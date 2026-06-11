@@ -1,0 +1,587 @@
+[
+  {
+    "id": "rel-001",
+    "from_id": "actor-006",
+    "to_id": "wf-001",
+    "relationship_type": "OWNS",
+    "description": "Nadia Kovalchuk owns and is accountable for the Month-End Financial Close workflow",
+    "strength": "primary",
+    "created_at": "2020-09-01"
+  },
+  {
+    "id": "rel-002",
+    "from_id": "actor-001",
+    "to_id": "dec-001",
+    "relationship_type": "DECIDED",
+    "description": "Sarah Chen made the final call to choose Salesforce over HubSpot",
+    "strength": "primary",
+    "created_at": "2022-03-15"
+  },
+  {
+    "id": "rel-003",
+    "from_id": "dec-001",
+    "to_id": "wf-005",
+    "relationship_type": "AFFECTS",
+    "description": "The Salesforce CRM decision shapes the Sales Handoff to CS workflow — all handoff data lives in Salesforce",
+    "strength": "primary",
+    "created_at": "2022-04-01"
+  },
+  {
+    "id": "rel-004",
+    "from_id": "dec-001",
+    "to_id": "wf-013",
+    "relationship_type": "AFFECTS",
+    "description": "Salesforce is the system of record for renewal management; the CRM decision directly affects how renewals are tracked",
+    "strength": "primary",
+    "created_at": "2022-04-01"
+  },
+  {
+    "id": "rel-005",
+    "from_id": "actor-010",
+    "to_id": "com-001",
+    "relationship_type": "COMMITTED_TO",
+    "description": "Ravi Patel made the SSO commitment to Hartfield Group during renewal negotiation",
+    "strength": "primary",
+    "created_at": "2024-10-14"
+  },
+  {
+    "id": "rel-006",
+    "from_id": "com-001",
+    "to_id": "vo-002",
+    "relationship_type": "AFFECTS",
+    "description": "The SSO commitment directly affects the Hartfield Group account relationship and health status",
+    "strength": "primary",
+    "created_at": "2024-10-14"
+  },
+  {
+    "id": "rel-007",
+    "from_id": "dec-008",
+    "to_id": "com-001",
+    "relationship_type": "AFFECTS",
+    "description": "The Q1 2026 tech debt freeze directly blocked delivery of the SSO commitment to Hartfield",
+    "strength": "primary",
+    "created_at": "2025-12-10"
+  },
+  {
+    "id": "rel-008",
+    "from_id": "dec-008",
+    "to_id": "com-002",
+    "relationship_type": "AFFECTS",
+    "description": "The tech debt freeze also put the Meridian Capital custom dashboard commitment at risk",
+    "strength": "primary",
+    "created_at": "2025-12-10"
+  },
+  {
+    "id": "rel-009",
+    "from_id": "actor-007",
+    "to_id": "vo-005",
+    "relationship_type": "OWNS",
+    "description": "James Okafor is the technical lead for the Finance Workflow Engine module",
+    "strength": "primary",
+    "created_at": "2021-08-15"
+  },
+  {
+    "id": "rel-010",
+    "from_id": "vo-005",
+    "to_id": "wf-001",
+    "relationship_type": "PRODUCES",
+    "description": "The Finance Workflow Engine is what Veridian customers use to run their Month-End Close workflows",
+    "strength": "primary",
+    "created_at": "2019-06-01"
+  },
+  {
+    "id": "rel-011",
+    "from_id": "actor-011",
+    "to_id": "vo-006",
+    "relationship_type": "OWNS",
+    "description": "Dev Anand owns the Customer Data Platform infrastructure and data quality",
+    "strength": "primary",
+    "created_at": "2023-01-10"
+  },
+  {
+    "id": "rel-012",
+    "from_id": "vo-006",
+    "to_id": "wf-010",
+    "relationship_type": "PRODUCES",
+    "description": "The Customer Data Platform produces the account health data used in QBR preparation",
+    "strength": "primary",
+    "created_at": "2023-06-01"
+  },
+  {
+    "id": "rel-013",
+    "from_id": "actor-003",
+    "to_id": "wf-006",
+    "relationship_type": "OWNS",
+    "description": "Priya Sharma owns the Customer Onboarding workflow (re-absorbed from dedicated team in 2023)",
+    "strength": "primary",
+    "created_at": "2023-09-01"
+  },
+  {
+    "id": "rel-014",
+    "from_id": "dec-003",
+    "to_id": "wf-006",
+    "relationship_type": "AFFECTS",
+    "description": "The decision to dissolve the Onboarding team and move responsibility to CS directly shaped the current onboarding workflow",
+    "strength": "primary",
+    "created_at": "2023-09-01"
+  },
+  {
+    "id": "rel-015",
+    "from_id": "actor-004",
+    "to_id": "dec-005",
+    "relationship_type": "DECIDED",
+    "description": "Sarah Chen and Tom Adeyemi jointly decided to defer the self-serve tier — Tom as dissenting co-decider",
+    "strength": "secondary",
+    "created_at": "2024-01-15"
+  },
+  {
+    "id": "rel-016",
+    "from_id": "dec-002",
+    "to_id": "wf-002",
+    "relationship_type": "AFFECTS",
+    "description": "The killed AI pilot for CS triage directly affects the current state of the CS ticket triage workflow — it explains why no AI tooling is in use",
+    "strength": "primary",
+    "created_at": "2024-07-22"
+  },
+  {
+    "id": "rel-017",
+    "from_id": "actor-005",
+    "to_id": "vo-007",
+    "relationship_type": "OWNS",
+    "description": "Yuki Tanaka owns the Engineering Runbook Library and is accountable for its coverage",
+    "strength": "primary",
+    "created_at": "2019-11-01"
+  },
+  {
+    "id": "rel-018",
+    "from_id": "vo-007",
+    "to_id": "wf-011",
+    "relationship_type": "PRODUCES",
+    "description": "The Runbook Library is the primary operational resource used during Production Incident Response",
+    "strength": "primary",
+    "created_at": "2020-01-01"
+  },
+  {
+    "id": "rel-019",
+    "from_id": "actor-009",
+    "to_id": "vo-009",
+    "relationship_type": "OWNS",
+    "description": "Chloe Beaumont maintains the informal Sales Commitment Log — a personal Notion doc that is the de facto commitment tracker",
+    "strength": "primary",
+    "created_at": "2024-03-01"
+  },
+  {
+    "id": "rel-020",
+    "from_id": "dec-009",
+    "to_id": "vo-009",
+    "relationship_type": "AFFECTS",
+    "description": "The deferred decision to build a proper commitment tracking system means Chloe's personal Notion doc remains the only record",
+    "strength": "primary",
+    "created_at": "2025-06-01"
+  },
+  {
+    "id": "rel-021",
+    "from_id": "actor-004",
+    "to_id": "wf-003",
+    "relationship_type": "OWNS",
+    "description": "Tom Adeyemi owns the Product Spec to Linear Ticket workflow",
+    "strength": "primary",
+    "created_at": "2021-02-01"
+  },
+  {
+    "id": "rel-022",
+    "from_id": "dec-004",
+    "to_id": "wf-003",
+    "relationship_type": "AFFECTS",
+    "description": "The Linear adoption decision determined the tooling for the spec-to-ticket workflow",
+    "strength": "primary",
+    "created_at": "2023-02-01"
+  },
+  {
+    "id": "rel-023",
+    "from_id": "actor-006",
+    "to_id": "dec-007",
+    "relationship_type": "DECIDED",
+    "description": "Nadia Kovalchuk initiated and co-decided the AI evaluation for finance workflows",
+    "strength": "primary",
+    "created_at": "2025-10-01"
+  },
+  {
+    "id": "rel-024",
+    "from_id": "dec-007",
+    "to_id": "wf-001",
+    "relationship_type": "AFFECTS",
+    "description": "The decision to evaluate AI for finance is reshaping the Month-End Close workflow",
+    "strength": "secondary",
+    "created_at": "2025-10-01"
+  },
+  {
+    "id": "rel-025",
+    "from_id": "com-004",
+    "to_id": "actor-003",
+    "relationship_type": "AFFECTS",
+    "description": "The broken public roadmap commitment from Product is directly harming Priya Sharma's ability to run effective QBRs and renewals",
+    "strength": "primary",
+    "created_at": "2026-03-31"
+  },
+  {
+    "id": "rel-026",
+    "from_id": "actor-002",
+    "to_id": "dec-008",
+    "relationship_type": "DECIDED",
+    "description": "Marcus Webb championed and made the final call on the Q1 2026 tech debt freeze",
+    "strength": "primary",
+    "created_at": "2025-12-10"
+  },
+  {
+    "id": "rel-027",
+    "from_id": "wf-005",
+    "to_id": "wf-006",
+    "relationship_type": "PRODUCES",
+    "description": "The Sales Handoff workflow produces the customer context that feeds into the Onboarding workflow",
+    "strength": "primary",
+    "created_at": "2020-01-01"
+  },
+  {
+    "id": "rel-028",
+    "from_id": "actor-008",
+    "to_id": "dec-009",
+    "relationship_type": "DECIDED",
+    "description": "Fatima Al-Rashid co-decided to defer the commitment tracking system, a decision she now considers a mistake",
+    "strength": "primary",
+    "created_at": "2025-06-01"
+  },
+  {
+    "id": "rel-029",
+    "from_id": "com-009",
+    "to_id": "com-001",
+    "relationship_type": "AFFECTS",
+    "description": "Sarah Chen's personal CEO-level commitment to Hartfield escalates the stakes of the original SSO commitment (com-001)",
+    "strength": "primary",
+    "created_at": "2026-03-02"
+  },
+  {
+    "id": "rel-030",
+    "from_id": "vo-008",
+    "to_id": "dec-008",
+    "relationship_type": "AFFECTS",
+    "description": "Series B runway constraints made it impossible to simply hire more engineers, forcing the tech debt freeze as the only viable option",
+    "strength": "secondary",
+    "created_at": "2025-12-10"
+  },
+  {
+    "id": "rel-031",
+    "from_id": "actor-009",
+    "to_id": "vo-002",
+    "relationship_type": "OWNS",
+    "description": "Chloe Beaumont is the named CSM for Hartfield Group",
+    "strength": "primary",
+    "created_at": "2022-01-15"
+  },
+  {
+    "id": "rel-032",
+    "from_id": "actor-009",
+    "to_id": "vo-003",
+    "relationship_type": "OWNS",
+    "description": "Chloe Beaumont is also the named CSM for Meridian Capital",
+    "strength": "primary",
+    "created_at": "2023-06-01"
+  },
+  {
+    "id": "rel-033",
+    "from_id": "wf-014",
+    "to_id": "wf-005",
+    "relationship_type": "PRODUCES",
+    "description": "The New Business Sales Process produces the closed deal that triggers the Sales Handoff to CS workflow",
+    "strength": "primary",
+    "created_at": "2020-01-01"
+  },
+  {
+    "id": "rel-034",
+    "from_id": "wf-013",
+    "to_id": "vo-008",
+    "relationship_type": "PRODUCES",
+    "description": "Contract Renewal Management directly produces the renewed ARR that extends the company's runway and Series B sustainability",
+    "strength": "primary",
+    "created_at": "2020-01-01"
+  },
+  {
+    "id": "rel-035",
+    "from_id": "actor-007",
+    "to_id": "com-012",
+    "relationship_type": "COMMITTED_TO",
+    "description": "James Okafor personally owns delivery of the Admin SSO Self-Serve interface as part of the tech debt freeze",
+    "strength": "primary",
+    "created_at": "2026-01-06"
+  },
+  {
+    "id": "rel-036",
+    "from_id": "actor-005",
+    "to_id": "wf-004",
+    "relationship_type": "OWNS",
+    "description": "Yuki Tanaka owns the Engineering Code Review workflow and sets review standards",
+    "strength": "primary",
+    "created_at": "2019-11-01"
+  },
+  {
+    "id": "rel-037",
+    "from_id": "actor-011",
+    "to_id": "wf-007",
+    "relationship_type": "OWNS",
+    "description": "Dev Anand owns Data Pipeline Monitoring and Incident Response",
+    "strength": "primary",
+    "created_at": "2023-01-10"
+  },
+  {
+    "id": "rel-038",
+    "from_id": "actor-006",
+    "to_id": "wf-008",
+    "relationship_type": "OWNS",
+    "description": "Nadia Kovalchuk owns the Invoice Reconciliation workflow",
+    "strength": "primary",
+    "created_at": "2020-09-01"
+  },
+  {
+    "id": "rel-039",
+    "from_id": "actor-005",
+    "to_id": "wf-009",
+    "relationship_type": "OWNS",
+    "description": "Yuki Tanaka owns Engineering Sprint Planning",
+    "strength": "primary",
+    "created_at": "2019-11-01"
+  },
+  {
+    "id": "rel-040",
+    "from_id": "actor-001",
+    "to_id": "wf-012",
+    "relationship_type": "OWNS",
+    "description": "Sarah Chen owns Annual Strategic Planning",
+    "strength": "primary",
+    "created_at": "2018-03-01"
+  },
+  {
+    "id": "rel-041",
+    "from_id": "actor-008",
+    "to_id": "wf-015",
+    "relationship_type": "OWNS",
+    "description": "Fatima Al-Rashid owns Cross-Functional Quarterly Planning as COO",
+    "strength": "primary",
+    "created_at": "2024-11-01"
+  },
+  {
+    "id": "rel-042",
+    "from_id": "dec-009",
+    "to_id": "wf-015",
+    "relationship_type": "AFFECTS",
+    "description": "The deferred commitment tracking system decision means quarterly planning commitments still go untracked after the meeting",
+    "strength": "primary",
+    "created_at": "2025-06-01"
+  },
+  {
+    "id": "rel-043",
+    "from_id": "actor-013",
+    "to_id": "actor-002",
+    "relationship_type": "REPORTS_TO",
+    "description": "Oliver Mwangi (VP Engineering) reports to Marcus Webb (CTO)",
+    "strength": "primary",
+    "created_at": "2023-04-01"
+  },
+  {
+    "id": "rel-044",
+    "from_id": "actor-005",
+    "to_id": "actor-013",
+    "relationship_type": "REPORTS_TO",
+    "description": "Yuki Tanaka now reports to Oliver Mwangi after dec-010 narrowed her scope",
+    "strength": "primary",
+    "created_at": "2023-04-01"
+  },
+  {
+    "id": "rel-045",
+    "from_id": "dec-010",
+    "to_id": "actor-005",
+    "relationship_type": "AFFECTS",
+    "description": "The external VP Engineering hire directly reduced Yuki Tanaka's organizational scope and changed her reporting line",
+    "strength": "primary",
+    "created_at": "2023-04-01"
+  },
+  {
+    "id": "rel-046",
+    "from_id": "actor-015",
+    "to_id": "wf-002",
+    "relationship_type": "TOUCHES",
+    "description": "Ben Osei owns the Intercom-Salesforce integration that causes the data quality issues in the CS ticket triage workflow",
+    "strength": "primary",
+    "created_at": "2023-07-15"
+  },
+  {
+    "id": "rel-047",
+    "from_id": "actor-016",
+    "to_id": "wf-016",
+    "relationship_type": "OWNS",
+    "description": "Imogen Walsh owns the Security and Compliance Review workflow",
+    "strength": "primary",
+    "created_at": "2024-02-01"
+  },
+  {
+    "id": "rel-048",
+    "from_id": "actor-017",
+    "to_id": "wf-014",
+    "relationship_type": "TOUCHES",
+    "description": "Carlos Mendez runs technical demos and security questionnaire responses as part of the new business sales process",
+    "strength": "primary",
+    "created_at": "2023-11-01"
+  },
+  {
+    "id": "rel-049",
+    "from_id": "actor-016",
+    "to_id": "wf-014",
+    "relationship_type": "TOUCHES",
+    "description": "Imogen Walsh is the legal reviewer in the New Business Sales Process — the #1 deal-slippage bottleneck",
+    "strength": "primary",
+    "created_at": "2024-02-01"
+  },
+  {
+    "id": "rel-050",
+    "from_id": "actor-014",
+    "to_id": "wf-017",
+    "relationship_type": "OWNS",
+    "description": "Sophie Laurent owns the Marketing Campaign Performance Review workflow",
+    "strength": "primary",
+    "created_at": "2022-09-01"
+  },
+  {
+    "id": "rel-051",
+    "from_id": "dec-011",
+    "to_id": "wf-017",
+    "relationship_type": "AFFECTS",
+    "description": "The split HubSpot/Salesforce stack decision (dec-011) is the root cause of the attribution gap that makes wf-017 painful",
+    "strength": "primary",
+    "created_at": "2022-09-15"
+  },
+  {
+    "id": "rel-052",
+    "from_id": "actor-019",
+    "to_id": "wf-006",
+    "relationship_type": "OWNS",
+    "description": "Wei Zhang owns the Customer Onboarding workflow — created specifically to fix the onboarding time regression from dec-003",
+    "strength": "primary",
+    "created_at": "2024-08-01"
+  },
+  {
+    "id": "rel-053",
+    "from_id": "dec-012",
+    "to_id": "actor-019",
+    "relationship_type": "AFFECTS",
+    "description": "The decision to create the Head of Customer Onboarding role (dec-012) directly created actor-019",
+    "strength": "primary",
+    "created_at": "2024-06-01"
+  },
+  {
+    "id": "rel-054",
+    "from_id": "dec-012",
+    "to_id": "dec-003",
+    "relationship_type": "SUPERSEDES",
+    "description": "dec-012 partially reverses dec-003 by re-creating dedicated onboarding ownership, though it was never framed as an admission of mistake",
+    "strength": "primary",
+    "created_at": "2024-06-01"
+  },
+  {
+    "id": "rel-055",
+    "from_id": "actor-020",
+    "to_id": "wf-001",
+    "relationship_type": "TOUCHES",
+    "description": "Kwame Asante is the practitioner who actually executes the 38-hour month-end close each month — Nadia owns it, Kwame does it",
+    "strength": "primary",
+    "created_at": "2023-03-15"
+  },
+  {
+    "id": "rel-056",
+    "from_id": "actor-020",
+    "to_id": "wf-008",
+    "relationship_type": "TOUCHES",
+    "description": "Kwame Asante handles day-to-day invoice reconciliation operations",
+    "strength": "primary",
+    "created_at": "2023-03-15"
+  },
+  {
+    "id": "rel-057",
+    "from_id": "actor-012",
+    "to_id": "wf-018",
+    "relationship_type": "OWNS",
+    "description": "Anya Volkov owns the New Employee Onboarding workflow",
+    "strength": "primary",
+    "created_at": "2022-07-01"
+  },
+  {
+    "id": "rel-058",
+    "from_id": "actor-013",
+    "to_id": "com-013",
+    "relationship_type": "COMMITTED_TO",
+    "description": "Oliver Mwangi made the runbook coverage commitment to Marcus Webb — a commitment that was subsequently broken",
+    "strength": "primary",
+    "created_at": "2026-01-06"
+  },
+  {
+    "id": "rel-059",
+    "from_id": "actor-014",
+    "to_id": "com-014",
+    "relationship_type": "COMMITTED_TO",
+    "description": "Sophie Laurent made the HubSpot-Salesforce attribution commitment to Sarah Chen",
+    "strength": "primary",
+    "created_at": "2026-03-05"
+  },
+  {
+    "id": "rel-060",
+    "from_id": "com-014",
+    "to_id": "actor-015",
+    "relationship_type": "DEPENDS_ON",
+    "description": "Sophie's attribution commitment (com-014) depends on Ben Osei doing the integration work — which is not yet scheduled",
+    "strength": "primary",
+    "created_at": "2026-03-05"
+  },
+  {
+    "id": "rel-061",
+    "from_id": "actor-018",
+    "to_id": "dec-002",
+    "relationship_type": "PARTICIPATED_IN",
+    "description": "Amara Diallo was the PM on the failed 2024 CS triage AI pilot — she carries institutional memory of what went wrong",
+    "strength": "primary",
+    "created_at": "2024-07-22"
+  },
+  {
+    "id": "rel-062",
+    "from_id": "actor-018",
+    "to_id": "wf-003",
+    "relationship_type": "TOUCHES",
+    "description": "Amara Diallo (Senior PM — Platform) contributes to the Product Spec to Linear Ticket workflow for Finance Workflow Engine roadmap items",
+    "strength": "secondary",
+    "created_at": "2022-05-01"
+  },
+  {
+    "id": "rel-063",
+    "from_id": "actor-013",
+    "to_id": "wf-009",
+    "relationship_type": "OWNS",
+    "description": "Oliver Mwangi now owns Engineering Sprint Planning as VP Engineering (previously Yuki's domain)",
+    "strength": "primary",
+    "created_at": "2023-04-01"
+  },
+  {
+    "id": "rel-064",
+    "from_id": "actor-016",
+    "to_id": "wf-013",
+    "relationship_type": "TOUCHES",
+    "description": "Imogen Walsh reviews contract terms in the Contract Renewal Management workflow when legal terms change",
+    "strength": "secondary",
+    "created_at": "2024-02-01"
+  },
+  {
+    "id": "rel-065",
+    "from_id": "wf-016",
+    "to_id": "wf-014",
+    "relationship_type": "PRODUCES",
+    "description": "The Security and Compliance Review workflow is a gate within the New Business Sales Process — a cleared review unblocks the deal",
+    "strength": "primary",
+    "created_at": "2024-02-01"
+  }
+]

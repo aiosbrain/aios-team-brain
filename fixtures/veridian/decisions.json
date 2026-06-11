@@ -1,0 +1,386 @@
+[
+  {
+    "id": "dec-001",
+    "title": "Chose Salesforce over HubSpot as primary CRM",
+    "made_by": ["actor-001", "actor-010"],
+    "made_at": "2022-03-15",
+    "summary": "Veridian selected Salesforce Sales Cloud as its CRM after a 6-week evaluation. HubSpot was the primary alternative.",
+    "context": "By early 2022, the company had grown to 40 people and was managing a £3M ARR pipeline in spreadsheets. The board flagged this as an operational risk. CEO Sarah Chen led the evaluation alongside Head of Sales Ravi Patel.",
+    "alternatives_considered": [
+      {
+        "name": "HubSpot",
+        "reason_rejected": "Richer native marketing automation, but weaker CPQ and enterprise deal management. Ravi actually preferred it; Sarah overruled citing Series B investor expectations of enterprise-grade tooling."
+      },
+      {
+        "name": "Pipedrive",
+        "reason_rejected": "Ruled out early — insufficient for enterprise deal complexity and reporting requirements."
+      },
+      {
+        "name": "Continue with spreadsheets",
+        "reason_rejected": "Not seriously considered — acknowledged as unsustainable at current growth rate."
+      }
+    ],
+    "outcome": "Salesforce deployed in April 2022. Took 4 months longer than planned to configure due to underestimating customization complexity. Still in use as of 2026.",
+    "rationale": "Salesforce was chosen primarily for (1) board/investor credibility — it signals operational maturity to Series B investors, (2) CPQ module for complex pricing, and (3) stronger Salesforce partner ecosystem for future integrations. The technical evaluation scored HubSpot higher on ease of use and sales productivity, but was overridden.",
+    "dissenting_views": [
+      {
+        "person": "actor-010",
+        "view": "Ravi Patel formally disagreed. He argued that HubSpot's tighter Outreach integration would reduce AE admin burden by 30–40% and that the 'investor credibility' rationale prioritized optics over usability. He documented his objection in the decision log but accepted the outcome."
+      }
+    ],
+    "still_valid": true,
+    "affects_workflows": ["wf-005", "wf-008", "wf-013", "wf-014"],
+    "tags": ["tooling", "go-to-market", "infrastructure"]
+  },
+  {
+    "id": "dec-002",
+    "title": "Killed AI pilot for CS ticket triage (2024)",
+    "made_by": ["actor-003", "actor-008"],
+    "made_at": "2024-07-22",
+    "summary": "A 3-month AI pilot using an off-the-shelf classifier to auto-triage Intercom tickets was shut down due to low adoption and poor accuracy on edge cases.",
+    "context": "In Q1 2024, CS Head Priya Sharma proposed using an AI tool (Forethought.ai) to auto-classify and route inbound support tickets. The problem was real: manual triage was consuming ~15% of CSM time. The pilot ran March–June 2024.",
+    "alternatives_considered": [
+      {
+        "name": "Continue and extend the Forethought pilot",
+        "reason_rejected": "Accuracy on finance-domain tickets was ~72% — too low for CSM trust. CSMs were checking and correcting every classification, adding work rather than reducing it."
+      },
+      {
+        "name": "Build custom classifier in-house",
+        "reason_rejected": "Engineering estimated 3 months of data labeling + model training. Not prioritized given product backlog."
+      },
+      {
+        "name": "Improve manual process with better Notion runbook",
+        "reason_rejected": "Rejected as a short-term patch; didn't address root cause."
+      }
+    ],
+    "outcome": "Pilot terminated July 2024. No AI tooling currently deployed in CS workflow. The triage problem remains unsolved. Priya is cautious about re-engaging with AI for this workflow without a clearer proof of concept. Amara Diallo (actor-018), who was PM on the pilot, carries scar tissue that surfaces when new AI proposals come to Product.",
+    "rationale": "The tool was domain-agnostic and had not been trained on finance workflow terminology. The classification confidence was too low for CSMs to trust without verification. More importantly, the pilot lacked a proper change management plan — CSMs weren't bought in and used the tool inconsistently from day one.",
+    "dissenting_views": [
+      {
+        "person": "actor-003",
+        "view": "Priya Sharma believes the failure was execution rather than technology — the wrong tool was chosen and the pilot lacked proper training data. She's open to revisiting with a better-designed implementation but wants Engineering ownership, not just a SaaS subscription."
+      }
+    ],
+    "still_valid": true,
+    "affects_workflows": ["wf-002"],
+    "tags": ["ai-pilot", "customer-success", "lessons-learned"]
+  },
+  {
+    "id": "dec-003",
+    "title": "Moved customer onboarding from dedicated team to CS",
+    "made_by": ["actor-001", "actor-008"],
+    "made_at": "2023-09-01",
+    "summary": "Veridian dissolved its 3-person dedicated Onboarding team and reabsorbed onboarding responsibilities into the Customer Success team to reduce headcount cost.",
+    "context": "In mid-2023, the company faced cash burn pressure ahead of Series B fundraising. The Onboarding team of 3 specialists was a cost center. The argument was that CSMs could absorb onboarding with a lighter-touch playbook, reducing headcount without impacting customer outcomes.",
+    "alternatives_considered": [
+      {
+        "name": "Keep dedicated Onboarding team",
+        "reason_rejected": "Monthly burn was £28K for the team. Board pressure to reduce headcount before Series B due diligence."
+      },
+      {
+        "name": "Reduce Onboarding team to 1 specialist",
+        "reason_rejected": "Considered but rejected — one specialist serving the whole customer base was deemed insufficient without proper tooling (which didn't exist)."
+      },
+      {
+        "name": "Outsource onboarding to implementation partner",
+        "reason_rejected": "No partner network in place; building one was estimated at 6 months minimum."
+      }
+    ],
+    "outcome": "Onboarding absorbed by CS in October 2023. Average onboarding time grew from 3 weeks to 6 weeks. Customer satisfaction during onboarding declined (NPS at onboarding down from +42 to +28). The decision was partially reversed in 2024 when Wei Zhang was hired as Head of Customer Onboarding (actor-019, dec-012). Onboarding time recovered to 4 weeks by Q4 2024.",
+    "rationale": "The primary driver was cost reduction ahead of Series B. The secondary rationale — that onboarding and CS are naturally aligned — was never validated. The hidden cost was CSM time dilution and onboarding quality decline.",
+    "dissenting_views": [
+      {
+        "person": "actor-003",
+        "view": "Priya Sharma opposed this decision and documented it. She argued that onboarding has a different success profile than ongoing CS — it requires project management skills, not relationship skills. 18 months later, she considers herself vindicated by the NPS data."
+      },
+      {
+        "person": "actor-009",
+        "view": "Chloe Beaumont was one of the CSMs who absorbed the extra workload. She has informally flagged to Priya that onboarding tasks now take up ~25% of her capacity, up from ~5% before the change."
+      }
+    ],
+    "still_valid": false,
+    "affects_workflows": ["wf-006", "wf-013"],
+    "tags": ["org-design", "customer-success", "cost-reduction", "revisit"]
+  },
+  {
+    "id": "dec-004",
+    "title": "Standardized on Linear over Jira for engineering and product",
+    "made_by": ["actor-002", "actor-004", "actor-005"],
+    "made_at": "2023-02-01",
+    "summary": "After a 6-week trial, Veridian migrated from Jira to Linear as its primary project management and issue tracking system for Engineering and Product.",
+    "context": "Veridian had used Jira since founding, but by early 2023 the instance had accumulated years of unmaintained configuration — custom workflows, dead projects, and a backlog no one trusted. The engineering team consistently cited Jira as a friction point in retros.",
+    "alternatives_considered": [
+      {
+        "name": "Jira cleanup and reconfiguration",
+        "reason_rejected": "Estimated 3 months of admin work to bring Jira to a usable state. Engineering morale would not survive another 3 months of 'we're fixing Jira.'"
+      },
+      {
+        "name": "Shortcut (formerly Clubhouse)",
+        "reason_rejected": "Trialed alongside Linear. Better Notion integration but slower and less opinionated — engineers preferred Linear's speed and keyboard shortcuts."
+      },
+      {
+        "name": "GitHub Projects",
+        "reason_rejected": "Too lightweight for product management needs; Tom Adeyemi rejected it."
+      }
+    ],
+    "outcome": "Linear deployed February 2023. Migration from Jira took 3 weeks (faster than estimated). Adopted well by Engineering. Tom Adeyemi (Head of Product) was skeptical initially — he'd invested heavily in Jira workflows — but converted within 60 days.",
+    "rationale": "Engineering productivity and morale improvement was the primary driver. Linear's opinionated structure forces better ticket hygiene. The secondary benefit was aligning Engineering and Product on the same tool with the same view of the backlog.",
+    "dissenting_views": [
+      {
+        "person": "actor-004",
+        "view": "Tom Adeyemi was skeptical of Linear's limited customization compared to Jira. His concern was that Linear's opinionated structure would constrain complex product planning needs. He raised this formally but ultimately agreed to trial it. His skepticism was resolved by how quickly the team adopted it."
+      }
+    ],
+    "still_valid": true,
+    "affects_workflows": ["wf-003", "wf-004", "wf-009"],
+    "tags": ["tooling", "engineering", "product", "productivity"]
+  },
+  {
+    "id": "dec-005",
+    "title": "Delayed building self-serve tier — defer to Series C",
+    "made_by": ["actor-001", "actor-004"],
+    "made_at": "2024-01-15",
+    "summary": "Despite recurring demand signals, Veridian decided to defer building a self-serve product tier until after its Series C fundraise, expected in H2 2026.",
+    "context": "Veridian has received consistent inbound interest from companies with <50 employees who can't afford the enterprise price point (£2,500+/month). Product ran an internal analysis in Q4 2023 showing ~180 waitlisted companies. The debate between Sarah Chen and Tom Adeyemi has been ongoing since 2022.",
+    "alternatives_considered": [
+      {
+        "name": "Build lightweight self-serve tier in H1 2024",
+        "reason_rejected": "Engineering estimated 4 months of work to build a proper billing, provisioning, and onboarding flow for self-serve. Marcus argued this would divert capacity from enterprise features that drive ARR."
+      },
+      {
+        "name": "Partner with a PLG tooling vendor (e.g. Paddle) to accelerate",
+        "reason_rejected": "Explored but dropped when it became clear that Veridian's product wasn't architected for multi-tenancy at the granularity self-serve requires."
+      },
+      {
+        "name": "Launch a freemium trial tier",
+        "reason_rejected": "Support cost per freemium user was modeled at an unsustainable level given current CS headcount."
+      }
+    ],
+    "outcome": "Self-serve deferred. No change as of Q1 2026. The 180-company waitlist has grown to an estimated 300+. Competitor momentum from newer entrants with self-serve-first architecture is cited in board meetings.",
+    "rationale": "Sarah Chen's position: Veridian's current ICP is mid-market finance teams (100–1,000 employees). Diluting focus with self-serve risks degrading enterprise product quality and CS capacity. The Series C story is cleaner with pure enterprise ARR. Post-Series C, a dedicated self-serve squad can be funded properly.",
+    "dissenting_views": [
+      {
+        "person": "actor-004",
+        "view": "Tom Adeyemi has argued consistently that deferring self-serve creates a competitive vulnerability — newer entrants will land self-serve customers and expand upmarket. He's proposed a minimum viable self-serve tier (view-only, limited workflows) that wouldn't require full billing infrastructure. This was not adopted."
+      }
+    ],
+    "still_valid": true,
+    "affects_workflows": ["wf-006", "wf-014"],
+    "tags": ["product-strategy", "growth", "series-c", "competitive"]
+  },
+  {
+    "id": "dec-006",
+    "title": "Hired Fatima Al-Rashid as COO externally, bypassing internal candidates",
+    "made_by": ["actor-001"],
+    "made_at": "2024-08-01",
+    "summary": "Sarah Chen hired Fatima Al-Rashid as COO from an external search, passing over two internal candidates who had been informally positioned for the role.",
+    "context": "By mid-2024, Veridian had grown to 90 people and was showing operational strain. Sarah was spending 40% of her time on operational coordination that should have been handled by a COO. Two internal candidates — the Head of People (Anya Volkov) and the Director of Revenue Operations — had both expressed interest in the role.",
+    "alternatives_considered": [
+      {
+        "name": "Promote Anya Volkov (Head of People) to COO",
+        "reason_rejected": "Strong cultural fit and institutional knowledge, but limited operational and commercial experience. Board was concerned about the risk of a first-time COO at this stage."
+      },
+      {
+        "name": "Promote Director of Revenue Operations to COO",
+        "reason_rejected": "Excellent RevOps expertise but perceived as too narrowly focused on go-to-market — wouldn't credibly own Engineering and Product operations."
+      }
+    ],
+    "outcome": "Fatima Al-Rashid joined November 2024. Has since taken ownership of cross-functional planning and commitment tracking. The Director of Revenue Operations left the company in February 2025. Anya remains in her role and has a functional working relationship with Fatima.",
+    "rationale": "Sarah's stated rationale: the company needed someone who had operated a 100–200 person SaaS company before, particularly through a Series C. Fatima had been VP Operations at a comparable SaaS company through its Series C and IPO. The board explicitly advised against promoting internally at this stage.",
+    "dissenting_views": [
+      {
+        "person": "actor-012",
+        "view": "Anya Volkov was professionally gracious about the decision but personally hurt. She had been building toward this role for 18 months with Sarah's encouragement. The lack of clear communication about criteria for the role left internal candidates feeling blindsided."
+      },
+      {
+        "person": "actor-004",
+        "view": "Tom Adeyemi raised concerns in a 1:1 with Sarah that hiring externally for COO signals to the leadership team that internal career progression is uncertain. He worried about retention of other senior managers."
+      }
+    ],
+    "still_valid": true,
+    "affects_workflows": ["wf-012", "wf-015"],
+    "tags": ["org-design", "leadership", "hiring", "culture"]
+  },
+  {
+    "id": "dec-007",
+    "title": "Initiated evaluation of AI for finance workflows (2025–2026)",
+    "made_by": ["actor-006", "actor-001", "actor-008"],
+    "made_at": "2025-10-01",
+    "summary": "Veridian's leadership approved a structured evaluation of AI tooling for Finance workflows, with month-end close and invoice reconciliation as the primary candidates.",
+    "context": "In the 2025 annual planning cycle, Nadia Kovalchuk presented data showing that Finance was spending 44 person-hours per month on work she believed was automatable. She proposed a 3-month evaluation of AI-assisted reconciliation tools. Sarah Chen approved it as part of Veridian's broader 'AI-first operations' narrative ahead of Series C.",
+    "alternatives_considered": [
+      {
+        "name": "Hire an additional Finance Analyst",
+        "reason_rejected": "Estimated £65K annual cost. AI evaluation estimated at <£10K for tooling + 20 hours of internal setup time."
+      },
+      {
+        "name": "Upgrade Xero subscription for automation features",
+        "reason_rejected": "Xero's native automation doesn't cover the Salesforce reconciliation step, which is the highest-friction task."
+      }
+    ],
+    "outcome": "Evaluation in progress as of Q1 2026. Nadia is leading with support from Dev Anand (data infrastructure) and an external AI consultant. Early results on invoice reconciliation matching are promising (~94% auto-match rate in testing). Kwame Asante is the primary practitioner being observed in the evaluation.",
+    "rationale": "Three converging factors: (1) Nadia's documented evidence of time waste, (2) Series C narrative benefit of demonstrating AI-augmented operations, (3) Fatima's mandate to reduce operational friction. This is also intended to serve as an internal proof point for Veridian's enterprise clients — 'we use AI in our own ops.'",
+    "dissenting_views": [
+      {
+        "person": "actor-002",
+        "view": "Marcus Webb has not formally objected but raised data security concerns in the evaluation kickoff — specifically about sending financial transaction data to external AI APIs. He requested that all AI processing use on-premise or EU-hosted models where possible."
+      }
+    ],
+    "still_valid": true,
+    "affects_workflows": ["wf-001", "wf-008"],
+    "tags": ["ai-strategy", "finance", "operations", "series-c"]
+  },
+  {
+    "id": "dec-008",
+    "title": "Froze all new feature development for Q1 2026 to address tech debt",
+    "made_by": ["actor-002", "actor-005", "actor-001"],
+    "made_at": "2025-12-10",
+    "summary": "After a Q4 2025 engineering retrospective showed that 40% of sprint capacity was being consumed by bugs and unplanned work, leadership approved a full feature freeze for Q1 2026.",
+    "context": "At the 2025 year-end engineering retrospective, Yuki Tanaka presented data that shocked the leadership team: unplanned work (bug fixes, incidents, and firefighting) had consumed on average 38–42% of engineering capacity for the prior two quarters. Three major customer-impacting incidents in Q4 2025 accelerated the decision. At 45 engineers across 5 squads, the tech debt was now compounding at scale.",
+    "alternatives_considered": [
+      {
+        "name": "Allocate 20% of each sprint to tech debt without feature freeze",
+        "reason_rejected": "Already tried in 2024 — tech debt tickets were consistently deprioritized when sprint capacity was tight. The 20% rule had never actually been honored."
+      },
+      {
+        "name": "Hire 4 additional engineers to absorb tech debt alongside feature work",
+        "reason_rejected": "6-month hiring timeline; immediate relief needed. Also, adding engineers to a codebase with structural issues was argued to be counterproductive (Brook's Law cited explicitly)."
+      },
+      {
+        "name": "Partial freeze: pause new features for 2 squads, keep 1 squad on features",
+        "reason_rejected": "Marcus rejected this — he argued a partial freeze would still allow product pressure to encroach and wouldn't send a clear enough signal."
+      }
+    ],
+    "outcome": "Feature freeze in effect from January 6, 2026. Five engineering squads working exclusively on: (1) database schema refactoring, (2) test coverage improvement (from 34% to 70% target), (3) incident tooling and runbook library, (4) Intercom-Salesforce sync cleanup, (5) infrastructure hardening. Customer-facing impact: 14 committed features delayed, including items promised to Hartfield Group and Meridian Capital.",
+    "rationale": "The compound cost of tech debt had reached a tipping point. Incident rate was accelerating, not declining. Marcus Webb's argument: 'We are building on sand. Every feature we ship doubles the sand.' The decision is expected to reduce unplanned work to <15% of sprint capacity by end of Q1 2026.",
+    "dissenting_views": [
+      {
+        "person": "actor-004",
+        "view": "Tom Adeyemi formally objected in writing. He argued that a full freeze was an overreaction and that the real problem was poor scoping, not tech debt. He was particularly concerned about the customer commitment impact — several enterprise accounts were told specific features were coming in Q1 2026."
+      },
+      {
+        "person": "actor-003",
+        "view": "Priya Sharma raised the customer relationship risk explicitly: 'We have open commitments we're about to break, and no plan for how to tell customers.' She asked for a communication plan before the freeze began. This was not adequately addressed."
+      }
+    ],
+    "still_valid": true,
+    "affects_workflows": ["wf-003", "wf-004", "wf-009"],
+    "tags": ["engineering", "tech-debt", "risk", "customer-impact"]
+  },
+  {
+    "id": "dec-009",
+    "title": "Deferred building internal commitment tracking system",
+    "made_by": ["actor-001", "actor-008"],
+    "made_at": "2025-06-01",
+    "summary": "A proposal to build an internal system for tracking cross-functional and customer commitments was scoped and then deferred due to competing engineering priorities.",
+    "context": "After a quarterly planning session in Q2 2025 where Fatima discovered that 3 commitments from the prior quarter had been forgotten entirely, she proposed building a lightweight internal commitment tracker. Engineering scoped it at 6 weeks. The proposal was deferred pending the Q3 roadmap prioritization.",
+    "alternatives_considered": [
+      {
+        "name": "Buy an off-the-shelf commitment tracker",
+        "reason_rejected": "No satisfactory SaaS option found that integrated with both Salesforce (customer commitments) and Linear (internal commitments) without significant custom work."
+      },
+      {
+        "name": "Use a Notion database as a manual tracker",
+        "reason_rejected": "Chloe Beaumont already maintains a personal Notion doc for customer commitments. This was acknowledged as 'a single point of failure, not a system.'"
+      }
+    ],
+    "outcome": "No commitment tracking system built as of Q1 2026. Chloe's Notion doc remains the de facto record. Three customer commitments have been missed or broken since this decision was deferred. This is now a named risk in Fatima's operational dashboard.",
+    "rationale": "The decision was driven by engineering capacity constraints and the belief that the problem was 'important but not urgent.' That assessment proved wrong.",
+    "dissenting_views": [
+      {
+        "person": "actor-008",
+        "view": "Fatima Al-Rashid disagreed with the deferral but accepted it given competing priorities. She has since escalated the problem twice in leadership meetings. She now considers this one of the top three operational risks at the company."
+      }
+    ],
+    "still_valid": false,
+    "affects_workflows": ["wf-010", "wf-013", "wf-015"],
+    "tags": ["operations", "commitment-tracking", "risk", "institutional-memory"]
+  },
+  {
+    "id": "dec-010",
+    "title": "Hired VP Engineering externally, partially displacing Yuki Tanaka's scope",
+    "made_by": ["actor-001"],
+    "made_at": "2023-02-15",
+    "summary": "Sarah Chen decided to hire a VP Engineering externally rather than promote Yuki Tanaka, as the company needed a VP-level hire to manage 3 engineering squads and own the technical org.",
+    "context": "By early 2023, Veridian had grown to 35 engineers and was adding a third squad. Marcus Webb was moving to CTO-level strategy and could no longer run the engineering org day-to-day. Yuki Tanaka was the obvious internal candidate — she had been Head of Engineering since 2019 and was universally respected. The decision was made without fully consulting Yuki or Marcus before the hire was in progress.",
+    "alternatives_considered": [
+      {
+        "name": "Promote Yuki Tanaka to VP Engineering",
+        "reason_rejected": "Sarah felt Yuki had not yet managed teams larger than 20 and that the company needed someone who had scaled an engineering org past 50 people. Yuki was considered an exceptional engineer and technical lead but an unproven manager at VP scale."
+      },
+      {
+        "name": "Promote James Okafor to Engineering Director",
+        "reason_rejected": "James was strong technically but expressed he wasn't seeking a management path — he preferred staying as a senior technical individual contributor."
+      }
+    ],
+    "outcome": "Oliver Mwangi hired April 2023 (actor-013). Yuki retained as Head of Engineering but scope narrowed to technical execution vs. org management — she now reports to Oliver rather than Marcus. Marcus strongly considers this a trust violation and has said so in 1:1s with Sarah. Yuki has remained professional but her engagement scores in anonymous surveys have declined. Still valid as of Q1 2026 but the dynamics it created are a retention risk.",
+    "rationale": "The company needed a VP-level hire with experience managing engineering orgs >30 people as Marcus moved to pure CTO-level focus. Oliver Mwangi had scaled Google UK's fintech engineering team from 25 to 80 people. The external hire was also intended to bring Google-scale engineering practices.",
+    "dissenting_views": [
+      {
+        "person": "actor-002",
+        "view": "Marcus Webb strongly favored promoting Yuki and considered the decision a trust violation. He argued that Yuki was fully capable of growing into the VP role with coaching, and that the external hire sent the wrong signal to the engineering team about career progression. He escalated his objection directly to Sarah but the decision stood."
+      }
+    ],
+    "still_valid": true,
+    "affects_workflows": ["wf-004", "wf-009"],
+    "tags": ["org-design", "engineering", "hiring", "culture", "retention-risk"]
+  },
+  {
+    "id": "dec-011",
+    "title": "Adopted HubSpot for Marketing while keeping Salesforce for Sales",
+    "made_by": ["actor-001", "actor-014"],
+    "made_at": "2022-09-15",
+    "summary": "When Sophie Laurent joined as Head of Marketing in September 2022, she brought a strong preference for HubSpot Marketing Hub. Rather than consolidate on Salesforce, Veridian built a bidirectional HubSpot-Salesforce sync.",
+    "context": "When Sophie was hired, she had run demand gen on HubSpot at her previous company and was unwilling to move to Salesforce Marketing Cloud, which she considered inferior for content-led demand gen. Sales was already committed to Salesforce. The path of least resistance was to run both and sync them.",
+    "alternatives_considered": [
+      {
+        "name": "Consolidate on Salesforce Marketing Cloud",
+        "reason_rejected": "Sophie Laurent rejected this — she had strong HubSpot skills and argued Salesforce Marketing Cloud had a worse UI and required more admin overhead."
+      },
+      {
+        "name": "Consolidate on HubSpot (Marketing + CRM)",
+        "reason_rejected": "Sales team was already using Salesforce with custom CPQ configuration. Migration would have been 3–4 months of work and high risk to pipeline tracking."
+      }
+    ],
+    "outcome": "Both tools deployed. The HubSpot-Salesforce sync has never worked cleanly — lead source data doesn't reliably flow to Salesforce, marketing-influenced pipeline is consistently understated, and paid channel ROI is effectively unmeasurable. Ravi Patel flagged attribution complexity when the decision was made. 18 months later, marketing ROI remains unmeasurable. Sophie has committed to fixing attribution by Q2 2026 (com-014), but the integration work sits with Ben Osei who hasn't scheduled it.",
+    "rationale": "The hire-with-their-stack approach was expedient — Sophie could start contributing immediately without learning a new platform. The longer-term integration cost was underestimated.",
+    "dissenting_views": [
+      {
+        "person": "actor-010",
+        "view": "Ravi Patel flagged attribution complexity at the time of the decision, noting that any multi-tool marketing stack requires perfect bidirectional sync to attribute pipeline correctly. His concern was noted but not acted on. He now has no visibility into which marketing campaigns are generating qualified pipeline."
+      }
+    ],
+    "still_valid": false,
+    "affects_workflows": ["wf-014", "wf-017"],
+    "tags": ["tooling", "marketing", "data-quality", "revisit"]
+  },
+  {
+    "id": "dec-012",
+    "title": "Created dedicated Head of Customer Onboarding role, partially reversing dec-003",
+    "made_by": ["actor-001", "actor-008"],
+    "made_at": "2024-06-01",
+    "summary": "After average onboarding time grew from 3 to 6 weeks following the dissolution of the Onboarding team in 2023, Sarah Chen and Fatima Al-Rashid approved the creation of a dedicated Head of Customer Onboarding role.",
+    "context": "By Q1 2024, data showed that onboarding time had doubled, onboarding NPS had fallen from +42 to +28, and early churn (0–90 day) had increased. The CSMs were visibly stretched. The Onboarding team dissolution in 2023 (dec-003) had been framed as a lean operational decision ahead of Series B — revisiting it publicly would require acknowledging a mistake.",
+    "alternatives_considered": [
+      {
+        "name": "Hire additional CSMs to absorb onboarding load",
+        "reason_rejected": "Onboarding required project management skills, not pure relationship management. More CSMs without a dedicated onboarding process would have the same problem."
+      },
+      {
+        "name": "Build self-serve onboarding tooling instead of hiring",
+        "reason_rejected": "The tooling investment was estimated at 3 months of Engineering time — not available given the tech debt backlog."
+      }
+    ],
+    "outcome": "Wei Zhang hired August 2024 as Head of Customer Onboarding (actor-019). By Q4 2024, onboarding time had recovered to 4 weeks (still longer than the 3-week baseline before dec-003, but significantly improved). The role creation was framed publicly as 'investing in customer experience' rather than as a reversal of dec-003, which Priya Sharma has noted with some frustration.",
+    "rationale": "The cost of extended onboarding (increased early churn, CSM time dilution, NPS decline) exceeded the cost of a dedicated hire. Fatima Al-Rashid, who joined post-dec-003, was the clearest-eyed about this analysis.",
+    "dissenting_views": [
+      {
+        "person": "actor-003",
+        "view": "Priya Sharma was supportive of the hire but felt the framing was dishonest — it acknowledged the mistake operationally without acknowledging it organizationally. She raised this with Fatima directly and was told the public framing was intentional."
+      }
+    ],
+    "still_valid": true,
+    "affects_workflows": ["wf-006", "wf-005"],
+    "tags": ["org-design", "customer-success", "onboarding", "revisit"]
+  }
+]

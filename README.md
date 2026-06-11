@@ -1,36 +1,75 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# AIOS Team Brain
 
-## Getting Started
+Mission control for agentic teamwork. Contributor repos (built on
+[Agentic Team Ops](https://github.com/your-github-org/agentic-team-ops)) sync
+tier-tagged content here via the `aios` CLI; the dashboard surfaces tasks,
+projects, decisions, deliverables, transcripts, and a grounded natural-language
+query over the team's shared memory.
 
-First, run the development server:
+**The pinned API contract lives in the contributor repo:**
+`agentic-team-ops/docs/brain-api.md` (v1). Both repos build against that file.
+
+## Stack
+
+Next.js 16 (App Router) · Supabase (Postgres + Auth, **RLS default-deny on
+every table**) · Claude API (`claude-opus-4-8`) for query · Tailwind v4 with
+Prism Light tokens. Self-host portable: plain SQL migrations, Postgres-backed
+rate limiting, no Vercel-only dependencies.
+
+## Architecture in one paragraph
+
+Members authenticate with magic-link/OAuth (invite-only; admin creates the
+member row, first login links it). Machines authenticate with per-member API
+keys (`aios_<key_id>_<secret>`, sha256-at-rest, shown once). Sync writes go
+through one narrow audited module (`lib/ingest`) using the service role;
+everything the dashboard reads goes through RLS, which enforces access tiers
+(`team` sees all, `external` sees only external; `admin`-tier content is
+rejected at the API with 422 — it never reaches the database, by contract).
+Markdown task/decision tables materialize into structured rows (diff-sync by
+`row_key`; UI-created tasks survive pushes). The query pipeline retrieves
+tier-filtered FTS hits + structured context (decisions, tasks, Company-Graph
+entities) and streams a cited answer; cost guards cap per-member and per-team
+daily spend in `query_log`.
+
+## Local development
 
 ```bash
+npm install
+supabase start                 # local stack on ports 554xx (see supabase/config.toml)
+cp .env.example .env.local     # fill from `supabase status -o env` + your Anthropic key
+npx tsx --conditions react-server scripts/seed-demo.ts   # demo team + Northwind + Veridian graph
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+The seed prints a demo API key once. Use it from a contributor repo:
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+```bash
+export AIOS_API_KEY=aios_…
+aios push          # from an agentic-team-ops scaffolded repo with brain_url set
+aios query "what's blocking sprint 1?"
+```
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## Verification
 
-## Learn More
+`scripts/e2e.sh` runs the full loop: reset → seed (asserts 8 tasks + 20
+decisions materialize through `lib/ingest`) → real `aios push` from a freshly
+scaffolded spoke → idempotent re-push → materialization check → admin-tier 422
+→ pull → live NL query that must ground in the advisory-gates decision.
 
-To learn more about Next.js, take a look at the following resources:
+## API surface (v1)
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+- `POST /api/v1/items` — upsert synced content (Bearer key + `X-AIOS-Team`)
+- `GET  /api/v1/items?since=` — tier-filtered pull, keyset-paginated
+- `GET  /api/v1/tasks?since=` — dashboard task changes for `aios pull` writeback
+- `POST /api/v1/query` — SSE: `delta` / `sources` / `done`
+- `POST /api/dashboard/query` — same pipeline, session-authenticated
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+## Security posture
 
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+RLS default-deny everywhere; helper fns in an unexposed `private` schema;
+`key_hash` column-revoked from clients; audit log append-only (trigger-backed);
+rate limits in Postgres; the service-role path is confined to `lib/ingest` +
+route handlers and audited on every write. Known accepted risk: sync writes
+bypass RLS by design (machine auth) — mitigated by the narrow module and the
+contract-level tier rejection; a `security definer` ingest function is the
+post-MVP hardening step.

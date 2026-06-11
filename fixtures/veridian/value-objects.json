@@ -1,0 +1,162 @@
+[
+  {
+    "id": "vo-001",
+    "type": "product",
+    "name": "Veridian Platform",
+    "description": "The core SaaS product: a workflow automation and orchestration platform designed for mid-market finance teams. Deployed as a multi-tenant cloud application on AWS. Current version: 4.2. Customers manage, automate, and audit their financial workflows entirely within the platform.",
+    "owner": "actor-004",
+    "business_value": "Primary revenue driver. All 89 active customers use it. ARR: £8.2M as of Q4 2025. NRR: 112% (up from 108% last year, recovering toward the 118% peak two years ago).",
+    "connected_workflows": ["wf-003", "wf-004", "wf-009", "wf-011"],
+    "health_status": "stable",
+    "metadata": {
+      "launched": "2019-06",
+      "tech_stack": ["React", "Node.js", "PostgreSQL", "AWS", "Terraform"],
+      "test_coverage_percent": 34,
+      "incident_count_q4_2025": 3,
+      "active_customers": 89
+    }
+  },
+  {
+    "id": "vo-002",
+    "type": "customer",
+    "name": "Hartfield Group",
+    "description": "Enterprise customer. A UK-based asset management firm with £12B AUM. Uses Veridian for fund accounting workflow automation across 4 teams. Their Head of Finance (Richard Hartfield) is the primary executive sponsor. Technically sophisticated — their IT team has raised SSO as a security requirement repeatedly.",
+    "owner": "actor-009",
+    "business_value": "ARR: £184,000/year. Highest single-account ARR in portfolio. At-risk due to SSO commitment breach. If churned, represents 2.2% ARR loss and a likely negative case study given Richard Hartfield's industry connections.",
+    "connected_workflows": ["wf-006", "wf-013"],
+    "health_status": "at_risk",
+    "metadata": {
+      "contract_start": "2022-01-15",
+      "last_renewal": "2024-11-01",
+      "next_renewal": "2026-10-31",
+      "nps_last_quarter": 22,
+      "open_commitments": ["com-001", "com-009"],
+      "csm": "actor-009"
+    }
+  },
+  {
+    "id": "vo-003",
+    "type": "customer",
+    "name": "Meridian Capital",
+    "description": "Enterprise customer. A mid-market private equity firm using Veridian for portfolio company reporting automation. Currently expanding their use case from 2 teams to 5, which triggered the contract upsell from £84K to £140K ARR. Their Finance Director is enthusiastic about the platform.",
+    "owner": "actor-009",
+    "business_value": "ARR: £84,000/year, expanding to £140,000 on renewal. Expansion customer — high retention probability. Two untracked commitments (custom dashboard, CSV export) are latent risks at renewal.",
+    "connected_workflows": ["wf-013"],
+    "health_status": "expanding",
+    "metadata": {
+      "contract_start": "2023-06-01",
+      "last_renewal": "2025-06-01",
+      "next_renewal": "2026-05-31",
+      "nps_last_quarter": 68,
+      "open_commitments": ["com-002", "com-011"],
+      "csm": "actor-009"
+    }
+  },
+  {
+    "id": "vo-004",
+    "type": "customer",
+    "name": "Solaris Financial",
+    "description": "Enterprise customer. A specialist financial services firm (wealth management + corporate treasury). Recently renewed at a 15% uplift. The dedicated CSM commitment was the deciding factor in their renewal. Currently being served by Chloe Beaumont on a temporary basis while a new CSM is hired.",
+    "owner": "actor-009",
+    "business_value": "ARR: £96,000/year (renewed at 15% uplift from £83,500). Stable. Risk: if dedicated CSM is not in place soon, renewal goodwill may erode.",
+    "connected_workflows": ["wf-013"],
+    "health_status": "stable",
+    "metadata": {
+      "contract_start": "2021-09-01",
+      "last_renewal": "2026-01-01",
+      "next_renewal": "2026-12-31",
+      "nps_last_quarter": 54,
+      "open_commitments": ["com-005"],
+      "csm": "actor-009"
+    }
+  },
+  {
+    "id": "vo-005",
+    "type": "product_module",
+    "name": "Finance Workflow Engine",
+    "description": "The core product module that powers financial workflow automation — reconciliation rules, approval chains, audit trails, and GL mapping. The highest-complexity and highest-revenue component of the Veridian Platform. 80% of customer workflows run through this module.",
+    "owner": "actor-007",
+    "business_value": "Powers the workflows that drive 80%+ of customer value. Technical debt in this module was a primary driver of the Q1 2026 engineering freeze. Test coverage at 34% (target: 70% by end of Q1 2026). Any instability here directly threatens top-tier customer accounts.",
+    "connected_workflows": ["wf-001", "wf-008", "wf-009"],
+    "health_status": "degraded",
+    "metadata": {
+      "code_age_years": 5,
+      "test_coverage_percent": 34,
+      "last_major_refactor": "2022-08",
+      "incident_attribution_percent": 65,
+      "primary_engineer": "actor-007"
+    }
+  },
+  {
+    "id": "vo-006",
+    "type": "internal_data_asset",
+    "name": "Customer Data Platform",
+    "description": "Internal data infrastructure built on BigQuery + dbt + Looker. Aggregates customer usage data, product telemetry, Salesforce CRM data, and Intercom support data into a single analytical layer. Used by CS for account health scoring and by Product for usage analytics.",
+    "owner": "actor-011",
+    "business_value": "Enables data-driven account health scoring, usage-based expansion signals, and the Looker dashboards that CS uses in renewal and QBR conversations. Data quality issues in this platform directly degrade CS effectiveness.",
+    "connected_workflows": ["wf-010", "wf-013", "wf-007"],
+    "health_status": "stable",
+    "metadata": {
+      "tables_count": 87,
+      "dbt_models_count": 134,
+      "data_freshness_sla_hours": 4,
+      "known_data_quality_issues": 12,
+      "looker_dashboards": 23,
+      "primary_consumers": ["actor-003", "actor-009", "actor-010"]
+    }
+  },
+  {
+    "id": "vo-007",
+    "type": "internal_knowledge_asset",
+    "name": "Engineering Runbook Library",
+    "description": "A Notion-hosted collection of operational runbooks for Engineering incident response, deployment procedures, and infrastructure operations. Currently covers approximately 60% of known incident types. Identified as a critical gap in the Q1 2026 tech debt freeze plan.",
+    "owner": "actor-005",
+    "business_value": "Reduces MTTR and on-call burden. Incomplete coverage means incidents take longer to resolve and knowledge is trapped in senior engineers' heads. Building this out is a Q1 2026 commitment.",
+    "connected_workflows": ["wf-007", "wf-011"],
+    "health_status": "degraded",
+    "metadata": {
+      "total_runbooks": 34,
+      "coverage_estimate_percent": 60,
+      "last_updated": "2025-11-15",
+      "update_cadence": "ad hoc",
+      "target_coverage_q2_2026": 90
+    }
+  },
+  {
+    "id": "vo-008",
+    "type": "capital_asset",
+    "name": "Series B Funding",
+    "description": "The £38M Series B raised in November 2023. Investors: Northwood Ventures (lead), Apex Capital (follow-on). Remaining runway approximately 28 months as of Q1 2026. The company is targeting Series C in H2 2026 — needs a £12M+ ARR narrative.",
+    "owner": "actor-001",
+    "business_value": "Primary financial resource constraining all major hiring and investment decisions. Burn rate: approximately £980K/month (higher than Series B baseline due to 150-person headcount). Series C timeline is directly linked to ARR growth — current £8.2M ARR trajectory needs to show £12M+ ARR to support a credible Series C narrative.",
+    "connected_workflows": ["wf-001", "wf-012"],
+    "health_status": "stable",
+    "metadata": {
+      "amount_gbp": 38000000,
+      "raised_date": "2023-11-01",
+      "lead_investor": "Northwood Ventures",
+      "monthly_burn_gbp": 980000,
+      "runway_months": 28,
+      "series_c_target_date": "2026-H2",
+      "series_c_arr_target_gbp": 12000000
+    }
+  },
+  {
+    "id": "vo-009",
+    "type": "internal_knowledge_asset",
+    "name": "Sales Commitment Log",
+    "description": "Informal record of customer commitments made during sales cycles. Currently maintained as a personal Notion document by Chloe Beaumont in CS — not a company-owned system. Incomplete and not integrated with Salesforce or Linear.",
+    "owner": "actor-009",
+    "business_value": "This is a critical institutional memory gap. Three customer commitments (com-001, com-002, com-011) were either made without Engineering knowledge or tracked only informally. A proper commitment tracking system was scoped (dec-009) but deferred. This document is a single point of failure.",
+    "connected_workflows": ["wf-010", "wf-013", "wf-014"],
+    "health_status": "at_risk",
+    "metadata": {
+      "format": "Notion database",
+      "maintained_by": "actor-009",
+      "completeness_estimate": "60-70%",
+      "integration_with_salesforce": false,
+      "integration_with_linear": false,
+      "created": "2024-03-01"
+    }
+  }
+]

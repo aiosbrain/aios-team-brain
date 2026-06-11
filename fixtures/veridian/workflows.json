@@ -1,0 +1,539 @@
+[
+  {
+    "id": "wf-001",
+    "name": "Month-End Financial Close",
+    "owner": "actor-006",
+    "job_family": "Finance",
+    "trigger": "Last business day of each month",
+    "output": "Board-ready P&L, balance sheet, and cash flow statement; variance commentary",
+    "steps": [
+      "Export raw transaction data from Xero",
+      "Cross-reference Salesforce revenue records against Xero invoices",
+      "Manually reconcile any mismatches in Google Sheets",
+      "Categorize uncommitted expenses and accruals",
+      "Run payroll reconciliation against Rippling",
+      "Build management pack in Google Slides",
+      "Review draft with CFO (Sarah, acting CFO)",
+      "Submit final to board portal by day 5 of following month"
+    ],
+    "tools_used": ["Xero", "Salesforce", "Google Sheets", "Rippling", "Google Slides", "Notion"],
+    "avg_time_hours": 38,
+    "pain_points": [
+      "Manual Xero→Salesforce reconciliation takes 12+ hours alone",
+      "No single source of truth for revenue recognition — two competing spreadsheets",
+      "Payroll reconciliation requires manual Rippling export; no API connection",
+      "Variance commentary written from scratch every month; no template memory",
+      "Month-end often delayed by late expense submissions from Engineering"
+    ],
+    "ai_readiness_score": 8,
+    "ai_candidate": true,
+    "ai_opportunity_summary": "High-ROI candidate for AI-assisted reconciliation. The Xero→Salesforce matching step is pattern-heavy and rule-based — a good fit for automated anomaly detection and auto-categorization. Variance commentary drafting is a strong LLM use case (structured input → narrative output). Estimated time savings: 15–20 hours/month. Kwame Asante (actor-020) is the primary beneficiary."
+  },
+  {
+    "id": "wf-002",
+    "name": "Customer Support Ticket Triage",
+    "owner": "actor-003",
+    "job_family": "Customer Success",
+    "trigger": "Inbound ticket creation in Intercom",
+    "output": "Triaged ticket with priority, assigned CSM, estimated resolution time, and initial response sent",
+    "steps": [
+      "Ticket arrives via Intercom (email, in-app, or Slack)",
+      "CSM manually reviews ticket content",
+      "Classify by type: bug, feature request, question, or escalation",
+      "Assign severity (P1–P4) based on account tier and business impact",
+      "Route to appropriate CSM based on account ownership",
+      "Send acknowledgment response to customer",
+      "If P1/P2: escalate to Engineering via Linear ticket",
+      "Log ticket in Salesforce against account record"
+    ],
+    "tools_used": ["Intercom", "Salesforce", "Linear", "Slack", "Notion"],
+    "avg_time_hours": 0.75,
+    "pain_points": [
+      "No automated classification — every ticket manually reviewed",
+      "Severity rubric lives in a Notion doc, not enforced",
+      "Routing to correct CSM requires tribal knowledge of account ownership",
+      "Duplicate tickets common — no deduplication step",
+      "Intercom→Salesforce sync has known data quality issues (Ben Osei owns the integration)",
+      "A previous AI pilot for this workflow failed in 2024 — team is wary"
+    ],
+    "ai_readiness_score": 6,
+    "ai_candidate": true,
+    "ai_opportunity_summary": "Moderate-difficulty AI use case. Classification and initial routing are automatable, but the failed 2024 AI pilot (wrong tool, low adoption) means change management is as important as the technology. Recommend starting with AI-suggested triage labels rather than fully automated routing. Data quality in Intercom must be cleaned up first — fix Ben Osei's integration issues before layering AI on top."
+  },
+  {
+    "id": "wf-003",
+    "name": "Product Spec to Linear Ticket",
+    "owner": "actor-004",
+    "job_family": "Product",
+    "trigger": "Product spec document completed and approved in Notion",
+    "output": "Structured Linear tickets (epics + stories) with acceptance criteria, estimates, and correct project assignment",
+    "steps": [
+      "PM writes feature spec in Notion using standard template",
+      "Spec reviewed in weekly product review meeting",
+      "PM manually creates Epic in Linear",
+      "PM breaks spec into user stories and creates child tickets",
+      "PM assigns story points (requires Engineering input)",
+      "PM sets project, milestone, and assignee",
+      "Engineering lead reviews ticket set and adds technical notes",
+      "Tickets move to 'Ready for Sprint' queue"
+    ],
+    "tools_used": ["Notion", "Linear", "Slack", "Figma"],
+    "avg_time_hours": 4,
+    "pain_points": [
+      "Ticket creation from spec is repetitive and time-consuming",
+      "Acceptance criteria often inconsistent in format",
+      "Story point estimates require a synchronous meeting",
+      "Links between spec documents and Linear tickets break frequently",
+      "No automated check that spec template sections are completed"
+    ],
+    "ai_readiness_score": 9,
+    "ai_candidate": true,
+    "ai_opportunity_summary": "Very strong AI candidate. Spec-to-ticket generation is a well-defined transformation task: structured Notion document → structured Linear ticket hierarchy. An LLM can draft tickets, generate acceptance criteria in Given/When/Then format, and suggest story breakdowns. This is one of the highest-leverage AI use cases in the product workflow — estimated 3 hours saved per spec cycle."
+  },
+  {
+    "id": "wf-004",
+    "name": "Engineering Code Review",
+    "owner": "actor-005",
+    "job_family": "Engineering",
+    "trigger": "Pull request opened in GitHub",
+    "output": "Reviewed, approved, and merged pull request with passing CI",
+    "steps": [
+      "Engineer opens PR against main branch",
+      "CI pipeline runs automatically (lint, tests, security scan)",
+      "PR auto-assigned to reviewer based on CODEOWNERS",
+      "Reviewer reads diff and leaves inline comments",
+      "Engineer addresses feedback",
+      "Second reviewer approves if changes are substantial",
+      "PR merged after 2 approvals and green CI"
+    ],
+    "tools_used": ["GitHub", "Linear", "Slack", "Datadog"],
+    "avg_time_hours": 3.5,
+    "pain_points": [
+      "Review queue builds up on Fridays — PRs sit unreviewed over weekend",
+      "No standard checklist — review quality is inconsistent",
+      "Large PRs (>500 lines) are rubber-stamped rather than thoroughly reviewed",
+      "Context on 'why' for a change often missing from PR descriptions",
+      "CODEOWNERS file has not been updated since 2023 — many orphaned areas"
+    ],
+    "ai_readiness_score": 7,
+    "ai_candidate": true,
+    "ai_opportunity_summary": "Good candidate for AI-assisted first-pass review (automated comments on style, test coverage, and obvious issues). LLMs can also auto-generate PR summaries and flag large diffs for human attention. Reduces reviewer cognitive load without replacing human judgment. GitHub Copilot code review feature is a low-friction entry point."
+  },
+  {
+    "id": "wf-005",
+    "name": "Sales Handoff to Customer Success",
+    "owner": "actor-010",
+    "job_family": "Sales",
+    "trigger": "Opportunity marked 'Closed Won' in Salesforce",
+    "output": "CS team briefed on new customer; onboarding kickoff scheduled within 5 business days",
+    "steps": [
+      "AE marks opportunity Closed Won in Salesforce",
+      "AE fills out internal handoff form in Notion (often skipped)",
+      "Salesforce automation triggers Slack notification to CS channel",
+      "CS manager assigns CSM to account",
+      "AE and CSM join 30-min handoff call",
+      "CSM creates customer folder in Notion",
+      "CSM sends kickoff scheduling email to customer",
+      "Onboarding kickoff call scheduled"
+    ],
+    "tools_used": ["Salesforce", "Notion", "Slack", "Google Calendar", "Google Workspace"],
+    "avg_time_hours": 2.5,
+    "pain_points": [
+      "AEs frequently skip the handoff form — CS enters onboarding blind",
+      "Customer commitments made during sales cycle not systematically captured",
+      "No standard way to transfer deal context (pain points, champion, blockers)",
+      "CSM assignment is ad hoc — no workload balancing system",
+      "Time-to-kickoff varies wildly: 2 days to 3 weeks"
+    ],
+    "ai_readiness_score": 7,
+    "ai_candidate": true,
+    "ai_opportunity_summary": "AI can auto-generate the handoff summary from Salesforce opportunity data, email threads, and call transcripts (if Gong is integrated). The commitment extraction step — identifying promises made during sales — is a particularly valuable LLM use case given Veridian's known gap here."
+  },
+  {
+    "id": "wf-006",
+    "name": "Customer Onboarding",
+    "owner": "actor-019",
+    "job_family": "Customer Success",
+    "trigger": "Onboarding kickoff call completed",
+    "output": "Customer live on Veridian platform with configured workflows, trained admin users, and signed off on success criteria",
+    "steps": [
+      "Kickoff call: align on success criteria and timeline",
+      "Technical setup: provision workspace, configure SSO if applicable",
+      "Data migration: import customer's existing workflow templates",
+      "Admin training session (2-hour call)",
+      "End-user training session",
+      "Parallel run period: customer uses both old and Veridian systems",
+      "Go-live sign-off from customer admin",
+      "30-day check-in scheduled"
+    ],
+    "tools_used": ["Intercom", "Notion", "Google Workspace", "Salesforce", "Slack"],
+    "avg_time_hours": 40,
+    "pain_points": [
+      "SSO setup is manual and error-prone — no self-serve option (Hartfield commitment)",
+      "Data migration requires Engineering involvement for non-standard formats",
+      "Training content not updated since 2023; screenshots out of date",
+      "Success criteria defined inconsistently across accounts",
+      "Average onboarding time was 6 weeks before Wei Zhang was hired; now recovering to 4 weeks"
+    ],
+    "ai_readiness_score": 5,
+    "ai_candidate": true,
+    "ai_opportunity_summary": "Medium-term AI opportunity. Near-term wins: auto-generate onboarding plan from customer profile, AI-powered chatbot for end-user training questions. Longer term: intelligent workflow migration tool that maps customer's existing processes to Veridian templates. Blocked by data quality and SSO infrastructure gaps. Wei Zhang's dedicated ownership (actor-019) is a prerequisite for any AI augmentation to land."
+  },
+  {
+    "id": "wf-007",
+    "name": "Data Pipeline Monitoring & Incident Response",
+    "owner": "actor-011",
+    "job_family": "Engineering",
+    "trigger": "Automated Datadog alert OR manual report of data anomaly",
+    "output": "Incident resolved; root cause documented; postmortem filed in Notion",
+    "steps": [
+      "Alert fires in Datadog or issue reported in #data-alerts Slack channel",
+      "On-call engineer acknowledges alert within 15 minutes",
+      "Initial triage: determine scope and affected downstream systems",
+      "Incident channel opened in Slack if P1/P2",
+      "Root cause investigation using Datadog and dbt logs",
+      "Fix deployed or pipeline paused to prevent data corruption",
+      "Downstream teams notified of resolution",
+      "Postmortem written and reviewed within 48 hours"
+    ],
+    "tools_used": ["Datadog", "dbt", "Airflow", "BigQuery", "Slack", "PagerDuty", "Notion"],
+    "avg_time_hours": 4.5,
+    "pain_points": [
+      "Runbook library is incomplete — 40% of incident types lack documented procedures",
+      "On-call rotation has been 3 engineers covering a 45-person engineering team",
+      "Root cause analysis often identifies same issues recurring — no feedback loop to prevent",
+      "Postmortem quality varies — no enforcement",
+      "Customer-facing data issues discovered by CSMs before Engineering (embarrassing)"
+    ],
+    "ai_readiness_score": 7,
+    "ai_candidate": true,
+    "ai_opportunity_summary": "Strong candidate for AI-assisted incident classification and runbook suggestion. Given the known gap in runbook coverage, an LLM that can suggest investigative steps from alert context could significantly reduce MTTR. Postmortem generation from Slack thread and logs is a mature use case. Requires Datadog MCP integration."
+  },
+  {
+    "id": "wf-008",
+    "name": "Invoice Reconciliation",
+    "owner": "actor-006",
+    "job_family": "Finance",
+    "trigger": "Weekly, every Monday at 09:00 GMT",
+    "output": "Reconciled invoice ledger; outstanding invoices flagged for follow-up; payment confirmations logged",
+    "steps": [
+      "Export invoice report from Xero (PDF + CSV)",
+      "Cross-check against Salesforce closed-won dates and contract values",
+      "Identify invoices >30 days overdue",
+      "Draft chaser emails for overdue invoices (manual)",
+      "Update payment status in Xero when bank confirms receipt",
+      "Flag any discrepancies between contract value and invoiced amount",
+      "Weekly summary report to Nadia and Sarah"
+    ],
+    "tools_used": ["Xero", "Salesforce", "Google Sheets", "Gmail"],
+    "avg_time_hours": 6,
+    "pain_points": [
+      "Contract values in Salesforce frequently don't match Xero invoice amounts due to amendments",
+      "Overdue chaser emails written manually — no templates, inconsistent tone",
+      "No automated payment matching — bank feed requires manual reconciliation",
+      "Revenue recognition timing disputes between Sales and Finance on multi-year deals",
+      "Escalation path for disputed invoices unclear"
+    ],
+    "ai_readiness_score": 8,
+    "ai_candidate": true,
+    "ai_opportunity_summary": "High-value AI target. Automated matching between Xero and Salesforce records, AI-drafted chaser emails with appropriate tone calibration by account tier, and anomaly flagging on contract vs. invoice discrepancies. Near-term win available with minimal infrastructure change — could be Veridian's first live AI workflow. Kwame Asante (actor-020) is the daily operator."
+  },
+  {
+    "id": "wf-009",
+    "name": "Engineering Sprint Planning",
+    "owner": "actor-013",
+    "job_family": "Engineering",
+    "trigger": "Bi-weekly, Monday of sprint start",
+    "output": "Committed sprint backlog with accepted tickets, capacity plan, and team assignments",
+    "steps": [
+      "Engineering lead reviews 'Ready for Sprint' queue in Linear",
+      "Capacity check: confirm engineer availability for sprint",
+      "Priority stack-rank tickets with Product lead (Tom)",
+      "Engineers pull tickets and estimate in planning call",
+      "Sprint goal defined and written into Linear",
+      "Tickets assigned; sprint kicked off",
+      "Board synced to all team leads via Slack"
+    ],
+    "tools_used": ["Linear", "Slack", "Notion", "Google Calendar"],
+    "avg_time_hours": 3,
+    "pain_points": [
+      "Ticket quality is inconsistent — many enter planning without clear acceptance criteria",
+      "Capacity calculation is manual (spreadsheet) and error-prone",
+      "Context from previous sprint retrospective not systematically surfaced",
+      "Tech debt tickets regularly deprioritized in favor of feature work (until Q1 2026 freeze)",
+      "Remote team timezone spread (London, Tokyo, Nairobi, Bangalore, Accra, Madrid) makes synchronous planning hard with 45 engineers across 5 squads"
+    ],
+    "ai_readiness_score": 6,
+    "ai_candidate": true,
+    "ai_opportunity_summary": "AI can assist with capacity planning automation and ticket quality checks (flag tickets missing acceptance criteria). Sprint retrospective summarization and carry-forward context are strong LLM use cases. Does not require major infrastructure changes. Ownership of this workflow moved from Yuki to Oliver (actor-013) as part of the VP Engineering hire."
+  },
+  {
+    "id": "wf-010",
+    "name": "Quarterly Business Review (QBR) Prep",
+    "owner": "actor-004",
+    "job_family": "Product",
+    "trigger": "6 weeks before end of each quarter",
+    "output": "QBR deck; account health summaries; renewal risk register; roadmap update for top accounts",
+    "steps": [
+      "CS pulls account health data from Salesforce and Looker",
+      "Product compiles roadmap progress against committed items",
+      "Finance prepares revenue and ARR summary by account",
+      "CS managers write narrative account health summaries (one per top-tier account)",
+      "Product identifies roadmap commitments at risk due to tech debt freeze",
+      "Draft deck assembled in Google Slides",
+      "Review with Sarah and Fatima",
+      "QBR calls conducted with top-10 accounts"
+    ],
+    "tools_used": ["Salesforce", "Looker", "Google Slides", "Notion", "Google Workspace"],
+    "avg_time_hours": 20,
+    "pain_points": [
+      "No single source of truth for account commitments — Chloe's personal Notion doc is the primary tracker",
+      "Product roadmap progress is manually compiled — no automated Linear → deck pipeline",
+      "Account health narratives written from scratch each quarter; prior QBR notes not surfaced",
+      "Finance ARR data often 1-2 weeks stale due to delayed close",
+      "Identifying which roadmap items were committed to which customer requires manual investigation"
+    ],
+    "ai_readiness_score": 7,
+    "ai_candidate": true,
+    "ai_opportunity_summary": "AI-assisted QBR prep is a high-visibility, high-value use case — directly affects customer retention. Auto-generating account health summaries from Salesforce + Looker data, surfacing prior QBR commitments, and drafting roadmap progress narratives are all strong LLM applications. This workflow most directly illustrates the Company Graph value proposition."
+  },
+  {
+    "id": "wf-011",
+    "name": "Production Incident Response",
+    "owner": "actor-005",
+    "job_family": "Engineering",
+    "trigger": "P1/P2 alert from Datadog OR customer-reported outage",
+    "output": "Incident resolved; customer communications sent; postmortem filed within 5 business days",
+    "steps": [
+      "Alert acknowledged by on-call engineer (target: <5 min for P1)",
+      "Incident severity assessed; P1 pages Yuki and Marcus",
+      "Incident Slack channel created (#incident-YYYYMMDD-description)",
+      "Customer-facing status page updated within 15 minutes of P1 declaration",
+      "Root cause investigation begins; timeline documented in channel",
+      "Fix deployed and verified",
+      "All-clear posted to status page and affected customers notified by CS",
+      "Postmortem scheduled within 24 hours"
+    ],
+    "tools_used": ["Datadog", "PagerDuty", "Slack", "GitHub", "Statuspage", "Intercom"],
+    "avg_time_hours": 6,
+    "pain_points": [
+      "On-call coverage is thin — same 3–4 engineers rotated for 18 months",
+      "Customer communication drafting during incidents handled inconsistently",
+      "Postmortems filed >5 days late 60% of the time",
+      "No blameless postmortem culture — engineers avoid filing thorough postmortems",
+      "Action items from postmortems not tracked in Linear — they die in Notion"
+    ],
+    "ai_readiness_score": 6,
+    "ai_candidate": true,
+    "ai_opportunity_summary": "AI can draft customer-facing incident communications in real time from technical Slack thread context. Postmortem generation from incident timeline is a well-documented LLM use case. Action item extraction and Linear ticket creation from postmortem text closes the loop that currently breaks."
+  },
+  {
+    "id": "wf-012",
+    "name": "Annual Strategic Planning",
+    "owner": "actor-001",
+    "job_family": "Executive Leadership",
+    "trigger": "October 1 each year (target: plan finalized by December 1)",
+    "output": "Annual company plan with OKRs, headcount plan, budget allocation, and product roadmap themes",
+    "steps": [
+      "CEO sets strategic context doc (what changed, what didn't)",
+      "Each function head submits 3-year department vision",
+      "Finance builds revenue model scenarios (base/bull/bear)",
+      "HR models headcount plan against budget",
+      "Product and Engineering align on annual roadmap themes",
+      "Offsite: 2-day leadership team planning session",
+      "OKRs cascaded to team level",
+      "All-hands presentation of annual plan"
+    ],
+    "tools_used": ["Notion", "Google Slides", "Google Sheets", "Slack"],
+    "avg_time_hours": 80,
+    "pain_points": [
+      "Prior year learnings not systematically surfaced — same debates recur annually",
+      "OKRs defined but not connected to workflows or commitments — orphaned shortly after all-hands",
+      "No mechanism to track which strategic decisions led to which outcomes",
+      "Department visions written in isolation — misalignments discovered late in process",
+      "Budget allocation process opaque to most team leads"
+    ],
+    "ai_readiness_score": 5,
+    "ai_candidate": false,
+    "ai_opportunity_summary": "AI value here is in synthesis and institutional memory — surfacing prior year decisions, identifying recurring debates, and connecting OKRs to operational commitments. Not a near-term automation target, but a strong case for Company Graph: this is exactly the workflow that degrades without structured institutional memory."
+  },
+  {
+    "id": "wf-013",
+    "name": "Contract Renewal Management",
+    "owner": "actor-003",
+    "job_family": "Customer Success",
+    "trigger": "90 days before contract end date (Salesforce renewal alert)",
+    "output": "Renewal signed or churn decision made; updated contract in Salesforce; finance notified",
+    "steps": [
+      "Salesforce triggers 90-day renewal alert",
+      "CSM reviews account health: usage, NPS, open commitments",
+      "CSM prepares renewal business case (value delivered, roadmap items)",
+      "Commercial negotiation with customer",
+      "Legal review if terms change (Imogen Walsh, actor-016)",
+      "DocuSign sent and signed",
+      "Updated contract uploaded to Salesforce",
+      "Finance notified for revenue recognition update"
+    ],
+    "tools_used": ["Salesforce", "DocuSign", "Notion", "Google Workspace", "Looker"],
+    "avg_time_hours": 12,
+    "pain_points": [
+      "No structured view of open commitments per account — CSM must manually piece together",
+      "Usage data in Looker not always current at time of renewal prep",
+      "Renewal business case written from scratch each time — no template or prior version",
+      "Legal review turnaround time unpredictable (2 days to 3 weeks — Imogen Walsh is the bottleneck)",
+      "Commitment status for renewal accounts surfaced too late — some commitments discovered broken at renewal call"
+    ],
+    "ai_readiness_score": 7,
+    "ai_candidate": true,
+    "ai_opportunity_summary": "High-value AI use case tied directly to revenue retention. AI can auto-generate renewal health summaries, surface all open and historical commitments per account, and draft the renewal business case narrative. Commitment status surfacing is the highest-ROI step — prevents surprise conversations at renewal calls."
+  },
+  {
+    "id": "wf-014",
+    "name": "New Business Sales Process",
+    "owner": "actor-010",
+    "job_family": "Sales",
+    "trigger": "Qualified lead enters CRM (MQL threshold met)",
+    "output": "Signed contract and Closed Won opportunity in Salesforce",
+    "steps": [
+      "SDR qualifies inbound lead or outbound prospect",
+      "Discovery call: pain, process, budget, authority, timeline",
+      "Technical demo (AE + Carlos Mendez, Solutions Engineering)",
+      "Proposal generated from Salesforce CPQ",
+      "Security review if customer requires it (Carlos + Imogen Walsh)",
+      "Negotiation and legal review",
+      "DocuSign sent; contract signed",
+      "Opportunity marked Closed Won; handoff to CS initiated"
+    ],
+    "tools_used": ["Salesforce", "Outreach", "ZoomInfo", "DocuSign", "Google Workspace"],
+    "avg_time_hours": 120,
+    "pain_points": [
+      "No formal process for capturing commitments made during sales — verbal agreements not logged",
+      "Proposal generation from CPQ is slow — custom pricing common for enterprise deals",
+      "Security review not standardized — Carlos answers same questions from scratch each time, no answer library",
+      "Legal review turnaround (Imogen Walsh) is the #1 deal-slippage driver according to Ravi Patel",
+      "AEs make product commitments to close deals that Engineering doesn't know about"
+    ],
+    "ai_readiness_score": 6,
+    "ai_candidate": true,
+    "ai_opportunity_summary": "AI can assist with proposal personalization, security questionnaire auto-completion, and — most valuably — commitment extraction from sales call transcripts. The security questionnaire use case is immediately actionable: Carlos Mendez has enough institutional knowledge to seed an answer library that an LLM can query and draft from."
+  },
+  {
+    "id": "wf-015",
+    "name": "Cross-Functional Quarterly Planning",
+    "owner": "actor-008",
+    "job_family": "Executive Leadership",
+    "trigger": "2 weeks before quarter start",
+    "output": "Agreed quarter priorities per function; cross-functional commitments documented; capacity conflicts resolved",
+    "steps": [
+      "Fatima circulates planning template to all function heads",
+      "Each function submits top 5 priorities and resource requirements",
+      "Fatima identifies conflicts and dependencies",
+      "2-hour planning call with all function heads",
+      "Conflicts resolved; cross-functional commitments made",
+      "Summary doc published in Notion",
+      "OKRs updated to reflect Q priorities"
+    ],
+    "tools_used": ["Notion", "Google Workspace", "Slack"],
+    "avg_time_hours": 10,
+    "pain_points": [
+      "Commitments made in the planning call not systematically tracked",
+      "Prior quarter commitments not reviewed at start of next planning cycle",
+      "Cross-functional dependencies identified too late",
+      "Output doc in Notion is rarely referenced after week 1",
+      "No accountability mechanism for broken internal commitments"
+    ],
+    "ai_readiness_score": 4,
+    "ai_candidate": false,
+    "ai_opportunity_summary": "The planning workflow itself is a human coordination problem, not an automation target. However, this is exactly the workflow that would benefit most from a Company Graph: surfacing prior commitments, tracking follow-through, and connecting cross-functional dependencies. The graph is the solution here, not an AI model."
+  },
+  {
+    "id": "wf-016",
+    "name": "Security & Compliance Review",
+    "owner": "actor-016",
+    "job_family": "Legal",
+    "trigger": "Enterprise deal >£50K OR customer-initiated security questionnaire received",
+    "output": "Completed security questionnaire; signed DPA/addendum if required; deal cleared for legal execution",
+    "steps": [
+      "Sales (Carlos Mendez) flags security review requirement in Salesforce",
+      "Imogen Walsh assigned as legal reviewer",
+      "Customer security questionnaire received (usually PDF or web form)",
+      "Carlos and Imogen work through questionnaire collaboratively",
+      "Engineering consulted for technical architecture questions (typically James Okafor or Dev Anand)",
+      "Legal addendum drafted if terms require it",
+      "Completed questionnaire returned to customer",
+      "Deal cleared to proceed to commercial negotiation"
+    ],
+    "tools_used": ["Notion", "DocuSign", "Google Workspace", "Slack"],
+    "avg_time_hours": 18,
+    "pain_points": [
+      "Each customer has a different questionnaire format — no standardization",
+      "No answer library: the same questions (data residency, encryption, access controls, SOC 2) are answered from scratch each time",
+      "Legal turnaround is the #1 reason deals slip according to Ravi Patel — ranges 2 days to 3 weeks",
+      "Engineering pulled in ad hoc with no scheduling — disrupts sprint work",
+      "No audit trail of previous answers — Carlos and Imogen hold institutional knowledge in their heads"
+    ],
+    "ai_readiness_score": 7,
+    "ai_candidate": true,
+    "ai_opportunity_summary": "High-value AI use case with a clear starting point: build a security answer library from Veridian's previous questionnaire responses (Carlos Mendez has most of these), then use an LLM to draft responses to new questionnaires by matching questions to the library. Carlos estimates 60%+ of questions across customers are identical or near-identical. Reduces Imogen's review time significantly and removes Engineering from the critical path for most reviews."
+  },
+  {
+    "id": "wf-017",
+    "name": "Marketing Campaign Performance Review",
+    "owner": "actor-014",
+    "job_family": "Marketing",
+    "trigger": "Monthly, first Monday",
+    "output": "Campaign performance summary; channel ROI analysis; recommendations for next month budget allocation",
+    "steps": [
+      "Sophie pulls campaign data from HubSpot Marketing Hub",
+      "Sophie pulls pipeline and closed-won data from Salesforce",
+      "Attempt to join HubSpot lead source data with Salesforce opportunity data",
+      "Pull paid channel spend data (LinkedIn, Google) from respective ad platforms",
+      "Pull content analytics from HubSpot and Notion",
+      "Manually assemble in Google Sheets",
+      "Write narrative commentary",
+      "Present to Sarah and Fatima in monthly marketing review"
+    ],
+    "tools_used": ["HubSpot Marketing", "Salesforce", "Google Sheets", "Slack", "Canva"],
+    "avg_time_hours": 8,
+    "pain_points": [
+      "HubSpot and Salesforce are not properly synced — lead source data in HubSpot doesn't reliably join to closed deals in Salesforce",
+      "No attribution from campaign to closed deal — paid channel ROI is effectively unmeasurable",
+      "Content performance metrics scattered across HubSpot, Notion, and LinkedIn native analytics",
+      "Marketing-sourced pipeline is consistently understated because Sales reps don't update lead source in Salesforce",
+      "Report is assembled manually every month with no template memory — same structure built from scratch"
+    ],
+    "ai_readiness_score": 6,
+    "ai_candidate": true,
+    "ai_opportunity_summary": "The attribution gap is a data infrastructure problem before it's an AI problem — the HubSpot-Salesforce sync must be fixed first (Ben Osei's work, tracked in com-014). Once data quality improves, AI can build a multi-touch attribution model and auto-generate the monthly performance narrative from structured inputs. Near-term win: AI-assisted narrative drafting from whatever data currently exists, even if attribution is incomplete."
+  },
+  {
+    "id": "wf-018",
+    "name": "New Employee Onboarding",
+    "owner": "actor-012",
+    "job_family": "People Operations",
+    "trigger": "New hire start date minus 5 business days",
+    "output": "New employee provisioned, introduced to team, assigned buddy, and working through role-specific onboarding plan by end of week 1",
+    "steps": [
+      "Anya Volkov notified of confirmed start date from Greenhouse",
+      "IT provisioning ticket created in Rippling (laptop, accounts, Slack)",
+      "Welcome email sent with first-week schedule",
+      "Buddy assigned (ad hoc, no matching system)",
+      "New hire completes Rippling onboarding checklist",
+      "HR orientation call (Anya or People Ops team member)",
+      "Manager check-in scheduled for end of week 1",
+      "30-day and 90-day review checkpoints created in Notion"
+    ],
+    "tools_used": ["Rippling", "Notion", "Slack", "Google Workspace", "Greenhouse"],
+    "avg_time_hours": 12,
+    "pain_points": [
+      "Onboarding documentation last fully updated in 2024; role-specific sections missing for most job families added since then",
+      "No role-specific onboarding paths — engineer onboarding is identical to CSM onboarding",
+      "Buddy assignment is ad hoc — Anya picks someone she knows is a good culture fit, no system",
+      "No measurement of new hire ramp time — unclear when someone is truly 'productive'",
+      "At 150 people and growing, ad hoc onboarding is creating inconsistent new hire experiences"
+    ],
+    "ai_readiness_score": 5,
+    "ai_candidate": true,
+    "ai_opportunity_summary": "Medium-term AI opportunity. Near-term: use AI to generate role-specific onboarding paths from existing job family information in Rippling and Notion. Buddy matching could be improved with a simple algorithm (team overlap, tenure, interests). Longer term: AI-personalized ramp plan that adapts based on early feedback. The prerequisite is updating the base onboarding documentation first — AI cannot personalize content that doesn't exist."
+  }
+]

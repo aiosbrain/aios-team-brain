@@ -1,26 +1,273 @@
 @import "tailwindcss";
 
+/* ── Prism Light tokens (source: vibrana.ai DESIGN.md) ─────────────────── */
+@theme {
+  /* brand accents */
+  --color-violet: #7c3aed;
+  --color-violet-tint: #8b5cf6;
+  --color-blue: #3b82f6;
+  --color-cyan: #2dd4bf;
+  --color-emerald: #4ade80;
+  --color-red: #ef4444;
+  --color-amber: #f59e0b;
+  --color-yellow: #fcd34d;
+
+  /* semantic surfaces (light set) */
+  --color-surface-base: #ffffff;
+  --color-surface-raised: #fafafa;
+  --color-surface-overlay: #f4f4f5;
+  --color-surface-card: rgba(0, 0, 0, 0.02);
+  --color-surface-card-hover: rgba(0, 0, 0, 0.04);
+  --color-surface-nav: rgba(255, 255, 255, 0.72);
+  --color-surface-inset: rgba(255, 255, 255, 0.95);
+
+  --color-border-subtle: rgba(0, 0, 0, 0.08);
+  --color-border-default: rgba(0, 0, 0, 0.12);
+  --color-border-strong: rgba(0, 0, 0, 0.22);
+
+  --color-ink: rgba(15, 15, 17, 0.95);
+  --color-ink-secondary: rgba(15, 15, 17, 0.66);
+  --color-ink-tertiary: rgba(15, 15, 17, 0.48);
+
+  /* typography */
+  --font-display: var(--font-bricolage), -apple-system, sans-serif;
+  --font-body: var(--font-hanken), -apple-system, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+}
+
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
-}
-
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+  --gradient-prism: linear-gradient(135deg, #7c3aed 0%, #3b82f6 50%, #2dd4bf 100%);
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  background: var(--color-surface-base);
+  color: var(--color-ink);
+  font-family: var(--font-body);
+  -webkit-font-smoothing: antialiased;
+}
+
+h1,
+h2,
+h3 {
+  font-family: var(--font-display);
+}
+
+/* ── Prism utilities ───────────────────────────────────────────────────── */
+.text-gradient-prism {
+  background: var(--gradient-prism);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.bg-gradient-prism {
+  background: var(--gradient-prism);
+}
+
+/* Frosted nav / sidebar layer */
+.frosted {
+  background: var(--color-surface-nav);
+  backdrop-filter: blur(20px) saturate(1.2);
+  -webkit-backdrop-filter: blur(20px) saturate(1.2);
+}
+
+/* Cards: flat at rest, violet-tinted glow on hover — never black shadows. */
+.prism-card {
+  background: var(--color-surface-card);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: 0.75rem;
+  transition: all 0.3s ease;
+}
+
+.prism-card-hover:hover {
+  background: var(--color-surface-card-hover);
+  border-color: rgba(139, 92, 246, 0.3);
+  box-shadow:
+    0 4px 24px rgba(124, 58, 237, 0.1),
+    0 1px 8px rgba(45, 212, 191, 0.07);
+  transform: translateY(-1px);
+}
+
+/* Primary button: translucent violet fill, lift + violet/cyan glow on hover */
+.btn-prism {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.625rem 1.25rem;
+  font-size: 0.875rem;
+  font-weight: 500;
+  border-radius: 0.5rem;
+  color: var(--color-ink);
+  background: rgba(139, 92, 246, 0.12);
+  border: 1px solid rgba(139, 92, 246, 0.3);
+  transition: all 0.3s ease;
+  cursor: pointer;
+}
+
+.btn-prism:hover {
+  transform: translateY(-1px);
+  border-color: rgba(139, 92, 246, 0.55);
+  box-shadow:
+    0 4px 18px rgba(139, 92, 246, 0.18),
+    0 2px 10px rgba(45, 212, 191, 0.1);
+}
+
+.btn-prism:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  transform: none;
+  box-shadow: none;
+}
+
+.btn-ghost {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.625rem 1.25rem;
+  font-size: 0.875rem;
+  font-weight: 500;
+  border-radius: 0.5rem;
+  color: var(--color-ink-secondary);
+  background: transparent;
+  border: 1px solid var(--color-border-default);
+  transition: all 0.3s ease;
+  cursor: pointer;
+}
+
+.btn-ghost:hover {
+  border-color: rgba(139, 92, 246, 0.35);
+  color: var(--color-ink);
+}
+
+.prism-input {
+  width: 100%;
+  padding: 0.625rem 0.875rem;
+  font-size: 0.875rem;
+  border-radius: 0.5rem;
+  border: 1px solid var(--color-border-default);
+  background: var(--color-surface-inset);
+  color: var(--color-ink);
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.prism-input:focus {
+  outline: none;
+  border-color: rgba(139, 92, 246, 0.5);
+  box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.12);
+}
+
+/* ── Markdown body (no typography plugin — hand-rolled prose) ──────────── */
+.prose-prism {
+  font-size: 0.9375rem;
+  line-height: 1.7;
+  color: var(--color-ink-secondary);
+}
+
+.prose-prism h1,
+.prose-prism h2,
+.prose-prism h3,
+.prose-prism h4 {
+  font-family: var(--font-display);
+  color: var(--color-ink);
+  font-weight: 600;
+  margin-top: 1.75em;
+  margin-bottom: 0.5em;
+  line-height: 1.3;
+}
+
+.prose-prism h1 {
+  font-size: 1.5rem;
+}
+
+.prose-prism h2 {
+  font-size: 1.25rem;
+}
+
+.prose-prism h3 {
+  font-size: 1.1rem;
+}
+
+.prose-prism p,
+.prose-prism ul,
+.prose-prism ol {
+  margin-bottom: 0.9em;
+}
+
+.prose-prism ul {
+  list-style: disc;
+  padding-left: 1.4em;
+}
+
+.prose-prism ol {
+  list-style: decimal;
+  padding-left: 1.4em;
+}
+
+.prose-prism a {
+  color: var(--color-violet);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.prose-prism strong {
+  color: var(--color-ink);
+  font-weight: 600;
+}
+
+.prose-prism code {
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+  background: var(--color-surface-overlay);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: 0.25rem;
+  padding: 0.1em 0.35em;
+}
+
+.prose-prism pre {
+  background: var(--color-surface-overlay);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: 0.5rem;
+  padding: 1rem;
+  overflow-x: auto;
+  margin-bottom: 1em;
+}
+
+.prose-prism pre code {
+  background: none;
+  border: none;
+  padding: 0;
+}
+
+.prose-prism blockquote {
+  border-left: 3px solid rgba(139, 92, 246, 0.4);
+  padding-left: 1em;
+  margin-bottom: 1em;
+  color: var(--color-ink-tertiary);
+}
+
+.prose-prism table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.875rem;
+  margin-bottom: 1.25em;
+}
+
+.prose-prism th {
+  text-align: left;
+  font-weight: 600;
+  color: var(--color-ink);
+  border-bottom: 1px solid var(--color-border-default);
+  padding: 0.5rem 0.75rem;
+}
+
+.prose-prism td {
+  border-bottom: 1px solid var(--color-border-subtle);
+  padding: 0.5rem 0.75rem;
+  vertical-align: top;
+}
+
+.prose-prism hr {
+  border: none;
+  border-top: 1px solid var(--color-border-subtle);
+  margin: 1.5em 0;
 }
