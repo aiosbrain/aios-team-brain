@@ -4,6 +4,7 @@ import { authenticateApiKey } from "@/lib/api/auth";
 import { rateLimit } from "@/lib/api/rate-limit";
 import { actionRequestSchema, errorResponse } from "@/lib/api/schemas";
 import { runAction } from "@/lib/actions";
+import { createE2BSandbox } from "@/lib/actions/sandbox/e2b";
 
 export const runtime = "nodejs";
 
@@ -35,13 +36,19 @@ export async function POST(req: NextRequest) {
   }
 
   try {
-    const outcome = await runAction(supabase, {
-      teamId: auth.teamId,
-      memberId: auth.memberId,
-      apiKeyId: auth.apiKeyId,
-      principal: { role: "member", tier: auth.memberTier, actor: auth.actorHandle },
-      request: parsed.data,
-    });
+    const outcome = await runAction(
+      supabase,
+      {
+        teamId: auth.teamId,
+        memberId: auth.memberId,
+        apiKeyId: auth.apiKeyId,
+        principal: { role: "member", tier: auth.memberTier, actor: auth.actorHandle },
+        request: parsed.data,
+      },
+      // E2B runs code.run in an isolated microVM when E2B_API_KEY is set; otherwise the
+      // runner reports unconfigured and code.run fails closed.
+      { sandbox: createE2BSandbox() }
+    );
     const status =
       outcome.status === "succeeded" ? 200
       : outcome.status === "pending_approval" ? 202

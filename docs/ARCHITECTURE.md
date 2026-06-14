@@ -136,6 +136,13 @@ flowchart TD
   DEN & Q & RES --> AUD["audit_log"]
 ```
 
+A queued (`pending_approval`) action is resolved by `resolveApproval()` (called by the
+session-authed dashboard; RLS restricts deciding to admins/leads): **approve** resumes and
+executes the handler, **deny** marks the action denied — both audited, and a second
+decision is rejected. Code execution uses an **E2B** `SandboxRunner`
+(`lib/actions/sandbox/e2b.ts`, opt-in: `npm i @e2b/code-interpreter` + `E2B_API_KEY`);
+self-host deployments can wire a microsandbox adapter against the same interface.
+
 ## Data model (core)
 
 ```mermaid

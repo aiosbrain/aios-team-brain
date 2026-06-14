@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { SupabaseClient } from "@supabase/supabase-js";
-import { runAction } from "@/lib/actions";
+import { runAction, resolveApproval } from "@/lib/actions";
 import type { ActionHandler, SandboxRunner } from "@/lib/actions";
 import { FakeSupabase } from "@/lib/ingest/fake-supabase";
 import type { Principal } from "@/lib/policy/evaluate";
@@ -111,5 +111,72 @@ describe("runAction gating", () => {
     });
     expect(out.status).toBe("failed");
     expect(out.error).toMatch(/no handler/);
+  });
+});
+
+describe("resolveApproval", () => {
+  // Queue a note.create action behind a require_approval policy.
+  async function queue(fake: FakeSupabase) {
+    seedPolicy(fake, { effect: "require_approval", action: "note.*", priority: 5 });
+    const out = await runAction(fake as unknown as SupabaseClient, {
+      ...base(fake),
+      request: {
+        type: "note.create",
+        resource: "project:acme/notes/n.md",
+        params: { project: "acme", path: "notes/n.md", body: "queued body", access: "team" },
+      },
+    });
+    expect(out.status).toBe("pending_approval");
+    return out.approvalRequestId!;
+  }
+
+  it("approve resumes the action and executes the handler", async () => {
+    const fake = new FakeSupabase();
+    const approvalRequestId = await queue(fake);
+    const res = await resolveApproval(fake as unknown as SupabaseClient, {
+      approvalRequestId,
+      decision: "approved",
+      deciderMemberId: "admin-1",
+    });
+    expect(res.status).toBe("approved");
+    expect(res.actionStatus).toBe("succeeded");
+    expect(fake.tables.items).toHaveLength(1);
+    expect(fake.tables.items[0].body).toBe("queued body");
+    expect(fake.tables.approval_requests[0].status).toBe("approved");
+    expect(fake.tables.approval_requests[0].decided_by).toBe("admin-1");
+    expect(fake.tables.actions[0].status).toBe("succeeded");
+  });
+
+  it("deny marks the action denied and runs nothing", async () => {
+    const fake = new FakeSupabase();
+    const approvalRequestId = await queue(fake);
+    const res = await resolveApproval(fake as unknown as SupabaseClient, {
+      approvalRequestId,
+      decision: "denied",
+      deciderMemberId: "admin-1",
+      note: "not now",
+    });
+    expect(res.status).toBe("denied");
+    expect(fake.tables.items ?? []).toHaveLength(0);
+    expect(fake.tables.approval_requests[0].status).toBe("denied");
+    expect(fake.tables.actions[0].status).toBe("denied");
+  });
+
+  it("guards against deciding twice", async () => {
+    const fake = new FakeSupabase();
+    const approvalRequestId = await queue(fake);
+    await resolveApproval(fake as unknown as SupabaseClient, { approvalRequestId, decision: "approved", deciderMemberId: "a" });
+    const again = await resolveApproval(fake as unknown as SupabaseClient, { approvalRequestId, decision: "denied", deciderMemberId: "a" });
+    expect(again.status).toBe("already_decided");
+  });
+
+  it("returns not_found for an unknown approval id", async () => {
+    const fake = new FakeSupabase();
+    const res = await resolveApproval(fake as unknown as SupabaseClient, {
+      approvalRequestId: "nope",
+      decision: "approved",
+      deciderMemberId: "a",
+    });
+    expect(res.status).toBe("not_found");
   });
 });
