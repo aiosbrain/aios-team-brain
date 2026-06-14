@@ -12,9 +12,11 @@ query over the team's shared memory.
 ## Stack
 
 Next.js 16 (App Router) · Supabase (Postgres + Auth, **RLS default-deny on
-every table**) · Claude API (`claude-opus-4-8`) for query · Tailwind v4 with
-Prism Light tokens. Self-host portable: plain SQL migrations, Postgres-backed
-rate limiting, no Vercel-only dependencies.
+every table**) · **pluggable LLM** for query — Anthropic by default, or any
+local OpenAI-compatible endpoint (Ollama/Hermes/llama.cpp), plus an optional
+local/cloud reranker (see [docs/PROVIDERS.md](docs/PROVIDERS.md)) · Tailwind v4
+with Prism Light tokens. Self-host portable: plain SQL migrations,
+Postgres-backed rate limiting, no Vercel-only dependencies.
 
 ## Architecture in one paragraph
 
@@ -40,6 +42,12 @@ cp .env.example .env.local     # fill from `supabase status -o env` + your Anthr
 npx tsx --conditions react-server scripts/seed-demo.ts   # demo team + Northwind + Veridian graph
 npm run dev
 ```
+
+**Run it local or cloud.** By default queries use the Anthropic API. To answer
+fully on-machine ($0), set `LLM_BASE_URL` (and optionally a local `RERANK_URL`)
+in `.env.local` — no rebuild. See **[docs/PROVIDERS.md](docs/PROVIDERS.md)** for
+every switch, and **[docs/LOCAL_AI_WORKSTATION.md](docs/LOCAL_AI_WORKSTATION.md)**
+to stand up the whole local stack (Ollama + Hermes + llm-wiki + GBrain).
 
 The seed prints a demo API key once. Use it from a contributor repo:
 
