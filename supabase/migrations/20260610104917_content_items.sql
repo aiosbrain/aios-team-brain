@@ -1,5 +1,5 @@
 -- 0002 content: projects, items, item_versions
--- Synced corpus from contributor repos (contract: agentic-team-ops docs/brain-api.md).
+-- Synced corpus from contributor repos (contract: aios-workspace docs/brain-api.md).
 -- pgvector is enabled and an embedding column reserved so semantic retrieval is a
 -- backfill later, not a migration.
 

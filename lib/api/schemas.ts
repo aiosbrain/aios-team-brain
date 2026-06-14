@@ -2,7 +2,7 @@ import { z } from "zod";
 
 /**
  * Zod schemas mirroring the pinned contract:
- * agentic-team-ops/docs/brain-api.md (v1).
+ * aios-workspace/docs/brain-api.md (v1).
  * Tier vocabulary: canonical admin|team|external; `client` is a legacy alias
  * normalized to external on ingest; `admin` is rejected with 422.
  */
@@ -45,10 +45,13 @@ export const querySchema = z.object({
   project: z.string().nullable().optional(),
 });
 
-/** Normalize tier per contract: client → external. Returns null for admin/unknown. */
+/**
+ * Normalize tier per contract. Outward labels client (consultant) and company
+ * (employee) → external. Returns null for admin/private/unknown (never stored).
+ */
 export function normalizeTier(tier: string): "team" | "external" | null {
   if (tier === "team") return "team";
-  if (tier === "external" || tier === "client") return "external";
+  if (tier === "external" || tier === "client" || tier === "company") return "external";
   return null;
 }
 

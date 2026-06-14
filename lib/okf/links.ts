@@ -1,6 +1,6 @@
 /**
  * OKF link-graph helpers. The link regex matches the contributor CLI's
- * (agentic-team-ops scripts/aios.mjs LINK_RE) so client and server agree on
+ * (aios-workspace scripts/aios.mjs LINK_RE) so client and server agree on
  * what counts as a document link: relative markdown links to .md / .yaml files,
  * excluding anchors (#) and URLs (:).
  */

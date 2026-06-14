@@ -25,7 +25,7 @@ const supabase = createClient(url, key, { auth: { persistSession: false } });
 const FIXTURES = path.resolve(__dirname, "..", "fixtures");
 const PROJECT_SLUG = "northwind-aios";
 
-// ── minimal frontmatter + table parsers (mirrors scripts/aios.mjs in agentic-team-ops) ──
+// ── minimal frontmatter + table parsers (mirrors scripts/aios.mjs in aios-workspace) ──
 function parseFrontmatter(content: string): { fm: Record<string, string>; body: string } {
   if (!content.startsWith("---")) return { fm: {}, body: content };
   const end = content.indexOf("\n---", 3);

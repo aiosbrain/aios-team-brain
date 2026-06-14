@@ -37,10 +37,10 @@ export async function POST(req: NextRequest) {
   }
 
   const tier = normalizeTier(parsed.data.access);
-  if (parsed.data.access === "admin") {
+  if (parsed.data.access === "admin" || parsed.data.access === "private") {
     return errorResponse(
       "forbidden_tier",
-      "admin-tier content must never leave the contributor repo",
+      "private/admin-tier content must never leave the workspace",
       422
     );
   }

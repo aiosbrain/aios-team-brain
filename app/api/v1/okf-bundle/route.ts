@@ -11,7 +11,7 @@ const PAGE_SIZE = 500;
 
 /**
  * GET /api/v1/okf-bundle — the engagement's OKF link graph (contract:
- * agentic-team-ops docs/brain-api.md). The link graph is derived on read from
+ * aios-workspace docs/brain-api.md). The link graph is derived on read from
  * stored item bodies (same regex as the CLI); functionally identical to the
  * contract's "denormalized at ingest" note, without a migration or re-ingest
  * dependency. Tier filtering matches GET /items, and links pointing above the

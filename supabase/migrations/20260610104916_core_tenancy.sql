@@ -8,7 +8,7 @@ create extension if not exists citext;
 -- ── enums ───────────────────────────────────────────────────────────────────
 create type member_role as enum ('admin', 'lead', 'member');
 create type member_status as enum ('invited', 'active', 'disabled');
--- Tier vocabulary per docs/brain-api.md (agentic-team-ops): canonical is
+-- Tier vocabulary per docs/brain-api.md (aios-workspace): canonical is
 -- admin|team|external; `client` is normalized to `external` at ingest and the
 -- `admin` value never reaches the database (422 at the API).
 create type access_tier as enum ('team', 'external');

@@ -9,12 +9,12 @@
 #   npm run test:setup            # full reset + seed + spoke
 #   npm run test:setup -- --no-reset   # keep existing data, just re-mint key + spoke
 #
-# Env: OPS_DIR (default ~/Projects/agentic-team-ops), SPOKE (default /tmp/acme-team-ops)
+# Env: OPS_DIR (default ~/Projects/aios-workspace), SPOKE (default /tmp/acme-workspace)
 
 set -euo pipefail
 BRAIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-OPS_DIR="${OPS_DIR:-$HOME/Projects/agentic-team-ops}"
-SPOKE="${SPOKE:-/tmp/acme-team-ops}"
+OPS_DIR="${OPS_DIR:-$HOME/Projects/aios-workspace}"
+SPOKE="${SPOKE:-/tmp/acme-workspace}"
 APP_URL="${APP_URL:-http://127.0.0.1:3000}"
 RESET=1
 [[ "${1:-}" == "--no-reset" ]] && RESET=0
@@ -22,7 +22,7 @@ RESET=1
 cd "$BRAIN_DIR"
 [[ -f .env.local ]] || { echo "missing .env.local — copy .env.example and fill it"; exit 1; }
 set -a; source .env.local; set +a
-[[ -d "$OPS_DIR" ]] || { echo "agentic-team-ops not found at $OPS_DIR (set OPS_DIR=)"; exit 1; }
+[[ -d "$OPS_DIR" ]] || { echo "aios-workspace not found at $OPS_DIR (set OPS_DIR=)"; exit 1; }
 
 if [[ "$RESET" == "1" ]]; then
   echo "── resetting + migrating the brain DB …"
@@ -36,7 +36,7 @@ KEY="$(cat "$BRAIN_DIR/.aios-demo-key" 2>/dev/null || true)"
 
 echo "── building wired demo spoke at $SPOKE …"
 bash "$OPS_DIR/scripts/demo-spoke.sh" \
-  --slug acme-team-ops --output "$SPOKE" \
+  --slug acme-workspace --output "$SPOKE" \
   --team-id demo --brain-url "$APP_URL" \
   --api-key "$KEY" --member alex >/dev/null
 echo "   spoke ready (content across team / external / admin tiers)."

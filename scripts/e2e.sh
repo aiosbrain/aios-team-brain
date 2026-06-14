@@ -2,7 +2,7 @@
 # e2e.sh — full cross-repo verification of the AIOS sync loop.
 #
 # Prereqs: supabase start (this repo), .env.local populated, `npm run dev` NOT
-# already running on :3000, and a checkout of agentic-team-ops for the CLI.
+# already running on :3000, and a checkout of aios-workspace for the CLI.
 #
 # Loop verified: seed → issue key → aios push (contributor CLI) → idempotent
 # re-push → pull → rows materialized → admin-tier 422 → NL query cites sources.
@@ -10,7 +10,7 @@
 set -euo pipefail
 
 BRAIN_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-OPS_DIR="${OPS_DIR:-$HOME/Projects/agentic-team-ops}"
+OPS_DIR="${OPS_DIR:-$HOME/Projects/aios-workspace}"
 PORT="${PORT:-3000}"
 DB_PORT="${DB_PORT:-55422}"
 

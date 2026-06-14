@@ -12,7 +12,7 @@ import { audit } from "@/lib/api/audit";
 /**
  * The ONLY write path for synced content. Runs with the service role (bypasses
  * RLS), so it is deliberately narrow, validated, and audited. Semantics are
- * normative in agentic-team-ops/docs/brain-api.md:
+ * normative in aios-workspace/docs/brain-api.md:
  *   1. upsert project on (team_id, slug)
  *   2. identical sha → bump synced_at, return "unchanged"
  *   3. upsert item; version on body change

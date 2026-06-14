@@ -1,13 +1,13 @@
 # AIOS Team Brain
 
 Mission control for agentic teamwork. Contributor repos (built on
-[Agentic Team Ops](https://github.com/your-github-org/agentic-team-ops)) sync
+[Agentic Team Ops](https://github.com/your-github-org/aios-workspace)) sync
 tier-tagged content here via the `aios` CLI; the dashboard surfaces tasks,
 projects, decisions, deliverables, transcripts, and a grounded natural-language
 query over the team's shared memory.
 
 **The pinned API contract lives in the contributor repo:**
-`agentic-team-ops/docs/brain-api.md` (v1). Both repos build against that file.
+`aios-workspace/docs/brain-api.md` (v1). Both repos build against that file.
 
 ## Stack
 
@@ -45,7 +45,7 @@ The seed prints a demo API key once. Use it from a contributor repo:
 
 ```bash
 export AIOS_API_KEY=aios_…
-aios push          # from an agentic-team-ops scaffolded repo with brain_url set
+aios push          # from an aios-workspace scaffolded repo with brain_url set
 aios query "what's blocking sprint 1?"
 ```
 
