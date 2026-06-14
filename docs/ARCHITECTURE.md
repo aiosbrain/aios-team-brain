@@ -45,7 +45,7 @@ flowchart LR
 | 1 | Knowledge repository | `items` + FTS + `lib/query` | ✅ MVP |
 | 2 | Ingestion layer | `lib/ingest` + `ingestion/` sidecar | ✅ MVP (8 sources) |
 | 3 | Context management | `lib/query/retrieve.ts` | 🟡 partial |
-| 4 | Action layer | — | ❌ not built |
+| 4 | Action layer | `lib/actions` + `actions` table + `POST /api/v1/actions` | 🟡 MVP (policy-gated; sandbox seam, no runner wired) |
 | 5 | Identity & membership | `teams`/`members`/`api_keys`, tiers | ✅ |
 | 6 | Policy engine | `lib/policy` + `policies`/`approval_requests` | 🟡 engine + schema (no UI/enforcement yet) |
 | 7 | Audit log | `audit_log` (append-only, trigger-backed) | ✅ |
@@ -120,16 +120,20 @@ flowchart LR
   ST[("sqlite: cursors + watch channels")] -.-> T2
 ```
 
-### Policy authorize (Organ 6 — gate for the future action layer)
+### Action layer (Organ 4) — policy-gated execution
 
 ```mermaid
 flowchart TD
-  REQ["principal + action + resource"] --> AUTH["authorize()"]
-  AUTH --> EV["evaluatePolicy(rules)"]
-  EV --> D{effect}
-  D -- allow --> ACT["proceed"]
-  D -- deny --> STOP["reject (default-deny)"]
-  D -- require_approval --> Q["fileApprovalRequest()<br/>→ approval_requests (pending)"]
+  REQ["POST /api/v1/actions<br/>{type, resource, params}"] --> REC["record actions row (requested)"]
+  REC --> AUTH["authorize() — lib/policy"]
+  AUTH --> D{effect}
+  D -- deny --> DEN["status=denied (default-deny)"]
+  D -- require_approval --> Q["fileApprovalRequest()<br/>→ approval_requests; status=pending_approval"]
+  D -- allow --> H["handler.execute()"]
+  H -- "note.create" --> ING["lib/ingest (audited write)"]
+  H -- "code.run" --> SBX["SandboxRunner<br/>(E2B/microsandbox; fails closed if unwired)"]
+  H --> RES["status=succeeded/failed + result"]
+  DEN & Q & RES --> AUD["audit_log"]
 ```
 
 ## Data model (core)
@@ -149,6 +153,8 @@ erDiagram
   graph_entities ||--o{ graph_relationships : from_to
   teams ||--o{ policies : governs
   teams ||--o{ approval_requests : queues
+  teams ||--o{ actions : runs
+  actions ||--o| approval_requests : may_link
   teams ||--o{ audit_log : records
   teams ||--o{ query_log : meters
 ```
@@ -162,6 +168,7 @@ erDiagram
 | `app/t/[team]/*` | Dashboard pages (tasks, projects, decisions, library, skills, query, admin) |
 | `lib/ingest` | The only audited write path (service role) |
 | `lib/query` | Retrieval + Claude streaming |
+| `lib/actions` | Policy-gated action execution + sandbox seam (Organ 4) |
 | `lib/policy` | Policy evaluation + approval queue (Organ 6) |
 | `lib/api` | auth, rate-limit, audit, zod schemas |
 | `lib/okf` | OKF link-graph helpers |
@@ -182,6 +189,7 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 - `GET /api/v1/tasks` — dashboard task changes for `aios pull` writeback
 - `POST /api/v1/query` — SSE grounded query (`delta`/`sources`/`done`)
 - `GET /api/v1/okf-bundle` — OKF link graph (tier-filtered, link redaction)
+- `POST /api/v1/actions` — request a policy-gated action (Organ 4)
 - `POST /api/dashboard/query` — same query pipeline, session-authenticated
 <!-- /drift:routes -->
 
@@ -190,7 +198,7 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 <!-- drift:tables -->
 `teams` · `members` · `api_keys` · `audit_log` · `rate_limits` · `projects` · `items` ·
 `item_versions` · `tasks` · `decisions` · `graph_entities` · `graph_relationships` ·
-`query_log` · `policies` · `approval_requests`
+`query_log` · `policies` · `approval_requests` · `actions`
 <!-- /drift:tables -->
 
 ### Ingestion sources

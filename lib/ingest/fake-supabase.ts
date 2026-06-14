@@ -72,6 +72,9 @@ class Builder implements PromiseLike<{ data: any; error: null }> {
     this.filters.push({ kind: "notNull", col });
     return this;
   }
+  order(_col: string, _opts?: { ascending?: boolean }) {
+    return this; // ordering is irrelevant to these unit tests
+  }
 
   // -- terminals ----------------------------------------------------------
   async single() {
