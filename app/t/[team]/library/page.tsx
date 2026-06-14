@@ -9,7 +9,7 @@ import { timeAgo } from "@/components/format";
 
 export const metadata: Metadata = { title: "Library" };
 
-const KINDS = ["deliverable", "transcript", "decision", "task", "artifact"] as const;
+const KINDS = ["deliverable", "transcript", "decision", "task", "artifact", "skill"] as const;
 
 type LibraryItem = {
   id: string;

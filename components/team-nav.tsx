@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
+  Blocks,
   FolderKanban,
   Gavel,
   Home,
@@ -18,6 +19,7 @@ const ICONS = {
   projects: FolderKanban,
   decisions: Gavel,
   library: Library,
+  skills: Blocks,
   query: Sparkles,
   admin: Shield,
 } as const;

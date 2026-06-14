@@ -70,6 +70,7 @@ export async function GET(req: NextRequest) {
   const cursor = url.searchParams.get("cursor");
   const project = url.searchParams.get("project");
   const kinds = url.searchParams.get("kinds")?.split(",").filter(Boolean);
+  const pathPrefix = url.searchParams.get("path_prefix");
 
   // Tier filtering re-applied server-side: external-tier keys see only external.
   let q = supabase
@@ -82,6 +83,8 @@ export async function GET(req: NextRequest) {
     .limit(PAGE_SIZE);
   if (auth.memberTier === "external") q = q.eq("access", "external");
   if (kinds?.length) q = q.in("kind", kinds);
+  // On-demand fetch of one skill/deliverable folder: match path by prefix.
+  if (pathPrefix) q = q.like("path", `${pathPrefix.replace(/[%_\\]/g, "\\$&")}%`);
 
   const { data, error } = await q;
   if (error) return errorResponse("internal", error.message, 500);
