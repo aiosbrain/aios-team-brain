@@ -1,6 +1,7 @@
 # aios-ingest — ingestion sidecar (Organ 2)
 
-Pulls content from external systems (GitHub, Slack, Notion, Google Drive, Confluence, …)
+Pulls content from external systems (GitHub, Slack, Notion, Google Drive, Confluence,
+Linear, web pages, local files, …)
 using **open-source readers** ([LlamaHub](https://llamahub.ai), MIT; [Unstructured](https://github.com/Unstructured-IO/unstructured), Apache-2.0),
 normalizes each document into the brain's `ItemPayload`, and **POSTs to `/api/v1/items`** —
 reusing the brain's audited, dedup-by-sha256, tier-enforcing write path. No new write path;

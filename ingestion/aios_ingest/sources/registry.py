@@ -12,8 +12,11 @@ from .base import Source
 from .confluence import ConfluenceSource
 from .gdrive import GoogleDriveSource
 from .github import GithubSource
+from .linear import LinearSource
+from .local import LocalSource
 from .notion import NotionSource
 from .slack import SlackSource
+from .web import WebSource
 
 Builder = Callable[..., Source]
 
@@ -23,6 +26,9 @@ _REGISTRY: dict[str, Builder] = {
     "notion": NotionSource,
     "gdrive": GoogleDriveSource,
     "confluence": ConfluenceSource,
+    "linear": LinearSource,
+    "web": WebSource,
+    "local": LocalSource,
 }
 
 
