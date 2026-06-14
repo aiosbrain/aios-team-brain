@@ -19,6 +19,15 @@ export async function GET(request: NextRequest) {
   // only allow internal redirects
   const safeNext = next.startsWith("/") && !next.startsWith("//") ? next : "/";
 
+  // Redirect back to the SAME host the caller used. Next dev reports
+  // request.url as localhost even when the browser is on 127.0.0.1; redirecting
+  // to a different host would drop the auth cookie (host-only) and bounce the
+  // user to /login. Preserve the request Host (or x-forwarded-host behind a proxy).
+  const fwdHost = request.headers.get("x-forwarded-host");
+  const host = fwdHost ?? request.headers.get("host");
+  const proto = request.headers.get("x-forwarded-proto") ?? new URL(request.url).protocol.replace(":", "");
+  const base = host ? `${proto}://${host}` : request.url;
+
   if (tokenHash && type) {
     const supabase = await serverClient();
     const { data, error } = await supabase.auth.verifyOtp({ type, token_hash: tokenHash });
@@ -36,9 +45,9 @@ export async function GET(request: NextRequest) {
           .is("auth_user_id", null)
           .neq("status", "disabled");
       }
-      return NextResponse.redirect(new URL(safeNext, request.url));
+      return NextResponse.redirect(new URL(safeNext, base));
     }
   }
 
-  return NextResponse.redirect(new URL("/login?error=invalid_link", request.url));
+  return NextResponse.redirect(new URL("/login?error=invalid_link", base));
 }

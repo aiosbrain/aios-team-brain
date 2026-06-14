@@ -41,8 +41,8 @@ bash "$OPS_DIR/scripts/demo-spoke.sh" \
   --api-key "$KEY" --member alex >/dev/null
 echo "   spoke ready (content across team / external / admin tiers)."
 
-echo "── one-click dashboard login link:"
-LOGIN_URL="$(npx tsx scripts/dev-login.ts alex@demo.aios.local demo 2>/dev/null | grep -E '^https?://')"
+# Stable, re-usable, host-correct one-click login (mints+verifies per request).
+LOGIN_URL="$APP_URL/auth/dev-login?email=alex@demo.aios.local&next=/t/demo"
 
 # Is the dev server up?
 DEV_UP=0
@@ -54,7 +54,7 @@ cat <<BANNER
   AIOS manual test — ready.
 ────────────────────────────────────────────────────────────────────
 
-  Dashboard login (paste in browser — no email needed):
+  Dashboard login (open in browser — no email, re-usable, never stale):
     $LOGIN_URL
 
   Contributor CLI (spoke is pre-wired; key is in its .env):
