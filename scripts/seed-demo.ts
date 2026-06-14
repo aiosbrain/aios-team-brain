@@ -8,7 +8,7 @@
  * Usage: npx tsx scripts/seed-demo.ts   (requires .env.local / env vars)
  */
 import { createHash, randomBytes } from "node:crypto";
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import { readFileSync, writeFileSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
 import { createClient } from "@supabase/supabase-js";
 import { ingestItem } from "../lib/ingest";
@@ -109,18 +109,39 @@ async function main() {
     .single();
   if (teamErr || !team) throw new Error(`team: ${teamErr?.message}`);
 
-  // 2. members
+  // 2. members — each gets a CONFIRMED auth user so they can actually log in.
+  //    (The login form uses shouldCreateUser:false / invite-only, so a member
+  //    row without a matching auth.users row can never sign in — the magic link
+  //    is silently not sent. Provisioning + linking here closes that gap for the
+  //    demo team; `npm run dev:login <email>` mints a one-click link.)
   const memberDefs = [
     { actor_handle: "alex", display_name: "Alex", email: "alex@demo.aios.local", role: "admin" },
     { actor_handle: "riley", display_name: "Riley", email: "riley@demo.aios.local", role: "member" },
     { actor_handle: "jordan", display_name: "Jordan", email: "jordan@demo.aios.local", role: "member" },
     { actor_handle: "sam", display_name: "Sam", email: "sam@demo.aios.local", role: "lead" },
   ];
+  // List once; create only the missing auth users (idempotent across re-seeds).
+  const { data: existingUsers } = await supabase.auth.admin.listUsers();
+  const authIdByEmail = new Map<string, string>(
+    (existingUsers?.users ?? []).map((u) => [(u.email ?? "").toLowerCase(), u.id])
+  );
   const members: Record<string, string> = {};
   for (const m of memberDefs) {
+    let authUserId = authIdByEmail.get(m.email.toLowerCase());
+    if (!authUserId) {
+      const { data: created, error: cErr } = await supabase.auth.admin.createUser({
+        email: m.email,
+        email_confirm: true,
+      });
+      if (cErr || !created?.user) throw new Error(`createUser ${m.email}: ${cErr?.message}`);
+      authUserId = created.user.id;
+    }
     const { data } = await supabase
       .from("members")
-      .upsert({ team_id: team.id, ...m, status: "active" }, { onConflict: "team_id,email" })
+      .upsert(
+        { team_id: team.id, ...m, status: "active", auth_user_id: authUserId },
+        { onConflict: "team_id,email" }
+      )
       .select("id, actor_handle")
       .single();
     if (data) members[data.actor_handle] = data.id;
@@ -232,6 +253,10 @@ async function main() {
   console.log(`graph: ${entities} entities, ${relCount} relationships`);
   console.log("");
   console.log(`demo API key (shown once): ${fullKey}`);
+
+  // Persist the key to a gitignored file so dev-test-setup.sh can wire the
+  // spoke automatically without scraping stdout.
+  writeFileSync(path.resolve(__dirname, "..", ".aios-demo-key"), fullKey + "\n");
 
   if ((taskCount ?? 0) < 8) throw new Error(`expected >=8 tasks, got ${taskCount}`);
   if ((decisionCount ?? 0) < 20) throw new Error(`expected >=20 decisions, got ${decisionCount}`);

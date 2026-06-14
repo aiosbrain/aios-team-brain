@@ -6,7 +6,10 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "dev:seed": "set -a; . ./.env.local; set +a; npx tsx --conditions react-server scripts/seed-demo.ts",
+    "dev:login": "set -a; . ./.env.local; set +a; npx tsx scripts/dev-login.ts",
+    "test:setup": "bash scripts/dev-test-setup.sh"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.104.1",
