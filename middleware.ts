@@ -37,6 +37,10 @@ export async function middleware(request: NextRequest) {
 }
 
 export const config = {
-  // API v1 does its own bearer auth; static assets skipped.
-  matcher: ["/((?!api/v1|_next/static|_next/image|favicon.ico).*)"],
+  // Exclude ALL of /api/* (routes do their own auth) and ALL of /_next/*
+  // — the latter is critical: the old matcher only skipped _next/static, so
+  // middleware ran on the _next/webpack-hmr WebSocket upgrade and broke it,
+  // which kills the Turbopack dev runtime and leaves pages non-interactive
+  // (buttons never hydrate). Never run auth middleware on _next or api.
+  matcher: ["/((?!api/|_next/|favicon.ico).*)"],
 };
