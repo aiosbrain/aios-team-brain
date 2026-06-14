@@ -11,6 +11,7 @@
     "dev:login": "set -a; . ./.env.local; set +a; npx tsx scripts/dev-login.ts",
     "test": "vitest run",
     "test:watch": "vitest",
+    "check:docs": "node scripts/check-docs-drift.mjs",
     "test:setup": "bash scripts/dev-test-setup.sh"
   },
   "dependencies": {
