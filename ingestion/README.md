@@ -44,7 +44,14 @@ aios-ingest sync --config connections.yaml
 
 # Webhooks (Slack/GitHub/Notion-beta):
 uvicorn aios_ingest.webhook_app:app --port 8088
+
+# Scheduled polling + Drive watch-channel renewal:
+aios-ingest schedule --config connections.yaml --poll-interval 300
 ```
+
+`schedule` polls each connection on an interval (sha256 dedup makes re-polls cheap no-ops)
+and, when a Drive `WatchManager` is wired, renews push-notification channels before they
+expire. Cursors and channel state live in a local sqlite file (`--state-db`).
 
 ## How content maps (the "unit of knowledge")
 

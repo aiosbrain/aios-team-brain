@@ -89,5 +89,22 @@ def sync(config_path, only) -> None:
     asyncio.run(run_all())
 
 
+@main.command()
+@click.option("--config", "config_path", required=True, help="connections.yaml path")
+@click.option("--poll-interval", default=300, type=int, help="seconds between polls")
+@click.option("--renewal-interval", default=1800, type=int, help="seconds between watch-channel sweeps")
+@click.option("--state-db", default="aios_ingest_state.sqlite", help="sqlite path for cursors/channels")
+def schedule(config_path, poll_interval, renewal_interval, state_db) -> None:
+    """Run the background scheduler: poll connections + renew Drive watch channels."""
+    from .scheduler import run as run_scheduler
+    from .state import StateStore
+
+    settings = BrainSettings.from_env()
+    conns = load_connections(config_path)
+    state = StateStore(state_db)
+    click.echo(f"scheduling {len(conns)} connection(s), poll every {poll_interval}s — Ctrl-C to stop")
+    run_scheduler(settings, conns, state=state, poll_interval=poll_interval, renewal_interval=renewal_interval)
+
+
 if __name__ == "__main__":
     main()
