@@ -36,6 +36,11 @@ export async function POST(req: NextRequest) {
     return errorResponse("payload_too_large", "body exceeds 1 MB", 413);
   }
 
+  // Only a lead/admin may publish the team blueprint (which tools the team uses).
+  if (parsed.data.kind === "blueprint" && auth.memberRole !== "admin" && auth.memberRole !== "lead") {
+    return errorResponse("forbidden", "only a team lead or admin can publish the team blueprint", 403);
+  }
+
   const tier = normalizeTier(parsed.data.access);
   if (parsed.data.access === "admin" || parsed.data.access === "private") {
     return errorResponse(
