@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useImperativeHandle, useState, type Ref } from "react";
 import Link from "next/link";
 import { Loader2, Send, Sparkles } from "lucide-react";
 import { Markdown } from "@/components/markdown";
@@ -21,14 +21,25 @@ type Exchange = {
   error?: string;
 };
 
-export function QueryChat({ teamSlug, initialQuestion }: { teamSlug: string; initialQuestion?: string }) {
+/** Imperative handle so parents (e.g. suggestion chips) can fire a query. */
+export type QueryChatHandle = { ask: (question: string) => void };
+
+export function QueryChat({
+  teamSlug,
+  initialQuestion,
+  ref,
+}: {
+  teamSlug: string;
+  initialQuestion?: string;
+  ref?: Ref<QueryChatHandle>;
+}) {
   const [question, setQuestion] = useState(initialQuestion ?? "");
   const [exchanges, setExchanges] = useState<Exchange[]>([]);
   const [busy, setBusy] = useState(false);
 
-  async function ask(e: React.FormEvent) {
-    e.preventDefault();
-    const q = question.trim();
+  async function ask(e?: React.FormEvent, override?: string) {
+    e?.preventDefault();
+    const q = (override ?? question).trim();
     if (!q || busy) return;
     setQuestion("");
     setBusy(true);
@@ -111,6 +122,13 @@ export function QueryChat({ teamSlug, initialQuestion }: { teamSlug: string; ini
       setBusy(false);
     }
   }
+
+  useImperativeHandle(ref, () => ({
+    ask: (q: string) => {
+      setQuestion(q);
+      void ask(undefined, q);
+    },
+  }));
 
   return (
     <div className="flex flex-col gap-5">
