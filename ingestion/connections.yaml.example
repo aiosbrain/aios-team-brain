@@ -1,0 +1,36 @@
+# Named source connections for `aios-ingest sync` and the webhook app.
+# Secrets use ${ENV_VAR} references, expanded at load time — never inline secrets here.
+connections:
+  - name: eng-handbook
+    source: github
+    project: handbook
+    access: team
+    options:
+      repo: run-llama/llama_index
+      path_glob: "docs/**/*.md"
+      webhook_secret: ${GITHUB_WEBHOOK_SECRET}
+
+  - name: eng-slack
+    source: slack
+    project: slack
+    access: team
+    options:
+      token: ${SLACK_TOKEN}
+      signing_secret: ${SLACK_SIGNING_SECRET}
+      channel_ids: C0123456,C0789ABC
+
+  - name: product-notion
+    source: notion
+    project: product
+    access: team
+    options:
+      token: ${NOTION_TOKEN}
+      database_id: 11111111111111111111111111111111
+
+  - name: client-shared-drive
+    source: gdrive
+    project: client-acme
+    access: external          # this connection's content is externally visible
+    options:
+      folder_id: 1AbCdEfGhIjKlMnOpQrStUvWxYz
+      service_account_key_path: ${GOOGLE_SA_KEY_PATH}

@@ -73,14 +73,34 @@ CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/ap
 echo "── 7. pull"
 node "$OPS_DIR/scripts/aios.mjs" pull --repo /tmp/e2e-spoke
 
+echo "── 8. ingestion sidecar (Organ 2): connector backfill"
+ING_BIN="$BRAIN_DIR/ingestion/.venv/bin/aios-ingest"
+if [ -x "$ING_BIN" ]; then
+  export BRAIN_URL="http://127.0.0.1:$PORT" AIOS_API_KEY="$KEY" AIOS_TEAM=demo
+  ING_OPTS=(--source github --opt repo=octocat/Hello-World --opt 'path_glob=*' --project github)
+  [ -n "${GITHUB_TOKEN:-}" ] && ING_OPTS+=(--opt "token=$GITHUB_TOKEN")
+  "$ING_BIN" backfill "${ING_OPTS[@]}" | tee /tmp/e2e-ingest.out
+  grep -qE '[1-9][0-9]* created|[1-9][0-9]* unchanged' /tmp/e2e-ingest.out \
+    || { echo "FAIL: backfill pushed nothing"; exit 1; }
+  ITEMS=$(PGPASSWORD=postgres psql -h 127.0.0.1 -p "$DB_PORT" -U postgres -d postgres -t -A \
+    -c "select count(*) from items i join projects p on p.id=i.project_id where p.slug='github'")
+  [ "$ITEMS" -ge 1 ] && echo "github-sourced items materialized: $ITEMS ✓" \
+    || { echo "FAIL: no github-sourced items"; exit 1; }
+  echo "── 8b. ingestion idempotent re-run"
+  "$ING_BIN" backfill "${ING_OPTS[@]}" | grep -q "unchanged" \
+    && echo "ingest re-run idempotent ✓" || { echo "FAIL: ingest not idempotent"; exit 1; }
+else
+  echo "SKIPPED (no ingestion venv — run: cd ingestion && uv venv && uv pip install -e .)"
+fi
+
 if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
-  echo "── 8. NL query (live Claude)"
+  echo "── 9. NL query (live Claude)"
   node "$OPS_DIR/scripts/aios.mjs" query "What did we decide about governance review gates?" \
     --repo /tmp/e2e-spoke | tee /tmp/e2e-query.out
   grep -q "advisory" /tmp/e2e-query.out && echo "query grounded ✓" \
     || { echo "FAIL: query did not cite the advisory-mode decision"; exit 1; }
 else
-  echo "── 8. NL query SKIPPED (no ANTHROPIC_API_KEY)"
+  echo "── 9. NL query SKIPPED (no ANTHROPIC_API_KEY)"
 fi
 
 echo ""
