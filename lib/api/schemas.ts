@@ -45,6 +45,13 @@ export const querySchema = z.object({
   project: z.string().nullable().optional(),
 });
 
+// Action-layer request (Organ 4). The brain authorizes `type` against policy before running.
+export const actionRequestSchema = z.object({
+  type: z.string().min(1).max(120),
+  resource: z.string().min(1).max(500).optional().default("*"),
+  params: z.record(z.string(), z.unknown()).optional().default({}),
+});
+
 /**
  * Normalize tier per contract. Outward labels client (consultant) and company
  * (employee) → external. Returns null for admin/private/unknown (never stored).

@@ -1,0 +1,49 @@
+[project]
+name = "aios-ingest"
+version = "0.1.0"
+description = "AIOS Team Brain ingestion sidecar — imports open-source readers (LlamaHub, Unstructured) and pushes normalized content into the brain over HTTP."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+  "httpx>=0.27",
+  "pydantic>=2.7",
+  "click>=8.1",
+  "pyyaml>=6.0",
+  "fastapi>=0.110",
+  "uvicorn>=0.29",
+  "apscheduler>=3.10",
+]
+
+# Reader/parsers are heavy and license-varied, so they are opt-in extras.
+# Adapters lazy-import them and raise a clear "install extra" error if missing.
+[project.optional-dependencies]
+github = ["llama-index-readers-github>=0.1"]
+slack = ["llama-index-readers-slack>=0.1"]
+gdrive = ["llama-index-readers-google>=0.1"]
+notion = ["llama-index-readers-notion>=0.1"]
+confluence = ["llama-index-readers-confluence>=0.1"]
+docs = ["unstructured>=0.13"]
+all = [
+  "llama-index-readers-github>=0.1",
+  "llama-index-readers-slack>=0.1",
+  "llama-index-readers-google>=0.1",
+  "llama-index-readers-notion>=0.1",
+  "llama-index-readers-confluence>=0.1",
+  "unstructured>=0.13",
+]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "respx>=0.21", "pip-licenses>=5"]
+
+[project.scripts]
+aios-ingest = "aios_ingest.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["aios_ingest"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

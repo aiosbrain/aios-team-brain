@@ -9,6 +9,9 @@
     "lint": "eslint",
     "dev:seed": "set -a; . ./.env.local; set +a; npx tsx --conditions react-server scripts/seed-demo.ts",
     "dev:login": "set -a; . ./.env.local; set +a; npx tsx scripts/dev-login.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "check:docs": "node scripts/check-docs-drift.mjs",
     "test:setup": "bash scripts/dev-test-setup.sh"
   },
   "dependencies": {
@@ -36,6 +39,7 @@
     "eslint-config-next": "16.2.9",
     "tailwindcss": "^4",
     "tsx": "^4.22.4",
-    "typescript": "^5"
+    "typescript": "^5",
+    "vitest": "^4.1.8"
   }
 }
