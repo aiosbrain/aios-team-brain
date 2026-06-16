@@ -25,7 +25,7 @@ do $$ begin
   create type access_tier as enum ('team', 'external');
 exception when duplicate_object then null; end $$;
 do $$ begin
-  create type item_kind as enum ('deliverable', 'transcript', 'decision', 'task', 'artifact', 'skill');
+  create type item_kind as enum ('deliverable', 'transcript', 'decision', 'task', 'artifact', 'skill', 'blueprint');
 exception when duplicate_object then null; end $$;
 do $$ begin
   create type task_status as enum ('backlog', 'ready', 'in_progress', 'blocked', 'done');

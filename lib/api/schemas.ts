@@ -30,7 +30,7 @@ export const decisionRowSchema = z.object({
 export const itemPayloadSchema = z.object({
   project: z.string().min(1).max(120),
   path: z.string().min(1).max(500),
-  kind: z.enum(["deliverable", "transcript", "decision", "task", "artifact", "skill"]),
+  kind: z.enum(["deliverable", "transcript", "decision", "task", "artifact", "skill", "blueprint"]),
   content_sha256: z.string().regex(/^[a-f0-9]{64}$/),
   actor: z.string().max(120).optional().default(""),
   access: z.string(),

@@ -8,7 +8,7 @@ import { SESSION_COOKIE, verifySession } from "@/lib/auth/pg-session";
  *  • supabase → refresh the Supabase session cookie and read the user
  *  • postgres → verify the signed session cookie (no refresh needed)
  */
-export async function middleware(request: NextRequest) {
+export async function proxy(request: NextRequest) {
   const path = request.nextUrl.pathname;
   const isProtected = path.startsWith("/t/");
 
