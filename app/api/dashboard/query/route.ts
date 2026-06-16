@@ -2,6 +2,7 @@ import { NextRequest } from "next/server";
 import { z } from "zod";
 import { serverClient } from "@/lib/supabase/server";
 import { adminClient } from "@/lib/supabase/admin";
+import { getSessionUser } from "@/lib/auth/session";
 import { rateLimit } from "@/lib/api/rate-limit";
 import { errorResponse } from "@/lib/api/schemas";
 import { retrieve } from "@/lib/query/retrieve";
@@ -27,9 +28,7 @@ const dashboardQuerySchema = z.object({
  */
 export async function POST(req: NextRequest) {
   const rls = await serverClient();
-  const {
-    data: { user },
-  } = await rls.auth.getUser();
+  const user = await getSessionUser();
   if (!user) return errorResponse("unauthorized", "sign in required", 401);
 
   let json: unknown;

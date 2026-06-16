@@ -1,5 +1,6 @@
 import { Shield } from "lucide-react";
 import { serverClient } from "@/lib/supabase/server";
+import { getSessionUser } from "@/lib/auth/session";
 import { AdminTabs } from "@/components/admin/admin-tabs";
 
 export default async function AdminLayout({
@@ -12,9 +13,7 @@ export default async function AdminLayout({
   const { team: teamSlug } = await params;
   const supabase = await serverClient();
 
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
+  const user = await getSessionUser();
 
   const { data: team } = await supabase
     .from("teams")

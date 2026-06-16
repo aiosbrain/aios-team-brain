@@ -1,20 +1,12 @@
+import "server-only";
 import { createServerClient } from "@supabase/ssr";
 import { cookies } from "next/headers";
-import type { SupabaseClient } from "@supabase/supabase-js";
-import { isPostgresBackend } from "@/lib/db/backend";
-import { pgClient } from "@/lib/db/pg/client";
 
 /**
- * Data client for server components and server actions.
- *  • supabase backend → RLS-governed Supabase client (access control in the DB)
- *  • postgres backend → pg adapter (access control enforced in app code)
- * The adapter is cast to SupabaseClient so call sites are backend-agnostic;
- * auth is handled separately by lib/auth.
+ * Cookie-bound Supabase client used ONLY for auth in the supabase backend
+ * (session read/refresh, verifyOtp). Data access goes through serverClient.
  */
-export async function serverClient(): Promise<SupabaseClient> {
-  if (isPostgresBackend()) {
-    return pgClient() as unknown as SupabaseClient;
-  }
+export async function supabaseAuthClient() {
   const cookieStore = await cookies();
   return createServerClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,

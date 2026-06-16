@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { Loader2, MailCheck, Send } from "lucide-react";
 import { browserClient } from "@/lib/supabase/client";
+import { publicDbBackend } from "@/lib/db/backend";
 
 export function LoginForm({ next }: { next?: string }) {
   const [email, setEmail] = useState("");
@@ -14,6 +15,24 @@ export function LoginForm({ next }: { next?: string }) {
     if (!email) return;
     setState("sending");
     setError("");
+
+    // Postgres backend: request a magic link from our own endpoint.
+    if (publicDbBackend() === "postgres") {
+      try {
+        const res = await fetch("/api/auth/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ email, next }),
+        });
+        if (!res.ok) throw new Error(`request failed (${res.status})`);
+        setState("sent");
+      } catch (err) {
+        setState("error");
+        setError(err instanceof Error ? err.message : "could not send link");
+      }
+      return;
+    }
+
     const supabase = browserClient();
     const redirect = `${window.location.origin}/auth/confirm${
       next ? `?next=${encodeURIComponent(next)}` : ""

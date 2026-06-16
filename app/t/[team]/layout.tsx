@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { CircleAlert } from "lucide-react";
 import { serverClient } from "@/lib/supabase/server";
+import { getSessionUser } from "@/lib/auth/session";
 import { TeamNav, type NavItem } from "@/components/team-nav";
 
 function NoTeamScreen({ slug }: { slug: string }) {
@@ -32,9 +33,7 @@ export default async function TeamLayout({
   const { team: teamSlug } = await params;
   const supabase = await serverClient();
 
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
+  const user = await getSessionUser();
   if (!user) return <NoTeamScreen slug={teamSlug} />;
 
   // RLS: this returns a row only if the signed-in user is an active member.

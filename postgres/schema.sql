@@ -1,0 +1,337 @@
+-- ───────────────────────────────────────────────────────────────────────────
+-- Plain-Postgres schema for the Team Brain (DB_BACKEND=postgres).
+--
+-- Derived from supabase/migrations/* but WITHOUT Supabase couplings:
+--   • no Row-Level Security / policies  → access control is enforced in app code
+--     (the RLS client and service client are the same connection here)
+--   • no `auth.users` / `auth.uid()`    → local `auth_users` + `auth_tokens`
+--   • no `private.*` RLS helper fns      → not needed without RLS
+--   • no pgvector `embedding` column     → unused by every query; dropped so this
+--     runs on a stock Postgres (e.g. Railway) with no extra extensions
+--
+-- Idempotent: safe to re-run. Load with `npm run pg:schema`.
+-- ───────────────────────────────────────────────────────────────────────────
+
+create extension if not exists citext;
+
+-- ── enums ────────────────────────────────────────────────────────────────────
+do $$ begin
+  create type member_role as enum ('admin', 'lead', 'member');
+exception when duplicate_object then null; end $$;
+do $$ begin
+  create type member_status as enum ('invited', 'active', 'disabled');
+exception when duplicate_object then null; end $$;
+do $$ begin
+  create type access_tier as enum ('team', 'external');
+exception when duplicate_object then null; end $$;
+do $$ begin
+  create type item_kind as enum ('deliverable', 'transcript', 'decision', 'task', 'artifact', 'skill');
+exception when duplicate_object then null; end $$;
+do $$ begin
+  create type task_status as enum ('backlog', 'ready', 'in_progress', 'blocked', 'done');
+exception when duplicate_object then null; end $$;
+do $$ begin
+  create type task_origin as enum ('sync', 'ui');
+exception when duplicate_object then null; end $$;
+do $$ begin
+  create type policy_effect as enum ('allow', 'deny', 'require_approval');
+exception when duplicate_object then null; end $$;
+do $$ begin
+  create type approval_status as enum ('pending', 'approved', 'denied', 'expired');
+exception when duplicate_object then null; end $$;
+do $$ begin
+  create type action_status as enum
+    ('requested', 'denied', 'pending_approval', 'running', 'succeeded', 'failed');
+exception when duplicate_object then null; end $$;
+
+-- ── auth (local) ─────────────────────────────────────────────────────────────
+-- Stand-ins for Supabase Auth. A session is a signed cookie (see lib/auth);
+-- magic-link tokens live in auth_tokens (sha256-at-rest, single-use, expiring).
+create table if not exists auth_users (
+  id uuid primary key default gen_random_uuid(),
+  email citext not null unique,
+  created_at timestamptz not null default now()
+);
+
+create table if not exists auth_tokens (
+  token_hash text primary key,             -- sha256(secret)
+  email citext not null,
+  next_path text not null default '/',
+  expires_at timestamptz not null,
+  used_at timestamptz,
+  created_at timestamptz not null default now()
+);
+create index if not exists auth_tokens_email_idx on auth_tokens (email, created_at desc);
+
+-- ── core tenancy ─────────────────────────────────────────────────────────────
+create table if not exists teams (
+  id uuid primary key default gen_random_uuid(),
+  slug text not null unique check (slug ~ '^[a-z0-9][a-z0-9-]*$'),
+  name text not null,
+  created_at timestamptz not null default now()
+);
+
+create table if not exists members (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  auth_user_id uuid references auth_users(id) on delete set null,
+  email citext not null,
+  display_name text not null,
+  actor_handle text not null,
+  role member_role not null default 'member',
+  tier access_tier not null default 'team',
+  status member_status not null default 'invited',
+  created_at timestamptz not null default now(),
+  unique (team_id, email),
+  unique (team_id, actor_handle)
+);
+create index if not exists members_auth_user_idx on members (auth_user_id);
+
+create table if not exists api_keys (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  member_id uuid not null references members(id) on delete cascade,
+  key_id text not null unique,
+  key_hash text not null,
+  name text not null default '',
+  created_at timestamptz not null default now(),
+  last_used_at timestamptz,
+  revoked_at timestamptz
+);
+
+create table if not exists audit_log (
+  id bigint generated always as identity primary key,
+  team_id uuid references teams(id) on delete cascade,
+  actor_kind text not null check (actor_kind in ('member', 'api_key', 'system')),
+  member_id uuid,
+  api_key_id uuid,
+  action text not null,
+  target_type text,
+  target_id text,
+  meta jsonb not null default '{}',
+  ip inet,
+  created_at timestamptz not null default now()
+);
+create index if not exists audit_log_team_time_idx on audit_log (team_id, created_at desc);
+
+-- Append-only audit log (same guarantee as the Supabase schema).
+create or replace function audit_protect()
+returns trigger language plpgsql as $$
+begin
+  raise exception 'audit_log is append-only';
+end $$;
+drop trigger if exists audit_log_protect on audit_log;
+create trigger audit_log_protect
+  before update or delete on audit_log
+  for each row execute function audit_protect();
+
+create table if not exists rate_limits (
+  bucket text not null,
+  window_start timestamptz not null,
+  count integer not null default 0,
+  primary key (bucket, window_start)
+);
+
+-- Fixed-window rate limiting. Returns the running count for the window so the
+-- caller can compare against its per-minute limit. (In Supabase mode this
+-- function is absent and rateLimit() fails open; here it actually enforces.)
+create or replace function rate_limit_hit(p_bucket text, p_window_start timestamptz)
+returns integer language plpgsql as $$
+declare c integer;
+begin
+  insert into rate_limits (bucket, window_start, count)
+  values (p_bucket, p_window_start, 1)
+  on conflict (bucket, window_start)
+  do update set count = rate_limits.count + 1
+  returning count into c;
+  return c;
+end $$;
+
+-- ── content ──────────────────────────────────────────────────────────────────
+create table if not exists projects (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  slug text not null,
+  name text not null default '',
+  last_synced_at timestamptz,
+  created_at timestamptz not null default now(),
+  unique (team_id, slug)
+);
+
+create table if not exists items (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  project_id uuid not null references projects(id) on delete cascade,
+  path text not null,
+  kind item_kind not null,
+  access access_tier not null,
+  frontmatter jsonb not null default '{}',
+  body text not null default '',
+  content_sha256 text not null,
+  actor text not null default '',
+  member_id uuid references members(id) on delete set null,
+  synced_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  search tsvector generated always as
+    (to_tsvector('english', coalesce(path, '') || ' ' || coalesce(body, ''))) stored,
+  unique (team_id, project_id, path)
+);
+create index if not exists items_team_updated_idx on items (team_id, updated_at desc);
+create index if not exists items_search_idx on items using gin (search);
+create index if not exists items_kind_idx on items (team_id, kind);
+
+create table if not exists item_versions (
+  id uuid primary key default gen_random_uuid(),
+  item_id uuid not null references items(id) on delete cascade,
+  content_sha256 text not null,
+  frontmatter jsonb not null default '{}',
+  body text not null default '',
+  member_id uuid references members(id) on delete set null,
+  created_at timestamptz not null default now()
+);
+create index if not exists item_versions_item_idx on item_versions (item_id, created_at desc);
+
+-- ── entities / graph ─────────────────────────────────────────────────────────
+create table if not exists tasks (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  project_id uuid not null references projects(id) on delete cascade,
+  source_item_id uuid references items(id) on delete set null,
+  row_key text,
+  title text not null,
+  assignee text not null default '',
+  status task_status not null default 'backlog',
+  raw_status text,
+  sprint text not null default '',
+  due_date date,
+  origin task_origin not null,
+  created_by uuid references members(id) on delete set null,
+  updated_at timestamptz not null default now(),
+  created_at timestamptz not null default now()
+);
+create unique index if not exists tasks_row_key_uq on tasks (team_id, project_id, row_key);
+create index if not exists tasks_team_status_idx on tasks (team_id, status);
+create index if not exists tasks_team_assignee_idx on tasks (team_id, assignee);
+create index if not exists tasks_team_updated_idx on tasks (team_id, updated_at desc);
+
+create table if not exists decisions (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  project_id uuid not null references projects(id) on delete cascade,
+  source_item_id uuid references items(id) on delete set null,
+  row_key text not null,
+  decided_at date,
+  title text not null,
+  rationale text not null default '',
+  decided_by text not null default '',
+  impact text not null default '',
+  tier smallint,
+  audience access_tier not null default 'team',
+  still_valid boolean not null default true,
+  updated_at timestamptz not null default now(),
+  unique (team_id, project_id, row_key)
+);
+create index if not exists decisions_team_date_idx on decisions (team_id, decided_at desc);
+
+create table if not exists graph_entities (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  entity_id text not null,
+  entity_type text not null check (entity_type in
+    ('actor', 'workflow', 'decision', 'commitment', 'value_object')),
+  name text not null default '',
+  attrs jsonb not null default '{}',
+  updated_at timestamptz not null default now(),
+  unique (team_id, entity_id)
+);
+create index if not exists graph_entities_type_idx on graph_entities (team_id, entity_type);
+create index if not exists graph_commitment_status_idx on graph_entities ((attrs->>'status'))
+  where entity_type = 'commitment';
+
+create table if not exists graph_relationships (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  from_id text not null,
+  to_id text not null,
+  relationship_type text not null check (relationship_type in
+    ('OWNS', 'DECIDED', 'AFFECTS', 'COMMITTED_TO', 'PRODUCES', 'TOUCHES',
+     'REPORTS_TO', 'BLOCKS', 'DEPENDS_ON', 'SUPERSEDES', 'CREATED_BY',
+     'PARTICIPATED_IN')),
+  attrs jsonb not null default '{}',
+  unique (team_id, from_id, to_id, relationship_type)
+);
+create index if not exists graph_rel_from_idx on graph_relationships (team_id, from_id);
+create index if not exists graph_rel_to_idx on graph_relationships (team_id, to_id);
+
+create table if not exists query_log (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  member_id uuid references members(id) on delete set null,
+  question text not null,
+  answer_preview text not null default '',
+  cited_item_ids uuid[] not null default '{}',
+  input_tokens integer not null default 0,
+  output_tokens integer not null default 0,
+  cache_read_tokens integer not null default 0,
+  cost_usd numeric(10, 5) not null default 0,
+  latency_ms integer not null default 0,
+  created_at timestamptz not null default now()
+);
+create index if not exists query_log_team_time_idx on query_log (team_id, created_at desc);
+
+-- ── policy engine (Organ 6) ──────────────────────────────────────────────────
+create table if not exists policies (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  priority integer not null default 0,
+  description text not null default '',
+  subject_role member_role,
+  subject_tier access_tier,
+  subject_actor text,
+  action text not null,
+  resource text not null default '*',
+  effect policy_effect not null,
+  enabled boolean not null default true,
+  created_by uuid references members(id) on delete set null,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+create index if not exists policies_team_idx on policies (team_id, enabled, priority desc);
+
+create table if not exists approval_requests (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  requested_by_member uuid references members(id) on delete set null,
+  requested_by_actor text not null default '',
+  action text not null,
+  resource text not null,
+  context jsonb not null default '{}',
+  matched_policy_id uuid references policies(id) on delete set null,
+  status approval_status not null default 'pending',
+  decided_by uuid references members(id) on delete set null,
+  decided_at timestamptz,
+  decision_note text not null default '',
+  created_at timestamptz not null default now()
+);
+create index if not exists approval_requests_team_status_idx
+  on approval_requests (team_id, status, created_at desc);
+
+-- ── action layer (Organ 4) ───────────────────────────────────────────────────
+create table if not exists actions (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  member_id uuid references members(id) on delete set null,
+  actor text not null default '',
+  action_type text not null,
+  resource text not null default '*',
+  params jsonb not null default '{}',
+  status action_status not null default 'requested',
+  decision text,
+  matched_policy_id uuid references policies(id) on delete set null,
+  approval_request_id uuid references approval_requests(id) on delete set null,
+  result jsonb not null default '{}',
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+create index if not exists actions_team_status_idx on actions (team_id, status, created_at desc);
+create index if not exists actions_team_actor_idx on actions (team_id, actor);
