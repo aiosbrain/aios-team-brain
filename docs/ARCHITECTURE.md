@@ -194,6 +194,7 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 - `GET /api/v1/items` — tier-filtered, keyset-paginated pull
 - `GET /api/v1/items/:id` — single item fetch
 - `GET /api/v1/tasks` — dashboard task changes for `aios pull` writeback
+- `GET /api/v1/me` — authenticated member identity + role (drives client UI gating)
 - `POST /api/v1/query` — SSE grounded query (`delta`/`sources`/`done`)
 - `GET /api/v1/okf-bundle` — OKF link graph (tier-filtered, link redaction)
 - `POST /api/v1/actions` — request a policy-gated action (Organ 4)

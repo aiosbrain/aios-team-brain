@@ -62,6 +62,7 @@ export default async function TeamLayout({
     { icon: "decisions", label: "Decisions", href: `${base}/decisions` },
     { icon: "library", label: "Library", href: `${base}/library` },
     { icon: "skills", label: "Skills", href: `${base}/skills` },
+    { icon: "teamtools", label: "Team tools", href: `${base}/team-tools` },
     { icon: "query", label: "Query", href: `${base}/query` },
   ];
   if (me.role === "admin") {

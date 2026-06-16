@@ -11,6 +11,7 @@ import {
   ListTodo,
   Shield,
   Sparkles,
+  Wrench,
 } from "lucide-react";
 
 const ICONS = {
@@ -20,6 +21,7 @@ const ICONS = {
   decisions: Gavel,
   library: Library,
   skills: Blocks,
+  teamtools: Wrench,
   query: Sparkles,
   admin: Shield,
 } as const;
