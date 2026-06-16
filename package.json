@@ -7,6 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
+    "prepare": "git config core.hooksPath .githooks || true",
     "dev:seed": "set -a; . ./.env.local; set +a; npx tsx --conditions react-server scripts/seed-demo.ts",
     "dev:login": "set -a; . ./.env.local; set +a; npx tsx scripts/dev-login.ts",
     "test": "vitest run",

@@ -218,9 +218,13 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 
 `scripts/check-docs-drift.mjs` derives the three inventories above from code
 (`app/api/**/route.ts`, `supabase/migrations/*.sql`, `ingestion/.../registry.py`) and
-diffs them against the `<!-- drift:* -->` blocks. The `.github/workflows/docs-drift.yml`
-workflow runs it on every PR; make it a **required status check** on `main` so PRs cannot
-merge while docs and code disagree.
+diffs them against the `<!-- drift:* -->` blocks. It runs in three places:
+
+- **CI** (`.github/workflows/ci.yml`, job *Docs drift guard*) — on every PR. Advisory until
+  the repo's plan allows a required status check; then make it required on `main`.
+- **Local pre-push hook** (`.githooks/pre-push`) — blocks a push that would drift the docs.
+  Auto-enabled by `npm install` (the `prepare` script sets `core.hooksPath=.githooks`);
+  bypass in an emergency with `git push --no-verify`.
 
 ```bash
 npm run check:docs   # run locally before pushing
