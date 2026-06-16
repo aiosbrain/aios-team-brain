@@ -10,17 +10,29 @@
 import { createHash, randomBytes } from "node:crypto";
 import { readFileSync, writeFileSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
-import { createClient } from "@supabase/supabase-js";
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { ingestItem } from "../lib/ingest";
 import { normalizeTier } from "../lib/api/schemas";
+import { isPostgresBackend } from "../lib/db/backend";
+import { pgClient } from "../lib/db/pg/client";
 
-const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
-const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
-if (!url || !key) {
-  console.error("set NEXT_PUBLIC_SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY (try: npx dotenv -e .env.local -- …, or export them)");
-  process.exit(1);
+const pgMode = isPostgresBackend();
+let supabase: SupabaseClient;
+if (pgMode) {
+  if (!process.env.DATABASE_URL) {
+    console.error("DB_BACKEND=postgres: set DATABASE_URL");
+    process.exit(1);
+  }
+  supabase = pgClient() as unknown as SupabaseClient;
+} else {
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!url || !key) {
+    console.error("set NEXT_PUBLIC_SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY (try: npx dotenv -e .env.local -- …, or export them)");
+    process.exit(1);
+  }
+  supabase = createClient(url, key, { auth: { persistSession: false } });
 }
-const supabase = createClient(url, key, { auth: { persistSession: false } });
 
 const FIXTURES = path.resolve(__dirname, "..", "fixtures");
 const PROJECT_SLUG = "northwind-aios";
@@ -120,15 +132,21 @@ async function main() {
     { actor_handle: "jordan", display_name: "Jordan", email: "jordan@demo.aios.local", role: "member" },
     { actor_handle: "sam", display_name: "Sam", email: "sam@demo.aios.local", role: "lead" },
   ];
-  // List once; create only the missing auth users (idempotent across re-seeds).
-  const { data: existingUsers } = await supabase.auth.admin.listUsers();
-  const authIdByEmail = new Map<string, string>(
-    (existingUsers?.users ?? []).map((u) => [(u.email ?? "").toLowerCase(), u.id])
-  );
+  // In supabase mode, provision a confirmed auth user per member so they can log
+  // in. In postgres mode there is no Supabase Auth — members are linked to a
+  // local auth_users row on first login (dev-login / magic link), so seed them
+  // with a null auth_user_id.
+  const authIdByEmail = new Map<string, string>();
+  if (!pgMode) {
+    const { data: existingUsers } = await supabase.auth.admin.listUsers();
+    for (const u of existingUsers?.users ?? []) {
+      authIdByEmail.set((u.email ?? "").toLowerCase(), u.id);
+    }
+  }
   const members: Record<string, string> = {};
   for (const m of memberDefs) {
     let authUserId = authIdByEmail.get(m.email.toLowerCase());
-    if (!authUserId) {
+    if (!authUserId && !pgMode) {
       const { data: created, error: cErr } = await supabase.auth.admin.createUser({
         email: m.email,
         email_confirm: true,
@@ -139,7 +157,7 @@ async function main() {
     const { data } = await supabase
       .from("members")
       .upsert(
-        { team_id: team.id, ...m, status: "active", auth_user_id: authUserId },
+        { team_id: team.id, ...m, status: "active", auth_user_id: authUserId ?? null },
         { onConflict: "team_id,email" }
       )
       .select("id, actor_handle")

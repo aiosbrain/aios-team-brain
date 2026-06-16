@@ -2,19 +2,19 @@
 
 import { useState } from "react";
 import { Loader2, X } from "lucide-react";
-import { browserClient } from "@/lib/supabase/client";
+import { createTaskAction } from "@/app/actions/tasks";
 import type { MemberOption, ProjectOption, Task } from "./types";
 
 export function NewTaskDialog({
   teamId,
-  myMemberId,
   projects,
   members,
   onCreated,
   onClose,
 }: {
   teamId: string;
-  myMemberId: string;
+  /** Accepted for call-site compatibility; the server action derives the member from the session. */
+  myMemberId?: string;
   projects: ProjectOption[];
   members: MemberOption[];
   onCreated: (task: Task) => void;
@@ -33,28 +33,20 @@ export function NewTaskDialog({
     if (!title.trim() || !projectId) return;
     setSaving(true);
     setError("");
-    const supabase = browserClient();
-    const { data, error: err } = await supabase
-      .from("tasks")
-      .insert({
-        team_id: teamId,
-        project_id: projectId,
-        title: title.trim(),
-        assignee,
-        sprint,
-        due_date: due || null,
-        status: "backlog",
-        origin: "ui",
-        created_by: myMemberId,
-      })
-      .select("id, row_key, title, assignee, status, sprint, due_date, origin, project_id, updated_at")
-      .single();
+    const res = await createTaskAction({
+      teamId,
+      projectId,
+      title: title.trim(),
+      assignee,
+      sprint,
+      dueDate: due || null,
+    });
     setSaving(false);
-    if (err || !data) {
-      setError(err?.message ?? "Could not create the task.");
+    if (!res.ok || !res.task) {
+      setError(res.error ?? "Could not create the task.");
       return;
     }
-    onCreated(data as Task);
+    onCreated(res.task);
     onClose();
   }
 

@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { ListTodo } from "lucide-react";
 import { serverClient } from "@/lib/supabase/server";
+import { getSessionUser } from "@/lib/auth/session";
 import { Board } from "@/components/kanban/board";
 import { EmptyState } from "@/components/empty-state";
 import type { MemberOption, ProjectOption, Task } from "@/components/kanban/types";
@@ -18,9 +19,7 @@ export default async function TasksPage({ params }: { params: Promise<{ team: st
     .maybeSingle();
   if (!team) return null;
 
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
+  const user = await getSessionUser();
 
   const [{ data: tasks }, { data: projects }, { data: members }, { data: me }] = await Promise.all([
     supabase

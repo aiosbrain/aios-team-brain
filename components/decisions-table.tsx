@@ -2,7 +2,7 @@
 
 import { useMemo, useState } from "react";
 import { ChevronRight, Search, X } from "lucide-react";
-import { browserClient } from "@/lib/supabase/client";
+import { setDecisionValidityAction } from "@/app/actions/decisions";
 import { TierBadge } from "@/components/tier-badge";
 import { fmtDate, truncate } from "@/components/format";
 
@@ -59,14 +59,10 @@ export function DecisionsTable({
     const previous = decisions;
     setDecisions((ds) => ds.map((x) => (x.id === d.id ? { ...x, still_valid: next } : x)));
     setError("");
-    const supabase = browserClient();
-    const { error: err } = await supabase
-      .from("decisions")
-      .update({ still_valid: next, updated_at: new Date().toISOString() })
-      .eq("id", d.id);
-    if (err) {
+    const res = await setDecisionValidityAction(d.id, next);
+    if (!res.ok) {
       setDecisions(previous);
-      setError(`Could not update #${d.row_key}: ${err.message}`);
+      setError(`Could not update #${d.row_key}: ${res.error}`);
     }
   }
 

@@ -1,6 +1,9 @@
 import { type NextRequest, NextResponse } from "next/server";
 import { serverClient } from "@/lib/supabase/server";
 import { adminClient } from "@/lib/supabase/admin";
+import { isPostgresBackend } from "@/lib/db/backend";
+import { ensureAuthUser, linkMemberByEmail } from "@/lib/auth/pg-login";
+import { signSession, SESSION_COOKIE, sessionCookieOptions } from "@/lib/auth/pg-session";
 
 export const runtime = "nodejs";
 
@@ -27,6 +30,17 @@ export async function GET(request: NextRequest) {
   const proto = request.headers.get("x-forwarded-proto") ?? new URL(request.url).protocol.replace(":", "");
   const base = host ? `${proto}://${host}` : request.url;
   const fail = (why: string) => NextResponse.redirect(new URL(`/login?error=${why}`, base));
+
+  // Postgres backend: create the local auth user, link the member, set the
+  // signed session cookie directly — no Supabase Auth involved.
+  if (isPostgresBackend()) {
+    const id = await ensureAuthUser(email);
+    await linkMemberByEmail(id, email);
+    const token = await signSession({ id, email });
+    const res = NextResponse.redirect(new URL(safeNext, base));
+    res.cookies.set(SESSION_COOKIE, token, sessionCookieOptions());
+    return res;
+  }
 
   const admin = adminClient();
 

@@ -11,7 +11,7 @@ import {
   type DragStartEvent,
 } from "@dnd-kit/core";
 import { LayoutGrid, List, Plus } from "lucide-react";
-import { browserClient } from "@/lib/supabase/client";
+import { moveTaskAction } from "@/app/actions/tasks";
 import { fmtDate } from "@/components/format";
 import { Column } from "./column";
 import { TaskCard } from "./task-card";
@@ -73,14 +73,10 @@ export function Board({
     );
     setError("");
 
-    const supabase = browserClient();
-    const { error: err } = await supabase
-      .from("tasks")
-      .update({ status: target, updated_at: updatedAt })
-      .eq("id", task.id);
-    if (err) {
+    const res = await moveTaskAction(task.id, target);
+    if (!res.ok) {
       setTasks(previous); // revert
-      setError(`Could not move "${task.title}": ${err.message}`);
+      setError(`Could not move "${task.title}": ${res.error}`);
     }
   }
 

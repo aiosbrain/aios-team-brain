@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { Rocket } from "lucide-react";
 import { serverClient } from "@/lib/supabase/server";
+import { getSessionUser } from "@/lib/auth/session";
 import { CopySnippet } from "@/components/copy-snippet";
 import { getPulseMetrics } from "@/lib/metrics/pulse";
 import { parseRange } from "@/lib/metrics/range";
@@ -86,9 +87,9 @@ export default async function TeamHome({
   const range = parseRange(rangeParam);
   const supabase = await serverClient();
 
-  const [{ data: team }, { data: { user } }] = await Promise.all([
+  const [{ data: team }, user] = await Promise.all([
     supabase.from("teams").select("id, name").eq("slug", teamSlug).maybeSingle(),
-    supabase.auth.getUser(),
+    getSessionUser(),
   ]);
   if (!team) return null; // layout already rendered the no-team screen
 

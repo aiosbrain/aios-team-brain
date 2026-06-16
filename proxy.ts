@@ -1,9 +1,33 @@
 import { createServerClient } from "@supabase/ssr";
 import { NextResponse, type NextRequest } from "next/server";
+import { isPostgresBackend } from "@/lib/db/backend";
+import { SESSION_COOKIE, verifySession } from "@/lib/auth/pg-session";
 
+/**
+ * Auth gate for the app shell (/t/*). Backend-aware:
+ *  • supabase → refresh the Supabase session cookie and read the user
+ *  • postgres → verify the signed session cookie (no refresh needed)
+ */
 export async function proxy(request: NextRequest) {
-  let response = NextResponse.next({ request });
+  const path = request.nextUrl.pathname;
+  const isProtected = path.startsWith("/t/");
 
+  if (isPostgresBackend()) {
+    if (isProtected) {
+      const token = request.cookies.get(SESSION_COOKIE)?.value;
+      const user = token ? await verifySession(token) : null;
+      if (!user) {
+        const url = request.nextUrl.clone();
+        url.pathname = "/login";
+        url.searchParams.set("next", path);
+        return NextResponse.redirect(url);
+      }
+    }
+    return NextResponse.next({ request });
+  }
+
+  // Supabase: refresh session + gate.
+  let response = NextResponse.next({ request });
   const supabase = createServerClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
     process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
@@ -23,10 +47,9 @@ export async function proxy(request: NextRequest) {
     }
   );
 
-  // Refresh the session; gate the app shell behind login.
-  const { data: { user } } = await supabase.auth.getUser();
-  const path = request.nextUrl.pathname;
-  const isProtected = path.startsWith("/t/");
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
   if (isProtected && !user) {
     const url = request.nextUrl.clone();
     url.pathname = "/login";
@@ -37,10 +60,6 @@ export async function proxy(request: NextRequest) {
 }
 
 export const config = {
-  // Exclude ALL of /api/* (routes do their own auth) and ALL of /_next/*
-  // — the latter is critical: the old matcher only skipped _next/static, so
-  // middleware ran on the _next/webpack-hmr WebSocket upgrade and broke it,
-  // which kills the Turbopack dev runtime and leaves pages non-interactive
-  // (buttons never hydrate). Never run auth middleware on _next or api.
+  // Exclude ALL of /api/* (routes do their own auth) and ALL of /_next/*.
   matcher: ["/((?!api/|_next/|favicon.ico).*)"],
 };
