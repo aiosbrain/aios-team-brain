@@ -199,6 +199,7 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 - `GET /api/v1/okf-bundle` — OKF link graph (tier-filtered, link redaction)
 - `POST /api/v1/actions` — request a policy-gated action (Organ 4)
 - `POST /api/dashboard/query` — same query pipeline, session-authenticated
+- `POST /api/auth/login` — postgres-mode magic-link request (invite-only; always `{ok:true}`)
 <!-- /drift:routes -->
 
 ### Database tables
