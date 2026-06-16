@@ -2,6 +2,9 @@ import { type NextRequest, NextResponse } from "next/server";
 import type { EmailOtpType } from "@supabase/supabase-js";
 import { serverClient } from "@/lib/supabase/server";
 import { adminClient } from "@/lib/supabase/admin";
+import { isPostgresBackend } from "@/lib/db/backend";
+import { redeemMagicToken } from "@/lib/auth/pg-login";
+import { signSession, SESSION_COOKIE, sessionCookieOptions } from "@/lib/auth/pg-session";
 
 export const runtime = "nodejs";
 
@@ -27,6 +30,24 @@ export async function GET(request: NextRequest) {
   const host = fwdHost ?? request.headers.get("host");
   const proto = request.headers.get("x-forwarded-proto") ?? new URL(request.url).protocol.replace(":", "");
   const base = host ? `${proto}://${host}` : request.url;
+
+  // Postgres backend: verify our own single-use magic-link token, link the
+  // member, and set the signed session cookie.
+  if (isPostgresBackend()) {
+    const token = searchParams.get("token");
+    if (token) {
+      const result = await redeemMagicToken(token);
+      if (result) {
+        const dest = result.nextPath.startsWith("/") && !result.nextPath.startsWith("//")
+          ? result.nextPath
+          : "/";
+        const res = NextResponse.redirect(new URL(dest, base));
+        res.cookies.set(SESSION_COOKIE, await signSession(result.user), sessionCookieOptions());
+        return res;
+      }
+    }
+    return NextResponse.redirect(new URL("/login?error=invalid_link", base));
+  }
 
   if (tokenHash && type) {
     const supabase = await serverClient();

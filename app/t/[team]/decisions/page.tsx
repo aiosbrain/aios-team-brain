@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { Gavel } from "lucide-react";
 import { serverClient } from "@/lib/supabase/server";
+import { getSessionUser } from "@/lib/auth/session";
 import { DecisionsTable, type Decision } from "@/components/decisions-table";
 import { EmptyState } from "@/components/empty-state";
 
@@ -17,9 +18,7 @@ export default async function DecisionsPage({ params }: { params: Promise<{ team
     .maybeSingle();
   if (!team) return null;
 
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
+  const user = await getSessionUser();
 
   const [{ data: decisions }, { data: me }] = await Promise.all([
     supabase

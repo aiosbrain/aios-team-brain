@@ -4,13 +4,12 @@ import { createHash, randomBytes } from "node:crypto";
 import { revalidatePath } from "next/cache";
 import { serverClient } from "@/lib/supabase/server";
 import { adminClient } from "@/lib/supabase/admin";
+import { getSessionUser } from "@/lib/auth/session";
 
 /** Verify the caller is an active admin of the team; returns ids or null. */
 async function requireAdmin(teamSlug: string) {
   const supabase = await serverClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
+  const user = await getSessionUser();
   if (!user) return null;
   const { data: team } = await supabase
     .from("teams")
