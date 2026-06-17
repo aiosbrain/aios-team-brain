@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  codebaseRecordSchema,
   itemPayloadSchema,
   normalizeTier,
   normalizeTaskStatus,
@@ -65,5 +66,20 @@ describe("taskRowSchema", () => {
   it("requires a non-empty row_key", () => {
     expect(taskRowSchema.safeParse({ row_key: "", title: "t" }).success).toBe(false);
     expect(taskRowSchema.safeParse({ row_key: "T-1", title: "t" }).success).toBe(true);
+  });
+});
+
+describe("codebaseRecordSchema.slug route-safety", () => {
+  // slug becomes a /codebases/[slug] path segment, so the ingest boundary must
+  // reject anything that would break or mis-route a detail link.
+  it("accepts real repo names", () => {
+    for (const slug of ["aios-team-brain", "llama_index", "Next.js", "repo123"]) {
+      expect(codebaseRecordSchema.safeParse({ slug }).success, slug).toBe(true);
+    }
+  });
+  it("rejects slugs that would break the route segment", () => {
+    for (const slug of ["evil/../x", "a?b", "a#frag", "has space", "", "a/b"]) {
+      expect(codebaseRecordSchema.safeParse({ slug }).success, slug).toBe(false);
+    }
   });
 });

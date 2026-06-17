@@ -45,7 +45,14 @@ export type ItemPayload = z.infer<typeof itemPayloadSchema>;
 // (lib/codebases/score) and writes them. Team-tier keys only (enforced in the route).
 
 export const codebaseRecordSchema = z.object({
-  slug: z.string().min(1).max(120),
+  // Route-safe: the slug is used directly as a /codebases/[slug] path segment, so it
+  // must not contain '/', '?', '#', or whitespace. Broader than the team-slug shape
+  // because codebase slugs are real repo names (allow '.' and '_', e.g. llama_index).
+  slug: z
+    .string()
+    .min(1)
+    .max(120)
+    .regex(/^[A-Za-z0-9._-]+$/, "slug must be route-safe (letters, digits, '.', '_', '-')"),
   full_name: z.string().max(200).optional().default(""),
   provider: z.string().max(40).optional().default("github"),
   default_branch: z.string().max(120).optional().default("main"),
