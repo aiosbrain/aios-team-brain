@@ -13,6 +13,7 @@ import { AgenticBreakdownCard } from "@/components/codebases/agentic-breakdown";
 import { ContributorTable } from "@/components/codebases/contributor-table";
 import { IssuesList } from "@/components/codebases/issues-list";
 import { AgenticTrend } from "@/components/charts/agentic-trend";
+import { ContributionsTrend } from "@/components/charts/contributions-trend";
 
 export const metadata: Metadata = { title: "Codebase" };
 
@@ -94,6 +95,8 @@ export default async function CodebaseDetailPage({
         {cb.breakdown ? <AgenticBreakdownCard b={cb.breakdown} /> : null}
         <AgenticTrend data={cb.trend} />
       </div>
+
+      <ContributionsTrend data={cb.commitVolume} />
 
       <section className="flex flex-col gap-3">
         <h2 className="text-sm font-semibold uppercase tracking-wider text-ink-tertiary">

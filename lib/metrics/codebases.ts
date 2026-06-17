@@ -216,6 +216,12 @@ export interface IssueRow {
   opened_at: string | null;
 }
 
+export interface CommitVolumePoint {
+  date: string; // YYYY-MM-DD
+  ai: number;
+  human: number;
+}
+
 export interface CodebaseDetail {
   id: string;
   slug: string;
@@ -232,6 +238,7 @@ export interface CodebaseDetail {
   breakdown: AgenticBreakdown | null;
   recent_commits: Record<string, unknown>[];
   trend: TrendPoint[];
+  commitVolume: CommitVolumePoint[];
   contributors: ContributorRow[];
   issues: IssueRow[];
 }
@@ -274,7 +281,7 @@ export async function getCodebaseDetail(
       .limit(2000),
     supabase
       .from("code_contributions")
-      .select("author_key, author_name, member_id, commits, ai_commits, additions, deletions")
+      .select("author_key, author_name, member_id, day, commits, ai_commits, additions, deletions")
       .eq("codebase_id", codebaseId)
       .gte("day", windowStart.slice(0, 10))
       .limit(10_000),
@@ -333,11 +340,28 @@ export async function getCodebaseDetail(
     author_key: string;
     author_name: string;
     member_id: string | null;
+    day: string;
     commits: number;
     ai_commits: number;
     additions: number;
     deletions: number;
   }[];
+
+  // commit volume per day (AI vs human) for the commit-volume chart
+  const volByDay = new Map<string, { ai: number; human: number }>();
+  for (const r of contribRows) {
+    const v = volByDay.get(r.day) ?? { ai: 0, human: 0 };
+    v.ai += r.ai_commits;
+    v.human += Math.max(0, r.commits - r.ai_commits);
+    volByDay.set(r.day, v);
+  }
+  const commitVolume: CommitVolumePoint[] = [...volByDay.entries()]
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([day, v]) => ({
+      date: new Date(day).toLocaleDateString("en-US", { month: "short", day: "numeric" }),
+      ai: v.ai,
+      human: v.human,
+    }));
   // Group by member when mapped (collapses one person's multiple git identities into
   // one row); fall back to per-author_key for genuinely unmapped contributors.
   const byContributor = new Map<string, ContributorRow>();
@@ -390,6 +414,7 @@ export async function getCodebaseDetail(
       ? (latest.recent_commits as Record<string, unknown>[])
       : [],
     trend,
+    commitVolume,
     contributors,
     issues,
   };
