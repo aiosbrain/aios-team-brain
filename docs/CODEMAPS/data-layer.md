@@ -1,16 +1,17 @@
-# CODEMAP — data layer (dual backend)
+# CODEMAP — data layer (configurable backend)
 
 > Last verified against code: 2026-06-17. Code wins; fix this map in the same PR.
 
-How the brain talks to its database. One Supabase-shaped data API, two implementations
-selected at runtime by `DB_BACKEND`. See `docs/ARCHITECTURE.md` §Sources-of-truth and the
-access-control invariant before changing anything here.
+How the brain talks to its database. **Configurable single backend** — one Supabase-shaped data API,
+two implementations, exactly one selected at runtime by `DB_BACKEND`. **Postgres is the default and the
+deployed target (Railway); Supabase is legacy/optional.** Canonical schema = `postgres/schema.sql`. See
+`docs/ARCHITECTURE.md` §Sources-of-truth and the access-control invariant before changing anything here.
 
 ## Backend selection
 
 | File | Role |
 |---|---|
-| `lib/db/backend.ts` | `dbBackend()` reads `DB_BACKEND` (`supabase` default, `postgres` self-host); `isPostgresBackend()`. Import-safe from client + server. |
+| `lib/db/backend.ts` | `dbBackend()` reads `DB_BACKEND` (`postgres` default/target; `supabase` legacy opt-in); `isPostgresBackend()`. Import-safe from client + server. |
 | `lib/supabase/server.ts` | `serverClient()` — session-scoped data client. supabase: `@supabase/ssr` (RLS via the user JWT). postgres: the pg adapter (no RLS). |
 | `lib/supabase/admin.ts` | `adminClient()` — service-role data client. supabase: service-role key (bypasses RLS). postgres: same pg adapter (there is no RLS to bypass). Used by `lib/ingest`, `/api/v1/*`, seed. |
 
@@ -34,20 +35,23 @@ A PostgREST-compatible query layer over `pg`, so the ~34 supabase-js call sites 
 | `pg-session.ts` | `jose`-signed session token (postgres mode). |
 | `pg-login.ts`, `mailer.ts`, `supabase-auth.ts` | Magic-link issue/verify (single-use, expiring `auth_tokens`), SMTP via nodemailer, Supabase-auth client. |
 
-## Access enforcement — the asymmetry that matters
+## Access enforcement — the standing invariant
 
-- **supabase:** the `items` RLS policy enforces team + **tier** isolation in the DB.
-- **postgres:** **no RLS.** Isolation is whatever the app code applies:
-  - `/api/v1/items*` and `lib/query/retrieve.ts` re-apply `.eq("access","external")` for external
-    principals → safe on both backends (covered by data-mechanics tests).
-  - 🔴 dashboard reads in `app/t/[team]/*` do **not** filter by tier → they lean on RLS, which is
-    absent in postgres mode. Tracked in `ARCHITECTURE.md` §Invariants.
+- **postgres (the target):** **no RLS.** Tier isolation is enforced **entirely in app code** —
+  `/api/v1/items*` and `lib/query/retrieve.ts` re-apply `.eq("access","external")` for external
+  principals, and dashboard reads in `app/t/[team]/*` route through the **`lib/auth/visibility`
+  choke-point** (`visibleItems`/`canSeeAccess`), enforced by `test/guards/dashboard-tier-filter.test.ts`
+  and proven by the data-mechanics tier. ✅ (the earlier dashboard-leak gap is closed.)
+- **supabase (legacy):** the `items` RLS policy enforces team + tier isolation in the DB; the app-code
+  checks above are defense-in-depth.
 
 ## Schema + local test DB
 
-- `postgres/schema.sql` — the postgres-mode schema: the Supabase migrations minus RLS / `auth.users`
-  coupling / pgvector, plus local `auth_users`/`auth_tokens` and a real `rate_limit_hit()`. Keeps
-  the generated `search` tsvector column. Loader: `npm run pg:schema`.
-- `supabase/migrations/*.sql` — the supabase-mode schema (RLS included).
+- `postgres/schema.sql` — **the canonical schema** (Postgres target; drift-guarded source of truth):
+  no RLS / `auth.users` coupling / pgvector, plus local `auth_users`/`auth_tokens` and a real
+  `rate_limit_hit()`. Keeps the generated `search` tsvector column. Loader: `npm run pg:schema`
+  (idempotent — also the prod rollout step against Railway's `DATABASE_URL`).
+- `supabase/migrations/*.sql` — the **legacy/derived** supabase-mode schema (RLS included), used only
+  when `DB_BACKEND=supabase`.
 - `compose.test.yml` + `npm run db:test:up` — ephemeral test Postgres (port 5434, tmpfs) loaded
   from `schema.sql` (migrate-from-zero = replay guard); target of the data-mechanics tier.

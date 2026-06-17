@@ -48,13 +48,12 @@ function deriveRoutes() {
 }
 
 function deriveTables() {
-  const migDir = join(ROOT, "supabase", "migrations");
+  // Canonical schema = postgres/schema.sql (the self-host target the project runs on).
+  // supabase/migrations/* is the derived/legacy artifact and is no longer the source of truth.
+  const src = readFileSync(join(ROOT, "postgres", "schema.sql"), "utf8");
   const tables = new Set();
-  for (const file of walk(migDir).filter((f) => f.endsWith(".sql"))) {
-    const src = readFileSync(file, "utf8");
-    for (const m of src.matchAll(/create\s+table\s+(?:if\s+not\s+exists\s+)?([a-z_][a-z0-9_]*)/gi)) {
-      tables.add(m[1].toLowerCase());
-    }
+  for (const m of src.matchAll(/create\s+table\s+(?:if\s+not\s+exists\s+)?([a-z_][a-z0-9_]*)/gi)) {
+    tables.add(m[1].toLowerCase());
   }
   return tables;
 }
