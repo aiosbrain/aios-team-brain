@@ -111,6 +111,22 @@ class BrainClient:
             raise BrainError(resp.status_code, *_error_fields(resp))
         raise BrainError(429, "rate_limited", f"gave up after {_MAX_RETRIES} retries")
 
+    async def push_codebase_scan(self, payload: dict) -> dict:
+        """POST one codebase scan (RAW metrics) to /api/v1/codebases. The brain computes
+        scores, audits, and upserts idempotently. Same retry policy as push()."""
+        url = f"{self._base}/api/v1/codebases"
+        for attempt in range(_MAX_RETRIES):
+            await self._limiter.acquire()
+            resp = await self._client.post(url, json=payload, headers=self._headers)
+            if resp.status_code in (200, 201):
+                return resp.json()
+            if resp.status_code == 429 or resp.status_code >= 500:
+                backoff = _retry_after(resp) or min(2**attempt, 30)
+                await asyncio.sleep(backoff)
+                continue
+            raise BrainError(resp.status_code, *_error_fields(resp))
+        raise BrainError(429, "rate_limited", f"gave up after {_MAX_RETRIES} retries")
+
 
 def _retry_after(resp: httpx.Response) -> float | None:
     raw = resp.headers.get("retry-after")

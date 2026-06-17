@@ -2,6 +2,7 @@ import Link from "next/link";
 import { CircleAlert } from "lucide-react";
 import { serverClient } from "@/lib/supabase/server";
 import { getSessionUser } from "@/lib/auth/session";
+import { isPostgresBackend } from "@/lib/db/backend";
 import { TeamNav, type NavItem } from "@/components/team-nav";
 
 function NoTeamScreen({ slug }: { slug: string }) {
@@ -64,6 +65,10 @@ export default async function TeamLayout({
     { icon: "teamtools", label: "Team tools", href: `${base}/team-tools` },
     { icon: "query", label: "Query", href: `${base}/query` },
   ];
+  // Codebase analytics live only on the postgres backend (canonical schema).
+  if (isPostgresBackend()) {
+    items.splice(3, 0, { icon: "codebases", label: "Codebases", href: `${base}/codebases` });
+  }
   if (me.role === "admin") {
     items.push({ icon: "admin", label: "Admin", href: `${base}/admin` });
   }

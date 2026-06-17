@@ -11,12 +11,14 @@ query over the team's shared memory.
 
 ## Stack
 
-Next.js 16 (App Router) · Supabase (Postgres + Auth, **RLS default-deny on
-every table**) · **pluggable LLM** for query — Anthropic by default, or any
-local OpenAI-compatible endpoint (Ollama/Hermes/llama.cpp), plus an optional
+Next.js 16 (App Router) · **configurable database backend** (`DB_BACKEND`) —
+**Postgres by default** (the deployed target, e.g. Railway; tier isolation
+enforced in app code) or **Supabase** (legacy; managed Postgres + Auth + RLS) ·
+**pluggable LLM** for query — Anthropic by default, or any local
+OpenAI-compatible endpoint (Ollama/Hermes/llama.cpp), plus an optional
 local/cloud reranker (see [docs/PROVIDERS.md](docs/PROVIDERS.md)) · Tailwind v4
-with Prism Light tokens. Self-host portable: plain SQL migrations,
-Postgres-backed rate limiting, no Vercel-only dependencies.
+with Prism Light tokens. Self-host portable: plain SQL schema, Postgres-backed
+rate limiting, no Vercel-only dependencies.
 
 ## Architecture in one paragraph
 
@@ -24,9 +26,10 @@ Members authenticate with magic-link/OAuth (invite-only; admin creates the
 member row, first login links it). Machines authenticate with per-member API
 keys (`aios_<key_id>_<secret>`, sha256-at-rest, shown once). Sync writes go
 through one narrow audited module (`lib/ingest`) using the service role;
-everything the dashboard reads goes through RLS, which enforces access tiers
-(`team` sees all, `external` sees only external; `admin`-tier content is
-rejected at the API with 422 — it never reaches the database, by contract).
+everything the dashboard reads is tier-gated — in Postgres mode by an app-code
+choke-point (`lib/auth/visibility`), in legacy Supabase mode by RLS — enforcing
+access tiers (`team` sees all, `external` sees only external; `admin`-tier
+content is rejected at the API with 422 — it never reaches the database).
 Markdown task/decision tables materialize into structured rows (diff-sync by
 `row_key`; UI-created tasks survive pushes). The query pipeline retrieves
 tier-filtered FTS hits + structured context (decisions, tasks, Company-Graph
@@ -37,11 +40,14 @@ daily spend in `query_log`.
 
 ```bash
 npm install
-supabase start                 # local stack on ports 554xx (see supabase/config.toml)
-cp .env.example .env.local     # fill from `supabase status -o env` + your Anthropic key
+cp .env.example .env.local     # set DATABASE_URL (Postgres), AUTH_SECRET + your Anthropic key
+npm run pg:schema              # load postgres/schema.sql (canonical) into DATABASE_URL
 npx tsx --conditions react-server scripts/seed-demo.ts   # demo team + Northwind + Veridian graph
 npm run dev
 ```
+
+> Legacy Supabase backend: set `DB_BACKEND=supabase`, run `supabase start`, fill
+> `.env.local` from `supabase status -o env`, and `supabase db reset` to migrate.
 
 **Run it local or cloud.** By default queries use the Anthropic API. To answer
 fully on-machine ($0), set `LLM_BASE_URL` (and optionally a local `RERANK_URL`)

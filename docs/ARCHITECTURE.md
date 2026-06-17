@@ -29,6 +29,7 @@ Reason from this table, not from a random call site.
 | Identity | `teams`, `members`, `api_keys` | admin UI / seed | `lib/auth`, guards | role-gated; `key_hash` column-revoked |
 | Sessions (postgres) | `auth_users`, `auth_tokens` | `lib/auth/pg-*` | `getSessionUser` | signed httpOnly cookie |
 | Rate limits | `rate_limits` | `rate_limit_hit` rpc | — | service-role only |
+| Codebase analytics | `codebases`, `code_metrics`, `code_contributions`, `github_issues` | **`lib/codebases/ingest` only** (single-writer guarded; via `POST /api/v1/codebases`) | codebases pages, `lib/metrics/codebases` | team-tier only; **app-code gate** (`lib/codebases/visibility` + guard) — no RLS backstop |
 
 ## System context
 
@@ -44,9 +45,9 @@ flowchart LR
     INGEST["lib/ingest<br/>(only write path, audited)"]
     QUERY["lib/query<br/>(retrieve + Claude stream)"]
     POLICY["lib/policy<br/>(authorize, Organ 6)"]
-    UI["Dashboard /t/[team]/*<br/>(RLS-scoped)"]
+    UI["Dashboard /t/[team]/*<br/>(tier-gated reads)"]
   end
-  DB[("Supabase Postgres<br/>RLS default-deny")]
+  DB[("Postgres (Railway)<br/>app-code tier isolation<br/>Supabase optional/legacy")]
   LLM["Claude API<br/>claude-opus-4-8"]
 
   SRC --> SIDE
@@ -200,7 +201,8 @@ erDiagram
 | `lib/policy` | Policy evaluation + approval queue (Organ 6) |
 | `lib/api` | auth, rate-limit, audit, zod schemas |
 | `lib/okf` | OKF link-graph helpers |
-| `supabase/migrations` | Schema (RLS default-deny everywhere) |
+| `postgres/schema.sql` | **Canonical schema** (Postgres target; app-code tier isolation). Drift-guarded. |
+| `supabase/migrations` | Derived/legacy schema (RLS) — only when `DB_BACKEND=supabase` |
 | `ingestion/` | Python connector sidecar (Organ 2) |
 | `lib/db`, `lib/auth` | Backend selector + pg adapter; backend-agnostic auth/session/guard |
 
@@ -263,6 +265,7 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 - `POST /api/v1/query` — SSE grounded query (`delta`/`sources`/`done`)
 - `GET /api/v1/okf-bundle` — OKF link graph (tier-filtered, link redaction)
 - `POST /api/v1/actions` — request a policy-gated action (Organ 4)
+- `POST /api/v1/codebases` — ingest a codebase scan (raw metrics; team-tier key only, audited)
 - `POST /api/dashboard/query` — same query pipeline, session-authenticated
 - `POST /api/auth/login` — postgres-mode magic-link request (invite-only; always `{ok:true}`)
 <!-- /drift:routes -->
@@ -270,9 +273,10 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 ### Database tables
 
 <!-- drift:tables -->
-`teams` · `members` · `api_keys` · `audit_log` · `rate_limits` · `projects` · `items` ·
-`item_versions` · `tasks` · `decisions` · `graph_entities` · `graph_relationships` ·
-`query_log` · `policies` · `approval_requests` · `actions`
+`auth_users` · `auth_tokens` · `teams` · `members` · `api_keys` · `audit_log` · `rate_limits` ·
+`projects` · `items` · `item_versions` · `tasks` · `decisions` · `graph_entities` ·
+`graph_relationships` · `query_log` · `policies` · `approval_requests` · `actions` ·
+`codebases` · `code_metrics` · `code_contributions` · `github_issues`
 <!-- /drift:tables -->
 
 ### Ingestion sources

@@ -14,6 +14,7 @@ from typing import Any
 
 import click
 
+from .brain_client import BrainClient
 from .config import BrainSettings, Connection, load_connections
 from .engine import run_connection
 from .sources import available_sources
@@ -87,6 +88,39 @@ def sync(config_path, only) -> None:
             click.echo(str(summary))
 
     asyncio.run(run_all())
+
+
+@main.command()
+@click.option("--path", "repo_path", default=".", help="local git checkout to analyze")
+@click.option("--slug", required=True, help="codebase slug (unique per team), e.g. aios-team-brain")
+@click.option("--full-name", default="", help="owner/repo (enables GitHub metadata + issues)")
+@click.option("--window", "window_days", default=90, type=int, help="analysis window in days")
+@click.option("--github-token", default=None, help="GitHub token (or env GITHUB_TOKEN) for enrichment")
+def scan(repo_path, slug, full_name, window_days, github_token) -> None:
+    """Analyze a local repo's git history + scaffolding and push RAW metrics to the brain.
+
+    The brain computes the agentic/health scores. Example:
+      aios-ingest scan --path ../aios-team-brain --slug aios-team-brain --full-name org/aios-team-brain
+    """
+    from .analyzers import analyze_repo
+
+    settings = BrainSettings.from_env()
+    payload = analyze_repo(
+        repo_path, slug=slug, full_name=full_name, window_days=window_days, github_token=github_token
+    )
+
+    async def run() -> None:
+        async with BrainClient(settings.base_url, settings.api_key, settings.team) as client:
+            result = await client.push_codebase_scan(payload)
+            click.echo(json.dumps(result))
+
+    m = payload["metrics"]
+    click.echo(
+        f"scanned {slug}: {m['commits_window']} commits ({m['ai_commits_window']} AI-assisted), "
+        f"{len(payload['contributions'])} author-days, coverage="
+        f"{m['test_coverage_pct'] if m['test_coverage_pct'] is not None else 'none'}"
+    )
+    asyncio.run(run())
 
 
 @main.command()

@@ -5,7 +5,8 @@
  *
  * Set by the deployer via `DB_BACKEND` (server) and mirrored to the browser via
  * `NEXT_PUBLIC_DB_BACKEND` so client components can branch (e.g. the login form).
- * Defaults to "supabase" so existing deployments are unaffected.
+ * Defaults to "postgres" — the self-host target the project runs on (Railway).
+ * Set `DB_BACKEND=supabase` to opt into the legacy managed backend.
  *
  * This module is import-safe from both server and client code — it only reads
  * env vars and contains no secrets or Node-only APIs.
@@ -15,7 +16,8 @@ export type DbBackend = "supabase" | "postgres";
 
 function normalize(value: string | undefined): DbBackend {
   const v = (value ?? "").trim().toLowerCase();
-  return v === "postgres" || v === "pg" ? "postgres" : "supabase";
+  // Postgres is the default runtime; only an explicit opt-in selects legacy Supabase.
+  return v === "supabase" ? "supabase" : "postgres";
 }
 
 /** Server-side backend selection. Reads DB_BACKEND, falls back to the public var. */

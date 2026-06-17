@@ -335,3 +335,111 @@ create table if not exists actions (
 );
 create index if not exists actions_team_status_idx on actions (team_id, status, created_at desc);
 create index if not exists actions_team_actor_idx on actions (team_id, actor);
+
+-- ── codebases (Organ 8 seam: code health + AI-transformation analytics) ───────
+-- Team-tier only (no `access` column → external members see nothing; enforced in
+-- app code via lib/metrics/codebases + lib/codebases/visibility — no RLS backstop).
+-- Single writer: lib/codebases/ingest (guarded). Scanner posts RAW metrics; scores
+-- are computed in the brain at ingest (lib/codebases/score).
+create table if not exists codebases (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  slug text not null,
+  full_name text not null default '',
+  provider text not null default 'github',
+  default_branch text not null default 'main',
+  description text not null default '',
+  homepage text not null default '',
+  primary_language text not null default '',
+  languages jsonb not null default '{}',
+  stars integer not null default 0,
+  forks integer not null default 0,
+  open_issues integer not null default 0,
+  is_archived boolean not null default false,
+  last_scan_at timestamptz,
+  created_at timestamptz not null default now(),
+  unique (team_id, slug)
+);
+create index if not exists codebases_team_idx on codebases (team_id, slug);
+
+-- One time-series point per scan. Idempotency key (codebase_id, head_sha): the same
+-- commit re-scanned upserts (no dup point); a new commit adds a new point.
+create table if not exists code_metrics (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  codebase_id uuid not null references codebases(id) on delete cascade,
+  head_sha text not null,
+  window_days integer not null default 90,
+  scanned_at timestamptz not null default now(),
+  -- raw measures (pushed by the scanner)
+  loc integer not null default 0,
+  files integer not null default 0,
+  commits_window integer not null default 0,
+  ai_commits_window integer not null default 0,
+  additions_window integer not null default 0,
+  deletions_window integer not null default 0,
+  test_coverage_pct numeric(5,2),                 -- null = no coverage report found
+  recent_commits jsonb not null default '[]',     -- [{sha,author,ai,additions,deletions,committed_at,message}]
+  -- explicit scaffolding inputs (named, not vague JSON → testable scoring)
+  has_claude_md boolean not null default false,
+  has_agents_md boolean not null default false,
+  agents_md_count integer not null default 0,
+  skills_count integer not null default 0,
+  commands_count integer not null default 0,
+  -- brain-computed scores (lib/codebases/score)
+  agentic_score numeric(5,2) not null default 0,
+  health_score numeric(5,2) not null default 0,
+  ai_commit_ratio numeric(5,2) not null default 0,
+  test_coverage_score numeric(5,2) not null default 0,
+  scaffolding_score numeric(5,2) not null default 0,
+  skill_breadth_score numeric(5,2) not null default 0,
+  cadence_score numeric(5,2) not null default 0,
+  issue_health numeric(5,2) not null default 0,
+  created_at timestamptz not null default now(),
+  unique (codebase_id, head_sha)
+);
+create index if not exists code_metrics_codebase_time_idx on code_metrics (codebase_id, scanned_at desc);
+create index if not exists code_metrics_team_time_idx on code_metrics (team_id, scanned_at desc);
+
+-- Daily contribution aggregates, recomputed + upserted each scan over the window.
+-- author_key is stable (normalized email, or name when email absent); git history
+-- rarely carries a GitHub login. member_id maps to the roster when resolvable.
+create table if not exists code_contributions (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  codebase_id uuid not null references codebases(id) on delete cascade,
+  author_key text not null,
+  author_name text not null default '',
+  author_email text not null default '',
+  member_id uuid references members(id) on delete set null,
+  day date not null,
+  commits integer not null default 0,
+  ai_commits integer not null default 0,
+  additions integer not null default 0,
+  deletions integer not null default 0,
+  created_at timestamptz not null default now(),
+  unique (codebase_id, author_key, day)
+);
+create index if not exists code_contributions_codebase_idx on code_contributions (codebase_id, day desc);
+create index if not exists code_contributions_member_idx on code_contributions (member_id);
+
+create table if not exists github_issues (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  codebase_id uuid not null references codebases(id) on delete cascade,
+  number integer not null,
+  title text not null default '',
+  state text not null default 'open',             -- open | closed
+  is_pull_request boolean not null default false,
+  author_login text not null default '',
+  assignee_login text not null default '',
+  labels jsonb not null default '[]',
+  comments integer not null default 0,
+  url text not null default '',
+  opened_at timestamptz,
+  closed_at timestamptz,
+  updated_at timestamptz not null default now(),
+  unique (codebase_id, number)
+);
+create index if not exists github_issues_codebase_state_idx
+  on github_issues (codebase_id, state, updated_at desc);

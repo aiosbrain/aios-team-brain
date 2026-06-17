@@ -40,6 +40,81 @@ export const itemPayloadSchema = z.object({
 });
 export type ItemPayload = z.infer<typeof itemPayloadSchema>;
 
+// ── codebase scan ingest (POST /api/v1/codebases) ────────────────────────────
+// The Python scanner pushes RAW metrics only; the brain computes scores at ingest
+// (lib/codebases/score) and writes them. Team-tier keys only (enforced in the route).
+
+export const codebaseRecordSchema = z.object({
+  slug: z.string().min(1).max(120),
+  full_name: z.string().max(200).optional().default(""),
+  provider: z.string().max(40).optional().default("github"),
+  default_branch: z.string().max(120).optional().default("main"),
+  description: z.string().max(2000).optional().default(""),
+  homepage: z.string().max(500).optional().default(""),
+  primary_language: z.string().max(80).optional().default(""),
+  languages: z.record(z.string(), z.number()).optional().default({}),
+  stars: z.number().int().nonnegative().optional().default(0),
+  forks: z.number().int().nonnegative().optional().default(0),
+  open_issues: z.number().int().nonnegative().optional().default(0),
+  is_archived: z.boolean().optional().default(false),
+});
+
+export const codeMetricsSchema = z.object({
+  head_sha: z.string().min(1).max(64),
+  window_days: z.number().int().positive().max(3650).optional().default(90),
+  scanned_at: z.string().nullable().optional(),
+  loc: z.number().int().nonnegative().optional().default(0),
+  files: z.number().int().nonnegative().optional().default(0),
+  commits_window: z.number().int().nonnegative().optional().default(0),
+  ai_commits_window: z.number().int().nonnegative().optional().default(0),
+  additions_window: z.number().int().nonnegative().optional().default(0),
+  deletions_window: z.number().int().nonnegative().optional().default(0),
+  test_coverage_pct: z.number().min(0).max(100).nullable().optional().default(null),
+  recent_commits: z.array(z.record(z.string(), z.unknown())).optional().default([]),
+  // explicit scaffolding inputs
+  has_claude_md: z.boolean().optional().default(false),
+  has_agents_md: z.boolean().optional().default(false),
+  agents_md_count: z.number().int().nonnegative().optional().default(0),
+  skills_count: z.number().int().nonnegative().optional().default(0),
+  commands_count: z.number().int().nonnegative().optional().default(0),
+  // cadence inputs (used to compute cadence_score; not persisted raw)
+  active_days: z.number().int().nonnegative().optional().default(0),
+  days_since_last_commit: z.number().int().nonnegative().nullable().optional().default(null),
+});
+
+export const codeContributionSchema = z.object({
+  author_key: z.string().min(1).max(320),
+  author_name: z.string().max(200).optional().default(""),
+  author_email: z.string().max(320).optional().default(""),
+  day: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  commits: z.number().int().nonnegative().optional().default(0),
+  ai_commits: z.number().int().nonnegative().optional().default(0),
+  additions: z.number().int().nonnegative().optional().default(0),
+  deletions: z.number().int().nonnegative().optional().default(0),
+});
+
+export const githubIssueSchema = z.object({
+  number: z.number().int().positive(),
+  title: z.string().max(1000).optional().default(""),
+  state: z.enum(["open", "closed"]).optional().default("open"),
+  is_pull_request: z.boolean().optional().default(false),
+  author_login: z.string().max(120).optional().default(""),
+  assignee_login: z.string().max(120).optional().default(""),
+  labels: z.array(z.string()).optional().default([]),
+  comments: z.number().int().nonnegative().optional().default(0),
+  url: z.string().max(500).optional().default(""),
+  opened_at: z.string().nullable().optional(),
+  closed_at: z.string().nullable().optional(),
+});
+
+export const codebaseScanPayloadSchema = z.object({
+  codebase: codebaseRecordSchema,
+  metrics: codeMetricsSchema,
+  contributions: z.array(codeContributionSchema).max(5000).optional().default([]),
+  issues: z.array(githubIssueSchema).max(5000).optional().default([]),
+});
+export type CodebaseScanPayload = z.infer<typeof codebaseScanPayloadSchema>;
+
 export const querySchema = z.object({
   question: z.string().min(1).max(4000),
   project: z.string().nullable().optional(),

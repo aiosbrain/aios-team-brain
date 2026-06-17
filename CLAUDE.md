@@ -57,7 +57,7 @@ Put a spec-derived test in the tier that catches *its* failure mode:
 | Tier | Runs against | Catches |
 |---|---|---|
 | **unit** (`vitest.config.ts`) | nothing (pure) | parse/format boundaries, pure logic, **all drift/contract guards** |
-| **data-mechanics** *(planned)* | **real Postgres, stubbed model** | persistence & access: write→store→read, dedup, diff-sync, tier isolation |
+| **data-mechanics** (`vitest.datamechanics.config.ts`) | **real Postgres, stubbed model** | persistence & access: write→store→read, dedup, diff-sync, tier isolation |
 | **integration** | API route handlers over a real DB + the system-level `scripts/e2e.sh` | routing, auth, tier-422, the cross-process sync loop |
 | **eval** *(not built)* | real model API | model judgment (grounded-answer quality) — exercised live in `e2e.sh` step 9 |
 
@@ -65,10 +65,10 @@ Mental model: **unit = parse/guards · data-mechanics = persistence + access · 
 routing/auth · eval = model judgment.** Don't let a tier that stubs the model + clean inputs give
 false confidence for a data-pipeline change — put that test in data-mechanics.
 
-**The current gap:** brain tests run against an in-memory `lib/ingest/fake-supabase.ts`. That is
-fast and fine for orchestration shape, but it has no RLS, constraints, triggers, or the `search`
-generated column — so it cannot verify persistence or access to the observable outcome. The
-real-DB data-mechanics tier (in progress) is authoritative for those.
+**Why the real-DB tier matters:** the legacy in-memory `lib/ingest/fake-supabase.ts` is fast and fine
+for orchestration shape, but it has no constraints, triggers, or the `search` generated column — so it
+cannot verify persistence or access to the observable outcome. The real-Postgres data-mechanics tier
+(`npm run db:test:up && npm run test:datamechanics`) is **built** and is authoritative for those.
 
 ---
 
@@ -85,43 +85,47 @@ instance hosts more than one team.
 content never leaves the workspace. This is a product feature (the `external` API tier, OKF link
 redaction), independent of multi-tenancy, and it must hold on **both** backends:
 
-- **`supabase`** — the `items` RLS policy enforces tier isolation in the DB
-  (`my_tier(team)='team' OR access='external'`); app-code checks are defense-in-depth.
-- **`postgres`** (the self-host target) — there is **no RLS**; tier isolation is enforced
-  **entirely in app code**. A missing `access`/tier filter has **no DB backstop**.
+- **`postgres`** (the default + deployed target, Railway) — there is **no RLS**; tier isolation is
+  enforced **entirely in app code**. A missing `access`/tier filter has **no DB backstop**.
+- **`supabase`** (legacy opt-in) — the `items` RLS policy enforces tier isolation in the DB
+  (`my_tier(team)='team' OR access='external'`); the app-code checks are then defense-in-depth.
 
-So: RLS is just *the supabase example's mechanism* for tier isolation — drop it freely for
-multi-tenancy reasons, but **tier isolation itself is a standing invariant** that the app code
-must guarantee on the postgres target.
+So: RLS is just *the legacy supabase mechanism* for tier isolation — **tier isolation itself is a
+standing invariant** that the app code must guarantee on the postgres target.
 
-> 🔴 **Known gap (pending product decision on whether the `external` tier is in scope):** API
-> routes re-apply the tier filter in app code (safe on both backends), but **dashboard
-> server-component reads (`app/t/[team]/*`) rely on RLS** and have no app-code tier filter — so in
-> `postgres` mode an `external` member would see `team` items. Fix = route dashboard reads through
-> one tier-aware choke-point + a data-mechanics parity test. See `docs/ARCHITECTURE.md` §3.
+> ✅ **Enforced (was a known gap, now closed):** API routes and `lib/query/retrieve.ts` re-apply the
+> tier filter, and dashboard server-component reads (`app/t/[team]/*`) route through the
+> **`lib/auth/visibility` choke-point** (`visibleItems`/`canSeeAccess`) — guarded by
+> `test/guards/dashboard-tier-filter.test.ts` and proven by the data-mechanics tier. New dashboard
+> surfaces (e.g. Codebases) must add their own app-code tier gate + guard; there is no RLS backstop.
 
 ---
 
 ## 6. Stack & key commands
 
-- **Brain:** Next.js 16 (App Router) · React 19 · TypeScript · Vitest. DB via `@supabase/supabase-js`
-  (and the pg query-builder in postgres mode). LLM/reranker are provider-configurable (`docs/PROVIDERS.md`).
+- **Brain:** Next.js 16 (App Router) · React 19 · TypeScript · Vitest. DB via the `lib/db/pg` adapter
+  (default; Postgres on Railway) or `@supabase/supabase-js` (legacy). LLM/reranker are
+  provider-configurable (`docs/PROVIDERS.md`).
 - **Sidecar:** `ingestion/` — Python connector service (LlamaHub/Unstructured), HTTP-only to the brain.
 
 ```bash
-npm run dev            # next dev
+npm run dev            # next dev (DB_BACKEND=postgres by default)
 npm test               # vitest (unit tier)
 npm run check:docs     # docs drift guard (also runs in CI + pre-push)
 npm run lint           # eslint
-supabase start         # local Supabase stack (db :55422, api :55421) — the e2e/data-DB target
-supabase db reset      # migrate from zero (replay guard) + seed
+npm run pg:schema      # load postgres/schema.sql (canonical) into DATABASE_URL — also the prod rollout step
+npm run db:test:up     # ephemeral test Postgres + load schema (migrate-from-zero = replay guard)
+npm run test:datamechanics  # real-Postgres tier: persistence + tier isolation
 bash scripts/e2e.sh    # system-level integration: seed → push → materialize → 422 → pull → live query
+# legacy supabase backend only (DB_BACKEND=supabase): `supabase start` / `supabase db reset`
 ```
 
-- **Migrations:** plain SQL in `supabase/migrations/` (timestamp-prefixed; applied transactionally
-  by the Supabase CLI). `supabase db reset` migrates from zero — that's the replayability guard.
-- **Deploy:** self-host portable (Railway/Vercel). After a merge, **confirm the platform started a
-  new build** (CI webhooks can be silently dropped); re-trigger if the latest deploy predates the merge.
+- **Schema:** canonical = `postgres/schema.sql` (idempotent; `npm run pg:schema` loads it and is the
+  prod rollout step against Railway). `supabase/migrations/` is the **legacy/derived** RLS schema, used
+  only when `DB_BACKEND=supabase`; its `migrations-numbering` guard is now legacy-scoped.
+- **Deploy:** Postgres on Railway (self-host portable). After a merge, run `npm run pg:schema` against
+  prod for any schema change, and **confirm the platform started a new build** (CI webhooks can be
+  silently dropped); re-trigger if the latest deploy predates the merge.
 
 ---
 
