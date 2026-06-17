@@ -11,6 +11,7 @@
     "dev:seed": "set -a; . ./.env.local; set +a; npx tsx --conditions react-server scripts/seed-demo.ts",
     "dev:login": "set -a; . ./.env.local; set +a; npx tsx scripts/dev-login.ts",
     "pg:schema": "npx tsx scripts/pg-load-schema.ts",
+    "admin": "npx tsx --conditions react-server scripts/admin.ts",
     "test": "vitest run",
     "test:watch": "vitest",
     "check:docs": "node scripts/check-docs-drift.mjs",

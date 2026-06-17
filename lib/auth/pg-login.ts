@@ -39,12 +39,17 @@ export async function emailHasMember(email: string): Promise<boolean> {
   return (rows[0]?.n ?? 0) > 0;
 }
 
-/** Issue a magic-link token, or null if the email has no member (invite-only). */
-export async function issueMagicToken(email: string, nextPath: string): Promise<string | null> {
+/** Issue a magic-link token, or null if the email has no member (invite-only).
+ * `ttlMinutes` defaults to the login TTL; admin-minted links may pass a longer one. */
+export async function issueMagicToken(
+  email: string,
+  nextPath: string,
+  ttlMinutes: number = TOKEN_TTL_MIN
+): Promise<string | null> {
   if (!(await emailHasMember(email))) return null;
   const raw = randomBytes(32).toString("base64url");
   const hash = createHash("sha256").update(raw).digest("hex");
-  const expires = new Date(Date.now() + TOKEN_TTL_MIN * 60_000).toISOString();
+  const expires = new Date(Date.now() + ttlMinutes * 60_000).toISOString();
   await runSql(
     `insert into auth_tokens (token_hash, email, next_path, expires_at)
      values ($1, $2, $3, $4)`,
