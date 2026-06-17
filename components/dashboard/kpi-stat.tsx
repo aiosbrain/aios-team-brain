@@ -1,5 +1,6 @@
 import { ArrowDownRight, ArrowUpRight } from "lucide-react";
 import type { Kpi, KpiAccent } from "@/lib/metrics/pulse";
+import { Sparkline } from "@/components/sparkline";
 
 const ACCENT_TEXT: Record<KpiAccent, string> = {
   violet: "text-violet",
@@ -8,31 +9,6 @@ const ACCENT_TEXT: Record<KpiAccent, string> = {
   amber: "text-amber",
   emerald: "text-emerald",
 };
-
-/** Inline sparkline. Inherits color from the parent via currentColor. */
-function Sparkline({ data }: { data: number[] }) {
-  if (data.length < 2) return null;
-  const max = Math.max(...data, 1);
-  const w = 64;
-  const h = 20;
-  const step = w / (data.length - 1);
-  const points = data
-    .map((v, i) => `${(i * step).toFixed(1)},${(h - (v / max) * h).toFixed(1)}`)
-    .join(" ");
-  return (
-    <svg width={w} height={h} viewBox={`0 0 ${w} ${h}`} className="overflow-visible" aria-hidden>
-      <polyline
-        points={points}
-        fill="none"
-        stroke="currentColor"
-        strokeWidth={1.5}
-        strokeLinejoin="round"
-        strokeLinecap="round"
-        opacity={0.85}
-      />
-    </svg>
-  );
-}
 
 export function KpiStat({ kpi }: { kpi: Kpi }) {
   const accent = ACCENT_TEXT[kpi.accent];

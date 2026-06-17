@@ -2,24 +2,8 @@ import Link from "next/link";
 import { Star, CircleDot } from "lucide-react";
 import type { CodebaseSummary } from "@/lib/metrics/codebases";
 import { timeAgo } from "@/components/format";
+import { Sparkline } from "@/components/sparkline";
 import { ScoreRing } from "./score-ring";
-
-/** Inline sparkline (agentic score over the window), inherits color via currentColor. */
-function Spark({ data }: { data: number[] }) {
-  if (data.length < 2) return null;
-  const max = Math.max(...data, 1);
-  const w = 72;
-  const h = 22;
-  const step = w / (data.length - 1);
-  const points = data
-    .map((v, i) => `${(i * step).toFixed(1)},${(h - (v / max) * h).toFixed(1)}`)
-    .join(" ");
-  return (
-    <svg width={w} height={h} viewBox={`0 0 ${w} ${h}`} className="overflow-visible text-violet" aria-hidden>
-      <polyline points={points} fill="none" stroke="currentColor" strokeWidth={1.5} strokeLinejoin="round" opacity={0.85} />
-    </svg>
-  );
-}
 
 export function CodebaseCard({ teamSlug, cb }: { teamSlug: string; cb: CodebaseSummary }) {
   return (
@@ -46,7 +30,7 @@ export function CodebaseCard({ teamSlug, cb }: { teamSlug: string; cb: CodebaseS
           cov
         </span>
         <span className="ml-auto">
-          <Spark data={cb.spark} />
+          <Sparkline data={cb.spark} width={72} height={22} className="text-violet" />
         </span>
       </div>
 
