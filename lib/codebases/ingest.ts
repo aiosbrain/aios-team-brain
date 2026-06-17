@@ -82,7 +82,10 @@ export async function ingestCodebaseScan(
         additions_window: m.additions_window,
         deletions_window: m.deletions_window,
         test_coverage_pct: m.test_coverage_pct,
-        recent_commits: m.recent_commits,
+        // jsonb ARRAY column: the pg adapter only auto-casts plain objects to
+        // ::jsonb, not arrays — stringify so Postgres parses it as jsonb (this
+        // feature is postgres-only). Empty + non-empty both round-trip correctly.
+        recent_commits: JSON.stringify(m.recent_commits),
         has_claude_md: m.has_claude_md,
         has_agents_md: m.has_agents_md,
         agents_md_count: m.agents_md_count,
@@ -139,7 +142,7 @@ export async function ingestCodebaseScan(
         is_pull_request: iss.is_pull_request,
         author_login: iss.author_login,
         assignee_login: iss.assignee_login,
-        labels: iss.labels,
+        labels: JSON.stringify(iss.labels), // jsonb array — see recent_commits note above
         comments: iss.comments,
         url: iss.url,
         opened_at: iss.opened_at || null,

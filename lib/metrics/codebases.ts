@@ -64,7 +64,8 @@ export async function getCodebaseSummaries(
       .select("codebase_id, scanned_at, agentic_score, health_score, test_coverage_pct, ai_commit_ratio")
       .eq("team_id", teamId)
       .gte("scanned_at", windowStart)
-      .order("scanned_at", { ascending: true })
+      // DESC + limit keeps the NEWEST points (ascending+limit would drop them at scale).
+      .order("scanned_at", { ascending: false })
       .limit(10_000),
   ]);
 
@@ -79,7 +80,7 @@ export async function getCodebaseSummaries(
   }[];
   const metrics = (mRes.data ?? []) as MetricRow[];
 
-  // group metrics by codebase, time-ordered
+  // group metrics by codebase (rows arrive newest-first)
   const byCb = new Map<string, MetricRow[]>();
   for (const m of metrics) {
     const arr = byCb.get(m.codebase_id) ?? [];
@@ -88,8 +89,8 @@ export async function getCodebaseSummaries(
   }
 
   const summaries: CodebaseSummary[] = codebases.map((cb) => {
-    const series = byCb.get(cb.id) ?? [];
-    const latest = series[series.length - 1];
+    const series = byCb.get(cb.id) ?? []; // newest-first
+    const latest = series[0];
     return {
       id: cb.id,
       slug: cb.slug,
@@ -102,7 +103,8 @@ export async function getCodebaseSummaries(
       health_score: num(latest?.health_score),
       test_coverage_pct: latest?.test_coverage_pct == null ? null : num(latest.test_coverage_pct),
       ai_commit_ratio: num(latest?.ai_commit_ratio),
-      spark: series.map((s) => num(s.agentic_score)),
+      // chronological for the sparkline (series is newest-first)
+      spark: series.map((s) => num(s.agentic_score)).reverse(),
     };
   });
 
@@ -266,7 +268,8 @@ export async function getCodebaseDetail(
       .select(METRIC_COLS)
       .eq("codebase_id", codebaseId)
       .gte("scanned_at", windowStart)
-      .order("scanned_at", { ascending: true })
+      // DESC + limit keeps the newest points; reversed below for chronological trend.
+      .order("scanned_at", { ascending: false })
       .limit(2000),
     supabase
       .from("code_contributions")
@@ -288,8 +291,10 @@ export async function getCodebaseDetail(
     if (m.display_name) memberNames.set(m.id, m.display_name);
   }
 
+  // newest-first from the query; reverse a copy for the chronological trend.
   const metrics = (metricsRes.data ?? []) as unknown as Record<string, unknown>[];
-  const latest = metrics[metrics.length - 1];
+  const chronological = [...metrics].reverse();
+  const latest = metrics[0];
 
   const breakdown: AgenticBreakdown | null = latest
     ? {
@@ -311,7 +316,7 @@ export async function getCodebaseDetail(
       }
     : null;
 
-  const trend: TrendPoint[] = metrics.map((m) => ({
+  const trend: TrendPoint[] = chronological.map((m) => ({
     date: new Date(m.scanned_at as string).toLocaleDateString("en-US", {
       month: "short",
       day: "numeric",
@@ -373,7 +378,9 @@ export async function getCodebaseDetail(
     open_issues: num(c.open_issues as number),
     last_scan_at: (c.last_scan_at as string) ?? null,
     breakdown,
-    recent_commits: latest ? ((latest.recent_commits as Record<string, unknown>[]) ?? []) : [],
+    recent_commits: Array.isArray(latest?.recent_commits)
+      ? (latest.recent_commits as Record<string, unknown>[])
+      : [],
     trend,
     contributors,
     issues,

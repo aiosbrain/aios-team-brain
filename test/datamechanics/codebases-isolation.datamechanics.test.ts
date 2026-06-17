@@ -31,9 +31,15 @@ function buildScan(over: {
       commands_count: 2,
       active_days: 30,
       days_since_last_commit: 1,
+      // NON-EMPTY jsonb array — regression guard: the pg adapter doesn't auto-cast
+      // arrays to ::jsonb, so this must round-trip via the ingest's JSON.stringify.
+      recent_commits: [
+        { sha: "abc1234", author: "Jo", ai: true, additions: 10, deletions: 2, committed_at: "2026-06-17T00:00:00Z", message: "feat: x" },
+      ],
     },
     contributions: over.contributions ?? [],
-    issues: [{ number: 1, title: "first", state: "open" }],
+    // labels is a NON-EMPTY jsonb array too — same regression guard.
+    issues: [{ number: 1, title: "first", state: "open", labels: ["bug", "p1"], url: "http://x/1" }],
   });
 }
 
@@ -73,6 +79,10 @@ describe("codebase tier isolation (real Postgres, no RLS backstop)", () => {
     const detail = await getCodebaseDetail(db(), seed.teamId, slug, "90d", "team");
     expect(detail?.slug).toBe(slug);
     expect(detail?.breakdown?.agentic_score).toBeGreaterThan(0);
+    // jsonb ARRAY columns round-trip (would have thrown at ingest if the adapter
+    // bound them as native arrays instead of jsonb).
+    expect(detail?.recent_commits.length).toBe(1);
+    expect(detail?.issues[0]?.labels).toContain("bug");
   });
 });
 
@@ -89,6 +99,23 @@ describe("codebase scan idempotency (real Postgres)", () => {
     await ingestScan(seed, buildScan({ slug, head_sha: "b".repeat(40) })); // new commit
     const after2 = await db().from("code_metrics").select("id").eq("codebase_id", res.codebase_id);
     expect((after2.data ?? []).length).toBe(2);
+  });
+
+  it("summary reflects the NEWEST scan point (desc order, not dropped by limit)", async () => {
+    const seed = await seedTeam();
+    const slug = `repo-${randomUUID().slice(0, 6)}`;
+    // older scan: coverage 70; newer scan: coverage 20 (distinct head_sha + scanned_at)
+    const older = buildScan({ slug, head_sha: "a".repeat(40) });
+    older.metrics.scanned_at = "2026-06-10T00:00:00Z";
+    await ingestScan(seed, older);
+    const newer = buildScan({ slug, head_sha: "b".repeat(40) });
+    newer.metrics.test_coverage_pct = 20;
+    newer.metrics.scanned_at = "2026-06-16T00:00:00Z";
+    await ingestScan(seed, newer);
+
+    const { codebases } = await getCodebaseSummaries(db(), seed.teamId, "90d", "team");
+    const row = codebases.find((c) => c.slug === slug);
+    expect(row?.test_coverage_pct).toBe(20); // newest wins
   });
 
   it("contributions recompute + upsert by (author_key, day), and map to a member", async () => {

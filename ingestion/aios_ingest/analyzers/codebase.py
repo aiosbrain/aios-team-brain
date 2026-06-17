@@ -141,21 +141,36 @@ def _analyze_git(repo: Path, window_days: int) -> dict[str, Any]:
     }
 
 
+def _entries_under(tracked: list[str], subdir: str) -> set[str]:
+    """Top-level entry names directly under any `.claude/<subdir>/` directory.
+
+    Handles both a root-level `.claude/skills/foo/...` and a nested
+    `pkg/.claude/skills/foo` — `str.find` locates the marker wherever it sits, so
+    a root path (index 0) no longer trips the leading-slash assumption that the
+    earlier split-based logic crashed on.
+    """
+    marker = f".claude/{subdir}/"
+    names: set[str] = set()
+    for f in tracked:
+        idx = f.find(marker)
+        if idx == -1:
+            continue
+        rest = f[idx + len(marker):]
+        head = rest.split("/", 1)[0]
+        if head:
+            names.add(head)
+    return names
+
+
 def _detect_scaffolding(repo: Path) -> dict[str, Any]:
     tracked = _git(repo, "ls-files").splitlines()
     agents = [f for f in tracked if f.lower().endswith("agents.md")]
-    skills = {f.split("/.claude/skills/")[1].split("/")[0]
-              for f in tracked if "/.claude/skills/" in f or f.startswith(".claude/skills/")}
-    skills |= {f.split(".claude/skills/")[1].split("/")[0]
-               for f in tracked if f.startswith(".claude/skills/")}
-    commands = [f for f in tracked
-                if f.startswith(".claude/commands/") or "/.claude/commands/" in f]
     return {
         "has_claude_md": (repo / "CLAUDE.md").is_file(),
         "has_agents_md": len(agents) > 0,
         "agents_md_count": len(agents),
-        "skills_count": len({s for s in skills if s}),
-        "commands_count": len(commands),
+        "skills_count": len(_entries_under(tracked, "skills")),
+        "commands_count": len(_entries_under(tracked, "commands")),
         "files": len(tracked),
         "loc": _count_loc(repo, tracked),
     }
