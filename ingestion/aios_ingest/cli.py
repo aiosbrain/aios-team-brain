@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from typing import Any
 
 import click
@@ -95,30 +96,41 @@ def sync(config_path, only) -> None:
 @click.option("--slug", required=True, help="codebase slug (unique per team), e.g. aios-team-brain")
 @click.option("--full-name", default="", help="owner/repo (enables GitHub metadata + issues)")
 @click.option("--window", "window_days", default=90, type=int, help="analysis window in days")
-@click.option("--github-token", default=None, help="GitHub token (or env GITHUB_TOKEN) for enrichment")
-def scan(repo_path, slug, full_name, window_days, github_token) -> None:
+@click.option("--backfill", default=0, type=int, help="also emit N weekly historical points (fills the trend)")
+def scan(repo_path, slug, full_name, window_days, backfill) -> None:
     """Analyze a local repo's git history + scaffolding and push RAW metrics to the brain.
+    GitHub enrichment (issues/PRs/metadata) uses the GITHUB_TOKEN env var if set
+    (never pass tokens as flags). The brain computes the agentic/health scores.
 
-    The brain computes the agentic/health scores. Example:
-      aios-ingest scan --path ../aios-team-brain --slug aios-team-brain --full-name org/aios-team-brain
+      GITHUB_TOKEN=… aios-ingest scan --path ../x --slug x --full-name org/x --backfill 12
     """
-    from .analyzers import analyze_repo
+    from .analyzers import analyze_repo, analyze_history
 
     settings = BrainSettings.from_env()
+    token = os.environ.get("GITHUB_TOKEN")  # read from env only; never logged
     payload = analyze_repo(
-        repo_path, slug=slug, full_name=full_name, window_days=window_days, github_token=github_token
+        repo_path, slug=slug, full_name=full_name, window_days=window_days, github_token=token
+    )
+    history = (
+        analyze_history(repo_path, slug=slug, full_name=full_name, window_days=window_days,
+                        weeks=backfill, github_token=token)
+        if backfill > 0
+        else []
     )
 
     async def run() -> None:
         async with BrainClient(settings.base_url, settings.api_key, settings.team) as client:
             result = await client.push_codebase_scan(payload)
             click.echo(json.dumps(result))
+            for hp in history:
+                await client.push_codebase_scan(hp)
 
     m = payload["metrics"]
     click.echo(
         f"scanned {slug}: {m['commits_window']} commits ({m['ai_commits_window']} AI-assisted), "
         f"{len(payload['contributions'])} author-days, coverage="
         f"{m['test_coverage_pct'] if m['test_coverage_pct'] is not None else 'none'}"
+        + (f"; +{len(history)} historical trend points" if history else "")
     )
     asyncio.run(run())
 

@@ -16,7 +16,7 @@ import os
 import re
 import subprocess
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +32,7 @@ _CODE_EXT = {
 }
 _MAX_FILE_BYTES = 1_000_000  # skip giant/generated files when counting LOC
 _MAX_ISSUE_PAGES = 10  # GitHub issues pagination cap (1000 issues); logged if hit
+_MAX_BACKFILL_POINTS = 60  # bound on historical trend points per scan
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -52,11 +53,22 @@ def _author_key(name: str, email: str) -> str:
     return (email or name).strip().lower()
 
 
-def _analyze_git(repo: Path, window_days: int) -> dict[str, Any]:
-    """Parse `git log` over the window into per-author/day rollups + window totals."""
-    since = f"--since={window_days}.days.ago"
+def _analyze_git(
+    repo: Path,
+    window_days: int,
+    *,
+    ref: str = "HEAD",
+    since_iso: str | None = None,
+    as_of: datetime | None = None,
+) -> dict[str, Any]:
+    """Parse `git log` over the window into per-author/day rollups + window totals.
+
+    For a historical snapshot pass `ref=<sha>` (the tip at that point), `since_iso`
+    (absolute window start) and `as_of` (the snapshot date, for cadence freshness).
+    """
+    since = f"--since={since_iso}" if since_iso else f"--since={window_days}.days.ago"
     fmt = f"tformat:{_RS}%H{_FS}%an{_FS}%ae{_FS}%aI{_FS}%B{_FS}"
-    raw = _git(repo, "log", since, "--no-merges", f"--pretty={fmt}", "--numstat")
+    raw = _git(repo, "log", ref, since, "--no-merges", f"--pretty={fmt}", "--numstat")
 
     contribs: dict[tuple[str, str], dict[str, Any]] = defaultdict(
         lambda: {"author_name": "", "author_email": "", "commits": 0, "ai_commits": 0,
@@ -131,7 +143,8 @@ def _analyze_git(repo: Path, window_days: int) -> dict[str, Any]:
 
     days_since_last = None
     if last_dt is not None:
-        days_since_last = max(0, (datetime.now(timezone.utc) - last_dt).days)
+        ref_now = as_of or datetime.now(timezone.utc)
+        days_since_last = max(0, (ref_now - last_dt).days)
 
     return {
         "commits_window": totals["commits"],
@@ -154,6 +167,7 @@ def _entries_under(tracked: list[str], subdir: str) -> set[str]:
     earlier split-based logic crashed on.
     """
     marker = f".claude/{subdir}/"
+    skip = {"readme.md", "index.md"}  # documentation, not a skill/command
     names: set[str] = set()
     for f in tracked:
         idx = f.find(marker)
@@ -161,14 +175,15 @@ def _entries_under(tracked: list[str], subdir: str) -> set[str]:
             continue
         rest = f[idx + len(marker):]
         head = rest.split("/", 1)[0]
-        if head:
+        if head and head.lower() not in skip:
             names.add(head)
     return names
 
 
 def _detect_scaffolding(repo: Path) -> dict[str, Any]:
     tracked = _git(repo, "ls-files").splitlines()
-    agents = [f for f in tracked if f.lower().endswith("agents.md")]
+    # Match the AGENTS.md basename only — `endswith` would catch e.g. managed-agents.md.
+    agents = [f for f in tracked if Path(f).name.lower() == "agents.md"]
     return {
         "has_claude_md": (repo / "CLAUDE.md").is_file(),
         "has_agents_md": len(agents) > 0,
@@ -306,7 +321,16 @@ def analyze_repo(
     gh = _github_enrich(full_name, github_token or os.environ.get("GITHUB_TOKEN"))
     meta = gh.get("meta", {})
 
-    codebase = {
+    return {
+        "codebase": _codebase_block(slug, full_name, meta),
+        "metrics": _metrics_block(git, scaff, coverage, _head_sha(repo), window_days),
+        "contributions": git["contributions"],
+        "issues": gh.get("issues", []),
+    }
+
+
+def _codebase_block(slug: str, full_name: str, meta: dict[str, Any]) -> dict[str, Any]:
+    return {
         "slug": slug,
         "full_name": full_name,
         "default_branch": meta.get("default_branch", "main"),
@@ -318,8 +342,18 @@ def analyze_repo(
         "forks": meta.get("forks", 0),
         "open_issues": meta.get("open_issues", 0),
     }
-    metrics = {
-        "head_sha": _head_sha(repo),
+
+
+def _metrics_block(
+    git: dict[str, Any],
+    scaff: dict[str, Any],
+    coverage: float | None,
+    head_sha: str,
+    window_days: int,
+    scanned_at: str | None = None,
+) -> dict[str, Any]:
+    block = {
+        "head_sha": head_sha,
         "window_days": window_days,
         "loc": scaff["loc"],
         "files": scaff["files"],
@@ -337,9 +371,76 @@ def analyze_repo(
         "active_days": git["active_days"],
         "days_since_last_commit": git["days_since_last_commit"],
     }
-    return {
-        "codebase": codebase,
-        "metrics": metrics,
-        "contributions": git["contributions"],
-        "issues": gh.get("issues", []),
-    }
+    if scanned_at:
+        block["scanned_at"] = scanned_at  # historical snapshots set their as-of date
+    return block
+
+
+def _scaffolding_at(repo: Path, sha: str) -> dict[str, Any]:
+    """Read scaffolding at a past commit via a throwaway worktree (non-destructive —
+    never touches the live working tree or HEAD)."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="aios-wt-") as tmp:
+        try:
+            _git(repo, "worktree", "add", "--detach", "--quiet", tmp, sha)
+        except subprocess.CalledProcessError:
+            return _detect_scaffolding(repo)  # fall back to current if checkout fails
+        try:
+            return _detect_scaffolding(Path(tmp))
+        finally:
+            _git(repo, "worktree", "remove", "--force", tmp)
+
+
+def analyze_history(
+    path: str,
+    *,
+    slug: str,
+    full_name: str = "",
+    window_days: int = 90,
+    weeks: int = 12,
+    github_token: str | None = None,
+) -> list[dict[str, Any]]:
+    """Emit one scan payload per DISTINCT historical HEAD over the past `weeks` weeks —
+    for the trend chart. Samples DAILY (so a young-but-active repo still gets multiple
+    points) and dedupes by SHA, so the result is one point per distinct code state.
+    Idempotent on the brain side (unique on codebase_id, head_sha). Git metrics +
+    scaffolding are computed at each historical commit; coverage is null for the past
+    (reports aren't committed). Capped at _MAX_BACKFILL_POINTS."""
+    repo = Path(path).resolve()
+    if not (repo / ".git").exists():
+        raise ValueError(f"{repo} is not a git repository")
+    branch = _git(repo, "rev-parse", "--abbrev-ref", "HEAD").strip() or "HEAD"
+    gh = _github_enrich(full_name, github_token or os.environ.get("GITHUB_TOKEN"))
+    meta = gh.get("meta", {})
+    codebase = _codebase_block(slug, full_name, meta)
+
+    now = datetime.now(timezone.utc)
+    seen: set[str] = set()
+    payloads: list[dict[str, Any]] = []
+    for d in range(weeks * 7 + 1):
+        if len(payloads) >= _MAX_BACKFILL_POINTS:
+            break
+        before = (now - timedelta(days=d)).date().isoformat()
+        try:
+            sha = _git(repo, "rev-list", "-1", f"--before={before}", branch).strip()
+        except subprocess.CalledProcessError:
+            continue
+        if not sha or sha in seen:
+            continue
+        seen.add(sha)
+        sha_iso = _git(repo, "show", "-s", "--format=%aI", sha).strip()
+        try:
+            sha_dt = datetime.fromisoformat(sha_iso)
+        except ValueError:
+            sha_dt = now
+        since_iso = (sha_dt - timedelta(days=window_days)).date().isoformat()
+        git = _analyze_git(repo, window_days, ref=sha, since_iso=since_iso, as_of=sha_dt)
+        scaff = _scaffolding_at(repo, sha)
+        payloads.append({
+            "codebase": codebase,
+            "metrics": _metrics_block(git, scaff, None, sha, window_days, scanned_at=sha_iso),
+            "contributions": git["contributions"],
+            "issues": [],  # issues are point-in-time; only the live scan syncs them
+        })
+    return payloads

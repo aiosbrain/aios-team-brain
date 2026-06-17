@@ -9,6 +9,15 @@ export default defineConfig({
     include: ["**/*.test.ts"],
     // Data-mechanics tests need a real DB; they run via vitest.datamechanics.config.ts.
     exclude: ["node_modules/**", "ingestion/**", ".next/**", "test/datamechanics/**"],
+    // `npm run coverage` writes coverage/coverage-summary.json — the codebase scanner
+    // reads total.lines.pct from it. Scoped to lib/** (the unit-tested core) for a
+    // representative number rather than diluting with untested UI.
+    coverage: {
+      provider: "v8",
+      reporter: ["text-summary", "json-summary"],
+      reportsDirectory: "coverage",
+      include: ["lib/**"],
+    },
   },
   resolve: {
     alias: {
