@@ -1,10 +1,11 @@
 "use server";
 
-import { createHash, randomBytes } from "node:crypto";
 import { revalidatePath } from "next/cache";
 import { serverClient } from "@/lib/supabase/server";
 import { adminClient } from "@/lib/supabase/admin";
 import { getSessionUser } from "@/lib/auth/session";
+import { createMember } from "@/lib/admin/members";
+import { issueApiKey as issueApiKeyPrimitive, revokeApiKey as revokeApiKeyPrimitive } from "@/lib/admin/keys";
 
 /** Verify the caller is an active admin of the team; returns ids or null. */
 async function requireAdmin(teamSlug: string) {
@@ -35,17 +36,21 @@ export async function inviteMember(
   const ctx = await requireAdmin(teamSlug);
   if (!ctx) return { ok: false, error: "admins only" };
 
-  // RLS-governed insert (members_admin_insert policy enforces this server-side too)
-  const supabase = await serverClient();
-  const { error } = await supabase.from("members").insert({
-    team_id: ctx.teamId,
-    email: form.email.trim().toLowerCase(),
-    display_name: form.displayName.trim(),
-    actor_handle: form.actorHandle.trim().toLowerCase(),
-    role: form.role,
-    status: "invited",
-  });
-  if (error) return { ok: false, error: error.message };
+  try {
+    await createMember(
+      adminClient(),
+      ctx.teamId,
+      {
+        email: form.email,
+        displayName: form.displayName,
+        actorHandle: form.actorHandle,
+        role: form.role,
+      },
+      { actor: { kind: "member", memberId: ctx.myMemberId } }
+    );
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "create failed" };
+  }
   revalidatePath(`/t/${teamSlug}/admin/members`);
   return { ok: true };
 }
@@ -58,33 +63,15 @@ export async function issueApiKey(
   const ctx = await requireAdmin(teamSlug);
   if (!ctx) return { ok: false, error: "admins only" };
 
-  // The secret is generated server-side and only its sha256 is stored —
-  // key_hash is column-revoked from authenticated clients, so this uses the
-  // admin client (the one sanctioned write path for hashes).
-  const keyId = randomBytes(6).toString("hex");
-  const secret = randomBytes(32).toString("base64url");
-  const admin = adminClient();
-  const { error } = await admin.from("api_keys").insert({
-    team_id: ctx.teamId,
-    member_id: memberId,
-    key_id: keyId,
-    key_hash: createHash("sha256").update(secret).digest("hex"),
-    name: name.trim() || "unnamed key",
-  });
-  if (error) return { ok: false, error: error.message };
-
-  await admin.from("audit_log").insert({
-    team_id: ctx.teamId,
-    actor_kind: "member",
-    member_id: ctx.myMemberId,
-    action: "api_key.issued",
-    target_type: "api_key",
-    target_id: keyId,
-    meta: { for_member: memberId },
-  });
-
-  revalidatePath(`/t/${teamSlug}/admin/keys`);
-  return { ok: true, key: `aios_${keyId}_${secret}` };
+  try {
+    const { key } = await issueApiKeyPrimitive(adminClient(), ctx.teamId, memberId, name, {
+      actor: { kind: "member", memberId: ctx.myMemberId },
+    });
+    revalidatePath(`/t/${teamSlug}/admin/keys`);
+    return { ok: true, key };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "issue failed" };
+  }
 }
 
 export async function revokeApiKey(
@@ -94,22 +81,13 @@ export async function revokeApiKey(
   const ctx = await requireAdmin(teamSlug);
   if (!ctx) return { ok: false, error: "admins only" };
 
-  const supabase = await serverClient(); // RLS: api_keys_admin_update
-  const { error } = await supabase
-    .from("api_keys")
-    .update({ revoked_at: new Date().toISOString() })
-    .eq("id", apiKeyId);
-  if (error) return { ok: false, error: error.message };
-
-  const admin = adminClient();
-  await admin.from("audit_log").insert({
-    team_id: ctx.teamId,
-    actor_kind: "member",
-    member_id: ctx.myMemberId,
-    action: "api_key.revoked",
-    target_type: "api_key",
-    target_id: apiKeyId,
-  });
-  revalidatePath(`/t/${teamSlug}/admin/keys`);
-  return { ok: true };
+  try {
+    await revokeApiKeyPrimitive(adminClient(), ctx.teamId, apiKeyId, {
+      actor: { kind: "member", memberId: ctx.myMemberId },
+    });
+    revalidatePath(`/t/${teamSlug}/admin/keys`);
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "revoke failed" };
+  }
 }
