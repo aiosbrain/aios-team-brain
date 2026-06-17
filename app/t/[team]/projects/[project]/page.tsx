@@ -2,6 +2,8 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 import { CircleCheck, CircleX, FolderOpen } from "lucide-react";
 import { serverClient } from "@/lib/supabase/server";
+import { currentMember } from "@/lib/auth/guard";
+import { visibleItems } from "@/lib/auth/visibility";
 import { KindBadge } from "@/components/kind-badge";
 import { TierBadge } from "@/components/tier-badge";
 import { EmptyState } from "@/components/empty-state";
@@ -49,13 +51,17 @@ export default async function ProjectPage({
     .maybeSingle();
   if (!project) notFound();
 
+  const me = await currentMember(team.id);
   const [{ data: items }, { data: decisions }, { data: roster }] = await Promise.all([
-    supabase
-      .from("items")
-      .select("id, path, kind, access, actor, frontmatter, synced_at")
-      .eq("team_id", team.id)
-      .eq("project_id", project.id)
-      .order("path"),
+    visibleItems(
+      supabase
+        .from("items")
+        .select("id, path, kind, access, actor, frontmatter, synced_at")
+        .eq("team_id", team.id)
+        .eq("project_id", project.id)
+        .order("path"),
+      me?.tier ?? "external"
+    ),
     supabase
       .from("decisions")
       .select("id, row_key, decided_at, title, decided_by, still_valid")

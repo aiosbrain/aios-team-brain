@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { Rocket } from "lucide-react";
 import { serverClient } from "@/lib/supabase/server";
+import { visibleItems } from "@/lib/auth/visibility";
 import { getSessionUser } from "@/lib/auth/session";
 import { CopySnippet } from "@/components/copy-snippet";
 import { getPulseMetrics } from "@/lib/metrics/pulse";
@@ -93,17 +94,21 @@ export default async function TeamHome({
   ]);
   if (!team) return null; // layout already rendered the no-team screen
 
-  const [{ count: itemCount }, { data: me }] = await Promise.all([
-    supabase.from("items").select("id", { count: "exact", head: true }).eq("team_id", team.id),
-    supabase
-      .from("members")
-      .select("role")
-      .eq("team_id", team.id)
-      .eq("auth_user_id", user?.id ?? "")
-      .eq("status", "active")
-      .maybeSingle(),
-  ]);
+  const { data: me } = await supabase
+    .from("members")
+    .select("role, tier")
+    .eq("team_id", team.id)
+    .eq("auth_user_id", user?.id ?? "")
+    .eq("status", "active")
+    .maybeSingle();
   const isAdmin = me?.role === "admin";
+  const tier = ((me?.tier as "team" | "external" | undefined) ?? "external");
+
+  // Tier-filtered count (no RLS backstop in postgres mode).
+  const { count: itemCount } = await visibleItems(
+    supabase.from("items").select("id", { count: "exact", head: true }).eq("team_id", team.id),
+    tier
+  );
 
   if (!itemCount) {
     return (
@@ -117,12 +122,15 @@ export default async function TeamHome({
   const [pulse, { data: activity }, { data: openTasks }, { data: commitments }, { data: decisions }] =
     await Promise.all([
       getPulseMetrics(supabase, team.id, range, isAdmin),
-      supabase
-        .from("items")
-        .select("id, path, kind, actor, synced_at, projects(slug)")
-        .eq("team_id", team.id)
-        .order("synced_at", { ascending: false })
-        .limit(12),
+      visibleItems(
+        supabase
+          .from("items")
+          .select("id, path, kind, actor, synced_at, projects(slug)")
+          .eq("team_id", team.id)
+          .order("synced_at", { ascending: false })
+          .limit(12),
+        tier
+      ),
       supabase
         .from("tasks")
         .select("id, title, assignee, status")

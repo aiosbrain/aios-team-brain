@@ -7,13 +7,18 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
+    "prepare": "git config core.hooksPath .githooks || true",
     "dev:seed": "set -a; . ./.env.local; set +a; npx tsx --conditions react-server scripts/seed-demo.ts",
     "dev:login": "set -a; . ./.env.local; set +a; npx tsx scripts/dev-login.ts",
     "pg:schema": "npx tsx scripts/pg-load-schema.ts",
     "test": "vitest run",
     "test:watch": "vitest",
     "check:docs": "node scripts/check-docs-drift.mjs",
-    "test:setup": "bash scripts/dev-test-setup.sh"
+    "test:setup": "bash scripts/dev-test-setup.sh",
+    "db:test:up": "docker compose -f compose.test.yml up -d --wait && DATABASE_URL=postgres://app:app@localhost:5434/app_test npm run pg:schema",
+    "db:test:down": "docker compose -f compose.test.yml down -v",
+    "test:datamechanics": "vitest run --config vitest.datamechanics.config.ts",
+    "test:datamechanics:local": "DATABASE_TEST_URL=postgres://app:app@localhost:5434/app_test vitest run --config vitest.datamechanics.config.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.104.1",

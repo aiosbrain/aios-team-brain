@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# pre-push: block pushes that would drift the docs from the code.
+#
+# Enabled via core.hooksPath=.githooks, set automatically by `npm install` (the
+# package.json "prepare" script). The brain repo is private on a free org plan, so
+# GitHub-side branch protection isn't available; this is the local enforcement of the
+# same `Docs drift guard` check that CI runs advisorily on every PR.
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+guard="$repo_root/scripts/check-docs-drift.mjs"
+
+if [ -f "$guard" ]; then
+  echo "pre-push: checking docs drift…"
+  if ! node "$guard"; then
+    echo "" >&2
+    echo "pre-push: BLOCKED — docs drift detected." >&2
+    echo "  Update the drift inventories in docs/ARCHITECTURE.md, then re-run: npm run check:docs" >&2
+    echo "  (To bypass in an emergency: git push --no-verify)" >&2
+    exit 1
+  fi
+fi
+exit 0

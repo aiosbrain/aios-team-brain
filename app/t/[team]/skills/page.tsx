@@ -2,6 +2,8 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import { Blocks } from "lucide-react";
 import { serverClient } from "@/lib/supabase/server";
+import { currentMember } from "@/lib/auth/guard";
+import { visibleItems } from "@/lib/auth/visibility";
 import { TierBadge } from "@/components/tier-badge";
 import { EmptyState } from "@/components/empty-state";
 import { CopySnippet } from "@/components/copy-snippet";
@@ -68,13 +70,17 @@ export default async function SkillsPage({ params }: { params: Promise<{ team: s
   const { data: team } = await supabase.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
   if (!team) return null;
 
-  const { data: items } = await supabase
-    .from("items")
-    .select("id, path, access, actor, synced_at, frontmatter, body, projects(slug)")
-    .eq("team_id", team.id)
-    .eq("kind", "skill")
-    .order("synced_at", { ascending: false })
-    .limit(200);
+  const me = await currentMember(team.id);
+  const { data: items } = await visibleItems(
+    supabase
+      .from("items")
+      .select("id, path, access, actor, synced_at, frontmatter, body, projects(slug)")
+      .eq("team_id", team.id)
+      .eq("kind", "skill")
+      .order("synced_at", { ascending: false })
+      .limit(200),
+    me?.tier ?? "external"
+  );
   const skills = (items ?? []) as unknown as SkillItem[];
 
   return (

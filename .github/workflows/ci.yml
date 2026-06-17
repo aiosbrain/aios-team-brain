@@ -31,6 +31,34 @@ jobs:
       - run: npm ci
       - run: npm test
 
+  datamechanics-tests:
+    name: Data-mechanics tests (real Postgres)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: app
+          POSTGRES_PASSWORD: app
+          POSTGRES_DB: app_test
+        ports: ["5434:5432"]
+        options: >-
+          --health-cmd "pg_isready -U app -d app_test"
+          --health-interval 2s --health-timeout 3s --health-retries 30
+    env:
+      # Matches vitest.datamechanics.config.ts (no-prod-fallback guard reads this).
+      DATABASE_TEST_URL: postgres://app:app@localhost:5434/app_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+      - run: npm ci
+      # migrate-from-zero into the service DB (also the replay guard)
+      - run: DATABASE_URL="$DATABASE_TEST_URL" npm run pg:schema
+      - run: npm run test:datamechanics
+
   ingestion-tests:
     name: Ingestion tests (pytest)
     runs-on: ubuntu-latest

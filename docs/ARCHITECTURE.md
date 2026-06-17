@@ -8,6 +8,27 @@ portable: plain SQL migrations, Postgres-backed rate limiting, no Vercel-only de
 > This doc describes **structure**. The enumerable surfaces (API routes, DB tables,
 > ingestion sources) are guarded against drift by `scripts/check-docs-drift.mjs` — see
 > [Docs drift guard](#docs-drift-guard).
+>
+> **Last verified against code: 2026-06-17.** If a flow here disagrees with the code, the
+> code wins — fix the doc (same PR).
+
+## Sources of truth
+
+Where each piece of state lives, who may write it, who reads it, and how access is enforced.
+Reason from this table, not from a random call site.
+
+| State | Store (table) | Writer | Readers | Tier/access enforcement |
+|---|---|---|---|---|
+| Synced content | `items`, `item_versions` | **`lib/ingest` only** (single-writer guarded) | dashboard pages, `/api/v1/items`, `lib/query/retrieve`, okf-bundle, metrics | supabase: RLS; postgres: app-code — API ✅, dashboard ✅ (`lib/auth/visibility` choke-point, guarded) |
+| Tasks | `tasks` | `lib/ingest` (sync rows) + `app/actions/tasks.ts` (UI) | dashboard, `/api/v1/tasks` | team-scoped; `origin='ui'` rows survive sync diff |
+| Decisions | `decisions` | `lib/ingest` + `app/actions/decisions.ts` | dashboard | `audience` tier column |
+| Policy rules | `policies` | admin (role-gated) | `lib/policy.authorize` | role-gated (admin/lead) |
+| Approvals | `approval_requests` | `lib/policy.fileApprovalRequest`, `lib/actions.resolveApproval` | dashboard | role-gated decide |
+| Actions | `actions` | **`lib/actions.runAction` only** (service role) | dashboard | team-scoped |
+| Audit | `audit_log` | `lib/api/audit` (append-only, trigger-backed) | admin | append-only; admin read |
+| Identity | `teams`, `members`, `api_keys` | admin UI / seed | `lib/auth`, guards | role-gated; `key_hash` column-revoked |
+| Sessions (postgres) | `auth_users`, `auth_tokens` | `lib/auth/pg-*` | `getSessionUser` | signed httpOnly cookie |
+| Rate limits | `rate_limits` | `rate_limit_hit` rpc | — | service-role only |
 
 ## System context
 
@@ -181,6 +202,50 @@ erDiagram
 | `lib/okf` | OKF link-graph helpers |
 | `supabase/migrations` | Schema (RLS default-deny everywhere) |
 | `ingestion/` | Python connector sidecar (Organ 2) |
+| `lib/db`, `lib/auth` | Backend selector + pg adapter; backend-agnostic auth/session/guard |
+
+## Invariants & gotchas
+
+Each entry is a real contract or bug, stated as the invariant that must now hold. Where a
+guard enforces it, it's named.
+
+- **Single-writer for content.** Only `lib/ingest` writes `items`/`item_versions`.
+  *Guard:* `test/guards/single-writer-items.test.ts` (fails the build on any other writer).
+- **Ingest is idempotent by `content_sha256`.** Identical re-push → `unchanged`, no new
+  `item_versions` row. *Verified:* `test/datamechanics/ingest.datamechanics.test.ts` (real PG).
+- **Tier isolation.** An `external`-tier principal never reads `team`/`admin` content. Enforced
+  by RLS in supabase mode, by app code in postgres mode (no DB backstop). Enforced in three
+  places, all verified on real PG: the retrieval path (`retrieve.ts`), the API routes (they
+  re-apply the filter), and the dashboard reads (`app/t/[team]/*`) — which now route every
+  `items` read through the **`lib/auth/visibility` choke-point** (`visibleItems`/`canSeeAccess`).
+  *Guard:* `test/guards/dashboard-tier-filter.test.ts` fails the build if a dashboard page reads
+  `items` without the choke-point. *Verified:* `access-isolation` + `dashboard-visibility`
+  data-mechanics tests.
+  🟡 **Not yet built — within-team privacy.** The tier model is binary (`team`/`external`); a
+  `team` member sees *all* `team` content. "Private to a subset of the team" (e.g. an ingested
+  private Slack thread hidden from other team members) needs a finer-grained ACL (per-member or
+  per-channel) and a new tier/scope — a product feature, not covered by the current filter.
+- **`admin`/`private` tiers never reach the DB** — rejected with 422 at the API.
+- **Append-only audit.** `audit_log` has a trigger that blocks UPDATE/DELETE.
+- **`key_hash` is column-revoked** from client roles; API secrets are sha256-at-rest, shown once.
+- **Migration replay.** 14-digit timestamp prefixes, unique, lexical == chronological.
+  *Guards:* `test/guards/migrations-numbering.test.ts` + `npm run db:test:up` (migrates from zero).
+
+## Changing X? read this
+
+- **Add/remove an API route, DB table, or ingestion source** → update the `<!-- drift:* -->`
+  inventories below (machine-guarded; CI + pre-push will fail otherwise).
+- **Write to `items`/`item_versions`** → it must live in `lib/ingest` (single-writer guard).
+- **Read tiered content on the dashboard** → apply the `access`/tier filter explicitly; there is
+  no RLS backstop in postgres mode.
+- **Add a migration** → 14-digit timestamp prefix; run `npm run db:test:up` to prove replay.
+- **Change access control** → treat it as dual-backend; add/extend a data-mechanics parity test.
+
+## Keeping this doc honest
+
+The drift inventories (routes/tables/sources) are machine-checked. The sources-of-truth table,
+the Mermaid flows, and the invariants are **hand-maintained** — update them in the same PR as the
+change and bump the "Last verified" date when you reconcile against code.
 
 ## Repository inventories
 
@@ -199,6 +264,7 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 - `GET /api/v1/okf-bundle` — OKF link graph (tier-filtered, link redaction)
 - `POST /api/v1/actions` — request a policy-gated action (Organ 4)
 - `POST /api/dashboard/query` — same query pipeline, session-authenticated
+- `POST /api/auth/login` — postgres-mode magic-link request (invite-only; always `{ok:true}`)
 <!-- /drift:routes -->
 
 ### Database tables
@@ -219,9 +285,13 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 
 `scripts/check-docs-drift.mjs` derives the three inventories above from code
 (`app/api/**/route.ts`, `supabase/migrations/*.sql`, `ingestion/.../registry.py`) and
-diffs them against the `<!-- drift:* -->` blocks. The `.github/workflows/docs-drift.yml`
-workflow runs it on every PR; make it a **required status check** on `main` so PRs cannot
-merge while docs and code disagree.
+diffs them against the `<!-- drift:* -->` blocks. It runs in three places:
+
+- **CI** (`.github/workflows/ci.yml`, job *Docs drift guard*) — on every PR. Advisory until
+  the repo's plan allows a required status check; then make it required on `main`.
+- **Local pre-push hook** (`.githooks/pre-push`) — blocks a push that would drift the docs.
+  Auto-enabled by `npm install` (the `prepare` script sets `core.hooksPath=.githooks`);
+  bypass in an emergency with `git push --no-verify`.
 
 ```bash
 npm run check:docs   # run locally before pushing

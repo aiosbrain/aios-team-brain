@@ -1,6 +1,8 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { serverClient } from "@/lib/supabase/server";
+import { currentMember } from "@/lib/auth/guard";
+import { canSeeAccess } from "@/lib/auth/visibility";
 import { Markdown } from "@/components/markdown";
 import { KindBadge } from "@/components/kind-badge";
 import { TierBadge } from "@/components/tier-badge";
@@ -29,7 +31,9 @@ export default async function LibraryItemPage({
     .eq("team_id", team.id)
     .eq("id", itemId)
     .maybeSingle();
-  if (!item) notFound();
+  // Tier check (no RLS backstop in postgres mode): hide above-tier items as 404.
+  const me = await currentMember(team.id);
+  if (!item || !canSeeAccess(me?.tier ?? "external", item.access as string)) notFound();
 
   const project = item.projects as unknown as { slug: string } | null;
   const member = item.members as unknown as { display_name: string } | null;

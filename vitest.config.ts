@@ -7,7 +7,8 @@ export default defineConfig({
   test: {
     environment: "node",
     include: ["**/*.test.ts"],
-    exclude: ["node_modules/**", "ingestion/**", ".next/**"],
+    // Data-mechanics tests need a real DB; they run via vitest.datamechanics.config.ts.
+    exclude: ["node_modules/**", "ingestion/**", ".next/**", "test/datamechanics/**"],
   },
   resolve: {
     alias: {
