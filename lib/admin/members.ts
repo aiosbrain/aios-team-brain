@@ -57,3 +57,69 @@ export async function createMember(
   });
   return { id: data.id, status: data.status };
 }
+
+export interface DeleteResult {
+  deleted: boolean;
+  reason?: "absent" | "last-admin";
+  mode?: "soft" | "hard";
+  id?: string;
+}
+
+/**
+ * Remove a member. Default is a **soft** delete (status='disabled', auth_user_id
+ * cleared) — auditable + reversible, and excluded from active-member checks. `hard`
+ * permanently deletes the row (cascades api_keys/member_emails; SET-NULLs content
+ * refs like code_contributions.member_id). Idempotent + safe:
+ *   • absent member → no-op
+ *   • refuses to remove the LAST active admin
+ */
+export async function deleteMember(
+  admin: SupabaseClient,
+  teamId: string,
+  email: string,
+  opts: { hard?: boolean; actor?: ActorContext } = {}
+): Promise<DeleteResult> {
+  const e = email.trim().toLowerCase();
+  const { data: m } = await admin
+    .from("members")
+    .select("id, role, status")
+    .eq("team_id", teamId)
+    .eq("email", e)
+    .maybeSingle();
+  const member = m as { id: string; role: string; status: string } | null;
+  if (!member) return { deleted: false, reason: "absent" };
+
+  // Refuse if this is the last non-disabled admin (avoid locking the team out —
+  // counts active AND invited admins; a disabled admin can't administer).
+  if (member.role === "admin" && member.status !== "disabled") {
+    const { data: admins } = await admin
+      .from("members")
+      .select("id")
+      .eq("team_id", teamId)
+      .eq("role", "admin")
+      .neq("status", "disabled");
+    if ((admins ?? []).length <= 1) return { deleted: false, reason: "last-admin" };
+  }
+
+  if (opts.hard) {
+    const { error } = await admin.from("members").delete().eq("id", member.id);
+    if (error) throw new Error(`delete member failed: ${error.message}`);
+  } else {
+    const { error } = await admin
+      .from("members")
+      .update({ status: "disabled", auth_user_id: null })
+      .eq("id", member.id);
+    if (error) throw new Error(`disable member failed: ${error.message}`);
+  }
+
+  await audit(admin, {
+    team_id: teamId,
+    actor_kind: opts.actor?.kind ?? "system",
+    member_id: opts.actor?.memberId ?? null,
+    action: opts.hard ? "member.deleted" : "member.disabled",
+    target_type: "member",
+    target_id: member.id,
+    meta: { email: e },
+  });
+  return { deleted: true, mode: opts.hard ? "hard" : "soft", id: member.id };
+}

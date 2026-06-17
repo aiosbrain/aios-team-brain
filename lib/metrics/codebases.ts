@@ -340,25 +340,33 @@ export async function getCodebaseDetail(
     author_key: string;
     author_name: string;
     member_id: string | null;
-    day: string;
+    day: string | Date;
     commits: number;
     ai_commits: number;
     additions: number;
     deletions: number;
   }[];
 
-  // commit volume per day (AI vs human) for the commit-volume chart
+  // commit volume per day (AI vs human) for the commit-volume chart.
+  // The pg `date` column comes back as a Date (node-pg) or a string — normalize to YYYY-MM-DD.
+  const dayKey = (d: string | Date): string =>
+    d instanceof Date ? d.toISOString().slice(0, 10) : String(d).slice(0, 10);
   const volByDay = new Map<string, { ai: number; human: number }>();
   for (const r of contribRows) {
-    const v = volByDay.get(r.day) ?? { ai: 0, human: 0 };
+    const k = dayKey(r.day);
+    const v = volByDay.get(k) ?? { ai: 0, human: 0 };
     v.ai += r.ai_commits;
     v.human += Math.max(0, r.commits - r.ai_commits);
-    volByDay.set(r.day, v);
+    volByDay.set(k, v);
   }
   const commitVolume: CommitVolumePoint[] = [...volByDay.entries()]
     .sort((a, b) => a[0].localeCompare(b[0]))
     .map(([day, v]) => ({
-      date: new Date(day).toLocaleDateString("en-US", { month: "short", day: "numeric" }),
+      date: new Date(`${day}T00:00:00Z`).toLocaleDateString("en-US", {
+        month: "short",
+        day: "numeric",
+        timeZone: "UTC",
+      }),
       ai: v.ai,
       human: v.human,
     }));

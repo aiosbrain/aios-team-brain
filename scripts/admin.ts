@@ -10,9 +10,10 @@
  */
 import { execFileSync } from "node:child_process";
 import { adminClient } from "@/lib/supabase/admin";
-import { createMember } from "@/lib/admin/members";
+import { createMember, deleteMember } from "@/lib/admin/members";
 import { issueApiKey, revokeApiKey } from "@/lib/admin/keys";
 import { issueLoginLink } from "@/lib/admin/login";
+import { renameTeam } from "@/lib/admin/teams";
 import { addAuthorAlias } from "@/lib/admin/aliases";
 import { linkGithub, listOrgMembers } from "@/lib/codebases/github";
 
@@ -42,9 +43,11 @@ function die(msg: string): never {
   process.exit(1);
 }
 
-async function resolveTeam(admin: ReturnType<typeof adminClient>, slug: string) {
-  const { data } = await admin.from("teams").select("id, slug").eq("slug", slug).maybeSingle();
-  if (!data) die(`no team '${slug}'`);
+async function resolveTeam(admin: ReturnType<typeof adminClient>, ref: string) {
+  // Accept a UUID or a slug — keying ops by team_id survives a slug rename.
+  const col = /^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(ref) ? "id" : "slug";
+  const { data } = await admin.from("teams").select("id, slug").eq(col, ref).maybeSingle();
+  if (!data) die(`no team '${ref}'`);
   return data as { id: string; slug: string };
 }
 
@@ -55,11 +58,13 @@ const USAGE = `Team Brain admin CLI — commands:
   revoke-key <api-key-uuid> [--team <slug>]
   list-members [--team <slug>]
   list-keys [--team <slug>]
-  add-author-alias <member-email> <git-identity> [--team <slug>] [--force]
-  link-github <member-email> <github-login> [--team <slug>] [--force]   # needs GITHUB_TOKEN env
-  sync-github --org <org> [--team <slug>]                               # list candidates (needs GITHUB_TOKEN)
+  delete-member <email> [--hard] [--team <id|slug>]   # soft-disable by default; --hard removes
+  rename-team <new-slug> [--name <display>] [--team <id|slug>]
+  add-author-alias <member-email> <git-identity> [--team <id|slug>] [--force]
+  link-github <member-email> <github-login> [--team <id|slug>] [--force]   # needs GITHUB_TOKEN env
+  sync-github --org <org> [--team <id|slug>]                               # list candidates (needs GITHUB_TOKEN)
   pg:schema                              # load postgres/schema.sql (idempotent)
-Defaults: --team demo. Requires DATABASE_URL (postgres). GitHub token via GITHUB_TOKEN env only.`;
+Defaults: --team demo (accepts a team UUID too). Requires DATABASE_URL (postgres). GitHub token via GITHUB_TOKEN env only.`;
 
 async function memberIdByEmail(admin: ReturnType<typeof adminClient>, teamId: string, email: string) {
   const { data } = await admin
@@ -149,6 +154,27 @@ async function main() {
         .eq("team_id", team.id)
         .order("created_at");
       console.table(data ?? []);
+      break;
+    }
+    case "delete-member": {
+      const email = positionals[0] || die("usage: delete-member <email> [--hard]");
+      const team = await resolveTeam(admin, teamSlug);
+      const r = await deleteMember(admin, team.id, email, { hard: Boolean(flags.hard) });
+      console.log(
+        r.deleted
+          ? `✓ ${r.mode === "hard" ? "deleted" : "disabled"} ${email} on ${team.slug}`
+          : `• no-op for ${email} (${r.reason})`
+      );
+      break;
+    }
+    case "rename-team": {
+      const newSlug = positionals[0] || die("usage: rename-team <new-slug> [--name <display>]");
+      const team = await resolveTeam(admin, teamSlug);
+      const r = await renameTeam(admin, team.id, {
+        slug: newSlug,
+        name: typeof flags.name === "string" ? flags.name : undefined,
+      });
+      console.log(`✓ team is now ${r.slug} / "${r.name}"`);
       break;
     }
     case "add-author-alias": {
