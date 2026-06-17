@@ -104,16 +104,23 @@ export async function ingestCodebaseScan(
   if (payload.contributions.length) {
     const memberId = await buildAuthorMap(supabase, auth.teamId);
     for (const row of payload.contributions) {
-      // Resolve to a roster member by email first (author_key is usually the email),
-      // then by handle derived from the email local-part (e.g. alice@corp → "alice").
-      const email = row.author_email.toLowerCase();
-      const keyLc = row.author_key.toLowerCase();
-      const localPart = (email || keyLc).split("@")[0];
+      // Resolve to a roster member by exact email first. Only derive a handle from
+      // an email local-part when that email uses a domain already present in the
+      // roster; otherwise external contributors like alex@gmail.com could be
+      // misattributed to an internal actor_handle "alex".
+      const email = row.author_email.trim().toLowerCase();
+      const keyLc = row.author_key.trim().toLowerCase();
+      const [localPart, domain] = email.includes("@") ? email.split("@", 2) : ["", ""];
+      const handleFromTeamDomain =
+        localPart && domain && memberId.emailDomains.has(domain)
+          ? memberId.byHandle.get(localPart)
+          : undefined;
+      const explicitHandle = keyLc && !keyLc.includes("@") ? memberId.byHandle.get(keyLc) : undefined;
       const mapped =
         memberId.byEmail.get(email) ??
         memberId.byEmail.get(keyLc) ??
-        memberId.byHandle.get(localPart) ??
-        memberId.byHandle.get(keyLc) ??
+        handleFromTeamDomain ??
+        explicitHandle ??
         null;
       const { error } = await supabase.from("code_contributions").upsert(
         {
@@ -196,9 +203,15 @@ async function buildAuthorMap(supabase: SupabaseClient, teamId: string) {
     .eq("team_id", teamId);
   const byEmail = new Map<string, string>();
   const byHandle = new Map<string, string>();
+  const emailDomains = new Set<string>();
   for (const r of (data ?? []) as { id: string; email: string | null; actor_handle: string | null }[]) {
-    if (r.email) byEmail.set(r.email.toLowerCase(), r.id);
+    if (r.email) {
+      const email = r.email.toLowerCase();
+      byEmail.set(email, r.id);
+      const domain = email.split("@", 2)[1];
+      if (domain) emailDomains.add(domain);
+    }
     if (r.actor_handle) byHandle.set(r.actor_handle.toLowerCase(), r.id);
   }
-  return { byEmail, byHandle };
+  return { byEmail, byHandle, emailDomains };
 }
