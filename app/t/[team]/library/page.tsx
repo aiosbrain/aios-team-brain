@@ -2,6 +2,8 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import { Library } from "lucide-react";
 import { serverClient } from "@/lib/supabase/server";
+import { currentMember } from "@/lib/auth/guard";
+import { visibleItems } from "@/lib/auth/visibility";
 import { KindBadge } from "@/components/kind-badge";
 import { TierBadge } from "@/components/tier-badge";
 import { EmptyState } from "@/components/empty-state";
@@ -39,12 +41,16 @@ export default async function LibraryPage({
     .maybeSingle();
   if (!team) return null;
 
+  const me = await currentMember(team.id);
+  const tier = me?.tier ?? "external";
+
   let query = supabase
     .from("items")
     .select("id, path, kind, access, actor, synced_at, projects(slug)")
     .eq("team_id", team.id)
     .order("synced_at", { ascending: false })
     .limit(200);
+  query = visibleItems(query, tier); // external viewers never see team/admin content
   if (kind && (KINDS as readonly string[]).includes(kind)) {
     query = query.eq("kind", kind);
   }

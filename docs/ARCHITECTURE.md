@@ -19,7 +19,7 @@ Reason from this table, not from a random call site.
 
 | State | Store (table) | Writer | Readers | Tier/access enforcement |
 |---|---|---|---|---|
-| Synced content | `items`, `item_versions` | **`lib/ingest` only** (single-writer guarded) | dashboard pages, `/api/v1/items`, `lib/query/retrieve`, okf-bundle, metrics | supabase: RLS; postgres: app-code — API ✅, **dashboard 🔴 (see §Invariants)** |
+| Synced content | `items`, `item_versions` | **`lib/ingest` only** (single-writer guarded) | dashboard pages, `/api/v1/items`, `lib/query/retrieve`, okf-bundle, metrics | supabase: RLS; postgres: app-code — API ✅, dashboard ✅ (`lib/auth/visibility` choke-point, guarded) |
 | Tasks | `tasks` | `lib/ingest` (sync rows) + `app/actions/tasks.ts` (UI) | dashboard, `/api/v1/tasks` | team-scoped; `origin='ui'` rows survive sync diff |
 | Decisions | `decisions` | `lib/ingest` + `app/actions/decisions.ts` | dashboard | `audience` tier column |
 | Policy rules | `policies` | admin (role-gated) | `lib/policy.authorize` | role-gated (admin/lead) |
@@ -214,12 +214,17 @@ guard enforces it, it's named.
 - **Ingest is idempotent by `content_sha256`.** Identical re-push → `unchanged`, no new
   `item_versions` row. *Verified:* `test/datamechanics/ingest.datamechanics.test.ts` (real PG).
 - **Tier isolation.** An `external`-tier principal never reads `team`/`admin` content. Enforced
-  by RLS in supabase mode, by app code in postgres mode (no DB backstop). *Verified for the
-  retrieval path* on real PG: `test/datamechanics/access-isolation.datamechanics.test.ts`.
-  🔴 **Open gap:** dashboard server-component reads (`app/t/[team]/*`) lack an app-code tier
-  filter and rely on RLS — so in **postgres mode** an `external` member would see `team` items.
-  API routes are safe (they re-apply the filter). Pending a product decision on whether the
-  `external` tier is in scope; fix = a single tier-aware read choke-point + a parity test.
+  by RLS in supabase mode, by app code in postgres mode (no DB backstop). Enforced in three
+  places, all verified on real PG: the retrieval path (`retrieve.ts`), the API routes (they
+  re-apply the filter), and the dashboard reads (`app/t/[team]/*`) — which now route every
+  `items` read through the **`lib/auth/visibility` choke-point** (`visibleItems`/`canSeeAccess`).
+  *Guard:* `test/guards/dashboard-tier-filter.test.ts` fails the build if a dashboard page reads
+  `items` without the choke-point. *Verified:* `access-isolation` + `dashboard-visibility`
+  data-mechanics tests.
+  🟡 **Not yet built — within-team privacy.** The tier model is binary (`team`/`external`); a
+  `team` member sees *all* `team` content. "Private to a subset of the team" (e.g. an ingested
+  private Slack thread hidden from other team members) needs a finer-grained ACL (per-member or
+  per-channel) and a new tier/scope — a product feature, not covered by the current filter.
 - **`admin`/`private` tiers never reach the DB** — rejected with 422 at the API.
 - **Append-only audit.** `audit_log` has a trigger that blocks UPDATE/DELETE.
 - **`key_hash` is column-revoked** from client roles; API secrets are sha256-at-rest, shown once.

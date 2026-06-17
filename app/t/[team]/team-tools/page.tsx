@@ -1,6 +1,8 @@
 import type { Metadata } from "next";
 import { Blocks } from "lucide-react";
 import { serverClient } from "@/lib/supabase/server";
+import { currentMember } from "@/lib/auth/guard";
+import { visibleItems } from "@/lib/auth/visibility";
 import { EmptyState } from "@/components/empty-state";
 import { timeAgo } from "@/components/format";
 
@@ -16,15 +18,18 @@ export default async function TeamToolsPage({ params }: { params: Promise<{ team
   const { data: team } = await supabase.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
   if (!team) return null;
 
-  // Latest published blueprint for the team (RLS already scopes to readable items).
-  const { data } = await supabase
-    .from("items")
-    .select("body, actor, updated_at, frontmatter")
-    .eq("team_id", team.id)
-    .eq("kind", "blueprint")
-    .order("updated_at", { ascending: false })
-    .limit(1)
-    .maybeSingle();
+  const me = await currentMember(team.id);
+  // Latest published blueprint for the team; tier-filtered in app code (no RLS in pg mode).
+  const { data } = await visibleItems(
+    supabase
+      .from("items")
+      .select("body, actor, updated_at, frontmatter")
+      .eq("team_id", team.id)
+      .eq("kind", "blueprint")
+      .order("updated_at", { ascending: false })
+      .limit(1),
+    me?.tier ?? "external"
+  ).maybeSingle();
   const bp = data as BlueprintItem | null;
 
   let connectors: Array<[string, Connector]> = [];
