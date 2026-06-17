@@ -13,6 +13,8 @@ import { adminClient } from "@/lib/supabase/admin";
 import { createMember } from "@/lib/admin/members";
 import { issueApiKey, revokeApiKey } from "@/lib/admin/keys";
 import { issueLoginLink } from "@/lib/admin/login";
+import { addAuthorAlias } from "@/lib/admin/aliases";
+import { linkGithub, listOrgMembers } from "@/lib/codebases/github";
 
 type Flags = Record<string, string | boolean>;
 
@@ -53,8 +55,11 @@ const USAGE = `Team Brain admin CLI — commands:
   revoke-key <api-key-uuid> [--team <slug>]
   list-members [--team <slug>]
   list-keys [--team <slug>]
+  add-author-alias <member-email> <git-identity> [--team <slug>] [--force]
+  link-github <member-email> <github-login> [--team <slug>] [--force]   # needs GITHUB_TOKEN env
+  sync-github --org <org> [--team <slug>]                               # list candidates (needs GITHUB_TOKEN)
   pg:schema                              # load postgres/schema.sql (idempotent)
-Defaults: --team demo. Requires DATABASE_URL (postgres).`;
+Defaults: --team demo. Requires DATABASE_URL (postgres). GitHub token via GITHUB_TOKEN env only.`;
 
 async function memberIdByEmail(admin: ReturnType<typeof adminClient>, teamId: string, email: string) {
   const { data } = await admin
@@ -144,6 +149,38 @@ async function main() {
         .eq("team_id", team.id)
         .order("created_at");
       console.table(data ?? []);
+      break;
+    }
+    case "add-author-alias": {
+      const email = positionals[0] || die("usage: add-author-alias <member-email> <git-identity>");
+      const identity = positionals[1] || die("usage: add-author-alias <member-email> <git-identity>");
+      const team = await resolveTeam(admin, teamSlug);
+      const memberId = (await memberIdByEmail(admin, team.id, email)) || die(`no member ${email}`);
+      const r = await addAuthorAlias(admin, team.id, memberId, identity, { force: Boolean(flags.force) });
+      console.log(
+        `✓ alias ${identity} → ${email}: backfilled ${r.backfilled}, remapped ${r.remapped}, collisions ${r.collisions}` +
+          (r.note ? `\n  ⚠ ${r.note}` : "")
+      );
+      break;
+    }
+    case "link-github": {
+      const email = positionals[0] || die("usage: link-github <member-email> <github-login>");
+      const login = positionals[1] || die("usage: link-github <member-email> <github-login>");
+      const token = process.env.GITHUB_TOKEN || die("set GITHUB_TOKEN env (do not pass as a flag)");
+      const team = await resolveTeam(admin, teamSlug);
+      const memberId = (await memberIdByEmail(admin, team.id, email)) || die(`no member ${email}`);
+      const r = await linkGithub(admin, team.id, memberId, token, login, { force: Boolean(flags.force) });
+      console.log(
+        `✓ linked ${email} → @${r.login} (avatar set); ${r.aliases.length} aliases, backfilled ${r.backfilled}`
+      );
+      break;
+    }
+    case "sync-github": {
+      const org = (flags.org as string) || die("usage: sync-github --org <org>");
+      const token = process.env.GITHUB_TOKEN || die("set GITHUB_TOKEN env (do not pass as a flag)");
+      const candidates = await listOrgMembers(org, token);
+      console.log(`Candidates in ${org} — confirm each with: admin link-github <member-email> <login>`);
+      console.table(candidates.map((c) => ({ login: c.login, id: c.id })));
       break;
     }
     default:

@@ -26,7 +26,8 @@ Reason from this table, not from a random call site.
 | Approvals | `approval_requests` | `lib/policy.fileApprovalRequest`, `lib/actions.resolveApproval` | dashboard | role-gated decide |
 | Actions | `actions` | **`lib/actions.runAction` only** (service role) | dashboard | team-scoped |
 | Audit | `audit_log` | `lib/api/audit` (append-only, trigger-backed) | admin | append-only; admin read |
-| Identity | `teams`, `members`, `api_keys` | admin UI / seed | `lib/auth`, guards | role-gated; `key_hash` column-revoked |
+| Identity | `teams`, `members`, `api_keys` | admin UI / seed / `lib/admin/*` (CLI) | `lib/auth`, guards | role-gated; `key_hash` column-revoked |
+| Git-author aliases | `member_emails` (+ `members.github_login`/`avatar_url`) | `lib/admin/*` + GitHub sync (`lib/codebases/github`) | `lib/codebases/ingest` (author→member), dashboard | team-scoped `unique(team_id,email)`; one alias → one member |
 | Sessions (postgres) | `auth_users`, `auth_tokens` | `lib/auth/pg-*` | `getSessionUser` | signed httpOnly cookie |
 | Rate limits | `rate_limits` | `rate_limit_hit` rpc | — | service-role only |
 | Codebase analytics | `codebases`, `code_metrics`, `code_contributions`, `github_issues` | **`lib/codebases/ingest` only** (single-writer guarded; via `POST /api/v1/codebases`) | codebases pages, `lib/metrics/codebases` | team-tier only; **app-code gate** (`lib/codebases/visibility` + guard) — no RLS backstop |
@@ -276,7 +277,7 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 `auth_users` · `auth_tokens` · `teams` · `members` · `api_keys` · `audit_log` · `rate_limits` ·
 `projects` · `items` · `item_versions` · `tasks` · `decisions` · `graph_entities` ·
 `graph_relationships` · `query_log` · `policies` · `approval_requests` · `actions` ·
-`codebases` · `code_metrics` · `code_contributions` · `github_issues`
+`codebases` · `code_metrics` · `code_contributions` · `github_issues` · `member_emails`
 <!-- /drift:tables -->
 
 ### Ingestion sources

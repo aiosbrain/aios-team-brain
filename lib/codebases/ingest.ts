@@ -213,5 +213,18 @@ async function buildAuthorMap(supabase: SupabaseClient, teamId: string) {
     }
     if (r.actor_handle) byHandle.set(r.actor_handle.toLowerCase(), r.id);
   }
+
+  // Fold in explicit git-author aliases (e.g. GitHub noreply emails) as EXACT
+  // byEmail matches. Deliberately NOT added to emailDomains — alias domains like
+  // users.noreply.github.com are shared, so widening the handle heuristic with them
+  // would re-introduce cross-author misattribution (the bug PR #11 closed).
+  const { data: aliases } = await supabase
+    .from("member_emails")
+    .select("email, member_id")
+    .eq("team_id", teamId);
+  for (const a of (aliases ?? []) as { email: string; member_id: string }[]) {
+    if (a.email) byEmail.set(a.email.toLowerCase(), a.member_id);
+  }
+
   return { byEmail, byHandle, emailDomains };
 }
