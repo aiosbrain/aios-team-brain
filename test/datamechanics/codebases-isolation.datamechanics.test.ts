@@ -56,6 +56,15 @@ async function memberEmail(memberId: string): Promise<string> {
   return (data as { email: string }).email;
 }
 
+async function memberIdentity(memberId: string): Promise<{ email: string; actor_handle: string }> {
+  const { data } = await db()
+    .from("members")
+    .select("email, actor_handle")
+    .eq("id", memberId)
+    .maybeSingle();
+  return data as { email: string; actor_handle: string };
+}
+
 describe("codebase tier isolation (real Postgres, no RLS backstop)", () => {
   it("external tier sees no codebases; team tier sees them", async () => {
     const seed = await seedTeam();
@@ -148,5 +157,54 @@ describe("codebase scan idempotency (real Postgres)", () => {
       .eq("codebase_id", res.codebase_id);
     expect((second.data ?? []).length).toBe(1);
     expect((second.data as { commits: number }[])[0].commits).toBe(8);
+  });
+
+  it("does not map an external contributor just because their email local-part matches a handle", async () => {
+    const seed = await seedTeam();
+    const slug = `repo-${randomUUID().slice(0, 6)}`;
+    const { actor_handle } = await memberIdentity(seed.memberId);
+    const externalEmail = `${actor_handle}@external.example`;
+
+    const res = await ingestScan(
+      seed,
+      buildScan({
+        slug,
+        contributions: [
+          { author_key: externalEmail, author_email: externalEmail, day: "2026-06-11", commits: 1 },
+        ],
+      })
+    );
+    const rows = await db()
+      .from("code_contributions")
+      .select("member_id")
+      .eq("codebase_id", res.codebase_id)
+      .eq("author_key", externalEmail);
+
+    expect((rows.data as { member_id: string | null }[])[0].member_id).toBeNull();
+  });
+
+  it("maps email local-part to handle only when the email uses a team roster domain", async () => {
+    const seed = await seedTeam();
+    const slug = `repo-${randomUUID().slice(0, 6)}`;
+    const { email, actor_handle } = await memberIdentity(seed.memberId);
+    const teamDomain = email.split("@")[1];
+    const teamDomainEmail = `${actor_handle}@${teamDomain}`;
+
+    const res = await ingestScan(
+      seed,
+      buildScan({
+        slug,
+        contributions: [
+          { author_key: teamDomainEmail, author_email: teamDomainEmail, day: "2026-06-12", commits: 1 },
+        ],
+      })
+    );
+    const rows = await db()
+      .from("code_contributions")
+      .select("member_id")
+      .eq("codebase_id", res.codebase_id)
+      .eq("author_key", teamDomainEmail);
+
+    expect((rows.data as { member_id: string | null }[])[0].member_id).toBe(seed.memberId);
   });
 });
