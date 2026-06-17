@@ -197,6 +197,8 @@ export interface ContributorRow {
   author_name: string;
   member_id: string | null;
   member_name: string | null;
+  avatar_url: string | null;
+  github_login: string | null;
   commits: number;
   ai_commits: number;
   additions: number;
@@ -282,12 +284,13 @@ export async function getCodebaseDetail(
       .eq("codebase_id", codebaseId)
       .order("updated_at", { ascending: false })
       .limit(200),
-    supabase.from("members").select("id, display_name").eq("team_id", teamId),
+    supabase.from("members").select("id, display_name, github_login, avatar_url").eq("team_id", teamId),
   ]);
 
-  const memberNames = new Map<string, string>();
-  for (const m of (membersRes.data ?? []) as { id: string; display_name: string | null }[]) {
-    if (m.display_name) memberNames.set(m.id, m.display_name);
+  type MemberMeta = { display_name: string | null; github_login: string | null; avatar_url: string | null };
+  const members = new Map<string, MemberMeta>();
+  for (const m of (membersRes.data ?? []) as ({ id: string } & MemberMeta)[]) {
+    members.set(m.id, { display_name: m.display_name, github_login: m.github_login, avatar_url: m.avatar_url });
   }
 
   // newest-first from the query; reverse a copy for the chronological trend.
@@ -335,15 +338,21 @@ export async function getCodebaseDetail(
     additions: number;
     deletions: number;
   }[];
-  const byAuthor = new Map<string, ContributorRow>();
+  // Group by member when mapped (collapses one person's multiple git identities into
+  // one row); fall back to per-author_key for genuinely unmapped contributors.
+  const byContributor = new Map<string, ContributorRow>();
   for (const r of contribRows) {
+    const groupKey = r.member_id ?? `unmapped:${r.author_key}`;
+    const meta = r.member_id ? members.get(r.member_id) : undefined;
     const cur =
-      byAuthor.get(r.author_key) ??
+      byContributor.get(groupKey) ??
       ({
         author_key: r.author_key,
         author_name: r.author_name,
         member_id: r.member_id,
-        member_name: r.member_id ? memberNames.get(r.member_id) ?? null : null,
+        member_name: meta?.display_name ?? null,
+        avatar_url: meta?.avatar_url ?? null,
+        github_login: meta?.github_login ?? null,
         commits: 0,
         ai_commits: 0,
         additions: 0,
@@ -353,9 +362,9 @@ export async function getCodebaseDetail(
     cur.ai_commits += r.ai_commits;
     cur.additions += r.additions;
     cur.deletions += r.deletions;
-    byAuthor.set(r.author_key, cur);
+    byContributor.set(groupKey, cur);
   }
-  const contributors = [...byAuthor.values()].sort((a, b) => b.commits - a.commits);
+  const contributors = [...byContributor.values()].sort((a, b) => b.commits - a.commits);
 
   const issues = ((issuesRes.data ?? []) as IssueRow[]).map((i) => ({
     ...i,

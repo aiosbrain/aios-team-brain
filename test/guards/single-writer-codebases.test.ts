@@ -4,15 +4,18 @@ import { join } from "node:path";
 
 /**
  * Single-writer guard for codebase analytics (CLAUDE.md §2). `codebases`,
- * `code_metrics`, `code_contributions`, and `github_issues` are written ONLY by
- * `lib/codebases/ingest` (the audited path behind POST /api/v1/codebases). This
- * test fails the build if any other file inserts/updates/upserts/deletes them, so
- * the contract is enforced by structure, not reviewer memory. (Reads are fine.)
+ * `code_metrics`, `code_contributions`, and `github_issues` are written ONLY by the
+ * sanctioned, audited paths: `lib/codebases/*` (ingest, behind POST /api/v1/codebases)
+ * and `lib/admin/aliases.ts` (the audited alias remap, which sets
+ * `code_contributions.member_id` and is itself guarded by the data-mechanics
+ * collision tests). This test fails the build if any OTHER file inserts/updates/
+ * upserts/deletes them, so the contract is enforced by structure. (Reads are fine.)
  */
 
 const ROOT = join(import.meta.dirname, "..", "..");
 const SCAN_DIRS = ["app", "lib", "scripts"];
-const OWNER = join("lib", "codebases"); // the only legal writer lives here
+// Sanctioned writers (audited): the ingest path + the alias remap.
+const OWNERS = [join("lib", "codebases"), join("lib", "admin", "aliases.ts")];
 const TABLES = "codebases|code_metrics|code_contributions|github_issues";
 const WRITE_RE = new RegExp(
   `from\\(\\s*["'](${TABLES})["']\\s*\\)\\s*\\.\\s*(insert|update|upsert|delete)\\b`,
@@ -39,7 +42,7 @@ function offenders(): string[] {
   for (const d of SCAN_DIRS) {
     for (const file of walk(join(ROOT, d))) {
       const rel = file.slice(ROOT.length + 1);
-      if (rel.startsWith(OWNER)) continue; // sanctioned writer
+      if (OWNERS.some((o) => rel.startsWith(o))) continue; // sanctioned writers
       if (rel.endsWith(".test.ts") || rel.includes("fake-supabase")) continue;
       const src = readFileSync(file, "utf8");
       for (const m of src.matchAll(WRITE_RE)) {
@@ -51,7 +54,7 @@ function offenders(): string[] {
 }
 
 describe("single-writer: codebase analytics tables", () => {
-  it("only lib/codebases/ingest writes the codebase tables", () => {
+  it("only the sanctioned paths (lib/codebases, lib/admin/aliases) write the codebase tables", () => {
     const violations = offenders();
     expect(
       violations,

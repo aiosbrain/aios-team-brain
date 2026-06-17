@@ -23,16 +23,26 @@ export function ContributorTable({ rows }: { rows: ContributorRow[] }) {
           {rows.map((r) => {
             const ai = pct(r.ai_commits, r.commits);
             return (
-              <tr key={r.author_key} className="border-b border-border-subtle last:border-0">
+              <tr key={r.member_id ?? `unmapped:${r.author_key}`} className="border-b border-border-subtle last:border-0">
                 <td className="px-4 py-3">
-                  <span className="font-medium text-ink">
-                    {r.member_name ?? r.author_name ?? r.author_key}
-                  </span>
-                  {!r.member_id ? (
-                    <span className="ml-2 text-[10px] uppercase tracking-wider text-ink-tertiary">
-                      unmapped
+                  <span className="flex items-center gap-2">
+                    {r.avatar_url ? (
+                      // eslint-disable-next-line @next/next/no-img-element
+                      <img src={r.avatar_url} alt="" className="size-6 rounded-full" />
+                    ) : (
+                      <span className="flex size-6 items-center justify-center rounded-full bg-surface-inset text-[10px] font-medium text-ink-tertiary">
+                        {(r.member_name ?? r.author_name ?? "?").slice(0, 1).toUpperCase()}
+                      </span>
+                    )}
+                    <span className="font-medium text-ink">
+                      {r.member_name ?? r.author_name ?? r.author_key}
                     </span>
-                  ) : null}
+                    {!r.member_id ? (
+                      <span className="text-[10px] uppercase tracking-wider text-ink-tertiary">
+                        unmapped
+                      </span>
+                    ) : null}
+                  </span>
                 </td>
                 <td className="px-4 py-3 text-ink-secondary">{r.commits}</td>
                 <td className="px-4 py-3">

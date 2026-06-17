@@ -87,6 +87,24 @@ create table if not exists members (
 );
 create index if not exists members_auth_user_idx on members (auth_user_id);
 
+-- GitHub profile link (set by the admin GitHub sync; powers avatars + alias derivation).
+alter table members add column if not exists github_login text;
+alter table members add column if not exists avatar_url text;
+
+-- Git author identities ("aliases") that map to one member: a person's real email,
+-- their GitHub noreply forms, etc. team-scoped uniqueness so an alias can never map to
+-- two members (which would silently re-fragment attribution). Written by lib/admin +
+-- the GitHub sync; read by lib/codebases/ingest to resolve code_contributions.member_id.
+create table if not exists member_emails (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  member_id uuid not null references members(id) on delete cascade,
+  email citext not null,
+  created_at timestamptz not null default now(),
+  unique (team_id, email)
+);
+create index if not exists member_emails_member_idx on member_emails (member_id);
+
 create table if not exists api_keys (
   id uuid primary key default gen_random_uuid(),
   team_id uuid not null references teams(id) on delete cascade,
