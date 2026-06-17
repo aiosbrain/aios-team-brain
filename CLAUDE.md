@@ -72,25 +72,33 @@ real-DB data-mechanics tier (in progress) is authoritative for those.
 
 ---
 
-## 5. Dual backend — the access-control parity invariant ⚠️
+## 5. Access control — what RLS is (and isn't) for here ⚠️
 
-The brain runs on **two interchangeable backends**, selected by `DB_BACKEND`
-(default `supabase`; `postgres` for self-host). A query-builder makes the data API identical, but
-**access control is enforced differently**, and that is the sharpest risk in the codebase:
+**Deployment model:** AIOS is **self-hosted per organization** — each org runs its own instance
+against its own database; all rows belong to that one org. So there is **no shared multi-tenant
+DB**, and cross-organization isolation is **not** a concern. The `team_id` scoping in the RLS
+policies is purely *internal* (separating teams *within* one org's DB) and only matters if an
+instance hosts more than one team.
 
-- **`supabase`** — tier/team isolation is enforced by **Postgres RLS** in the DB; app-code checks
-  are defense-in-depth.
-- **`postgres`** — there is **no RLS**; isolation is enforced **entirely in app code** (the auth
-  guard + the `access`/tier filters in queries). A missing filter has **no DB backstop**.
+**What still matters regardless of multi-tenancy: TIER isolation.** An `external`-tier principal
+(a client/consultant collaborator) must never read `team`/`admin` content; `admin`/`private`
+content never leaves the workspace. This is a product feature (the `external` API tier, OKF link
+redaction), independent of multi-tenancy, and it must hold on **both** backends:
 
-**Invariant (must hold on BOTH backends): an `external`-tier principal never reads `team`/`admin`
-content; `admin`/`private` content never leaves the workspace.** When the data-mechanics tier
-lands, every access assertion is run against **both** backends — a parity gate. Treat any
-access-control change as dual-backend until proven otherwise.
+- **`supabase`** — the `items` RLS policy enforces tier isolation in the DB
+  (`my_tier(team)='team' OR access='external'`); app-code checks are defense-in-depth.
+- **`postgres`** (the self-host target) — there is **no RLS**; tier isolation is enforced
+  **entirely in app code**. A missing `access`/tier filter has **no DB backstop**.
 
-> Status: the dual-backend implementation lands via the `dual-db-backend` PR. Until it is merged
-> to `main`, the live code here is supabase-mode (RLS); this section is the standing contract the
-> parity tier will enforce once both backends are on `main`.
+So: RLS is just *the supabase example's mechanism* for tier isolation — drop it freely for
+multi-tenancy reasons, but **tier isolation itself is a standing invariant** that the app code
+must guarantee on the postgres target.
+
+> 🔴 **Known gap (pending product decision on whether the `external` tier is in scope):** API
+> routes re-apply the tier filter in app code (safe on both backends), but **dashboard
+> server-component reads (`app/t/[team]/*`) rely on RLS** and have no app-code tier filter — so in
+> `postgres` mode an `external` member would see `team` items. Fix = route dashboard reads through
+> one tier-aware choke-point + a data-mechanics parity test. See `docs/ARCHITECTURE.md` §3.
 
 ---
 

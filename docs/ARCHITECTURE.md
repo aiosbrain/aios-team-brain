@@ -8,6 +8,27 @@ portable: plain SQL migrations, Postgres-backed rate limiting, no Vercel-only de
 > This doc describes **structure**. The enumerable surfaces (API routes, DB tables,
 > ingestion sources) are guarded against drift by `scripts/check-docs-drift.mjs` — see
 > [Docs drift guard](#docs-drift-guard).
+>
+> **Last verified against code: 2026-06-17.** If a flow here disagrees with the code, the
+> code wins — fix the doc (same PR).
+
+## Sources of truth
+
+Where each piece of state lives, who may write it, who reads it, and how access is enforced.
+Reason from this table, not from a random call site.
+
+| State | Store (table) | Writer | Readers | Tier/access enforcement |
+|---|---|---|---|---|
+| Synced content | `items`, `item_versions` | **`lib/ingest` only** (single-writer guarded) | dashboard pages, `/api/v1/items`, `lib/query/retrieve`, okf-bundle, metrics | supabase: RLS; postgres: app-code — API ✅, **dashboard 🔴 (see §Invariants)** |
+| Tasks | `tasks` | `lib/ingest` (sync rows) + `app/actions/tasks.ts` (UI) | dashboard, `/api/v1/tasks` | team-scoped; `origin='ui'` rows survive sync diff |
+| Decisions | `decisions` | `lib/ingest` + `app/actions/decisions.ts` | dashboard | `audience` tier column |
+| Policy rules | `policies` | admin (role-gated) | `lib/policy.authorize` | role-gated (admin/lead) |
+| Approvals | `approval_requests` | `lib/policy.fileApprovalRequest`, `lib/actions.resolveApproval` | dashboard | role-gated decide |
+| Actions | `actions` | **`lib/actions.runAction` only** (service role) | dashboard | team-scoped |
+| Audit | `audit_log` | `lib/api/audit` (append-only, trigger-backed) | admin | append-only; admin read |
+| Identity | `teams`, `members`, `api_keys` | admin UI / seed | `lib/auth`, guards | role-gated; `key_hash` column-revoked |
+| Sessions (postgres) | `auth_users`, `auth_tokens` | `lib/auth/pg-*` | `getSessionUser` | signed httpOnly cookie |
+| Rate limits | `rate_limits` | `rate_limit_hit` rpc | — | service-role only |
 
 ## System context
 
@@ -181,6 +202,45 @@ erDiagram
 | `lib/okf` | OKF link-graph helpers |
 | `supabase/migrations` | Schema (RLS default-deny everywhere) |
 | `ingestion/` | Python connector sidecar (Organ 2) |
+| `lib/db`, `lib/auth` | Backend selector + pg adapter; backend-agnostic auth/session/guard |
+
+## Invariants & gotchas
+
+Each entry is a real contract or bug, stated as the invariant that must now hold. Where a
+guard enforces it, it's named.
+
+- **Single-writer for content.** Only `lib/ingest` writes `items`/`item_versions`.
+  *Guard:* `test/guards/single-writer-items.test.ts` (fails the build on any other writer).
+- **Ingest is idempotent by `content_sha256`.** Identical re-push → `unchanged`, no new
+  `item_versions` row. *Verified:* `test/datamechanics/ingest.datamechanics.test.ts` (real PG).
+- **Tier isolation.** An `external`-tier principal never reads `team`/`admin` content. Enforced
+  by RLS in supabase mode, by app code in postgres mode (no DB backstop). *Verified for the
+  retrieval path* on real PG: `test/datamechanics/access-isolation.datamechanics.test.ts`.
+  🔴 **Open gap:** dashboard server-component reads (`app/t/[team]/*`) lack an app-code tier
+  filter and rely on RLS — so in **postgres mode** an `external` member would see `team` items.
+  API routes are safe (they re-apply the filter). Pending a product decision on whether the
+  `external` tier is in scope; fix = a single tier-aware read choke-point + a parity test.
+- **`admin`/`private` tiers never reach the DB** — rejected with 422 at the API.
+- **Append-only audit.** `audit_log` has a trigger that blocks UPDATE/DELETE.
+- **`key_hash` is column-revoked** from client roles; API secrets are sha256-at-rest, shown once.
+- **Migration replay.** 14-digit timestamp prefixes, unique, lexical == chronological.
+  *Guards:* `test/guards/migrations-numbering.test.ts` + `npm run db:test:up` (migrates from zero).
+
+## Changing X? read this
+
+- **Add/remove an API route, DB table, or ingestion source** → update the `<!-- drift:* -->`
+  inventories below (machine-guarded; CI + pre-push will fail otherwise).
+- **Write to `items`/`item_versions`** → it must live in `lib/ingest` (single-writer guard).
+- **Read tiered content on the dashboard** → apply the `access`/tier filter explicitly; there is
+  no RLS backstop in postgres mode.
+- **Add a migration** → 14-digit timestamp prefix; run `npm run db:test:up` to prove replay.
+- **Change access control** → treat it as dual-backend; add/extend a data-mechanics parity test.
+
+## Keeping this doc honest
+
+The drift inventories (routes/tables/sources) are machine-checked. The sources-of-truth table,
+the Mermaid flows, and the invariants are **hand-maintained** — update them in the same PR as the
+change and bump the "Last verified" date when you reconcile against code.
 
 ## Repository inventories
 
