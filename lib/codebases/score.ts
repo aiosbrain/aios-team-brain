@@ -11,6 +11,8 @@
  * inputs so this stays testable. Weights live here and are meant to be tuned.
  */
 
+import { clamp, round } from "@/lib/num";
+
 export const AGENTIC_WEIGHTS = {
   ai_commit_ratio: 0.15,
   test_coverage_score: 0.25,
@@ -55,9 +57,6 @@ export interface ComputedScores {
   cadence_score: number;
   issue_health: number;
 }
-
-const clamp = (n: number, lo = 0, hi = 100) => Math.min(hi, Math.max(lo, n));
-const round2 = (n: number) => Math.round(n * 100) / 100;
 
 /** % of commits in the window that are AI-coauthored (heuristic; can saturate). */
 export function aiCommitRatio(i: ScanInputs): number {
@@ -118,13 +117,13 @@ export function computeScores(i: ScanInputs): ComputedScores {
     HEALTH_WEIGHTS.issue_health * issue_health;
 
   return {
-    agentic_score: round2(agentic_score),
-    health_score: round2(health_score),
-    ai_commit_ratio: round2(ai_commit_ratio),
-    test_coverage_score: round2(test_coverage_score),
-    scaffolding_score: round2(scaffolding_score),
-    skill_breadth_score: round2(skill_breadth_score),
-    cadence_score: round2(cadence_score),
-    issue_health: round2(issue_health),
+    agentic_score: round(agentic_score),
+    health_score: round(health_score),
+    ai_commit_ratio: round(ai_commit_ratio),
+    test_coverage_score: round(test_coverage_score),
+    scaffolding_score: round(scaffolding_score),
+    skill_breadth_score: round(skill_breadth_score),
+    cadence_score: round(cadence_score),
+    issue_health: round(issue_health),
   };
 }

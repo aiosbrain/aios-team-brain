@@ -3,6 +3,7 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import type { Kpi } from "./pulse";
 import { rangeDays, type Range } from "./range";
 import { canSeeCodebases, type ViewerTier } from "@/lib/codebases/visibility";
+import { num, round } from "@/lib/num";
 
 /**
  * The ONLY read path for codebase analytics tables — pages must go through here,
@@ -40,8 +41,6 @@ type MetricRow = {
   test_coverage_pct: number | string | null;
   ai_commit_ratio: number | string;
 };
-
-const num = (v: number | string | null | undefined) => (v == null ? 0 : Number(v) || 0);
 
 export async function getCodebaseSummaries(
   supabase: SupabaseClient,
@@ -113,7 +112,7 @@ export async function getCodebaseSummaries(
 
 function avg(nums: number[]): number {
   if (!nums.length) return 0;
-  return Math.round((nums.reduce((a, b) => a + b, 0) / nums.length) * 10) / 10;
+  return round(nums.reduce((a, b) => a + b, 0) / nums.length, 1);
 }
 
 function teamKpis(s: CodebaseSummary[], range: Range): Kpi[] {

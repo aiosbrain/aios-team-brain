@@ -104,9 +104,16 @@ export async function ingestCodebaseScan(
   if (payload.contributions.length) {
     const memberId = await buildAuthorMap(supabase, auth.teamId);
     for (const row of payload.contributions) {
+      // Resolve to a roster member by email first (author_key is usually the email),
+      // then by handle derived from the email local-part (e.g. alice@corp → "alice").
+      const email = row.author_email.toLowerCase();
+      const keyLc = row.author_key.toLowerCase();
+      const localPart = (email || keyLc).split("@")[0];
       const mapped =
-        memberId.byEmail.get(row.author_email.toLowerCase()) ??
-        memberId.byHandle.get(row.author_key.toLowerCase()) ??
+        memberId.byEmail.get(email) ??
+        memberId.byEmail.get(keyLc) ??
+        memberId.byHandle.get(localPart) ??
+        memberId.byHandle.get(keyLc) ??
         null;
       const { error } = await supabase.from("code_contributions").upsert(
         {

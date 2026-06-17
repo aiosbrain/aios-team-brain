@@ -11,6 +11,7 @@ repo metadata (stars/forks/languages) and issues/PRs are enriched best-effort.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import subprocess
@@ -18,6 +19,8 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 # unit/record separators that won't appear in commit metadata
 _RS = "\x1e"
@@ -28,6 +31,7 @@ _CODE_EXT = {
     ".c", ".h", ".cpp", ".cs", ".sql", ".sh", ".mjs", ".cjs", ".svelte", ".vue",
 }
 _MAX_FILE_BYTES = 1_000_000  # skip giant/generated files when counting LOC
+_MAX_ISSUE_PAGES = 10  # GitHub issues pagination cap (1000 issues); logged if hit
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -246,25 +250,37 @@ def _github_enrich(full_name: str, token: str | None) -> dict[str, Any]:
             langs = gh.get(f"https://api.github.com/repos/{full_name}/languages").json()
             out["meta"]["languages"] = langs if isinstance(langs, dict) else {}
 
-            issues_resp = gh.get(
-                f"https://api.github.com/repos/{full_name}/issues",
-                params={"state": "all", "per_page": 100},
-            ).json()
-            issues = []
-            for it in issues_resp if isinstance(issues_resp, list) else []:
-                issues.append({
-                    "number": it["number"],
-                    "title": (it.get("title") or "")[:1000],
-                    "state": it.get("state", "open"),
-                    "is_pull_request": "pull_request" in it,
-                    "author_login": (it.get("user") or {}).get("login", ""),
-                    "assignee_login": (it.get("assignee") or {}).get("login", "") or "",
-                    "labels": [lb["name"] for lb in it.get("labels", []) if isinstance(lb, dict)],
-                    "comments": it.get("comments", 0),
-                    "url": it.get("html_url", ""),
-                    "opened_at": it.get("created_at"),
-                    "closed_at": it.get("closed_at"),
-                })
+            # Paginate so we don't silently truncate repos with >100 issues/PRs.
+            # Cap at _MAX_ISSUE_PAGES (logged) to bound API calls on huge repos.
+            issues: list[dict[str, Any]] = []
+            for page in range(1, _MAX_ISSUE_PAGES + 1):
+                batch = gh.get(
+                    f"https://api.github.com/repos/{full_name}/issues",
+                    params={"state": "all", "per_page": 100, "page": page},
+                ).json()
+                if not isinstance(batch, list) or not batch:
+                    break
+                for it in batch:
+                    issues.append({
+                        "number": it["number"],
+                        "title": (it.get("title") or "")[:1000],
+                        "state": it.get("state", "open"),
+                        "is_pull_request": "pull_request" in it,
+                        "author_login": (it.get("user") or {}).get("login", ""),
+                        "assignee_login": (it.get("assignee") or {}).get("login", "") or "",
+                        "labels": [lb["name"] for lb in it.get("labels", []) if isinstance(lb, dict)],
+                        "comments": it.get("comments", 0),
+                        "url": it.get("html_url", ""),
+                        "opened_at": it.get("created_at"),
+                        "closed_at": it.get("closed_at"),
+                    })
+                if len(batch) < 100:
+                    break
+            else:
+                log.warning(
+                    "issues truncated at %d pages (%d issues) for %s",
+                    _MAX_ISSUE_PAGES, len(issues), full_name,
+                )
             out["issues"] = issues
     except Exception:  # noqa: BLE001 — enrichment is best-effort; local git still wins
         return {}
