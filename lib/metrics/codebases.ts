@@ -347,13 +347,11 @@ export async function getCodebaseDetail(
     deletions: number;
   }[];
 
-  // commit volume per day (AI vs human) for the commit-volume chart.
-  // The pg `date` column comes back as a Date (node-pg) or a string — normalize to YYYY-MM-DD.
-  const dayKey = (d: string | Date): string =>
-    d instanceof Date ? d.toISOString().slice(0, 10) : String(d).slice(0, 10);
+  // commit volume per day (AI vs human) for the commit-volume chart. Normalize the pg
+  // `date` column (Date or string) via dayStr — local components, no UTC midnight shift.
   const volByDay = new Map<string, { ai: number; human: number }>();
   for (const r of contribRows) {
-    const k = dayKey(r.day);
+    const k = dayStr(r.day);
     const v = volByDay.get(k) ?? { ai: 0, human: 0 };
     v.ai += r.ai_commits;
     v.human += Math.max(0, r.commits - r.ai_commits);

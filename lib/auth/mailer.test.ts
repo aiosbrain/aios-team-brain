@@ -58,4 +58,16 @@ describe("mailer delivery", () => {
     expect(body.text).not.toMatch(/token=/);
     expect(body.text).toMatch(/sign in/i);
   });
+
+  it("never writes a magic token to logs when no provider is configured", async () => {
+    vi.stubEnv("NODE_ENV", "development");
+    vi.stubEnv("RESEND_API_KEY", "");
+    vi.stubEnv("SMTP_URL", "");
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+
+    await sendMagicLink("x@y.test", "https://brain.test/auth/confirm?token=SECRET_TOKEN");
+
+    expect(JSON.stringify(info.mock.calls)).not.toContain("SECRET_TOKEN");
+    expect(JSON.stringify(info.mock.calls)).not.toContain("token=");
+  });
 });

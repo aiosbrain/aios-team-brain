@@ -12,13 +12,17 @@ import "server-only";
  * succeeded — and returns whether a provider accepted the message.
  */
 function senderFrom(): string {
-  // A verified domain + RESEND_FROM is required to send to arbitrary recipients;
-  // `onboarding@resend.dev` only delivers to the Resend account owner (fine for first-run).
-  return (
-    process.env.RESEND_FROM ??
-    process.env.SMTP_FROM ??
-    "AIOS Team Brain <onboarding@resend.dev>"
-  );
+  const explicit = process.env.RESEND_FROM ?? process.env.SMTP_FROM;
+  if (explicit) return explicit;
+  // `onboarding@resend.dev` only delivers to the Resend account owner — a footgun for real
+  // invites. Warn if a key is configured but no verified sender is set.
+  if (process.env.RESEND_API_KEY) {
+    console.warn(
+      "[mailer] RESEND_FROM unset — falling back to onboarding@resend.dev, which Resend only " +
+        "delivers to the account owner. Set RESEND_FROM to a verified-domain address for real recipients."
+    );
+  }
+  return "AIOS Team Brain <onboarding@resend.dev>";
 }
 
 async function deliver(to: string, subject: string, text: string): Promise<boolean> {
@@ -49,9 +53,10 @@ async function deliver(to: string, subject: string, text: string): Promise<boole
     }
   }
 
-  // No provider configured. Dev/first-run only — never a prod path.
+  // No provider configured. NEVER log the body/link — it carries a one-time token.
+  // For local sign-in without email, use /auth/dev-login (dev only).
   if (process.env.NODE_ENV !== "production") {
-    console.info(`[mailer] (dev, no provider) ${subject} → ${to}\n${text}`);
+    console.info(`[mailer] (dev, no provider) would send "${subject}" → ${to}; set RESEND_API_KEY to deliver.`);
   } else {
     console.error(`[mailer] no provider (set RESEND_API_KEY or SMTP_URL); dropped: ${subject} → ${to}`);
   }

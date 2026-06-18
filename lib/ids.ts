@@ -4,14 +4,14 @@ import { randomBytes } from "crypto";
 /**
  * Stable, collision-safe row key for dashboard-created rows (tasks, decisions).
  *
- * The `ui-` prefix never collides with markdown-derived IDs on a push round-trip
- * (tasks.md `ID` column / decision-log.md `#` column hold integers or slugs), and
- * the random suffix makes intra-project collisions astronomically unlikely. The key
- * is persisted at create time so it stays stable when the row is written back into a
- * workspace file and later re-pushed (origin `ui`→`sync` lifecycle).
+ * The `ui-` prefix is RESERVED for dashboard-created rows (documented in brain-api.md);
+ * markdown authors should not write `ui-*` keys. The 12-hex (48-bit) random suffix makes
+ * an intra-project collision with a hand-authored `ui-*` key cryptographically negligible
+ * (~1 in 2.8e14 per attempt). The key is persisted at create time so it stays stable when
+ * the row is written back into a workspace file and later re-pushed (origin `ui`→`sync`).
  */
 export function uiRowKey(): string {
-  return `ui-${randomBytes(4).toString("hex")}`;
+  return `ui-${randomBytes(6).toString("hex")}`;
 }
 
 /** True when a pg adapter error is a unique-constraint violation (no `.code` is

@@ -25,6 +25,16 @@ export function canSeeAccess(tier: ViewerTier, access: string): boolean {
 }
 
 /**
+ * Restrict a `decisions` query to what `tier` may see: external → only `audience='external'`.
+ * Decisions carry their tier in the `audience` column (not `access`); same SOLE-enforcement
+ * rule as items on the postgres target (no RLS). Route dashboard decision reads through here.
+ */
+export function visibleDecisions<Q>(query: Q, tier: ViewerTier): Q {
+  if (tier !== "external") return query;
+  return (query as { eq(column: string, value: string): Q }).eq("audience", "external");
+}
+
+/**
  * Role-scoped visibility for `query_log` reads (CLAUDE.md §5). `query_log` rows carry a
  * `member_id`; in postgres mode there is NO RLS, so this app-code filter is the SOLE thing
  * stopping a non-admin from reading the whole team's questions and `cost_usd`. Admins see the

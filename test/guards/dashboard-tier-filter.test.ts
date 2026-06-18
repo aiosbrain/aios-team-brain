@@ -13,6 +13,8 @@ import { join } from "node:path";
 const DASH_DIR = join(import.meta.dirname, "..", "..", "app", "t");
 const CHOKE = /(visibleItems|canSeeAccess)\s*\(/;
 const READS_ITEMS = /from\(\s*["']items["']\s*\)/;
+const DECISION_CHOKE = /(visibleDecisions|canSeeAccess)\s*\(/;
+const READS_DECISIONS = /from\(\s*["']decisions["']\s*\)/;
 const OPT_OUT = /tier-ok:/;
 
 function walk(dir: string, out: string[] = []): string[] {
@@ -30,16 +32,18 @@ function walk(dir: string, out: string[] = []): string[] {
   return out;
 }
 
-function offenders(): string[] {
+function offendersFor(reads: RegExp, choke: RegExp): string[] {
   const hits: string[] = [];
   for (const file of walk(DASH_DIR)) {
     const src = readFileSync(file, "utf8");
-    if (!READS_ITEMS.test(src)) continue;
+    if (!reads.test(src)) continue;
     if (OPT_OUT.test(src)) continue;
-    if (!CHOKE.test(src)) hits.push(file.slice(file.indexOf("app/")));
+    if (!choke.test(src)) hits.push(file.slice(file.indexOf("app/")));
   }
   return hits.sort();
 }
+
+const offenders = () => offendersFor(READS_ITEMS, CHOKE);
 
 describe("dashboard tier isolation", () => {
   it("every dashboard page reading items applies the tier choke-point", () => {
@@ -51,9 +55,20 @@ describe("dashboard tier isolation", () => {
     ).toEqual([]);
   });
 
+  it("every dashboard page reading decisions applies the tier choke-point", () => {
+    const violations = offendersFor(READS_DECISIONS, DECISION_CHOKE);
+    expect(
+      violations,
+      `Dashboard pages read decisions without the audience tier filter (no RLS backstop).\n` +
+        `Route the read through visibleDecisions() (or // tier-ok: <reason>):\n${violations.join("\n")}`
+    ).toEqual([]);
+  });
+
   it("the matchers discriminate (non-vacuity)", () => {
     expect(READS_ITEMS.test('supabase.from("items").select("id")')).toBe(true);
+    expect(READS_DECISIONS.test('supabase.from("decisions").select("id")')).toBe(true);
     expect(CHOKE.test("query = visibleItems(query, me.tier)")).toBe(true);
+    expect(DECISION_CHOKE.test("visibleDecisions(q, tier)")).toBe(true);
     expect(CHOKE.test('q.eq("team_id", t)')).toBe(false);
   });
 });

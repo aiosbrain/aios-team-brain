@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { Gavel } from "lucide-react";
 import { serverClient } from "@/lib/supabase/server";
 import { getSessionUser } from "@/lib/auth/session";
+import { visibleDecisions } from "@/lib/auth/visibility";
 import { DecisionsTable, type Decision } from "@/components/decisions-table";
 import { NewDecisionButton } from "@/components/decisions/new-decision-button";
 import { EmptyState } from "@/components/empty-state";
@@ -21,21 +22,28 @@ export default async function DecisionsPage({ params }: { params: Promise<{ team
 
   const user = await getSessionUser();
 
-  const [{ data: decisions }, { data: me }, { data: projects }] = await Promise.all([
-    supabase
-      .from("decisions")
-      .select(
-        "id, row_key, decided_at, title, rationale, decided_by, impact, tier, audience, still_valid, projects(slug)"
-      )
-      .eq("team_id", team.id)
-      .order("decided_at", { ascending: false }),
-    supabase
-      .from("members")
-      .select("role")
-      .eq("team_id", team.id)
-      .eq("auth_user_id", user?.id ?? "")
-      .eq("status", "active")
-      .maybeSingle(),
+  // The viewer's tier gates the decision read (audience filter) — fetch it before the
+  // query so an external principal never receives team-audience rows (no RLS backstop).
+  const { data: me } = await supabase
+    .from("members")
+    .select("role, tier")
+    .eq("team_id", team.id)
+    .eq("auth_user_id", user?.id ?? "")
+    .eq("status", "active")
+    .maybeSingle();
+  const tier = (me?.tier as "team" | "external" | undefined) ?? "external";
+
+  const [{ data: decisions }, { data: projects }] = await Promise.all([
+    visibleDecisions(
+      supabase
+        .from("decisions")
+        .select(
+          "id, row_key, decided_at, title, rationale, decided_by, impact, tier, audience, still_valid, projects(slug)"
+        )
+        .eq("team_id", team.id)
+        .order("decided_at", { ascending: false }),
+      tier
+    ),
     supabase
       .from("projects")
       .select("id, slug, name")

@@ -1,7 +1,7 @@
 import Link from "next/link";
 import { Rocket } from "lucide-react";
 import { serverClient } from "@/lib/supabase/server";
-import { visibleItems } from "@/lib/auth/visibility";
+import { visibleItems, visibleDecisions } from "@/lib/auth/visibility";
 import { getSessionUser } from "@/lib/auth/session";
 import { CopySnippet } from "@/components/copy-snippet";
 import { getPulseMetrics } from "@/lib/metrics/pulse";
@@ -146,12 +146,15 @@ export default async function TeamHome({
         .eq("entity_type", "commitment")
         .in("attrs->>status", ["open", "overdue", "at_risk", "broken"])
         .limit(20),
-      supabase
-        .from("decisions")
-        .select("id, title, decided_at, tier, still_valid")
-        .eq("team_id", team.id)
-        .order("decided_at", { ascending: false })
-        .limit(8),
+      visibleDecisions(
+        supabase
+          .from("decisions")
+          .select("id, title, decided_at, tier, still_valid")
+          .eq("team_id", team.id)
+          .order("decided_at", { ascending: false })
+          .limit(8),
+        tier
+      ),
     ]);
 
   return (
