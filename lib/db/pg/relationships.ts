@@ -50,6 +50,11 @@ export const RELATIONSHIPS: Record<string, Record<string, Relationship>> = {
     // member profile aggregates a contributor's work across codebases by slug.
     codebases: { kind: "one", table: "codebases", local: "codebase_id", foreign: "id" },
   },
+  integrations: {
+    // admin Integrations surface shows who configured each integration.
+    members: { kind: "one", table: "members", local: "created_by", foreign: "id" },
+    teams: { kind: "one", table: "teams", local: "team_id", foreign: "id" },
+  },
 };
 
 export function lookupRelationship(base: string, name: string): Relationship | undefined {

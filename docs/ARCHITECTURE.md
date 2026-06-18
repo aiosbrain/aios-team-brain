@@ -279,7 +279,8 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 `auth_users` · `auth_tokens` · `teams` · `members` · `api_keys` · `audit_log` · `rate_limits` ·
 `projects` · `items` · `item_versions` · `tasks` · `decisions` · `graph_entities` ·
 `graph_relationships` · `query_log` · `policies` · `approval_requests` · `actions` ·
-`codebases` · `code_metrics` · `code_contributions` · `github_issues` · `member_emails`
+`codebases` · `code_metrics` · `code_contributions` · `github_issues` · `member_emails` ·
+`integrations`
 <!-- /drift:tables -->
 
 ### Ingestion sources
