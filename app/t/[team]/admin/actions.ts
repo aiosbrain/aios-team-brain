@@ -6,6 +6,8 @@ import { adminClient } from "@/lib/supabase/admin";
 import { getSessionUser } from "@/lib/auth/session";
 import { createMember } from "@/lib/admin/members";
 import { issueApiKey as issueApiKeyPrimitive, revokeApiKey as revokeApiKeyPrimitive } from "@/lib/admin/keys";
+import { issueMagicToken } from "@/lib/auth/pg-login";
+import { sendInviteEmail } from "@/lib/auth/mailer";
 
 /** Verify the caller is an active admin of the team; returns ids or null. */
 async function requireAdmin(teamSlug: string) {
@@ -51,6 +53,23 @@ export async function inviteMember(
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "create failed" };
   }
+
+  // Best-effort invite email — never blocks the invite (createMember already succeeded).
+  // A direct one-time sign-in link when APP_URL is set (server actions have no request
+  // origin); otherwise a non-secret "sign in" nudge. The token is never logged.
+  try {
+    const email = form.email.trim().toLowerCase();
+    const appUrl = process.env.APP_URL?.replace(/\/$/, "");
+    let link: string | null = null;
+    if (appUrl) {
+      const raw = await issueMagicToken(email, `/t/${teamSlug}`, 1440); // 24h invite TTL
+      if (raw) link = `${appUrl}/auth/confirm?token=${raw}`;
+    }
+    await sendInviteEmail(email, link);
+  } catch (e) {
+    console.error("[invite] email send failed:", e instanceof Error ? e.message : e);
+  }
+
   revalidatePath(`/t/${teamSlug}/admin/members`);
   return { ok: true };
 }
