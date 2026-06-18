@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { runAction, resolveApproval } from "@/lib/actions";
-import type { ActionHandler, SandboxRunner } from "@/lib/actions";
+import type { SandboxRunner } from "@/lib/actions";
 import { FakeSupabase } from "@/lib/ingest/fake-supabase";
 import type { Principal } from "@/lib/policy/evaluate";
 
@@ -24,7 +24,7 @@ function seedPolicy(fake: FakeSupabase, over: Record<string, unknown>) {
   });
 }
 
-const base = (fake: FakeSupabase) => ({
+const base = (_fake: FakeSupabase) => ({
   teamId: "team-1",
   principal: PRINCIPAL,
   memberId: "mem-1",

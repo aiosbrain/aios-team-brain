@@ -4,7 +4,7 @@
  * insert/update/delete/select with eq()/maybeSingle()/single()/not(col,'is',null).
  * Not a general mock — faithful to the calls in index.ts, deliberately small.
  */
-type Row = Record<string, any>;
+type Row = Record<string, unknown>;
 type Filter =
   | { kind: "eq"; col: string; val: unknown }
   | { kind: "notNull"; col: string };
@@ -28,7 +28,7 @@ export class FakeSupabase {
   }
 }
 
-class Builder implements PromiseLike<{ data: any; error: null }> {
+class Builder implements PromiseLike<{ data: unknown; error: null }> {
   private op: "select" | "insert" | "update" | "upsert" | "delete" = "select";
   private payload: Row | null = null;
   private conflict: string[] = [];
@@ -84,7 +84,7 @@ class Builder implements PromiseLike<{ data: any; error: null }> {
   async maybeSingle() {
     return { data: this.run()[0] ?? null, error: null };
   }
-  then<R>(resolve: (v: { data: any; error: null }) => R): R {
+  then<R>(resolve: (v: { data: unknown; error: null }) => R): R {
     return resolve({ data: this.run(), error: null });
   }
 

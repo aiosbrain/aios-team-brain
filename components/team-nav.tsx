@@ -70,7 +70,7 @@ function Leaf({ item, indent = false }: { item: NavLeaf; indent?: boolean }) {
 export function TeamNav({ items }: { items: NavEntry[] }) {
   return (
     <nav className="flex flex-col gap-0.5">
-      {items.map((entry, i) =>
+      {items.map((entry) =>
         isSection(entry) ? (
           <div key={`section-${entry.label}`} className="mt-3 first:mt-0">
             <p className="px-3 pb-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-ink-tertiary">
