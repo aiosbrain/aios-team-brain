@@ -102,7 +102,7 @@ export default async function CodebaseDetailPage({
         <h2 className="text-sm font-semibold uppercase tracking-wider text-ink-tertiary">
           Contributors
         </h2>
-        <ContributorTable rows={cb.contributors} />
+        <ContributorTable rows={cb.contributors} teamSlug={teamSlug} codebaseSlug={cb.slug} />
       </section>
 
       <section className="flex flex-col gap-3">

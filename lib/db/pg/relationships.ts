@@ -46,6 +46,10 @@ export const RELATIONSHIPS: Record<string, Record<string, Relationship>> = {
     items: { kind: "many", table: "items", local: "id", foreign: "project_id" },
     tasks: { kind: "many", table: "tasks", local: "id", foreign: "project_id" },
   },
+  code_contributions: {
+    // member profile aggregates a contributor's work across codebases by slug.
+    codebases: { kind: "one", table: "codebases", local: "codebase_id", foreign: "id" },
+  },
 };
 
 export function lookupRelationship(base: string, name: string): Relationship | undefined {

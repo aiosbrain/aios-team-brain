@@ -427,3 +427,240 @@ export async function getCodebaseDetail(
     issues,
   };
 }
+
+// ── Contributor drill-down + member profile (tier-gated, team-only) ───────────
+
+export interface ContributorDay {
+  day: string; // YYYY-MM-DD
+  commits: number;
+  ai_commits: number;
+  additions: number;
+  deletions: number;
+}
+
+export interface ContributorDetail {
+  codebase_slug: string;
+  author_key: string;
+  member_id: string | null;
+  name: string;
+  avatar_url: string | null;
+  github_login: string | null;
+  totals: { commits: number; ai_commits: number; additions: number; deletions: number; active_days: number };
+  days: ContributorDay[];
+}
+
+/** Identify a contributor either by mapped member (aggregates all their aliases) or by
+ *  a raw author_key (unmapped). */
+export type ContributorRef = { memberId: string } | { authorKey: string };
+
+function emptyDay(day: string): ContributorDay {
+  return { day, commits: 0, ai_commits: 0, additions: 0, deletions: 0 };
+}
+
+/** Normalize a `date` column (pg adapter returns it as a Date, sometimes a string) to YYYY-MM-DD. */
+function dayStr(v: string | Date): string {
+  if (typeof v === "string") return v.slice(0, 10);
+  return `${v.getFullYear()}-${String(v.getMonth() + 1).padStart(2, "0")}-${String(v.getDate()).padStart(2, "0")}`;
+}
+
+/**
+ * Per-day contributions for one contributor within a codebase — powers the drill-down
+ * (commit heatmap + trend). Tier-gated: team-only, like the rest of codebase analytics
+ * (the `lib/metrics/codebases` choke-point is the sole enforcement on postgres).
+ */
+export async function getContributorDetail(
+  supabase: SupabaseClient,
+  teamId: string,
+  slug: string,
+  ref: ContributorRef,
+  range: Range,
+  tier: ViewerTier
+): Promise<ContributorDetail | null> {
+  if (!canSeeCodebases(tier)) return null;
+
+  const { data: cb } = await supabase
+    .from("codebases")
+    .select("id, slug")
+    .eq("team_id", teamId)
+    .eq("slug", slug)
+    .maybeSingle();
+  if (!cb) return null;
+
+  const windowStart = new Date(Date.now() - rangeDays(range) * 86_400_000).toISOString().slice(0, 10);
+  let q = supabase
+    .from("code_contributions")
+    .select("author_key, author_name, member_id, day, commits, ai_commits, additions, deletions")
+    .eq("codebase_id", (cb as { id: string }).id)
+    .gte("day", windowStart)
+    .order("day", { ascending: true })
+    .limit(10_000);
+  q = "memberId" in ref ? q.eq("member_id", ref.memberId) : q.eq("author_key", ref.authorKey);
+
+  const { data } = await q;
+  const rows = (data ?? []) as {
+    author_key: string;
+    author_name: string;
+    member_id: string | null;
+    day: string | Date;
+    commits: number;
+    ai_commits: number;
+    additions: number;
+    deletions: number;
+  }[];
+  if (rows.length === 0) return null;
+
+  const byDay = new Map<string, ContributorDay>();
+  const totals = { commits: 0, ai_commits: 0, additions: 0, deletions: 0, active_days: 0 };
+  for (const r of rows) {
+    const day = dayStr(r.day);
+    const d = byDay.get(day) ?? emptyDay(day);
+    d.commits += r.commits;
+    d.ai_commits += r.ai_commits;
+    d.additions += r.additions;
+    d.deletions += r.deletions;
+    byDay.set(day, d);
+    totals.commits += r.commits;
+    totals.ai_commits += r.ai_commits;
+    totals.additions += r.additions;
+    totals.deletions += r.deletions;
+  }
+  totals.active_days = byDay.size;
+
+  let name = rows[0].author_name || rows[0].author_key;
+  let avatar_url: string | null = null;
+  let github_login: string | null = null;
+  const member_id = "memberId" in ref ? ref.memberId : rows.find((r) => r.member_id)?.member_id ?? null;
+  if (member_id) {
+    const { data: m } = await supabase
+      .from("members")
+      .select("display_name, avatar_url, github_login")
+      .eq("id", member_id)
+      .eq("team_id", teamId)
+      .maybeSingle();
+    if (m) {
+      const mm = m as { display_name: string | null; avatar_url: string | null; github_login: string | null };
+      name = mm.display_name ?? name;
+      avatar_url = mm.avatar_url;
+      github_login = mm.github_login;
+    }
+  }
+
+  return {
+    codebase_slug: (cb as { slug: string }).slug,
+    author_key: rows[0].author_key,
+    member_id,
+    name,
+    avatar_url,
+    github_login,
+    totals,
+    days: [...byDay.values()].sort((a, b) => a.day.localeCompare(b.day)),
+  };
+}
+
+export interface MemberProfileRepo {
+  slug: string;
+  commits: number;
+  ai_commits: number;
+}
+
+export interface MemberProfile {
+  member_id: string;
+  handle: string;
+  name: string;
+  avatar_url: string | null;
+  github_login: string | null;
+  role: string;
+  totals: { commits: number; ai_commits: number; additions: number; deletions: number; active_days: number };
+  repos: MemberProfileRepo[];
+  days: ContributorDay[]; // across all codebases — for a cross-repo heatmap
+}
+
+/**
+ * A member profile: identity (GitHub avatar) + their contributions aggregated across all
+ * the team's codebases. Looked up by `actor_handle` or `github_login`. Tier-gated team-only.
+ */
+export async function getMemberProfile(
+  supabase: SupabaseClient,
+  teamId: string,
+  handle: string,
+  range: Range,
+  tier: ViewerTier
+): Promise<MemberProfile | null> {
+  if (!canSeeCodebases(tier)) return null;
+
+  const { data: members } = await supabase
+    .from("members")
+    .select("id, display_name, actor_handle, github_login, avatar_url, role, status")
+    .eq("team_id", teamId);
+  const lc = handle.toLowerCase();
+  const member = ((members ?? []) as {
+    id: string;
+    display_name: string | null;
+    actor_handle: string | null;
+    github_login: string | null;
+    avatar_url: string | null;
+    role: string;
+    status: string;
+  }[]).find(
+    (m) =>
+      m.status === "active" &&
+      (m.actor_handle?.toLowerCase() === lc ||
+        m.github_login?.toLowerCase() === lc ||
+        m.id === handle)
+  );
+  if (!member) return null;
+
+  const windowStart = new Date(Date.now() - rangeDays(range) * 86_400_000).toISOString().slice(0, 10);
+  const { data: contribs } = await supabase
+    .from("code_contributions")
+    .select("day, commits, ai_commits, additions, deletions, codebases(slug)")
+    .eq("team_id", teamId)
+    .eq("member_id", member.id)
+    .gte("day", windowStart)
+    .order("day", { ascending: true })
+    .limit(20_000);
+
+  const rows = (contribs ?? []) as unknown as {
+    day: string | Date;
+    commits: number;
+    ai_commits: number;
+    additions: number;
+    deletions: number;
+    codebases: { slug: string } | null;
+  }[];
+
+  const byDay = new Map<string, ContributorDay>();
+  const byRepo = new Map<string, MemberProfileRepo>();
+  const totals = { commits: 0, ai_commits: 0, additions: 0, deletions: 0, active_days: 0 };
+  for (const r of rows) {
+    const day = dayStr(r.day);
+    const d = byDay.get(day) ?? emptyDay(day);
+    d.commits += r.commits;
+    d.ai_commits += r.ai_commits;
+    d.additions += r.additions;
+    d.deletions += r.deletions;
+    byDay.set(day, d);
+    const slug = r.codebases?.slug ?? "unknown";
+    const repo = byRepo.get(slug) ?? { slug, commits: 0, ai_commits: 0 };
+    repo.commits += r.commits;
+    repo.ai_commits += r.ai_commits;
+    byRepo.set(slug, repo);
+    totals.commits += r.commits;
+    totals.ai_commits += r.ai_commits;
+    totals.additions += r.additions;
+    totals.deletions += r.deletions;
+  }
+  totals.active_days = byDay.size;
+
+  return {
+    member_id: member.id,
+    handle: member.actor_handle ?? member.github_login ?? member.id,
+    name: member.display_name ?? member.actor_handle ?? "Member",
+    avatar_url: member.avatar_url,
+    github_login: member.github_login,
+    role: member.role,
+    totals,
+    repos: [...byRepo.values()].sort((a, b) => b.commits - a.commits),
+    days: [...byDay.values()].sort((a, b) => a.day.localeCompare(b.day)),
+  };
+}
