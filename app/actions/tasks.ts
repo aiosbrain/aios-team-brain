@@ -2,6 +2,7 @@
 
 import { serverClient } from "@/lib/supabase/server";
 import { currentMember } from "@/lib/auth/guard";
+import { uiRowKey, isUniqueViolation } from "@/lib/ids";
 import { TASK_STATUSES, type Task, type TaskStatus } from "@/components/kanban/types";
 
 /**
@@ -50,23 +51,31 @@ export async function createTaskAction(
   if (!me) return { ok: false, error: "not a member of this team" };
 
   const supabase = await serverClient();
-  const { data, error } = await supabase
-    .from("tasks")
-    .insert({
-      team_id: input.teamId,
-      project_id: input.projectId,
-      title,
-      assignee: input.assignee,
-      sprint: input.sprint,
-      due_date: input.dueDate || null,
-      status: "backlog",
-      origin: "ui",
-      created_by: me.id,
-    })
-    .select(
-      "id, row_key, title, assignee, status, sprint, due_date, origin, project_id, updated_at"
-    )
-    .single();
-  if (error || !data) return { ok: false, error: error?.message ?? "could not create task" };
-  return { ok: true, task: data as Task };
+  // Mint a stable `ui-` row_key so the task is visible to `GET /api/v1/tasks`
+  // writeback (which filters `row_key is not null`) and round-trips into tasks.md.
+  // Retry once on the (team_id,project_id,row_key) unique constraint.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const { data, error } = await supabase
+      .from("tasks")
+      .insert({
+        team_id: input.teamId,
+        project_id: input.projectId,
+        row_key: uiRowKey(),
+        title,
+        assignee: input.assignee,
+        sprint: input.sprint,
+        due_date: input.dueDate || null,
+        status: "backlog",
+        origin: "ui",
+        created_by: me.id,
+      })
+      .select(
+        "id, row_key, title, assignee, status, sprint, due_date, origin, project_id, updated_at"
+      )
+      .single();
+    if (!error && data) return { ok: true, task: data as Task };
+    if (attempt === 0 && isUniqueViolation(error?.message)) continue;
+    return { ok: false, error: error?.message ?? "could not create task" };
+  }
+  return { ok: false, error: "could not create task" };
 }
