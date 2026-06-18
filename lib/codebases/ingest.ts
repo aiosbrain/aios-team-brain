@@ -2,6 +2,7 @@ import "server-only";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import type { CodebaseScanPayload } from "@/lib/api/schemas";
 import { computeScores } from "@/lib/codebases/score";
+import { buildIdentityMap, resolveMember } from "@/lib/identity/resolve";
 import { audit } from "@/lib/api/audit";
 
 /**
@@ -102,26 +103,12 @@ export async function ingestCodebaseScan(
   // 4. contributions — map author → member, then recompute + upsert daily aggregates
   let contribCount = 0;
   if (payload.contributions.length) {
-    const memberId = await buildAuthorMap(supabase, auth.teamId);
+    const identityMap = await buildIdentityMap(supabase, auth.teamId);
     for (const row of payload.contributions) {
-      // Resolve to a roster member by exact email first. Only derive a handle from
-      // an email local-part when that email uses a domain already present in the
-      // roster; otherwise external contributors like alex@gmail.com could be
-      // misattributed to an internal actor_handle "alex".
-      const email = row.author_email.trim().toLowerCase();
-      const keyLc = row.author_key.trim().toLowerCase();
-      const [localPart, domain] = email.includes("@") ? email.split("@", 2) : ["", ""];
-      const handleFromTeamDomain =
-        localPart && domain && memberId.emailDomains.has(domain)
-          ? memberId.byHandle.get(localPart)
-          : undefined;
-      const explicitHandle = keyLc && !keyLc.includes("@") ? memberId.byHandle.get(keyLc) : undefined;
-      const mapped =
-        memberId.byEmail.get(email) ??
-        memberId.byEmail.get(keyLc) ??
-        handleFromTeamDomain ??
-        explicitHandle ??
-        null;
+      const mapped = resolveMember(identityMap, {
+        email: row.author_email,
+        key: row.author_key,
+      });
       const { error } = await supabase.from("code_contributions").upsert(
         {
           team_id: auth.teamId,
@@ -193,38 +180,4 @@ export async function ingestCodebaseScan(
     contributions: contribCount,
     issues: issueCount,
   };
-}
-
-/** Lookup tables mapping git author identity → member_id for the team. */
-async function buildAuthorMap(supabase: SupabaseClient, teamId: string) {
-  const { data } = await supabase
-    .from("members")
-    .select("id, email, actor_handle")
-    .eq("team_id", teamId);
-  const byEmail = new Map<string, string>();
-  const byHandle = new Map<string, string>();
-  const emailDomains = new Set<string>();
-  for (const r of (data ?? []) as { id: string; email: string | null; actor_handle: string | null }[]) {
-    if (r.email) {
-      const email = r.email.toLowerCase();
-      byEmail.set(email, r.id);
-      const domain = email.split("@", 2)[1];
-      if (domain) emailDomains.add(domain);
-    }
-    if (r.actor_handle) byHandle.set(r.actor_handle.toLowerCase(), r.id);
-  }
-
-  // Fold in explicit git-author aliases (e.g. GitHub noreply emails) as EXACT
-  // byEmail matches. Deliberately NOT added to emailDomains — alias domains like
-  // users.noreply.github.com are shared, so widening the handle heuristic with them
-  // would re-introduce cross-author misattribution (the bug PR #11 closed).
-  const { data: aliases } = await supabase
-    .from("member_emails")
-    .select("email, member_id")
-    .eq("team_id", teamId);
-  for (const a of (aliases ?? []) as { email: string; member_id: string }[]) {
-    if (a.email) byEmail.set(a.email.toLowerCase(), a.member_id);
-  }
-
-  return { byEmail, byHandle, emailDomains };
 }

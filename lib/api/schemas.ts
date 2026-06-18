@@ -162,3 +162,92 @@ export function errorResponse(code: string, message: string, status: number) {
     { status }
   );
 }
+
+// ── Integrations (Wave 1 framework) ────────────────────────────────────────────
+// The `integrations.config` jsonb holds NON-SECRET selection only. Secrets (tokens) live
+// in the sidecar's env/connections.yaml and are merged locally — the brain never stores them.
+// Enforcement (not just a comment): per-type `.strict()` allowlists reject unknown keys, an
+// explicit secret-key scan rejects token-like keys anywhere (incl. nested), and a byte cap
+// bounds the column.
+
+export const INTEGRATION_TYPES = ["github", "granola", "slack", "wise", "linear", "plane"] as const;
+export type IntegrationType = (typeof INTEGRATION_TYPES)[number];
+export const INTEGRATION_STATUSES = ["enabled", "disabled"] as const;
+
+/** Per-type NON-SECRET config allowlists. `.strict()` rejects any key not listed. */
+const integrationConfigSchemas: Record<IntegrationType, z.ZodType> = {
+  github: z.object({ repos: z.array(z.string().min(1).max(200)).max(200).default([]) }).strict(),
+  slack: z.object({ channelIds: z.array(z.string().min(1).max(40)).max(200).default([]) }).strict(),
+  granola: z
+    .object({
+      // Privacy allowlist: only meetings matching these are candidates for decision extraction.
+      matchKeywords: z.array(z.string().min(1).max(120)).max(50).default([]),
+      participantEmails: z.array(z.string().email().max(200)).max(50).default([]),
+    })
+    .strict(),
+  wise: z.object({ profileId: z.string().max(64).optional() }).strict(),
+  linear: z
+    .object({ teamId: z.string().max(64).optional(), projectId: z.string().max(64).optional() })
+    .strict(),
+  plane: z
+    .object({
+      workspaceSlug: z.string().max(120).optional(),
+      projectId: z.string().max(64).optional(),
+    })
+    .strict(),
+};
+
+const SECRET_KEY_RE = /token|secret|api[_-]?key|password|bearer|credential|client[_-]?secret|private[_-]?key/i;
+const MAX_CONFIG_BYTES = 8 * 1024;
+
+/** Thrown when integration config is malformed/oversized/contains a secret-like key (→ 400). */
+export class IntegrationConfigError extends Error {}
+
+function collectKeys(value: unknown, out: string[] = []): string[] {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    for (const [k, v] of Object.entries(value)) {
+      out.push(k);
+      collectKeys(v, out);
+    }
+  } else if (Array.isArray(value)) {
+    for (const v of value) collectKeys(v, out);
+  }
+  return out;
+}
+
+/**
+ * Validate + normalize an integration's NON-SECRET config. Order: byte cap → secret-key scan
+ * (anywhere, incl. nested) → per-type `.strict()` allowlist. Throws IntegrationConfigError.
+ */
+export function validateIntegrationConfig(
+  type: IntegrationType,
+  config: unknown
+): Record<string, unknown> {
+  const value = config ?? {};
+  const serialized = JSON.stringify(value);
+  if (serialized.length > MAX_CONFIG_BYTES) {
+    throw new IntegrationConfigError(`config exceeds ${MAX_CONFIG_BYTES} bytes`);
+  }
+  for (const key of collectKeys(value)) {
+    if (SECRET_KEY_RE.test(key)) {
+      throw new IntegrationConfigError(
+        `secret-like key "${key}" is not allowed — secrets stay in the sidecar's local config, never the brain`
+      );
+    }
+  }
+  const parsed = integrationConfigSchemas[type].safeParse(value);
+  if (!parsed.success) {
+    throw new IntegrationConfigError(
+      parsed.error.issues.map((i) => `${i.path.join(".") || "config"}: ${i.message}`).join("; ")
+    );
+  }
+  return parsed.data as Record<string, unknown>;
+}
+
+export const integrationInputSchema = z.object({
+  type: z.enum(INTEGRATION_TYPES),
+  name: z.string().min(1).max(120),
+  config: z.unknown().optional(),
+  status: z.enum(INTEGRATION_STATUSES).optional(),
+});
+export type IntegrationInput = z.infer<typeof integrationInputSchema>;

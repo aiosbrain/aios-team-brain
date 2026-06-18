@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { visibleItems, canSeeAccess } from "@/lib/auth/visibility";
+import { visibleItems, visibleDecisions, canSeeAccess } from "@/lib/auth/visibility";
 import { db, ingest, seedTeam } from "./helpers";
 
 // The dashboard tier choke-point (lib/auth/visibility), verified to the observable outcome
@@ -30,5 +30,47 @@ describe("visibleItems() / canSeeAccess() on real Postgres", () => {
     expect(canSeeAccess("external", "team")).toBe(false);
     expect(canSeeAccess("external", "external")).toBe(true);
     expect(canSeeAccess("team", "team")).toBe(true);
+  });
+});
+
+describe("dashboard decision visibility on real Postgres", () => {
+  it("external dashboard reads do not expose team-audience decisions", async () => {
+    const seed = await seedTeam();
+    const { data: project } = await db()
+      .from("projects")
+      .insert({ team_id: seed.teamId, slug: "acme", name: "Acme" })
+      .select("id")
+      .single();
+
+    await db().from("decisions").insert([
+      {
+        team_id: seed.teamId,
+        project_id: (project as { id: string }).id,
+        row_key: "D-team",
+        title: "Internal pricing posture",
+        audience: "team",
+      },
+      {
+        team_id: seed.teamId,
+        project_id: (project as { id: string }).id,
+        row_key: "D-external",
+        title: "Client-facing launch date",
+        audience: "external",
+      },
+    ]);
+
+    const base = () =>
+      db().from("decisions").select("row_key, title, audience").eq("team_id", seed.teamId).order("row_key");
+
+    // External viewer through the choke-point: only audience='external'.
+    const { data: ext } = await visibleDecisions(base(), "external");
+    const extKeys = ((ext ?? []) as { row_key: string }[]).map((r) => r.row_key);
+    expect(extKeys).toContain("D-external"); // non-vacuity
+    expect(extKeys).not.toContain("D-team"); // no leak, no RLS backstop
+
+    // Team viewer sees both.
+    const { data: team } = await visibleDecisions(base(), "team");
+    const teamKeys = ((team ?? []) as { row_key: string }[]).map((r) => r.row_key);
+    expect(teamKeys).toEqual(["D-external", "D-team"]);
   });
 });

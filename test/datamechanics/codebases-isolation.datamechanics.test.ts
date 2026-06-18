@@ -1,7 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
 import { ingestCodebaseScan } from "@/lib/codebases/ingest";
-import { getCodebaseSummaries, getCodebaseDetail } from "@/lib/metrics/codebases";
+import {
+  getCodebaseSummaries,
+  getCodebaseDetail,
+  getContributorDetail,
+  getMemberProfile,
+} from "@/lib/metrics/codebases";
 import { codebaseScanPayloadSchema } from "@/lib/api/schemas";
 import { db, seedTeam, type Seed } from "./helpers";
 
@@ -181,6 +186,33 @@ describe("codebase scan idempotency (real Postgres)", () => {
       .eq("author_key", externalEmail);
 
     expect((rows.data as { member_id: string | null }[])[0].member_id).toBeNull();
+  });
+
+  it("contributor drill-down + member profile are team-only (external sees nothing)", async () => {
+    const seed = await seedTeam();
+    const slug = `repo-${randomUUID().slice(0, 6)}`;
+    const { email, actor_handle } = await memberIdentity(seed.memberId);
+    await ingestScan(
+      seed,
+      buildScan({
+        slug,
+        contributions: [{ author_key: email, author_email: email, day: "2026-06-15", commits: 7, ai_commits: 4 }],
+      })
+    );
+
+    // drill-down: present for team, null for external (the crown jewel)
+    const detail = await getContributorDetail(db(), seed.teamId, slug, { memberId: seed.memberId }, "90d", "team");
+    expect(detail?.totals.commits).toBe(7); // non-vacuity: the data IS there
+    expect(detail?.days.length).toBeGreaterThan(0);
+    expect(
+      await getContributorDetail(db(), seed.teamId, slug, { memberId: seed.memberId }, "90d", "external")
+    ).toBeNull();
+
+    // profile (by actor_handle): present for team, null for external
+    const profile = await getMemberProfile(db(), seed.teamId, actor_handle, "90d", "team");
+    expect(profile?.totals.commits).toBe(7);
+    expect(profile?.repos.map((r) => r.slug)).toContain(slug);
+    expect(await getMemberProfile(db(), seed.teamId, actor_handle, "90d", "external")).toBeNull();
   });
 
   it("maps email local-part to handle only when the email uses a team roster domain", async () => {

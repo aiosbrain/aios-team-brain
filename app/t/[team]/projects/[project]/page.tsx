@@ -3,7 +3,7 @@ import { notFound } from "next/navigation";
 import { CircleCheck, CircleX, FolderOpen } from "lucide-react";
 import { serverClient } from "@/lib/supabase/server";
 import { currentMember } from "@/lib/auth/guard";
-import { visibleItems } from "@/lib/auth/visibility";
+import { visibleItems, visibleDecisions } from "@/lib/auth/visibility";
 import { KindBadge } from "@/components/kind-badge";
 import { TierBadge } from "@/components/tier-badge";
 import { EmptyState } from "@/components/empty-state";
@@ -62,12 +62,15 @@ export default async function ProjectPage({
         .order("path"),
       me?.tier ?? "external"
     ),
-    supabase
-      .from("decisions")
-      .select("id, row_key, decided_at, title, decided_by, still_valid")
-      .eq("team_id", team.id)
-      .eq("project_id", project.id)
-      .order("decided_at", { ascending: false }),
+    visibleDecisions(
+      supabase
+        .from("decisions")
+        .select("id, row_key, decided_at, title, decided_by, still_valid")
+        .eq("team_id", team.id)
+        .eq("project_id", project.id)
+        .order("decided_at", { ascending: false }),
+      me?.tier ?? "external"
+    ),
     supabase
       .from("members")
       .select("id, display_name, actor_handle, role")

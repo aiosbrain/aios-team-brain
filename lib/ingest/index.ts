@@ -93,12 +93,15 @@ export async function ingestItem(
     member_id: auth.memberId,
   });
 
-  // 4. materialize rows
-  if (payload.rows?.length) {
+  // 4. materialize rows. Present (even if empty) for task/decision items, so an emptied
+  // markdown table diff-deletes its synced rows. `now` (the item's synced_at) is used as
+  // the row updated_at, so a freshly-synced row is NOT mistaken for "edited after sync"
+  // by the writeback (which would otherwise re-emit a just-written-back UI row forever).
+  if (payload.rows && (payload.kind === "task" || payload.kind === "decision")) {
     if (payload.kind === "task") {
-      await materializeTasks(supabase, auth.teamId, project.id, itemId, payload.rows);
-    } else if (payload.kind === "decision") {
-      await materializeDecisions(supabase, auth.teamId, project.id, itemId, payload.rows);
+      await materializeTasks(supabase, auth.teamId, project.id, itemId, payload.rows, now);
+    } else {
+      await materializeDecisions(supabase, auth.teamId, project.id, itemId, payload.rows, now);
     }
   }
 
@@ -118,7 +121,8 @@ async function materializeTasks(
   teamId: string,
   projectId: string,
   itemId: string,
-  rawRows: unknown[]
+  rawRows: unknown[],
+  syncedAt: string
 ) {
   const rows = rawRows
     .map((r) => taskRowSchema.safeParse(r))
@@ -142,7 +146,7 @@ async function materializeTasks(
         sprint: row.sprint ?? "",
         due_date: row.due || null,
         origin: "sync",
-        updated_at: new Date().toISOString(),
+        updated_at: syncedAt,
       },
       { onConflict: "team_id,project_id,row_key" }
     );
@@ -168,7 +172,8 @@ async function materializeDecisions(
   teamId: string,
   projectId: string,
   itemId: string,
-  rawRows: unknown[]
+  rawRows: unknown[],
+  syncedAt: string
 ) {
   const rows = rawRows
     .map((r) => decisionRowSchema.safeParse(r))
@@ -190,7 +195,7 @@ async function materializeDecisions(
         impact: row.impact ?? "",
         tier: row.tier ?? null,
         audience,
-        updated_at: new Date().toISOString(),
+        updated_at: syncedAt,
       },
       { onConflict: "team_id,project_id,row_key" }
     );

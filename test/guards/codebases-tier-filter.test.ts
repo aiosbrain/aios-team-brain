@@ -50,6 +50,20 @@ describe("codebase tier isolation", () => {
     expect(src).toMatch(/canSeeCodebases\s*\(/);
   });
 
+  it("EVERY exported helper that reads a codebase table gates on canSeeCodebases", () => {
+    const src = readFileSync(HELPER, "utf8");
+    // Each chunk is one exported function body (up to the next export / EOF).
+    const ungated = src
+      .split(/export async function /)
+      .slice(1)
+      .filter((chunk) => TABLES.test(chunk) && !/canSeeCodebases\s*\(/.test(chunk))
+      .map((chunk) => chunk.slice(0, chunk.indexOf("(")));
+    expect(
+      ungated,
+      `helper fn(s) read codebase tables without a canSeeCodebases gate: ${ungated.join(", ")}`
+    ).toEqual([]);
+  });
+
   it("the matcher discriminates (non-vacuity)", () => {
     expect(TABLES.test('supabase.from("code_metrics").select("x")')).toBe(true);
     expect(TABLES.test('supabase.from("items").select("x")')).toBe(false);

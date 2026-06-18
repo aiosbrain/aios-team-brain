@@ -6,10 +6,6 @@ import type { ItemPayload } from "@/lib/api/schemas";
 
 const AUTH = { teamId: "team-1", memberId: "mem-1", apiKeyId: "key-1" };
 
-function db() {
-  return new FakeSupabase() as unknown as SupabaseClient;
-}
-
 function payload(over: Partial<ItemPayload> = {}): ItemPayload {
   return {
     project: "acme",

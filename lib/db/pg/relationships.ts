@@ -31,6 +31,9 @@ export const RELATIONSHIPS: Record<string, Record<string, Relationship>> = {
   },
   decisions: {
     projects: { kind: "one", table: "projects", local: "project_id", foreign: "id" },
+    // alias `items:source_item_id(...)` → embed name "items", FK source_item_id
+    // (used by GET /api/v1/decisions writeback to read the source item's synced_at).
+    items: { kind: "one", table: "items", local: "source_item_id", foreign: "id" },
   },
   api_keys: {
     members: { kind: "one", table: "members", local: "member_id", foreign: "id" },
@@ -42,6 +45,15 @@ export const RELATIONSHIPS: Record<string, Record<string, Relationship>> = {
   projects: {
     items: { kind: "many", table: "items", local: "id", foreign: "project_id" },
     tasks: { kind: "many", table: "tasks", local: "id", foreign: "project_id" },
+  },
+  code_contributions: {
+    // member profile aggregates a contributor's work across codebases by slug.
+    codebases: { kind: "one", table: "codebases", local: "codebase_id", foreign: "id" },
+  },
+  integrations: {
+    // admin Integrations surface shows who configured each integration.
+    members: { kind: "one", table: "members", local: "created_by", foreign: "id" },
+    teams: { kind: "one", table: "teams", local: "team_id", foreign: "id" },
   },
 };
 

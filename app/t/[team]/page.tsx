@@ -1,7 +1,7 @@
 import Link from "next/link";
 import { Rocket } from "lucide-react";
 import { serverClient } from "@/lib/supabase/server";
-import { visibleItems } from "@/lib/auth/visibility";
+import { visibleItems, visibleDecisions } from "@/lib/auth/visibility";
 import { getSessionUser } from "@/lib/auth/session";
 import { CopySnippet } from "@/components/copy-snippet";
 import { getPulseMetrics } from "@/lib/metrics/pulse";
@@ -96,13 +96,14 @@ export default async function TeamHome({
 
   const { data: me } = await supabase
     .from("members")
-    .select("role, tier")
+    .select("id, role, tier")
     .eq("team_id", team.id)
     .eq("auth_user_id", user?.id ?? "")
     .eq("status", "active")
     .maybeSingle();
   const isAdmin = me?.role === "admin";
   const tier = ((me?.tier as "team" | "external" | undefined) ?? "external");
+  const memberId = (me?.id as string | undefined) ?? "";
 
   // Tier-filtered count (no RLS backstop in postgres mode).
   const { count: itemCount } = await visibleItems(
@@ -121,7 +122,7 @@ export default async function TeamHome({
 
   const [pulse, { data: activity }, { data: openTasks }, { data: commitments }, { data: decisions }] =
     await Promise.all([
-      getPulseMetrics(supabase, team.id, range, isAdmin),
+      getPulseMetrics(supabase, team.id, range, { isAdmin, memberId }),
       visibleItems(
         supabase
           .from("items")
@@ -145,12 +146,15 @@ export default async function TeamHome({
         .eq("entity_type", "commitment")
         .in("attrs->>status", ["open", "overdue", "at_risk", "broken"])
         .limit(20),
-      supabase
-        .from("decisions")
-        .select("id, title, decided_at, tier, still_valid")
-        .eq("team_id", team.id)
-        .order("decided_at", { ascending: false })
-        .limit(8),
+      visibleDecisions(
+        supabase
+          .from("decisions")
+          .select("id, title, decided_at, tier, still_valid")
+          .eq("team_id", team.id)
+          .order("decided_at", { ascending: false })
+          .limit(8),
+        tier
+      ),
     ]);
 
   return (

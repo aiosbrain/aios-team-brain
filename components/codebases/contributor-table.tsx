@@ -1,10 +1,25 @@
+import Link from "next/link";
 import type { ContributorRow } from "@/lib/metrics/codebases";
 
 function pct(ai: number, total: number): number {
   return total === 0 ? 0 : Math.round((100 * ai) / total);
 }
 
-export function ContributorTable({ rows }: { rows: ContributorRow[] }) {
+/** Drill-down ref: a mapped member aggregates all aliases (`m:`), else raw key (`a:`). */
+function contributorHref(teamSlug: string, codebaseSlug: string, r: ContributorRow): string {
+  const ref = r.member_id ? `m:${r.member_id}` : `a:${encodeURIComponent(r.author_key)}`;
+  return `/t/${teamSlug}/codebases/${codebaseSlug}/contributors/${ref}`;
+}
+
+export function ContributorTable({
+  rows,
+  teamSlug,
+  codebaseSlug,
+}: {
+  rows: ContributorRow[];
+  teamSlug?: string;
+  codebaseSlug?: string;
+}) {
   if (rows.length === 0) {
     return <p className="text-sm text-ink-tertiary">No contributions in this window.</p>;
   }
@@ -34,9 +49,18 @@ export function ContributorTable({ rows }: { rows: ContributorRow[] }) {
                         {(r.member_name ?? r.author_name ?? "?").slice(0, 1).toUpperCase()}
                       </span>
                     )}
-                    <span className="font-medium text-ink">
-                      {r.member_name ?? r.author_name ?? r.author_key}
-                    </span>
+                    {teamSlug && codebaseSlug ? (
+                      <Link
+                        href={contributorHref(teamSlug, codebaseSlug, r)}
+                        className="font-medium text-ink hover:text-violet"
+                      >
+                        {r.member_name ?? r.author_name ?? r.author_key}
+                      </Link>
+                    ) : (
+                      <span className="font-medium text-ink">
+                        {r.member_name ?? r.author_name ?? r.author_key}
+                      </span>
+                    )}
                     {!r.member_id ? (
                       <span className="text-[10px] uppercase tracking-wider text-ink-tertiary">
                         unmapped

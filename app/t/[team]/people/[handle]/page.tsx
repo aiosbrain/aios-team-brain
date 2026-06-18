@@ -1,0 +1,127 @@
+import type { Metadata } from "next";
+import Link from "next/link";
+import { notFound } from "next/navigation";
+import { ArrowLeft } from "lucide-react";
+import { isPostgresBackend } from "@/lib/db/backend";
+import { serverClient } from "@/lib/supabase/server";
+import { currentMember } from "@/lib/auth/guard";
+import { getMemberProfile } from "@/lib/metrics/codebases";
+import { parseRange } from "@/lib/metrics/range";
+import { RangeSelector } from "@/components/dashboard/range-selector";
+import { CommitHeatmap } from "@/components/codebases/commit-heatmap";
+
+export const metadata: Metadata = { title: "Profile" };
+
+function Stat({ label, value }: { label: string; value: string | number }) {
+  return (
+    <div className="prism-card px-4 py-3">
+      <p className="text-[11px] uppercase tracking-wider text-ink-tertiary">{label}</p>
+      <p className="mt-1 text-xl font-semibold text-ink">{value}</p>
+    </div>
+  );
+}
+
+export default async function PersonPage({
+  params,
+  searchParams,
+}: {
+  params: Promise<{ team: string; handle: string }>;
+  searchParams: Promise<{ range?: string }>;
+}) {
+  if (!isPostgresBackend()) notFound();
+
+  const { team: teamSlug, handle } = await params;
+  const range = parseRange((await searchParams).range);
+  const supabase = await serverClient();
+
+  const { data: team } = await supabase.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
+  if (!team) return null;
+  const me = await currentMember(team.id);
+  if (!me) return null;
+
+  const p = await getMemberProfile(supabase, team.id, decodeURIComponent(handle), range, me.tier);
+  if (!p) notFound();
+
+  const aiPct = p.totals.commits ? Math.round((100 * p.totals.ai_commits) / p.totals.commits) : 0;
+
+  return (
+    <div className="mx-auto flex max-w-5xl flex-col gap-5">
+      <div>
+        <Link
+          href={`/t/${teamSlug}/codebases`}
+          className="inline-flex items-center gap-1 text-xs text-ink-tertiary hover:text-ink-secondary"
+        >
+          <ArrowLeft className="size-3" /> Codebases
+        </Link>
+        <div className="mt-2 flex items-start justify-between gap-3">
+          <div className="flex items-center gap-3">
+            {p.avatar_url ? (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img src={p.avatar_url} alt="" className="size-14 rounded-full" />
+            ) : (
+              <span className="flex size-14 items-center justify-center rounded-full bg-surface-inset text-xl font-medium text-ink-tertiary">
+                {p.name.slice(0, 1).toUpperCase()}
+              </span>
+            )}
+            <div>
+              <h1 className="font-display text-2xl font-semibold text-ink">{p.name}</h1>
+              <div className="mt-0.5 flex items-center gap-3 text-xs text-ink-tertiary">
+                <span className="capitalize">{p.role}</span>
+                {p.github_login ? (
+                  <a
+                    href={`https://github.com/${p.github_login}`}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="hover:text-violet"
+                  >
+                    @{p.github_login}
+                  </a>
+                ) : null}
+              </div>
+            </div>
+          </div>
+          <RangeSelector value={range} />
+        </div>
+      </div>
+
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+        <Stat label="Commits" value={p.totals.commits} />
+        <Stat label="AI-assisted" value={`${aiPct}%`} />
+        <Stat label="Active days" value={p.totals.active_days} />
+        <Stat label="Repos" value={p.repos.length} />
+      </div>
+
+      <section className="prism-card flex flex-col gap-3 p-5">
+        <h2 className="text-sm font-semibold uppercase tracking-wider text-ink-tertiary">
+          Commit activity (all repos)
+        </h2>
+        <CommitHeatmap days={p.days} />
+      </section>
+
+      {p.repos.length ? (
+        <section className="flex flex-col gap-2">
+          <h2 className="text-sm font-semibold uppercase tracking-wider text-ink-tertiary">
+            By codebase
+          </h2>
+          <div className="prism-card divide-y divide-border-subtle">
+            {p.repos.map((r) => (
+              <Link
+                key={r.slug}
+                href={`/t/${teamSlug}/codebases/${r.slug}/contributors/m:${p.member_id}`}
+                className="flex items-center justify-between px-4 py-3 text-sm hover:bg-surface-card-hover"
+              >
+                <span className="font-medium text-ink">{r.slug}</span>
+                <span className="text-ink-secondary">
+                  {r.commits} commits
+                  <span className="ml-2 text-ink-tertiary">
+                    {r.commits ? Math.round((100 * r.ai_commits) / r.commits) : 0}% AI
+                  </span>
+                </span>
+              </Link>
+            ))}
+          </div>
+        </section>
+      ) : null}
+    </div>
+  );
+}

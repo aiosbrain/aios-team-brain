@@ -461,3 +461,24 @@ create table if not exists github_issues (
 );
 create index if not exists github_issues_codebase_state_idx
   on github_issues (codebase_id, state, updated_at desc);
+
+-- Integration selections (Wave 1 framework). Holds NON-SECRET selection/config only —
+-- e.g. which repos to scan, which Slack channels to ingest, a Linear/Plane project slug.
+-- Secrets (tokens) live in the sidecar's env/connections.yaml and are merged locally by
+-- (type, name); the brain never stores them. POSTGRES-ONLY: no RLS is defined here, so tier/
+-- role isolation is enforced in app code (lib/integrations/read.ts) — there is no DB backstop.
+-- No updated_at trigger exists in this schema; the single writer (lib/integrations/manage.ts)
+-- must set updated_at = now() explicitly on update.
+create table if not exists integrations (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  type text not null check (type in ('github','granola','slack','wise','linear','plane')),
+  name text not null,
+  config jsonb not null default '{}',
+  status text not null default 'enabled' check (status in ('enabled','disabled')),
+  created_by uuid references members(id) on delete set null,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  unique (team_id, type, name)
+);
+create index if not exists integrations_team_type_idx on integrations (team_id, type);
