@@ -3,7 +3,7 @@ import { CircleAlert } from "lucide-react";
 import { serverClient } from "@/lib/supabase/server";
 import { getSessionUser } from "@/lib/auth/session";
 import { isPostgresBackend } from "@/lib/db/backend";
-import { TeamNav, type NavItem } from "@/components/team-nav";
+import { TeamNav, type NavEntry, type NavLeaf } from "@/components/team-nav";
 
 function NoTeamScreen({ slug }: { slug: string }) {
   return (
@@ -55,23 +55,35 @@ export default async function TeamLayout({
   if (!me) return <NoTeamScreen slug={teamSlug} />;
 
   const base = `/t/${team.slug}`;
-  const items: NavItem[] = [
-    { icon: "home", label: "Home", href: base, exact: true },
-    { icon: "tasks", label: "Tasks", href: `${base}/tasks` },
-    { icon: "projects", label: "Projects", href: `${base}/projects` },
-    { icon: "decisions", label: "Decisions", href: `${base}/decisions` },
-    { icon: "library", label: "Library", href: `${base}/library` },
-    { icon: "skills", label: "Skills", href: `${base}/skills` },
+
+  // Settings groups the low-frequency config surfaces; Admin is appended only for admins.
+  const settingsChildren: NavLeaf[] = [
     { icon: "teamtools", label: "Team tools", href: `${base}/team-tools` },
-    { icon: "query", label: "Query", href: `${base}/query` },
   ];
-  // Codebase analytics live only on the postgres backend (canonical schema).
-  if (isPostgresBackend()) {
-    items.splice(3, 0, { icon: "codebases", label: "Codebases", href: `${base}/codebases` });
-  }
   if (me.role === "admin") {
-    items.push({ icon: "admin", label: "Admin", href: `${base}/admin` });
+    settingsChildren.push({ icon: "admin", label: "Admin", href: `${base}/admin` });
   }
+
+  // Grouped IA: ~6 primary entries. "Work" gathers the operational surfaces; Skills folds
+  // into Library (reached at /library/skills, not a top-level peer). Codebase analytics
+  // live only on the postgres backend (canonical schema).
+  const items: NavEntry[] = [
+    { icon: "home", label: "Home", href: base, exact: true },
+    {
+      label: "Work",
+      children: [
+        { icon: "tasks", label: "Tasks", href: `${base}/tasks` },
+        { icon: "projects", label: "Projects", href: `${base}/projects` },
+        { icon: "decisions", label: "Decisions", href: `${base}/decisions` },
+      ],
+    },
+    { icon: "library", label: "Library", href: `${base}/library` },
+  ];
+  if (isPostgresBackend()) {
+    items.push({ icon: "codebases", label: "Codebases", href: `${base}/codebases` });
+  }
+  items.push({ icon: "query", label: "Query", href: `${base}/query` });
+  items.push({ label: "Settings", children: settingsChildren });
 
   return (
     <div className="flex min-h-dvh flex-1 bg-surface-raised">

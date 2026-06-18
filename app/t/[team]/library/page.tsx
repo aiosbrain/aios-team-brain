@@ -76,7 +76,9 @@ export default async function LibraryPage({
         {KINDS.map((k) => (
           <Link
             key={k}
-            href={`/t/${teamSlug}/library?kind=${k}`}
+            // Skills have a dedicated rich view (pull snippet, descriptions) — the chip
+            // routes there rather than to a flat ?kind=skill list (single skills surface).
+            href={k === "skill" ? `/t/${teamSlug}/library/skills` : `/t/${teamSlug}/library?kind=${k}`}
             className={`rounded-full border px-3 py-1 text-xs font-medium capitalize transition-colors ${
               kind === k
                 ? "border-violet/40 bg-violet/10 text-violet"
