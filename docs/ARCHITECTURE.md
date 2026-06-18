@@ -263,6 +263,7 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 - `GET /api/v1/items/:id` — single item fetch
 - `GET /api/v1/tasks` — dashboard task changes for `aios pull` writeback
 - `GET /api/v1/decisions` — dashboard decision changes for `aios pull` writeback (tier-scoped)
+- `GET /api/v1/projects` — team project list for `aios pull` brain-project registration (team-tier only)
 - `GET /api/v1/me` — authenticated member identity + role (drives client UI gating)
 - `POST /api/v1/query` — SSE grounded query (`delta`/`sources`/`done`)
 - `GET /api/v1/okf-bundle` — OKF link graph (tier-filtered, link redaction)
