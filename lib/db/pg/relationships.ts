@@ -31,6 +31,9 @@ export const RELATIONSHIPS: Record<string, Record<string, Relationship>> = {
   },
   decisions: {
     projects: { kind: "one", table: "projects", local: "project_id", foreign: "id" },
+    // alias `items:source_item_id(...)` → embed name "items", FK source_item_id
+    // (used by GET /api/v1/decisions writeback to read the source item's synced_at).
+    items: { kind: "one", table: "items", local: "source_item_id", foreign: "id" },
   },
   api_keys: {
     members: { kind: "one", table: "members", local: "member_id", foreign: "id" },

@@ -20,8 +20,8 @@ Reason from this table, not from a random call site.
 | State | Store (table) | Writer | Readers | Tier/access enforcement |
 |---|---|---|---|---|
 | Synced content | `items`, `item_versions` | **`lib/ingest` only** (single-writer guarded) | dashboard pages, `/api/v1/items`, `lib/query/retrieve`, okf-bundle, metrics | supabase: RLS; postgres: app-code — API ✅, dashboard ✅ (`lib/auth/visibility` choke-point, guarded) |
-| Tasks | `tasks` | `lib/ingest` (sync rows) + `app/actions/tasks.ts` (UI) | dashboard, `/api/v1/tasks` | team-scoped; `origin='ui'` rows survive sync diff |
-| Decisions | `decisions` | `lib/ingest` + `app/actions/decisions.ts` | dashboard | `audience` tier column |
+| Tasks | `tasks` | `lib/ingest` (sync rows) + `app/actions/tasks.ts` (UI; mints `ui-` row_key) | dashboard, `/api/v1/tasks` | team-scoped; `origin='ui'` rows survive sync diff |
+| Decisions | `decisions` | `lib/ingest` (sync rows) + `app/actions/decisions.ts` (UI; `source_item_id` NULL) | dashboard, `/api/v1/decisions` | team-scoped; UI rows (`source_item_id` NULL) never diff-deleted; writeback tier-scoped by `audience` |
 | Policy rules | `policies` | admin (role-gated) | `lib/policy.authorize` | role-gated (admin/lead) |
 | Approvals | `approval_requests` | `lib/policy.fileApprovalRequest`, `lib/actions.resolveApproval` | dashboard | role-gated decide |
 | Actions | `actions` | **`lib/actions.runAction` only** (service role) | dashboard | team-scoped |
@@ -262,6 +262,7 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 - `GET /api/v1/items` — tier-filtered, keyset-paginated pull
 - `GET /api/v1/items/:id` — single item fetch
 - `GET /api/v1/tasks` — dashboard task changes for `aios pull` writeback
+- `GET /api/v1/decisions` — dashboard decision changes for `aios pull` writeback (tier-scoped)
 - `GET /api/v1/me` — authenticated member identity + role (drives client UI gating)
 - `POST /api/v1/query` — SSE grounded query (`delta`/`sources`/`done`)
 - `GET /api/v1/okf-bundle` — OKF link graph (tier-filtered, link redaction)
