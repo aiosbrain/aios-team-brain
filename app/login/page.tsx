@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { LoginForm } from "@/components/login-form";
+import { publicDbBackend } from "@/lib/db/backend";
 
 export const metadata: Metadata = { title: "Sign in" };
 
@@ -29,7 +30,9 @@ export default async function LoginPage({
             </p>
             <h1 className="mt-2 text-2xl font-semibold text-ink">Sign in</h1>
             <p className="mt-1 mb-6 text-sm text-ink-secondary">
-              We&apos;ll email you a one-time magic link.
+              {publicDbBackend() === "postgres"
+                ? "Enter your work email to sign in."
+                : "We'll email you a one-time magic link."}
             </p>
             {error === "invalid_link" ? (
               <p className="mb-4 rounded-lg border border-red/30 bg-red/5 px-3 py-2 text-sm text-red">
