@@ -16,7 +16,8 @@ export function LoginForm({ next }: { next?: string }) {
     setState("sending");
     setError("");
 
-    // Postgres backend: request a magic link from our own endpoint.
+    // Postgres backend: direct (passwordless) sign-in — recognized members are logged in
+    // immediately; unknown emails are rejected (invite-only).
     if (publicDbBackend() === "postgres") {
       try {
         const res = await fetch("/api/auth/login", {
@@ -24,11 +25,17 @@ export function LoginForm({ next }: { next?: string }) {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ email, next }),
         });
-        if (!res.ok) throw new Error(`request failed (${res.status})`);
-        setState("sent");
+        if (res.status === 403) {
+          setState("error");
+          setError("That email isn't recognized. Team Brain is invite-only — ask your admin to add you.");
+          return;
+        }
+        if (!res.ok) throw new Error(`sign-in failed (${res.status})`);
+        const data = (await res.json()) as { redirect?: string };
+        window.location.href = data.redirect || next || "/";
       } catch (err) {
         setState("error");
-        setError(err instanceof Error ? err.message : "could not send link");
+        setError(err instanceof Error ? err.message : "could not sign in");
       }
       return;
     }
@@ -83,7 +90,7 @@ export function LoginForm({ next }: { next?: string }) {
         ) : (
           <Send className="size-4" />
         )}
-        Send magic link
+        {publicDbBackend() === "postgres" ? "Sign in" : "Send magic link"}
       </button>
       {state === "error" ? <p className="text-sm text-red">{error}</p> : null}
     </form>

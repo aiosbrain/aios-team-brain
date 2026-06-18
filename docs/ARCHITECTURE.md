@@ -78,8 +78,11 @@ flowchart LR
 
 Two principals, one tier model:
 
-- **Humans** — magic-link / OAuth, invite-only. Dashboard reads go through **RLS**
-  (`private.my_*` SECURITY DEFINER helpers anchor every policy to `auth.uid()`).
+- **Humans** — invite-only. In the **postgres** target, sign-in is **direct passwordless**:
+  POST `/api/auth/login` with a recognized member email → signed session cookie (no email
+  round-trip; unknown emails 403). Trusts the email with no ownership proof — acceptable only
+  for this self-hosted, small known-member instance (`lib/auth/pg-login.loginByEmail`). In the
+  legacy **supabase** mode, magic-link / OAuth via Supabase Auth.
 - **Machines** — per-member API key `aios_<key_id>_<secret>` (sha256 at rest, shown
   once). Sync writes use the **service role** and bypass RLS — confined to `lib/ingest`
   and audited on every write.

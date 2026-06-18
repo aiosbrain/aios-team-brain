@@ -39,6 +39,31 @@ export async function emailHasMember(email: string): Promise<boolean> {
   return (rows[0]?.n ?? 0) > 0;
 }
 
+/**
+ * Direct (passwordless) login. If the email belongs to a non-disabled member, ensure the
+ * auth user, **force-link** the member to it (and activate if invited), and return the
+ * session user. Returns null if the email is not a recognized member (caller rejects).
+ *
+ * SECURITY NOTE: this trusts the submitted email with NO ownership proof — anyone who knows
+ * a registered email can sign in. Acceptable only for an invite-only, self-hosted instance
+ * with a small known member list (the explicit product choice here). Re-introduce magic-link
+ * verification (issueMagicToken/redeemMagicToken below) to harden later.
+ */
+export async function loginByEmail(email: string): Promise<SessionUser | null> {
+  if (!(await emailHasMember(email))) return null;
+  const id = await ensureAuthUser(email);
+  // Force-link so the session subject always matches members.auth_user_id (handles rows
+  // seeded active with a different/empty auth_user_id), and activate invited rows.
+  await runSql(
+    `update members
+        set auth_user_id = $1,
+            status = case when status = 'invited' then 'active' else status end
+      where email = $2 and status <> 'disabled'`,
+    [id, email]
+  );
+  return { id, email };
+}
+
 /** Issue a magic-link token, or null if the email has no member (invite-only).
  * `ttlMinutes` defaults to the login TTL; admin-minted links may pass a longer one. */
 export async function issueMagicToken(

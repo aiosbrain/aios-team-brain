@@ -1,8 +1,8 @@
 import { type NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { isPostgresBackend } from "@/lib/db/backend";
-import { issueMagicToken } from "@/lib/auth/pg-login";
-import { sendMagicLink } from "@/lib/auth/mailer";
+import { loginByEmail } from "@/lib/auth/pg-login";
+import { signSession, SESSION_COOKIE, sessionCookieOptions } from "@/lib/auth/pg-session";
 
 export const runtime = "nodejs";
 
@@ -12,10 +12,12 @@ const schema = z.object({
 });
 
 /**
- * Magic-link request for the postgres backend (supabase mode uses the client
- * SDK directly). Invite-only: a token is only issued for emails that already
- * have a member row, but the response is always `{ ok: true }` so the endpoint
- * doesn't reveal which emails exist.
+ * Direct (passwordless) sign-in for the postgres backend. Invite-only: if the email is a
+ * recognized non-disabled member we set the signed session cookie immediately; otherwise we
+ * reject with 403. No email round-trip / magic link.
+ *
+ * SECURITY: trusts the submitted email with no ownership proof — fine only for this
+ * invite-only, self-hosted instance with a known member list. See lib/auth/pg-login.loginByEmail.
  */
 export async function POST(req: NextRequest) {
   if (!isPostgresBackend()) {
@@ -35,10 +37,13 @@ export async function POST(req: NextRequest) {
   const nextParam = parsed.data.next ?? "/";
   const safeNext = nextParam.startsWith("/") && !nextParam.startsWith("//") ? nextParam : "/";
 
-  const raw = await issueMagicToken(email, safeNext);
-  if (raw) {
-    const origin = req.headers.get("origin") ?? new URL(req.url).origin;
-    await sendMagicLink(email, `${origin}/auth/confirm?token=${raw}`);
+  const user = await loginByEmail(email);
+  if (!user) {
+    // Not a recognized member — invite-only.
+    return NextResponse.json({ error: "not_recognized" }, { status: 403 });
   }
-  return NextResponse.json({ ok: true });
+
+  const res = NextResponse.json({ ok: true, redirect: safeNext });
+  res.cookies.set(SESSION_COOKIE, await signSession(user), sessionCookieOptions());
+  return res;
 }
