@@ -96,13 +96,14 @@ export default async function TeamHome({
 
   const { data: me } = await supabase
     .from("members")
-    .select("role, tier")
+    .select("id, role, tier")
     .eq("team_id", team.id)
     .eq("auth_user_id", user?.id ?? "")
     .eq("status", "active")
     .maybeSingle();
   const isAdmin = me?.role === "admin";
   const tier = ((me?.tier as "team" | "external" | undefined) ?? "external");
+  const memberId = (me?.id as string | undefined) ?? "";
 
   // Tier-filtered count (no RLS backstop in postgres mode).
   const { count: itemCount } = await visibleItems(
@@ -121,7 +122,7 @@ export default async function TeamHome({
 
   const [pulse, { data: activity }, { data: openTasks }, { data: commitments }, { data: decisions }] =
     await Promise.all([
-      getPulseMetrics(supabase, team.id, range, isAdmin),
+      getPulseMetrics(supabase, team.id, range, { isAdmin, memberId }),
       visibleItems(
         supabase
           .from("items")

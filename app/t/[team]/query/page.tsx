@@ -1,6 +1,8 @@
 import type { Metadata } from "next";
 import { History } from "lucide-react";
 import { serverClient } from "@/lib/supabase/server";
+import { currentMember } from "@/lib/auth/guard";
+import { scopeQueryLog } from "@/lib/auth/visibility";
 import { QueryChat } from "@/components/query-chat";
 import { timeAgo, truncate } from "@/components/format";
 
@@ -24,13 +26,20 @@ export default async function QueryPage({
     .maybeSingle();
   if (!team) return null;
 
-  // RLS: members see their own queries; admins see the whole team's.
-  const { data: recent } = await supabase
-    .from("query_log")
-    .select("id, question, answer_preview, cost_usd, latency_ms, created_at")
-    .eq("team_id", team.id)
-    .order("created_at", { ascending: false })
-    .limit(10);
+  // No RLS in postgres mode: scope query_log in app code. Members see only their own queries;
+  // admins see the whole team's (scopeQueryLog, CLAUDE.md §5).
+  const me = await currentMember(team.id);
+  const { data: recent } = me
+    ? await scopeQueryLog(
+        supabase
+          .from("query_log")
+          .select("id, question, answer_preview, cost_usd, latency_ms, created_at")
+          .eq("team_id", team.id),
+        { isAdmin: me.role === "admin", memberId: me.id }
+      )
+        .order("created_at", { ascending: false })
+        .limit(10)
+    : { data: [] };
 
   return (
     <div className="mx-auto flex max-w-3xl flex-col gap-6">

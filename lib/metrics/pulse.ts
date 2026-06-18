@@ -1,11 +1,14 @@
 import "server-only";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { rangeDays, type Range } from "./range";
+import { scopeQueryLog } from "@/lib/auth/visibility";
 
 /**
- * Range-aware dashboard metrics. Every read goes through the caller's
- * RLS-governed client, so tier/role filtering (e.g. query_log being member-
- * scoped for members and team-wide for admins) is enforced automatically.
+ * Range-aware dashboard metrics. In postgres mode there is NO RLS, so query_log row-level
+ * scoping is NOT automatic — it is applied here in app code via `scopeQueryLog`: members see
+ * only their own queries/spend, admins see the whole team's (CLAUDE.md §5). The items/tasks
+ * aggregates are team-wide counts shown only to a team-tier viewer (the home page gates the
+ * page on a tier-filtered item count first).
  *
  * Aggregation is done in JS over rows fetched within the window. That is fine
  * at MVP volumes; if the corpus grows large, move the day-bucketing into SQL
@@ -123,8 +126,9 @@ export async function getPulseMetrics(
   supabase: SupabaseClient,
   teamId: string,
   range: Range,
-  isAdmin: boolean
+  viewer: { isAdmin: boolean; memberId: string }
 ): Promise<PulseMetrics> {
+  const { isAdmin } = viewer;
   const days = rangeDays(range);
   const now = new Date();
   const windowStart = new Date(now.getTime() - days * 86_400_000);
@@ -143,13 +147,16 @@ export async function getPulseMetrics(
       .gte("synced_at", priorStart.toISOString())
       .order("synced_at", { ascending: false })
       .limit(10_000),
-    supabase
-      .from("query_log")
-      .select("cost_usd, created_at")
-      .eq("team_id", teamId)
-      .gte("created_at", priorStart.toISOString())
-      .order("created_at", { ascending: false })
-      .limit(10_000),
+    scopeQueryLog(
+      supabase
+        .from("query_log")
+        .select("cost_usd, created_at")
+        .eq("team_id", teamId)
+        .gte("created_at", priorStart.toISOString())
+        .order("created_at", { ascending: false })
+        .limit(10_000),
+      viewer
+    ),
     supabase
       .from("tasks")
       .select("status, updated_at")
