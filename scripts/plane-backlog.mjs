@@ -26,6 +26,7 @@ const BASE = (process.env.PLANE_BASE_URL || "https://api.plane.so").replace(/\/$
 const EXTERNAL_SOURCE = "aios-backlog";
 const DRY = process.argv.includes("--dry-run");
 const VERBOSE = process.argv.includes("--verbose");
+const RESTATE = process.argv.includes("--restate"); // move all backlog items into the target state
 
 if (!API_KEY) {
   console.error("PLANE_API_KEY is not set. Run via: dotenvx run -f <workspace>/.env -- node scripts/plane-backlog.mjs");
@@ -218,6 +219,15 @@ async function main() {
   const proj = (p) => `/projects/${PID}${p}`;
   console.log(`Project: ${project.name} (${project.identifier}) ${PID}`);
 
+  // Target state — items land in "To Do" (unstarted), not the default "Backlog".
+  const states = await fetchAll(proj(`/states/`));
+  const want = (process.env.PLANE_STATE || "Todo").toLowerCase().replace(/\s+/g, "");
+  const todoState =
+    states.find((s) => s.name.toLowerCase().replace(/\s+/g, "") === want) ||
+    states.find((s) => s.group === "unstarted");
+  const stateId = todoState?.id || null;
+  if (stateId) console.log(`Target state: ${todoState.name} (${stateId})`);
+
   const totalItems = BACKLOG.length + BACKLOG.reduce((n, e) => n + e.subs.length, 0);
   console.log(`Backlog: ${BACKLOG.length} epics + ${totalItems - BACKLOG.length} sub-issues = ${totalItems} work items\n`);
   if (DRY) {
@@ -272,6 +282,7 @@ async function main() {
       external_source: EXTERNAL_SOURCE,
     };
     if (priority) body.priority = priority;
+    if (stateId) body.state = stateId; // new items start in "To Do", not Backlog
     if (labels?.length) body.labels = labels.map((n) => labelId.get(n)).filter(Boolean);
     if (parent) body.parent = parent;
     const created = await api("POST", proj(`/work-items/`), body);
@@ -301,6 +312,18 @@ async function main() {
       await api("POST", proj(`/modules/${mid}/module-issues/`), { issues: missing });
       console.log(`module ${wave} += ${missing.length} items`);
     }
+  }
+
+  // 7. optional: move all backlog items into the target state (one-off migration / fix).
+  // Only runs with --restate so a normal re-run never fights a board change a human made.
+  if (RESTATE && stateId) {
+    const all = await fetchAll(proj(`/work-items/`));
+    const targets = all.filter((x) => x.external_source === EXTERNAL_SOURCE && x.state !== stateId);
+    for (const it of targets) {
+      await api("PATCH", proj(`/work-items/${it.id}/`), { state: stateId });
+      console.log(`restate ${it.external_id || it.id} → ${todoState.name}`);
+    }
+    console.log(`restated ${targets.length} item(s) → ${todoState?.name}.`);
   }
 
   console.log(`\nDone. created=${stats.created} skipped=${stats.skipped} (total ${totalItems}).`);
