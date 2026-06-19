@@ -16,6 +16,7 @@
     "test:watch": "vitest",
     "coverage": "vitest run --coverage",
     "check:docs": "node scripts/check-docs-drift.mjs",
+    "plane:backlog": "npx --yes @dotenvx/dotenvx run -f ../aios-workspace/.env -- node scripts/plane-backlog.mjs",
     "test:setup": "bash scripts/dev-test-setup.sh",
     "db:test:up": "docker compose -f compose.test.yml up -d --wait && DATABASE_URL=postgres://app:app@localhost:5434/app_test npm run pg:schema",
     "db:test:down": "docker compose -f compose.test.yml down -v",
