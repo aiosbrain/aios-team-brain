@@ -89,10 +89,17 @@ export const codeMetricsSchema = z.object({
   days_since_last_commit: z.number().int().nonnegative().nullable().optional().default(null),
   // AEM agent-readiness — scored scanner-side against the canonical rubric
   // (agentic-engineering-maturity/rubric/agent-readiness.json); the brain persists as-is.
-  readiness_level: z.string().max(8).nullable().optional().default(null),
+  // Validate at the boundary so malformed scanner output can't become permanent analytics:
+  // level is the fixed L0..L5 ladder, and a pillar can't report more passed than total.
+  readiness_level: z.enum(["L0", "L1", "L2", "L3", "L4", "L5"]).nullable().optional().default(null),
   readiness_pct: z.number().min(0).max(100).nullable().optional().default(null),
   readiness_pillars: z
-    .record(z.string(), z.object({ passed: z.number().int().nonnegative(), total: z.number().int().nonnegative() }))
+    .record(
+      z.string(),
+      z
+        .object({ passed: z.number().int().nonnegative(), total: z.number().int().nonnegative() })
+        .refine((p) => p.passed <= p.total, { message: "passed must be <= total" })
+    )
     .optional()
     .default({}),
   readiness_rubric_version: z.string().max(32).nullable().optional().default(null),
