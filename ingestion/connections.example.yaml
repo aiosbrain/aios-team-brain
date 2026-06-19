@@ -28,3 +28,19 @@ connections:
         - https://github.com/anthropics/claude-code/releases.atom
         - https://hnrss.org/newest?q=Claude+Code&points=50
       max_entries_per_feed: 50
+
+  # ── Granola meetings → decisions (sanitized, consented) ───────────────────────
+  # HARD RULE: meetings ingest as DECISION ROWS ONLY. The sync path below pushes a
+  # privacy-safe metadata MARKER (kind=artifact, NO transcript). Verbatim transcripts
+  # are pulled to the LOCAL workspace at admin-tier and never synced. Decisions reach
+  # the brain only after HUMAN review via decision-log.md + `aios push`. See docs/GRANOLA.md.
+  - name: granola-aios
+    source: granola
+    access: team            # markers only — transcripts stay admin-tier and local
+    project: aios
+    actor: granola-sync
+    options:
+      api_key: ${GRANOLA_API_KEY}   # grn_… ; resolved from env, never committed
+      topics: AIOS                  # allowlist: title topic match (comma-separated)
+      participants: john,chetan     # allowlist: participant name/email match
+      require_consent: true         # per-note consent gate — NEVER false for team runs
