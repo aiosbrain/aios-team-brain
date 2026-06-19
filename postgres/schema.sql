@@ -425,6 +425,14 @@ create table if not exists code_metrics (
 create index if not exists code_metrics_codebase_time_idx on code_metrics (codebase_id, scanned_at desc);
 create index if not exists code_metrics_team_time_idx on code_metrics (team_id, scanned_at desc);
 
+-- Keep `npm run pg:schema` safe for existing deployments that created
+-- code_metrics before AEM readiness fields were added. The table declaration
+-- alone does not backfill new columns.
+alter table code_metrics add column if not exists readiness_level text;
+alter table code_metrics add column if not exists readiness_pct numeric(5,2);
+alter table code_metrics add column if not exists readiness_pillars jsonb not null default '{}';
+alter table code_metrics add column if not exists readiness_rubric_version text;
+
 -- Daily contribution aggregates, recomputed + upserted each scan over the window.
 -- author_key is stable (normalized email, or name when email absent); git history
 -- rarely carries a GitHub login. member_id maps to the roster when resolvable.
