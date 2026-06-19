@@ -10,6 +10,7 @@ import {
   setIntegrationStatus,
   deleteIntegration,
 } from "@/lib/integrations/manage";
+import { runSlackIngestion } from "@/lib/ingest/run";
 import { IntegrationConfigError, type IntegrationType } from "@/lib/api/schemas";
 
 async function requireAdmin(teamSlug: string) {
@@ -103,6 +104,29 @@ export async function rotateSecret(
   }
   revalidatePath(`/t/${teamSlug}/admin/integrations`);
   return { ok: true };
+}
+
+/**
+ * Run Slack ingestion now for this team (admins only). Pulls the configured
+ * channels through the in-app runner and reports a one-line summary. The
+ * scheduler also runs this on its interval; this is the on-demand trigger.
+ */
+export async function syncSlackNow(
+  teamSlug: string
+): Promise<{ ok: boolean; error?: string; message?: string }> {
+  const ctx = await requireAdmin(teamSlug);
+  if (!ctx) return { ok: false, error: "admins only" };
+  try {
+    const s = await runSlackIngestion({ teamId: ctx.teamId });
+    if (!s.ok && s.errors.length) return { ok: false, error: s.errors.join("; ") };
+    revalidatePath(`/t/${teamSlug}/admin/integrations`);
+    return {
+      ok: true,
+      message: `Synced ${s.channels} channel(s): +${s.created} new, ~${s.updated} updated, =${s.unchanged} unchanged.`,
+    };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "sync failed" };
+  }
 }
 
 export async function removeIntegration(

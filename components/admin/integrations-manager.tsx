@@ -2,12 +2,13 @@
 
 import { useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
-import { Plug, Plus, Trash2, KeyRound } from "lucide-react";
+import { Plug, Plus, Trash2, KeyRound, RefreshCw } from "lucide-react";
 import {
   saveIntegration,
   toggleIntegration,
   rotateSecret,
   removeIntegration,
+  syncSlackNow,
 } from "@/app/t/[team]/admin/integrations/actions";
 
 type IntegrationType = "github" | "granola" | "slack" | "wise" | "linear" | "plane";
@@ -51,6 +52,20 @@ export function IntegrationsManager({
   const router = useRouter();
   const [pending, startTransition] = useTransition();
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+
+  function syncSlack() {
+    setError(null);
+    setNotice(null);
+    startTransition(async () => {
+      const res = await syncSlackNow(teamSlug);
+      if (!res.ok) setError(res.error ?? "sync failed");
+      else {
+        setNotice(res.message ?? "Synced.");
+        router.refresh();
+      }
+    });
+  }
   const [form, setForm] = useState<{ type: IntegrationType; name: string; selection: string; secret: string }>({
     type: "slack",
     name: "",
@@ -121,6 +136,12 @@ export function IntegrationsManager({
         {error ? <p className="text-sm text-red">{error}</p> : null}
       </form>
 
+      {notice ? (
+        <p className="rounded-lg border border-emerald/30 bg-emerald/5 px-3 py-2 text-sm text-emerald-700">
+          {notice}
+        </p>
+      ) : null}
+
       {integrations.length === 0 ? (
         <p className="text-sm text-ink-tertiary">No integrations yet. Add one above.</p>
       ) : (
@@ -134,6 +155,16 @@ export function IntegrationsManager({
                 {i.hasSecret ? " · secret set" : " · no secret"}
               </span>
               <div className="ml-auto flex items-center gap-2">
+                {i.type === "slack" ? (
+                  <button
+                    onClick={syncSlack}
+                    disabled={pending}
+                    className="flex items-center gap-1.5 rounded-lg border border-violet/40 bg-violet/10 px-3 py-1 text-xs font-medium text-violet disabled:opacity-50"
+                    title="Pull this team's Slack channels into the brain now"
+                  >
+                    <RefreshCw className={`size-3.5 ${pending ? "animate-spin" : ""}`} /> Sync now
+                  </button>
+                ) : null}
                 <button
                   onClick={() => run(() => toggleIntegration(teamSlug, i.id, i.status === "enabled" ? "disabled" : "enabled"))}
                   disabled={pending}
