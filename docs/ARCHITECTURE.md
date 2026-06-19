@@ -210,6 +210,8 @@ erDiagram
 | `supabase/migrations` | Derived/legacy schema (RLS) — only when `DB_BACKEND=supabase` |
 | `ingestion/` | Python connector sidecar (Organ 2) |
 | `lib/db`, `lib/auth` | Backend selector + pg adapter; backend-agnostic auth/session/guard |
+| `instrumentation.ts` + `sentry.{server,edge}.config.ts` + `instrumentation-client.ts` | Sentry init per runtime (server/edge/browser); `onRequestError` forwards server errors. All DSN/token env-driven and inert when unset. See `docs/OPS.md`. |
+| `app/global-error.tsx` | Root error boundary; reports to Sentry and renders fallback UI |
 
 ## Invariants & gotchas
 
