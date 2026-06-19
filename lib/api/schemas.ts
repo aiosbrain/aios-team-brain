@@ -138,6 +138,41 @@ export const codebaseScanPayloadSchema = z.object({
 });
 export type CodebaseScanPayload = z.infer<typeof codebaseScanPayloadSchema>;
 
+// AEM individual-scope maturity signals (ratios + counts; the entire privacy
+// surface — no tool names, no branch, no cwd, no message text).
+export const aemSignalsSchema = z.object({
+  delegation_ratio: z.number().min(0).optional().default(0),
+  correction_loop_avg: z.number().min(0).optional().default(0),
+  error_rate: z.number().min(0).optional().default(0),
+  cost_per_task: z.number().min(0).optional().default(0),
+  tokens_per_task: z.number().min(0).optional().default(0),
+  cache_hit_rate: z.number().min(0).optional().default(0),
+  tool_diversity: z.number().min(0).optional().default(0),
+  verify_tool_rate: z.number().min(0).optional().default(0),
+  subagent_usage: z.number().min(0).optional().default(0),
+});
+
+export const maturitySnapshotPayloadSchema = z.object({
+  // optional; defaults to the authenticated key's member. A supplied handle must
+  // resolve to a member on the caller's team or the push is rejected.
+  member: z.string().max(120).nullable().optional(),
+  metric: z.string().max(60).optional().default("aem-individual"),
+  date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  window_days: z.number().int().positive().max(3650).optional().default(1),
+  signals: aemSignalsSchema,
+  // client-side provisional placement (persisted as provenance only)
+  provisional: z
+    .object({
+      spine: z.string().max(8).optional().default("L1"),
+      axes: z.record(z.string(), z.number()).optional().default({}),
+    })
+    .optional()
+    .default({ spine: "L1", axes: {} }),
+  sessions: z.number().int().nonnegative().optional().default(0),
+  tasks: z.number().int().nonnegative().optional().default(0),
+});
+export type MaturitySnapshotPayload = z.infer<typeof maturitySnapshotPayloadSchema>;
+
 export const querySchema = z.object({
   question: z.string().min(1).max(4000),
   project: z.string().nullable().optional(),

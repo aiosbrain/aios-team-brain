@@ -474,6 +474,51 @@ create table if not exists github_issues (
 create index if not exists github_issues_codebase_state_idx
   on github_issues (codebase_id, state, updated_at desc);
 
+-- Agentic-maturity snapshots (AEM individual scope). One row per member per day,
+-- pushed by `aios analyze --push` from a member's LOCAL session logs (Claude/Codex/
+-- Cursor). Raw session content never leaves the machine — only the ratios + counts
+-- (the `signals`) and the scores below cross the boundary. The client sends its
+-- `provisional` placement; the brain RECOMPUTES the `canonical` axis/Spine scores
+-- from the signals (lib/metrics/individual-maturity) so team rollups have one authority.
+-- Team-tier only; POSTGRES-ONLY — no RLS backstop, app code is the tier gate.
+create table if not exists agentic_maturity_snapshots (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  member_id uuid not null references members(id) on delete cascade,
+  snapshot_date date not null,
+  metric text not null default 'aem-individual',
+  window_days integer not null default 1,
+  -- raw signals (the entire privacy surface: ratios + counts, never content)
+  delegation_ratio numeric(6,4) not null default 0,
+  correction_loop_avg numeric(8,2) not null default 0,
+  error_rate numeric(6,4) not null default 0,
+  cost_per_task numeric(10,4) not null default 0,
+  tokens_per_task numeric(12,2) not null default 0,
+  cache_hit_rate numeric(6,4) not null default 0,
+  tool_diversity numeric(8,2) not null default 0,
+  verify_tool_rate numeric(6,4) not null default 0,
+  subagent_usage numeric(6,4) not null default 0,
+  sessions integer not null default 0,
+  tasks integer not null default 0,
+  -- client-side provisional placement (provenance; axes 0–4, spine L1–L5)
+  provisional_spine text not null default 'L1',
+  provisional_axes jsonb not null default '{}',
+  -- brain-recomputed canonical placement (the authority for rollups)
+  canonical_spine text not null default 'L1',
+  canonical_verification numeric(4,2) not null default 0,
+  canonical_context_hygiene numeric(4,2) not null default 0,
+  canonical_autonomy numeric(4,2) not null default 0,
+  canonical_learning numeric(4,2) not null default 0,
+  canonical_cost_governance numeric(4,2) not null default 0,
+  canonical_overall numeric(4,2) not null default 0,
+  created_at timestamptz not null default now(),
+  unique (team_id, member_id, snapshot_date, metric)
+);
+create index if not exists aem_snapshots_member_time_idx
+  on agentic_maturity_snapshots (member_id, snapshot_date desc);
+create index if not exists aem_snapshots_team_time_idx
+  on agentic_maturity_snapshots (team_id, snapshot_date desc);
+
 -- Integration selections. `config` holds NON-SECRET selection only (repos, channels, project
 -- slugs); the per-type allowlist + secret-key rejection (lib/api/schemas) keep secrets OUT of
 -- config. The connector secret (Slack/GitHub/… token) lives ENCRYPTED in `secret_ciphertext`
