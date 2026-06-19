@@ -93,3 +93,32 @@ def test_no_github_token_means_no_issues(tmp_path, monkeypatch):
     payload = analyze_repo(str(repo), slug="x", full_name="org/x")
     assert payload["issues"] == []
     assert payload["metrics"]["test_coverage_pct"] is None  # no committed report
+
+
+def test_live_scan_carries_scored_readiness(tmp_path):
+    """analyze_repo scores readiness against the vendored rubric and emits all 4 keys."""
+    repo = _init(tmp_path)
+    (repo / "README.md").write_text("# x")
+    (repo / "package.json").write_text("{}")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "c1")
+    m = analyze_repo(str(repo), slug="x")["metrics"]
+    assert m["readiness_level"] == "L1"             # README + manifest
+    assert isinstance(m["readiness_pct"], float)
+    assert m["readiness_pillars"]["docs"]["passed"] == 1
+    assert m["readiness_rubric_version"] == "1.0.0"
+
+
+def test_history_points_carry_null_readiness(tmp_path):
+    """Historical backfill points are NOT scored — they carry the schema-safe null shape."""
+    now = datetime.now(timezone.utc)
+    repo = _init(tmp_path)
+    (repo / "CLAUDE.md").write_text("x" * 500)  # would score if mis-wired
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "c1", when=(now - timedelta(days=1)).isoformat())
+    for pt in analyze_history(str(repo), slug="x", window_days=90, weeks=2):
+        m = pt["metrics"]
+        assert m["readiness_level"] is None
+        assert m["readiness_pct"] is None
+        assert m["readiness_pillars"] == {}
+        assert m["readiness_rubric_version"] is None

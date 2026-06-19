@@ -97,10 +97,13 @@ def sync(config_path, only) -> None:
 @click.option("--full-name", default="", help="owner/repo (enables GitHub metadata + issues)")
 @click.option("--window", "window_days", default=90, type=int, help="analysis window in days")
 @click.option("--backfill", default=0, type=int, help="also emit N weekly historical points (fills the trend)")
-def scan(repo_path, slug, full_name, window_days, backfill) -> None:
-    """Analyze a local repo's git history + scaffolding and push RAW metrics to the brain.
+@click.option("--readiness-rubric", "rubric_path", default=None,
+              help="path to an AEM agent-readiness rubric JSON (default: the vendored copy)")
+def scan(repo_path, slug, full_name, window_days, backfill, rubric_path) -> None:
+    """Analyze a local repo's git history + scaffolding and push metrics to the brain.
     GitHub enrichment (issues/PRs/metadata) uses the GITHUB_TOKEN env var if set
-    (never pass tokens as flags). The brain computes the agentic/health scores.
+    (never pass tokens as flags). The brain computes the agentic/health scores; AEM
+    agent-readiness is scored scanner-side against the rubric.
 
       GITHUB_TOKEN=… aios-ingest scan --path ../x --slug x --full-name org/x --backfill 12
     """
@@ -109,7 +112,8 @@ def scan(repo_path, slug, full_name, window_days, backfill) -> None:
     settings = BrainSettings.from_env()
     token = os.environ.get("GITHUB_TOKEN")  # read from env only; never logged
     payload = analyze_repo(
-        repo_path, slug=slug, full_name=full_name, window_days=window_days, github_token=token
+        repo_path, slug=slug, full_name=full_name, window_days=window_days,
+        github_token=token, rubric_path=rubric_path,
     )
     history = (
         analyze_history(repo_path, slug=slug, full_name=full_name, window_days=window_days,
@@ -126,10 +130,15 @@ def scan(repo_path, slug, full_name, window_days, backfill) -> None:
                 await client.push_codebase_scan(hp)
 
     m = payload["metrics"]
+    readiness = (
+        f"{m['readiness_level']} ({m['readiness_pct']}%)"
+        if m.get("readiness_level") else "unscored"
+    )
     click.echo(
         f"scanned {slug}: {m['commits_window']} commits ({m['ai_commits_window']} AI-assisted), "
         f"{len(payload['contributions'])} author-days, coverage="
-        f"{m['test_coverage_pct'] if m['test_coverage_pct'] is not None else 'none'}"
+        f"{m['test_coverage_pct'] if m['test_coverage_pct'] is not None else 'none'}, "
+        f"readiness={readiness}"
         + (f"; +{len(history)} historical trend points" if history else "")
     )
     asyncio.run(run())

@@ -1,9 +1,15 @@
 """Codebase analyzer — RAW metrics from a local git checkout (+ optional GitHub API).
 
-Produces the payload for POST /api/v1/codebases. It NEVER computes scores; the brain
-does that from these raw inputs (one scoring implementation, unit-tested in TS). The
+Produces the payload for POST /api/v1/codebases. With ONE deliberate exception
+(``readiness`` — see below) it computes no scores; the brain derives ``agentic_score`` /
+``health_score`` from these raw inputs (one scoring implementation, unit-tested in TS). The
 key AI-transformation signal is the ``Co-Authored-By: Claude`` commit trailer — treated
 as a heuristic for AI-*assisted* commits, not exact AI-authored lines.
+
+**The readiness exception:** AEM agent-readiness is scored HERE (``analyzers/readiness.py``)
+against the vendored rubric, because its checks are filesystem questions only the scanner can
+answer (the brain has no repo access). The brain persists the result verbatim. See
+``docs/ARCHITECTURE.md`` and the pinned contract ``aios-workspace/docs/brain-api.md``.
 
 Pure local-git operation needs no network. If ``full_name`` + a GitHub token are given,
 repo metadata (stars/forks/languages) and issues/PRs are enriched best-effort.
@@ -19,6 +25,8 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+
+from .readiness import score_readiness
 
 log = logging.getLogger(__name__)
 
@@ -309,8 +317,10 @@ def analyze_repo(
     full_name: str = "",
     window_days: int = 90,
     github_token: str | None = None,
+    rubric_path: str | None = None,
 ) -> dict[str, Any]:
-    """Build the codebase scan payload (RAW metrics only) from a local checkout."""
+    """Build the codebase scan payload from a local checkout. Raw metrics, plus scanner-side
+    AEM agent-readiness (the one computed score; ``rubric_path`` overrides the vendored rubric)."""
     repo = Path(path).resolve()
     if not (repo / ".git").exists():
         raise ValueError(f"{repo} is not a git repository")
@@ -318,12 +328,13 @@ def analyze_repo(
     git = _analyze_git(repo, window_days)
     scaff = _detect_scaffolding(repo)
     coverage = _read_coverage(repo)
+    readiness = score_readiness(repo, rubric_path)
     gh = _github_enrich(full_name, github_token or os.environ.get("GITHUB_TOKEN"))
     meta = gh.get("meta", {})
 
     return {
         "codebase": _codebase_block(slug, full_name, meta),
-        "metrics": _metrics_block(git, scaff, coverage, _head_sha(repo), window_days),
+        "metrics": _metrics_block(git, scaff, coverage, _head_sha(repo), window_days, readiness=readiness),
         "contributions": git["contributions"],
         "issues": gh.get("issues", []),
     }
@@ -351,7 +362,12 @@ def _metrics_block(
     head_sha: str,
     window_days: int,
     scanned_at: str | None = None,
+    readiness: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    # Single normalizer for the readiness fields: a scored dict OR None (scorer failure /
+    # historical backfill) both yield the brain's schema-safe shape — level/pct/version
+    # nullable, pillars defaults to {} (NOT nullable). Keeps the two paths byte-identical.
+    r = readiness or {}
     block = {
         "head_sha": head_sha,
         "window_days": window_days,
@@ -370,6 +386,10 @@ def _metrics_block(
         "commands_count": scaff["commands_count"],
         "active_days": git["active_days"],
         "days_since_last_commit": git["days_since_last_commit"],
+        "readiness_level": r.get("readiness_level"),
+        "readiness_pct": r.get("readiness_pct"),
+        "readiness_pillars": r.get("readiness_pillars", {}),
+        "readiness_rubric_version": r.get("readiness_rubric_version"),
     }
     if scanned_at:
         block["scanned_at"] = scanned_at  # historical snapshots set their as-of date
