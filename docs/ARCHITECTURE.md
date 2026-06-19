@@ -30,6 +30,7 @@ Reason from this table, not from a random call site.
 | Git-author aliases | `member_emails` (+ `members.github_login`/`avatar_url`) | `lib/admin/*` + GitHub sync (`lib/codebases/github`) | `lib/codebases/ingest` (author→member), dashboard | team-scoped `unique(team_id,email)`; one alias → one member |
 | Sessions (postgres) | `auth_users`, `auth_tokens` | `lib/auth/pg-*` | `getSessionUser` | signed httpOnly cookie |
 | Rate limits | `rate_limits` | `rate_limit_hit` rpc | — | service-role only |
+| Integrations | `integrations` | **`lib/integrations/manage` only** (single-writer guarded; admin actions) | Admin → Integrations page (`lib/integrations/read`); `GET /api/v1/integrations` (sidecar) | `config` is NON-secret (per-type allowlist + secret-key rejection); the connector secret is **encrypted at rest** in `secret_ciphertext` (`lib/secrets`, AES-256-GCM), plaintext only on the connector-key read path (audited); admin-gated writes; postgres-only |
 | Codebase analytics | `codebases`, `code_metrics`, `code_contributions`, `github_issues` | **`lib/codebases/ingest` only** (single-writer guarded; via `POST /api/v1/codebases`) | codebases pages, `lib/metrics/codebases` | team-tier only; **app-code gate** (`lib/codebases/visibility` + guard) — no RLS backstop |
 
 ## System context
@@ -272,8 +273,9 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 - `GET /api/v1/okf-bundle` — OKF link graph (tier-filtered, link redaction)
 - `POST /api/v1/actions` — request a policy-gated action (Organ 4)
 - `POST /api/v1/codebases` — ingest a codebase scan (raw metrics; team-tier key only, audited)
+- `GET /api/v1/integrations` — sidecar pulls enabled integrations + decrypted secrets (connector key; audited)
 - `POST /api/dashboard/query` — same query pipeline, session-authenticated
-- `POST /api/auth/login` — postgres-mode magic-link request (invite-only; always `{ok:true}`)
+- `POST /api/auth/login` — postgres-mode direct passwordless sign-in (invite-only; 403 if unknown)
 <!-- /drift:routes -->
 
 ### Database tables

@@ -265,5 +265,8 @@ export const integrationInputSchema = z.object({
   name: z.string().min(1).max(120),
   config: z.unknown().optional(),
   status: z.enum(INTEGRATION_STATUSES).optional(),
+  // Connector secret (e.g. a Slack `xoxb-` token). Stored ENCRYPTED, never in `config`.
+  // Omit to leave an existing secret unchanged; provide to set/rotate it.
+  secret: z.string().min(1).max(8192).optional(),
 });
 export type IntegrationInput = z.infer<typeof integrationInputSchema>;
