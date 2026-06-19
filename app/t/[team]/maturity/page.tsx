@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import Link from "next/link";
 import { Gauge } from "lucide-react";
 import { isPostgresBackend } from "@/lib/db/backend";
 import { serverClient } from "@/lib/supabase/server";
@@ -50,6 +51,12 @@ export default async function MaturityPage({
           <p className="text-sm text-ink-secondary">
             How agent-ready the team&apos;s codebases are, scored against the AEM rubric.
           </p>
+          <Link
+            href={`/t/${teamSlug}/maturity/people`}
+            className="mt-1 inline-block text-sm text-ink-secondary underline-offset-2 hover:text-ink hover:underline"
+          >
+            View individual maturity (per-person, from agent sessions) →
+          </Link>
         </div>
         <RangeSelector value={range} />
       </div>

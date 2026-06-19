@@ -274,6 +274,7 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 - `POST /api/v1/actions` — request a policy-gated action (Organ 4)
 - `POST /api/v1/codebases` — ingest a codebase scan (raw metrics; team-tier key only, audited)
 - `GET /api/v1/integrations` — sidecar pulls enabled integrations + decrypted secrets (connector key; audited)
+- `POST /api/v1/metrics` — ingest an AEM individual maturity daily snapshot (team-tier key only; brain recomputes canonical scores; audited)
 - `POST /api/dashboard/query` — same query pipeline, session-authenticated
 - `POST /api/auth/login` — postgres-mode direct passwordless sign-in (invite-only; 403 if unknown)
 <!-- /drift:routes -->
@@ -285,7 +286,7 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 `projects` · `items` · `item_versions` · `tasks` · `decisions` · `graph_entities` ·
 `graph_relationships` · `query_log` · `policies` · `approval_requests` · `actions` ·
 `codebases` · `code_metrics` · `code_contributions` · `github_issues` · `member_emails` ·
-`integrations`
+`integrations` · `agentic_maturity_snapshots`
 <!-- /drift:tables -->
 
 ### Ingestion sources
