@@ -131,12 +131,27 @@ def _path_exists(entry: str, tracked_set: set[str], tracked_list: list[str]) -> 
 
 # ── file/content/config/dependency matchers (all tracked-file scoped) ───────────────────────
 
-def _read_text(repo: Path, rel: str | None, tracked_set: set[str]) -> str | None:
+def _resolve_in_repo(repo: Path, rel: str | None, tracked_set: set[str]) -> Path | None:
+    """A real, openable path for `rel`, or None. Beyond the relpath-text + tracked-set checks,
+    fully resolve symlinks and require the target stay under repo.resolve() — a tracked file
+    can itself be a symlink (or sit behind a symlinked dir) pointing outside the repo, and
+    read_text()/stat() would otherwise follow it off the host filesystem."""
     safe = _safe_rel(rel) if rel else None
     if safe is None or safe not in tracked_set:
         return None
+    repo_root = repo.resolve()
+    target = (repo_root / safe).resolve()
+    if target != repo_root and not target.is_relative_to(repo_root):
+        return None
+    return target
+
+
+def _read_text(repo: Path, rel: str | None, tracked_set: set[str]) -> str | None:
+    target = _resolve_in_repo(repo, rel, tracked_set)
+    if target is None:
+        return None
     try:
-        return (repo / safe).read_text(encoding="utf-8", errors="ignore")
+        return target.read_text(encoding="utf-8", errors="ignore")
     except OSError:
         return None
 
@@ -144,11 +159,11 @@ def _read_text(repo: Path, rel: str | None, tracked_set: set[str]) -> str | None
 def _file_min_bytes(spec: dict[str, Any], repo: Path, tracked_set: set[str]) -> bool:
     need = spec.get("bytes", 0)
     for rel in spec.get("anyOf", []):
-        safe = _safe_rel(rel)
-        if safe is None or safe not in tracked_set:
+        target = _resolve_in_repo(repo, rel, tracked_set)
+        if target is None:
             continue
         try:
-            if (repo / safe).stat().st_size >= need:
+            if target.stat().st_size >= need:
                 return True
         except OSError:
             continue

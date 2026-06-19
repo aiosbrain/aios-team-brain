@@ -191,6 +191,27 @@ def test_safe_rel_rejects_traversal():
     assert _safe_rel("a/../../b") is None
 
 
+def test_tracked_symlink_cannot_escape_repo(tmp_path):
+    """A COMMITTED symlink pointing outside the repo must not let a size/content check read
+    the external file. Regression for the PR #28 review finding: a CLAUDE.md symlink to an
+    external >=400-byte file wrongly counted as non-trivial agent instructions."""
+    outside = tmp_path / "outside-secret.txt"
+    outside.write_text("x" * 800)  # big enough to trip nontrivial (>=400) + nothing else
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "CLAUDE.md").symlink_to(outside)  # tracked symlink escaping the repo
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True, env=_ENV)
+    subprocess.run(["git", "branch", "-m", "main"], cwd=repo, check=True, env=_ENV)
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True, env=_ENV)
+    subprocess.run(["git", "commit", "-qm", "seed"], cwd=repo, check=True, env=_ENV)
+
+    ai = score_readiness(repo)["readiness_pillars"]["agent_instructions"]
+    # present (existence, no read) may pass; the size-based checks (nontrivial, compounding)
+    # must NOT read the external file — so passed is 1, never 2+.
+    assert ai["passed"] == 1
+
+
 def test_path_escape_via_override_rubric(tmp_path, capsys):
     """A malicious override rubric pointing outside the repo reads nothing → check fails,
     scorer still returns a valid result (does not crash, does not probe the host)."""
