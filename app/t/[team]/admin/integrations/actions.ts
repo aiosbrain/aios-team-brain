@@ -11,23 +11,21 @@ import {
   deleteIntegration,
 } from "@/lib/integrations/manage";
 import { runSlackIngestion } from "@/lib/ingest/run";
+import { resolveIntegrationsAdmin } from "@/lib/integrations/read";
 import { IntegrationConfigError, type IntegrationType } from "@/lib/api/schemas";
 
+/**
+ * Session half of the admin gate: resolve the signed-in user, then delegate to the DB-level
+ * `resolveIntegrationsAdmin` (same role==="admin" + active-member check as the /admin layout).
+ * Returns null on any non-admin/unknown/wrong-team caller → every write action rejects.
+ */
 async function requireAdmin(teamSlug: string) {
   const supabase = await serverClient();
   const user = await getSessionUser();
   if (!user) return null;
-  const { data: team } = await supabase.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
-  if (!team) return null;
-  const { data: me } = await supabase
-    .from("members")
-    .select("id, role")
-    .eq("team_id", team.id)
-    .eq("auth_user_id", user.id)
-    .eq("status", "active")
-    .maybeSingle();
-  if (me?.role !== "admin") return null;
-  return { teamId: team.id, myMemberId: me.id as string };
+  const ctx = await resolveIntegrationsAdmin(supabase, teamSlug, user.id);
+  if (!ctx) return null;
+  return { teamId: ctx.teamId, myMemberId: ctx.memberId };
 }
 
 function toList(raw: string): string[] {
