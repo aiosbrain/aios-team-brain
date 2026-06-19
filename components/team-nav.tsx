@@ -5,6 +5,7 @@ import { usePathname } from "next/navigation";
 import {
   Blocks,
   FolderKanban,
+  Gauge,
   Gavel,
   GitBranch,
   Home,
@@ -23,6 +24,7 @@ const ICONS = {
   library: Library,
   skills: Blocks,
   codebases: GitBranch,
+  maturity: Gauge,
   teamtools: Wrench,
   query: Sparkles,
   admin: Shield,

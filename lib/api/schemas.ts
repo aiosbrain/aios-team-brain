@@ -87,6 +87,15 @@ export const codeMetricsSchema = z.object({
   // cadence inputs (used to compute cadence_score; not persisted raw)
   active_days: z.number().int().nonnegative().optional().default(0),
   days_since_last_commit: z.number().int().nonnegative().nullable().optional().default(null),
+  // AEM agent-readiness — scored scanner-side against the canonical rubric
+  // (agentic-engineering-maturity/rubric/agent-readiness.json); the brain persists as-is.
+  readiness_level: z.string().max(8).nullable().optional().default(null),
+  readiness_pct: z.number().min(0).max(100).nullable().optional().default(null),
+  readiness_pillars: z
+    .record(z.string(), z.object({ passed: z.number().int().nonnegative(), total: z.number().int().nonnegative() }))
+    .optional()
+    .default({}),
+  readiness_rubric_version: z.string().max(32).nullable().optional().default(null),
 });
 
 export const codeContributionSchema = z.object({

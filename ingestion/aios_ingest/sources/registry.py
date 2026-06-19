@@ -15,6 +15,7 @@ from .github import GithubSource
 from .linear import LinearSource
 from .local import LocalSource
 from .notion import NotionSource
+from .radar import RadarSource
 from .slack import SlackSource
 from .web import WebSource
 
@@ -29,6 +30,7 @@ _REGISTRY: dict[str, Builder] = {
     "linear": LinearSource,
     "web": WebSource,
     "local": LocalSource,
+    "radar": RadarSource,
 }
 
 

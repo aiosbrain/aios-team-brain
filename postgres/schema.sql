@@ -413,6 +413,12 @@ create table if not exists code_metrics (
   skill_breadth_score numeric(5,2) not null default 0,
   cadence_score numeric(5,2) not null default 0,
   issue_health numeric(5,2) not null default 0,
+  -- AEM agent-readiness (rubric-scored scanner-side; the brain only persists the result.
+  -- canonical rubric: agentic-engineering-maturity/rubric/agent-readiness.json)
+  readiness_level text,                            -- L0..L5, null = not scored
+  readiness_pct numeric(5,2),                      -- % of all rubric checks passed
+  readiness_pillars jsonb not null default '{}',   -- { pillarKey: {passed,total} }
+  readiness_rubric_version text,                   -- which rubric version produced the score
   created_at timestamptz not null default now(),
   unique (codebase_id, head_sha)
 );

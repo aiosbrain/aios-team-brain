@@ -29,6 +29,14 @@ export function CodebaseCard({ teamSlug, cb }: { teamSlug: string; cb: CodebaseS
           </span>{" "}
           cov
         </span>
+        {cb.readiness_level ? (
+          <span
+            title={`AEM agent-readiness${cb.readiness_pct == null ? "" : ` — ${cb.readiness_pct}% of checks`}`}
+            className="inline-flex items-center rounded-full border border-white/10 bg-white/[0.04] px-2 py-0.5 font-mono text-[10px] font-semibold text-ink-secondary"
+          >
+            {cb.readiness_level} ready
+          </span>
+        ) : null}
         <span className="ml-auto">
           <Sparkline data={cb.spark} width={72} height={22} className="text-violet" />
         </span>

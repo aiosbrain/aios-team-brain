@@ -92,6 +92,11 @@ export async function ingestCodebaseScan(
         agents_md_count: m.agents_md_count,
         skills_count: m.skills_count,
         commands_count: m.commands_count,
+        // AEM agent-readiness — scored scanner-side; persisted as-is (jsonb object auto-casts).
+        readiness_level: m.readiness_level,
+        readiness_pct: m.readiness_pct,
+        readiness_pillars: m.readiness_pillars,
+        readiness_rubric_version: m.readiness_rubric_version,
         ...scores,
       },
       { onConflict: "codebase_id,head_sha" }
@@ -169,6 +174,7 @@ export async function ingestCodebaseScan(
       head_sha: m.head_sha,
       agentic_score: scores.agentic_score,
       health_score: scores.health_score,
+      readiness_level: m.readiness_level,
       contributions: contribCount,
       issues: issueCount,
     },

@@ -23,6 +23,7 @@ slack = ["llama-index-readers-slack>=0.1"]
 gdrive = ["llama-index-readers-google>=0.1"]
 notion = ["llama-index-readers-notion>=0.1"]
 confluence = ["llama-index-readers-confluence>=0.1"]
+radar = ["feedparser>=6.0"]
 docs = ["unstructured>=0.13"]
 all = [
   "llama-index-readers-github>=0.1",
@@ -30,6 +31,7 @@ all = [
   "llama-index-readers-google>=0.1",
   "llama-index-readers-notion>=0.1",
   "llama-index-readers-confluence>=0.1",
+  "feedparser>=6.0",
   "unstructured>=0.13",
 ]
 dev = ["pytest>=8", "pytest-asyncio>=0.23", "respx>=0.21", "pip-licenses>=5"]

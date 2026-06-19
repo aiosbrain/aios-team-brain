@@ -81,6 +81,7 @@ export default async function TeamLayout({
   ];
   if (isPostgresBackend()) {
     items.push({ icon: "codebases", label: "Codebases", href: `${base}/codebases` });
+    items.push({ icon: "maturity", label: "Maturity", href: `${base}/maturity` });
   }
   items.push({ icon: "query", label: "Query", href: `${base}/query` });
   items.push({ label: "Settings", children: settingsChildren });
