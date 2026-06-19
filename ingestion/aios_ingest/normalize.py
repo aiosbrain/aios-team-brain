@@ -25,6 +25,7 @@ DEFAULT_KIND_BY_SOURCE: dict[str, ItemKind] = {
     "github": "deliverable",
     "web": "deliverable",
     "local": "deliverable",
+    "radar": "artifact",
 }
 
 _SLUG_OK = re.compile(r"[^a-z0-9/_.-]+")
