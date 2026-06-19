@@ -12,6 +12,13 @@
  *   PLANE_WORKSPACE_SLUG (default "aios-alpha")
  *   PLANE_BASE_URL       (default "https://api.plane.so")
  *   PLANE_PROJECT_ID     (optional; otherwise discovered by matching project identifier "AIOS")
+ *   PLANE_ASSIGNEE_ID    (optional; preferred default assignee for created/seeded items)
+ *   PLANE_ASSIGNEE_EMAIL (optional; resolve default assignee by project-member email)
+ *   PLANE_ASSIGNEE_NAME  (optional; resolve default assignee by display/full name)
+ *
+ * If no assignee env is set, the script assigns the API-key owner (`/api/v1/users/me/`) when that
+ * user belongs to the project. If that cannot be resolved, it falls back to the sole non-bot
+ * project member. If there are still multiple humans, set one of the PLANE_ASSIGNEE_* vars.
  *
  * Run (decrypts the dotenvx-encrypted key from the workspace .env):
  *   dotenvx run -f /Users/iamjohndass/Projects/aios/aios-workspace/.env -- node scripts/plane-backlog.mjs
@@ -27,6 +34,9 @@ const EXTERNAL_SOURCE = "aios-backlog";
 const DRY = process.argv.includes("--dry-run");
 const VERBOSE = process.argv.includes("--verbose");
 const RESTATE = process.argv.includes("--restate"); // move all backlog items into the target state
+const ASSIGNEE_ID = process.env.PLANE_ASSIGNEE_ID || "";
+const ASSIGNEE_EMAIL = (process.env.PLANE_ASSIGNEE_EMAIL || "").toLowerCase();
+const ASSIGNEE_NAME = (process.env.PLANE_ASSIGNEE_NAME || "").toLowerCase();
 
 if (!API_KEY) {
   console.error("PLANE_API_KEY is not set. Run via: dotenvx run -f <workspace>/.env -- node scripts/plane-backlog.mjs");
@@ -194,6 +204,24 @@ async function api(method, path, body) {
   return json;
 }
 
+async function baseApi(method, path, body) {
+  const now = Date.now();
+  const wait = Math.max(0, 1050 - (now - lastReq));
+  if (wait) await new Promise((r) => setTimeout(r, wait));
+  lastReq = Date.now();
+  const res = await fetch(`${BASE}${path}`, {
+    method,
+    headers: { "X-API-Key": API_KEY, "Content-Type": "application/json" },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const text = await res.text();
+  let json;
+  try { json = text ? JSON.parse(text) : {}; } catch { json = { raw: text }; }
+  if (!res.ok) throw new Error(`${method} ${path} → ${res.status}: ${text.slice(0, 300)}`);
+  if (VERBOSE) console.log(`  ${method} ${path} → ${res.status}`);
+  return json;
+}
+
 async function fetchAll(path) {
   // cursor pagination: ?cursor=value&per_page=100
   const out = [];
@@ -201,11 +229,60 @@ async function fetchAll(path) {
   for (let i = 0; i < 100; i++) {
     const sep = path.includes("?") ? "&" : "?";
     const page = await api("GET", `${path}${sep}per_page=100&cursor=${encodeURIComponent(cursor)}`);
+    if (Array.isArray(page)) {
+      out.push(...page);
+      break;
+    }
     out.push(...(page.results || []));
     if (!page.next_page_results || !page.next_cursor) break;
     cursor = page.next_cursor;
   }
   return out;
+}
+
+function memberName(member) {
+  return [member.first_name, member.last_name].filter(Boolean).join(" ").trim();
+}
+
+function isBotMember(member) {
+  return member.email?.startsWith("bot_user_") || member.display_name?.toLowerCase() === "plane";
+}
+
+async function resolveDefaultAssignee(proj) {
+  const projectMembers = await fetchAll(proj(`/members/`));
+  const matchers = [];
+  if (ASSIGNEE_ID) matchers.push((m) => m.id === ASSIGNEE_ID);
+  if (ASSIGNEE_EMAIL) matchers.push((m) => m.email?.toLowerCase() === ASSIGNEE_EMAIL);
+  if (ASSIGNEE_NAME) {
+    matchers.push((m) => {
+      const names = [m.display_name, memberName(m), m.first_name, m.email].filter(Boolean);
+      return names.some((name) => name.toLowerCase() === ASSIGNEE_NAME);
+    });
+  }
+
+  for (const matches of matchers) {
+    const member = projectMembers.find(matches);
+    if (member) return member;
+  }
+
+  if (ASSIGNEE_ID || ASSIGNEE_EMAIL || ASSIGNEE_NAME) {
+    throw new Error("Configured Plane assignee is not a member of the AIOS project");
+  }
+
+  try {
+    const currentUser = await baseApi("GET", "/api/v1/users/me/");
+    const projectMember = projectMembers.find((m) => m.id === currentUser.id);
+    if (projectMember) return projectMember;
+    console.warn(`Plane API user ${currentUser.email || currentUser.id} is not a member of the AIOS project.`);
+  } catch (err) {
+    console.warn(`Could not resolve Plane API user: ${err.message}`);
+  }
+
+  const humans = projectMembers.filter((m) => !isBotMember(m));
+  if (humans.length === 1) return humans[0];
+
+  console.warn("No default assignee set; set PLANE_ASSIGNEE_ID, PLANE_ASSIGNEE_EMAIL, or PLANE_ASSIGNEE_NAME.");
+  return null;
 }
 
 async function main() {
@@ -218,6 +295,11 @@ async function main() {
   const PID = project.id;
   const proj = (p) => `/projects/${PID}${p}`;
   console.log(`Project: ${project.name} (${project.identifier}) ${PID}`);
+  const defaultAssignee = await resolveDefaultAssignee(proj);
+  const assigneeIds = defaultAssignee ? [defaultAssignee.id] : [];
+  if (defaultAssignee) {
+    console.log(`Assignee: ${memberName(defaultAssignee) || defaultAssignee.display_name || defaultAssignee.email} (${defaultAssignee.id})`);
+  }
 
   // Target state — items land in "To Do" (unstarted), not the default "Backlog".
   const states = await fetchAll(proj(`/states/`));
@@ -263,17 +345,25 @@ async function main() {
   const existingItems = await fetchAll(proj(`/work-items/`));
   const byExt = new Map();
   for (const it of existingItems) {
-    if (it.external_source === EXTERNAL_SOURCE && it.external_id) byExt.set(it.external_id, it.id);
+    if (it.external_source === EXTERNAL_SOURCE && it.external_id) byExt.set(it.external_id, it);
   }
 
-  const stats = { created: 0, skipped: 0 };
+  const stats = { created: 0, skipped: 0, assigned: 0 };
   const moduleMembers = new Map([[WAVE1, []], [WAVE2, []]]);
 
   async function ensureItem({ ext, name, desc, priority, labels, parent }) {
-    if (byExt.has(ext)) {
+    const existing = byExt.get(ext);
+    if (existing) {
       stats.skipped++;
       if (VERBOSE) console.log(`skip   ${ext} (exists)`);
-      return byExt.get(ext);
+      const nextAssignees = new Set(existing.assignees || []);
+      for (const id of assigneeIds) nextAssignees.add(id);
+      if (nextAssignees.size !== (existing.assignees || []).length) {
+        await api("PATCH", proj(`/work-items/${existing.id}/`), { assignees: [...nextAssignees] });
+        stats.assigned++;
+        console.log(`assign ${ext}  ${name}`);
+      }
+      return existing.id;
     }
     const body = {
       name,
@@ -284,9 +374,10 @@ async function main() {
     if (priority) body.priority = priority;
     if (stateId) body.state = stateId; // new items start in "To Do", not Backlog
     if (labels?.length) body.labels = labels.map((n) => labelId.get(n)).filter(Boolean);
+    if (assigneeIds.length) body.assignees = assigneeIds;
     if (parent) body.parent = parent;
     const created = await api("POST", proj(`/work-items/`), body);
-    byExt.set(ext, created.id);
+    byExt.set(ext, created);
     stats.created++;
     console.log(`create ${ext}  ${name}`);
     return created.id;
@@ -326,7 +417,7 @@ async function main() {
     console.log(`restated ${targets.length} item(s) → ${todoState?.name}.`);
   }
 
-  console.log(`\nDone. created=${stats.created} skipped=${stats.skipped} (total ${totalItems}).`);
+  console.log(`\nDone. created=${stats.created} skipped=${stats.skipped} assigned=${stats.assigned} (total ${totalItems}).`);
 }
 
 main().catch((e) => { console.error("FAILED:", e.message); process.exit(1); });

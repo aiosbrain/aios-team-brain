@@ -38,8 +38,9 @@ we're testing.
 > ln -sfn /Users/iamjohndass/Projects/aios/aios-team-brain/node_modules node_modules
 > ```
 > **Plane tracking (workspace `aios-alpha`, project `AIOS`, via the Plane MCP):** find the epic and its
-> sub-issues; move the epic to **In Progress** when you start; move each sub-issue to **Done** as you
-> finish it; when you open the PR, **comment the PR URL on the epic** and move it to In Review/Done.
+> sub-issues; assign the epic and sub-issues to yourself; move the epic to **In Progress** when you
+> start; move each sub-issue to **Done** as you finish it; when you open the PR, **comment the PR URL
+> on the epic** and move it to In Review/Done.
 > **Engineering rules:** spec-first **red** tests (unit = parse/guards; data-mechanics = persistence/tier;
 > over a real DB); **single-writer + build-failing guard** for any new write surface; **tier/role
 > isolation is app-code only** (no RLS on postgres) — add a scoped read helper + guard test per new table;
@@ -63,7 +64,7 @@ Set up your worktree:
   cd ../aios-team-brain-f3
   ln -sfn /Users/iamjohndass/Projects/aios/aios-team-brain/node_modules node_modules
 
-Track progress in Plane via the Plane MCP (workspace aios-alpha, project AIOS): find epic "F3 — Integrations auth surfaces + contract bump" and its sub-issues (F3.1–F3.4). Move the epic to In Progress now; move each sub-issue to Done as you complete it; comment the PR URL on the epic when you open it.
+Track progress in Plane via the Plane MCP (workspace aios-alpha, project AIOS): find epic "F3 — Integrations auth surfaces + contract bump" and its sub-issues (F3.1–F3.4). Assign the epic and sub-issues to yourself. Move the epic to In Progress now; move each sub-issue to Done as you complete it; comment the PR URL on the epic when you open it.
 
 OBJECTIVE: give the integrations framework two auth surfaces WITHOUT touching the pinned /api/v1 write contract. Note: lib/integrations/manage.ts already exists (single writer + config validation) and may already have encrypted-secret storage — read it on main first and reconcile; do not duplicate.
 
@@ -90,7 +91,7 @@ Worktree:
   cd ../aios-team-brain-f4
   ln -sfn /Users/iamjohndass/Projects/aios/aios-team-brain/node_modules node_modules
 
-Plane: epic "F4 — Sidecar consumes selections" (F4.1–F4.3). Epic → In Progress; sub-issues → Done as completed; comment PR on the epic.
+Plane: epic "F4 — Sidecar consumes selections" (F4.1–F4.3). Assign the epic and sub-issues to yourself. Epic → In Progress; sub-issues → Done as completed; comment PR on the epic.
 
 OBJECTIVE: close the "table does nothing" gap — the ingestion engine fetches brain-side NON-SECRET selections and merges them with LOCAL secrets.
 SCOPE:
@@ -113,7 +114,7 @@ Worktree:
   cd ../aios-team-brain-f5
   ln -sfn /Users/iamjohndass/Projects/aios/aios-team-brain/node_modules node_modules
 
-Plane: epic "F5 — Admin Integrations UI + tier guards" (F5.1–F5.5). Epic → In Progress; sub-issues → Done; comment PR.
+Plane: epic "F5 — Admin Integrations UI + tier guards" (F5.1–F5.5). Assign the epic and sub-issues to yourself. Epic → In Progress; sub-issues → Done; comment PR.
 
 OBJECTIVE: admin-gated Integrations surface + per-table tier/role guards (NO RLS backstop on postgres).
 SCOPE:
@@ -138,7 +139,7 @@ Worktree:
   cd ../aios-team-brain-w1.1
   ln -sfn /Users/iamjohndass/Projects/aios/aios-team-brain/node_modules node_modules
 
-Plane: epic "W1.1 — Granola → decisions (sanitized, consented)" (W1.1.1–W1.1.5). Epic → In Progress; sub-issues → Done; comment PR.
+Plane: epic "W1.1 — Granola → decisions (sanitized, consented)" (W1.1.1–W1.1.5). Assign the epic and sub-issues to yourself. Epic → In Progress; sub-issues → Done; comment PR.
 
 OBJECTIVE: ingest Granola meetings as DECISION ROWS ONLY — NO verbatim transcript synced team-tier. Privacy is the point.
 SCOPE:
@@ -163,7 +164,7 @@ Worktree:
   cd ../aios-team-brain-w1.2
   ln -sfn /Users/iamjohndass/Projects/aios/aios-team-brain/node_modules node_modules
 
-Plane: epic "W1.2 — Token + cost per member (brain spend)" (W1.2.1–W1.2.4). Epic → In Progress; sub-issues → Done; comment PR.
+Plane: epic "W1.2 — Token + cost per member (brain spend)" (W1.2.1–W1.2.4). Assign the epic and sub-issues to yourself. Epic → In Progress; sub-issues → Done; comment PR.
 
 OBJECTIVE: per-member LLM cost from query_log (brain spend only; external providers are Wave 2).
 SCOPE:
@@ -187,7 +188,7 @@ Worktree:
   cd ../aios-team-brain-w1.3
   ln -sfn /Users/iamjohndass/Projects/aios/aios-team-brain/node_modules node_modules
 
-Plane: epic "W1.3 — GitHub native UI (selection + manual scan)" (W1.3.1–W1.3.4). Epic → In Progress; sub-issues → Done; comment PR.
+Plane: epic "W1.3 — GitHub native UI (selection + manual scan)" (W1.3.1–W1.3.4). Assign the epic and sub-issues to yourself. Epic → In Progress; sub-issues → Done; comment PR.
 
 OBJECTIVE: dashboard repo selection + member→GitHub linking on the Integrations surface. NO server-triggered scan in Wave 1 — selection persists and the sidecar consumes it; scans run via the documented aios-ingest CLI.
 SCOPE:
@@ -211,7 +212,7 @@ Worktree:
   cd ../aios-team-brain-w1.4
   ln -sfn /Users/iamjohndass/Projects/aios/aios-team-brain/node_modules node_modules
 
-Plane: epic "W1.4 — Ops hardening (Sentry, CodeRabbit, BugBot)" (W1.4.1–W1.4.4). Epic → In Progress; sub-issues → Done; comment PR.
+Plane: epic "W1.4 — Ops hardening (Sentry, CodeRabbit, BugBot)" (W1.4.1–W1.4.4). Assign the epic and sub-issues to yourself. Epic → In Progress; sub-issues → Done; comment PR.
 
 OBJECTIVE: error logging + AI code review.
 SCOPE:
