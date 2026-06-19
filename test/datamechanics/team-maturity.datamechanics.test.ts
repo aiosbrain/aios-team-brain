@@ -4,6 +4,7 @@ import { ingestCodebaseScan } from "@/lib/codebases/ingest";
 import { getTeamMaturity } from "@/lib/metrics/maturity";
 import { codebaseScanPayloadSchema } from "@/lib/api/schemas";
 import { db, seedTeam } from "./helpers";
+import { fullMetrics } from "@/test/fixtures/codebase-scan";
 
 // Spec: the team rollup aggregates per-repo agent-readiness into "% at L3+" and is
 // team-tier only (no leak to external), reusing the codebase choke-point.
@@ -11,13 +12,12 @@ import { db, seedTeam } from "./helpers";
 function scan(slug: string, level: string, pct: number) {
   return codebaseScanPayloadSchema.parse({
     codebase: { slug, full_name: `acme/${slug}`, open_issues: 0 },
-    metrics: {
+    metrics: fullMetrics({
       head_sha: "c".repeat(40),
-      window_days: 90,
       readiness_level: level,
       readiness_pct: pct,
       readiness_rubric_version: "1.0.0",
-    },
+    }),
     contributions: [],
     issues: [],
   });
