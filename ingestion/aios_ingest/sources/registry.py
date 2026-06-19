@@ -12,6 +12,7 @@ from .base import Source
 from .confluence import ConfluenceSource
 from .gdrive import GoogleDriveSource
 from .github import GithubSource
+from .granola import GranolaSource
 from .linear import LinearSource
 from .local import LocalSource
 from .notion import NotionSource
@@ -31,6 +32,7 @@ _REGISTRY: dict[str, Builder] = {
     "web": WebSource,
     "local": LocalSource,
     "radar": RadarSource,
+    "granola": GranolaSource,
 }
 
 

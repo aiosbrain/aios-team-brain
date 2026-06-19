@@ -293,8 +293,15 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 ### Ingestion sources
 
 <!-- drift:sources -->
-`github` · `slack` · `notion` · `gdrive` · `confluence` · `linear` · `web` · `local` · `radar`
+`github` · `slack` · `notion` · `gdrive` · `confluence` · `linear` · `web` · `local` · `radar` · `granola`
 <!-- /drift:sources -->
+
+> **`granola` privacy invariant:** Granola is the one source that must **never** sync
+> verbatim transcript team-tier. Its `fetch()` team-push path emits metadata-only meeting
+> *markers* (`kind=artifact`, `transcript_synced:false`), behind an allowlist + per-note
+> consent gate; full transcripts are written to the local workspace at **admin tier only**
+> and decisions reach the `decisions` table solely through the human-reviewed
+> decision-log.md → `aios push` → `materializeDecisions` flow. See `docs/GRANOLA.md`.
 
 ## Docs drift guard
 

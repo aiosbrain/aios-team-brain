@@ -60,6 +60,7 @@ expire. Cursors and channel state live in a local sqlite file (`--state-db`).
 |--------|--------------|--------|----------|
 | Slack / meeting notes | `transcript` | `slack/<channel>/<ts>.md` | per-connection (default `team`) |
 | Drive / Notion / Confluence / GitHub | `deliverable` | `<source>/<external-id>.md` | per-connection |
+| Granola (meeting **marker**) | `artifact` | `granola/<note-id>.md` | `team` — **no transcript**; see [docs/GRANOLA.md](../docs/GRANOLA.md) |
 
 Provenance (`source`, `source_id`, `source_url`, `author`, `source_ts`) is stored in the
 item's `frontmatter`. Re-reads of unchanged content are no-ops (sha256 dedup at the brain).
