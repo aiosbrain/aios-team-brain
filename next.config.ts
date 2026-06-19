@@ -1,4 +1,5 @@
 import type { NextConfig } from "next";
+import { withSentryConfig } from "@sentry/nextjs";
 import { lstatSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
@@ -29,4 +30,23 @@ const nextConfig: NextConfig = {
   ...(nodeModulesIsSymlink ? { turbopack: { root: resolve(here, "..") } } : {}),
 };
 
-export default nextConfig;
+// Wrap with Sentry. This build-time wrapper enables source-map upload (so
+// stack traces in Sentry are un-minified). It is env-driven and inert without
+// credentials: with no SENTRY_AUTH_TOKEN, the build skips the upload step and
+// proceeds normally — so local/CI builds need no Sentry secrets.
+//
+// Source-map upload works under Turbopack with @sentry/nextjs >= 10.13.
+// There are no custom webpack plugins in this config (Turbopack ignores them),
+// so nothing here depends on the webpack pipeline.
+export default withSentryConfig(nextConfig, {
+  // Org/project for source-map upload. Also read from SENTRY_ORG / SENTRY_PROJECT.
+  org: process.env.SENTRY_ORG,
+  project: process.env.SENTRY_PROJECT,
+  // Auth token for uploading source maps at build time. MUST come from env;
+  // never commit it. Also read from SENTRY_AUTH_TOKEN if omitted here.
+  authToken: process.env.SENTRY_AUTH_TOKEN,
+  // Quiet the build logs unless explicitly debugging.
+  silent: !process.env.CI,
+  // Don't send build-tool telemetry to Sentry.
+  telemetry: false,
+});
