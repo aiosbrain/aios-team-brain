@@ -468,19 +468,20 @@ create table if not exists github_issues (
 create index if not exists github_issues_codebase_state_idx
   on github_issues (codebase_id, state, updated_at desc);
 
--- Integration selections (Wave 1 framework). Holds NON-SECRET selection/config only —
--- e.g. which repos to scan, which Slack channels to ingest, a Linear/Plane project slug.
--- Secrets (tokens) live in the sidecar's env/connections.yaml and are merged locally by
--- (type, name); the brain never stores them. POSTGRES-ONLY: no RLS is defined here, so tier/
--- role isolation is enforced in app code (lib/integrations/read.ts) — there is no DB backstop.
--- No updated_at trigger exists in this schema; the single writer (lib/integrations/manage.ts)
--- must set updated_at = now() explicitly on update.
+-- Integration selections. `config` holds NON-SECRET selection only (repos, channels, project
+-- slugs); the per-type allowlist + secret-key rejection (lib/api/schemas) keep secrets OUT of
+-- config. The connector secret (Slack/GitHub/… token) lives ENCRYPTED in `secret_ciphertext`
+-- (AES-256-GCM via lib/secrets) so admins set it self-serve in the dashboard; plaintext is only
+-- produced on the connector-key read path (GET /api/v1/integrations, audited). POSTGRES-ONLY:
+-- no RLS — tier/role isolation is in app code. Single writer: lib/integrations/manage.ts (sets
+-- updated_at explicitly; no trigger).
 create table if not exists integrations (
   id uuid primary key default gen_random_uuid(),
   team_id uuid not null references teams(id) on delete cascade,
   type text not null check (type in ('github','granola','slack','wise','linear','plane')),
   name text not null,
   config jsonb not null default '{}',
+  secret_ciphertext text,                 -- AES-256-GCM blob (base64); null if no secret set
   status text not null default 'enabled' check (status in ('enabled','disabled')),
   created_by uuid references members(id) on delete set null,
   created_at timestamptz not null default now(),
@@ -488,3 +489,5 @@ create table if not exists integrations (
   unique (team_id, type, name)
 );
 create index if not exists integrations_team_type_idx on integrations (team_id, type);
+-- Additive column for existing deployments (idempotent rollout via `npm run pg:schema`).
+alter table integrations add column if not exists secret_ciphertext text;
