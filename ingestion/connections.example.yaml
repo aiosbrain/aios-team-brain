@@ -1,0 +1,30 @@
+# Example ingestion connections. Copy to connections.yaml and edit.
+#   aios-ingest sync --config connections.yaml
+#   aios-ingest schedule --config connections.yaml --poll-interval 21600   # every 6h
+#
+# Secrets in `options` use ${ENV_VAR} and are expanded from the environment.
+
+connections:
+  # ── Agentic Engineering Radar ────────────────────────────────────────────────
+  # Mines the best practicing agentic engineers into the brain as team-tier artifacts.
+  # Curated items are later promoted to the public wiki (a deliberate human act —
+  # see docs/RADAR.md). The radar source only fills the team-tier staging layer.
+  - name: agentic-radar
+    source: radar
+    access: team            # NEVER external/admin — staging stays internal until promoted
+    project: agentic-radar
+    actor: radar-sync
+    options:
+      # Option A — point at the canonical watchlist JSON (recommended; one source of truth):
+      #   the monorepo file agentic-engineering-maturity/rubric/watchlist.json, or a copy.
+      watchlist_path: ${AIOS_WATCHLIST_PATH}
+      # Option B — inline feeds (use instead of, or in addition to, watchlist_path):
+      feeds:
+        - https://simonwillison.net/atom/everything/
+        - https://lucumr.pocoo.org/feed.atom
+        - https://ghuntley.com/rss/
+        - https://registerspill.thorstenball.com/feed
+        - https://www.latent.space/feed
+        - https://github.com/anthropics/claude-code/releases.atom
+        - https://hnrss.org/newest?q=Claude+Code&points=50
+      max_entries_per_feed: 50

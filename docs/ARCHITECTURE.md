@@ -289,7 +289,7 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 ### Ingestion sources
 
 <!-- drift:sources -->
-`github` · `slack` · `notion` · `gdrive` · `confluence` · `linear` · `web` · `local`
+`github` · `slack` · `notion` · `gdrive` · `confluence` · `linear` · `web` · `local` · `radar`
 <!-- /drift:sources -->
 
 ## Docs drift guard
