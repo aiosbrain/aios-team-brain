@@ -20,6 +20,8 @@ if (!databaseTestUrl) {
 process.env.DB_BACKEND = "postgres";
 process.env.NEXT_PUBLIC_DB_BACKEND = "postgres";
 process.env.DATABASE_URL = databaseTestUrl;
+// Fixed test key for connector-secret crypto (lib/secrets); not a real secret.
+process.env.SECRETS_KEY ??= Buffer.alloc(32, 7).toString("base64");
 
 export default defineConfig({
   test: {

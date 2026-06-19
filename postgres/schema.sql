@@ -461,3 +461,22 @@ create table if not exists github_issues (
 );
 create index if not exists github_issues_codebase_state_idx
   on github_issues (codebase_id, state, updated_at desc);
+
+-- Ingestion connections (Integrations settings). Holds per-team connector config and an
+-- ENCRYPTED secret (AES-256-GCM via lib/secrets) — the plaintext token never lives in the
+-- DB. Admins manage these in the dashboard; the ingestion sidecar pulls enabled connections
+-- (with decrypted secrets) from GET /api/v1/connections. Sole writer: lib/connections.
+create table if not exists connections (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  source text not null,                         -- 'slack' | 'github' | 'notion' | ...
+  name text not null,                           -- human label, unique per team
+  config jsonb not null default '{}',           -- NON-secret config (channel_ids, etc.)
+  secret_ciphertext text,                       -- AES-256-GCM blob (base64); null if none
+  enabled boolean not null default true,
+  created_by uuid references members(id) on delete set null,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  unique (team_id, name)
+);
+create index if not exists connections_team_idx on connections (team_id, source);
