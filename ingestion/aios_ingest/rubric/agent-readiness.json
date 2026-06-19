@@ -1,0 +1,192 @@
+{
+  "$schema": "./agent-readiness.schema.json",
+  "id": "aios.agent-readiness",
+  "version": "1.0.0",
+  "title": "Codebase Agent-Readiness Rubric",
+  "description": "Machine-readable scoring rubric for how ready a repository is for agents to work in it effectively and verifiably. Consumed by the aios-workspace validator (OGR10) and the aios-team-brain codebase scan. Each check is a binary, automatable signal (file existence + lightweight config parse). A repo's level is the highest level for which >= advanceThreshold of that level's cumulative checks pass. The Spine level is CAPPED at L3 when the Verification pillar scores 0 passing checks (the core AEM rule: no real agentic maturity without verification).",
+  "advanceThreshold": 0.8,
+  "verificationCapLevel": 3,
+  "verificationCapPillar": "testing",
+  "levels": [
+    { "id": "L1", "name": "Functional", "blurb": "A human can build and run it." },
+    { "id": "L2", "name": "Structured", "blurb": "Conventions are explicit and enforced." },
+    { "id": "L3", "name": "Agent-ready", "blurb": "An agent can work here safely and verifiably.", "target": true },
+    { "id": "L4", "name": "Measured", "blurb": "Quality is enforced and evaluated." },
+    { "id": "L5", "name": "Self-improving", "blurb": "The repo helps agents improve it." }
+  ],
+  "pillars": [
+    { "key": "agent_instructions", "title": "Agent instructions" },
+    { "key": "testing", "title": "Testing & verification" },
+    { "key": "build_validation", "title": "Build & validation guardrails" },
+    { "key": "docs", "title": "Documentation" },
+    { "key": "dev_env", "title": "Dev environment" },
+    { "key": "code_quality", "title": "Code quality gates" },
+    { "key": "observability", "title": "Observability" },
+    { "key": "security", "title": "Security & governance" },
+    { "key": "evals", "title": "Evals" }
+  ],
+  "checks": [
+    {
+      "id": "readme_present",
+      "pillar": "docs",
+      "level": "L1",
+      "title": "README exists",
+      "rationale": "Baseline orientation for any worker, human or agent.",
+      "signal": { "anyFileExists": ["README.md", "README.mdx", "README.rst", "README.txt", "readme.md"] }
+    },
+    {
+      "id": "buildable",
+      "pillar": "build_validation",
+      "level": "L1",
+      "title": "Declares how to build/run (package manifest)",
+      "rationale": "A worker must be able to install and run the project.",
+      "signal": { "anyFileExists": ["package.json", "pyproject.toml", "requirements.txt", "Cargo.toml", "go.mod", "pom.xml", "build.gradle", "Gemfile", "composer.json", "Makefile"] }
+    },
+    {
+      "id": "agent_instructions_present",
+      "pillar": "agent_instructions",
+      "level": "L2",
+      "title": "CLAUDE.md or AGENTS.md exists",
+      "rationale": "Agents need a conventions/gotchas file to work effectively (the highest-leverage agent-readiness signal).",
+      "signal": { "anyFileExists": ["CLAUDE.md", "AGENTS.md", ".claude/CLAUDE.md", ".cursorrules", ".github/copilot-instructions.md"] }
+    },
+    {
+      "id": "agent_instructions_nontrivial",
+      "pillar": "agent_instructions",
+      "level": "L2",
+      "title": "Agent instructions are non-trivial (>= 400 bytes)",
+      "rationale": "A stub CLAUDE.md doesn't help; substance does.",
+      "signal": { "fileMinBytes": { "anyOf": ["CLAUDE.md", "AGENTS.md", ".claude/CLAUDE.md"], "bytes": 400 } }
+    },
+    {
+      "id": "linter_configured",
+      "pillar": "code_quality",
+      "level": "L2",
+      "title": "Linter configured",
+      "rationale": "Static guardrail that keeps agent output consistent.",
+      "signal": { "anyFileExists": [".eslintrc", ".eslintrc.json", ".eslintrc.js", ".eslintrc.cjs", "eslint.config.js", "eslint.config.mjs", ".ruff.toml", "ruff.toml", ".flake8", ".rubocop.yml", ".golangci.yml", ".golangci.yaml"], "orConfigKey": [{ "file": "package.json", "key": "eslintConfig" }, { "file": "pyproject.toml", "section": "tool.ruff" }] }
+    },
+    {
+      "id": "formatter_configured",
+      "pillar": "code_quality",
+      "level": "L2",
+      "title": "Formatter configured",
+      "rationale": "Deterministic formatting handles the 'last 10%' agents miss.",
+      "signal": { "anyFileExists": [".prettierrc", ".prettierrc.json", ".prettierrc.js", "prettier.config.js", ".editorconfig", "rustfmt.toml", ".rustfmt.toml"], "orConfigKey": [{ "file": "package.json", "key": "prettier" }, { "file": "pyproject.toml", "section": "tool.black" }, { "file": "pyproject.toml", "section": "tool.ruff.format" }] }
+    },
+    {
+      "id": "tests_present",
+      "pillar": "testing",
+      "level": "L2",
+      "title": "A test suite exists",
+      "rationale": "The agent's primary feedback loop; verification is the AEM differentiator.",
+      "signal": { "anyPathMatches": ["**/*.test.*", "**/*.spec.*", "**/test_*.py", "**/*_test.go", "**/tests/**", "**/test/**", "**/__tests__/**", "**/spec/**"] }
+    },
+    {
+      "id": "ci_on_pr",
+      "pillar": "testing",
+      "level": "L3",
+      "title": "CI runs on PRs",
+      "rationale": "Automates the verification loop so agent changes are checked before merge.",
+      "signal": { "anyFileExists": [".github/workflows", ".gitlab-ci.yml", ".circleci/config.yml", "azure-pipelines.yml", ".buildkite/pipeline.yml", "Jenkinsfile", ".github/workflows/ci.yml", ".github/workflows/test.yml"] }
+    },
+    {
+      "id": "type_checker",
+      "pillar": "build_validation",
+      "level": "L3",
+      "title": "Type-checker configured",
+      "rationale": "Types are a strong guardrail that catches a class of agent mistakes at edit time.",
+      "signal": { "anyFileExists": ["tsconfig.json", "mypy.ini", ".mypy.ini", "pyrightconfig.json"], "orConfigKey": [{ "file": "pyproject.toml", "section": "tool.mypy" }, { "file": "pyproject.toml", "section": "tool.pyright" }] }
+    },
+    {
+      "id": "one_command_setup",
+      "pillar": "dev_env",
+      "level": "L3",
+      "title": "One-command setup / dev environment",
+      "rationale": "Agents (and humans) get a reproducible environment without guesswork.",
+      "signal": { "anyFileExists": ["Makefile", "Taskfile.yml", "justfile", ".devcontainer/devcontainer.json", "docker-compose.yml", "docker-compose.yaml", "flake.nix", "scripts/setup.sh", "scripts/bootstrap.sh", "bin/setup"] }
+    },
+    {
+      "id": "setup_docs",
+      "pillar": "docs",
+      "level": "L3",
+      "title": "Setup/contributing docs present",
+      "rationale": "Documents how to work in the repo beyond the README stub.",
+      "signal": { "anyFileExists": ["CONTRIBUTING.md", "docs/", "DEVELOPMENT.md", "docs/development.md", "docs/setup.md", "doc/"] }
+    },
+    {
+      "id": "secret_scanning",
+      "pillar": "security",
+      "level": "L3",
+      "title": "Secret scanning / ignore hygiene",
+      "rationale": "Prevents agents from committing or surfacing secrets.",
+      "signal": { "anyFileExists": [".gitleaks.toml", ".github/workflows/secret-scan.yml", ".pre-commit-config.yaml", ".secrets.baseline", ".trufflehog.yml"], "orFileContains": [{ "file": ".gitignore", "anyOf": [".env", "*.pem", "secrets"] }] }
+    },
+    {
+      "id": "precommit_hooks",
+      "pillar": "code_quality",
+      "level": "L4",
+      "title": "Pre-commit / pre-push hooks",
+      "rationale": "Enforces quality gates deterministically, not by reminder.",
+      "signal": { "anyFileExists": [".pre-commit-config.yaml", ".husky", ".husky/pre-commit", ".githooks", "lefthook.yml", ".lefthook.yml"] }
+    },
+    {
+      "id": "observability",
+      "pillar": "observability",
+      "level": "L4",
+      "title": "Logging / monitoring present",
+      "rationale": "Agent actions and runtime behavior are inspectable.",
+      "signal": { "anyFileExists": ["**/logger.*", "**/logging.*"], "orDependency": ["pino", "winston", "structlog", "loguru", "opentelemetry", "@opentelemetry/api", "sentry-sdk", "@sentry/node"] }
+    },
+    {
+      "id": "eval_harness",
+      "pillar": "evals",
+      "level": "L4",
+      "title": "Eval suite or LLM-as-judge harness",
+      "rationale": "Verification becomes a first-class, measured artifact (EDD).",
+      "signal": { "anyPathMatches": ["**/evals/**", "**/eval/**", "**/*.eval.*", "**/promptfoo*.{yml,yaml,json}", "**/braintrust*", "**/.promptfoo*"], "orDependency": ["promptfoo", "braintrust", "deepeval", "ragas"] }
+    },
+    {
+      "id": "compounding_instructions",
+      "pillar": "agent_instructions",
+      "level": "L5",
+      "title": "Agent instructions show compounding (substantial, sectioned)",
+      "rationale": "A living, frequently-updated CLAUDE.md that has grown past a single page is a signal of compounding engineering.",
+      "signal": { "fileMinBytes": { "anyOf": ["CLAUDE.md", "AGENTS.md", ".claude/CLAUDE.md"], "bytes": 2000 } }
+    },
+    {
+      "id": "shared_skills_commands",
+      "pillar": "agent_instructions",
+      "level": "L5",
+      "title": "Shared agent skills / commands",
+      "rationale": "The repo ships reusable agent harnesses (skills, slash-commands), not just prose.",
+      "signal": { "anyFileExists": [".claude/skills", ".claude/commands", ".claude/agents", ".cursor/rules"] }
+    },
+    {
+      "id": "agent_readable_docs",
+      "pillar": "docs",
+      "level": "L5",
+      "title": "Agent-readable docs (llms.txt)",
+      "rationale": "Built for agents as a first-class consumer of the repo's information.",
+      "signal": { "anyFileExists": ["llms.txt", "llms-full.txt", "public/llms.txt", ".well-known/llms.txt"] }
+    }
+  ],
+  "remediationOrder": [
+    "agent_instructions_present",
+    "tests_present",
+    "ci_on_pr",
+    "type_checker",
+    "one_command_setup",
+    "secret_scanning",
+    "setup_docs",
+    "linter_configured",
+    "formatter_configured",
+    "agent_instructions_nontrivial",
+    "precommit_hooks",
+    "observability",
+    "eval_harness",
+    "compounding_instructions",
+    "shared_skills_commands",
+    "agent_readable_docs"
+  ]
+}

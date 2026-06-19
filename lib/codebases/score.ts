@@ -1,6 +1,9 @@
 /**
  * Codebase scoring — computed in the brain at ingest from RAW scanner metrics
- * (the Python scanner never computes scores; one TS implementation, unit-tested).
+ * (one TS implementation, unit-tested). The scanner sends raw facts; the brain derives
+ * the scores here. The lone exception is AEM agent-readiness, which the scanner scores
+ * against the rubric (its checks are filesystem questions the brain can't see) and the
+ * brain persists verbatim — see lib/metrics/codebases.ts and docs/ARCHITECTURE.md.
  *
  * The "agentic score" is a PROVISIONAL, tunable heuristic for how AI-native a
  * codebase is. The `Co-Authored-By: Claude` commit trailer proves a commit was

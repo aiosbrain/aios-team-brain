@@ -64,6 +64,20 @@ expire. Cursors and channel state live in a local sqlite file (`--state-db`).
 Provenance (`source`, `source_id`, `source_url`, `author`, `source_ts`) is stored in the
 item's `frontmatter`. Re-reads of unchanged content are no-ops (sha256 dedup at the brain).
 
+## Codebase scan & agent-readiness
+
+`aios-ingest scan` analyzes a local git checkout and pushes metrics to the brain
+(`POST /api/v1/codebases`). The brain derives `agentic_score`/`health_score`; **AEM
+agent-readiness is scored scanner-side** (`aios_ingest/analyzers/readiness.py`) against a
+vendored copy of the canonical rubric at `aios_ingest/rubric/agent-readiness.json`. It's
+vendored so the deployed sidecar is self-contained; every scan records
+`readiness_rubric_version` so a stale copy is observable.
+
+- Refresh the vendored rubric from the canonical sibling repo:
+  `scripts/refresh-rubric.sh` (copies from `../agentic-engineering-maturity/rubric/…`).
+- Score against a different rubric ad hoc: `aios-ingest scan … --readiness-rubric PATH`.
+- Readiness is scored on the live scan only; `--backfill` historical points carry null readiness.
+
 ## Limitations (MVP)
 
 - **No deletes** — the brain has no DELETE endpoint yet; removing a source doc won't remove the item.
