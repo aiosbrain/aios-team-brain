@@ -25,6 +25,8 @@ export interface CodebaseSummary {
   health_score: number;
   test_coverage_pct: number | null;
   ai_commit_ratio: number;
+  readiness_level: string | null; // AEM agent-readiness level (L0..L5), null = not scored
+  readiness_pct: number | null;
   spark: number[]; // agentic_score over the window
 }
 
@@ -40,6 +42,8 @@ type MetricRow = {
   health_score: number | string;
   test_coverage_pct: number | string | null;
   ai_commit_ratio: number | string;
+  readiness_level: string | null;
+  readiness_pct: number | string | null;
 };
 
 export async function getCodebaseSummaries(
@@ -60,7 +64,7 @@ export async function getCodebaseSummaries(
       .order("last_scan_at", { ascending: false, nullsFirst: false }),
     supabase
       .from("code_metrics")
-      .select("codebase_id, scanned_at, agentic_score, health_score, test_coverage_pct, ai_commit_ratio")
+      .select("codebase_id, scanned_at, agentic_score, health_score, test_coverage_pct, ai_commit_ratio, readiness_level, readiness_pct")
       .eq("team_id", teamId)
       .gte("scanned_at", windowStart)
       // DESC + limit keeps the NEWEST points (ascending+limit would drop them at scale).
@@ -102,6 +106,8 @@ export async function getCodebaseSummaries(
       health_score: num(latest?.health_score),
       test_coverage_pct: latest?.test_coverage_pct == null ? null : num(latest.test_coverage_pct),
       ai_commit_ratio: num(latest?.ai_commit_ratio),
+      readiness_level: latest?.readiness_level ?? null,
+      readiness_pct: latest?.readiness_pct == null ? null : num(latest.readiness_pct),
       // chronological for the sparkline (series is newest-first)
       spark: series.map((s) => num(s.agentic_score)).reverse(),
     };
@@ -183,6 +189,9 @@ export interface AgenticBreakdown {
   skills_count: number;
   commands_count: number;
   test_coverage_pct: number | null;
+  readiness_level: string | null;
+  readiness_pct: number | null;
+  readiness_pillars: Record<string, { passed: number; total: number }>;
 }
 
 export interface TrendPoint {
@@ -268,7 +277,8 @@ export async function getCodebaseDetail(
   const METRIC_COLS =
     "scanned_at, agentic_score, health_score, ai_commit_ratio, test_coverage_score, " +
     "scaffolding_score, skill_breadth_score, cadence_score, issue_health, has_claude_md, " +
-    "has_agents_md, agents_md_count, skills_count, commands_count, test_coverage_pct, recent_commits";
+    "has_agents_md, agents_md_count, skills_count, commands_count, test_coverage_pct, recent_commits, " +
+    "readiness_level, readiness_pct, readiness_pillars";
 
   const [metricsRes, contribRes, issuesRes, membersRes] = await Promise.all([
     supabase
@@ -322,6 +332,10 @@ export async function getCodebaseDetail(
         commands_count: num(latest.commands_count as number),
         test_coverage_pct:
           latest.test_coverage_pct == null ? null : num(latest.test_coverage_pct as number),
+        readiness_level: (latest.readiness_level as string | null) ?? null,
+        readiness_pct: latest.readiness_pct == null ? null : num(latest.readiness_pct as number),
+        readiness_pillars:
+          (latest.readiness_pillars as Record<string, { passed: number; total: number }>) ?? {},
       }
     : null;
 

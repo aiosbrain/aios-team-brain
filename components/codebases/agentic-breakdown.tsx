@@ -28,6 +28,51 @@ function Check2({ ok, label }: { ok: boolean; label: string }) {
   );
 }
 
+// Pillar keys arrive from the scanner's rubric (e.g. "testing", "agent_docs"); humanize for display.
+function humanizePillar(key: string): string {
+  const s = key.replace(/[_-]+/g, " ").trim();
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+// AEM agent-readiness — rubric-scored scanner-side; the brain only persists + surfaces it.
+// Renders only when a scan carried a readiness level (older scans / unscored repos are null).
+function ReadinessSection({ b }: { b: Breakdown }) {
+  if (!b.readiness_level) return null;
+  const pillars = Object.entries(b.readiness_pillars ?? {});
+  return (
+    <div className="flex flex-col gap-3 border-t border-border-subtle pt-3">
+      <div className="flex items-baseline justify-between gap-3">
+        <h3 className="text-xs font-semibold uppercase tracking-wider text-ink-tertiary">
+          Agent readiness
+        </h3>
+        <span className="inline-flex items-baseline gap-2 font-mono text-xs">
+          <span className="rounded-full border border-white/10 bg-white/[0.04] px-2 py-0.5 font-semibold text-ink-secondary">
+            {b.readiness_level}
+          </span>
+          {b.readiness_pct == null ? null : (
+            <span className="text-ink-tertiary">{b.readiness_pct}%</span>
+          )}
+        </span>
+      </div>
+      {pillars.length > 0 ? (
+        <div className="flex flex-col gap-2">
+          {pillars.map(([key, { passed, total }]) => (
+            <div key={key} className="flex flex-col gap-1">
+              <div className="flex items-baseline justify-between text-xs">
+                <span className="text-ink-secondary">{humanizePillar(key)}</span>
+                <span className="text-ink-tertiary">
+                  {passed}/{total}
+                </span>
+              </div>
+              <Bar value={total > 0 ? (passed / total) * 100 : 0} />
+            </div>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 export function AgenticBreakdownCard({ b }: { b: Breakdown }) {
   return (
     <section className="prism-card flex flex-col gap-4 px-5 py-4">
@@ -71,6 +116,8 @@ export function AgenticBreakdownCard({ b }: { b: Breakdown }) {
           label={b.test_coverage_pct == null ? "no coverage report" : `${b.test_coverage_pct}% coverage`}
         />
       </div>
+
+      <ReadinessSection b={b} />
     </section>
   );
 }
