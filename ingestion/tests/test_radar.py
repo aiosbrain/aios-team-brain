@@ -3,6 +3,11 @@
 import json
 
 import httpx
+import pytest
+
+# RadarSource.fetch() needs the 'radar' extra (feedparser). Skip cleanly if a bare
+# '.[dev]' env runs these; CI installs '.[dev,radar]' so they actually run there.
+pytest.importorskip("feedparser")
 
 from aios_ingest.sources.radar import RadarSource, _feeds_from_watchlist, _struct_to_iso
 
