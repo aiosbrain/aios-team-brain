@@ -162,5 +162,43 @@ export async function getEnabledIntegrationsWithSecrets(
   }));
 }
 
+/** A team's enabled integration selection — NON-SECRET fields only. */
+export interface IntegrationSelection {
+  id: string;
+  type: IntegrationType;
+  name: string;
+  config: Record<string, unknown>;
+  status: "enabled";
+}
+
+/**
+ * The API read path for `GET /api/v1/integrations`: a team's ENABLED integrations as NON-SECRET
+ * selections (type + name + config). It deliberately never selects, decrypts, or returns
+ * `secret_ciphertext` — the connector secret never crosses this HTTP boundary, even to an
+ * authenticated connector key. (The in-process Slack runner reads decrypted secrets directly via
+ * `getEnabledIntegrationsWithSecrets` above, never over HTTP.) Gated by the connector key at the
+ * route (`authenticateApiKey`), not a dashboard role — so it lives here, not in read.ts (whose
+ * helpers are all admin-role-gated). Team-scoped: only the caller's `teamId` is returned.
+ */
+export async function listEnabledIntegrationSelections(
+  supabase: SupabaseClient,
+  teamId: string
+): Promise<IntegrationSelection[]> {
+  const { data, error } = await supabase
+    .from("integrations")
+    .select("id, type, name, config, status") // NOTE: no secret_ciphertext — by design
+    .eq("team_id", teamId)
+    .eq("status", "enabled")
+    .order("created_at", { ascending: true });
+  if (error) throw new Error(`list integration selections failed: ${error.message}`);
+  return (data ?? []).map((r) => ({
+    id: r.id as string,
+    type: r.type as IntegrationType,
+    name: r.name as string,
+    config: (r.config as Record<string, unknown>) ?? {},
+    status: "enabled" as const,
+  }));
+}
+
 /** Re-exported for callers that branch on type without importing schemas directly. */
 export type { IntegrationType };
