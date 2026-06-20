@@ -20,6 +20,12 @@ export type Task = {
   origin: "sync" | "ui";
   project_id: string;
   updated_at: string;
+  task_pm_links?: {
+    provider: "plane" | "linear";
+    provider_url: string;
+    last_synced_status: string | null;
+    last_error: string | null;
+  }[];
 };
 
 export type ProjectOption = { id: string; slug: string; name: string };

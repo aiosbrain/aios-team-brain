@@ -29,8 +29,8 @@ const SELECTION_HINT: Record<IntegrationType, string> = {
   slack: "channel IDs (comma-separated)",
   github: "repos owner/name (comma-separated)",
   granola: "match keywords (comma-separated)",
-  linear: "project ID",
-  plane: "project ID",
+  linear: "teamId=..., projectId=..., doneStateName=Done",
+  plane: "workspaceSlug=..., projectId=..., doneStateName=DONE, externalSource=aios-backlog",
   wise: "profile ID",
 };
 
@@ -39,6 +39,21 @@ function summarizeConfig(type: IntegrationType, config: Record<string, unknown>)
   if (type === "slack") return `${arr("channelIds").length} channel(s)`;
   if (type === "github") return `${arr("repos").length} repo(s)`;
   if (type === "granola") return `${arr("matchKeywords").length} keyword(s)`;
+  if (type === "linear") {
+    return [
+      config.teamId ? `team ${config.teamId}` : null,
+      config.projectId ? `project ${config.projectId}` : null,
+      config.doneStateName ? `done ${config.doneStateName}` : null,
+    ].filter(Boolean).join(" · ") || "—";
+  }
+  if (type === "plane") {
+    return [
+      config.workspaceSlug ? `workspace ${config.workspaceSlug}` : null,
+      config.projectId ? `project ${config.projectId}` : null,
+      config.doneStateName ? `done ${config.doneStateName}` : null,
+      config.externalSource ? `source ${config.externalSource}` : null,
+    ].filter(Boolean).join(" · ") || "—";
+  }
   return Object.values(config)[0] ? String(Object.values(config)[0]) : "—";
 }
 

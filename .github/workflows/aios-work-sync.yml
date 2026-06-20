@@ -1,0 +1,73 @@
+name: AIOS work sync
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  notify-brain:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    env:
+      AIOS_BRAIN_URL: ${{ secrets.AIOS_BRAIN_URL }}
+      AIOS_API_KEY: ${{ secrets.AIOS_API_KEY }}
+      AIOS_TEAM: ${{ secrets.AIOS_TEAM }}
+      AIOS_PROJECT: aios-team-brain
+    steps:
+      - name: Post merged work event
+        run: |
+          node <<'NODE'
+          const fs = require("node:fs");
+
+          const brain = process.env.AIOS_BRAIN_URL;
+          const key = process.env.AIOS_API_KEY;
+          const team = process.env.AIOS_TEAM;
+          if (!brain || !key || !team) {
+            console.log("AIOS work sync skipped: AIOS_BRAIN_URL, AIOS_API_KEY, or AIOS_TEAM is not configured.");
+            process.exit(0);
+          }
+
+          const event = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, "utf8"));
+          const pr = event.pull_request;
+          const text = [pr.title, pr.body || "", pr.head?.ref || ""].join("\n");
+          const re = /\b(?:AIOS-Work:\s*)?([A-Z][A-Z0-9]+-\d+|[A-Z]\d+(?:\.\d+)*)\b/g;
+          const workKeys = [...new Set([...text.matchAll(re)].map((m) => m[1]))];
+
+          const payload = {
+            project: process.env.AIOS_PROJECT,
+            event_kind: "merged",
+            repo: event.repository.full_name,
+            merged_sha: pr.merge_commit_sha || event.after || pr.head.sha,
+            pr_url: pr.html_url,
+            pr_title: pr.title,
+            pr_body: pr.body || "",
+            branch: pr.head?.ref || "",
+            work_keys: workKeys,
+            actor: pr.merged_by?.login || pr.user?.login || "",
+          };
+
+          const url = `${brain.replace(/\/$/, "")}/api/v1/work-events`;
+          fetch(url, {
+            method: "POST",
+            headers: {
+              "Authorization": `Bearer ${key}`,
+              "X-AIOS-Team": team,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify(payload),
+          }).then(async (res) => {
+            const body = await res.text();
+            if (!res.ok) {
+              console.error(`AIOS work sync failed: ${res.status} ${body}`);
+              process.exit(1);
+            }
+            console.log(body);
+          }).catch((err) => {
+            console.error(err);
+            process.exit(1);
+          });
+          NODE

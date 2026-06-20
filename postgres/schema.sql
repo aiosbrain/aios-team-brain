@@ -232,6 +232,54 @@ create index if not exists tasks_team_status_idx on tasks (team_id, status);
 create index if not exists tasks_team_assignee_idx on tasks (team_id, assignee);
 create index if not exists tasks_team_updated_idx on tasks (team_id, updated_at desc);
 
+-- Links between AIOS task rows and the external PM tool selected by the team.
+-- AIOS remains the source of truth for row identity/status; this table records how
+-- a row maps onto Plane/Linear and what the last provider sync did.
+create table if not exists task_pm_links (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  project_id uuid not null references projects(id) on delete cascade,
+  task_id uuid references tasks(id) on delete set null,
+  row_key text not null,
+  provider text not null check (provider in ('plane', 'linear')),
+  provider_resource_id text,
+  provider_external_source text not null default 'aios',
+  provider_external_id text not null,
+  provider_url text not null default '',
+  last_synced_status text,
+  last_synced_at timestamptz,
+  last_error text,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  unique (team_id, project_id, row_key, provider)
+);
+create index if not exists task_pm_links_task_idx on task_pm_links (task_id);
+create index if not exists task_pm_links_team_provider_idx on task_pm_links (team_id, provider);
+
+-- Observable work events from code repos. The initial event is "merged": after a PR
+-- lands on main, the matching task row moves to done and provider sync is attempted.
+create table if not exists work_events (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  project_id uuid references projects(id) on delete set null,
+  task_id uuid references tasks(id) on delete set null,
+  row_key text not null,
+  event_kind text not null check (event_kind in ('merged')),
+  repo text not null,
+  merged_sha text not null,
+  pr_url text not null default '',
+  pr_title text not null default '',
+  pr_body text not null default '',
+  actor text not null default '',
+  status text not null default 'unresolved' check (status in ('applied', 'unresolved')),
+  error text,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  unique (team_id, repo, merged_sha, row_key, event_kind)
+);
+create index if not exists work_events_team_status_idx on work_events (team_id, status, created_at desc);
+create index if not exists work_events_task_idx on work_events (task_id);
+
 create table if not exists decisions (
   id uuid primary key default gen_random_uuid(),
   team_id uuid not null references teams(id) on delete cascade,

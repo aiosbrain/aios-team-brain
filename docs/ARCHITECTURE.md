@@ -9,7 +9,7 @@ portable: plain SQL migrations, Postgres-backed rate limiting, no Vercel-only de
 > ingestion sources) are guarded against drift by `scripts/check-docs-drift.mjs` — see
 > [Docs drift guard](#docs-drift-guard).
 >
-> **Last verified against code: 2026-06-17.** If a flow here disagrees with the code, the
+> **Last verified against code: 2026-06-20.** If a flow here disagrees with the code, the
 > code wins — fix the doc (same PR).
 
 ## Sources of truth
@@ -20,7 +20,9 @@ Reason from this table, not from a random call site.
 | State | Store (table) | Writer | Readers | Tier/access enforcement |
 |---|---|---|---|---|
 | Synced content | `items`, `item_versions` | **`lib/ingest` only** (single-writer guarded) | dashboard pages, `/api/v1/items`, `lib/query/retrieve`, okf-bundle, metrics | supabase: RLS; postgres: app-code — API ✅, dashboard ✅ (`lib/auth/visibility` choke-point, guarded) |
-| Tasks | `tasks` | `lib/ingest` (sync rows) + `app/actions/tasks.ts` (UI; mints `ui-` row_key) | dashboard, `/api/v1/tasks` | team-scoped; `origin='ui'` rows survive sync diff |
+| Tasks | `tasks` | `lib/ingest` (sync rows) + `app/actions/tasks.ts` (UI; mints `ui-` row_key) + `lib/work-events` (merged-work completion) | dashboard, `/api/v1/tasks`, PM sync | team-scoped; `origin='ui'` rows survive sync diff |
+| Task PM links | `task_pm_links` | `lib/ingest` (optional task-row PM metadata) + PM backfill | dashboard task badges, `lib/pm-sync` | team-scoped; stores provider IDs/status only, never secrets |
+| Work events | `work_events` | `POST /api/v1/work-events` → `lib/work-events` | Admin → PM sync health | team-tier only; unresolved events are preserved for reconciliation |
 | Decisions | `decisions` | `lib/ingest` (sync rows) + `app/actions/decisions.ts` (UI; `source_item_id` NULL) | dashboard, `/api/v1/decisions` | team-scoped; UI rows (`source_item_id` NULL) never diff-deleted; writeback tier-scoped by `audience` |
 | Policy rules | `policies` | admin (role-gated) | `lib/policy.authorize` | role-gated (admin/lead) |
 | Approvals | `approval_requests` | `lib/policy.fileApprovalRequest`, `lib/actions.resolveApproval` | dashboard | role-gated decide |
@@ -74,7 +76,7 @@ flowchart LR
 | 5 | Identity & membership | `teams`/`members`/`api_keys`, tiers | ✅ |
 | 6 | Policy engine | `lib/policy` + `policies`/`approval_requests` | 🟡 engine + schema (no UI/enforcement yet) |
 | 7 | Audit log | `audit_log` (append-only, trigger-backed) | ✅ |
-| 8 | Feedback loop | — | ❌ not built |
+| 8 | Feedback loop | `work_events` + `lib/pm-sync` + codebase analytics | 🟡 PM progression loop + code health |
 
 ## Auth & access tiers
 
@@ -148,6 +150,27 @@ flowchart LR
   ST[("sqlite: cursors + watch channels")] -.-> T2
 ```
 
+### PM progression loop — merged work → done in Plane/Linear
+
+```mermaid
+flowchart LR
+  PR["Merged PR on main"] --> WF["GitHub workflow or aios work done --push"]
+  WF --> API["POST /api/v1/work-events"]
+  API --> EVT["lib/work-events"]
+  EVT --> TASKS[("tasks.status = done")]
+  EVT --> LINKS[("task_pm_links")]
+  LINKS --> PMS["lib/pm-sync provider adapter"]
+  PMS --> PLANE["Plane work item completed state"]
+  PMS --> LINEAR["Linear completed workflow state"]
+  EVT --> UNRES["unresolved work_events for admin reconciliation"]
+```
+
+AIOS task `row_key` is the durable work identity. Optional `PM` / `PM URL`
+columns in `tasks.md` materialize into `task_pm_links`; the provider secret still
+lives only in `integrations.secret_ciphertext` and is decrypted on the server-side
+sync path. Provider failures update `task_pm_links.last_error` and the task remains
+done — PM drift is visible, not allowed to roll back completed code work.
+
 ### Action layer (Organ 4) — policy-gated execution
 
 ```mermaid
@@ -182,6 +205,8 @@ erDiagram
   projects ||--o{ items : contains
   items ||--o{ item_versions : versions
   projects ||--o{ tasks : materializes
+  tasks ||--o{ task_pm_links : syncs_to
+  tasks ||--o{ work_events : completed_by
   projects ||--o{ decisions : materializes
   items ||--o{ tasks : source
   teams ||--o{ graph_entities : has
@@ -204,6 +229,8 @@ erDiagram
 | `lib/ingest` | The only audited write path (service role) |
 | `lib/query` | Retrieval + Claude streaming |
 | `lib/actions` | Policy-gated action execution + sandbox seam (Organ 4) |
+| `lib/work-events` | Merged-work event ingestion; idempotently marks matching tasks done |
+| `lib/pm-sync` | Provider-neutral Plane/Linear status sync, errors recorded on task links |
 | `lib/policy` | Policy evaluation + approval queue (Organ 6) |
 | `lib/api` | auth, rate-limit, audit, zod schemas |
 | `lib/okf` | OKF link-graph helpers |
@@ -237,6 +264,9 @@ guard enforces it, it's named.
   per-channel) and a new tier/scope — a product feature, not covered by the current filter.
 - **`admin`/`private` tiers never reach the DB** — rejected with 422 at the API.
 - **Append-only audit.** `audit_log` has a trigger that blocks UPDATE/DELETE.
+- **PM sync is an effect, not the source of truth.** A merged-work event marks the matching
+  AIOS task done first. Plane/Linear failures are recorded on `task_pm_links.last_error` and
+  surfaced in Admin → PM sync; they never roll the task back.
 - **`key_hash` is column-revoked** from client roles; API secrets are sha256-at-rest, shown once.
 - **Migration replay.** 14-digit timestamp prefixes, unique, lexical == chronological.
   *Guards:* `test/guards/migrations-numbering.test.ts` + `npm run db:test:up` (migrates from zero).
@@ -278,6 +308,7 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 - `POST /api/v1/codebases` — ingest a codebase scan (raw metrics + scanner-scored AEM agent-readiness, persisted verbatim; team-tier key only, audited)
 - `GET /api/v1/integrations` — API-key read of a team's enabled integration selections; NON-SECRET only (no secret/secret_ciphertext), team-scoped, audited
 - `POST /api/v1/metrics` — ingest an AEM individual maturity daily snapshot (team-tier key only; brain recomputes canonical scores; audited)
+- `POST /api/v1/work-events` — merged-work completion event; marks matching tasks done and triggers PM sync
 - `POST /api/dashboard/query` — same query pipeline, session-authenticated
 - `POST /api/auth/login` — postgres-mode direct passwordless sign-in (invite-only; 403 if unknown)
 <!-- /drift:routes -->
@@ -289,7 +320,7 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 `projects` · `items` · `item_versions` · `tasks` · `decisions` · `graph_entities` ·
 `graph_relationships` · `query_log` · `policies` · `approval_requests` · `actions` ·
 `codebases` · `code_metrics` · `code_contributions` · `github_issues` · `member_emails` ·
-`integrations` · `agentic_maturity_snapshots`
+`integrations` · `agentic_maturity_snapshots` · `task_pm_links` · `work_events`
 <!-- /drift:tables -->
 
 ### Ingestion sources

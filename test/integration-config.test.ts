@@ -53,4 +53,23 @@ describe("validateIntegrationConfig()", () => {
       validateIntegrationConfig("granola", { participantEmails: ["john@aios.dev"], matchKeywords: ["AIOS"] })
     ).toEqual({ participantEmails: ["john@aios.dev"], matchKeywords: ["AIOS"] });
   });
+
+  it("accepts Plane and Linear PM sync mapping hints", () => {
+    expect(
+      validateIntegrationConfig("plane", {
+        workspaceSlug: "aios-alpha",
+        projectId: "plane-project",
+        doneStateName: "DONE",
+        externalSource: "aios-backlog",
+      })
+    ).toEqual({
+      workspaceSlug: "aios-alpha",
+      projectId: "plane-project",
+      doneStateName: "DONE",
+      externalSource: "aios-backlog",
+    });
+    expect(
+      validateIntegrationConfig("linear", { teamId: "team-uuid", projectId: "project-uuid", doneStateName: "Done" })
+    ).toEqual({ teamId: "team-uuid", projectId: "project-uuid", doneStateName: "Done" });
+  });
 });

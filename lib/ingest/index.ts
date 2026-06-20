@@ -133,7 +133,7 @@ async function materializeTasks(
 
   for (const row of rows) {
     const { status, raw_status } = normalizeTaskStatus(row.status || "");
-    const { error } = await supabase.from("tasks").upsert(
+    const { data: task, error } = await supabase.from("tasks").upsert(
       {
         team_id: teamId,
         project_id: projectId,
@@ -149,8 +149,27 @@ async function materializeTasks(
         updated_at: syncedAt,
       },
       { onConflict: "team_id,project_id,row_key" }
-    );
+    )
+      .select("id")
+      .single();
     if (error) throw new Error(`task row ${row.row_key}: ${error.message}`);
+
+    if (row.pm_provider && row.pm_external_id) {
+      const { error: linkErr } = await supabase.from("task_pm_links").upsert(
+        {
+          team_id: teamId,
+          project_id: projectId,
+          task_id: (task as { id: string } | null)?.id ?? null,
+          row_key: row.row_key,
+          provider: row.pm_provider,
+          provider_external_id: row.pm_external_id,
+          provider_url: row.pm_url ?? "",
+          updated_at: syncedAt,
+        },
+        { onConflict: "team_id,project_id,row_key,provider" }
+      );
+      if (linkErr) throw new Error(`task PM link ${row.row_key}: ${linkErr.message}`);
+    }
   }
 
   // diff-delete: sync-originated rows absent from this push; UI rows survive.

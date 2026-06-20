@@ -130,6 +130,7 @@ export function Board({
                 <th className="px-4 py-3 font-medium">Title</th>
                 <th className="px-4 py-3 font-medium">Assignee</th>
                 <th className="px-4 py-3 font-medium">Status</th>
+                <th className="px-4 py-3 font-medium">PM sync</th>
                 <th className="px-4 py-3 font-medium">Sprint</th>
                 <th className="px-4 py-3 font-medium">Due</th>
               </tr>
@@ -143,6 +144,13 @@ export function Board({
                   <td className="px-4 py-2.5 text-ink">{t.title}</td>
                   <td className="px-4 py-2.5 text-ink-secondary">{t.assignee || "—"}</td>
                   <td className="px-4 py-2.5 text-ink-secondary">{STATUS_LABELS[t.status]}</td>
+                  <td className="px-4 py-2.5 text-ink-secondary">
+                    {t.task_pm_links?.length ? (
+                      <span className={t.task_pm_links.some((l) => l.last_error) ? "text-red" : "text-emerald-700"}>
+                        {t.task_pm_links.map((l) => `${l.provider}${l.last_synced_status ? `:${l.last_synced_status}` : ""}`).join(", ")}
+                      </span>
+                    ) : "—"}
+                  </td>
                   <td className="px-4 py-2.5 text-ink-secondary">{t.sprint || "—"}</td>
                   <td className="px-4 py-2.5 text-ink-secondary">
                     {t.due_date ? fmtDate(t.due_date) : "—"}

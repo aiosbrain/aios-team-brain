@@ -25,6 +25,15 @@ export function TaskCard({ task, overlay = false }: { task: Task; overlay?: bool
         {task.row_key ? <span className="font-mono">{task.row_key}</span> : null}
         {task.assignee ? <span className="font-medium text-violet">{task.assignee}</span> : null}
         {task.sprint ? <span>{task.sprint}</span> : null}
+        {task.task_pm_links?.map((link) => (
+          <span
+            key={link.provider}
+            className={link.last_error ? "font-medium text-red" : "font-medium text-emerald-700"}
+            title={link.last_error || link.last_synced_status || "PM link"}
+          >
+            {link.provider}{link.last_synced_status ? `:${link.last_synced_status}` : ""}
+          </span>
+        ))}
         {task.due_date ? (
           <span className="inline-flex items-center gap-1">
             <Clock className="size-3" /> {fmtDate(task.due_date)}

@@ -14,6 +14,9 @@ export const taskRowSchema = z.object({
   status: z.string().optional().default(""),
   sprint: z.string().optional().default(""),
   due: z.string().nullable().optional(),
+  pm_provider: z.enum(["plane", "linear"]).nullable().optional(),
+  pm_external_id: z.string().max(200).nullable().optional(),
+  pm_url: z.string().max(500).nullable().optional(),
 });
 
 export const decisionRowSchema = z.object({
@@ -189,6 +192,20 @@ export const actionRequestSchema = z.object({
   params: z.record(z.string(), z.unknown()).optional().default({}),
 });
 
+export const workEventPayloadSchema = z.object({
+  project: z.string().min(1).max(120),
+  event_kind: z.enum(["merged"]).optional().default("merged"),
+  repo: z.string().min(1).max(200),
+  merged_sha: z.string().min(7).max(64),
+  pr_url: z.string().max(500).optional().default(""),
+  pr_title: z.string().max(1000).optional().default(""),
+  pr_body: z.string().max(100_000).optional().default(""),
+  branch: z.string().max(300).optional().default(""),
+  work_keys: z.array(z.string().min(1).max(80)).max(50).optional().default([]),
+  actor: z.string().max(120).optional().default(""),
+});
+export type WorkEventPayload = z.infer<typeof workEventPayloadSchema>;
+
 /**
  * Normalize tier per contract. Outward labels client (consultant) and company
  * (employee) → external. Returns null for admin/private/unknown (never stored).
@@ -242,12 +259,19 @@ const integrationConfigSchemas: Record<IntegrationType, z.ZodType> = {
     .strict(),
   wise: z.object({ profileId: z.string().max(64).optional() }).strict(),
   linear: z
-    .object({ teamId: z.string().max(64).optional(), projectId: z.string().max(64).optional() })
+    .object({
+      teamId: z.string().max(64).optional(),
+      projectId: z.string().max(64).optional(),
+      doneStateName: z.string().max(80).optional(),
+    })
     .strict(),
   plane: z
     .object({
+      baseUrl: z.string().max(200).optional(),
       workspaceSlug: z.string().max(120).optional(),
       projectId: z.string().max(64).optional(),
+      doneStateName: z.string().max(80).optional(),
+      externalSource: z.string().max(80).optional(),
     })
     .strict(),
 };

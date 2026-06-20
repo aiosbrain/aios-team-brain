@@ -24,7 +24,7 @@ export default async function TasksPage({ params }: { params: Promise<{ team: st
   const [{ data: tasks }, { data: projects }, { data: members }, { data: me }] = await Promise.all([
     supabase
       .from("tasks")
-      .select("id, row_key, title, assignee, status, sprint, due_date, origin, project_id, updated_at")
+      .select("id, row_key, title, assignee, status, sprint, due_date, origin, project_id, updated_at, task_pm_links(provider, provider_url, last_synced_status, last_error)")
       .eq("team_id", team.id)
       .order("updated_at", { ascending: false })
       .limit(500),
