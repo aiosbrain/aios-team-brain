@@ -34,7 +34,11 @@ function scan(slug: string, contributions: { author_key: string; author_email: s
   return codebaseScanPayloadSchema.parse({
     codebase: { slug, full_name: `acme/${slug}`, open_issues: 0 },
     metrics: {
-      head_sha: "a".repeat(40), window_days: 90, commits_window: 8, ai_commits_window: 8,
+      // Core raw-scan fields are REQUIRED since #35 (reject sparse pushes) — send the full block.
+      head_sha: "a".repeat(40), window_days: 90,
+      loc: 1000, files: 50, commits_window: 8, ai_commits_window: 8,
+      additions_window: 100, deletions_window: 20, recent_commits: [],
+      has_claude_md: true, has_agents_md: true, agents_md_count: 1, skills_count: 3, commands_count: 1,
       active_days: 3, days_since_last_commit: 1,
     },
     contributions,
