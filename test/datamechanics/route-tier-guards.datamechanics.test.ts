@@ -5,6 +5,7 @@ import { POST as codebasesPOST } from "@/app/api/v1/codebases/route";
 import { POST as metricsPOST } from "@/app/api/v1/metrics/route";
 import { issueApiKey } from "@/lib/admin/keys";
 import { db, seedTeam, type Seed } from "./helpers";
+import { fullMetrics } from "@/test/fixtures/codebase-scan";
 
 // The route handlers are the SOLE tier gate for codebase + maturity analytics
 // (POSTGRES-ONLY, no RLS backstop). The lib-level datamechanics tests cover the
@@ -61,8 +62,13 @@ function post(
   return route(req);
 }
 
-// Minimal bodies that satisfy the schemas (only the required fields).
-const scanBody = () => ({ codebase: { slug: "guard-repo" }, metrics: { head_sha: "a".repeat(40) } });
+// A full scan body (the schema requires the core raw-metrics block).
+const scanBody = () => ({ codebase: { slug: "guard-repo" }, metrics: fullMetrics() });
+// A sparse readiness-only body (the shape the old assess-codebase --push sent).
+const sparseScanBody = () => ({
+  codebase: { slug: "guard-repo" },
+  metrics: { head_sha: "a".repeat(40), readiness_level: "L3", readiness_pct: 50 },
+});
 const metricsBody = () => ({ date: "2026-06-19", signals: {} });
 
 describe("route tier guards (real handlers, real Postgres)", () => {
@@ -77,6 +83,13 @@ describe("route tier guards (real handlers, real Postgres)", () => {
     const denied = await post(codebasesPOST, CB_URL, ext.key, seed.teamSlug, scanBody());
     expect(denied.status).toBe(403);
     expect((await denied.json()).error.code).toBe("forbidden_tier");
+  });
+
+  it("codebases: a sparse (readiness-only) scan is rejected 422, not silently persisted", async () => {
+    const seed = await seedTeam();
+    const team = await issueKeyFor(seed, "team");
+    const res = await post(codebasesPOST, CB_URL, team.key, seed.teamSlug, sparseScanBody());
+    expect(res.status).toBe(422);
   });
 
   it("metrics: team key 201, external key 403 forbidden_tier", async () => {

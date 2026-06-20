@@ -70,20 +70,24 @@ export const codeMetricsSchema = z.object({
   head_sha: z.string().min(1).max(64),
   window_days: z.number().int().positive().max(3650).optional().default(90),
   scanned_at: z.string().nullable().optional(),
-  loc: z.number().int().nonnegative().optional().default(0),
-  files: z.number().int().nonnegative().optional().default(0),
-  commits_window: z.number().int().nonnegative().optional().default(0),
-  ai_commits_window: z.number().int().nonnegative().optional().default(0),
-  additions_window: z.number().int().nonnegative().optional().default(0),
-  deletions_window: z.number().int().nonnegative().optional().default(0),
+  // Core raw-scan fields are REQUIRED — a partial/sparse push (e.g. a readiness-only payload)
+  // is rejected at the boundary (422) instead of upserting a row that zeroes existing analytics
+  // (code_metrics upserts on (codebase_id, head_sha) and REPLACES the row). The ingestion
+  // scanner (`aios-ingest scan`) always sends the full block; readiness fields stay optional.
+  loc: z.number().int().nonnegative(),
+  files: z.number().int().nonnegative(),
+  commits_window: z.number().int().nonnegative(),
+  ai_commits_window: z.number().int().nonnegative(),
+  additions_window: z.number().int().nonnegative(),
+  deletions_window: z.number().int().nonnegative(),
   test_coverage_pct: z.number().min(0).max(100).nullable().optional().default(null),
-  recent_commits: z.array(z.record(z.string(), z.unknown())).optional().default([]),
-  // explicit scaffolding inputs
-  has_claude_md: z.boolean().optional().default(false),
-  has_agents_md: z.boolean().optional().default(false),
-  agents_md_count: z.number().int().nonnegative().optional().default(0),
-  skills_count: z.number().int().nonnegative().optional().default(0),
-  commands_count: z.number().int().nonnegative().optional().default(0),
+  recent_commits: z.array(z.record(z.string(), z.unknown())),
+  // explicit scaffolding inputs (required)
+  has_claude_md: z.boolean(),
+  has_agents_md: z.boolean(),
+  agents_md_count: z.number().int().nonnegative(),
+  skills_count: z.number().int().nonnegative(),
+  commands_count: z.number().int().nonnegative(),
   // cadence inputs (used to compute cadence_score; not persisted raw)
   active_days: z.number().int().nonnegative().optional().default(0),
   days_since_last_commit: z.number().int().nonnegative().nullable().optional().default(null),

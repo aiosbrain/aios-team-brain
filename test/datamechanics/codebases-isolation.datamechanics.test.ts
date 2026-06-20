@@ -28,6 +28,8 @@ function buildScan(over: {
       files: 300,
       commits_window: 100,
       ai_commits_window: 60,
+      additions_window: 5000,
+      deletions_window: 1200,
       test_coverage_pct: 70,
       has_claude_md: true,
       has_agents_md: true,

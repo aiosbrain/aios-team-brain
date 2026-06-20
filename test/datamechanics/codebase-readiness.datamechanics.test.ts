@@ -4,6 +4,7 @@ import { ingestCodebaseScan } from "@/lib/codebases/ingest";
 import { getCodebaseDetail, getCodebaseSummaries } from "@/lib/metrics/codebases";
 import { codebaseScanPayloadSchema } from "@/lib/api/schemas";
 import { db, seedTeam } from "./helpers";
+import { fullMetrics } from "@/test/fixtures/codebase-scan";
 
 // Spec: the scanner scores AEM agent-readiness (scanner-side, against the canonical
 // rubric) and pushes it on the metrics payload; the brain persists it verbatim and
@@ -13,13 +14,10 @@ import { db, seedTeam } from "./helpers";
 function scanWithReadiness(slug: string) {
   return codebaseScanPayloadSchema.parse({
     codebase: { slug, full_name: `acme/${slug}`, open_issues: 0 },
-    metrics: {
+    metrics: fullMetrics({
       head_sha: "b".repeat(40),
-      window_days: 90,
       commits_window: 4,
       ai_commits_window: 2,
-      active_days: 2,
-      days_since_last_commit: 1,
       readiness_level: "L3",
       readiness_pct: 67,
       readiness_pillars: {
@@ -27,7 +25,7 @@ function scanWithReadiness(slug: string) {
         docs: { passed: 2, total: 3 },
       },
       readiness_rubric_version: "1.0.0",
-    },
+    }),
     contributions: [],
     issues: [],
   });

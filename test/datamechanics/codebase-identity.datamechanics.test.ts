@@ -6,16 +6,14 @@ import { addAuthorAlias } from "@/lib/admin/aliases";
 import { createMember } from "@/lib/admin/members";
 import { codebaseScanPayloadSchema } from "@/lib/api/schemas";
 import { db, seedTeam } from "./helpers";
+import { fullMetrics } from "@/test/fixtures/codebase-scan";
 
 const NOREPLY = "123+john@users.noreply.github.com";
 
 function scan(slug: string, contributions: { author_key: string; author_email: string; day: string; commits: number }[]) {
   return codebaseScanPayloadSchema.parse({
     codebase: { slug, full_name: `acme/${slug}`, open_issues: 0 },
-    metrics: {
-      head_sha: "a".repeat(40), window_days: 90, commits_window: 8, ai_commits_window: 8,
-      active_days: 3, days_since_last_commit: 1,
-    },
+    metrics: fullMetrics({ commits_window: 8, ai_commits_window: 8, active_days: 3 }),
     contributions,
     issues: [],
   });
