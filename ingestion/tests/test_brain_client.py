@@ -54,3 +54,50 @@ async def test_push_raises_brainerror_on_422():
 def test_rejects_non_aios_key():
     with pytest.raises(ValueError):
         BrainClient("http://brain", "badkey", "demo")
+
+
+async def test_fetch_integration_selections_parses_list_and_sends_auth():
+    def handler(req: httpx.Request) -> httpx.Response:
+        assert req.method == "GET"
+        assert req.url.path == "/api/v1/integrations"
+        assert req.headers["authorization"] == "Bearer aios_abc_def"
+        assert req.headers["x-aios-team"] == "demo"
+        return httpx.Response(
+            200,
+            json={
+                "integrations": [
+                    {
+                        "id": "i1",
+                        "type": "slack",
+                        "name": "eng-slack",
+                        "config": {"channelIds": ["C1"]},
+                        "status": "enabled",
+                    }
+                ]
+            },
+        )
+
+    async with _client(httpx.MockTransport(handler)) as c:
+        sels = await c.fetch_integration_selections()
+    assert len(sels) == 1
+    assert sels[0]["type"] == "slack"
+    assert sels[0]["config"]["channelIds"] == ["C1"]
+
+
+async def test_fetch_integration_selections_returns_empty_on_404():
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"error": {"code": "not_found", "message": "no route"}})
+
+    async with _client(httpx.MockTransport(handler)) as c:
+        sels = await c.fetch_integration_selections()
+    assert sels == []
+
+
+async def test_fetch_integration_selections_raises_on_definitive_4xx():
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, json={"error": {"code": "forbidden", "message": "nope"}})
+
+    async with _client(httpx.MockTransport(handler)) as c:
+        with pytest.raises(BrainError) as ei:
+            await c.fetch_integration_selections()
+    assert ei.value.status_code == 403

@@ -111,6 +111,26 @@ class BrainClient:
             raise BrainError(resp.status_code, *_error_fields(resp))
         raise BrainError(429, "rate_limited", f"gave up after {_MAX_RETRIES} retries")
 
+    async def fetch_integration_selections(self) -> list[dict]:
+        """GET /api/v1/integrations → the team's ENABLED integration selections
+        (non-secret: type, name, config). Returns [] on 404 (older brain). Same auth
+        headers as push(). Raises BrainError on a definitive 4xx (other than 404)."""
+        url = f"{self._base}/api/v1/integrations"
+        for attempt in range(_MAX_RETRIES):
+            await self._limiter.acquire()
+            resp = await self._client.get(url, headers=self._headers)
+            if resp.status_code == 200:
+                return resp.json().get("integrations", [])
+            if resp.status_code == 404:
+                # Brain too old / route absent — backward-compat: no selections.
+                return []
+            if resp.status_code == 429 or resp.status_code >= 500:
+                backoff = _retry_after(resp) or min(2**attempt, 30)
+                await asyncio.sleep(backoff)
+                continue
+            raise BrainError(resp.status_code, *_error_fields(resp))
+        raise BrainError(429, "rate_limited", f"gave up after {_MAX_RETRIES} retries")
+
     async def push_codebase_scan(self, payload: dict) -> dict:
         """POST one codebase scan (RAW metrics) to /api/v1/codebases. The brain computes
         scores, audits, and upserts idempotently. Same retry policy as push()."""

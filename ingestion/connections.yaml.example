@@ -1,5 +1,18 @@
 # Named source connections for `aios-ingest sync` and the webhook app.
 # Secrets use ${ENV_VAR} references, expanded at load time — never inline secrets here.
+#
+# Brain selections (opt-in):
+#   When you run `aios-ingest sync --use-brain-selections` (or set
+#   AIOS_BRAIN_SELECTIONS=1), the sidecar fetches the team's enabled integration
+#   selections from the brain (Admin → Integrations) and OVERLAYS their non-secret
+#   selection — slack channel ids, github repos, granola keywords — onto the matching
+#   local connection. Matching is by (source == brain type) AND (name == brain name).
+#   The brain rejects secret-like keys at write time, so secrets ALWAYS stay local:
+#   the token / signing_secret / webhook_secret / api_key you set below via ${ENV_VAR}
+#   are preserved verbatim and never overwritten by a brain selection.
+#
+#   With the flag OFF (the default), there is NO brain call and behavior is exactly as
+#   the entries below describe — local options are used unchanged.
 connections:
   - name: eng-handbook
     source: github
