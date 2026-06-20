@@ -15,10 +15,36 @@ from typing import Any
 
 import click
 
-from .brain_client import BrainClient
+from .brain_client import BrainClient, BrainError
 from .config import BrainSettings, Connection, load_connections
 from .engine import run_connection
+from .selections import merge_selections
 from .sources import available_sources
+
+_TRUTHY = {"1", "true", "yes"}
+
+
+def _selections_enabled(flag: bool) -> bool:
+    """Effective opt-in: the CLI flag OR a truthy ``AIOS_BRAIN_SELECTIONS`` env var.
+    Default (flag False, env unset) is False so behavior is unchanged."""
+    if flag:
+        return True
+    return os.environ.get("AIOS_BRAIN_SELECTIONS", "").strip().lower() in _TRUTHY
+
+
+async def _apply_brain_selections(
+    settings: BrainSettings, conns: list[Connection]
+) -> list[Connection]:
+    """Fetch the brain's enabled selections and overlay them onto local connections.
+    Resilient: on any brain error, log and fall back to the local connections so a
+    selection-fetch failure never crashes a sync."""
+    try:
+        async with BrainClient(settings.base_url, settings.api_key, settings.team) as client:
+            remote = await client.fetch_integration_selections()
+    except BrainError as e:
+        click.echo(f"warning: brain selection fetch failed ({e}); using local connections")
+        return conns
+    return merge_selections(conns, remote)
 
 
 def _parse_opts(pairs: tuple[str, ...]) -> dict[str, Any]:
@@ -74,17 +100,29 @@ def backfill(source, opts, project, access, actor, since) -> None:
 @main.command()
 @click.option("--config", "config_path", required=True, help="connections.yaml path")
 @click.option("--only", default=None, help="run only the named connection")
-def sync(config_path, only) -> None:
+@click.option(
+    "--use-brain-selections/--no-use-brain-selections",
+    "use_brain_selections",
+    default=False,
+    help="overlay the brain's Admin → Integrations selections onto local connections "
+    "by (source, name); secrets stay local. Also enabled by AIOS_BRAIN_SELECTIONS=1.",
+)
+def sync(config_path, only, use_brain_selections) -> None:
     """Run all configured connections (or one with --only)."""
     settings = BrainSettings.from_env()
     conns = load_connections(config_path)
-    if only:
-        conns = [c for c in conns if c.name == only]
-        if not conns:
-            raise click.ClickException(f"no connection named '{only}'")
 
     async def run_all() -> None:
-        for conn in conns:
+        nonlocal conns
+        if _selections_enabled(use_brain_selections):
+            conns = await _apply_brain_selections(settings, conns)
+        # Apply --only AFTER the merge so brain selections are honored first.
+        run_conns = conns
+        if only:
+            run_conns = [c for c in conns if c.name == only]
+            if not run_conns:
+                raise click.ClickException(f"no connection named '{only}'")
+        for conn in run_conns:
             summary = await run_connection(settings, conn)
             click.echo(str(summary))
 
