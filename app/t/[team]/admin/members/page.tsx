@@ -1,5 +1,6 @@
 import { serverClient } from "@/lib/supabase/server";
 import { InviteMember } from "@/components/admin/invite-member";
+import { MemberGithubLink } from "@/components/admin/member-github-link";
 
 export default async function MembersAdminPage({
   params,
@@ -18,7 +19,7 @@ export default async function MembersAdminPage({
 
   const { data: members } = await supabase
     .from("members")
-    .select("id, display_name, email, actor_handle, role, tier, status, created_at")
+    .select("id, display_name, email, actor_handle, role, tier, status, github_login, avatar_url, created_at")
     .eq("team_id", team.id)
     .order("created_at");
 
@@ -41,6 +42,7 @@ export default async function MembersAdminPage({
               <th className="px-4 py-3">Role</th>
               <th className="px-4 py-3">Tier</th>
               <th className="px-4 py-3">Status</th>
+              <th className="px-4 py-3">GitHub</th>
             </tr>
           </thead>
           <tbody>
@@ -59,6 +61,14 @@ export default async function MembersAdminPage({
                   <span className={`text-xs ${m.status === "active" ? "text-emerald-600" : m.status === "invited" ? "text-amber-600" : "text-ink-tertiary"}`}>
                     {m.status}
                   </span>
+                </td>
+                <td className="px-4 py-3">
+                  <MemberGithubLink
+                    teamSlug={teamSlug}
+                    memberId={m.id}
+                    githubLogin={m.github_login ?? null}
+                    avatarUrl={m.avatar_url ?? null}
+                  />
                 </td>
               </tr>
             ))}

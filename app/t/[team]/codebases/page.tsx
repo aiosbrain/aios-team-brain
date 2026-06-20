@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { notFound } from "next/navigation";
+import Link from "next/link";
 import { GitBranch } from "lucide-react";
 import { isPostgresBackend } from "@/lib/db/backend";
 import { serverClient } from "@/lib/supabase/server";
@@ -45,7 +46,15 @@ export default async function CodebasesPage({
             Health, coverage, and AI-transformation across the team&apos;s repos.
           </p>
         </div>
-        <RangeSelector value={range} />
+        <div className="flex items-center gap-2">
+          <Link
+            href={`/t/${teamSlug}/codebases/github`}
+            className="flex items-center gap-1.5 rounded-lg border border-border-default px-3 py-1.5 text-sm text-ink-secondary hover:text-ink"
+          >
+            <GitBranch className="size-4" /> GitHub scans
+          </Link>
+          <RangeSelector value={range} />
+        </div>
       </div>
 
       {codebases.length === 0 ? (

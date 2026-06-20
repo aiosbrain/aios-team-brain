@@ -172,6 +172,68 @@ function teamKpis(s: CodebaseSummary[], range: Range): Kpi[] {
   ];
 }
 
+// ── scan freshness (W1.3) ───────────────────────────────────────────────────────
+
+export interface CodebaseFreshness {
+  id: string;
+  slug: string;
+  full_name: string;
+  default_branch: string;
+  last_scan_at: string | null;
+  last_scanned_sha: string | null; // newest code_metrics.head_sha, null if never scanned
+}
+
+/**
+ * Per-codebase scan freshness for the Codebases → GitHub surface: the repo's full_name +
+ * default_branch, when it was last scanned, and the SHA that scan was taken at (the newest
+ * `code_metrics.head_sha`). The page compares `last_scanned_sha` to the live branch HEAD
+ * (`lib/codebases/github.fetchRepoHeadSha`) to show fresh/stale — there is NO server-triggered
+ * scan in Wave 1; the page documents the manual `aios-ingest scan` command. Tier-gated team-only
+ * like the rest of codebase analytics (sole enforcement on postgres, no RLS).
+ */
+export async function getCodebaseFreshness(
+  supabase: SupabaseClient,
+  teamId: string,
+  tier: ViewerTier
+): Promise<CodebaseFreshness[]> {
+  if (!canSeeCodebases(tier)) return [];
+
+  const { data: cbData } = await supabase
+    .from("codebases")
+    .select("id, slug, full_name, default_branch, last_scan_at")
+    .eq("team_id", teamId)
+    .order("full_name", { ascending: true });
+  const codebases = (cbData ?? []) as {
+    id: string;
+    slug: string;
+    full_name: string;
+    default_branch: string;
+    last_scan_at: string | null;
+  }[];
+  if (codebases.length === 0) return [];
+
+  // Newest head_sha per codebase (rows arrive newest-first; first seen wins).
+  const { data: mData } = await supabase
+    .from("code_metrics")
+    .select("codebase_id, head_sha, scanned_at")
+    .eq("team_id", teamId)
+    .order("scanned_at", { ascending: false })
+    .limit(10_000);
+  const latestSha = new Map<string, string>();
+  for (const m of (mData ?? []) as { codebase_id: string; head_sha: string }[]) {
+    if (!latestSha.has(m.codebase_id)) latestSha.set(m.codebase_id, m.head_sha);
+  }
+
+  return codebases.map((cb) => ({
+    id: cb.id,
+    slug: cb.slug,
+    full_name: cb.full_name,
+    default_branch: cb.default_branch,
+    last_scan_at: cb.last_scan_at,
+    last_scanned_sha: latestSha.get(cb.id) ?? null,
+  }));
+}
+
 // ── detail ────────────────────────────────────────────────────────────────────
 
 export interface AgenticBreakdown {

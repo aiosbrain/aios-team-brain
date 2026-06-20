@@ -41,6 +41,31 @@ export async function fetchGithubUser(login: string, token: string): Promise<Git
   return u;
 }
 
+/**
+ * Current HEAD commit SHA of a repo's branch (default `main`) via the GitHub API. Used by the
+ * Codebases → GitHub freshness panel to compare a codebase's last-scanned SHA against the live
+ * tip. `fullName` is "owner/repo". Token from GITHUB_TOKEN env, never logged. Throws on a bad
+ * full_name or a non-2xx response — the caller decides whether to degrade to "unknown".
+ */
+export async function fetchRepoHeadSha(
+  fullName: string,
+  token: string,
+  ref = "main"
+): Promise<string> {
+  const [owner, repo, ...rest] = fullName.split("/");
+  if (!owner || !repo || rest.length) {
+    throw new Error(`invalid repo full_name "${fullName}" (expected owner/repo)`);
+  }
+  const r = await fetch(
+    `${GH}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/commits/${encodeURIComponent(ref)}`,
+    { headers: ghHeaders(token) }
+  );
+  if (!r.ok) throw new Error(`GitHub /repos/${fullName}/commits/${ref} → ${r.status}`);
+  const body = (await r.json()) as { sha?: string };
+  if (!body.sha) throw new Error(`GitHub /repos/${fullName}/commits/${ref} → no sha in response`);
+  return body.sha;
+}
+
 /** Candidate org members (login/id/avatar) for the admin to confirm against members. */
 export async function listOrgMembers(
   org: string,
