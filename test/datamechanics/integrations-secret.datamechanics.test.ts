@@ -34,7 +34,7 @@ describe("integrations secret (real Postgres)", () => {
     expect(raw!.secret_ciphertext).not.toContain(token);
 
     // Admin metadata list: hasSecret true, never the value.
-    const list = await listIntegrations(db(), seed.teamId);
+    const list = await listIntegrations(db(), seed.teamId, { role: "admin" });
     expect(list[0].hasSecret).toBe(true);
     expect(JSON.stringify(list)).not.toContain(token);
 

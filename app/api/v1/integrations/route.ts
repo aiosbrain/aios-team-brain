@@ -4,7 +4,7 @@ import { authenticateApiKey } from "@/lib/api/auth";
 import { rateLimit } from "@/lib/api/rate-limit";
 import { errorResponse } from "@/lib/api/schemas";
 import { audit } from "@/lib/api/audit";
-import { listEnabledIntegrationSelections } from "@/lib/integrations/read";
+import { listEnabledIntegrationSelections } from "@/lib/integrations/manage";
 
 export const runtime = "nodejs";
 

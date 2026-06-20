@@ -1,10 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { loginByEmail } from "@/lib/auth/pg-login";
-import { upsertIntegration, setIntegrationSecret } from "@/lib/integrations/manage";
 import {
-  resolveIntegrationsAdmin,
+  upsertIntegration,
+  setIntegrationSecret,
   listEnabledIntegrationSelections,
-} from "@/lib/integrations/read";
+} from "@/lib/integrations/manage";
+import { resolveIntegrationsAdmin } from "@/lib/integrations/read";
 import { db, seedTeam } from "./helpers";
 
 // F3.4 — spec-first, verified to the observable outcome on real Postgres.

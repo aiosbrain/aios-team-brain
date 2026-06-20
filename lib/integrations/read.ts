@@ -1,12 +1,24 @@
 import "server-only";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import type { IntegrationType } from "@/lib/api/schemas";
+import { canManageIntegrations } from "@/lib/integrations/visibility";
 
 /**
- * Integration reads for UI/admin surfaces. METADATA only — never the secret value (only
- * `hasSecret`). Team-scoped; callers (admin pages/actions) gate on role. The privileged
- * decrypt read used by the sidecar lives in manage.ts (getEnabledIntegrationsWithSecrets).
+ * DASHBOARD integration reads — METADATA only (never the secret value, only `hasSecret`).
+ * Team-scoped AND admin-gated: every helper here that reads the `integrations` table routes
+ * through `canManageIntegrations(viewer.role)`, because integrations are admin-tier and there is
+ * no RLS backstop on the postgres target (CLAUDE.md §5). The integrations-tier-filter guard
+ * enforces that routing; the data-mechanics tier test proves the outcome.
+ *
+ * Other boundaries live elsewhere on purpose: the privileged decrypt read used by the in-process
+ * runner and the API-key selection read both live in manage.ts (gated by the connector key at the
+ * route, not a dashboard role); writes are gated by `resolveIntegrationsAdmin` (below).
  */
+
+/** A viewer of the dashboard integrations surface. `role` is the member's role on the team. */
+export interface IntegrationsViewer {
+  role: string | null | undefined;
+}
 
 export interface IntegrationMeta {
   id: string;
@@ -20,8 +32,11 @@ export interface IntegrationMeta {
 
 export async function listIntegrations(
   supabase: SupabaseClient,
-  teamId: string
+  teamId: string,
+  viewer: IntegrationsViewer
 ): Promise<IntegrationMeta[]> {
+  // Admin-tier surface, no RLS on postgres → this app-code gate is the sole enforcement.
+  if (!canManageIntegrations(viewer.role)) return [];
   const { data, error } = await supabase
     .from("integrations")
     .select("id, type, name, config, status, secret_ciphertext, created_at")
@@ -64,41 +79,4 @@ export async function resolveIntegrationsAdmin(
     .maybeSingle();
   if (!me || me.role !== "admin") return null;
   return { teamId: team.id as string, memberId: me.id as string };
-}
-
-/** A team's enabled integration selection — NON-SECRET fields only. */
-export interface IntegrationSelection {
-  id: string;
-  type: IntegrationType;
-  name: string;
-  config: Record<string, unknown>;
-  status: "enabled";
-}
-
-/**
- * The API read path for `GET /api/v1/integrations`: a team's ENABLED integrations as
- * NON-SECRET selections (type + name + config). It deliberately never selects, decrypts, or
- * returns `secret_ciphertext` — the connector secret never crosses this HTTP boundary, even to
- * an authenticated connector key. (The in-process Slack runner reads decrypted secrets directly
- * via `manage.getEnabledIntegrationsWithSecrets`, never over HTTP.) Team-scoped: only the
- * caller's `teamId` is returned.
- */
-export async function listEnabledIntegrationSelections(
-  supabase: SupabaseClient,
-  teamId: string
-): Promise<IntegrationSelection[]> {
-  const { data, error } = await supabase
-    .from("integrations")
-    .select("id, type, name, config, status") // NOTE: no secret_ciphertext — by design
-    .eq("team_id", teamId)
-    .eq("status", "enabled")
-    .order("created_at", { ascending: true });
-  if (error) throw new Error(`list integration selections failed: ${error.message}`);
-  return (data ?? []).map((r) => ({
-    id: r.id as string,
-    type: r.type as IntegrationType,
-    name: r.name as string,
-    config: (r.config as Record<string, unknown>) ?? {},
-    status: "enabled" as const,
-  }));
 }
