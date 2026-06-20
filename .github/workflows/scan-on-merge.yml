@@ -1,0 +1,50 @@
+name: scan-on-merge
+
+# Keep the codebase's agent-readiness fresh: on every merge to main, scan this repo with the
+# ingestion scanner and push the result (full raw metrics + readiness) to the Team Brain.
+# The scan is read-only against the repo and idempotent on the brain (keyed by head_sha).
+#
+# Required repo secrets (until set, the job logs "skipping" and exits 0 — never red):
+#   BRAIN_URL     — e.g. https://aios-team-brain-production.up.railway.app
+#   AIOS_TEAM     — team slug (e.g. aios)
+#   AIOS_API_KEY  — a TEAM-TIER api key (codebase scans are team-tier; keep it least-privilege)
+# GITHUB_TOKEN is the built-in token (read access to this repo for stars/issues metadata).
+
+on:
+  push:
+    branches: [main]
+
+# One scan at a time; newer pushes supersede in-flight ones.
+concurrency:
+  group: scan-on-merge
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    name: codebase readiness scan → brain
+    runs-on: ubuntu-latest
+    if: github.repository == 'AIOS-alpha/aios-team-brain'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history — the scanner reads the commit window
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install the ingestion scanner
+        run: pip install -e ingestion
+
+      - name: Scan this repo into the brain
+        env:
+          BRAIN_URL: ${{ secrets.BRAIN_URL }}
+          AIOS_TEAM: ${{ secrets.AIOS_TEAM }}
+          AIOS_API_KEY: ${{ secrets.AIOS_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -z "$AIOS_API_KEY" ] || [ -z "$BRAIN_URL" ] || [ -z "$AIOS_TEAM" ]; then
+            echo "scan secrets not configured (BRAIN_URL/AIOS_TEAM/AIOS_API_KEY) — skipping."
+            exit 0
+          fi
+          aios-ingest scan --path . --slug aios-team-brain --full-name "$GITHUB_REPOSITORY"
