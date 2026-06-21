@@ -5,9 +5,10 @@ name: scan-on-merge
 # The scan is read-only against the repo and idempotent on the brain (keyed by head_sha).
 #
 # Required repo secrets (until set, the job logs "skipping" and exits 0 — never red):
-#   BRAIN_URL     — e.g. https://aios-team-brain-production.up.railway.app
-#   AIOS_TEAM     — team slug (e.g. aios)
-#   AIOS_API_KEY  — a TEAM-TIER api key (codebase scans are team-tier; keep it least-privilege)
+#   AIOS_BRAIN_URL — e.g. https://aios-team-brain-production.up.railway.app
+#   AIOS_TEAM      — team slug (e.g. aios)
+#   AIOS_API_KEY   — a TEAM-TIER api key (codebase scans are team-tier; keep it least-privilege)
+# (These already exist for the aios-work-sync workflow; the scanner reads BRAIN_URL, mapped below.)
 # GITHUB_TOKEN is the built-in token (read access to this repo for stars/issues metadata).
 
 on:
@@ -38,7 +39,7 @@ jobs:
 
       - name: Scan this repo into the brain
         env:
-          BRAIN_URL: ${{ secrets.BRAIN_URL }}
+          BRAIN_URL: ${{ secrets.AIOS_BRAIN_URL }}
           AIOS_TEAM: ${{ secrets.AIOS_TEAM }}
           AIOS_API_KEY: ${{ secrets.AIOS_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
