@@ -49,7 +49,7 @@ export async function seedTeam(): Promise<Seed> {
 export async function ingest(
   seed: Seed,
   over: Partial<ItemPayload> & { body: string; path: string; access: "team" | "external" }
-): Promise<{ status: string; id: string }> {
+): Promise<{ status: string; id: string; projectId?: string; changedTaskRowKeys?: string[] }> {
   const payload: ItemPayload = {
     project: "acme",
     kind: "deliverable",

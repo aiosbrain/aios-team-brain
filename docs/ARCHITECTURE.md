@@ -188,6 +188,18 @@ the work-events done path calls `projectTask` (creating the link/item if missing
 remains as a thin state-only delegate. Assignees and inbound/two-way reconciliation are deferred
 (Phase 5 uses `provider_seen_status` to detect divergence).
 
+**Reactive triggers (brain-api v1.2 Phase 2).** Projection is no longer manual-only. Task UI
+writes — `createTaskAction` / `moveTaskAction` / the new `updateTaskAction` (title/sprint/due/
+parent/labels/priority/body) — schedule a single-row `projectTask` via `next/server`'s `after()`
+(`lib/pm-sync/after-write.ts: projectTaskByIdAfterWrite`). Sync **pushes** (`POST /api/v1/items`,
+task kind) schedule `projectChangedTasksAfterWrite` for **only the rows whose projected fields
+changed this push** — `lib/ingest` computes the changed set by diffing the projectable columns
+(title/status/sprint/priority/labels/parent — not assignee/due/body) against a pre-upsert snapshot
+(`lib/ingest/projectable-diff.ts`), so an unchanged backlog never re-projects. These callbacks run
+**after** the response and **never fail** the originating action/push — on error they only record
+`task_pm_links.last_error`; the `projection_fingerprint` skip keeps them from re-writing the board.
+The manual `projectBoardAction` and the inline work-events projection remain.
+
 **Legacy seed scripts (being retired).** The backlog was originally authored in
 `scripts/aios-backlog.mjs` and pushed by `npm run plane:backlog` / `npm run linear:backlog`
 (idempotent by `external_id` / the `aios-ext:` marker). The projection engine supersedes these;
@@ -294,11 +306,16 @@ guard enforces it, it's named.
 - **Append-only audit.** `audit_log` has a trigger that blocks UPDATE/DELETE.
 - **The brain is the source of truth; the PM board is a one-way projection.** The `tasks` table is
   canonical (v1.2: hierarchy + `body`). The brain projects task create/update/state into the single
-  `teams.primary_pm_provider` board (Plane/Linear) — never the reverse in v1. A merged-work event
-  still marks the matching task done first; provider failures are recorded on
-  `task_pm_links.last_error` and surfaced in Admin → PM sync, never rolling the task back. Inbound
-  PM→brain reconciliation (two-way) is deferred (Phase 5); v1 only records `provider_seen_status` so
-  divergence is detectable.
+  `teams.primary_pm_provider` board (Plane/Linear) — never the reverse in v1. Projection fires both
+  **manually** (admin "Project board now") and **reactively** (v1.2 Phase 2): task UI writes
+  (`create`/`move`/`updateTaskAction`) and changed-row pushes (`POST /api/v1/items`) schedule it via
+  `after()` — bounded to the rows whose projected fields changed, run after the response, and never
+  failing the user action (errors → `task_pm_links.last_error` only; `projection_fingerprint` skips
+  redundant writes). A merged-work event still marks the matching task done first; provider failures
+  are surfaced in Admin → PM sync, never rolling the task back. Inbound PM→brain reconciliation
+  (two-way) is deferred (Phase 5); v1 only records `provider_seen_status` so divergence is detectable.
+  (Rows removed from a push are diff-deleted in `tasks` but **not** deleted from the PM board in
+  Phase 2 — PM deletion-on-diff is a later phase.)
 - **`key_hash` is column-revoked** from client roles; API secrets are sha256-at-rest, shown once.
 - **Migration replay.** 14-digit timestamp prefixes, unique, lexical == chronological.
   *Guards:* `test/guards/migrations-numbering.test.ts` + `npm run db:test:up` (migrates from zero).

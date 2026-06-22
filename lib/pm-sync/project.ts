@@ -131,6 +131,11 @@ function toProjectable(row: ProjectionTaskRow, parentResourceId: string | null):
 const LINK_COLS =
   "id, team_id, project_id, task_id, row_key, provider, provider_resource_id, provider_external_source, provider_external_id, provider_url, projection_fingerprint, last_projected_status, provider_seen_status";
 
+// The exact `tasks` columns that hydrate a ProjectionTaskRow. Named explicitly (the pg adapter
+// rejects "*") and shared by every loader so the projected shape can't drift between call sites.
+export const PROJECTION_TASK_COLS =
+  "id, team_id, project_id, row_key, title, status, sprint, priority, labels, body, parent_row_key";
+
 // Get-or-create the task_pm_links row for (team, project, row_key, provider).
 async function ensureLink(
   supabase: SupabaseClient,
@@ -201,7 +206,7 @@ async function loadTaskByRowKey(
 ): Promise<ProjectionTaskRow | null> {
   const { data } = await supabase
     .from("tasks")
-    .select("id, team_id, project_id, row_key, title, status, sprint, priority, labels, body, parent_row_key")
+    .select(PROJECTION_TASK_COLS)
     .eq("team_id", teamId)
     .eq("project_id", projectId)
     .eq("row_key", rowKey)
@@ -291,7 +296,7 @@ export async function projectTask(
 
 // Order rows parent-before-child (epics first). Rows whose parent is missing/cyclic are still
 // emitted (projectTask reports the failure) so the batch never silently drops them.
-function topoOrder(rows: ProjectionTaskRow[]): ProjectionTaskRow[] {
+export function topoOrder(rows: ProjectionTaskRow[]): ProjectionTaskRow[] {
   const byKey = new Map(rows.map((r) => [r.row_key, r]));
   const ordered: ProjectionTaskRow[] = [];
   const placed = new Set<string>();
@@ -317,28 +322,17 @@ export interface ProjectAllOptions {
   throttleMs?: number;
 }
 
-// Server-side replacement for `npm run plane:backlog` / `linear:backlog`: project the whole board
-// for a (team, project). ~80 rows × 1 provider ≈ ~90s with the throttle. Continues on per-row
-// failure and returns a per-row report.
-export async function projectAllTasks(
+// Shared batch projector: prefetch the provider bootstrap ONCE (labels/states/items), then project
+// the rows parent-before-child sharing a single `resolved` map, paying the ~1 req/s throttle only on
+// rows that actually wrote. Both `projectAllTasks` (whole board) and the reactive changed-rows path
+// reuse this so the prepare/order/throttle semantics can't drift apart.
+export async function projectRows(
   supabase: SupabaseClient,
-  teamId: string,
-  projectId: string,
+  primary: ResolvedPrimary,
+  rows: ProjectionTaskRow[],
   opts: ProjectAllOptions = {}
-): Promise<{ provider: PmProvider | null; reports: ProjectionReport[]; reason?: string }> {
-  const primary = await resolvePrimaryProvider(supabase, teamId);
-  if (primary.provider === null || primary.integration === null) {
-    return { provider: primary.provider, reports: [], reason: primary.reason };
-  }
-
-  const { data: taskRows } = await supabase
-    .from("tasks")
-    .select("id, team_id, project_id, row_key, title, status, sprint, priority, labels, body, parent_row_key")
-    .eq("team_id", teamId)
-    .eq("project_id", projectId)
-    .not("row_key", "is", null);
-  const rows = ((taskRows ?? []) as ProjectionTaskRow[]).filter((r) => r.row_key);
-  if (!rows.length) return { provider: primary.provider, reports: [] };
+): Promise<ProjectionReport[]> {
+  if (!rows.length) return [];
 
   // Prefetch once: ensure all labels exist + cache states/items/issues for the run.
   const allLabels = Array.from(new Set(rows.flatMap((r) => r.labels ?? []).filter(Boolean)));
@@ -363,5 +357,32 @@ export async function projectAllTasks(
     // Only pay the throttle when we actually wrote to the provider.
     if (report.status === "synced") await sleep(throttleMs);
   }
+  return reports;
+}
+
+// Server-side replacement for `npm run plane:backlog` / `linear:backlog`: project the whole board
+// for a (team, project). ~80 rows × 1 provider ≈ ~90s with the throttle. Continues on per-row
+// failure and returns a per-row report.
+export async function projectAllTasks(
+  supabase: SupabaseClient,
+  teamId: string,
+  projectId: string,
+  opts: ProjectAllOptions = {}
+): Promise<{ provider: PmProvider | null; reports: ProjectionReport[]; reason?: string }> {
+  const primary = await resolvePrimaryProvider(supabase, teamId);
+  if (primary.provider === null || primary.integration === null) {
+    return { provider: primary.provider, reports: [], reason: primary.reason };
+  }
+
+  const { data: taskRows } = await supabase
+    .from("tasks")
+    .select(PROJECTION_TASK_COLS)
+    .eq("team_id", teamId)
+    .eq("project_id", projectId)
+    .not("row_key", "is", null);
+  const rows = ((taskRows ?? []) as ProjectionTaskRow[]).filter((r) => r.row_key);
+  if (!rows.length) return { provider: primary.provider, reports: [] };
+
+  const reports = await projectRows(supabase, primary, rows, opts);
   return { provider: primary.provider, reports };
 }
