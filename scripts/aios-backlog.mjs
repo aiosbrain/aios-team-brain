@@ -7,7 +7,7 @@
  *
  * Consumed by:
  *   - scripts/plane-backlog.mjs   → seeds Plane (epics + sub-issues + Wave modules)
- *   - scripts/linear-backlog.mjs  → mirrors into Linear (Wave projects + parent/sub issues)
+ *   - scripts/linear-backlog.mjs  → mirrors into Linear (Wave views + parent/sub issues)
  *
  * Keep this file data-only so both seeds stay in lock-step — edit the backlog here once.
  */

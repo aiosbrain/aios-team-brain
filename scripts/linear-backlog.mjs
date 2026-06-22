@@ -2,19 +2,21 @@
 /**
  * Idempotent mirror of the AIOS remaining-work backlog into Linear.
  *
- * Linear-native mapping (decided with John): each Wave becomes a Linear PROJECT, each epic
- * becomes a parent ISSUE inside its wave's project, and each chunk becomes a SUB-ISSUE.
+ * Linear-native mapping (decided with John): each Wave becomes a team CUSTOM VIEW (filtered by
+ * the wave label), each epic becomes a parent ISSUE, and each chunk becomes a SUB-ISSUE.
  * The backlog data is shared verbatim with scripts/plane-backlog.mjs via scripts/aios-backlog.mjs,
  * so the Plane board and the Linear board stay in lock-step.
  *
- *   Wave 1 — MVP    →  Linear project "AIOS — Wave 1 (MVP)"
- *   Wave 2 — Later  →  Linear project "AIOS — Wave 2 (Later)"
+ *   Wave 1 — MVP    →  custom view "AIOS — Wave 1 (MVP)" (label wave-1)
+ *   Wave 2 — Later  →  custom view "AIOS — Wave 2 (Later)" (label wave-2)
  *     epic  P0      →  parent issue  "P0 — Plane integration (MCP + seed)"
  *       chunk P0.1  →  sub-issue     "Register official Plane MCP server"
  *
  * Idempotency: Linear has no Plane-style external_id, so each created issue carries a stable
  * footer marker `aios-ext: <ext>` in its description (ext = P0, P0.1, …). Re-runs read that
  * marker off existing issues and skip anything already present — safe to run repeatedly.
+ * Re-runs do not update titles, descriptions, labels, or parent links when the backlog changes;
+ * edit issues in Linear/Plane or delete and re-seed if you need a full refresh.
  *
  * Auth/config from env (read at runtime — never hard-coded):
  *   LINEAR_API_KEY  (required)  → header Authorization: <raw personal key>  (NOT a Bearer token)
@@ -31,7 +33,8 @@
  *   npx --yes @dotenvx/dotenvx run -f ../aios-workspace/.env -- node scripts/linear-backlog.mjs
  *   # or: npm run linear:backlog
  *
- * Flags: --dry-run (no writes; print plan)   --verbose   --team <key>
+ * Flags: --dry-run (no writes; print plan; with --sync-status, plan state changes only)
+ *        --verbose   --team <key>
  *        --sync-status (after seeding, set each Linear issue's state from its Plane counterpart)
  */
 
@@ -47,18 +50,26 @@ const SYNC_STATUS = process.argv.includes("--sync-status");
 const teamFlagIdx = process.argv.indexOf("--team");
 const TEAM_WANT = (teamFlagIdx !== -1 ? process.argv[teamFlagIdx + 1] : process.env.LINEAR_TEAM || "").trim();
 
-// Wave module → Linear project name.
-const PROJECT_NAME = {
+// Wave → saved view name + filter label (issues already carry wave-1 / wave-2 labels).
+const VIEW_NAME = {
   [WAVE1]: "AIOS — Wave 1 (MVP)",
   [WAVE2]: "AIOS — Wave 2 (Later)",
+};
+const WAVE_LABEL = {
+  [WAVE1]: "wave-1",
+  [WAVE2]: "wave-2",
 };
 
 // Stable per-issue idempotency marker, embedded in the issue description.
 const EXT_SOURCE = "aios-backlog";
 const extMarker = (ext) => `aios-ext: ${ext} · source: ${EXT_SOURCE}`;
-const EXT_RE = /aios-ext:\s*([A-Za-z0-9._-]+)/;
+const EXT_RE = /aios-ext:\s*([A-Za-z0-9._-]+)\s*[·•]\s*source:\s*aios-backlog\b/;
+const parseExt = (description) => {
+  const m = String(description || "").match(EXT_RE);
+  return m ? m[1] : null;
+};
 
-if (!API_KEY && !DRY) {
+if (!API_KEY && (!DRY || SYNC_STATUS)) {
   console.error("LINEAR_API_KEY is not set. Run via: npx @dotenvx/dotenvx run -f ../aios-workspace/.env -- node scripts/linear-backlog.mjs");
   process.exit(1);
 }
@@ -84,8 +95,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ── GraphQL transport: light throttle + 429 backoff ───────────────────────────
 const MIN_INTERVAL = 150; // ms between requests; Linear allows ~1500 req/hr for personal keys
+const MAX_429_RETRIES = 8;
 let lastReq = 0;
-async function gql(query, variables, attempt = 0) {
+async function gql(query, variables, attempt = 0, rateLimitAttempt = 0) {
   const now = Date.now();
   const wait = Math.max(0, MIN_INTERVAL - (now - lastReq));
   if (wait) await sleep(wait);
@@ -99,20 +111,21 @@ async function gql(query, variables, attempt = 0) {
     });
   } catch (err) {
     // network blip — retry a few times before giving up
-    if (attempt < 4) { console.warn(`  network error (${err.message}); retry ${attempt + 1}/4`); await sleep(1000 * (attempt + 1)); return gql(query, variables, attempt + 1); }
+    if (attempt < 4) { console.warn(`  network error (${err.message}); retry ${attempt + 1}/4`); await sleep(1000 * (attempt + 1)); return gql(query, variables, attempt + 1, rateLimitAttempt); }
     throw err;
   }
   if (res.status === 429) {
+    if (rateLimitAttempt >= MAX_429_RETRIES) throw new Error(`Linear rate-limited after ${MAX_429_RETRIES} retries`);
     const retry = Number(res.headers.get("Retry-After") || 5) * 1000;
-    console.warn(`  rate-limited; backing off ${retry}ms`);
+    console.warn(`  rate-limited; backing off ${retry}ms (${rateLimitAttempt + 1}/${MAX_429_RETRIES})`);
     await sleep(retry);
-    return gql(query, variables, attempt);
+    return gql(query, variables, attempt, rateLimitAttempt + 1);
   }
   if (res.status >= 500 && attempt < 4) {
     // transient Linear gateway error (502/503/504) — back off and retry
     console.warn(`  Linear HTTP ${res.status}; retry ${attempt + 1}/4`);
     await sleep(1000 * (attempt + 1));
-    return gql(query, variables, attempt + 1);
+    return gql(query, variables, attempt + 1, rateLimitAttempt);
   }
   const json = await res.json().catch(() => null);
   if (!res.ok || !json || json.errors) {
@@ -138,18 +151,23 @@ async function resolveTeam() {
   throw new Error(`Multiple Linear teams — set LINEAR_TEAM (or --team) to one of: ${teams.map((t) => `${t.key} (${t.name})`).join(", ")}`);
 }
 
-async function teamProjects(teamId) {
-  const data = await gql(`query($id: String!) { team(id: $id) { projects(first: 250) { nodes { id name } } } }`, { id: teamId });
-  return data.team.projects.nodes;
+async function teamCustomViews(teamId) {
+  const data = await gql(`query { customViews(first: 250) { nodes { id name team { id } } } }`);
+  return data.customViews.nodes.filter((v) => v.team?.id === teamId);
 }
 
-async function createProject(teamId, name) {
+async function createCustomView(teamId, name, labelName) {
   const data = await gql(
-    `mutation($input: ProjectCreateInput!) { projectCreate(input: $input) { success project { id name } } }`,
-    { input: { name, teamIds: [teamId], description: `Mirror of the AIOS ${name.includes("Wave 1") ? WAVE1 : WAVE2} backlog (see Plane workspace aios-alpha / project AIOS).` }
-  });
-  if (!data.projectCreate.success) throw new Error(`projectCreate failed for ${name}`);
-  return data.projectCreate.project;
+    `mutation($input: CustomViewCreateInput!) { customViewCreate(input: $input) { success customView { id name } } }`,
+    { input: {
+      name,
+      teamId,
+      filterData: { labels: { name: { eq: labelName } } },
+      description: `AIOS backlog mirror — issues labeled ${labelName} (see Plane workspace aios-alpha / project AIOS).`,
+    } }
+  );
+  if (!data.customViewCreate.success) throw new Error(`customViewCreate failed for ${name}`);
+  return data.customViewCreate.customView;
 }
 
 async function teamLabels(teamId) {
@@ -184,8 +202,8 @@ async function existingByExt(teamId) {
     );
     const conn = data.team.issues;
     for (const node of conn.nodes) {
-      const m = (node.description || "").match(EXT_RE);
-      if (m) byExt.set(m[1], node.id);
+      const ext = parseExt(node.description);
+      if (ext) byExt.set(ext, node.id);
     }
     if (!conn.pageInfo.hasNextPage) break;
     after = conn.pageInfo.endCursor;
@@ -193,11 +211,10 @@ async function existingByExt(teamId) {
   return byExt;
 }
 
-async function createIssue({ teamId, title, description, priority, labelIds, projectId, parentId }) {
+async function createIssue({ teamId, title, description, priority, labelIds, parentId }) {
   const input = { teamId, title, description };
   if (priority) input.priority = priority;
   if (labelIds?.length) input.labelIds = labelIds;
-  if (projectId) input.projectId = projectId;
   if (parentId) input.parentId = parentId;
   const data = await gql(
     `mutation($input: IssueCreateInput!) { issueCreate(input: $input) { success issue { id identifier } } }`,
@@ -258,7 +275,7 @@ async function planeExtGroups() {
   return byExt;
 }
 
-async function reconcileStatus(teamId) {
+async function reconcileStatus(teamId, { dryRun = false } = {}) {
   // Linear workflow states for the team.
   const sData = await gql(`query($id: String!) { team(id: $id) { states(first: 50) { nodes { id name type } } } }`, { id: teamId });
   const states = sData.team.states.nodes;
@@ -279,8 +296,8 @@ async function reconcileStatus(teamId) {
     );
     const conn = d.team.issues;
     for (const n of conn.nodes) {
-      const m = (n.description || "").match(EXT_RE);
-      if (m) current.set(m[1], { id: n.id, stateId: n.state?.id || null });
+      const ext = parseExt(n.description);
+      if (ext) current.set(ext, { id: n.id, stateId: n.state?.id || null });
     }
     if (!conn.pageInfo.hasNextPage) break;
     after = conn.pageInfo.endCursor;
@@ -294,25 +311,37 @@ async function reconcileStatus(teamId) {
     matched++;
     const target = stateForGroup(group);
     if (!target || target === issue.stateId) continue;
-    await setIssueState(issue.id, target);
     changed++;
+    if (dryRun) {
+      if (VERBOSE) console.log(`would  ${ext} → ${GROUP_PREFERRED[group]} (${group})`);
+      continue;
+    }
+    await setIssueState(issue.id, target);
     if (VERBOSE) console.log(`state  ${ext} → ${GROUP_PREFERRED[group]} (${group})`);
   }
-  console.log(`Status sync: ${changed} updated · ${matched - changed} already correct · ${missing} Plane item(s) not in Linear (e.g. pre-backlog history).`);
+  const prefix = dryRun ? "Status sync (dry-run)" : "Status sync";
+  console.log(`${prefix}: ${changed} ${dryRun ? "would update" : "updated"} · ${matched - changed} already correct · ${missing} Plane item(s) not in Linear (e.g. pre-backlog history).`);
 }
 
 // ── plan / run ────────────────────────────────────────────────────────────────
 async function main() {
   const totalItems = BACKLOG.length + BACKLOG.reduce((n, e) => n + e.subs.length, 0);
 
-  if (DRY) {
+  if (DRY && !SYNC_STATUS) {
     console.log(`Linear mirror plan (--dry-run): ${BACKLOG.length} epics + ${totalItems - BACKLOG.length} sub-issues = ${totalItems} issues`);
-    console.log(`Projects: "${PROJECT_NAME[WAVE1]}", "${PROJECT_NAME[WAVE2]}"  ·  team: ${TEAM_WANT || "(auto / single team)"}\n`);
+    console.log(`Views: "${VIEW_NAME[WAVE1]}" (${WAVE_LABEL[WAVE1]}), "${VIEW_NAME[WAVE2]}" (${WAVE_LABEL[WAVE2]})  ·  team: ${TEAM_WANT || "(auto / single team)"}\n`);
     for (const e of BACKLOG) {
-      console.log(`◆ [${PROJECT_NAME[e.wave]}] (${e.priority})  ${e.name}`);
+      console.log(`◆ [${VIEW_NAME[e.wave]}] (${e.priority})  ${e.name}`);
       for (const s of e.subs) console.log(`   └─ ${s.ext}  ${s.name}`);
     }
     console.log("\n--dry-run: no writes performed. Set LINEAR_API_KEY + LINEAR_TEAM and re-run without --dry-run.");
+    return;
+  }
+
+  if (DRY && SYNC_STATUS) {
+    const team = await resolveTeam();
+    console.log(`Team: ${team.name} (${team.key}) ${team.id}\n`);
+    await reconcileStatus(team.id, { dryRun: true });
     return;
   }
 
@@ -320,19 +349,15 @@ async function main() {
   const team = await resolveTeam();
   console.log(`Team: ${team.name} (${team.key}) ${team.id}`);
 
-  // 2. ensure wave projects
-  const existingProjects = await teamProjects(team.id);
-  const projectId = new Map(existingProjects.map((p) => [p.name, p.id]));
-  const waveProject = new Map();
+  // 2. ensure wave views (label-filtered saved views, not projects)
+  const existingViews = await teamCustomViews(team.id);
+  const viewId = new Map(existingViews.map((v) => [v.name, v.id]));
   for (const wave of [WAVE1, WAVE2]) {
-    const name = PROJECT_NAME[wave];
-    let id = projectId.get(name);
-    if (!id) {
-      const created = await createProject(team.id, name);
-      id = created.id;
-      console.log(`project + ${name}`);
-    }
-    waveProject.set(wave, id);
+    const name = VIEW_NAME[wave];
+    if (viewId.has(name)) continue;
+    const created = await createCustomView(team.id, name, WAVE_LABEL[wave]);
+    viewId.set(name, created.id);
+    console.log(`view + ${name} (label ${WAVE_LABEL[wave]})`);
   }
 
   // 3. ensure labels
@@ -362,7 +387,6 @@ async function main() {
       description: bodyFor(desc, ext),
       priority: mapPriority(priority),
       labelIds: (labels || []).map((n) => labelId.get(n)).filter(Boolean),
-      projectId: waveProject.get(wave),
       parentId,
     });
     byExt.set(ext, issue.id);

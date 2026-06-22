@@ -175,9 +175,9 @@ done — PM drift is visible, not allowed to roll back completed code work.
 authored once in `scripts/aios-backlog.mjs` (the single source of truth) and
 projected into each PM tool by a seed script that shares that data:
 `npm run plane:backlog` (Plane: epics + sub-issues + Wave modules, idempotent by
-`external_id`) and `npm run linear:backlog` (Linear-native: a Project per Wave,
-epics as parent issues, chunks as sub-issues, idempotent by an `aios-ext:` marker
-in each issue description). `npm run linear:backlog -- --sync-status` additionally
+`external_id`) and `npm run linear:backlog` (Linear-native: a saved View per Wave
+filtered by the wave label, epics as parent issues, chunks as sub-issues, idempotent
+by an `aios-ext:` + `source: aios-backlog` marker in each issue description). `npm run linear:backlog -- --sync-status` additionally
 reconciles each Linear issue's workflow state from its Plane counterpart (matched by
 the shared ext key, mapped by state group) so "done in Plane" shows as "done in
 Linear". Both read `LINEAR_API_KEY`/`PLANE_API_KEY` (+ optional `LINEAR_TEAM`) from
