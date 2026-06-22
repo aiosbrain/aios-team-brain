@@ -18,9 +18,11 @@
  *
  * Auth/config from env (read at runtime — never hard-coded):
  *   LINEAR_API_KEY  (required)  → header Authorization: <raw personal key>  (NOT a Bearer token)
- *   LINEAR_TEAM     (optional)  → target team key or name (e.g. "AIOS" / "Engineering").
+ *   LINEAR_TEAM     (optional)  → target team key or name (e.g. "AIO" / "Engineering").
  *                                 If unset and the account has exactly one team, that team is used.
  *                                 May also be passed as `--team <key>`.
+ *   PLANE_API_KEY / PLANE_WORKSPACE_SLUG / PLANE_BASE_URL  (only for --sync-status; same env as
+ *                                 plane:backlog) → read Plane state groups to mirror onto Linear.
  *
  * Endpoint/auth verified against https://linear.app/developers (matches the shipped
  * linear-direct skill): POST https://api.linear.app/graphql, Authorization: <api-key>.
@@ -30,6 +32,7 @@
  *   # or: npm run linear:backlog
  *
  * Flags: --dry-run (no writes; print plan)   --verbose   --team <key>
+ *        --sync-status (after seeding, set each Linear issue's state from its Plane counterpart)
  */
 
 import { BACKLOG, WAVE1, WAVE2, LABELS } from "./aios-backlog.mjs";
@@ -38,6 +41,9 @@ const API = "https://api.linear.app/graphql";
 const API_KEY = process.env.LINEAR_API_KEY;
 const DRY = process.argv.includes("--dry-run");
 const VERBOSE = process.argv.includes("--verbose");
+// After seeding, reconcile each Linear issue's workflow state to match its Plane counterpart
+// (matched by the shared ext key) so "done in Plane" shows as "done in Linear". Needs PLANE_API_KEY.
+const SYNC_STATUS = process.argv.includes("--sync-status");
 const teamFlagIdx = process.argv.indexOf("--team");
 const TEAM_WANT = (teamFlagIdx !== -1 ? process.argv[teamFlagIdx + 1] : process.env.LINEAR_TEAM || "").trim();
 
@@ -79,21 +85,34 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // ── GraphQL transport: light throttle + 429 backoff ───────────────────────────
 const MIN_INTERVAL = 150; // ms between requests; Linear allows ~1500 req/hr for personal keys
 let lastReq = 0;
-async function gql(query, variables) {
+async function gql(query, variables, attempt = 0) {
   const now = Date.now();
   const wait = Math.max(0, MIN_INTERVAL - (now - lastReq));
   if (wait) await sleep(wait);
   lastReq = Date.now();
-  const res = await fetch(API, {
-    method: "POST",
-    headers: { Authorization: API_KEY, "Content-Type": "application/json" },
-    body: JSON.stringify({ query, variables }),
-  });
+  let res;
+  try {
+    res = await fetch(API, {
+      method: "POST",
+      headers: { Authorization: API_KEY, "Content-Type": "application/json" },
+      body: JSON.stringify({ query, variables }),
+    });
+  } catch (err) {
+    // network blip — retry a few times before giving up
+    if (attempt < 4) { console.warn(`  network error (${err.message}); retry ${attempt + 1}/4`); await sleep(1000 * (attempt + 1)); return gql(query, variables, attempt + 1); }
+    throw err;
+  }
   if (res.status === 429) {
     const retry = Number(res.headers.get("Retry-After") || 5) * 1000;
     console.warn(`  rate-limited; backing off ${retry}ms`);
     await sleep(retry);
-    return gql(query, variables);
+    return gql(query, variables, attempt);
+  }
+  if (res.status >= 500 && attempt < 4) {
+    // transient Linear gateway error (502/503/504) — back off and retry
+    console.warn(`  Linear HTTP ${res.status}; retry ${attempt + 1}/4`);
+    await sleep(1000 * (attempt + 1));
+    return gql(query, variables, attempt + 1);
   }
   const json = await res.json().catch(() => null);
   if (!res.ok || !json || json.errors) {
@@ -188,6 +207,100 @@ async function createIssue({ teamId, title, description, priority, labelIds, pro
   return data.issueCreate.issue;
 }
 
+async function setIssueState(issueId, stateId) {
+  const data = await gql(
+    `mutation($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }`,
+    { id: issueId, input: { stateId } }
+  );
+  if (!data.issueUpdate.success) throw new Error(`issueUpdate failed for ${issueId}`);
+}
+
+// ── status sync: mirror Plane state groups onto Linear workflow states ─────────
+// Plane and Linear share the same five workflow-state "groups"/"types", so we map by group
+// and prefer a same-named state, falling back to the first state of that type.
+const GROUP_TO_TYPE = { backlog: "backlog", unstarted: "unstarted", started: "started", completed: "completed", cancelled: "canceled" };
+const GROUP_PREFERRED = { backlog: "Backlog", unstarted: "Todo", started: "In Progress", completed: "Done", cancelled: "Canceled" };
+
+// Read Plane state groups for the AIOS backlog: returns Map(ext → group). Reuses the same env
+// and cursor-pagination shape as scripts/plane-backlog.mjs.
+async function planeExtGroups() {
+  const KEY = process.env.PLANE_API_KEY;
+  if (!KEY) throw new Error("--sync-status needs PLANE_API_KEY (same env as plane:backlog).");
+  const SLUG = process.env.PLANE_WORKSPACE_SLUG || "aios-alpha";
+  const BASE = (process.env.PLANE_BASE_URL || "https://api.plane.so").replace(/\/$/, "");
+  const h = { "X-API-Key": KEY, "Content-Type": "application/json" };
+  async function all(path) {
+    const out = []; let cursor = "100:0:0";
+    for (let i = 0; i < 100; i++) {
+      const sep = path.includes("?") ? "&" : "?";
+      const r = await fetch(`${BASE}/api/v1/workspaces/${SLUG}${path}${sep}per_page=100&cursor=${encodeURIComponent(cursor)}`, { headers: h });
+      if (!r.ok) throw new Error(`Plane ${path} → ${r.status}`);
+      const j = await r.json();
+      if (Array.isArray(j)) { out.push(...j); break; }
+      out.push(...(j.results || []));
+      if (!j.next_page_results || !j.next_cursor) break;
+      cursor = j.next_cursor;
+    }
+    return out;
+  }
+  const projects = await all("/projects/");
+  const project = process.env.PLANE_PROJECT_ID
+    ? projects.find((p) => p.id === process.env.PLANE_PROJECT_ID)
+    : projects.find((p) => p.identifier === "AIOS" || /(^|\b)AIOS\b/.test(p.name));
+  if (!project) throw new Error(`AIOS project not found in Plane workspace ${SLUG}`);
+  const states = await all(`/projects/${project.id}/states/`);
+  const groupOf = new Map(states.map((s) => [s.id, s.group]));
+  const items = await all(`/projects/${project.id}/work-items/`);
+  const byExt = new Map();
+  for (const it of items) {
+    if (it.external_source === "aios-backlog" && it.external_id) byExt.set(it.external_id, groupOf.get(it.state) || "unstarted");
+  }
+  return byExt;
+}
+
+async function reconcileStatus(teamId) {
+  // Linear workflow states for the team.
+  const sData = await gql(`query($id: String!) { team(id: $id) { states(first: 50) { nodes { id name type } } } }`, { id: teamId });
+  const states = sData.team.states.nodes;
+  const stateForGroup = (group) => {
+    const type = GROUP_TO_TYPE[group];
+    const ofType = states.filter((s) => s.type === type);
+    return ofType.find((s) => s.name === GROUP_PREFERRED[group])?.id || ofType[0]?.id || null;
+  };
+
+  // Current Linear issues (ext marker → {id, current stateId}).
+  const current = new Map();
+  let after = null;
+  for (let i = 0; i < 100; i++) {
+    const d = await gql(
+      `query($id: String!, $after: String) { team(id: $id) { issues(first: 250, after: $after) {
+        pageInfo { hasNextPage endCursor } nodes { id description state { id } } } } }`,
+      { id: teamId, after }
+    );
+    const conn = d.team.issues;
+    for (const n of conn.nodes) {
+      const m = (n.description || "").match(EXT_RE);
+      if (m) current.set(m[1], { id: n.id, stateId: n.state?.id || null });
+    }
+    if (!conn.pageInfo.hasNextPage) break;
+    after = conn.pageInfo.endCursor;
+  }
+
+  const planeGroups = await planeExtGroups();
+  let changed = 0, matched = 0, missing = 0;
+  for (const [ext, group] of planeGroups) {
+    const issue = current.get(ext);
+    if (!issue) { missing++; continue; }
+    matched++;
+    const target = stateForGroup(group);
+    if (!target || target === issue.stateId) continue;
+    await setIssueState(issue.id, target);
+    changed++;
+    if (VERBOSE) console.log(`state  ${ext} → ${GROUP_PREFERRED[group]} (${group})`);
+  }
+  console.log(`Status sync: ${changed} updated · ${matched - changed} already correct · ${missing} Plane item(s) not in Linear (e.g. pre-backlog history).`);
+}
+
 // ── plan / run ────────────────────────────────────────────────────────────────
 async function main() {
   const totalItems = BACKLOG.length + BACKLOG.reduce((n, e) => n + e.subs.length, 0);
@@ -267,6 +380,9 @@ async function main() {
   }
 
   console.log(`\nDone. created=${stats.created} skipped=${stats.skipped} (total ${totalItems}).`);
+
+  // 6. optional: mirror Plane state groups onto Linear (done-in-Plane → done-in-Linear).
+  if (SYNC_STATUS) await reconcileStatus(team.id);
 }
 
 main().catch((e) => { console.error("FAILED:", e.message); process.exit(1); });

@@ -177,8 +177,11 @@ projected into each PM tool by a seed script that shares that data:
 `npm run plane:backlog` (Plane: epics + sub-issues + Wave modules, idempotent by
 `external_id`) and `npm run linear:backlog` (Linear-native: a Project per Wave,
 epics as parent issues, chunks as sub-issues, idempotent by an `aios-ext:` marker
-in each issue description). Both read `LINEAR_API_KEY`/`PLANE_API_KEY` from the
-workspace `.env` via dotenvx and support `--dry-run`. This is the Plane-vs-Linear
+in each issue description). `npm run linear:backlog -- --sync-status` additionally
+reconciles each Linear issue's workflow state from its Plane counterpart (matched by
+the shared ext key, mapped by state group) so "done in Plane" shows as "done in
+Linear". Both read `LINEAR_API_KEY`/`PLANE_API_KEY` (+ optional `LINEAR_TEAM`) from
+the workspace `.env` via dotenvx and support `--dry-run`. This is the Plane-vs-Linear
 bake-off substrate (backlog epic W2.4); the runtime write-back loop above is
 unchanged and provider-neutral.
 
