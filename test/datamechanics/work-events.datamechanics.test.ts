@@ -124,4 +124,53 @@ describe("work events (real Postgres)", () => {
       .single();
     expect((link as { last_error: string }).last_error).toMatch(/plane integration/i);
   });
+
+  it("creates a PM link row when none exists yet (insert-returning path against real PG)", async () => {
+    const seed = await seedTeam();
+    // primary provider set, integration absent, and NO markdown PM column ⇒ no pre-existing link.
+    // The work-events done path must INSERT a task_pm_links row to record the error — this exercises
+    // ensureLink's insert-returning, which the prod pg adapter rejects with a bare "*" select.
+    await db().from("teams").update({ primary_pm_provider: "plane" }).eq("id", seed.teamId);
+    await ingest(seed, {
+      kind: "task",
+      path: "3-log/tasks.md",
+      body: "| ID | Task | Assignee | Status | Sprint | Due |\n| P7 | no pm column | alex | ready | | |",
+      access: "team",
+      rows: [{ row_key: "P7", title: "no pm column", status: "ready" }],
+    } as never);
+
+    const res = await ingestWorkEvent(
+      db(),
+      { teamId: seed.teamId, memberId: seed.memberId, apiKeyId: "api-key" },
+      {
+        project: "acme",
+        event_kind: "merged",
+        repo: "AIOS-alpha/aios-team-brain",
+        merged_sha: "abcdef987654",
+        pr_url: "",
+        pr_title: "P7 done",
+        pr_body: "",
+        branch: "",
+        work_keys: ["P7"],
+        actor: "alex",
+      }
+    );
+
+    expect(await taskStatus("P7")).toBe("done");
+    expect(res.pm_sync).toEqual([
+      expect.objectContaining({ row_key: "P7", provider: "plane", status: "missing_integration" }),
+    ]);
+    // The link was created (not pre-existing) and carries the error.
+    const { data: link } = await db()
+      .from("task_pm_links")
+      .select("provider, provider_external_id, last_error")
+      .eq("team_id", seed.teamId)
+      .eq("row_key", "P7")
+      .single();
+    expect(link as { provider: string; provider_external_id: string; last_error: string }).toMatchObject({
+      provider: "plane",
+      provider_external_id: "P7",
+    });
+    expect((link as { last_error: string }).last_error).toMatch(/plane integration/i);
+  });
 });

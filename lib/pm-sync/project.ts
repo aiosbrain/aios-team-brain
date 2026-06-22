@@ -126,6 +126,11 @@ function toProjectable(row: ProjectionTaskRow, parentResourceId: string | null):
   };
 }
 
+// Columns of task_pm_links the projection engine reads. The pg adapter (prod) rejects a bare
+// "*" column reference, so every select / insert-returning must name columns explicitly.
+const LINK_COLS =
+  "id, team_id, project_id, task_id, row_key, provider, provider_resource_id, provider_external_source, provider_external_id, provider_url, projection_fingerprint, last_projected_status, provider_seen_status";
+
 // Get-or-create the task_pm_links row for (team, project, row_key, provider).
 async function ensureLink(
   supabase: SupabaseClient,
@@ -135,7 +140,7 @@ async function ensureLink(
 ): Promise<TaskPmLink> {
   const { data: existing } = await supabase
     .from("task_pm_links")
-    .select("*")
+    .select(LINK_COLS)
     .eq("team_id", row.team_id)
     .eq("project_id", row.project_id)
     .eq("row_key", row.row_key)
@@ -153,7 +158,7 @@ async function ensureLink(
     provider_external_source: defaultSource,
     provider_url: "",
   };
-  const { data, error } = await supabase.from("task_pm_links").insert(insert).select("*").single();
+  const { data, error } = await supabase.from("task_pm_links").insert(insert).select(LINK_COLS).single();
   if (error) throw new Error(`create task PM link failed: ${error.message}`);
   return data as TaskPmLink;
 }
