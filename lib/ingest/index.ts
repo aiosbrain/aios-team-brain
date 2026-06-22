@@ -7,6 +7,7 @@ import {
   normalizeTier,
   normalizeTaskStatus,
   normalizeTaskPriority,
+  IngestValidationError,
 } from "@/lib/api/schemas";
 import { audit } from "@/lib/api/audit";
 
@@ -125,73 +126,92 @@ async function materializeTasks(
   rawRows: unknown[],
   syncedAt: string
 ) {
-  const rows = rawRows
-    .map((r) => taskRowSchema.safeParse(r))
-    .filter((r) => r.success)
-    .map((r) => r.data!);
+  // Fail the whole push on any malformed task row — a silently-dropped row would otherwise be
+  // diff-deleted below (absent from incomingKeys), so a single bad cell could erase a real task.
+  const parsed = rawRows.map((r) => taskRowSchema.safeParse(r));
+  const firstBad = parsed.find((r) => !r.success);
+  if (firstBad && !firstBad.success) {
+    throw new IngestValidationError(`invalid task row: ${firstBad.error.issues[0]?.message ?? "bad shape"}`);
+  }
+  const rows = parsed.map((r) => r.data!);
 
   const incomingKeys = new Set(rows.map((r) => r.row_key));
   const incomingByKey = new Map(rows.map((r) => [r.row_key, r]));
   const parentOf = (r: (typeof rows)[number]) => (r.parent ?? "").trim();
 
   // Parent integrity (brain-api v1.2): every parent must resolve within (team, project), and the
-  // incoming graph must be acyclic. Reject the whole push on violation so a bad hierarchy never
-  // lands half-applied or leaves orphan PM sub-issues downstream.
+  // combined graph (existing rows + this push) must be acyclic. Reject the whole push on violation
+  // so a bad hierarchy never lands half-applied or leaves orphan PM sub-issues downstream.
+  // Build the post-push parent map: existing parents, then overridden by incoming rows (only where
+  // a row carries the `parent` key — a six-column push leaves existing parents untouched).
+  const parentMap = new Map<string, string>(); // row_key -> parent row_key (non-empty)
   const existingKeys = new Set<string>();
   {
     const { data: existing } = await supabase
       .from("tasks")
-      .select("row_key")
+      .select("row_key, parent_row_key")
       .eq("team_id", teamId)
       .eq("project_id", projectId)
       .not("row_key", "is", null);
-    for (const t of existing ?? []) if (t.row_key) existingKeys.add(t.row_key);
-  }
-  for (const row of rows) {
-    const parent = parentOf(row);
-    if (!parent) continue;
-    if (parent === row.row_key) throw new Error(`task ${row.row_key}: parent cannot reference itself`);
-    if (!incomingByKey.has(parent) && !existingKeys.has(parent)) {
-      throw new Error(`task ${row.row_key}: parent "${parent}" not found in project`);
+    for (const t of existing ?? []) {
+      if (!t.row_key) continue;
+      existingKeys.add(t.row_key);
+      const p = (t.parent_row_key ?? "").trim();
+      if (p) parentMap.set(t.row_key, p);
     }
   }
-  // Cycle detection within the incoming graph (follow parent links through this push).
   for (const row of rows) {
+    if (!("parent" in row)) continue; // six-column row — does not change this row's parent
+    const parent = parentOf(row);
+    if (!parent) {
+      parentMap.delete(row.row_key); // explicit clear (empty Parent cell)
+      continue;
+    }
+    if (parent === row.row_key) {
+      throw new IngestValidationError(`task ${row.row_key}: parent cannot reference itself`);
+    }
+    if (!incomingByKey.has(parent) && !existingKeys.has(parent)) {
+      throw new IngestValidationError(`task ${row.row_key}: parent "${parent}" not found in project`);
+    }
+    parentMap.set(row.row_key, parent);
+  }
+  // Cycle detection over the combined graph (catches a cycle formed across two syncs, e.g. DB has
+  // B.parent=A and this push sets A.parent=B).
+  for (const start of parentMap.keys()) {
     const seen = new Set<string>();
-    let cur: string | undefined = row.row_key;
+    let cur: string | undefined = start;
     while (cur) {
-      if (seen.has(cur)) throw new Error(`task ${row.row_key}: parent cycle detected`);
+      if (seen.has(cur)) throw new IngestValidationError(`task ${start}: parent cycle detected`);
       seen.add(cur);
-      const node = incomingByKey.get(cur);
-      const p = node ? parentOf(node) : "";
-      cur = p || undefined;
+      cur = parentMap.get(cur);
     }
   }
 
   for (const row of rows) {
     const { status, raw_status } = normalizeTaskStatus(row.status || "");
-    // NOTE: `body` is intentionally NOT written here — it is dashboard/DB-only and must survive
-    // a sync push. Omitting it from the upsert preserves it on update and defaults to '' on insert.
-    const { data: task, error } = await supabase.from("tasks").upsert(
-      {
-        team_id: teamId,
-        project_id: projectId,
-        source_item_id: itemId,
-        row_key: row.row_key,
-        title: row.title,
-        assignee: row.assignee ?? "",
-        status,
-        raw_status,
-        sprint: row.sprint ?? "",
-        due_date: row.due || null,
-        parent_row_key: parentOf(row) || null,
-        labels: row.labels ?? [],
-        priority: normalizeTaskPriority(row.priority),
-        origin: "sync",
-        updated_at: syncedAt,
-      },
-      { onConflict: "team_id,project_id,row_key" }
-    )
+    // `body` is dashboard/DB-only and `parent`/`labels`/`priority` are optional v1.2 fields: each is
+    // written ONLY when the row carries the key, so a six-column push preserves them on update and
+    // falls back to DB defaults on insert. (A present-but-empty value is authoritative — it clears.)
+    const upsertRow: Record<string, unknown> = {
+      team_id: teamId,
+      project_id: projectId,
+      source_item_id: itemId,
+      row_key: row.row_key,
+      title: row.title,
+      assignee: row.assignee ?? "",
+      status,
+      raw_status,
+      sprint: row.sprint ?? "",
+      due_date: row.due || null,
+      origin: "sync",
+      updated_at: syncedAt,
+    };
+    if ("parent" in row) upsertRow.parent_row_key = parentOf(row) || null;
+    if ("labels" in row) upsertRow.labels = row.labels ?? [];
+    if ("priority" in row) upsertRow.priority = normalizeTaskPriority(row.priority);
+    const { data: task, error } = await supabase
+      .from("tasks")
+      .upsert(upsertRow, { onConflict: "team_id,project_id,row_key" })
       .select("id")
       .single();
     if (error) throw new Error(`task row ${row.row_key}: ${error.message}`);

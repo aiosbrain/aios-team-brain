@@ -236,8 +236,8 @@ create table if not exists tasks (
   -- Hierarchy/board fields (brain-api v1.2). The brain is the source of truth that projects a
   -- structured board into the primary PM tool. parent_row_key is the epic's row_key, resolved
   -- within (team_id, project_id); integrity (exists, acyclic) is enforced in app code (lib/ingest
-  -- + the task server actions), not a DB FK. body is dashboard/DB-only — it never round-trips
-  -- through the markdown contract.
+  -- on the sync push), not a DB FK. body is dashboard/DB-only — it never round-trips through the
+  -- markdown contract.
   parent_row_key text,
   labels text[] not null default '{}',
   priority text not null default 'none' check (priority in ('none', 'low', 'medium', 'high', 'urgent')),

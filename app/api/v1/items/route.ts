@@ -2,7 +2,12 @@ import { NextRequest } from "next/server";
 import { adminClient } from "@/lib/supabase/admin";
 import { authenticateApiKey } from "@/lib/api/auth";
 import { rateLimit } from "@/lib/api/rate-limit";
-import { itemPayloadSchema, normalizeTier, errorResponse } from "@/lib/api/schemas";
+import {
+  itemPayloadSchema,
+  normalizeTier,
+  errorResponse,
+  IngestValidationError,
+} from "@/lib/api/schemas";
 import { ingestItem } from "@/lib/ingest";
 
 export const runtime = "nodejs";
@@ -57,6 +62,11 @@ export async function POST(req: NextRequest) {
     const result = await ingestItem(supabase, auth, parsed.data, tier);
     return Response.json(result, { status: result.status === "created" ? 201 : 200 });
   } catch (e) {
+    // Client validation failures (e.g. a bad task row or a parent-integrity violation) are 422,
+    // not 500 — the CLI needs a structured signal to fix the markdown and retry.
+    if (e instanceof IngestValidationError) {
+      return errorResponse("invalid_payload", e.message, 422);
+    }
     return errorResponse("internal", e instanceof Error ? e.message : "ingest failed", 500);
   }
 }

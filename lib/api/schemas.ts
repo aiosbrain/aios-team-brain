@@ -302,6 +302,13 @@ const MAX_CONFIG_BYTES = 8 * 1024;
 /** Thrown when integration config is malformed/oversized/contains a secret-like key (→ 400). */
 export class IntegrationConfigError extends Error {}
 
+/**
+ * A client-side validation failure detected during ingest (e.g. a malformed task row or a
+ * task-hierarchy violation: missing/self/cyclic parent). The /api/v1/items route maps this to
+ * 422 invalid_payload so the CLI gets a structured "fix your markdown" signal, not a 500.
+ */
+export class IngestValidationError extends Error {}
+
 function collectKeys(value: unknown, out: string[] = []): string[] {
   if (value && typeof value === "object" && !Array.isArray(value)) {
     for (const [k, v] of Object.entries(value)) {
