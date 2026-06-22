@@ -59,7 +59,7 @@ export default async function PmSyncPage({ params }: { params: Promise<{ team: s
                 <th className="py-2 pr-4 font-medium">Key</th>
                 <th className="py-2 pr-4 font-medium">PR</th>
                 <th className="py-2 pr-4 font-medium">Repo</th>
-                <th className="py-2 pr-4 font-medium">Error</th>
+                <th className="py-2 pr-4 font-medium">Reason</th>
               </tr>
             </thead>
             <tbody>
@@ -70,7 +70,7 @@ export default async function PmSyncPage({ params }: { params: Promise<{ team: s
                     {e.pr_url ? <a className="text-violet" href={e.pr_url}>{e.pr_title || e.pr_url}</a> : e.pr_title || "—"}
                   </td>
                   <td className="py-2 pr-4 text-ink-secondary">{e.repo}</td>
-                  <td className="py-2 pr-4 text-red">{e.error || "unresolved"}</td>
+                  <td className="py-2 pr-4 text-ink-secondary">{e.error || "unresolved"}</td>
                 </tr>
               ))}
               {(unresolved ?? []).length === 0 ? (
