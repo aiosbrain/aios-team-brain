@@ -17,6 +17,15 @@ export default defineConfig({
       reporter: ["text-summary", "json-summary"],
       reportsDirectory: "coverage",
       include: ["lib/**"],
+      // Merge gate: floor ≈ (baseline − 2pts) off the lib/** baseline
+      // (lines 28.18 / functions 31.92 / branches 25.12). vitest exits non-zero
+      // below these, so `npm run coverage` in CI blocks regressions. Ratchet up as
+      // lib/** test coverage improves — never lower to make a red build pass.
+      thresholds: {
+        lines: 26,
+        functions: 29,
+        branches: 23,
+      },
     },
   },
   resolve: {
