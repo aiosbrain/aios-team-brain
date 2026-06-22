@@ -48,8 +48,11 @@ describe("POST /api/v1/work-events (HTTP)", () => {
     expect(body.status).toBe("ok");
     expect(body.applied).toEqual([{ row_key: "W1.2.1", task_id: body.applied[0]?.task_id }]);
     expect(body.unresolved).toEqual([]);
-    // The task has no PM link, so sync is a no-op (status "no_link") — no external call.
-    expect(body.pm_sync).toEqual([{ provider: null, row_key: "W1.2.1", status: "no_link" }]);
+    // The done path runs the brain→PM projection engine (lib/pm-sync/project). The test
+    // team has no enabled PM integration, so projection reports missing_integration and
+    // makes no external call — the task is still completed (asserted below).
+    expect(body.pm_sync).toHaveLength(1);
+    expect(body.pm_sync[0]).toMatchObject({ row_key: "W1.2.1", status: "missing_integration" });
 
     const { data } = await db()
       .from("tasks")
