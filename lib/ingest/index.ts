@@ -251,14 +251,14 @@ async function materializeTasks(
       });
     }
   }
-  const changed: string[] = [];
+  const changed = new Set<string>();
 
   for (const row of rows) {
     const { status, raw_status } = normalizeTaskStatus(row.status || "");
     // Projected-field change detection (title/status/sprint/priority/labels/parent only). A new row
     // (no snapshot) is always "changed"; assignee/due/body changes never trigger projection.
     const snapshot = snapshotByKey.get(row.row_key) ?? null;
-    if (projectableChanged(snapshot, effectiveProjectable(row, snapshot))) changed.push(row.row_key);
+    if (projectableChanged(snapshot, effectiveProjectable(row, snapshot))) changed.add(row.row_key);
     // `body` is dashboard/DB-only and `parent`/`labels`/`priority` are optional v1.2 fields: each is
     // written ONLY when the row carries the key, so a six-column push preserves them on update and
     // falls back to DB defaults on insert. (A present-but-empty value is authoritative — it clears.)
@@ -326,12 +326,15 @@ async function materializeTasks(
     const parent = (t.parent_row_key ?? "").trim();
     if (parent && survivors.has(t.row_key!) && !survivors.has(parent)) {
       await supabase.from("tasks").update({ parent_row_key: null }).eq("id", t.id);
+      // Nulling a dangling parent IS a projected-field change (the child must un-nest on the board),
+      // but it happens after the snapshot diff — so flag it here or reactive projection would miss it.
+      if (t.row_key) changed.add(t.row_key);
     }
   }
 
   // The row_keys whose projected fields changed this push. The route projects only these (the
-  // after() callback reloads each row's final DB state, so a parent later nulled above is reflected).
-  return changed;
+  // after() callback reloads each row's final DB state, so a parent nulled above is reflected).
+  return [...changed];
 }
 
 async function materializeDecisions(

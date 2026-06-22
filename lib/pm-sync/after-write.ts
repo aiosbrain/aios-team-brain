@@ -60,7 +60,7 @@ export async function projectChangedTasksAfterWrite(
   if (!rowKeys.length) return [];
   try {
     const primary = await resolvePrimaryProvider(supabase, teamId);
-    if (primary.provider === null || primary.integration === null) return [];
+    if (primary.provider === null) return []; // no PM tool configured → nothing to project or surface
 
     const { data } = await supabase
       .from("tasks")
@@ -70,6 +70,15 @@ export async function projectChangedTasksAfterWrite(
       .in("row_key", rowKeys);
     const rows = ((data ?? []) as ProjectionTaskRow[]).filter((r) => r.row_key);
     if (!rows.length) return [];
+
+    // Provider configured but its integration is missing/secret-less: record the error on each
+    // changed row's link (parity with single-row projectTask) so Admin → PM sync surfaces it,
+    // instead of failing silently. No bootstrap is reachable here, so don't take the batch path.
+    if (primary.integration === null) {
+      const reports: ProjectionReport[] = [];
+      for (const row of rows) reports.push(await projectTask(supabase, row, { primary, fetchImpl: opts.fetchImpl }));
+      return reports;
+    }
 
     return await projectRows(supabase, primary, rows, { fetchImpl: opts.fetchImpl });
   } catch {

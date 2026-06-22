@@ -200,4 +200,42 @@ describe("materialize changed-rows detection (real Postgres)", () => {
     ]);
     expect(res.changedTaskRowKeys).toEqual([]);
   });
+
+  it("flags a child whose dangling parent is nulled by an epic diff-delete", async () => {
+    const seed = await seedTeam();
+    await pushTasks(seed, "v1", [
+      { row_key: "E", title: "Epic" },
+      { row_key: "C", title: "Child", parent: "E" },
+    ]);
+    // Push drops the epic E but keeps C (still referencing E) → C.parent_row_key is nulled AFTER the
+    // pre-upsert snapshot diff. C's projected parent changed (E → null), so it must still be flagged.
+    const res = await pushTasks(seed, "v2", [{ row_key: "C", title: "Child", parent: "E" }]);
+    expect(res.changedTaskRowKeys).toContain("C");
+    const { data } = await db()
+      .from("tasks")
+      .select("parent_row_key")
+      .eq("team_id", seed.teamId)
+      .eq("row_key", "C")
+      .single();
+    expect((data as { parent_row_key: string | null }).parent_row_key).toBeNull();
+  });
+});
+
+describe("reactive projection — missing integration (real Postgres)", () => {
+  it("records missing_integration on each changed row's link (observability parity)", async () => {
+    const seed = await seedTeam();
+    // Primary provider configured, but NO integration enabled → the push path must still surface the
+    // failure on the link (not return silently), matching single-row projectTask.
+    await db().from("teams").update({ primary_pm_provider: "linear" }).eq("id", seed.teamId);
+    await pushTasks(seed, "v1", [{ row_key: "P0", title: "x" }]);
+    const projectId = await projectIdOf(seed.teamId);
+
+    const reports = await projectChangedTasksAfterWrite(db(), seed.teamId, projectId, ["P0"]);
+    expect(reports).toEqual([
+      expect.objectContaining({ row_key: "P0", provider: "linear", status: "missing_integration" }),
+    ]);
+    const link = await linkOf(seed.teamId, "P0");
+    expect(link?.last_error).toBeTruthy();
+    expect(link?.provider_external_id).toBe("P0");
+  });
 });

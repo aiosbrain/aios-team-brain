@@ -58,8 +58,10 @@ export interface ProjectionReport {
 export interface ProjectTaskOptions {
   statusOnly?: boolean;
   fetchImpl?: typeof fetch;
-  // Resolved once by projectAllTasks and threaded through to avoid re-resolution per row.
-  primary?: ResolvedPrimary;
+  // Resolved once by the orchestrator and threaded through to avoid re-resolution per row. Accepts
+  // any resolution (incl. provider-known-but-integration-missing) so projectTask still records the
+  // missing_integration error on the link instead of re-resolving.
+  primary?: PrimaryResolution;
   bootstrap?: unknown;
   // Map of row_key → already-projected provider resource id (parent-first ordering).
   resolved?: Map<string, string>;
