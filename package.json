@@ -32,7 +32,7 @@
     "@dnd-kit/sortable": "^10.0.0",
     "@sentry/nextjs": "^10.58.0",
     "@supabase/ssr": "^0.12.0",
-    "@supabase/supabase-js": "^2.108.1",
+    "@supabase/supabase-js": "^2.108.2",
     "jose": "^6.2.3",
     "lucide-react": "^1.17.0",
     "next": "16.2.9",
