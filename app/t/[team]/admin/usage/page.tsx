@@ -41,12 +41,12 @@ export default async function UsageAdminPage({
   const memberId = (me?.id as string | undefined) ?? "";
   const viewer = { isAdmin, memberId };
 
-  const [costs, external, combined, throughput] = await Promise.all([
+  const [costs, external, throughput] = await Promise.all([
     getPerMemberCosts(supabase, team.id, range, viewer),
     getExternalCosts(supabase, team.id, range, viewer),
-    getCombinedSpend(supabase, team.id, range, viewer),
     getThroughputVsCost(supabase, team.id, range, viewer),
   ]);
+  const combined = await getCombinedSpend(supabase, team.id, range, viewer, external);
 
   return (
     <div className="flex flex-col gap-6">

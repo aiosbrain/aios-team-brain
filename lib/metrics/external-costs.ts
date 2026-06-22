@@ -171,21 +171,23 @@ export async function getCombinedSpend(
   supabase: SupabaseClient,
   teamId: string,
   range: Range,
-  viewer: QueryLogViewer
+  viewer: QueryLogViewer,
+  externalSummary?: Pick<ExternalCostsSummary, "totals">
 ): Promise<{ brain_usd: number; external_usd: number; total_usd: number }> {
   const windowStart = new Date(Date.now() - rangeDays(range) * 86_400_000).toISOString();
 
-  const [brainRes, external] = await Promise.all([
-    scopeQueryLog(
-      supabase
-        .from("query_log")
-        .select("cost_usd")
-        .eq("team_id", teamId)
-        .gte("created_at", windowStart),
-      viewer
-    ),
-    getExternalCosts(supabase, teamId, range, viewer),
-  ]);
+  const brainRes = await scopeQueryLog(
+    supabase
+      .from("query_log")
+      .select("cost_usd")
+      .eq("team_id", teamId)
+      .gte("created_at", windowStart),
+    viewer
+  );
+
+  const external =
+    externalSummary ??
+    (await getExternalCosts(supabase, teamId, range, viewer));
 
   const brain_usd = round(
     ((brainRes.data ?? []) as { cost_usd: number | string }[]).reduce(
