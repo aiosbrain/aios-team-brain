@@ -1,4 +1,8 @@
 import { describe, expect, it } from "vitest";
+import { createHash } from "node:crypto";
+import type { NextRequest } from "next/server";
+import { POST as itemsPOST } from "@/app/api/v1/items/route";
+import { issueApiKey } from "@/lib/admin/keys";
 import { db, ingest, seedTeam } from "./helpers";
 import { IngestValidationError } from "@/lib/api/schemas";
 
@@ -144,6 +148,13 @@ describe("task hierarchy materialization (real Postgres)", () => {
     ).rejects.toThrow(IngestValidationError);
     // The good row must NOT have landed — the push is all-or-nothing.
     expect(await readTask(seed.teamId, "GOOD")).toBeNull();
+    // The item must NOT have been written either (validation runs before item upsert).
+    const { count } = await db()
+      .from("items")
+      .select("id", { count: "exact", head: true })
+      .eq("team_id", seed.teamId)
+      .eq("path", "3-log/tasks.md");
+    expect(count).toBe(0);
   });
 
   it("nulls a dangling parent when the epic is diff-deleted", async () => {
@@ -159,5 +170,77 @@ describe("task hierarchy materialization (real Postgres)", () => {
 
     expect(await readTask(seed.teamId, "E")).toBeNull(); // epic diff-deleted
     expect((await readTask(seed.teamId, "C"))?.parent_row_key).toBeNull(); // dangling parent cleared
+  });
+});
+
+const ITEMS_URL = "http://test/api/v1/items";
+
+function sha(body: string): string {
+  return createHash("sha256").update(body).digest("hex");
+}
+
+async function issueTeamKey(seed: Awaited<ReturnType<typeof seedTeam>>) {
+  const { key, keyId } = await issueApiKey(db(), seed.teamId, seed.memberId, "team key");
+  const { data: row } = await db().from("api_keys").select("id").eq("key_id", keyId).single();
+  return { key, apiKeyId: (row as { id: string }).id };
+}
+
+function postItems(key: string, teamSlug: string, body: unknown) {
+  const req = new Request(ITEMS_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${key}`,
+      "X-AIOS-Team": teamSlug,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  }) as unknown as NextRequest;
+  return itemsPOST(req);
+}
+
+describe("task hierarchy route guards (real handlers, real Postgres)", () => {
+  it("POST /items: a self-parent task row is 422 invalid_payload, not 500", async () => {
+    const seed = await seedTeam();
+    const { key } = await issueTeamKey(seed);
+    const mdBody = "| A | a | A | | |";
+    const res = await postItems(key, seed.teamSlug, {
+      project: "acme",
+      path: "3-log/tasks.md",
+      kind: "task",
+      access: "team",
+      actor: "tester",
+      frontmatter: {},
+      body: mdBody,
+      content_sha256: sha(mdBody),
+      rows: [{ row_key: "A", title: "a", parent: "A" }],
+    });
+    expect(res.status).toBe(422);
+    const json = await res.json();
+    expect(json.error.code).toBe("invalid_payload");
+    expect(json.error.message).toMatch(/cannot reference itself/);
+  });
+
+  it("POST /items: a bad hierarchy push does not persist the item", async () => {
+    const seed = await seedTeam();
+    const { key } = await issueTeamKey(seed);
+    const mdBody = "| C | child | GHOST | | |";
+    const res = await postItems(key, seed.teamSlug, {
+      project: "acme",
+      path: "3-log/tasks.md",
+      kind: "task",
+      access: "team",
+      actor: "tester",
+      frontmatter: {},
+      body: mdBody,
+      content_sha256: sha(mdBody),
+      rows: [{ row_key: "C", title: "child", parent: "GHOST" }],
+    });
+    expect(res.status).toBe(422);
+    const { count } = await db()
+      .from("items")
+      .select("id", { count: "exact", head: true })
+      .eq("team_id", seed.teamId)
+      .eq("path", "3-log/tasks.md");
+    expect(count).toBe(0);
   });
 });

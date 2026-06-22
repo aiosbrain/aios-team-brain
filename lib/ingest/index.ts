@@ -60,6 +60,17 @@ export async function ingestItem(
     return { status: "unchanged", id: existing.id };
   }
 
+  // Validate task rows before mutating items so a 422 never leaves a revised item/version behind.
+  let validatedTaskRows: TaskRow[] | undefined;
+  if (payload.rows && payload.kind === "task") {
+    validatedTaskRows = await parseAndValidateTaskRows(
+      supabase,
+      auth.teamId,
+      project.id,
+      payload.rows
+    );
+  }
+
   // 3. upsert item (+ version when body changed)
   const itemRecord = {
     team_id: auth.teamId,
@@ -101,7 +112,14 @@ export async function ingestItem(
   // by the writeback (which would otherwise re-emit a just-written-back UI row forever).
   if (payload.rows && (payload.kind === "task" || payload.kind === "decision")) {
     if (payload.kind === "task") {
-      await materializeTasks(supabase, auth.teamId, project.id, itemId, payload.rows, now);
+      await materializeTasks(
+        supabase,
+        auth.teamId,
+        project.id,
+        itemId,
+        validatedTaskRows!,
+        now
+      );
     } else {
       await materializeDecisions(supabase, auth.teamId, project.id, itemId, payload.rows, now);
     }
@@ -118,33 +136,28 @@ export async function ingestItem(
   return { status: existing ? "updated" : "created", id: itemId };
 }
 
-async function materializeTasks(
+type TaskRow = NonNullable<ReturnType<typeof taskRowSchema.safeParse>["data"]>;
+
+/** Parse + parent-integrity checks only (no writes). Called before item upsert so 422 is clean. */
+async function parseAndValidateTaskRows(
   supabase: SupabaseClient,
   teamId: string,
   projectId: string,
-  itemId: string,
-  rawRows: unknown[],
-  syncedAt: string
-) {
-  // Fail the whole push on any malformed task row — a silently-dropped row would otherwise be
-  // diff-deleted below (absent from incomingKeys), so a single bad cell could erase a real task.
+  rawRows: unknown[]
+): Promise<TaskRow[]> {
   const parsed = rawRows.map((r) => taskRowSchema.safeParse(r));
   const firstBad = parsed.find((r) => !r.success);
   if (firstBad && !firstBad.success) {
-    throw new IngestValidationError(`invalid task row: ${firstBad.error.issues[0]?.message ?? "bad shape"}`);
+    throw new IngestValidationError(
+      `invalid task row: ${firstBad.error.issues[0]?.message ?? "bad shape"}`
+    );
   }
   const rows = parsed.map((r) => r.data!);
 
-  const incomingKeys = new Set(rows.map((r) => r.row_key));
   const incomingByKey = new Map(rows.map((r) => [r.row_key, r]));
-  const parentOf = (r: (typeof rows)[number]) => (r.parent ?? "").trim();
+  const parentOf = (r: TaskRow) => (r.parent ?? "").trim();
 
-  // Parent integrity (brain-api v1.2): every parent must resolve within (team, project), and the
-  // combined graph (existing rows + this push) must be acyclic. Reject the whole push on violation
-  // so a bad hierarchy never lands half-applied or leaves orphan PM sub-issues downstream.
-  // Build the post-push parent map: existing parents, then overridden by incoming rows (only where
-  // a row carries the `parent` key — a six-column push leaves existing parents untouched).
-  const parentMap = new Map<string, string>(); // row_key -> parent row_key (non-empty)
+  const parentMap = new Map<string, string>();
   const existingKeys = new Set<string>();
   {
     const { data: existing } = await supabase
@@ -161,10 +174,10 @@ async function materializeTasks(
     }
   }
   for (const row of rows) {
-    if (!("parent" in row)) continue; // six-column row — does not change this row's parent
+    if (!("parent" in row)) continue;
     const parent = parentOf(row);
     if (!parent) {
-      parentMap.delete(row.row_key); // explicit clear (empty Parent cell)
+      parentMap.delete(row.row_key);
       continue;
     }
     if (parent === row.row_key) {
@@ -175,8 +188,6 @@ async function materializeTasks(
     }
     parentMap.set(row.row_key, parent);
   }
-  // Cycle detection over the combined graph (catches a cycle formed across two syncs, e.g. DB has
-  // B.parent=A and this push sets A.parent=B).
   for (const start of parentMap.keys()) {
     const seen = new Set<string>();
     let cur: string | undefined = start;
@@ -186,6 +197,19 @@ async function materializeTasks(
       cur = parentMap.get(cur);
     }
   }
+  return rows;
+}
+
+async function materializeTasks(
+  supabase: SupabaseClient,
+  teamId: string,
+  projectId: string,
+  itemId: string,
+  rows: TaskRow[],
+  syncedAt: string
+) {
+  const incomingKeys = new Set(rows.map((r) => r.row_key));
+  const parentOf = (r: TaskRow) => (r.parent ?? "").trim();
 
   for (const row of rows) {
     const { status, raw_status } = normalizeTaskStatus(row.status || "");
