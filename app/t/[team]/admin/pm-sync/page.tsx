@@ -1,6 +1,8 @@
 import type { Metadata } from "next";
 import { serverClient } from "@/lib/supabase/server";
+import { isDiverged } from "@/lib/pm-sync/reconcile";
 import { ProjectBoardButton } from "./project-board-button";
+import { ReconcileButton } from "./reconcile-button";
 
 export const metadata: Metadata = { title: "PM sync" };
 
@@ -14,7 +16,7 @@ export default async function PmSyncPage({ params }: { params: Promise<{ team: s
     .maybeSingle();
   if (!team) return null;
 
-  const [{ data: unresolved }, { data: failedLinks }] = await Promise.all([
+  const [{ data: unresolved }, { data: failedLinks }, { data: seenLinks }] = await Promise.all([
     supabase
       .from("work_events")
       .select("row_key, repo, merged_sha, pr_url, pr_title, error, created_at")
@@ -29,7 +31,27 @@ export default async function PmSyncPage({ params }: { params: Promise<{ team: s
       .not("last_error", "is", null)
       .order("updated_at", { ascending: false })
       .limit(50),
+    // Inbound divergence (Phase 5): links the reconcile pass has recorded a provider_seen_status on.
+    // Divergence is computed in JS (the pg adapter can't compare two columns in a filter).
+    supabase
+      .from("task_pm_links")
+      .select("row_key, provider, provider_url, last_projected_status, provider_seen_status, updated_at")
+      .eq("team_id", team.id)
+      .not("provider_seen_status", "is", null)
+      .order("updated_at", { ascending: false })
+      .limit(200),
   ]);
+
+  const divergences = (
+    (seenLinks ?? []) as {
+      row_key: string;
+      provider: string;
+      provider_url: string | null;
+      last_projected_status: string | null;
+      provider_seen_status: string | null;
+      updated_at: string;
+    }[]
+  ).filter(isDiverged);
 
   return (
     <div className="flex flex-col gap-5">
@@ -44,6 +66,48 @@ export default async function PmSyncPage({ params }: { params: Promise<{ team: s
             teamSlug={teamSlug}
             primaryProvider={(team as { primary_pm_provider: string | null }).primary_pm_provider}
           />
+        </div>
+      </section>
+
+      <section className="prism-card p-4" data-section="inbound-divergence">
+        <h2 className="text-lg font-semibold text-ink">Inbound divergence</h2>
+        <p className="mt-1 text-sm text-ink-secondary">
+          Tasks whose state in the PM tool has drifted from what the brain last projected. The brain
+          is the source of truth — this is <span className="font-medium text-ink">surface-only</span>,
+          shown for a human to pull; it is never written back automatically.
+        </p>
+        <div className="mt-4">
+          <ReconcileButton
+            teamSlug={teamSlug}
+            primaryProvider={(team as { primary_pm_provider: string | null }).primary_pm_provider}
+          />
+        </div>
+        <div className="mt-4 overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead className="text-left text-xs uppercase tracking-wider text-ink-tertiary">
+              <tr>
+                <th className="py-2 pr-4 font-medium">Key</th>
+                <th className="py-2 pr-4 font-medium">Provider</th>
+                <th className="py-2 pr-4 font-medium">Brain projected</th>
+                <th className="py-2 pr-4 font-medium">Seen in tool</th>
+              </tr>
+            </thead>
+            <tbody>
+              {divergences.map((d) => (
+                <tr key={`${d.provider}-${d.row_key}`} data-divergence={d.row_key} className="border-t border-border-subtle">
+                  <td className="py-2 pr-4 font-mono text-xs">{d.row_key}</td>
+                  <td className="py-2 pr-4">
+                    {d.provider_url ? <a className="text-violet" href={d.provider_url}>{d.provider}</a> : d.provider}
+                  </td>
+                  <td className="py-2 pr-4 text-ink-secondary">{d.last_projected_status}</td>
+                  <td className="py-2 pr-4 font-medium text-amber-700">{d.provider_seen_status}</td>
+                </tr>
+              ))}
+              {divergences.length === 0 ? (
+                <tr><td colSpan={4} className="py-4 text-ink-tertiary">No divergence detected.</td></tr>
+              ) : null}
+            </tbody>
+          </table>
         </div>
       </section>
 

@@ -89,6 +89,11 @@ export interface PrepareInput {
   fetchImpl?: typeof fetch;
 }
 
+export interface FetchSeenStatesInput {
+  integration: IntegrationWithSecret;
+  fetchImpl?: typeof fetch;
+}
+
 export interface PmAdapter {
   provider: PmProvider;
   // Optional per-run prefetch: returns an opaque provider bootstrap (states/labels/items/modules)
@@ -96,6 +101,10 @@ export interface PmAdapter {
   prepare?(input: PrepareInput): Promise<unknown>;
   upsertWorkItem(input: UpsertWorkItemInput): Promise<UpsertWorkItemResult>;
   moveToDone(input: ProviderSyncInput): Promise<ProviderSyncResult>;
+  // Inbound reconciliation (brain-api v1.2 Phase 5): read the CURRENT provider workflow-state NAME
+  // for every projected item, keyed by provider resource id. Read-only — never mutates the provider.
+  // Optional: a provider without an implementation simply has no divergence detection.
+  fetchSeenStates?(input: FetchSeenStatesInput): Promise<Map<string, string>>;
 }
 
 // status → desired provider state. Both providers share five workflow groups; `blocked` has no

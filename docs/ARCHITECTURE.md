@@ -187,8 +187,18 @@ membership. A `projection_fingerprint` on the link skips a provider round-trip w
 changed (a second `projectAllTasks` run does zero writes). The admin **"Project board now"**
 button (`projectBoardAction`, admin-gated + audited) on the pm-sync page triggers a full run;
 the work-events done path calls `projectTask` (creating the link/item if missing). `moveToDone`
-remains as a thin state-only delegate. Assignees and inbound/two-way reconciliation are deferred
-(Phase 5 uses `provider_seen_status` to detect divergence).
+remains as a thin state-only delegate. Assignee projection is deferred.
+
+**Inbound divergence detection (brain-api v1.2 Phase 5, surface-only).** The reconcile pass
+(`lib/pm-sync/reconcile.ts: reconcileProviderState`) reads the primary tool's CURRENT workflow
+state for every linked task (adapter `fetchSeenStates` — read-only), records it on
+`task_pm_links.provider_seen_status`, and surfaces any item whose state has drifted from the brain's
+`last_projected_status`. It is **SURFACE-ONLY (brain wins)**: it never mutates the provider and never
+changes brain `tasks.status` — the only write is `provider_seen_status`, and only when it changed
+(so a second pass does zero writes — idempotent). The admin **"Check for divergence"** button
+(`reconcileDivergenceAction`, admin-gated + audited) runs it; the PM-sync page renders the divergence
+list read-only from stored state (`isDiverged`). Conflict policy is fixed at brain-wins: drift is
+shown for a human to pull, never silently applied. Two-way write-back remains out of scope.
 
 **Reactive triggers (brain-api v1.2 Phase 2).** Projection is no longer manual-only. Task UI
 writes — `createTaskAction` / `moveTaskAction` / the new `updateTaskAction` (title/sprint/due/
@@ -328,8 +338,10 @@ guard enforces it, it's named.
   `after()` — bounded to the rows whose projected fields changed, run after the response, and never
   failing the user action (errors → `task_pm_links.last_error` only; `projection_fingerprint` skips
   redundant writes). A merged-work event still marks the matching task done first; provider failures
-  are surfaced in Admin → PM sync, never rolling the task back. Inbound PM→brain reconciliation
-  (two-way) is deferred (Phase 5); v1 only records `provider_seen_status` so divergence is detectable.
+  are surfaced in Admin → PM sync, never rolling the task back. Inbound PM→brain divergence is
+  **detected and surfaced** (Phase 5, `reconcileProviderState`): drift between the tool's state and
+  `last_projected_status` is recorded on `provider_seen_status` and shown on the PM-sync page —
+  surface-only, brain wins, never written back. Two-way write-back remains out of scope.
   (Rows removed from a push are diff-deleted in `tasks` but **not** deleted from the PM board in
   Phase 2 — PM deletion-on-diff is a later phase.)
 - **`key_hash` is column-revoked** from client roles; API secrets are sha256-at-rest, shown once.
