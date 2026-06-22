@@ -25,7 +25,9 @@ export async function GET(req: NextRequest) {
 
   const { data, error } = await supabase
     .from("tasks")
-    .select("row_key, title, assignee, status, sprint, due_date, origin, updated_at, projects(slug), items:source_item_id(synced_at)")
+    .select(
+      "row_key, title, assignee, status, sprint, due_date, parent_row_key, labels, priority, origin, updated_at, projects(slug), items:source_item_id(synced_at)"
+    )
     .eq("team_id", auth.teamId)
     .gt("updated_at", since)
     .not("row_key", "is", null)
@@ -39,7 +41,20 @@ export async function GET(req: NextRequest) {
     return synced ? new Date(t.updated_at) > new Date(synced) : false;
   });
 
-  const byProject = new Map<string, { row_key: string; title: string; assignee: string; status: string; sprint: string; due: string | null }[]>();
+  const byProject = new Map<
+    string,
+    {
+      row_key: string;
+      title: string;
+      assignee: string;
+      status: string;
+      sprint: string;
+      due: string | null;
+      parent: string | null;
+      labels: string[];
+      priority: string;
+    }[]
+  >();
   for (const t of uiChanged) {
     const slug = (t.projects as unknown as { slug: string })?.slug ?? "unknown";
     if (!byProject.has(slug)) byProject.set(slug, []);
@@ -50,6 +65,10 @@ export async function GET(req: NextRequest) {
       status: t.status,
       sprint: t.sprint,
       due: t.due_date,
+      // v1.2 hierarchy fields (body is intentionally excluded — dashboard/DB-only).
+      parent: t.parent_row_key ?? null,
+      labels: (t.labels as string[] | null) ?? [],
+      priority: t.priority ?? "none",
     });
   }
 

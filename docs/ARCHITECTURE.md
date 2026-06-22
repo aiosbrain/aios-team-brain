@@ -20,8 +20,9 @@ Reason from this table, not from a random call site.
 | State | Store (table) | Writer | Readers | Tier/access enforcement |
 |---|---|---|---|---|
 | Synced content | `items`, `item_versions` | **`lib/ingest` only** (single-writer guarded) | dashboard pages, `/api/v1/items`, `lib/query/retrieve`, okf-bundle, metrics | supabase: RLS; postgres: app-code — API ✅, dashboard ✅ (`lib/auth/visibility` choke-point, guarded) |
-| Tasks | `tasks` | `lib/ingest` (sync rows) + `app/actions/tasks.ts` (UI; mints `ui-` row_key) + `lib/work-events` (merged-work completion) | dashboard, `/api/v1/tasks`, PM sync | team-scoped; `origin='ui'` rows survive sync diff |
-| Task PM links | `task_pm_links` | `lib/ingest` (optional task-row PM metadata) + PM backfill | dashboard task badges, `lib/pm-sync` | team-scoped; stores provider IDs/status only, never secrets |
+| Tasks | `tasks` | `lib/ingest` (sync rows) + `app/actions/tasks.ts` (UI; mints `ui-` row_key) + `lib/work-events` (merged-work completion) | dashboard, `/api/v1/tasks`, PM sync | team-scoped; `origin='ui'` rows survive sync diff; v1.2 hierarchy fields `parent_row_key`/`labels`/`priority` (parent integrity — exists + acyclic — enforced in `lib/ingest`); `body` is dashboard/DB-only (never in the markdown contract) |
+| Task PM links | `task_pm_links` | `lib/ingest` (optional task-row PM metadata) + PM backfill | dashboard task badges, `lib/pm-sync` | team-scoped; stores provider IDs/status only, never secrets; v1.2 adds `last_projected_status`/`projection_fingerprint` (skip-detection) + `provider_seen_status` (Phase 5 divergence) |
+| Primary PM provider | `teams.primary_pm_provider` | Admin → Integrations (`setPrimaryPmProvider`, admin-gated + audited) | `lib/pm-sync` projection | the single PM tool the brain projects into; null = projection no-ops / sole-enabled fallback |
 | Work events | `work_events` | `POST /api/v1/work-events` → `lib/work-events` | Admin → PM sync health | team-tier only; unresolved events are preserved for reconciliation |
 | Decisions | `decisions` | `lib/ingest` (sync rows) + `app/actions/decisions.ts` (UI; `source_item_id` NULL) | dashboard, `/api/v1/decisions` | team-scoped; UI rows (`source_item_id` NULL) never diff-deleted; writeback tier-scoped by `audience` |
 | Policy rules | `policies` | admin (role-gated) | `lib/policy.authorize` | role-gated (admin/lead) |
@@ -278,9 +279,13 @@ guard enforces it, it's named.
   per-channel) and a new tier/scope — a product feature, not covered by the current filter.
 - **`admin`/`private` tiers never reach the DB** — rejected with 422 at the API.
 - **Append-only audit.** `audit_log` has a trigger that blocks UPDATE/DELETE.
-- **PM sync is an effect, not the source of truth.** A merged-work event marks the matching
-  AIOS task done first. Plane/Linear failures are recorded on `task_pm_links.last_error` and
-  surfaced in Admin → PM sync; they never roll the task back.
+- **The brain is the source of truth; the PM board is a one-way projection.** The `tasks` table is
+  canonical (v1.2: hierarchy + `body`). The brain projects task create/update/state into the single
+  `teams.primary_pm_provider` board (Plane/Linear) — never the reverse in v1. A merged-work event
+  still marks the matching task done first; provider failures are recorded on
+  `task_pm_links.last_error` and surfaced in Admin → PM sync, never rolling the task back. Inbound
+  PM→brain reconciliation (two-way) is deferred (Phase 5); v1 only records `provider_seen_status` so
+  divergence is detectable.
 - **`key_hash` is column-revoked** from client roles; API secrets are sha256-at-rest, shown once.
 - **Migration replay.** 14-digit timestamp prefixes, unique, lexical == chronological.
   *Guards:* `test/guards/migrations-numbering.test.ts` + `npm run db:test:up` (migrates from zero).

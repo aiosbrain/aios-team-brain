@@ -40,7 +40,11 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ t
   // Resolve the viewer's role on this team for the read gate (the layout already blocks non-admins).
   const sessionDb = await serverClient();
   const user = await getSessionUser();
-  const { data: team } = await sessionDb.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
+  const { data: team } = await sessionDb
+    .from("teams")
+    .select("id, primary_pm_provider")
+    .eq("slug", teamSlug)
+    .maybeSingle();
   if (!team) return null;
   const { data: me } = user
     ? await sessionDb
@@ -67,7 +71,11 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ t
           integrations to run ingestion. Secrets are stored encrypted and never shown again.
         </p>
       </div>
-      <IntegrationsManager teamSlug={teamSlug} integrations={integrations} />
+      <IntegrationsManager
+        teamSlug={teamSlug}
+        integrations={integrations}
+        primaryPmProvider={(team.primary_pm_provider as "plane" | "linear" | null) ?? null}
+      />
     </div>
   );
 }

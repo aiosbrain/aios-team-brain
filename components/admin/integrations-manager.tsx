@@ -9,6 +9,8 @@ import {
   rotateSecret,
   removeIntegration,
   syncSlackNow,
+  setPrimaryPmProvider,
+  type PrimaryPmProvider,
 } from "@/app/t/[team]/admin/integrations/actions";
 
 type IntegrationType = "github" | "granola" | "slack" | "wise" | "linear" | "plane";
@@ -60,9 +62,11 @@ function summarizeConfig(type: IntegrationType, config: Record<string, unknown>)
 export function IntegrationsManager({
   teamSlug,
   integrations,
+  primaryPmProvider,
 }: {
   teamSlug: string;
   integrations: IntegrationRow[];
+  primaryPmProvider: PrimaryPmProvider;
 }) {
   const router = useRouter();
   const [pending, startTransition] = useTransition();
@@ -99,6 +103,41 @@ export function IntegrationsManager({
 
   return (
     <div className="flex flex-col gap-6">
+      <div className="prism-card flex flex-col gap-2 p-4">
+        <p className="flex items-center gap-2 text-sm font-medium text-ink">
+          <Plug className="size-4 text-violet" /> Primary PM tool
+        </p>
+        <p className="text-xs text-ink-secondary">
+          The single project-management tool the brain projects tasks into (epics, sub-issues,
+          status). The brain stays the source of truth; the chosen board is a downstream projection.
+        </p>
+        <div className="flex flex-wrap gap-2">
+          {(
+            [
+              { value: null, label: "None" },
+              { value: "plane", label: "Plane" },
+              { value: "linear", label: "Linear" },
+            ] as { value: PrimaryPmProvider; label: string }[]
+          ).map((opt) => {
+            const active = primaryPmProvider === opt.value;
+            return (
+              <button
+                key={opt.label}
+                type="button"
+                disabled={pending || active}
+                onClick={() => run(() => setPrimaryPmProvider(teamSlug, opt.value))}
+                className={`rounded-md border px-3 py-1.5 text-sm ${
+                  active
+                    ? "border-violet bg-violet/10 text-ink"
+                    : "border-ink/15 text-ink-secondary hover:border-ink/30"
+                }`}
+              >
+                {opt.label}
+              </button>
+            );
+          })}
+        </div>
+      </div>
       <form
         onSubmit={(e) => {
           e.preventDefault();

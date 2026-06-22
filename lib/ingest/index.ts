@@ -6,6 +6,8 @@ import {
   decisionRowSchema,
   normalizeTier,
   normalizeTaskStatus,
+  normalizeTaskPriority,
+  IngestValidationError,
 } from "@/lib/api/schemas";
 import { audit } from "@/lib/api/audit";
 
@@ -58,6 +60,17 @@ export async function ingestItem(
     return { status: "unchanged", id: existing.id };
   }
 
+  // Validate task rows before mutating items so a 422 never leaves a revised item/version behind.
+  let validatedTaskRows: TaskRow[] | undefined;
+  if (payload.rows && payload.kind === "task") {
+    validatedTaskRows = await parseAndValidateTaskRows(
+      supabase,
+      auth.teamId,
+      project.id,
+      payload.rows
+    );
+  }
+
   // 3. upsert item (+ version when body changed)
   const itemRecord = {
     team_id: auth.teamId,
@@ -99,7 +112,14 @@ export async function ingestItem(
   // by the writeback (which would otherwise re-emit a just-written-back UI row forever).
   if (payload.rows && (payload.kind === "task" || payload.kind === "decision")) {
     if (payload.kind === "task") {
-      await materializeTasks(supabase, auth.teamId, project.id, itemId, payload.rows, now);
+      await materializeTasks(
+        supabase,
+        auth.teamId,
+        project.id,
+        itemId,
+        validatedTaskRows!,
+        now
+      );
     } else {
       await materializeDecisions(supabase, auth.teamId, project.id, itemId, payload.rows, now);
     }
@@ -116,40 +136,106 @@ export async function ingestItem(
   return { status: existing ? "updated" : "created", id: itemId };
 }
 
+type TaskRow = NonNullable<ReturnType<typeof taskRowSchema.safeParse>["data"]>;
+
+/** Parse + parent-integrity checks only (no writes). Called before item upsert so 422 is clean. */
+async function parseAndValidateTaskRows(
+  supabase: SupabaseClient,
+  teamId: string,
+  projectId: string,
+  rawRows: unknown[]
+): Promise<TaskRow[]> {
+  const parsed = rawRows.map((r) => taskRowSchema.safeParse(r));
+  const firstBad = parsed.find((r) => !r.success);
+  if (firstBad && !firstBad.success) {
+    throw new IngestValidationError(
+      `invalid task row: ${firstBad.error.issues[0]?.message ?? "bad shape"}`
+    );
+  }
+  const rows = parsed.map((r) => r.data!);
+
+  const incomingByKey = new Map(rows.map((r) => [r.row_key, r]));
+  const parentOf = (r: TaskRow) => (r.parent ?? "").trim();
+
+  const parentMap = new Map<string, string>();
+  const existingKeys = new Set<string>();
+  {
+    const { data: existing } = await supabase
+      .from("tasks")
+      .select("row_key, parent_row_key")
+      .eq("team_id", teamId)
+      .eq("project_id", projectId)
+      .not("row_key", "is", null);
+    for (const t of existing ?? []) {
+      if (!t.row_key) continue;
+      existingKeys.add(t.row_key);
+      const p = (t.parent_row_key ?? "").trim();
+      if (p) parentMap.set(t.row_key, p);
+    }
+  }
+  for (const row of rows) {
+    if (!("parent" in row)) continue;
+    const parent = parentOf(row);
+    if (!parent) {
+      parentMap.delete(row.row_key);
+      continue;
+    }
+    if (parent === row.row_key) {
+      throw new IngestValidationError(`task ${row.row_key}: parent cannot reference itself`);
+    }
+    if (!incomingByKey.has(parent) && !existingKeys.has(parent)) {
+      throw new IngestValidationError(`task ${row.row_key}: parent "${parent}" not found in project`);
+    }
+    parentMap.set(row.row_key, parent);
+  }
+  for (const start of parentMap.keys()) {
+    const seen = new Set<string>();
+    let cur: string | undefined = start;
+    while (cur) {
+      if (seen.has(cur)) throw new IngestValidationError(`task ${start}: parent cycle detected`);
+      seen.add(cur);
+      cur = parentMap.get(cur);
+    }
+  }
+  return rows;
+}
+
 async function materializeTasks(
   supabase: SupabaseClient,
   teamId: string,
   projectId: string,
   itemId: string,
-  rawRows: unknown[],
+  rows: TaskRow[],
   syncedAt: string
 ) {
-  const rows = rawRows
-    .map((r) => taskRowSchema.safeParse(r))
-    .filter((r) => r.success)
-    .map((r) => r.data!);
-
   const incomingKeys = new Set(rows.map((r) => r.row_key));
+  const parentOf = (r: TaskRow) => (r.parent ?? "").trim();
 
   for (const row of rows) {
     const { status, raw_status } = normalizeTaskStatus(row.status || "");
-    const { data: task, error } = await supabase.from("tasks").upsert(
-      {
-        team_id: teamId,
-        project_id: projectId,
-        source_item_id: itemId,
-        row_key: row.row_key,
-        title: row.title,
-        assignee: row.assignee ?? "",
-        status,
-        raw_status,
-        sprint: row.sprint ?? "",
-        due_date: row.due || null,
-        origin: "sync",
-        updated_at: syncedAt,
-      },
-      { onConflict: "team_id,project_id,row_key" }
-    )
+    // `body` is dashboard/DB-only and `parent`/`labels`/`priority` are optional v1.2 fields: each is
+    // written ONLY when the row carries the key, so a six-column push preserves them on update and
+    // falls back to DB defaults on insert. (A present-but-empty value is authoritative — it clears.)
+    const upsertRow: Record<string, unknown> = {
+      team_id: teamId,
+      project_id: projectId,
+      source_item_id: itemId,
+      row_key: row.row_key,
+      title: row.title,
+      assignee: row.assignee ?? "",
+      status,
+      raw_status,
+      sprint: row.sprint ?? "",
+      due_date: row.due || null,
+      origin: "sync",
+      updated_at: syncedAt,
+    };
+    if ("parent" in row) upsertRow.parent_row_key = parentOf(row) || null;
+    if ("labels" in row) upsertRow.labels = row.labels ?? [];
+    if ("priority" in row) upsertRow.priority = normalizeTaskPriority(row.priority);
+    const { data: task, error } = await supabase
+      .from("tasks")
+      .upsert(upsertRow, { onConflict: "team_id,project_id,row_key" })
       .select("id")
       .single();
     if (error) throw new Error(`task row ${row.row_key}: ${error.message}`);
@@ -175,13 +261,25 @@ async function materializeTasks(
   // diff-delete: sync-originated rows absent from this push; UI rows survive.
   const { data: current } = await supabase
     .from("tasks")
-    .select("id, row_key, origin")
+    .select("id, row_key, origin, parent_row_key")
     .eq("team_id", teamId)
     .eq("project_id", projectId)
     .not("row_key", "is", null);
+  const survivors = new Set<string>();
   for (const t of current ?? []) {
     if (t.origin === "sync" && t.row_key && !incomingKeys.has(t.row_key)) {
       await supabase.from("tasks").delete().eq("id", t.id);
+    } else if (t.row_key) {
+      survivors.add(t.row_key);
+    }
+  }
+  // No DB FK backs parent_row_key, so a deleted epic can leave a surviving child pointing at a
+  // now-missing parent. Null those dangling references so the brain stays internally consistent
+  // (the projection's topological sort errors on a missing parent).
+  for (const t of current ?? []) {
+    const parent = (t.parent_row_key ?? "").trim();
+    if (parent && survivors.has(t.row_key!) && !survivors.has(parent)) {
+      await supabase.from("tasks").update({ parent_row_key: null }).eq("id", t.id);
     }
   }
 }
