@@ -74,4 +74,4 @@ changes bump the major version.
 Be kind and direct. This is real work for real teams — assume good faith, prefer the durable fix
 over the quick one, and leave the map (and the tests) better than you found them.
 
-Maintainer: John Dass — iamjohndass@pm.me
+Maintainer: John Ellison — john@john-ellison.com
