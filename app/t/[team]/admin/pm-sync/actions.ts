@@ -8,6 +8,7 @@ import { getSessionUser } from "@/lib/auth/session";
 import { resolveIntegrationsAdmin } from "@/lib/integrations/read";
 import { audit } from "@/lib/api/audit";
 import { projectAllTasks, type ProjectionReport } from "@/lib/pm-sync";
+import { reconcileProviderState, type DivergenceRow } from "@/lib/pm-sync/reconcile";
 
 async function requireAdmin(teamSlug: string) {
   const supabase = await serverClient();
@@ -66,4 +67,40 @@ export async function projectBoardAction(teamSlug: string): Promise<ProjectBoard
 
   revalidatePath(`/t/${teamSlug}/admin/pm-sync`);
   return { ok: true, provider, counts, reports };
+}
+
+export interface ReconcileResultDto {
+  ok: boolean;
+  error?: string;
+  provider?: string | null;
+  seenUpdated?: number;
+  divergences?: DivergenceRow[];
+}
+
+/**
+ * "Check for divergence" — inbound reconcile pass (brain-api v1.2 Phase 5). Admins only; audited.
+ * Reads the primary PM tool's CURRENT state for each linked task, records `provider_seen_status`,
+ * and surfaces items whose provider state has drifted from the brain's `last_projected_status`.
+ * SURFACE-ONLY: brain wins — it never writes back to the brain or the board.
+ */
+export async function reconcileDivergenceAction(teamSlug: string): Promise<ReconcileResultDto> {
+  const ctx = await requireAdmin(teamSlug);
+  if (!ctx) return { ok: false, error: "admins only" };
+
+  const db = adminClient();
+  const result = await reconcileProviderState(db, ctx.teamId);
+  if (result.provider === null) return { ok: false, error: result.reason ?? "no primary PM provider configured" };
+
+  await audit(db, {
+    team_id: ctx.teamId,
+    actor_kind: "member",
+    member_id: ctx.myMemberId,
+    action: "team.reconcile_divergence",
+    target_type: "team",
+    target_id: ctx.teamId,
+    meta: { provider: result.provider, seenUpdated: result.seenUpdated, divergences: result.divergences.length },
+  });
+
+  revalidatePath(`/t/${teamSlug}/admin/pm-sync`);
+  return { ok: true, provider: result.provider, seenUpdated: result.seenUpdated, divergences: result.divergences };
 }

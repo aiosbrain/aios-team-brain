@@ -8,6 +8,7 @@ import {
   requireString,
   sameLabelSet,
   type DesiredState,
+  type FetchSeenStatesInput,
   type PmAdapter,
   type PrepareInput,
   type ProviderSyncInput,
@@ -218,6 +219,19 @@ export const linearAdapter: PmAdapter = {
     const ctx = linearCtx({ integration, fetchImpl });
     const teamId = requireString(ctx.teamIdConfig, "Linear teamId (config.teamId) for projection");
     return buildBootstrap(ctx, teamId);
+  },
+
+  // Phase 5 inbound reconcile: list every issue once and return resource id → current state NAME.
+  // Read-only (reuses the projection bootstrap queries; performs no mutations).
+  async fetchSeenStates({ integration, fetchImpl }: FetchSeenStatesInput): Promise<Map<string, string>> {
+    const ctx = linearCtx({ integration, fetchImpl });
+    const teamId = requireString(ctx.teamIdConfig, "Linear teamId (config.teamId) for reconcile");
+    const boot = await buildBootstrap(ctx, teamId);
+    const seen = new Map<string, string>();
+    for (const [id, issue] of boot.issuesById) {
+      if (issue.state?.name) seen.set(id, issue.state.name);
+    }
+    return seen;
   },
 
   async upsertWorkItem({ task, link, integration, desiredFingerprint, statusOnly, bootstrap, fetchImpl }: UpsertWorkItemInput): Promise<UpsertWorkItemResult> {
