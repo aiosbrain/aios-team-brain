@@ -46,7 +46,8 @@ reviews:
         test DB (DATABASE_TEST_URL) — no mocks for persistence or RLS checks.
 
   finishing_touches:
-    docstrings: false
+    docstrings:
+      enabled: false
 
 chat:
   auto_reply: true
