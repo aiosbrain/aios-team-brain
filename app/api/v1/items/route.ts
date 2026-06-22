@@ -1,4 +1,4 @@
-import { NextRequest } from "next/server";
+import { NextRequest, after } from "next/server";
 import { adminClient } from "@/lib/supabase/admin";
 import { authenticateApiKey } from "@/lib/api/auth";
 import { rateLimit } from "@/lib/api/rate-limit";
@@ -9,6 +9,7 @@ import {
   IngestValidationError,
 } from "@/lib/api/schemas";
 import { ingestItem } from "@/lib/ingest";
+import { projectChangedTasksAfterWrite } from "@/lib/pm-sync";
 
 export const runtime = "nodejs";
 
@@ -60,7 +61,30 @@ export async function POST(req: NextRequest) {
 
   try {
     const result = await ingestItem(supabase, auth, parsed.data, tier);
-    return Response.json(result, { status: result.status === "created" ? 201 : 200 });
+
+    // Reactive auto-projection (brain-api v1.2 Phase 2): on a task push that actually changed
+    // projected fields, schedule a bounded projection of ONLY the changed rows into the team's
+    // primary PM tool — after the response, never failing/blocking the push. Fire-and-forget; the
+    // helper swallows all errors. work-events keeps its own inline projection (unchanged).
+    if (
+      parsed.data.kind === "task" &&
+      result.status !== "unchanged" &&
+      result.projectId &&
+      (result.changedTaskRowKeys?.length ?? 0) > 0
+    ) {
+      const teamId = auth.teamId;
+      const projectId = result.projectId;
+      const rowKeys = result.changedTaskRowKeys!;
+      after(async () => {
+        await projectChangedTasksAfterWrite(adminClient(), teamId, projectId, rowKeys);
+      });
+    }
+
+    // Strip the internal scheduling hints — the HTTP wire format stays { status, id }.
+    return Response.json(
+      { status: result.status, id: result.id },
+      { status: result.status === "created" ? 201 : 200 }
+    );
   } catch (e) {
     // Client validation failures (e.g. a bad task row or a parent-integrity violation) are 422,
     // not 500 — the CLI needs a structured signal to fix the markdown and retry.

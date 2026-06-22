@@ -10,6 +10,11 @@ import {
   IngestValidationError,
 } from "@/lib/api/schemas";
 import { audit } from "@/lib/api/audit";
+import {
+  effectiveProjectable,
+  projectableChanged,
+  type ProjectableSnapshot,
+} from "@/lib/ingest/projectable-diff";
 
 /**
  * The ONLY write path for synced content. Runs with the service role (bypasses
@@ -20,13 +25,24 @@ import { audit } from "@/lib/api/audit";
  *   3. upsert item; version on body change
  *   4. rows[] → diff-sync by row_key; never delete origin='ui' task rows
  *   5. access 'client' → 'external' (handled by caller); 'admin' → 422 (caller)
+ *
+ * For task items, returns `projectId` + `changedTaskRowKeys` (the row_keys whose *projected* fields
+ * changed this push) so the route can schedule a bounded reactive projection via `after()`. These
+ * are internal scheduling hints — the route strips them from the HTTP response (wire format unchanged).
  */
+export interface IngestResult {
+  status: "created" | "updated" | "unchanged";
+  id: string;
+  projectId?: string;
+  changedTaskRowKeys?: string[];
+}
+
 export async function ingestItem(
   supabase: SupabaseClient,
   auth: { teamId: string; memberId: string; apiKeyId: string },
   payload: ItemPayload,
   access: "team" | "external"
-): Promise<{ status: "created" | "updated" | "unchanged"; id: string }> {
+): Promise<IngestResult> {
   // 1. project
   const { data: project, error: projErr } = await supabase
     .from("projects")
@@ -57,7 +73,8 @@ export async function ingestItem(
       action: "item.unchanged", target_type: "item", target_id: existing.id,
       meta: { path: payload.path },
     });
-    return { status: "unchanged", id: existing.id };
+    // No projection on an unchanged push (the route also guards status !== "unchanged").
+    return { status: "unchanged", id: existing.id, projectId: project.id };
   }
 
   // Validate task rows before mutating items so a 422 never leaves a revised item/version behind.
@@ -110,9 +127,10 @@ export async function ingestItem(
   // markdown table diff-deletes its synced rows. `now` (the item's synced_at) is used as
   // the row updated_at, so a freshly-synced row is NOT mistaken for "edited after sync"
   // by the writeback (which would otherwise re-emit a just-written-back UI row forever).
+  let changedTaskRowKeys: string[] | undefined;
   if (payload.rows && (payload.kind === "task" || payload.kind === "decision")) {
     if (payload.kind === "task") {
-      await materializeTasks(
+      changedTaskRowKeys = await materializeTasks(
         supabase,
         auth.teamId,
         project.id,
@@ -133,7 +151,7 @@ export async function ingestItem(
     meta: { path: payload.path, kind: payload.kind, access, rows: payload.rows?.length ?? 0 },
   });
 
-  return { status: existing ? "updated" : "created", id: itemId };
+  return { status: existing ? "updated" : "created", id: itemId, projectId: project.id, changedTaskRowKeys };
 }
 
 type TaskRow = NonNullable<ReturnType<typeof taskRowSchema.safeParse>["data"]>;
@@ -207,12 +225,40 @@ async function materializeTasks(
   itemId: string,
   rows: TaskRow[],
   syncedAt: string
-) {
+): Promise<string[]> {
   const incomingKeys = new Set(rows.map((r) => r.row_key));
   const parentOf = (r: TaskRow) => (r.parent ?? "").trim();
 
+  // Snapshot the incoming rows' projectable columns BEFORE the upsert loop, so we can detect which
+  // rows' projected fields changed this push (bounded reactive projection — see projectable-diff).
+  const snapshotByKey = new Map<string, ProjectableSnapshot>();
+  if (incomingKeys.size) {
+    const { data: before } = await supabase
+      .from("tasks")
+      .select("row_key, title, status, sprint, priority, labels, parent_row_key")
+      .eq("team_id", teamId)
+      .eq("project_id", projectId)
+      .not("row_key", "is", null);
+    for (const t of before ?? []) {
+      if (!t.row_key || !incomingKeys.has(t.row_key)) continue;
+      snapshotByKey.set(t.row_key, {
+        title: t.title ?? "",
+        status: t.status ?? "backlog",
+        sprint: t.sprint ?? "",
+        priority: t.priority || "none",
+        labels: t.labels ?? [],
+        parent_row_key: t.parent_row_key ?? null,
+      });
+    }
+  }
+  const changed = new Set<string>();
+
   for (const row of rows) {
     const { status, raw_status } = normalizeTaskStatus(row.status || "");
+    // Projected-field change detection (title/status/sprint/priority/labels/parent only). A new row
+    // (no snapshot) is always "changed"; assignee/due/body changes never trigger projection.
+    const snapshot = snapshotByKey.get(row.row_key) ?? null;
+    if (projectableChanged(snapshot, effectiveProjectable(row, snapshot))) changed.add(row.row_key);
     // `body` is dashboard/DB-only and `parent`/`labels`/`priority` are optional v1.2 fields: each is
     // written ONLY when the row carries the key, so a six-column push preserves them on update and
     // falls back to DB defaults on insert. (A present-but-empty value is authoritative — it clears.)
@@ -280,8 +326,15 @@ async function materializeTasks(
     const parent = (t.parent_row_key ?? "").trim();
     if (parent && survivors.has(t.row_key!) && !survivors.has(parent)) {
       await supabase.from("tasks").update({ parent_row_key: null }).eq("id", t.id);
+      // Nulling a dangling parent IS a projected-field change (the child must un-nest on the board),
+      // but it happens after the snapshot diff — so flag it here or reactive projection would miss it.
+      if (t.row_key) changed.add(t.row_key);
     }
   }
+
+  // The row_keys whose projected fields changed this push. The route projects only these (the
+  // after() callback reloads each row's final DB state, so a parent nulled above is reflected).
+  return [...changed];
 }
 
 async function materializeDecisions(

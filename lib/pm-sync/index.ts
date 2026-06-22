@@ -7,6 +7,7 @@ import type { PmProvider } from "@/lib/pm-sync/provider";
 
 export { projectTask, projectAllTasks } from "@/lib/pm-sync/project";
 export type { ProjectionReport, ProjectionTaskRow } from "@/lib/pm-sync/project";
+export { projectTaskByIdAfterWrite, projectChangedTasksAfterWrite } from "@/lib/pm-sync/after-write";
 
 export interface TaskForPmSync {
   id: string;

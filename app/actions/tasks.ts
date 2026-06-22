@@ -1,15 +1,34 @@
 "use server";
 
+import { after } from "next/server";
+
 import { serverClient } from "@/lib/supabase/server";
+import { adminClient } from "@/lib/supabase/admin";
 import { currentMember } from "@/lib/auth/guard";
 import { uiRowKey, isUniqueViolation } from "@/lib/ids";
+import { normalizeTaskPriority } from "@/lib/api/schemas";
+import { projectTaskByIdAfterWrite } from "@/lib/pm-sync";
 import { TASK_STATUSES, type Task, type TaskStatus } from "@/components/kanban/types";
 
 /**
  * Backend-agnostic task mutations initiated from the Kanban board. In supabase
  * mode these also satisfy RLS; in postgres mode the currentMember() guard is
  * the access control. (Browser → server action so no PostgREST is needed.)
+ *
+ * Reactive projection (brain-api v1.2 Phase 2): each successful write schedules a single-row
+ * projection into the team's primary PM tool via `after()` (runs after the response). It loads the
+ * full task row inside the callback and NEVER fails the user action — on error it only records
+ * `task_pm_links.last_error`. UI writes always schedule (they bypass the push-path changed-rows
+ * guard); the engine's projection_fingerprint skip prevents a redundant provider write.
  */
+
+// Schedule the fire-and-forget projection. adminClient() needs no request context (gone by the time
+// the callback runs); the helper swallows every error so projection can't fail the action.
+function scheduleProjection(taskId: string) {
+  after(async () => {
+    await projectTaskByIdAfterWrite(adminClient(), taskId);
+  });
+}
 
 export interface NewTaskInput {
   teamId: string;
@@ -39,7 +58,9 @@ export async function moveTaskAction(
     .from("tasks")
     .update({ status, updated_at: new Date().toISOString() })
     .eq("id", taskId);
-  return error ? { ok: false, error: error.message } : { ok: true };
+  if (error) return { ok: false, error: error.message };
+  scheduleProjection(taskId);
+  return { ok: true };
 }
 
 export async function createTaskAction(
@@ -73,9 +94,75 @@ export async function createTaskAction(
         "id, row_key, title, assignee, status, sprint, due_date, origin, project_id, updated_at"
       )
       .single();
-    if (!error && data) return { ok: true, task: data as Task };
+    if (!error && data) {
+      scheduleProjection((data as Task).id);
+      return { ok: true, task: data as Task };
+    }
     if (attempt === 0 && isUniqueViolation(error?.message)) continue;
     return { ok: false, error: error?.message ?? "could not create task" };
   }
   return { ok: false, error: "could not create task" };
+}
+
+export interface UpdateTaskInput {
+  taskId: string;
+  title?: string;
+  sprint?: string;
+  dueDate?: string | null;
+  parentRowKey?: string | null;
+  labels?: string[];
+  priority?: string;
+  body?: string;
+}
+
+/**
+ * Edit a task's projectable fields from the dashboard (brain-api v1.2). Partial — only provided keys
+ * are written, so a title-only edit never clobbers labels. Schedules projection on success.
+ * (Kanban UI wiring lands in Phase 4; this action + its projection trigger ship now.)
+ */
+export async function updateTaskAction(
+  input: UpdateTaskInput
+): Promise<{ ok: boolean; error?: string }> {
+  if (!input.taskId) return { ok: false, error: "taskId required" };
+  const supabase = await serverClient();
+  const { data: task } = await supabase
+    .from("tasks")
+    .select("team_id, project_id, row_key")
+    .eq("id", input.taskId)
+    .maybeSingle();
+  if (!task) return { ok: false, error: "task not found" };
+  const row = task as { team_id: string; project_id: string; row_key: string | null };
+  const me = await currentMember(row.team_id);
+  if (!me) return { ok: false, error: "not a member of this team" };
+
+  // Parent integrity (when provided + non-empty): reject self-parent; require the parent to exist in
+  // the same (team, project). Full cycle detection is deferred to Phase 4's richer CRUD — the
+  // projection engine's visiting-guard prevents any runtime loop meanwhile.
+  const update: Record<string, unknown> = { updated_at: new Date().toISOString() };
+  if (input.title !== undefined) update.title = input.title;
+  if (input.sprint !== undefined) update.sprint = input.sprint;
+  if (input.dueDate !== undefined) update.due_date = input.dueDate || null;
+  if (input.labels !== undefined) update.labels = input.labels;
+  if (input.priority !== undefined) update.priority = normalizeTaskPriority(input.priority);
+  if (input.body !== undefined) update.body = input.body;
+  if (input.parentRowKey !== undefined) {
+    const parent = (input.parentRowKey ?? "").trim();
+    if (parent) {
+      if (parent === row.row_key) return { ok: false, error: "a task cannot be its own parent" };
+      const { data: parentRow } = await supabase
+        .from("tasks")
+        .select("id")
+        .eq("team_id", row.team_id)
+        .eq("project_id", row.project_id)
+        .eq("row_key", parent)
+        .maybeSingle();
+      if (!parentRow) return { ok: false, error: `parent "${parent}" not found in project` };
+    }
+    update.parent_row_key = parent || null;
+  }
+
+  const { error } = await supabase.from("tasks").update(update).eq("id", input.taskId);
+  if (error) return { ok: false, error: error.message };
+  scheduleProjection(input.taskId);
+  return { ok: true };
 }
