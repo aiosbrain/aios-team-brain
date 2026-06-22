@@ -24,7 +24,9 @@
     "db:test:up": "docker compose -f compose.test.yml up -d --wait && DATABASE_URL=postgres://app:app@localhost:5434/app_test npm run pg:schema",
     "db:test:down": "docker compose -f compose.test.yml down -v",
     "test:datamechanics": "vitest run --config vitest.datamechanics.config.ts",
-    "test:datamechanics:local": "DATABASE_TEST_URL=postgres://app:app@localhost:5434/app_test vitest run --config vitest.datamechanics.config.ts"
+    "test:datamechanics:local": "DATABASE_TEST_URL=postgres://app:app@localhost:5434/app_test vitest run --config vitest.datamechanics.config.ts",
+    "test:http": "vitest run --config vitest.http.config.ts",
+    "test:http:local": "npm run build && DATABASE_TEST_URL=postgres://app:app@localhost:5434/app_test vitest run --config vitest.http.config.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.104.1",
