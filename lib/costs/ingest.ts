@@ -1,6 +1,6 @@
 import "server-only";
 import type { SupabaseClient } from "@supabase/supabase-js";
-import type { UsageCostPayload } from "@/lib/api/schemas";
+import { IngestValidationError, type UsageCostPayload } from "@/lib/api/schemas";
 import { buildIdentityMap, resolveMember } from "@/lib/identity/resolve";
 import { audit } from "@/lib/api/audit";
 
@@ -17,7 +17,7 @@ export async function ingestUsageCost(
   if (payload.member) {
     const map = await buildIdentityMap(supabase, auth.teamId);
     const resolved = resolveMember(map, { key: payload.member });
-    if (!resolved) throw new Error(`unknown member handle '${payload.member}'`);
+    if (!resolved) throw new IngestValidationError(`unknown member handle '${payload.member}'`);
     memberId = resolved;
   }
 

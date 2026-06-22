@@ -123,6 +123,12 @@ bash scripts/e2e.sh    # system-level integration: seed → push → materialize
 - **Schema:** canonical = `postgres/schema.sql` (idempotent; `npm run pg:schema` loads it and is the
   prod rollout step against Railway). `supabase/migrations/` is the **legacy/derived** RLS schema, used
   only when `DB_BACKEND=supabase`; its `migrations-numbering` guard is now legacy-scoped.
+- **Adding a COLUMN to an existing table:** `schema.sql` is `create … if not exists`, so editing the
+  `create table` body is a **no-op on a DB that already has the table** — prod keeps the old shape.
+  Put the `alter table … add column if not exists` in **`postgres/migrations/`** (applied by
+  `pg:schema` after `schema.sql`, in filename order) **and** mirror it into `schema.sql` for
+  from-zero. See `postgres/migrations/README.md`. (A brand-new table needs no migration —
+  `create table if not exists` in `schema.sql` covers it.)
 - **Deploy:** Postgres on Railway (self-host portable). After a merge, run `npm run pg:schema` against
   prod for any schema change, and **confirm the platform started a new build** (CI webhooks can be
   silently dropped); re-trigger if the latest deploy predates the merge.

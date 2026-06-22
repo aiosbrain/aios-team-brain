@@ -2,7 +2,11 @@ import { NextRequest } from "next/server";
 import { adminClient } from "@/lib/supabase/admin";
 import { authenticateApiKey } from "@/lib/api/auth";
 import { rateLimit } from "@/lib/api/rate-limit";
-import { maturitySnapshotPayloadSchema, errorResponse } from "@/lib/api/schemas";
+import {
+  maturitySnapshotPayloadSchema,
+  errorResponse,
+  IngestValidationError,
+} from "@/lib/api/schemas";
 import { ingestMaturitySnapshot } from "@/lib/metrics/individual-maturity-ingest";
 
 export const runtime = "nodejs";
@@ -42,6 +46,10 @@ export async function POST(req: NextRequest) {
     const result = await ingestMaturitySnapshot(supabase, auth, parsed.data);
     return Response.json({ status: "ok", ...result }, { status: 201 });
   } catch (e) {
+    // Unknown member handle = client input error → 422, not a 500 brain fault.
+    if (e instanceof IngestValidationError) {
+      return errorResponse("invalid_payload", e.message, 422);
+    }
     return errorResponse("internal", e instanceof Error ? e.message : "snapshot ingest failed", 500);
   }
 }

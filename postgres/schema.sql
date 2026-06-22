@@ -10,6 +10,10 @@
 --     runs on a stock Postgres (e.g. Railway) with no extra extensions
 --
 -- Idempotent: safe to re-run. Load with `npm run pg:schema`.
+-- NOTE: every object below is `create … if not exists`, so editing a `create table` body does
+-- NOT alter a table that already exists in a deployed DB. To ADD A COLUMN, also add an idempotent
+-- `alter table … add column if not exists` to `postgres/migrations/` (pg:schema applies those
+-- after this file). See `postgres/migrations/README.md`.
 -- ───────────────────────────────────────────────────────────────────────────
 
 create extension if not exists citext;
