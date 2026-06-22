@@ -1,6 +1,10 @@
 export const TASK_STATUSES = ["backlog", "ready", "in_progress", "blocked", "done"] as const;
 export type TaskStatus = (typeof TASK_STATUSES)[number];
 
+// Canonical priority words (postgres `task_priority`); mirrors normalizeTaskPriority's output set.
+export const TASK_PRIORITIES = ["none", "low", "medium", "high", "urgent"] as const;
+export type TaskPriority = (typeof TASK_PRIORITIES)[number];
+
 export const STATUS_LABELS: Record<TaskStatus, string> = {
   backlog: "Backlog",
   ready: "Ready",
@@ -20,6 +24,11 @@ export type Task = {
   origin: "sync" | "ui";
   project_id: string;
   updated_at: string;
+  // Hierarchy/board fields (brain-api v1.2). `body` is dashboard/DB-only.
+  parent_row_key?: string | null;
+  labels?: string[];
+  priority?: string;
+  body?: string;
   task_pm_links?: {
     provider: "plane" | "linear";
     provider_url: string;
