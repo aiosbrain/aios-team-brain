@@ -330,7 +330,7 @@ export const planeAdapter: PmAdapter = {
       status: mutated ? "synced" : "skipped",
       providerResourceId: item.id,
       providerUrl: link?.provider_url || "",
-      parentResourceId: item.id,
+      parentResourceId: parent,
       externalSource: ctx.externalSource,
       syncedStatus: state.id,
       fingerprint: desiredFingerprint,

@@ -84,6 +84,9 @@ describe("work events (real Postgres)", () => {
 
   it("records provider sync errors on the PM link without losing task completion", async () => {
     const seed = await seedTeam();
+    // v1.2: projection targets the team's primary PM tool. Declare it so the work-events done path
+    // knows the intended provider even though no integration is enabled (→ missing_integration).
+    await db().from("teams").update({ primary_pm_provider: "plane" }).eq("id", seed.teamId);
     await ingest(seed, {
       kind: "task",
       path: "3-log/tasks.md",

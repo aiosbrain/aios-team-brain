@@ -72,6 +72,13 @@ export interface ResolvedPrimary {
   integration: IntegrationWithSecret;
 }
 
+// Resolution outcomes: ready (provider + integration), provider-known-but-integration-missing
+// (still link + record the error for the pm-sync surface), or unresolved (true no-op).
+export type PrimaryResolution =
+  | ResolvedPrimary
+  | { provider: PmProvider; integration: null; reason: string }
+  | { provider: null; reason: string };
+
 const PROVIDERS: PmProvider[] = ["plane", "linear"];
 
 function chooseIntegration(integrations: IntegrationWithSecret[], provider: PmProvider): IntegrationWithSecret | null {
@@ -83,7 +90,7 @@ function chooseIntegration(integrations: IntegrationWithSecret[], provider: PmPr
 export async function resolvePrimaryProvider(
   supabase: SupabaseClient,
   teamId: string
-): Promise<ResolvedPrimary | { provider: null; reason: string }> {
+): Promise<PrimaryResolution> {
   const integrations = await getEnabledIntegrationsWithSecrets(supabase, teamId);
   const { data: team } = await supabase.from("teams").select("primary_pm_provider").eq("id", teamId).maybeSingle();
   const configured = (team?.primary_pm_provider as PmProvider | null) ?? null;
@@ -91,7 +98,9 @@ export async function resolvePrimaryProvider(
   if (configured) {
     const integration = chooseIntegration(integrations, configured);
     if (!integration) {
-      return { provider: null, reason: `primary provider "${configured}" has no enabled integration/secret` };
+      // Target is known but its integration is absent/secret-less: callers still record the
+      // failure on the link (observability parity with pre-v1.2 markdown-link sync).
+      return { provider: configured, integration: null, reason: `${configured} integration is not enabled or has no secret` };
     }
     return { provider: configured, integration };
   }
@@ -204,9 +213,16 @@ export async function projectTask(
 ): Promise<ProjectionReport> {
   if (!row.row_key) return { row_key: "", provider: null, status: "no_row_key" };
 
-  const primary = opts.primary ?? (await resolvePrimaryProvider(supabase, row.team_id));
-  if (!("integration" in primary)) {
+  const primary: PrimaryResolution = opts.primary ?? (await resolvePrimaryProvider(supabase, row.team_id));
+  if (primary.provider === null) {
     return { row_key: row.row_key, provider: null, status: "no_primary_provider", error: primary.reason };
+  }
+  if (primary.integration === null) {
+    // Provider is known but its integration is missing — create/find the link and record the
+    // error on it so the pm-sync failure surface shows it, then report missing_integration.
+    const link = await ensureLink(supabase, row, primary.provider, "aios-backlog");
+    await persistError(supabase, link, primary.reason);
+    return { row_key: row.row_key, provider: primary.provider, status: "missing_integration", error: primary.reason };
   }
   const { provider, integration } = primary;
   const adapter = ADAPTERS[provider];
@@ -306,8 +322,8 @@ export async function projectAllTasks(
   opts: ProjectAllOptions = {}
 ): Promise<{ provider: PmProvider | null; reports: ProjectionReport[]; reason?: string }> {
   const primary = await resolvePrimaryProvider(supabase, teamId);
-  if (!("integration" in primary)) {
-    return { provider: null, reports: [], reason: primary.reason };
+  if (primary.provider === null || primary.integration === null) {
+    return { provider: primary.provider, reports: [], reason: primary.reason };
   }
 
   const { data: taskRows } = await supabase

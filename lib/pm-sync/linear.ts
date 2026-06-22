@@ -304,7 +304,7 @@ export const linearAdapter: PmAdapter = {
       status: mutated ? "synced" : "skipped",
       providerResourceId: issue.id,
       providerUrl: issue.url || link?.provider_url || "",
-      parentResourceId: issue.id,
+      parentResourceId: parent,
       externalSource: ctx.externalSource,
       syncedStatus: state.name,
       fingerprint: desiredFingerprint,
