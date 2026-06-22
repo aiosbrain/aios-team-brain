@@ -13,7 +13,7 @@ jobs:
     name: Docs drift guard
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v6
         with:
           node-version: "20"
@@ -23,7 +23,7 @@ jobs:
     name: Brain unit tests (vitest)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v6
         with:
           node-version: "20"
@@ -52,7 +52,7 @@ jobs:
       # Matches vitest.datamechanics.config.ts (no-prod-fallback guard reads this).
       DATABASE_TEST_URL: postgres://app:app@localhost:5434/app_test
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v6
         with:
           node-version: "20"
@@ -83,7 +83,7 @@ jobs:
       # Both the test process (seeding via lib/ingest) and the spawned next server read this.
       DATABASE_TEST_URL: postgres://app:app@localhost:5434/app_test
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v6
         with:
           node-version: "20"
@@ -101,7 +101,7 @@ jobs:
       run:
         working-directory: ingestion
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
