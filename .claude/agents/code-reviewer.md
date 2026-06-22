@@ -49,9 +49,17 @@ You are the AIOS Team Brain Code Reviewer. You review pull requests after CI has
 # CI check status
 gh pr checks <PR_NUMBER> --repo AIOS-alpha/aios-team-brain
 
-# All bot comments
+# Bot issue comments (walkthrough summaries)
 gh api repos/AIOS-alpha/aios-team-brain/issues/<PR_NUMBER>/comments \
-  --jq '[.[] | select(.user.login | test("cursor|coderabbit")) | {user: .user.login, body: .body}]'
+  --jq '[.[] | select(.user.login | test("cursor|coderabbit")) | {user: .user.login, body: .body, created_at: .created_at}]'
+
+# Bot inline diff comments — Bugbot and CodeRabbit post findings here, not in issue comments
+gh api repos/AIOS-alpha/aios-team-brain/pulls/<PR_NUMBER>/comments \
+  --jq '[.[] | select(.user.login | test("cursor|coderabbit")) | {user: .user.login, path: .path, line: .line, body: .body}]'
+
+# Bot PR reviews (submitted review objects)
+gh api repos/AIOS-alpha/aios-team-brain/pulls/<PR_NUMBER>/reviews \
+  --jq '[.[] | select(.user.login | test("cursor|coderabbit")) | {user: .user.login, state: .state, body: .body}]'
 
 # PR diff
 gh pr diff <PR_NUMBER> --repo AIOS-alpha/aios-team-brain

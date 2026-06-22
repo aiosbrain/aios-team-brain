@@ -82,7 +82,14 @@ These run outside GitHub Actions and post comments to the PR conversation. They 
 | CodeRabbit | `coderabbitai[bot]` | ~2 min | Walkthrough summary + inline suggestions |
 | Cursor Security Reviewer | `cursor[bot]` | 2–5 min | Auth, injection, secrets, access control |
 
-**Polling:** The builder agent runs `scripts/wait-for-bots.mjs --pr <n> --repo AIOS-alpha/aios-team-brain` after opening a PR. It blocks until `cursor[bot]` and `coderabbitai[bot]` have both posted, then prints a summary before the Code Reviewer agent runs.
+**Polling:** The builder agent runs `wait-for-bots.mjs` from the `aios-workspace` repo, passing `--repo` explicitly to target any AIOS-alpha repo:
+
+```bash
+node /path/to/aios-workspace/scripts/wait-for-bots.mjs \
+  --pr <n> --repo AIOS-alpha/aios-team-brain
+```
+
+The script lives only in `aios-workspace` (not duplicated here) — it is a shared cross-repo tool. It blocks until `cursor[bot]` and `coderabbitai[bot]` have both posted substantive feedback after the latest push (rate-limit stubs and pre-push comments are rejected), then prints a summary before the Code Reviewer agent runs.
 
 ---
 
