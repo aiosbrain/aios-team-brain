@@ -59,12 +59,9 @@ type MemberMeta = {
 
 const UNATTRIBUTED = "Unattributed";
 
-function scopeUsageCosts(
-  query: ReturnType<SupabaseClient["from"]>,
-  viewer: QueryLogViewer
-) {
+function scopeUsageCosts<Q>(query: Q, viewer: QueryLogViewer): Q {
   if (viewer.isAdmin) return query;
-  return query.eq("member_id", viewer.memberId);
+  return (query as { eq(column: string, value: string): Q }).eq("member_id", viewer.memberId);
 }
 
 export async function getExternalCosts(
