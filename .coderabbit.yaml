@@ -1,0 +1,52 @@
+version: "2"
+language: "en-US"
+
+reviews:
+  profile: "chill"
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  review_status: true
+  collapse_walkthrough: false
+  auto_review:
+    enabled: true
+    drafts: false
+    base_branches:
+      - main
+
+  path_filters:
+    - "!.next/**"
+    - "!ingestion/.venv/**"
+    - "!ingestion/**/*.pyc"
+    - "!coverage/**"
+    - "!node_modules/**"
+    - "!*.lock"
+
+  path_instructions:
+    - path: "app/api/**"
+      instructions: |
+        Check that every new route is documented in the <!-- drift:routes --> block of
+        docs/ARCHITECTURE.md. Flag if not.
+    - path: "postgres/schema.sql"
+      instructions: |
+        Check that every new table is documented in the <!-- drift:tables --> block of
+        docs/ARCHITECTURE.md. Flag if not.
+    - path: "ingestion/**"
+      instructions: |
+        Check that any new ingest source is registered in sources/registry.py and
+        documented in the <!-- drift:sources --> block of docs/ARCHITECTURE.md.
+    - path: "lib/**"
+      instructions: |
+        Verify tier access: functions that return data must filter by the caller's
+        access tier (admin/team/external). The brain rejects admin-tier at the API
+        boundary (422) — never expose admin content to team-tier callers.
+    - path: "**/*.test.ts"
+      instructions: |
+        Tests should be spec-first. datamechanics tests must use the real Postgres
+        test DB (DATABASE_TEST_URL) — no mocks for persistence or RLS checks.
+
+  finishing_touches:
+    docstrings: false
+
+chat:
+  auto_reply: true

@@ -1,0 +1,8 @@
+# AIOS Team Brain — code owners
+# All PRs require review from core team.
+* @AIOS-alpha/core
+
+# Sync contract — extra scrutiny for API changes
+docs/brain-api.md @AIOS-alpha/core
+app/api/ @AIOS-alpha/core
+postgres/schema.sql @AIOS-alpha/core
