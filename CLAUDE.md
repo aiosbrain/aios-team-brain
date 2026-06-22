@@ -58,7 +58,7 @@ Put a spec-derived test in the tier that catches *its* failure mode:
 |---|---|---|
 | **unit** (`vitest.config.ts`) | nothing (pure) | parse/format boundaries, pure logic, **all drift/contract guards** |
 | **data-mechanics** (`vitest.datamechanics.config.ts`) | **real Postgres, stubbed model** | persistence & access: write→store→read, dedup, diff-sync, tier isolation |
-| **integration** | API route handlers over a real DB + the system-level `scripts/e2e.sh` | routing, auth, tier-422, the cross-process sync loop |
+| **integration** (`vitest.http.config.ts`, `npm run test:http`) | the API over a **real socket** (`next start` + real Postgres) + the system-level `scripts/e2e.sh` | routing, auth, tier-422, cookies/headers, the JSON wire format, the cross-process sync loop |
 | **eval** *(not built)* | real model API | model judgment (grounded-answer quality) — exercised live in `e2e.sh` step 9 |
 
 Mental model: **unit = parse/guards · data-mechanics = persistence + access · integration =

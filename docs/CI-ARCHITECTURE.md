@@ -25,8 +25,9 @@ flowchart TD
         B1["docs-drift\ncheck-docs-drift.mjs\nRoutes · Tables · Sources"]
         B2["brain-tests\nvitest unit\npure logic + contract guards"]
         B3["datamechanics-tests\nvitest + real Postgres 16\nRLS · persistence · access control"]
-        B4["ingestion-tests\npytest\nPython ingest pipeline"]
-        B5["aios-work-sync\nPOST /api/v1/work-events\ncloses Plane ticket on merge"]
+        B4["http-tests (advisory)\nnext build + test:http\nreal socket · route runtime"]
+        B5["ingestion-tests\npytest\nPython ingest pipeline"]
+        B6["aios-work-sync\nPOST /api/v1/work-events\ncloses Plane ticket on merge"]
     end
 
     subgraph BotReviews["Async Bot Reviews — GitHub Apps"]
@@ -46,7 +47,7 @@ flowchart TD
     GitHubPR --> BotReviews
     GitHubActions --> D1
     BotReviews --> D2
-    MERGE --> B5
+    MERGE --> B6
 ```
 
 ---
@@ -60,9 +61,10 @@ flowchart TD
 | `docs-drift` | `node scripts/check-docs-drift.mjs` — validates routes, tables, sources against `docs/ARCHITECTURE.md` markers | Yes |
 | `brain-tests` | `npm test` — vitest unit tests (pure logic, parse/format, contract guards) | Yes |
 | `datamechanics-tests` | `npm run test:datamechanics` against real Postgres 16 (port 5434) — RLS, persistence, access control | Yes |
+| `http-tests` | `npm run build` + `npm run test:http` — the API over a real socket against Postgres 16: TCP fetch, the Next.js route runtime (cookies/headers), JSON wire format | No (advisory) |
 | `ingestion-tests` | `pytest -q` inside `ingestion/` — Python ingest pipeline | Yes |
 
-All four must pass for a PR to merge (enforced via branch protection).
+The four required jobs (`docs-drift`, `brain-tests`, `datamechanics-tests`, `ingestion-tests`) must pass for a PR to merge (enforced via branch protection). `http-tests` runs `continue-on-error` (advisory) until it proves stable — see Branch Protection below.
 
 ### `aios-work-sync.yml` — fires on merge to `main`
 
@@ -120,6 +122,7 @@ If you add an API route, table, or ingest source, update the corresponding `<!--
 Repo: `AIOS-alpha/aios-team-brain` → Settings → Branches → `main`
 
 - [x] Require status checks: `docs-drift`, `brain-tests`, `datamechanics-tests`, `ingestion-tests`
+- [ ] `http-tests` — currently advisory (`continue-on-error`). Graduate to required after 5 consecutive green runs on `main`: drop `continue-on-error` in `ci.yml` and add it to this list.
 - [x] Require branches to be up to date before merging
 - [x] Dismiss stale reviews on new pushes
 - [x] Require review from code owners (CODEOWNERS)

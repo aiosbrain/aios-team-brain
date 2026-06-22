@@ -59,6 +59,38 @@ jobs:
       - run: DATABASE_URL="$DATABASE_TEST_URL" npm run pg:schema
       - run: npm run test:datamechanics
 
+  http-tests:
+    name: Integration tests (HTTP)
+    runs-on: ubuntu-latest
+    # Advisory until 5 consecutive green runs on main, then drop this line and add
+    # http-tests to branch protection (see docs/CI-ARCHITECTURE.md).
+    continue-on-error: true
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: app
+          POSTGRES_PASSWORD: app
+          POSTGRES_DB: app_test
+        ports: ["5434:5432"]
+        options: >-
+          --health-cmd "pg_isready -U app -d app_test"
+          --health-interval 2s --health-timeout 3s --health-retries 30
+    env:
+      # Both the test process (seeding via lib/ingest) and the spawned next server read this.
+      DATABASE_TEST_URL: postgres://app:app@localhost:5434/app_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+      - run: npm ci
+      - run: DATABASE_URL="$DATABASE_TEST_URL" npm run pg:schema
+      # Production build first; global-setup spawns `next start` against .next.
+      - run: npm run build
+      - run: npm run test:http
+
   ingestion-tests:
     name: Ingestion tests (pytest)
     runs-on: ubuntu-latest
