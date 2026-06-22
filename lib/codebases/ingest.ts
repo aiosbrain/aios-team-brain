@@ -83,6 +83,8 @@ export async function ingestCodebaseScan(
         additions_window: m.additions_window,
         deletions_window: m.deletions_window,
         test_coverage_pct: m.test_coverage_pct,
+        test_coverage_functions_pct: m.test_coverage_functions_pct,
+        test_coverage_branches_pct: m.test_coverage_branches_pct,
         // jsonb ARRAY column: the pg adapter only auto-casts plain objects to
         // ::jsonb, not arrays — stringify so Postgres parses it as jsonb (this
         // feature is postgres-only). Empty + non-empty both round-trip correctly.

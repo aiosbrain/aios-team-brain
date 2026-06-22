@@ -486,7 +486,9 @@ create table if not exists code_metrics (
   ai_commits_window integer not null default 0,
   additions_window integer not null default 0,
   deletions_window integer not null default 0,
-  test_coverage_pct numeric(5,2),                 -- null = no coverage report found
+  test_coverage_pct numeric(5,2),                 -- null = no coverage report found (lines %)
+  test_coverage_functions_pct numeric(5,2),       -- null = not reported
+  test_coverage_branches_pct numeric(5,2),        -- null = not reported
   recent_commits jsonb not null default '[]',     -- [{sha,author,ai,additions,deletions,committed_at,message}]
   -- explicit scaffolding inputs (named, not vague JSON → testable scoring)
   has_claude_md boolean not null default false,
@@ -520,6 +522,11 @@ alter table code_metrics add column if not exists readiness_level text;
 alter table code_metrics add column if not exists readiness_pct numeric(5,2);
 alter table code_metrics add column if not exists readiness_pillars jsonb not null default '{}';
 alter table code_metrics add column if not exists readiness_rubric_version text;
+
+-- Functions/branches coverage — added via alter so an already-deployed code_metrics
+-- gains them on `pg:schema` (the create-table above is a no-op once the table exists).
+alter table code_metrics add column if not exists test_coverage_functions_pct numeric(5,2);
+alter table code_metrics add column if not exists test_coverage_branches_pct numeric(5,2);
 
 -- Keep `npm run pg:schema` safe for existing deployments that created
 -- code_metrics before AEM readiness fields were added. The table declaration

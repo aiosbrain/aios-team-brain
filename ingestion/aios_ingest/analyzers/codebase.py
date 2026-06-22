@@ -219,35 +219,60 @@ def _count_loc(repo: Path, tracked: list[str]) -> int:
     return loc
 
 
-def _read_coverage(repo: Path) -> float | None:
-    """Read a committed coverage report if present (Istanbul json or lcov). Else None."""
+def _read_coverage(repo: Path) -> dict[str, float | None]:
+    """Read a committed coverage report if present (Istanbul json or lcov).
+
+    Returns {"lines", "functions", "branches"} percentages, each None when that
+    dimension isn't reported (or no report exists at all). `lines` is the headline
+    number; functions/branches are surfaced alongside it on the dashboard.
+    """
     import json
+
+    empty: dict[str, float | None] = {"lines": None, "functions": None, "branches": None}
 
     for rel in ("coverage/coverage-summary.json", "coverage-summary.json"):
         p = repo / rel
         if p.is_file():
             try:
-                data = json.loads(p.read_text())
-                pct = data.get("total", {}).get("lines", {}).get("pct")
-                if isinstance(pct, (int, float)):
-                    return float(pct)
+                total = json.loads(p.read_text()).get("total", {})
+
+                def _pct(key: str) -> float | None:
+                    v = total.get(key, {}).get("pct")
+                    return float(v) if isinstance(v, (int, float)) else None
+
+                if _pct("lines") is not None:
+                    return {"lines": _pct("lines"), "functions": _pct("functions"), "branches": _pct("branches")}
             except (ValueError, OSError):
                 pass
 
     lcov = repo / "coverage" / "lcov.info"
     if lcov.is_file():
         try:
-            hit = found = 0
+            # [hit, found] per dimension: L=lines, FN=functions, BR=branches.
+            counts = {"L": [0, 0], "FN": [0, 0], "BR": [0, 0]}
             for line in lcov.read_text().splitlines():
                 if line.startswith("LH:"):
-                    hit += int(line[3:])
+                    counts["L"][0] += int(line[3:])
                 elif line.startswith("LF:"):
-                    found += int(line[3:])
-            if found:
-                return round(100 * hit / found, 2)
+                    counts["L"][1] += int(line[3:])
+                elif line.startswith("FNH:"):
+                    counts["FN"][0] += int(line[4:])
+                elif line.startswith("FNF:"):
+                    counts["FN"][1] += int(line[4:])
+                elif line.startswith("BRH:"):
+                    counts["BR"][0] += int(line[4:])
+                elif line.startswith("BRF:"):
+                    counts["BR"][1] += int(line[4:])
+
+            def _ratio(k: str) -> float | None:
+                hit, found = counts[k]
+                return round(100 * hit / found, 2) if found else None
+
+            if counts["L"][1]:  # lines found → a real report
+                return {"lines": _ratio("L"), "functions": _ratio("FN"), "branches": _ratio("BR")}
         except (ValueError, OSError):
             pass
-    return None
+    return empty
 
 
 def _github_enrich(full_name: str, token: str | None) -> dict[str, Any]:
@@ -358,7 +383,7 @@ def _codebase_block(slug: str, full_name: str, meta: dict[str, Any]) -> dict[str
 def _metrics_block(
     git: dict[str, Any],
     scaff: dict[str, Any],
-    coverage: float | None,
+    coverage: dict[str, float | None] | None,
     head_sha: str,
     window_days: int,
     scanned_at: str | None = None,
@@ -368,6 +393,7 @@ def _metrics_block(
     # historical backfill) both yield the brain's schema-safe shape — level/pct/version
     # nullable, pillars defaults to {} (NOT nullable). Keeps the two paths byte-identical.
     r = readiness or {}
+    c = coverage or {}  # history backfill passes None (no coverage at past SHAs)
     block = {
         "head_sha": head_sha,
         "window_days": window_days,
@@ -377,7 +403,9 @@ def _metrics_block(
         "ai_commits_window": git["ai_commits_window"],
         "additions_window": git["additions_window"],
         "deletions_window": git["deletions_window"],
-        "test_coverage_pct": coverage,
+        "test_coverage_pct": c.get("lines"),
+        "test_coverage_functions_pct": c.get("functions"),
+        "test_coverage_branches_pct": c.get("branches"),
         "recent_commits": git["recent_commits"],
         "has_claude_md": scaff["has_claude_md"],
         "has_agents_md": scaff["has_agents_md"],
