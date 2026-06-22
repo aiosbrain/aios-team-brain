@@ -113,7 +113,15 @@ export function AgenticBreakdownCard({ b }: { b: Breakdown }) {
         <Check2 ok={b.commands_count > 0} label={`${b.commands_count} commands`} />
         <Check2
           ok={b.test_coverage_pct != null}
-          label={b.test_coverage_pct == null ? "no coverage report" : `${b.test_coverage_pct}% coverage`}
+          label={b.test_coverage_pct == null ? "no coverage report" : `${b.test_coverage_pct}% lines`}
+        />
+        <Check2
+          ok={b.test_coverage_functions_pct != null}
+          label={b.test_coverage_functions_pct == null ? "no fn coverage" : `${b.test_coverage_functions_pct}% functions`}
+        />
+        <Check2
+          ok={b.test_coverage_branches_pct != null}
+          label={b.test_coverage_branches_pct == null ? "no branch coverage" : `${b.test_coverage_branches_pct}% branches`}
         />
       </div>
 

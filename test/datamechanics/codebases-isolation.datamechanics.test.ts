@@ -31,6 +31,8 @@ function buildScan(over: {
       additions_window: 5000,
       deletions_window: 1200,
       test_coverage_pct: 70,
+      test_coverage_functions_pct: 65,
+      test_coverage_branches_pct: 55,
       has_claude_md: true,
       has_agents_md: true,
       agents_md_count: 1,
@@ -132,6 +134,20 @@ describe("codebase scan idempotency (real Postgres)", () => {
     const { codebases } = await getCodebaseSummaries(db(), seed.teamId, "90d", "team");
     const row = codebases.find((c) => c.slug === slug);
     expect(row?.test_coverage_pct).toBe(20); // newest wins
+  });
+
+  it("persists and surfaces all three coverage dimensions (lines/functions/branches)", async () => {
+    const seed = await seedTeam();
+    const slug = `repo-${randomUUID().slice(0, 6)}`;
+    await ingestScan(seed, buildScan({ slug })); // 70 / 65 / 55
+
+    const detail = await getCodebaseDetail(db(), seed.teamId, slug, "90d", "team");
+    // Reading back through the real DB proves persistence AND the read mapping.
+    expect(detail?.breakdown).toMatchObject({
+      test_coverage_pct: 70,
+      test_coverage_functions_pct: 65,
+      test_coverage_branches_pct: 55,
+    });
   });
 
   it("contributions recompute + upsert by (author_key, day), and map to a member", async () => {

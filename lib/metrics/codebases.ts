@@ -251,6 +251,8 @@ export interface AgenticBreakdown {
   skills_count: number;
   commands_count: number;
   test_coverage_pct: number | null;
+  test_coverage_functions_pct: number | null;
+  test_coverage_branches_pct: number | null;
   readiness_level: string | null;
   readiness_pct: number | null;
   readiness_pillars: Record<string, { passed: number; total: number }>;
@@ -339,7 +341,8 @@ export async function getCodebaseDetail(
   const METRIC_COLS =
     "scanned_at, agentic_score, health_score, ai_commit_ratio, test_coverage_score, " +
     "scaffolding_score, skill_breadth_score, cadence_score, issue_health, has_claude_md, " +
-    "has_agents_md, agents_md_count, skills_count, commands_count, test_coverage_pct, recent_commits, " +
+    "has_agents_md, agents_md_count, skills_count, commands_count, test_coverage_pct, " +
+    "test_coverage_functions_pct, test_coverage_branches_pct, recent_commits, " +
     "readiness_level, readiness_pct, readiness_pillars";
 
   const [metricsRes, contribRes, issuesRes, membersRes] = await Promise.all([
@@ -394,6 +397,10 @@ export async function getCodebaseDetail(
         commands_count: num(latest.commands_count as number),
         test_coverage_pct:
           latest.test_coverage_pct == null ? null : num(latest.test_coverage_pct as number),
+        test_coverage_functions_pct:
+          latest.test_coverage_functions_pct == null ? null : num(latest.test_coverage_functions_pct as number),
+        test_coverage_branches_pct:
+          latest.test_coverage_branches_pct == null ? null : num(latest.test_coverage_branches_pct as number),
         readiness_level: (latest.readiness_level as string | null) ?? null,
         readiness_pct: latest.readiness_pct == null ? null : num(latest.readiness_pct as number),
         readiness_pillars:

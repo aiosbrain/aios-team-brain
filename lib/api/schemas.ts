@@ -90,6 +90,8 @@ export const codeMetricsSchema = z.object({
   additions_window: z.number().int().nonnegative(),
   deletions_window: z.number().int().nonnegative(),
   test_coverage_pct: z.number().min(0).max(100).nullable().optional().default(null),
+  test_coverage_functions_pct: z.number().min(0).max(100).nullable().optional().default(null),
+  test_coverage_branches_pct: z.number().min(0).max(100).nullable().optional().default(null),
   recent_commits: z.array(z.record(z.string(), z.unknown())),
   // explicit scaffolding inputs (required)
   has_claude_md: z.boolean(),

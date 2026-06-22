@@ -13,6 +13,8 @@ export function fullMetrics(overrides: Record<string, unknown> = {}) {
     additions_window: 100,
     deletions_window: 20,
     test_coverage_pct: null,
+    test_coverage_functions_pct: null,
+    test_coverage_branches_pct: null,
     recent_commits: [],
     has_claude_md: false,
     has_agents_md: false,

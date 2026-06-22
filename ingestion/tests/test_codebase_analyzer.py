@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from aios_ingest.analyzers.codebase import (
     _detect_scaffolding,
     _entries_under,
+    _read_coverage,
     analyze_history,
     analyze_repo,
 )
@@ -92,7 +93,33 @@ def test_no_github_token_means_no_issues(tmp_path, monkeypatch):
     _git(repo, "commit", "-m", "c1")
     payload = analyze_repo(str(repo), slug="x", full_name="org/x")
     assert payload["issues"] == []
-    assert payload["metrics"]["test_coverage_pct"] is None  # no committed report
+    m = payload["metrics"]
+    assert m["test_coverage_pct"] is None  # no committed report
+    assert m["test_coverage_functions_pct"] is None
+    assert m["test_coverage_branches_pct"] is None
+
+
+def test_read_coverage_istanbul_all_three(tmp_path):
+    """Istanbul coverage-summary.json yields lines/functions/branches percentages."""
+    cov = tmp_path / "coverage"
+    cov.mkdir()
+    (cov / "coverage-summary.json").write_text(
+        '{"total": {"lines": {"pct": 31.67}, "functions": {"pct": 34.33}, "branches": {"pct": 25.7}}}'
+    )
+    assert _read_coverage(tmp_path) == {"lines": 31.67, "functions": 34.33, "branches": 25.7}
+
+
+def test_read_coverage_lcov_all_three(tmp_path):
+    """LCOV lcov.info yields lines/functions/branches computed from hit/found totals."""
+    cov = tmp_path / "coverage"
+    cov.mkdir()
+    (cov / "lcov.info").write_text("\n".join(["LF:200", "LH:100", "FNF:40", "FNH:30", "BRF:50", "BRH:20", "end_of_record"]))
+    assert _read_coverage(tmp_path) == {"lines": 50.0, "functions": 75.0, "branches": 40.0}
+
+
+def test_read_coverage_none_when_absent(tmp_path):
+    """No report → all three None (so the scanner pushes nulls, not zeros)."""
+    assert _read_coverage(tmp_path) == {"lines": None, "functions": None, "branches": None}
 
 
 def test_live_scan_carries_scored_readiness(tmp_path):
