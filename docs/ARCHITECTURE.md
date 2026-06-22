@@ -202,6 +202,18 @@ changed this push** — `lib/ingest` computes the changed set by diffing the pro
 `task_pm_links.last_error`; the `projection_fingerprint` skip keeps them from re-writing the board.
 The manual `projectBoardAction` and the inline work-events projection remain.
 
+**Dashboard hierarchical CRUD (brain-api v1.2 Phase 4).** The tasks page (`app/t/[team]/tasks`)
+is the second authoring surface alongside `aios push`. It **server-renders the hierarchy** —
+`components/kanban/task-hierarchy.tsx` groups sub-tasks under their epic (by `parent_row_key`) and
+shows each task's primary-provider link + sync status. Editing a task (`components/kanban/
+edit-task-dialog.tsx`) calls `updateTaskAction`, which writes the projectable fields and schedules
+the same reactive `after()` projection. `updateTaskAction` enforces **parent integrity** —
+self-parent, missing parent, and **cycle** (it walks the proposed parent's ancestor chain over the
+project's edges) are all rejected before the write. PM-link badges are loaded by a **sibling
+`task_pm_links` query grouped in JS**, not a PostgREST embed: the pg adapter only supports to-many
+embeds as `(count)`, so an embedded `task_pm_links(...)` select returns no rows on the postgres
+backend.
+
 **Seed scripts (retired, Phase 3).** The backlog was originally authored in a `BACKLOG`
 constant (`scripts/aios-backlog.mjs`) and one-way-pushed into the boards by
 `scripts/{plane,linear}-backlog.mjs` (+ `plane-views.mjs`, `pm-sync-backfill.ts`). The

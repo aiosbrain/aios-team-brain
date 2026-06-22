@@ -136,8 +136,8 @@ export async function updateTaskAction(
   if (!me) return { ok: false, error: "not a member of this team" };
 
   // Parent integrity (when provided + non-empty): reject self-parent; require the parent to exist in
-  // the same (team, project). Full cycle detection is deferred to Phase 4's richer CRUD — the
-  // projection engine's visiting-guard prevents any runtime loop meanwhile.
+  // the same (team, project); and reject any re-parent that would close a cycle (the epic→sub graph
+  // must stay a forest — no PM sub-issue may become its own ancestor).
   const update: Record<string, unknown> = { updated_at: new Date().toISOString() };
   if (input.title !== undefined) update.title = input.title;
   if (input.sprint !== undefined) update.sprint = input.sprint;
@@ -157,6 +157,26 @@ export async function updateTaskAction(
         .eq("row_key", parent)
         .maybeSingle();
       if (!parentRow) return { ok: false, error: `parent "${parent}" not found in project` };
+
+      // Cycle guard: walk ancestors up from the proposed parent over the project's current edges;
+      // reaching this row's own key means the new edge would form a loop. Bounded by the edge count
+      // so a pre-existing data cycle can't spin forever.
+      const { data: edgeRows } = await supabase
+        .from("tasks")
+        .select("row_key, parent_row_key")
+        .eq("team_id", row.team_id)
+        .eq("project_id", row.project_id);
+      const parentOf = new Map<string, string | null>();
+      for (const e of (edgeRows ?? []) as { row_key: string | null; parent_row_key: string | null }[]) {
+        if (e.row_key) parentOf.set(e.row_key, e.parent_row_key);
+      }
+      let cursor: string | null = parent;
+      for (let steps = 0; cursor && steps <= parentOf.size; steps++) {
+        if (cursor === row.row_key) {
+          return { ok: false, error: `re-parenting "${row.row_key}" under "${parent}" would create a cycle` };
+        }
+        cursor = parentOf.get(cursor) ?? null;
+      }
     }
     update.parent_row_key = parent || null;
   }
