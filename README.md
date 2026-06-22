@@ -46,6 +46,10 @@ npx tsx --conditions react-server scripts/seed-demo.ts   # demo team + Northwind
 npm run dev
 ```
 
+> **New contributor?** [`DEVELOPMENT.md`](DEVELOPMENT.md) is the full local-setup + test-tier walkthrough
+> (prereqs, `.env.local`, `AUTH_SECRET`, troubleshooting); [`CONTRIBUTING.md`](CONTRIBUTING.md) is the
+> PR checklist (worktrees, spec-first tests, the architecture-map loop). Start there.
+
 > Legacy Supabase backend: set `DB_BACKEND=supabase`, run `supabase start`, fill
 > `.env.local` from `supabase status -o env`, and `supabase db reset` to migrate.
 
