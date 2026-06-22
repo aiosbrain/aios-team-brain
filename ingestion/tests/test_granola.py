@@ -25,7 +25,7 @@ def _note(**kw):
         "id": "n1",
         "title": "AIOS planning",
         "created_at": "2026-06-14T10:00:00Z",
-        "participants": [{"name": "John Dass", "email": "iamjohndass@pm.me"}],
+        "participants": [{"name": "John Ellison", "email": "john@john-ellison.com"}],
         "tags": ["aios-consent"],
         "url": "https://granola.ai/notes/n1",
     }

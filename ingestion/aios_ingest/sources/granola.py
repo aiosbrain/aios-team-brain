@@ -51,7 +51,7 @@ _MAX_RETRIES = 5
 
 # Default privacy gate. AIOS-topic meetings or meetings with John/Chetan, AND consent.
 _DEFAULT_TOPICS = ("aios",)
-_DEFAULT_PARTICIPANTS = ("john", "chetan", "iamjohndass@pm.me")
+_DEFAULT_PARTICIPANTS = ("john", "chetan", "john@john-ellison.com")
 # A note is treated as consented if any of these markers is present.
 _CONSENT_TAGS = ("aios-consent", "consent", "share-decisions")
 _CONSENT_TITLE_TOKENS = ("[aios]", "[consent]")
