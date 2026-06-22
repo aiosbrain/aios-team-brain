@@ -11,7 +11,7 @@ This document describes the full CI/CD pipeline for `aios-team-brain`, including
 ```mermaid
 flowchart TD
     subgraph AgentLoop["Multi-Agent Dev Loop (local)"]
-        A1[Opus — Planner\nCreates spec / Plane issue] --> A2[Codex — Critic\nReviews plan]
+        A1[Opus — Planner\nCreates spec / Linear issue] --> A2[Codex — Critic\nReviews plan]
         A2 --> A3[Opus — Planner\nFinalizes plan]
         A3 --> A4[Opus — Builder\nImplements, commits\nopens PR via gh]
         A4 -->|wait-for-bots.mjs\npoll every 30s ≤10 min| A4W{Bots landed?}
@@ -27,7 +27,7 @@ flowchart TD
         B3["datamechanics-tests\nvitest + real Postgres 16\nRLS · persistence · access control"]
         B4["http-tests (advisory)\nnext build + test:http\nreal socket · route runtime"]
         B5["ingestion-tests\npytest\nPython ingest pipeline"]
-        B6["aios-work-sync\nPOST /api/v1/work-events\ncloses Plane ticket on merge"]
+        B6["aios-work-sync\nPOST /api/v1/work-events\ncloses Linear issue on merge"]
     end
 
     subgraph BotReviews["Async Bot Reviews — GitHub Apps"]
@@ -68,7 +68,7 @@ The four required jobs (`docs-drift`, `brain-tests`, `datamechanics-tests`, `ing
 
 ### `aios-work-sync.yml` — fires on merge to `main`
 
-Extracts `AIOS-Work: <KEY>` from the PR title/body and POSTs a merge event to `/api/v1/work-events`. This closes the matching Plane work item automatically.
+Extracts `AIOS-Work: <KEY>` from the PR title/body and POSTs a merge event to `/api/v1/work-events`. This closes the matching issue in the team's primary PM tool automatically — currently **Linear** (the brain projects the merge event to whichever provider `teams.primary_pm_provider` names; the sync path itself is provider-neutral).
 
 **Required secrets:** `AIOS_BRAIN_URL`, `AIOS_API_KEY`, `AIOS_TEAM`
 
@@ -132,7 +132,7 @@ Repo: `AIOS-alpha/aios-team-brain` → Settings → Branches → `main`
 ## Optimized Agent Pipeline Sequencing
 
 ```
-1. Opus (Planner)  → creates spec from Plane issue
+1. Opus (Planner)  → creates spec from Linear issue
 2. Codex (Critic)  → reviews plan, requests changes
 3. Opus (Planner)  → finalizes, hands off to builder
 4. Opus (Builder)  → implements, commits, opens PR
@@ -142,5 +142,5 @@ Repo: `AIOS-alpha/aios-team-brain` → Settings → Branches → `main`
 8. Code Reviewer   → reads CI status + all bot comments → structured findings
 9. Opus (Builder)  → addresses findings, pushes fix commits if needed
 10. Human          → approves + merges
-11.                  aios-work-sync fires → Plane ticket closed
+11.                  aios-work-sync fires → Linear issue closed
 ```

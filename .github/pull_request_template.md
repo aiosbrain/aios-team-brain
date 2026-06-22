@@ -4,8 +4,8 @@
 
 ## Work item
 
-<!-- Link this PR to a Plane item so aios-work-sync closes it on merge. -->
-AIOS-Work: <!-- e.g. AIOS-123 -->
+<!-- Link this PR to a Linear issue so aios-work-sync closes it on merge. -->
+AIOS-Work: <!-- e.g. AIO-72 -->
 
 ## Checklist
 
