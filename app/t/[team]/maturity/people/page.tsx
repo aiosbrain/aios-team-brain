@@ -15,6 +15,17 @@ const SPINE_LABEL: Record<string, string> = {
   L1: "Prompting", L2: "Prompt Eng", L3: "Context Eng", L4: "Agentic Eng", L5: "Orchestration",
 };
 
+function fmtUsd(n: number): string {
+  if (n >= 1000) return `$${(n / 1000).toFixed(1)}k`;
+  return `$${n.toFixed(n < 1 && n > 0 ? 4 : 2)}`;
+}
+
+function fmtTokens(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1000) return `${Math.round(n / 1000)}k`;
+  return String(Math.round(n));
+}
+
 function radarData(axes: AemAxes): RadarDatum[] {
   return AXIS_META.map((a) => ({ axis: a.label, you: axes[a.key] }));
 }
@@ -89,6 +100,8 @@ export default async function MaturityPage({ params }: { params: Promise<{ team:
                   <th className="px-4 py-3 font-medium">Overall</th>
                   <th className="px-4 py-3 font-medium">Weakest axis</th>
                   <th className="px-4 py-3 text-right font-medium">Tasks</th>
+                  <th className="px-4 py-3 text-right font-medium">Est. spend</th>
+                  <th className="px-4 py-3 text-right font-medium">Tokens</th>
                 </tr>
               </thead>
               <tbody>
@@ -108,6 +121,12 @@ export default async function MaturityPage({ params }: { params: Promise<{ team:
                       {AXIS_META.find((a) => a.key === m.weakest)?.label}
                     </td>
                     <td className="px-4 py-3 text-right tabular-nums text-ink-secondary">{m.tasks}</td>
+                    <td className="px-4 py-3 text-right tabular-nums text-ink-secondary" title="API-equivalent from session logs">
+                      {m.total_cost_usd > 0 ? fmtUsd(m.total_cost_usd) : "—"}
+                    </td>
+                    <td className="px-4 py-3 text-right tabular-nums text-ink-secondary">
+                      {m.total_tokens > 0 ? fmtTokens(m.total_tokens) : "—"}
+                    </td>
                   </tr>
                 ))}
               </tbody>

@@ -163,6 +163,10 @@ export const aemSignalsSchema = z.object({
   tool_diversity: z.number().min(0).optional().default(0),
   verify_tool_rate: z.number().min(0).optional().default(0),
   subagent_usage: z.number().min(0).optional().default(0),
+  total_cost_usd: z.number().min(0).optional().default(0),
+  input_tokens: z.number().int().nonnegative().optional().default(0),
+  output_tokens: z.number().int().nonnegative().optional().default(0),
+  cache_read_tokens: z.number().int().nonnegative().optional().default(0),
 });
 
 export const maturitySnapshotPayloadSchema = z.object({
@@ -185,6 +189,21 @@ export const maturitySnapshotPayloadSchema = z.object({
   tasks: z.number().int().nonnegative().optional().default(0),
 });
 export type MaturitySnapshotPayload = z.infer<typeof maturitySnapshotPayloadSchema>;
+
+export const usageCostPayloadSchema = z.object({
+  member: z.string().max(120).nullable().optional(),
+  date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  provider: z.enum(["cursor", "claude", "anthropic", "openai", "codex", "other"]),
+  source: z.string().min(1).max(60),
+  project: z.string().max(120).optional().default(""),
+  input_tokens: z.number().int().nonnegative().optional().default(0),
+  output_tokens: z.number().int().nonnegative().optional().default(0),
+  cache_read_tokens: z.number().int().nonnegative().optional().default(0),
+  cost_usd: z.number().nonnegative(),
+  events: z.number().int().nonnegative().optional().default(0),
+  meta: z.record(z.string(), z.unknown()).optional().default({}),
+});
+export type UsageCostPayload = z.infer<typeof usageCostPayloadSchema>;
 
 export const querySchema = z.object({
   question: z.string().min(1).max(4000),

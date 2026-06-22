@@ -135,6 +135,10 @@ type SnapshotRow = {
   canonical_cost_governance: number;
   tasks: number;
   sessions: number;
+  total_cost_usd: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
 };
 
 function rowAxes(r: SnapshotRow): AemAxes {
@@ -157,6 +161,9 @@ export type MemberMaturityCard = {
   overall: number;
   axes: AemAxes;
   tasks: number;
+  sessions: number;
+  total_cost_usd: number;
+  total_tokens: number;
   weakest: keyof AemAxes;
 };
 
@@ -193,7 +200,8 @@ export async function getTeamMaturity(
   const { data: snaps } = await supabase
     .from("agentic_maturity_snapshots")
     .select(
-      `member_id, snapshot_date, canonical_spine, canonical_overall, tasks, sessions, ${AXIS_COLS.join(", ")}`
+      `member_id, snapshot_date, canonical_spine, canonical_overall, tasks, sessions,
+       total_cost_usd, input_tokens, output_tokens, cache_read_tokens, ${AXIS_COLS.join(", ")}`
     )
     .eq("team_id", teamId)
     .eq("metric", "aem-individual")
@@ -229,6 +237,9 @@ export async function getTeamMaturity(
       overall: Number(r.canonical_overall),
       axes,
       tasks: Number(r.tasks),
+      sessions: Number(r.sessions),
+      total_cost_usd: Number(r.total_cost_usd ?? 0),
+      total_tokens: Number(r.input_tokens ?? 0) + Number(r.output_tokens ?? 0) + Number(r.cache_read_tokens ?? 0),
       weakest: weakestOf(axes),
     };
   }).sort((a, b) => b.overall - a.overall);
@@ -279,7 +290,8 @@ export async function getMemberMaturity(
   const { data: snaps } = await supabase
     .from("agentic_maturity_snapshots")
     .select(
-      `member_id, snapshot_date, canonical_spine, canonical_overall, tasks, sessions, ${AXIS_COLS.join(", ")}`
+      `member_id, snapshot_date, canonical_spine, canonical_overall, tasks, sessions,
+       total_cost_usd, input_tokens, output_tokens, cache_read_tokens, ${AXIS_COLS.join(", ")}`
     )
     .eq("team_id", teamId)
     .eq("member_id", m.id)
@@ -300,7 +312,10 @@ export async function getMemberMaturity(
   const latest: MemberMaturityCard = {
     member_id: m.id, handle: m.actor_handle, name: m.display_name, avatar_url: m.avatar_url,
     date: dayStr(last.snapshot_date), spine: last.canonical_spine, overall: Number(last.canonical_overall),
-    axes, tasks: Number(last.tasks), weakest,
+    axes, tasks: Number(last.tasks), sessions: Number(last.sessions),
+    total_cost_usd: Number(last.total_cost_usd ?? 0),
+    total_tokens: Number(last.input_tokens ?? 0) + Number(last.output_tokens ?? 0) + Number(last.cache_read_tokens ?? 0),
+    weakest,
   };
 
   // team average for the comparison overlay (reuse the team read, tier already checked)
