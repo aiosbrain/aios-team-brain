@@ -45,7 +45,7 @@ jobs:
       - name: Generate coverage report (metrics source for the scanner)
         run: npm run coverage || true
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
