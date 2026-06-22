@@ -13,6 +13,9 @@ import {
 import { runSlackIngestion } from "@/lib/ingest/run";
 import { resolveIntegrationsAdmin } from "@/lib/integrations/read";
 import { IntegrationConfigError, type IntegrationType } from "@/lib/api/schemas";
+import { audit } from "@/lib/api/audit";
+
+export type PrimaryPmProvider = "plane" | "linear" | null;
 
 /**
  * Session half of the admin gate: resolve the signed-in user, then delegate to the DB-level
@@ -160,6 +163,39 @@ export async function removeIntegration(
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "could not delete" };
   }
+  revalidatePath(`/t/${teamSlug}/admin/integrations`);
+  return { ok: true };
+}
+
+/**
+ * Choose the single PM tool the brain projects tasks into (brain-api v1.2). Admins only; audited.
+ * Pass `null` to clear it. The projection engine reads `teams.primary_pm_provider`; with it unset it
+ * no-ops (or falls back to the sole enabled PM integration).
+ */
+export async function setPrimaryPmProvider(
+  teamSlug: string,
+  provider: PrimaryPmProvider
+): Promise<{ ok: boolean; error?: string }> {
+  const ctx = await requireAdmin(teamSlug);
+  if (!ctx) return { ok: false, error: "admins only" };
+  if (provider !== null && provider !== "plane" && provider !== "linear") {
+    return { ok: false, error: "invalid provider" };
+  }
+  const db = adminClient();
+  const { error } = await db
+    .from("teams")
+    .update({ primary_pm_provider: provider })
+    .eq("id", ctx.teamId);
+  if (error) return { ok: false, error: error.message };
+  await audit(db, {
+    team_id: ctx.teamId,
+    actor_kind: "member",
+    member_id: ctx.myMemberId,
+    action: "team.primary_pm_provider_set",
+    target_type: "team",
+    target_id: ctx.teamId,
+    meta: { provider },
+  });
   revalidatePath(`/t/${teamSlug}/admin/integrations`);
   return { ok: true };
 }

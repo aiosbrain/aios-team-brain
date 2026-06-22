@@ -68,8 +68,18 @@ create table if not exists teams (
   id uuid primary key default gen_random_uuid(),
   slug text not null unique check (slug ~ '^[a-z0-9][a-z0-9-]*$'),
   name text not null,
+  -- The single PM tool the brain projects tasks into (brain-api v1.2). Null until an admin picks
+  -- one; projection no-ops (or uses the sole enabled PM integration) when unset.
+  primary_pm_provider text check (primary_pm_provider in ('plane', 'linear')),
   created_at timestamptz not null default now()
 );
+-- Additive column for existing deployments.
+alter table teams add column if not exists primary_pm_provider text;
+do $$ begin
+  if not exists (select 1 from pg_constraint where conname = 'teams_primary_pm_provider_check') then
+    alter table teams add constraint teams_primary_pm_provider_check check (primary_pm_provider in ('plane', 'linear'));
+  end if;
+end $$;
 
 create table if not exists members (
   id uuid primary key default gen_random_uuid(),
@@ -223,14 +233,36 @@ create table if not exists tasks (
   sprint text not null default '',
   due_date date,
   origin task_origin not null,
+  -- Hierarchy/board fields (brain-api v1.2). The brain is the source of truth that projects a
+  -- structured board into the primary PM tool. parent_row_key is the epic's row_key, resolved
+  -- within (team_id, project_id); integrity (exists, acyclic) is enforced in app code (lib/ingest
+  -- + the task server actions), not a DB FK. body is dashboard/DB-only — it never round-trips
+  -- through the markdown contract.
+  parent_row_key text,
+  labels text[] not null default '{}',
+  priority text not null default 'none' check (priority in ('none', 'low', 'medium', 'high', 'urgent')),
+  body text not null default '',
   created_by uuid references members(id) on delete set null,
   updated_at timestamptz not null default now(),
   created_at timestamptz not null default now()
 );
+-- Additive columns for existing deployments (idempotent rollout via `npm run pg:schema`).
+-- Run BEFORE any index that references them so an existing DB (where the column arrives via
+-- ALTER, because the table definition above is not re-run for an existing table) can build the index.
+alter table tasks add column if not exists parent_row_key text;
+alter table tasks add column if not exists labels text[] not null default '{}';
+alter table tasks add column if not exists priority text not null default 'none';
+alter table tasks add column if not exists body text not null default '';
+do $$ begin
+  if not exists (select 1 from pg_constraint where conname = 'tasks_priority_check') then
+    alter table tasks add constraint tasks_priority_check check (priority in ('none', 'low', 'medium', 'high', 'urgent'));
+  end if;
+end $$;
 create unique index if not exists tasks_row_key_uq on tasks (team_id, project_id, row_key);
 create index if not exists tasks_team_status_idx on tasks (team_id, status);
 create index if not exists tasks_team_assignee_idx on tasks (team_id, assignee);
 create index if not exists tasks_team_updated_idx on tasks (team_id, updated_at desc);
+create index if not exists tasks_team_parent_idx on tasks (team_id, project_id, parent_row_key);
 
 -- Links between AIOS task rows and the external PM tool selected by the team.
 -- AIOS remains the source of truth for row identity/status; this table records how
@@ -249,12 +281,22 @@ create table if not exists task_pm_links (
   last_synced_status text,
   last_synced_at timestamptz,
   last_error text,
+  -- Projection bookkeeping (brain-api v1.2). last_projected_status + projection_fingerprint let
+  -- the projection engine skip a provider write when nothing changed; provider_seen_status records
+  -- the last state observed on the provider so Phase 5 (inbound/two-way) can detect divergence.
+  last_projected_status text,
+  projection_fingerprint text,
+  provider_seen_status text,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   unique (team_id, project_id, row_key, provider)
 );
 create index if not exists task_pm_links_task_idx on task_pm_links (task_id);
 create index if not exists task_pm_links_team_provider_idx on task_pm_links (team_id, provider);
+-- Additive columns for existing deployments.
+alter table task_pm_links add column if not exists last_projected_status text;
+alter table task_pm_links add column if not exists projection_fingerprint text;
+alter table task_pm_links add column if not exists provider_seen_status text;
 
 -- Observable work events from code repos. The initial event is "merged": after a PR
 -- lands on main, the matching task row moves to done and provider sync is attempted.

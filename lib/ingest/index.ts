@@ -6,6 +6,7 @@ import {
   decisionRowSchema,
   normalizeTier,
   normalizeTaskStatus,
+  normalizeTaskPriority,
 } from "@/lib/api/schemas";
 import { audit } from "@/lib/api/audit";
 
@@ -130,9 +131,47 @@ async function materializeTasks(
     .map((r) => r.data!);
 
   const incomingKeys = new Set(rows.map((r) => r.row_key));
+  const incomingByKey = new Map(rows.map((r) => [r.row_key, r]));
+  const parentOf = (r: (typeof rows)[number]) => (r.parent ?? "").trim();
+
+  // Parent integrity (brain-api v1.2): every parent must resolve within (team, project), and the
+  // incoming graph must be acyclic. Reject the whole push on violation so a bad hierarchy never
+  // lands half-applied or leaves orphan PM sub-issues downstream.
+  const existingKeys = new Set<string>();
+  {
+    const { data: existing } = await supabase
+      .from("tasks")
+      .select("row_key")
+      .eq("team_id", teamId)
+      .eq("project_id", projectId)
+      .not("row_key", "is", null);
+    for (const t of existing ?? []) if (t.row_key) existingKeys.add(t.row_key);
+  }
+  for (const row of rows) {
+    const parent = parentOf(row);
+    if (!parent) continue;
+    if (parent === row.row_key) throw new Error(`task ${row.row_key}: parent cannot reference itself`);
+    if (!incomingByKey.has(parent) && !existingKeys.has(parent)) {
+      throw new Error(`task ${row.row_key}: parent "${parent}" not found in project`);
+    }
+  }
+  // Cycle detection within the incoming graph (follow parent links through this push).
+  for (const row of rows) {
+    const seen = new Set<string>();
+    let cur: string | undefined = row.row_key;
+    while (cur) {
+      if (seen.has(cur)) throw new Error(`task ${row.row_key}: parent cycle detected`);
+      seen.add(cur);
+      const node = incomingByKey.get(cur);
+      const p = node ? parentOf(node) : "";
+      cur = p || undefined;
+    }
+  }
 
   for (const row of rows) {
     const { status, raw_status } = normalizeTaskStatus(row.status || "");
+    // NOTE: `body` is intentionally NOT written here — it is dashboard/DB-only and must survive
+    // a sync push. Omitting it from the upsert preserves it on update and defaults to '' on insert.
     const { data: task, error } = await supabase.from("tasks").upsert(
       {
         team_id: teamId,
@@ -145,6 +184,9 @@ async function materializeTasks(
         raw_status,
         sprint: row.sprint ?? "",
         due_date: row.due || null,
+        parent_row_key: parentOf(row) || null,
+        labels: row.labels ?? [],
+        priority: normalizeTaskPriority(row.priority),
         origin: "sync",
         updated_at: syncedAt,
       },
@@ -175,13 +217,25 @@ async function materializeTasks(
   // diff-delete: sync-originated rows absent from this push; UI rows survive.
   const { data: current } = await supabase
     .from("tasks")
-    .select("id, row_key, origin")
+    .select("id, row_key, origin, parent_row_key")
     .eq("team_id", teamId)
     .eq("project_id", projectId)
     .not("row_key", "is", null);
+  const survivors = new Set<string>();
   for (const t of current ?? []) {
     if (t.origin === "sync" && t.row_key && !incomingKeys.has(t.row_key)) {
       await supabase.from("tasks").delete().eq("id", t.id);
+    } else if (t.row_key) {
+      survivors.add(t.row_key);
+    }
+  }
+  // No DB FK backs parent_row_key, so a deleted epic can leave a surviving child pointing at a
+  // now-missing parent. Null those dangling references so the brain stays internally consistent
+  // (the projection's topological sort errors on a missing parent).
+  for (const t of current ?? []) {
+    const parent = (t.parent_row_key ?? "").trim();
+    if (parent && survivors.has(t.row_key!) && !survivors.has(parent)) {
+      await supabase.from("tasks").update({ parent_row_key: null }).eq("id", t.id);
     }
   }
 }

@@ -14,6 +14,12 @@ export const taskRowSchema = z.object({
   status: z.string().optional().default(""),
   sprint: z.string().optional().default(""),
   due: z.string().nullable().optional(),
+  // Hierarchy fields (brain-api v1.2, all optional). `parent` is the epic's row_key; `labels` is a
+  // string array; `priority` is sent verbatim and normalized server-side. `body` is intentionally
+  // absent — it is dashboard/DB-only and never travels through the contract.
+  parent: z.string().nullable().optional(),
+  labels: z.array(z.string().max(80)).max(50).optional(),
+  priority: z.string().max(20).nullable().optional(),
   pm_provider: z.enum(["plane", "linear"]).nullable().optional(),
   pm_external_id: z.string().max(200).nullable().optional(),
   pm_url: z.string().max(500).nullable().optional(),
@@ -226,6 +232,20 @@ export function normalizeTaskStatus(raw: string): {
     return { status: s as (typeof TASK_STATUSES)[number], raw_status: null };
   }
   return { status: "backlog", raw_status: raw };
+}
+
+export const TASK_PRIORITIES = ["none", "low", "medium", "high", "urgent"] as const;
+export type TaskPriority = (typeof TASK_PRIORITIES)[number];
+// Normalize a free-text priority to the allowed set. Unknown / empty → "none". Also accepts a few
+// common aliases (e.g. Plane's "urgent", Linear's numeric labels are mapped upstream).
+export function normalizeTaskPriority(raw: string | null | undefined): TaskPriority {
+  const s = (raw ?? "").trim().toLowerCase();
+  if ((TASK_PRIORITIES as readonly string[]).includes(s)) return s as TaskPriority;
+  if (s === "critical" || s === "p0" || s === "highest") return "urgent";
+  if (s === "p1") return "high";
+  if (s === "p2") return "medium";
+  if (s === "p3" || s === "p4") return "low";
+  return "none";
 }
 
 export function errorResponse(code: string, message: string, status: number) {
