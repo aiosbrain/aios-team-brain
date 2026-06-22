@@ -55,6 +55,30 @@ export default async function MemberMaturityPage({
         </div>
       </div>
 
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+        <div className="card p-4">
+          <div className="text-xs uppercase tracking-wide text-ink-subtle">Tasks</div>
+          <div className="mt-1 text-xl tabular-nums text-ink">{latest.tasks}</div>
+        </div>
+        <div className="card p-4">
+          <div className="text-xs uppercase tracking-wide text-ink-subtle">Sessions</div>
+          <div className="mt-1 text-xl tabular-nums text-ink">{latest.sessions}</div>
+        </div>
+        <div className="card p-4">
+          <div className="text-xs uppercase tracking-wide text-ink-subtle">Est. spend</div>
+          <div className="mt-1 text-xl tabular-nums text-ink">
+            {latest.total_cost_usd > 0 ? `$${latest.total_cost_usd.toFixed(2)}` : "—"}
+          </div>
+          <p className="mt-1 text-[11px] text-ink-subtle">API-equivalent from session logs</p>
+        </div>
+        <div className="card p-4">
+          <div className="text-xs uppercase tracking-wide text-ink-subtle">Tokens</div>
+          <div className="mt-1 text-xl tabular-nums text-ink">
+            {latest.total_tokens > 0 ? latest.total_tokens.toLocaleString("en-US") : "—"}
+          </div>
+        </div>
+      </div>
+
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         <MaturityRadar
           data={radarData(latest.axes, teamAxes)}

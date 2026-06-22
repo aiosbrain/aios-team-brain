@@ -2,16 +2,14 @@ import { serverClient } from "@/lib/supabase/server";
 import { getSessionUser } from "@/lib/auth/session";
 import { parseRange } from "@/lib/metrics/range";
 import { getPerMemberCosts, getThroughputVsCost } from "@/lib/metrics/members";
+import { getExternalCosts, getCombinedSpend } from "@/lib/metrics/external-costs";
 import { RangeSelector } from "@/components/dashboard/range-selector";
 import { MemberCostTable } from "@/components/usage/member-cost-table";
+import { ExternalCostTable } from "@/components/usage/external-cost-table";
 import { ThroughputCostTable } from "@/components/usage/throughput-cost-table";
 
 /**
- * Admin → Usage (W1.2.2). Brain spend (query_log) per member + throughput-vs-cost. Lives under
- * the admin layout, which already blocks non-admins. We STILL resolve the real role and route
- * every query_log read through scopeQueryLog (inside getPerMemberCosts/getThroughputVsCost) —
- * defense-in-depth, no RLS backstop in postgres mode (CLAUDE.md §5). External-provider spend
- * is out of scope (Wave 2).
+ * Admin → Usage. Brain spend (query_log) + external AI spend (usage_costs from workstations).
  */
 export default async function UsageAdminPage({
   params,
@@ -43,8 +41,10 @@ export default async function UsageAdminPage({
   const memberId = (me?.id as string | undefined) ?? "";
   const viewer = { isAdmin, memberId };
 
-  const [costs, throughput] = await Promise.all([
+  const [costs, external, combined, throughput] = await Promise.all([
     getPerMemberCosts(supabase, team.id, range, viewer),
+    getExternalCosts(supabase, team.id, range, viewer),
+    getCombinedSpend(supabase, team.id, range, viewer),
     getThroughputVsCost(supabase, team.id, range, viewer),
   ]);
 
@@ -52,21 +52,52 @@ export default async function UsageAdminPage({
     <div className="flex flex-col gap-6">
       <div className="flex items-center justify-between gap-4">
         <p className="text-sm text-ink-secondary">
-          Brain spend per member — query tokens &amp; cost from the team brain. External-provider
-          spend (Claude/OpenAI API keys) lands in a later wave.
+          Team AI spend — brain queries plus external providers (Cursor, Claude) pushed from
+          workstations via <code className="text-xs">aios analyze --push</code>.
         </p>
         <RangeSelector value={range} />
       </div>
 
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
-        <SummaryCard label="Queries" value={costs.totals.queries.toLocaleString("en-US")} />
-        <SummaryCard label="Tokens" value={costs.totals.total_tokens.toLocaleString("en-US")} />
-        <SummaryCard label="Brain spend" value={`$${costs.totals.cost_usd.toFixed(2)}`} accent />
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-4">
+        <SummaryCard label="Brain spend" value={`$${costs.totals.cost_usd.toFixed(2)}`} />
+        <SummaryCard
+          label="External AI"
+          value={`$${external.totals.cost_usd.toFixed(2)}`}
+          accent
+        />
+        <SummaryCard label="Combined" value={`$${combined.total_usd.toFixed(2)}`} accent />
+        <SummaryCard label="Brain queries" value={costs.totals.queries.toLocaleString("en-US")} />
       </div>
+
+      {external.by_provider.length > 0 ? (
+        <section className="flex flex-col gap-2">
+          <h2 className="text-sm font-semibold uppercase tracking-wider text-ink-tertiary">
+            External by provider
+          </h2>
+          <div className="flex flex-wrap gap-3">
+            {external.by_provider.map((p) => (
+              <div key={p.provider} className="prism-card px-4 py-3">
+                <p className="text-[11px] uppercase tracking-wider text-ink-tertiary capitalize">
+                  {p.provider}
+                </p>
+                <p className="mt-1 text-lg font-semibold text-emerald">${p.cost_usd.toFixed(2)}</p>
+                <p className="text-xs text-ink-tertiary">{p.events} events</p>
+              </div>
+            ))}
+          </div>
+        </section>
+      ) : null}
 
       <section className="flex flex-col gap-2">
         <h2 className="text-sm font-semibold uppercase tracking-wider text-ink-tertiary">
-          Cost per member
+          External AI spend
+        </h2>
+        <ExternalCostTable rows={external.rows} />
+      </section>
+
+      <section className="flex flex-col gap-2">
+        <h2 className="text-sm font-semibold uppercase tracking-wider text-ink-tertiary">
+          Brain spend per member
         </h2>
         <MemberCostTable rows={costs.rows} />
       </section>
