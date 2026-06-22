@@ -202,16 +202,18 @@ changed this push** — `lib/ingest` computes the changed set by diffing the pro
 `task_pm_links.last_error`; the `projection_fingerprint` skip keeps them from re-writing the board.
 The manual `projectBoardAction` and the inline work-events projection remain.
 
-**Legacy seed scripts (being retired).** The backlog was originally authored in
-`scripts/aios-backlog.mjs` and pushed by `npm run plane:backlog` / `npm run linear:backlog`
-(idempotent by `external_id` / the `aios-ext:` marker). The projection engine supersedes these;
-they are removed once the live backlog is migrated (brain-api v1.2 Phase 3).
+**Seed scripts (retired, Phase 3).** The backlog was originally authored in a `BACKLOG`
+constant (`scripts/aios-backlog.mjs`) and one-way-pushed into the boards by
+`scripts/{plane,linear}-backlog.mjs` (+ `plane-views.mjs`, `pm-sync-backfill.ts`). The
+projection engine above fully supersedes them: the brain `tasks` table is now the source of
+truth and projects the board. Once the live backlog was migrated into `tasks`, those scripts
+and their npm entries (`plane:backlog` / `linear:backlog` / `plane:views` / `pm:backfill`) were
+**deleted** (brain-api v1.2 Phase 3). The board is created/updated only via `lib/pm-sync`.
 
 **PM tool decision (resolved).** The Plane-vs-Linear bake-off (backlog epic W2.4) is settled —
-**Linear is the chosen PM tool** (more adoption + better compatibility), and
-`teams.primary_pm_provider` is set to `linear`. The Plane adapter and the `npm run plane:backlog`
-/ `--sync-status` mirror are legacy/reference-only; the runtime projection path stays
-provider-neutral (both adapters still exist).
+**Linear is the chosen PM tool**, and `teams.primary_pm_provider` is set to `linear`. The Plane
+adapter (`lib/pm-sync/plane.ts`) remains in code so the runtime projection path stays
+provider-neutral, but Plane is no longer used and the Plane seed/mirror scripts are gone.
 
 ### Action layer (Organ 4) — policy-gated execution
 

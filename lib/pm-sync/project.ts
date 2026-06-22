@@ -362,9 +362,9 @@ export async function projectRows(
   return reports;
 }
 
-// Server-side replacement for `npm run plane:backlog` / `linear:backlog`: project the whole board
-// for a (team, project). ~80 rows × 1 provider ≈ ~90s with the throttle. Continues on per-row
-// failure and returns a per-row report.
+// Server-side projection of the whole board for a (team, project) — the replacement for the
+// retired plane:backlog / linear:backlog seed scripts. ~80 rows × 1 provider ≈ ~90s with the
+// throttle. Continues on per-row failure and returns a per-row report.
 export async function projectAllTasks(
   supabase: SupabaseClient,
   teamId: string,
