@@ -4,6 +4,11 @@ name: scan-on-merge
 # ingestion scanner and push the result (full raw metrics + readiness) to the Team Brain.
 # The scan is read-only against the repo and idempotent on the brain (keyed by head_sha).
 #
+# We run `npm run coverage` first so a fresh coverage/coverage-summary.json exists for the
+# scanner's _read_coverage() to pick up — otherwise test_coverage_pct lands null and the
+# Codebases dashboard shows "no reports". The coverage GATE still lives in ci.yml; here it is
+# purely a metrics source, so a threshold miss must not block the scan (|| true).
+#
 # Required repo secrets (until set, the job logs "skipping" and exits 0 — never red):
 #   AIOS_BRAIN_URL — e.g. https://aios-team-brain-production.up.railway.app
 #   AIOS_TEAM      — team slug (e.g. aios)
@@ -29,6 +34,16 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0 # full history — the scanner reads the commit window
+
+      # Produce coverage/coverage-summary.json (lib/** lines pct) for the scanner to read.
+      # `|| true`: this is a metrics source, not a gate — never block the scan on coverage.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+      - run: npm ci
+      - name: Generate coverage report (metrics source for the scanner)
+        run: npm run coverage || true
 
       - uses: actions/setup-python@v5
         with:
