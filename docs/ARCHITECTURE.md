@@ -151,7 +151,7 @@ flowchart LR
   ST[("sqlite: cursors + watch channels")] -.-> T2
 ```
 
-### PM progression loop — merged work → done in Plane/Linear
+### PM progression loop — merged work → done in the primary PM tool (Linear)
 
 ```mermaid
 flowchart LR
@@ -161,8 +161,8 @@ flowchart LR
   EVT --> TASKS[("tasks.status = done")]
   EVT --> LINKS[("task_pm_links")]
   LINKS --> PMS["lib/pm-sync provider adapter"]
-  PMS --> PLANE["Plane work item completed state"]
-  PMS --> LINEAR["Linear completed workflow state"]
+  PMS --> LINEAR["Linear completed workflow state (primary)"]
+  PMS --> PLANE["Plane completed state (legacy adapter)"]
   EVT --> UNRES["unresolved work_events for admin reconciliation"]
 ```
 
@@ -192,6 +192,12 @@ remains as a thin state-only delegate. Assignees and inbound/two-way reconciliat
 `scripts/aios-backlog.mjs` and pushed by `npm run plane:backlog` / `npm run linear:backlog`
 (idempotent by `external_id` / the `aios-ext:` marker). The projection engine supersedes these;
 they are removed once the live backlog is migrated (brain-api v1.2 Phase 3).
+
+**PM tool decision (resolved).** The Plane-vs-Linear bake-off (backlog epic W2.4) is settled —
+**Linear is the chosen PM tool** (more adoption + better compatibility), and
+`teams.primary_pm_provider` is set to `linear`. The Plane adapter and the `npm run plane:backlog`
+/ `--sync-status` mirror are legacy/reference-only; the runtime projection path stays
+provider-neutral (both adapters still exist).
 
 ### Action layer (Organ 4) — policy-gated execution
 
