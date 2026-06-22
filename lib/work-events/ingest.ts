@@ -4,7 +4,7 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import { audit } from "@/lib/api/audit";
 import type { WorkEventPayload } from "@/lib/api/schemas";
 import { extractWorkKeys } from "@/lib/pm-sync/work-keys";
-import { syncTaskPmLinks, type TaskPmSyncReport } from "@/lib/pm-sync";
+import { projectTask, projectionToSyncReport, type ProjectionTaskRow, type TaskPmSyncReport } from "@/lib/pm-sync";
 
 export interface WorkEventAuth {
   teamId: string;
@@ -125,7 +125,17 @@ export async function ingestWorkEvent(
     });
 
     if (opts.syncPm !== false) {
-      pm_sync.push(...(await syncTaskPmLinks(supabase, found, { fetchImpl: opts.fetchImpl })));
+      // Full projection (not done-only): load the now-done task row and project it through the
+      // upsert path so a task with no pre-existing link/item still gets created + linked.
+      const { data: fullRow } = await supabase
+        .from("tasks")
+        .select("id, team_id, project_id, row_key, title, status, sprint, priority, labels, body, parent_row_key")
+        .eq("id", found.id)
+        .maybeSingle();
+      if (fullRow) {
+        const report = await projectTask(supabase, fullRow as ProjectionTaskRow, { fetchImpl: opts.fetchImpl });
+        pm_sync.push(projectionToSyncReport(report));
+      }
     }
   }
 

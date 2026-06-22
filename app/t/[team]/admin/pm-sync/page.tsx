@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { serverClient } from "@/lib/supabase/server";
+import { ProjectBoardButton } from "./project-board-button";
 
 export const metadata: Metadata = { title: "PM sync" };
 
@@ -8,7 +9,7 @@ export default async function PmSyncPage({ params }: { params: Promise<{ team: s
   const supabase = await serverClient();
   const { data: team } = await supabase
     .from("teams")
-    .select("id")
+    .select("id, primary_pm_provider")
     .eq("slug", teamSlug)
     .maybeSingle();
   if (!team) return null;
@@ -32,6 +33,20 @@ export default async function PmSyncPage({ params }: { params: Promise<{ team: s
 
   return (
     <div className="flex flex-col gap-5">
+      <section className="prism-card p-4">
+        <h2 className="text-lg font-semibold text-ink">Project board</h2>
+        <p className="mt-1 text-sm text-ink-secondary">
+          The brain is the source of truth. This projects every task into the primary PM tool
+          (create/update/state, one-way, brain wins). Re-running is idempotent — unchanged rows are skipped.
+        </p>
+        <div className="mt-4">
+          <ProjectBoardButton
+            teamSlug={teamSlug}
+            primaryProvider={(team as { primary_pm_provider: string | null }).primary_pm_provider}
+          />
+        </div>
+      </section>
+
       <section className="prism-card p-4">
         <h2 className="text-lg font-semibold text-ink">Unresolved merge events</h2>
         <p className="mt-1 text-sm text-ink-secondary">

@@ -1,15 +1,12 @@
 import "server-only";
 
 import type { SupabaseClient } from "@supabase/supabase-js";
-import { getEnabledIntegrationsWithSecrets, type IntegrationWithSecret } from "@/lib/integrations/manage";
-import { linearAdapter } from "@/lib/pm-sync/linear";
-import { planeAdapter } from "@/lib/pm-sync/plane";
-import type { PmAdapter, PmProvider, ProviderSyncResult, TaskPmLink } from "@/lib/pm-sync/provider";
 
-const ADAPTERS: Record<PmProvider, PmAdapter> = {
-  plane: planeAdapter,
-  linear: linearAdapter,
-};
+import { projectTask, type ProjectionReport, type ProjectionTaskRow } from "@/lib/pm-sync/project";
+import type { PmProvider } from "@/lib/pm-sync/provider";
+
+export { projectTask, projectAllTasks } from "@/lib/pm-sync/project";
+export type { ProjectionReport, ProjectionTaskRow } from "@/lib/pm-sync/project";
 
 export interface TaskForPmSync {
   id: string;
@@ -25,38 +22,28 @@ export interface TaskPmSyncReport {
   error?: string;
 }
 
-async function updateLinkSuccess(
-  supabase: SupabaseClient,
-  link: TaskPmLink,
-  result: ProviderSyncResult
-) {
-  await supabase
-    .from("task_pm_links")
-    .update({
-      provider_resource_id: result.providerResourceId ?? link.provider_resource_id,
-      provider_url: result.providerUrl ?? link.provider_url ?? "",
-      last_synced_status: result.syncedStatus ?? "done",
-      last_synced_at: new Date().toISOString(),
-      last_error: null,
-      updated_at: new Date().toISOString(),
-    })
-    .eq("id", link.id);
+export function projectionToSyncReport(report: ProjectionReport): TaskPmSyncReport {
+  return { row_key: report.row_key, provider: report.provider, status: mapStatus(report.status), error: report.error };
 }
 
-async function updateLinkError(supabase: SupabaseClient, link: TaskPmLink, error: string) {
-  await supabase
-    .from("task_pm_links")
-    .update({ last_error: error.slice(0, 1000), updated_at: new Date().toISOString() })
-    .eq("id", link.id);
+function mapStatus(status: ProjectionReport["status"]): TaskPmSyncReport["status"] {
+  switch (status) {
+    case "synced":
+    case "skipped":
+    case "failed":
+      return status;
+    case "no_row_key":
+      return "no_link";
+    case "no_primary_provider":
+    case "missing_integration":
+      return "missing_integration";
+    default:
+      return "failed";
+  }
 }
 
-function chooseIntegration(
-  integrations: IntegrationWithSecret[],
-  provider: PmProvider
-): IntegrationWithSecret | null {
-  return integrations.find((i) => i.type === provider && i.secret) ?? null;
-}
-
+// Back-compat wrapper retained for the work-events report shape. Loads the full task row and
+// delegates to the projection engine in statusOnly mode (reconcile workflow state only).
 export async function syncTaskPmLinks(
   supabase: SupabaseClient,
   task: TaskForPmSync,
@@ -64,37 +51,13 @@ export async function syncTaskPmLinks(
 ): Promise<TaskPmSyncReport[]> {
   if (!task.row_key) return [{ row_key: "", provider: null, status: "no_link" }];
 
-  const { data, error } = await supabase
-    .from("task_pm_links")
-    .select("*")
-    .eq("team_id", task.team_id)
-    .eq("project_id", task.project_id)
-    .eq("row_key", task.row_key);
-  if (error) throw new Error(`load task PM links failed: ${error.message}`);
+  const { data } = await supabase
+    .from("tasks")
+    .select("id, team_id, project_id, row_key, title, status, sprint, priority, labels, body, parent_row_key")
+    .eq("id", task.id)
+    .maybeSingle();
+  if (!data) return [{ row_key: task.row_key, provider: null, status: "no_link" }];
 
-  const links = (data ?? []) as TaskPmLink[];
-  if (!links.length) return [{ row_key: task.row_key, provider: null, status: "no_link" }];
-
-  const integrations = await getEnabledIntegrationsWithSecrets(supabase, task.team_id);
-  const reports: TaskPmSyncReport[] = [];
-  for (const link of links) {
-    const provider = link.provider;
-    const integration = chooseIntegration(integrations, provider);
-    if (!integration) {
-      const message = `${provider} integration is not enabled or has no secret`;
-      await updateLinkError(supabase, link, message);
-      reports.push({ row_key: link.row_key, provider, status: "missing_integration", error: message });
-      continue;
-    }
-    try {
-      const result = await ADAPTERS[provider].moveToDone({ link, integration, fetchImpl: opts.fetchImpl });
-      await updateLinkSuccess(supabase, link, result);
-      reports.push({ row_key: link.row_key, provider, status: result.status });
-    } catch (e) {
-      const message = e instanceof Error ? e.message : "PM sync failed";
-      await updateLinkError(supabase, link, message);
-      reports.push({ row_key: link.row_key, provider, status: "failed", error: message });
-    }
-  }
-  return reports;
+  const report = await projectTask(supabase, data as ProjectionTaskRow, { statusOnly: true, fetchImpl: opts.fetchImpl });
+  return [{ row_key: report.row_key, provider: report.provider, status: mapStatus(report.status), error: report.error }];
 }

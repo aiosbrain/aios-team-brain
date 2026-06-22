@@ -172,19 +172,26 @@ lives only in `integrations.secret_ciphertext` and is decrypted on the server-si
 sync path. Provider failures update `task_pm_links.last_error` and the task remains
 done — PM drift is visible, not allowed to roll back completed code work.
 
-**Seeding/mirroring the board (one-way, idempotent).** The backlog itself is
-authored once in `scripts/aios-backlog.mjs` (the single source of truth) and
-projected into each PM tool by a seed script that shares that data:
-`npm run plane:backlog` (Plane: epics + sub-issues + Wave modules, idempotent by
-`external_id`) and `npm run linear:backlog` (Linear-native: a saved View per Wave
-filtered by the wave label, epics as parent issues, chunks as sub-issues, idempotent
-by an `aios-ext:` + `source: aios-backlog` marker in each issue description). `npm run linear:backlog -- --sync-status` additionally
-reconciles each Linear issue's workflow state from its Plane counterpart (matched by
-the shared ext key, mapped by state group) so "done in Plane" shows as "done in
-Linear". Both read `LINEAR_API_KEY`/`PLANE_API_KEY` (+ optional `LINEAR_TEAM`) from
-the workspace `.env` via dotenvx and support `--dry-run`. This is the Plane-vs-Linear
-bake-off substrate (backlog epic W2.4); the runtime write-back loop above is
-unchanged and provider-neutral.
+**Full projection engine (brain → PM, one-way, brain wins).** As of brain-api v1.2 the
+`tasks` table is the source of truth that **projects** a structured board into the team's
+single `teams.primary_pm_provider`. `lib/pm-sync/project.ts` owns this:
+`projectTask()` upserts one task (resolving its epic parent first, then the work item),
+and `projectAllTasks()` projects a whole `(team, project)` in topological order with a
+~1 req/s throttle — the server-side replacement for the seed scripts. Each adapter's
+`upsertWorkItem()` **adopts-or-creates** (Plane by `external_id` across
+`["aios-backlog","aios"]`; Linear by the `aios-ext: <row_key> · source: …` footer marker),
+then **brain-wins PATCHes** title/body/state/priority/labels/parent and Plane Wave-module
+membership. A `projection_fingerprint` on the link skips a provider round-trip when nothing
+changed (a second `projectAllTasks` run does zero writes). The admin **"Project board now"**
+button (`projectBoardAction`, admin-gated + audited) on the pm-sync page triggers a full run;
+the work-events done path calls `projectTask` (creating the link/item if missing). `moveToDone`
+remains as a thin state-only delegate. Assignees and inbound/two-way reconciliation are deferred
+(Phase 5 uses `provider_seen_status` to detect divergence).
+
+**Legacy seed scripts (being retired).** The backlog was originally authored in
+`scripts/aios-backlog.mjs` and pushed by `npm run plane:backlog` / `npm run linear:backlog`
+(idempotent by `external_id` / the `aios-ext:` marker). The projection engine supersedes these;
+they are removed once the live backlog is migrated (brain-api v1.2 Phase 3).
 
 ### Action layer (Organ 4) — policy-gated execution
 
