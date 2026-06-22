@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { ingestUsageCost } from "@/lib/costs/ingest";
 import { getExternalCosts } from "@/lib/metrics/external-costs";
+import { IngestValidationError } from "@/lib/api/schemas";
 import { db, seedTeam } from "./helpers";
 
 describe("usage_costs ingest + read (W2.1)", () => {
@@ -71,5 +72,21 @@ describe("usage_costs ingest + read (W2.1)", () => {
     });
     expect(view.totals.cost_usd).toBeCloseTo(61.5, 2);
     expect(view.totals.events).toBe(36);
+  });
+
+  it("rejects an unknown member handle as a client error (→ route 422, not 500)", async () => {
+    const seed = await seedTeam();
+    const auth = { teamId: seed.teamId, memberId: seed.memberId, apiKeyId: "test-key" };
+
+    await expect(
+      ingestUsageCost(db(), auth, {
+        member: "nobody-here",
+        date: "2026-06-22",
+        provider: "cursor",
+        source: "dashboard-api",
+        project: "",
+        cost_usd: 1,
+      })
+    ).rejects.toBeInstanceOf(IngestValidationError);
   });
 });

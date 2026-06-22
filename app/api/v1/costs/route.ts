@@ -2,7 +2,7 @@ import { NextRequest } from "next/server";
 import { adminClient } from "@/lib/supabase/admin";
 import { authenticateApiKey } from "@/lib/api/auth";
 import { rateLimit } from "@/lib/api/rate-limit";
-import { usageCostPayloadSchema, errorResponse } from "@/lib/api/schemas";
+import { usageCostPayloadSchema, errorResponse, IngestValidationError } from "@/lib/api/schemas";
 import { ingestUsageCost } from "@/lib/costs/ingest";
 
 export const runtime = "nodejs";
@@ -41,6 +41,11 @@ export async function POST(req: NextRequest) {
     const result = await ingestUsageCost(supabase, auth, parsed.data);
     return Response.json({ status: "ok", ...result }, { status: 201 });
   } catch (e) {
+    // An unknown member handle is a client input error (the caller sent a handle the team
+    // doesn't have), not a brain fault — surface 422 so the CLI gets a structured signal.
+    if (e instanceof IngestValidationError) {
+      return errorResponse("invalid_payload", e.message, 422);
+    }
     return errorResponse("internal", e instanceof Error ? e.message : "cost ingest failed", 500);
   }
 }
