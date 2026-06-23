@@ -69,6 +69,7 @@ h1,
 h2,
 h3 {
   font-family: var(--font-display);
+  font-weight: 400;
 }
 
 /* ── Prism utilities ───────────────────────────────────────────────────── */
@@ -186,7 +187,7 @@ h3 {
 .prose-prism h4 {
   font-family: var(--font-display);
   color: var(--color-ink);
-  font-weight: 600;
+  font-weight: 400;
   margin-top: 1.75em;
   margin-bottom: 0.5em;
   line-height: 1.3;
