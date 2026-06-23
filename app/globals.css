@@ -19,9 +19,9 @@
    var() refs resolve per active mode rather than baking a static color.
    Fonts come from next/font (see app/layout.tsx). */
 @theme inline {
-  /* brand + supporting accents */
-  --color-violet: var(--aios-primary);
-  --color-violet-tint: var(--aios-primary);
+  /* brand + supporting accents — violet is the brand token (not editorial primary) */
+  --color-violet: var(--aios-violet);
+  --color-violet-tint: var(--aios-violet);
   --color-blue: var(--aios-cyan);
   --color-cyan: var(--aios-cyan);
   --color-emerald: var(--aios-emerald);
@@ -48,8 +48,8 @@
   --color-ink-tertiary: var(--aios-fg-muted);
 
   /* typography — next/font variables, falling back to the ecosystem families */
-  --font-display: var(--font-space-grotesk), "Space Grotesk", system-ui, sans-serif;
-  --font-body: var(--font-plus-jakarta), "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-display: var(--font-instrument-serif), "Instrument Serif", Georgia, serif;
+  --font-body: var(--font-instrument-sans), "Instrument Sans", ui-sans-serif, system-ui, sans-serif;
   --font-mono: var(--font-jetbrains), "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
 }
 
@@ -62,12 +62,14 @@ body {
   color: var(--color-ink);
   font-family: var(--font-body);
   -webkit-font-smoothing: antialiased;
+  font-synthesis: none;
 }
 
 h1,
 h2,
 h3 {
   font-family: var(--font-display);
+  font-weight: 400;
 }
 
 /* ── Prism utilities ───────────────────────────────────────────────────── */
@@ -106,7 +108,7 @@ h3 {
   transform: translateY(-1px);
 }
 
-/* Primary button: translucent violet fill, lift + violet/cyan glow on hover */
+/* Primary button: editorial near-black/white pill (no glow) */
 .btn-prism {
   display: inline-flex;
   align-items: center;
@@ -114,20 +116,18 @@ h3 {
   padding: 0.625rem 1.25rem;
   font-size: 0.875rem;
   font-weight: 500;
-  border-radius: 0.5rem;
-  color: var(--color-ink);
-  background: rgba(139, 92, 246, 0.12);
-  border: 1px solid rgba(139, 92, 246, 0.3);
-  transition: all 0.3s ease;
+  border-radius: 9999px;
+  color: var(--aios-primary-fg);
+  background: var(--aios-primary);
+  border: 1px solid transparent;
+  transition: background 0.2s ease;
   cursor: pointer;
 }
 
 .btn-prism:hover {
-  transform: translateY(-1px);
-  border-color: rgba(139, 92, 246, 0.55);
-  box-shadow:
-    0 4px 18px rgba(139, 92, 246, 0.18),
-    0 2px 10px rgba(45, 212, 191, 0.1);
+  background: var(--aios-primary-hover);
+  transform: none;
+  box-shadow: none;
 }
 
 .btn-prism:disabled {
@@ -187,7 +187,7 @@ h3 {
 .prose-prism h4 {
   font-family: var(--font-display);
   color: var(--color-ink);
-  font-weight: 600;
+  font-weight: 400;
   margin-top: 1.75em;
   margin-bottom: 0.5em;
   line-height: 1.3;
