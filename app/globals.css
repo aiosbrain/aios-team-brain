@@ -1,42 +1,60 @@
+/* Tokens from the @aios-alpha/design package (single cross-repo source of
+   truth): light = :root, dark = .dark. Then the Tailwind v4 bridge, then
+   Tailwind itself. Order matters. */
+@import "@aios-alpha/design/tokens.css";
+@import "@aios-alpha/design/tailwind-theme.css";
 @import "tailwindcss";
 
-/* ── Prism Light tokens (source: vibrana.ai DESIGN.md) ─────────────────── */
-@theme {
-  /* brand accents */
-  --color-violet: #7c3aed;
-  --color-violet-tint: #8b5cf6;
-  --color-blue: #3b82f6;
-  --color-cyan: #2dd4bf;
-  --color-emerald: #4ade80;
-  --color-red: #ef4444;
-  --color-amber: #f59e0b;
-  --color-yellow: #fcd34d;
+/* Pull @aios-alpha/ui's compiled components into Tailwind's content scan so
+   their utility classes are generated (node_modules is ignored by default). */
+@source "../node_modules/@aios-alpha/ui/dist";
 
-  /* semantic surfaces (light set) */
-  --color-surface-base: #ffffff;
-  --color-surface-raised: #fafafa;
-  --color-surface-overlay: #f4f4f5;
-  --color-surface-card: rgba(0, 0, 0, 0.02);
-  --color-surface-card-hover: rgba(0, 0, 0, 0.04);
-  --color-surface-nav: rgba(255, 255, 255, 0.72);
-  --color-surface-inset: rgba(255, 255, 255, 0.95);
+/* Dark mode is class-driven (next-themes sets class="dark" on <html>). */
+@custom-variant dark (&:where(.dark, .dark *));
 
-  --color-border-subtle: rgba(0, 0, 0, 0.08);
-  --color-border-default: rgba(0, 0, 0, 0.12);
-  --color-border-strong: rgba(0, 0, 0, 0.22);
+/* ── Legacy-name compatibility ─────────────────────────────────────────────
+   Map team-brain's prior token names onto the @aios-alpha/design tokens so the
+   existing utilities (.prism-*, .btn-*, .prose-prism, badges, text-ink,
+   bg-surface-*) keep working unchanged — now mode-aware. `inline` so the
+   var() refs resolve per active mode rather than baking a static color.
+   Fonts come from next/font (see app/layout.tsx). */
+@theme inline {
+  /* brand + supporting accents */
+  --color-violet: var(--aios-primary);
+  --color-violet-tint: var(--aios-primary);
+  --color-blue: var(--aios-cyan);
+  --color-cyan: var(--aios-cyan);
+  --color-emerald: var(--aios-emerald);
+  --color-red: var(--aios-destructive);
+  --color-amber: var(--aios-amber);
+  --color-yellow: var(--aios-amber);
 
-  --color-ink: rgba(15, 15, 17, 0.95);
-  --color-ink-secondary: rgba(15, 15, 17, 0.66);
-  --color-ink-tertiary: rgba(15, 15, 17, 0.48);
+  /* semantic surfaces — now resolve light/dark via the tokens */
+  --color-surface-base: var(--aios-bg);
+  --color-surface-raised: var(--aios-surface);
+  --color-surface-overlay: var(--aios-muted);
+  /* card fill steps off raised canvas (surface) so .prism-card stays visible */
+  --color-surface-card: var(--aios-muted);
+  --color-surface-card-hover: var(--aios-elevated);
+  --color-surface-nav: color-mix(in srgb, var(--aios-surface) 80%, transparent);
+  --color-surface-inset: var(--aios-surface);
 
-  /* typography */
-  --font-display: var(--font-bricolage), -apple-system, sans-serif;
-  --font-body: var(--font-hanken), -apple-system, sans-serif;
-  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+  --color-border-subtle: var(--aios-border);
+  --color-border-default: var(--aios-border-visible);
+  --color-border-strong: var(--aios-border-strong);
+
+  --color-ink: var(--aios-fg);
+  --color-ink-secondary: var(--aios-fg-secondary);
+  --color-ink-tertiary: var(--aios-fg-muted);
+
+  /* typography — next/font variables, falling back to the ecosystem families */
+  --font-display: var(--font-space-grotesk), "Space Grotesk", system-ui, sans-serif;
+  --font-body: var(--font-plus-jakarta), "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-jetbrains), "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
 }
 
 :root {
-  --gradient-prism: linear-gradient(135deg, #7c3aed 0%, #3b82f6 50%, #2dd4bf 100%);
+  --gradient-prism: var(--aios-gradient-prism);
 }
 
 body {

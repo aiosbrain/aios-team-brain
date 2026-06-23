@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import { ThemeToggle } from "@/components/theme-toggle";
 import {
   Blocks,
   FolderKanban,
@@ -88,6 +89,9 @@ export function TeamNav({ items }: { items: NavEntry[] }) {
           <Leaf key={entry.href} item={entry} />
         )
       )}
+      <div className="mt-3 border-t border-border-subtle pt-2">
+        <ThemeToggle />
+      </div>
     </nav>
   );
 }
