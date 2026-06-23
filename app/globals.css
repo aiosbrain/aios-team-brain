@@ -33,7 +33,8 @@
   --color-surface-base: var(--aios-bg);
   --color-surface-raised: var(--aios-surface);
   --color-surface-overlay: var(--aios-muted);
-  --color-surface-card: var(--aios-surface);
+  /* card fill steps off raised canvas (surface) so .prism-card stays visible */
+  --color-surface-card: var(--aios-muted);
   --color-surface-card-hover: var(--aios-elevated);
   --color-surface-nav: color-mix(in srgb, var(--aios-surface) 80%, transparent);
   --color-surface-inset: var(--aios-surface);
