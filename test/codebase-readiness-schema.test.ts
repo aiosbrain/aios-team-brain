@@ -76,3 +76,30 @@ describe("codebaseScanPayloadSchema — readiness validation", () => {
     expect(r.success).toBe(true);
   });
 });
+
+describe("codebaseScanPayloadSchema — coverage validation", () => {
+  it("accepts line/function/branch coverage dimensions independently", () => {
+    const parsed = codebaseScanPayloadSchema.parse(
+      payload({
+        test_coverage_pct: 88.5,
+        test_coverage_functions_pct: null,
+        test_coverage_branches_pct: 42.25,
+      })
+    );
+
+    expect(parsed.metrics.test_coverage_pct).toBe(88.5);
+    expect(parsed.metrics.test_coverage_functions_pct).toBeNull();
+    expect(parsed.metrics.test_coverage_branches_pct).toBe(42.25);
+  });
+
+  it("rejects coverage percentages outside 0..100 for every dimension", () => {
+    for (const field of [
+      "test_coverage_pct",
+      "test_coverage_functions_pct",
+      "test_coverage_branches_pct",
+    ]) {
+      expect(codebaseScanPayloadSchema.safeParse(payload({ [field]: -0.01 })).success, field).toBe(false);
+      expect(codebaseScanPayloadSchema.safeParse(payload({ [field]: 100.01 })).success, field).toBe(false);
+    }
+  });
+});
