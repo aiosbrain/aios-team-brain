@@ -6,6 +6,9 @@ import { ingestItem } from "@/lib/ingest";
 import { getEnabledIntegrationsWithSecrets } from "@/lib/integrations/manage";
 import { SlackClient, fetchSlackChannel } from "./sources/slack";
 import { normalizeThread } from "./sources/slack-normalize";
+import { fetchPlaneProject } from "./sources/plane";
+import { normalizePlaneProject } from "./sources/plane-normalize";
+import type { PlaneConnection } from "@/lib/pm-sync/plane-client";
 
 /**
  * In-app ingestion runner — the TypeScript replacement for the Python sidecar's
@@ -47,16 +50,23 @@ async function teamsWithSlack(supabase: SupabaseClient): Promise<string[]> {
   return [...new Set(ids)];
 }
 
-/** Find (or auto-provision) the per-team connector member used as the ingest actor. */
+interface ConnectorIdentity {
+  handle: string;
+  email: string;
+  displayName: string;
+}
+
+/** Find (or auto-provision) the per-team connector member used as a given source's ingest actor. */
 async function resolveConnectorAuth(
   supabase: SupabaseClient,
-  teamId: string
+  teamId: string,
+  identity: ConnectorIdentity
 ): Promise<{ teamId: string; memberId: string; apiKeyId: string } | null> {
   const { data: existing } = await supabase
     .from("members")
     .select("id")
     .eq("team_id", teamId)
-    .eq("actor_handle", "slack-sync")
+    .eq("actor_handle", identity.handle)
     .maybeSingle();
 
   let memberId = (existing as { id: string } | null)?.id;
@@ -66,9 +76,9 @@ async function resolveConnectorAuth(
       .upsert(
         {
           team_id: teamId,
-          email: "slack-sync@connector.local",
-          display_name: "Slack Sync",
-          actor_handle: "slack-sync",
+          email: identity.email,
+          display_name: identity.displayName,
+          actor_handle: identity.handle,
           role: "member",
           tier: "team",
           status: "active",
@@ -126,7 +136,11 @@ export async function runSlackIngestion(opts: { teamId?: string } = {}): Promise
         continue;
       }
       if (slackIntegrations.length === 0) continue;
-      const auth = await resolveConnectorAuth(supabase, teamId);
+      const auth = await resolveConnectorAuth(supabase, teamId, {
+        handle: "slack-sync",
+        email: "slack-sync@connector.local",
+        displayName: "Slack Sync",
+      });
       if (!auth) {
         summary.errors.push(`team ${teamId}: no connector member`);
         continue;
@@ -174,5 +188,122 @@ export async function runSlackIngestion(opts: { teamId?: string } = {}): Promise
     return summary;
   } finally {
     running = false;
+  }
+}
+
+// ── Plane inbound import ──────────────────────────────────────────────────────
+
+export interface PlaneIngestSummary {
+  ok: boolean;
+  integrations: number;
+  projects: number;
+  created: number;
+  updated: number;
+  unchanged: number;
+  /** Total work-items imported as task rows this run (after de-dupe). */
+  items: number;
+  errors: string[];
+  skipped?: boolean;
+}
+
+/** Distinct teams with at least one enabled Plane integration. */
+async function teamsWithPlane(supabase: SupabaseClient): Promise<string[]> {
+  const { data } = await supabase
+    .from("integrations")
+    .select("team_id")
+    .eq("type", "plane")
+    .eq("status", "enabled");
+  const ids = (data ?? []).map((r) => (r as { team_id: string }).team_id);
+  return [...new Set(ids)];
+}
+
+let planeRunning = false;
+
+/**
+ * Run Plane ingestion for all enabled Plane integrations (optionally one team). Each integration's
+ * project is imported into its OWN brain project (`plane-<identifier>`) as one kind="task" item;
+ * normalize de-dupes brain-projected round-trippers and the writer dedups unchanged boards.
+ */
+export async function runPlaneIngestion(opts: { teamId?: string } = {}): Promise<PlaneIngestSummary> {
+  const empty: PlaneIngestSummary = {
+    ok: true,
+    integrations: 0,
+    projects: 0,
+    created: 0,
+    updated: 0,
+    unchanged: 0,
+    items: 0,
+    errors: [],
+  };
+  if (planeRunning) return { ...empty, skipped: true };
+  planeRunning = true;
+  try {
+    const supabase = adminClient();
+    const teamIds = opts.teamId ? [opts.teamId] : await teamsWithPlane(supabase);
+
+    const summary: PlaneIngestSummary = { ...empty };
+    for (const teamId of teamIds) {
+      let planeIntegrations;
+      try {
+        planeIntegrations = (await getEnabledIntegrationsWithSecrets(supabase, teamId)).filter(
+          (i) => i.type === "plane"
+        );
+      } catch (err) {
+        summary.errors.push(`team ${teamId}: ${err instanceof Error ? err.message : "secret read failed"}`);
+        continue;
+      }
+      if (planeIntegrations.length === 0) continue;
+      const auth = await resolveConnectorAuth(supabase, teamId, {
+        handle: "plane-sync",
+        email: "plane-sync@connector.local",
+        displayName: "Plane Sync",
+      });
+      if (!auth) {
+        summary.errors.push(`team ${teamId}: no connector member`);
+        continue;
+      }
+
+      for (const integ of planeIntegrations) {
+        summary.integrations++;
+        const apiKey = integ.secret;
+        const workspaceSlug = integ.config.workspaceSlug as string | undefined;
+        const projectId = integ.config.projectId as string | undefined;
+        if (!apiKey || !workspaceSlug || !projectId) {
+          summary.errors.push(
+            `integration "${integ.name}": needs an API key + workspaceSlug + projectId in the dashboard`
+          );
+          continue;
+        }
+        const conn: PlaneConnection = {
+          fetchImpl: fetch,
+          base: ((integ.config.baseUrl as string | undefined) || "https://api.plane.so").replace(/\/$/, ""),
+          apiKey,
+          workspaceSlug,
+          projectId,
+        };
+        // Round-tripper de-dupe also honors a custom configured externalSource.
+        const externalSource = integ.config.externalSource as string | undefined;
+        const aiosSources = [...new Set(["aios", "aios-backlog", ...(externalSource ? [externalSource] : [])])];
+
+        summary.projects++;
+        try {
+          const fetched = await fetchPlaneProject(conn);
+          const payload = normalizePlaneProject({ ...fetched, aiosSources });
+          summary.items += payload.rows?.length ?? 0;
+          const res = await ingestItem(supabase, auth, payload, "team");
+          if (res.status === "created") summary.created++;
+          else if (res.status === "updated") summary.updated++;
+          else summary.unchanged++;
+        } catch (err) {
+          summary.errors.push(
+            `integration "${integ.name}": ${err instanceof Error ? err.message : "import failed"}`
+          );
+        }
+      }
+    }
+    summary.ok = summary.errors.length === 0;
+    return summary;
+  } finally {
+    planeRunning = false;
   }
 }

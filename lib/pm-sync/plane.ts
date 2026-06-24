@@ -1,6 +1,12 @@
 import "server-only";
 
 import {
+  fetchAllPaged,
+  planeApi,
+  projPath,
+  type PlaneConnection,
+} from "@/lib/pm-sync/plane-client";
+import {
   desiredStateForStatus,
   htmlToPlainText,
   normalizeName,
@@ -43,29 +49,7 @@ interface PlaneBootstrap {
   moduleMembers: Map<string, Set<string>>; // moduleId → issue ids
 }
 
-async function readJson(res: Response): Promise<unknown> {
-  const text = await res.text();
-  try {
-    return text ? JSON.parse(text) : {};
-  } catch {
-    return { raw: text };
-  }
-}
-
-function asArray(value: unknown): unknown[] {
-  if (Array.isArray(value)) return value;
-  if (value && typeof value === "object" && Array.isArray((value as { results?: unknown[] }).results)) {
-    return (value as { results: unknown[] }).results;
-  }
-  return [];
-}
-
-interface PlaneCtx {
-  fetchImpl: typeof fetch;
-  base: string;
-  apiKey: string;
-  workspaceSlug: string;
-  projectId: string;
+interface PlaneCtx extends PlaneConnection {
   externalSource: string;
 }
 
@@ -80,49 +64,6 @@ function planeCtx(input: { integration: { config?: Record<string, unknown> | nul
   const externalSource =
     (config.externalSource as string | undefined) || input.link?.provider_external_source || "aios-backlog";
   return { fetchImpl: input.fetchImpl ?? fetch, base, apiKey, workspaceSlug, projectId, externalSource };
-}
-
-async function planeApi(ctx: PlaneCtx, method: string, path: string, body?: Record<string, unknown>): Promise<unknown> {
-  const url = `${ctx.base}${path}`;
-  for (let attempt = 0; ; attempt++) {
-    const res = await ctx.fetchImpl(url, {
-      method,
-      headers: { "X-API-Key": ctx.apiKey, "Content-Type": "application/json" },
-      body: body ? JSON.stringify(body) : undefined,
-    });
-    if (res.status === 429 && attempt < 6) {
-      const retry = Number(res.headers.get("Retry-After") || 5) * 1000;
-      await new Promise((r) => setTimeout(r, retry));
-      continue;
-    }
-    const json = await readJson(res);
-    if (!res.ok) {
-      throw new PmSyncError(`Plane ${method} ${path} failed (${res.status}): ${JSON.stringify(json).slice(0, 300)}`);
-    }
-    return json;
-  }
-}
-
-function projPath(ctx: PlaneCtx, suffix: string): string {
-  return `/api/v1/workspaces/${ctx.workspaceSlug}/projects/${ctx.projectId}${suffix}`;
-}
-
-async function fetchAllPaged(ctx: PlaneCtx, suffix: string): Promise<unknown[]> {
-  const out: unknown[] = [];
-  let cursor = "100:0:0";
-  for (let i = 0; i < 100; i++) {
-    const sep = suffix.includes("?") ? "&" : "?";
-    const page = await planeApi(ctx, "GET", `${projPath(ctx, suffix)}${sep}per_page=100&cursor=${encodeURIComponent(cursor)}`);
-    if (Array.isArray(page)) {
-      out.push(...page);
-      break;
-    }
-    out.push(...asArray(page));
-    const next = page && typeof page === "object" ? (page as { next_page_results?: boolean; next_cursor?: string }) : null;
-    if (!next?.next_page_results || !next.next_cursor) break;
-    cursor = next.next_cursor;
-  }
-  return out;
 }
 
 function extKey(source: string | null | undefined, ext: string | null | undefined): string {

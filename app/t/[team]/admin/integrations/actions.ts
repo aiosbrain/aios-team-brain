@@ -10,7 +10,7 @@ import {
   setIntegrationStatus,
   deleteIntegration,
 } from "@/lib/integrations/manage";
-import { runSlackIngestion } from "@/lib/ingest/run";
+import { runSlackIngestion, runPlaneIngestion } from "@/lib/ingest/run";
 import { resolveIntegrationsAdmin } from "@/lib/integrations/read";
 import { IntegrationConfigError, type IntegrationType } from "@/lib/api/schemas";
 import { audit } from "@/lib/api/audit";
@@ -146,6 +146,29 @@ export async function syncSlackNow(
     return {
       ok: true,
       message: `Synced ${s.channels} channel(s): +${s.created} new, ~${s.updated} updated, =${s.unchanged} unchanged.`,
+    };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "sync failed" };
+  }
+}
+
+/**
+ * Run Plane ingestion now for this team (admins only). Imports the configured project's work-items
+ * into the brain (one dedicated task project per Plane project) and reports a one-line summary. The
+ * scheduler also runs this on its interval; this is the on-demand trigger.
+ */
+export async function syncPlaneNow(
+  teamSlug: string
+): Promise<{ ok: boolean; error?: string; message?: string }> {
+  const ctx = await requireAdmin(teamSlug);
+  if (!ctx) return { ok: false, error: "admins only" };
+  try {
+    const s = await runPlaneIngestion({ teamId: ctx.teamId });
+    if (!s.ok && s.errors.length) return { ok: false, error: s.errors.join("; ") };
+    revalidatePath(`/t/${teamSlug}/admin/integrations`);
+    return {
+      ok: true,
+      message: `Imported ${s.items} work-item(s) from ${s.projects} project(s): +${s.created} new, ~${s.updated} updated, =${s.unchanged} unchanged.`,
     };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "sync failed" };

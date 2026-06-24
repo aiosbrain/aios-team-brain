@@ -20,7 +20,7 @@ Reason from this table, not from a random call site.
 | State | Store (table) | Writer | Readers | Tier/access enforcement |
 |---|---|---|---|---|
 | Synced content | `items`, `item_versions` | **`lib/ingest` only** (single-writer guarded) | dashboard pages, `/api/v1/items`, `lib/query/retrieve`, okf-bundle, metrics | supabase: RLS; postgres: app-code — API ✅, dashboard ✅ (`lib/auth/visibility` choke-point, guarded) |
-| Tasks | `tasks` | `lib/ingest` (sync rows) + `app/actions/tasks.ts` (UI; mints `ui-` row_key) + `lib/work-events` (merged-work completion) | dashboard, `/api/v1/tasks`, PM sync | team-scoped; `origin='ui'` rows survive sync diff; v1.2 hierarchy fields `parent_row_key`/`labels`/`priority` (parent integrity — exists + acyclic — enforced in `lib/ingest`); `body` is dashboard/DB-only (never in the markdown contract) |
+| Tasks | `tasks` | `lib/ingest` (sync rows — incl. inbound Plane import into a dedicated `plane-<id>` project) + `app/actions/tasks.ts` (UI; mints `ui-` row_key) + `lib/work-events` (merged-work completion) | dashboard, `/api/v1/tasks`, PM sync | team-scoped; `origin='ui'` rows survive sync diff; v1.2 hierarchy fields `parent_row_key`/`labels`/`priority` (parent integrity — exists + acyclic — enforced in `lib/ingest`); `body` is dashboard/DB-only (never in the markdown contract) |
 | Task PM links | `task_pm_links` | `lib/ingest` (optional task-row PM metadata) + PM backfill | dashboard task badges, `lib/pm-sync` | team-scoped; stores provider IDs/status only, never secrets; v1.2 adds `last_projected_status`/`projection_fingerprint` (skip-detection) + `provider_seen_status` (Phase 5 divergence) |
 | Primary PM provider | `teams.primary_pm_provider` | Admin → Integrations (`setPrimaryPmProvider`, admin-gated + audited) | `lib/pm-sync` projection | the single PM tool the brain projects into; null = projection no-ops / sole-enabled fallback |
 | Work events | `work_events` | `POST /api/v1/work-events` → `lib/work-events` | Admin → PM sync health | team-tier only; unresolved events are preserved for reconciliation |
@@ -33,7 +33,7 @@ Reason from this table, not from a random call site.
 | Git-author aliases | `member_emails` (+ `members.github_login`/`avatar_url`) | `lib/admin/*` + GitHub sync (`lib/codebases/github`) | `lib/codebases/ingest` (author→member), dashboard | team-scoped `unique(team_id,email)`; one alias → one member |
 | Sessions (postgres) | `auth_users`, `auth_tokens` | `lib/auth/pg-*` | `getSessionUser` | signed httpOnly cookie |
 | Rate limits | `rate_limits` | `rate_limit_hit` rpc | — | service-role only |
-| Integrations | `integrations` | **`lib/integrations/manage` only** (single-writer guarded; admin server actions) | Admin → Integrations page (`lib/integrations/read`, **admin-gated** `canManageIntegrations`); `GET /api/v1/integrations` (API-key, NON-secret selections via `manage.listEnabledIntegrationSelections`); in-process Slack runner (`lib/ingest/run` via `manage.getEnabledIntegrationsWithSecrets`) | `config` is NON-secret (per-type allowlist + secret-key rejection); the connector secret is **encrypted at rest** in `secret_ciphertext` (`lib/secrets`, AES-256-GCM) and decrypted **only in-process** for the runner — it never leaves over HTTP, not even on the API-key read. Admin-tier (no per-row `access` column): both writes (`resolveIntegrationsAdmin`) and the dashboard read (`canManageIntegrations`, in `lib/integrations/read`) are app-code gated on `role==="admin"` — no RLS backstop; guarded by `test/guards/integrations-tier-filter` + the data-mechanics tier test. The page fails closed under `DB_BACKEND=supabase`. postgres-only |
+| Integrations | `integrations` | **`lib/integrations/manage` only** (single-writer guarded; admin server actions) | Admin → Integrations page (`lib/integrations/read`, **admin-gated** `canManageIntegrations`); `GET /api/v1/integrations` (API-key, NON-secret selections via `manage.listEnabledIntegrationSelections`); in-process Slack + Plane runners (`lib/ingest/run` via `manage.getEnabledIntegrationsWithSecrets`) | `config` is NON-secret (per-type allowlist + secret-key rejection); the connector secret is **encrypted at rest** in `secret_ciphertext` (`lib/secrets`, AES-256-GCM) and decrypted **only in-process** for the runner — it never leaves over HTTP, not even on the API-key read. Admin-tier (no per-row `access` column): both writes (`resolveIntegrationsAdmin`) and the dashboard read (`canManageIntegrations`, in `lib/integrations/read`) are app-code gated on `role==="admin"` — no RLS backstop; guarded by `test/guards/integrations-tier-filter` + the data-mechanics tier test. The page fails closed under `DB_BACKEND=supabase`. postgres-only |
 | Codebase analytics | `codebases`, `code_metrics`, `code_contributions`, `github_issues` | **`lib/codebases/ingest` only** (single-writer guarded; via `POST /api/v1/codebases`) | codebases pages incl. Codebases → GitHub (scan freshness via `lib/metrics/codebases.getCodebaseFreshness` + live HEAD compare `lib/codebases/github.fetchRepoHeadSha`), `lib/metrics/codebases` | team-tier only; **app-code gate** (`lib/codebases/visibility` + guard) — no RLS backstop. Brain derives `agentic_score`/`health_score`; AEM `readiness_*` is scored scanner-side (`ingestion/aios_ingest/analyzers/readiness.py`) and persisted verbatim. W1.3 native UI: repo selection persists to `integrations` (type=github, admin); member→GitHub linking via `linkGithub` on Admin → Members (admin); **no server-triggered scan** — the GitHub surface documents the manual `aios-ingest scan` command and the sidecar consumes the selection (F4) |
 | Brain spend / usage meter | `query_log` (`cost_usd`, `input/output/cache_tokens`, `member_id`) | the query routes (`/api/v1/query`, `/api/dashboard/query`) — one row per answered question | `lib/metrics/pulse` (usage KPIs), `lib/metrics/members` (per-member cost + throughput-vs-cost, W1.2), Admin → Usage page | **role-scoped in app code** via `scopeQueryLog` (admins → team-wide; everyone else → own rows) — no RLS backstop in postgres; guarded by `test/guards/query-log-visibility`. Brain spend only |
 | External AI spend | `usage_costs` | **`lib/costs/ingest` only** (via `POST /api/v1/costs`) | `lib/metrics/external-costs`, Admin → Usage page | team-tier only; workstation pushes from `aios analyze --push` (Cursor dashboard USD + session-log estimates); idempotent on `(team, member, date, provider, source, project)` |
@@ -199,6 +199,25 @@ changes brain `tasks.status` — the only write is `provider_seen_status`, and o
 (`reconcileDivergenceAction`, admin-gated + audited) runs it; the PM-sync page renders the divergence
 list read-only from stored state (`isDiverged`). Conflict policy is fixed at brain-wins: drift is
 shown for a human to pull, never silently applied. Two-way write-back remains out of scope.
+
+**Inbound Plane import (Plane → brain, in-app runner).** The *opposite* direction from the
+projection engine: `lib/ingest/sources/plane.ts` + `plane-normalize.ts` pull a Plane project's
+work-items **into** the brain as tasks, run in-process by `lib/ingest/run.ts: runPlaneIngestion`
+(scheduler tick + the admin **"Sync now"** button on a Plane integration; actor = the auto-provisioned
+`plane-sync` connector member). It shares the low-level HTTP client with the outbound adapter via
+`lib/pm-sync/plane-client.ts`. Two invariants keep it from fighting the projection engine:
+> • **Dedicated brain project per Plane project** (`plane-<identifier>`). `materializeTasks`'
+> diff-delete is **project-wide**, so a Plane import must never share a project with CLI/UI tasks
+> or each run would delete the other's rows. Each import emits ONE `kind="task"` item whose `rows[]`
+> are the whole project, so a work-item removed in Plane diff-deletes from the brain — within that
+> project only.
+> • **One-directional, de-dupe over exclude.** Items the brain itself projected OUT (`external_source`
+> starting `aios`) are **skipped** on import — the brain already owns that `row_key` in its real
+> project, so re-importing would duplicate (this preserves "brain wins"). Plane-native items import
+> fresh, keyed by `<IDENTIFIER>-<sequence_id>`. Sub-issue `parent` → `parent_row_key` (resolved only
+> within the imported set; a skipped/absent parent is nulled, never dangling), module → `sprint`,
+> labels/state/priority/assignee carried through. Imports stay at **team tier**; the runner does not
+> populate `task_pm_links`, so an imported task is not re-projected back out.
 
 **Reactive triggers (brain-api v1.2 Phase 2).** Projection is no longer manual-only. Task UI
 writes — `createTaskAction` / `moveTaskAction` / the new `updateTaskAction` (title/sprint/due/
