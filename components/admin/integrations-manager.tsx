@@ -14,7 +14,16 @@ import {
   type PrimaryPmProvider,
 } from "@/app/t/[team]/admin/integrations/actions";
 
-type IntegrationType = "github" | "granola" | "slack" | "wise" | "linear" | "plane";
+type IntegrationType =
+  | "github"
+  | "granola"
+  | "slack"
+  | "wise"
+  | "linear"
+  | "plane"
+  | "openai"
+  | "anthropic"
+  | "google";
 
 export interface IntegrationRow {
   id: string;
@@ -25,10 +34,22 @@ export interface IntegrationRow {
   hasSecret: boolean;
 }
 
+// Data-source connectors shown in the generic "Add an integration" form. Provider keys are NOT
+// here — they get their own dedicated panel (PROVIDER_TYPES) so the page reads as a key panel.
 const TYPES: IntegrationType[] = ["slack", "github", "granola", "linear", "plane", "wise"];
 
+// LLM provider API keys — one set for the team, managed in the dedicated "AI provider keys" panel.
+const PROVIDER_TYPES = ["anthropic", "openai", "google"] as const;
+type ProviderType = (typeof PROVIDER_TYPES)[number];
+const PROVIDER_META: Record<ProviderType, { label: string; note: string; placeholder: string }> = {
+  anthropic: { label: "Anthropic", note: "Powers the AI query box (Claude).", placeholder: "sk-ant-…" },
+  openai: { label: "OpenAI", note: "Embeddings & local/OpenAI-compatible LLMs.", placeholder: "sk-…" },
+  google: { label: "Google", note: "Stored for Gemini — not wired into queries yet.", placeholder: "AIza…" },
+};
+
 // What the single "selection" field means per type (hint text + how config renders back).
-const SELECTION_HINT: Record<IntegrationType, string> = {
+// Keyed to the data-source TYPES only; provider keys use the dedicated panel, not this form.
+const SELECTION_HINT: Partial<Record<IntegrationType, string>> = {
   slack: "channel IDs (comma-separated)",
   github: "repos owner/name (comma-separated)",
   granola: "match keywords (comma-separated)",
@@ -102,8 +123,76 @@ export function IntegrationsManager({
     });
   }
 
+  // Provider keys render in their own panel; keep them out of the data-source list below.
+  const sources = integrations.filter(
+    (i) => !(PROVIDER_TYPES as readonly string[]).includes(i.type)
+  );
+
+  function setProviderKey(p: ProviderType, existing: IntegrationRow | undefined) {
+    const key = window.prompt(`${PROVIDER_META[p].label} API key (${PROVIDER_META[p].placeholder}):`);
+    if (!key) return;
+    run(() =>
+      existing
+        ? rotateSecret(teamSlug, existing.id, key)
+        : saveIntegration(teamSlug, { type: p, name: p, selection: "", secret: key })
+    );
+  }
+
   return (
     <div className="flex flex-col gap-6">
+      <div className="prism-card flex flex-col gap-3 p-4">
+        <p className="flex items-center gap-2 text-sm font-medium text-ink">
+          <KeyRound className="size-4 text-violet" /> AI provider keys
+        </p>
+        <p className="text-xs text-ink-secondary">
+          One set of LLM provider keys for the team. Stored encrypted (AES-256-GCM); never shown
+          again after saving. Unset providers fall back to the server&apos;s environment key.
+        </p>
+        <div className="flex flex-col gap-2">
+          {PROVIDER_TYPES.map((p) => {
+            const row = integrations.find((i) => i.type === p);
+            const isSet = !!row?.hasSecret;
+            return (
+              <div
+                key={p}
+                className="flex flex-wrap items-center gap-3 rounded-lg border border-border-subtle px-3 py-2"
+              >
+                <span className="font-medium text-ink">{PROVIDER_META[p].label}</span>
+                <span className="text-xs text-ink-tertiary">{PROVIDER_META[p].note}</span>
+                <span className={`text-xs ${isSet ? "text-emerald-700" : "text-ink-tertiary"}`}>
+                  {isSet ? "key set ✓" : "not set"}
+                </span>
+                <div className="ml-auto flex items-center gap-2">
+                  <button
+                    type="button"
+                    disabled={pending}
+                    onClick={() => setProviderKey(p, row)}
+                    className="rounded-lg border border-violet/40 bg-violet/10 px-3 py-1 text-xs font-medium text-violet disabled:opacity-50"
+                  >
+                    {isSet ? "Replace key" : "Set key"}
+                  </button>
+                  {row ? (
+                    <button
+                      type="button"
+                      disabled={pending}
+                      onClick={() => {
+                        if (window.confirm(`Remove ${PROVIDER_META[p].label} key?`)) {
+                          run(() => removeIntegration(teamSlug, row.id));
+                        }
+                      }}
+                      className="rounded-lg border border-border-default p-1.5 text-ink-secondary hover:text-red"
+                      aria-label={`Remove ${PROVIDER_META[p].label} key`}
+                    >
+                      <Trash2 className="size-4" />
+                    </button>
+                  ) : null}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
       <div className="prism-card flex flex-col gap-2 p-4">
         <p className="flex items-center gap-2 text-sm font-medium text-ink">
           <Plug className="size-4 text-violet" /> Primary PM tool
@@ -197,11 +286,11 @@ export function IntegrationsManager({
         </p>
       ) : null}
 
-      {integrations.length === 0 ? (
-        <p className="text-sm text-ink-tertiary">No integrations yet. Add one above.</p>
+      {sources.length === 0 ? (
+        <p className="text-sm text-ink-tertiary">No source integrations yet. Add one above.</p>
       ) : (
         <div className="flex flex-col gap-2">
-          {integrations.map((i) => (
+          {sources.map((i) => (
             <div key={i.id} className="prism-card flex flex-wrap items-center gap-3 px-4 py-3">
               <span className="rounded-full bg-violet/10 px-2 py-0.5 font-mono text-xs text-violet">{i.type}</span>
               <span className="font-medium text-ink">{i.name}</span>

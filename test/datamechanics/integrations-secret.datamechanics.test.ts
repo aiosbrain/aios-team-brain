@@ -4,6 +4,7 @@ import {
   setIntegrationSecret,
   setIntegrationStatus,
   getEnabledIntegrationsWithSecrets,
+  getProviderKey,
 } from "@/lib/integrations/manage";
 import { listIntegrations } from "@/lib/integrations/read";
 import { db, seedTeam } from "./helpers";
@@ -65,5 +66,31 @@ describe("integrations secret (real Postgres)", () => {
     await setIntegrationSecret(db(), a, id, "ghp_x");
     await setIntegrationStatus(db(), a, id, "disabled");
     expect(await getEnabledIntegrationsWithSecrets(db(), seed.teamId)).toHaveLength(0);
+  });
+});
+
+// Spec: LLM provider API keys round-trip through the same encrypted store; getProviderKey resolves
+// the team's key for the query path and returns null (→ env fallback) when unset/disabled.
+describe("provider keys (real Postgres)", () => {
+  it("stores a provider key encrypted and resolves it by type", async () => {
+    const seed = await seedTeam();
+    const a = auth(seed.teamId, seed.memberId);
+    const key = "sk-ant-REAL-anthropic-key-xyz";
+
+    const { id } = await upsertIntegration(db(), a, { type: "anthropic", name: "anthropic", config: {} });
+    await setIntegrationSecret(db(), a, id, key);
+
+    expect(await getProviderKey(db(), seed.teamId, "anthropic")).toBe(key);
+    // A provider with no integration row → null (caller falls back to the env key).
+    expect(await getProviderKey(db(), seed.teamId, "openai")).toBeNull();
+  });
+
+  it("returns null for a disabled provider key (env fallback)", async () => {
+    const seed = await seedTeam();
+    const a = auth(seed.teamId, seed.memberId);
+    const { id } = await upsertIntegration(db(), a, { type: "openai", name: "openai", config: {} });
+    await setIntegrationSecret(db(), a, id, "sk-openai-x");
+    await setIntegrationStatus(db(), a, id, "disabled");
+    expect(await getProviderKey(db(), seed.teamId, "openai")).toBeNull();
   });
 });
