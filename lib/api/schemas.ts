@@ -289,7 +289,14 @@ export const INTEGRATION_STATUSES = ["enabled", "disabled"] as const;
 
 /** Per-type NON-SECRET config allowlists. `.strict()` rejects any key not listed. */
 const integrationConfigSchemas: Record<IntegrationType, z.ZodType> = {
-  github: z.object({ repos: z.array(z.string().min(1).max(200)).max(200).default([]) }).strict(),
+  github: z
+    .object({
+      repos: z.array(z.string().min(1).max(200)).max(200).default([]),
+      // Inbound file-content ingestion: glob(s) of repo files to import as deliverable items.
+      // Empty/absent ⇒ default to markdown (see lib/ingest/sources/github-files).
+      fileGlobs: z.array(z.string().min(1).max(100)).max(50).optional(),
+    })
+    .strict(),
   slack: z.object({ channelIds: z.array(z.string().min(1).max(40)).max(200).default([]) }).strict(),
   granola: z
     .object({

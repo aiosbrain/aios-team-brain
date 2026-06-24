@@ -9,7 +9,19 @@ import type { GithubIssueRaw } from "./github-normalize";
  * normalize step drops them (they carry a `pull_request` field).
  */
 
-const API = "https://api.github.com";
+export const GITHUB_API = "https://api.github.com";
+
+/** Standard GitHub REST headers; the PAT (optional) lifts rate limits and reaches private repos. */
+export function githubHeaders(token?: string | null): Record<string, string> {
+  const headers: Record<string, string> = {
+    Accept: "application/vnd.github+json",
+    "X-GitHub-Api-Version": "2022-11-28",
+  };
+  if (token) headers.Authorization = `Bearer ${token}`;
+  return headers;
+}
+
+const API = GITHUB_API;
 
 export interface FetchedGithubRepo {
   owner: string;
@@ -25,11 +37,7 @@ export async function fetchGithubRepoIssues(opts: {
   maxPages?: number;
 }): Promise<FetchedGithubRepo> {
   const fetchImpl = opts.fetchImpl ?? fetch;
-  const headers: Record<string, string> = {
-    Accept: "application/vnd.github+json",
-    "X-GitHub-Api-Version": "2022-11-28",
-  };
-  if (opts.token) headers.Authorization = `Bearer ${opts.token}`;
+  const headers = githubHeaders(opts.token);
 
   const issues: GithubIssueRaw[] = [];
   const maxPages = opts.maxPages ?? 50;

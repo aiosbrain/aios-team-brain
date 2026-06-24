@@ -13,6 +13,8 @@ import { fetchLinearTeam } from "./sources/linear";
 import { normalizeLinearTeam } from "./sources/linear-normalize";
 import { fetchGithubRepoIssues } from "./sources/github";
 import { normalizeGithubRepo } from "./sources/github-normalize";
+import { fetchGithubRepoFiles } from "./sources/github-files";
+import { normalizeGithubFiles } from "./sources/github-files-normalize";
 
 /**
  * In-app ingestion runner — the TypeScript replacement for the Python sidecar's
@@ -429,6 +431,7 @@ export async function runGithubIngestion(opts: { teamId?: string } = {}): Promis
         summary.integrations++;
         const token = integ.secret; // optional — public repos work token-free
         const repos = (integ.config.repos as string[] | undefined) ?? [];
+        const fileGlobs = integ.config.fileGlobs as string[] | undefined;
         for (const full of repos) {
           const [owner, repo] = full.split("/", 2);
           if (!owner || !repo) {
@@ -436,6 +439,7 @@ export async function runGithubIngestion(opts: { teamId?: string } = {}): Promis
             continue;
           }
           summary.projects++;
+          // Issues → tasks (one kind=task item, diff-synced).
           try {
             const fetched = await fetchGithubRepoIssues({ owner, repo, token });
             const payload = normalizeGithubRepo(fetched);
@@ -445,7 +449,21 @@ export async function runGithubIngestion(opts: { teamId?: string } = {}): Promis
             else if (res.status === "updated") summary.updated++;
             else summary.unchanged++;
           } catch (err) {
-            summary.errors.push(`${full}: ${err instanceof Error ? err.message : "import failed"}`);
+            summary.errors.push(`${full} issues: ${err instanceof Error ? err.message : "import failed"}`);
+          }
+          // Repo files → deliverable items (one per file, idempotent by path+sha).
+          try {
+            const fetched = await fetchGithubRepoFiles({ owner, repo, token, globs: fileGlobs });
+            const payloads = normalizeGithubFiles(fetched);
+            summary.items += payloads.length;
+            for (const payload of payloads) {
+              const res = await ingestItem(supabase, auth, payload, "team");
+              if (res.status === "created") summary.created++;
+              else if (res.status === "updated") summary.updated++;
+              else summary.unchanged++;
+            }
+          } catch (err) {
+            summary.errors.push(`${full} files: ${err instanceof Error ? err.message : "import failed"}`);
           }
         }
       }

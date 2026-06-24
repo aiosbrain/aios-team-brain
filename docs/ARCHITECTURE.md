@@ -230,13 +230,20 @@ tier, `run<X>Ingestion` + scheduler tick + admin "Sync now"):
 > issues carrying the `aios-ext: <row_key>` footer (the projection's idempotency marker, now shared in
 > `linear-client`) are **de-duped/skipped**. `state.type` → status, priority int → word, sub-issue
 > `parent` → `parent_row_key`, project → `sprint`, cycle → `cycle:<name>` label.
-> • **GitHub** — `lib/ingest/sources/github.ts` + `github-normalize.ts` (REST issues, public repos
-> token-free). One project **per repo** in `config.repos` (`github-<owner>-<repo>`), row_key = `GH-<n>`.
-> PRs are dropped; `open` → backlog (or a workflow label like "in progress"/"blocked"), `closed` → done;
-> milestone → `sprint`, labels/assignees carried. GitHub is **not** a pm-sync provider, so there is no
-> round-trip loop — idempotency is the stable row_key + sha. These replace the Python sidecar's
-> `linear`/`github` inbound sources for issue import (the sidecar `sources` drift list is unchanged;
-> these native sources are TS, not registered there).
+> • **GitHub** — two complementary native sources per repo in `config.repos`, both into project
+> `github-<owner>-<repo>`:
+>   - **Issues → tasks** (`github.ts` + `github-normalize.ts`, REST, public repos token-free): one
+>     `kind="task"` item, row_key = `GH-<n>`. PRs dropped; `open` → backlog (or a workflow label like
+>     "in progress"/"blocked"), `closed` → done; milestone → `sprint`, labels/assignees carried.
+>     GitHub is **not** a pm-sync provider, so no round-trip loop — idempotency is row_key + sha.
+>   - **Repo files → deliverables** (`github-files.ts` + `github-files-normalize.ts`): the native port
+>     of the Python sidecar's GitHub source — walks the default branch's tree, keeps files matching
+>     `config.fileGlobs` (default `*.md`/`*.mdx`), and writes ONE `kind="deliverable"` item **per file**
+>     (path `github/<owner>-<repo>/<filepath>`, idempotent by path+sha, content pattern like Slack — not
+>     diff-deleted). This is content/knowledge ingestion, distinct from the task importer.
+>
+> Together these replace the Python sidecar's `linear`/`github` inbound sources (the sidecar `sources`
+> drift list is unchanged; these native sources are TS, not registered there).
 
 **Reactive triggers (brain-api v1.2 Phase 2).** Projection is no longer manual-only. Task UI
 writes — `createTaskAction` / `moveTaskAction` / the new `updateTaskAction` (title/sprint/due/
