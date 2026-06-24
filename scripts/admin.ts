@@ -81,7 +81,7 @@ async function main() {
   if (cmd === "help" || flags.help) return console.log(USAGE);
 
   if (cmd === "pg:schema") {
-    execFileSync("npx", ["tsx", "scripts/pg-load-schema.ts"], { stdio: "inherit" });
+    execFileSync("node", ["scripts/pg-load-schema.mjs"], { stdio: "inherit" });
     return;
   }
 

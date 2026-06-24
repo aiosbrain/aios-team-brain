@@ -1,13 +1,14 @@
 /**
- * Load postgres/schema.sql into the database at DATABASE_URL, then apply every additive
- * delta in postgres/migrations/ (in lexical filename order).
+ * Load postgres/schema.sql into the database at DATABASE_URL, then apply every additive delta in
+ * postgres/migrations/ (in lexical filename order). Both are idempotent, so this is safe to re-run
+ * and is the prod rollout step for schema changes (`npm run pg:schema`).
  *
- * schema.sql is `create … if not exists` throughout, so it is a no-op on an EXISTING table —
- * it cannot add a column to a table prod already has. postgres/migrations/ holds the idempotent
- * `alter table … add column if not exists` deltas that catch an existing DB up. Both are
- * idempotent, so this is safe to re-run and is the prod rollout step (`npm run pg:schema`).
+ * Pure node + the `pg` runtime dependency (NO tsx) so it runs in the pruned production image — it
+ * is the Railway pre-deploy hook (railway.json `deploy.preDeployCommand`), so every deploy
+ * self-applies pending migrations before the new app version goes live. A failure here aborts the
+ * release rather than shipping app code ahead of its schema.
  *
- * Usage: DATABASE_URL=postgres://… npx tsx scripts/pg-load-schema.ts
+ * Usage: DATABASE_URL=postgres://… node scripts/pg-load-schema.mjs
  */
 import { readFileSync, existsSync, readdirSync } from "node:fs";
 import path from "node:path";
@@ -33,12 +34,9 @@ async function main() {
     await client.query(sql);
     console.log("✓ postgres/schema.sql loaded");
 
-    // Additive deltas that `create … if not exists` can't apply to an existing table.
     const migDir = path.join(pgDir, "migrations");
     const files = existsSync(migDir)
-      ? readdirSync(migDir)
-          .filter((f) => f.endsWith(".sql"))
-          .sort()
+      ? readdirSync(migDir).filter((f) => f.endsWith(".sql")).sort()
       : [];
     for (const f of files) {
       await client.query(readFileSync(path.join(migDir, f), "utf8"));
