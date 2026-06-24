@@ -10,7 +10,7 @@ import {
   setIntegrationStatus,
   deleteIntegration,
 } from "@/lib/integrations/manage";
-import { runSlackIngestion, runPlaneIngestion } from "@/lib/ingest/run";
+import { runSlackIngestion, runPlaneIngestion, runLinearIngestion, runGithubIngestion } from "@/lib/ingest/run";
 import { resolveIntegrationsAdmin } from "@/lib/integrations/read";
 import { IntegrationConfigError, type IntegrationType } from "@/lib/api/schemas";
 import { audit } from "@/lib/api/audit";
@@ -169,6 +169,44 @@ export async function syncPlaneNow(
     return {
       ok: true,
       message: `Imported ${s.items} work-item(s) from ${s.projects} project(s): +${s.created} new, ~${s.updated} updated, =${s.unchanged} unchanged.`,
+    };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "sync failed" };
+  }
+}
+
+/** Run Linear ingestion now for this team (admins only). Imports the configured team's issues. */
+export async function syncLinearNow(
+  teamSlug: string
+): Promise<{ ok: boolean; error?: string; message?: string }> {
+  const ctx = await requireAdmin(teamSlug);
+  if (!ctx) return { ok: false, error: "admins only" };
+  try {
+    const s = await runLinearIngestion({ teamId: ctx.teamId });
+    if (!s.ok && s.errors.length) return { ok: false, error: s.errors.join("; ") };
+    revalidatePath(`/t/${teamSlug}/admin/integrations`);
+    return {
+      ok: true,
+      message: `Imported ${s.items} issue(s) from ${s.projects} team(s): +${s.created} new, ~${s.updated} updated, =${s.unchanged} unchanged.`,
+    };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "sync failed" };
+  }
+}
+
+/** Run GitHub Issues ingestion now for this team (admins only). Imports each configured repo's issues. */
+export async function syncGithubNow(
+  teamSlug: string
+): Promise<{ ok: boolean; error?: string; message?: string }> {
+  const ctx = await requireAdmin(teamSlug);
+  if (!ctx) return { ok: false, error: "admins only" };
+  try {
+    const s = await runGithubIngestion({ teamId: ctx.teamId });
+    if (!s.ok && s.errors.length) return { ok: false, error: s.errors.join("; ") };
+    revalidatePath(`/t/${teamSlug}/admin/integrations`);
+    return {
+      ok: true,
+      message: `Imported ${s.items} issue(s) from ${s.projects} repo(s): +${s.created} new, ~${s.updated} updated, =${s.unchanged} unchanged.`,
     };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "sync failed" };

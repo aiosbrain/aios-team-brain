@@ -10,6 +10,8 @@ import {
   removeIntegration,
   syncSlackNow,
   syncPlaneNow,
+  syncLinearNow,
+  syncGithubNow,
   setPrimaryPmProvider,
   type PrimaryPmProvider,
 } from "@/app/t/[team]/admin/integrations/actions";
@@ -74,11 +76,26 @@ export function IntegrationsManager({
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
+  const SYNCABLE: Partial<Record<IntegrationType, (slug: string) => Promise<{ ok: boolean; error?: string; message?: string }>>> = {
+    slack: syncSlackNow,
+    plane: syncPlaneNow,
+    linear: syncLinearNow,
+    github: syncGithubNow,
+  };
+  const SYNC_TITLES: Partial<Record<IntegrationType, string>> = {
+    slack: "Pull this team's Slack channels into the brain now",
+    plane: "Import this Plane project's work-items into the brain now",
+    linear: "Import this Linear team's issues into the brain now",
+    github: "Import this GitHub repo's issues into the brain now",
+  };
+
   function syncNow(type: IntegrationType) {
+    const fn = SYNCABLE[type];
+    if (!fn) return;
     setError(null);
     setNotice(null);
     startTransition(async () => {
-      const res = type === "plane" ? await syncPlaneNow(teamSlug) : await syncSlackNow(teamSlug);
+      const res = await fn(teamSlug);
       if (!res.ok) setError(res.error ?? "sync failed");
       else {
         setNotice(res.message ?? "Synced.");
@@ -210,16 +227,12 @@ export function IntegrationsManager({
                 {i.hasSecret ? " · secret set" : " · no secret"}
               </span>
               <div className="ml-auto flex items-center gap-2">
-                {i.type === "slack" || i.type === "plane" ? (
+                {SYNC_TITLES[i.type] ? (
                   <button
                     onClick={() => syncNow(i.type)}
                     disabled={pending}
                     className="flex items-center gap-1.5 rounded-lg border border-violet/40 bg-violet/10 px-3 py-1 text-xs font-medium text-violet disabled:opacity-50"
-                    title={
-                      i.type === "plane"
-                        ? "Import this Plane project's work-items into the brain now"
-                        : "Pull this team's Slack channels into the brain now"
-                    }
+                    title={SYNC_TITLES[i.type]}
                   >
                     <RefreshCw className={`size-3.5 ${pending ? "animate-spin" : ""}`} /> Sync now
                   </button>

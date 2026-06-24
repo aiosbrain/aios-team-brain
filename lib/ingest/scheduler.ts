@@ -1,5 +1,6 @@
 import "server-only";
-import { runSlackIngestion, runPlaneIngestion } from "./run";
+import { runSlackIngestion, runPlaneIngestion, runLinearIngestion, runGithubIngestion } from "./run";
+import type { ImportSummary } from "./run";
 
 /**
  * In-process poller — the single-service alternative to a separate cron worker.
@@ -32,22 +33,29 @@ export function startIngestScheduler(): void {
     } catch (err) {
       console.error("[ingest] slack tick failed:", err instanceof Error ? err.message : err);
     }
+    await runImport("plane", runPlaneIngestion);
+    await runImport("linear", runLinearIngestion);
+    await runImport("github", runGithubIngestion);
+  };
+
+  // Shared runner for the task-importers (Plane/Linear/GitHub): same summary shape + log line.
+  async function runImport(label: string, run: () => Promise<ImportSummary>): Promise<void> {
     try {
-      const p = await runPlaneIngestion();
-      if (p.created || p.updated || p.errors.length) {
+      const s = await run();
+      if (s.created || s.updated || s.errors.length) {
         console.info(
-          `[ingest] plane: +${p.created} ~${p.updated} =${p.unchanged} ` +
-            `(${p.items} items, ${p.projects} projects, ${p.integrations} integrations)` +
-            (p.errors.length ? ` errors: ${p.errors.join("; ")}` : "")
+          `[ingest] ${label}: +${s.created} ~${s.updated} =${s.unchanged} ` +
+            `(${s.items} items, ${s.projects} projects, ${s.integrations} integrations)` +
+            (s.errors.length ? ` errors: ${s.errors.join("; ")}` : "")
         );
       }
     } catch (err) {
-      console.error("[ingest] plane tick failed:", err instanceof Error ? err.message : err);
+      console.error(`[ingest] ${label} tick failed:`, err instanceof Error ? err.message : err);
     }
-  };
+  }
 
   // Delay the first run so boot isn't blocked; then poll on the interval.
   setTimeout(tick, 20_000).unref?.();
   setInterval(tick, intervalMs).unref?.();
-  console.info(`[ingest] scheduler started — Slack + Plane every ${minutes}m`);
+  console.info(`[ingest] scheduler started — Slack + Plane + Linear + GitHub every ${minutes}m`);
 }
