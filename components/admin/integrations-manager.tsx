@@ -9,6 +9,7 @@ import {
   rotateSecret,
   removeIntegration,
   syncSlackNow,
+  syncPlaneNow,
   setPrimaryPmProvider,
   type PrimaryPmProvider,
 } from "@/app/t/[team]/admin/integrations/actions";
@@ -73,11 +74,11 @@ export function IntegrationsManager({
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
-  function syncSlack() {
+  function syncNow(type: IntegrationType) {
     setError(null);
     setNotice(null);
     startTransition(async () => {
-      const res = await syncSlackNow(teamSlug);
+      const res = type === "plane" ? await syncPlaneNow(teamSlug) : await syncSlackNow(teamSlug);
       if (!res.ok) setError(res.error ?? "sync failed");
       else {
         setNotice(res.message ?? "Synced.");
@@ -209,12 +210,16 @@ export function IntegrationsManager({
                 {i.hasSecret ? " · secret set" : " · no secret"}
               </span>
               <div className="ml-auto flex items-center gap-2">
-                {i.type === "slack" ? (
+                {i.type === "slack" || i.type === "plane" ? (
                   <button
-                    onClick={syncSlack}
+                    onClick={() => syncNow(i.type)}
                     disabled={pending}
                     className="flex items-center gap-1.5 rounded-lg border border-violet/40 bg-violet/10 px-3 py-1 text-xs font-medium text-violet disabled:opacity-50"
-                    title="Pull this team's Slack channels into the brain now"
+                    title={
+                      i.type === "plane"
+                        ? "Import this Plane project's work-items into the brain now"
+                        : "Pull this team's Slack channels into the brain now"
+                    }
                   >
                     <RefreshCw className={`size-3.5 ${pending ? "animate-spin" : ""}`} /> Sync now
                   </button>

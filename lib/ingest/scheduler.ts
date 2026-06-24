@@ -1,5 +1,5 @@
 import "server-only";
-import { runSlackIngestion } from "./run";
+import { runSlackIngestion, runPlaneIngestion } from "./run";
 
 /**
  * In-process poller — the single-service alternative to a separate cron worker.
@@ -30,12 +30,24 @@ export function startIngestScheduler(): void {
         );
       }
     } catch (err) {
-      console.error("[ingest] tick failed:", err instanceof Error ? err.message : err);
+      console.error("[ingest] slack tick failed:", err instanceof Error ? err.message : err);
+    }
+    try {
+      const p = await runPlaneIngestion();
+      if (p.created || p.updated || p.errors.length) {
+        console.info(
+          `[ingest] plane: +${p.created} ~${p.updated} =${p.unchanged} ` +
+            `(${p.items} items, ${p.projects} projects, ${p.integrations} integrations)` +
+            (p.errors.length ? ` errors: ${p.errors.join("; ")}` : "")
+        );
+      }
+    } catch (err) {
+      console.error("[ingest] plane tick failed:", err instanceof Error ? err.message : err);
     }
   };
 
   // Delay the first run so boot isn't blocked; then poll on the interval.
   setTimeout(tick, 20_000).unref?.();
   setInterval(tick, intervalMs).unref?.();
-  console.info(`[ingest] scheduler started — Slack every ${minutes}m`);
+  console.info(`[ingest] scheduler started — Slack + Plane every ${minutes}m`);
 }
