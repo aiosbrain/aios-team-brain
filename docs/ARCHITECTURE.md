@@ -215,8 +215,10 @@ work-items **into** the brain as tasks, run in-process by `lib/ingest/run.ts: ru
 > starting `aios`) are **skipped** on import — the brain already owns that `row_key` in its real
 > project, so re-importing would duplicate (this preserves "brain wins"). Plane-native items import
 > fresh, keyed by `<IDENTIFIER>-<sequence_id>`. Sub-issue `parent` → `parent_row_key` (resolved only
-> within the imported set; a skipped/absent parent is nulled, never dangling), module → `sprint`,
-> labels/state/priority/assignee carried through. Imports stay at **team tier**; the runner does not
+> within the imported set; a skipped/absent parent is nulled, never dangling), module → `sprint`
+> (round-trip-consistent with pm-sync's "Wave" mapping), cycle → a namespaced `cycle:<name>` label
+> (iterations have no dedicated task column), labels/state/priority/assignee carried through. Imports
+> stay at **team tier**; the runner does not
 > populate `task_pm_links`, so an imported task is not re-projected back out.
 
 **Reactive triggers (brain-api v1.2 Phase 2).** Projection is no longer manual-only. Task UI

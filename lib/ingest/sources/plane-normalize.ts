@@ -53,8 +53,10 @@ export interface NormalizePlaneInput {
   labels?: { id: string; name: string }[];
   /** member id → display name (best-effort). */
   members?: Record<string, string>;
-  /** work-item id → module (epic) name. */
+  /** work-item id → module (epic) name. Maps to `sprint` (round-trip-consistent with pm-sync). */
   moduleByItem?: Record<string, string>;
+  /** work-item id → cycle (iteration) name. Maps to a namespaced `cycle:<name>` label. */
+  cycleByItem?: Record<string, string>;
   /** external_source values that mark a brain-projected round-tripper. Defaults to the aios markers. */
   aiosSources?: string[];
 }
@@ -111,6 +113,7 @@ export function normalizePlaneProject(input: NormalizePlaneInput): ItemPayload {
   const labelById = new Map((input.labels ?? []).map((l) => [l.id, l.name]));
   const members = input.members ?? {};
   const moduleByItem = input.moduleByItem ?? {};
+  const cycleByItem = input.cycleByItem ?? {};
 
   const identifier = input.projectIdentifier;
   const slugSeg = safeSegment(identifier || input.projectId.slice(0, 8)) || "project";
@@ -130,6 +133,10 @@ export function normalizePlaneProject(input: NormalizePlaneInput): ItemPayload {
     const labels = (it.labels ?? [])
       .map((id) => labelById.get(id))
       .filter((n): n is string => Boolean(n));
+    // Cycle (iteration) has no dedicated task column → carry it as a namespaced label so it survives
+    // and stays distinct from module→sprint. Cap at the row schema's 80-char label limit.
+    const cycle = cycleByItem[it.id];
+    if (cycle) labels.push(`cycle:${cycle}`.slice(0, 80));
     const assignee = (it.assignees ?? [])
       .map((id) => members[id] ?? id)
       .join(", ");

@@ -135,6 +135,28 @@ describe("normalizePlaneProject", () => {
     expect(row.sprint).toBe("Wave 1");
   });
 
+  it("maps Plane cycle → a namespaced label (cycle:<name>) alongside real labels", () => {
+    const p = normalizePlaneProject({
+      ...base,
+      cycleByItem: { "wi-1": "Sprint 7" },
+      items: [{ id: "wi-1", sequence_id: 6, name: "Task", state: "s-todo", labels: ["l-bug"] }],
+    });
+    const row = (p.rows as Record<string, unknown>[])[0];
+    expect(row.labels).toEqual(["bug", "cycle:Sprint 7"]);
+  });
+
+  it("keeps module → sprint and cycle → label independent (both preserved)", () => {
+    const p = normalizePlaneProject({
+      ...base,
+      moduleByItem: { "wi-1": "Auth epic" },
+      cycleByItem: { "wi-1": "Sprint 7" },
+      items: [{ id: "wi-1", sequence_id: 6, name: "Task", state: "s-todo" }],
+    });
+    const row = (p.rows as Record<string, unknown>[])[0];
+    expect(row.sprint).toBe("Auth epic"); // module → sprint (round-trip-consistent with pm-sync)
+    expect(row.labels).toEqual(["cycle:Sprint 7"]); // cycle → label
+  });
+
   it("honors a state NAMED like a brain status over its group (Blocked → blocked)", () => {
     const p = normalizePlaneProject({
       ...base,
