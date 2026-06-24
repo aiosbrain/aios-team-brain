@@ -6,6 +6,7 @@ import {
   validateIntegrationConfig,
   type IntegrationInput,
   type IntegrationType,
+  type ProviderIntegrationType,
 } from "@/lib/api/schemas";
 
 /**
@@ -160,6 +161,30 @@ export async function getEnabledIntegrationsWithSecrets(
     config: (r.config as Record<string, unknown>) ?? {},
     secret: r.secret_ciphertext ? decryptSecret(r.secret_ciphertext as string) : null,
   }));
+}
+
+/**
+ * Resolve a team's stored LLM provider API key (decrypted), or null if none is set/enabled.
+ * Server-only consumption path for the query LLM (lib/query/claude.ts) and embeddings — callers
+ * fall back to the process env when this is null, so an unset key keeps today's env behavior.
+ * Never reaches a browser; the key is decrypted only here, in-process.
+ */
+export async function getProviderKey(
+  supabase: SupabaseClient,
+  teamId: string,
+  type: ProviderIntegrationType
+): Promise<string | null> {
+  const { data, error } = await supabase
+    .from("integrations")
+    .select("secret_ciphertext")
+    .eq("team_id", teamId)
+    .eq("type", type)
+    .eq("status", "enabled")
+    .limit(1)
+    .maybeSingle();
+  if (error) throw new Error(`load provider key failed: ${error.message}`);
+  const blob = (data as { secret_ciphertext: string | null } | null)?.secret_ciphertext;
+  return blob ? decryptSecret(blob) : null;
 }
 
 /** A team's enabled integration selection — NON-SECRET fields only. */

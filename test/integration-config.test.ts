@@ -72,4 +72,25 @@ describe("validateIntegrationConfig()", () => {
       validateIntegrationConfig("linear", { teamId: "team-uuid", projectId: "project-uuid", doneStateName: "Done" })
     ).toEqual({ teamId: "team-uuid", projectId: "project-uuid", doneStateName: "Done" });
   });
+
+  it("treats LLM provider keys as secret-only (empty config; the key lives in secret_ciphertext)", () => {
+    for (const type of ["openai", "anthropic", "google"] as const) {
+      // No non-secret config — empty object is the only valid config.
+      expect(validateIntegrationConfig(type, {})).toEqual({});
+      // Any non-empty config is rejected by the strict empty-object allowlist…
+      expect(() => validateIntegrationConfig(type, { model: "gpt-4" })).toThrow(IntegrationConfigError);
+      // …and a key-like field is caught by the secret-key scan before the allowlist.
+      expect(() => validateIntegrationConfig(type, { apiKey: "sk-1" })).toThrow(/secret-like key/i);
+    }
+  });
+});
+
+describe("INTEGRATION_TYPES", () => {
+  it("includes the LLM provider key types", async () => {
+    const { INTEGRATION_TYPES, PROVIDER_INTEGRATION_TYPES } = await import("@/lib/api/schemas");
+    for (const t of PROVIDER_INTEGRATION_TYPES) {
+      expect(INTEGRATION_TYPES).toContain(t);
+    }
+    expect([...PROVIDER_INTEGRATION_TYPES].sort()).toEqual(["anthropic", "google", "openai"]);
+  });
 });

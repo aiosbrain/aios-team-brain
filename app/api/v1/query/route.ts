@@ -5,6 +5,7 @@ import { rateLimit } from "@/lib/api/rate-limit";
 import { querySchema, errorResponse } from "@/lib/api/schemas";
 import { retrieve } from "@/lib/query/retrieve";
 import { streamAnswer } from "@/lib/query/claude";
+import { getProviderKey } from "@/lib/integrations/manage";
 
 export const runtime = "nodejs";
 export const maxDuration = 120;
@@ -55,6 +56,12 @@ export async function POST(req: NextRequest) {
   const started = Date.now();
   const ctx = await retrieve(supabase, auth.teamId, auth.memberTier, question, project);
 
+  // Per-team provider keys (encrypted in integrations); null → env fallback in streamAnswer.
+  const [anthropicKey, openaiKey] = await Promise.all([
+    getProviderKey(supabase, auth.teamId, "anthropic"),
+    getProviderKey(supabase, auth.teamId, "openai"),
+  ]);
+
   const encoder = new TextEncoder();
   const stream = new ReadableStream({
     async start(controller) {
@@ -63,7 +70,7 @@ export async function POST(req: NextRequest) {
 
       let answer = "";
       try {
-        for await (const chunk of streamAnswer(ctx, question)) {
+        for await (const chunk of streamAnswer(ctx, question, { anthropicKey, openaiKey })) {
           if (chunk.type === "delta") {
             answer += chunk.text;
             send("delta", { text: chunk.text });
