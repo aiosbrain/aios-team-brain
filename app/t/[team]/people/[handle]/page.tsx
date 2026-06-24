@@ -64,7 +64,7 @@ export default async function PersonPage({
               </span>
             )}
             <div>
-              <h1 className="font-display text-2xl font-semibold text-ink">{p.name}</h1>
+              <h1 className="font-display text-2xl text-ink">{p.name}</h1>
               <div className="mt-0.5 flex items-center gap-3 text-xs text-ink-tertiary">
                 <span className="capitalize">{p.role}</span>
                 {p.github_login ? (

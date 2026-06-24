@@ -19,7 +19,7 @@ export function AskBrain({ teamSlug, teamName }: { teamSlug: string; teamName: s
       <div className="rounded-2xl bg-surface-inset px-5 py-5 sm:px-6 sm:py-6">
         <div className="mb-4 flex items-center gap-2">
           <Sparkles className="size-4 text-violet" />
-          <h2 className="font-display text-lg font-semibold text-ink">
+          <h2 className="font-display text-lg text-ink">
             Ask {teamName}&apos;s brain
           </h2>
         </div>

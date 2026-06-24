@@ -84,11 +84,12 @@ h3 {
   background: var(--gradient-prism);
 }
 
-/* Frosted nav / sidebar layer */
+/* Frosted nav / sidebar layer — liquid-glass tokens (mode-aware, 0.3.0) */
 .frosted {
-  background: var(--color-surface-nav);
-  backdrop-filter: blur(20px) saturate(1.2);
-  -webkit-backdrop-filter: blur(20px) saturate(1.2);
+  background: var(--aios-glass-bg);
+  border-color: var(--aios-glass-border);
+  backdrop-filter: var(--aios-blur-glass-strong) saturate(1.2);
+  -webkit-backdrop-filter: var(--aios-blur-glass-strong) saturate(1.2);
 }
 
 /* Cards: flat at rest, violet-tinted glow on hover — never black shadows. */
@@ -96,6 +97,8 @@ h3 {
   background: var(--color-surface-card);
   border: 1px solid var(--color-border-subtle);
   border-radius: 0.75rem;
+  /* subtle mode-aware resting elevation (0.3.0 effects layer) */
+  box-shadow: var(--aios-shadow-glow-card);
   transition: all 0.3s ease;
 }
 

@@ -74,7 +74,7 @@ export default async function ContributorPage({
               </span>
             )}
             <div>
-              <h1 className="font-display text-2xl font-semibold text-ink">{c.name}</h1>
+              <h1 className="font-display text-2xl text-ink">{c.name}</h1>
               <div className="mt-0.5 flex items-center gap-3 text-xs text-ink-tertiary">
                 {c.github_login ? (
                   <a
