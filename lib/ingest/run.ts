@@ -7,8 +7,14 @@ import { getEnabledIntegrationsWithSecrets } from "@/lib/integrations/manage";
 import { SlackClient, fetchSlackChannel } from "./sources/slack";
 import { normalizeThread } from "./sources/slack-normalize";
 import { fetchPlaneProject } from "./sources/plane";
-import { normalizePlaneProject } from "./sources/plane-normalize";
+import { normalizePlaneProject, normalizePlaneDocs } from "./sources/plane-normalize";
 import type { PlaneConnection } from "@/lib/pm-sync/plane-client";
+import { fetchLinearTeam } from "./sources/linear";
+import { normalizeLinearTeam, normalizeLinearDocs } from "./sources/linear-normalize";
+import { fetchGithubRepoIssues } from "./sources/github";
+import { normalizeGithubRepo } from "./sources/github-normalize";
+import { fetchGithubRepoFiles } from "./sources/github-files";
+import { normalizeGithubFiles } from "./sources/github-files-normalize";
 
 /**
  * In-app ingestion runner — the TypeScript replacement for the Python sidecar's
@@ -288,12 +294,20 @@ export async function runPlaneIngestion(opts: { teamId?: string } = {}): Promise
         summary.projects++;
         try {
           const fetched = await fetchPlaneProject(conn);
+          // Work-items → tasks (one kind=task item).
           const payload = normalizePlaneProject({ ...fetched, aiosSources });
           summary.items += payload.rows?.length ?? 0;
           const res = await ingestItem(supabase, auth, payload, "team");
           if (res.status === "created") summary.created++;
           else if (res.status === "updated") summary.updated++;
           else summary.unchanged++;
+          // Work-item text → deliverable items (searchable), one per work-item.
+          for (const doc of normalizePlaneDocs({ ...fetched, aiosSources })) {
+            const r = await ingestItem(supabase, auth, doc, "team");
+            if (r.status === "created") summary.created++;
+            else if (r.status === "updated") summary.updated++;
+            else summary.unchanged++;
+          }
         } catch (err) {
           summary.errors.push(
             `integration "${integ.name}": ${err instanceof Error ? err.message : "import failed"}`
@@ -305,5 +319,174 @@ export async function runPlaneIngestion(opts: { teamId?: string } = {}): Promise
     return summary;
   } finally {
     planeRunning = false;
+  }
+}
+
+// ── Linear + GitHub inbound import (mirror Plane) ─────────────────────────────
+
+/** Same shape as PlaneIngestSummary — `projects` counts brain projects written (1/team for Linear, 1/repo for GitHub). */
+export type ImportSummary = PlaneIngestSummary;
+
+/** Distinct teams with at least one enabled integration of a given type. */
+async function teamsWithType(supabase: SupabaseClient, type: "linear" | "github"): Promise<string[]> {
+  const { data } = await supabase
+    .from("integrations")
+    .select("team_id")
+    .eq("type", type)
+    .eq("status", "enabled");
+  const ids = (data ?? []).map((r) => (r as { team_id: string }).team_id);
+  return [...new Set(ids)];
+}
+
+function emptyImportSummary(): ImportSummary {
+  return { ok: true, integrations: 0, projects: 0, created: 0, updated: 0, unchanged: 0, items: 0, errors: [] };
+}
+
+let linearRunning = false;
+
+/**
+ * Run Linear ingestion for all enabled Linear integrations (optionally one team). Each integration's
+ * team is imported into its own brain project (`linear-<teamKey>`) as one kind="task" item; normalize
+ * de-dupes brain-projected round-trippers (aios-ext footer) and the writer dedups unchanged teams.
+ */
+export async function runLinearIngestion(opts: { teamId?: string } = {}): Promise<ImportSummary> {
+  if (linearRunning) return { ...emptyImportSummary(), skipped: true };
+  linearRunning = true;
+  try {
+    const supabase = adminClient();
+    const teamIds = opts.teamId ? [opts.teamId] : await teamsWithType(supabase, "linear");
+    const summary = emptyImportSummary();
+    for (const teamId of teamIds) {
+      let integrations;
+      try {
+        integrations = (await getEnabledIntegrationsWithSecrets(supabase, teamId)).filter((i) => i.type === "linear");
+      } catch (err) {
+        summary.errors.push(`team ${teamId}: ${err instanceof Error ? err.message : "secret read failed"}`);
+        continue;
+      }
+      if (integrations.length === 0) continue;
+      const auth = await resolveConnectorAuth(supabase, teamId, {
+        handle: "linear-sync",
+        email: "linear-sync@connector.local",
+        displayName: "Linear Sync",
+      });
+      if (!auth) {
+        summary.errors.push(`team ${teamId}: no connector member`);
+        continue;
+      }
+      for (const integ of integrations) {
+        summary.integrations++;
+        const apiKey = integ.secret;
+        const linearTeamId = integ.config.teamId as string | undefined;
+        if (!apiKey || !linearTeamId) {
+          summary.errors.push(`integration "${integ.name}": needs an API key + teamId in the dashboard`);
+          continue;
+        }
+        summary.projects++;
+        try {
+          const fetched = await fetchLinearTeam({ apiKey, teamId: linearTeamId });
+          // Issues → tasks (one kind=task item).
+          const payload = normalizeLinearTeam(fetched);
+          summary.items += payload.rows?.length ?? 0;
+          const res = await ingestItem(supabase, auth, payload, "team");
+          if (res.status === "created") summary.created++;
+          else if (res.status === "updated") summary.updated++;
+          else summary.unchanged++;
+          // Issue text → deliverable items (searchable), one per issue.
+          for (const doc of normalizeLinearDocs(fetched)) {
+            const r = await ingestItem(supabase, auth, doc, "team");
+            if (r.status === "created") summary.created++;
+            else if (r.status === "updated") summary.updated++;
+            else summary.unchanged++;
+          }
+        } catch (err) {
+          summary.errors.push(`integration "${integ.name}": ${err instanceof Error ? err.message : "import failed"}`);
+        }
+      }
+    }
+    summary.ok = summary.errors.length === 0;
+    return summary;
+  } finally {
+    linearRunning = false;
+  }
+}
+
+let githubRunning = false;
+
+/**
+ * Run GitHub Issues ingestion for all enabled GitHub integrations (optionally one team). Each repo in
+ * an integration's `config.repos` is imported into its own brain project (`github-<owner>-<repo>`) as
+ * one kind="task" item. GitHub is not a pm-sync provider, so idempotency is the stable row_key + sha.
+ */
+export async function runGithubIngestion(opts: { teamId?: string } = {}): Promise<ImportSummary> {
+  if (githubRunning) return { ...emptyImportSummary(), skipped: true };
+  githubRunning = true;
+  try {
+    const supabase = adminClient();
+    const teamIds = opts.teamId ? [opts.teamId] : await teamsWithType(supabase, "github");
+    const summary = emptyImportSummary();
+    for (const teamId of teamIds) {
+      let integrations;
+      try {
+        integrations = (await getEnabledIntegrationsWithSecrets(supabase, teamId)).filter((i) => i.type === "github");
+      } catch (err) {
+        summary.errors.push(`team ${teamId}: ${err instanceof Error ? err.message : "secret read failed"}`);
+        continue;
+      }
+      if (integrations.length === 0) continue;
+      const auth = await resolveConnectorAuth(supabase, teamId, {
+        handle: "github-sync",
+        email: "github-sync@connector.local",
+        displayName: "GitHub Sync",
+      });
+      if (!auth) {
+        summary.errors.push(`team ${teamId}: no connector member`);
+        continue;
+      }
+      for (const integ of integrations) {
+        summary.integrations++;
+        const token = integ.secret; // optional — public repos work token-free
+        const repos = (integ.config.repos as string[] | undefined) ?? [];
+        const fileGlobs = integ.config.fileGlobs as string[] | undefined;
+        for (const full of repos) {
+          const [owner, repo] = full.split("/", 2);
+          if (!owner || !repo) {
+            summary.errors.push(`integration "${integ.name}": repo "${full}" must be "owner/name"`);
+            continue;
+          }
+          summary.projects++;
+          // Issues → tasks (one kind=task item, diff-synced).
+          try {
+            const fetched = await fetchGithubRepoIssues({ owner, repo, token });
+            const payload = normalizeGithubRepo(fetched);
+            summary.items += payload.rows?.length ?? 0;
+            const res = await ingestItem(supabase, auth, payload, "team");
+            if (res.status === "created") summary.created++;
+            else if (res.status === "updated") summary.updated++;
+            else summary.unchanged++;
+          } catch (err) {
+            summary.errors.push(`${full} issues: ${err instanceof Error ? err.message : "import failed"}`);
+          }
+          // Repo files → deliverable items (one per file, idempotent by path+sha).
+          try {
+            const fetched = await fetchGithubRepoFiles({ owner, repo, token, globs: fileGlobs });
+            const payloads = normalizeGithubFiles(fetched);
+            summary.items += payloads.length;
+            for (const payload of payloads) {
+              const res = await ingestItem(supabase, auth, payload, "team");
+              if (res.status === "created") summary.created++;
+              else if (res.status === "updated") summary.updated++;
+              else summary.unchanged++;
+            }
+          } catch (err) {
+            summary.errors.push(`${full} files: ${err instanceof Error ? err.message : "import failed"}`);
+          }
+        }
+      }
+    }
+    summary.ok = summary.errors.length === 0;
+    return summary;
+  } finally {
+    githubRunning = false;
   }
 }

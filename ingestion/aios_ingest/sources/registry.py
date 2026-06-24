@@ -13,7 +13,6 @@ from .confluence import ConfluenceSource
 from .gdrive import GoogleDriveSource
 from .github import GithubSource
 from .granola import GranolaSource
-from .linear import LinearSource
 from .local import LocalSource
 from .notion import NotionSource
 from .radar import RadarSource
@@ -28,7 +27,6 @@ _REGISTRY: dict[str, Builder] = {
     "notion": NotionSource,
     "gdrive": GoogleDriveSource,
     "confluence": ConfluenceSource,
-    "linear": LinearSource,
     "web": WebSource,
     "local": LocalSource,
     "radar": RadarSource,

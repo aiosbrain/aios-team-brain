@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type { ItemPayload } from "@/lib/api/schemas";
 import { normalizeTaskStatus } from "@/lib/api/schemas";
+import { htmlToPlainText } from "@/lib/pm-sync/provider";
 
 /**
  * Pure: a Plane project's fetched work-items → ONE brain `kind="task"` ItemPayload
@@ -33,6 +34,7 @@ export interface PlaneWorkItemRaw {
   id: string;
   sequence_id?: number;
   name?: string;
+  description_html?: string | null;
   state?: string; // state id
   priority?: string | null;
   labels?: string[] | null; // label ids
@@ -181,4 +183,42 @@ export function normalizePlaneProject(input: NormalizePlaneInput): ItemPayload {
     body,
     rows,
   };
+}
+
+/**
+ * Searchable companion to the Plane task import: ONE `kind="deliverable"` item per work-item carrying
+ * the title + (HTML→text) description, so Plane prose is full-text searchable in the brain — not just
+ * the terse task table. aios round-trippers are skipped, same as the task import. Content pattern
+ * (keyed by path, idempotent by sha, not diff-deleted).
+ */
+export function normalizePlaneDocs(input: NormalizePlaneInput): ItemPayload[] {
+  const aiosSources = input.aiosSources ?? ["aios", "aios-backlog"];
+  const identifier = input.projectIdentifier;
+  const slugSeg = safeSegment(identifier || input.projectId.slice(0, 8)) || "project";
+  return input.items
+    .filter((it) => !isAiosOrigin(it.external_source, aiosSources))
+    .map((it) => {
+      const rk = rowKeyFor(it, identifier);
+      const title = it.name?.trim() || "(untitled)";
+      // htmlToPlainText handles block tags + entities; strip any remaining inline tags so the
+      // searchable body is clean prose.
+      const description = htmlToPlainText(it.description_html).replace(/<[^>]+>/g, "").trim();
+      const body = `# ${rk}: ${title}\n\n${description}\n`;
+      return {
+        project: `plane-${slugSeg}`,
+        path: `plane/${slugSeg}/${rk}.md`,
+        kind: "deliverable" as const,
+        content_sha256: sha256(body),
+        actor: "",
+        access: "team",
+        frontmatter: {
+          source: "plane",
+          identifier: rk,
+          plane_id: it.id,
+          workspace: input.workspaceSlug,
+          project_id: input.projectId,
+        },
+        body,
+      };
+    });
 }

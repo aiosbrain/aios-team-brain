@@ -20,7 +20,7 @@ Reason from this table, not from a random call site.
 | State | Store (table) | Writer | Readers | Tier/access enforcement |
 |---|---|---|---|---|
 | Synced content | `items`, `item_versions` | **`lib/ingest` only** (single-writer guarded) | dashboard pages, `/api/v1/items`, `lib/query/retrieve`, okf-bundle, metrics | supabase: RLS; postgres: app-code — API ✅, dashboard ✅ (`lib/auth/visibility` choke-point, guarded) |
-| Tasks | `tasks` | `lib/ingest` (sync rows — incl. inbound Plane import into a dedicated `plane-<id>` project) + `app/actions/tasks.ts` (UI; mints `ui-` row_key) + `lib/work-events` (merged-work completion) | dashboard, `/api/v1/tasks`, PM sync | team-scoped; `origin='ui'` rows survive sync diff; v1.2 hierarchy fields `parent_row_key`/`labels`/`priority` (parent integrity — exists + acyclic — enforced in `lib/ingest`); `body` is dashboard/DB-only (never in the markdown contract) |
+| Tasks | `tasks` | `lib/ingest` (sync rows — incl. inbound Plane/Linear/GitHub import, each into a dedicated `plane-<id>`/`linear-<team>`/`github-<owner>-<repo>` project) + `app/actions/tasks.ts` (UI; mints `ui-` row_key) + `lib/work-events` (merged-work completion) | dashboard, `/api/v1/tasks`, PM sync | team-scoped; `origin='ui'` rows survive sync diff; v1.2 hierarchy fields `parent_row_key`/`labels`/`priority` (parent integrity — exists + acyclic — enforced in `lib/ingest`); `body` is dashboard/DB-only (never in the markdown contract) |
 | Task PM links | `task_pm_links` | `lib/ingest` (optional task-row PM metadata) + PM backfill | dashboard task badges, `lib/pm-sync` | team-scoped; stores provider IDs/status only, never secrets; v1.2 adds `last_projected_status`/`projection_fingerprint` (skip-detection) + `provider_seen_status` (Phase 5 divergence) |
 | Primary PM provider | `teams.primary_pm_provider` | Admin → Integrations (`setPrimaryPmProvider`, admin-gated + audited) | `lib/pm-sync` projection | the single PM tool the brain projects into; null = projection no-ops / sole-enabled fallback |
 | Work events | `work_events` | `POST /api/v1/work-events` → `lib/work-events` | Admin → PM sync health | team-tier only; unresolved events are preserved for reconciliation |
@@ -33,7 +33,7 @@ Reason from this table, not from a random call site.
 | Git-author aliases | `member_emails` (+ `members.github_login`/`avatar_url`) | `lib/admin/*` + GitHub sync (`lib/codebases/github`) | `lib/codebases/ingest` (author→member), dashboard | team-scoped `unique(team_id,email)`; one alias → one member |
 | Sessions (postgres) | `auth_users`, `auth_tokens` | `lib/auth/pg-*` | `getSessionUser` | signed httpOnly cookie |
 | Rate limits | `rate_limits` | `rate_limit_hit` rpc | — | service-role only |
-| Integrations | `integrations` | **`lib/integrations/manage` only** (single-writer guarded; admin server actions) | Admin → Integrations page (`lib/integrations/read`, **admin-gated** `canManageIntegrations`); `GET /api/v1/integrations` (API-key, NON-secret selections via `manage.listEnabledIntegrationSelections`); in-process Slack + Plane runners (`lib/ingest/run` via `manage.getEnabledIntegrationsWithSecrets`) | `config` is NON-secret (per-type allowlist + secret-key rejection); the connector secret is **encrypted at rest** in `secret_ciphertext` (`lib/secrets`, AES-256-GCM) and decrypted **only in-process** for the runner — it never leaves over HTTP, not even on the API-key read. Admin-tier (no per-row `access` column): both writes (`resolveIntegrationsAdmin`) and the dashboard read (`canManageIntegrations`, in `lib/integrations/read`) are app-code gated on `role==="admin"` — no RLS backstop; guarded by `test/guards/integrations-tier-filter` + the data-mechanics tier test. The page fails closed under `DB_BACKEND=supabase`. **LLM provider keys** (`openai`/`anthropic`/`google`) are secret-only integration types managed in the Admin → Integrations "AI provider keys" panel; the query LLM resolves the team's key via `manage.getProviderKey` (falls back to the process env when unset). postgres-only |
+| Integrations | `integrations` | **`lib/integrations/manage` only** (single-writer guarded; admin server actions) | Admin → Integrations page (`lib/integrations/read`, **admin-gated** `canManageIntegrations`); `GET /api/v1/integrations` (API-key, NON-secret selections via `manage.listEnabledIntegrationSelections`); in-process Slack + Plane + Linear + GitHub runners (`lib/ingest/run` via `manage.getEnabledIntegrationsWithSecrets`) | `config` is NON-secret (per-type allowlist + secret-key rejection); the connector secret is **encrypted at rest** in `secret_ciphertext` (`lib/secrets`, AES-256-GCM) and decrypted **only in-process** for the runner — it never leaves over HTTP, not even on the API-key read. Admin-tier (no per-row `access` column): both writes (`resolveIntegrationsAdmin`) and the dashboard read (`canManageIntegrations`, in `lib/integrations/read`) are app-code gated on `role==="admin"` — no RLS backstop; guarded by `test/guards/integrations-tier-filter` + the data-mechanics tier test. The page fails closed under `DB_BACKEND=supabase`. **LLM provider keys** (`openai`/`anthropic`/`google`) are secret-only integration types managed in the Admin → Integrations "AI provider keys" panel; the query LLM resolves the team's key via `manage.getProviderKey` (falls back to the process env when unset). postgres-only |
 | Codebase analytics | `codebases`, `code_metrics`, `code_contributions`, `github_issues` | **`lib/codebases/ingest` only** (single-writer guarded; via `POST /api/v1/codebases`) | codebases pages incl. Codebases → GitHub (scan freshness via `lib/metrics/codebases.getCodebaseFreshness` + live HEAD compare `lib/codebases/github.fetchRepoHeadSha`), `lib/metrics/codebases` | team-tier only; **app-code gate** (`lib/codebases/visibility` + guard) — no RLS backstop. Brain derives `agentic_score`/`health_score`; AEM `readiness_*` is scored scanner-side (`ingestion/aios_ingest/analyzers/readiness.py`) and persisted verbatim. W1.3 native UI: repo selection persists to `integrations` (type=github, admin); member→GitHub linking via `linkGithub` on Admin → Members (admin); **no server-triggered scan** — the GitHub surface documents the manual `aios-ingest scan` command and the sidecar consumes the selection (F4) |
 | Brain spend / usage meter | `query_log` (`cost_usd`, `input/output/cache_tokens`, `member_id`) | the query routes (`/api/v1/query`, `/api/dashboard/query`) — one row per answered question | `lib/metrics/pulse` (usage KPIs), `lib/metrics/members` (per-member cost + throughput-vs-cost, W1.2), Admin → Usage page | **role-scoped in app code** via `scopeQueryLog` (admins → team-wide; everyone else → own rows) — no RLS backstop in postgres; guarded by `test/guards/query-log-visibility`. Brain spend only |
 | External AI spend | `usage_costs` | **`lib/costs/ingest` only** (via `POST /api/v1/costs`) | `lib/metrics/external-costs`, Admin → Usage page | team-tier only; workstation pushes from `aios analyze --push` (Cursor dashboard USD + session-log estimates); idempotent on `(team, member, date, provider, source, project)` |
@@ -220,6 +220,38 @@ work-items **into** the brain as tasks, run in-process by `lib/ingest/run.ts: ru
 > (iterations have no dedicated task column), labels/state/priority/assignee carried through. Imports
 > stay at **team tier**; the runner does not
 > populate `task_pm_links`, so an imported task is not re-projected back out.
+> • **Searchable issue text.** Alongside the task item, the runner also writes ONE `kind="deliverable"`
+> item **per work-item** (`normalizePlaneDocs` → `plane/<slug>/<id>.md`) carrying the title +
+> HTML→text description, so Plane prose is full-text searchable via the `items.search` column — not
+> just the terse task table. Round-trippers are skipped here too; this is the content pattern
+> (keyed by path, idempotent by sha, not diff-deleted).
+
+**Inbound Linear & GitHub import (same pattern as Plane).** Two more in-app task importers, each
+mirroring the Plane design (dedicated project, one `kind="task"` item, project-wide diff-delete, team
+tier, `run<X>Ingestion` + scheduler tick + admin "Sync now"):
+> • **Linear** — `lib/ingest/sources/linear.ts` + `linear-normalize.ts`, sharing the GraphQL client
+> `lib/pm-sync/linear-client.ts` with the outbound adapter. Project `linear-<teamKey>`, row_key = the
+> Linear identifier (`ENG-123`). Linear **is** the pm-sync provider, so it has the same round-trip risk:
+> issues carrying the `aios-ext: <row_key>` footer (the projection's idempotency marker, now shared in
+> `linear-client`) are **de-duped/skipped**. `state.type` → status, priority int → word, sub-issue
+> `parent` → `parent_row_key`, project → `sprint`, cycle → `cycle:<name>` label. Like Plane, it also
+> writes a searchable `kind="deliverable"` item per issue (`normalizeLinearDocs` →
+> `linear/<teamKey>/<identifier>.md`, title + description).
+> • **GitHub** — two complementary native sources per repo in `config.repos`, both into project
+> `github-<owner>-<repo>`:
+>   - **Issues → tasks** (`github.ts` + `github-normalize.ts`, REST, public repos token-free): one
+>     `kind="task"` item, row_key = `GH-<n>`. PRs dropped; `open` → backlog (or a workflow label like
+>     "in progress"/"blocked"), `closed` → done; milestone → `sprint`, labels/assignees carried.
+>     GitHub is **not** a pm-sync provider, so no round-trip loop — idempotency is row_key + sha.
+>   - **Repo files → deliverables** (`github-files.ts` + `github-files-normalize.ts`): the native port
+>     of the Python sidecar's GitHub source — walks the default branch's tree, keeps files matching
+>     `config.fileGlobs` (default `*.md`/`*.mdx`), and writes ONE `kind="deliverable"` item **per file**
+>     (path `github/<owner>-<repo>/<filepath>`, idempotent by path+sha, content pattern like Slack — not
+>     diff-deleted). This is content/knowledge ingestion, distinct from the task importer.
+>
+> Together these replace the Python sidecar's `linear`/`github` inbound sources. The **`linear`
+> sidecar source has been removed** (dropped from the registry + the `drift:sources` list); the
+> `github` sidecar source remains for now but is superseded by these native sources.
 
 **Reactive triggers (brain-api v1.2 Phase 2).** Projection is no longer manual-only. Task UI
 writes — `createTaskAction` / `moveTaskAction` / the new `updateTaskAction` (title/sprint/due/
@@ -425,7 +457,7 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 ### Ingestion sources
 
 <!-- drift:sources -->
-`github` · `slack` · `notion` · `gdrive` · `confluence` · `linear` · `web` · `local` · `radar` · `granola`
+`github` · `slack` · `notion` · `gdrive` · `confluence` · `web` · `local` · `radar` · `granola`
 <!-- /drift:sources -->
 
 > **`granola` privacy invariant:** Granola is the one source that must **never** sync

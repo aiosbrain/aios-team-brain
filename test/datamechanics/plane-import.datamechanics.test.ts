@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { db, ingest, seedTeam, type Seed } from "./helpers";
-import { normalizePlaneProject, type PlaneWorkItemRaw } from "@/lib/ingest/sources/plane-normalize";
+import { normalizePlaneProject, normalizePlaneDocs, type PlaneWorkItemRaw } from "@/lib/ingest/sources/plane-normalize";
 
 // Spec (Plane inbound import) verified to the observable outcome — rows read back from real Postgres:
 //   1. import materializes work-items as tasks in a DEDICATED brain project;
@@ -124,6 +124,31 @@ describe("Plane import (data-mechanics)", () => {
     const row = data as { sprint: string; labels: string[] } | null;
     expect(row?.sprint).toBe("Auth epic");
     expect(row?.labels).toContain("cycle:Sprint 7");
+  });
+
+  it("writes work-item text as a searchable deliverable item at team tier", async () => {
+    const seed = await seedTeam();
+    const docs = normalizePlaneDocs({
+      projectId: "p-1",
+      projectIdentifier: "ENG",
+      workspaceSlug: "acme",
+      baseUrl: "https://api.plane.so",
+      states: STATES,
+      items: [{ id: "wi-1", sequence_id: 1, name: "Searchable", description_html: "<p>find me by this prose</p>", state: "s-todo" }],
+    });
+    for (const d of docs) {
+      await ingest(seed, { project: d.project, kind: "deliverable", path: d.path, body: d.body, access: "team" } as never);
+    }
+    const { data } = await db()
+      .from("items")
+      .select("kind, access, body")
+      .eq("team_id", seed.teamId)
+      .eq("path", "plane/eng/ENG-1.md")
+      .maybeSingle();
+    const row = data as { kind: string; access: string; body: string } | null;
+    expect(row?.kind).toBe("deliverable");
+    expect(row?.access).toBe("team");
+    expect(row?.body).toContain("find me by this prose");
   });
 
   it("writes imported Plane data at team tier (never external)", async () => {

@@ -17,8 +17,8 @@ import {
   type UpsertWorkItemInput,
   type UpsertWorkItemResult,
 } from "@/lib/pm-sync/provider";
+import { linearGraphql, parseExt, withFooter, stripFooter } from "@/lib/pm-sync/linear-client";
 
-type LinearGraphqlResponse<T> = { data?: T; errors?: { message: string }[] };
 type LinearState = { id: string; name: string; type: string };
 type LinearLabel = { id: string; name: string };
 type LinearIssue = {
@@ -51,35 +51,6 @@ const GROUP_TO_TYPE: Record<StateGroup, string> = {
   cancelled: "canceled",
 };
 
-const EXT_RE = /aios-ext:\s*([A-Za-z0-9._-]+)\s*[·•]\s*source:\s*([A-Za-z0-9._-]+)/;
-const extMarker = (rowKey: string, source: string) => `aios-ext: ${rowKey} · source: ${source}`;
-function parseExt(description: string | null | undefined): string | null {
-  const m = String(description ?? "").match(EXT_RE);
-  return m ? m[1] : null;
-}
-// Body that Linear stores = plain text + the idempotency footer. Strip the footer to compare to tasks.body.
-function withFooter(body: string, rowKey: string, source: string): string {
-  const text = (body ?? "").trim();
-  return `${text}\n\n${extMarker(rowKey, source)}`;
-}
-function stripFooter(description: string | null | undefined): string {
-  return String(description ?? "").replace(EXT_RE, "").trim();
-}
-
-async function graphql<T>(fetchImpl: typeof fetch, apiKey: string, query: string, variables: Record<string, unknown>): Promise<T> {
-  const res = await fetchImpl("https://api.linear.app/graphql", {
-    method: "POST",
-    headers: { Authorization: apiKey, "Content-Type": "application/json" },
-    body: JSON.stringify({ query, variables }),
-  });
-  const json = (await res.json().catch(() => null)) as LinearGraphqlResponse<T> | null;
-  if (!res.ok || json?.errors?.length || !json?.data) {
-    const message = json?.errors?.map((e) => e.message).join("; ") || `HTTP ${res.status}`;
-    throw new PmSyncError(`Linear GraphQL failed: ${message}`);
-  }
-  return json.data;
-}
-
 interface LinearCtx {
   fetchImpl: typeof fetch;
   apiKey: string;
@@ -105,7 +76,7 @@ function resolveStateByGroup(states: LinearState[], desired: DesiredState): Line
 }
 
 async function buildBootstrap(ctx: LinearCtx, teamId: string): Promise<LinearBootstrap> {
-  const data = await graphql<{
+  const data = await linearGraphql<{
     team: {
       states: { nodes: LinearState[] };
       labels: { nodes: LinearLabel[] };
@@ -129,7 +100,7 @@ async function buildBootstrap(ctx: LinearCtx, teamId: string): Promise<LinearBoo
   type IssuesPage = { team: { issues: { pageInfo: { hasNextPage: boolean; endCursor: string }; nodes: LinearIssue[] } } | null };
   let after: string | null = null;
   for (let i = 0; i < 100; i++) {
-    const page: IssuesPage = await graphql<IssuesPage>(
+    const page: IssuesPage = await linearGraphql<IssuesPage>(
       ctx.fetchImpl,
       ctx.apiKey,
       `query ProjectionIssues($teamId: String!, $after: String) {
@@ -161,7 +132,7 @@ async function ensureLabelIds(ctx: LinearCtx, boot: LinearBootstrap, names: stri
     if (!name) continue;
     let id = boot.labels.get(name);
     if (!id) {
-      const data = await graphql<{ issueLabelCreate: { issueLabel: { id: string } } }>(
+      const data = await linearGraphql<{ issueLabelCreate: { issueLabel: { id: string } } }>(
         ctx.fetchImpl,
         ctx.apiKey,
         `mutation CreateLabel($name: String!, $teamId: String!) {
@@ -178,7 +149,7 @@ async function ensureLabelIds(ctx: LinearCtx, boot: LinearBootstrap, names: stri
 }
 
 async function resolveIssueLite(ctx: LinearCtx, id: string): Promise<LinearIssue> {
-  const data = await graphql<{ issue: LinearIssue | null }>(
+  const data = await linearGraphql<{ issue: LinearIssue | null }>(
     ctx.fetchImpl,
     ctx.apiKey,
     `query IssueForPmSync($id: String!) {
@@ -191,7 +162,7 @@ async function resolveIssueLite(ctx: LinearCtx, id: string): Promise<LinearIssue
 }
 
 async function resolveStatesForTeam(ctx: LinearCtx, teamId: string): Promise<LinearState[]> {
-  const data = await graphql<{ team: { states: { nodes: LinearState[] } } | null }>(
+  const data = await linearGraphql<{ team: { states: { nodes: LinearState[] } } | null }>(
     ctx.fetchImpl,
     ctx.apiKey,
     `query TeamDoneStates($teamId: String!) {
@@ -249,7 +220,7 @@ export const linearAdapter: PmAdapter = {
       const state = resolveStateByGroup(states, desired);
       const changed = issue.state?.id !== state.id;
       if (changed) {
-        await graphql(
+        await linearGraphql(
           ctx.fetchImpl,
           ctx.apiKey,
           `mutation SetIssueState($id: String!, $stateId: String!) {
@@ -286,7 +257,7 @@ export const linearAdapter: PmAdapter = {
     if (existing?.id) {
       issue = existing;
       if (!linearIssueMatches(issue, desiredFields)) {
-        const data = await graphql<{ issueUpdate: { issue: LinearIssue } }>(
+        const data = await linearGraphql<{ issueUpdate: { issue: LinearIssue } }>(
           ctx.fetchImpl,
           ctx.apiKey,
           `mutation UpdateIssue($id: String!, $input: IssueUpdateInput!) {
@@ -299,7 +270,7 @@ export const linearAdapter: PmAdapter = {
         mutated = true;
       }
     } else {
-      const data = await graphql<{ issueCreate: { issue: LinearIssue } }>(
+      const data = await linearGraphql<{ issueCreate: { issue: LinearIssue } }>(
         ctx.fetchImpl,
         ctx.apiKey,
         `mutation CreateIssue($input: IssueCreateInput!) {
@@ -336,7 +307,7 @@ export const linearAdapter: PmAdapter = {
     const state = resolveStateByGroup(states, desiredStateForStatus("done"));
     const changed = issue.state?.id !== state.id;
     if (changed) {
-      await graphql(
+      await linearGraphql(
         ctx.fetchImpl,
         ctx.apiKey,
         `mutation CompleteIssue($id: String!, $stateId: String!) {
