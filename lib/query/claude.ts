@@ -39,9 +39,20 @@ export type QueryUsage = {
   cost_usd: number;
 };
 
+/**
+ * Per-team provider keys (resolved from the encrypted integrations store by the caller). When a key
+ * is null/absent the SDK / fetch falls back to the process env, preserving the original env-only
+ * behavior for instances that haven't set a key in the dashboard.
+ */
+export interface ProviderKeys {
+  anthropicKey?: string | null;
+  openaiKey?: string | null;
+}
+
 export async function* streamAnswer(
   ctx: RetrievedContext,
-  question: string
+  question: string,
+  keys: ProviderKeys = {}
 ): AsyncGenerator<
   | { type: "delta"; text: string }
   | { type: "done"; usage: QueryUsage }
@@ -55,11 +66,12 @@ export async function* streamAnswer(
 
   // Local OpenAI-compatible backend (Ollama/Hermes) — fully on-machine, $0.
   if (LLM_BASE_URL) {
-    yield* streamLocal(ctx.structured, sourcesBlock, question);
+    yield* streamLocal(ctx.structured, sourcesBlock, question, keys.openaiKey);
     return;
   }
 
-  const client = new Anthropic();
+  // Per-team key wins; otherwise the SDK reads ANTHROPIC_API_KEY from the env.
+  const client = new Anthropic(keys.anthropicKey ? { apiKey: keys.anthropicKey } : undefined);
 
   const stream = client.messages.stream({
     model: MODEL,
@@ -116,7 +128,8 @@ export async function* streamAnswer(
 async function* streamLocal(
   structured: string,
   sourcesBlock: string,
-  question: string
+  question: string,
+  openaiKey?: string | null
 ): AsyncGenerator<
   | { type: "delta"; text: string }
   | { type: "done"; usage: QueryUsage }
@@ -130,7 +143,7 @@ async function* streamLocal(
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${process.env.OPENAI_API_KEY ?? "local"}`,
+      Authorization: `Bearer ${openaiKey ?? process.env.OPENAI_API_KEY ?? "local"}`,
     },
     body: JSON.stringify({
       model: LLM_MODEL,
