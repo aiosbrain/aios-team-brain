@@ -13,7 +13,7 @@ export function CodebaseCard({ teamSlug, cb }: { teamSlug: string; cb: CodebaseS
     >
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
-          <h2 className="truncate font-display text-lg font-semibold text-ink">{cb.slug}</h2>
+          <h2 className="truncate font-display text-lg text-ink">{cb.slug}</h2>
           <p className="truncate font-mono text-xs text-ink-tertiary">{cb.full_name || cb.slug}</p>
         </div>
         <ScoreRing value={cb.agentic_score} label="agentic" />

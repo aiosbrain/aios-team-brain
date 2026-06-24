@@ -15,7 +15,7 @@ export function AgentsPlaceholder() {
           </div>
         </div>
         <div>
-          <h2 className="font-display text-base font-semibold text-ink">Agent workstations</h2>
+          <h2 className="font-display text-base text-ink">Agent workstations</h2>
           <p className="mt-0.5 max-w-md text-sm text-ink-secondary">
             Spawn permissioned agents to claim tasks from the board and act under your team&apos;s
             policy. Coming soon.
