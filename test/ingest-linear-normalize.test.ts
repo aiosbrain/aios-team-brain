@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { normalizeLinearTeam, type NormalizeLinearInput } from "@/lib/ingest/sources/linear-normalize";
+import { normalizeLinearTeam, normalizeLinearDocs, type NormalizeLinearInput } from "@/lib/ingest/sources/linear-normalize";
 import { itemPayloadSchema, taskRowSchema } from "@/lib/api/schemas";
 import { withFooter } from "@/lib/pm-sync/linear-client";
 
@@ -116,5 +116,36 @@ describe("normalizeLinearTeam", () => {
     const mk = (type: string) =>
       normalizeLinearTeam({ ...base, issues: [{ id: "u1", identifier: "ENG-1", title: "T", state: { type } }] });
     expect(mk("backlog").content_sha256).not.toBe(mk("started").content_sha256);
+  });
+});
+
+describe("normalizeLinearDocs (searchable issue text)", () => {
+  it("emits one deliverable item per issue with title + description in the body", () => {
+    const docs = normalizeLinearDocs({
+      teamKey: "ENG",
+      issues: [
+        { id: "u1", identifier: "ENG-1", title: "Ship it", description: "the full prose here", url: "https://l/ENG-1", state: { name: "Todo" } },
+      ],
+    });
+    expect(docs).toHaveLength(1);
+    const d = docs[0];
+    expect(() => itemPayloadSchema.parse(d)).not.toThrow();
+    expect(d.kind).toBe("deliverable");
+    expect(d.project).toBe("linear-eng");
+    expect(d.path).toBe("linear/eng/ENG-1.md");
+    expect(d.body).toContain("Ship it");
+    expect(d.body).toContain("the full prose here"); // description is searchable
+    expect(d.frontmatter.identifier).toBe("ENG-1");
+  });
+
+  it("skips brain round-trippers (aios-ext footer), same as the task import", () => {
+    const docs = normalizeLinearDocs({
+      teamKey: "ENG",
+      issues: [
+        { id: "u1", identifier: "ENG-1", title: "Native", description: "real" },
+        { id: "u2", identifier: "ENG-2", title: "RT", description: withFooter("x", "T-5", "aios-backlog") },
+      ],
+    });
+    expect(docs.map((d) => d.frontmatter.identifier)).toEqual(["ENG-1"]);
   });
 });

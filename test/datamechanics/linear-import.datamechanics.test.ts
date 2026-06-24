@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { db, ingest, seedTeam, type Seed } from "./helpers";
-import { normalizeLinearTeam, type LinearImportIssue } from "@/lib/ingest/sources/linear-normalize";
+import { normalizeLinearTeam, normalizeLinearDocs, type LinearImportIssue } from "@/lib/ingest/sources/linear-normalize";
 import { withFooter } from "@/lib/pm-sync/linear-client";
 
 // Spec (Linear inbound import) verified to the observable outcome — rows read back from real Postgres.
@@ -86,6 +86,27 @@ describe("Linear import (data-mechanics)", () => {
     ]);
     expect(await tasksByKey(seed.teamId, "ENG-1")).toHaveLength(1);
     expect(await tasksByKey(seed.teamId, "ENG-2")).toHaveLength(0);
+  });
+
+  it("writes issue text as a searchable deliverable item at team tier", async () => {
+    const seed = await seedTeam();
+    const docs = normalizeLinearDocs({
+      teamKey: "ENG",
+      issues: [{ id: "u1", identifier: "ENG-1", title: "Searchable", description: "find me by this prose", state: { type: "backlog" } }],
+    });
+    for (const d of docs) {
+      await ingest(seed, { project: d.project, kind: "deliverable", path: d.path, body: d.body, access: "team" } as never);
+    }
+    const { data } = await db()
+      .from("items")
+      .select("kind, access, body")
+      .eq("team_id", seed.teamId)
+      .eq("path", "linear/eng/ENG-1.md")
+      .maybeSingle();
+    const row = data as { kind: string; access: string; body: string } | null;
+    expect(row?.kind).toBe("deliverable");
+    expect(row?.access).toBe("team");
+    expect(row?.body).toContain("find me by this prose");
   });
 
   it("writes imported Linear data at team tier (never external)", async () => {

@@ -132,3 +132,39 @@ export function normalizeLinearTeam(input: NormalizeLinearInput): ItemPayload {
     rows,
   };
 }
+
+/**
+ * Searchable companion to the task import: ONE `kind="deliverable"` item per issue carrying the full
+ * title + description text, so issue prose is full-text searchable in the brain (the `items.search`
+ * column) — not just the terse task table. Round-trippers (aios-ext footer) are skipped, same as the
+ * task import. Content pattern (keyed by path, idempotent by sha, not diff-deleted).
+ */
+export function normalizeLinearDocs(input: NormalizeLinearInput): ItemPayload[] {
+  const slugSeg = safeSegment(input.teamKey) || "team";
+  return input.issues
+    .filter((it) => !parseExt(it.description))
+    .map((it) => {
+      const title = it.title?.trim() || "(untitled)";
+      const description = (it.description ?? "").trim();
+      const body = `# ${it.identifier}: ${title}\n\n${description}\n`;
+      return {
+        project: `linear-${slugSeg}`,
+        path: `linear/${slugSeg}/${it.identifier}.md`,
+        kind: "deliverable" as const,
+        content_sha256: sha256(body),
+        actor: "",
+        access: "team",
+        frontmatter: {
+          source: "linear",
+          identifier: it.identifier,
+          team_key: input.teamKey,
+          url: it.url ?? "",
+          state: it.state?.name ?? "",
+          assignee: it.assignee?.displayName ?? "",
+          priority: PRIORITY_BY_INT[it.priority ?? 0] ?? "none",
+          project_name: it.project?.name ?? "",
+        },
+        body,
+      };
+    });
+}

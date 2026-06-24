@@ -7,10 +7,10 @@ import { getEnabledIntegrationsWithSecrets } from "@/lib/integrations/manage";
 import { SlackClient, fetchSlackChannel } from "./sources/slack";
 import { normalizeThread } from "./sources/slack-normalize";
 import { fetchPlaneProject } from "./sources/plane";
-import { normalizePlaneProject } from "./sources/plane-normalize";
+import { normalizePlaneProject, normalizePlaneDocs } from "./sources/plane-normalize";
 import type { PlaneConnection } from "@/lib/pm-sync/plane-client";
 import { fetchLinearTeam } from "./sources/linear";
-import { normalizeLinearTeam } from "./sources/linear-normalize";
+import { normalizeLinearTeam, normalizeLinearDocs } from "./sources/linear-normalize";
 import { fetchGithubRepoIssues } from "./sources/github";
 import { normalizeGithubRepo } from "./sources/github-normalize";
 import { fetchGithubRepoFiles } from "./sources/github-files";
@@ -294,12 +294,20 @@ export async function runPlaneIngestion(opts: { teamId?: string } = {}): Promise
         summary.projects++;
         try {
           const fetched = await fetchPlaneProject(conn);
+          // Work-items → tasks (one kind=task item).
           const payload = normalizePlaneProject({ ...fetched, aiosSources });
           summary.items += payload.rows?.length ?? 0;
           const res = await ingestItem(supabase, auth, payload, "team");
           if (res.status === "created") summary.created++;
           else if (res.status === "updated") summary.updated++;
           else summary.unchanged++;
+          // Work-item text → deliverable items (searchable), one per work-item.
+          for (const doc of normalizePlaneDocs({ ...fetched, aiosSources })) {
+            const r = await ingestItem(supabase, auth, doc, "team");
+            if (r.status === "created") summary.created++;
+            else if (r.status === "updated") summary.updated++;
+            else summary.unchanged++;
+          }
         } catch (err) {
           summary.errors.push(
             `integration "${integ.name}": ${err instanceof Error ? err.message : "import failed"}`
@@ -377,12 +385,20 @@ export async function runLinearIngestion(opts: { teamId?: string } = {}): Promis
         summary.projects++;
         try {
           const fetched = await fetchLinearTeam({ apiKey, teamId: linearTeamId });
+          // Issues → tasks (one kind=task item).
           const payload = normalizeLinearTeam(fetched);
           summary.items += payload.rows?.length ?? 0;
           const res = await ingestItem(supabase, auth, payload, "team");
           if (res.status === "created") summary.created++;
           else if (res.status === "updated") summary.updated++;
           else summary.unchanged++;
+          // Issue text → deliverable items (searchable), one per issue.
+          for (const doc of normalizeLinearDocs(fetched)) {
+            const r = await ingestItem(supabase, auth, doc, "team");
+            if (r.status === "created") summary.created++;
+            else if (r.status === "updated") summary.updated++;
+            else summary.unchanged++;
+          }
         } catch (err) {
           summary.errors.push(`integration "${integ.name}": ${err instanceof Error ? err.message : "import failed"}`);
         }

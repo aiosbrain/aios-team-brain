@@ -204,13 +204,11 @@ def test_selections_enabled_honors_env(monkeypatch):
 
 
 def test_unwired_type_translates_to_no_op():
-    # linear/plane/wise/notion have no consuming adapter field yet — must not inject
-    # keys the adapter would reject.
-    local = Connection(name="lin", source="linear", options={"api_key": "lin-LOCAL"})
+    # plane/wise/notion have no consuming adapter field yet — a remote selection must not inject
+    # keys the adapter would reject (translates to no-op, leaving the local options untouched).
+    local = Connection(name="nt", source="notion", options={"token": "LOCAL"})
     remote = [
-        {"type": "linear", "name": "lin", "config": {"teamId": "T1", "projectId": "P1"}, "status": "enabled"}
+        {"type": "notion", "name": "nt", "config": {"database_id": "D1"}, "status": "enabled"}
     ]
     merged = merge_selections([local], remote)
-    assert merged[0].options == {"api_key": "lin-LOCAL"}
-    # constructs cleanly (only api_key passed)
-    assert build_source("linear", merged[0].options) is not None
+    assert merged[0].options == {"token": "LOCAL"}  # unchanged — nothing injected

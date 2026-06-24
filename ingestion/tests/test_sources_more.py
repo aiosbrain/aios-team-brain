@@ -3,7 +3,6 @@ import httpx
 from aios_ingest.sources import available_sources, build_source
 from aios_ingest.sources.local import LocalSource
 from aios_ingest.sources.web import WebSource, _extract
-from aios_ingest.sources.linear import LinearSource
 
 _REAL_CLIENT = httpx.Client  # captured before any monkeypatch rebinds httpx.Client
 
@@ -13,7 +12,7 @@ def _mock_client_factory(handler):
 
 
 def test_registry_includes_new_sources():
-    assert {"linear", "web", "local"} <= set(available_sources())
+    assert {"web", "local"} <= set(available_sources())
     assert isinstance(build_source("local", {"root": "."}), LocalSource)
 
 
@@ -50,40 +49,3 @@ def test_web_fetch_mocked(monkeypatch):
     assert len(docs) == 1
     assert docs[0].external_id == "https://example.com/a"
     assert "Content here" in docs[0].body
-
-
-# -- linear ---------------------------------------------------------------
-def test_linear_fetch_paginates_mocked(monkeypatch):
-    pages = [
-        {
-            "data": {"issues": {
-                "pageInfo": {"hasNextPage": True, "endCursor": "c1"},
-                "nodes": [{"id": "1", "identifier": "ENG-1", "title": "First",
-                           "description": "desc", "url": "https://lin/ENG-1",
-                           "updatedAt": "2026-06-14T00:00:00Z",
-                           "assignee": {"displayName": "Alex"}, "state": {"name": "Todo"}}],
-            }}
-        },
-        {
-            "data": {"issues": {
-                "pageInfo": {"hasNextPage": False, "endCursor": "c2"},
-                "nodes": [{"id": "2", "identifier": "ENG-2", "title": "Second",
-                           "description": "", "url": "https://lin/ENG-2",
-                           "updatedAt": "2026-06-14T01:00:00Z",
-                           "assignee": None, "state": {"name": "Done"}}],
-            }}
-        },
-    ]
-    calls = {"n": 0}
-
-    def handler(req: httpx.Request) -> httpx.Response:
-        resp = httpx.Response(200, json=pages[calls["n"]])
-        calls["n"] += 1
-        return resp
-
-    monkeypatch.setattr(httpx, "Client", _mock_client_factory(handler))
-    docs = list(LinearSource(api_key="lin_x").fetch())
-    assert [d.external_id for d in docs] == ["ENG-1", "ENG-2"]
-    assert docs[0].title == "ENG-1: First"
-    assert docs[0].author == "Alex"
-    assert calls["n"] == 2  # paginated through both pages

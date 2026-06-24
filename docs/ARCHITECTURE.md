@@ -220,6 +220,11 @@ work-items **into** the brain as tasks, run in-process by `lib/ingest/run.ts: ru
 > (iterations have no dedicated task column), labels/state/priority/assignee carried through. Imports
 > stay at **team tier**; the runner does not
 > populate `task_pm_links`, so an imported task is not re-projected back out.
+> • **Searchable issue text.** Alongside the task item, the runner also writes ONE `kind="deliverable"`
+> item **per work-item** (`normalizePlaneDocs` → `plane/<slug>/<id>.md`) carrying the title +
+> HTML→text description, so Plane prose is full-text searchable via the `items.search` column — not
+> just the terse task table. Round-trippers are skipped here too; this is the content pattern
+> (keyed by path, idempotent by sha, not diff-deleted).
 
 **Inbound Linear & GitHub import (same pattern as Plane).** Two more in-app task importers, each
 mirroring the Plane design (dedicated project, one `kind="task"` item, project-wide diff-delete, team
@@ -229,7 +234,9 @@ tier, `run<X>Ingestion` + scheduler tick + admin "Sync now"):
 > Linear identifier (`ENG-123`). Linear **is** the pm-sync provider, so it has the same round-trip risk:
 > issues carrying the `aios-ext: <row_key>` footer (the projection's idempotency marker, now shared in
 > `linear-client`) are **de-duped/skipped**. `state.type` → status, priority int → word, sub-issue
-> `parent` → `parent_row_key`, project → `sprint`, cycle → `cycle:<name>` label.
+> `parent` → `parent_row_key`, project → `sprint`, cycle → `cycle:<name>` label. Like Plane, it also
+> writes a searchable `kind="deliverable"` item per issue (`normalizeLinearDocs` →
+> `linear/<teamKey>/<identifier>.md`, title + description).
 > • **GitHub** — two complementary native sources per repo in `config.repos`, both into project
 > `github-<owner>-<repo>`:
 >   - **Issues → tasks** (`github.ts` + `github-normalize.ts`, REST, public repos token-free): one
@@ -242,8 +249,9 @@ tier, `run<X>Ingestion` + scheduler tick + admin "Sync now"):
 >     (path `github/<owner>-<repo>/<filepath>`, idempotent by path+sha, content pattern like Slack — not
 >     diff-deleted). This is content/knowledge ingestion, distinct from the task importer.
 >
-> Together these replace the Python sidecar's `linear`/`github` inbound sources (the sidecar `sources`
-> drift list is unchanged; these native sources are TS, not registered there).
+> Together these replace the Python sidecar's `linear`/`github` inbound sources. The **`linear`
+> sidecar source has been removed** (dropped from the registry + the `drift:sources` list); the
+> `github` sidecar source remains for now but is superseded by these native sources.
 
 **Reactive triggers (brain-api v1.2 Phase 2).** Projection is no longer manual-only. Task UI
 writes — `createTaskAction` / `moveTaskAction` / the new `updateTaskAction` (title/sprint/due/
@@ -449,7 +457,7 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 ### Ingestion sources
 
 <!-- drift:sources -->
-`github` · `slack` · `notion` · `gdrive` · `confluence` · `linear` · `web` · `local` · `radar` · `granola`
+`github` · `slack` · `notion` · `gdrive` · `confluence` · `web` · `local` · `radar` · `granola`
 <!-- /drift:sources -->
 
 > **`granola` privacy invariant:** Granola is the one source that must **never** sync

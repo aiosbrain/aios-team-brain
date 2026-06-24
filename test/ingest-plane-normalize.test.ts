@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { normalizePlaneProject, type NormalizePlaneInput } from "@/lib/ingest/sources/plane-normalize";
+import { normalizePlaneProject, normalizePlaneDocs, type NormalizePlaneInput } from "@/lib/ingest/sources/plane-normalize";
 import { itemPayloadSchema, taskRowSchema } from "@/lib/api/schemas";
 
 // Spec (Plane inbound import): a Plane project's work-items normalize to ONE kind="task"
@@ -174,5 +174,41 @@ describe("normalizePlaneProject", () => {
     const a = mk("s-todo");
     const b = mk("s-doing");
     expect(a.content_sha256).not.toBe(b.content_sha256); // status change is NOT a no-op at the writer
+  });
+});
+
+describe("normalizePlaneDocs (searchable work-item text)", () => {
+  it("emits one deliverable per work-item with title + HTML→text description in the body", () => {
+    const docs = normalizePlaneDocs({
+      ...base,
+      items: [
+        {
+          id: "wi-1",
+          sequence_id: 42,
+          name: "Ship it",
+          description_html: "<p>the <b>full</b> prose</p>",
+          state: "s-todo",
+        },
+      ],
+    });
+    expect(docs).toHaveLength(1);
+    const d = docs[0];
+    expect(() => itemPayloadSchema.parse(d)).not.toThrow();
+    expect(d.kind).toBe("deliverable");
+    expect(d.project).toBe("plane-eng");
+    expect(d.path).toBe("plane/eng/ENG-42.md");
+    expect(d.body).toContain("Ship it");
+    expect(d.body).toContain("the full prose"); // HTML stripped, text is searchable
+  });
+
+  it("skips aios round-trippers, same as the task import", () => {
+    const docs = normalizePlaneDocs({
+      ...base,
+      items: [
+        { id: "wi-1", sequence_id: 1, name: "Native", state: "s-todo" },
+        { id: "wi-2", sequence_id: 2, name: "RT", state: "s-todo", external_source: "aios", external_id: "T-5" },
+      ],
+    });
+    expect(docs.map((d) => d.frontmatter.identifier)).toEqual(["ENG-1"]);
   });
 });
