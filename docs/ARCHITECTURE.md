@@ -34,7 +34,7 @@ Reason from this table, not from a random call site.
 | Sessions (postgres) | `auth_users`, `auth_tokens` | `lib/auth/pg-*` | `getSessionUser` | signed httpOnly cookie |
 | Rate limits | `rate_limits` | `rate_limit_hit` rpc | — | service-role only |
 | Integrations | `integrations` | **`lib/integrations/manage` only** (single-writer guarded; admin server actions) | Admin → Integrations page (`lib/integrations/read`, **admin-gated** `canManageIntegrations`); `GET /api/v1/integrations` (API-key, NON-secret selections via `manage.listEnabledIntegrationSelections`); in-process Slack + Plane + Linear + GitHub runners (`lib/ingest/run` via `manage.getEnabledIntegrationsWithSecrets`) | `config` is NON-secret (per-type allowlist + secret-key rejection); the connector secret is **encrypted at rest** in `secret_ciphertext` (`lib/secrets`, AES-256-GCM) and decrypted **only in-process** for the runner — it never leaves over HTTP, not even on the API-key read. Admin-tier (no per-row `access` column): both writes (`resolveIntegrationsAdmin`) and the dashboard read (`canManageIntegrations`, in `lib/integrations/read`) are app-code gated on `role==="admin"` — no RLS backstop; guarded by `test/guards/integrations-tier-filter` + the data-mechanics tier test. The page fails closed under `DB_BACKEND=supabase`. **LLM provider keys** (`openai`/`anthropic`/`google`) are secret-only integration types managed in the Admin → Integrations "AI provider keys" panel; the query LLM resolves the team's key via `manage.getProviderKey` (falls back to the process env when unset). postgres-only |
-| Codebase analytics | `codebases`, `code_metrics`, `code_contributions`, `github_issues` | **`lib/codebases/ingest` only** (single-writer guarded; via `POST /api/v1/codebases`) | codebases pages incl. Codebases → GitHub (scan freshness via `lib/metrics/codebases.getCodebaseFreshness` + live HEAD compare `lib/codebases/github.fetchRepoHeadSha`), `lib/metrics/codebases` | team-tier only; **app-code gate** (`lib/codebases/visibility` + guard) — no RLS backstop. Brain derives `agentic_score`/`health_score`; AEM `readiness_*` is scored scanner-side (`ingestion/aios_ingest/analyzers/readiness.py`) and persisted verbatim. W1.3 native UI: repo selection persists to `integrations` (type=github, admin); member→GitHub linking via `linkGithub` on Admin → Members (admin); **no server-triggered scan** — the GitHub surface documents the manual `aios-ingest scan` command and the sidecar consumes the selection (F4) |
+| Codebase analytics | `codebases`, `code_metrics`, `code_contributions`, `github_issues` | **`lib/codebases/ingest` only** (single-writer guarded; via `POST /api/v1/codebases`) | codebases pages incl. Codebases → GitHub (scan freshness via `lib/metrics/codebases.getCodebaseFreshness` + live HEAD compare `lib/codebases/github.fetchRepoHeadSha`), `lib/metrics/codebases` | team-tier only; **app-code gate** (`lib/codebases/visibility` + guard) — no RLS backstop. Brain derives `agentic_score`/`health_score`; AEM `readiness_*` is scored scanner-side (`ingestion/aios_ingest/analyzers/readiness.py`) and persisted verbatim. W1.3 native UI: repo selection persists to `integrations` (type=github, admin); member→GitHub linking via `linkGithub` on Admin → Members (admin); **no server-triggered scan** — the GitHub surface documents the manual `aios-ingest scan` command; the repo selection (`config.repos`) is consumed by the in-process native GitHub importer (`lib/ingest/run`) |
 | Brain spend / usage meter | `query_log` (`cost_usd`, `input/output/cache_tokens`, `member_id`) | the query routes (`/api/v1/query`, `/api/dashboard/query`) — one row per answered question | `lib/metrics/pulse` (usage KPIs), `lib/metrics/members` (per-member cost + throughput-vs-cost, W1.2), Admin → Usage page | **role-scoped in app code** via `scopeQueryLog` (admins → team-wide; everyone else → own rows) — no RLS backstop in postgres; guarded by `test/guards/query-log-visibility`. Brain spend only |
 | External AI spend | `usage_costs` | **`lib/costs/ingest` only** (via `POST /api/v1/costs`) | `lib/metrics/external-costs`, Admin → Usage page | team-tier only; workstation pushes from `aios analyze --push` (Cursor dashboard USD + session-log estimates); idempotent on `(team, member, date, provider, source, project)` |
 | AEM maturity snapshots | `agentic_maturity_snapshots` | `POST /api/v1/metrics` → `lib/metrics/individual-maturity-ingest` | Maturity → People (`lib/metrics/individual-maturity`) | team-tier only; daily aggregates incl. token/cost totals from session logs; no raw session content |
@@ -250,9 +250,10 @@ tier, `run<X>Ingestion` + scheduler tick + admin "Sync now"):
 >     (path `github/<owner>-<repo>/<filepath>`, idempotent by path+sha, content pattern like Slack — not
 >     diff-deleted). This is content/knowledge ingestion, distinct from the task importer.
 >
-> Together these replace the Python sidecar's `linear`/`github` inbound sources. The **`linear`
-> sidecar source has been removed** (dropped from the registry + the `drift:sources` list); the
-> `github` sidecar source remains for now but is superseded by these native sources.
+> Together these replace the Python sidecar's `linear`/`github` inbound sources — **both have been
+> removed** from the sidecar (dropped from the registry, `_SELECTION_TRANSLATORS`, and the
+> `drift:sources` list). The GitHub *codebase analytics* scanner (`analyzers/codebase.py`,
+> `lib/codebases/*`) is independent and remains.
 
 **Reactive triggers (brain-api v1.2 Phase 2).** Projection is no longer manual-only. Task UI
 writes — `createTaskAction` / `moveTaskAction` / the new `updateTaskAction` (title/sprint/due/
@@ -460,7 +461,7 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 ### Ingestion sources
 
 <!-- drift:sources -->
-`github` · `slack` · `notion` · `gdrive` · `confluence` · `web` · `local` · `radar` · `granola`
+`slack` · `notion` · `gdrive` · `confluence` · `web` · `local` · `radar` · `granola`
 <!-- /drift:sources -->
 
 > **`granola` privacy invariant:** Granola is the one source that must **never** sync
