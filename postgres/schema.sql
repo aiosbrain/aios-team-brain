@@ -680,3 +680,20 @@ create table if not exists integrations (
 create index if not exists integrations_team_type_idx on integrations (team_id, type);
 -- Additive column for existing deployments (idempotent rollout via `npm run pg:schema`).
 alter table integrations add column if not exists secret_ciphertext text;
+
+-- Graphiti projection state (idempotency for the brain → Graphiti projector, lib/graph/project).
+-- Graphiti does not dedupe by source id, so we track which brain rows we've already projected
+-- and the content hash we sent. Re-projection skips unchanged rows; changed content re-pushes
+-- (Graphiti's temporal model invalidates the old fact). Sole writer: lib/graph/project.
+create table if not exists graph_episodes (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  source_table text not null,                  -- e.g. 'items'
+  source_id uuid not null,                     -- the projected row's id
+  group_id text not null,                      -- '<teamSlug>:<tier>' (tier-scoped, see lib/graph/group)
+  content_sha256 text not null,                -- hash of the episode content we sent
+  episode_uuid text,                           -- Graphiti's episode id, if returned
+  projected_at timestamptz not null default now(),
+  unique (team_id, source_table, source_id)
+);
+create index if not exists graph_episodes_team_idx on graph_episodes (team_id, projected_at desc);
