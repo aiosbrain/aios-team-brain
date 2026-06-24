@@ -7,9 +7,22 @@
 
 export type AccessTier = "team" | "external";
 
+/**
+ * Graphiti's `validate_group_id` permits ONLY `[A-Za-z0-9_-]` — a `:` separator raises
+ * GroupIdValidationError, which propagates out of the graph service's ingest worker (it catches
+ * only CancelledError) and silently kills it for the whole process. So we join team + tier with
+ * `_` (team slugs are `[a-z0-9-]`, never `_`, so this stays collision-free and reversible-by-eye)
+ * and assert the result is valid — failing loud here beats a stalled worker. Verified live 2026-06-24.
+ */
+const VALID_GROUP_ID = /^[A-Za-z0-9_-]+$/;
+
 /** The group_id an episode is written to, from the source row's team + access tier. */
 export function episodeGroupId(teamSlug: string, access: AccessTier): string {
-  return `${teamSlug}:${access}`;
+  const id = `${teamSlug}_${access}`;
+  if (!VALID_GROUP_ID.test(id)) {
+    throw new Error(`invalid Graphiti group_id "${id}" — team slug must match [A-Za-z0-9_-]`);
+  }
+  return id;
 }
 
 /**

@@ -16,11 +16,15 @@ export async function register() {
     await import("./sentry.edge.config");
   }
 
-  // Ingestion scheduler only runs in the Node.js server runtime (not edge, not build).
+  // Background pollers only run in the Node.js server runtime (not edge, not build).
   if (process.env.NEXT_RUNTIME !== "nodejs") return;
-  if (process.env.INGEST_POLL_ENABLED === "false") return;
-  const { startIngestScheduler } = await import("@/lib/ingest/scheduler");
-  startIngestScheduler();
+  if (process.env.INGEST_POLL_ENABLED !== "false") {
+    const { startIngestScheduler } = await import("@/lib/ingest/scheduler");
+    startIngestScheduler();
+  }
+  // Graphiti projector poller — self-gates to a no-op unless GRAPHITI_URL is set.
+  const { startGraphScheduler } = await import("@/lib/graph/scheduler");
+  startGraphScheduler();
 }
 
 // Forward Next.js server-side request errors to Sentry. Sentry's

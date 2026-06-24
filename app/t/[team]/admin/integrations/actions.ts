@@ -11,6 +11,7 @@ import {
   deleteIntegration,
 } from "@/lib/integrations/manage";
 import { runSlackIngestion, runPlaneIngestion, runLinearIngestion, runGithubIngestion } from "@/lib/ingest/run";
+import { runGraphProjection } from "@/lib/graph/run";
 import { resolveIntegrationsAdmin } from "@/lib/integrations/read";
 import { IntegrationConfigError, type IntegrationType } from "@/lib/api/schemas";
 import { audit } from "@/lib/api/audit";
@@ -210,6 +211,33 @@ export async function syncGithubNow(
     };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "sync failed" };
+  }
+}
+
+/**
+ * Project this team's brain content (Phase 1: Slack transcripts) into the Graphiti graph memory now
+ * (admins only). The scheduler also runs this on its interval; this is the on-demand trigger. Inert
+ * (reports "not configured") when GRAPHITI_URL is unset, so it's safe to expose even where the graph
+ * is off. Idempotent — re-running re-pushes only changed content.
+ */
+export async function projectToGraphNow(
+  teamSlug: string
+): Promise<{ ok: boolean; error?: string; message?: string }> {
+  const ctx = await requireAdmin(teamSlug);
+  if (!ctx) return { ok: false, error: "admins only" };
+  try {
+    const s = await runGraphProjection({ teamId: ctx.teamId });
+    if (!s.configured) {
+      return { ok: false, error: "Graph memory is not configured (set GRAPHITI_URL on the brain)." };
+    }
+    if (!s.ok && s.errors.length) return { ok: false, error: s.errors.join("; ") };
+    revalidatePath(`/t/${teamSlug}/admin/integrations`);
+    return {
+      ok: true,
+      message: `Projected ${s.projected} item(s) to the graph (=${s.skipped} unchanged, ${s.scanned} scanned).`,
+    };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "projection failed" };
   }
 }
 

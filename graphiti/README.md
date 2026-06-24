@@ -16,14 +16,22 @@ docker compose up -d --wait
 ```
 Then point the brain at it: `GRAPHITI_URL=http://localhost:8000` in the brain's env.
 
-## REST surface the brain uses (verified against getzep/graphiti)
-- `POST /messages` — add episodes: `{ group_id, messages: [{ content, timestamp, source_description, name, role_type }] }` (async, 202).
+## REST surface the brain uses (verified live 2026-06-24 against getzep/graphiti)
+- `POST /messages` — add episodes: `{ group_id, messages: [{ content, timestamp, source_description, name, role_type, role }] }` (async, 202). **`role` is required** (nullable) — omitting it → 422. The async worker is serial (~10-20s/episode via gpt-4o) and **dies silently on any non-Cancelled exception** (e.g. an invalid `group_id`), so validate before posting.
 - `POST /search` — `{ query, group_ids, max_facts }` → facts (graph edges) with temporal validity + source.
 
 ## Tiering (must hold — see CLAUDE.md §5)
-Graphiti has no tier awareness, so we **encode team+tier into `group_id`** (`<teamSlug>:team` /
-`<teamSlug>:external`). The query endpoint only searches the group_ids a viewer's tier may see.
-See `lib/graph/group.ts`.
+Graphiti has no tier awareness, so we **encode team+tier into `group_id`** (`<teamSlug>_team` /
+`<teamSlug>_external`). Graphiti's `validate_group_id` permits only `[A-Za-z0-9_-]` — a `:` separator
+is rejected — so we join with `_`. The query endpoint only searches the group_ids a viewer's tier
+may see. See `lib/graph/group.ts`.
+
+## Projection trigger (the on-ramp)
+`lib/graph/project` only *defines* the projection; `lib/graph/run` (`runGraphProjection`) drives it.
+Two callers: the admin **"Project to graph"** button on the Integrations page (on-demand) and
+`lib/graph/scheduler` (an interval poller registered in `instrumentation.ts`). Both are inert
+unless `GRAPHITI_URL` is set. Tune with `GRAPH_PROJECT_MINUTES` (default 60), `GRAPH_PROJECT_LIMIT`
+(default 500 items/run), `GRAPH_PROJECT_ENABLED=false` to disable.
 
 ## LLM note
 Extraction quality depends on structured-output support. Start with a strong cloud model; a local

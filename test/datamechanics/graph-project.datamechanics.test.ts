@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { GraphitiClient, GraphEpisode } from "@/lib/graph/graphiti-client";
 import { projectSlackToGraph } from "@/lib/graph/project";
+import { runGraphProjection } from "@/lib/graph/run";
 import { db, ingest, seedTeam } from "./helpers";
 
 // Spec: the projector reads Slack transcripts from the brain and pushes them to Graphiti as
@@ -9,6 +10,8 @@ import { db, ingest, seedTeam } from "./helpers";
 
 class FakeGraphiti {
   pushes: { groupId: string; episodes: GraphEpisode[] }[] = [];
+  // runGraphProjection gates on `client.configured` — the fake reports configured so the run proceeds.
+  readonly configured = true;
   async addEpisodes(groupId: string, episodes: GraphEpisode[]): Promise<void> {
     this.pushes.push({ groupId, episodes });
   }
@@ -36,7 +39,7 @@ describe("Slack → Graphiti projector (real Postgres, mocked Graphiti)", () => 
     expect(res.projected).toBe(2);
     expect(res.skipped).toBe(0);
     const groups = fake.pushes.map((p) => p.groupId).sort();
-    expect(groups).toEqual([`${slug}:external`, `${slug}:team`]); // tier encoded in group_id
+    expect(groups).toEqual([`${slug}_external`, `${slug}_team`]); // tier encoded in group_id (Graphiti-valid)
 
     // State recorded for both, keyed by source id.
     const { data: state } = await db().from("graph_episodes").select("source_id, group_id").eq("team_id", seed.teamId);
@@ -71,5 +74,27 @@ describe("Slack → Graphiti projector (real Postgres, mocked Graphiti)", () => 
     const res = await projectSlackToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(again) });
     expect(again.pushes).toHaveLength(1); // changed content re-pushed
     expect(res.projected).toBe(1);
+  });
+});
+
+// The runner (lib/graph/run.ts) is the on-ramp the admin action + scheduler call: it resolves the
+// team from the DB, then projects. This exercises that team-resolution + aggregation on real Postgres.
+describe("runGraphProjection runner (real Postgres, mocked Graphiti)", () => {
+  it("resolves the team, projects its transcripts, and is idempotent on re-run", async () => {
+    const seed = await seedTeam();
+    const slug = await teamSlugFor(seed.teamId);
+    await ingest(seed, { kind: "transcript", path: "slack/eng/1.md", body: "alpha thread", access: "team" });
+    await ingest(seed, { kind: "transcript", path: "slack/client/2.md", body: "beta thread", access: "external" });
+
+    const fake = new FakeGraphiti();
+    const first = await runGraphProjection({ teamId: seed.teamId, client: client(fake), supabase: db() });
+    expect(first.configured).toBe(true);
+    expect(first.teams).toBe(1);
+    expect(first.projected).toBe(2);
+    expect(fake.pushes.map((p) => p.groupId).sort()).toEqual([`${slug}_external`, `${slug}_team`]);
+
+    const second = await runGraphProjection({ teamId: seed.teamId, client: client(new FakeGraphiti()), supabase: db() });
+    expect(second.projected).toBe(0);
+    expect(second.skipped).toBe(2); // idempotent across the runner too
   });
 });

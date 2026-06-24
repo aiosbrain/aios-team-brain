@@ -2,7 +2,7 @@
 
 import { useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
-import { Plug, Plus, Trash2, KeyRound, RefreshCw } from "lucide-react";
+import { Plug, Plus, Trash2, KeyRound, RefreshCw, Network } from "lucide-react";
 import {
   saveIntegration,
   toggleIntegration,
@@ -12,6 +12,7 @@ import {
   syncPlaneNow,
   syncLinearNow,
   syncGithubNow,
+  projectToGraphNow,
   setPrimaryPmProvider,
   type PrimaryPmProvider,
 } from "@/app/t/[team]/admin/integrations/actions";
@@ -131,6 +132,19 @@ export function IntegrationsManager({
     secret: "",
   });
 
+  function projectToGraph() {
+    setError(null);
+    setNotice(null);
+    startTransition(async () => {
+      const res = await projectToGraphNow(teamSlug);
+      if (!res.ok) setError(res.error ?? "projection failed");
+      else {
+        setNotice(res.message ?? "Projected to graph.");
+        router.refresh();
+      }
+    });
+  }
+
   function run(fn: () => Promise<{ ok: boolean; error?: string }>) {
     setError(null);
     startTransition(async () => {
@@ -245,6 +259,28 @@ export function IntegrationsManager({
           })}
         </div>
       </div>
+      <div className="prism-card flex flex-col gap-2 p-4">
+        <p className="flex items-center gap-2 text-sm font-medium text-ink">
+          <Network className="size-4 text-violet" /> Graph memory (Graphiti)
+        </p>
+        <p className="text-xs text-ink-secondary">
+          Project the brain&apos;s ingested content (Phase 1: Slack transcripts) into the Graphiti
+          temporal knowledge graph for natural-language queries. Idempotent — re-running only pushes
+          changed content. Also runs automatically on a schedule when the graph is configured.
+        </p>
+        <div>
+          <button
+            type="button"
+            onClick={projectToGraph}
+            disabled={pending}
+            className="flex items-center gap-1.5 rounded-lg border border-violet/40 bg-violet/10 px-3 py-1.5 text-xs font-medium text-violet disabled:opacity-50"
+            title="Project this team's brain content into the Graphiti graph now"
+          >
+            <Network className={`size-3.5 ${pending ? "animate-pulse" : ""}`} /> Project to graph now
+          </button>
+        </div>
+      </div>
+
       <form
         onSubmit={(e) => {
           e.preventDefault();
