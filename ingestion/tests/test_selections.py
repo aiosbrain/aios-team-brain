@@ -63,37 +63,6 @@ def test_slack_brain_channels_win_local_secrets_preserved():
     assert opts["signing_secret"] == "s"
 
 
-# --- github repos -> repo ---------------------------------------------------
-
-
-def test_github_single_repo_maps_and_preserves_secrets():
-    remote = [
-        {"type": "github", "name": "eng-handbook", "config": {"repos": ["org/a"]}, "status": "enabled"}
-    ]
-    merged = merge_selections([_github_conn()], remote)
-    opts = merged[0].options
-    assert opts["repo"] == "org/a"
-    assert opts["token"] == "ghp-LOCAL"
-    assert opts["webhook_secret"] == "wh"
-    # the camelCase `repos` list must NOT leak into options (build_source would crash)
-    assert "repos" not in opts
-
-
-def test_github_multi_repo_uses_first_and_no_repos_leak():
-    remote = [
-        {
-            "type": "github",
-            "name": "eng-handbook",
-            "config": {"repos": ["org/a", "org/b"]},
-            "status": "enabled",
-        }
-    ]
-    merged = merge_selections([_github_conn()], remote)
-    opts = merged[0].options
-    assert opts["repo"] == "org/a"
-    assert "repos" not in opts
-
-
 # --- granola mapping --------------------------------------------------------
 
 
@@ -121,15 +90,6 @@ def test_merged_slack_options_construct_without_typeerror():
         {"type": "slack", "name": "eng-slack", "config": {"channelIds": ["C1"]}, "status": "enabled"}
     ]
     conn = merge_selections([_slack_conn()], remote)[0]
-    src = build_source(conn.source, conn.options)  # must not raise TypeError
-    assert src is not None
-
-
-def test_merged_github_options_construct_without_typeerror():
-    remote = [
-        {"type": "github", "name": "eng-handbook", "config": {"repos": ["org/a"]}, "status": "enabled"}
-    ]
-    conn = merge_selections([_github_conn()], remote)[0]
     src = build_source(conn.source, conn.options)  # must not raise TypeError
     assert src is not None
 

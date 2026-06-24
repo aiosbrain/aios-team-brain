@@ -31,22 +31,6 @@ def _translate_slack(config: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def _translate_github(config: dict[str, Any]) -> dict[str, Any]:
-    out: dict[str, Any] = {}
-    repos = config.get("repos")
-    if repos:
-        if len(repos) > 1:
-            log.warning(
-                "github selection lists %d repos but the single-repo adapter "
-                "supports one; using the first (%s)",
-                len(repos),
-                repos[0],
-            )
-        out["repo"] = repos[0]
-    # empty / missing repos → emit nothing (keep the local repo selection)
-    return out
-
-
 def _translate_granola(config: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {}
     if "matchKeywords" in config:
@@ -67,7 +51,6 @@ def _no_op(config: dict[str, Any]) -> dict[str, Any]:
 # type never injects keys that would make build_source() raise TypeError.
 _SELECTION_TRANSLATORS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "slack": _translate_slack,
-    "github": _translate_github,
     "granola": _translate_granola,
     "linear": _no_op,
     "plane": _no_op,
