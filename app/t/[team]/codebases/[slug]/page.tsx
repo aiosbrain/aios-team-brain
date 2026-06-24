@@ -53,7 +53,7 @@ export default async function CodebaseDetailPage({
         </Link>
         <div className="mt-2 flex items-start justify-between gap-3">
           <div className="min-w-0">
-            <h1 className="font-display text-2xl font-semibold text-ink">{cb.slug}</h1>
+            <h1 className="font-display text-2xl text-ink">{cb.slug}</h1>
             {cb.full_name ? (
               <a
                 href={`https://github.com/${cb.full_name}`}

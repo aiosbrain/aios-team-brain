@@ -18,7 +18,7 @@ export function KpiStat({ kpi }: { kpi: Kpi }) {
         {kpi.label}
       </p>
       <div className="flex items-end justify-between gap-2">
-        <span className="font-display text-2xl font-semibold leading-none text-ink">
+        <span className="font-display text-2xl leading-none text-ink">
           {kpi.value}
         </span>
         <span className={accent}>

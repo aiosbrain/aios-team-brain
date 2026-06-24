@@ -73,7 +73,7 @@ export default async function MaturityPage({
               <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-ink-tertiary">
                 Repos at L3+ (agent-ready)
               </p>
-              <p className="mt-1 font-display text-4xl font-semibold text-gradient-prism">
+              <p className="mt-1 font-display text-4xl text-gradient-prism">
                 {m.pctAtL3Plus}%
               </p>
               <p className="mt-1 text-xs text-ink-secondary">

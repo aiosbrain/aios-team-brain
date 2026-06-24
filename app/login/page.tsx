@@ -28,7 +28,7 @@ export default async function LoginPage({
       <div className="relative w-full max-w-sm">
         <div className="bg-gradient-prism rounded-2xl p-[1px]">
           <div className="rounded-2xl bg-surface-inset px-8 py-10">
-            <p className="font-display text-sm font-semibold uppercase tracking-[0.15em] text-gradient-prism">
+            <p className="font-display text-sm uppercase tracking-[0.15em] text-gradient-prism">
               Team Brain
             </p>
             <h1 className="mt-2 text-2xl font-semibold text-ink">Sign in</h1>
