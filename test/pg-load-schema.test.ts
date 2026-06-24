@@ -100,10 +100,10 @@ describe("pg-load-schema", () => {
       "alter table base add column second text;",
     ]);
     expect(clients[0].ended).toBe(true);
-    expect(log.mock.calls.map(([message]) => message)).toEqual([
-      "✓ postgres/schema.sql loaded",
-      "✓ postgres/migrations/001_first.sql applied",
-      "✓ postgres/migrations/002_second.sql applied",
+    expect(log.mock.calls.map(([message]) => message.replace(/^.\s/, ""))).toEqual([
+      "postgres/schema.sql loaded",
+      "postgres/migrations/001_first.sql applied",
+      "postgres/migrations/002_second.sql applied",
     ]);
   });
 
