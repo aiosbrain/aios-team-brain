@@ -1,0 +1,52 @@
+name: aios-graphiti
+# Graphiti graph-memory engine, run locally / self-hosted. Two containers:
+#   graph  — Graphiti's FastAPI REST service (zepai/graphiti), the only thing the brain calls
+#   neo4j  — the graph database
+# The brain (TypeScript) talks to `graph` over REST at GRAPHITI_URL (default http://localhost:8000);
+# it never imports Python. See lib/graph/* for the client/projector/query.
+#
+# LLM: Graphiti's prebuilt server is OpenAI-compatible. Use real OpenAI (OPENAI_API_KEY) or any
+# OpenAI-compatible endpoint (e.g. Ollama) by also setting OPENAI_BASE_URL. Extraction quality
+# depends on structured-output support — start with a strong cloud model, swap later via env.
+services:
+  graph:
+    image: zepai/graphiti:latest
+    ports:
+      - "${GRAPHITI_PORT:-8000}:8000"
+    depends_on:
+      neo4j:
+        condition: service_healthy
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY:?set OPENAI_API_KEY (or point OPENAI_BASE_URL at a local model)}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-}
+      - MODEL_NAME=${MODEL_NAME:-}
+      - EMBEDDER_MODEL_NAME=${EMBEDDER_MODEL_NAME:-}
+      - NEO4J_URI=bolt://neo4j:7687
+      - NEO4J_USER=${NEO4J_USER:-neo4j}
+      - NEO4J_PASSWORD=${NEO4J_PASSWORD:-password}
+      - PORT=8000
+      - db_backend=neo4j
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthcheck')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  neo4j:
+    image: neo4j:5.26.2
+    ports:
+      - "${NEO4J_HTTP_PORT:-7474}:7474" # browser
+      - "${NEO4J_BOLT_PORT:-7687}:7687" # bolt
+    volumes:
+      - neo4j_data:/data
+    environment:
+      - NEO4J_AUTH=${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:-password}
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 || exit 1"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+
+volumes:
+  neo4j_data:

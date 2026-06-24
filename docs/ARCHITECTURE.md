@@ -38,6 +38,7 @@ Reason from this table, not from a random call site.
 | Brain spend / usage meter | `query_log` (`cost_usd`, `input/output/cache_tokens`, `member_id`) | the query routes (`/api/v1/query`, `/api/dashboard/query`) — one row per answered question | `lib/metrics/pulse` (usage KPIs), `lib/metrics/members` (per-member cost + throughput-vs-cost, W1.2), Admin → Usage page | **role-scoped in app code** via `scopeQueryLog` (admins → team-wide; everyone else → own rows) — no RLS backstop in postgres; guarded by `test/guards/query-log-visibility`. Brain spend only |
 | External AI spend | `usage_costs` | **`lib/costs/ingest` only** (via `POST /api/v1/costs`) | `lib/metrics/external-costs`, Admin → Usage page | team-tier only; workstation pushes from `aios analyze --push` (Cursor dashboard USD + session-log estimates); idempotent on `(team, member, date, provider, source, project)` |
 | AEM maturity snapshots | `agentic_maturity_snapshots` | `POST /api/v1/metrics` → `lib/metrics/individual-maturity-ingest` | Maturity → People (`lib/metrics/individual-maturity`) | team-tier only; daily aggregates incl. token/cost totals from session logs; no raw session content |
+| Graph memory (Graphiti) | `graph_episodes` (projection state) + **Graphiti/Neo4j** (the graph itself, self-hosted, `graphiti/`) | **`lib/graph/project` only** (single-writer guarded) — projects brain `items` (Slack transcripts) → Graphiti episodes | `POST /api/v1/graph-query` via `lib/graph/graphiti-client` | **experiment alongside** `graph_entities`/`/api/v1/query` (not a replacement). Graphiti has no tier awareness → tier is encoded in `group_id` (`<slug>:<tier>`, `lib/graph/group`) and the query scopes to `visibleGroupIds(viewerTier)` — SOLE isolation, no RLS backstop. LLM extraction via OpenAI-compatible endpoint (`GRAPHITI_URL`/`graphiti/.env`); postgres-only |
 
 ## System context
 
@@ -408,6 +409,7 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 - `POST /api/v1/metrics` — ingest an AEM individual maturity daily snapshot (team-tier key only; brain recomputes canonical scores; audited)
 - `POST /api/v1/costs` — ingest external AI provider daily spend (Cursor dashboard + session-log estimates; team-tier key only; audited)
 - `POST /api/v1/work-events` — merged-work completion event; marks matching tasks done and triggers PM sync
+- `POST /api/v1/graph-query` — NL query over Graphiti graph memory; tier-scoped group_ids; citable facts
 - `POST /api/dashboard/query` — same query pipeline, session-authenticated
 - `POST /api/auth/login` — postgres-mode direct passwordless sign-in (invite-only; 403 if unknown)
 <!-- /drift:routes -->
@@ -419,7 +421,8 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 `projects` · `items` · `item_versions` · `tasks` · `decisions` · `graph_entities` ·
 `graph_relationships` · `query_log` · `policies` · `approval_requests` · `actions` ·
 `codebases` · `code_metrics` · `code_contributions` · `github_issues` · `member_emails` ·
-`integrations` · `agentic_maturity_snapshots` · `task_pm_links` · `work_events` · `usage_costs`
+`integrations` · `agentic_maturity_snapshots` · `task_pm_links` · `work_events` · `usage_costs` ·
+`graph_episodes`
 <!-- /drift:tables -->
 
 ### Ingestion sources
