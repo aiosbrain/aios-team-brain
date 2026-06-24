@@ -21,6 +21,7 @@ export interface FetchedPlaneProject {
   labels: { id: string; name: string }[];
   members: Record<string, string>;
   moduleByItem: Record<string, string>;
+  cycleByItem: Record<string, string>;
 }
 
 /** Project's short identifier (e.g. "ENG") for stable, human-readable row_keys. Best-effort. */
@@ -98,14 +99,41 @@ async function fetchModuleByItem(conn: PlaneConnection): Promise<Record<string, 
   return out;
 }
 
+/** work-item id → cycle (iteration) name, by walking each cycle's issue membership. Best-effort. */
+async function fetchCycleByItem(conn: PlaneConnection): Promise<Record<string, string>> {
+  const out: Record<string, string> = {};
+  try {
+    const cycles = (await fetchAllPaged(conn, "/cycles/")) as { id: string; name?: string }[];
+    for (const cyc of cycles) {
+      if (!cyc.name) continue;
+      try {
+        const members = (await fetchAllPaged(conn, `/cycles/${cyc.id}/cycle-issues/`)) as {
+          issue?: string;
+          id?: string;
+        }[];
+        for (const ci of members) {
+          const issueId = ci.issue || ci.id;
+          if (issueId) out[issueId] = cyc.name;
+        }
+      } catch {
+        // one cycle's membership failed — skip it, keep the rest.
+      }
+    }
+  } catch {
+    // no cycle access — import without iteration grouping.
+  }
+  return out;
+}
+
 export async function fetchPlaneProject(conn: PlaneConnection): Promise<FetchedPlaneProject> {
-  const [items, states, labels, identifier, members, moduleByItem] = await Promise.all([
+  const [items, states, labels, identifier, members, moduleByItem, cycleByItem] = await Promise.all([
     fetchAllPaged(conn, "/work-items/") as Promise<PlaneWorkItemRaw[]>,
     fetchAllPaged(conn, "/states/") as Promise<PlaneState[]>,
     fetchAllPaged(conn, "/labels/") as Promise<{ id: string; name: string }[]>,
     fetchIdentifier(conn),
     fetchMembers(conn),
     fetchModuleByItem(conn),
+    fetchCycleByItem(conn),
   ]);
   return {
     projectId: conn.projectId,
@@ -117,5 +145,6 @@ export async function fetchPlaneProject(conn: PlaneConnection): Promise<FetchedP
     labels,
     members,
     moduleByItem,
+    cycleByItem,
   };
 }

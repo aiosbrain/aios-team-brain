@@ -15,7 +15,11 @@ const STATES = [
   { id: "s-doing", name: "In Progress", group: "started" },
 ];
 
-function importPlane(seed: Seed, items: PlaneWorkItemRaw[]) {
+function importPlane(
+  seed: Seed,
+  items: PlaneWorkItemRaw[],
+  extra: { moduleByItem?: Record<string, string>; cycleByItem?: Record<string, string> } = {}
+) {
   const payload = normalizePlaneProject({
     projectId: "p-1",
     projectIdentifier: "ENG",
@@ -23,6 +27,7 @@ function importPlane(seed: Seed, items: PlaneWorkItemRaw[]) {
     baseUrl: "https://api.plane.so",
     states: STATES,
     items,
+    ...extra,
   });
   return ingest(seed, {
     project: payload.project,
@@ -101,6 +106,24 @@ describe("Plane import (data-mechanics)", () => {
     ]);
     expect(await tasksByKey(seed.teamId, "ENG-1")).toHaveLength(1);
     expect(await tasksByKey(seed.teamId, "ENG-2")).toHaveLength(0); // skipped
+  });
+
+  it("persists module → sprint and cycle → cycle:<name> label on the task row", async () => {
+    const seed = await seedTeam();
+    await importPlane(
+      seed,
+      [{ id: "wi-1", sequence_id: 1, name: "Task", state: "s-todo" }],
+      { moduleByItem: { "wi-1": "Auth epic" }, cycleByItem: { "wi-1": "Sprint 7" } }
+    );
+    const { data } = await db()
+      .from("tasks")
+      .select("sprint, labels")
+      .eq("team_id", seed.teamId)
+      .eq("row_key", "ENG-1")
+      .maybeSingle();
+    const row = data as { sprint: string; labels: string[] } | null;
+    expect(row?.sprint).toBe("Auth epic");
+    expect(row?.labels).toContain("cycle:Sprint 7");
   });
 
   it("writes imported Plane data at team tier (never external)", async () => {
