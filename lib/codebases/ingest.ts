@@ -3,6 +3,7 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import type { CodebaseScanPayload } from "@/lib/api/schemas";
 import { computeScores } from "@/lib/codebases/score";
 import { buildIdentityMap, resolveMember } from "@/lib/identity/resolve";
+import { projectCommitsToItems, type ScanCommit } from "@/lib/codebases/commits-to-items";
 import { audit } from "@/lib/api/audit";
 
 /**
@@ -107,10 +108,13 @@ export async function ingestCodebaseScan(
     .single();
   if (mErr || !metrics) throw new Error(`code_metrics upsert failed: ${mErr?.message}`);
 
-  // 4. contributions — map author → member, then recompute + upsert daily aggregates
+  // 4. contributions + commits — map author → member, then write aggregates and searchable items.
+  const recentCommits = (m.recent_commits ?? []) as ScanCommit[];
   let contribCount = 0;
-  if (payload.contributions.length) {
+  let commitItemCount = 0;
+  if (payload.contributions.length || recentCommits.length) {
     const identityMap = await buildIdentityMap(supabase, auth.teamId);
+
     for (const row of payload.contributions) {
       const mapped = resolveMember(identityMap, {
         email: row.author_email,
@@ -135,6 +139,10 @@ export async function ingestCodebaseScan(
       if (error) throw new Error(`contribution ${row.author_key}/${row.day}: ${error.message}`);
       contribCount++;
     }
+
+    // Project recent commits into searchable items (author message text + member attribution),
+    // so NL queries can answer per-person git history — not just the aggregate counts above.
+    commitItemCount = await projectCommitsToItems(supabase, auth, c.slug, recentCommits, identityMap);
   }
 
   // 5. issues — upsert by number
@@ -178,6 +186,7 @@ export async function ingestCodebaseScan(
       health_score: scores.health_score,
       readiness_level: m.readiness_level,
       contributions: contribCount,
+      commit_items: commitItemCount,
       issues: issueCount,
     },
   });
