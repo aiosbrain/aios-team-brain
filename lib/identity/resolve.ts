@@ -16,6 +16,12 @@ export interface IdentityMap {
   byHandle: Map<string, string>;
   /** email domains present in the roster (gates the local-part → handle heuristic) */
   emailDomains: Set<string>;
+  /** `<provider>:<external_id_lc>` → member_id, from member_identities (Slack/Linear/… user ids) */
+  byProviderId: Map<string, string>;
+}
+
+function providerKey(provider: string, externalId: string): string {
+  return `${provider.trim().toLowerCase()}:${externalId.trim().toLowerCase()}`;
 }
 
 export interface AuthorIdentity {
@@ -62,7 +68,25 @@ export async function buildIdentityMap(
     if (a.email) byEmail.set(a.email.toLowerCase(), a.member_id);
   }
 
-  return { byEmail, byHandle, emailDomains };
+  // Cross-provider identities (Slack/Linear/… user ids). Keyed by (provider, external_id); any
+  // email carried on the row is also folded into byEmail as a secondary exact match.
+  const byProviderId = new Map<string, string>();
+  const { data: identities } = await supabase
+    .from("member_identities")
+    .select("provider, external_id, email, member_id")
+    .eq("team_id", teamId);
+  for (const i of (identities ?? []) as { provider: string; external_id: string; email: string | null; member_id: string }[]) {
+    if (i.provider && i.external_id) byProviderId.set(providerKey(i.provider, i.external_id), i.member_id);
+    if (i.email) byEmail.set(i.email.toLowerCase(), i.member_id);
+  }
+
+  return { byEmail, byHandle, emailDomains, byProviderId };
+}
+
+/** Resolve a provider's stable user id (e.g. a Slack `Uxxx`) to a roster member_id, or null. */
+export function resolveByProviderId(map: IdentityMap, provider: string, externalId: string): string | null {
+  if (!externalId) return null;
+  return map.byProviderId.get(providerKey(provider, externalId)) ?? null;
 }
 
 /**

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { resolveMember, type IdentityMap } from "@/lib/identity/resolve";
+import { resolveMember, resolveByProviderId, type IdentityMap } from "@/lib/identity/resolve";
 
 // Pure-logic spec for the shared identity resolver (lib/identity/resolve). Locks the
 // misattribution-prevention rules so codebase contributions and cost attribution stay aligned.
@@ -15,6 +15,7 @@ function mapOf(): IdentityMap {
       ["bob", "m-bob"],
     ]),
     emailDomains: new Set(["acme.com"]),
+    byProviderId: new Map([["slack:u123", "m-jane"]]),
   };
 }
 
@@ -42,5 +43,18 @@ describe("resolveMember()", () => {
 
   it("returns null for an unknown identity", () => {
     expect(resolveMember(mapOf(), { email: "nobody@elsewhere.io", key: "ghost" })).toBeNull();
+  });
+});
+
+describe("resolveByProviderId()", () => {
+  it("resolves a provider user id (case-insensitive) to a member", () => {
+    expect(resolveByProviderId(mapOf(), "slack", "U123")).toBe("m-jane");
+    expect(resolveByProviderId(mapOf(), "Slack", "u123")).toBe("m-jane");
+  });
+
+  it("returns null for an unmapped provider id or empty external id", () => {
+    expect(resolveByProviderId(mapOf(), "slack", "U999")).toBeNull();
+    expect(resolveByProviderId(mapOf(), "linear", "U123")).toBeNull(); // wrong provider
+    expect(resolveByProviderId(mapOf(), "slack", "")).toBeNull();
   });
 });

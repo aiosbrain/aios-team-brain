@@ -119,6 +119,25 @@ create table if not exists member_emails (
 );
 create index if not exists member_emails_member_idx on member_emails (member_id);
 
+-- Cross-provider identities that map to one member, keyed by the PROVIDER'S stable user id
+-- (Slack `Uxxx`, Linear/Plane user id, GitHub login, …) — the general form of member_emails
+-- (which stays the email-keyed git-alias store). This is how a person's Slack/Linear/… author
+-- is reconciled to the roster so "who is doing what" joins across tools. team-scoped unique
+-- (provider, external_id) so one provider identity maps to at most one member. `email` is an
+-- optional secondary match the resolver folds into its byEmail map. Read by lib/identity/resolve.
+create table if not exists member_identities (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  member_id uuid not null references members(id) on delete cascade,
+  provider text not null,
+  external_id text not null,
+  handle text not null default '',
+  email citext not null default '',
+  created_at timestamptz not null default now(),
+  unique (team_id, provider, external_id)
+);
+create index if not exists member_identities_member_idx on member_identities (member_id);
+
 create table if not exists api_keys (
   id uuid primary key default gen_random_uuid(),
   team_id uuid not null references teams(id) on delete cascade,
