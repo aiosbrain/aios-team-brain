@@ -20,6 +20,7 @@ export type RetrievedContext = {
 
 const MAX_SOURCE_CHARS = 8_000;
 const MAX_TOTAL_CHARS = 160_000; // ~40k tokens context cap
+const GIT_WINDOW_DAYS = 90; // recency window for the per-contributor git-activity digest
 
 // Optional external retrieval augmentation (e.g. a local GBrain adapter or a
 // cloud retrieval service). Vendor-neutral HTTP contract:
@@ -165,10 +166,63 @@ export function toOrQuery(question: string): string {
 }
 
 /**
+ * Per-contributor git-activity digest from `code_contributions` (the scan aggregates). This is the
+ * ONLY place the query pipeline surfaces git history — without it, "what is John doing in git" has
+ * no context to answer from (the data lived only in the codebase metrics tables, never in retrieval).
+ * Author→person is already resolved at scan time (`code_contributions.member_id`); we fold the
+ * member display name in here. **team-tier only** — code/contributor activity is internal, never
+ * shown to an external viewer (CLAUDE.md §5). Returns "" when there's no recent activity.
+ */
+async function gitActivityDigest(supabase: SupabaseClient, teamId: string): Promise<string> {
+  const since = new Date(Date.now() - GIT_WINDOW_DAYS * 86_400_000).toISOString().slice(0, 10);
+  const { data: contribs } = await supabase
+    .from("code_contributions")
+    .select("codebase_id, member_id, author_name, author_email, commits, ai_commits, additions, deletions, day")
+    .eq("team_id", teamId)
+    .gte("day", since)
+    .order("day", { ascending: false })
+    .limit(2000);
+  if (!contribs?.length) return "";
+
+  const { data: members } = await supabase.from("members").select("id, display_name").eq("team_id", teamId);
+  const nameById = new Map((members ?? []).map((m) => [(m as { id: string }).id, (m as { display_name: string }).display_name]));
+  const { data: cbs } = await supabase.from("codebases").select("id, slug").eq("team_id", teamId);
+  const slugById = new Map((cbs ?? []).map((c) => [(c as { id: string }).id, (c as { slug: string }).slug]));
+
+  type Agg = { name: string; email: string; commits: number; ai: number; adds: number; dels: number; repos: Set<string>; lastDay: string };
+  const byPerson = new Map<string, Agg>();
+  for (const r of contribs as {
+    codebase_id: string; member_id: string | null; author_name: string; author_email: string;
+    commits: number; ai_commits: number; additions: number; deletions: number; day: string;
+  }[]) {
+    const key = r.member_id ?? r.author_email ?? r.author_name;
+    const name = (r.member_id && nameById.get(r.member_id)) || r.author_name || r.author_email || "unknown";
+    const a = byPerson.get(key) ?? { name, email: r.author_email ?? "", commits: 0, ai: 0, adds: 0, dels: 0, repos: new Set<string>(), lastDay: "" };
+    a.commits += r.commits;
+    a.ai += r.ai_commits;
+    a.adds += r.additions;
+    a.dels += r.deletions;
+    const slug = slugById.get(r.codebase_id);
+    if (slug) a.repos.add(slug);
+    if (r.day > a.lastDay) a.lastDay = r.day;
+    byPerson.set(key, a);
+  }
+
+  const lines = [...byPerson.values()]
+    .sort((a, b) => b.commits - a.commits)
+    .map(
+      (p) =>
+        `- ${p.name}${p.email ? ` (${p.email})` : ""}: ${p.commits} commits${p.ai ? ` (${p.ai} AI-assisted)` : ""}, ` +
+        `+${p.adds}/-${p.dels} across ${[...p.repos].join(", ") || "—"}; last commit ${p.lastDay}`
+    );
+  return ["", `## Git activity (last ${GIT_WINDOW_DAYS}d, by contributor)`, ...lines].join("\n");
+}
+
+/**
  * Tier-filtered retrieval: recall-friendly FTS + always-include structured context
- * (recent decisions, open/blocked tasks, projects, compact graph digest, and
- * Graphiti temporal facts) + recently synced items. All independent queries run in
- * parallel; all respect the caller's tier.
+ * (recent decisions, open/blocked tasks, projects, compact graph digest, Graphiti temporal facts,
+ * + a per-contributor git-activity digest on the team tier) + recently synced items. All independent
+ * queries run in parallel; all respect the caller's tier.
  */
 export async function retrieve(
   supabase: SupabaseClient,
@@ -179,6 +233,8 @@ export async function retrieve(
 ): Promise<RetrievedContext> {
   // Kick off the Graphiti graph-memory search concurrently with Postgres retrieval.
   const graphFactsP = fetchGraphFacts(supabase, teamId, tier, question);
+  // Git-activity digest (team tier only — code/contributor activity is internal) runs in parallel too.
+  const gitDigestP = tier === "team" ? gitActivityDigest(supabase, teamId) : Promise.resolve("");
 
   // All independent retrieval queries run in PARALLEL (was sequential → ~7 serial round-trips).
   // 1. Recall-friendly FTS over items (OR of significant terms; see toOrQuery).
@@ -300,6 +356,7 @@ export async function retrieve(
   }
 
   // 3. Structured context (compact, always included) — built from the parallel results above.
+  const gitDigest = await gitDigestP;
   const structured = [
     "## Recent decisions (newest first)",
     ...(decisions ?? []).map(
@@ -326,6 +383,7 @@ export async function retrieve(
     "",
     "## Key relationships",
     ...(rels ?? []).map((r) => `- ${r.from_id} ${r.relationship_type} ${r.to_id}`),
+    gitDigest,
   ].join("\n");
 
   // 3b. Blend in Graphiti temporal facts (graph memory over all ingestions), if any.

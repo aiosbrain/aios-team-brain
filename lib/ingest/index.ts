@@ -41,7 +41,12 @@ export async function ingestItem(
   supabase: SupabaseClient,
   auth: { teamId: string; memberId: string; apiKeyId: string },
   payload: ItemPayload,
-  access: "team" | "external"
+  access: "team" | "external",
+  // INTERNAL-only attribution override (NOT on the wire ItemPayload, so external pushers can't
+  // spoof authorship). When an internal caller already knows the content's author — e.g. the
+  // codebase scanner attributing a commit to a resolved member — it passes that here; otherwise
+  // the item is attributed to the ingesting actor (`auth.memberId`), as before.
+  opts?: { authorMemberId?: string | null }
 ): Promise<IngestResult> {
   // 1. project
   const { data: project, error: projErr } = await supabase
@@ -99,7 +104,7 @@ export async function ingestItem(
     body: payload.body,
     content_sha256: payload.content_sha256,
     actor: payload.actor ?? "",
-    member_id: auth.memberId,
+    member_id: opts?.authorMemberId ?? auth.memberId,
     synced_at: now,
     updated_at: now,
   };
