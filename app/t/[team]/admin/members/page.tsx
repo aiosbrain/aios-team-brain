@@ -1,6 +1,7 @@
 import { serverClient } from "@/lib/supabase/server";
 import { InviteMember } from "@/components/admin/invite-member";
 import { MemberGithubLink } from "@/components/admin/member-github-link";
+import { MemberSlackLink } from "@/components/admin/member-slack-link";
 
 export default async function MembersAdminPage({
   params,
@@ -23,6 +24,19 @@ export default async function MembersAdminPage({
     .eq("team_id", team.id)
     .order("created_at");
 
+  // Slack identities (member_identities, provider=slack) → memberId → {externalId, handle}
+  const { data: slackIds } = await supabase
+    .from("member_identities")
+    .select("member_id, external_id, handle")
+    .eq("team_id", team.id)
+    .eq("provider", "slack");
+  const slackByMember = new Map(
+    (slackIds ?? []).map((s) => [
+      (s as { member_id: string }).member_id,
+      s as { external_id: string; handle: string },
+    ])
+  );
+
   return (
     <div className="flex flex-col gap-4">
       <div className="flex items-center justify-between">
@@ -43,6 +57,7 @@ export default async function MembersAdminPage({
               <th className="px-4 py-3">Tier</th>
               <th className="px-4 py-3">Status</th>
               <th className="px-4 py-3">GitHub</th>
+              <th className="px-4 py-3">Slack</th>
             </tr>
           </thead>
           <tbody>
@@ -68,6 +83,14 @@ export default async function MembersAdminPage({
                     memberId={m.id}
                     githubLogin={m.github_login ?? null}
                     avatarUrl={m.avatar_url ?? null}
+                  />
+                </td>
+                <td className="px-4 py-3">
+                  <MemberSlackLink
+                    teamSlug={teamSlug}
+                    memberId={m.id}
+                    slackUserId={slackByMember.get(m.id)?.external_id ?? null}
+                    slackHandle={slackByMember.get(m.id)?.handle ?? null}
                   />
                 </td>
               </tr>
