@@ -6,6 +6,8 @@ import { ingestItem } from "@/lib/ingest";
 import { getEnabledIntegrationsWithSecrets } from "@/lib/integrations/manage";
 import { SlackClient, fetchSlackChannel } from "./sources/slack";
 import { normalizeThread } from "./sources/slack-normalize";
+import { syncSlackIdentities } from "./sources/slack-identity";
+import { buildIdentityMap, resolveByProviderId } from "@/lib/identity/resolve";
 import { fetchPlaneProject } from "./sources/plane";
 import { normalizePlaneProject, normalizePlaneDocs } from "./sources/plane-normalize";
 import type { PlaneConnection } from "@/lib/pm-sync/plane-client";
@@ -165,7 +167,16 @@ export async function runSlackIngestion(opts: { teamId?: string } = {}): Promise
         if (channelIds.length === 0) continue;
 
         const client = new SlackClient(token);
-        const users = await client.usersMap(); // one pass per integration token
+        const detailed = await client.usersDetailed(); // one pass per integration token (incl. emails when scoped)
+        // Best-effort reconcile Slack users → members by email, then build the resolver map so
+        // each thread's author is attributed to the real person (manual mappings included).
+        try {
+          await syncSlackIdentities(supabase, teamId, detailed);
+        } catch (err) {
+          summary.errors.push(`team ${teamId}: slack identity sync: ${err instanceof Error ? err.message : "failed"}`);
+        }
+        const idMap = await buildIdentityMap(supabase, teamId);
+        const users = Object.fromEntries(detailed.map((u) => [u.id, u.displayName]));
         for (const channelId of channelIds) {
           summary.channels++;
           try {
@@ -177,7 +188,9 @@ export async function runSlackIngestion(opts: { teamId?: string } = {}): Promise
                 users: channel.users,
                 project: "slack",
               });
-              const res = await ingestItem(supabase, auth, payload, "team");
+              // Attribute the item to the thread author's mapped member (else the ingesting actor).
+              const authorMemberId = resolveByProviderId(idMap, "slack", thread.root.user ?? "");
+              const res = await ingestItem(supabase, auth, payload, "team", { authorMemberId });
               if (res.status === "created") summary.created++;
               else if (res.status === "updated") summary.updated++;
               else summary.unchanged++;

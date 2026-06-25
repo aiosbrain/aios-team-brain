@@ -92,6 +92,38 @@ export class SlackClient {
     return (r.messages ?? []).filter((m) => m.ts !== threadTs);
   }
 
+  /**
+   * All workspace users with display name + email (one paginated pass; best-effort). Email is
+   * present only when the token has the `users:read.email` scope — otherwise undefined, and
+   * automatic identity mapping degrades to manual admin mapping. Used to attribute Slack content
+   * to the right person.
+   */
+  async usersDetailed(): Promise<{ id: string; displayName: string; email?: string }[]> {
+    const out: { id: string; displayName: string; email?: string }[] = [];
+    let cursor: string | undefined;
+    try {
+      do {
+        const params: Record<string, string> = { limit: "200" };
+        if (cursor) params.cursor = cursor;
+        const r = await this.call<{
+          members: { id: string; name?: string; real_name?: string; profile?: { display_name?: string; real_name?: string; email?: string } }[];
+          response_metadata?: { next_cursor?: string };
+        }>("users.list", params);
+        for (const u of r.members ?? []) {
+          out.push({
+            id: u.id,
+            displayName: u.profile?.display_name || u.profile?.real_name || u.real_name || u.name || u.id,
+            email: u.profile?.email,
+          });
+        }
+        cursor = r.response_metadata?.next_cursor || undefined;
+      } while (cursor);
+    } catch {
+      // users:read[.email] not granted — caller degrades gracefully.
+    }
+    return out;
+  }
+
   /** All workspace users → id→name map (one paginated pass; best-effort). */
   async usersMap(): Promise<Record<string, string>> {
     const map: Record<string, string> = {};
