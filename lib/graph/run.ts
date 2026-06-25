@@ -2,7 +2,7 @@ import "server-only";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { adminClient } from "@/lib/supabase/admin";
 import { GraphitiClient } from "./graphiti-client";
-import { projectSlackToGraph } from "./project";
+import { projectItemsToGraph } from "./project";
 
 /**
  * Graph-projection runner — the on-ramp that actually drives `projectSlackToGraph` (which is
@@ -64,7 +64,7 @@ export async function runGraphProjection(opts?: {
 
   for (const t of teams) {
     try {
-      const s = await projectSlackToGraph(supabase, {
+      const s = await projectItemsToGraph(supabase, {
         teamId: t.id,
         teamSlug: t.slug,
         client,

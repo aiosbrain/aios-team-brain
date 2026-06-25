@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { GraphitiClient, GraphEpisode } from "@/lib/graph/graphiti-client";
-import { projectSlackToGraph } from "@/lib/graph/project";
+import { projectSlackToGraph, projectItemsToGraph } from "@/lib/graph/project";
 import { runGraphProjection } from "@/lib/graph/run";
 import { db, ingest, seedTeam } from "./helpers";
 
@@ -74,6 +74,26 @@ describe("Slack → Graphiti projector (real Postgres, mocked Graphiti)", () => 
     const res = await projectSlackToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(again) });
     expect(again.pushes).toHaveLength(1); // changed content re-pushed
     expect(res.projected).toBe(1);
+  });
+});
+
+// All ingestions (not just Slack) feed the graph: projectItemsToGraph projects every content-bearing
+// kind and excludes config kinds (skill/blueprint). Verified on real Postgres with a mocked Graphiti.
+describe("projectItemsToGraph — all ingestions (real Postgres, mocked Graphiti)", () => {
+  it("projects all content kinds and excludes config kinds (skill)", async () => {
+    const seed = await seedTeam();
+    const slug = await teamSlugFor(seed.teamId);
+    await ingest(seed, { kind: "transcript", path: "slack/eng/1.md", body: "slack thread", access: "team" });
+    await ingest(seed, { kind: "deliverable", path: "notion/spec.md", body: "product spec", access: "team" });
+    await ingest(seed, { kind: "decision", path: "decisions/d1.md", body: "we chose postgres", access: "team" });
+    await ingest(seed, { kind: "task", path: "tasks/t1.md", body: "ship the graph", access: "team" });
+    await ingest(seed, { kind: "skill", path: "skills/s.md", body: "skill manifest", access: "team" }); // excluded
+
+    const fake = new FakeGraphiti();
+    const res = await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(fake) });
+
+    expect(res.projected).toBe(4); // transcript + deliverable + decision + task; skill excluded
+    expect(fake.pushes).toHaveLength(4);
   });
 });
 

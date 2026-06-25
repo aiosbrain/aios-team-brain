@@ -1,5 +1,7 @@
 import "server-only";
 import type { SupabaseClient } from "@supabase/supabase-js";
+import { GraphitiClient, type GraphFact } from "@/lib/graph/graphiti-client";
+import { visibleGroupIds } from "@/lib/graph/group";
 
 export type Source = {
   sid: string; // S1, S2…
@@ -112,10 +114,36 @@ async function fetchAugmentedSources(
   }
 }
 
+// Graphiti graph-memory blend (temporal knowledge graph over ALL ingestions). Best-effort:
+// tier-scoped via group_ids, short timeout, never throws — a clean [] when GRAPHITI_URL is unset
+// or the call fails, so retrieval degrades to Postgres-only. Facts join the structured digest.
+const GRAPH_FACTS_LIMIT = Number(process.env.GRAPH_QUERY_FACTS ?? 12);
+const GRAPH_QUERY_TIMEOUT_MS = Number(process.env.GRAPH_QUERY_TIMEOUT_MS ?? 4000);
+
+async function fetchGraphFacts(
+  supabase: SupabaseClient,
+  teamId: string,
+  tier: "team" | "external",
+  question: string
+): Promise<GraphFact[]> {
+  const client = new GraphitiClient({ timeoutMs: GRAPH_QUERY_TIMEOUT_MS });
+  if (!client.configured) return [];
+  try {
+    const { data: team } = await supabase.from("teams").select("slug").eq("id", teamId).maybeSingle();
+    const slug = (team as { slug: string } | null)?.slug;
+    if (!slug) return [];
+    const groupIds = visibleGroupIds(slug, tier);
+    return await client.search(question, groupIds, GRAPH_FACTS_LIMIT);
+  } catch {
+    return []; // degrade to Postgres-only retrieval
+  }
+}
+
 /**
  * Tier-filtered retrieval: FTS top-12 + always-include structured context
- * (recent decisions, open/blocked tasks, projects, compact graph digest)
- * + 5 most recently synced items. All queries respect the caller's tier.
+ * (recent decisions, open/blocked tasks, projects, compact graph digest, and
+ * Graphiti temporal facts) + 5 most recently synced items. All queries respect
+ * the caller's tier.
  */
 export async function retrieve(
   supabase: SupabaseClient,
@@ -124,6 +152,9 @@ export async function retrieve(
   question: string,
   projectSlug?: string | null
 ): Promise<RetrievedContext> {
+  // Kick off the Graphiti graph-memory search concurrently with Postgres retrieval.
+  const graphFactsP = fetchGraphFacts(supabase, teamId, tier, question);
+
   // 1. FTS over items
   let fts = supabase
     .from("items")
@@ -257,9 +288,23 @@ export async function retrieve(
     ...(rels ?? []).map((r) => `- ${r.from_id} ${r.relationship_type} ${r.to_id}`),
   ].join("\n");
 
+  // 3b. Blend in Graphiti temporal facts (graph memory over all ingestions), if any.
+  const graphFacts = await graphFactsP;
+  const structuredWithGraph = graphFacts.length
+    ? structured +
+      "\n\n" +
+      [
+        "## Graph memory (temporal facts — entity/relationship knowledge across all ingestions)",
+        ...graphFacts.map(
+          (f) =>
+            `- ${f.fact}${f.valid_at ? ` (valid ${f.valid_at.slice(0, 10)})` : ""}${f.invalid_at ? " [SUPERSEDED]" : ""}`
+        ),
+      ].join("\n")
+    : structured;
+
   // 4. Optional cross-encoder rerank (local llama-server or cloud). No-op when
   // RERANK_URL is unset; reorders so the most relevant source is cited first.
   const ranked = await rerankSources(question, sources);
 
-  return { sources: ranked, structured };
+  return { sources: ranked, structured: structuredWithGraph };
 }
