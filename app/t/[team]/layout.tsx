@@ -65,7 +65,7 @@ export default async function TeamLayout({
   }
 
   // Grouped IA: ~6 primary entries. "Work" gathers the operational surfaces; Skills folds
-  // into Library (reached at /library/skills, not a top-level peer). Codebase analytics
+  // into Data (reached at /library/skills, not a top-level peer). Codebase analytics
   // live only on the postgres backend (canonical schema).
   const items: NavEntry[] = [
     { icon: "home", label: "Home", href: base, exact: true },
@@ -77,7 +77,7 @@ export default async function TeamLayout({
         { icon: "decisions", label: "Decisions", href: `${base}/decisions` },
       ],
     },
-    { icon: "library", label: "Library", href: `${base}/library` },
+    { icon: "library", label: "Data", href: `${base}/library` },
   ];
   if (isPostgresBackend()) {
     items.push({ icon: "codebases", label: "Codebases", href: `${base}/codebases` });

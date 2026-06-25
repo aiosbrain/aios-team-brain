@@ -44,7 +44,7 @@ export default async function LibraryItemPage({
     <div className="mx-auto flex max-w-5xl flex-col gap-6">
       <div>
         <Link href={`/t/${teamSlug}/library`} className="text-xs text-ink-tertiary hover:text-violet">
-          ← Library
+          ← Data
         </Link>
         <div className="mt-2 flex flex-wrap items-center gap-2">
           <KindBadge kind={item.kind} />
