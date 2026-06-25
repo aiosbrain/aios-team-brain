@@ -139,11 +139,36 @@ async function fetchGraphFacts(
   }
 }
 
+// Question words + common stopwords dropped before building the FTS query — they carry no signal
+// and (under AND semantics) tanked recall (e.g. "what has john been posting to slack" required the
+// literal "posting"/"slack" in the body). We keep all other terms.
+const FTS_STOP = new Set([
+  "the", "a", "an", "of", "to", "in", "on", "for", "and", "or", "is", "are", "was", "were",
+  "be", "been", "being", "what", "who", "whom", "whose", "when", "where", "why", "how", "which",
+  "did", "do", "does", "has", "have", "had", "with", "about", "from", "by", "our", "we", "you",
+  "i", "me", "my", "your", "their", "this", "that", "these", "those", "it", "its", "as", "at",
+  "any", "all", "can", "could", "would", "should", "tell", "show", "give", "list", "get",
+]);
+
 /**
- * Tier-filtered retrieval: FTS top-12 + always-include structured context
+ * Build a recall-friendly FTS query: significant terms OR-joined. `websearch_to_tsquery` treats the
+ * word "or" as the OR operator, so this matches docs containing ANY significant term (then the LLM
+ * filters relevance) instead of requiring ALL of them. Falls back to the raw question when nothing
+ * significant remains. (Ranked/semantic retrieval — pgvector — is the durable fix at larger scale.)
+ */
+export function toOrQuery(question: string): string {
+  const terms = (question.toLowerCase().match(/[a-z0-9][a-z0-9'-]*/g) ?? []).filter(
+    (t) => t.length >= 3 && !FTS_STOP.has(t)
+  );
+  const unique = [...new Set(terms)];
+  return unique.length ? unique.join(" or ") : question;
+}
+
+/**
+ * Tier-filtered retrieval: recall-friendly FTS + always-include structured context
  * (recent decisions, open/blocked tasks, projects, compact graph digest, and
- * Graphiti temporal facts) + 5 most recently synced items. All queries respect
- * the caller's tier.
+ * Graphiti temporal facts) + recently synced items. All independent queries run in
+ * parallel; all respect the caller's tier.
  */
 export async function retrieve(
   supabase: SupabaseClient,
@@ -155,25 +180,77 @@ export async function retrieve(
   // Kick off the Graphiti graph-memory search concurrently with Postgres retrieval.
   const graphFactsP = fetchGraphFacts(supabase, teamId, tier, question);
 
-  // 1. FTS over items
-  let fts = supabase
+  // All independent retrieval queries run in PARALLEL (was sequential → ~7 serial round-trips).
+  // 1. Recall-friendly FTS over items (OR of significant terms; see toOrQuery).
+  let ftsB = supabase
     .from("items")
     .select("id, path, kind, body, synced_at, projects(slug)")
     .eq("team_id", teamId)
-    .textSearch("search", question, { type: "websearch", config: "english" })
-    .limit(12);
-  if (tier === "external") fts = fts.eq("access", "external");
-  const { data: ftsHits } = await fts;
+    .textSearch("search", toOrQuery(question), { type: "websearch", config: "english" })
+    .limit(20);
+  if (tier === "external") ftsB = ftsB.eq("access", "external");
 
-  // 2. Recency: 5 most recent items
-  let recent = supabase
+  // 2. Recency: most recent items (a fallback so fresh content always has a shot).
+  let recentB = supabase
     .from("items")
     .select("id, path, kind, body, synced_at, projects(slug)")
     .eq("team_id", teamId)
     .order("synced_at", { ascending: false })
-    .limit(5);
-  if (tier === "external") recent = recent.eq("access", "external");
-  const { data: recentHits } = await recent;
+    .limit(8);
+  if (tier === "external") recentB = recentB.eq("access", "external");
+
+  // 3. Structured-context query builders (awaited together with the above).
+  let decisionsB = supabase
+    .from("decisions")
+    .select("row_key, decided_at, title, decided_by, still_valid, projects(slug)")
+    .eq("team_id", teamId)
+    .order("decided_at", { ascending: false })
+    .limit(50);
+  if (tier === "external") decisionsB = decisionsB.eq("audience", "external");
+  const tasksB = supabase
+    .from("tasks")
+    .select("row_key, title, assignee, status, sprint, projects(slug)")
+    .eq("team_id", teamId)
+    .in("status", ["in_progress", "blocked", "ready"])
+    .limit(50);
+  const commitmentsB = supabase
+    .from("graph_entities")
+    .select("entity_id, name, attrs")
+    .eq("team_id", teamId)
+    .eq("entity_type", "commitment")
+    .limit(30);
+  const relsB = supabase
+    .from("graph_relationships")
+    .select("from_id, to_id, relationship_type")
+    .eq("team_id", teamId)
+    .in("relationship_type", ["REPORTS_TO", "OWNS", "BLOCKS"])
+    .limit(80);
+  const actorsB = supabase
+    .from("graph_entities")
+    .select("entity_id, name, attrs")
+    .eq("team_id", teamId)
+    .eq("entity_type", "actor")
+    .limit(40);
+
+  const [
+    { data: ftsHits },
+    { data: recentHits },
+    { data: decisions },
+    { data: tasks },
+    { data: commitments },
+    { data: rels },
+    { data: actors },
+    augmented,
+  ] = await Promise.all([
+    ftsB,
+    recentB,
+    decisionsB,
+    tasksB,
+    commitmentsB,
+    relsB,
+    actorsB,
+    fetchAugmentedSources(question, tier),
+  ]);
 
   // Merge, dedupe by id, cap sizes
   const seen = new Set<string>();
@@ -203,7 +280,7 @@ export async function retrieve(
   // Merged after Postgres hits, deduped by path, same char budget. No-op + safe
   // fallback when RETRIEVAL_AUGMENT_URL is unset or the call fails.
   const seenPaths = new Set(sources.map((s) => s.path));
-  for (const hit of await fetchAugmentedSources(question, tier)) {
+  for (const hit of augmented) {
     const text = (hit.text || "").slice(0, MAX_SOURCE_CHARS);
     if (!text) continue;
     const path = hit.path || `gbrain:${n}`;
@@ -222,44 +299,7 @@ export async function retrieve(
     });
   }
 
-  // 3. Structured context (compact, always included)
-  let decisionsQ = supabase
-    .from("decisions")
-    .select("row_key, decided_at, title, decided_by, still_valid, projects(slug)")
-    .eq("team_id", teamId)
-    .order("decided_at", { ascending: false })
-    .limit(50);
-  if (tier === "external") decisionsQ = decisionsQ.eq("audience", "external");
-  const { data: decisions } = await decisionsQ;
-
-  const { data: tasks } = await supabase
-    .from("tasks")
-    .select("row_key, title, assignee, status, sprint, projects(slug)")
-    .eq("team_id", teamId)
-    .in("status", ["in_progress", "blocked", "ready"])
-    .limit(50);
-
-  const { data: commitments } = await supabase
-    .from("graph_entities")
-    .select("entity_id, name, attrs")
-    .eq("team_id", teamId)
-    .eq("entity_type", "commitment")
-    .limit(30);
-
-  const { data: rels } = await supabase
-    .from("graph_relationships")
-    .select("from_id, to_id, relationship_type")
-    .eq("team_id", teamId)
-    .in("relationship_type", ["REPORTS_TO", "OWNS", "BLOCKS"])
-    .limit(80);
-
-  const { data: actors } = await supabase
-    .from("graph_entities")
-    .select("entity_id, name, attrs")
-    .eq("team_id", teamId)
-    .eq("entity_type", "actor")
-    .limit(40);
-
+  // 3. Structured context (compact, always included) — built from the parallel results above.
   const structured = [
     "## Recent decisions (newest first)",
     ...(decisions ?? []).map(
