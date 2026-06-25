@@ -19,6 +19,8 @@ export interface GraphEpisode {
   /** Stable label for the episode (we use the brain source id). */
   name?: string;
   roleType?: "user" | "assistant" | "system";
+  /** Speaker/author label. Graphiti's Message requires the key present (may be null). */
+  role?: string | null;
 }
 
 /** A fact (graph edge) returned by /search — citable via source + temporal validity. */
@@ -83,6 +85,9 @@ export class GraphitiClient {
         source_description: e.sourceDescription,
         name: e.name,
         role_type: e.roleType ?? "user",
+        // Graphiti's Message schema REQUIRES `role` to be present (nullable). Omitting it → HTTP 422
+        // on every push. A Slack thread has many speakers, so we send null. Verified live 2026-06-24.
+        role: e.role ?? null,
       })),
     });
   }

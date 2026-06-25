@@ -24,16 +24,22 @@ describe("GraphitiClient", () => {
   it("addEpisodes POSTs mapped episodes to /messages", async () => {
     const calls: Call[] = [];
     const c = new GraphitiClient({ baseUrl: "http://gx:8000", fetchImpl: stubFetch(calls) });
-    await c.addEpisodes("acme:team", [
+    await c.addEpisodes("acme_team", [
       { content: "hello", timestamp: "2026-06-01T00:00:00Z", sourceDescription: "Slack thread — #eng" },
     ]);
     expect(calls).toHaveLength(1);
     expect(calls[0].url).toBe("http://gx:8000/messages");
-    const b = calls[0].body as { group_id: string; messages: { content: string; source_description: string; role_type: string }[] };
-    expect(b.group_id).toBe("acme:team");
+    const b = calls[0].body as {
+      group_id: string;
+      messages: { content: string; source_description: string; role_type: string; role: string | null }[];
+    };
+    expect(b.group_id).toBe("acme_team");
     expect(b.messages[0].content).toBe("hello");
     expect(b.messages[0].source_description).toBe("Slack thread — #eng");
     expect(b.messages[0].role_type).toBe("user");
+    // Regression: Graphiti's Message schema requires `role` present (nullable). Omitting it → 422.
+    expect(b.messages[0]).toHaveProperty("role");
+    expect(b.messages[0].role).toBeNull();
   });
 
   it("addEpisodes is a no-op for an empty batch", async () => {
