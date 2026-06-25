@@ -2,9 +2,11 @@
 
 Graphiti is a temporal knowledge-graph engine. We run it **locally / self-hosted** (it never
 mixes into the TS codebase — the brain calls its REST API). It sits **downstream of the brain**:
-the brain's connectors fill `items`/`tasks`/`decisions`; `lib/graph` *projects* those rows into
-Graphiti as episodes; a tier-scoped query endpoint searches it. This is a parallel path next to
-the existing `graph_entities`/`graph_relationships` + `/api/v1/query` — not a replacement.
+the brain's connectors fill `items` (ALL ingestions: Slack transcripts, deliverables, decisions,
+tasks, artifacts); `lib/graph` *projects* those rows into Graphiti as episodes; the standalone
+`/api/v1/graph-query` endpoint searches it, AND `lib/query/retrieve` blends Graphiti's temporal
+facts into the main AI query box's context (tier-scoped, best-effort). Graphiti complements the
+existing `graph_entities`/`graph_relationships` digest — not a replacement.
 
 ## Run it
 ```bash
@@ -38,5 +40,7 @@ Extraction quality depends on structured-output support. Start with a strong clo
 model (Ollama via `OPENAI_BASE_URL`) trades quality/speed for privacy — swap via env, no code change.
 
 ## Status
-Phase 1: Slack transcripts → episodes, one team, bounded backfill. Validate the graph before
+Phase 2: ALL content-bearing item kinds (transcript/deliverable/decision/task/artifact) → episodes,
+projected on a schedule, and blended into the main query box. Bounded per run (`GRAPH_PROJECT_LIMIT`);
+a backlog beyond one run still needs cursor pagination. Earlier: Phase 1 was Slack transcripts only. Validate the graph before
 wiring Linear/Plane (those land in the brain via other work; the projector reads them downstream).
