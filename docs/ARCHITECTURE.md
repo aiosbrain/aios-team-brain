@@ -136,7 +136,7 @@ sequenceDiagram
   participant LLM as Claude
   U->>Q: {question, project?}
   Q->>Q: auth · cost guard (per-member/day, per-team $/day in query_log)
-  Q->>RET: tier-filtered FTS top-12 + recent + Graphiti semantic expansion + structured digest (incl. per-contributor git activity + per-person cross-tool activity, team tier)
+  Q->>RET: tier-filtered FTS top-12 + recent + Graphiti semantic expansion + structured digest (git + per-person activity digests included only for activity questions — context shaping)
   RET-->>Q: {sources[], structured}
   Q->>CL: streamAnswer(ctx, question)  %% ctx.grounded=false (no FTS/semantic match) → abstain note (stay-quiet)
   CL->>LLM: cached system + numbered sources + question

@@ -194,6 +194,18 @@ export function graphExpansionQuery(facts: GraphFact[]): string {
   return [...terms].slice(0, MAX_EXPANSION_TERMS).join(" or ");
 }
 
+// Activity-intent detector for context shaping. The git + per-person activity digests are the
+// heaviest always-on context blocks (two extra scans + tokens). We only compute/include them when
+// the question is actually about who's doing what — biased INCLUSIVE (a false positive just restores
+// the old always-on behavior; a false negative would drop relevant context, so we'd rather over-include).
+const ACTIVITY_INTENT =
+  /\b(who|whose|doing|working|worked|activity|active|busy|contribut\w*|commit\w*|posting|posted|assigned|assignee|standup|workload|lately|recently)\b|\bup to\b|\bthis (week|sprint|month)\b/i;
+
+/** True when a query is about people/activity (→ include the git + people-activity digests). */
+export function wantsActivityContext(question: string): boolean {
+  return ACTIVITY_INTENT.test(question);
+}
+
 /**
  * Per-contributor git-activity digest from `code_contributions` (the scan aggregates). This is the
  * ONLY place the query pipeline surfaces git history — without it, "what is John doing in git" has
@@ -328,8 +340,10 @@ export async function retrieve(
   // Kick off the Graphiti graph-memory search concurrently with Postgres retrieval.
   const graphFactsP = fetchGraphFacts(supabase, teamId, tier, question);
   // Git-activity + per-person activity digests (team tier only — internal) run in parallel too.
-  const gitDigestP = tier === "team" ? gitActivityDigest(supabase, teamId) : Promise.resolve("");
-  const peopleDigestP = tier === "team" ? peopleActivityDigest(supabase, teamId) : Promise.resolve("");
+  // Context shaping: the activity digests are heavy + only relevant to "who's doing what" questions.
+  const wantsActivity = tier === "team" && wantsActivityContext(question);
+  const gitDigestP = wantsActivity ? gitActivityDigest(supabase, teamId) : Promise.resolve("");
+  const peopleDigestP = wantsActivity ? peopleActivityDigest(supabase, teamId) : Promise.resolve("");
 
   // All independent retrieval queries run in PARALLEL (was sequential → ~7 serial round-trips).
   // 1. Recall-friendly FTS over items (OR of significant terms; see toOrQuery).
