@@ -6,9 +6,11 @@ import { isPostgresBackend } from "@/lib/db/backend";
 import { serverClient } from "@/lib/supabase/server";
 import { currentMember } from "@/lib/auth/guard";
 import { getMemberProfile } from "@/lib/metrics/codebases";
+import { getMemberContext } from "@/lib/identity/context";
 import { parseRange } from "@/lib/metrics/range";
 import { RangeSelector } from "@/components/dashboard/range-selector";
 import { CommitHeatmap } from "@/components/codebases/commit-heatmap";
+import { MemberContextPanel } from "@/components/people/member-context";
 
 export const metadata: Metadata = { title: "Profile" };
 
@@ -41,6 +43,8 @@ export default async function PersonPage({
 
   const p = await getMemberProfile(supabase, team.id, decodeURIComponent(handle), range, me.tier);
   if (!p) notFound();
+
+  const context = await getMemberContext(supabase, team.id, p.member_id, me.tier);
 
   const aiPct = p.totals.commits ? Math.round((100 * p.totals.ai_commits) / p.totals.commits) : 0;
 
@@ -90,6 +94,8 @@ export default async function PersonPage({
         <Stat label="Active days" value={p.totals.active_days} />
         <Stat label="Repos" value={p.repos.length} />
       </div>
+
+      {context ? <MemberContextPanel context={context} /> : null}
 
       <section className="prism-card flex flex-col gap-3 p-5">
         <h2 className="text-sm font-semibold uppercase tracking-wider text-ink-tertiary">
