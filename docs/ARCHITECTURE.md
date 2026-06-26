@@ -444,6 +444,8 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 - `GET /api/v1/decisions` — dashboard decision changes for `aios pull` writeback (tier-scoped)
 - `GET /api/v1/projects` — team project list for `aios pull` brain-project registration (team-tier only)
 - `GET /api/v1/me` — authenticated member identity + role (drives client UI gating)
+- `GET /api/v1/members` — team roster + cross-tool identities for external resolution (team-tier only; `?email`/`?handle`/`?provider` filters)
+- `GET /api/v1/identities/resolve` — resolve a provider external_id (or email/handle) to a member + canonical contacts incl. `slack_id` (team-tier only; 404 on miss)
 - `POST /api/v1/query` — SSE grounded query (`delta`/`sources`/`done`)
 - `GET /api/v1/okf-bundle` — OKF link graph (tier-filtered, link redaction)
 - `POST /api/v1/actions` — request a policy-gated action (Organ 4)
