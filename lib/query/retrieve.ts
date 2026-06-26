@@ -372,12 +372,16 @@ export async function retrieve(
     .order("decided_at", { ascending: false })
     .limit(50);
   if (tier === "external") decisionsB = decisionsB.eq("audience", "external");
+  // ALL statuses (incl. `done`), most-recently-updated first — so "what got completed today?"
+  // can ground on finished tasks. `tasks.updated_at` is bumped on every sync upsert (incl. a
+  // status→done transition), so recency ordering surfaces today's completions. (Was active-only:
+  // `in_progress/blocked/ready`, which structurally hid every completion from the brain.)
   const tasksB = supabase
     .from("tasks")
-    .select("row_key, title, assignee, status, sprint, projects(slug)")
+    .select("row_key, title, assignee, status, sprint, updated_at, projects(slug)")
     .eq("team_id", teamId)
-    .in("status", ["in_progress", "blocked", "ready"])
-    .limit(50);
+    .order("updated_at", { ascending: false })
+    .limit(80);
   const commitmentsB = supabase
     .from("graph_entities")
     .select("entity_id, name, attrs")
@@ -505,11 +509,12 @@ export async function retrieve(
         `- #${d.row_key} (${d.decided_at ?? "?"}, ${(d.projects as unknown as { slug: string })?.slug}) ${d.title} — by ${d.decided_by}${d.still_valid ? "" : " [SUPERSEDED]"}`
     ),
     "",
-    "## Open/active tasks",
-    ...(tasks ?? []).map(
-      (t) =>
-        `- ${t.row_key} [${t.status}] ${t.title} (${t.assignee || "unassigned"}, ${t.sprint || "no sprint"})`
-    ),
+    "## Tasks (all statuses, most recently updated first)",
+    ...(tasks ?? []).map((t) => {
+      const u = t.updated_at;
+      const day = typeof u === "string" ? u.slice(0, 10) : u ? new Date(u).toISOString().slice(0, 10) : "?";
+      return `- ${t.row_key} [${t.status}] ${t.title} (${t.assignee || "unassigned"}, ${t.sprint || "no sprint"}) — updated ${day}`;
+    }),
     "",
     "## Commitments (graph)",
     ...(commitments ?? []).map(
