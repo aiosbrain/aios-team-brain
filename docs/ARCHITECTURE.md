@@ -138,7 +138,7 @@ sequenceDiagram
   Q->>Q: auth · cost guard (per-member/day, per-team $/day in query_log)
   Q->>RET: tier-filtered FTS top-12 + recent + Graphiti semantic expansion + structured digest (incl. per-contributor git activity + per-person cross-tool activity, team tier)
   RET-->>Q: {sources[], structured}
-  Q->>CL: streamAnswer(ctx, question)
+  Q->>CL: streamAnswer(ctx, question)  %% ctx.grounded=false (no FTS/semantic match) → abstain note (stay-quiet)
   CL->>LLM: cached system + numbered sources + question
   LLM-->>U: SSE delta* then sources then done(usage)
 ```
