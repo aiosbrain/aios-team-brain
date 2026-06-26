@@ -9,6 +9,8 @@ const TABS = [
   { slug: "keys", label: "API keys" },
   { slug: "integrations", label: "Integrations" },
   { slug: "pm-sync", label: "PM sync" },
+  { slug: "policies", label: "Policies" },
+  { slug: "approvals", label: "Approvals" },
   { slug: "audit", label: "Audit log" },
 ];
 
