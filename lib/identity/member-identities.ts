@@ -93,3 +93,38 @@ export async function setMemberIdentity(
   });
   return res;
 }
+
+/** Remove a provider identity mapping (admins correcting/clearing a link). Audited; no-op if absent. */
+export async function removeMemberIdentity(
+  admin: SupabaseClient,
+  teamId: string,
+  input: { provider: string; externalId: string },
+  opts: { actor?: IdentityActor } = {}
+): Promise<{ removed: boolean }> {
+  const provider = input.provider.trim().toLowerCase();
+  const externalId = input.externalId.trim();
+  if (!provider || !externalId) throw new Error("provider and externalId are required");
+
+  const { data: existing } = await admin
+    .from("member_identities")
+    .select("id, member_id")
+    .eq("team_id", teamId)
+    .eq("provider", provider)
+    .eq("external_id", externalId)
+    .maybeSingle();
+  const ex = existing as { id: string; member_id: string } | null;
+  if (!ex) return { removed: false };
+
+  const { error } = await admin.from("member_identities").delete().eq("id", ex.id);
+  if (error) throw new Error(`identity delete failed: ${error.message}`);
+  await audit(admin, {
+    team_id: teamId,
+    actor_kind: opts.actor?.kind ?? "system",
+    member_id: opts.actor?.memberId ?? null,
+    action: "identity.removed",
+    target_type: "member",
+    target_id: ex.member_id,
+    meta: { provider, external_id: externalId },
+  });
+  return { removed: true };
+}

@@ -93,3 +93,38 @@ export async function addAuthorAlias(
   });
   return res;
 }
+
+/**
+ * Remove a git-author email alias. Audited; no-op if absent. Existing `code_contributions` already
+ * attributed via this alias keep their `member_id` (we don't re-orphan history) — removal only stops
+ * FUTURE resolution through this email.
+ */
+export async function removeAuthorAlias(
+  admin: SupabaseClient,
+  teamId: string,
+  email: string,
+  opts: { actor?: ActorContext } = {}
+): Promise<{ removed: boolean }> {
+  const e = email.trim().toLowerCase();
+  if (!e) throw new Error("email is required");
+  const { data: existing } = await admin
+    .from("member_emails")
+    .select("id, member_id")
+    .eq("team_id", teamId)
+    .eq("email", e)
+    .maybeSingle();
+  const ex = existing as { id: string; member_id: string } | null;
+  if (!ex) return { removed: false };
+  const { error } = await admin.from("member_emails").delete().eq("id", ex.id);
+  if (error) throw new Error(`alias delete failed: ${error.message}`);
+  await audit(admin, {
+    team_id: teamId,
+    actor_kind: opts.actor?.kind ?? "system",
+    member_id: opts.actor?.memberId ?? null,
+    action: "alias.removed",
+    target_type: "member",
+    target_id: ex.member_id,
+    meta: { email: e },
+  });
+  return { removed: true };
+}
