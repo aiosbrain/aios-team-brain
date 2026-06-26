@@ -157,7 +157,8 @@ export function QueryChat({
             <Sparkles className="size-6 text-violet" />
             <p className="max-w-sm text-sm text-ink-secondary">
               Ask anything about your team — Slack, decisions, tasks, code, and the knowledge graph.
-              Answers cite their sources.
+              Answers cite their sources. Type <span className="font-mono text-violet">/sync</span> to
+              pull the latest from your connectors.
             </p>
             <div className="flex flex-wrap justify-center gap-2">
               {suggestions.map((s) => (
@@ -244,7 +245,7 @@ export function QueryChat({
             }
           }}
           rows={1}
-          placeholder="Ask the brain…  (Enter to send, Shift+Enter for newline)"
+          placeholder="Ask the brain…  (or /sync to pull latest · Enter to send, Shift+Enter for newline)"
           className="max-h-40 min-h-[2.5rem] w-full resize-none rounded-xl border border-border-default bg-surface-base px-3 py-2 text-sm text-ink outline-none placeholder:text-ink-tertiary focus:border-violet/50"
         />
         <button

@@ -30,7 +30,20 @@ Rules:
 - Cite sources inline using their markers, e.g. [S2]. Cite the structured context as [CTX].
 - Be concise and operational: lead with the answer, then the supporting evidence.
 - Decisions marked [SUPERSEDED] are no longer valid — say so if relevant.
+- Interpret relative dates ("today", "yesterday", "this week", "recently") against the Current date given at the top of the context. Dates in the structured context (e.g. a task's "updated" date) are UTC calendar dates — compare them to the Current date to answer "what happened today/this week".
 - Never speculate about content above the caller's access tier; what you were given is what they may see.`;
+
+const WEEKDAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+
+/**
+ * A single line stating today's date, injected at the top of the query context so the model can
+ * resolve "today / this week / recently". UTC to match the structured digest's date basis (all
+ * digest dates are UTC ISO slices). Pure + injectable `now` for deterministic tests.
+ */
+export function currentDateLine(now: Date = new Date()): string {
+  const iso = now.toISOString().slice(0, 10);
+  return `Current date: ${iso} (${WEEKDAYS[now.getUTCDay()]}, UTC).`;
+}
 
 /**
  * "Stay quiet" (Organ 3): when retrieval found no query-specific match (`grounded === false`), the
@@ -102,6 +115,7 @@ export async function* streamAnswer(
       {
         role: "user",
         content: [
+          { type: "text", text: currentDateLine() },
           ...(note ? [{ type: "text" as const, text: note }] : []),
           { type: "text", text: `<structured_context>\n${ctx.structured}\n</structured_context>` },
           { type: "text", text: sourcesBlock || "<no document sources matched>" },
@@ -151,6 +165,8 @@ async function* streamLocal(
   | { type: "done"; usage: QueryUsage }
 > {
   const userContent =
+    currentDateLine() +
+    "\n\n" +
     note +
     `<structured_context>\n${structured}\n</structured_context>\n\n` +
     `${sourcesBlock || "<no document sources matched>"}\n\n` +

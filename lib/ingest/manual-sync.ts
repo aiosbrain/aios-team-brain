@@ -1,0 +1,86 @@
+import "server-only";
+import { runSlackIngestion, runPlaneIngestion, runLinearIngestion, runGithubIngestion } from "./run";
+
+/**
+ * On-demand "scrape now" from the query box. `isSyncCommand` recognizes when a chat message is a
+ * sync command (not a question) so the query route can pull the connectors instead of asking the
+ * LLM; `runManualSync` runs every enabled source for the team and returns a markdown summary that
+ * streams back as the brain's "answer". This is the user-facing twin of the admin "Run … now"
+ * actions and the 30-min scheduler — same single-writer ingestion underneath.
+ */
+
+// Whole-message commands only (so a real question like "what got synced from Slack?" never triggers).
+const EXACT = new Set([
+  "sync", "scrape", "refresh", "resync", "rescrape", "reindex",
+  "sync now", "scrape now", "refresh now", "resync now", "scrape it", "sync it",
+  "sync data", "scrape data", "refresh data", "sync the data", "scrape the data", "refresh the data",
+  "pull latest", "pull now", "pull data", "update data", "fetch latest",
+  "sync everything", "scrape everything", "refresh everything",
+]);
+
+/** True when the message is a scrape/sync command rather than a question for the brain. */
+export function isSyncCommand(question: string): boolean {
+  const q = question.trim().toLowerCase().replace(/[!.?\s]+$/g, "");
+  if (!q) return false;
+  if (q.startsWith("/sync") || q.startsWith("/scrape") || q.startsWith("/refresh")) return true;
+  return EXACT.has(q);
+}
+
+export interface ManualSyncResult {
+  summary: string; // markdown — streamed back as the brain's answer
+  created: number;
+  updated: number;
+  errors: number;
+}
+
+type RunCounts = { created: number; updated: number; integrations: number; errors: string[] } | null;
+
+/** Run every enabled source for the team and summarize. One source failing never fails the others. */
+export async function runManualSync(teamId: string): Promise<ManualSyncResult> {
+  const safe = async (p: Promise<RunCounts>): Promise<RunCounts> => {
+    try {
+      return await p;
+    } catch {
+      return null;
+    }
+  };
+  const [slack, plane, linear, github] = await Promise.all([
+    safe(runSlackIngestion({ teamId })),
+    safe(runPlaneIngestion({ teamId })),
+    safe(runLinearIngestion({ teamId })),
+    safe(runGithubIngestion({ teamId })),
+  ]);
+
+  const lines: string[] = [];
+  let created = 0;
+  let updated = 0;
+  let errors = 0;
+
+  const add = (label: string, s: RunCounts) => {
+    if (!s || !s.integrations) return; // source not configured for this team — omit
+    created += s.created;
+    updated += s.updated;
+    errors += s.errors.length;
+    const errNote = s.errors.length ? ` — ${s.errors.length} error${s.errors.length > 1 ? "s" : ""}` : "";
+    lines.push(`- **${label}**: +${s.created} new, ~${s.updated} updated${errNote}`);
+  };
+  add("Slack", slack);
+  add("Plane", plane);
+  add("Linear", linear);
+  add("GitHub", github);
+
+  let summary: string;
+  if (!lines.length) {
+    summary =
+      "No connectors are configured for this team yet, so there was nothing to scrape. " +
+      "An admin can add **Slack / Plane / Linear / GitHub** under **Admin → Integrations**.";
+  } else {
+    const head =
+      created || updated
+        ? "**Scrape complete** — pulled the latest from your connectors:"
+        : "**Scrape complete** — everything was already up to date:";
+    summary = `${head}\n\n${lines.join("\n")}`;
+  }
+
+  return { summary, created, updated, errors };
+}

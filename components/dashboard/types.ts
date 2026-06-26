@@ -1,14 +1,5 @@
 /** Shared shapes for the dashboard data widgets. */
 
-export interface ActivityItem {
-  id: string;
-  path: string;
-  kind: string;
-  actor: string;
-  synced_at: string;
-  projects: { slug: string } | null;
-}
-
 export interface CommitmentRow {
   id: string;
   entity_id: string;

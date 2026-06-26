@@ -9,13 +9,11 @@ import { parseRange } from "@/lib/metrics/range";
 import { AskBrain } from "@/components/dashboard/ask-brain";
 import { KpiBand } from "@/components/dashboard/kpi-band";
 import { RangeSelector } from "@/components/dashboard/range-selector";
-import { ActivityFeed } from "@/components/dashboard/activity-feed";
 import { CommitmentsCard } from "@/components/dashboard/commitments-card";
 import { DecisionsCard } from "@/components/dashboard/decisions-card";
 import { TasksByMember } from "@/components/dashboard/tasks-by-member";
 import { AgentsPlaceholder } from "@/components/dashboard/agents-placeholder";
 import type {
-  ActivityItem,
   CommitmentRow,
   DecisionRow,
   TaskRow,
@@ -120,18 +118,9 @@ export default async function TeamHome({
     );
   }
 
-  const [pulse, { data: activity }, { data: openTasks }, { data: commitments }, { data: decisions }] =
+  const [pulse, { data: openTasks }, { data: commitments }, { data: decisions }] =
     await Promise.all([
       getPulseMetrics(supabase, team.id, range, { isAdmin, memberId }),
-      visibleItems(
-        supabase
-          .from("items")
-          .select("id, path, kind, actor, synced_at, projects(slug)")
-          .eq("team_id", team.id)
-          .order("synced_at", { ascending: false })
-          .limit(12),
-        tier
-      ),
       supabase
         .from("tasks")
         .select("id, title, assignee, status")
@@ -175,14 +164,9 @@ export default async function TeamHome({
         <UsageChart data={pulse.usage} scope={isAdmin ? "team" : "your"} />
       </div>
 
-      <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
-        <div className="lg:col-span-2">
-          <ActivityFeed teamSlug={teamSlug} items={(activity ?? []) as unknown as ActivityItem[]} />
-        </div>
-        <div className="flex flex-col gap-6">
-          <CommitmentsCard commitments={(commitments ?? []) as CommitmentRow[]} />
-          <DecisionsCard teamSlug={teamSlug} decisions={(decisions ?? []) as DecisionRow[]} />
-        </div>
+      <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
+        <CommitmentsCard commitments={(commitments ?? []) as CommitmentRow[]} />
+        <DecisionsCard teamSlug={teamSlug} decisions={(decisions ?? []) as DecisionRow[]} />
       </div>
 
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
