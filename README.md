@@ -79,6 +79,8 @@ scaffolded spoke → idempotent re-push → materialization check → admin-tier
 - `POST /api/v1/items` — upsert synced content (Bearer key + `X-AIOS-Team`)
 - `GET  /api/v1/items?since=` — tier-filtered pull, keyset-paginated
 - `GET  /api/v1/tasks?since=` — dashboard task changes for `aios pull` writeback
+- `GET  /api/v1/members` — team roster + cross-tool identities (team-tier); filters `?email=` `?handle=` `?provider=`
+- `GET  /api/v1/identities/resolve?provider=slack&external_id=U…` — resolve an external id (or `?email=`/`?handle=`) to a member + their canonical contacts (team-tier; 404 on miss)
 - `POST /api/v1/query` — SSE: `delta` / `sources` / `done`
 - `POST /api/dashboard/query` — same pipeline, session-authenticated
 

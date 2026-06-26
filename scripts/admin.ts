@@ -16,6 +16,7 @@ import { issueLoginLink } from "@/lib/admin/login";
 import { renameTeam } from "@/lib/admin/teams";
 import { addAuthorAlias } from "@/lib/admin/aliases";
 import { linkGithub, listOrgMembers } from "@/lib/codebases/github";
+import { setMemberIdentity } from "@/lib/identity/member-identities";
 
 type Flags = Record<string, string | boolean>;
 
@@ -62,6 +63,8 @@ const USAGE = `Team Brain admin CLI — commands:
   rename-team <new-slug> [--name <display>] [--team <id|slug>]
   add-author-alias <member-email> <git-identity> [--team <id|slug>] [--force]
   link-github <member-email> <github-login> [--team <id|slug>] [--force]   # needs GITHUB_TOKEN env
+  link-identity <member-email> <provider> <external-id> [--handle <h>] [--email <e>] [--team <id|slug>] [--force]
+                                         # link a provider user id (e.g. slack U…) to a member
   sync-github --org <org> [--team <id|slug>]                               # list candidates (needs GITHUB_TOKEN)
   pg:schema                              # load postgres/schema.sql (idempotent)
 Defaults: --team demo (accepts a team UUID too). Requires DATABASE_URL (postgres). GitHub token via GITHUB_TOKEN env only.`;
@@ -199,6 +202,30 @@ async function main() {
       console.log(
         `✓ linked ${email} → @${r.login} (avatar set); ${r.aliases.length} aliases, backfilled ${r.backfilled}`
       );
+      break;
+    }
+    case "link-identity": {
+      const email = positionals[0] || die("usage: link-identity <member-email> <provider> <external-id>");
+      const provider = positionals[1] || die("usage: link-identity <member-email> <provider> <external-id>");
+      const externalId = positionals[2] || die("usage: link-identity <member-email> <provider> <external-id>");
+      const team = await resolveTeam(admin, teamSlug);
+      const memberId = (await memberIdByEmail(admin, team.id, email)) || die(`no member ${email}`);
+      const r = await setMemberIdentity(
+        admin,
+        team.id,
+        memberId,
+        {
+          provider,
+          externalId,
+          handle: (flags.handle as string) || undefined,
+          email: (flags.email as string) || undefined,
+        },
+        { force: Boolean(flags.force), actor: { kind: "system" } }
+      );
+      if (r.conflict) {
+        die(`${provider}:${externalId} is already linked to a different member${r.note ? ` (${r.note})` : ""}; pass --force to reassign`);
+      }
+      console.log(`✓ ${provider}:${externalId} → ${email} (${r.created ? "created" : r.updated ? "updated" : "unchanged"})`);
       break;
     }
     case "sync-github": {
