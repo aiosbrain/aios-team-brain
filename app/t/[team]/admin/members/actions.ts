@@ -6,7 +6,12 @@ import { adminClient } from "@/lib/supabase/admin";
 import { getSessionUser } from "@/lib/auth/session";
 import { resolveIntegrationsAdmin } from "@/lib/integrations/read";
 import { linkGithub } from "@/lib/codebases/github";
-import { setMemberIdentity } from "@/lib/identity/member-identities";
+import { setMemberIdentity, removeMemberIdentity } from "@/lib/identity/member-identities";
+import { addAuthorAlias, removeAuthorAlias } from "@/lib/admin/aliases";
+import { reattributeItems } from "@/lib/ingest/reattribute";
+
+// Providers whose identity is a stable user id in member_identities (GitHub uses its own login flow).
+const PROVIDERS = new Set(["slack", "linear", "plane"]);
 
 /**
  * Admin gate for member mutations: resolve the signed-in user to an `{teamId, memberId}` admin
@@ -49,32 +54,134 @@ export async function linkMemberGithub(
 }
 
 /**
- * Map a roster member to their Slack user id (admins only) — the manual path for when the Slack
- * connector lacks the `users:read.email` scope to auto-reconcile. Writes a `member_identities`
- * row (provider=slack), so future Slack ingestion attributes that user's threads to this member.
- * Admin-set, so it forces over any prior mapping.
+ * Map a roster member to a provider user id (admins only) — the manual path / correction when
+ * auto-reconciliation missed or mismapped (e.g. a person uses a different email on that platform).
+ * Writes a `member_identities` row so future ingestion attributes that provider's content to this
+ * member. Admin-set → forces over any prior mapping. Provider ∈ {slack, linear, plane} (GitHub has
+ * its own login flow via `linkMemberGithub`).
  */
+export async function linkMemberIdentity(
+  teamSlug: string,
+  memberId: string,
+  provider: string,
+  externalId: string,
+  handle?: string
+): Promise<{ ok: boolean; error?: string }> {
+  const ctx = await requireAdmin(teamSlug);
+  if (!ctx) return { ok: false, error: "admins only" };
+  const p = provider.trim().toLowerCase();
+  if (!PROVIDERS.has(p)) return { ok: false, error: `unsupported provider "${provider}"` };
+  const ext = externalId.trim();
+  if (!ext) return { ok: false, error: `${p} user id is required` };
+  try {
+    await setMemberIdentity(
+      adminClient(),
+      ctx.teamId,
+      memberId,
+      { provider: p, externalId: ext, handle: (handle ?? "").trim() },
+      { force: true, actor: { kind: "member", memberId: ctx.memberId } }
+    );
+    revalidatePath(`/t/${teamSlug}/admin/members`);
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "could not link identity" };
+  }
+}
+
+/** Back-compat wrapper for the Slack-specific call site. */
 export async function linkMemberSlack(
   teamSlug: string,
   memberId: string,
   slackUserId: string,
   handle?: string
 ): Promise<{ ok: boolean; error?: string }> {
+  return linkMemberIdentity(teamSlug, memberId, "slack", slackUserId, handle);
+}
+
+/** Remove a provider identity mapping (admins clearing/correcting a link). */
+export async function unlinkMemberIdentity(
+  teamSlug: string,
+  provider: string,
+  externalId: string
+): Promise<{ ok: boolean; error?: string }> {
   const ctx = await requireAdmin(teamSlug);
   if (!ctx) return { ok: false, error: "admins only" };
-  const externalId = slackUserId.trim();
-  if (!externalId) return { ok: false, error: "slack user id is required (e.g. U0123ABC)" };
   try {
-    await setMemberIdentity(
+    await removeMemberIdentity(
       adminClient(),
       ctx.teamId,
-      memberId,
-      { provider: "slack", externalId, handle: (handle ?? "").trim() },
-      { force: true, actor: { kind: "member", memberId: ctx.memberId } }
+      { provider: provider.trim().toLowerCase(), externalId: externalId.trim() },
+      { actor: { kind: "member", memberId: ctx.memberId } }
     );
     revalidatePath(`/t/${teamSlug}/admin/members`);
     return { ok: true };
   } catch (e) {
-    return { ok: false, error: e instanceof Error ? e.message : "could not link slack" };
+    return { ok: false, error: e instanceof Error ? e.message : "could not unlink identity" };
+  }
+}
+
+/**
+ * Add an email alias to a member (admins only) — the fix for "different email on a platform": once
+ * the alternate email is an alias, every connector keying on it reconciles to this person. Reuses
+ * `addAuthorAlias`, which also back-fills existing git contributions. `force` re-points an alias
+ * currently on another member.
+ */
+export async function addMemberEmail(
+  teamSlug: string,
+  memberId: string,
+  email: string,
+  force?: boolean
+): Promise<{ ok: boolean; error?: string; note?: string }> {
+  const ctx = await requireAdmin(teamSlug);
+  if (!ctx) return { ok: false, error: "admins only" };
+  const e = email.trim();
+  if (!e || !e.includes("@")) return { ok: false, error: "a valid email is required" };
+  try {
+    const res = await addAuthorAlias(adminClient(), ctx.teamId, memberId, e, {
+      force,
+      actor: { kind: "member", memberId: ctx.memberId },
+    });
+    revalidatePath(`/t/${teamSlug}/admin/members`);
+    if (res.collisions && !force) return { ok: false, error: res.note };
+    return { ok: true, note: res.note };
+  } catch (e2) {
+    return { ok: false, error: e2 instanceof Error ? e2.message : "could not add email" };
+  }
+}
+
+/**
+ * Re-attribute existing content to the CURRENT identity mappings (admins only). Run this after
+ * linking/correcting identities so already-ingested items (which were attributed at ingest time)
+ * pick up the new mapping. Conservative — never un-attributes. See `lib/ingest/reattribute`.
+ */
+export async function reattributeIdentitiesNow(
+  teamSlug: string
+): Promise<{ ok: boolean; error?: string; message?: string }> {
+  const ctx = await requireAdmin(teamSlug);
+  if (!ctx) return { ok: false, error: "admins only" };
+  try {
+    const s = await reattributeItems(adminClient(), ctx.teamId);
+    revalidatePath(`/t/${teamSlug}/admin/members`);
+    return { ok: true, message: `Re-attributed ${s.updated} of ${s.scanned} item(s) to current identity mappings.` };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "re-attribution failed" };
+  }
+}
+
+/** Remove an email alias from a member (admins only). */
+export async function removeMemberEmail(
+  teamSlug: string,
+  email: string
+): Promise<{ ok: boolean; error?: string }> {
+  const ctx = await requireAdmin(teamSlug);
+  if (!ctx) return { ok: false, error: "admins only" };
+  try {
+    await removeAuthorAlias(adminClient(), ctx.teamId, email, {
+      actor: { kind: "member", memberId: ctx.memberId },
+    });
+    revalidatePath(`/t/${teamSlug}/admin/members`);
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "could not remove email" };
   }
 }
