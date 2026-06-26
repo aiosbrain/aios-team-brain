@@ -1,7 +1,7 @@
 import { serverClient } from "@/lib/supabase/server";
 import { InviteMember } from "@/components/admin/invite-member";
-import { MemberGithubLink } from "@/components/admin/member-github-link";
-import { MemberSlackLink } from "@/components/admin/member-slack-link";
+import { MemberIdentities, type ProviderLink } from "@/components/admin/member-identities";
+import { listMemberIdentities } from "@/lib/identity/list";
 
 export default async function MembersAdminPage({
   params,
@@ -24,25 +24,20 @@ export default async function MembersAdminPage({
     .eq("team_id", team.id)
     .order("created_at");
 
-  // Slack identities (member_identities, provider=slack) → memberId → {externalId, handle}
-  const { data: slackIds } = await supabase
-    .from("member_identities")
-    .select("member_id, external_id, handle")
-    .eq("team_id", team.id)
-    .eq("provider", "slack");
-  const slackByMember = new Map(
-    (slackIds ?? []).map((s) => [
-      (s as { member_id: string }).member_id,
-      s as { external_id: string; handle: string },
-    ])
-  );
+  // All linked identities (email aliases + slack/linear/plane provider ids) for the panel.
+  const identities = await listMemberIdentities(supabase, team.id);
+  const providerOf = (memberId: string, provider: string): ProviderLink | null => {
+    const p = identities.get(memberId)?.providers.find((x) => x.provider === provider);
+    return p ? { externalId: p.externalId, handle: p.handle } : null;
+  };
 
   return (
     <div className="flex flex-col gap-4">
       <div className="flex items-center justify-between">
         <p className="text-sm text-ink-secondary">
-          {(members ?? []).length} member(s). Actor handles must match the <code>actor</code> each
-          person&apos;s <code>aios</code> CLI resolves — that&apos;s how pushes get attributed.
+          {(members ?? []).length} member(s). The <strong>Identities</strong> column shows every
+          platform we&apos;ve linked this person to — expand it to add an alternate email or correct a
+          link.
         </p>
         <InviteMember teamSlug={teamSlug} />
       </div>
@@ -56,13 +51,12 @@ export default async function MembersAdminPage({
               <th className="px-4 py-3">Role</th>
               <th className="px-4 py-3">Tier</th>
               <th className="px-4 py-3">Status</th>
-              <th className="px-4 py-3">GitHub</th>
-              <th className="px-4 py-3">Slack</th>
+              <th className="px-4 py-3">Identities</th>
             </tr>
           </thead>
           <tbody>
             {(members ?? []).map((m) => (
-              <tr key={m.id} className="border-b border-border-subtle last:border-0">
+              <tr key={m.id} className="border-b border-border-subtle last:border-0 align-top">
                 <td className="px-4 py-3 font-medium text-ink">{m.display_name}</td>
                 <td className="px-4 py-3 text-ink-secondary">{m.email}</td>
                 <td className="px-4 py-3 font-mono text-xs text-ink-secondary">{m.actor_handle}</td>
@@ -78,19 +72,15 @@ export default async function MembersAdminPage({
                   </span>
                 </td>
                 <td className="px-4 py-3">
-                  <MemberGithubLink
+                  <MemberIdentities
                     teamSlug={teamSlug}
                     memberId={m.id}
-                    githubLogin={m.github_login ?? null}
-                    avatarUrl={m.avatar_url ?? null}
-                  />
-                </td>
-                <td className="px-4 py-3">
-                  <MemberSlackLink
-                    teamSlug={teamSlug}
-                    memberId={m.id}
-                    slackUserId={slackByMember.get(m.id)?.external_id ?? null}
-                    slackHandle={slackByMember.get(m.id)?.handle ?? null}
+                    rosterEmail={m.email}
+                    github={m.github_login ? { login: m.github_login, avatarUrl: m.avatar_url ?? null } : null}
+                    emails={identities.get(m.id)?.emails ?? []}
+                    slack={providerOf(m.id, "slack")}
+                    linear={providerOf(m.id, "linear")}
+                    plane={providerOf(m.id, "plane")}
                   />
                 </td>
               </tr>
