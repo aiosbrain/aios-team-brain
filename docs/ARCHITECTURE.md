@@ -143,6 +143,11 @@ sequenceDiagram
   LLM-->>U: SSE delta* then sources then done(usage)
 ```
 
+> **Retrieval recall is benchmarked.** `test/datamechanics/retrieval-eval.datamechanics.test.ts` is a
+> deterministic eval: a fixed corpus + question→expected-source cases scoring recall@sources through the
+> real `retrieve()`. It pins the current keyword-FTS floor (6/9; the 3 misses are paraphrase/"semantic"
+> gaps) so retrieval upgrades (semantic/hybrid) are *provable* and regressions fail CI.
+
 ### Ingestion sidecar pipeline
 
 ```mermaid
