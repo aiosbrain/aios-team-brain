@@ -217,6 +217,8 @@ export function normalizePlaneDocs(input: NormalizePlaneInput): ItemPayload[] {
           plane_id: it.id,
           workspace: input.workspaceSlug,
           project_id: input.projectId,
+          // First assignee's Plane member id → resolved to a person at ingest (lib/ingest/run).
+          assignee_id: (it.assignees ?? [])[0] ?? "",
         },
         body,
       };

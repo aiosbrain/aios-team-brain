@@ -20,6 +20,8 @@ export interface FetchedPlaneProject {
   states: PlaneState[];
   labels: { id: string; name: string }[];
   members: Record<string, string>;
+  /** Member details (incl. email when available) for identity reconciliation. */
+  memberDetails: PlaneMemberDetail[];
   moduleByItem: Record<string, string>;
   cycleByItem: Record<string, string>;
 }
@@ -38,8 +40,17 @@ async function fetchIdentifier(conn: PlaneConnection): Promise<string | undefine
   }
 }
 
-/** Workspace member id → display name. Best-effort (needs member-read scope). */
-async function fetchMembers(conn: PlaneConnection): Promise<Record<string, string>> {
+export interface PlaneMemberDetail {
+  id: string;
+  displayName: string;
+  email?: string;
+}
+
+/** Workspace members → { id→name map (for the task table), detail list (for identity sync) }.
+ *  Best-effort (needs member-read scope); email is present when the API returns it. */
+async function fetchMembers(
+  conn: PlaneConnection
+): Promise<{ names: Record<string, string>; details: PlaneMemberDetail[] }> {
   try {
     const rows = (await planeApi(
       conn,
@@ -49,7 +60,8 @@ async function fetchMembers(conn: PlaneConnection): Promise<Record<string, strin
     const list = Array.isArray(rows)
       ? rows
       : (rows as { results?: unknown[] })?.results ?? [];
-    const map: Record<string, string> = {};
+    const names: Record<string, string> = {};
+    const details: PlaneMemberDetail[] = [];
     for (const m of list as {
       member?: string;
       id?: string;
@@ -65,11 +77,12 @@ async function fetchMembers(conn: PlaneConnection): Promise<Record<string, strin
         [m.first_name, m.last_name].filter(Boolean).join(" ").trim() ||
         m.email ||
         id;
-      map[id] = name;
+      names[id] = name;
+      details.push({ id, displayName: name, email: m.email });
     }
-    return map;
+    return { names, details };
   } catch {
-    return {};
+    return { names: {}, details: [] };
   }
 }
 
@@ -126,7 +139,7 @@ async function fetchCycleByItem(conn: PlaneConnection): Promise<Record<string, s
 }
 
 export async function fetchPlaneProject(conn: PlaneConnection): Promise<FetchedPlaneProject> {
-  const [items, states, labels, identifier, members, moduleByItem, cycleByItem] = await Promise.all([
+  const [items, states, labels, identifier, memberInfo, moduleByItem, cycleByItem] = await Promise.all([
     fetchAllPaged(conn, "/work-items/") as Promise<PlaneWorkItemRaw[]>,
     fetchAllPaged(conn, "/states/") as Promise<PlaneState[]>,
     fetchAllPaged(conn, "/labels/") as Promise<{ id: string; name: string }[]>,
@@ -143,7 +156,8 @@ export async function fetchPlaneProject(conn: PlaneConnection): Promise<FetchedP
     items,
     states,
     labels,
-    members,
+    members: memberInfo.names,
+    memberDetails: memberInfo.details,
     moduleByItem,
     cycleByItem,
   };
