@@ -138,6 +138,66 @@ create table if not exists member_identities (
 );
 create index if not exists member_identities_member_idx on member_identities (member_id);
 
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Identity CONTEXT layer — per-member curated context on top of the lean roster.
+-- These are MANUAL fields (a self-service profile + admin edit), distinct from the
+-- machine-reconciled identity tables above (member_emails / member_identities which
+-- map authors→member). Written ONLY by `lib/identity/profile.ts` (the audited single
+-- writer, guarded by test/guards/single-writer-profile.test.ts); read by getMemberContext.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- One row per member (member_id is the PK → 1:1, upsert-on-member_id): scheduling +
+-- contact preferences + free-form bio. `working_hours` is a per-weekday map
+-- { mon: ["09:00","17:00"], ... }; `preferred_channels` is an ORDERED contact preference list.
+create table if not exists member_profiles (
+  member_id uuid primary key references members(id) on delete cascade,
+  team_id uuid not null references teams(id) on delete cascade,
+  timezone text not null default '',
+  working_hours jsonb not null default '{}'::jsonb,
+  preferred_channels text[] not null default '{}',
+  location text not null default '',
+  bio text not null default '',
+  updated_at timestamptz not null default now(),
+  updated_by uuid references members(id) on delete set null
+);
+create index if not exists member_profiles_team_idx on member_profiles (team_id);
+
+-- Time-off date ranges (PTO / holiday / sick / other). Many rows per member.
+create table if not exists member_time_off (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  member_id uuid not null references members(id) on delete cascade,
+  starts_on date not null,
+  ends_on date not null,
+  kind text not null default 'pto',
+  note text not null default '',
+  created_at timestamptz not null default now(),
+  check (ends_on >= starts_on)
+);
+create index if not exists member_time_off_member_idx on member_time_off (member_id);
+
+-- OKRs / goals. `source` is tagged so a future JIRA/Plane-initiative importer backfills the
+-- SAME table with no schema change; the partial unique index dedups only imported rows
+-- (source <> 'manual' with a non-empty external_id) so manual goals are never blocked by it.
+create table if not exists member_goals (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  member_id uuid not null references members(id) on delete cascade,
+  kind text not null default 'goal',
+  title text not null,
+  detail text not null default '',
+  status text not null default 'on_track',
+  target_date date,
+  source text not null default 'manual',
+  external_id text not null default '',
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+create index if not exists member_goals_member_idx on member_goals (member_id);
+create unique index if not exists member_goals_source_ext_unq
+  on member_goals (team_id, source, external_id)
+  where source <> 'manual' and external_id <> '';
+
 create table if not exists api_keys (
   id uuid primary key default gen_random_uuid(),
   team_id uuid not null references teams(id) on delete cascade,
