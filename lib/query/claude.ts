@@ -32,6 +32,18 @@ Rules:
 - Decisions marked [SUPERSEDED] are no longer valid — say so if relevant.
 - Never speculate about content above the caller's access tier; what you were given is what they may see.`;
 
+/**
+ * "Stay quiet" (Organ 3): when retrieval found no query-specific match (`grounded === false`), the
+ * sources are just recent items as background, not a real hit. We surface that explicitly so the
+ * model abstains instead of confabulating a connection. Soft — it still lets a clearly-relevant
+ * structured digest answer; it just removes the false confidence of "documents were retrieved".
+ */
+export function groundingNote(grounded: boolean): string {
+  return grounded
+    ? ""
+    : "[Retrieval note] No documents specifically matched this question — the sources below are recent items included only as background. If neither they nor the structured context clearly contain the answer, say you don't have that information rather than guessing.\n\n";
+}
+
 export type QueryUsage = {
   input_tokens: number;
   output_tokens: number;
@@ -64,9 +76,11 @@ export async function* streamAnswer(
     )
     .join("\n\n");
 
+  const note = groundingNote(ctx.grounded);
+
   // Local OpenAI-compatible backend (Ollama/Hermes) — fully on-machine, $0.
   if (LLM_BASE_URL) {
-    yield* streamLocal(ctx.structured, sourcesBlock, question, keys.openaiKey);
+    yield* streamLocal(note, ctx.structured, sourcesBlock, question, keys.openaiKey);
     return;
   }
 
@@ -88,6 +102,7 @@ export async function* streamAnswer(
       {
         role: "user",
         content: [
+          ...(note ? [{ type: "text" as const, text: note }] : []),
           { type: "text", text: `<structured_context>\n${ctx.structured}\n</structured_context>` },
           { type: "text", text: sourcesBlock || "<no document sources matched>" },
           { type: "text", text: `Question: ${question}` },
@@ -126,6 +141,7 @@ export async function* streamAnswer(
  * clean even when LLM_MODEL points at a reasoning model.
  */
 async function* streamLocal(
+  note: string,
   structured: string,
   sourcesBlock: string,
   question: string,
@@ -135,6 +151,7 @@ async function* streamLocal(
   | { type: "done"; usage: QueryUsage }
 > {
   const userContent =
+    note +
     `<structured_context>\n${structured}\n</structured_context>\n\n` +
     `${sourcesBlock || "<no document sources matched>"}\n\n` +
     `Question: ${question}`;

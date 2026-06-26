@@ -16,6 +16,8 @@ export type Source = {
 export type RetrievedContext = {
   sources: Source[];
   structured: string; // decisions/tasks/graph digest (always included)
+  /** True when query-specific search (FTS/semantic) matched something; false = only recency padding. */
+  grounded: boolean;
 };
 
 const MAX_SOURCE_CHARS = 8_000;
@@ -448,6 +450,11 @@ export async function retrieve(
     });
   }
 
+  // Grounding signal (stay-quiet): did query-specific SEARCH match anything, or are the sources just
+  // recency padding? FTS/semantic hits = real grounding; if both are empty the answer layer is told
+  // retrieval found no strong match so it abstains instead of confabulating from recent items.
+  let grounded = (ftsHits?.length ?? 0) > 0;
+
   // 2c. Semantic expansion via Graphiti (the graph search ran in parallel above). Use the facts'
   // entity/relationship terms to expand the FTS and surface items the literal keyword search missed.
   // No-op when Graphiti is unconfigured / returned nothing → pure keyword behavior, no regression.
@@ -462,6 +469,7 @@ export async function retrieve(
       .limit(10);
     if (tier === "external") semB = semB.eq("access", "external");
     const { data: semHits } = await semB;
+    if ((semHits?.length ?? 0) > 0) grounded = true;
     for (const hit of (semHits ?? []) as { id: string; path: string; kind: string; body: string; synced_at: string; projects: unknown }[]) {
       if (seen.has(hit.id)) continue;
       seen.add(hit.id);
@@ -524,5 +532,5 @@ export async function retrieve(
   // RERANK_URL is unset; reorders so the most relevant source is cited first.
   const ranked = await rerankSources(question, sources);
 
-  return { sources: ranked, structured: structuredWithGraph };
+  return { sources: ranked, structured: structuredWithGraph, grounded };
 }
