@@ -16,6 +16,8 @@ export type Source = {
 export type RetrievedContext = {
   sources: Source[];
   structured: string; // decisions/tasks/graph digest (always included)
+  /** True when query-specific search (FTS/semantic) matched something; false = only recency padding. */
+  grounded: boolean;
 };
 
 const MAX_SOURCE_CHARS = 8_000;
@@ -166,6 +168,44 @@ export function toOrQuery(question: string): string {
   return unique.length ? unique.join(" or ") : question;
 }
 
+const MAX_EXPANSION_TERMS = 24;
+
+/**
+ * SEMANTIC EXPANSION via Graphiti. The graph's hybrid search returns the *facts* (entities +
+ * relationships) relevant to a question even when it's phrased with no surface-term overlap. We
+ * harvest the salient words from those facts (entity names + fact text) into extra FTS OR-terms, so
+ * a second keyword pass can reach the *source items* a literal search missed (paraphrase/synonym
+ * recall — Graphiti's `/search` returns facts, not item ids, so query-expansion is how we surface
+ * items). Pure + unit-tested; returns "" when there are no facts (→ keyword-only, no behavior change).
+ */
+export function graphExpansionQuery(facts: GraphFact[]): string {
+  const terms = new Set<string>();
+  const add = (s: string | undefined | null) => {
+    for (const w of (s ?? "").toLowerCase().match(/[a-z0-9][a-z0-9'-]*/g) ?? []) {
+      if (w.length >= 3 && !FTS_STOP.has(w)) terms.add(w);
+    }
+  };
+  for (const f of facts) {
+    add(f.source_node_name);
+    add(f.target_node_name);
+    add(f.fact);
+    if (terms.size >= MAX_EXPANSION_TERMS) break;
+  }
+  return [...terms].slice(0, MAX_EXPANSION_TERMS).join(" or ");
+}
+
+// Activity-intent detector for context shaping. The git + per-person activity digests are the
+// heaviest always-on context blocks (two extra scans + tokens). We only compute/include them when
+// the question is actually about who's doing what — biased INCLUSIVE (a false positive just restores
+// the old always-on behavior; a false negative would drop relevant context, so we'd rather over-include).
+const ACTIVITY_INTENT =
+  /\b(who|whose|doing|working|worked|activity|active|busy|contribut\w*|commit\w*|posting|posted|assigned|assignee|standup|workload|lately|recently)\b|\bup to\b|\bthis (week|sprint|month)\b/i;
+
+/** True when a query is about people/activity (→ include the git + people-activity digests). */
+export function wantsActivityContext(question: string): boolean {
+  return ACTIVITY_INTENT.test(question);
+}
+
 /**
  * Per-contributor git-activity digest from `code_contributions` (the scan aggregates). This is the
  * ONLY place the query pipeline surfaces git history — without it, "what is John doing in git" has
@@ -300,8 +340,10 @@ export async function retrieve(
   // Kick off the Graphiti graph-memory search concurrently with Postgres retrieval.
   const graphFactsP = fetchGraphFacts(supabase, teamId, tier, question);
   // Git-activity + per-person activity digests (team tier only — internal) run in parallel too.
-  const gitDigestP = tier === "team" ? gitActivityDigest(supabase, teamId) : Promise.resolve("");
-  const peopleDigestP = tier === "team" ? peopleActivityDigest(supabase, teamId) : Promise.resolve("");
+  // Context shaping: the activity digests are heavy + only relevant to "who's doing what" questions.
+  const wantsActivity = tier === "team" && wantsActivityContext(question);
+  const gitDigestP = wantsActivity ? gitActivityDigest(supabase, teamId) : Promise.resolve("");
+  const peopleDigestP = wantsActivity ? peopleActivityDigest(supabase, teamId) : Promise.resolve("");
 
   // All independent retrieval queries run in PARALLEL (was sequential → ~7 serial round-trips).
   // 1. Recall-friendly FTS over items (OR of significant terms; see toOrQuery).
@@ -422,6 +464,38 @@ export async function retrieve(
     });
   }
 
+  // Grounding signal (stay-quiet): did query-specific SEARCH match anything, or are the sources just
+  // recency padding? FTS/semantic hits = real grounding; if both are empty the answer layer is told
+  // retrieval found no strong match so it abstains instead of confabulating from recent items.
+  let grounded = (ftsHits?.length ?? 0) > 0;
+
+  // 2c. Semantic expansion via Graphiti (the graph search ran in parallel above). Use the facts'
+  // entity/relationship terms to expand the FTS and surface items the literal keyword search missed.
+  // No-op when Graphiti is unconfigured / returned nothing → pure keyword behavior, no regression.
+  const graphFacts = await graphFactsP;
+  const expansion = graphExpansionQuery(graphFacts);
+  if (expansion) {
+    let semB = supabase
+      .from("items")
+      .select("id, path, kind, body, synced_at, projects(slug)")
+      .eq("team_id", teamId)
+      .textSearch("search", expansion, { type: "websearch", config: "english" })
+      .limit(10);
+    if (tier === "external") semB = semB.eq("access", "external");
+    const { data: semHits } = await semB;
+    if ((semHits?.length ?? 0) > 0) grounded = true;
+    for (const hit of (semHits ?? []) as { id: string; path: string; kind: string; body: string; synced_at: string; projects: unknown }[]) {
+      if (seen.has(hit.id)) continue;
+      seen.add(hit.id);
+      const slug = (hit.projects as { slug: string })?.slug ?? "";
+      if (projectSlug && slug !== projectSlug) continue;
+      const text = (hit.body || "").slice(0, MAX_SOURCE_CHARS);
+      if (total + text.length > MAX_TOTAL_CHARS) break;
+      total += text.length;
+      sources.push({ sid: `S${n++}`, item_id: hit.id, project: slug, path: hit.path, kind: hit.kind, synced_at: hit.synced_at, text });
+    }
+  }
+
   // 3. Structured context (compact, always included) — built from the parallel results above.
   const [gitDigest, peopleDigest] = await Promise.all([gitDigestP, peopleDigestP]);
   const structured = [
@@ -454,8 +528,8 @@ export async function retrieve(
     peopleDigest,
   ].join("\n");
 
-  // 3b. Blend in Graphiti temporal facts (graph memory over all ingestions), if any.
-  const graphFacts = await graphFactsP;
+  // 3b. Blend in Graphiti temporal facts (graph memory over all ingestions), if any. (`graphFacts`
+  // was awaited above for the semantic expansion.)
   const structuredWithGraph = graphFacts.length
     ? structured +
       "\n\n" +
@@ -472,5 +546,5 @@ export async function retrieve(
   // RERANK_URL is unset; reorders so the most relevant source is cited first.
   const ranked = await rerankSources(question, sources);
 
-  return { sources: ranked, structured: structuredWithGraph };
+  return { sources: ranked, structured: structuredWithGraph, grounded };
 }

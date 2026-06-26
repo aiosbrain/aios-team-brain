@@ -25,8 +25,8 @@ Reason from this table, not from a random call site.
 | Primary PM provider | `teams.primary_pm_provider` | Admin → Integrations (`setPrimaryPmProvider`, admin-gated + audited) | `lib/pm-sync` projection | the single PM tool the brain projects into; null = projection no-ops / sole-enabled fallback |
 | Work events | `work_events` | `POST /api/v1/work-events` → `lib/work-events` | Admin → PM sync health | team-tier only; unresolved events are preserved for reconciliation |
 | Decisions | `decisions` | `lib/ingest` (sync rows) + `app/actions/decisions.ts` (UI; `source_item_id` NULL) | dashboard, `/api/v1/decisions` | team-scoped; UI rows (`source_item_id` NULL) never diff-deleted; writeback tier-scoped by `audience` |
-| Policy rules | `policies` | admin (role-gated) | `lib/policy.authorize` | role-gated (admin/lead) |
-| Approvals | `approval_requests` | `lib/policy.fileApprovalRequest`, `lib/actions.resolveApproval` | dashboard | role-gated decide |
+| Policy rules | `policies` | **`lib/policy/manage` only** (validated + audited) via the **Admin → Policies** editor (`savePolicy`/`togglePolicy`/`removePolicy`, admin-gated) | `lib/policy.authorize` (enabled-only) + the editor (`listAllPolicies`, incl. disabled) | admin-gated (the whole `/admin` area is) |
+| Approvals | `approval_requests` | `lib/policy.fileApprovalRequest` (queue) + `lib/actions.resolveApproval` (decide) — decided from the **Admin → Approvals** queue (`decideApproval`, admin-gated; approve resumes the action with the E2B sandbox) | Admin → Approvals page | admin-gated decide; audited |
 | Actions | `actions` | **`lib/actions.runAction` only** (service role) | dashboard | team-scoped |
 | Audit | `audit_log` | `lib/api/audit` (append-only, trigger-backed) | admin | append-only; admin read |
 | Identity | `teams`, `members`, `api_keys` | admin UI / seed / `lib/admin/*` (CLI: create/disable/delete members, rename teams, issue/revoke keys) | `lib/auth`, guards | role-gated; `key_hash` column-revoked; member disable/delete + team rename are audited (`member.disabled`/`member.deleted`/`team.renamed`); delete refuses the last active admin |
@@ -136,12 +136,21 @@ sequenceDiagram
   participant LLM as Claude
   U->>Q: {question, project?}
   Q->>Q: auth · cost guard (per-member/day, per-team $/day in query_log)
-  Q->>RET: tier-filtered FTS top-12 + recent + structured digest (incl. per-contributor git activity + per-person cross-tool activity, team tier)
+  Q->>RET: tier-filtered FTS top-12 + recent + Graphiti semantic expansion + structured digest (git + per-person activity digests included only for activity questions — context shaping)
   RET-->>Q: {sources[], structured}
-  Q->>CL: streamAnswer(ctx, question)
+  Q->>CL: streamAnswer(ctx, question)  %% ctx.grounded=false (no FTS/semantic match) → abstain note (stay-quiet)
   CL->>LLM: cached system + numbered sources + question
   LLM-->>U: SSE delta* then sources then done(usage)
 ```
+
+> **Retrieval recall is benchmarked.** `test/datamechanics/retrieval-eval.datamechanics.test.ts` is a
+> deterministic eval: a fixed corpus + question→expected-source cases scoring recall@sources through the
+> real `retrieve()`. It pins the keyword-FTS floor (6/9; 3 paraphrase/"semantic" gaps) so retrieval
+> upgrades are *provable* and regressions fail CI. **Semantic expansion** (`graphExpansionQuery`): when
+> Graphiti is configured, its hybrid search returns the relevant entities/facts for a question; those
+> terms expand a second FTS pass to surface items a literal search missed. The live eval
+> (`retrieval-semantic.datamechanics.test.ts`, self-skips unless `GRAPHITI_URL` is set) proves it
+> closes all 3 gaps (6/9 → 9/9 on the gap set).
 
 ### Ingestion sidecar pipeline
 

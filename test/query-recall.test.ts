@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { toOrQuery } from "@/lib/query/retrieve";
+import { toOrQuery, graphExpansionQuery, wantsActivityContext } from "@/lib/query/retrieve";
+import type { GraphFact } from "@/lib/graph/graphiti-client";
 
 // Spec for the FTS recall fix: the AI query box failed "what has john ellison been posting to slack?"
 // because websearch AND-semantics required EVERY term in the body. toOrQuery drops question/stopwords
@@ -18,5 +19,47 @@ describe("toOrQuery (FTS recall)", () => {
 
   it("falls back to the raw question when nothing significant remains", () => {
     expect(toOrQuery("what is it?")).toBe("what is it?");
+  });
+});
+
+// Spec: Graphiti facts → FTS expansion terms. A paraphrased question ("how do users sign in?") has
+// no overlap with the auth doc, but the graph's facts name the real entities ("magic links",
+// "passwordless authentication"); harvesting those lets a second FTS pass reach the source item.
+describe("graphExpansionQuery (semantic expansion)", () => {
+  const facts: GraphFact[] = [
+    { fact: "Authentication uses passwordless magic links", source_node_name: "Authentication", target_node_name: "Magic Links" },
+    { fact: "The legacy password flow was removed" },
+  ];
+
+  it("harvests entity names + fact terms into an OR query (lowercased, stopwords/short dropped)", () => {
+    const q = graphExpansionQuery(facts);
+    for (const t of ["authentication", "passwordless", "magic", "links", "legacy", "password", "flow"]) {
+      expect(q.split(" or ")).toContain(t);
+    }
+    expect(q.split(" or ")).not.toContain("the"); // stopword dropped (as a standalone term)
+  });
+
+  it("returns '' for no facts (→ keyword-only, no behavior change)", () => {
+    expect(graphExpansionQuery([])).toBe("");
+  });
+
+  it("caps the number of expansion terms", () => {
+    const many: GraphFact[] = Array.from({ length: 50 }, (_, i) => ({ fact: `alpha${i} beta${i} gamma${i} delta${i}` }));
+    expect(graphExpansionQuery(many).split(" or ").length).toBeLessThanOrEqual(24);
+  });
+});
+
+// Spec: context shaping — the heavy activity digests are only included for "who's doing what"
+// questions. Biased inclusive (false positives just restore old behavior).
+describe("wantsActivityContext (context shaping)", () => {
+  it("true for activity/person questions", () => {
+    for (const q of ["what is John working on?", "who has been posting to slack?", "what has Priya been up to?", "show recent commits", "team workload this sprint"]) {
+      expect(wantsActivityContext(q), q).toBe(true);
+    }
+  });
+  it("false for non-activity questions", () => {
+    for (const q of ["what did we decide about auth?", "show me the Q3 roadmap", "how does login work?", "what is the SSRF fix?"]) {
+      expect(wantsActivityContext(q), q).toBe(false);
+    }
   });
 });
