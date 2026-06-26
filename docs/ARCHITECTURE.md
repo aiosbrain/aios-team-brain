@@ -136,7 +136,7 @@ sequenceDiagram
   participant LLM as Claude
   U->>Q: {question, project?}
   Q->>Q: auth · cost guard (per-member/day, per-team $/day in query_log)
-  Q->>RET: tier-filtered FTS top-12 + recent + structured digest (incl. per-contributor git activity, team tier)
+  Q->>RET: tier-filtered FTS top-12 + recent + structured digest (incl. per-contributor git activity + per-person cross-tool activity, team tier)
   RET-->>Q: {sources[], structured}
   Q->>CL: streamAnswer(ctx, question)
   CL->>LLM: cached system + numbered sources + question

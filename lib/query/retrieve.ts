@@ -21,6 +21,7 @@ export type RetrievedContext = {
 const MAX_SOURCE_CHARS = 8_000;
 const MAX_TOTAL_CHARS = 160_000; // ~40k tokens context cap
 const GIT_WINDOW_DAYS = 90; // recency window for the per-contributor git-activity digest
+const PEOPLE_WINDOW_DAYS = 90; // recency window for the per-person cross-tool activity digest
 
 // Optional external retrieval augmentation (e.g. a local GBrain adapter or a
 // cloud retrieval service). Vendor-neutral HTTP contract:
@@ -219,6 +220,71 @@ async function gitActivityDigest(supabase: SupabaseClient, teamId: string): Prom
 }
 
 /**
+ * Per-person cross-tool activity digest from attributed `items` — the payoff of the identity work:
+ * once Slack threads / Linear+Plane issues / docs carry the author's `member_id`, "what is each
+ * person doing" is answerable beyond git. Counts each person's recent items by source (Slack/PM/docs),
+ * EXCLUDING `git` (the git digest above covers code) and connector members (their `@connector.local`
+ * email). **team-tier only** — internal activity, never shown to an external viewer. Returns "" when
+ * there's nothing attributed.
+ */
+async function peopleActivityDigest(supabase: SupabaseClient, teamId: string): Promise<string> {
+  const since = new Date(Date.now() - PEOPLE_WINDOW_DAYS * 86_400_000).toISOString();
+  const { data: items } = await supabase
+    .from("items")
+    .select("member_id, kind, frontmatter, synced_at")
+    .eq("team_id", teamId)
+    .gte("synced_at", since)
+    .order("synced_at", { ascending: false })
+    .limit(5000);
+  if (!items?.length) return "";
+
+  const { data: members } = await supabase
+    .from("members")
+    .select("id, display_name, email")
+    .eq("team_id", teamId);
+  const memById = new Map(
+    (members ?? []).map((m) => {
+      const r = m as { id: string; display_name: string; email: string };
+      return [r.id, { name: r.display_name, email: r.email }];
+    })
+  );
+  // Connector members (slack-sync@connector.local, …) author the unattributed remainder — skip them.
+  const isConnector = (id: string) => (memById.get(id)?.email ?? "").endsWith("@connector.local");
+
+  type Agg = { name: string; email: string; bySource: Map<string, number>; last: string };
+  const byPerson = new Map<string, Agg>();
+  for (const it of items as {
+    member_id: string | null;
+    kind: string | null;
+    frontmatter: Record<string, unknown> | null;
+    synced_at: string | Date;
+  }[]) {
+    if (!it.member_id || isConnector(it.member_id)) continue;
+    const fm = it.frontmatter ?? {};
+    const source = typeof fm.source === "string" && fm.source ? fm.source : it.kind ?? "item";
+    if (source === "git") continue; // code activity has its own section
+    // synced_at comes back as a Date on the pg adapter; normalize to an ISO string.
+    const ts = typeof it.synced_at === "string" ? it.synced_at : new Date(it.synced_at).toISOString();
+    const m = memById.get(it.member_id);
+    const a = byPerson.get(it.member_id) ?? { name: m?.name ?? "unknown", email: m?.email ?? "", bySource: new Map(), last: "" };
+    a.bySource.set(source, (a.bySource.get(source) ?? 0) + 1);
+    if (ts > a.last) a.last = ts;
+    byPerson.set(it.member_id, a);
+  }
+  if (byPerson.size === 0) return "";
+
+  const total = (a: Agg) => [...a.bySource.values()].reduce((x, y) => x + y, 0);
+  const lines = [...byPerson.values()]
+    .sort((a, b) => total(b) - total(a))
+    .slice(0, 15)
+    .map((p) => {
+      const parts = [...p.bySource.entries()].sort((a, b) => b[1] - a[1]).map(([s, n]) => `${n} ${s}`);
+      return `- ${p.name}${p.email ? ` (${p.email})` : ""}: ${parts.join(", ")}; last active ${p.last.slice(0, 10)}`;
+    });
+  return ["", `## Activity by person (Slack/issues/docs, last ${PEOPLE_WINDOW_DAYS}d)`, ...lines].join("\n");
+}
+
+/**
  * Tier-filtered retrieval: recall-friendly FTS + always-include structured context
  * (recent decisions, open/blocked tasks, projects, compact graph digest, Graphiti temporal facts,
  * + a per-contributor git-activity digest on the team tier) + recently synced items. All independent
@@ -233,8 +299,9 @@ export async function retrieve(
 ): Promise<RetrievedContext> {
   // Kick off the Graphiti graph-memory search concurrently with Postgres retrieval.
   const graphFactsP = fetchGraphFacts(supabase, teamId, tier, question);
-  // Git-activity digest (team tier only — code/contributor activity is internal) runs in parallel too.
+  // Git-activity + per-person activity digests (team tier only — internal) run in parallel too.
   const gitDigestP = tier === "team" ? gitActivityDigest(supabase, teamId) : Promise.resolve("");
+  const peopleDigestP = tier === "team" ? peopleActivityDigest(supabase, teamId) : Promise.resolve("");
 
   // All independent retrieval queries run in PARALLEL (was sequential → ~7 serial round-trips).
   // 1. Recall-friendly FTS over items (OR of significant terms; see toOrQuery).
@@ -356,7 +423,7 @@ export async function retrieve(
   }
 
   // 3. Structured context (compact, always included) — built from the parallel results above.
-  const gitDigest = await gitDigestP;
+  const [gitDigest, peopleDigest] = await Promise.all([gitDigestP, peopleDigestP]);
   const structured = [
     "## Recent decisions (newest first)",
     ...(decisions ?? []).map(
@@ -384,6 +451,7 @@ export async function retrieve(
     "## Key relationships",
     ...(rels ?? []).map((r) => `- ${r.from_id} ${r.relationship_type} ${r.to_id}`),
     gitDigest,
+    peopleDigest,
   ].join("\n");
 
   // 3b. Blend in Graphiti temporal facts (graph memory over all ingestions), if any.
