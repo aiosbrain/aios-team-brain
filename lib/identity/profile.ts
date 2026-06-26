@@ -1,6 +1,38 @@
 import "server-only";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { audit } from "@/lib/api/audit";
+import {
+  WEEKDAYS,
+  CHANNEL_KINDS,
+  TIME_OFF_KINDS,
+  GOAL_KINDS,
+  GOAL_STATUSES,
+  GOAL_SOURCES,
+  type Weekday,
+  type WorkingHours,
+  type ChannelKind,
+  type TimeOffKind,
+  type GoalKind,
+  type GoalStatus,
+  type GoalSource,
+} from "@/lib/identity/profile-constants";
+
+// Re-export the client-safe constants/types so server callers keep a single import site.
+export {
+  WEEKDAYS,
+  CHANNEL_KINDS,
+  TIME_OFF_KINDS,
+  GOAL_KINDS,
+  GOAL_STATUSES,
+  GOAL_SOURCES,
+  type Weekday,
+  type WorkingHours,
+  type ChannelKind,
+  type TimeOffKind,
+  type GoalKind,
+  type GoalStatus,
+  type GoalSource,
+};
 
 /**
  * Single writer for the identity CONTEXT layer — `member_profiles`, `member_time_off`,
@@ -15,28 +47,6 @@ import { audit } from "@/lib/api/audit";
  */
 
 // ── Types ────────────────────────────────────────────────────────────────────
-
-export type Weekday = "mon" | "tue" | "wed" | "thu" | "fri" | "sat" | "sun";
-const WEEKDAYS: readonly Weekday[] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
-
-/** Per-weekday [start, end] in 24h "HH:MM"; omitted days mean "not working". */
-export type WorkingHours = Partial<Record<Weekday, [string, string]>>;
-
-/** Contact-preference channels, in priority order. Allowlisted to keep the set queryable. */
-export const CHANNEL_KINDS = ["slack", "email", "linear", "plane", "github", "phone", "in_person"] as const;
-export type ChannelKind = (typeof CHANNEL_KINDS)[number];
-
-export const TIME_OFF_KINDS = ["pto", "holiday", "sick", "other"] as const;
-export type TimeOffKind = (typeof TIME_OFF_KINDS)[number];
-
-export const GOAL_KINDS = ["okr", "goal"] as const;
-export type GoalKind = (typeof GOAL_KINDS)[number];
-
-export const GOAL_STATUSES = ["on_track", "at_risk", "off_track", "done"] as const;
-export type GoalStatus = (typeof GOAL_STATUSES)[number];
-
-export const GOAL_SOURCES = ["manual", "jira", "plane", "linear"] as const;
-export type GoalSource = (typeof GOAL_SOURCES)[number];
 
 export interface ProfileInput {
   timezone?: string;
