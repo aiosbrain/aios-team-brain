@@ -136,7 +136,7 @@ sequenceDiagram
   participant LLM as Claude
   U->>Q: {question, project?}
   Q->>Q: auth · cost guard (per-member/day, per-team $/day in query_log)
-  Q->>RET: tier-filtered FTS top-12 + recent + structured digest (incl. per-contributor git activity + per-person cross-tool activity, team tier)
+  Q->>RET: tier-filtered FTS top-12 + recent + Graphiti semantic expansion + structured digest (incl. per-contributor git activity + per-person cross-tool activity, team tier)
   RET-->>Q: {sources[], structured}
   Q->>CL: streamAnswer(ctx, question)
   CL->>LLM: cached system + numbered sources + question
@@ -145,8 +145,12 @@ sequenceDiagram
 
 > **Retrieval recall is benchmarked.** `test/datamechanics/retrieval-eval.datamechanics.test.ts` is a
 > deterministic eval: a fixed corpus + question→expected-source cases scoring recall@sources through the
-> real `retrieve()`. It pins the current keyword-FTS floor (6/9; the 3 misses are paraphrase/"semantic"
-> gaps) so retrieval upgrades (semantic/hybrid) are *provable* and regressions fail CI.
+> real `retrieve()`. It pins the keyword-FTS floor (6/9; 3 paraphrase/"semantic" gaps) so retrieval
+> upgrades are *provable* and regressions fail CI. **Semantic expansion** (`graphExpansionQuery`): when
+> Graphiti is configured, its hybrid search returns the relevant entities/facts for a question; those
+> terms expand a second FTS pass to surface items a literal search missed. The live eval
+> (`retrieval-semantic.datamechanics.test.ts`, self-skips unless `GRAPHITI_URL` is set) proves it
+> closes all 3 gaps (6/9 → 9/9 on the gap set).
 
 ### Ingestion sidecar pipeline
 
