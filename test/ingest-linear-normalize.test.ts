@@ -138,6 +138,19 @@ describe("normalizeLinearDocs (searchable issue text)", () => {
     expect(d.frontmatter.identifier).toBe("ENG-1");
   });
 
+  it("carries the assignee's Linear user id for per-person attribution at ingest", () => {
+    const docs = normalizeLinearDocs({
+      teamKey: "ENG",
+      issues: [
+        { id: "u1", identifier: "ENG-1", title: "Ship it", description: "x", assignee: { id: "LU-9", displayName: "Alex" } },
+        { id: "u2", identifier: "ENG-2", title: "Unassigned", description: "y" },
+      ],
+    });
+    expect(docs[0].frontmatter.assignee_id).toBe("LU-9");
+    expect(docs[0].frontmatter.assignee).toBe("Alex");
+    expect(docs[1].frontmatter.assignee_id).toBe(""); // unassigned → empty (falls back to connector)
+  });
+
   it("skips brain round-trippers (aios-ext footer), same as the task import", () => {
     const docs = normalizeLinearDocs({
       teamKey: "ENG",

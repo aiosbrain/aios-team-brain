@@ -26,7 +26,7 @@ export interface LinearImportIssue {
   url?: string;
   priority?: number | null; // 0 none · 1 urgent · 2 high · 3 medium · 4 low
   state?: { name?: string; type?: string } | null; // type: backlog|unstarted|started|completed|canceled
-  assignee?: { displayName?: string } | null;
+  assignee?: { id?: string; displayName?: string } | null;
   parent?: { identifier?: string } | null;
   labels?: { nodes: { name: string }[] } | null;
   project?: { name?: string } | null;
@@ -161,6 +161,8 @@ export function normalizeLinearDocs(input: NormalizeLinearInput): ItemPayload[] 
           url: it.url ?? "",
           state: it.state?.name ?? "",
           assignee: it.assignee?.displayName ?? "",
+          // Assignee's Linear user id → resolved to a person at ingest (lib/ingest/run).
+          assignee_id: it.assignee?.id ?? "",
           priority: PRIORITY_BY_INT[it.priority ?? 0] ?? "none",
           project_name: it.project?.name ?? "",
         },

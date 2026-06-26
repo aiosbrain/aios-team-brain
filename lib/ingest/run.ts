@@ -7,6 +7,7 @@ import { getEnabledIntegrationsWithSecrets } from "@/lib/integrations/manage";
 import { SlackClient, fetchSlackChannel } from "./sources/slack";
 import { normalizeThread } from "./sources/slack-normalize";
 import { syncSlackIdentities } from "./sources/slack-identity";
+import { syncProviderIdentities } from "@/lib/identity/provider-sync";
 import { buildIdentityMap, resolveByProviderId } from "@/lib/identity/resolve";
 import { fetchPlaneProject } from "./sources/plane";
 import { normalizePlaneProject, normalizePlaneDocs } from "./sources/plane-normalize";
@@ -307,6 +308,14 @@ export async function runPlaneIngestion(opts: { teamId?: string } = {}): Promise
         summary.projects++;
         try {
           const fetched = await fetchPlaneProject(conn);
+          // Reconcile Plane members → people by email, then build the resolver map so each
+          // work-item's assignee is attributed to the real person.
+          try {
+            await syncProviderIdentities(supabase, teamId, "plane", fetched.memberDetails);
+          } catch (err) {
+            summary.errors.push(`team ${teamId}: plane identity sync: ${err instanceof Error ? err.message : "failed"}`);
+          }
+          const idMap = await buildIdentityMap(supabase, teamId);
           // Work-items → tasks (one kind=task item).
           const payload = normalizePlaneProject({ ...fetched, aiosSources });
           summary.items += payload.rows?.length ?? 0;
@@ -314,9 +323,10 @@ export async function runPlaneIngestion(opts: { teamId?: string } = {}): Promise
           if (res.status === "created") summary.created++;
           else if (res.status === "updated") summary.updated++;
           else summary.unchanged++;
-          // Work-item text → deliverable items (searchable), one per work-item.
+          // Work-item text → deliverable items (searchable), one per work-item; attributed to assignee.
           for (const doc of normalizePlaneDocs({ ...fetched, aiosSources })) {
-            const r = await ingestItem(supabase, auth, doc, "team");
+            const authorMemberId = resolveByProviderId(idMap, "plane", String(doc.frontmatter?.assignee_id ?? ""));
+            const r = await ingestItem(supabase, auth, doc, "team", { authorMemberId });
             if (r.status === "created") summary.created++;
             else if (r.status === "updated") summary.updated++;
             else summary.unchanged++;
@@ -398,6 +408,14 @@ export async function runLinearIngestion(opts: { teamId?: string } = {}): Promis
         summary.projects++;
         try {
           const fetched = await fetchLinearTeam({ apiKey, teamId: linearTeamId });
+          // Reconcile Linear members → people by email, then build the resolver map so each
+          // issue's assignee is attributed to the real person.
+          try {
+            await syncProviderIdentities(supabase, teamId, "linear", fetched.members);
+          } catch (err) {
+            summary.errors.push(`team ${teamId}: linear identity sync: ${err instanceof Error ? err.message : "failed"}`);
+          }
+          const idMap = await buildIdentityMap(supabase, teamId);
           // Issues → tasks (one kind=task item).
           const payload = normalizeLinearTeam(fetched);
           summary.items += payload.rows?.length ?? 0;
@@ -405,9 +423,10 @@ export async function runLinearIngestion(opts: { teamId?: string } = {}): Promis
           if (res.status === "created") summary.created++;
           else if (res.status === "updated") summary.updated++;
           else summary.unchanged++;
-          // Issue text → deliverable items (searchable), one per issue.
+          // Issue text → deliverable items (searchable), one per issue; attributed to assignee.
           for (const doc of normalizeLinearDocs(fetched)) {
-            const r = await ingestItem(supabase, auth, doc, "team");
+            const authorMemberId = resolveByProviderId(idMap, "linear", String(doc.frontmatter?.assignee_id ?? ""));
+            const r = await ingestItem(supabase, auth, doc, "team", { authorMemberId });
             if (r.status === "created") summary.created++;
             else if (r.status === "updated") summary.updated++;
             else summary.unchanged++;

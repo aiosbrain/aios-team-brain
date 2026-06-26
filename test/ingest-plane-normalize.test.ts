@@ -201,6 +201,18 @@ describe("normalizePlaneDocs (searchable work-item text)", () => {
     expect(d.body).toContain("the full prose"); // HTML stripped, text is searchable
   });
 
+  it("carries the first assignee's Plane member id for per-person attribution at ingest", () => {
+    const docs = normalizePlaneDocs({
+      ...base,
+      items: [
+        { id: "wi-1", sequence_id: 1, name: "Assigned", state: "s-todo", assignees: ["mid-7", "mid-8"] },
+        { id: "wi-2", sequence_id: 2, name: "Unassigned", state: "s-todo" },
+      ],
+    });
+    expect(docs[0].frontmatter.assignee_id).toBe("mid-7"); // first assignee
+    expect(docs[1].frontmatter.assignee_id).toBe(""); // none → empty
+  });
+
   it("skips aios round-trippers, same as the task import", () => {
     const docs = normalizePlaneDocs({
       ...base,
