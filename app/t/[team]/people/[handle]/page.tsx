@@ -11,6 +11,7 @@ import { parseRange } from "@/lib/metrics/range";
 import { RangeSelector } from "@/components/dashboard/range-selector";
 import { CommitHeatmap } from "@/components/codebases/commit-heatmap";
 import { MemberContextPanel } from "@/components/people/member-context";
+import { ContextEditor } from "@/components/people/context-editor";
 
 export const metadata: Metadata = { title: "Profile" };
 
@@ -45,6 +46,7 @@ export default async function PersonPage({
   if (!p) notFound();
 
   const context = await getMemberContext(supabase, team.id, p.member_id, me.tier);
+  const canEdit = !!context && (me.id === p.member_id || me.role === "admin");
 
   const aiPct = p.totals.commits ? Math.round((100 * p.totals.ai_commits) / p.totals.commits) : 0;
 
@@ -96,6 +98,9 @@ export default async function PersonPage({
       </div>
 
       {context ? <MemberContextPanel context={context} /> : null}
+      {canEdit && context ? (
+        <ContextEditor teamSlug={teamSlug} memberId={p.member_id} context={context} />
+      ) : null}
 
       <section className="prism-card flex flex-col gap-3 p-5">
         <h2 className="text-sm font-semibold uppercase tracking-wider text-ink-tertiary">

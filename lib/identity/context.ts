@@ -61,6 +61,19 @@ export function canSeeMemberContext(tier: ViewerTier): boolean {
 }
 
 /**
+ * Authorization predicate for EDITING a member's context: only the member themselves or an
+ * admin may write it — a teammate (non-admin) cannot edit someone else's profile/goals/time-off.
+ * Pure + exported so the security boundary is spec-tested (test/identity-can-edit-context.test.ts)
+ * independent of the server-action plumbing.
+ */
+export function canEditMemberContext(
+  actor: { id: string; role: "admin" | "lead" | "member" },
+  targetMemberId: string
+): boolean {
+  return actor.id === targetMemberId || actor.role === "admin";
+}
+
+/**
  * Normalize a Postgres `date` to a stable "YYYY-MM-DD" string. The pg driver returns bare
  * `date` columns as a Date at LOCAL midnight, so `toISOString()` would shift the calendar day
  * across the UTC boundary — read the local Y/M/D components (the same tz the driver used).
