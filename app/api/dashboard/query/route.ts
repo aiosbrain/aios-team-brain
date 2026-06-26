@@ -8,6 +8,49 @@ import { errorResponse } from "@/lib/api/schemas";
 import { retrieve } from "@/lib/query/retrieve";
 import { streamAnswer } from "@/lib/query/claude";
 import { getProviderKey } from "@/lib/integrations/manage";
+import { isSyncCommand, runManualSync } from "@/lib/ingest/manual-sync";
+import { audit } from "@/lib/api/audit";
+
+const SSE_HEADERS = {
+  "Content-Type": "text/event-stream",
+  "Cache-Control": "no-cache",
+  Connection: "keep-alive",
+} as const;
+
+/**
+ * Stream a manual scrape as the brain's "answer" (same delta/done SSE the chat already renders).
+ * The query box doubles as a sync trigger: typing "/sync" (or "scrape now", …) pulls every enabled
+ * connector for the team instead of asking the LLM. team-tier only + its own rate limit (enforced
+ * by the caller); writes go through the single-writer ingestion underneath, and the run is audited.
+ */
+function syncResponse(supabase: ReturnType<typeof adminClient>, teamId: string, memberId: string): Response {
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream({
+    async start(controller) {
+      const send = (event: string, data: unknown) =>
+        controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+      try {
+        send("delta", { text: "🔄 Scraping connectors (Slack · Plane · Linear · GitHub)…\n\n" });
+        const r = await runManualSync(teamId);
+        send("delta", { text: r.summary });
+        send("sources", { sources: [] });
+        send("done", { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cost_usd: 0 });
+        await audit(supabase, {
+          team_id: teamId,
+          actor_kind: "member",
+          member_id: memberId,
+          action: "ingest.manual_sync",
+          meta: { created: r.created, updated: r.updated, errors: r.errors },
+        });
+      } catch (e) {
+        send("error", { message: e instanceof Error ? e.message : "scrape failed" });
+      } finally {
+        controller.close();
+      }
+    },
+  });
+  return new Response(stream, { headers: SSE_HEADERS });
+}
 
 export const runtime = "nodejs";
 export const maxDuration = 120;
@@ -62,6 +105,19 @@ export async function POST(req: NextRequest) {
 
   const memberTier = me.tier as "team" | "external";
   const supabase = adminClient();
+
+  // The query box doubles as a scrape trigger: "/sync" / "scrape now" / … pulls every enabled
+  // connector instead of asking the LLM. team-tier only (external collaborators can't trigger a
+  // sync of internal data); its own tighter rate limit; doesn't consume the daily LLM query budget.
+  if (isSyncCommand(question)) {
+    if (memberTier === "external") {
+      return errorResponse("forbidden", "scraping is available to team members only", 403);
+    }
+    if (!(await rateLimit(supabase, `${me.id}:sync`, 2))) {
+      return errorResponse("rate_limited", "2 scrapes/min per member — try again shortly", 429);
+    }
+    return syncResponse(supabase, team.id, me.id);
+  }
 
   if (!(await rateLimit(supabase, `${me.id}:query`, 10))) {
     return errorResponse("rate_limited", "10 queries/min per member", 429);
