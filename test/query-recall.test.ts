@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { toOrQuery, graphExpansionQuery } from "@/lib/query/retrieve";
+import { toOrQuery, graphExpansionQuery, wantsActivityContext } from "@/lib/query/retrieve";
 import type { GraphFact } from "@/lib/graph/graphiti-client";
 
 // Spec for the FTS recall fix: the AI query box failed "what has john ellison been posting to slack?"
@@ -46,5 +46,20 @@ describe("graphExpansionQuery (semantic expansion)", () => {
   it("caps the number of expansion terms", () => {
     const many: GraphFact[] = Array.from({ length: 50 }, (_, i) => ({ fact: `alpha${i} beta${i} gamma${i} delta${i}` }));
     expect(graphExpansionQuery(many).split(" or ").length).toBeLessThanOrEqual(24);
+  });
+});
+
+// Spec: context shaping — the heavy activity digests are only included for "who's doing what"
+// questions. Biased inclusive (false positives just restore old behavior).
+describe("wantsActivityContext (context shaping)", () => {
+  it("true for activity/person questions", () => {
+    for (const q of ["what is John working on?", "who has been posting to slack?", "what has Priya been up to?", "show recent commits", "team workload this sprint"]) {
+      expect(wantsActivityContext(q), q).toBe(true);
+    }
+  });
+  it("false for non-activity questions", () => {
+    for (const q of ["what did we decide about auth?", "show me the Q3 roadmap", "how does login work?", "what is the SSRF fix?"]) {
+      expect(wantsActivityContext(q), q).toBe(false);
+    }
   });
 });
