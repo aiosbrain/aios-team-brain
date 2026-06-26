@@ -8,6 +8,7 @@ import { resolveIntegrationsAdmin } from "@/lib/integrations/read";
 import { linkGithub } from "@/lib/codebases/github";
 import { setMemberIdentity, removeMemberIdentity } from "@/lib/identity/member-identities";
 import { addAuthorAlias, removeAuthorAlias } from "@/lib/admin/aliases";
+import { reattributeItems } from "@/lib/ingest/reattribute";
 
 // Providers whose identity is a stable user id in member_identities (GitHub uses its own login flow).
 const PROVIDERS = new Set(["slack", "linear", "plane"]);
@@ -145,6 +146,25 @@ export async function addMemberEmail(
     return { ok: true, note: res.note };
   } catch (e2) {
     return { ok: false, error: e2 instanceof Error ? e2.message : "could not add email" };
+  }
+}
+
+/**
+ * Re-attribute existing content to the CURRENT identity mappings (admins only). Run this after
+ * linking/correcting identities so already-ingested items (which were attributed at ingest time)
+ * pick up the new mapping. Conservative — never un-attributes. See `lib/ingest/reattribute`.
+ */
+export async function reattributeIdentitiesNow(
+  teamSlug: string
+): Promise<{ ok: boolean; error?: string; message?: string }> {
+  const ctx = await requireAdmin(teamSlug);
+  if (!ctx) return { ok: false, error: "admins only" };
+  try {
+    const s = await reattributeItems(adminClient(), ctx.teamId);
+    revalidatePath(`/t/${teamSlug}/admin/members`);
+    return { ok: true, message: `Re-attributed ${s.updated} of ${s.scanned} item(s) to current identity mappings.` };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "re-attribution failed" };
   }
 }
 

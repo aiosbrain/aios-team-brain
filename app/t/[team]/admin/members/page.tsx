@@ -1,6 +1,7 @@
 import { serverClient } from "@/lib/supabase/server";
 import { InviteMember } from "@/components/admin/invite-member";
 import { MemberIdentities, type ProviderLink } from "@/components/admin/member-identities";
+import { ReattributeButton } from "@/components/admin/reattribute-button";
 import { listMemberIdentities } from "@/lib/identity/list";
 
 export default async function MembersAdminPage({
@@ -39,7 +40,10 @@ export default async function MembersAdminPage({
           platform we&apos;ve linked this person to — expand it to add an alternate email or correct a
           link.
         </p>
-        <InviteMember teamSlug={teamSlug} />
+        <div className="flex items-center gap-2">
+          <ReattributeButton teamSlug={teamSlug} />
+          <InviteMember teamSlug={teamSlug} />
+        </div>
       </div>
       <div className="prism-card overflow-x-auto">
         <table className="w-full text-sm">
