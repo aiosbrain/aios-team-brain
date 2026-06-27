@@ -446,6 +446,9 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 - `GET /api/v1/me` — authenticated member identity + role (drives client UI gating)
 - `GET /api/v1/members` — team roster + cross-tool identities for external resolution (team-tier only; `?email`/`?handle`/`?provider` filters)
 - `GET /api/v1/identities/resolve` — resolve a provider external_id (or email/handle) to a member + canonical contacts incl. `slack_id` (team-tier only; 404 on miss)
+- `GET /api/v1/me/slack-token` — the caller's OWN Slack user token for "act as me" (owner-only: member from the API key, never a param; 404 if not connected; `no-store`)
+- `POST /api/v1/me/slack-token` — connect the caller's Slack via manual paste: validate (`auth.test`) + store encrypted (`member_secrets`) + capture identity
+- `DELETE /api/v1/me/slack-token` — disconnect the caller's Slack
 - `POST /api/v1/query` — SSE grounded query (`delta`/`sources`/`done`)
 - `GET /api/v1/okf-bundle` — OKF link graph (tier-filtered, link redaction)
 - `POST /api/v1/actions` — request a policy-gated action (Organ 4)
@@ -466,7 +469,7 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 `projects` · `items` · `item_versions` · `tasks` · `decisions` · `graph_entities` ·
 `graph_relationships` · `query_log` · `policies` · `approval_requests` · `actions` ·
 `codebases` · `code_metrics` · `code_contributions` · `github_issues` · `member_emails` ·
-`member_identities` · `member_profiles` · `member_time_off` · `member_goals` · `integrations` ·
+`member_identities` · `member_secrets` · `member_profiles` · `member_time_off` · `member_goals` · `integrations` ·
 `agentic_maturity_snapshots` · `task_pm_links` · `work_events` · `usage_costs` · `graph_episodes`
 <!-- /drift:tables -->
 
