@@ -14,23 +14,32 @@ import { BRAIN_API_VERSION } from "@/lib/api/version";
 
 const ARCH_DOC = join(import.meta.dirname, "..", "..", "docs", "ARCHITECTURE.md");
 
+// The architecture doc carries one canonical claim of the implemented version:
+//   "...implements brain-api v1.2..."
+// We assert that exact, version-anchored sentence (not just any `v1.2` substring, which the
+// doc mentions in many feature contexts). `\b` keeps v1.2 from matching v1.20.
+function implementsClaim(version: string): RegExp {
+  return new RegExp(String.raw`implements\s+\*{0,2}brain-api\s+v${version.replace(".", "\\.")}\b`, "i");
+}
+
 describe("brain-api contract version", () => {
   it("BRAIN_API_VERSION has a major.minor shape", () => {
     expect(BRAIN_API_VERSION).toMatch(/^\d+\.\d+$/);
   });
 
-  it("the architecture doc references the same version (`v<version>`)", () => {
+  it("the architecture doc's canonical claim matches the implemented version", () => {
     const doc = readFileSync(ARCH_DOC, "utf8");
     expect(
-      doc.includes(`v${BRAIN_API_VERSION}`),
-      `docs/ARCHITECTURE.md does not mention "v${BRAIN_API_VERSION}". ` +
-        `Bump BRAIN_API_VERSION and the architecture doc together when the contract changes.`
+      implementsClaim(BRAIN_API_VERSION).test(doc),
+      `docs/ARCHITECTURE.md must state "implements brain-api v${BRAIN_API_VERSION}". ` +
+        `Bump BRAIN_API_VERSION and that sentence together when the contract changes.`
     ).toBe(true);
   });
 
-  it("the doc-agreement check is non-vacuous", () => {
+  it("the claim is version-specific (non-vacuous)", () => {
     const doc = readFileSync(ARCH_DOC, "utf8");
-    // A version that is not the implemented one must NOT be claimed as implemented.
-    expect(doc.includes("v9.9")).toBe(false);
+    // The same anchored claim for a *different* version must NOT be present — proving the
+    // matcher is pinned to the actual version, not matching any text.
+    expect(implementsClaim("9.9").test(doc)).toBe(false);
   });
 });

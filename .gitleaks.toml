@@ -1,17 +1,32 @@
 # gitleaks config for aios-team-brain.
-# Extends the built-in ruleset; only adds an allowlist for files that legitimately
-# contain key-shaped *placeholder* material (example env files, test fixtures).
-# CI scans the working tree (`detect --no-git`) as a backstop against newly committed secrets.
+# Extends the built-in ruleset. CI scans the working tree (`detect --no-git`) as a backstop
+# against newly committed secrets.
+#
+# Allowlisting philosophy: do NOT blanket-allow whole source dirs (that would let a real key
+# committed under test/ slip past the scan). Instead we (a) skip build output / dependency
+# trees that aren't our source, and (b) suppress only *obvious placeholder* values by regex,
+# so a real high-entropy secret in a test/fixture is still caught.
 
 [extend]
 useDefault = true
 
 [allowlist]
-description = "Placeholder/example secrets in example env files and test fixtures"
+description = "Build output + deps (not our source), example env files, and obvious placeholders"
+# Path skips: generated/vendored trees. node_modules etc. are absent in the CI secret-scan job
+# (no npm ci there), but listing them keeps a local `gitleaks detect --no-git` run honest too.
 paths = [
+  '''(^|/)node_modules/''',
+  '''(^|/)\.next/''',
+  '''(^|/)dist/''',
+  '''(^|/)build/''',
+  '''(^|/)coverage/''',
   '''\.env\.example$''',
-  '''.*\.test\.(ts|tsx|mjs|cjs|js|jsx)$''',
-  '''(^|/)test/''',
-  '''(^|/)__fixtures__/''',
-  '''(^|/)fixtures/''',
+]
+# Value skips: match the *secret* itself. Only obvious non-secret placeholders — an ascending
+# digit run, a repeated hex stub, or words like example/placeholder/dummy/changeme. A real
+# random secret will not contain these, so test-file fixtures pass while real keys still fail.
+regexes = [
+  '''1234567890''',
+  '''abcdefABCDEF''',
+  '''(?i)(example|placeholder|dummy|changeme|redacted|your[-_]?(api[-_]?)?(key|token|secret))''',
 ]
