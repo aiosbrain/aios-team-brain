@@ -85,6 +85,11 @@ flowchart LR
 
 ## Auth & access tiers
 
+This server **implements brain-api v1.2** (the wire contract; source of truth:
+`aios-workspace/docs/brain-api.md`). That version is pinned in code as `BRAIN_API_VERSION`
+(`lib/api/version.ts`) and asserted against this sentence by
+`test/guards/contract-version.test.ts` — bump all three together on a contract change.
+
 Two principals, one tier model:
 
 - **Humans** — invite-only. In the **postgres** target, sign-in is **direct passwordless**:
@@ -422,6 +427,13 @@ guard enforces it, it's named.
   no RLS backstop in postgres mode.
 - **Add a migration** → 14-digit timestamp prefix; run `npm run db:test:up` to prove replay.
 - **Change access control** → treat it as dual-backend; add/extend a data-mechanics parity test.
+- **Change the brain-api wire contract** → the contract is pinned in
+  `aios-workspace/docs/brain-api.md`; bump `BRAIN_API_VERSION` (`lib/api/version.ts`) and this
+  doc's `v<version>` references together (guard: `test/guards/contract-version.test.ts`).
+- **Cross the module boundary** → `lib/` is the backend domain layer (never imports `app/`), and
+  `app/` reaches the DB only through the backend factory (`lib/supabase/server|admin`), never
+  `lib/db/pg` internals. Both directions are enforced by `import/no-restricted-paths` in
+  `eslint.config.mjs`.
 
 ## Keeping this doc honest
 
