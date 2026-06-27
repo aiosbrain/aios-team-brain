@@ -1,0 +1,17 @@
+# gitleaks config for aios-team-brain.
+# Extends the built-in ruleset; only adds an allowlist for files that legitimately
+# contain key-shaped *placeholder* material (example env files, test fixtures).
+# CI scans the working tree (`detect --no-git`) as a backstop against newly committed secrets.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Placeholder/example secrets in example env files and test fixtures"
+paths = [
+  '''\.env\.example$''',
+  '''.*\.test\.(ts|tsx|mjs|cjs|js|jsx)$''',
+  '''(^|/)test/''',
+  '''(^|/)__fixtures__/''',
+  '''(^|/)fixtures/''',
+]
