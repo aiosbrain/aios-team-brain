@@ -5,7 +5,8 @@
 Please report security issues **privately**. Do not open a public GitHub issue for a
 suspected vulnerability.
 
-- Email **john@john-ellison.com** with a description, reproduction steps, and impact.
+- Use **GitHub's private vulnerability reporting**: the repository's **Security** tab →
+  **Report a vulnerability**. Include a description, reproduction steps, and impact.
 - We aim to acknowledge within 3 business days and to agree on a disclosure timeline with you.
 - Please give us a reasonable window to ship a fix before any public disclosure.
 
