@@ -129,9 +129,20 @@ bash scripts/e2e.sh    # system-level integration: seed → push → materialize
   `pg:schema` after `schema.sql`, in filename order) **and** mirror it into `schema.sql` for
   from-zero. See `postgres/migrations/README.md`. (A brand-new table needs no migration —
   `create table if not exists` in `schema.sql` covers it.)
-- **Deploy:** Postgres on Railway (self-host portable). After a merge, run `npm run pg:schema` against
-  prod for any schema change, and **confirm the platform started a new build** (CI webhooks can be
-  silently dropped); re-trigger if the latest deploy predates the merge.
+- **Deploy:** Postgres on Railway (self-host portable). **Deploys happen ONLY by merging to `main`** —
+  Railway's GitHub integration auto-builds AIOS → `aios-team-brain`. After a merge, run `npm run pg:schema`
+  against prod for any schema change, and **confirm the platform started a new build** (`railway deployment
+  list`; CI webhooks can be silently dropped) — re-trigger via the Railway dashboard if the latest deploy
+  predates the merge.
+- **⛔ NEVER run `railway up` / `railway redeploy` / `railway down` / `railway delete`.** The Railway CLI is
+  **read-only** here (`status`, `logs`, `variables`, `deployment list`). `railway up` deploys the current
+  worktree's code to whatever project that directory is *linked* to (`~/.railway/config.json`, keyed by
+  absolute path) — and a Conductor worktree that drifted to the wrong link (an aios worktree linked to the
+  **Kula** project) once shipped this repo's code into Kula and took it down. The GitHub-merge path is bound
+  to the right project and cannot do that. This is **guarded**: `.claude/settings.json` denies those verbs +
+  a PreToolUse hook (`scripts/railway-deploy-guard.sh`) blocks them (incl. `cd other && railway up`). Before
+  *any* Railway command, confirm `railway status` shows **Project: AIOS**; audit all worktrees with
+  `bash scripts/railway-link-check.sh`.
 
 ---
 

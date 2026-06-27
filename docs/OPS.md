@@ -103,3 +103,44 @@ the org (John is the **AIOS-alpha** org owner).
 3. Grant it access to the public AIOS repos. BugBot then comments on PRs with potential bugs.
 
 No env vars or secrets in this repo are required.
+
+---
+
+## 4. Railway deploy safety — links + project token — W1.4.5
+
+**Incident:** the Railway CLI links each directory to a project in `~/.railway/config.json`
+(keyed by absolute path). `railway up`/`redeploy` deploys the **current directory's code to that
+linked project**. A Conductor worktree for *this* repo had drifted to the **Kula** project's link,
+so a deploy from it shipped aios-team-brain into Kula and took Kula down.
+
+### The rule (enforced)
+Production deploys happen **only by merging to `main`** → Railway's GitHub integration auto-builds
+**AIOS → `aios-team-brain`** (bound in the dashboard; cannot target another project). The Railway
+CLI is **read-only** here. The destructive verbs are **blocked** by `.claude/settings.json`
+(deny-list + the `scripts/railway-deploy-guard.sh` PreToolUse hook, which also catches the
+`cd other && <deploy>` form). See CLAUDE.md §6.
+
+### After creating a new worktree
+Conductor spawns worktrees that can inherit a wrong link. Audit + fix:
+
+```bash
+bash scripts/railway-link-check.sh   # flags any aios dir not linked to AIOS
+# fix a flagged dir:
+( cd <path> && railway link --project AIOS --environment production --service aios-team-brain )
+```
+
+### Strongest guard — a project-scoped token (recommended) — HUMAN STEP
+A **project token** scopes the CLI to a single project + environment, so even a stray deploy from a
+mislinked directory physically cannot reach another project (e.g. Kula).
+
+1. Railway dashboard → **AIOS** project → **Settings → Tokens** → create a **Project token** for
+   the **production** environment (name it e.g. `aios-cli`).
+2. Put it in each aios worktree's environment (do **not** commit it):
+   ```bash
+   echo 'export RAILWAY_TOKEN=<the-project-token>' >> ~/.aios-railway.env   # or the worktree .env.local (gitignored)
+   ```
+   With `RAILWAY_TOKEN` set, the CLI ignores `~/.railway/config.json` and acts only on the AIOS
+   project — link drift becomes harmless.
+3. Verify: `railway status` shows **Project: AIOS** regardless of the directory's link.
+
+> Tokens are secrets — never commit them; rotate from the dashboard if exposed.
