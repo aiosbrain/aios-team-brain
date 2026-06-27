@@ -1,0 +1,29 @@
+{
+  "$comment": "Committed, team-shared guardrails for the aios-team-brain repo. The Railway rules below prevent a `railway up` from deploying this repo's code to the wrong Railway project (an aios worktree once drifted to the Kula link and a deploy took Kula down). Deploys happen only via merge to main → Railway GitHub auto-deploy. See CLAUDE.md §6 and scripts/railway-deploy-guard.sh.",
+  "permissions": {
+    "deny": [
+      "Bash(railway up)",
+      "Bash(railway up:*)",
+      "Bash(railway redeploy)",
+      "Bash(railway redeploy:*)",
+      "Bash(railway down)",
+      "Bash(railway down:*)",
+      "Bash(railway delete)",
+      "Bash(railway delete:*)",
+      "Bash(railway service delete:*)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/scripts/railway-deploy-guard.sh\""
+          }
+        ]
+      }
+    ]
+  }
+}
