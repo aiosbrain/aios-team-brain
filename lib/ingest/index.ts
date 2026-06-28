@@ -238,12 +238,13 @@ async function materializeTasks(
   // rows' projected fields changed this push (bounded reactive projection — see projectable-diff).
   const snapshotByKey = new Map<string, ProjectableSnapshot>();
   if (incomingKeys.size) {
-    const { data: before } = await supabase
+    const { data: before, error: beforeErr } = await supabase
       .from("tasks")
       .select("row_key, title, status, sprint, priority, labels, parent_row_key, assignee")
       .eq("team_id", teamId)
       .eq("project_id", projectId)
       .not("row_key", "is", null);
+    if (beforeErr) throw new Error(`task snapshot: ${beforeErr.message}`);
     for (const t of before ?? []) {
       if (!t.row_key || !incomingKeys.has(t.row_key)) continue;
       snapshotByKey.set(t.row_key, {
