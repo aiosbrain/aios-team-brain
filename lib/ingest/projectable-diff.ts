@@ -5,11 +5,12 @@ import { normalizeTaskStatus, normalizeTaskPriority } from "@/lib/api/schemas";
  * *projected* fields changed — so an unchanged backlog never re-projects on every push (bounded; no
  * board spam). The projected field set the engine writes to the PM tool is:
  *
- *   title · normalized status · sprint · priority · labels · parent_row_key
+ *   title · normalized status · sprint · priority · labels · parent_row_key · assignee
  *
- * Notably NOT: `assignee` / `due_date` (never projected) and `body` (dashboard/DB-only on the push
- * path — `tasks.body` is owned by the dashboard, not the markdown table). A push that only flips
- * `due_date` or whose body/content_sha256 changed but projected columns didn't ⇒ no projection.
+ * `assignee` joined this set once the projection engine started writing it to the PM tool (resolved
+ * to a provider user). Notably still NOT: `due_date` (never projected) and `body` (dashboard/DB-only
+ * on the push path — `tasks.body` is owned by the dashboard, not the markdown table). A push that
+ * only flips `due_date` or whose body/content_sha256 changed but projected columns didn't ⇒ no projection.
  */
 export interface ProjectableSnapshot {
   title: string;
@@ -18,6 +19,7 @@ export interface ProjectableSnapshot {
   priority: string; // normalized: none | low | medium | high | urgent
   labels: string[];
   parent_row_key: string | null;
+  assignee: string;
 }
 
 // The subset of a parsed task row this predicate reads. Presence of `parent`/`labels`/`priority`
@@ -29,6 +31,7 @@ export interface IncomingProjectableRow {
   parent?: string | null;
   labels?: string[];
   priority?: string | null;
+  assignee?: string | null;
 }
 
 function sameLabels(a: string[], b: string[]): boolean {
@@ -52,6 +55,7 @@ export function effectiveProjectable(
     labels: "labels" in row ? row.labels ?? [] : snapshot?.labels ?? [],
     parent_row_key:
       "parent" in row ? (row.parent ?? "").trim() || null : snapshot?.parent_row_key ?? null,
+    assignee: "assignee" in row ? (row.assignee ?? "") : snapshot?.assignee ?? "",
   };
 }
 
@@ -67,6 +71,7 @@ export function projectableChanged(
     snapshot.sprint === effective.sprint &&
     (snapshot.priority || "none") === effective.priority &&
     (snapshot.parent_row_key ?? null) === (effective.parent_row_key ?? null) &&
+    (snapshot.assignee ?? "") === effective.assignee &&
     sameLabels(snapshot.labels ?? [], effective.labels ?? [])
   );
 }

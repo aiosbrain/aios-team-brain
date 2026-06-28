@@ -240,7 +240,7 @@ async function materializeTasks(
   if (incomingKeys.size) {
     const { data: before } = await supabase
       .from("tasks")
-      .select("row_key, title, status, sprint, priority, labels, parent_row_key")
+      .select("row_key, title, status, sprint, priority, labels, parent_row_key, assignee")
       .eq("team_id", teamId)
       .eq("project_id", projectId)
       .not("row_key", "is", null);
@@ -253,6 +253,7 @@ async function materializeTasks(
         priority: t.priority || "none",
         labels: t.labels ?? [],
         parent_row_key: t.parent_row_key ?? null,
+        assignee: t.assignee ?? "",
       });
     }
   }
@@ -260,8 +261,8 @@ async function materializeTasks(
 
   for (const row of rows) {
     const { status, raw_status } = normalizeTaskStatus(row.status || "");
-    // Projected-field change detection (title/status/sprint/priority/labels/parent only). A new row
-    // (no snapshot) is always "changed"; assignee/due/body changes never trigger projection.
+    // Projected-field change detection (title/status/sprint/priority/labels/parent/assignee). A new
+    // row (no snapshot) is always "changed"; due_date/body changes never trigger projection.
     const snapshot = snapshotByKey.get(row.row_key) ?? null;
     if (projectableChanged(snapshot, effectiveProjectable(row, snapshot))) changed.add(row.row_key);
     // `body` is dashboard/DB-only and `parent`/`labels`/`priority` are optional v1.2 fields: each is

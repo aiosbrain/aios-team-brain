@@ -35,6 +35,9 @@ import { linearGraphql } from "@/lib/pm-sync/linear-client";
 
 type Flags = Record<string, string | boolean>;
 type Admin = ReturnType<typeof adminClient>;
+type ResolvePage = {
+  team: { issues: { pageInfo: { hasNextPage: boolean; endCursor: string }; nodes: { id: string; identifier: string; url: string }[] } } | null;
+};
 
 const STATUSES = ["backlog", "ready", "in_progress", "blocked", "done"];
 
@@ -244,7 +247,7 @@ async function main() {
       const rows: { identifier: string; id: string; url: string }[] = [];
       let after: string | null = null;
       for (let i = 0; i < 100; i++) {
-        const page = await linearGraphql<{ team: { issues: { pageInfo: { hasNextPage: boolean; endCursor: string }; nodes: { id: string; identifier: string; url: string }[] } } | null }>(
+        const page: ResolvePage = await linearGraphql<ResolvePage>(
           fetch,
           lin.secret as string,
           `query ResolveIssues($teamId: String!, $after: String) {
@@ -277,7 +280,11 @@ async function main() {
         .eq("project_id", projectId)
         .eq("row_key", rowKey)
         .maybeSingle();
-      const taskId = (task as { id: string } | null)?.id ?? null;
+      // Require the brain task to exist: a link with a null task_id would still exclude this Linear
+      // issue from inbound import (by resource id), then the next mirror diff-delete drops its synced
+      // row — silently orphaning a genuinely Linear-authored task. Add the task first.
+      const taskId = (task as { id: string } | null)?.id;
+      if (!taskId) die(`no brain task '${rowKey}' in project ${projectId} — \`add\` it before \`adopt\``);
       const { data: existing } = await admin
         .from("task_pm_links")
         .select("id")
@@ -293,19 +300,18 @@ async function main() {
         projection_fingerprint: null,
         updated_at: new Date().toISOString(),
       };
-      if (existing) {
-        await admin.from("task_pm_links").update(patch).eq("id", (existing as { id: string }).id);
-      } else {
-        await admin.from("task_pm_links").insert({
-          team_id: team.id,
-          project_id: projectId,
-          row_key: rowKey,
-          provider: "linear",
-          provider_external_id: rowKey,
-          provider_external_source: "aios-backlog",
-          ...patch,
-        });
-      }
+      const { error: adoptErr } = existing
+        ? await admin.from("task_pm_links").update(patch).eq("id", (existing as { id: string }).id)
+        : await admin.from("task_pm_links").insert({
+            team_id: team.id,
+            project_id: projectId,
+            row_key: rowKey,
+            provider: "linear",
+            provider_external_id: rowKey,
+            provider_external_source: "aios-backlog",
+            ...patch,
+          });
+      if (adoptErr) die(adoptErr.message);
       console.log(`✓ adopted ${rowKey} → linear ${resourceId} (re-project to push brain state)`);
       break;
     }

@@ -6,7 +6,7 @@ import {
 } from "@/lib/ingest/projectable-diff";
 
 // Spec: the reactive push path re-projects ONLY rows whose projected fields changed. Projected set is
-// title · normalized status · sprint · priority · labels · parent_row_key — NOT assignee/due/body.
+// title · normalized status · sprint · priority · labels · parent_row_key · assignee — NOT due/body.
 
 const snap = (over: Partial<ProjectableSnapshot> = {}): ProjectableSnapshot => ({
   title: "T",
@@ -15,6 +15,7 @@ const snap = (over: Partial<ProjectableSnapshot> = {}): ProjectableSnapshot => (
   priority: "none",
   labels: [],
   parent_row_key: null,
+  assignee: "",
   ...over,
 });
 
@@ -23,10 +24,19 @@ describe("projectable-diff (changed-rows predicate)", () => {
     expect(projectableChanged(null, effectiveProjectable({ title: "x" }, null))).toBe(true);
   });
 
-  it("identical projected values are unchanged (a due/assignee-only edit never trips this)", () => {
+  it("identical projected values are unchanged (a due-only edit never trips this)", () => {
     const s = snap({ title: "x", status: "ready" });
-    // Six-col push re-emits title/status with the same values; due_date/assignee aren't in the set.
+    // Re-emits title/status with the same values; due_date isn't in the projected set.
     expect(projectableChanged(s, effectiveProjectable({ title: "x", status: "ready" }, s))).toBe(false);
+  });
+
+  it("an assignee change IS a change (assignee is now projected); same assignee is not", () => {
+    const s = snap({ title: "T", assignee: "Chetan" });
+    expect(projectableChanged(s, effectiveProjectable({ title: "T", assignee: "Chetan" }, s))).toBe(false);
+    expect(projectableChanged(s, effectiveProjectable({ title: "T", assignee: "John" }, s))).toBe(true);
+    // a present-but-empty assignee clears it (change); an absent assignee key preserves the snapshot
+    expect(projectableChanged(s, effectiveProjectable({ title: "T", assignee: "" }, s))).toBe(true);
+    expect(projectableChanged(s, effectiveProjectable({ title: "T" }, s))).toBe(false);
   });
 
   it("a title change is changed", () => {

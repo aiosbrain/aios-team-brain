@@ -45,9 +45,30 @@ interface LinearBootstrap {
   issuesById: Map<string, LinearIssue>;
 }
 
+// Build the assignee resolver index from team members. A normalized name OR displayName shared by two
+// different users is AMBIGUOUS and dropped — we never guess an owner (resolveAssigneeId then returns
+// undefined = leave untouched). Email is unique, so it is always authoritative (added after the drop).
+function indexMembers(nodes: LinearUser[]): Map<string, string> {
+  const map = new Map<string, string>();
+  const ambiguous = new Set<string>();
+  const addName = (key: string, id: string) => {
+    if (!key) return;
+    const prev = map.get(key);
+    if (prev && prev !== id) ambiguous.add(key);
+    else map.set(key, id);
+  };
+  for (const u of nodes) {
+    if (u.name) addName(normalizeName(u.name), u.id);
+    if (u.displayName) addName(normalizeName(u.displayName), u.id);
+  }
+  for (const key of ambiguous) map.delete(key);
+  for (const u of nodes) if (u.email) map.set(u.email.trim().toLowerCase(), u.id);
+  return map;
+}
+
 // Resolve a brain `assignee` free-text value to a Linear user id. Returns undefined when the text is
-// empty OR matches no member — callers treat undefined as "leave the provider assignee untouched"
-// (the brain never force-unassigns; it only sets an owner it can positively resolve).
+// empty OR matches no (unambiguous) member — callers treat undefined as "leave the provider assignee
+// untouched" (the brain never force-unassigns; it only sets an owner it can positively resolve).
 function resolveAssigneeId(members: Map<string, string>, assignee: string): string | undefined {
   const key = normalizeName(assignee || "");
   if (!key) return undefined;
@@ -92,7 +113,6 @@ async function buildBootstrap(ctx: LinearCtx, teamId: string): Promise<LinearBoo
     team: {
       states: { nodes: LinearState[] };
       labels: { nodes: LinearLabel[] };
-      members: { nodes: LinearUser[] };
     } | null;
   }>(
     ctx.fetchImpl,
@@ -101,7 +121,6 @@ async function buildBootstrap(ctx: LinearCtx, teamId: string): Promise<LinearBoo
       team(id: $teamId) {
         states(first: 100) { nodes { id name type } }
         labels(first: 250) { nodes { id name } }
-        members(first: 250) { nodes { id name displayName email } }
       }
     }`,
     { teamId }
@@ -109,14 +128,27 @@ async function buildBootstrap(ctx: LinearCtx, teamId: string): Promise<LinearBoo
   const states = data.team?.states.nodes ?? [];
   const labels = new Map<string, string>((data.team?.labels.nodes ?? []).map((l) => [l.name, l.id]));
 
-  // Index each member under its normalized name + displayName, and its lowercased email, so a brain
-  // assignee written as a full name, a handle, or an email all resolve to the same user id.
-  const members = new Map<string, string>();
-  for (const u of data.team?.members?.nodes ?? []) {
-    if (u.name) members.set(normalizeName(u.name), u.id);
-    if (u.displayName) members.set(normalizeName(u.displayName), u.id);
-    if (u.email) members.set(u.email.trim().toLowerCase(), u.id);
+  // Page ALL team members (one page caps at 250 → silently un-resolvable assignees on a large team),
+  // then index by normalized name + displayName + lowercased email (see indexMembers).
+  type MembersPage = { team: { members: { pageInfo: { hasNextPage: boolean; endCursor: string }; nodes: LinearUser[] } } | null };
+  const memberNodes: LinearUser[] = [];
+  let mAfter: string | null = null;
+  for (let i = 0; i < 50; i++) {
+    const mp: MembersPage = await linearGraphql<MembersPage>(
+      ctx.fetchImpl,
+      ctx.apiKey,
+      `query ProjectionMembers($teamId: String!, $after: String) {
+        team(id: $teamId) { members(first: 250, after: $after) { pageInfo { hasNextPage endCursor } nodes { id name displayName email } } }
+      }`,
+      { teamId, after: mAfter }
+    );
+    const conn = mp.team?.members;
+    if (!conn) break;
+    memberNodes.push(...conn.nodes);
+    if (!conn.pageInfo.hasNextPage || !conn.pageInfo.endCursor) break;
+    mAfter = conn.pageInfo.endCursor;
   }
+  const members = indexMembers(memberNodes);
 
   const issuesByExt = new Map<string, LinearIssue>();
   const issuesById = new Map<string, LinearIssue>();
