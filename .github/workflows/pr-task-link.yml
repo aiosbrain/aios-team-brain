@@ -21,7 +21,12 @@ jobs:
           const fs = require("node:fs");
           const ev = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, "utf8"));
           const pr = ev.pull_request || {};
-          const text = [pr.title, pr.body || "", pr.head?.ref || ""].join("\n");
+          // Strip HTML comments first so PR-template placeholders (e.g. `<!-- e.g. AIO-72 -->`) aren't matched.
+          const text = [
+            pr.title || "",
+            (pr.body || "").replace(/<!--[\s\S]*?-->/g, " "),
+            pr.head?.ref || "",
+          ].join("\n");
           // Same matcher aios-work-sync uses (lib/pm-sync/work-keys): AIO-12 / W2.5.8 / etc.
           const re = /\b(?:AIOS-Work:\s*)?([A-Z][A-Z0-9]+-\d+|[A-Z]\d+(?:\.\d+)*)\b/g;
           const keys = [...new Set([...text.matchAll(re)].map((m) => m[1]))];
