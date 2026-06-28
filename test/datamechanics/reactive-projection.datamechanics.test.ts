@@ -201,6 +201,23 @@ describe("materialize changed-rows detection (real Postgres)", () => {
     expect(res.changedTaskRowKeys).toEqual([]);
   });
 
+  it("preserves an existing assignee when a later push omits the assignee key", async () => {
+    const seed = await seedTeam();
+    let res = await pushTasks(seed, "v1", [{ row_key: "P0", title: "Owned", assignee: "Chetan" }]);
+    expect(res.changedTaskRowKeys).toEqual(["P0"]);
+
+    res = await pushTasks(seed, "v2", [{ row_key: "P0", title: "Owned" }]);
+    expect(res.changedTaskRowKeys).toEqual([]);
+
+    const { data } = await db()
+      .from("tasks")
+      .select("assignee")
+      .eq("team_id", seed.teamId)
+      .eq("row_key", "P0")
+      .single();
+    expect((data as { assignee: string }).assignee).toBe("Chetan");
+  });
+
   it("flags a child whose dangling parent is nulled by an epic diff-delete", async () => {
     const seed = await seedTeam();
     await pushTasks(seed, "v1", [

@@ -397,6 +397,20 @@ export async function runLinearIngestion(opts: { teamId?: string } = {}): Promis
         summary.errors.push(`team ${teamId}: no connector member`);
         continue;
       }
+      // Linear node ids the brain already owns via a projection/adoption link — excluded from the
+      // inbound mirror so only net-new Linear-authored issues import (brain authors → Linear out;
+      // only Linear-side tasks flow back in). Footer round-trippers are filtered in normalize too.
+      const { data: ownedLinks } = await supabase
+        .from("task_pm_links")
+        .select("provider_resource_id")
+        .eq("team_id", teamId)
+        .eq("provider", "linear")
+        .not("provider_resource_id", "is", null);
+      const ownedResourceIds = new Set(
+        ((ownedLinks ?? []) as { provider_resource_id: string | null }[])
+          .map((l) => l.provider_resource_id)
+          .filter((v): v is string => !!v)
+      );
       for (const integ of integrations) {
         summary.integrations++;
         const apiKey = integ.secret;
@@ -416,15 +430,15 @@ export async function runLinearIngestion(opts: { teamId?: string } = {}): Promis
             summary.errors.push(`team ${teamId}: linear identity sync: ${err instanceof Error ? err.message : "failed"}`);
           }
           const idMap = await buildIdentityMap(supabase, teamId);
-          // Issues → tasks (one kind=task item).
-          const payload = normalizeLinearTeam(fetched);
+          // Issues → tasks (one kind=task item). Brain-owned issues are excluded (only Linear-authored import).
+          const payload = normalizeLinearTeam({ ...fetched, ownedResourceIds });
           summary.items += payload.rows?.length ?? 0;
           const res = await ingestItem(supabase, auth, payload, "team");
           if (res.status === "created") summary.created++;
           else if (res.status === "updated") summary.updated++;
           else summary.unchanged++;
           // Issue text → deliverable items (searchable), one per issue; attributed to assignee.
-          for (const doc of normalizeLinearDocs(fetched)) {
+          for (const doc of normalizeLinearDocs({ ...fetched, ownedResourceIds })) {
             const authorMemberId = resolveByProviderId(idMap, "linear", String(doc.frontmatter?.assignee_id ?? ""));
             const r = await ingestItem(supabase, auth, doc, "team", { authorMemberId });
             if (r.status === "created") summary.created++;

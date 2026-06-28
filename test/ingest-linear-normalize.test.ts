@@ -60,6 +60,19 @@ describe("normalizeLinearTeam", () => {
     expect(keys).toEqual(["ENG-1"]);
   });
 
+  it("excludes brain-owned issues (projection link) even without a footer — only Linear-authored import", () => {
+    const issues = [
+      { id: "u1", identifier: "ENG-1", title: "Linear-authored", state: { type: "backlog" as const } },
+      { id: "u2", identifier: "ENG-2", title: "Brain-owned, no footer", state: { type: "backlog" as const } },
+    ];
+    const ownedResourceIds = new Set(["u2"]); // ENG-2 has a task_pm_links link but no aios-ext footer
+    const p = normalizeLinearTeam({ teamKey: "ENG", issues, ownedResourceIds });
+    expect((p.rows as Record<string, unknown>[]).map((r) => r.row_key)).toEqual(["ENG-1"]);
+    // docs path excludes it too
+    const docs = normalizeLinearDocs({ teamKey: "ENG", issues, ownedResourceIds });
+    expect(docs.map((d) => d.frontmatter.identifier)).toEqual(["ENG-1"]);
+  });
+
   it("maps priority ints and terminal/canceled states correctly", () => {
     const p = normalizeLinearTeam({
       ...base,

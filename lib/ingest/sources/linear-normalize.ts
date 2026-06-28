@@ -10,9 +10,11 @@ import { parseExt } from "@/lib/pm-sync/linear-client";
  * Mirrors lib/ingest/sources/plane-normalize.ts — same invariants:
  *   • Dedicated brain project per Linear team (`linear-<teamKey>`). The task diff-delete is
  *     project-wide, so Linear imports never share a project with CLI/UI/Plane tasks.
- *   • One-directional (Linear → brain), de-dupe over exclude. Linear is also the pm-sync OUTBOUND
- *     provider; issues the brain itself projected carry the `aios-ext: <row_key>` footer, so they
- *     are skipped on import (the brain already owns that row_key) — keeps "brain wins".
+ *   • One-directional (Linear → brain): import ONLY issues the brain doesn't already own — i.e.
+ *     genuinely Linear-originated tasks (authored inside Linear). An issue is brain-owned if it
+ *     carries the `aios-ext: <row_key>` footer (a brain→Linear round-tripper) OR its node id is in
+ *     `ownedResourceIds` (a task_pm_links projection/adoption link). Brain-authored work stays out of
+ *     the inbound mirror, so the mirror holds only net-new Linear-side tasks — keeps "brain wins".
  *   • Org structure preserved: sub-issue parent → parent_row_key (resolved within the imported set;
  *     a skipped/absent parent is nulled), project → sprint, cycle → `cycle:<name>` label,
  *     labels/state/priority/assignee carried through. Team tier; deterministic output (sha no-op).
@@ -36,6 +38,15 @@ export interface LinearImportIssue {
 export interface NormalizeLinearInput {
   teamKey: string; // e.g. "ENG" — drives the brain project slug
   issues: LinearImportIssue[];
+  // Linear node ids the brain already owns via a task_pm_links projection/adoption link. Issues whose
+  // id is here are excluded from the inbound mirror (the brain authored & projected them outbound), so
+  // only genuinely Linear-originated tasks are imported. Omitted in pure tests → falls back to footer-only.
+  ownedResourceIds?: Set<string>;
+}
+
+/** Brain-owned = carries the aios-ext footer (round-tripper) OR has a projection/adoption link. */
+function isBrainOwned(it: LinearImportIssue, owned: Set<string> | undefined): boolean {
+  return !!parseExt(it.description) || (owned?.has(it.id) ?? false);
 }
 
 export interface LinearTaskRow {
@@ -80,10 +91,10 @@ export function normalizeLinearTeam(input: NormalizeLinearInput): ItemPayload {
   const slugSeg = safeSegment(input.teamKey) || "team";
   const project = `linear-${slugSeg}`;
 
-  // De-dupe brain-projected round-trippers (issues carrying the aios-ext footer). Stable sort so a
-  // re-import produces byte-identical output → a true no-op at the sha256 writer.
+  // Exclude every brain-owned issue (footer round-trippers + projection-linked), importing only
+  // net-new Linear-side tasks. Stable sort so a re-import is byte-identical → a no-op at the sha writer.
   const included = input.issues
-    .filter((it) => !parseExt(it.description))
+    .filter((it) => !isBrainOwned(it, input.ownedResourceIds))
     .sort((a, b) => a.identifier.localeCompare(b.identifier));
 
   const includedKeys = new Set(included.map((it) => it.identifier));
@@ -136,13 +147,13 @@ export function normalizeLinearTeam(input: NormalizeLinearInput): ItemPayload {
 /**
  * Searchable companion to the task import: ONE `kind="deliverable"` item per issue carrying the full
  * title + description text, so issue prose is full-text searchable in the brain (the `items.search`
- * column) — not just the terse task table. Round-trippers (aios-ext footer) are skipped, same as the
- * task import. Content pattern (keyed by path, idempotent by sha, not diff-deleted).
+ * column) — not just the terse task table. Brain-owned issues (footer round-trippers + projection
+ * links) are skipped, same as the task import. Content pattern (keyed by path, idempotent by sha).
  */
 export function normalizeLinearDocs(input: NormalizeLinearInput): ItemPayload[] {
   const slugSeg = safeSegment(input.teamKey) || "team";
   return input.issues
-    .filter((it) => !parseExt(it.description))
+    .filter((it) => !isBrainOwned(it, input.ownedResourceIds))
     .map((it) => {
       const title = it.title?.trim() || "(untitled)";
       const description = (it.description ?? "").trim();
