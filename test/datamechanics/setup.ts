@@ -24,6 +24,7 @@ const DATA_TABLES = [
   "teams",
   "auth_tokens",
   "auth_users",
+  "oauth_states",
 ];
 
 const client = new Client({ connectionString: process.env.DATABASE_URL });
