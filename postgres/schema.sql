@@ -67,6 +67,22 @@ create table if not exists auth_tokens (
 );
 create index if not exists auth_tokens_email_idx on auth_tokens (email, created_at desc);
 
+-- Single-use OAuth state nonces (one-click Slack connect): minted at /api/auth/slack/start,
+-- atomically consumed at /api/auth/slack/callback. Short-lived (10-min TTL); the signed state
+-- JWT carries the same nonce so a leaked/forged state can't be replayed. Same single-use family
+-- as auth_tokens — no FK by design (mirrors auth_tokens; rows are ephemeral, cleared per-test via
+-- DATA_TABLES and opportunistically at /start).
+create table if not exists oauth_states (
+  nonce uuid primary key default gen_random_uuid(),
+  team_id uuid not null,
+  member_id uuid not null,
+  provider text not null default 'slack',
+  expires_at timestamptz not null,
+  used_at timestamptz,
+  created_at timestamptz not null default now()
+);
+create index if not exists oauth_states_expires_idx on oauth_states (expires_at);
+
 -- ── core tenancy ─────────────────────────────────────────────────────────────
 create table if not exists teams (
   id uuid primary key default gen_random_uuid(),
