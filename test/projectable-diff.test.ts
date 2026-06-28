@@ -4,6 +4,7 @@ import {
   projectableChanged,
   type ProjectableSnapshot,
 } from "@/lib/ingest/projectable-diff";
+import { taskRowSchema } from "@/lib/api/schemas";
 
 // Spec: the reactive push path re-projects ONLY rows whose projected fields changed. Projected set is
 // title · normalized status · sprint · priority · labels · parent_row_key · assignee — NOT due/body.
@@ -37,6 +38,14 @@ describe("projectable-diff (changed-rows predicate)", () => {
     // a present-but-empty assignee clears it (change); an absent assignee key preserves the snapshot
     expect(projectableChanged(s, effectiveProjectable({ title: "T", assignee: "" }, s))).toBe(true);
     expect(projectableChanged(s, effectiveProjectable({ title: "T" }, s))).toBe(false);
+  });
+
+  it("a parsed row that omitted assignee still preserves the snapshot", () => {
+    const s = snap({ title: "T", assignee: "Chetan" });
+    const parsed = taskRowSchema.parse({ row_key: "T-1", title: "T" });
+    expect("assignee" in parsed).toBe(false);
+    expect(projectableChanged(s, effectiveProjectable(parsed, s))).toBe(false);
+    expect(effectiveProjectable(parsed, s).assignee).toBe("Chetan");
   });
 
   it("a title change is changed", () => {

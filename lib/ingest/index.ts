@@ -274,7 +274,6 @@ async function materializeTasks(
       source_item_id: itemId,
       row_key: row.row_key,
       title: row.title,
-      assignee: row.assignee ?? "",
       status,
       raw_status,
       sprint: row.sprint ?? "",
@@ -282,6 +281,8 @@ async function materializeTasks(
       origin: "sync",
       updated_at: syncedAt,
     };
+    if ("assignee" in row) upsertRow.assignee = (row.assignee ?? "").trim();
+    else if (!snapshot) upsertRow.assignee = "";
     if ("parent" in row) upsertRow.parent_row_key = parentOf(row) || null;
     if ("labels" in row) upsertRow.labels = row.labels ?? [];
     if ("priority" in row) upsertRow.priority = normalizeTaskPriority(row.priority);

@@ -55,7 +55,7 @@ export function effectiveProjectable(
     labels: "labels" in row ? row.labels ?? [] : snapshot?.labels ?? [],
     parent_row_key:
       "parent" in row ? (row.parent ?? "").trim() || null : snapshot?.parent_row_key ?? null,
-    assignee: "assignee" in row ? (row.assignee ?? "") : snapshot?.assignee ?? "",
+    assignee: "assignee" in row ? (row.assignee ?? "").trim() : snapshot?.assignee ?? "",
   };
 }
 
