@@ -35,6 +35,7 @@ export interface ProjectionTaskRow {
   labels: string[];
   body: string;
   parent_row_key: string | null;
+  assignee: string;
 }
 
 export type ProjectionStatus =
@@ -124,6 +125,7 @@ function toProjectable(row: ProjectionTaskRow, parentResourceId: string | null):
     priority: row.priority || "none",
     labels: row.labels ?? [],
     sprint: row.sprint ?? "",
+    assignee: row.assignee ?? "",
     parentResourceId,
   };
 }
@@ -136,7 +138,7 @@ const LINK_COLS =
 // The exact `tasks` columns that hydrate a ProjectionTaskRow. Named explicitly (the pg adapter
 // rejects "*") and shared by every loader so the projected shape can't drift between call sites.
 export const PROJECTION_TASK_COLS =
-  "id, team_id, project_id, row_key, title, status, sprint, priority, labels, body, parent_row_key";
+  "id, team_id, project_id, row_key, title, status, sprint, priority, labels, body, parent_row_key, assignee";
 
 // Get-or-create the task_pm_links row for (team, project, row_key, provider).
 async function ensureLink(

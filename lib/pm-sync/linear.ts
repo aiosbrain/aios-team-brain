@@ -21,6 +21,7 @@ import { linearGraphql, parseExt, withFooter, stripFooter } from "@/lib/pm-sync/
 
 type LinearState = { id: string; name: string; type: string };
 type LinearLabel = { id: string; name: string };
+type LinearUser = { id: string; name?: string; displayName?: string; email?: string };
 type LinearIssue = {
   id: string;
   identifier?: string;
@@ -31,6 +32,7 @@ type LinearIssue = {
   parent?: { id: string } | null;
   state?: { id: string; name?: string; type?: string } | null;
   labels?: { nodes: LinearLabel[] } | null;
+  assignee?: { id: string } | null;
   team?: { id: string } | null;
 };
 
@@ -38,8 +40,18 @@ interface LinearBootstrap {
   teamId: string;
   states: LinearState[];
   labels: Map<string, string>; // name → id
+  members: Map<string, string>; // normalized name / displayName / email → user id
   issuesByExt: Map<string, LinearIssue>; // row_key → issue
   issuesById: Map<string, LinearIssue>;
+}
+
+// Resolve a brain `assignee` free-text value to a Linear user id. Returns undefined when the text is
+// empty OR matches no member — callers treat undefined as "leave the provider assignee untouched"
+// (the brain never force-unassigns; it only sets an owner it can positively resolve).
+function resolveAssigneeId(members: Map<string, string>, assignee: string): string | undefined {
+  const key = normalizeName(assignee || "");
+  if (!key) return undefined;
+  return members.get(key) ?? members.get((assignee || "").trim().toLowerCase());
 }
 
 // Plane↔Linear share five groups; Linear state.type uses "canceled" (one l).
@@ -80,6 +92,7 @@ async function buildBootstrap(ctx: LinearCtx, teamId: string): Promise<LinearBoo
     team: {
       states: { nodes: LinearState[] };
       labels: { nodes: LinearLabel[] };
+      members: { nodes: LinearUser[] };
     } | null;
   }>(
     ctx.fetchImpl,
@@ -88,12 +101,22 @@ async function buildBootstrap(ctx: LinearCtx, teamId: string): Promise<LinearBoo
       team(id: $teamId) {
         states(first: 100) { nodes { id name type } }
         labels(first: 250) { nodes { id name } }
+        members(first: 250) { nodes { id name displayName email } }
       }
     }`,
     { teamId }
   );
   const states = data.team?.states.nodes ?? [];
   const labels = new Map<string, string>((data.team?.labels.nodes ?? []).map((l) => [l.name, l.id]));
+
+  // Index each member under its normalized name + displayName, and its lowercased email, so a brain
+  // assignee written as a full name, a handle, or an email all resolve to the same user id.
+  const members = new Map<string, string>();
+  for (const u of data.team?.members?.nodes ?? []) {
+    if (u.name) members.set(normalizeName(u.name), u.id);
+    if (u.displayName) members.set(normalizeName(u.displayName), u.id);
+    if (u.email) members.set(u.email.trim().toLowerCase(), u.id);
+  }
 
   const issuesByExt = new Map<string, LinearIssue>();
   const issuesById = new Map<string, LinearIssue>();
@@ -107,7 +130,7 @@ async function buildBootstrap(ctx: LinearCtx, teamId: string): Promise<LinearBoo
         team(id: $teamId) {
           issues(first: 250, after: $after) {
             pageInfo { hasNextPage endCursor }
-            nodes { id identifier url title description priority parent { id } state { id name type } labels { nodes { id name } } team { id } }
+            nodes { id identifier url title description priority parent { id } state { id name type } labels { nodes { id name } } assignee { id } team { id } }
           }
         }
       }`,
@@ -123,7 +146,7 @@ async function buildBootstrap(ctx: LinearCtx, teamId: string): Promise<LinearBoo
     if (!conn.pageInfo.hasNextPage) break;
     after = conn.pageInfo.endCursor;
   }
-  return { teamId, states, labels, issuesByExt, issuesById };
+  return { teamId, states, labels, members, issuesByExt, issuesById };
 }
 
 async function ensureLabelIds(ctx: LinearCtx, boot: LinearBootstrap, names: string[]): Promise<string[]> {
@@ -173,12 +196,15 @@ async function resolveStatesForTeam(ctx: LinearCtx, teamId: string): Promise<Lin
   return data.team?.states.nodes ?? [];
 }
 
-function linearIssueMatches(issue: LinearIssue, desired: { title: string; stateId: string; priority: number; labelIds: string[]; parent: string | null; body: string }): boolean {
+function linearIssueMatches(issue: LinearIssue, desired: { title: string; stateId: string; priority: number; labelIds: string[]; parent: string | null; body: string; assigneeId: string | undefined }): boolean {
   if ((issue.title ?? "") !== desired.title) return false;
   if ((issue.state?.id ?? "") !== desired.stateId) return false;
   if ((issue.priority ?? 0) !== desired.priority) return false;
   if ((issue.parent?.id ?? null) !== desired.parent) return false;
   if (!sameLabelSet((issue.labels?.nodes ?? []).map((l) => l.id), desired.labelIds)) return false;
+  // Only a positively-resolved owner participates in the diff: undefined = "leave as-is", so a brain
+  // task with no resolvable owner never reports a mismatch on assignee (and never blanks it).
+  if (desired.assigneeId !== undefined && (issue.assignee?.id ?? null) !== desired.assigneeId) return false;
   if (stripFooter(issue.description) !== desired.body.trim()) return false;
   return true;
 }
@@ -246,8 +272,9 @@ export const linearAdapter: PmAdapter = {
     const labelIds = await ensureLabelIds(ctx, boot, task.labels);
     const priority = priorityToLinearInt(task.priority);
     const parent = task.parentResourceId ?? null;
+    const assigneeId = resolveAssigneeId(boot.members, task.assignee);
     const description = withFooter(task.body, task.row_key, ctx.externalSource);
-    const desiredFields = { title: task.title, stateId: state.id, priority, labelIds, parent, body: task.body };
+    const desiredFields = { title: task.title, stateId: state.id, priority, labelIds, parent, body: task.body, assigneeId };
 
     // Adopt-or-create: resource id wins, else the footer marker carrying the row_key.
     const existing = (link?.provider_resource_id ? boot.issuesById.get(link.provider_resource_id) : undefined) || boot.issuesByExt.get(task.row_key);
@@ -263,9 +290,9 @@ export const linearAdapter: PmAdapter = {
           `mutation UpdateIssue($id: String!, $input: IssueUpdateInput!) {
             issueUpdate(id: $id, input: $input) { success issue { id identifier url } }
           }`,
-          { id: issue.id, input: { title: task.title, description, stateId: state.id, priority, labelIds, parentId: parent } }
+          { id: issue.id, input: { title: task.title, description, stateId: state.id, priority, labelIds, parentId: parent, ...(assigneeId !== undefined ? { assigneeId } : {}) } }
         );
-        issue = { ...issue, ...data.issueUpdate.issue, state: { id: state.id }, priority, labels: { nodes: labelIds.map((id) => ({ id, name: "" })) }, parent: parent ? { id: parent } : null, title: task.title, description };
+        issue = { ...issue, ...data.issueUpdate.issue, state: { id: state.id }, priority, labels: { nodes: labelIds.map((id) => ({ id, name: "" })) }, parent: parent ? { id: parent } : null, assignee: assigneeId !== undefined ? { id: assigneeId } : issue.assignee, title: task.title, description };
         boot.issuesById.set(issue.id, issue);
         mutated = true;
       }
@@ -276,9 +303,9 @@ export const linearAdapter: PmAdapter = {
         `mutation CreateIssue($input: IssueCreateInput!) {
           issueCreate(input: $input) { success issue { id identifier url } }
         }`,
-        { input: { teamId, title: task.title, description, stateId: state.id, priority, labelIds, parentId: parent } }
+        { input: { teamId, title: task.title, description, stateId: state.id, priority, labelIds, parentId: parent, ...(assigneeId !== undefined ? { assigneeId } : {}) } }
       );
-      issue = { ...data.issueCreate.issue, description, title: task.title };
+      issue = { ...data.issueCreate.issue, description, title: task.title, assignee: assigneeId !== undefined ? { id: assigneeId } : null };
       boot.issuesById.set(issue.id, issue);
       boot.issuesByExt.set(task.row_key, issue);
       mutated = true;

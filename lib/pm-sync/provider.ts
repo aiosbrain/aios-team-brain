@@ -56,6 +56,10 @@ export interface ProjectableTask {
   priority: string; // normalized: none | low | medium | high | urgent
   labels: string[];
   sprint: string; // Wave name → Plane module membership ("" = none)
+  // Free-text owner (brain-canonical). Adapters resolve it to a provider user; "" means the brain
+  // asserts no owner — adapters MUST leave the provider assignee untouched (never force-unassign),
+  // so a brain task with no owner can't blank an assignee a human set in the PM tool.
+  assignee: string;
   parentResourceId?: string | null;
 }
 
@@ -159,6 +163,7 @@ export function projectionFingerprint(
     priority: task.priority || "none",
     parent: parentResourceId ?? "",
     sprint: task.sprint ?? "",
+    assignee: task.assignee ?? "",
     group: desiredStateForStatus(task.status).group,
   });
   return createHash("sha256").update(payload).digest("hex");
