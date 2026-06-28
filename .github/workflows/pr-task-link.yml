@@ -1,0 +1,33 @@
+name: PR task link (advisory)
+
+# Nudge, not a gate: warns when a PR has no brain task work-key, so untracked work is
+# visible at review time. The actual close happens on merge via aios-work-sync.yml
+# (→ POST /api/v1/work-events → tasks.status=done → pm-sync projects to Linear).
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  work-key:
+    name: PR references a brain task
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check for an AIOS work-key
+        run: |
+          node <<'NODE'
+          const fs = require("node:fs");
+          const ev = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, "utf8"));
+          const pr = ev.pull_request || {};
+          const text = [pr.title, pr.body || "", pr.head?.ref || ""].join("\n");
+          // Same matcher aios-work-sync uses (lib/pm-sync/work-keys): AIO-12 / W2.5.8 / etc.
+          const re = /\b(?:AIOS-Work:\s*)?([A-Z][A-Z0-9]+-\d+|[A-Z]\d+(?:\.\d+)*)\b/g;
+          const keys = [...new Set([...text.matchAll(re)].map((m) => m[1]))];
+          if (keys.length) {
+            console.log(`Found work key(s): ${keys.join(", ")} — merge will advance the matching brain task to Done.`);
+          } else {
+            console.log("::warning title=No brain task linked::This PR has no AIOS work-key (e.g. `AIOS-Work: W2.5.8`). Merge won't auto-close a task in Linear. If this work should be tracked, link or create a brain task first. (Advisory — not blocking.)");
+          }
+          NODE
