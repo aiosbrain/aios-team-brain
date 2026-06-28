@@ -27,15 +27,15 @@ we're testing.
 ## Common preamble (already embedded in each prompt below — shown once for reference)
 
 > You are a senior engineer on **AIOS Team Brain** (Next.js 16 App Router · React 19 · TypeScript ·
-> Postgres via `lib/db/pg`). **First, read** the root `/Users/iamjohndass/Projects/aios/CLAUDE.md`
+> Postgres via `lib/db/pg`). **First, read** the root `~/Projects/aios/CLAUDE.md`
 > (it MANDATES git worktrees — follow it), this repo's `CLAUDE.md` + `AGENTS.md`, and
 > `docs/ARCHITECTURE.md` §1. Then set up your worktree:
 > ```bash
-> cd /Users/iamjohndass/Projects/aios/aios-team-brain
+> cd ~/Projects/aios/aios-team-brain
 > git fetch origin
 > git worktree add -b feat/<epic> ../aios-team-brain-<epic> origin/main
 > cd ../aios-team-brain-<epic>
-> ln -sfn /Users/iamjohndass/Projects/aios/aios-team-brain/node_modules node_modules
+> ln -sfn ~/Projects/aios/aios-team-brain/node_modules node_modules
 > ```
 > **Plane tracking (workspace `aios-alpha`, project `AIOS`, via the Plane MCP):** find the epic and its
 > sub-issues; assign the epic and sub-issues to yourself; move the epic to **In Progress** when you
@@ -55,14 +55,14 @@ we're testing.
 ## F3 — Integrations auth surfaces + contract bump  (Wave A)
 
 ```
-You are a senior engineer on AIOS Team Brain (Next.js 16 App Router, React 19, TypeScript, Postgres via lib/db/pg). Read /Users/iamjohndass/Projects/aios/CLAUDE.md (it MANDATES git worktrees — follow it), this repo's CLAUDE.md + AGENTS.md, and docs/ARCHITECTURE.md §1 before coding.
+You are a senior engineer on AIOS Team Brain (Next.js 16 App Router, React 19, TypeScript, Postgres via lib/db/pg). Read ~/Projects/aios/CLAUDE.md (it MANDATES git worktrees — follow it), this repo's CLAUDE.md + AGENTS.md, and docs/ARCHITECTURE.md §1 before coding.
 
 Set up your worktree:
-  cd /Users/iamjohndass/Projects/aios/aios-team-brain
+  cd ~/Projects/aios/aios-team-brain
   git fetch origin
   git worktree add -b feat/f3-integrations-auth ../aios-team-brain-f3 origin/main
   cd ../aios-team-brain-f3
-  ln -sfn /Users/iamjohndass/Projects/aios/aios-team-brain/node_modules node_modules
+  ln -sfn ~/Projects/aios/aios-team-brain/node_modules node_modules
 
 Track progress in Plane via the Plane MCP (workspace aios-alpha, project AIOS): find epic "F3 — Integrations auth surfaces + contract bump" and its sub-issues (F3.1–F3.4). Assign the epic and sub-issues to yourself. Move the epic to In Progress now; move each sub-issue to Done as you complete it; comment the PR URL on the epic when you open it.
 
@@ -82,14 +82,14 @@ VERIFY: npx tsc --noEmit; npm run lint; npm test; npm run check:docs; npm run db
 ## F4 — Sidecar consumes selections  (Wave B — after F3 merges)
 
 ```
-You are a senior engineer on AIOS (the Python ingestion sidecar in aios-team-brain/ingestion + the brain). Read /Users/iamjohndass/Projects/aios/CLAUDE.md (MANDATES worktrees), this repo's CLAUDE.md/AGENTS.md, docs/ARCHITECTURE.md §1, and the ingestion source pattern (ingestion/aios_ingest/sources/registry.py, engine.py, brain_client.py). Requires F3 (GET /api/v1/integrations) merged to main — confirm it exists before starting.
+You are a senior engineer on AIOS (the Python ingestion sidecar in aios-team-brain/ingestion + the brain). Read ~/Projects/aios/CLAUDE.md (MANDATES worktrees), this repo's CLAUDE.md/AGENTS.md, docs/ARCHITECTURE.md §1, and the ingestion source pattern (ingestion/aios_ingest/sources/registry.py, engine.py, brain_client.py). Requires F3 (GET /api/v1/integrations) merged to main — confirm it exists before starting.
 
 Worktree:
-  cd /Users/iamjohndass/Projects/aios/aios-team-brain
+  cd ~/Projects/aios/aios-team-brain
   git fetch origin
   git worktree add -b feat/f4-sidecar-selections ../aios-team-brain-f4 origin/main
   cd ../aios-team-brain-f4
-  ln -sfn /Users/iamjohndass/Projects/aios/aios-team-brain/node_modules node_modules
+  ln -sfn ~/Projects/aios/aios-team-brain/node_modules node_modules
 
 Plane: epic "F4 — Sidecar consumes selections" (F4.1–F4.3). Assign the epic and sub-issues to yourself. Epic → In Progress; sub-issues → Done as completed; comment PR on the epic.
 
@@ -105,14 +105,14 @@ VERIFY: run the ingestion Python tests; npm run check:docs if you touch ARCHITEC
 ## F5 — Admin Integrations UI + tier guards  (Wave B — after F3 merges)
 
 ```
-You are a senior engineer on AIOS Team Brain. Read /Users/iamjohndass/Projects/aios/CLAUDE.md (MANDATES worktrees), this repo's CLAUDE.md/AGENTS.md, docs/ARCHITECTURE.md §1 and §5 (tier isolation), and these existing patterns: components/admin/admin-tabs.tsx, app/t/[team]/admin/layout.tsx (admin gate), lib/auth/visibility.ts, test/guards/codebases-tier-filter.test.ts. Requires F3 merged.
+You are a senior engineer on AIOS Team Brain. Read ~/Projects/aios/CLAUDE.md (MANDATES worktrees), this repo's CLAUDE.md/AGENTS.md, docs/ARCHITECTURE.md §1 and §5 (tier isolation), and these existing patterns: components/admin/admin-tabs.tsx, app/t/[team]/admin/layout.tsx (admin gate), lib/auth/visibility.ts, test/guards/codebases-tier-filter.test.ts. Requires F3 merged.
 
 Worktree:
-  cd /Users/iamjohndass/Projects/aios/aios-team-brain
+  cd ~/Projects/aios/aios-team-brain
   git fetch origin
   git worktree add -b feat/f5-integrations-ui ../aios-team-brain-f5 origin/main
   cd ../aios-team-brain-f5
-  ln -sfn /Users/iamjohndass/Projects/aios/aios-team-brain/node_modules node_modules
+  ln -sfn ~/Projects/aios/aios-team-brain/node_modules node_modules
 
 Plane: epic "F5 — Admin Integrations UI + tier guards" (F5.1–F5.5). Assign the epic and sub-issues to yourself. Epic → In Progress; sub-issues → Done; comment PR.
 
@@ -130,14 +130,14 @@ VERIFY: npx tsc --noEmit; npm run lint; npm test; npm run check:docs; npm run db
 ## W1.1 — Granola → decisions (sanitized, consented)  (Wave A)
 
 ```
-You are a senior engineer on AIOS (the Python ingestion sidecar + the transcript→decision workflow). Read /Users/iamjohndass/Projects/aios/CLAUDE.md (MANDATES worktrees), this repo's CLAUDE.md/AGENTS.md, the source pattern (ingestion/aios_ingest/sources/registry.py + base.py + an existing source like slack.py), and the existing granola-digest + transcript-decisions skills. There is already a granola-mcp server configured — reuse its pull/parse logic; do not re-write transcript fetching.
+You are a senior engineer on AIOS (the Python ingestion sidecar + the transcript→decision workflow). Read ~/Projects/aios/CLAUDE.md (MANDATES worktrees), this repo's CLAUDE.md/AGENTS.md, the source pattern (ingestion/aios_ingest/sources/registry.py + base.py + an existing source like slack.py), and the existing granola-digest + transcript-decisions skills. There is already a granola-mcp server configured — reuse its pull/parse logic; do not re-write transcript fetching.
 
 Worktree:
-  cd /Users/iamjohndass/Projects/aios/aios-team-brain
+  cd ~/Projects/aios/aios-team-brain
   git fetch origin
   git worktree add -b feat/w1.1-granola ../aios-team-brain-w1.1 origin/main
   cd ../aios-team-brain-w1.1
-  ln -sfn /Users/iamjohndass/Projects/aios/aios-team-brain/node_modules node_modules
+  ln -sfn ~/Projects/aios/aios-team-brain/node_modules node_modules
 
 Plane: epic "W1.1 — Granola → decisions (sanitized, consented)" (W1.1.1–W1.1.5). Assign the epic and sub-issues to yourself. Epic → In Progress; sub-issues → Done; comment PR.
 
@@ -155,14 +155,14 @@ VERIFY: ingestion Python tests; npm run check:docs (drift:sources). PR from feat
 ## W1.2 — Token + cost per member (brain spend)  (Wave A)
 
 ```
-You are a senior engineer on AIOS Team Brain. Read /Users/iamjohndass/Projects/aios/CLAUDE.md (MANDATES worktrees), this repo's CLAUDE.md/AGENTS.md, and these SHIPPED pieces you build on: lib/auth/visibility.ts (scopeQueryLog — query_log is role-scoped), lib/identity/resolve.ts (shared identity resolver), lib/metrics/pulse.ts (JS day-bucketing pattern), and the codebases contributor-table/chart components.
+You are a senior engineer on AIOS Team Brain. Read ~/Projects/aios/CLAUDE.md (MANDATES worktrees), this repo's CLAUDE.md/AGENTS.md, and these SHIPPED pieces you build on: lib/auth/visibility.ts (scopeQueryLog — query_log is role-scoped), lib/identity/resolve.ts (shared identity resolver), lib/metrics/pulse.ts (JS day-bucketing pattern), and the codebases contributor-table/chart components.
 
 Worktree:
-  cd /Users/iamjohndass/Projects/aios/aios-team-brain
+  cd ~/Projects/aios/aios-team-brain
   git fetch origin
   git worktree add -b feat/w1.2-cost-per-member ../aios-team-brain-w1.2 origin/main
   cd ../aios-team-brain-w1.2
-  ln -sfn /Users/iamjohndass/Projects/aios/aios-team-brain/node_modules node_modules
+  ln -sfn ~/Projects/aios/aios-team-brain/node_modules node_modules
 
 Plane: epic "W1.2 — Token + cost per member (brain spend)" (W1.2.1–W1.2.4). Assign the epic and sub-issues to yourself. Epic → In Progress; sub-issues → Done; comment PR.
 
@@ -179,14 +179,14 @@ VERIFY: npx tsc --noEmit; npm run lint; npm test; npm run db:test:up && npm run 
 ## W1.3 — GitHub native UI (selection + manual scan)  (Wave C — after F5 merges)
 
 ```
-You are a senior engineer on AIOS Team Brain. Read /Users/iamjohndass/Projects/aios/CLAUDE.md (MANDATES worktrees), this repo's CLAUDE.md/AGENTS.md, and reuse (do NOT fork): lib/codebases/github.ts (fetchGithubUser/listOrgMembers/linkGithub), lib/codebases/ingest.ts (single writer), lib/codebases/visibility.ts (canSeeCodebases). Requires F5 (integrations UI) and F4 (sidecar consumes selections) merged. Heed memory codebase-scan-deploy-race.
+You are a senior engineer on AIOS Team Brain. Read ~/Projects/aios/CLAUDE.md (MANDATES worktrees), this repo's CLAUDE.md/AGENTS.md, and reuse (do NOT fork): lib/codebases/github.ts (fetchGithubUser/listOrgMembers/linkGithub), lib/codebases/ingest.ts (single writer), lib/codebases/visibility.ts (canSeeCodebases). Requires F5 (integrations UI) and F4 (sidecar consumes selections) merged. Heed memory codebase-scan-deploy-race.
 
 Worktree:
-  cd /Users/iamjohndass/Projects/aios/aios-team-brain
+  cd ~/Projects/aios/aios-team-brain
   git fetch origin
   git worktree add -b feat/w1.3-github-ui ../aios-team-brain-w1.3 origin/main
   cd ../aios-team-brain-w1.3
-  ln -sfn /Users/iamjohndass/Projects/aios/aios-team-brain/node_modules node_modules
+  ln -sfn ~/Projects/aios/aios-team-brain/node_modules node_modules
 
 Plane: epic "W1.3 — GitHub native UI (selection + manual scan)" (W1.3.1–W1.3.4). Assign the epic and sub-issues to yourself. Epic → In Progress; sub-issues → Done; comment PR.
 
@@ -203,14 +203,14 @@ VERIFY: npx tsc --noEmit; npm run lint; npm test; npm run check:docs; data-mecha
 ## W1.4 — Ops hardening (Sentry, CodeRabbit, BugBot)  (Wave A)
 
 ```
-You are a senior engineer on AIOS Team Brain (Next.js 16 + Turbopack). Read /Users/iamjohndass/Projects/aios/CLAUDE.md (MANDATES worktrees) and this repo's CLAUDE.md/AGENTS.md. AGENTS.md warns this Next.js has breaking changes — read node_modules/next/dist/docs as needed.
+You are a senior engineer on AIOS Team Brain (Next.js 16 + Turbopack). Read ~/Projects/aios/CLAUDE.md (MANDATES worktrees) and this repo's CLAUDE.md/AGENTS.md. AGENTS.md warns this Next.js has breaking changes — read node_modules/next/dist/docs as needed.
 
 Worktree:
-  cd /Users/iamjohndass/Projects/aios/aios-team-brain
+  cd ~/Projects/aios/aios-team-brain
   git fetch origin
   git worktree add -b feat/w1.4-ops ../aios-team-brain-w1.4 origin/main
   cd ../aios-team-brain-w1.4
-  ln -sfn /Users/iamjohndass/Projects/aios/aios-team-brain/node_modules node_modules
+  ln -sfn ~/Projects/aios/aios-team-brain/node_modules node_modules
 
 Plane: epic "W1.4 — Ops hardening (Sentry, CodeRabbit, BugBot)" (W1.4.1–W1.4.4). Assign the epic and sub-issues to yourself. Epic → In Progress; sub-issues → Done; comment PR.
 
