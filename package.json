@@ -33,7 +33,7 @@
     "@anthropic-ai/sdk": "^0.105.0",
     "@dnd-kit/core": "^6.3.1",
     "@dnd-kit/sortable": "^10.0.0",
-    "@sentry/nextjs": "^10.58.0",
+    "@sentry/nextjs": "^10.62.0",
     "@supabase/ssr": "^0.12.0",
     "@supabase/supabase-js": "^2.108.2",
     "jose": "^6.2.3",
