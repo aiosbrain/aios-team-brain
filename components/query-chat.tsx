@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
-import { Loader2, Send, Sparkles } from "lucide-react";
+import { Loader2, Maximize2, Minimize2, Send, Sparkles } from "lucide-react";
 import { Markdown } from "@/components/markdown";
 
 type SourceChip = {
@@ -13,7 +13,7 @@ type SourceChip = {
   kind: string;
 };
 
-type Exchange = {
+export type Exchange = {
   question: string;
   answer: string;
   sources: SourceChip[];
@@ -39,17 +39,39 @@ export function QueryChat({
   initialQuestion,
   variant = "embed",
   suggestions = DEFAULT_SUGGESTIONS,
+  initialConversationId = null,
+  initialMessages,
+  onConversationChange,
 }: {
   teamSlug: string;
   initialQuestion?: string;
   variant?: "page" | "embed";
   suggestions?: string[];
+  /** Seed an existing thread (the sidebar remounts QueryChat with `key` when switching threads). */
+  initialConversationId?: string | null;
+  initialMessages?: Exchange[];
+  /** Fires when this chat gets/changes its persistent thread id (so a list can refresh). */
+  onConversationChange?: (id: string) => void;
 }) {
   const [question, setQuestion] = useState("");
-  const [exchanges, setExchanges] = useState<Exchange[]>([]);
+  const [exchanges, setExchanges] = useState<Exchange[]>(initialMessages ?? []);
   const [busy, setBusy] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const askedInitial = useRef(false);
+  const [expanded, setExpanded] = useState(false);
+  // Persistent thread id — null until the server creates/returns one; sent on later turns so the
+  // brain loads this conversation's history server-side (shared across sessions and interfaces).
+  const [conversationId, setConversationId] = useState<string | null>(initialConversationId);
+
+  // Esc collapses the expanded (near-fullscreen) chat.
+  useEffect(() => {
+    if (!expanded) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setExpanded(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [expanded]);
 
   // Autoscroll to the newest content as the answer streams in.
   useEffect(() => {
@@ -72,7 +94,11 @@ export function QueryChat({
       const res = await fetch("/api/dashboard/query", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question: text, team: teamSlug }),
+        body: JSON.stringify({
+          question: text,
+          team: teamSlug,
+          ...(conversationId ? { conversation_id: conversationId } : {}),
+        }),
       });
 
       if (!res.ok || !res.body) {
@@ -95,7 +121,13 @@ export function QueryChat({
       const handle = (event: string, data: string) => {
         try {
           const payload = JSON.parse(data) as Record<string, unknown>;
-          if (event === "delta") {
+          if (event === "conversation") {
+            const id = String(payload.id ?? "");
+            if (id) {
+              setConversationId(id);
+              onConversationChange?.(id);
+            }
+          } else if (event === "delta") {
             answer += String(payload.text ?? "");
             patch({ answer });
           } else if (event === "sources") {
@@ -147,9 +179,33 @@ export function QueryChat({
   }, [initialQuestion]);
 
   const height = variant === "page" ? "h-[calc(100dvh-11rem)]" : "h-[26rem]";
+  // Expanded = a focused near-fullscreen overlay so long conversations are readable.
+  const panelClass = expanded
+    ? "fixed inset-3 z-50 mx-auto flex max-w-5xl flex-col overflow-hidden rounded-2xl border border-border-subtle bg-surface-inset shadow-2xl sm:inset-6"
+    : `flex ${height} flex-col overflow-hidden rounded-2xl border border-border-subtle bg-surface-inset`;
 
   return (
-    <div className={`flex ${height} flex-col overflow-hidden rounded-2xl border border-border-subtle bg-surface-inset`}>
+    <>
+      {expanded ? (
+        <div
+          className="fixed inset-0 z-40 bg-ink/40 backdrop-blur-sm"
+          onClick={() => setExpanded(false)}
+          aria-hidden
+        />
+      ) : null}
+      <div className={panelClass}>
+      {/* Slim chrome bar with the expand / collapse control. */}
+      <div className="flex items-center justify-end border-b border-border-subtle px-2 py-1">
+        <button
+          type="button"
+          onClick={() => setExpanded((v) => !v)}
+          className="rounded-md p-1 text-ink-tertiary transition-colors hover:bg-surface-raised hover:text-ink"
+          aria-label={expanded ? "Collapse chat" : "Expand chat"}
+          title={expanded ? "Collapse (Esc)" : "Expand"}
+        >
+          {expanded ? <Minimize2 className="size-3.5" /> : <Maximize2 className="size-3.5" />}
+        </button>
+      </div>
       {/* Messages (oldest → newest); scrolls; composer is pinned below. */}
       <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 py-4 sm:px-5">
         {exchanges.length === 0 ? (
@@ -257,6 +313,7 @@ export function QueryChat({
           {busy ? <Loader2 className="size-4 animate-spin" /> : <Send className="size-4" />}
         </button>
       </form>
-    </div>
+      </div>
+    </>
   );
 }
