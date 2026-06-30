@@ -6,6 +6,12 @@ on:
   push:
     branches: [main]
 
+# Cancel superseded runs on the same ref so rapid pushes don't pile up parallel
+# Postgres/build jobs. Each job already caches npm via setup-node (cache: "npm").
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   # Required gate: docs inventories must match the code (see docs/ARCHITECTURE.md).
   # Make this a required status check on `main` so PRs can't merge while docs drift.
@@ -18,6 +24,34 @@ jobs:
         with:
           node-version: "20"
       - run: node scripts/check-docs-drift.mjs
+
+  static-checks:
+    name: Static checks (lint + typecheck)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+          cache: "npm"
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+
+  secret-scan:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Working-tree scan (no git history): a backstop against newly committed secrets.
+      # Allowlist for example/fixture files lives in .gitleaks.toml. Pinned binary so we
+      # don't depend on the licensed gitleaks-action.
+      - name: Run gitleaks
+        env:
+          GITLEAKS_VERSION: "8.18.4"
+        run: |
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" | tar -xz gitleaks
+          ./gitleaks detect --no-git --source . --config .gitleaks.toml --redact --no-banner --exit-code 1
 
   brain-tests:
     name: Brain unit tests (vitest)
@@ -65,9 +99,9 @@ jobs:
   http-tests:
     name: Integration tests (HTTP)
     runs-on: ubuntu-latest
-    # Advisory until 5 consecutive green runs on main, then drop this line and add
-    # http-tests to branch protection (see docs/CI-ARCHITECTURE.md).
-    continue-on-error: true
+    # Now a blocking gate: the job was green on >5 consecutive `main` runs (the documented
+    # promotion bar — see docs/CI-ARCHITECTURE.md). To finish the promotion, add the
+    # "Integration tests (HTTP)" check to branch protection on `main` (repo Settings → Branches).
     services:
       postgres:
         image: postgres:16

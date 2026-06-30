@@ -67,6 +67,22 @@ create table if not exists auth_tokens (
 );
 create index if not exists auth_tokens_email_idx on auth_tokens (email, created_at desc);
 
+-- Single-use OAuth state nonces (one-click Slack connect): minted at /api/auth/slack/start,
+-- atomically consumed at /api/auth/slack/callback. Short-lived (10-min TTL); the signed state
+-- JWT carries the same nonce so a leaked/forged state can't be replayed. Same single-use family
+-- as auth_tokens — no FK by design (mirrors auth_tokens; rows are ephemeral, cleared per-test via
+-- DATA_TABLES and opportunistically at /start).
+create table if not exists oauth_states (
+  nonce uuid primary key default gen_random_uuid(),
+  team_id uuid not null,
+  member_id uuid not null,
+  provider text not null default 'slack',
+  expires_at timestamptz not null,
+  used_at timestamptz,
+  created_at timestamptz not null default now()
+);
+create index if not exists oauth_states_expires_idx on oauth_states (expires_at);
+
 -- ── core tenancy ─────────────────────────────────────────────────────────────
 create table if not exists teams (
   id uuid primary key default gen_random_uuid(),
@@ -137,6 +153,26 @@ create table if not exists member_identities (
   unique (team_id, provider, external_id)
 );
 create index if not exists member_identities_member_idx on member_identities (member_id);
+
+-- Per-member encrypted secrets (e.g. a member's own Slack USER token for "act as me").
+-- DISTINCT from team `integrations.secret_ciphertext` (team-scoped, bot/read): this is
+-- per-member + write-capable, written only by lib/member-secrets/manage.ts (audited
+-- single writer) and read only by the owner via GET /api/v1/me/<provider>-token.
+-- `secret_ciphertext` is the AES-256-GCM blob (lib/secrets/crypto.ts); `meta` holds
+-- NON-secret context (slack_user_id, workspace, scopes, acquired_via). The secret value
+-- is never stored or logged in plaintext.
+create table if not exists member_secrets (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  member_id uuid not null references members(id) on delete cascade,
+  provider text not null,                  -- 'slack'
+  secret_ciphertext text not null,         -- AES-256-GCM blob (base64), encryptSecret()
+  meta jsonb not null default '{}',
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  unique (team_id, member_id, provider)
+);
+create index if not exists member_secrets_member_idx on member_secrets (member_id);
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Identity CONTEXT layer — per-member curated context on top of the lean roster.

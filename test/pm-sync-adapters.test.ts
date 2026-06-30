@@ -60,7 +60,7 @@ function planeMock(opts: { items?: unknown[]; labels?: { id: string; name: strin
 }
 
 function projectable(over: Partial<ProjectableTask> = {}): ProjectableTask {
-  return { row_key: "P0", title: "Epic title", body: "Do the thing", status: "ready", priority: "none", labels: [], sprint: "", parentResourceId: null, ...over };
+  return { row_key: "P0", title: "Epic title", body: "Do the thing", status: "ready", priority: "none", labels: [], sprint: "", assignee: "", parentResourceId: null, ...over };
 }
 
 describe("Plane projection — upsertWorkItem", () => {
@@ -152,7 +152,7 @@ const linearIntegration = {
   config: { teamId: "team-uuid" },
 } as IntegrationWithSecret;
 
-function linearMock(opts: { issues?: unknown[]; states?: unknown[]; labels?: unknown[] } = {}) {
+function linearMock(opts: { issues?: unknown[]; states?: unknown[]; labels?: unknown[]; members?: unknown[] } = {}) {
   const mutations: { name: string; variables: { [k: string]: unknown } }[] = [];
   const states = opts.states ?? [
     { id: "ls-todo", name: "Todo", type: "unstarted" },
@@ -163,6 +163,9 @@ function linearMock(opts: { issues?: unknown[]; states?: unknown[]; labels?: unk
     const { query, variables } = JSON.parse(String(init?.body));
     if (query.includes("ProjectionBootstrap")) {
       return Response.json({ data: { team: { states: { nodes: states }, labels: { nodes: opts.labels ?? [] } } } });
+    }
+    if (query.includes("ProjectionMembers")) {
+      return Response.json({ data: { team: { members: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: opts.members ?? [] } } } });
     }
     if (query.includes("ProjectionIssues")) {
       return Response.json({ data: { team: { issues: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: opts.issues ?? [] } } } });
@@ -227,6 +230,72 @@ describe("Linear projection — upsertWorkItem", () => {
     expect(result.status).toBe("synced");
     const create = mutations.find((m) => m.name === "CreateIssue");
     expect((create?.variables as { input: { description: string } }).input.description).toContain("aios-ext: P3 · source: aios-backlog");
+  });
+
+  it("resolves a brain assignee (by name / handle / email) to a Linear user id on create", async () => {
+    const members = [{ id: "LU-7", name: "Chetan", displayName: "chetan", email: "chetan@x.io" }];
+    for (const who of ["Chetan", "chetan", "CHETAN@X.IO"]) {
+      const task = projectable({ row_key: "P3", title: "Owned", assignee: who });
+      const { fetchImpl, mutations } = linearMock({ issues: [], members });
+      await linearAdapter.upsertWorkItem({
+        task,
+        link: { ...link, provider: "linear", row_key: "P3", provider_external_id: "P3" },
+        integration: linearIntegration,
+        desiredFingerprint: projectionFingerprint(task, null),
+        fetchImpl,
+      });
+      const create = mutations.find((m) => m.name === "CreateIssue");
+      expect((create?.variables as { input: { assigneeId?: string } }).input.assigneeId).toBe("LU-7");
+    }
+  });
+
+  it("does not guess when a normalized name is shared by two users (ambiguous → unresolved)", async () => {
+    // Two distinct users both normalize to "alexkim"; the ambiguous name must NOT resolve, but each
+    // user's unique email still does.
+    const members = [
+      { id: "LU-1", name: "Alex Kim", email: "alex.kim@x.io" },
+      { id: "LU-2", displayName: "alex-kim", email: "akim@x.io" },
+    ];
+    const task = projectable({ row_key: "P5", title: "Ambiguous", assignee: "Alex Kim" });
+    const { fetchImpl, mutations } = linearMock({ issues: [], members });
+    await linearAdapter.upsertWorkItem({
+      task,
+      link: { ...link, provider: "linear", row_key: "P5", provider_external_id: "P5" },
+      integration: linearIntegration,
+      desiredFingerprint: projectionFingerprint(task, null),
+      fetchImpl,
+    });
+    const create = mutations.find((m) => m.name === "CreateIssue");
+    expect((create?.variables as { input: Record<string, unknown> }).input).not.toHaveProperty("assigneeId");
+
+    // …but the unique email resolves unambiguously to that user.
+    const task2 = projectable({ row_key: "P6", title: "ByEmail", assignee: "akim@x.io" });
+    const m2 = linearMock({ issues: [], members });
+    await linearAdapter.upsertWorkItem({
+      task: task2,
+      link: { ...link, provider: "linear", row_key: "P6", provider_external_id: "P6" },
+      integration: linearIntegration,
+      desiredFingerprint: projectionFingerprint(task2, null),
+      fetchImpl: m2.fetchImpl,
+    });
+    expect((m2.mutations.find((m) => m.name === "CreateIssue")?.variables as { input: { assigneeId?: string } }).input.assigneeId).toBe("LU-2");
+  });
+
+  it("never sends assigneeId when the brain owner is empty or unresolved (no force-unassign)", async () => {
+    const members = [{ id: "LU-7", name: "Chetan" }];
+    for (const who of ["", "Nobody Known"]) {
+      const task = projectable({ row_key: "P4", title: "Unowned", assignee: who });
+      const { fetchImpl, mutations } = linearMock({ issues: [], members });
+      await linearAdapter.upsertWorkItem({
+        task,
+        link: { ...link, provider: "linear", row_key: "P4", provider_external_id: "P4" },
+        integration: linearIntegration,
+        desiredFingerprint: projectionFingerprint(task, null),
+        fetchImpl,
+      });
+      const create = mutations.find((m) => m.name === "CreateIssue");
+      expect((create?.variables as { input: Record<string, unknown> }).input).not.toHaveProperty("assigneeId");
+    }
   });
 
   it("moveToDone (back-compat) moves an issue to the completed state", async () => {

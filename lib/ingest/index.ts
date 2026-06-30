@@ -238,12 +238,13 @@ async function materializeTasks(
   // rows' projected fields changed this push (bounded reactive projection — see projectable-diff).
   const snapshotByKey = new Map<string, ProjectableSnapshot>();
   if (incomingKeys.size) {
-    const { data: before } = await supabase
+    const { data: before, error: beforeErr } = await supabase
       .from("tasks")
-      .select("row_key, title, status, sprint, priority, labels, parent_row_key")
+      .select("row_key, title, status, sprint, priority, labels, parent_row_key, assignee")
       .eq("team_id", teamId)
       .eq("project_id", projectId)
       .not("row_key", "is", null);
+    if (beforeErr) throw new Error(`task snapshot: ${beforeErr.message}`);
     for (const t of before ?? []) {
       if (!t.row_key || !incomingKeys.has(t.row_key)) continue;
       snapshotByKey.set(t.row_key, {
@@ -253,6 +254,7 @@ async function materializeTasks(
         priority: t.priority || "none",
         labels: t.labels ?? [],
         parent_row_key: t.parent_row_key ?? null,
+        assignee: t.assignee ?? "",
       });
     }
   }
@@ -260,8 +262,8 @@ async function materializeTasks(
 
   for (const row of rows) {
     const { status, raw_status } = normalizeTaskStatus(row.status || "");
-    // Projected-field change detection (title/status/sprint/priority/labels/parent only). A new row
-    // (no snapshot) is always "changed"; assignee/due/body changes never trigger projection.
+    // Projected-field change detection (title/status/sprint/priority/labels/parent/assignee). A new
+    // row (no snapshot) is always "changed"; due_date/body changes never trigger projection.
     const snapshot = snapshotByKey.get(row.row_key) ?? null;
     if (projectableChanged(snapshot, effectiveProjectable(row, snapshot))) changed.add(row.row_key);
     // `body` is dashboard/DB-only and `parent`/`labels`/`priority` are optional v1.2 fields: each is
@@ -273,7 +275,6 @@ async function materializeTasks(
       source_item_id: itemId,
       row_key: row.row_key,
       title: row.title,
-      assignee: row.assignee ?? "",
       status,
       raw_status,
       sprint: row.sprint ?? "",
@@ -281,6 +282,8 @@ async function materializeTasks(
       origin: "sync",
       updated_at: syncedAt,
     };
+    if ("assignee" in row) upsertRow.assignee = (row.assignee ?? "").trim();
+    else if (!snapshot) upsertRow.assignee = "";
     if ("parent" in row) upsertRow.parent_row_key = parentOf(row) || null;
     if ("labels" in row) upsertRow.labels = row.labels ?? [];
     if ("priority" in row) upsertRow.priority = normalizeTaskPriority(row.priority);

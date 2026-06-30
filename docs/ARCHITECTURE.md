@@ -33,6 +33,7 @@ Reason from this table, not from a random call site.
 | Identities (author→member) | `member_emails` (email/git aliases) + `member_identities` (provider user ids: slack/linear/plane/… ) (+ `members.github_login`/`avatar_url`) | `lib/admin/*` + GitHub sync (`lib/codebases/github`) for emails; **`lib/identity/member-identities` only** (`setMemberIdentity`/`removeMemberIdentity`) for provider ids — auto-mapped by email via the shared **`lib/identity/provider-sync.syncProviderIdentities`** (Slack/Linear/Plane connectors call it in `lib/ingest/run`); admins view + correct every link in the **Admin → Members "Identities" panel** (`lib/identity/list.listMemberIdentities` reader; `linkMemberIdentity`/`unlinkMemberIdentity`/`addMemberEmail`/`removeMemberEmail` actions) — the fix for "different email per platform"; the **"Re-attribute content"** button (`reattributeIdentitiesNow` → `lib/ingest/reattribute.reattributeItems`) re-applies current mappings to already-ingested items (which were attributed at ingest time) | **`lib/identity/resolve`** (the one resolver: `byEmail` + `byProviderId`) → `lib/codebases/ingest`, `lib/ingest` Slack/Linear/Plane per-author attribution (each issue's assignee, each thread's author), costs/maturity, dashboard | team-scoped one-to-one (`unique(team_id,email)` / `unique(team_id,provider,external_id)`); cross-member remap blocked unless forced. **Slack auto-map needs `users:read.email`** (Linear/Plane carry emails via their API); else map manually |
 | Identity context (per-member) | `member_profiles` (1:1: timezone, `working_hours`, `preferred_channels`, location, bio) + `member_time_off` (PTO/holiday ranges) + `member_goals` (OKRs/goals, `source`-tagged) | **`lib/identity/profile` only** (single-writer guarded; validates tz/working-hours/channel-allowlist/dates + audits) — manual self-service profile + admin edit; `member_goals.source` ≠ `manual` reserved for a future JIRA/Plane-initiative importer (idempotent on `(team,source,external_id)` via a partial unique index) | **`lib/identity/context.getMemberContext`** (folds profile + time-off + goals + projects DERIVED from `tasks.assignee`) → People page (`app/t/[team]/people/[handle]`) | team-tier only — `canSeeMemberContext` gate returns null for `external` (sole enforcement, no RLS backstop); guarded by `test/guards/member-context-tier-filter` |
 | Sessions (postgres) | `auth_users`, `auth_tokens` | `lib/auth/pg-*` | `getSessionUser` | signed httpOnly cookie |
+| Personal Slack token + OAuth state | `member_secrets` (per-member encrypted `xoxp` "act as me" token) + `oauth_states` (single-use OAuth nonces) | **`lib/member-secrets/manage` only** (`setMemberSecret`/`deleteMemberSecret`) for the token; **`lib/auth/slack-oauth-state` only** for nonces (mint at `GET /api/auth/slack/start`, atomically consume at `/callback`) | `getMemberSecret` → owner-only `GET /api/v1/me/slack-token` (paste path) + `GET /api/auth/slack/status` (connected/identity, never the token); nonces are consume-once, read nowhere else | token encrypted at rest (AES-256-GCM, `lib/secrets`), returned only over the owner-authed token endpoint, never logged. OAuth state = signed short-TTL JWT (HS256, `AUTH_SECRET`) bound to the single-use `oauth_states` nonce → CSRF + replay guard; **residual v1 risk:** first-use code-injection if an *unused* signed state leaks within its 10-min TTL (v2: PKCE/browser-binding) |
 | Rate limits | `rate_limits` | `rate_limit_hit` rpc | — | service-role only |
 | Integrations | `integrations` | **`lib/integrations/manage` only** (single-writer guarded; admin server actions) | Admin → Integrations page (`lib/integrations/read`, **admin-gated** `canManageIntegrations`); `GET /api/v1/integrations` (API-key, NON-secret selections via `manage.listEnabledIntegrationSelections`); in-process Slack + Plane + Linear + GitHub runners (`lib/ingest/run` via `manage.getEnabledIntegrationsWithSecrets`) | `config` is NON-secret (per-type allowlist + secret-key rejection); the connector secret is **encrypted at rest** in `secret_ciphertext` (`lib/secrets`, AES-256-GCM) and decrypted **only in-process** for the runner — it never leaves over HTTP, not even on the API-key read. Admin-tier (no per-row `access` column): both writes (`resolveIntegrationsAdmin`) and the dashboard read (`canManageIntegrations`, in `lib/integrations/read`) are app-code gated on `role==="admin"` — no RLS backstop; guarded by `test/guards/integrations-tier-filter` + the data-mechanics tier test. The page fails closed under `DB_BACKEND=supabase`. **LLM provider keys** (`openai`/`anthropic`/`google`) are secret-only integration types managed in the Admin → Integrations "AI provider keys" panel; the query LLM resolves the team's key via `manage.getProviderKey` (falls back to the process env when unset). postgres-only |
 | Codebase analytics | `codebases`, `code_metrics`, `code_contributions`, `github_issues` | **`lib/codebases/ingest` only** (single-writer guarded; via `POST /api/v1/codebases`) | codebases pages incl. Codebases → GitHub (scan freshness via `lib/metrics/codebases.getCodebaseFreshness` + live HEAD compare `lib/codebases/github.fetchRepoHeadSha`), `lib/metrics/codebases` | team-tier only; **app-code gate** (`lib/codebases/visibility` + guard) — no RLS backstop. Brain derives `agentic_score`/`health_score`; AEM `readiness_*` is scored scanner-side (`ingestion/aios_ingest/analyzers/readiness.py`) and persisted verbatim. W1.3 native UI: repo selection persists to `integrations` (type=github, admin); member→GitHub linking via `linkGithub` on Admin → Members (admin); **no server-triggered scan** — the GitHub surface documents the manual `aios-ingest scan` command; the repo selection (`config.repos`) is consumed by the in-process native GitHub importer (`lib/ingest/run`). Also projects each scan's `recent_commits` → searchable `items` (kind `artifact`, `frontmatter.source=git`, in the `commits` project) via `lib/codebases/commits-to-items` → `ingestItem` (author-attributed via the identity map, `team` tier) so git history is answerable in NL queries |
@@ -84,6 +85,11 @@ flowchart LR
 | 8 | Feedback loop | `work_events` + `lib/pm-sync` + codebase analytics | 🟡 PM progression loop + code health |
 
 ## Auth & access tiers
+
+This server **implements brain-api v1.2** (the wire contract; source of truth:
+`aios-workspace/docs/brain-api.md`). That version is pinned in code as `BRAIN_API_VERSION`
+(`lib/api/version.ts`) and asserted against this sentence by
+`test/guards/contract-version.test.ts` — bump all three together on a contract change.
 
 Two principals, one tier model:
 
@@ -422,6 +428,13 @@ guard enforces it, it's named.
   no RLS backstop in postgres mode.
 - **Add a migration** → 14-digit timestamp prefix; run `npm run db:test:up` to prove replay.
 - **Change access control** → treat it as dual-backend; add/extend a data-mechanics parity test.
+- **Change the brain-api wire contract** → the contract is pinned in
+  `aios-workspace/docs/brain-api.md`; bump `BRAIN_API_VERSION` (`lib/api/version.ts`) and this
+  doc's `v<version>` references together (guard: `test/guards/contract-version.test.ts`).
+- **Cross the module boundary** → `lib/` is the backend domain layer (never imports `app/`), and
+  `app/` reaches the DB only through the backend factory (`lib/supabase/server|admin`), never
+  `lib/db/pg` internals. Both directions are enforced by `import/no-restricted-paths` in
+  `eslint.config.mjs`.
 
 ## Keeping this doc honest
 
@@ -444,6 +457,14 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 - `GET /api/v1/decisions` — dashboard decision changes for `aios pull` writeback (tier-scoped)
 - `GET /api/v1/projects` — team project list for `aios pull` brain-project registration (team-tier only)
 - `GET /api/v1/me` — authenticated member identity + role (drives client UI gating)
+- `GET /api/v1/members` — team roster + cross-tool identities for external resolution (team-tier only; `?email`/`?handle`/`?provider` filters)
+- `GET /api/v1/identities/resolve` — resolve a provider external_id (or email/handle) to a member + canonical contacts incl. `slack_id` (team-tier only; 404 on miss)
+- `GET /api/v1/me/slack-token` — the caller's OWN Slack user token for "act as me" (owner-only: member from the API key, never a param; 404 if not connected; `no-store`)
+- `POST /api/v1/me/slack-token` — connect the caller's Slack via manual paste: validate (`auth.test`) + store encrypted (`member_secrets`) + capture identity
+- `DELETE /api/v1/me/slack-token` — disconnect the caller's Slack
+- `GET /api/auth/slack/start` — member-authed: mint single-use state nonce + return Slack OAuth authorize_url (signed short-TTL state JWT; CSRF/replay guard)
+- `GET /api/auth/slack/callback` — browser (no API key): verify+consume state nonce, exchange `code` (`oauth.v2.access`), re-validate via `auth.test`, store the user token encrypted (`member_secrets`) + capture identity; renders HTML (never the token)
+- `GET /api/auth/slack/status` — member-authed: `{ connected, slack_user_id, workspace }` (never returns the token; `no-store`)
 - `POST /api/v1/query` — SSE grounded query (`delta`/`sources`/`done`)
 - `GET /api/v1/okf-bundle` — OKF link graph (tier-filtered, link redaction)
 - `POST /api/v1/actions` — request a policy-gated action (Organ 4)
@@ -460,11 +481,11 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 ### Database tables
 
 <!-- drift:tables -->
-`auth_users` · `auth_tokens` · `teams` · `members` · `api_keys` · `audit_log` · `rate_limits` ·
+`auth_users` · `auth_tokens` · `oauth_states` · `teams` · `members` · `api_keys` · `audit_log` · `rate_limits` ·
 `projects` · `items` · `item_versions` · `tasks` · `decisions` · `graph_entities` ·
 `graph_relationships` · `query_log` · `policies` · `approval_requests` · `actions` ·
 `codebases` · `code_metrics` · `code_contributions` · `github_issues` · `member_emails` ·
-`member_identities` · `member_profiles` · `member_time_off` · `member_goals` · `integrations` ·
+`member_identities` · `member_secrets` · `member_profiles` · `member_time_off` · `member_goals` · `integrations` ·
 `agentic_maturity_snapshots` · `task_pm_links` · `work_events` · `usage_costs` · `graph_episodes`
 <!-- /drift:tables -->
 

@@ -10,7 +10,9 @@ import { z } from "zod";
 export const taskRowSchema = z.object({
   row_key: z.string().min(1),
   title: z.string(),
-  assignee: z.string().optional().default(""),
+  // Optional without a default so ingest can distinguish "omitted" (preserve existing assignee)
+  // from an explicit empty string (clear assignee).
+  assignee: z.string().optional(),
   status: z.string().optional().default(""),
   sprint: z.string().optional().default(""),
   due: z.string().nullable().optional(),
