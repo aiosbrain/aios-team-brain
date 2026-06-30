@@ -212,6 +212,10 @@ export type UsageCostPayload = z.infer<typeof usageCostPayloadSchema>;
 export const querySchema = z.object({
   question: z.string().min(1).max(4000),
   project: z.string().nullable().optional(),
+  // Optional persistent thread (owned by the key's member). Omit to start a new one — the server
+  // returns its id via a `conversation` SSE event. Pass it back so history loads server-side; this
+  // is what lets the CLI / Telegram-via-Hermes share threads with the dashboard chat.
+  conversation_id: z.string().uuid().optional(),
 });
 
 // Action-layer request (Organ 4). The brain authorizes `type` against policy before running.

@@ -6,6 +6,12 @@ import { querySchema, errorResponse } from "@/lib/api/schemas";
 import { retrieve } from "@/lib/query/retrieve";
 import { streamAnswer } from "@/lib/query/claude";
 import { getProviderKey } from "@/lib/integrations/manage";
+import {
+  ownsConversation,
+  recentTurns,
+  createConversation,
+  appendMessage,
+} from "@/lib/chat/store";
 
 export const runtime = "nodejs";
 export const maxDuration = 120;
@@ -51,7 +57,19 @@ export async function POST(req: NextRequest) {
   }
   const parsed = querySchema.safeParse(json);
   if (!parsed.success) return errorResponse("invalid_payload", "question required", 422);
-  const { question, project } = parsed.data;
+  const { question, project, conversation_id } = parsed.data;
+
+  // Persistent thread, owned by the key's member — same store as the dashboard chat, so a CLI /
+  // Telegram-via-Hermes turn continues the member's existing conversation. Load prior turns BEFORE
+  // recording the current question; the assistant turn is persisted once streaming completes.
+  const owner = { teamId: auth.teamId, memberId: auth.memberId };
+  let conversationId = conversation_id && (await ownsConversation(supabase, owner, conversation_id)) ? conversation_id : null;
+  const priorTurns = conversationId ? await recentTurns(supabase, owner, conversationId) : [];
+  if (!conversationId) {
+    const created = await createConversation(supabase, owner, question);
+    conversationId = created?.id ?? null;
+  }
+  if (conversationId) await appendMessage(supabase, owner, conversationId, "user", question);
 
   const started = Date.now();
   const ctx = await retrieve(supabase, auth.teamId, auth.memberTier, question, project);
@@ -68,9 +86,11 @@ export async function POST(req: NextRequest) {
       const send = (event: string, data: unknown) =>
         controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
 
+      if (conversationId) send("conversation", { id: conversationId });
+
       let answer = "";
       try {
-        for await (const chunk of streamAnswer(ctx, question, { anthropicKey, openaiKey })) {
+        for await (const chunk of streamAnswer(ctx, question, { anthropicKey, openaiKey }, priorTurns)) {
           if (chunk.type === "delta") {
             answer += chunk.text;
             send("delta", { text: chunk.text });
@@ -89,6 +109,15 @@ export async function POST(req: NextRequest) {
               }));
             send("sources", { sources });
             send("done", chunk.usage);
+
+            if (conversationId) {
+              await appendMessage(supabase, owner, conversationId, "assistant", answer, {
+                cited_item_ids: sources.map((s) => s.item_id).filter((id): id is string => Boolean(id)),
+                input_tokens: chunk.usage.input_tokens,
+                output_tokens: chunk.usage.output_tokens,
+                cost_usd: chunk.usage.cost_usd,
+              });
+            }
 
             await supabase.from("query_log").insert({
               team_id: auth.teamId,
