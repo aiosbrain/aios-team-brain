@@ -29,6 +29,8 @@ Rules:
 - Answer ONLY from the provided sources and structured context. If they don't cover the question, say so plainly — never invent facts, decisions, or attributions.
 - Cite sources inline using their markers, e.g. [S2]. Cite the structured context as [CTX].
 - Be concise and operational: lead with the answer, then the supporting evidence.
+- Answer EVERY part of a multi-part question. If it contains several asks (e.g. about two different people), address each one explicitly — never silently drop a part.
+- If a <conversation_so_far> block is present, use it to resolve references to earlier turns ("he", "she", "they", "that", "the same one"). It is prior context only — still answer ONLY from the sources and structured context below.
 - Decisions marked [SUPERSEDED] are no longer valid — say so if relevant.
 - Interpret relative dates ("today", "yesterday", "this week", "recently") against the Current date given at the top of the context. Dates in the structured context (e.g. a task's "updated" date) are UTC calendar dates — compare them to the Current date to answer "what happened today/this week".
 - Never speculate about content above the caller's access tier; what you were given is what they may see.`;
@@ -57,6 +59,41 @@ export function groundingNote(grounded: boolean): string {
     : "[Retrieval note] No documents specifically matched this question — the sources below are recent items included only as background. If neither they nor the structured context clearly contain the answer, say you don't have that information rather than guessing.\n\n";
 }
 
+/** One prior exchange in the current chat session, used to resolve follow-ups/pronouns. */
+export interface ChatTurn {
+  question: string;
+  answer: string;
+}
+
+// Windowed memory: the brain is RAG-grounded, not a freeform chatbot, so we carry only the last
+// few turns (each answer truncated) — enough to resolve "he/that", cheap on tokens, no overflow.
+const MAX_HISTORY_TURNS = 6;
+const MAX_ANSWER_CHARS = 400;
+
+/**
+ * Build a compact `<conversation_so_far>` block from recent turns so the model can resolve
+ * references to earlier messages. Pure + bounded: last N turns, each prior answer collapsed to a
+ * single line and truncated. Returns "" when there's no usable history.
+ */
+export function conversationBlock(
+  history: ChatTurn[] | undefined,
+  opts: { maxTurns?: number; maxAnswerChars?: number } = {}
+): string {
+  const maxTurns = opts.maxTurns ?? MAX_HISTORY_TURNS;
+  const maxAnswerChars = opts.maxAnswerChars ?? MAX_ANSWER_CHARS;
+  const recent = (history ?? [])
+    .filter((t) => t.question.trim())
+    .slice(-maxTurns);
+  if (recent.length === 0) return "";
+  const lines = recent.map((t) => {
+    const q = t.question.trim().replace(/\s+/g, " ");
+    let a = t.answer.trim().replace(/\s+/g, " ");
+    if (a.length > maxAnswerChars) a = `${a.slice(0, maxAnswerChars).trimEnd()}…`;
+    return a ? `User: ${q}\nBrain: ${a}` : `User: ${q}`;
+  });
+  return `<conversation_so_far>\n${lines.join("\n\n")}\n</conversation_so_far>`;
+}
+
 export type QueryUsage = {
   input_tokens: number;
   output_tokens: number;
@@ -77,7 +114,8 @@ export interface ProviderKeys {
 export async function* streamAnswer(
   ctx: RetrievedContext,
   question: string,
-  keys: ProviderKeys = {}
+  keys: ProviderKeys = {},
+  history: ChatTurn[] = []
 ): AsyncGenerator<
   | { type: "delta"; text: string }
   | { type: "done"; usage: QueryUsage }
@@ -90,10 +128,11 @@ export async function* streamAnswer(
     .join("\n\n");
 
   const note = groundingNote(ctx.grounded);
+  const convo = conversationBlock(history);
 
   // Local OpenAI-compatible backend (Ollama/Hermes) — fully on-machine, $0.
   if (LLM_BASE_URL) {
-    yield* streamLocal(note, ctx.structured, sourcesBlock, question, keys.openaiKey);
+    yield* streamLocal(note, convo, ctx.structured, sourcesBlock, question, keys.openaiKey);
     return;
   }
 
@@ -119,6 +158,7 @@ export async function* streamAnswer(
           ...(note ? [{ type: "text" as const, text: note }] : []),
           { type: "text", text: `<structured_context>\n${ctx.structured}\n</structured_context>` },
           { type: "text", text: sourcesBlock || "<no document sources matched>" },
+          ...(convo ? [{ type: "text" as const, text: convo }] : []),
           { type: "text", text: `Question: ${question}` },
         ],
       },
@@ -156,6 +196,7 @@ export async function* streamAnswer(
  */
 async function* streamLocal(
   note: string,
+  convo: string,
   structured: string,
   sourcesBlock: string,
   question: string,
@@ -170,6 +211,7 @@ async function* streamLocal(
     note +
     `<structured_context>\n${structured}\n</structured_context>\n\n` +
     `${sourcesBlock || "<no document sources matched>"}\n\n` +
+    (convo ? `${convo}\n\n` : "") +
     `Question: ${question}`;
 
   const res = await fetch(`${LLM_BASE_URL!.replace(/\/$/, "")}/chat/completions`, {
