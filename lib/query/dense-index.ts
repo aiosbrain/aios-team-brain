@@ -2,6 +2,7 @@ import "server-only";
 import { runSql } from "@/lib/db/pg/pool";
 import { embed, embeddingsConfigured, toVectorLiteral } from "./embeddings";
 import { chunkText } from "./chunk";
+import { resolveEmbeddingKey } from "./embedding-key";
 
 /**
  * Single writer for `item_chunks` — chunks an item's body, embeds each chunk, and REPLACES the
@@ -124,11 +125,19 @@ export async function indexPendingItems(limit = 100, apiKey?: string | null): Pr
   );
   let indexed = 0;
   let chunks = 0;
+  const keyByTeam = new Map<string, string | null>(); // resolve each team's embedding key once
   for (const it of pending.rows) {
     try {
+      let key: string | null;
+      if (apiKey !== undefined) key = apiKey;
+      else if (keyByTeam.has(it.team_id)) key = keyByTeam.get(it.team_id)!;
+      else {
+        key = await resolveEmbeddingKey(it.team_id);
+        keyByTeam.set(it.team_id, key);
+      }
       const r = await indexItem(
         { id: it.id, teamId: it.team_id, body: it.body, access: it.access, contentSha256: it.content_sha256 },
-        apiKey
+        key
       );
       if (!r.skipped) {
         indexed++;

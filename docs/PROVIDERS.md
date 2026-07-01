@@ -43,9 +43,15 @@ Enable it in three steps (needs a Postgres with the `vector` extension — Railw
 ```bash
 npm run pg:schema           # base schema (as usual)
 npm run pg:schema:vector    # optional: create the vector extension + item_chunks + HNSW
-export EMBEDDINGS_URL=https://api.openai.com/v1   # + OPENAI_API_KEY (or a per-team key)
+export EMBEDDINGS_URL=https://api.openai.com/v1   # the embeddings endpoint (append /embeddings)
 npm run embed:backfill      # embed existing items (idempotent); new items index each ingest cycle
 ```
+
+**The embeddings key** is resolved the SAME way as the answering LLM's: the team's OpenAI key from
+**Admin → Integrations → AI model settings** (encrypted `integrations` store, via `getProviderKey`),
+falling back to the `OPENAI_API_KEY` env var when unset. So if you've already set the key in the
+dashboard for the LLM, dense retrieval reuses it — no extra env var needed. `EMBEDDINGS_URL` can be
+the same value as `LLM_BASE_URL` when both point at OpenAI.
 
 With `EMBEDDINGS_URL` unset **or** the pgvector schema not loaded, dense retrieval is a complete
 no-op — the brain behaves exactly as before. Dense hits are tier-filtered on live `items.access`
