@@ -2,6 +2,7 @@ import "server-only";
 import { runSql } from "@/lib/db/pg/pool";
 import { embed, toVectorLiteral } from "./embeddings";
 import { denseIndexAvailable } from "./dense-index";
+import { resolveEmbeddingKey } from "./embedding-key";
 import type { Source } from "./provider";
 
 /**
@@ -31,7 +32,9 @@ export async function denseSearch(
 ): Promise<DenseHit[]> {
   if (!question.trim() || !(await denseIndexAvailable())) return [];
   try {
-    const vecs = await embed([question], apiKey);
+    // Key from AI model settings (integrations store), same as the LLM; embed() falls back to env.
+    const key = apiKey ?? (await resolveEmbeddingKey(teamId));
+    const vecs = await embed([question], key);
     if (!vecs || !vecs[0]) return [];
     const qv = toVectorLiteral(vecs[0]);
 

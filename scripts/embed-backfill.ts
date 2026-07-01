@@ -8,6 +8,7 @@
  */
 import { runSql } from "@/lib/db/pg/pool";
 import { indexItem, denseIndexAvailable } from "@/lib/query/dense-index";
+import { resolveEmbeddingKey } from "@/lib/query/embedding-key";
 
 type ItemRow = {
   id: string;
@@ -36,15 +37,18 @@ async function main() {
   let chunks = 0;
   let skipped = 0;
   let failed = 0;
+  const keyByTeam = new Map<string, string | null>(); // resolve each team's embedding key once
   for (const it of items.rows) {
     try {
-      const r = await indexItem({
-        id: it.id,
-        teamId: it.team_id,
-        body: it.body,
-        access: it.access,
-        contentSha256: it.content_sha256,
-      });
+      let key = keyByTeam.get(it.team_id);
+      if (key === undefined) {
+        key = await resolveEmbeddingKey(it.team_id);
+        keyByTeam.set(it.team_id, key);
+      }
+      const r = await indexItem(
+        { id: it.id, teamId: it.team_id, body: it.body, access: it.access, contentSha256: it.content_sha256 },
+        key
+      );
       if (r.skipped) skipped++;
       else {
         indexed++;
