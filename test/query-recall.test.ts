@@ -57,6 +57,23 @@ describe("wantsActivityContext (context shaping)", () => {
       expect(wantsActivityContext(q), q).toBe(true);
     }
   });
+  // Spec (this branch): first-person "what have I done" questions must route to the activity digests
+  // too — otherwise "how about me?" has no git/people context to ground on. Bias stays inclusive.
+  it("true for first-person / completed-work questions", () => {
+    for (const q of [
+      "how about me?",
+      "what about me",
+      "what have I shipped this week?",
+      "what did I complete yesterday?",
+      "my github submissions",
+      "what are my open PRs?",
+      "what did I finish today",
+      "what have I merged lately",
+      "tell me about my recent work",
+    ]) {
+      expect(wantsActivityContext(q), q).toBe(true);
+    }
+  });
   it("false for non-activity questions", () => {
     for (const q of ["what did we decide about auth?", "show me the Q3 roadmap", "how does login work?", "what is the SSRF fix?"]) {
       expect(wantsActivityContext(q), q).toBe(false);

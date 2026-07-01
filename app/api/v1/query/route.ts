@@ -71,6 +71,9 @@ export async function POST(req: NextRequest) {
   }
   if (conversationId) await appendMessage(supabase, owner, conversationId, "user", question);
 
+  // Who the answer is FOR — anchors first-person resolution ("what did I ship?") to this member.
+  const caller = { displayName: auth.displayName, email: auth.email, handle: auth.actorHandle };
+
   const started = Date.now();
   const ctx = await retrieve(supabase, auth.teamId, auth.memberTier, question, project);
 
@@ -90,7 +93,7 @@ export async function POST(req: NextRequest) {
 
       let answer = "";
       try {
-        for await (const chunk of streamAnswer(ctx, question, { anthropicKey, openaiKey }, priorTurns)) {
+        for await (const chunk of streamAnswer(ctx, question, { anthropicKey, openaiKey }, priorTurns, caller)) {
           if (chunk.type === "delta") {
             answer += chunk.text;
             send("delta", { text: chunk.text });
