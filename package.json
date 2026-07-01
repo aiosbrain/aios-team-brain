@@ -14,6 +14,7 @@
     "dev:login": "set -a; . ./.env.local; set +a; npx tsx scripts/dev-login.ts",
     "pg:schema": "node scripts/pg-load-schema.mjs",
     "pg:schema:vector": "node scripts/pg-load-vector.mjs",
+    "embed:backfill": "npx tsx --conditions react-server scripts/embed-backfill.ts",
     "admin": "npx tsx --conditions react-server scripts/admin.ts",
     "brain-tasks": "npx tsx --conditions react-server scripts/brain-tasks.ts",
     "test": "vitest run",
