@@ -2,23 +2,18 @@ import "server-only";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { GraphitiClient, type GraphFact } from "@/lib/graph/graphiti-client";
 import { visibleGroupIds } from "@/lib/graph/group";
+import {
+  selectedProviderName,
+  type RetrievalProvider,
+  type Source,
+  type RetrievedContext,
+} from "./provider";
+import { externalProvider } from "./external-provider";
+import { denseSearch, fuseByRrf } from "./dense-search";
 
-export type Source = {
-  sid: string; // S1, S2…
-  item_id: string | null;
-  project: string;
-  path: string;
-  kind: string;
-  synced_at: string;
-  text: string;
-};
-
-export type RetrievedContext = {
-  sources: Source[];
-  structured: string; // decisions/tasks/graph digest (always included)
-  /** True when query-specific search (FTS/semantic) matched something; false = only recency padding. */
-  grounded: boolean;
-};
+// Types live in ./provider (the pluggable seam). Re-exported here so existing importers
+// (lib/query/claude, tests, …) keep importing them from "@/lib/query/retrieve" unchanged.
+export type { Source, RetrievedContext };
 
 const MAX_SOURCE_CHARS = 8_000;
 const MAX_TOTAL_CHARS = 160_000; // ~40k tokens context cap
@@ -330,7 +325,7 @@ async function peopleActivityDigest(supabase: SupabaseClient, teamId: string): P
  * + a per-contributor git-activity digest on the team tier) + recently synced items. All independent
  * queries run in parallel; all respect the caller's tier.
  */
-export async function retrieve(
+async function nativeRetrieve(
   supabase: SupabaseClient,
   teamId: string,
   tier: "team" | "external",
@@ -339,6 +334,9 @@ export async function retrieve(
 ): Promise<RetrievedContext> {
   // Kick off the Graphiti graph-memory search concurrently with Postgres retrieval.
   const graphFactsP = fetchGraphFacts(supabase, teamId, tier, question);
+  // Optional dense (semantic) passage search — pgvector. Runs concurrently; resolves to [] unless
+  // EMBEDDINGS_URL is set AND the pgvector schema is loaded (default installs stay pure-FTS).
+  const denseP = denseSearch(teamId, tier, question, projectSlug);
   // Git-activity + per-person activity digests (team tier only — internal) run in parallel too.
   // Context shaping: the activity digests are heavy + only relevant to "who's doing what" questions.
   const wantsActivity = tier === "team" && wantsActivityContext(question);
@@ -500,6 +498,39 @@ export async function retrieve(
     }
   }
 
+  // 2d. Dense (semantic) passage retrieval — the optional pgvector leg. Adds best-chunk sources for
+  // items keyword search missed, then RRF-fuses the keyword + dense rankings into the source order.
+  // denseHits is [] unless dense retrieval is configured, so default installs are byte-for-byte
+  // unchanged. Tier already enforced in denseSearch (live items.access).
+  let orderedSources = sources;
+  const denseHits = await denseP;
+  if (denseHits.length) {
+    grounded = true;
+    for (const h of denseHits) {
+      if (seen.has(h.item_id)) continue;
+      seen.add(h.item_id);
+      if (projectSlug && h.project !== projectSlug) continue;
+      const text = (h.content || "").slice(0, MAX_SOURCE_CHARS);
+      if (!text) continue;
+      if (total + text.length > MAX_TOTAL_CHARS) break;
+      total += text.length;
+      sources.push({
+        sid: `S${n++}`,
+        item_id: h.item_id,
+        project: h.project,
+        path: h.path,
+        kind: h.kind,
+        synced_at: h.synced_at,
+        text,
+      });
+    }
+    orderedSources = fuseByRrf(
+      sources,
+      (ftsHits ?? []).map((h) => (h as { id: string }).id),
+      denseHits.map((h) => h.item_id)
+    );
+  }
+
   // 3. Structured context (compact, always included) — built from the parallel results above.
   const [gitDigest, peopleDigest] = await Promise.all([gitDigestP, peopleDigestP]);
   const structured = [
@@ -549,7 +580,33 @@ export async function retrieve(
 
   // 4. Optional cross-encoder rerank (local llama-server or cloud). No-op when
   // RERANK_URL is unset; reorders so the most relevant source is cited first.
-  const ranked = await rerankSources(question, sources);
+  // (Runs on the RRF-fused order when dense retrieval contributed, else the FTS/recency order.)
+  const ranked = await rerankSources(question, orderedSources);
 
   return { sources: ranked, structured: structuredWithGraph, grounded };
+}
+
+/**
+ * The default context provider: Postgres FTS + structured digests + Graphiti temporal facts
+ * (+ optional external augmentation and cross-encoder rerank). Tier is enforced in-DB.
+ */
+export const nativeProvider: RetrievalProvider = {
+  name: "native",
+  retrieve: (r) => nativeRetrieve(r.supabase, r.teamId, r.tier, r.question, r.projectSlug),
+};
+
+/**
+ * Public retrieval entry — dispatches to the selected context provider (CONTEXT_PROVIDER, default
+ * `native`). Signature is unchanged so every caller (the two query routes, tests) is untouched;
+ * swapping the whole context layer for gbrain/another is `CONTEXT_PROVIDER=external` + an adapter.
+ */
+export async function retrieve(
+  supabase: SupabaseClient,
+  teamId: string,
+  tier: "team" | "external",
+  question: string,
+  projectSlug?: string | null
+): Promise<RetrievedContext> {
+  const provider = selectedProviderName() === "external" ? externalProvider : nativeProvider;
+  return provider.retrieve({ supabase, teamId, tier, question, projectSlug: projectSlug ?? null });
 }

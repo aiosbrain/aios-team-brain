@@ -5,17 +5,51 @@ optional reranker. **Both are configurable, and both default to cloud-free.**
 You can run the whole query path on your own machine, on cloud APIs, or mix the
 two — purely through environment variables. No code changes.
 
-There are three independent knobs:
+There are four independent knobs:
 
 | Knob | Env | Default (unset) | Local option | Cloud option |
 |------|-----|-----------------|--------------|--------------|
+| **Context layer** | `CONTEXT_PROVIDER` | `native` (Postgres + Graphiti) | `external` → a gbrain adapter | `external` → any RAG service |
 | **Answering LLM** | `LLM_BASE_URL` | Anthropic (`ANTHROPIC_API_KEY`) | Ollama / Hermes / llama.cpp | any OpenAI-compatible API |
 | **Reranker** | `RERANK_URL` | off (Postgres order) | `llama-server --reranking` | Cohere / Voyage / ZeroEntropy |
 | **Extra retrieval** | `RETRIEVAL_AUGMENT_URL` | off (Postgres only) | GBrain adapter | hosted retrieval API |
 
+**Context layer vs extra retrieval:** `RETRIEVAL_AUGMENT_URL` *adds* an external source on top of
+the native Postgres retrieval. `CONTEXT_PROVIDER=external` *replaces* the whole context layer with
+the external service (same `POST {query,limit,tier} → {sources[]}` contract) — the seam for swapping
+in gbrain or another engine wholesale. Both providers implement `RetrievalProvider` (`lib/query/provider.ts`).
+⚠️ An `external` provider must enforce the caller's **tier** itself — there is no DB backstop (CLAUDE.md §5).
+
 Everything degrades safely: if a local/cloud endpoint is unreachable or times
 out, the brain falls back (LLM → error surfaced; reranker/augmentation → skipped)
 rather than breaking the query.
+
+---
+
+## 0. Dense (semantic) retrieval — optional pgvector
+
+By default the native provider retrieves with **keyword FTS + Graphiti facts** and runs on stock
+Postgres (no extensions). You can add **dense passage retrieval** (embeddings + HNSW + RRF fusion
+with the keyword hits) as an opt-in upgrade:
+
+| Env | Default | Purpose |
+|-----|---------|---------|
+| `EMBEDDINGS_URL` | unset → dense OFF | OpenAI-compatible base, e.g. `https://api.openai.com/v1`, `http://localhost:11434/v1` (Ollama) |
+| `EMBEDDINGS_MODEL` | `text-embedding-3-small` | any embedding model the endpoint serves |
+| `EMBEDDINGS_DIM` | `1536` | MUST equal the `vector(N)` column in `postgres/optional/pgvector.sql` |
+
+Enable it in three steps (needs a Postgres with the `vector` extension — Railway/Supabase/pgvector image):
+
+```bash
+npm run pg:schema           # base schema (as usual)
+npm run pg:schema:vector    # optional: create the vector extension + item_chunks + HNSW
+export EMBEDDINGS_URL=https://api.openai.com/v1   # + OPENAI_API_KEY (or a per-team key)
+npm run embed:backfill      # embed existing items (idempotent); new items index each ingest cycle
+```
+
+With `EMBEDDINGS_URL` unset **or** the pgvector schema not loaded, dense retrieval is a complete
+no-op — the brain behaves exactly as before. Dense hits are tier-filtered on live `items.access`
+(no leak to `external` viewers). Pair with `RERANK_URL` for best precision.
 
 ---
 

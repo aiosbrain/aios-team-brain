@@ -28,6 +28,15 @@ export function startIngestScheduler(): void {
     await runImport(supabase, "plane", runPlaneIngestion);
     await runImport(supabase, "linear", runLinearIngestion);
     await runImport(supabase, "github", runGithubIngestion);
+    // Incremental dense (semantic) indexing of newly-synced items. No-op unless dense retrieval is
+    // configured (EMBEDDINGS_URL + pgvector schema); best-effort — never fails the tick.
+    try {
+      const { indexPendingItems } = await import("@/lib/query/dense-index");
+      const d = await indexPendingItems();
+      if (d.indexed) console.info(`[ingest] dense: embedded ${d.indexed} items (${d.chunks} chunks)`);
+    } catch (err) {
+      console.error("[ingest] dense index tick failed:", err instanceof Error ? err.message : err);
+    }
   };
 
   // Shared runner: run one source, log a line, and record the outcome to ingest_runs so a failure
