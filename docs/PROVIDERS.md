@@ -5,13 +5,20 @@ optional reranker. **Both are configurable, and both default to cloud-free.**
 You can run the whole query path on your own machine, on cloud APIs, or mix the
 two — purely through environment variables. No code changes.
 
-There are three independent knobs:
+There are four independent knobs:
 
 | Knob | Env | Default (unset) | Local option | Cloud option |
 |------|-----|-----------------|--------------|--------------|
+| **Context layer** | `CONTEXT_PROVIDER` | `native` (Postgres + Graphiti) | `external` → a gbrain adapter | `external` → any RAG service |
 | **Answering LLM** | `LLM_BASE_URL` | Anthropic (`ANTHROPIC_API_KEY`) | Ollama / Hermes / llama.cpp | any OpenAI-compatible API |
 | **Reranker** | `RERANK_URL` | off (Postgres order) | `llama-server --reranking` | Cohere / Voyage / ZeroEntropy |
 | **Extra retrieval** | `RETRIEVAL_AUGMENT_URL` | off (Postgres only) | GBrain adapter | hosted retrieval API |
+
+**Context layer vs extra retrieval:** `RETRIEVAL_AUGMENT_URL` *adds* an external source on top of
+the native Postgres retrieval. `CONTEXT_PROVIDER=external` *replaces* the whole context layer with
+the external service (same `POST {query,limit,tier} → {sources[]}` contract) — the seam for swapping
+in gbrain or another engine wholesale. Both providers implement `RetrievalProvider` (`lib/query/provider.ts`).
+⚠️ An `external` provider must enforce the caller's **tier** itself — there is no DB backstop (CLAUDE.md §5).
 
 Everything degrades safely: if a local/cloud endpoint is unreachable or times
 out, the brain falls back (LLM → error surfaced; reranker/augmentation → skipped)

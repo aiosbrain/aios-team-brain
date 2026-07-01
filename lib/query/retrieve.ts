@@ -2,23 +2,17 @@ import "server-only";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { GraphitiClient, type GraphFact } from "@/lib/graph/graphiti-client";
 import { visibleGroupIds } from "@/lib/graph/group";
+import {
+  selectedProviderName,
+  type RetrievalProvider,
+  type Source,
+  type RetrievedContext,
+} from "./provider";
+import { externalProvider } from "./external-provider";
 
-export type Source = {
-  sid: string; // S1, S2…
-  item_id: string | null;
-  project: string;
-  path: string;
-  kind: string;
-  synced_at: string;
-  text: string;
-};
-
-export type RetrievedContext = {
-  sources: Source[];
-  structured: string; // decisions/tasks/graph digest (always included)
-  /** True when query-specific search (FTS/semantic) matched something; false = only recency padding. */
-  grounded: boolean;
-};
+// Types live in ./provider (the pluggable seam). Re-exported here so existing importers
+// (lib/query/claude, tests, …) keep importing them from "@/lib/query/retrieve" unchanged.
+export type { Source, RetrievedContext };
 
 const MAX_SOURCE_CHARS = 8_000;
 const MAX_TOTAL_CHARS = 160_000; // ~40k tokens context cap
@@ -330,7 +324,7 @@ async function peopleActivityDigest(supabase: SupabaseClient, teamId: string): P
  * + a per-contributor git-activity digest on the team tier) + recently synced items. All independent
  * queries run in parallel; all respect the caller's tier.
  */
-export async function retrieve(
+async function nativeRetrieve(
   supabase: SupabaseClient,
   teamId: string,
   tier: "team" | "external",
@@ -552,4 +546,29 @@ export async function retrieve(
   const ranked = await rerankSources(question, sources);
 
   return { sources: ranked, structured: structuredWithGraph, grounded };
+}
+
+/**
+ * The default context provider: Postgres FTS + structured digests + Graphiti temporal facts
+ * (+ optional external augmentation and cross-encoder rerank). Tier is enforced in-DB.
+ */
+export const nativeProvider: RetrievalProvider = {
+  name: "native",
+  retrieve: (r) => nativeRetrieve(r.supabase, r.teamId, r.tier, r.question, r.projectSlug),
+};
+
+/**
+ * Public retrieval entry — dispatches to the selected context provider (CONTEXT_PROVIDER, default
+ * `native`). Signature is unchanged so every caller (the two query routes, tests) is untouched;
+ * swapping the whole context layer for gbrain/another is `CONTEXT_PROVIDER=external` + an adapter.
+ */
+export async function retrieve(
+  supabase: SupabaseClient,
+  teamId: string,
+  tier: "team" | "external",
+  question: string,
+  projectSlug?: string | null
+): Promise<RetrievedContext> {
+  const provider = selectedProviderName() === "external" ? externalProvider : nativeProvider;
+  return provider.retrieve({ supabase, teamId, tier, question, projectSlug: projectSlug ?? null });
 }
