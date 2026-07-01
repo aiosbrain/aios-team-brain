@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { indexItem, denseIndexAvailable } from "@/lib/query/dense-index";
+import { indexItem, indexPendingItems, denseIndexAvailable } from "@/lib/query/dense-index";
 
 /**
  * Spec: dense indexing is OFF by default (no EMBEDDINGS_URL in this env) and must be a clean no-op
@@ -22,5 +22,10 @@ describe("dense indexing when unconfigured", () => {
       contentSha256: "deadbeef",
     });
     expect(r).toEqual({ itemId: "item-1", chunks: 0, skipped: true });
+  });
+
+  it("indexPendingItems() is a clean no-op (no DB access) when dense retrieval is off", async () => {
+    const r = await indexPendingItems();
+    expect(r).toEqual({ scanned: 0, indexed: 0, chunks: 0, skipped: true });
   });
 });

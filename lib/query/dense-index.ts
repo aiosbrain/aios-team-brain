@@ -90,3 +90,53 @@ export async function indexItem(item: IndexItemInput, apiKey?: string | null): P
   );
   return { itemId: item.id, chunks: chunks.length, skipped: false };
 }
+
+export interface BatchIndexResult {
+  scanned: number;
+  indexed: number;
+  chunks: number;
+  skipped: boolean; // true = dense retrieval off (whole batch was a no-op)
+}
+
+/**
+ * Embed items whose chunk set is MISSING or STALE (content hash differs), bounded per call. A no-op
+ * when dense retrieval is off. Used by the ingest scheduler for incremental indexing each cycle and
+ * by the backfill script. Empty-body items are excluded (nothing to embed). One item failing (e.g. a
+ * transient embeddings error) is skipped so the rest of the batch still indexes.
+ */
+export async function indexPendingItems(limit = 100, apiKey?: string | null): Promise<BatchIndexResult> {
+  if (!(await denseIndexAvailable())) return { scanned: 0, indexed: 0, chunks: 0, skipped: true };
+  const pending = await runSql<{
+    id: string;
+    team_id: string;
+    body: string;
+    access: "team" | "external";
+    content_sha256: string;
+  }>(
+    `select i.id, i.team_id, i.body, i.access, i.content_sha256
+       from items i
+       left join (select item_id, min(content_sha256) as sha from item_chunks group by item_id) c
+         on c.item_id = i.id
+      where i.body <> '' and (c.item_id is null or c.sha <> i.content_sha256)
+      order by i.updated_at desc
+      limit $1`,
+    [limit]
+  );
+  let indexed = 0;
+  let chunks = 0;
+  for (const it of pending.rows) {
+    try {
+      const r = await indexItem(
+        { id: it.id, teamId: it.team_id, body: it.body, access: it.access, contentSha256: it.content_sha256 },
+        apiKey
+      );
+      if (!r.skipped) {
+        indexed++;
+        chunks += r.chunks;
+      }
+    } catch {
+      // transient (e.g. embeddings) error on one item — skip, continue the batch
+    }
+  }
+  return { scanned: pending.rows.length, indexed, chunks, skipped: false };
+}

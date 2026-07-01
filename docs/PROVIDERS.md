@@ -26,6 +26,33 @@ rather than breaking the query.
 
 ---
 
+## 0. Dense (semantic) retrieval — optional pgvector
+
+By default the native provider retrieves with **keyword FTS + Graphiti facts** and runs on stock
+Postgres (no extensions). You can add **dense passage retrieval** (embeddings + HNSW + RRF fusion
+with the keyword hits) as an opt-in upgrade:
+
+| Env | Default | Purpose |
+|-----|---------|---------|
+| `EMBEDDINGS_URL` | unset → dense OFF | OpenAI-compatible base, e.g. `https://api.openai.com/v1`, `http://localhost:11434/v1` (Ollama) |
+| `EMBEDDINGS_MODEL` | `text-embedding-3-small` | any embedding model the endpoint serves |
+| `EMBEDDINGS_DIM` | `1536` | MUST equal the `vector(N)` column in `postgres/optional/pgvector.sql` |
+
+Enable it in three steps (needs a Postgres with the `vector` extension — Railway/Supabase/pgvector image):
+
+```bash
+npm run pg:schema           # base schema (as usual)
+npm run pg:schema:vector    # optional: create the vector extension + item_chunks + HNSW
+export EMBEDDINGS_URL=https://api.openai.com/v1   # + OPENAI_API_KEY (or a per-team key)
+npm run embed:backfill      # embed existing items (idempotent); new items index each ingest cycle
+```
+
+With `EMBEDDINGS_URL` unset **or** the pgvector schema not loaded, dense retrieval is a complete
+no-op — the brain behaves exactly as before. Dense hits are tier-filtered on live `items.access`
+(no leak to `external` viewers). Pair with `RERANK_URL` for best precision.
+
+---
+
 ## 1. Answering LLM
 
 ### Cloud (default)

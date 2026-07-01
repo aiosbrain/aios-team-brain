@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createServer, type Server } from "node:http";
 import { retrieve } from "@/lib/query/retrieve";
-import { indexItem, resetDenseIndexProbe } from "@/lib/query/dense-index";
+import { indexItem, indexPendingItems, resetDenseIndexProbe } from "@/lib/query/dense-index";
 import { db, ingest, seedTeam } from "./helpers";
 
 /**
@@ -66,15 +66,12 @@ live("dense retrieval (real pgvector + stub embeddings)", () => {
     await ingest(seed, { path: "deliverables/lunch.md", body: "Catering options for the team lunch.", access: "team" });
     await ingest(seed, { path: "deliverables/parking.md", body: "Visitor parking is in lot C; register at reception.", access: "team" });
 
-    // Index every seeded item into item_chunks (chunk → embed via stub → store).
-    const { data: items } = await db()
-      .from("items")
-      .select("id, team_id, body, access, content_sha256")
-      .eq("team_id", seed.teamId);
-    for (const it of (items ?? []) as Array<{ id: string; team_id: string; body: string; access: "team" | "external"; content_sha256: string }>) {
-      const r = await indexItem({ id: it.id, teamId: it.team_id, body: it.body, access: it.access, contentSha256: it.content_sha256 });
-      expect(r.skipped).toBe(false); // dense IS available here (pgvector + EMBEDDINGS_URL set)
-    }
+    // Index via the batch path the ingest scheduler uses (pending-items query → chunk → embed → store).
+    const batch = await indexPendingItems();
+    expect(batch.skipped).toBe(false); // dense IS available here (pgvector + EMBEDDINGS_URL set)
+    expect(batch.indexed).toBeGreaterThanOrEqual(3);
+    // Idempotent: a second pass re-embeds nothing (unchanged content hashes).
+    expect((await indexPendingItems()).indexed).toBe(0);
 
     // "authentication credentials" shares the `auth` concept with the doc, but its stemmed terms
     // (authent/credential) don't overlap the doc's tokens (auth/passwordless/login) → FTS misses it.
