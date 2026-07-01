@@ -65,6 +65,39 @@ export interface ChatTurn {
   answer: string;
 }
 
+/**
+ * The signed-in member a query is being answered FOR. Anchors first-person resolution: without it,
+ * "how about me?" has no referent (the model only sees a by-name activity digest, with no way to
+ * know which row is the caller). Every field optional — we render whatever identity we have.
+ */
+export interface CallerIdentity {
+  displayName?: string | null;
+  email?: string | null;
+  handle?: string | null;
+}
+
+/**
+ * A one-line "who is asking" anchor injected into the query context so the model can resolve
+ * first-person references ("me", "my", "I", "mine") to a concrete person — and match that person
+ * against the by-name entries in the structured digests (git/people activity, tasks, decisions).
+ * Pure + bounded; returns "" when we have no usable identity (→ no behavior change).
+ */
+export function callerBlock(caller?: CallerIdentity): string {
+  if (!caller) return "";
+  const name = (caller.displayName ?? "").trim();
+  const email = (caller.email ?? "").trim();
+  const handle = (caller.handle ?? "").trim();
+  if (!name && !email && !handle) return "";
+  const who = [name || null, email ? `<${email}>` : null, handle ? `@${handle}` : null]
+    .filter(Boolean)
+    .join(" ");
+  return (
+    `<caller>\nYou are answering for ${who}. Resolve first-person references ("me", "my", "I", "mine") ` +
+    `to this person, and match them against the named entries in the structured context (e.g. the activity ` +
+    `digests, task assignees, decision authors).\n</caller>`
+  );
+}
+
 // Windowed memory: the brain is RAG-grounded, not a freeform chatbot, so we carry only the last
 // few turns (each answer truncated) — enough to resolve "he/that", cheap on tokens, no overflow.
 const MAX_HISTORY_TURNS = 6;
@@ -115,7 +148,8 @@ export async function* streamAnswer(
   ctx: RetrievedContext,
   question: string,
   keys: ProviderKeys = {},
-  history: ChatTurn[] = []
+  history: ChatTurn[] = [],
+  caller?: CallerIdentity
 ): AsyncGenerator<
   | { type: "delta"; text: string }
   | { type: "done"; usage: QueryUsage }
@@ -129,10 +163,11 @@ export async function* streamAnswer(
 
   const note = groundingNote(ctx.grounded);
   const convo = conversationBlock(history);
+  const who = callerBlock(caller);
 
   // Local OpenAI-compatible backend (Ollama/Hermes) — fully on-machine, $0.
   if (LLM_BASE_URL) {
-    yield* streamLocal(note, convo, ctx.structured, sourcesBlock, question, keys.openaiKey);
+    yield* streamLocal(note, who, convo, ctx.structured, sourcesBlock, question, keys.openaiKey);
     return;
   }
 
@@ -155,6 +190,7 @@ export async function* streamAnswer(
         role: "user",
         content: [
           { type: "text", text: currentDateLine() },
+          ...(who ? [{ type: "text" as const, text: who }] : []),
           ...(note ? [{ type: "text" as const, text: note }] : []),
           { type: "text", text: `<structured_context>\n${ctx.structured}\n</structured_context>` },
           { type: "text", text: sourcesBlock || "<no document sources matched>" },
@@ -196,6 +232,7 @@ export async function* streamAnswer(
  */
 async function* streamLocal(
   note: string,
+  who: string,
   convo: string,
   structured: string,
   sourcesBlock: string,
@@ -208,6 +245,7 @@ async function* streamLocal(
   const userContent =
     currentDateLine() +
     "\n\n" +
+    (who ? `${who}\n\n` : "") +
     note +
     `<structured_context>\n${structured}\n</structured_context>\n\n` +
     `${sourcesBlock || "<no document sources matched>"}\n\n` +

@@ -105,12 +105,15 @@ export async function POST(req: NextRequest) {
 
   const { data: me } = await rls
     .from("members")
-    .select("id, tier")
+    .select("id, tier, display_name, email, actor_handle")
     .eq("team_id", team.id)
     .eq("auth_user_id", user.id)
     .eq("status", "active")
     .maybeSingle();
   if (!me) return errorResponse("forbidden", "not a member of this team", 403);
+
+  // Who the answer is FOR — anchors first-person resolution ("how about me?") to this person.
+  const caller = { displayName: me.display_name, email: me.email, handle: me.actor_handle };
 
   const memberTier = me.tier as "team" | "external";
   const supabase = adminClient();
@@ -185,7 +188,7 @@ export async function POST(req: NextRequest) {
 
       let answer = "";
       try {
-        for await (const chunk of streamAnswer(ctx, question, { anthropicKey, openaiKey }, priorTurns)) {
+        for await (const chunk of streamAnswer(ctx, question, { anthropicKey, openaiKey }, priorTurns, caller)) {
           if (chunk.type === "delta") {
             answer += chunk.text;
             send("delta", { text: chunk.text });

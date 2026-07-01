@@ -199,7 +199,7 @@ export function graphExpansionQuery(facts: GraphFact[]): string {
 // the question is actually about who's doing what — biased INCLUSIVE (a false positive just restores
 // the old always-on behavior; a false negative would drop relevant context, so we'd rather over-include).
 const ACTIVITY_INTENT =
-  /\b(who|whose|doing|working|worked|activity|active|busy|contribut\w*|commit\w*|posting|posted|assigned|assignee|standup|workload|lately|recently)\b|\bup to\b|\bthis (week|sprint|month)\b/i;
+  /\b(who|whose|doing|working|worked|activity|active|busy|contribut\w*|commit\w*|posting|posted|assigned|assignee|standup|workload|lately|recently|my|mine|github|submission\w*|prs?|ship\w*|complet\w*|accomplish\w*|finish\w*|deliver\w*|merg\w*|yesterday|today)\b|\bi've\b|\babout me\b|\bme[?!.\s]*$|\bpull request\b|\bup to\b|\b(this|last) (week|sprint|month)\b/i;
 
 /** True when a query is about people/activity (→ include the git + people-activity digests). */
 export function wantsActivityContext(question: string): boolean {
