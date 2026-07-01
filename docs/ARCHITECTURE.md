@@ -141,12 +141,12 @@ sequenceDiagram
   participant RET as lib/query/retrieve
   participant CL as lib/query/claude
   participant LLM as Claude
-  U->>Q: {question, project?}
-  Q->>Q: auth · cost guard (per-member/day, per-team $/day in query_log)
+  U->>Q: {question, project?, tz?}  %% tz = browser IANA timezone (dashboard)
+  Q->>Q: auth · cost guard (per-member/day, per-team $/day in query_log) · resolve timezone (browser tz → member profile → BRAIN_DEFAULT_TIMEZONE → UTC)
   Q->>RET: tier-filtered FTS top-12 + recent + Graphiti semantic expansion + structured digest (git + per-person activity digests included only for activity questions — context shaping)
   RET-->>Q: {sources[], structured}
-  Q->>CL: streamAnswer(ctx, question, keys, history, caller)  %% caller = signed-in member (name/email/handle) so first-person "how about me?" resolves; ctx.grounded=false → abstain note (stay-quiet)
-  CL->>LLM: cached system + caller anchor + numbered sources + question
+  Q->>CL: streamAnswer(ctx, question, keys, history, caller, timeZone)  %% caller = signed-in member (name/email/handle) so first-person "how about me?" resolves; timeZone anchors relative dates ("today" = last 24h in the user's tz); ctx.grounded=false → abstain note (stay-quiet)
+  CL->>LLM: cached system + date/tz anchor + caller anchor + numbered sources + question
   LLM-->>U: SSE delta* then sources then done(usage)
 ```
 
