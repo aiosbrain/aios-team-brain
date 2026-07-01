@@ -8,6 +8,7 @@ backing off on 429. It is the only thing in the sidecar that talks to the brain.
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from dataclasses import dataclass
 from typing import Literal
@@ -21,6 +22,12 @@ IngestStatus = Literal["created", "updated", "unchanged"]
 # Brain limit is 120/min/key; stay safely under it. Tokens refill continuously.
 _DEFAULT_MAX_PER_MIN = 100
 _MAX_RETRIES = 5
+# A codebase scan push is the heaviest single request: the brain projects every recent commit into
+# searchable items (with embeddings) synchronously before responding, which can far exceed the 30s
+# default. The scan runs in CI (latency-insensitive) and the endpoint is idempotent, so we give this
+# one call a generous read timeout — otherwise the client raises httpx.ReadTimeout and the job goes
+# RED even though the server finished the write. Override via AIOS_SCAN_TIMEOUT.
+_SCAN_TIMEOUT = float(os.environ.get("AIOS_SCAN_TIMEOUT", "300"))
 
 
 @dataclass(frozen=True)
@@ -133,11 +140,12 @@ class BrainClient:
 
     async def push_codebase_scan(self, payload: dict) -> dict:
         """POST one codebase scan (RAW metrics) to /api/v1/codebases. The brain computes
-        scores, audits, and upserts idempotently. Same retry policy as push()."""
+        scores, audits, and upserts idempotently. Same retry policy as push(); a longer
+        read timeout (_SCAN_TIMEOUT) because the server projects commits→items synchronously."""
         url = f"{self._base}/api/v1/codebases"
         for attempt in range(_MAX_RETRIES):
             await self._limiter.acquire()
-            resp = await self._client.post(url, json=payload, headers=self._headers)
+            resp = await self._client.post(url, json=payload, headers=self._headers, timeout=_SCAN_TIMEOUT)
             if resp.status_code in (200, 201):
                 return resp.json()
             if resp.status_code == 429 or resp.status_code >= 500:
