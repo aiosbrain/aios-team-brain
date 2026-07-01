@@ -32,19 +32,51 @@ Rules:
 - Answer EVERY part of a multi-part question. If it contains several asks (e.g. about two different people), address each one explicitly — never silently drop a part.
 - If a <conversation_so_far> block is present, use it to resolve references to earlier turns ("he", "she", "they", "that", "the same one"). It is prior context only — still answer ONLY from the sources and structured context below.
 - Decisions marked [SUPERSEDED] are no longer valid — say so if relevant.
-- Interpret relative dates ("today", "yesterday", "this week", "recently") against the Current date given at the top of the context. Dates in the structured context (e.g. a task's "updated" date) are UTC calendar dates — compare them to the Current date to answer "what happened today/this week".
+- Interpret relative dates in the USER'S timezone stated at the top of the context. "today" means the last 24 hours (the rolling window given, NOT the calendar day) — so an item timestamped within that window counts as "today" even if its calendar date reads as yesterday. "yesterday" = the 24h before that; "this week" = the last 7 days; "recently" ≈ the last two weeks. Dates in the structured context (e.g. a task's "updated" date, a commit's day) are calendar dates and may be in UTC or the commit's own timezone — reconcile them against the window rather than assuming the user's calendar day.
 - Never speculate about content above the caller's access tier; what you were given is what they may see.`;
 
-const WEEKDAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+/** Render an instant's Y-M-D, H:M, weekday and UTC-offset in a given IANA timezone. */
+function partsInZone(now: Date, timeZone: string): { date: string; time: string; weekday: string; offset: string } {
+  const fmt = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23", // 00–23 (avoids the "24:00" ICU quirk at midnight)
+    weekday: "long",
+    timeZoneName: "longOffset",
+  });
+  const p = Object.fromEntries(fmt.formatToParts(now).map((x) => [x.type, x.value]));
+  return {
+    date: `${p.year}-${p.month}-${p.day}`,
+    time: `${p.hour}:${p.minute}`,
+    weekday: p.weekday ?? "",
+    offset: (p.timeZoneName ?? "GMT+00:00").replace("GMT", "UTC"),
+  };
+}
 
 /**
- * A single line stating today's date, injected at the top of the query context so the model can
- * resolve "today / this week / recently". UTC to match the structured digest's date basis (all
- * digest dates are UTC ISO slices). Pure + injectable `now` for deterministic tests.
+ * The date/time anchor injected at the top of the query context. States NOW in the user's timezone
+ * and defines "today" as the trailing 24 hours (a rolling window with an explicit UTC cutoff the
+ * model can compare digest dates against) — so a GMT+8 user's 05:00-UTC commit reads as "today",
+ * not "yesterday". Pure + injectable (`now`, `timeZone`) for deterministic tests; invalid tz → UTC.
  */
-export function currentDateLine(now: Date = new Date()): string {
-  const iso = now.toISOString().slice(0, 10);
-  return `Current date: ${iso} (${WEEKDAYS[now.getUTCDay()]}, UTC).`;
+export function currentDateLine(now: Date = new Date(), timeZone: string = "UTC"): string {
+  let z = timeZone;
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: z });
+  } catch {
+    z = "UTC";
+  }
+  const { date, time, weekday, offset } = partsInZone(now, z);
+  const since = new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString();
+  return (
+    `Current date & time: ${date} ${time} (${weekday}) — user timezone ${z} (${offset}).\n` +
+    `"today" = the last 24 hours (rolling window since ${since}); "yesterday" = the 24h before that; ` +
+    `"this week" = the last 7 days. Resolve all relative dates in the user's timezone.`
+  );
 }
 
 /**
@@ -149,7 +181,8 @@ export async function* streamAnswer(
   question: string,
   keys: ProviderKeys = {},
   history: ChatTurn[] = [],
-  caller?: CallerIdentity
+  caller?: CallerIdentity,
+  timeZone: string = "UTC"
 ): AsyncGenerator<
   | { type: "delta"; text: string }
   | { type: "done"; usage: QueryUsage }
@@ -167,7 +200,7 @@ export async function* streamAnswer(
 
   // Local OpenAI-compatible backend (Ollama/Hermes) — fully on-machine, $0.
   if (LLM_BASE_URL) {
-    yield* streamLocal(note, who, convo, ctx.structured, sourcesBlock, question, keys.openaiKey);
+    yield* streamLocal(note, who, convo, ctx.structured, sourcesBlock, question, timeZone, keys.openaiKey);
     return;
   }
 
@@ -189,7 +222,7 @@ export async function* streamAnswer(
       {
         role: "user",
         content: [
-          { type: "text", text: currentDateLine() },
+          { type: "text", text: currentDateLine(new Date(), timeZone) },
           ...(who ? [{ type: "text" as const, text: who }] : []),
           ...(note ? [{ type: "text" as const, text: note }] : []),
           { type: "text", text: `<structured_context>\n${ctx.structured}\n</structured_context>` },
@@ -237,13 +270,14 @@ async function* streamLocal(
   structured: string,
   sourcesBlock: string,
   question: string,
+  timeZone: string,
   openaiKey?: string | null
 ): AsyncGenerator<
   | { type: "delta"; text: string }
   | { type: "done"; usage: QueryUsage }
 > {
   const userContent =
-    currentDateLine() +
+    currentDateLine(new Date(), timeZone) +
     "\n\n" +
     (who ? `${who}\n\n` : "") +
     note +

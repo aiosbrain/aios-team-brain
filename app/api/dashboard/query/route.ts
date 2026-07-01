@@ -7,6 +7,7 @@ import { rateLimit } from "@/lib/api/rate-limit";
 import { errorResponse } from "@/lib/api/schemas";
 import { retrieve } from "@/lib/query/retrieve";
 import { streamAnswer } from "@/lib/query/claude";
+import { pickTimezone, DEFAULT_TIMEZONE } from "@/lib/query/timezone";
 import {
   ownsConversation,
   recentTurns,
@@ -72,6 +73,9 @@ const dashboardQuerySchema = z.object({
   // Persistent thread id. Omit to start a new conversation (the server creates one and returns its
   // id via a `conversation` SSE event); pass it back on later turns so history loads server-side.
   conversation_id: z.string().uuid().optional(),
+  // Browser-detected IANA timezone (Intl.DateTimeFormat().resolvedOptions().timeZone) so relative
+  // dates ("today") resolve in the ASKER's timezone. Optional/validated; falls back to profile/UTC.
+  tz: z.string().max(64).optional(),
 });
 
 /**
@@ -92,7 +96,7 @@ export async function POST(req: NextRequest) {
   }
   const parsed = dashboardQuerySchema.safeParse(json);
   if (!parsed.success) return errorResponse("invalid_payload", "question and team required", 422);
-  const { question, team: teamSlug, project, conversation_id } = parsed.data;
+  const { question, team: teamSlug, project, conversation_id, tz } = parsed.data;
 
   // Resolve team + membership under RLS — returns nothing unless the
   // signed-in user is an active member of that team.
@@ -114,6 +118,15 @@ export async function POST(req: NextRequest) {
 
   // Who the answer is FOR — anchors first-person resolution ("how about me?") to this person.
   const caller = { displayName: me.display_name, email: me.email, handle: me.actor_handle };
+
+  // Timezone for relative-date anchoring: browser tz (most accurate) → member profile → instance default.
+  const { data: prof } = await rls
+    .from("member_profiles")
+    .select("timezone")
+    .eq("team_id", team.id)
+    .eq("member_id", me.id)
+    .maybeSingle();
+  const timeZone = pickTimezone([tz, prof?.timezone, DEFAULT_TIMEZONE]);
 
   const memberTier = me.tier as "team" | "external";
   const supabase = adminClient();
@@ -188,7 +201,7 @@ export async function POST(req: NextRequest) {
 
       let answer = "";
       try {
-        for await (const chunk of streamAnswer(ctx, question, { anthropicKey, openaiKey }, priorTurns, caller)) {
+        for await (const chunk of streamAnswer(ctx, question, { anthropicKey, openaiKey }, priorTurns, caller, timeZone)) {
           if (chunk.type === "delta") {
             answer += chunk.text;
             send("delta", { text: chunk.text });

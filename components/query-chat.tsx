@@ -97,6 +97,8 @@ export function QueryChat({
         body: JSON.stringify({
           question: text,
           team: teamSlug,
+          // Browser timezone so "today"/"this week" resolve in the user's local time, not server UTC.
+          tz: Intl.DateTimeFormat().resolvedOptions().timeZone,
           ...(conversationId ? { conversation_id: conversationId } : {}),
         }),
       });
