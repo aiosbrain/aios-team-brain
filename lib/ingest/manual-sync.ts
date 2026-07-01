@@ -1,5 +1,7 @@
 import "server-only";
 import { runSlackIngestion, runPlaneIngestion, runLinearIngestion, runGithubIngestion } from "./run";
+import { adminClient } from "@/lib/supabase/admin";
+import { recordIngestRun } from "./runs";
 
 /**
  * On-demand "scrape now" from the query box. `isSyncCommand` recognizes when a chat message is a
@@ -44,12 +46,30 @@ export async function runManualSync(teamId: string): Promise<ManualSyncResult> {
       return null;
     }
   };
+  const startedAt = Date.now();
   const [slack, plane, linear, github] = await Promise.all([
     safe(runSlackIngestion({ teamId })),
     safe(runPlaneIngestion({ teamId })),
     safe(runLinearIngestion({ teamId })),
     safe(runGithubIngestion({ teamId })),
   ]);
+
+  // Record each configured source's run so a manual /sync failure is diagnosable in the runs log.
+  const runsDb = adminClient();
+  for (const [source, s] of [["slack", slack], ["plane", plane], ["linear", linear], ["github", github]] as const) {
+    if (!s || (!s.integrations && !s.errors.length)) continue; // unconfigured + clean → nothing to log
+    await recordIngestRun(runsDb, {
+      teamId,
+      source,
+      trigger: "manual",
+      ok: s.errors.length === 0,
+      created: s.created,
+      updated: s.updated,
+      errors: s.errors,
+      meta: { integrations: s.integrations },
+      startedAt,
+    });
+  }
 
   const lines: string[] = [];
   let created = 0;
