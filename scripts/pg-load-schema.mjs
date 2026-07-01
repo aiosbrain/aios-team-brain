@@ -13,8 +13,14 @@
 import { readFileSync, existsSync, readdirSync } from "node:fs";
 import path from "node:path";
 import { Client } from "pg";
+import { assertServiceIdentity } from "./service-guard.mjs";
 
 async function main() {
+  // On Railway, refuse to run if this app landed on a non-AIOS service — the
+  // 2026-06-27 vector: this preDeployCommand ran against Kula's DATABASE_URL and
+  // injected our schema into Kula's prod DB. Abort BEFORE reading DATABASE_URL.
+  assertServiceIdentity("load the AIOS schema");
+
   const url = process.env.DATABASE_URL;
   if (!url) throw new Error("DATABASE_URL is required");
 

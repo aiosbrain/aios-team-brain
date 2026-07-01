@@ -143,6 +143,13 @@ bash scripts/e2e.sh    # system-level integration: seed → push → materialize
   a PreToolUse hook (`scripts/railway-deploy-guard.sh`) blocks them (incl. `cd other && railway up`). Before
   *any* Railway command, confirm `railway status` shows **Project: AIOS**; audit all worktrees with
   `bash scripts/railway-link-check.sh`.
+- **Runtime backstop (`scripts/service-guard.mjs`).** The hook above only fires inside the agent's shell; it
+  can't stop a human `railway up` or any other path that lands this code on a foreign service. So the schema
+  loaders (`pg-load-schema.mjs` = the `preDeployCommand`, and `pg-load-vector.mjs`) call `assertServiceIdentity`
+  **before** connecting: if `RAILWAY_SERVICE_NAME` is set and isn't an AIOS service (`aios` / `aios-*`, override
+  via `AIOS_RAILWAY_SERVICES`), the load aborts non-zero and Railway halts the release — so this repo can never
+  inject its schema into another project's DB again (the 2026-06-27 Kula incident). Mirrors Kula's
+  `src/lib/service-guard.ts`; guarded by `test/guards/service-guard.test.ts`.
 
 ---
 

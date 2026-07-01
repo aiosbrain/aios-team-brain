@@ -9,8 +9,13 @@
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { Client } from "pg";
+import { assertServiceIdentity } from "./service-guard.mjs";
 
 async function main() {
+  // Same service-identity backstop as pg-load-schema.mjs — never load our schema
+  // onto a foreign (non-AIOS) Railway service's database.
+  assertServiceIdentity("load the AIOS pgvector schema");
+
   const url = process.env.DATABASE_URL;
   if (!url) throw new Error("DATABASE_URL is required");
 
