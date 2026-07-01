@@ -9,6 +9,7 @@ import {
   type RetrievedContext,
 } from "./provider";
 import { externalProvider } from "./external-provider";
+import { denseSearch, fuseByRrf } from "./dense-search";
 
 // Types live in ./provider (the pluggable seam). Re-exported here so existing importers
 // (lib/query/claude, tests, …) keep importing them from "@/lib/query/retrieve" unchanged.
@@ -333,6 +334,9 @@ async function nativeRetrieve(
 ): Promise<RetrievedContext> {
   // Kick off the Graphiti graph-memory search concurrently with Postgres retrieval.
   const graphFactsP = fetchGraphFacts(supabase, teamId, tier, question);
+  // Optional dense (semantic) passage search — pgvector. Runs concurrently; resolves to [] unless
+  // EMBEDDINGS_URL is set AND the pgvector schema is loaded (default installs stay pure-FTS).
+  const denseP = denseSearch(teamId, tier, question, projectSlug);
   // Git-activity + per-person activity digests (team tier only — internal) run in parallel too.
   // Context shaping: the activity digests are heavy + only relevant to "who's doing what" questions.
   const wantsActivity = tier === "team" && wantsActivityContext(question);
@@ -494,6 +498,39 @@ async function nativeRetrieve(
     }
   }
 
+  // 2d. Dense (semantic) passage retrieval — the optional pgvector leg. Adds best-chunk sources for
+  // items keyword search missed, then RRF-fuses the keyword + dense rankings into the source order.
+  // denseHits is [] unless dense retrieval is configured, so default installs are byte-for-byte
+  // unchanged. Tier already enforced in denseSearch (live items.access).
+  let orderedSources = sources;
+  const denseHits = await denseP;
+  if (denseHits.length) {
+    grounded = true;
+    for (const h of denseHits) {
+      if (seen.has(h.item_id)) continue;
+      seen.add(h.item_id);
+      if (projectSlug && h.project !== projectSlug) continue;
+      const text = (h.content || "").slice(0, MAX_SOURCE_CHARS);
+      if (!text) continue;
+      if (total + text.length > MAX_TOTAL_CHARS) break;
+      total += text.length;
+      sources.push({
+        sid: `S${n++}`,
+        item_id: h.item_id,
+        project: h.project,
+        path: h.path,
+        kind: h.kind,
+        synced_at: h.synced_at,
+        text,
+      });
+    }
+    orderedSources = fuseByRrf(
+      sources,
+      (ftsHits ?? []).map((h) => (h as { id: string }).id),
+      denseHits.map((h) => h.item_id)
+    );
+  }
+
   // 3. Structured context (compact, always included) — built from the parallel results above.
   const [gitDigest, peopleDigest] = await Promise.all([gitDigestP, peopleDigestP]);
   const structured = [
@@ -543,7 +580,8 @@ async function nativeRetrieve(
 
   // 4. Optional cross-encoder rerank (local llama-server or cloud). No-op when
   // RERANK_URL is unset; reorders so the most relevant source is cited first.
-  const ranked = await rerankSources(question, sources);
+  // (Runs on the RRF-fused order when dense retrieval contributed, else the FTS/recency order.)
+  const ranked = await rerankSources(question, orderedSources);
 
   return { sources: ranked, structured: structuredWithGraph, grounded };
 }
