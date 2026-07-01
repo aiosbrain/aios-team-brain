@@ -843,3 +843,30 @@ create table if not exists chat_messages (
   created_at timestamptz not null default now()
 );
 create index if not exists chat_messages_conversation_idx on chat_messages (conversation_id, created_at);
+
+-- ── ingestion run log (observability for imports/scans) ───────────────────────
+-- One row per ingestion run: every scheduler tick, manual /sync, and codebase scan records its
+-- outcome here (counts + the actual error messages) so failures are DIAGNOSABLE after the fact
+-- instead of vanishing into container logs. This is the fix for silent import breakage (e.g. a
+-- scan-on-merge that skipped for weeks, or a client-timeout that reported failure while the server
+-- succeeded). Written ONLY by lib/ingest/runs.recordIngestRun (single writer); read by the
+-- Admin → Integrations "recent runs" panel. team_id is null for instance-wide scheduler aggregates
+-- (the runners loop teams internally), set for per-team manual syncs and scans.
+create table if not exists ingest_runs (
+  id bigint generated always as identity primary key,
+  team_id uuid references teams(id) on delete cascade,
+  source text not null,        -- 'slack' | 'linear' | 'plane' | 'github' | 'scan' | …
+  trigger text not null,       -- 'scheduler' | 'manual' | 'merge' | 'cli' | 'api'
+  ok boolean not null default true,
+  created integer not null default 0,
+  updated integer not null default 0,
+  unchanged integer not null default 0,
+  error_count integer not null default 0,
+  errors jsonb not null default '[]',   -- the actual messages, not just a count
+  meta jsonb not null default '{}',     -- source-specific extras (channels, head_sha, …)
+  started_at timestamptz not null default now(),
+  finished_at timestamptz not null default now(),
+  duration_ms integer
+);
+create index if not exists ingest_runs_team_source_idx on ingest_runs (team_id, source, finished_at desc);
+create index if not exists ingest_runs_finished_idx on ingest_runs (finished_at desc);
