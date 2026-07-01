@@ -13,6 +13,7 @@
     "dev:seed": "set -a; . ./.env.local; set +a; npx tsx --conditions react-server scripts/seed-demo.ts",
     "dev:login": "set -a; . ./.env.local; set +a; npx tsx scripts/dev-login.ts",
     "pg:schema": "node scripts/pg-load-schema.mjs",
+    "pg:schema:vector": "node scripts/pg-load-vector.mjs",
     "admin": "npx tsx --conditions react-server scripts/admin.ts",
     "brain-tasks": "npx tsx --conditions react-server scripts/brain-tasks.ts",
     "test": "vitest run",
