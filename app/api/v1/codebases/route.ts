@@ -4,6 +4,10 @@ import { authenticateApiKey } from "@/lib/api/auth";
 import { rateLimit } from "@/lib/api/rate-limit";
 import { codebaseScanPayloadSchema, errorResponse } from "@/lib/api/schemas";
 import { ingestCodebaseScan } from "@/lib/codebases/ingest";
+import { recordIngestRun, type IngestTrigger } from "@/lib/ingest/runs";
+
+// Known callers set X-AIOS-Trigger so the runs log distinguishes a merge scan from an ad-hoc one.
+const KNOWN_TRIGGERS = new Set<IngestTrigger>(["scheduler", "manual", "merge", "cli", "api"]);
 
 export const runtime = "nodejs";
 
@@ -38,10 +42,37 @@ export async function POST(req: NextRequest) {
     return errorResponse("invalid_payload", parsed.error.issues[0]?.message ?? "invalid", 422);
   }
 
+  // Record the scan outcome (success OR failure) so a broken scan is diagnosable — this is the exact
+  // path that silently failed for weeks. Trigger comes from the caller's header when set.
+  const startedAt = Date.now();
+  const hdr = (req.headers.get("x-aios-trigger") || "").toLowerCase() as IngestTrigger;
+  const trigger: IngestTrigger = KNOWN_TRIGGERS.has(hdr) ? hdr : "api";
+  const slug = parsed.data.codebase.slug;
+  const headSha = parsed.data.metrics?.head_sha;
+
   try {
     const result = await ingestCodebaseScan(supabase, auth, parsed.data);
+    await recordIngestRun(supabase, {
+      teamId: auth.teamId,
+      source: "scan",
+      trigger,
+      ok: true,
+      updated: result.contributions, // scans upsert contributor rollups (no clean created/updated split)
+      meta: { slug, head_sha: headSha, contributions: result.contributions, issues: result.issues },
+      startedAt,
+    });
     return Response.json({ status: "ok", ...result }, { status: 201 });
   } catch (e) {
-    return errorResponse("internal", e instanceof Error ? e.message : "scan ingest failed", 500);
+    const msg = e instanceof Error ? e.message : "scan ingest failed";
+    await recordIngestRun(supabase, {
+      teamId: auth.teamId,
+      source: "scan",
+      trigger,
+      ok: false,
+      errors: [msg],
+      meta: { slug, head_sha: headSha },
+      startedAt,
+    });
+    return errorResponse("internal", msg, 500);
   }
 }

@@ -812,3 +812,61 @@ create table if not exists graph_episodes (
   unique (team_id, source_table, source_id)
 );
 create index if not exists graph_episodes_team_idx on graph_episodes (team_id, projected_at desc);
+
+-- ── chat conversations (persistent, owner-scoped chat history) ────────────────
+-- ChatGPT-style threads persisted server-side so history survives across sessions AND interfaces
+-- (web, mobile, CLI, Telegram/Hermes). Owner-scoped: a member reads only their own conversations
+-- (app-code gate via lib/chat/store; no RLS backstop on the postgres target). Distinct from
+-- query_log (the spend meter, truncated answer) — this is the full thread of record.
+create table if not exists conversations (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  member_id uuid not null references members(id) on delete cascade,
+  title text not null default '',
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  archived_at timestamptz
+);
+create index if not exists conversations_owner_idx on conversations (team_id, member_id, updated_at desc);
+
+create table if not exists chat_messages (
+  id uuid primary key default gen_random_uuid(),
+  conversation_id uuid not null references conversations(id) on delete cascade,
+  team_id uuid not null references teams(id) on delete cascade,
+  member_id uuid references members(id) on delete set null,
+  role text not null check (role in ('user', 'assistant')),
+  content text not null,
+  cited_item_ids uuid[] not null default '{}',
+  input_tokens integer not null default 0,
+  output_tokens integer not null default 0,
+  cost_usd numeric(10, 5) not null default 0,
+  created_at timestamptz not null default now()
+);
+create index if not exists chat_messages_conversation_idx on chat_messages (conversation_id, created_at);
+
+-- ── ingestion run log (observability for imports/scans) ───────────────────────
+-- One row per ingestion run: every scheduler tick, manual /sync, and codebase scan records its
+-- outcome here (counts + the actual error messages) so failures are DIAGNOSABLE after the fact
+-- instead of vanishing into container logs. This is the fix for silent import breakage (e.g. a
+-- scan-on-merge that skipped for weeks, or a client-timeout that reported failure while the server
+-- succeeded). Written ONLY by lib/ingest/runs.recordIngestRun (single writer); read by the
+-- Admin → Integrations "recent runs" panel. team_id is null for instance-wide scheduler aggregates
+-- (the runners loop teams internally), set for per-team manual syncs and scans.
+create table if not exists ingest_runs (
+  id bigint generated always as identity primary key,
+  team_id uuid references teams(id) on delete cascade,
+  source text not null,        -- 'slack' | 'linear' | 'plane' | 'github' | 'scan' | …
+  trigger text not null,       -- 'scheduler' | 'manual' | 'merge' | 'cli' | 'api'
+  ok boolean not null default true,
+  created integer not null default 0,
+  updated integer not null default 0,
+  unchanged integer not null default 0,
+  error_count integer not null default 0,
+  errors jsonb not null default '[]',   -- the actual messages, not just a count
+  meta jsonb not null default '{}',     -- source-specific extras (channels, head_sha, …)
+  started_at timestamptz not null default now(),
+  finished_at timestamptz not null default now(),
+  duration_ms integer
+);
+create index if not exists ingest_runs_team_source_idx on ingest_runs (team_id, source, finished_at desc);
+create index if not exists ingest_runs_finished_idx on ingest_runs (finished_at desc);

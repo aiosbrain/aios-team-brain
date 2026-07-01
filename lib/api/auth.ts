@@ -10,6 +10,8 @@ export type ApiAuth = {
   memberRole: "admin" | "lead" | "member";
   apiKeyId: string;
   actorHandle: string;
+  displayName: string | null;
+  email: string | null;
 };
 
 /**
@@ -40,7 +42,7 @@ export async function authenticateApiKey(req: Request): Promise<ApiAuth | null> 
 
   const { data: key } = await supabase
     .from("api_keys")
-    .select("id, team_id, member_id, key_hash, revoked_at, members(actor_handle, tier, status, role), teams(slug)")
+    .select("id, team_id, member_id, key_hash, revoked_at, members(actor_handle, tier, status, role, display_name, email), teams(slug)")
     .eq("key_id", keyId)
     .maybeSingle();
 
@@ -52,7 +54,7 @@ export async function authenticateApiKey(req: Request): Promise<ApiAuth | null> 
     return fail("bad_secret");
   }
 
-  const member = key.members as unknown as { actor_handle: string; tier: "team" | "external"; status: string; role: "admin" | "lead" | "member" };
+  const member = key.members as unknown as { actor_handle: string; tier: "team" | "external"; status: string; role: "admin" | "lead" | "member"; display_name: string | null; email: string | null };
   if (member?.status !== "active") return fail("member_not_active");
 
   const team = key.teams as unknown as { slug: string };
@@ -75,5 +77,7 @@ export async function authenticateApiKey(req: Request): Promise<ApiAuth | null> 
     memberRole: member.role,
     apiKeyId: key.id,
     actorHandle: member.actor_handle,
+    displayName: member.display_name,
+    email: member.email,
   };
 }

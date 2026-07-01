@@ -5,6 +5,8 @@ import { getSessionUser } from "@/lib/auth/session";
 import { isSupabaseBackend } from "@/lib/db/backend";
 import { listIntegrations } from "@/lib/integrations/read";
 import { IntegrationsManager, type IntegrationRow } from "@/components/admin/integrations-manager";
+import { listRecentIngestRuns } from "@/lib/ingest/runs";
+import { IngestRunsPanel } from "@/components/admin/ingest-runs-panel";
 
 export const metadata: Metadata = { title: "Integrations" };
 
@@ -57,9 +59,10 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ t
     : { data: null };
 
   const supabase = adminClient();
-  const integrations = (await listIntegrations(supabase, team.id, {
-    role: me?.role as string | undefined,
-  })) as IntegrationRow[];
+  const [integrations, ingestRuns] = await Promise.all([
+    listIntegrations(supabase, team.id, { role: me?.role as string | undefined }) as Promise<IntegrationRow[]>,
+    listRecentIngestRuns(supabase, team.id, 30),
+  ]);
 
   return (
     <div className="flex flex-col gap-4">
@@ -76,6 +79,14 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ t
         integrations={integrations}
         primaryPmProvider={(team.primary_pm_provider as "plane" | "linear" | null) ?? null}
       />
+      <div>
+        <h2 className="text-sm font-semibold text-ink">Recent ingestion runs</h2>
+        <p className="mb-2 mt-1 text-xs text-ink-secondary">
+          Every scheduler tick, manual <code>/sync</code>, and codebase scan and its outcome — so a
+          failed or stale import is diagnosable here instead of only in server logs.
+        </p>
+        <IngestRunsPanel runs={ingestRuns} />
+      </div>
     </div>
   );
 }

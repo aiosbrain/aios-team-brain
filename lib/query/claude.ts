@@ -29,20 +29,54 @@ Rules:
 - Answer ONLY from the provided sources and structured context. If they don't cover the question, say so plainly — never invent facts, decisions, or attributions.
 - Cite sources inline using their markers, e.g. [S2]. Cite the structured context as [CTX].
 - Be concise and operational: lead with the answer, then the supporting evidence.
+- Answer EVERY part of a multi-part question. If it contains several asks (e.g. about two different people), address each one explicitly — never silently drop a part.
+- If a <conversation_so_far> block is present, use it to resolve references to earlier turns ("he", "she", "they", "that", "the same one"). It is prior context only — still answer ONLY from the sources and structured context below.
 - Decisions marked [SUPERSEDED] are no longer valid — say so if relevant.
-- Interpret relative dates ("today", "yesterday", "this week", "recently") against the Current date given at the top of the context. Dates in the structured context (e.g. a task's "updated" date) are UTC calendar dates — compare them to the Current date to answer "what happened today/this week".
+- Interpret relative dates in the USER'S timezone stated at the top of the context. "today" means the last 24 hours (the rolling window given, NOT the calendar day) — so an item timestamped within that window counts as "today" even if its calendar date reads as yesterday. "yesterday" = the 24h before that; "this week" = the last 7 days; "recently" ≈ the last two weeks. Dates in the structured context (e.g. a task's "updated" date, a commit's day) are calendar dates and may be in UTC or the commit's own timezone — reconcile them against the window rather than assuming the user's calendar day.
 - Never speculate about content above the caller's access tier; what you were given is what they may see.`;
 
-const WEEKDAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+/** Render an instant's Y-M-D, H:M, weekday and UTC-offset in a given IANA timezone. */
+function partsInZone(now: Date, timeZone: string): { date: string; time: string; weekday: string; offset: string } {
+  const fmt = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23", // 00–23 (avoids the "24:00" ICU quirk at midnight)
+    weekday: "long",
+    timeZoneName: "longOffset",
+  });
+  const p = Object.fromEntries(fmt.formatToParts(now).map((x) => [x.type, x.value]));
+  return {
+    date: `${p.year}-${p.month}-${p.day}`,
+    time: `${p.hour}:${p.minute}`,
+    weekday: p.weekday ?? "",
+    offset: (p.timeZoneName ?? "GMT+00:00").replace("GMT", "UTC"),
+  };
+}
 
 /**
- * A single line stating today's date, injected at the top of the query context so the model can
- * resolve "today / this week / recently". UTC to match the structured digest's date basis (all
- * digest dates are UTC ISO slices). Pure + injectable `now` for deterministic tests.
+ * The date/time anchor injected at the top of the query context. States NOW in the user's timezone
+ * and defines "today" as the trailing 24 hours (a rolling window with an explicit UTC cutoff the
+ * model can compare digest dates against) — so a GMT+8 user's 05:00-UTC commit reads as "today",
+ * not "yesterday". Pure + injectable (`now`, `timeZone`) for deterministic tests; invalid tz → UTC.
  */
-export function currentDateLine(now: Date = new Date()): string {
-  const iso = now.toISOString().slice(0, 10);
-  return `Current date: ${iso} (${WEEKDAYS[now.getUTCDay()]}, UTC).`;
+export function currentDateLine(now: Date = new Date(), timeZone: string = "UTC"): string {
+  let z = timeZone;
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: z });
+  } catch {
+    z = "UTC";
+  }
+  const { date, time, weekday, offset } = partsInZone(now, z);
+  const since = new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString();
+  return (
+    `Current date & time: ${date} ${time} (${weekday}) — user timezone ${z} (${offset}).\n` +
+    `"today" = the last 24 hours (rolling window since ${since}); "yesterday" = the 24h before that; ` +
+    `"this week" = the last 7 days. Resolve all relative dates in the user's timezone.`
+  );
 }
 
 /**
@@ -55,6 +89,74 @@ export function groundingNote(grounded: boolean): string {
   return grounded
     ? ""
     : "[Retrieval note] No documents specifically matched this question — the sources below are recent items included only as background. If neither they nor the structured context clearly contain the answer, say you don't have that information rather than guessing.\n\n";
+}
+
+/** One prior exchange in the current chat session, used to resolve follow-ups/pronouns. */
+export interface ChatTurn {
+  question: string;
+  answer: string;
+}
+
+/**
+ * The signed-in member a query is being answered FOR. Anchors first-person resolution: without it,
+ * "how about me?" has no referent (the model only sees a by-name activity digest, with no way to
+ * know which row is the caller). Every field optional — we render whatever identity we have.
+ */
+export interface CallerIdentity {
+  displayName?: string | null;
+  email?: string | null;
+  handle?: string | null;
+}
+
+/**
+ * A one-line "who is asking" anchor injected into the query context so the model can resolve
+ * first-person references ("me", "my", "I", "mine") to a concrete person — and match that person
+ * against the by-name entries in the structured digests (git/people activity, tasks, decisions).
+ * Pure + bounded; returns "" when we have no usable identity (→ no behavior change).
+ */
+export function callerBlock(caller?: CallerIdentity): string {
+  if (!caller) return "";
+  const name = (caller.displayName ?? "").trim();
+  const email = (caller.email ?? "").trim();
+  const handle = (caller.handle ?? "").trim();
+  if (!name && !email && !handle) return "";
+  const who = [name || null, email ? `<${email}>` : null, handle ? `@${handle}` : null]
+    .filter(Boolean)
+    .join(" ");
+  return (
+    `<caller>\nYou are answering for ${who}. Resolve first-person references ("me", "my", "I", "mine") ` +
+    `to this person, and match them against the named entries in the structured context (e.g. the activity ` +
+    `digests, task assignees, decision authors).\n</caller>`
+  );
+}
+
+// Windowed memory: the brain is RAG-grounded, not a freeform chatbot, so we carry only the last
+// few turns (each answer truncated) — enough to resolve "he/that", cheap on tokens, no overflow.
+const MAX_HISTORY_TURNS = 6;
+const MAX_ANSWER_CHARS = 400;
+
+/**
+ * Build a compact `<conversation_so_far>` block from recent turns so the model can resolve
+ * references to earlier messages. Pure + bounded: last N turns, each prior answer collapsed to a
+ * single line and truncated. Returns "" when there's no usable history.
+ */
+export function conversationBlock(
+  history: ChatTurn[] | undefined,
+  opts: { maxTurns?: number; maxAnswerChars?: number } = {}
+): string {
+  const maxTurns = opts.maxTurns ?? MAX_HISTORY_TURNS;
+  const maxAnswerChars = opts.maxAnswerChars ?? MAX_ANSWER_CHARS;
+  const recent = (history ?? [])
+    .filter((t) => t.question.trim())
+    .slice(-maxTurns);
+  if (recent.length === 0) return "";
+  const lines = recent.map((t) => {
+    const q = t.question.trim().replace(/\s+/g, " ");
+    let a = t.answer.trim().replace(/\s+/g, " ");
+    if (a.length > maxAnswerChars) a = `${a.slice(0, maxAnswerChars).trimEnd()}…`;
+    return a ? `User: ${q}\nBrain: ${a}` : `User: ${q}`;
+  });
+  return `<conversation_so_far>\n${lines.join("\n\n")}\n</conversation_so_far>`;
 }
 
 export type QueryUsage = {
@@ -77,7 +179,10 @@ export interface ProviderKeys {
 export async function* streamAnswer(
   ctx: RetrievedContext,
   question: string,
-  keys: ProviderKeys = {}
+  keys: ProviderKeys = {},
+  history: ChatTurn[] = [],
+  caller?: CallerIdentity,
+  timeZone: string = "UTC"
 ): AsyncGenerator<
   | { type: "delta"; text: string }
   | { type: "done"; usage: QueryUsage }
@@ -90,10 +195,12 @@ export async function* streamAnswer(
     .join("\n\n");
 
   const note = groundingNote(ctx.grounded);
+  const convo = conversationBlock(history);
+  const who = callerBlock(caller);
 
   // Local OpenAI-compatible backend (Ollama/Hermes) — fully on-machine, $0.
   if (LLM_BASE_URL) {
-    yield* streamLocal(note, ctx.structured, sourcesBlock, question, keys.openaiKey);
+    yield* streamLocal(note, who, convo, ctx.structured, sourcesBlock, question, timeZone, keys.openaiKey);
     return;
   }
 
@@ -115,10 +222,12 @@ export async function* streamAnswer(
       {
         role: "user",
         content: [
-          { type: "text", text: currentDateLine() },
+          { type: "text", text: currentDateLine(new Date(), timeZone) },
+          ...(who ? [{ type: "text" as const, text: who }] : []),
           ...(note ? [{ type: "text" as const, text: note }] : []),
           { type: "text", text: `<structured_context>\n${ctx.structured}\n</structured_context>` },
           { type: "text", text: sourcesBlock || "<no document sources matched>" },
+          ...(convo ? [{ type: "text" as const, text: convo }] : []),
           { type: "text", text: `Question: ${question}` },
         ],
       },
@@ -156,20 +265,25 @@ export async function* streamAnswer(
  */
 async function* streamLocal(
   note: string,
+  who: string,
+  convo: string,
   structured: string,
   sourcesBlock: string,
   question: string,
+  timeZone: string,
   openaiKey?: string | null
 ): AsyncGenerator<
   | { type: "delta"; text: string }
   | { type: "done"; usage: QueryUsage }
 > {
   const userContent =
-    currentDateLine() +
+    currentDateLine(new Date(), timeZone) +
     "\n\n" +
+    (who ? `${who}\n\n` : "") +
     note +
     `<structured_context>\n${structured}\n</structured_context>\n\n` +
     `${sourcesBlock || "<no document sources matched>"}\n\n` +
+    (convo ? `${convo}\n\n` : "") +
     `Question: ${question}`;
 
   const res = await fetch(`${LLM_BASE_URL!.replace(/\/$/, "")}/chat/completions`, {

@@ -1,6 +1,8 @@
 import "server-only";
 import { runSlackIngestion, runPlaneIngestion, runLinearIngestion, runGithubIngestion } from "./run";
-import type { ImportSummary } from "./run";
+import type { ImportSummary, IngestSummary } from "./run";
+import { adminClient } from "@/lib/supabase/admin";
+import { recordIngestRun } from "./runs";
 
 /**
  * In-process poller — the single-service alternative to a separate cron worker.
@@ -21,21 +23,11 @@ export function startIngestScheduler(): void {
   const intervalMs = Math.max(1, minutes) * 60_000;
 
   const tick = async () => {
-    try {
-      const s = await runSlackIngestion();
-      if (s.created || s.updated || s.errors.length) {
-        console.info(
-          `[ingest] slack: +${s.created} ~${s.updated} =${s.unchanged} ` +
-            `(${s.channels} channels, ${s.integrations} integrations)` +
-            (s.errors.length ? ` errors: ${s.errors.join("; ")}` : "")
-        );
-      }
-    } catch (err) {
-      console.error("[ingest] slack tick failed:", err instanceof Error ? err.message : err);
-    }
-    await runImport("plane", runPlaneIngestion);
-    await runImport("linear", runLinearIngestion);
-    await runImport("github", runGithubIngestion);
+    const supabase = adminClient();
+    await runImport(supabase, "slack", runSlackIngestion);
+    await runImport(supabase, "plane", runPlaneIngestion);
+    await runImport(supabase, "linear", runLinearIngestion);
+    await runImport(supabase, "github", runGithubIngestion);
     // Incremental dense (semantic) indexing of newly-synced items. No-op unless dense retrieval is
     // configured (EMBEDDINGS_URL + pgvector schema); best-effort — never fails the tick.
     try {
@@ -47,19 +39,47 @@ export function startIngestScheduler(): void {
     }
   };
 
-  // Shared runner for the task-importers (Plane/Linear/GitHub): same summary shape + log line.
-  async function runImport(label: string, run: () => Promise<ImportSummary>): Promise<void> {
+  // Shared runner: run one source, log a line, and record the outcome to ingest_runs so a failure
+  // (or a silent staleness) is diagnosable later instead of only living in container logs.
+  async function runImport(
+    supabase: ReturnType<typeof adminClient>,
+    label: string,
+    run: () => Promise<ImportSummary | IngestSummary>
+  ): Promise<void> {
+    const startedAt = Date.now();
     try {
       const s = await run();
+      if (s.skipped) return; // another run in-flight — it will record its own outcome
+      // Source-specific extras: slack reports channels; the task importers report items/projects.
+      const meta: Record<string, unknown> =
+        "channels" in s
+          ? { integrations: s.integrations, channels: s.channels }
+          : { integrations: s.integrations, items: s.items, projects: s.projects };
       if (s.created || s.updated || s.errors.length) {
+        const detail = "channels" in s ? `${s.channels} channels` : `${s.items} items, ${s.projects} projects`;
         console.info(
-          `[ingest] ${label}: +${s.created} ~${s.updated} =${s.unchanged} ` +
-            `(${s.items} items, ${s.projects} projects, ${s.integrations} integrations)` +
+          `[ingest] ${label}: +${s.created} ~${s.updated} =${s.unchanged} (${detail}, ${s.integrations} integrations)` +
             (s.errors.length ? ` errors: ${s.errors.join("; ")}` : "")
         );
       }
+      // Skip logging unconfigured sources with nothing to report (avoids a no-op row every tick);
+      // still record configured sources (proves the poller ran) and anything with errors.
+      if (s.integrations === 0 && s.errors.length === 0) return;
+      await recordIngestRun(supabase, {
+        source: label,
+        trigger: "scheduler",
+        ok: s.ok,
+        created: s.created,
+        updated: s.updated,
+        unchanged: s.unchanged,
+        errors: s.errors,
+        meta,
+        startedAt,
+      });
     } catch (err) {
-      console.error(`[ingest] ${label} tick failed:`, err instanceof Error ? err.message : err);
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[ingest] ${label} tick failed:`, msg);
+      await recordIngestRun(supabase, { source: label, trigger: "scheduler", ok: false, errors: [msg], startedAt });
     }
   }
 

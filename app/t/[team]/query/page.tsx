@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
 import { serverClient } from "@/lib/supabase/server";
-import { QueryChat } from "@/components/query-chat";
+import { ChatWorkspace } from "@/components/chat/chat-workspace";
 
 export const metadata: Metadata = { title: "Chat" };
 
@@ -23,7 +23,7 @@ export default async function QueryPage({
   if (!team) return null;
 
   return (
-    <div className="mx-auto flex max-w-3xl flex-col gap-3">
+    <div className="mx-auto flex max-w-5xl flex-col gap-3">
       <div>
         <h1 className="text-2xl font-semibold text-ink">Chat</h1>
         <p className="mt-1 text-sm text-ink-secondary">
@@ -31,7 +31,7 @@ export default async function QueryPage({
           graph. Answers cite their sources.
         </p>
       </div>
-      <QueryChat teamSlug={teamSlug} variant="page" initialQuestion={q} />
+      <ChatWorkspace teamSlug={teamSlug} initialQuestion={q} />
     </div>
   );
 }

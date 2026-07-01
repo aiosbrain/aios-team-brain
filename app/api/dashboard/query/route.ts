@@ -7,6 +7,13 @@ import { rateLimit } from "@/lib/api/rate-limit";
 import { errorResponse } from "@/lib/api/schemas";
 import { retrieve } from "@/lib/query/retrieve";
 import { streamAnswer } from "@/lib/query/claude";
+import { pickTimezone, DEFAULT_TIMEZONE } from "@/lib/query/timezone";
+import {
+  ownsConversation,
+  recentTurns,
+  createConversation,
+  appendMessage,
+} from "@/lib/chat/store";
 import { getProviderKey } from "@/lib/integrations/manage";
 import { isSyncCommand, runManualSync } from "@/lib/ingest/manual-sync";
 import { audit } from "@/lib/api/audit";
@@ -63,6 +70,12 @@ const dashboardQuerySchema = z.object({
   question: z.string().min(1).max(4000),
   team: z.string().min(1).max(120),
   project: z.string().nullable().optional(),
+  // Persistent thread id. Omit to start a new conversation (the server creates one and returns its
+  // id via a `conversation` SSE event); pass it back on later turns so history loads server-side.
+  conversation_id: z.string().uuid().optional(),
+  // Browser-detected IANA timezone (Intl.DateTimeFormat().resolvedOptions().timeZone) so relative
+  // dates ("today") resolve in the ASKER's timezone. Optional/validated; falls back to profile/UTC.
+  tz: z.string().max(64).optional(),
 });
 
 /**
@@ -83,7 +96,7 @@ export async function POST(req: NextRequest) {
   }
   const parsed = dashboardQuerySchema.safeParse(json);
   if (!parsed.success) return errorResponse("invalid_payload", "question and team required", 422);
-  const { question, team: teamSlug, project } = parsed.data;
+  const { question, team: teamSlug, project, conversation_id, tz } = parsed.data;
 
   // Resolve team + membership under RLS — returns nothing unless the
   // signed-in user is an active member of that team.
@@ -96,12 +109,24 @@ export async function POST(req: NextRequest) {
 
   const { data: me } = await rls
     .from("members")
-    .select("id, tier")
+    .select("id, tier, display_name, email, actor_handle")
     .eq("team_id", team.id)
     .eq("auth_user_id", user.id)
     .eq("status", "active")
     .maybeSingle();
   if (!me) return errorResponse("forbidden", "not a member of this team", 403);
+
+  // Who the answer is FOR — anchors first-person resolution ("how about me?") to this person.
+  const caller = { displayName: me.display_name, email: me.email, handle: me.actor_handle };
+
+  // Timezone for relative-date anchoring: browser tz (most accurate) → member profile → instance default.
+  const { data: prof } = await rls
+    .from("member_profiles")
+    .select("timezone")
+    .eq("team_id", team.id)
+    .eq("member_id", me.id)
+    .maybeSingle();
+  const timeZone = pickTimezone([tz, prof?.timezone, DEFAULT_TIMEZONE]);
 
   const memberTier = me.tier as "team" | "external";
   const supabase = adminClient();
@@ -144,6 +169,18 @@ export async function POST(req: NextRequest) {
     return errorResponse("rate_limited", "team daily query budget reached — see admin/policy", 429);
   }
 
+  // Resolve the persistent thread: adopt the caller's conversation if they own it, else start one.
+  // Load the prior turns for the LLM memory window BEFORE persisting the current question, then
+  // record the user message. The assistant message is persisted once the answer finishes streaming.
+  const owner = { teamId: team.id, memberId: me.id };
+  let conversationId = conversation_id && (await ownsConversation(supabase, owner, conversation_id)) ? conversation_id : null;
+  const priorTurns = conversationId ? await recentTurns(supabase, owner, conversationId) : [];
+  if (!conversationId) {
+    const created = await createConversation(supabase, owner, question);
+    conversationId = created?.id ?? null;
+  }
+  if (conversationId) await appendMessage(supabase, owner, conversationId, "user", question);
+
   const started = Date.now();
   const ctx = await retrieve(supabase, team.id, memberTier, question, project);
 
@@ -159,9 +196,12 @@ export async function POST(req: NextRequest) {
       const send = (event: string, data: unknown) =>
         controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
 
+      // Tell the client which thread this turn belongs to (a new conversation returns its fresh id).
+      if (conversationId) send("conversation", { id: conversationId });
+
       let answer = "";
       try {
-        for await (const chunk of streamAnswer(ctx, question, { anthropicKey, openaiKey })) {
+        for await (const chunk of streamAnswer(ctx, question, { anthropicKey, openaiKey }, priorTurns, caller, timeZone)) {
           if (chunk.type === "delta") {
             answer += chunk.text;
             send("delta", { text: chunk.text });
@@ -179,6 +219,16 @@ export async function POST(req: NextRequest) {
               }));
             send("sources", { sources });
             send("done", chunk.usage);
+
+            // Persist the assistant turn into the thread (full answer + cited sources + cost).
+            if (conversationId) {
+              await appendMessage(supabase, owner, conversationId, "assistant", answer, {
+                cited_item_ids: sources.map((s) => s.item_id).filter((id): id is string => Boolean(id)),
+                input_tokens: chunk.usage.input_tokens,
+                output_tokens: chunk.usage.output_tokens,
+                cost_usd: chunk.usage.cost_usd,
+              });
+            }
 
             await supabase.from("query_log").insert({
               team_id: team.id,
