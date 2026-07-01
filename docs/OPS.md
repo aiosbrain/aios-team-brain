@@ -120,6 +120,16 @@ CLI is **read-only** here. The destructive verbs are **blocked** by `.claude/set
 (deny-list + the `scripts/railway-deploy-guard.sh` PreToolUse hook, which also catches the
 `cd other && <deploy>` form). See CLAUDE.md §6.
 
+### Runtime backstop (defense in depth)
+The hook only fires inside the agent's shell. The **runtime** guard covers everything else (a human
+`railway up`, or any path that lands this code on a foreign service): the schema loaders
+(`pg-load-schema.mjs` = the `preDeployCommand`, `pg-load-vector.mjs`) call `assertServiceIdentity`
+(`scripts/service-guard.mjs`) **before** opening a DB connection. If `RAILWAY_SERVICE_NAME` is set and
+isn't an AIOS service (`aios` / `aios-*`; override `AIOS_RAILWAY_SERVICES`), the load aborts non-zero and
+Railway halts the release — so aios can never inject its schema into another project's DB (2026-06-27).
+This mirrors Kula's `src/lib/service-guard.ts`; both apps carrying it is what makes the protection
+symmetric. Guarded by `test/guards/service-guard.test.ts`.
+
 ### After creating a new worktree
 Conductor spawns worktrees that can inherit a wrong link. Audit + fix:
 
