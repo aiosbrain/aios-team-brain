@@ -477,6 +477,9 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 - `POST /api/v1/costs` — ingest external AI provider daily spend (Cursor dashboard + session-log estimates; team-tier key only; audited)
 - `POST /api/v1/work-events` — merged-work completion event; marks matching tasks done and triggers PM sync
 - `POST /api/v1/graph-query` — NL query over Graphiti graph memory; tier-scoped group_ids; citable facts
+- `GET /api/brain/facts` — Brain-Learning panel Layer 1: recent Graphiti facts (last 24h) read directly from Neo4j; session-authed; tier-scoped via `visibleGroupIds` (sole enforcement, no RLS backstop)
+- `POST /api/brain/arcs` — Brain-Learning Layer 3: LLM-synthesized narrative arcs from the last 7d of the graph (cached 10 min); session-authed; tier-scoped
+- `POST /api/brain/arcs/recompute` — re-derive arcs with human corrections + write each correction back to Graphiti as a `correction:<arc_id>` episode (team-tier only)
 - `POST /api/dashboard/query` — same query pipeline, session-authenticated; persists the thread (`conversation_id`)
 - `GET /api/dashboard/conversations` — the signed-in member's own chat threads (owner-scoped)
 - `GET /api/dashboard/conversations/:id` — a thread's full messages (owner-only)
