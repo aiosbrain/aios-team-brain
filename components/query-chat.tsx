@@ -34,6 +34,16 @@ const DEFAULT_SUGGESTIONS = [
  * `variant` controls height: "page" fills the viewport (the /query chat), "embed" is a compact panel
  * (the Home launcher). Answers stream from /api/dashboard/query (SSE) and cite their sources.
  */
+/** Pair persisted user→assistant messages into the chat's Exchange shape (source chips not rehydrated). */
+export function messagesToExchanges(messages: { role: string; content: string }[]): Exchange[] {
+  const out: Exchange[] = [];
+  for (const m of messages) {
+    if (m.role === "user") out.push({ question: m.content, answer: "", sources: [], status: "done" });
+    else if (m.role === "assistant" && out.length) out[out.length - 1].answer = m.content;
+  }
+  return out;
+}
+
 export function QueryChat({
   teamSlug,
   initialQuestion,
@@ -42,6 +52,7 @@ export function QueryChat({
   initialConversationId = null,
   initialMessages,
   onConversationChange,
+  persistKey,
 }: {
   teamSlug: string;
   initialQuestion?: string;
@@ -52,6 +63,9 @@ export function QueryChat({
   initialMessages?: Exchange[];
   /** Fires when this chat gets/changes its persistent thread id (so a list can refresh). */
   onConversationChange?: (id: string) => void;
+  /** localStorage key: when set (e.g. the Home embed), remember the thread across remounts and
+   *  reload it on mount, so navigating away and back doesn't lose the visible history. */
+  persistKey?: string;
 }) {
   const [question, setQuestion] = useState("");
   const [exchanges, setExchanges] = useState<Exchange[]>(initialMessages ?? []);
@@ -62,6 +76,40 @@ export function QueryChat({
   // Persistent thread id — null until the server creates/returns one; sent on later turns so the
   // brain loads this conversation's history server-side (shared across sessions and interfaces).
   const [conversationId, setConversationId] = useState<string | null>(initialConversationId);
+  const restored = useRef(false);
+
+  // Remember-the-thread (Home embed): on mount, reload the last thread from the server so navigating
+  // away and back restores the visible history. The thread is already persisted server-side; we just
+  // remember WHICH one in localStorage. Only when persistKey is set and we weren't seeded a thread.
+  useEffect(() => {
+    if (!persistKey || restored.current || initialConversationId) return;
+    restored.current = true;
+    const saved = typeof window !== "undefined" ? window.localStorage.getItem(persistKey) : null;
+    if (!saved) return;
+    (async () => {
+      try {
+        const res = await fetch(`/api/dashboard/conversations/${saved}?team=${encodeURIComponent(teamSlug)}`);
+        if (!res.ok) {
+          window.localStorage.removeItem(persistKey); // thread deleted/renamed away — forget it
+          return;
+        }
+        const convo = (await res.json()) as { id: string; messages?: { role: string; content: string }[] };
+        const ex = messagesToExchanges(convo.messages ?? []);
+        // Only hydrate if the user hasn't already started a new turn while this was loading.
+        setExchanges((cur) => (cur.length === 0 && ex.length ? ex : cur));
+        setConversationId((cur) => cur ?? convo.id);
+      } catch {
+        // ignore — start fresh
+      }
+    })();
+  }, [persistKey, teamSlug, initialConversationId]);
+
+  // Persist the thread id so a later remount can reload it.
+  useEffect(() => {
+    if (persistKey && conversationId && typeof window !== "undefined") {
+      window.localStorage.setItem(persistKey, conversationId);
+    }
+  }, [persistKey, conversationId]);
 
   // Esc collapses the expanded (near-fullscreen) chat.
   useEffect(() => {
