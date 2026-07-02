@@ -95,6 +95,29 @@ arc-synthesis prompt, cache 10 min. Arcs = `{id, title, confidence, summary, par
 
 ---
 
+## Integration with the dense/vector store (pgvector)
+
+The pgvector dense-retrieval DB and the Graphiti graph are **two indexes over the same `items`**,
+serving different jobs — they complement, not compete:
+
+- **pgvector** = semantic *passage* retrieval (find the right text to answer a question). It already
+  powers the Q&A box: `lib/query/retrieve` fuses dense (pgvector) + FTS + Graphiti facts via RRF.
+- **Graphiti** = entity/relationship/*temporal structure* (who/what/when). It powers this panel's
+  facts → events → arcs.
+
+Every ingested item is BOTH chunked+embedded into `item_chunks` AND projected as a Graphiti episode →
+entities/edges. So: **graph = the skeleton (structure + time); vector = the flesh (semantic evidence).**
+
+Where the vector store plugs into this panel (mostly Layer 3):
+- **Layer 3 arc grounding** — when Claude synthesizes an arc, pull the most semantically-relevant item
+  passages (dense retrieval) as supporting evidence, so arc summaries cite real text, not just graph
+  edges. Makes arcs concrete instead of abstract.
+- **Fact/event enrichment** — link a fact or event to its nearest items (dense) as "supporting sources".
+- **Search the panel** — "show arcs/events about X" uses dense retrieval to find relevant events.
+
+Layers 1–2 stay graph-native (structure); the vector store enters at Layer 3 (evidence/grounding) and
+any search affordance. No new plumbing — both already read from the same `items`.
+
 ## Phasing
 1. **Neo4j read client + tier isolation test** (the foundation; prove group_id filtering blocks
    cross-tier reads on a real Graphiti-populated Neo4j).

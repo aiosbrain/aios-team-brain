@@ -83,6 +83,7 @@ export default async function TeamLayout({
     items.push({ icon: "codebases", label: "Codebases", href: `${base}/codebases` });
     items.push({ icon: "maturity", label: "Maturity", href: `${base}/maturity` });
   }
+  items.push({ icon: "learning", label: "Learning", href: `${base}/learning` });
   items.push({ icon: "query", label: "Query", href: `${base}/query` });
   items.push({ label: "Settings", children: settingsChildren });
 

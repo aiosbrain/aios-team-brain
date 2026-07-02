@@ -5,6 +5,7 @@ import { usePathname } from "next/navigation";
 import { ThemeToggle } from "@/components/theme-toggle";
 import {
   Blocks,
+  Brain,
   FolderKanban,
   Gauge,
   Database,
@@ -28,6 +29,7 @@ const ICONS = {
   maturity: Gauge,
   teamtools: Wrench,
   query: Sparkles,
+  learning: Brain,
   admin: Shield,
 } as const;
 
