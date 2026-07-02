@@ -69,3 +69,69 @@ export async function recentFacts(
     return []; // degrade — panel shows empty rather than erroring
   }
 }
+
+/** Layer 2 — an event (a source episode) with its participants + the facts extracted from it. */
+export interface GraphEvent {
+  id: string; // episode uuid
+  itemId: string | null; // parsed from the episode name "items:<id>" → link back to the brain item
+  source: string; // slack / github / notion / granola / linear …
+  title: string;
+  at: string;
+  participants: string[];
+  facts: string[];
+  factCount: number;
+}
+
+/**
+ * Layer 2 — recent events (source episodes) for the tier-visible groups, newest first. Each episode
+ * is one ingested item (its `name` is `items:<id>`); we return its mentioned entities (participants)
+ * and the facts extracted from it, so the panel can group facts by the event that produced them.
+ */
+export async function recentEvents(
+  groups: string[],
+  sinceISO: string,
+  limit = 30
+): Promise<GraphEvent[]> {
+  if (!neo4jConfigured() || groups.length === 0) return [];
+  try {
+    const rows = await runRead<{
+      id: string;
+      name: string | null;
+      source: string | null;
+      title: string | null;
+      at: string;
+      participants: (string | null)[] | null;
+      facts: (string | null)[] | null;
+    }>(
+      `MATCH (ep:Episodic)
+       WHERE ep.group_id IN $groups AND ep.created_at >= datetime($since)
+       OPTIONAL MATCH (ep)-[:MENTIONS]->(p:Entity)
+       OPTIONAL MATCH (a:Entity)-[r:RELATES_TO]->(b:Entity)
+         WHERE r.group_id IN $groups AND ep.uuid IN r.episodes
+       RETURN ep.uuid AS id, ep.name AS name, ep.source AS source,
+              ep.source_description AS title, toString(ep.created_at) AS at,
+              collect(DISTINCT p.name) AS participants,
+              collect(DISTINCT r.fact) AS facts
+       ORDER BY at DESC
+       LIMIT toInteger($limit)`,
+      { groups, since: sinceISO, limit }
+    );
+    return rows.map((r) => {
+      const name = r.name ?? "";
+      const participants = (r.participants ?? []).filter((x): x is string => !!x);
+      const facts = (r.facts ?? []).filter((x): x is string => !!x);
+      return {
+        id: r.id,
+        itemId: name.startsWith("items:") ? name.slice("items:".length) : null,
+        source: (r.source ?? "").toLowerCase(),
+        title: r.title ?? name,
+        at: r.at,
+        participants,
+        facts,
+        factCount: facts.length,
+      };
+    });
+  } catch {
+    return [];
+  }
+}

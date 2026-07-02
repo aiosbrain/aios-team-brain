@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import neo4j, { type Driver } from "neo4j-driver";
-import { recentFacts } from "@/lib/graph/learning";
+import { recentFacts, recentEvents } from "@/lib/graph/learning";
 import { closeNeo4j } from "@/lib/graph/neo4j";
 
 /**
@@ -31,9 +31,13 @@ live("Graphiti Neo4j tier isolation (real Neo4j)", () => {
         `CREATE (a1:Entity:Person {name:'Alice', group_id:$team})
          CREATE (b1:Entity {name:'Payments', group_id:$team})
          CREATE (a1)-[:RELATES_TO {uuid:'f-team', fact:'Alice owns Payments', created_at:datetime(), group_id:$team, episodes:['ep1']}]->(b1)
+         CREATE (e1:Episodic {uuid:'ep1', name:'items:item-team', source:'slack', source_description:'Slack — standup', created_at:datetime(), group_id:$team})
+         CREATE (e1)-[:MENTIONS]->(a1)
          CREATE (a2:Entity:Person {name:'Bob', group_id:$ext})
          CREATE (b2:Entity {name:'PublicSite', group_id:$ext})
-         CREATE (a2)-[:RELATES_TO {uuid:'f-ext', fact:'Bob owns PublicSite', created_at:datetime(), group_id:$ext, episodes:['ep2']}]->(b2)`,
+         CREATE (a2)-[:RELATES_TO {uuid:'f-ext', fact:'Bob owns PublicSite', created_at:datetime(), group_id:$ext, episodes:['ep2']}]->(b2)
+         CREATE (e2:Episodic {uuid:'ep2', name:'items:item-ext', source:'notion', source_description:'Notion — public doc', created_at:datetime(), group_id:$ext})
+         CREATE (e2)-[:MENTIONS]->(a2)`,
         { team: TEAM, ext: EXT }
       );
     } finally {
@@ -62,5 +66,20 @@ live("Graphiti Neo4j tier isolation (real Neo4j)", () => {
 
   it("empty visible-groups returns nothing (fail closed)", async () => {
     expect(await recentFacts([], since)).toEqual([]);
+  });
+
+  it("events: returns the team's events with participants + grouped facts, item link", async () => {
+    const events = await recentEvents([TEAM], since);
+    const ev = events.find((e) => e.id === "ep1")!;
+    expect(ev.itemId).toBe("item-team");
+    expect(ev.source).toBe("slack");
+    expect(ev.participants).toContain("Alice");
+    expect(ev.facts).toContain("Alice owns Payments");
+    expect(events.map((e) => e.id)).not.toContain("ep2");
+  });
+
+  it("events: an external viewer NEVER sees team events", async () => {
+    const events = await recentEvents([EXT], since);
+    expect(events.map((e) => e.id)).toEqual(["ep2"]);
   });
 });

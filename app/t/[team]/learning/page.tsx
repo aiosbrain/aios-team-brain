@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { serverClient } from "@/lib/supabase/server";
 import { currentMember } from "@/lib/auth/guard";
 import { FactsFeed } from "@/components/learning/facts-feed";
+import { EventsFeed } from "@/components/learning/events-feed";
 import { ArcsPanel } from "@/components/learning/arcs-panel";
 
 export const metadata: Metadata = { title: "Learning" };
@@ -34,6 +35,13 @@ export default async function LearningPage({ params }: { params: Promise<{ team:
           Narrative arcs · last 7 days
         </h2>
         <ArcsPanel teamSlug={teamSlug} />
+      </section>
+
+      <section className="flex flex-col gap-2">
+        <h2 className="text-sm font-semibold uppercase tracking-wider text-ink-tertiary">
+          Events · last 7 days
+        </h2>
+        <EventsFeed teamSlug={teamSlug} />
       </section>
 
       <section className="flex flex-col gap-2">
