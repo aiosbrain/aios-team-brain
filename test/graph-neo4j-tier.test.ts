@@ -82,4 +82,23 @@ live("Graphiti Neo4j tier isolation (real Neo4j)", () => {
     const events = await recentEvents([EXT], since);
     expect(events.map((e) => e.id)).toEqual(["ep2"]);
   });
+
+  // Sparse-data fallback (a stale graph must not render blank). A `since` in the FUTURE makes the
+  // windowed query return nothing — the same shape as a graph whose newest fact is weeks old. The
+  // fallback must then surface the most-recent-N regardless of age, WITHOUT dropping tier scoping.
+  const future = new Date(Date.now() + 24 * 3600 * 1000).toISOString();
+
+  it("facts: falls back to most-recent-N when the window is empty (still tier-scoped)", async () => {
+    const facts = await recentFacts([TEAM], future);
+    expect(facts.map((f) => f.fact)).toContain("Alice owns Payments"); // stale fact surfaces
+    const ext = await recentFacts([EXT], future);
+    expect(ext.map((f) => f.fact)).toEqual(["Bob owns PublicSite"]); // external still scoped
+    expect(ext.map((f) => f.fact)).not.toContain("Alice owns Payments");
+  });
+
+  it("events: falls back to most-recent-N when the window is empty (still tier-scoped)", async () => {
+    const events = await recentEvents([TEAM], future);
+    expect(events.map((e) => e.id)).toContain("ep1"); // stale event surfaces
+    expect(events.map((e) => e.id)).not.toContain("ep2"); // external event never leaks
+  });
 });
