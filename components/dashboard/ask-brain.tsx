@@ -18,7 +18,7 @@ export function AskBrain({ teamSlug, teamName }: { teamSlug: string; teamName: s
           <MessageSquare className="size-3.5" /> Open full chat
         </Link>
       </div>
-      <QueryChat teamSlug={teamSlug} variant="embed" />
+      <QueryChat teamSlug={teamSlug} variant="embed" persistKey={`aios:home-thread:${teamSlug}`} />
     </section>
   );
 }
