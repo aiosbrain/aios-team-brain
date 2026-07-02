@@ -10,6 +10,12 @@ import { runRead, neo4jConfigured } from "./neo4j";
  * Best-effort: returns [] when Neo4j is unconfigured/unreachable so the panel degrades gracefully.
  * Graphiti schema: `(:Entity)-[:RELATES_TO {fact, created_at, group_id, episodes}]->(:Entity)`,
  * `(:Episodic {name:"items:<id>", created_at, group_id})`, `(:Episodic)-[:MENTIONS]->(:Entity)`.
+ *
+ * SPARSE-DATA FALLBACK: the `sinceISO` window is a SOFT preference, not a hard cutoff. When the
+ * windowed query returns nothing (a stale graph — e.g. Graphiti's extractor stalled and the newest
+ * fact is weeks old), we retry the SAME query without the time bound and surface the most-recent-N
+ * regardless of age. The panel then shows real recent learning instead of looking broken. The
+ * group_id tier filter is NEVER dropped — only the time bound is — so tier isolation still holds.
  */
 
 /** Layer 1 — one recently-extracted fact (a RELATES_TO edge). */
@@ -33,7 +39,20 @@ export async function recentFacts(
   limit = 15
 ): Promise<AtomicFact[]> {
   if (!neo4jConfigured() || groups.length === 0) return [];
-  try {
+  // `withSince` gates ONLY the time bound; the group_id tier filter is present either way.
+  const factsCypher = (withSince: boolean) =>
+    `MATCH (a:Entity)-[r:RELATES_TO]->(b:Entity)
+     WHERE r.group_id IN $groups${withSince ? " AND r.created_at >= datetime($since)" : ""}
+     RETURN r.uuid AS id,
+            r.fact AS fact,
+            toString(r.created_at) AS at,
+            head([l IN labels(a) WHERE l <> 'Entity']) AS subjectType,
+            a.name AS subject,
+            b.name AS object,
+            r.episodes AS episodeUuids
+     ORDER BY r.created_at DESC
+     LIMIT toInteger($limit)`;
+  const query = async (withSince: boolean): Promise<AtomicFact[]> => {
     const rows = await runRead<{
       id: string;
       fact: string;
@@ -42,20 +61,7 @@ export async function recentFacts(
       subject: string | null;
       object: string | null;
       episodeUuids: string[] | null;
-    }>(
-      `MATCH (a:Entity)-[r:RELATES_TO]->(b:Entity)
-       WHERE r.group_id IN $groups AND r.created_at >= datetime($since)
-       RETURN r.uuid AS id,
-              r.fact AS fact,
-              toString(r.created_at) AS at,
-              head([l IN labels(a) WHERE l <> 'Entity']) AS subjectType,
-              a.name AS subject,
-              b.name AS object,
-              r.episodes AS episodeUuids
-       ORDER BY r.created_at DESC
-       LIMIT toInteger($limit)`,
-      { groups, since: sinceISO, limit }
-    );
+    }>(factsCypher(withSince), { groups, since: sinceISO, limit });
     return rows.map((r) => ({
       id: r.id,
       fact: r.fact,
@@ -65,6 +71,12 @@ export async function recentFacts(
       object: r.object ?? "",
       episodeUuids: Array.isArray(r.episodeUuids) ? r.episodeUuids : [],
     }));
+  };
+  try {
+    const windowed = await query(true);
+    // Fall back to most-recent-N (still tier-scoped) only when the window is empty — preserves the
+    // "recent" intent when the graph is fresh, degrades gracefully when it's stale/sparse.
+    return windowed.length > 0 ? windowed : await query(false);
   } catch {
     return []; // degrade — panel shows empty rather than erroring
   }
@@ -93,7 +105,20 @@ export async function recentEvents(
   limit = 30
 ): Promise<GraphEvent[]> {
   if (!neo4jConfigured() || groups.length === 0) return [];
-  try {
+  // `withSince` gates ONLY the time bound; both group_id tier filters are present either way.
+  const eventsCypher = (withSince: boolean) =>
+    `MATCH (ep:Episodic)
+     WHERE ep.group_id IN $groups${withSince ? " AND ep.created_at >= datetime($since)" : ""}
+     OPTIONAL MATCH (ep)-[:MENTIONS]->(p:Entity)
+     OPTIONAL MATCH (a:Entity)-[r:RELATES_TO]->(b:Entity)
+       WHERE r.group_id IN $groups AND ep.uuid IN r.episodes
+     RETURN ep.uuid AS id, ep.name AS name, ep.source AS source,
+            ep.source_description AS title, toString(ep.created_at) AS at,
+            collect(DISTINCT p.name) AS participants,
+            collect(DISTINCT r.fact) AS facts
+     ORDER BY at DESC
+     LIMIT toInteger($limit)`;
+  const query = async (withSince: boolean): Promise<GraphEvent[]> => {
     const rows = await runRead<{
       id: string;
       name: string | null;
@@ -102,20 +127,7 @@ export async function recentEvents(
       at: string;
       participants: (string | null)[] | null;
       facts: (string | null)[] | null;
-    }>(
-      `MATCH (ep:Episodic)
-       WHERE ep.group_id IN $groups AND ep.created_at >= datetime($since)
-       OPTIONAL MATCH (ep)-[:MENTIONS]->(p:Entity)
-       OPTIONAL MATCH (a:Entity)-[r:RELATES_TO]->(b:Entity)
-         WHERE r.group_id IN $groups AND ep.uuid IN r.episodes
-       RETURN ep.uuid AS id, ep.name AS name, ep.source AS source,
-              ep.source_description AS title, toString(ep.created_at) AS at,
-              collect(DISTINCT p.name) AS participants,
-              collect(DISTINCT r.fact) AS facts
-       ORDER BY at DESC
-       LIMIT toInteger($limit)`,
-      { groups, since: sinceISO, limit }
-    );
+    }>(eventsCypher(withSince), { groups, since: sinceISO, limit });
     return rows.map((r) => {
       const name = r.name ?? "";
       const participants = (r.participants ?? []).filter((x): x is string => !!x);
@@ -131,6 +143,11 @@ export async function recentEvents(
         factCount: facts.length,
       };
     });
+  };
+  try {
+    const windowed = await query(true);
+    // Same sparse-data fallback as recentFacts — most-recent-N when the window is empty.
+    return windowed.length > 0 ? windowed : await query(false);
   } catch {
     return [];
   }

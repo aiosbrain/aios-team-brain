@@ -133,6 +133,15 @@ any search affordance. No new plumbing — both already read from the same `item
   on the aios-team-brain service; internal to the AIOS Railway project). Read-only credentials preferred.
 - **Extraction lag** — Graphiti's async worker is ~10–20s/episode and serial; "last 24h" facts lag
   ingestion. The panel should show "as of" and not imply real-time.
+- **Sparse/stale graph (soft window)** — Graphiti's extractor can stall silently (it did in prod on
+  2026-06-25, leaving ~200 pushed-but-unextracted episodes; newest graph fact was weeks old). With a
+  hard time cutoff every layer then renders blank and the panel looks broken. *Mitigate:* the
+  `sinceISO` window in `lib/graph/learning.ts` is a **soft preference** — when the windowed query
+  returns nothing, `recentFacts`/`recentEvents` retry without the time bound and surface the
+  most-recent-N regardless of age (arcs inherit this via `recentFacts`). The `group_id` tier filter
+  is **never** dropped in the fallback — only the time bound — so tier isolation still holds
+  (proven in `test/graph-neo4j-tier.test.ts`). This is a display safety net, **not** a substitute for
+  fixing the upstream extractor stall.
 - **Fallback** — if direct Neo4j proves unviable in prod, Layer 2 can fall back to `GET /episodes` +
   `items`/`graph_episodes` (event = item, participants = `member_id`), and Layer 1 to `/search`; Layer 3
   synthesis is unaffected. Kept as the degrade path, not the primary.
