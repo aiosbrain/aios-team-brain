@@ -12,6 +12,7 @@ import { RangeSelector } from "@/components/dashboard/range-selector";
 import { CommitHeatmap } from "@/components/codebases/commit-heatmap";
 import { MemberContextPanel } from "@/components/people/member-context";
 import { ContextEditor } from "@/components/people/context-editor";
+import { MyApiKeys, type MyKeyRow } from "@/components/people/my-api-keys";
 
 export const metadata: Metadata = { title: "Profile" };
 
@@ -47,6 +48,18 @@ export default async function PersonPage({
 
   const context = await getMemberContext(supabase, team.id, p.member_id, me.tier);
   const canEdit = !!context && (me.id === p.member_id || me.role === "admin");
+  const isSelf = me.id === p.member_id;
+
+  let myKeys: MyKeyRow[] = [];
+  if (isSelf) {
+    const { data } = await supabase
+      .from("api_keys")
+      .select("id, key_id, name, created_at, last_used_at, revoked_at")
+      .eq("team_id", team.id)
+      .eq("member_id", me.id)
+      .order("created_at", { ascending: false });
+    myKeys = (data ?? []) as MyKeyRow[];
+  }
 
   const aiPct = p.totals.commits ? Math.round((100 * p.totals.ai_commits) / p.totals.commits) : 0;
 
@@ -101,6 +114,7 @@ export default async function PersonPage({
       {canEdit && context ? (
         <ContextEditor teamSlug={teamSlug} memberId={p.member_id} context={context} />
       ) : null}
+      {isSelf ? <MyApiKeys teamSlug={teamSlug} keys={myKeys} /> : null}
 
       <section className="prism-card flex flex-col gap-3 p-5">
         <h2 className="text-sm font-semibold uppercase tracking-wider text-ink-tertiary">

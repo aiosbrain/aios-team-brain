@@ -25,10 +25,12 @@ function SetupChecklist({ teamSlug }: { teamSlug: string }) {
       </Link>
     </span>,
     <span key="2">
-      Issue an API key in{" "}
+      Each teammate generates their own API key from their profile page once signed in (or an
+      admin can issue one for them in{" "}
       <Link href={`/t/${teamSlug}/admin/keys`} className="text-violet underline underline-offset-2">
         Admin → Keys
       </Link>
+      )
     </span>,
     <span key="3">
       Run <code className="rounded bg-surface-overlay px-1 py-0.5 font-mono text-xs">aios push</code>{" "}
