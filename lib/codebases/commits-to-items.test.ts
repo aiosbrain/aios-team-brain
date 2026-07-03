@@ -23,6 +23,20 @@ describe("normalizeCommit", () => {
     expect(p!.frontmatter).toMatchObject({ source: "git", type: "commit", sha: "abc1234567deadbeef" });
   });
 
+  it("persists the author email in frontmatter (so attribution can resolve by email)", () => {
+    const p = normalizeCommit("repo", {
+      sha: "deadbeef01",
+      author: "Chetan Nandakumar",
+      author_email: "chetan-guevara@users.noreply.github.com",
+      message: "feat: thing",
+    });
+    // Commit author is name-only in the body, but the resolvable email is kept in frontmatter.
+    expect(p!.frontmatter).toMatchObject({
+      author: "Chetan Nandakumar",
+      author_email: "chetan-guevara@users.noreply.github.com",
+    });
+  });
+
   it("returns null for a commit with no sha (no stable identity)", () => {
     expect(normalizeCommit("repo", { author: "x", message: "y" })).toBeNull();
   });
