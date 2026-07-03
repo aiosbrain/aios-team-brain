@@ -3,7 +3,7 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import { getArcs, type ProviderKeys } from "@/lib/graph/arcs";
 import { visibleGroupIds, type AccessTier } from "@/lib/graph/group";
 import type { RosterPerson } from "./people-match";
-import { assembleTeamWork, type TaskLite, type PersonWork } from "./team-work";
+import { assembleTeamWork, commitSubject, type TaskLite, type CommitLite, type PersonWork } from "./team-work";
 
 /**
  * Live wiring for the consolidated "Working On" box: roster (members) + tasks (one query) + arcs
@@ -45,13 +45,23 @@ export async function getTeamWork(
   if (roster.length === 0) return [];
 
   const doneSinceIso = new Date(Date.now() - DONE_WINDOW_DAYS * 86_400_000).toISOString();
-  const [{ data: taskRows }, arcs] = await Promise.all([
+  const [{ data: taskRows }, { data: commitRows }, arcs] = await Promise.all([
     supabase
       .from("tasks")
       .select("id, title, assignee, status, updated_at")
       .eq("team_id", teamId)
       .order("updated_at", { ascending: false })
       .limit(2000),
+    // Git commits are member_id-attributed (author→member at scan time) — the real "done" signal for
+    // code contributors, who often have no `done` task rows. frontmatter->>source='git' + member set.
+    supabase
+      .from("items")
+      .select("id, body, member_id, frontmatter, synced_at")
+      .eq("team_id", teamId)
+      .eq("frontmatter->>source", "git")
+      .not("member_id", "is", null)
+      .order("synced_at", { ascending: false })
+      .limit(600),
     getArcs(teamSlug, tier, visibleGroupIds(teamSlug, tier), keys).catch(() => []),
   ]);
 
@@ -70,6 +80,24 @@ export async function getTeamWork(
     updatedAt: typeof t.updated_at === "string" ? t.updated_at : new Date(t.updated_at).toISOString(),
   }));
 
-  const people = assembleTeamWork(roster, tasks, arcs, doneSinceIso);
+  const commits: CommitLite[] = ((commitRows ?? []) as {
+    id: string;
+    body: string | null;
+    member_id: string | null;
+    frontmatter: Record<string, unknown> | null;
+    synced_at: string | Date;
+  }[]).flatMap((r) => {
+    if (!r.member_id) return [];
+    const committedAt = r.frontmatter?.committed_at;
+    // Commit date drives the "accomplished" window; normalize to UTC ISO so it sorts vs task dates.
+    const at = committedAt
+      ? new Date(String(committedAt)).toISOString()
+      : typeof r.synced_at === "string"
+        ? r.synced_at
+        : new Date(r.synced_at).toISOString();
+    return [{ id: r.id, memberId: r.member_id, title: commitSubject(r.body ?? ""), at }];
+  });
+
+  const people = assembleTeamWork(roster, tasks, arcs, commits, doneSinceIso);
   return people.filter((p) => p.summary || p.threads.length || p.openTasks.length || p.accomplished.length);
 }
