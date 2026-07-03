@@ -9,15 +9,9 @@ import { parseRange } from "@/lib/metrics/range";
 import { AskBrain } from "@/components/dashboard/ask-brain";
 import { KpiBand } from "@/components/dashboard/kpi-band";
 import { RangeSelector } from "@/components/dashboard/range-selector";
-import { CommitmentsCard } from "@/components/dashboard/commitments-card";
 import { DecisionsCard } from "@/components/dashboard/decisions-card";
-import { TasksByMember } from "@/components/dashboard/tasks-by-member";
-import { AgentsPlaceholder } from "@/components/dashboard/agents-placeholder";
-import type {
-  CommitmentRow,
-  DecisionRow,
-  TaskRow,
-} from "@/components/dashboard/types";
+import { WorkingOn } from "@/components/dashboard/working-on";
+import type { DecisionRow } from "@/components/dashboard/types";
 import { KnowledgeGrowth } from "@/components/charts/knowledge-growth";
 import { UsageChart } from "@/components/charts/usage-chart";
 import { TaskFunnel } from "@/components/charts/task-funnel";
@@ -118,33 +112,18 @@ export default async function TeamHome({
     );
   }
 
-  const [pulse, { data: openTasks }, { data: commitments }, { data: decisions }] =
-    await Promise.all([
-      getPulseMetrics(supabase, team.id, range, { isAdmin, memberId }),
+  const [pulse, { data: decisions }] = await Promise.all([
+    getPulseMetrics(supabase, team.id, range, { isAdmin, memberId }),
+    visibleDecisions(
       supabase
-        .from("tasks")
-        .select("id, title, assignee, status")
+        .from("decisions")
+        .select("id, title, decided_at, tier, still_valid")
         .eq("team_id", team.id)
-        .in("status", ["in_progress", "blocked", "ready"])
-        .order("updated_at", { ascending: false })
-        .limit(200),
-      supabase
-        .from("graph_entities")
-        .select("id, entity_id, name, attrs")
-        .eq("team_id", team.id)
-        .eq("entity_type", "commitment")
-        .in("attrs->>status", ["open", "overdue", "at_risk", "broken"])
-        .limit(20),
-      visibleDecisions(
-        supabase
-          .from("decisions")
-          .select("id, title, decided_at, tier, still_valid")
-          .eq("team_id", team.id)
-          .order("decided_at", { ascending: false })
-          .limit(8),
-        tier
-      ),
-    ]);
+        .order("decided_at", { ascending: false })
+        .limit(8),
+      tier
+    ),
+  ]);
 
   return (
     <div className="mx-auto flex max-w-6xl flex-col gap-6">
@@ -164,19 +143,13 @@ export default async function TeamHome({
         <UsageChart data={pulse.usage} scope={isAdmin ? "team" : "your"} />
       </div>
 
-      <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
-        <CommitmentsCard commitments={(commitments ?? []) as CommitmentRow[]} />
-        <DecisionsCard teamSlug={teamSlug} decisions={(decisions ?? []) as DecisionRow[]} />
-      </div>
+      {/* One consolidated per-person "Working On": summary (arcs) + open tasks + accomplished. */}
+      <WorkingOn teamSlug={teamSlug} />
 
-      <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
-        <div className="lg:col-span-2">
-          <TasksByMember teamSlug={teamSlug} tasks={(openTasks ?? []) as TaskRow[]} />
-        </div>
+      <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
+        <DecisionsCard teamSlug={teamSlug} decisions={(decisions ?? []) as DecisionRow[]} />
         <TaskFunnel data={pulse.funnel} />
       </div>
-
-      <AgentsPlaceholder />
     </div>
   );
 }

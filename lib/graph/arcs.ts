@@ -52,6 +52,22 @@ function stableId(title: string): string {
 }
 
 /**
+ * Strip issue/task keys (Linear/Jira-style `AIO-138`, optionally bracketed) from arc text. The graph
+ * facts carry these keys, so the LLM tends to echo them into titles/summaries — but they're noise in
+ * a human-facing narrative. Removes the key and tidies the leftover brackets/spacing/punctuation.
+ * Pure + exported so it's unit-tested.
+ */
+export function stripTaskKeys(text: string): string {
+  return (text ?? "")
+    .replace(/[([]\s*[A-Z][A-Z0-9]+-\d+\s*[)\]]/g, "") // (AIO-138) / [AIO-138]
+    .replace(/\b[A-Z][A-Z0-9]+-\d+\b/g, "") // bare AIO-138
+    .replace(/\s+([.,;:)])/g, "$1") // space before punctuation
+    .replace(/\(\s*\)/g, "") // empty parens left behind
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
+/**
  * Parse + normalize the LLM's JSON into safe arcs: caps at 5, coerces confidence, defaults missing
  * fields, assigns a stable id from the title, stamps `derived_at`. Returns [] on malformed input.
  * Pure + exported so the fragile parsing is unit-tested without an LLM.
@@ -63,11 +79,11 @@ export function parseArcsJson(raw: string | null, now = new Date().toISOString()
     if (!Array.isArray(obj.arcs)) return [];
     return obj.arcs.slice(0, 5).map((a) => ({
       id: stableId(a.title ?? ""),
-      title: (a.title ?? "Untitled").toString(),
+      title: stripTaskKeys((a.title ?? "Untitled").toString()) || "Untitled",
       confidence: (["high", "medium", "low"] as const).includes(a.confidence as "high")
         ? (a.confidence as NarrativeArc["confidence"])
         : "low",
-      summary: (a.summary ?? "").toString(),
+      summary: stripTaskKeys((a.summary ?? "").toString()),
       participants: Array.isArray(a.participants) ? a.participants.map(String) : [],
       supporting_sources: Array.isArray(a.supporting_sources) ? a.supporting_sources.map(String) : [],
       derived_at: now,
