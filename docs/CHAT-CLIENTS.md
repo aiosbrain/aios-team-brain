@@ -53,9 +53,10 @@ Server behavior you rely on:
   `{ "conversation_id": "…", "updated_at": "…" }` (optionally keyed by cwd/project).
 - `aios chat "<question>"` → send the stored `conversation_id`; update it from the `conversation`
   event. `aios chat --new` → clear it first (start a fresh thread).
-- `aios chat --list` could hit `GET /api/dashboard/conversations` — but that's session-authed, not
-  API-key; for the CLI, a `GET /api/v1/conversations` (API-key) would be a small server add if you
-  want list/resume from the terminal. (Not built yet — flag if you want it.)
+- `aios chat --list` → **`GET /api/v1/conversations`** (API-key) returns the key member's threads
+  (`id`, `title`, `updated_at`), newest-active first. `aios chat --resume <id>` →
+  **`GET /api/v1/conversations/:id`** re-hydrates the full message history, then continue by sending
+  that `conversation_id` on the next `POST /api/v1/query`.
 
 ## Telegram via Hermes (the box on Fly.io)
 
@@ -78,6 +79,7 @@ share one Hermes key, their chats all land under that one member (fine for a sin
 for multi-user, issue a key per member and pick it by Telegram user).
 
 ## Not yet on the server (say the word)
-- `GET /api/v1/conversations[/:id]` (API-key list/resume for the CLI) — the dashboard has the
-  session-authed equivalents; the API-key versions are a small add.
-- Content search over message bodies (the dashboard sidebar currently searches titles client-side).
+- API-key **rename/delete** of a conversation (the session-authed dashboard has `PATCH`/`DELETE`;
+  the API-key list/get are built, management verbs are a small add).
+- Content search over message bodies (the dashboard sidebar currently searches titles client-side;
+  a server FTS endpoint would cover message content).
