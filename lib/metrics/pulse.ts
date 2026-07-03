@@ -83,6 +83,17 @@ function isoDay(d: Date): string {
   return d.toISOString().slice(0, 10);
 }
 
+/**
+ * Normalize a timestamptz to an ISO string. CRITICAL: the postgres adapter (the deployed backend)
+ * returns timestamptz columns as **Date objects**, while supabase returns ISO strings. The window
+ * math below compares/ slices these as strings, and `Date >= isoString` coerces the string to NaN
+ * (→ always false), which silently bucketed every recent row as "prior" — the dashboard read 0 with
+ * ↓100% on postgres. Mirrors lib/query/retrieve.ts. Accepts string | Date so both backends work.
+ */
+function toIso(v: string | Date): string {
+  return typeof v === "string" ? v : new Date(v).toISOString();
+}
+
 /** One bucket per day, oldest → newest, ending today. */
 function buildBuckets(days: number, now: Date): Bucket[] {
   const out: Bucket[] = [];
@@ -170,9 +181,10 @@ export async function getPulseMetrics(
       .limit(2_000),
   ]);
 
-  const itemRows = (itemsRes.data ?? []) as { kind: string; synced_at: string }[];
-  const queryRows = (queryRes.data ?? []) as { cost_usd: number | string; created_at: string }[];
-  const taskRows = (tasksRes.data ?? []) as { status: string; updated_at: string }[];
+  // NB: the pg adapter returns timestamptz as Date; supabase as string. Normalize via toIso below.
+  const itemRows = (itemsRes.data ?? []) as { kind: string; synced_at: string | Date }[];
+  const queryRows = (queryRes.data ?? []) as { cost_usd: number | string; created_at: string | Date }[];
+  const taskRows = (tasksRes.data ?? []) as { status: string; updated_at: string | Date }[];
   const commitRows = (commitRes.data ?? []) as { attrs: Record<string, unknown> }[];
 
   const winStartIso = windowStart.toISOString();
@@ -192,9 +204,10 @@ export async function getPulseMetrics(
   let itemsCurrent = 0;
   let itemsPrior = 0;
   for (const row of itemRows) {
-    if (inWindow(row.synced_at)) {
+    const syncedIso = toIso(row.synced_at);
+    if (inWindow(syncedIso)) {
       itemsCurrent++;
-      const i = index.get(row.synced_at.slice(0, 10));
+      const i = index.get(syncedIso.slice(0, 10));
       if (i !== undefined) {
         itemSpark[i]++;
         const kind = (ITEM_KINDS as readonly string[]).includes(row.kind)
@@ -216,10 +229,11 @@ export async function getPulseMetrics(
   let spendPrior = 0;
   for (const row of queryRows) {
     const cost = Number(row.cost_usd) || 0;
-    if (inWindow(row.created_at)) {
+    const createdIso = toIso(row.created_at);
+    if (inWindow(createdIso)) {
       queriesCurrent++;
       spendCurrent += cost;
-      const i = index.get(row.created_at.slice(0, 10));
+      const i = index.get(createdIso.slice(0, 10));
       if (i !== undefined) {
         querySpark[i]++;
         usage[i].queries++;
@@ -240,8 +254,9 @@ export async function getPulseMetrics(
     statusCounts.set(row.status, (statusCounts.get(row.status) ?? 0) + 1);
     if (IN_FLIGHT.has(row.status)) inFlight++;
     if (row.status === "blocked") blocked++;
-    if (inWindow(row.updated_at)) {
-      const i = index.get(row.updated_at.slice(0, 10));
+    const updatedIso = toIso(row.updated_at);
+    if (inWindow(updatedIso)) {
+      const i = index.get(updatedIso.slice(0, 10));
       if (i !== undefined) taskSpark[i]++;
     }
   }
