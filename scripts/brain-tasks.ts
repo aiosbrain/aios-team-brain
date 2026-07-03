@@ -26,7 +26,7 @@
  * priority: none | low | medium | high | urgent              (default none)
  */
 import { readFileSync } from "node:fs";
-import { adminClient } from "@/lib/supabase/admin";
+import { adminClient } from "@/lib/db/admin";
 import { uiRowKey } from "@/lib/ids";
 import { normalizeTaskPriority } from "@/lib/api/schemas";
 import { projectAllTasks } from "@/lib/pm-sync";

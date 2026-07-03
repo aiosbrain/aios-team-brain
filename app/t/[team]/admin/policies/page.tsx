@@ -1,4 +1,4 @@
-import { serverClient } from "@/lib/supabase/server";
+import { serverClient } from "@/lib/db/server";
 import { listAllPolicies } from "@/lib/policy/manage";
 import { PoliciesManager } from "@/components/admin/policies-manager";
 

@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
 import { Gavel } from "lucide-react";
-import { serverClient } from "@/lib/supabase/server";
+import { serverClient } from "@/lib/db/server";
 import { getSessionUser } from "@/lib/auth/session";
 import { visibleDecisions } from "@/lib/auth/visibility";
 import { DecisionsTable, type Decision } from "@/components/decisions-table";

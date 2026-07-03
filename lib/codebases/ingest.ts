@@ -1,5 +1,5 @@
 import "server-only";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 import type { CodebaseScanPayload } from "@/lib/api/schemas";
 import { computeScores } from "@/lib/codebases/score";
 import { buildIdentityMap, resolveMember } from "@/lib/identity/resolve";
@@ -16,7 +16,7 @@ import { audit } from "@/lib/api/audit";
  *   • github_issues   — upsert (codebase_id, number)
  */
 export async function ingestCodebaseScan(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   auth: { teamId: string; memberId: string; apiKeyId: string },
   payload: CodebaseScanPayload
 ): Promise<{ codebase_id: string; metrics_id: string; contributions: number; issues: number }> {

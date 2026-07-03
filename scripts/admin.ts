@@ -9,7 +9,7 @@
  *         'DATABASE_URL=$DATABASE_PUBLIC_URL npx tsx --conditions react-server scripts/admin.ts <cmd>'
  */
 import { execFileSync } from "node:child_process";
-import { adminClient } from "@/lib/supabase/admin";
+import { adminClient } from "@/lib/db/admin";
 import { createMember, deleteMember } from "@/lib/admin/members";
 import { issueApiKey, revokeApiKey } from "@/lib/admin/keys";
 import { issueLoginLink } from "@/lib/admin/login";

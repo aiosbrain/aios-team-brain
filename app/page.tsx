@@ -1,5 +1,5 @@
 import { redirect } from "next/navigation";
-import { serverClient } from "@/lib/supabase/server";
+import { serverClient } from "@/lib/db/server";
 import { getSessionUser } from "@/lib/auth/session";
 
 export default async function Home() {

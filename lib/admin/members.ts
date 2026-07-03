@@ -1,5 +1,5 @@
 import "server-only";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 import { audit } from "@/lib/api/audit";
 
 /**
@@ -22,7 +22,7 @@ export interface ActorContext {
 }
 
 export async function createMember(
-  admin: SupabaseClient,
+  admin: DbClient,
   teamId: string,
   input: MemberInput,
   opts: { upsert?: boolean; actor?: ActorContext } = {}
@@ -74,7 +74,7 @@ export interface DeleteResult {
  *   • refuses to remove the LAST active admin
  */
 export async function deleteMember(
-  admin: SupabaseClient,
+  admin: DbClient,
   teamId: string,
   email: string,
   opts: { hard?: boolean; actor?: ActorContext } = {}

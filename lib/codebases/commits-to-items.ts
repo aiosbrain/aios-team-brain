@@ -1,6 +1,6 @@
 import "server-only";
 import { createHash } from "node:crypto";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 import { ingestItem } from "@/lib/ingest";
 import type { ItemPayload } from "@/lib/api/schemas";
 import { resolveMember, type IdentityMap, type AuthorIdentity } from "@/lib/identity/resolve";
@@ -91,7 +91,7 @@ export function normalizeCommit(codebaseSlug: string, commit: ScanCommit): ItemP
  * Reuses the caller's already-built identity map. Returns the count of commits processed.
  */
 export async function projectCommitsToItems(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   auth: { teamId: string; memberId: string; apiKeyId: string },
   codebaseSlug: string,
   recentCommits: ScanCommit[],

@@ -1,5 +1,5 @@
 import "server-only";
-import { adminClient } from "@/lib/supabase/admin";
+import { adminClient } from "@/lib/db/admin";
 import { getProviderKey } from "@/lib/integrations/manage";
 
 /**

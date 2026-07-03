@@ -1,5 +1,5 @@
 import "server-only";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 import { getArcs, type ProviderKeys } from "@/lib/graph/arcs";
 import { visibleGroupIds, type AccessTier } from "@/lib/graph/group";
 import type { RosterPerson } from "./people-match";
@@ -28,7 +28,7 @@ function toRoster(
  * unavailable, so the box still shows tasks. Returns only people who have SOME signal.
  */
 export async function getTeamWork(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   teamId: string,
   teamSlug: string,
   tier: AccessTier,

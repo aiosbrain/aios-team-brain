@@ -1,7 +1,7 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { CircleCheck, CircleX, FolderOpen } from "lucide-react";
-import { serverClient } from "@/lib/supabase/server";
+import { serverClient } from "@/lib/db/server";
 import { currentMember } from "@/lib/auth/guard";
 import { visibleItems, visibleDecisions } from "@/lib/auth/visibility";
 import { KindBadge } from "@/components/kind-badge";

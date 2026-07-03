@@ -1,9 +1,7 @@
 import type { Metadata } from "next";
-import { notFound } from "next/navigation";
 import Link from "next/link";
 import { ArrowLeft, GitBranch } from "lucide-react";
-import { isPostgresBackend } from "@/lib/db/backend";
-import { serverClient } from "@/lib/supabase/server";
+import { serverClient } from "@/lib/db/server";
 import { currentMember } from "@/lib/auth/guard";
 import { canSeeCodebases } from "@/lib/codebases/visibility";
 import { getCodebaseFreshness, type CodebaseFreshness } from "@/lib/metrics/codebases";
@@ -49,7 +47,6 @@ function FreshnessBadge({ f }: { f: Freshness }) {
 }
 
 export default async function CodebasesGithubPage({ params }: { params: Promise<{ team: string }> }) {
-  if (!isPostgresBackend()) notFound();
 
   const { team: teamSlug } = await params;
   const supabase = await serverClient();

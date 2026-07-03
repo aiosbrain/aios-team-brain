@@ -1,6 +1,6 @@
 import "server-only";
 
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 
 import { linearAdapter } from "@/lib/pm-sync/linear";
 import { planeAdapter } from "@/lib/pm-sync/plane";
@@ -69,7 +69,7 @@ export function isDiverged(link: {
 }
 
 export async function reconcileProviderState(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   teamId: string,
   opts: { fetchImpl?: typeof fetch } = {}
 ): Promise<ReconcileResult> {

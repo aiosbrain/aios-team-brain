@@ -1,7 +1,7 @@
 import "server-only";
 import { randomUUID } from "node:crypto";
 import { SignJWT, jwtVerify } from "jose";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 
 /**
  * The single owner of the one-click Slack OAuth `state` — both the signed JWT and the
@@ -40,7 +40,7 @@ function secret(): Uint8Array {
  * Returns the signed `state` string for the Slack authorize URL.
  */
 export async function createSlackOAuthState(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   teamId: string,
   memberId: string
 ): Promise<string> {
@@ -63,7 +63,7 @@ export async function createSlackOAuthState(
  * persisted row disagrees with the JWT claims. Single SQL UPDATE … RETURNING → no TOCTOU race.
  */
 export async function consumeSlackOAuthState(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   token: string | null | undefined
 ): Promise<{ teamId: string; memberId: string } | null> {
   if (!token) return null;

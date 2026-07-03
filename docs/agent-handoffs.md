@@ -121,7 +121,7 @@ SCOPE:
 - F5.1 Add {slug:"integrations",label:"Integrations"} to components/admin/admin-tabs.tsx + app/t/[team]/admin/integrations/page.tsx (inherits the admin-only gate). Calls the F3 server action to create/enable/disable integrations.
 - F5.2 lib/integrations/read.ts — role/tier-scoped reads for the surface.
 - F5.3 test/guards/integrations-tier-filter.test.ts modeled on codebases-tier-filter.test.ts (non-vacuous).
-- F5.4 Under DB_BACKEND=supabase: the surface fails closed with a "not available on legacy backend" notice (integrations is postgres-only).
+- F5.4 The Integrations surface works against the Postgres backend (the only backend); no legacy-backend gating.
 - F5.5 Data-mechanics: integrations persist; an external-tier viewer cannot read admin config.
 
 VERIFY: npx tsc --noEmit; npm run lint; npm test; npm run check:docs; npm run db:test:up && npm run test:datamechanics:local. PR from feat/f5-integrations-ui → main; comment on the Plane epic.

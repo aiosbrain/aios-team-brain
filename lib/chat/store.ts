@@ -1,5 +1,5 @@
 import "server-only";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 import type { ChatTurn } from "@/lib/query/claude";
 
 /**
@@ -45,7 +45,7 @@ export function deriveTitle(firstQuestion: string): string {
 type Owner = { teamId: string; memberId: string };
 
 export async function createConversation(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   owner: Owner,
   title: string
 ): Promise<{ id: string } | null> {
@@ -60,7 +60,7 @@ export async function createConversation(
 
 /** True iff this member owns the conversation (the owner check every reader/writer runs first). */
 export async function ownsConversation(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   owner: Owner,
   conversationId: string
 ): Promise<boolean> {
@@ -76,7 +76,7 @@ export async function ownsConversation(
 }
 
 export async function appendMessage(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   owner: Owner,
   conversationId: string,
   role: "user" | "assistant",
@@ -106,7 +106,7 @@ export async function appendMessage(
 
 /** The member's conversations, newest-active first, excluding archived. */
 export async function listConversations(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   owner: Owner,
   limit = 100
 ): Promise<Conversation[]> {
@@ -123,7 +123,7 @@ export async function listConversations(
 
 /** A conversation's full message thread — owner-checked; null if not owned/absent. */
 export async function getConversation(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   owner: Owner,
   conversationId: string
 ): Promise<{ id: string; title: string; messages: ChatMessage[] } | null> {
@@ -150,7 +150,7 @@ export async function getConversation(
  * Owner-checked. Call this BEFORE persisting the current user message so it returns only prior turns.
  */
 export async function recentTurns(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   owner: Owner,
   conversationId: string,
   maxTurns = 6
@@ -177,7 +177,7 @@ export async function recentTurns(
 }
 
 export async function renameConversation(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   owner: Owner,
   conversationId: string,
   title: string
@@ -197,7 +197,7 @@ export async function renameConversation(
 
 /** Soft-delete (archive) — hides it from the list; messages stay for any later restore/audit. */
 export async function archiveConversation(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   owner: Owner,
   conversationId: string
 ): Promise<boolean> {

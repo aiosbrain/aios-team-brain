@@ -1,4 +1,4 @@
-import { serverClient } from "@/lib/supabase/server";
+import { serverClient } from "@/lib/db/server";
 import { ApprovalsQueue, type ApprovalRow, type DecidedRow } from "@/components/admin/approvals-queue";
 
 export default async function ApprovalsAdminPage({ params }: { params: Promise<{ team: string }> }) {

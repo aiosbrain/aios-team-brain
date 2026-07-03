@@ -1,8 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { Gauge } from "lucide-react";
-import { isPostgresBackend } from "@/lib/db/backend";
-import { serverClient } from "@/lib/supabase/server";
+import { serverClient } from "@/lib/db/server";
 import { currentMember } from "@/lib/auth/guard";
 import { getTeamMaturity, type ReadinessLevel } from "@/lib/metrics/maturity";
 import { parseRange } from "@/lib/metrics/range";
@@ -28,7 +27,6 @@ export default async function MaturityPage({
   params: Promise<{ team: string }>;
   searchParams: Promise<{ range?: string }>;
 }) {
-  if (!isPostgresBackend()) return null;
 
   const { team: teamSlug } = await params;
   const range = parseRange((await searchParams).range);

@@ -1,5 +1,5 @@
 import "server-only";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 import { audit } from "@/lib/api/audit";
 import type { ActorContext } from "./members";
 
@@ -11,7 +11,7 @@ const SLUG_RE = /^[a-z0-9][a-z0-9-]*$/;
  * Audited. team_id is stable, so existing data/keys/sessions survive a slug change.
  */
 export async function renameTeam(
-  admin: SupabaseClient,
+  admin: DbClient,
   teamId: string,
   fields: { slug?: string; name?: string },
   opts: { actor?: ActorContext } = {}

@@ -1,5 +1,5 @@
 import "server-only";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 import type { ViewerTier } from "@/lib/auth/visibility";
 import type { WorkingHours } from "@/lib/identity/profile";
 
@@ -102,7 +102,7 @@ function assigneeMatches(assignee: string, names: string[]): boolean {
  * resolves handle→member via getMemberProfile, so resolution isn't duplicated here).
  */
 export async function getMemberContext(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   teamId: string,
   memberId: string,
   tier: ViewerTier
@@ -199,7 +199,7 @@ export async function getMemberContext(
 
 /** Distinct projects this member is assigned tasks in, with open/total counts. */
 async function deriveProjects(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   teamId: string,
   names: string[]
 ): Promise<ProjectView[]> {

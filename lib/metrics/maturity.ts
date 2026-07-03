@@ -1,5 +1,5 @@
 import "server-only";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 import type { Range } from "./range";
 import type { ViewerTier } from "@/lib/codebases/visibility";
 import { getCodebaseSummaries } from "./codebases";
@@ -37,7 +37,7 @@ function rank(level: string | null): number {
 }
 
 export async function getTeamMaturity(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   teamId: string,
   range: Range,
   tier: ViewerTier

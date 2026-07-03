@@ -1,5 +1,5 @@
 import "server-only";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 import { authorize, fileApprovalRequest } from "@/lib/policy";
 import type { Principal } from "@/lib/policy/evaluate";
 import { audit } from "@/lib/api/audit";
@@ -41,7 +41,7 @@ export type RunActionOutcome = {
 type ExecOpts = { handlers?: ActionHandler[]; sandbox?: SandboxRunner };
 
 export async function runAction(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   input: RunActionInput,
   opts: ExecOpts = {}
 ): Promise<RunActionOutcome> {
@@ -145,7 +145,7 @@ export type ResolveApprovalOutcome = {
  * the service role to perform the resumed handler's writes.
  */
 export async function resolveApproval(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   input: ResolveApprovalInput,
   opts: ExecOpts = {}
 ): Promise<ResolveApprovalOutcome> {
@@ -218,7 +218,7 @@ export async function resolveApproval(
 type ExecResult = { status: "succeeded" | "failed"; result?: Record<string, unknown>; error?: string };
 
 async function executeHandler(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   actionId: string,
   ctx: Parameters<ActionHandler["execute"]>[0],
   request: ActionRequest,
@@ -247,7 +247,7 @@ async function executeHandler(
 }
 
 function makeAuditAction(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   ids: { teamId: string; memberId: string | null; apiKeyId: string | null; actionId: string }
 ) {
   return (action: string, meta: Record<string, unknown>) =>
@@ -268,7 +268,7 @@ function now(): string {
 }
 
 async function finish(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   actionId: string,
   status: "succeeded" | "failed",
   result: Record<string, unknown>

@@ -1,5 +1,5 @@
 import "server-only";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 import { audit } from "@/lib/api/audit";
 import {
   WEEKDAYS,
@@ -144,7 +144,7 @@ function assertDate(label: string, value: string): void {
  * field is left untouched on an existing row); validation runs before any DB write.
  */
 export async function setMemberProfile(
-  admin: SupabaseClient,
+  admin: DbClient,
   teamId: string,
   memberId: string,
   input: ProfileInput,
@@ -182,7 +182,7 @@ export async function setMemberProfile(
 
 /** Add a time-off range for a member. Returns the new row id. */
 export async function addTimeOff(
-  admin: SupabaseClient,
+  admin: DbClient,
   teamId: string,
   memberId: string,
   input: TimeOffInput,
@@ -226,7 +226,7 @@ export async function addTimeOff(
 
 /** Remove a time-off row (team-scoped so an id can't be deleted across teams). */
 export async function removeTimeOff(
-  admin: SupabaseClient,
+  admin: DbClient,
   teamId: string,
   id: string,
   opts: { actor?: ProfileActor } = {}
@@ -250,7 +250,7 @@ export async function removeTimeOff(
  * duplicates. Returns the goal id.
  */
 export async function setMemberGoal(
-  admin: SupabaseClient,
+  admin: DbClient,
   teamId: string,
   memberId: string,
   input: GoalInput,
@@ -331,7 +331,7 @@ export async function setMemberGoal(
 
 /** Remove a goal (team-scoped). */
 export async function removeMemberGoal(
-  admin: SupabaseClient,
+  admin: DbClient,
   teamId: string,
   id: string,
   opts: { actor?: ProfileActor } = {}

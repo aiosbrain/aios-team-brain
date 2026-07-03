@@ -1,5 +1,5 @@
 import "server-only";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 import { buildIdentityMap, resolveMember } from "@/lib/identity/resolve";
 import { setMemberIdentity } from "@/lib/identity/member-identities";
 
@@ -24,7 +24,7 @@ export interface ProviderIdentitySyncResult {
 }
 
 export async function syncProviderIdentities(
-  admin: SupabaseClient,
+  admin: DbClient,
   teamId: string,
   provider: string,
   users: ProviderUser[]

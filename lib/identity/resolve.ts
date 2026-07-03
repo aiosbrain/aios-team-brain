@@ -1,5 +1,5 @@
 import "server-only";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 
 /**
  * Shared identity resolution: git/provider author identity → roster `member_id` for a team.
@@ -32,7 +32,7 @@ export interface AuthorIdentity {
 
 /** Build lookup tables mapping author identity → member_id for the team. */
 export async function buildIdentityMap(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   teamId: string
 ): Promise<IdentityMap> {
   const { data } = await supabase
@@ -113,7 +113,7 @@ export function resolveMember(map: IdentityMap, identity: AuthorIdentity): strin
 
 /** Convenience: build the map once and resolve a batch of identities to member_ids. */
 export async function resolveMembers(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   teamId: string,
   identities: AuthorIdentity[]
 ): Promise<(string | null)[]> {

@@ -1,5 +1,5 @@
 import "server-only";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 import {
   type ItemPayload,
   taskRowSchema,
@@ -38,7 +38,7 @@ export interface IngestResult {
 }
 
 export async function ingestItem(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   auth: { teamId: string; memberId: string; apiKeyId: string },
   payload: ItemPayload,
   access: "team" | "external",
@@ -163,7 +163,7 @@ type TaskRow = NonNullable<ReturnType<typeof taskRowSchema.safeParse>["data"]>;
 
 /** Parse + parent-integrity checks only (no writes). Called before item upsert so 422 is clean. */
 async function parseAndValidateTaskRows(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   teamId: string,
   projectId: string,
   rawRows: unknown[]
@@ -224,7 +224,7 @@ async function parseAndValidateTaskRows(
 }
 
 async function materializeTasks(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   teamId: string,
   projectId: string,
   itemId: string,
@@ -346,7 +346,7 @@ async function materializeTasks(
 }
 
 async function materializeDecisions(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   teamId: string,
   projectId: string,
   itemId: string,

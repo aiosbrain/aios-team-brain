@@ -1,12 +1,12 @@
 import { randomUUID, createHash } from "node:crypto";
-import type { SupabaseClient } from "@supabase/supabase-js";
-import { adminClient } from "@/lib/supabase/admin";
+import type { DbClient } from "@/lib/db/types";
+import { adminClient } from "@/lib/db/admin";
 import { ingestItem } from "@/lib/ingest";
 import type { ItemPayload } from "@/lib/api/schemas";
 
 // In DB_BACKEND=postgres (set by the data-mechanics config) adminClient() is the
 // pg adapter over the real test Postgres — so the real app code runs unchanged.
-export function db(): SupabaseClient {
+export function db(): DbClient {
   return adminClient();
 }
 

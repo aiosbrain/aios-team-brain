@@ -1,5 +1,5 @@
 import "server-only";
-import { serverClient } from "@/lib/supabase/server";
+import { serverClient } from "@/lib/db/server";
 import { getSessionUser } from "@/lib/auth/session";
 
 /**

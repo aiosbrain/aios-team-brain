@@ -1,5 +1,5 @@
 import "server-only";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 import { GraphitiClient, type GraphFact } from "@/lib/graph/graphiti-client";
 import { visibleGroupIds } from "@/lib/graph/group";
 import {
@@ -120,7 +120,7 @@ const GRAPH_FACTS_LIMIT = Number(process.env.GRAPH_QUERY_FACTS ?? 12);
 const GRAPH_QUERY_TIMEOUT_MS = Number(process.env.GRAPH_QUERY_TIMEOUT_MS ?? 4000);
 
 async function fetchGraphFacts(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   teamId: string,
   tier: "team" | "external",
   question: string
@@ -209,7 +209,7 @@ export function wantsActivityContext(question: string): boolean {
  * member display name in here. **team-tier only** — code/contributor activity is internal, never
  * shown to an external viewer (CLAUDE.md §5). Returns "" when there's no recent activity.
  */
-async function gitActivityDigest(supabase: SupabaseClient, teamId: string): Promise<string> {
+async function gitActivityDigest(supabase: DbClient, teamId: string): Promise<string> {
   const since = new Date(Date.now() - GIT_WINDOW_DAYS * 86_400_000).toISOString().slice(0, 10);
   const { data: contribs } = await supabase
     .from("code_contributions")
@@ -262,7 +262,7 @@ async function gitActivityDigest(supabase: SupabaseClient, teamId: string): Prom
  * email). **team-tier only** — internal activity, never shown to an external viewer. Returns "" when
  * there's nothing attributed.
  */
-async function peopleActivityDigest(supabase: SupabaseClient, teamId: string): Promise<string> {
+async function peopleActivityDigest(supabase: DbClient, teamId: string): Promise<string> {
   const since = new Date(Date.now() - PEOPLE_WINDOW_DAYS * 86_400_000).toISOString();
   const { data: items } = await supabase
     .from("items")
@@ -326,7 +326,7 @@ async function peopleActivityDigest(supabase: SupabaseClient, teamId: string): P
  * queries run in parallel; all respect the caller's tier.
  */
 async function nativeRetrieve(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   teamId: string,
   tier: "team" | "external",
   question: string,
@@ -601,7 +601,7 @@ export const nativeProvider: RetrievalProvider = {
  * swapping the whole context layer for gbrain/another is `CONTEXT_PROVIDER=external` + an adapter.
  */
 export async function retrieve(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   teamId: string,
   tier: "team" | "external",
   question: string,

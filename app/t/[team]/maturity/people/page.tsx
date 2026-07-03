@@ -1,8 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { Gauge } from "lucide-react";
-import { isPostgresBackend } from "@/lib/db/backend";
-import { serverClient } from "@/lib/supabase/server";
+import { serverClient } from "@/lib/db/server";
 import { currentMember } from "@/lib/auth/guard";
 import { getTeamMaturity, AXIS_META, type AemAxes } from "@/lib/metrics/individual-maturity";
 import { EmptyState } from "@/components/empty-state";
@@ -31,8 +30,6 @@ function radarData(axes: AemAxes): RadarDatum[] {
 }
 
 export default async function MaturityPage({ params }: { params: Promise<{ team: string }> }) {
-  // Maturity analytics live only on the postgres backend (canonical schema).
-  if (!isPostgresBackend()) return null;
 
   const { team: teamSlug } = await params;
   const supabase = await serverClient();

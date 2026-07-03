@@ -1,6 +1,6 @@
 import "server-only";
 
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 import { audit } from "@/lib/api/audit";
 import type { WorkEventPayload } from "@/lib/api/schemas";
 import { extractWorkKeys } from "@/lib/pm-sync/work-keys";
@@ -33,7 +33,7 @@ function eventKeys(payload: WorkEventPayload): string[] {
 }
 
 export async function ingestWorkEvent(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   auth: WorkEventAuth,
   payload: WorkEventPayload,
   opts: { syncPm?: boolean; fetchImpl?: typeof fetch } = {}

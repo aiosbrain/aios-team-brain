@@ -1,5 +1,5 @@
 import "server-only";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 import type { Kpi } from "./pulse";
 import { rangeDays, type Range } from "./range";
 import { canSeeCodebases, type ViewerTier } from "@/lib/codebases/visibility";
@@ -47,7 +47,7 @@ type MetricRow = {
 };
 
 export async function getCodebaseSummaries(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   teamId: string,
   range: Range,
   tier: ViewerTier
@@ -192,7 +192,7 @@ export interface CodebaseFreshness {
  * like the rest of codebase analytics (sole enforcement on postgres, no RLS).
  */
 export async function getCodebaseFreshness(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   teamId: string,
   tier: ViewerTier
 ): Promise<CodebaseFreshness[]> {
@@ -317,7 +317,7 @@ export interface CodebaseDetail {
 }
 
 export async function getCodebaseDetail(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   teamId: string,
   slug: string,
   range: Range,
@@ -550,7 +550,7 @@ function dayStr(v: string | Date): string {
  * (the `lib/metrics/codebases` choke-point is the sole enforcement on postgres).
  */
 export async function getContributorDetail(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   teamId: string,
   slug: string,
   ref: ContributorRef,
@@ -661,7 +661,7 @@ export interface MemberProfile {
  * the team's codebases. Looked up by `actor_handle` or `github_login`. Tier-gated team-only.
  */
 export async function getMemberProfile(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   teamId: string,
   handle: string,
   range: Range,

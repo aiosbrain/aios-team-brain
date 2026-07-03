@@ -1,6 +1,5 @@
 import { type NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
-import { isPostgresBackend } from "@/lib/db/backend";
 import { loginByEmail } from "@/lib/auth/pg-login";
 import { signSession, SESSION_COOKIE, sessionCookieOptions } from "@/lib/auth/pg-session";
 
@@ -12,18 +11,14 @@ const schema = z.object({
 });
 
 /**
- * Direct (passwordless) sign-in for the postgres backend. Invite-only: if the email is a
- * recognized non-disabled member we set the signed session cookie immediately; otherwise we
+ * Direct (passwordless) sign-in. Invite-only: if the email is a recognized
+ * non-disabled member we set the signed session cookie immediately; otherwise we
  * reject with 403. No email round-trip / magic link.
  *
  * SECURITY: trusts the submitted email with no ownership proof — fine only for this
  * invite-only, self-hosted instance with a known member list. See lib/auth/pg-login.loginByEmail.
  */
 export async function POST(req: NextRequest) {
-  if (!isPostgresBackend()) {
-    return NextResponse.json({ error: "not_applicable" }, { status: 400 });
-  }
-
   let body: unknown;
   try {
     body = await req.json();

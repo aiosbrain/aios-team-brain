@@ -1,6 +1,6 @@
 import "server-only";
 
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 
 import { getEnabledIntegrationsWithSecrets, type IntegrationWithSecret } from "@/lib/integrations/manage";
 import { linearAdapter } from "@/lib/pm-sync/linear";
@@ -91,7 +91,7 @@ function chooseIntegration(integrations: IntegrationWithSecret[], provider: PmPr
 // Resolve the team's projection target: its configured primary_pm_provider, or — if unset — the
 // sole enabled PM integration. Ambiguous/none → null (caller no-ops with a clear report).
 export async function resolvePrimaryProvider(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   teamId: string
 ): Promise<PrimaryResolution> {
   const integrations = await getEnabledIntegrationsWithSecrets(supabase, teamId);
@@ -142,7 +142,7 @@ export const PROJECTION_TASK_COLS =
 
 // Get-or-create the task_pm_links row for (team, project, row_key, provider).
 async function ensureLink(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   row: ProjectionTaskRow,
   provider: PmProvider,
   defaultSource: string
@@ -173,7 +173,7 @@ async function ensureLink(
 }
 
 async function persistSuccess(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   link: TaskPmLink,
   result: UpsertWorkItemResult,
   fingerprint: string
@@ -195,7 +195,7 @@ async function persistSuccess(
     .eq("id", link.id);
 }
 
-async function persistError(supabase: SupabaseClient, link: TaskPmLink, message: string) {
+async function persistError(supabase: DbClient, link: TaskPmLink, message: string) {
   await supabase
     .from("task_pm_links")
     .update({ last_error: message.slice(0, 1000), updated_at: new Date().toISOString() })
@@ -203,7 +203,7 @@ async function persistError(supabase: SupabaseClient, link: TaskPmLink, message:
 }
 
 async function loadTaskByRowKey(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   teamId: string,
   projectId: string,
   rowKey: string
@@ -221,7 +221,7 @@ async function loadTaskByRowKey(
 // Project one task into the team's primary PM tool. Resolves the parent first (so the provider
 // sub-issue link exists), upserts the work item, and persists the link bookkeeping. Brain-wins.
 export async function projectTask(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   row: ProjectionTaskRow,
   opts: ProjectTaskOptions = {}
 ): Promise<ProjectionReport> {
@@ -331,7 +331,7 @@ export interface ProjectAllOptions {
 // rows that actually wrote. Both `projectAllTasks` (whole board) and the reactive changed-rows path
 // reuse this so the prepare/order/throttle semantics can't drift apart.
 export async function projectRows(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   primary: ResolvedPrimary,
   rows: ProjectionTaskRow[],
   opts: ProjectAllOptions = {}
@@ -368,7 +368,7 @@ export async function projectRows(
 // retired plane:backlog / linear:backlog seed scripts. ~80 rows × 1 provider ≈ ~90s with the
 // throttle. Continues on per-row failure and returns a per-row report.
 export async function projectAllTasks(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   teamId: string,
   projectId: string,
   opts: ProjectAllOptions = {}

@@ -19,7 +19,7 @@ Reason from this table, not from a random call site.
 
 | State | Store (table) | Writer | Readers | Tier/access enforcement |
 |---|---|---|---|---|
-| Synced content | `items`, `item_versions` | **`lib/ingest` only** (single-writer guarded) | dashboard pages, `/api/v1/items`, `lib/query/retrieve`, okf-bundle, metrics | supabase: RLS; postgres: app-code — API ✅, dashboard ✅ (`lib/auth/visibility` choke-point, guarded) |
+| Synced content | `items`, `item_versions` | **`lib/ingest` only** (single-writer guarded) | dashboard pages, `/api/v1/items`, `lib/query/retrieve`, okf-bundle, metrics | app-code tier isolation (no RLS) — API ✅, dashboard ✅ (`lib/auth/visibility` choke-point, guarded) |
 | Dense index (OPTIONAL) | `item_chunks` (embeddings; **not** in `schema.sql` — `postgres/optional/pgvector.sql`, load via `pg:schema:vector`) | **`lib/query/dense-index` only** (single-writer guarded; chunk+embed, idempotent on `items.content_sha256`) — incremental in the ingest scheduler + `npm run embed:backfill` | `lib/query/dense-search` (HNSW cosine → RRF-fused into `retrieve`) | opt-in (`EMBEDDINGS_URL` + pgvector present, else a complete no-op); dense hits tier-filtered on **live `items.access`** — no `external` leak (guarded by the dense data-mechanics test) |
 | Tasks | `tasks` | `lib/ingest` (sync rows — incl. inbound Plane/Linear/GitHub import, each into a dedicated `plane-<id>`/`linear-<team>`/`github-<owner>-<repo>` project) + `app/actions/tasks.ts` (UI; mints `ui-` row_key) + `lib/work-events` (merged-work completion) | dashboard, `/api/v1/tasks`, PM sync | team-scoped; `origin='ui'` rows survive sync diff; v1.2 hierarchy fields `parent_row_key`/`labels`/`priority` (parent integrity — exists + acyclic — enforced in `lib/ingest`); `body` is dashboard/DB-only (never in the markdown contract) |
 | Task PM links | `task_pm_links` | `lib/ingest` (optional task-row PM metadata) + PM backfill | dashboard task badges, `lib/pm-sync` | team-scoped; stores provider IDs/status only, never secrets; v1.2 adds `last_projected_status`/`projection_fingerprint` (skip-detection) + `provider_seen_status` (Phase 5 divergence) |
@@ -37,13 +37,13 @@ Reason from this table, not from a random call site.
 | Sessions (postgres) | `auth_users`, `auth_tokens` | `lib/auth/pg-*` | `getSessionUser` | signed httpOnly cookie |
 | Personal Slack token + OAuth state | `member_secrets` (per-member encrypted `xoxp` "act as me" token) + `oauth_states` (single-use OAuth nonces) | **`lib/member-secrets/manage` only** (`setMemberSecret`/`deleteMemberSecret`) for the token; **`lib/auth/slack-oauth-state` only** for nonces (mint at `GET /api/auth/slack/start`, atomically consume at `/callback`) | `getMemberSecret` → owner-only `GET /api/v1/me/slack-token` (paste path) + `GET /api/auth/slack/status` (connected/identity, never the token); nonces are consume-once, read nowhere else | token encrypted at rest (AES-256-GCM, `lib/secrets`), returned only over the owner-authed token endpoint, never logged. OAuth state = signed short-TTL JWT (HS256, `AUTH_SECRET`) bound to the single-use `oauth_states` nonce → CSRF + replay guard; **residual v1 risk:** first-use code-injection if an *unused* signed state leaks within its 10-min TTL (v2: PKCE/browser-binding) |
 | Rate limits | `rate_limits` | `rate_limit_hit` rpc | — | service-role only |
-| Integrations | `integrations` | **`lib/integrations/manage` only** (single-writer guarded; admin server actions) | Admin → Integrations page (`lib/integrations/read`, **admin-gated** `canManageIntegrations`); `GET /api/v1/integrations` (API-key, NON-secret selections via `manage.listEnabledIntegrationSelections`); in-process Slack + Plane + Linear + GitHub runners (`lib/ingest/run` via `manage.getEnabledIntegrationsWithSecrets`) | `config` is NON-secret (per-type allowlist + secret-key rejection); the connector secret is **encrypted at rest** in `secret_ciphertext` (`lib/secrets`, AES-256-GCM) and decrypted **only in-process** for the runner — it never leaves over HTTP, not even on the API-key read. Admin-tier (no per-row `access` column): both writes (`resolveIntegrationsAdmin`) and the dashboard read (`canManageIntegrations`, in `lib/integrations/read`) are app-code gated on `role==="admin"` — no RLS backstop; guarded by `test/guards/integrations-tier-filter` + the data-mechanics tier test. The page fails closed under `DB_BACKEND=supabase`. **LLM provider keys** (`openai`/`anthropic`/`google`) are secret-only integration types managed in the Admin → Integrations "AI provider keys" panel; the query LLM resolves the team's key via `manage.getProviderKey` (falls back to the process env when unset). postgres-only |
+| Integrations | `integrations` | **`lib/integrations/manage` only** (single-writer guarded; admin server actions) | Admin → Integrations page (`lib/integrations/read`, **admin-gated** `canManageIntegrations`); `GET /api/v1/integrations` (API-key, NON-secret selections via `manage.listEnabledIntegrationSelections`); in-process Slack + Plane + Linear + GitHub runners (`lib/ingest/run` via `manage.getEnabledIntegrationsWithSecrets`) | `config` is NON-secret (per-type allowlist + secret-key rejection); the connector secret is **encrypted at rest** in `secret_ciphertext` (`lib/secrets`, AES-256-GCM) and decrypted **only in-process** for the runner — it never leaves over HTTP, not even on the API-key read. Admin-tier (no per-row `access` column): both writes (`resolveIntegrationsAdmin`) and the dashboard read (`canManageIntegrations`, in `lib/integrations/read`) are app-code gated on `role==="admin"` — no RLS backstop; guarded by `test/guards/integrations-tier-filter` + the data-mechanics tier test. **LLM provider keys** (`openai`/`anthropic`/`google`) are secret-only integration types managed in the Admin → Integrations "AI provider keys" panel; the query LLM resolves the team's key via `manage.getProviderKey` (falls back to the process env when unset). |
 | Codebase analytics | `codebases`, `code_metrics`, `code_contributions`, `github_issues` | **`lib/codebases/ingest` only** (single-writer guarded; via `POST /api/v1/codebases`) | codebases pages incl. Codebases → GitHub (scan freshness via `lib/metrics/codebases.getCodebaseFreshness` + live HEAD compare `lib/codebases/github.fetchRepoHeadSha`), `lib/metrics/codebases` | team-tier only; **app-code gate** (`lib/codebases/visibility` + guard) — no RLS backstop. Brain derives `agentic_score`/`health_score`; AEM `readiness_*` is scored scanner-side (`ingestion/aios_ingest/analyzers/readiness.py`) and persisted verbatim. W1.3 native UI: repo selection persists to `integrations` (type=github, admin) via the dedicated **Admin → Integrations "GitHub repositories" panel** (`components/admin/github-repos-panel` → `addGithubRepo`/`removeGithubRepo` actions → single-writer `lib/integrations/github-link`, writing one canonical github row's `config.repos`; the panel also offers already-scanned `codebases.full_name` as one-click link suggestions); member→GitHub linking via `linkGithub` on Admin → Members (admin); **no server-triggered scan** — the GitHub surface documents the manual `aios-ingest scan` command; the repo selection (`config.repos`) is consumed by the in-process native GitHub importer (`lib/ingest/run`). Also projects each scan's `recent_commits` → searchable `items` (kind `artifact`, `frontmatter.source=git`, in the `commits` project) via `lib/codebases/commits-to-items` → `ingestItem` (author-attributed via the identity map, `team` tier) so git history is answerable in NL queries |
-| Brain spend / usage meter | `query_log` (`cost_usd`, `input/output/cache_tokens`, `member_id`) | the query routes (`/api/v1/query`, `/api/dashboard/query`) — one row per answered question | `lib/metrics/pulse` (usage KPIs), `lib/metrics/members` (per-member cost + throughput-vs-cost, W1.2), Admin → Usage page | **role-scoped in app code** via `scopeQueryLog` (admins → team-wide; everyone else → own rows) — no RLS backstop in postgres; guarded by `test/guards/query-log-visibility`. Brain spend only |
-| Chat history | `conversations` + `chat_messages` | **`lib/chat/store` only** (single-writer guarded) — both `POST /api/dashboard/query` (web) and `POST /api/v1/query` (machine API: CLI / Telegram-via-Hermes) create/continue a thread and persist each user+assistant turn; the conversation routes rename/archive | the `/query` sidebar + `GET /api/dashboard/conversations[/:id]`; `POST /api/dashboard/query` loads the windowed history (`recentTurns`) so follow-ups/pronouns resolve | **owner-scoped per member** — every store call filters `(team_id, member_id)`; a member sees only their own threads (no RLS backstop; the store IS the gate, guarded by `test/guards/single-writer-chat` + the chat-store data-mechanics owner-isolation test). Persists across sessions/interfaces keyed by `conversation_id`; soft-delete via `archived_at`. Distinct from `query_log` (the spend meter). postgres-only |
+| Brain spend / usage meter | `query_log` (`cost_usd`, `input/output/cache_tokens`, `member_id`) | the query routes (`/api/v1/query`, `/api/dashboard/query`) — one row per answered question | `lib/metrics/pulse` (usage KPIs), `lib/metrics/members` (per-member cost + throughput-vs-cost, W1.2), Admin → Usage page | **role-scoped in app code** via `scopeQueryLog` (admins → team-wide; everyone else → own rows) — no RLS backstop; guarded by `test/guards/query-log-visibility`. Brain spend only |
+| Chat history | `conversations` + `chat_messages` | **`lib/chat/store` only** (single-writer guarded) — both `POST /api/dashboard/query` (web) and `POST /api/v1/query` (machine API: CLI / Telegram-via-Hermes) create/continue a thread and persist each user+assistant turn; the conversation routes rename/archive | the `/query` sidebar + `GET /api/dashboard/conversations[/:id]`; `POST /api/dashboard/query` loads the windowed history (`recentTurns`) so follow-ups/pronouns resolve | **owner-scoped per member** — every store call filters `(team_id, member_id)`; a member sees only their own threads (no RLS backstop; the store IS the gate, guarded by `test/guards/single-writer-chat` + the chat-store data-mechanics owner-isolation test). Persists across sessions/interfaces keyed by `conversation_id`; soft-delete via `archived_at`. Distinct from `query_log` (the spend meter). |
 | External AI spend | `usage_costs` | **`lib/costs/ingest` only** (via `POST /api/v1/costs`) | `lib/metrics/external-costs`, Admin → Usage page | team-tier only; workstation pushes from `aios analyze --push` (Cursor dashboard USD + session-log estimates); idempotent on `(team, member, date, provider, source, project)` |
 | AEM maturity snapshots | `agentic_maturity_snapshots` | `POST /api/v1/metrics` → `lib/metrics/individual-maturity-ingest` | Maturity → People (`lib/metrics/individual-maturity`) | team-tier only; daily aggregates incl. token/cost totals from session logs; no raw session content |
-| Graph memory (Graphiti) | `graph_episodes` (projection state) + **Graphiti/Neo4j** (the graph itself, self-hosted, `graphiti/`) | **`lib/graph/project` only** (single-writer guarded) — projects brain `items` (Slack transcripts) → Graphiti episodes; driven by `lib/graph/run` (`runGraphProjection`) via the admin **"Project to graph"** action (`projectToGraphNow`, admin-gated) + the `lib/graph/scheduler` interval poller (registered in `instrumentation.ts`, self-gated to inert unless `GRAPHITI_URL` set) | `POST /api/v1/graph-query` via `lib/graph/graphiti-client` | **experiment alongside** `graph_entities`/`/api/v1/query` (not a replacement). Graphiti has no tier awareness → tier is encoded in `group_id` (`<slug>_<tier>` — Graphiti rejects `:`; `lib/graph/group`) and the query scopes to `visibleGroupIds(viewerTier)` — SOLE isolation, no RLS backstop. `/messages` requires a (nullable) `role` field. LLM extraction via OpenAI-compatible endpoint (`GRAPHITI_URL`/`graphiti/.env`); postgres-only |
+| Graph memory (Graphiti) | `graph_episodes` (projection state) + **Graphiti/Neo4j** (the graph itself, self-hosted, `graphiti/`) | **`lib/graph/project` only** (single-writer guarded) — projects brain `items` (Slack transcripts) → Graphiti episodes; driven by `lib/graph/run` (`runGraphProjection`) via the admin **"Project to graph"** action (`projectToGraphNow`, admin-gated) + the `lib/graph/scheduler` interval poller (registered in `instrumentation.ts`, self-gated to inert unless `GRAPHITI_URL` set) | `POST /api/v1/graph-query` via `lib/graph/graphiti-client` | **experiment alongside** `graph_entities`/`/api/v1/query` (not a replacement). Graphiti has no tier awareness → tier is encoded in `group_id` (`<slug>_<tier>` — Graphiti rejects `:`; `lib/graph/group`) and the query scopes to `visibleGroupIds(viewerTier)` — SOLE isolation, no RLS backstop. `/messages` requires a (nullable) `role` field. LLM extraction via OpenAI-compatible endpoint (`GRAPHITI_URL`/`graphiti/.env`) |
 
 ## System context
 
@@ -61,7 +61,7 @@ flowchart LR
     POLICY["lib/policy<br/>(authorize, Organ 6)"]
     UI["Dashboard /t/[team]/*<br/>(tier-gated reads)"]
   end
-  DB[("Postgres (Railway)<br/>app-code tier isolation<br/>Supabase optional/legacy")]
+  DB[("Postgres (Railway)<br/>app-code tier isolation")]
   LLM["Claude API<br/>claude-opus-4-8"]
 
   SRC --> SIDE
@@ -96,13 +96,13 @@ This server **implements brain-api v1.2** (the wire contract; source of truth:
 
 Two principals, one tier model:
 
-- **Humans** — invite-only. In the **postgres** target, sign-in is **direct passwordless**:
+- **Humans** — invite-only. Sign-in is **direct passwordless**:
   POST `/api/auth/login` with a recognized member email → signed session cookie (no email
   round-trip; unknown emails 403). Trusts the email with no ownership proof — acceptable only
-  for this self-hosted, small known-member instance (`lib/auth/pg-login.loginByEmail`). In the
-  legacy **supabase** mode, magic-link / OAuth via Supabase Auth.
+  for this self-hosted, small known-member instance (`lib/auth/pg-login.loginByEmail`). The
+  session is a `jose`-signed httpOnly cookie (`lib/auth/pg-session`).
 - **Machines** — per-member API key `aios_<key_id>_<secret>` (sha256 at rest, shown
-  once). Sync writes use the **service role** and bypass RLS — confined to `lib/ingest`
+  once). Sync writes use the **service role** — confined to `lib/ingest`
   and audited on every write.
 - **Tiers** — `team` (sees all) vs `external` (sees only external). `admin`/`private`
   are rejected with **422** at the API and never reach the database.
@@ -328,7 +328,7 @@ flowchart TD
 ```
 
 A queued (`pending_approval`) action is resolved by `resolveApproval()` (called by the
-session-authed dashboard; RLS restricts deciding to admins/leads): **approve** resumes and
+session-authed dashboard; app-code role checks restrict deciding to admins/leads): **approve** resumes and
 executes the handler, **deny** marks the action denied — both audited, and a second
 decision is rejected. Code execution uses an **E2B** `SandboxRunner`
 (`lib/actions/sandbox/e2b.ts`, opt-in: `npm i @e2b/code-interpreter` + `E2B_API_KEY`);
@@ -374,10 +374,9 @@ erDiagram
 | `lib/policy` | Policy evaluation + approval queue (Organ 6) |
 | `lib/api` | auth, rate-limit, audit, zod schemas |
 | `lib/okf` | OKF link-graph helpers |
-| `postgres/schema.sql` | **Canonical schema** (Postgres target; app-code tier isolation). Drift-guarded. |
-| `supabase/migrations` | Derived/legacy schema (RLS) — only when `DB_BACKEND=supabase` |
+| `postgres/schema.sql` | **Canonical schema** (Postgres; app-code tier isolation). Drift-guarded. |
 | `ingestion/` | Python connector sidecar (Organ 2) |
-| `lib/db`, `lib/auth` | Backend selector + pg adapter; backend-agnostic auth/session/guard |
+| `lib/db`, `lib/auth` | pg adapter (`DbClient`) + factories (`lib/db/{server,admin}`); signed-cookie auth/session/guard |
 | `instrumentation.ts` + `sentry.{server,edge}.config.ts` + `instrumentation-client.ts` | Sentry init per runtime (server/edge/browser); `onRequestError` forwards server errors. All DSN/token env-driven and inert when unset. See `docs/OPS.md`. |
 | `app/global-error.tsx` | Root error boundary; reports to Sentry and renders fallback UI |
 
@@ -391,7 +390,7 @@ guard enforces it, it's named.
 - **Ingest is idempotent by `content_sha256`.** Identical re-push → `unchanged`, no new
   `item_versions` row. *Verified:* `test/datamechanics/ingest.datamechanics.test.ts` (real PG).
 - **Tier isolation.** An `external`-tier principal never reads `team`/`admin` content. Enforced
-  by RLS in supabase mode, by app code in postgres mode (no DB backstop). Enforced in three
+  in app code (no RLS, no DB backstop). Enforced in three
   places, all verified on real PG: the retrieval path (`retrieve.ts`), the API routes (they
   re-apply the filter), and the dashboard reads (`app/t/[team]/*`) — which now route every
   `items` read through the **`lib/auth/visibility` choke-point** (`visibleItems`/`canSeeAccess`).
@@ -428,14 +427,14 @@ guard enforces it, it's named.
   inventories below (machine-guarded; CI + pre-push will fail otherwise).
 - **Write to `items`/`item_versions`** → it must live in `lib/ingest` (single-writer guard).
 - **Read tiered content on the dashboard** → apply the `access`/tier filter explicitly; there is
-  no RLS backstop in postgres mode.
+  no RLS backstop.
 - **Add a migration** → 14-digit timestamp prefix; run `npm run db:test:up` to prove replay.
-- **Change access control** → treat it as dual-backend; add/extend a data-mechanics parity test.
+- **Change access control** → add/extend a data-mechanics test that proves tier isolation on real PG.
 - **Change the brain-api wire contract** → the contract is pinned in
   `aios-workspace/docs/brain-api.md`; bump `BRAIN_API_VERSION` (`lib/api/version.ts`) and this
   doc's `v<version>` references together (guard: `test/guards/contract-version.test.ts`).
 - **Cross the module boundary** → `lib/` is the backend domain layer (never imports `app/`), and
-  `app/` reaches the DB only through the backend factory (`lib/supabase/server|admin`), never
+  `app/` reaches the DB only through the data-client factories (`lib/db/server|admin`), never
   `lib/db/pg` internals. Both directions are enforced by `import/no-restricted-paths` in
   `eslint.config.mjs`.
 
@@ -518,7 +517,7 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 ## Docs drift guard
 
 `scripts/check-docs-drift.mjs` derives the three inventories above from code
-(`app/api/**/route.ts`, `supabase/migrations/*.sql`, `ingestion/.../registry.py`) and
+(`app/api/**/route.ts`, `postgres/schema.sql`, `ingestion/.../registry.py`) and
 diffs them against the `<!-- drift:* -->` blocks. It runs in three places:
 
 - **CI** (`.github/workflows/ci.yml`, job *Docs drift guard*) — on every PR. Advisory until

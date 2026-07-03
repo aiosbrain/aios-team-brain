@@ -1,4 +1,4 @@
-import { serverClient } from "@/lib/supabase/server";
+import { serverClient } from "@/lib/db/server";
 import { timeAgo } from "@/components/format";
 
 export default async function AuditAdminPage({

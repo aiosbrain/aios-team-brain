@@ -3,7 +3,9 @@
 #   reset+seed the brain (with login-able demo users) → build a wired demo spoke
 #   → print a one-click dashboard login link and the exact aios commands to run.
 #
-# Prereqs: `supabase start` (this repo) and `npm run dev` (port 3000) both up.
+# Prereqs: the ephemeral test Postgres (`npm run db:test:up`, port 5434) and
+# `npm run dev` (port 3000) both up, with `npm run dev` pointed at the SAME test DB
+# (DATABASE_URL=postgres://app:app@localhost:5434/app_test) — never a real/prod DB.
 #
 # Usage:
 #   npm run test:setup            # full reset + seed + spoke
@@ -16,17 +18,20 @@ BRAIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OPS_DIR="${OPS_DIR:-$HOME/Projects/aios-workspace}"
 SPOKE="${SPOKE:-/tmp/acme-workspace}"
 APP_URL="${APP_URL:-http://127.0.0.1:3000}"
+DB_PORT="${DB_PORT:-5434}"
 RESET=1
 [[ "${1:-}" == "--no-reset" ]] && RESET=0
 
 cd "$BRAIN_DIR"
 [[ -f .env.local ]] || { echo "missing .env.local — copy .env.example and fill it"; exit 1; }
 set -a; source .env.local; set +a
+# Target the ephemeral test DB, never whatever .env.local's DATABASE_URL points at.
+export DATABASE_URL="postgres://app:app@localhost:${DB_PORT}/app_test"
 [[ -d "$OPS_DIR" ]] || { echo "aios-workspace not found at $OPS_DIR (set OPS_DIR=)"; exit 1; }
 
 if [[ "$RESET" == "1" ]]; then
-  echo "── resetting + migrating the brain DB …"
-  supabase db reset >/dev/null
+  echo "── resetting + migrating the brain DB (ephemeral test Postgres) …"
+  npm run db:test:up >/dev/null
 fi
 
 echo "── seeding demo team (creates login-able users + demo data + API key) …"

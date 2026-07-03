@@ -13,8 +13,7 @@ Rules:
 - **Idempotent only.** Use `add column if not exists`, `create index if not exists`,
   guarded `do $$ … $$` blocks. Files are replayed on every rollout and in the
   migrate-from-zero test (`npm run db:test:up`), so a non-idempotent file will break CI.
-- **Name as `YYYYMMDDHHMMSS_short_description.sql`** (matches `supabase/migrations/`).
+- **Name as `YYYYMMDDHHMMSS_short_description.sql`.**
 - **Mirror the change into `postgres/schema.sql`** so a from-zero load still produces the
   same shape — the file here is only what an *existing* DB needs to catch up.
-- This is the `DB_BACKEND=postgres` (Railway) rollout path. `supabase/migrations/` remains
-  the legacy supabase-only schema.
+- This is the Railway rollout path; `postgres/migrations/` is the only migrations directory.

@@ -1,4 +1,4 @@
-import { serverClient } from "@/lib/supabase/server";
+import { serverClient } from "@/lib/db/server";
 import { getSessionUser } from "@/lib/auth/session";
 import { parseRange } from "@/lib/metrics/range";
 import { getPerMemberCosts, getThroughputVsCost } from "@/lib/metrics/members";

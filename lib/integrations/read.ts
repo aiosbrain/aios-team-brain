@@ -1,5 +1,5 @@
 import "server-only";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 import type { IntegrationType } from "@/lib/api/schemas";
 import { canManageIntegrations } from "@/lib/integrations/visibility";
 
@@ -31,7 +31,7 @@ export interface IntegrationMeta {
 }
 
 export async function listIntegrations(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   teamId: string,
   viewer: IntegrationsViewer
 ): Promise<IntegrationMeta[]> {
@@ -64,7 +64,7 @@ export async function listIntegrations(
  * isolation.
  */
 export async function resolveIntegrationsAdmin(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   teamSlug: string,
   userId: string
 ): Promise<{ teamId: string; memberId: string } | null> {

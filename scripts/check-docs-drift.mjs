@@ -49,7 +49,6 @@ function deriveRoutes() {
 
 function deriveTables() {
   // Canonical schema = postgres/schema.sql (the self-host target the project runs on).
-  // supabase/migrations/* is the derived/legacy artifact and is no longer the source of truth.
   const src = readFileSync(join(ROOT, "postgres", "schema.sql"), "utf8");
   const tables = new Set();
   for (const m of src.matchAll(/create\s+table\s+(?:if\s+not\s+exists\s+)?([a-z_][a-z0-9_]*)/gi)) {

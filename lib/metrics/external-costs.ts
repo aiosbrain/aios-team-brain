@@ -1,5 +1,5 @@
 import "server-only";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 import { rangeDays, type Range } from "./range";
 import { scopeQueryLog, type QueryLogViewer } from "@/lib/auth/visibility";
 import { num, round } from "@/lib/num";
@@ -65,7 +65,7 @@ function scopeUsageCosts<Q>(query: Q, viewer: QueryLogViewer): Q {
 }
 
 export async function getExternalCosts(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   teamId: string,
   range: Range,
   viewer: QueryLogViewer
@@ -168,7 +168,7 @@ export async function getExternalCosts(
 
 /** Combined brain + external spend for a member-facing total. */
 export async function getCombinedSpend(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   teamId: string,
   range: Range,
   viewer: QueryLogViewer,

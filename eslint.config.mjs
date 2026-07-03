@@ -36,12 +36,12 @@ const eslintConfig = defineConfig([
                 "lib/ is the backend domain layer and must not import from app/ (dependency flows app -> lib, never the reverse).",
             },
             {
-              // Don't reach past the backend factory into the pg client. Go through
-              // lib/supabase/{server,admin} (which select pg vs supabase) or a lib/ domain service.
+              // Don't reach past the db factory into the pg client. Go through
+              // lib/db/{server,admin} or a lib/ domain service.
               target: "./app",
               from: "./lib/db/pg",
               message:
-                "Do not import lib/db/pg internals from app/. Use the backend factory (lib/supabase/server|admin) or a lib/ domain service so the db backend stays swappable.",
+                "Do not import lib/db/pg internals from app/. Use the db factory (lib/db/server|admin) or a lib/ domain service.",
             },
           ],
         },

@@ -1,8 +1,8 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
-import { serverClient } from "@/lib/supabase/server";
-import { adminClient } from "@/lib/supabase/admin";
+import { serverClient } from "@/lib/db/server";
+import { adminClient } from "@/lib/db/admin";
 import { getSessionUser } from "@/lib/auth/session";
 import { resolveIntegrationsAdmin } from "@/lib/integrations/read";
 import { linkGithub } from "@/lib/codebases/github";

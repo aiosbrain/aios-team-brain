@@ -1,6 +1,6 @@
 "use server";
 
-import { serverClient } from "@/lib/supabase/server";
+import { serverClient } from "@/lib/db/server";
 import { currentMember } from "@/lib/auth/guard";
 import { uiRowKey, isUniqueViolation } from "@/lib/ids";
 
