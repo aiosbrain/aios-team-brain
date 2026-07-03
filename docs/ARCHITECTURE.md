@@ -486,6 +486,7 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 - `GET /api/dashboard/conversations/:id` — a thread's full messages (owner-only)
 - `PATCH /api/dashboard/conversations/:id` — rename a thread (owner-only)
 - `DELETE /api/dashboard/conversations/:id` — soft-archive a thread (owner-only)
+- `GET /api/dashboard/team-work` — dashboard "Working On": per-person summary (narrative arcs) + open tasks + recent accomplishments; session-authed; tier-scoped
 - `POST /api/auth/login` — postgres-mode direct passwordless sign-in (invite-only; 403 if unknown)
 <!-- /drift:routes -->
 
