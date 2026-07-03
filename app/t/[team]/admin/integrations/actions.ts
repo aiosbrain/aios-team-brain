@@ -13,6 +13,8 @@ import {
 import { runSlackIngestion, runPlaneIngestion, runLinearIngestion, runGithubIngestion } from "@/lib/ingest/run";
 import { runGraphProjection } from "@/lib/graph/run";
 import { resolveIntegrationsAdmin } from "@/lib/integrations/read";
+import { linkGithubRepo, unlinkGithubRepo } from "@/lib/integrations/github-link";
+import { RepoFormatError } from "@/lib/integrations/github-repos";
 import { IntegrationConfigError, type IntegrationType } from "@/lib/api/schemas";
 import { audit } from "@/lib/api/audit";
 
@@ -212,6 +214,46 @@ export async function syncGithubNow(
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "sync failed" };
   }
+}
+
+/**
+ * Link a GitHub repo to the brain (admins only). `repo` is `owner/name` or a github URL. Persists
+ * to the team's canonical github integration's `config.repos` (creating the row on first link) via
+ * the single-writer path. The native importer then pulls each repo's issues → tasks + files →
+ * deliverables. Returns a clear message on a malformed repo rather than silently dropping it.
+ */
+export async function addGithubRepo(
+  teamSlug: string,
+  repo: string
+): Promise<{ ok: boolean; error?: string }> {
+  const ctx = await requireAdmin(teamSlug);
+  if (!ctx) return { ok: false, error: "admins only" };
+  try {
+    await linkGithubRepo(adminClient(), { teamId: ctx.teamId, memberId: ctx.myMemberId }, repo);
+  } catch (e) {
+    if (e instanceof RepoFormatError || e instanceof IntegrationConfigError) {
+      return { ok: false, error: e.message };
+    }
+    return { ok: false, error: e instanceof Error ? e.message : "could not link repo" };
+  }
+  revalidatePath(`/t/${teamSlug}/admin/integrations`);
+  return { ok: true };
+}
+
+/** Unlink a GitHub repo from the brain (admins only). Case-insensitive; no-op if not linked. */
+export async function removeGithubRepo(
+  teamSlug: string,
+  repo: string
+): Promise<{ ok: boolean; error?: string }> {
+  const ctx = await requireAdmin(teamSlug);
+  if (!ctx) return { ok: false, error: "admins only" };
+  try {
+    await unlinkGithubRepo(adminClient(), { teamId: ctx.teamId, memberId: ctx.myMemberId }, repo);
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "could not unlink repo" };
+  }
+  revalidatePath(`/t/${teamSlug}/admin/integrations`);
+  return { ok: true };
 }
 
 /**

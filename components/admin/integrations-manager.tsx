@@ -37,9 +37,10 @@ export interface IntegrationRow {
   hasSecret: boolean;
 }
 
-// Data-source connectors shown in the generic "Add an integration" form. Provider keys are NOT
-// here — they get their own dedicated panel (PROVIDER_TYPES) so the page reads as a key panel.
-const TYPES: IntegrationType[] = ["slack", "github", "granola", "linear", "plane", "wise"];
+// Data-source connectors shown in the generic "Add an integration" form. Provider keys get their
+// own panel (PROVIDER_TYPES); GitHub gets its own repo panel (GithubReposPanel) — so both are
+// excluded here to avoid two places to manage the same thing.
+const TYPES: IntegrationType[] = ["slack", "granola", "linear", "plane", "wise"];
 
 // LLM provider API keys — one set for the team, managed in the dedicated "AI provider keys" panel.
 const PROVIDER_TYPES = ["anthropic", "openai", "google"] as const;
@@ -154,9 +155,9 @@ export function IntegrationsManager({
     });
   }
 
-  // Provider keys render in their own panel; keep them out of the data-source list below.
+  // Provider keys and GitHub each render in their own dedicated panel; keep them out of this list.
   const sources = integrations.filter(
-    (i) => !(PROVIDER_TYPES as readonly string[]).includes(i.type)
+    (i) => i.type !== "github" && !(PROVIDER_TYPES as readonly string[]).includes(i.type)
   );
 
   function setProviderKey(p: ProviderType, existing: IntegrationRow | undefined) {

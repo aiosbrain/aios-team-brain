@@ -5,6 +5,8 @@ import { getSessionUser } from "@/lib/auth/session";
 import { isSupabaseBackend } from "@/lib/db/backend";
 import { listIntegrations } from "@/lib/integrations/read";
 import { IntegrationsManager, type IntegrationRow } from "@/components/admin/integrations-manager";
+import { GithubReposPanel } from "@/components/admin/github-repos-panel";
+import { getCodebaseFreshness } from "@/lib/metrics/codebases";
 import { listRecentIngestRuns } from "@/lib/ingest/runs";
 import { IngestRunsPanel } from "@/components/admin/ingest-runs-panel";
 
@@ -51,7 +53,7 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ t
   const { data: me } = user
     ? await sessionDb
         .from("members")
-        .select("role")
+        .select("role, tier")
         .eq("team_id", team.id)
         .eq("auth_user_id", user.id)
         .eq("status", "active")
@@ -59,10 +61,17 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ t
     : { data: null };
 
   const supabase = adminClient();
-  const [integrations, ingestRuns] = await Promise.all([
+  const [integrations, ingestRuns, freshness] = await Promise.all([
     listIntegrations(supabase, team.id, { role: me?.role as string | undefined }) as Promise<IntegrationRow[]>,
     listRecentIngestRuns(supabase, team.id, 30),
+    // Already-scanned repos (from codebase scans) → offered as one-click link suggestions. Read
+    // through the tier-gated codebases choke point (CLAUDE.md §5), never the table directly.
+    getCodebaseFreshness(supabase, team.id, (me?.tier as "team" | "external") ?? "external"),
   ]);
+  const githubIntegration = integrations.find((i) => i.type === "github") ?? null;
+  const scannedRepos = Array.from(
+    new Set(freshness.map((c) => c.full_name).filter((n): n is string => !!n))
+  );
 
   return (
     <div className="flex flex-col gap-4">
@@ -74,6 +83,11 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ t
           integrations to run ingestion. Secrets are stored encrypted and never shown again.
         </p>
       </div>
+      <GithubReposPanel
+        teamSlug={teamSlug}
+        integration={githubIntegration}
+        scannedRepos={scannedRepos}
+      />
       <IntegrationsManager
         teamSlug={teamSlug}
         integrations={integrations}
