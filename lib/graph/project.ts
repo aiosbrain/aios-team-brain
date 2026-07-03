@@ -17,6 +17,17 @@ import { episodeGroupId, type AccessTier } from "./group";
 
 const SOURCE_TABLE = "items";
 
+/**
+ * Max episode content length pushed to Graphiti. getzep's ingest worker has NO per-job exception
+ * handling (`graph_service/routers/ingest.py` catches only `CancelledError`), so ANY exception from
+ * `add_episode` permanently kills the worker and wedges the whole queue. A large episode whose
+ * entity/edge extraction overflows the LLM's output-token cap raises exactly such an exception (seen
+ * in prod 2026-06-25 and again 2026-07-03: `Output length exceeded max tokens 8192`). Capping content
+ * keeps extraction output well under that limit. Full item text still lives in `items`/pgvector/FTS —
+ * only the graph episode is truncated (affects a handful of outlier docs; median item is ~240 chars).
+ */
+export const MAX_EPISODE_CHARS = 6000;
+
 /** Item kinds worth projecting as graph episodes — content-bearing knowledge, not raw config.
  * `skill`/`blueprint` are configuration manifests, not events/knowledge, so they're excluded. */
 export const PROJECTABLE_KINDS = ["transcript", "deliverable", "decision", "task", "artifact"] as const;
@@ -60,7 +71,9 @@ function toEpisode(item: ItemRow): GraphEpisode {
   const ts = typeof fm.source_ts === "string" ? fm.source_ts : item.synced_at; // when it happened
   const label = KIND_LABEL[item.kind] ?? "Item";
   return {
-    content: item.body ?? "",
+    // Cap content so a large episode can't overflow extraction and wedge getzep's worker (see
+    // MAX_EPISODE_CHARS). The content hash is taken over this capped value, so idempotency holds.
+    content: (item.body ?? "").slice(0, MAX_EPISODE_CHARS),
     timestamp: ts,
     sourceDescription: `${label} — ${title ?? item.path}${url ? ` (${url})` : ""}`,
     name: `${SOURCE_TABLE}:${item.id}`,

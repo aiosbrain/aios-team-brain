@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { GraphitiClient, GraphEpisode } from "@/lib/graph/graphiti-client";
-import { projectSlackToGraph, projectItemsToGraph } from "@/lib/graph/project";
+import { projectSlackToGraph, projectItemsToGraph, MAX_EPISODE_CHARS } from "@/lib/graph/project";
 import { runGraphProjection } from "@/lib/graph/run";
 import { db, ingest, seedTeam } from "./helpers";
 
@@ -94,6 +94,24 @@ describe("projectItemsToGraph — all ingestions (real Postgres, mocked Graphiti
 
     expect(res.projected).toBe(4); // transcript + deliverable + decision + task; skill excluded
     expect(fake.pushes).toHaveLength(4);
+  });
+
+  // Spec: a large item must be pushed with capped content — getzep's worker dies on any extraction
+  // exception (no per-job catch), and an oversized episode overflows the LLM output-token cap and
+  // wedges the whole queue (prod stalls 2026-06-25 / 2026-07-03). See MAX_EPISODE_CHARS.
+  it("caps oversized episode content so extraction can't overflow and wedge the worker", async () => {
+    const seed = await seedTeam();
+    const slug = await teamSlugFor(seed.teamId);
+    const huge = "x ".repeat(40_000); // ~80k chars, far above the cap
+    await ingest(seed, { kind: "deliverable", path: "notion/huge.md", body: huge, access: "team" });
+
+    const fake = new FakeGraphiti();
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(fake) });
+
+    expect(fake.pushes).toHaveLength(1);
+    const pushed = fake.pushes[0].episodes[0].content;
+    expect(pushed.length).toBe(MAX_EPISODE_CHARS); // truncated to the cap
+    expect(huge.length).toBeGreaterThan(MAX_EPISODE_CHARS); // guard: the input really was oversized
   });
 });
 

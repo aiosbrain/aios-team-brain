@@ -133,6 +133,20 @@ any search affordance. No new plumbing — both already read from the same `item
   on the aios-team-brain service; internal to the AIOS Railway project). Read-only credentials preferred.
 - **Extraction lag** — Graphiti's async worker is ~10–20s/episode and serial; "last 24h" facts lag
   ingestion. The panel should show "as of" and not imply real-time.
+- **getzep worker dies on any job exception (root cause of the stalls)** — `graph_service/routers/ingest.py`'s
+  `AsyncWorker.worker()` loop catches only `asyncio.CancelledError`, so ANY other exception from
+  `add_episode` permanently kills the worker and freezes the whole ingest queue (silent — the HTTP API
+  keeps 202-ing). The trigger seen twice in prod (2026-06-25, 2026-07-03) is a large episode whose
+  entity/edge extraction overflows the LLM output-token cap (`Output length exceeded max tokens 8192`).
+  *Mitigate (our side, since we can't patch their image):* `lib/graph/project.ts` caps episode content
+  at `MAX_EPISODE_CHARS` (6000) so extraction output stays under the limit; full item text still lives
+  in `items`/pgvector/FTS. Only a few outlier docs are truncated (median item ~240 chars). If the worker
+  ever wedges anyway, restart graphiti (it's an image-based service; the Custom Start Command below persists).
+- **Graphiti start command (Railway)** — the `zepai/graphiti:latest` image declares a non-root `USER app`
+  but its default CMD launches via `uv` at `/root/.local/bin/uv`, which `app` can't exec once Railway
+  runs the container as the declared user (it broke on a 2026-07-03 restart). Fix = a **Custom Start
+  Command** on the graphiti service: `/app/.venv/bin/uvicorn graph_service.main:app --host 0.0.0.0 --port 8000`
+  (runs uvicorn straight from the venv, no `uv`). This persists across restarts/redeploys.
 - **Sparse/stale graph (soft window)** — Graphiti's extractor can stall silently (it did in prod on
   2026-06-25, leaving ~200 pushed-but-unextracted episodes; newest graph fact was weeks old). With a
   hard time cutoff every layer then renders blank and the panel looks broken. *Mitigate:* the
