@@ -43,8 +43,43 @@ export default async function PersonPage({
   const me = await currentMember(team.id);
   if (!me) return null;
 
-  const p = await getMemberProfile(supabase, team.id, decodeURIComponent(handle), range, me.tier);
-  if (!p) notFound();
+  const decodedHandle = decodeURIComponent(handle);
+  const p = await getMemberProfile(supabase, team.id, decodedHandle, range, me.tier);
+
+  if (!p) {
+    // getMemberProfile gates on canSeeCodebases(tier) — an external-tier member (a client/
+    // consultant collaborator) can't see codebase contribution stats, so it returns null even
+    // for their OWN handle. That's the correct tier gate for commit metrics, but it must not
+    // also block them from managing their own API key — resolve "is this actually me" directly
+    // against the members table, independent of the tier-gated profile query.
+    const { data: meRow } = await supabase
+      .from("members")
+      .select("actor_handle, github_login")
+      .eq("id", me.id)
+      .maybeSingle();
+    const m = meRow as { actor_handle: string | null; github_login: string | null } | null;
+    const lc = decodedHandle.toLowerCase();
+    const isSelfByHandle =
+      me.id === decodedHandle ||
+      m?.actor_handle?.toLowerCase() === lc ||
+      m?.github_login?.toLowerCase() === lc;
+
+    if (!isSelfByHandle) notFound();
+
+    const { data: keyRows } = await supabase
+      .from("api_keys")
+      .select("id, key_id, name, created_at, last_used_at, revoked_at")
+      .eq("team_id", team.id)
+      .eq("member_id", me.id)
+      .order("created_at", { ascending: false });
+
+    return (
+      <div className="mx-auto flex max-w-2xl flex-col gap-5">
+        <h1 className="font-display text-2xl font-semibold text-ink">Your account</h1>
+        <MyApiKeys teamSlug={teamSlug} keys={(keyRows ?? []) as MyKeyRow[]} />
+      </div>
+    );
+  }
 
   const context = await getMemberContext(supabase, team.id, p.member_id, me.tier);
   const canEdit = !!context && (me.id === p.member_id || me.role === "admin");

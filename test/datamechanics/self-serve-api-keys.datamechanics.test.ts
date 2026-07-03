@@ -57,11 +57,28 @@ describe("revokeOwnApiKey (real Postgres)", () => {
     expect(revoked).toBe(false);
   });
 
-  it("no-ops (does not throw) on an already-revoked or nonexistent key id", async () => {
+  it("no-ops (does not throw) on a nonexistent key id", async () => {
     const seed = await seedTeam();
     await expect(
       revokeOwnApiKey(db(), seed.teamId, seed.memberId, randomUUID())
     ).resolves.toEqual({ revoked: false });
+  });
+
+  it("no-ops on an already-revoked key it owns — does not re-revoke or duplicate the audit entry", async () => {
+    const seed = await seedTeam();
+    const { keyId: apiKeyRowId } = await issueOwnRow(seed.teamId, seed.memberId);
+    const first = await revokeOwnApiKey(db(), seed.teamId, seed.memberId, apiKeyRowId);
+    expect(first).toEqual({ revoked: true });
+
+    const second = await revokeOwnApiKey(db(), seed.teamId, seed.memberId, apiKeyRowId);
+    expect(second).toEqual({ revoked: false }); // already revoked — not re-revoked
+
+    const { data: entries } = await db()
+      .from("audit_log")
+      .select("id")
+      .eq("target_id", apiKeyRowId)
+      .eq("action", "api_key.revoked");
+    expect(entries).toHaveLength(1); // exactly one revoke event, not two
   });
 });
 
