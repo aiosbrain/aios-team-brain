@@ -195,6 +195,25 @@ export async function renameConversation(
   return Boolean((data as { id: string } | null)?.id);
 }
 
+/**
+ * Set a conversation's title without bumping `updated_at` (so an auto-generated title doesn't
+ * reorder the list). Owner-scoped. Used by the background title generator; a no-op if not owned.
+ */
+export async function setTitle(
+  supabase: SupabaseClient,
+  owner: Owner,
+  conversationId: string,
+  title: string
+): Promise<void> {
+  const { error } = await supabase
+    .from("conversations")
+    .update({ title: deriveTitle(title) })
+    .eq("id", conversationId)
+    .eq("team_id", owner.teamId)
+    .eq("member_id", owner.memberId);
+  if (error) throw new Error(`setTitle: ${error.message}`);
+}
+
 /** Soft-delete (archive) — hides it from the list; messages stay for any later restore/audit. */
 export async function archiveConversation(
   supabase: SupabaseClient,

@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { MessageSquarePlus, Loader2, Trash2, Pencil } from "lucide-react";
+import { MessageSquarePlus, Loader2, Trash2, Pencil, Search } from "lucide-react";
 import { QueryChat, type Exchange } from "@/components/query-chat";
 
 interface ConversationListItem {
@@ -39,6 +39,7 @@ function toExchanges(messages: StoredMessage[]): Exchange[] {
  */
 export function ChatWorkspace({ teamSlug, initialQuestion }: { teamSlug: string; initialQuestion?: string }) {
   const [conversations, setConversations] = useState<ConversationListItem[]>([]);
+  const [filter, setFilter] = useState("");
   const [activeId, setActiveId] = useState<string | null>(null);
   const [loadingId, setLoadingId] = useState<string | null>(null);
   const newNonce = useRef(0);
@@ -97,6 +98,11 @@ export function ChatWorkspace({ teamSlug, initialQuestion }: { teamSlug: string;
     void loadList();
   }
 
+  // Client-side title search over the already-loaded list (instant; owner data is here). Content
+  // search (over message bodies) would be a server FTS endpoint — a later increment.
+  const q = filter.trim().toLowerCase();
+  const shown = q ? conversations.filter((c) => (c.title || "").toLowerCase().includes(q)) : conversations;
+
   return (
     <div className="grid grid-cols-1 gap-4 md:grid-cols-[230px_1fr]">
       <aside className="flex flex-col gap-2 md:max-h-[calc(100dvh-11rem)]">
@@ -107,11 +113,24 @@ export function ChatWorkspace({ teamSlug, initialQuestion }: { teamSlug: string;
         >
           <MessageSquarePlus className="size-4" /> New chat
         </button>
+        {conversations.length > 0 ? (
+          <div className="relative">
+            <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-ink-tertiary" />
+            <input
+              value={filter}
+              onChange={(e) => setFilter(e.target.value)}
+              placeholder="Search chats…"
+              className="w-full rounded-lg border border-border-default bg-surface py-1.5 pl-8 pr-2 text-xs text-ink placeholder:text-ink-tertiary focus:border-violet/40 focus:outline-none"
+            />
+          </div>
+        ) : null}
         <div className="flex flex-col gap-0.5 overflow-y-auto">
           {conversations.length === 0 ? (
             <p className="px-2 py-3 text-xs text-ink-tertiary">No saved chats yet.</p>
+          ) : shown.length === 0 ? (
+            <p className="px-2 py-3 text-xs text-ink-tertiary">No chats match &ldquo;{filter}&rdquo;.</p>
           ) : (
-            conversations.map((c) => {
+            shown.map((c) => {
               const active = c.id === activeId;
               return (
                 <div
