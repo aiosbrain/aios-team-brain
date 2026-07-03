@@ -129,7 +129,6 @@ const FUNNEL_ORDER: { status: string; label: string }[] = [
 ];
 
 const IN_FLIGHT = new Set(["ready", "in_progress", "blocked"]);
-const AT_RISK = new Set(["at_risk", "overdue", "broken"]);
 
 // ── main ─────────────────────────────────────────────────────────────────────
 
@@ -150,7 +149,7 @@ export async function getPulseMetrics(
 
   // Fetch each source once over the combined [prior, now] window where a delta
   // is needed, then split current vs. prior in JS.
-  const [itemsRes, queryRes, tasksRes, commitRes] = await Promise.all([
+  const [itemsRes, queryRes, tasksRes] = await Promise.all([
     supabase
       .from("items")
       .select("kind, synced_at")
@@ -173,19 +172,12 @@ export async function getPulseMetrics(
       .select("status, updated_at")
       .eq("team_id", teamId)
       .limit(5_000),
-    supabase
-      .from("graph_entities")
-      .select("attrs")
-      .eq("team_id", teamId)
-      .eq("entity_type", "commitment")
-      .limit(2_000),
   ]);
 
   // NB: the pg adapter returns timestamptz as Date; supabase as string. Normalize via toIso below.
   const itemRows = (itemsRes.data ?? []) as { kind: string; synced_at: string | Date }[];
   const queryRows = (queryRes.data ?? []) as { cost_usd: number | string; created_at: string | Date }[];
   const taskRows = (tasksRes.data ?? []) as { status: string; updated_at: string | Date }[];
-  const commitRows = (commitRes.data ?? []) as { attrs: Record<string, unknown> }[];
 
   const winStartIso = windowStart.toISOString();
   const inWindow = (iso: string) => iso >= winStartIso;
@@ -265,15 +257,6 @@ export async function getPulseMetrics(
     count: statusCounts.get(f.status) ?? 0,
   }));
 
-  // ── commitments at risk KPI ──
-  let atRisk = 0;
-  let broken = 0;
-  for (const row of commitRows) {
-    const status = String(row.attrs?.status ?? "");
-    if (AT_RISK.has(status)) atRisk++;
-    if (status === "broken") broken++;
-  }
-
   const usageLabel = isAdmin ? "Team queries" : "Your queries";
   const spendLabel = isAdmin ? "Team spend" : "Your spend";
 
@@ -304,15 +287,6 @@ export async function getPulseMetrics(
       spark: taskSpark,
       hint: blocked > 0 ? `${blocked} blocked` : "none blocked",
       accent: "cyan",
-    },
-    {
-      key: "commitments",
-      label: "Commitments at risk",
-      value: fmtNum(atRisk),
-      delta: null,
-      spark: [],
-      hint: broken > 0 ? `${broken} broken` : "tracked live",
-      accent: "amber",
     },
     {
       key: "spend",
