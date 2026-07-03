@@ -130,7 +130,7 @@ def _analyze_git(
             last_dt = dt
         if len(recent) < 20:
             recent.append({
-                "sha": sha[:10], "author": name, "ai": ai,
+                "sha": sha[:10], "author": name, "author_email": email, "ai": ai,
                 "additions": adds, "deletions": dels,
                 "committed_at": iso, "message": body.splitlines()[0] if body else "",
             })
