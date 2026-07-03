@@ -145,8 +145,12 @@ any search affordance. No new plumbing — both already read from the same `item
 - **Graphiti start command (Railway)** — the `zepai/graphiti:latest` image declares a non-root `USER app`
   but its default CMD launches via `uv` at `/root/.local/bin/uv`, which `app` can't exec once Railway
   runs the container as the declared user (it broke on a 2026-07-03 restart). Fix = a **Custom Start
-  Command** on the graphiti service: `/app/.venv/bin/uvicorn graph_service.main:app --host 0.0.0.0 --port 8000`
-  (runs uvicorn straight from the venv, no `uv`). This persists across restarts/redeploys.
+  Command** on the graphiti service that (a) base64-injects an `except Exception: continue` into the
+  worker loop of `graph_service/routers/ingest.py` (the resilience patch above — applied at boot, since
+  we can't edit the image), then (b) `exec /app/.venv/bin/uvicorn graph_service.main:app --host 0.0.0.0
+  --port 8000` (runs uvicorn straight from the venv, no `uv`). It always falls through to launching
+  uvicorn even if the patch no-ops, and persists across restarts/redeploys. **Do not reset it to plain
+  uvicorn** — that reintroduces the worker-death wedge.
 - **Sparse/stale graph (soft window)** — Graphiti's extractor can stall silently (it did in prod on
   2026-06-25, leaving ~200 pushed-but-unextracted episodes; newest graph fact was weeks old). With a
   hard time cutoff every layer then renders blank and the panel looks broken. *Mitigate:* the
