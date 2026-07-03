@@ -50,7 +50,17 @@ export function CodebaseCard({ teamSlug, cb }: { teamSlug: string; cb: CodebaseS
         <span className="inline-flex items-center gap-1">
           <CircleDot className="size-3" /> {cb.open_issues}
         </span>
-        <span className="ml-auto">scanned {timeAgo(cb.last_scan_at)}</span>
+        <span className="ml-auto inline-flex items-center gap-1.5">
+          {cb.stale ? (
+            <span
+              title="No recent scan — showing the last known values. Re-scan to refresh."
+              className="inline-flex items-center rounded-full border border-amber-400/25 bg-amber-400/10 px-1.5 py-0.5 text-[10px] font-semibold text-amber-500/90"
+            >
+              stale
+            </span>
+          ) : null}
+          <span>scanned {timeAgo(cb.last_scan_at)}</span>
+        </span>
       </div>
     </Link>
   );

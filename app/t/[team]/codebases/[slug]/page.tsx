@@ -89,6 +89,14 @@ export default async function CodebaseDetailPage({
         </div>
       </div>
 
+      {cb.stale ? (
+        <div className="rounded-lg border border-amber-400/25 bg-amber-400/10 px-4 py-2.5 text-xs text-amber-600 dark:text-amber-300">
+          No recent scan — the scores below are from the last scan{" "}
+          {cb.last_scan_at ? timeAgo(cb.last_scan_at) : ""}. Contribution and commit-volume charts
+          only cover the selected range, so they may be empty until this repo is re-scanned.
+        </div>
+      ) : null}
+
       <div className="grid grid-cols-1 gap-5 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.4fr)]">
         {cb.breakdown ? <AgenticBreakdownCard b={cb.breakdown} /> : null}
         <AgenticTrend data={cb.trend} />
