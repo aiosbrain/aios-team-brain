@@ -10,13 +10,8 @@ import { AskBrain } from "@/components/dashboard/ask-brain";
 import { KpiBand } from "@/components/dashboard/kpi-band";
 import { RangeSelector } from "@/components/dashboard/range-selector";
 import { DecisionsCard } from "@/components/dashboard/decisions-card";
-import { TasksByMember } from "@/components/dashboard/tasks-by-member";
 import { WorkingOn } from "@/components/dashboard/working-on";
-import { getWorkingOn } from "@/lib/dashboard/working-on";
-import type {
-  DecisionRow,
-  TaskRow,
-} from "@/components/dashboard/types";
+import type { DecisionRow } from "@/components/dashboard/types";
 import { KnowledgeGrowth } from "@/components/charts/knowledge-growth";
 import { UsageChart } from "@/components/charts/usage-chart";
 import { TaskFunnel } from "@/components/charts/task-funnel";
@@ -117,28 +112,18 @@ export default async function TeamHome({
     );
   }
 
-  const [pulse, { data: openTasks }, workingOn, { data: decisions }] =
-    await Promise.all([
-      getPulseMetrics(supabase, team.id, range, { isAdmin, memberId }),
+  const [pulse, { data: decisions }] = await Promise.all([
+    getPulseMetrics(supabase, team.id, range, { isAdmin, memberId }),
+    visibleDecisions(
       supabase
-        .from("tasks")
-        .select("id, title, assignee, status")
+        .from("decisions")
+        .select("id, title, decided_at, tier, still_valid")
         .eq("team_id", team.id)
-        .in("status", ["in_progress", "blocked", "ready"])
-        .order("updated_at", { ascending: false })
-        .limit(200),
-      // Per-person "working on", pulled from the Learning layer (Graphiti facts), roster-keyed.
-      getWorkingOn(supabase, team.id, teamSlug, tier),
-      visibleDecisions(
-        supabase
-          .from("decisions")
-          .select("id, title, decided_at, tier, still_valid")
-          .eq("team_id", team.id)
-          .order("decided_at", { ascending: false })
-          .limit(8),
-        tier
-      ),
-    ]);
+        .order("decided_at", { ascending: false })
+        .limit(8),
+      tier
+    ),
+  ]);
 
   return (
     <div className="mx-auto flex max-w-6xl flex-col gap-6">
@@ -158,15 +143,11 @@ export default async function TeamHome({
         <UsageChart data={pulse.usage} scope={isAdmin ? "team" : "your"} />
       </div>
 
-      <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
-        <WorkingOn entries={workingOn} />
-        <DecisionsCard teamSlug={teamSlug} decisions={(decisions ?? []) as DecisionRow[]} />
-      </div>
+      {/* One consolidated per-person "Working On": summary (arcs) + open tasks + accomplished. */}
+      <WorkingOn teamSlug={teamSlug} />
 
-      <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
-        <div className="lg:col-span-2">
-          <TasksByMember teamSlug={teamSlug} tasks={(openTasks ?? []) as TaskRow[]} />
-        </div>
+      <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
+        <DecisionsCard teamSlug={teamSlug} decisions={(decisions ?? []) as DecisionRow[]} />
         <TaskFunnel data={pulse.funnel} />
       </div>
     </div>
