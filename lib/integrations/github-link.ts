@@ -1,5 +1,6 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { upsertIntegration, type IntegrationAuth } from "./manage";
+import { decryptSecret } from "@/lib/secrets/crypto";
 import { addRepo, removeRepo } from "./github-repos";
 
 /**
@@ -66,6 +67,48 @@ export async function linkGithubRepo(
   const repos = addRepo(currentRepos(row), repoInput); // validates + case-insensitive de-dup
   await writeRepos(supabase, auth, row, repos);
   return repos;
+}
+
+/**
+ * Ensure a canonical github integration row exists (creating an empty one if none) and return its
+ * id — so a token can be attached before any repo is linked. Idempotent via the (team,type,name)
+ * upsert key.
+ */
+export async function ensureGithubIntegration(
+  supabase: SupabaseClient,
+  auth: IntegrationAuth
+): Promise<string> {
+  const row = await firstGithubRow(supabase, auth.teamId);
+  const { id } = await upsertIntegration(supabase, auth, {
+    type: "github",
+    name: row?.name ?? "github",
+    config: { ...(row?.config ?? {}), repos: currentRepos(row) }, // preserve repos, no-op if unchanged
+    status: row?.status ?? "enabled",
+  });
+  return id;
+}
+
+/**
+ * The canonical github row's linked repos + its decrypted token (or null). Server-only — the token
+ * is decrypted in-process for the access-probe/importer and never returned to a browser. Reads the
+ * row regardless of enabled/disabled so an access check reflects the true stored token.
+ */
+export async function githubReposAndToken(
+  supabase: SupabaseClient,
+  teamId: string
+): Promise<{ repos: string[]; token: string | null }> {
+  const { data } = await supabase
+    .from("integrations")
+    .select("config, secret_ciphertext")
+    .eq("team_id", teamId)
+    .eq("type", "github")
+    .order("created_at", { ascending: true })
+    .limit(1)
+    .maybeSingle();
+  const config = ((data?.config as Record<string, unknown>) ?? {}) as Record<string, unknown>;
+  const repos = Array.isArray(config.repos) ? (config.repos as string[]) : [];
+  const cipher = data?.secret_ciphertext as string | null | undefined;
+  return { repos, token: cipher ? decryptSecret(cipher) : null };
 }
 
 /** Unlink a repo (case-insensitive). No-op if no github row / repo absent. Returns the repos list. */
