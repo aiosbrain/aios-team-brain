@@ -9,12 +9,11 @@ import { parseRange } from "@/lib/metrics/range";
 import { AskBrain } from "@/components/dashboard/ask-brain";
 import { KpiBand } from "@/components/dashboard/kpi-band";
 import { RangeSelector } from "@/components/dashboard/range-selector";
-import { CommitmentsCard } from "@/components/dashboard/commitments-card";
 import { DecisionsCard } from "@/components/dashboard/decisions-card";
 import { TasksByMember } from "@/components/dashboard/tasks-by-member";
-import { AgentsPlaceholder } from "@/components/dashboard/agents-placeholder";
+import { WorkingOn } from "@/components/dashboard/working-on";
+import { getWorkingOn } from "@/lib/dashboard/working-on";
 import type {
-  CommitmentRow,
   DecisionRow,
   TaskRow,
 } from "@/components/dashboard/types";
@@ -118,7 +117,7 @@ export default async function TeamHome({
     );
   }
 
-  const [pulse, { data: openTasks }, { data: commitments }, { data: decisions }] =
+  const [pulse, { data: openTasks }, workingOn, { data: decisions }] =
     await Promise.all([
       getPulseMetrics(supabase, team.id, range, { isAdmin, memberId }),
       supabase
@@ -128,13 +127,8 @@ export default async function TeamHome({
         .in("status", ["in_progress", "blocked", "ready"])
         .order("updated_at", { ascending: false })
         .limit(200),
-      supabase
-        .from("graph_entities")
-        .select("id, entity_id, name, attrs")
-        .eq("team_id", team.id)
-        .eq("entity_type", "commitment")
-        .in("attrs->>status", ["open", "overdue", "at_risk", "broken"])
-        .limit(20),
+      // Per-person "working on", pulled from the Learning layer (Graphiti facts), roster-keyed.
+      getWorkingOn(supabase, team.id, teamSlug, tier),
       visibleDecisions(
         supabase
           .from("decisions")
@@ -165,7 +159,7 @@ export default async function TeamHome({
       </div>
 
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
-        <CommitmentsCard commitments={(commitments ?? []) as CommitmentRow[]} />
+        <WorkingOn entries={workingOn} />
         <DecisionsCard teamSlug={teamSlug} decisions={(decisions ?? []) as DecisionRow[]} />
       </div>
 
@@ -175,8 +169,6 @@ export default async function TeamHome({
         </div>
         <TaskFunnel data={pulse.funnel} />
       </div>
-
-      <AgentsPlaceholder />
     </div>
   );
 }
