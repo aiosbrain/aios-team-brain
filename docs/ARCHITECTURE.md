@@ -460,7 +460,7 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 - `GET /api/v1/decisions` — dashboard decision changes for `aios pull` writeback (tier-scoped)
 - `GET /api/v1/projects` — team project list for `aios pull` brain-project registration (team-tier only)
 - `GET /api/v1/me` — authenticated member identity + role (drives client UI gating)
-- `GET /api/v1/members` — team roster + cross-tool identities for external resolution (team-tier only; `?email`/`?handle`/`?provider` filters)
+- `GET /api/v1/members` — team roster + cross-tool identities for external resolution, incl. `github_login`/`avatar_url` for contributor-avatar consumers like `aios timeline` (team-tier only; `?email`/`?handle`/`?provider` filters)
 - `GET /api/v1/identities/resolve` — resolve a provider external_id (or email/handle) to a member + canonical contacts incl. `slack_id` (team-tier only; 404 on miss)
 - `GET /api/v1/me/slack-token` — the caller's OWN Slack user token for "act as me" (owner-only: member from the API key, never a param; 404 if not connected; `no-store`)
 - `POST /api/v1/me/slack-token` — connect the caller's Slack via manual paste: validate (`auth.test`) + store encrypted (`member_secrets`) + capture identity

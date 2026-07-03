@@ -63,6 +63,45 @@ describe("members + identity-resolve endpoints (real handlers, real Postgres)", 
     expect(forbidden.status).toBe(403);
   });
 
+  it("members: carries avatar_url when the GitHub sync has populated it, null otherwise", async () => {
+    const seed = await seedTeam();
+    const team = await issueKeyFor(seed, "team");
+    const { error } = await db()
+      .from("members")
+      .update({ github_login: "octocat", avatar_url: "https://avatars.githubusercontent.com/u/583231" })
+      .eq("id", seed.memberId)
+      .eq("team_id", seed.teamId);
+    expect(error).toBeNull();
+    const { data: unsynced, error: insertError } = await db()
+      .from("members")
+      .insert({
+        team_id: seed.teamId,
+        email: `unsynced-${randomUUID().slice(0, 8)}@test.local`,
+        display_name: "Unsynced",
+        actor_handle: `unsynced-${randomUUID().slice(0, 8)}`,
+        role: "member",
+        tier: "team",
+        status: "active",
+      })
+      .select("id")
+      .single();
+    expect(insertError).toBeNull();
+    const unsyncedId = (unsynced as { id: string }).id;
+
+    const ok = await get(membersGET, MEMBERS_URL, team, seed.teamSlug);
+    expect(ok.status).toBe(200);
+    const body = (await ok.json()) as {
+      members: { id: string; github_login: string | null; avatar_url: string | null }[];
+    };
+    const synced = body.members.find((m) => m.id === seed.memberId);
+    expect(synced?.github_login).toBe("octocat");
+    expect(synced?.avatar_url).toBe("https://avatars.githubusercontent.com/u/583231");
+
+    const fresh = body.members.find((m) => m.id === unsyncedId);
+    expect(fresh?.github_login).toBeNull();
+    expect(fresh?.avatar_url).toBeNull();
+  });
+
   it("resolve: slack external_id → member; provider filter; 404 on miss", async () => {
     const seed = await seedTeam();
     const team = await issueKeyFor(seed, "team");
