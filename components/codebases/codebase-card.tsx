@@ -16,31 +16,46 @@ export function CodebaseCard({ teamSlug, cb }: { teamSlug: string; cb: CodebaseS
           <h2 className="truncate font-display text-lg font-semibold text-ink">{cb.slug}</h2>
           <p className="truncate font-mono text-xs text-ink-tertiary">{cb.full_name || cb.slug}</p>
         </div>
-        <ScoreRing value={cb.agentic_score} label="agentic" />
+        {cb.scanned ? (
+          <ScoreRing value={cb.agentic_score} label="agentic" />
+        ) : (
+          <span
+            title="Contributions synced from GitHub. Run aios-ingest scan for agent-readiness & coverage."
+            className="inline-flex shrink-0 items-center rounded-full border border-white/10 bg-white/[0.04] px-2 py-0.5 font-mono text-[10px] font-semibold text-ink-tertiary"
+          >
+            not scanned
+          </span>
+        )}
       </div>
 
-      <div className="flex items-center gap-5 text-xs text-ink-secondary">
-        <span>
-          <span className="font-semibold text-ink">{cb.health_score}</span> health
-        </span>
-        <span>
-          <span className="font-semibold text-ink">
-            {cb.test_coverage_pct == null ? "—" : `${cb.test_coverage_pct}%`}
-          </span>{" "}
-          cov
-        </span>
-        {cb.readiness_level ? (
-          <span
-            title={`AEM agent-readiness${cb.readiness_pct == null ? "" : ` — ${cb.readiness_pct}% of checks`}`}
-            className="inline-flex items-center rounded-full border border-white/10 bg-white/[0.04] px-2 py-0.5 font-mono text-[10px] font-semibold text-ink-secondary"
-          >
-            {cb.readiness_level} ready
+      {cb.scanned ? (
+        <div className="flex items-center gap-5 text-xs text-ink-secondary">
+          <span>
+            <span className="font-semibold text-ink">{cb.health_score}</span> health
           </span>
-        ) : null}
-        <span className="ml-auto">
-          <Sparkline data={cb.spark} width={72} height={22} className="text-violet" />
-        </span>
-      </div>
+          <span>
+            <span className="font-semibold text-ink">
+              {cb.test_coverage_pct == null ? "—" : `${cb.test_coverage_pct}%`}
+            </span>{" "}
+            cov
+          </span>
+          {cb.readiness_level ? (
+            <span
+              title={`AEM agent-readiness${cb.readiness_pct == null ? "" : ` — ${cb.readiness_pct}% of checks`}`}
+              className="inline-flex items-center rounded-full border border-white/10 bg-white/[0.04] px-2 py-0.5 font-mono text-[10px] font-semibold text-ink-secondary"
+            >
+              {cb.readiness_level} ready
+            </span>
+          ) : null}
+          <span className="ml-auto">
+            <Sparkline data={cb.spark} width={72} height={22} className="text-violet" />
+          </span>
+        </div>
+      ) : (
+        <p className="text-xs text-ink-tertiary">
+          Contributions synced from GitHub — run a scan for readiness &amp; coverage.
+        </p>
+      )}
 
       <div className="mt-auto flex items-center gap-4 text-[11px] text-ink-tertiary">
         {cb.primary_language ? <span>{cb.primary_language}</span> : null}
@@ -51,7 +66,7 @@ export function CodebaseCard({ teamSlug, cb }: { teamSlug: string; cb: CodebaseS
           <CircleDot className="size-3" /> {cb.open_issues}
         </span>
         <span className="ml-auto inline-flex items-center gap-1.5">
-          {cb.stale ? (
+          {cb.scanned && cb.stale ? (
             <span
               title="No recent scan — showing the last known values. Re-scan to refresh."
               className="inline-flex items-center rounded-full border border-amber-400/25 bg-amber-400/10 px-1.5 py-0.5 text-[10px] font-semibold text-amber-500/90"

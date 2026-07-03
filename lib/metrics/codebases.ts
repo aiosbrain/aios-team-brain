@@ -29,6 +29,7 @@ export interface CodebaseSummary {
   readiness_pct: number | null;
   spark: number[]; // agentic_score trend (windowed; falls back to last points if the window is empty)
   stale: boolean; // last scan is older than STALE_DAYS — headline shows last-known values, flagged in the UI
+  scanned: boolean; // has ≥1 code_metrics row — false = GitHub-API sync only (contributions, no readiness)
 }
 
 /**
@@ -155,6 +156,7 @@ export async function getCodebaseSummaries(
       // windowed trend (falls back to the most recent points so a stale card still shows a line)
       spark: windowedSpark(series, windowStart),
       stale: isCodebaseStale(cb.last_scan_at, now),
+      scanned: series.length > 0,
     };
   });
 

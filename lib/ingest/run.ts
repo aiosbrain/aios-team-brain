@@ -18,6 +18,7 @@ import { fetchGithubRepoIssues } from "./sources/github";
 import { normalizeGithubRepo } from "./sources/github-normalize";
 import { fetchGithubRepoFiles } from "./sources/github-files";
 import { normalizeGithubFiles } from "./sources/github-files-normalize";
+import { ingestGithubApiScan } from "@/lib/codebases/github-api-scan";
 
 /**
  * In-app ingestion runner — the TypeScript replacement for the Python sidecar's
@@ -526,6 +527,14 @@ export async function runGithubIngestion(opts: { teamId?: string } = {}): Promis
             }
           } catch (err) {
             summary.errors.push(`${full} files: ${err instanceof Error ? err.message : "import failed"}`);
+          }
+          // Contributions + commit volume → codebases + code_contributions via the GitHub API
+          // (no checkout). Auto-populates the per-person + commit-volume graphs on link. No-op for
+          // a repo a real `aios-ingest scan` already owns (the scanner's rows are richer).
+          try {
+            await ingestGithubApiScan(db, auth, { owner, repo, slug: repo, token: token ?? "" });
+          } catch (err) {
+            summary.errors.push(`${full} contributions: ${err instanceof Error ? err.message : "sync failed"}`);
           }
         }
       }
