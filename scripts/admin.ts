@@ -96,7 +96,11 @@ async function main() {
   switch (cmd) {
     case "create-team": {
       const slug = positionals[0] || die("usage: create-team <slug> --name <display>");
-      const name = (flags.name as string) || die("usage: create-team <slug> --name <display>");
+      // `--name` with no following value parses as boolean `true` (parseArgs), which would
+      // otherwise pass truthiness here and crash later at `.trim()` instead of showing usage.
+      const name =
+        (typeof flags.name === "string" && flags.name) ||
+        die("usage: create-team <slug> --name <display>");
       const team = await createTeam(admin, { slug, name });
       console.log(`✓ team ${team.slug} (${team.id}) "${team.name}"`);
       break;
