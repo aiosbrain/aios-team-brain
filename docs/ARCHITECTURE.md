@@ -89,7 +89,7 @@ flowchart LR
 
 ## Auth & access tiers
 
-This server **implements brain-api v1.2** (the wire contract; source of truth:
+This server **implements brain-api v1.3** (the wire contract; source of truth:
 `aios-workspace/docs/brain-api.md`). That version is pinned in code as `BRAIN_API_VERSION`
 (`lib/api/version.ts`) and asserted against this sentence by
 `test/guards/contract-version.test.ts` — bump all three together on a contract change.
