@@ -14,6 +14,14 @@ function radarData(axes: AemAxes, team: AemAxes): RadarDatum[] {
   return AXIS_META.map((a) => ({ axis: a.label, you: axes[a.key], team: team[a.key] }));
 }
 
+function CeShadowBadge() {
+  return (
+    <span className="mt-1 inline-flex rounded-full bg-amber/10 px-2 py-0.5 text-[10px] font-medium text-amber-700">
+      shadow · uncalibrated
+    </span>
+  );
+}
+
 export default async function MemberMaturityPage({
   params,
 }: {
@@ -53,7 +61,7 @@ export default async function MemberMaturityPage({
         </div>
       </div>
 
-      <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
         <div className="card p-4">
           <div className="text-xs uppercase tracking-wide text-ink-subtle">Tasks</div>
           <div className="mt-1 text-xl tabular-nums text-ink">{latest.tasks}</div>
@@ -61,6 +69,13 @@ export default async function MemberMaturityPage({
         <div className="card p-4">
           <div className="text-xs uppercase tracking-wide text-ink-subtle">Sessions</div>
           <div className="mt-1 text-xl tabular-nums text-ink">{latest.sessions}</div>
+        </div>
+        <div className="card p-4">
+          <div className="text-xs uppercase tracking-wide text-ink-subtle">CE</div>
+          <div className="mt-1 text-xl tabular-nums text-ink">
+            {latest.ce_band == null ? "—" : `${latest.ce_band}/4`}
+          </div>
+          <CeShadowBadge />
         </div>
         <div className="card p-4">
           <div className="text-xs uppercase tracking-wide text-ink-subtle">Est. spend</div>
@@ -85,7 +100,9 @@ export default async function MemberMaturityPage({
           title="Axes vs. team average"
           hint="scored 0–4"
         />
-        <MaturityTimeline data={timeline.map((t) => ({ date: t.date, overall: t.overall }))} />
+        <MaturityTimeline
+          data={timeline.map((t) => ({ date: t.date, overall: t.overall, ce_band: t.ce_band }))}
+        />
       </div>
 
       <div className="card flex flex-col gap-2 p-5">

@@ -25,6 +25,18 @@ function fmtTokens(n: number): string {
   return String(Math.round(n));
 }
 
+function CeShadowBadge() {
+  return (
+    <span className="ml-1.5 rounded-full bg-amber/10 px-2 py-0.5 text-[10px] font-medium text-amber-700">
+      shadow · uncalibrated
+    </span>
+  );
+}
+
+function fmtCeBand(band: number | null): string {
+  return band == null ? "—" : `${band}/4`;
+}
+
 function radarData(axes: AemAxes): RadarDatum[] {
   return AXIS_META.map((a) => ({ axis: a.label, you: axes[a.key] }));
 }
@@ -95,6 +107,7 @@ export default async function MaturityPage({ params }: { params: Promise<{ team:
                   <th className="px-4 py-3 font-medium">Member</th>
                   <th className="px-4 py-3 font-medium">Spine</th>
                   <th className="px-4 py-3 font-medium">Overall</th>
+                  <th className="px-4 py-3 font-medium">CE</th>
                   <th className="px-4 py-3 font-medium">Weakest axis</th>
                   <th className="px-4 py-3 text-right font-medium">Tasks</th>
                   <th className="px-4 py-3 text-right font-medium">Est. spend</th>
@@ -114,6 +127,10 @@ export default async function MaturityPage({ params }: { params: Promise<{ team:
                       <span className="rounded-full bg-surface-sunken px-2 py-0.5 font-mono text-xs text-ink">{m.spine}</span>
                     </td>
                     <td className="px-4 py-3 tabular-nums text-ink-secondary">{m.overall.toFixed(2)}</td>
+                    <td className="px-4 py-3 tabular-nums text-ink-secondary">
+                      {fmtCeBand(m.ce_band)}
+                      <CeShadowBadge />
+                    </td>
                     <td className="px-4 py-3 text-ink-secondary">
                       {AXIS_META.find((a) => a.key === m.weakest)?.label}
                     </td>

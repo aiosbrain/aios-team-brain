@@ -77,4 +77,30 @@ describe("agentic-maturity dashboard reads (real Postgres)", () => {
     const seed = await seedTeam();
     expect(await getMemberMaturity(db(), seed.teamId, "ghost", "team")).toBeNull();
   });
+
+  it("exposes ce_band on cards and timeline without affecting teamAxes or spineDistribution", async () => {
+    const seed = await seedTeam();
+    const alex = await createMember(db(), seed.teamId, {
+      email: "a@x.test",
+      displayName: "Alex",
+      actorHandle: "alex",
+      role: "member",
+    });
+    await ingest(seed.teamId, alex.id, snap("alex", "2026-06-16", { ce_band: null }));
+    await ingest(seed.teamId, alex.id, snap("alex", "2026-06-18", { ce_band: 3 }));
+
+    const team = await getTeamMaturity(db(), seed.teamId, "team");
+    const alexCard = team.members.find((m) => m.handle === "alex")!;
+    expect(alexCard.ce_band).toBe(3);
+    expect(team.teamAxes).toBeTruthy();
+    expect(Object.keys(team.spineDistribution).length).toBeGreaterThan(0);
+
+    const m = await getMemberMaturity(db(), seed.teamId, "alex", "team");
+    expect(m!.timeline.map((t) => t.ce_band)).toEqual([null, 3]);
+    expect(m!.latest.ce_band).toBe(3);
+
+    const ext = await getTeamMaturity(db(), seed.teamId, "external");
+    expect(ext.members).toEqual([]);
+    expect(await getMemberMaturity(db(), seed.teamId, "alex", "external")).toBeNull();
+  });
 });
