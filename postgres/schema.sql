@@ -406,6 +406,11 @@ create table if not exists task_pm_links (
   last_projected_status text,
   projection_fingerprint text,
   provider_seen_status text,
+  -- Inbound conflict baseline (brain-api v1.4): the EXACT brain `tasks.status` at the last
+  -- successful outbound projection / adoption / inbound apply. The provider-group fingerprint
+  -- alone cannot decide "brain unchanged" — in_progress and blocked both hash to group 'started',
+  -- so a same-group brain edit would be silently overwritten without this exact baseline.
+  last_projected_brain_status text,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   unique (team_id, project_id, row_key, provider)
@@ -416,6 +421,7 @@ create index if not exists task_pm_links_team_provider_idx on task_pm_links (tea
 alter table task_pm_links add column if not exists last_projected_status text;
 alter table task_pm_links add column if not exists projection_fingerprint text;
 alter table task_pm_links add column if not exists provider_seen_status text;
+alter table task_pm_links add column if not exists last_projected_brain_status text;
 
 -- Observable work events from code repos. The initial event is "merged": after a PR
 -- lands on main, the matching task row moves to done and provider sync is attempted.

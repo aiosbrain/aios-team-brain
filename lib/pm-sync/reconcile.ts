@@ -100,22 +100,22 @@ export async function reconcileProviderState(
     const seen = seenByResource.get(link.provider_resource_id!) ?? null;
     if (seen === null) continue; // provider has no state for this item (e.g. deleted) — leave as-is
 
-    // Persist the seen state ONLY when it changed — keeps a re-run write-free (idempotent).
-    if (seen !== link.provider_seen_status) {
+    // Persist the seen state NAME ONLY when it changed — keeps a re-run write-free (idempotent).
+    if (seen.name !== link.provider_seen_status) {
       await supabase
         .from("task_pm_links")
-        .update({ provider_seen_status: seen, updated_at: new Date().toISOString() })
+        .update({ provider_seen_status: seen.name, updated_at: new Date().toISOString() })
         .eq("id", link.id);
       seenUpdated += 1;
     }
 
     // Surface divergence from the brain's last projection — using the freshly-seen value.
-    if (isDiverged({ last_projected_status: link.last_projected_status, provider_seen_status: seen })) {
+    if (isDiverged({ last_projected_status: link.last_projected_status, provider_seen_status: seen.name })) {
       divergences.push({
         row_key: link.row_key,
         provider: link.provider,
         last_projected_status: link.last_projected_status,
-        provider_seen_status: seen,
+        provider_seen_status: seen.name,
       });
     }
   }
