@@ -147,5 +147,33 @@ describe("agentic-maturity snapshot ingest (real Postgres)", () => {
       expect(rowWith!.canonical_spine).toBe(rowWithout!.canonical_spine);
       expect(Number(rowWith!.canonical_overall)).toBe(Number(rowWithout!.canonical_overall));
     });
+
+    // Regression: the audit trail must not collapse "omitted" and "explicit null" into the
+    // same logged value — that would hide whether a re-push actually cleared a stored band.
+    it("audit meta distinguishes omitted (unchanged) from an explicit band or null", async () => {
+      async function metaFor(teamId: string) {
+        const { data } = await db()
+          .from("audit_log")
+          .select("meta")
+          .eq("team_id", teamId)
+          .eq("action", "maturity.snapshot")
+          .order("created_at", { ascending: false })
+          .limit(1)
+          .single();
+        return (data as { meta: Record<string, unknown> }).meta;
+      }
+
+      const seedOmitted = await seedTeam();
+      await ingest(seedOmitted, snapshot());
+      expect((await metaFor(seedOmitted.teamId)).ce_band).toBe("unchanged");
+
+      const seedBand = await seedTeam();
+      await ingest(seedBand, snapshot({ ce_band: 3 }));
+      expect((await metaFor(seedBand.teamId)).ce_band).toBe(3);
+
+      const seedNull = await seedTeam();
+      await ingest(seedNull, snapshot({ ce_band: null }));
+      expect((await metaFor(seedNull.teamId)).ce_band).toBeNull();
+    });
   });
 });

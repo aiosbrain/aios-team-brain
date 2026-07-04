@@ -86,7 +86,9 @@ export async function ingestMaturitySnapshot(
       spine: canonical.spine,
       overall: canonical.overall,
       tasks: payload.tasks,
-      ce_band: payload.ce_band ?? null,
+      // Preserve the omitted-vs-explicit-null distinction in the audit trail too — collapsing
+      // them (e.g. via `?? null`) would hide whether a re-push actually cleared a stored band.
+      ce_band: payload.ce_band === undefined ? "unchanged" : payload.ce_band,
     },
   });
 
