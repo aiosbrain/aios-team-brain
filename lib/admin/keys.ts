@@ -61,3 +61,33 @@ export async function revokeApiKey(
     target_id: apiKeyId,
   });
 }
+
+/**
+ * Self-serve variant of revokeApiKey: a member may revoke ONLY their own key. Unlike
+ * revokeApiKey (which trusts the caller's authz check and only scopes by team), this
+ * primitive re-derives ownership from the DB itself, so the ownership check can never be
+ * skipped by a caller that forgets to gate it — same "single writer, one legal path"
+ * shape as createTeam/createMember. Returns `{ revoked: false }` (no-op, not an error) if
+ * the key is absent, already revoked, or owned by someone else; throws on a genuine DB
+ * failure so a caller never mistakes "the lookup broke" for "not allowed."
+ */
+export async function revokeOwnApiKey(
+  admin: SupabaseClient,
+  teamId: string,
+  memberId: string,
+  apiKeyId: string,
+  opts: { actor?: ActorContext } = {}
+): Promise<{ revoked: boolean }> {
+  const { data: row, error } = await admin
+    .from("api_keys")
+    .select("member_id, revoked_at")
+    .eq("id", apiKeyId)
+    .eq("team_id", teamId)
+    .maybeSingle();
+  if (error) throw new Error(`revoke key lookup failed: ${error.message}`);
+  const r = row as { member_id: string; revoked_at: string | null } | null;
+  if (!r || r.member_id !== memberId || r.revoked_at) return { revoked: false };
+
+  await revokeApiKey(admin, teamId, apiKeyId, opts);
+  return { revoked: true };
+}
