@@ -191,6 +191,9 @@ export const maturitySnapshotPayloadSchema = z.object({
     .default({ spine: "L1", axes: {} }),
   sessions: z.number().int().nonnegative().optional().default(0),
   tasks: z.number().int().nonnegative().optional().default(0),
+  // Shadow Cognitive-Ergonomics band (v1.3). No `.default()`: omitted (older client) must
+  // stay distinguishable from an explicit null. Provenance-only — never recomputed here.
+  ce_band: z.number().int().min(0).max(4).nullable().optional(),
 });
 export type MaturitySnapshotPayload = z.infer<typeof maturitySnapshotPayloadSchema>;
 

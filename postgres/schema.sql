@@ -744,6 +744,10 @@ create table if not exists agentic_maturity_snapshots (
   canonical_learning numeric(4,2) not null default 0,
   canonical_cost_governance numeric(4,2) not null default 0,
   canonical_overall numeric(4,2) not null default 0,
+  -- shadow Cognitive-Ergonomics band (v1.3, optional, 0-4, nullable, no default).
+  -- Client-derived, provenance-only: never recomputed here, never feeds placement().
+  -- Shadow / uncalibrated — never a canonical scorer input.
+  ce_band smallint check (ce_band is null or ce_band between 0 and 4),
   created_at timestamptz not null default now(),
   unique (team_id, member_id, snapshot_date, metric)
 );

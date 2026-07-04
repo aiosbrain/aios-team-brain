@@ -93,4 +93,59 @@ describe("agentic-maturity snapshot ingest (real Postgres)", () => {
 
     await expect(ingest(seed, snapshot({ member: "ghost" }))).rejects.toThrow(/unknown member/i);
   });
+
+  describe("ce_band (v1.3 shadow band)", () => {
+    it("persists an explicit band; canonical_* is unaffected by its presence", async () => {
+      const seed = await seedTeam();
+      const withBand = await ingest(seed, snapshot({ ce_band: 3 }));
+      const row = await rowFor(seed.teamId, seed.memberId, "2026-06-18");
+      expect(row!.ce_band).toBe(3);
+      expect(withBand.canonical.spine).toMatch(/^L[1-5]$/);
+    });
+
+    it("persists an explicit null", async () => {
+      const seed = await seedTeam();
+      await ingest(seed, snapshot({ ce_band: null }));
+      const row = await rowFor(seed.teamId, seed.memberId, "2026-06-18");
+      expect(row!.ce_band).toBeNull();
+    });
+
+    it("stays NULL when the field is omitted (older client)", async () => {
+      const seed = await seedTeam();
+      await ingest(seed, snapshot());
+      const row = await rowFor(seed.teamId, seed.memberId, "2026-06-18");
+      expect(row!.ce_band).toBeNull();
+    });
+
+    it("column-wise merge: push-with-band then re-push-without leaves the band intact", async () => {
+      const seed = await seedTeam();
+      await ingest(seed, snapshot({ ce_band: 3 }));
+      await ingest(seed, snapshot({ tasks: 999 })); // no ce_band key at all
+      const row = await rowFor(seed.teamId, seed.memberId, "2026-06-18");
+      expect(row!.ce_band).toBe(3);
+      expect(Number(row!.tasks)).toBe(999); // the re-push's other fields DID apply
+    });
+
+    it("re-push with explicit null clears a previously stored band", async () => {
+      const seed = await seedTeam();
+      await ingest(seed, snapshot({ ce_band: 3 }));
+      await ingest(seed, snapshot({ ce_band: null }));
+      const row = await rowFor(seed.teamId, seed.memberId, "2026-06-18");
+      expect(row!.ce_band).toBeNull();
+    });
+
+    it("canonical_* columns are identical with and without ce_band", async () => {
+      const seed = await seedTeam();
+      const withBand = await ingest(seed, snapshot({ ce_band: 3 }));
+      const rowWith = await rowFor(seed.teamId, seed.memberId, "2026-06-18");
+
+      const seed2 = await seedTeam();
+      const withoutBand = await ingest(seed2, snapshot());
+      const rowWithout = await rowFor(seed2.teamId, seed2.memberId, "2026-06-18");
+
+      expect(withBand.canonical).toEqual(withoutBand.canonical);
+      expect(rowWith!.canonical_spine).toBe(rowWithout!.canonical_spine);
+      expect(Number(rowWith!.canonical_overall)).toBe(Number(rowWithout!.canonical_overall));
+    });
+  });
 });

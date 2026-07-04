@@ -63,6 +63,9 @@ export async function ingestMaturitySnapshot(
         canonical_learning: canonical.axes.learning,
         canonical_cost_governance: canonical.axes.cost_governance,
         canonical_overall: canonical.overall,
+        // Omitted (older client) → key absent, column untouched on conflict (preserves a
+        // previously stored band). Explicit null → column set to NULL, clearing it.
+        ...(payload.ce_band !== undefined ? { ce_band: payload.ce_band } : {}),
       },
       { onConflict: "team_id,member_id,snapshot_date,metric" }
     )
@@ -78,7 +81,13 @@ export async function ingestMaturitySnapshot(
     action: "maturity.snapshot",
     target_type: "member",
     target_id: memberId,
-    meta: { date: payload.date, spine: canonical.spine, overall: canonical.overall, tasks: payload.tasks },
+    meta: {
+      date: payload.date,
+      spine: canonical.spine,
+      overall: canonical.overall,
+      tasks: payload.tasks,
+      ce_band: payload.ce_band ?? null,
+    },
   });
 
   return { snapshot_id: data.id, member_id: memberId, canonical };
