@@ -2,6 +2,7 @@ import "server-only";
 import { runSlackIngestion, runPlaneIngestion, runLinearIngestion, runGithubIngestion } from "./run";
 import { adminClient } from "@/lib/supabase/admin";
 import { recordIngestRun } from "./runs";
+import { runLinearInbound, type InboundRunSummary } from "@/lib/pm-sync/inbound";
 
 /**
  * On-demand "scrape now" from the query box. `isSyncCommand` recognizes when a chat message is a
@@ -54,6 +55,19 @@ export async function runManualSync(teamId: string): Promise<ManualSyncResult> {
     safe(runGithubIngestion({ teamId })),
   ]);
 
+  // Inbound Linear→brain apply/adopt (brain-api v1.4): runs AFTER the Linear ingest leg above has
+  // resolved (never in parallel with it) so adopt sees freshly-imported mirror tasks. Per-team
+  // opt-in — a team without inboundApply gets a quiet no-op.
+  let inbound: InboundRunSummary | null = null;
+  if (linear?.integrations) {
+    try {
+      inbound = await runLinearInbound({ teamId });
+      if (inbound.skipped || !inbound.teams) inbound = null;
+    } catch {
+      inbound = null;
+    }
+  }
+
   // Record each configured source's run so a manual /sync failure is diagnosable in the runs log.
   const runsDb = adminClient();
   for (const [source, s] of [["slack", slack], ["plane", plane], ["linear", linear], ["github", github]] as const) {
@@ -67,6 +81,21 @@ export async function runManualSync(teamId: string): Promise<ManualSyncResult> {
       updated: s.updated,
       errors: s.errors,
       meta: { integrations: s.integrations },
+      startedAt,
+    });
+  }
+
+  if (inbound && (inbound.applied || inbound.adopted || inbound.conflicts || inbound.errors.length)) {
+    await recordIngestRun(runsDb, {
+      teamId,
+      source: "linear_inbound",
+      trigger: "manual",
+      ok: inbound.ok,
+      created: inbound.adopted,
+      updated: inbound.applied,
+      unchanged: inbound.noops,
+      errors: inbound.errors,
+      meta: { conflicts: inbound.conflicts, skipped: inbound.skippedReasons },
       startedAt,
     });
   }
@@ -88,6 +117,14 @@ export async function runManualSync(teamId: string): Promise<ManualSyncResult> {
   add("Plane", plane);
   add("Linear", linear);
   add("GitHub", github);
+
+  if (inbound && (inbound.applied || inbound.adopted || inbound.conflicts)) {
+    errors += inbound.errors.length;
+    const conflictNote = inbound.conflicts
+      ? ` — ${inbound.conflicts} conflict${inbound.conflicts > 1 ? "s" : ""} (see Admin → PM sync)`
+      : "";
+    lines.push(`- **Linear inbound**: ${inbound.applied} applied, ${inbound.adopted} adopted${conflictNote}`);
+  }
 
   let summary: string;
   if (!lines.length) {

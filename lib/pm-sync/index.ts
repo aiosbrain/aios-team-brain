@@ -8,6 +8,8 @@ import type { PmProvider } from "@/lib/pm-sync/provider";
 export { projectTask, projectAllTasks } from "@/lib/pm-sync/project";
 export type { ProjectionReport, ProjectionTaskRow } from "@/lib/pm-sync/project";
 export { projectTaskByIdAfterWrite, projectChangedTasksAfterWrite } from "@/lib/pm-sync/after-write";
+export { runInboundForTeam, runLinearInbound, loadInboundRows, classifyInboundRow } from "@/lib/pm-sync/inbound";
+export type { InboundResult, InboundRunSummary, InboundRow, InboundRowState } from "@/lib/pm-sync/inbound";
 
 export interface TaskForPmSync {
   id: string;
