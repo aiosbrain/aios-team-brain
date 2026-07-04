@@ -133,6 +133,7 @@ type SnapshotRow = {
   canonical_autonomy: number;
   canonical_learning: number;
   canonical_cost_governance: number;
+  ce_band: number | null;
   tasks: number;
   sessions: number;
   total_cost_usd: number;
@@ -159,6 +160,7 @@ export type MemberMaturityCard = {
   date: string;
   spine: string;
   overall: number;
+  ce_band: number | null;
   axes: AemAxes;
   tasks: number;
   sessions: number;
@@ -200,7 +202,7 @@ export async function getTeamMaturity(
   const { data: snaps } = await supabase
     .from("agentic_maturity_snapshots")
     .select(
-      `member_id, snapshot_date, canonical_spine, canonical_overall, tasks, sessions,
+      `member_id, snapshot_date, canonical_spine, canonical_overall, ce_band, tasks, sessions,
        total_cost_usd, input_tokens, output_tokens, cache_read_tokens, ${AXIS_COLS.join(", ")}`
     )
     .eq("team_id", teamId)
@@ -235,6 +237,7 @@ export async function getTeamMaturity(
       date: dayStr(r.snapshot_date),
       spine: r.canonical_spine,
       overall: Number(r.canonical_overall),
+      ce_band: r.ce_band == null ? null : Number(r.ce_band),
       axes,
       tasks: Number(r.tasks),
       sessions: Number(r.sessions),
@@ -255,7 +258,10 @@ export async function getTeamMaturity(
   };
 }
 
-export type MemberTimelinePoint = { date: string } & AemAxes & { overall: number };
+export type MemberTimelinePoint = { date: string } & AemAxes & {
+  overall: number;
+  ce_band: number | null;
+};
 export type MemberMaturity = {
   handle: string;
   name: string;
@@ -290,7 +296,7 @@ export async function getMemberMaturity(
   const { data: snaps } = await supabase
     .from("agentic_maturity_snapshots")
     .select(
-      `member_id, snapshot_date, canonical_spine, canonical_overall, tasks, sessions,
+      `member_id, snapshot_date, canonical_spine, canonical_overall, ce_band, tasks, sessions,
        total_cost_usd, input_tokens, output_tokens, cache_read_tokens, ${AXIS_COLS.join(", ")}`
     )
     .eq("team_id", teamId)
@@ -304,6 +310,7 @@ export async function getMemberMaturity(
   const timeline: MemberTimelinePoint[] = rows.map((r) => ({
     date: dayStr(r.snapshot_date),
     overall: Number(r.canonical_overall),
+    ce_band: r.ce_band == null ? null : Number(r.ce_band),
     ...rowAxes(r),
   }));
   const last = rows[rows.length - 1];
@@ -312,6 +319,7 @@ export async function getMemberMaturity(
   const latest: MemberMaturityCard = {
     member_id: m.id, handle: m.actor_handle, name: m.display_name, avatar_url: m.avatar_url,
     date: dayStr(last.snapshot_date), spine: last.canonical_spine, overall: Number(last.canonical_overall),
+    ce_band: last.ce_band == null ? null : Number(last.ce_band),
     axes, tasks: Number(last.tasks), sessions: Number(last.sessions),
     total_cost_usd: Number(last.total_cost_usd ?? 0),
     total_tokens: Number(last.input_tokens ?? 0) + Number(last.output_tokens ?? 0) + Number(last.cache_read_tokens ?? 0),
