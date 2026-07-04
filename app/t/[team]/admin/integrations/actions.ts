@@ -13,7 +13,13 @@ import {
 import { runSlackIngestion, runPlaneIngestion, runLinearIngestion, runGithubIngestion } from "@/lib/ingest/run";
 import { runGraphProjection } from "@/lib/graph/run";
 import { resolveIntegrationsAdmin } from "@/lib/integrations/read";
-import { linkGithubRepo, unlinkGithubRepo } from "@/lib/integrations/github-link";
+import {
+  linkGithubRepo,
+  unlinkGithubRepo,
+  ensureGithubIntegration,
+  githubReposAndToken,
+} from "@/lib/integrations/github-link";
+import { validateGithubToken, checkRepoAccess, type RepoAccess } from "@/lib/integrations/github-validate";
 import { RepoFormatError } from "@/lib/integrations/github-repos";
 import { IntegrationConfigError, type IntegrationType } from "@/lib/api/schemas";
 import { audit } from "@/lib/api/audit";
@@ -254,6 +260,50 @@ export async function removeGithubRepo(
   }
   revalidatePath(`/t/${teamSlug}/admin/integrations`);
   return { ok: true };
+}
+
+/**
+ * Connect a GitHub token for private-repo access (admins only). Validates the PAT against GitHub
+ * (`GET /user`) BEFORE storing, so a bad/expired token is rejected immediately instead of failing
+ * silently at sync time. On success the token is stored encrypted on the team's github integration
+ * (row created if needed) and the authenticated login is returned for a "Connected as @login" badge.
+ */
+export async function connectGithubToken(
+  teamSlug: string,
+  token: string
+): Promise<{ ok: boolean; login?: string; error?: string }> {
+  const ctx = await requireAdmin(teamSlug);
+  if (!ctx) return { ok: false, error: "admins only" };
+  const v = await validateGithubToken(token);
+  if (!v.ok) return { ok: false, error: v.error ?? "token validation failed" };
+  try {
+    const auth = { teamId: ctx.teamId, memberId: ctx.myMemberId };
+    const id = await ensureGithubIntegration(adminClient(), auth);
+    await setIntegrationSecret(adminClient(), auth, id, token.trim());
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "could not save token" };
+  }
+  revalidatePath(`/t/${teamSlug}/admin/integrations`);
+  return { ok: true, login: v.login };
+}
+
+/**
+ * Probe each linked repo's accessibility with the team's stored token (admins only) — public /
+ * private (reachable) / no_access (private-without-access or missing). Lets the panel show whether a
+ * private repo will actually sync BEFORE running one. Read-only; the token never leaves the server.
+ */
+export async function checkGithubAccess(
+  teamSlug: string
+): Promise<{ ok: boolean; access?: RepoAccess[]; error?: string }> {
+  const ctx = await requireAdmin(teamSlug);
+  if (!ctx) return { ok: false, error: "admins only" };
+  try {
+    const { repos, token } = await githubReposAndToken(adminClient(), ctx.teamId);
+    const access = await Promise.all(repos.map((r) => checkRepoAccess(r, token)));
+    return { ok: true, access };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "access check failed" };
+  }
 }
 
 /**

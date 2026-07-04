@@ -332,6 +332,9 @@ const integrationConfigSchemas: Record<IntegrationType, z.ZodType> = {
       teamId: z.string().max(64).optional(),
       projectId: z.string().max(64).optional(),
       doneStateName: z.string().max(80).optional(),
+      // Per-team opt-in for the v1.4 inbound apply (Linear→brain status + adopt). Default off:
+      // enabling Linear-writes-brain is a deliberate, reversible, per-team act (brain-api v1.4).
+      inboundApply: z.boolean().optional(),
     })
     .strict(),
   plane: z

@@ -13,7 +13,7 @@ import { adminClient } from "@/lib/db/admin";
 import { createMember, deleteMember } from "@/lib/admin/members";
 import { issueApiKey, revokeApiKey } from "@/lib/admin/keys";
 import { issueLoginLink } from "@/lib/admin/login";
-import { renameTeam } from "@/lib/admin/teams";
+import { createTeam, renameTeam } from "@/lib/admin/teams";
 import { addAuthorAlias } from "@/lib/admin/aliases";
 import { linkGithub, listOrgMembers } from "@/lib/codebases/github";
 import { setMemberIdentity } from "@/lib/identity/member-identities";
@@ -53,6 +53,7 @@ async function resolveTeam(admin: ReturnType<typeof adminClient>, ref: string) {
 }
 
 const USAGE = `Team Brain admin CLI — commands:
+  create-team <slug> --name <display>   # bootstrap: create a team, no SQL. Idempotent.
   create-member <email> --name <n> --handle <h> [--role admin|lead|member] [--team <slug>] [--upsert]
   login-link <email> [--team <slug>] [--ttl-min <n>] [--base-url <url> | env BRAIN_URL]
   issue-key <member-email> [--name <n>] [--team <slug>]
@@ -93,6 +94,17 @@ async function main() {
   const teamSlug = (flags.team as string) || "demo";
 
   switch (cmd) {
+    case "create-team": {
+      const slug = positionals[0] || die("usage: create-team <slug> --name <display>");
+      // `--name` with no following value parses as boolean `true` (parseArgs), which would
+      // otherwise pass truthiness here and crash later at `.trim()` instead of showing usage.
+      const name =
+        (typeof flags.name === "string" && flags.name) ||
+        die("usage: create-team <slug> --name <display>");
+      const team = await createTeam(admin, { slug, name });
+      console.log(`✓ team ${team.slug} (${team.id}) "${team.name}"`);
+      break;
+    }
     case "create-member": {
       const email = positionals[0] || die("usage: create-member <email> --name <n> --handle <h>");
       const team = await resolveTeam(admin, teamSlug);

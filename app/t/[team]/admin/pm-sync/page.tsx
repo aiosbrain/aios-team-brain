@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
 import { serverClient } from "@/lib/db/server";
-import { isDiverged } from "@/lib/pm-sync/reconcile";
+import { classifyInboundRow, loadInboundRows } from "@/lib/pm-sync/inbound";
 import { ProjectBoardButton } from "./project-board-button";
 import { ReconcileButton } from "./reconcile-button";
 
@@ -16,7 +16,7 @@ export default async function PmSyncPage({ params }: { params: Promise<{ team: s
     .maybeSingle();
   if (!team) return null;
 
-  const [{ data: unresolved }, { data: failedLinks }, { data: seenLinks }] = await Promise.all([
+  const [{ data: unresolved }, { data: failedLinks }, inboundRows] = await Promise.all([
     supabase
       .from("work_events")
       .select("row_key, repo, merged_sha, pr_url, pr_title, error, created_at")
@@ -31,27 +31,23 @@ export default async function PmSyncPage({ params }: { params: Promise<{ team: s
       .not("last_error", "is", null)
       .order("updated_at", { ascending: false })
       .limit(50),
-    // Inbound divergence (Phase 5): links the reconcile pass has recorded a provider_seen_status on.
-    // Divergence is computed in JS (the pg adapter can't compare two columns in a filter).
-    supabase
-      .from("task_pm_links")
-      .select("row_key, provider, provider_url, last_projected_status, provider_seen_status, updated_at")
-      .eq("team_id", team.id)
-      .not("provider_seen_status", "is", null)
-      .order("updated_at", { ascending: false })
-      .limit(200),
+    // Inbound divergence (brain-api v1.4): the enriched read the inbound engine itself uses —
+    // links + task rows + the exact brain-status baseline — so the page deterministically
+    // recomputes "conflict (both changed)" vs "pending apply" from persisted data alone.
+    loadInboundRows(supabase, team.id),
   ]);
 
-  const divergences = (
-    (seenLinks ?? []) as {
-      row_key: string;
-      provider: string;
-      provider_url: string | null;
-      last_projected_status: string | null;
-      provider_seen_status: string | null;
-      updated_at: string;
-    }[]
-  ).filter(isDiverged);
+  const divergences = inboundRows
+    .map((row) => ({ row, state: classifyInboundRow(row) }))
+    .filter((d) => d.state !== "in_sync")
+    .map(({ row, state }) => ({
+      row_key: row.link.row_key,
+      provider: row.link.provider,
+      provider_url: row.link.provider_url,
+      last_projected_status: row.link.last_projected_status,
+      provider_seen_status: row.link.provider_seen_status,
+      state,
+    }));
 
   return (
     <div className="flex flex-col gap-5">
@@ -72,9 +68,11 @@ export default async function PmSyncPage({ params }: { params: Promise<{ team: s
       <section className="prism-card p-4" data-section="inbound-divergence">
         <h2 className="text-lg font-semibold text-ink">Inbound divergence</h2>
         <p className="mt-1 text-sm text-ink-secondary">
-          Tasks whose state in the PM tool has drifted from what the brain last projected. The brain
-          is the source of truth — this is <span className="font-medium text-ink">surface-only</span>,
-          shown for a human to pull; it is never written back automatically.
+          Tasks whose state in the PM tool has drifted from what the brain last projected.
+          With inbound apply enabled, a <span className="font-medium text-ink">pending apply</span> row
+          is written to the brain on the next sync (the brain hadn&apos;t changed); a{" "}
+          <span className="font-medium text-ink">conflict</span> means both sides changed — it is
+          surfaced here for a human and never auto-merged.
         </p>
         <div className="mt-4">
           <ReconcileButton
@@ -90,6 +88,7 @@ export default async function PmSyncPage({ params }: { params: Promise<{ team: s
                 <th className="py-2 pr-4 font-medium">Provider</th>
                 <th className="py-2 pr-4 font-medium">Brain projected</th>
                 <th className="py-2 pr-4 font-medium">Seen in tool</th>
+                <th className="py-2 pr-4 font-medium">Resolution</th>
               </tr>
             </thead>
             <tbody>
@@ -101,10 +100,17 @@ export default async function PmSyncPage({ params }: { params: Promise<{ team: s
                   </td>
                   <td className="py-2 pr-4 text-ink-secondary">{d.last_projected_status}</td>
                   <td className="py-2 pr-4 font-medium text-amber-700">{d.provider_seen_status}</td>
+                  <td className="py-2 pr-4" data-resolution={d.state}>
+                    {d.state === "conflict" ? (
+                      <span className="font-medium text-red">conflict — both changed</span>
+                    ) : (
+                      <span className="text-ink-secondary">pending apply</span>
+                    )}
+                  </td>
                 </tr>
               ))}
               {divergences.length === 0 ? (
-                <tr><td colSpan={4} className="py-4 text-ink-tertiary">No divergence detected.</td></tr>
+                <tr><td colSpan={5} className="py-4 text-ink-tertiary">No divergence detected.</td></tr>
               ) : null}
             </tbody>
           </table>

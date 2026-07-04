@@ -5,6 +5,55 @@ import type { ActorContext } from "./members";
 
 const SLUG_RE = /^[a-z0-9][a-z0-9-]*$/;
 
+export interface TeamInput {
+  slug: string;
+  name: string;
+}
+
+/**
+ * Create a team — the no-SQL bootstrap primitive for a fresh instance. Pairs with
+ * `createMember({ role: "admin" })` to stand up the first team + admin without
+ * hand-written SQL (AIOS is self-hosted per organization; this is NOT a public
+ * signup path — see CLAUDE.md §5). Idempotent: an existing slug returns that row
+ * rather than erroring, so a bootstrap script can be re-run safely.
+ */
+export async function createTeam(
+  admin: DbClient,
+  input: TeamInput,
+  opts: { actor?: ActorContext } = {}
+): Promise<{ id: string; slug: string; name: string }> {
+  const slug = input.slug.trim().toLowerCase();
+  if (!SLUG_RE.test(slug)) throw new Error(`invalid slug '${slug}' (need ^[a-z0-9][a-z0-9-]*$)`);
+  const name = input.name.trim();
+  if (!name) throw new Error("name is required");
+
+  const { data: existing } = await admin
+    .from("teams")
+    .select("id, slug, name")
+    .eq("slug", slug)
+    .maybeSingle();
+  if (existing) return existing as { id: string; slug: string; name: string };
+
+  const { data, error } = await admin
+    .from("teams")
+    .insert({ slug, name })
+    .select("id, slug, name")
+    .single();
+  if (error || !data) throw new Error(`create team failed: ${error?.message}`);
+  const team = data as { id: string; slug: string; name: string };
+
+  await audit(admin, {
+    team_id: team.id,
+    actor_kind: opts.actor?.kind ?? "system",
+    member_id: opts.actor?.memberId ?? null,
+    action: "team.created",
+    target_type: "team",
+    target_id: team.id,
+    meta: { slug, name },
+  });
+  return team;
+}
+
 /**
  * Rename a team's slug and/or display name. Idempotent (setting the slug/name it
  * already has is a no-op, not an error). The slug must be route-safe and unique.

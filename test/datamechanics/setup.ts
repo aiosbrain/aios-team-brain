@@ -13,6 +13,7 @@ const DATA_TABLES = [
   "graph_relationships",
   "graph_entities",
   "decisions",
+  "task_pm_links",
   "tasks",
   "item_versions",
   "items",

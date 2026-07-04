@@ -27,6 +27,10 @@ export interface TaskPmLink {
   projection_fingerprint?: string | null;
   last_projected_status?: string | null;
   provider_seen_status?: string | null;
+  // Exact brain `tasks.status` at the last successful projection/adopt/inbound apply — the
+  // inbound conflict baseline (brain-api v1.4). The fingerprint hashes the provider state GROUP,
+  // so it cannot distinguish same-group statuses (in_progress vs blocked); this can.
+  last_projected_brain_status?: string | null;
 }
 
 export interface ProviderSyncResult {
@@ -98,6 +102,15 @@ export interface FetchSeenStatesInput {
   fetchImpl?: typeof fetch;
 }
 
+// A provider workflow state as currently seen on the board. `name` is the display name (what
+// reconcile persists to provider_seen_status); `type` is the provider's raw state group — for
+// Linear the 1-L `backlog|unstarted|started|completed|canceled` — which the inbound apply needs
+// to map a seen state to a brain status via the SAME mapper ingest uses (linearStatus).
+export interface SeenState {
+  name: string;
+  type: string;
+}
+
 export interface PmAdapter {
   provider: PmProvider;
   // Optional per-run prefetch: returns an opaque provider bootstrap (states/labels/items/modules)
@@ -105,10 +118,11 @@ export interface PmAdapter {
   prepare?(input: PrepareInput): Promise<unknown>;
   upsertWorkItem(input: UpsertWorkItemInput): Promise<UpsertWorkItemResult>;
   moveToDone(input: ProviderSyncInput): Promise<ProviderSyncResult>;
-  // Inbound reconciliation (brain-api v1.2 Phase 5): read the CURRENT provider workflow-state NAME
-  // for every projected item, keyed by provider resource id. Read-only — never mutates the provider.
-  // Optional: a provider without an implementation simply has no divergence detection.
-  fetchSeenStates?(input: FetchSeenStatesInput): Promise<Map<string, string>>;
+  // Inbound reconciliation (brain-api v1.2 Phase 5 / v1.4 inbound apply): read the CURRENT
+  // provider workflow state ({ name, type }) for every projected item, keyed by provider resource
+  // id. Read-only — never mutates the provider. Optional: a provider without an implementation
+  // simply has no divergence detection (and no inbound apply).
+  fetchSeenStates?(input: FetchSeenStatesInput): Promise<Map<string, SeenState>>;
 }
 
 // status → desired provider state. Both providers share five workflow groups; `blocked` has no

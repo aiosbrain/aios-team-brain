@@ -13,6 +13,7 @@ import {
   createConversation,
   appendMessage,
 } from "@/lib/chat/store";
+import { generateAndSetTitle } from "@/lib/chat/title";
 
 export const runtime = "nodejs";
 export const maxDuration = 120;
@@ -66,9 +67,11 @@ export async function POST(req: NextRequest) {
   const owner = { teamId: auth.teamId, memberId: auth.memberId };
   let conversationId = conversation_id && (await ownsConversation(supabase, owner, conversation_id)) ? conversation_id : null;
   const priorTurns = conversationId ? await recentTurns(supabase, owner, conversationId) : [];
+  let createdNew = false;
   if (!conversationId) {
     const created = await createConversation(supabase, owner, question);
     conversationId = created?.id ?? null;
+    createdNew = true;
   }
   if (conversationId) await appendMessage(supabase, owner, conversationId, "user", question);
 
@@ -130,6 +133,9 @@ export async function POST(req: NextRequest) {
                 output_tokens: chunk.usage.output_tokens,
                 cost_usd: chunk.usage.cost_usd,
               });
+              if (createdNew) {
+                await generateAndSetTitle(supabase, owner, conversationId, question, answer, { anthropicKey, openaiKey });
+              }
             }
 
             await supabase.from("query_log").insert({

@@ -12,6 +12,10 @@ export const runtime = "nodejs";
  * so an external tool (e.g. a Hermes comms agent or the `slack` CLI) can resolve "how do
  * I reach teammate X" from the single source of truth instead of a local list.
  *
+ * Also carries `github_login`/`avatar_url` (populated by the admin GitHub sync) so
+ * tools that render contributors — e.g. `aios timeline` — can resolve avatars from
+ * the brain before falling back to GitHub's public avatar CDN.
+ *
  * Team-tier only (the roster is team metadata; an external key gets 403). Optional filters:
  *   ?email=<addr>     exact roster email
  *   ?handle=<handle>  exact actor_handle
@@ -37,7 +41,7 @@ export async function GET(req: NextRequest) {
 
   let q = supabase
     .from("members")
-    .select("id, email, display_name, actor_handle, github_login, role, tier, status")
+    .select("id, email, display_name, actor_handle, github_login, avatar_url, role, tier, status")
     .eq("team_id", auth.teamId)
     .neq("status", "disabled");
   if (email) q = q.eq("email", email);
@@ -59,6 +63,7 @@ export async function GET(req: NextRequest) {
         display_name: m.display_name as string,
         actor_handle: m.actor_handle as string,
         github_login: (m.github_login as string | null) ?? null,
+        avatar_url: (m.avatar_url as string | null) ?? null,
         role: m.role as string,
         tier: m.tier as string,
         identities: provs,

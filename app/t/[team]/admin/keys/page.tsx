@@ -34,8 +34,9 @@ export default async function KeysAdminPage({
     <div className="flex flex-col gap-4">
       <div className="flex items-center justify-between">
         <p className="text-sm text-ink-secondary">
-          Per-member sync keys for the <code>aios</code> CLI. Secrets are hashed at rest and shown
-          exactly once at issue time.
+          Per-member sync keys for the <code>aios</code> CLI. Members can generate their own from
+          their profile page — use this to issue one on their behalf instead, or revoke any key.
+          Secrets are hashed at rest and shown exactly once at issue time.
         </p>
         <IssueKey teamSlug={teamSlug} members={members ?? []} />
       </div>
@@ -80,7 +81,8 @@ export default async function KeysAdminPage({
             {(keys ?? []).length === 0 && (
               <tr>
                 <td colSpan={6} className="px-4 py-8 text-center text-sm text-ink-tertiary">
-                  No keys yet — issue one so a member can run <code>aios push</code>.
+                  No keys yet — members can generate their own from their profile page, or issue
+                  one here for them.
                 </td>
               </tr>
             )}

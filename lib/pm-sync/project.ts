@@ -116,7 +116,9 @@ export async function resolvePrimaryProvider(
   return { provider: null, reason: "multiple PM integrations enabled but teams.primary_pm_provider is unset" };
 }
 
-function toProjectable(row: ProjectionTaskRow, parentResourceId: string | null): ProjectableTask {
+// Exported so the inbound apply (lib/pm-sync/inbound.ts) recomputes fingerprints over the EXACT
+// same projectable shape the outbound engine hashes — the two must never drift.
+export function toProjectable(row: ProjectionTaskRow, parentResourceId: string | null): ProjectableTask {
   return {
     row_key: row.row_key,
     title: row.title,
@@ -133,7 +135,7 @@ function toProjectable(row: ProjectionTaskRow, parentResourceId: string | null):
 // Columns of task_pm_links the projection engine reads. The pg adapter (prod) rejects a bare
 // "*" column reference, so every select / insert-returning must name columns explicitly.
 const LINK_COLS =
-  "id, team_id, project_id, task_id, row_key, provider, provider_resource_id, provider_external_source, provider_external_id, provider_url, projection_fingerprint, last_projected_status, provider_seen_status";
+  "id, team_id, project_id, task_id, row_key, provider, provider_resource_id, provider_external_source, provider_external_id, provider_url, projection_fingerprint, last_projected_status, last_projected_brain_status, provider_seen_status";
 
 // The exact `tasks` columns that hydrate a ProjectionTaskRow. Named explicitly (the pg adapter
 // rejects "*") and shared by every loader so the projected shape can't drift between call sites.
@@ -176,7 +178,10 @@ async function persistSuccess(
   supabase: DbClient,
   link: TaskPmLink,
   result: UpsertWorkItemResult,
-  fingerprint: string
+  fingerprint: string,
+  // Exact brain `tasks.status` this projection wrote from — the inbound conflict baseline
+  // (brain-api v1.4). The group-granular fingerprint can't distinguish in_progress vs blocked.
+  brainStatus: string
 ) {
   const now = new Date().toISOString();
   await supabase
@@ -188,6 +193,7 @@ async function persistSuccess(
       last_synced_status: result.syncedStatus ?? null,
       last_synced_at: now,
       last_projected_status: result.syncedStatus ?? null,
+      last_projected_brain_status: brainStatus,
       projection_fingerprint: fingerprint,
       last_error: null,
       updated_at: now,
@@ -288,7 +294,7 @@ export async function projectTask(
       bootstrap: opts.bootstrap,
       fetchImpl: opts.fetchImpl,
     });
-    await persistSuccess(supabase, link, result, fingerprint);
+    await persistSuccess(supabase, link, result, fingerprint, row.status);
     opts.resolved?.set(row.row_key, result.providerResourceId);
     return { row_key: row.row_key, provider, status: result.status, providerResourceId: result.providerResourceId };
   } catch (e) {

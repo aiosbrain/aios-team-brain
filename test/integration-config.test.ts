@@ -73,6 +73,18 @@ describe("validateIntegrationConfig()", () => {
     ).toEqual({ teamId: "team-uuid", projectId: "project-uuid", doneStateName: "Done" });
   });
 
+  it("accepts the Linear inboundApply opt-in (brain-api v1.4) but still no secret-like keys", () => {
+    expect(validateIntegrationConfig("linear", { teamId: "team-uuid", inboundApply: true })).toEqual({
+      teamId: "team-uuid",
+      inboundApply: true,
+    });
+    // Boundary regression for the DEFERRED webhook work: a webhook signing secret has no home in
+    // config — the secret-key scan must keep rejecting it (it belongs in an encrypted column).
+    expect(() => validateIntegrationConfig("linear", { webhookSecret: "whsec_x" })).toThrow(/secret-like key/i);
+    // …and any other webhook-ish key is rejected by the strict allowlist.
+    expect(() => validateIntegrationConfig("linear", { webhookUrl: "https://x" })).toThrow(IntegrationConfigError);
+  });
+
   it("treats LLM provider keys as secret-only (empty config; the key lives in secret_ciphertext)", () => {
     for (const type of ["openai", "anthropic", "google"] as const) {
       // No non-secret config — empty object is the only valid config.

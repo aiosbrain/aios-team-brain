@@ -71,7 +71,9 @@ export default async function TeamLayout({
       label: "Work",
       children: [
         { icon: "tasks", label: "Tasks", href: `${base}/tasks` },
-        { icon: "projects", label: "Projects", href: `${base}/projects` },
+        // Projects hidden for now — the tab currently surfaces ingestion namespaces (slack, commits,
+        // github-*, …) rather than human work-projects. Unhide once it shows real projects.
+        // { icon: "projects", label: "Projects", href: `${base}/projects` },
         { icon: "decisions", label: "Decisions", href: `${base}/decisions` },
       ],
     },

@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { linkGithubRepo, unlinkGithubRepo } from "@/lib/integrations/github-link";
+import {
+  linkGithubRepo,
+  unlinkGithubRepo,
+  ensureGithubIntegration,
+  githubReposAndToken,
+} from "@/lib/integrations/github-link";
+import { setIntegrationSecret } from "@/lib/integrations/manage";
 import { RepoFormatError } from "@/lib/integrations/github-repos";
 import { db, seedTeam } from "./helpers";
 
@@ -50,5 +56,26 @@ describe("GitHub repo linking (real Postgres)", () => {
     const auth = { teamId: seed.teamId, memberId: seed.memberId };
     await expect(linkGithubRepo(db(), auth, "not-a-repo")).rejects.toBeInstanceOf(RepoFormatError);
     expect(await githubRow(seed.teamId)).toHaveLength(0); // nothing persisted
+  });
+
+  it("ensureGithubIntegration creates a row when none exists, idempotently", async () => {
+    const seed = await seedTeam();
+    const auth = { teamId: seed.teamId, memberId: seed.memberId };
+    const id1 = await ensureGithubIntegration(db(), auth);
+    const id2 = await ensureGithubIntegration(db(), auth); // idempotent
+    expect(id1).toBe(id2);
+    expect(await githubRow(seed.teamId)).toHaveLength(1);
+  });
+
+  it("token round-trips: connect a token, then reads decrypt it alongside the repos", async () => {
+    const seed = await seedTeam();
+    const auth = { teamId: seed.teamId, memberId: seed.memberId };
+    await linkGithubRepo(db(), auth, "acme/private-svc");
+    const id = await ensureGithubIntegration(db(), auth);
+    await setIntegrationSecret(db(), auth, id, "ghp_secrettoken123");
+
+    const { repos, token } = await githubReposAndToken(db(), seed.teamId);
+    expect(repos).toEqual(["acme/private-svc"]);
+    expect(token).toBe("ghp_secrettoken123"); // decrypted, in-process only
   });
 });

@@ -84,6 +84,21 @@ Production is Postgres on Railway. After a merge that changes `postgres/schema.s
 `npm run pg:schema` against the prod `DATABASE_URL` and confirm the platform started a new build
 (CI webhooks can be dropped — re-trigger if the latest deploy predates the merge).
 
+## Bootstrapping a fresh instance (first team + admin)
+
+AIOS is self-hosted per organization (see CLAUDE.md §5) — there's no public signup. The first
+team and its first admin are created once, with no hand-written SQL, by chaining two idempotent
+CLI commands (against the target `DATABASE_URL` — prod uses the Railway DB):
+
+```bash
+npm run admin -- create-team <slug> --name "<Display Name>"
+npm run admin -- create-member <you@org.com> --name "<Your Name>" --handle <you> --role admin --team <slug>
+```
+
+Both are safe to re-run: `create-team` returns the existing row for an already-used slug, and
+`create-member` takes `--upsert` if you need to re-run it. From here, follow "Giving a new
+contributor brain access" below to invite everyone else onto the same team.
+
 ## Giving a new contributor brain access (admins)
 
 People are invite-only; machines (the `aios` CLI / sidecar) use a per-member API key. To onboard

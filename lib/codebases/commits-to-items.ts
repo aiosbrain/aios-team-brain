@@ -19,6 +19,7 @@ const COMMITS_PROJECT = "commits";
 export interface ScanCommit {
   sha?: unknown;
   author?: unknown;
+  author_email?: unknown; // git author email — the reliable key for author→member resolution
   message?: unknown;
   committed_at?: unknown;
   ai?: unknown;
@@ -50,6 +51,7 @@ export function normalizeCommit(codebaseSlug: string, commit: ScanCommit): ItemP
   const sha = str(commit.sha).trim();
   if (!sha) return null;
   const author = str(commit.author).trim() || "unknown";
+  const authorEmail = str(commit.author_email).trim();
   const message = str(commit.message).trim();
   const when = str(commit.committed_at).trim();
   const ai = commit.ai === true;
@@ -77,6 +79,7 @@ export function normalizeCommit(codebaseSlug: string, commit: ScanCommit): ItemP
       codebase: codebaseSlug,
       sha,
       author,
+      author_email: authorEmail, // persisted so future re-attribution can resolve by email
       committed_at: when,
       ai,
       additions: adds,
@@ -101,7 +104,16 @@ export async function projectCommitsToItems(
   for (const commit of recentCommits) {
     const payload = normalizeCommit(codebaseSlug, commit);
     if (!payload) continue;
-    const authorMemberId = resolveMember(identityMap, parseAuthorIdentity(str(commit.author)));
+    // Resolve by the git author EMAIL (the reliable key, matching how code_contributions attributes).
+    // Falls back to parsing an inline `name <email>` from the author string. Without a resolvable
+    // email the commit is name-only → resolveMember returns null → ingestItem would attribute the
+    // item to the SCANNER's member (the CI key), which mis-files every author's commits under one
+    // person. So we pass the parsed identity and let resolveMember do email/handle matching.
+    const email = str(commit.author_email).trim();
+    const identity: AuthorIdentity = email
+      ? { name: str(commit.author), email, key: email }
+      : parseAuthorIdentity(str(commit.author));
+    const authorMemberId = resolveMember(identityMap, identity);
     await ingestItem(supabase, auth, payload, "team", { authorMemberId });
     processed++;
   }
