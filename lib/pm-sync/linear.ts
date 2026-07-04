@@ -13,6 +13,7 @@ import {
   type PrepareInput,
   type ProviderSyncInput,
   type ProviderSyncResult,
+  type SeenState,
   type StateGroup,
   type UpsertWorkItemInput,
   type UpsertWorkItemResult,
@@ -250,15 +251,15 @@ export const linearAdapter: PmAdapter = {
     return buildBootstrap(ctx, teamId);
   },
 
-  // Phase 5 inbound reconcile: list every issue once and return resource id → current state NAME.
-  // Read-only (reuses the projection bootstrap queries; performs no mutations).
-  async fetchSeenStates({ integration, fetchImpl }: FetchSeenStatesInput): Promise<Map<string, string>> {
+  // Phase 5 inbound reconcile / v1.4 inbound apply: list every issue once and return resource id →
+  // current state { name, type }. Read-only (reuses the projection bootstrap queries; no mutations).
+  async fetchSeenStates({ integration, fetchImpl }: FetchSeenStatesInput): Promise<Map<string, SeenState>> {
     const ctx = linearCtx({ integration, fetchImpl });
     const teamId = requireString(ctx.teamIdConfig, "Linear teamId (config.teamId) for reconcile");
     const boot = await buildBootstrap(ctx, teamId);
-    const seen = new Map<string, string>();
+    const seen = new Map<string, SeenState>();
     for (const [id, issue] of boot.issuesById) {
-      if (issue.state?.name) seen.set(id, issue.state.name);
+      if (issue.state?.name) seen.set(id, { name: issue.state.name, type: issue.state.type ?? "" });
     }
     return seen;
   },

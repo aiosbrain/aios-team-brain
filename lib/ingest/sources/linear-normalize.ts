@@ -68,6 +68,11 @@ function safeSegment(s: string): string {
   return s.toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
 }
 
+/** The deterministic brain project slug a Linear team's issues mirror into (`linear-<teamKey>`). */
+export function linearMirrorProject(teamKey: string): string {
+  return `linear-${safeSegment(teamKey) || "team"}`;
+}
+
 // Linear state.type → brain status. Linear uses "canceled" (one l); both terminal states → done.
 const TYPE_TO_STATUS: Record<string, string> = {
   backlog: "backlog",
@@ -77,11 +82,29 @@ const TYPE_TO_STATUS: Record<string, string> = {
   canceled: "done",
 };
 
-/** A state NAMED like a brain status wins (e.g. a "Blocked" started state); else map by type. */
-function linearStatus(stateName: string | undefined, type: string | undefined): string {
+/**
+ * Strict variant for the inbound apply (brain-api v1.4): a state whose name doesn't match a brain
+ * status AND whose type isn't a known Linear group resolves to NULL — the contract treats an
+ * unresolvable state as a CONFLICT, never a silent default. `linearStatus` keeps the ingest
+ * behavior (defaults to backlog) by delegating here.
+ */
+export function linearStatusOrNull(stateName: string | undefined, type: string | undefined): string | null {
   const byName = normalizeTaskStatus(stateName ?? "");
   if (byName.raw_status === null && byName.status !== "backlog") return byName.status;
-  return TYPE_TO_STATUS[type ?? ""] ?? "backlog";
+  const byType = TYPE_TO_STATUS[type ?? ""];
+  if (byType) return byType;
+  // A state literally named "Backlog" (any/unknown type) still resolves by name.
+  return byName.raw_status === null ? byName.status : null;
+}
+
+/**
+ * A state NAMED like a brain status wins (e.g. a "Blocked" started state); else map by type.
+ * Exported (v1.4): the inbound apply reuses this exact mapper so inbound and ingest agree — it is
+ * keyed on Linear's 1-L `canceled`, never the 2-L `StateGroup` spelling (`provider.ts`), which
+ * would silently mis-map canceled states.
+ */
+export function linearStatus(stateName: string | undefined, type: string | undefined): string {
+  return linearStatusOrNull(stateName, type) ?? "backlog";
 }
 
 // Linear priority int → brain priority word.
@@ -89,7 +112,7 @@ const PRIORITY_BY_INT: Record<number, string> = { 0: "none", 1: "urgent", 2: "hi
 
 export function normalizeLinearTeam(input: NormalizeLinearInput): ItemPayload {
   const slugSeg = safeSegment(input.teamKey) || "team";
-  const project = `linear-${slugSeg}`;
+  const project = linearMirrorProject(input.teamKey);
 
   // Exclude every brain-owned issue (footer round-trippers + projection-linked), importing only
   // net-new Linear-side tasks. Stable sort so a re-import is byte-identical → a no-op at the sha writer.
