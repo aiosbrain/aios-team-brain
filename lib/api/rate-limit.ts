@@ -1,12 +1,12 @@
 import "server-only";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 
 /**
  * Postgres fixed-window rate limiting (no Vercel KV — self-host portable).
  * Window = 1 minute. Returns true if the call is allowed.
  */
 export async function rateLimit(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   bucket: string,
   limitPerMinute: number
 ): Promise<boolean> {

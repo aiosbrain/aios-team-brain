@@ -1,5 +1,5 @@
 import "server-only";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 import { audit } from "@/lib/api/audit";
 import { addAuthorAlias } from "@/lib/admin/aliases";
 import type { ActorContext } from "@/lib/admin/members";
@@ -97,7 +97,7 @@ export function noreplyEmails(user: { id: number; login: string }): string[] {
  * backfilling contributions. Returns a summary.
  */
 export async function linkGithub(
-  admin: SupabaseClient,
+  admin: DbClient,
   teamId: string,
   memberId: string,
   token: string,

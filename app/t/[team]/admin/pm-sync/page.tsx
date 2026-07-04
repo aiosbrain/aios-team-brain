@@ -1,5 +1,5 @@
 import type { Metadata } from "next";
-import { serverClient } from "@/lib/supabase/server";
+import { serverClient } from "@/lib/db/server";
 import { classifyInboundRow, loadInboundRows } from "@/lib/pm-sync/inbound";
 import { ProjectBoardButton } from "./project-board-button";
 import { ReconcileButton } from "./reconcile-button";

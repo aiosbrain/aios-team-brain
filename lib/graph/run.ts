@@ -1,6 +1,6 @@
 import "server-only";
-import type { SupabaseClient } from "@supabase/supabase-js";
-import { adminClient } from "@/lib/supabase/admin";
+import type { DbClient } from "@/lib/db/types";
+import { adminClient } from "@/lib/db/admin";
 import { GraphitiClient } from "./graphiti-client";
 import { projectItemsToGraph } from "./project";
 
@@ -29,7 +29,7 @@ export interface GraphProjectionSummary {
 const DEFAULT_LIMIT = Number(process.env.GRAPH_PROJECT_LIMIT ?? 500);
 
 async function resolveTeams(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   teamId?: string
 ): Promise<{ id: string; slug: string }[]> {
   let q = supabase.from("teams").select("id, slug");
@@ -42,7 +42,7 @@ async function resolveTeams(
 export async function runGraphProjection(opts?: {
   teamId?: string;
   client?: GraphitiClient;
-  supabase?: SupabaseClient;
+  supabase?: DbClient;
   limit?: number;
 }): Promise<GraphProjectionSummary> {
   const client = opts?.client ?? new GraphitiClient();

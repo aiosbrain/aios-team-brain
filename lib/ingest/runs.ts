@@ -1,5 +1,5 @@
 import "server-only";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 
 /**
  * The ingestion run log (`ingest_runs`) — the single home for "did this import work, and if not,
@@ -56,7 +56,7 @@ const MAX_ERROR_CHARS = 500;
  * Append one ingestion run. Never throws — a logging failure must not fail the ingestion it
  * describes. `ok` is derived to false whenever there are errors, even if the caller passed true.
  */
-export async function recordIngestRun(supabase: SupabaseClient, run: IngestRunInput): Promise<void> {
+export async function recordIngestRun(supabase: DbClient, run: IngestRunInput): Promise<void> {
   try {
     const errors = (run.errors ?? []).slice(0, MAX_ERRORS).map((e) => String(e).slice(0, MAX_ERROR_CHARS));
     const finishedAt = run.finishedAt ?? Date.now();
@@ -86,7 +86,7 @@ export async function recordIngestRun(supabase: SupabaseClient, run: IngestRunIn
  * aggregates (team_id null). Newest first. Read-only; the Admin page gates access (CLAUDE.md §5).
  */
 export async function listRecentIngestRuns(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   teamId: string,
   limit = 50
 ): Promise<IngestRunRow[]> {

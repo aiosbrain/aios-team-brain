@@ -1,6 +1,6 @@
 import Link from "next/link";
 import { Rocket } from "lucide-react";
-import { serverClient } from "@/lib/supabase/server";
+import { serverClient } from "@/lib/db/server";
 import { visibleItems, visibleDecisions } from "@/lib/auth/visibility";
 import { getSessionUser } from "@/lib/auth/session";
 import { CopySnippet } from "@/components/copy-snippet";

@@ -1,7 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { FolderKanban } from "lucide-react";
-import { serverClient } from "@/lib/supabase/server";
+import { serverClient } from "@/lib/db/server";
 import { EmptyState } from "@/components/empty-state";
 import { NewProjectButton } from "@/components/projects/new-project-button";
 import { timeAgo } from "@/components/format";

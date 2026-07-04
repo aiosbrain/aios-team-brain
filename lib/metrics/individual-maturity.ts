@@ -1,5 +1,5 @@
 import "server-only";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 import type { MaturitySnapshotPayload } from "@/lib/api/schemas";
 import { canSeeMaturity, type ViewerTier } from "@/lib/metrics/individual-maturity-visibility";
 
@@ -191,7 +191,7 @@ function averageAxes(rows: AemAxes[]): AemAxes {
  * Spine distribution. Team-tier only — an external viewer gets an empty board.
  */
 export async function getTeamMaturity(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   teamId: string,
   tier: ViewerTier
 ): Promise<TeamMaturity> {
@@ -271,7 +271,7 @@ export type MemberMaturity = {
  * (for the comparison radar) + the weakest-axis prescription. Team-tier only.
  */
 export async function getMemberMaturity(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   teamId: string,
   handle: string,
   tier: ViewerTier

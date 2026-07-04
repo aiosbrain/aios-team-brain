@@ -2,8 +2,7 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { ArrowLeft } from "lucide-react";
-import { isPostgresBackend } from "@/lib/db/backend";
-import { serverClient } from "@/lib/supabase/server";
+import { serverClient } from "@/lib/db/server";
 import { currentMember } from "@/lib/auth/guard";
 import { getContributorDetail, type ContributorRef } from "@/lib/metrics/codebases";
 import { parseRange } from "@/lib/metrics/range";
@@ -35,7 +34,6 @@ export default async function ContributorPage({
   params: Promise<{ team: string; slug: string; author: string }>;
   searchParams: Promise<{ range?: string }>;
 }) {
-  if (!isPostgresBackend()) notFound();
 
   const { team: teamSlug, slug, author } = await params;
   const ref = parseAuthor(author);

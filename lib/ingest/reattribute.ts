@@ -1,5 +1,5 @@
 import "server-only";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 import { buildIdentityMap, resolveByProviderId, resolveMember, type IdentityMap } from "@/lib/identity/resolve";
 import { parseAuthorIdentity } from "@/lib/codebases/commits-to-items";
 
@@ -39,7 +39,7 @@ function resolveItemAuthor(idMap: IdentityMap, fm: Record<string, unknown>): str
 }
 
 export async function reattributeItems(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   teamId: string
 ): Promise<ReattributeSummary> {
   const idMap = await buildIdentityMap(supabase, teamId);

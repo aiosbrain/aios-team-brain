@@ -1,5 +1,5 @@
 import "server-only";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 import { audit } from "@/lib/api/audit";
 import { encryptSecret, decryptSecret } from "@/lib/secrets/crypto";
 import {
@@ -23,7 +23,7 @@ export interface IntegrationAuth {
 }
 
 export async function upsertIntegration(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   auth: IntegrationAuth,
   input: IntegrationInput
 ): Promise<{ id: string; status: string }> {
@@ -60,7 +60,7 @@ export async function upsertIntegration(
 }
 
 export async function setIntegrationStatus(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   auth: IntegrationAuth,
   id: string,
   status: "enabled" | "disabled"
@@ -83,7 +83,7 @@ export async function setIntegrationStatus(
 }
 
 export async function deleteIntegration(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   auth: IntegrationAuth,
   id: string
 ): Promise<void> {
@@ -110,7 +110,7 @@ export async function deleteIntegration(
  * never the value).
  */
 export async function setIntegrationSecret(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   auth: IntegrationAuth,
   id: string,
   secret: string
@@ -145,7 +145,7 @@ export interface IntegrationWithSecret {
  * from the connector-key-authenticated endpoint (GET /api/v1/integrations) — never a page.
  */
 export async function getEnabledIntegrationsWithSecrets(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   teamId: string
 ): Promise<IntegrationWithSecret[]> {
   const { data, error } = await supabase
@@ -170,7 +170,7 @@ export async function getEnabledIntegrationsWithSecrets(
  * Never reaches a browser; the key is decrypted only here, in-process.
  */
 export async function getProviderKey(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   teamId: string,
   type: ProviderIntegrationType
 ): Promise<string | null> {
@@ -206,7 +206,7 @@ export interface IntegrationSelection {
  * helpers are all admin-role-gated). Team-scoped: only the caller's `teamId` is returned.
  */
 export async function listEnabledIntegrationSelections(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   teamId: string
 ): Promise<IntegrationSelection[]> {
   const { data, error } = await supabase

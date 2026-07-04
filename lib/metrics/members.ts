@@ -1,5 +1,5 @@
 import "server-only";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 import { rangeDays, type Range } from "./range";
 import { scopeQueryLog, type QueryLogViewer } from "@/lib/auth/visibility";
 import { num, round } from "@/lib/num";
@@ -65,7 +65,7 @@ const UNATTRIBUTED = "Unattributed";
  * through `scopeQueryLog`: admins get team-wide rows, everyone else only their own.
  */
 export async function getPerMemberCosts(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   teamId: string,
   range: Range,
   viewer: QueryLogViewer
@@ -170,7 +170,7 @@ export interface ThroughputCost {
  * authors have no member_id to attribute spend to).
  */
 export async function getThroughputVsCost(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   teamId: string,
   range: Range,
   viewer: QueryLogViewer

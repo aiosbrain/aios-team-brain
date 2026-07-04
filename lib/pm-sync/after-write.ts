@@ -1,6 +1,6 @@
 import "server-only";
 
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 
 import {
   projectTask,
@@ -24,7 +24,7 @@ import {
 
 // Load a task by id with the canonical projection column set (shared with the engine). Missing row
 // (e.g. deleted between the write and the after() callback) → null.
-async function loadTaskById(supabase: SupabaseClient, taskId: string): Promise<ProjectionTaskRow | null> {
+async function loadTaskById(supabase: DbClient, taskId: string): Promise<ProjectionTaskRow | null> {
   const { data } = await supabase.from("tasks").select(PROJECTION_TASK_COLS).eq("id", taskId).maybeSingle();
   return (data as ProjectionTaskRow | null) ?? null;
 }
@@ -33,7 +33,7 @@ async function loadTaskById(supabase: SupabaseClient, taskId: string): Promise<P
 // moveTaskAction / updateTaskAction via after(). Always single-row — the UI bypasses the push-path
 // changed-rows guard (Decision 3) and the engine's fingerprint skip prevents a redundant write.
 export async function projectTaskByIdAfterWrite(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   taskId: string,
   opts: { fetchImpl?: typeof fetch } = {}
 ): Promise<ProjectionReport | null> {
@@ -51,7 +51,7 @@ export async function projectTaskByIdAfterWrite(
 // semantics — prepare once, parent-before-child, shared resolved map, synced-only throttle — but
 // scoped to the rows whose projected fields changed this push.
 export async function projectChangedTasksAfterWrite(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   teamId: string,
   projectId: string,
   rowKeys: string[],

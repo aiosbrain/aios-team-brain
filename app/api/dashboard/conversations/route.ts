@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { adminClient } from "@/lib/supabase/admin";
+import { adminClient } from "@/lib/db/admin";
 import { errorResponse } from "@/lib/api/schemas";
 import { resolveChatOwner } from "@/lib/chat/session";
 import { listConversations } from "@/lib/chat/store";

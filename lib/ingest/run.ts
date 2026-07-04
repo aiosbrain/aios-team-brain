@@ -1,7 +1,7 @@
 import "server-only";
 import { randomUUID } from "node:crypto";
-import type { SupabaseClient } from "@supabase/supabase-js";
-import { adminClient } from "@/lib/supabase/admin";
+import type { DbClient } from "@/lib/db/types";
+import { adminClient } from "@/lib/db/admin";
 import { ingestItem } from "@/lib/ingest";
 import { getEnabledIntegrationsWithSecrets } from "@/lib/integrations/manage";
 import { SlackClient, fetchSlackChannel } from "./sources/slack";
@@ -49,7 +49,7 @@ function envSlackToken(): string | null {
 }
 
 /** Distinct teams that have at least one enabled Slack integration. */
-async function teamsWithSlack(supabase: SupabaseClient): Promise<string[]> {
+async function teamsWithSlack(supabase: DbClient): Promise<string[]> {
   const { data } = await supabase
     .from("integrations")
     .select("team_id")
@@ -67,7 +67,7 @@ interface ConnectorIdentity {
 
 /** Find (or auto-provision) the per-team connector member used as a given source's ingest actor. */
 async function resolveConnectorAuth(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   teamId: string,
   identity: ConnectorIdentity
 ): Promise<{ teamId: string; memberId: string; apiKeyId: string } | null> {
@@ -227,7 +227,7 @@ export interface PlaneIngestSummary {
 }
 
 /** Distinct teams with at least one enabled Plane integration. */
-async function teamsWithPlane(supabase: SupabaseClient): Promise<string[]> {
+async function teamsWithPlane(supabase: DbClient): Promise<string[]> {
   const { data } = await supabase
     .from("integrations")
     .select("team_id")
@@ -351,7 +351,7 @@ export async function runPlaneIngestion(opts: { teamId?: string } = {}): Promise
 export type ImportSummary = PlaneIngestSummary;
 
 /** Distinct teams with at least one enabled integration of a given type. */
-async function teamsWithType(supabase: SupabaseClient, type: "linear" | "github"): Promise<string[]> {
+async function teamsWithType(supabase: DbClient, type: "linear" | "github"): Promise<string[]> {
   const { data } = await supabase
     .from("integrations")
     .select("team_id")

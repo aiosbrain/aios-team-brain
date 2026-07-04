@@ -2,8 +2,7 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { ArrowLeft } from "lucide-react";
-import { isPostgresBackend } from "@/lib/db/backend";
-import { serverClient } from "@/lib/supabase/server";
+import { serverClient } from "@/lib/db/server";
 import { currentMember } from "@/lib/auth/guard";
 import { getMemberMaturity, AXIS_META, type AemAxes } from "@/lib/metrics/individual-maturity";
 import { MaturityRadar, type RadarDatum } from "@/components/charts/maturity-radar";
@@ -20,7 +19,6 @@ export default async function MemberMaturityPage({
 }: {
   params: Promise<{ team: string; handle: string }>;
 }) {
-  if (!isPostgresBackend()) return null;
 
   const { team: teamSlug, handle } = await params;
   const supabase = await serverClient();

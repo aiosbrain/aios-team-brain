@@ -1,5 +1,5 @@
 import "server-only";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 import { IngestValidationError, type MaturitySnapshotPayload } from "@/lib/api/schemas";
 import { buildIdentityMap, resolveMember } from "@/lib/identity/resolve";
 import { audit } from "@/lib/api/audit";
@@ -14,7 +14,7 @@ import { placement, type AemPlacement } from "@/lib/metrics/individual-maturity"
  * maturity.ts so the maturity-tier-filter guard only polices reads.
  */
 export async function ingestMaturitySnapshot(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   auth: { teamId: string; memberId: string; apiKeyId: string },
   payload: MaturitySnapshotPayload
 ): Promise<{ snapshot_id: string; member_id: string; canonical: AemPlacement }> {

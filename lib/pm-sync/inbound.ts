@@ -1,8 +1,7 @@
 import "server-only";
 
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 
-import { isPostgresBackend } from "@/lib/db/backend";
 import { withTransaction } from "@/lib/db/pg/tx";
 import { fetchLinearTeam, type FetchedLinearTeam } from "@/lib/ingest/sources/linear";
 import {
@@ -25,7 +24,7 @@ import {
   type TaskStatusValue,
 } from "@/lib/pm-sync/provider";
 import { isDiverged } from "@/lib/pm-sync/reconcile";
-import { adminClient } from "@/lib/supabase/admin";
+import { adminClient } from "@/lib/db/admin";
 
 /**
  * Inbound Linear→brain apply + adopt (brain-api v1.4, AIO-145) — the write half that turns the
@@ -159,7 +158,7 @@ export function classifyInboundRow(row: InboundRow): InboundRowState {
  * Load every Linear link for the team enriched with its task row, outbound-identical parent
  * resolution, the recomputed fingerprint, and the two-check `brainUnchanged` verdict.
  */
-export async function loadInboundRows(supabase: SupabaseClient, teamId: string): Promise<InboundRow[]> {
+export async function loadInboundRows(supabase: DbClient, teamId: string): Promise<InboundRow[]> {
   const { data: linkData } = await supabase
     .from("task_pm_links")
     .select(INBOUND_LINK_COLS)
@@ -267,7 +266,7 @@ async function applyStatusTx(args: {
 }
 
 async function applyInbound(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   teamId: string,
   seenByResource: Map<string, SeenState>,
   result: InboundResult
@@ -367,7 +366,7 @@ function topoIssues(issues: LinearImportIssue[]): LinearImportIssue[] {
 }
 
 async function adoptInbound(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   teamId: string,
   primary: ResolvedPrimary,
   fetched: FetchedLinearTeam,
@@ -505,7 +504,7 @@ async function adoptInbound(
  * instead of throwing (matching the ingest runner's surfaced-reason pattern).
  */
 export async function runInboundForTeam(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   teamId: string,
   opts: { fetchImpl?: typeof fetch } = {}
 ): Promise<InboundResult> {
@@ -520,17 +519,6 @@ export async function runInboundForTeam(
     return emptyResult({
       provider: "linear",
       reason: "inbound apply is not enabled for this team (set inboundApply on the Linear integration)",
-    });
-  }
-  if (!isPostgresBackend()) {
-    // The v1.4 loop-prevention invariant requires a real transaction; the legacy supabase-js
-    // backend has no transactional write path, so inbound stays off there rather than running
-    // non-atomically against the contract.
-    return emptyResult({
-      provider: "linear",
-      enabled: true,
-      skipped: ["inbound apply requires the postgres backend (atomic loop-prevention)"],
-      reason: "inbound apply requires the postgres backend",
     });
   }
   const teamIdConfig = primary.integration.config?.teamId as string | undefined;

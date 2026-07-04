@@ -1,5 +1,5 @@
 import "server-only";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 import { audit } from "@/lib/api/audit";
 import type { PolicyEffect } from "./evaluate";
 
@@ -67,7 +67,7 @@ function fields(input: PolicyInput) {
   };
 }
 
-export async function listAllPolicies(supabase: SupabaseClient, teamId: string): Promise<PolicyRecord[]> {
+export async function listAllPolicies(supabase: DbClient, teamId: string): Promise<PolicyRecord[]> {
   const { data, error } = await supabase
     .from("policies")
     .select("id, priority, description, subject_role, subject_tier, subject_actor, action, resource, effect, enabled")
@@ -79,7 +79,7 @@ export async function listAllPolicies(supabase: SupabaseClient, teamId: string):
 }
 
 export async function createPolicy(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   teamId: string,
   input: PolicyInput,
   actor: PolicyActor = {}
@@ -100,7 +100,7 @@ export async function createPolicy(
 }
 
 export async function updatePolicy(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   teamId: string,
   id: string,
   input: PolicyInput,
@@ -121,7 +121,7 @@ export async function updatePolicy(
 }
 
 export async function setPolicyEnabled(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   teamId: string,
   id: string,
   enabled: boolean,
@@ -140,7 +140,7 @@ export async function setPolicyEnabled(
 }
 
 export async function deletePolicy(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   teamId: string,
   id: string,
   actor: PolicyActor = {}

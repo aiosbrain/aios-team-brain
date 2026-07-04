@@ -1,5 +1,5 @@
 import { NextRequest } from "next/server";
-import { serverClient } from "@/lib/supabase/server";
+import { serverClient } from "@/lib/db/server";
 import { getSessionUser } from "@/lib/auth/session";
 import { errorResponse } from "@/lib/api/schemas";
 import { visibleGroupIds } from "@/lib/graph/group";

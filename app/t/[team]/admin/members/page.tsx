@@ -1,4 +1,4 @@
-import { serverClient } from "@/lib/supabase/server";
+import { serverClient } from "@/lib/db/server";
 import { InviteMember } from "@/components/admin/invite-member";
 import { MemberIdentities, type ProviderLink } from "@/components/admin/member-identities";
 import { ReattributeButton } from "@/components/admin/reattribute-button";

@@ -1,5 +1,5 @@
 import "server-only";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 
 /** Tier of the pulling principal (the API key's member tier). */
 export type ViewerTier = "team" | "external";
@@ -31,7 +31,7 @@ export interface DecisionWritebackGroup {
  * `external` viewer receives only `audience='external'` decisions.
  */
 export async function getDecisionWriteback(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   teamId: string,
   tier: ViewerTier,
   since: string

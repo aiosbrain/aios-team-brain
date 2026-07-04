@@ -1,13 +1,11 @@
 "use client";
 
 import { useState } from "react";
-import { Loader2, MailCheck, Send } from "lucide-react";
-import { browserClient } from "@/lib/supabase/client";
-import { publicDbBackend } from "@/lib/db/backend";
+import { Loader2, Send } from "lucide-react";
 
 export function LoginForm({ next }: { next?: string }) {
   const [email, setEmail] = useState("");
-  const [state, setState] = useState<"idle" | "sending" | "sent" | "error">("idle");
+  const [state, setState] = useState<"idle" | "sending" | "error">("idle");
   const [error, setError] = useState("");
 
   async function onSubmit(e: React.FormEvent) {
@@ -16,57 +14,26 @@ export function LoginForm({ next }: { next?: string }) {
     setState("sending");
     setError("");
 
-    // Postgres backend: direct (passwordless) sign-in — recognized members are logged in
+    // Direct (passwordless) sign-in — recognized members are logged in
     // immediately; unknown emails are rejected (invite-only).
-    if (publicDbBackend() === "postgres") {
-      try {
-        const res = await fetch("/api/auth/login", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ email, next }),
-        });
-        if (res.status === 403) {
-          setState("error");
-          setError("That email isn't recognized. Team Brain is invite-only — ask your admin to add you.");
-          return;
-        }
-        if (!res.ok) throw new Error(`sign-in failed (${res.status})`);
-        const data = (await res.json()) as { redirect?: string };
-        window.location.href = data.redirect || next || "/";
-      } catch (err) {
+    try {
+      const res = await fetch("/api/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email, next }),
+      });
+      if (res.status === 403) {
         setState("error");
-        setError(err instanceof Error ? err.message : "could not sign in");
+        setError("That email isn't recognized. Team Brain is invite-only — ask your admin to add you.");
+        return;
       }
-      return;
-    }
-
-    const supabase = browserClient();
-    const redirect = `${window.location.origin}/auth/confirm${
-      next ? `?next=${encodeURIComponent(next)}` : ""
-    }`;
-    const { error: err } = await supabase.auth.signInWithOtp({
-      email,
-      options: { emailRedirectTo: redirect, shouldCreateUser: false },
-    });
-    if (err) {
+      if (!res.ok) throw new Error(`sign-in failed (${res.status})`);
+      const data = (await res.json()) as { redirect?: string };
+      window.location.href = data.redirect || next || "/";
+    } catch (err) {
       setState("error");
-      setError(err.message);
-    } else {
-      setState("sent");
+      setError(err instanceof Error ? err.message : "could not sign in");
     }
-  }
-
-  if (state === "sent") {
-    return (
-      <div className="flex flex-col items-center gap-3 py-4 text-center">
-        <MailCheck className="size-8 text-violet" strokeWidth={1.5} />
-        <p className="text-sm text-ink-secondary">
-          Magic link sent to <span className="font-medium text-ink">{email}</span>.
-          <br />
-          Check your inbox and click the link to sign in.
-        </p>
-      </div>
-    );
   }
 
   return (
@@ -90,7 +57,7 @@ export function LoginForm({ next }: { next?: string }) {
         ) : (
           <Send className="size-4" />
         )}
-        {publicDbBackend() === "postgres" ? "Sign in" : "Send magic link"}
+        Sign in
       </button>
       {state === "error" ? <p className="text-sm text-red">{error}</p> : null}
     </form>

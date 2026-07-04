@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
 import { ListTodo } from "lucide-react";
-import { serverClient } from "@/lib/supabase/server";
+import { serverClient } from "@/lib/db/server";
 import { getSessionUser } from "@/lib/auth/session";
 import { Board } from "@/components/kanban/board";
 import { TaskHierarchy } from "@/components/kanban/task-hierarchy";

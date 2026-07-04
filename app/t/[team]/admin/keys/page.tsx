@@ -1,4 +1,4 @@
-import { serverClient } from "@/lib/supabase/server";
+import { serverClient } from "@/lib/db/server";
 import { IssueKey, RevokeKeyButton } from "@/components/admin/issue-key";
 import { timeAgo } from "@/components/format";
 

@@ -1,5 +1,5 @@
 import "server-only";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 import { IngestValidationError, type UsageCostPayload } from "@/lib/api/schemas";
 import { buildIdentityMap, resolveMember } from "@/lib/identity/resolve";
 import { audit } from "@/lib/api/audit";
@@ -9,7 +9,7 @@ import { audit } from "@/lib/api/audit";
  * aggregates from `aios analyze --push` — Cursor dashboard USD + Claude session estimates.
  */
 export async function ingestUsageCost(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   auth: { teamId: string; memberId: string; apiKeyId: string },
   payload: UsageCostPayload
 ): Promise<{ cost_id: string; member_id: string }> {

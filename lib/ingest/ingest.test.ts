@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 import { ingestItem } from "@/lib/ingest";
 import { FakeSupabase } from "@/lib/ingest/fake-supabase";
 import type { ItemPayload } from "@/lib/api/schemas";
@@ -23,7 +23,7 @@ function payload(over: Partial<ItemPayload> = {}): ItemPayload {
 describe("ingestItem dedup", () => {
   it("returns 'unchanged' on identical sha and writes no new version", async () => {
     const fake = new FakeSupabase();
-    const supa = fake as unknown as SupabaseClient;
+    const supa = fake as unknown as DbClient;
 
     const first = await ingestItem(supa, AUTH, payload(), "team");
     expect(first.status).toBe("created");
@@ -37,7 +37,7 @@ describe("ingestItem dedup", () => {
 
   it("returns 'updated' and versions when the body (sha) changes", async () => {
     const fake = new FakeSupabase();
-    const supa = fake as unknown as SupabaseClient;
+    const supa = fake as unknown as DbClient;
     await ingestItem(supa, AUTH, payload(), "team");
     const res = await ingestItem(
       supa,
@@ -54,7 +54,7 @@ describe("ingestItem dedup", () => {
 describe("ingestItem task diff-sync", () => {
   it("deletes sync rows absent from the push but preserves UI-created rows", async () => {
     const fake = new FakeSupabase();
-    const supa = fake as unknown as SupabaseClient;
+    const supa = fake as unknown as DbClient;
 
     // First push establishes T-1 and T-2 as sync-origin tasks.
     await ingestItem(

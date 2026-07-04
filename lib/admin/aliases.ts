@@ -1,5 +1,5 @@
 import "server-only";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 import { audit } from "@/lib/api/audit";
 import type { ActorContext } from "./members";
 
@@ -19,7 +19,7 @@ export interface AliasResult {
 }
 
 export async function addAuthorAlias(
-  admin: SupabaseClient,
+  admin: DbClient,
   teamId: string,
   memberId: string,
   gitIdentity: string,
@@ -100,7 +100,7 @@ export async function addAuthorAlias(
  * FUTURE resolution through this email.
  */
 export async function removeAuthorAlias(
-  admin: SupabaseClient,
+  admin: DbClient,
   teamId: string,
   email: string,
   opts: { actor?: ActorContext } = {}

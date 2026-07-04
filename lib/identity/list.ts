@@ -1,5 +1,5 @@
 import "server-only";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 
 /**
  * Read the per-member identity view for the Admin → Members "Identities" panel: each member's git
@@ -21,7 +21,7 @@ export interface MemberIdentityRecord {
 }
 
 export async function listMemberIdentities(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   teamId: string
 ): Promise<Map<string, MemberIdentityRecord>> {
   const out = new Map<string, MemberIdentityRecord>();

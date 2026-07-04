@@ -1,5 +1,5 @@
 import "server-only";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 import { audit } from "@/lib/api/audit";
 import type { ActorContext } from "./members";
 
@@ -18,7 +18,7 @@ export interface TeamInput {
  * rather than erroring, so a bootstrap script can be re-run safely.
  */
 export async function createTeam(
-  admin: SupabaseClient,
+  admin: DbClient,
   input: TeamInput,
   opts: { actor?: ActorContext } = {}
 ): Promise<{ id: string; slug: string; name: string }> {
@@ -60,7 +60,7 @@ export async function createTeam(
  * Audited. team_id is stable, so existing data/keys/sessions survive a slug change.
  */
 export async function renameTeam(
-  admin: SupabaseClient,
+  admin: DbClient,
   teamId: string,
   fields: { slug?: string; name?: string },
   opts: { actor?: ActorContext } = {}

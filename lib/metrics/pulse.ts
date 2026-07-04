@@ -1,5 +1,5 @@
 import "server-only";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 import { rangeDays, type Range } from "./range";
 import { scopeQueryLog } from "@/lib/auth/visibility";
 
@@ -133,7 +133,7 @@ const IN_FLIGHT = new Set(["ready", "in_progress", "blocked"]);
 // ── main ─────────────────────────────────────────────────────────────────────
 
 export async function getPulseMetrics(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   teamId: string,
   range: Range,
   viewer: { isAdmin: boolean; memberId: string }

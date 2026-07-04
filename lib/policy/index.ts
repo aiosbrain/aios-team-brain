@@ -1,5 +1,5 @@
 import "server-only";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 import {
   evaluatePolicy,
   type PolicyDecision,
@@ -44,7 +44,7 @@ function mapRow(r: PolicyRow): PolicyRule {
 }
 
 export async function loadPolicies(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   teamId: string
 ): Promise<PolicyRule[]> {
   const { data, error } = await supabase
@@ -60,7 +60,7 @@ export async function loadPolicies(
 }
 
 export async function authorize(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   teamId: string,
   request: PolicyRequest
 ): Promise<PolicyDecision> {
@@ -72,7 +72,7 @@ export async function authorize(
  * Record a pending approval for a `require_approval` decision. Returns the request id.
  */
 export async function fileApprovalRequest(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   args: {
     teamId: string;
     request: PolicyRequest;

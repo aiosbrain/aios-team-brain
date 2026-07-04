@@ -1,5 +1,5 @@
 import type { Metadata } from "next";
-import { serverClient } from "@/lib/supabase/server";
+import { serverClient } from "@/lib/db/server";
 import { ChatWorkspace } from "@/components/chat/chat-workspace";
 
 export const metadata: Metadata = { title: "Chat" };

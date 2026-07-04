@@ -1,5 +1,5 @@
 import type { Metadata } from "next";
-import { serverClient } from "@/lib/supabase/server";
+import { serverClient } from "@/lib/db/server";
 import { currentMember } from "@/lib/auth/guard";
 import { FactsFeed } from "@/components/learning/facts-feed";
 import { EventsFeed } from "@/components/learning/events-feed";

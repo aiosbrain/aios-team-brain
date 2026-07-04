@@ -1,6 +1,6 @@
 import "server-only";
 import Anthropic from "@anthropic-ai/sdk";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 import type { ProviderKeys } from "@/lib/query/claude";
 import { setTitle } from "@/lib/chat/store";
 
@@ -77,7 +77,7 @@ export async function generateTitle(
 
 /** Generate + persist a title for a freshly-created conversation. Best-effort (never throws to the caller). */
 export async function generateAndSetTitle(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   owner: { teamId: string; memberId: string },
   conversationId: string,
   question: string,

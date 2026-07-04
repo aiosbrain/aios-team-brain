@@ -1,5 +1,5 @@
 import "server-only";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 import { audit } from "@/lib/api/audit";
 
 /**
@@ -31,7 +31,7 @@ export interface SetIdentityResult {
 }
 
 export async function setMemberIdentity(
-  admin: SupabaseClient,
+  admin: DbClient,
   teamId: string,
   memberId: string,
   input: SetIdentityInput,
@@ -96,7 +96,7 @@ export async function setMemberIdentity(
 
 /** Remove a provider identity mapping (admins correcting/clearing a link). Audited; no-op if absent. */
 export async function removeMemberIdentity(
-  admin: SupabaseClient,
+  admin: DbClient,
   teamId: string,
   input: { provider: string; externalId: string },
   opts: { actor?: IdentityActor } = {}

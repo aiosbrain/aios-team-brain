@@ -1,6 +1,6 @@
 import "server-only";
 
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 
 import { projectTask, type ProjectionReport, type ProjectionTaskRow } from "@/lib/pm-sync/project";
 import type { PmProvider } from "@/lib/pm-sync/provider";
@@ -48,7 +48,7 @@ function mapStatus(status: ProjectionReport["status"]): TaskPmSyncReport["status
 // Back-compat wrapper retained for the work-events report shape. Loads the full task row and
 // delegates to the projection engine in statusOnly mode (reconcile workflow state only).
 export async function syncTaskPmLinks(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   task: TaskForPmSync,
   opts: { fetchImpl?: typeof fetch } = {}
 ): Promise<TaskPmSyncReport[]> {

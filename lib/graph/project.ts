@@ -1,6 +1,6 @@
 import "server-only";
 import { createHash } from "node:crypto";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 import { GraphitiClient, type GraphEpisode } from "./graphiti-client";
 import { episodeGroupId, type AccessTier } from "./group";
 
@@ -87,7 +87,7 @@ function toEpisode(item: ItemRow): GraphEpisode {
  * an empty body are skipped (nothing to extract).
  */
 export async function projectItemsToGraph(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   args: {
     teamId: string;
     teamSlug: string;
@@ -157,7 +157,7 @@ export async function projectItemsToGraph(
 
 /** Back-compat: project only Slack transcripts. Prefer `projectItemsToGraph` (all ingestions). */
 export async function projectSlackToGraph(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   args: { teamId: string; teamSlug: string; client?: GraphitiClient; since?: string; limit?: number }
 ): Promise<ProjectSummary> {
   return projectItemsToGraph(supabase, { ...args, kinds: ["transcript"] });

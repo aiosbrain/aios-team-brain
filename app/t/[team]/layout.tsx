@@ -1,8 +1,7 @@
 import Link from "next/link";
 import { CircleAlert } from "lucide-react";
-import { serverClient } from "@/lib/supabase/server";
+import { serverClient } from "@/lib/db/server";
 import { getSessionUser } from "@/lib/auth/session";
-import { isPostgresBackend } from "@/lib/db/backend";
 import { TeamNav, type NavEntry, type NavLeaf } from "@/components/team-nav";
 
 function NoTeamScreen({ slug }: { slug: string }) {
@@ -37,7 +36,7 @@ export default async function TeamLayout({
   const user = await getSessionUser();
   if (!user) return <NoTeamScreen slug={teamSlug} />;
 
-  // RLS: this returns a row only if the signed-in user is an active member.
+  // Membership is enforced below via the `me` lookup (app-code access control).
   const { data: team } = await supabase
     .from("teams")
     .select("id, slug, name")
@@ -65,8 +64,7 @@ export default async function TeamLayout({
   }
 
   // Grouped IA: ~6 primary entries. "Work" gathers the operational surfaces; Skills folds
-  // into Data (reached at /library/skills, not a top-level peer). Codebase analytics
-  // live only on the postgres backend (canonical schema).
+  // into Data (reached at /library/skills, not a top-level peer).
   const items: NavEntry[] = [
     { icon: "home", label: "Home", href: base, exact: true },
     {
@@ -80,11 +78,9 @@ export default async function TeamLayout({
       ],
     },
     { icon: "library", label: "Data", href: `${base}/library` },
+    { icon: "codebases", label: "Codebases", href: `${base}/codebases` },
+    { icon: "maturity", label: "Maturity", href: `${base}/maturity` },
   ];
-  if (isPostgresBackend()) {
-    items.push({ icon: "codebases", label: "Codebases", href: `${base}/codebases` });
-    items.push({ icon: "maturity", label: "Maturity", href: `${base}/maturity` });
-  }
   items.push({ icon: "learning", label: "Learning", href: `${base}/learning` });
   items.push({ icon: "query", label: "Query", href: `${base}/query` });
   items.push({ label: "Settings", children: settingsChildren });

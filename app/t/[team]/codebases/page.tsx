@@ -1,9 +1,7 @@
 import type { Metadata } from "next";
-import { notFound } from "next/navigation";
 import Link from "next/link";
 import { GitBranch } from "lucide-react";
-import { isPostgresBackend } from "@/lib/db/backend";
-import { serverClient } from "@/lib/supabase/server";
+import { serverClient } from "@/lib/db/server";
 import { currentMember } from "@/lib/auth/guard";
 import { getCodebaseSummaries } from "@/lib/metrics/codebases";
 import { parseRange } from "@/lib/metrics/range";
@@ -21,8 +19,6 @@ export default async function CodebasesPage({
   params: Promise<{ team: string }>;
   searchParams: Promise<{ range?: string }>;
 }) {
-  // Codebase analytics live only on the postgres backend (canonical schema).
-  if (!isPostgresBackend()) notFound();
 
   const { team: teamSlug } = await params;
   const range = parseRange((await searchParams).range);

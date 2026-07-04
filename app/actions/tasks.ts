@@ -2,8 +2,8 @@
 
 import { after } from "next/server";
 
-import { serverClient } from "@/lib/supabase/server";
-import { adminClient } from "@/lib/supabase/admin";
+import { serverClient } from "@/lib/db/server";
+import { adminClient } from "@/lib/db/admin";
 import { currentMember } from "@/lib/auth/guard";
 import { uiRowKey, isUniqueViolation } from "@/lib/ids";
 import { normalizeTaskPriority } from "@/lib/api/schemas";

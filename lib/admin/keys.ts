@@ -1,6 +1,6 @@
 import "server-only";
 import { createHash, randomBytes } from "node:crypto";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 import { audit } from "@/lib/api/audit";
 import type { ActorContext } from "./members";
 
@@ -10,7 +10,7 @@ import type { ActorContext } from "./members";
  * returned ONCE and never persisted. Service-role client; caller does authz.
  */
 export async function issueApiKey(
-  admin: SupabaseClient,
+  admin: DbClient,
   teamId: string,
   memberId: string,
   name: string,
@@ -40,7 +40,7 @@ export async function issueApiKey(
 }
 
 export async function revokeApiKey(
-  admin: SupabaseClient,
+  admin: DbClient,
   teamId: string,
   apiKeyId: string,
   opts: { actor?: ActorContext } = {}
@@ -72,7 +72,7 @@ export async function revokeApiKey(
  * failure so a caller never mistakes "the lookup broke" for "not allowed."
  */
 export async function revokeOwnApiKey(
-  admin: SupabaseClient,
+  admin: DbClient,
   teamId: string,
   memberId: string,
   apiKeyId: string,

@@ -1,5 +1,5 @@
 import "server-only";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 import { audit } from "@/lib/api/audit";
 import { encryptSecret, decryptSecret } from "@/lib/secrets/crypto";
 
@@ -25,7 +25,7 @@ export interface MemberSecret {
 
 /** Upsert a member's secret for a provider (encrypts at rest; audits keys/flags only). */
 export async function setMemberSecret(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   auth: MemberAuth,
   provider: string,
   secret: string,
@@ -61,7 +61,7 @@ export async function setMemberSecret(
 
 /** Read + decrypt a member's secret, or null if not connected. Server-only. */
 export async function getMemberSecret(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   teamId: string,
   memberId: string,
   provider: string
@@ -85,7 +85,7 @@ export async function getMemberSecret(
 
 /** Delete a member's secret for a provider (disconnect). Audited. */
 export async function deleteMemberSecret(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   auth: MemberAuth,
   provider: string
 ): Promise<void> {

@@ -2,8 +2,7 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { ArrowLeft, Star, GitFork, CircleDot } from "lucide-react";
-import { isPostgresBackend } from "@/lib/db/backend";
-import { serverClient } from "@/lib/supabase/server";
+import { serverClient } from "@/lib/db/server";
 import { currentMember } from "@/lib/auth/guard";
 import { getCodebaseDetail } from "@/lib/metrics/codebases";
 import { parseRange } from "@/lib/metrics/range";
@@ -24,7 +23,6 @@ export default async function CodebaseDetailPage({
   params: Promise<{ team: string; slug: string }>;
   searchParams: Promise<{ range?: string }>;
 }) {
-  if (!isPostgresBackend()) notFound();
 
   const { team: teamSlug, slug } = await params;
   const range = parseRange((await searchParams).range);

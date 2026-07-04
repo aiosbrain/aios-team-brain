@@ -1,5 +1,5 @@
 import "server-only";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 import { syncProviderIdentities, type ProviderIdentitySyncResult } from "@/lib/identity/provider-sync";
 
 /**
@@ -18,7 +18,7 @@ export interface SlackUser {
 export type SlackIdentitySyncResult = ProviderIdentitySyncResult;
 
 export async function syncSlackIdentities(
-  admin: SupabaseClient,
+  admin: DbClient,
   teamId: string,
   users: SlackUser[]
 ): Promise<SlackIdentitySyncResult> {

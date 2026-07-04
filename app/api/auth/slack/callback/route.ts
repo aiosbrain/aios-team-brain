@@ -1,5 +1,5 @@
 import { NextRequest } from "next/server";
-import { adminClient } from "@/lib/supabase/admin";
+import { adminClient } from "@/lib/db/admin";
 import { rateLimit } from "@/lib/api/rate-limit";
 import { setMemberSecret } from "@/lib/member-secrets/manage";
 import { setMemberIdentity } from "@/lib/identity/member-identities";

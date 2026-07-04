@@ -1,5 +1,5 @@
 import "server-only";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 import { issueMagicToken } from "@/lib/auth/pg-login";
 import { audit } from "@/lib/api/audit";
 import type { ActorContext } from "./members";
@@ -11,7 +11,7 @@ import type { ActorContext } from "./members";
  * The raw token is a credential: surface once, never log it.
  */
 export async function issueLoginLink(
-  admin: SupabaseClient,
+  admin: DbClient,
   teamId: string,
   email: string,
   opts: { nextPath?: string; ttlMinutes?: number; baseUrl?: string; actor?: ActorContext } = {}

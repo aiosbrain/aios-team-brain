@@ -1,9 +1,9 @@
 -- ───────────────────────────────────────────────────────────────────────────
--- Plain-Postgres schema for the Team Brain (DB_BACKEND=postgres).
+-- Plain-Postgres schema for the Team Brain.
 --
--- Derived from supabase/migrations/* but WITHOUT Supabase couplings:
+-- Canonical schema — self-contained, with no Supabase couplings:
 --   • no Row-Level Security / policies  → access control is enforced in app code
---     (the RLS client and service client are the same connection here)
+--     (there is a single connection; no separate RLS client)
 --   • no `auth.users` / `auth.uid()`    → local `auth_users` + `auth_tokens`
 --   • no `private.*` RLS helper fns      → not needed without RLS
 --   • no pgvector `embedding` column     → unused by every query; dropped so this
@@ -49,8 +49,8 @@ do $$ begin
 exception when duplicate_object then null; end $$;
 
 -- ── auth (local) ─────────────────────────────────────────────────────────────
--- Stand-ins for Supabase Auth. A session is a signed cookie (see lib/auth);
--- magic-link tokens live in auth_tokens (sha256-at-rest, single-use, expiring).
+-- Local auth tables (a session is a signed cookie; see lib/auth). Magic-link
+-- tokens live in auth_tokens (sha256-at-rest, single-use, expiring).
 create table if not exists auth_users (
   id uuid primary key default gen_random_uuid(),
   email citext not null unique,
@@ -261,7 +261,7 @@ create table if not exists audit_log (
 );
 create index if not exists audit_log_team_time_idx on audit_log (team_id, created_at desc);
 
--- Append-only audit log (same guarantee as the Supabase schema).
+-- Append-only audit log.
 create or replace function audit_protect()
 returns trigger language plpgsql as $$
 begin
@@ -280,8 +280,7 @@ create table if not exists rate_limits (
 );
 
 -- Fixed-window rate limiting. Returns the running count for the window so the
--- caller can compare against its per-minute limit. (In Supabase mode this
--- function is absent and rateLimit() fails open; here it actually enforces.)
+-- caller can compare against its per-minute limit.
 create or replace function rate_limit_hit(p_bucket text, p_window_start timestamptz)
 returns integer language plpgsql as $$
 declare c integer;

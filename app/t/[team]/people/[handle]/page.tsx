@@ -2,8 +2,7 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { ArrowLeft } from "lucide-react";
-import { isPostgresBackend } from "@/lib/db/backend";
-import { serverClient } from "@/lib/supabase/server";
+import { serverClient } from "@/lib/db/server";
 import { currentMember } from "@/lib/auth/guard";
 import { getMemberProfile } from "@/lib/metrics/codebases";
 import { getMemberContext } from "@/lib/identity/context";
@@ -32,7 +31,6 @@ export default async function PersonPage({
   params: Promise<{ team: string; handle: string }>;
   searchParams: Promise<{ range?: string }>;
 }) {
-  if (!isPostgresBackend()) notFound();
 
   const { team: teamSlug, handle } = await params;
   const range = parseRange((await searchParams).range);

@@ -4,7 +4,7 @@
 -- This is NOT part of the default schema (`postgres/schema.sql`), which stays
 -- extension-free so the brain runs on stock Postgres. Load this ONLY if you want
 -- semantic retrieval, and only against a Postgres that has the `vector` extension
--- available (Railway, Supabase, or the `pgvector/pgvector` image):
+-- available (Railway or the `pgvector/pgvector` image):
 --
 --     DATABASE_URL=… npm run pg:schema:vector      # after `npm run pg:schema`
 --

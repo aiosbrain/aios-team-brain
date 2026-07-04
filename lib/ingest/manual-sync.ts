@@ -1,6 +1,6 @@
 import "server-only";
 import { runSlackIngestion, runPlaneIngestion, runLinearIngestion, runGithubIngestion } from "./run";
-import { adminClient } from "@/lib/supabase/admin";
+import { adminClient } from "@/lib/db/admin";
 import { recordIngestRun } from "./runs";
 import { runLinearInbound, type InboundRunSummary } from "@/lib/pm-sync/inbound";
 

@@ -1,4 +1,4 @@
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 import { upsertIntegration, type IntegrationAuth } from "./manage";
 import { decryptSecret } from "@/lib/secrets/crypto";
 import { addRepo, removeRepo } from "./github-repos";
@@ -18,7 +18,7 @@ interface GithubRow {
 }
 
 /** The team's canonical github integration (earliest-created if several), or null. */
-async function firstGithubRow(supabase: SupabaseClient, teamId: string): Promise<GithubRow | null> {
+async function firstGithubRow(supabase: DbClient, teamId: string): Promise<GithubRow | null> {
   const { data } = await supabase
     .from("integrations")
     .select("name, status, config")
@@ -41,7 +41,7 @@ function currentRepos(row: GithubRow | null): string[] {
 
 /** Upsert the canonical github row with a new repos list, preserving other config + status. */
 async function writeRepos(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   auth: IntegrationAuth,
   row: GithubRow | null,
   repos: string[]
@@ -59,7 +59,7 @@ async function writeRepos(
  * Returns the resulting repos list. Throws `RepoFormatError` on malformed input (surfaced to the UI).
  */
 export async function linkGithubRepo(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   auth: IntegrationAuth,
   repoInput: string
 ): Promise<string[]> {
@@ -75,7 +75,7 @@ export async function linkGithubRepo(
  * upsert key.
  */
 export async function ensureGithubIntegration(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   auth: IntegrationAuth
 ): Promise<string> {
   const row = await firstGithubRow(supabase, auth.teamId);
@@ -94,7 +94,7 @@ export async function ensureGithubIntegration(
  * row regardless of enabled/disabled so an access check reflects the true stored token.
  */
 export async function githubReposAndToken(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   teamId: string
 ): Promise<{ repos: string[]; token: string | null }> {
   const { data } = await supabase
@@ -113,7 +113,7 @@ export async function githubReposAndToken(
 
 /** Unlink a repo (case-insensitive). No-op if no github row / repo absent. Returns the repos list. */
 export async function unlinkGithubRepo(
-  supabase: SupabaseClient,
+  supabase: DbClient,
   auth: IntegrationAuth,
   repoInput: string
 ): Promise<string[]> {
