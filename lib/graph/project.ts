@@ -47,6 +47,9 @@ export interface ProjectSummary {
   scanned: number;
   projected: number;
   skipped: number;
+  /** `synced_at` of the last row scanned this batch — the cursor the runner pages forward from
+   * (audit H2). `undefined` when the batch was empty (nothing left to scan). */
+  lastSyncedAt?: string;
 }
 
 type ItemRow = {
@@ -152,7 +155,11 @@ export async function projectItemsToGraph(
     projected++;
   }
 
-  return { scanned: rows.length, projected, skipped };
+  // Cursor for the runner: rows are ordered by synced_at ascending, so the last row is the high-water
+  // mark to page past next batch (audit H2). Without this the runner only ever re-scanned the oldest
+  // `limit` rows and never reached items beyond that window.
+  const lastSyncedAt = rows.length ? rows[rows.length - 1].synced_at : undefined;
+  return { scanned: rows.length, projected, skipped, lastSyncedAt };
 }
 
 /** Back-compat: project only Slack transcripts. Prefer `projectItemsToGraph` (all ingestions). */

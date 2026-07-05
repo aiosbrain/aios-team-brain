@@ -2,6 +2,7 @@ import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { GraphitiClient, type GraphFact } from "@/lib/graph/graphiti-client";
 import { visibleGroupIds } from "@/lib/graph/group";
+import { visibleTasks } from "@/lib/auth/visibility";
 import {
   selectedProviderName,
   type RetrievalProvider,
@@ -374,30 +375,48 @@ async function nativeRetrieve(
   // can ground on finished tasks. `tasks.updated_at` is bumped on every sync upsert (incl. a
   // status→done transition), so recency ordering surfaces today's completions. (Was active-only:
   // `in_progress/blocked/ready`, which structurally hid every completion from the brain.)
-  const tasksB = supabase
-    .from("tasks")
-    .select("row_key, title, assignee, status, sprint, updated_at, projects(slug)")
-    .eq("team_id", teamId)
-    .order("updated_at", { ascending: false })
-    .limit(80);
-  const commitmentsB = supabase
-    .from("graph_entities")
-    .select("entity_id, name, attrs")
-    .eq("team_id", teamId)
-    .eq("entity_type", "commitment")
-    .limit(30);
-  const relsB = supabase
-    .from("graph_relationships")
-    .select("from_id, to_id, relationship_type")
-    .eq("team_id", teamId)
-    .in("relationship_type", ["REPORTS_TO", "OWNS", "BLOCKS"])
-    .limit(80);
-  const actorsB = supabase
-    .from("graph_entities")
-    .select("entity_id, name, attrs")
-    .eq("team_id", teamId)
-    .eq("entity_type", "actor")
-    .limit(40);
+  // Tasks carry `audience` (audit H1); an external principal sees only external-tier tasks. Without
+  // this filter the external query context leaked every internal task board.
+  const tasksB = visibleTasks(
+    supabase
+      .from("tasks")
+      .select("row_key, title, assignee, status, sprint, updated_at, projects(slug)")
+      .eq("team_id", teamId)
+      .order("updated_at", { ascending: false })
+      .limit(80),
+    tier
+  );
+  // graph_entities / graph_relationships carry NO tier column, so they can't be audience-filtered.
+  // For an external principal we therefore omit them entirely (audit H1) rather than risk leaking
+  // internal commitments/actors/reporting lines. `emptyRows` resolves to the same `{ data }` shape.
+  const emptyRows = Promise.resolve({ data: [] as unknown[] });
+  const commitmentsB =
+    tier === "external"
+      ? emptyRows
+      : supabase
+          .from("graph_entities")
+          .select("entity_id, name, attrs")
+          .eq("team_id", teamId)
+          .eq("entity_type", "commitment")
+          .limit(30);
+  const relsB =
+    tier === "external"
+      ? emptyRows
+      : supabase
+          .from("graph_relationships")
+          .select("from_id, to_id, relationship_type")
+          .eq("team_id", teamId)
+          .in("relationship_type", ["REPORTS_TO", "OWNS", "BLOCKS"])
+          .limit(80);
+  const actorsB =
+    tier === "external"
+      ? emptyRows
+      : supabase
+          .from("graph_entities")
+          .select("entity_id, name, attrs")
+          .eq("team_id", teamId)
+          .eq("entity_type", "actor")
+          .limit(40);
 
   const [
     { data: ftsHits },

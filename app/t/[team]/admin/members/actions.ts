@@ -1,10 +1,8 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
-import { serverClient } from "@/lib/db/server";
 import { adminClient } from "@/lib/db/admin";
-import { getSessionUser } from "@/lib/auth/session";
-import { resolveIntegrationsAdmin } from "@/lib/integrations/read";
+import { requireTeamAdmin as requireAdmin } from "@/lib/auth/guard";
 import { linkGithub } from "@/lib/codebases/github";
 import { setMemberIdentity, removeMemberIdentity } from "@/lib/identity/member-identities";
 import { addAuthorAlias, removeAuthorAlias } from "@/lib/admin/aliases";
@@ -12,18 +10,6 @@ import { reattributeItems } from "@/lib/ingest/reattribute";
 
 // Providers whose identity is a stable user id in member_identities (GitHub uses its own login flow).
 const PROVIDERS = new Set(["slack", "linear", "plane"]);
-
-/**
- * Admin gate for member mutations: resolve the signed-in user to an `{teamId, memberId}` admin
- * context (same role==="admin" + active-member check the /admin layout uses; `resolveIntegrationsAdmin`
- * is the shared team-admin resolver). Returns null for any non-admin/unknown/wrong-team caller.
- */
-async function requireAdmin(teamSlug: string) {
-  const supabase = await serverClient();
-  const user = await getSessionUser();
-  if (!user) return null;
-  return resolveIntegrationsAdmin(supabase, teamSlug, user.id);
-}
 
 /**
  * Link a roster member to a GitHub login (admins only). Reuses `linkGithub`, which writes

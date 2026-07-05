@@ -2,22 +2,11 @@
 
 import { revalidatePath } from "next/cache";
 
-import { serverClient } from "@/lib/db/server";
 import { adminClient } from "@/lib/db/admin";
-import { getSessionUser } from "@/lib/auth/session";
-import { resolveIntegrationsAdmin } from "@/lib/integrations/read";
+import { requireTeamAdmin as requireAdmin } from "@/lib/auth/guard";
 import { audit } from "@/lib/api/audit";
 import { projectAllTasks, type ProjectionReport } from "@/lib/pm-sync";
 import { reconcileProviderState, type DivergenceRow } from "@/lib/pm-sync/reconcile";
-
-async function requireAdmin(teamSlug: string) {
-  const supabase = await serverClient();
-  const user = await getSessionUser();
-  if (!user) return null;
-  const ctx = await resolveIntegrationsAdmin(supabase, teamSlug, user.id);
-  if (!ctx) return null;
-  return { teamId: ctx.teamId, myMemberId: ctx.memberId };
-}
 
 export interface ProjectBoardResult {
   ok: boolean;
@@ -58,7 +47,7 @@ export async function projectBoardAction(teamSlug: string): Promise<ProjectBoard
   await audit(db, {
     team_id: ctx.teamId,
     actor_kind: "member",
-    member_id: ctx.myMemberId,
+    member_id: ctx.memberId,
     action: "team.project_board",
     target_type: "team",
     target_id: ctx.teamId,
@@ -94,7 +83,7 @@ export async function reconcileDivergenceAction(teamSlug: string): Promise<Recon
   await audit(db, {
     team_id: ctx.teamId,
     actor_kind: "member",
-    member_id: ctx.myMemberId,
+    member_id: ctx.memberId,
     action: "team.reconcile_divergence",
     target_type: "team",
     target_id: ctx.teamId,

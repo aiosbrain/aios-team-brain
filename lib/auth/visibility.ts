@@ -35,6 +35,17 @@ export function visibleDecisions<Q>(query: Q, tier: ViewerTier): Q {
 }
 
 /**
+ * Restrict a `tasks` query to what `tier` may see: external → only `audience='external'`.
+ * Tasks carry their tier in the `audience` column (inherited from the materializing item's
+ * `access`); same SOLE-enforcement rule as items/decisions on the postgres target (no RLS).
+ * Route every tier-scoped task read (retrieval, the v1 pull API, dashboard boxes) through here.
+ */
+export function visibleTasks<Q>(query: Q, tier: ViewerTier): Q {
+  if (tier !== "external") return query;
+  return (query as { eq(column: string, value: string): Q }).eq("audience", "external");
+}
+
+/**
  * Role-scoped visibility for `query_log` reads (CLAUDE.md §5). `query_log` rows carry a
  * `member_id`; in postgres mode there is NO RLS, so this app-code filter is the SOLE thing
  * stopping a non-admin from reading the whole team's questions and `cost_usd`. Admins see the

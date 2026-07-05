@@ -71,13 +71,11 @@ export async function ingestItem(
   const now = new Date().toISOString();
 
   if (existing && existing.content_sha256 === payload.content_sha256) {
+    // Refresh "last seen this sync"; do NOT write an audit row (audit M4). Every 30-min sync tick
+    // re-pushes every unchanged item, so an `item.unchanged` audit here added ~one row/item/tick
+    // (~24k/day at 500 items) — unbounded audit_log growth with no diagnostic value. The synced_at
+    // bump is the freshness signal; create/update/delete stay audited on the paths below.
     await supabase.from("items").update({ synced_at: now }).eq("id", existing.id);
-    await audit(supabase, {
-      team_id: auth.teamId, actor_kind: "api_key",
-      member_id: auth.memberId, api_key_id: auth.apiKeyId,
-      action: "item.unchanged", target_type: "item", target_id: existing.id,
-      meta: { path: payload.path },
-    });
     // No projection on an unchanged push (the route also guards status !== "unchanged").
     return { status: "unchanged", id: existing.id, projectId: project.id };
   }
@@ -93,7 +91,14 @@ export async function ingestItem(
     );
   }
 
-  // 3. upsert item (+ version when body changed)
+  // 3. upsert item (+ version when body changed). The item write and the row materialization below
+  // are NOT one transaction (the compat adapter can't share a pinned connection), so we WITHHOLD the
+  // new content_sha256 until materialize succeeds (audit H4). On a mid-materialize failure the item
+  // keeps its OLD sha (or, for a brand-new row, an empty sentinel a 64-hex sha can never equal), so
+  // the retry's "unchanged" fast-path above does NOT fire and the rows get re-materialized — instead
+  // of the item being marked synced while its task/decision board stays permanently diverged. The
+  // real hash is committed in one final update (step 5), the single point that marks this push synced.
+  const PENDING_SHA = ""; // real content_sha256 is 64 hex chars; "" forces reprocess after a crash
   const itemRecord = {
     team_id: auth.teamId,
     project_id: project.id,
@@ -102,7 +107,7 @@ export async function ingestItem(
     access,
     frontmatter: payload.frontmatter ?? {},
     body: payload.body,
-    content_sha256: payload.content_sha256,
+    content_sha256: existing ? existing.content_sha256 : PENDING_SHA,
     actor: payload.actor ?? "",
     member_id: opts?.authorMemberId ?? auth.memberId,
     synced_at: now,
@@ -120,13 +125,15 @@ export async function ingestItem(
     itemId = data.id;
   }
 
-  await supabase.from("item_versions").insert({
+  // Version history — surface errors (audit LOW: previously swallowed, silently losing versions).
+  const { error: versionErr } = await supabase.from("item_versions").insert({
     item_id: itemId,
     content_sha256: payload.content_sha256,
     frontmatter: payload.frontmatter ?? {},
     body: payload.body,
     member_id: auth.memberId,
   });
+  if (versionErr) throw new Error(`item version insert failed: ${versionErr.message}`);
 
   // 4. materialize rows. Present (even if empty) for task/decision items, so an emptied
   // markdown table diff-deletes its synced rows. `now` (the item's synced_at) is used as
@@ -141,12 +148,21 @@ export async function ingestItem(
         project.id,
         itemId,
         validatedTaskRows!,
-        now
+        now,
+        access
       );
     } else {
       await materializeDecisions(supabase, auth.teamId, project.id, itemId, payload.rows, now);
     }
   }
+
+  // 5. Commit the content hash LAST — marks the push durably synced (audit H4). Any throw above left
+  // the old/sentinel sha, so a retry reprocesses rather than short-circuiting on "unchanged".
+  const { error: shaErr } = await supabase
+    .from("items")
+    .update({ content_sha256: payload.content_sha256 })
+    .eq("id", itemId);
+  if (shaErr) throw new Error(`item sha commit failed: ${shaErr.message}`);
 
   await audit(supabase, {
     team_id: auth.teamId, actor_kind: "api_key",
@@ -229,7 +245,11 @@ async function materializeTasks(
   projectId: string,
   itemId: string,
   rows: TaskRow[],
-  syncedAt: string
+  syncedAt: string,
+  // Tier the materialized rows inherit (audit H1). Tasks carry no wire-level audience; a task is
+  // visible at exactly the tier of the item that produced it, so an external principal never reads
+  // internal task boards. See tasks.audience / visibleTasks.
+  audience: "team" | "external"
 ): Promise<string[]> {
   const incomingKeys = new Set(rows.map((r) => r.row_key));
   const parentOf = (r: TaskRow) => (r.parent ?? "").trim();
@@ -280,6 +300,7 @@ async function materializeTasks(
       sprint: row.sprint ?? "",
       due_date: row.due || null,
       origin: "sync",
+      audience,
       updated_at: syncedAt,
     };
     if ("assignee" in row) upsertRow.assignee = (row.assignee ?? "").trim();

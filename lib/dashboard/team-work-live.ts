@@ -2,6 +2,7 @@ import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { getArcs, type ProviderKeys } from "@/lib/graph/arcs";
 import { visibleGroupIds, type AccessTier } from "@/lib/graph/group";
+import { visibleItems, visibleTasks } from "@/lib/auth/visibility";
 import type { RosterPerson } from "./people-match";
 import { assembleTeamWork, commitSubject, type TaskLite, type CommitLite, type PersonWork } from "./team-work";
 
@@ -45,23 +46,32 @@ export async function getTeamWork(
   if (roster.length === 0) return [];
 
   const doneSinceIso = new Date(Date.now() - DONE_WINDOW_DAYS * 86_400_000).toISOString();
+  // Tier isolation (audit H1): tasks carry `audience`, git-commit items carry `access`. An external
+  // viewer of this box must not receive internal task titles or commit subjects. The `tier` param was
+  // previously used only for arcs — the task/commit queries ran unfiltered.
   const [{ data: taskRows }, { data: commitRows }, arcs] = await Promise.all([
-    supabase
-      .from("tasks")
-      .select("id, title, assignee, status, updated_at")
-      .eq("team_id", teamId)
-      .order("updated_at", { ascending: false })
-      .limit(2000),
+    visibleTasks(
+      supabase
+        .from("tasks")
+        .select("id, title, assignee, status, updated_at")
+        .eq("team_id", teamId)
+        .order("updated_at", { ascending: false })
+        .limit(2000),
+      tier
+    ),
     // Git commits are member_id-attributed (author→member at scan time) — the real "done" signal for
     // code contributors, who often have no `done` task rows. frontmatter->>source='git' + member set.
-    supabase
-      .from("items")
-      .select("id, body, member_id, frontmatter, synced_at")
-      .eq("team_id", teamId)
-      .eq("frontmatter->>source", "git")
-      .not("member_id", "is", null)
-      .order("synced_at", { ascending: false })
-      .limit(600),
+    visibleItems(
+      supabase
+        .from("items")
+        .select("id, body, member_id, frontmatter, synced_at")
+        .eq("team_id", teamId)
+        .eq("frontmatter->>source", "git")
+        .not("member_id", "is", null)
+        .order("synced_at", { ascending: false })
+        .limit(600),
+      tier
+    ),
     getArcs(teamSlug, tier, visibleGroupIds(teamSlug, tier), keys).catch(() => []),
   ]);
 

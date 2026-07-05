@@ -1,35 +1,12 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
-import { serverClient } from "@/lib/db/server";
 import { adminClient } from "@/lib/db/admin";
-import { getSessionUser } from "@/lib/auth/session";
+import { requireTeamAdmin as requireAdmin } from "@/lib/auth/guard";
 import { createMember } from "@/lib/admin/members";
 import { issueApiKey as issueApiKeyPrimitive, revokeApiKey as revokeApiKeyPrimitive } from "@/lib/admin/keys";
 import { issueMagicToken } from "@/lib/auth/pg-login";
 import { sendInviteEmail } from "@/lib/auth/mailer";
-
-/** Verify the caller is an active admin of the team; returns ids or null. */
-async function requireAdmin(teamSlug: string) {
-  const supabase = await serverClient();
-  const user = await getSessionUser();
-  if (!user) return null;
-  const { data: team } = await supabase
-    .from("teams")
-    .select("id")
-    .eq("slug", teamSlug)
-    .maybeSingle();
-  if (!team) return null;
-  const { data: me } = await supabase
-    .from("members")
-    .select("id, role")
-    .eq("team_id", team.id)
-    .eq("auth_user_id", user.id)
-    .eq("status", "active")
-    .maybeSingle();
-  if (me?.role !== "admin") return null;
-  return { teamId: team.id, myMemberId: me.id };
-}
 
 export async function inviteMember(
   teamSlug: string,
@@ -48,7 +25,7 @@ export async function inviteMember(
         actorHandle: form.actorHandle,
         role: form.role,
       },
-      { actor: { kind: "member", memberId: ctx.myMemberId } }
+      { actor: { kind: "member", memberId: ctx.memberId } }
     );
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "create failed" };
@@ -84,7 +61,7 @@ export async function issueApiKey(
 
   try {
     const { key } = await issueApiKeyPrimitive(adminClient(), ctx.teamId, memberId, name, {
-      actor: { kind: "member", memberId: ctx.myMemberId },
+      actor: { kind: "member", memberId: ctx.memberId },
     });
     revalidatePath(`/t/${teamSlug}/admin/keys`);
     return { ok: true, key };
@@ -102,7 +79,7 @@ export async function revokeApiKey(
 
   try {
     await revokeApiKeyPrimitive(adminClient(), ctx.teamId, apiKeyId, {
-      actor: { kind: "member", memberId: ctx.myMemberId },
+      actor: { kind: "member", memberId: ctx.memberId },
     });
     revalidatePath(`/t/${teamSlug}/admin/keys`);
     return { ok: true };

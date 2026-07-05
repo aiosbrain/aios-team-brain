@@ -2,8 +2,15 @@ import { type NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { loginByEmail } from "@/lib/auth/pg-login";
 import { signSession, SESSION_COOKIE, sessionCookieOptions } from "@/lib/auth/pg-session";
+import { adminClient } from "@/lib/db/admin";
+import { rateLimit } from "@/lib/api/rate-limit";
 
 export const runtime = "nodejs";
+
+// Login attempts allowed per client IP per minute (audit M2). Passwordless login returns 403-vs-200
+// by membership, so without a throttle it's a member-email enumeration oracle. Generous enough for a
+// real user retrying, tight enough to make enumeration impractical.
+const LOGIN_RATE_PER_MIN = 10;
 
 const schema = z.object({
   email: z.string().email().max(200),
@@ -27,6 +34,13 @@ export async function POST(req: NextRequest) {
   }
   const parsed = schema.safeParse(body);
   if (!parsed.success) return NextResponse.json({ error: "invalid_email" }, { status: 422 });
+
+  // Throttle by client IP before touching the DB, so login can't be used to enumerate member emails
+  // (audit M2). x-forwarded-for's first hop is the client on Railway/Vercel edge.
+  const ip = (req.headers.get("x-forwarded-for") ?? "").split(",")[0].trim() || "unknown";
+  if (!(await rateLimit(adminClient(), `login:${ip}`, LOGIN_RATE_PER_MIN))) {
+    return NextResponse.json({ error: "rate_limited" }, { status: 429 });
+  }
 
   const email = parsed.data.email.trim().toLowerCase();
   const nextParam = parsed.data.next ?? "/";

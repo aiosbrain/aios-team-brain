@@ -2,6 +2,8 @@ import type { Metadata } from "next";
 import { ListTodo } from "lucide-react";
 import { serverClient } from "@/lib/db/server";
 import { getSessionUser } from "@/lib/auth/session";
+import { currentMember } from "@/lib/auth/guard";
+import { visibleTasks } from "@/lib/auth/visibility";
 import { Board } from "@/components/kanban/board";
 import { TaskHierarchy } from "@/components/kanban/task-hierarchy";
 import { EmptyState } from "@/components/empty-state";
@@ -21,6 +23,9 @@ export default async function TasksPage({ params }: { params: Promise<{ team: st
   if (!team) return null;
 
   const user = await getSessionUser();
+  // Tier isolation (audit H1): an external-tier dashboard member must not see internal task boards.
+  const viewer = await currentMember(team.id);
+  const tier = viewer?.tier ?? "external";
 
   // PM links are fetched as a sibling query and grouped in JS rather than as an embedded resource:
   // the pg adapter (the deployed backend) only supports to-many embeds as `(count)`, so a
@@ -28,12 +33,15 @@ export default async function TasksPage({ params }: { params: Promise<{ team: st
   // works on both backends and keeps the per-task badge wiring intact.
   const [{ data: tasks }, { data: links }, { data: projects }, { data: members }, { data: me }] =
     await Promise.all([
-      supabase
-        .from("tasks")
-        .select("id, row_key, title, assignee, status, sprint, due_date, origin, project_id, updated_at, parent_row_key, labels, priority, body")
-        .eq("team_id", team.id)
-        .order("updated_at", { ascending: false })
-        .limit(500),
+      visibleTasks(
+        supabase
+          .from("tasks")
+          .select("id, row_key, title, assignee, status, sprint, due_date, origin, project_id, updated_at, parent_row_key, labels, priority, body")
+          .eq("team_id", team.id)
+          .order("updated_at", { ascending: false })
+          .limit(500),
+        tier
+      ),
       supabase
         .from("task_pm_links")
         .select("task_id, provider, provider_url, last_synced_status, last_error")
