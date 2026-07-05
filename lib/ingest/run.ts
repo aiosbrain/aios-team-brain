@@ -1,5 +1,6 @@
 import "server-only";
 import { randomUUID } from "node:crypto";
+import { timeoutFetch } from "@/lib/http";
 import type { DbClient } from "@/lib/db/types";
 import { adminClient } from "@/lib/db/admin";
 import { ingestItem } from "@/lib/ingest";
@@ -295,7 +296,7 @@ export async function runPlaneIngestion(opts: { teamId?: string } = {}): Promise
           continue;
         }
         const conn: PlaneConnection = {
-          fetchImpl: fetch,
+          fetchImpl: timeoutFetch,
           base: ((integ.config.baseUrl as string | undefined) || "https://api.plane.so").replace(/\/$/, ""),
           apiKey,
           workspaceSlug,

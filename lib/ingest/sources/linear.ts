@@ -1,6 +1,7 @@
 import "server-only";
 
 import { linearGraphql } from "@/lib/pm-sync/linear-client";
+import { timeoutFetch } from "@/lib/http";
 import type { LinearImportIssue } from "./linear-normalize";
 
 /**
@@ -56,7 +57,7 @@ export async function fetchLinearTeam(opts: {
   teamId: string;
   fetchImpl?: typeof fetch;
 }): Promise<FetchedLinearTeam> {
-  const fetchImpl = opts.fetchImpl ?? fetch;
+  const fetchImpl = opts.fetchImpl ?? timeoutFetch;
   const issues: LinearImportIssue[] = [];
   let teamKey = opts.teamId;
   let members: LinearMember[] = [];

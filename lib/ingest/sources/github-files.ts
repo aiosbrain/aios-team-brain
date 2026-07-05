@@ -1,6 +1,7 @@
 import "server-only";
 
 import { GITHUB_API, githubHeaders } from "./github";
+import { timeoutFetch } from "@/lib/http";
 import type { GithubFileRaw } from "./github-files-normalize";
 
 /**
@@ -41,7 +42,7 @@ export async function fetchGithubRepoFiles(opts: {
   fetchImpl?: typeof fetch;
   maxFiles?: number;
 }): Promise<FetchedGithubFiles> {
-  const fetchImpl = opts.fetchImpl ?? fetch;
+  const fetchImpl = opts.fetchImpl ?? timeoutFetch;
   const headers = githubHeaders(opts.token);
   const globs = (opts.globs && opts.globs.length ? opts.globs : DEFAULT_FILE_GLOBS).map(globToRegExp);
   const maxFiles = opts.maxFiles ?? 1000;

@@ -135,4 +135,27 @@ describe("runGraphProjection runner (real Postgres, mocked Graphiti)", () => {
     expect(second.projected).toBe(0);
     expect(second.skipped).toBe(2); // idempotent across the runner too
   });
+
+  // Spec for audit H2: the runner must PAGE through the whole backlog. Before the fix it re-scanned
+  // only the oldest `limit` rows every run, so items beyond that window were never projected.
+  it("pages the full backlog beyond a single batch limit (audit H2)", async () => {
+    const seed = await seedTeam();
+    for (let i = 0; i < 5; i++) {
+      await ingest(seed, { kind: "transcript", path: `slack/eng/${i}.md`, body: `thread ${i}`, access: "team" });
+      // Stamp strictly-increasing synced_at so the cursor advances deterministically (no ties).
+      await db()
+        .from("items")
+        .update({ synced_at: `2026-06-20T10:0${i}:00Z` })
+        .eq("team_id", seed.teamId)
+        .eq("path", `slack/eng/${i}.md`);
+    }
+
+    const fake = new FakeGraphiti();
+    // limit=2: without paging only the oldest 2 ever project; with the cursor all 5 do.
+    const res = await runGraphProjection({ teamId: seed.teamId, client: client(fake), supabase: db(), limit: 2 });
+    expect(res.projected).toBe(5);
+    expect(fake.pushes).toHaveLength(5);
+    const { data: state } = await db().from("graph_episodes").select("source_id").eq("team_id", seed.teamId);
+    expect((state ?? []).length).toBe(5);
+  });
 });
