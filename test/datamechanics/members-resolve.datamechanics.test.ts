@@ -102,6 +102,32 @@ describe("members + identity-resolve endpoints (real handlers, real Postgres)", 
     expect(fresh?.avatar_url).toBeNull();
   });
 
+  it("members: excludes connector service-accounts (e.g. the auto-provisioned plane-sync actor)", async () => {
+    const seed = await seedTeam();
+    const team = await issueKeyFor(seed, "team");
+    const { data: connector, error } = await db()
+      .from("members")
+      .insert({
+        team_id: seed.teamId,
+        email: "plane-sync@connector.local",
+        display_name: "Plane Sync",
+        actor_handle: "plane-sync",
+        role: "member",
+        tier: "team",
+        status: "active",
+        is_connector: true,
+      })
+      .select("id")
+      .single();
+    expect(error).toBeNull();
+    const connectorId = (connector as { id: string }).id;
+
+    const ok = await get(membersGET, MEMBERS_URL, team, seed.teamSlug);
+    const body = (await ok.json()) as { members: { id: string }[] };
+    expect(body.members.some((m) => m.id === connectorId)).toBe(false);
+    expect(body.members.some((m) => m.id === seed.memberId)).toBe(true);
+  });
+
   it("resolve: slack external_id → member; provider filter; 404 on miss", async () => {
     const seed = await seedTeam();
     const team = await issueKeyFor(seed, "team");

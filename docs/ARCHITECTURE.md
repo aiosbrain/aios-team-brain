@@ -242,7 +242,8 @@ shown for a human to pull, never silently applied. Two-way write-back remains ou
 projection engine: `lib/ingest/sources/plane.ts` + `plane-normalize.ts` pull a Plane project's
 work-items **into** the brain as tasks, run in-process by `lib/ingest/run.ts: runPlaneIngestion`
 (scheduler tick + the admin **"Sync now"** button on a Plane integration; actor = the auto-provisioned
-`plane-sync` connector member). It shares the low-level HTTP client with the outbound adapter via
+`plane-sync` connector member, `members.is_connector = true` — excluded from Admin → Members and
+`/api/v1/members` so it never renders as a human). It shares the low-level HTTP client with the outbound adapter via
 `lib/pm-sync/plane-client.ts`. Two invariants keep it from fighting the projection engine:
 > • **Dedicated brain project per Plane project** (`plane-<identifier>`). `materializeTasks`'
 > diff-delete is **project-wide**, so a Plane import must never share a project with CLI/UI tasks

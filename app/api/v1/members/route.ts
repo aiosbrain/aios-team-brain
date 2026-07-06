@@ -43,6 +43,7 @@ export async function GET(req: NextRequest) {
     .from("members")
     .select("id, email, display_name, actor_handle, github_login, avatar_url, role, tier, status")
     .eq("team_id", auth.teamId)
+    .eq("is_connector", false)
     .neq("status", "disabled");
   if (email) q = q.eq("email", email);
   if (handle) q = q.eq("actor_handle", handle);
