@@ -42,29 +42,17 @@ export async function emailHasMember(email: string): Promise<boolean> {
 }
 
 /**
- * Grant a session for an email already known to be a valid, verified sign-in (password checked,
- * or a redeemed magic token) — NOT a public entry point (callers below gate it). Ensures the auth
- * user, force-links the member to it (handles rows seeded active with a different/empty
- * auth_user_id), activates an invited row, and returns the session user.
- */
-async function grantSession(email: string): Promise<SessionUser> {
-  const id = await ensureAuthUser(email);
-  await runSql(
-    `update members
-        set auth_user_id = $1,
-            status = case when status = 'invited' then 'active' else status end
-      where email = $2 and status <> 'disabled'`,
-    [id, email]
-  );
-  return { id, email };
-}
-
-/**
  * Email+password login (audit M1/M2b — replaces the earlier trust-any-known-email passwordless
  * flow). Rejects unless: the email belongs to a non-disabled member, a password has actually been
  * set (an admin-created account with no password yet cannot be logged into), and it matches.
+ * Returns whether this was a first login (an invited row's first activation) so the caller can
+ * route through the one-time welcome screen, matching the magic-link path's behavior
+ * (`redeemMagicToken`'s `firstLogin`).
  */
-export async function loginWithPassword(email: string, password: string): Promise<SessionUser | null> {
+export async function loginWithPassword(
+  email: string,
+  password: string
+): Promise<{ user: SessionUser; firstLogin: boolean } | null> {
   if (!(await emailHasMember(email))) return null;
   const { rows } = await runSql<{ password_hash: string | null }>(
     `select password_hash from auth_users where email = $1`,
@@ -73,7 +61,22 @@ export async function loginWithPassword(email: string, password: string): Promis
   const hash = rows[0]?.password_hash;
   if (!hash) return null; // no password set yet — ask an admin, don't fall back to passwordless
   if (!(await verifyPasswordHash(password, hash))) return null;
-  return grantSession(email);
+
+  // Capture 'invited' status BEFORE the update below activates it (same pattern as redeemMagicToken).
+  const { rows: before } = await runSql<{ status: string }>(
+    `select status from members where email = $1 and status <> 'disabled' limit 1`,
+    [email]
+  );
+  const firstLogin = before[0]?.status === "invited";
+  const id = await ensureAuthUser(email);
+  await runSql(
+    `update members
+        set auth_user_id = $1,
+            status = case when status = 'invited' then 'active' else status end
+      where email = $2 and status <> 'disabled'`,
+    [id, email]
+  );
+  return { user: { id, email }, firstLogin };
 }
 
 /** Admin sets (or resets) a member's password directly — no current-password check. */

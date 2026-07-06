@@ -45,7 +45,7 @@ describe("loginWithPassword (real Postgres, invite-only, password-gated)", () =>
     expect(await loginWithPassword(email, "not-the-real-password")).toBeNull();
   });
 
-  it("signs in with the correct password, force-links the auth user, activates invited", async () => {
+  it("signs in with the correct password, force-links the auth user, activates invited, and reports firstLogin", async () => {
     const seed = await seedTeam();
     const email = "invitee@test.local";
     await db().from("members").insert({
@@ -54,9 +54,12 @@ describe("loginWithPassword (real Postgres, invite-only, password-gated)", () =>
     });
     await adminSetPassword(email, "the-real-password-123");
 
-    const user = await loginWithPassword(email, "the-real-password-123");
-    expect(user).not.toBeNull();
-    expect(user!.email).toBe(email);
+    const result = await loginWithPassword(email, "the-real-password-123");
+    expect(result).not.toBeNull();
+    expect(result!.user.email).toBe(email);
+    // Was 'invited' before this login — this is the activation, so the caller should route
+    // through the one-time welcome screen (audit-adjacent: matches redeemMagicToken's behavior).
+    expect(result!.firstLogin).toBe(true);
 
     // Outcome in the DB: activated + linked to the same auth user the session carries.
     const { data } = await db()
@@ -65,6 +68,10 @@ describe("loginWithPassword (real Postgres, invite-only, password-gated)", () =>
       .eq("email", email)
       .maybeSingle();
     expect(data!.status).toBe("active");
-    expect(data!.auth_user_id).toBe(user!.id);
+    expect(data!.auth_user_id).toBe(result!.user.id);
+
+    // A second login is NOT a first login — the member is already active.
+    const second = await loginWithPassword(email, "the-real-password-123");
+    expect(second!.firstLogin).toBe(false);
   });
 });

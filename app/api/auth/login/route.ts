@@ -46,12 +46,16 @@ export async function POST(req: NextRequest) {
   const nextParam = parsed.data.next ?? "/";
   const safeNext = nextParam.startsWith("/") && !nextParam.startsWith("//") ? nextParam : "/";
 
-  const user = await loginWithPassword(email, parsed.data.password);
-  if (!user) {
+  const result = await loginWithPassword(email, parsed.data.password);
+  if (!result) {
     return NextResponse.json({ error: "invalid_credentials" }, { status: 401 });
   }
 
-  const res = NextResponse.json({ ok: true, redirect: safeNext });
-  res.cookies.set(SESSION_COOKIE, await signSession(user), sessionCookieOptions());
+  // First login (an invite's first activation): route through the one-time welcome screen instead
+  // of dropping straight onto the dashboard — same behavior as the magic-link path (/auth/confirm).
+  const redirect = result.firstLogin ? `/auth/welcome?next=${encodeURIComponent(safeNext)}` : safeNext;
+
+  const res = NextResponse.json({ ok: true, redirect });
+  res.cookies.set(SESSION_COOKIE, await signSession(result.user), sessionCookieOptions());
   return res;
 }

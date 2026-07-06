@@ -24,9 +24,9 @@ describe("changePassword (real Postgres, self-service)", () => {
     expect(changed).toBe(true);
 
     expect(await loginWithPassword(email, "old-password-123")).toBeNull();
-    const user = await loginWithPassword(email, "new-password-456");
-    expect(user).not.toBeNull();
-    expect(user!.email).toBe(email);
+    const result = await loginWithPassword(email, "new-password-456");
+    expect(result).not.toBeNull();
+    expect(result!.user.email).toBe(email);
   });
 
   it("refuses to change the password when the current one is wrong, and leaves it unchanged", async () => {
