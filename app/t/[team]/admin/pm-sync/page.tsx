@@ -8,8 +8,8 @@ export const metadata: Metadata = { title: "PM sync" };
 
 export default async function PmSyncPage({ params }: { params: Promise<{ team: string }> }) {
   const { team: teamSlug } = await params;
-  const supabase = await serverClient();
-  const { data: team } = await supabase
+  const db = await serverClient();
+  const { data: team } = await db
     .from("teams")
     .select("id, primary_pm_provider")
     .eq("slug", teamSlug)
@@ -17,14 +17,14 @@ export default async function PmSyncPage({ params }: { params: Promise<{ team: s
   if (!team) return null;
 
   const [{ data: unresolved }, { data: failedLinks }, inboundRows] = await Promise.all([
-    supabase
+    db
       .from("work_events")
       .select("row_key, repo, merged_sha, pr_url, pr_title, error, created_at")
       .eq("team_id", team.id)
       .eq("status", "unresolved")
       .order("created_at", { ascending: false })
       .limit(50),
-    supabase
+    db
       .from("task_pm_links")
       .select("row_key, provider, provider_external_id, provider_url, last_error, updated_at")
       .eq("team_id", team.id)
@@ -34,7 +34,7 @@ export default async function PmSyncPage({ params }: { params: Promise<{ team: s
     // Inbound divergence (brain-api v1.4): the enriched read the inbound engine itself uses —
     // links + task rows + the exact brain-status baseline — so the page deterministically
     // recomputes "conflict (both changed)" vs "pending apply" from persisted data alone.
-    loadInboundRows(supabase, team.id),
+    loadInboundRows(db, team.id),
   ]);
 
   const divergences = inboundRows

@@ -9,10 +9,10 @@ import { createPolicy, updatePolicy, setPolicyEnabled, deletePolicy, type Policy
 
 /** Admin gate (same shared resolver the other admin actions use). */
 async function requireAdmin(teamSlug: string) {
-  const supabase = await serverClient();
+  const db = await serverClient();
   const user = await getSessionUser();
   if (!user) return null;
-  return resolveIntegrationsAdmin(supabase, teamSlug, user.id);
+  return resolveIntegrationsAdmin(db, teamSlug, user.id);
 }
 
 export type PolicyForm = PolicyInput & { id?: string };

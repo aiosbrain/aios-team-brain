@@ -32,11 +32,11 @@ async function slackAuthTest(token: string) {
 export async function GET(req: NextRequest) {
   const auth = await authenticateApiKey(req);
   if (!auth) return errorResponse("unauthorized", "invalid API key or team", 401);
-  const supabase = adminClient();
-  if (!(await rateLimit(supabase, `${auth.apiKeyId}:me:slack-token`, 60))) {
+  const db = adminClient();
+  if (!(await rateLimit(db, `${auth.apiKeyId}:me:slack-token`, 60))) {
     return errorResponse("rate_limited", "60 reads/min per key", 429);
   }
-  const rec = await getMemberSecret(supabase, auth.teamId, auth.memberId, "slack");
+  const rec = await getMemberSecret(db, auth.teamId, auth.memberId, "slack");
   if (!rec) {
     return Response.json({ connected: false, error: "not_connected" }, { status: 404, headers: NO_STORE });
   }
@@ -54,8 +54,8 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   const auth = await authenticateApiKey(req);
   if (!auth) return errorResponse("unauthorized", "invalid API key or team", 401);
-  const supabase = adminClient();
-  if (!(await rateLimit(supabase, `${auth.apiKeyId}:me:slack-token:write`, 20))) {
+  const db = adminClient();
+  if (!(await rateLimit(db, `${auth.apiKeyId}:me:slack-token:write`, 20))) {
     return errorResponse("rate_limited", "20 writes/min per key", 429);
   }
 
@@ -75,7 +75,7 @@ export async function POST(req: NextRequest) {
     return errorResponse("invalid_token", `Slack rejected the token (${test.error ?? "auth.test failed"})`, 422);
   }
 
-  await setMemberSecret(supabase, { teamId: auth.teamId, memberId: auth.memberId }, "slack", token, {
+  await setMemberSecret(db, { teamId: auth.teamId, memberId: auth.memberId }, "slack", token, {
     slack_user_id: test.user_id,
     workspace: test.team ?? null,
     workspace_id: test.team_id ?? null,
@@ -83,7 +83,7 @@ export async function POST(req: NextRequest) {
   });
 
   // Capture the member's Slack identity so `slack dm --member` + resolve work afterward.
-  const { data: m } = await supabase
+  const { data: m } = await db
     .from("members")
     .select("email")
     .eq("team_id", auth.teamId)
@@ -91,7 +91,7 @@ export async function POST(req: NextRequest) {
     .maybeSingle();
   try {
     await setMemberIdentity(
-      supabase,
+      db,
       auth.teamId,
       auth.memberId,
       { provider: "slack", externalId: test.user_id, handle: test.user ?? "", email: (m?.email as string) ?? "" },
@@ -110,7 +110,7 @@ export async function POST(req: NextRequest) {
 export async function DELETE(req: NextRequest) {
   const auth = await authenticateApiKey(req);
   if (!auth) return errorResponse("unauthorized", "invalid API key or team", 401);
-  const supabase = adminClient();
-  await deleteMemberSecret(supabase, { teamId: auth.teamId, memberId: auth.memberId }, "slack");
+  const db = adminClient();
+  await deleteMemberSecret(db, { teamId: auth.teamId, memberId: auth.memberId }, "slack");
   return Response.json({ ok: true, connected: false }, { headers: NO_STORE });
 }

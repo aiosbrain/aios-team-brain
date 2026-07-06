@@ -9,10 +9,10 @@ import { resolveApproval } from "@/lib/actions";
 import { createE2BSandbox } from "@/lib/actions/sandbox/e2b";
 
 async function requireAdmin(teamSlug: string) {
-  const supabase = await serverClient();
+  const db = await serverClient();
   const user = await getSessionUser();
   if (!user) return null;
-  return resolveIntegrationsAdmin(supabase, teamSlug, user.id);
+  return resolveIntegrationsAdmin(db, teamSlug, user.id);
 }
 
 /**

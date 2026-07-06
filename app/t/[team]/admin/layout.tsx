@@ -11,18 +11,18 @@ export default async function AdminLayout({
   params: Promise<{ team: string }>;
 }) {
   const { team: teamSlug } = await params;
-  const supabase = await serverClient();
+  const db = await serverClient();
 
   const user = await getSessionUser();
 
-  const { data: team } = await supabase
+  const { data: team } = await db
     .from("teams")
     .select("id")
     .eq("slug", teamSlug)
     .maybeSingle();
 
   const { data: me } = team
-    ? await supabase
+    ? await db
         .from("members")
         .select("role")
         .eq("team_id", team.id)

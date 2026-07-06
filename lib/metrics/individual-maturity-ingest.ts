@@ -14,14 +14,14 @@ import { placement, type AemPlacement } from "@/lib/metrics/individual-maturity"
  * maturity.ts so the maturity-tier-filter guard only polices reads.
  */
 export async function ingestMaturitySnapshot(
-  supabase: DbClient,
+  db: DbClient,
   auth: { teamId: string; memberId: string; apiKeyId: string },
   payload: MaturitySnapshotPayload
 ): Promise<{ snapshot_id: string; member_id: string; canonical: AemPlacement }> {
   // Resolve the member: an explicit handle must map to a team member; else self.
   let memberId = auth.memberId;
   if (payload.member) {
-    const map = await buildIdentityMap(supabase, auth.teamId);
+    const map = await buildIdentityMap(db, auth.teamId);
     const resolved = resolveMember(map, { key: payload.member });
     if (!resolved) throw new IngestValidationError(`unknown member handle '${payload.member}'`);
     memberId = resolved;
@@ -30,7 +30,7 @@ export async function ingestMaturitySnapshot(
   const s = payload.signals;
   const canonical = placement(s);
 
-  const { data, error } = await supabase
+  const { data, error } = await db
     .from("agentic_maturity_snapshots")
     .upsert(
       {
@@ -73,7 +73,7 @@ export async function ingestMaturitySnapshot(
     .single();
   if (error || !data) throw new Error(`maturity snapshot upsert failed: ${error?.message}`);
 
-  await audit(supabase, {
+  await audit(db, {
     team_id: auth.teamId,
     actor_kind: "api_key",
     member_id: auth.memberId,

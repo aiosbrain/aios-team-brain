@@ -65,14 +65,14 @@ async function slackAuthTest(token: string): Promise<AuthTest> {
 }
 
 export async function GET(req: NextRequest) {
-  const supabase = adminClient();
+  const db = adminClient();
   const params = new URL(req.url).searchParams;
   const code = params.get("code");
   const state = params.get("state");
   const errorParam = params.get("error");
 
   const clientIp = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || "unknown";
-  if (!(await rateLimit(supabase, `slack-oauth:callback:${clientIp}`, 30))) {
+  if (!(await rateLimit(db, `slack-oauth:callback:${clientIp}`, 30))) {
     return htmlPage(429, "Too many attempts", "Please wait a minute and try connecting Slack again.");
   }
 
@@ -84,7 +84,7 @@ export async function GET(req: NextRequest) {
   }
 
   // Verify + consume the single-use state FIRST (CSRF/replay guard). Invalid/expired/used → stop.
-  const bound = await consumeSlackOAuthState(supabase, state);
+  const bound = await consumeSlackOAuthState(db, state);
   if (!bound) return denied();
 
   // User declined consent (Slack sends ?error with no code): nonce already consumed, store nothing.
@@ -101,7 +101,7 @@ export async function GET(req: NextRequest) {
     return htmlPage(422, "Slack connection failed", "Slack did not return a valid user token. You can close this tab and try again.");
   }
 
-  await setMemberSecret(supabase, { teamId: bound.teamId, memberId: bound.memberId }, "slack", token, {
+  await setMemberSecret(db, { teamId: bound.teamId, memberId: bound.memberId }, "slack", token, {
     slack_user_id: test.user_id,
     workspace: test.team ?? null,
     workspace_id: test.team_id ?? null,
@@ -109,7 +109,7 @@ export async function GET(req: NextRequest) {
   });
 
   // Capture the member's Slack identity so resolve + `slack dm --member` work afterward (best-effort).
-  const { data: m } = await supabase
+  const { data: m } = await db
     .from("members")
     .select("email")
     .eq("team_id", bound.teamId)
@@ -117,7 +117,7 @@ export async function GET(req: NextRequest) {
     .maybeSingle();
   try {
     await setMemberIdentity(
-      supabase,
+      db,
       bound.teamId,
       bound.memberId,
       { provider: "slack", externalId: test.user_id, handle: test.user ?? "", email: (m?.email as string) ?? "" },

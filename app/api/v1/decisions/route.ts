@@ -16,15 +16,15 @@ export async function GET(req: NextRequest) {
   const auth = await authenticateApiKey(req);
   if (!auth) return errorResponse("unauthorized", "invalid API key or team", 401);
 
-  const supabase = adminClient();
-  if (!(await rateLimit(supabase, `${auth.apiKeyId}:decisions:get`, 60))) {
+  const db = adminClient();
+  if (!(await rateLimit(db, `${auth.apiKeyId}:decisions:get`, 60))) {
     return errorResponse("rate_limited", "60 pulls/min per key", 429);
   }
 
   const since = new URL(req.url).searchParams.get("since") || "1970-01-01T00:00:00Z";
 
   try {
-    const decisions = await getDecisionWriteback(supabase, auth.teamId, auth.memberTier, since);
+    const decisions = await getDecisionWriteback(db, auth.teamId, auth.memberTier, since);
     return Response.json({ decisions, next_cursor: null });
   } catch (e) {
     return errorResponse("internal", e instanceof Error ? e.message : "writeback failed", 500);

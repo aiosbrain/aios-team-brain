@@ -23,13 +23,13 @@ export interface IntegrationAuth {
 }
 
 export async function upsertIntegration(
-  supabase: DbClient,
+  db: DbClient,
   auth: IntegrationAuth,
   input: IntegrationInput
 ): Promise<{ id: string; status: string }> {
   const config = validateIntegrationConfig(input.type, input.config); // throws IntegrationConfigError → 400
   const now = new Date().toISOString();
-  const { data, error } = await supabase
+  const { data, error } = await db
     .from("integrations")
     .upsert(
       {
@@ -47,7 +47,7 @@ export async function upsertIntegration(
     .single();
   if (error || !data) throw new Error(`integration upsert failed: ${error?.message}`);
 
-  await audit(supabase, {
+  await audit(db, {
     team_id: auth.teamId,
     actor_kind: "member",
     member_id: auth.memberId,
@@ -60,18 +60,18 @@ export async function upsertIntegration(
 }
 
 export async function setIntegrationStatus(
-  supabase: DbClient,
+  db: DbClient,
   auth: IntegrationAuth,
   id: string,
   status: "enabled" | "disabled"
 ): Promise<void> {
-  const { error } = await supabase
+  const { error } = await db
     .from("integrations")
     .update({ status, updated_at: new Date().toISOString() })
     .eq("id", id)
     .eq("team_id", auth.teamId); // team-scope the write — no cross-team mutation
   if (error) throw new Error(`integration status update failed: ${error.message}`);
-  await audit(supabase, {
+  await audit(db, {
     team_id: auth.teamId,
     actor_kind: "member",
     member_id: auth.memberId,
@@ -83,17 +83,17 @@ export async function setIntegrationStatus(
 }
 
 export async function deleteIntegration(
-  supabase: DbClient,
+  db: DbClient,
   auth: IntegrationAuth,
   id: string
 ): Promise<void> {
-  const { error } = await supabase
+  const { error } = await db
     .from("integrations")
     .delete()
     .eq("id", id)
     .eq("team_id", auth.teamId);
   if (error) throw new Error(`integration delete failed: ${error.message}`);
-  await audit(supabase, {
+  await audit(db, {
     team_id: auth.teamId,
     actor_kind: "member",
     member_id: auth.memberId,
@@ -110,18 +110,18 @@ export async function deleteIntegration(
  * never the value).
  */
 export async function setIntegrationSecret(
-  supabase: DbClient,
+  db: DbClient,
   auth: IntegrationAuth,
   id: string,
   secret: string
 ): Promise<void> {
-  const { error } = await supabase
+  const { error } = await db
     .from("integrations")
     .update({ secret_ciphertext: encryptSecret(secret), updated_at: new Date().toISOString() })
     .eq("id", id)
     .eq("team_id", auth.teamId);
   if (error) throw new Error(`integration secret update failed: ${error.message}`);
-  await audit(supabase, {
+  await audit(db, {
     team_id: auth.teamId,
     actor_kind: "member",
     member_id: auth.memberId,
@@ -145,10 +145,10 @@ export interface IntegrationWithSecret {
  * from the connector-key-authenticated endpoint (GET /api/v1/integrations) — never a page.
  */
 export async function getEnabledIntegrationsWithSecrets(
-  supabase: DbClient,
+  db: DbClient,
   teamId: string
 ): Promise<IntegrationWithSecret[]> {
-  const { data, error } = await supabase
+  const { data, error } = await db
     .from("integrations")
     .select("id, type, name, config, secret_ciphertext")
     .eq("team_id", teamId)
@@ -170,11 +170,11 @@ export async function getEnabledIntegrationsWithSecrets(
  * Never reaches a browser; the key is decrypted only here, in-process.
  */
 export async function getProviderKey(
-  supabase: DbClient,
+  db: DbClient,
   teamId: string,
   type: ProviderIntegrationType
 ): Promise<string | null> {
-  const { data, error } = await supabase
+  const { data, error } = await db
     .from("integrations")
     .select("secret_ciphertext")
     .eq("team_id", teamId)
@@ -206,10 +206,10 @@ export interface IntegrationSelection {
  * helpers are all admin-role-gated). Team-scoped: only the caller's `teamId` is returned.
  */
 export async function listEnabledIntegrationSelections(
-  supabase: DbClient,
+  db: DbClient,
   teamId: string
 ): Promise<IntegrationSelection[]> {
-  const { data, error } = await supabase
+  const { data, error } = await db
     .from("integrations")
     .select("id, type, name, config, status") // NOTE: no secret_ciphertext — by design
     .eq("team_id", teamId)

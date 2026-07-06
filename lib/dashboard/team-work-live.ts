@@ -28,13 +28,13 @@ function toRoster(
  * unavailable, so the box still shows tasks. Returns only people who have SOME signal.
  */
 export async function getTeamWork(
-  supabase: DbClient,
+  db: DbClient,
   teamId: string,
   teamSlug: string,
   tier: AccessTier,
   keys: ProviderKeys
 ): Promise<PersonWork[]> {
-  const { data: members } = await supabase
+  const { data: members } = await db
     .from("members")
     .select("id, display_name, actor_handle, email")
     .eq("team_id", teamId)
@@ -46,7 +46,7 @@ export async function getTeamWork(
 
   const doneSinceIso = new Date(Date.now() - DONE_WINDOW_DAYS * 86_400_000).toISOString();
   const [{ data: taskRows }, { data: commitRows }, arcs] = await Promise.all([
-    supabase
+    db
       .from("tasks")
       .select("id, title, assignee, status, updated_at")
       .eq("team_id", teamId)
@@ -54,7 +54,7 @@ export async function getTeamWork(
       .limit(2000),
     // Git commits are member_id-attributed (author→member at scan time) — the real "done" signal for
     // code contributors, who often have no `done` task rows. frontmatter->>source='git' + member set.
-    supabase
+    db
       .from("items")
       .select("id, body, member_id, frontmatter, synced_at")
       .eq("team_id", teamId)

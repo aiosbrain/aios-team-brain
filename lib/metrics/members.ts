@@ -65,7 +65,7 @@ const UNATTRIBUTED = "Unattributed";
  * through `scopeQueryLog`: admins get team-wide rows, everyone else only their own.
  */
 export async function getPerMemberCosts(
-  supabase: DbClient,
+  db: DbClient,
   teamId: string,
   range: Range,
   viewer: QueryLogViewer
@@ -74,7 +74,7 @@ export async function getPerMemberCosts(
 
   const [logRes, membersRes] = await Promise.all([
     scopeQueryLog(
-      supabase
+      db
         .from("query_log")
         .select("member_id, input_tokens, output_tokens, cache_read_tokens, cost_usd, created_at")
         .eq("team_id", teamId)
@@ -83,7 +83,7 @@ export async function getPerMemberCosts(
         .limit(50_000),
       viewer
     ),
-    supabase
+    db
       .from("members")
       .select("id, display_name, actor_handle, github_login, avatar_url")
       .eq("team_id", teamId),
@@ -170,7 +170,7 @@ export interface ThroughputCost {
  * authors have no member_id to attribute spend to).
  */
 export async function getThroughputVsCost(
-  supabase: DbClient,
+  db: DbClient,
   teamId: string,
   range: Range,
   viewer: QueryLogViewer
@@ -180,7 +180,7 @@ export async function getThroughputVsCost(
 
   // Contributions are restricted to the viewer's own member_id for non-admins (mirrors the
   // query_log scoping — a member must not see another member's throughput). Admins: team-wide.
-  let contribQuery = supabase
+  let contribQuery = db
     .from("code_contributions")
     .select("member_id, commits, ai_commits")
     .eq("team_id", teamId)
@@ -191,7 +191,7 @@ export async function getThroughputVsCost(
 
   const [contribRes, costs] = await Promise.all([
     contribQuery,
-    getPerMemberCosts(supabase, teamId, range, viewer),
+    getPerMemberCosts(db, teamId, range, viewer),
   ]);
 
   const contribRows = (contribRes.data ?? []) as {
@@ -230,7 +230,7 @@ export async function getThroughputVsCost(
   // (e.g. a member with commits but zero brain queries in the window).
   const missing = [...byMember.values()].filter((r) => r.member_name === "Member");
   if (missing.length) {
-    const { data: meta } = await supabase
+    const { data: meta } = await db
       .from("members")
       .select("id, display_name, actor_handle, avatar_url")
       .eq("team_id", teamId)

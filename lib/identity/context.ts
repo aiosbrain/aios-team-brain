@@ -102,7 +102,7 @@ function assigneeMatches(assignee: string, names: string[]): boolean {
  * resolves handle→member via getMemberProfile, so resolution isn't duplicated here).
  */
 export async function getMemberContext(
-  supabase: DbClient,
+  db: DbClient,
   teamId: string,
   memberId: string,
   tier: ViewerTier
@@ -110,7 +110,7 @@ export async function getMemberContext(
   if (!canSeeMemberContext(tier)) return null;
 
   // Member name/handle drive the derived-projects match against tasks.assignee (free text).
-  const { data: member } = await supabase
+  const { data: member } = await db
     .from("members")
     .select("display_name, actor_handle")
     .eq("team_id", teamId)
@@ -123,19 +123,19 @@ export async function getMemberContext(
     .map((n) => n.toLowerCase());
 
   const [profileRes, timeOffRes, goalsRes] = await Promise.all([
-    supabase
+    db
       .from("member_profiles")
       .select("timezone, working_hours, preferred_channels, location, bio")
       .eq("team_id", teamId)
       .eq("member_id", memberId)
       .maybeSingle(),
-    supabase
+    db
       .from("member_time_off")
       .select("id, starts_on, ends_on, kind, note")
       .eq("team_id", teamId)
       .eq("member_id", memberId)
       .order("starts_on", { ascending: true }),
-    supabase
+    db
       .from("member_goals")
       .select("id, kind, title, detail, status, target_date, source")
       .eq("team_id", teamId)
@@ -192,19 +192,19 @@ export async function getMemberContext(
     source: r.source,
   }));
 
-  const projects = await deriveProjects(supabase, teamId, names);
+  const projects = await deriveProjects(db, teamId, names);
 
   return { profile, timeOff, goals, projects };
 }
 
 /** Distinct projects this member is assigned tasks in, with open/total counts. */
 async function deriveProjects(
-  supabase: DbClient,
+  db: DbClient,
   teamId: string,
   names: string[]
 ): Promise<ProjectView[]> {
   if (!names.length) return [];
-  const { data: tasks } = await supabase
+  const { data: tasks } = await db
     .from("tasks")
     .select("project_id, assignee, status")
     .eq("team_id", teamId);
@@ -220,7 +220,7 @@ async function deriveProjects(
   }
   if (!byProject.size) return [];
 
-  const { data: projects } = await supabase
+  const { data: projects } = await db
     .from("projects")
     .select("id, slug, name")
     .eq("team_id", teamId)

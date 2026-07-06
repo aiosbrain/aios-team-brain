@@ -58,11 +58,11 @@ describe("single-writer: items / item_versions", () => {
 
   it("the matcher discriminates (non-vacuity)", () => {
     const W = () => new RegExp(WRITE_RE.source, "g");
-    expect(W().test('await supabase.from("items").insert(rec)')).toBe(true);
-    expect(W().test('await supabase.from("item_versions")\n  .update(x)')).toBe(true);
+    expect(W().test('await db.from("items").insert(rec)')).toBe(true);
+    expect(W().test('await db.from("item_versions")\n  .update(x)')).toBe(true);
     // reads must NOT trip it
-    expect(W().test('supabase.from("items").select("id").eq("team_id", t)')).toBe(false);
+    expect(W().test('db.from("items").select("id").eq("team_id", t)')).toBe(false);
     // a different table must NOT trip it
-    expect(W().test('supabase.from("tasks").upsert(row)')).toBe(false);
+    expect(W().test('db.from("tasks").upsert(row)')).toBe(false);
   });
 });

@@ -19,10 +19,10 @@ const PROVIDERS = new Set(["slack", "linear", "plane"]);
  * is the shared team-admin resolver). Returns null for any non-admin/unknown/wrong-team caller.
  */
 async function requireAdmin(teamSlug: string) {
-  const supabase = await serverClient();
+  const db = await serverClient();
   const user = await getSessionUser();
   if (!user) return null;
-  return resolveIntegrationsAdmin(supabase, teamSlug, user.id);
+  return resolveIntegrationsAdmin(db, teamSlug, user.id);
 }
 
 /**

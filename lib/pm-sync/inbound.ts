@@ -158,8 +158,8 @@ export function classifyInboundRow(row: InboundRow): InboundRowState {
  * Load every Linear link for the team enriched with its task row, outbound-identical parent
  * resolution, the recomputed fingerprint, and the two-check `brainUnchanged` verdict.
  */
-export async function loadInboundRows(supabase: DbClient, teamId: string): Promise<InboundRow[]> {
-  const { data: linkData } = await supabase
+export async function loadInboundRows(db: DbClient, teamId: string): Promise<InboundRow[]> {
+  const { data: linkData } = await db
     .from("task_pm_links")
     .select(INBOUND_LINK_COLS)
     .eq("team_id", teamId)
@@ -170,7 +170,7 @@ export async function loadInboundRows(supabase: DbClient, teamId: string): Promi
   const taskIds = links.map((l) => l.task_id).filter((v): v is string => !!v);
   const tasksById = new Map<string, ProjectionTaskRow>();
   if (taskIds.length) {
-    const { data: taskData } = await supabase
+    const { data: taskData } = await db
       .from("tasks")
       .select(PROJECTION_TASK_COLS)
       .eq("team_id", teamId)
@@ -266,12 +266,12 @@ async function applyStatusTx(args: {
 }
 
 async function applyInbound(
-  supabase: DbClient,
+  db: DbClient,
   teamId: string,
   seenByResource: Map<string, SeenState>,
   result: InboundResult
 ): Promise<void> {
-  const rows = await loadInboundRows(supabase, teamId);
+  const rows = await loadInboundRows(db, teamId);
   for (const row of rows) {
     const { link, task } = row;
     if (!link.provider_resource_id) continue; // never projected/adopted — nothing to reconcile
@@ -283,7 +283,7 @@ async function applyInbound(
 
     // Persist the freshly-seen state name (write-if-changed — same semantics as reconcile.ts).
     if (seen.name !== link.provider_seen_status) {
-      await supabase
+      await db
         .from("task_pm_links")
         .update({ provider_seen_status: seen.name, updated_at: new Date().toISOString() })
         .eq("id", link.id);
@@ -309,7 +309,7 @@ async function applyInbound(
       // Renamed/deleted state with no resolvable group → conflict, not an apply (v1.4 normative).
       const reason = `unresolvable Linear state "${seen.name}" (type "${seen.type}")`;
       result.conflicts.push(conflictOf(link, seen.name, task.status, reason));
-      await supabase
+      await db
         .from("task_pm_links")
         .update({ last_error: `inbound: ${reason}`.slice(0, 1000), updated_at: new Date().toISOString() })
         .eq("id", link.id);
@@ -366,7 +366,7 @@ function topoIssues(issues: LinearImportIssue[]): LinearImportIssue[] {
 }
 
 async function adoptInbound(
-  supabase: DbClient,
+  db: DbClient,
   teamId: string,
   primary: ResolvedPrimary,
   fetched: FetchedLinearTeam,
@@ -377,7 +377,7 @@ async function adoptInbound(
   if ((ADOPT_TIER as string) !== "team") throw new Error("inbound adopt must be team-tier");
 
   const mirrorSlug = linearMirrorProject(fetched.teamKey);
-  const { data: proj } = await supabase
+  const { data: proj } = await db
     .from("projects")
     .select("id")
     .eq("team_id", teamId)
@@ -390,7 +390,7 @@ async function adoptInbound(
   const projectId = (proj as { id: string }).id;
 
   // Links for dedupe (owned node ids) + outbound-identical parent resolution within the mirror.
-  const { data: linkData } = await supabase
+  const { data: linkData } = await db
     .from("task_pm_links")
     .select("project_id, row_key, provider_resource_id")
     .eq("team_id", teamId)
@@ -408,7 +408,7 @@ async function adoptInbound(
   const externalSource = (primary.integration.config?.externalSource as string | undefined) || "aios-backlog";
 
   for (const it of candidates) {
-    const { data: taskData } = await supabase
+    const { data: taskData } = await db
       .from("tasks")
       .select(PROJECTION_TASK_COLS)
       .eq("team_id", teamId)
@@ -500,15 +500,15 @@ async function adoptInbound(
 
 /**
  * Run the full inbound pass (apply + adopt) for one team. Fail-soft at every gate: no Linear
- * primary / no opt-in / no teamId / supabase legacy backend all return an explanatory reason
- * instead of throwing (matching the ingest runner's surfaced-reason pattern).
+ * primary / no opt-in / no teamId all return an explanatory reason instead of throwing (matching
+ * the ingest runner's surfaced-reason pattern).
  */
 export async function runInboundForTeam(
-  supabase: DbClient,
+  db: DbClient,
   teamId: string,
   opts: { fetchImpl?: typeof fetch } = {}
 ): Promise<InboundResult> {
-  const primary = await resolvePrimaryProvider(supabase, teamId);
+  const primary = await resolvePrimaryProvider(db, teamId);
   if (primary.provider !== "linear") {
     return emptyResult({ provider: null, reason: primary.provider === null ? (primary.reason ?? "no primary PM provider") : "inbound apply is Linear-only" });
   }
@@ -536,7 +536,7 @@ export async function runInboundForTeam(
 
   // Phase A — apply. One read-only provider listing ({name,type} per issue id).
   const seenByResource = await linearAdapter.fetchSeenStates!({ integration: primary.integration, fetchImpl });
-  await applyInbound(supabase, teamId, seenByResource, result);
+  await applyInbound(db, teamId, seenByResource, result);
 
   // Phase B — adopt. Reuses the ingest fetch (identifier/description/url, footer detection).
   const fetched = await fetchLinearTeam({
@@ -544,7 +544,7 @@ export async function runInboundForTeam(
     teamId: teamIdConfig,
     fetchImpl,
   });
-  await adoptInbound(supabase, teamId, primary, fetched, result, fetchImpl);
+  await adoptInbound(db, teamId, primary, fetched, result, fetchImpl);
 
   return result;
 }
@@ -585,12 +585,12 @@ export async function runLinearInbound(
   if (inboundRunning) return { ...summary, skipped: true };
   inboundRunning = true;
   try {
-    const supabase = adminClient();
+    const db = adminClient();
     let teamIds: string[];
     if (opts.teamId) {
       teamIds = [opts.teamId];
     } else {
-      const { data } = await supabase
+      const { data } = await db
         .from("integrations")
         .select("team_id")
         .eq("type", "linear")
@@ -599,7 +599,7 @@ export async function runLinearInbound(
     }
     for (const teamId of teamIds) {
       try {
-        const r = await runInboundForTeam(supabase, teamId, { fetchImpl: opts.fetchImpl });
+        const r = await runInboundForTeam(db, teamId, { fetchImpl: opts.fetchImpl });
         if (!r.enabled) continue; // not opted in / not Linear — quiet no-op
         summary.teams += 1;
         summary.applied += r.applied.length;

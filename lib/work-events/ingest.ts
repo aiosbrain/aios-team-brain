@@ -33,13 +33,13 @@ function eventKeys(payload: WorkEventPayload): string[] {
 }
 
 export async function ingestWorkEvent(
-  supabase: DbClient,
+  db: DbClient,
   auth: WorkEventAuth,
   payload: WorkEventPayload,
   opts: { syncPm?: boolean; fetchImpl?: typeof fetch } = {}
 ): Promise<WorkEventIngestResult> {
   const now = new Date().toISOString();
-  const { data: project } = await supabase
+  const { data: project } = await db
     .from("projects")
     .select("id")
     .eq("team_id", auth.teamId)
@@ -53,7 +53,7 @@ export async function ingestWorkEvent(
 
   for (const rowKey of eventKeys(payload)) {
     const { data: task } = projectId
-      ? await supabase
+      ? await db
           .from("tasks")
           .select("id, team_id, project_id, row_key")
           .eq("team_id", auth.teamId)
@@ -65,7 +65,7 @@ export async function ingestWorkEvent(
     const found = task as { id: string; team_id: string; project_id: string; row_key: string } | null;
     const status = found ? "applied" : "unresolved";
 
-    const { data: event, error: eventErr } = await supabase
+    const { data: event, error: eventErr } = await db
       .from("work_events")
       .upsert(
         {
@@ -92,7 +92,7 @@ export async function ingestWorkEvent(
 
     if (!found) {
       unresolved.push({ row_key: rowKey });
-      await audit(supabase, {
+      await audit(db, {
         team_id: auth.teamId,
         actor_kind: "api_key",
         member_id: auth.memberId,
@@ -105,7 +105,7 @@ export async function ingestWorkEvent(
       continue;
     }
 
-    const { error: taskErr } = await supabase
+    const { error: taskErr } = await db
       .from("tasks")
       .update({ status: "done", updated_at: now })
       .eq("id", found.id)
@@ -113,7 +113,7 @@ export async function ingestWorkEvent(
     if (taskErr) throw new Error(`task completion update failed: ${taskErr.message}`);
     applied.push({ row_key: rowKey, task_id: found.id });
 
-    await audit(supabase, {
+    await audit(db, {
       team_id: auth.teamId,
       actor_kind: "api_key",
       member_id: auth.memberId,
@@ -127,13 +127,13 @@ export async function ingestWorkEvent(
     if (opts.syncPm !== false) {
       // Full projection (not done-only): load the now-done task row and project it through the
       // upsert path so a task with no pre-existing link/item still gets created + linked.
-      const { data: fullRow } = await supabase
+      const { data: fullRow } = await db
         .from("tasks")
         .select("id, team_id, project_id, row_key, title, status, sprint, priority, labels, body, parent_row_key")
         .eq("id", found.id)
         .maybeSingle();
       if (fullRow) {
-        const report = await projectTask(supabase, fullRow as ProjectionTaskRow, { fetchImpl: opts.fetchImpl });
+        const report = await projectTask(db, fullRow as ProjectionTaskRow, { fetchImpl: opts.fetchImpl });
         pm_sync.push(projectionToSyncReport(report));
       }
     }

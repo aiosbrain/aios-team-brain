@@ -41,7 +41,7 @@ export type RunActionOutcome = {
 type ExecOpts = { handlers?: ActionHandler[]; sandbox?: SandboxRunner };
 
 export async function runAction(
-  supabase: DbClient,
+  db: DbClient,
   input: RunActionInput,
   opts: ExecOpts = {}
 ): Promise<RunActionOutcome> {
@@ -50,7 +50,7 @@ export async function runAction(
   const apiKeyId = input.apiKeyId ?? null;
 
   // 1. record the request
-  const { data: row, error: insErr } = await supabase
+  const { data: row, error: insErr } = await db
     .from("actions")
     .insert({
       team_id: teamId,
@@ -65,17 +65,17 @@ export async function runAction(
     .single();
   if (insErr || !row) throw new Error(`action insert failed: ${insErr?.message}`);
   const actionId: string = row.id;
-  const auditAction = makeAuditAction(supabase, { teamId, memberId, apiKeyId, actionId });
+  const auditAction = makeAuditAction(db, { teamId, memberId, apiKeyId, actionId });
 
   // 2. authorize through the policy engine
-  const decision = await authorize(supabase, teamId, {
+  const decision = await authorize(db, teamId, {
     principal,
     action: request.type,
     resource: request.resource,
   });
 
   if (decision.effect === "deny") {
-    await supabase
+    await db
       .from("actions")
       .update({ status: "denied", decision: "deny", matched_policy_id: decision.matchedRuleId, updated_at: now() })
       .eq("id", actionId);
@@ -84,14 +84,14 @@ export async function runAction(
   }
 
   if (decision.effect === "require_approval") {
-    const approvalRequestId = await fileApprovalRequest(supabase, {
+    const approvalRequestId = await fileApprovalRequest(db, {
       teamId,
       request: { principal, action: request.type, resource: request.resource },
       decision,
       memberId,
       context: { params: request.params, action_id: actionId },
     });
-    await supabase
+    await db
       .from("actions")
       .update({
         status: "pending_approval",
@@ -106,15 +106,15 @@ export async function runAction(
   }
 
   // 3. allowed → execute
-  await supabase
+  await db
     .from("actions")
     .update({ status: "running", decision: "allow", matched_policy_id: decision.matchedRuleId, updated_at: now() })
     .eq("id", actionId);
 
   const exec = await executeHandler(
-    supabase,
+    db,
     actionId,
-    { supabase, teamId, memberId, apiKeyId, principal, sandbox: opts.sandbox ?? unconfiguredSandbox },
+    { db, teamId, memberId, apiKeyId, principal, sandbox: opts.sandbox ?? unconfiguredSandbox },
     request,
     opts.handlers,
     auditAction
@@ -145,13 +145,13 @@ export type ResolveApprovalOutcome = {
  * the service role to perform the resumed handler's writes.
  */
 export async function resolveApproval(
-  supabase: DbClient,
+  db: DbClient,
   input: ResolveApprovalInput,
   opts: ExecOpts = {}
 ): Promise<ResolveApprovalOutcome> {
   const { approvalRequestId, decision, deciderMemberId, note } = input;
 
-  const { data: appr } = await supabase
+  const { data: appr } = await db
     .from("approval_requests")
     .select("id, team_id, status")
     .eq("id", approvalRequestId)
@@ -159,14 +159,14 @@ export async function resolveApproval(
   if (!appr) return { approvalRequestId, status: "not_found" };
   if (appr.status !== "pending") return { approvalRequestId, status: "already_decided" };
 
-  const { data: action } = await supabase
+  const { data: action } = await db
     .from("actions")
     .select("id, action_type, resource, params, actor, member_id")
     .eq("approval_request_id", approvalRequestId)
     .maybeSingle();
 
   // Record the human decision on the approval request.
-  await supabase
+  await db
     .from("approval_requests")
     .update({
       status: decision,
@@ -176,7 +176,7 @@ export async function resolveApproval(
     })
     .eq("id", approvalRequestId);
 
-  const auditAction = makeAuditAction(supabase, {
+  const auditAction = makeAuditAction(db, {
     teamId: appr.team_id,
     memberId: deciderMemberId,
     apiKeyId: null,
@@ -186,7 +186,7 @@ export async function resolveApproval(
 
   if (decision === "denied") {
     if (action) {
-      await supabase.from("actions").update({ status: "denied", updated_at: now() }).eq("id", action.id);
+      await db.from("actions").update({ status: "denied", updated_at: now() }).eq("id", action.id);
     }
     return { approvalRequestId, status: "denied", actionId: action?.id ?? null, actionStatus: action ? "denied" : undefined };
   }
@@ -194,12 +194,12 @@ export async function resolveApproval(
   // approved → resume the action
   if (!action) return { approvalRequestId, status: "approved", actionId: null };
 
-  await supabase.from("actions").update({ status: "running", updated_at: now() }).eq("id", action.id);
+  await db.from("actions").update({ status: "running", updated_at: now() }).eq("id", action.id);
   const principal: Principal = { role: "member", tier: "team", actor: action.actor };
   const exec = await executeHandler(
-    supabase,
+    db,
     action.id,
-    { supabase, teamId: appr.team_id, memberId: action.member_id, apiKeyId: null, principal, sandbox: opts.sandbox ?? unconfiguredSandbox },
+    { db, teamId: appr.team_id, memberId: action.member_id, apiKeyId: null, principal, sandbox: opts.sandbox ?? unconfiguredSandbox },
     { type: action.action_type, resource: action.resource, params: action.params ?? {} },
     opts.handlers,
     auditAction
@@ -218,7 +218,7 @@ export async function resolveApproval(
 type ExecResult = { status: "succeeded" | "failed"; result?: Record<string, unknown>; error?: string };
 
 async function executeHandler(
-  supabase: DbClient,
+  db: DbClient,
   actionId: string,
   ctx: Parameters<ActionHandler["execute"]>[0],
   request: ActionRequest,
@@ -228,30 +228,30 @@ async function executeHandler(
   const handler = handlerRegistry(handlers).get(request.type);
   if (!handler) {
     const error = `no handler for action type '${request.type}'`;
-    await finish(supabase, actionId, "failed", { error });
+    await finish(db, actionId, "failed", { error });
     await auditAction("action.failed", { type: request.type, error });
     return { status: "failed", error };
   }
   try {
     const res = await handler.execute(ctx, request.params);
     const status = res.ok ? "succeeded" : "failed";
-    await finish(supabase, actionId, status, res.ok ? { output: res.output ?? {} } : { error: res.error ?? "failed" });
+    await finish(db, actionId, status, res.ok ? { output: res.output ?? {} } : { error: res.error ?? "failed" });
     await auditAction(`action.${status}`, { type: request.type });
     return { status, result: res.output, error: res.error };
   } catch (e) {
     const error = e instanceof Error ? e.message : "handler threw";
-    await finish(supabase, actionId, "failed", { error });
+    await finish(db, actionId, "failed", { error });
     await auditAction("action.failed", { type: request.type, error });
     return { status: "failed", error };
   }
 }
 
 function makeAuditAction(
-  supabase: DbClient,
+  db: DbClient,
   ids: { teamId: string; memberId: string | null; apiKeyId: string | null; actionId: string }
 ) {
   return (action: string, meta: Record<string, unknown>) =>
-    audit(supabase, {
+    audit(db, {
       team_id: ids.teamId,
       actor_kind: ids.apiKeyId ? "api_key" : "member",
       member_id: ids.memberId,
@@ -268,10 +268,10 @@ function now(): string {
 }
 
 async function finish(
-  supabase: DbClient,
+  db: DbClient,
   actionId: string,
   status: "succeeded" | "failed",
   result: Record<string, unknown>
 ): Promise<void> {
-  await supabase.from("actions").update({ status, result, updated_at: now() }).eq("id", actionId);
+  await db.from("actions").update({ status, result, updated_at: now() }).eq("id", actionId);
 }

@@ -31,20 +31,20 @@ export default async function TeamLayout({
   params: Promise<{ team: string }>;
 }) {
   const { team: teamSlug } = await params;
-  const supabase = await serverClient();
+  const db = await serverClient();
 
   const user = await getSessionUser();
   if (!user) return <NoTeamScreen slug={teamSlug} />;
 
   // Membership is enforced below via the `me` lookup (app-code access control).
-  const { data: team } = await supabase
+  const { data: team } = await db
     .from("teams")
     .select("id, slug, name")
     .eq("slug", teamSlug)
     .maybeSingle();
   if (!team) return <NoTeamScreen slug={teamSlug} />;
 
-  const { data: me } = await supabase
+  const { data: me } = await db
     .from("members")
     .select("id, role, display_name, tier")
     .eq("team_id", team.id)

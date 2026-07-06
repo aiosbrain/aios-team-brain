@@ -47,7 +47,7 @@ type MetricRow = {
 };
 
 export async function getCodebaseSummaries(
-  supabase: DbClient,
+  db: DbClient,
   teamId: string,
   range: Range,
   tier: ViewerTier
@@ -57,12 +57,12 @@ export async function getCodebaseSummaries(
   const windowStart = new Date(Date.now() - rangeDays(range) * 86_400_000).toISOString();
 
   const [cbRes, mRes] = await Promise.all([
-    supabase
+    db
       .from("codebases")
       .select("id, slug, full_name, primary_language, stars, open_issues, last_scan_at")
       .eq("team_id", teamId)
       .order("last_scan_at", { ascending: false, nullsFirst: false }),
-    supabase
+    db
       .from("code_metrics")
       .select("codebase_id, scanned_at, agentic_score, health_score, test_coverage_pct, ai_commit_ratio, readiness_level, readiness_pct")
       .eq("team_id", teamId)
@@ -192,13 +192,13 @@ export interface CodebaseFreshness {
  * like the rest of codebase analytics (sole enforcement on postgres, no RLS).
  */
 export async function getCodebaseFreshness(
-  supabase: DbClient,
+  db: DbClient,
   teamId: string,
   tier: ViewerTier
 ): Promise<CodebaseFreshness[]> {
   if (!canSeeCodebases(tier)) return [];
 
-  const { data: cbData } = await supabase
+  const { data: cbData } = await db
     .from("codebases")
     .select("id, slug, full_name, default_branch, last_scan_at")
     .eq("team_id", teamId)
@@ -213,7 +213,7 @@ export async function getCodebaseFreshness(
   if (codebases.length === 0) return [];
 
   // Newest head_sha per codebase (rows arrive newest-first; first seen wins).
-  const { data: mData } = await supabase
+  const { data: mData } = await db
     .from("code_metrics")
     .select("codebase_id, head_sha, scanned_at")
     .eq("team_id", teamId)
@@ -317,7 +317,7 @@ export interface CodebaseDetail {
 }
 
 export async function getCodebaseDetail(
-  supabase: DbClient,
+  db: DbClient,
   teamId: string,
   slug: string,
   range: Range,
@@ -325,7 +325,7 @@ export async function getCodebaseDetail(
 ): Promise<CodebaseDetail | null> {
   if (!canSeeCodebases(tier)) return null;
 
-  const { data: cb } = await supabase
+  const { data: cb } = await db
     .from("codebases")
     .select(
       "id, slug, full_name, default_branch, description, homepage, primary_language, languages, stars, forks, open_issues, last_scan_at"
@@ -346,7 +346,7 @@ export async function getCodebaseDetail(
     "readiness_level, readiness_pct, readiness_pillars";
 
   const [metricsRes, contribRes, issuesRes, membersRes] = await Promise.all([
-    supabase
+    db
       .from("code_metrics")
       .select(METRIC_COLS)
       .eq("codebase_id", codebaseId)
@@ -354,19 +354,19 @@ export async function getCodebaseDetail(
       // DESC + limit keeps the newest points; reversed below for chronological trend.
       .order("scanned_at", { ascending: false })
       .limit(2000),
-    supabase
+    db
       .from("code_contributions")
       .select("author_key, author_name, member_id, day, commits, ai_commits, additions, deletions")
       .eq("codebase_id", codebaseId)
       .gte("day", windowStart.slice(0, 10))
       .limit(10_000),
-    supabase
+    db
       .from("github_issues")
       .select("number, title, state, is_pull_request, author_login, labels, url, opened_at")
       .eq("codebase_id", codebaseId)
       .order("updated_at", { ascending: false })
       .limit(200),
-    supabase.from("members").select("id, display_name, github_login, avatar_url").eq("team_id", teamId),
+    db.from("members").select("id, display_name, github_login, avatar_url").eq("team_id", teamId),
   ]);
 
   type MemberMeta = { display_name: string | null; github_login: string | null; avatar_url: string | null };
@@ -550,7 +550,7 @@ function dayStr(v: string | Date): string {
  * (the `lib/metrics/codebases` choke-point is the sole enforcement on postgres).
  */
 export async function getContributorDetail(
-  supabase: DbClient,
+  db: DbClient,
   teamId: string,
   slug: string,
   ref: ContributorRef,
@@ -559,7 +559,7 @@ export async function getContributorDetail(
 ): Promise<ContributorDetail | null> {
   if (!canSeeCodebases(tier)) return null;
 
-  const { data: cb } = await supabase
+  const { data: cb } = await db
     .from("codebases")
     .select("id, slug")
     .eq("team_id", teamId)
@@ -568,7 +568,7 @@ export async function getContributorDetail(
   if (!cb) return null;
 
   const windowStart = new Date(Date.now() - rangeDays(range) * 86_400_000).toISOString().slice(0, 10);
-  let q = supabase
+  let q = db
     .from("code_contributions")
     .select("author_key, author_name, member_id, day, commits, ai_commits, additions, deletions")
     .eq("codebase_id", (cb as { id: string }).id)
@@ -612,7 +612,7 @@ export async function getContributorDetail(
   let github_login: string | null = null;
   const member_id = "memberId" in ref ? ref.memberId : rows.find((r) => r.member_id)?.member_id ?? null;
   if (member_id) {
-    const { data: m } = await supabase
+    const { data: m } = await db
       .from("members")
       .select("display_name, avatar_url, github_login")
       .eq("id", member_id)
@@ -661,7 +661,7 @@ export interface MemberProfile {
  * the team's codebases. Looked up by `actor_handle` or `github_login`. Tier-gated team-only.
  */
 export async function getMemberProfile(
-  supabase: DbClient,
+  db: DbClient,
   teamId: string,
   handle: string,
   range: Range,
@@ -669,7 +669,7 @@ export async function getMemberProfile(
 ): Promise<MemberProfile | null> {
   if (!canSeeCodebases(tier)) return null;
 
-  const { data: members } = await supabase
+  const { data: members } = await db
     .from("members")
     .select("id, display_name, actor_handle, github_login, avatar_url, role, status")
     .eq("team_id", teamId);
@@ -692,7 +692,7 @@ export async function getMemberProfile(
   if (!member) return null;
 
   const windowStart = new Date(Date.now() - rangeDays(range) * 86_400_000).toISOString().slice(0, 10);
-  const { data: contribs } = await supabase
+  const { data: contribs } = await db
     .from("code_contributions")
     .select("day, commits, ai_commits, additions, deletions, codebases(slug)")
     .eq("team_id", teamId)

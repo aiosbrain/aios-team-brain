@@ -30,8 +30,8 @@ interface Gate {
 }
 
 async function gate(teamSlug: string, targetMemberId: string): Promise<Gate | null> {
-  const supabase = await serverClient();
-  const { data: team } = await supabase.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
+  const db = await serverClient();
+  const { data: team } = await db.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
   if (!team) return null;
   const me = await currentMember((team as { id: string }).id);
   if (!me) return null;
@@ -142,8 +142,8 @@ export async function deleteMemberGoal(
  * closes); admins keep member-picker issuance for exceptional cases via /admin/keys.
  */
 async function selfGate(teamSlug: string): Promise<Gate | null> {
-  const supabase = await serverClient();
-  const { data: team } = await supabase.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
+  const db = await serverClient();
+  const { data: team } = await db.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
   if (!team) return null;
   const me = await currentMember((team as { id: string }).id);
   if (!me) return null;

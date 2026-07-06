@@ -125,13 +125,13 @@ describe("runGraphProjection runner (real Postgres, mocked Graphiti)", () => {
     await ingest(seed, { kind: "transcript", path: "slack/client/2.md", body: "beta thread", access: "external" });
 
     const fake = new FakeGraphiti();
-    const first = await runGraphProjection({ teamId: seed.teamId, client: client(fake), supabase: db() });
+    const first = await runGraphProjection({ teamId: seed.teamId, client: client(fake), db: db() });
     expect(first.configured).toBe(true);
     expect(first.teams).toBe(1);
     expect(first.projected).toBe(2);
     expect(fake.pushes.map((p) => p.groupId).sort()).toEqual([`${slug}_external`, `${slug}_team`]);
 
-    const second = await runGraphProjection({ teamId: seed.teamId, client: client(new FakeGraphiti()), supabase: db() });
+    const second = await runGraphProjection({ teamId: seed.teamId, client: client(new FakeGraphiti()), db: db() });
     expect(second.projected).toBe(0);
     expect(second.skipped).toBe(2); // idempotent across the runner too
   });

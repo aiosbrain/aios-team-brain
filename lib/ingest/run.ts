@@ -49,8 +49,8 @@ function envSlackToken(): string | null {
 }
 
 /** Distinct teams that have at least one enabled Slack integration. */
-async function teamsWithSlack(supabase: DbClient): Promise<string[]> {
-  const { data } = await supabase
+async function teamsWithSlack(db: DbClient): Promise<string[]> {
+  const { data } = await db
     .from("integrations")
     .select("team_id")
     .eq("type", "slack")
@@ -67,11 +67,11 @@ interface ConnectorIdentity {
 
 /** Find (or auto-provision) the per-team connector member used as a given source's ingest actor. */
 async function resolveConnectorAuth(
-  supabase: DbClient,
+  db: DbClient,
   teamId: string,
   identity: ConnectorIdentity
 ): Promise<{ teamId: string; memberId: string; apiKeyId: string } | null> {
-  const { data: existing } = await supabase
+  const { data: existing } = await db
     .from("members")
     .select("id")
     .eq("team_id", teamId)
@@ -80,7 +80,7 @@ async function resolveConnectorAuth(
 
   let memberId = (existing as { id: string } | null)?.id;
   if (!memberId) {
-    const { data: created } = await supabase
+    const { data: created } = await db
       .from("members")
       .upsert(
         {
@@ -101,7 +101,7 @@ async function resolveConnectorAuth(
   if (!memberId) return null;
 
   // api_key_id is recorded in the audit row (no FK); reuse one if present.
-  const { data: key } = await supabase
+  const { data: key } = await db
     .from("api_keys")
     .select("id")
     .eq("team_id", teamId)
@@ -128,15 +128,15 @@ export async function runSlackIngestion(opts: { teamId?: string } = {}): Promise
   if (running) return { ...empty, skipped: true };
   running = true;
   try {
-    const supabase = adminClient();
-    const teamIds = opts.teamId ? [opts.teamId] : await teamsWithSlack(supabase);
+    const db = adminClient();
+    const teamIds = opts.teamId ? [opts.teamId] : await teamsWithSlack(db);
     const envToken = envSlackToken();
 
     const summary: IngestSummary = { ...empty };
     for (const teamId of teamIds) {
       let slackIntegrations;
       try {
-        slackIntegrations = (await getEnabledIntegrationsWithSecrets(supabase, teamId)).filter(
+        slackIntegrations = (await getEnabledIntegrationsWithSecrets(db, teamId)).filter(
           (i) => i.type === "slack"
         );
       } catch (err) {
@@ -145,7 +145,7 @@ export async function runSlackIngestion(opts: { teamId?: string } = {}): Promise
         continue;
       }
       if (slackIntegrations.length === 0) continue;
-      const auth = await resolveConnectorAuth(supabase, teamId, {
+      const auth = await resolveConnectorAuth(db, teamId, {
         handle: "slack-sync",
         email: "slack-sync@connector.local",
         displayName: "Slack Sync",
@@ -172,11 +172,11 @@ export async function runSlackIngestion(opts: { teamId?: string } = {}): Promise
         // Best-effort reconcile Slack users → members by email, then build the resolver map so
         // each thread's author is attributed to the real person (manual mappings included).
         try {
-          await syncSlackIdentities(supabase, teamId, detailed);
+          await syncSlackIdentities(db, teamId, detailed);
         } catch (err) {
           summary.errors.push(`team ${teamId}: slack identity sync: ${err instanceof Error ? err.message : "failed"}`);
         }
-        const idMap = await buildIdentityMap(supabase, teamId);
+        const idMap = await buildIdentityMap(db, teamId);
         const users = Object.fromEntries(detailed.map((u) => [u.id, u.displayName]));
         for (const channelId of channelIds) {
           summary.channels++;
@@ -191,7 +191,7 @@ export async function runSlackIngestion(opts: { teamId?: string } = {}): Promise
               });
               // Attribute the item to the thread author's mapped member (else the ingesting actor).
               const authorMemberId = resolveByProviderId(idMap, "slack", thread.root.user ?? "");
-              const res = await ingestItem(supabase, auth, payload, "team", { authorMemberId });
+              const res = await ingestItem(db, auth, payload, "team", { authorMemberId });
               if (res.status === "created") summary.created++;
               else if (res.status === "updated") summary.updated++;
               else summary.unchanged++;
@@ -227,8 +227,8 @@ export interface PlaneIngestSummary {
 }
 
 /** Distinct teams with at least one enabled Plane integration. */
-async function teamsWithPlane(supabase: DbClient): Promise<string[]> {
-  const { data } = await supabase
+async function teamsWithPlane(db: DbClient): Promise<string[]> {
+  const { data } = await db
     .from("integrations")
     .select("team_id")
     .eq("type", "plane")
@@ -258,14 +258,14 @@ export async function runPlaneIngestion(opts: { teamId?: string } = {}): Promise
   if (planeRunning) return { ...empty, skipped: true };
   planeRunning = true;
   try {
-    const supabase = adminClient();
-    const teamIds = opts.teamId ? [opts.teamId] : await teamsWithPlane(supabase);
+    const db = adminClient();
+    const teamIds = opts.teamId ? [opts.teamId] : await teamsWithPlane(db);
 
     const summary: PlaneIngestSummary = { ...empty };
     for (const teamId of teamIds) {
       let planeIntegrations;
       try {
-        planeIntegrations = (await getEnabledIntegrationsWithSecrets(supabase, teamId)).filter(
+        planeIntegrations = (await getEnabledIntegrationsWithSecrets(db, teamId)).filter(
           (i) => i.type === "plane"
         );
       } catch (err) {
@@ -273,7 +273,7 @@ export async function runPlaneIngestion(opts: { teamId?: string } = {}): Promise
         continue;
       }
       if (planeIntegrations.length === 0) continue;
-      const auth = await resolveConnectorAuth(supabase, teamId, {
+      const auth = await resolveConnectorAuth(db, teamId, {
         handle: "plane-sync",
         email: "plane-sync@connector.local",
         displayName: "Plane Sync",
@@ -311,22 +311,22 @@ export async function runPlaneIngestion(opts: { teamId?: string } = {}): Promise
           // Reconcile Plane members → people by email, then build the resolver map so each
           // work-item's assignee is attributed to the real person.
           try {
-            await syncProviderIdentities(supabase, teamId, "plane", fetched.memberDetails);
+            await syncProviderIdentities(db, teamId, "plane", fetched.memberDetails);
           } catch (err) {
             summary.errors.push(`team ${teamId}: plane identity sync: ${err instanceof Error ? err.message : "failed"}`);
           }
-          const idMap = await buildIdentityMap(supabase, teamId);
+          const idMap = await buildIdentityMap(db, teamId);
           // Work-items → tasks (one kind=task item).
           const payload = normalizePlaneProject({ ...fetched, aiosSources });
           summary.items += payload.rows?.length ?? 0;
-          const res = await ingestItem(supabase, auth, payload, "team");
+          const res = await ingestItem(db, auth, payload, "team");
           if (res.status === "created") summary.created++;
           else if (res.status === "updated") summary.updated++;
           else summary.unchanged++;
           // Work-item text → deliverable items (searchable), one per work-item; attributed to assignee.
           for (const doc of normalizePlaneDocs({ ...fetched, aiosSources })) {
             const authorMemberId = resolveByProviderId(idMap, "plane", String(doc.frontmatter?.assignee_id ?? ""));
-            const r = await ingestItem(supabase, auth, doc, "team", { authorMemberId });
+            const r = await ingestItem(db, auth, doc, "team", { authorMemberId });
             if (r.status === "created") summary.created++;
             else if (r.status === "updated") summary.updated++;
             else summary.unchanged++;
@@ -351,8 +351,8 @@ export async function runPlaneIngestion(opts: { teamId?: string } = {}): Promise
 export type ImportSummary = PlaneIngestSummary;
 
 /** Distinct teams with at least one enabled integration of a given type. */
-async function teamsWithType(supabase: DbClient, type: "linear" | "github"): Promise<string[]> {
-  const { data } = await supabase
+async function teamsWithType(db: DbClient, type: "linear" | "github"): Promise<string[]> {
+  const { data } = await db
     .from("integrations")
     .select("team_id")
     .eq("type", type)
@@ -376,19 +376,19 @@ export async function runLinearIngestion(opts: { teamId?: string } = {}): Promis
   if (linearRunning) return { ...emptyImportSummary(), skipped: true };
   linearRunning = true;
   try {
-    const supabase = adminClient();
-    const teamIds = opts.teamId ? [opts.teamId] : await teamsWithType(supabase, "linear");
+    const db = adminClient();
+    const teamIds = opts.teamId ? [opts.teamId] : await teamsWithType(db, "linear");
     const summary = emptyImportSummary();
     for (const teamId of teamIds) {
       let integrations;
       try {
-        integrations = (await getEnabledIntegrationsWithSecrets(supabase, teamId)).filter((i) => i.type === "linear");
+        integrations = (await getEnabledIntegrationsWithSecrets(db, teamId)).filter((i) => i.type === "linear");
       } catch (err) {
         summary.errors.push(`team ${teamId}: ${err instanceof Error ? err.message : "secret read failed"}`);
         continue;
       }
       if (integrations.length === 0) continue;
-      const auth = await resolveConnectorAuth(supabase, teamId, {
+      const auth = await resolveConnectorAuth(db, teamId, {
         handle: "linear-sync",
         email: "linear-sync@connector.local",
         displayName: "Linear Sync",
@@ -400,7 +400,7 @@ export async function runLinearIngestion(opts: { teamId?: string } = {}): Promis
       // Linear node ids the brain already owns via a projection/adoption link — excluded from the
       // inbound mirror so only net-new Linear-authored issues import (brain authors → Linear out;
       // only Linear-side tasks flow back in). Footer round-trippers are filtered in normalize too.
-      const { data: ownedLinks } = await supabase
+      const { data: ownedLinks } = await db
         .from("task_pm_links")
         .select("provider_resource_id")
         .eq("team_id", teamId)
@@ -425,22 +425,22 @@ export async function runLinearIngestion(opts: { teamId?: string } = {}): Promis
           // Reconcile Linear members → people by email, then build the resolver map so each
           // issue's assignee is attributed to the real person.
           try {
-            await syncProviderIdentities(supabase, teamId, "linear", fetched.members);
+            await syncProviderIdentities(db, teamId, "linear", fetched.members);
           } catch (err) {
             summary.errors.push(`team ${teamId}: linear identity sync: ${err instanceof Error ? err.message : "failed"}`);
           }
-          const idMap = await buildIdentityMap(supabase, teamId);
+          const idMap = await buildIdentityMap(db, teamId);
           // Issues → tasks (one kind=task item). Brain-owned issues are excluded (only Linear-authored import).
           const payload = normalizeLinearTeam({ ...fetched, ownedResourceIds });
           summary.items += payload.rows?.length ?? 0;
-          const res = await ingestItem(supabase, auth, payload, "team");
+          const res = await ingestItem(db, auth, payload, "team");
           if (res.status === "created") summary.created++;
           else if (res.status === "updated") summary.updated++;
           else summary.unchanged++;
           // Issue text → deliverable items (searchable), one per issue; attributed to assignee.
           for (const doc of normalizeLinearDocs({ ...fetched, ownedResourceIds })) {
             const authorMemberId = resolveByProviderId(idMap, "linear", String(doc.frontmatter?.assignee_id ?? ""));
-            const r = await ingestItem(supabase, auth, doc, "team", { authorMemberId });
+            const r = await ingestItem(db, auth, doc, "team", { authorMemberId });
             if (r.status === "created") summary.created++;
             else if (r.status === "updated") summary.updated++;
             else summary.unchanged++;
@@ -468,19 +468,19 @@ export async function runGithubIngestion(opts: { teamId?: string } = {}): Promis
   if (githubRunning) return { ...emptyImportSummary(), skipped: true };
   githubRunning = true;
   try {
-    const supabase = adminClient();
-    const teamIds = opts.teamId ? [opts.teamId] : await teamsWithType(supabase, "github");
+    const db = adminClient();
+    const teamIds = opts.teamId ? [opts.teamId] : await teamsWithType(db, "github");
     const summary = emptyImportSummary();
     for (const teamId of teamIds) {
       let integrations;
       try {
-        integrations = (await getEnabledIntegrationsWithSecrets(supabase, teamId)).filter((i) => i.type === "github");
+        integrations = (await getEnabledIntegrationsWithSecrets(db, teamId)).filter((i) => i.type === "github");
       } catch (err) {
         summary.errors.push(`team ${teamId}: ${err instanceof Error ? err.message : "secret read failed"}`);
         continue;
       }
       if (integrations.length === 0) continue;
-      const auth = await resolveConnectorAuth(supabase, teamId, {
+      const auth = await resolveConnectorAuth(db, teamId, {
         handle: "github-sync",
         email: "github-sync@connector.local",
         displayName: "GitHub Sync",
@@ -506,7 +506,7 @@ export async function runGithubIngestion(opts: { teamId?: string } = {}): Promis
             const fetched = await fetchGithubRepoIssues({ owner, repo, token });
             const payload = normalizeGithubRepo(fetched);
             summary.items += payload.rows?.length ?? 0;
-            const res = await ingestItem(supabase, auth, payload, "team");
+            const res = await ingestItem(db, auth, payload, "team");
             if (res.status === "created") summary.created++;
             else if (res.status === "updated") summary.updated++;
             else summary.unchanged++;
@@ -519,7 +519,7 @@ export async function runGithubIngestion(opts: { teamId?: string } = {}): Promis
             const payloads = normalizeGithubFiles(fetched);
             summary.items += payloads.length;
             for (const payload of payloads) {
-              const res = await ingestItem(supabase, auth, payload, "team");
+              const res = await ingestItem(db, auth, payload, "team");
               if (res.status === "created") summary.created++;
               else if (res.status === "updated") summary.updated++;
               else summary.unchanged++;

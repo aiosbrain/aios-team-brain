@@ -29,7 +29,7 @@ const noteCreate: ActionHandler = {
     if (!access) return { ok: false, error: "invalid access tier" };
 
     const result = await ingestItem(
-      ctx.supabase,
+      ctx.db,
       { teamId: ctx.teamId, memberId: ctx.memberId ?? "", apiKeyId: ctx.apiKeyId ?? "" },
       {
         project,

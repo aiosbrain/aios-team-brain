@@ -16,7 +16,7 @@ import { audit } from "@/lib/api/audit";
  *   • github_issues   — upsert (codebase_id, number)
  */
 export async function ingestCodebaseScan(
-  supabase: DbClient,
+  db: DbClient,
   auth: { teamId: string; memberId: string; apiKeyId: string },
   payload: CodebaseScanPayload
 ): Promise<{ codebase_id: string; metrics_id: string; contributions: number; issues: number }> {
@@ -24,7 +24,7 @@ export async function ingestCodebaseScan(
   const c = payload.codebase;
 
   // 1. upsert codebase identity + last_scan_at
-  const { data: codebase, error: cbErr } = await supabase
+  const { data: codebase, error: cbErr } = await db
     .from("codebases")
     .upsert(
       {
@@ -68,7 +68,7 @@ export async function ingestCodebaseScan(
   });
 
   // 3. upsert the metrics snapshot (time-series point, keyed by head_sha)
-  const { data: metrics, error: mErr } = await supabase
+  const { data: metrics, error: mErr } = await db
     .from("code_metrics")
     .upsert(
       {
@@ -113,14 +113,14 @@ export async function ingestCodebaseScan(
   let contribCount = 0;
   let commitItemCount = 0;
   if (payload.contributions.length || recentCommits.length) {
-    const identityMap = await buildIdentityMap(supabase, auth.teamId);
+    const identityMap = await buildIdentityMap(db, auth.teamId);
 
     for (const row of payload.contributions) {
       const mapped = resolveMember(identityMap, {
         email: row.author_email,
         key: row.author_key,
       });
-      const { error } = await supabase.from("code_contributions").upsert(
+      const { error } = await db.from("code_contributions").upsert(
         {
           team_id: auth.teamId,
           codebase_id: codebase.id,
@@ -142,13 +142,13 @@ export async function ingestCodebaseScan(
 
     // Project recent commits into searchable items (author message text + member attribution),
     // so NL queries can answer per-person git history — not just the aggregate counts above.
-    commitItemCount = await projectCommitsToItems(supabase, auth, c.slug, recentCommits, identityMap);
+    commitItemCount = await projectCommitsToItems(db, auth, c.slug, recentCommits, identityMap);
   }
 
   // 5. issues — upsert by number
   let issueCount = 0;
   for (const iss of payload.issues) {
-    const { error } = await supabase.from("github_issues").upsert(
+    const { error } = await db.from("github_issues").upsert(
       {
         team_id: auth.teamId,
         codebase_id: codebase.id,
@@ -171,7 +171,7 @@ export async function ingestCodebaseScan(
     issueCount++;
   }
 
-  await audit(supabase, {
+  await audit(db, {
     team_id: auth.teamId,
     actor_kind: "api_key",
     member_id: auth.memberId,

@@ -27,8 +27,8 @@ export async function GET(req: NextRequest) {
     return errorResponse("forbidden_tier", "identity resolution is team-tier only", 403);
   }
 
-  const supabase = adminClient();
-  if (!(await rateLimit(supabase, `${auth.apiKeyId}:resolve:get`, 120))) {
+  const db = adminClient();
+  if (!(await rateLimit(db, `${auth.apiKeyId}:resolve:get`, 120))) {
     return errorResponse("rate_limited", "120 resolves/min per key", 429);
   }
 
@@ -49,14 +49,14 @@ export async function GET(req: NextRequest) {
     return errorResponse("bad_request", "external_id requires provider", 400);
   }
 
-  const map = await buildIdentityMap(supabase, auth.teamId);
+  const map = await buildIdentityMap(db, auth.teamId);
   let memberId: string | null = null;
   if (externalId && provider) memberId = resolveByProviderId(map, provider, externalId);
   if (!memberId && (email || handle)) memberId = resolveMember(map, { email: email ?? undefined, key: handle ?? undefined });
 
   if (!memberId) return errorResponse("not_found", "no member matches that identifier", 404);
 
-  const { data: m, error } = await supabase
+  const { data: m, error } = await db
     .from("members")
     .select("id, email, display_name, actor_handle, github_login, role, tier")
     .eq("team_id", auth.teamId)
@@ -65,7 +65,7 @@ export async function GET(req: NextRequest) {
   if (error) return errorResponse("internal", error.message, 500);
   if (!m) return errorResponse("not_found", "member resolved but not readable", 404);
 
-  const identities = (await listMemberIdentities(supabase, auth.teamId)).get(memberId);
+  const identities = (await listMemberIdentities(db, auth.teamId)).get(memberId);
   const provs = identities?.providers ?? [];
   const slack = provs.find((p) => p.provider === "slack");
 

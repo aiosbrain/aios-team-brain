@@ -29,15 +29,15 @@ export default async function MemberMaturityPage({
 }) {
 
   const { team: teamSlug, handle } = await params;
-  const supabase = await serverClient();
-  const { data: team } = await supabase.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
+  const db = await serverClient();
+  const { data: team } = await db.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
   if (!team) return null;
 
   const me = await currentMember(team.id);
   if (!me) return null;
 
   // Tier-gated read; external viewers and unknown handles → 404.
-  const data = await getMemberMaturity(supabase, team.id, handle, me.tier);
+  const data = await getMemberMaturity(db, team.id, handle, me.tier);
   if (!data) notFound();
 
   const { latest, timeline, teamAxes, prescription } = data;

@@ -41,13 +41,13 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ t
         .maybeSingle()
     : { data: null };
 
-  const supabase = adminClient();
+  const db = adminClient();
   const [integrations, ingestRuns, freshness] = await Promise.all([
-    listIntegrations(supabase, team.id, { role: me?.role as string | undefined }) as Promise<IntegrationRow[]>,
-    listRecentIngestRuns(supabase, team.id, 30),
+    listIntegrations(db, team.id, { role: me?.role as string | undefined }) as Promise<IntegrationRow[]>,
+    listRecentIngestRuns(db, team.id, 30),
     // Already-scanned repos (from codebase scans) → offered as one-click link suggestions. Read
     // through the tier-gated codebases choke point (CLAUDE.md §5), never the table directly.
-    getCodebaseFreshness(supabase, team.id, (me?.tier as "team" | "external") ?? "external"),
+    getCodebaseFreshness(db, team.id, (me?.tier as "team" | "external") ?? "external"),
   ]);
   const githubIntegration = integrations.find((i) => i.type === "github") ?? null;
   const scannedRepos = Array.from(

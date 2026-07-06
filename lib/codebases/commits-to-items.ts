@@ -94,7 +94,7 @@ export function normalizeCommit(codebaseSlug: string, commit: ScanCommit): ItemP
  * Reuses the caller's already-built identity map. Returns the count of commits processed.
  */
 export async function projectCommitsToItems(
-  supabase: DbClient,
+  db: DbClient,
   auth: { teamId: string; memberId: string; apiKeyId: string },
   codebaseSlug: string,
   recentCommits: ScanCommit[],
@@ -114,7 +114,7 @@ export async function projectCommitsToItems(
       ? { name: str(commit.author), email, key: email }
       : parseAuthorIdentity(str(commit.author));
     const authorMemberId = resolveMember(identityMap, identity);
-    await ingestItem(supabase, auth, payload, "team", { authorMemberId });
+    await ingestItem(db, auth, payload, "team", { authorMemberId });
     processed++;
   }
   return processed;

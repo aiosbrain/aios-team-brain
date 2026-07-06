@@ -14,8 +14,8 @@ export const metadata: Metadata = { title: "Learning" };
  */
 export default async function LearningPage({ params }: { params: Promise<{ team: string }> }) {
   const { team: teamSlug } = await params;
-  const supabase = await serverClient();
-  const { data: team } = await supabase.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
+  const db = await serverClient();
+  const { data: team } = await db.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
   if (!team) return null;
   const me = await currentMember(team.id);
   if (!me) return null;

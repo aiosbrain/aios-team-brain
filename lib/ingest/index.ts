@@ -38,7 +38,7 @@ export interface IngestResult {
 }
 
 export async function ingestItem(
-  supabase: DbClient,
+  db: DbClient,
   auth: { teamId: string; memberId: string; apiKeyId: string },
   payload: ItemPayload,
   access: "team" | "external",
@@ -49,7 +49,7 @@ export async function ingestItem(
   opts?: { authorMemberId?: string | null }
 ): Promise<IngestResult> {
   // 1. project
-  const { data: project, error: projErr } = await supabase
+  const { data: project, error: projErr } = await db
     .from("projects")
     .upsert(
       { team_id: auth.teamId, slug: payload.project, last_synced_at: new Date().toISOString() },
@@ -60,7 +60,7 @@ export async function ingestItem(
   if (projErr || !project) throw new Error(`project upsert failed: ${projErr?.message}`);
 
   // 2. existing item?
-  const { data: existing } = await supabase
+  const { data: existing } = await db
     .from("items")
     .select("id, content_sha256")
     .eq("team_id", auth.teamId)
@@ -71,8 +71,8 @@ export async function ingestItem(
   const now = new Date().toISOString();
 
   if (existing && existing.content_sha256 === payload.content_sha256) {
-    await supabase.from("items").update({ synced_at: now }).eq("id", existing.id);
-    await audit(supabase, {
+    await db.from("items").update({ synced_at: now }).eq("id", existing.id);
+    await audit(db, {
       team_id: auth.teamId, actor_kind: "api_key",
       member_id: auth.memberId, api_key_id: auth.apiKeyId,
       action: "item.unchanged", target_type: "item", target_id: existing.id,
@@ -86,7 +86,7 @@ export async function ingestItem(
   let validatedTaskRows: TaskRow[] | undefined;
   if (payload.rows && payload.kind === "task") {
     validatedTaskRows = await parseAndValidateTaskRows(
-      supabase,
+      db,
       auth.teamId,
       project.id,
       payload.rows
@@ -111,16 +111,16 @@ export async function ingestItem(
 
   let itemId: string;
   if (existing) {
-    const { error } = await supabase.from("items").update(itemRecord).eq("id", existing.id);
+    const { error } = await db.from("items").update(itemRecord).eq("id", existing.id);
     if (error) throw new Error(`item update failed: ${error.message}`);
     itemId = existing.id;
   } else {
-    const { data, error } = await supabase.from("items").insert(itemRecord).select("id").single();
+    const { data, error } = await db.from("items").insert(itemRecord).select("id").single();
     if (error || !data) throw new Error(`item insert failed: ${error?.message}`);
     itemId = data.id;
   }
 
-  await supabase.from("item_versions").insert({
+  await db.from("item_versions").insert({
     item_id: itemId,
     content_sha256: payload.content_sha256,
     frontmatter: payload.frontmatter ?? {},
@@ -136,7 +136,7 @@ export async function ingestItem(
   if (payload.rows && (payload.kind === "task" || payload.kind === "decision")) {
     if (payload.kind === "task") {
       changedTaskRowKeys = await materializeTasks(
-        supabase,
+        db,
         auth.teamId,
         project.id,
         itemId,
@@ -144,11 +144,11 @@ export async function ingestItem(
         now
       );
     } else {
-      await materializeDecisions(supabase, auth.teamId, project.id, itemId, payload.rows, now);
+      await materializeDecisions(db, auth.teamId, project.id, itemId, payload.rows, now);
     }
   }
 
-  await audit(supabase, {
+  await audit(db, {
     team_id: auth.teamId, actor_kind: "api_key",
     member_id: auth.memberId, api_key_id: auth.apiKeyId,
     action: existing ? "item.updated" : "item.created",
@@ -163,7 +163,7 @@ type TaskRow = NonNullable<ReturnType<typeof taskRowSchema.safeParse>["data"]>;
 
 /** Parse + parent-integrity checks only (no writes). Called before item upsert so 422 is clean. */
 async function parseAndValidateTaskRows(
-  supabase: DbClient,
+  db: DbClient,
   teamId: string,
   projectId: string,
   rawRows: unknown[]
@@ -183,7 +183,7 @@ async function parseAndValidateTaskRows(
   const parentMap = new Map<string, string>();
   const existingKeys = new Set<string>();
   {
-    const { data: existing } = await supabase
+    const { data: existing } = await db
       .from("tasks")
       .select("row_key, parent_row_key")
       .eq("team_id", teamId)
@@ -224,7 +224,7 @@ async function parseAndValidateTaskRows(
 }
 
 async function materializeTasks(
-  supabase: DbClient,
+  db: DbClient,
   teamId: string,
   projectId: string,
   itemId: string,
@@ -238,7 +238,7 @@ async function materializeTasks(
   // rows' projected fields changed this push (bounded reactive projection — see projectable-diff).
   const snapshotByKey = new Map<string, ProjectableSnapshot>();
   if (incomingKeys.size) {
-    const { data: before, error: beforeErr } = await supabase
+    const { data: before, error: beforeErr } = await db
       .from("tasks")
       .select("row_key, title, status, sprint, priority, labels, parent_row_key, assignee")
       .eq("team_id", teamId)
@@ -287,7 +287,7 @@ async function materializeTasks(
     if ("parent" in row) upsertRow.parent_row_key = parentOf(row) || null;
     if ("labels" in row) upsertRow.labels = row.labels ?? [];
     if ("priority" in row) upsertRow.priority = normalizeTaskPriority(row.priority);
-    const { data: task, error } = await supabase
+    const { data: task, error } = await db
       .from("tasks")
       .upsert(upsertRow, { onConflict: "team_id,project_id,row_key" })
       .select("id")
@@ -295,7 +295,7 @@ async function materializeTasks(
     if (error) throw new Error(`task row ${row.row_key}: ${error.message}`);
 
     if (row.pm_provider && row.pm_external_id) {
-      const { error: linkErr } = await supabase.from("task_pm_links").upsert(
+      const { error: linkErr } = await db.from("task_pm_links").upsert(
         {
           team_id: teamId,
           project_id: projectId,
@@ -313,7 +313,7 @@ async function materializeTasks(
   }
 
   // diff-delete: sync-originated rows absent from this push; UI rows survive.
-  const { data: current } = await supabase
+  const { data: current } = await db
     .from("tasks")
     .select("id, row_key, origin, parent_row_key")
     .eq("team_id", teamId)
@@ -322,7 +322,7 @@ async function materializeTasks(
   const survivors = new Set<string>();
   for (const t of current ?? []) {
     if (t.origin === "sync" && t.row_key && !incomingKeys.has(t.row_key)) {
-      await supabase.from("tasks").delete().eq("id", t.id);
+      await db.from("tasks").delete().eq("id", t.id);
     } else if (t.row_key) {
       survivors.add(t.row_key);
     }
@@ -333,7 +333,7 @@ async function materializeTasks(
   for (const t of current ?? []) {
     const parent = (t.parent_row_key ?? "").trim();
     if (parent && survivors.has(t.row_key!) && !survivors.has(parent)) {
-      await supabase.from("tasks").update({ parent_row_key: null }).eq("id", t.id);
+      await db.from("tasks").update({ parent_row_key: null }).eq("id", t.id);
       // Nulling a dangling parent IS a projected-field change (the child must un-nest on the board),
       // but it happens after the snapshot diff — so flag it here or reactive projection would miss it.
       if (t.row_key) changed.add(t.row_key);
@@ -346,7 +346,7 @@ async function materializeTasks(
 }
 
 async function materializeDecisions(
-  supabase: DbClient,
+  db: DbClient,
   teamId: string,
   projectId: string,
   itemId: string,
@@ -360,7 +360,7 @@ async function materializeDecisions(
 
   for (const row of rows) {
     const audience = normalizeTier(row.audience || "team") ?? "team";
-    const { error } = await supabase.from("decisions").upsert(
+    const { error } = await db.from("decisions").upsert(
       {
         team_id: teamId,
         project_id: projectId,

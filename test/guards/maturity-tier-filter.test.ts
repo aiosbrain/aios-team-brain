@@ -62,7 +62,7 @@ describe("agentic-maturity tier isolation", () => {
   });
 
   it("the matcher discriminates (non-vacuity)", () => {
-    expect(TABLE.test('supabase.from("agentic_maturity_snapshots").select("x")')).toBe(true);
-    expect(TABLE.test('supabase.from("items").select("x")')).toBe(false);
+    expect(TABLE.test('db.from("agentic_maturity_snapshots").select("x")')).toBe(true);
+    expect(TABLE.test('db.from("items").select("x")')).toBe(false);
   });
 });

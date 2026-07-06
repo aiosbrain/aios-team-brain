@@ -44,10 +44,10 @@ function mapRow(r: PolicyRow): PolicyRule {
 }
 
 export async function loadPolicies(
-  supabase: DbClient,
+  db: DbClient,
   teamId: string
 ): Promise<PolicyRule[]> {
-  const { data, error } = await supabase
+  const { data, error } = await db
     .from("policies")
     .select(
       "id, priority, subject_role, subject_tier, subject_actor, action, resource, effect, enabled"
@@ -60,11 +60,11 @@ export async function loadPolicies(
 }
 
 export async function authorize(
-  supabase: DbClient,
+  db: DbClient,
   teamId: string,
   request: PolicyRequest
 ): Promise<PolicyDecision> {
-  const rules = await loadPolicies(supabase, teamId);
+  const rules = await loadPolicies(db, teamId);
   return evaluatePolicy(rules, request);
 }
 
@@ -72,7 +72,7 @@ export async function authorize(
  * Record a pending approval for a `require_approval` decision. Returns the request id.
  */
 export async function fileApprovalRequest(
-  supabase: DbClient,
+  db: DbClient,
   args: {
     teamId: string;
     request: PolicyRequest;
@@ -81,7 +81,7 @@ export async function fileApprovalRequest(
     context?: Record<string, unknown>;
   }
 ): Promise<string> {
-  const { data, error } = await supabase
+  const { data, error } = await db
     .from("approval_requests")
     .insert({
       team_id: args.teamId,

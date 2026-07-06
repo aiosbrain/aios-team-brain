@@ -30,16 +30,16 @@ export default async function MaturityPage({
 
   const { team: teamSlug } = await params;
   const range = parseRange((await searchParams).range);
-  const supabase = await serverClient();
+  const db = await serverClient();
 
-  const { data: team } = await supabase.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
+  const { data: team } = await db.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
   if (!team) return null;
 
   const me = await currentMember(team.id);
   if (!me) return null;
 
   // Tier gate lives in getTeamMaturity → getCodebaseSummaries (team-only).
-  const m = await getTeamMaturity(supabase, team.id, range, me.tier);
+  const m = await getTeamMaturity(db, team.id, range, me.tier);
 
   return (
     <div className="mx-auto flex max-w-5xl flex-col gap-5">

@@ -42,20 +42,20 @@ export async function GET(req: NextRequest) {
     return errorResponse("forbidden_tier", "the company graph is team-tier only", 403);
   }
 
-  const supabase = adminClient();
-  if (!(await rateLimit(supabase, `${auth.apiKeyId}:company-graph:get`, 60))) {
+  const db = adminClient();
+  if (!(await rateLimit(db, `${auth.apiKeyId}:company-graph:get`, 60))) {
     return errorResponse("rate_limited", "60 reads/min per key", 429);
   }
 
   // One entity read serves both halves: `people[]` (entity_type=actor) and the
   // server-side join that resolves ownership edge targets (typically workflows).
   const [entitiesRes, edgesRes] = await Promise.all([
-    supabase
+    db
       .from("graph_entities")
       .select("entity_id, entity_type, name, attrs")
       .eq("team_id", auth.teamId)
       .order("entity_id"),
-    supabase
+    db
       .from("graph_relationships")
       .select("from_id, to_id, relationship_type")
       .eq("team_id", auth.teamId)

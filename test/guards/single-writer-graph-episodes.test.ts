@@ -50,7 +50,7 @@ describe("single-writer: graph_episodes", () => {
 
   it("the matcher discriminates (non-vacuity)", () => {
     const W = () => new RegExp(WRITE_RE.source, "g");
-    expect(W().test('supabase.from("graph_episodes").upsert(x)')).toBe(true);
-    expect(W().test('supabase.from("graph_episodes").select("id")')).toBe(false);
+    expect(W().test('db.from("graph_episodes").upsert(x)')).toBe(true);
+    expect(W().test('db.from("graph_episodes").select("id")')).toBe(false);
   });
 });

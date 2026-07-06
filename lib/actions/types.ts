@@ -15,7 +15,7 @@ export interface ActionRequest {
 }
 
 export interface ActionContext {
-  supabase: DbClient; // service-role client
+  db: DbClient; // service-role client
   teamId: string;
   memberId: string | null;
   apiKeyId: string | null;

@@ -31,13 +31,13 @@ export interface IntegrationMeta {
 }
 
 export async function listIntegrations(
-  supabase: DbClient,
+  db: DbClient,
   teamId: string,
   viewer: IntegrationsViewer
 ): Promise<IntegrationMeta[]> {
   // Admin-tier surface, no RLS on postgres → this app-code gate is the sole enforcement.
   if (!canManageIntegrations(viewer.role)) return [];
-  const { data, error } = await supabase
+  const { data, error } = await db
     .from("integrations")
     .select("id, type, name, config, status, secret_ciphertext, created_at")
     .eq("team_id", teamId)
@@ -64,13 +64,13 @@ export async function listIntegrations(
  * isolation.
  */
 export async function resolveIntegrationsAdmin(
-  supabase: DbClient,
+  db: DbClient,
   teamSlug: string,
   userId: string
 ): Promise<{ teamId: string; memberId: string } | null> {
-  const { data: team } = await supabase.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
+  const { data: team } = await db.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
   if (!team) return null;
-  const { data: me } = await supabase
+  const { data: me } = await db
     .from("members")
     .select("id, role")
     .eq("team_id", team.id)

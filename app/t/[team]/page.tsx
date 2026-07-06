@@ -80,15 +80,15 @@ export default async function TeamHome({
   const { team: teamSlug } = await params;
   const { range: rangeParam } = await searchParams;
   const range = parseRange(rangeParam);
-  const supabase = await serverClient();
+  const db = await serverClient();
 
   const [{ data: team }, user] = await Promise.all([
-    supabase.from("teams").select("id, name").eq("slug", teamSlug).maybeSingle(),
+    db.from("teams").select("id, name").eq("slug", teamSlug).maybeSingle(),
     getSessionUser(),
   ]);
   if (!team) return null; // layout already rendered the no-team screen
 
-  const { data: me } = await supabase
+  const { data: me } = await db
     .from("members")
     .select("id, role, tier")
     .eq("team_id", team.id)
@@ -101,7 +101,7 @@ export default async function TeamHome({
 
   // Tier-filtered count (no RLS backstop in postgres mode).
   const { count: itemCount } = await visibleItems(
-    supabase.from("items").select("id", { count: "exact", head: true }).eq("team_id", team.id),
+    db.from("items").select("id", { count: "exact", head: true }).eq("team_id", team.id),
     tier
   );
 
@@ -115,9 +115,9 @@ export default async function TeamHome({
   }
 
   const [pulse, { data: decisions }] = await Promise.all([
-    getPulseMetrics(supabase, team.id, range, { isAdmin, memberId }),
+    getPulseMetrics(db, team.id, range, { isAdmin, memberId }),
     visibleDecisions(
-      supabase
+      db
         .from("decisions")
         .select("id, title, decided_at, tier, still_valid")
         .eq("team_id", team.id)
