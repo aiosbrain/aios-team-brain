@@ -11,16 +11,15 @@ export interface CurrentMember {
 }
 
 /**
- * Resolve the signed-in user's active membership in a team, or null. This is
- * the app-level access check that replaces RLS in postgres mode (and is a
- * defense-in-depth check in supabase mode). Use in server actions that mutate
- * team data initiated from the browser.
+ * Resolve the signed-in user's active membership in a team, or null. There is no RLS, so this
+ * app-code access check is the SOLE enforcement. Use in server actions that mutate team data
+ * initiated from the browser.
  */
 export async function currentMember(teamId: string): Promise<CurrentMember | null> {
   const user = await getSessionUser();
   if (!user) return null;
-  const supabase = await serverClient();
-  const { data } = await supabase
+  const db = await serverClient();
+  const { data } = await db
     .from("members")
     .select("id, role, tier")
     .eq("team_id", teamId)

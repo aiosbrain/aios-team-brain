@@ -69,11 +69,11 @@ export function isDiverged(link: {
 }
 
 export async function reconcileProviderState(
-  supabase: DbClient,
+  db: DbClient,
   teamId: string,
   opts: { fetchImpl?: typeof fetch } = {}
 ): Promise<ReconcileResult> {
-  const primary = await resolvePrimaryProvider(supabase, teamId);
+  const primary = await resolvePrimaryProvider(db, teamId);
   if (primary.provider === null || primary.integration === null) {
     return { provider: primary.provider, seenUpdated: 0, divergences: [], reason: primary.reason };
   }
@@ -82,7 +82,7 @@ export async function reconcileProviderState(
     return { provider: primary.provider, seenUpdated: 0, divergences: [], reason: `${primary.provider} has no inbound reconcile support` };
   }
 
-  const { data } = await supabase
+  const { data } = await db
     .from("task_pm_links")
     .select(LINK_COLS)
     .eq("team_id", teamId)
@@ -102,7 +102,7 @@ export async function reconcileProviderState(
 
     // Persist the seen state NAME ONLY when it changed — keeps a re-run write-free (idempotent).
     if (seen.name !== link.provider_seen_status) {
-      await supabase
+      await db
         .from("task_pm_links")
         .update({ provider_seen_status: seen.name, updated_at: new Date().toISOString() })
         .eq("id", link.id);

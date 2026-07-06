@@ -13,9 +13,9 @@ export const metadata: Metadata = { title: "Tasks" };
 
 export default async function TasksPage({ params }: { params: Promise<{ team: string }> }) {
   const { team: teamSlug } = await params;
-  const supabase = await serverClient();
+  const db = await serverClient();
 
-  const { data: team } = await supabase
+  const { data: team } = await db
     .from("teams")
     .select("id")
     .eq("slug", teamSlug)
@@ -34,7 +34,7 @@ export default async function TasksPage({ params }: { params: Promise<{ team: st
   const [{ data: tasks }, { data: links }, { data: projects }, { data: members }, { data: me }] =
     await Promise.all([
       visibleTasks(
-        supabase
+        db
           .from("tasks")
           .select("id, row_key, title, assignee, status, sprint, due_date, origin, project_id, updated_at, parent_row_key, labels, priority, body")
           .eq("team_id", team.id)
@@ -42,22 +42,22 @@ export default async function TasksPage({ params }: { params: Promise<{ team: st
           .limit(500),
         tier
       ),
-      supabase
+      db
         .from("task_pm_links")
         .select("task_id, provider, provider_url, last_synced_status, last_error")
         .eq("team_id", team.id),
-      supabase
+      db
         .from("projects")
         .select("id, slug, name")
         .eq("team_id", team.id)
         .order("slug"),
-      supabase
+      db
         .from("members")
         .select("id, display_name, actor_handle")
         .eq("team_id", team.id)
         .eq("status", "active")
         .order("display_name"),
-      supabase
+      db
         .from("members")
         .select("id")
         .eq("team_id", team.id)

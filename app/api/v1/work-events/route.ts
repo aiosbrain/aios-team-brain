@@ -14,8 +14,8 @@ export async function POST(req: NextRequest) {
     return errorResponse("forbidden_tier", "work events are team-tier only", 403);
   }
 
-  const supabase = adminClient();
-  if (!(await rateLimit(supabase, `${auth.apiKeyId}:work-events:post`, 60))) {
+  const db = adminClient();
+  if (!(await rateLimit(db, `${auth.apiKeyId}:work-events:post`, 60))) {
     return errorResponse("rate_limited", "60 work events/min per key", 429);
   }
 
@@ -26,7 +26,7 @@ export async function POST(req: NextRequest) {
 
   try {
     const result = await ingestWorkEvent(
-      supabase,
+      db,
       { teamId: auth.teamId, memberId: auth.memberId, apiKeyId: auth.apiKeyId },
       parsed.data
     );

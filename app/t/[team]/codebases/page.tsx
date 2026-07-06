@@ -22,16 +22,16 @@ export default async function CodebasesPage({
 
   const { team: teamSlug } = await params;
   const range = parseRange((await searchParams).range);
-  const supabase = await serverClient();
+  const db = await serverClient();
 
-  const { data: team } = await supabase.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
+  const { data: team } = await db.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
   if (!team) return null;
 
   const me = await currentMember(team.id);
   if (!me) return null;
 
   // Read helper enforces the team-tier gate (external → empty).
-  const { codebases, kpis } = await getCodebaseSummaries(supabase, team.id, range, me.tier);
+  const { codebases, kpis } = await getCodebaseSummaries(db, team.id, range, me.tier);
 
   return (
     <div className="mx-auto flex max-w-6xl flex-col gap-5">

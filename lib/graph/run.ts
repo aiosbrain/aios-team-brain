@@ -38,10 +38,10 @@ const DEFAULT_LIMIT = Number(process.env.GRAPH_PROJECT_LIMIT ?? 500);
 const MAX_BATCHES = Number(process.env.GRAPH_PROJECT_MAX_BATCHES ?? 200);
 
 async function resolveTeams(
-  supabase: DbClient,
+  db: DbClient,
   teamId?: string
 ): Promise<{ id: string; slug: string }[]> {
-  let q = supabase.from("teams").select("id, slug");
+  let q = db.from("teams").select("id, slug");
   if (teamId) q = q.eq("id", teamId);
   const { data, error } = await q;
   if (error) throw new Error(`graph projection: load teams failed: ${error.message}`);
@@ -56,7 +56,7 @@ let inFlight: Promise<GraphProjectionSummary> | null = null;
 export async function runGraphProjection(opts?: {
   teamId?: string;
   client?: GraphitiClient;
-  supabase?: DbClient;
+  db?: DbClient;
   limit?: number;
 }): Promise<GraphProjectionSummary> {
   if (inFlight) return inFlight;
@@ -71,7 +71,7 @@ export async function runGraphProjection(opts?: {
 async function runGraphProjectionInner(opts?: {
   teamId?: string;
   client?: GraphitiClient;
-  supabase?: DbClient;
+  db?: DbClient;
   limit?: number;
 }): Promise<GraphProjectionSummary> {
   const client = opts?.client ?? new GraphitiClient();
@@ -88,9 +88,9 @@ async function runGraphProjectionInner(opts?: {
   };
   if (!client.configured) return summary; // nowhere to project — skip cleanly
 
-  const supabase = opts?.supabase ?? adminClient();
+  const db = opts?.db ?? adminClient();
   const limit = opts?.limit ?? DEFAULT_LIMIT;
-  const teams = await resolveTeams(supabase, opts?.teamId);
+  const teams = await resolveTeams(db, opts?.teamId);
   summary.teams = teams.length;
 
   for (const t of teams) {
@@ -100,7 +100,7 @@ async function runGraphProjectionInner(opts?: {
       // MAX_BATCHES caps the loop as a runaway guard. (audit H2)
       let since: string | undefined;
       for (let batch = 0; batch < MAX_BATCHES; batch++) {
-        const s = await projectItemsToGraph(supabase, {
+        const s = await projectItemsToGraph(db, {
           teamId: t.id,
           teamSlug: t.slug,
           client,
@@ -116,7 +116,7 @@ async function runGraphProjectionInner(opts?: {
 
       // Reconcile after paging (audit H3, Option B): confirm this team's recorded episodes actually
       // landed, and re-queue any that a crashed worker never got to. Off the hot push path.
-      const r = await reconcileProjectedEpisodes(supabase, client, t.id);
+      const r = await reconcileProjectedEpisodes(db, client, t.id);
       summary.reconciled += r.confirmed;
       summary.requeued += r.reQueued;
     } catch (e) {

@@ -12,14 +12,14 @@ export async function GET(req: NextRequest, ctx: { params: Promise<{ id: string 
   const auth = await authenticateApiKey(req);
   if (!auth) return errorResponse("unauthorized", "invalid API key or team", 401);
 
-  const supabase = adminClient();
-  if (!(await rateLimit(supabase, `${auth.apiKeyId}:items:get`, 60))) {
+  const db = adminClient();
+  if (!(await rateLimit(db, `${auth.apiKeyId}:items:get`, 60))) {
     return errorResponse("rate_limited", "60 pulls/min per key", 429);
   }
 
   const { id } = await ctx.params;
 
-  let q = supabase
+  let q = db
     .from("items")
     .select("id, path, kind, access, frontmatter, body, content_sha256, actor, updated_at, projects(slug)")
     .eq("team_id", auth.teamId)

@@ -34,7 +34,7 @@ export type RetrievedContext = {
 };
 
 export interface RetrievalRequest {
-  supabase: DbClient;
+  db: DbClient;
   teamId: string;
   tier: "team" | "external";
   question: string;

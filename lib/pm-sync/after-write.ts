@@ -24,8 +24,8 @@ import {
 
 // Load a task by id with the canonical projection column set (shared with the engine). Missing row
 // (e.g. deleted between the write and the after() callback) → null.
-async function loadTaskById(supabase: DbClient, taskId: string): Promise<ProjectionTaskRow | null> {
-  const { data } = await supabase.from("tasks").select(PROJECTION_TASK_COLS).eq("id", taskId).maybeSingle();
+async function loadTaskById(db: DbClient, taskId: string): Promise<ProjectionTaskRow | null> {
+  const { data } = await db.from("tasks").select(PROJECTION_TASK_COLS).eq("id", taskId).maybeSingle();
   return (data as ProjectionTaskRow | null) ?? null;
 }
 
@@ -33,14 +33,14 @@ async function loadTaskById(supabase: DbClient, taskId: string): Promise<Project
 // moveTaskAction / updateTaskAction via after(). Always single-row — the UI bypasses the push-path
 // changed-rows guard (Decision 3) and the engine's fingerprint skip prevents a redundant write.
 export async function projectTaskByIdAfterWrite(
-  supabase: DbClient,
+  db: DbClient,
   taskId: string,
   opts: { fetchImpl?: typeof fetch } = {}
 ): Promise<ProjectionReport | null> {
   try {
-    const row = await loadTaskById(supabase, taskId);
+    const row = await loadTaskById(db, taskId);
     if (!row) return null;
-    return await projectTask(supabase, row, { fetchImpl: opts.fetchImpl });
+    return await projectTask(db, row, { fetchImpl: opts.fetchImpl });
   } catch {
     // Swallow — projection must never surface as a user-action failure.
     return null;
@@ -51,7 +51,7 @@ export async function projectTaskByIdAfterWrite(
 // semantics — prepare once, parent-before-child, shared resolved map, synced-only throttle — but
 // scoped to the rows whose projected fields changed this push.
 export async function projectChangedTasksAfterWrite(
-  supabase: DbClient,
+  db: DbClient,
   teamId: string,
   projectId: string,
   rowKeys: string[],
@@ -59,10 +59,10 @@ export async function projectChangedTasksAfterWrite(
 ): Promise<ProjectionReport[]> {
   if (!rowKeys.length) return [];
   try {
-    const primary = await resolvePrimaryProvider(supabase, teamId);
+    const primary = await resolvePrimaryProvider(db, teamId);
     if (primary.provider === null) return []; // no PM tool configured → nothing to project or surface
 
-    const { data } = await supabase
+    const { data } = await db
       .from("tasks")
       .select(PROJECTION_TASK_COLS)
       .eq("team_id", teamId)
@@ -76,11 +76,11 @@ export async function projectChangedTasksAfterWrite(
     // instead of failing silently. No bootstrap is reachable here, so don't take the batch path.
     if (primary.integration === null) {
       const reports: ProjectionReport[] = [];
-      for (const row of rows) reports.push(await projectTask(supabase, row, { primary, fetchImpl: opts.fetchImpl }));
+      for (const row of rows) reports.push(await projectTask(db, row, { primary, fetchImpl: opts.fetchImpl }));
       return reports;
     }
 
-    return await projectRows(supabase, primary, rows, { fetchImpl: opts.fetchImpl });
+    return await projectRows(db, primary, rows, { fetchImpl: opts.fetchImpl });
   } catch {
     return [];
   }

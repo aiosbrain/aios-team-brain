@@ -16,8 +16,8 @@ export async function GET(req: NextRequest) {
   const auth = await authenticateApiKey(req);
   if (!auth) return errorResponse("unauthorized", "invalid API key or team", 401);
 
-  const supabase = adminClient();
-  if (!(await rateLimit(supabase, `${auth.apiKeyId}:tasks:get`, 60))) {
+  const db = adminClient();
+  if (!(await rateLimit(db, `${auth.apiKeyId}:tasks:get`, 60))) {
     return errorResponse("rate_limited", "60 pulls/min per key", 429);
   }
 
@@ -27,7 +27,7 @@ export async function GET(req: NextRequest) {
   // Tier isolation (audit H1): an external-tier key must never pull internal task boards. `tasks`
   // carries `audience` (inherited from the source item's access) — filter it via the choke-point.
   const { data, error } = await visibleTasks(
-    supabase
+    db
       .from("tasks")
       .select(
         "row_key, title, assignee, status, sprint, due_date, parent_row_key, labels, priority, origin, updated_at, projects(slug), items:source_item_id(synced_at)"

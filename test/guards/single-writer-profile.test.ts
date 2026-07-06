@@ -58,9 +58,9 @@ describe("single-writer: identity context tables", () => {
   });
 
   it("the matcher discriminates writes from reads (non-vacuity)", () => {
-    expect(writeRe("member_goals").test('supabase.from("member_goals").insert(')).toBe(true);
+    expect(writeRe("member_goals").test('db.from("member_goals").insert(')).toBe(true);
     expect(writeRe("member_profiles").test('admin.from("member_profiles").upsert(')).toBe(true);
     expect(writeRe("member_time_off").test('admin.from("member_time_off").delete(')).toBe(true);
-    expect(writeRe("member_goals").test('supabase.from("member_goals").select(')).toBe(false);
+    expect(writeRe("member_goals").test('db.from("member_goals").select(')).toBe(false);
   });
 });

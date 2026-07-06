@@ -29,8 +29,8 @@ export async function GET(req: NextRequest) {
     return errorResponse("forbidden_tier", "the roster is team-tier only", 403);
   }
 
-  const supabase = adminClient();
-  if (!(await rateLimit(supabase, `${auth.apiKeyId}:members:get`, 60))) {
+  const db = adminClient();
+  if (!(await rateLimit(db, `${auth.apiKeyId}:members:get`, 60))) {
     return errorResponse("rate_limited", "60 reads/min per key", 429);
   }
 
@@ -39,7 +39,7 @@ export async function GET(req: NextRequest) {
   const handle = url.searchParams.get("handle")?.toLowerCase() || null;
   const provider = url.searchParams.get("provider")?.toLowerCase() || null;
 
-  let q = supabase
+  let q = db
     .from("members")
     .select("id, email, display_name, actor_handle, github_login, avatar_url, role, tier, status")
     .eq("team_id", auth.teamId)
@@ -50,7 +50,7 @@ export async function GET(req: NextRequest) {
   const { data: rows, error } = await q.order("display_name");
   if (error) return errorResponse("internal", error.message, 500);
 
-  const identities = await listMemberIdentities(supabase, auth.teamId);
+  const identities = await listMemberIdentities(db, auth.teamId);
 
   const members = (rows ?? [])
     .map((m) => {

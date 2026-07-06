@@ -19,8 +19,8 @@ export async function POST(req: NextRequest) {
   const auth = await authenticateApiKey(req);
   if (!auth) return errorResponse("unauthorized", "invalid API key or team", 401);
 
-  const supabase = adminClient();
-  if (!(await rateLimit(supabase, `${auth.apiKeyId}:actions:post`, 60))) {
+  const db = adminClient();
+  if (!(await rateLimit(db, `${auth.apiKeyId}:actions:post`, 60))) {
     return errorResponse("rate_limited", "60 actions/min per key", 429);
   }
 
@@ -37,7 +37,7 @@ export async function POST(req: NextRequest) {
 
   try {
     const outcome = await runAction(
-      supabase,
+      db,
       {
         teamId: auth.teamId,
         memberId: auth.memberId,

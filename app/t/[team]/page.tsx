@@ -7,6 +7,7 @@ import { CopySnippet } from "@/components/copy-snippet";
 import { getPulseMetrics } from "@/lib/metrics/pulse";
 import { parseRange } from "@/lib/metrics/range";
 import { pickHomeState } from "@/lib/dashboard/home-state";
+import { buildAgentOnboardingPrompt } from "@/lib/onboarding/agent-prompt";
 import { AskBrain } from "@/components/dashboard/ask-brain";
 import { KpiBand } from "@/components/dashboard/kpi-band";
 import { RangeSelector } from "@/components/dashboard/range-selector";
@@ -18,11 +19,6 @@ import type { DecisionRow } from "@/components/dashboard/types";
 import { KnowledgeGrowth } from "@/components/charts/knowledge-growth";
 import { UsageChart } from "@/components/charts/usage-chart";
 import { TaskFunnel } from "@/components/charts/task-funnel";
-
-/** Placeholder until the personalized template lands (aios-workspace docs/getting-started/agent-onboarding.md). */
-function buildAgentPrompt(teamSlug: string): string {
-  return `You are onboarding a new AIOS individual contributor for the "${teamSlug}" team. Follow exactly: https://aiosbrain.dev/getting-started/onboarding-a-contributor/`;
-}
 
 function SetupChecklist({ teamSlug }: { teamSlug: string }) {
   const steps = [
@@ -88,15 +84,15 @@ export default async function TeamHome({
   const { team: teamSlug } = await params;
   const { range: rangeParam } = await searchParams;
   const range = parseRange(rangeParam);
-  const supabase = await serverClient();
+  const db = await serverClient();
 
   const [{ data: team }, user] = await Promise.all([
-    supabase.from("teams").select("id, name").eq("slug", teamSlug).maybeSingle(),
+    db.from("teams").select("id, name").eq("slug", teamSlug).maybeSingle(),
     getSessionUser(),
   ]);
   if (!team) return null; // layout already rendered the no-team screen
 
-  const { data: me } = await supabase
+  const { data: me } = await db
     .from("members")
     .select("id, role, tier, display_name")
     .eq("team_id", team.id)
@@ -110,14 +106,14 @@ export default async function TeamHome({
 
   // Tier-filtered count (no RLS backstop in postgres mode).
   const { count: itemCount } = await visibleItems(
-    supabase.from("items").select("id", { count: "exact", head: true }).eq("team_id", team.id),
+    db.from("items").select("id", { count: "exact", head: true }).eq("team_id", team.id),
     tier
   );
 
   // Has this member EVER issued their own key (revoked or not) — the proxy for "has this
   // person's workstation setup even started," independent of whether the TEAM has synced
   // anything yet (a member invited into an already-active team must still see this).
-  const { count: ownKeyCount } = await supabase
+  const { count: ownKeyCount } = await db
     .from("api_keys")
     .select("id", { count: "exact", head: true })
     .eq("team_id", team.id)
@@ -139,7 +135,7 @@ export default async function TeamHome({
   }
 
   if (homeState === "member-setup") {
-    const { data: keyRows } = await supabase
+    const { data: keyRows } = await db
       .from("api_keys")
       .select("id, key_id, name, created_at, last_used_at, revoked_at")
       .eq("team_id", team.id)
@@ -152,7 +148,10 @@ export default async function TeamHome({
         <WorkstationSetup
           teamSlug={teamSlug}
           firstName={firstName}
-          agentPrompt={buildAgentPrompt(teamSlug)}
+          agentPrompt={buildAgentOnboardingPrompt({
+            teamSlug,
+            brainUrl: (process.env.APP_URL ?? "").replace(/\/$/, ""),
+          })}
           keys={(keyRows ?? []) as MyKeyRow[]}
         />
       </div>
@@ -160,9 +159,9 @@ export default async function TeamHome({
   }
 
   const [pulse, { data: decisions }] = await Promise.all([
-    getPulseMetrics(supabase, team.id, range, { isAdmin, memberId }),
+    getPulseMetrics(db, team.id, range, { isAdmin, memberId }),
     visibleDecisions(
-      supabase
+      db
         .from("decisions")
         .select("id, title, decided_at, tier, still_valid")
         .eq("team_id", team.id)

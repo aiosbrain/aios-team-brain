@@ -22,8 +22,8 @@ export async function POST(req: NextRequest) {
     return errorResponse("forbidden_tier", "codebase metrics are team-tier only", 403);
   }
 
-  const supabase = adminClient();
-  if (!(await rateLimit(supabase, `${auth.apiKeyId}:codebases:post`, 60))) {
+  const db = adminClient();
+  if (!(await rateLimit(db, `${auth.apiKeyId}:codebases:post`, 60))) {
     return errorResponse("rate_limited", "60 scans/min per key", 429);
   }
 
@@ -51,8 +51,8 @@ export async function POST(req: NextRequest) {
   const headSha = parsed.data.metrics?.head_sha;
 
   try {
-    const result = await ingestCodebaseScan(supabase, auth, parsed.data);
-    await recordIngestRun(supabase, {
+    const result = await ingestCodebaseScan(db, auth, parsed.data);
+    await recordIngestRun(db, {
       teamId: auth.teamId,
       source: "scan",
       trigger,
@@ -64,7 +64,7 @@ export async function POST(req: NextRequest) {
     return Response.json({ status: "ok", ...result }, { status: 201 });
   } catch (e) {
     const msg = e instanceof Error ? e.message : "scan ingest failed";
-    await recordIngestRun(supabase, {
+    await recordIngestRun(db, {
       teamId: auth.teamId,
       source: "scan",
       trigger,

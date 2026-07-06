@@ -65,14 +65,14 @@ function refCount(it: SkillItem): number {
 
 export default async function SkillsPage({ params }: { params: Promise<{ team: string }> }) {
   const { team: teamSlug } = await params;
-  const supabase = await serverClient();
+  const db = await serverClient();
 
-  const { data: team } = await supabase.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
+  const { data: team } = await db.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
   if (!team) return null;
 
   const me = await currentMember(team.id);
   const { data: items } = await visibleItems(
-    supabase
+    db
       .from("items")
       .select("id, path, access, actor, synced_at, frontmatter, body, projects(slug)")
       .eq("team_id", team.id)

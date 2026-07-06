@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { LoginForm } from "@/components/login-form";
+import { magicLinkAvailable } from "@/lib/auth/mailer";
 
 export const metadata: Metadata = { title: "Sign in" };
 
@@ -9,6 +10,9 @@ export default async function LoginPage({
   searchParams: Promise<{ next?: string; error?: string }>;
 }) {
   const { next, error } = await searchParams;
+  // Password is always the default (needs no email infra); offer magic-link only when a domain +
+  // mail delivery are actually configured — env vars are server-only, so this is resolved here.
+  const magicLink = magicLinkAvailable();
 
   return (
     <main className="relative flex flex-1 items-center justify-center bg-surface-raised px-6 py-24">
@@ -36,7 +40,7 @@ export default async function LoginPage({
                 That link is invalid or expired — sign in with your email and password below.
               </p>
             ) : null}
-            <LoginForm next={next} />
+            <LoginForm next={next} magicLinkAvailable={magicLink} />
             <p className="mt-6 border-t border-border-subtle pt-4 text-xs text-ink-tertiary">
               Team Brain is invite-only: ask your team admin for an account and password.
             </p>

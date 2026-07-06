@@ -149,13 +149,13 @@ describe("runGraphProjection runner (real Postgres, mocked Graphiti)", () => {
     await ingest(seed, { kind: "transcript", path: "slack/client/2.md", body: "beta thread", access: "external" });
 
     const fake = new FakeGraphiti();
-    const first = await runGraphProjection({ teamId: seed.teamId, client: client(fake), supabase: db() });
+    const first = await runGraphProjection({ teamId: seed.teamId, client: client(fake), db: db() });
     expect(first.configured).toBe(true);
     expect(first.teams).toBe(1);
     expect(first.projected).toBe(2);
     expect(fake.pushes.map((p) => p.groupId).sort()).toEqual([`${slug}_external`, `${slug}_team`]);
 
-    const second = await runGraphProjection({ teamId: seed.teamId, client: client(new FakeGraphiti()), supabase: db() });
+    const second = await runGraphProjection({ teamId: seed.teamId, client: client(new FakeGraphiti()), db: db() });
     expect(second.projected).toBe(0);
     expect(second.skipped).toBe(2); // idempotent across the runner too
   });
@@ -176,7 +176,7 @@ describe("runGraphProjection runner (real Postgres, mocked Graphiti)", () => {
 
     const fake = new FakeGraphiti();
     // limit=2: without paging only the oldest 2 ever project; with the cursor all 5 do.
-    const res = await runGraphProjection({ teamId: seed.teamId, client: client(fake), supabase: db(), limit: 2 });
+    const res = await runGraphProjection({ teamId: seed.teamId, client: client(fake), db: db(), limit: 2 });
     expect(res.projected).toBe(5);
     expect(fake.pushes).toHaveLength(5);
     const { data: state } = await db().from("graph_episodes").select("source_id").eq("team_id", seed.teamId);

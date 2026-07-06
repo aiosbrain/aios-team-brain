@@ -20,14 +20,14 @@ export async function GET(req: NextRequest) {
   const auth = await authenticateApiKey(req);
   if (!auth) return errorResponse("unauthorized", "invalid API key or team", 401);
 
-  const supabase = adminClient();
-  if (!(await rateLimit(supabase, `${auth.apiKeyId}:integrations:get`, 60))) {
+  const db = adminClient();
+  if (!(await rateLimit(db, `${auth.apiKeyId}:integrations:get`, 60))) {
     return errorResponse("rate_limited", "60/min per key", 429);
   }
 
   try {
-    const integrations = await listEnabledIntegrationSelections(supabase, auth.teamId);
-    await audit(supabase, {
+    const integrations = await listEnabledIntegrationSelections(db, auth.teamId);
+    await audit(db, {
       team_id: auth.teamId,
       actor_kind: "api_key",
       member_id: auth.memberId,

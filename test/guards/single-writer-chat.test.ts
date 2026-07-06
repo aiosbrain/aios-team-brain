@@ -57,9 +57,9 @@ describe("single-writer: conversations / chat_messages", () => {
 
   it("the matcher discriminates (non-vacuity)", () => {
     const W = () => new RegExp(WRITE_RE.source, "g");
-    expect(W().test('await supabase.from("conversations").insert(rec)')).toBe(true);
-    expect(W().test('supabase.from("chat_messages")\n  .update(x)')).toBe(true);
-    expect(W().test('supabase.from("conversations").select("id").eq("team_id", t)')).toBe(false);
-    expect(W().test('supabase.from("tasks").upsert(row)')).toBe(false);
+    expect(W().test('await db.from("conversations").insert(rec)')).toBe(true);
+    expect(W().test('db.from("chat_messages")\n  .update(x)')).toBe(true);
+    expect(W().test('db.from("conversations").select("id").eq("team_id", t)')).toBe(false);
+    expect(W().test('db.from("tasks").upsert(row)')).toBe(false);
   });
 });

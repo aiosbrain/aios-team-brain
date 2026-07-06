@@ -45,11 +45,11 @@ export function deriveTitle(firstQuestion: string): string {
 type Owner = { teamId: string; memberId: string };
 
 export async function createConversation(
-  supabase: DbClient,
+  db: DbClient,
   owner: Owner,
   title: string
 ): Promise<{ id: string } | null> {
-  const { data, error } = await supabase
+  const { data, error } = await db
     .from("conversations")
     .insert({ team_id: owner.teamId, member_id: owner.memberId, title: deriveTitle(title) })
     .select("id")
@@ -60,11 +60,11 @@ export async function createConversation(
 
 /** True iff this member owns the conversation (the owner check every reader/writer runs first). */
 export async function ownsConversation(
-  supabase: DbClient,
+  db: DbClient,
   owner: Owner,
   conversationId: string
 ): Promise<boolean> {
-  const { data } = await supabase
+  const { data } = await db
     .from("conversations")
     .select("id")
     .eq("id", conversationId)
@@ -76,14 +76,14 @@ export async function ownsConversation(
 }
 
 export async function appendMessage(
-  supabase: DbClient,
+  db: DbClient,
   owner: Owner,
   conversationId: string,
   role: "user" | "assistant",
   content: string,
   usage: MessageUsage = {}
 ): Promise<void> {
-  const { error } = await supabase.from("chat_messages").insert({
+  const { error } = await db.from("chat_messages").insert({
     conversation_id: conversationId,
     team_id: owner.teamId,
     member_id: owner.memberId,
@@ -96,7 +96,7 @@ export async function appendMessage(
   });
   if (error) throw new Error(`appendMessage: ${error.message}`);
   // Bump the conversation so the list sorts most-recent-first.
-  await supabase
+  await db
     .from("conversations")
     .update({ updated_at: new Date().toISOString() })
     .eq("id", conversationId)
@@ -106,11 +106,11 @@ export async function appendMessage(
 
 /** The member's conversations, newest-active first, excluding archived. */
 export async function listConversations(
-  supabase: DbClient,
+  db: DbClient,
   owner: Owner,
   limit = 100
 ): Promise<Conversation[]> {
-  const { data } = await supabase
+  const { data } = await db
     .from("conversations")
     .select("id, title, created_at, updated_at")
     .eq("team_id", owner.teamId)
@@ -123,11 +123,11 @@ export async function listConversations(
 
 /** A conversation's full message thread — owner-checked; null if not owned/absent. */
 export async function getConversation(
-  supabase: DbClient,
+  db: DbClient,
   owner: Owner,
   conversationId: string
 ): Promise<{ id: string; title: string; messages: ChatMessage[] } | null> {
-  const { data: convo } = await supabase
+  const { data: convo } = await db
     .from("conversations")
     .select("id, title")
     .eq("id", conversationId)
@@ -137,7 +137,7 @@ export async function getConversation(
     .maybeSingle();
   const c = convo as { id: string; title: string } | null;
   if (!c) return null;
-  const { data: msgs } = await supabase
+  const { data: msgs } = await db
     .from("chat_messages")
     .select("id, role, content, cited_item_ids, created_at")
     .eq("conversation_id", conversationId)
@@ -150,13 +150,13 @@ export async function getConversation(
  * Owner-checked. Call this BEFORE persisting the current user message so it returns only prior turns.
  */
 export async function recentTurns(
-  supabase: DbClient,
+  db: DbClient,
   owner: Owner,
   conversationId: string,
   maxTurns = 6
 ): Promise<ChatTurn[]> {
-  if (!(await ownsConversation(supabase, owner, conversationId))) return [];
-  const { data } = await supabase
+  if (!(await ownsConversation(db, owner, conversationId))) return [];
+  const { data } = await db
     .from("chat_messages")
     .select("role, content, created_at")
     .eq("conversation_id", conversationId)
@@ -177,12 +177,12 @@ export async function recentTurns(
 }
 
 export async function renameConversation(
-  supabase: DbClient,
+  db: DbClient,
   owner: Owner,
   conversationId: string,
   title: string
 ): Promise<boolean> {
-  const { data, error } = await supabase
+  const { data, error } = await db
     .from("conversations")
     .update({ title: deriveTitle(title), updated_at: new Date().toISOString() })
     .eq("id", conversationId)
@@ -200,12 +200,12 @@ export async function renameConversation(
  * reorder the list). Owner-scoped. Used by the background title generator; a no-op if not owned.
  */
 export async function setTitle(
-  supabase: DbClient,
+  db: DbClient,
   owner: Owner,
   conversationId: string,
   title: string
 ): Promise<void> {
-  const { error } = await supabase
+  const { error } = await db
     .from("conversations")
     .update({ title: deriveTitle(title) })
     .eq("id", conversationId)
@@ -216,11 +216,11 @@ export async function setTitle(
 
 /** Soft-delete (archive) — hides it from the list; messages stay for any later restore/audit. */
 export async function archiveConversation(
-  supabase: DbClient,
+  db: DbClient,
   owner: Owner,
   conversationId: string
 ): Promise<boolean> {
-  const { data, error } = await supabase
+  const { data, error } = await db
     .from("conversations")
     .update({ archived_at: new Date().toISOString() })
     .eq("id", conversationId)

@@ -48,19 +48,19 @@ function mapStatus(status: ProjectionReport["status"]): TaskPmSyncReport["status
 // Back-compat wrapper retained for the work-events report shape. Loads the full task row and
 // delegates to the projection engine in statusOnly mode (reconcile workflow state only).
 export async function syncTaskPmLinks(
-  supabase: DbClient,
+  db: DbClient,
   task: TaskForPmSync,
   opts: { fetchImpl?: typeof fetch } = {}
 ): Promise<TaskPmSyncReport[]> {
   if (!task.row_key) return [{ row_key: "", provider: null, status: "no_link" }];
 
-  const { data } = await supabase
+  const { data } = await db
     .from("tasks")
     .select("id, team_id, project_id, row_key, title, status, sprint, priority, labels, body, parent_row_key")
     .eq("id", task.id)
     .maybeSingle();
   if (!data) return [{ row_key: task.row_key, provider: null, status: "no_link" }];
 
-  const report = await projectTask(supabase, data as ProjectionTaskRow, { statusOnly: true, fetchImpl: opts.fetchImpl });
+  const report = await projectTask(db, data as ProjectionTaskRow, { statusOnly: true, fetchImpl: opts.fetchImpl });
   return [{ row_key: report.row_key, provider: report.provider, status: mapStatus(report.status), error: report.error }];
 }

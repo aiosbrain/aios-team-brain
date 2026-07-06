@@ -39,9 +39,9 @@ export async function createDecisionAction(
     return { ok: false, error: "admins and leads only" };
   }
 
-  const supabase = await serverClient();
+  const db = await serverClient();
   for (let attempt = 0; attempt < 2; attempt++) {
-    const { data, error } = await supabase
+    const { data, error } = await db
       .from("decisions")
       .insert({
         team_id: input.teamId,
@@ -72,8 +72,8 @@ export async function setDecisionValidityAction(
   decisionId: string,
   stillValid: boolean
 ): Promise<{ ok: boolean; error?: string }> {
-  const supabase = await serverClient();
-  const { data: decision } = await supabase
+  const db = await serverClient();
+  const { data: decision } = await db
     .from("decisions")
     .select("team_id")
     .eq("id", decisionId)
@@ -85,7 +85,7 @@ export async function setDecisionValidityAction(
     return { ok: false, error: "admins and leads only" };
   }
 
-  const { error } = await supabase
+  const { error } = await db
     .from("decisions")
     .update({ still_valid: stillValid, updated_at: new Date().toISOString() })
     .eq("id", decisionId);

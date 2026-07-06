@@ -1,6 +1,7 @@
 import { serverClient } from "@/lib/db/server";
 import { InviteMember } from "@/components/admin/invite-member";
 import { MemberIdentities, type ProviderLink } from "@/components/admin/member-identities";
+import { MemberRoleSelect } from "@/components/admin/member-role-select";
 import { ReattributeButton } from "@/components/admin/reattribute-button";
 import { ResetPasswordButton } from "@/components/admin/reset-password-button";
 import { listMemberIdentities } from "@/lib/identity/list";
@@ -11,23 +12,23 @@ export default async function MembersAdminPage({
   params: Promise<{ team: string }>;
 }) {
   const { team: teamSlug } = await params;
-  const supabase = await serverClient();
+  const db = await serverClient();
 
-  const { data: team } = await supabase
+  const { data: team } = await db
     .from("teams")
     .select("id")
     .eq("slug", teamSlug)
     .maybeSingle();
   if (!team) return null;
 
-  const { data: members } = await supabase
+  const { data: members } = await db
     .from("members")
     .select("id, display_name, email, actor_handle, role, tier, status, github_login, avatar_url, created_at")
     .eq("team_id", team.id)
     .order("created_at");
 
   // All linked identities (email aliases + slack/linear/plane provider ids) for the panel.
-  const identities = await listMemberIdentities(supabase, team.id);
+  const identities = await listMemberIdentities(db, team.id);
   const providerOf = (memberId: string, provider: string): ProviderLink | null => {
     const p = identities.get(memberId)?.providers.find((x) => x.provider === provider);
     return p ? { externalId: p.externalId, handle: p.handle } : null;
@@ -67,9 +68,7 @@ export default async function MembersAdminPage({
                 <td className="px-4 py-3 text-ink-secondary">{m.email}</td>
                 <td className="px-4 py-3 font-mono text-xs text-ink-secondary">{m.actor_handle}</td>
                 <td className="px-4 py-3">
-                  <span className={`rounded-full px-2 py-0.5 text-xs ${m.role === "admin" ? "bg-violet/10 text-violet" : "bg-surface-overlay text-ink-secondary"}`}>
-                    {m.role}
-                  </span>
+                  <MemberRoleSelect teamSlug={teamSlug} memberId={m.id} role={m.role as "admin" | "lead" | "member"} />
                 </td>
                 <td className="px-4 py-3 text-ink-secondary">{m.tier}</td>
                 <td className="px-4 py-3">

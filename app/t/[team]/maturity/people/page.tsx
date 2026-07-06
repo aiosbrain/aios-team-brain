@@ -44,15 +44,15 @@ function radarData(axes: AemAxes): RadarDatum[] {
 export default async function MaturityPage({ params }: { params: Promise<{ team: string }> }) {
 
   const { team: teamSlug } = await params;
-  const supabase = await serverClient();
-  const { data: team } = await supabase.from("teams").select("id, name").eq("slug", teamSlug).maybeSingle();
+  const db = await serverClient();
+  const { data: team } = await db.from("teams").select("id, name").eq("slug", teamSlug).maybeSingle();
   if (!team) return null;
 
   const me = await currentMember(team.id);
   if (!me) return null;
 
   // Read helper enforces the team-tier gate (external → empty board).
-  const { members, teamAxes, spineDistribution, asOf } = await getTeamMaturity(supabase, team.id, me.tier);
+  const { members, teamAxes, spineDistribution, asOf } = await getTeamMaturity(db, team.id, me.tier);
 
   return (
     <div className="mx-auto flex max-w-6xl flex-col gap-5">

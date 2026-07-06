@@ -17,13 +17,18 @@ const schema = z.object({
 });
 
 /**
- * Email+password sign-in (audit M1/M2b — replaces the earlier passwordless flow that trusted any
- * known member email with no ownership proof). Invite-only: an admin must have created the member
- * AND set a password before anyone can sign in as them.
+ * Email+password sign-in — the DEFAULT sign-in path (audit M1/M2b — replaces the earlier
+ * passwordless flow that trusted any known member email with no ownership proof, and needs no
+ * email infrastructure to work). Invite-only: an admin must have created the member AND set a
+ * password before anyone can sign in as them.
  *
  * The failure response is intentionally the SAME (401 `invalid_credentials`) whether the email is
  * unrecognized, has no password set, or the password is wrong — so login can't be used to enumerate
- * member emails (the passwordless flow's 403-vs-200 shape was exactly that oracle).
+ * member emails (the old passwordless flow's 403-vs-200 shape was exactly that oracle).
+ *
+ * `POST /api/auth/request-magic-link` is an OPTIONAL secondary sign-in route, surfaced by the login
+ * form only when a domain + mail delivery are actually configured (`magicLinkAvailable()`) — a
+ * magic link can't work without somewhere real to send it.
  */
 export async function POST(req: NextRequest) {
   let body: unknown;

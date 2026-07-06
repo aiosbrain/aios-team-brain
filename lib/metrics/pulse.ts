@@ -85,10 +85,11 @@ function isoDay(d: Date): string {
 
 /**
  * Normalize a timestamptz to an ISO string. CRITICAL: the postgres adapter (the deployed backend)
- * returns timestamptz columns as **Date objects**, while supabase returns ISO strings. The window
- * math below compares/ slices these as strings, and `Date >= isoString` coerces the string to NaN
- * (→ always false), which silently bucketed every recent row as "prior" — the dashboard read 0 with
- * ↓100% on postgres. Mirrors lib/query/retrieve.ts. Accepts string | Date so both backends work.
+ * returns timestamptz columns as **Date objects**, whereas the legacy Supabase-js client returned
+ * ISO strings. The window math below compares/slices these as strings, and `Date >= isoString`
+ * coerces the string to NaN (→ always false), which silently bucketed every recent row as "prior" —
+ * the dashboard read 0 with ↓100% on postgres. Mirrors lib/query/retrieve.ts. Still accepts
+ * `string | Date` so a caller passing either shape normalizes correctly.
  */
 function toIso(v: string | Date): string {
   return typeof v === "string" ? v : new Date(v).toISOString();
@@ -133,7 +134,7 @@ const IN_FLIGHT = new Set(["ready", "in_progress", "blocked"]);
 // ── main ─────────────────────────────────────────────────────────────────────
 
 export async function getPulseMetrics(
-  supabase: DbClient,
+  db: DbClient,
   teamId: string,
   range: Range,
   viewer: { isAdmin: boolean; memberId: string }
@@ -150,7 +151,7 @@ export async function getPulseMetrics(
   // Fetch each source once over the combined [prior, now] window where a delta
   // is needed, then split current vs. prior in JS.
   const [itemsRes, queryRes, tasksRes] = await Promise.all([
-    supabase
+    db
       .from("items")
       .select("kind, synced_at")
       .eq("team_id", teamId)
@@ -158,7 +159,7 @@ export async function getPulseMetrics(
       .order("synced_at", { ascending: false })
       .limit(10_000),
     scopeQueryLog(
-      supabase
+      db
         .from("query_log")
         .select("cost_usd, created_at")
         .eq("team_id", teamId)
@@ -167,14 +168,14 @@ export async function getPulseMetrics(
         .limit(10_000),
       viewer
     ),
-    supabase
+    db
       .from("tasks")
       .select("status, updated_at")
       .eq("team_id", teamId)
       .limit(5_000),
   ]);
 
-  // NB: the pg adapter returns timestamptz as Date; supabase as string. Normalize via toIso below.
+  // NB: the pg adapter returns timestamptz as Date (legacy Supabase-js returned string). Normalize via toIso below.
   const itemRows = (itemsRes.data ?? []) as { kind: string; synced_at: string | Date }[];
   const queryRows = (queryRes.data ?? []) as { cost_usd: number | string; created_at: string | Date }[];
   const taskRows = (tasksRes.data ?? []) as { status: string; updated_at: string | Date }[];

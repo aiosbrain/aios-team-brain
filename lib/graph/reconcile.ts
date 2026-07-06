@@ -30,13 +30,13 @@ type EpisodeRow = {
 };
 
 export async function reconcileProjectedEpisodes(
-  supabase: DbClient,
+  db: DbClient,
   client: GraphitiClient,
   teamId: string
 ): Promise<ReconcileSummary> {
   if (!client.configured) return { groupsChecked: 0, confirmed: 0, reQueued: 0 };
 
-  const { data } = await supabase
+  const { data } = await db
     .from("graph_episodes")
     .select("id, source_id, group_id, projected_at, episode_uuid")
     .eq("team_id", teamId);
@@ -66,10 +66,10 @@ export async function reconcileProjectedEpisodes(
       if (uuid) {
         confirmed++;
         if (!row.episode_uuid) {
-          await supabase.from("graph_episodes").update({ episode_uuid: uuid }).eq("id", row.id);
+          await db.from("graph_episodes").update({ episode_uuid: uuid }).eq("id", row.id);
         }
       } else {
-        await supabase.from("graph_episodes").delete().eq("id", row.id);
+        await db.from("graph_episodes").delete().eq("id", row.id);
         reQueued++;
       }
     }

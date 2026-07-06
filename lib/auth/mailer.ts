@@ -91,6 +91,17 @@ export async function sendMagicLink(email: string, link: string): Promise<void> 
   });
 }
 
+/**
+ * Whether magic-link sign-in is a real, usable option right now: a stable domain (`APP_URL`) to
+ * build the link against, AND a mail provider actually configured to deliver it. Password login is
+ * the default and needs neither — this only gates whether the login form offers magic-link as a
+ * secondary option (`POST /api/auth/request-magic-link`). Without both, a "link sent" response would
+ * be a lie (no stable link, or nothing to send it with).
+ */
+export function magicLinkAvailable(): boolean {
+  return Boolean(process.env.APP_URL) && Boolean(process.env.RESEND_API_KEY || process.env.SMTP_URL);
+}
+
 export interface InviteEmailContext {
   /** The invitee's display name, as entered by the inviter. First name is used in the greeting. */
   inviteeName: string;

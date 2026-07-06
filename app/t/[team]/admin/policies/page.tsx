@@ -4,12 +4,12 @@ import { PoliciesManager } from "@/components/admin/policies-manager";
 
 export default async function PoliciesAdminPage({ params }: { params: Promise<{ team: string }> }) {
   const { team: teamSlug } = await params;
-  const supabase = await serverClient();
+  const db = await serverClient();
 
-  const { data: team } = await supabase.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
+  const { data: team } = await db.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
   if (!team) return null;
 
-  const policies = await listAllPolicies(supabase, team.id);
+  const policies = await listAllPolicies(db, team.id);
 
   return (
     <div className="flex flex-col gap-4">

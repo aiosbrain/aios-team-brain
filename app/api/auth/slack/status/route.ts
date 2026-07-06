@@ -19,12 +19,12 @@ export async function GET(req: NextRequest) {
   const auth = await authenticateApiKey(req);
   if (!auth) return errorResponse("unauthorized", "invalid API key or team", 401);
 
-  const supabase = adminClient();
-  if (!(await rateLimit(supabase, `${auth.apiKeyId}:slack-oauth:status`, 60))) {
+  const db = adminClient();
+  if (!(await rateLimit(db, `${auth.apiKeyId}:slack-oauth:status`, 60))) {
     return errorResponse("rate_limited", "60 reads/min per key", 429);
   }
 
-  const rec = await getMemberSecret(supabase, auth.teamId, auth.memberId, "slack");
+  const rec = await getMemberSecret(db, auth.teamId, auth.memberId, "slack");
   return Response.json(
     {
       connected: !!rec,

@@ -19,16 +19,16 @@ type ProjectCard = {
 
 export default async function ProjectsPage({ params }: { params: Promise<{ team: string }> }) {
   const { team: teamSlug } = await params;
-  const supabase = await serverClient();
+  const db = await serverClient();
 
-  const { data: team } = await supabase
+  const { data: team } = await db
     .from("teams")
     .select("id")
     .eq("slug", teamSlug)
     .maybeSingle();
   if (!team) return null;
 
-  const { data: projects } = await supabase
+  const { data: projects } = await db
     .from("projects")
     .select("id, slug, name, last_synced_at, items(count), tasks(count)")
     .eq("team_id", team.id)

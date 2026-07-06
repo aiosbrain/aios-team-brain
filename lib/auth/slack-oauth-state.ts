@@ -40,13 +40,13 @@ function secret(): Uint8Array {
  * Returns the signed `state` string for the Slack authorize URL.
  */
 export async function createSlackOAuthState(
-  supabase: DbClient,
+  db: DbClient,
   teamId: string,
   memberId: string
 ): Promise<string> {
   const nonce = randomUUID();
   const expiresAt = new Date(Date.now() + TTL_S * 1000).toISOString();
-  const { error } = await supabase
+  const { error } = await db
     .from("oauth_states")
     .insert({ nonce, team_id: teamId, member_id: memberId, provider: "slack", expires_at: expiresAt });
   if (error) throw new Error(`oauth state insert failed: ${error.message}`);
@@ -63,7 +63,7 @@ export async function createSlackOAuthState(
  * persisted row disagrees with the JWT claims. Single SQL UPDATE … RETURNING → no TOCTOU race.
  */
 export async function consumeSlackOAuthState(
-  supabase: DbClient,
+  db: DbClient,
   token: string | null | undefined
 ): Promise<{ teamId: string; memberId: string } | null> {
   if (!token) return null;
@@ -83,7 +83,7 @@ export async function consumeSlackOAuthState(
   }
 
   // Atomic single-use consume: succeeds only if the nonce is still unused and unexpired.
-  const { data, error } = await supabase
+  const { data, error } = await db
     .from("oauth_states")
     .update({ used_at: new Date().toISOString() })
     .eq("nonce", claims.nonce)

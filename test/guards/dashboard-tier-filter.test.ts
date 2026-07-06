@@ -65,8 +65,8 @@ describe("dashboard tier isolation", () => {
   });
 
   it("the matchers discriminate (non-vacuity)", () => {
-    expect(READS_ITEMS.test('supabase.from("items").select("id")')).toBe(true);
-    expect(READS_DECISIONS.test('supabase.from("decisions").select("id")')).toBe(true);
+    expect(READS_ITEMS.test('db.from("items").select("id")')).toBe(true);
+    expect(READS_DECISIONS.test('db.from("decisions").select("id")')).toBe(true);
     expect(CHOKE.test("query = visibleItems(query, me.tier)")).toBe(true);
     expect(DECISION_CHOKE.test("visibleDecisions(q, tier)")).toBe(true);
     expect(CHOKE.test('q.eq("team_id", t)')).toBe(false);

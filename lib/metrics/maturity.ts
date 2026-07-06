@@ -37,7 +37,7 @@ function rank(level: string | null): number {
 }
 
 export async function getTeamMaturity(
-  supabase: DbClient,
+  db: DbClient,
   teamId: string,
   range: Range,
   tier: ViewerTier
@@ -51,7 +51,7 @@ export async function getTeamMaturity(
     repos: [],
   };
 
-  const { codebases } = await getCodebaseSummaries(supabase, teamId, range, tier);
+  const { codebases } = await getCodebaseSummaries(db, teamId, range, tier);
   if (!codebases.length) return empty;
 
   const distribution = { ...empty.distribution };
