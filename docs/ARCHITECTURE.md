@@ -101,6 +101,11 @@ Two principals, one tier model:
   round-trip; unknown emails 403). Trusts the email with no ownership proof — acceptable only
   for this self-hosted, small known-member instance (`lib/auth/pg-login.loginByEmail`). The
   session is a `jose`-signed httpOnly cookie (`lib/auth/pg-session`).
+  Invite links (`GET /auth/confirm`) instead use a single-use magic-link token
+  (`issueMagicToken`/`redeemMagicToken`). A member's **first** redemption (an invite being
+  activated) routes through `/auth/welcome` — name, team, and inviter (resolved from the
+  append-only `audit_log`, no `invited_by` column needed) — before landing on the dashboard;
+  later logins redirect straight through as before.
 - **Machines** — per-member API key `aios_<key_id>_<secret>` (sha256 at rest, shown
   once). Sync writes use the **service role** — confined to `lib/ingest`
   and audited on every write.
