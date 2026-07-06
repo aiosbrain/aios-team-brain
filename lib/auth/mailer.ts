@@ -25,14 +25,29 @@ function senderFrom(): string {
   return "AIOS Team Brain <onboarding@resend.dev>";
 }
 
-async function deliver(to: string, subject: string, text: string): Promise<boolean> {
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+async function deliver(to: string, subject: string, body: { text: string; html?: string }): Promise<boolean> {
   const resendKey = process.env.RESEND_API_KEY;
   if (resendKey) {
     try {
       const res = await fetch("https://api.resend.com/emails", {
         method: "POST",
         headers: { Authorization: `Bearer ${resendKey}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ from: senderFrom(), to, subject, text }),
+        body: JSON.stringify({
+          from: senderFrom(),
+          to,
+          subject,
+          text: body.text,
+          ...(body.html ? { html: body.html } : {}),
+        }),
       });
       if (res.ok) return true;
       console.error(`[mailer] Resend rejected ${to}: HTTP ${res.status}`);
@@ -46,7 +61,13 @@ async function deliver(to: string, subject: string, text: string): Promise<boole
     try {
       const nodemailer = await import("nodemailer");
       const transport = nodemailer.createTransport(smtpUrl);
-      await transport.sendMail({ to, from: senderFrom(), subject, text });
+      await transport.sendMail({
+        to,
+        from: senderFrom(),
+        subject,
+        text: body.text,
+        ...(body.html ? { html: body.html } : {}),
+      });
       return true;
     } catch (err) {
       console.error(`[mailer] SMTP send failed for ${to}:`, err instanceof Error ? err.message : err);
@@ -65,21 +86,48 @@ async function deliver(to: string, subject: string, text: string): Promise<boole
 
 /** Magic-link sign-in email (login flow). Never throws. */
 export async function sendMagicLink(email: string, link: string): Promise<void> {
-  await deliver(
-    email,
-    "Your AIOS Team Brain sign-in link",
-    `Click to sign in (valid 15 minutes):\n\n${link}\n\nIf you didn't request this, ignore this email.`
-  );
+  await deliver(email, "Your AIOS Team Brain sign-in link", {
+    text: `Click to sign in (valid 15 minutes):\n\n${link}\n\nIf you didn't request this, ignore this email.`,
+  });
+}
+
+export interface InviteEmailContext {
+  /** The invitee's display name, as entered by the inviter. First name is used in the greeting. */
+  inviteeName: string;
+  teamName: string;
+  inviterName: string;
 }
 
 /**
  * New-member invite email. With a `link` (a one-time sign-in URL) it's a direct
  * sign-in; without one (no APP_URL configured) it's a non-secret nudge to sign in.
- * Never throws.
+ * Never throws. Names are attacker-controlled input (display names), so the HTML
+ * body escapes them — this is the only place they're rendered as markup.
  */
-export async function sendInviteEmail(email: string, link: string | null): Promise<void> {
+export async function sendInviteEmail(email: string, link: string | null, ctx: InviteEmailContext): Promise<void> {
+  const firstName = ctx.inviteeName.trim().split(/\s+/)[0] || ctx.inviteeName;
+  const subject = `${ctx.inviterName} added you to ${ctx.teamName} on AIOS`;
+
   const text = link
-    ? `You've been added to the AIOS Team Brain.\n\nSign in with this one-time link (single-use, expires in 24 hours):\n\n${link}\n\nIf you weren't expecting this, you can ignore this email.`
-    : `You've been added to the AIOS Team Brain. Open the team brain and sign in with this email address to get started.`;
-  await deliver(email, "You've been added to the AIOS Team Brain", text);
+    ? `Hi ${firstName},\n\n${ctx.inviterName} added you to ${ctx.teamName}'s AIOS Team Brain.\n\nSign in with this one-time link (single-use, expires in 24 hours):\n\n${link}\n\nIf you weren't expecting this, you can ignore this email.`
+    : `Hi ${firstName},\n\n${ctx.inviterName} added you to ${ctx.teamName}'s AIOS Team Brain. Open the team brain and sign in with this email address to get started.`;
+
+  const safeFirstName = escapeHtml(firstName);
+  const safeInviter = escapeHtml(ctx.inviterName);
+  const safeTeam = escapeHtml(ctx.teamName);
+  const intro = `<p>Hi ${safeFirstName},</p><p><strong>${safeInviter}</strong> added you to <strong>${safeTeam}</strong>'s AIOS Team Brain.</p>`;
+  const html = link
+    ? `<div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px;color:#1a1a1a;">
+        ${intro}
+        <p style="margin:24px 0;">
+          <a href="${link}" style="background:#111;color:#fff;padding:12px 20px;border-radius:6px;text-decoration:none;font-weight:600;display:inline-block;">Sign in to AIOS</a>
+        </p>
+        <p style="color:#666;font-size:13px;">This link is single-use and expires in 24 hours. If you weren't expecting this, you can ignore this email.</p>
+      </div>`
+    : `<div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px;color:#1a1a1a;">
+        ${intro}
+        <p>Open the team brain and sign in with this email address to get started.</p>
+      </div>`;
+
+  await deliver(email, subject, { text, html });
 }
