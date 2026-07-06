@@ -10,23 +10,23 @@ export default async function MembersAdminPage({
   params: Promise<{ team: string }>;
 }) {
   const { team: teamSlug } = await params;
-  const supabase = await serverClient();
+  const db = await serverClient();
 
-  const { data: team } = await supabase
+  const { data: team } = await db
     .from("teams")
     .select("id")
     .eq("slug", teamSlug)
     .maybeSingle();
   if (!team) return null;
 
-  const { data: members } = await supabase
+  const { data: members } = await db
     .from("members")
     .select("id, display_name, email, actor_handle, role, tier, status, github_login, avatar_url, created_at")
     .eq("team_id", team.id)
     .order("created_at");
 
   // All linked identities (email aliases + slack/linear/plane provider ids) for the panel.
-  const identities = await listMemberIdentities(supabase, team.id);
+  const identities = await listMemberIdentities(db, team.id);
   const providerOf = (memberId: string, provider: string): ProviderLink | null => {
     const p = identities.get(memberId)?.providers.find((x) => x.provider === provider);
     return p ? { externalId: p.externalId, handle: p.handle } : null;

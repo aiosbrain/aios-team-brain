@@ -25,7 +25,7 @@ export interface MemberSecret {
 
 /** Upsert a member's secret for a provider (encrypts at rest; audits keys/flags only). */
 export async function setMemberSecret(
-  supabase: DbClient,
+  db: DbClient,
   auth: MemberAuth,
   provider: string,
   secret: string,
@@ -34,7 +34,7 @@ export async function setMemberSecret(
   const p = provider.trim().toLowerCase();
   if (!p) throw new Error("provider is required");
   if (!secret) throw new Error("secret is required");
-  const { error } = await supabase
+  const { error } = await db
     .from("member_secrets")
     .upsert(
       {
@@ -48,7 +48,7 @@ export async function setMemberSecret(
       { onConflict: "team_id,member_id,provider" }
     );
   if (error) throw new Error(`member secret upsert failed: ${error.message}`);
-  await audit(supabase, {
+  await audit(db, {
     team_id: auth.teamId,
     actor_kind: "member",
     member_id: auth.memberId,
@@ -61,13 +61,13 @@ export async function setMemberSecret(
 
 /** Read + decrypt a member's secret, or null if not connected. Server-only. */
 export async function getMemberSecret(
-  supabase: DbClient,
+  db: DbClient,
   teamId: string,
   memberId: string,
   provider: string
 ): Promise<MemberSecret | null> {
   const p = provider.trim().toLowerCase();
-  const { data, error } = await supabase
+  const { data, error } = await db
     .from("member_secrets")
     .select("secret_ciphertext, meta, updated_at")
     .eq("team_id", teamId)
@@ -85,19 +85,19 @@ export async function getMemberSecret(
 
 /** Delete a member's secret for a provider (disconnect). Audited. */
 export async function deleteMemberSecret(
-  supabase: DbClient,
+  db: DbClient,
   auth: MemberAuth,
   provider: string
 ): Promise<void> {
   const p = provider.trim().toLowerCase();
-  const { error } = await supabase
+  const { error } = await db
     .from("member_secrets")
     .delete()
     .eq("team_id", auth.teamId)
     .eq("member_id", auth.memberId)
     .eq("provider", p);
   if (error) throw new Error(`member secret delete failed: ${error.message}`);
-  await audit(supabase, {
+  await audit(db, {
     team_id: auth.teamId,
     actor_kind: "member",
     member_id: auth.memberId,

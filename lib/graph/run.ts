@@ -29,10 +29,10 @@ export interface GraphProjectionSummary {
 const DEFAULT_LIMIT = Number(process.env.GRAPH_PROJECT_LIMIT ?? 500);
 
 async function resolveTeams(
-  supabase: DbClient,
+  db: DbClient,
   teamId?: string
 ): Promise<{ id: string; slug: string }[]> {
-  let q = supabase.from("teams").select("id, slug");
+  let q = db.from("teams").select("id, slug");
   if (teamId) q = q.eq("id", teamId);
   const { data, error } = await q;
   if (error) throw new Error(`graph projection: load teams failed: ${error.message}`);
@@ -42,7 +42,7 @@ async function resolveTeams(
 export async function runGraphProjection(opts?: {
   teamId?: string;
   client?: GraphitiClient;
-  supabase?: DbClient;
+  db?: DbClient;
   limit?: number;
 }): Promise<GraphProjectionSummary> {
   const client = opts?.client ?? new GraphitiClient();
@@ -57,14 +57,14 @@ export async function runGraphProjection(opts?: {
   };
   if (!client.configured) return summary; // nowhere to project — skip cleanly
 
-  const supabase = opts?.supabase ?? adminClient();
+  const db = opts?.db ?? adminClient();
   const limit = opts?.limit ?? DEFAULT_LIMIT;
-  const teams = await resolveTeams(supabase, opts?.teamId);
+  const teams = await resolveTeams(db, opts?.teamId);
   summary.teams = teams.length;
 
   for (const t of teams) {
     try {
-      const s = await projectItemsToGraph(supabase, {
+      const s = await projectItemsToGraph(db, {
         teamId: t.id,
         teamSlug: t.slug,
         client,

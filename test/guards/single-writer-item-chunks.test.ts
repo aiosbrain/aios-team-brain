@@ -62,7 +62,7 @@ describe("single-writer: item_chunks table", () => {
     RAW_RE.lastIndex = 0;
     expect(RAW_RE.test("select content from item_chunks where team_id = $1")).toBe(false);
     RAW_RE.lastIndex = 0;
-    expect(BUILDER_RE.test('supabase.from("item_chunks").insert(')).toBe(true);
+    expect(BUILDER_RE.test('db.from("item_chunks").insert(')).toBe(true);
     BUILDER_RE.lastIndex = 0;
   });
 });

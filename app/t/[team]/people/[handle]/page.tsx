@@ -34,15 +34,15 @@ export default async function PersonPage({
 
   const { team: teamSlug, handle } = await params;
   const range = parseRange((await searchParams).range);
-  const supabase = await serverClient();
+  const db = await serverClient();
 
-  const { data: team } = await supabase.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
+  const { data: team } = await db.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
   if (!team) return null;
   const me = await currentMember(team.id);
   if (!me) return null;
 
   const decodedHandle = decodeURIComponent(handle);
-  const p = await getMemberProfile(supabase, team.id, decodedHandle, range, me.tier);
+  const p = await getMemberProfile(db, team.id, decodedHandle, range, me.tier);
 
   if (!p) {
     // getMemberProfile gates on canSeeCodebases(tier) — an external-tier member (a client/
@@ -50,7 +50,7 @@ export default async function PersonPage({
     // for their OWN handle. That's the correct tier gate for commit metrics, but it must not
     // also block them from managing their own API key — resolve "is this actually me" directly
     // against the members table, independent of the tier-gated profile query.
-    const { data: meRow } = await supabase
+    const { data: meRow } = await db
       .from("members")
       .select("actor_handle, github_login")
       .eq("id", me.id)
@@ -64,7 +64,7 @@ export default async function PersonPage({
 
     if (!isSelfByHandle) notFound();
 
-    const { data: keyRows } = await supabase
+    const { data: keyRows } = await db
       .from("api_keys")
       .select("id, key_id, name, created_at, last_used_at, revoked_at")
       .eq("team_id", team.id)
@@ -79,13 +79,13 @@ export default async function PersonPage({
     );
   }
 
-  const context = await getMemberContext(supabase, team.id, p.member_id, me.tier);
+  const context = await getMemberContext(db, team.id, p.member_id, me.tier);
   const canEdit = !!context && (me.id === p.member_id || me.role === "admin");
   const isSelf = me.id === p.member_id;
 
   let myKeys: MyKeyRow[] = [];
   if (isSelf) {
-    const { data } = await supabase
+    const { data } = await db
       .from("api_keys")
       .select("id, key_id, name, created_at, last_used_at, revoked_at")
       .eq("team_id", team.id)

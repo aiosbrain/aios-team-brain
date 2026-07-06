@@ -20,8 +20,8 @@ export async function POST(req: NextRequest) {
   const auth = await authenticateApiKey(req);
   if (!auth) return errorResponse("unauthorized", "invalid API key or team", 401);
 
-  const supabase = adminClient();
-  if (!(await rateLimit(supabase, `${auth.apiKeyId}:items:post`, 120))) {
+  const db = adminClient();
+  if (!(await rateLimit(db, `${auth.apiKeyId}:items:post`, 120))) {
     return errorResponse("rate_limited", "120 pushes/min per key", 429);
   }
 
@@ -60,7 +60,7 @@ export async function POST(req: NextRequest) {
   }
 
   try {
-    const result = await ingestItem(supabase, auth, parsed.data, tier);
+    const result = await ingestItem(db, auth, parsed.data, tier);
 
     // Reactive auto-projection (brain-api v1.2 Phase 2): on a task push that actually changed
     // projected fields, schedule a bounded projection of ONLY the changed rows into the team's
@@ -99,8 +99,8 @@ export async function GET(req: NextRequest) {
   const auth = await authenticateApiKey(req);
   if (!auth) return errorResponse("unauthorized", "invalid API key or team", 401);
 
-  const supabase = adminClient();
-  if (!(await rateLimit(supabase, `${auth.apiKeyId}:items:get`, 60))) {
+  const db = adminClient();
+  if (!(await rateLimit(db, `${auth.apiKeyId}:items:get`, 60))) {
     return errorResponse("rate_limited", "60 pulls/min per key", 429);
   }
 
@@ -112,7 +112,7 @@ export async function GET(req: NextRequest) {
   const pathPrefix = url.searchParams.get("path_prefix");
 
   // Tier filtering re-applied server-side: external-tier keys see only external.
-  let q = supabase
+  let q = db
     .from("items")
     .select("id, path, kind, access, frontmatter, body, content_sha256, actor, updated_at, projects(slug)")
     .eq("team_id", auth.teamId)

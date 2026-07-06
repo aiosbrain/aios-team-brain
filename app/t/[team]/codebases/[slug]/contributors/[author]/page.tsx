@@ -39,14 +39,14 @@ export default async function ContributorPage({
   const ref = parseAuthor(author);
   if (!ref) notFound();
   const range = parseRange((await searchParams).range);
-  const supabase = await serverClient();
+  const db = await serverClient();
 
-  const { data: team } = await supabase.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
+  const { data: team } = await db.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
   if (!team) return null;
   const me = await currentMember(team.id);
   if (!me) return null;
 
-  const c = await getContributorDetail(supabase, team.id, slug, ref, range, me.tier);
+  const c = await getContributorDetail(db, team.id, slug, ref, range, me.tier);
   if (!c) notFound();
 
   const aiPct = c.totals.commits ? Math.round((100 * c.totals.ai_commits) / c.totals.commits) : 0;

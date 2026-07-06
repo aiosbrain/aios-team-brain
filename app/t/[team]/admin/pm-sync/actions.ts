@@ -11,10 +11,10 @@ import { projectAllTasks, type ProjectionReport } from "@/lib/pm-sync";
 import { reconcileProviderState, type DivergenceRow } from "@/lib/pm-sync/reconcile";
 
 async function requireAdmin(teamSlug: string) {
-  const supabase = await serverClient();
+  const db = await serverClient();
   const user = await getSessionUser();
   if (!user) return null;
-  const ctx = await resolveIntegrationsAdmin(supabase, teamSlug, user.id);
+  const ctx = await resolveIntegrationsAdmin(db, teamSlug, user.id);
   if (!ctx) return null;
   return { teamId: ctx.teamId, myMemberId: ctx.memberId };
 }

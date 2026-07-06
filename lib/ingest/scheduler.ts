@@ -24,14 +24,14 @@ export function startIngestScheduler(): void {
   const intervalMs = Math.max(1, minutes) * 60_000;
 
   const tick = async () => {
-    const supabase = adminClient();
-    await runImport(supabase, "slack", runSlackIngestion);
-    await runImport(supabase, "plane", runPlaneIngestion);
-    await runImport(supabase, "linear", runLinearIngestion);
+    const db = adminClient();
+    await runImport(db, "slack", runSlackIngestion);
+    await runImport(db, "plane", runPlaneIngestion);
+    await runImport(db, "linear", runLinearIngestion);
     // Inbound Linear→brain apply/adopt (brain-api v1.4) — sequenced AFTER the Linear ingest so
     // adopt sees freshly-imported mirror tasks. Per-team opt-in; quiet no-op otherwise.
-    await runInbound(supabase);
-    await runImport(supabase, "github", runGithubIngestion);
+    await runInbound(db);
+    await runImport(db, "github", runGithubIngestion);
     // Incremental dense (semantic) indexing of newly-synced items. No-op unless dense retrieval is
     // configured (EMBEDDINGS_URL + pgvector schema); best-effort — never fails the tick.
     try {
@@ -46,7 +46,7 @@ export function startIngestScheduler(): void {
   // Inbound PM-sync step (brain-api v1.4): apply Linear board edits to brain tasks + adopt
   // Linear-native issues, for opted-in teams. Records to ingest_runs like the importers; a
   // quiet pass (nothing enabled / nothing changed / no conflicts) logs nothing.
-  async function runInbound(supabase: ReturnType<typeof adminClient>): Promise<void> {
+  async function runInbound(db: ReturnType<typeof adminClient>): Promise<void> {
     const startedAt = Date.now();
     try {
       const s = await runLinearInbound();
@@ -57,7 +57,7 @@ export function startIngestScheduler(): void {
         `[ingest] linear-inbound: applied ${s.applied}, adopted ${s.adopted}, conflicts ${s.conflicts} (${s.teams} teams)` +
           (s.errors.length ? ` errors: ${s.errors.join("; ")}` : "")
       );
-      await recordIngestRun(supabase, {
+      await recordIngestRun(db, {
         source: "linear_inbound",
         trigger: "scheduler",
         ok: s.ok,
@@ -71,14 +71,14 @@ export function startIngestScheduler(): void {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`[ingest] linear-inbound tick failed:`, msg);
-      await recordIngestRun(supabase, { source: "linear_inbound", trigger: "scheduler", ok: false, errors: [msg], startedAt });
+      await recordIngestRun(db, { source: "linear_inbound", trigger: "scheduler", ok: false, errors: [msg], startedAt });
     }
   }
 
   // Shared runner: run one source, log a line, and record the outcome to ingest_runs so a failure
   // (or a silent staleness) is diagnosable later instead of only living in container logs.
   async function runImport(
-    supabase: ReturnType<typeof adminClient>,
+    db: ReturnType<typeof adminClient>,
     label: string,
     run: () => Promise<ImportSummary | IngestSummary>
   ): Promise<void> {
@@ -101,7 +101,7 @@ export function startIngestScheduler(): void {
       // Skip logging unconfigured sources with nothing to report (avoids a no-op row every tick);
       // still record configured sources (proves the poller ran) and anything with errors.
       if (s.integrations === 0 && s.errors.length === 0) return;
-      await recordIngestRun(supabase, {
+      await recordIngestRun(db, {
         source: label,
         trigger: "scheduler",
         ok: s.ok,
@@ -115,7 +115,7 @@ export function startIngestScheduler(): void {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`[ingest] ${label} tick failed:`, msg);
-      await recordIngestRun(supabase, { source: label, trigger: "scheduler", ok: false, errors: [msg], startedAt });
+      await recordIngestRun(db, { source: label, trigger: "scheduler", ok: false, errors: [msg], startedAt });
     }
   }
 

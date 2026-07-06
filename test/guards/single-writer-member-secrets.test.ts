@@ -53,9 +53,9 @@ describe("single-writer: member_secrets table", () => {
   });
 
   it("the matcher discriminates (non-vacuity)", () => {
-    expect(WRITE_RE.test('supabase.from("member_secrets").upsert(')).toBe(true);
+    expect(WRITE_RE.test('db.from("member_secrets").upsert(')).toBe(true);
     WRITE_RE.lastIndex = 0;
-    expect(WRITE_RE.test('supabase.from("member_secrets").select(')).toBe(false);
+    expect(WRITE_RE.test('db.from("member_secrets").select(')).toBe(false);
     WRITE_RE.lastIndex = 0;
   });
 });

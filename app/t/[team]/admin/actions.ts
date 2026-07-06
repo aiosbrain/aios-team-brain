@@ -11,16 +11,16 @@ import { sendInviteEmail } from "@/lib/auth/mailer";
 
 /** Verify the caller is an active admin of the team; returns ids or null. */
 async function requireAdmin(teamSlug: string) {
-  const supabase = await serverClient();
+  const db = await serverClient();
   const user = await getSessionUser();
   if (!user) return null;
-  const { data: team } = await supabase
+  const { data: team } = await db
     .from("teams")
     .select("id, name")
     .eq("slug", teamSlug)
     .maybeSingle();
   if (!team) return null;
-  const { data: me } = await supabase
+  const { data: me } = await db
     .from("members")
     .select("id, role, display_name")
     .eq("team_id", team.id)

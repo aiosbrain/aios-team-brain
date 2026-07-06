@@ -26,15 +26,15 @@ export default async function CodebaseDetailPage({
 
   const { team: teamSlug, slug } = await params;
   const range = parseRange((await searchParams).range);
-  const supabase = await serverClient();
+  const db = await serverClient();
 
-  const { data: team } = await supabase.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
+  const { data: team } = await db.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
   if (!team) return null;
 
   const me = await currentMember(team.id);
   if (!me) return null;
 
-  const cb = await getCodebaseDetail(supabase, team.id, slug, range, me.tier);
+  const cb = await getCodebaseDetail(db, team.id, slug, range, me.tier);
   if (!cb) notFound();
 
   const langs = Object.entries(cb.languages)

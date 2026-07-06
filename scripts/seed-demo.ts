@@ -19,7 +19,7 @@ if (!process.env.DATABASE_URL) {
   console.error("set DATABASE_URL (try: npx dotenvx run -f .env.local -- …, or export it)");
   process.exit(1);
 }
-const supabase = pgClient() as unknown as DbClient;
+const db = pgClient() as unknown as DbClient;
 
 const FIXTURES = path.resolve(__dirname, "..", "fixtures");
 const PROJECT_SLUG = "northwind-aios";
@@ -101,7 +101,7 @@ function* walk(dir: string, base: string): Generator<string> {
 
 async function main() {
   // 1. demo team
-  const { data: team, error: teamErr } = await supabase
+  const { data: team, error: teamErr } = await db
     .from("teams")
     .upsert({ slug: "demo", name: "Northwind Robotics — AI Transformation" }, { onConflict: "slug" })
     .select("id")
@@ -119,7 +119,7 @@ async function main() {
   ];
   const members: Record<string, string> = {};
   for (const m of memberDefs) {
-    const { data } = await supabase
+    const { data } = await db
       .from("members")
       .upsert(
         { team_id: team.id, ...m, status: "active", auth_user_id: null },
@@ -134,7 +134,7 @@ async function main() {
   const keyId = randomBytes(6).toString("hex");
   const secret = randomBytes(32).toString("base64url");
   const fullKey = `aios_${keyId}_${secret}`;
-  await supabase.from("api_keys").insert({
+  await db.from("api_keys").insert({
     team_id: team.id,
     member_id: members["alex"],
     key_id: keyId,
@@ -157,7 +157,7 @@ async function main() {
       : kind === "decision" ? parseDecisionRows(body)
       : undefined;
     await ingestItem(
-      supabase,
+      db,
       auth,
       {
         project: PROJECT_SLUG,
@@ -190,7 +190,7 @@ async function main() {
     const json = load(file);
     const items = Array.isArray(json) ? json : json[arrayKey] ?? Object.values(json)[0];
     for (const e of items as Record<string, unknown>[]) {
-      await supabase.from("graph_entities").upsert(
+      await db.from("graph_entities").upsert(
         {
           team_id: team.id,
           entity_id: String(e.id),
@@ -207,7 +207,7 @@ async function main() {
   const rels = Array.isArray(relJson) ? relJson : relJson.relationships ?? Object.values(relJson)[0];
   let relCount = 0;
   for (const r of rels as Record<string, unknown>[]) {
-    const { error } = await supabase.from("graph_relationships").upsert(
+    const { error } = await db.from("graph_relationships").upsert(
       {
         team_id: team.id,
         from_id: String(r.from_id),
@@ -221,11 +221,11 @@ async function main() {
   }
 
   // 6. verify materialization (the regression assertions)
-  const { count: taskCount } = await supabase
+  const { count: taskCount } = await db
     .from("tasks").select("id", { count: "exact", head: true }).eq("team_id", team.id);
-  const { count: decisionCount } = await supabase
+  const { count: decisionCount } = await db
     .from("decisions").select("id", { count: "exact", head: true }).eq("team_id", team.id);
-  const { count: itemCount } = await supabase
+  const { count: itemCount } = await db
     .from("items").select("id", { count: "exact", head: true }).eq("team_id", team.id);
 
   console.log(`team: demo (${team.id})`);

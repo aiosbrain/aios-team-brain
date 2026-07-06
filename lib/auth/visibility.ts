@@ -1,10 +1,10 @@
 import "server-only";
 
 /**
- * Tier-visibility choke-point for dashboard reads (CLAUDE.md §5). In postgres mode there is
- * NO RLS, so this app-code filter is the SOLE enforcement that an `external`-tier viewer never
- * sees `team`/`admin` content; in supabase mode it's defense-in-depth alongside RLS. Route
- * every dashboard `items` read through here — the dashboard-tier-filter guard enforces it.
+ * Tier-visibility choke-point for dashboard reads (CLAUDE.md §5). There is NO RLS, so this
+ * app-code filter is the SOLE enforcement that an `external`-tier viewer never sees `team`/`admin`
+ * content. Route every dashboard `items` read through here — the dashboard-tier-filter guard
+ * enforces it.
  */
 
 export type ViewerTier = "team" | "external";

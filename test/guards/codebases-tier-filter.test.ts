@@ -65,7 +65,7 @@ describe("codebase tier isolation", () => {
   });
 
   it("the matcher discriminates (non-vacuity)", () => {
-    expect(TABLES.test('supabase.from("code_metrics").select("x")')).toBe(true);
-    expect(TABLES.test('supabase.from("items").select("x")')).toBe(false);
+    expect(TABLES.test('db.from("code_metrics").select("x")')).toBe(true);
+    expect(TABLES.test('db.from("items").select("x")')).toBe(false);
   });
 });

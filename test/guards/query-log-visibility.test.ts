@@ -56,7 +56,7 @@ describe("query_log row-level visibility", () => {
   });
 
   it("the matchers discriminate (non-vacuity)", () => {
-    expect(READS_QUERY_LOG.test('supabase.from("query_log").select("cost_usd")')).toBe(true);
+    expect(READS_QUERY_LOG.test('db.from("query_log").select("cost_usd")')).toBe(true);
     expect(SCOPE.test("scopeQueryLog(q, { isAdmin, memberId })")).toBe(true);
     expect(SCOPE.test('q.eq("team_id", t)')).toBe(false);
   });

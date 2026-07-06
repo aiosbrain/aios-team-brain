@@ -38,16 +38,16 @@ export default async function DataPage({
 }) {
   const { team: teamSlug } = await params;
   const { channel: channelParam, limit: limitParam } = await searchParams;
-  const supabase = await serverClient();
+  const db = await serverClient();
 
-  const { data: team } = await supabase.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
+  const { data: team } = await db.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
   if (!team) return null;
 
   const me = await currentMember(team.id);
   const tier = me?.tier ?? "external";
 
   // 1) Channel list — group a bounded recent window of visible items by path prefix.
-  let chQuery = supabase
+  let chQuery = db
     .from("items")
     .select("path, synced_at")
     .eq("team_id", team.id)
@@ -65,7 +65,7 @@ export default async function DataPage({
   let items: FeedItem[] = [];
   let hasMore = false;
   if (selected) {
-    let feedQuery = supabase
+    let feedQuery = db
       .from("items")
       .select("id, path, kind, access, actor, synced_at, body")
       .eq("team_id", team.id)

@@ -39,11 +39,11 @@ function resolveItemAuthor(idMap: IdentityMap, fm: Record<string, unknown>): str
 }
 
 export async function reattributeItems(
-  supabase: DbClient,
+  db: DbClient,
   teamId: string
 ): Promise<ReattributeSummary> {
-  const idMap = await buildIdentityMap(supabase, teamId);
-  const { data: items } = await supabase
+  const idMap = await buildIdentityMap(db, teamId);
+  const { data: items } = await db
     .from("items")
     .select("id, member_id, frontmatter")
     .eq("team_id", teamId);
@@ -58,7 +58,7 @@ export async function reattributeItems(
   for (const it of rows) {
     const resolved = resolveItemAuthor(idMap, it.frontmatter ?? {});
     if (resolved && resolved !== it.member_id) {
-      const { error } = await supabase.from("items").update({ member_id: resolved }).eq("id", it.id);
+      const { error } = await db.from("items").update({ member_id: resolved }).eq("id", it.id);
       if (error) throw new Error(`reattribute item ${it.id}: ${error.message}`);
       updated++;
     }

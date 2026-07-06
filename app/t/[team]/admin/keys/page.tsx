@@ -8,9 +8,9 @@ export default async function KeysAdminPage({
   params: Promise<{ team: string }>;
 }) {
   const { team: teamSlug } = await params;
-  const supabase = await serverClient();
+  const db = await serverClient();
 
-  const { data: team } = await supabase
+  const { data: team } = await db
     .from("teams")
     .select("id")
     .eq("slug", teamSlug)
@@ -18,12 +18,12 @@ export default async function KeysAdminPage({
   if (!team) return null;
 
   const [{ data: keys }, { data: members }] = await Promise.all([
-    supabase
+    db
       .from("api_keys")
       .select("id, key_id, name, created_at, last_used_at, revoked_at, members(display_name, actor_handle)")
       .eq("team_id", team.id)
       .order("created_at", { ascending: false }),
-    supabase
+    db
       .from("members")
       .select("id, display_name, actor_handle")
       .eq("team_id", team.id)

@@ -87,7 +87,7 @@ function toEpisode(item: ItemRow): GraphEpisode {
  * an empty body are skipped (nothing to extract).
  */
 export async function projectItemsToGraph(
-  supabase: DbClient,
+  db: DbClient,
   args: {
     teamId: string;
     teamSlug: string;
@@ -101,7 +101,7 @@ export async function projectItemsToGraph(
   const limit = args.limit ?? 50;
   const kinds = args.kinds ?? PROJECTABLE_KINDS;
 
-  let q = supabase
+  let q = db
     .from("items")
     .select("id, kind, access, body, path, synced_at, frontmatter")
     .eq("team_id", args.teamId)
@@ -123,7 +123,7 @@ export async function projectItemsToGraph(
     }
     const contentSha = sha(episode.content);
 
-    const { data: existing } = await supabase
+    const { data: existing } = await db
       .from("graph_episodes")
       .select("content_sha256")
       .eq("team_id", args.teamId)
@@ -138,7 +138,7 @@ export async function projectItemsToGraph(
     const groupId = episodeGroupId(args.teamSlug, item.access);
     await client.addEpisodes(groupId, [episode]);
 
-    await supabase.from("graph_episodes").upsert(
+    await db.from("graph_episodes").upsert(
       {
         team_id: args.teamId,
         source_table: SOURCE_TABLE,
@@ -157,8 +157,8 @@ export async function projectItemsToGraph(
 
 /** Back-compat: project only Slack transcripts. Prefer `projectItemsToGraph` (all ingestions). */
 export async function projectSlackToGraph(
-  supabase: DbClient,
+  db: DbClient,
   args: { teamId: string; teamSlug: string; client?: GraphitiClient; since?: string; limit?: number }
 ): Promise<ProjectSummary> {
-  return projectItemsToGraph(supabase, { ...args, kinds: ["transcript"] });
+  return projectItemsToGraph(db, { ...args, kinds: ["transcript"] });
 }

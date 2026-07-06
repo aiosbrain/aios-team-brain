@@ -77,7 +77,7 @@ export async function generateTitle(
 
 /** Generate + persist a title for a freshly-created conversation. Best-effort (never throws to the caller). */
 export async function generateAndSetTitle(
-  supabase: DbClient,
+  db: DbClient,
   owner: { teamId: string; memberId: string },
   conversationId: string,
   question: string,
@@ -86,7 +86,7 @@ export async function generateAndSetTitle(
 ): Promise<void> {
   try {
     const title = await generateTitle(question, answer, keys);
-    if (title) await setTitle(supabase, owner, conversationId, title);
+    if (title) await setTitle(db, owner, conversationId, title);
   } catch {
     // keep the derived title
   }

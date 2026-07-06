@@ -49,8 +49,8 @@ function FreshnessBadge({ f }: { f: Freshness }) {
 export default async function CodebasesGithubPage({ params }: { params: Promise<{ team: string }> }) {
 
   const { team: teamSlug } = await params;
-  const supabase = await serverClient();
-  const { data: team } = await supabase.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
+  const db = await serverClient();
+  const { data: team } = await db.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
   if (!team) return null;
 
   const me = await currentMember(team.id);
@@ -69,7 +69,7 @@ export default async function CodebasesGithubPage({ params }: { params: Promise<
   }
 
   // Read helper enforces the team-tier gate; live HEAD compare is best-effort and never blocks.
-  const freshness = await getCodebaseFreshness(supabase, team.id, me.tier);
+  const freshness = await getCodebaseFreshness(db, team.id, me.tier);
   const rows = await withLiveHead(freshness, process.env.GITHUB_TOKEN);
 
   return (

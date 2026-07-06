@@ -13,9 +13,9 @@ export default async function QueryPage({
 }) {
   const { team: teamSlug } = await params;
   const { q } = await searchParams;
-  const supabase = await serverClient();
+  const db = await serverClient();
 
-  const { data: team } = await supabase
+  const { data: team } = await db
     .from("teams")
     .select("id, name")
     .eq("slug", teamSlug)

@@ -3,19 +3,19 @@ import { ApprovalsQueue, type ApprovalRow, type DecidedRow } from "@/components/
 
 export default async function ApprovalsAdminPage({ params }: { params: Promise<{ team: string }> }) {
   const { team: teamSlug } = await params;
-  const supabase = await serverClient();
+  const db = await serverClient();
 
-  const { data: team } = await supabase.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
+  const { data: team } = await db.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
   if (!team) return null;
 
-  const { data: pending } = await supabase
+  const { data: pending } = await db
     .from("approval_requests")
     .select("id, requested_by_actor, action, resource, context, created_at")
     .eq("team_id", team.id)
     .eq("status", "pending")
     .order("created_at", { ascending: false });
 
-  const { data: recent } = await supabase
+  const { data: recent } = await db
     .from("approval_requests")
     .select("id, requested_by_actor, action, resource, status, decided_at, decision_note")
     .eq("team_id", team.id)

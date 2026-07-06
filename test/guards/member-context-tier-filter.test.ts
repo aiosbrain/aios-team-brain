@@ -59,7 +59,7 @@ describe("identity-context tier isolation", () => {
   });
 
   it("the matcher discriminates (non-vacuity)", () => {
-    expect(TABLES.test('supabase.from("member_goals").select("x")')).toBe(true);
-    expect(TABLES.test('supabase.from("members").select("x")')).toBe(false);
+    expect(TABLES.test('db.from("member_goals").select("x")')).toBe(true);
+    expect(TABLES.test('db.from("members").select("x")')).toBe(false);
   });
 });

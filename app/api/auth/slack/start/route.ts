@@ -23,8 +23,8 @@ export async function GET(req: NextRequest) {
   const auth = await authenticateApiKey(req);
   if (!auth) return errorResponse("unauthorized", "invalid API key or team", 401);
 
-  const supabase = adminClient();
-  if (!(await rateLimit(supabase, `${auth.apiKeyId}:slack-oauth:start`, 30))) {
+  const db = adminClient();
+  if (!(await rateLimit(db, `${auth.apiKeyId}:slack-oauth:start`, 30))) {
     return errorResponse("rate_limited", "30 starts/min per key", 429);
   }
 
@@ -35,9 +35,9 @@ export async function GET(req: NextRequest) {
   }
 
   // Opportunistic hygiene: drop this member's expired nonces (no GC job needed for v1).
-  await supabase.from("oauth_states").delete().eq("member_id", auth.memberId).lt("expires_at", new Date().toISOString());
+  await db.from("oauth_states").delete().eq("member_id", auth.memberId).lt("expires_at", new Date().toISOString());
 
-  const state = await createSlackOAuthState(supabase, auth.teamId, auth.memberId);
+  const state = await createSlackOAuthState(db, auth.teamId, auth.memberId);
 
   const params = new URLSearchParams({
     client_id: clientId,

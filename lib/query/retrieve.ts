@@ -120,7 +120,7 @@ const GRAPH_FACTS_LIMIT = Number(process.env.GRAPH_QUERY_FACTS ?? 12);
 const GRAPH_QUERY_TIMEOUT_MS = Number(process.env.GRAPH_QUERY_TIMEOUT_MS ?? 4000);
 
 async function fetchGraphFacts(
-  supabase: DbClient,
+  db: DbClient,
   teamId: string,
   tier: "team" | "external",
   question: string
@@ -128,7 +128,7 @@ async function fetchGraphFacts(
   const client = new GraphitiClient({ timeoutMs: GRAPH_QUERY_TIMEOUT_MS });
   if (!client.configured) return [];
   try {
-    const { data: team } = await supabase.from("teams").select("slug").eq("id", teamId).maybeSingle();
+    const { data: team } = await db.from("teams").select("slug").eq("id", teamId).maybeSingle();
     const slug = (team as { slug: string } | null)?.slug;
     if (!slug) return [];
     const groupIds = visibleGroupIds(slug, tier);
@@ -209,9 +209,9 @@ export function wantsActivityContext(question: string): boolean {
  * member display name in here. **team-tier only** — code/contributor activity is internal, never
  * shown to an external viewer (CLAUDE.md §5). Returns "" when there's no recent activity.
  */
-async function gitActivityDigest(supabase: DbClient, teamId: string): Promise<string> {
+async function gitActivityDigest(db: DbClient, teamId: string): Promise<string> {
   const since = new Date(Date.now() - GIT_WINDOW_DAYS * 86_400_000).toISOString().slice(0, 10);
-  const { data: contribs } = await supabase
+  const { data: contribs } = await db
     .from("code_contributions")
     .select("codebase_id, member_id, author_name, author_email, commits, ai_commits, additions, deletions, day")
     .eq("team_id", teamId)
@@ -220,9 +220,9 @@ async function gitActivityDigest(supabase: DbClient, teamId: string): Promise<st
     .limit(2000);
   if (!contribs?.length) return "";
 
-  const { data: members } = await supabase.from("members").select("id, display_name").eq("team_id", teamId);
+  const { data: members } = await db.from("members").select("id, display_name").eq("team_id", teamId);
   const nameById = new Map((members ?? []).map((m) => [(m as { id: string }).id, (m as { display_name: string }).display_name]));
-  const { data: cbs } = await supabase.from("codebases").select("id, slug").eq("team_id", teamId);
+  const { data: cbs } = await db.from("codebases").select("id, slug").eq("team_id", teamId);
   const slugById = new Map((cbs ?? []).map((c) => [(c as { id: string }).id, (c as { slug: string }).slug]));
 
   type Agg = { name: string; email: string; commits: number; ai: number; adds: number; dels: number; repos: Set<string>; lastDay: string };
@@ -262,9 +262,9 @@ async function gitActivityDigest(supabase: DbClient, teamId: string): Promise<st
  * email). **team-tier only** — internal activity, never shown to an external viewer. Returns "" when
  * there's nothing attributed.
  */
-async function peopleActivityDigest(supabase: DbClient, teamId: string): Promise<string> {
+async function peopleActivityDigest(db: DbClient, teamId: string): Promise<string> {
   const since = new Date(Date.now() - PEOPLE_WINDOW_DAYS * 86_400_000).toISOString();
-  const { data: items } = await supabase
+  const { data: items } = await db
     .from("items")
     .select("member_id, kind, frontmatter, synced_at")
     .eq("team_id", teamId)
@@ -273,7 +273,7 @@ async function peopleActivityDigest(supabase: DbClient, teamId: string): Promise
     .limit(5000);
   if (!items?.length) return "";
 
-  const { data: members } = await supabase
+  const { data: members } = await db
     .from("members")
     .select("id, display_name, email")
     .eq("team_id", teamId);
@@ -326,26 +326,26 @@ async function peopleActivityDigest(supabase: DbClient, teamId: string): Promise
  * queries run in parallel; all respect the caller's tier.
  */
 async function nativeRetrieve(
-  supabase: DbClient,
+  db: DbClient,
   teamId: string,
   tier: "team" | "external",
   question: string,
   projectSlug?: string | null
 ): Promise<RetrievedContext> {
   // Kick off the Graphiti graph-memory search concurrently with Postgres retrieval.
-  const graphFactsP = fetchGraphFacts(supabase, teamId, tier, question);
+  const graphFactsP = fetchGraphFacts(db, teamId, tier, question);
   // Optional dense (semantic) passage search — pgvector. Runs concurrently; resolves to [] unless
   // EMBEDDINGS_URL is set AND the pgvector schema is loaded (default installs stay pure-FTS).
   const denseP = denseSearch(teamId, tier, question, projectSlug);
   // Git-activity + per-person activity digests (team tier only — internal) run in parallel too.
   // Context shaping: the activity digests are heavy + only relevant to "who's doing what" questions.
   const wantsActivity = tier === "team" && wantsActivityContext(question);
-  const gitDigestP = wantsActivity ? gitActivityDigest(supabase, teamId) : Promise.resolve("");
-  const peopleDigestP = wantsActivity ? peopleActivityDigest(supabase, teamId) : Promise.resolve("");
+  const gitDigestP = wantsActivity ? gitActivityDigest(db, teamId) : Promise.resolve("");
+  const peopleDigestP = wantsActivity ? peopleActivityDigest(db, teamId) : Promise.resolve("");
 
   // All independent retrieval queries run in PARALLEL (was sequential → ~7 serial round-trips).
   // 1. Recall-friendly FTS over items (OR of significant terms; see toOrQuery).
-  let ftsB = supabase
+  let ftsB = db
     .from("items")
     .select("id, path, kind, body, synced_at, projects(slug)")
     .eq("team_id", teamId)
@@ -354,7 +354,7 @@ async function nativeRetrieve(
   if (tier === "external") ftsB = ftsB.eq("access", "external");
 
   // 2. Recency: most recent items (a fallback so fresh content always has a shot).
-  let recentB = supabase
+  let recentB = db
     .from("items")
     .select("id, path, kind, body, synced_at, projects(slug)")
     .eq("team_id", teamId)
@@ -363,7 +363,7 @@ async function nativeRetrieve(
   if (tier === "external") recentB = recentB.eq("access", "external");
 
   // 3. Structured-context query builders (awaited together with the above).
-  let decisionsB = supabase
+  let decisionsB = db
     .from("decisions")
     .select("row_key, decided_at, title, decided_by, still_valid, projects(slug)")
     .eq("team_id", teamId)
@@ -374,25 +374,25 @@ async function nativeRetrieve(
   // can ground on finished tasks. `tasks.updated_at` is bumped on every sync upsert (incl. a
   // status→done transition), so recency ordering surfaces today's completions. (Was active-only:
   // `in_progress/blocked/ready`, which structurally hid every completion from the brain.)
-  const tasksB = supabase
+  const tasksB = db
     .from("tasks")
     .select("row_key, title, assignee, status, sprint, updated_at, projects(slug)")
     .eq("team_id", teamId)
     .order("updated_at", { ascending: false })
     .limit(80);
-  const commitmentsB = supabase
+  const commitmentsB = db
     .from("graph_entities")
     .select("entity_id, name, attrs")
     .eq("team_id", teamId)
     .eq("entity_type", "commitment")
     .limit(30);
-  const relsB = supabase
+  const relsB = db
     .from("graph_relationships")
     .select("from_id, to_id, relationship_type")
     .eq("team_id", teamId)
     .in("relationship_type", ["REPORTS_TO", "OWNS", "BLOCKS"])
     .limit(80);
-  const actorsB = supabase
+  const actorsB = db
     .from("graph_entities")
     .select("entity_id, name, attrs")
     .eq("team_id", teamId)
@@ -477,7 +477,7 @@ async function nativeRetrieve(
   const graphFacts = await graphFactsP;
   const expansion = graphExpansionQuery(graphFacts);
   if (expansion) {
-    let semB = supabase
+    let semB = db
       .from("items")
       .select("id, path, kind, body, synced_at, projects(slug)")
       .eq("team_id", teamId)
@@ -592,7 +592,7 @@ async function nativeRetrieve(
  */
 export const nativeProvider: RetrievalProvider = {
   name: "native",
-  retrieve: (r) => nativeRetrieve(r.supabase, r.teamId, r.tier, r.question, r.projectSlug),
+  retrieve: (r) => nativeRetrieve(r.db, r.teamId, r.tier, r.question, r.projectSlug),
 };
 
 /**
@@ -601,12 +601,12 @@ export const nativeProvider: RetrievalProvider = {
  * swapping the whole context layer for gbrain/another is `CONTEXT_PROVIDER=external` + an adapter.
  */
 export async function retrieve(
-  supabase: DbClient,
+  db: DbClient,
   teamId: string,
   tier: "team" | "external",
   question: string,
   projectSlug?: string | null
 ): Promise<RetrievedContext> {
   const provider = selectedProviderName() === "external" ? externalProvider : nativeProvider;
-  return provider.retrieve({ supabase, teamId, tier, question, projectSlug: projectSlug ?? null });
+  return provider.retrieve({ db, teamId, tier, question, projectSlug: projectSlug ?? null });
 }

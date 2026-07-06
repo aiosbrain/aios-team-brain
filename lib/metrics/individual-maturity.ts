@@ -193,13 +193,13 @@ function averageAxes(rows: AemAxes[]): AemAxes {
  * Spine distribution. Team-tier only — an external viewer gets an empty board.
  */
 export async function getTeamMaturity(
-  supabase: DbClient,
+  db: DbClient,
   teamId: string,
   tier: ViewerTier
 ): Promise<TeamMaturity> {
   if (!canSeeMaturity(tier)) return { asOf: null, members: [], teamAxes: averageAxes([]), spineDistribution: {} };
 
-  const { data: snaps } = await supabase
+  const { data: snaps } = await db
     .from("agentic_maturity_snapshots")
     .select(
       `member_id, snapshot_date, canonical_spine, canonical_overall, ce_band, tasks, sessions,
@@ -217,7 +217,7 @@ export async function getTeamMaturity(
   const memberIds = [...latest.keys()];
   const nameById = new Map<string, { handle: string; name: string; avatar: string | null }>();
   if (memberIds.length) {
-    const { data: members } = await supabase
+    const { data: members } = await db
       .from("members")
       .select("id, actor_handle, display_name, avatar_url")
       .in("id", memberIds);
@@ -277,14 +277,14 @@ export type MemberMaturity = {
  * (for the comparison radar) + the weakest-axis prescription. Team-tier only.
  */
 export async function getMemberMaturity(
-  supabase: DbClient,
+  db: DbClient,
   teamId: string,
   handle: string,
   tier: ViewerTier
 ): Promise<MemberMaturity | null> {
   if (!canSeeMaturity(tier)) return null;
 
-  const { data: member } = await supabase
+  const { data: member } = await db
     .from("members")
     .select("id, actor_handle, display_name, avatar_url")
     .eq("team_id", teamId)
@@ -293,7 +293,7 @@ export async function getMemberMaturity(
   if (!member) return null;
   const m = member as { id: string; actor_handle: string; display_name: string; avatar_url: string | null };
 
-  const { data: snaps } = await supabase
+  const { data: snaps } = await db
     .from("agentic_maturity_snapshots")
     .select(
       `member_id, snapshot_date, canonical_spine, canonical_overall, ce_band, tasks, sessions,
@@ -327,7 +327,7 @@ export async function getMemberMaturity(
   };
 
   // team average for the comparison overlay (reuse the team read, tier already checked)
-  const team = await getTeamMaturity(supabase, teamId, tier);
+  const team = await getTeamMaturity(db, teamId, tier);
 
   return {
     handle: m.actor_handle,

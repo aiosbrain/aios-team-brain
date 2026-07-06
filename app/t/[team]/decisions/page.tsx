@@ -11,9 +11,9 @@ export const metadata: Metadata = { title: "Decisions" };
 
 export default async function DecisionsPage({ params }: { params: Promise<{ team: string }> }) {
   const { team: teamSlug } = await params;
-  const supabase = await serverClient();
+  const db = await serverClient();
 
-  const { data: team } = await supabase
+  const { data: team } = await db
     .from("teams")
     .select("id")
     .eq("slug", teamSlug)
@@ -24,7 +24,7 @@ export default async function DecisionsPage({ params }: { params: Promise<{ team
 
   // The viewer's tier gates the decision read (audience filter) — fetch it before the
   // query so an external principal never receives team-audience rows (no RLS backstop).
-  const { data: me } = await supabase
+  const { data: me } = await db
     .from("members")
     .select("role, tier")
     .eq("team_id", team.id)
@@ -35,7 +35,7 @@ export default async function DecisionsPage({ params }: { params: Promise<{ team
 
   const [{ data: decisions }, { data: projects }] = await Promise.all([
     visibleDecisions(
-      supabase
+      db
         .from("decisions")
         .select(
           "id, row_key, decided_at, title, rationale, decided_by, impact, tier, audience, still_valid, projects(slug)"
@@ -44,7 +44,7 @@ export default async function DecisionsPage({ params }: { params: Promise<{ team
         .order("decided_at", { ascending: false }),
       tier
     ),
-    supabase
+    db
       .from("projects")
       .select("id, slug, name")
       .eq("team_id", team.id)
