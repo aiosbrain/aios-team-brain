@@ -2,6 +2,7 @@ import { serverClient } from "@/lib/db/server";
 import { InviteMember } from "@/components/admin/invite-member";
 import { MemberIdentities, type ProviderLink } from "@/components/admin/member-identities";
 import { ReattributeButton } from "@/components/admin/reattribute-button";
+import { ResetPasswordButton } from "@/components/admin/reset-password-button";
 import { listMemberIdentities } from "@/lib/identity/list";
 
 export default async function MembersAdminPage({
@@ -55,6 +56,7 @@ export default async function MembersAdminPage({
               <th className="px-4 py-3">Role</th>
               <th className="px-4 py-3">Tier</th>
               <th className="px-4 py-3">Status</th>
+              <th className="px-4 py-3">Password</th>
               <th className="px-4 py-3">Identities</th>
             </tr>
           </thead>
@@ -74,6 +76,9 @@ export default async function MembersAdminPage({
                   <span className={`text-xs ${m.status === "active" ? "text-emerald-600" : m.status === "invited" ? "text-amber-600" : "text-ink-tertiary"}`}>
                     {m.status}
                   </span>
+                </td>
+                <td className="px-4 py-3">
+                  <ResetPasswordButton teamSlug={teamSlug} memberId={m.id} />
                 </td>
                 <td className="px-4 py-3">
                   <MemberIdentities

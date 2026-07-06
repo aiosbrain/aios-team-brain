@@ -13,6 +13,8 @@ import { adminClient } from "@/lib/db/admin";
 import { createMember, deleteMember } from "@/lib/admin/members";
 import { issueApiKey, revokeApiKey } from "@/lib/admin/keys";
 import { issueLoginLink } from "@/lib/admin/login";
+import { adminSetPassword } from "@/lib/auth/pg-login";
+import { isPasswordStrongEnough, randomPassword, MIN_PASSWORD_LENGTH } from "@/lib/auth/password";
 import { createTeam, renameTeam } from "@/lib/admin/teams";
 import { addAuthorAlias } from "@/lib/admin/aliases";
 import { linkGithub, listOrgMembers } from "@/lib/codebases/github";
@@ -106,7 +108,7 @@ async function main() {
       break;
     }
     case "create-member": {
-      const email = positionals[0] || die("usage: create-member <email> --name <n> --handle <h>");
+      const email = positionals[0] || die("usage: create-member <email> --name <n> --handle <h> [--password <p>]");
       const team = await resolveTeam(admin, teamSlug);
       const res = await createMember(
         admin,
@@ -120,7 +122,14 @@ async function main() {
         },
         { upsert: Boolean(flags.upsert) }
       );
+      // Set a sign-in password (audit M1/M2b) — printed ONCE, never logged elsewhere. Without this
+      // the member row exists but no one can log in as them until an admin resets a password via
+      // the dashboard.
+      const password = (flags.password as string) || randomPassword();
+      if (!isPasswordStrongEnough(password)) die(`password must be at least ${MIN_PASSWORD_LENGTH} characters`);
+      await adminSetPassword(email, password);
       console.log(`✓ member ${email} (${res.id}) status=${res.status} on team ${team.slug}`);
+      console.log(`✓ password set (copy now, shown once): ${password}`);
       break;
     }
     case "login-link": {

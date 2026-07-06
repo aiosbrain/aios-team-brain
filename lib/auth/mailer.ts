@@ -73,13 +73,15 @@ export async function sendMagicLink(email: string, link: string): Promise<void> 
 }
 
 /**
- * New-member invite email. With a `link` (a one-time sign-in URL) it's a direct
- * sign-in; without one (no APP_URL configured) it's a non-secret nudge to sign in.
- * Never throws.
+ * New-member invite courtesy email. Sign-in is email+password (the admin shares the password
+ * out-of-band, the same "shown once" pattern as an API key) — this email NEVER carries a secret,
+ * it's just a heads-up that an account exists. Never throws.
  */
-export async function sendInviteEmail(email: string, link: string | null): Promise<void> {
-  const text = link
-    ? `You've been added to the AIOS Team Brain.\n\nSign in with this one-time link (single-use, expires in 24 hours):\n\n${link}\n\nIf you weren't expecting this, you can ignore this email.`
-    : `You've been added to the AIOS Team Brain. Open the team brain and sign in with this email address to get started.`;
-  await deliver(email, "You've been added to the AIOS Team Brain", text);
+export async function sendInviteEmail(email: string): Promise<void> {
+  await deliver(
+    email,
+    "You've been added to the AIOS Team Brain",
+    "You've been added to the AIOS Team Brain. Ask your admin for your sign-in password, then " +
+      "open the team brain and sign in with this email address."
+  );
 }

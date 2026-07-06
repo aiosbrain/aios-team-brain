@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { loginByEmail } from "@/lib/auth/pg-login";
+import { ensureAuthUser, linkMemberByEmail } from "@/lib/auth/pg-login";
 import {
   upsertIntegration,
   setIntegrationSecret,
@@ -40,9 +40,9 @@ async function seedMemberWithAuth(
     })
     .select("id")
     .single();
-  const user = await loginByEmail(email); // activates + links auth_user_id
-  if (!user) throw new Error("login link failed in seed");
-  return { memberId: m!.id as string, userId: user.id };
+  const userId = await ensureAuthUser(email); // activates + links auth_user_id
+  await linkMemberByEmail(userId, email);
+  return { memberId: m!.id as string, userId };
 }
 
 describe("integrations dashboard write gate (real Postgres)", () => {

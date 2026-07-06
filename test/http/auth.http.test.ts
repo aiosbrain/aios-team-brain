@@ -6,24 +6,40 @@ import { BASE_URL, issueKeyFor, keyHeaders, seedMemberEmail, seedTeam } from "./
 // real Set-Cookie session, and /api/v1/me round-trips Bearer + X-AIOS-Team headers.
 
 describe("POST /api/auth/login (HTTP)", () => {
-  it("rejects an unknown email with 403", async () => {
+  it("rejects an unknown email with a uniform 401 (not enumerable)", async () => {
     const res = await fetch(`${BASE_URL}/api/auth/login`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email: `nobody-${randomUUID().slice(0, 8)}@nope.test` }),
+      body: JSON.stringify({
+        email: `nobody-${randomUUID().slice(0, 8)}@nope.test`,
+        password: "whatever-password",
+      }),
     });
-    expect(res.status).toBe(403);
-    expect((await res.json()).error).toBe("not_recognized");
+    expect(res.status).toBe(401);
+    expect((await res.json()).error).toBe("invalid_credentials");
   });
 
-  it("signs in a known member with 200 + a session cookie", async () => {
+  it("rejects a recognized email with the wrong password — same 401 shape as an unknown email", async () => {
     const seed = await seedTeam();
-    const email = await seedMemberEmail(seed);
+    const { email } = await seedMemberEmail(seed);
 
     const res = await fetch(`${BASE_URL}/api/auth/login`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email }),
+      body: JSON.stringify({ email, password: "not-the-real-password" }),
+    });
+    expect(res.status).toBe(401);
+    expect((await res.json()).error).toBe("invalid_credentials");
+  });
+
+  it("signs in a known member with the correct password: 200 + a session cookie", async () => {
+    const seed = await seedTeam();
+    const { email, password } = await seedMemberEmail(seed);
+
+    const res = await fetch(`${BASE_URL}/api/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, password }),
     });
     expect(res.status).toBe(200);
     expect((await res.json()).ok).toBe(true);

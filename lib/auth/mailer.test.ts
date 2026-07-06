@@ -26,7 +26,7 @@ describe("mailer delivery", () => {
     vi.stubEnv("RESEND_API_KEY", "re_test_key");
     const fetchFn = mockFetch(true);
 
-    await sendInviteEmail("new@member.test", "https://brain.test/auth/confirm?token=REDACTED");
+    await sendInviteEmail("new@member.test");
 
     expect(fetchFn).toHaveBeenCalledTimes(1);
     expect(fetchFn.mock.calls[0][0]).toBe("https://api.resend.com/emails");
@@ -46,14 +46,14 @@ describe("mailer delivery", () => {
     vi.stubEnv("SMTP_URL", "");
     const fetchFn = vi.fn();
     vi.stubGlobal("fetch", fetchFn);
-    await expect(sendInviteEmail("a@b.test", null)).resolves.toBeUndefined();
+    await expect(sendInviteEmail("a@b.test")).resolves.toBeUndefined();
     expect(fetchFn).not.toHaveBeenCalled();
   });
 
-  it("an invite with no link is a non-secret nudge (no token in the body)", async () => {
+  it("an invite email never carries a password or token", async () => {
     vi.stubEnv("RESEND_API_KEY", "re_test_key");
     const fetchFn = mockFetch(true);
-    await sendInviteEmail("a@b.test", null);
+    await sendInviteEmail("a@b.test");
     const body = sentBody(fetchFn);
     expect(body.text).not.toMatch(/token=/);
     expect(body.text).toMatch(/sign in/i);

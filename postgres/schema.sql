@@ -54,8 +54,12 @@ exception when duplicate_object then null; end $$;
 create table if not exists auth_users (
   id uuid primary key default gen_random_uuid(),
   email citext not null unique,
+  -- Email+password auth (audit M1/M2b): admin sets the initial password, the member logs in with
+  -- it and can change it anytime. NULL = no password set yet (login rejected, not allowed through).
+  password_hash text,
   created_at timestamptz not null default now()
 );
+alter table auth_users add column if not exists password_hash text;
 
 create table if not exists auth_tokens (
   token_hash text primary key,             -- sha256(secret)

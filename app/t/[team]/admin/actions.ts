@@ -5,16 +5,35 @@ import { adminClient } from "@/lib/db/admin";
 import { requireTeamAdmin as requireAdmin } from "@/lib/auth/guard";
 import { createMember } from "@/lib/admin/members";
 import { issueApiKey as issueApiKeyPrimitive, revokeApiKey as revokeApiKeyPrimitive } from "@/lib/admin/keys";
-import { issueMagicToken } from "@/lib/auth/pg-login";
+import { adminSetPassword } from "@/lib/auth/pg-login";
+import { isPasswordStrongEnough, randomPassword, MIN_PASSWORD_LENGTH } from "@/lib/auth/password";
 import { sendInviteEmail } from "@/lib/auth/mailer";
 
+/**
+ * Create a member AND set their initial sign-in password (audit M1/M2b — replaces magic-link
+ * invites). `form.password` is optional: an admin can type one, or leave it blank to get a strong
+ * generated one — either way it's returned ONCE for the admin to hand to the person out-of-band
+ * (same "shown once" pattern as API key issuance below), never emailed.
+ */
 export async function inviteMember(
   teamSlug: string,
-  form: { email: string; displayName: string; actorHandle: string; role: "admin" | "lead" | "member" }
-): Promise<{ ok: boolean; error?: string }> {
+  form: {
+    email: string;
+    displayName: string;
+    actorHandle: string;
+    role: "admin" | "lead" | "member";
+    password?: string;
+  }
+): Promise<{ ok: boolean; password?: string; error?: string }> {
   const ctx = await requireAdmin(teamSlug);
   if (!ctx) return { ok: false, error: "admins only" };
 
+  const password = form.password?.trim() || randomPassword();
+  if (!isPasswordStrongEnough(password)) {
+    return { ok: false, error: `password must be at least ${MIN_PASSWORD_LENGTH} characters` };
+  }
+
+  const email = form.email.trim().toLowerCase();
   try {
     await createMember(
       adminClient(),
@@ -27,28 +46,20 @@ export async function inviteMember(
       },
       { actor: { kind: "member", memberId: ctx.memberId } }
     );
+    await adminSetPassword(email, password);
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "create failed" };
   }
 
-  // Best-effort invite email — never blocks the invite (createMember already succeeded).
-  // A direct one-time sign-in link when APP_URL is set (server actions have no request
-  // origin); otherwise a non-secret "sign in" nudge. The token is never logged.
+  // Best-effort courtesy notification — never blocks the invite, and never carries the password.
   try {
-    const email = form.email.trim().toLowerCase();
-    const appUrl = process.env.APP_URL?.replace(/\/$/, "");
-    let link: string | null = null;
-    if (appUrl) {
-      const raw = await issueMagicToken(email, `/t/${teamSlug}`, 1440); // 24h invite TTL
-      if (raw) link = `${appUrl}/auth/confirm?token=${raw}`;
-    }
-    await sendInviteEmail(email, link);
+    await sendInviteEmail(email);
   } catch (e) {
     console.error("[invite] email send failed:", e instanceof Error ? e.message : e);
   }
 
   revalidatePath(`/t/${teamSlug}/admin/members`);
-  return { ok: true };
+  return { ok: true, password };
 }
 
 export async function issueApiKey(

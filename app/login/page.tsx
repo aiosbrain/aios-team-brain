@@ -29,16 +29,16 @@ export default async function LoginPage({
             </p>
             <h1 className="mt-2 text-2xl font-semibold text-ink">Sign in</h1>
             <p className="mt-1 mb-6 text-sm text-ink-secondary">
-              Enter your work email to sign in.
+              Enter your work email and password to sign in.
             </p>
             {error === "invalid_link" ? (
               <p className="mb-4 rounded-lg border border-red/30 bg-red/5 px-3 py-2 text-sm text-red">
-                That link is invalid or expired — request a new one below.
+                That link is invalid or expired — sign in with your email and password below.
               </p>
             ) : null}
             <LoginForm next={next} />
             <p className="mt-6 border-t border-border-subtle pt-4 text-xs text-ink-tertiary">
-              Team Brain is invite-only: ask your team admin to add you before signing in.
+              Team Brain is invite-only: ask your team admin for an account and password.
             </p>
           </div>
         </div>
