@@ -129,6 +129,14 @@ export async function issueMagicToken(
 export interface RedeemResult {
   user: SessionUser;
   nextPath: string;
+  /** True iff this redemption activated an 'invited' member — the caller should show
+   * the one-time welcome screen instead of dropping straight onto the dashboard. */
+  firstLogin: boolean;
+}
+
+function teamSlugFromNextPath(nextPath: string): string | null {
+  const m = /^\/t\/([^/?]+)/.exec(nextPath);
+  return m ? m[1] : null;
 }
 
 /** Verify + consume a magic token; links the member and returns the session user. */
@@ -142,7 +150,22 @@ export async function redeemMagicToken(raw: string): Promise<RedeemResult | null
   );
   const tok = rows[0];
   if (!tok) return null;
+
+  // Capture 'invited' status BEFORE linkMemberByEmail activates it below.
+  let firstLogin = false;
+  const teamSlug = teamSlugFromNextPath(tok.next_path);
+  if (teamSlug) {
+    const { rows: memberRows } = await runSql<{ status: string }>(
+      `select m.status
+         from members m
+         join teams t on t.id = m.team_id
+        where t.slug = $1 and m.email = $2 and m.status <> 'disabled'`,
+      [teamSlug, tok.email]
+    );
+    firstLogin = memberRows[0]?.status === "invited";
+  }
+
   const id = await ensureAuthUser(tok.email);
   await linkMemberByEmail(id, tok.email);
-  return { user: { id, email: tok.email }, nextPath: tok.next_path };
+  return { user: { id, email: tok.email }, nextPath: tok.next_path, firstLogin };
 }

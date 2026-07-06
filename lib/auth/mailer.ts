@@ -25,14 +25,29 @@ function senderFrom(): string {
   return "AIOS Team Brain <onboarding@resend.dev>";
 }
 
-async function deliver(to: string, subject: string, text: string): Promise<boolean> {
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+async function deliver(to: string, subject: string, body: { text: string; html?: string }): Promise<boolean> {
   const resendKey = process.env.RESEND_API_KEY;
   if (resendKey) {
     try {
       const res = await fetch("https://api.resend.com/emails", {
         method: "POST",
         headers: { Authorization: `Bearer ${resendKey}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ from: senderFrom(), to, subject, text }),
+        body: JSON.stringify({
+          from: senderFrom(),
+          to,
+          subject,
+          text: body.text,
+          ...(body.html ? { html: body.html } : {}),
+        }),
       });
       if (res.ok) return true;
       console.error(`[mailer] Resend rejected ${to}: HTTP ${res.status}`);
@@ -46,7 +61,13 @@ async function deliver(to: string, subject: string, text: string): Promise<boole
     try {
       const nodemailer = await import("nodemailer");
       const transport = nodemailer.createTransport(smtpUrl);
-      await transport.sendMail({ to, from: senderFrom(), subject, text });
+      await transport.sendMail({
+        to,
+        from: senderFrom(),
+        subject,
+        text: body.text,
+        ...(body.html ? { html: body.html } : {}),
+      });
       return true;
     } catch (err) {
       console.error(`[mailer] SMTP send failed for ${to}:`, err instanceof Error ? err.message : err);
@@ -65,23 +86,41 @@ async function deliver(to: string, subject: string, text: string): Promise<boole
 
 /** Magic-link sign-in email (login flow). Never throws. */
 export async function sendMagicLink(email: string, link: string): Promise<void> {
-  await deliver(
-    email,
-    "Your AIOS Team Brain sign-in link",
-    `Click to sign in (valid 15 minutes):\n\n${link}\n\nIf you didn't request this, ignore this email.`
-  );
+  await deliver(email, "Your AIOS Team Brain sign-in link", {
+    text: `Click to sign in (valid 15 minutes):\n\n${link}\n\nIf you didn't request this, ignore this email.`,
+  });
+}
+
+export interface InviteEmailContext {
+  /** The invitee's display name, as entered by the inviter. First name is used in the greeting. */
+  inviteeName: string;
+  teamName: string;
+  inviterName: string;
 }
 
 /**
- * New-member invite courtesy email. Sign-in is email+password (the admin shares the password
- * out-of-band, the same "shown once" pattern as an API key) — this email NEVER carries a secret,
- * it's just a heads-up that an account exists. Never throws.
+ * New-member invite courtesy email, personalized (name/team/inviter). Sign-in is email+password
+ * (the admin shares the password out-of-band, the same "shown once" pattern as an API key) — this
+ * email NEVER carries a secret, it's just a heads-up that an account exists. Never throws. Names
+ * are attacker-controlled input (display names), so the HTML body escapes them — this is the only
+ * place they're rendered as markup.
  */
-export async function sendInviteEmail(email: string): Promise<void> {
-  await deliver(
-    email,
-    "You've been added to the AIOS Team Brain",
-    "You've been added to the AIOS Team Brain. Ask your admin for your sign-in password, then " +
-      "open the team brain and sign in with this email address."
-  );
+export async function sendInviteEmail(email: string, ctx: InviteEmailContext): Promise<void> {
+  const firstName = ctx.inviteeName.trim().split(/\s+/)[0] || ctx.inviteeName;
+  const subject = `${ctx.inviterName} added you to ${ctx.teamName} on AIOS`;
+
+  const text =
+    `Hi ${firstName},\n\n${ctx.inviterName} added you to ${ctx.teamName}'s AIOS Team Brain.\n\n` +
+    `Ask your admin for your sign-in password, then open the team brain and sign in with this email address.`;
+
+  const safeFirstName = escapeHtml(firstName);
+  const safeInviter = escapeHtml(ctx.inviterName);
+  const safeTeam = escapeHtml(ctx.teamName);
+  const intro = `<p>Hi ${safeFirstName},</p><p><strong>${safeInviter}</strong> added you to <strong>${safeTeam}</strong>'s AIOS Team Brain.</p>`;
+  const html = `<div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px;color:#1a1a1a;">
+        ${intro}
+        <p>Ask your admin for your sign-in password, then open the team brain and sign in with this email address.</p>
+      </div>`;
+
+  await deliver(email, subject, { text, html });
 }

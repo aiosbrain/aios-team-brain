@@ -102,9 +102,14 @@ Two principals, one tier model:
   scrypt hash in `auth_users.password_hash` (`lib/auth/password`, `lib/auth/pg-login.loginWithPassword`)
   → signed session cookie; the failure response is the SAME (401 `invalid_credentials`) whether the
   email is unknown, has no password set, or the password is wrong, so login can't be used to
-  enumerate members. Magic-link tokens (`issueMagicToken`/`redeemMagicToken`) remain as an
-  operator/admin-CLI one-time-login-link tool (`scripts/admin.ts login-link`), not the sign-in path.
-  The session is a `jose`-signed httpOnly cookie (`lib/auth/pg-session`).
+  enumerate members. A member's **first** successful login (an invite's first activation) routes
+  through `/auth/welcome` — name, team, and inviter (resolved from the append-only `audit_log`, no
+  `invited_by` column needed) — before landing on the dashboard; later logins go straight through
+  (`loginWithPassword`'s `firstLogin`, mirroring `redeemMagicToken`'s). Magic-link tokens
+  (`issueMagicToken`/`redeemMagicToken`, `GET /auth/confirm`) remain as an operator/admin-CLI
+  one-time-login-link tool (`scripts/admin.ts login-link`) — not the primary sign-in path, but they
+  drive the same first-login welcome screen when used. The session is a `jose`-signed httpOnly
+  cookie (`lib/auth/pg-session`).
 - **Machines** — per-member API key `aios_<key_id>_<secret>` (sha256 at rest, shown
   once). Sync writes use the **service role** — confined to `lib/ingest`
   and audited on every write.

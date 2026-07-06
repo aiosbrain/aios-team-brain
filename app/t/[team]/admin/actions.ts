@@ -13,7 +13,8 @@ import { sendInviteEmail } from "@/lib/auth/mailer";
  * Create a member AND set their initial sign-in password (audit M1/M2b — replaces magic-link
  * invites). `form.password` is optional: an admin can type one, or leave it blank to get a strong
  * generated one — either way it's returned ONCE for the admin to hand to the person out-of-band
- * (same "shown once" pattern as API key issuance below), never emailed.
+ * (same "shown once" pattern as API key issuance below), never emailed. The invite email is a
+ * personalized courtesy notification (name/team/inviter) — it never carries the password.
  */
 export async function inviteMember(
   teamSlug: string,
@@ -53,7 +54,16 @@ export async function inviteMember(
 
   // Best-effort courtesy notification — never blocks the invite, and never carries the password.
   try {
-    await sendInviteEmail(email);
+    const db = adminClient();
+    const [{ data: team }, { data: inviter }] = await Promise.all([
+      db.from("teams").select("name").eq("id", ctx.teamId).maybeSingle(),
+      db.from("members").select("display_name").eq("id", ctx.memberId).maybeSingle(),
+    ]);
+    await sendInviteEmail(email, {
+      inviteeName: form.displayName,
+      teamName: (team as { name: string } | null)?.name ?? teamSlug,
+      inviterName: (inviter as { display_name: string } | null)?.display_name ?? "Your admin",
+    });
   } catch (e) {
     console.error("[invite] email send failed:", e instanceof Error ? e.message : e);
   }
