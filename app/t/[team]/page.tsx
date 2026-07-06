@@ -7,6 +7,7 @@ import { CopySnippet } from "@/components/copy-snippet";
 import { getPulseMetrics } from "@/lib/metrics/pulse";
 import { parseRange } from "@/lib/metrics/range";
 import { pickHomeState } from "@/lib/dashboard/home-state";
+import { buildAgentOnboardingPrompt } from "@/lib/onboarding/agent-prompt";
 import { AskBrain } from "@/components/dashboard/ask-brain";
 import { KpiBand } from "@/components/dashboard/kpi-band";
 import { RangeSelector } from "@/components/dashboard/range-selector";
@@ -18,11 +19,6 @@ import type { DecisionRow } from "@/components/dashboard/types";
 import { KnowledgeGrowth } from "@/components/charts/knowledge-growth";
 import { UsageChart } from "@/components/charts/usage-chart";
 import { TaskFunnel } from "@/components/charts/task-funnel";
-
-/** Placeholder until the personalized template lands (aios-workspace docs/getting-started/agent-onboarding.md). */
-function buildAgentPrompt(teamSlug: string): string {
-  return `You are onboarding a new AIOS individual contributor for the "${teamSlug}" team. Follow exactly: https://aiosbrain.dev/getting-started/onboarding-a-contributor/`;
-}
 
 function SetupChecklist({ teamSlug }: { teamSlug: string }) {
   const steps = [
@@ -152,7 +148,10 @@ export default async function TeamHome({
         <WorkstationSetup
           teamSlug={teamSlug}
           firstName={firstName}
-          agentPrompt={buildAgentPrompt(teamSlug)}
+          agentPrompt={buildAgentOnboardingPrompt({
+            teamSlug,
+            brainUrl: (process.env.APP_URL ?? "").replace(/\/$/, ""),
+          })}
           keys={(keyRows ?? []) as MyKeyRow[]}
         />
       </div>
