@@ -11,14 +11,18 @@ const schema = z.object({
 });
 
 /**
- * Direct (passwordless) sign-in. Invite-only: if the email is a recognized
- * non-disabled member we set the signed session cookie immediately; otherwise we
- * reject with 403. No email round-trip / magic link.
- *
- * SECURITY: trusts the submitted email with no ownership proof — fine only for this
- * invite-only, self-hosted instance with a known member list. See lib/auth/pg-login.loginByEmail.
+ * DEV-ONLY direct (passwordless) sign-in: no email round-trip, sets the session
+ * cookie immediately for any recognized member. This used to be the production
+ * sign-in path — it traded ownership proof for convenience, which the code has long
+ * flagged as acceptable only for a small self-hosted instance. It no longer is: the
+ * real sign-in path is POST /api/auth/request-magic-link (see components/login-form).
+ * Hard-disabled outside development, mirroring app/auth/dev-login/route.ts exactly.
  */
 export async function POST(req: NextRequest) {
+  if (process.env.NODE_ENV === "production" && process.env.ALLOW_DEV_LOGIN !== "1") {
+    return NextResponse.json({ error: "not_found" }, { status: 404 });
+  }
+
   let body: unknown;
   try {
     body = await req.json();
