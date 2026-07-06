@@ -66,6 +66,22 @@ function sha(content: string): string {
   return createHash("sha256").update(content).digest("hex");
 }
 
+/**
+ * Resolve our stable episode `name` to Graphiti's server-assigned uuid within `groupId`, then
+ * delete it. `/messages` is fire-and-forget and never returns a uuid, so this is the only way to
+ * target a specific episode for deletion (audit M6). A no-op if the episode isn't found (already
+ * gone, or the async worker never got to it) — the caller treats this as best-effort.
+ */
+export async function deleteEpisodeByName(
+  client: GraphitiClient,
+  groupId: string,
+  name: string
+): Promise<void> {
+  const episodes = await client.listEpisodes(groupId);
+  const match = episodes.find((e) => e.name === name);
+  if (match) await client.deleteEpisode(match.uuid);
+}
+
 /** Episode content + provenance from an item, labeled by kind. */
 function toEpisode(item: ItemRow): GraphEpisode {
   const fm = item.frontmatter ?? {};
@@ -125,20 +141,30 @@ export async function projectItemsToGraph(
       continue; // nothing to extract
     }
     const contentSha = sha(episode.content);
+    const groupId = episodeGroupId(args.teamSlug, item.access);
 
     const { data: existing } = await supabase
       .from("graph_episodes")
-      .select("content_sha256")
+      .select("content_sha256, group_id")
       .eq("team_id", args.teamId)
       .eq("source_table", SOURCE_TABLE)
       .eq("source_id", item.id)
       .maybeSingle();
-    if (existing && existing.content_sha256 === contentSha) {
+    const existingRow = existing as { content_sha256: string; group_id: string } | null;
+    const tierChanged = existingRow && existingRow.group_id !== groupId;
+    if (existingRow && existingRow.content_sha256 === contentSha && !tierChanged) {
       skipped++;
-      continue; // unchanged → no-op (idempotent)
+      continue; // unchanged content, same tier → no-op (idempotent)
     }
 
-    const groupId = episodeGroupId(args.teamSlug, item.access);
+    // Audit M6: a tier reclassification (e.g. external→team) must not leave the old episode
+    // searchable in the old group forever — delete it there before projecting into the new group.
+    // Best-effort: Graphiti's async worker may not have created the node yet, or it may already be
+    // gone; either way we still proceed with the new-group push so projection isn't blocked on it.
+    if (tierChanged && existingRow) {
+      await deleteEpisodeByName(client, existingRow.group_id, episode.name!).catch(() => {});
+    }
+
     await client.addEpisodes(groupId, [episode]);
 
     await supabase.from("graph_episodes").upsert(

@@ -1,19 +1,43 @@
 import { describe, expect, it } from "vitest";
-import type { GraphitiClient, GraphEpisode } from "@/lib/graph/graphiti-client";
+import type { GraphitiClient, GraphEpisode, GraphEpisodeRef } from "@/lib/graph/graphiti-client";
 import { projectSlackToGraph, projectItemsToGraph, MAX_EPISODE_CHARS } from "@/lib/graph/project";
 import { runGraphProjection } from "@/lib/graph/run";
+import { reconcileProjectedEpisodes } from "@/lib/graph/reconcile";
 import { db, ingest, seedTeam } from "./helpers";
 
 // Spec: the projector reads Slack transcripts from the brain and pushes them to Graphiti as
 // episodes, idempotently, with tier-scoped group_ids. Verified on real Postgres with a MOCKED
 // Graphiti client (no live graph service needed) — we assert the pushes + the graph_episodes state.
 
+let fakeUuidCounter = 0;
+
+/** In-memory Graphiti double: tracks episodes per group with server-assigned uuids, so
+ * listEpisodes/deleteEpisode (M6, H3 reconcile) behave like the real REST surface. */
 class FakeGraphiti {
   pushes: { groupId: string; episodes: GraphEpisode[] }[] = [];
-  // runGraphProjection gates on `client.configured` — the fake reports configured so the run proceeds.
+  // groupId -> uuid -> episode (mirrors Graphiti's own per-group episode store)
+  store = new Map<string, Map<string, GraphEpisodeRef>>();
+  // Names that should be treated as "never landed" (simulates a worker crash before extraction).
+  neverLands = new Set<string>();
   readonly configured = true;
+
   async addEpisodes(groupId: string, episodes: GraphEpisode[]): Promise<void> {
     this.pushes.push({ groupId, episodes });
+    const group = this.store.get(groupId) ?? new Map<string, GraphEpisodeRef>();
+    for (const e of episodes) {
+      if (e.name && this.neverLands.has(e.name)) continue; // simulated crash: never materializes
+      const uuid = `fake-uuid-${++fakeUuidCounter}`;
+      group.set(uuid, { uuid, name: e.name ?? "" });
+    }
+    this.store.set(groupId, group);
+  }
+
+  async listEpisodes(groupId: string): Promise<GraphEpisodeRef[]> {
+    return [...(this.store.get(groupId)?.values() ?? [])];
+  }
+
+  async deleteEpisode(uuid: string): Promise<void> {
+    for (const group of this.store.values()) group.delete(uuid);
   }
 }
 
@@ -157,5 +181,113 @@ describe("runGraphProjection runner (real Postgres, mocked Graphiti)", () => {
     expect(fake.pushes).toHaveLength(5);
     const { data: state } = await db().from("graph_episodes").select("source_id").eq("team_id", seed.teamId);
     expect((state ?? []).length).toBe(5);
+  });
+});
+
+// Spec for audit M6: a tier reclassification (e.g. external→team) must not leave the old episode
+// searchable in the old Graphiti group forever. Verified on real Postgres with the stateful fake.
+describe("tier reclassification cleans up the stale episode (audit M6)", () => {
+  it("deletes the episode from the old group when a re-synced item's access tier changes", async () => {
+    const seed = await seedTeam();
+    const slug = await teamSlugFor(seed.teamId);
+    await ingest(seed, { kind: "deliverable", path: "docs/spec.md", body: "the spec", access: "external" });
+
+    const fake = new FakeGraphiti();
+    const first = await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(fake) });
+    expect(first.projected).toBe(1);
+    const externalGroup = `${slug}_external`;
+    expect(await fake.listEpisodes(externalGroup)).toHaveLength(1);
+
+    // Re-sync the same item, now team-tier (a legitimate access change on re-push — the real `aios
+    // push` CLI hashes the whole file incl. frontmatter, so a tier change always changes the sha;
+    // the test's `ingest()` helper hashes only `body`, so bump it here to model that honestly).
+    await ingest(seed, { kind: "deliverable", path: "docs/spec.md", body: "the spec, now team-tier", access: "team" });
+    const second = await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(fake) });
+    expect(second.projected).toBe(1);
+
+    // Old group no longer has it; new group does.
+    expect(await fake.listEpisodes(externalGroup)).toHaveLength(0);
+    const teamGroup = `${slug}_team`;
+    expect(await fake.listEpisodes(teamGroup)).toHaveLength(1);
+
+    // graph_episodes reflects the new group.
+    const { data: state } = await db()
+      .from("graph_episodes")
+      .select("group_id")
+      .eq("team_id", seed.teamId)
+      .maybeSingle();
+    expect((state as { group_id: string }).group_id).toBe(teamGroup);
+  });
+});
+
+// Spec for audit H3 (Option B): a recorded episode that never actually landed in Graphiti (the
+// worker crashed before/while extracting it) must be cleared so the next projector run re-pushes
+// it — and one that DID land gets its episode_uuid backfilled, not touched otherwise.
+describe("reconcileProjectedEpisodes (audit H3, real Postgres)", () => {
+  it("re-queues a recorded episode that never landed, and leaves a landed one alone (backfilling its uuid)", async () => {
+    const seed = await seedTeam();
+    const slug = await teamSlugFor(seed.teamId);
+    const group = `${slug}_team`;
+    const oldTimestamp = "2020-01-01T00:00:00Z"; // well outside the 5-min grace window
+
+    // "Landed" row: the fake's store actually has this episode.
+    const landedItem = await ingest(seed, { kind: "deliverable", path: "docs/landed.md", body: "landed", access: "team" });
+    const fake = new FakeGraphiti();
+    await fake.addEpisodes(group, [{ content: "landed", timestamp: oldTimestamp, sourceDescription: "x", name: `items:${landedItem.id}` }]);
+    await db().from("graph_episodes").insert({
+      team_id: seed.teamId, source_table: "items", source_id: landedItem.id,
+      group_id: group, content_sha256: "deadbeef", projected_at: oldTimestamp,
+    });
+
+    // "Crashed" row: recorded as projected, but the fake never actually stored it.
+    const crashedItem = await ingest(seed, { kind: "deliverable", path: "docs/crashed.md", body: "crashed", access: "team" });
+    await db().from("graph_episodes").insert({
+      team_id: seed.teamId, source_table: "items", source_id: crashedItem.id,
+      group_id: group, content_sha256: "cafef00d", projected_at: oldTimestamp,
+    });
+
+    const res = await reconcileProjectedEpisodes(db(), client(fake), seed.teamId);
+    expect(res.confirmed).toBe(1);
+    expect(res.reQueued).toBe(1);
+
+    // The landed row survives and now carries the resolved episode_uuid.
+    const { data: landedRow } = await db()
+      .from("graph_episodes")
+      .select("episode_uuid")
+      .eq("team_id", seed.teamId)
+      .eq("source_id", landedItem.id)
+      .maybeSingle();
+    expect((landedRow as { episode_uuid: string | null }).episode_uuid).toBeTruthy();
+
+    // The crashed row is gone — a subsequent projector run will treat it as unprojected.
+    const { data: crashedRow } = await db()
+      .from("graph_episodes")
+      .select("id")
+      .eq("team_id", seed.teamId)
+      .eq("source_id", crashedItem.id)
+      .maybeSingle();
+    expect(crashedRow).toBeNull();
+
+    const reproject = await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(fake) });
+    expect(reproject.projected).toBeGreaterThanOrEqual(1); // the crashed item gets re-pushed
+  });
+
+  it("does not judge a row projected within the grace window (still may be processing)", async () => {
+    const seed = await seedTeam();
+    const slug = await teamSlugFor(seed.teamId);
+    const group = `${slug}_team`;
+    const item = await ingest(seed, { kind: "deliverable", path: "docs/fresh.md", body: "fresh", access: "team" });
+    // Recorded just now, and the fake never stored it — but it's too fresh to judge.
+    await db().from("graph_episodes").insert({
+      team_id: seed.teamId, source_table: "items", source_id: item.id,
+      group_id: group, content_sha256: "abc123", projected_at: new Date().toISOString(),
+    });
+
+    const res = await reconcileProjectedEpisodes(db(), client(new FakeGraphiti()), seed.teamId);
+    expect(res.confirmed).toBe(0);
+    expect(res.reQueued).toBe(0); // left alone, not prematurely cleared
+
+    const { data } = await db().from("graph_episodes").select("id").eq("team_id", seed.teamId).eq("source_id", item.id).maybeSingle();
+    expect(data).not.toBeNull();
   });
 });

@@ -3,6 +3,7 @@ import type { DbClient } from "@/lib/db/types";
 import { adminClient } from "@/lib/db/admin";
 import { GraphitiClient } from "./graphiti-client";
 import { projectItemsToGraph } from "./project";
+import { reconcileProjectedEpisodes } from "./reconcile";
 
 /**
  * Graph-projection runner — the on-ramp that actually drives `projectSlackToGraph` (which is
@@ -21,6 +22,11 @@ export interface GraphProjectionSummary {
   scanned: number;
   projected: number;
   skipped: number;
+  /** Episodes confirmed to have actually landed in Graphiti this run (audit H3 reconcile pass). */
+  reconciled: number;
+  /** Episodes recorded as projected but never found in Graphiti — cleared so the next run
+   * re-pushes them (a worker crash between accept and extraction; audit H3). */
+  requeued: number;
   errors: string[];
 }
 
@@ -76,6 +82,8 @@ async function runGraphProjectionInner(opts?: {
     scanned: 0,
     projected: 0,
     skipped: 0,
+    reconciled: 0,
+    requeued: 0,
     errors: [],
   };
   if (!client.configured) return summary; // nowhere to project — skip cleanly
@@ -105,6 +113,12 @@ async function runGraphProjectionInner(opts?: {
         if (s.scanned < limit || !s.lastSyncedAt || s.lastSyncedAt === since) break;
         since = s.lastSyncedAt;
       }
+
+      // Reconcile after paging (audit H3, Option B): confirm this team's recorded episodes actually
+      // landed, and re-queue any that a crashed worker never got to. Off the hot push path.
+      const r = await reconcileProjectedEpisodes(supabase, client, t.id);
+      summary.reconciled += r.confirmed;
+      summary.requeued += r.reQueued;
     } catch (e) {
       summary.ok = false;
       summary.errors.push(`${t.slug}: ${e instanceof Error ? e.message : "projection failed"}`);
