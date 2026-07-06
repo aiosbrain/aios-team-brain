@@ -28,6 +28,11 @@ process.env.DATABASE_URL = databaseTestUrl;
 process.env.SECRETS_KEY ??= Buffer.alloc(32, 7).toString("base64");
 // The login route signs sessions with AUTH_SECRET (lib/auth/pg-session requires >=16 chars).
 process.env.AUTH_SECRET ??= "http-tier-test-secret-not-for-production";
+// Several other HTTP-tier test files use the direct-by-email POST /api/auth/login as a
+// convenience helper to establish a session for testing unrelated pages — not to test
+// login itself. That route (like /auth/dev-login) is now dev-only in production, so the
+// spawned `next start` server needs this same escape hatch for those helpers to keep working.
+process.env.ALLOW_DEV_LOGIN ??= "1";
 // Server port override (default 3010 — see test/http/server-url.ts, which derives
 // the URL both the server and clients use). We avoid process.env.BASE_URL: Vite
 // reserves that name and pins it to "/".
