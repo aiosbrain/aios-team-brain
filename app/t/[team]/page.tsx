@@ -113,7 +113,7 @@ export default async function TeamHome({
   // Has this member EVER issued their own key (revoked or not) — the proxy for "has this
   // person's workstation setup even started," independent of whether the TEAM has synced
   // anything yet (a member invited into an already-active team must still see this).
-  const { count: ownKeyCount } = await supabase
+  const { count: ownKeyCount } = await db
     .from("api_keys")
     .select("id", { count: "exact", head: true })
     .eq("team_id", team.id)
@@ -135,7 +135,7 @@ export default async function TeamHome({
   }
 
   if (homeState === "member-setup") {
-    const { data: keyRows } = await supabase
+    const { data: keyRows } = await db
       .from("api_keys")
       .select("id, key_id, name, created_at, last_used_at, revoked_at")
       .eq("team_id", team.id)
