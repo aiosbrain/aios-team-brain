@@ -10,7 +10,7 @@ import { reattributeItems } from "@/lib/ingest/reattribute";
 import { adminSetPassword } from "@/lib/auth/pg-login";
 import { isPasswordStrongEnough, randomPassword, MIN_PASSWORD_LENGTH } from "@/lib/auth/password";
 import { audit } from "@/lib/api/audit";
-import { updateMemberRole } from "@/lib/admin/members";
+import { updateMemberRole, deleteMember } from "@/lib/admin/members";
 
 // Providers whose identity is a stable user id in member_identities (GitHub uses its own login flow).
 const PROVIDERS = new Set(["slack", "linear", "plane"]);
@@ -227,6 +227,42 @@ export async function setMemberRole(
     return { ok: true };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "could not change role" };
+  }
+}
+
+/**
+ * Remove a member from the team (admins only). Soft-disables (`status='disabled'`) rather
+ * than hard-deleting — reversible, excluded from the active roster and `/api/v1/members`,
+ * and consistent with `deleteMember`'s default. A permanent hard delete stays a CLI-only
+ * operation (`scripts/admin.ts delete-member <email> --hard`) since it cascades away
+ * api_keys/aliases and isn't something a misclick in the dashboard should be able to do.
+ * Refuses to remove the LAST active admin, same guard as `setMemberRole`.
+ */
+export async function removeMember(
+  teamSlug: string,
+  memberId: string
+): Promise<{ ok: boolean; error?: string }> {
+  const ctx = await requireAdmin(teamSlug);
+  if (!ctx) return { ok: false, error: "admins only" };
+  const db = adminClient();
+  const { data: member } = await db
+    .from("members")
+    .select("email")
+    .eq("id", memberId)
+    .eq("team_id", ctx.teamId)
+    .maybeSingle();
+  if (!member) return { ok: false, error: "member not found on this team" };
+  try {
+    const res = await deleteMember(db, ctx.teamId, (member as { email: string }).email, {
+      actor: { kind: "member", memberId: ctx.memberId },
+    });
+    if (!res.deleted && res.reason === "last-admin") {
+      return { ok: false, error: "can't remove the last admin — promote someone else first" };
+    }
+    revalidatePath(`/t/${teamSlug}/admin/members`);
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "could not remove member" };
   }
 }
 

@@ -4,6 +4,7 @@ import { MemberIdentities, type ProviderLink } from "@/components/admin/member-i
 import { MemberRoleSelect } from "@/components/admin/member-role-select";
 import { ReattributeButton } from "@/components/admin/reattribute-button";
 import { ResetPasswordButton } from "@/components/admin/reset-password-button";
+import { RemoveMemberButton } from "@/components/admin/remove-member-button";
 import { listMemberIdentities } from "@/lib/identity/list";
 
 export default async function MembersAdminPage({
@@ -59,6 +60,7 @@ export default async function MembersAdminPage({
               <th className="px-4 py-3">Status</th>
               <th className="px-4 py-3">Password</th>
               <th className="px-4 py-3">Identities</th>
+              <th className="px-4 py-3">Remove</th>
             </tr>
           </thead>
           <tbody>
@@ -90,6 +92,9 @@ export default async function MembersAdminPage({
                     linear={providerOf(m.id, "linear")}
                     plane={providerOf(m.id, "plane")}
                   />
+                </td>
+                <td className="px-4 py-3">
+                  <RemoveMemberButton teamSlug={teamSlug} memberId={m.id} />
                 </td>
               </tr>
             ))}
