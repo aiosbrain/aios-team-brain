@@ -96,16 +96,17 @@ This server **implements brain-api v1.3** (the wire contract; source of truth:
 
 Two principals, one tier model:
 
-- **Humans** — invite-only. Sign-in is **direct passwordless**:
-  POST `/api/auth/login` with a recognized member email → signed session cookie (no email
-  round-trip; unknown emails 403). Trusts the email with no ownership proof — acceptable only
-  for this self-hosted, small known-member instance (`lib/auth/pg-login.loginByEmail`). The
-  session is a `jose`-signed httpOnly cookie (`lib/auth/pg-session`).
-  Invite links (`GET /auth/confirm`) instead use a single-use magic-link token
-  (`issueMagicToken`/`redeemMagicToken`). A member's **first** redemption (an invite being
-  activated) routes through `/auth/welcome` — name, team, and inviter (resolved from the
+- **Humans** — invite-only, **passwordless via magic link**. `POST /api/auth/request-magic-link`
+  issues + emails a single-use token (`issueMagicToken`/`sendMagicLink`; unknown emails still
+  get an explicit 403, matching the prior direct-login UX) and never sets a session cookie
+  itself. Clicking the emailed link hits `GET /auth/confirm`, which verifies + consumes the
+  token (`redeemMagicToken`) and is the ONLY place that sets the session cookie
+  (`jose`-signed httpOnly, `lib/auth/pg-session`). A member's **first** redemption (an invite
+  being activated) routes through `/auth/welcome` — name, team, and inviter (resolved from the
   append-only `audit_log`, no `invited_by` column needed) — before landing on the dashboard;
-  later logins redirect straight through as before.
+  later logins redirect straight through. `POST /api/auth/login` (direct-by-email, no
+  ownership proof, no email round-trip) is now **dev-only** — 404s in production unless
+  `ALLOW_DEV_LOGIN=1` — mirroring `/auth/dev-login`'s existing gate exactly.
 - **Machines** — per-member API key `aios_<key_id>_<secret>` (sha256 at rest, shown
   once). Sync writes use the **service role** — confined to `lib/ingest`
   and audited on every write.
@@ -494,7 +495,8 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 - `PATCH /api/dashboard/conversations/:id` — rename a thread (owner-only)
 - `DELETE /api/dashboard/conversations/:id` — soft-archive a thread (owner-only)
 - `GET /api/dashboard/team-work` — dashboard "Working On": per-person summary (narrative arcs) + open tasks + recent accomplishments; session-authed; tier-scoped
-- `POST /api/auth/login` — postgres-mode direct passwordless sign-in (invite-only; 403 if unknown)
+- `POST /api/auth/login` — **dev-only** (404 in production unless `ALLOW_DEV_LOGIN=1`): direct passwordless sign-in with no ownership proof, kept as a dev/test convenience
+- `POST /api/auth/request-magic-link` — the real sign-in path: issues + emails a single-use magic link (invite-only; 403 if unknown); never sets a session cookie itself
 <!-- /drift:routes -->
 
 ### Database tables
