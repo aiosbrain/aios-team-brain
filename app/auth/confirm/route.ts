@@ -28,7 +28,10 @@ export async function GET(request: NextRequest) {
       const dest = result.nextPath.startsWith("/") && !result.nextPath.startsWith("//")
         ? result.nextPath
         : "/";
-      const res = NextResponse.redirect(new URL(dest, base));
+      // First login (an invite being activated): route through the welcome screen
+      // instead of dropping straight onto the dashboard. Later logins are unaffected.
+      const target = result.firstLogin ? `/auth/welcome?next=${encodeURIComponent(dest)}` : dest;
+      const res = NextResponse.redirect(new URL(target, base));
       res.cookies.set(SESSION_COOKIE, await signSession(result.user), sessionCookieOptions());
       return res;
     }
