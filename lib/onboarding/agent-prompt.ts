@@ -1,5 +1,7 @@
 export interface AgentPromptContext {
   teamSlug: string;
+  /** The team's real display name (proper casing) — for prose, never the URL slug. */
+  teamName: string;
   /** This deployment's own base URL (APP_URL) — the brain a scaffolded workspace should connect to. */
   brainUrl: string;
 }
@@ -14,9 +16,13 @@ export interface AgentPromptContext {
  * themselves. Pure string template — no I/O, easy to keep in sync by eye with the
  * source doc in the sibling aios-workspace repo.
  */
-export function buildAgentOnboardingPrompt({ teamSlug, brainUrl }: AgentPromptContext): string {
+export function buildAgentOnboardingPrompt({
+  teamSlug,
+  teamName,
+  brainUrl,
+}: AgentPromptContext): string {
   return [
-    `You are onboarding a new AIOS individual contributor for the "${teamSlug}" team.`,
+    `You are onboarding a new AIOS individual contributor for the "${teamName}" team.`,
     `Follow exactly: https://aiosbrain.dev/getting-started/onboarding-a-contributor/`,
     ``,
     `Rules:`,
