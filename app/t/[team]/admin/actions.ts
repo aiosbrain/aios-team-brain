@@ -16,19 +16,19 @@ async function requireAdmin(teamSlug: string) {
   if (!user) return null;
   const { data: team } = await supabase
     .from("teams")
-    .select("id")
+    .select("id, name")
     .eq("slug", teamSlug)
     .maybeSingle();
   if (!team) return null;
   const { data: me } = await supabase
     .from("members")
-    .select("id, role")
+    .select("id, role, display_name")
     .eq("team_id", team.id)
     .eq("auth_user_id", user.id)
     .eq("status", "active")
     .maybeSingle();
   if (me?.role !== "admin") return null;
-  return { teamId: team.id, myMemberId: me.id };
+  return { teamId: team.id, teamName: team.name, myMemberId: me.id, myDisplayName: me.display_name };
 }
 
 export async function inviteMember(
@@ -65,7 +65,11 @@ export async function inviteMember(
       const raw = await issueMagicToken(email, `/t/${teamSlug}`, 1440); // 24h invite TTL
       if (raw) link = `${appUrl}/auth/confirm?token=${raw}`;
     }
-    await sendInviteEmail(email, link);
+    await sendInviteEmail(email, link, {
+      inviteeName: form.displayName,
+      teamName: ctx.teamName,
+      inviterName: ctx.myDisplayName,
+    });
   } catch (e) {
     console.error("[invite] email send failed:", e instanceof Error ? e.message : e);
   }
