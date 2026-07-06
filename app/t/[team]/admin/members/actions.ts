@@ -9,6 +9,7 @@ import { linkGithub } from "@/lib/codebases/github";
 import { setMemberIdentity, removeMemberIdentity } from "@/lib/identity/member-identities";
 import { addAuthorAlias, removeAuthorAlias } from "@/lib/admin/aliases";
 import { reattributeItems } from "@/lib/ingest/reattribute";
+import { updateMemberRole } from "@/lib/admin/members";
 
 // Providers whose identity is a stable user id in member_identities (GitHub uses its own login flow).
 const PROVIDERS = new Set(["slack", "linear", "plane"]);
@@ -165,6 +166,35 @@ export async function reattributeIdentitiesNow(
     return { ok: true, message: `Re-attributed ${s.updated} of ${s.scanned} item(s) to current identity mappings.` };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "re-attribution failed" };
+  }
+}
+
+/**
+ * Change an existing member's role (admins only). Refuses to demote the LAST active/invited
+ * admin, so a team can't lock itself out of its own admin panel — surfaced to the caller as an
+ * error rather than a silent no-op.
+ */
+export async function setMemberRole(
+  teamSlug: string,
+  memberId: string,
+  role: "admin" | "lead" | "member"
+): Promise<{ ok: boolean; error?: string }> {
+  const ctx = await requireAdmin(teamSlug);
+  if (!ctx) return { ok: false, error: "admins only" };
+  try {
+    const res = await updateMemberRole(adminClient(), ctx.teamId, memberId, role, {
+      actor: { kind: "member", memberId: ctx.memberId },
+    });
+    if (!res.updated && res.reason === "last-admin") {
+      return { ok: false, error: "can't demote the last admin — promote someone else first" };
+    }
+    if (!res.updated && res.reason === "absent") {
+      return { ok: false, error: "member not found" };
+    }
+    revalidatePath(`/t/${teamSlug}/admin/members`);
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "could not change role" };
   }
 }
 

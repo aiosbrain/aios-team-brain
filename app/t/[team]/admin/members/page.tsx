@@ -1,6 +1,7 @@
 import { serverClient } from "@/lib/db/server";
 import { InviteMember } from "@/components/admin/invite-member";
 import { MemberIdentities, type ProviderLink } from "@/components/admin/member-identities";
+import { MemberRoleSelect } from "@/components/admin/member-role-select";
 import { ReattributeButton } from "@/components/admin/reattribute-button";
 import { listMemberIdentities } from "@/lib/identity/list";
 
@@ -65,9 +66,7 @@ export default async function MembersAdminPage({
                 <td className="px-4 py-3 text-ink-secondary">{m.email}</td>
                 <td className="px-4 py-3 font-mono text-xs text-ink-secondary">{m.actor_handle}</td>
                 <td className="px-4 py-3">
-                  <span className={`rounded-full px-2 py-0.5 text-xs ${m.role === "admin" ? "bg-violet/10 text-violet" : "bg-surface-overlay text-ink-secondary"}`}>
-                    {m.role}
-                  </span>
+                  <MemberRoleSelect teamSlug={teamSlug} memberId={m.id} role={m.role as "admin" | "lead" | "member"} />
                 </td>
                 <td className="px-4 py-3 text-ink-secondary">{m.tier}</td>
                 <td className="px-4 py-3">

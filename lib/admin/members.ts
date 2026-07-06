@@ -58,6 +58,61 @@ export async function createMember(
   return { id: data.id, status: data.status };
 }
 
+export interface UpdateRoleResult {
+  updated: boolean;
+  reason?: "absent" | "last-admin" | "unchanged";
+  role?: "admin" | "lead" | "member";
+}
+
+/**
+ * Change an existing member's role (admins only — the caller gates via requireAdmin).
+ * Mirrors deleteMember's last-admin guard: refuses to demote the LAST non-disabled
+ * admin, so a team can never lock itself out of its own admin panel.
+ */
+export async function updateMemberRole(
+  admin: DbClient,
+  teamId: string,
+  memberId: string,
+  role: "admin" | "lead" | "member",
+  opts: { actor?: ActorContext } = {}
+): Promise<UpdateRoleResult> {
+  const { data: m } = await admin
+    .from("members")
+    .select("id, role, status")
+    .eq("team_id", teamId)
+    .eq("id", memberId)
+    .maybeSingle();
+  const member = m as { id: string; role: "admin" | "lead" | "member"; status: string } | null;
+  if (!member) return { updated: false, reason: "absent" };
+  if (member.role === role) return { updated: false, reason: "unchanged", role };
+
+  // Refuse to demote the last non-disabled admin (counts active AND invited admins,
+  // matching deleteMember — a disabled admin can't administer either way).
+  if (member.role === "admin" && member.status !== "disabled") {
+    const { data: admins } = await admin
+      .from("members")
+      .select("id")
+      .eq("team_id", teamId)
+      .eq("role", "admin")
+      .neq("status", "disabled");
+    if ((admins ?? []).length <= 1) return { updated: false, reason: "last-admin" };
+  }
+
+  const { error } = await admin.from("members").update({ role }).eq("id", member.id);
+  if (error) throw new Error(`update member role failed: ${error.message}`);
+
+  await audit(admin, {
+    team_id: teamId,
+    actor_kind: opts.actor?.kind ?? "system",
+    member_id: opts.actor?.memberId ?? null,
+    action: "member.role_changed",
+    target_type: "member",
+    target_id: member.id,
+    meta: { from: member.role, to: role },
+  });
+  return { updated: true, role };
+}
+
 export interface DeleteResult {
   deleted: boolean;
   reason?: "absent" | "last-admin";
