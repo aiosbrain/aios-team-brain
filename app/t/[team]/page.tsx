@@ -6,15 +6,23 @@ import { getSessionUser } from "@/lib/auth/session";
 import { CopySnippet } from "@/components/copy-snippet";
 import { getPulseMetrics } from "@/lib/metrics/pulse";
 import { parseRange } from "@/lib/metrics/range";
+import { pickHomeState } from "@/lib/dashboard/home-state";
 import { AskBrain } from "@/components/dashboard/ask-brain";
 import { KpiBand } from "@/components/dashboard/kpi-band";
 import { RangeSelector } from "@/components/dashboard/range-selector";
 import { DecisionsCard } from "@/components/dashboard/decisions-card";
 import { WorkingOn } from "@/components/dashboard/working-on";
+import { WorkstationSetup } from "@/components/dashboard/workstation-setup";
+import type { MyKeyRow } from "@/components/people/my-api-keys";
 import type { DecisionRow } from "@/components/dashboard/types";
 import { KnowledgeGrowth } from "@/components/charts/knowledge-growth";
 import { UsageChart } from "@/components/charts/usage-chart";
 import { TaskFunnel } from "@/components/charts/task-funnel";
+
+/** Placeholder until the personalized template lands (aios-workspace docs/getting-started/agent-onboarding.md). */
+function buildAgentPrompt(teamSlug: string): string {
+  return `You are onboarding a new AIOS individual contributor for the "${teamSlug}" team. Follow exactly: https://aiosbrain.dev/getting-started/onboarding-a-contributor/`;
+}
 
 function SetupChecklist({ teamSlug }: { teamSlug: string }) {
   const steps = [
@@ -90,7 +98,7 @@ export default async function TeamHome({
 
   const { data: me } = await supabase
     .from("members")
-    .select("id, role, tier")
+    .select("id, role, tier, display_name")
     .eq("team_id", team.id)
     .eq("auth_user_id", user?.id ?? "")
     .eq("status", "active")
@@ -98,6 +106,7 @@ export default async function TeamHome({
   const isAdmin = me?.role === "admin";
   const tier = ((me?.tier as "team" | "external" | undefined) ?? "external");
   const memberId = (me?.id as string | undefined) ?? "";
+  const firstName = ((me?.display_name as string | undefined) ?? "").trim().split(/\s+/)[0] || "there";
 
   // Tier-filtered count (no RLS backstop in postgres mode).
   const { count: itemCount } = await visibleItems(
@@ -105,11 +114,47 @@ export default async function TeamHome({
     tier
   );
 
-  if (!itemCount) {
+  // Has this member EVER issued their own key (revoked or not) — the proxy for "has this
+  // person's workstation setup even started," independent of whether the TEAM has synced
+  // anything yet (a member invited into an already-active team must still see this).
+  const { count: ownKeyCount } = await supabase
+    .from("api_keys")
+    .select("id", { count: "exact", head: true })
+    .eq("team_id", team.id)
+    .eq("member_id", memberId);
+
+  const homeState = pickHomeState({
+    isAdmin,
+    itemCount: itemCount ?? 0,
+    hasOwnKey: (ownKeyCount ?? 0) > 0,
+  });
+
+  if (homeState === "admin-bootstrap") {
     return (
       <div className="mx-auto max-w-3xl pt-8">
         <h1 className="mb-6 text-2xl font-semibold text-ink">Home</h1>
         <SetupChecklist teamSlug={teamSlug} />
+      </div>
+    );
+  }
+
+  if (homeState === "member-setup") {
+    const { data: keyRows } = await supabase
+      .from("api_keys")
+      .select("id, key_id, name, created_at, last_used_at, revoked_at")
+      .eq("team_id", team.id)
+      .eq("member_id", memberId)
+      .order("created_at", { ascending: false });
+
+    return (
+      <div className="mx-auto max-w-3xl pt-8">
+        <h1 className="mb-6 text-2xl font-semibold text-ink">Home</h1>
+        <WorkstationSetup
+          teamSlug={teamSlug}
+          firstName={firstName}
+          agentPrompt={buildAgentPrompt(teamSlug)}
+          keys={(keyRows ?? []) as MyKeyRow[]}
+        />
       </div>
     );
   }

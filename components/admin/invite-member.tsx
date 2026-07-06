@@ -13,7 +13,7 @@ export function InviteMember({ teamSlug }: { teamSlug: string }) {
     return (
       <button
         onClick={() => setOpen(true)}
-        className="inline-flex items-center gap-2 rounded-lg bg-violet px-4 py-2 text-sm font-medium text-white transition-opacity hover:opacity-90"
+        className="inline-flex shrink-0 items-center gap-2 whitespace-nowrap rounded-lg bg-violet px-4 py-2 text-sm font-medium text-white transition-opacity hover:opacity-90"
       >
         <UserPlus className="size-4" strokeWidth={1.75} />
         Invite member
