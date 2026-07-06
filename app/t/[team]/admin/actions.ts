@@ -26,8 +26,15 @@ async function resolveTeamUrl(): Promise<string> {
 }
 
 export type InviteMemberResult =
-  | { ok: true; mode: "magic-link"; email: string }
-  | { ok: true; mode: "manual"; email: string; password: string; inviteMessage: string }
+  | { ok: true; mode: "magic-link"; email: string; emailDelivered: boolean }
+  | {
+      ok: true;
+      mode: "manual";
+      reason: "no-mail" | "admin-choice";
+      email: string;
+      password: string;
+      inviteMessage: string;
+    }
   | { ok: false; error: string };
 
 /**
@@ -47,13 +54,15 @@ export async function inviteMember(
     displayName: string;
     actorHandle: string;
     role: "admin" | "lead" | "member";
+    /** When true, skip the magic-link invite even if mail delivery is configured. */
+    manualInvite?: boolean;
     password?: string;
   }
 ): Promise<InviteMemberResult> {
   const ctx = await requireAdmin(teamSlug);
   if (!ctx) return { ok: false, error: "admins only" };
 
-  const useMagicLink = magicLinkAvailable() && !form.password?.trim();
+  const useMagicLink = magicLinkAvailable() && !form.manualInvite;
 
   let password = "";
   if (!useMagicLink) {
@@ -98,17 +107,23 @@ export async function inviteMember(
     });
     if (!url) return { ok: false, error: "could not issue a sign-in link" };
 
-    // Best-effort — never blocks the invite (the member row + link both already exist).
+    let emailDelivered = false;
     try {
-      await sendInviteEmail(email, { inviteeName: form.displayName, teamName, inviterName, loginUrl: url });
+      emailDelivered = await sendInviteEmail(email, {
+        inviteeName: form.displayName,
+        teamName,
+        inviterName,
+        loginUrl: url,
+      });
     } catch (e) {
       console.error("[invite] email send failed:", e instanceof Error ? e.message : e);
     }
 
     revalidatePath(`/t/${teamSlug}/admin/members`);
-    return { ok: true, mode: "magic-link", email };
+    return { ok: true, mode: "magic-link", email, emailDelivered };
   }
 
+  const manualReason = form.manualInvite ? "admin-choice" : "no-mail";
   const inviteMessage = buildManualInviteMessage({
     inviteeName: form.displayName,
     teamName,
@@ -119,7 +134,7 @@ export async function inviteMember(
   });
 
   revalidatePath(`/t/${teamSlug}/admin/members`);
-  return { ok: true, mode: "manual", email, password, inviteMessage };
+  return { ok: true, mode: "manual", reason: manualReason, email, password, inviteMessage };
 }
 
 export async function issueApiKey(

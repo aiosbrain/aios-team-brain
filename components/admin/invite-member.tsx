@@ -43,7 +43,9 @@ export function InviteMember({ teamSlug }: { teamSlug: string }) {
     return (
       <div className="prism-card flex flex-col gap-3 border border-violet/40 p-4">
         <p className="text-sm font-medium text-ink">
-          Invite email sent to {issued.email} with a one-time sign-in link (valid 7 days).
+          {issued.emailDelivered
+            ? `Invite email sent to ${issued.email} with a one-time sign-in link (valid 7 days).`
+            : `Member created for ${issued.email}, but we couldn't confirm the invite email was delivered. Check your mail provider settings, or ask them to request a sign-in link at the login page.`}
         </p>
         <button
           onClick={reset}
@@ -56,13 +58,13 @@ export function InviteMember({ teamSlug }: { teamSlug: string }) {
   }
 
   if (issued?.mode === "manual") {
+    const intro =
+      issued.reason === "admin-choice"
+        ? `Share this message with ${issued.email} directly (Slack, DM, etc). It's shown exactly once; only the password's hash is stored.`
+        : `Email delivery isn't configured for this deployment — share this message with ${issued.email} directly (Slack, DM, etc). It's shown exactly once; only the password's hash is stored.`;
     return (
       <div className="prism-card flex flex-col gap-3 border border-violet/40 p-4">
-        <p className="text-sm font-medium text-ink">
-          Email delivery isn&apos;t configured for this deployment — share this message with{" "}
-          {issued.email} directly (Slack, DM, etc). It&apos;s shown exactly once; only the
-          password&apos;s hash is stored.
-        </p>
+        <p className="text-sm font-medium text-ink">{intro}</p>
         <pre className="whitespace-pre-wrap rounded-lg bg-surface-overlay px-3 py-2 font-mono text-xs text-ink">
           {issued.inviteMessage}
         </pre>
@@ -103,6 +105,7 @@ export function InviteMember({ teamSlug }: { teamSlug: string }) {
             displayName: String(formData.get("displayName") ?? ""),
             actorHandle: String(formData.get("actorHandle") ?? ""),
             role: (String(formData.get("role")) as "admin" | "lead" | "member") || "member",
+            manualInvite: manual,
             password: manual ? password || undefined : undefined,
           });
           if (!res.ok) setError(res.error);

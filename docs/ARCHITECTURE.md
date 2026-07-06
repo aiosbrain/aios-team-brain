@@ -97,14 +97,21 @@ This server **implements brain-api v1.3** (the wire contract; source of truth:
 Two principals, one tier model:
 
 - **Humans** — invite-only, two sign-in mechanisms:
-  - **Email+password (the DEFAULT, always available — audit M1/M2b).** An admin creates the
-    member and sets/resets their password (shown once, out-of-band — never emailed); the member
-    signs in with it and can change it anytime (`/t/:team/account`). `POST /api/auth/login`
-    verifies against the scrypt hash in `auth_users.password_hash` (`lib/auth/password`,
-    `lib/auth/pg-login.loginWithPassword`) → signed session cookie; the failure response is the
-    SAME (401 `invalid_credentials`) whether the email is unknown, has no password set, or the
-    password is wrong, so login can't be used to enumerate members. Needs no email infrastructure.
-  - **Magic link (OPTIONAL secondary path, needs a domain).** `POST /api/auth/request-magic-link`
+  - **Admin invite (`inviteMember`, Admin → Members).** Creates the member row, then either:
+    - **Magic-link invite** (default when `magicLinkAvailable()` — `APP_URL` + mail provider):
+      `issueLoginLink` mints a single-use 7-day token and `sendInviteEmail` delivers a one-click
+      link; no password is set upfront. The admin UI reports whether delivery was confirmed.
+    - **Manual invite** (when mail isn't configured, or the admin chooses a password): sets the
+      initial password via `adminSetPassword` (shown once to the admin as a ready-to-paste message
+      from `buildManualInviteMessage` — URL, email, password — for Slack/DM/etc; never emailed).
+  - **Email+password sign-in (always available — audit M1/M2b).** Members sign in with the
+    password an admin set (or one they chose on first login — see welcome screen below) and can
+    change it anytime (`/t/:team/account`). `POST /api/auth/login` verifies against the scrypt hash
+    in `auth_users.password_hash` (`lib/auth/password`, `lib/auth/pg-login.loginWithPassword`) →
+    signed session cookie; the failure response is the SAME (401 `invalid_credentials`) whether the
+    email is unknown, has no password set, or the password is wrong, so login can't be used to
+    enumerate members. Needs no email infrastructure.
+  - **Magic link sign-in (OPTIONAL secondary path, needs a domain).** `POST /api/auth/request-magic-link`
     issues + emails a single-use token (`issueMagicToken`/`sendMagicLink`; unknown emails get an
     explicit 403) and never sets a session cookie itself; only `GET /auth/confirm`
     (`redeemMagicToken`) does that, once the link is clicked. The login form only offers this
@@ -116,7 +123,8 @@ Two principals, one tier model:
     login-link`).
   - Either mechanism's **first** successful login (an invite's first activation) routes through
     `/auth/welcome` — name, team, and inviter (resolved from the append-only `audit_log`, no
-    `invited_by` column needed) — before landing on the dashboard; later logins go straight
+    `invited_by` column needed) — before landing on the dashboard; magic-link-only accounts can
+    optionally set a first password there (`setPasswordIfUnset`, skippable). Later logins go straight
     through (`loginWithPassword`'s and `redeemMagicToken`'s `firstLogin`). The session is a
     `jose`-signed httpOnly cookie (`lib/auth/pg-session`) either way.
 - **Machines** — per-member API key `aios_<key_id>_<secret>` (sha256 at rest, shown

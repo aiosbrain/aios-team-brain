@@ -130,7 +130,8 @@ export interface InviteEmailContext {
  * sign-in link when one is available. Never throws. Names are attacker-controlled input (display
  * names), so the HTML body escapes them — this is the only place they're rendered as markup.
  */
-export async function sendInviteEmail(email: string, ctx: InviteEmailContext): Promise<void> {
+/** Returns whether a configured mail provider accepted the message. Never throws. */
+export async function sendInviteEmail(email: string, ctx: InviteEmailContext): Promise<boolean> {
   const firstName = ctx.inviteeName.trim().split(/\s+/)[0] || ctx.inviteeName;
   const subject = `${ctx.inviterName} added you to ${ctx.teamName} on AIOS`;
   const explainer = inviteExplainer(ctx);
@@ -153,7 +154,7 @@ export async function sendInviteEmail(email: string, ctx: InviteEmailContext): P
         ${htmlAction}
       </div>`;
 
-  await deliver(email, subject, { text, html });
+  return deliver(email, subject, { text, html });
 }
 
 export interface ManualInviteContext {

@@ -13,13 +13,13 @@ describe("buildManualInviteMessage", () => {
       inviterName: "Grace Hopper",
       teamUrl: "https://brain.acme.test",
       email: "ada@acme.test",
-      password: "s3cret-generated-pw",
+      password: "example-invite-password",
     });
 
     expect(msg).toContain("Hi Ada,");
     expect(msg).toContain("Grace Hopper added you to Acme's AIOS Team Brain");
     expect(msg).toContain("Sign in at: https://brain.acme.test");
     expect(msg).toContain("Email: ada@acme.test");
-    expect(msg).toContain("Password: s3cret-generated-pw");
+    expect(msg).toContain("Password: example-invite-password");
   });
 });
