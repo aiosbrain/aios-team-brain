@@ -2,44 +2,79 @@
 
 import { useState, useTransition } from "react";
 import { UserPlus, Copy, Check, Dices } from "lucide-react";
-import { inviteMember } from "@/app/t/[team]/admin/actions";
+import { inviteMember, type InviteMemberResult } from "@/app/t/[team]/admin/actions";
+
+type Issued = Extract<InviteMemberResult, { ok: true }>;
+
+function CopyButton({ text, label }: { text: string; label: string }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <button
+      type="button"
+      onClick={async () => {
+        await navigator.clipboard.writeText(text);
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1500);
+      }}
+      className="inline-flex items-center gap-2 rounded-lg border border-border-default px-3 py-2 text-sm text-ink-secondary hover:text-ink"
+    >
+      {copied ? <Check className="size-4 text-violet" /> : <Copy className="size-4" />}
+      {copied ? "Copied" : label}
+    </button>
+  );
+}
 
 export function InviteMember({ teamSlug }: { teamSlug: string }) {
   const [open, setOpen] = useState(false);
+  const [manual, setManual] = useState(false);
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
-  const [issued, setIssued] = useState<string | null>(null);
-  const [copied, setCopied] = useState(false);
+  const [issued, setIssued] = useState<Issued | null>(null);
   const [pending, startTransition] = useTransition();
 
-  if (issued) {
+  function reset() {
+    setIssued(null);
+    setOpen(false);
+    setManual(false);
+    setPassword("");
+  }
+
+  if (issued?.mode === "magic-link") {
     return (
       <div className="prism-card flex flex-col gap-3 border border-violet/40 p-4">
         <p className="text-sm font-medium text-ink">
-          Member created — copy their password now and share it out-of-band. It is shown exactly
-          once; only its hash is stored.
+          Invite email sent to {issued.email} with a one-time sign-in link (valid 7 days).
         </p>
-        <div className="flex items-center gap-2">
-          <code className="flex-1 overflow-x-auto rounded-lg bg-surface-overlay px-3 py-2 font-mono text-xs text-ink">
-            {issued}
-          </code>
-          <button
-            onClick={async () => {
-              await navigator.clipboard.writeText(issued);
-              setCopied(true);
-              setTimeout(() => setCopied(false), 1500);
-            }}
-            className="rounded-lg border border-border-default p-2 text-ink-secondary hover:text-ink"
-            aria-label="Copy password"
-          >
-            {copied ? <Check className="size-4 text-violet" /> : <Copy className="size-4" />}
-          </button>
-        </div>
         <button
-          onClick={() => { setIssued(null); setOpen(false); setPassword(""); }}
+          onClick={reset}
           className="self-start rounded-lg bg-violet px-4 py-2 text-sm font-medium text-white"
         >
-          Done — I copied it
+          Done
+        </button>
+      </div>
+    );
+  }
+
+  if (issued?.mode === "manual") {
+    return (
+      <div className="prism-card flex flex-col gap-3 border border-violet/40 p-4">
+        <p className="text-sm font-medium text-ink">
+          Email delivery isn&apos;t configured for this deployment — share this message with{" "}
+          {issued.email} directly (Slack, DM, etc). It&apos;s shown exactly once; only the
+          password&apos;s hash is stored.
+        </p>
+        <pre className="whitespace-pre-wrap rounded-lg bg-surface-overlay px-3 py-2 font-mono text-xs text-ink">
+          {issued.inviteMessage}
+        </pre>
+        <div className="flex gap-2">
+          <CopyButton text={issued.inviteMessage} label="Copy message" />
+          <CopyButton text={issued.password} label="Copy password only" />
+        </div>
+        <button
+          onClick={reset}
+          className="self-start rounded-lg bg-violet px-4 py-2 text-sm font-medium text-white"
+        >
+          Done — I shared it
         </button>
       </div>
     );
@@ -68,10 +103,10 @@ export function InviteMember({ teamSlug }: { teamSlug: string }) {
             displayName: String(formData.get("displayName") ?? ""),
             actorHandle: String(formData.get("actorHandle") ?? ""),
             role: (String(formData.get("role")) as "admin" | "lead" | "member") || "member",
-            password: password || undefined,
+            password: manual ? password || undefined : undefined,
           });
-          if (!res.ok) setError(res.error ?? "failed");
-          else setIssued(res.password ?? null);
+          if (!res.ok) setError(res.error);
+          else setIssued(res);
         });
       }}
     >
@@ -88,7 +123,18 @@ export function InviteMember({ teamSlug }: { teamSlug: string }) {
           <option value="lead">lead</option>
           <option value="admin">admin</option>
         </select>
-        <div className="col-span-2 flex items-center gap-2">
+      </div>
+
+      <button
+        type="button"
+        onClick={() => setManual((m) => !m)}
+        className="self-start text-xs text-ink-tertiary underline"
+      >
+        {manual ? "Use a magic sign-in link instead" : "Set a password manually instead"}
+      </button>
+
+      {manual && (
+        <div className="flex items-center gap-2">
           <input
             name="password"
             type="text"
@@ -107,7 +153,8 @@ export function InviteMember({ teamSlug }: { teamSlug: string }) {
             <Dices className="size-4" />
           </button>
         </div>
-      </div>
+      )}
+
       {error && <p className="text-sm text-red-600">{error}</p>}
       <div className="flex gap-2">
         <button type="submit" disabled={pending}
@@ -120,8 +167,9 @@ export function InviteMember({ teamSlug }: { teamSlug: string }) {
         </button>
       </div>
       <p className="text-xs text-ink-tertiary">
-        Invite-only: the member signs in with this email + password. Share the password with them
-        out-of-band (Slack, in person) — it&apos;s never emailed.
+        {manual
+          ? "The member signs in with this email + password. Share the password with them out-of-band (Slack, in person) — it's never emailed."
+          : "The member gets a one-click sign-in link by email. If this deployment has no mail provider configured, you'll get a ready-to-share invite instead."}
       </p>
     </form>
   );

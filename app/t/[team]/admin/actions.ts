@@ -1,20 +1,44 @@
 "use server";
 
+import { headers } from "next/headers";
 import { revalidatePath } from "next/cache";
 import { adminClient } from "@/lib/db/admin";
 import { requireTeamAdmin as requireAdmin } from "@/lib/auth/guard";
 import { createMember } from "@/lib/admin/members";
 import { issueApiKey as issueApiKeyPrimitive, revokeApiKey as revokeApiKeyPrimitive } from "@/lib/admin/keys";
+import { issueLoginLink } from "@/lib/admin/login";
 import { adminSetPassword } from "@/lib/auth/pg-login";
 import { isPasswordStrongEnough, randomPassword, MIN_PASSWORD_LENGTH } from "@/lib/auth/password";
-import { sendInviteEmail } from "@/lib/auth/mailer";
+import { sendInviteEmail, magicLinkAvailable, buildManualInviteMessage } from "@/lib/auth/mailer";
+
+// Generous window for an admin-issued invite (vs. the 15-minute TTL for a self-service login link)
+// — the invitee may not open their email right away.
+const INVITE_LINK_TTL_MINUTES = 7 * 24 * 60;
+
+/** `APP_URL` if set, else the request's own host — so there's always a URL to show, even on a
+ * fresh self-host with no domain configured yet. */
+async function resolveTeamUrl(): Promise<string> {
+  if (process.env.APP_URL) return process.env.APP_URL.replace(/\/$/, "");
+  const h = await headers();
+  const host = h.get("x-forwarded-host") ?? h.get("host");
+  const proto = h.get("x-forwarded-proto") ?? "https";
+  return host ? `${proto}://${host}` : "";
+}
+
+export type InviteMemberResult =
+  | { ok: true; mode: "magic-link"; email: string }
+  | { ok: true; mode: "manual"; email: string; password: string; inviteMessage: string }
+  | { ok: false; error: string };
 
 /**
- * Create a member AND set their initial sign-in password (audit M1/M2b — replaces magic-link
- * invites). `form.password` is optional: an admin can type one, or leave it blank to get a strong
- * generated one — either way it's returned ONCE for the admin to hand to the person out-of-band
- * (same "shown once" pattern as API key issuance below), never emailed. The invite email is a
- * personalized courtesy notification (name/team/inviter) — it never carries the password.
+ * Create a member and get them working sign-in access, one of two ways depending on this
+ * deployment:
+ *  - **Magic-link** (default when `magicLinkAvailable()` — mail delivery is configured): email a
+ *    one-click, single-use sign-in link, valid 7 days. No password is set.
+ *  - **Manual** (mail delivery isn't configured, or the admin explicitly typed `form.password`):
+ *    set a password directly and return a complete, ready-to-paste invite (team brain URL,
+ *    sign-in email, password) for the admin to share out-of-band (Slack, DM, etc) — this is the
+ *    expected default path for a fresh self-hosted deployment with no mail provider set up.
  */
 export async function inviteMember(
   teamSlug: string,
@@ -25,19 +49,25 @@ export async function inviteMember(
     role: "admin" | "lead" | "member";
     password?: string;
   }
-): Promise<{ ok: boolean; password?: string; error?: string }> {
+): Promise<InviteMemberResult> {
   const ctx = await requireAdmin(teamSlug);
   if (!ctx) return { ok: false, error: "admins only" };
 
-  const password = form.password?.trim() || randomPassword();
-  if (!isPasswordStrongEnough(password)) {
-    return { ok: false, error: `password must be at least ${MIN_PASSWORD_LENGTH} characters` };
+  const useMagicLink = magicLinkAvailable() && !form.password?.trim();
+
+  let password = "";
+  if (!useMagicLink) {
+    password = form.password?.trim() || randomPassword();
+    if (!isPasswordStrongEnough(password)) {
+      return { ok: false, error: `password must be at least ${MIN_PASSWORD_LENGTH} characters` };
+    }
   }
 
   const email = form.email.trim().toLowerCase();
+  const db = adminClient();
   try {
     await createMember(
-      adminClient(),
+      db,
       ctx.teamId,
       {
         email: form.email,
@@ -47,29 +77,49 @@ export async function inviteMember(
       },
       { actor: { kind: "member", memberId: ctx.memberId } }
     );
-    await adminSetPassword(email, password);
+    if (!useMagicLink) await adminSetPassword(email, password);
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "create failed" };
   }
 
-  // Best-effort courtesy notification — never blocks the invite, and never carries the password.
-  try {
-    const db = adminClient();
-    const [{ data: team }, { data: inviter }] = await Promise.all([
-      db.from("teams").select("name").eq("id", ctx.teamId).maybeSingle(),
-      db.from("members").select("display_name").eq("id", ctx.memberId).maybeSingle(),
-    ]);
-    await sendInviteEmail(email, {
-      inviteeName: form.displayName,
-      teamName: (team as { name: string } | null)?.name ?? teamSlug,
-      inviterName: (inviter as { display_name: string } | null)?.display_name ?? "Your admin",
+  const [{ data: team }, { data: inviter }] = await Promise.all([
+    db.from("teams").select("name").eq("id", ctx.teamId).maybeSingle(),
+    db.from("members").select("display_name").eq("id", ctx.memberId).maybeSingle(),
+  ]);
+  const teamName = (team as { name: string } | null)?.name ?? teamSlug;
+  const inviterName = (inviter as { display_name: string } | null)?.display_name ?? "Your admin";
+
+  if (useMagicLink) {
+    const { url } = await issueLoginLink(db, ctx.teamId, email, {
+      nextPath: `/t/${teamSlug}`,
+      ttlMinutes: INVITE_LINK_TTL_MINUTES,
+      baseUrl: process.env.APP_URL,
+      actor: { kind: "member", memberId: ctx.memberId },
     });
-  } catch (e) {
-    console.error("[invite] email send failed:", e instanceof Error ? e.message : e);
+    if (!url) return { ok: false, error: "could not issue a sign-in link" };
+
+    // Best-effort — never blocks the invite (the member row + link both already exist).
+    try {
+      await sendInviteEmail(email, { inviteeName: form.displayName, teamName, inviterName, loginUrl: url });
+    } catch (e) {
+      console.error("[invite] email send failed:", e instanceof Error ? e.message : e);
+    }
+
+    revalidatePath(`/t/${teamSlug}/admin/members`);
+    return { ok: true, mode: "magic-link", email };
   }
 
+  const inviteMessage = buildManualInviteMessage({
+    inviteeName: form.displayName,
+    teamName,
+    inviterName,
+    teamUrl: await resolveTeamUrl(),
+    email,
+    password,
+  });
+
   revalidatePath(`/t/${teamSlug}/admin/members`);
-  return { ok: true, password };
+  return { ok: true, mode: "manual", email, password, inviteMessage };
 }
 
 export async function issueApiKey(

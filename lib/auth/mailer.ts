@@ -102,36 +102,78 @@ export function magicLinkAvailable(): boolean {
   return Boolean(process.env.APP_URL) && Boolean(process.env.RESEND_API_KEY || process.env.SMTP_URL);
 }
 
+/** Shared across the emailed invite and the manual copy-paste invite, so tone/wording match. */
+function inviteExplainer(ctx: { teamName: string; inviterName: string }): string {
+  return (
+    `${ctx.inviterName} added you to ${ctx.teamName}'s AIOS Team Brain — your team's shared hub ` +
+    `for tasks, decisions, and knowledge synced from everyone's AIOS workspace.`
+  );
+}
+
 export interface InviteEmailContext {
   /** The invitee's display name, as entered by the inviter. First name is used in the greeting. */
   inviteeName: string;
   teamName: string;
   inviterName: string;
+  /**
+   * Ready-to-click sign-in link (single-use, 7-day magic-link token). Present whenever
+   * `magicLinkAvailable()` is true — the invite flow only calls `sendInviteEmail` in that case, since
+   * without a link there's nothing useful to email (the manual copy-paste path handles that case
+   * instead). Kept optional here, with the old "ask your admin" copy as a defensive fallback, so this
+   * function never sends a broken email if ever called without one.
+   */
+  loginUrl?: string;
 }
 
 /**
- * New-member invite courtesy email, personalized (name/team/inviter). Sign-in is email+password
- * (the admin shares the password out-of-band, the same "shown once" pattern as an API key) — this
- * email NEVER carries a secret, it's just a heads-up that an account exists. Never throws. Names
- * are attacker-controlled input (display names), so the HTML body escapes them — this is the only
- * place they're rendered as markup.
+ * New-member invite email, personalized (name/team/inviter) and carrying a one-click magic
+ * sign-in link when one is available. Never throws. Names are attacker-controlled input (display
+ * names), so the HTML body escapes them — this is the only place they're rendered as markup.
  */
 export async function sendInviteEmail(email: string, ctx: InviteEmailContext): Promise<void> {
   const firstName = ctx.inviteeName.trim().split(/\s+/)[0] || ctx.inviteeName;
   const subject = `${ctx.inviterName} added you to ${ctx.teamName} on AIOS`;
+  const explainer = inviteExplainer(ctx);
 
-  const text =
-    `Hi ${firstName},\n\n${ctx.inviterName} added you to ${ctx.teamName}'s AIOS Team Brain.\n\n` +
-    `Ask your admin for your sign-in password, then open the team brain and sign in with this email address.`;
+  const textAction = ctx.loginUrl
+    ? `Get started: ${ctx.loginUrl}\n\nThis link is single-use and valid for 7 days.`
+    : `Ask your admin for your sign-in password, then open the team brain and sign in with this email address.`;
+  const text = `Hi ${firstName},\n\n${explainer}\n\n${textAction}`;
 
   const safeFirstName = escapeHtml(firstName);
-  const safeInviter = escapeHtml(ctx.inviterName);
-  const safeTeam = escapeHtml(ctx.teamName);
-  const intro = `<p>Hi ${safeFirstName},</p><p><strong>${safeInviter}</strong> added you to <strong>${safeTeam}</strong>'s AIOS Team Brain.</p>`;
+  const safeExplainer = escapeHtml(explainer);
+  const intro = `<p>Hi ${safeFirstName},</p><p>${safeExplainer}</p>`;
+  const htmlAction = ctx.loginUrl
+    ? `<p><a href="${escapeHtml(ctx.loginUrl)}" style="display:inline-block;background:#7c3aed;color:#fff;padding:10px 20px;border-radius:8px;text-decoration:none;font-weight:600;">Get started</a></p>
+       <p style="font-size:13px;color:#666;">Or paste this link into your browser:<br>${escapeHtml(ctx.loginUrl)}</p>
+       <p style="font-size:13px;color:#666;">This link is single-use and valid for 7 days.</p>`
+    : `<p>Ask your admin for your sign-in password, then open the team brain and sign in with this email address.</p>`;
   const html = `<div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px;color:#1a1a1a;">
         ${intro}
-        <p>Ask your admin for your sign-in password, then open the team brain and sign in with this email address.</p>
+        ${htmlAction}
       </div>`;
 
   await deliver(email, subject, { text, html });
+}
+
+export interface ManualInviteContext {
+  inviteeName: string;
+  teamName: string;
+  inviterName: string;
+  teamUrl: string;
+  email: string;
+  password: string;
+}
+
+/**
+ * Plain-text, ready-to-paste invite for admins on a deployment with no mail provider configured
+ * (`!magicLinkAvailable()`) — everything the admin needs to hand a new member sign-in access via
+ * Slack/DM/whatever channel they use: the team brain URL, the sign-in email, and the password.
+ */
+export function buildManualInviteMessage(ctx: ManualInviteContext): string {
+  const firstName = ctx.inviteeName.trim().split(/\s+/)[0] || ctx.inviteeName;
+  return (
+    `Hi ${firstName},\n\n${inviteExplainer(ctx)}\n\n` +
+    `Sign in at: ${ctx.teamUrl}\nEmail: ${ctx.email}\nPassword: ${ctx.password}`
+  );
 }

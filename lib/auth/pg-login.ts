@@ -89,6 +89,30 @@ export async function adminSetPassword(email: string, password: string): Promise
   );
 }
 
+/** Whether this auth_users row already has a password (vs. a magic-link-only account). */
+export async function hasPasswordSet(authUserId: string): Promise<boolean> {
+  const { rows } = await runSql<{ password_hash: string | null }>(
+    `select password_hash from auth_users where id = $1`,
+    [authUserId]
+  );
+  return Boolean(rows[0]?.password_hash);
+}
+
+/**
+ * First-time password set for a magic-link-only account — deliberately NOT a reset: only writes
+ * when `password_hash` is currently null, so this can't be used to silently overwrite an existing
+ * password (that's `changePassword`, which requires the current one). Returns false if a password
+ * was already set.
+ */
+export async function setPasswordIfUnset(authUserId: string, password: string): Promise<boolean> {
+  const hash = await hashPassword(password);
+  const { rows } = await runSql<{ id: string }>(
+    `update auth_users set password_hash = $1 where id = $2 and password_hash is null returning id`,
+    [hash, authUserId]
+  );
+  return rows.length > 0;
+}
+
 /**
  * Self-service password change. Verifies `currentPassword` against the signed-in user's stored
  * hash before writing the new one — `authUserId` comes from the caller's own session (`sub`), so

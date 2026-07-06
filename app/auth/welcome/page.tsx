@@ -2,6 +2,8 @@ import type { Metadata } from "next";
 import { redirect } from "next/navigation";
 import { getSessionUser } from "@/lib/auth/session";
 import { getWelcomeContext } from "@/lib/auth/welcome-context";
+import { hasPasswordSet } from "@/lib/auth/pg-login";
+import { SetPasswordForm } from "./set-password-form";
 
 export const metadata: Metadata = { title: "Welcome" };
 
@@ -31,7 +33,10 @@ export default async function WelcomePage({
   if (!user) redirect("/login");
 
   const teamSlug = teamSlugFromPath(dest);
-  const ctx = teamSlug ? await getWelcomeContext(teamSlug, user.email) : null;
+  const [ctx, needsPassword] = await Promise.all([
+    teamSlug ? getWelcomeContext(teamSlug, user.email) : Promise.resolve(null),
+    hasPasswordSet(user.id).then((has) => !has),
+  ]);
   const firstName = ctx?.inviteeName.trim().split(/\s+/)[0] || "there";
 
   return (
@@ -61,6 +66,7 @@ export default async function WelcomePage({
             <a href={dest} className="btn-prism w-full justify-center">
               Continue to your dashboard
             </a>
+            {needsPassword && <SetPasswordForm />}
           </div>
         </div>
       </div>
