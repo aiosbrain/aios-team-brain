@@ -201,6 +201,17 @@ export function GithubReposPanel({ teamSlug, integration, scannedRepos }: Github
         </p>
       ) : null}
 
+      <p className="rounded-lg border border-border-subtle bg-white/[0.02] px-3 py-2 text-xs text-ink-tertiary">
+        <span className="font-semibold text-ink-secondary">Note:</span> syncing a repo imports its
+        issues + files (knowledge base) and auto-populates the{" "}
+        <span className="text-ink-secondary">Codebases</span> dashboard&apos;s commit-volume and
+        per-person contribution graphs from the GitHub API.{" "}
+        <span className="text-ink-secondary">Agent-readiness &amp; test coverage</span> still need a
+        full <span className="font-mono text-ink-secondary">aios-ingest scan</span> (it reads the
+        code checkout) — run it in CI on merge (
+        <span className="font-mono text-ink-secondary">scan-on-merge.yml</span>) or once locally.
+      </p>
+
       {/* Linked repos */}
       {linked.length === 0 ? (
         <p className="rounded-lg border border-dashed border-border-default px-3 py-4 text-center text-sm text-ink-tertiary">
