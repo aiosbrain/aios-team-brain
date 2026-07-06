@@ -1,19 +1,10 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
-import { serverClient } from "@/lib/db/server";
 import { adminClient } from "@/lib/db/admin";
-import { getSessionUser } from "@/lib/auth/session";
-import { resolveIntegrationsAdmin } from "@/lib/integrations/read";
+import { requireTeamAdmin as requireAdmin } from "@/lib/auth/guard";
 import { resolveApproval } from "@/lib/actions";
 import { createE2BSandbox } from "@/lib/actions/sandbox/e2b";
-
-async function requireAdmin(teamSlug: string) {
-  const db = await serverClient();
-  const user = await getSessionUser();
-  if (!user) return null;
-  return resolveIntegrationsAdmin(db, teamSlug, user.id);
-}
 
 /**
  * Decide a queued approval (admins only). Approve → `resolveApproval` resumes & runs the action's

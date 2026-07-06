@@ -1,5 +1,6 @@
 import "server-only";
 
+import { timeoutFetch } from "@/lib/http";
 import {
   fetchAllPaged,
   planeApi,
@@ -63,7 +64,7 @@ function planeCtx(input: { integration: { config?: Record<string, unknown> | nul
   // a fresh integration can override via config.externalSource.
   const externalSource =
     (config.externalSource as string | undefined) || input.link?.provider_external_source || "aios-backlog";
-  return { fetchImpl: input.fetchImpl ?? fetch, base, apiKey, workspaceSlug, projectId, externalSource };
+  return { fetchImpl: input.fetchImpl ?? timeoutFetch, base, apiKey, workspaceSlug, projectId, externalSource };
 }
 
 function extKey(source: string | null | undefined, ext: string | null | undefined): string {

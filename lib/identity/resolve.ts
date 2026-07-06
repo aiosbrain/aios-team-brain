@@ -110,13 +110,3 @@ export function resolveMember(map: IdentityMap, identity: AuthorIdentity): strin
     null
   );
 }
-
-/** Convenience: build the map once and resolve a batch of identities to member_ids. */
-export async function resolveMembers(
-  db: DbClient,
-  teamId: string,
-  identities: AuthorIdentity[]
-): Promise<(string | null)[]> {
-  const map = await buildIdentityMap(db, teamId);
-  return identities.map((id) => resolveMember(map, id));
-}

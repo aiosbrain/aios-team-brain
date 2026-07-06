@@ -21,7 +21,7 @@ Reason from this table, not from a random call site.
 |---|---|---|---|---|
 | Synced content | `items`, `item_versions` | **`lib/ingest` only** (single-writer guarded) | dashboard pages, `/api/v1/items`, `lib/query/retrieve`, okf-bundle, metrics | app-code tier isolation (no RLS) — API ✅, dashboard ✅ (`lib/auth/visibility` choke-point, guarded) |
 | Dense index (OPTIONAL) | `item_chunks` (embeddings; **not** in `schema.sql` — `postgres/optional/pgvector.sql`, load via `pg:schema:vector`) | **`lib/query/dense-index` only** (single-writer guarded; chunk+embed, idempotent on `items.content_sha256`) — incremental in the ingest scheduler + `npm run embed:backfill` | `lib/query/dense-search` (HNSW cosine → RRF-fused into `retrieve`) | opt-in (`EMBEDDINGS_URL` + pgvector present, else a complete no-op); dense hits tier-filtered on **live `items.access`** — no `external` leak (guarded by the dense data-mechanics test) |
-| Tasks | `tasks` | `lib/ingest` (sync rows — incl. inbound Plane/Linear/GitHub import, each into a dedicated `plane-<id>`/`linear-<team>`/`github-<owner>-<repo>` project) + `app/actions/tasks.ts` (UI; mints `ui-` row_key) + `lib/work-events` (merged-work completion) | dashboard, `/api/v1/tasks`, PM sync | team-scoped; `origin='ui'` rows survive sync diff; v1.2 hierarchy fields `parent_row_key`/`labels`/`priority` (parent integrity — exists + acyclic — enforced in `lib/ingest`); `body` is dashboard/DB-only (never in the markdown contract) |
+| Tasks | `tasks` | `lib/ingest` (sync rows — incl. inbound Plane/Linear/GitHub import, each into a dedicated `plane-<id>`/`linear-<team>`/`github-<owner>-<repo>` project) + `app/actions/tasks.ts` (UI; mints `ui-` row_key) + `lib/work-events` (merged-work completion) | dashboard, `/api/v1/tasks`, PM sync | app-code tier isolation via `tasks.audience` (inherits the materializing item's `access`; external reads filter `audience='external'` through the `visibleTasks` choke-point — retrieval, `/api/v1/tasks`, dashboard box + page; no RLS backstop); `origin='ui'` rows survive sync diff; v1.2 hierarchy fields `parent_row_key`/`labels`/`priority` (parent integrity — exists + acyclic — enforced in `lib/ingest`); `body` is dashboard/DB-only (never in the markdown contract) |
 | Task PM links | `task_pm_links` | `lib/ingest` (optional task-row PM metadata) + PM backfill | dashboard task badges, `lib/pm-sync` | team-scoped; stores provider IDs/status only, never secrets; v1.2 adds `last_projected_status`/`projection_fingerprint` (skip-detection) + `provider_seen_status` (Phase 5 divergence) |
 | Primary PM provider | `teams.primary_pm_provider` | Admin → Integrations (`setPrimaryPmProvider`, admin-gated + audited) | `lib/pm-sync` projection | the single PM tool the brain projects into; null = projection no-ops / sole-enabled fallback |
 | Work events | `work_events` | `POST /api/v1/work-events` → `lib/work-events` | Admin → PM sync health | team-tier only; unresolved events are preserved for reconciliation |
@@ -43,7 +43,7 @@ Reason from this table, not from a random call site.
 | Chat history | `conversations` + `chat_messages` | **`lib/chat/store` only** (single-writer guarded) — both `POST /api/dashboard/query` (web) and `POST /api/v1/query` (machine API: CLI / Telegram-via-Hermes) create/continue a thread and persist each user+assistant turn; the conversation routes rename/archive | the `/query` sidebar + `GET /api/dashboard/conversations[/:id]`; `POST /api/dashboard/query` loads the windowed history (`recentTurns`) so follow-ups/pronouns resolve | **owner-scoped per member** — every store call filters `(team_id, member_id)`; a member sees only their own threads (no RLS backstop; the store IS the gate, guarded by `test/guards/single-writer-chat` + the chat-store data-mechanics owner-isolation test). Persists across sessions/interfaces keyed by `conversation_id`; soft-delete via `archived_at`. Distinct from `query_log` (the spend meter). |
 | External AI spend | `usage_costs` | **`lib/costs/ingest` only** (via `POST /api/v1/costs`) | `lib/metrics/external-costs`, Admin → Usage page | team-tier only; workstation pushes from `aios analyze --push` (Cursor dashboard USD + session-log estimates); idempotent on `(team, member, date, provider, source, project)` |
 | AEM maturity snapshots | `agentic_maturity_snapshots` | `POST /api/v1/metrics` → `lib/metrics/individual-maturity-ingest` | Maturity → People (`lib/metrics/individual-maturity`) | team-tier only; daily aggregates incl. token/cost totals from session logs; no raw session content |
-| Graph memory (Graphiti) | `graph_episodes` (projection state) + **Graphiti/Neo4j** (the graph itself, self-hosted, `graphiti/`) | **`lib/graph/project` only** (single-writer guarded) — projects brain `items` (Slack transcripts) → Graphiti episodes; driven by `lib/graph/run` (`runGraphProjection`) via the admin **"Project to graph"** action (`projectToGraphNow`, admin-gated) + the `lib/graph/scheduler` interval poller (registered in `instrumentation.ts`, self-gated to inert unless `GRAPHITI_URL` set) | `POST /api/v1/graph-query` via `lib/graph/graphiti-client` | **experiment alongside** `graph_entities`/`/api/v1/query` (not a replacement). Graphiti has no tier awareness → tier is encoded in `group_id` (`<slug>_<tier>` — Graphiti rejects `:`; `lib/graph/group`) and the query scopes to `visibleGroupIds(viewerTier)` — SOLE isolation, no RLS backstop. `/messages` requires a (nullable) `role` field. LLM extraction via OpenAI-compatible endpoint (`GRAPHITI_URL`/`graphiti/.env`) |
+| Graph memory (Graphiti) | `graph_episodes` (projection state, incl. `episode_uuid` once resolved) + **Graphiti/Neo4j** (the graph itself, self-hosted, `graphiti/`) | **`lib/graph/project` only** (single-writer guarded) — projects brain `items` → Graphiti episodes, paging a `synced_at` cursor through the whole backlog (audit H2) and single-flight guarded against a concurrent run (`lib/graph/run`); driven by `runGraphProjection` via the admin **"Project to graph"** action (`projectToGraphNow`, admin-gated) + the `lib/graph/scheduler` interval poller (registered in `instrumentation.ts`, self-gated to inert unless `GRAPHITI_URL` set). Each run also calls `lib/graph/reconcile.reconcileProjectedEpisodes` (audit H3): since `/messages` is async and never returns a uuid, a recorded episode's actual presence is confirmed via `GET /episodes/{group}` (matched by our stable `name`); one that never landed (a worker crash mid-extraction) is cleared so the next run re-pushes it — off the hot push path. A tier reclassification on re-sync (audit M6) deletes the stale episode from the OLD group (`lib/graph/project.deleteEpisodeByName`, resolves name→uuid via `listEpisodes` then `DELETE /episode/{uuid}`) before projecting into the new one. | `POST /api/v1/graph-query` via `lib/graph/graphiti-client` | **experiment alongside** `graph_entities`/`/api/v1/query` (not a replacement). Graphiti has no tier awareness → tier is encoded in `group_id` (`<slug>_<tier>` — Graphiti rejects `:`; `lib/graph/group`) and the query scopes to `visibleGroupIds(viewerTier)` — SOLE isolation, no RLS backstop. `/messages` requires a (nullable) `role` field. LLM extraction via OpenAI-compatible endpoint (`GRAPHITI_URL`/`graphiti/.env`) |
 
 ## System context
 
@@ -96,17 +96,29 @@ This server **implements brain-api v1.3** (the wire contract; source of truth:
 
 Two principals, one tier model:
 
-- **Humans** — invite-only, **passwordless via magic link**. `POST /api/auth/request-magic-link`
-  issues + emails a single-use token (`issueMagicToken`/`sendMagicLink`; unknown emails still
-  get an explicit 403, matching the prior direct-login UX) and never sets a session cookie
-  itself. Clicking the emailed link hits `GET /auth/confirm`, which verifies + consumes the
-  token (`redeemMagicToken`) and is the ONLY place that sets the session cookie
-  (`jose`-signed httpOnly, `lib/auth/pg-session`). A member's **first** redemption (an invite
-  being activated) routes through `/auth/welcome` — name, team, and inviter (resolved from the
-  append-only `audit_log`, no `invited_by` column needed) — before landing on the dashboard;
-  later logins redirect straight through. `POST /api/auth/login` (direct-by-email, no
-  ownership proof, no email round-trip) is now **dev-only** — 404s in production unless
-  `ALLOW_DEV_LOGIN=1` — mirroring `/auth/dev-login`'s existing gate exactly.
+- **Humans** — invite-only, two sign-in mechanisms:
+  - **Email+password (the DEFAULT, always available — audit M1/M2b).** An admin creates the
+    member and sets/resets their password (shown once, out-of-band — never emailed); the member
+    signs in with it and can change it anytime (`/t/:team/account`). `POST /api/auth/login`
+    verifies against the scrypt hash in `auth_users.password_hash` (`lib/auth/password`,
+    `lib/auth/pg-login.loginWithPassword`) → signed session cookie; the failure response is the
+    SAME (401 `invalid_credentials`) whether the email is unknown, has no password set, or the
+    password is wrong, so login can't be used to enumerate members. Needs no email infrastructure.
+  - **Magic link (OPTIONAL secondary path, needs a domain).** `POST /api/auth/request-magic-link`
+    issues + emails a single-use token (`issueMagicToken`/`sendMagicLink`; unknown emails get an
+    explicit 403) and never sets a session cookie itself; only `GET /auth/confirm`
+    (`redeemMagicToken`) does that, once the link is clicked. The login form only offers this
+    option when `magicLinkAvailable()` (`lib/auth/mailer`) is true — `APP_URL` set AND a mail
+    provider configured — since a link can't work without a stable domain to build it against or
+    anything to deliver it with; the route itself stays reachable regardless (degrades to the
+    mailer's existing dev-log/drop-silently behavior without a provider). `issueMagicToken`/
+    `redeemMagicToken` also back the admin-CLI one-time-login-link tool (`scripts/admin.ts
+    login-link`).
+  - Either mechanism's **first** successful login (an invite's first activation) routes through
+    `/auth/welcome` — name, team, and inviter (resolved from the append-only `audit_log`, no
+    `invited_by` column needed) — before landing on the dashboard; later logins go straight
+    through (`loginWithPassword`'s and `redeemMagicToken`'s `firstLogin`). The session is a
+    `jose`-signed httpOnly cookie (`lib/auth/pg-session`) either way.
 - **Machines** — per-member API key `aios_<key_id>_<secret>` (sha256 at rest, shown
   once). Sync writes use the **service role** — confined to `lib/ingest`
   and audited on every write.
@@ -495,8 +507,8 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 - `PATCH /api/dashboard/conversations/:id` — rename a thread (owner-only)
 - `DELETE /api/dashboard/conversations/:id` — soft-archive a thread (owner-only)
 - `GET /api/dashboard/team-work` — dashboard "Working On": per-person summary (narrative arcs) + open tasks + recent accomplishments; session-authed; tier-scoped
-- `POST /api/auth/login` — **dev-only** (404 in production unless `ALLOW_DEV_LOGIN=1`): direct passwordless sign-in with no ownership proof, kept as a dev/test convenience
-- `POST /api/auth/request-magic-link` — the real sign-in path: issues + emails a single-use magic link (invite-only; 403 if unknown); never sets a session cookie itself
+- `POST /api/auth/login` — email+password sign-in, the DEFAULT path (invite-only; uniform 401 on any failure)
+- `POST /api/auth/request-magic-link` — OPTIONAL secondary sign-in: issues + emails a single-use magic link (invite-only; 403 if unknown); never sets a session cookie itself; the login form only offers it when `magicLinkAvailable()` (a domain + mail provider are configured)
 <!-- /drift:routes -->
 
 ### Database tables

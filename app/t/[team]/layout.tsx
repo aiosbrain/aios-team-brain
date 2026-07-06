@@ -3,6 +3,7 @@ import { CircleAlert } from "lucide-react";
 import { serverClient } from "@/lib/db/server";
 import { getSessionUser } from "@/lib/auth/session";
 import { TeamNav, type NavEntry, type NavLeaf } from "@/components/team-nav";
+import { SignOutButton } from "@/components/account/sign-out-button";
 
 function NoTeamScreen({ slug }: { slug: string }) {
   return (
@@ -57,6 +58,7 @@ export default async function TeamLayout({
 
   // Settings groups the low-frequency config surfaces; Admin is appended only for admins.
   const settingsChildren: NavLeaf[] = [
+    { icon: "account", label: "Account", href: `${base}/account` },
     { icon: "teamtools", label: "Team tools", href: `${base}/team-tools` },
   ];
   if (me.role === "admin") {
@@ -102,6 +104,9 @@ export default async function TeamLayout({
           <p className="text-xs capitalize text-ink-tertiary">
             {me.role} · {me.tier} tier
           </p>
+          <div className="mt-2">
+            <SignOutButton />
+          </div>
         </div>
       </aside>
       <main className="min-w-0 flex-1 px-8 py-8">{children}</main>

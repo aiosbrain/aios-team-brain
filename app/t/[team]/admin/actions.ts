@@ -1,43 +1,40 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
-import { serverClient } from "@/lib/db/server";
 import { adminClient } from "@/lib/db/admin";
-import { getSessionUser } from "@/lib/auth/session";
+import { requireTeamAdmin as requireAdmin } from "@/lib/auth/guard";
 import { createMember } from "@/lib/admin/members";
 import { issueApiKey as issueApiKeyPrimitive, revokeApiKey as revokeApiKeyPrimitive } from "@/lib/admin/keys";
-import { issueMagicToken } from "@/lib/auth/pg-login";
+import { adminSetPassword } from "@/lib/auth/pg-login";
+import { isPasswordStrongEnough, randomPassword, MIN_PASSWORD_LENGTH } from "@/lib/auth/password";
 import { sendInviteEmail } from "@/lib/auth/mailer";
 
-/** Verify the caller is an active admin of the team; returns ids or null. */
-async function requireAdmin(teamSlug: string) {
-  const db = await serverClient();
-  const user = await getSessionUser();
-  if (!user) return null;
-  const { data: team } = await db
-    .from("teams")
-    .select("id, name")
-    .eq("slug", teamSlug)
-    .maybeSingle();
-  if (!team) return null;
-  const { data: me } = await db
-    .from("members")
-    .select("id, role, display_name")
-    .eq("team_id", team.id)
-    .eq("auth_user_id", user.id)
-    .eq("status", "active")
-    .maybeSingle();
-  if (me?.role !== "admin") return null;
-  return { teamId: team.id, teamName: team.name, myMemberId: me.id, myDisplayName: me.display_name };
-}
-
+/**
+ * Create a member AND set their initial sign-in password (audit M1/M2b — replaces magic-link
+ * invites). `form.password` is optional: an admin can type one, or leave it blank to get a strong
+ * generated one — either way it's returned ONCE for the admin to hand to the person out-of-band
+ * (same "shown once" pattern as API key issuance below), never emailed. The invite email is a
+ * personalized courtesy notification (name/team/inviter) — it never carries the password.
+ */
 export async function inviteMember(
   teamSlug: string,
-  form: { email: string; displayName: string; actorHandle: string; role: "admin" | "lead" | "member" }
-): Promise<{ ok: boolean; error?: string }> {
+  form: {
+    email: string;
+    displayName: string;
+    actorHandle: string;
+    role: "admin" | "lead" | "member";
+    password?: string;
+  }
+): Promise<{ ok: boolean; password?: string; error?: string }> {
   const ctx = await requireAdmin(teamSlug);
   if (!ctx) return { ok: false, error: "admins only" };
 
+  const password = form.password?.trim() || randomPassword();
+  if (!isPasswordStrongEnough(password)) {
+    return { ok: false, error: `password must be at least ${MIN_PASSWORD_LENGTH} characters` };
+  }
+
+  const email = form.email.trim().toLowerCase();
   try {
     await createMember(
       adminClient(),
@@ -48,34 +45,31 @@ export async function inviteMember(
         actorHandle: form.actorHandle,
         role: form.role,
       },
-      { actor: { kind: "member", memberId: ctx.myMemberId } }
+      { actor: { kind: "member", memberId: ctx.memberId } }
     );
+    await adminSetPassword(email, password);
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "create failed" };
   }
 
-  // Best-effort invite email — never blocks the invite (createMember already succeeded).
-  // A direct one-time sign-in link when APP_URL is set (server actions have no request
-  // origin); otherwise a non-secret "sign in" nudge. The token is never logged.
+  // Best-effort courtesy notification — never blocks the invite, and never carries the password.
   try {
-    const email = form.email.trim().toLowerCase();
-    const appUrl = process.env.APP_URL?.replace(/\/$/, "");
-    let link: string | null = null;
-    if (appUrl) {
-      const raw = await issueMagicToken(email, `/t/${teamSlug}`, 1440); // 24h invite TTL
-      if (raw) link = `${appUrl}/auth/confirm?token=${raw}`;
-    }
-    await sendInviteEmail(email, link, {
+    const db = adminClient();
+    const [{ data: team }, { data: inviter }] = await Promise.all([
+      db.from("teams").select("name").eq("id", ctx.teamId).maybeSingle(),
+      db.from("members").select("display_name").eq("id", ctx.memberId).maybeSingle(),
+    ]);
+    await sendInviteEmail(email, {
       inviteeName: form.displayName,
-      teamName: ctx.teamName,
-      inviterName: ctx.myDisplayName,
+      teamName: (team as { name: string } | null)?.name ?? teamSlug,
+      inviterName: (inviter as { display_name: string } | null)?.display_name ?? "Your admin",
     });
   } catch (e) {
     console.error("[invite] email send failed:", e instanceof Error ? e.message : e);
   }
 
   revalidatePath(`/t/${teamSlug}/admin/members`);
-  return { ok: true };
+  return { ok: true, password };
 }
 
 export async function issueApiKey(
@@ -88,7 +82,7 @@ export async function issueApiKey(
 
   try {
     const { key } = await issueApiKeyPrimitive(adminClient(), ctx.teamId, memberId, name, {
-      actor: { kind: "member", memberId: ctx.myMemberId },
+      actor: { kind: "member", memberId: ctx.memberId },
     });
     revalidatePath(`/t/${teamSlug}/admin/keys`);
     return { ok: true, key };
@@ -106,7 +100,7 @@ export async function revokeApiKey(
 
   try {
     await revokeApiKeyPrimitive(adminClient(), ctx.teamId, apiKeyId, {
-      actor: { kind: "member", memberId: ctx.myMemberId },
+      actor: { kind: "member", memberId: ctx.memberId },
     });
     revalidatePath(`/t/${teamSlug}/admin/keys`);
     return { ok: true };

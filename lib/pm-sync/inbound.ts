@@ -3,6 +3,7 @@ import "server-only";
 import type { DbClient } from "@/lib/db/types";
 
 import { withTransaction } from "@/lib/db/pg/tx";
+import { timeoutFetch } from "@/lib/http";
 import { fetchLinearTeam, type FetchedLinearTeam } from "@/lib/ingest/sources/linear";
 import {
   linearMirrorProject,
@@ -531,7 +532,7 @@ export async function runInboundForTeam(
     });
   }
 
-  const fetchImpl = opts.fetchImpl ?? fetch;
+  const fetchImpl = opts.fetchImpl ?? timeoutFetch;
   const result = emptyResult({ provider: "linear", enabled: true });
 
   // Phase A — apply. One read-only provider listing ({name,type} per issue id).

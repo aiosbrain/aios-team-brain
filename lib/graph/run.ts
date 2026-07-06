@@ -3,6 +3,7 @@ import type { DbClient } from "@/lib/db/types";
 import { adminClient } from "@/lib/db/admin";
 import { GraphitiClient } from "./graphiti-client";
 import { projectItemsToGraph } from "./project";
+import { reconcileProjectedEpisodes } from "./reconcile";
 
 /**
  * Graph-projection runner — the on-ramp that actually drives `projectSlackToGraph` (which is
@@ -21,12 +22,20 @@ export interface GraphProjectionSummary {
   scanned: number;
   projected: number;
   skipped: number;
+  /** Episodes confirmed to have actually landed in Graphiti this run (audit H3 reconcile pass). */
+  reconciled: number;
+  /** Episodes recorded as projected but never found in Graphiti — cleared so the next run
+   * re-pushes them (a worker crash between accept and extraction; audit H3). */
+  requeued: number;
   errors: string[];
 }
 
-// Phase 1 keeps a single run bounded (episodes are LLM-extracted on Graphiti's side). The per-row
-// sha dedup makes re-runs cheap no-ops; a backlog larger than this needs cursor pagination (Phase 2).
+// Per-batch scan size (episodes are LLM-extracted on Graphiti's side, so each batch stays bounded).
+// The runner pages through the whole backlog batch-by-batch via a synced_at cursor (audit H2), so a
+// corpus larger than one batch is fully projected instead of stalling on the oldest `limit` rows.
 const DEFAULT_LIMIT = Number(process.env.GRAPH_PROJECT_LIMIT ?? 500);
+// Safety bound so a runaway (e.g. clock skew re-scanning a tied synced_at) can't loop forever.
+const MAX_BATCHES = Number(process.env.GRAPH_PROJECT_MAX_BATCHES ?? 200);
 
 async function resolveTeams(
   db: DbClient,
@@ -39,7 +48,27 @@ async function resolveTeams(
   return (data ?? []) as { id: string; slug: string }[];
 }
 
+// Single-flight guard (audit MEDIUM): the interval scheduler and the admin "Project to graph" action
+// both call this. Without it, two concurrent runs hit the check-then-act in project.ts (no episode
+// row yet → both push) and duplicate episodes in Graphiti. In-process only — one brain instance.
+let inFlight: Promise<GraphProjectionSummary> | null = null;
+
 export async function runGraphProjection(opts?: {
+  teamId?: string;
+  client?: GraphitiClient;
+  db?: DbClient;
+  limit?: number;
+}): Promise<GraphProjectionSummary> {
+  if (inFlight) return inFlight;
+  inFlight = runGraphProjectionInner(opts);
+  try {
+    return await inFlight;
+  } finally {
+    inFlight = null;
+  }
+}
+
+async function runGraphProjectionInner(opts?: {
   teamId?: string;
   client?: GraphitiClient;
   db?: DbClient;
@@ -53,6 +82,8 @@ export async function runGraphProjection(opts?: {
     scanned: 0,
     projected: 0,
     skipped: 0,
+    reconciled: 0,
+    requeued: 0,
     errors: [],
   };
   if (!client.configured) return summary; // nowhere to project — skip cleanly
@@ -64,15 +95,30 @@ export async function runGraphProjection(opts?: {
 
   for (const t of teams) {
     try {
-      const s = await projectItemsToGraph(db, {
-        teamId: t.id,
-        teamSlug: t.slug,
-        client,
-        limit,
-      });
-      summary.scanned += s.scanned;
-      summary.projected += s.projected;
-      summary.skipped += s.skipped;
+      // Page forward through this team's whole backlog: advance the `since` cursor by the last
+      // synced_at scanned until a batch comes back short (fewer rows than the limit = tail reached).
+      // MAX_BATCHES caps the loop as a runaway guard. (audit H2)
+      let since: string | undefined;
+      for (let batch = 0; batch < MAX_BATCHES; batch++) {
+        const s = await projectItemsToGraph(db, {
+          teamId: t.id,
+          teamSlug: t.slug,
+          client,
+          limit,
+          since,
+        });
+        summary.scanned += s.scanned;
+        summary.projected += s.projected;
+        summary.skipped += s.skipped;
+        if (s.scanned < limit || !s.lastSyncedAt || s.lastSyncedAt === since) break;
+        since = s.lastSyncedAt;
+      }
+
+      // Reconcile after paging (audit H3, Option B): confirm this team's recorded episodes actually
+      // landed, and re-queue any that a crashed worker never got to. Off the hot push path.
+      const r = await reconcileProjectedEpisodes(db, client, t.id);
+      summary.reconciled += r.confirmed;
+      summary.requeued += r.reQueued;
     } catch (e) {
       summary.ok = false;
       summary.errors.push(`${t.slug}: ${e instanceof Error ? e.message : "projection failed"}`);

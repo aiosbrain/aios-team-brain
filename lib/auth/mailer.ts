@@ -91,6 +91,17 @@ export async function sendMagicLink(email: string, link: string): Promise<void> 
   });
 }
 
+/**
+ * Whether magic-link sign-in is a real, usable option right now: a stable domain (`APP_URL`) to
+ * build the link against, AND a mail provider actually configured to deliver it. Password login is
+ * the default and needs neither — this only gates whether the login form offers magic-link as a
+ * secondary option (`POST /api/auth/request-magic-link`). Without both, a "link sent" response would
+ * be a lie (no stable link, or nothing to send it with).
+ */
+export function magicLinkAvailable(): boolean {
+  return Boolean(process.env.APP_URL) && Boolean(process.env.RESEND_API_KEY || process.env.SMTP_URL);
+}
+
 export interface InviteEmailContext {
   /** The invitee's display name, as entered by the inviter. First name is used in the greeting. */
   inviteeName: string;
@@ -99,34 +110,27 @@ export interface InviteEmailContext {
 }
 
 /**
- * New-member invite email. With a `link` (a one-time sign-in URL) it's a direct
- * sign-in; without one (no APP_URL configured) it's a non-secret nudge to sign in.
- * Never throws. Names are attacker-controlled input (display names), so the HTML
- * body escapes them — this is the only place they're rendered as markup.
+ * New-member invite courtesy email, personalized (name/team/inviter). Sign-in is email+password
+ * (the admin shares the password out-of-band, the same "shown once" pattern as an API key) — this
+ * email NEVER carries a secret, it's just a heads-up that an account exists. Never throws. Names
+ * are attacker-controlled input (display names), so the HTML body escapes them — this is the only
+ * place they're rendered as markup.
  */
-export async function sendInviteEmail(email: string, link: string | null, ctx: InviteEmailContext): Promise<void> {
+export async function sendInviteEmail(email: string, ctx: InviteEmailContext): Promise<void> {
   const firstName = ctx.inviteeName.trim().split(/\s+/)[0] || ctx.inviteeName;
   const subject = `${ctx.inviterName} added you to ${ctx.teamName} on AIOS`;
 
-  const text = link
-    ? `Hi ${firstName},\n\n${ctx.inviterName} added you to ${ctx.teamName}'s AIOS Team Brain.\n\nSign in with this one-time link (single-use, expires in 24 hours):\n\n${link}\n\nIf you weren't expecting this, you can ignore this email.`
-    : `Hi ${firstName},\n\n${ctx.inviterName} added you to ${ctx.teamName}'s AIOS Team Brain. Open the team brain and sign in with this email address to get started.`;
+  const text =
+    `Hi ${firstName},\n\n${ctx.inviterName} added you to ${ctx.teamName}'s AIOS Team Brain.\n\n` +
+    `Ask your admin for your sign-in password, then open the team brain and sign in with this email address.`;
 
   const safeFirstName = escapeHtml(firstName);
   const safeInviter = escapeHtml(ctx.inviterName);
   const safeTeam = escapeHtml(ctx.teamName);
   const intro = `<p>Hi ${safeFirstName},</p><p><strong>${safeInviter}</strong> added you to <strong>${safeTeam}</strong>'s AIOS Team Brain.</p>`;
-  const html = link
-    ? `<div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px;color:#1a1a1a;">
+  const html = `<div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px;color:#1a1a1a;">
         ${intro}
-        <p style="margin:24px 0;">
-          <a href="${link}" style="background:#111;color:#fff;padding:12px 20px;border-radius:6px;text-decoration:none;font-weight:600;display:inline-block;">Sign in to AIOS</a>
-        </p>
-        <p style="color:#666;font-size:13px;">This link is single-use and expires in 24 hours. If you weren't expecting this, you can ignore this email.</p>
-      </div>`
-    : `<div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px;color:#1a1a1a;">
-        ${intro}
-        <p>Open the team brain and sign in with this email address to get started.</p>
+        <p>Ask your admin for your sign-in password, then open the team brain and sign in with this email address.</p>
       </div>`;
 
   await deliver(email, subject, { text, html });

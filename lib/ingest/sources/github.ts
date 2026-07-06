@@ -1,5 +1,6 @@
 import "server-only";
 
+import { timeoutFetch } from "@/lib/http";
 import type { GithubIssueRaw } from "./github-normalize";
 
 /**
@@ -36,7 +37,7 @@ export async function fetchGithubRepoIssues(opts: {
   fetchImpl?: typeof fetch;
   maxPages?: number;
 }): Promise<FetchedGithubRepo> {
-  const fetchImpl = opts.fetchImpl ?? fetch;
+  const fetchImpl = opts.fetchImpl ?? timeoutFetch;
   const headers = githubHeaders(opts.token);
 
   const issues: GithubIssueRaw[] = [];

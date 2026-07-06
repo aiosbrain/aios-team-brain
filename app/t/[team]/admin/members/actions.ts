@@ -1,30 +1,19 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
-import { serverClient } from "@/lib/db/server";
 import { adminClient } from "@/lib/db/admin";
-import { getSessionUser } from "@/lib/auth/session";
-import { resolveIntegrationsAdmin } from "@/lib/integrations/read";
+import { requireTeamAdmin as requireAdmin } from "@/lib/auth/guard";
 import { linkGithub } from "@/lib/codebases/github";
 import { setMemberIdentity, removeMemberIdentity } from "@/lib/identity/member-identities";
 import { addAuthorAlias, removeAuthorAlias } from "@/lib/admin/aliases";
 import { reattributeItems } from "@/lib/ingest/reattribute";
+import { adminSetPassword } from "@/lib/auth/pg-login";
+import { isPasswordStrongEnough, randomPassword, MIN_PASSWORD_LENGTH } from "@/lib/auth/password";
+import { audit } from "@/lib/api/audit";
 import { updateMemberRole } from "@/lib/admin/members";
 
 // Providers whose identity is a stable user id in member_identities (GitHub uses its own login flow).
 const PROVIDERS = new Set(["slack", "linear", "plane"]);
-
-/**
- * Admin gate for member mutations: resolve the signed-in user to an `{teamId, memberId}` admin
- * context (same role==="admin" + active-member check the /admin layout uses; `resolveIntegrationsAdmin`
- * is the shared team-admin resolver). Returns null for any non-admin/unknown/wrong-team caller.
- */
-async function requireAdmin(teamSlug: string) {
-  const db = await serverClient();
-  const user = await getSessionUser();
-  if (!user) return null;
-  return resolveIntegrationsAdmin(db, teamSlug, user.id);
-}
 
 /**
  * Link a roster member to a GitHub login (admins only). Reuses `linkGithub`, which writes
@@ -167,6 +156,49 @@ export async function reattributeIdentitiesNow(
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "re-attribution failed" };
   }
+}
+
+/**
+ * Reset a member's sign-in password (admins only) — audit M1/M2b. Sets a NEW password directly (no
+ * current-password check, unlike self-service change), scoped to a member of THIS team so an admin
+ * can't reach across teams via a raw memberId. Returns the plaintext password ONCE (shown-once UI,
+ * same pattern as API key issuance) for the admin to hand to the person out-of-band — never emailed,
+ * never logged.
+ */
+export async function resetMemberPassword(
+  teamSlug: string,
+  memberId: string,
+  password?: string
+): Promise<{ ok: boolean; password?: string; error?: string }> {
+  const ctx = await requireAdmin(teamSlug);
+  if (!ctx) return { ok: false, error: "admins only" };
+
+  const newPassword = password?.trim() || randomPassword();
+  if (!isPasswordStrongEnough(newPassword)) {
+    return { ok: false, error: `password must be at least ${MIN_PASSWORD_LENGTH} characters` };
+  }
+
+  const db = adminClient();
+  const { data: member } = await db
+    .from("members")
+    .select("id, email")
+    .eq("id", memberId)
+    .eq("team_id", ctx.teamId)
+    .maybeSingle();
+  if (!member) return { ok: false, error: "member not found on this team" };
+
+  await adminSetPassword((member as { email: string }).email, newPassword);
+  await audit(db, {
+    team_id: ctx.teamId,
+    actor_kind: "member",
+    member_id: ctx.memberId,
+    action: "member.password_reset",
+    target_type: "member",
+    target_id: memberId,
+    meta: {},
+  });
+  revalidatePath(`/t/${teamSlug}/admin/members`);
+  return { ok: true, password: newPassword };
 }
 
 /**

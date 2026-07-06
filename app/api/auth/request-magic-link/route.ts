@@ -11,12 +11,14 @@ const schema = z.object({
 });
 
 /**
- * Request a magic sign-in link — the primary sign-in path (replaces the insecure
- * direct-by-email login at /api/auth/login, now dev-only). Never sets a session
- * cookie itself; only GET /auth/confirm does that, once the emailed link is
- * actually clicked. Keeps the prior UX of an explicit 403 for an unrecognized
- * email (invite-only, no password to brute-force — not a meaningful enumeration
- * risk for this self-hosted, small known-member product).
+ * Request a magic sign-in link — an OPTIONAL secondary sign-in path (email+password at
+ * POST /api/auth/login is the default; see that route's docblock). Never sets a session cookie
+ * itself; only GET /auth/confirm does that, once the emailed link is actually clicked. Keeps the
+ * explicit 403 for an unrecognized email (invite-only, no password to brute-force here — not a
+ * meaningful enumeration risk for this self-hosted, small known-member product). The login form
+ * only offers this option when a domain + mail provider are configured (`magicLinkAvailable`); the
+ * route itself stays reachable regardless — with no provider configured, `sendMagicLink` degrades
+ * to its existing dev-log/drop-and-log behavior (lib/auth/mailer), same as every other email here.
  */
 export async function POST(req: NextRequest) {
   let body: unknown;

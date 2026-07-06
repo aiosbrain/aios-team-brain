@@ -14,9 +14,6 @@ const EMBEDDINGS_URL = process.env.EMBEDDINGS_URL;
 const EMBEDDINGS_MODEL = process.env.EMBEDDINGS_MODEL ?? "text-embedding-3-small";
 const EMBEDDINGS_TIMEOUT_MS = Number(process.env.EMBEDDINGS_TIMEOUT_MS ?? 20_000);
 
-/** Vector dimension of the configured model; must equal the `item_chunks.embedding` column dim. */
-export const EMBEDDING_DIM = Number(process.env.EMBEDDINGS_DIM ?? 1536);
-
 /** True when an embeddings endpoint is configured (dense retrieval opt-in). */
 export function embeddingsConfigured(): boolean {
   return !!EMBEDDINGS_URL;

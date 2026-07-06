@@ -6,10 +6,52 @@ import { BASE_URL, db, issueKeyFor, keyHeaders, seedMemberEmail, seedTeam } from
 // HTTP auth edges that the in-process tier can't reach: cookie-setting routes need a
 // real Set-Cookie response, and /api/v1/me round-trips Bearer + X-AIOS-Team headers.
 //
-// POST /api/auth/login's dev-only gate is covered at the unit tier
-// (app/api/auth/login/route.test.ts) instead of here: this suite's shared spawned
-// server runs with ALLOW_DEV_LOGIN=1 (see vitest.http.config.ts) so OTHER HTTP test
-// files can keep using it as a convenience session-setup helper.
+// Two sign-in paths: email+password (POST /api/auth/login) is the DEFAULT, always available.
+// The magic-link request+confirm pair is an OPTIONAL secondary path, surfaced by the login form
+// only when a domain + mail provider are configured — but the route itself stays reachable
+// regardless (see request-magic-link/route.ts), so it's tested here unconditionally too.
+
+describe("POST /api/auth/login (HTTP)", () => {
+  it("rejects an unknown email with a uniform 401 (not enumerable)", async () => {
+    const res = await fetch(`${BASE_URL}/api/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        email: `nobody-${randomUUID().slice(0, 8)}@nope.test`,
+        password: "whatever-password",
+      }),
+    });
+    expect(res.status).toBe(401);
+    expect((await res.json()).error).toBe("invalid_credentials");
+  });
+
+  it("rejects a recognized email with the wrong password — same 401 shape as an unknown email", async () => {
+    const seed = await seedTeam();
+    const { email } = await seedMemberEmail(seed);
+
+    const res = await fetch(`${BASE_URL}/api/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, password: "not-the-real-password" }),
+    });
+    expect(res.status).toBe(401);
+    expect((await res.json()).error).toBe("invalid_credentials");
+  });
+
+  it("signs in a known member with the correct password: 200 + a session cookie", async () => {
+    const seed = await seedTeam();
+    const { email, password } = await seedMemberEmail(seed);
+
+    const res = await fetch(`${BASE_URL}/api/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, password }),
+    });
+    expect(res.status).toBe(200);
+    expect((await res.json()).ok).toBe(true);
+    expect(res.headers.get("set-cookie") ?? "").toContain("aios_session");
+  });
+});
 
 describe("POST /api/auth/request-magic-link (HTTP)", () => {
   it("rejects an unknown email with 403 and never sets a cookie", async () => {
@@ -25,7 +67,7 @@ describe("POST /api/auth/request-magic-link (HTTP)", () => {
 
   it("accepts a known member's email with 200 but never sets a session cookie itself", async () => {
     const seed = await seedTeam();
-    const email = await seedMemberEmail(seed);
+    const { email } = await seedMemberEmail(seed);
 
     const res = await fetch(`${BASE_URL}/api/auth/request-magic-link`, {
       method: "POST",
@@ -42,7 +84,7 @@ describe("POST /api/auth/request-magic-link (HTTP)", () => {
 describe("GET /auth/confirm (HTTP) — full magic-link round trip", () => {
   it("redeems a token minted for a known member, sets the session cookie, and routes a first login through /auth/welcome", async () => {
     const seed = await seedTeam();
-    const email = await seedMemberEmail(seed);
+    const { email } = await seedMemberEmail(seed);
     // seedMemberEmail creates the member pre-activated (status: "active"), so this is
     // a repeat-login redemption — mint the token the same way the real request route
     // does, bypassing the outbound email (which isn't observable over HTTP here).

@@ -54,8 +54,12 @@ exception when duplicate_object then null; end $$;
 create table if not exists auth_users (
   id uuid primary key default gen_random_uuid(),
   email citext not null unique,
+  -- Email+password auth (audit M1/M2b): admin sets the initial password, the member logs in with
+  -- it and can change it anytime. NULL = no password set yet (login rejected, not allowed through).
+  password_hash text,
   created_at timestamptz not null default now()
 );
+alter table auth_users add column if not exists password_hash text;
 
 create table if not exists auth_tokens (
   token_hash text primary key,             -- sha256(secret)
@@ -323,6 +327,7 @@ create table if not exists items (
   unique (team_id, project_id, path)
 );
 create index if not exists items_team_updated_idx on items (team_id, updated_at desc);
+create index if not exists items_team_synced_idx on items (team_id, synced_at desc);
 create index if not exists items_search_idx on items using gin (search);
 create index if not exists items_kind_idx on items (team_id, kind);
 
@@ -360,6 +365,11 @@ create table if not exists tasks (
   labels text[] not null default '{}',
   priority text not null default 'none' check (priority in ('none', 'low', 'medium', 'high', 'urgent')),
   body text not null default '',
+  -- Tier visibility (audit H1). A task inherits the `access` tier of the item that materialized it
+  -- (lib/ingest materializeTasks); external-tier reads filter `audience='external'`. There is NO RLS
+  -- backstop (CLAUDE.md §5) — this column is the SOLE thing stopping an external principal reading
+  -- internal task boards. Mirrors `decisions.audience`.
+  audience access_tier not null default 'team',
   created_by uuid references members(id) on delete set null,
   updated_at timestamptz not null default now(),
   created_at timestamptz not null default now()
@@ -371,6 +381,7 @@ alter table tasks add column if not exists parent_row_key text;
 alter table tasks add column if not exists labels text[] not null default '{}';
 alter table tasks add column if not exists priority text not null default 'none';
 alter table tasks add column if not exists body text not null default '';
+alter table tasks add column if not exists audience access_tier not null default 'team';
 do $$ begin
   if not exists (select 1 from pg_constraint where conname = 'tasks_priority_check') then
     alter table tasks add constraint tasks_priority_check check (priority in ('none', 'low', 'medium', 'high', 'urgent'));
@@ -381,6 +392,7 @@ create index if not exists tasks_team_status_idx on tasks (team_id, status);
 create index if not exists tasks_team_assignee_idx on tasks (team_id, assignee);
 create index if not exists tasks_team_updated_idx on tasks (team_id, updated_at desc);
 create index if not exists tasks_team_parent_idx on tasks (team_id, project_id, parent_row_key);
+create index if not exists tasks_team_audience_idx on tasks (team_id, audience);
 
 -- Links between AIOS task rows and the external PM tool selected by the team.
 -- AIOS remains the source of truth for row identity/status; this table records how
@@ -681,6 +693,7 @@ create table if not exists code_contributions (
 );
 create index if not exists code_contributions_codebase_idx on code_contributions (codebase_id, day desc);
 create index if not exists code_contributions_member_idx on code_contributions (member_id);
+create index if not exists code_contributions_team_idx on code_contributions (team_id);
 
 create table if not exists github_issues (
   id uuid primary key default gen_random_uuid(),

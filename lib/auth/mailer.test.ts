@@ -2,8 +2,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { sendInviteEmail, sendMagicLink } from "./mailer";
 
 // Spec: deliver via Resend HTTP API when keyed; never throw; never treat dev-logging as
-// a delivery path; never leak the one-time token into a non-link invite. We assert on
-// recipient/subject/shape — NOT on token values (no secrets in assertions).
+// a delivery path; never leak a secret (password or magic token) into the invite email —
+// sign-in is email+password, shared out-of-band by the admin, never mailed.
 
 afterEach(() => {
   vi.unstubAllEnvs();
@@ -30,7 +30,7 @@ describe("mailer delivery", () => {
     vi.stubEnv("RESEND_API_KEY", "re_test_key");
     const fetchFn = mockFetch(true);
 
-    await sendInviteEmail("new@member.test", "https://brain.test/auth/confirm?token=REDACTED", inviteCtx);
+    await sendInviteEmail("new@member.test", inviteCtx);
 
     expect(fetchFn).toHaveBeenCalledTimes(1);
     expect(fetchFn.mock.calls[0][0]).toBe("https://api.resend.com/emails");
@@ -44,7 +44,7 @@ describe("mailer delivery", () => {
     vi.stubEnv("RESEND_API_KEY", "re_test_key");
     const fetchFn = mockFetch(true);
 
-    await sendInviteEmail("new@member.test", "https://brain.test/auth/confirm?token=REDACTED", inviteCtx);
+    await sendInviteEmail("new@member.test", inviteCtx);
 
     const body = sentBody(fetchFn);
     expect(body.text).toContain("Alicia");
@@ -54,14 +54,13 @@ describe("mailer delivery", () => {
     expect(body.html).toContain("Alicia");
     expect(body.html).toContain("Bob Admin");
     expect(body.html).toContain("Acme Co");
-    expect(body.html).toMatch(/<a href="https:\/\/brain\.test\/auth\/confirm\?token=REDACTED"/);
   });
 
   it("escapes HTML-unsafe characters in names before rendering the html body", async () => {
     vi.stubEnv("RESEND_API_KEY", "re_test_key");
     const fetchFn = mockFetch(true);
 
-    await sendInviteEmail("new@member.test", "https://brain.test/auth/confirm?token=REDACTED", {
+    await sendInviteEmail("new@member.test", {
       inviteeName: "<script>alert(1)</script>",
       teamName: "Acme & Co <b>",
       inviterName: "Bob \"Boss\" Admin",
@@ -83,14 +82,14 @@ describe("mailer delivery", () => {
     vi.stubEnv("SMTP_URL", "");
     const fetchFn = vi.fn();
     vi.stubGlobal("fetch", fetchFn);
-    await expect(sendInviteEmail("a@b.test", null, inviteCtx)).resolves.toBeUndefined();
+    await expect(sendInviteEmail("a@b.test", inviteCtx)).resolves.toBeUndefined();
     expect(fetchFn).not.toHaveBeenCalled();
   });
 
-  it("an invite with no link is a non-secret nudge (no token in the body)", async () => {
+  it("an invite email never carries a password or token", async () => {
     vi.stubEnv("RESEND_API_KEY", "re_test_key");
     const fetchFn = mockFetch(true);
-    await sendInviteEmail("a@b.test", null, inviteCtx);
+    await sendInviteEmail("a@b.test", inviteCtx);
     const body = sentBody(fetchFn);
     expect(body.text).not.toMatch(/token=/);
     expect(body.text).toMatch(/sign in/i);

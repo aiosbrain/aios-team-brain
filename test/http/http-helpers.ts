@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { issueApiKey } from "@/lib/admin/keys";
+import { adminSetPassword } from "@/lib/auth/pg-login";
 import { db, seedTeam, type Seed } from "../datamechanics/helpers";
 import { BASE_URL } from "./server-url";
 
@@ -37,9 +38,10 @@ export async function issueKeyFor(seed: Seed, tier: "team" | "external"): Promis
   return { key };
 }
 
-/** Seed a member with a known email under the seeded team (for login tests). */
-export async function seedMemberEmail(seed: Seed): Promise<string> {
+/** Seed a member with a known email + password under the seeded team (for login tests). */
+export async function seedMemberEmail(seed: Seed): Promise<{ email: string; password: string }> {
   const email = `login-${randomUUID().slice(0, 8)}@test.local`;
+  const password = `test-password-${randomUUID().slice(0, 12)}`;
   const { error } = await db()
     .from("members")
     .insert({
@@ -52,7 +54,8 @@ export async function seedMemberEmail(seed: Seed): Promise<string> {
       status: "active",
     });
   if (error) throw new Error(`login member seed failed: ${error.message}`);
-  return email;
+  await adminSetPassword(email, password);
+  return { email, password };
 }
 
 /** Standard auth headers for an API-key request. */
