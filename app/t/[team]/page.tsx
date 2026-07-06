@@ -24,25 +24,37 @@ function SetupChecklist({ teamSlug }: { teamSlug: string }) {
   const steps = [
     <span key="1">
       Invite your team in{" "}
-      <Link href={`/t/${teamSlug}/admin/members`} className="text-violet underline underline-offset-2">
+      <Link
+        href={`/t/${teamSlug}/admin/members`}
+        className="text-violet underline underline-offset-2"
+      >
         Admin → Members
       </Link>
     </span>,
     <span key="2">
-      Each teammate generates their own API key from their profile page once signed in (or an
-      admin can issue one for them in{" "}
-      <Link href={`/t/${teamSlug}/admin/keys`} className="text-violet underline underline-offset-2">
+      Each teammate generates their own API key from their profile page once
+      signed in (or an admin can issue one for them in{" "}
+      <Link
+        href={`/t/${teamSlug}/admin/keys`}
+        className="text-violet underline underline-offset-2"
+      >
         Admin → Keys
       </Link>
       )
     </span>,
     <span key="3">
-      Run <code className="rounded bg-surface-overlay px-1 py-0.5 font-mono text-xs">aios push</code>{" "}
+      Run{" "}
+      <code className="rounded bg-surface-overlay px-1 py-0.5 font-mono text-xs">
+        aios push
+      </code>{" "}
       from your project repo
     </span>,
     <span key="4">
       Ask your first question in{" "}
-      <Link href={`/t/${teamSlug}/query`} className="text-violet underline underline-offset-2">
+      <Link
+        href={`/t/${teamSlug}/query`}
+        className="text-violet underline underline-offset-2"
+      >
         Query
       </Link>
     </span>,
@@ -53,14 +65,20 @@ function SetupChecklist({ teamSlug }: { teamSlug: string }) {
       <div className="rounded-2xl bg-surface-inset px-8 py-10">
         <div className="mb-4 flex items-center gap-3">
           <Rocket className="size-6 text-violet" strokeWidth={1.5} />
-          <h2 className="text-xl font-semibold text-ink">Get your team brain online</h2>
+          <h2 className="text-xl font-semibold text-ink">
+            Get your team brain online
+          </h2>
         </div>
         <p className="mb-6 text-sm text-ink-secondary">
-          Nothing has been synced yet. Four steps and your team&apos;s memory starts compounding:
+          Nothing has been synced yet. Four steps and your team&apos;s memory
+          starts compounding:
         </p>
         <ol className="mb-6 flex flex-col gap-3">
           {steps.map((step, i) => (
-            <li key={i} className="flex items-start gap-3 text-sm text-ink-secondary">
+            <li
+              key={i}
+              className="flex items-start gap-3 text-sm text-ink-secondary"
+            >
               <span className="bg-gradient-prism mt-0.5 flex size-5 shrink-0 items-center justify-center rounded-full text-[11px] font-semibold text-white">
                 {i + 1}
               </span>
@@ -100,14 +118,19 @@ export default async function TeamHome({
     .eq("status", "active")
     .maybeSingle();
   const isAdmin = me?.role === "admin";
-  const tier = ((me?.tier as "team" | "external" | undefined) ?? "external");
+  const tier = (me?.tier as "team" | "external" | undefined) ?? "external";
   const memberId = (me?.id as string | undefined) ?? "";
-  const firstName = ((me?.display_name as string | undefined) ?? "").trim().split(/\s+/)[0] || "there";
+  const firstName =
+    ((me?.display_name as string | undefined) ?? "").trim().split(/\s+/)[0] ||
+    "there";
 
   // Tier-filtered count (no RLS backstop in postgres mode).
   const { count: itemCount } = await visibleItems(
-    db.from("items").select("id", { count: "exact", head: true }).eq("team_id", team.id),
-    tier
+    db
+      .from("items")
+      .select("id", { count: "exact", head: true })
+      .eq("team_id", team.id),
+    tier,
   );
 
   // Has this member EVER issued their own key (revoked or not) — the proxy for "has this
@@ -150,6 +173,7 @@ export default async function TeamHome({
           firstName={firstName}
           agentPrompt={buildAgentOnboardingPrompt({
             teamSlug,
+            teamName: team.name,
             brainUrl: (process.env.APP_URL ?? "").replace(/\/$/, ""),
           })}
           keys={(keyRows ?? []) as MyKeyRow[]}
@@ -167,7 +191,7 @@ export default async function TeamHome({
         .eq("team_id", team.id)
         .order("decided_at", { ascending: false })
         .limit(8),
-      tier
+      tier,
     ),
   ]);
 
@@ -193,7 +217,10 @@ export default async function TeamHome({
       <WorkingOn teamSlug={teamSlug} />
 
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
-        <DecisionsCard teamSlug={teamSlug} decisions={(decisions ?? []) as DecisionRow[]} />
+        <DecisionsCard
+          teamSlug={teamSlug}
+          decisions={(decisions ?? []) as DecisionRow[]}
+        />
         <TaskFunnel data={pulse.funnel} />
       </div>
     </div>
