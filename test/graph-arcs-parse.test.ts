@@ -73,4 +73,31 @@ describe("parseArcsJson", () => {
     expect(parseArcsJson("not json")).toEqual([]);
     expect(parseArcsJson(JSON.stringify({ nope: 1 }))).toEqual([]);
   });
+
+  // Regression: Claude/GPT often ignore "return ONLY JSON" and wrap the object in a markdown code
+  // fence or a leading sentence. Before this fix that silently degraded to "no arcs" with zero
+  // diagnostics — exactly the failure mode reported on the Learning page.
+  it("unwraps a JSON object wrapped in a ```json code fence", () => {
+    const body = JSON.stringify({ arcs: [{ title: "Auth rewrite", confidence: "high" }] });
+    const [arc] = parseArcsJson("```json\n" + body + "\n```", NOW);
+    expect(arc.title).toBe("Auth rewrite");
+  });
+
+  it("unwraps a JSON object wrapped in a bare ``` code fence", () => {
+    const body = JSON.stringify({ arcs: [{ title: "Auth rewrite", confidence: "high" }] });
+    const [arc] = parseArcsJson("```\n" + body + "\n```", NOW);
+    expect(arc.title).toBe("Auth rewrite");
+  });
+
+  it("unwraps a JSON object padded with a leading/trailing sentence", () => {
+    const body = JSON.stringify({ arcs: [{ title: "Auth rewrite", confidence: "high" }] });
+    const [arc] = parseArcsJson(`Here is the analysis:\n${body}\nLet me know if you need more.`, NOW);
+    expect(arc.title).toBe("Auth rewrite");
+  });
+
+  it("leaves a clean, unwrapped response untouched", () => {
+    const raw = JSON.stringify({ arcs: [{ title: "Auth rewrite", confidence: "high" }] });
+    const [arc] = parseArcsJson(raw, NOW);
+    expect(arc.title).toBe("Auth rewrite");
+  });
 });
