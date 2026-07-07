@@ -82,6 +82,38 @@ export async function recentFacts(
   }
 }
 
+/**
+ * Resolve a set of episode UUIDs → their source item id + source, tier-scoped. Episodes are named
+ * `items:<id>`, so this lets a fact (which carries `episodeUuids`) link back to the brain item that
+ * produced it — the provenance behind a narrative arc's evidence. Best-effort empty map on failure.
+ */
+export async function resolveEpisodeItems(
+  groups: string[],
+  uuids: string[]
+): Promise<Map<string, { itemId?: string; source?: string }>> {
+  const out = new Map<string, { itemId?: string; source?: string }>();
+  const unique = [...new Set(uuids.filter(Boolean))].slice(0, 500);
+  if (!neo4jConfigured() || groups.length === 0 || unique.length === 0) return out;
+  try {
+    const rows = await runRead<{ uuid: string; name: string | null; source: string | null }>(
+      `MATCH (ep:Episodic)
+       WHERE ep.group_id IN $groups AND ep.uuid IN $uuids
+       RETURN ep.uuid AS uuid, ep.name AS name, ep.source AS source`,
+      { groups, uuids: unique }
+    );
+    for (const r of rows) {
+      const name = r.name ?? "";
+      out.set(r.uuid, {
+        itemId: name.startsWith("items:") ? name.slice("items:".length) : undefined,
+        source: r.source ? r.source.toLowerCase() : undefined,
+      });
+    }
+    return out;
+  } catch {
+    return out; // degrade — evidence just won't carry links
+  }
+}
+
 /** Layer 2 — an event (a source episode) with its participants + the facts extracted from it. */
 export interface GraphEvent {
   id: string; // episode uuid
