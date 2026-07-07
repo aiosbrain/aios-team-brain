@@ -874,7 +874,10 @@ create table if not exists chat_messages (
   search tsvector generated always as (to_tsvector('english', coalesce(content, ''))) stored
 );
 create index if not exists chat_messages_conversation_idx on chat_messages (conversation_id, created_at);
-create index if not exists chat_messages_search_idx on chat_messages using gin (search);
+-- NOTE: the `chat_messages_search_idx` GIN index lives in migration 20260707130000, NOT here — on a
+-- DB that already has chat_messages the create-table above is a no-op (so the `search` column isn't
+-- added here), and an index on a not-yet-existing column would fail. The migration adds the column
+-- then the index, covering both from-zero and existing prod.
 
 -- ── ingestion run log (observability for imports/scans) ───────────────────────
 -- One row per ingestion run: every scheduler tick, manual /sync, and codebase scan records its
