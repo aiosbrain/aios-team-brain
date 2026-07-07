@@ -869,9 +869,12 @@ create table if not exists chat_messages (
   input_tokens integer not null default 0,
   output_tokens integer not null default 0,
   cost_usd numeric(10, 5) not null default 0,
-  created_at timestamptz not null default now()
+  created_at timestamptz not null default now(),
+  -- FTS over message bodies so the sidebar search can match conversation CONTENT (mirrors items.search).
+  search tsvector generated always as (to_tsvector('english', coalesce(content, ''))) stored
 );
 create index if not exists chat_messages_conversation_idx on chat_messages (conversation_id, created_at);
+create index if not exists chat_messages_search_idx on chat_messages using gin (search);
 
 -- ── ingestion run log (observability for imports/scans) ───────────────────────
 -- One row per ingestion run: every scheduler tick, manual /sync, and codebase scan records its

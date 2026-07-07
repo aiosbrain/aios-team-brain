@@ -121,6 +121,45 @@ export async function listConversations(
   return (data ?? []) as Conversation[];
 }
 
+/**
+ * Search the member's conversations by title OR message content (owner-scoped). Content matches use
+ * FTS over `chat_messages` (`websearch_to_tsquery`); title matches are a case-insensitive substring
+ * over the member's own list. Most-recent-active first, capped. Empty query → the plain list.
+ */
+export async function searchConversations(
+  db: DbClient,
+  owner: Owner,
+  query: string,
+  limit = 50
+): Promise<Conversation[]> {
+  const q = query.trim();
+  if (!q) return listConversations(db, owner, limit);
+  // Content matches: message bodies via FTS → the conversations they belong to (owner-scoped).
+  const { data: hits } = await db
+    .from("chat_messages")
+    .select("conversation_id")
+    .eq("team_id", owner.teamId)
+    .eq("member_id", owner.memberId)
+    .textSearch("search", q, { type: "websearch", config: "english" })
+    .limit(1000);
+  const contentIds = new Set(
+    (hits ?? []).map((h) => (h as { conversation_id: string }).conversation_id)
+  );
+  // The member's non-archived conversations; keep those whose title matches OR whose content matched.
+  const { data } = await db
+    .from("conversations")
+    .select("id, title, created_at, updated_at")
+    .eq("team_id", owner.teamId)
+    .eq("member_id", owner.memberId)
+    .is("archived_at", null)
+    .order("updated_at", { ascending: false })
+    .limit(500);
+  const ql = q.toLowerCase();
+  return ((data ?? []) as Conversation[])
+    .filter((c) => (c.title || "").toLowerCase().includes(ql) || contentIds.has(c.id))
+    .slice(0, limit);
+}
+
 /** A conversation's full message thread — owner-checked; null if not owned/absent. */
 export async function getConversation(
   db: DbClient,
