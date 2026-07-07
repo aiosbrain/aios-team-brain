@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import type { NextRequest } from "next/server";
 import { GET as companyGraphGET } from "@/app/api/v1/company-graph/route";
 import { issueApiKey } from "@/lib/admin/keys";
+import { syncMemberActor, memberEntityId } from "@/lib/graph/company-actors";
 import { db, seedTeam, type Seed } from "./helpers";
 
 // HTTP edge for GET /api/v1/company-graph (brain-api v1.5, AIO-141). The graph tables
@@ -171,5 +172,92 @@ describe("company-graph endpoint (real handler, real Postgres)", () => {
     const res = await get(key, other.teamSlug);
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ people: [], ownership: [] });
+  });
+
+  it("a real, member-synced actor's reports_to is projected from attrs.reports_to (not just a relationship row)", async () => {
+    const seed = await seedTeam();
+    const { data: manager } = await db()
+      .from("members")
+      .insert({
+        team_id: seed.teamId,
+        email: `${randomUUID()}@test.local`,
+        display_name: "Manager",
+        actor_handle: `mgr-${randomUUID().slice(0, 8)}`,
+        role: "lead",
+        tier: "team",
+        status: "active",
+      })
+      .select("id")
+      .single();
+    const managerId = (manager as { id: string }).id;
+    await db().from("members").update({ manager_member_id: managerId }).eq("id", seed.memberId);
+    await syncMemberActor(db(), seed.teamId, managerId);
+    await syncMemberActor(db(), seed.teamId, seed.memberId);
+
+    const key = await issueKeyFor(seed, "team");
+    const res = await get(key, seed.teamSlug);
+    const body = (await res.json()) as { people: { entity_id: string; reports_to: string | null }[] };
+    const synced = body.people.find((p) => p.entity_id === memberEntityId(seed.memberId));
+    expect(synced?.reports_to).toBe(memberEntityId(managerId));
+  });
+
+  it("a soft-disabled member's entity is absent from people[] but still present in graph_entities directly", async () => {
+    const seed = await seedTeam();
+    // A key must belong to a still-active member (authenticateApiKey rejects a disabled owner
+    // outright) — issue from a second, active member; seed.memberId is the one being disabled.
+    const { data: activeCaller } = await db()
+      .from("members")
+      .insert({
+        team_id: seed.teamId,
+        email: `${randomUUID()}@test.local`,
+        display_name: "Caller",
+        actor_handle: `caller-${randomUUID().slice(0, 8)}`,
+        role: "member",
+        tier: "team",
+        status: "active",
+      })
+      .select("id")
+      .single();
+    const { key } = await issueApiKey(db(), seed.teamId, (activeCaller as { id: string }).id, "team key");
+
+    await syncMemberActor(db(), seed.teamId, seed.memberId);
+    await db().from("members").update({ status: "disabled" }).eq("id", seed.memberId);
+    await syncMemberActor(db(), seed.teamId, seed.memberId);
+
+    const res = await get(key, seed.teamSlug);
+    const body = (await res.json()) as { people: { entity_id: string }[] };
+    expect(body.people.some((p) => p.entity_id === memberEntityId(seed.memberId))).toBe(false);
+
+    const { data: rawEntity } = await db()
+      .from("graph_entities")
+      .select("entity_id")
+      .eq("team_id", seed.teamId)
+      .eq("entity_id", memberEntityId(seed.memberId))
+      .maybeSingle();
+    expect(rawEntity).not.toBeNull(); // kept for history, just not surfaced as current staff
+  });
+
+  it("a connector member never appears in people[] even after a backfill-style sync attempt", async () => {
+    const seed = await seedTeam();
+    const { data: connector } = await db()
+      .from("members")
+      .insert({
+        team_id: seed.teamId,
+        email: `${randomUUID()}@test.local`,
+        display_name: "Plane Sync",
+        actor_handle: `plane-sync-${randomUUID().slice(0, 8)}`,
+        role: "member",
+        tier: "team",
+        status: "active",
+        is_connector: true,
+      })
+      .select("id")
+      .single();
+    await syncMemberActor(db(), seed.teamId, (connector as { id: string }).id);
+
+    const key = await issueKeyFor(seed, "team");
+    const res = await get(key, seed.teamSlug);
+    const body = (await res.json()) as { people: { entity_id: string }[] };
+    expect(body.people.some((p) => p.entity_id === memberEntityId((connector as { id: string }).id))).toBe(false);
   });
 });

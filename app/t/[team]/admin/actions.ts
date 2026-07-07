@@ -5,6 +5,7 @@ import { revalidatePath } from "next/cache";
 import { adminClient } from "@/lib/db/admin";
 import { requireTeamAdmin as requireAdmin } from "@/lib/auth/guard";
 import { createMember } from "@/lib/admin/members";
+import { syncMemberActor } from "@/lib/graph/company-actors";
 import { issueApiKey as issueApiKeyPrimitive, revokeApiKey as revokeApiKeyPrimitive } from "@/lib/admin/keys";
 import { issueLoginLink } from "@/lib/admin/login";
 import { adminSetPassword } from "@/lib/auth/pg-login";
@@ -74,8 +75,9 @@ export async function inviteMember(
 
   const email = form.email.trim().toLowerCase();
   const db = adminClient();
+  let newMemberId: string;
   try {
-    await createMember(
+    const created = await createMember(
       db,
       ctx.teamId,
       {
@@ -86,9 +88,18 @@ export async function inviteMember(
       },
       { actor: { kind: "member", memberId: ctx.memberId } }
     );
+    newMemberId = created.id;
     if (!useMagicLink) await adminSetPassword(email, password);
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "create failed" };
+  }
+
+  // Best-effort — the company graph is a derived context surface, not the source of truth; a
+  // transient sync hiccup must never block onboarding a real person.
+  try {
+    await syncMemberActor(db, ctx.teamId, newMemberId);
+  } catch (e) {
+    console.error("[company-graph] actor sync failed on invite:", e instanceof Error ? e.message : e);
   }
 
   const [{ data: team }, { data: inviter }] = await Promise.all([

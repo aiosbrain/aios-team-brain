@@ -119,6 +119,9 @@ create table if not exists members (
   -- resolveConnectorAuth), never for a real human — excluded from Admin -> Members and
   -- /api/v1/members so a connector never renders indistinguishable from a person.
   is_connector boolean not null default false,
+  -- Org-chart source: who this member reports to (nullable self-FK). Synced into the company
+  -- graph (lib/graph/company-actors.ts) as a REPORTS_TO edge + attrs.reports_to.
+  manager_member_id uuid references members(id) on delete set null,
   created_at timestamptz not null default now(),
   unique (team_id, email),
   unique (team_id, actor_handle)

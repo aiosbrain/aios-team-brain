@@ -10,7 +10,8 @@ import { reattributeItems } from "@/lib/ingest/reattribute";
 import { adminSetPassword } from "@/lib/auth/pg-login";
 import { isPasswordStrongEnough, randomPassword, MIN_PASSWORD_LENGTH } from "@/lib/auth/password";
 import { audit } from "@/lib/api/audit";
-import { updateMemberRole, deleteMember } from "@/lib/admin/members";
+import { updateMemberRole, deleteMember, updateMemberManager, type UpdateManagerResult } from "@/lib/admin/members";
+import { syncMemberActor } from "@/lib/graph/company-actors";
 
 // Providers whose identity is a stable user id in member_identities (GitHub uses its own login flow).
 const PROVIDERS = new Set(["slack", "linear", "plane"]);
@@ -213,8 +214,9 @@ export async function setMemberRole(
 ): Promise<{ ok: boolean; error?: string }> {
   const ctx = await requireAdmin(teamSlug);
   if (!ctx) return { ok: false, error: "admins only" };
+  const db = adminClient();
   try {
-    const res = await updateMemberRole(adminClient(), ctx.teamId, memberId, role, {
+    const res = await updateMemberRole(db, ctx.teamId, memberId, role, {
       actor: { kind: "member", memberId: ctx.memberId },
     });
     if (!res.updated && res.reason === "last-admin") {
@@ -223,11 +225,54 @@ export async function setMemberRole(
     if (!res.updated && res.reason === "absent") {
       return { ok: false, error: "member not found" };
     }
+    if (res.updated) {
+      try {
+        await syncMemberActor(db, ctx.teamId, memberId);
+      } catch (e) {
+        console.error("[company-graph] actor sync failed on role change:", e instanceof Error ? e.message : e);
+      }
+    }
     revalidatePath(`/t/${teamSlug}/admin/members`);
     return { ok: true };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "could not change role" };
   }
+}
+
+const MANAGER_ERROR: Record<NonNullable<UpdateManagerResult["reason"]>, string> = {
+  absent: "member not found",
+  self: "a member can't manage themselves",
+  "manager-not-found": "manager not found on this team",
+  "manager-disabled": "can't assign a disabled member as manager",
+  "manager-is-connector": "can't assign a connector as manager",
+};
+
+/**
+ * Set (or clear) an existing member's manager (admins only) — the org-chart source synced into
+ * the company graph (`syncMemberActor` re-reads the row and calls `syncReportsTo`, which writes
+ * both the REPORTS_TO relationship edge `retrieve.ts`'s prompt reads and `attrs.reports_to` on the
+ * entity `GET /api/v1/company-graph` reads). Validation itself lives in `updateMemberManager`
+ * (self/cross-team/disabled/connector rejection) — this is a thin session-gated wrapper.
+ */
+export async function setMemberManager(
+  teamSlug: string,
+  memberId: string,
+  managerMemberId: string | null
+): Promise<{ ok: boolean; error?: string }> {
+  const ctx = await requireAdmin(teamSlug);
+  if (!ctx) return { ok: false, error: "admins only" };
+
+  const db = adminClient();
+  const res = await updateMemberManager(db, ctx.teamId, memberId, managerMemberId);
+  if (!res.updated) return { ok: false, error: MANAGER_ERROR[res.reason!] };
+
+  try {
+    await syncMemberActor(db, ctx.teamId, memberId);
+  } catch (e) {
+    console.error("[company-graph] reports-to sync failed:", e instanceof Error ? e.message : e);
+  }
+  revalidatePath(`/t/${teamSlug}/admin/members`);
+  return { ok: true };
 }
 
 /**
@@ -258,6 +303,15 @@ export async function removeMember(
     });
     if (!res.deleted && res.reason === "last-admin") {
       return { ok: false, error: "can't remove the last admin — promote someone else first" };
+    }
+    if (res.deleted) {
+      try {
+        // Soft-disable (this action's only mode) keeps the actor entity for history — just
+        // refreshes attrs.status so it drops out of retrieve.ts/company-graph's live context.
+        await syncMemberActor(db, ctx.teamId, memberId);
+      } catch (e) {
+        console.error("[company-graph] actor sync failed on remove:", e instanceof Error ? e.message : e);
+      }
     }
     revalidatePath(`/t/${teamSlug}/admin/members`);
     return { ok: true };
