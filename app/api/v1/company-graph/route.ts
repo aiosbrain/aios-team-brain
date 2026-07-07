@@ -75,9 +75,11 @@ export async function GET(req: NextRequest) {
   const byId = new Map(entities.map((e) => [e.entity_id, e]));
 
   // people[]: every actor entity; role/job_family/reports_to projected out of attrs
-  // (the seed stores the whole fixture object in attrs), missing attrs → null.
+  // (the seed stores the whole fixture object in attrs), missing attrs → null. A disabled
+  // member's entity is kept in graph_entities for history but never surfaced as current
+  // staff (member-synced actors carry attrs.status; the seed fixtures never set it).
   const people = entities
-    .filter((e) => e.entity_type === "actor")
+    .filter((e) => e.entity_type === "actor" && attrStr(e.attrs, "status") !== "disabled")
     .map((e) => ({
       entity_id: e.entity_id,
       name: e.name,

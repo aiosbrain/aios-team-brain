@@ -113,6 +113,56 @@ export async function updateMemberRole(
   return { updated: true, role };
 }
 
+export interface UpdateManagerResult {
+  updated: boolean;
+  reason?: "absent" | "self" | "manager-not-found" | "manager-disabled" | "manager-is-connector";
+  managerMemberId?: string | null;
+}
+
+/**
+ * Set (or clear) an existing member's manager — the org-chart source synced into the company
+ * graph (`lib/graph/company-actors.syncMemberActor`/`syncReportsTo`). Rejects self-management, a
+ * manager outside the caller's own team, a disabled manager, and a connector "manager" — none of
+ * those make sense as a reporting line. No multi-hop cycle detection (A→B→C→A remains possible) —
+ * out of scope at this team's scale.
+ */
+export async function updateMemberManager(
+  admin: DbClient,
+  teamId: string,
+  memberId: string,
+  managerMemberId: string | null
+): Promise<UpdateManagerResult> {
+  const { data: m } = await admin
+    .from("members")
+    .select("id")
+    .eq("team_id", teamId)
+    .eq("id", memberId)
+    .maybeSingle();
+  if (!m) return { updated: false, reason: "absent" };
+  if (managerMemberId === memberId) return { updated: false, reason: "self" };
+
+  if (managerMemberId) {
+    const { data: mgr } = await admin
+      .from("members")
+      .select("team_id, status, is_connector")
+      .eq("id", managerMemberId)
+      .maybeSingle();
+    const manager = mgr as { team_id: string; status: string; is_connector: boolean } | null;
+    if (!manager || manager.team_id !== teamId) return { updated: false, reason: "manager-not-found" };
+    if (manager.status === "disabled") return { updated: false, reason: "manager-disabled" };
+    if (manager.is_connector) return { updated: false, reason: "manager-is-connector" };
+  }
+
+  const { error } = await admin
+    .from("members")
+    .update({ manager_member_id: managerMemberId })
+    .eq("id", memberId)
+    .eq("team_id", teamId);
+  if (error) throw new Error(`update member manager failed: ${error.message}`);
+
+  return { updated: true, managerMemberId };
+}
+
 export interface DeleteResult {
   deleted: boolean;
   reason?: "absent" | "last-admin";

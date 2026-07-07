@@ -259,8 +259,8 @@ async function gitActivityDigest(db: DbClient, teamId: string): Promise<string> 
  * Per-person cross-tool activity digest from attributed `items` — the payoff of the identity work:
  * once Slack threads / Linear+Plane issues / docs carry the author's `member_id`, "what is each
  * person doing" is answerable beyond git. Counts each person's recent items by source (Slack/PM/docs),
- * EXCLUDING `git` (the git digest above covers code) and connector members (their `@connector.local`
- * email). **team-tier only** — internal activity, never shown to an external viewer. Returns "" when
+ * EXCLUDING `git` (the git digest above covers code) and connector members (`is_connector`).
+ * **team-tier only** — internal activity, never shown to an external viewer. Returns "" when
  * there's nothing attributed.
  */
 async function peopleActivityDigest(db: DbClient, teamId: string): Promise<string> {
@@ -276,16 +276,16 @@ async function peopleActivityDigest(db: DbClient, teamId: string): Promise<strin
 
   const { data: members } = await db
     .from("members")
-    .select("id, display_name, email")
+    .select("id, display_name, email, is_connector")
     .eq("team_id", teamId);
   const memById = new Map(
     (members ?? []).map((m) => {
-      const r = m as { id: string; display_name: string; email: string };
-      return [r.id, { name: r.display_name, email: r.email }];
+      const r = m as { id: string; display_name: string; email: string; is_connector: boolean };
+      return [r.id, { name: r.display_name, email: r.email, isConnector: r.is_connector }];
     })
   );
-  // Connector members (slack-sync@connector.local, …) author the unattributed remainder — skip them.
-  const isConnector = (id: string) => (memById.get(id)?.email ?? "").endsWith("@connector.local");
+  // Connector members author the unattributed remainder — skip them.
+  const isConnector = (id: string) => memById.get(id)?.isConnector === true;
 
   type Agg = { name: string; email: string; bySource: Map<string, number>; last: string };
   const byPerson = new Map<string, Agg>();
@@ -573,9 +573,9 @@ async function nativeRetrieve(
     ),
     "",
     "## Actors (graph)",
-    ...(actors ?? []).map(
-      (a) => `- ${a.entity_id}: ${a.name} (${(a.attrs as Record<string, unknown>)?.role ?? ""})`
-    ),
+    ...(actors ?? [])
+      .filter((a) => (a.attrs as { status?: string } | null)?.status !== "disabled")
+      .map((a) => `- ${a.entity_id}: ${a.name} (${(a.attrs as Record<string, unknown>)?.role ?? ""})`),
     "",
     "## Key relationships",
     ...(rels ?? []).map((r) => `- ${r.from_id} ${r.relationship_type} ${r.to_id}`),
