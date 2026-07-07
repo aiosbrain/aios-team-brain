@@ -40,6 +40,7 @@ function toExchanges(messages: StoredMessage[]): Exchange[] {
 export function ChatWorkspace({ teamSlug, initialQuestion }: { teamSlug: string; initialQuestion?: string }) {
   const [conversations, setConversations] = useState<ConversationListItem[]>([]);
   const [filter, setFilter] = useState("");
+  const [searchResults, setSearchResults] = useState<ConversationListItem[] | null>(null);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [loadingId, setLoadingId] = useState<string | null>(null);
   const newNonce = useRef(0);
@@ -61,6 +62,29 @@ export function ChatWorkspace({ teamSlug, initialQuestion }: { teamSlug: string;
     // eslint-disable-next-line react-hooks/set-state-in-effect
     void loadList();
   }, [loadList]);
+
+  // Debounced server search (title OR message content, owner-scoped FTS). Empty query → clear so the
+  // full list shows. All setState happens inside the async timeout callback (never synchronously).
+  useEffect(() => {
+    const q = filter.trim();
+    const t = setTimeout(async () => {
+      if (!q) {
+        setSearchResults(null);
+        return;
+      }
+      try {
+        const res = await fetch(
+          `/api/dashboard/conversations?team=${encodeURIComponent(teamSlug)}&q=${encodeURIComponent(q)}`
+        );
+        if (!res.ok) return;
+        const body = (await res.json()) as { conversations?: ConversationListItem[] };
+        setSearchResults(body.conversations ?? []);
+      } catch {
+        // keep the instant client-side title fallback
+      }
+    }, q ? 250 : 0);
+    return () => clearTimeout(t);
+  }, [filter, teamSlug]);
 
   async function openConversation(id: string) {
     setLoadingId(id);
@@ -98,10 +122,13 @@ export function ChatWorkspace({ teamSlug, initialQuestion }: { teamSlug: string;
     void loadList();
   }
 
-  // Client-side title search over the already-loaded list (instant; owner data is here). Content
-  // search (over message bodies) would be a server FTS endpoint — a later increment.
-  const q = filter.trim().toLowerCase();
-  const shown = q ? conversations.filter((c) => (c.title || "").toLowerCase().includes(q)) : conversations;
+  // Search matches by title OR message content (server FTS). While the debounced request is in
+  // flight we show an instant client-side title filter as a fallback, then swap in the server hits.
+  const ql = filter.trim().toLowerCase();
+  const clientFiltered = ql
+    ? conversations.filter((c) => (c.title || "").toLowerCase().includes(ql))
+    : conversations;
+  const shown = ql ? searchResults ?? clientFiltered : conversations;
 
   return (
     <div className="grid grid-cols-1 gap-4 md:grid-cols-[230px_1fr]">

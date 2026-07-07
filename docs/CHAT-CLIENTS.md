@@ -81,5 +81,5 @@ for multi-user, issue a key per member and pick it by Telegram user).
 ## Not yet on the server (say the word)
 - API-key **rename/delete** of a conversation (the session-authed dashboard has `PATCH`/`DELETE`;
   the API-key list/get are built, management verbs are a small add).
-- Content search over message bodies (the dashboard sidebar currently searches titles client-side;
-  a server FTS endpoint would cover message content).
+- API-key **search** — the dashboard supports it (`GET /api/dashboard/conversations?q=` matches title
+  OR message content via FTS); the API-key `GET /api/v1/conversations` doesn't take `q` yet.
