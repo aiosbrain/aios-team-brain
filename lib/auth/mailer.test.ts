@@ -30,8 +30,9 @@ describe("mailer delivery", () => {
     vi.stubEnv("RESEND_API_KEY", "re_test_key");
     const fetchFn = mockFetch(true);
 
-    await sendInviteEmail("new@member.test", inviteCtx);
+    const delivered = await sendInviteEmail("new@member.test", inviteCtx);
 
+    expect(delivered).toBe(true);
     expect(fetchFn).toHaveBeenCalledTimes(1);
     expect(fetchFn.mock.calls[0][0]).toBe("https://api.resend.com/emails");
     const body = sentBody(fetchFn);
@@ -82,7 +83,7 @@ describe("mailer delivery", () => {
     vi.stubEnv("SMTP_URL", "");
     const fetchFn = vi.fn();
     vi.stubGlobal("fetch", fetchFn);
-    await expect(sendInviteEmail("a@b.test", inviteCtx)).resolves.toBeUndefined();
+    await expect(sendInviteEmail("a@b.test", inviteCtx)).resolves.toBe(false);
     expect(fetchFn).not.toHaveBeenCalled();
   });
 
