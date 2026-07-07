@@ -148,7 +148,18 @@ async function callOpenAICompatible(userContent: string, apiKey?: string | null)
       ],
     }),
   });
-  if (!res.ok) return null;
+  if (!res.ok) {
+    // Silent before this fix: a down/misconfigured LLM_BASE_URL endpoint (Ollama/local model —
+    // a first-class deployment option, see docs/PROVIDERS.md) degraded to "no arcs" with NO trace
+    // anywhere, indistinguishable from every other empty-arcs cause. Log the actual HTTP status +
+    // body so this is diagnosable instead of silent.
+    const body = await res.text().catch(() => "");
+    console.error(
+      `[arcs] LLM_BASE_URL call failed: ${res.status} ${res.statusText} —`,
+      body.slice(0, 300)
+    );
+    return null;
+  }
   const data = (await res.json()) as { choices?: { message?: { content?: string } }[] };
   return data.choices?.[0]?.message?.content ?? null;
 }
