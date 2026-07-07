@@ -45,8 +45,12 @@ export async function ingestItem(
   // INTERNAL-only attribution override (NOT on the wire ItemPayload, so external pushers can't
   // spoof authorship). When an internal caller already knows the content's author — e.g. the
   // codebase scanner attributing a commit to a resolved member — it passes that here; otherwise
-  // the item is attributed to the ingesting actor (`auth.memberId`), as before.
-  opts?: { authorMemberId?: string | null }
+  // (opts omitted entirely) the item is attributed to the ingesting actor (`auth.memberId`). A
+  // caller that HAS attempted resolution but come up empty must pass `authorMemberId: null`
+  // explicitly (not omit opts) — that's the only way to say "leave this unattributed" rather than
+  // "attribute to whoever's pushing," so a connector ingesting on behalf of an unresolved human
+  // never silently falls back to the connector's own member_id.
+  opts?: { authorMemberId: string | null }
 ): Promise<IngestResult> {
   // 1. project
   const { data: project, error: projErr } = await db
@@ -109,7 +113,7 @@ export async function ingestItem(
     body: payload.body,
     content_sha256: existing ? existing.content_sha256 : PENDING_SHA,
     actor: payload.actor ?? "",
-    member_id: opts?.authorMemberId ?? auth.memberId,
+    member_id: opts ? opts.authorMemberId : auth.memberId,
     synced_at: now,
     updated_at: now,
   };
@@ -131,7 +135,7 @@ export async function ingestItem(
     content_sha256: payload.content_sha256,
     frontmatter: payload.frontmatter ?? {},
     body: payload.body,
-    member_id: auth.memberId,
+    member_id: opts ? opts.authorMemberId : auth.memberId,
   });
   if (versionErr) throw new Error(`item version insert failed: ${versionErr.message}`);
 

@@ -46,9 +46,9 @@ describe("commits → searchable, attributed items (real Postgres)", () => {
     expect((resolved as { kind: string }).kind).toBe("artifact");
     expect((resolved as { frontmatter: Record<string, unknown> }).frontmatter.source).toBe("git");
 
-    // The unresolved commit falls back to the ingesting actor (member B).
+    // The unresolved commit stays unattributed — not falling back to the ingesting scanner.
     const { data: unresolved } = await db().from("items").select("member_id").eq("team_id", seed.teamId).eq("path", `commits/aios-team-brain/${"b".repeat(40)}.md`).single();
-    expect((unresolved as { member_id: string }).member_id).toBe(scannerId);
+    expect((unresolved as { member_id: string | null }).member_id).toBeNull();
 
     // Searchable: an NL query for the commit message surfaces it via FTS.
     const ctx = await retrieve(db(), seed.teamId, "team", "login redirect bug");
