@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
-import { ListTodo } from "lucide-react";
+import Link from "next/link";
+import { ListTodo, ScanLine } from "lucide-react";
 import { serverClient } from "@/lib/db/server";
 import { getSessionUser } from "@/lib/auth/session";
 import { currentMember } from "@/lib/auth/guard";
@@ -82,7 +83,15 @@ export default async function TasksPage({ params }: { params: Promise<{ team: st
 
   return (
     <div className="mx-auto flex max-w-7xl flex-col gap-5">
-      <h1 className="text-2xl font-semibold text-ink">Tasks</h1>
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <h1 className="text-2xl font-semibold text-ink">Tasks</h1>
+        {tier === "team" ? (
+          <Link href={`/t/${teamSlug}/tasks/extract`} className="btn-ghost">
+            <ScanLine className="size-4" />
+            Extract from meetings
+          </Link>
+        ) : null}
+      </div>
       {taskRows.length === 0 && (projects ?? []).length === 0 ? (
         <EmptyState
           icon={ListTodo}

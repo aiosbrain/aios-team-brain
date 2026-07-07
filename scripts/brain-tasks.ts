@@ -21,6 +21,8 @@
  *   list   --team <slug|id> [--project <id>] [--sprint <s>]
  *   show   <row_key> --project <id> [--team <slug|id>]
  *   project --team <slug|id> [--project <id>]   # projectAllTasks (all projects if --project omitted)
+ *   extract-meeting-todos --team <slug|id> [--source-project <slug>] [--path-prefix <p>]
+ *          [--since <iso>] [--limit <n>] [--dry-run] [--project-to-linear]
  *
  * status:   backlog | ready | in_progress | blocked | done   (default backlog)
  * priority: none | low | medium | high | urgent              (default none)
@@ -32,6 +34,10 @@ import { normalizeTaskPriority } from "@/lib/api/schemas";
 import { projectAllTasks } from "@/lib/pm-sync";
 import { getEnabledIntegrationsWithSecrets } from "@/lib/integrations/manage";
 import { linearGraphql } from "@/lib/pm-sync/linear-client";
+import {
+  extractMeetingTodosForTeam,
+  MEETING_TODO_PROJECT_NAME,
+} from "@/lib/meetings/extract-todos";
 
 type Flags = Record<string, string | boolean>;
 type Admin = ReturnType<typeof adminClient>;
@@ -102,6 +108,8 @@ const USAGE = `Team Brain task CLI — brain is canonical, project one-way to Li
   list    --team <slug|id> [--project <id>] [--sprint <s>]
   show    <row_key> --project <id> [--team <slug|id>]
   project --team <slug|id> [--project <id>]
+  extract-meeting-todos --team <slug|id> [--source-project <slug>] [--path-prefix <p>]
+          [--since <iso>] [--limit <n>] [--dry-run] [--project-to-linear]
   resolve --team <slug|id> [--filter <substr>]      # Linear identifier → node UUID + url
   adopt   <row_key> --project <id> --resource-id <linear-uuid> [--url <u>]  # bind to existing issue
 status: ${STATUSES.join(" | ")}   priority: none|low|medium|high|urgent
@@ -229,6 +237,48 @@ async function main() {
         for (const r of reports) counts[r.status] = (counts[r.status] ?? 0) + 1;
         const summary = Object.entries(counts).map(([k, v]) => `${k}=${v}`).join(" ") || "no rows";
         console.log(`✓ project ${pid} → ${provider}: ${summary}`);
+        const notable = reports.filter((r) => !["synced", "skipped"].includes(r.status));
+        for (const r of notable) console.log(`    ${r.status.padEnd(18)} ${r.row_key}${r.error ? ` — ${r.error}` : ""}`);
+      }
+      break;
+    }
+    case "extract-meeting-todos": {
+      const team = await resolveTeam(admin, teamSlug);
+      const limitRaw = flags.limit;
+      const limit = typeof limitRaw === "string" ? Number.parseInt(limitRaw, 10) : undefined;
+      if (limitRaw !== undefined && (!Number.isFinite(limit) || (limit ?? 0) <= 0)) {
+        die("--limit must be a positive integer");
+      }
+
+      const res = await extractMeetingTodosForTeam(admin, team.id, {
+        sourceProject: typeof flags["source-project"] === "string" ? flags["source-project"] : undefined,
+        pathPrefix: typeof flags["path-prefix"] === "string" ? flags["path-prefix"] : undefined,
+        since: typeof flags.since === "string" ? flags.since : undefined,
+        limit,
+        dryRun: Boolean(flags["dry-run"]),
+      });
+
+      console.log(
+        `✓ ${flags["dry-run"] ? "found" : "extracted"} ${res.extracted} todo(s) from ${res.scanned} note item(s) into ${MEETING_TODO_PROJECT_NAME}`
+      );
+      if (!flags["dry-run"]) {
+        console.log(`  upserted=${res.upserted} deleted=${res.deleted} project=${res.projectId}`);
+      }
+      for (const row of res.rows.slice(0, 25)) {
+        console.log(`  ${row.rowKey}\t${row.title}\t${row.sourcePath}:${row.line}`);
+      }
+      if (res.rows.length > 25) console.log(`  … ${res.rows.length - 25} more`);
+
+      if (!flags["dry-run"] && flags["project-to-linear"] && res.projectId) {
+        const { provider, reports, reason } = await projectAllTasks(admin, team.id, res.projectId);
+        if (reason) {
+          console.log(`• Linear projection skipped: ${reason}`);
+          break;
+        }
+        const counts: Record<string, number> = {};
+        for (const r of reports) counts[r.status] = (counts[r.status] ?? 0) + 1;
+        const summary = Object.entries(counts).map(([k, v]) => `${k}=${v}`).join(" ") || "no rows";
+        console.log(`✓ projected ${MEETING_TODO_PROJECT_NAME} → ${provider}: ${summary}`);
         const notable = reports.filter((r) => !["synced", "skipped"].includes(r.status));
         for (const r of notable) console.log(`    ${r.status.padEnd(18)} ${r.row_key}${r.error ? ` — ${r.error}` : ""}`);
       }
