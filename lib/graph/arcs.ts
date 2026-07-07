@@ -36,7 +36,7 @@ export interface ProviderKeys {
 
 const LLM_BASE_URL = process.env.LLM_BASE_URL;
 const LLM_MODEL = process.env.LLM_MODEL ?? "gpt-4o";
-const ANTHROPIC_MODEL = process.env.ARCS_ANTHROPIC_MODEL ?? "claude-sonnet-4-6";
+const ANTHROPIC_MODEL = process.env.ARCS_ANTHROPIC_MODEL ?? "claude-sonnet-5";
 const WINDOW_DAYS = 7;
 const MAX_FACTS = 200;
 const CACHE_TTL_MS = 10 * 60_000;
@@ -45,7 +45,8 @@ const SYSTEM_PROMPT =
   "You are analyzing a team knowledge graph. Identify 3-5 active narrative arcs — ongoing storylines " +
   "about what this team is working through. Return ONLY a JSON object of the form " +
   '{"arcs":[{"title":"short","confidence":"high|medium|low","summary":"2-3 sentences, present tense, ' +
-  'specific","participants":["names"],"supporting_sources":["short source refs"]}]}. No prose.';
+  'specific","participants":["names"],"supporting_sources":["short source refs"]}]}. No prose, no ' +
+  "markdown code fences — the raw JSON object only.";
 
 function stableId(title: string): string {
   return "arc-" + createHash("sha256").update(title.trim().toLowerCase()).digest("hex").slice(0, 10);
@@ -75,7 +76,7 @@ export function stripTaskKeys(text: string): string {
 export function parseArcsJson(raw: string | null, now = new Date().toISOString()): NarrativeArc[] {
   if (!raw) return [];
   try {
-    const obj = JSON.parse(raw) as { arcs?: Partial<NarrativeArc>[] };
+    const obj = JSON.parse(extractJsonObject(raw)) as { arcs?: Partial<NarrativeArc>[] };
     if (!Array.isArray(obj.arcs)) return [];
     return obj.arcs.slice(0, 5).map((a) => ({
       id: stableId(a.title ?? ""),
@@ -88,16 +89,46 @@ export function parseArcsJson(raw: string | null, now = new Date().toISOString()
       supporting_sources: Array.isArray(a.supporting_sources) ? a.supporting_sources.map(String) : [],
       derived_at: now,
     }));
-  } catch {
+  } catch (err) {
+    // The prompt asks for "ONLY JSON", but Claude/GPT often ignore that and wrap the object in a
+    // markdown fence or a leading sentence anyway — extractJsonObject handles the common cases, so
+    // landing here means the model returned something genuinely unparseable. Log it (never thrown
+    // further — arcs are best-effort) so a silent "no arcs" isn't a silent, undiagnosable one too.
+    console.error(
+      "[arcs] LLM response wasn't parseable JSON:",
+      err instanceof Error ? err.message : err,
+      "— raw (first 300 chars):",
+      raw.slice(0, 300)
+    );
     return [];
   }
 }
 
-/** Ask the configured LLM for arcs as JSON; returns [] on any parse/transport failure (best-effort). */
+/**
+ * Best-effort unwrap of a JSON object the model wrapped in a markdown code fence (```json ... ```
+ * or ``` ... ```) or padded with leading/trailing prose despite being told not to. Falls back to the
+ * original string when no fence/wrapping is detected, so a clean response is untouched.
+ */
+function extractJsonObject(raw: string): string {
+  const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const body = (fenced ? fenced[1] : raw).trim();
+  const start = body.indexOf("{");
+  const end = body.lastIndexOf("}");
+  return start !== -1 && end !== -1 && end > start ? body.slice(start, end + 1) : body;
+}
+
+/** Ask the configured LLM for arcs as JSON; returns [] on any transport/parse failure (best-effort —
+ *  an LLM outage or a stale model id must degrade to "no arcs" instead of failing the whole request). */
 async function callLLM(userContent: string, keys: ProviderKeys): Promise<NarrativeArc[]> {
-  const raw = LLM_BASE_URL
-    ? await callOpenAICompatible(userContent, keys.openaiKey)
-    : await callAnthropic(userContent, keys.anthropicKey);
+  let raw: string | null;
+  try {
+    raw = LLM_BASE_URL
+      ? await callOpenAICompatible(userContent, keys.openaiKey)
+      : await callAnthropic(userContent, keys.anthropicKey);
+  } catch (err) {
+    console.error("[arcs] LLM call failed:", err instanceof Error ? err.message : err);
+    return [];
+  }
   return parseArcsJson(raw);
 }
 
