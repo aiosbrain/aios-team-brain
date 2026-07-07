@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
 #
 # Hydrate a freshly created git worktree with the local, gitignored dev config that
-# `git worktree add` can't bring along. `.envrc`, `.env.local`, and `.env.keys` all match
-# `.gitignore`'s `.env*` pattern, so a new worktree checkout starts with none of them:
+# `git worktree add` can't bring along. `.envrc`, `.env.local`, `.env.keys`, and `.env` all
+# match `.gitignore`'s `.env*` pattern, so a new worktree checkout starts with none of them:
 #   - `.env.local` (dotenvx-encrypted: DATABASE_URL, AUTH_SECRET, RESEND_API_KEY, APP_URL, ...)
 #     is decrypted at request time by Next's own `@next/env` loader using the sibling
 #     `.env.keys` — both files just need to physically exist in cwd for `npm run dev` /
 #     `next build` to pick them up. Neither direnv nor the shell is involved in this part.
 #   - `.envrc` is the separate, lower-privilege Tessera root cascade (shared keys like
 #     ANTHROPIC_API_KEY) — this DOES need direnv active to reach the shell/process env.
-# Symlinks both sets (plus node_modules) from the PRIMARY checkout — resolved via
+#   - `.env` is a plain (unencrypted) env file, also gitignored.
+# Symlinks all four (plus node_modules) from the PRIMARY checkout — resolved via
 # `git rev-parse --git-common-dir`, so this needs no arguments and works from any worktree —
-# into the current directory, then runs `direnv allow` for the second piece. Idempotent: safe
-# to re-run.
+# into the current directory, then runs `direnv allow` for the cascade piece.
+# Idempotent: safe to re-run; will not overwrite existing real files or working symlinks.
 #
 # Run from INSIDE the new worktree, right after `git worktree add`:
 #   cd ../aios-team-brain-<task>
@@ -33,8 +34,12 @@ for name in node_modules .envrc .env.local .env.keys .env; do
   src="$main_worktree/$name"
   [[ -e "$src" ]] || continue
 
-  if [[ -e "$here/$name" && ! -L "$here/$name" ]]; then
-    echo "skip $name — a real file already exists here (not overwriting)"
+  if [[ -e "$here/$name" ]]; then
+    if [[ -L "$here/$name" ]]; then
+      echo "skip $name — already linked"
+    else
+      echo "skip $name — a real file/directory already exists here (not overwriting)"
+    fi
     continue
   fi
 
