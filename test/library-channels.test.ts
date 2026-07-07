@@ -30,6 +30,20 @@ describe("groupChannels", () => {
     expect(eng.count).toBe(3);
     expect(eng.lastSyncedAt).toBe("2026-06-25T10:00:00Z"); // max, not first-seen
   });
+
+  // Regression for the prod crash "b.lastSyncedAt.localeCompare is not a function": the pg adapter
+  // returns `synced_at` as a Date, not an ISO string (the #134 gotcha) — the whole Data page 500'd
+  // whenever ≥2 channels existed. groupChannels must accept both and normalize.
+  it("accepts Date-typed synced_at (the pg adapter's real shape) without crashing", () => {
+    const channels = groupChannels([
+      { path: "slack/eng/3.md", synced_at: new Date("2026-06-25T10:00:00Z") },
+      { path: "slack/eng/1.md", synced_at: new Date("2026-06-25T09:00:00Z") },
+      { path: "linear/aio/A-1.md", synced_at: new Date("2026-06-25T11:00:00Z") },
+    ]);
+    expect(channels.map((c) => c.key)).toEqual(["linear/aio", "slack/eng"]);
+    const eng = channels.find((c) => c.key === "slack/eng")!;
+    expect(eng.lastSyncedAt).toBe("2026-06-25T10:00:00.000Z"); // normalized to ISO string for the UI
+  });
 });
 
 describe("freshness", () => {

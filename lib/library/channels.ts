@@ -10,7 +10,9 @@
 
 export interface ChannelRow {
   path: string;
-  synced_at: string;
+  // The pg adapter returns timestamptz as a Date, not an ISO string (the #134 gotcha) — accept
+  // both so the caller can pass rows straight through. Normalized to an ISO string internally.
+  synced_at: string | Date;
 }
 
 export interface Channel {
@@ -29,21 +31,27 @@ export function parseChannel(path: string): { key: string; source: string; name:
   return { key: only, source: only, name: only };
 }
 
+/** Normalize a timestamptz value (Date from the pg adapter, or an ISO string) to an ISO string. */
+function isoOf(v: string | Date): string {
+  return typeof v === "string" ? v : v.toISOString();
+}
+
 /** Group rows into channels with item counts + most-recent arrival, sorted by recency (newest first). */
 export function groupChannels(rows: ChannelRow[]): Channel[] {
   const byKey = new Map<string, Channel>();
   for (const row of rows) {
     const { key, source, name } = parseChannel(row.path);
+    const syncedAt = isoOf(row.synced_at);
     const existing = byKey.get(key);
     if (!existing) {
-      byKey.set(key, { key, source, name, count: 1, lastSyncedAt: row.synced_at });
+      byKey.set(key, { key, source, name, count: 1, lastSyncedAt: syncedAt });
     } else {
       existing.count += 1;
-      // ISO-8601 strings compare lexicographically in timestamp order.
-      if (row.synced_at > existing.lastSyncedAt) existing.lastSyncedAt = row.synced_at;
+      // Compare by epoch ms — mixed "Z"/offset ISO forms don't sort lexicographically.
+      if (Date.parse(syncedAt) > Date.parse(existing.lastSyncedAt)) existing.lastSyncedAt = syncedAt;
     }
   }
-  return [...byKey.values()].sort((a, b) => b.lastSyncedAt.localeCompare(a.lastSyncedAt));
+  return [...byKey.values()].sort((a, b) => Date.parse(b.lastSyncedAt) - Date.parse(a.lastSyncedAt));
 }
 
 export type Freshness = "fresh" | "recent" | "stale";
