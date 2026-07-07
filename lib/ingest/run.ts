@@ -93,6 +93,7 @@ async function resolveConnectorAuth(
           role: "member",
           tier: "team",
           status: "active",
+          is_connector: true,
         },
         { onConflict: "team_id,actor_handle" }
       )

@@ -26,6 +26,7 @@ export default async function MembersAdminPage({
     .from("members")
     .select("id, display_name, email, actor_handle, role, tier, status, github_login, avatar_url, created_at")
     .eq("team_id", team.id)
+    .eq("is_connector", false)
     .order("created_at");
 
   // All linked identities (email aliases + slack/linear/plane provider ids) for the panel.

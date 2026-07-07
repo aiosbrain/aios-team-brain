@@ -115,6 +115,10 @@ create table if not exists members (
   role member_role not null default 'member',
   tier access_tier not null default 'team',
   status member_status not null default 'invited',
+  -- true for the auto-provisioned per-source ingest actor (lib/ingest/run.ts's
+  -- resolveConnectorAuth), never for a real human — excluded from Admin -> Members and
+  -- /api/v1/members so a connector never renders indistinguishable from a person.
+  is_connector boolean not null default false,
   created_at timestamptz not null default now(),
   unique (team_id, email),
   unique (team_id, actor_handle)
