@@ -5,7 +5,7 @@ import type { DbClient } from "@/lib/db/types";
 import { recentFacts, resolveEpisodeItems, type AtomicFact } from "./learning";
 import { GraphitiClient } from "./graphiti-client";
 import { episodeGroupId, type AccessTier } from "./group";
-import { attributeParticipants } from "./arc-attribution";
+import { attributeParticipants, attributedFactTexts } from "./arc-attribution";
 
 /**
  * Layer 3 — narrative arcs. Gathers the recent graph substrate (facts, last 7d, tier-scoped),
@@ -242,14 +242,15 @@ async function callAnthropic(userContent: string, apiKey?: string | null): Promi
 }
 
 /**
- * Build the user prompt from the recent facts substrate (+ any human corrections). Facts are NUMBERED
- * `[F1] … [F2] …` so the model can cite them in `supporting_facts` — we map those numbers back to the
- * real facts (and their source items) to build verifiable evidence.
+ * Build the user prompt from the recent facts' (already-attributed, see `attributedFactTexts`) text
+ * + any human corrections. Facts are NUMBERED `[F1] … [F2] …` so the model can cite them in
+ * `supporting_facts` — we map those numbers back to the real facts (and their source items) to build
+ * verifiable evidence.
  */
-function buildPrompt(facts: AtomicFact[], corrections: string[]): string {
+function buildPrompt(factTexts: string[], corrections: string[]): string {
   const lines = [
     "Recent facts from the team knowledge graph (most recent first), each numbered for citation:",
-    ...facts.map((f, i) => `[F${i + 1}] ${f.fact}`),
+    ...factTexts.map((t, i) => `[F${i + 1}] ${t}`),
   ];
   if (corrections.length) {
     lines.push("", "Human corrections to incorporate:", ...corrections.map((c) => `- ${c}`));
@@ -258,42 +259,69 @@ function buildPrompt(facts: AtomicFact[], corrections: string[]): string {
 }
 
 /**
- * Distinct human (non-connector) display names behind a set of brain item ids — the traceable
- * humans behind an arc's evidence, used to tag any AI-agent participant name (`arc-attribution.ts`)
- * instead of letting the tool stand in for a person. Best-effort: [] on any failure or when nothing
- * resolves (e.g. a connector-only item, or Postgres unreachable) — an unattributed AI agent is still
- * more honest than a thrown error.
+ * Item id → resolved human (non-connector) display name, for a batch of brain item ids in one query
+ * — the primitive both the synthesis PROMPT (`attributedFactTexts`, grounding the LLM's input) and
+ * the arc OUTPUT (`attributeParticipants`, tagging `participants`) build on, so a whole `getArcs` call
+ * costs one Postgres round trip regardless of how many facts/arcs reference those items. Best-effort:
+ * an empty map on failure or when an item has no resolvable (non-connector) human — an unattributed
+ * AI agent is still more honest than a thrown error.
  */
-export async function resolveHumanActors(db: DbClient, teamId: string, itemIds: string[]): Promise<string[]> {
+async function resolveHumanActorsByItem(
+  db: DbClient,
+  teamId: string,
+  itemIds: string[]
+): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
   const ids = [...new Set(itemIds.filter(Boolean))];
-  if (ids.length === 0) return [];
+  if (ids.length === 0) return out;
   try {
     const { data } = await db
       .from("items")
-      .select("members(display_name, is_connector)")
+      .select("id, members(display_name, is_connector)")
       .eq("team_id", teamId)
       .in("id", ids);
-    const rows = (data ?? []) as { members: { display_name: string | null; is_connector: boolean } | null }[];
-    const names = rows
-      .map((r) => r.members)
-      .filter((m): m is { display_name: string; is_connector: boolean } => !!m && !m.is_connector && !!m.display_name)
-      .map((m) => m.display_name);
-    return [...new Set(names)];
+    const rows = (data ?? []) as {
+      id: string;
+      members: { display_name: string | null; is_connector: boolean } | null;
+    }[];
+    for (const r of rows) {
+      const m = r.members;
+      if (m && !m.is_connector && m.display_name) out.set(r.id, m.display_name);
+    }
   } catch {
-    return [];
+    // best-effort — empty map on failure
   }
+  return out;
+}
+
+/** Distinct human (non-connector) display names behind a set of brain item ids. Thin wrapper over
+ *  `resolveHumanActorsByItem` for callers that only need the deduped name list, not the per-item map. */
+export async function resolveHumanActors(db: DbClient, teamId: string, itemIds: string[]): Promise<string[]> {
+  const byItem = await resolveHumanActorsByItem(db, teamId, itemIds);
+  return [...new Set(byItem.values())];
+}
+
+/** Distinct humans behind a set of item ids, looked up in an already-resolved `humanByItem` map
+ *  (no DB access) — shared by the per-arc `participants` rewrite below. */
+function humansForItems(itemIds: (string | undefined)[], humanByItem: Map<string, string>): string[] {
+  return [
+    ...new Set(
+      itemIds.filter((id): id is string => !!id).map((id) => humanByItem.get(id)).filter((h): h is string => !!h)
+    ),
+  ];
 }
 
 /** Rewrite each arc's `participants` to tag recognized AI-agent names with the human(s) behind that
- *  arc's own evidence items (never cross-arc — an arc's attribution must trace to ITS OWN work). */
-async function withHumanAttribution(db: DbClient, teamId: string, arcs: NarrativeArc[]): Promise<NarrativeArc[]> {
-  return Promise.all(
-    arcs.map(async (arc) => {
-      const itemIds = arc.evidence.map((e) => e.itemId).filter((id): id is string => !!id);
-      const humans = await resolveHumanActors(db, teamId, itemIds);
-      return { ...arc, participants: attributeParticipants(arc.participants, humans) };
-    })
-  );
+ *  arc's own evidence items (never cross-arc — an arc's attribution must trace to ITS OWN work).
+ *  Pure over an already-resolved `humanByItem` map — no DB access here. */
+function attributeArcs(arcs: NarrativeArc[], humanByItem: Map<string, string>): NarrativeArc[] {
+  return arcs.map((arc) => ({
+    ...arc,
+    participants: attributeParticipants(
+      arc.participants,
+      humansForItems(arc.evidence.map((e) => e.itemId), humanByItem)
+    ),
+  }));
 }
 
 // In-memory cache (single-instance app). Keyed by the tier-visible group set.
@@ -316,11 +344,15 @@ export async function getArcs(
   const since = new Date(Date.now() - WINDOW_DAYS * 86_400_000).toISOString();
   const facts = await recentFacts(groups, since, MAX_FACTS);
   if (facts.length === 0) return [];
-  const [raw, epToItem] = await Promise.all([
-    callLLMRaw(buildPrompt(facts, []), keys),
-    resolveEpisodeItems(groups, facts.flatMap((f) => f.episodeUuids)),
-  ]);
-  const arcs = await withHumanAttribution(db, teamId, parseArcsJson(raw, { facts, epToItem }));
+  // Sequential, not Promise.all-able: the PROMPT needs each fact's human attribution baked in
+  // (attributedFactTexts), so item/human resolution must finish before the LLM call starts — a real
+  // latency cost, traded for a synthesis input that's grounded in a human from the start rather than
+  // patched after the fact.
+  const epToItem = await resolveEpisodeItems(groups, facts.flatMap((f) => f.episodeUuids));
+  const allItemIds = [...new Set([...epToItem.values()].map((v) => v.itemId).filter((id): id is string => !!id))];
+  const humanByItem = await resolveHumanActorsByItem(db, teamId, allItemIds);
+  const raw = await callLLMRaw(buildPrompt(attributedFactTexts(facts, epToItem, humanByItem), []), keys);
+  const arcs = attributeArcs(parseArcsJson(raw, { facts, epToItem }), humanByItem);
   cache.set(key, { arcs, at: Date.now() });
   return arcs;
 }
@@ -342,11 +374,14 @@ export async function recomputeArcs(
   if (groups.length === 0) return [];
   const since = new Date(Date.now() - WINDOW_DAYS * 86_400_000).toISOString();
   const facts = await recentFacts(groups, since, MAX_FACTS);
-  const [raw, epToItem] = await Promise.all([
-    callLLMRaw(buildPrompt(facts, corrections.map((c) => c.corrected_text)), keys),
-    resolveEpisodeItems(groups, facts.flatMap((f) => f.episodeUuids)),
-  ]);
-  const arcs = await withHumanAttribution(db, teamId, parseArcsJson(raw, { facts, epToItem }));
+  const epToItem = await resolveEpisodeItems(groups, facts.flatMap((f) => f.episodeUuids));
+  const allItemIds = [...new Set([...epToItem.values()].map((v) => v.itemId).filter((id): id is string => !!id))];
+  const humanByItem = await resolveHumanActorsByItem(db, teamId, allItemIds);
+  const raw = await callLLMRaw(
+    buildPrompt(attributedFactTexts(facts, epToItem, humanByItem), corrections.map((c) => c.corrected_text)),
+    keys
+  );
+  const arcs = attributeArcs(parseArcsJson(raw, { facts, epToItem }), humanByItem);
   cache.set(groups.slice().sort().join(","), { arcs, at: Date.now() });
 
   // Persist corrections as first-class episodes (team-tier group; corrections are internal).

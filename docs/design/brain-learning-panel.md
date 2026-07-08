@@ -125,25 +125,44 @@ any search affordance. No new plumbing — both already read from the same `item
 3. **Layer 2** (events) — episodes + participants reconciled to `members`.
 4. **Layer 3** (arcs) — synthesis + cache; then inline edit + recompute + correction writeback.
 
-## Human attribution for AI-agent participants (added 2026-07-08)
+## Human attribution for AI-agent participants (added 2026-07-08, extended 2026-07-08)
 
-Layer 3's `participants` are LLM-synthesized from episode prose, so a recognized AI-agent/tool name
-(e.g. "Claude Code", "AIOS Team Brain", "Claude Agent SDK" — mentioned in a Slack message or PR body,
-not a real actor) could stand in a narrative arc as if it were the person who did the work, with no
-way to trace it to a human. Every ingested item already carries a real attribution
-(`items.member_id` → `members`, excluding connector service-accounts — see `lib/ingest/run.ts`'s
-`resolveConnectorAuth`/`is_connector`), so `getArcs`/`recomputeArcs` (`lib/graph/arcs.ts`) now:
+A recognized AI-agent/tool name (e.g. "Claude Code", "AIOS Team Brain", "Claude Agent SDK" —
+mentioned in a Slack message or PR body, not a real actor) could stand in a narrative arc as if it
+were the person who did the work, with no way to trace it to a human. Every ingested item already
+carries a real attribution (`items.member_id` → `members`, excluding connector service-accounts —
+see `lib/ingest/run.ts`'s `resolveConnectorAuth`/`is_connector`), so `getArcs`/`recomputeArcs`
+(`lib/graph/arcs.ts`) resolve it in **two places**, not one:
 
-1. Resolve, per arc, the distinct human (non-connector) display names behind that arc's OWN evidence
-   items (`resolveHumanActors`, joining `items` → `members` in Postgres, team-scoped).
-2. Rewrite `participants` (`attributeParticipants` in `lib/graph/arc-attribution.ts`, pure + unit
-   tested) so a recognized AI-agent name is tagged `"Claude Code (Chetan Nandakumar)"`, or
-   `"Claude Code (unattributed AI agent)"` when no human resolves — never silently dropped or guessed.
+1. **The synthesis PROMPT (input)** — before calling the LLM, every numbered fact `[F12] …` fed to
+   the arc-synthesis prompt is attributed: if a fact's `subject` is a recognized AI-agent name, its
+   text is prefixed `"(Chetan Nandakumar, via Claude Code) Claude Code refactored the auth module"`
+   (`attributedFactTexts` in `lib/graph/arc-attribution.ts`, pure). This grounds the LLM's summary
+   text in a human from the start, instead of only patching the arc's `participants` array after the
+   fact — a summary that used to read "Claude Code is refactoring auth" now has the human in its own
+   input to draw from.
+2. **The arc OUTPUT (`participants`)** — `attributeParticipants` still rewrites a recognized AI-agent
+   participant name to `"Claude Code (Chetan Nandakumar)"`, or `"Claude Code (unattributed AI agent)"`
+   when no human resolves, as a backstop in case the LLM still echoes a bare agent name into
+   `participants` despite the grounded prompt.
 
-This only covers Layer 3 (narrative arcs). Layer 2's `participants` (`recentEvents` in
-`lib/graph/learning.ts`) are still raw `MENTIONS` entity names from Graphiti's own extractor,
-unattributed — the same gap could recur there if a future change surfaces Layer 2 participants
-more prominently in the UI.
+Both steps resolve humans from the SAME batched Postgres query, `resolveHumanActorsByItem` — one
+`items → members` round trip for every item id touched by a `getArcs`/`recomputeArcs` call (not one
+query per fact and another per arc), returning an `item id → human` map that both `attributedFactTexts`
+(prompt) and the `participants` rewrite (output) read from in-memory. `resolveHumanActors` (a thin
+wrapper returning the deduped name list) is kept for callers that only need that shape.
+
+**Latency trade-off:** the fact-resolution step must complete BEFORE the LLM call now (the prompt
+depends on it), so `resolveEpisodeItems` + `resolveHumanActorsByItem` can no longer run in
+`Promise.all` alongside `callLLMRaw` the way they used to. This adds one sequential Postgres round
+trip to every `getArcs`/`recomputeArcs` call — accepted as the cost of a synthesis input that's
+grounded in a human instead of raw tool-name prose.
+
+**Still not covered:** Layer 2's `participants` (`recentEvents` in `lib/graph/learning.ts`) are still
+raw `MENTIONS` entity names from Graphiti's own extractor, unattributed — the same gap could recur
+there if a future change surfaces Layer 2 participants more prominently in the UI. Layer 1's
+`subject`/`object` fields have the same characteristic (raw extracted entity names) but are not
+currently displayed as if they were actors.
 
 ## Risks & mitigations
 - **Schema coupling** — we depend on Graphiti's internal Neo4j labels/props, which can change across
