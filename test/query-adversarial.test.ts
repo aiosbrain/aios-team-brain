@@ -12,31 +12,36 @@ import { toOrQuery } from "@/lib/query/retrieve";
  * tier isolation across channels) live in test/datamechanics/multichannel-adversarial.datamechanics.
  */
 
-describe("adversarial: short-token recall gap (worsens with eng-heavy channels)", () => {
-  // toOrQuery drops every token shorter than 3 chars. In an engineering Slack that means the most
-  // load-bearing search terms — CI, QA, PR, AI, UX, S3, k8, v2, DB — are silently discarded, so a
-  // query ABOUT them searches on the leftover filler words instead. This is invisible today (one
-  // low-volume channel) and becomes a routine "why didn't it find the CI outage thread?" at scale.
+describe("short-token recall (FIXED — was Gap #1; eng-heavy channels)", () => {
+  // toOrQuery used to drop every token < 3 chars, discarding the most load-bearing eng terms —
+  // CI, QA, PR, S3, v2, k8 — so a query ABOUT them searched on the leftover filler. Now a 2-char
+  // token is kept when it's an upper-cased acronym or carries a digit (version/product), while
+  // lowercase common words (us, up, so, no) are still dropped.
 
-  it("KNOWN GAP: a 2-char acronym is dropped from the FTS query", () => {
-    // "what is the status of CI" → only "status" survives; "ci" is gone.
-    // This documents (pins) the current lossy behavior so the fix below is legible.
-    expect(toOrQuery("what is the status of CI")).toBe("status");
+  it("keeps an upper-cased 2-char acronym alongside the other terms", () => {
+    expect(toOrQuery("what is the status of CI")).toBe("status or ci");
   });
 
-  it.fails("SHOULD keep short but meaningful acronyms (CI/QA/PR/AI/S3)", () => {
+  it("keeps short but meaningful acronyms (CI/PR/QA/S3)", () => {
     const terms = toOrQuery("did CI pass and is the PR ready for QA on S3?").split(" or ");
-    // desired: the acronyms are searchable terms, not discarded
     expect(terms).toContain("ci");
     expect(terms).toContain("pr");
     expect(terms).toContain("qa");
     expect(terms).toContain("s3");
   });
 
-  it.fails("SHOULD keep short version identifiers (v2, k8)", () => {
+  it("keeps short version identifiers (v2, k8)", () => {
     const terms = toOrQuery("is v2 deployed to k8?").split(" or ");
     expect(terms).toContain("v2");
     expect(terms).toContain("k8");
+  });
+
+  it("still drops lowercase 2-char common words (no acronym/version signal)", () => {
+    // "us"/"up"/"so" are noise, not acronyms — they must NOT become OR terms. (A real term keeps
+    // this off the raw-question fallback path.)
+    const terms = toOrQuery("so is the deployment up for us").split(" or ");
+    expect(terms).toContain("deployment");
+    for (const noise of ["us", "up", "so"]) expect(terms).not.toContain(noise);
   });
 });
 
