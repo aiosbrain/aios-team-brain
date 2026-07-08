@@ -175,10 +175,9 @@ describe("multi-channel adversarial retrieval (real Postgres)", () => {
     expect(engBleed, `eng-channel Atlas bled into a sales-scoped query: ${engBleed.join(", ")}`).toEqual([]);
   });
 
-  it.fails("GAP: task aggregation truncates — 'how many open tasks' undercounts past the 80 cap", async () => {
-    // A multi-channel org easily has >80 live tasks. The structured-context task digest caps at 80
-    // (most-recently-updated), so any count/rollup question is answered from a truncated board — the
-    // oldest-updated open tasks are simply invisible. Desired: the digest can represent all of them.
+  it("STRENGTH: task aggregation is correct past the 80 cap (Gap #5 fixed — full-corpus count)", async () => {
+    // A multi-channel org easily has >80 live tasks. The 80-row task DETAIL digest still caps, but a
+    // full-corpus count-by-status line now answers "how many open tasks?" correctly regardless.
     const projectId = await makeProject("ops");
     const base = Date.parse("2026-01-01T00:00:00Z");
     for (let i = 0; i < 90; i++) {
@@ -190,20 +189,18 @@ describe("multi-channel adversarial retrieval (real Postgres)", () => {
         status: "in_progress",
         origin: "sync",
         audience: "team",
-        // task 0 is the oldest-updated → first to fall off the 80 cap.
         updated_at: new Date(base + i * 60_000).toISOString(),
       });
       if (error) throw new Error(`task insert failed: ${error.message}`);
     }
     const ctx = await retrieve(db(), seed.teamId, "team", "how many open tasks are there across the team?");
-    // Desired: the oldest-updated task is still represented so a count is complete.
-    expect(ctx.structured).toContain("TASK-000");
+    // The count reflects all 90, not the 80 the detail list can show.
+    expect(ctx.structured).toContain("90 open");
   });
 
-  it.fails("GAP: decisions fall off — an older decision is unanswerable once volume passes the 50 cap", async () => {
-    // The decisions digest caps at 50 (newest first), with no date-range awareness. In a busy org
-    // that's a few weeks of decisions; "what did we decide about vendor X back in Q1" then has NO
-    // grounding, even though the decision is on record. Desired: the older decision is retrievable.
+  it("STRENGTH: an older decision surfaces by keyword past the 50-cap (Gap #6 fixed — decision FTS)", async () => {
+    // The recency-50 decisions window still caps, but ALL decisions are now keyword-searched, so
+    // "which vendor did we pick in Q1?" reaches the old on-record decision regardless of recency.
     const projectId = await makeProject("gov");
     const base = Date.parse("2026-01-01T00:00:00Z");
     for (let i = 0; i < 60; i++) {

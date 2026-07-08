@@ -49,12 +49,12 @@ real test") the moment the gap is closed. So the count of `it.fails` in these fi
 4. **No channel scoping.** A user who scopes explicitly ("…in the #sales channel") gets bleed from
    other channels — path prefixes aren't a query dimension, so an `#eng` "Atlas" contaminates a
    sales-scoped "Atlas" question. Same-name-different-meaning collisions multiply with channels.
-5. **Aggregation/rollup truncates.** The task digest caps at 80 (most-recently-updated), so "how many
-   open tasks?" undercounts once a multi-channel org passes 80 live tasks — the oldest-updated ones
-   are simply invisible to the answer.
-6. **Temporal fall-off.** The decisions digest caps at 50 (newest-first) with no date-range awareness.
-   "Which vendor did we pick in Q1?" loses grounding once ~50 newer decisions exist, even though the
-   decision is on record.
+5. ~~**Aggregation/rollup truncates.**~~ **FIXED** — a full-corpus **task count-by-status** line
+   (`lib/query/structured-extras`) is now in the structured context, so "how many open tasks?" is
+   correct regardless of the 80-row detail cap.
+6. ~~**Temporal fall-off.**~~ **FIXED** — ALL decisions are now **keyword-searched** (title+rationale,
+   ranked), so an on-record decision surfaces past the recency-50 window ("which vendor did we pick in
+   Q1?" reaches it).
 
 ## The through-line
 
