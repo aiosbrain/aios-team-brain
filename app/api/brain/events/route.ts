@@ -1,9 +1,12 @@
 import { NextRequest } from "next/server";
 import { serverClient } from "@/lib/db/server";
+import { adminClient } from "@/lib/db/admin";
 import { getSessionUser } from "@/lib/auth/session";
 import { errorResponse } from "@/lib/api/schemas";
 import { visibleGroupIds } from "@/lib/graph/group";
 import { recentEvents } from "@/lib/graph/learning";
+import { resolveHumanActorsByItem } from "@/lib/graph/human-actors";
+import { attributeEventParticipants } from "@/lib/graph/arc-attribution";
 
 export const runtime = "nodejs";
 
@@ -38,5 +41,12 @@ export async function GET(req: NextRequest) {
   const since = new Date(Date.now() - WINDOW_HOURS * 3600 * 1000).toISOString();
   const events = await recentEvents(visibleGroupIds(teamSlug, tier), since, LIMIT);
 
-  return Response.json({ events, as_of: new Date().toISOString() });
+  // Tag any recognized AI-agent participant name with the human behind that event's item, or
+  // "(unattributed AI agent)" when none resolves — same attribution as narrative arcs (Layer 3);
+  // see docs/design/brain-learning-panel.md.
+  const itemIds = [...new Set(events.map((e) => e.itemId).filter((id): id is string => !!id))];
+  const humanByItem = await resolveHumanActorsByItem(adminClient(), team.id, itemIds);
+  const attributed = attributeEventParticipants(events, humanByItem);
+
+  return Response.json({ events: attributed, as_of: new Date().toISOString() });
 }

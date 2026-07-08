@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
 import { db, seedTeam, ingest, sha } from "./helpers";
 import { ingestItem } from "@/lib/ingest";
-import { resolveHumanActors } from "@/lib/graph/arcs";
+import { resolveHumanActors } from "@/lib/graph/human-actors";
 
 // Spec (narrative-arc human attribution, real Postgres): the join that turns a brain item's
 // `member_id` into a traceable human name for the arc-attribution layer — must resolve real humans,

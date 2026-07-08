@@ -6,6 +6,7 @@ import { recentFacts, resolveEpisodeItems, type AtomicFact } from "./learning";
 import { GraphitiClient } from "./graphiti-client";
 import { episodeGroupId, type AccessTier } from "./group";
 import { attributeParticipants, attributedFactTexts } from "./arc-attribution";
+import { resolveHumanActorsByItem } from "./human-actors";
 
 /**
  * Layer 3 — narrative arcs. Gathers the recent graph substrate (facts, last 7d, tier-scoped),
@@ -256,49 +257,6 @@ function buildPrompt(factTexts: string[], corrections: string[]): string {
     lines.push("", "Human corrections to incorporate:", ...corrections.map((c) => `- ${c}`));
   }
   return lines.join("\n");
-}
-
-/**
- * Item id → resolved human (non-connector) display name, for a batch of brain item ids in one query
- * — the primitive both the synthesis PROMPT (`attributedFactTexts`, grounding the LLM's input) and
- * the arc OUTPUT (`attributeParticipants`, tagging `participants`) build on, so a whole `getArcs` call
- * costs one Postgres round trip regardless of how many facts/arcs reference those items. Best-effort:
- * an empty map on failure or when an item has no resolvable (non-connector) human — an unattributed
- * AI agent is still more honest than a thrown error.
- */
-async function resolveHumanActorsByItem(
-  db: DbClient,
-  teamId: string,
-  itemIds: string[]
-): Promise<Map<string, string>> {
-  const out = new Map<string, string>();
-  const ids = [...new Set(itemIds.filter(Boolean))];
-  if (ids.length === 0) return out;
-  try {
-    const { data } = await db
-      .from("items")
-      .select("id, members(display_name, is_connector)")
-      .eq("team_id", teamId)
-      .in("id", ids);
-    const rows = (data ?? []) as {
-      id: string;
-      members: { display_name: string | null; is_connector: boolean } | null;
-    }[];
-    for (const r of rows) {
-      const m = r.members;
-      if (m && !m.is_connector && m.display_name) out.set(r.id, m.display_name);
-    }
-  } catch {
-    // best-effort — empty map on failure
-  }
-  return out;
-}
-
-/** Distinct human (non-connector) display names behind a set of brain item ids. Thin wrapper over
- *  `resolveHumanActorsByItem` for callers that only need the deduped name list, not the per-item map. */
-export async function resolveHumanActors(db: DbClient, teamId: string, itemIds: string[]): Promise<string[]> {
-  const byItem = await resolveHumanActorsByItem(db, teamId, itemIds);
-  return [...new Set(byItem.values())];
 }
 
 /** Distinct humans behind a set of item ids, looked up in an already-resolved `humanByItem` map
