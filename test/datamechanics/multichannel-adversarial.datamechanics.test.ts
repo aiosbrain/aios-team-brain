@@ -60,6 +60,17 @@ describe("multi-channel adversarial retrieval (real Postgres)", () => {
     expect(await paths("SSRF image proxy vulnerability")).toContain("slack/security/ssrf.md");
   });
 
+  it("STRENGTH: a 2-char-acronym query now retrieves its doc end-to-end (Gap #1 fixed)", async () => {
+    // The only terms shared between question and doc are the acronyms CI + S3. Before the fix
+    // toOrQuery dropped every <3-char token, so the query searched on "happened" alone (absent from
+    // the doc) and never found it; the doc is buried under newer chatter so recency can't save it.
+    await post("slack/eng", "ci-outage", "The CI pipeline broke on the S3 upload step; reverted the change.");
+    for (let i = 0; i < 10; i++) {
+      await post("slack/random", `n${i}`, `Lunch and parking note ${i}; nothing technical.`);
+    }
+    expect(await paths("what happened with CI and S3?")).toContain("slack/eng/ci-outage.md");
+  });
+
   it("STRENGTH: tier isolation holds across every channel (external sees zero team content)", async () => {
     // The one invariant that MUST NOT degrade at scale: an external principal never sees team channels.
     for (const ch of ["slack/eng", "slack/payments", "slack/design", "slack/leadership", "slack/random"]) {

@@ -151,15 +151,35 @@ const FTS_STOP = new Set([
 ]);
 
 /**
+ * Is this raw token (original case preserved) worth searching on?
+ *   • never a stopword
+ *   • ≥3 chars → yes
+ *   • exactly 2 chars → only if it's a version/product token with a digit (v2, s3, k8) OR an
+ *     acronym the user upper-cased (CI, QA, PR, DB) — NOT a lowercase common word (us, up, so, no).
+ *   • 1 char → no (single letters are noise)
+ * The 2-char rule is the fix for eng-heavy channels where CI/QA/PR/S3 are the load-bearing terms;
+ * dropping them (the old `length >= 3` filter) meant a query ABOUT them searched on filler words.
+ */
+function isSignificantTerm(original: string): boolean {
+  const t = original.toLowerCase();
+  if (FTS_STOP.has(t)) return false;
+  if (t.length >= 3) return true;
+  if (t.length === 2) return /\d/.test(t) || original === original.toUpperCase();
+  return false;
+}
+
+/**
  * Build a recall-friendly FTS query: significant terms OR-joined. `websearch_to_tsquery` treats the
  * word "or" as the OR operator, so this matches docs containing ANY significant term (then the LLM
  * filters relevance) instead of requiring ALL of them. Falls back to the raw question when nothing
  * significant remains. (Ranked/semantic retrieval — pgvector — is the durable fix at larger scale.)
  */
 export function toOrQuery(question: string): string {
-  const terms = (question.toLowerCase().match(/[a-z0-9][a-z0-9'-]*/g) ?? []).filter(
-    (t) => t.length >= 3 && !FTS_STOP.has(t)
-  );
+  // Match on the ORIGINAL (case preserved) so `isSignificantTerm` can tell an upper-cased acronym
+  // (CI) from a lowercase common word (us); lowercase only after the keep/drop decision.
+  const terms = (question.match(/[A-Za-z0-9][A-Za-z0-9'-]*/g) ?? [])
+    .filter(isSignificantTerm)
+    .map((t) => t.toLowerCase());
   const unique = [...new Set(terms)];
   return unique.length ? unique.join(" or ") : question;
 }
@@ -177,8 +197,8 @@ const MAX_EXPANSION_TERMS = 24;
 export function graphExpansionQuery(facts: GraphFact[]): string {
   const terms = new Set<string>();
   const add = (s: string | undefined | null) => {
-    for (const w of (s ?? "").toLowerCase().match(/[a-z0-9][a-z0-9'-]*/g) ?? []) {
-      if (w.length >= 3 && !FTS_STOP.has(w)) terms.add(w);
+    for (const w of (s ?? "").match(/[A-Za-z0-9][A-Za-z0-9'-]*/g) ?? []) {
+      if (isSignificantTerm(w)) terms.add(w.toLowerCase());
     }
   };
   for (const f of facts) {
