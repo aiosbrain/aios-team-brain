@@ -50,10 +50,15 @@ export async function POST(req: NextRequest) {
     getProviderKey(admin, team.id, "openai"),
     getProviderKey(admin, team.id, "anthropic"),
   ]);
-  const arcs = await recomputeArcs(teamSlug, tier, visibleGroupIds(teamSlug, tier), corrections, {
-    openaiKey,
-    anthropicKey,
-  });
+  const arcs = await recomputeArcs(
+    admin,
+    team.id,
+    teamSlug,
+    tier,
+    visibleGroupIds(teamSlug, tier),
+    corrections,
+    { openaiKey, anthropicKey }
+  );
 
   return Response.json({ arcs, as_of: new Date().toISOString() });
 }

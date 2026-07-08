@@ -125,6 +125,26 @@ any search affordance. No new plumbing — both already read from the same `item
 3. **Layer 2** (events) — episodes + participants reconciled to `members`.
 4. **Layer 3** (arcs) — synthesis + cache; then inline edit + recompute + correction writeback.
 
+## Human attribution for AI-agent participants (added 2026-07-08)
+
+Layer 3's `participants` are LLM-synthesized from episode prose, so a recognized AI-agent/tool name
+(e.g. "Claude Code", "AIOS Team Brain", "Claude Agent SDK" — mentioned in a Slack message or PR body,
+not a real actor) could stand in a narrative arc as if it were the person who did the work, with no
+way to trace it to a human. Every ingested item already carries a real attribution
+(`items.member_id` → `members`, excluding connector service-accounts — see `lib/ingest/run.ts`'s
+`resolveConnectorAuth`/`is_connector`), so `getArcs`/`recomputeArcs` (`lib/graph/arcs.ts`) now:
+
+1. Resolve, per arc, the distinct human (non-connector) display names behind that arc's OWN evidence
+   items (`resolveHumanActors`, joining `items` → `members` in Postgres, team-scoped).
+2. Rewrite `participants` (`attributeParticipants` in `lib/graph/arc-attribution.ts`, pure + unit
+   tested) so a recognized AI-agent name is tagged `"Claude Code (Chetan Nandakumar)"`, or
+   `"Claude Code (unattributed AI agent)"` when no human resolves — never silently dropped or guessed.
+
+This only covers Layer 3 (narrative arcs). Layer 2's `participants` (`recentEvents` in
+`lib/graph/learning.ts`) are still raw `MENTIONS` entity names from Graphiti's own extractor,
+unattributed — the same gap could recur there if a future change surfaces Layer 2 participants
+more prominently in the UI.
+
 ## Risks & mitigations
 - **Schema coupling** — we depend on Graphiti's internal Neo4j labels/props, which can change across
   Graphiti versions. *Mitigate:* pin the `zepai/graphiti` image tag; isolate ALL Cypher in
