@@ -200,7 +200,7 @@ export type MaturitySnapshotPayload = z.infer<typeof maturitySnapshotPayloadSche
 export const usageCostPayloadSchema = z.object({
   member: z.string().max(120).nullable().optional(),
   date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
-  provider: z.enum(["cursor", "claude", "anthropic", "openai", "codex", "other"]),
+  provider: z.enum(["cursor", "claude", "opencode", "anthropic", "openai", "codex", "other"]),
   source: z.string().min(1).max(60),
   project: z.string().max(120).optional().default(""),
   input_tokens: z.number().int().nonnegative().optional().default(0),
