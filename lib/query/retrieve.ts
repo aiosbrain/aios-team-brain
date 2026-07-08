@@ -195,6 +195,25 @@ export function toOrQuery(question: string): string {
   return unique.length ? unique.join(" or ") : question;
 }
 
+/**
+ * Detect an EXPLICIT channel scope in the question and strip it (Gap #4). Conservative on purpose —
+ * only `#channel` (Slack style) or "in/on/from [the] X channel" qualify, so "the sales pipeline"
+ * (no literal "channel") never wrongly scopes. Returns the lowercased channel name (matched against
+ * a path's 2nd segment `<source>/<name>/…` in retrieval) and the question with the scope phrase
+ * removed, so the channel word doesn't also leak in as a content search term. Pure + unit-tested.
+ */
+export function parseChannelScope(question: string): { channel: string | null; cleaned: string } {
+  const hash = question.match(/#([a-z0-9][a-z0-9_-]{1,40})\b/i);
+  if (hash) {
+    return { channel: hash[1].toLowerCase(), cleaned: question.replace(hash[0], " ").replace(/\s{2,}/g, " ").trim() };
+  }
+  const phrase = question.match(/\b(?:in|on|from|to)\s+(?:the\s+)?([a-z0-9][a-z0-9_-]{1,40})\s+channel\b/i);
+  if (phrase) {
+    return { channel: phrase[1].toLowerCase(), cleaned: question.replace(phrase[0], " ").replace(/\s{2,}/g, " ").trim() };
+  }
+  return { channel: null, cleaned: question };
+}
+
 const MAX_EXPANSION_TERMS = 24;
 
 /**
@@ -364,14 +383,19 @@ async function nativeRetrieve(
   question: string,
   projectSlug?: string | null
 ): Promise<RetrievedContext> {
+  // Channel scope (Gap #4): if the question names a channel ("#eng" / "in the sales channel"), scope
+  // item retrieval to it and strip the phrase so the channel word isn't also a content search term.
+  const { channel, cleaned } = parseChannelScope(question);
+  const q = channel ? cleaned : question;
+
   // Kick off the Graphiti graph-memory search concurrently with Postgres retrieval.
-  const graphFactsP = fetchGraphFacts(db, teamId, tier, question);
+  const graphFactsP = fetchGraphFacts(db, teamId, tier, q);
   // Optional dense (semantic) passage search — pgvector. Runs concurrently; resolves to [] unless
   // EMBEDDINGS_URL is set AND the pgvector schema is loaded (default installs stay pure-FTS).
-  const denseP = denseSearch(teamId, tier, question, projectSlug);
+  const denseP = denseSearch(teamId, tier, q, projectSlug);
   // Git-activity + per-person activity digests (team tier only — internal) run in parallel too.
   // Context shaping: the activity digests are heavy + only relevant to "who's doing what" questions.
-  const wantsActivity = tier === "team" && wantsActivityContext(question);
+  const wantsActivity = tier === "team" && wantsActivityContext(q);
   const gitDigestP = wantsActivity ? gitActivityDigest(db, teamId) : Promise.resolve("");
   const peopleDigestP = wantsActivity ? peopleActivityDigest(db, teamId) : Promise.resolve("");
 
@@ -379,9 +403,9 @@ async function nativeRetrieve(
   // 1. Recall-friendly, RANKED FTS over items (OR of significant terms; see toOrQuery). Ordered by
   //    ts_rank so the capped top-20 is the most relevant 20, not an arbitrary 20 (Gap #2). Raw SQL
   //    (fts-search) because the builder emits an unordered `@@` filter.
-  const terms = significantTerms(question);
-  const orQuery = terms.length ? terms.join(" or ") : question;
-  const ftsP = rankedFtsSearch(teamId, tier, orQuery, 20);
+  const terms = significantTerms(q);
+  const orQuery = terms.length ? terms.join(" or ") : q;
+  const ftsP = rankedFtsSearch(teamId, tier, orQuery, 20, channel);
   // Grounding specificity (Gap #3) — runs concurrently; combined with hadFtsHit below.
   const specificityP = analyzeTermSpecificity(teamId, tier, terms);
   // Structured-context scaling (Gaps #5/#6): a FULL-corpus task count (aggregates survive the 80-row
@@ -398,6 +422,9 @@ async function nativeRetrieve(
     .order("synced_at", { ascending: false })
     .limit(8);
   if (tier === "external") recentB = recentB.eq("access", "external");
+  // Channel scope (Gap #4) — keep the recency fallback inside the same channel. LIKE on the 2nd
+  // path segment; the FTS leg uses a precise split_part match, this soft filter is fine for padding.
+  if (channel) recentB = recentB.like("path", `%/${channel}/%`);
 
   // 3. Structured-context query builders (awaited together with the above).
   let decisionsB = db
@@ -543,7 +570,7 @@ async function nativeRetrieve(
   const graphFacts = await graphFactsP;
   const expansion = graphExpansionQuery(graphFacts);
   if (expansion) {
-    const semHits = await rankedFtsSearch(teamId, tier, expansion, 10);
+    const semHits = await rankedFtsSearch(teamId, tier, expansion, 10, channel);
     if (semHits.length > 0) grounded = true;
     for (const hit of semHits) {
       if (seen.has(hit.id)) continue;

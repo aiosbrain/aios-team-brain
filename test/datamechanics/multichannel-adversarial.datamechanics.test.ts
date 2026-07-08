@@ -164,15 +164,21 @@ describe("multi-channel adversarial retrieval (real Postgres)", () => {
     expect(ctx.grounded).toBe(true);
   });
 
-  it.fails("GAP: no channel scoping — a channel-qualified query still bleeds in other channels", async () => {
-    // "Atlas" means different things in different channels: a project in #eng, a vendor in #sales.
-    // The user scopes explicitly ("...in the sales channel"), but retrieval has no channel filter —
-    // path prefixes aren't a query dimension — so the #eng Atlas bleeds in. Desired: sales-only.
+  it("STRENGTH: a channel-qualified query scopes to that channel (Gap #4 fixed)", async () => {
+    // "Atlas" means different things per channel: a project in #eng, a vendor in #sales. Scoping
+    // explicitly ("...in the sales channel") now filters retrieval to that channel's path prefix, so
+    // the #eng Atlas no longer bleeds in — while an UNSCOPED "Atlas" query still sees both.
     await post("slack/eng", "atlas", "Project Atlas: refactoring the retrieval layer to add reranking.");
     await post("slack/sales", "atlas", "Atlas Corp (vendor) sent the renewal quote for the analytics contract.");
-    const got = await paths("what's the latest on Atlas in the sales channel?");
-    const engBleed = got.filter((p) => p.startsWith("slack/eng/"));
-    expect(engBleed, `eng-channel Atlas bled into a sales-scoped query: ${engBleed.join(", ")}`).toEqual([]);
+
+    const scoped = await paths("what's the latest on Atlas in the sales channel?");
+    expect(scoped).toContain("slack/sales/atlas.md");
+    expect(scoped.filter((p) => p.startsWith("slack/eng/")), "eng bled into a sales-scoped query").toEqual([]);
+
+    // Sanity: without a scope, both channels' Atlas are eligible (no over-filtering).
+    const unscoped = await paths("what's the latest on Atlas?");
+    expect(unscoped).toContain("slack/sales/atlas.md");
+    expect(unscoped).toContain("slack/eng/atlas.md");
   });
 
   it("STRENGTH: task aggregation is correct past the 80 cap (Gap #5 fixed — full-corpus count)", async () => {
