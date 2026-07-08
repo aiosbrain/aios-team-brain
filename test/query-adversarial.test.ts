@@ -88,4 +88,10 @@ describe("strength: recall-friendly normalization we get RIGHT", () => {
   it("falls back to the raw question when nothing significant survives", () => {
     expect(toOrQuery("who is it?")).toBe("who is it?");
   });
+
+  it("drops temporal deictics so they don't become search/grounding noise (Gap #3 support)", () => {
+    // "latest"/"today"/"recent" are query intent, not content — recency is handled elsewhere.
+    expect(toOrQuery("what are the latest updates today?")).toBe("updates");
+    expect(toOrQuery("any recent deployment news").split(" or ")).not.toContain("recent");
+  });
 });

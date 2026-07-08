@@ -130,16 +130,38 @@ describe("multi-channel adversarial retrieval (real Postgres)", () => {
     expect(missing, `${missing.length}/50 on-topic items were dropped by the caps`).toEqual([]);
   });
 
-  it.fails("GAP: false grounding — an incidental shared term flips `grounded` true for an absent topic", async () => {
-    // Many channels post routine "update" messages. A question about something the brain has NEVER
-    // ingested (Helsinki datacenter migration) shares the stemmed term "updat" with that chatter, so
-    // FTS matches → grounded=true → the answer layer won't abstain → confabulation risk. Desired:
-    // grounded=false, because nothing about the actual topic exists.
+  it("STRENGTH: false grounding fixed — an incidental common term does NOT ground an absent topic (Gap #3)", async () => {
+    // Many channels post routine "update" messages. A question about something NEVER ingested
+    // (Helsinki datacenter migration) shares the stemmed term "updat" with that chatter. The old
+    // signal (any FTS hit) flipped grounded=true → confabulation risk. The IDF signal sees that
+    // "update" is corpus-common while helsinki/datacenter/migration match nothing → grounded=false.
     for (let i = 0; i < 12; i++) {
       await post(`slack/ch${i % 6}`, `daily-${i}`, `Daily update ${i}: posted a quick update to the channel, all normal.`);
     }
     const ctx = await retrieve(db(), seed.teamId, "team", "any updates on the Helsinki datacenter migration?");
     expect(ctx.grounded).toBe(false);
+  });
+
+  it("STRENGTH: a SPECIFIC single-term query stays grounded amid common-word noise (Gap #3 no regression)", async () => {
+    // The danger of any naive grounding fix: rejecting a specific single-term query. "SSRF" is one
+    // term but rare (df=1) → must stay grounded even though the corpus is mostly common "update" chatter.
+    for (let i = 0; i < 12; i++) {
+      await post(`slack/ch${i % 6}`, `daily-${i}`, `Daily update ${i}: routine status, nothing notable.`);
+    }
+    await post("slack/security", "ssrf", "The SSRF vulnerability in the image proxy was patched.");
+    const ctx = await retrieve(db(), seed.teamId, "team", "was the SSRF issue fixed?");
+    expect(ctx.grounded).toBe(true);
+    expect(ctx.sources.some((s) => s.path === "slack/security/ssrf.md")).toBe(true);
+  });
+
+  it("STRENGTH: an all-common-term query still grounds on real matches (no over-abstain)", async () => {
+    // If every query term is corpus-common, the IDF signal falls back to "any FTS hit" so a legit
+    // "what's the latest update?" isn't wrongly forced to abstain.
+    for (let i = 0; i < 6; i++) {
+      await post(`slack/ch${i}`, `update-${i}`, `Weekly update ${i}: the team shipped features and fixed bugs.`);
+    }
+    const ctx = await retrieve(db(), seed.teamId, "team", "what are the latest updates?");
+    expect(ctx.grounded).toBe(true);
   });
 
   it.fails("GAP: no channel scoping — a channel-qualified query still bleeds in other channels", async () => {

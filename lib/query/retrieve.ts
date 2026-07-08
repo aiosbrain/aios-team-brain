@@ -12,6 +12,7 @@ import {
 import { externalProvider } from "./external-provider";
 import { denseSearch, fuseByRrf } from "./dense-search";
 import { rankedFtsSearch } from "./fts-search";
+import { analyzeTermSpecificity } from "./grounding";
 
 // Types live in ./provider (the pluggable seam). Re-exported here so existing importers
 // (lib/query/claude, tests, …) keep importing them from "@/lib/query/retrieve" unchanged.
@@ -149,6 +150,10 @@ const FTS_STOP = new Set([
   "did", "do", "does", "has", "have", "had", "with", "about", "from", "by", "our", "we", "you",
   "i", "me", "my", "your", "their", "this", "that", "these", "those", "it", "its", "as", "at",
   "any", "all", "can", "could", "would", "should", "tell", "show", "give", "list", "get",
+  // Temporal/recency deictics: query INTENT, not content — they never match usefully as keywords
+  // and (df≈0) would otherwise poison the grounding signal (Gap #3). Recency is handled by the
+  // recency fallback + activity digests, not by matching the literal word.
+  "latest", "recent", "recently", "lately", "today", "yesterday", "tomorrow", "currently", "now", "soon", "upcoming",
 ]);
 
 /**
@@ -175,13 +180,17 @@ function isSignificantTerm(original: string): boolean {
  * filters relevance) instead of requiring ALL of them. Falls back to the raw question when nothing
  * significant remains. (Ranked/semantic retrieval — pgvector — is the durable fix at larger scale.)
  */
-export function toOrQuery(question: string): string {
+export function significantTerms(question: string): string[] {
   // Match on the ORIGINAL (case preserved) so `isSignificantTerm` can tell an upper-cased acronym
-  // (CI) from a lowercase common word (us); lowercase only after the keep/drop decision.
+  // (CI) from a lowercase common word (us); lowercase only after the keep/drop decision. De-duped.
   const terms = (question.match(/[A-Za-z0-9][A-Za-z0-9'-]*/g) ?? [])
     .filter(isSignificantTerm)
     .map((t) => t.toLowerCase());
-  const unique = [...new Set(terms)];
+  return [...new Set(terms)];
+}
+
+export function toOrQuery(question: string): string {
+  const unique = significantTerms(question);
   return unique.length ? unique.join(" or ") : question;
 }
 
@@ -369,7 +378,10 @@ async function nativeRetrieve(
   // 1. Recall-friendly, RANKED FTS over items (OR of significant terms; see toOrQuery). Ordered by
   //    ts_rank so the capped top-20 is the most relevant 20, not an arbitrary 20 (Gap #2). Raw SQL
   //    (fts-search) because the builder emits an unordered `@@` filter.
-  const ftsP = rankedFtsSearch(teamId, tier, toOrQuery(question), 20);
+  const terms = significantTerms(question);
+  const ftsP = rankedFtsSearch(teamId, tier, terms.length ? terms.join(" or ") : question, 20);
+  // Grounding specificity (Gap #3) — runs concurrently; combined with hadFtsHit below.
+  const specificityP = analyzeTermSpecificity(teamId, tier, terms);
 
   // 2. Recency: most recent items (a fallback so fresh content always has a shot).
   let recentB = db
@@ -509,10 +521,14 @@ async function nativeRetrieve(
     });
   }
 
-  // Grounding signal (stay-quiet): did query-specific SEARCH match anything, or are the sources just
-  // recency padding? FTS/semantic hits = real grounding; if both are empty the answer layer is told
-  // retrieval found no strong match so it abstains instead of confabulating from recent items.
-  let grounded = ftsHits.length > 0;
+  // Grounding signal (stay-quiet): is there query-SPECIFIC evidence, or are the sources just recency
+  // padding / an incidental common-word match? (Gap #3.) A specific (rare) term that actually matches
+  // → grounded. If every query term is corpus-common, fall back to "any FTS hit" (don't over-abstain
+  // on legit common-word queries). Otherwise — specific terms that match nothing + incidental common
+  // words — NOT grounded, so the answer layer abstains instead of confabulating.
+  const hadFtsHit = ftsHits.length > 0;
+  const spec = await specificityP;
+  let grounded = spec.specificMatching ? true : spec.allCommon ? hadFtsHit : false;
 
   // 2c. Semantic expansion via Graphiti (the graph search ran in parallel above). Use the facts'
   // entity/relationship terms to expand the FTS and surface items the literal keyword search missed.
