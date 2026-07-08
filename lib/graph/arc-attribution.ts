@@ -1,10 +1,11 @@
 /**
- * Layer 3 human attribution. An AI agent/tool name (e.g. "Claude Code", "AIOS Team Brain") is not a
- * traceable actor by itself — it shows up in `participants` only because the arc-synthesis LLM read
- * it out of episode prose (a Slack message, a PR body). Every ingested item is already attributed to
- * a human via `items.member_id` (excluding connector service-accounts, `members.is_connector`), so
- * this rewrites a recognized AI-agent participant to name the human actually responsible for that
- * work, instead of letting the tool stand in for one.
+ * Human attribution for Layer 2 (events) and Layer 3 (narrative arcs). An AI agent/tool name (e.g.
+ * "Claude Code", "AIOS Team Brain") is not a traceable actor by itself — it shows up in
+ * `participants` only because Graphiti's entity extractor (Layer 2) or the arc-synthesis LLM (Layer
+ * 3) read it out of episode prose (a Slack message, a PR body). Every ingested item is already
+ * attributed to a human via `items.member_id` (excluding connector service-accounts,
+ * `members.is_connector`), so this rewrites a recognized AI-agent name to name the human actually
+ * responsible for that work, instead of letting the tool stand in for one.
  */
 
 /**
@@ -107,5 +108,28 @@ export function attributedFactTexts(
       ),
     ];
     return attributeFactText(f.fact, f.subject, humans);
+  });
+}
+
+/** The minimal shape of a Layer-2 event `attributeEventParticipants` needs — structurally compatible
+ *  with `GraphEvent` (lib/graph/learning.ts) without importing it. */
+export interface EventParticipantsRef {
+  itemId: string | null;
+  participants: string[];
+}
+
+/**
+ * Rewrite each event's `participants` (Layer 2) to tag a recognized AI-agent name with the human
+ * behind that event's single source item. Mirrors `attributeParticipants` for arcs — but an event
+ * maps to exactly ONE item (`itemId`), not a set of evidence items, so there's no per-event merge
+ * across items. Pure over an already-resolved `humanByItem` map — no DB access here.
+ */
+export function attributeEventParticipants<T extends EventParticipantsRef>(
+  events: T[],
+  humanByItem: Map<string, string>
+): T[] {
+  return events.map((e) => {
+    const human = e.itemId ? humanByItem.get(e.itemId) : undefined;
+    return { ...e, participants: attributeParticipants(e.participants, human ? [human] : []) };
   });
 }

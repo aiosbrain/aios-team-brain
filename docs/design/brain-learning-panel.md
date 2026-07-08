@@ -146,11 +146,12 @@ see `lib/ingest/run.ts`'s `resolveConnectorAuth`/`is_connector`), so `getArcs`/`
    when no human resolves, as a backstop in case the LLM still echoes a bare agent name into
    `participants` despite the grounded prompt.
 
-Both steps resolve humans from the SAME batched Postgres query, `resolveHumanActorsByItem` — one
-`items → members` round trip for every item id touched by a `getArcs`/`recomputeArcs` call (not one
-query per fact and another per arc), returning an `item id → human` map that both `attributedFactTexts`
-(prompt) and the `participants` rewrite (output) read from in-memory. `resolveHumanActors` (a thin
-wrapper returning the deduped name list) is kept for callers that only need that shape.
+Both steps resolve humans from a batched Postgres query, `resolveHumanActorsByItem`
+(`lib/graph/human-actors.ts`, shared with the Layer 2 fix below) — one `items → members` round trip
+for every item id touched by a `getArcs`/`recomputeArcs` call (not one query per fact and another per
+arc), returning an `item id → human` map that both `attributedFactTexts` (prompt) and the
+`participants` rewrite (output) read from in-memory. `resolveHumanActors` (a thin wrapper returning
+the deduped name list) is kept for callers that only need that shape.
 
 **Latency trade-off:** the fact-resolution step must complete BEFORE the LLM call now (the prompt
 depends on it), so `resolveEpisodeItems` + `resolveHumanActorsByItem` can no longer run in
@@ -158,11 +159,21 @@ depends on it), so `resolveEpisodeItems` + `resolveHumanActorsByItem` can no lon
 trip to every `getArcs`/`recomputeArcs` call — accepted as the cost of a synthesis input that's
 grounded in a human instead of raw tool-name prose.
 
-**Still not covered:** Layer 2's `participants` (`recentEvents` in `lib/graph/learning.ts`) are still
-raw `MENTIONS` entity names from Graphiti's own extractor, unattributed — the same gap could recur
-there if a future change surfaces Layer 2 participants more prominently in the UI. Layer 1's
-`subject`/`object` fields have the same characteristic (raw extracted entity names) but are not
-currently displayed as if they were actors.
+**Layer 2 (added 2026-07-08):** `GET /api/brain/events`'s `participants` had the same gap — raw
+`MENTIONS` entity names from Graphiti's own extractor, unattributed. Since one event maps to exactly
+ONE source item (unlike an arc's multiple evidence items), the fix is simpler: `resolveHumanActorsByItem`
+resolves every event's `itemId` in one batched query, and `attributeEventParticipants`
+(`lib/graph/arc-attribution.ts`) rewrites `participants` the same way `attributeParticipants` does for
+arcs. Layer 1's `subject`/`object` fields have the same characteristic (raw extracted entity names)
+but are not currently displayed as if they were actors, so they're left unattributed for now.
+
+**Learning page layout (added 2026-07-08):** narrative arcs (Layer 3) are the synthesized payoff and
+stay expanded at the top of `app/t/[team]/learning/page.tsx`; events and atomic facts (Layers 1–2) —
+the raw evidence trail underneath — are collapsed by default behind a single `<details>` disclosure
+("Recent activity — events & atomic facts"), the same native-element pattern already used for an
+arc's evidence list (`components/learning/arcs-panel.tsx`). Rationale: an arc's own clickable evidence
+links are the primary "verify this" path; the full unfiltered Layer 1/2 feed is there for the rare
+deeper dive, not as permanently-stacked primary UI.
 
 ## Risks & mitigations
 - **Schema coupling** — we depend on Graphiti's internal Neo4j labels/props, which can change across

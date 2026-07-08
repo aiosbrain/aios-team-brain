@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { attributeParticipants, attributedFactTexts, attributeFactText, isAiAgentName } from "@/lib/graph/arc-attribution";
+import {
+  attributeParticipants,
+  attributedFactTexts,
+  attributeFactText,
+  attributeEventParticipants,
+  isAiAgentName,
+} from "@/lib/graph/arc-attribution";
 
 /**
  * Spec: an AI agent/tool name in an arc's `participants` must never stand in for a human — it gets
@@ -111,6 +117,43 @@ describe("attributedFactTexts", () => {
     const facts = [{ fact: "Claude Code did something", subject: "Claude Code", episodeUuids: [] }];
     expect(attributedFactTexts(facts, epToItem, humanByItem)).toEqual([
       "(unattributed AI agent: Claude Code) Claude Code did something",
+    ]);
+  });
+});
+
+describe("attributeEventParticipants (Layer 2)", () => {
+  const humanByItem = new Map([["item-aaa", "Chetan Nandakumar"]]);
+
+  it("tags a recognized AI-agent participant with the human behind the event's item", () => {
+    const events = [{ itemId: "item-aaa", participants: ["Claude Code"] }];
+    expect(attributeEventParticipants(events, humanByItem)).toEqual([
+      { itemId: "item-aaa", participants: ["Claude Code (Chetan Nandakumar)"] },
+    ]);
+  });
+
+  it("leaves ordinary human participants untouched", () => {
+    const events = [{ itemId: "item-aaa", participants: ["Chetan Nandakumar"] }];
+    expect(attributeEventParticipants(events, humanByItem)).toEqual(events);
+  });
+
+  it("marks an AI-agent participant unattributed when the item has no resolvable human", () => {
+    const events = [{ itemId: "item-bbb", participants: ["Codex"] }];
+    expect(attributeEventParticipants(events, humanByItem)).toEqual([
+      { itemId: "item-bbb", participants: ["Codex (unattributed AI agent)"] },
+    ]);
+  });
+
+  it("marks an AI-agent participant unattributed when the event has no item at all", () => {
+    const events = [{ itemId: null, participants: ["AIOS Team Brain"] }];
+    expect(attributeEventParticipants(events, humanByItem)).toEqual([
+      { itemId: null, participants: ["AIOS Team Brain (unattributed AI agent)"] },
+    ]);
+  });
+
+  it("preserves any extra fields on the event object (structural passthrough)", () => {
+    const events = [{ itemId: "item-aaa", participants: ["Claude Code"], source: "github", factCount: 3 }];
+    expect(attributeEventParticipants(events, humanByItem)).toEqual([
+      { itemId: "item-aaa", participants: ["Claude Code (Chetan Nandakumar)"], source: "github", factCount: 3 },
     ]);
   });
 });
