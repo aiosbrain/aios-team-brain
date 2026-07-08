@@ -13,6 +13,7 @@ import { externalProvider } from "./external-provider";
 import { denseSearch, fuseByRrf } from "./dense-search";
 import { rankedFtsSearch } from "./fts-search";
 import { analyzeTermSpecificity } from "./grounding";
+import { taskStatusCounts, matchingDecisions } from "./structured-extras";
 
 // Types live in ./provider (the pluggable seam). Re-exported here so existing importers
 // (lib/query/claude, tests, …) keep importing them from "@/lib/query/retrieve" unchanged.
@@ -379,9 +380,15 @@ async function nativeRetrieve(
   //    ts_rank so the capped top-20 is the most relevant 20, not an arbitrary 20 (Gap #2). Raw SQL
   //    (fts-search) because the builder emits an unordered `@@` filter.
   const terms = significantTerms(question);
-  const ftsP = rankedFtsSearch(teamId, tier, terms.length ? terms.join(" or ") : question, 20);
+  const orQuery = terms.length ? terms.join(" or ") : question;
+  const ftsP = rankedFtsSearch(teamId, tier, orQuery, 20);
   // Grounding specificity (Gap #3) — runs concurrently; combined with hadFtsHit below.
   const specificityP = analyzeTermSpecificity(teamId, tier, terms);
+  // Structured-context scaling (Gaps #5/#6): a FULL-corpus task count (aggregates survive the 80-row
+  // cap) + a keyword search over ALL decisions (an old-but-relevant decision survives the 50-row
+  // recency window). Both run concurrently; folded into the structured block below.
+  const taskCountsP = taskStatusCounts(teamId, tier);
+  const matchedDecisionsP = terms.length ? matchingDecisions(teamId, tier, orQuery, 10) : Promise.resolve([]);
 
   // 2. Recency: most recent items (a fallback so fresh content always has a shot).
   let recentB = db
@@ -583,13 +590,34 @@ async function nativeRetrieve(
   }
 
   // 3. Structured context (compact, always included) — built from the parallel results above.
-  const [gitDigest, peopleDigest] = await Promise.all([gitDigestP, peopleDigestP]);
+  const [gitDigest, peopleDigest, taskCounts, matchedDecisions] = await Promise.all([
+    gitDigestP,
+    peopleDigestP,
+    taskCountsP,
+    matchedDecisionsP,
+  ]);
+
+  // Decisions: the recency-50 window PLUS any keyword-matched decision that scrolled past it (Gap #6),
+  // deduped by row_key. Recency rows first (fresh context), then the older matches under their own note.
+  type DecisionLine = { row_key: string; decided_at: string | null; title: string; decided_by: string; still_valid: boolean; slug: string };
+  const recencyDecisions: DecisionLine[] = (decisions ?? []).map((d) => ({
+    row_key: d.row_key as string,
+    decided_at: (d.decided_at as string | null) ?? null,
+    title: d.title as string,
+    decided_by: d.decided_by as string,
+    still_valid: d.still_valid as boolean,
+    slug: (d.projects as unknown as { slug: string })?.slug ?? "",
+  }));
+  const recencyKeys = new Set(recencyDecisions.map((d) => d.row_key));
+  const olderMatches = matchedDecisions.filter((d) => !recencyKeys.has(d.row_key));
+  const fmtDecision = (d: DecisionLine) =>
+    `- #${d.row_key} (${d.decided_at ?? "?"}, ${d.slug}) ${d.title} — by ${d.decided_by}${d.still_valid ? "" : " [SUPERSEDED]"}`;
+
   const structured = [
+    `## Task counts (all ${taskCounts.total} tasks: ${taskCounts.open} open, ${taskCounts.byStatus.done ?? 0} done)`,
     "## Recent decisions (newest first)",
-    ...(decisions ?? []).map(
-      (d) =>
-        `- #${d.row_key} (${d.decided_at ?? "?"}, ${(d.projects as unknown as { slug: string })?.slug}) ${d.title} — by ${d.decided_by}${d.still_valid ? "" : " [SUPERSEDED]"}`
-    ),
+    ...recencyDecisions.map(fmtDecision),
+    ...(olderMatches.length ? ["", "## Older decisions matching this query", ...olderMatches.map(fmtDecision)] : []),
     "",
     "## Tasks (all statuses, most recently updated first)",
     ...(tasks ?? []).map((t) => {
