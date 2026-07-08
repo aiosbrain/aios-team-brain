@@ -39,10 +39,13 @@ real test") the moment the gap is closed. So the count of `it.fails` in these fi
    even when recency can't save it). **Still open:** the *recall ceiling* — a query legitimately
    matching 50 items still returns only ~28 (test: 22/50 dropped). Ranking makes the kept set the
    best set; closing the ceiling needs dense/pgvector retrieval + higher/query-scoped caps.
-3. **False grounding.** `grounded = ftsHits > 0`. An incidental stemmed term ("update" chatter across
-   channels) flips `grounded` true for a topic the brain has **never ingested** (Helsinki datacenter
-   migration) → the answer layer won't abstain → confabulation risk. More channels ⇒ more incidental
-   term overlap ⇒ the stay-quiet safety erodes.
+3. ~~**False grounding.**~~ **FIXED** — grounding now keys on term **specificity (document frequency)**,
+   not "any FTS hit" (`lib/query/grounding`). A *specific* (rare, ≤15%-of-corpus) term that actually
+   matches → grounded; if every query term is corpus-common → fall back to any-hit (no over-abstain on
+   "what's the latest update?"); otherwise (specific terms that match nothing + incidental common words)
+   → NOT grounded. Temporal deictics ("latest/recent/today") are now stopwords so they don't poison the
+   signal. Verified: the "Helsinki migration" chatter no longer grounds, while a specific single-term
+   query ("SSRF") still does.
 4. **No channel scoping.** A user who scopes explicitly ("…in the #sales channel") gets bleed from
    other channels — path prefixes aren't a query dimension, so an `#eng` "Atlas" contaminates a
    sales-scoped "Atlas" question. Same-name-different-meaning collisions multiply with channels.
