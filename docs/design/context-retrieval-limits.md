@@ -33,11 +33,12 @@ real test") the moment the gap is closed. So the count of `it.fails` in these fi
    when it's an upper-cased acronym (`CI`, `QA`, `PR`, `DB`) or carries a digit (`S3`, `v2`, `k8`),
    while still dropping lowercase common words (`us`, `up`, `so`). Proven end-to-end: a query whose
    only shared terms are `CI`/`S3` now retrieves its doc.
-2. **No relevance ranking + hard caps → truncated, unranked recall at scale.** FTS is a bare
-   `@@ websearch_to_tsquery` filter with **no `ts_rank ORDER BY`**, capped at 20 (+8 recency). A
-   broad-but-legitimate query ("summarize the payments migration") that legitimately matches 50 items
-   returns ~28, and there's **no guarantee they're the most relevant 28** (test: 22/50 dropped).
-   Single channel ≈ always under the cap; many channels routinely blow past it.
+2. **Hard caps → truncated recall at scale.** ~~No relevance ranking~~ **RANKING FIXED** — the FTS
+   query now orders by `ts_rank` (`lib/query/fts-search`), so the capped top-20 is the *most relevant*
+   20, not an arbitrary 20 (proven: a 5-term-match item beats 25 single-term items into the window
+   even when recency can't save it). **Still open:** the *recall ceiling* — a query legitimately
+   matching 50 items still returns only ~28 (test: 22/50 dropped). Ranking makes the kept set the
+   best set; closing the ceiling needs dense/pgvector retrieval + higher/query-scoped caps.
 3. **False grounding.** `grounded = ftsHits > 0`. An incidental stemmed term ("update" chatter across
    channels) flips `grounded` true for a topic the brain has **never ingested** (Helsinki datacenter
    migration) → the answer layer won't abstain → confabulation risk. More channels ⇒ more incidental

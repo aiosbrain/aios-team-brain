@@ -11,6 +11,7 @@ import {
 } from "./provider";
 import { externalProvider } from "./external-provider";
 import { denseSearch, fuseByRrf } from "./dense-search";
+import { rankedFtsSearch } from "./fts-search";
 
 // Types live in ./provider (the pluggable seam). Re-exported here so existing importers
 // (lib/query/claude, tests, …) keep importing them from "@/lib/query/retrieve" unchanged.
@@ -365,14 +366,10 @@ async function nativeRetrieve(
   const peopleDigestP = wantsActivity ? peopleActivityDigest(db, teamId) : Promise.resolve("");
 
   // All independent retrieval queries run in PARALLEL (was sequential → ~7 serial round-trips).
-  // 1. Recall-friendly FTS over items (OR of significant terms; see toOrQuery).
-  let ftsB = db
-    .from("items")
-    .select("id, path, kind, body, synced_at, projects(slug)")
-    .eq("team_id", teamId)
-    .textSearch("search", toOrQuery(question), { type: "websearch", config: "english" })
-    .limit(20);
-  if (tier === "external") ftsB = ftsB.eq("access", "external");
+  // 1. Recall-friendly, RANKED FTS over items (OR of significant terms; see toOrQuery). Ordered by
+  //    ts_rank so the capped top-20 is the most relevant 20, not an arbitrary 20 (Gap #2). Raw SQL
+  //    (fts-search) because the builder emits an unordered `@@` filter.
+  const ftsP = rankedFtsSearch(teamId, tier, toOrQuery(question), 20);
 
   // 2. Recency: most recent items (a fallback so fresh content always has a shot).
   let recentB = db
@@ -439,7 +436,7 @@ async function nativeRetrieve(
           .limit(40);
 
   const [
-    { data: ftsHits },
+    ftsHits,
     { data: recentHits },
     { data: decisions },
     { data: tasks },
@@ -448,7 +445,7 @@ async function nativeRetrieve(
     { data: actors },
     augmented,
   ] = await Promise.all([
-    ftsB,
+    ftsP,
     recentB,
     decisionsB,
     tasksB,
@@ -458,23 +455,30 @@ async function nativeRetrieve(
     fetchAugmentedSources(question, tier),
   ]);
 
-  // Merge, dedupe by id, cap sizes
+  // Merge, dedupe by id, cap sizes. Ranked FTS hits (already ordered by relevance) come first, then
+  // recency padding. Normalize the two row shapes (FTS carries `project` as a slug string; the
+  // recency builder embeds `projects(slug)`).
+  type MergeHit = { id: string; path: string; kind: string; body: string; synced_at: string; slug: string };
+  const iso = (v: string | Date): string => (v instanceof Date ? v.toISOString() : String(v ?? ""));
+  const rankedHits: MergeHit[] = ftsHits.map((h) => ({ id: h.id, path: h.path, kind: h.kind, body: h.body, synced_at: h.synced_at, slug: h.project }));
+  const recencyHits: MergeHit[] = ((recentHits ?? []) as { id: string; path: string; kind: string; body: string | null; synced_at: string | Date; projects: unknown }[]).map(
+    (h) => ({ id: h.id, path: h.path, kind: h.kind, body: h.body ?? "", synced_at: iso(h.synced_at), slug: (h.projects as { slug: string })?.slug ?? "" })
+  );
   const seen = new Set<string>();
   const sources: Source[] = [];
   let total = 0;
   let n = 1;
-  for (const hit of [...(ftsHits ?? []), ...(recentHits ?? [])]) {
+  for (const hit of [...rankedHits, ...recencyHits]) {
     if (seen.has(hit.id)) continue;
     seen.add(hit.id);
-    const slug = (hit.projects as unknown as { slug: string })?.slug ?? "";
-    if (projectSlug && slug !== projectSlug) continue;
+    if (projectSlug && hit.slug !== projectSlug) continue;
     const text = (hit.body || "").slice(0, MAX_SOURCE_CHARS);
     if (total + text.length > MAX_TOTAL_CHARS) break;
     total += text.length;
     sources.push({
       sid: `S${n++}`,
       item_id: hit.id,
-      project: slug,
+      project: hit.slug,
       path: hit.path,
       kind: hit.kind,
       synced_at: hit.synced_at,
@@ -508,7 +512,7 @@ async function nativeRetrieve(
   // Grounding signal (stay-quiet): did query-specific SEARCH match anything, or are the sources just
   // recency padding? FTS/semantic hits = real grounding; if both are empty the answer layer is told
   // retrieval found no strong match so it abstains instead of confabulating from recent items.
-  let grounded = (ftsHits?.length ?? 0) > 0;
+  let grounded = ftsHits.length > 0;
 
   // 2c. Semantic expansion via Graphiti (the graph search ran in parallel above). Use the facts'
   // entity/relationship terms to expand the FTS and surface items the literal keyword search missed.
@@ -516,24 +520,16 @@ async function nativeRetrieve(
   const graphFacts = await graphFactsP;
   const expansion = graphExpansionQuery(graphFacts);
   if (expansion) {
-    let semB = db
-      .from("items")
-      .select("id, path, kind, body, synced_at, projects(slug)")
-      .eq("team_id", teamId)
-      .textSearch("search", expansion, { type: "websearch", config: "english" })
-      .limit(10);
-    if (tier === "external") semB = semB.eq("access", "external");
-    const { data: semHits } = await semB;
-    if ((semHits?.length ?? 0) > 0) grounded = true;
-    for (const hit of (semHits ?? []) as { id: string; path: string; kind: string; body: string; synced_at: string; projects: unknown }[]) {
+    const semHits = await rankedFtsSearch(teamId, tier, expansion, 10);
+    if (semHits.length > 0) grounded = true;
+    for (const hit of semHits) {
       if (seen.has(hit.id)) continue;
       seen.add(hit.id);
-      const slug = (hit.projects as { slug: string })?.slug ?? "";
-      if (projectSlug && slug !== projectSlug) continue;
+      if (projectSlug && hit.project !== projectSlug) continue;
       const text = (hit.body || "").slice(0, MAX_SOURCE_CHARS);
       if (total + text.length > MAX_TOTAL_CHARS) break;
       total += text.length;
-      sources.push({ sid: `S${n++}`, item_id: hit.id, project: slug, path: hit.path, kind: hit.kind, synced_at: hit.synced_at, text });
+      sources.push({ sid: `S${n++}`, item_id: hit.id, project: hit.project, path: hit.path, kind: hit.kind, synced_at: hit.synced_at, text });
     }
   }
 
@@ -565,7 +561,7 @@ async function nativeRetrieve(
     }
     orderedSources = fuseByRrf(
       sources,
-      (ftsHits ?? []).map((h) => (h as { id: string }).id),
+      ftsHits.map((h) => h.id),
       denseHits.map((h) => h.item_id)
     );
   }

@@ -71,6 +71,21 @@ describe("multi-channel adversarial retrieval (real Postgres)", () => {
     expect(await paths("what happened with CI and S3?")).toContain("slack/eng/ci-outage.md");
   });
 
+  it("STRENGTH: ts_rank puts the most-specific item into the capped window (Gap #2 fixed)", async () => {
+    // 25 weak items across channels each match ONE query term ("migration"); one target matches five.
+    // The target is buried under 8 newer filler items so recency can't rescue it — its ONLY path in
+    // is ranked FTS. Before Gap #2, FTS was an unordered `@@` filter, so the target (26th of 26
+    // matches, capped at 20) could be dropped; now ts_rank orders it #1 so it's always retrieved.
+    for (let i = 0; i < 25; i++) {
+      await post(`slack/ch${i % 6}`, `weak-${i}`, `General migration reminder ${i}: nothing specific to report today.`);
+    }
+    await post("slack/payments", "target", "Payments migration: the Stripe webhook cutover and rollback plan were finalized.");
+    for (let i = 0; i < 8; i++) {
+      await post("slack/random", `newer-${i}`, `Fresh unrelated chatter ${i}: lunch and parking.`);
+    }
+    expect(await paths("payments migration Stripe webhook cutover rollback")).toContain("slack/payments/target.md");
+  });
+
   it("STRENGTH: tier isolation holds across every channel (external sees zero team content)", async () => {
     // The one invariant that MUST NOT degrade at scale: an external principal never sees team channels.
     for (const ch of ["slack/eng", "slack/payments", "slack/design", "slack/leadership", "slack/random"]) {
