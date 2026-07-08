@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { toOrQuery } from "@/lib/query/retrieve";
+import { toOrQuery, parseChannelScope } from "@/lib/query/retrieve";
 
 /**
  * ADVERSARIAL — query-transformation limits (pure, deterministic). These probe the FTS query builder
@@ -75,6 +75,27 @@ describe("adversarial: a channel name is treated as a content term, not a scope"
 
   it("documents: the channel name leaks in as a plain search term", () => {
     expect(toOrQuery("what was decided in the payments channel").split(" or ")).toContain("payments");
+  });
+});
+
+describe("channel scope parsing (Gap #4 — conservative)", () => {
+  it("extracts a '#channel' scope and strips it from the query", () => {
+    const { channel, cleaned } = parseChannelScope("what shipped in #eng lately?");
+    expect(channel).toBe("eng");
+    expect(cleaned).not.toContain("#eng");
+  });
+
+  it("extracts an 'in the X channel' scope and strips the phrase", () => {
+    const { channel, cleaned } = parseChannelScope("what's the latest on Atlas in the sales channel?");
+    expect(channel).toBe("sales");
+    expect(cleaned).not.toMatch(/sales channel/i); // channel word doesn't leak into search terms
+    expect(toOrQuery(cleaned).split(" or ")).toContain("atlas");
+    expect(toOrQuery(cleaned).split(" or ")).not.toContain("sales");
+  });
+
+  it("does NOT scope when 'channel' is absent (no false positives)", () => {
+    expect(parseChannelScope("what's the sales pipeline forecast?").channel).toBeNull();
+    expect(parseChannelScope("how do users sign in?").channel).toBeNull();
   });
 });
 

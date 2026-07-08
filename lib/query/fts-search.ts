@@ -27,12 +27,18 @@ export async function rankedFtsSearch(
   teamId: string,
   tier: "team" | "external",
   orQuery: string,
-  limit = 20
+  limit = 20,
+  channel?: string | null
 ): Promise<FtsHit[]> {
   if (!orQuery.trim()) return [];
   const params: unknown[] = [orQuery, teamId];
   let where = "i.team_id = $2 and i.search @@ websearch_to_tsquery('english', $1)";
   if (tier === "external") where += " and i.access = 'external'";
+  if (channel) {
+    // Channel scope (Gap #4): the channel is a path's 2nd segment, `<source>/<name>/…`.
+    params.push(channel);
+    where += ` and split_part(i.path, '/', 2) = $${params.length}`;
+  }
   params.push(limit);
   const limitIdx = params.length;
 

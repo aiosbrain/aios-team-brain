@@ -46,9 +46,10 @@ real test") the moment the gap is closed. So the count of `it.fails` in these fi
    → NOT grounded. Temporal deictics ("latest/recent/today") are now stopwords so they don't poison the
    signal. Verified: the "Helsinki migration" chatter no longer grounds, while a specific single-term
    query ("SSRF") still does.
-4. **No channel scoping.** A user who scopes explicitly ("…in the #sales channel") gets bleed from
-   other channels — path prefixes aren't a query dimension, so an `#eng` "Atlas" contaminates a
-   sales-scoped "Atlas" question. Same-name-different-meaning collisions multiply with channels.
+4. ~~**No channel scoping.**~~ **FIXED** — `parseChannelScope` detects an explicit `#channel` /
+   "in the X channel" qualifier (conservative — "the sales pipeline" never scopes), strips it from the
+   search terms, and filters item retrieval to that channel's path segment. An `#eng` "Atlas" no
+   longer contaminates a sales-scoped "Atlas" question; an unscoped query still sees both.
 5. ~~**Aggregation/rollup truncates.**~~ **FIXED** — a full-corpus **task count-by-status** line
    (`lib/query/structured-extras`) is now in the structured context, so "how many open tasks?" is
    correct regardless of the 80-row detail cap.
@@ -56,12 +57,12 @@ real test") the moment the gap is closed. So the count of `it.fails` in these fi
    ranked), so an on-record decision surfaces past the recency-50 window ("which vendor did we pick in
    Q1?" reaches it).
 
-## The through-line
+## Status
 
-The system is tuned for **one low-volume channel**: fixed caps are never hit, unranked FTS is fine
-because there's little to rank, recency masks crowding, and `grounded` rarely false-positives. Every
-gap above is a **scaling cliff** that the current corpus hides. The durable fixes are already gestured
-at in the code comments — **semantic/dense ranking (pgvector) + a reranker** for (1)(2), a stronger
-grounding signal than "any FTS hit" for (3), **channel/source as a first-class retrieval filter** for
-(4), and **query-scoped (not global-capped) structured context** for (5)(6). The tests here make each
-fix *provable*: close the gap and its `it.fails` turns red.
+Gaps **#1, #3, #4, #5, #6 are fixed** and #2's ranking facet is fixed — the multi-channel adversarial
+suite is green except one remaining `it.fails`: the **recall ceiling** (a query legitimately matching
+50+ items returns only ~28). That's the one gap keyword search can't close on its own; the durable fix
+is **dense/pgvector retrieval + a reranker + query-scoped caps** (the `EMBEDDINGS_URL` leg already
+exists but is off by default). Everything else — short-token recall, `ts_rank` ordering, IDF grounding,
+channel scoping, full-corpus task counts, decision keyword search — now holds as channels multiply. The
+tests make each fix *provable*: each closed gap's `it.fails` flipped to a green `it()`.
