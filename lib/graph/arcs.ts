@@ -1,9 +1,11 @@
 import "server-only";
 import { createHash } from "node:crypto";
 import Anthropic from "@anthropic-ai/sdk";
+import type { DbClient } from "@/lib/db/types";
 import { recentFacts, resolveEpisodeItems, type AtomicFact } from "./learning";
 import { GraphitiClient } from "./graphiti-client";
 import { episodeGroupId, type AccessTier } from "./group";
+import { attributeParticipants } from "./arc-attribution";
 
 /**
  * Layer 3 — narrative arcs. Gathers the recent graph substrate (facts, last 7d, tier-scoped),
@@ -255,11 +257,57 @@ function buildPrompt(facts: AtomicFact[], corrections: string[]): string {
   return lines.join("\n");
 }
 
+/**
+ * Distinct human (non-connector) display names behind a set of brain item ids — the traceable
+ * humans behind an arc's evidence, used to tag any AI-agent participant name (`arc-attribution.ts`)
+ * instead of letting the tool stand in for a person. Best-effort: [] on any failure or when nothing
+ * resolves (e.g. a connector-only item, or Postgres unreachable) — an unattributed AI agent is still
+ * more honest than a thrown error.
+ */
+export async function resolveHumanActors(db: DbClient, teamId: string, itemIds: string[]): Promise<string[]> {
+  const ids = [...new Set(itemIds.filter(Boolean))];
+  if (ids.length === 0) return [];
+  try {
+    const { data } = await db
+      .from("items")
+      .select("members(display_name, is_connector)")
+      .eq("team_id", teamId)
+      .in("id", ids);
+    const rows = (data ?? []) as { members: { display_name: string | null; is_connector: boolean } | null }[];
+    const names = rows
+      .map((r) => r.members)
+      .filter((m): m is { display_name: string; is_connector: boolean } => !!m && !m.is_connector && !!m.display_name)
+      .map((m) => m.display_name);
+    return [...new Set(names)];
+  } catch {
+    return [];
+  }
+}
+
+/** Rewrite each arc's `participants` to tag recognized AI-agent names with the human(s) behind that
+ *  arc's own evidence items (never cross-arc — an arc's attribution must trace to ITS OWN work). */
+async function withHumanAttribution(db: DbClient, teamId: string, arcs: NarrativeArc[]): Promise<NarrativeArc[]> {
+  return Promise.all(
+    arcs.map(async (arc) => {
+      const itemIds = arc.evidence.map((e) => e.itemId).filter((id): id is string => !!id);
+      const humans = await resolveHumanActors(db, teamId, itemIds);
+      return { ...arc, participants: attributeParticipants(arc.participants, humans) };
+    })
+  );
+}
+
 // In-memory cache (single-instance app). Keyed by the tier-visible group set.
 const cache = new Map<string, { arcs: NarrativeArc[]; at: number }>();
 
 /** Synthesize (or return cached) arcs for a team+tier. Empty when the graph/LLM is unavailable. */
-export async function getArcs(teamSlug: string, tier: AccessTier, groups: string[], keys: ProviderKeys): Promise<NarrativeArc[]> {
+export async function getArcs(
+  db: DbClient,
+  teamId: string,
+  teamSlug: string,
+  tier: AccessTier,
+  groups: string[],
+  keys: ProviderKeys
+): Promise<NarrativeArc[]> {
   if (groups.length === 0) return [];
   const key = groups.slice().sort().join(",");
   const hit = cache.get(key);
@@ -272,7 +320,7 @@ export async function getArcs(teamSlug: string, tier: AccessTier, groups: string
     callLLMRaw(buildPrompt(facts, []), keys),
     resolveEpisodeItems(groups, facts.flatMap((f) => f.episodeUuids)),
   ]);
-  const arcs = parseArcsJson(raw, { facts, epToItem });
+  const arcs = await withHumanAttribution(db, teamId, parseArcsJson(raw, { facts, epToItem }));
   cache.set(key, { arcs, at: Date.now() });
   return arcs;
 }
@@ -283,6 +331,8 @@ export async function getArcs(teamSlug: string, tier: AccessTier, groups: string
  * informs future synthesis. Writeback is best-effort — a Graphiti hiccup doesn't fail the recompute.
  */
 export async function recomputeArcs(
+  db: DbClient,
+  teamId: string,
   teamSlug: string,
   tier: AccessTier,
   groups: string[],
@@ -296,7 +346,7 @@ export async function recomputeArcs(
     callLLMRaw(buildPrompt(facts, corrections.map((c) => c.corrected_text)), keys),
     resolveEpisodeItems(groups, facts.flatMap((f) => f.episodeUuids)),
   ]);
-  const arcs = parseArcsJson(raw, { facts, epToItem });
+  const arcs = await withHumanAttribution(db, teamId, parseArcsJson(raw, { facts, epToItem }));
   cache.set(groups.slice().sort().join(","), { arcs, at: Date.now() });
 
   // Persist corrections as first-class episodes (team-tier group; corrections are internal).

@@ -72,7 +72,7 @@ export async function getTeamWork(
         .limit(600),
       tier
     ),
-    getArcs(teamSlug, tier, visibleGroupIds(teamSlug, tier), keys).catch(() => []),
+    getArcs(db, teamId, teamSlug, tier, visibleGroupIds(teamSlug, tier), keys).catch(() => []),
   ]);
 
   const tasks: TaskLite[] = ((taskRows ?? []) as {
