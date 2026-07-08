@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { attributeParticipants, isAiAgentName } from "@/lib/graph/arc-attribution";
+import { attributeParticipants, attributedFactTexts, attributeFactText, isAiAgentName } from "@/lib/graph/arc-attribution";
 
 /**
  * Spec: an AI agent/tool name in an arc's `participants` must never stand in for a human — it gets
@@ -58,6 +58,59 @@ describe("attributeParticipants", () => {
     expect(attributeParticipants(["Claude Code", "Chetan Nandakumar"], ["Chetan Nandakumar"])).toEqual([
       "Claude Code (Chetan Nandakumar)",
       "Chetan Nandakumar",
+    ]);
+  });
+});
+
+describe("attributeFactText", () => {
+  it("prefixes a fact whose subject is a recognized AI agent with its human, via the agent", () => {
+    expect(attributeFactText("Claude Code refactored the auth module", "Claude Code", ["Chetan Nandakumar"])).toBe(
+      "(Chetan Nandakumar, via Claude Code) Claude Code refactored the auth module"
+    );
+  });
+
+  it("marks the agent unattributed when no human resolves", () => {
+    expect(attributeFactText("AIOS Team Brain shipped the importer", "AIOS Team Brain", [])).toBe(
+      "(unattributed AI agent: AIOS Team Brain) AIOS Team Brain shipped the importer"
+    );
+  });
+
+  it("leaves a fact whose subject is an ordinary human untouched", () => {
+    expect(attributeFactText("Chetan shipped the Linear importer", "Chetan", ["Chetan Nandakumar"])).toBe(
+      "Chetan shipped the Linear importer"
+    );
+  });
+});
+
+describe("attributedFactTexts", () => {
+  const epToItem = new Map([
+    ["ep-1", { itemId: "item-aaa" }],
+    ["ep-2", { itemId: "item-bbb" }],
+  ]);
+  const humanByItem = new Map([["item-aaa", "Chetan Nandakumar"]]);
+
+  it("resolves each fact's human via its episodes and only tags AI-agent subjects", () => {
+    const facts = [
+      { fact: "Claude Code refactored the auth module", subject: "Claude Code", episodeUuids: ["ep-1"] },
+      { fact: "John reviewed the RLS change", subject: "John", episodeUuids: ["ep-1"] },
+    ];
+    expect(attributedFactTexts(facts, epToItem, humanByItem)).toEqual([
+      "(Chetan Nandakumar, via Claude Code) Claude Code refactored the auth module",
+      "John reviewed the RLS change",
+    ]);
+  });
+
+  it("tags an AI-agent subject unattributed when its item has no resolvable human", () => {
+    const facts = [{ fact: "Codex opened a PR", subject: "Codex", episodeUuids: ["ep-2"] }];
+    expect(attributedFactTexts(facts, epToItem, humanByItem)).toEqual([
+      "(unattributed AI agent: Codex) Codex opened a PR",
+    ]);
+  });
+
+  it("handles a fact with no resolvable episode/item at all", () => {
+    const facts = [{ fact: "Claude Code did something", subject: "Claude Code", episodeUuids: [] }];
+    expect(attributedFactTexts(facts, epToItem, humanByItem)).toEqual([
+      "(unattributed AI agent: Claude Code) Claude Code did something",
     ]);
   });
 });
