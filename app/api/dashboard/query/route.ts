@@ -5,6 +5,7 @@ import { adminClient } from "@/lib/db/admin";
 import { getSessionUser } from "@/lib/auth/session";
 import { rateLimit } from "@/lib/api/rate-limit";
 import { errorResponse } from "@/lib/api/schemas";
+import { formatSseFrame } from "@/lib/api/sse";
 import { retrieve } from "@/lib/query/retrieve";
 import { streamAnswer } from "@/lib/query/claude";
 import { pickTimezone, DEFAULT_TIMEZONE } from "@/lib/query/timezone";
@@ -36,7 +37,7 @@ function syncResponse(db: ReturnType<typeof adminClient>, teamId: string, member
   const stream = new ReadableStream({
     async start(controller) {
       const send = (event: string, data: unknown) =>
-        controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+        controller.enqueue(encoder.encode(formatSseFrame(event, data)));
       try {
         send("delta", { text: "🔄 Scraping connectors (Slack · Plane · Linear · GitHub)…\n\n" });
         const r = await runManualSync(teamId);
@@ -197,7 +198,7 @@ export async function POST(req: NextRequest) {
   const stream = new ReadableStream({
     async start(controller) {
       const send = (event: string, data: unknown) =>
-        controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+        controller.enqueue(encoder.encode(formatSseFrame(event, data)));
 
       // Tell the client which thread this turn belongs to (a new conversation returns its fresh id).
       if (conversationId) send("conversation", { id: conversationId });
