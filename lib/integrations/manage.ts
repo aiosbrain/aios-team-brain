@@ -182,7 +182,15 @@ export async function getProviderKey(
     .eq("status", "enabled")
     .limit(1)
     .maybeSingle();
-  if (error) throw new Error(`load provider key failed: ${error.message}`);
+  if (error) {
+    // A not-yet-migrated DB may lack the `integrations` table entirely. Treat a
+    // missing table the same as "no key configured" so callers fall back to the
+    // process env (see the doc comment above) instead of 500-ing the query path.
+    if (/(relation|table).*does not exist|no such table/i.test(error.message)) {
+      return null;
+    }
+    throw new Error(`load provider key failed: ${error.message}`);
+  }
   const blob = (data as { secret_ciphertext: string | null } | null)?.secret_ciphertext;
   return blob ? decryptSecret(blob) : null;
 }
