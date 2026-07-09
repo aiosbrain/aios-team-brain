@@ -12,48 +12,66 @@
  */
 import { readFileSync, existsSync, readdirSync } from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { Client } from "pg";
 import { assertServiceIdentity } from "./service-guard.mjs";
 
-async function main() {
+export function shouldUseSsl(databaseUrl, env = process.env) {
+  return (
+    /\bsslmode=require\b/.test(databaseUrl) ||
+    env.PGSSL === "require" ||
+    env.PGSSLMODE === "require"
+  );
+}
+
+export async function loadSchema({
+  cwd = process.cwd(),
+  databaseUrl = process.env.DATABASE_URL,
+  env = process.env,
+  createClient,
+  readFile = readFileSync,
+  exists = existsSync,
+  readDir = readdirSync,
+  logger = console,
+} = {}) {
   // On Railway, refuse to run if this app landed on a non-AIOS service — the
   // 2026-06-27 vector: this preDeployCommand ran against Kula's DATABASE_URL and
-  // injected our schema into Kula's prod DB. Abort BEFORE reading DATABASE_URL.
+  // injected our schema into Kula's prod DB. Abort BEFORE reading DATABASE_URL or
+  // opening any database connection.
   assertServiceIdentity("load the AIOS schema");
 
-  const url = process.env.DATABASE_URL;
-  if (!url) throw new Error("DATABASE_URL is required");
+  if (!databaseUrl) throw new Error("DATABASE_URL is required");
 
-  const pgDir = path.join(process.cwd(), "postgres");
-  const sql = readFileSync(path.join(pgDir, "schema.sql"), "utf8");
-  const useSsl =
-    /\bsslmode=require\b/.test(url) ||
-    process.env.PGSSL === "require" ||
-    process.env.PGSSLMODE === "require";
+  const pgDir = path.join(cwd, "postgres");
+  const sql = readFile(path.join(pgDir, "schema.sql"), "utf8");
+  const useSsl = shouldUseSsl(databaseUrl, env);
 
-  const client = new Client({
-    connectionString: url,
+  const makeClient = createClient ?? ((config) => new Client(config));
+  const client = makeClient({
+    connectionString: databaseUrl,
     ssl: useSsl ? { rejectUnauthorized: false } : undefined,
   });
   await client.connect();
   try {
     await client.query(sql);
-    console.log("✓ postgres/schema.sql loaded");
+    logger.log("✓ postgres/schema.sql loaded");
 
     const migDir = path.join(pgDir, "migrations");
-    const files = existsSync(migDir)
-      ? readdirSync(migDir).filter((f) => f.endsWith(".sql")).sort()
+    const files = exists(migDir)
+      ? readDir(migDir).filter((f) => f.endsWith(".sql")).sort()
       : [];
     for (const f of files) {
-      await client.query(readFileSync(path.join(migDir, f), "utf8"));
-      console.log(`✓ postgres/migrations/${f} applied`);
+      await client.query(readFile(path.join(migDir, f), "utf8"));
+      logger.log(`✓ postgres/migrations/${f} applied`);
     }
   } finally {
     await client.end();
   }
 }
 
-main().catch((err) => {
-  console.error("schema load failed:", err instanceof Error ? err.message : err);
-  process.exit(1);
-});
+if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
+  loadSchema().catch((err) => {
+    console.error("schema load failed:", err instanceof Error ? err.message : err);
+    process.exit(1);
+  });
+}
