@@ -1,7 +1,7 @@
 # AIOS Team Brain
 
 Mission control for agentic teamwork. Contributor repos (built on
-[Agentic Team Ops](https://github.com/aiosbrain/aios-workspace)) sync
+[AIOS Workspace](https://github.com/aiosbrain/aios-workspace)) sync
 tier-tagged content here via the `aios` CLI; the dashboard surfaces tasks,
 projects, decisions, deliverables, transcripts, and a grounded natural-language
 query over the team's shared memory.

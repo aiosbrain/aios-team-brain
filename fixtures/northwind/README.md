@@ -1,6 +1,6 @@
 # Sample Engagement — Northwind Robotics (synthetic)
 
-A fully synthetic engagement used to demonstrate and test the Agentic Team Ops
+A fully synthetic engagement used to demonstrate and test the AIOS
 harnesses. **Northwind Robotics and everyone in it are fictional.** The data is
 seeded with deliberate issues so the harnesses have something real to find.
 

@@ -43,6 +43,6 @@ export async function requireTeamAdmin(
 ): Promise<{ teamId: string; memberId: string } | null> {
   const user = await getSessionUser();
   if (!user) return null;
-  const supabase = await serverClient();
-  return resolveIntegrationsAdmin(supabase, teamSlug, user.id);
+  const db = await serverClient();
+  return resolveIntegrationsAdmin(db, teamSlug, user.id);
 }
