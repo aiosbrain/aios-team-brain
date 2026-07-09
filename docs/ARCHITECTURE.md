@@ -211,7 +211,7 @@ flowchart LR
   EVT --> LINKS[("task_pm_links")]
   LINKS --> PMS["lib/pm-sync provider adapter"]
   PMS --> LINEAR["Linear completed workflow state (primary)"]
-  PMS --> PLANE["Plane completed state (legacy adapter)"]
+  PMS --> PLANE["Plane completed state (supported adapter)"]
   EVT --> UNRES["unresolved work_events for admin reconciliation"]
 ```
 
@@ -335,9 +335,11 @@ and their npm entries (`plane:backlog` / `linear:backlog` / `plane:views` / `pm:
 **deleted** (brain-api v1.2 Phase 3). The board is created/updated only via `lib/pm-sync`.
 
 **PM tool decision (resolved).** The Plane-vs-Linear bake-off (backlog epic W2.4) is settled —
-**Linear is the chosen PM tool**, and `teams.primary_pm_provider` is set to `linear`. The Plane
-adapter (`lib/pm-sync/plane.ts`) remains in code so the runtime projection path stays
-provider-neutral, but Plane is no longer used and the Plane seed/mirror scripts are gone.
+**Linear is AIOS's default PM tool**, and this team's `teams.primary_pm_provider` is set to
+`linear`. **Plane is not retired — it remains a fully supported provider:** the adapter
+(`lib/pm-sync/plane.ts`), the inbound ingestion runner (`runPlaneIngestion`), and the admin
+Primary-PM-tool selector all stay live for teams that prefer Plane. AIOS itself just runs Linear;
+only the internal Plane seed/mirror dev scripts were removed.
 
 ### Action layer (Organ 4) — policy-gated execution
 
