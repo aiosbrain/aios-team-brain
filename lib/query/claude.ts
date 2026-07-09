@@ -53,8 +53,20 @@ function partsInZone(now: Date, timeZone: string): { date: string; time: string;
     date: `${p.year}-${p.month}-${p.day}`,
     time: `${p.hour}:${p.minute}`,
     weekday: p.weekday ?? "",
-    offset: (p.timeZoneName ?? "GMT+00:00").replace("GMT", "UTC"),
+    offset: normalizeOffset(p.timeZoneName ?? "GMT+00:00"),
   };
+}
+
+/**
+ * Normalize an ICU `longOffset` string to a deterministic "UTC±HH:MM" form. Some ICU builds render
+ * UTC's longOffset as bare "GMT" instead of "GMT+00:00" (both are valid CLDR renderings) — left
+ * unhandled, that yields "UTC" instead of "UTC+00:00" after the GMT→UTC replace, which is
+ * inconsistent across Node/ICU builds even for the same input instant/timezone. Normalize the
+ * offsetless case explicitly so output doesn't depend on the local ICU data.
+ */
+function normalizeOffset(raw: string): string {
+  const withUtc = raw.replace("GMT", "UTC");
+  return withUtc === "UTC" ? "UTC+00:00" : withUtc;
 }
 
 /**
