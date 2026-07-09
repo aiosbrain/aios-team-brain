@@ -2,8 +2,8 @@
 
 > **Status:** Wave 1 (`F3`–`F5`, `W1.1`–`W1.4`) below has shipped and merged; the prompts are kept
 > as a worked template for how to structure a parallel-agent handoff. PM tracking has moved from
-> Plane to **Linear** (Plane is retired — see `docs/ARCHITECTURE.md` "PM tool decision (resolved)");
-> the tracking instructions below reflect that. Wave 2 (`W2.*`) was **superseded 2026-06-29** by the
+> Plane to **Linear** (Plane remains a supported provider, just not AIOS's default — see
+> `docs/ARCHITECTURE.md` "PM tool decision (resolved)"); the tracking instructions below reflect that. Wave 2 (`W2.*`) was **superseded 2026-06-29** by the
 > V1.0 Operator Loop roadmap — see the note under "Parallelization waves".
 
 Each prompt below is **self-contained**: copy one verbatim into a **fresh Claude Code session**.
@@ -29,8 +29,9 @@ projection path) — that's the workflow we're testing.
   `npm run test:datamechanics:local`, or (b) give an agent its own DB:
   `docker compose -f compose.test.yml -p <epic> up -d` on a different port. Data-mechanics tests seed
   random team ids, so they don't collide once the schema is loaded — only the reset step is destructive.
-- **Linear** is the canonical PM tool (Plane is retired). Track work via the brain-tasks CLI
-  (brain→Linear projection) — do not use the Plane MCP.
+- **Linear** is AIOS's default PM tool (Plane remains a supported provider, just not AIOS's
+  default). Track **AIOS's own** work via the brain-tasks CLI (brain→Linear projection) — do not use
+  the Plane MCP for AIOS-internal tracking.
 - Some `F3` scaffolding (encrypted-secret storage in `lib/integrations/manage.ts`) may already exist on
   `main` — **read main first and reconcile**, don't blindly recreate.
 
