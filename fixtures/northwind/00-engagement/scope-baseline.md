@@ -8,7 +8,7 @@ created: 2026-03-02
 # Scope Baseline — Northwind Robotics
 
 > **Synthetic example.** Northwind Robotics is a fictional company. All names, data,
-> and decisions in this engagement are invented to exercise the Agentic Team Ops
+> and decisions in this engagement are invented to exercise the AIOS
 > harnesses. Any resemblance to a real engagement is coincidental.
 
 AI transformation engagement, Sprint 1 ("Foundations"). The contracted scope for the
