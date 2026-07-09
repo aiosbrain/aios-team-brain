@@ -91,10 +91,10 @@ export default async function TeamLayout({
     <div className="flex min-h-dvh flex-1 bg-surface-raised">
       <aside className="frosted sticky top-0 flex h-dvh w-60 shrink-0 flex-col border-r border-border-subtle px-4 py-6">
         <div className="mb-8 px-3">
-          <p className="font-display text-[11px] font-semibold uppercase tracking-[0.18em] text-gradient-prism">
+          <p className="font-display text-[11px] uppercase tracking-[0.18em] text-gradient-prism">
             Team Brain
           </p>
-          <h2 className="mt-1 truncate font-display text-lg font-semibold text-ink" title={team.name}>
+          <h2 className="mt-1 truncate font-display text-lg text-ink" title={team.name}>
             {team.name}
           </h2>
         </div>

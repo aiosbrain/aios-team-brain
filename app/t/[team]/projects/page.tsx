@@ -57,7 +57,7 @@ export default async function ProjectsPage({ params }: { params: Promise<{ team:
               className="prism-card prism-card-hover flex flex-col gap-3 px-5 py-5"
             >
               <div>
-                <h2 className="font-display text-lg font-semibold text-ink">{p.name || p.slug}</h2>
+                <h2 className="font-display text-lg text-ink">{p.name || p.slug}</h2>
                 <p className="font-mono text-xs text-ink-tertiary">{p.slug}</p>
               </div>
               <div className="mt-auto flex items-center gap-4 text-xs text-ink-secondary">

@@ -8,7 +8,7 @@ export function AskBrain({ teamSlug, teamName }: { teamSlug: string; teamName: s
   return (
     <section className="flex flex-col gap-2">
       <div className="flex items-center justify-between">
-        <h2 className="flex items-center gap-2 font-display text-lg font-semibold text-ink">
+        <h2 className="flex items-center gap-2 font-display text-lg text-ink">
           <Sparkles className="size-4 text-violet" /> Ask {teamName}&apos;s brain
         </h2>
         <Link
