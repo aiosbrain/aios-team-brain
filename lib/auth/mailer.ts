@@ -84,6 +84,20 @@ async function deliver(to: string, subject: string, body: { text: string; html?:
   return false;
 }
 
+/**
+ * Ops/admin alert email (e.g. "semantic search degraded"). Plain-text, best-effort — never throws,
+ * returns whether a provider actually delivered it (false when none is configured). Not a secret, so
+ * it's fine that no provider = a logged drop.
+ */
+export async function sendOpsAlert(to: string, subject: string, text: string): Promise<boolean> {
+  return deliver(to, subject, { text });
+}
+
+/** Whether an email provider is configured at all (so callers can skip work when nothing can send). */
+export function mailerConfigured(): boolean {
+  return Boolean(process.env.RESEND_API_KEY || process.env.SMTP_URL);
+}
+
 /** Magic-link sign-in email (login flow). Never throws. */
 export async function sendMagicLink(email: string, link: string): Promise<void> {
   await deliver(email, "Your AIOS Team Brain sign-in link", {

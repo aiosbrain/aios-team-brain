@@ -38,6 +38,10 @@ export function startIngestScheduler(): void {
     // degraded stack shows on Admin → Integrations instead of silently indexing nothing.
     {
       const startedAt = Date.now();
+      const { lastDenseRunFailed, alertDenseDegraded, alertDenseRecovered } = await import("@/lib/query/retrieval-alert");
+      // Capture the leg's state BEFORE this tick so we can email admins only on the EDGE (ok→degraded
+      // or degraded→ok), not once per tick during a sustained outage.
+      const priorFailed = await lastDenseRunFailed(db).catch(() => false);
       try {
         const { indexPendingItems } = await import("@/lib/query/dense-index");
         const d = await indexPendingItems();
@@ -53,6 +57,7 @@ export function startIngestScheduler(): void {
             meta: { indexed: d.indexed, failed: d.failed, chunks: d.chunks },
             startedAt,
           });
+          await alertDenseDegraded(db, priorFailed, { failed: d.failed, scanned: d.scanned, errorSample: d.errorSample });
         } else if (d.indexed > 0) {
           await recordIngestRun(db, {
             source: "dense",
@@ -62,11 +67,13 @@ export function startIngestScheduler(): void {
             meta: { indexed: d.indexed, chunks: d.chunks },
             startedAt,
           });
+          await alertDenseRecovered(db, priorFailed, d.indexed);
         }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         console.error("[ingest] dense index tick failed:", msg);
         await recordIngestRun(db, { source: "dense", trigger: "scheduler", ok: false, errors: [msg], startedAt });
+        await alertDenseDegraded(db, priorFailed, { failed: 0, scanned: 0, errorSample: msg });
       }
     }
   };
