@@ -292,16 +292,26 @@ button (`projectBoardAction`, admin-gated + audited) on the pm-sync page trigger
 the work-events done path calls `projectTask` (creating the link/item if missing). `moveToDone`
 remains as a thin state-only delegate. Assignee projection is deferred.
 
-**Inbound divergence detection (brain-api v1.2 Phase 5, surface-only).** The reconcile pass
+**Inbound divergence detection (brain-api v1.2 Phase 5).** The reconcile pass
 (`lib/pm-sync/reconcile.ts: reconcileProviderState`) reads the primary tool's CURRENT workflow
 state for every linked task (adapter `fetchSeenStates` — read-only), records it on
 `task_pm_links.provider_seen_status`, and surfaces any item whose state has drifted from the brain's
-`last_projected_status`. It is **SURFACE-ONLY (brain wins)**: it never mutates the provider and never
-changes brain `tasks.status` — the only write is `provider_seen_status`, and only when it changed
-(so a second pass does zero writes — idempotent). The admin **"Check for divergence"** button
+`last_projected_status`. On its own it never mutates the provider and never changes brain
+`tasks.status` — the only write is `provider_seen_status`, and only when it changed (so a second pass
+does zero writes — idempotent). The admin **"Check for divergence"** button
 (`reconcileDivergenceAction`, admin-gated + audited) runs it; the PM-sync page renders the divergence
-list read-only from stored state (`isDiverged`). Conflict policy is fixed at brain-wins: drift is
-shown for a human to pull, never silently applied. Two-way write-back remains out of scope.
+list read-only from stored state (`isDiverged`).
+
+**Inbound apply — status write-back (brain-api v1.4, AIO-145).** `lib/pm-sync/inbound.ts` turns
+detected divergence into an actual write: `applyStatusTx()` atomically updates `tasks.status` in
+Postgres when Linear's seen state disagrees with `last_projected_status`, using a
+**"pm-wins-if-brain-unchanged"** conflict policy — the provider's state only wins if the brain row
+hasn't been edited since the last projection; otherwise the brain's status stands and gets
+re-projected outward instead. Every other field (title/body/priority/labels) is still
+surface-only/brain-wins. This is **opt-in per team** (`config.inboundApply` on the Linear
+integration, default off, toggled in Admin) and runs automatically after each ingestion cycle via
+the scheduler (`lib/ingest/scheduler.ts`), plus on manual sync (`lib/ingest/manual-sync.ts`). Full
+two-way write-back for fields beyond status, and PM-triggered agent actions, remain out of scope.
 
 **Inbound Plane import (Plane → brain, in-app runner).** The _opposite_ direction from the
 projection engine: `lib/ingest/sources/plane.ts` + `plane-normalize.ts` pull a Plane project's
@@ -498,18 +508,25 @@ guard enforces it, it's named.
 - **Append-only audit.** `audit_log` has a trigger that blocks UPDATE/DELETE.
 - **Durable jobs are single-writer + at-least-once.** Only `lib/jobs/store` writes `social_jobs`; a job is claimed by a conditional `UPDATE … WHERE status='queued'` (exactly one worker wins it), and a handler may run more than once (crash after side effect, before `done`) — so **handlers must be idempotent**. Failures never throw out of the runner: they requeue with exponential backoff or dead-letter, surfaced on `social_jobs.last_error`. Claim safety today rests on the poller's in-process single-flight guard (one instance); the documented multi-instance upgrade is `FOR UPDATE SKIP LOCKED`. *Guards:* `test/guards/single-writer-social-jobs.test.ts` + the `social-jobs` data-mechanics tier test.
 - **Social content can't out-publish its evidence (§5).** `lib/social/store.createOpportunity` enforces the evidence→tier-leak invariant: an opportunity's `access` may be at most as public as its most-restrictive cited `items` row — an `external` opportunity citing any `team` (or unresolved) item is rejected with `TierLeakError`. Tier then propagates opportunity→plan→variant in the store (the caller never sets a child's tier). No RLS backstop. *Guards:* `test/social-tier.test.ts` (pure rule) + the `social-tier-leak` data-mechanics tier test.
-- **The brain is the source of truth; the PM board is a one-way projection.** The `tasks` table is
-  canonical (v1.2: hierarchy + `body`). The brain projects task create/update/state into the single
-  `teams.primary_pm_provider` board (Plane/Linear) — never the reverse in v1. Projection fires both
-  **manually** (admin "Project board now") and **reactively** (v1.2 Phase 2): task UI writes
-  (`create`/`move`/`updateTaskAction`) and changed-row pushes (`POST /api/v1/items`) schedule it via
-  `after()` — bounded to the rows whose projected fields changed, run after the response, and never
-  failing the user action (errors → `task_pm_links.last_error` only; `projection_fingerprint` skips
-  redundant writes). A merged-work event still marks the matching task done first; provider failures
-  are surfaced in Admin → PM sync, never rolling the task back. Inbound PM→brain divergence is
-  **detected and surfaced** (Phase 5, `reconcileProviderState`): drift between the tool's state and
-  `last_projected_status` is recorded on `provider_seen_status` and shown on the PM-sync page —
-  surface-only, brain wins, never written back. Two-way write-back remains out of scope.
+- **The brain is the source of truth for task content; status can now sync both ways.** The `tasks`
+  table is canonical (v1.2: hierarchy + `body`). The brain projects task create/update/state into the
+  single `teams.primary_pm_provider` board (Plane/Linear). Projection fires both **manually** (admin
+  "Project board now") and **reactively** (v1.2 Phase 2): task UI writes (`create`/`move`/
+  `updateTaskAction`) and changed-row pushes (`POST /api/v1/items`) schedule it via `after()` —
+  bounded to the rows whose projected fields changed, run after the response, and never failing the
+  user action (errors → `task_pm_links.last_error` only; `projection_fingerprint` skips redundant
+  writes). A merged-work event still marks the matching task done first; provider failures are
+  surfaced in Admin → PM sync, never rolling the task back. Inbound PM→brain divergence is
+  **detected** (Phase 5, `reconcileProviderState`): drift between the tool's state and
+  `last_projected_status` is recorded on `provider_seen_status` and shown on the PM-sync page.
+  **Since brain-api v1.4 (AIO-145, `lib/pm-sync/inbound.ts`), that divergence can also be applied
+  back into the brain**, not just surfaced: `status` writes back from Linear using a
+  "pm-wins-if-brain-unchanged" policy (Linear only wins if the brain row hasn't been edited since the
+  last projection — otherwise brain wins and re-projects). Every other field (title/body/labels/
+  priority) stays brain-wins/surface-only. This is opt-in per team via `config.inboundApply` on the
+  Linear integration (default off, toggled in Admin), and runs after each ingestion cycle via the
+  scheduler. Full two-way write-back for fields beyond status, and PM-triggered agent actions, remain
+  out of scope.
   (Rows removed from a push are diff-deleted in `tasks` but **not** deleted from the PM board in
   Phase 2 — PM deletion-on-diff is a later phase.)
 - **`key_hash` is column-revoked** from client roles; API secrets are sha256-at-rest, shown once.
