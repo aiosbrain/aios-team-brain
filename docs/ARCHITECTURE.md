@@ -448,6 +448,11 @@ guard enforces it, it's named.
 - **`key_hash` is column-revoked** from client roles; API secrets are sha256-at-rest, shown once.
 - **Migration replay.** 14-digit timestamp prefixes, unique, lexical == chronological.
   *Guards:* `test/guards/migrations-numbering.test.ts` + `npm run db:test:up` (migrates from zero).
+- **timestamptz/date columns are exposed as strings, never Date objects.** node-postgres parses
+  `timestamptz`/`timestamp`/`date` into JavaScript `Date` objects by default, but the application
+  types them all as `string`. The type parsers set in `lib/db/pg/pool.ts` (OIDs 1082/1114/1184)
+  are the single normalization point; every PgQuery consumer gets the raw wire-format string.
+  *Guard:* `test/datamechanics/timestamptz-string.datamechanics.test.ts` (real PG).
 
 ## Changing X? read this
 
