@@ -8,6 +8,8 @@ import { GithubReposPanel } from "@/components/admin/github-repos-panel";
 import { getCodebaseFreshness } from "@/lib/metrics/codebases";
 import { listRecentIngestRuns } from "@/lib/ingest/runs";
 import { IngestRunsPanel } from "@/components/admin/ingest-runs-panel";
+import { getRetrievalHealth } from "@/lib/query/retrieval-health";
+import { RetrievalHealthCard } from "@/components/admin/retrieval-health-card";
 
 export const metadata: Metadata = { title: "Integrations" };
 
@@ -42,12 +44,13 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ t
     : { data: null };
 
   const db = adminClient();
-  const [integrations, ingestRuns, freshness] = await Promise.all([
+  const [integrations, ingestRuns, freshness, retrievalHealth] = await Promise.all([
     listIntegrations(db, team.id, { role: me?.role as string | undefined }) as Promise<IntegrationRow[]>,
     listRecentIngestRuns(db, team.id, 30),
     // Already-scanned repos (from codebase scans) → offered as one-click link suggestions. Read
     // through the tier-gated codebases choke point (CLAUDE.md §5), never the table directly.
     getCodebaseFreshness(db, team.id, (me?.tier as "team" | "external") ?? "external"),
+    getRetrievalHealth(team.id),
   ]);
   const githubIntegration = integrations.find((i) => i.type === "github") ?? null;
   const scannedRepos = Array.from(
@@ -64,6 +67,7 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ t
           integrations to run ingestion. Secrets are stored encrypted and never shown again.
         </p>
       </div>
+      <RetrievalHealthCard health={retrievalHealth} />
       <GithubReposPanel
         teamSlug={teamSlug}
         integration={githubIntegration}

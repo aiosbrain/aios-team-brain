@@ -33,13 +33,41 @@ export function startIngestScheduler(): void {
     await runInbound(db);
     await runImport(db, "github", runGithubIngestion);
     // Incremental dense (semantic) indexing of newly-synced items. No-op unless dense retrieval is
-    // configured (EMBEDDINGS_URL + pgvector schema); best-effort — never fails the tick.
-    try {
-      const { indexPendingItems } = await import("@/lib/query/dense-index");
-      const d = await indexPendingItems();
-      if (d.indexed) console.info(`[ingest] dense: embedded ${d.indexed} items (${d.chunks} chunks)`);
-    } catch (err) {
-      console.error("[ingest] dense index tick failed:", err instanceof Error ? err.message : err);
+    // configured (EMBEDDINGS_URL + pgvector schema); best-effort — never fails the tick. A batch where
+    // items were SCANNED but all FAILED (e.g. embeddings quota/outage) records an ERROR run so the
+    // degraded stack shows on Admin → Integrations instead of silently indexing nothing.
+    {
+      const startedAt = Date.now();
+      try {
+        const { indexPendingItems } = await import("@/lib/query/dense-index");
+        const d = await indexPendingItems();
+        if (d.indexed) console.info(`[ingest] dense: embedded ${d.indexed} items (${d.chunks} chunks)`);
+        if (d.failed > 0) {
+          console.error(`[ingest] dense: ${d.failed}/${d.scanned} items failed to embed — ${d.errorSample ?? "unknown error"}`);
+          await recordIngestRun(db, {
+            source: "dense",
+            trigger: "scheduler",
+            ok: false,
+            created: d.indexed,
+            errors: [`${d.failed} of ${d.scanned} items failed to embed: ${d.errorSample ?? "unknown error"}`],
+            meta: { indexed: d.indexed, failed: d.failed, chunks: d.chunks },
+            startedAt,
+          });
+        } else if (d.indexed > 0) {
+          await recordIngestRun(db, {
+            source: "dense",
+            trigger: "scheduler",
+            ok: true,
+            created: d.indexed,
+            meta: { indexed: d.indexed, chunks: d.chunks },
+            startedAt,
+          });
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error("[ingest] dense index tick failed:", msg);
+        await recordIngestRun(db, { source: "dense", trigger: "scheduler", ok: false, errors: [msg], startedAt });
+      }
     }
   };
 

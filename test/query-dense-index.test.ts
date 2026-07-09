@@ -26,6 +26,6 @@ describe("dense indexing when unconfigured", () => {
 
   it("indexPendingItems() is a clean no-op (no DB access) when dense retrieval is off", async () => {
     const r = await indexPendingItems();
-    expect(r).toEqual({ scanned: 0, indexed: 0, chunks: 0, skipped: true });
+    expect(r).toEqual({ scanned: 0, indexed: 0, chunks: 0, skipped: true, failed: 0 });
   });
 });

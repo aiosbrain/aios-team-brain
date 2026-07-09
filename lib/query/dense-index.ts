@@ -97,6 +97,8 @@ export interface BatchIndexResult {
   indexed: number;
   chunks: number;
   skipped: boolean; // true = dense retrieval off (whole batch was a no-op)
+  failed: number; // items that errored (e.g. embeddings quota/outage) — surfaced, not swallowed
+  errorSample?: string; // first error message, for the health/alert surface
 }
 
 /**
@@ -106,7 +108,7 @@ export interface BatchIndexResult {
  * transient embeddings error) is skipped so the rest of the batch still indexes.
  */
 export async function indexPendingItems(limit = 100, apiKey?: string | null): Promise<BatchIndexResult> {
-  if (!(await denseIndexAvailable())) return { scanned: 0, indexed: 0, chunks: 0, skipped: true };
+  if (!(await denseIndexAvailable())) return { scanned: 0, indexed: 0, chunks: 0, skipped: true, failed: 0 };
   const pending = await runSql<{
     id: string;
     team_id: string;
@@ -125,6 +127,8 @@ export async function indexPendingItems(limit = 100, apiKey?: string | null): Pr
   );
   let indexed = 0;
   let chunks = 0;
+  let failed = 0;
+  let errorSample: string | undefined;
   const keyByTeam = new Map<string, string | null>(); // resolve each team's embedding key once
   for (const it of pending.rows) {
     try {
@@ -143,9 +147,13 @@ export async function indexPendingItems(limit = 100, apiKey?: string | null): Pr
         indexed++;
         chunks += r.chunks;
       }
-    } catch {
-      // transient (e.g. embeddings) error on one item — skip, continue the batch
+    } catch (err) {
+      // An embeddings error (quota/outage/auth) on one item — skip it, continue the batch, but COUNT
+      // it and keep the first message so the caller can surface a degraded stack instead of the old
+      // silent "indexed: 0". A whole-batch failure (every item errored) is how a provider outage looks.
+      failed++;
+      if (!errorSample) errorSample = err instanceof Error ? err.message : String(err);
     }
   }
-  return { scanned: pending.rows.length, indexed, chunks, skipped: false };
+  return { scanned: pending.rows.length, indexed, chunks, skipped: false, failed, errorSample };
 }
