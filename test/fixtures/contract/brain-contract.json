@@ -78,5 +78,10 @@
       }
     ]
   },
-  "contentHash": "94bc343a4c57d39ad2fbbd00d0a2cebe57c3356fb67d81361fac99de91006726"
+  "provisioningTools": [
+    "linear",
+    "slack",
+    "github"
+  ],
+  "contentHash": "bbed14ced6a77e7a0fd5b44aa148082e138b59b1e617395bd3e99aea992be6e5"
 }

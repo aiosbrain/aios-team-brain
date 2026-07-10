@@ -119,6 +119,30 @@ Two principals, one tier model:
       (the UI success card + the members-table retry badge; the API `provisioning[]` array). The
       REST route is idempotent on (team_id, email) — an existing non-disabled member re-issues access
       + re-provisions (`created:false`), a disabled member is a hard 422.
+
+    **Adding a provisioning tool** (say, `notion`) — not every integration gets one: only services
+    where "invite this person" is meaningful (a per-key AI provider or a data connector like
+    granola doesn't qualify). The checklist, in order:
+
+    1. `lib/provisioning/types.ts` — add the tool to the `ProvisioningTool` union. From here the
+       compiler forces step 2–3 (`ADAPTERS` is `Record<ProvisioningTool, ProvisioningAdapter>`).
+    2. `lib/provisioning/<tool>.ts` — the adapter: `isConfigured` + `invite`, **non-throwing**;
+       map the service's "already a member/invited" to `skipped` and permission errors to a
+       `failed` with an actionable detail.
+    3. `lib/provisioning/run.ts` — register it in `ADAPTERS` + `ALL_TOOLS`. The invite-form
+       checkbox, results card, members-table retry badge, upserts, and audit all light up from the
+       registry with no further wiring.
+    4. `lib/api/schemas.ts` — TWO spots: `PROVISIONING_TOOLS` (the invite request-schema enum) and
+       the tool's integration-type config allowlist (its invite-config keys).
+    5. Settings — `lib/provisioning/settings.ts` + the Member-onboarding panel: its config fields.
+    6. ⚠️ **Check constraints need a migration**: `member_provisioning.tool` (and, for a brand-new
+       integration type, `integrations.type`) are check-constrained and the tables already exist in
+       prod — widen via `postgres/migrations/` AND mirror in `schema.sql` (see §schema rules).
+    7. **Cross-repo, guard-enforced**: regenerate `brain-contract.json`'s `provisioningTools` (+
+       contentHash) in `aios-workspace/docs/contract/`, re-vendor the copy here, add a revision
+       bullet to `docs/brain-api.md`, and extend the `aios member` CLI's `TOOLS` set. The
+       conformance guards (`test/guards/contract-conformance.test.ts` here; the mirror in
+       aios-workspace) fail whichever side is missing the tool, so none of this relies on memory.
   - **Email+password sign-in (always available — audit M1/M2b).** Members sign in with the
     password an admin set (or one they chose on first login — see welcome screen below) and can
     change it anytime (`/t/:team/account`). `POST /api/auth/login` verifies against the scrypt hash
