@@ -12,6 +12,8 @@ import { isPasswordStrongEnough, randomPassword, MIN_PASSWORD_LENGTH } from "@/l
 import { audit } from "@/lib/api/audit";
 import { updateMemberRole, deleteMember, updateMemberManager, type UpdateManagerResult } from "@/lib/admin/members";
 import { syncMemberActor } from "@/lib/graph/company-actors";
+import { runProvisioning } from "@/lib/provisioning/run";
+import type { ProvisioningResult, ProvisioningTool } from "@/lib/provisioning/types";
 
 // Providers whose identity is a stable user id in member_identities (GitHub uses its own login flow).
 const PROVIDERS = new Set(["slack", "linear", "plane"]);
@@ -318,6 +320,47 @@ export async function removeMember(
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "could not remove member" };
   }
+}
+
+/**
+ * Re-run the provisioning cascade for ONE tool for a member (admins only) — the retry behind a
+ * `failed` badge on the members table. Looks up the member row on THIS team (so a raw memberId can't
+ * reach across teams), rebuilds the `ProvisioningMember` shape, and runs the single-writer
+ * `runProvisioning` for just that tool. `runProvisioning` never throws; it upserts the member's row
+ * for that tool in place, so the badge reflects the fresh outcome after `revalidatePath`.
+ */
+export async function retryProvisioning(
+  teamSlug: string,
+  memberId: string,
+  tool: ProvisioningTool
+): Promise<{ ok: boolean; error?: string; result?: ProvisioningResult }> {
+  const ctx = await requireAdmin(teamSlug);
+  if (!ctx) return { ok: false, error: "admins only" };
+
+  const db = adminClient();
+  const { data: member } = await db
+    .from("members")
+    .select("id, email, display_name, role, tier")
+    .eq("id", memberId)
+    .eq("team_id", ctx.teamId)
+    .maybeSingle();
+  if (!member) return { ok: false, error: "member not found on this team" };
+
+  const m = member as {
+    id: string;
+    email: string;
+    display_name: string;
+    role: "admin" | "lead" | "member";
+    tier: "team" | "external";
+  };
+  const [result] = await runProvisioning(
+    db,
+    ctx.teamId,
+    { id: m.id, email: m.email, displayName: m.display_name, role: m.role, tier: m.tier },
+    [tool]
+  );
+  revalidatePath(`/t/${teamSlug}/admin/members`);
+  return { ok: true, result };
 }
 
 /** Remove an email alias from a member (admins only). */
