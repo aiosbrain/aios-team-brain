@@ -8,55 +8,74 @@ Format per item: **Status · Why deferred · When to revisit · How to do it**.
 
 ---
 
-## Active plan — navigation cleanup + Learning-page fixes (2026-07-10)
+## Navigation cleanup + Learning-page fixes — SHIPPED 2026-07-10
 
-Batch of product changes requested 2026-07-10. Sequenced as: (A) nav change → one commit/PR, then
-(B) two Learning-page fixes → one commit/PR. Items marked ✅ are done, ⏳ in progress, ⬜ not started.
+- ✅ **Lean primary nav** (#213) — Tasks, Maturity, Decisions removed from the left nav; the empty
+  "Work" group dropped. Nav is now Home / Codebases / Learning / Query / Settings. Routes still
+  resolve by direct URL (`/tasks`, `/maturity`, `/decisions`) — only the nav entry was cut.
+- ✅ **Data moved under Admin → Data** (#213) — the ingested-data channel browser is now admin-gated;
+  `/library` index redirects to `/admin/data`; `/library/[id]` detail + `/library/skills` unchanged.
+- ✅ **Arc cache persisted + serve-stale-while-revalidate** (#217) — `arc_cache` table; `getArcs`
+  reads in-memory → Postgres (fresh → return; stale → return stale + fire-and-forget recompute,
+  in-flight-deduped; cold → compute inline). SWR chosen over a timer-driven global refresh.
+- ✅ **Universal fact attribution** (#217) — `attributedFactTexts` now attributes every fact that has
+  a resolvable human (fixes the nameless "Context-Management Enhancements" / "Deterministic Checklist
+  Evaluator" arcs), keeping the `(Name, via Agent)` form for agent subjects.
 
-### A. Navigation cleanup (one PR)
-- ✅ **Remove "Tasks" from the left nav.** Route `/tasks` still resolves (direct URL); only the nav
-  entry was cut. `app/t/[team]/layout.tsx`.
-- ✅ **Remove "Maturity" from the left nav.** Route `/maturity` still resolves; nav entry cut.
-- ⏳ **Remove "Decisions" from the left nav + page.** Team confirmed it's empty and unused. Cut the
-  nav entry now. (Full backend teardown — table, ingest writer, `visibleDecisions` choke-point,
-  actions, tests — is a separate deferred item below; nav removal is the product-visible change.)
-- ⏳ **Move "Data" from the primary nav under Admin.** Data (`/library` index — the channel browser)
-  is a verification/debug view, not a daily surface. Move it to an **Admin → Data** tab
-  (`app/t/[team]/admin/data`), which makes it **admin-gated** (was all-tiers). `/library/[id]` item
-  detail and `/library/skills` stay put (linked from arc evidence, query citations — must not break);
-  `/library` index redirects to `/admin/data`. Parametrize `ChannelRail` base path.
+## Deferred cleanups — KEEP THE CODE for now (decision 2026-07-10)
 
-### B. Learning-page fixes (one PR)
-- ⬜ **Fix 1 — persist the arc cache + serve-stale-while-revalidate.** Today `getArcs` caches in
-  memory for 10 min, keyed by team+tier — lost on every deploy, not shared across instances, and the
-  first request after expiry blocks on the LLM. Add an `arc_cache` Postgres table
-  `(team_id, group_key, arcs jsonb, computed_at)`; `getArcs` reads it first (fresh → return; stale →
-  return stale immediately + fire-and-forget recompute with in-flight dedupe; cold → compute inline).
-  `recomputeArcs` writes back. **Chose SWR over a global timer-driven refresh** — a scheduler would
-  fire LLM calls for every team on a timer even when nobody's looking (cost multiplier + needs each
-  team's provider keys in the background); SWR only recomputes teams actually being viewed and still
-  gives warm reads. New table → `schema.sql` only (no migration; `create table if not exists`) + the
-  `<!-- drift:tables -->` block in `docs/ARCHITECTURE.md`.
-- ⬜ **Fix 2 — attribute *every* fact with its human, not just AI-agent-subject facts.** Today
-  `attributedFactTexts` prefixes a fact only when its `subject` is a recognized AI-agent name — so
-  arcs like "Context-Management System Enhancements" / "Deterministic Checklist Evaluator" (whose
-  facts have technical/component subjects) reach synthesis with no human, and render with no person's
-  name. The human IS resolvable (`items.member_id`) — surface it universally: prefix every fact that
-  has a resolvable human with `(Name)`, keeping the `(Name, via Agent)` form when the subject is an
-  agent. Mild redundancy when the subject already IS that human is an acceptable cost vs. unattributed
-  arcs. Pure change in `lib/graph/arc-attribution.ts` + tests.
+The nav-hidden surfaces still have live backends. **Decision: leave the code in place** (it's inert
+from the product's POV now that the nav entries are gone) and revisit teardown later. Recorded here so
+it isn't forgotten, not scheduled.
 
-### Deferred out of this batch (not blocking A/B)
-- ⬜ **Full Decisions backend teardown.** Nav removal (above) hides it; full removal deletes the
-  `decisions` table, `lib/ingest` decision-row writer, `app/actions/decisions.ts`, `visibleDecisions`
-  choke-point, `components/decisions-table` + `decisions/*`, the `/decisions` route, the drift-guard
-  table block, and the decisions tests. Larger surgical change with schema/drift implications — do it
-  as its own PR once the nav removal has settled and nobody reports missing it.
-- ⬜ **Delete (vs. hide) the Tasks & Maturity routes.** Currently only unlinked from nav; routes still
-  resolve. Decide whether to delete the pages/loaders outright. Kept for now in case they're wanted
-  back.
-- ⬜ **Flatten the "Work" nav group.** After removing Tasks + Decisions, "Work" contains nothing (or
-  only future items). Either drop the group wrapper or repopulate it.
+- ⬜ **Full Decisions backend teardown.** Nav entry is gone; the backend remains. A future teardown
+  would delete the `decisions` table, the `lib/ingest` decision-row writer, `app/actions/decisions.ts`,
+  the `visibleDecisions` choke-point, `components/decisions-table` + `decisions/*`, the `/decisions`
+  route, the drift-guard table block, and the decisions tests. Larger surgical change with schema/drift
+  implications — own PR, only once we're sure nobody wants Decisions back.
+- ⬜ **Delete (vs. keep) the Tasks & Maturity routes.** Currently just unlinked from nav; the pages,
+  loaders (`lib/metrics/maturity`, the tasks board), and their data still exist and resolve by URL.
+  Keep for now — decide delete-vs-keep later; no action unless the routes are confirmed dead.
+
+## Arc-cache proactive warming (timer-driven) — deferred follow-up
+
+**Status:** Deferred (2026-07-10). SWR (demand-driven refresh, #217) covers the common case.
+
+**What:** A scheduled job that proactively recomputes each active team's arcs on an interval so even a
+team's *first* view of the day is warm (SWR only warms a team once someone has viewed it). **Why
+deferred:** it fires LLM calls for teams nobody is looking at (cost multiplier) and needs each team's
+provider keys available in the background. **When to revisit:** if first-view latency on the Learning
+page becomes a real complaint, or an org wants a nightly org-wide warm. **How:** piggyback the
+`lib/ingest/scheduler` tick; enumerate teams with a recent `arc_cache` row (proxy for "actively
+viewed") and refresh only those, using the team's stored provider keys.
+
+## Social Brain v1 — narrative arcs → social posts (product direction 2026-07-10)
+
+**Status:** Spec'd, not started. Builds on the existing foundation: M0 durable jobs/outbox (#215),
+M1 Brand Brain voice/knowledge/governance config (#218), M2 content domain model + tier isolation
+(#219 — `social_opportunities`, `content_plans`, `content_variants`, `content_status` enum).
+
+**The simple v1 (deliberately minimal — keep it small first):**
+1. **Source = narrative arcs.** The discovery step reads the team's Layer-3 narrative arcs
+   (`lib/graph/arcs.getArcs`) and selects some as **candidate stories** worth posting. Arcs are
+   already synthesized, evidence-backed, and human-attributed — so this reuses existing intelligence
+   instead of building a separate discovery engine. (Maps an arc → a `social_opportunity`.)
+2. **Channels = text socials only.** LinkedIn and Twitter/X. No video/carousel/thread orchestration
+   in v1 — a single text post per channel, shaped by the Brand Brain voice config (M1).
+3. **Images.** Each post can generate **one relevant image** to accompany the text (image-gen
+   provider TBD — wire behind a provider seam like the LLM/reranker seams, so it's swappable).
+4. **Human approval before anything leaves.** Reuse the existing `content_status` `awaiting_approval`
+   state + the approvals surface — nothing auto-publishes (mirrors the "promote, never auto-publish"
+   philosophy the Radar already follows).
+
+**Open product questions before building the publish leg:**
+- Which arc-selection signal picks "post-worthy" arcs (confidence? recency? a human toggle per arc)?
+- LinkedIn/Twitter posting = real API integration (OAuth per team) or draft-to-clipboard for v1?
+- Image generation provider + whether images are on by default or opt-in per post.
+
+**First build slice (once the above are answered):** arc → `social_opportunity` selection + a
+`content_plan`/`content_variant` per channel with LLM-drafted text (Brand voice) landing in
+`awaiting_approval`. Publish + image-gen as follow-on slices.
 
 ---
 
