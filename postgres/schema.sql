@@ -47,6 +47,9 @@ do $$ begin
   create type action_status as enum
     ('requested', 'denied', 'pending_approval', 'running', 'succeeded', 'failed');
 exception when duplicate_object then null; end $$;
+do $$ begin
+  create type social_job_status as enum ('queued', 'running', 'done', 'dead');
+exception when duplicate_object then null; end $$;
 
 -- ── auth (local) ─────────────────────────────────────────────────────────────
 -- Local auth tables (a session is a signed cookie; see lib/auth). Magic-link
@@ -943,3 +946,31 @@ create table if not exists ingest_runs (
 );
 create index if not exists ingest_runs_team_source_idx on ingest_runs (team_id, source, finished_at desc);
 create index if not exists ingest_runs_finished_idx on ingest_runs (finished_at desc);
+
+-- ── Social Brain durable job/outbox (M0) ─────────────────────────────────────
+-- The one durable async primitive: work that survives a redeploy and retries on failure
+-- (media renders, provider polling, scheduled publishing, publish/analytics retries). The
+-- in-process poller (lib/jobs/scheduler) claims due rows, runs the handler registered for the
+-- `kind`, and on failure requeues with exponential backoff until `max_attempts` → 'dead'.
+-- `run_after` doubles as the scheduled-publish time. Single writer: lib/jobs/store.ts. No RLS
+-- — team scoping is app-code. Claim is a conditional UPDATE under the poller's single-flight
+-- guard (one instance today); the documented multi-instance upgrade is FOR UPDATE SKIP LOCKED.
+create table if not exists social_jobs (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  kind text not null,                         -- 'generate_image' | 'poll_render' | 'publish' | 'collect_analytics' | …
+  payload jsonb not null default '{}',        -- kind-specific input (no secrets — those stay in integrations)
+  status social_job_status not null default 'queued',
+  attempts integer not null default 0,        -- times a worker has started this job
+  max_attempts integer not null default 5,    -- after this many failed attempts → 'dead'
+  run_after timestamptz not null default now(), -- earliest eligible run time (scheduling + backoff)
+  locked_at timestamptz,                       -- when the current worker claimed it (null unless running)
+  last_error text,                             -- most recent failure message (surfaced, never thrown)
+  dedup_key text,                              -- optional idempotency key; unique per team when set
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+create index if not exists social_jobs_due_idx on social_jobs (status, run_after);
+create index if not exists social_jobs_team_idx on social_jobs (team_id, created_at desc);
+create unique index if not exists social_jobs_dedup_idx
+  on social_jobs (team_id, dedup_key) where dedup_key is not null;
