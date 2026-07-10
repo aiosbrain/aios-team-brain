@@ -17,6 +17,7 @@ import {
   ensureGithubIntegration,
   githubReposAndToken,
 } from "@/lib/integrations/github-link";
+import { saveProvisioningSettings as saveProvisioningSettings_ } from "@/lib/provisioning/settings";
 import { validateGithubToken, checkRepoAccess, type RepoAccess } from "@/lib/integrations/github-validate";
 import { RepoFormatError } from "@/lib/integrations/github-repos";
 import { IntegrationConfigError, type IntegrationType } from "@/lib/api/schemas";
@@ -315,6 +316,35 @@ export async function projectToGraphNow(
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "projection failed" };
   }
+}
+
+/**
+ * Save the Member-onboarding (provisioning) invite hints (admins only). Delegates the merge-and-write
+ * to the single-writer lib helper; only the non-secret provisioning keys are touched.
+ */
+export async function saveProvisioningSettings(
+  teamSlug: string,
+  values: { linearTeamIds: string; linearRole: string; slackInviteLink: string; githubOrg: string }
+): Promise<{ ok: boolean; error?: string }> {
+  const ctx = await requireAdmin(teamSlug);
+  if (!ctx) return { ok: false, error: "admins only" };
+  try {
+    await saveProvisioningSettings_(
+      adminClient(),
+      { teamId: ctx.teamId, memberId: ctx.memberId },
+      {
+        linearTeamIds: toList(values.linearTeamIds),
+        linearRole: values.linearRole.trim(),
+        slackInviteLink: values.slackInviteLink,
+        githubOrg: values.githubOrg,
+      }
+    );
+  } catch (e) {
+    if (e instanceof IntegrationConfigError) return { ok: false, error: e.message };
+    return { ok: false, error: e instanceof Error ? e.message : "could not save settings" };
+  }
+  revalidatePath(`/t/${teamSlug}/admin/integrations`);
+  return { ok: true };
 }
 
 export async function removeIntegration(
