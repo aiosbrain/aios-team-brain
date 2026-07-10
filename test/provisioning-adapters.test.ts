@@ -63,6 +63,18 @@ describe("linear provisioning adapter", () => {
     expect(res.detail).toMatch(/already/i);
   });
 
+  it('maps Linear\'s live duplicate-invite wording ("Existing invite.") to skipped', async () => {
+    // Exact message observed against the real Linear API in the 2026-07-10 prod E2E —
+    // it does NOT contain "already", which a plain /already/i heuristic requires.
+    const { fetchImpl } = linearFetch({ errors: [{ message: "Linear GraphQL failed: Existing invite." }] });
+    const db = fakeIntegrationsDb([{ type: "linear", secret: "lin_key", config: {} }]);
+
+    const res = await linearAdapter.invite(db, "team-1", member(), fetchImpl);
+
+    expect(res.status).toBe("skipped");
+    expect(res.detail).toMatch(/existing invite/i);
+  });
+
   it("maps any other GraphQL error to failed with the message", async () => {
     const { fetchImpl } = linearFetch({ errors: [{ message: "Rate limited" }] });
     const db = fakeIntegrationsDb([{ type: "linear", secret: "lin_key", config: {} }]);

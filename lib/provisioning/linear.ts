@@ -59,7 +59,9 @@ export const linearAdapter: ProvisioningAdapter = {
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       // An already-member / already-invited error is not a failure — the person is reachable.
-      if (/already/i.test(msg)) return { tool: "linear", status: "skipped", detail: msg };
+      // Linear's live wording for a duplicate pending invite is exactly "Existing invite."
+      // (observed in the 2026-07-10 prod E2E), which a plain /already/i heuristic misses.
+      if (/already|existing invite/i.test(msg)) return { tool: "linear", status: "skipped", detail: msg };
       return { tool: "linear", status: "failed", detail: msg };
     }
   },
