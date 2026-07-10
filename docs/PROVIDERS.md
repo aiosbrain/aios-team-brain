@@ -69,6 +69,14 @@ Set `ANTHROPIC_API_KEY` and leave `LLM_BASE_URL` unset. Queries use
 ANTHROPIC_API_KEY=sk-ant-...
 ```
 
+### OpenRouter (dashboard, no env)
+Set it per-team in **Admin → Integrations → OpenRouter**: paste an OpenRouter key (validated on
+save, stored encrypted) and a model slug (e.g. `anthropic/claude-sonnet-4`, `openai/gpt-4o-mini`).
+Once connected it **takes precedence** over both `LLM_BASE_URL` and the Anthropic default — a team
+can switch models without touching env. OpenRouter is an OpenAI-compatible gateway, so it reuses the
+same streaming path. Backend precedence is a single function: `lib/query/llm-backend.selectLlmBackend`
+(**OpenRouter → `LLM_BASE_URL` → Anthropic**), shared by the answer stream and the title generator.
+
 ### Local
 Set `LLM_BASE_URL` to any OpenAI-compatible `/v1` endpoint. `ANTHROPIC_API_KEY`
 is then ignored, and reported cost is `$0`.

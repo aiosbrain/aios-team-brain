@@ -16,7 +16,7 @@ import {
   appendMessage,
 } from "@/lib/chat/store";
 import { generateAndSetTitle } from "@/lib/chat/title";
-import { getProviderKey } from "@/lib/integrations/manage";
+import { getProviderKey, getOpenrouterSettings } from "@/lib/integrations/manage";
 import { isSyncCommand, runManualSync } from "@/lib/ingest/manual-sync";
 import { audit } from "@/lib/api/audit";
 
@@ -189,10 +189,18 @@ export async function POST(req: NextRequest) {
   const ctx = await retrieve(db, team.id, memberTier, question, project);
 
   // Per-team provider keys (encrypted in integrations); null → env fallback in streamAnswer.
-  const [anthropicKey, openaiKey] = await Promise.all([
+  // OpenRouter (key + model) takes precedence in selectLlmBackend when configured.
+  const [anthropicKey, openaiKey, openrouter] = await Promise.all([
     getProviderKey(db, team.id, "anthropic"),
     getProviderKey(db, team.id, "openai"),
+    getOpenrouterSettings(db, team.id),
   ]);
+  const keys = {
+    anthropicKey,
+    openaiKey,
+    openrouterKey: openrouter.key,
+    openrouterModel: openrouter.model,
+  };
 
   const encoder = new TextEncoder();
   const stream = new ReadableStream({
@@ -205,7 +213,7 @@ export async function POST(req: NextRequest) {
 
       let answer = "";
       try {
-        for await (const chunk of streamAnswer(ctx, question, { anthropicKey, openaiKey }, priorTurns, caller, timeZone)) {
+        for await (const chunk of streamAnswer(ctx, question, keys, priorTurns, caller, timeZone)) {
           if (chunk.type === "delta") {
             answer += chunk.text;
             send("delta", { text: chunk.text });
@@ -234,7 +242,7 @@ export async function POST(req: NextRequest) {
               });
               // On a new thread, replace the derived title with a short LLM-written one (bounded).
               if (createdNew) {
-                await generateAndSetTitle(db, owner, conversationId, question, answer, { anthropicKey, openaiKey });
+                await generateAndSetTitle(db, owner, conversationId, question, answer, keys);
               }
             }
 

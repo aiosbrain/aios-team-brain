@@ -5,6 +5,7 @@ import { getSessionUser } from "@/lib/auth/session";
 import { listIntegrations } from "@/lib/integrations/read";
 import { IntegrationsManager, type IntegrationRow } from "@/components/admin/integrations-manager";
 import { GithubReposPanel } from "@/components/admin/github-repos-panel";
+import { OpenrouterPanel } from "@/components/admin/openrouter-panel";
 import { MemberOnboardingPanel } from "@/components/admin/member-onboarding-panel";
 import { getCodebaseFreshness } from "@/lib/metrics/codebases";
 import { listRecentIngestRuns } from "@/lib/ingest/runs";
@@ -54,6 +55,7 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ t
     getRetrievalHealth(team.id),
   ]);
   const githubIntegration = integrations.find((i) => i.type === "github") ?? null;
+  const openrouter = integrations.find((i) => i.type === "openrouter") ?? null;
   const scannedRepos = Array.from(
     new Set(freshness.map((c) => c.full_name).filter((n): n is string => !!n))
   );
@@ -86,6 +88,11 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ t
         teamSlug={teamSlug}
         integration={githubIntegration}
         scannedRepos={scannedRepos}
+      />
+      <OpenrouterPanel
+        teamSlug={teamSlug}
+        connected={!!openrouter?.hasSecret}
+        model={(openrouter?.config.model as string | undefined) ?? null}
       />
       <IntegrationsManager
         teamSlug={teamSlug}

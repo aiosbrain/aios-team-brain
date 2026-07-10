@@ -20,6 +20,7 @@ import {
 import { saveProvisioningSettings as saveProvisioningSettings_ } from "@/lib/provisioning/settings";
 import { validateGithubToken, checkRepoAccess, type RepoAccess } from "@/lib/integrations/github-validate";
 import { RepoFormatError } from "@/lib/integrations/github-repos";
+import { validateOpenrouterKey, saveOpenrouterSettings } from "@/lib/integrations/openrouter";
 import { IntegrationConfigError, type IntegrationType } from "@/lib/api/schemas";
 import { buildConfig, toList } from "@/lib/integrations/build-config";
 import { audit } from "@/lib/api/audit";
@@ -257,6 +258,34 @@ export async function checkGithubAccess(
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "access check failed" };
   }
+}
+
+/**
+ * Save OpenRouter settings (admins only) — the model slug and/or the API key. When a key is given it
+ * is VALIDATED against OpenRouter (`GET /api/v1/key`) before storing (encrypted), so a bad key is
+ * rejected up front. Once set, the query LLM routes through OpenRouter (see selectLlmBackend). Only
+ * the provided fields change — save a model without re-entering the key, or vice versa.
+ */
+export async function saveOpenrouter(
+  teamSlug: string,
+  input: { key?: string; model?: string }
+): Promise<{ ok: boolean; label?: string; error?: string }> {
+  const ctx = await requireAdmin(teamSlug);
+  if (!ctx) return { ok: false, error: "admins only" };
+  let label: string | undefined;
+  if (input.key && input.key.trim()) {
+    const v = await validateOpenrouterKey(input.key);
+    if (!v.ok) return { ok: false, error: v.error ?? "key validation failed" };
+    label = v.label;
+  }
+  try {
+    await saveOpenrouterSettings(adminClient(), { teamId: ctx.teamId, memberId: ctx.memberId }, input);
+  } catch (e) {
+    if (e instanceof IntegrationConfigError) return { ok: false, error: e.message };
+    return { ok: false, error: e instanceof Error ? e.message : "could not save OpenRouter settings" };
+  }
+  revalidatePath(`/t/${teamSlug}/admin/integrations`);
+  return { ok: true, label };
 }
 
 /**

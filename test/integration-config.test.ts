@@ -122,6 +122,14 @@ describe("INTEGRATION_TYPES", () => {
     for (const t of PROVIDER_INTEGRATION_TYPES) {
       expect(INTEGRATION_TYPES).toContain(t);
     }
-    expect([...PROVIDER_INTEGRATION_TYPES].sort()).toEqual(["anthropic", "google", "openai"]);
+    expect([...PROVIDER_INTEGRATION_TYPES].sort()).toEqual(["anthropic", "google", "openai", "openrouter"]);
+  });
+
+  it("openrouter carries a NON-secret model config (rejects unknown keys, allows model)", async () => {
+    const { validateIntegrationConfig } = await import("@/lib/api/schemas");
+    expect(validateIntegrationConfig("openrouter", { model: "openai/gpt-4o-mini" })).toEqual({
+      model: "openai/gpt-4o-mini",
+    });
+    expect(() => validateIntegrationConfig("openrouter", { apiKey: "sk-or-x" })).toThrow(); // secret rejected
   });
 });
