@@ -72,6 +72,7 @@ function summarizeConfig(type: IntegrationType, config: Record<string, unknown>)
       config.teamId ? `team ${config.teamId}` : null,
       config.projectId ? `project ${config.projectId}` : null,
       config.doneStateName ? `done ${config.doneStateName}` : null,
+      config.inboundApply === true ? "inbound ✓" : null,
     ].filter(Boolean).join(" · ") || "—";
   }
   if (type === "plane") {
@@ -126,11 +127,18 @@ export function IntegrationsManager({
       }
     });
   }
-  const [form, setForm] = useState<{ type: IntegrationType; name: string; selection: string; secret: string }>({
+  const [form, setForm] = useState<{
+    type: IntegrationType;
+    name: string;
+    selection: string;
+    secret: string;
+    inboundApply: boolean;
+  }>({
     type: "slack",
     name: "",
     selection: "",
     secret: "",
+    inboundApply: false,
   });
 
   function projectToGraph() {
@@ -287,7 +295,8 @@ export function IntegrationsManager({
           e.preventDefault();
           run(async () => {
             const res = await saveIntegration(teamSlug, form);
-            if (res.ok) setForm({ type: form.type, name: "", selection: "", secret: "" });
+            if (res.ok)
+              setForm({ type: form.type, name: "", selection: "", secret: "", inboundApply: false });
             return res;
           });
         }}
@@ -320,6 +329,21 @@ export function IntegrationsManager({
           value={form.selection}
           onChange={(e) => setForm({ ...form, selection: e.target.value })}
         />
+        {form.type === "linear" ? (
+          <label className="flex items-start gap-2 text-xs text-ink-secondary">
+            <input
+              type="checkbox"
+              className="mt-0.5"
+              checked={form.inboundApply}
+              onChange={(e) => setForm({ ...form, inboundApply: e.target.checked })}
+            />
+            <span>
+              Apply inbound Linear changes back to the brain (two-way sync). Off by default — the
+              brain stays the source of truth; enabling lets a status change made directly in Linear
+              flow back. Reversible; re-save with this unchecked to turn it off.
+            </span>
+          </label>
+        ) : null}
         <input
           className="prism-input"
           type="password"

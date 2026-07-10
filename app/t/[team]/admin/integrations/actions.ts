@@ -21,53 +21,21 @@ import { saveProvisioningSettings as saveProvisioningSettings_ } from "@/lib/pro
 import { validateGithubToken, checkRepoAccess, type RepoAccess } from "@/lib/integrations/github-validate";
 import { RepoFormatError } from "@/lib/integrations/github-repos";
 import { IntegrationConfigError, type IntegrationType } from "@/lib/api/schemas";
+import { buildConfig, toList } from "@/lib/integrations/build-config";
 import { audit } from "@/lib/api/audit";
 
 export type PrimaryPmProvider = "plane" | "linear" | null;
 
-function toList(raw: string): string[] {
-  return raw.split(/[\n,]/).map((s) => s.trim()).filter(Boolean);
-}
-
-function toKeyValues(raw: string): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const part of toList(raw)) {
-    const m = part.match(/^([A-Za-z][A-Za-z0-9_-]*)\s*=\s*(.+)$/);
-    if (m) out[m[1]] = m[2].trim();
-  }
-  return out;
-}
-
-/** Map a single "selection" field to the per-type NON-SECRET config shape (validated downstream). */
-function buildConfig(type: IntegrationType, selection: string): Record<string, unknown> {
-  const list = toList(selection);
-  const kv = toKeyValues(selection);
-  switch (type) {
-    case "slack": return { channelIds: list };
-    case "github": return { repos: list };
-    case "granola": return { matchKeywords: list };
-    case "wise": return list[0] ? { profileId: list[0] } : {};
-    case "linear":
-      return Object.keys(kv).length
-        ? { teamId: kv.teamId, projectId: kv.projectId, doneStateName: kv.doneStateName }
-        : list[0] ? { projectId: list[0] } : {};
-    case "plane":
-      return Object.keys(kv).length
-        ? {
-            baseUrl: kv.baseUrl,
-            workspaceSlug: kv.workspaceSlug,
-            projectId: kv.projectId,
-            doneStateName: kv.doneStateName,
-            externalSource: kv.externalSource,
-          }
-        : list[0] ? { projectId: list[0] } : {};
-    default: return {};
-  }
-}
-
 export async function saveIntegration(
   teamSlug: string,
-  form: { type: IntegrationType; name: string; selection: string; secret: string }
+  form: {
+    type: IntegrationType;
+    name: string;
+    selection: string;
+    secret: string;
+    /** Linear only: per-team inbound-apply opt-in (Linear→brain). Default off. */
+    inboundApply?: boolean;
+  }
 ): Promise<{ ok: boolean; error?: string }> {
   const ctx = await requireAdmin(teamSlug);
   if (!ctx) return { ok: false, error: "admins only" };
@@ -78,7 +46,7 @@ export async function saveIntegration(
     const { id } = await upsertIntegration(adminClient(), auth, {
       type: form.type,
       name,
-      config: buildConfig(form.type, form.selection),
+      config: buildConfig(form.type, form.selection, { inboundApply: form.inboundApply }),
       status: "enabled",
     });
     if (form.secret) await setIntegrationSecret(adminClient(), auth, id, form.secret);
