@@ -63,21 +63,32 @@ export default async function UsageAdminPage({
     <div className="flex flex-col gap-6">
       <div className="flex items-center justify-between gap-4">
         <p className="text-sm text-ink-secondary">
-          Team AI spend — brain queries plus external providers (Cursor, Claude) pushed from
-          workstations via <code className="text-xs">aios analyze --push</code>.
+          Team AI spend — brain queries plus external providers (Cursor, Claude)
+          pushed from workstations via{" "}
+          <code className="text-xs">aios analyze --push</code>.
         </p>
         <RangeSelector value={range} />
       </div>
 
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-4">
-        <SummaryCard label="Brain spend" value={`$${costs.totals.cost_usd.toFixed(2)}`} />
+        <SummaryCard
+          label="Brain spend"
+          value={`$${costs.totals.cost_usd.toFixed(2)}`}
+        />
         <SummaryCard
           label="External AI"
           value={`$${external.totals.cost_usd.toFixed(2)}`}
           accent
         />
-        <SummaryCard label="Combined" value={`$${combined.total_usd.toFixed(2)}`} accent />
-        <SummaryCard label="Brain queries" value={costs.totals.queries.toLocaleString("en-US")} />
+        <SummaryCard
+          label="Combined"
+          value={`$${combined.total_usd.toFixed(2)}`}
+          accent
+        />
+        <SummaryCard
+          label="Brain queries"
+          value={costs.totals.queries.toLocaleString("en-US")}
+        />
       </div>
 
       {external.by_provider.length > 0 ? (
@@ -91,7 +102,9 @@ export default async function UsageAdminPage({
                 <p className="text-[11px] uppercase tracking-wider text-ink-tertiary capitalize">
                   {p.provider}
                 </p>
-                <p className="mt-1 text-lg font-semibold text-emerald">${p.cost_usd.toFixed(2)}</p>
+                <p className="mt-1 text-lg font-semibold text-emerald">
+                  ${p.cost_usd.toFixed(2)}
+                </p>
                 <p className="text-xs text-ink-tertiary">{p.events} events</p>
               </div>
             ))}
@@ -104,11 +117,22 @@ export default async function UsageAdminPage({
           External AI trends
         </h2>
         <p className="text-xs text-ink-tertiary">
-          Cursor is authoritative billing; Claude and Codex are token estimates; Opencode is
-          per-message session cost. Estimates can diverge from a provider&apos;s invoice.
+          Cursor is authoritative billing; Claude and Codex are token estimates;
+          Opencode is per-message session cost. Estimates can diverge from a
+          provider&apos;s invoice.
         </p>
+        {series.truncated ? (
+          <p className="text-xs text-amber">
+            Showing the most recent 50,000 records — older days in this window
+            are omitted from the trend charts. Narrow the range for a complete
+            view.
+          </p>
+        ) : null}
         <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-          <SpendByProviderChart data={series.spendByDay} providers={series.providers} />
+          <SpendByProviderChart
+            data={series.spendByDay}
+            providers={series.providers}
+          />
           <TokenTrendChart data={series.tokensByDay} />
           <ProviderShareChart data={external.by_provider} />
           {isAdmin ? <MemberSpendChart rows={external.rows} /> : null}
@@ -134,8 +158,8 @@ export default async function UsageAdminPage({
           Throughput vs. cost
         </h2>
         <p className="text-xs text-ink-tertiary">
-          Brain spend against code throughput — what each AI-assisted commit costs in brain
-          queries.
+          Brain spend against code throughput — what each AI-assisted commit
+          costs in brain queries.
         </p>
         <ThroughputCostTable rows={throughput.rows} />
       </section>
@@ -154,8 +178,12 @@ function SummaryCard({
 }) {
   return (
     <div className="prism-card px-5 py-4">
-      <p className="text-[11px] uppercase tracking-wider text-ink-tertiary">{label}</p>
-      <p className={`mt-1 text-2xl font-semibold ${accent ? "text-emerald" : "text-ink"}`}>
+      <p className="text-[11px] uppercase tracking-wider text-ink-tertiary">
+        {label}
+      </p>
+      <p
+        className={`mt-1 text-2xl font-semibold ${accent ? "text-emerald" : "text-ink"}`}
+      >
         {value}
       </p>
     </div>

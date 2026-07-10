@@ -1,14 +1,21 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { ingestUsageCost } from "@/lib/costs/ingest";
-import { getExternalCosts, getExternalCostSeries } from "@/lib/metrics/external-costs";
+import {
+  getExternalCosts,
+  getExternalCostSeries,
+} from "@/lib/metrics/external-costs";
 import { IngestValidationError } from "@/lib/api/schemas";
 import { db, seedTeam } from "./helpers";
 
 describe("usage_costs ingest + read (W2.1)", () => {
   it("upserts daily provider cost and reads it back team-wide for admin", async () => {
     const seed = await seedTeam();
-    const auth = { teamId: seed.teamId, memberId: seed.memberId, apiKeyId: "test-key" };
+    const auth = {
+      teamId: seed.teamId,
+      memberId: seed.memberId,
+      apiKeyId: "test-key",
+    };
 
     await ingestUsageCost(db(), auth, {
       date: "2026-06-22",
@@ -41,7 +48,10 @@ describe("usage_costs ingest + read (W2.1)", () => {
       memberId: seed.memberId,
     });
     expect(adminView.totals.cost_usd).toBeCloseTo(96.07, 2);
-    expect(adminView.by_provider.map((p) => p.provider).sort()).toEqual(["claude", "cursor"]);
+    expect(adminView.by_provider.map((p) => p.provider).sort()).toEqual([
+      "claude",
+      "cursor",
+    ]);
     expect(adminView.rows[0].providers.length).toBe(2);
 
     const selfView = await getExternalCosts(db(), seed.teamId, "90d", {
@@ -54,7 +64,11 @@ describe("usage_costs ingest + read (W2.1)", () => {
 
   it("idempotent re-push updates the same day row", async () => {
     const seed = await seedTeam();
-    const auth = { teamId: seed.teamId, memberId: seed.memberId, apiKeyId: "test-key" };
+    const auth = {
+      teamId: seed.teamId,
+      memberId: seed.memberId,
+      apiKeyId: "test-key",
+    };
     const payload = {
       date: "2026-06-20",
       provider: "cursor" as const,
@@ -65,7 +79,11 @@ describe("usage_costs ingest + read (W2.1)", () => {
     };
 
     await ingestUsageCost(db(), auth, payload);
-    await ingestUsageCost(db(), auth, { ...payload, cost_usd: 61.5, events: 36 });
+    await ingestUsageCost(db(), auth, {
+      ...payload,
+      cost_usd: 61.5,
+      events: 36,
+    });
 
     const view = await getExternalCosts(db(), seed.teamId, "90d", {
       isAdmin: true,
@@ -106,7 +124,7 @@ describe("usage_costs ingest + read (W2.1)", () => {
         output_tokens: 120,
         cost_usd: 4.0,
         events: 6,
-      }
+      },
     );
     await ingestUsageCost(
       db(),
@@ -121,7 +139,7 @@ describe("usage_costs ingest + read (W2.1)", () => {
         cost_usd: 2.0,
         events: 9,
         meta: { estimated: true },
-      }
+      },
     );
 
     // Admin sees the whole team: both providers, both costs stacked on the one day.
@@ -129,7 +147,8 @@ describe("usage_costs ingest + read (W2.1)", () => {
       isAdmin: true,
       memberId: seed.memberId,
     });
-    expect(admin.providers.sort()).toEqual(["codex", "opencode"]);
+    // Exact order (no sort) — asserts the stable providerRank ordering: codex before opencode.
+    expect(admin.providers).toEqual(["codex", "opencode"]);
     expect(admin.spendByDay.length).toBe(1);
     expect(admin.spendByDay[0].date).toBe("2026-07-09");
     expect(admin.spendByDay[0].opencode).toBeCloseTo(4.0, 2);
@@ -149,7 +168,11 @@ describe("usage_costs ingest + read (W2.1)", () => {
 
   it("rejects an unknown member handle as a client error (→ route 422, not 500)", async () => {
     const seed = await seedTeam();
-    const auth = { teamId: seed.teamId, memberId: seed.memberId, apiKeyId: "test-key" };
+    const auth = {
+      teamId: seed.teamId,
+      memberId: seed.memberId,
+      apiKeyId: "test-key",
+    };
 
     await expect(
       ingestUsageCost(db(), auth, {
@@ -159,7 +182,7 @@ describe("usage_costs ingest + read (W2.1)", () => {
         source: "dashboard-api",
         project: "",
         cost_usd: 1,
-      })
+      }),
     ).rejects.toBeInstanceOf(IngestValidationError);
   });
 });

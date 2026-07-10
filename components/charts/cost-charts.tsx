@@ -13,7 +13,11 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
-import type { ExternalMemberCosts, SpendDayPoint, TokenDayPoint } from "@/lib/metrics/external-costs";
+import type {
+  ExternalMemberCosts,
+  SpendDayPoint,
+  TokenDayPoint,
+} from "@/lib/metrics/external-costs";
 import { AXIS_TICK, GRID_STROKE, PRISM, TOOLTIP_STYLE } from "./palette";
 import { ChartCard } from "./chart-card";
 
@@ -27,9 +31,27 @@ const PROVIDER_COLOR: Record<string, string> = {
   openai: PRISM.cyan,
   other: PRISM.red,
 };
-const CYCLE = [PRISM.violet, PRISM.blue, PRISM.emerald, PRISM.amber, PRISM.cyan, PRISM.fuchsia, PRISM.red];
-function providerColor(provider: string, index: number): string {
-  return PROVIDER_COLOR[provider] ?? CYCLE[index % CYCLE.length];
+const CYCLE = [
+  PRISM.violet,
+  PRISM.blue,
+  PRISM.emerald,
+  PRISM.amber,
+  PRISM.cyan,
+  PRISM.fuchsia,
+  PRISM.red,
+];
+/**
+ * Stable per-provider color. Unknown providers hash their NAME into the cycle
+ * (not their array index) so the same provider gets the same color across the
+ * stacked chart (ordered by rank) and the share doughnut (ordered by cost).
+ */
+function providerColor(provider: string): string {
+  const mapped = PROVIDER_COLOR[provider];
+  if (mapped) return mapped;
+  let h = 0;
+  for (let i = 0; i < provider.length; i++)
+    h = (h * 31 + provider.charCodeAt(i)) | 0;
+  return CYCLE[Math.abs(h) % CYCLE.length];
 }
 
 const usd = (n: number) => `$${n.toFixed(2)}`;
@@ -56,9 +78,18 @@ export function SpendByProviderChart({
       emptyLabel="No provider spend in this window."
     >
       <ResponsiveContainer width="100%" height={240}>
-        <BarChart data={data} margin={{ top: 4, right: 4, left: -12, bottom: 0 }}>
+        <BarChart
+          data={data}
+          margin={{ top: 4, right: 4, left: -12, bottom: 0 }}
+        >
           <CartesianGrid vertical={false} stroke={GRID_STROKE} />
-          <XAxis dataKey="date" tick={AXIS_TICK} tickLine={false} axisLine={false} minTickGap={28} />
+          <XAxis
+            dataKey="date"
+            tick={AXIS_TICK}
+            tickLine={false}
+            axisLine={false}
+            minTickGap={28}
+          />
           <YAxis
             tick={AXIS_TICK}
             tickLine={false}
@@ -66,14 +97,17 @@ export function SpendByProviderChart({
             width={44}
             tickFormatter={(v: number) => `$${compact(v)}`}
           />
-          <Tooltip contentStyle={TOOLTIP_STYLE} formatter={(v) => usd(Number(v))} />
+          <Tooltip
+            contentStyle={TOOLTIP_STYLE}
+            formatter={(v) => usd(Number(v))}
+          />
           <Legend wrapperStyle={{ fontSize: 11 }} />
           {providers.map((p, i) => (
             <Bar
               key={p}
               dataKey={p}
               stackId="spend"
-              fill={providerColor(p, i)}
+              fill={providerColor(p)}
               name={p}
               radius={i === providers.length - 1 ? [3, 3, 0, 0] : undefined}
             />
@@ -84,11 +118,17 @@ export function SpendByProviderChart({
   );
 }
 
-const TOKEN_COLORS = { input: PRISM.blue, output: PRISM.violet, cache_read: PRISM.cyan };
+const TOKEN_COLORS = {
+  input: PRISM.blue,
+  output: PRISM.violet,
+  cache_read: PRISM.cyan,
+};
 
 /** Daily tokens, stacked by kind (input / output / cache-read) across all providers. */
 export function TokenTrendChart({ data }: { data: TokenDayPoint[] }) {
-  const empty = data.every((d) => d.input === 0 && d.output === 0 && d.cache_read === 0);
+  const empty = data.every(
+    (d) => d.input === 0 && d.output === 0 && d.cache_read === 0,
+  );
   return (
     <ChartCard
       title="Daily tokens"
@@ -97,9 +137,18 @@ export function TokenTrendChart({ data }: { data: TokenDayPoint[] }) {
       emptyLabel="No token activity in this window."
     >
       <ResponsiveContainer width="100%" height={240}>
-        <BarChart data={data} margin={{ top: 4, right: 4, left: -4, bottom: 0 }}>
+        <BarChart
+          data={data}
+          margin={{ top: 4, right: 4, left: -4, bottom: 0 }}
+        >
           <CartesianGrid vertical={false} stroke={GRID_STROKE} />
-          <XAxis dataKey="date" tick={AXIS_TICK} tickLine={false} axisLine={false} minTickGap={28} />
+          <XAxis
+            dataKey="date"
+            tick={AXIS_TICK}
+            tickLine={false}
+            axisLine={false}
+            minTickGap={28}
+          />
           <YAxis
             tick={AXIS_TICK}
             tickLine={false}
@@ -112,8 +161,18 @@ export function TokenTrendChart({ data }: { data: TokenDayPoint[] }) {
             formatter={(v) => Number(v).toLocaleString("en-US")}
           />
           <Legend wrapperStyle={{ fontSize: 11 }} />
-          <Bar dataKey="input" stackId="tok" fill={TOKEN_COLORS.input} name="Input" />
-          <Bar dataKey="output" stackId="tok" fill={TOKEN_COLORS.output} name="Output" />
+          <Bar
+            dataKey="input"
+            stackId="tok"
+            fill={TOKEN_COLORS.input}
+            name="Input"
+          />
+          <Bar
+            dataKey="output"
+            stackId="tok"
+            fill={TOKEN_COLORS.output}
+            name="Output"
+          />
           <Bar
             dataKey="cache_read"
             stackId="tok"
@@ -135,7 +194,11 @@ export function ProviderShareChart({
 }) {
   const empty = data.length === 0 || data.every((d) => d.cost_usd === 0);
   return (
-    <ChartCard title="Cost share by provider" empty={empty} emptyLabel="No spend in this window.">
+    <ChartCard
+      title="Cost share by provider"
+      empty={empty}
+      emptyLabel="No spend in this window."
+    >
       <ResponsiveContainer width="100%" height={240}>
         <PieChart>
           <Pie
@@ -146,11 +209,14 @@ export function ProviderShareChart({
             outerRadius={88}
             paddingAngle={2}
           >
-            {data.map((d, i) => (
-              <Cell key={d.provider} fill={providerColor(d.provider, i)} />
+            {data.map((d) => (
+              <Cell key={d.provider} fill={providerColor(d.provider)} />
             ))}
           </Pie>
-          <Tooltip contentStyle={TOOLTIP_STYLE} formatter={(v) => usd(Number(v))} />
+          <Tooltip
+            contentStyle={TOOLTIP_STYLE}
+            formatter={(v) => usd(Number(v))}
+          />
           <Legend wrapperStyle={{ fontSize: 11 }} />
         </PieChart>
       </ResponsiveContainer>
@@ -166,9 +232,21 @@ export function MemberSpendChart({ rows }: { rows: ExternalMemberCosts[] }) {
     .slice(0, 12);
   const empty = data.length === 0;
   return (
-    <ChartCard title="Spend by member" hint="team, top 12" empty={empty} emptyLabel="No attributed spend.">
-      <ResponsiveContainer width="100%" height={Math.max(160, data.length * 30)}>
-        <BarChart data={data} layout="vertical" margin={{ top: 4, right: 12, left: 8, bottom: 0 }}>
+    <ChartCard
+      title="Spend by member"
+      hint="team, top 12"
+      empty={empty}
+      emptyLabel="No attributed spend."
+    >
+      <ResponsiveContainer
+        width="100%"
+        height={Math.max(160, data.length * 30)}
+      >
+        <BarChart
+          data={data}
+          layout="vertical"
+          margin={{ top: 4, right: 12, left: 8, bottom: 0 }}
+        >
           <CartesianGrid horizontal={false} stroke={GRID_STROKE} />
           <XAxis
             type="number"
@@ -177,9 +255,24 @@ export function MemberSpendChart({ rows }: { rows: ExternalMemberCosts[] }) {
             axisLine={false}
             tickFormatter={(v: number) => `$${compact(v)}`}
           />
-          <YAxis type="category" dataKey="name" tick={AXIS_TICK} tickLine={false} axisLine={false} width={120} />
-          <Tooltip contentStyle={TOOLTIP_STYLE} formatter={(v) => usd(Number(v))} />
-          <Bar dataKey="cost_usd" fill={PRISM.violet} radius={[0, 3, 3, 0]} name="Spend" />
+          <YAxis
+            type="category"
+            dataKey="name"
+            tick={AXIS_TICK}
+            tickLine={false}
+            axisLine={false}
+            width={120}
+          />
+          <Tooltip
+            contentStyle={TOOLTIP_STYLE}
+            formatter={(v) => usd(Number(v))}
+          />
+          <Bar
+            dataKey="cost_usd"
+            fill={PRISM.violet}
+            radius={[0, 3, 3, 0]}
+            name="Spend"
+          />
         </BarChart>
       </ResponsiveContainer>
     </ChartCard>
