@@ -224,6 +224,71 @@ export async function addTimeOff(
   return (data as { id: string }).id;
 }
 
+// A resized/compressed avatar (client-side canvas, ~256px) comfortably fits well under this; the
+// cap exists to stop a large or unresized image from bloating a `text` column indefinitely.
+const MAX_AVATAR_DATA_URL_LEN = 400_000;
+const AVATAR_DATA_URL_RE = /^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/]+=*$/;
+
+/**
+ * Set (or clear, with `dataUrl: null`) a member's self-uploaded profile picture. Stored as a
+ * `data:` URL — no object storage in this codebase (self-host-portable, no extra infra); the
+ * caller (client-side canvas) is responsible for resizing/compressing before calling this.
+ */
+export async function setMemberAvatar(
+  admin: DbClient,
+  teamId: string,
+  memberId: string,
+  dataUrl: string | null,
+  opts: { actor?: ProfileActor } = {}
+): Promise<void> {
+  if (dataUrl !== null) {
+    if (dataUrl.length > MAX_AVATAR_DATA_URL_LEN) {
+      throw new Error(`avatar image too large (${dataUrl.length} chars, max ${MAX_AVATAR_DATA_URL_LEN})`);
+    }
+    if (!AVATAR_DATA_URL_RE.test(dataUrl)) {
+      throw new Error("avatar must be a base64 data: URL (image/png, image/jpeg, or image/webp)");
+    }
+  }
+
+  const { error } = await admin.from("member_profiles").upsert(
+    {
+      member_id: memberId,
+      team_id: teamId,
+      avatar_data_url: dataUrl,
+      updated_at: new Date().toISOString(),
+      updated_by: opts.actor?.memberId ?? null,
+    },
+    { onConflict: "member_id" }
+  );
+  if (error) throw new Error(`avatar upsert failed: ${error.message}`);
+
+  await audit(admin, {
+    team_id: teamId,
+    actor_kind: opts.actor?.kind ?? "system",
+    member_id: opts.actor?.memberId ?? null,
+    action: dataUrl ? "profile.avatar_set" : "profile.avatar_removed",
+    target_type: "member",
+    target_id: memberId,
+  });
+}
+
+/**
+ * Read one member's uploaded avatar (or null). Deliberately NOT tier-gated (unlike the rest of
+ * this module's profile fields) — a photo is the same visibility class as the GitHub avatar it
+ * complements, used wherever a person is named across the dashboard. Routing every page's read
+ * through this single-writer file (rather than an inline `.from("member_profiles")`) keeps
+ * `test/guards/member-context-tier-filter` passing, which requires the table read from nowhere
+ * but this module.
+ */
+export async function getMemberAvatar(db: DbClient, memberId: string): Promise<string | null> {
+  const { data } = await db
+    .from("member_profiles")
+    .select("avatar_data_url")
+    .eq("member_id", memberId)
+    .maybeSingle();
+  return (data as { avatar_data_url: string | null } | null)?.avatar_data_url ?? null;
+}
+
 /** Remove a time-off row (team-scoped so an id can't be deleted across teams). */
 export async function removeTimeOff(
   admin: DbClient,

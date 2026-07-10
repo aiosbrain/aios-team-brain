@@ -217,10 +217,17 @@ create table if not exists member_profiles (
   preferred_channels text[] not null default '{}',
   location text not null default '',
   bio text not null default '',
+  -- Self-uploaded profile picture, stored as a data: URL (no object storage in this codebase —
+  -- self-host-portable, no extra infra). Resized/compressed client-side before upload; NULL = no
+  -- manual upload, fall back to members.avatar_url (GitHub) then initials. Written only by
+  -- lib/identity/profile.ts (same single-writer guard as the rest of this table).
+  avatar_data_url text,
   updated_at timestamptz not null default now(),
   updated_by uuid references members(id) on delete set null
 );
 create index if not exists member_profiles_team_idx on member_profiles (team_id);
+-- Additive column for existing deployments (idempotent rollout via `npm run pg:schema`).
+alter table member_profiles add column if not exists avatar_data_url text;
 
 -- Time-off date ranges (PTO / holiday / sick / other). Many rows per member.
 create table if not exists member_time_off (
@@ -517,6 +524,33 @@ create table if not exists decisions (
   unique (team_id, project_id, row_key)
 );
 create index if not exists decisions_team_date_idx on decisions (team_id, decided_at desc);
+
+-- Meeting notes: the rich metadata layer over a transcript. The full text lives as a normal
+-- `items` row (kind='transcript', written through the existing lib/ingest single writer) so it's
+-- searchable/queryable through the existing FTS/retrieve pipeline for free; this table holds what
+-- `items` has no columns for (who submitted it, who attended, an LLM-written summary). Sole writer:
+-- lib/meetings/notes.ts.
+create table if not exists meeting_notes (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  source_item_id uuid not null references items(id) on delete cascade,
+  submitted_by uuid references members(id) on delete set null,
+  title text not null,
+  summary text not null default '',
+  occurred_at date,
+  created_at timestamptz not null default now(),
+  unique (source_item_id)
+);
+create index if not exists meeting_notes_team_idx on meeting_notes (team_id, created_at desc);
+
+-- LLM-matched roster attendees (many-to-many; an unmatched name in the transcript is simply
+-- dropped, never blocks the note from saving).
+create table if not exists meeting_note_attendees (
+  meeting_note_id uuid not null references meeting_notes(id) on delete cascade,
+  member_id uuid not null references members(id) on delete cascade,
+  primary key (meeting_note_id, member_id)
+);
+create index if not exists meeting_note_attendees_member_idx on meeting_note_attendees (member_id);
 
 create table if not exists graph_entities (
   id uuid primary key default gen_random_uuid(),

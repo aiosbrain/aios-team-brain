@@ -74,9 +74,11 @@ export default async function TeamLayout({
   // direct URL, only the nav entry was cut: "Tasks" (/tasks), "Maturity" (/maturity), "Decisions"
   // (/decisions, empty + unused). "Data" moved under Admin → Data (verification/debug view, now
   // admin-gated). The "Work" group is dropped (nothing left in it; Projects stays commented out).
+  // "Meetings" stays a top-level entry — a new, actively-used surface, not part of the trim.
   const items: NavEntry[] = [
     { icon: "home", label: "Home", href: base, exact: true },
     { icon: "codebases", label: "Codebases", href: `${base}/codebases` },
+    { icon: "meetings", label: "Meetings", href: `${base}/meetings` },
     { icon: "learning", label: "Learning", href: `${base}/learning` },
     { icon: "query", label: "Query", href: `${base}/query` },
     { label: "Settings", children: settingsChildren },

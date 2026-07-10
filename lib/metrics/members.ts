@@ -26,6 +26,7 @@ export interface MemberCostRow {
   member_id: string | null;
   member_name: string;
   avatar_url: string | null;
+  avatar_data_url: string | null;
   github_login: string | null;
   queries: number;
   input_tokens: number;
@@ -56,6 +57,7 @@ type MemberMeta = {
   actor_handle: string | null;
   github_login: string | null;
   avatar_url: string | null;
+  avatar_data_url: string | null;
 };
 
 const UNATTRIBUTED = "Unattributed";
@@ -72,7 +74,7 @@ export async function getPerMemberCosts(
 ): Promise<PerMemberCosts> {
   const windowStart = new Date(Date.now() - rangeDays(range) * 86_400_000).toISOString();
 
-  const [logRes, membersRes] = await Promise.all([
+  const [logRes, membersRes, profilesRes] = await Promise.all([
     scopeQueryLog(
       db
         .from("query_log")
@@ -87,16 +89,26 @@ export async function getPerMemberCosts(
       .from("members")
       .select("id, display_name, actor_handle, github_login, avatar_url")
       .eq("team_id", teamId),
+    // Uploaded avatars live on member_profiles (1:1, separate table — the pg adapter's embeds
+    // don't cover this relationship), so it's a sibling query merged in JS.
+    db.from("member_profiles").select("member_id, avatar_data_url").eq("team_id", teamId),
   ]);
 
   const logRows = (logRes.data ?? []) as QueryLogRow[];
+  const avatarDataByMember = new Map(
+    ((profilesRes.data ?? []) as { member_id: string; avatar_data_url: string | null }[]).map((p) => [
+      p.member_id,
+      p.avatar_data_url,
+    ])
+  );
   const members = new Map<string, MemberMeta>();
-  for (const m of (membersRes.data ?? []) as ({ id: string } & MemberMeta)[]) {
+  for (const m of (membersRes.data ?? []) as ({ id: string } & Omit<MemberMeta, "avatar_data_url">)[]) {
     members.set(m.id, {
       display_name: m.display_name,
       actor_handle: m.actor_handle,
       github_login: m.github_login,
       avatar_url: m.avatar_url,
+      avatar_data_url: avatarDataByMember.get(m.id) ?? null,
     });
   }
 
@@ -113,6 +125,7 @@ export async function getPerMemberCosts(
         member_name:
           meta?.display_name ?? meta?.actor_handle ?? (r.member_id ? "Unknown" : UNATTRIBUTED),
         avatar_url: meta?.avatar_url ?? null,
+        avatar_data_url: meta?.avatar_data_url ?? null,
         github_login: meta?.github_login ?? null,
         queries: 0,
         input_tokens: 0,
@@ -148,6 +161,7 @@ export interface ThroughputCostRow {
   member_id: string;
   member_name: string;
   avatar_url: string | null;
+  avatar_data_url: string | null;
   ai_commits: number;
   commits: number;
   cost_usd: number;
@@ -215,6 +229,7 @@ export async function getThroughputVsCost(
         member_id: r.member_id,
         member_name: spend?.member_name ?? "Member",
         avatar_url: spend?.avatar_url ?? null,
+        avatar_data_url: spend?.avatar_data_url ?? null,
         ai_commits: 0,
         commits: 0,
         cost_usd: spend?.cost_usd ?? 0,
@@ -230,14 +245,21 @@ export async function getThroughputVsCost(
   // (e.g. a member with commits but zero brain queries in the window).
   const missing = [...byMember.values()].filter((r) => r.member_name === "Member");
   if (missing.length) {
-    const { data: meta } = await db
-      .from("members")
-      .select("id, display_name, actor_handle, avatar_url")
-      .eq("team_id", teamId)
-      .in(
-        "id",
-        missing.map((r) => r.member_id)
-      );
+    const missingIds = missing.map((r) => r.member_id);
+    const [{ data: meta }, { data: profiles }] = await Promise.all([
+      db
+        .from("members")
+        .select("id, display_name, actor_handle, avatar_url")
+        .eq("team_id", teamId)
+        .in("id", missingIds),
+      db.from("member_profiles").select("member_id, avatar_data_url").in("member_id", missingIds),
+    ]);
+    const avatarDataByMember = new Map(
+      ((profiles ?? []) as { member_id: string; avatar_data_url: string | null }[]).map((p) => [
+        p.member_id,
+        p.avatar_data_url,
+      ])
+    );
     for (const m of (meta ?? []) as {
       id: string;
       display_name: string | null;
@@ -248,6 +270,7 @@ export async function getThroughputVsCost(
       if (row) {
         row.member_name = m.display_name ?? m.actor_handle ?? "Member";
         row.avatar_url = m.avatar_url;
+        row.avatar_data_url = avatarDataByMember.get(m.id) ?? null;
       }
     }
   }

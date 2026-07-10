@@ -5,9 +5,11 @@ import { ArrowLeft } from "lucide-react";
 import { serverClient } from "@/lib/db/server";
 import { currentMember } from "@/lib/auth/guard";
 import { getContributorDetail, type ContributorRef } from "@/lib/metrics/codebases";
+import { getMemberAvatar } from "@/lib/identity/profile";
 import { parseRange } from "@/lib/metrics/range";
 import { RangeSelector } from "@/components/dashboard/range-selector";
 import { CommitHeatmap } from "@/components/codebases/commit-heatmap";
+import { MemberAvatar } from "@/components/people/member-avatar";
 
 export const metadata: Metadata = { title: "Contributor" };
 
@@ -52,6 +54,8 @@ export default async function ContributorPage({
   const aiPct = c.totals.commits ? Math.round((100 * c.totals.ai_commits) / c.totals.commits) : 0;
   const profileHandle = c.github_login ?? c.member_id;
 
+  const avatarDataUrl = c.member_id ? await getMemberAvatar(db, c.member_id) : null;
+
   return (
     <div className="mx-auto flex max-w-5xl flex-col gap-5">
       <div>
@@ -63,14 +67,7 @@ export default async function ContributorPage({
         </Link>
         <div className="mt-2 flex items-start justify-between gap-3">
           <div className="flex items-center gap-3">
-            {c.avatar_url ? (
-              // eslint-disable-next-line @next/next/no-img-element
-              <img src={c.avatar_url} alt="" className="size-12 rounded-full" />
-            ) : (
-              <span className="flex size-12 items-center justify-center rounded-full bg-surface-inset text-lg font-medium text-ink-tertiary">
-                {c.name.slice(0, 1).toUpperCase()}
-              </span>
-            )}
+            <MemberAvatar person={{ displayName: c.name, avatarUrl: c.avatar_url, avatarDataUrl }} size={48} />
             <div>
               <h1 className="font-display text-2xl text-ink">{c.name}</h1>
               <div className="mt-0.5 flex items-center gap-3 text-xs text-ink-tertiary">

@@ -1,5 +1,6 @@
 import Link from "next/link";
 import type { ContributorRow } from "@/lib/metrics/codebases";
+import { MemberAvatar } from "@/components/people/member-avatar";
 
 function pct(ai: number, total: number): number {
   return total === 0 ? 0 : Math.round((100 * ai) / total);
@@ -41,14 +42,14 @@ export function ContributorTable({
               <tr key={r.member_id ?? `unmapped:${r.author_key}`} className="border-b border-border-subtle last:border-0">
                 <td className="px-4 py-3">
                   <span className="flex items-center gap-2">
-                    {r.avatar_url ? (
-                      // eslint-disable-next-line @next/next/no-img-element
-                      <img src={r.avatar_url} alt="" className="size-6 rounded-full" />
-                    ) : (
-                      <span className="flex size-6 items-center justify-center rounded-full bg-surface-inset text-[10px] font-medium text-ink-tertiary">
-                        {(r.member_name ?? r.author_name ?? "?").slice(0, 1).toUpperCase()}
-                      </span>
-                    )}
+                    <MemberAvatar
+                      person={{
+                        displayName: r.member_name ?? r.author_name ?? r.author_key,
+                        avatarUrl: r.avatar_url,
+                        avatarDataUrl: r.avatar_data_url,
+                      }}
+                      size={24}
+                    />
                     {teamSlug && codebaseSlug ? (
                       <Link
                         href={contributorHref(teamSlug, codebaseSlug, r)}
