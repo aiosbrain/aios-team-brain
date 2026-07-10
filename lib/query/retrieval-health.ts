@@ -1,5 +1,6 @@
 import "server-only";
 import { runSql } from "@/lib/db/pg/pool";
+import { graphitiConfigured } from "@/lib/graph/graphiti-client";
 
 /**
  * Retrieval-stack health for the admin dashboard (Phase 1 of the retrieval-observability plan).
@@ -37,16 +38,12 @@ export interface RetrievalHealth {
 const COVERAGE_FLOOR = 0.9; // ≥90% embedded = healthy
 const STALE_MS = 2 * 60 * 60 * 1000; // no embed activity in 2h + incomplete = stalled, not "building"
 
-/** True when GRAPHITI_URL is a usable http(s) URL with a host (prod had a malformed "http://"). */
-export function graphConfigured(url: string | undefined): boolean {
-  if (!url) return false;
-  try {
-    const u = new URL(url);
-    return (u.protocol === "http:" || u.protocol === "https:") && u.hostname.length > 0;
-  } catch {
-    return false;
-  }
-}
+/**
+ * True when GRAPHITI_URL is a usable http(s) URL with a host (prod had a malformed "http://").
+ * Single source of truth with the runtime GraphitiClient, so the health card and the code that
+ * actually calls Graphiti agree on whether the leg is on.
+ */
+export const graphConfigured = graphitiConfigured;
 
 /**
  * Derive the dense-leg state from the raw signals. Pure + unit-tested — the fiddly bit is separating
