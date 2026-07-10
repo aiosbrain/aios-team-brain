@@ -159,8 +159,9 @@ export function startIngestScheduler(): void {
   // scheduler tick runs far more often than this needs to, so it's throttled to once/day —
   // checked via the last recorded 'auth_cleanup' ingest_runs row, the same "read the last
   // recorded run" pattern the dense-index leg uses for its own edge detection
-  // (lib/query/retrieval-alert.lastDenseRunFailed). A quiet pass (nothing to purge, or throttled)
-  // logs and records nothing.
+  // (lib/query/retrieval-alert.lastDenseRunFailed). A throttled pass records nothing; a completed
+  // sweep always records a run (that row IS the throttle bookkeeping) and logs only when it
+  // actually purged something.
   const AUTH_CLEANUP_INTERVAL_MS = 24 * 60 * 60_000;
   async function runAuthCleanup(db: ReturnType<typeof adminClient>): Promise<void> {
     const startedAt = Date.now();
