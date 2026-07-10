@@ -26,6 +26,7 @@ type IntegrationType =
   | "plane"
   | "openai"
   | "anthropic"
+  | "openrouter"
   | "google";
 
 export interface IntegrationRow {
@@ -157,7 +158,10 @@ export function IntegrationsManager({
 
   // Provider keys and GitHub each render in their own dedicated panel; keep them out of this list.
   const sources = integrations.filter(
-    (i) => i.type !== "github" && !(PROVIDER_TYPES as readonly string[]).includes(i.type)
+    (i) =>
+      i.type !== "github" &&
+      i.type !== "openrouter" && // OpenRouter has its own dedicated panel (key + model)
+      !(PROVIDER_TYPES as readonly string[]).includes(i.type)
   );
 
   function setProviderKey(p: ProviderType, existing: IntegrationRow | undefined) {

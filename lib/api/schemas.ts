@@ -299,14 +299,16 @@ export const INTEGRATION_TYPES = [
   "wise",
   "linear",
   "plane",
-  // LLM provider API keys (secret-only; no non-secret config). The key is stored encrypted in
-  // secret_ciphertext, same path as the source connectors above.
+  // LLM provider API keys. The key is stored encrypted in secret_ciphertext, same path as the
+  // source connectors above. openai/anthropic/google are secret-only; openrouter also carries a
+  // NON-secret `model` selection (the OpenAI-compatible gateway needs a model slug).
   "openai",
   "anthropic",
   "google",
+  "openrouter",
 ] as const;
-/** Provider key integration types — secret-only, carry no config selection. */
-export const PROVIDER_INTEGRATION_TYPES = ["openai", "anthropic", "google"] as const;
+/** Provider key integration types — the LLM providers whose key the query path resolves per team. */
+export const PROVIDER_INTEGRATION_TYPES = ["openai", "anthropic", "google", "openrouter"] as const;
 export type ProviderIntegrationType = (typeof PROVIDER_INTEGRATION_TYPES)[number];
 export type IntegrationType = (typeof INTEGRATION_TYPES)[number];
 export const INTEGRATION_STATUSES = ["enabled", "disabled"] as const;
@@ -349,10 +351,12 @@ const integrationConfigSchemas: Record<IntegrationType, z.ZodType> = {
       externalSource: z.string().max(80).optional(),
     })
     .strict(),
-  // Provider key types hold only the encrypted secret — no non-secret config.
+  // Provider key types hold only the encrypted secret — no non-secret config …
   openai: z.object({}).strict(),
   anthropic: z.object({}).strict(),
   google: z.object({}).strict(),
+  // … except OpenRouter, which also stores the chosen model slug (e.g. "openai/gpt-4o-mini").
+  openrouter: z.object({ model: z.string().min(1).max(120).optional() }).strict(),
 };
 
 const SECRET_KEY_RE = /token|secret|api[_-]?key|password|bearer|credential|client[_-]?secret|private[_-]?key/i;

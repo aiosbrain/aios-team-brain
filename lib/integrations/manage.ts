@@ -195,6 +195,36 @@ export async function getProviderKey(
   return blob ? decryptSecret(blob) : null;
 }
 
+/**
+ * Resolve a team's OpenRouter settings — the decrypted key plus the chosen model slug — in one read.
+ * OpenRouter is an OpenAI-compatible gateway, so the query LLM needs both the key AND a model
+ * (`config.model`). Returns nulls when unset/disabled so the caller falls through to the next backend
+ * (LLM_BASE_URL env, then Anthropic). Server-only; the key is decrypted only here, in-process.
+ */
+export async function getOpenrouterSettings(
+  db: DbClient,
+  teamId: string
+): Promise<{ key: string | null; model: string | null }> {
+  const { data, error } = await db
+    .from("integrations")
+    .select("secret_ciphertext, config")
+    .eq("team_id", teamId)
+    .eq("type", "openrouter")
+    .eq("status", "enabled")
+    .limit(1)
+    .maybeSingle();
+  if (error) {
+    if (/(relation|table).*does not exist|no such table/i.test(error.message)) {
+      return { key: null, model: null };
+    }
+    throw new Error(`load openrouter settings failed: ${error.message}`);
+  }
+  const row = data as { secret_ciphertext: string | null; config: Record<string, unknown> | null } | null;
+  const key = row?.secret_ciphertext ? decryptSecret(row.secret_ciphertext) : null;
+  const model = typeof row?.config?.model === "string" ? (row.config.model as string) : null;
+  return { key, model };
+}
+
 /** A team's enabled integration selection — NON-SECRET fields only. */
 export interface IntegrationSelection {
   id: string;

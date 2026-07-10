@@ -811,7 +811,7 @@ create index if not exists usage_costs_member_date_idx
 create table if not exists integrations (
   id uuid primary key default gen_random_uuid(),
   team_id uuid not null references teams(id) on delete cascade,
-  type text not null check (type in ('github','granola','slack','wise','linear','plane','openai','anthropic','google')),
+  type text not null check (type in ('github','granola','slack','wise','linear','plane','openai','anthropic','google','openrouter')),
   name text not null,
   config jsonb not null default '{}',
   secret_ciphertext text,                 -- AES-256-GCM blob (base64); null if no secret set

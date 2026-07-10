@@ -2,6 +2,7 @@ import "server-only";
 import Anthropic from "@anthropic-ai/sdk";
 import type { DbClient } from "@/lib/db/types";
 import type { ProviderKeys } from "@/lib/query/claude";
+import { selectLlmBackend } from "@/lib/query/llm-backend";
 import { setTitle } from "@/lib/chat/store";
 
 /**
@@ -37,15 +38,19 @@ export async function generateTitle(
 ): Promise<string | null> {
   const prompt = `Question: ${question.trim()}\n\nAnswer: ${answer.trim().slice(0, 600)}\n\nTitle:`;
   try {
-    if (LLM_BASE_URL) {
-      const res = await fetch(`${LLM_BASE_URL.replace(/\/$/, "")}/chat/completions`, {
+    // Same backend the answer used (OpenRouter → LLM_BASE_URL → Anthropic), so titles never diverge.
+    const backend = selectLlmBackend({ LLM_BASE_URL, LLM_MODEL }, keys);
+    if (backend.kind !== "anthropic") {
+      const apiKey = backend.apiKey ?? process.env.OPENAI_API_KEY ?? "local";
+      const res = await fetch(`${backend.baseUrl.replace(/\/$/, "")}/chat/completions`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          Authorization: `Bearer ${keys.openaiKey ?? process.env.OPENAI_API_KEY ?? "local"}`,
+          Authorization: `Bearer ${apiKey}`,
+          ...(backend.kind === "openrouter" ? backend.headers : {}),
         },
         body: JSON.stringify({
-          model: LLM_MODEL,
+          model: backend.model,
           max_tokens: 24,
           messages: [
             { role: "system", content: TITLE_SYSTEM },
