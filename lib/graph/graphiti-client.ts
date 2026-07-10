@@ -13,6 +13,23 @@ import "server-only";
  * `fetchImpl`/`baseUrl` are injectable so the client is unit-testable without a live Graphiti.
  */
 
+/**
+ * Is `url` a USABLE Graphiti endpoint? A valid http(s) URL with a host. This is stricter than
+ * "non-empty" on purpose: prod once carried a malformed `GRAPHITI_URL = "http://"`, which the old
+ * `base.length > 0` check treated as configured → every query + scheduler tick fired a doomed HTTP
+ * call and swallowed the error. Shared with the Admin retrieval-health card so the runtime and the
+ * dashboard agree on whether the graph leg is on. Pure — unit-tested.
+ */
+export function graphitiConfigured(url: string | undefined): boolean {
+  if (!url) return false;
+  try {
+    const u = new URL(url);
+    return (u.protocol === "http:" || u.protocol === "https:") && u.hostname.length > 0;
+  } catch {
+    return false;
+  }
+}
+
 export interface GraphEpisode {
   /** The episode text Graphiti extracts entities/relationships from. */
   content: string;
@@ -61,7 +78,7 @@ export class GraphitiClient {
   }
 
   get configured(): boolean {
-    return this.base.length > 0;
+    return graphitiConfigured(this.base);
   }
 
   private async request<T>(method: string, path: string, body?: unknown): Promise<T> {

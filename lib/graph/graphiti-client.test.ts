@@ -21,6 +21,15 @@ describe("GraphitiClient", () => {
     await expect(c.search("q", ["g"])).rejects.toThrow(/not set/);
   });
 
+  it("is NOT configured for a malformed URL — no doomed calls (prod had 'http://')", async () => {
+    // The old `base.length > 0` treated "http://" as configured → every query fired a doomed call.
+    for (const bad of ["http://", "https://", "not a url", "://x"]) {
+      expect(new GraphitiClient({ baseUrl: bad }).configured, bad).toBe(false);
+    }
+    expect(new GraphitiClient({ baseUrl: "http://gx:8000" }).configured).toBe(true);
+    expect(new GraphitiClient({ baseUrl: "http://gx:8000/" }).configured).toBe(true); // trailing slash ok
+  });
+
   it("addEpisodes POSTs mapped episodes to /messages", async () => {
     const calls: Call[] = [];
     const c = new GraphitiClient({ baseUrl: "http://gx:8000", fetchImpl: stubFetch(calls) });
