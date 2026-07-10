@@ -54,6 +54,15 @@ describe("usage_costs ingest + read (W2.1)", () => {
     ]);
     expect(adminView.rows[0].providers.length).toBe(2);
 
+    // Honest split: cursor (dashboard-api) is billed; claude (session-logs) is an estimate.
+    expect(adminView.totals.billed_usd).toBeCloseTo(83.57, 2);
+    expect(adminView.totals.estimated_usd).toBeCloseTo(12.5, 2);
+    const byProv = Object.fromEntries(
+      adminView.by_provider.map((p) => [p.provider, p.estimated]),
+    );
+    expect(byProv.cursor).toBe(false);
+    expect(byProv.claude).toBe(true);
+
     const selfView = await getExternalCosts(db(), seed.teamId, "90d", {
       isAdmin: false,
       memberId: seed.memberId,
@@ -149,6 +158,8 @@ describe("usage_costs ingest + read (W2.1)", () => {
     });
     // Exact order (no sort) — asserts the stable providerRank ordering: codex before opencode.
     expect(admin.providers).toEqual(["codex", "opencode"]);
+    // codex (session-logs) is an estimate; opencode (session-api) is billed.
+    expect(admin.estimatedProviders).toEqual(["codex"]);
     expect(admin.spendByDay.length).toBe(1);
     expect(admin.spendByDay[0].date).toBe("2026-07-09");
     expect(admin.spendByDay[0].opencode).toBeCloseTo(4.0, 2);

@@ -822,6 +822,23 @@ create index if not exists usage_costs_team_date_idx
 create index if not exists usage_costs_member_date_idx
   on usage_costs (member_id, cost_date desc);
 
+-- Flat AI-tool subscriptions (Claude Max/Pro, Cursor, …). One current plan per
+-- member+provider — the real recurring spend, distinct from per-token usage_costs.
+-- Written only by lib/subscriptions/ingest via POST /api/v1/subscriptions (v1.8).
+create table if not exists subscriptions (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  member_id uuid not null references members(id) on delete cascade,
+  provider text not null,
+  plan text not null default '',
+  monthly_usd numeric(10, 2) not null default 0,
+  source text not null default 'unknown',
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  unique (team_id, member_id, provider)
+);
+create index if not exists subscriptions_team_idx on subscriptions (team_id);
+
 -- Integration selections. `config` holds NON-SECRET selection only (repos, channels, project
 -- slugs); the per-type allowlist + secret-key rejection (lib/api/schemas) keep secrets OUT of
 -- config. The connector secret (Slack/GitHub/… token) lives ENCRYPTED in `secret_ciphertext`
