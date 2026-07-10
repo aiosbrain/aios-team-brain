@@ -8,6 +8,58 @@ Format per item: **Status · Why deferred · When to revisit · How to do it**.
 
 ---
 
+## Active plan — navigation cleanup + Learning-page fixes (2026-07-10)
+
+Batch of product changes requested 2026-07-10. Sequenced as: (A) nav change → one commit/PR, then
+(B) two Learning-page fixes → one commit/PR. Items marked ✅ are done, ⏳ in progress, ⬜ not started.
+
+### A. Navigation cleanup (one PR)
+- ✅ **Remove "Tasks" from the left nav.** Route `/tasks` still resolves (direct URL); only the nav
+  entry was cut. `app/t/[team]/layout.tsx`.
+- ✅ **Remove "Maturity" from the left nav.** Route `/maturity` still resolves; nav entry cut.
+- ⏳ **Remove "Decisions" from the left nav + page.** Team confirmed it's empty and unused. Cut the
+  nav entry now. (Full backend teardown — table, ingest writer, `visibleDecisions` choke-point,
+  actions, tests — is a separate deferred item below; nav removal is the product-visible change.)
+- ⏳ **Move "Data" from the primary nav under Admin.** Data (`/library` index — the channel browser)
+  is a verification/debug view, not a daily surface. Move it to an **Admin → Data** tab
+  (`app/t/[team]/admin/data`), which makes it **admin-gated** (was all-tiers). `/library/[id]` item
+  detail and `/library/skills` stay put (linked from arc evidence, query citations — must not break);
+  `/library` index redirects to `/admin/data`. Parametrize `ChannelRail` base path.
+
+### B. Learning-page fixes (one PR)
+- ⬜ **Fix 1 — persist the arc cache + serve-stale-while-revalidate.** Today `getArcs` caches in
+  memory for 10 min, keyed by team+tier — lost on every deploy, not shared across instances, and the
+  first request after expiry blocks on the LLM. Add an `arc_cache` Postgres table
+  `(team_id, group_key, arcs jsonb, computed_at)`; `getArcs` reads it first (fresh → return; stale →
+  return stale immediately + fire-and-forget recompute with in-flight dedupe; cold → compute inline).
+  `recomputeArcs` writes back. **Chose SWR over a global timer-driven refresh** — a scheduler would
+  fire LLM calls for every team on a timer even when nobody's looking (cost multiplier + needs each
+  team's provider keys in the background); SWR only recomputes teams actually being viewed and still
+  gives warm reads. New table → `schema.sql` only (no migration; `create table if not exists`) + the
+  `<!-- drift:tables -->` block in `docs/ARCHITECTURE.md`.
+- ⬜ **Fix 2 — attribute *every* fact with its human, not just AI-agent-subject facts.** Today
+  `attributedFactTexts` prefixes a fact only when its `subject` is a recognized AI-agent name — so
+  arcs like "Context-Management System Enhancements" / "Deterministic Checklist Evaluator" (whose
+  facts have technical/component subjects) reach synthesis with no human, and render with no person's
+  name. The human IS resolvable (`items.member_id`) — surface it universally: prefix every fact that
+  has a resolvable human with `(Name)`, keeping the `(Name, via Agent)` form when the subject is an
+  agent. Mild redundancy when the subject already IS that human is an acceptable cost vs. unattributed
+  arcs. Pure change in `lib/graph/arc-attribution.ts` + tests.
+
+### Deferred out of this batch (not blocking A/B)
+- ⬜ **Full Decisions backend teardown.** Nav removal (above) hides it; full removal deletes the
+  `decisions` table, `lib/ingest` decision-row writer, `app/actions/decisions.ts`, `visibleDecisions`
+  choke-point, `components/decisions-table` + `decisions/*`, the `/decisions` route, the drift-guard
+  table block, and the decisions tests. Larger surgical change with schema/drift implications — do it
+  as its own PR once the nav removal has settled and nobody reports missing it.
+- ⬜ **Delete (vs. hide) the Tasks & Maturity routes.** Currently only unlinked from nav; routes still
+  resolve. Decide whether to delete the pages/loaders outright. Kept for now in case they're wanted
+  back.
+- ⬜ **Flatten the "Work" nav group.** After removing Tasks + Decisions, "Work" contains nothing (or
+  only future items). Either drop the group wrapper or repopulate it.
+
+---
+
 ## Cross-encoder reranker for retrieval (`RERANK_URL`)
 
 **Status:** Deferred (2026-07-02). Dense retrieval is live without it.
