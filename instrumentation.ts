@@ -25,6 +25,11 @@ export async function register() {
   // Graphiti projector poller — self-gates to a no-op unless GRAPHITI_URL is set.
   const { startGraphScheduler } = await import("@/lib/graph/scheduler");
   startGraphScheduler();
+
+  // Social Brain durable job poller — opt-in (inert unless SOCIAL_JOBS_ENABLED=true) while the
+  // feature is pre-launch, so a deploy without it never polls.
+  const { startSocialJobsScheduler } = await import("@/lib/jobs/scheduler");
+  startSocialJobsScheduler();
 }
 
 // Forward Next.js server-side request errors to Sentry. Sentry's
