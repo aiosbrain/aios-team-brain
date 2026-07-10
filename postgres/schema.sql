@@ -974,3 +974,20 @@ create index if not exists social_jobs_due_idx on social_jobs (status, run_after
 create index if not exists social_jobs_team_idx on social_jobs (team_id, created_at desc);
 create unique index if not exists social_jobs_dedup_idx
   on social_jobs (team_id, dedup_key) where dedup_key is not null;
+
+-- ── Brand Brain (Social Brain M1) ────────────────────────────────────────────
+-- One persistent per-team brand config the Social Brain enforces: voice (vocabulary/tone/
+-- formatting/preferred+prohibited phrases), company knowledge (products/positioning/audiences/
+-- claims/roadmap visibility), and governance (confidential topics, legal/pricing/disclosure
+-- rules, approval thresholds). Non-secret config only — credentials stay in `integrations`.
+-- One row per team (team_id PK). Single writer: lib/brand/manage.ts. No RLS — the /admin area
+-- is admin-gated in app code.
+create table if not exists brand_profiles (
+  team_id uuid primary key references teams(id) on delete cascade,
+  voice jsonb not null default '{}',
+  knowledge jsonb not null default '{}',
+  governance jsonb not null default '{}',
+  created_by uuid references members(id) on delete set null,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);

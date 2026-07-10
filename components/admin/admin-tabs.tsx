@@ -10,6 +10,7 @@ const TABS = [
   { slug: "integrations", label: "Integrations" },
   { slug: "pm-sync", label: "PM sync" },
   { slug: "policies", label: "Policies" },
+  { slug: "brand", label: "Brand" },
   { slug: "approvals", label: "Approvals" },
   { slug: "audit", label: "Audit log" },
 ];
