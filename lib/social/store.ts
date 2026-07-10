@@ -1,11 +1,14 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { visibleByAccess, type ViewerTier } from "@/lib/auth/visibility";
+import { TierLeakError, violatesEvidenceTier } from "./tier";
 import type {
+  AccessTier,
   ContentStatus,
   CreateOpportunityInput,
   CreatePlanInput,
   CreateVariantInput,
+  Evidence,
   OpportunityRow,
   OpportunityStatus,
   PlanRow,
@@ -43,6 +46,43 @@ function normalizeOpportunity(row: Record<string, unknown>): OpportunityRow {
   return out as unknown as OpportunityRow;
 }
 
+/**
+ * Enforce the evidence→tier-leak invariant (lib/social/tier): the requested `access` may be at
+ * most as public as the most-restrictive item this opportunity cites. Looks up the actual
+ * `items.access` for every evidence entry that references an item and throws TierLeakError if the
+ * request would over-expose. Fail-closed — an evidence id that resolves to no item counts as
+ * restrictive. No item-evidence → unconstrained (a manual opportunity may be external).
+ */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+async function assertEvidenceTier(
+  db: DbClient,
+  teamId: string,
+  access: AccessTier,
+  evidence: Evidence[]
+): Promise<void> {
+  const itemIds = [...new Set(evidence.map((e) => e.itemId).filter((id): id is string => !!id))];
+  if (itemIds.length === 0) return;
+
+  // Only syntactically-valid UUIDs can reference a real item; a malformed id can't be looked up
+  // (it would crash the `in` cast) and is counted as unresolved → restrictive (fail-closed).
+  const uuids = itemIds.filter((id) => UUID_RE.test(id));
+  let found: { id: string; access: AccessTier }[] = [];
+  if (uuids.length) {
+    const { data, error } = await db.from("items").select("id, access").eq("team_id", teamId).in("id", uuids);
+    if (error) throw new Error(`assertEvidenceTier: items lookup failed: ${error.message}`);
+    found = (data ?? []) as { id: string; access: AccessTier }[];
+  }
+
+  const missing = itemIds.length - found.length;
+  if (violatesEvidenceTier(access, found.map((r) => r.access), missing)) {
+    throw new TierLeakError(
+      `opportunity access '${access}' exceeds its evidence tier — evidence cites ` +
+        `non-public (team) or unresolved items, so it cannot be ${access}`
+    );
+  }
+}
+
 // ── opportunities ──────────────────────────────────────────────────────────────
 
 /** Create an opportunity. Idempotent when `dedupKey` is set (returns the existing one). */
@@ -61,6 +101,9 @@ export async function createOpportunity(
       .maybeSingle();
     if (existing.data) return normalizeOpportunity(existing.data);
   }
+
+  // §5 tier-leak guard: an opportunity can be no more public than its most-restrictive evidence.
+  await assertEvidenceTier(db, teamId, input.access, input.evidence ?? []);
 
   const row: Record<string, unknown> = {
     team_id: teamId,
