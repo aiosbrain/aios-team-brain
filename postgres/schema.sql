@@ -893,6 +893,21 @@ create table if not exists graph_episodes (
 );
 create index if not exists graph_episodes_team_idx on graph_episodes (team_id, projected_at desc);
 
+-- Narrative-arc synthesis cache (Layer 3, lib/graph/arcs). Arcs are an LLM synthesis over the last
+-- 7d of the graph — expensive to compute and identical for everyone sharing a tier-visible group set.
+-- This persists the result across restarts/deploys and shares it across instances (the in-memory
+-- cache did neither). `group_key` is the sorted visible-group set (already the in-memory cache key);
+-- `arcs` is the fully-attributed NarrativeArc[] JSON. Read serves-stale-while-revalidate (a stale row
+-- is returned immediately while a background recompute refreshes it) — see getArcs. Regenerable cache,
+-- not a source of truth. Sole writer: lib/graph/arc-cache (via lib/graph/arcs).
+create table if not exists arc_cache (
+  team_id uuid not null references teams(id) on delete cascade,
+  group_key text not null,                       -- sorted visible-group set, e.g. 'acme_external,acme_team'
+  arcs jsonb not null default '[]'::jsonb,        -- NarrativeArc[] (already human-attributed)
+  computed_at timestamptz not null default now(),
+  primary key (team_id, group_key)
+);
+
 -- ── chat conversations (persistent, owner-scoped chat history) ────────────────
 -- ChatGPT-style threads persisted server-side so history survives across sessions AND interfaces
 -- (web, mobile, CLI, Telegram/Hermes). Owner-scoped: a member reads only their own conversations

@@ -75,22 +75,45 @@ export interface FactRef {
 }
 
 /**
- * Prefix a single fact's text with its human attribution, but ONLY when the fact's `subject` is a
- * recognized AI-agent name — an ordinary human subject needs no prefix, the fact text already names
- * them. This grounds the arc-synthesis LLM's INPUT in a real human (so a summary like "Claude Code is
- * refactoring auth" becomes "Chetan Nandakumar (via Claude Code) is refactoring auth"), rather than
- * only patching the arc's output `participants` after the fact (`attributeParticipants`, above).
+ * True when `subject` already refers to one of the resolved humans — so we don't double-attribute
+ * a fact like "Chetan shipped X" (subject "Chetan", human "Chetan Nandakumar") into the ugly
+ * "(Chetan Nandakumar) Chetan shipped X". Case-insensitive: exact match, or the full human name
+ * contains the (usually shorter) subject (first-name → full-name). Conservative — only suppresses
+ * the prefix, so a miss just leaves a mild redundancy rather than dropping attribution.
+ */
+function subjectNamesAHuman(subject: string, humanNames: string[]): boolean {
+  const s = subject.trim().toLowerCase();
+  if (!s) return false;
+  return humanNames.some((h) => {
+    const hl = h.trim().toLowerCase();
+    return hl === s || hl.includes(s);
+  });
+}
+
+/**
+ * Prefix a single fact's text with the human(s) responsible for it, so the arc-synthesis LLM's INPUT
+ * is grounded in a real person from the start (not patched onto the arc's output `participants`
+ * after the fact). Three cases:
+ *   - subject is a recognized AI agent → `(Name, via Agent) fact` (or `(unattributed AI agent: Agent)`),
+ *   - subject is an ordinary name with a resolvable human → `(Name) fact` — UNLESS the subject already
+ *     names that human (`subjectNamesAHuman`), in which case the fact already attributes itself,
+ *   - no resolvable human and not an agent → unchanged.
+ * This is the fix for arcs whose facts have technical/component subjects (e.g. "the checklist
+ * evaluator"): the human is still known via `items.member_id`, so surface it rather than letting the
+ * arc render with no person's name.
  */
 export function attributeFactText(fact: string, subject: string, humanNames: string[]): string {
-  if (!isAiAgentName(subject)) return fact;
-  return `${attributionTag(subject, humanNames)} ${fact}`;
+  const humans = [...new Set(humanNames.filter(Boolean))].slice(0, MAX_ATTRIBUTED_HUMANS);
+  if (isAiAgentName(subject)) return `${attributionTag(subject, humans)} ${fact}`;
+  if (humans.length === 0 || subjectNamesAHuman(subject, humans)) return fact;
+  return `(${humans.join(", ")}) ${fact}`;
 }
 
 /**
  * Batch version of `attributeFactText` for the numbered facts fed to the synthesis prompt. For each
  * fact, resolves its source item(s) via `episodeUuids` → `epToItem`, looks up each item's human via
- * `humanByItem`, and attributes the fact text if its subject is a recognized AI agent. Pure — the two
- * maps are pre-resolved by the caller (arcs.ts, which owns the DB/Neo4j round trips).
+ * `humanByItem`, and attributes the fact text with that human (or `via`-tags a recognized AI agent).
+ * Pure — the two maps are pre-resolved by the caller (arcs.ts, which owns the DB/Neo4j round trips).
  */
 export function attributedFactTexts(
   facts: FactRef[],
