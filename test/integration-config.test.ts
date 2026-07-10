@@ -85,6 +85,25 @@ describe("validateIntegrationConfig()", () => {
     expect(() => validateIntegrationConfig("linear", { webhookUrl: "https://x" })).toThrow(IntegrationConfigError);
   });
 
+  it("accepts the member-onboarding provisioning keys (linear/slack/github) but rejects secret-like ones", () => {
+    // Linear invite hints
+    expect(
+      validateIntegrationConfig("linear", { teamId: "t", inviteTeamIds: ["T1", "T2"], inviteRole: "guest" })
+    ).toEqual({ teamId: "t", inviteTeamIds: ["T1", "T2"], inviteRole: "guest" });
+    // an invalid role is rejected by the enum
+    expect(() => validateIntegrationConfig("linear", { inviteRole: "owner" })).toThrow(IntegrationConfigError);
+    // Slack invite link (must be a URL)
+    expect(validateIntegrationConfig("slack", { inviteLink: "https://join.slack.com/t/x/abc" })).toEqual({
+      channelIds: [],
+      inviteLink: "https://join.slack.com/t/x/abc",
+    });
+    expect(() => validateIntegrationConfig("slack", { inviteLink: "not-a-url" })).toThrow(IntegrationConfigError);
+    // GitHub org
+    expect(validateIntegrationConfig("github", { org: "acme" })).toEqual({ repos: [], org: "acme" });
+    // The new keys must not trip the secret-key scan, but a real secret-like sibling still does.
+    expect(() => validateIntegrationConfig("github", { org: "acme", token: "ghp_x" })).toThrow(/secret-like key/i);
+  });
+
   it("treats LLM provider keys as secret-only (empty config; the key lives in secret_ciphertext)", () => {
     for (const type of ["openai", "anthropic", "google"] as const) {
       // No non-secret config — empty object is the only valid config.

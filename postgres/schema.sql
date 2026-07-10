@@ -245,6 +245,27 @@ create unique index if not exists member_goals_source_ext_unq
   on member_goals (team_id, source, external_id)
   where source <> 'manual' and external_id <> '';
 
+-- Member provisioning: the tool-invite cascade. One row per (member, tool) recording whether a
+-- member was invited into Linear / Slack / GitHub during onboarding. SINGLE WRITER:
+-- lib/provisioning/run.ts (runProvisioning) — no other module writes this table. `status` is the
+-- outcome: sent (the provider emailed an invite), link_provided (a standing join link was surfaced,
+-- acceptance not verified), skipped (not configured / already a member), failed (the provider call
+-- errored). `detail` is a human-readable note; `meta` holds NON-secret context only (e.g. a slack
+-- inviteLink). Team-tier (admin area) — no per-row tier column, no RLS backstop.
+create table if not exists member_provisioning (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  member_id uuid not null references members(id) on delete cascade,
+  tool text not null check (tool in ('linear','slack','github')),
+  status text not null check (status in ('sent','link_provided','skipped','failed')),
+  detail text not null default '',
+  meta jsonb not null default '{}',
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  unique (team_id, member_id, tool)
+);
+create index if not exists member_provisioning_member_idx on member_provisioning (member_id);
+
 create table if not exists api_keys (
   id uuid primary key default gen_random_uuid(),
   team_id uuid not null references teams(id) on delete cascade,

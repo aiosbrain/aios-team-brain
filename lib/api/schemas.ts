@@ -319,9 +319,19 @@ const integrationConfigSchemas: Record<IntegrationType, z.ZodType> = {
       // Inbound file-content ingestion: glob(s) of repo files to import as deliverable items.
       // Empty/absent ⇒ default to markdown (see lib/ingest/sources/github-files).
       fileGlobs: z.array(z.string().min(1).max(100)).max(50).optional(),
+      // Member-onboarding provisioning: the GitHub org new members are invited into
+      // (POST /orgs/{org}/invitations). NON-secret; the token stays encrypted in secret_ciphertext.
+      org: z.string().max(100).optional(),
     })
     .strict(),
-  slack: z.object({ channelIds: z.array(z.string().min(1).max(40)).max(200).default([]) }).strict(),
+  slack: z
+    .object({
+      channelIds: z.array(z.string().min(1).max(40)).max(200).default([]),
+      // Member-onboarding provisioning: a standing workspace join link surfaced to new members
+      // (Slack Free/Pro has no invite API — link mode only). NON-secret, so it lives in config.
+      inviteLink: z.string().url().max(500).optional(),
+    })
+    .strict(),
   granola: z
     .object({
       // Privacy allowlist: only meetings matching these are candidates for decision extraction.
@@ -338,6 +348,10 @@ const integrationConfigSchemas: Record<IntegrationType, z.ZodType> = {
       // Per-team opt-in for the v1.4 inbound apply (Linear→brain status + adopt). Default off:
       // enabling Linear-writes-brain is a deliberate, reversible, per-team act (brain-api v1.4).
       inboundApply: z.boolean().optional(),
+      // Member-onboarding provisioning: which Linear team(s) a new member is added to on invite, and
+      // the invite role (default resolves from tier: external→guest, else user). NON-secret hints.
+      inviteTeamIds: z.array(z.string().max(64)).max(20).optional(),
+      inviteRole: z.enum(["user", "admin", "guest"]).optional(),
     })
     .strict(),
   plane: z
