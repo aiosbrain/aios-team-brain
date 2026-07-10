@@ -17,56 +17,26 @@ import {
   ensureGithubIntegration,
   githubReposAndToken,
 } from "@/lib/integrations/github-link";
+import { saveProvisioningSettings as saveProvisioningSettings_ } from "@/lib/provisioning/settings";
 import { validateGithubToken, checkRepoAccess, type RepoAccess } from "@/lib/integrations/github-validate";
 import { RepoFormatError } from "@/lib/integrations/github-repos";
+import { validateOpenrouterKey, saveOpenrouterSettings } from "@/lib/integrations/openrouter";
 import { IntegrationConfigError, type IntegrationType } from "@/lib/api/schemas";
+import { buildConfig, toList } from "@/lib/integrations/build-config";
 import { audit } from "@/lib/api/audit";
 
 export type PrimaryPmProvider = "plane" | "linear" | null;
 
-function toList(raw: string): string[] {
-  return raw.split(/[\n,]/).map((s) => s.trim()).filter(Boolean);
-}
-
-function toKeyValues(raw: string): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const part of toList(raw)) {
-    const m = part.match(/^([A-Za-z][A-Za-z0-9_-]*)\s*=\s*(.+)$/);
-    if (m) out[m[1]] = m[2].trim();
-  }
-  return out;
-}
-
-/** Map a single "selection" field to the per-type NON-SECRET config shape (validated downstream). */
-function buildConfig(type: IntegrationType, selection: string): Record<string, unknown> {
-  const list = toList(selection);
-  const kv = toKeyValues(selection);
-  switch (type) {
-    case "slack": return { channelIds: list };
-    case "github": return { repos: list };
-    case "granola": return { matchKeywords: list };
-    case "wise": return list[0] ? { profileId: list[0] } : {};
-    case "linear":
-      return Object.keys(kv).length
-        ? { teamId: kv.teamId, projectId: kv.projectId, doneStateName: kv.doneStateName }
-        : list[0] ? { projectId: list[0] } : {};
-    case "plane":
-      return Object.keys(kv).length
-        ? {
-            baseUrl: kv.baseUrl,
-            workspaceSlug: kv.workspaceSlug,
-            projectId: kv.projectId,
-            doneStateName: kv.doneStateName,
-            externalSource: kv.externalSource,
-          }
-        : list[0] ? { projectId: list[0] } : {};
-    default: return {};
-  }
-}
-
 export async function saveIntegration(
   teamSlug: string,
-  form: { type: IntegrationType; name: string; selection: string; secret: string }
+  form: {
+    type: IntegrationType;
+    name: string;
+    selection: string;
+    secret: string;
+    /** Linear only: per-team inbound-apply opt-in (Linear→brain). Default off. */
+    inboundApply?: boolean;
+  }
 ): Promise<{ ok: boolean; error?: string }> {
   const ctx = await requireAdmin(teamSlug);
   if (!ctx) return { ok: false, error: "admins only" };
@@ -77,7 +47,7 @@ export async function saveIntegration(
     const { id } = await upsertIntegration(adminClient(), auth, {
       type: form.type,
       name,
-      config: buildConfig(form.type, form.selection),
+      config: buildConfig(form.type, form.selection, { inboundApply: form.inboundApply }),
       status: "enabled",
     });
     if (form.secret) await setIntegrationSecret(adminClient(), auth, id, form.secret);
@@ -291,6 +261,34 @@ export async function checkGithubAccess(
 }
 
 /**
+ * Save OpenRouter settings (admins only) — the model slug and/or the API key. When a key is given it
+ * is VALIDATED against OpenRouter (`GET /api/v1/key`) before storing (encrypted), so a bad key is
+ * rejected up front. Once set, the query LLM routes through OpenRouter (see selectLlmBackend). Only
+ * the provided fields change — save a model without re-entering the key, or vice versa.
+ */
+export async function saveOpenrouter(
+  teamSlug: string,
+  input: { key?: string; model?: string }
+): Promise<{ ok: boolean; label?: string; error?: string }> {
+  const ctx = await requireAdmin(teamSlug);
+  if (!ctx) return { ok: false, error: "admins only" };
+  let label: string | undefined;
+  if (input.key && input.key.trim()) {
+    const v = await validateOpenrouterKey(input.key);
+    if (!v.ok) return { ok: false, error: v.error ?? "key validation failed" };
+    label = v.label;
+  }
+  try {
+    await saveOpenrouterSettings(adminClient(), { teamId: ctx.teamId, memberId: ctx.memberId }, input);
+  } catch (e) {
+    if (e instanceof IntegrationConfigError) return { ok: false, error: e.message };
+    return { ok: false, error: e instanceof Error ? e.message : "could not save OpenRouter settings" };
+  }
+  revalidatePath(`/t/${teamSlug}/admin/integrations`);
+  return { ok: true, label };
+}
+
+/**
  * Project this team's brain content (Phase 1: Slack transcripts) into the Graphiti graph memory now
  * (admins only). The scheduler also runs this on its interval; this is the on-demand trigger. Inert
  * (reports "not configured") when GRAPHITI_URL is unset, so it's safe to expose even where the graph
@@ -315,6 +313,35 @@ export async function projectToGraphNow(
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "projection failed" };
   }
+}
+
+/**
+ * Save the Member-onboarding (provisioning) invite hints (admins only). Delegates the merge-and-write
+ * to the single-writer lib helper; only the non-secret provisioning keys are touched.
+ */
+export async function saveProvisioningSettings(
+  teamSlug: string,
+  values: { linearTeamIds: string; linearRole: string; slackInviteLink: string; githubOrg: string }
+): Promise<{ ok: boolean; error?: string }> {
+  const ctx = await requireAdmin(teamSlug);
+  if (!ctx) return { ok: false, error: "admins only" };
+  try {
+    await saveProvisioningSettings_(
+      adminClient(),
+      { teamId: ctx.teamId, memberId: ctx.memberId },
+      {
+        linearTeamIds: toList(values.linearTeamIds),
+        linearRole: values.linearRole.trim(),
+        slackInviteLink: values.slackInviteLink,
+        githubOrg: values.githubOrg,
+      }
+    );
+  } catch (e) {
+    if (e instanceof IntegrationConfigError) return { ok: false, error: e.message };
+    return { ok: false, error: e instanceof Error ? e.message : "could not save settings" };
+  }
+  revalidatePath(`/t/${teamSlug}/admin/integrations`);
+  return { ok: true };
 }
 
 export async function removeIntegration(

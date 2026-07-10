@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { adminSetPassword, loginWithPassword } from "@/lib/auth/pg-login";
+import { activateInvitedMembership, adminSetPassword, loginWithPassword } from "@/lib/auth/pg-login";
 import { db, seedTeam } from "./helpers";
 
 // Spec (audit M1/M2b): email+password login is invite-only AND requires a password an admin has
@@ -45,7 +45,7 @@ describe("loginWithPassword (real Postgres, invite-only, password-gated)", () =>
     expect(await loginWithPassword(email, "not-the-real-password")).toBeNull();
   });
 
-  it("signs in with the correct password, force-links the auth user, activates invited, and reports firstLogin", async () => {
+  it("signs in with the correct password, links the auth user, and reports firstLogin — activation is deferred to the first team visit", async () => {
     const seed = await seedTeam();
     const email = "invitee@test.local";
     await db().from("members").insert({
@@ -57,20 +57,28 @@ describe("loginWithPassword (real Postgres, invite-only, password-gated)", () =>
     const result = await loginWithPassword(email, "the-real-password-123");
     expect(result).not.toBeNull();
     expect(result!.user.email).toBe(email);
-    // Was 'invited' before this login — this is the activation, so the caller should route
-    // through the one-time welcome screen (audit-adjacent: matches redeemMagicToken's behavior).
+    // Was 'invited' before this login — the caller routes through the one-time welcome screen.
     expect(result!.firstLogin).toBe(true);
 
-    // Outcome in the DB: activated + linked to the same auth user the session carries.
+    // Outcome in the DB: linked to the session's auth user, but STILL invited — a password
+    // login carries no team context, so team-scoped activation happens on the member's first
+    // visit to the team (activateInvitedMembership via the team layout), never at sign-in.
     const { data } = await db()
       .from("members")
       .select("auth_user_id, status")
       .eq("email", email)
       .maybeSingle();
-    expect(data!.status).toBe("active");
+    expect(data!.status).toBe("invited");
     expect(data!.auth_user_id).toBe(result!.user.id);
 
-    // A second login is NOT a first login — the member is already active.
+    // First team visit activates; a login after that is no longer a first login.
+    await activateInvitedMembership(seed.teamId, result!.user.id);
+    const { data: after } = await db()
+      .from("members")
+      .select("status")
+      .eq("email", email)
+      .maybeSingle();
+    expect(after!.status).toBe("active");
     const second = await loginWithPassword(email, "the-real-password-123");
     expect(second!.firstLogin).toBe(false);
   });

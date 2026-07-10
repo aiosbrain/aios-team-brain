@@ -5,6 +5,8 @@ import { getSessionUser } from "@/lib/auth/session";
 import { listIntegrations } from "@/lib/integrations/read";
 import { IntegrationsManager, type IntegrationRow } from "@/components/admin/integrations-manager";
 import { GithubReposPanel } from "@/components/admin/github-repos-panel";
+import { OpenrouterPanel } from "@/components/admin/openrouter-panel";
+import { MemberOnboardingPanel } from "@/components/admin/member-onboarding-panel";
 import { getCodebaseFreshness } from "@/lib/metrics/codebases";
 import { listRecentIngestRuns } from "@/lib/ingest/runs";
 import { IngestRunsPanel } from "@/components/admin/ingest-runs-panel";
@@ -53,9 +55,23 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ t
     getRetrievalHealth(team.id),
   ]);
   const githubIntegration = integrations.find((i) => i.type === "github") ?? null;
+  const openrouter = integrations.find((i) => i.type === "openrouter") ?? null;
   const scannedRepos = Array.from(
     new Set(freshness.map((c) => c.full_name).filter((n): n is string => !!n))
   );
+
+  // Prefill the Member onboarding panel from each tool's current (non-secret) config.
+  const cfgOf = (type: "linear" | "slack" | "github") =>
+    (integrations.find((i) => i.type === type)?.config ?? {}) as Record<string, unknown>;
+  const linearCfg = cfgOf("linear");
+  const onboardingValues = {
+    linearTeamIds: Array.isArray(linearCfg.inviteTeamIds)
+      ? (linearCfg.inviteTeamIds as string[]).join(", ")
+      : "",
+    linearRole: typeof linearCfg.inviteRole === "string" ? linearCfg.inviteRole : "",
+    slackInviteLink: typeof cfgOf("slack").inviteLink === "string" ? (cfgOf("slack").inviteLink as string) : "",
+    githubOrg: typeof cfgOf("github").org === "string" ? (cfgOf("github").org as string) : "",
+  };
 
   return (
     <div className="flex flex-col gap-4">
@@ -73,11 +89,17 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ t
         integration={githubIntegration}
         scannedRepos={scannedRepos}
       />
+      <OpenrouterPanel
+        teamSlug={teamSlug}
+        connected={!!openrouter?.hasSecret}
+        model={(openrouter?.config.model as string | undefined) ?? null}
+      />
       <IntegrationsManager
         teamSlug={teamSlug}
         integrations={integrations}
         primaryPmProvider={(team.primary_pm_provider as "plane" | "linear" | null) ?? null}
       />
+      <MemberOnboardingPanel teamSlug={teamSlug} values={onboardingValues} />
       <div>
         <h2 className="text-sm font-semibold text-ink">Recent ingestion runs</h2>
         <p className="mb-2 mt-1 text-xs text-ink-secondary">

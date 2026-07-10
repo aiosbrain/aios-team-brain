@@ -21,6 +21,12 @@ export type { Source, RetrievedContext };
 
 const MAX_SOURCE_CHARS = 8_000;
 const MAX_TOTAL_CHARS = 160_000; // ~40k tokens context cap
+// How many ranked keyword candidates to pull before the char budget truncates. Was 20 — too small
+// once many channels make a broad query legitimately match dozens of items; the top-20 then dropped
+// relevant evidence. `MAX_TOTAL_CHARS` is the real output ceiling (it truncates large corpora), so a
+// larger candidate pool just lets more of a many-small-item corpus through, best-ranked first. Tune
+// via FTS_CANDIDATE_LIMIT. (The recall CEILING beyond this is the dense/rerank job, not keyword FTS.)
+const FTS_CANDIDATE_LIMIT = Number(process.env.FTS_CANDIDATE_LIMIT ?? 50);
 const GIT_WINDOW_DAYS = 90; // recency window for the per-contributor git-activity digest
 const PEOPLE_WINDOW_DAYS = 90; // recency window for the per-person cross-tool activity digest
 
@@ -405,7 +411,7 @@ async function nativeRetrieve(
   //    (fts-search) because the builder emits an unordered `@@` filter.
   const terms = significantTerms(q);
   const orQuery = terms.length ? terms.join(" or ") : q;
-  const ftsP = rankedFtsSearch(teamId, tier, orQuery, 20, channel);
+  const ftsP = rankedFtsSearch(teamId, tier, orQuery, FTS_CANDIDATE_LIMIT, channel);
   // Grounding specificity (Gap #3) — runs concurrently; combined with hadFtsHit below.
   const specificityP = analyzeTermSpecificity(teamId, tier, terms);
   // Structured-context scaling (Gaps #5/#6): a FULL-corpus task count (aggregates survive the 80-row
@@ -590,6 +596,9 @@ async function nativeRetrieve(
   let orderedSources = sources;
   const denseHits = await denseP;
   if (denseHits.length) {
+    // A dense hit here is a REAL semantic match — denseSearch applies a distance floor, so far
+    // nearest-neighbors (which every query has) are already excluded. That's what makes this a valid
+    // grounding signal rather than "any vector exists" (which would defeat the IDF grounding above).
     grounded = true;
     for (const h of denseHits) {
       if (seen.has(h.item_id)) continue;

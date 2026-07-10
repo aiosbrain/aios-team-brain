@@ -1,6 +1,7 @@
 import "server-only";
 import Anthropic from "@anthropic-ai/sdk";
 import type { RetrievedContext } from "./retrieve";
+import { selectLlmBackend, type LlmBackend } from "./llm-backend";
 
 /**
  * Thin adapter around the Claude API so a future agent backend (e.g. Hermes)
@@ -186,6 +187,9 @@ export type QueryUsage = {
 export interface ProviderKeys {
   anthropicKey?: string | null;
   openaiKey?: string | null;
+  // OpenRouter (OpenAI-compatible gateway): a per-team key + chosen model select this backend first.
+  openrouterKey?: string | null;
+  openrouterModel?: string | null;
 }
 
 export async function* streamAnswer(
@@ -210,9 +214,10 @@ export async function* streamAnswer(
   const convo = conversationBlock(history);
   const who = callerBlock(caller);
 
-  // Local OpenAI-compatible backend (Ollama/Hermes) — fully on-machine, $0.
-  if (LLM_BASE_URL) {
-    yield* streamLocal(note, who, convo, ctx.structured, sourcesBlock, question, timeZone, keys.openaiKey);
+  // OpenRouter (per-team) or a local OpenAI-compatible endpoint (LLM_BASE_URL) — same wire shape.
+  const backend = selectLlmBackend({ LLM_BASE_URL, LLM_MODEL }, keys);
+  if (backend.kind !== "anthropic") {
+    yield* streamOpenAICompatible(backend, note, who, convo, ctx.structured, sourcesBlock, question, timeZone);
     return;
   }
 
@@ -270,20 +275,20 @@ export async function* streamAnswer(
 }
 
 /**
- * Stream from a local OpenAI-compatible chat endpoint (Ollama/Hermes/llama.cpp).
- * Same `delta`/`done` contract as the Anthropic path; cost is always $0.
- * Strips any `<think>…</think>` reasoning spans so the Team Brain answer stays
- * clean even when LLM_MODEL points at a reasoning model.
+ * Stream from an OpenAI-compatible chat endpoint — OpenRouter (per-team gateway) OR a local
+ * endpoint (Ollama/Hermes/llama.cpp via LLM_BASE_URL). Same `delta`/`done` contract as the Anthropic
+ * path. Strips any `<think>…</think>` reasoning spans so the answer stays clean on reasoning models.
+ * Cost is reported as $0 here (token counts are accurate); per-model OpenRouter cost is a follow-up.
  */
-async function* streamLocal(
+async function* streamOpenAICompatible(
+  backend: Extract<LlmBackend, { kind: "openrouter" | "openai-compatible" }>,
   note: string,
   who: string,
   convo: string,
   structured: string,
   sourcesBlock: string,
   question: string,
-  timeZone: string,
-  openaiKey?: string | null
+  timeZone: string
 ): AsyncGenerator<
   | { type: "delta"; text: string }
   | { type: "done"; usage: QueryUsage }
@@ -298,14 +303,16 @@ async function* streamLocal(
     (convo ? `${convo}\n\n` : "") +
     `Question: ${question}`;
 
-  const res = await fetch(`${LLM_BASE_URL!.replace(/\/$/, "")}/chat/completions`, {
+  const apiKey = backend.apiKey ?? process.env.OPENAI_API_KEY ?? "local";
+  const res = await fetch(`${backend.baseUrl.replace(/\/$/, "")}/chat/completions`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${openaiKey ?? process.env.OPENAI_API_KEY ?? "local"}`,
+      Authorization: `Bearer ${apiKey}`,
+      ...(backend.kind === "openrouter" ? backend.headers : {}),
     },
     body: JSON.stringify({
-      model: LLM_MODEL,
+      model: backend.model,
       max_tokens: 4096,
       stream: true,
       stream_options: { include_usage: true },
@@ -317,7 +324,7 @@ async function* streamLocal(
   });
 
   if (!res.ok || !res.body) {
-    throw new Error(`local LLM ${LLM_MODEL} @ ${LLM_BASE_URL}: ${res.status} ${await res.text().catch(() => "")}`);
+    throw new Error(`LLM ${backend.model} @ ${backend.baseUrl}: ${res.status} ${await res.text().catch(() => "")}`);
   }
 
   const reader = res.body.getReader();

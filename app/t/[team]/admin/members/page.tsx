@@ -1,4 +1,5 @@
 import { serverClient } from "@/lib/db/server";
+import { adminClient } from "@/lib/db/admin";
 import { InviteMember } from "@/components/admin/invite-member";
 import { MemberIdentities, type ProviderLink } from "@/components/admin/member-identities";
 import { MemberRoleSelect } from "@/components/admin/member-role-select";
@@ -6,7 +7,10 @@ import { ReattributeButton } from "@/components/admin/reattribute-button";
 import { ResetPasswordButton } from "@/components/admin/reset-password-button";
 import { RemoveMemberButton } from "@/components/admin/remove-member-button";
 import { ManagerSelect } from "@/components/admin/manager-select";
+import { MemberProvisioningCell } from "@/components/admin/member-provisioning-cell";
 import { listMemberIdentities } from "@/lib/identity/list";
+import { getProvisioningAvailabilityAction } from "@/app/t/[team]/admin/actions";
+import { getMemberProvisioning } from "@/lib/provisioning/run";
 
 export default async function MembersAdminPage({
   params,
@@ -38,6 +42,19 @@ export default async function MembersAdminPage({
     .filter((m) => m.status !== "disabled")
     .map((m) => ({ id: m.id as string, displayName: m.display_name as string }));
 
+  // Per-tool provisioning availability (drives the invite checkboxes) + each member's current
+  // provisioning rows (drives the compact retry badges). Reads go through the admin service client
+  // and the single-writer's read helpers — the members subtree is already admin-gated by the layout.
+  const adminDb = adminClient();
+  const provisioningAvailability = await getProvisioningAvailabilityAction(teamSlug);
+  const provisioningByMember = new Map(
+    await Promise.all(
+      (members ?? []).map(
+        async (m) => [m.id, await getMemberProvisioning(adminDb, team.id, m.id as string)] as const
+      )
+    )
+  );
+
   // All linked identities (email aliases + slack/linear/plane provider ids) for the panel.
   const identities = await listMemberIdentities(db, team.id);
   const providerOf = (memberId: string, provider: string): ProviderLink | null => {
@@ -55,7 +72,7 @@ export default async function MembersAdminPage({
         </p>
         <div className="flex items-center gap-2">
           <ReattributeButton teamSlug={teamSlug} />
-          <InviteMember teamSlug={teamSlug} />
+          <InviteMember teamSlug={teamSlug} provisioningAvailability={provisioningAvailability} />
         </div>
       </div>
       <div className="prism-card overflow-x-auto">
@@ -70,6 +87,7 @@ export default async function MembersAdminPage({
               <th className="px-4 py-3">Status</th>
               <th className="px-4 py-3">Reports to</th>
               <th className="px-4 py-3">Password</th>
+              <th className="px-4 py-3">Tools</th>
               <th className="px-4 py-3">Identities</th>
               <th className="px-4 py-3">Remove</th>
             </tr>
@@ -99,6 +117,13 @@ export default async function MembersAdminPage({
                 </td>
                 <td className="px-4 py-3">
                   <ResetPasswordButton teamSlug={teamSlug} memberId={m.id} />
+                </td>
+                <td className="px-4 py-3">
+                  <MemberProvisioningCell
+                    teamSlug={teamSlug}
+                    memberId={m.id}
+                    rows={provisioningByMember.get(m.id) ?? []}
+                  />
                 </td>
                 <td className="px-4 py-3">
                   <MemberIdentities

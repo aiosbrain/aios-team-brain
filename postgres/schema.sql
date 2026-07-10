@@ -47,6 +47,19 @@ do $$ begin
   create type action_status as enum
     ('requested', 'denied', 'pending_approval', 'running', 'succeeded', 'failed');
 exception when duplicate_object then null; end $$;
+do $$ begin
+  create type social_job_status as enum ('queued', 'running', 'done', 'dead');
+exception when duplicate_object then null; end $$;
+do $$ begin
+  create type opportunity_status as enum ('discovered', 'evaluated', 'planned', 'rejected', 'expired');
+exception when duplicate_object then null; end $$;
+do $$ begin
+  create type content_status as enum (
+    'planned', 'generating', 'generated', 'validating', 'awaiting_approval', 'approved',
+    'scheduled', 'publishing', 'published', 'analyzing', 'completed',
+    'rejected', 'failed', 'cancelled', 'expired'
+  );
+exception when duplicate_object then null; end $$;
 
 -- ── auth (local) ─────────────────────────────────────────────────────────────
 -- Local auth tables (a session is a signed cookie; see lib/auth). Magic-link
@@ -251,6 +264,27 @@ create index if not exists member_goals_member_idx on member_goals (member_id);
 create unique index if not exists member_goals_source_ext_unq
   on member_goals (team_id, source, external_id)
   where source <> 'manual' and external_id <> '';
+
+-- Member provisioning: the tool-invite cascade. One row per (member, tool) recording whether a
+-- member was invited into Linear / Slack / GitHub during onboarding. SINGLE WRITER:
+-- lib/provisioning/run.ts (runProvisioning) — no other module writes this table. `status` is the
+-- outcome: sent (the provider emailed an invite), link_provided (a standing join link was surfaced,
+-- acceptance not verified), skipped (not configured / already a member), failed (the provider call
+-- errored). `detail` is a human-readable note; `meta` holds NON-secret context only (e.g. a slack
+-- inviteLink). Team-tier (admin area) — no per-row tier column, no RLS backstop.
+create table if not exists member_provisioning (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  member_id uuid not null references members(id) on delete cascade,
+  tool text not null check (tool in ('linear','slack','github')),
+  status text not null check (status in ('sent','link_provided','skipped','failed')),
+  detail text not null default '',
+  meta jsonb not null default '{}',
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  unique (team_id, member_id, tool)
+);
+create index if not exists member_provisioning_member_idx on member_provisioning (member_id);
 
 create table if not exists api_keys (
   id uuid primary key default gen_random_uuid(),
@@ -835,6 +869,23 @@ create index if not exists usage_costs_team_date_idx
 create index if not exists usage_costs_member_date_idx
   on usage_costs (member_id, cost_date desc);
 
+-- Flat AI-tool subscriptions (Claude Max/Pro, Cursor, …). One current plan per
+-- member+provider — the real recurring spend, distinct from per-token usage_costs.
+-- Written only by lib/subscriptions/ingest via POST /api/v1/subscriptions (v1.8).
+create table if not exists subscriptions (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  member_id uuid not null references members(id) on delete cascade,
+  provider text not null,
+  plan text not null default '',
+  monthly_usd numeric(10, 2) not null default 0,
+  source text not null default 'unknown',
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  unique (team_id, member_id, provider)
+);
+create index if not exists subscriptions_team_idx on subscriptions (team_id);
+
 -- Integration selections. `config` holds NON-SECRET selection only (repos, channels, project
 -- slugs); the per-type allowlist + secret-key rejection (lib/api/schemas) keep secrets OUT of
 -- config. The connector secret (Slack/GitHub/… token) lives ENCRYPTED in `secret_ciphertext`
@@ -845,7 +896,7 @@ create index if not exists usage_costs_member_date_idx
 create table if not exists integrations (
   id uuid primary key default gen_random_uuid(),
   team_id uuid not null references teams(id) on delete cascade,
-  type text not null check (type in ('github','granola','slack','wise','linear','plane','openai','anthropic','google')),
+  type text not null check (type in ('github','granola','slack','wise','linear','plane','openai','anthropic','google','openrouter')),
   name text not null,
   config jsonb not null default '{}',
   secret_ciphertext text,                 -- AES-256-GCM blob (base64); null if no secret set
@@ -939,3 +990,109 @@ create table if not exists ingest_runs (
 );
 create index if not exists ingest_runs_team_source_idx on ingest_runs (team_id, source, finished_at desc);
 create index if not exists ingest_runs_finished_idx on ingest_runs (finished_at desc);
+
+-- ── Social Brain durable job/outbox (M0) ─────────────────────────────────────
+-- The one durable async primitive: work that survives a redeploy and retries on failure
+-- (media renders, provider polling, scheduled publishing, publish/analytics retries). The
+-- in-process poller (lib/jobs/scheduler) claims due rows, runs the handler registered for the
+-- `kind`, and on failure requeues with exponential backoff until `max_attempts` → 'dead'.
+-- `run_after` doubles as the scheduled-publish time. Single writer: lib/jobs/store.ts. No RLS
+-- — team scoping is app-code. Claim is a conditional UPDATE under the poller's single-flight
+-- guard (one instance today); the documented multi-instance upgrade is FOR UPDATE SKIP LOCKED.
+create table if not exists social_jobs (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  kind text not null,                         -- 'generate_image' | 'poll_render' | 'publish' | 'collect_analytics' | …
+  payload jsonb not null default '{}',        -- kind-specific input (no secrets — those stay in integrations)
+  status social_job_status not null default 'queued',
+  attempts integer not null default 0,        -- times a worker has started this job
+  max_attempts integer not null default 5,    -- after this many failed attempts → 'dead'
+  run_after timestamptz not null default now(), -- earliest eligible run time (scheduling + backoff)
+  locked_at timestamptz,                       -- when the current worker claimed it (null unless running)
+  last_error text,                             -- most recent failure message (surfaced, never thrown)
+  dedup_key text,                              -- optional idempotency key; unique per team when set
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+create index if not exists social_jobs_due_idx on social_jobs (status, run_after);
+create index if not exists social_jobs_team_idx on social_jobs (team_id, created_at desc);
+create unique index if not exists social_jobs_dedup_idx
+  on social_jobs (team_id, dedup_key) where dedup_key is not null;
+
+-- ── Brand Brain (Social Brain M1) ────────────────────────────────────────────
+-- One persistent per-team brand config the Social Brain enforces: voice (vocabulary/tone/
+-- formatting/preferred+prohibited phrases), company knowledge (products/positioning/audiences/
+-- claims/roadmap visibility), and governance (confidential topics, legal/pricing/disclosure
+-- rules, approval thresholds). Non-secret config only — credentials stay in `integrations`.
+-- One row per team (team_id PK). Single writer: lib/brand/manage.ts. No RLS — the /admin area
+-- is admin-gated in app code.
+create table if not exists brand_profiles (
+  team_id uuid primary key references teams(id) on delete cascade,
+  voice jsonb not null default '{}',
+  knowledge jsonb not null default '{}',
+  governance jsonb not null default '{}',
+  created_by uuid references members(id) on delete set null,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+-- ── Social Brain content domain (M2 foundation) ──────────────────────────────
+-- The durable data model + lifecycle for opportunity → plan → variant. Each row carries an
+-- `access` tier inherited from its source evidence, so tier isolation (CLAUDE.md §5) propagates
+-- down the chain. Schema only in M2 — discovery-scoring + brand-aware planning are a later
+-- product-steered milestone. Single writer: lib/social/store.ts. No RLS — app-code enforced.
+create table if not exists social_opportunities (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  access access_tier not null,
+  source_type text not null,                -- 'manual' | 'item' | 'commit' | 'decision' | …
+  title text not null,
+  summary text not null default '',
+  evidence jsonb not null default '[]',     -- [{item_id, path, note}] — provenance to brain knowledge
+  topics jsonb not null default '[]',
+  audiences jsonb not null default '[]',
+  novelty_score numeric(4, 3) not null default 0,
+  relevance_score numeric(4, 3) not null default 0,
+  urgency_score numeric(4, 3) not null default 0,
+  confidence_score numeric(4, 3) not null default 0,
+  status opportunity_status not null default 'discovered',
+  dedup_key text,
+  created_by uuid references members(id) on delete set null,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+create index if not exists social_opportunities_team_status_idx on social_opportunities (team_id, status, created_at desc);
+create index if not exists social_opportunities_team_access_idx on social_opportunities (team_id, access);
+create unique index if not exists social_opportunities_dedup_idx
+  on social_opportunities (team_id, dedup_key) where dedup_key is not null;
+
+create table if not exists content_plans (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  opportunity_id uuid not null references social_opportunities(id) on delete cascade,
+  access access_tier not null,
+  objective text not null default '',
+  audience text not null default '',
+  status text not null default 'planned' check (status in ('planned', 'active', 'archived')),
+  created_by uuid references members(id) on delete set null,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+create index if not exists content_plans_team_opp_idx on content_plans (team_id, opportunity_id);
+create index if not exists content_plans_team_access_idx on content_plans (team_id, access);
+
+create table if not exists content_variants (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  plan_id uuid not null references content_plans(id) on delete cascade,
+  access access_tier not null,
+  platform text not null,                   -- 'x' | 'linkedin' | 'threads' | …
+  format text not null,                     -- 'text' | 'image' | 'carousel' | …
+  tone text not null default '',
+  body text not null default '',
+  status content_status not null default 'planned',
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+create index if not exists content_variants_team_plan_idx on content_variants (team_id, plan_id);
+create index if not exists content_variants_team_status_idx on content_variants (team_id, status);

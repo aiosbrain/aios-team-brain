@@ -41,7 +41,15 @@ export const decisionRowSchema = z.object({
 export const itemPayloadSchema = z.object({
   project: z.string().min(1).max(120),
   path: z.string().min(1).max(500),
-  kind: z.enum(["deliverable", "transcript", "decision", "task", "artifact", "skill", "blueprint"]),
+  kind: z.enum([
+    "deliverable",
+    "transcript",
+    "decision",
+    "task",
+    "artifact",
+    "skill",
+    "blueprint",
+  ]),
   content_sha256: z.string().regex(/^[a-f0-9]{64}$/),
   actor: z.string().max(120).optional().default(""),
   access: z.string(),
@@ -63,7 +71,10 @@ export const codebaseRecordSchema = z.object({
     .string()
     .min(1)
     .max(120)
-    .regex(/^[A-Za-z0-9._-]+$/, "slug must be route-safe (letters, digits, '.', '_', '-')"),
+    .regex(
+      /^[A-Za-z0-9._-]+$/,
+      "slug must be route-safe (letters, digits, '.', '_', '-')",
+    ),
   full_name: z.string().max(200).optional().default(""),
   provider: z.string().max(40).optional().default("github"),
   default_branch: z.string().max(120).optional().default("main"),
@@ -91,9 +102,27 @@ export const codeMetricsSchema = z.object({
   ai_commits_window: z.number().int().nonnegative(),
   additions_window: z.number().int().nonnegative(),
   deletions_window: z.number().int().nonnegative(),
-  test_coverage_pct: z.number().min(0).max(100).nullable().optional().default(null),
-  test_coverage_functions_pct: z.number().min(0).max(100).nullable().optional().default(null),
-  test_coverage_branches_pct: z.number().min(0).max(100).nullable().optional().default(null),
+  test_coverage_pct: z
+    .number()
+    .min(0)
+    .max(100)
+    .nullable()
+    .optional()
+    .default(null),
+  test_coverage_functions_pct: z
+    .number()
+    .min(0)
+    .max(100)
+    .nullable()
+    .optional()
+    .default(null),
+  test_coverage_branches_pct: z
+    .number()
+    .min(0)
+    .max(100)
+    .nullable()
+    .optional()
+    .default(null),
   recent_commits: z.array(z.record(z.string(), z.unknown())),
   // explicit scaffolding inputs (required)
   has_claude_md: z.boolean(),
@@ -103,23 +132,43 @@ export const codeMetricsSchema = z.object({
   commands_count: z.number().int().nonnegative(),
   // cadence inputs (used to compute cadence_score; not persisted raw)
   active_days: z.number().int().nonnegative().optional().default(0),
-  days_since_last_commit: z.number().int().nonnegative().nullable().optional().default(null),
+  days_since_last_commit: z
+    .number()
+    .int()
+    .nonnegative()
+    .nullable()
+    .optional()
+    .default(null),
   // AEM agent-readiness — scored scanner-side against the canonical rubric
   // (agentic-engineering-maturity/rubric/agent-readiness.json); the brain persists as-is.
   // Validate at the boundary so malformed scanner output can't become permanent analytics:
   // level is the fixed L0..L5 ladder, and a pillar can't report more passed than total.
-  readiness_level: z.enum(["L0", "L1", "L2", "L3", "L4", "L5"]).nullable().optional().default(null),
+  readiness_level: z
+    .enum(["L0", "L1", "L2", "L3", "L4", "L5"])
+    .nullable()
+    .optional()
+    .default(null),
   readiness_pct: z.number().min(0).max(100).nullable().optional().default(null),
   readiness_pillars: z
     .record(
       z.string(),
       z
-        .object({ passed: z.number().int().nonnegative(), total: z.number().int().nonnegative() })
-        .refine((p) => p.passed <= p.total, { message: "passed must be <= total" })
+        .object({
+          passed: z.number().int().nonnegative(),
+          total: z.number().int().nonnegative(),
+        })
+        .refine((p) => p.passed <= p.total, {
+          message: "passed must be <= total",
+        }),
     )
     .optional()
     .default({}),
-  readiness_rubric_version: z.string().max(32).nullable().optional().default(null),
+  readiness_rubric_version: z
+    .string()
+    .max(32)
+    .nullable()
+    .optional()
+    .default(null),
 });
 
 export const codeContributionSchema = z.object({
@@ -150,7 +199,11 @@ export const githubIssueSchema = z.object({
 export const codebaseScanPayloadSchema = z.object({
   codebase: codebaseRecordSchema,
   metrics: codeMetricsSchema,
-  contributions: z.array(codeContributionSchema).max(5000).optional().default([]),
+  contributions: z
+    .array(codeContributionSchema)
+    .max(5000)
+    .optional()
+    .default([]),
   issues: z.array(githubIssueSchema).max(5000).optional().default([]),
 });
 export type CodebaseScanPayload = z.infer<typeof codebaseScanPayloadSchema>;
@@ -195,12 +248,22 @@ export const maturitySnapshotPayloadSchema = z.object({
   // stay distinguishable from an explicit null. Provenance-only — never recomputed here.
   ce_band: z.number().int().min(0).max(4).nullable().optional(),
 });
-export type MaturitySnapshotPayload = z.infer<typeof maturitySnapshotPayloadSchema>;
+export type MaturitySnapshotPayload = z.infer<
+  typeof maturitySnapshotPayloadSchema
+>;
 
 export const usageCostPayloadSchema = z.object({
   member: z.string().max(120).nullable().optional(),
   date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
-  provider: z.enum(["cursor", "claude", "opencode", "anthropic", "openai", "codex", "other"]),
+  provider: z.enum([
+    "cursor",
+    "claude",
+    "opencode",
+    "anthropic",
+    "openai",
+    "codex",
+    "other",
+  ]),
   source: z.string().min(1).max(60),
   project: z.string().max(120).optional().default(""),
   input_tokens: z.number().int().nonnegative().optional().default(0),
@@ -211,6 +274,24 @@ export const usageCostPayloadSchema = z.object({
   meta: z.record(z.string(), z.unknown()).optional().default({}),
 });
 export type UsageCostPayload = z.infer<typeof usageCostPayloadSchema>;
+
+/** A member's flat AI-tool subscription (v1.8) — real recurring spend, not per-token. */
+export const subscriptionPayloadSchema = z.object({
+  member: z.string().max(120).nullable().optional(),
+  provider: z.enum([
+    "cursor",
+    "claude",
+    "opencode",
+    "anthropic",
+    "openai",
+    "codex",
+    "other",
+  ]),
+  plan: z.string().max(60).optional().default(""),
+  monthly_usd: z.number().nonnegative(),
+  source: z.string().min(1).max(60).optional().default("unknown"),
+});
+export type SubscriptionPayload = z.infer<typeof subscriptionPayloadSchema>;
 
 export const querySchema = z.object({
   question: z.string().min(1).max(4000),
@@ -242,35 +323,80 @@ export const workEventPayloadSchema = z.object({
 });
 export type WorkEventPayload = z.infer<typeof workEventPayloadSchema>;
 
+// ── Member invite (brain-api v1.7: POST /api/v1/members/invite) ─────────────────
+// Wire is snake_case. `tools` selects the provisioning cascade: the literal "all"/"none", or an
+// explicit array of tool names — an unknown tool name fails the `z.enum` (→ 422 invalid_payload).
+// `.strict()` rejects unknown top-level keys. Email uses zod's `.email()`, identical to
+// `isValidInviteEmail` (`lib/admin/members`, which is `z.string().email()`), kept inline so this
+// shared schema module stays free of the server-only members lib.
+export const PROVISIONING_TOOLS = ["linear", "slack", "github"] as const;
+
+export const memberInviteRequestSchema = z
+  .object({
+    email: z.string().email(),
+    display_name: z.string().trim().min(1),
+    actor_handle: z.string().trim().min(1),
+    role: z.enum(["member", "lead", "admin"]).optional().default("member"),
+    tools: z
+      .union([
+        z.literal("all"),
+        z.literal("none"),
+        z.array(z.enum(PROVISIONING_TOOLS)),
+      ])
+      .optional()
+      .default("all"),
+  })
+  .strict();
+export type MemberInviteRequest = z.infer<typeof memberInviteRequestSchema>;
+
 /**
  * Normalize tier per contract. Outward labels client (consultant) and company
  * (employee) → external. Returns null for admin/private/unknown (never stored).
  */
 export function normalizeTier(tier: string): "team" | "external" | null {
   if (tier === "team") return "team";
-  if (tier === "external" || tier === "client" || tier === "company") return "external";
+  if (tier === "external" || tier === "client" || tier === "company")
+    return "external";
   return null;
 }
 
-export const TASK_STATUSES = ["backlog", "ready", "in_progress", "blocked", "done"] as const;
+export const TASK_STATUSES = [
+  "backlog",
+  "ready",
+  "in_progress",
+  "blocked",
+  "done",
+] as const;
 export function normalizeTaskStatus(raw: string): {
   status: (typeof TASK_STATUSES)[number];
   raw_status: string | null;
 } {
-  const s = raw.trim().toLowerCase().replace(/[\s-]+/g, "_");
+  const s = raw
+    .trim()
+    .toLowerCase()
+    .replace(/[\s-]+/g, "_");
   if ((TASK_STATUSES as readonly string[]).includes(s)) {
     return { status: s as (typeof TASK_STATUSES)[number], raw_status: null };
   }
   return { status: "backlog", raw_status: raw };
 }
 
-export const TASK_PRIORITIES = ["none", "low", "medium", "high", "urgent"] as const;
+export const TASK_PRIORITIES = [
+  "none",
+  "low",
+  "medium",
+  "high",
+  "urgent",
+] as const;
 export type TaskPriority = (typeof TASK_PRIORITIES)[number];
 // Normalize a free-text priority to the allowed set. Unknown / empty → "none". Also accepts a few
 // common aliases (e.g. Plane's "urgent", Linear's numeric labels are mapped upstream).
-export function normalizeTaskPriority(raw: string | null | undefined): TaskPriority {
+export function normalizeTaskPriority(
+  raw: string | null | undefined,
+): TaskPriority {
   const s = (raw ?? "").trim().toLowerCase();
-  if ((TASK_PRIORITIES as readonly string[]).includes(s)) return s as TaskPriority;
+  if ((TASK_PRIORITIES as readonly string[]).includes(s))
+    return s as TaskPriority;
   if (s === "critical" || s === "p0" || s === "highest") return "urgent";
   if (s === "p1") return "high";
   if (s === "p2") return "medium";
@@ -281,7 +407,7 @@ export function normalizeTaskPriority(raw: string | null | undefined): TaskPrior
 export function errorResponse(code: string, message: string, status: number) {
   return Response.json(
     { error: { code, message, request_id: crypto.randomUUID() } },
-    { status }
+    { status },
   );
 }
 
@@ -299,14 +425,16 @@ export const INTEGRATION_TYPES = [
   "wise",
   "linear",
   "plane",
-  // LLM provider API keys (secret-only; no non-secret config). The key is stored encrypted in
-  // secret_ciphertext, same path as the source connectors above.
+  // LLM provider API keys. The key is stored encrypted in secret_ciphertext, same path as the
+  // source connectors above. openai/anthropic/google are secret-only; openrouter also carries a
+  // NON-secret `model` selection (the OpenAI-compatible gateway needs a model slug).
   "openai",
   "anthropic",
   "google",
+  "openrouter",
 ] as const;
-/** Provider key integration types — secret-only, carry no config selection. */
-export const PROVIDER_INTEGRATION_TYPES = ["openai", "anthropic", "google"] as const;
+/** Provider key integration types — the LLM providers whose key the query path resolves per team. */
+export const PROVIDER_INTEGRATION_TYPES = ["openai", "anthropic", "google", "openrouter"] as const;
 export type ProviderIntegrationType = (typeof PROVIDER_INTEGRATION_TYPES)[number];
 export type IntegrationType = (typeof INTEGRATION_TYPES)[number];
 export const INTEGRATION_STATUSES = ["enabled", "disabled"] as const;
@@ -319,14 +447,27 @@ const integrationConfigSchemas: Record<IntegrationType, z.ZodType> = {
       // Inbound file-content ingestion: glob(s) of repo files to import as deliverable items.
       // Empty/absent ⇒ default to markdown (see lib/ingest/sources/github-files).
       fileGlobs: z.array(z.string().min(1).max(100)).max(50).optional(),
+      // Member-onboarding provisioning: the GitHub org new members are invited into
+      // (POST /orgs/{org}/invitations). NON-secret; the token stays encrypted in secret_ciphertext.
+      org: z.string().max(100).optional(),
     })
     .strict(),
-  slack: z.object({ channelIds: z.array(z.string().min(1).max(40)).max(200).default([]) }).strict(),
+  slack: z
+    .object({
+      channelIds: z.array(z.string().min(1).max(40)).max(200).default([]),
+      // Member-onboarding provisioning: a standing workspace join link surfaced to new members
+      // (Slack Free/Pro has no invite API — link mode only). NON-secret, so it lives in config.
+      inviteLink: z.string().url().max(500).optional(),
+    })
+    .strict(),
   granola: z
     .object({
       // Privacy allowlist: only meetings matching these are candidates for decision extraction.
       matchKeywords: z.array(z.string().min(1).max(120)).max(50).default([]),
-      participantEmails: z.array(z.string().email().max(200)).max(50).default([]),
+      participantEmails: z
+        .array(z.string().email().max(200))
+        .max(50)
+        .default([]),
     })
     .strict(),
   wise: z.object({ profileId: z.string().max(64).optional() }).strict(),
@@ -338,6 +479,10 @@ const integrationConfigSchemas: Record<IntegrationType, z.ZodType> = {
       // Per-team opt-in for the v1.4 inbound apply (Linear→brain status + adopt). Default off:
       // enabling Linear-writes-brain is a deliberate, reversible, per-team act (brain-api v1.4).
       inboundApply: z.boolean().optional(),
+      // Member-onboarding provisioning: which Linear team(s) a new member is added to on invite, and
+      // the invite role (default resolves from tier: external→guest, else user). NON-secret hints.
+      inviteTeamIds: z.array(z.string().max(64)).max(20).optional(),
+      inviteRole: z.enum(["user", "admin", "guest"]).optional(),
     })
     .strict(),
   plane: z
@@ -349,13 +494,16 @@ const integrationConfigSchemas: Record<IntegrationType, z.ZodType> = {
       externalSource: z.string().max(80).optional(),
     })
     .strict(),
-  // Provider key types hold only the encrypted secret — no non-secret config.
+  // Provider key types hold only the encrypted secret — no non-secret config …
   openai: z.object({}).strict(),
   anthropic: z.object({}).strict(),
   google: z.object({}).strict(),
+  // … except OpenRouter, which also stores the chosen model slug (e.g. "openai/gpt-4o-mini").
+  openrouter: z.object({ model: z.string().min(1).max(120).optional() }).strict(),
 };
 
-const SECRET_KEY_RE = /token|secret|api[_-]?key|password|bearer|credential|client[_-]?secret|private[_-]?key/i;
+const SECRET_KEY_RE =
+  /token|secret|api[_-]?key|password|bearer|credential|client[_-]?secret|private[_-]?key/i;
 const MAX_CONFIG_BYTES = 8 * 1024;
 
 /** Thrown when integration config is malformed/oversized/contains a secret-like key (→ 400). */
@@ -386,24 +534,28 @@ function collectKeys(value: unknown, out: string[] = []): string[] {
  */
 export function validateIntegrationConfig(
   type: IntegrationType,
-  config: unknown
+  config: unknown,
 ): Record<string, unknown> {
   const value = config ?? {};
   const serialized = JSON.stringify(value);
   if (serialized.length > MAX_CONFIG_BYTES) {
-    throw new IntegrationConfigError(`config exceeds ${MAX_CONFIG_BYTES} bytes`);
+    throw new IntegrationConfigError(
+      `config exceeds ${MAX_CONFIG_BYTES} bytes`,
+    );
   }
   for (const key of collectKeys(value)) {
     if (SECRET_KEY_RE.test(key)) {
       throw new IntegrationConfigError(
-        `secret-like key "${key}" is not allowed — secrets stay in the sidecar's local config, never the brain`
+        `secret-like key "${key}" is not allowed — secrets stay in the sidecar's local config, never the brain`,
       );
     }
   }
   const parsed = integrationConfigSchemas[type].safeParse(value);
   if (!parsed.success) {
     throw new IntegrationConfigError(
-      parsed.error.issues.map((i) => `${i.path.join(".") || "config"}: ${i.message}`).join("; ")
+      parsed.error.issues
+        .map((i) => `${i.path.join(".") || "config"}: ${i.message}`)
+        .join("; "),
     );
   }
   return parsed.data as Record<string, unknown>;
