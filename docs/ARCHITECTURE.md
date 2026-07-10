@@ -91,13 +91,13 @@ flowchart LR
 
 ## Auth & access tiers
 
-This server **implements brain-api v1.6** (the wire contract; source of truth:
-`aios-workspace/docs/brain-api.md`). The member-invite endpoint (`POST /api/v1/members/invite`)
-is built to the v1.7 invite contract; the formal `BRAIN_API_VERSION` bump to `1.7` is a separate
-coordinated step (it regenerates the shared `brain-contract` fixture in lockstep with
-`aios-workspace`). That version is pinned in code as `BRAIN_API_VERSION`
-(`lib/api/version.ts`) and asserted against this sentence by
-`test/guards/contract-version.test.ts` — bump all three together on a contract change.
+This server **implements brain-api v1.7** (the wire contract; source of truth:
+`aios-workspace/docs/brain-api.md`; v1.7 added the member-invite endpoint,
+`POST /api/v1/members/invite`). That version is pinned in code as `BRAIN_API_VERSION`
+(`lib/api/version.ts`), asserted against this sentence by
+`test/guards/contract-version.test.ts`, and mirrored by the vendored
+`test/fixtures/contract/brain-contract.json` (regenerated in lockstep with the canonical
+copy in `aios-workspace/docs/contract/`) — bump all of them together on a contract change.
 
 Two principals, one tier model:
 
