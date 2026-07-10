@@ -38,6 +38,46 @@ export interface ExternalCostsSummary {
   selfOnly: boolean;
 }
 
+/** One calendar day, cost split per provider (keys are provider names, values USD). */
+export interface SpendDayPoint {
+  date: string;
+  [provider: string]: number | string;
+}
+/** One calendar day, tokens split by kind across all providers. */
+export interface TokenDayPoint {
+  date: string;
+  input: number;
+  output: number;
+  cache_read: number;
+}
+
+export interface ExternalCostSeries {
+  /** Providers present in the window, in a stable display order (chart series + colors). */
+  providers: string[];
+  /** Per-day cost, one numeric key per provider (0-filled) — for a stacked spend chart. */
+  spendByDay: SpendDayPoint[];
+  /** Per-day token totals across all providers — for a stacked token chart. */
+  tokensByDay: TokenDayPoint[];
+  selfOnly: boolean;
+  /** True if the 50k row cap was hit — oldest days dropped; totals may undercount. */
+  truncated: boolean;
+}
+
+/** Stable display order; unknown providers sort after these, alphabetically. */
+const PROVIDER_ORDER = [
+  "cursor",
+  "claude",
+  "codex",
+  "opencode",
+  "anthropic",
+  "openai",
+  "other",
+];
+function providerRank(p: string): number {
+  const i = PROVIDER_ORDER.indexOf(p);
+  return i === -1 ? PROVIDER_ORDER.length : i;
+}
+
 type UsageCostRow = {
   member_id: string;
   provider: string;
@@ -61,14 +101,17 @@ const UNATTRIBUTED = "Unattributed";
 
 function scopeUsageCosts<Q>(query: Q, viewer: QueryLogViewer): Q {
   if (viewer.isAdmin) return query;
-  return (query as { eq(column: string, value: string): Q }).eq("member_id", viewer.memberId);
+  return (query as { eq(column: string, value: string): Q }).eq(
+    "member_id",
+    viewer.memberId,
+  );
 }
 
 export async function getExternalCosts(
   db: DbClient,
   teamId: string,
   range: Range,
-  viewer: QueryLogViewer
+  viewer: QueryLogViewer,
 ): Promise<ExternalCostsSummary> {
   const windowStart = new Date(Date.now() - rangeDays(range) * 86_400_000)
     .toISOString()
@@ -79,13 +122,13 @@ export async function getExternalCosts(
       db
         .from("usage_costs")
         .select(
-          "member_id, provider, source, project, input_tokens, output_tokens, cache_read_tokens, cost_usd, events, cost_date"
+          "member_id, provider, source, project, input_tokens, output_tokens, cache_read_tokens, cost_usd, events, cost_date",
         )
         .eq("team_id", teamId)
         .gte("cost_date", windowStart)
         .order("cost_date", { ascending: false })
         .limit(50_000),
-      viewer
+      viewer,
     ),
     db
       .from("members")
@@ -115,7 +158,9 @@ export async function getExternalCosts(
       ({
         member_id: r.member_id,
         member_name:
-          meta?.display_name ?? meta?.actor_handle ?? (r.member_id ? "Unknown" : UNATTRIBUTED),
+          meta?.display_name ??
+          meta?.actor_handle ??
+          (r.member_id ? "Unknown" : UNATTRIBUTED),
         avatar_url: meta?.avatar_url ?? null,
         providers: [],
         cost_usd: 0,
@@ -166,15 +211,109 @@ export async function getExternalCosts(
   };
 }
 
+/**
+ * Per-day time series over usage_costs for the cost charts. Day×provider spend plus daily
+ * token buckets. Tier/role scoped identically to getExternalCosts (admins → team-wide;
+ * everyone else → own rows only) via scopeUsageCosts — no RLS backstop (CLAUDE.md §5).
+ */
+export async function getExternalCostSeries(
+  db: DbClient,
+  teamId: string,
+  range: Range,
+  viewer: QueryLogViewer,
+): Promise<ExternalCostSeries> {
+  const windowStart = new Date(Date.now() - rangeDays(range) * 86_400_000)
+    .toISOString()
+    .slice(0, 10);
+
+  const costRes = await scopeUsageCosts(
+    db
+      .from("usage_costs")
+      .select(
+        "provider, input_tokens, output_tokens, cache_read_tokens, cost_usd, cost_date",
+      )
+      .eq("team_id", teamId)
+      .gte("cost_date", windowStart)
+      // Most-recent first so the 50k cap drops the OLDEST days, matching
+      // getExternalCosts (the tables) — the charts re-sort ascending below.
+      .order("cost_date", { ascending: false })
+      .limit(50_000),
+    viewer,
+  );
+
+  type SeriesRow = {
+    provider: string;
+    input_tokens: number | string;
+    output_tokens: number | string;
+    cache_read_tokens: number | string;
+    cost_usd: number | string;
+    cost_date: string;
+  };
+  const rows = (costRes.data ?? []) as SeriesRow[];
+
+  const providers = new Set<string>();
+  const spend = new Map<string, Map<string, number>>(); // date → provider → usd
+  const tokens = new Map<string, TokenDayPoint>(); // date → token buckets
+
+  for (const r of rows) {
+    const date = r.cost_date;
+    providers.add(r.provider);
+
+    const perProvider = spend.get(date) ?? new Map<string, number>();
+    perProvider.set(
+      r.provider,
+      round((perProvider.get(r.provider) ?? 0) + num(r.cost_usd), 5),
+    );
+    spend.set(date, perProvider);
+
+    const tok = tokens.get(date) ?? {
+      date,
+      input: 0,
+      output: 0,
+      cache_read: 0,
+    };
+    tok.input += num(r.input_tokens);
+    tok.output += num(r.output_tokens);
+    tok.cache_read += num(r.cache_read_tokens);
+    tokens.set(date, tok);
+  }
+
+  const providerList = [...providers].sort(
+    (a, b) => providerRank(a) - providerRank(b) || a.localeCompare(b),
+  );
+
+  const dates = [...spend.keys()].sort((a, b) => a.localeCompare(b));
+  const spendByDay: SpendDayPoint[] = dates.map((date) => {
+    const perProvider = spend.get(date)!;
+    const point: SpendDayPoint = { date };
+    for (const p of providerList) point[p] = perProvider.get(p) ?? 0;
+    return point;
+  });
+
+  const tokensByDay = [...tokens.values()].sort((a, b) =>
+    a.date.localeCompare(b.date),
+  );
+
+  return {
+    providers: providerList,
+    spendByDay,
+    tokensByDay,
+    selfOnly: !viewer.isAdmin,
+    truncated: rows.length >= 50_000,
+  };
+}
+
 /** Combined brain + external spend for a member-facing total. */
 export async function getCombinedSpend(
   db: DbClient,
   teamId: string,
   range: Range,
   viewer: QueryLogViewer,
-  externalSummary?: Pick<ExternalCostsSummary, "totals">
+  externalSummary?: Pick<ExternalCostsSummary, "totals">,
 ): Promise<{ brain_usd: number; external_usd: number; total_usd: number }> {
-  const windowStart = new Date(Date.now() - rangeDays(range) * 86_400_000).toISOString();
+  const windowStart = new Date(
+    Date.now() - rangeDays(range) * 86_400_000,
+  ).toISOString();
 
   const brainRes = await scopeQueryLog(
     db
@@ -182,19 +321,18 @@ export async function getCombinedSpend(
       .select("cost_usd")
       .eq("team_id", teamId)
       .gte("created_at", windowStart),
-    viewer
+    viewer,
   );
 
   const external =
-    externalSummary ??
-    (await getExternalCosts(db, teamId, range, viewer));
+    externalSummary ?? (await getExternalCosts(db, teamId, range, viewer));
 
   const brain_usd = round(
     ((brainRes.data ?? []) as { cost_usd: number | string }[]).reduce(
       (s, r) => s + num(r.cost_usd),
-      0
+      0,
     ),
-    5
+    5,
   );
   const external_usd = external.totals.cost_usd;
   return {
