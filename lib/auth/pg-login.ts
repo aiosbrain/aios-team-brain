@@ -25,12 +25,44 @@ export async function ensureAuthUser(email: string): Promise<string> {
   return rows[0].id;
 }
 
-/** First login: claim invited member row(s) for this email and activate them. */
-export async function linkMemberByEmail(authUserId: string, email: string): Promise<void> {
+/**
+ * First login: link this email's member rows to the auth user (identity only — every team's
+ * row, since the credential is per-email), and activate the invited row **only for `teamId`**
+ * when the login carries team context (a magic link minted for `/t/<team>`). Activation is
+ * team-scoped on purpose: with one email on multiple teams, signing in to team A must never
+ * flip team B's `invited` row to `active` — B activates on the member's first visit instead
+ * (`activateInvitedMembership`, called from `app/t/[team]/layout.tsx`).
+ */
+export async function linkMemberByEmail(
+  authUserId: string,
+  email: string,
+  teamId?: string | null
+): Promise<void> {
   await runSql(
-    `update members set auth_user_id = $1, status = 'active'
+    `update members set auth_user_id = $1
      where email = $2 and auth_user_id is null and status <> 'disabled'`,
     [authUserId, email]
+  );
+  if (teamId) {
+    await runSql(
+      `update members set status = 'active'
+       where team_id = $1 and email = $2 and status = 'invited'`,
+      [teamId, email]
+    );
+  }
+}
+
+/**
+ * The deferred half of team-scoped activation: flip the caller's own `invited` membership in
+ * one team to `active` on their first authorized visit (the team layout calls this after
+ * resolving the session user's row). `authUserId` comes from the caller's session, so this can
+ * only ever activate the caller's own membership.
+ */
+export async function activateInvitedMembership(teamId: string, authUserId: string): Promise<void> {
+  await runSql(
+    `update members set status = 'active'
+     where team_id = $1 and auth_user_id = $2 and status = 'invited'`,
+    [teamId, authUserId]
   );
 }
 
@@ -63,20 +95,16 @@ export async function loginWithPassword(
   if (!hash) return null; // no password set yet — ask an admin, don't fall back to passwordless
   if (!(await verifyPasswordHash(password, hash))) return null;
 
-  // Capture 'invited' status BEFORE the update below activates it (same pattern as redeemMagicToken).
+  // Capture 'invited' status BEFORE linking (same pattern as redeemMagicToken).
   const { rows: before } = await runSql<{ status: string }>(
     `select status from members where email = $1 and status <> 'disabled' limit 1`,
     [email]
   );
   const firstLogin = before[0]?.status === "invited";
   const id = await ensureAuthUser(email);
-  await runSql(
-    `update members
-        set auth_user_id = $1,
-            status = case when status = 'invited' then 'active' else status end
-      where email = $2 and status <> 'disabled'`,
-    [id, email]
-  );
+  // Identity linking only — a password login carries no team context, so activation is
+  // deferred to the first team visit (see linkMemberByEmail's docblock).
+  await linkMemberByEmail(id, email);
   return { user: { id, email }, firstLogin };
 }
 
@@ -185,21 +213,24 @@ export async function redeemMagicToken(raw: string): Promise<RedeemResult | null
   const tok = rows[0];
   if (!tok) return null;
 
-  // Capture 'invited' status BEFORE linkMemberByEmail activates it below.
+  // Capture 'invited' status BEFORE linkMemberByEmail activates it below, and resolve the
+  // token's team so activation stays scoped to the team the link was minted for.
   let firstLogin = false;
+  let teamId: string | null = null;
   const teamSlug = teamSlugFromNextPath(tok.next_path);
   if (teamSlug) {
-    const { rows: memberRows } = await runSql<{ status: string }>(
-      `select m.status
+    const { rows: memberRows } = await runSql<{ status: string; team_id: string }>(
+      `select m.status, m.team_id
          from members m
          join teams t on t.id = m.team_id
         where t.slug = $1 and m.email = $2 and m.status <> 'disabled'`,
       [teamSlug, tok.email]
     );
     firstLogin = memberRows[0]?.status === "invited";
+    teamId = memberRows[0]?.team_id ?? null;
   }
 
   const id = await ensureAuthUser(tok.email);
-  await linkMemberByEmail(id, tok.email);
+  await linkMemberByEmail(id, tok.email, teamId);
   return { user: { id, email: tok.email }, nextPath: tok.next_path, firstLogin };
 }

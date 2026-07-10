@@ -2,6 +2,7 @@ import Link from "next/link";
 import { CircleAlert } from "lucide-react";
 import { serverClient } from "@/lib/db/server";
 import { getSessionUser } from "@/lib/auth/session";
+import { activateInvitedMembership } from "@/lib/auth/pg-login";
 import { TeamNav, type NavEntry, type NavLeaf } from "@/components/team-nav";
 import { SignOutButton } from "@/components/account/sign-out-button";
 
@@ -47,12 +48,16 @@ export default async function TeamLayout({
 
   const { data: me } = await db
     .from("members")
-    .select("id, role, display_name, tier")
+    .select("id, role, display_name, tier, status")
     .eq("team_id", team.id)
     .eq("auth_user_id", user.id)
-    .eq("status", "active")
+    .neq("status", "disabled")
     .maybeSingle();
   if (!me) return <NoTeamScreen slug={teamSlug} />;
+  // Team-scoped activation, deferred half: signing in never activates memberships in teams the
+  // login carried no context for (see linkMemberByEmail) — the invited row flips to active here,
+  // on the member's own first visit to this team.
+  if (me.status === "invited") await activateInvitedMembership(team.id, user.id);
 
   const base = `/t/${team.slug}`;
 
