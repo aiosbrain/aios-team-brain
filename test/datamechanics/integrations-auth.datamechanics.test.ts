@@ -40,8 +40,9 @@ async function seedMemberWithAuth(
     })
     .select("id")
     .single();
-  const userId = await ensureAuthUser(email); // activates + links auth_user_id
-  await linkMemberByEmail(userId, email);
+  const userId = await ensureAuthUser(email);
+  // Team-scoped activation: pass the team so the invited row is linked AND activated here.
+  await linkMemberByEmail(userId, email, teamId);
   return { memberId: m!.id as string, userId };
 }
 

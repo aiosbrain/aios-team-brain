@@ -1,4 +1,5 @@
 import "server-only";
+import { z } from "zod";
 import type { DbClient } from "@/lib/db/types";
 import { audit } from "@/lib/api/audit";
 
@@ -19,6 +20,32 @@ export interface MemberInput {
 export interface ActorContext {
   kind?: "member" | "system";
   memberId?: string | null;
+}
+
+/** Thrown by `createMember` when the team already has a member with this email or actor
+ * handle (the `members_team_id_email_key` / `members_team_id_actor_handle_key` unique
+ * constraints) — a friendly, dedicated error instead of leaking the raw pg constraint-violation
+ * text to callers (the admin UI, the CLI). */
+export class MemberExistsError extends Error {
+  constructor() {
+    super("a member with this email or handle already exists");
+    this.name = "MemberExistsError";
+  }
+}
+
+/** Pure detector, extracted so the constraint-name matching is unit-testable without a DB: does
+ * this pg error message indicate the `members` table's team+email or team+actor_handle unique
+ * constraint was violated? */
+export function isMemberUniqueConstraintViolation(pgErrorMessage: string): boolean {
+  return /members_team_id_email_key|members_team_id_actor_handle_key/.test(pgErrorMessage);
+}
+
+/** Pure validator, extracted so it's unit-testable without a session/DB: is this a well-formed
+ * email address? `inviteMember` (`app/t/[team]/admin/actions.ts`) runs this on the
+ * trimmed/lowercased email BEFORE calling `createMember`, so a malformed address never reaches
+ * the DB or mints a member row. */
+export function isValidInviteEmail(email: string): boolean {
+  return z.string().email().safeParse(email).success;
 }
 
 export async function createMember(
@@ -44,7 +71,12 @@ export async function createMember(
     : admin.from("members").insert({ ...row, status: "invited" });
 
   const { data, error } = await builder.select("id, status").single();
-  if (error || !data) throw new Error(`create member failed: ${error?.message}`);
+  if (error || !data) {
+    if (error && isMemberUniqueConstraintViolation(error.message)) {
+      throw new MemberExistsError();
+    }
+    throw new Error(`create member failed: ${error?.message}`);
+  }
 
   await audit(admin, {
     team_id: teamId,
@@ -56,6 +88,36 @@ export async function createMember(
     meta: { email, role: input.role, upsert: Boolean(opts.upsert) },
   });
   return { id: data.id, status: data.status };
+}
+
+/**
+ * Compensating action for a failed invite: hard-deletes a just-created member row and audits the
+ * rollback (`member.deleted`, `meta.reason = "invite-rollback"`) — distinct from `deleteMember`'s
+ * own hard-delete path (which is an intentional admin removal, has a different audit meta shape,
+ * and enforces the last-admin guard, which doesn't apply here: this member was never active).
+ *
+ * Exists because `inviteMember` (`app/t/[team]/admin/actions.ts`) can't wrap `createMember` and
+ * `adminSetPassword` in one SQL transaction — `createMember` writes through the `DbClient` adapter
+ * while `adminSetPassword` writes `auth_users` via raw `runSql` (`lib/db/pg/pool`), different
+ * connections/paths. If the password write fails after the member row already landed, this is the
+ * explicit, auditable undo instead of leaving an orphaned 'invited' member with no way to sign in.
+ */
+export async function rollbackMemberCreation(
+  admin: DbClient,
+  teamId: string,
+  memberId: string,
+  opts: { actor?: ActorContext } = {}
+): Promise<void> {
+  await admin.from("members").delete().eq("id", memberId);
+  await audit(admin, {
+    team_id: teamId,
+    actor_kind: opts.actor?.kind ?? "system",
+    member_id: opts.actor?.memberId ?? null,
+    action: "member.deleted",
+    target_type: "member",
+    target_id: memberId,
+    meta: { reason: "invite-rollback" },
+  });
 }
 
 export interface UpdateRoleResult {
