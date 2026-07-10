@@ -2,11 +2,13 @@ import "server-only";
 import { createHash } from "node:crypto";
 import Anthropic from "@anthropic-ai/sdk";
 import type { DbClient } from "@/lib/db/types";
+import { adminClient } from "@/lib/db/admin";
 import { recentFacts, resolveEpisodeItems, type AtomicFact } from "./learning";
 import { GraphitiClient } from "./graphiti-client";
 import { episodeGroupId, type AccessTier } from "./group";
 import { attributeParticipants, attributedFactTexts } from "./arc-attribution";
 import { resolveHumanActorsByItem } from "./human-actors";
+import { readArcCache, writeArcCache } from "./arc-cache";
 
 /**
  * Layer 3 — narrative arcs. Gathers the recent graph substrate (facts, last 7d, tier-scoped),
@@ -282,10 +284,68 @@ function attributeArcs(arcs: NarrativeArc[], humanByItem: Map<string, string>): 
   }));
 }
 
-// In-memory cache (single-instance app). Keyed by the tier-visible group set.
-const cache = new Map<string, { arcs: NarrativeArc[]; at: number }>();
+/**
+ * Core synthesis pipeline (no caching): recent facts → attributed prompt → LLM → attributed arcs.
+ * `correctionTexts` is empty for a normal derive, populated for the human-correction recompute.
+ * Sequential, not Promise.all-able: the PROMPT needs each fact's human attribution baked in
+ * (attributedFactTexts), so item/human resolution must finish before the LLM call starts — a real
+ * latency cost, traded for a synthesis input grounded in a human from the start rather than patched
+ * after the fact.
+ */
+async function synthesizeArcs(
+  db: DbClient,
+  teamId: string,
+  groups: string[],
+  correctionTexts: string[],
+  keys: ProviderKeys
+): Promise<NarrativeArc[]> {
+  const since = new Date(Date.now() - WINDOW_DAYS * 86_400_000).toISOString();
+  const facts = await recentFacts(groups, since, MAX_FACTS);
+  // No facts and nothing to correct → nothing to synthesize. (A correction with no facts still runs
+  // the LLM, preserving the pre-cache recompute behavior.)
+  if (facts.length === 0 && correctionTexts.length === 0) return [];
+  const epToItem = await resolveEpisodeItems(groups, facts.flatMap((f) => f.episodeUuids));
+  const allItemIds = [...new Set([...epToItem.values()].map((v) => v.itemId).filter((id): id is string => !!id))];
+  const humanByItem = await resolveHumanActorsByItem(db, teamId, allItemIds);
+  const raw = await callLLMRaw(buildPrompt(attributedFactTexts(facts, epToItem, humanByItem), correctionTexts), keys);
+  return attributeArcs(parseArcsJson(raw, { facts, epToItem }), humanByItem);
+}
 
-/** Synthesize (or return cached) arcs for a team+tier. Empty when the graph/LLM is unavailable. */
+// In-memory cache (per process). Keyed by the tier-visible group set. Fronts the Postgres `arc_cache`
+// (lib/graph/arc-cache) — the persistent, cross-instance layer that survives restarts.
+const cache = new Map<string, { arcs: NarrativeArc[]; at: number }>();
+// Group keys currently being recomputed in the background, so concurrent stale reads fire ONE
+// recompute (and thus one LLM call), not N.
+const refreshing = new Set<string>();
+
+/** Fire-and-forget background recompute for a stale cache key (serve-stale-while-revalidate). Uses
+ *  its own adminClient so it doesn't depend on the request's client lifecycle. Deduped via
+ *  `refreshing`; errors are logged, never thrown (nothing awaits this). */
+function refreshArcsInBackground(teamId: string, key: string, groups: string[], keys: ProviderKeys): void {
+  if (refreshing.has(key)) return;
+  refreshing.add(key);
+  void (async () => {
+    const bg = adminClient();
+    try {
+      const arcs = await synthesizeArcs(bg, teamId, groups, [], keys);
+      cache.set(key, { arcs, at: Date.now() });
+      await writeArcCache(bg, teamId, key, arcs);
+    } catch (err) {
+      console.error("[arcs] background refresh failed:", err instanceof Error ? err.message : err);
+    } finally {
+      refreshing.delete(key);
+    }
+  })();
+}
+
+/**
+ * Return arcs for a team+tier, serve-stale-while-revalidate:
+ *   1. fresh in-memory (this process) → return instantly;
+ *   2. Postgres `arc_cache` — fresh → return; stale → return stale NOW + refresh in the background;
+ *   3. cold miss → compute inline, then persist to both caches.
+ * Empty when the graph/LLM is unavailable. Chose SWR over a global timer-driven refresh so LLM calls
+ * only happen for teams actually being viewed (not every team on a timer). See docs/design/brain-learning-panel.md.
+ */
 export async function getArcs(
   db: DbClient,
   teamId: string,
@@ -296,27 +356,31 @@ export async function getArcs(
 ): Promise<NarrativeArc[]> {
   if (groups.length === 0) return [];
   const key = groups.slice().sort().join(",");
-  const hit = cache.get(key);
-  if (hit && Date.now() - hit.at < CACHE_TTL_MS) return hit.arcs;
+  const now = Date.now();
 
-  const since = new Date(Date.now() - WINDOW_DAYS * 86_400_000).toISOString();
-  const facts = await recentFacts(groups, since, MAX_FACTS);
-  if (facts.length === 0) return [];
-  // Sequential, not Promise.all-able: the PROMPT needs each fact's human attribution baked in
-  // (attributedFactTexts), so item/human resolution must finish before the LLM call starts — a real
-  // latency cost, traded for a synthesis input that's grounded in a human from the start rather than
-  // patched after the fact.
-  const epToItem = await resolveEpisodeItems(groups, facts.flatMap((f) => f.episodeUuids));
-  const allItemIds = [...new Set([...epToItem.values()].map((v) => v.itemId).filter((id): id is string => !!id))];
-  const humanByItem = await resolveHumanActorsByItem(db, teamId, allItemIds);
-  const raw = await callLLMRaw(buildPrompt(attributedFactTexts(facts, epToItem, humanByItem), []), keys);
-  const arcs = attributeArcs(parseArcsJson(raw, { facts, epToItem }), humanByItem);
+  // 1. In-memory (fastest, same process).
+  const mem = cache.get(key);
+  if (mem && now - mem.at < CACHE_TTL_MS) return mem.arcs;
+
+  // 2. Persistent cache (survives restart, shared across instances).
+  const persisted = await readArcCache(db, teamId, key);
+  if (persisted) {
+    cache.set(key, { arcs: persisted.arcs, at: persisted.computedAt });
+    if (now - persisted.computedAt < CACHE_TTL_MS) return persisted.arcs;
+    // Stale — hand back the stale arcs immediately and refresh behind the request.
+    refreshArcsInBackground(teamId, key, groups, keys);
+    return persisted.arcs;
+  }
+
+  // 3. Cold miss — first-ever load for this key. Compute inline so the user gets a real answer.
+  const arcs = await synthesizeArcs(db, teamId, groups, [], keys);
   cache.set(key, { arcs, at: Date.now() });
+  await writeArcCache(db, teamId, key, arcs);
   return arcs;
 }
 
 /**
- * Recompute arcs with human corrections: re-derive (corrections in the prompt), refresh the cache,
+ * Recompute arcs with human corrections: re-derive (corrections in the prompt), refresh both caches,
  * AND persist each correction to Graphiti as a `correction:<arc_id>` episode (team-tier group) so it
  * informs future synthesis. Writeback is best-effort — a Graphiti hiccup doesn't fail the recompute.
  */
@@ -330,17 +394,10 @@ export async function recomputeArcs(
   keys: ProviderKeys
 ): Promise<NarrativeArc[]> {
   if (groups.length === 0) return [];
-  const since = new Date(Date.now() - WINDOW_DAYS * 86_400_000).toISOString();
-  const facts = await recentFacts(groups, since, MAX_FACTS);
-  const epToItem = await resolveEpisodeItems(groups, facts.flatMap((f) => f.episodeUuids));
-  const allItemIds = [...new Set([...epToItem.values()].map((v) => v.itemId).filter((id): id is string => !!id))];
-  const humanByItem = await resolveHumanActorsByItem(db, teamId, allItemIds);
-  const raw = await callLLMRaw(
-    buildPrompt(attributedFactTexts(facts, epToItem, humanByItem), corrections.map((c) => c.corrected_text)),
-    keys
-  );
-  const arcs = attributeArcs(parseArcsJson(raw, { facts, epToItem }), humanByItem);
-  cache.set(groups.slice().sort().join(","), { arcs, at: Date.now() });
+  const key = groups.slice().sort().join(",");
+  const arcs = await synthesizeArcs(db, teamId, groups, corrections.map((c) => c.corrected_text), keys);
+  cache.set(key, { arcs, at: Date.now() });
+  await writeArcCache(db, teamId, key, arcs);
 
   // Persist corrections as first-class episodes (team-tier group; corrections are internal).
   const client = new GraphitiClient();

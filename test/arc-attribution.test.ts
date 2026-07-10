@@ -81,9 +81,30 @@ describe("attributeFactText", () => {
     );
   });
 
-  it("leaves a fact whose subject is an ordinary human untouched", () => {
+  it("prefixes a fact with a technical/component subject with the resolved human", () => {
+    // The fix: an arc whose facts have non-person subjects still reaches synthesis with a human.
+    expect(
+      attributeFactText("the checklist evaluator was added to adversarial testing", "the checklist evaluator", [
+        "Chetan Nandakumar",
+      ])
+    ).toBe("(Chetan Nandakumar) the checklist evaluator was added to adversarial testing");
+  });
+
+  it("does not double-attribute when the subject already names the human (first-name → full-name)", () => {
     expect(attributeFactText("Chetan shipped the Linear importer", "Chetan", ["Chetan Nandakumar"])).toBe(
       "Chetan shipped the Linear importer"
+    );
+  });
+
+  it("leaves a fact untouched when no human resolves and the subject isn't an agent", () => {
+    expect(attributeFactText("the checklist evaluator was added", "the checklist evaluator", [])).toBe(
+      "the checklist evaluator was added"
+    );
+  });
+
+  it("joins up to 2 resolved humans on a component-subject fact", () => {
+    expect(attributeFactText("context management was enhanced", "context management", ["Alice", "Bob", "Carol"])).toBe(
+      "(Alice, Bob) context management was enhanced"
     );
   });
 });
@@ -95,15 +116,23 @@ describe("attributedFactTexts", () => {
   ]);
   const humanByItem = new Map([["item-aaa", "Chetan Nandakumar"]]);
 
-  it("resolves each fact's human via its episodes and only tags AI-agent subjects", () => {
+  it("resolves each fact's human via its episodes and attributes agent + component subjects", () => {
     const facts = [
       { fact: "Claude Code refactored the auth module", subject: "Claude Code", episodeUuids: ["ep-1"] },
-      { fact: "John reviewed the RLS change", subject: "John", episodeUuids: ["ep-1"] },
+      // Component subject: the human (Chetan, via item-aaa) is surfaced even though the subject
+      // isn't a person or an agent — this is the fix.
+      { fact: "the retriever gained date-awareness", subject: "the retriever", episodeUuids: ["ep-1"] },
     ];
     expect(attributedFactTexts(facts, epToItem, humanByItem)).toEqual([
       "(Chetan Nandakumar, via Claude Code) Claude Code refactored the auth module",
-      "John reviewed the RLS change",
+      "(Chetan Nandakumar) the retriever gained date-awareness",
     ]);
+  });
+
+  it("leaves a component-subject fact untouched when its item has no resolvable human", () => {
+    // item-bbb has no human in humanByItem → nothing to attribute, not an agent → unchanged.
+    const facts = [{ fact: "the parser was refactored", subject: "the parser", episodeUuids: ["ep-2"] }];
+    expect(attributedFactTexts(facts, epToItem, humanByItem)).toEqual(["the parser was refactored"]);
   });
 
   it("tags an AI-agent subject unattributed when its item has no resolvable human", () => {
