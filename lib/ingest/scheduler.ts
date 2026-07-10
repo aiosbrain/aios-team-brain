@@ -32,6 +32,7 @@ export function startIngestScheduler(): void {
     // adopt sees freshly-imported mirror tasks. Per-team opt-in; quiet no-op otherwise.
     await runInbound(db);
     await runImport(db, "github", runGithubIngestion);
+    await runAuthCleanup(db);
     // Incremental dense (semantic) indexing of newly-synced items. No-op unless dense retrieval is
     // configured (EMBEDDINGS_URL + pgvector schema); best-effort — never fails the tick. A batch where
     // items were SCANNED but all FAILED (e.g. embeddings quota/outage) records an ERROR run so the
@@ -151,6 +152,49 @@ export function startIngestScheduler(): void {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`[ingest] ${label} tick failed:`, msg);
       await recordIngestRun(db, { source: label, trigger: "scheduler", ok: false, errors: [msg], startedAt });
+    }
+  }
+
+  // Housekeeping: purge expired/used auth_tokens + oauth_states rows (lib/auth/cleanup). A
+  // scheduler tick runs far more often than this needs to, so it's throttled to once/day —
+  // checked via the last recorded 'auth_cleanup' ingest_runs row, the same "read the last
+  // recorded run" pattern the dense-index leg uses for its own edge detection
+  // (lib/query/retrieval-alert.lastDenseRunFailed). A quiet pass (nothing to purge, or throttled)
+  // logs and records nothing.
+  const AUTH_CLEANUP_INTERVAL_MS = 24 * 60 * 60_000;
+  async function runAuthCleanup(db: ReturnType<typeof adminClient>): Promise<void> {
+    const startedAt = Date.now();
+    try {
+      const { data: last } = await db
+        .from("ingest_runs")
+        .select("started_at")
+        .eq("source", "auth_cleanup")
+        .order("started_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      const lastStartedAt = (last as { started_at: string } | null)?.started_at;
+      if (lastStartedAt && Date.now() - new Date(lastStartedAt).getTime() < AUTH_CLEANUP_INTERVAL_MS) {
+        return; // already ran within the last day
+      }
+      const { purgeExpiredAuthRows } = await import("@/lib/auth/cleanup");
+      const result = await purgeExpiredAuthRows();
+      if (result.authTokens || result.oauthStates) {
+        console.info(
+          `[ingest] auth-cleanup: purged ${result.authTokens} auth_tokens, ${result.oauthStates} oauth_states`
+        );
+      }
+      await recordIngestRun(db, {
+        source: "auth_cleanup",
+        trigger: "scheduler",
+        ok: true,
+        updated: result.authTokens + result.oauthStates,
+        meta: { authTokens: result.authTokens, oauthStates: result.oauthStates },
+        startedAt,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error("[ingest] auth-cleanup tick failed:", msg);
+      await recordIngestRun(db, { source: "auth_cleanup", trigger: "scheduler", ok: false, errors: [msg], startedAt });
     }
   }
 

@@ -4,7 +4,7 @@ import { headers } from "next/headers";
 import { revalidatePath } from "next/cache";
 import { adminClient } from "@/lib/db/admin";
 import { requireTeamAdmin as requireAdmin } from "@/lib/auth/guard";
-import { createMember } from "@/lib/admin/members";
+import { createMember, rollbackMemberCreation, MemberExistsError, isValidInviteEmail } from "@/lib/admin/members";
 import { syncMemberActor } from "@/lib/graph/company-actors";
 import { issueApiKey as issueApiKeyPrimitive, revokeApiKey as revokeApiKeyPrimitive } from "@/lib/admin/keys";
 import { issueLoginLink } from "@/lib/admin/login";
@@ -27,7 +27,16 @@ async function resolveTeamUrl(): Promise<string> {
 }
 
 export type InviteMemberResult =
-  | { ok: true; mode: "magic-link"; email: string; emailDelivered: boolean }
+  | {
+      ok: true;
+      mode: "magic-link";
+      email: string;
+      emailDelivered: boolean;
+      /** Set ONLY when `emailDelivered` is false — the already-issued sign-in link, so the admin
+       * has a working fallback instead of a dead end. Security-equivalent to the manual path's
+       * password reveal: same admin, same screen, shown once. */
+      loginUrl?: string;
+    }
   | {
       ok: true;
       mode: "manual";
@@ -74,6 +83,10 @@ export async function inviteMember(
   }
 
   const email = form.email.trim().toLowerCase();
+  if (!isValidInviteEmail(email)) {
+    return { ok: false, error: "invalid email address" };
+  }
+
   const db = adminClient();
   let newMemberId: string;
   try {
@@ -89,9 +102,27 @@ export async function inviteMember(
       { actor: { kind: "member", memberId: ctx.memberId } }
     );
     newMemberId = created.id;
-    if (!useMagicLink) await adminSetPassword(email, password);
   } catch (e) {
+    if (e instanceof MemberExistsError) return { ok: false, error: e.message };
     return { ok: false, error: e instanceof Error ? e.message : "create failed" };
+  }
+
+  if (!useMagicLink) {
+    try {
+      await adminSetPassword(email, password);
+    } catch (e) {
+      // Compensating action, not a transaction: createMember writes through the DbClient adapter
+      // while adminSetPassword writes auth_users via raw runSql (lib/db/pg/pool) — different
+      // connections/paths, so there's no single SQL transaction to wrap them in. If the password
+      // write fails AFTER the member row already landed, leaving it in place would orphan an
+      // 'invited' member with no way to ever sign in (no password, and magic-link isn't in play
+      // on this branch). rollbackMemberCreation hard-deletes it and audits the rollback so it's
+      // traceable, then we surface the failure so the admin can retry.
+      await rollbackMemberCreation(db, ctx.teamId, newMemberId, {
+        actor: { kind: "member", memberId: ctx.memberId },
+      });
+      return { ok: false, error: e instanceof Error ? e.message : "could not set initial password" };
+    }
   }
 
   // Best-effort — the company graph is a derived context surface, not the source of truth; a
@@ -131,7 +162,16 @@ export async function inviteMember(
     }
 
     revalidatePath(`/t/${teamSlug}/admin/members`);
-    return { ok: true, mode: "magic-link", email, emailDelivered };
+    return {
+      ok: true,
+      mode: "magic-link",
+      email,
+      emailDelivered,
+      // Same admin, same screen, shown once — security-equivalent to the manual path's password
+      // reveal. Only surfaced when delivery failed; otherwise the admin has no legitimate need to
+      // see the credential (it went out over email).
+      ...(emailDelivered ? {} : { loginUrl: url }),
+    };
   }
 
   const manualReason = form.manualInvite ? "admin-choice" : "no-mail";

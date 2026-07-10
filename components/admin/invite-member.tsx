@@ -45,8 +45,22 @@ export function InviteMember({ teamSlug }: { teamSlug: string }) {
         <p className="text-sm font-medium text-ink">
           {issued.emailDelivered
             ? `Invite email sent to ${issued.email} with a one-time sign-in link (valid 7 days).`
-            : `Member created for ${issued.email}, but we couldn't confirm the invite email was delivered. Check your mail provider settings, or ask them to request a sign-in link at the login page.`}
+            : `Member created for ${issued.email}, but we couldn't confirm the invite email was delivered.`}
         </p>
+        {!issued.emailDelivered && issued.loginUrl && (
+          <>
+            <pre className="whitespace-pre-wrap break-all rounded-lg bg-surface-overlay px-3 py-2 font-mono text-xs text-ink">
+              {issued.loginUrl}
+            </pre>
+            <div className="flex gap-2">
+              <CopyButton text={issued.loginUrl} label="Copy sign-in link" />
+            </div>
+            <p className="text-xs text-ink-tertiary">
+              Email delivery failed — share this sign-in link directly, or re-invite with a manual
+              password.
+            </p>
+          </>
+        )}
         <button
           onClick={reset}
           className="self-start rounded-lg bg-violet px-4 py-2 text-sm font-medium text-white"

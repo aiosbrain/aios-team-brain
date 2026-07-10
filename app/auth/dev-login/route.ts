@@ -12,7 +12,7 @@ export const runtime = "nodejs";
  * isn't single-use-fragile. Hard-disabled outside development.
  */
 export async function GET(request: NextRequest) {
-  if (process.env.NODE_ENV === "production" && process.env.ALLOW_DEV_LOGIN !== "1") {
+  if (process.env.NODE_ENV === "production") {
     return new NextResponse("dev-login is disabled", { status: 404 });
   }
 

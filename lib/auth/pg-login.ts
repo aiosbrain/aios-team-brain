@@ -2,6 +2,7 @@ import "server-only";
 import { createHash, randomBytes } from "node:crypto";
 import { runSql } from "@/lib/db/pg/pool";
 import { hashPassword, verifyPasswordHash } from "./password";
+import { purgeExpiredAuthRows } from "./cleanup";
 import type { SessionUser } from "./pg-session";
 
 /**
@@ -150,6 +151,12 @@ export async function issueMagicToken(
      values ($1, $2, $3, $4)`,
     [hash, email, nextPath, expires]
   );
+  // Opportunistic housekeeping — every token issuance is a natural, low-cost moment to sweep
+  // expired/used auth_tokens + oauth_states rows (two small indexed deletes). Fire-and-forget:
+  // must never block or fail token issuance, so errors are swallowed here, not propagated.
+  void purgeExpiredAuthRows().catch((err) => {
+    console.error("[auth] opportunistic cleanup failed:", err instanceof Error ? err.message : err);
+  });
   return raw;
 }
 

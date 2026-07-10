@@ -134,6 +134,16 @@ Two principals, one tier model:
 - **Tiers** — `team` (sees all) vs `external` (sees only external). `admin`/`private`
   are rejected with **422** at the API and never reach the database.
 
+**Accepted behavior — the magic-link enumeration oracle.** `POST /api/auth/request-magic-link`'s
+explicit 403 `not_recognized` for an unknown email is a deliberate, disclosed design choice, not an
+oversight: this is an invite-only, self-hosted surface with a small known-member set, so confirming
+"does this email have an account" carries little practical risk, and the alternative (a fake-success
+response for a typo'd email) would silently break the sign-in UX with no way to recover. `POST
+/api/auth/login` — the default, always-available sign-in path — deliberately does NOT make the same
+tradeoff: its failure response stays a uniform 401 `invalid_credentials` regardless of cause, because
+password login is reachable unconditionally while the magic-link route is only ever offered by the
+login form when an admin has opted into mail delivery (`magicLinkAvailable()`).
+
 ## Key flows
 
 ### Sync ingest — `POST /api/v1/items`
