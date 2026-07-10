@@ -1051,6 +1051,20 @@ create table if not exists brand_profiles (
   updated_at timestamptz not null default now()
 );
 
+-- Brand assets: per-team reference library (website/URLs, logo/image links, reference examples)
+-- the Brand Brain layers into generation. Non-secret. Single writer: lib/brand/assets.ts.
+create table if not exists brand_assets (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  kind text not null check (kind in ('url', 'asset', 'reference')),
+  label text not null,
+  url text,
+  notes text not null default '',
+  created_by uuid references members(id) on delete set null,
+  created_at timestamptz not null default now()
+);
+create index if not exists brand_assets_team_idx on brand_assets (team_id, created_at desc);
+
 -- ── Social Brain content domain (M2 foundation) ──────────────────────────────
 -- The durable data model + lifecycle for opportunity → plan → variant. Each row carries an
 -- `access` tier inherited from its source evidence, so tier isolation (CLAUDE.md §5) propagates

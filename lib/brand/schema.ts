@@ -65,6 +65,34 @@ export type BrandKnowledge = z.infer<typeof brandKnowledgeSchema>;
 export type BrandGovernance = z.infer<typeof brandGovernanceSchema>;
 export type BrandProfileInput = z.infer<typeof brandProfileSchema>;
 
+/** A brand asset: a reference URL, an image/logo asset link, or an example to emulate. */
+export const brandAssetSchema = z
+  .object({
+    kind: z.enum(["url", "asset", "reference"]),
+    label: z.string().trim().min(1).max(200),
+    url: z.union([z.string().trim().url().max(2000), z.literal("")]).optional(),
+    notes: z.string().max(2000).optional(),
+  })
+  .strict()
+  .superRefine((v, ctx) => {
+    if ((v.kind === "url" || v.kind === "asset") && !v.url) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: "a URL is required for this kind", path: ["url"] });
+    }
+  });
+
+export type BrandAssetInput = z.infer<typeof brandAssetSchema>;
+
+/** Validate an untrusted brand asset; throws BrandProfileError with a readable reason. */
+export function validateBrandAsset(input: unknown): BrandAssetInput {
+  const parsed = brandAssetSchema.safeParse(input);
+  if (!parsed.success) {
+    const first = parsed.error.issues[0];
+    const path = first.path.join(".") || "(root)";
+    throw new BrandProfileError(`invalid brand asset: ${path} — ${first.message}`);
+  }
+  return parsed.data;
+}
+
 /** Overall cap on the serialized profile (defense against an oversized config blob). */
 export const MAX_BRAND_BYTES = 32 * 1024;
 
