@@ -1,12 +1,9 @@
 import type { ThroughputCostRow } from "@/lib/metrics/members";
+import { MemberAvatar } from "@/components/people/member-avatar";
 
 function fmtUsd(n: number | null): string {
   if (n == null) return "—";
   return `$${n.toFixed(n < 1 ? 4 : 2)}`;
-}
-
-function initial(r: ThroughputCostRow): string {
-  return (r.member_name || "?").slice(0, 1).toUpperCase();
 }
 
 /**
@@ -38,14 +35,10 @@ export function ThroughputCostTable({ rows }: { rows: ThroughputCostRow[] }) {
             <tr key={r.member_id} className="border-b border-border-subtle last:border-0">
               <td className="px-4 py-3">
                 <span className="flex items-center gap-2">
-                  {r.avatar_url ? (
-                    // eslint-disable-next-line @next/next/no-img-element
-                    <img src={r.avatar_url} alt="" className="size-6 rounded-full" />
-                  ) : (
-                    <span className="flex size-6 items-center justify-center rounded-full bg-surface-inset text-[10px] font-medium text-ink-tertiary">
-                      {initial(r)}
-                    </span>
-                  )}
+                  <MemberAvatar
+                    person={{ displayName: r.member_name, avatarUrl: r.avatar_url, avatarDataUrl: r.avatar_data_url }}
+                    size={24}
+                  />
                   <span className="font-medium text-ink">{r.member_name}</span>
                 </span>
               </td>

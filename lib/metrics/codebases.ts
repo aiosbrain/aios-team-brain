@@ -318,6 +318,7 @@ export interface ContributorRow {
   member_id: string | null;
   member_name: string | null;
   avatar_url: string | null;
+  avatar_data_url: string | null;
   github_login: string | null;
   commits: number;
   ai_commits: number;
@@ -393,7 +394,7 @@ export async function getCodebaseDetail(
     "test_coverage_functions_pct, test_coverage_branches_pct, recent_commits, " +
     "readiness_level, readiness_pct, readiness_pillars";
 
-  const [metricsRes, contribRes, issuesRes, membersRes] = await Promise.all([
+  const [metricsRes, contribRes, issuesRes, membersRes, profilesRes] = await Promise.all([
     // NOT windowed: the breakdown/headline reflect the LAST scan even if it predates the range
     // (a stale detail page keeps its last-known values). The trend windows this series in JS below.
     db
@@ -416,9 +417,17 @@ export async function getCodebaseDetail(
       .order("updated_at", { ascending: false })
       .limit(200),
     db.from("members").select("id, display_name, github_login, avatar_url").eq("team_id", teamId),
+    // Uploaded avatars live on member_profiles (1:1, separate table) — sibling query, merged in JS.
+    db.from("member_profiles").select("member_id, avatar_data_url").eq("team_id", teamId),
   ]);
 
   type MemberMeta = { display_name: string | null; github_login: string | null; avatar_url: string | null };
+  const avatarDataByMember = new Map(
+    ((profilesRes.data ?? []) as { member_id: string; avatar_data_url: string | null }[]).map((p) => [
+      p.member_id,
+      p.avatar_data_url,
+    ])
+  );
   const members = new Map<string, MemberMeta>();
   for (const m of (membersRes.data ?? []) as ({ id: string } & MemberMeta)[]) {
     members.set(m.id, { display_name: m.display_name, github_login: m.github_login, avatar_url: m.avatar_url });
@@ -520,6 +529,7 @@ export async function getCodebaseDetail(
         member_id: r.member_id,
         member_name: meta?.display_name ?? null,
         avatar_url: meta?.avatar_url ?? null,
+        avatar_data_url: r.member_id ? (avatarDataByMember.get(r.member_id) ?? null) : null,
         github_login: meta?.github_login ?? null,
         commits: 0,
         ai_commits: 0,

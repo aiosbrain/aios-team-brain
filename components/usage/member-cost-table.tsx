@@ -1,4 +1,5 @@
 import type { MemberCostRow } from "@/lib/metrics/members";
+import { MemberAvatar } from "@/components/people/member-avatar";
 
 function fmtUsd(n: number): string {
   return `$${n.toFixed(n < 1 ? 4 : 2)}`;
@@ -6,10 +7,6 @@ function fmtUsd(n: number): string {
 
 function fmtNum(n: number): string {
   return n.toLocaleString("en-US");
-}
-
-function initial(r: MemberCostRow): string {
-  return (r.member_name || "?").slice(0, 1).toUpperCase();
 }
 
 /** Brain spend per member (query_log). Reuses the codebases contributor-table visual language. */
@@ -36,14 +33,10 @@ export function MemberCostTable({ rows }: { rows: MemberCostRow[] }) {
             >
               <td className="px-4 py-3">
                 <span className="flex items-center gap-2">
-                  {r.avatar_url ? (
-                    // eslint-disable-next-line @next/next/no-img-element
-                    <img src={r.avatar_url} alt="" className="size-6 rounded-full" />
-                  ) : (
-                    <span className="flex size-6 items-center justify-center rounded-full bg-surface-inset text-[10px] font-medium text-ink-tertiary">
-                      {initial(r)}
-                    </span>
-                  )}
+                  <MemberAvatar
+                    person={{ displayName: r.member_name, avatarUrl: r.avatar_url, avatarDataUrl: r.avatar_data_url }}
+                    size={24}
+                  />
                   <span className="font-medium text-ink">{r.member_name}</span>
                   {!r.member_id ? (
                     <span className="text-[10px] uppercase tracking-wider text-ink-tertiary">

@@ -77,6 +77,7 @@ export default async function TeamLayout({
         // github-*, …) rather than human work-projects. Unhide once it shows real projects.
         // { icon: "projects", label: "Projects", href: `${base}/projects` },
         { icon: "decisions", label: "Decisions", href: `${base}/decisions` },
+        { icon: "meetings", label: "Meetings", href: `${base}/meetings` },
       ],
     },
     { icon: "library", label: "Data", href: `${base}/library` },

@@ -6,12 +6,15 @@ import { serverClient } from "@/lib/db/server";
 import { currentMember } from "@/lib/auth/guard";
 import { getMemberProfile } from "@/lib/metrics/codebases";
 import { getMemberContext } from "@/lib/identity/context";
+import { getMemberAvatar } from "@/lib/identity/profile";
 import { parseRange } from "@/lib/metrics/range";
 import { RangeSelector } from "@/components/dashboard/range-selector";
 import { CommitHeatmap } from "@/components/codebases/commit-heatmap";
 import { MemberContextPanel } from "@/components/people/member-context";
 import { ContextEditor } from "@/components/people/context-editor";
 import { MyApiKeys, type MyKeyRow } from "@/components/people/my-api-keys";
+import { MemberAvatar } from "@/components/people/member-avatar";
+import { AvatarUpload } from "@/components/people/avatar-upload";
 
 export const metadata: Metadata = { title: "Profile" };
 
@@ -83,6 +86,12 @@ export default async function PersonPage({
   const canEdit = !!context && (me.id === p.member_id || me.role === "admin");
   const isSelf = me.id === p.member_id;
 
+  const avatarPerson = {
+    displayName: p.name,
+    avatarUrl: p.avatar_url,
+    avatarDataUrl: await getMemberAvatar(db, p.member_id),
+  };
+
   let myKeys: MyKeyRow[] = [];
   if (isSelf) {
     const { data } = await db
@@ -107,13 +116,10 @@ export default async function PersonPage({
         </Link>
         <div className="mt-2 flex items-start justify-between gap-3">
           <div className="flex items-center gap-3">
-            {p.avatar_url ? (
-              // eslint-disable-next-line @next/next/no-img-element
-              <img src={p.avatar_url} alt="" className="size-14 rounded-full" />
+            {canEdit ? (
+              <AvatarUpload teamSlug={teamSlug} memberId={p.member_id} person={avatarPerson} />
             ) : (
-              <span className="flex size-14 items-center justify-center rounded-full bg-surface-inset text-xl font-medium text-ink-tertiary">
-                {p.name.slice(0, 1).toUpperCase()}
-              </span>
+              <MemberAvatar person={avatarPerson} size={56} />
             )}
             <div>
               <h1 className="font-display text-2xl text-ink">{p.name}</h1>

@@ -11,6 +11,7 @@ import {
   removeTimeOff,
   setMemberGoal,
   removeMemberGoal,
+  setMemberAvatar,
   type ProfileInput,
   type TimeOffInput,
   type GoalInput,
@@ -126,6 +127,25 @@ export async function deleteMemberGoal(
   if (!ctx) return { ok: false, error: "not allowed" };
   try {
     await removeMemberGoal(adminClient(), ctx.teamId, id, {
+      actor: { kind: "member", memberId: ctx.actorMemberId },
+    });
+    revalidatePath(`/t/${teamSlug}/people/${memberId}`);
+    return { ok: true };
+  } catch (e) {
+    return fail(e);
+  }
+}
+
+/**
+ * Set (dataUrl present) or remove (dataUrl null) a member's profile picture. Same edit gate as the
+ * rest of this file (self or admin). The client is responsible for resizing/compressing to a data:
+ * URL before calling this — validation of size/format happens in the single writer.
+ */
+export async function saveAvatar(teamSlug: string, memberId: string, dataUrl: string | null): Promise<Result> {
+  const ctx = await gate(teamSlug, memberId);
+  if (!ctx) return { ok: false, error: "not allowed" };
+  try {
+    await setMemberAvatar(adminClient(), ctx.teamId, memberId, dataUrl, {
       actor: { kind: "member", memberId: ctx.actorMemberId },
     });
     revalidatePath(`/t/${teamSlug}/people/${memberId}`);

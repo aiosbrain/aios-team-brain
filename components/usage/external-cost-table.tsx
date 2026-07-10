@@ -1,4 +1,5 @@
 import type { ExternalMemberCosts } from "@/lib/metrics/external-costs";
+import { MemberAvatar } from "@/components/people/member-avatar";
 
 function fmtUsd(n: number): string {
   return `$${n.toFixed(n < 1 ? 4 : 2)}`;
@@ -6,10 +7,6 @@ function fmtUsd(n: number): string {
 
 function fmtNum(n: number): string {
   return n.toLocaleString("en-US");
-}
-
-function initial(name: string): string {
-  return (name || "?").slice(0, 1).toUpperCase();
 }
 
 /** External AI provider spend per member (usage_costs). */
@@ -28,14 +25,10 @@ export function ExternalCostTable({ rows }: { rows: ExternalMemberCosts[] }) {
       {rows.map((r) => (
         <div key={r.member_id ?? "unattributed"} className="prism-card overflow-x-auto">
           <div className="flex items-center gap-2 border-b border-border-subtle px-4 py-3">
-            {r.avatar_url ? (
-              // eslint-disable-next-line @next/next/no-img-element
-              <img src={r.avatar_url} alt="" className="size-6 rounded-full" />
-            ) : (
-              <span className="flex size-6 items-center justify-center rounded-full bg-surface-inset text-[10px] font-medium text-ink-tertiary">
-                {initial(r.member_name)}
-              </span>
-            )}
+            <MemberAvatar
+              person={{ displayName: r.member_name, avatarUrl: r.avatar_url, avatarDataUrl: r.avatar_data_url }}
+              size={24}
+            />
             <span className="font-medium text-ink">{r.member_name}</span>
             <span className="ml-auto font-medium text-emerald">{fmtUsd(r.cost_usd)}</span>
           </div>
