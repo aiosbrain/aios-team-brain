@@ -70,27 +70,17 @@ export default async function TeamLayout({
     settingsChildren.push({ icon: "admin", label: "Admin", href: `${base}/admin` });
   }
 
-  // Grouped IA: ~6 primary entries. "Work" gathers the operational surfaces; Skills folds
-  // into Data (reached at /library/skills, not a top-level peer).
+  // Lean primary IA (2026-07-10, product call). Removed from the left nav — routes still resolve by
+  // direct URL, only the nav entry was cut: "Tasks" (/tasks), "Maturity" (/maturity), "Decisions"
+  // (/decisions, empty + unused). "Data" moved under Admin → Data (verification/debug view, now
+  // admin-gated). The "Work" group is dropped (nothing left in it; Projects stays commented out).
   const items: NavEntry[] = [
     { icon: "home", label: "Home", href: base, exact: true },
-    {
-      label: "Work",
-      children: [
-        { icon: "tasks", label: "Tasks", href: `${base}/tasks` },
-        // Projects hidden for now — the tab currently surfaces ingestion namespaces (slack, commits,
-        // github-*, …) rather than human work-projects. Unhide once it shows real projects.
-        // { icon: "projects", label: "Projects", href: `${base}/projects` },
-        { icon: "decisions", label: "Decisions", href: `${base}/decisions` },
-      ],
-    },
-    { icon: "library", label: "Data", href: `${base}/library` },
     { icon: "codebases", label: "Codebases", href: `${base}/codebases` },
-    { icon: "maturity", label: "Maturity", href: `${base}/maturity` },
+    { icon: "learning", label: "Learning", href: `${base}/learning` },
+    { icon: "query", label: "Query", href: `${base}/query` },
+    { label: "Settings", children: settingsChildren },
   ];
-  items.push({ icon: "learning", label: "Learning", href: `${base}/learning` });
-  items.push({ icon: "query", label: "Query", href: `${base}/query` });
-  items.push({ label: "Settings", children: settingsChildren });
 
   return (
     <div className="flex min-h-dvh flex-1 bg-surface-raised">

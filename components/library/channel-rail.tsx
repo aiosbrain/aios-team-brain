@@ -33,11 +33,13 @@ const DOT_TITLE: Record<Freshness, string> = {
  * hydration drift — this component only filters.
  */
 export function ChannelRail({
-  teamSlug,
+  basePath,
   channels,
   selectedKey,
 }: {
-  teamSlug: string;
+  /** Route the channel links resolve against (e.g. `/t/acme/admin/data`). Selecting a channel
+   *  appends `?channel=`, so the server re-renders the feed on that page. */
+  basePath: string;
   channels: RailChannel[];
   selectedKey: string | null;
 }) {
@@ -87,7 +89,7 @@ export function ChannelRail({
                 return (
                   <Link
                     key={c.key}
-                    href={`/t/${teamSlug}/library?channel=${encodeURIComponent(c.key)}`}
+                    href={`${basePath}?channel=${encodeURIComponent(c.key)}`}
                     aria-current={active ? "true" : undefined}
                     className={`flex items-center gap-2 rounded-lg px-2 py-1.5 text-xs transition-colors ${
                       active ? "bg-violet/10 text-violet" : "text-ink-secondary hover:bg-surface-raised"
