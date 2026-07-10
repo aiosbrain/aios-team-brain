@@ -20,7 +20,16 @@ export interface DenseHit {
   kind: string;
   synced_at: string;
   project: string;
+  dist: number; // cosine distance to the query (0 = identical … 2 = opposite); lower = more relevant
 }
+
+// Relevance floor for the vector search: nearest-neighbor ALWAYS returns its N closest chunks no
+// matter how far away, so an absent topic still yields "matches". Without a ceiling those far hits
+// (a) become junk context and (b) flip retrieve()'s grounding signal true — defeating the IDF
+// grounding safety. Only hits within this cosine distance are returned, so a dense hit is a REAL
+// semantic match. 0.6 (~similarity 0.4) keeps genuine paraphrase matches while rejecting the
+// unrelated tail; tune per embedding model via DENSE_MAX_DISTANCE.
+const DENSE_MAX_DISTANCE = Number(process.env.DENSE_MAX_DISTANCE ?? 0.6);
 
 export async function denseSearch(
   teamId: string,
@@ -45,11 +54,13 @@ export async function denseSearch(
       params.push(projectSlug);
       where += ` and p.slug = $${params.length}`;
     }
+    params.push(DENSE_MAX_DISTANCE);
+    const distIdx = params.length;
     params.push(limit);
     const limitIdx = params.length;
 
     const sql = `
-      select item_id, content, path, kind, synced_at, project from (
+      select item_id, content, path, kind, synced_at, project, dist from (
         select distinct on (c.item_id)
           c.item_id, c.content, i.path, i.kind, i.synced_at, coalesce(p.slug, '') as project,
           (c.embedding <=> $1::vector) as dist
@@ -59,6 +70,7 @@ export async function denseSearch(
         where ${where}
         order by c.item_id, (c.embedding <=> $1::vector)
       ) best
+      where dist <= $${distIdx}
       order by dist asc
       limit $${limitIdx}`;
 
@@ -69,6 +81,7 @@ export async function denseSearch(
       kind: string;
       synced_at: string | Date;
       project: string;
+      dist: number | string;
     }>(sql, params);
 
     return res.rows.map((r) => ({
@@ -79,6 +92,7 @@ export async function denseSearch(
       synced_at:
         r.synced_at instanceof Date ? r.synced_at.toISOString() : String(r.synced_at ?? ""),
       project: r.project,
+      dist: typeof r.dist === "number" ? r.dist : Number(r.dist) || 0,
     }));
   } catch {
     return []; // degrade to keyword FTS + Graphiti
