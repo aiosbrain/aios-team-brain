@@ -34,7 +34,7 @@ Reason from this table, not from a random call site.
 | Identity | `teams`, `members`, `api_keys` | admin UI / seed / `lib/admin/*` (CLI: create/disable/delete/change-role members, rename teams, issue/revoke keys) | `lib/auth`, guards | role-gated; `key_hash` column-revoked; member disable/delete/role-change + team rename are audited (`member.disabled`/`member.deleted`/`member.role_changed`/`team.renamed`); an existing member's role is editable and a member is removable (soft-disable) from **Admin → Members** (`updateMemberRole` → `setMemberRole`; `deleteMember` → `removeMember`); a permanent hard delete stays CLI-only (`scripts/admin.ts delete-member <email> --hard`); role-change and remove both refuse to touch the last active admin (no lockout) |
 | Identities (author→member) | `member_emails` (email/git aliases) + `member_identities` (provider user ids: slack/linear/plane/… ) (+ `members.github_login`/`avatar_url`) | `lib/admin/*` + GitHub sync (`lib/codebases/github`) for emails; **`lib/identity/member-identities` only** (`setMemberIdentity`/`removeMemberIdentity`) for provider ids — auto-mapped by email via the shared **`lib/identity/provider-sync.syncProviderIdentities`** (Slack/Linear/Plane connectors call it in `lib/ingest/run`); admins view + correct every link in the **Admin → Members "Identities" panel** (`lib/identity/list.listMemberIdentities` reader; `linkMemberIdentity`/`unlinkMemberIdentity`/`addMemberEmail`/`removeMemberEmail` actions) — the fix for "different email per platform"; the **"Re-attribute content"** button (`reattributeIdentitiesNow` → `lib/ingest/reattribute.reattributeItems`) re-applies current mappings to already-ingested items (which were attributed at ingest time) | **`lib/identity/resolve`** (the one resolver: `byEmail` + `byProviderId`) → `lib/codebases/ingest`, `lib/ingest` Slack/Linear/Plane per-author attribution (each issue's assignee, each thread's author), costs/maturity, dashboard | team-scoped one-to-one (`unique(team_id,email)` / `unique(team_id,provider,external_id)`); cross-member remap blocked unless forced. **Slack auto-map needs `users:read.email`** (Linear/Plane carry emails via their API); else map manually |
 | Identity context (per-member) | `member_profiles` (1:1: timezone, `working_hours`, `preferred_channels`, location, bio) + `member_time_off` (PTO/holiday ranges) + `member_goals` (OKRs/goals, `source`-tagged) | **`lib/identity/profile` only** (single-writer guarded; validates tz/working-hours/channel-allowlist/dates + audits) — manual self-service profile + admin edit; `member_goals.source` ≠ `manual` reserved for a future JIRA/Plane-initiative importer (idempotent on `(team,source,external_id)` via a partial unique index) | **`lib/identity/context.getMemberContext`** (folds profile + time-off + goals + projects DERIVED from `tasks.assignee`) → People page (`app/t/[team]/people/[handle]`) | team-tier only — `canSeeMemberContext` gate returns null for `external` (sole enforcement, no RLS backstop); guarded by `test/guards/member-context-tier-filter` |
-| Member provisioning | `member_provisioning` | **`lib/provisioning/run` only** (single writer; `runProvisioning`) — the tool-invite cascade upserts one row per (member, tool) | Admin → Members provisioning status (later UI PR) via `getMemberProvisioning` | team-tier (admin area); no per-row tier column, no RLS backstop; audited (`member.provisioned`, tool + status only — never emails/links). Adapters (`lib/provisioning/{linear,slack,github}`) read the team's enabled `integrations` config/secret to send/surface invites; Slack is link-only (no invite API), GitHub uses `POST /orgs/{org}/invitations`, Linear uses the `organizationInviteCreate` GraphQL mutation |
+| Member provisioning | `member_provisioning` | **`lib/provisioning/run` only** (single writer; `runProvisioning`) — the tool-invite cascade upserts one row per (member, tool). Driven by both invite triggers via the shared `lib/admin/invite` core (admin action `inviteMember` + `POST /api/v1/members/invite`) and by the members-table per-tool retry (`retryProvisioning`) | Admin → Members provisioning-status badges via `getMemberProvisioning`; the invite success card renders the just-run results | team-tier (admin area); no per-row tier column, no RLS backstop; audited (`member.provisioned`, tool + status only — never emails/links). Adapters (`lib/provisioning/{linear,slack,github}`) read the team's enabled `integrations` config/secret to send/surface invites; Slack is link-only (no invite API), GitHub uses `POST /orgs/{org}/invitations`, Linear uses the `organizationInviteCreate` GraphQL mutation |
 | Sessions (postgres) | `auth_users`, `auth_tokens` | `lib/auth/pg-*` | `getSessionUser` | signed httpOnly cookie |
 | Personal Slack token + OAuth state | `member_secrets` (per-member encrypted `xoxp` "act as me" token) + `oauth_states` (single-use OAuth nonces) | **`lib/member-secrets/manage` only** (`setMemberSecret`/`deleteMemberSecret`) for the token; **`lib/auth/slack-oauth-state` only** for nonces (mint at `GET /api/auth/slack/start`, atomically consume at `/callback`) | `getMemberSecret` → owner-only `GET /api/v1/me/slack-token` (paste path) + `GET /api/auth/slack/status` (connected/identity, never the token); nonces are consume-once, read nowhere else | token encrypted at rest (AES-256-GCM, `lib/secrets`), returned only over the owner-authed token endpoint, never logged. OAuth state = signed short-TTL JWT (HS256, `AUTH_SECRET`) bound to the single-use `oauth_states` nonce → CSRF + replay guard; **residual v1 risk:** first-use code-injection if an *unused* signed state leaks within its 10-min TTL (v2: PKCE/browser-binding) |
 | Rate limits | `rate_limits` | `rate_limit_hit` rpc | — | service-role only |
@@ -92,20 +92,33 @@ flowchart LR
 ## Auth & access tiers
 
 This server **implements brain-api v1.6** (the wire contract; source of truth:
-`aios-workspace/docs/brain-api.md`). That version is pinned in code as `BRAIN_API_VERSION`
+`aios-workspace/docs/brain-api.md`). The member-invite endpoint (`POST /api/v1/members/invite`)
+is built to the v1.7 invite contract; the formal `BRAIN_API_VERSION` bump to `1.7` is a separate
+coordinated step (it regenerates the shared `brain-contract` fixture in lockstep with
+`aios-workspace`). That version is pinned in code as `BRAIN_API_VERSION`
 (`lib/api/version.ts`) and asserted against this sentence by
 `test/guards/contract-version.test.ts` — bump all three together on a contract change.
 
 Two principals, one tier model:
 
 - **Humans** — invite-only, two sign-in mechanisms:
-  - **Admin invite (`inviteMember`, Admin → Members).** Creates the member row, then either:
+  - **Admin invite (`inviteMember`, Admin → Members) + REST (`POST /api/v1/members/invite`).** Both
+    triggers create/resolve the member row and then run the SAME shared core (`lib/admin/invite`
+    `issueMemberInvite`), which grants sign-in access one of two ways and then runs the best-effort
+    tool-provisioning cascade (`lib/provisioning/run` — see the Member-provisioning row above):
     - **Magic-link invite** (default when `magicLinkAvailable()` — `APP_URL` + mail provider):
       `issueLoginLink` mints a single-use 7-day token and `sendInviteEmail` delivers a one-click
-      link; no password is set upfront. The admin UI reports whether delivery was confirmed.
-    - **Manual invite** (when mail isn't configured, or the admin chooses a password): sets the
+      link; no password is set upfront. Provisioning runs BEFORE the email so a Slack join link /
+      Linear+GitHub "invite on its way" note rides along in a "Your team tools" section. The admin
+      UI reports whether delivery was confirmed.
+    - **Manual invite** (when mail isn't configured, or — UI only — the admin chooses a password;
+      the API has no admin-choice and picks manual purely on `!magicLinkAvailable()`): sets the
       initial password via `adminSetPassword` (shown once to the admin as a ready-to-paste message
       from `buildManualInviteMessage` — URL, email, password — for Slack/DM/etc; never emailed).
+    - A provisioning failure NEVER fails the invite; per-tool outcomes are returned to the caller
+      (the UI success card + the members-table retry badge; the API `provisioning[]` array). The
+      REST route is idempotent on (team_id, email) — an existing non-disabled member re-issues access
+      + re-provisions (`created:false`), a disabled member is a hard 422.
   - **Email+password sign-in (always available — audit M1/M2b).** Members sign in with the
     password an admin set (or one they chose on first login — see welcome screen below) and can
     change it anytime (`/t/:team/account`). `POST /api/auth/login` verifies against the scrypt hash
@@ -507,6 +520,7 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 - `GET /api/v1/company-graph` — structured stakeholder map for `aios stakeholders` / MCP `brain_stakeholders` (brain-api v1.5): `people[]` (actor entities with attrs-projected `role`/`job_family`/`reports_to`) + `ownership[]` (server-resolved `OWNS`/`TOUCHES`/`PRODUCES` edges → target workflow name/kind/job_family); team-tier only, app-code gate (no RLS backstop); unseeded team → `200` empty arrays
 - `GET /api/v1/me` — authenticated member identity + role (drives client UI gating)
 - `GET /api/v1/members` — team roster + cross-tool identities for external resolution, incl. `github_login`/`avatar_url` for contributor-avatar consumers like `aios timeline` (team-tier only; `?email`/`?handle`/`?provider` filters)
+- `POST /api/v1/members/invite` — invite a member + run the tool-provisioning cascade (brain-api v1.7): team-tier **admin** key only (else 403 `forbidden_role`), 10/min; idempotent on (team_id, email) — existing non-disabled member → `created:false` + re-issue access + re-provision, disabled member → 422; magic-link vs manual decided by `magicLinkAvailable()`; provisioning is best-effort and never changes status; shares the `lib/admin/invite` core with the admin UI action
 - `GET /api/v1/identities/resolve` — resolve a provider external_id (or email/handle) to a member + canonical contacts incl. `slack_id` (team-tier only; 404 on miss)
 - `GET /api/v1/me/slack-token` — the caller's OWN Slack user token for "act as me" (owner-only: member from the API key, never a param; 404 if not connected; `no-store`)
 - `POST /api/v1/me/slack-token` — connect the caller's Slack via manual paste: validate (`auth.test`) + store encrypted (`member_secrets`) + capture identity

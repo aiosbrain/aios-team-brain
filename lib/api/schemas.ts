@@ -242,6 +242,28 @@ export const workEventPayloadSchema = z.object({
 });
 export type WorkEventPayload = z.infer<typeof workEventPayloadSchema>;
 
+// ── Member invite (brain-api v1.7: POST /api/v1/members/invite) ─────────────────
+// Wire is snake_case. `tools` selects the provisioning cascade: the literal "all"/"none", or an
+// explicit array of tool names — an unknown tool name fails the `z.enum` (→ 422 invalid_payload).
+// `.strict()` rejects unknown top-level keys. Email uses zod's `.email()`, identical to
+// `isValidInviteEmail` (`lib/admin/members`, which is `z.string().email()`), kept inline so this
+// shared schema module stays free of the server-only members lib.
+export const PROVISIONING_TOOLS = ["linear", "slack", "github"] as const;
+
+export const memberInviteRequestSchema = z
+  .object({
+    email: z.string().email(),
+    display_name: z.string().trim().min(1),
+    actor_handle: z.string().trim().min(1),
+    role: z.enum(["member", "lead", "admin"]).optional().default("member"),
+    tools: z
+      .union([z.literal("all"), z.literal("none"), z.array(z.enum(PROVISIONING_TOOLS))])
+      .optional()
+      .default("all"),
+  })
+  .strict();
+export type MemberInviteRequest = z.infer<typeof memberInviteRequestSchema>;
+
 /**
  * Normalize tier per contract. Outward labels client (consultant) and company
  * (employee) → external. Returns null for admin/private/unknown (never stored).

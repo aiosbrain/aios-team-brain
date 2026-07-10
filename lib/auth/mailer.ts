@@ -137,6 +137,18 @@ export interface InviteEmailContext {
    * function never sends a broken email if ever called without one.
    */
   loginUrl?: string;
+  /**
+   * Provisioning-cascade outcomes, distilled for the email's "Your team tools" section (only the
+   * bits the invitee acts on). `slackInviteLink` is a standing join link the member opens themselves
+   * (Slack has no invite API); `linearInvited`/`githubInvited` note that a separate invitation email
+   * is on its way from that provider. All are attacker-influenced admin config, so the HTML body
+   * escapes them. Omitted (or all-empty) → no tools section is rendered.
+   */
+  tools?: {
+    slackInviteLink?: string;
+    linearInvited?: boolean;
+    githubInvited?: boolean;
+  };
 }
 
 /**
@@ -153,7 +165,17 @@ export async function sendInviteEmail(email: string, ctx: InviteEmailContext): P
   const textAction = ctx.loginUrl
     ? `Get started: ${ctx.loginUrl}\n\nThis link is single-use and valid for 7 days.`
     : `Ask your admin for your sign-in password, then open the team brain and sign in with this email address.`;
-  const text = `Hi ${firstName},\n\n${explainer}\n\n${textAction}`;
+
+  const t = ctx.tools;
+  const hasTools = Boolean(t && (t.slackInviteLink || t.linearInvited || t.githubInvited));
+  const textToolLines: string[] = [];
+  if (hasTools) {
+    if (t!.slackInviteLink) textToolLines.push(`- Slack: join your team's workspace: ${t!.slackInviteLink}`);
+    if (t!.linearInvited) textToolLines.push(`- Linear: a separate invitation email is on its way from Linear.`);
+    if (t!.githubInvited) textToolLines.push(`- GitHub: a separate invitation email is on its way from GitHub.`);
+  }
+  const toolsText = hasTools ? `\n\nYour team tools:\n${textToolLines.join("\n")}` : "";
+  const text = `Hi ${firstName},\n\n${explainer}\n\n${textAction}${toolsText}`;
 
   const safeFirstName = escapeHtml(firstName);
   const safeExplainer = escapeHtml(explainer);
@@ -163,9 +185,25 @@ export async function sendInviteEmail(email: string, ctx: InviteEmailContext): P
        <p style="font-size:13px;color:#666;">Or paste this link into your browser:<br>${escapeHtml(ctx.loginUrl)}</p>
        <p style="font-size:13px;color:#666;">This link is single-use and valid for 7 days.</p>`
     : `<p>Ask your admin for your sign-in password, then open the team brain and sign in with this email address.</p>`;
+
+  let toolsHtml = "";
+  if (hasTools) {
+    const items: string[] = [];
+    if (t!.slackInviteLink) {
+      items.push(
+        `<li>Slack: <a href="${escapeHtml(t!.slackInviteLink)}">join your team's workspace</a></li>`
+      );
+    }
+    if (t!.linearInvited) items.push(`<li>Linear: a separate invitation email is on its way from Linear.</li>`);
+    if (t!.githubInvited) items.push(`<li>GitHub: a separate invitation email is on its way from GitHub.</li>`);
+    toolsHtml = `<p style="font-weight:600;margin:16px 0 4px;">Your team tools</p>
+       <ul style="padding-left:18px;font-size:14px;color:#1a1a1a;">${items.join("")}</ul>`;
+  }
+
   const html = `<div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px;color:#1a1a1a;">
         ${intro}
         ${htmlAction}
+        ${toolsHtml}
       </div>`;
 
   return deliver(email, subject, { text, html });
