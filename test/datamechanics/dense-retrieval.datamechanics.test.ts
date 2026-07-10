@@ -81,6 +81,23 @@ live("dense retrieval (real pgvector + stub embeddings)", () => {
     expect(ctx.grounded).toBe(true);
   });
 
+  it("does NOT ground on a far nearest-neighbor for an absent topic (distance floor)", async () => {
+    const seed = await seedTeam();
+    await ingest(seed, { path: "deliverables/auth.md", body: "We shipped auth: a passwordless login flow.", access: "team" });
+    await ingest(seed, { path: "deliverables/lunch.md", body: "Catering options for the team lunch.", access: "team" });
+    await ingest(seed, { path: "deliverables/parking.md", body: "Visitor parking is in lot C.", access: "team" });
+    expect((await indexPendingItems()).skipped).toBe(false);
+
+    // "latency" is a concept NONE of the docs embed, and its terms don't keyword-match either, so the
+    // nearest chunk is orthogonal (cosine dist ~1). WITHOUT the floor, dense would still return it and
+    // flip grounded=true (false grounding — the bug). With the floor it's excluded → grounded stays
+    // false, so the answer layer abstains instead of confabulating from an irrelevant nearest-neighbor.
+    const ctx = await retrieve(db(), seed.teamId, "team", "what is causing the high latency?");
+    expect(ctx.grounded).toBe(false);
+    // Recency padding still returns background items — exactly what grounded=false guards against.
+    expect(ctx.sources.length).toBeGreaterThan(0);
+  });
+
   it("does not leak team chunks to an external-tier caller", async () => {
     const seed = await seedTeam();
     await ingest(seed, {

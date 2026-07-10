@@ -590,6 +590,9 @@ async function nativeRetrieve(
   let orderedSources = sources;
   const denseHits = await denseP;
   if (denseHits.length) {
+    // A dense hit here is a REAL semantic match — denseSearch applies a distance floor, so far
+    // nearest-neighbors (which every query has) are already excluded. That's what makes this a valid
+    // grounding signal rather than "any vector exists" (which would defeat the IDF grounding above).
     grounded = true;
     for (const h of denseHits) {
       if (seen.has(h.item_id)) continue;
