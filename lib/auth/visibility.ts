@@ -46,6 +46,18 @@ export function visibleTasks<Q>(query: Q, tier: ViewerTier): Q {
 }
 
 /**
+ * Restrict a Social Brain content query (`social_opportunities` / `content_plans` /
+ * `content_variants`) to what `tier` may see: external → only `access='external'`. Every one of
+ * these rows carries an `access` tier inherited from its source evidence (opportunity → plan →
+ * variant), so the SAME sole-enforcement rule as items applies — a public-tier consumer must never
+ * see team-sourced content. Route every tier-scoped Social read through here (no RLS backstop).
+ */
+export function visibleByAccess<Q>(query: Q, tier: ViewerTier): Q {
+  if (tier !== "external") return query;
+  return (query as { eq(column: string, value: string): Q }).eq("access", "external");
+}
+
+/**
  * Role-scoped visibility for `query_log` reads (CLAUDE.md §5). `query_log` rows carry a
  * `member_id`; in postgres mode there is NO RLS, so this app-code filter is the SOLE thing
  * stopping a non-admin from reading the whole team's questions and `cost_usd`. Admins see the
