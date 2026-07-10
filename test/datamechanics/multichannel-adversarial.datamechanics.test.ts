@@ -114,12 +114,12 @@ describe("multi-channel adversarial retrieval (real Postgres)", () => {
     expect(await paths("scheduled security review")).toContain("slack/incidents/target.md");
   });
 
-  it.fails("GAP: a broad-but-legitimate query matches more items than the caps allow, unranked", async () => {
-    // Across 6 channels, 50 genuinely on-topic items about the payments migration. The unique-source
-    // ceiling is ~28 (FTS 20 + recency 8), so retrieval returns a bounded, UNRANKED subset — and with
-    // no ts_rank there's no guarantee it's the most relevant ~28. "Summarize the payments migration"
-    // then silently sees roughly half the real evidence. Desired: full recall for a topic this focused
-    // (or at least a *ranked* best-N, so what's dropped is provably the least relevant).
+  it("STRENGTH: a broad query gets full recall up to the raised candidate cap (Gap #2 recall facet)", async () => {
+    // Across 6 channels, 50 genuinely on-topic items about the payments migration. The FTS candidate
+    // cap was 20 (+8 recency) → ~half were silently dropped. Raised to FTS_CANDIDATE_LIMIT (50), all
+    // 50 now come through (they're small, so the char budget doesn't bind), best-ranked first. The
+    // ceiling still exists far higher — a corpus with hundreds of matches needs dense/rerank — but a
+    // realistic multi-channel broad query no longer loses half its evidence.
     const posted: string[] = [];
     for (let i = 0; i < 50; i++) {
       await post(`slack/ch${i % 6}`, `payments-${i}`, `Payments migration note ${i}: Stripe webhook cutover step ${i} discussed.`);
