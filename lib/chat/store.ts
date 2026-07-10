@@ -1,5 +1,5 @@
 import "server-only";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 import type { ChatTurn } from "@/lib/query/claude";
 
 /**
@@ -45,11 +45,11 @@ export function deriveTitle(firstQuestion: string): string {
 type Owner = { teamId: string; memberId: string };
 
 export async function createConversation(
-  supabase: SupabaseClient,
+  db: DbClient,
   owner: Owner,
   title: string
 ): Promise<{ id: string } | null> {
-  const { data, error } = await supabase
+  const { data, error } = await db
     .from("conversations")
     .insert({ team_id: owner.teamId, member_id: owner.memberId, title: deriveTitle(title) })
     .select("id")
@@ -60,11 +60,11 @@ export async function createConversation(
 
 /** True iff this member owns the conversation (the owner check every reader/writer runs first). */
 export async function ownsConversation(
-  supabase: SupabaseClient,
+  db: DbClient,
   owner: Owner,
   conversationId: string
 ): Promise<boolean> {
-  const { data } = await supabase
+  const { data } = await db
     .from("conversations")
     .select("id")
     .eq("id", conversationId)
@@ -76,14 +76,14 @@ export async function ownsConversation(
 }
 
 export async function appendMessage(
-  supabase: SupabaseClient,
+  db: DbClient,
   owner: Owner,
   conversationId: string,
   role: "user" | "assistant",
   content: string,
   usage: MessageUsage = {}
 ): Promise<void> {
-  const { error } = await supabase.from("chat_messages").insert({
+  const { error } = await db.from("chat_messages").insert({
     conversation_id: conversationId,
     team_id: owner.teamId,
     member_id: owner.memberId,
@@ -96,7 +96,7 @@ export async function appendMessage(
   });
   if (error) throw new Error(`appendMessage: ${error.message}`);
   // Bump the conversation so the list sorts most-recent-first.
-  await supabase
+  await db
     .from("conversations")
     .update({ updated_at: new Date().toISOString() })
     .eq("id", conversationId)
@@ -106,11 +106,11 @@ export async function appendMessage(
 
 /** The member's conversations, newest-active first, excluding archived. */
 export async function listConversations(
-  supabase: SupabaseClient,
+  db: DbClient,
   owner: Owner,
   limit = 100
 ): Promise<Conversation[]> {
-  const { data } = await supabase
+  const { data } = await db
     .from("conversations")
     .select("id, title, created_at, updated_at")
     .eq("team_id", owner.teamId)
@@ -121,13 +121,52 @@ export async function listConversations(
   return (data ?? []) as Conversation[];
 }
 
+/**
+ * Search the member's conversations by title OR message content (owner-scoped). Content matches use
+ * FTS over `chat_messages` (`websearch_to_tsquery`); title matches are a case-insensitive substring
+ * over the member's own list. Most-recent-active first, capped. Empty query → the plain list.
+ */
+export async function searchConversations(
+  db: DbClient,
+  owner: Owner,
+  query: string,
+  limit = 50
+): Promise<Conversation[]> {
+  const q = query.trim();
+  if (!q) return listConversations(db, owner, limit);
+  // Content matches: message bodies via FTS → the conversations they belong to (owner-scoped).
+  const { data: hits } = await db
+    .from("chat_messages")
+    .select("conversation_id")
+    .eq("team_id", owner.teamId)
+    .eq("member_id", owner.memberId)
+    .textSearch("search", q, { type: "websearch", config: "english" })
+    .limit(1000);
+  const contentIds = new Set(
+    (hits ?? []).map((h) => (h as { conversation_id: string }).conversation_id)
+  );
+  // The member's non-archived conversations; keep those whose title matches OR whose content matched.
+  const { data } = await db
+    .from("conversations")
+    .select("id, title, created_at, updated_at")
+    .eq("team_id", owner.teamId)
+    .eq("member_id", owner.memberId)
+    .is("archived_at", null)
+    .order("updated_at", { ascending: false })
+    .limit(500);
+  const ql = q.toLowerCase();
+  return ((data ?? []) as Conversation[])
+    .filter((c) => (c.title || "").toLowerCase().includes(ql) || contentIds.has(c.id))
+    .slice(0, limit);
+}
+
 /** A conversation's full message thread — owner-checked; null if not owned/absent. */
 export async function getConversation(
-  supabase: SupabaseClient,
+  db: DbClient,
   owner: Owner,
   conversationId: string
 ): Promise<{ id: string; title: string; messages: ChatMessage[] } | null> {
-  const { data: convo } = await supabase
+  const { data: convo } = await db
     .from("conversations")
     .select("id, title")
     .eq("id", conversationId)
@@ -137,7 +176,7 @@ export async function getConversation(
     .maybeSingle();
   const c = convo as { id: string; title: string } | null;
   if (!c) return null;
-  const { data: msgs } = await supabase
+  const { data: msgs } = await db
     .from("chat_messages")
     .select("id, role, content, cited_item_ids, created_at")
     .eq("conversation_id", conversationId)
@@ -150,13 +189,13 @@ export async function getConversation(
  * Owner-checked. Call this BEFORE persisting the current user message so it returns only prior turns.
  */
 export async function recentTurns(
-  supabase: SupabaseClient,
+  db: DbClient,
   owner: Owner,
   conversationId: string,
   maxTurns = 6
 ): Promise<ChatTurn[]> {
-  if (!(await ownsConversation(supabase, owner, conversationId))) return [];
-  const { data } = await supabase
+  if (!(await ownsConversation(db, owner, conversationId))) return [];
+  const { data } = await db
     .from("chat_messages")
     .select("role, content, created_at")
     .eq("conversation_id", conversationId)
@@ -177,12 +216,12 @@ export async function recentTurns(
 }
 
 export async function renameConversation(
-  supabase: SupabaseClient,
+  db: DbClient,
   owner: Owner,
   conversationId: string,
   title: string
 ): Promise<boolean> {
-  const { data, error } = await supabase
+  const { data, error } = await db
     .from("conversations")
     .update({ title: deriveTitle(title), updated_at: new Date().toISOString() })
     .eq("id", conversationId)
@@ -195,13 +234,32 @@ export async function renameConversation(
   return Boolean((data as { id: string } | null)?.id);
 }
 
+/**
+ * Set a conversation's title without bumping `updated_at` (so an auto-generated title doesn't
+ * reorder the list). Owner-scoped. Used by the background title generator; a no-op if not owned.
+ */
+export async function setTitle(
+  db: DbClient,
+  owner: Owner,
+  conversationId: string,
+  title: string
+): Promise<void> {
+  const { error } = await db
+    .from("conversations")
+    .update({ title: deriveTitle(title) })
+    .eq("id", conversationId)
+    .eq("team_id", owner.teamId)
+    .eq("member_id", owner.memberId);
+  if (error) throw new Error(`setTitle: ${error.message}`);
+}
+
 /** Soft-delete (archive) — hides it from the list; messages stay for any later restore/audit. */
 export async function archiveConversation(
-  supabase: SupabaseClient,
+  db: DbClient,
   owner: Owner,
   conversationId: string
 ): Promise<boolean> {
-  const { data, error } = await supabase
+  const { data, error } = await db
     .from("conversations")
     .update({ archived_at: new Date().toISOString() })
     .eq("id", conversationId)

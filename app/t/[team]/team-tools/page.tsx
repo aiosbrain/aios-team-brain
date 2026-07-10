@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
 import { Blocks } from "lucide-react";
-import { serverClient } from "@/lib/supabase/server";
+import { serverClient } from "@/lib/db/server";
 import { currentMember } from "@/lib/auth/guard";
 import { visibleItems } from "@/lib/auth/visibility";
 import { EmptyState } from "@/components/empty-state";
@@ -13,15 +13,15 @@ type Connector = { enabled?: boolean; name?: string; transport?: string; instanc
 
 export default async function TeamToolsPage({ params }: { params: Promise<{ team: string }> }) {
   const { team: teamSlug } = await params;
-  const supabase = await serverClient();
+  const db = await serverClient();
 
-  const { data: team } = await supabase.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
+  const { data: team } = await db.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
   if (!team) return null;
 
   const me = await currentMember(team.id);
   // Latest published blueprint for the team; tier-filtered in app code (no RLS in pg mode).
   const { data } = await visibleItems(
-    supabase
+    db
       .from("items")
       .select("body, actor, updated_at, frontmatter")
       .eq("team_id", team.id)

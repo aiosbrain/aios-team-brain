@@ -1,9 +1,8 @@
 name: aios-brain-test
-# Local test Postgres for the data-mechanics tier (DB_BACKEND=postgres path).
+# Local test Postgres for the data-mechanics tier.
 # tmpfs → wiped every `up`; offset port 5434 so a local dev DB never collides
 # (5433 is taken by another project's test DB on this machine).
-# No Redis: the brain has no queue. The Supabase-mode parity target uses the
-# project's `supabase start` stack, not this container.
+# No Redis: the brain has no queue.
 services:
   postgres:
     image: postgres:16

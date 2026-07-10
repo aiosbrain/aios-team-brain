@@ -1,0 +1,82 @@
+{
+  "$schema": "aios-brain-contract/v1",
+  "_note": "Canonical conformance fixture for the workspace<->brain seam (AIO-314). Home: aios-workspace/docs/contract. Vendored into aios-team-brain/test/fixtures/contract. contentHash pins the content; /docs-sync compares the two copies. Regenerate: scratchpad gen-contract-fixture.mjs.",
+  "version": "1.6",
+  "tierAliases": {
+    "shared": {
+      "team": "team",
+      "external": "external",
+      "client": "external",
+      "company": "external"
+    },
+    "divergent": {
+      "private": {
+        "client": "admin",
+        "server": null
+      },
+      "admin": {
+        "client": "admin",
+        "server": null
+      },
+      "unknown-tier": {
+        "client": "unknown-tier",
+        "server": null
+      }
+    }
+  },
+  "sse": {
+    "frames": [
+      {
+        "name": "delta",
+        "event": "delta",
+        "data": {
+          "text": "Here is the answer."
+        },
+        "raw": "event: delta\ndata: {\"text\":\"Here is the answer.\"}\n\n"
+      },
+      {
+        "name": "sources",
+        "event": "sources",
+        "data": {
+          "sources": [
+            {
+              "id": "S1",
+              "item_id": "item_abc",
+              "project": "acme",
+              "path": "2-work/notes.md",
+              "kind": "note"
+            }
+          ]
+        },
+        "raw": "event: sources\ndata: {\"sources\":[{\"id\":\"S1\",\"item_id\":\"item_abc\",\"project\":\"acme\",\"path\":\"2-work/notes.md\",\"kind\":\"note\"}]}\n\n"
+      },
+      {
+        "name": "done",
+        "event": "done",
+        "data": {
+          "input_tokens": 1200,
+          "output_tokens": 340,
+          "cost_usd": 0.0123
+        },
+        "raw": "event: done\ndata: {\"input_tokens\":1200,\"output_tokens\":340,\"cost_usd\":0.0123}\n\n"
+      },
+      {
+        "name": "conversation",
+        "event": "conversation",
+        "data": {
+          "id": "conv_123"
+        },
+        "raw": "event: conversation\ndata: {\"id\":\"conv_123\"}\n\n"
+      },
+      {
+        "name": "forward-compat",
+        "event": "reasoning",
+        "data": {
+          "note": "an event kind the client does not know; per brain-api it MUST be ignored, not crash"
+        },
+        "raw": "event: reasoning\ndata: {\"note\":\"an event kind the client does not know; per brain-api it MUST be ignored, not crash\"}\n\n"
+      }
+    ]
+  },
+  "contentHash": "8d77062d02b3d7d42c327cdfa4276ff84a5e459b21bac892dc1d25ba166b054f"
+}

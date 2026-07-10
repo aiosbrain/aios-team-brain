@@ -1,6 +1,6 @@
 import { describe, expect, it, beforeAll } from "vitest";
 import { SignJWT } from "jose";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 import { consumeSlackOAuthState } from "@/lib/auth/slack-oauth-state";
 
 // Pure-logic guard for the state JWT layer (no DB): a forged or tampered `state` must be rejected
@@ -18,7 +18,7 @@ const noDb = new Proxy({}, {
   get() {
     throw new Error("consumeSlackOAuthState must reject this token before touching the DB");
   },
-}) as unknown as SupabaseClient;
+}) as unknown as DbClient;
 
 function sign(secret: string, claims: Record<string, unknown>, exp = "600s") {
   return new SignJWT(claims)

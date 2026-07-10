@@ -1,6 +1,6 @@
 "use server";
 
-import { serverClient } from "@/lib/supabase/server";
+import { serverClient } from "@/lib/db/server";
 import { currentMember } from "@/lib/auth/guard";
 import { slugify } from "@/lib/ids";
 
@@ -27,8 +27,8 @@ export async function createProjectAction(input: {
   const me = await currentMember(input.teamId);
   if (!me) return { ok: false, error: "not a member of this team" };
 
-  const supabase = await serverClient();
-  const { data, error } = await supabase
+  const db = await serverClient();
+  const { data, error } = await db
     .from("projects")
     .insert({ team_id: input.teamId, slug, name })
     .select("id, slug, name")

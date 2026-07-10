@@ -1,7 +1,11 @@
-import { serverClient } from "@/lib/supabase/server";
+import { serverClient } from "@/lib/db/server";
 import { InviteMember } from "@/components/admin/invite-member";
 import { MemberIdentities, type ProviderLink } from "@/components/admin/member-identities";
+import { MemberRoleSelect } from "@/components/admin/member-role-select";
 import { ReattributeButton } from "@/components/admin/reattribute-button";
+import { ResetPasswordButton } from "@/components/admin/reset-password-button";
+import { RemoveMemberButton } from "@/components/admin/remove-member-button";
+import { ManagerSelect } from "@/components/admin/manager-select";
 import { listMemberIdentities } from "@/lib/identity/list";
 
 export default async function MembersAdminPage({
@@ -10,23 +14,32 @@ export default async function MembersAdminPage({
   params: Promise<{ team: string }>;
 }) {
   const { team: teamSlug } = await params;
-  const supabase = await serverClient();
+  const db = await serverClient();
 
-  const { data: team } = await supabase
+  const { data: team } = await db
     .from("teams")
     .select("id")
     .eq("slug", teamSlug)
     .maybeSingle();
   if (!team) return null;
 
-  const { data: members } = await supabase
+  const { data: members } = await db
     .from("members")
-    .select("id, display_name, email, actor_handle, role, tier, status, github_login, avatar_url, created_at")
+    .select(
+      "id, display_name, email, actor_handle, role, tier, status, github_login, avatar_url, created_at, manager_member_id"
+    )
     .eq("team_id", team.id)
+    .eq("is_connector", false)
     .order("created_at");
 
+  // Candidate managers for the "Reports to" selector: any other non-disabled, non-connector
+  // member (setMemberManager rejects disabled/connector targets server-side too).
+  const managerCandidates = (members ?? [])
+    .filter((m) => m.status !== "disabled")
+    .map((m) => ({ id: m.id as string, displayName: m.display_name as string }));
+
   // All linked identities (email aliases + slack/linear/plane provider ids) for the panel.
-  const identities = await listMemberIdentities(supabase, team.id);
+  const identities = await listMemberIdentities(db, team.id);
   const providerOf = (memberId: string, provider: string): ProviderLink | null => {
     const p = identities.get(memberId)?.providers.find((x) => x.provider === provider);
     return p ? { externalId: p.externalId, handle: p.handle } : null;
@@ -55,7 +68,10 @@ export default async function MembersAdminPage({
               <th className="px-4 py-3">Role</th>
               <th className="px-4 py-3">Tier</th>
               <th className="px-4 py-3">Status</th>
+              <th className="px-4 py-3">Reports to</th>
+              <th className="px-4 py-3">Password</th>
               <th className="px-4 py-3">Identities</th>
+              <th className="px-4 py-3">Remove</th>
             </tr>
           </thead>
           <tbody>
@@ -65,15 +81,24 @@ export default async function MembersAdminPage({
                 <td className="px-4 py-3 text-ink-secondary">{m.email}</td>
                 <td className="px-4 py-3 font-mono text-xs text-ink-secondary">{m.actor_handle}</td>
                 <td className="px-4 py-3">
-                  <span className={`rounded-full px-2 py-0.5 text-xs ${m.role === "admin" ? "bg-violet/10 text-violet" : "bg-surface-overlay text-ink-secondary"}`}>
-                    {m.role}
-                  </span>
+                  <MemberRoleSelect teamSlug={teamSlug} memberId={m.id} role={m.role as "admin" | "lead" | "member"} />
                 </td>
                 <td className="px-4 py-3 text-ink-secondary">{m.tier}</td>
                 <td className="px-4 py-3">
                   <span className={`text-xs ${m.status === "active" ? "text-emerald-600" : m.status === "invited" ? "text-amber-600" : "text-ink-tertiary"}`}>
                     {m.status}
                   </span>
+                </td>
+                <td className="px-4 py-3">
+                  <ManagerSelect
+                    teamSlug={teamSlug}
+                    memberId={m.id}
+                    managerMemberId={m.manager_member_id as string | null}
+                    candidates={managerCandidates.filter((c) => c.id !== m.id)}
+                  />
+                </td>
+                <td className="px-4 py-3">
+                  <ResetPasswordButton teamSlug={teamSlug} memberId={m.id} />
                 </td>
                 <td className="px-4 py-3">
                   <MemberIdentities
@@ -86,6 +111,9 @@ export default async function MembersAdminPage({
                     linear={providerOf(m.id, "linear")}
                     plane={providerOf(m.id, "plane")}
                   />
+                </td>
+                <td className="px-4 py-3">
+                  <RemoveMemberButton teamSlug={teamSlug} memberId={m.id} />
                 </td>
               </tr>
             ))}

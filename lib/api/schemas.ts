@@ -191,13 +191,16 @@ export const maturitySnapshotPayloadSchema = z.object({
     .default({ spine: "L1", axes: {} }),
   sessions: z.number().int().nonnegative().optional().default(0),
   tasks: z.number().int().nonnegative().optional().default(0),
+  // Shadow Cognitive-Ergonomics band (v1.3). No `.default()`: omitted (older client) must
+  // stay distinguishable from an explicit null. Provenance-only — never recomputed here.
+  ce_band: z.number().int().min(0).max(4).nullable().optional(),
 });
 export type MaturitySnapshotPayload = z.infer<typeof maturitySnapshotPayloadSchema>;
 
 export const usageCostPayloadSchema = z.object({
   member: z.string().max(120).nullable().optional(),
   date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
-  provider: z.enum(["cursor", "claude", "anthropic", "openai", "codex", "other"]),
+  provider: z.enum(["cursor", "claude", "opencode", "anthropic", "openai", "codex", "other"]),
   source: z.string().min(1).max(60),
   project: z.string().max(120).optional().default(""),
   input_tokens: z.number().int().nonnegative().optional().default(0),
@@ -332,6 +335,9 @@ const integrationConfigSchemas: Record<IntegrationType, z.ZodType> = {
       teamId: z.string().max(64).optional(),
       projectId: z.string().max(64).optional(),
       doneStateName: z.string().max(80).optional(),
+      // Per-team opt-in for the v1.4 inbound apply (Linear→brain status + adopt). Default off:
+      // enabling Linear-writes-brain is a deliberate, reversible, per-team act (brain-api v1.4).
+      inboundApply: z.boolean().optional(),
     })
     .strict(),
   plane: z

@@ -1,8 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { Gauge } from "lucide-react";
-import { isPostgresBackend } from "@/lib/db/backend";
-import { serverClient } from "@/lib/supabase/server";
+import { serverClient } from "@/lib/db/server";
 import { currentMember } from "@/lib/auth/guard";
 import { getTeamMaturity, AXIS_META, type AemAxes } from "@/lib/metrics/individual-maturity";
 import { EmptyState } from "@/components/empty-state";
@@ -26,24 +25,34 @@ function fmtTokens(n: number): string {
   return String(Math.round(n));
 }
 
+function CeShadowBadge() {
+  return (
+    <span className="ml-1.5 rounded-full bg-amber/10 px-2 py-0.5 text-[10px] font-medium text-amber-700">
+      shadow · uncalibrated
+    </span>
+  );
+}
+
+function fmtCeBand(band: number | null): string {
+  return band == null ? "—" : `${band}/4`;
+}
+
 function radarData(axes: AemAxes): RadarDatum[] {
   return AXIS_META.map((a) => ({ axis: a.label, you: axes[a.key] }));
 }
 
 export default async function MaturityPage({ params }: { params: Promise<{ team: string }> }) {
-  // Maturity analytics live only on the postgres backend (canonical schema).
-  if (!isPostgresBackend()) return null;
 
   const { team: teamSlug } = await params;
-  const supabase = await serverClient();
-  const { data: team } = await supabase.from("teams").select("id, name").eq("slug", teamSlug).maybeSingle();
+  const db = await serverClient();
+  const { data: team } = await db.from("teams").select("id, name").eq("slug", teamSlug).maybeSingle();
   if (!team) return null;
 
   const me = await currentMember(team.id);
   if (!me) return null;
 
   // Read helper enforces the team-tier gate (external → empty board).
-  const { members, teamAxes, spineDistribution, asOf } = await getTeamMaturity(supabase, team.id, me.tier);
+  const { members, teamAxes, spineDistribution, asOf } = await getTeamMaturity(db, team.id, me.tier);
 
   return (
     <div className="mx-auto flex max-w-6xl flex-col gap-5">
@@ -98,6 +107,7 @@ export default async function MaturityPage({ params }: { params: Promise<{ team:
                   <th className="px-4 py-3 font-medium">Member</th>
                   <th className="px-4 py-3 font-medium">Spine</th>
                   <th className="px-4 py-3 font-medium">Overall</th>
+                  <th className="px-4 py-3 font-medium">CE</th>
                   <th className="px-4 py-3 font-medium">Weakest axis</th>
                   <th className="px-4 py-3 text-right font-medium">Tasks</th>
                   <th className="px-4 py-3 text-right font-medium">Est. spend</th>
@@ -117,6 +127,10 @@ export default async function MaturityPage({ params }: { params: Promise<{ team:
                       <span className="rounded-full bg-surface-sunken px-2 py-0.5 font-mono text-xs text-ink">{m.spine}</span>
                     </td>
                     <td className="px-4 py-3 tabular-nums text-ink-secondary">{m.overall.toFixed(2)}</td>
+                    <td className="px-4 py-3 tabular-nums text-ink-secondary">
+                      {fmtCeBand(m.ce_band)}
+                      <CeShadowBadge />
+                    </td>
                     <td className="px-4 py-3 text-ink-secondary">
                       {AXIS_META.find((a) => a.key === m.weakest)?.label}
                     </td>

@@ -2,8 +2,8 @@
 
 import { after } from "next/server";
 
-import { serverClient } from "@/lib/supabase/server";
-import { adminClient } from "@/lib/supabase/admin";
+import { serverClient } from "@/lib/db/server";
+import { adminClient } from "@/lib/db/admin";
 import { currentMember } from "@/lib/auth/guard";
 import { uiRowKey, isUniqueViolation } from "@/lib/ids";
 import { normalizeTaskPriority } from "@/lib/api/schemas";
@@ -11,9 +11,8 @@ import { projectTaskByIdAfterWrite } from "@/lib/pm-sync";
 import { TASK_STATUSES, type Task, type TaskStatus } from "@/components/kanban/types";
 
 /**
- * Backend-agnostic task mutations initiated from the Kanban board. In supabase
- * mode these also satisfy RLS; in postgres mode the currentMember() guard is
- * the access control. (Browser → server action so no PostgREST is needed.)
+ * Task mutations initiated from the Kanban board. There is no RLS on the postgres target, so the
+ * `currentMember()` guard is the access control. (Browser → server action so no PostgREST is needed.)
  *
  * Reactive projection (brain-api v1.2 Phase 2): each successful write schedules a single-row
  * projection into the team's primary PM tool via `after()` (runs after the response). It loads the
@@ -44,8 +43,8 @@ export async function moveTaskAction(
   status: TaskStatus
 ): Promise<{ ok: boolean; error?: string }> {
   if (!TASK_STATUSES.includes(status)) return { ok: false, error: "invalid status" };
-  const supabase = await serverClient();
-  const { data: task } = await supabase
+  const db = await serverClient();
+  const { data: task } = await db
     .from("tasks")
     .select("team_id")
     .eq("id", taskId)
@@ -54,7 +53,7 @@ export async function moveTaskAction(
   const me = await currentMember((task as { team_id: string }).team_id);
   if (!me) return { ok: false, error: "not a member of this team" };
 
-  const { error } = await supabase
+  const { error } = await db
     .from("tasks")
     .update({ status, updated_at: new Date().toISOString() })
     .eq("id", taskId);
@@ -71,12 +70,12 @@ export async function createTaskAction(
   const me = await currentMember(input.teamId);
   if (!me) return { ok: false, error: "not a member of this team" };
 
-  const supabase = await serverClient();
+  const db = await serverClient();
   // Mint a stable `ui-` row_key so the task is visible to `GET /api/v1/tasks`
   // writeback (which filters `row_key is not null`) and round-trips into tasks.md.
   // Retry once on the (team_id,project_id,row_key) unique constraint.
   for (let attempt = 0; attempt < 2; attempt++) {
-    const { data, error } = await supabase
+    const { data, error } = await db
       .from("tasks")
       .insert({
         team_id: input.teamId,
@@ -124,8 +123,8 @@ export async function updateTaskAction(
   input: UpdateTaskInput
 ): Promise<{ ok: boolean; error?: string }> {
   if (!input.taskId) return { ok: false, error: "taskId required" };
-  const supabase = await serverClient();
-  const { data: task } = await supabase
+  const db = await serverClient();
+  const { data: task } = await db
     .from("tasks")
     .select("team_id, project_id, row_key")
     .eq("id", input.taskId)
@@ -149,7 +148,7 @@ export async function updateTaskAction(
     const parent = (input.parentRowKey ?? "").trim();
     if (parent) {
       if (parent === row.row_key) return { ok: false, error: "a task cannot be its own parent" };
-      const { data: parentRow } = await supabase
+      const { data: parentRow } = await db
         .from("tasks")
         .select("id")
         .eq("team_id", row.team_id)
@@ -161,7 +160,7 @@ export async function updateTaskAction(
       // Cycle guard: walk ancestors up from the proposed parent over the project's current edges;
       // reaching this row's own key means the new edge would form a loop. Bounded by the edge count
       // so a pre-existing data cycle can't spin forever.
-      const { data: edgeRows } = await supabase
+      const { data: edgeRows } = await db
         .from("tasks")
         .select("row_key, parent_row_key")
         .eq("team_id", row.team_id)
@@ -181,7 +180,7 @@ export async function updateTaskAction(
     update.parent_row_key = parent || null;
   }
 
-  const { error } = await supabase.from("tasks").update(update).eq("id", input.taskId);
+  const { error } = await db.from("tasks").update(update).eq("id", input.taskId);
   if (error) return { ok: false, error: error.message };
   scheduleProjection(input.taskId);
   return { ok: true };

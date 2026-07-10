@@ -1,7 +1,7 @@
 import { NextRequest } from "next/server";
 import { z } from "zod";
-import { serverClient } from "@/lib/supabase/server";
-import { adminClient } from "@/lib/supabase/admin";
+import { serverClient } from "@/lib/db/server";
+import { adminClient } from "@/lib/db/admin";
 import { getSessionUser } from "@/lib/auth/session";
 import { errorResponse } from "@/lib/api/schemas";
 import { getProviderKey } from "@/lib/integrations/manage";
@@ -50,10 +50,15 @@ export async function POST(req: NextRequest) {
     getProviderKey(admin, team.id, "openai"),
     getProviderKey(admin, team.id, "anthropic"),
   ]);
-  const arcs = await recomputeArcs(teamSlug, tier, visibleGroupIds(teamSlug, tier), corrections, {
-    openaiKey,
-    anthropicKey,
-  });
+  const arcs = await recomputeArcs(
+    admin,
+    team.id,
+    teamSlug,
+    tier,
+    visibleGroupIds(teamSlug, tier),
+    corrections,
+    { openaiKey, anthropicKey }
+  );
 
   return Response.json({ arcs, as_of: new Date().toISOString() });
 }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 import { runAction, resolveApproval } from "@/lib/actions";
 import type { SandboxRunner } from "@/lib/actions";
 import { FakeSupabase } from "@/lib/ingest/fake-supabase";
@@ -34,7 +34,7 @@ const base = (_fake: FakeSupabase) => ({
 describe("runAction gating", () => {
   it("denies when no policy allows (default-deny)", async () => {
     const fake = new FakeSupabase();
-    const out = await runAction(fake as unknown as SupabaseClient, {
+    const out = await runAction(fake as unknown as DbClient, {
       ...base(fake),
       request: { type: "note.create", resource: "project:acme/x", params: {} },
     });
@@ -46,7 +46,7 @@ describe("runAction gating", () => {
   it("queues for approval when policy requires it", async () => {
     const fake = new FakeSupabase();
     seedPolicy(fake, { effect: "require_approval", action: "note.*", priority: 5 });
-    const out = await runAction(fake as unknown as SupabaseClient, {
+    const out = await runAction(fake as unknown as DbClient, {
       ...base(fake),
       request: { type: "note.create", resource: "project:acme/x", params: { project: "acme", path: "p", body: "b" } },
     });
@@ -59,7 +59,7 @@ describe("runAction gating", () => {
   it("executes note.create when allowed (writes an item via the ingest path)", async () => {
     const fake = new FakeSupabase();
     seedPolicy(fake, { effect: "allow", action: "note.create", priority: 1 });
-    const out = await runAction(fake as unknown as SupabaseClient, {
+    const out = await runAction(fake as unknown as DbClient, {
       ...base(fake),
       request: {
         type: "note.create",
@@ -76,7 +76,7 @@ describe("runAction gating", () => {
   it("fails closed on code.run with no sandbox configured", async () => {
     const fake = new FakeSupabase();
     seedPolicy(fake, { effect: "allow", action: "code.run", priority: 1 });
-    const out = await runAction(fake as unknown as SupabaseClient, {
+    const out = await runAction(fake as unknown as DbClient, {
       ...base(fake),
       request: { type: "code.run", resource: "*", params: { code: "print(1)" } },
     });
@@ -94,7 +94,7 @@ describe("runAction gating", () => {
       },
     };
     const out = await runAction(
-      fake as unknown as SupabaseClient,
+      fake as unknown as DbClient,
       { ...base(fake), request: { type: "code.run", resource: "*", params: { code: "print(1)" } } },
       { sandbox }
     );
@@ -105,7 +105,7 @@ describe("runAction gating", () => {
   it("fails on an unknown action type even when allowed", async () => {
     const fake = new FakeSupabase();
     seedPolicy(fake, { effect: "allow", action: "*", priority: 1 });
-    const out = await runAction(fake as unknown as SupabaseClient, {
+    const out = await runAction(fake as unknown as DbClient, {
       ...base(fake),
       request: { type: "mystery.do", resource: "*", params: {} },
     });
@@ -118,7 +118,7 @@ describe("resolveApproval", () => {
   // Queue a note.create action behind a require_approval policy.
   async function queue(fake: FakeSupabase) {
     seedPolicy(fake, { effect: "require_approval", action: "note.*", priority: 5 });
-    const out = await runAction(fake as unknown as SupabaseClient, {
+    const out = await runAction(fake as unknown as DbClient, {
       ...base(fake),
       request: {
         type: "note.create",
@@ -133,7 +133,7 @@ describe("resolveApproval", () => {
   it("approve resumes the action and executes the handler", async () => {
     const fake = new FakeSupabase();
     const approvalRequestId = await queue(fake);
-    const res = await resolveApproval(fake as unknown as SupabaseClient, {
+    const res = await resolveApproval(fake as unknown as DbClient, {
       approvalRequestId,
       decision: "approved",
       deciderMemberId: "admin-1",
@@ -150,7 +150,7 @@ describe("resolveApproval", () => {
   it("deny marks the action denied and runs nothing", async () => {
     const fake = new FakeSupabase();
     const approvalRequestId = await queue(fake);
-    const res = await resolveApproval(fake as unknown as SupabaseClient, {
+    const res = await resolveApproval(fake as unknown as DbClient, {
       approvalRequestId,
       decision: "denied",
       deciderMemberId: "admin-1",
@@ -165,14 +165,14 @@ describe("resolveApproval", () => {
   it("guards against deciding twice", async () => {
     const fake = new FakeSupabase();
     const approvalRequestId = await queue(fake);
-    await resolveApproval(fake as unknown as SupabaseClient, { approvalRequestId, decision: "approved", deciderMemberId: "a" });
-    const again = await resolveApproval(fake as unknown as SupabaseClient, { approvalRequestId, decision: "denied", deciderMemberId: "a" });
+    await resolveApproval(fake as unknown as DbClient, { approvalRequestId, decision: "approved", deciderMemberId: "a" });
+    const again = await resolveApproval(fake as unknown as DbClient, { approvalRequestId, decision: "denied", deciderMemberId: "a" });
     expect(again.status).toBe("already_decided");
   });
 
   it("returns not_found for an unknown approval id", async () => {
     const fake = new FakeSupabase();
-    const res = await resolveApproval(fake as unknown as SupabaseClient, {
+    const res = await resolveApproval(fake as unknown as DbClient, {
       approvalRequestId: "nope",
       decision: "approved",
       deciderMemberId: "a",

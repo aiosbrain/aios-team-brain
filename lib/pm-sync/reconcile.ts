@@ -1,6 +1,6 @@
 import "server-only";
 
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 
 import { linearAdapter } from "@/lib/pm-sync/linear";
 import { planeAdapter } from "@/lib/pm-sync/plane";
@@ -69,11 +69,11 @@ export function isDiverged(link: {
 }
 
 export async function reconcileProviderState(
-  supabase: SupabaseClient,
+  db: DbClient,
   teamId: string,
   opts: { fetchImpl?: typeof fetch } = {}
 ): Promise<ReconcileResult> {
-  const primary = await resolvePrimaryProvider(supabase, teamId);
+  const primary = await resolvePrimaryProvider(db, teamId);
   if (primary.provider === null || primary.integration === null) {
     return { provider: primary.provider, seenUpdated: 0, divergences: [], reason: primary.reason };
   }
@@ -82,7 +82,7 @@ export async function reconcileProviderState(
     return { provider: primary.provider, seenUpdated: 0, divergences: [], reason: `${primary.provider} has no inbound reconcile support` };
   }
 
-  const { data } = await supabase
+  const { data } = await db
     .from("task_pm_links")
     .select(LINK_COLS)
     .eq("team_id", teamId)
@@ -100,22 +100,22 @@ export async function reconcileProviderState(
     const seen = seenByResource.get(link.provider_resource_id!) ?? null;
     if (seen === null) continue; // provider has no state for this item (e.g. deleted) — leave as-is
 
-    // Persist the seen state ONLY when it changed — keeps a re-run write-free (idempotent).
-    if (seen !== link.provider_seen_status) {
-      await supabase
+    // Persist the seen state NAME ONLY when it changed — keeps a re-run write-free (idempotent).
+    if (seen.name !== link.provider_seen_status) {
+      await db
         .from("task_pm_links")
-        .update({ provider_seen_status: seen, updated_at: new Date().toISOString() })
+        .update({ provider_seen_status: seen.name, updated_at: new Date().toISOString() })
         .eq("id", link.id);
       seenUpdated += 1;
     }
 
     // Surface divergence from the brain's last projection — using the freshly-seen value.
-    if (isDiverged({ last_projected_status: link.last_projected_status, provider_seen_status: seen })) {
+    if (isDiverged({ last_projected_status: link.last_projected_status, provider_seen_status: seen.name })) {
       divergences.push({
         row_key: link.row_key,
         provider: link.provider,
         last_projected_status: link.last_projected_status,
-        provider_seen_status: seen,
+        provider_seen_status: seen.name,
       });
     }
   }

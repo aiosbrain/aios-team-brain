@@ -1,7 +1,7 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { CircleCheck, CircleX, FolderOpen } from "lucide-react";
-import { serverClient } from "@/lib/supabase/server";
+import { serverClient } from "@/lib/db/server";
 import { currentMember } from "@/lib/auth/guard";
 import { visibleItems, visibleDecisions } from "@/lib/auth/visibility";
 import { KindBadge } from "@/components/kind-badge";
@@ -34,16 +34,16 @@ export default async function ProjectPage({
   params: Promise<{ team: string; project: string }>;
 }) {
   const { team: teamSlug, project: projectSlug } = await params;
-  const supabase = await serverClient();
+  const db = await serverClient();
 
-  const { data: team } = await supabase
+  const { data: team } = await db
     .from("teams")
     .select("id")
     .eq("slug", teamSlug)
     .maybeSingle();
   if (!team) return null;
 
-  const { data: project } = await supabase
+  const { data: project } = await db
     .from("projects")
     .select("id, slug, name, last_synced_at")
     .eq("team_id", team.id)
@@ -54,7 +54,7 @@ export default async function ProjectPage({
   const me = await currentMember(team.id);
   const [{ data: items }, { data: decisions }, { data: roster }] = await Promise.all([
     visibleItems(
-      supabase
+      db
         .from("items")
         .select("id, path, kind, access, actor, frontmatter, synced_at")
         .eq("team_id", team.id)
@@ -63,7 +63,7 @@ export default async function ProjectPage({
       me?.tier ?? "external"
     ),
     visibleDecisions(
-      supabase
+      db
         .from("decisions")
         .select("id, row_key, decided_at, title, decided_by, still_valid")
         .eq("team_id", team.id)
@@ -71,7 +71,7 @@ export default async function ProjectPage({
         .order("decided_at", { ascending: false }),
       me?.tier ?? "external"
     ),
-    supabase
+    db
       .from("members")
       .select("id, display_name, actor_handle, role")
       .eq("team_id", team.id)

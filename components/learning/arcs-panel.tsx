@@ -1,7 +1,15 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Loader2, Sparkles, RefreshCw } from "lucide-react";
+import Link from "next/link";
+import { Loader2, Sparkles, RefreshCw, ChevronRight, ExternalLink } from "lucide-react";
+
+interface ArcEvidence {
+  fact: string;
+  at?: string;
+  itemId?: string;
+  source?: string;
+}
 
 interface Arc {
   id: string;
@@ -10,6 +18,7 @@ interface Arc {
   summary: string;
   participants: string[];
   supporting_sources: string[];
+  evidence: ArcEvidence[];
   derived_at: string;
 }
 
@@ -165,10 +174,31 @@ export function ArcsPanel({ teamSlug }: { teamSlug: string }) {
               </div>
             ) : null}
 
-            {arc.supporting_sources.length ? (
-              <p className="text-[11px] text-ink-tertiary">
-                sources: {arc.supporting_sources.join(" · ")}
-              </p>
+            {arc.evidence.length ? (
+              <details className="group/ev mt-0.5">
+                <summary className="flex w-fit cursor-pointer list-none items-center gap-1 text-xs font-medium text-ink-secondary transition-colors hover:text-ink">
+                  <ChevronRight className="size-3.5 transition-transform group-open/ev:rotate-90" />
+                  Evidence ({arc.evidence.length})
+                </summary>
+                <ul className="mt-2 flex flex-col gap-2 border-l border-border-subtle pl-3">
+                  {arc.evidence.map((e, i) => (
+                    <li key={i} className="flex flex-col gap-0.5">
+                      <span className="text-sm leading-snug text-ink-secondary">{e.fact}</span>
+                      {e.itemId ? (
+                        <Link
+                          href={`/t/${teamSlug}/library/${e.itemId}`}
+                          className="inline-flex w-fit items-center gap-1 text-[11px] text-violet hover:underline"
+                        >
+                          view source{e.source ? ` · ${e.source}` : ""}
+                          <ExternalLink className="size-3" />
+                        </Link>
+                      ) : e.source ? (
+                        <span className="text-[11px] text-ink-tertiary">{e.source}</span>
+                      ) : null}
+                    </li>
+                  ))}
+                </ul>
+              </details>
             ) : null}
           </div>
         );

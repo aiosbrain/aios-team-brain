@@ -10,29 +10,16 @@
 import { createHash, randomBytes } from "node:crypto";
 import { readFileSync, writeFileSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
-import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { ingestItem } from "../lib/ingest";
 import { normalizeTier } from "../lib/api/schemas";
-import { isPostgresBackend } from "../lib/db/backend";
 import { pgClient } from "../lib/db/pg/client";
+import type { DbClient } from "../lib/db/types";
 
-const pgMode = isPostgresBackend();
-let supabase: SupabaseClient;
-if (pgMode) {
-  if (!process.env.DATABASE_URL) {
-    console.error("DB_BACKEND=postgres: set DATABASE_URL");
-    process.exit(1);
-  }
-  supabase = pgClient() as unknown as SupabaseClient;
-} else {
-  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
-  if (!url || !key) {
-    console.error("set NEXT_PUBLIC_SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY (try: npx dotenv -e .env.local -- …, or export them)");
-    process.exit(1);
-  }
-  supabase = createClient(url, key, { auth: { persistSession: false } });
+if (!process.env.DATABASE_URL) {
+  console.error("set DATABASE_URL (try: npx dotenvx run -f .env.local -- …, or export it)");
+  process.exit(1);
 }
+const db = pgClient() as unknown as DbClient;
 
 const FIXTURES = path.resolve(__dirname, "..", "fixtures");
 const PROJECT_SLUG = "northwind-aios";
@@ -114,50 +101,28 @@ function* walk(dir: string, base: string): Generator<string> {
 
 async function main() {
   // 1. demo team
-  const { data: team, error: teamErr } = await supabase
+  const { data: team, error: teamErr } = await db
     .from("teams")
     .upsert({ slug: "demo", name: "Northwind Robotics — AI Transformation" }, { onConflict: "slug" })
     .select("id")
     .single();
   if (teamErr || !team) throw new Error(`team: ${teamErr?.message}`);
 
-  // 2. members — each gets a CONFIRMED auth user so they can actually log in.
-  //    (The login form uses shouldCreateUser:false / invite-only, so a member
-  //    row without a matching auth.users row can never sign in — the magic link
-  //    is silently not sent. Provisioning + linking here closes that gap for the
-  //    demo team; `npm run dev:login <email>` mints a one-click link.)
+  // 2. members — seeded with a null auth_user_id. There is no Supabase Auth;
+  //    members are linked to a local auth_users row on first login (the dev-login
+  //    route / magic link), so a seed row needs no pre-provisioned auth user.
   const memberDefs = [
     { actor_handle: "alex", display_name: "Alex", email: "alex@demo.aios.local", role: "admin" },
     { actor_handle: "riley", display_name: "Riley", email: "riley@demo.aios.local", role: "member" },
     { actor_handle: "jordan", display_name: "Jordan", email: "jordan@demo.aios.local", role: "member" },
     { actor_handle: "sam", display_name: "Sam", email: "sam@demo.aios.local", role: "lead" },
   ];
-  // In supabase mode, provision a confirmed auth user per member so they can log
-  // in. In postgres mode there is no Supabase Auth — members are linked to a
-  // local auth_users row on first login (dev-login / magic link), so seed them
-  // with a null auth_user_id.
-  const authIdByEmail = new Map<string, string>();
-  if (!pgMode) {
-    const { data: existingUsers } = await supabase.auth.admin.listUsers();
-    for (const u of existingUsers?.users ?? []) {
-      authIdByEmail.set((u.email ?? "").toLowerCase(), u.id);
-    }
-  }
   const members: Record<string, string> = {};
   for (const m of memberDefs) {
-    let authUserId = authIdByEmail.get(m.email.toLowerCase());
-    if (!authUserId && !pgMode) {
-      const { data: created, error: cErr } = await supabase.auth.admin.createUser({
-        email: m.email,
-        email_confirm: true,
-      });
-      if (cErr || !created?.user) throw new Error(`createUser ${m.email}: ${cErr?.message}`);
-      authUserId = created.user.id;
-    }
-    const { data } = await supabase
+    const { data } = await db
       .from("members")
       .upsert(
-        { team_id: team.id, ...m, status: "active", auth_user_id: authUserId ?? null },
+        { team_id: team.id, ...m, status: "active", auth_user_id: null },
         { onConflict: "team_id,email" }
       )
       .select("id, actor_handle")
@@ -169,7 +134,7 @@ async function main() {
   const keyId = randomBytes(6).toString("hex");
   const secret = randomBytes(32).toString("base64url");
   const fullKey = `aios_${keyId}_${secret}`;
-  await supabase.from("api_keys").insert({
+  await db.from("api_keys").insert({
     team_id: team.id,
     member_id: members["alex"],
     key_id: keyId,
@@ -192,7 +157,7 @@ async function main() {
       : kind === "decision" ? parseDecisionRows(body)
       : undefined;
     await ingestItem(
-      supabase,
+      db,
       auth,
       {
         project: PROJECT_SLUG,
@@ -225,7 +190,7 @@ async function main() {
     const json = load(file);
     const items = Array.isArray(json) ? json : json[arrayKey] ?? Object.values(json)[0];
     for (const e of items as Record<string, unknown>[]) {
-      await supabase.from("graph_entities").upsert(
+      await db.from("graph_entities").upsert(
         {
           team_id: team.id,
           entity_id: String(e.id),
@@ -242,7 +207,7 @@ async function main() {
   const rels = Array.isArray(relJson) ? relJson : relJson.relationships ?? Object.values(relJson)[0];
   let relCount = 0;
   for (const r of rels as Record<string, unknown>[]) {
-    const { error } = await supabase.from("graph_relationships").upsert(
+    const { error } = await db.from("graph_relationships").upsert(
       {
         team_id: team.id,
         from_id: String(r.from_id),
@@ -256,11 +221,11 @@ async function main() {
   }
 
   // 6. verify materialization (the regression assertions)
-  const { count: taskCount } = await supabase
+  const { count: taskCount } = await db
     .from("tasks").select("id", { count: "exact", head: true }).eq("team_id", team.id);
-  const { count: decisionCount } = await supabase
+  const { count: decisionCount } = await db
     .from("decisions").select("id", { count: "exact", head: true }).eq("team_id", team.id);
-  const { count: itemCount } = await supabase
+  const { count: itemCount } = await db
     .from("items").select("id", { count: "exact", head: true }).eq("team_id", team.id);
 
   console.log(`team: demo (${team.id})`);

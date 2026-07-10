@@ -1,8 +1,9 @@
 import { NextRequest } from "next/server";
-import { adminClient } from "@/lib/supabase/admin";
+import { adminClient } from "@/lib/db/admin";
 import { authenticateApiKey } from "@/lib/api/auth";
 import { rateLimit } from "@/lib/api/rate-limit";
 import { querySchema, errorResponse } from "@/lib/api/schemas";
+import { formatSseFrame } from "@/lib/api/sse";
 import { retrieve } from "@/lib/query/retrieve";
 import { streamAnswer } from "@/lib/query/claude";
 import { pickTimezone, DEFAULT_TIMEZONE } from "@/lib/query/timezone";
@@ -13,6 +14,7 @@ import {
   createConversation,
   appendMessage,
 } from "@/lib/chat/store";
+import { generateAndSetTitle } from "@/lib/chat/title";
 
 export const runtime = "nodejs";
 export const maxDuration = 120;
@@ -24,15 +26,15 @@ export async function POST(req: NextRequest) {
   const auth = await authenticateApiKey(req);
   if (!auth) return errorResponse("unauthorized", "invalid API key or team", 401);
 
-  const supabase = adminClient();
-  if (!(await rateLimit(supabase, `${auth.memberId}:query`, 10))) {
+  const db = adminClient();
+  if (!(await rateLimit(db, `${auth.memberId}:query`, 10))) {
     return errorResponse("rate_limited", "10 queries/min per member", 429);
   }
 
   // Daily guards: per-member count + per-team budget from query_log
   const dayStart = new Date();
   dayStart.setHours(0, 0, 0, 0);
-  const { count: todayCount } = await supabase
+  const { count: todayCount } = await db
     .from("query_log")
     .select("id", { count: "exact", head: true })
     .eq("member_id", auth.memberId)
@@ -40,7 +42,7 @@ export async function POST(req: NextRequest) {
   if ((todayCount ?? 0) >= DAILY_QUERIES_PER_MEMBER) {
     return errorResponse("rate_limited", `${DAILY_QUERIES_PER_MEMBER} queries/day per member`, 429);
   }
-  const { data: spend } = await supabase
+  const { data: spend } = await db
     .from("query_log")
     .select("cost_usd")
     .eq("team_id", auth.teamId)
@@ -64,19 +66,21 @@ export async function POST(req: NextRequest) {
   // Telegram-via-Hermes turn continues the member's existing conversation. Load prior turns BEFORE
   // recording the current question; the assistant turn is persisted once streaming completes.
   const owner = { teamId: auth.teamId, memberId: auth.memberId };
-  let conversationId = conversation_id && (await ownsConversation(supabase, owner, conversation_id)) ? conversation_id : null;
-  const priorTurns = conversationId ? await recentTurns(supabase, owner, conversationId) : [];
+  let conversationId = conversation_id && (await ownsConversation(db, owner, conversation_id)) ? conversation_id : null;
+  const priorTurns = conversationId ? await recentTurns(db, owner, conversationId) : [];
+  let createdNew = false;
   if (!conversationId) {
-    const created = await createConversation(supabase, owner, question);
+    const created = await createConversation(db, owner, question);
     conversationId = created?.id ?? null;
+    createdNew = true;
   }
-  if (conversationId) await appendMessage(supabase, owner, conversationId, "user", question);
+  if (conversationId) await appendMessage(db, owner, conversationId, "user", question);
 
   // Who the answer is FOR — anchors first-person resolution ("what did I ship?") to this member.
   const caller = { displayName: auth.displayName, email: auth.email, handle: auth.actorHandle };
 
   // Timezone for relative-date anchoring (no browser here): member profile → instance default.
-  const { data: prof } = await supabase
+  const { data: prof } = await db
     .from("member_profiles")
     .select("timezone")
     .eq("team_id", auth.teamId)
@@ -85,19 +89,19 @@ export async function POST(req: NextRequest) {
   const timeZone = pickTimezone([prof?.timezone, DEFAULT_TIMEZONE]);
 
   const started = Date.now();
-  const ctx = await retrieve(supabase, auth.teamId, auth.memberTier, question, project);
+  const ctx = await retrieve(db, auth.teamId, auth.memberTier, question, project);
 
   // Per-team provider keys (encrypted in integrations); null → env fallback in streamAnswer.
   const [anthropicKey, openaiKey] = await Promise.all([
-    getProviderKey(supabase, auth.teamId, "anthropic"),
-    getProviderKey(supabase, auth.teamId, "openai"),
+    getProviderKey(db, auth.teamId, "anthropic"),
+    getProviderKey(db, auth.teamId, "openai"),
   ]);
 
   const encoder = new TextEncoder();
   const stream = new ReadableStream({
     async start(controller) {
       const send = (event: string, data: unknown) =>
-        controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+        controller.enqueue(encoder.encode(formatSseFrame(event, data)));
 
       if (conversationId) send("conversation", { id: conversationId });
 
@@ -124,15 +128,18 @@ export async function POST(req: NextRequest) {
             send("done", chunk.usage);
 
             if (conversationId) {
-              await appendMessage(supabase, owner, conversationId, "assistant", answer, {
+              await appendMessage(db, owner, conversationId, "assistant", answer, {
                 cited_item_ids: sources.map((s) => s.item_id).filter((id): id is string => Boolean(id)),
                 input_tokens: chunk.usage.input_tokens,
                 output_tokens: chunk.usage.output_tokens,
                 cost_usd: chunk.usage.cost_usd,
               });
+              if (createdNew) {
+                await generateAndSetTitle(db, owner, conversationId, question, answer, { anthropicKey, openaiKey });
+              }
             }
 
-            await supabase.from("query_log").insert({
+            await db.from("query_log").insert({
               team_id: auth.teamId,
               member_id: auth.memberId,
               question,

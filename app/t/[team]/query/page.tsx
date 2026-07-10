@@ -1,5 +1,5 @@
 import type { Metadata } from "next";
-import { serverClient } from "@/lib/supabase/server";
+import { serverClient } from "@/lib/db/server";
 import { ChatWorkspace } from "@/components/chat/chat-workspace";
 
 export const metadata: Metadata = { title: "Chat" };
@@ -13,9 +13,9 @@ export default async function QueryPage({
 }) {
   const { team: teamSlug } = await params;
   const { q } = await searchParams;
-  const supabase = await serverClient();
+  const db = await serverClient();
 
-  const { data: team } = await supabase
+  const { data: team } = await db
     .from("teams")
     .select("id, name")
     .eq("slug", teamSlug)

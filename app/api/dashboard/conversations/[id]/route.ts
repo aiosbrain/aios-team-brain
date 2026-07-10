@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
-import { adminClient } from "@/lib/supabase/admin";
+import { adminClient } from "@/lib/db/admin";
 import { errorResponse } from "@/lib/api/schemas";
 import { resolveChatOwner } from "@/lib/chat/session";
 import { getConversation, renameConversation, archiveConversation } from "@/lib/chat/store";

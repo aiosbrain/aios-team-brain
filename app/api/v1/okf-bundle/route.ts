@@ -1,5 +1,5 @@
 import { NextRequest } from "next/server";
-import { adminClient } from "@/lib/supabase/admin";
+import { adminClient } from "@/lib/db/admin";
 import { authenticateApiKey } from "@/lib/api/auth";
 import { rateLimit } from "@/lib/api/rate-limit";
 import { errorResponse } from "@/lib/api/schemas";
@@ -28,11 +28,11 @@ export async function GET(req: NextRequest) {
   const cursor = url.searchParams.get("cursor");
   const requestedTier = url.searchParams.get("tier");
 
-  const supabase = adminClient();
+  const db = adminClient();
   // include_body returns full text → tighter limit, per contract.
   const ok = includeBody
-    ? await rateLimit(supabase, `${auth.apiKeyId}:okf-body`, 10)
-    : await rateLimit(supabase, `${auth.apiKeyId}:okf`, 30);
+    ? await rateLimit(db, `${auth.apiKeyId}:okf-body`, 10)
+    : await rateLimit(db, `${auth.apiKeyId}:okf`, 30);
   if (!ok) return errorResponse("rate_limited", includeBody ? "10/min with body" : "30/min", 429);
 
   // Effective tier can never exceed the caller's ceiling.
@@ -45,7 +45,7 @@ export async function GET(req: NextRequest) {
   // join, so we filter by project_id instead.)
   let projectId: string | null = null;
   if (project) {
-    const { data: p } = await supabase
+    const { data: p } = await db
       .from("projects")
       .select("id")
       .eq("team_id", auth.teamId)
@@ -63,7 +63,7 @@ export async function GET(req: NextRequest) {
   // 1. Path → access map for the whole team, to resolve + redact links.
   //    (Whole-team is intentional: keys are slug-scoped, and cross-project
   //    links are preserved as "broken" per contract point 3.)
-  const { data: allRows, error: mapErr } = await supabase
+  const { data: allRows, error: mapErr } = await db
     .from("items")
     .select("path, access, projects(slug)")
     .eq("team_id", auth.teamId);
@@ -75,7 +75,7 @@ export async function GET(req: NextRequest) {
   }
 
   // 2. The page of nodes the caller's tier may see.
-  let q = supabase
+  let q = db
     .from("items")
     .select("path, kind, access, frontmatter, body, content_sha256, updated_at, projects(slug)")
     .eq("team_id", auth.teamId)

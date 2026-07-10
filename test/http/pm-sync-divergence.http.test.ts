@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
+import { adminSetPassword } from "@/lib/auth/pg-login";
 import { BASE_URL, db, seedTeam, type Seed } from "./http-helpers";
 
 // Spec (brain-api v1.2 Phase 5): the admin PM-sync page server-renders the inbound-divergence list —
@@ -7,8 +8,9 @@ import { BASE_URL, db, seedTeam, type Seed } from "./http-helpers";
 // real socket (HTTP 200) with an admin session. Divergence is read from stored provider_seen_status
 // (a prior reconcile pass populated it) — no live PM call on render.
 
-async function seedAdmin(seed: Seed): Promise<string> {
+async function seedAdmin(seed: Seed): Promise<{ email: string; password: string }> {
   const email = `admin-${randomUUID().slice(0, 8)}@test.local`;
+  const password = `test-password-${randomUUID().slice(0, 12)}`;
   const { error } = await db().from("members").insert({
     team_id: seed.teamId,
     email,
@@ -19,14 +21,15 @@ async function seedAdmin(seed: Seed): Promise<string> {
     status: "active",
   });
   if (error) throw new Error(`admin seed failed: ${error.message}`);
-  return email;
+  await adminSetPassword(email, password);
+  return { email, password };
 }
 
-async function login(email: string): Promise<string> {
+async function login(email: string, password: string): Promise<string> {
   const res = await fetch(`${BASE_URL}/api/auth/login`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ email }),
+    body: JSON.stringify({ email, password }),
   });
   if (res.status !== 200) throw new Error(`login failed: ${res.status}`);
   const cookie = (res.headers.get("set-cookie") ?? "").split(";")[0];
@@ -60,8 +63,8 @@ async function seedDivergedLink(seed: Seed) {
 describe("GET /t/{team}/admin/pm-sync (HTTP) — inbound divergence list", () => {
   it("server-renders the divergence row (brain vs tool) for an admin (200)", async () => {
     const seed = await seedTeam();
-    const email = await seedAdmin(seed);
-    const cookie = await login(email);
+    const { email, password } = await seedAdmin(seed);
+    const cookie = await login(email, password);
     await seedDivergedLink(seed);
 
     const res = await fetch(`${BASE_URL}/t/${seed.teamSlug}/admin/pm-sync`, { headers: { cookie }, cache: "no-store" });
@@ -78,8 +81,8 @@ describe("GET /t/{team}/admin/pm-sync (HTTP) — inbound divergence list", () =>
 
   it("shows the empty state when nothing has diverged", async () => {
     const seed = await seedTeam();
-    const email = await seedAdmin(seed);
-    const cookie = await login(email);
+    const { email, password } = await seedAdmin(seed);
+    const cookie = await login(email, password);
 
     const res = await fetch(`${BASE_URL}/t/${seed.teamSlug}/admin/pm-sync`, { headers: { cookie }, cache: "no-store" });
     expect(res.status).toBe(200);

@@ -1,5 +1,5 @@
 import "server-only";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 import type { Kpi } from "./pulse";
 import { rangeDays, type Range } from "./range";
 import { canSeeCodebases, type ViewerTier } from "@/lib/codebases/visibility";
@@ -27,7 +27,50 @@ export interface CodebaseSummary {
   ai_commit_ratio: number;
   readiness_level: string | null; // AEM agent-readiness level (L0..L5), null = not scored
   readiness_pct: number | null;
-  spark: number[]; // agentic_score over the window
+  spark: number[]; // agentic_score trend (windowed; falls back to last points if the window is empty)
+  stale: boolean; // last scan is older than STALE_DAYS — headline shows last-known values, flagged in the UI
+  scanned: boolean; // has ≥1 code_metrics row — false = GitHub-API sync only (contributions, no readiness)
+}
+
+/**
+ * A codebase's card headline (agentic/health/coverage/readiness) reflects its LAST scan
+ * regardless of the selected range — a repo that hasn't been scanned recently keeps showing
+ * its last-known numbers instead of blanking out. We only mark it `stale` (a UI badge) when
+ * the newest scan is older than this. The sparkline stays range-windowed (with a fallback to
+ * the most recent points so it never renders empty). There is no scanner backstop on the
+ * postgres target — a stale card means "run a scan", not "no data".
+ */
+export const STALE_DAYS = 14;
+
+/** True when the last scan is older than `staleDays` (or never scanned). Pure — unit-tested. */
+export function isCodebaseStale(
+  lastScanAt: string | null,
+  nowMs: number,
+  staleDays: number = STALE_DAYS
+): boolean {
+  if (!lastScanAt) return true;
+  const scannedMs = Date.parse(lastScanAt);
+  if (Number.isNaN(scannedMs)) return true;
+  return nowMs - scannedMs > staleDays * 86_400_000;
+}
+
+/**
+ * Sparkline series from a newest-first metric series: the points inside the window, oldest→newest.
+ * If the window holds fewer than two points (e.g. a repo not scanned recently), fall back to the
+ * most recent `fallback` points overall so the card still shows its historical trend rather than a
+ * flat/empty line. Pure — unit-tested.
+ */
+export function windowedSpark(
+  seriesNewestFirst: { scanned_at: string | Date; agentic_score: number | string }[],
+  windowStartIso: string,
+  fallback = 12
+): number[] {
+  // Compare by epoch ms — the pg adapter returns `scanned_at` as a Date, not an ISO string,
+  // so a lexicographic string compare would silently never match (the #134 gotcha).
+  const windowStartMs = Date.parse(windowStartIso);
+  const inWindow = seriesNewestFirst.filter((s) => new Date(s.scanned_at).getTime() >= windowStartMs);
+  const source = inWindow.length >= 2 ? inWindow : seriesNewestFirst.slice(0, fallback);
+  return source.map((s) => num(s.agentic_score)).reverse();
 }
 
 export interface CodebaseListResult {
@@ -47,27 +90,29 @@ type MetricRow = {
 };
 
 export async function getCodebaseSummaries(
-  supabase: SupabaseClient,
+  db: DbClient,
   teamId: string,
   range: Range,
   tier: ViewerTier
 ): Promise<CodebaseListResult> {
   if (!canSeeCodebases(tier)) return { codebases: [], kpis: [] };
 
-  const windowStart = new Date(Date.now() - rangeDays(range) * 86_400_000).toISOString();
+  const now = Date.now();
+  const windowStart = new Date(now - rangeDays(range) * 86_400_000).toISOString();
 
   const [cbRes, mRes] = await Promise.all([
-    supabase
+    db
       .from("codebases")
       .select("id, slug, full_name, primary_language, stars, open_issues, last_scan_at")
       .eq("team_id", teamId)
       .order("last_scan_at", { ascending: false, nullsFirst: false }),
-    supabase
+    // NOT windowed: we want each codebase's LAST scan for the headline even if it predates the
+    // range, so a card never blanks out (it's flagged `stale` instead). The sparkline windows this
+    // series in JS. DESC + limit keeps the NEWEST points (ascending+limit would drop them at scale).
+    db
       .from("code_metrics")
       .select("codebase_id, scanned_at, agentic_score, health_score, test_coverage_pct, ai_commit_ratio, readiness_level, readiness_pct")
       .eq("team_id", teamId)
-      .gte("scanned_at", windowStart)
-      // DESC + limit keeps the NEWEST points (ascending+limit would drop them at scale).
       .order("scanned_at", { ascending: false })
       .limit(10_000),
   ]);
@@ -108,8 +153,10 @@ export async function getCodebaseSummaries(
       ai_commit_ratio: num(latest?.ai_commit_ratio),
       readiness_level: latest?.readiness_level ?? null,
       readiness_pct: latest?.readiness_pct == null ? null : num(latest.readiness_pct),
-      // chronological for the sparkline (series is newest-first)
-      spark: series.map((s) => num(s.agentic_score)).reverse(),
+      // windowed trend (falls back to the most recent points so a stale card still shows a line)
+      spark: windowedSpark(series, windowStart),
+      stale: isCodebaseStale(cb.last_scan_at, now),
+      scanned: series.length > 0,
     };
   });
 
@@ -192,13 +239,13 @@ export interface CodebaseFreshness {
  * like the rest of codebase analytics (sole enforcement on postgres, no RLS).
  */
 export async function getCodebaseFreshness(
-  supabase: SupabaseClient,
+  db: DbClient,
   teamId: string,
   tier: ViewerTier
 ): Promise<CodebaseFreshness[]> {
   if (!canSeeCodebases(tier)) return [];
 
-  const { data: cbData } = await supabase
+  const { data: cbData } = await db
     .from("codebases")
     .select("id, slug, full_name, default_branch, last_scan_at")
     .eq("team_id", teamId)
@@ -213,7 +260,7 @@ export async function getCodebaseFreshness(
   if (codebases.length === 0) return [];
 
   // Newest head_sha per codebase (rows arrive newest-first; first seen wins).
-  const { data: mData } = await supabase
+  const { data: mData } = await db
     .from("code_metrics")
     .select("codebase_id, head_sha, scanned_at")
     .eq("team_id", teamId)
@@ -308,6 +355,7 @@ export interface CodebaseDetail {
   forks: number;
   open_issues: number;
   last_scan_at: string | null;
+  stale: boolean; // last scan older than STALE_DAYS — headline is last-known; windowed charts may be empty
   breakdown: AgenticBreakdown | null;
   recent_commits: Record<string, unknown>[];
   trend: TrendPoint[];
@@ -317,7 +365,7 @@ export interface CodebaseDetail {
 }
 
 export async function getCodebaseDetail(
-  supabase: SupabaseClient,
+  db: DbClient,
   teamId: string,
   slug: string,
   range: Range,
@@ -325,7 +373,7 @@ export async function getCodebaseDetail(
 ): Promise<CodebaseDetail | null> {
   if (!canSeeCodebases(tier)) return null;
 
-  const { data: cb } = await supabase
+  const { data: cb } = await db
     .from("codebases")
     .select(
       "id, slug, full_name, default_branch, description, homepage, primary_language, languages, stars, forks, open_issues, last_scan_at"
@@ -346,27 +394,28 @@ export async function getCodebaseDetail(
     "readiness_level, readiness_pct, readiness_pillars";
 
   const [metricsRes, contribRes, issuesRes, membersRes] = await Promise.all([
-    supabase
+    // NOT windowed: the breakdown/headline reflect the LAST scan even if it predates the range
+    // (a stale detail page keeps its last-known values). The trend windows this series in JS below.
+    db
       .from("code_metrics")
       .select(METRIC_COLS)
       .eq("codebase_id", codebaseId)
-      .gte("scanned_at", windowStart)
       // DESC + limit keeps the newest points; reversed below for chronological trend.
       .order("scanned_at", { ascending: false })
       .limit(2000),
-    supabase
+    db
       .from("code_contributions")
       .select("author_key, author_name, member_id, day, commits, ai_commits, additions, deletions")
       .eq("codebase_id", codebaseId)
       .gte("day", windowStart.slice(0, 10))
       .limit(10_000),
-    supabase
+    db
       .from("github_issues")
       .select("number, title, state, is_pull_request, author_login, labels, url, opened_at")
       .eq("codebase_id", codebaseId)
       .order("updated_at", { ascending: false })
       .limit(200),
-    supabase.from("members").select("id, display_name, github_login, avatar_url").eq("team_id", teamId),
+    db.from("members").select("id, display_name, github_login, avatar_url").eq("team_id", teamId),
   ]);
 
   type MemberMeta = { display_name: string | null; github_login: string | null; avatar_url: string | null };
@@ -375,9 +424,15 @@ export async function getCodebaseDetail(
     members.set(m.id, { display_name: m.display_name, github_login: m.github_login, avatar_url: m.avatar_url });
   }
 
-  // newest-first from the query; reverse a copy for the chronological trend.
+  // newest-first from the query. `latest` is the true last scan (unwindowed) so the breakdown
+  // never blanks; the trend is windowed with a fallback to the most recent points.
   const metrics = (metricsRes.data ?? []) as unknown as Record<string, unknown>[];
-  const chronological = [...metrics].reverse();
+  // Compare by epoch ms — scanned_at comes back as a Date via the pg adapter (#134 gotcha).
+  const windowStartMs = Date.parse(windowStart);
+  const inWindow = metrics.filter(
+    (m) => new Date(m.scanned_at as string | Date).getTime() >= windowStartMs
+  );
+  const chronological = [...(inWindow.length >= 2 ? inWindow : metrics.slice(0, 12))].reverse();
   const latest = metrics[0];
 
   const breakdown: AgenticBreakdown | null = latest
@@ -498,6 +553,7 @@ export async function getCodebaseDetail(
     forks: num(c.forks as number),
     open_issues: num(c.open_issues as number),
     last_scan_at: (c.last_scan_at as string) ?? null,
+    stale: isCodebaseStale((c.last_scan_at as string) ?? null, Date.now()),
     breakdown,
     recent_commits: Array.isArray(latest?.recent_commits)
       ? (latest.recent_commits as Record<string, unknown>[])
@@ -550,7 +606,7 @@ function dayStr(v: string | Date): string {
  * (the `lib/metrics/codebases` choke-point is the sole enforcement on postgres).
  */
 export async function getContributorDetail(
-  supabase: SupabaseClient,
+  db: DbClient,
   teamId: string,
   slug: string,
   ref: ContributorRef,
@@ -559,7 +615,7 @@ export async function getContributorDetail(
 ): Promise<ContributorDetail | null> {
   if (!canSeeCodebases(tier)) return null;
 
-  const { data: cb } = await supabase
+  const { data: cb } = await db
     .from("codebases")
     .select("id, slug")
     .eq("team_id", teamId)
@@ -568,7 +624,7 @@ export async function getContributorDetail(
   if (!cb) return null;
 
   const windowStart = new Date(Date.now() - rangeDays(range) * 86_400_000).toISOString().slice(0, 10);
-  let q = supabase
+  let q = db
     .from("code_contributions")
     .select("author_key, author_name, member_id, day, commits, ai_commits, additions, deletions")
     .eq("codebase_id", (cb as { id: string }).id)
@@ -612,7 +668,7 @@ export async function getContributorDetail(
   let github_login: string | null = null;
   const member_id = "memberId" in ref ? ref.memberId : rows.find((r) => r.member_id)?.member_id ?? null;
   if (member_id) {
-    const { data: m } = await supabase
+    const { data: m } = await db
       .from("members")
       .select("display_name, avatar_url, github_login")
       .eq("id", member_id)
@@ -661,7 +717,7 @@ export interface MemberProfile {
  * the team's codebases. Looked up by `actor_handle` or `github_login`. Tier-gated team-only.
  */
 export async function getMemberProfile(
-  supabase: SupabaseClient,
+  db: DbClient,
   teamId: string,
   handle: string,
   range: Range,
@@ -669,7 +725,7 @@ export async function getMemberProfile(
 ): Promise<MemberProfile | null> {
   if (!canSeeCodebases(tier)) return null;
 
-  const { data: members } = await supabase
+  const { data: members } = await db
     .from("members")
     .select("id, display_name, actor_handle, github_login, avatar_url, role, status")
     .eq("team_id", teamId);
@@ -692,7 +748,7 @@ export async function getMemberProfile(
   if (!member) return null;
 
   const windowStart = new Date(Date.now() - rangeDays(range) * 86_400_000).toISOString().slice(0, 10);
-  const { data: contribs } = await supabase
+  const { data: contribs } = await db
     .from("code_contributions")
     .select("day, commits, ai_commits, additions, deletions, codebases(slug)")
     .eq("team_id", teamId)

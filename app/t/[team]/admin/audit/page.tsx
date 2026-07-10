@@ -1,4 +1,4 @@
-import { serverClient } from "@/lib/supabase/server";
+import { serverClient } from "@/lib/db/server";
 import { timeAgo } from "@/components/format";
 
 export default async function AuditAdminPage({
@@ -7,16 +7,16 @@ export default async function AuditAdminPage({
   params: Promise<{ team: string }>;
 }) {
   const { team: teamSlug } = await params;
-  const supabase = await serverClient();
+  const db = await serverClient();
 
-  const { data: team } = await supabase
+  const { data: team } = await db
     .from("teams")
     .select("id")
     .eq("slug", teamSlug)
     .maybeSingle();
   if (!team) return null;
 
-  const { data: entries } = await supabase
+  const { data: entries } = await db
     .from("audit_log")
     .select("id, actor_kind, action, target_type, target_id, meta, ip, created_at")
     .eq("team_id", team.id)

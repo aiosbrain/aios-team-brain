@@ -1,19 +1,9 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
-import { serverClient } from "@/lib/supabase/server";
-import { adminClient } from "@/lib/supabase/admin";
-import { getSessionUser } from "@/lib/auth/session";
-import { resolveIntegrationsAdmin } from "@/lib/integrations/read";
+import { adminClient } from "@/lib/db/admin";
+import { requireTeamAdmin as requireAdmin } from "@/lib/auth/guard";
 import { createPolicy, updatePolicy, setPolicyEnabled, deletePolicy, type PolicyInput } from "@/lib/policy/manage";
-
-/** Admin gate (same shared resolver the other admin actions use). */
-async function requireAdmin(teamSlug: string) {
-  const supabase = await serverClient();
-  const user = await getSessionUser();
-  if (!user) return null;
-  return resolveIntegrationsAdmin(supabase, teamSlug, user.id);
-}
 
 export type PolicyForm = PolicyInput & { id?: string };
 

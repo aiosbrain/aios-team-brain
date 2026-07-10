@@ -15,6 +15,7 @@ import {
   ListTodo,
   Shield,
   Sparkles,
+  UserCircle,
   Wrench,
 } from "lucide-react";
 
@@ -31,6 +32,7 @@ const ICONS = {
   query: Sparkles,
   learning: Brain,
   admin: Shield,
+  account: UserCircle,
 } as const;
 
 export type NavLeaf = {

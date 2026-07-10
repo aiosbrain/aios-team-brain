@@ -1,7 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { Blocks } from "lucide-react";
-import { serverClient } from "@/lib/supabase/server";
+import { serverClient } from "@/lib/db/server";
 import { currentMember } from "@/lib/auth/guard";
 import { visibleItems } from "@/lib/auth/visibility";
 import { TierBadge } from "@/components/tier-badge";
@@ -65,14 +65,14 @@ function refCount(it: SkillItem): number {
 
 export default async function SkillsPage({ params }: { params: Promise<{ team: string }> }) {
   const { team: teamSlug } = await params;
-  const supabase = await serverClient();
+  const db = await serverClient();
 
-  const { data: team } = await supabase.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
+  const { data: team } = await db.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
   if (!team) return null;
 
   const me = await currentMember(team.id);
   const { data: items } = await visibleItems(
-    supabase
+    db
       .from("items")
       .select("id, path, access, actor, synced_at, frontmatter, body, projects(slug)")
       .eq("team_id", team.id)

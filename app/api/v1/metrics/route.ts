@@ -1,5 +1,5 @@
 import { NextRequest } from "next/server";
-import { adminClient } from "@/lib/supabase/admin";
+import { adminClient } from "@/lib/db/admin";
 import { authenticateApiKey } from "@/lib/api/auth";
 import { rateLimit } from "@/lib/api/rate-limit";
 import {
@@ -22,8 +22,8 @@ export async function POST(req: NextRequest) {
     return errorResponse("forbidden_tier", "agentic-maturity metrics are team-tier only", 403);
   }
 
-  const supabase = adminClient();
-  if (!(await rateLimit(supabase, `${auth.apiKeyId}:metrics:post`, 60))) {
+  const db = adminClient();
+  if (!(await rateLimit(db, `${auth.apiKeyId}:metrics:post`, 60))) {
     return errorResponse("rate_limited", "60 snapshots/min per key", 429);
   }
 
@@ -43,7 +43,7 @@ export async function POST(req: NextRequest) {
   }
 
   try {
-    const result = await ingestMaturitySnapshot(supabase, auth, parsed.data);
+    const result = await ingestMaturitySnapshot(db, auth, parsed.data);
     return Response.json({ status: "ok", ...result }, { status: 201 });
   } catch (e) {
     // Unknown member handle = client input error → 422, not a 500 brain fault.

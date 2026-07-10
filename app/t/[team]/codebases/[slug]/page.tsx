@@ -2,8 +2,7 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { ArrowLeft, Star, GitFork, CircleDot } from "lucide-react";
-import { isPostgresBackend } from "@/lib/db/backend";
-import { serverClient } from "@/lib/supabase/server";
+import { serverClient } from "@/lib/db/server";
 import { currentMember } from "@/lib/auth/guard";
 import { getCodebaseDetail } from "@/lib/metrics/codebases";
 import { parseRange } from "@/lib/metrics/range";
@@ -24,19 +23,18 @@ export default async function CodebaseDetailPage({
   params: Promise<{ team: string; slug: string }>;
   searchParams: Promise<{ range?: string }>;
 }) {
-  if (!isPostgresBackend()) notFound();
 
   const { team: teamSlug, slug } = await params;
   const range = parseRange((await searchParams).range);
-  const supabase = await serverClient();
+  const db = await serverClient();
 
-  const { data: team } = await supabase.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
+  const { data: team } = await db.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
   if (!team) return null;
 
   const me = await currentMember(team.id);
   if (!me) return null;
 
-  const cb = await getCodebaseDetail(supabase, team.id, slug, range, me.tier);
+  const cb = await getCodebaseDetail(db, team.id, slug, range, me.tier);
   if (!cb) notFound();
 
   const langs = Object.entries(cb.languages)
@@ -55,7 +53,7 @@ export default async function CodebaseDetailPage({
         </Link>
         <div className="mt-2 flex items-start justify-between gap-3">
           <div className="min-w-0">
-            <h1 className="font-display text-2xl font-semibold text-ink">{cb.slug}</h1>
+            <h1 className="font-display text-2xl text-ink">{cb.slug}</h1>
             {cb.full_name ? (
               <a
                 href={`https://github.com/${cb.full_name}`}
@@ -90,6 +88,14 @@ export default async function CodebaseDetailPage({
           <RangeSelector value={range} />
         </div>
       </div>
+
+      {cb.stale ? (
+        <div className="rounded-lg border border-amber-400/25 bg-amber-400/10 px-4 py-2.5 text-xs text-amber-600 dark:text-amber-300">
+          No recent scan — the scores below are from the last scan{" "}
+          {cb.last_scan_at ? timeAgo(cb.last_scan_at) : ""}. Contribution and commit-volume charts
+          only cover the selected range, so they may be empty until this repo is re-scanned.
+        </div>
+      ) : null}
 
       <div className="grid grid-cols-1 gap-5 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.4fr)]">
         {cb.breakdown ? <AgenticBreakdownCard b={cb.breakdown} /> : null}

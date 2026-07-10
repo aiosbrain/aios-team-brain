@@ -1,5 +1,5 @@
 import "server-only";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 import {
   type ItemPayload,
   taskRowSchema,
@@ -38,18 +38,22 @@ export interface IngestResult {
 }
 
 export async function ingestItem(
-  supabase: SupabaseClient,
+  db: DbClient,
   auth: { teamId: string; memberId: string; apiKeyId: string },
   payload: ItemPayload,
   access: "team" | "external",
   // INTERNAL-only attribution override (NOT on the wire ItemPayload, so external pushers can't
   // spoof authorship). When an internal caller already knows the content's author — e.g. the
   // codebase scanner attributing a commit to a resolved member — it passes that here; otherwise
-  // the item is attributed to the ingesting actor (`auth.memberId`), as before.
-  opts?: { authorMemberId?: string | null }
+  // (opts omitted entirely) the item is attributed to the ingesting actor (`auth.memberId`). A
+  // caller that HAS attempted resolution but come up empty must pass `authorMemberId: null`
+  // explicitly (not omit opts) — that's the only way to say "leave this unattributed" rather than
+  // "attribute to whoever's pushing," so a connector ingesting on behalf of an unresolved human
+  // never silently falls back to the connector's own member_id.
+  opts?: { authorMemberId: string | null }
 ): Promise<IngestResult> {
   // 1. project
-  const { data: project, error: projErr } = await supabase
+  const { data: project, error: projErr } = await db
     .from("projects")
     .upsert(
       { team_id: auth.teamId, slug: payload.project, last_synced_at: new Date().toISOString() },
@@ -60,7 +64,7 @@ export async function ingestItem(
   if (projErr || !project) throw new Error(`project upsert failed: ${projErr?.message}`);
 
   // 2. existing item?
-  const { data: existing } = await supabase
+  const { data: existing } = await db
     .from("items")
     .select("id, content_sha256")
     .eq("team_id", auth.teamId)
@@ -71,13 +75,11 @@ export async function ingestItem(
   const now = new Date().toISOString();
 
   if (existing && existing.content_sha256 === payload.content_sha256) {
-    await supabase.from("items").update({ synced_at: now }).eq("id", existing.id);
-    await audit(supabase, {
-      team_id: auth.teamId, actor_kind: "api_key",
-      member_id: auth.memberId, api_key_id: auth.apiKeyId,
-      action: "item.unchanged", target_type: "item", target_id: existing.id,
-      meta: { path: payload.path },
-    });
+    // Refresh "last seen this sync"; do NOT write an audit row (audit M4). Every 30-min sync tick
+    // re-pushes every unchanged item, so an `item.unchanged` audit here added ~one row/item/tick
+    // (~24k/day at 500 items) — unbounded audit_log growth with no diagnostic value. The synced_at
+    // bump is the freshness signal; create/update/delete stay audited on the paths below.
+    await db.from("items").update({ synced_at: now }).eq("id", existing.id);
     // No projection on an unchanged push (the route also guards status !== "unchanged").
     return { status: "unchanged", id: existing.id, projectId: project.id };
   }
@@ -86,14 +88,21 @@ export async function ingestItem(
   let validatedTaskRows: TaskRow[] | undefined;
   if (payload.rows && payload.kind === "task") {
     validatedTaskRows = await parseAndValidateTaskRows(
-      supabase,
+      db,
       auth.teamId,
       project.id,
       payload.rows
     );
   }
 
-  // 3. upsert item (+ version when body changed)
+  // 3. upsert item (+ version when body changed). The item write and the row materialization below
+  // are NOT one transaction (the compat adapter can't share a pinned connection), so we WITHHOLD the
+  // new content_sha256 until materialize succeeds (audit H4). On a mid-materialize failure the item
+  // keeps its OLD sha (or, for a brand-new row, an empty sentinel a 64-hex sha can never equal), so
+  // the retry's "unchanged" fast-path above does NOT fire and the rows get re-materialized — instead
+  // of the item being marked synced while its task/decision board stays permanently diverged. The
+  // real hash is committed in one final update (step 5), the single point that marks this push synced.
+  const PENDING_SHA = ""; // real content_sha256 is 64 hex chars; "" forces reprocess after a crash
   const itemRecord = {
     team_id: auth.teamId,
     project_id: project.id,
@@ -102,31 +111,33 @@ export async function ingestItem(
     access,
     frontmatter: payload.frontmatter ?? {},
     body: payload.body,
-    content_sha256: payload.content_sha256,
+    content_sha256: existing ? existing.content_sha256 : PENDING_SHA,
     actor: payload.actor ?? "",
-    member_id: opts?.authorMemberId ?? auth.memberId,
+    member_id: opts ? opts.authorMemberId : auth.memberId,
     synced_at: now,
     updated_at: now,
   };
 
   let itemId: string;
   if (existing) {
-    const { error } = await supabase.from("items").update(itemRecord).eq("id", existing.id);
+    const { error } = await db.from("items").update(itemRecord).eq("id", existing.id);
     if (error) throw new Error(`item update failed: ${error.message}`);
     itemId = existing.id;
   } else {
-    const { data, error } = await supabase.from("items").insert(itemRecord).select("id").single();
+    const { data, error } = await db.from("items").insert(itemRecord).select("id").single();
     if (error || !data) throw new Error(`item insert failed: ${error?.message}`);
     itemId = data.id;
   }
 
-  await supabase.from("item_versions").insert({
+  // Version history — surface errors (audit LOW: previously swallowed, silently losing versions).
+  const { error: versionErr } = await db.from("item_versions").insert({
     item_id: itemId,
     content_sha256: payload.content_sha256,
     frontmatter: payload.frontmatter ?? {},
     body: payload.body,
-    member_id: auth.memberId,
+    member_id: opts ? opts.authorMemberId : auth.memberId,
   });
+  if (versionErr) throw new Error(`item version insert failed: ${versionErr.message}`);
 
   // 4. materialize rows. Present (even if empty) for task/decision items, so an emptied
   // markdown table diff-deletes its synced rows. `now` (the item's synced_at) is used as
@@ -136,19 +147,28 @@ export async function ingestItem(
   if (payload.rows && (payload.kind === "task" || payload.kind === "decision")) {
     if (payload.kind === "task") {
       changedTaskRowKeys = await materializeTasks(
-        supabase,
+        db,
         auth.teamId,
         project.id,
         itemId,
         validatedTaskRows!,
-        now
+        now,
+        access
       );
     } else {
-      await materializeDecisions(supabase, auth.teamId, project.id, itemId, payload.rows, now);
+      await materializeDecisions(db, auth.teamId, project.id, itemId, payload.rows, now);
     }
   }
 
-  await audit(supabase, {
+  // 5. Commit the content hash LAST — marks the push durably synced (audit H4). Any throw above left
+  // the old/sentinel sha, so a retry reprocesses rather than short-circuiting on "unchanged".
+  const { error: shaErr } = await db
+    .from("items")
+    .update({ content_sha256: payload.content_sha256 })
+    .eq("id", itemId);
+  if (shaErr) throw new Error(`item sha commit failed: ${shaErr.message}`);
+
+  await audit(db, {
     team_id: auth.teamId, actor_kind: "api_key",
     member_id: auth.memberId, api_key_id: auth.apiKeyId,
     action: existing ? "item.updated" : "item.created",
@@ -163,7 +183,7 @@ type TaskRow = NonNullable<ReturnType<typeof taskRowSchema.safeParse>["data"]>;
 
 /** Parse + parent-integrity checks only (no writes). Called before item upsert so 422 is clean. */
 async function parseAndValidateTaskRows(
-  supabase: SupabaseClient,
+  db: DbClient,
   teamId: string,
   projectId: string,
   rawRows: unknown[]
@@ -183,7 +203,7 @@ async function parseAndValidateTaskRows(
   const parentMap = new Map<string, string>();
   const existingKeys = new Set<string>();
   {
-    const { data: existing } = await supabase
+    const { data: existing } = await db
       .from("tasks")
       .select("row_key, parent_row_key")
       .eq("team_id", teamId)
@@ -224,12 +244,16 @@ async function parseAndValidateTaskRows(
 }
 
 async function materializeTasks(
-  supabase: SupabaseClient,
+  db: DbClient,
   teamId: string,
   projectId: string,
   itemId: string,
   rows: TaskRow[],
-  syncedAt: string
+  syncedAt: string,
+  // Tier the materialized rows inherit (audit H1). Tasks carry no wire-level audience; a task is
+  // visible at exactly the tier of the item that produced it, so an external principal never reads
+  // internal task boards. See tasks.audience / visibleTasks.
+  audience: "team" | "external"
 ): Promise<string[]> {
   const incomingKeys = new Set(rows.map((r) => r.row_key));
   const parentOf = (r: TaskRow) => (r.parent ?? "").trim();
@@ -238,7 +262,7 @@ async function materializeTasks(
   // rows' projected fields changed this push (bounded reactive projection — see projectable-diff).
   const snapshotByKey = new Map<string, ProjectableSnapshot>();
   if (incomingKeys.size) {
-    const { data: before, error: beforeErr } = await supabase
+    const { data: before, error: beforeErr } = await db
       .from("tasks")
       .select("row_key, title, status, sprint, priority, labels, parent_row_key, assignee")
       .eq("team_id", teamId)
@@ -280,6 +304,7 @@ async function materializeTasks(
       sprint: row.sprint ?? "",
       due_date: row.due || null,
       origin: "sync",
+      audience,
       updated_at: syncedAt,
     };
     if ("assignee" in row) upsertRow.assignee = (row.assignee ?? "").trim();
@@ -287,7 +312,7 @@ async function materializeTasks(
     if ("parent" in row) upsertRow.parent_row_key = parentOf(row) || null;
     if ("labels" in row) upsertRow.labels = row.labels ?? [];
     if ("priority" in row) upsertRow.priority = normalizeTaskPriority(row.priority);
-    const { data: task, error } = await supabase
+    const { data: task, error } = await db
       .from("tasks")
       .upsert(upsertRow, { onConflict: "team_id,project_id,row_key" })
       .select("id")
@@ -295,7 +320,7 @@ async function materializeTasks(
     if (error) throw new Error(`task row ${row.row_key}: ${error.message}`);
 
     if (row.pm_provider && row.pm_external_id) {
-      const { error: linkErr } = await supabase.from("task_pm_links").upsert(
+      const { error: linkErr } = await db.from("task_pm_links").upsert(
         {
           team_id: teamId,
           project_id: projectId,
@@ -313,7 +338,7 @@ async function materializeTasks(
   }
 
   // diff-delete: sync-originated rows absent from this push; UI rows survive.
-  const { data: current } = await supabase
+  const { data: current } = await db
     .from("tasks")
     .select("id, row_key, origin, parent_row_key")
     .eq("team_id", teamId)
@@ -322,7 +347,7 @@ async function materializeTasks(
   const survivors = new Set<string>();
   for (const t of current ?? []) {
     if (t.origin === "sync" && t.row_key && !incomingKeys.has(t.row_key)) {
-      await supabase.from("tasks").delete().eq("id", t.id);
+      await db.from("tasks").delete().eq("id", t.id);
     } else if (t.row_key) {
       survivors.add(t.row_key);
     }
@@ -333,7 +358,7 @@ async function materializeTasks(
   for (const t of current ?? []) {
     const parent = (t.parent_row_key ?? "").trim();
     if (parent && survivors.has(t.row_key!) && !survivors.has(parent)) {
-      await supabase.from("tasks").update({ parent_row_key: null }).eq("id", t.id);
+      await db.from("tasks").update({ parent_row_key: null }).eq("id", t.id);
       // Nulling a dangling parent IS a projected-field change (the child must un-nest on the board),
       // but it happens after the snapshot diff — so flag it here or reactive projection would miss it.
       if (t.row_key) changed.add(t.row_key);
@@ -346,7 +371,7 @@ async function materializeTasks(
 }
 
 async function materializeDecisions(
-  supabase: SupabaseClient,
+  db: DbClient,
   teamId: string,
   projectId: string,
   itemId: string,
@@ -360,7 +385,7 @@ async function materializeDecisions(
 
   for (const row of rows) {
     const audience = normalizeTier(row.audience || "team") ?? "team";
-    const { error } = await supabase.from("decisions").upsert(
+    const { error } = await db.from("decisions").upsert(
       {
         team_id: teamId,
         project_id: projectId,

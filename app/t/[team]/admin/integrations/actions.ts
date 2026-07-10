@@ -1,9 +1,8 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
-import { serverClient } from "@/lib/supabase/server";
-import { adminClient } from "@/lib/supabase/admin";
-import { getSessionUser } from "@/lib/auth/session";
+import { adminClient } from "@/lib/db/admin";
+import { requireTeamAdmin as requireAdmin } from "@/lib/auth/guard";
 import {
   upsertIntegration,
   setIntegrationSecret,
@@ -12,7 +11,6 @@ import {
 } from "@/lib/integrations/manage";
 import { runSlackIngestion, runPlaneIngestion, runLinearIngestion, runGithubIngestion } from "@/lib/ingest/run";
 import { runGraphProjection } from "@/lib/graph/run";
-import { resolveIntegrationsAdmin } from "@/lib/integrations/read";
 import {
   linkGithubRepo,
   unlinkGithubRepo,
@@ -25,20 +23,6 @@ import { IntegrationConfigError, type IntegrationType } from "@/lib/api/schemas"
 import { audit } from "@/lib/api/audit";
 
 export type PrimaryPmProvider = "plane" | "linear" | null;
-
-/**
- * Session half of the admin gate: resolve the signed-in user, then delegate to the DB-level
- * `resolveIntegrationsAdmin` (same role==="admin" + active-member check as the /admin layout).
- * Returns null on any non-admin/unknown/wrong-team caller → every write action rejects.
- */
-async function requireAdmin(teamSlug: string) {
-  const supabase = await serverClient();
-  const user = await getSessionUser();
-  if (!user) return null;
-  const ctx = await resolveIntegrationsAdmin(supabase, teamSlug, user.id);
-  if (!ctx) return null;
-  return { teamId: ctx.teamId, myMemberId: ctx.memberId };
-}
 
 function toList(raw: string): string[] {
   return raw.split(/[\n,]/).map((s) => s.trim()).filter(Boolean);
@@ -88,7 +72,7 @@ export async function saveIntegration(
   if (!ctx) return { ok: false, error: "admins only" };
   const name = form.name.trim();
   if (!name) return { ok: false, error: "name is required" };
-  const auth = { teamId: ctx.teamId, memberId: ctx.myMemberId };
+  const auth = { teamId: ctx.teamId, memberId: ctx.memberId };
   try {
     const { id } = await upsertIntegration(adminClient(), auth, {
       type: form.type,
@@ -113,7 +97,7 @@ export async function toggleIntegration(
   const ctx = await requireAdmin(teamSlug);
   if (!ctx) return { ok: false, error: "admins only" };
   try {
-    await setIntegrationStatus(adminClient(), { teamId: ctx.teamId, memberId: ctx.myMemberId }, id, status);
+    await setIntegrationStatus(adminClient(), { teamId: ctx.teamId, memberId: ctx.memberId }, id, status);
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "could not update" };
   }
@@ -130,7 +114,7 @@ export async function rotateSecret(
   if (!ctx) return { ok: false, error: "admins only" };
   if (!secret) return { ok: false, error: "secret is required" };
   try {
-    await setIntegrationSecret(adminClient(), { teamId: ctx.teamId, memberId: ctx.myMemberId }, id, secret);
+    await setIntegrationSecret(adminClient(), { teamId: ctx.teamId, memberId: ctx.memberId }, id, secret);
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "could not rotate" };
   }
@@ -235,7 +219,7 @@ export async function addGithubRepo(
   const ctx = await requireAdmin(teamSlug);
   if (!ctx) return { ok: false, error: "admins only" };
   try {
-    await linkGithubRepo(adminClient(), { teamId: ctx.teamId, memberId: ctx.myMemberId }, repo);
+    await linkGithubRepo(adminClient(), { teamId: ctx.teamId, memberId: ctx.memberId }, repo);
   } catch (e) {
     if (e instanceof RepoFormatError || e instanceof IntegrationConfigError) {
       return { ok: false, error: e.message };
@@ -254,7 +238,7 @@ export async function removeGithubRepo(
   const ctx = await requireAdmin(teamSlug);
   if (!ctx) return { ok: false, error: "admins only" };
   try {
-    await unlinkGithubRepo(adminClient(), { teamId: ctx.teamId, memberId: ctx.myMemberId }, repo);
+    await unlinkGithubRepo(adminClient(), { teamId: ctx.teamId, memberId: ctx.memberId }, repo);
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "could not unlink repo" };
   }
@@ -277,7 +261,7 @@ export async function connectGithubToken(
   const v = await validateGithubToken(token);
   if (!v.ok) return { ok: false, error: v.error ?? "token validation failed" };
   try {
-    const auth = { teamId: ctx.teamId, memberId: ctx.myMemberId };
+    const auth = { teamId: ctx.teamId, memberId: ctx.memberId };
     const id = await ensureGithubIntegration(adminClient(), auth);
     await setIntegrationSecret(adminClient(), auth, id, token.trim());
   } catch (e) {
@@ -340,7 +324,7 @@ export async function removeIntegration(
   const ctx = await requireAdmin(teamSlug);
   if (!ctx) return { ok: false, error: "admins only" };
   try {
-    await deleteIntegration(adminClient(), { teamId: ctx.teamId, memberId: ctx.myMemberId }, id);
+    await deleteIntegration(adminClient(), { teamId: ctx.teamId, memberId: ctx.memberId }, id);
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "could not delete" };
   }
@@ -371,7 +355,7 @@ export async function setPrimaryPmProvider(
   await audit(db, {
     team_id: ctx.teamId,
     actor_kind: "member",
-    member_id: ctx.myMemberId,
+    member_id: ctx.memberId,
     action: "team.primary_pm_provider_set",
     target_type: "team",
     target_id: ctx.teamId,

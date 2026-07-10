@@ -1,9 +1,9 @@
 -- ───────────────────────────────────────────────────────────────────────────
--- Plain-Postgres schema for the Team Brain (DB_BACKEND=postgres).
+-- Plain-Postgres schema for the Team Brain.
 --
--- Derived from supabase/migrations/* but WITHOUT Supabase couplings:
+-- Canonical schema — self-contained, with no Supabase couplings:
 --   • no Row-Level Security / policies  → access control is enforced in app code
---     (the RLS client and service client are the same connection here)
+--     (there is a single connection; no separate RLS client)
 --   • no `auth.users` / `auth.uid()`    → local `auth_users` + `auth_tokens`
 --   • no `private.*` RLS helper fns      → not needed without RLS
 --   • no pgvector `embedding` column     → unused by every query; dropped so this
@@ -49,13 +49,17 @@ do $$ begin
 exception when duplicate_object then null; end $$;
 
 -- ── auth (local) ─────────────────────────────────────────────────────────────
--- Stand-ins for Supabase Auth. A session is a signed cookie (see lib/auth);
--- magic-link tokens live in auth_tokens (sha256-at-rest, single-use, expiring).
+-- Local auth tables (a session is a signed cookie; see lib/auth). Magic-link
+-- tokens live in auth_tokens (sha256-at-rest, single-use, expiring).
 create table if not exists auth_users (
   id uuid primary key default gen_random_uuid(),
   email citext not null unique,
+  -- Email+password auth (audit M1/M2b): admin sets the initial password, the member logs in with
+  -- it and can change it anytime. NULL = no password set yet (login rejected, not allowed through).
+  password_hash text,
   created_at timestamptz not null default now()
 );
+alter table auth_users add column if not exists password_hash text;
 
 create table if not exists auth_tokens (
   token_hash text primary key,             -- sha256(secret)
@@ -111,6 +115,13 @@ create table if not exists members (
   role member_role not null default 'member',
   tier access_tier not null default 'team',
   status member_status not null default 'invited',
+  -- true for the auto-provisioned per-source ingest actor (lib/ingest/run.ts's
+  -- resolveConnectorAuth), never for a real human — excluded from Admin -> Members and
+  -- /api/v1/members so a connector never renders indistinguishable from a person.
+  is_connector boolean not null default false,
+  -- Org-chart source: who this member reports to (nullable self-FK). Synced into the company
+  -- graph (lib/graph/company-actors.ts) as a REPORTS_TO edge + attrs.reports_to.
+  manager_member_id uuid references members(id) on delete set null,
   created_at timestamptz not null default now(),
   unique (team_id, email),
   unique (team_id, actor_handle)
@@ -261,7 +272,7 @@ create table if not exists audit_log (
 );
 create index if not exists audit_log_team_time_idx on audit_log (team_id, created_at desc);
 
--- Append-only audit log (same guarantee as the Supabase schema).
+-- Append-only audit log.
 create or replace function audit_protect()
 returns trigger language plpgsql as $$
 begin
@@ -280,8 +291,7 @@ create table if not exists rate_limits (
 );
 
 -- Fixed-window rate limiting. Returns the running count for the window so the
--- caller can compare against its per-minute limit. (In Supabase mode this
--- function is absent and rateLimit() fails open; here it actually enforces.)
+-- caller can compare against its per-minute limit.
 create or replace function rate_limit_hit(p_bucket text, p_window_start timestamptz)
 returns integer language plpgsql as $$
 declare c integer;
@@ -324,6 +334,7 @@ create table if not exists items (
   unique (team_id, project_id, path)
 );
 create index if not exists items_team_updated_idx on items (team_id, updated_at desc);
+create index if not exists items_team_synced_idx on items (team_id, synced_at desc);
 create index if not exists items_search_idx on items using gin (search);
 create index if not exists items_kind_idx on items (team_id, kind);
 
@@ -361,6 +372,11 @@ create table if not exists tasks (
   labels text[] not null default '{}',
   priority text not null default 'none' check (priority in ('none', 'low', 'medium', 'high', 'urgent')),
   body text not null default '',
+  -- Tier visibility (audit H1). A task inherits the `access` tier of the item that materialized it
+  -- (lib/ingest materializeTasks); external-tier reads filter `audience='external'`. There is NO RLS
+  -- backstop (CLAUDE.md §5) — this column is the SOLE thing stopping an external principal reading
+  -- internal task boards. Mirrors `decisions.audience`.
+  audience access_tier not null default 'team',
   created_by uuid references members(id) on delete set null,
   updated_at timestamptz not null default now(),
   created_at timestamptz not null default now()
@@ -372,6 +388,7 @@ alter table tasks add column if not exists parent_row_key text;
 alter table tasks add column if not exists labels text[] not null default '{}';
 alter table tasks add column if not exists priority text not null default 'none';
 alter table tasks add column if not exists body text not null default '';
+alter table tasks add column if not exists audience access_tier not null default 'team';
 do $$ begin
   if not exists (select 1 from pg_constraint where conname = 'tasks_priority_check') then
     alter table tasks add constraint tasks_priority_check check (priority in ('none', 'low', 'medium', 'high', 'urgent'));
@@ -382,6 +399,7 @@ create index if not exists tasks_team_status_idx on tasks (team_id, status);
 create index if not exists tasks_team_assignee_idx on tasks (team_id, assignee);
 create index if not exists tasks_team_updated_idx on tasks (team_id, updated_at desc);
 create index if not exists tasks_team_parent_idx on tasks (team_id, project_id, parent_row_key);
+create index if not exists tasks_team_audience_idx on tasks (team_id, audience);
 
 -- Links between AIOS task rows and the external PM tool selected by the team.
 -- AIOS remains the source of truth for row identity/status; this table records how
@@ -406,6 +424,11 @@ create table if not exists task_pm_links (
   last_projected_status text,
   projection_fingerprint text,
   provider_seen_status text,
+  -- Inbound conflict baseline (brain-api v1.4): the EXACT brain `tasks.status` at the last
+  -- successful outbound projection / adoption / inbound apply. The provider-group fingerprint
+  -- alone cannot decide "brain unchanged" — in_progress and blocked both hash to group 'started',
+  -- so a same-group brain edit would be silently overwritten without this exact baseline.
+  last_projected_brain_status text,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   unique (team_id, project_id, row_key, provider)
@@ -416,6 +439,7 @@ create index if not exists task_pm_links_team_provider_idx on task_pm_links (tea
 alter table task_pm_links add column if not exists last_projected_status text;
 alter table task_pm_links add column if not exists projection_fingerprint text;
 alter table task_pm_links add column if not exists provider_seen_status text;
+alter table task_pm_links add column if not exists last_projected_brain_status text;
 
 -- Observable work events from code repos. The initial event is "merged": after a PR
 -- lands on main, the matching task row moves to done and provider sync is attempted.
@@ -676,6 +700,7 @@ create table if not exists code_contributions (
 );
 create index if not exists code_contributions_codebase_idx on code_contributions (codebase_id, day desc);
 create index if not exists code_contributions_member_idx on code_contributions (member_id);
+create index if not exists code_contributions_team_idx on code_contributions (team_id);
 
 create table if not exists github_issues (
   id uuid primary key default gen_random_uuid(),
@@ -739,6 +764,10 @@ create table if not exists agentic_maturity_snapshots (
   canonical_learning numeric(4,2) not null default 0,
   canonical_cost_governance numeric(4,2) not null default 0,
   canonical_overall numeric(4,2) not null default 0,
+  -- shadow Cognitive-Ergonomics band (v1.3, optional, 0-4, nullable, no default).
+  -- Client-derived, provenance-only: never recomputed here, never feeds placement().
+  -- Shadow / uncalibrated — never a canonical scorer input.
+  ce_band smallint check (ce_band is null or ce_band between 0 and 4),
   created_at timestamptz not null default now(),
   unique (team_id, member_id, snapshot_date, metric)
 );
@@ -840,9 +869,15 @@ create table if not exists chat_messages (
   input_tokens integer not null default 0,
   output_tokens integer not null default 0,
   cost_usd numeric(10, 5) not null default 0,
-  created_at timestamptz not null default now()
+  created_at timestamptz not null default now(),
+  -- FTS over message bodies so the sidebar search can match conversation CONTENT (mirrors items.search).
+  search tsvector generated always as (to_tsvector('english', coalesce(content, ''))) stored
 );
 create index if not exists chat_messages_conversation_idx on chat_messages (conversation_id, created_at);
+-- NOTE: the `chat_messages_search_idx` GIN index lives in migration 20260707130000, NOT here — on a
+-- DB that already has chat_messages the create-table above is a no-op (so the `search` column isn't
+-- added here), and an index on a not-yet-existing column would fail. The migration adds the column
+-- then the index, covering both from-zero and existing prod.
 
 -- ── ingestion run log (observability for imports/scans) ───────────────────────
 -- One row per ingestion run: every scheduler tick, manual /sync, and codebase scan records its

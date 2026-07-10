@@ -1,4 +1,5 @@
 import "server-only";
+import { INGEST_FETCH_TIMEOUT_MS } from "@/lib/http";
 
 /**
  * Minimal Slack Web API client (raw fetch, no SDK) for the in-app ingestion
@@ -41,8 +42,10 @@ export class SlackClient {
 
   private async call<T>(method: string, params: Record<string, string>): Promise<T> {
     const url = `${SLACK_API}/${method}?${new URLSearchParams(params).toString()}`;
+    // Timeout so a stalled Slack socket can't hang the ingest loop and wedge its running flag (M8).
     const res = await fetch(url, {
       headers: { Authorization: `Bearer ${this.token}` },
+      signal: AbortSignal.timeout(INGEST_FETCH_TIMEOUT_MS),
     });
     const json = (await res.json()) as { ok: boolean; error?: string } & T;
     if (!json.ok) {

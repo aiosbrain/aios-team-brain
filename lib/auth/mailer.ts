@@ -25,14 +25,29 @@ function senderFrom(): string {
   return "AIOS Team Brain <onboarding@resend.dev>";
 }
 
-async function deliver(to: string, subject: string, text: string): Promise<boolean> {
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+async function deliver(to: string, subject: string, body: { text: string; html?: string }): Promise<boolean> {
   const resendKey = process.env.RESEND_API_KEY;
   if (resendKey) {
     try {
       const res = await fetch("https://api.resend.com/emails", {
         method: "POST",
         headers: { Authorization: `Bearer ${resendKey}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ from: senderFrom(), to, subject, text }),
+        body: JSON.stringify({
+          from: senderFrom(),
+          to,
+          subject,
+          text: body.text,
+          ...(body.html ? { html: body.html } : {}),
+        }),
       });
       if (res.ok) return true;
       console.error(`[mailer] Resend rejected ${to}: HTTP ${res.status}`);
@@ -46,7 +61,13 @@ async function deliver(to: string, subject: string, text: string): Promise<boole
     try {
       const nodemailer = await import("nodemailer");
       const transport = nodemailer.createTransport(smtpUrl);
-      await transport.sendMail({ to, from: senderFrom(), subject, text });
+      await transport.sendMail({
+        to,
+        from: senderFrom(),
+        subject,
+        text: body.text,
+        ...(body.html ? { html: body.html } : {}),
+      });
       return true;
     } catch (err) {
       console.error(`[mailer] SMTP send failed for ${to}:`, err instanceof Error ? err.message : err);
@@ -63,23 +84,111 @@ async function deliver(to: string, subject: string, text: string): Promise<boole
   return false;
 }
 
+/**
+ * Ops/admin alert email (e.g. "semantic search degraded"). Plain-text, best-effort — never throws,
+ * returns whether a provider actually delivered it (false when none is configured). Not a secret, so
+ * it's fine that no provider = a logged drop.
+ */
+export async function sendOpsAlert(to: string, subject: string, text: string): Promise<boolean> {
+  return deliver(to, subject, { text });
+}
+
+/** Whether an email provider is configured at all (so callers can skip work when nothing can send). */
+export function mailerConfigured(): boolean {
+  return Boolean(process.env.RESEND_API_KEY || process.env.SMTP_URL);
+}
+
 /** Magic-link sign-in email (login flow). Never throws. */
 export async function sendMagicLink(email: string, link: string): Promise<void> {
-  await deliver(
-    email,
-    "Your AIOS Team Brain sign-in link",
-    `Click to sign in (valid 15 minutes):\n\n${link}\n\nIf you didn't request this, ignore this email.`
-  );
+  await deliver(email, "Your AIOS Team Brain sign-in link", {
+    text: `Click to sign in (valid 15 minutes):\n\n${link}\n\nIf you didn't request this, ignore this email.`,
+  });
 }
 
 /**
- * New-member invite email. With a `link` (a one-time sign-in URL) it's a direct
- * sign-in; without one (no APP_URL configured) it's a non-secret nudge to sign in.
- * Never throws.
+ * Whether magic-link sign-in is a real, usable option right now: a stable domain (`APP_URL`) to
+ * build the link against, AND a mail provider actually configured to deliver it. Password login is
+ * the default and needs neither — this only gates whether the login form offers magic-link as a
+ * secondary option (`POST /api/auth/request-magic-link`). Without both, a "link sent" response would
+ * be a lie (no stable link, or nothing to send it with).
  */
-export async function sendInviteEmail(email: string, link: string | null): Promise<void> {
-  const text = link
-    ? `You've been added to the AIOS Team Brain.\n\nSign in with this one-time link (single-use, expires in 24 hours):\n\n${link}\n\nIf you weren't expecting this, you can ignore this email.`
-    : `You've been added to the AIOS Team Brain. Open the team brain and sign in with this email address to get started.`;
-  await deliver(email, "You've been added to the AIOS Team Brain", text);
+export function magicLinkAvailable(): boolean {
+  return Boolean(process.env.APP_URL) && Boolean(process.env.RESEND_API_KEY || process.env.SMTP_URL);
+}
+
+/** Shared across the emailed invite and the manual copy-paste invite, so tone/wording match. */
+function inviteExplainer(ctx: { teamName: string; inviterName: string }): string {
+  return (
+    `${ctx.inviterName} added you to ${ctx.teamName}'s AIOS Team Brain — your team's shared hub ` +
+    `for tasks, decisions, and knowledge synced from everyone's AIOS workspace.`
+  );
+}
+
+export interface InviteEmailContext {
+  /** The invitee's display name, as entered by the inviter. First name is used in the greeting. */
+  inviteeName: string;
+  teamName: string;
+  inviterName: string;
+  /**
+   * Ready-to-click sign-in link (single-use, 7-day magic-link token). Present whenever
+   * `magicLinkAvailable()` is true — the invite flow only calls `sendInviteEmail` in that case, since
+   * without a link there's nothing useful to email (the manual copy-paste path handles that case
+   * instead). Kept optional here, with the old "ask your admin" copy as a defensive fallback, so this
+   * function never sends a broken email if ever called without one.
+   */
+  loginUrl?: string;
+}
+
+/**
+ * New-member invite email, personalized (name/team/inviter) and carrying a one-click magic
+ * sign-in link when one is available. Never throws. Names are attacker-controlled input (display
+ * names), so the HTML body escapes them — this is the only place they're rendered as markup.
+ */
+/** Returns whether a configured mail provider accepted the message. Never throws. */
+export async function sendInviteEmail(email: string, ctx: InviteEmailContext): Promise<boolean> {
+  const firstName = ctx.inviteeName.trim().split(/\s+/)[0] || ctx.inviteeName;
+  const subject = `${ctx.inviterName} added you to ${ctx.teamName} on AIOS`;
+  const explainer = inviteExplainer(ctx);
+
+  const textAction = ctx.loginUrl
+    ? `Get started: ${ctx.loginUrl}\n\nThis link is single-use and valid for 7 days.`
+    : `Ask your admin for your sign-in password, then open the team brain and sign in with this email address.`;
+  const text = `Hi ${firstName},\n\n${explainer}\n\n${textAction}`;
+
+  const safeFirstName = escapeHtml(firstName);
+  const safeExplainer = escapeHtml(explainer);
+  const intro = `<p>Hi ${safeFirstName},</p><p>${safeExplainer}</p>`;
+  const htmlAction = ctx.loginUrl
+    ? `<p><a href="${escapeHtml(ctx.loginUrl)}" style="display:inline-block;background:#7c3aed;color:#fff;padding:10px 20px;border-radius:8px;text-decoration:none;font-weight:600;">Get started</a></p>
+       <p style="font-size:13px;color:#666;">Or paste this link into your browser:<br>${escapeHtml(ctx.loginUrl)}</p>
+       <p style="font-size:13px;color:#666;">This link is single-use and valid for 7 days.</p>`
+    : `<p>Ask your admin for your sign-in password, then open the team brain and sign in with this email address.</p>`;
+  const html = `<div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px;color:#1a1a1a;">
+        ${intro}
+        ${htmlAction}
+      </div>`;
+
+  return deliver(email, subject, { text, html });
+}
+
+export interface ManualInviteContext {
+  inviteeName: string;
+  teamName: string;
+  inviterName: string;
+  teamUrl: string;
+  email: string;
+  password: string;
+}
+
+/**
+ * Plain-text, ready-to-paste invite for admins on a deployment with no mail provider configured
+ * (`!magicLinkAvailable()`) — everything the admin needs to hand a new member sign-in access via
+ * Slack/DM/whatever channel they use: the team brain URL, the sign-in email, and the password.
+ */
+export function buildManualInviteMessage(ctx: ManualInviteContext): string {
+  const firstName = ctx.inviteeName.trim().split(/\s+/)[0] || ctx.inviteeName;
+  return (
+    `Hi ${firstName},\n\n${inviteExplainer(ctx)}\n\n` +
+    `Sign in at: ${ctx.teamUrl}\nEmail: ${ctx.email}\nPassword: ${ctx.password}`
+  );
 }

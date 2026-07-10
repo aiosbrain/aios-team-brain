@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { MessageSquarePlus, Loader2, Trash2, Pencil } from "lucide-react";
+import { MessageSquarePlus, Loader2, Trash2, Pencil, Search } from "lucide-react";
 import { QueryChat, type Exchange } from "@/components/query-chat";
 
 interface ConversationListItem {
@@ -39,6 +39,8 @@ function toExchanges(messages: StoredMessage[]): Exchange[] {
  */
 export function ChatWorkspace({ teamSlug, initialQuestion }: { teamSlug: string; initialQuestion?: string }) {
   const [conversations, setConversations] = useState<ConversationListItem[]>([]);
+  const [filter, setFilter] = useState("");
+  const [searchResults, setSearchResults] = useState<ConversationListItem[] | null>(null);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [loadingId, setLoadingId] = useState<string | null>(null);
   const newNonce = useRef(0);
@@ -60,6 +62,29 @@ export function ChatWorkspace({ teamSlug, initialQuestion }: { teamSlug: string;
     // eslint-disable-next-line react-hooks/set-state-in-effect
     void loadList();
   }, [loadList]);
+
+  // Debounced server search (title OR message content, owner-scoped FTS). Empty query → clear so the
+  // full list shows. All setState happens inside the async timeout callback (never synchronously).
+  useEffect(() => {
+    const q = filter.trim();
+    const t = setTimeout(async () => {
+      if (!q) {
+        setSearchResults(null);
+        return;
+      }
+      try {
+        const res = await fetch(
+          `/api/dashboard/conversations?team=${encodeURIComponent(teamSlug)}&q=${encodeURIComponent(q)}`
+        );
+        if (!res.ok) return;
+        const body = (await res.json()) as { conversations?: ConversationListItem[] };
+        setSearchResults(body.conversations ?? []);
+      } catch {
+        // keep the instant client-side title fallback
+      }
+    }, q ? 250 : 0);
+    return () => clearTimeout(t);
+  }, [filter, teamSlug]);
 
   async function openConversation(id: string) {
     setLoadingId(id);
@@ -97,6 +122,14 @@ export function ChatWorkspace({ teamSlug, initialQuestion }: { teamSlug: string;
     void loadList();
   }
 
+  // Search matches by title OR message content (server FTS). While the debounced request is in
+  // flight we show an instant client-side title filter as a fallback, then swap in the server hits.
+  const ql = filter.trim().toLowerCase();
+  const clientFiltered = ql
+    ? conversations.filter((c) => (c.title || "").toLowerCase().includes(ql))
+    : conversations;
+  const shown = ql ? searchResults ?? clientFiltered : conversations;
+
   return (
     <div className="grid grid-cols-1 gap-4 md:grid-cols-[230px_1fr]">
       <aside className="flex flex-col gap-2 md:max-h-[calc(100dvh-11rem)]">
@@ -107,11 +140,24 @@ export function ChatWorkspace({ teamSlug, initialQuestion }: { teamSlug: string;
         >
           <MessageSquarePlus className="size-4" /> New chat
         </button>
+        {conversations.length > 0 ? (
+          <div className="relative">
+            <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-ink-tertiary" />
+            <input
+              value={filter}
+              onChange={(e) => setFilter(e.target.value)}
+              placeholder="Search chats…"
+              className="w-full rounded-lg border border-border-default bg-surface py-1.5 pl-8 pr-2 text-xs text-ink placeholder:text-ink-tertiary focus:border-violet/40 focus:outline-none"
+            />
+          </div>
+        ) : null}
         <div className="flex flex-col gap-0.5 overflow-y-auto">
           {conversations.length === 0 ? (
             <p className="px-2 py-3 text-xs text-ink-tertiary">No saved chats yet.</p>
+          ) : shown.length === 0 ? (
+            <p className="px-2 py-3 text-xs text-ink-tertiary">No chats match &ldquo;{filter}&rdquo;.</p>
           ) : (
-            conversations.map((c) => {
+            shown.map((c) => {
               const active = c.id === activeId;
               return (
                 <div

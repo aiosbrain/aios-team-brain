@@ -1,9 +1,9 @@
 import Link from "next/link";
 import { CircleAlert } from "lucide-react";
-import { serverClient } from "@/lib/supabase/server";
+import { serverClient } from "@/lib/db/server";
 import { getSessionUser } from "@/lib/auth/session";
-import { isPostgresBackend } from "@/lib/db/backend";
 import { TeamNav, type NavEntry, type NavLeaf } from "@/components/team-nav";
+import { SignOutButton } from "@/components/account/sign-out-button";
 
 function NoTeamScreen({ slug }: { slug: string }) {
   return (
@@ -32,20 +32,20 @@ export default async function TeamLayout({
   params: Promise<{ team: string }>;
 }) {
   const { team: teamSlug } = await params;
-  const supabase = await serverClient();
+  const db = await serverClient();
 
   const user = await getSessionUser();
   if (!user) return <NoTeamScreen slug={teamSlug} />;
 
-  // RLS: this returns a row only if the signed-in user is an active member.
-  const { data: team } = await supabase
+  // Membership is enforced below via the `me` lookup (app-code access control).
+  const { data: team } = await db
     .from("teams")
     .select("id, slug, name")
     .eq("slug", teamSlug)
     .maybeSingle();
   if (!team) return <NoTeamScreen slug={teamSlug} />;
 
-  const { data: me } = await supabase
+  const { data: me } = await db
     .from("members")
     .select("id, role, display_name, tier")
     .eq("team_id", team.id)
@@ -58,6 +58,7 @@ export default async function TeamLayout({
 
   // Settings groups the low-frequency config surfaces; Admin is appended only for admins.
   const settingsChildren: NavLeaf[] = [
+    { icon: "account", label: "Account", href: `${base}/account` },
     { icon: "teamtools", label: "Team tools", href: `${base}/team-tools` },
   ];
   if (me.role === "admin") {
@@ -65,8 +66,7 @@ export default async function TeamLayout({
   }
 
   // Grouped IA: ~6 primary entries. "Work" gathers the operational surfaces; Skills folds
-  // into Data (reached at /library/skills, not a top-level peer). Codebase analytics
-  // live only on the postgres backend (canonical schema).
+  // into Data (reached at /library/skills, not a top-level peer).
   const items: NavEntry[] = [
     { icon: "home", label: "Home", href: base, exact: true },
     {
@@ -80,11 +80,9 @@ export default async function TeamLayout({
       ],
     },
     { icon: "library", label: "Data", href: `${base}/library` },
+    { icon: "codebases", label: "Codebases", href: `${base}/codebases` },
+    { icon: "maturity", label: "Maturity", href: `${base}/maturity` },
   ];
-  if (isPostgresBackend()) {
-    items.push({ icon: "codebases", label: "Codebases", href: `${base}/codebases` });
-    items.push({ icon: "maturity", label: "Maturity", href: `${base}/maturity` });
-  }
   items.push({ icon: "learning", label: "Learning", href: `${base}/learning` });
   items.push({ icon: "query", label: "Query", href: `${base}/query` });
   items.push({ label: "Settings", children: settingsChildren });
@@ -93,10 +91,10 @@ export default async function TeamLayout({
     <div className="flex min-h-dvh flex-1 bg-surface-raised">
       <aside className="frosted sticky top-0 flex h-dvh w-60 shrink-0 flex-col border-r border-border-subtle px-4 py-6">
         <div className="mb-8 px-3">
-          <p className="font-display text-[11px] font-semibold uppercase tracking-[0.18em] text-gradient-prism">
+          <p className="font-display text-[11px] uppercase tracking-[0.18em] text-gradient-prism">
             Team Brain
           </p>
-          <h2 className="mt-1 truncate font-display text-lg font-semibold text-ink" title={team.name}>
+          <h2 className="mt-1 truncate font-display text-lg text-ink" title={team.name}>
             {team.name}
           </h2>
         </div>
@@ -106,6 +104,9 @@ export default async function TeamLayout({
           <p className="text-xs capitalize text-ink-tertiary">
             {me.role} · {me.tier} tier
           </p>
+          <div className="mt-2">
+            <SignOutButton />
+          </div>
         </div>
       </aside>
       <main className="min-w-0 flex-1 px-8 py-8">{children}</main>

@@ -25,7 +25,7 @@ who reads it**. The map only pays off if it's trustworthy, so:
 ## 2. Four operating principles (internalize these)
 
 1. **Spec-first testing, never characterization-first.** Write the assertion from what the
-   product *should* do (the brain-api contract, the tier/RLS intent, a scenario), then run it.
+   product *should* do (the brain-api contract, the tier intent, a scenario), then run it.
    A spec-derived test that goes **red** found a real gap — that's the point. Tests that read
    the implementation and assert what it already does are green by construction and forbidden
    as the default. For a confirmed-but-unfixed gap, use `it.fails(...)` so it stays green until
@@ -72,26 +72,22 @@ cannot verify persistence or access to the observable outcome. The real-Postgres
 
 ---
 
-## 5. Access control — what RLS is (and isn't) for here ⚠️
+## 5. Access control — tier isolation is an app-code invariant ⚠️
 
 **Deployment model:** AIOS is **self-hosted per organization** — each org runs its own instance
 against its own database; all rows belong to that one org. So there is **no shared multi-tenant
-DB**, and cross-organization isolation is **not** a concern. The `team_id` scoping in the RLS
-policies is purely *internal* (separating teams *within* one org's DB) and only matters if an
-instance hosts more than one team.
+DB**, and cross-organization isolation is **not** a concern. The `team_id` scoping is purely
+*internal* (separating teams *within* one org's DB) and only matters if an instance hosts more
+than one team.
 
 **What still matters regardless of multi-tenancy: TIER isolation.** An `external`-tier principal
 (a client/consultant collaborator) must never read `team`/`admin` content; `admin`/`private`
 content never leaves the workspace. This is a product feature (the `external` API tier, OKF link
-redaction), independent of multi-tenancy, and it must hold on **both** backends:
+redaction), independent of multi-tenancy.
 
-- **`postgres`** (the default + deployed target, Railway) — there is **no RLS**; tier isolation is
-  enforced **entirely in app code**. A missing `access`/tier filter has **no DB backstop**.
-- **`supabase`** (legacy opt-in) — the `items` RLS policy enforces tier isolation in the DB
-  (`my_tier(team)='team' OR access='external'`); the app-code checks are then defense-in-depth.
-
-So: RLS is just *the legacy supabase mechanism* for tier isolation — **tier isolation itself is a
-standing invariant** that the app code must guarantee on the postgres target.
+There is **no RLS** — Postgres is the one and only backend, and tier isolation is enforced
+**entirely in app code**. A missing `access`/tier filter has **no DB backstop**. Tier isolation
+is therefore a **standing invariant** that the app code must guarantee on every read path.
 
 > ✅ **Enforced (was a known gap, now closed):** API routes and `lib/query/retrieve.ts` re-apply the
 > tier filter, and dashboard server-component reads (`app/t/[team]/*`) route through the
@@ -104,12 +100,11 @@ standing invariant** that the app code must guarantee on the postgres target.
 ## 6. Stack & key commands
 
 - **Brain:** Next.js 16 (App Router) · React 19 · TypeScript · Vitest. DB via the `lib/db/pg` adapter
-  (default; Postgres on Railway) or `@supabase/supabase-js` (legacy). LLM/reranker are
-  provider-configurable (`docs/PROVIDERS.md`).
+  (Postgres on Railway). LLM/reranker are provider-configurable (`docs/PROVIDERS.md`).
 - **Sidecar:** `ingestion/` — Python connector service (LlamaHub/Unstructured), HTTP-only to the brain.
 
 ```bash
-npm run dev            # next dev (DB_BACKEND=postgres by default)
+npm run dev            # next dev
 npm test               # vitest (unit tier)
 npm run check:docs     # docs drift guard (also runs in CI + pre-push)
 npm run lint           # eslint
@@ -117,12 +112,11 @@ npm run pg:schema      # load postgres/schema.sql (canonical) into DATABASE_URL 
 npm run db:test:up     # ephemeral test Postgres + load schema (migrate-from-zero = replay guard)
 npm run test:datamechanics  # real-Postgres tier: persistence + tier isolation
 bash scripts/e2e.sh    # system-level integration: seed → push → materialize → 422 → pull → live query
-# legacy supabase backend only (DB_BACKEND=supabase): `supabase start` / `supabase db reset`
 ```
 
 - **Schema:** canonical = `postgres/schema.sql` (idempotent; `npm run pg:schema` loads it and is the
-  prod rollout step against Railway). `supabase/migrations/` is the **legacy/derived** RLS schema, used
-  only when `DB_BACKEND=supabase`; its `migrations-numbering` guard is now legacy-scoped.
+  prod rollout step against Railway). Additive deltas live in `postgres/migrations/` (the only
+  migrations directory; guarded by the `migrations-numbering` guard).
 - **Adding a COLUMN to an existing table:** `schema.sql` is `create … if not exists`, so editing the
   `create table` body is a **no-op on a DB that already has the table** — prod keeps the old shape.
   Put the `alter table … add column if not exists` in **`postgres/migrations/`** (applied by

@@ -1,10 +1,10 @@
 import "server-only";
 
 /**
- * Tier-visibility choke-point for dashboard reads (CLAUDE.md §5). In postgres mode there is
- * NO RLS, so this app-code filter is the SOLE enforcement that an `external`-tier viewer never
- * sees `team`/`admin` content; in supabase mode it's defense-in-depth alongside RLS. Route
- * every dashboard `items` read through here — the dashboard-tier-filter guard enforces it.
+ * Tier-visibility choke-point for dashboard reads (CLAUDE.md §5). There is NO RLS, so this
+ * app-code filter is the SOLE enforcement that an `external`-tier viewer never sees `team`/`admin`
+ * content. Route every dashboard `items` read through here — the dashboard-tier-filter guard
+ * enforces it.
  */
 
 export type ViewerTier = "team" | "external";
@@ -30,6 +30,17 @@ export function canSeeAccess(tier: ViewerTier, access: string): boolean {
  * rule as items on the postgres target (no RLS). Route dashboard decision reads through here.
  */
 export function visibleDecisions<Q>(query: Q, tier: ViewerTier): Q {
+  if (tier !== "external") return query;
+  return (query as { eq(column: string, value: string): Q }).eq("audience", "external");
+}
+
+/**
+ * Restrict a `tasks` query to what `tier` may see: external → only `audience='external'`.
+ * Tasks carry their tier in the `audience` column (inherited from the materializing item's
+ * `access`); same SOLE-enforcement rule as items/decisions on the postgres target (no RLS).
+ * Route every tier-scoped task read (retrieval, the v1 pull API, dashboard boxes) through here.
+ */
+export function visibleTasks<Q>(query: Q, tier: ViewerTier): Q {
   if (tier !== "external") return query;
   return (query as { eq(column: string, value: string): Q }).eq("audience", "external");
 }

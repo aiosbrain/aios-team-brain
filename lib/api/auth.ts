@@ -1,6 +1,6 @@
 import "server-only";
 import { createHash, timingSafeEqual } from "node:crypto";
-import { adminClient } from "@/lib/supabase/admin";
+import { adminClient } from "@/lib/db/admin";
 import { audit } from "@/lib/api/audit";
 
 export type ApiAuth = {
@@ -23,11 +23,11 @@ export async function authenticateApiKey(req: Request): Promise<ApiAuth | null> 
   const header = req.headers.get("authorization") || "";
   const teamHeader = req.headers.get("x-aios-team") || "";
   const m = header.match(/^Bearer\s+aios_([A-Za-z0-9]+)_([A-Za-z0-9_-]+)$/);
-  const supabase = adminClient();
+  const db = adminClient();
   const ip = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || null;
 
   const fail = async (reason: string) => {
-    await audit(supabase, {
+    await audit(db, {
       team_id: null,
       actor_kind: "system",
       action: "auth.failed",
@@ -40,7 +40,7 @@ export async function authenticateApiKey(req: Request): Promise<ApiAuth | null> 
   if (!m) return fail("malformed_bearer");
   const [, keyId, secret] = m;
 
-  const { data: key } = await supabase
+  const { data: key } = await db
     .from("api_keys")
     .select("id, team_id, member_id, key_hash, revoked_at, members(actor_handle, tier, status, role, display_name, email), teams(slug)")
     .eq("key_id", keyId)
@@ -64,7 +64,7 @@ export async function authenticateApiKey(req: Request): Promise<ApiAuth | null> 
   }
 
   // fire-and-forget last_used_at
-  void supabase
+  void db
     .from("api_keys")
     .update({ last_used_at: new Date().toISOString() })
     .eq("id", key.id)

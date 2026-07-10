@@ -1,4 +1,4 @@
-import { serverClient } from "@/lib/supabase/server";
+import { serverClient } from "@/lib/db/server";
 import { getSessionUser } from "@/lib/auth/session";
 import { parseRange } from "@/lib/metrics/range";
 import { getPerMemberCosts, getThroughputVsCost } from "@/lib/metrics/members";
@@ -21,15 +21,15 @@ export default async function UsageAdminPage({
   const { team: teamSlug } = await params;
   const { range: rangeParam } = await searchParams;
   const range = parseRange(rangeParam);
-  const supabase = await serverClient();
+  const db = await serverClient();
 
   const [{ data: team }, user] = await Promise.all([
-    supabase.from("teams").select("id").eq("slug", teamSlug).maybeSingle(),
+    db.from("teams").select("id").eq("slug", teamSlug).maybeSingle(),
     getSessionUser(),
   ]);
   if (!team) return null;
 
-  const { data: me } = await supabase
+  const { data: me } = await db
     .from("members")
     .select("id, role")
     .eq("team_id", team.id)
@@ -42,11 +42,11 @@ export default async function UsageAdminPage({
   const viewer = { isAdmin, memberId };
 
   const [costs, external, throughput] = await Promise.all([
-    getPerMemberCosts(supabase, team.id, range, viewer),
-    getExternalCosts(supabase, team.id, range, viewer),
-    getThroughputVsCost(supabase, team.id, range, viewer),
+    getPerMemberCosts(db, team.id, range, viewer),
+    getExternalCosts(db, team.id, range, viewer),
+    getThroughputVsCost(db, team.id, range, viewer),
   ]);
-  const combined = await getCombinedSpend(supabase, team.id, range, viewer, external);
+  const combined = await getCombinedSpend(db, team.id, range, viewer, external);
 
   return (
     <div className="flex flex-col gap-6">

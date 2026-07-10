@@ -15,8 +15,8 @@ const h = vi.hoisted(() => ({
   afterCbs: [] as Array<() => Promise<void> | void>,
 }));
 
-vi.mock("@/lib/supabase/server", () => ({
-  serverClient: async () => (await import("@/lib/supabase/admin")).adminClient(),
+vi.mock("@/lib/db/server", () => ({
+  serverClient: async () => (await import("@/lib/db/admin")).adminClient(),
 }));
 vi.mock("@/lib/auth/guard", () => ({
   currentMember: async () =>

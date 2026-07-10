@@ -1,8 +1,8 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
-import { serverClient } from "@/lib/supabase/server";
-import { adminClient } from "@/lib/supabase/admin";
+import { serverClient } from "@/lib/db/server";
+import { adminClient } from "@/lib/db/admin";
 import { currentMember } from "@/lib/auth/guard";
 import { canEditMemberContext } from "@/lib/identity/context";
 import {
@@ -15,6 +15,7 @@ import {
   type TimeOffInput,
   type GoalInput,
 } from "@/lib/identity/profile";
+import { issueApiKey, revokeOwnApiKey } from "@/lib/admin/keys";
 
 /**
  * Server actions for the per-member identity context editor. The security boundary is
@@ -29,8 +30,8 @@ interface Gate {
 }
 
 async function gate(teamSlug: string, targetMemberId: string): Promise<Gate | null> {
-  const supabase = await serverClient();
-  const { data: team } = await supabase.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
+  const db = await serverClient();
+  const { data: team } = await db.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
   if (!team) return null;
   const me = await currentMember((team as { id: string }).id);
   if (!me) return null;
@@ -128,6 +129,52 @@ export async function deleteMemberGoal(
       actor: { kind: "member", memberId: ctx.actorMemberId },
     });
     revalidatePath(`/t/${teamSlug}/people/${memberId}`);
+    return { ok: true };
+  } catch (e) {
+    return fail(e);
+  }
+}
+
+/**
+ * Self-only gate for API keys — deliberately stricter than `gate()`: a member may issue or
+ * revoke ONLY their own key here, never a teammate's, even as an admin. An admin generating a
+ * secret on someone else's behalf has no safe way to hand it over (that's the whole gap this
+ * closes); admins keep member-picker issuance for exceptional cases via /admin/keys.
+ */
+async function selfGate(teamSlug: string): Promise<Gate | null> {
+  const db = await serverClient();
+  const { data: team } = await db.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
+  if (!team) return null;
+  const me = await currentMember((team as { id: string }).id);
+  if (!me) return null;
+  return { teamId: (team as { id: string }).id, actorMemberId: me.id };
+}
+
+type KeyResult = { ok: boolean; error?: string; key?: string };
+
+export async function issueMyApiKey(teamSlug: string, name: string): Promise<KeyResult> {
+  const ctx = await selfGate(teamSlug);
+  if (!ctx) return { ok: false, error: "not signed in" };
+  try {
+    const { key } = await issueApiKey(adminClient(), ctx.teamId, ctx.actorMemberId, name, {
+      actor: { kind: "member", memberId: ctx.actorMemberId },
+    });
+    revalidatePath(`/t/${teamSlug}/people/${ctx.actorMemberId}`);
+    return { ok: true, key };
+  } catch (e) {
+    return fail(e);
+  }
+}
+
+export async function revokeMyApiKey(teamSlug: string, apiKeyId: string): Promise<KeyResult> {
+  const ctx = await selfGate(teamSlug);
+  if (!ctx) return { ok: false, error: "not signed in" };
+  try {
+    const { revoked } = await revokeOwnApiKey(adminClient(), ctx.teamId, ctx.actorMemberId, apiKeyId, {
+      actor: { kind: "member", memberId: ctx.actorMemberId },
+    });
+    if (!revoked) return { ok: false, error: "not allowed" };
+    revalidatePath(`/t/${teamSlug}/people/${ctx.actorMemberId}`);
     return { ok: true };
   } catch (e) {
     return fail(e);

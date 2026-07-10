@@ -2,8 +2,7 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { ArrowLeft } from "lucide-react";
-import { isPostgresBackend } from "@/lib/db/backend";
-import { serverClient } from "@/lib/supabase/server";
+import { serverClient } from "@/lib/db/server";
 import { currentMember } from "@/lib/auth/guard";
 import { getContributorDetail, type ContributorRef } from "@/lib/metrics/codebases";
 import { parseRange } from "@/lib/metrics/range";
@@ -35,20 +34,19 @@ export default async function ContributorPage({
   params: Promise<{ team: string; slug: string; author: string }>;
   searchParams: Promise<{ range?: string }>;
 }) {
-  if (!isPostgresBackend()) notFound();
 
   const { team: teamSlug, slug, author } = await params;
   const ref = parseAuthor(author);
   if (!ref) notFound();
   const range = parseRange((await searchParams).range);
-  const supabase = await serverClient();
+  const db = await serverClient();
 
-  const { data: team } = await supabase.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
+  const { data: team } = await db.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
   if (!team) return null;
   const me = await currentMember(team.id);
   if (!me) return null;
 
-  const c = await getContributorDetail(supabase, team.id, slug, ref, range, me.tier);
+  const c = await getContributorDetail(db, team.id, slug, ref, range, me.tier);
   if (!c) notFound();
 
   const aiPct = c.totals.commits ? Math.round((100 * c.totals.ai_commits) / c.totals.commits) : 0;
@@ -74,7 +72,7 @@ export default async function ContributorPage({
               </span>
             )}
             <div>
-              <h1 className="font-display text-2xl font-semibold text-ink">{c.name}</h1>
+              <h1 className="font-display text-2xl text-ink">{c.name}</h1>
               <div className="mt-0.5 flex items-center gap-3 text-xs text-ink-tertiary">
                 {c.github_login ? (
                   <a

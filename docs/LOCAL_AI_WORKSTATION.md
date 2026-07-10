@@ -148,6 +148,6 @@ user LaunchAgents in `~/Library/LaunchAgents/`. Pattern: `RunAtLoad` +
 | Brain LLM | `LLM_BASE_URL` → Ollama | `ANTHROPIC_API_KEY` |
 | Embeddings | `ollama:nomic-embed-text` | `openai:text-embedding-3-large` |
 | Reranker | `llama-server` Qwen3-Reranker | Cohere / Voyage / ZeroEntropy |
-| Storage | PGLite / local Postgres | Supabase / hosted Postgres |
+| Storage | PGLite / local Postgres | hosted Postgres |
 
 Mix freely — each layer is an independent switch.

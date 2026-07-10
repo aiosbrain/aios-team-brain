@@ -1,5 +1,5 @@
 import "server-only";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 import { audit } from "@/lib/api/audit";
 import type { PolicyEffect } from "./evaluate";
 
@@ -67,8 +67,8 @@ function fields(input: PolicyInput) {
   };
 }
 
-export async function listAllPolicies(supabase: SupabaseClient, teamId: string): Promise<PolicyRecord[]> {
-  const { data, error } = await supabase
+export async function listAllPolicies(db: DbClient, teamId: string): Promise<PolicyRecord[]> {
+  const { data, error } = await db
     .from("policies")
     .select("id, priority, description, subject_role, subject_tier, subject_actor, action, resource, effect, enabled")
     .eq("team_id", teamId)
@@ -79,19 +79,19 @@ export async function listAllPolicies(supabase: SupabaseClient, teamId: string):
 }
 
 export async function createPolicy(
-  supabase: SupabaseClient,
+  db: DbClient,
   teamId: string,
   input: PolicyInput,
   actor: PolicyActor = {}
 ): Promise<string> {
   validate(input);
-  const { data, error } = await supabase
+  const { data, error } = await db
     .from("policies")
     .insert({ team_id: teamId, created_by: actor.memberId ?? null, ...fields(input) })
     .select("id")
     .single();
   if (error || !data) throw new Error(`policy create failed: ${error?.message}`);
-  await audit(supabase, {
+  await audit(db, {
     team_id: teamId, actor_kind: "member", member_id: actor.memberId ?? null,
     action: "policy.created", target_type: "policy", target_id: data.id,
     meta: { action: input.action, effect: input.effect, resource: input.resource ?? "*" },
@@ -100,20 +100,20 @@ export async function createPolicy(
 }
 
 export async function updatePolicy(
-  supabase: SupabaseClient,
+  db: DbClient,
   teamId: string,
   id: string,
   input: PolicyInput,
   actor: PolicyActor = {}
 ): Promise<void> {
   validate(input);
-  const { error } = await supabase
+  const { error } = await db
     .from("policies")
     .update({ ...fields(input), updated_at: new Date().toISOString() })
     .eq("team_id", teamId)
     .eq("id", id);
   if (error) throw new Error(`policy update failed: ${error.message}`);
-  await audit(supabase, {
+  await audit(db, {
     team_id: teamId, actor_kind: "member", member_id: actor.memberId ?? null,
     action: "policy.updated", target_type: "policy", target_id: id,
     meta: { action: input.action, effect: input.effect },
@@ -121,33 +121,33 @@ export async function updatePolicy(
 }
 
 export async function setPolicyEnabled(
-  supabase: SupabaseClient,
+  db: DbClient,
   teamId: string,
   id: string,
   enabled: boolean,
   actor: PolicyActor = {}
 ): Promise<void> {
-  const { error } = await supabase
+  const { error } = await db
     .from("policies")
     .update({ enabled, updated_at: new Date().toISOString() })
     .eq("team_id", teamId)
     .eq("id", id);
   if (error) throw new Error(`policy toggle failed: ${error.message}`);
-  await audit(supabase, {
+  await audit(db, {
     team_id: teamId, actor_kind: "member", member_id: actor.memberId ?? null,
     action: enabled ? "policy.enabled" : "policy.disabled", target_type: "policy", target_id: id, meta: {},
   });
 }
 
 export async function deletePolicy(
-  supabase: SupabaseClient,
+  db: DbClient,
   teamId: string,
   id: string,
   actor: PolicyActor = {}
 ): Promise<void> {
-  const { error } = await supabase.from("policies").delete().eq("team_id", teamId).eq("id", id);
+  const { error } = await db.from("policies").delete().eq("team_id", teamId).eq("id", id);
   if (error) throw new Error(`policy delete failed: ${error.message}`);
-  await audit(supabase, {
+  await audit(db, {
     team_id: teamId, actor_kind: "member", member_id: actor.memberId ?? null,
     action: "policy.deleted", target_type: "policy", target_id: id, meta: {},
   });

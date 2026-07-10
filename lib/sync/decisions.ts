@@ -1,5 +1,5 @@
 import "server-only";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 
 /** Tier of the pulling principal (the API key's member tier). */
 export type ViewerTier = "team" | "external";
@@ -31,12 +31,12 @@ export interface DecisionWritebackGroup {
  * `external` viewer receives only `audience='external'` decisions.
  */
 export async function getDecisionWriteback(
-  supabase: SupabaseClient,
+  db: DbClient,
   teamId: string,
   tier: ViewerTier,
   since: string
 ): Promise<DecisionWritebackGroup[]> {
-  let query = supabase
+  let query = db
     .from("decisions")
     .select(
       "row_key, decided_at, title, rationale, decided_by, impact, tier, audience, updated_at, source_item_id, projects(slug), items:source_item_id(synced_at)"

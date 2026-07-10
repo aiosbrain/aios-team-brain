@@ -1,4 +1,4 @@
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 import type { Principal } from "@/lib/policy/evaluate";
 
 /**
@@ -15,7 +15,7 @@ export interface ActionRequest {
 }
 
 export interface ActionContext {
-  supabase: SupabaseClient; // service-role client
+  db: DbClient; // service-role client
   teamId: string;
   memberId: string | null;
   apiKeyId: string | null;

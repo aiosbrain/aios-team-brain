@@ -1,6 +1,6 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
-import { serverClient } from "@/lib/supabase/server";
+import { serverClient } from "@/lib/db/server";
 import { currentMember } from "@/lib/auth/guard";
 import { canSeeAccess } from "@/lib/auth/visibility";
 import { Markdown } from "@/components/markdown";
@@ -14,16 +14,16 @@ export default async function LibraryItemPage({
   params: Promise<{ team: string; itemId: string }>;
 }) {
   const { team: teamSlug, itemId } = await params;
-  const supabase = await serverClient();
+  const db = await serverClient();
 
-  const { data: team } = await supabase
+  const { data: team } = await db
     .from("teams")
     .select("id")
     .eq("slug", teamSlug)
     .maybeSingle();
   if (!team) return null;
 
-  const { data: item } = await supabase
+  const { data: item } = await db
     .from("items")
     .select(
       "id, path, kind, access, body, content_sha256, actor, synced_at, updated_at, projects(slug), members(display_name), item_versions(count)"

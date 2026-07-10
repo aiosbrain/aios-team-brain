@@ -4,10 +4,11 @@ import { db, seedTeam, ingest } from "./helpers";
 
 /**
  * Spec for the dashboard "pulse" metrics on REAL Postgres. The deployed pg adapter returns
- * timestamptz columns as Date objects (supabase returns strings); the window math compared them as
- * strings (`Date >= isoString` → coerces to NaN → always false), so every recent row was bucketed
- * as "prior" and the dashboard read 0 items / 0 queries with ↓100% — while the data was clearly
- * present. This tier is the ONLY one that reproduces it (the fake/supabase paths return strings).
+ * timestamptz columns as Date objects (the legacy Supabase-js client returned strings); the window
+ * math compared them as strings (`Date >= isoString` → coerces to NaN → always false), so every
+ * recent row was bucketed as "prior" and the dashboard read 0 items / 0 queries with ↓100% — while
+ * the data was clearly present. This tier is the ONLY one that reproduces it (the FakeSupabase test
+ * double, matching the old client's shape, returns strings same as it always did).
  * Derived from the product contract (recent activity must count as current), not the implementation.
  */
 

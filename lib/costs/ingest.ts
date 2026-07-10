@@ -1,5 +1,5 @@
 import "server-only";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 import { IngestValidationError, type UsageCostPayload } from "@/lib/api/schemas";
 import { buildIdentityMap, resolveMember } from "@/lib/identity/resolve";
 import { audit } from "@/lib/api/audit";
@@ -9,19 +9,19 @@ import { audit } from "@/lib/api/audit";
  * aggregates from `aios analyze --push` — Cursor dashboard USD + Claude session estimates.
  */
 export async function ingestUsageCost(
-  supabase: SupabaseClient,
+  db: DbClient,
   auth: { teamId: string; memberId: string; apiKeyId: string },
   payload: UsageCostPayload
 ): Promise<{ cost_id: string; member_id: string }> {
   let memberId = auth.memberId;
   if (payload.member) {
-    const map = await buildIdentityMap(supabase, auth.teamId);
+    const map = await buildIdentityMap(db, auth.teamId);
     const resolved = resolveMember(map, { key: payload.member });
     if (!resolved) throw new IngestValidationError(`unknown member handle '${payload.member}'`);
     memberId = resolved;
   }
 
-  const { data, error } = await supabase
+  const { data, error } = await db
     .from("usage_costs")
     .upsert(
       {
@@ -45,7 +45,7 @@ export async function ingestUsageCost(
     .single();
   if (error || !data) throw new Error(`usage cost upsert failed: ${error?.message}`);
 
-  await audit(supabase, {
+  await audit(db, {
     team_id: auth.teamId,
     actor_kind: "api_key",
     member_id: auth.memberId,

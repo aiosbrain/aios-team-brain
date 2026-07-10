@@ -6,11 +6,11 @@ import { BASE_URL, db, seedMemberEmail, seedTeam, type Seed } from "./http-helpe
 // children grouped beneath them — and shows each task's primary-provider link + sync status. This is
 // the only tier that proves the real Next server component renders over the wire (HTTP 200 + HTML).
 
-async function login(email: string): Promise<string> {
+async function login(email: string, password: string): Promise<string> {
   const res = await fetch(`${BASE_URL}/api/auth/login`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ email }),
+    body: JSON.stringify({ email, password }),
   });
   if (res.status !== 200) throw new Error(`login failed: ${res.status}`);
   const setCookie = res.headers.get("set-cookie") ?? "";
@@ -55,8 +55,8 @@ async function seedLink(seed: Seed, projectId: string, taskId: string, rowKey: s
 describe("GET /t/{team}/tasks (HTTP) — hierarchical render", () => {
   it("server-renders epics with their children grouped and shows pm-link + sync status (200)", async () => {
     const seed = await seedTeam();
-    const email = await seedMemberEmail(seed); // a known-email, team-tier member on this team
-    const cookie = await login(email);
+    const { email, password } = await seedMemberEmail(seed); // a known-email, team-tier member on this team
+    const cookie = await login(email, password);
 
     const project = await seedProject(seed.teamId);
     const epicId = await seedTask(seed.teamId, project, "EPIC-1", { title: "Wave 1 Foundations" });

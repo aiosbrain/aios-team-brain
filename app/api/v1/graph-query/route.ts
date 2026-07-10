@@ -1,6 +1,6 @@
 import { NextRequest } from "next/server";
 import { z } from "zod";
-import { adminClient } from "@/lib/supabase/admin";
+import { adminClient } from "@/lib/db/admin";
 import { authenticateApiKey } from "@/lib/api/auth";
 import { rateLimit } from "@/lib/api/rate-limit";
 import { errorResponse } from "@/lib/api/schemas";
@@ -25,8 +25,8 @@ export async function POST(req: NextRequest) {
   const auth = await authenticateApiKey(req);
   if (!auth) return errorResponse("unauthorized", "invalid API key or team", 401);
 
-  const supabase = adminClient();
-  if (!(await rateLimit(supabase, `${auth.apiKeyId}:graph-query`, 30))) {
+  const db = adminClient();
+  if (!(await rateLimit(db, `${auth.apiKeyId}:graph-query`, 30))) {
     return errorResponse("rate_limited", "30/min per key", 429);
   }
 
@@ -45,13 +45,13 @@ export async function POST(req: NextRequest) {
   }
 
   // Resolve the team slug, then scope to the tiers this caller may see.
-  const { data: team } = await supabase.from("teams").select("slug").eq("id", auth.teamId).maybeSingle();
+  const { data: team } = await db.from("teams").select("slug").eq("id", auth.teamId).maybeSingle();
   if (!team) return errorResponse("internal", "team not found", 500);
   const groupIds = visibleGroupIds((team as { slug: string }).slug, auth.memberTier);
 
   try {
     const facts = await client.search(parsed.data.query, groupIds, parsed.data.maxFacts ?? 20);
-    await audit(supabase, {
+    await audit(db, {
       team_id: auth.teamId,
       actor_kind: "api_key",
       member_id: auth.memberId,

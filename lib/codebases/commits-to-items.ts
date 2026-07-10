@@ -1,6 +1,6 @@
 import "server-only";
 import { createHash } from "node:crypto";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 import { ingestItem } from "@/lib/ingest";
 import type { ItemPayload } from "@/lib/api/schemas";
 import { resolveMember, type IdentityMap, type AuthorIdentity } from "@/lib/identity/resolve";
@@ -94,7 +94,7 @@ export function normalizeCommit(codebaseSlug: string, commit: ScanCommit): ItemP
  * Reuses the caller's already-built identity map. Returns the count of commits processed.
  */
 export async function projectCommitsToItems(
-  supabase: SupabaseClient,
+  db: DbClient,
   auth: { teamId: string; memberId: string; apiKeyId: string },
   codebaseSlug: string,
   recentCommits: ScanCommit[],
@@ -106,15 +106,15 @@ export async function projectCommitsToItems(
     if (!payload) continue;
     // Resolve by the git author EMAIL (the reliable key, matching how code_contributions attributes).
     // Falls back to parsing an inline `name <email>` from the author string. Without a resolvable
-    // email the commit is name-only → resolveMember returns null → ingestItem would attribute the
-    // item to the SCANNER's member (the CI key), which mis-files every author's commits under one
-    // person. So we pass the parsed identity and let resolveMember do email/handle matching.
+    // email the commit is name-only → resolveMember returns null → the item stays unattributed
+    // (member_id: null), rather than being mis-filed under the scanner's own identity. So we pass
+    // the parsed identity and let resolveMember do email/handle matching.
     const email = str(commit.author_email).trim();
     const identity: AuthorIdentity = email
       ? { name: str(commit.author), email, key: email }
       : parseAuthorIdentity(str(commit.author));
     const authorMemberId = resolveMember(identityMap, identity);
-    await ingestItem(supabase, auth, payload, "team", { authorMemberId });
+    await ingestItem(db, auth, payload, "team", { authorMemberId });
     processed++;
   }
   return processed;

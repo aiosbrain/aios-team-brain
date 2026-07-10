@@ -1,5 +1,5 @@
 import "server-only";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 import { audit } from "@/lib/api/audit";
 
 /**
@@ -22,7 +22,7 @@ export interface ActorContext {
 }
 
 export async function createMember(
-  admin: SupabaseClient,
+  admin: DbClient,
   teamId: string,
   input: MemberInput,
   opts: { upsert?: boolean; actor?: ActorContext } = {}
@@ -58,6 +58,111 @@ export async function createMember(
   return { id: data.id, status: data.status };
 }
 
+export interface UpdateRoleResult {
+  updated: boolean;
+  reason?: "absent" | "last-admin" | "unchanged";
+  role?: "admin" | "lead" | "member";
+}
+
+/**
+ * Change an existing member's role (admins only — the caller gates via requireAdmin).
+ * Mirrors deleteMember's last-admin guard: refuses to demote the LAST non-disabled
+ * admin, so a team can never lock itself out of its own admin panel.
+ */
+export async function updateMemberRole(
+  admin: DbClient,
+  teamId: string,
+  memberId: string,
+  role: "admin" | "lead" | "member",
+  opts: { actor?: ActorContext } = {}
+): Promise<UpdateRoleResult> {
+  const { data: m } = await admin
+    .from("members")
+    .select("id, role, status")
+    .eq("team_id", teamId)
+    .eq("id", memberId)
+    .maybeSingle();
+  const member = m as { id: string; role: "admin" | "lead" | "member"; status: string } | null;
+  if (!member) return { updated: false, reason: "absent" };
+  if (member.role === role) return { updated: false, reason: "unchanged", role };
+
+  // Refuse to demote the last non-disabled admin (counts active AND invited admins,
+  // matching deleteMember — a disabled admin can't administer either way).
+  if (member.role === "admin" && member.status !== "disabled") {
+    const { data: admins } = await admin
+      .from("members")
+      .select("id")
+      .eq("team_id", teamId)
+      .eq("role", "admin")
+      .neq("status", "disabled");
+    if ((admins ?? []).length <= 1) return { updated: false, reason: "last-admin" };
+  }
+
+  const { error } = await admin.from("members").update({ role }).eq("id", member.id);
+  if (error) throw new Error(`update member role failed: ${error.message}`);
+
+  await audit(admin, {
+    team_id: teamId,
+    actor_kind: opts.actor?.kind ?? "system",
+    member_id: opts.actor?.memberId ?? null,
+    action: "member.role_changed",
+    target_type: "member",
+    target_id: member.id,
+    meta: { from: member.role, to: role },
+  });
+  return { updated: true, role };
+}
+
+export interface UpdateManagerResult {
+  updated: boolean;
+  reason?: "absent" | "self" | "manager-not-found" | "manager-disabled" | "manager-is-connector";
+  managerMemberId?: string | null;
+}
+
+/**
+ * Set (or clear) an existing member's manager — the org-chart source synced into the company
+ * graph (`lib/graph/company-actors.syncMemberActor`/`syncReportsTo`). Rejects self-management, a
+ * manager outside the caller's own team, a disabled manager, and a connector "manager" — none of
+ * those make sense as a reporting line. No multi-hop cycle detection (A→B→C→A remains possible) —
+ * out of scope at this team's scale.
+ */
+export async function updateMemberManager(
+  admin: DbClient,
+  teamId: string,
+  memberId: string,
+  managerMemberId: string | null
+): Promise<UpdateManagerResult> {
+  const { data: m } = await admin
+    .from("members")
+    .select("id")
+    .eq("team_id", teamId)
+    .eq("id", memberId)
+    .maybeSingle();
+  if (!m) return { updated: false, reason: "absent" };
+  if (managerMemberId === memberId) return { updated: false, reason: "self" };
+
+  if (managerMemberId) {
+    const { data: mgr } = await admin
+      .from("members")
+      .select("team_id, status, is_connector")
+      .eq("id", managerMemberId)
+      .maybeSingle();
+    const manager = mgr as { team_id: string; status: string; is_connector: boolean } | null;
+    if (!manager || manager.team_id !== teamId) return { updated: false, reason: "manager-not-found" };
+    if (manager.status === "disabled") return { updated: false, reason: "manager-disabled" };
+    if (manager.is_connector) return { updated: false, reason: "manager-is-connector" };
+  }
+
+  const { error } = await admin
+    .from("members")
+    .update({ manager_member_id: managerMemberId })
+    .eq("id", memberId)
+    .eq("team_id", teamId);
+  if (error) throw new Error(`update member manager failed: ${error.message}`);
+
+  return { updated: true, managerMemberId };
+}
+
 export interface DeleteResult {
   deleted: boolean;
   reason?: "absent" | "last-admin";
@@ -74,7 +179,7 @@ export interface DeleteResult {
  *   • refuses to remove the LAST active admin
  */
 export async function deleteMember(
-  admin: SupabaseClient,
+  admin: DbClient,
   teamId: string,
   email: string,
   opts: { hard?: boolean; actor?: ActorContext } = {}

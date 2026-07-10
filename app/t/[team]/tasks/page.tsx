@@ -1,7 +1,10 @@
 import type { Metadata } from "next";
-import { ListTodo } from "lucide-react";
-import { serverClient } from "@/lib/supabase/server";
+import Link from "next/link";
+import { ListTodo, ScanLine } from "lucide-react";
+import { serverClient } from "@/lib/db/server";
 import { getSessionUser } from "@/lib/auth/session";
+import { currentMember } from "@/lib/auth/guard";
+import { visibleTasks } from "@/lib/auth/visibility";
 import { Board } from "@/components/kanban/board";
 import { TaskHierarchy } from "@/components/kanban/task-hierarchy";
 import { EmptyState } from "@/components/empty-state";
@@ -11,9 +14,9 @@ export const metadata: Metadata = { title: "Tasks" };
 
 export default async function TasksPage({ params }: { params: Promise<{ team: string }> }) {
   const { team: teamSlug } = await params;
-  const supabase = await serverClient();
+  const db = await serverClient();
 
-  const { data: team } = await supabase
+  const { data: team } = await db
     .from("teams")
     .select("id")
     .eq("slug", teamSlug)
@@ -21,6 +24,9 @@ export default async function TasksPage({ params }: { params: Promise<{ team: st
   if (!team) return null;
 
   const user = await getSessionUser();
+  // Tier isolation (audit H1): an external-tier dashboard member must not see internal task boards.
+  const viewer = await currentMember(team.id);
+  const tier = viewer?.tier ?? "external";
 
   // PM links are fetched as a sibling query and grouped in JS rather than as an embedded resource:
   // the pg adapter (the deployed backend) only supports to-many embeds as `(count)`, so a
@@ -28,28 +34,31 @@ export default async function TasksPage({ params }: { params: Promise<{ team: st
   // works on both backends and keeps the per-task badge wiring intact.
   const [{ data: tasks }, { data: links }, { data: projects }, { data: members }, { data: me }] =
     await Promise.all([
-      supabase
-        .from("tasks")
-        .select("id, row_key, title, assignee, status, sprint, due_date, origin, project_id, updated_at, parent_row_key, labels, priority, body")
-        .eq("team_id", team.id)
-        .order("updated_at", { ascending: false })
-        .limit(500),
-      supabase
+      visibleTasks(
+        db
+          .from("tasks")
+          .select("id, row_key, title, assignee, status, sprint, due_date, origin, project_id, updated_at, parent_row_key, labels, priority, body")
+          .eq("team_id", team.id)
+          .order("updated_at", { ascending: false })
+          .limit(500),
+        tier
+      ),
+      db
         .from("task_pm_links")
         .select("task_id, provider, provider_url, last_synced_status, last_error")
         .eq("team_id", team.id),
-      supabase
+      db
         .from("projects")
         .select("id, slug, name")
         .eq("team_id", team.id)
         .order("slug"),
-      supabase
+      db
         .from("members")
         .select("id, display_name, actor_handle")
         .eq("team_id", team.id)
         .eq("status", "active")
         .order("display_name"),
-      supabase
+      db
         .from("members")
         .select("id")
         .eq("team_id", team.id)
@@ -74,7 +83,15 @@ export default async function TasksPage({ params }: { params: Promise<{ team: st
 
   return (
     <div className="mx-auto flex max-w-7xl flex-col gap-5">
-      <h1 className="text-2xl font-semibold text-ink">Tasks</h1>
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <h1 className="text-2xl font-semibold text-ink">Tasks</h1>
+        {tier === "team" ? (
+          <Link href={`/t/${teamSlug}/tasks/extract`} className="btn-ghost">
+            <ScanLine className="size-4" />
+            Extract from meetings
+          </Link>
+        ) : null}
+      </div>
       {taskRows.length === 0 && (projects ?? []).length === 0 ? (
         <EmptyState
           icon={ListTodo}

@@ -2,8 +2,7 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { ArrowLeft } from "lucide-react";
-import { isPostgresBackend } from "@/lib/db/backend";
-import { serverClient } from "@/lib/supabase/server";
+import { serverClient } from "@/lib/db/server";
 import { currentMember } from "@/lib/auth/guard";
 import { getMemberMaturity, AXIS_META, type AemAxes } from "@/lib/metrics/individual-maturity";
 import { MaturityRadar, type RadarDatum } from "@/components/charts/maturity-radar";
@@ -15,23 +14,30 @@ function radarData(axes: AemAxes, team: AemAxes): RadarDatum[] {
   return AXIS_META.map((a) => ({ axis: a.label, you: axes[a.key], team: team[a.key] }));
 }
 
+function CeShadowBadge() {
+  return (
+    <span className="mt-1 inline-flex rounded-full bg-amber/10 px-2 py-0.5 text-[10px] font-medium text-amber-700">
+      shadow · uncalibrated
+    </span>
+  );
+}
+
 export default async function MemberMaturityPage({
   params,
 }: {
   params: Promise<{ team: string; handle: string }>;
 }) {
-  if (!isPostgresBackend()) return null;
 
   const { team: teamSlug, handle } = await params;
-  const supabase = await serverClient();
-  const { data: team } = await supabase.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
+  const db = await serverClient();
+  const { data: team } = await db.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
   if (!team) return null;
 
   const me = await currentMember(team.id);
   if (!me) return null;
 
   // Tier-gated read; external viewers and unknown handles → 404.
-  const data = await getMemberMaturity(supabase, team.id, handle, me.tier);
+  const data = await getMemberMaturity(db, team.id, handle, me.tier);
   if (!data) notFound();
 
   const { latest, timeline, teamAxes, prescription } = data;
@@ -55,7 +61,7 @@ export default async function MemberMaturityPage({
         </div>
       </div>
 
-      <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
         <div className="card p-4">
           <div className="text-xs uppercase tracking-wide text-ink-subtle">Tasks</div>
           <div className="mt-1 text-xl tabular-nums text-ink">{latest.tasks}</div>
@@ -63,6 +69,13 @@ export default async function MemberMaturityPage({
         <div className="card p-4">
           <div className="text-xs uppercase tracking-wide text-ink-subtle">Sessions</div>
           <div className="mt-1 text-xl tabular-nums text-ink">{latest.sessions}</div>
+        </div>
+        <div className="card p-4">
+          <div className="text-xs uppercase tracking-wide text-ink-subtle">CE</div>
+          <div className="mt-1 text-xl tabular-nums text-ink">
+            {latest.ce_band == null ? "—" : `${latest.ce_band}/4`}
+          </div>
+          <CeShadowBadge />
         </div>
         <div className="card p-4">
           <div className="text-xs uppercase tracking-wide text-ink-subtle">Est. spend</div>
@@ -87,7 +100,9 @@ export default async function MemberMaturityPage({
           title="Axes vs. team average"
           hint="scored 0–4"
         />
-        <MaturityTimeline data={timeline.map((t) => ({ date: t.date, overall: t.overall }))} />
+        <MaturityTimeline
+          data={timeline.map((t) => ({ date: t.date, overall: t.overall, ce_band: t.ce_band }))}
+        />
       </div>
 
       <div className="card flex flex-col gap-2 p-5">

@@ -9,11 +9,14 @@
  *         'DATABASE_URL=$DATABASE_PUBLIC_URL npx tsx --conditions react-server scripts/admin.ts <cmd>'
  */
 import { execFileSync } from "node:child_process";
-import { adminClient } from "@/lib/supabase/admin";
+import { adminClient } from "@/lib/db/admin";
 import { createMember, deleteMember } from "@/lib/admin/members";
+import { syncMemberActor, removeMemberActor } from "@/lib/graph/company-actors";
 import { issueApiKey, revokeApiKey } from "@/lib/admin/keys";
 import { issueLoginLink } from "@/lib/admin/login";
-import { renameTeam } from "@/lib/admin/teams";
+import { adminSetPassword } from "@/lib/auth/pg-login";
+import { isPasswordStrongEnough, randomPassword, MIN_PASSWORD_LENGTH } from "@/lib/auth/password";
+import { createTeam, renameTeam } from "@/lib/admin/teams";
 import { addAuthorAlias } from "@/lib/admin/aliases";
 import { linkGithub, listOrgMembers } from "@/lib/codebases/github";
 import { setMemberIdentity } from "@/lib/identity/member-identities";
@@ -53,6 +56,7 @@ async function resolveTeam(admin: ReturnType<typeof adminClient>, ref: string) {
 }
 
 const USAGE = `Team Brain admin CLI — commands:
+  create-team <slug> --name <display>   # bootstrap: create a team, no SQL. Idempotent.
   create-member <email> --name <n> --handle <h> [--role admin|lead|member] [--team <slug>] [--upsert]
   login-link <email> [--team <slug>] [--ttl-min <n>] [--base-url <url> | env BRAIN_URL]
   issue-key <member-email> [--name <n>] [--team <slug>]
@@ -93,8 +97,19 @@ async function main() {
   const teamSlug = (flags.team as string) || "demo";
 
   switch (cmd) {
+    case "create-team": {
+      const slug = positionals[0] || die("usage: create-team <slug> --name <display>");
+      // `--name` with no following value parses as boolean `true` (parseArgs), which would
+      // otherwise pass truthiness here and crash later at `.trim()` instead of showing usage.
+      const name =
+        (typeof flags.name === "string" && flags.name) ||
+        die("usage: create-team <slug> --name <display>");
+      const team = await createTeam(admin, { slug, name });
+      console.log(`✓ team ${team.slug} (${team.id}) "${team.name}"`);
+      break;
+    }
     case "create-member": {
-      const email = positionals[0] || die("usage: create-member <email> --name <n> --handle <h>");
+      const email = positionals[0] || die("usage: create-member <email> --name <n> --handle <h> [--password <p>]");
       const team = await resolveTeam(admin, teamSlug);
       const res = await createMember(
         admin,
@@ -108,7 +123,19 @@ async function main() {
         },
         { upsert: Boolean(flags.upsert) }
       );
+      // Set a sign-in password (audit M1/M2b) — printed ONCE, never logged elsewhere. Without this
+      // the member row exists but no one can log in as them until an admin resets a password via
+      // the dashboard.
+      const password = (flags.password as string) || randomPassword();
+      if (!isPasswordStrongEnough(password)) die(`password must be at least ${MIN_PASSWORD_LENGTH} characters`);
+      await adminSetPassword(email, password);
+      try {
+        await syncMemberActor(admin, team.id, res.id);
+      } catch (e) {
+        console.error("company-graph sync failed:", e instanceof Error ? e.message : e);
+      }
       console.log(`✓ member ${email} (${res.id}) status=${res.status} on team ${team.slug}`);
+      console.log(`✓ password set (copy now, shown once): ${password}`);
       break;
     }
     case "login-link": {
@@ -162,7 +189,27 @@ async function main() {
     case "delete-member": {
       const email = positionals[0] || die("usage: delete-member <email> [--hard]");
       const team = await resolveTeam(admin, teamSlug);
-      const r = await deleteMember(admin, team.id, email, { hard: Boolean(flags.hard) });
+      const hard = Boolean(flags.hard);
+      // Capture direct reports BEFORE the delete — a hard delete's FK cascade clears their
+      // manager_member_id as part of the delete itself, so reading it back after would find none.
+      let directReportIds: string[] = [];
+      if (hard) {
+        const { data: before } = await admin.from("members").select("id").eq("team_id", team.id).eq("email", email).maybeSingle();
+        const beforeId = (before as { id: string } | null)?.id;
+        if (beforeId) {
+          const { data: reports } = await admin.from("members").select("id").eq("team_id", team.id).eq("manager_member_id", beforeId);
+          directReportIds = (reports ?? []).map((r) => (r as { id: string }).id);
+        }
+      }
+      const r = await deleteMember(admin, team.id, email, { hard });
+      if (r.deleted && r.id) {
+        try {
+          if (r.mode === "hard") await removeMemberActor(admin, team.id, r.id, directReportIds);
+          else await syncMemberActor(admin, team.id, r.id);
+        } catch (e) {
+          console.error("company-graph sync failed:", e instanceof Error ? e.message : e);
+        }
+      }
       console.log(
         r.deleted
           ? `✓ ${r.mode === "hard" ? "deleted" : "disabled"} ${email} on ${team.slug}`

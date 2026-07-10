@@ -1,10 +1,11 @@
 import { NextRequest } from "next/server";
 import { z } from "zod";
-import { serverClient } from "@/lib/supabase/server";
-import { adminClient } from "@/lib/supabase/admin";
+import { serverClient } from "@/lib/db/server";
+import { adminClient } from "@/lib/db/admin";
 import { getSessionUser } from "@/lib/auth/session";
 import { rateLimit } from "@/lib/api/rate-limit";
 import { errorResponse } from "@/lib/api/schemas";
+import { formatSseFrame } from "@/lib/api/sse";
 import { retrieve } from "@/lib/query/retrieve";
 import { streamAnswer } from "@/lib/query/claude";
 import { pickTimezone, DEFAULT_TIMEZONE } from "@/lib/query/timezone";
@@ -14,6 +15,7 @@ import {
   createConversation,
   appendMessage,
 } from "@/lib/chat/store";
+import { generateAndSetTitle } from "@/lib/chat/title";
 import { getProviderKey } from "@/lib/integrations/manage";
 import { isSyncCommand, runManualSync } from "@/lib/ingest/manual-sync";
 import { audit } from "@/lib/api/audit";
@@ -30,19 +32,19 @@ const SSE_HEADERS = {
  * connector for the team instead of asking the LLM. team-tier only + its own rate limit (enforced
  * by the caller); writes go through the single-writer ingestion underneath, and the run is audited.
  */
-function syncResponse(supabase: ReturnType<typeof adminClient>, teamId: string, memberId: string): Response {
+function syncResponse(db: ReturnType<typeof adminClient>, teamId: string, memberId: string): Response {
   const encoder = new TextEncoder();
   const stream = new ReadableStream({
     async start(controller) {
       const send = (event: string, data: unknown) =>
-        controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+        controller.enqueue(encoder.encode(formatSseFrame(event, data)));
       try {
         send("delta", { text: "🔄 Scraping connectors (Slack · Plane · Linear · GitHub)…\n\n" });
         const r = await runManualSync(teamId);
         send("delta", { text: r.summary });
         send("sources", { sources: [] });
         send("done", { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cost_usd: 0 });
-        await audit(supabase, {
+        await audit(db, {
           team_id: teamId,
           actor_kind: "member",
           member_id: memberId,
@@ -129,7 +131,7 @@ export async function POST(req: NextRequest) {
   const timeZone = pickTimezone([tz, prof?.timezone, DEFAULT_TIMEZONE]);
 
   const memberTier = me.tier as "team" | "external";
-  const supabase = adminClient();
+  const db = adminClient();
 
   // The query box doubles as a scrape trigger: "/sync" / "scrape now" / … pulls every enabled
   // connector instead of asking the LLM. team-tier only (external collaborators can't trigger a
@@ -138,20 +140,20 @@ export async function POST(req: NextRequest) {
     if (memberTier === "external") {
       return errorResponse("forbidden", "scraping is available to team members only", 403);
     }
-    if (!(await rateLimit(supabase, `${me.id}:sync`, 2))) {
+    if (!(await rateLimit(db, `${me.id}:sync`, 2))) {
       return errorResponse("rate_limited", "2 scrapes/min per member — try again shortly", 429);
     }
-    return syncResponse(supabase, team.id, me.id);
+    return syncResponse(db, team.id, me.id);
   }
 
-  if (!(await rateLimit(supabase, `${me.id}:query`, 10))) {
+  if (!(await rateLimit(db, `${me.id}:query`, 10))) {
     return errorResponse("rate_limited", "10 queries/min per member", 429);
   }
 
   // Daily guards: per-member count + per-team budget from query_log
   const dayStart = new Date();
   dayStart.setHours(0, 0, 0, 0);
-  const { count: todayCount } = await supabase
+  const { count: todayCount } = await db
     .from("query_log")
     .select("id", { count: "exact", head: true })
     .eq("member_id", me.id)
@@ -159,7 +161,7 @@ export async function POST(req: NextRequest) {
   if ((todayCount ?? 0) >= DAILY_QUERIES_PER_MEMBER) {
     return errorResponse("rate_limited", `${DAILY_QUERIES_PER_MEMBER} queries/day per member`, 429);
   }
-  const { data: spend } = await supabase
+  const { data: spend } = await db
     .from("query_log")
     .select("cost_usd")
     .eq("team_id", team.id)
@@ -173,28 +175,30 @@ export async function POST(req: NextRequest) {
   // Load the prior turns for the LLM memory window BEFORE persisting the current question, then
   // record the user message. The assistant message is persisted once the answer finishes streaming.
   const owner = { teamId: team.id, memberId: me.id };
-  let conversationId = conversation_id && (await ownsConversation(supabase, owner, conversation_id)) ? conversation_id : null;
-  const priorTurns = conversationId ? await recentTurns(supabase, owner, conversationId) : [];
+  let conversationId = conversation_id && (await ownsConversation(db, owner, conversation_id)) ? conversation_id : null;
+  const priorTurns = conversationId ? await recentTurns(db, owner, conversationId) : [];
+  let createdNew = false;
   if (!conversationId) {
-    const created = await createConversation(supabase, owner, question);
+    const created = await createConversation(db, owner, question);
     conversationId = created?.id ?? null;
+    createdNew = true;
   }
-  if (conversationId) await appendMessage(supabase, owner, conversationId, "user", question);
+  if (conversationId) await appendMessage(db, owner, conversationId, "user", question);
 
   const started = Date.now();
-  const ctx = await retrieve(supabase, team.id, memberTier, question, project);
+  const ctx = await retrieve(db, team.id, memberTier, question, project);
 
   // Per-team provider keys (encrypted in integrations); null → env fallback in streamAnswer.
   const [anthropicKey, openaiKey] = await Promise.all([
-    getProviderKey(supabase, team.id, "anthropic"),
-    getProviderKey(supabase, team.id, "openai"),
+    getProviderKey(db, team.id, "anthropic"),
+    getProviderKey(db, team.id, "openai"),
   ]);
 
   const encoder = new TextEncoder();
   const stream = new ReadableStream({
     async start(controller) {
       const send = (event: string, data: unknown) =>
-        controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+        controller.enqueue(encoder.encode(formatSseFrame(event, data)));
 
       // Tell the client which thread this turn belongs to (a new conversation returns its fresh id).
       if (conversationId) send("conversation", { id: conversationId });
@@ -222,15 +226,19 @@ export async function POST(req: NextRequest) {
 
             // Persist the assistant turn into the thread (full answer + cited sources + cost).
             if (conversationId) {
-              await appendMessage(supabase, owner, conversationId, "assistant", answer, {
+              await appendMessage(db, owner, conversationId, "assistant", answer, {
                 cited_item_ids: sources.map((s) => s.item_id).filter((id): id is string => Boolean(id)),
                 input_tokens: chunk.usage.input_tokens,
                 output_tokens: chunk.usage.output_tokens,
                 cost_usd: chunk.usage.cost_usd,
               });
+              // On a new thread, replace the derived title with a short LLM-written one (bounded).
+              if (createdNew) {
+                await generateAndSetTitle(db, owner, conversationId, question, answer, { anthropicKey, openaiKey });
+              }
             }
 
-            await supabase.from("query_log").insert({
+            await db.from("query_log").insert({
               team_id: team.id,
               member_id: me.id,
               question,

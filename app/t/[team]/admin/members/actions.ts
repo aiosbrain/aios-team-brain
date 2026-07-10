@@ -1,29 +1,20 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
-import { serverClient } from "@/lib/supabase/server";
-import { adminClient } from "@/lib/supabase/admin";
-import { getSessionUser } from "@/lib/auth/session";
-import { resolveIntegrationsAdmin } from "@/lib/integrations/read";
+import { adminClient } from "@/lib/db/admin";
+import { requireTeamAdmin as requireAdmin } from "@/lib/auth/guard";
 import { linkGithub } from "@/lib/codebases/github";
 import { setMemberIdentity, removeMemberIdentity } from "@/lib/identity/member-identities";
 import { addAuthorAlias, removeAuthorAlias } from "@/lib/admin/aliases";
 import { reattributeItems } from "@/lib/ingest/reattribute";
+import { adminSetPassword } from "@/lib/auth/pg-login";
+import { isPasswordStrongEnough, randomPassword, MIN_PASSWORD_LENGTH } from "@/lib/auth/password";
+import { audit } from "@/lib/api/audit";
+import { updateMemberRole, deleteMember, updateMemberManager, type UpdateManagerResult } from "@/lib/admin/members";
+import { syncMemberActor } from "@/lib/graph/company-actors";
 
 // Providers whose identity is a stable user id in member_identities (GitHub uses its own login flow).
 const PROVIDERS = new Set(["slack", "linear", "plane"]);
-
-/**
- * Admin gate for member mutations: resolve the signed-in user to an `{teamId, memberId}` admin
- * context (same role==="admin" + active-member check the /admin layout uses; `resolveIntegrationsAdmin`
- * is the shared team-admin resolver). Returns null for any non-admin/unknown/wrong-team caller.
- */
-async function requireAdmin(teamSlug: string) {
-  const supabase = await serverClient();
-  const user = await getSessionUser();
-  if (!user) return null;
-  return resolveIntegrationsAdmin(supabase, teamSlug, user.id);
-}
 
 /**
  * Link a roster member to a GitHub login (admins only). Reuses `linkGithub`, which writes
@@ -165,6 +156,167 @@ export async function reattributeIdentitiesNow(
     return { ok: true, message: `Re-attributed ${s.updated} of ${s.scanned} item(s) to current identity mappings.` };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "re-attribution failed" };
+  }
+}
+
+/**
+ * Reset a member's sign-in password (admins only) — audit M1/M2b. Sets a NEW password directly (no
+ * current-password check, unlike self-service change), scoped to a member of THIS team so an admin
+ * can't reach across teams via a raw memberId. Returns the plaintext password ONCE (shown-once UI,
+ * same pattern as API key issuance) for the admin to hand to the person out-of-band — never emailed,
+ * never logged.
+ */
+export async function resetMemberPassword(
+  teamSlug: string,
+  memberId: string,
+  password?: string
+): Promise<{ ok: boolean; password?: string; error?: string }> {
+  const ctx = await requireAdmin(teamSlug);
+  if (!ctx) return { ok: false, error: "admins only" };
+
+  const newPassword = password?.trim() || randomPassword();
+  if (!isPasswordStrongEnough(newPassword)) {
+    return { ok: false, error: `password must be at least ${MIN_PASSWORD_LENGTH} characters` };
+  }
+
+  const db = adminClient();
+  const { data: member } = await db
+    .from("members")
+    .select("id, email")
+    .eq("id", memberId)
+    .eq("team_id", ctx.teamId)
+    .maybeSingle();
+  if (!member) return { ok: false, error: "member not found on this team" };
+
+  await adminSetPassword((member as { email: string }).email, newPassword);
+  await audit(db, {
+    team_id: ctx.teamId,
+    actor_kind: "member",
+    member_id: ctx.memberId,
+    action: "member.password_reset",
+    target_type: "member",
+    target_id: memberId,
+    meta: {},
+  });
+  revalidatePath(`/t/${teamSlug}/admin/members`);
+  return { ok: true, password: newPassword };
+}
+
+/**
+ * Change an existing member's role (admins only). Refuses to demote the LAST active/invited
+ * admin, so a team can't lock itself out of its own admin panel — surfaced to the caller as an
+ * error rather than a silent no-op.
+ */
+export async function setMemberRole(
+  teamSlug: string,
+  memberId: string,
+  role: "admin" | "lead" | "member"
+): Promise<{ ok: boolean; error?: string }> {
+  const ctx = await requireAdmin(teamSlug);
+  if (!ctx) return { ok: false, error: "admins only" };
+  const db = adminClient();
+  try {
+    const res = await updateMemberRole(db, ctx.teamId, memberId, role, {
+      actor: { kind: "member", memberId: ctx.memberId },
+    });
+    if (!res.updated && res.reason === "last-admin") {
+      return { ok: false, error: "can't demote the last admin — promote someone else first" };
+    }
+    if (!res.updated && res.reason === "absent") {
+      return { ok: false, error: "member not found" };
+    }
+    if (res.updated) {
+      try {
+        await syncMemberActor(db, ctx.teamId, memberId);
+      } catch (e) {
+        console.error("[company-graph] actor sync failed on role change:", e instanceof Error ? e.message : e);
+      }
+    }
+    revalidatePath(`/t/${teamSlug}/admin/members`);
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "could not change role" };
+  }
+}
+
+const MANAGER_ERROR: Record<NonNullable<UpdateManagerResult["reason"]>, string> = {
+  absent: "member not found",
+  self: "a member can't manage themselves",
+  "manager-not-found": "manager not found on this team",
+  "manager-disabled": "can't assign a disabled member as manager",
+  "manager-is-connector": "can't assign a connector as manager",
+};
+
+/**
+ * Set (or clear) an existing member's manager (admins only) — the org-chart source synced into
+ * the company graph (`syncMemberActor` re-reads the row and calls `syncReportsTo`, which writes
+ * both the REPORTS_TO relationship edge `retrieve.ts`'s prompt reads and `attrs.reports_to` on the
+ * entity `GET /api/v1/company-graph` reads). Validation itself lives in `updateMemberManager`
+ * (self/cross-team/disabled/connector rejection) — this is a thin session-gated wrapper.
+ */
+export async function setMemberManager(
+  teamSlug: string,
+  memberId: string,
+  managerMemberId: string | null
+): Promise<{ ok: boolean; error?: string }> {
+  const ctx = await requireAdmin(teamSlug);
+  if (!ctx) return { ok: false, error: "admins only" };
+
+  const db = adminClient();
+  const res = await updateMemberManager(db, ctx.teamId, memberId, managerMemberId);
+  if (!res.updated) return { ok: false, error: MANAGER_ERROR[res.reason!] };
+
+  try {
+    await syncMemberActor(db, ctx.teamId, memberId);
+  } catch (e) {
+    console.error("[company-graph] reports-to sync failed:", e instanceof Error ? e.message : e);
+  }
+  revalidatePath(`/t/${teamSlug}/admin/members`);
+  return { ok: true };
+}
+
+/**
+ * Remove a member from the team (admins only). Soft-disables (`status='disabled'`) rather
+ * than hard-deleting — reversible, excluded from the active roster and `/api/v1/members`,
+ * and consistent with `deleteMember`'s default. A permanent hard delete stays a CLI-only
+ * operation (`scripts/admin.ts delete-member <email> --hard`) since it cascades away
+ * api_keys/aliases and isn't something a misclick in the dashboard should be able to do.
+ * Refuses to remove the LAST active admin, same guard as `setMemberRole`.
+ */
+export async function removeMember(
+  teamSlug: string,
+  memberId: string
+): Promise<{ ok: boolean; error?: string }> {
+  const ctx = await requireAdmin(teamSlug);
+  if (!ctx) return { ok: false, error: "admins only" };
+  const db = adminClient();
+  const { data: member } = await db
+    .from("members")
+    .select("email")
+    .eq("id", memberId)
+    .eq("team_id", ctx.teamId)
+    .maybeSingle();
+  if (!member) return { ok: false, error: "member not found on this team" };
+  try {
+    const res = await deleteMember(db, ctx.teamId, (member as { email: string }).email, {
+      actor: { kind: "member", memberId: ctx.memberId },
+    });
+    if (!res.deleted && res.reason === "last-admin") {
+      return { ok: false, error: "can't remove the last admin — promote someone else first" };
+    }
+    if (res.deleted) {
+      try {
+        // Soft-disable (this action's only mode) keeps the actor entity for history — just
+        // refreshes attrs.status so it drops out of retrieve.ts/company-graph's live context.
+        await syncMemberActor(db, ctx.teamId, memberId);
+      } catch (e) {
+        console.error("[company-graph] actor sync failed on remove:", e instanceof Error ? e.message : e);
+      }
+    }
+    revalidatePath(`/t/${teamSlug}/admin/members`);
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "could not remove member" };
   }
 }
 

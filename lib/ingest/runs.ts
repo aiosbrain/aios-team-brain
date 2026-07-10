@@ -1,5 +1,5 @@
 import "server-only";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 
 /**
  * The ingestion run log (`ingest_runs`) — the single home for "did this import work, and if not,
@@ -56,11 +56,11 @@ const MAX_ERROR_CHARS = 500;
  * Append one ingestion run. Never throws — a logging failure must not fail the ingestion it
  * describes. `ok` is derived to false whenever there are errors, even if the caller passed true.
  */
-export async function recordIngestRun(supabase: SupabaseClient, run: IngestRunInput): Promise<void> {
+export async function recordIngestRun(db: DbClient, run: IngestRunInput): Promise<void> {
   try {
     const errors = (run.errors ?? []).slice(0, MAX_ERRORS).map((e) => String(e).slice(0, MAX_ERROR_CHARS));
     const finishedAt = run.finishedAt ?? Date.now();
-    await supabase.from("ingest_runs").insert({
+    await db.from("ingest_runs").insert({
       team_id: run.teamId ?? null,
       source: run.source,
       trigger: run.trigger,
@@ -86,7 +86,7 @@ export async function recordIngestRun(supabase: SupabaseClient, run: IngestRunIn
  * aggregates (team_id null). Newest first. Read-only; the Admin page gates access (CLAUDE.md §5).
  */
 export async function listRecentIngestRuns(
-  supabase: SupabaseClient,
+  db: DbClient,
   teamId: string,
   limit = 50
 ): Promise<IngestRunRow[]> {
@@ -95,8 +95,8 @@ export async function listRecentIngestRuns(
   // Two queries + JS merge: the postgres adapter has no `.or()`, and this is the team's own runs
   // PLUS instance-wide scheduler aggregates (team_id null). Newest first, capped at `limit`.
   const [own, aggregate] = await Promise.all([
-    supabase.from("ingest_runs").select(cols).eq("team_id", teamId).order("finished_at", { ascending: false }).limit(limit),
-    supabase.from("ingest_runs").select(cols).is("team_id", null).order("finished_at", { ascending: false }).limit(limit),
+    db.from("ingest_runs").select(cols).eq("team_id", teamId).order("finished_at", { ascending: false }).limit(limit),
+    db.from("ingest_runs").select(cols).is("team_id", null).order("finished_at", { ascending: false }).limit(limit),
   ]);
   return [...((own.data ?? []) as IngestRunRow[]), ...((aggregate.data ?? []) as IngestRunRow[])]
     .sort((a, b) => (a.finished_at < b.finished_at ? 1 : a.finished_at > b.finished_at ? -1 : 0))

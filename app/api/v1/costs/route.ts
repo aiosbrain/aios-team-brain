@@ -1,5 +1,5 @@
 import { NextRequest } from "next/server";
-import { adminClient } from "@/lib/supabase/admin";
+import { adminClient } from "@/lib/db/admin";
 import { authenticateApiKey } from "@/lib/api/auth";
 import { rateLimit } from "@/lib/api/rate-limit";
 import { usageCostPayloadSchema, errorResponse, IngestValidationError } from "@/lib/api/schemas";
@@ -17,8 +17,8 @@ export async function POST(req: NextRequest) {
     return errorResponse("forbidden_tier", "usage costs are team-tier only", 403);
   }
 
-  const supabase = adminClient();
-  if (!(await rateLimit(supabase, `${auth.apiKeyId}:costs:post`, 120))) {
+  const db = adminClient();
+  if (!(await rateLimit(db, `${auth.apiKeyId}:costs:post`, 120))) {
     return errorResponse("rate_limited", "120 cost pushes/min per key", 429);
   }
 
@@ -38,7 +38,7 @@ export async function POST(req: NextRequest) {
   }
 
   try {
-    const result = await ingestUsageCost(supabase, auth, parsed.data);
+    const result = await ingestUsageCost(db, auth, parsed.data);
     return Response.json({ status: "ok", ...result }, { status: 201 });
   } catch (e) {
     // An unknown member handle is a client input error (the caller sent a handle the team

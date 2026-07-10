@@ -1,7 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { FolderKanban } from "lucide-react";
-import { serverClient } from "@/lib/supabase/server";
+import { serverClient } from "@/lib/db/server";
 import { EmptyState } from "@/components/empty-state";
 import { NewProjectButton } from "@/components/projects/new-project-button";
 import { timeAgo } from "@/components/format";
@@ -19,16 +19,16 @@ type ProjectCard = {
 
 export default async function ProjectsPage({ params }: { params: Promise<{ team: string }> }) {
   const { team: teamSlug } = await params;
-  const supabase = await serverClient();
+  const db = await serverClient();
 
-  const { data: team } = await supabase
+  const { data: team } = await db
     .from("teams")
     .select("id")
     .eq("slug", teamSlug)
     .maybeSingle();
   if (!team) return null;
 
-  const { data: projects } = await supabase
+  const { data: projects } = await db
     .from("projects")
     .select("id, slug, name, last_synced_at, items(count), tasks(count)")
     .eq("team_id", team.id)
@@ -57,7 +57,7 @@ export default async function ProjectsPage({ params }: { params: Promise<{ team:
               className="prism-card prism-card-hover flex flex-col gap-3 px-5 py-5"
             >
               <div>
-                <h2 className="font-display text-lg font-semibold text-ink">{p.name || p.slug}</h2>
+                <h2 className="font-display text-lg text-ink">{p.name || p.slug}</h2>
                 <p className="font-mono text-xs text-ink-tertiary">{p.slug}</p>
               </div>
               <div className="mt-auto flex items-center gap-4 text-xs text-ink-secondary">

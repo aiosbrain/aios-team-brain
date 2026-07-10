@@ -37,8 +37,8 @@ describe("selectedProviderName", () => {
 describe("externalProvider", () => {
   it("returns an empty, ungrounded context when RETRIEVAL_AUGMENT_URL is unset (never throws)", async () => {
     const ctx = await externalProvider.retrieve({
-      // supabase is unused on the no-URL path
-      supabase: null as never,
+      // db is unused on the no-URL path
+      db: null as never,
       teamId: "t1",
       tier: "team",
       question: "anything",

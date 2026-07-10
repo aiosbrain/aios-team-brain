@@ -1,5 +1,5 @@
 import { NextRequest } from "next/server";
-import { adminClient } from "@/lib/supabase/admin";
+import { adminClient } from "@/lib/db/admin";
 import { authenticateApiKey } from "@/lib/api/auth";
 import { rateLimit } from "@/lib/api/rate-limit";
 import { errorResponse } from "@/lib/api/schemas";
@@ -18,12 +18,12 @@ export async function GET(req: NextRequest) {
     return errorResponse("forbidden_tier", "projects are team-tier only", 403);
   }
 
-  const supabase = adminClient();
-  if (!(await rateLimit(supabase, `${auth.apiKeyId}:projects:get`, 60))) {
+  const db = adminClient();
+  if (!(await rateLimit(db, `${auth.apiKeyId}:projects:get`, 60))) {
     return errorResponse("rate_limited", "60 pulls/min per key", 429);
   }
 
-  const { data, error } = await supabase
+  const { data, error } = await db
     .from("projects")
     .select("slug, name, last_synced_at")
     .eq("team_id", auth.teamId)

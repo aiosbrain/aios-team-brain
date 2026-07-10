@@ -1,24 +1,34 @@
 #!/bin/bash
 # e2e.sh — full cross-repo verification of the AIOS sync loop.
 #
-# Prereqs: supabase start (this repo), .env.local populated, `npm run dev` NOT
-# already running on :3000, and a checkout of aios-workspace for the CLI.
+# Prereqs: Docker (for the ephemeral test Postgres), .env.local populated,
+# `npm run dev` NOT already running on :3000, and a checkout of aios-workspace
+# for the CLI.
 #
 # Loop verified: seed → issue key → aios push (contributor CLI) → idempotent
 # re-push → pull → rows materialized → admin-tier 422 → NL query cites sources.
+#
+# Runs against an ephemeral test Postgres (compose.test.yml, port 5434) that is
+# wiped on every `db:test:up` — never against a real/prod DATABASE_URL.
 
 set -euo pipefail
 
 BRAIN_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 OPS_DIR="${OPS_DIR:-$HOME/Projects/aios-workspace}"
 PORT="${PORT:-3000}"
-DB_PORT="${DB_PORT:-55422}"
+DB_PORT="${DB_PORT:-5434}"
+# The test Postgres from compose.test.yml (app/app/app_test on :5434).
+export DATABASE_URL="postgres://app:app@localhost:${DB_PORT}/app_test"
+export AUTH_SECRET="${AUTH_SECRET:-e2e-local-session-secret-000000}"
 
 cd "$BRAIN_DIR"
 set -a; source .env.local; set +a
+# Force the test DB regardless of what .env.local carries.
+export DATABASE_URL="postgres://app:app@localhost:${DB_PORT}/app_test"
 
 echo "── 1. reset + migrate + seed"
-supabase db reset >/dev/null
+npm run db:test:up >/dev/null
+trap 'npm run db:test:down >/dev/null 2>&1 || true' EXIT
 SEED_OUT=$(npx tsx --conditions react-server scripts/seed-demo.ts)
 echo "$SEED_OUT" | grep -E "tasks materialized|decisions materialized|assertions"
 KEY=$(echo "$SEED_OUT" | grep -oE 'aios_[A-Za-z0-9]+_[A-Za-z0-9_-]+')
@@ -26,7 +36,7 @@ KEY=$(echo "$SEED_OUT" | grep -oE 'aios_[A-Za-z0-9]+_[A-Za-z0-9_-]+')
 echo "── 2. start dev server"
 npm run dev > /tmp/e2e-dev.log 2>&1 &
 DEV_PID=$!
-trap 'kill $DEV_PID 2>/dev/null || true' EXIT
+trap 'kill $DEV_PID 2>/dev/null || true; npm run db:test:down >/dev/null 2>&1 || true' EXIT
 for i in $(seq 1 30); do
   code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/api/v1/items" || true)
   [ "$code" = "401" ] && break
@@ -59,7 +69,7 @@ node "$OPS_DIR/scripts/aios.mjs" push --repo /tmp/e2e-spoke | grep -q "nothing t
   && echo "no-op re-push ✓" || { echo "FAIL: re-push not idempotent"; exit 1; }
 
 echo "── 5. materialization"
-TASKS=$(PGPASSWORD=postgres psql -h 127.0.0.1 -p "$DB_PORT" -U postgres -d postgres -t -A \
+TASKS=$(PGPASSWORD=app psql -h 127.0.0.1 -p "$DB_PORT" -U app -d app_test -t -A \
   -c "select count(*) from tasks t join projects p on p.id=t.project_id where p.slug='e2e-spoke'")
 [ "$TASKS" -ge 1 ] && echo "e2e-spoke tasks materialized: $TASKS ✓" \
   || { echo "FAIL: no tasks materialized"; exit 1; }
@@ -82,7 +92,7 @@ if [ -x "$ING_BIN" ]; then
   "$ING_BIN" backfill "${ING_OPTS[@]}" | tee /tmp/e2e-ingest.out
   grep -qE '[1-9][0-9]* created|[1-9][0-9]* unchanged' /tmp/e2e-ingest.out \
     || { echo "FAIL: backfill pushed nothing"; exit 1; }
-  ITEMS=$(PGPASSWORD=postgres psql -h 127.0.0.1 -p "$DB_PORT" -U postgres -d postgres -t -A \
+  ITEMS=$(PGPASSWORD=app psql -h 127.0.0.1 -p "$DB_PORT" -U app -d app_test -t -A \
     -c "select count(*) from items i join projects p on p.id=i.project_id where p.slug='github'")
   [ "$ITEMS" -ge 1 ] && echo "github-sourced items materialized: $ITEMS ✓" \
     || { echo "FAIL: no github-sourced items"; exit 1; }

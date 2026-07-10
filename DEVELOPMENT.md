@@ -15,7 +15,7 @@ lives is [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md); the conventions an agen
   without it; only live NL queries need an LLM (cloud key or a local endpoint — see
   [`docs/PROVIDERS.md`](docs/PROVIDERS.md)).
 
-## First run (Postgres backend — the default)
+## First run
 
 ```bash
 npm install
@@ -25,15 +25,13 @@ cp .env.example .env.local
 Edit `.env.local` and set, at minimum:
 
 ```bash
-DB_BACKEND=postgres
-NEXT_PUBLIC_DB_BACKEND=postgres
 DATABASE_URL=postgres://app:app@localhost:5434/app_test   # see "Where do I get a DATABASE_URL?"
 AUTH_SECRET=<paste 32 random bytes — command below>
 APP_URL=http://localhost:3000
 # ANTHROPIC_API_KEY=sk-ant-...   # optional; only for live queries
 ```
 
-Generate `AUTH_SECRET` (signs the session cookie in Postgres mode):
+Generate `AUTH_SECRET` (signs the session cookie):
 
 ```bash
 node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
@@ -59,10 +57,6 @@ npm run dev:login     # prints a login link for the seeded admin
 > (`docker run -e POSTGRES_PASSWORD=app -e POSTGRES_USER=app -e POSTGRES_DB=app -p 5432:5432 postgres:16`)
 > and use `postgres://app:app@localhost:5432/app`. For a managed provider that requires TLS (e.g.
 > Railway) also set `PGSSL=require`.
-
-> **Legacy Supabase backend:** set `DB_BACKEND=supabase`, run `supabase start`, fill `.env.local`
-> from `supabase status -o env`, and `supabase db reset` to migrate. New work targets Postgres;
-> Supabase is opt-in and its migrations are legacy-scoped.
 
 ## Tests — which tier catches what
 
@@ -90,6 +84,21 @@ Production is Postgres on Railway. After a merge that changes `postgres/schema.s
 `npm run pg:schema` against the prod `DATABASE_URL` and confirm the platform started a new build
 (CI webhooks can be dropped — re-trigger if the latest deploy predates the merge).
 
+## Bootstrapping a fresh instance (first team + admin)
+
+AIOS is self-hosted per organization (see CLAUDE.md §5) — there's no public signup. The first
+team and its first admin are created once, with no hand-written SQL, by chaining two idempotent
+CLI commands (against the target `DATABASE_URL` — prod uses the Railway DB):
+
+```bash
+npm run admin -- create-team <slug> --name "<Display Name>"
+npm run admin -- create-member <you@org.com> --name "<Your Name>" --handle <you> --role admin --team <slug>
+```
+
+Both are safe to re-run: `create-team` returns the existing row for an already-used slug, and
+`create-member` takes `--upsert` if you need to re-run it. From here, follow "Giving a new
+contributor brain access" below to invite everyone else onto the same team.
+
 ## Giving a new contributor brain access (admins)
 
 People are invite-only; machines (the `aios` CLI / sidecar) use a per-member API key. To onboard
@@ -113,6 +122,6 @@ npm run admin -- login-link <email> --team aios            # optional: a magic l
 | `ECONNREFUSED 127.0.0.1:5434` in data-mechanics | the test container is down → `npm run db:test:up` |
 | data-mechanics refuses to run (`requires DATABASE_TEST_URL`) | use `npm run test:datamechanics:local` |
 | `relation "..." does not exist` / empty dashboard | schema/seed not loaded → `npm run pg:schema && npm run dev:seed` |
-| auth/cookie errors in Postgres mode | `AUTH_SECRET` unset in `.env.local` |
+| auth/cookie errors | `AUTH_SECRET` unset in `.env.local` |
 | invite/magic links point at the wrong host | set `APP_URL` to your absolute base URL |
 | live query errors, everything else works | no LLM configured — set `ANTHROPIC_API_KEY` or `LLM_BASE_URL` ([`docs/PROVIDERS.md`](docs/PROVIDERS.md)) |

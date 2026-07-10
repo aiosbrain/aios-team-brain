@@ -1,5 +1,5 @@
 import "server-only";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 import { IngestValidationError, type MaturitySnapshotPayload } from "@/lib/api/schemas";
 import { buildIdentityMap, resolveMember } from "@/lib/identity/resolve";
 import { audit } from "@/lib/api/audit";
@@ -14,14 +14,14 @@ import { placement, type AemPlacement } from "@/lib/metrics/individual-maturity"
  * maturity.ts so the maturity-tier-filter guard only polices reads.
  */
 export async function ingestMaturitySnapshot(
-  supabase: SupabaseClient,
+  db: DbClient,
   auth: { teamId: string; memberId: string; apiKeyId: string },
   payload: MaturitySnapshotPayload
 ): Promise<{ snapshot_id: string; member_id: string; canonical: AemPlacement }> {
   // Resolve the member: an explicit handle must map to a team member; else self.
   let memberId = auth.memberId;
   if (payload.member) {
-    const map = await buildIdentityMap(supabase, auth.teamId);
+    const map = await buildIdentityMap(db, auth.teamId);
     const resolved = resolveMember(map, { key: payload.member });
     if (!resolved) throw new IngestValidationError(`unknown member handle '${payload.member}'`);
     memberId = resolved;
@@ -30,7 +30,7 @@ export async function ingestMaturitySnapshot(
   const s = payload.signals;
   const canonical = placement(s);
 
-  const { data, error } = await supabase
+  const { data, error } = await db
     .from("agentic_maturity_snapshots")
     .upsert(
       {
@@ -63,6 +63,9 @@ export async function ingestMaturitySnapshot(
         canonical_learning: canonical.axes.learning,
         canonical_cost_governance: canonical.axes.cost_governance,
         canonical_overall: canonical.overall,
+        // Omitted (older client) → key absent, column untouched on conflict (preserves a
+        // previously stored band). Explicit null → column set to NULL, clearing it.
+        ...(payload.ce_band !== undefined ? { ce_band: payload.ce_band } : {}),
       },
       { onConflict: "team_id,member_id,snapshot_date,metric" }
     )
@@ -70,7 +73,7 @@ export async function ingestMaturitySnapshot(
     .single();
   if (error || !data) throw new Error(`maturity snapshot upsert failed: ${error?.message}`);
 
-  await audit(supabase, {
+  await audit(db, {
     team_id: auth.teamId,
     actor_kind: "api_key",
     member_id: auth.memberId,
@@ -78,7 +81,15 @@ export async function ingestMaturitySnapshot(
     action: "maturity.snapshot",
     target_type: "member",
     target_id: memberId,
-    meta: { date: payload.date, spine: canonical.spine, overall: canonical.overall, tasks: payload.tasks },
+    meta: {
+      date: payload.date,
+      spine: canonical.spine,
+      overall: canonical.overall,
+      tasks: payload.tasks,
+      // Preserve the omitted-vs-explicit-null distinction in the audit trail too — collapsing
+      // them (e.g. via `?? null`) would hide whether a re-push actually cleared a stored band.
+      ce_band: payload.ce_band === undefined ? "unchanged" : payload.ce_band,
+    },
   });
 
   return { snapshot_id: data.id, member_id: memberId, canonical };

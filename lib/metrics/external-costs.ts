@@ -1,5 +1,5 @@
 import "server-only";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 import { rangeDays, type Range } from "./range";
 import { scopeQueryLog, type QueryLogViewer } from "@/lib/auth/visibility";
 import { num, round } from "@/lib/num";
@@ -65,7 +65,7 @@ function scopeUsageCosts<Q>(query: Q, viewer: QueryLogViewer): Q {
 }
 
 export async function getExternalCosts(
-  supabase: SupabaseClient,
+  db: DbClient,
   teamId: string,
   range: Range,
   viewer: QueryLogViewer
@@ -76,7 +76,7 @@ export async function getExternalCosts(
 
   const [costRes, membersRes] = await Promise.all([
     scopeUsageCosts(
-      supabase
+      db
         .from("usage_costs")
         .select(
           "member_id, provider, source, project, input_tokens, output_tokens, cache_read_tokens, cost_usd, events, cost_date"
@@ -87,7 +87,7 @@ export async function getExternalCosts(
         .limit(50_000),
       viewer
     ),
-    supabase
+    db
       .from("members")
       .select("id, display_name, actor_handle, avatar_url")
       .eq("team_id", teamId),
@@ -168,7 +168,7 @@ export async function getExternalCosts(
 
 /** Combined brain + external spend for a member-facing total. */
 export async function getCombinedSpend(
-  supabase: SupabaseClient,
+  db: DbClient,
   teamId: string,
   range: Range,
   viewer: QueryLogViewer,
@@ -177,7 +177,7 @@ export async function getCombinedSpend(
   const windowStart = new Date(Date.now() - rangeDays(range) * 86_400_000).toISOString();
 
   const brainRes = await scopeQueryLog(
-    supabase
+    db
       .from("query_log")
       .select("cost_usd")
       .eq("team_id", teamId)
@@ -187,7 +187,7 @@ export async function getCombinedSpend(
 
   const external =
     externalSummary ??
-    (await getExternalCosts(supabase, teamId, range, viewer));
+    (await getExternalCosts(db, teamId, range, viewer));
 
   const brain_usd = round(
     ((brainRes.data ?? []) as { cost_usd: number | string }[]).reduce(

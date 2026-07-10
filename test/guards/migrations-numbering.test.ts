@@ -3,13 +3,14 @@ import { readdirSync } from "node:fs";
 import { join } from "node:path";
 
 /**
- * Migration numbering/replay hygiene (playbook §4/§7). Supabase applies migrations in
- * lexical filename order; a duplicate or malformed timestamp prefix silently changes apply
- * order and breaks replay-from-zero (which `npm run db:test:up` exercises). This guard fails
- * the build on a bad prefix so the error surfaces in review, not on the next deploy.
+ * Migration numbering/replay hygiene (playbook §4/§7). `npm run pg:schema` applies the
+ * files in `postgres/migrations/` in lexical filename order (after `schema.sql`); a duplicate
+ * or malformed timestamp prefix silently changes apply order and breaks replay-from-zero
+ * (which `npm run db:test:up` exercises). This guard fails the build on a bad prefix so the
+ * error surfaces in review, not on the next deploy.
  */
 
-const MIG_DIR = join(import.meta.dirname, "..", "..", "supabase", "migrations");
+const MIG_DIR = join(import.meta.dirname, "..", "..", "postgres", "migrations");
 const NAME_RE = /^(\d{14})_[a-z0-9_]+\.sql$/; // YYYYMMDDHHMMSS_snake_name.sql
 
 function migrationFiles(): string[] {

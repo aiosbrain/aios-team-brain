@@ -1,9 +1,7 @@
 import type { Metadata } from "next";
-import { notFound } from "next/navigation";
 import Link from "next/link";
 import { GitBranch } from "lucide-react";
-import { isPostgresBackend } from "@/lib/db/backend";
-import { serverClient } from "@/lib/supabase/server";
+import { serverClient } from "@/lib/db/server";
 import { currentMember } from "@/lib/auth/guard";
 import { getCodebaseSummaries } from "@/lib/metrics/codebases";
 import { parseRange } from "@/lib/metrics/range";
@@ -21,21 +19,19 @@ export default async function CodebasesPage({
   params: Promise<{ team: string }>;
   searchParams: Promise<{ range?: string }>;
 }) {
-  // Codebase analytics live only on the postgres backend (canonical schema).
-  if (!isPostgresBackend()) notFound();
 
   const { team: teamSlug } = await params;
   const range = parseRange((await searchParams).range);
-  const supabase = await serverClient();
+  const db = await serverClient();
 
-  const { data: team } = await supabase.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
+  const { data: team } = await db.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
   if (!team) return null;
 
   const me = await currentMember(team.id);
   if (!me) return null;
 
   // Read helper enforces the team-tier gate (external → empty).
-  const { codebases, kpis } = await getCodebaseSummaries(supabase, team.id, range, me.tier);
+  const { codebases, kpis } = await getCodebaseSummaries(db, team.id, range, me.tier);
 
   return (
     <div className="mx-auto flex max-w-6xl flex-col gap-5">

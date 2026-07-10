@@ -3,10 +3,10 @@ import { PgQuery } from "./query-builder";
 import { runSql } from "./pool";
 
 /**
- * Minimal Supabase-shaped data client backed by `pg`. Exposes `.from()` and the
- * `.rpc()` calls the app makes. It is cast to `SupabaseClient` at the factory
- * boundary (lib/supabase/*) so the ~34 existing call sites need no changes;
- * auth is handled separately by lib/auth (this client has no `.auth`).
+ * The data client backed by `pg` — the single runtime DB client. Exposes a
+ * PostgREST-shaped `.from()` chain and the `.rpc()` calls the app makes; it is
+ * surfaced as `DbClient` (lib/db/types) at the factory boundary (lib/db/*).
+ * Auth is handled separately by lib/auth (this client has no `.auth`).
  */
 export class PgClient {
   from<T = unknown>(table: string): PgQuery<T> {

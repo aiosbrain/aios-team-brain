@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { currentDateLine } from "@/lib/query/claude";
 
 /**
@@ -42,5 +42,33 @@ describe("currentDateLine", () => {
     const line = currentDateLine(new Date("2026-06-26T23:30:00Z"));
     expect(line).toContain("2026-06-26 23:30");
     expect(line).toContain("UTC");
+  });
+
+  describe("ICU longOffset edge cases", () => {
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    it("normalizes a bare 'GMT' longOffset (some ICU builds omit '+00:00' for UTC) to 'UTC+00:00'", () => {
+      // Some ICU builds render longOffset for UTC as bare "GMT" instead of "GMT+00:00" — both are
+      // valid CLDR renderings, but the code must produce identical output either way. Simulate that
+      // build by rewriting the timeZoneName part on top of whatever this environment's ICU returns.
+      const originalFormatToParts = Intl.DateTimeFormat.prototype.formatToParts;
+      vi.spyOn(Intl.DateTimeFormat.prototype, "formatToParts").mockImplementation(function (
+        this: Intl.DateTimeFormat,
+        ...args: Parameters<typeof originalFormatToParts>
+      ) {
+        const parts = originalFormatToParts.apply(this, args);
+        return parts.map((part) =>
+          part.type === "timeZoneName" && part.value.replace("GMT", "UTC") === "UTC+00:00"
+            ? { ...part, value: "GMT" }
+            : part
+        );
+      });
+
+      const line = currentDateLine(new Date("2026-06-26T09:30:00Z"), "UTC");
+      expect(line).toContain("2026-06-26 09:30");
+      expect(line).toContain("UTC (UTC+00:00)");
+    });
   });
 });

@@ -1,5 +1,5 @@
 import "server-only";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 
 export type AuditEntry = {
   team_id: string | null;
@@ -14,9 +14,9 @@ export type AuditEntry = {
 };
 
 /** Append-only audit write via the service role. Best-effort: never throws. */
-export async function audit(supabase: SupabaseClient, entry: AuditEntry) {
+export async function audit(db: DbClient, entry: AuditEntry) {
   try {
-    await supabase.from("audit_log").insert({
+    await db.from("audit_log").insert({
       team_id: entry.team_id,
       actor_kind: entry.actor_kind,
       member_id: entry.member_id ?? null,

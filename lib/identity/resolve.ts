@@ -1,5 +1,5 @@
 import "server-only";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 
 /**
  * Shared identity resolution: git/provider author identity → roster `member_id` for a team.
@@ -32,10 +32,10 @@ export interface AuthorIdentity {
 
 /** Build lookup tables mapping author identity → member_id for the team. */
 export async function buildIdentityMap(
-  supabase: SupabaseClient,
+  db: DbClient,
   teamId: string
 ): Promise<IdentityMap> {
-  const { data } = await supabase
+  const { data } = await db
     .from("members")
     .select("id, email, actor_handle")
     .eq("team_id", teamId);
@@ -60,7 +60,7 @@ export async function buildIdentityMap(
   // Deliberately NOT added to emailDomains — alias domains like users.noreply.github.com are
   // shared, so widening the handle heuristic with them would re-introduce cross-author
   // misattribution (the bug PR #11 closed).
-  const { data: aliases } = await supabase
+  const { data: aliases } = await db
     .from("member_emails")
     .select("email, member_id")
     .eq("team_id", teamId);
@@ -71,7 +71,7 @@ export async function buildIdentityMap(
   // Cross-provider identities (Slack/Linear/… user ids). Keyed by (provider, external_id); any
   // email carried on the row is also folded into byEmail as a secondary exact match.
   const byProviderId = new Map<string, string>();
-  const { data: identities } = await supabase
+  const { data: identities } = await db
     .from("member_identities")
     .select("provider, external_id, email, member_id")
     .eq("team_id", teamId);
@@ -109,14 +109,4 @@ export function resolveMember(map: IdentityMap, identity: AuthorIdentity): strin
     explicitHandle ??
     null
   );
-}
-
-/** Convenience: build the map once and resolve a batch of identities to member_ids. */
-export async function resolveMembers(
-  supabase: SupabaseClient,
-  teamId: string,
-  identities: AuthorIdentity[]
-): Promise<(string | null)[]> {
-  const map = await buildIdentityMap(supabase, teamId);
-  return identities.map((id) => resolveMember(map, id));
 }

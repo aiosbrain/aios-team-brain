@@ -1,4 +1,4 @@
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 import { upsertIntegration, type IntegrationAuth } from "./manage";
 import { decryptSecret } from "@/lib/secrets/crypto";
 import { addRepo, removeRepo } from "./github-repos";
@@ -18,8 +18,8 @@ interface GithubRow {
 }
 
 /** The team's canonical github integration (earliest-created if several), or null. */
-async function firstGithubRow(supabase: SupabaseClient, teamId: string): Promise<GithubRow | null> {
-  const { data } = await supabase
+async function firstGithubRow(db: DbClient, teamId: string): Promise<GithubRow | null> {
+  const { data } = await db
     .from("integrations")
     .select("name, status, config")
     .eq("team_id", teamId)
@@ -41,12 +41,12 @@ function currentRepos(row: GithubRow | null): string[] {
 
 /** Upsert the canonical github row with a new repos list, preserving other config + status. */
 async function writeRepos(
-  supabase: SupabaseClient,
+  db: DbClient,
   auth: IntegrationAuth,
   row: GithubRow | null,
   repos: string[]
 ): Promise<void> {
-  await upsertIntegration(supabase, auth, {
+  await upsertIntegration(db, auth, {
     type: "github",
     name: row?.name ?? "github", // conflict key is (team,type,name) — a stable name = one row
     config: { ...(row?.config ?? {}), repos },
@@ -59,13 +59,13 @@ async function writeRepos(
  * Returns the resulting repos list. Throws `RepoFormatError` on malformed input (surfaced to the UI).
  */
 export async function linkGithubRepo(
-  supabase: SupabaseClient,
+  db: DbClient,
   auth: IntegrationAuth,
   repoInput: string
 ): Promise<string[]> {
-  const row = await firstGithubRow(supabase, auth.teamId);
+  const row = await firstGithubRow(db, auth.teamId);
   const repos = addRepo(currentRepos(row), repoInput); // validates + case-insensitive de-dup
-  await writeRepos(supabase, auth, row, repos);
+  await writeRepos(db, auth, row, repos);
   return repos;
 }
 
@@ -75,11 +75,11 @@ export async function linkGithubRepo(
  * upsert key.
  */
 export async function ensureGithubIntegration(
-  supabase: SupabaseClient,
+  db: DbClient,
   auth: IntegrationAuth
 ): Promise<string> {
-  const row = await firstGithubRow(supabase, auth.teamId);
-  const { id } = await upsertIntegration(supabase, auth, {
+  const row = await firstGithubRow(db, auth.teamId);
+  const { id } = await upsertIntegration(db, auth, {
     type: "github",
     name: row?.name ?? "github",
     config: { ...(row?.config ?? {}), repos: currentRepos(row) }, // preserve repos, no-op if unchanged
@@ -94,10 +94,10 @@ export async function ensureGithubIntegration(
  * row regardless of enabled/disabled so an access check reflects the true stored token.
  */
 export async function githubReposAndToken(
-  supabase: SupabaseClient,
+  db: DbClient,
   teamId: string
 ): Promise<{ repos: string[]; token: string | null }> {
-  const { data } = await supabase
+  const { data } = await db
     .from("integrations")
     .select("config, secret_ciphertext")
     .eq("team_id", teamId)
@@ -113,13 +113,13 @@ export async function githubReposAndToken(
 
 /** Unlink a repo (case-insensitive). No-op if no github row / repo absent. Returns the repos list. */
 export async function unlinkGithubRepo(
-  supabase: SupabaseClient,
+  db: DbClient,
   auth: IntegrationAuth,
   repoInput: string
 ): Promise<string[]> {
-  const row = await firstGithubRow(supabase, auth.teamId);
+  const row = await firstGithubRow(db, auth.teamId);
   if (!row) return [];
   const repos = removeRepo(currentRepos(row), repoInput);
-  await writeRepos(supabase, auth, row, repos);
+  await writeRepos(db, auth, row, repos);
   return repos;
 }

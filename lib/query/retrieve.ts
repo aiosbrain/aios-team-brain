@@ -1,7 +1,8 @@
 import "server-only";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 import { GraphitiClient, type GraphFact } from "@/lib/graph/graphiti-client";
 import { visibleGroupIds } from "@/lib/graph/group";
+import { visibleTasks } from "@/lib/auth/visibility";
 import {
   selectedProviderName,
   type RetrievalProvider,
@@ -10,6 +11,9 @@ import {
 } from "./provider";
 import { externalProvider } from "./external-provider";
 import { denseSearch, fuseByRrf } from "./dense-search";
+import { rankedFtsSearch } from "./fts-search";
+import { analyzeTermSpecificity } from "./grounding";
+import { taskStatusCounts, matchingDecisions } from "./structured-extras";
 
 // Types live in ./provider (the pluggable seam). Re-exported here so existing importers
 // (lib/query/claude, tests, …) keep importing them from "@/lib/query/retrieve" unchanged.
@@ -120,7 +124,7 @@ const GRAPH_FACTS_LIMIT = Number(process.env.GRAPH_QUERY_FACTS ?? 12);
 const GRAPH_QUERY_TIMEOUT_MS = Number(process.env.GRAPH_QUERY_TIMEOUT_MS ?? 4000);
 
 async function fetchGraphFacts(
-  supabase: SupabaseClient,
+  db: DbClient,
   teamId: string,
   tier: "team" | "external",
   question: string
@@ -128,7 +132,7 @@ async function fetchGraphFacts(
   const client = new GraphitiClient({ timeoutMs: GRAPH_QUERY_TIMEOUT_MS });
   if (!client.configured) return [];
   try {
-    const { data: team } = await supabase.from("teams").select("slug").eq("id", teamId).maybeSingle();
+    const { data: team } = await db.from("teams").select("slug").eq("id", teamId).maybeSingle();
     const slug = (team as { slug: string } | null)?.slug;
     if (!slug) return [];
     const groupIds = visibleGroupIds(slug, tier);
@@ -147,7 +151,29 @@ const FTS_STOP = new Set([
   "did", "do", "does", "has", "have", "had", "with", "about", "from", "by", "our", "we", "you",
   "i", "me", "my", "your", "their", "this", "that", "these", "those", "it", "its", "as", "at",
   "any", "all", "can", "could", "would", "should", "tell", "show", "give", "list", "get",
+  // Temporal/recency deictics: query INTENT, not content — they never match usefully as keywords
+  // and (df≈0) would otherwise poison the grounding signal (Gap #3). Recency is handled by the
+  // recency fallback + activity digests, not by matching the literal word.
+  "latest", "recent", "recently", "lately", "today", "yesterday", "tomorrow", "currently", "now", "soon", "upcoming",
 ]);
+
+/**
+ * Is this raw token (original case preserved) worth searching on?
+ *   • never a stopword
+ *   • ≥3 chars → yes
+ *   • exactly 2 chars → only if it's a version/product token with a digit (v2, s3, k8) OR an
+ *     acronym the user upper-cased (CI, QA, PR, DB) — NOT a lowercase common word (us, up, so, no).
+ *   • 1 char → no (single letters are noise)
+ * The 2-char rule is the fix for eng-heavy channels where CI/QA/PR/S3 are the load-bearing terms;
+ * dropping them (the old `length >= 3` filter) meant a query ABOUT them searched on filler words.
+ */
+function isSignificantTerm(original: string): boolean {
+  const t = original.toLowerCase();
+  if (FTS_STOP.has(t)) return false;
+  if (t.length >= 3) return true;
+  if (t.length === 2) return /\d/.test(t) || original === original.toUpperCase();
+  return false;
+}
 
 /**
  * Build a recall-friendly FTS query: significant terms OR-joined. `websearch_to_tsquery` treats the
@@ -155,12 +181,37 @@ const FTS_STOP = new Set([
  * filters relevance) instead of requiring ALL of them. Falls back to the raw question when nothing
  * significant remains. (Ranked/semantic retrieval — pgvector — is the durable fix at larger scale.)
  */
+export function significantTerms(question: string): string[] {
+  // Match on the ORIGINAL (case preserved) so `isSignificantTerm` can tell an upper-cased acronym
+  // (CI) from a lowercase common word (us); lowercase only after the keep/drop decision. De-duped.
+  const terms = (question.match(/[A-Za-z0-9][A-Za-z0-9'-]*/g) ?? [])
+    .filter(isSignificantTerm)
+    .map((t) => t.toLowerCase());
+  return [...new Set(terms)];
+}
+
 export function toOrQuery(question: string): string {
-  const terms = (question.toLowerCase().match(/[a-z0-9][a-z0-9'-]*/g) ?? []).filter(
-    (t) => t.length >= 3 && !FTS_STOP.has(t)
-  );
-  const unique = [...new Set(terms)];
+  const unique = significantTerms(question);
   return unique.length ? unique.join(" or ") : question;
+}
+
+/**
+ * Detect an EXPLICIT channel scope in the question and strip it (Gap #4). Conservative on purpose —
+ * only `#channel` (Slack style) or "in/on/from [the] X channel" qualify, so "the sales pipeline"
+ * (no literal "channel") never wrongly scopes. Returns the lowercased channel name (matched against
+ * a path's 2nd segment `<source>/<name>/…` in retrieval) and the question with the scope phrase
+ * removed, so the channel word doesn't also leak in as a content search term. Pure + unit-tested.
+ */
+export function parseChannelScope(question: string): { channel: string | null; cleaned: string } {
+  const hash = question.match(/#([a-z0-9][a-z0-9_-]{1,40})\b/i);
+  if (hash) {
+    return { channel: hash[1].toLowerCase(), cleaned: question.replace(hash[0], " ").replace(/\s{2,}/g, " ").trim() };
+  }
+  const phrase = question.match(/\b(?:in|on|from|to)\s+(?:the\s+)?([a-z0-9][a-z0-9_-]{1,40})\s+channel\b/i);
+  if (phrase) {
+    return { channel: phrase[1].toLowerCase(), cleaned: question.replace(phrase[0], " ").replace(/\s{2,}/g, " ").trim() };
+  }
+  return { channel: null, cleaned: question };
 }
 
 const MAX_EXPANSION_TERMS = 24;
@@ -176,8 +227,8 @@ const MAX_EXPANSION_TERMS = 24;
 export function graphExpansionQuery(facts: GraphFact[]): string {
   const terms = new Set<string>();
   const add = (s: string | undefined | null) => {
-    for (const w of (s ?? "").toLowerCase().match(/[a-z0-9][a-z0-9'-]*/g) ?? []) {
-      if (w.length >= 3 && !FTS_STOP.has(w)) terms.add(w);
+    for (const w of (s ?? "").match(/[A-Za-z0-9][A-Za-z0-9'-]*/g) ?? []) {
+      if (isSignificantTerm(w)) terms.add(w.toLowerCase());
     }
   };
   for (const f of facts) {
@@ -209,9 +260,9 @@ export function wantsActivityContext(question: string): boolean {
  * member display name in here. **team-tier only** — code/contributor activity is internal, never
  * shown to an external viewer (CLAUDE.md §5). Returns "" when there's no recent activity.
  */
-async function gitActivityDigest(supabase: SupabaseClient, teamId: string): Promise<string> {
+async function gitActivityDigest(db: DbClient, teamId: string): Promise<string> {
   const since = new Date(Date.now() - GIT_WINDOW_DAYS * 86_400_000).toISOString().slice(0, 10);
-  const { data: contribs } = await supabase
+  const { data: contribs } = await db
     .from("code_contributions")
     .select("codebase_id, member_id, author_name, author_email, commits, ai_commits, additions, deletions, day")
     .eq("team_id", teamId)
@@ -220,9 +271,9 @@ async function gitActivityDigest(supabase: SupabaseClient, teamId: string): Prom
     .limit(2000);
   if (!contribs?.length) return "";
 
-  const { data: members } = await supabase.from("members").select("id, display_name").eq("team_id", teamId);
+  const { data: members } = await db.from("members").select("id, display_name").eq("team_id", teamId);
   const nameById = new Map((members ?? []).map((m) => [(m as { id: string }).id, (m as { display_name: string }).display_name]));
-  const { data: cbs } = await supabase.from("codebases").select("id, slug").eq("team_id", teamId);
+  const { data: cbs } = await db.from("codebases").select("id, slug").eq("team_id", teamId);
   const slugById = new Map((cbs ?? []).map((c) => [(c as { id: string }).id, (c as { slug: string }).slug]));
 
   type Agg = { name: string; email: string; commits: number; ai: number; adds: number; dels: number; repos: Set<string>; lastDay: string };
@@ -258,13 +309,13 @@ async function gitActivityDigest(supabase: SupabaseClient, teamId: string): Prom
  * Per-person cross-tool activity digest from attributed `items` — the payoff of the identity work:
  * once Slack threads / Linear+Plane issues / docs carry the author's `member_id`, "what is each
  * person doing" is answerable beyond git. Counts each person's recent items by source (Slack/PM/docs),
- * EXCLUDING `git` (the git digest above covers code) and connector members (their `@connector.local`
- * email). **team-tier only** — internal activity, never shown to an external viewer. Returns "" when
+ * EXCLUDING `git` (the git digest above covers code) and connector members (`is_connector`).
+ * **team-tier only** — internal activity, never shown to an external viewer. Returns "" when
  * there's nothing attributed.
  */
-async function peopleActivityDigest(supabase: SupabaseClient, teamId: string): Promise<string> {
+async function peopleActivityDigest(db: DbClient, teamId: string): Promise<string> {
   const since = new Date(Date.now() - PEOPLE_WINDOW_DAYS * 86_400_000).toISOString();
-  const { data: items } = await supabase
+  const { data: items } = await db
     .from("items")
     .select("member_id, kind, frontmatter, synced_at")
     .eq("team_id", teamId)
@@ -273,18 +324,18 @@ async function peopleActivityDigest(supabase: SupabaseClient, teamId: string): P
     .limit(5000);
   if (!items?.length) return "";
 
-  const { data: members } = await supabase
+  const { data: members } = await db
     .from("members")
-    .select("id, display_name, email")
+    .select("id, display_name, email, is_connector")
     .eq("team_id", teamId);
   const memById = new Map(
     (members ?? []).map((m) => {
-      const r = m as { id: string; display_name: string; email: string };
-      return [r.id, { name: r.display_name, email: r.email }];
+      const r = m as { id: string; display_name: string; email: string; is_connector: boolean };
+      return [r.id, { name: r.display_name, email: r.email, isConnector: r.is_connector }];
     })
   );
-  // Connector members (slack-sync@connector.local, …) author the unattributed remainder — skip them.
-  const isConnector = (id: string) => (memById.get(id)?.email ?? "").endsWith("@connector.local");
+  // Connector members author the unattributed remainder — skip them.
+  const isConnector = (id: string) => memById.get(id)?.isConnector === true;
 
   type Agg = { name: string; email: string; bySource: Map<string, number>; last: string };
   const byPerson = new Map<string, Agg>();
@@ -326,44 +377,57 @@ async function peopleActivityDigest(supabase: SupabaseClient, teamId: string): P
  * queries run in parallel; all respect the caller's tier.
  */
 async function nativeRetrieve(
-  supabase: SupabaseClient,
+  db: DbClient,
   teamId: string,
   tier: "team" | "external",
   question: string,
   projectSlug?: string | null
 ): Promise<RetrievedContext> {
+  // Channel scope (Gap #4): if the question names a channel ("#eng" / "in the sales channel"), scope
+  // item retrieval to it and strip the phrase so the channel word isn't also a content search term.
+  const { channel, cleaned } = parseChannelScope(question);
+  const q = channel ? cleaned : question;
+
   // Kick off the Graphiti graph-memory search concurrently with Postgres retrieval.
-  const graphFactsP = fetchGraphFacts(supabase, teamId, tier, question);
+  const graphFactsP = fetchGraphFacts(db, teamId, tier, q);
   // Optional dense (semantic) passage search — pgvector. Runs concurrently; resolves to [] unless
   // EMBEDDINGS_URL is set AND the pgvector schema is loaded (default installs stay pure-FTS).
-  const denseP = denseSearch(teamId, tier, question, projectSlug);
+  const denseP = denseSearch(teamId, tier, q, projectSlug);
   // Git-activity + per-person activity digests (team tier only — internal) run in parallel too.
   // Context shaping: the activity digests are heavy + only relevant to "who's doing what" questions.
-  const wantsActivity = tier === "team" && wantsActivityContext(question);
-  const gitDigestP = wantsActivity ? gitActivityDigest(supabase, teamId) : Promise.resolve("");
-  const peopleDigestP = wantsActivity ? peopleActivityDigest(supabase, teamId) : Promise.resolve("");
+  const wantsActivity = tier === "team" && wantsActivityContext(q);
+  const gitDigestP = wantsActivity ? gitActivityDigest(db, teamId) : Promise.resolve("");
+  const peopleDigestP = wantsActivity ? peopleActivityDigest(db, teamId) : Promise.resolve("");
 
   // All independent retrieval queries run in PARALLEL (was sequential → ~7 serial round-trips).
-  // 1. Recall-friendly FTS over items (OR of significant terms; see toOrQuery).
-  let ftsB = supabase
-    .from("items")
-    .select("id, path, kind, body, synced_at, projects(slug)")
-    .eq("team_id", teamId)
-    .textSearch("search", toOrQuery(question), { type: "websearch", config: "english" })
-    .limit(20);
-  if (tier === "external") ftsB = ftsB.eq("access", "external");
+  // 1. Recall-friendly, RANKED FTS over items (OR of significant terms; see toOrQuery). Ordered by
+  //    ts_rank so the capped top-20 is the most relevant 20, not an arbitrary 20 (Gap #2). Raw SQL
+  //    (fts-search) because the builder emits an unordered `@@` filter.
+  const terms = significantTerms(q);
+  const orQuery = terms.length ? terms.join(" or ") : q;
+  const ftsP = rankedFtsSearch(teamId, tier, orQuery, 20, channel);
+  // Grounding specificity (Gap #3) — runs concurrently; combined with hadFtsHit below.
+  const specificityP = analyzeTermSpecificity(teamId, tier, terms);
+  // Structured-context scaling (Gaps #5/#6): a FULL-corpus task count (aggregates survive the 80-row
+  // cap) + a keyword search over ALL decisions (an old-but-relevant decision survives the 50-row
+  // recency window). Both run concurrently; folded into the structured block below.
+  const taskCountsP = taskStatusCounts(teamId, tier);
+  const matchedDecisionsP = terms.length ? matchingDecisions(teamId, tier, orQuery, 10) : Promise.resolve([]);
 
   // 2. Recency: most recent items (a fallback so fresh content always has a shot).
-  let recentB = supabase
+  let recentB = db
     .from("items")
     .select("id, path, kind, body, synced_at, projects(slug)")
     .eq("team_id", teamId)
     .order("synced_at", { ascending: false })
     .limit(8);
   if (tier === "external") recentB = recentB.eq("access", "external");
+  // Channel scope (Gap #4) — keep the recency fallback inside the same channel. LIKE on the 2nd
+  // path segment; the FTS leg uses a precise split_part match, this soft filter is fine for padding.
+  if (channel) recentB = recentB.like("path", `%/${channel}/%`);
 
   // 3. Structured-context query builders (awaited together with the above).
-  let decisionsB = supabase
+  let decisionsB = db
     .from("decisions")
     .select("row_key, decided_at, title, decided_by, still_valid, projects(slug)")
     .eq("team_id", teamId)
@@ -374,33 +438,51 @@ async function nativeRetrieve(
   // can ground on finished tasks. `tasks.updated_at` is bumped on every sync upsert (incl. a
   // status→done transition), so recency ordering surfaces today's completions. (Was active-only:
   // `in_progress/blocked/ready`, which structurally hid every completion from the brain.)
-  const tasksB = supabase
-    .from("tasks")
-    .select("row_key, title, assignee, status, sprint, updated_at, projects(slug)")
-    .eq("team_id", teamId)
-    .order("updated_at", { ascending: false })
-    .limit(80);
-  const commitmentsB = supabase
-    .from("graph_entities")
-    .select("entity_id, name, attrs")
-    .eq("team_id", teamId)
-    .eq("entity_type", "commitment")
-    .limit(30);
-  const relsB = supabase
-    .from("graph_relationships")
-    .select("from_id, to_id, relationship_type")
-    .eq("team_id", teamId)
-    .in("relationship_type", ["REPORTS_TO", "OWNS", "BLOCKS"])
-    .limit(80);
-  const actorsB = supabase
-    .from("graph_entities")
-    .select("entity_id, name, attrs")
-    .eq("team_id", teamId)
-    .eq("entity_type", "actor")
-    .limit(40);
+  // Tasks carry `audience` (audit H1); an external principal sees only external-tier tasks. Without
+  // this filter the external query context leaked every internal task board.
+  const tasksB = visibleTasks(
+    db
+      .from("tasks")
+      .select("row_key, title, assignee, status, sprint, updated_at, projects(slug)")
+      .eq("team_id", teamId)
+      .order("updated_at", { ascending: false })
+      .limit(80),
+    tier
+  );
+  // graph_entities / graph_relationships carry NO tier column, so they can't be audience-filtered.
+  // For an external principal we therefore omit them entirely (audit H1) rather than risk leaking
+  // internal commitments/actors/reporting lines. `emptyRows` resolves to the same `{ data }` shape.
+  const emptyRows = Promise.resolve({ data: [] as unknown[] });
+  const commitmentsB =
+    tier === "external"
+      ? emptyRows
+      : db
+          .from("graph_entities")
+          .select("entity_id, name, attrs")
+          .eq("team_id", teamId)
+          .eq("entity_type", "commitment")
+          .limit(30);
+  const relsB =
+    tier === "external"
+      ? emptyRows
+      : db
+          .from("graph_relationships")
+          .select("from_id, to_id, relationship_type")
+          .eq("team_id", teamId)
+          .in("relationship_type", ["REPORTS_TO", "OWNS", "BLOCKS"])
+          .limit(80);
+  const actorsB =
+    tier === "external"
+      ? emptyRows
+      : db
+          .from("graph_entities")
+          .select("entity_id, name, attrs")
+          .eq("team_id", teamId)
+          .eq("entity_type", "actor")
+          .limit(40);
 
   const [
-    { data: ftsHits },
+    ftsHits,
     { data: recentHits },
     { data: decisions },
     { data: tasks },
@@ -409,7 +491,7 @@ async function nativeRetrieve(
     { data: actors },
     augmented,
   ] = await Promise.all([
-    ftsB,
+    ftsP,
     recentB,
     decisionsB,
     tasksB,
@@ -419,23 +501,30 @@ async function nativeRetrieve(
     fetchAugmentedSources(question, tier),
   ]);
 
-  // Merge, dedupe by id, cap sizes
+  // Merge, dedupe by id, cap sizes. Ranked FTS hits (already ordered by relevance) come first, then
+  // recency padding. Normalize the two row shapes (FTS carries `project` as a slug string; the
+  // recency builder embeds `projects(slug)`).
+  type MergeHit = { id: string; path: string; kind: string; body: string; synced_at: string; slug: string };
+  const iso = (v: string | Date): string => (v instanceof Date ? v.toISOString() : String(v ?? ""));
+  const rankedHits: MergeHit[] = ftsHits.map((h) => ({ id: h.id, path: h.path, kind: h.kind, body: h.body, synced_at: h.synced_at, slug: h.project }));
+  const recencyHits: MergeHit[] = ((recentHits ?? []) as { id: string; path: string; kind: string; body: string | null; synced_at: string | Date; projects: unknown }[]).map(
+    (h) => ({ id: h.id, path: h.path, kind: h.kind, body: h.body ?? "", synced_at: iso(h.synced_at), slug: (h.projects as { slug: string })?.slug ?? "" })
+  );
   const seen = new Set<string>();
   const sources: Source[] = [];
   let total = 0;
   let n = 1;
-  for (const hit of [...(ftsHits ?? []), ...(recentHits ?? [])]) {
+  for (const hit of [...rankedHits, ...recencyHits]) {
     if (seen.has(hit.id)) continue;
     seen.add(hit.id);
-    const slug = (hit.projects as unknown as { slug: string })?.slug ?? "";
-    if (projectSlug && slug !== projectSlug) continue;
+    if (projectSlug && hit.slug !== projectSlug) continue;
     const text = (hit.body || "").slice(0, MAX_SOURCE_CHARS);
     if (total + text.length > MAX_TOTAL_CHARS) break;
     total += text.length;
     sources.push({
       sid: `S${n++}`,
       item_id: hit.id,
-      project: slug,
+      project: hit.slug,
       path: hit.path,
       kind: hit.kind,
       synced_at: hit.synced_at,
@@ -466,10 +555,14 @@ async function nativeRetrieve(
     });
   }
 
-  // Grounding signal (stay-quiet): did query-specific SEARCH match anything, or are the sources just
-  // recency padding? FTS/semantic hits = real grounding; if both are empty the answer layer is told
-  // retrieval found no strong match so it abstains instead of confabulating from recent items.
-  let grounded = (ftsHits?.length ?? 0) > 0;
+  // Grounding signal (stay-quiet): is there query-SPECIFIC evidence, or are the sources just recency
+  // padding / an incidental common-word match? (Gap #3.) A specific (rare) term that actually matches
+  // → grounded. If every query term is corpus-common, fall back to "any FTS hit" (don't over-abstain
+  // on legit common-word queries). Otherwise — specific terms that match nothing + incidental common
+  // words — NOT grounded, so the answer layer abstains instead of confabulating.
+  const hadFtsHit = ftsHits.length > 0;
+  const spec = await specificityP;
+  let grounded = spec.specificMatching ? true : spec.allCommon ? hadFtsHit : false;
 
   // 2c. Semantic expansion via Graphiti (the graph search ran in parallel above). Use the facts'
   // entity/relationship terms to expand the FTS and surface items the literal keyword search missed.
@@ -477,24 +570,16 @@ async function nativeRetrieve(
   const graphFacts = await graphFactsP;
   const expansion = graphExpansionQuery(graphFacts);
   if (expansion) {
-    let semB = supabase
-      .from("items")
-      .select("id, path, kind, body, synced_at, projects(slug)")
-      .eq("team_id", teamId)
-      .textSearch("search", expansion, { type: "websearch", config: "english" })
-      .limit(10);
-    if (tier === "external") semB = semB.eq("access", "external");
-    const { data: semHits } = await semB;
-    if ((semHits?.length ?? 0) > 0) grounded = true;
-    for (const hit of (semHits ?? []) as { id: string; path: string; kind: string; body: string; synced_at: string; projects: unknown }[]) {
+    const semHits = await rankedFtsSearch(teamId, tier, expansion, 10, channel);
+    if (semHits.length > 0) grounded = true;
+    for (const hit of semHits) {
       if (seen.has(hit.id)) continue;
       seen.add(hit.id);
-      const slug = (hit.projects as { slug: string })?.slug ?? "";
-      if (projectSlug && slug !== projectSlug) continue;
+      if (projectSlug && hit.project !== projectSlug) continue;
       const text = (hit.body || "").slice(0, MAX_SOURCE_CHARS);
       if (total + text.length > MAX_TOTAL_CHARS) break;
       total += text.length;
-      sources.push({ sid: `S${n++}`, item_id: hit.id, project: slug, path: hit.path, kind: hit.kind, synced_at: hit.synced_at, text });
+      sources.push({ sid: `S${n++}`, item_id: hit.id, project: hit.project, path: hit.path, kind: hit.kind, synced_at: hit.synced_at, text });
     }
   }
 
@@ -526,19 +611,40 @@ async function nativeRetrieve(
     }
     orderedSources = fuseByRrf(
       sources,
-      (ftsHits ?? []).map((h) => (h as { id: string }).id),
+      ftsHits.map((h) => h.id),
       denseHits.map((h) => h.item_id)
     );
   }
 
   // 3. Structured context (compact, always included) — built from the parallel results above.
-  const [gitDigest, peopleDigest] = await Promise.all([gitDigestP, peopleDigestP]);
+  const [gitDigest, peopleDigest, taskCounts, matchedDecisions] = await Promise.all([
+    gitDigestP,
+    peopleDigestP,
+    taskCountsP,
+    matchedDecisionsP,
+  ]);
+
+  // Decisions: the recency-50 window PLUS any keyword-matched decision that scrolled past it (Gap #6),
+  // deduped by row_key. Recency rows first (fresh context), then the older matches under their own note.
+  type DecisionLine = { row_key: string; decided_at: string | null; title: string; decided_by: string; still_valid: boolean; slug: string };
+  const recencyDecisions: DecisionLine[] = (decisions ?? []).map((d) => ({
+    row_key: d.row_key as string,
+    decided_at: (d.decided_at as string | null) ?? null,
+    title: d.title as string,
+    decided_by: d.decided_by as string,
+    still_valid: d.still_valid as boolean,
+    slug: (d.projects as unknown as { slug: string })?.slug ?? "",
+  }));
+  const recencyKeys = new Set(recencyDecisions.map((d) => d.row_key));
+  const olderMatches = matchedDecisions.filter((d) => !recencyKeys.has(d.row_key));
+  const fmtDecision = (d: DecisionLine) =>
+    `- #${d.row_key} (${d.decided_at ?? "?"}, ${d.slug}) ${d.title} — by ${d.decided_by}${d.still_valid ? "" : " [SUPERSEDED]"}`;
+
   const structured = [
+    `## Task counts (all ${taskCounts.total} tasks: ${taskCounts.open} open, ${taskCounts.byStatus.done ?? 0} done)`,
     "## Recent decisions (newest first)",
-    ...(decisions ?? []).map(
-      (d) =>
-        `- #${d.row_key} (${d.decided_at ?? "?"}, ${(d.projects as unknown as { slug: string })?.slug}) ${d.title} — by ${d.decided_by}${d.still_valid ? "" : " [SUPERSEDED]"}`
-    ),
+    ...recencyDecisions.map(fmtDecision),
+    ...(olderMatches.length ? ["", "## Older decisions matching this query", ...olderMatches.map(fmtDecision)] : []),
     "",
     "## Tasks (all statuses, most recently updated first)",
     ...(tasks ?? []).map((t) => {
@@ -554,9 +660,9 @@ async function nativeRetrieve(
     ),
     "",
     "## Actors (graph)",
-    ...(actors ?? []).map(
-      (a) => `- ${a.entity_id}: ${a.name} (${(a.attrs as Record<string, unknown>)?.role ?? ""})`
-    ),
+    ...(actors ?? [])
+      .filter((a) => (a.attrs as { status?: string } | null)?.status !== "disabled")
+      .map((a) => `- ${a.entity_id}: ${a.name} (${(a.attrs as Record<string, unknown>)?.role ?? ""})`),
     "",
     "## Key relationships",
     ...(rels ?? []).map((r) => `- ${r.from_id} ${r.relationship_type} ${r.to_id}`),
@@ -592,7 +698,7 @@ async function nativeRetrieve(
  */
 export const nativeProvider: RetrievalProvider = {
   name: "native",
-  retrieve: (r) => nativeRetrieve(r.supabase, r.teamId, r.tier, r.question, r.projectSlug),
+  retrieve: (r) => nativeRetrieve(r.db, r.teamId, r.tier, r.question, r.projectSlug),
 };
 
 /**
@@ -601,12 +707,12 @@ export const nativeProvider: RetrievalProvider = {
  * swapping the whole context layer for gbrain/another is `CONTEXT_PROVIDER=external` + an adapter.
  */
 export async function retrieve(
-  supabase: SupabaseClient,
+  db: DbClient,
   teamId: string,
   tier: "team" | "external",
   question: string,
   projectSlug?: string | null
 ): Promise<RetrievedContext> {
   const provider = selectedProviderName() === "external" ? externalProvider : nativeProvider;
-  return provider.retrieve({ supabase, teamId, tier, question, projectSlug: projectSlug ?? null });
+  return provider.retrieve({ db, teamId, tier, question, projectSlug: projectSlug ?? null });
 }

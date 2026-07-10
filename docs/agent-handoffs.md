@@ -1,15 +1,26 @@
 # AIOS — Parallel Agent Handoff Prompts
 
+> **Status:** Wave 1 (`F3`–`F5`, `W1.1`–`W1.4`) below has shipped and merged; the prompts are kept
+> as a worked template for how to structure a parallel-agent handoff. PM tracking has moved from
+> Plane to **Linear** (Plane remains a supported provider, just not AIOS's default — see
+> `docs/ARCHITECTURE.md` "PM tool decision (resolved)"); the tracking instructions below reflect that. Wave 2 (`W2.*`) was **superseded 2026-06-29** by the
+> V1.0 Operator Loop roadmap — see the note under "Parallelization waves".
+
 Each prompt below is **self-contained**: copy one verbatim into a **fresh Claude Code session**.
 Every agent works in its **own git worktree** off `origin/main` (never the primary checkout) and
-tracks its progress on the **Plane** board (AIOS project) via the Plane MCP — that's the workflow
-we're testing.
+tracks its progress in **Linear** (the canonical PM tool; the brain-tasks CLI is the brain→Linear
+projection path) — that's the workflow we're testing.
 
 ## Parallelization waves (respect dependencies)
 - **Wave A — start in parallel now (no cross-deps):** `F3`, `W1.1`, `W1.2`, `W1.4`
 - **Wave B — after `F3` merges:** `F4`, `F5`
 - **Wave C — after `F5` merges:** `W1.3`
-- Wave 2 epics (`W2.*`) come after Wave 1; generate their prompts the same way.
+- **Wave 2** (`W2.*`: external AI cost, Slack bidirectional, Wise finance, PM bake-off, Pencil
+  design, connector rename) was **superseded 2026-06-29** by the V1.0 Operator Loop roadmap — do
+  not generate new prompts from this template for it. `W2.4` (the Plane-vs-Linear PM bake-off) did
+  complete before the supersession — Linear was chosen as the canonical PM tool (see
+  `docs/ARCHITECTURE.md` "PM tool decision (resolved)"). Current work is tracked in Linear; see
+  `aios-workspace/docs/v1-operator-loop/` for the V1.0 roadmap that superseded Wave 2.
 
 ## Shared caveats for parallel runs
 - **Worktrees:** name each uniquely — `../aios-team-brain-<epic>` (e.g. `-f3`, `-w1.1`).
@@ -18,7 +29,9 @@ we're testing.
   `npm run test:datamechanics:local`, or (b) give an agent its own DB:
   `docker compose -f compose.test.yml -p <epic> up -d` on a different port. Data-mechanics tests seed
   random team ids, so they don't collide once the schema is loaded — only the reset step is destructive.
-- **Plane MCP** must be connected (user-scope `plane` server). If `/mcp` doesn't list it, restart the session.
+- **Linear** is AIOS's default PM tool (Plane remains a supported provider, just not AIOS's
+  default). Track **AIOS's own** work via the brain-tasks CLI (brain→Linear projection) — do not use
+  the Plane MCP for AIOS-internal tracking.
 - Some `F3` scaffolding (encrypted-secret storage in `lib/integrations/manage.ts`) may already exist on
   `main` — **read main first and reconcile**, don't blindly recreate.
 
@@ -37,10 +50,10 @@ we're testing.
 > cd ../aios-team-brain-<epic>
 > ln -sfn ~/Projects/aios/aios-team-brain/node_modules node_modules
 > ```
-> **Plane tracking (workspace `aios-alpha`, project `AIOS`, via the Plane MCP):** find the epic and its
-> sub-issues; assign the epic and sub-issues to yourself; move the epic to **In Progress** when you
-> start; move each sub-issue to **Done** as you finish it; when you open the PR, **comment the PR URL
-> on the epic** and move it to In Review/Done.
+> **Linear tracking (brain-tasks CLI, brain→Linear projection):** find the issue and its sub-issues;
+> assign them to yourself; move the issue to **In Progress** when you start; move each sub-issue to
+> **Done** as you finish it; when you open the PR, **reference the issue key** in the PR body (see
+> `.github/pull_request_template.md`) so `aios-work-sync` closes it on merge.
 > **Engineering rules:** spec-first **red** tests (unit = parse/guards; data-mechanics = persistence/tier;
 > over a real DB); **single-writer + build-failing guard** for any new write surface; **tier/role
 > isolation is app-code only** (no RLS on postgres) — add a scoped read helper + guard test per new table;
@@ -64,7 +77,7 @@ Set up your worktree:
   cd ../aios-team-brain-f3
   ln -sfn ~/Projects/aios/aios-team-brain/node_modules node_modules
 
-Track progress in Plane via the Plane MCP (workspace aios-alpha, project AIOS): find epic "F3 — Integrations auth surfaces + contract bump" and its sub-issues (F3.1–F3.4). Assign the epic and sub-issues to yourself. Move the epic to In Progress now; move each sub-issue to Done as you complete it; comment the PR URL on the epic when you open it.
+Track progress in Linear (brain-tasks CLI, brain→Linear projection): find issue "F3 — Integrations auth surfaces + contract bump" and its sub-issues (F3.1–F3.4). Assign them to yourself. Move the issue to In Progress now; move each sub-issue to Done as you complete it; reference the issue key in the PR body so aios-work-sync closes it on merge.
 
 OBJECTIVE: give the integrations framework two auth surfaces WITHOUT touching the pinned /api/v1 write contract. Note: lib/integrations/manage.ts already exists (single writer + config validation) and may already have encrypted-secret storage — read it on main first and reconcile; do not duplicate.
 
@@ -76,7 +89,7 @@ SCOPE (sub-issues):
 
 CONSTRAINTS: single-writer stays lib/integrations/manage.ts; tier/role isolation is app-code (no RLS); secret-like keys must never appear in non-secret selections.
 
-VERIFY: npx tsc --noEmit; npm run lint; npm test; npm run check:docs; npm run db:test:up && npm run test:datamechanics:local. Then open a PR from feat/f3-integrations-auth against main and comment the link on the Plane epic.
+VERIFY: npx tsc --noEmit; npm run lint; npm test; npm run check:docs; npm run db:test:up && npm run test:datamechanics:local. Then open a PR from feat/f3-integrations-auth against main referencing the Linear issue key.
 ```
 
 ## F4 — Sidecar consumes selections  (Wave B — after F3 merges)
@@ -91,7 +104,7 @@ Worktree:
   cd ../aios-team-brain-f4
   ln -sfn ~/Projects/aios/aios-team-brain/node_modules node_modules
 
-Plane: epic "F4 — Sidecar consumes selections" (F4.1–F4.3). Assign the epic and sub-issues to yourself. Epic → In Progress; sub-issues → Done as completed; comment PR on the epic.
+Linear: issue "F4 — Sidecar consumes selections" (F4.1–F4.3). Assign them to yourself. Issue → In Progress; sub-issues → Done as completed; reference the issue key in the PR body.
 
 OBJECTIVE: close the "table does nothing" gap — the ingestion engine fetches brain-side NON-SECRET selections and merges them with LOCAL secrets.
 SCOPE:
@@ -99,7 +112,7 @@ SCOPE:
 - F4.2 connections.yaml.example note + docs. Backward-compatible: if selection-fetch isn't configured, behave exactly as today.
 - F4.3 Python tests: merge precedence + the backward-compat (unconfigured) path.
 
-VERIFY: run the ingestion Python tests; npm run check:docs if you touch ARCHITECTURE. PR from feat/f4-sidecar-selections → main; comment on the Plane epic.
+VERIFY: run the ingestion Python tests; npm run check:docs if you touch ARCHITECTURE. PR from feat/f4-sidecar-selections → main referencing the Linear issue key.
 ```
 
 ## F5 — Admin Integrations UI + tier guards  (Wave B — after F3 merges)
@@ -114,17 +127,17 @@ Worktree:
   cd ../aios-team-brain-f5
   ln -sfn ~/Projects/aios/aios-team-brain/node_modules node_modules
 
-Plane: epic "F5 — Admin Integrations UI + tier guards" (F5.1–F5.5). Assign the epic and sub-issues to yourself. Epic → In Progress; sub-issues → Done; comment PR.
+Linear: issue "F5 — Admin Integrations UI + tier guards" (F5.1–F5.5). Assign them to yourself. Issue → In Progress; sub-issues → Done; reference the issue key in the PR body.
 
 OBJECTIVE: admin-gated Integrations surface + per-table tier/role guards (NO RLS backstop on postgres).
 SCOPE:
 - F5.1 Add {slug:"integrations",label:"Integrations"} to components/admin/admin-tabs.tsx + app/t/[team]/admin/integrations/page.tsx (inherits the admin-only gate). Calls the F3 server action to create/enable/disable integrations.
 - F5.2 lib/integrations/read.ts — role/tier-scoped reads for the surface.
 - F5.3 test/guards/integrations-tier-filter.test.ts modeled on codebases-tier-filter.test.ts (non-vacuous).
-- F5.4 Under DB_BACKEND=supabase: the surface fails closed with a "not available on legacy backend" notice (integrations is postgres-only).
+- F5.4 The Integrations surface works against the Postgres backend (the only backend); no legacy-backend gating.
 - F5.5 Data-mechanics: integrations persist; an external-tier viewer cannot read admin config.
 
-VERIFY: npx tsc --noEmit; npm run lint; npm test; npm run check:docs; npm run db:test:up && npm run test:datamechanics:local. PR from feat/f5-integrations-ui → main; comment on the Plane epic.
+VERIFY: npx tsc --noEmit; npm run lint; npm test; npm run check:docs; npm run db:test:up && npm run test:datamechanics:local. PR from feat/f5-integrations-ui → main referencing the Linear issue key.
 ```
 
 ## W1.1 — Granola → decisions (sanitized, consented)  (Wave A)
@@ -139,7 +152,7 @@ Worktree:
   cd ../aios-team-brain-w1.1
   ln -sfn ~/Projects/aios/aios-team-brain/node_modules node_modules
 
-Plane: epic "W1.1 — Granola → decisions (sanitized, consented)" (W1.1.1–W1.1.5). Assign the epic and sub-issues to yourself. Epic → In Progress; sub-issues → Done; comment PR.
+Linear: issue "W1.1 — Granola → decisions (sanitized, consented)" (W1.1.1–W1.1.5). Assign them to yourself. Issue → In Progress; sub-issues → Done; reference the issue key in the PR body.
 
 OBJECTIVE: ingest Granola meetings as DECISION ROWS ONLY — NO verbatim transcript synced team-tier. Privacy is the point.
 SCOPE:
@@ -149,7 +162,7 @@ SCOPE:
 - W1.1.4 Wire the transcript-decisions workflow: extract candidate decisions → HUMAN review → append to decision-log.md → aios push → materializeDecisions (lib/ingest) → decisions table.
 - W1.1.5 Python tests: registry wiring + normalize + MOCKED API pagination/rate-limit.
 
-VERIFY: ingestion Python tests; npm run check:docs (drift:sources). PR from feat/w1.1-granola → main; comment on the Plane epic.
+VERIFY: ingestion Python tests; npm run check:docs (drift:sources). PR from feat/w1.1-granola → main referencing the Linear issue key.
 ```
 
 ## W1.2 — Token + cost per member (brain spend)  (Wave A)
@@ -164,7 +177,7 @@ Worktree:
   cd ../aios-team-brain-w1.2
   ln -sfn ~/Projects/aios/aios-team-brain/node_modules node_modules
 
-Plane: epic "W1.2 — Token + cost per member (brain spend)" (W1.2.1–W1.2.4). Assign the epic and sub-issues to yourself. Epic → In Progress; sub-issues → Done; comment PR.
+Linear: issue "W1.2 — Token + cost per member (brain spend)" (W1.2.1–W1.2.4). Assign them to yourself. Issue → In Progress; sub-issues → Done; reference the issue key in the PR body.
 
 OBJECTIVE: per-member LLM cost from query_log (brain spend only; external providers are Wave 2).
 SCOPE:
@@ -173,7 +186,7 @@ SCOPE:
 - W1.2.3 Throughput-vs-cost: join code_contributions (mapped via lib/identity/resolve.ts) × query_log spend → "$ per AI commit / per contributor".
 - W1.2.4 Tier/role guard test + a data-mechanics aggregation test.
 
-VERIFY: npx tsc --noEmit; npm run lint; npm test; npm run db:test:up && npm run test:datamechanics:local. PR from feat/w1.2-cost-per-member → main; comment on the Plane epic.
+VERIFY: npx tsc --noEmit; npm run lint; npm test; npm run db:test:up && npm run test:datamechanics:local. PR from feat/w1.2-cost-per-member → main referencing the Linear issue key.
 ```
 
 ## W1.3 — GitHub native UI (selection + manual scan)  (Wave C — after F5 merges)
@@ -188,7 +201,7 @@ Worktree:
   cd ../aios-team-brain-w1.3
   ln -sfn ~/Projects/aios/aios-team-brain/node_modules node_modules
 
-Plane: epic "W1.3 — GitHub native UI (selection + manual scan)" (W1.3.1–W1.3.4). Assign the epic and sub-issues to yourself. Epic → In Progress; sub-issues → Done; comment PR.
+Linear: issue "W1.3 — GitHub native UI (selection + manual scan)" (W1.3.1–W1.3.4). Assign them to yourself. Issue → In Progress; sub-issues → Done; reference the issue key in the PR body.
 
 OBJECTIVE: dashboard repo selection + member→GitHub linking on the Integrations surface. NO server-triggered scan in Wave 1 — selection persists and the sidecar consumes it; scans run via the documented aios-ingest CLI.
 SCOPE:
@@ -197,7 +210,7 @@ SCOPE:
 - W1.3.3 Show last-scan SHA vs main HEAD + a clearly-labelled "run a scan" panel documenting the aios-ingest command.
 - W1.3.4 Respect lib/codebases/visibility.ts (team-tier only).
 
-VERIFY: npx tsc --noEmit; npm run lint; npm test; npm run check:docs; data-mechanics if persistence touched. PR from feat/w1.3-github-ui → main; comment on the Plane epic.
+VERIFY: npx tsc --noEmit; npm run lint; npm test; npm run check:docs; data-mechanics if persistence touched. PR from feat/w1.3-github-ui → main referencing the Linear issue key.
 ```
 
 ## W1.4 — Ops hardening (Sentry, CodeRabbit, BugBot)  (Wave A)
@@ -212,7 +225,7 @@ Worktree:
   cd ../aios-team-brain-w1.4
   ln -sfn ~/Projects/aios/aios-team-brain/node_modules node_modules
 
-Plane: epic "W1.4 — Ops hardening (Sentry, CodeRabbit, BugBot)" (W1.4.1–W1.4.4). Assign the epic and sub-issues to yourself. Epic → In Progress; sub-issues → Done; comment PR.
+Linear: issue "W1.4 — Ops hardening (Sentry, CodeRabbit, BugBot)" (W1.4.1–W1.4.4). Assign them to yourself. Issue → In Progress; sub-issues → Done; reference the issue key in the PR body.
 
 OBJECTIVE: error logging + AI code review.
 SCOPE:
@@ -221,14 +234,18 @@ SCOPE:
 - W1.4.3 BugBot: document John (org owner) approving the Cursor app at AIOS-alpha → Settings → Third-party Access (manual).
 - W1.4.4 Sentry smoke: a client error and a server error both produce events with resolved source maps (note how to verify).
 
-VERIFY: npx tsc --noEmit; npm run lint; npm run build (Turbopack) succeeds with Sentry wired. PR from feat/w1.4-ops → main; comment on the Plane epic.
+VERIFY: npx tsc --noEmit; npm run lint; npm run build (Turbopack) succeeds with Sentry wired. PR from feat/w1.4-ops → main referencing the Linear issue key.
 ```
 
 ---
 
-## Wave 2 (generate full prompts the same way when ready)
+## Wave 2 — superseded 2026-06-29
+
 `W2.1` external AI cost (usage_costs table + Anthropic/Cursor sources) · `W2.2` Slack bidirectional ·
 `W2.3` Wise finance · `W2.4` PM bake-off (ingest Linear + Plane into the brain) · `W2.5` Pencil design
-system · `W2.6` connector→integration rename (versioned blueprint migration). Each has its epic +
-sub-issues already in Plane; reuse the common preamble, point at the epic, and list its sub-issues.
-```
+system · `W2.6` connector→integration rename (versioned blueprint migration).
+
+This wave was **superseded 2026-06-29** by the V1.0 Operator Loop roadmap — do not generate prompts
+from this template for it. `W2.4` (the PM bake-off) is the one item that did complete beforehand:
+Linear was chosen as the canonical PM tool over Plane (see `docs/ARCHITECTURE.md` "PM tool decision
+(resolved)"). For current planned work, see `aios-workspace/docs/v1-operator-loop/` and Linear.

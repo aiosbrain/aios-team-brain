@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
 import { LoginForm } from "@/components/login-form";
-import { publicDbBackend } from "@/lib/db/backend";
+import { magicLinkAvailable } from "@/lib/auth/mailer";
 
 export const metadata: Metadata = { title: "Sign in" };
 
@@ -10,6 +10,9 @@ export default async function LoginPage({
   searchParams: Promise<{ next?: string; error?: string }>;
 }) {
   const { next, error } = await searchParams;
+  // Password is always the default (needs no email infra); offer magic-link only when a domain +
+  // mail delivery are actually configured — env vars are server-only, so this is resolved here.
+  const magicLink = magicLinkAvailable();
 
   return (
     <main className="relative flex flex-1 items-center justify-center bg-surface-raised px-6 py-24">
@@ -25,23 +28,21 @@ export default async function LoginPage({
       <div className="relative w-full max-w-sm">
         <div className="bg-gradient-prism rounded-2xl p-[1px]">
           <div className="rounded-2xl bg-surface-inset px-8 py-10">
-            <p className="font-display text-sm font-semibold uppercase tracking-[0.15em] text-gradient-prism">
+            <p className="font-display text-sm uppercase tracking-[0.15em] text-gradient-prism">
               Team Brain
             </p>
             <h1 className="mt-2 text-2xl font-semibold text-ink">Sign in</h1>
             <p className="mt-1 mb-6 text-sm text-ink-secondary">
-              {publicDbBackend() === "postgres"
-                ? "Enter your work email to sign in."
-                : "We'll email you a one-time magic link."}
+              Enter your work email and password to sign in.
             </p>
             {error === "invalid_link" ? (
               <p className="mb-4 rounded-lg border border-red/30 bg-red/5 px-3 py-2 text-sm text-red">
-                That link is invalid or expired — request a new one below.
+                That link is invalid or expired — sign in with your email and password below.
               </p>
             ) : null}
-            <LoginForm next={next} />
+            <LoginForm next={next} magicLinkAvailable={magicLink} />
             <p className="mt-6 border-t border-border-subtle pt-4 text-xs text-ink-tertiary">
-              Team Brain is invite-only: ask your team admin to add you before signing in.
+              Team Brain is invite-only: ask your team admin for an account and password.
             </p>
           </div>
         </div>

@@ -1,8 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { Gauge } from "lucide-react";
-import { isPostgresBackend } from "@/lib/db/backend";
-import { serverClient } from "@/lib/supabase/server";
+import { serverClient } from "@/lib/db/server";
 import { currentMember } from "@/lib/auth/guard";
 import { getTeamMaturity, type ReadinessLevel } from "@/lib/metrics/maturity";
 import { parseRange } from "@/lib/metrics/range";
@@ -28,20 +27,19 @@ export default async function MaturityPage({
   params: Promise<{ team: string }>;
   searchParams: Promise<{ range?: string }>;
 }) {
-  if (!isPostgresBackend()) return null;
 
   const { team: teamSlug } = await params;
   const range = parseRange((await searchParams).range);
-  const supabase = await serverClient();
+  const db = await serverClient();
 
-  const { data: team } = await supabase.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
+  const { data: team } = await db.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
   if (!team) return null;
 
   const me = await currentMember(team.id);
   if (!me) return null;
 
   // Tier gate lives in getTeamMaturity → getCodebaseSummaries (team-only).
-  const m = await getTeamMaturity(supabase, team.id, range, me.tier);
+  const m = await getTeamMaturity(db, team.id, range, me.tier);
 
   return (
     <div className="mx-auto flex max-w-5xl flex-col gap-5">
@@ -75,7 +73,7 @@ export default async function MaturityPage({
               <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-ink-tertiary">
                 Repos at L3+ (agent-ready)
               </p>
-              <p className="mt-1 font-display text-4xl font-semibold text-gradient-prism">
+              <p className="mt-1 font-display text-4xl text-gradient-prism">
                 {m.pctAtL3Plus}%
               </p>
               <p className="mt-1 text-xs text-ink-secondary">

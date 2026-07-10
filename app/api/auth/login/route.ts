@@ -1,29 +1,36 @@
 import { type NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
-import { isPostgresBackend } from "@/lib/db/backend";
-import { loginByEmail } from "@/lib/auth/pg-login";
+import { loginWithPassword } from "@/lib/auth/pg-login";
 import { signSession, SESSION_COOKIE, sessionCookieOptions } from "@/lib/auth/pg-session";
+import { adminClient } from "@/lib/db/admin";
+import { rateLimit } from "@/lib/api/rate-limit";
 
 export const runtime = "nodejs";
 
+// Login attempts allowed per client IP per minute (audit M2) — throttles brute-force/enumeration.
+const LOGIN_RATE_PER_MIN = 10;
+
 const schema = z.object({
   email: z.string().email().max(200),
+  password: z.string().min(1).max(200),
   next: z.string().optional(),
 });
 
 /**
- * Direct (passwordless) sign-in for the postgres backend. Invite-only: if the email is a
- * recognized non-disabled member we set the signed session cookie immediately; otherwise we
- * reject with 403. No email round-trip / magic link.
+ * Email+password sign-in — the DEFAULT sign-in path (audit M1/M2b — replaces the earlier
+ * passwordless flow that trusted any known member email with no ownership proof, and needs no
+ * email infrastructure to work). Invite-only: an admin must have created the member AND set a
+ * password before anyone can sign in as them.
  *
- * SECURITY: trusts the submitted email with no ownership proof — fine only for this
- * invite-only, self-hosted instance with a known member list. See lib/auth/pg-login.loginByEmail.
+ * The failure response is intentionally the SAME (401 `invalid_credentials`) whether the email is
+ * unrecognized, has no password set, or the password is wrong — so login can't be used to enumerate
+ * member emails (the old passwordless flow's 403-vs-200 shape was exactly that oracle).
+ *
+ * `POST /api/auth/request-magic-link` is an OPTIONAL secondary sign-in route, surfaced by the login
+ * form only when a domain + mail delivery are actually configured (`magicLinkAvailable()`) — a
+ * magic link can't work without somewhere real to send it.
  */
 export async function POST(req: NextRequest) {
-  if (!isPostgresBackend()) {
-    return NextResponse.json({ error: "not_applicable" }, { status: 400 });
-  }
-
   let body: unknown;
   try {
     body = await req.json();
@@ -31,19 +38,29 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "invalid_payload" }, { status: 422 });
   }
   const parsed = schema.safeParse(body);
-  if (!parsed.success) return NextResponse.json({ error: "invalid_email" }, { status: 422 });
+  if (!parsed.success) return NextResponse.json({ error: "invalid_payload" }, { status: 422 });
+
+  // Throttle by client IP before touching the DB (audit M2). x-forwarded-for's first hop is the
+  // client on Railway/Vercel edge.
+  const ip = (req.headers.get("x-forwarded-for") ?? "").split(",")[0].trim() || "unknown";
+  if (!(await rateLimit(adminClient(), `login:${ip}`, LOGIN_RATE_PER_MIN))) {
+    return NextResponse.json({ error: "rate_limited" }, { status: 429 });
+  }
 
   const email = parsed.data.email.trim().toLowerCase();
   const nextParam = parsed.data.next ?? "/";
   const safeNext = nextParam.startsWith("/") && !nextParam.startsWith("//") ? nextParam : "/";
 
-  const user = await loginByEmail(email);
-  if (!user) {
-    // Not a recognized member — invite-only.
-    return NextResponse.json({ error: "not_recognized" }, { status: 403 });
+  const result = await loginWithPassword(email, parsed.data.password);
+  if (!result) {
+    return NextResponse.json({ error: "invalid_credentials" }, { status: 401 });
   }
 
-  const res = NextResponse.json({ ok: true, redirect: safeNext });
-  res.cookies.set(SESSION_COOKIE, await signSession(user), sessionCookieOptions());
+  // First login (an invite's first activation): route through the one-time welcome screen instead
+  // of dropping straight onto the dashboard — same behavior as the magic-link path (/auth/confirm).
+  const redirect = result.firstLogin ? `/auth/welcome?next=${encodeURIComponent(safeNext)}` : safeNext;
+
+  const res = NextResponse.json({ ok: true, redirect });
+  res.cookies.set(SESSION_COOKIE, await signSession(result.user), sessionCookieOptions());
   return res;
 }

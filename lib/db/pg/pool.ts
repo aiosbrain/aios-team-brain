@@ -1,11 +1,25 @@
 import "server-only";
-import { Pool } from "pg";
+import { Pool, types } from "pg";
 
 /**
  * Singleton pg Pool for DB_BACKEND=postgres. Reads DATABASE_URL (Railway/any
  * standard Postgres). SSL is enabled when the URL asks for it or PGSSL=require,
  * with relaxed verification for managed providers that use self-signed chains.
  */
+
+// Override date/time type parsers to return strings instead of Date objects.
+// By default node-postgres parses timestamptz/date/timestamp into JavaScript
+// Date objects, but the application types them all as `string`. Setting
+// string-returning parsers here is the single normalization point that closes
+// the #134 gotcha — every consumer through runSql (and therefore PgQuery) gets
+// the raw wire-format string, never a Date object.
+//
+// OID 1082 (date)       → YYYY-MM-DD
+// OID 1114 (timestamp)  → YYYY-MM-DD HH:MM:SS.ssssss
+// OID 1184 (timestamptz) → ISO-8601 with offset (e.g. ...+08:00 or ...Z)
+types.setTypeParser(1082, (val: string) => val);
+types.setTypeParser(1114, (val: string) => val);
+types.setTypeParser(1184, (val: string) => val);
 
 let pool: Pool | undefined;
 

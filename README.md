@@ -1,7 +1,7 @@
 # AIOS Team Brain
 
 Mission control for agentic teamwork. Contributor repos (built on
-[Agentic Team Ops](https://github.com/your-github-org/aios-workspace)) sync
+[AIOS Workspace](https://github.com/aiosbrain/aios-workspace)) sync
 tier-tagged content here via the `aios` CLI; the dashboard surfaces tasks,
 projects, decisions, deliverables, transcripts, and a grounded natural-language
 query over the team's shared memory.
@@ -11,9 +11,8 @@ query over the team's shared memory.
 
 ## Stack
 
-Next.js 16 (App Router) · **configurable database backend** (`DB_BACKEND`) —
-**Postgres by default** (the deployed target, e.g. Railway; tier isolation
-enforced in app code) or **Supabase** (legacy; managed Postgres + Auth + RLS) ·
+Next.js 16 (App Router) · **Postgres** (the one backend; the deployed target,
+e.g. Railway; tier isolation enforced in app code) ·
 **pluggable LLM** for query — Anthropic by default, or any local
 OpenAI-compatible endpoint (Ollama/Hermes/llama.cpp), plus an optional
 local/cloud reranker (see [docs/PROVIDERS.md](docs/PROVIDERS.md)) · Tailwind v4
@@ -26,8 +25,8 @@ Members authenticate with magic-link/OAuth (invite-only; admin creates the
 member row, first login links it). Machines authenticate with per-member API
 keys (`aios_<key_id>_<secret>`, sha256-at-rest, shown once). Sync writes go
 through one narrow audited module (`lib/ingest`) using the service role;
-everything the dashboard reads is tier-gated — in Postgres mode by an app-code
-choke-point (`lib/auth/visibility`), in legacy Supabase mode by RLS — enforcing
+everything the dashboard reads is tier-gated by an app-code choke-point
+(`lib/auth/visibility`) — enforcing
 access tiers (`team` sees all, `external` sees only external; `admin`-tier
 content is rejected at the API with 422 — it never reaches the database).
 Markdown task/decision tables materialize into structured rows (diff-sync by
@@ -49,9 +48,6 @@ npm run dev
 > **New contributor?** [`DEVELOPMENT.md`](DEVELOPMENT.md) is the full local-setup + test-tier walkthrough
 > (prereqs, `.env.local`, `AUTH_SECRET`, troubleshooting); [`CONTRIBUTING.md`](CONTRIBUTING.md) is the
 > PR checklist (worktrees, spec-first tests, the architecture-map loop). Start there.
-
-> Legacy Supabase backend: set `DB_BACKEND=supabase`, run `supabase start`, fill
-> `.env.local` from `supabase status -o env`, and `supabase db reset` to migrate.
 
 **Run it local or cloud.** By default queries use the Anthropic API. To answer
 fully on-machine ($0), set `LLM_BASE_URL` (and optionally a local `RERANK_URL`)
@@ -86,10 +82,11 @@ scaffolded spoke → idempotent re-push → materialization check → admin-tier
 
 ## Security posture
 
-RLS default-deny everywhere; helper fns in an unexposed `private` schema;
-`key_hash` column-revoked from clients; audit log append-only (trigger-backed);
-rate limits in Postgres; the service-role path is confined to `lib/ingest` +
-route handlers and audited on every write. Known accepted risk: sync writes
-bypass RLS by design (machine auth) — mitigated by the narrow module and the
-contract-level tier rejection; a `security definer` ingest function is the
-post-MVP hardening step.
+Tier isolation enforced in app code (no RLS) at every read path — the
+`lib/auth/visibility` choke-point + re-applied filters in `/api/v1/items*` and
+`lib/query/retrieve`; `key_hash` column-revoked from clients; audit log
+append-only (trigger-backed); rate limits in Postgres; the service-role write
+path is confined to `lib/ingest` + route handlers and audited on every write.
+Known accepted risk: machine sync writes carry no DB-level tier backstop —
+mitigated by the narrow single-writer module and the contract-level tier
+rejection (`admin`-tier content is 422'd at the API, never reaching the DB).

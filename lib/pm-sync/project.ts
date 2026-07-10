@@ -1,6 +1,6 @@
 import "server-only";
 
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 
 import { getEnabledIntegrationsWithSecrets, type IntegrationWithSecret } from "@/lib/integrations/manage";
 import { linearAdapter } from "@/lib/pm-sync/linear";
@@ -91,11 +91,11 @@ function chooseIntegration(integrations: IntegrationWithSecret[], provider: PmPr
 // Resolve the team's projection target: its configured primary_pm_provider, or — if unset — the
 // sole enabled PM integration. Ambiguous/none → null (caller no-ops with a clear report).
 export async function resolvePrimaryProvider(
-  supabase: SupabaseClient,
+  db: DbClient,
   teamId: string
 ): Promise<PrimaryResolution> {
-  const integrations = await getEnabledIntegrationsWithSecrets(supabase, teamId);
-  const { data: team } = await supabase.from("teams").select("primary_pm_provider").eq("id", teamId).maybeSingle();
+  const integrations = await getEnabledIntegrationsWithSecrets(db, teamId);
+  const { data: team } = await db.from("teams").select("primary_pm_provider").eq("id", teamId).maybeSingle();
   const configured = (team?.primary_pm_provider as PmProvider | null) ?? null;
 
   if (configured) {
@@ -116,7 +116,9 @@ export async function resolvePrimaryProvider(
   return { provider: null, reason: "multiple PM integrations enabled but teams.primary_pm_provider is unset" };
 }
 
-function toProjectable(row: ProjectionTaskRow, parentResourceId: string | null): ProjectableTask {
+// Exported so the inbound apply (lib/pm-sync/inbound.ts) recomputes fingerprints over the EXACT
+// same projectable shape the outbound engine hashes — the two must never drift.
+export function toProjectable(row: ProjectionTaskRow, parentResourceId: string | null): ProjectableTask {
   return {
     row_key: row.row_key,
     title: row.title,
@@ -133,7 +135,7 @@ function toProjectable(row: ProjectionTaskRow, parentResourceId: string | null):
 // Columns of task_pm_links the projection engine reads. The pg adapter (prod) rejects a bare
 // "*" column reference, so every select / insert-returning must name columns explicitly.
 const LINK_COLS =
-  "id, team_id, project_id, task_id, row_key, provider, provider_resource_id, provider_external_source, provider_external_id, provider_url, projection_fingerprint, last_projected_status, provider_seen_status";
+  "id, team_id, project_id, task_id, row_key, provider, provider_resource_id, provider_external_source, provider_external_id, provider_url, projection_fingerprint, last_projected_status, last_projected_brain_status, provider_seen_status";
 
 // The exact `tasks` columns that hydrate a ProjectionTaskRow. Named explicitly (the pg adapter
 // rejects "*") and shared by every loader so the projected shape can't drift between call sites.
@@ -142,12 +144,12 @@ export const PROJECTION_TASK_COLS =
 
 // Get-or-create the task_pm_links row for (team, project, row_key, provider).
 async function ensureLink(
-  supabase: SupabaseClient,
+  db: DbClient,
   row: ProjectionTaskRow,
   provider: PmProvider,
   defaultSource: string
 ): Promise<TaskPmLink> {
-  const { data: existing } = await supabase
+  const { data: existing } = await db
     .from("task_pm_links")
     .select(LINK_COLS)
     .eq("team_id", row.team_id)
@@ -167,19 +169,22 @@ async function ensureLink(
     provider_external_source: defaultSource,
     provider_url: "",
   };
-  const { data, error } = await supabase.from("task_pm_links").insert(insert).select(LINK_COLS).single();
+  const { data, error } = await db.from("task_pm_links").insert(insert).select(LINK_COLS).single();
   if (error) throw new Error(`create task PM link failed: ${error.message}`);
   return data as TaskPmLink;
 }
 
 async function persistSuccess(
-  supabase: SupabaseClient,
+  db: DbClient,
   link: TaskPmLink,
   result: UpsertWorkItemResult,
-  fingerprint: string
+  fingerprint: string,
+  // Exact brain `tasks.status` this projection wrote from — the inbound conflict baseline
+  // (brain-api v1.4). The group-granular fingerprint can't distinguish in_progress vs blocked.
+  brainStatus: string
 ) {
   const now = new Date().toISOString();
-  await supabase
+  await db
     .from("task_pm_links")
     .update({
       provider_resource_id: result.providerResourceId,
@@ -188,6 +193,7 @@ async function persistSuccess(
       last_synced_status: result.syncedStatus ?? null,
       last_synced_at: now,
       last_projected_status: result.syncedStatus ?? null,
+      last_projected_brain_status: brainStatus,
       projection_fingerprint: fingerprint,
       last_error: null,
       updated_at: now,
@@ -195,20 +201,20 @@ async function persistSuccess(
     .eq("id", link.id);
 }
 
-async function persistError(supabase: SupabaseClient, link: TaskPmLink, message: string) {
-  await supabase
+async function persistError(db: DbClient, link: TaskPmLink, message: string) {
+  await db
     .from("task_pm_links")
     .update({ last_error: message.slice(0, 1000), updated_at: new Date().toISOString() })
     .eq("id", link.id);
 }
 
 async function loadTaskByRowKey(
-  supabase: SupabaseClient,
+  db: DbClient,
   teamId: string,
   projectId: string,
   rowKey: string
 ): Promise<ProjectionTaskRow | null> {
-  const { data } = await supabase
+  const { data } = await db
     .from("tasks")
     .select(PROJECTION_TASK_COLS)
     .eq("team_id", teamId)
@@ -221,21 +227,21 @@ async function loadTaskByRowKey(
 // Project one task into the team's primary PM tool. Resolves the parent first (so the provider
 // sub-issue link exists), upserts the work item, and persists the link bookkeeping. Brain-wins.
 export async function projectTask(
-  supabase: SupabaseClient,
+  db: DbClient,
   row: ProjectionTaskRow,
   opts: ProjectTaskOptions = {}
 ): Promise<ProjectionReport> {
   if (!row.row_key) return { row_key: "", provider: null, status: "no_row_key" };
 
-  const primary: PrimaryResolution = opts.primary ?? (await resolvePrimaryProvider(supabase, row.team_id));
+  const primary: PrimaryResolution = opts.primary ?? (await resolvePrimaryProvider(db, row.team_id));
   if (primary.provider === null) {
     return { row_key: row.row_key, provider: null, status: "no_primary_provider", error: primary.reason };
   }
   if (primary.integration === null) {
     // Provider is known but its integration is missing — create/find the link and record the
     // error on it so the pm-sync failure surface shows it, then report missing_integration.
-    const link = await ensureLink(supabase, row, primary.provider, "aios-backlog");
-    await persistError(supabase, link, primary.reason);
+    const link = await ensureLink(db, row, primary.provider, "aios-backlog");
+    await persistError(db, link, primary.reason);
     return { row_key: row.row_key, provider: primary.provider, status: "missing_integration", error: primary.reason };
   }
   const { provider, integration } = primary;
@@ -255,11 +261,11 @@ export async function projectTask(
         return { row_key: row.row_key, provider, status: "cycle", error: `parent cycle at ${row.row_key}` };
       }
       visiting.add(row.row_key);
-      const parentRow = await loadTaskByRowKey(supabase, row.team_id, row.project_id, row.parent_row_key);
+      const parentRow = await loadTaskByRowKey(db, row.team_id, row.project_id, row.parent_row_key);
       if (!parentRow) {
         return { row_key: row.row_key, provider, status: "missing_parent", error: `parent ${row.parent_row_key} not found` };
       }
-      const parentReport = await projectTask(supabase, parentRow, { ...opts, visiting });
+      const parentReport = await projectTask(db, parentRow, { ...opts, visiting });
       if (parentReport.status === "failed" || parentReport.status === "cycle" || parentReport.status === "missing_parent") {
         return { row_key: row.row_key, provider, status: parentReport.status, error: `parent ${row.parent_row_key}: ${parentReport.error ?? parentReport.status}` };
       }
@@ -267,7 +273,7 @@ export async function projectTask(
     }
   }
 
-  const link = await ensureLink(supabase, row, provider, defaultSource);
+  const link = await ensureLink(db, row, provider, defaultSource);
   const task = toProjectable(row, parentResourceId);
   const fingerprint = projectionFingerprint(task, parentResourceId);
 
@@ -288,12 +294,12 @@ export async function projectTask(
       bootstrap: opts.bootstrap,
       fetchImpl: opts.fetchImpl,
     });
-    await persistSuccess(supabase, link, result, fingerprint);
+    await persistSuccess(db, link, result, fingerprint, row.status);
     opts.resolved?.set(row.row_key, result.providerResourceId);
     return { row_key: row.row_key, provider, status: result.status, providerResourceId: result.providerResourceId };
   } catch (e) {
     const message = e instanceof Error ? e.message : "projection failed";
-    await persistError(supabase, link, message);
+    await persistError(db, link, message);
     return { row_key: row.row_key, provider, status: "failed", error: message };
   }
 }
@@ -331,7 +337,7 @@ export interface ProjectAllOptions {
 // rows that actually wrote. Both `projectAllTasks` (whole board) and the reactive changed-rows path
 // reuse this so the prepare/order/throttle semantics can't drift apart.
 export async function projectRows(
-  supabase: SupabaseClient,
+  db: DbClient,
   primary: ResolvedPrimary,
   rows: ProjectionTaskRow[],
   opts: ProjectAllOptions = {}
@@ -351,7 +357,7 @@ export async function projectRows(
   const reports: ProjectionReport[] = [];
 
   for (const row of topoOrder(rows)) {
-    const report = await projectTask(supabase, row, {
+    const report = await projectTask(db, row, {
       primary,
       bootstrap,
       resolved,
@@ -368,17 +374,17 @@ export async function projectRows(
 // retired plane:backlog / linear:backlog seed scripts. ~80 rows × 1 provider ≈ ~90s with the
 // throttle. Continues on per-row failure and returns a per-row report.
 export async function projectAllTasks(
-  supabase: SupabaseClient,
+  db: DbClient,
   teamId: string,
   projectId: string,
   opts: ProjectAllOptions = {}
 ): Promise<{ provider: PmProvider | null; reports: ProjectionReport[]; reason?: string }> {
-  const primary = await resolvePrimaryProvider(supabase, teamId);
+  const primary = await resolvePrimaryProvider(db, teamId);
   if (primary.provider === null || primary.integration === null) {
     return { provider: primary.provider, reports: [], reason: primary.reason };
   }
 
-  const { data: taskRows } = await supabase
+  const { data: taskRows } = await db
     .from("tasks")
     .select(PROJECTION_TASK_COLS)
     .eq("team_id", teamId)
@@ -387,6 +393,6 @@ export async function projectAllTasks(
   const rows = ((taskRows ?? []) as ProjectionTaskRow[]).filter((r) => r.row_key);
   if (!rows.length) return { provider: primary.provider, reports: [] };
 
-  const reports = await projectRows(supabase, primary, rows, opts);
+  const reports = await projectRows(db, primary, rows, opts);
   return { provider: primary.provider, reports };
 }

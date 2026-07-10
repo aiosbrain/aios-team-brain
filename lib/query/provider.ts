@@ -1,5 +1,5 @@
 import "server-only";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 
 /**
  * The pluggable context/retrieval layer.
@@ -34,7 +34,7 @@ export type RetrievedContext = {
 };
 
 export interface RetrievalRequest {
-  supabase: SupabaseClient;
+  db: DbClient;
   teamId: string;
   tier: "team" | "external";
   question: string;

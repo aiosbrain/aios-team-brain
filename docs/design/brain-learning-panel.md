@@ -125,6 +125,56 @@ any search affordance. No new plumbing — both already read from the same `item
 3. **Layer 2** (events) — episodes + participants reconciled to `members`.
 4. **Layer 3** (arcs) — synthesis + cache; then inline edit + recompute + correction writeback.
 
+## Human attribution for AI-agent participants (added 2026-07-08, extended 2026-07-08)
+
+A recognized AI-agent/tool name (e.g. "Claude Code", "AIOS Team Brain", "Claude Agent SDK" —
+mentioned in a Slack message or PR body, not a real actor) could stand in a narrative arc as if it
+were the person who did the work, with no way to trace it to a human. Every ingested item already
+carries a real attribution (`items.member_id` → `members`, excluding connector service-accounts —
+see `lib/ingest/run.ts`'s `resolveConnectorAuth`/`is_connector`), so `getArcs`/`recomputeArcs`
+(`lib/graph/arcs.ts`) resolve it in **two places**, not one:
+
+1. **The synthesis PROMPT (input)** — before calling the LLM, every numbered fact `[F12] …` fed to
+   the arc-synthesis prompt is attributed: if a fact's `subject` is a recognized AI-agent name, its
+   text is prefixed `"(Chetan Nandakumar, via Claude Code) Claude Code refactored the auth module"`
+   (`attributedFactTexts` in `lib/graph/arc-attribution.ts`, pure). This grounds the LLM's summary
+   text in a human from the start, instead of only patching the arc's `participants` array after the
+   fact — a summary that used to read "Claude Code is refactoring auth" now has the human in its own
+   input to draw from.
+2. **The arc OUTPUT (`participants`)** — `attributeParticipants` still rewrites a recognized AI-agent
+   participant name to `"Claude Code (Chetan Nandakumar)"`, or `"Claude Code (unattributed AI agent)"`
+   when no human resolves, as a backstop in case the LLM still echoes a bare agent name into
+   `participants` despite the grounded prompt.
+
+Both steps resolve humans from a batched Postgres query, `resolveHumanActorsByItem`
+(`lib/graph/human-actors.ts`, shared with the Layer 2 fix below) — one `items → members` round trip
+for every item id touched by a `getArcs`/`recomputeArcs` call (not one query per fact and another per
+arc), returning an `item id → human` map that both `attributedFactTexts` (prompt) and the
+`participants` rewrite (output) read from in-memory. `resolveHumanActors` (a thin wrapper returning
+the deduped name list) is kept for callers that only need that shape.
+
+**Latency trade-off:** the fact-resolution step must complete BEFORE the LLM call now (the prompt
+depends on it), so `resolveEpisodeItems` + `resolveHumanActorsByItem` can no longer run in
+`Promise.all` alongside `callLLMRaw` the way they used to. This adds one sequential Postgres round
+trip to every `getArcs`/`recomputeArcs` call — accepted as the cost of a synthesis input that's
+grounded in a human instead of raw tool-name prose.
+
+**Layer 2 (added 2026-07-08):** `GET /api/brain/events`'s `participants` had the same gap — raw
+`MENTIONS` entity names from Graphiti's own extractor, unattributed. Since one event maps to exactly
+ONE source item (unlike an arc's multiple evidence items), the fix is simpler: `resolveHumanActorsByItem`
+resolves every event's `itemId` in one batched query, and `attributeEventParticipants`
+(`lib/graph/arc-attribution.ts`) rewrites `participants` the same way `attributeParticipants` does for
+arcs. Layer 1's `subject`/`object` fields have the same characteristic (raw extracted entity names)
+but are not currently displayed as if they were actors, so they're left unattributed for now.
+
+**Learning page layout (added 2026-07-08):** narrative arcs (Layer 3) are the synthesized payoff and
+stay expanded at the top of `app/t/[team]/learning/page.tsx`; events and atomic facts (Layers 1–2) —
+the raw evidence trail underneath — are collapsed by default behind a single `<details>` disclosure
+("Recent activity — events & atomic facts"), the same native-element pattern already used for an
+arc's evidence list (`components/learning/arcs-panel.tsx`). Rationale: an arc's own clickable evidence
+links are the primary "verify this" path; the full unfiltered Layer 1/2 feed is there for the rare
+deeper dive, not as permanently-stacked primary UI.
+
 ## Risks & mitigations
 - **Schema coupling** — we depend on Graphiti's internal Neo4j labels/props, which can change across
   Graphiti versions. *Mitigate:* pin the `zepai/graphiti` image tag; isolate ALL Cypher in

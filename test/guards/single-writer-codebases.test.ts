@@ -63,9 +63,9 @@ describe("single-writer: codebase analytics tables", () => {
   });
 
   it("the matcher discriminates (non-vacuity)", () => {
-    expect(WRITE_RE.test('supabase.from("code_metrics").upsert(')).toBe(true);
+    expect(WRITE_RE.test('db.from("code_metrics").upsert(')).toBe(true);
     WRITE_RE.lastIndex = 0;
-    expect(WRITE_RE.test('supabase.from("code_metrics").select(')).toBe(false);
+    expect(WRITE_RE.test('db.from("code_metrics").select(')).toBe(false);
     WRITE_RE.lastIndex = 0;
   });
 });

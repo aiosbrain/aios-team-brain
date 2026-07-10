@@ -11,7 +11,7 @@ describe("runGraphProjection (configured gate)", () => {
     const from = vi.fn(() => {
       throw new Error("DB must not be touched when Graphiti is unconfigured");
     });
-    const res = await runGraphProjection({ client, supabase: { from } as never });
+    const res = await runGraphProjection({ client, db: { from } as never });
 
     expect(res.configured).toBe(false);
     expect(res.ok).toBe(true);

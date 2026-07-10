@@ -1,5 +1,5 @@
 import "server-only";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { DbClient } from "@/lib/db/types";
 import { buildIdentityMap, resolveByProviderId, resolveMember, type IdentityMap } from "@/lib/identity/resolve";
 import { parseAuthorIdentity } from "@/lib/codebases/commits-to-items";
 
@@ -7,13 +7,17 @@ import { parseAuthorIdentity } from "@/lib/codebases/commits-to-items";
  * Re-attribute existing items to the CURRENT identity mappings. `ingestItem` only stamps
  * `items.member_id` on create/change, so when an admin adds or corrects an identity mapping (or an
  * email alias) AFTER content was ingested, those already-stored unchanged rows keep their old
- * attribution (often the connector member). This pass re-resolves each item's author from its
- * frontmatter against the freshly-built identity map and re-points `member_id`.
+ * attribution. This pass re-resolves each item's author from its frontmatter against the freshly-
+ * built identity map and re-points `member_id`.
  *
  * Lives in lib/ingest because it writes `items` (the single-writer guard). Conservative: it only
- * RE-POINTS to a positively-resolved member that differs from the current one — it never
- * un-attributes (a row that no longer resolves is left as-is), so it can't erase good attribution.
- * Idempotent: a second run with no mapping changes updates nothing.
+ * RE-POINTS to a positively-resolved member that differs from the current one — it never erases a
+ * previously-resolved HUMAN's attribution (a row that no longer resolves and isn't on a connector
+ * is left as-is). The one exception: a row still attributed to a connector service-account
+ * (`is_connector = true` — a pre-fix leftover from before ingestion correctly left unresolved
+ * authors unattributed) that STILL doesn't resolve is cleared to `null` rather than left on the
+ * connector, since that was never "good attribution" to begin with. Idempotent: a second run with
+ * no mapping changes updates nothing.
  */
 
 export interface ReattributeSummary {
@@ -39,14 +43,20 @@ function resolveItemAuthor(idMap: IdentityMap, fm: Record<string, unknown>): str
 }
 
 export async function reattributeItems(
-  supabase: SupabaseClient,
+  db: DbClient,
   teamId: string
 ): Promise<ReattributeSummary> {
-  const idMap = await buildIdentityMap(supabase, teamId);
-  const { data: items } = await supabase
+  const idMap = await buildIdentityMap(db, teamId);
+  const { data: items } = await db
     .from("items")
     .select("id, member_id, frontmatter")
     .eq("team_id", teamId);
+  const { data: connectors } = await db
+    .from("members")
+    .select("id")
+    .eq("team_id", teamId)
+    .eq("is_connector", true);
+  const connectorIds = new Set((connectors ?? []).map((c) => (c as { id: string }).id));
 
   const rows = (items ?? []) as {
     id: string;
@@ -58,7 +68,14 @@ export async function reattributeItems(
   for (const it of rows) {
     const resolved = resolveItemAuthor(idMap, it.frontmatter ?? {});
     if (resolved && resolved !== it.member_id) {
-      const { error } = await supabase.from("items").update({ member_id: resolved }).eq("id", it.id);
+      const { error } = await db.from("items").update({ member_id: resolved }).eq("id", it.id);
+      if (error) throw new Error(`reattribute item ${it.id}: ${error.message}`);
+      updated++;
+    } else if (!resolved && it.member_id && connectorIds.has(it.member_id)) {
+      // Never "good attribution" — a pre-fix row still standing on a connector member with no
+      // real author resolvable. Clear it, same conservative bar (only touches a strictly-worse
+      // value), never applied to a previously-resolved human's attribution.
+      const { error } = await db.from("items").update({ member_id: null }).eq("id", it.id);
       if (error) throw new Error(`reattribute item ${it.id}: ${error.message}`);
       updated++;
     }
