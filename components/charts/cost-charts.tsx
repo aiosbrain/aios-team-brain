@@ -65,15 +65,21 @@ function compact(n: number): string {
 export function SpendByProviderChart({
   data,
   providers,
+  estimated = [],
 }: {
   data: SpendDayPoint[];
   providers: string[];
+  /** Providers whose spend is an API-equivalent estimate — marked "(est.)" in the legend. */
+  estimated?: string[];
 }) {
   const empty = data.length === 0 || providers.length === 0;
+  const est = new Set(estimated);
   return (
     <ChartCard
       title="Daily spend by provider"
-      hint="USD / day"
+      hint={
+        est.size ? "USD / day · (est.) = API-equivalent value" : "USD / day"
+      }
       empty={empty}
       emptyLabel="No provider spend in this window."
     >
@@ -108,7 +114,7 @@ export function SpendByProviderChart({
               dataKey={p}
               stackId="spend"
               fill={providerColor(p)}
-              name={p}
+              name={est.has(p) ? `${p} (est.)` : p}
               radius={i === providers.length - 1 ? [3, 3, 0, 0] : undefined}
             />
           ))}

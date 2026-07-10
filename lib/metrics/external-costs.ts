@@ -9,6 +9,17 @@ import { num, round } from "@/lib/num";
  * Team-tier data only; members see their own rows, admins see team-wide.
  */
 
+/**
+ * A cost row is an "estimate" (API-equivalent value, NOT a bill) when it came from local
+ * session logs — Claude/Codex token estimates. Everything else is genuinely billed/metered
+ * (Cursor billing API, Opencode session cost, Anthropic admin cost report). This split is
+ * what stops a $25k token estimate from reading as spend on the team dashboard.
+ */
+const ESTIMATED_SOURCES = new Set(["session-logs"]);
+export function isEstimatedSource(source: string): boolean {
+  return ESTIMATED_SOURCES.has(source);
+}
+
 export interface ProviderCostRow {
   provider: string;
   source: string;
@@ -19,6 +30,7 @@ export interface ProviderCostRow {
   total_tokens: number;
   cost_usd: number;
   events: number;
+  estimated: boolean;
 }
 
 export interface ExternalMemberCosts {
@@ -33,8 +45,20 @@ export interface ExternalMemberCosts {
 
 export interface ExternalCostsSummary {
   rows: ExternalMemberCosts[];
-  by_provider: { provider: string; cost_usd: number; events: number }[];
-  totals: { cost_usd: number; total_tokens: number; events: number };
+  by_provider: {
+    provider: string;
+    cost_usd: number;
+    events: number;
+    estimated: boolean;
+  }[];
+  totals: {
+    cost_usd: number;
+    total_tokens: number;
+    events: number;
+    /** billed = real metered $ (Cursor/Opencode/Anthropic); estimated = API-equivalent value. */
+    billed_usd: number;
+    estimated_usd: number;
+  };
   selfOnly: boolean;
 }
 
@@ -54,6 +78,8 @@ export interface TokenDayPoint {
 export interface ExternalCostSeries {
   /** Providers present in the window, in a stable display order (chart series + colors). */
   providers: string[];
+  /** Subset of `providers` whose spend is an API-equivalent estimate, not billed. */
+  estimatedProviders: string[];
   /** Per-day cost, one numeric key per provider (0-filled) — for a stacked spend chart. */
   spendByDay: SpendDayPoint[];
   /** Per-day token totals across all providers — for a stacked token chart. */
@@ -147,8 +173,17 @@ export async function getExternalCosts(
   }
 
   const byMember = new Map<string, ExternalMemberCosts>();
-  const byProvider = new Map<string, { cost_usd: number; events: number }>();
-  const totals = { cost_usd: 0, total_tokens: 0, events: 0 };
+  const byProvider = new Map<
+    string,
+    { cost_usd: number; events: number; estimated: boolean }
+  >();
+  const totals = {
+    cost_usd: 0,
+    total_tokens: 0,
+    events: 0,
+    billed_usd: 0,
+    estimated_usd: 0,
+  };
 
   for (const r of rows) {
     const key = r.member_id ?? UNATTRIBUTED;
@@ -174,6 +209,7 @@ export async function getExternalCosts(
     const cost = num(r.cost_usd);
     const evCount = num(r.events);
     const totalTok = inTok + outTok + cacheTok;
+    const estimated = isEstimatedSource(r.source);
 
     cur.providers.push({
       provider: r.provider,
@@ -185,20 +221,30 @@ export async function getExternalCosts(
       total_tokens: totalTok,
       cost_usd: round(cost, 5),
       events: evCount,
+      estimated,
     });
     cur.cost_usd = round(cur.cost_usd + cost, 5);
     cur.total_tokens += totalTok;
     cur.events += evCount;
     byMember.set(key, cur);
 
-    const p = byProvider.get(r.provider) ?? { cost_usd: 0, events: 0 };
+    // A provider is "estimated" only if EVERY row for it is estimated (a real billed
+    // row demotes it to billed). Init true; AND in each row's class.
+    const p = byProvider.get(r.provider) ?? {
+      cost_usd: 0,
+      events: 0,
+      estimated: true,
+    };
     p.cost_usd = round(p.cost_usd + cost, 5);
     p.events += evCount;
+    p.estimated = p.estimated && estimated;
     byProvider.set(r.provider, p);
 
     totals.cost_usd = round(totals.cost_usd + cost, 5);
     totals.total_tokens += totalTok;
     totals.events += evCount;
+    if (estimated) totals.estimated_usd = round(totals.estimated_usd + cost, 5);
+    else totals.billed_usd = round(totals.billed_usd + cost, 5);
   }
 
   return {
@@ -230,7 +276,7 @@ export async function getExternalCostSeries(
     db
       .from("usage_costs")
       .select(
-        "provider, input_tokens, output_tokens, cache_read_tokens, cost_usd, cost_date",
+        "provider, source, input_tokens, output_tokens, cache_read_tokens, cost_usd, cost_date",
       )
       .eq("team_id", teamId)
       .gte("cost_date", windowStart)
@@ -243,6 +289,7 @@ export async function getExternalCostSeries(
 
   type SeriesRow = {
     provider: string;
+    source: string;
     input_tokens: number | string;
     output_tokens: number | string;
     cache_read_tokens: number | string;
@@ -252,12 +299,18 @@ export async function getExternalCostSeries(
   const rows = (costRes.data ?? []) as SeriesRow[];
 
   const providers = new Set<string>();
+  const estimatedByProvider = new Map<string, boolean>(); // provider → all-rows-estimated
   const spend = new Map<string, Map<string, number>>(); // date → provider → usd
   const tokens = new Map<string, TokenDayPoint>(); // date → token buckets
 
   for (const r of rows) {
     const date = r.cost_date;
     providers.add(r.provider);
+    const est = isEstimatedSource(r.source);
+    estimatedByProvider.set(
+      r.provider,
+      (estimatedByProvider.get(r.provider) ?? true) && est,
+    );
 
     const perProvider = spend.get(date) ?? new Map<string, number>();
     perProvider.set(
@@ -296,6 +349,7 @@ export async function getExternalCostSeries(
 
   return {
     providers: providerList,
+    estimatedProviders: providerList.filter((p) => estimatedByProvider.get(p)),
     spendByDay,
     tokensByDay,
     selfOnly: !viewer.isAdmin,
