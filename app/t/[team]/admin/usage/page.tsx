@@ -2,11 +2,21 @@ import { serverClient } from "@/lib/db/server";
 import { getSessionUser } from "@/lib/auth/session";
 import { parseRange } from "@/lib/metrics/range";
 import { getPerMemberCosts, getThroughputVsCost } from "@/lib/metrics/members";
-import { getExternalCosts, getCombinedSpend } from "@/lib/metrics/external-costs";
+import {
+  getExternalCosts,
+  getExternalCostSeries,
+  getCombinedSpend,
+} from "@/lib/metrics/external-costs";
 import { RangeSelector } from "@/components/dashboard/range-selector";
 import { MemberCostTable } from "@/components/usage/member-cost-table";
 import { ExternalCostTable } from "@/components/usage/external-cost-table";
 import { ThroughputCostTable } from "@/components/usage/throughput-cost-table";
+import {
+  SpendByProviderChart,
+  TokenTrendChart,
+  ProviderShareChart,
+  MemberSpendChart,
+} from "@/components/charts/cost-charts";
 
 /**
  * Admin → Usage. Brain spend (query_log) + external AI spend (usage_costs from workstations).
@@ -41,9 +51,10 @@ export default async function UsageAdminPage({
   const memberId = (me?.id as string | undefined) ?? "";
   const viewer = { isAdmin, memberId };
 
-  const [costs, external, throughput] = await Promise.all([
+  const [costs, external, series, throughput] = await Promise.all([
     getPerMemberCosts(db, team.id, range, viewer),
     getExternalCosts(db, team.id, range, viewer),
+    getExternalCostSeries(db, team.id, range, viewer),
     getThroughputVsCost(db, team.id, range, viewer),
   ]);
   const combined = await getCombinedSpend(db, team.id, range, viewer, external);
@@ -87,6 +98,22 @@ export default async function UsageAdminPage({
           </div>
         </section>
       ) : null}
+
+      <section className="flex flex-col gap-3">
+        <h2 className="text-sm font-semibold uppercase tracking-wider text-ink-tertiary">
+          External AI trends
+        </h2>
+        <p className="text-xs text-ink-tertiary">
+          Cursor is authoritative billing; Claude and Codex are token estimates; Opencode is
+          per-message session cost. Estimates can diverge from a provider&apos;s invoice.
+        </p>
+        <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+          <SpendByProviderChart data={series.spendByDay} providers={series.providers} />
+          <TokenTrendChart data={series.tokensByDay} />
+          <ProviderShareChart data={external.by_provider} />
+          {isAdmin ? <MemberSpendChart rows={external.rows} /> : null}
+        </div>
+      </section>
 
       <section className="flex flex-col gap-2">
         <h2 className="text-sm font-semibold uppercase tracking-wider text-ink-tertiary">
