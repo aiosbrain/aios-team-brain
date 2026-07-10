@@ -3,8 +3,10 @@
 import { useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
 import { Radar } from "lucide-react";
-import { discoverNow } from "@/app/t/[team]/admin/social/actions";
+import { discoverNow, planNow } from "@/app/t/[team]/admin/social/actions";
 import type { OpportunityRow } from "@/lib/social/types";
+
+const PLANNED_OR_BEYOND = new Set(["planned"]);
 
 const PCT = (n: number) => `${Math.round(n * 100)}%`;
 
@@ -17,6 +19,7 @@ export function SocialOpportunitiesPanel({
 }) {
   const router = useRouter();
   const [pending, startTransition] = useTransition();
+  const [planningId, setPlanningId] = useState<string | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -27,6 +30,19 @@ export function SocialOpportunitiesPanel({
       const res = await discoverNow(teamSlug);
       if (!res.ok) return setError(res.error ?? "discovery failed");
       setMsg(`Scanned ${res.scanned}, created ${res.created}, skipped ${res.skipped}.`);
+      router.refresh();
+    });
+  }
+
+  function plan(id: string) {
+    setError(null);
+    setMsg(null);
+    setPlanningId(id);
+    startTransition(async () => {
+      const res = await planNow(teamSlug, id);
+      setPlanningId(null);
+      if (!res.ok) return setError(res.error ?? "planning failed");
+      setMsg(res.created ? `Planned — ${res.variants} variants created.` : "Already planned.");
       router.refresh();
     });
   }
@@ -57,6 +73,7 @@ export function SocialOpportunitiesPanel({
                 <th className="px-3 py-2 font-medium">Novelty</th>
                 <th className="px-3 py-2 font-medium">Relevance</th>
                 <th className="px-3 py-2 font-medium">Status</th>
+                <th className="px-3 py-2 font-medium"></th>
               </tr>
             </thead>
             <tbody>
@@ -76,6 +93,20 @@ export function SocialOpportunitiesPanel({
                   <td className="px-3 py-2 text-ink-secondary">{PCT(o.novelty_score)}</td>
                   <td className="px-3 py-2 text-ink-secondary">{PCT(o.relevance_score)}</td>
                   <td className="px-3 py-2 text-ink-tertiary">{o.status}</td>
+                  <td className="px-3 py-2 text-right">
+                    {PLANNED_OR_BEYOND.has(o.status) ? (
+                      <span className="text-xs text-ink-tertiary">planned</span>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => plan(o.id)}
+                        disabled={pending}
+                        className="text-xs font-medium text-violet hover:underline disabled:opacity-50"
+                      >
+                        {planningId === o.id ? "Planning…" : "Plan"}
+                      </button>
+                    )}
+                  </td>
                 </tr>
               ))}
             </tbody>
