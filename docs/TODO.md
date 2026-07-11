@@ -76,12 +76,17 @@ M1 Brand Brain voice/knowledge/governance config (#218), M2 content domain model
   arcs"** (`discoverFromArcsNow`), alongside the existing item-based discovery. Feeds the existing
   deterministic planner (#224), which already emits `x` + `linkedin` text variants (bodies still
   empty — that's slice 2).
-- ⬜ **Slice 2 — text generation.** Fill the `content_variant` bodies with LLM-drafted, Brand-voice
-  posts (the "generation milestone" `plan.ts` defers). Land them in `awaiting_approval`.
-- ⬜ **Slice 3 — images.** Generate one relevant image per post behind a swappable provider seam
-  (like the LLM/reranker seams); on-by-default vs opt-in TBD.
-- ⬜ **Slice 4 — publish.** LinkedIn/Twitter posting after human approval. Real per-team OAuth vs.
-  draft-to-clipboard for v1 is an open product question.
+- ✅ **Slice 2 — text generation + drafts UX** (`lib/social/generate.ts`). Fills each `content_variant`
+  body with an LLM-drafted, Brand-voice post via the team's answering provider (OpenRouter →
+  OpenAI-compatible → Anthropic), moving them to `awaiting_approval`. Idempotent (fills empty bodies;
+  `force` re-drafts). Admin → Social **"Generate"** plans-then-drafts in one click; the panel now shows
+  each opportunity's X + LinkedIn drafts inline with a **Copy** button (v1 = draft-for-copy-paste,
+  nothing auto-publishes). Reader: `listVariantsByOpportunity`. Answers "is there a proper UX" — yes.
+- ⬜ **Slice 3 — images.** One image per post via **Gemini nano-banana** (product call 2026-07-11),
+  **on by default, capped 10/day, adjustable in settings**. Behind a swappable provider seam. Display
+  in the drafts UX with copy/download. (Open: image storage — Files API vs. a `content_images` table.)
+- ⬜ **Slice 4 — publish.** DECIDED: **v1 is draft-for-copy-paste only** (no real posting). Real
+  per-team LinkedIn/Twitter OAuth posting is a later milestone.
 
 **Open product questions (not blocking slices 1–2):**
 - Which arc-selection signal picks "post-worthy" arcs (confidence? recency? a human toggle per arc)?

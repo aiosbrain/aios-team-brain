@@ -2,14 +2,27 @@
 
 import { revalidatePath } from "next/cache";
 import { adminClient } from "@/lib/db/admin";
+import type { DbClient } from "@/lib/db/types";
 import { requireTeamAdmin as requireAdmin } from "@/lib/auth/guard";
-import { getProviderKey } from "@/lib/integrations/manage";
+import { getProviderKey, getOpenrouterSettings } from "@/lib/integrations/manage";
 import { visibleGroupIds } from "@/lib/graph/group";
+import type { ProviderKeys } from "@/lib/query/claude";
 import { discoverOpportunities } from "@/lib/social/discover";
 import { discoverOpportunitiesFromArcs } from "@/lib/social/discover-arcs";
-import { planOpportunity } from "@/lib/social/plan";
+import { generateForOpportunity } from "@/lib/social/generate";
 
 type DiscoverResult = { ok: boolean; created?: number; skipped?: number; scanned?: number; error?: string };
+
+/** The team's full answering-provider key set (OpenRouter → OpenAI-compatible → Anthropic), same as
+ *  the Q&A path — so social drafts use whatever provider the team configured. */
+async function resolveProviderKeys(db: DbClient, teamId: string): Promise<ProviderKeys> {
+  const [anthropicKey, openaiKey, openrouter] = await Promise.all([
+    getProviderKey(db, teamId, "anthropic"),
+    getProviderKey(db, teamId, "openai"),
+    getOpenrouterSettings(db, teamId),
+  ]);
+  return { anthropicKey, openaiKey, openrouterKey: openrouter.key, openrouterModel: openrouter.model };
+}
 
 /** Run content discovery over recent brain knowledge (admins only). */
 export async function discoverNow(teamSlug: string): Promise<DiscoverResult> {
@@ -49,18 +62,24 @@ export async function discoverFromArcsNow(teamSlug: string): Promise<DiscoverRes
   }
 }
 
-/** Plan an opportunity into platform variants (admins only). Idempotent. */
-export async function planNow(
+/**
+ * Draft the post text for an opportunity's variants (admins only): plans it if needed, then fills
+ * each X + LinkedIn body in the Brand voice and moves them to `awaiting_approval`. One click →
+ * ready-to-copy drafts. Idempotent (only fills empty bodies unless the model returns nothing).
+ */
+export async function generateNow(
   teamSlug: string,
   opportunityId: string
-): Promise<{ ok: boolean; variants?: number; created?: boolean; error?: string }> {
+): Promise<{ ok: boolean; generated?: number; skipped?: number; error?: string }> {
   const ctx = await requireAdmin(teamSlug);
   if (!ctx) return { ok: false, error: "admins only" };
   try {
-    const r = await planOpportunity(adminClient(), ctx.teamId, opportunityId, { memberId: ctx.memberId });
+    const db = adminClient();
+    const keys = await resolveProviderKeys(db, ctx.teamId);
+    const s = await generateForOpportunity(db, ctx.teamId, opportunityId, keys, { actor: { memberId: ctx.memberId } });
     revalidatePath(`/t/${teamSlug}/admin/social`);
-    return { ok: true, variants: r.variants.length, created: r.created };
+    return { ok: true, generated: s.generated, skipped: s.skipped };
   } catch (e) {
-    return { ok: false, error: e instanceof Error ? e.message : "planning failed" };
+    return { ok: false, error: e instanceof Error ? e.message : "generation failed" };
   }
 }

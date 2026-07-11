@@ -264,6 +264,23 @@ export async function setVariantStatus(
   if (error) throw new Error(`setVariantStatus failed: ${error.message}`);
 }
 
+/** Fill a variant's drafted `body` and advance its `status` (generation → awaiting_approval). The
+ *  single writer for variant content — tier is never touched (it stays inherited from the plan). */
+export async function setVariantContent(
+  db: DbClient,
+  teamId: string,
+  id: string,
+  body: string,
+  status: ContentStatus
+): Promise<void> {
+  const { error } = await db
+    .from("content_variants")
+    .update({ body, status, updated_at: new Date().toISOString() })
+    .eq("team_id", teamId)
+    .eq("id", id);
+  if (error) throw new Error(`setVariantContent failed: ${error.message}`);
+}
+
 /** Variants for a plan, visible to `tier` (external → only `access='external'`). */
 export async function listVariants(
   db: DbClient,
@@ -277,4 +294,47 @@ export async function listVariants(
   );
   const { data } = await q.order("created_at", { ascending: true });
   return (data ?? []) as VariantRow[];
+}
+
+/**
+ * Variants grouped by their originating OPPORTUNITY, for a batch of opportunity ids — the read the
+ * Social dashboard uses to show each opportunity's drafts inline. Two tier-scoped queries (plans →
+ * variants), joined in memory. `external` viewers only ever see `access='external'` rows (the plan
+ * and variant carry the same inherited tier), so there is no cross-tier bleed.
+ */
+export async function listVariantsByOpportunity(
+  db: DbClient,
+  teamId: string,
+  opportunityIds: string[],
+  tier: ViewerTier
+): Promise<Map<string, VariantRow[]>> {
+  const out = new Map<string, VariantRow[]>();
+  const ids = [...new Set(opportunityIds)];
+  if (ids.length === 0) return out;
+
+  const { data: plans } = await visibleByAccess(
+    db.from("content_plans").select("id, opportunity_id").eq("team_id", teamId).in("opportunity_id", ids),
+    tier
+  );
+  const planRows = (plans ?? []) as { id: string; opportunity_id: string }[];
+  if (planRows.length === 0) return out;
+  const planToOpp = new Map(planRows.map((p) => [p.id, p.opportunity_id]));
+
+  const { data: variants } = await visibleByAccess(
+    db
+      .from("content_variants")
+      .select(VARIANT_COLS)
+      .eq("team_id", teamId)
+      .in("plan_id", [...planToOpp.keys()]),
+    tier
+  ).order("created_at", { ascending: true });
+
+  for (const v of (variants ?? []) as VariantRow[]) {
+    const oppId = planToOpp.get(v.plan_id);
+    if (!oppId) continue;
+    const list = out.get(oppId) ?? [];
+    list.push(v);
+    out.set(oppId, list);
+  }
+  return out;
 }
