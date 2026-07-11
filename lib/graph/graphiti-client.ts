@@ -81,6 +81,27 @@ export class GraphitiClient {
     return graphitiConfigured(this.base);
   }
 
+  /**
+   * Liveness probe for the admin health card — `GET /healthcheck` with a SHORT timeout (independent of
+   * the 30s call timeout; a dashboard render must not hang on a dead service). Best-effort: returns
+   * false on any error (unconfigured, unreachable, timeout, non-2xx) so a set-but-down Graphiti reads
+   * as *degraded* on the dashboard instead of a false "on" — Graphiti's worker dies silently, so a
+   * configured URL alone is not evidence the leg actually works. Never throws.
+   */
+  async healthcheck(timeoutMs = 2500): Promise<boolean> {
+    if (!this.configured) return false;
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+      const res = await this.fetch(`${this.base}/healthcheck`, { method: "GET", signal: ctrl.signal });
+      return res.ok;
+    } catch {
+      return false;
+    } finally {
+      clearTimeout(t);
+    }
+  }
+
   private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
     if (!this.configured) throw new Error("GRAPHITI_URL not set — Graphiti graph memory is not configured.");
     const ctrl = new AbortController();
