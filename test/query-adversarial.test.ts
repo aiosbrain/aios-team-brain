@@ -45,25 +45,43 @@ describe("short-token recall (FIXED — was Gap #1; eng-heavy channels)", () => 
   });
 });
 
-describe("adversarial: OR-semantics trades precision for recall (multi-topic queries)", () => {
-  // toOrQuery OR-joins every significant term. That's a deliberate recall win for single-topic
-  // paraphrase queries, but it means a multi-topic question can't be expressed as a conjunction:
-  // "the AUTH decision in the PAYMENTS project" becomes auth|decision|payments, which also matches a
-  // pure-payments doc that has nothing to do with auth. At one channel this is tolerable noise; across
-  // dozens of channels the top-N (capped, unranked — see the DB suite) fills with these weak matches.
+describe("conjunctive intent (FIXED — explicit AND operator; precision on multi-topic queries)", () => {
+  // toOrQuery OR-joins every significant term — a deliberate recall win for single-topic paraphrase
+  // queries. But without an AND path a 2-topic question ("auth AND payments") can't narrow to docs
+  // about BOTH; the OR match also surfaces a pure-payments doc that has nothing to do with auth. An
+  // explicit upper-cased `AND` is now an opt-in precision operator (like a search engine's AND):
+  // upper-case only, so ordinary lowercase "and" (a stopword) never wrongly narrows and guts recall.
 
-  it("documents: OR-joins topics (recall bias) — no way to require ALL terms", () => {
+  it("OR-joins topics by default (recall bias) — lowercase 'and' does NOT narrow", () => {
+    // No explicit operator: "the auth decision in the payments project" stays a broad OR.
     expect(toOrQuery("the auth decision in the payments project")).toBe(
       "auth or decision or payments or project"
     );
   });
 
-  it.fails("SHOULD support conjunctive intent so a 2-topic query can require both topics", () => {
-    // A precision-preserving transform would let "auth AND payments" narrow to docs about both.
-    // Today there is no AND path — this asserts the capability we lack.
+  it("supports conjunctive intent so a 2-topic query requires BOTH topics", () => {
+    // websearch_to_tsquery reads space/"and" as AND, so the AND-join narrows to docs about both.
     const q = toOrQuery("auth AND payments");
     expect(q).toMatch(/auth.*and.*payments/i);
     expect(q).not.toBe("auth or payments");
+    expect(q).toBe("auth and payments");
+  });
+
+  it("only the UPPER-CASED operator narrows — lowercase 'and' is an ordinary stopword", () => {
+    // "auth and payments" (lowercase) is a normal question → OR of the two content terms, not a
+    // conjunction. This is what keeps recall intact for everyday phrasing.
+    expect(toOrQuery("auth and payments")).toBe("auth or payments");
+  });
+
+  it("does NOT narrow when a side has no significant topic (avoids false conjunctions)", () => {
+    // "the AND payments" — the left side is all stopwords, so there's no real 2-topic conjunction;
+    // fall back to the OR default rather than emit a one-sided AND.
+    expect(toOrQuery("the AND payments")).toBe("payments");
+  });
+
+  it("collapses multi-word sides to a flat AND of every significant term", () => {
+    // No grouping in websearch_to_tsquery, so "auth flow AND payments" requires all three.
+    expect(toOrQuery("auth flow AND payments")).toBe("auth and flow and payments");
   });
 });
 

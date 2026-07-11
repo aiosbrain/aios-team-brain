@@ -69,9 +69,14 @@ real test") the moment the gap is closed. So the count of `it.fails` in these fi
   large corpora truncate best-ranked-first rather than blowing the token budget.
 - **Dense grounding** — `denseSearch` now applies a distance floor (`DENSE_MAX_DISTANCE`), so far
   nearest-neighbors don't false-ground (they were silently overriding the IDF signal once dense went live).
+- **Conjunctive intent** — an explicit upper-cased `AND` (`buildFtsQuery` / `conjunctiveTerms`) is now an
+  opt-in precision operator: "auth AND payments" narrows to docs about BOTH topics instead of OR-matching
+  either. `websearch_to_tsquery` already reads space/"and" as AND, so the join word alone flips the
+  operator — no SQL change. Upper-case only, so ordinary lowercase "and" (a stopword) never guts recall.
+  Proven at the FTS leg on real Postgres (retrieve()'s recency net always pads recent docs, so the
+  narrowing is only cleanly observable on the ranked candidates the operator controls).
 
 **What remains (intentionally, for the large-collective-data future, not this scale):** the recall
 ceiling BEYOND the candidate cap (a query matching *hundreds* of items) and true relevance beyond
 lexical rank — both the job of **dense/pgvector + a reranker**, whose leg exists (`EMBEDDINGS_URL`,
-`RERANK_URL`) and is now grounded safely. Also open: conjunctive intent ("auth AND payments" as a
-precision narrow), tracked by a unit `it.fails` in `test/query-adversarial`.
+`RERANK_URL`) and is now grounded safely.
