@@ -1,6 +1,8 @@
 import { serverClient } from "@/lib/db/server";
 import { getBrandProfile } from "@/lib/brand/manage";
+import { listBrandAssets } from "@/lib/brand/assets";
 import { BrandManager } from "@/components/admin/brand-manager";
+import { BrandAssetsPanel } from "@/components/admin/brand-assets-panel";
 import type { BrandProfileInput } from "@/lib/brand/schema";
 
 export default async function BrandAdminPage({ params }: { params: Promise<{ team: string }> }) {
@@ -10,7 +12,7 @@ export default async function BrandAdminPage({ params }: { params: Promise<{ tea
   const { data: team } = await db.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
   if (!team) return null;
 
-  const record = await getBrandProfile(db, team.id);
+  const [record, assets] = await Promise.all([getBrandProfile(db, team.id), listBrandAssets(db, team.id)]);
   const profile: BrandProfileInput | null = record
     ? { voice: record.voice, knowledge: record.knowledge, governance: record.governance }
     : null;
@@ -23,6 +25,7 @@ export default async function BrandAdminPage({ params }: { params: Promise<{ tea
         before it can be approved or published. Everything here is optional — fill in what matters.
       </p>
       <BrandManager teamSlug={teamSlug} profile={profile} />
+      <BrandAssetsPanel teamSlug={teamSlug} assets={assets} />
     </div>
   );
 }

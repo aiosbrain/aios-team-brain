@@ -8,6 +8,7 @@ const DATA_TABLES = [
   "content_variants",
   "content_plans",
   "social_opportunities",
+  "brand_assets",
   "brand_profiles",
   "social_jobs",
   "integrations",

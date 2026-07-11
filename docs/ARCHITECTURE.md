@@ -461,7 +461,7 @@ erDiagram
 | `lib/work-events`                                                                     | Merged-work event ingestion; idempotently marks matching tasks done                                                                                       |
 | `lib/pm-sync`                                                                         | Provider-neutral Plane/Linear status sync, errors recorded on task links                                                                                  |
 | `lib/jobs` | Durable job/outbox (Social Brain M0): single-writer store + backoff + registry + in-process poller. The one primitive for async work that must survive redeploys/retries |
-| `lib/brand` | Brand Brain (Social Brain M1): per-team voice/knowledge/governance config — single-writer store + `.strict()` validation. Read by the content pipeline to generate in-voice + enforce governance |
+| `lib/brand` | Brand Brain: per-team voice/knowledge/governance config (`manage`) + reference **assets** library — URLs/logos/examples (`assets`, single-writer). `.strict()` validation. Read by the content pipeline to generate in-voice, layer in assets, and enforce governance |
 | `lib/social` | Social Brain content domain: opportunity → plan → variant single-writer store + lifecycle; the evidence→tier-leak invariant (`tier.ts`); **discovery** (`discover.ts` + `discover-score.ts`) — deterministic scan of recent decision/deliverable/artifact `items` → ranked opportunities (idempotent, per-item tier); and **planning** (`plan.ts`) — brand-aware, deterministic first-cut opportunity → plan + platform variants (idempotent, tier-inherited). Exposed via **Admin → Social**. Tier inherited from evidence, propagated down the chain (no RLS backstop) |
 | `lib/policy`                                                                          | Policy evaluation + approval queue (Organ 6)                                                                                                              |
 | `lib/api`                                                                             | auth, rate-limit, audit, zod schemas                                                                                                                      |
@@ -605,7 +605,7 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 `codebases` · `code_metrics` · `code_contributions` · `github_issues` · `member_emails` ·
 `member_identities` · `member_secrets` · `member_profiles` · `member_time_off` · `member_goals` · `member_provisioning` · `integrations` ·
 `agentic_maturity_snapshots` · `task_pm_links` · `work_events` · `usage_costs` · `subscriptions` · `graph_episodes` · `arc_cache` ·
-`conversations` · `chat_messages` · `ingest_runs` · `social_jobs` · `brand_profiles` · `social_opportunities` · `content_plans` · `content_variants` ·
+`conversations` · `chat_messages` · `ingest_runs` · `social_jobs` · `brand_profiles` · `brand_assets` · `social_opportunities` · `content_plans` · `content_variants` ·
 `meeting_notes` · `meeting_note_attendees`
 <!-- /drift:tables -->
 
