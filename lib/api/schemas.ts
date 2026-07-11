@@ -432,6 +432,9 @@ export const INTEGRATION_TYPES = [
   "anthropic",
   "google",
   "openrouter",
+  // Social publishing provider (Social Brain M5). Secret = the Typefully v2 API key; NON-secret
+  // config carries the social-set id to post into.
+  "typefully",
 ] as const;
 /** Provider key integration types — the LLM providers whose key the query path resolves per team. */
 export const PROVIDER_INTEGRATION_TYPES = ["openai", "anthropic", "google", "openrouter"] as const;
@@ -500,6 +503,8 @@ const integrationConfigSchemas: Record<IntegrationType, z.ZodType> = {
   google: z.object({}).strict(),
   // … except OpenRouter, which also stores the chosen model slug (e.g. "openai/gpt-4o-mini").
   openrouter: z.object({ model: z.string().min(1).max(120).optional() }).strict(),
+  // Typefully: the social-set id to publish into (NON-secret); the API key stays encrypted.
+  typefully: z.object({ socialSetId: z.string().min(1).max(120).optional() }).strict(),
 };
 
 const SECRET_KEY_RE =

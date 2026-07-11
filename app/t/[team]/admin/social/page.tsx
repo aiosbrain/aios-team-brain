@@ -2,9 +2,11 @@ import { serverClient } from "@/lib/db/server";
 import { listOpportunities } from "@/lib/social/store";
 import { listTeamMediaMeta } from "@/lib/media/store";
 import { imageBudget } from "@/lib/media/generate-image";
-import { getAutonomy } from "@/lib/social/settings";
+import { getAutonomy, getPublishDryRun } from "@/lib/social/settings";
 import { listPendingApprovals } from "@/lib/social/approvals";
-import { SocialOpportunitiesPanel, type VariantView, type PendingApprovalView } from "@/components/admin/social-opportunities-panel";
+import { listPublications } from "@/lib/social/publications";
+import { typefullyStatus } from "@/lib/integrations/typefully";
+import { SocialOpportunitiesPanel, type VariantView, type PendingApprovalView, type PublicationView } from "@/components/admin/social-opportunities-panel";
 
 export default async function SocialAdminPage({ params }: { params: Promise<{ team: string }> }) {
   const { team: teamSlug } = await params;
@@ -54,6 +56,17 @@ export default async function SocialAdminPage({ params }: { params: Promise<{ te
     oppTitle: variantCtx[a.variant_id]?.oppTitle ?? "",
   }));
 
+  // Publishing (M5): Typefully connection, dry-run flag, and the publication ledger per variant.
+  const [tf, publishDryRun, pubs] = await Promise.all([
+    typefullyStatus(db, team.id),
+    getPublishDryRun(db, team.id),
+    listPublications(db, team.id, 200),
+  ]);
+  const publicationsByVariant: Record<string, PublicationView[]> = {};
+  for (const p of pubs) {
+    (publicationsByVariant[p.variant_id] ??= []).push({ status: p.status, url: p.external_url, dryRun: p.dry_run });
+  }
+
   return (
     <div className="flex flex-col gap-4">
       <p className="text-sm text-ink-secondary">
@@ -72,6 +85,10 @@ export default async function SocialAdminPage({ params }: { params: Promise<{ te
         imageCap={budget.cap}
         autonomy={autonomy}
         pendingApprovals={pendingApprovals}
+        typefullyConnected={tf.connected}
+        typefullySocialSetId={tf.socialSetId}
+        publishDryRun={publishDryRun}
+        publicationsByVariant={publicationsByVariant}
       />
     </div>
   );

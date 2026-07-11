@@ -10,8 +10,10 @@ import { discoverOpportunitiesFromArcs } from "@/lib/social/discover-arcs";
 import { planOpportunity } from "@/lib/social/plan";
 import { generatePlanDrafts } from "@/lib/social/generate";
 import { generateVariantImage, imageBudget } from "@/lib/media/generate-image";
-import { setAutonomy } from "@/lib/social/settings";
+import { setAutonomy, setPublishDryRun } from "@/lib/social/settings";
 import { submitForApproval, decideApproval } from "@/lib/social/approvals";
+import { scheduleVariant } from "@/lib/social/publish";
+import { saveTypefully } from "@/lib/integrations/typefully";
 import type { AutonomyLevel } from "@/lib/social/autonomy";
 
 type DiscoverResult = { ok: boolean; created?: number; skipped?: number; scanned?: number; error?: string };
@@ -133,6 +135,54 @@ export async function decideContentApproval(
     return { ok: true };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "could not decide" };
+  }
+}
+
+/** Connect (or update) Typefully — the publishing key + social-set id (admins only). */
+export async function connectTypefully(
+  teamSlug: string,
+  input: { key?: string; socialSetId?: string }
+): Promise<{ ok: boolean; error?: string }> {
+  const ctx = await requireAdmin(teamSlug);
+  if (!ctx) return { ok: false, error: "admins only" };
+  try {
+    await saveTypefully(adminClient(), { teamId: ctx.teamId, memberId: ctx.memberId }, input);
+    revalidatePath(`/t/${teamSlug}/admin/social`);
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "could not save Typefully key" };
+  }
+}
+
+/** Toggle publish dry-run mode (admins only). */
+export async function setDryRun(teamSlug: string, dryRun: boolean): Promise<{ ok: boolean; error?: string }> {
+  const ctx = await requireAdmin(teamSlug);
+  if (!ctx) return { ok: false, error: "admins only" };
+  try {
+    await setPublishDryRun(adminClient(), ctx.teamId, dryRun, { memberId: ctx.memberId });
+    revalidatePath(`/t/${teamSlug}/admin/social`);
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "could not set dry-run" };
+  }
+}
+
+/** Schedule/publish an approved variant (admins only). `at` empty = publish now. */
+export async function scheduleVariantAction(
+  teamSlug: string,
+  variantId: string,
+  at?: string
+): Promise<{ ok: boolean; dryRun?: boolean; error?: string }> {
+  const ctx = await requireAdmin(teamSlug);
+  if (!ctx) return { ok: false, error: "admins only" };
+  try {
+    const when = at && at.trim() ? new Date(at) : undefined;
+    if (when && Number.isNaN(when.getTime())) return { ok: false, error: "invalid schedule time" };
+    const pub = await scheduleVariant(adminClient(), ctx.teamId, variantId, { at: when, actor: { memberId: ctx.memberId } });
+    revalidatePath(`/t/${teamSlug}/admin/social`);
+    return { ok: true, dryRun: pub.dry_run };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "could not schedule" };
   }
 }
 
