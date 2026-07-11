@@ -8,6 +8,7 @@ import { visibleGroupIds } from "@/lib/graph/group";
 import { discoverOpportunities } from "@/lib/social/discover";
 import { discoverOpportunitiesFromArcs } from "@/lib/social/discover-arcs";
 import { planOpportunity } from "@/lib/social/plan";
+import { generatePlanDrafts } from "@/lib/social/generate";
 
 type DiscoverResult = { ok: boolean; created?: number; skipped?: number; scanned?: number; error?: string };
 
@@ -62,5 +63,21 @@ export async function planNow(
     return { ok: true, variants: r.variants.length, created: r.created };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "planning failed" };
+  }
+}
+
+/** Generate drafts for an opportunity's variants, in-brand + governance-gated (admins only). */
+export async function generateDrafts(
+  teamSlug: string,
+  opportunityId: string
+): Promise<{ ok: boolean; generated?: number; blocked?: number; failed?: number; error?: string }> {
+  const ctx = await requireAdmin(teamSlug);
+  if (!ctx) return { ok: false, error: "admins only" };
+  try {
+    const s = await generatePlanDrafts(adminClient(), ctx.teamId, opportunityId);
+    revalidatePath(`/t/${teamSlug}/admin/social`);
+    return { ok: true, generated: s.generated, blocked: s.blocked, failed: s.failed };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "generation failed" };
   }
 }

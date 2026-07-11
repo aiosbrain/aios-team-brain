@@ -77,6 +77,7 @@ export interface VariantRow {
   tone: string;
   body: string;
   status: ContentStatus;
+  validation: Record<string, unknown>;
   created_at: string;
   updated_at: string;
 }

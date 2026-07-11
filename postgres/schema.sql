@@ -1120,8 +1120,10 @@ create table if not exists content_variants (
   tone text not null default '',
   body text not null default '',
   status content_status not null default 'planned',
+  validation jsonb not null default '{}',   -- governance gate result (violations/warnings), lib/social/validate
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
+alter table content_variants add column if not exists validation jsonb not null default '{}';
 create index if not exists content_variants_team_plan_idx on content_variants (team_id, plan_id);
 create index if not exists content_variants_team_status_idx on content_variants (team_id, status);
