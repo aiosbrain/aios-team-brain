@@ -463,6 +463,7 @@ erDiagram
 | `lib/jobs` | Durable job/outbox (Social Brain M0): single-writer store + backoff + registry + in-process poller. The one primitive for async work that must survive redeploys/retries |
 | `lib/brand` | Brand Brain: per-team voice/knowledge/governance config (`manage`) + reference **assets** library — URLs/logos/examples (`assets`, single-writer). `.strict()` validation. Read by the content pipeline to generate in-voice, layer in assets, and enforce governance |
 | `lib/social` | Social Brain content domain: opportunity → plan → variant single-writer store + lifecycle; the evidence→tier-leak invariant (`tier.ts`); **discovery** from two sources — `discover.ts` + `discover-score.ts` (deterministic scan of recent decision/deliverable/artifact `items` → ranked opportunities, per-item tier) and **`discover-arcs.ts`** (Layer-3 narrative arcs → opportunities, `access` = most-restrictive tier across the arc's evidence via `evidenceCeiling`, idempotent by `arc:<id>`); **planning** (`plan.ts`) — brand-aware, deterministic first-cut opportunity → plan + platform variants (idempotent, tier-inherited); and **generation** — `llm` (reuse the answer-backend), `generate` (in-brand, evidence-grounded drafts), and the `validate` governance gate (block prohibited/confidential, warn unverified) → variant `generated`/`rejected`. Exposed via **Admin → Social** (`discoverNow` / `discoverFromArcsNow` / `planNow` / `generateDrafts`). Tier inherited from evidence, propagated down the chain (no RLS backstop) |
+| `lib/media` | Social Brain media: OpenAI image adapter (`providers/openai-image`), the opt-in + daily-capped `generate-image` (tier inherited from the variant), and the single-writer `store` (`media_assets`). Bytes served out-of-band by `/api/dashboard/social/media/:id` |
 | `lib/policy`                                                                          | Policy evaluation + approval queue (Organ 6)                                                                                                              |
 | `lib/api`                                                                             | auth, rate-limit, audit, zod schemas                                                                                                                      |
 | `lib/okf`                                                                             | OKF link-graph helpers                                                                                                                                    |
@@ -593,6 +594,7 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 - `GET /api/dashboard/team-work` — dashboard "Working On": per-person summary (narrative arcs) + open tasks + recent accomplishments; session-authed; tier-scoped
 - `POST /api/auth/login` — email+password sign-in, the DEFAULT path (invite-only; uniform 401 on any failure)
 - `POST /api/auth/request-magic-link` — OPTIONAL secondary sign-in: issues + emails a single-use magic link (invite-only; 403 if unknown); never sets a session cookie itself; the login form only offers it when `magicLinkAvailable()` (a domain + mail provider are configured)
+- `GET /api/dashboard/social/media/:id` — serve a generated image's bytes (session-authed, admin-only; team resolved from the asset)
 <!-- /drift:routes -->
 
 ### Database tables
@@ -605,7 +607,7 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 `codebases` · `code_metrics` · `code_contributions` · `github_issues` · `member_emails` ·
 `member_identities` · `member_secrets` · `member_profiles` · `member_time_off` · `member_goals` · `member_provisioning` · `integrations` ·
 `agentic_maturity_snapshots` · `task_pm_links` · `work_events` · `usage_costs` · `subscriptions` · `graph_episodes` · `arc_cache` ·
-`conversations` · `chat_messages` · `ingest_runs` · `social_jobs` · `brand_profiles` · `brand_assets` · `social_opportunities` · `content_plans` · `content_variants` ·
+`conversations` · `chat_messages` · `ingest_runs` · `social_jobs` · `brand_profiles` · `brand_assets` · `social_opportunities` · `content_plans` · `content_variants` · `media_assets` ·
 `meeting_notes` · `meeting_note_attendees`
 <!-- /drift:tables -->
 

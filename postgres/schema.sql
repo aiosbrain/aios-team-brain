@@ -1127,3 +1127,22 @@ create table if not exists content_variants (
 alter table content_variants add column if not exists validation jsonb not null default '{}';
 create index if not exists content_variants_team_plan_idx on content_variants (team_id, plan_id);
 create index if not exists content_variants_team_status_idx on content_variants (team_id, status);
+
+-- Generated media (images) for a variant. Opt-in + rate-capped (lib/media/generate-image); bytes
+-- inline as base64 for V1. Single writer: lib/media/store.ts. Tier inherited from the variant.
+create table if not exists media_assets (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  variant_id uuid not null references content_variants(id) on delete cascade,
+  access access_tier not null,
+  kind text not null default 'image' check (kind in ('image')),
+  provider text not null,
+  model text not null,
+  prompt text not null default '',
+  data_base64 text not null,
+  cost_usd numeric(10, 5) not null default 0,
+  created_by uuid references members(id) on delete set null,
+  created_at timestamptz not null default now()
+);
+create index if not exists media_assets_variant_idx on media_assets (variant_id, created_at desc);
+create index if not exists media_assets_team_day_idx on media_assets (team_id, created_at);

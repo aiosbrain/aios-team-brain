@@ -2,8 +2,8 @@
 
 import { useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
-import { Radar, PenLine, Sparkles, AlertTriangle, ShieldAlert } from "lucide-react";
-import { discoverNow, discoverFromArcsNow, planNow, generateDrafts } from "@/app/t/[team]/admin/social/actions";
+import { Radar, PenLine, Sparkles, AlertTriangle, ShieldAlert, ImagePlus } from "lucide-react";
+import { discoverNow, discoverFromArcsNow, planNow, generateDrafts, generateImage } from "@/app/t/[team]/admin/social/actions";
 import type { OpportunityRow } from "@/lib/social/types";
 
 const PCT = (n: number) => `${Math.round(n * 100)}%`;
@@ -24,10 +24,16 @@ export function SocialOpportunitiesPanel({
   teamSlug,
   opportunities,
   variantsByOpportunity,
+  mediaByVariant,
+  imagesRemaining,
+  imageCap,
 }: {
   teamSlug: string;
   opportunities: OpportunityRow[];
   variantsByOpportunity: Record<string, VariantView[]>;
+  mediaByVariant: Record<string, string[]>;
+  imagesRemaining: number;
+  imageCap: number;
 }) {
   const router = useRouter();
   const [pending, startTransition] = useTransition();
@@ -73,6 +79,7 @@ export function SocialOpportunitiesPanel({
         >
           <Sparkles className="size-4" /> {pending ? "Discovering…" : "Discover from arcs"}
         </button>
+        <span className="ml-auto text-xs text-ink-tertiary">images today: {imageCap - imagesRemaining}/{imageCap}</span>
         {msg ? <p className="text-sm text-emerald-700">{msg}</p> : null}
         {error ? <p className="text-sm text-red">{error}</p> : null}
       </div>
@@ -149,6 +156,28 @@ export function SocialOpportunitiesPanel({
                               <AlertTriangle className="size-3" /> review: {warnings.map((x) => `“${x.term}”`).join(", ")}
                             </p>
                           ) : null}
+                          {(mediaByVariant[v.id] ?? []).length > 0 ? (
+                            <div className="mt-1 flex flex-wrap gap-2">
+                              {(mediaByVariant[v.id] ?? []).map((mid) => (
+                                // eslint-disable-next-line @next/next/no-img-element
+                                <img key={mid} src={`/api/dashboard/social/media/${mid}`} alt="generated graphic" className="size-24 rounded object-cover" />
+                              ))}
+                            </div>
+                          ) : null}
+                          <button
+                            type="button"
+                            onClick={() => act(
+                              () => generateImage(teamSlug, v.id),
+                              (r) => { const x = r as { remaining?: number }; return `Image generated (${x.remaining} left today).`; },
+                              v.id
+                            )}
+                            disabled={pending || imagesRemaining <= 0}
+                            title={imagesRemaining <= 0 ? "Daily image cap reached" : undefined}
+                            className="mt-1 text-xs font-medium text-violet hover:underline disabled:opacity-50"
+                          >
+                            <ImagePlus className="mr-1 inline size-3" />
+                            {busyId === v.id ? "Generating image…" : "Generate image"}
+                          </button>
                         </li>
                       );
                     })}

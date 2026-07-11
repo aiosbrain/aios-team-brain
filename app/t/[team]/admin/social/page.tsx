@@ -1,5 +1,7 @@
 import { serverClient } from "@/lib/db/server";
 import { listOpportunities } from "@/lib/social/store";
+import { listTeamMediaMeta } from "@/lib/media/store";
+import { imageBudget } from "@/lib/media/generate-image";
 import { SocialOpportunitiesPanel, type VariantView } from "@/components/admin/social-opportunities-panel";
 
 export default async function SocialAdminPage({ params }: { params: Promise<{ team: string }> }) {
@@ -27,6 +29,12 @@ export default async function SocialAdminPage({ params }: { params: Promise<{ te
     if (oppId) (byOpportunity[oppId] ??= []).push(v);
   }
 
+  // Generated images grouped by variant (ids only — bytes are served by the media route).
+  const media = await listTeamMediaMeta(db, team.id, 200);
+  const mediaByVariant: Record<string, string[]> = {};
+  for (const m of media) (mediaByVariant[m.variant_id] ??= []).push(m.id);
+  const budget = await imageBudget(db, team.id);
+
   return (
     <div className="flex flex-col gap-4">
       <p className="text-sm text-ink-secondary">
@@ -40,6 +48,9 @@ export default async function SocialAdminPage({ params }: { params: Promise<{ te
         teamSlug={teamSlug}
         opportunities={opportunities}
         variantsByOpportunity={byOpportunity}
+        mediaByVariant={mediaByVariant}
+        imagesRemaining={budget.remaining}
+        imageCap={budget.cap}
       />
     </div>
   );
