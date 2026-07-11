@@ -24,7 +24,7 @@ export async function discoverNow(teamSlug: string): Promise<DiscoverResult> {
   if (!ctx) return { ok: false, error: "admins only" };
   try {
     const s = await discoverOpportunities(adminClient(), ctx.teamId, { actor: { memberId: ctx.memberId } });
-    revalidatePath(`/t/${teamSlug}/admin/social`);
+    revalidatePath(`/t/${teamSlug}/social`);
     return { ok: true, created: s.created, skipped: s.skipped, scanned: s.scanned };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "discovery failed" };
@@ -49,7 +49,7 @@ export async function discoverFromArcsNow(teamSlug: string): Promise<DiscoverRes
     const s = await discoverOpportunitiesFromArcs(db, ctx.teamId, teamSlug, "team", groups, { openaiKey, anthropicKey }, {
       actor: { memberId: ctx.memberId },
     });
-    revalidatePath(`/t/${teamSlug}/admin/social`);
+    revalidatePath(`/t/${teamSlug}/social`);
     return { ok: true, created: s.created, skipped: s.skipped, scanned: s.scanned };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "arc discovery failed" };
@@ -65,7 +65,7 @@ export async function planNow(
   if (!ctx) return { ok: false, error: "admins only" };
   try {
     const r = await planOpportunity(adminClient(), ctx.teamId, opportunityId, { memberId: ctx.memberId });
-    revalidatePath(`/t/${teamSlug}/admin/social`);
+    revalidatePath(`/t/${teamSlug}/social`);
     return { ok: true, variants: r.variants.length, created: r.created };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "planning failed" };
@@ -81,7 +81,7 @@ export async function generateDrafts(
   if (!ctx) return { ok: false, error: "admins only" };
   try {
     const s = await generatePlanDrafts(adminClient(), ctx.teamId, opportunityId);
-    revalidatePath(`/t/${teamSlug}/admin/social`);
+    revalidatePath(`/t/${teamSlug}/social`);
     return { ok: true, generated: s.generated, blocked: s.blocked, failed: s.failed };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "generation failed" };
@@ -97,7 +97,7 @@ export async function setAutonomyLevel(
   if (!ctx) return { ok: false, error: "admins only" };
   try {
     await setAutonomy(adminClient(), ctx.teamId, level, { memberId: ctx.memberId });
-    revalidatePath(`/t/${teamSlug}/admin/social`);
+    revalidatePath(`/t/${teamSlug}/social`);
     return { ok: true };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "could not set autonomy" };
@@ -113,7 +113,7 @@ export async function submitApproval(
   if (!ctx) return { ok: false, error: "admins only" };
   try {
     const r = await submitForApproval(adminClient(), ctx.teamId, variantId, { memberId: ctx.memberId });
-    revalidatePath(`/t/${teamSlug}/admin/social`);
+    revalidatePath(`/t/${teamSlug}/social`);
     return { ok: true, outcome: r.outcome };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "could not submit" };
@@ -131,7 +131,7 @@ export async function decideContentApproval(
   if (!ctx) return { ok: false, error: "admins only" };
   try {
     await decideApproval(adminClient(), ctx.teamId, approvalId, decision, note, { memberId: ctx.memberId });
-    revalidatePath(`/t/${teamSlug}/admin/social`);
+    revalidatePath(`/t/${teamSlug}/social`);
     return { ok: true };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "could not decide" };
@@ -147,7 +147,7 @@ export async function connectTypefully(
   if (!ctx) return { ok: false, error: "admins only" };
   try {
     await saveTypefully(adminClient(), { teamId: ctx.teamId, memberId: ctx.memberId }, input);
-    revalidatePath(`/t/${teamSlug}/admin/social`);
+    revalidatePath(`/t/${teamSlug}/social`);
     return { ok: true };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "could not save Typefully key" };
@@ -160,7 +160,7 @@ export async function setDryRun(teamSlug: string, dryRun: boolean): Promise<{ ok
   if (!ctx) return { ok: false, error: "admins only" };
   try {
     await setPublishDryRun(adminClient(), ctx.teamId, dryRun, { memberId: ctx.memberId });
-    revalidatePath(`/t/${teamSlug}/admin/social`);
+    revalidatePath(`/t/${teamSlug}/social`);
     return { ok: true };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "could not set dry-run" };
@@ -179,7 +179,7 @@ export async function scheduleVariantAction(
     const when = at && at.trim() ? new Date(at) : undefined;
     if (when && Number.isNaN(when.getTime())) return { ok: false, error: "invalid schedule time" };
     const pub = await scheduleVariant(adminClient(), ctx.teamId, variantId, { at: when, actor: { memberId: ctx.memberId } });
-    revalidatePath(`/t/${teamSlug}/admin/social`);
+    revalidatePath(`/t/${teamSlug}/social`);
     return { ok: true, dryRun: pub.dry_run };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "could not schedule" };
@@ -197,7 +197,7 @@ export async function generateImage(
     const db = adminClient();
     await generateVariantImage(db, ctx.teamId, variantId, { actor: { memberId: ctx.memberId } });
     const budget = await imageBudget(db, ctx.teamId);
-    revalidatePath(`/t/${teamSlug}/admin/social`);
+    revalidatePath(`/t/${teamSlug}/social`);
     return { ok: true, remaining: budget.remaining };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "image generation failed" };

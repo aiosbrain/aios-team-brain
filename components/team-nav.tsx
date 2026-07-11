@@ -13,6 +13,7 @@ import {
   GitBranch,
   Home,
   ListTodo,
+  Megaphone,
   NotebookText,
   Shield,
   Sparkles,
@@ -33,6 +34,7 @@ const ICONS = {
   teamtools: Wrench,
   query: Sparkles,
   learning: Brain,
+  social: Megaphone,
   admin: Shield,
   account: UserCircle,
 } as const;

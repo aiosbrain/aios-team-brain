@@ -81,8 +81,12 @@ export default async function TeamLayout({
     { icon: "meetings", label: "Meetings", href: `${base}/meetings` },
     { icon: "learning", label: "Learning", href: `${base}/learning` },
     { icon: "query", label: "Query", href: `${base}/query` },
-    { label: "Settings", children: settingsChildren },
   ];
+  // Social Brain — an operator surface (discovers, generates, spends, publishes), so admin-only.
+  if (me.role === "admin") {
+    items.push({ icon: "social", label: "Social", href: `${base}/social` });
+  }
+  items.push({ label: "Settings", children: settingsChildren });
 
   return (
     <div className="flex min-h-dvh flex-1 bg-surface-raised">
