@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { deriveDenseState, graphConfigured } from "@/lib/query/retrieval-health";
+import { deriveDenseState, deriveGraphState, graphConfigured } from "@/lib/query/retrieval-health";
 
 // Spec: the dense-leg state machine must separate off / building / degraded / healthy so the admin
 // card tells the truth — especially "degraded" (erroring or stalled, red) vs "building" (catching
@@ -52,5 +52,18 @@ describe("graphConfigured", () => {
   it("true for a real http(s) URL with a host", () => {
     expect(graphConfigured("http://graphiti.railway.internal:8000")).toBe(true);
     expect(graphConfigured("https://graph.example.com")).toBe(true);
+  });
+});
+
+describe("deriveGraphState", () => {
+  it("off when not configured (regardless of reachability)", () => {
+    expect(deriveGraphState({ configured: false, reachable: false })).toBe("off");
+    expect(deriveGraphState({ configured: false, reachable: true })).toBe("off");
+  });
+  it("on when configured AND /healthcheck answered", () => {
+    expect(deriveGraphState({ configured: true, reachable: true })).toBe("on");
+  });
+  it("degraded when configured BUT unreachable — the silent-failure case reviving must surface", () => {
+    expect(deriveGraphState({ configured: true, reachable: false })).toBe("degraded");
   });
 });

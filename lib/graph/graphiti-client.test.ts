@@ -58,6 +58,38 @@ describe("GraphitiClient", () => {
     expect(calls).toHaveLength(0);
   });
 
+  it("healthcheck GETs /healthcheck and returns true when the service answers", async () => {
+    const calls: Call[] = [];
+    const okFetch = (async (url: string) => {
+      calls.push({ url: String(url), body: undefined });
+      return { ok: true, status: 200, text: async () => "" } as Response;
+    }) as unknown as typeof fetch;
+    const c = new GraphitiClient({ baseUrl: "http://gx:8000", fetchImpl: okFetch });
+    expect(await c.healthcheck()).toBe(true);
+    expect(calls[0].url).toBe("http://gx:8000/healthcheck");
+  });
+
+  it("healthcheck returns false on a non-2xx (service up but unhealthy)", async () => {
+    const downFetch = (async () => ({ ok: false, status: 503, text: async () => "" }) as Response) as unknown as typeof fetch;
+    const c = new GraphitiClient({ baseUrl: "http://gx:8000", fetchImpl: downFetch });
+    expect(await c.healthcheck()).toBe(false);
+  });
+
+  it("healthcheck returns false (never throws) when the service is unreachable", async () => {
+    const throwFetch = (async () => {
+      throw new Error("ECONNREFUSED");
+    }) as unknown as typeof fetch;
+    const c = new GraphitiClient({ baseUrl: "http://gx:8000", fetchImpl: throwFetch });
+    expect(await c.healthcheck()).toBe(false);
+  });
+
+  it("healthcheck returns false without a call when GRAPHITI_URL is unset/malformed", async () => {
+    const calls: Call[] = [];
+    const c = new GraphitiClient({ baseUrl: "http://", fetchImpl: stubFetch(calls) });
+    expect(await c.healthcheck()).toBe(false);
+    expect(calls).toHaveLength(0); // no doomed call to a malformed URL
+  });
+
   it("search POSTs group_ids + query and returns facts", async () => {
     const calls: Call[] = [];
     const facts = [{ fact: "Alex owns the payments service", valid_at: "2026-06-01T00:00:00Z" }];
