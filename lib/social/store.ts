@@ -35,7 +35,7 @@ const OPP_COLS =
 const PLAN_COLS =
   "id, team_id, opportunity_id, access, objective, audience, status, created_at, updated_at";
 const VARIANT_COLS =
-  "id, team_id, plan_id, access, platform, format, tone, body, status, created_at, updated_at";
+  "id, team_id, plan_id, access, platform, format, tone, body, status, validation, created_at, updated_at";
 
 const SCORE_KEYS = ["novelty_score", "relevance_score", "urgency_score", "confidence_score"] as const;
 
@@ -262,6 +262,36 @@ export async function setVariantStatus(
     .eq("team_id", teamId)
     .eq("id", id);
   if (error) throw new Error(`setVariantStatus failed: ${error.message}`);
+}
+
+export async function getVariant(db: DbClient, teamId: string, id: string): Promise<VariantRow | null> {
+  const { data } = await db
+    .from("content_variants")
+    .select(VARIANT_COLS)
+    .eq("team_id", teamId)
+    .eq("id", id)
+    .maybeSingle();
+  return (data as VariantRow) ?? null;
+}
+
+/** Persist a generated draft's body, status, and governance-gate result together. */
+export async function setVariantGeneration(
+  db: DbClient,
+  teamId: string,
+  id: string,
+  fields: { body: string; status: ContentStatus; validation: Record<string, unknown> }
+): Promise<void> {
+  const { error } = await db
+    .from("content_variants")
+    .update({
+      body: fields.body,
+      status: fields.status,
+      validation: fields.validation,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("team_id", teamId)
+    .eq("id", id);
+  if (error) throw new Error(`setVariantGeneration failed: ${error.message}`);
 }
 
 /** Variants for a plan, visible to `tier` (external → only `access='external'`). */

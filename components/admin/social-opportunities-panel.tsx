@@ -2,58 +2,48 @@
 
 import { useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
-import { Radar, Sparkles } from "lucide-react";
-import { discoverNow, discoverFromArcsNow, planNow } from "@/app/t/[team]/admin/social/actions";
+import { Radar, PenLine, Sparkles, AlertTriangle, ShieldAlert } from "lucide-react";
+import { discoverNow, discoverFromArcsNow, planNow, generateDrafts } from "@/app/t/[team]/admin/social/actions";
 import type { OpportunityRow } from "@/lib/social/types";
 
-const PLANNED_OR_BEYOND = new Set(["planned"]);
-
 const PCT = (n: number) => `${Math.round(n * 100)}%`;
+
+interface Finding {
+  rule: string;
+  term: string;
+}
+export interface VariantView {
+  id: string;
+  platform: string;
+  status: string;
+  body: string;
+  validation: { violations?: Finding[]; warnings?: Finding[] } | null;
+}
 
 export function SocialOpportunitiesPanel({
   teamSlug,
   opportunities,
+  variantsByOpportunity,
 }: {
   teamSlug: string;
   opportunities: OpportunityRow[];
+  variantsByOpportunity: Record<string, VariantView[]>;
 }) {
   const router = useRouter();
   const [pending, startTransition] = useTransition();
-  const [planningId, setPlanningId] = useState<string | null>(null);
+  const [busyId, setBusyId] = useState<string | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  function run() {
+  function act(fn: () => Promise<{ ok: boolean; error?: string }>, onOk: (r: unknown) => string, id?: string) {
     setError(null);
     setMsg(null);
+    setBusyId(id ?? null);
     startTransition(async () => {
-      const res = await discoverNow(teamSlug);
-      if (!res.ok) return setError(res.error ?? "discovery failed");
-      setMsg(`Scanned ${res.scanned}, created ${res.created}, skipped ${res.skipped}.`);
-      router.refresh();
-    });
-  }
-
-  function runArcs() {
-    setError(null);
-    setMsg(null);
-    startTransition(async () => {
-      const res = await discoverFromArcsNow(teamSlug);
-      if (!res.ok) return setError(res.error ?? "arc discovery failed");
-      setMsg(`Arcs: scanned ${res.scanned}, created ${res.created}, skipped ${res.skipped}.`);
-      router.refresh();
-    });
-  }
-
-  function plan(id: string) {
-    setError(null);
-    setMsg(null);
-    setPlanningId(id);
-    startTransition(async () => {
-      const res = await planNow(teamSlug, id);
-      setPlanningId(null);
-      if (!res.ok) return setError(res.error ?? "planning failed");
-      setMsg(res.created ? `Planned — ${res.variants} variants created.` : "Already planned.");
+      const res = await fn();
+      setBusyId(null);
+      if (!res.ok) return setError(res.error ?? "something went wrong");
+      setMsg(onOk(res));
       router.refresh();
     });
   }
@@ -61,10 +51,26 @@ export function SocialOpportunitiesPanel({
   return (
     <div className="flex flex-col gap-4">
       <div className="flex items-center gap-3">
-        <button type="button" onClick={run} disabled={pending} className="btn-prism justify-center">
-          <Radar className="size-4" /> {pending ? "Discovering…" : "Discover now"}
+        <button
+          type="button"
+          onClick={() => act(() => discoverNow(teamSlug), (r) => {
+            const x = r as { scanned?: number; created?: number; skipped?: number };
+            return `Scanned ${x.scanned}, created ${x.created}, skipped ${x.skipped}.`;
+          })}
+          disabled={pending}
+          className="btn-prism justify-center"
+        >
+          <Radar className="size-4" /> {pending && !busyId ? "Discovering…" : "Discover now"}
         </button>
-        <button type="button" onClick={runArcs} disabled={pending} className="btn-ghost justify-center">
+        <button
+          type="button"
+          onClick={() => act(() => discoverFromArcsNow(teamSlug), (r) => {
+            const x = r as { scanned?: number; created?: number; skipped?: number };
+            return `Arcs: scanned ${x.scanned}, created ${x.created}, skipped ${x.skipped}.`;
+          })}
+          disabled={pending}
+          className="btn-ghost justify-center"
+        >
           <Sparkles className="size-4" /> {pending ? "Discovering…" : "Discover from arcs"}
         </button>
         {msg ? <p className="text-sm text-emerald-700">{msg}</p> : null}
@@ -73,59 +79,85 @@ export function SocialOpportunitiesPanel({
 
       {opportunities.length === 0 ? (
         <p className="text-sm text-ink-tertiary">
-          No opportunities yet. “Discover now” scans recent decisions, deliverables, and commits and
-          ranks what’s worth communicating.
+          No opportunities yet. “Discover now” scans recent decisions, deliverables, and commits.
         </p>
       ) : (
-        <div className="prism-card overflow-hidden">
-          <table className="w-full text-sm">
-            <thead className="text-left text-xs text-ink-tertiary">
-              <tr className="border-b border-border-subtle">
-                <th className="px-3 py-2 font-medium">Title</th>
-                <th className="px-3 py-2 font-medium">Tier</th>
-                <th className="px-3 py-2 font-medium">Source</th>
-                <th className="px-3 py-2 font-medium">Novelty</th>
-                <th className="px-3 py-2 font-medium">Relevance</th>
-                <th className="px-3 py-2 font-medium">Status</th>
-                <th className="px-3 py-2 font-medium"></th>
-              </tr>
-            </thead>
-            <tbody>
-              {opportunities.map((o) => (
-                <tr key={o.id} className="border-b border-border-subtle/50">
-                  <td className="px-3 py-2 text-ink">{o.title}</td>
-                  <td className="px-3 py-2">
-                    <span
-                      className={`rounded px-1.5 py-0.5 text-xs ${
-                        o.access === "external" ? "bg-amber-100 text-amber-800" : "bg-slate-100 text-slate-700"
-                      }`}
+        <ul className="flex flex-col gap-3">
+          {opportunities.map((o) => {
+            const variants = variantsByOpportunity[o.id] ?? [];
+            const planned = o.status === "planned";
+            return (
+              <li key={o.id} className="prism-card flex flex-col gap-2 p-4">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="font-medium text-ink">{o.title}</span>
+                  <span
+                    className={`rounded px-1.5 py-0.5 text-xs ${
+                      o.access === "external" ? "bg-amber-100 text-amber-800" : "bg-slate-100 text-slate-700"
+                    }`}
+                  >
+                    {o.access}
+                  </span>
+                  <span className="text-xs text-ink-tertiary">{o.source_type}</span>
+                  <span className="text-xs text-ink-tertiary">· novelty {PCT(o.novelty_score)} · relevance {PCT(o.relevance_score)}</span>
+                  <span className="ml-auto text-xs text-ink-tertiary">{o.status}</span>
+                  {!planned ? (
+                    <button
+                      type="button"
+                      onClick={() => act(() => planNow(teamSlug, o.id), () => "Planned.", o.id)}
+                      disabled={pending}
+                      className="text-xs font-medium text-violet hover:underline disabled:opacity-50"
                     >
-                      {o.access}
-                    </span>
-                  </td>
-                  <td className="px-3 py-2 text-ink-tertiary">{o.source_type}</td>
-                  <td className="px-3 py-2 text-ink-secondary">{PCT(o.novelty_score)}</td>
-                  <td className="px-3 py-2 text-ink-secondary">{PCT(o.relevance_score)}</td>
-                  <td className="px-3 py-2 text-ink-tertiary">{o.status}</td>
-                  <td className="px-3 py-2 text-right">
-                    {PLANNED_OR_BEYOND.has(o.status) ? (
-                      <span className="text-xs text-ink-tertiary">planned</span>
-                    ) : (
-                      <button
-                        type="button"
-                        onClick={() => plan(o.id)}
-                        disabled={pending}
-                        className="text-xs font-medium text-violet hover:underline disabled:opacity-50"
-                      >
-                        {planningId === o.id ? "Planning…" : "Plan"}
-                      </button>
-                    )}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+                      <PenLine className="mr-1 inline size-3" />
+                      {busyId === o.id ? "Planning…" : "Plan"}
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => act(
+                        () => generateDrafts(teamSlug, o.id),
+                        (r) => { const x = r as { generated?: number; blocked?: number }; return `Generated ${x.generated}, blocked ${x.blocked}.`; },
+                        o.id
+                      )}
+                      disabled={pending}
+                      className="text-xs font-medium text-violet hover:underline disabled:opacity-50"
+                    >
+                      <Sparkles className="mr-1 inline size-3" />
+                      {busyId === o.id ? "Generating…" : "Generate drafts"}
+                    </button>
+                  )}
+                </div>
+
+                {variants.length > 0 ? (
+                  <ul className="flex flex-col gap-2 border-t border-border-subtle pt-2">
+                    {variants.map((v) => {
+                      const violations = v.validation?.violations ?? [];
+                      const warnings = v.validation?.warnings ?? [];
+                      return (
+                        <li key={v.id} className="text-sm">
+                          <div className="flex items-center gap-2 text-xs text-ink-tertiary">
+                            <span className="font-medium uppercase text-ink-secondary">{v.platform}</span>
+                            <span>· {v.status}</span>
+                          </div>
+                          {v.body ? <p className="whitespace-pre-wrap text-ink">{v.body}</p> : <p className="text-ink-tertiary">— not generated —</p>}
+                          {violations.length > 0 ? (
+                            <p className="mt-0.5 flex items-center gap-1 text-xs text-red">
+                              <ShieldAlert className="size-3" /> blocked: {violations.map((x) => `${x.rule} “${x.term}”`).join(", ")}
+                            </p>
+                          ) : null}
+                          {warnings.length > 0 ? (
+                            <p className="mt-0.5 flex items-center gap-1 text-xs text-amber-700">
+                              <AlertTriangle className="size-3" /> review: {warnings.map((x) => `“${x.term}”`).join(", ")}
+                            </p>
+                          ) : null}
+                        </li>
+                      );
+                    })}
+                  </ul>
+                ) : null}
+              </li>
+            );
+          })}
+        </ul>
       )}
     </div>
   );
