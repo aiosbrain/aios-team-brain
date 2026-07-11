@@ -2,7 +2,9 @@ import { serverClient } from "@/lib/db/server";
 import { listOpportunities } from "@/lib/social/store";
 import { listTeamMediaMeta } from "@/lib/media/store";
 import { imageBudget } from "@/lib/media/generate-image";
-import { SocialOpportunitiesPanel, type VariantView } from "@/components/admin/social-opportunities-panel";
+import { getAutonomy } from "@/lib/social/settings";
+import { listPendingApprovals } from "@/lib/social/approvals";
+import { SocialOpportunitiesPanel, type VariantView, type PendingApprovalView } from "@/components/admin/social-opportunities-panel";
 
 export default async function SocialAdminPage({ params }: { params: Promise<{ team: string }> }) {
   const { team: teamSlug } = await params;
@@ -35,6 +37,23 @@ export default async function SocialAdminPage({ params }: { params: Promise<{ te
   for (const m of media) (mediaByVariant[m.variant_id] ??= []).push(m.id);
   const budget = await imageBudget(db, team.id);
 
+  // Approval workflow (M4): autonomy + the pending queue, with per-variant context for display.
+  const autonomy = await getAutonomy(db, team.id);
+  const pendingRows = await listPendingApprovals(db, team.id);
+  const variantCtx: Record<string, { platform: string; body: string; oppTitle: string }> = {};
+  for (const [oppId, vs] of Object.entries(byOpportunity)) {
+    const oppTitle = opportunities.find((o) => o.id === oppId)?.title ?? "";
+    for (const v of vs) variantCtx[v.id] = { platform: v.platform, body: v.body, oppTitle };
+  }
+  const pendingApprovals: PendingApprovalView[] = pendingRows.map((a) => ({
+    id: a.id,
+    variantId: a.variant_id,
+    access: a.access,
+    platform: variantCtx[a.variant_id]?.platform ?? "",
+    body: variantCtx[a.variant_id]?.body ?? "",
+    oppTitle: variantCtx[a.variant_id]?.oppTitle ?? "",
+  }));
+
   return (
     <div className="flex flex-col gap-4">
       <p className="text-sm text-ink-secondary">
@@ -51,6 +70,8 @@ export default async function SocialAdminPage({ params }: { params: Promise<{ te
         mediaByVariant={mediaByVariant}
         imagesRemaining={budget.remaining}
         imageCap={budget.cap}
+        autonomy={autonomy}
+        pendingApprovals={pendingApprovals}
       />
     </div>
   );

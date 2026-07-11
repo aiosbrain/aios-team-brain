@@ -2,8 +2,18 @@
 
 import { useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
-import { Radar, PenLine, Sparkles, AlertTriangle, ShieldAlert, ImagePlus } from "lucide-react";
-import { discoverNow, discoverFromArcsNow, planNow, generateDrafts, generateImage } from "@/app/t/[team]/admin/social/actions";
+import { Radar, PenLine, Sparkles, AlertTriangle, ShieldAlert, ImagePlus, Send, Check, X } from "lucide-react";
+import {
+  discoverNow,
+  discoverFromArcsNow,
+  planNow,
+  generateDrafts,
+  generateImage,
+  submitApproval,
+  decideContentApproval,
+  setAutonomyLevel,
+} from "@/app/t/[team]/admin/social/actions";
+import { AUTONOMY_LEVELS, type AutonomyLevel } from "@/lib/social/autonomy";
 import type { OpportunityRow } from "@/lib/social/types";
 
 const PCT = (n: number) => `${Math.round(n * 100)}%`;
@@ -19,6 +29,14 @@ export interface VariantView {
   body: string;
   validation: { violations?: Finding[]; warnings?: Finding[] } | null;
 }
+export interface PendingApprovalView {
+  id: string;
+  variantId: string;
+  access: string;
+  platform: string;
+  body: string;
+  oppTitle: string;
+}
 
 export function SocialOpportunitiesPanel({
   teamSlug,
@@ -27,6 +45,8 @@ export function SocialOpportunitiesPanel({
   mediaByVariant,
   imagesRemaining,
   imageCap,
+  autonomy,
+  pendingApprovals,
 }: {
   teamSlug: string;
   opportunities: OpportunityRow[];
@@ -34,10 +54,13 @@ export function SocialOpportunitiesPanel({
   mediaByVariant: Record<string, string[]>;
   imagesRemaining: number;
   imageCap: number;
+  autonomy: AutonomyLevel;
+  pendingApprovals: PendingApprovalView[];
 }) {
   const router = useRouter();
   const [pending, startTransition] = useTransition();
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [notes, setNotes] = useState<Record<string, string>>({});
   const [msg, setMsg] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -79,10 +102,23 @@ export function SocialOpportunitiesPanel({
         >
           <Sparkles className="size-4" /> {pending ? "Discovering…" : "Discover from arcs"}
         </button>
-        <span className="ml-auto text-xs text-ink-tertiary">images today: {imageCap - imagesRemaining}/{imageCap}</span>
-        {msg ? <p className="text-sm text-emerald-700">{msg}</p> : null}
-        {error ? <p className="text-sm text-red">{error}</p> : null}
+        <label className="ml-auto flex items-center gap-1 text-xs text-ink-tertiary">
+          Autonomy
+          <select
+            className="prism-input py-1"
+            value={autonomy}
+            disabled={pending}
+            onChange={(e) => act(() => setAutonomyLevel(teamSlug, e.target.value as AutonomyLevel), () => "Autonomy updated.")}
+          >
+            {AUTONOMY_LEVELS.map((l) => (
+              <option key={l} value={l}>{l.replace(/_/g, " ")}</option>
+            ))}
+          </select>
+        </label>
+        <span className="text-xs text-ink-tertiary">images today: {imageCap - imagesRemaining}/{imageCap}</span>
       </div>
+      {msg ? <p className="text-sm text-emerald-700">{msg}</p> : null}
+      {error ? <p className="text-sm text-red">{error}</p> : null}
 
       {opportunities.length === 0 ? (
         <p className="text-sm text-ink-tertiary">
@@ -178,6 +214,21 @@ export function SocialOpportunitiesPanel({
                             <ImagePlus className="mr-1 inline size-3" />
                             {busyId === v.id ? "Generating image…" : "Generate image"}
                           </button>
+                          {v.status === "generated" ? (
+                            <button
+                              type="button"
+                              onClick={() => act(
+                                () => submitApproval(teamSlug, v.id),
+                                (r) => { const x = r as { outcome?: string }; return x.outcome === "auto_approved" ? "Auto-approved." : "Submitted for approval."; },
+                                v.id
+                              )}
+                              disabled={pending}
+                              className="ml-3 mt-1 text-xs font-medium text-violet hover:underline disabled:opacity-50"
+                            >
+                              <Send className="mr-1 inline size-3" />
+                              {busyId === v.id ? "Submitting…" : "Submit for approval"}
+                            </button>
+                          ) : null}
                         </li>
                       );
                     })}
@@ -188,6 +239,52 @@ export function SocialOpportunitiesPanel({
           })}
         </ul>
       )}
+
+      {pendingApprovals.length > 0 ? (
+        <div className="prism-card flex flex-col gap-3 p-4">
+          <p className="text-sm font-medium text-ink">Pending approvals ({pendingApprovals.length})</p>
+          <ul className="flex flex-col gap-3">
+            {pendingApprovals.map((a) => (
+              <li key={a.id} className="flex flex-col gap-1 border-b border-border-subtle/60 pb-3 last:border-0 last:pb-0">
+                <div className="flex items-center gap-2 text-xs text-ink-tertiary">
+                  <span className="font-medium uppercase text-ink-secondary">{a.platform}</span>
+                  <span
+                    className={`rounded px-1.5 py-0.5 ${a.access === "external" ? "bg-amber-100 text-amber-800" : "bg-slate-100 text-slate-700"}`}
+                  >
+                    {a.access}
+                  </span>
+                  <span>· {a.oppTitle}</span>
+                </div>
+                <p className="whitespace-pre-wrap text-sm text-ink">{a.body}</p>
+                <div className="mt-1 flex items-center gap-2">
+                  <input
+                    className="prism-input flex-1 py-1 text-xs"
+                    placeholder="note (optional)"
+                    value={notes[a.id] ?? ""}
+                    onChange={(e) => setNotes((n) => ({ ...n, [a.id]: e.target.value }))}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => act(() => decideContentApproval(teamSlug, a.id, "approved", notes[a.id] ?? ""), () => "Approved.", a.id)}
+                    disabled={pending}
+                    className="flex items-center gap-1 text-xs font-medium text-emerald-700 hover:underline disabled:opacity-50"
+                  >
+                    <Check className="size-3" /> Approve
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => act(() => decideContentApproval(teamSlug, a.id, "denied", notes[a.id] ?? ""), () => "Denied.", a.id)}
+                    disabled={pending}
+                    className="flex items-center gap-1 text-xs font-medium text-red hover:underline disabled:opacity-50"
+                  >
+                    <X className="size-3" /> Deny
+                  </button>
+                </div>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
     </div>
   );
 }

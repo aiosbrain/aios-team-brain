@@ -1146,3 +1146,26 @@ create table if not exists media_assets (
 );
 create index if not exists media_assets_variant_idx on media_assets (variant_id, created_at desc);
 create index if not exists media_assets_team_day_idx on media_assets (team_id, created_at);
+
+-- Social Brain approval workflow (M4). Per-team autonomy gate + the content-approval queue.
+-- Single writers: lib/social/settings.ts (autonomy), lib/social/approvals.ts (queue).
+create table if not exists social_settings (
+  team_id uuid primary key references teams(id) on delete cascade,
+  autonomy text not null default 'draft_only'
+    check (autonomy in ('draft_only', 'approval_required', 'auto_publish_low_risk', 'fully_autonomous')),
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists content_approvals (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  variant_id uuid not null references content_variants(id) on delete cascade,
+  access access_tier not null,
+  status approval_status not null default 'pending',
+  decided_by uuid references members(id) on delete set null,
+  decided_at timestamptz,
+  decision_note text not null default '',
+  created_at timestamptz not null default now()
+);
+create index if not exists content_approvals_team_status_idx on content_approvals (team_id, status, created_at desc);
+create index if not exists content_approvals_variant_idx on content_approvals (variant_id);

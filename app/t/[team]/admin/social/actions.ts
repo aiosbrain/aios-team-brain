@@ -10,6 +10,9 @@ import { discoverOpportunitiesFromArcs } from "@/lib/social/discover-arcs";
 import { planOpportunity } from "@/lib/social/plan";
 import { generatePlanDrafts } from "@/lib/social/generate";
 import { generateVariantImage, imageBudget } from "@/lib/media/generate-image";
+import { setAutonomy } from "@/lib/social/settings";
+import { submitForApproval, decideApproval } from "@/lib/social/approvals";
+import type { AutonomyLevel } from "@/lib/social/autonomy";
 
 type DiscoverResult = { ok: boolean; created?: number; skipped?: number; scanned?: number; error?: string };
 
@@ -80,6 +83,56 @@ export async function generateDrafts(
     return { ok: true, generated: s.generated, blocked: s.blocked, failed: s.failed };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "generation failed" };
+  }
+}
+
+/** Set the team's autonomy level (admins only). */
+export async function setAutonomyLevel(
+  teamSlug: string,
+  level: AutonomyLevel
+): Promise<{ ok: boolean; error?: string }> {
+  const ctx = await requireAdmin(teamSlug);
+  if (!ctx) return { ok: false, error: "admins only" };
+  try {
+    await setAutonomy(adminClient(), ctx.teamId, level, { memberId: ctx.memberId });
+    revalidatePath(`/t/${teamSlug}/admin/social`);
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "could not set autonomy" };
+  }
+}
+
+/** Submit a generated variant for approval (admins only). Routed by autonomy. */
+export async function submitApproval(
+  teamSlug: string,
+  variantId: string
+): Promise<{ ok: boolean; outcome?: string; error?: string }> {
+  const ctx = await requireAdmin(teamSlug);
+  if (!ctx) return { ok: false, error: "admins only" };
+  try {
+    const r = await submitForApproval(adminClient(), ctx.teamId, variantId, { memberId: ctx.memberId });
+    revalidatePath(`/t/${teamSlug}/admin/social`);
+    return { ok: true, outcome: r.outcome };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "could not submit" };
+  }
+}
+
+/** Approve or deny a pending content approval (admins only). */
+export async function decideContentApproval(
+  teamSlug: string,
+  approvalId: string,
+  decision: "approved" | "denied",
+  note: string
+): Promise<{ ok: boolean; error?: string }> {
+  const ctx = await requireAdmin(teamSlug);
+  if (!ctx) return { ok: false, error: "admins only" };
+  try {
+    await decideApproval(adminClient(), ctx.teamId, approvalId, decision, note, { memberId: ctx.memberId });
+    revalidatePath(`/t/${teamSlug}/admin/social`);
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "could not decide" };
   }
 }
 
