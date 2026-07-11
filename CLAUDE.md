@@ -2,6 +2,10 @@
 
 # AIOS Team Brain — operating manual
 
+**Skill/doc routing: see `RESOLVER.md`** — gates (architecture-map loop, Railway
+read-only, tier isolation, brain-api, migrations, spec-first tests, Linear-only)
+and skill routing.
+
 This file is read at the start of every session. It encodes the durable conventions for
 working in this repo. Follow it over generic habits.
 
