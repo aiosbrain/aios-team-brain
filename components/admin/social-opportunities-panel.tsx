@@ -2,8 +2,8 @@
 
 import { useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
-import { Radar } from "lucide-react";
-import { discoverNow, planNow } from "@/app/t/[team]/admin/social/actions";
+import { Radar, Sparkles } from "lucide-react";
+import { discoverNow, discoverFromArcsNow, planNow } from "@/app/t/[team]/admin/social/actions";
 import type { OpportunityRow } from "@/lib/social/types";
 
 const PLANNED_OR_BEYOND = new Set(["planned"]);
@@ -34,6 +34,17 @@ export function SocialOpportunitiesPanel({
     });
   }
 
+  function runArcs() {
+    setError(null);
+    setMsg(null);
+    startTransition(async () => {
+      const res = await discoverFromArcsNow(teamSlug);
+      if (!res.ok) return setError(res.error ?? "arc discovery failed");
+      setMsg(`Arcs: scanned ${res.scanned}, created ${res.created}, skipped ${res.skipped}.`);
+      router.refresh();
+    });
+  }
+
   function plan(id: string) {
     setError(null);
     setMsg(null);
@@ -52,6 +63,9 @@ export function SocialOpportunitiesPanel({
       <div className="flex items-center gap-3">
         <button type="button" onClick={run} disabled={pending} className="btn-prism justify-center">
           <Radar className="size-4" /> {pending ? "Discovering…" : "Discover now"}
+        </button>
+        <button type="button" onClick={runArcs} disabled={pending} className="btn-ghost justify-center">
+          <Sparkles className="size-4" /> {pending ? "Discovering…" : "Discover from arcs"}
         </button>
         {msg ? <p className="text-sm text-emerald-700">{msg}</p> : null}
         {error ? <p className="text-sm text-red">{error}</p> : null}

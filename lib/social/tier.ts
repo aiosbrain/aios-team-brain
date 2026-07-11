@@ -34,7 +34,17 @@ export function violatesEvidenceTier(
   evidenceAccess: AccessTier[],
   missing: number
 ): boolean {
+  return RANK[requested] > RANK[evidenceCeiling(evidenceAccess, missing)];
+}
+
+/**
+ * The most-public tier an opportunity built from this evidence may hold. `team` if any evidence is
+ * team-tier OR any referenced item is missing (fail-closed); `external` only when every cited item
+ * resolved and is itself external. Callers that discover from multi-item sources (e.g. narrative
+ * arcs, whose evidence spans several items of possibly-mixed tier) use this to pick a tier-SAFE
+ * `access` up front, so `createOpportunity` never has to reject them for over-exposure.
+ */
+export function evidenceCeiling(evidenceAccess: AccessTier[], missing: number): AccessTier {
   const anyRestrictive = missing > 0 || evidenceAccess.some((a) => a === "team");
-  const ceiling: AccessTier = anyRestrictive ? "team" : "external";
-  return RANK[requested] > RANK[ceiling];
+  return anyRestrictive ? "team" : "external";
 }

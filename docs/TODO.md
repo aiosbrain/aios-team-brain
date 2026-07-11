@@ -68,14 +68,27 @@ M1 Brand Brain voice/knowledge/governance config (#218), M2 content domain model
    state + the approvals surface — nothing auto-publishes (mirrors the "promote, never auto-publish"
    philosophy the Radar already follows).
 
-**Open product questions before building the publish leg:**
+**Build status (slices):**
+- ✅ **Slice 1 — arc → opportunity discovery** (`lib/social/discover-arcs.ts`). Reads Layer-3 narrative
+  arcs and creates one `social_opportunity` per arc, at its **tier-safe** access (most-restrictive
+  tier across the arc's evidence, fail-closed — an arc built from internal items stays `team` and
+  can't become a public post). Idempotent by `arc:<id>`. Wired as **Admin → Social → "Discover from
+  arcs"** (`discoverFromArcsNow`), alongside the existing item-based discovery. Feeds the existing
+  deterministic planner (#224), which already emits `x` + `linkedin` text variants (bodies still
+  empty — that's slice 2).
+- ⬜ **Slice 2 — text generation.** Fill the `content_variant` bodies with LLM-drafted, Brand-voice
+  posts (the "generation milestone" `plan.ts` defers). Land them in `awaiting_approval`.
+- ⬜ **Slice 3 — images.** Generate one relevant image per post behind a swappable provider seam
+  (like the LLM/reranker seams); on-by-default vs opt-in TBD.
+- ⬜ **Slice 4 — publish.** LinkedIn/Twitter posting after human approval. Real per-team OAuth vs.
+  draft-to-clipboard for v1 is an open product question.
+
+**Open product questions (not blocking slices 1–2):**
 - Which arc-selection signal picks "post-worthy" arcs (confidence? recency? a human toggle per arc)?
+  Slice 1 currently surfaces *all* arcs as candidates, scored by confidence + recency; a human picks
+  which to plan.
 - LinkedIn/Twitter posting = real API integration (OAuth per team) or draft-to-clipboard for v1?
 - Image generation provider + whether images are on by default or opt-in per post.
-
-**First build slice (once the above are answered):** arc → `social_opportunity` selection + a
-`content_plan`/`content_variant` per channel with LLM-drafted text (Brand voice) landing in
-`awaiting_approval`. Publish + image-gen as follow-on slices.
 
 ---
 
