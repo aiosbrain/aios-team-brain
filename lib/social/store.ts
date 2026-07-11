@@ -4,7 +4,9 @@ import { visibleByAccess, type ViewerTier } from "@/lib/auth/visibility";
 import { TierLeakError, violatesEvidenceTier } from "./tier";
 import type {
   AccessTier,
+  ContentImageRow,
   ContentStatus,
+  CreateImageInput,
   CreateOpportunityInput,
   CreatePlanInput,
   CreateVariantInput,
@@ -36,6 +38,7 @@ const PLAN_COLS =
   "id, team_id, opportunity_id, access, objective, audience, status, created_at, updated_at";
 const VARIANT_COLS =
   "id, team_id, plan_id, access, platform, format, tone, body, status, created_at, updated_at";
+const IMAGE_COLS = "id, team_id, variant_id, access, mime, data_base64, prompt, created_at";
 
 const SCORE_KEYS = ["novelty_score", "relevance_score", "urgency_score", "confidence_score"] as const;
 
@@ -337,4 +340,89 @@ export async function listVariantsByOpportunity(
     out.set(oppId, list);
   }
   return out;
+}
+
+// ── content_images (generated post images) ───────────────────────────────────
+
+/**
+ * Store (or replace) the generated image for a variant. Access is INHERITED from the variant — the
+ * caller never sets it, so a team-tier post's image can't be widened to `external`. One image per
+ * variant (unique variant_id); a regen upserts. Sole writer of `content_images`.
+ */
+export async function addContentImage(
+  db: DbClient,
+  teamId: string,
+  variantId: string,
+  input: CreateImageInput
+): Promise<ContentImageRow> {
+  const { data: v } = await db
+    .from("content_variants")
+    .select("id, access")
+    .eq("team_id", teamId)
+    .eq("id", variantId)
+    .maybeSingle();
+  const variant = v as { id: string; access: AccessTier } | null;
+  if (!variant) throw new Error(`addContentImage: variant ${variantId} not found for team`);
+
+  const { data, error } = await db
+    .from("content_images")
+    .upsert(
+      {
+        team_id: teamId,
+        variant_id: variantId,
+        access: variant.access, // inherited — caller cannot widen tier
+        mime: input.mime,
+        data_base64: input.dataBase64,
+        prompt: input.prompt ?? "",
+        created_at: new Date().toISOString(),
+      },
+      { onConflict: "variant_id" }
+    )
+    .select(IMAGE_COLS)
+    .single();
+  if (error || !data) throw new Error(`addContentImage failed: ${error?.message ?? "no row"}`);
+  return data as ContentImageRow;
+}
+
+/** One image by id, tier-scoped (for the serving route). Null on miss or wrong tier. */
+export async function getContentImage(
+  db: DbClient,
+  teamId: string,
+  id: string,
+  tier: ViewerTier
+): Promise<ContentImageRow | null> {
+  const { data } = await visibleByAccess(
+    db.from("content_images").select(IMAGE_COLS).eq("team_id", teamId).eq("id", id),
+    tier
+  ).maybeSingle();
+  return (data as ContentImageRow | null) ?? null;
+}
+
+/** variantId → imageId for a batch of variants, tier-scoped — lets the dashboard build image URLs
+ *  without loading the (large) base64 payloads. */
+export async function listImageIdsByVariant(
+  db: DbClient,
+  teamId: string,
+  variantIds: string[],
+  tier: ViewerTier
+): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  const ids = [...new Set(variantIds)];
+  if (ids.length === 0) return out;
+  const { data } = await visibleByAccess(
+    db.from("content_images").select("id, variant_id").eq("team_id", teamId).in("variant_id", ids),
+    tier
+  );
+  for (const r of (data ?? []) as { id: string; variant_id: string }[]) out.set(r.variant_id, r.id);
+  return out;
+}
+
+/** How many images this team has generated since `sinceIso` — the daily-cap counter. */
+export async function countImagesSince(db: DbClient, teamId: string, sinceIso: string): Promise<number> {
+  const { data } = await db
+    .from("content_images")
+    .select("id")
+    .eq("team_id", teamId)
+    .gte("created_at", sinceIso);
+  return (data ?? []).length;
 }

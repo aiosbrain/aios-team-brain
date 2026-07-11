@@ -108,6 +108,24 @@ export interface CreateVariantInput {
   body?: string;
 }
 
+/** A generated image for a post variant (base64-encoded; tier inherited from the variant). */
+export interface ContentImageRow {
+  id: string;
+  team_id: string;
+  variant_id: string;
+  access: AccessTier;
+  mime: string;
+  data_base64: string;
+  prompt: string;
+  created_at: string;
+}
+
+export interface CreateImageInput {
+  mime: string;
+  dataBase64: string;
+  prompt?: string;
+}
+
 export interface SocialActor {
   memberId?: string | null;
 }

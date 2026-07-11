@@ -1,5 +1,6 @@
 import { serverClient } from "@/lib/db/server";
-import { listOpportunities, listVariantsByOpportunity } from "@/lib/social/store";
+import { listOpportunities, listVariantsByOpportunity, listImageIdsByVariant } from "@/lib/social/store";
+import { getImageDailyCap } from "@/lib/social/settings";
 import { SocialOpportunitiesPanel } from "@/components/admin/social-opportunities-panel";
 import type { VariantRow } from "@/lib/social/types";
 
@@ -18,6 +19,9 @@ export default async function SocialAdminPage({ params }: { params: Promise<{ te
     opportunities.map((o) => o.id),
     "team"
   );
+  const allVariantIds = [...variantsByOpp.values()].flat().map((v) => v.id);
+  const imageByVariant = Object.fromEntries(await listImageIdsByVariant(db, team.id, allVariantIds, "team"));
+  const imageCap = await getImageDailyCap(db, team.id);
   // Maps don't serialize across the server→client boundary — hand the client a plain object.
   const drafts: Record<string, VariantRow[]> = Object.fromEntries(variantsByOpp);
 
@@ -27,10 +31,16 @@ export default async function SocialAdminPage({ params }: { params: Promise<{ te
         The <strong>Social Brain</strong> turns your team’s knowledge into content opportunities —
         from recent decisions/deliverables and from your narrative arcs. Each opportunity inherits the
         tier of its source, so internal-only knowledge can never be surfaced for a public post.
-        <strong> Generate</strong> drafts an X + LinkedIn post in your brand voice; nothing publishes —
-        copy the draft where you want it.
+        <strong> Generate</strong> drafts an X + LinkedIn post in your brand voice with an image;
+        nothing publishes — copy the draft where you want it.
       </p>
-      <SocialOpportunitiesPanel teamSlug={teamSlug} opportunities={opportunities} drafts={drafts} />
+      <SocialOpportunitiesPanel
+        teamSlug={teamSlug}
+        opportunities={opportunities}
+        drafts={drafts}
+        imageByVariant={imageByVariant}
+        imageCap={imageCap}
+      />
     </div>
   );
 }

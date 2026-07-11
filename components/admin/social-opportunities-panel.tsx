@@ -2,8 +2,8 @@
 
 import { useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
-import { Radar, Sparkles, Wand2, Copy, Check } from "lucide-react";
-import { discoverNow, discoverFromArcsNow, generateNow } from "@/app/t/[team]/admin/social/actions";
+import { Radar, Sparkles, Wand2, Copy, Check, Download } from "lucide-react";
+import { discoverNow, discoverFromArcsNow, generateNow, setImageCap } from "@/app/t/[team]/admin/social/actions";
 import type { OpportunityRow, VariantRow } from "@/lib/social/types";
 
 const PCT = (n: number) => `${Math.round(n * 100)}%`;
@@ -33,9 +33,10 @@ function CopyButton({ text }: { text: string }) {
   );
 }
 
-function DraftCard({ variant }: { variant: VariantRow }) {
+function DraftCard({ variant, imageId }: { variant: VariantRow; imageId?: string }) {
   const label = PLATFORM_LABEL[variant.platform] ?? variant.platform;
   const hasBody = !!variant.body.trim();
+  const imageUrl = imageId ? `/api/social/images/${imageId}` : null;
   return (
     <div className="rounded-lg border border-border-subtle bg-surface-raised/40 p-3">
       <div className="mb-1.5 flex items-center justify-between">
@@ -50,6 +51,19 @@ function DraftCard({ variant }: { variant: VariantRow }) {
       ) : (
         <p className="text-xs italic text-ink-tertiary">Not drafted yet — click Generate.</p>
       )}
+      {imageUrl ? (
+        <div className="mt-2">
+          {/* eslint-disable-next-line @next/next/no-img-element -- auth-gated dynamic bytes, not a static asset */}
+          <img src={imageUrl} alt={`${label} post image`} className="w-full rounded-md border border-border-subtle" />
+          <a
+            href={imageUrl}
+            download={`${variant.platform}-image.png`}
+            className="mt-1 inline-flex items-center gap-1 text-[11px] font-medium text-ink-secondary hover:text-violet"
+          >
+            <Download className="size-3" /> Download image
+          </a>
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -58,16 +72,21 @@ export function SocialOpportunitiesPanel({
   teamSlug,
   opportunities,
   drafts,
+  imageByVariant,
+  imageCap,
 }: {
   teamSlug: string;
   opportunities: OpportunityRow[];
   drafts: Record<string, VariantRow[]>;
+  imageByVariant: Record<string, string>;
+  imageCap: number;
 }) {
   const router = useRouter();
   const [pending, startTransition] = useTransition();
   const [busyId, setBusyId] = useState<string | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [cap, setCap] = useState(imageCap);
 
   function discover(kind: "items" | "arcs") {
     setError(null);
@@ -88,8 +107,21 @@ export function SocialOpportunitiesPanel({
       const res = await generateNow(teamSlug, id);
       setBusyId(null);
       if (!res.ok) return setError(res.error ?? "generation failed");
-      setMsg(`Drafted ${res.generated} post${res.generated === 1 ? "" : "s"}${res.skipped ? ` (skipped ${res.skipped})` : ""}.`);
+      const imgNote = res.images ? `, ${res.images} image${res.images === 1 ? "" : "s"}` : "";
+      const capNote = res.capped ? ` (${res.capped} image${res.capped === 1 ? "" : "s"} skipped — daily cap)` : "";
+      setMsg(`Drafted ${res.generated} post${res.generated === 1 ? "" : "s"}${imgNote}${capNote}.`);
       router.refresh();
+    });
+  }
+
+  function saveCap() {
+    setError(null);
+    setMsg(null);
+    startTransition(async () => {
+      const res = await setImageCap(teamSlug, cap);
+      if (!res.ok) return setError(res.error ?? "failed to save");
+      setCap(res.cap ?? cap);
+      setMsg(`Image cap set to ${res.cap}/day.`);
     });
   }
 
@@ -102,9 +134,24 @@ export function SocialOpportunitiesPanel({
         <button type="button" onClick={() => discover("arcs")} disabled={pending} className="btn-ghost justify-center">
           <Sparkles className="size-4" /> {pending ? "Working…" : "Discover from arcs"}
         </button>
-        {msg ? <p className="text-sm text-emerald-700">{msg}</p> : null}
-        {error ? <p className="text-sm text-red">{error}</p> : null}
+        <div className="ml-auto flex items-center gap-1.5 text-xs text-ink-tertiary">
+          <label htmlFor="img-cap">Images/day</label>
+          <input
+            id="img-cap"
+            type="number"
+            min={0}
+            max={100}
+            value={cap}
+            onChange={(e) => setCap(Number(e.target.value))}
+            className="prism-input w-16 px-2 py-1 text-center text-sm"
+          />
+          <button type="button" onClick={saveCap} disabled={pending || cap === imageCap} className="text-violet hover:underline disabled:opacity-40">
+            Save
+          </button>
+        </div>
       </div>
+      {msg ? <p className="text-sm text-emerald-700">{msg}</p> : null}
+      {error ? <p className="text-sm text-red">{error}</p> : null}
 
       {opportunities.length === 0 ? (
         <p className="text-sm text-ink-tertiary">
@@ -150,7 +197,7 @@ export function SocialOpportunitiesPanel({
                 {variants.length > 0 ? (
                   <div className="grid grid-cols-1 gap-2 md:grid-cols-2">
                     {variants.map((v) => (
-                      <DraftCard key={v.id} variant={v} />
+                      <DraftCard key={v.id} variant={v} imageId={imageByVariant[v.id]} />
                     ))}
                   </div>
                 ) : null}

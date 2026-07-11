@@ -108,10 +108,13 @@ create table if not exists teams (
   -- The single PM tool the brain projects tasks into (brain-api v1.2). Null until an admin picks
   -- one; projection no-ops (or uses the sole enabled PM integration) when unset.
   primary_pm_provider text check (primary_pm_provider in ('plane', 'linear')),
+  -- Social Brain: max post-images generated per UTC day (Admin → Social). Default 10; on by default.
+  social_image_daily_cap int not null default 10,
   created_at timestamptz not null default now()
 );
 -- Additive column for existing deployments.
 alter table teams add column if not exists primary_pm_provider text;
+alter table teams add column if not exists social_image_daily_cap int not null default 10;
 do $$ begin
   if not exists (select 1 from pg_constraint where conname = 'teams_primary_pm_provider_check') then
     alter table teams add constraint teams_primary_pm_provider_check check (primary_pm_provider in ('plane', 'linear'));
@@ -1125,3 +1128,21 @@ create table if not exists content_variants (
 );
 create index if not exists content_variants_team_plan_idx on content_variants (team_id, plan_id);
 create index if not exists content_variants_team_status_idx on content_variants (team_id, status);
+
+-- Generated post images (Social Brain, one per variant). Stored as base64 text (not bytea) because
+-- the pg adapter binds a Buffer as jsonb; base64 is portable and fine at the per-team daily volume.
+-- Tier is inherited from the variant (never widened) — a team-tier post's image stays team-tier.
+-- Daily generation is capped per team (teams.social_image_daily_cap); count is `created_at`-based.
+-- Sole writer: lib/social/store.
+create table if not exists content_images (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  variant_id uuid not null references content_variants(id) on delete cascade,
+  access access_tier not null,
+  mime text not null default 'image/png',
+  data_base64 text not null,
+  prompt text not null default '',
+  created_at timestamptz not null default now(),
+  unique (variant_id)                          -- one image per variant (regen replaces)
+);
+create index if not exists content_images_team_created_idx on content_images (team_id, created_at desc);

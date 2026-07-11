@@ -4,15 +4,16 @@ import { join } from "node:path";
 
 /**
  * Single-writer guard for the Social Brain content tables (CLAUDE.md §2): `social_opportunities`,
- * `content_plans`, `content_variants` are written ONLY by `lib/social/store.ts` — the path that
- * enforces tier inheritance (plan ⟵ opportunity, variant ⟵ plan). This fails the build if any
- * other file writes them, so the tier-propagation invariant can't be bypassed. (Reads are fine.)
+ * `content_plans`, `content_variants`, `content_images` are written ONLY by `lib/social/store.ts` —
+ * the path that enforces tier inheritance (plan ⟵ opportunity, variant ⟵ plan, image ⟵ variant).
+ * This fails the build if any other file writes them, so the tier-propagation invariant can't be
+ * bypassed. (Reads are fine.)
  */
 
 const ROOT = join(import.meta.dirname, "..", "..");
 const SCAN_DIRS = ["app", "lib", "scripts"];
 const OWNERS = [join("lib", "social", "store.ts")];
-const TABLES = "(social_opportunities|content_plans|content_variants)";
+const TABLES = "(social_opportunities|content_plans|content_variants|content_images)";
 const WRITE_RE = new RegExp(
   `from\\(\\s*["']${TABLES}["']\\s*\\)\\s*\\.\\s*(insert|update|upsert|delete)\\b`,
   "g"
