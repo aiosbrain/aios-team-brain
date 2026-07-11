@@ -9,6 +9,7 @@ import { discoverOpportunities } from "@/lib/social/discover";
 import { discoverOpportunitiesFromArcs } from "@/lib/social/discover-arcs";
 import { planOpportunity } from "@/lib/social/plan";
 import { generatePlanDrafts } from "@/lib/social/generate";
+import { generateVariantImage, imageBudget } from "@/lib/media/generate-image";
 
 type DiscoverResult = { ok: boolean; created?: number; skipped?: number; scanned?: number; error?: string };
 
@@ -79,5 +80,23 @@ export async function generateDrafts(
     return { ok: true, generated: s.generated, blocked: s.blocked, failed: s.failed };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "generation failed" };
+  }
+}
+
+/** Generate an image for a variant (admins only). Opt-in + daily-capped. */
+export async function generateImage(
+  teamSlug: string,
+  variantId: string
+): Promise<{ ok: boolean; remaining?: number; error?: string }> {
+  const ctx = await requireAdmin(teamSlug);
+  if (!ctx) return { ok: false, error: "admins only" };
+  try {
+    const db = adminClient();
+    await generateVariantImage(db, ctx.teamId, variantId, { actor: { memberId: ctx.memberId } });
+    const budget = await imageBudget(db, ctx.teamId);
+    revalidatePath(`/t/${teamSlug}/admin/social`);
+    return { ok: true, remaining: budget.remaining };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "image generation failed" };
   }
 }
