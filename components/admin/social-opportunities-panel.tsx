@@ -15,7 +15,7 @@ import {
   connectTypefully,
   setDryRun,
   scheduleVariantAction,
-} from "@/app/t/[team]/admin/social/actions";
+} from "@/app/t/[team]/social/actions";
 import { AUTONOMY_LEVELS, type AutonomyLevel } from "@/lib/social/autonomy";
 import type { OpportunityRow } from "@/lib/social/types";
 

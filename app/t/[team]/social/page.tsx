@@ -1,4 +1,7 @@
+import Link from "next/link";
+import { CircleAlert } from "lucide-react";
 import { serverClient } from "@/lib/db/server";
+import { currentMember } from "@/lib/auth/guard";
 import { listOpportunities } from "@/lib/social/store";
 import { listTeamMediaMeta } from "@/lib/media/store";
 import { imageBudget } from "@/lib/media/generate-image";
@@ -8,17 +11,39 @@ import { listPublications } from "@/lib/social/publications";
 import { typefullyStatus } from "@/lib/integrations/typefully";
 import { SocialOpportunitiesPanel, type VariantView, type PendingApprovalView, type PublicationView } from "@/components/admin/social-opportunities-panel";
 
-export default async function SocialAdminPage({ params }: { params: Promise<{ team: string }> }) {
+function Kpi({ label, value }: { label: string; value: number | string }) {
+  return (
+    <div className="prism-card flex flex-col gap-0.5 px-4 py-3">
+      <span className="text-2xl font-semibold text-ink">{value}</span>
+      <span className="text-xs text-ink-tertiary">{label}</span>
+    </div>
+  );
+}
+
+export default async function SocialPage({ params }: { params: Promise<{ team: string }> }) {
   const { team: teamSlug } = await params;
   const db = await serverClient();
 
   const { data: team } = await db.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
   if (!team) return null;
 
-  // Admin view — the whole /admin area is admin-gated, so it sees all tiers (team).
+  // Operator surface — spends money + posts publicly, so admin-only (matches the nav gate).
+  const me = await currentMember(team.id);
+  if (!me || me.role !== "admin") {
+    return (
+      <div className="prism-card flex max-w-lg flex-col items-start gap-2 p-6">
+        <CircleAlert className="size-6 text-violet" strokeWidth={1.5} />
+        <h1 className="text-lg font-semibold text-ink">Social Brain is admin-only</h1>
+        <p className="text-sm text-ink-secondary">
+          Discovering, generating, and publishing content is restricted to team admins. Ask an admin
+          if you need access.
+        </p>
+      </div>
+    );
+  }
+
   const opportunities = await listOpportunities(db, team.id, "team", 100);
 
-  // Variants grouped by opportunity (plan is the join). Reads only; admin-gated area.
   const { data: plans } = await db.from("content_plans").select("id, opportunity_id").eq("team_id", team.id);
   const planToOpp = new Map((plans ?? []).map((p: { id: string; opportunity_id: string }) => [p.id, p.opportunity_id]));
   const { data: variants } = await db
@@ -28,18 +53,17 @@ export default async function SocialAdminPage({ params }: { params: Promise<{ te
     .order("created_at", { ascending: true });
 
   const byOpportunity: Record<string, VariantView[]> = {};
-  for (const v of (variants ?? []) as (VariantView & { plan_id: string })[]) {
+  const allVariants = (variants ?? []) as (VariantView & { plan_id: string })[];
+  for (const v of allVariants) {
     const oppId = planToOpp.get(v.plan_id);
     if (oppId) (byOpportunity[oppId] ??= []).push(v);
   }
 
-  // Generated images grouped by variant (ids only — bytes are served by the media route).
   const media = await listTeamMediaMeta(db, team.id, 200);
   const mediaByVariant: Record<string, string[]> = {};
   for (const m of media) (mediaByVariant[m.variant_id] ??= []).push(m.id);
   const budget = await imageBudget(db, team.id);
 
-  // Approval workflow (M4): autonomy + the pending queue, with per-variant context for display.
   const autonomy = await getAutonomy(db, team.id);
   const pendingRows = await listPendingApprovals(db, team.id);
   const variantCtx: Record<string, { platform: string; body: string; oppTitle: string }> = {};
@@ -56,7 +80,6 @@ export default async function SocialAdminPage({ params }: { params: Promise<{ te
     oppTitle: variantCtx[a.variant_id]?.oppTitle ?? "",
   }));
 
-  // Publishing (M5): Typefully connection, dry-run flag, and the publication ledger per variant.
   const [tf, publishDryRun, pubs] = await Promise.all([
     typefullyStatus(db, team.id),
     getPublishDryRun(db, team.id),
@@ -67,15 +90,32 @@ export default async function SocialAdminPage({ params }: { params: Promise<{ te
     (publicationsByVariant[p.variant_id] ??= []).push({ status: p.status, url: p.external_url, dryRun: p.dry_run });
   }
 
+  const publishedCount = pubs.filter((p) => p.status === "published").length;
+
   return (
-    <div className="flex flex-col gap-4">
-      <p className="text-sm text-ink-secondary">
-        The <strong>Social Brain</strong> turns your team’s knowledge into content. <em>Discover</em>
-        ranks recent decisions, deliverables, and commits; <em>Plan</em> shapes brand-aware variants;
-        <em>Generate</em> drafts each in your voice, grounded only in the source evidence and checked
-        against your governance rules. Each opportunity inherits the tier of its source, so
-        internal-only knowledge can never surface in a public post.
-      </p>
+    <div className="flex flex-col gap-5">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <h1 className="font-display text-2xl text-ink">Social Brain</h1>
+          <p className="mt-1 max-w-2xl text-sm text-ink-secondary">
+            Turn your team’s knowledge into content: <em>Discover</em> → <em>Plan</em> →{" "}
+            <em>Generate</em> → <em>Approve</em> → <em>Publish</em>. Every draft is grounded only in
+            its source evidence and checked against your brand governance, and each opportunity
+            inherits its source’s tier — internal knowledge never surfaces in a public post.
+          </p>
+        </div>
+        <Link href={`/t/${teamSlug}/admin/brand`} className="btn-ghost shrink-0">
+          Brand settings
+        </Link>
+      </div>
+
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+        <Kpi label="Opportunities" value={opportunities.length} />
+        <Kpi label="Drafts" value={allVariants.filter((v) => v.status === "generated" || v.body).length} />
+        <Kpi label="Pending approvals" value={pendingApprovals.length} />
+        <Kpi label="Published" value={publishedCount} />
+      </div>
+
       <SocialOpportunitiesPanel
         teamSlug={teamSlug}
         opportunities={opportunities}

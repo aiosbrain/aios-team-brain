@@ -12,7 +12,6 @@ const TABS = [
   { slug: "pm-sync", label: "PM sync" },
   { slug: "policies", label: "Policies" },
   { slug: "brand", label: "Brand" },
-  { slug: "social", label: "Social" },
   { slug: "approvals", label: "Approvals" },
   { slug: "audit", label: "Audit log" },
 ];
