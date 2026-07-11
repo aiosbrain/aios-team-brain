@@ -8,6 +8,30 @@ Format per item: **Status · Why deferred · When to revisit · How to do it**.
 
 ---
 
+## ⚠️ Working note — parallel Conductor worktrees collide on the same subsystem
+
+This repo is often worked by **multiple Conductor worktrees at once** (all under one git account, so
+author name is not a signal). It has already caused duplicated work twice: two independent sessions
+built different fixes for the same auth vuln (2026-07-06), and two worktrees built the same Social
+Brain generation/image slices in parallel (2026-07-11) — the later one merging first and wasting
+~1,200 lines of the other's effort (PRs #230/#234, closed as superseded by #227/#233).
+
+**Before starting deep work on a subsystem** (e.g. `lib/social`, `lib/query`, auth), check for
+competing in-flight work first — it costs seconds:
+
+```
+gh pr list --state all --search "<subsystem> in:title" --limit 20
+git log --oneline -20 origin/main            # has main moved in this area?
+```
+
+If another worktree is already shipping the same milestone, **stop and confirm which worktree owns
+it** rather than building a duplicate. Also `git fetch origin main` partway through a long build (not
+just at merge time) — `main` can move by many PRs during one session. When a duplicate is discovered
+after the fact: the merged version wins, **close the duplicate PR**, and salvage only the delta main
+lacks (diff the closed branch vs `main`).
+
+---
+
 ## Navigation cleanup + Learning-page fixes — SHIPPED 2026-07-10
 
 - ✅ **Lean primary nav** (#213) — Tasks, Maturity, Decisions removed from the left nav; the empty
