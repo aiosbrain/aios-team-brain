@@ -47,11 +47,18 @@ export EMBEDDINGS_URL=https://api.openai.com/v1   # the embeddings endpoint (app
 npm run embed:backfill      # embed existing items (idempotent); new items index each ingest cycle
 ```
 
-**The embeddings key** is resolved the SAME way as the answering LLM's: the team's OpenAI key from
-**Admin → Integrations → AI model settings** (encrypted `integrations` store, via `getProviderKey`),
-falling back to the `OPENAI_API_KEY` env var when unset. So if you've already set the key in the
-dashboard for the LLM, dense retrieval reuses it — no extra env var needed. `EMBEDDINGS_URL` can be
-the same value as `LLM_BASE_URL` when both point at OpenAI.
+**The embeddings key** resolves in precedence order: `EMBEDDINGS_API_KEY` env → the team's OpenAI key
+from **Admin → Integrations → AI model settings** (encrypted `integrations` store, via `getProviderKey`)
+→ the `OPENAI_API_KEY` env. So by default, if you've already set the key in the dashboard for the LLM,
+dense retrieval reuses it — no extra env var needed, and `EMBEDDINGS_URL` can equal `LLM_BASE_URL` when
+both point at OpenAI.
+
+> **Decoupling (optional, recommended at scale).** Embeddings sharing the answer LLM's key means one
+> account's quota exhaustion silently takes down BOTH answering and semantic search at once. Set
+> **`EMBEDDINGS_API_KEY`** to a **separate account** to isolate them — semantic search then survives an
+> answer-LLM outage and vice-versa. It wins over the shared store key, so it's a one-env-var opt-in with
+> no dashboard change. Failures are already surfaced loudly on **Admin → Integrations → Retrieval health**
+> (coverage %, degraded state) + the admin email alert, so a degraded leg is visible either way.
 
 With `EMBEDDINGS_URL` unset **or** the pgvector schema not loaded, dense retrieval is a complete
 no-op — the brain behaves exactly as before. Dense hits are tier-filtered on live `items.access`

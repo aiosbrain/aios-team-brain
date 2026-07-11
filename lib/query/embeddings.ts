@@ -5,9 +5,11 @@ import "server-only";
  * `LLM_BASE_URL` / `RERANK_URL` convention (any provider that speaks the OpenAI wire shape: OpenAI,
  * Ollama, ZeroEntropy, a local server, …). Dense retrieval is OFF until `EMBEDDINGS_URL` is set.
  *
- *   EMBEDDINGS_URL   base URL, e.g. https://api.openai.com/v1  or  http://localhost:11434/v1
- *   EMBEDDINGS_MODEL default text-embedding-3-small
- *   EMBEDDINGS_DIM   default 1536 — MUST match the vector(N) column in postgres/optional/pgvector.sql
+ *   EMBEDDINGS_URL     base URL, e.g. https://api.openai.com/v1  or  http://localhost:11434/v1
+ *   EMBEDDINGS_MODEL   default text-embedding-3-small
+ *   EMBEDDINGS_DIM     default 1536 — MUST match the vector(N) column in postgres/optional/pgvector.sql
+ *   EMBEDDINGS_API_KEY optional — a DEDICATED embeddings key so semantic search survives the answer
+ *                      LLM's quota (and vice-versa). See resolveEmbeddingKey; unset → shared key.
  */
 
 const EMBEDDINGS_URL = process.env.EMBEDDINGS_URL;
@@ -17,6 +19,20 @@ const EMBEDDINGS_TIMEOUT_MS = Number(process.env.EMBEDDINGS_TIMEOUT_MS ?? 20_000
 /** True when an embeddings endpoint is configured (dense retrieval opt-in). */
 export function embeddingsConfigured(): boolean {
   return !!EMBEDDINGS_URL;
+}
+
+/**
+ * Resolve the bearer key for the embeddings call, in precedence order:
+ *   1. `apiKey` — the key the caller resolved (per-team store key via resolveEmbeddingKey, which
+ *      already prefers a dedicated embeddings key), or
+ *   2. `EMBEDDINGS_API_KEY` — a DEDICATED embeddings account at the env layer, so exhausting the
+ *      answer LLM's `OPENAI_API_KEY` quota can't silently kill semantic search too (the decouple), or
+ *   3. `OPENAI_API_KEY` — the shared env key (today's default; embeddings reuse the LLM's key), or
+ *   4. `"local"` — a placeholder for keyless self-hosted servers (Ollama/llama.cpp ignore it).
+ * Pure — no I/O — so the precedence is unit-testable without a live endpoint.
+ */
+export function embeddingAuthKey(apiKey?: string | null): string {
+  return apiKey ?? process.env.EMBEDDINGS_API_KEY ?? process.env.OPENAI_API_KEY ?? "local";
 }
 
 /**
@@ -35,7 +51,7 @@ export async function embed(texts: string[], apiKey?: string | null): Promise<nu
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey ?? process.env.OPENAI_API_KEY ?? "local"}`,
+        Authorization: `Bearer ${embeddingAuthKey(apiKey)}`,
       },
       body: JSON.stringify({ model: EMBEDDINGS_MODEL, input: texts }),
       signal: ctrl.signal,
