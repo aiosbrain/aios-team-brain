@@ -27,7 +27,9 @@ export async function register() {
   startGraphScheduler();
 
   // Social Brain durable job poller — opt-in (inert unless SOCIAL_JOBS_ENABLED=true) while the
-  // feature is pre-launch, so a deploy without it never polls.
+  // feature is pre-launch, so a deploy without it never polls. Import the publish module first so
+  // its `publish` job handler is registered before the poller can claim a publish job.
+  await import("@/lib/social/publish");
   const { startSocialJobsScheduler } = await import("@/lib/jobs/scheduler");
   startSocialJobsScheduler();
 }

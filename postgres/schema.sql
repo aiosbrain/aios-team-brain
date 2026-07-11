@@ -896,7 +896,7 @@ create index if not exists subscriptions_team_idx on subscriptions (team_id);
 create table if not exists integrations (
   id uuid primary key default gen_random_uuid(),
   team_id uuid not null references teams(id) on delete cascade,
-  type text not null check (type in ('github','granola','slack','wise','linear','plane','openai','anthropic','google','openrouter')),
+  type text not null check (type in ('github','granola','slack','wise','linear','plane','openai','anthropic','google','openrouter','typefully')),
   name text not null,
   config jsonb not null default '{}',
   secret_ciphertext text,                 -- AES-256-GCM blob (base64); null if no secret set
@@ -1153,8 +1153,33 @@ create table if not exists social_settings (
   team_id uuid primary key references teams(id) on delete cascade,
   autonomy text not null default 'draft_only'
     check (autonomy in ('draft_only', 'approval_required', 'auto_publish_low_risk', 'fully_autonomous')),
+  publish_dry_run boolean not null default true,   -- no live posts until an admin flips this off
   updated_at timestamptz not null default now()
 );
+alter table social_settings add column if not exists publish_dry_run boolean not null default true;
+
+-- Publication ledger (M5): one row per publish attempt of a variant. Single writer:
+-- lib/social/publications.ts. Tier inherited from the variant. Publishing rides the M0 job runner.
+create table if not exists social_publications (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  variant_id uuid not null references content_variants(id) on delete cascade,
+  access access_tier not null,
+  provider text not null default 'typefully',
+  status text not null default 'scheduled'
+    check (status in ('scheduled', 'publishing', 'published', 'failed', 'cancelled')),
+  dry_run boolean not null default true,
+  scheduled_at timestamptz,
+  published_at timestamptz,
+  external_id text,
+  external_url text,
+  last_error text,
+  created_by uuid references members(id) on delete set null,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+create index if not exists social_publications_team_idx on social_publications (team_id, created_at desc);
+create index if not exists social_publications_variant_idx on social_publications (variant_id);
 
 create table if not exists content_approvals (
   id uuid primary key default gen_random_uuid(),

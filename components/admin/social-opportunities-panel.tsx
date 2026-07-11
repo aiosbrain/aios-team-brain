@@ -2,7 +2,7 @@
 
 import { useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
-import { Radar, PenLine, Sparkles, AlertTriangle, ShieldAlert, ImagePlus, Send, Check, X } from "lucide-react";
+import { Radar, PenLine, Sparkles, AlertTriangle, ShieldAlert, ImagePlus, Send, Check, X, Rocket } from "lucide-react";
 import {
   discoverNow,
   discoverFromArcsNow,
@@ -12,6 +12,9 @@ import {
   submitApproval,
   decideContentApproval,
   setAutonomyLevel,
+  connectTypefully,
+  setDryRun,
+  scheduleVariantAction,
 } from "@/app/t/[team]/admin/social/actions";
 import { AUTONOMY_LEVELS, type AutonomyLevel } from "@/lib/social/autonomy";
 import type { OpportunityRow } from "@/lib/social/types";
@@ -37,6 +40,11 @@ export interface PendingApprovalView {
   body: string;
   oppTitle: string;
 }
+export interface PublicationView {
+  status: string;
+  url: string | null;
+  dryRun: boolean;
+}
 
 export function SocialOpportunitiesPanel({
   teamSlug,
@@ -47,6 +55,10 @@ export function SocialOpportunitiesPanel({
   imageCap,
   autonomy,
   pendingApprovals,
+  typefullyConnected,
+  typefullySocialSetId,
+  publishDryRun,
+  publicationsByVariant,
 }: {
   teamSlug: string;
   opportunities: OpportunityRow[];
@@ -56,11 +68,18 @@ export function SocialOpportunitiesPanel({
   imageCap: number;
   autonomy: AutonomyLevel;
   pendingApprovals: PendingApprovalView[];
+  typefullyConnected: boolean;
+  typefullySocialSetId: string | null;
+  publishDryRun: boolean;
+  publicationsByVariant: Record<string, PublicationView[]>;
 }) {
   const router = useRouter();
   const [pending, startTransition] = useTransition();
   const [busyId, setBusyId] = useState<string | null>(null);
   const [notes, setNotes] = useState<Record<string, string>>({});
+  const [scheduleAt, setScheduleAt] = useState<Record<string, string>>({});
+  const [tfKey, setTfKey] = useState("");
+  const [tfSet, setTfSet] = useState(typefullySocialSetId ?? "");
   const [msg, setMsg] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -119,6 +138,48 @@ export function SocialOpportunitiesPanel({
       </div>
       {msg ? <p className="text-sm text-emerald-700">{msg}</p> : null}
       {error ? <p className="text-sm text-red">{error}</p> : null}
+
+      <details className="prism-card p-4 text-sm">
+        <summary className="cursor-pointer font-medium text-ink">
+          Publishing —{" "}
+          <span className={typefullyConnected ? "text-emerald-700" : "text-ink-tertiary"}>
+            {typefullyConnected ? "Typefully connected" : "not connected"}
+          </span>
+          {" · "}
+          <span className={publishDryRun ? "text-amber-700" : "text-emerald-700"}>
+            {publishDryRun ? "dry-run" : "LIVE"}
+          </span>
+        </summary>
+        <div className="mt-3 flex flex-col gap-3">
+          <div className="flex flex-wrap items-end gap-2">
+            <label className="flex flex-col gap-1 text-xs text-ink-tertiary">
+              Typefully v2 API key
+              <input type="password" className="prism-input" value={tfKey} onChange={(e) => setTfKey(e.target.value)} placeholder={typefullyConnected ? "•••• (set — paste to replace)" : "paste key"} />
+            </label>
+            <label className="flex flex-col gap-1 text-xs text-ink-tertiary">
+              Social-set id
+              <input className="prism-input" value={tfSet} onChange={(e) => setTfSet(e.target.value)} placeholder="social set id" />
+            </label>
+            <button
+              type="button"
+              onClick={() => act(() => connectTypefully(teamSlug, { key: tfKey || undefined, socialSetId: tfSet || undefined }), () => { setTfKey(""); return "Typefully saved."; })}
+              disabled={pending}
+              className="btn-prism justify-center"
+            >
+              Save
+            </button>
+          </div>
+          <label className="flex items-center gap-2 text-xs text-ink-secondary">
+            <input
+              type="checkbox"
+              checked={!publishDryRun}
+              onChange={(e) => act(() => setDryRun(teamSlug, !e.target.checked), () => "Publish mode updated.")}
+              disabled={pending}
+            />
+            Publish live (uncheck = dry-run — records a publication without posting)
+          </label>
+        </div>
+      </details>
 
       {opportunities.length === 0 ? (
         <p className="text-sm text-ink-tertiary">
@@ -229,6 +290,35 @@ export function SocialOpportunitiesPanel({
                               {busyId === v.id ? "Submitting…" : "Submit for approval"}
                             </button>
                           ) : null}
+                          {v.status === "approved" ? (
+                            <div className="mt-1 flex flex-wrap items-center gap-2">
+                              <input
+                                type="datetime-local"
+                                className="prism-input py-1 text-xs"
+                                value={scheduleAt[v.id] ?? ""}
+                                onChange={(e) => setScheduleAt((s) => ({ ...s, [v.id]: e.target.value }))}
+                              />
+                              <button
+                                type="button"
+                                onClick={() => act(
+                                  () => scheduleVariantAction(teamSlug, v.id, scheduleAt[v.id]),
+                                  (r) => { const x = r as { dryRun?: boolean }; return x.dryRun ? "Scheduled (dry-run — nothing posted)." : "Scheduled to publish."; },
+                                  v.id
+                                )}
+                                disabled={pending}
+                                className="text-xs font-medium text-violet hover:underline disabled:opacity-50"
+                              >
+                                <Rocket className="mr-1 inline size-3" />
+                                {busyId === v.id ? "Scheduling…" : scheduleAt[v.id] ? "Schedule" : "Publish now"}
+                              </button>
+                            </div>
+                          ) : null}
+                          {(publicationsByVariant[v.id] ?? []).map((p, i) => (
+                            <p key={i} className="mt-0.5 text-xs text-ink-tertiary">
+                              publication: {p.status}{p.dryRun ? " (dry-run)" : ""}
+                              {p.url ? <> · <a href={p.url} target="_blank" rel="noreferrer" className="text-violet hover:underline">view</a></> : null}
+                            </p>
+                          ))}
                         </li>
                       );
                     })}
