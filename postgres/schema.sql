@@ -1181,6 +1181,26 @@ create table if not exists social_publications (
 create index if not exists social_publications_team_idx on social_publications (team_id, created_at desc);
 create index if not exists social_publications_variant_idx on social_publications (variant_id);
 
+-- Normalized per-publication analytics (M6). One row per publication (latest snapshot). Typefully
+-- exposes X-only metrics. Single writer: lib/social/analytics.ts. Tier inherited from publication.
+create table if not exists publication_analytics (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  publication_id uuid not null unique references social_publications(id) on delete cascade,
+  access access_tier not null,
+  provider text not null default 'typefully',
+  impressions integer,
+  likes integer,
+  comments integer,
+  shares integer,
+  saves integer,
+  clicks integer,
+  raw jsonb not null default '{}',
+  collected_at timestamptz not null default now(),
+  created_at timestamptz not null default now()
+);
+create index if not exists publication_analytics_team_idx on publication_analytics (team_id, collected_at desc);
+
 create table if not exists content_approvals (
   id uuid primary key default gen_random_uuid(),
   team_id uuid not null references teams(id) on delete cascade,

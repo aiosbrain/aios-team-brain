@@ -13,6 +13,7 @@ import { generateVariantImage, imageBudget } from "@/lib/media/generate-image";
 import { setAutonomy, setPublishDryRun } from "@/lib/social/settings";
 import { submitForApproval, decideApproval } from "@/lib/social/approvals";
 import { scheduleVariant } from "@/lib/social/publish";
+import { runCollectAnalytics } from "@/lib/social/collect-analytics";
 import { saveTypefully } from "@/lib/integrations/typefully";
 import type { AutonomyLevel } from "@/lib/social/autonomy";
 
@@ -183,6 +184,19 @@ export async function scheduleVariantAction(
     return { ok: true, dryRun: pub.dry_run };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "could not schedule" };
+  }
+}
+
+/** Collect/refresh analytics for a publication now (admins only). */
+export async function refreshAnalytics(teamSlug: string, publicationId: string): Promise<{ ok: boolean; error?: string }> {
+  const ctx = await requireAdmin(teamSlug);
+  if (!ctx) return { ok: false, error: "admins only" };
+  try {
+    await runCollectAnalytics(adminClient(), ctx.teamId, publicationId);
+    revalidatePath(`/t/${teamSlug}/social`);
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "could not refresh analytics" };
   }
 }
 

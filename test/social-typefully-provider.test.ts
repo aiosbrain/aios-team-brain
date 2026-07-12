@@ -43,4 +43,19 @@ describe("typefullyProvider", () => {
       typefullyProvider("k").publish({ text: "x", platforms: ["x"], socialSetId: "" })
     ).rejects.toThrow(/social-set/);
   });
+
+  it("normalizes X analytics for the matching post", async () => {
+    const fakeFetch = (async () =>
+      new Response(
+        JSON.stringify({ posts: [{ draft_id: "D1", impressions: 100, likes: 9, comments: 2, reposts: 3, bookmarks: 4, link_clicks: 5 }] }),
+        { status: 200 }
+      )) as unknown as typeof fetch;
+    const m = await typefullyProvider("KEY", fakeFetch).getAnalytics!({ externalId: "D1", socialSetId: "S" });
+    expect(m).toMatchObject({ impressions: 100, likes: 9, comments: 2, shares: 3, saves: 4, clicks: 5 });
+  });
+
+  it("returns null when no post matches the external id", async () => {
+    const fakeFetch = (async () => new Response(JSON.stringify({ posts: [{ draft_id: "OTHER" }] }), { status: 200 })) as unknown as typeof fetch;
+    expect(await typefullyProvider("KEY", fakeFetch).getAnalytics!({ externalId: "D1", socialSetId: "S" })).toBeNull();
+  });
 });
