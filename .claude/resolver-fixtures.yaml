@@ -1,0 +1,26 @@
+# Routing fixtures for the aios-team-brain resolver.
+# Schema: ~/Projects/.tessera/resolver/fixtures-schema.yaml
+# Run: node ~/Projects/.tessera/resolver/bin/routing-eval.mjs <this-repo>
+fixtures:
+  - intent: "Add a new ingest source"
+    expected: "ARCHITECTURE.md"
+  - intent: "Deploy the latest changes"
+    expected: "merging to main"
+  - intent: "Run railway up to push this fix"
+    expected: "never up/redeploy/down/delete"
+  - intent: "Add a new dashboard page listing team items"
+    expected: "lib/auth/visibility"
+  - intent: "Change the push endpoint's payload"
+    expected: "brain-api.md"
+  - intent: "Add a status column to the tasks table"
+    expected: "postgres/migrations"
+  - intent: "Write a test for the dedup logic"
+    expected: "Spec-first"
+  - intent: "Sync the board to Plane"
+    expected: "Plane is retired"
+  - intent: "Clean up the diverged feature branch"
+    expected: "branch-reconciliation"
+  - intent: "Is the tier filter test actually running in CI?"
+    expected: "test-ci-wiring-audit"
+  - intent: "Why isn't this task showing up in Linear?"
+    expected: "lib/pm-sync"
