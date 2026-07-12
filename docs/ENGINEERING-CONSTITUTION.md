@@ -13,7 +13,7 @@ governed by the sync contract and the tier model — there is no side channel.
 
 ## 2. The sync contract is law
 
-`aios-workspace/docs/brain-api.md` (currently v1.7, major `/api/v1`) is the single
+`aios-workspace/docs/brain-api.md` (currently v1.8, major `/api/v1`) is the single
 pinned contract. Any protocol change is a versioned change in that file first, with
 matching changes on both sides. Clients must ignore unknown item kinds
 (forward-compat); the brain must never silently change response shapes.
@@ -51,7 +51,7 @@ and update it in the same commit as any principle change.
 <!-- agent-digest:start -->
 - The brain is the ONE shared hub: workspaces push to it; it never reaches into a
   workspace; no side channels around the sync contract.
-- `brain-api.md` (v1.7, `/api/v1`) is law: protocol changes are versioned there
+- `brain-api.md` (v1.8, `/api/v1`) is law: protocol changes are versioned there
   FIRST with matching changes on both sides; never silently change a response
   shape; ignore-unknown-kinds stays intact.
 - Tier enforcement is a hard boundary: `admin`-tier content → 422 at the API
