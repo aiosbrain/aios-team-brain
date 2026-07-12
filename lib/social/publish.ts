@@ -5,6 +5,7 @@ import { getTypefullyCredentials } from "@/lib/integrations/typefully";
 import { getVariant, setVariantStatus } from "./store";
 import { getPublishDryRun } from "./settings";
 import { createPublication, getPublication, setPublicationState, type PublicationRow } from "./publications";
+import { scheduleAnalyticsCollection } from "./collect-analytics";
 import { typefullyProvider } from "./providers/typefully";
 import type { SocialPublishingProvider } from "./providers/types";
 
@@ -108,6 +109,8 @@ export async function runPublication(
       last_error: null,
     });
     await setVariantStatus(db, teamId, pub.variant_id, "published");
+    // Schedule a delayed analytics collection (M6) — best-effort, never fails the publish.
+    await scheduleAnalyticsCollection(db, teamId, publicationId).catch(() => {});
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     await setPublicationState(db, teamId, publicationId, { status: "failed", last_error: msg.slice(0, 2000) });

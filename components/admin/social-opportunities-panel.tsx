@@ -15,6 +15,7 @@ import {
   connectTypefully,
   setDryRun,
   scheduleVariantAction,
+  refreshAnalytics,
 } from "@/app/t/[team]/social/actions";
 import { AUTONOMY_LEVELS, type AutonomyLevel } from "@/lib/social/autonomy";
 import type { OpportunityRow } from "@/lib/social/types";
@@ -41,9 +42,11 @@ export interface PendingApprovalView {
   oppTitle: string;
 }
 export interface PublicationView {
+  id: string;
   status: string;
   url: string | null;
   dryRun: boolean;
+  metrics: { impressions: number | null; likes: number | null; comments: number | null; shares: number | null } | null;
 }
 
 export function SocialOpportunitiesPanel({
@@ -313,10 +316,16 @@ export function SocialOpportunitiesPanel({
                               </button>
                             </div>
                           ) : null}
-                          {(publicationsByVariant[v.id] ?? []).map((p, i) => (
-                            <p key={i} className="mt-0.5 text-xs text-ink-tertiary">
+                          {(publicationsByVariant[v.id] ?? []).map((p) => (
+                            <p key={p.id} className="mt-0.5 text-xs text-ink-tertiary">
                               publication: {p.status}{p.dryRun ? " (dry-run)" : ""}
                               {p.url ? <> · <a href={p.url} target="_blank" rel="noreferrer" className="text-violet hover:underline">view</a></> : null}
+                              {p.metrics ? (
+                                <> · {p.metrics.impressions ?? 0} impr · {p.metrics.likes ?? 0} likes · {p.metrics.comments ?? 0} comments · {p.metrics.shares ?? 0} shares</>
+                              ) : null}
+                              {p.status === "published" ? (
+                                <> · <button type="button" onClick={() => act(() => refreshAnalytics(teamSlug, p.id), () => "Analytics refreshed.", p.id)} disabled={pending} className="text-violet hover:underline disabled:opacity-50">refresh analytics</button></>
+                              ) : null}
                             </p>
                           ))}
                         </li>

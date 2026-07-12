@@ -21,7 +21,27 @@ export interface PublishResult {
   status: string;
 }
 
+/** Normalized engagement metrics across providers (nullable — not every provider reports each). */
+export interface NormalizedMetrics {
+  impressions?: number | null;
+  likes?: number | null;
+  comments?: number | null;
+  shares?: number | null;
+  saves?: number | null;
+  clicks?: number | null;
+  /** The provider's raw payload, for debugging + fields we don't normalize yet. */
+  raw?: Record<string, unknown>;
+}
+
+export interface AnalyticsRequest {
+  /** The provider post/draft id from the publish result. */
+  externalId: string;
+  socialSetId: string;
+}
+
 export interface SocialPublishingProvider {
   readonly name: string;
   publish(req: PublishRequest): Promise<PublishResult>;
+  /** Optional — providers that expose analytics implement this (Typefully: X-only). */
+  getAnalytics?(req: AnalyticsRequest): Promise<NormalizedMetrics | null>;
 }

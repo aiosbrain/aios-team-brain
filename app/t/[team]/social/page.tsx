@@ -8,6 +8,7 @@ import { imageBudget } from "@/lib/media/generate-image";
 import { getAutonomy, getPublishDryRun } from "@/lib/social/settings";
 import { listPendingApprovals } from "@/lib/social/approvals";
 import { listPublications } from "@/lib/social/publications";
+import { listTeamAnalytics, teamAnalyticsSummary } from "@/lib/social/analytics";
 import { typefullyStatus } from "@/lib/integrations/typefully";
 import { SocialOpportunitiesPanel, type VariantView, type PendingApprovalView, type PublicationView } from "@/components/admin/social-opportunities-panel";
 
@@ -85,12 +86,24 @@ export default async function SocialPage({ params }: { params: Promise<{ team: s
     getPublishDryRun(db, team.id),
     listPublications(db, team.id, 200),
   ]);
+  const analyticsRows = await listTeamAnalytics(db, team.id, 500);
+  const analyticsByPublication = new Map(analyticsRows.map((a) => [a.publication_id, a]));
   const publicationsByVariant: Record<string, PublicationView[]> = {};
   for (const p of pubs) {
-    (publicationsByVariant[p.variant_id] ??= []).push({ status: p.status, url: p.external_url, dryRun: p.dry_run });
+    const a = analyticsByPublication.get(p.id);
+    (publicationsByVariant[p.variant_id] ??= []).push({
+      id: p.id,
+      status: p.status,
+      url: p.external_url,
+      dryRun: p.dry_run,
+      metrics: a
+        ? { impressions: a.impressions, likes: a.likes, comments: a.comments, shares: a.shares }
+        : null,
+    });
   }
 
   const publishedCount = pubs.filter((p) => p.status === "published").length;
+  const analytics = await teamAnalyticsSummary(db, team.id);
 
   return (
     <div className="flex flex-col gap-5">
@@ -109,11 +122,12 @@ export default async function SocialPage({ params }: { params: Promise<{ team: s
         </Link>
       </div>
 
-      <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
         <Kpi label="Opportunities" value={opportunities.length} />
         <Kpi label="Drafts" value={allVariants.filter((v) => v.status === "generated" || v.body).length} />
         <Kpi label="Pending approvals" value={pendingApprovals.length} />
         <Kpi label="Published" value={publishedCount} />
+        <Kpi label="Impressions" value={analytics.impressions.toLocaleString()} />
       </div>
 
       <SocialOpportunitiesPanel

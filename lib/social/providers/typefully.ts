@@ -1,5 +1,5 @@
 import "server-only";
-import type { PublishRequest, PublishResult, SocialPublishingProvider } from "./types";
+import type { AnalyticsRequest, NormalizedMetrics, PublishRequest, PublishResult, SocialPublishingProvider } from "./types";
 
 /**
  * Typefully v2 publishing adapter. Base `https://api.typefully.com/v2`, Bearer key (per the
@@ -45,6 +45,30 @@ export function typefullyProvider(apiKey: string, fetchImpl: Fetch = fetch): Soc
         externalId: j.id != null ? String(j.id) : "",
         url: j.preview ?? null,
         status: j.status ?? "scheduled",
+      };
+    },
+
+    // X-only analytics (Typefully exposes engagement for X posts). Best-effort + verify-at-build:
+    // the exact response shape and how a draft id maps to its published X post are only partially
+    // documented (spike). Returns null when nothing matches, so a collect run just records no data.
+    async getAnalytics(req: AnalyticsRequest): Promise<NormalizedMetrics | null> {
+      const res = await fetchImpl(`${BASE_URL}/analytics/x/posts?social_set_id=${encodeURIComponent(req.socialSetId)}`, {
+        headers: { Authorization: `Bearer ${apiKey}` },
+        signal: AbortSignal.timeout(30_000),
+      });
+      if (!res.ok) throw new Error(`typefully analytics ${res.status}: ${await res.text().catch(() => "")}`);
+      const j = (await res.json().catch(() => ({}))) as { posts?: Record<string, unknown>[] };
+      const post = (j.posts ?? []).find((p) => String(p.draft_id ?? p.id ?? "") === req.externalId);
+      if (!post) return null;
+      const num = (v: unknown): number | null => (typeof v === "number" ? v : null);
+      return {
+        impressions: num(post.impressions),
+        likes: num(post.likes),
+        comments: num(post.comments),
+        shares: num(post.reposts ?? post.shares),
+        saves: num(post.saves ?? post.bookmarks),
+        clicks: num(post.link_clicks ?? post.clicks),
+        raw: post,
       };
     },
   };
