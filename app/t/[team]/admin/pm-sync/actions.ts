@@ -5,7 +5,7 @@ import { revalidatePath } from "next/cache";
 import { adminClient } from "@/lib/db/admin";
 import { requireTeamAdmin as requireAdmin } from "@/lib/auth/guard";
 import { audit } from "@/lib/api/audit";
-import { projectAllTasks, type ProjectionReport } from "@/lib/pm-sync";
+import { projectAllTasks, recordProjectionRun, type ProjectionReport } from "@/lib/pm-sync";
 import { reconcileProviderState, type DivergenceRow } from "@/lib/pm-sync/reconcile";
 
 export interface ProjectBoardResult {
@@ -26,6 +26,7 @@ export async function projectBoardAction(teamSlug: string): Promise<ProjectBoard
   if (!ctx) return { ok: false, error: "admins only" };
 
   const db = adminClient();
+  const startedAt = Date.now();
   const { data: projects, error: projErr } = await db.from("projects").select("id").eq("team_id", ctx.teamId);
   if (projErr) return { ok: false, error: projErr.message };
 
@@ -38,6 +39,17 @@ export async function projectBoardAction(teamSlug: string): Promise<ProjectBoard
     if (res.reason) reason = res.reason;
     reports.push(...res.reports);
   }
+
+  // AIO-357: record this run (last-run timestamp + result) so Admin → PM sync can surface
+  // "when did projection last run, and did it work" instead of that being undiagnosable.
+  await recordProjectionRun(db, {
+    teamId: ctx.teamId,
+    provider: (provider as ProjectionReport["provider"]) ?? null,
+    trigger: "manual",
+    reports,
+    reason: provider ? undefined : reason,
+    startedAt,
+  });
 
   if (!provider && reason) return { ok: false, error: reason };
 

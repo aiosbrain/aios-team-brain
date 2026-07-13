@@ -6,7 +6,7 @@ import { z } from "zod";
 import { adminClient } from "@/lib/db/admin";
 import { serverClient } from "@/lib/db/server";
 import { currentMember } from "@/lib/auth/guard";
-import { projectAllTasks } from "@/lib/pm-sync";
+import { projectAllTasks, recordProjectionRun } from "@/lib/pm-sync";
 import {
   createMeetingTodoTasks,
   MEETING_TODO_PROJECT_SLUG,
@@ -128,7 +128,10 @@ export async function createMeetingTodosAction(input: z.input<typeof createSchem
   const created = await createMeetingTodoTasks(db, team.id, parsed.data.rows);
   const projected: Record<string, number> = {};
   if (parsed.data.projectToLinear) {
-    const { reports, reason } = await projectAllTasks(db, team.id, created.projectId);
+    const startedAt = Date.now();
+    const { provider, reports, reason } = await projectAllTasks(db, team.id, created.projectId);
+    // AIO-357: record this run regardless of outcome, including the no-provider-configured case.
+    await recordProjectionRun(db, { teamId: team.id, provider: provider ?? null, trigger: "manual", reports, reason, startedAt });
     if (reason) return { ok: false, error: `created tasks, but Linear projection skipped: ${reason}` };
     for (const report of reports) projected[report.status] = (projected[report.status] ?? 0) + 1;
   }

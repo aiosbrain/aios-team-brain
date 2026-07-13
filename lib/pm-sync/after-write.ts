@@ -10,6 +10,7 @@ import {
   type ProjectionReport,
   type ProjectionTaskRow,
 } from "@/lib/pm-sync/project";
+import { recordProjectionRun } from "@/lib/pm-sync/runs";
 
 /**
  * Fire-and-forget projection for the reactive write paths (UI server actions + the changed-rows push
@@ -37,10 +38,15 @@ export async function projectTaskByIdAfterWrite(
   taskId: string,
   opts: { fetchImpl?: typeof fetch } = {}
 ): Promise<ProjectionReport | null> {
+  const startedAt = Date.now();
   try {
     const row = await loadTaskById(db, taskId);
     if (!row) return null;
-    return await projectTask(db, row, { fetchImpl: opts.fetchImpl });
+    const report = await projectTask(db, row, { fetchImpl: opts.fetchImpl });
+    // AIO-357: record this reactive run so "did the projection for this edit actually run" is
+    // diagnosable — this is the UI single-task path (create/move/update task actions).
+    await recordProjectionRun(db, { teamId: row.team_id, provider: report.provider, trigger: "api", reports: [report], startedAt });
+    return report;
   } catch {
     // Swallow — projection must never surface as a user-action failure.
     return null;
@@ -58,6 +64,7 @@ export async function projectChangedTasksAfterWrite(
   opts: { fetchImpl?: typeof fetch } = {}
 ): Promise<ProjectionReport[]> {
   if (!rowKeys.length) return [];
+  const startedAt = Date.now();
   try {
     const primary = await resolvePrimaryProvider(db, teamId);
     if (primary.provider === null) return []; // no PM tool configured → nothing to project or surface
@@ -77,10 +84,16 @@ export async function projectChangedTasksAfterWrite(
     if (primary.integration === null) {
       const reports: ProjectionReport[] = [];
       for (const row of rows) reports.push(await projectTask(db, row, { primary, fetchImpl: opts.fetchImpl }));
+      // AIO-357: still a run — surfacing "projection is misconfigured" is the point of this log.
+      await recordProjectionRun(db, { teamId, provider: primary.provider, trigger: "api", reports, startedAt });
       return reports;
     }
 
-    return await projectRows(db, primary, rows, { fetchImpl: opts.fetchImpl });
+    const reports = await projectRows(db, primary, rows, { fetchImpl: opts.fetchImpl });
+    // AIO-357: record this reactive batch run — this is the push-path (`POST /api/v1/items`
+    // changed-rows tail) that the "task edit doesn't appear in Linear" gap was about.
+    await recordProjectionRun(db, { teamId, provider: primary.provider, trigger: "api", reports, startedAt });
+    return reports;
   } catch {
     return [];
   }
