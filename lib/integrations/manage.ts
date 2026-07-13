@@ -196,33 +196,77 @@ export async function getProviderKey(
 }
 
 /**
- * Resolve a team's OpenRouter settings — the decrypted key plus the chosen model slug — in one read.
- * OpenRouter is an OpenAI-compatible gateway, so the query LLM needs both the key AND a model
- * (`config.model`). Returns nulls when unset/disabled so the caller falls through to the next backend
- * (LLM_BASE_URL env, then Anthropic). Server-only; the key is decrypted only here, in-process.
+ * Resolve one provider's answering settings — the decrypted key plus the chosen model slug
+ * (`config.model`) — in one read. Used by the answering resolver (lib/query/answering) to build the
+ * per-team backend keys. Returns nulls when unset/disabled so the caller falls through. Server-only;
+ * the key is decrypted only here, in-process.
  */
-export async function getOpenrouterSettings(
+export async function getProviderSettings(
   db: DbClient,
-  teamId: string
+  teamId: string,
+  type: ProviderIntegrationType
 ): Promise<{ key: string | null; model: string | null }> {
   const { data, error } = await db
     .from("integrations")
     .select("secret_ciphertext, config")
     .eq("team_id", teamId)
-    .eq("type", "openrouter")
+    .eq("type", type)
     .eq("status", "enabled")
     .limit(1)
     .maybeSingle();
   if (error) {
+    // A not-yet-migrated DB may lack the `integrations` table — treat as "not configured".
     if (/(relation|table).*does not exist|no such table/i.test(error.message)) {
       return { key: null, model: null };
     }
-    throw new Error(`load openrouter settings failed: ${error.message}`);
+    throw new Error(`load ${type} settings failed: ${error.message}`);
   }
   const row = data as { secret_ciphertext: string | null; config: Record<string, unknown> | null } | null;
   const key = row?.secret_ciphertext ? decryptSecret(row.secret_ciphertext) : null;
   const model = typeof row?.config?.model === "string" ? (row.config.model as string) : null;
   return { key, model };
+}
+
+/** OpenRouter settings — a thin alias for the generic reader (kept for existing callers). */
+export function getOpenrouterSettings(
+  db: DbClient,
+  teamId: string
+): Promise<{ key: string | null; model: string | null }> {
+  return getProviderSettings(db, teamId, "openrouter");
+}
+
+/**
+ * Persist the NON-secret answer-model slug on a provider key (anthropic/openai/openrouter), merging
+ * into the row's existing config so the encrypted key is preserved. Creates a keyless row if none
+ * exists yet (a model-only choice is valid — e.g. Anthropic answers via the SDK's env key). Empty
+ * string clears the choice (falls back to the provider's default model). Single-writer via
+ * `upsertIntegration`; the caller (admin action) is the gate.
+ */
+export async function saveProviderModel(
+  db: DbClient,
+  auth: IntegrationAuth,
+  type: ProviderIntegrationType,
+  model: string
+): Promise<void> {
+  const { data } = await db
+    .from("integrations")
+    .select("name, status, config")
+    .eq("team_id", auth.teamId)
+    .eq("type", type)
+    .order("created_at", { ascending: true })
+    .limit(1)
+    .maybeSingle();
+  const row = data as
+    | { name: string; status: "enabled" | "disabled"; config: Record<string, unknown> | null }
+    | null;
+  const config: Record<string, unknown> = { ...(row?.config ?? {}) };
+  config.model = model.trim() || undefined;
+  await upsertIntegration(db, auth, {
+    type,
+    name: row?.name ?? type,
+    config,
+    status: row?.status ?? "enabled",
+  });
 }
 
 /** A team's enabled integration selection — NON-SECRET fields only. */

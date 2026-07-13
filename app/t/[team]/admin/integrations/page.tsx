@@ -12,6 +12,8 @@ import { listRecentIngestRuns } from "@/lib/ingest/runs";
 import { IngestRunsPanel } from "@/components/admin/ingest-runs-panel";
 import { getRetrievalHealth } from "@/lib/query/retrieval-health";
 import { RetrievalHealthCard } from "@/components/admin/retrieval-health-card";
+import { describeAnswering } from "@/lib/query/llm-backend";
+import { normalizeAnsweringProvider } from "@/lib/query/answering";
 
 export const metadata: Metadata = { title: "Integrations" };
 
@@ -31,7 +33,7 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ t
   const user = await getSessionUser();
   const { data: team } = await sessionDb
     .from("teams")
-    .select("id, primary_pm_provider")
+    .select("id, primary_pm_provider, answering_provider")
     .eq("slug", teamSlug)
     .maybeSingle();
   if (!team) return null;
@@ -56,6 +58,34 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ t
   ]);
   const githubIntegration = integrations.find((i) => i.type === "github") ?? null;
   const openrouter = integrations.find((i) => i.type === "openrouter") ?? null;
+
+  // "Active answering model" state: the explicit override + each provider's availability/model, and
+  // the RESOLVED backend (provider + model) so the panel shows exactly what's answering — without
+  // decrypting any key (a non-empty sentinel stands in for "key is set" since the resolver only
+  // checks presence). LLM_BASE_URL comes from the server env (the self-hosted "local" backend).
+  const modelOf = (type: "anthropic" | "openai" | "openrouter") =>
+    (integrations.find((i) => i.type === type)?.config.model as string | undefined) ?? null;
+  const hasKey = (type: "anthropic" | "openai" | "openrouter") =>
+    !!integrations.find((i) => i.type === type)?.hasSecret;
+  const answeringProvider = normalizeAnsweringProvider(team.answering_provider);
+  const localBaseUrl = process.env.LLM_BASE_URL ?? undefined;
+  const answering = describeAnswering(
+    { LLM_BASE_URL: localBaseUrl, LLM_MODEL: process.env.LLM_MODEL },
+    {
+      anthropicKey: "env-or-set", // anthropic answers via env key even when no team key is stored
+      anthropicModel: modelOf("anthropic"),
+      openaiKey: hasKey("openai") ? "set" : null,
+      openaiModel: modelOf("openai"),
+      openrouterKey: hasKey("openrouter") ? "set" : null,
+      openrouterModel: modelOf("openrouter"),
+      activeProvider: answeringProvider,
+    }
+  );
+  const answeringModels: Record<"anthropic" | "openai", string | null> = {
+    anthropic: modelOf("anthropic"),
+    openai: modelOf("openai"),
+  };
+  const localConfigured = !!localBaseUrl;
   const scannedRepos = Array.from(
     new Set(freshness.map((c) => c.full_name).filter((n): n is string => !!n))
   );
@@ -98,6 +128,15 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ t
         teamSlug={teamSlug}
         integrations={integrations}
         primaryPmProvider={(team.primary_pm_provider as "plane" | "linear" | null) ?? null}
+        answering={{
+          provider: answeringProvider,
+          models: answeringModels,
+          effective: { provider: answering.provider, model: answering.model },
+          usedFallback: answering.usedFallback,
+          localConfigured,
+          openrouterConfigured: hasKey("openrouter"),
+          openaiConfigured: hasKey("openai"),
+        }}
       />
       <MemberOnboardingPanel teamSlug={teamSlug} values={onboardingValues} />
       <div>

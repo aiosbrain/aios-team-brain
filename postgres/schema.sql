@@ -108,13 +108,20 @@ create table if not exists teams (
   -- The single PM tool the brain projects tasks into (brain-api v1.2). Null until an admin picks
   -- one; projection no-ops (or uses the sole enabled PM integration) when unset.
   primary_pm_provider text check (primary_pm_provider in ('plane', 'linear')),
+  -- Explicit answering-backend override for the Query box. Null = auto precedence
+  -- (OpenRouter → LLM_BASE_URL → Anthropic); otherwise force that backend (lib/query/llm-backend).
+  answering_provider text check (answering_provider in ('anthropic', 'openai', 'openrouter', 'local')),
   created_at timestamptz not null default now()
 );
--- Additive column for existing deployments.
+-- Additive columns for existing deployments.
 alter table teams add column if not exists primary_pm_provider text;
+alter table teams add column if not exists answering_provider text;
 do $$ begin
   if not exists (select 1 from pg_constraint where conname = 'teams_primary_pm_provider_check') then
     alter table teams add constraint teams_primary_pm_provider_check check (primary_pm_provider in ('plane', 'linear'));
+  end if;
+  if not exists (select 1 from pg_constraint where conname = 'teams_answering_provider_check') then
+    alter table teams add constraint teams_answering_provider_check check (answering_provider in ('anthropic', 'openai', 'openrouter', 'local'));
   end if;
 end $$;
 

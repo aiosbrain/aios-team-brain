@@ -16,7 +16,7 @@ import {
   appendMessage,
 } from "@/lib/chat/store";
 import { generateAndSetTitle } from "@/lib/chat/title";
-import { getProviderKey, getOpenrouterSettings } from "@/lib/integrations/manage";
+import { resolveAnsweringKeys } from "@/lib/query/answering";
 import { isSyncCommand, runManualSync } from "@/lib/ingest/manual-sync";
 import { audit } from "@/lib/api/audit";
 
@@ -188,19 +188,9 @@ export async function POST(req: NextRequest) {
   const started = Date.now();
   const ctx = await retrieve(db, team.id, memberTier, question, project);
 
-  // Per-team provider keys (encrypted in integrations); null → env fallback in streamAnswer.
-  // OpenRouter (key + model) takes precedence in selectLlmBackend when configured.
-  const [anthropicKey, openaiKey, openrouter] = await Promise.all([
-    getProviderKey(db, team.id, "anthropic"),
-    getProviderKey(db, team.id, "openai"),
-    getOpenrouterSettings(db, team.id),
-  ]);
-  const keys = {
-    anthropicKey,
-    openaiKey,
-    openrouterKey: openrouter.key,
-    openrouterModel: openrouter.model,
-  };
+  // Per-team provider keys + models + the explicit answering-backend override (null fields → env
+  // fallback in streamAnswer; `activeProvider` forces a backend, else selectLlmBackend precedence).
+  const keys = await resolveAnsweringKeys(db, team.id);
 
   const encoder = new TextEncoder();
   const stream = new ReadableStream({
