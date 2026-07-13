@@ -7,7 +7,7 @@ import { formatSseFrame } from "@/lib/api/sse";
 import { retrieve } from "@/lib/query/retrieve";
 import { streamAnswer } from "@/lib/query/claude";
 import { pickTimezone, DEFAULT_TIMEZONE } from "@/lib/query/timezone";
-import { getProviderKey } from "@/lib/integrations/manage";
+import { resolveAnsweringKeys } from "@/lib/query/answering";
 import {
   ownsConversation,
   recentTurns,
@@ -91,11 +91,9 @@ export async function POST(req: NextRequest) {
   const started = Date.now();
   const ctx = await retrieve(db, auth.teamId, auth.memberTier, question, project);
 
-  // Per-team provider keys (encrypted in integrations); null → env fallback in streamAnswer.
-  const [anthropicKey, openaiKey] = await Promise.all([
-    getProviderKey(db, auth.teamId, "anthropic"),
-    getProviderKey(db, auth.teamId, "openai"),
-  ]);
+  // Per-team provider keys + models + the explicit answering-backend override (same resolver the
+  // dashboard route uses, so both honor OpenRouter/OpenAI/local + `teams.answering_provider`).
+  const keys = await resolveAnsweringKeys(db, auth.teamId);
 
   const encoder = new TextEncoder();
   const stream = new ReadableStream({
@@ -107,7 +105,7 @@ export async function POST(req: NextRequest) {
 
       let answer = "";
       try {
-        for await (const chunk of streamAnswer(ctx, question, { anthropicKey, openaiKey }, priorTurns, caller, timeZone)) {
+        for await (const chunk of streamAnswer(ctx, question, keys, priorTurns, caller, timeZone)) {
           if (chunk.type === "delta") {
             answer += chunk.text;
             send("delta", { text: chunk.text });
@@ -135,7 +133,7 @@ export async function POST(req: NextRequest) {
                 cost_usd: chunk.usage.cost_usd,
               });
               if (createdNew) {
-                await generateAndSetTitle(db, owner, conversationId, question, answer, { anthropicKey, openaiKey });
+                await generateAndSetTitle(db, owner, conversationId, question, answer, keys);
               }
             }
 

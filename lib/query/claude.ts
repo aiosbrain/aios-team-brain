@@ -1,7 +1,7 @@
 import "server-only";
 import Anthropic from "@anthropic-ai/sdk";
 import type { RetrievedContext } from "./retrieve";
-import { selectLlmBackend, type LlmBackend } from "./llm-backend";
+import { selectLlmBackend, type LlmBackend, type LlmBackendKeys } from "./llm-backend";
 
 /**
  * Thin adapter around the Claude API so a future agent backend (e.g. Hermes)
@@ -14,7 +14,6 @@ import { selectLlmBackend, type LlmBackend } from "./llm-backend";
  *   - LLM_BASE_URL unset → the original Anthropic path (unchanged).
  */
 
-const MODEL = "claude-opus-4-8";
 // $5 / $25 per MTok; cache reads ~0.1x input
 const INPUT_PER_TOKEN = 5 / 1_000_000;
 const OUTPUT_PER_TOKEN = 25 / 1_000_000;
@@ -184,13 +183,12 @@ export type QueryUsage = {
  * is null/absent the SDK / fetch falls back to the process env, preserving the original env-only
  * behavior for instances that haven't set a key in the dashboard.
  */
-export interface ProviderKeys {
-  anthropicKey?: string | null;
-  openaiKey?: string | null;
-  // OpenRouter (OpenAI-compatible gateway): a per-team key + chosen model select this backend first.
-  openrouterKey?: string | null;
-  openrouterModel?: string | null;
-}
+/**
+ * The full set of per-team provider keys + models + the explicit answering-backend override.
+ * A single shape (`LlmBackendKeys`) so every caller — the answer stream, the title generator, and
+ * the admin indicator — reasons about the same fields. All optional; unset → env/precedence fallback.
+ */
+export type ProviderKeys = LlmBackendKeys;
 
 export async function* streamAnswer(
   ctx: RetrievedContext,
@@ -225,7 +223,7 @@ export async function* streamAnswer(
   const client = new Anthropic(keys.anthropicKey ? { apiKey: keys.anthropicKey } : undefined);
 
   const stream = client.messages.stream({
-    model: MODEL,
+    model: backend.model,
     max_tokens: 4096,
     thinking: { type: "adaptive" },
     system: [

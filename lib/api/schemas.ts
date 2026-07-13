@@ -497,11 +497,12 @@ const integrationConfigSchemas: Record<IntegrationType, z.ZodType> = {
       externalSource: z.string().max(80).optional(),
     })
     .strict(),
-  // Provider key types hold only the encrypted secret — no non-secret config …
-  openai: z.object({}).strict(),
-  anthropic: z.object({}).strict(),
+  // Provider key types hold the encrypted secret plus an optional NON-secret answer-model slug
+  // (which model that provider's key answers with — surfaced/chosen in Admin → Integrations).
+  // google stays config-less (not wired into answering yet).
+  openai: z.object({ model: z.string().min(1).max(120).optional() }).strict(),
+  anthropic: z.object({ model: z.string().min(1).max(120).optional() }).strict(),
   google: z.object({}).strict(),
-  // … except OpenRouter, which also stores the chosen model slug (e.g. "openai/gpt-4o-mini").
   openrouter: z.object({ model: z.string().min(1).max(120).optional() }).strict(),
   // Typefully: the social-set id to publish into (NON-secret); the API key stays encrypted.
   typefully: z.object({ socialSetId: z.string().min(1).max(120).optional() }).strict(),
