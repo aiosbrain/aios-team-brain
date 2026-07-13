@@ -47,6 +47,19 @@ do $$ begin
   create type action_status as enum
     ('requested', 'denied', 'pending_approval', 'running', 'succeeded', 'failed');
 exception when duplicate_object then null; end $$;
+do $$ begin
+  create type social_job_status as enum ('queued', 'running', 'done', 'dead');
+exception when duplicate_object then null; end $$;
+do $$ begin
+  create type opportunity_status as enum ('discovered', 'evaluated', 'planned', 'rejected', 'expired');
+exception when duplicate_object then null; end $$;
+do $$ begin
+  create type content_status as enum (
+    'planned', 'generating', 'generated', 'validating', 'awaiting_approval', 'approved',
+    'scheduled', 'publishing', 'published', 'analyzing', 'completed',
+    'rejected', 'failed', 'cancelled', 'expired'
+  );
+exception when duplicate_object then null; end $$;
 
 -- ── auth (local) ─────────────────────────────────────────────────────────────
 -- Local auth tables (a session is a signed cookie; see lib/auth). Magic-link
@@ -204,10 +217,17 @@ create table if not exists member_profiles (
   preferred_channels text[] not null default '{}',
   location text not null default '',
   bio text not null default '',
+  -- Self-uploaded profile picture, stored as a data: URL (no object storage in this codebase —
+  -- self-host-portable, no extra infra). Resized/compressed client-side before upload; NULL = no
+  -- manual upload, fall back to members.avatar_url (GitHub) then initials. Written only by
+  -- lib/identity/profile.ts (same single-writer guard as the rest of this table).
+  avatar_data_url text,
   updated_at timestamptz not null default now(),
   updated_by uuid references members(id) on delete set null
 );
 create index if not exists member_profiles_team_idx on member_profiles (team_id);
+-- Additive column for existing deployments (idempotent rollout via `npm run pg:schema`).
+alter table member_profiles add column if not exists avatar_data_url text;
 
 -- Time-off date ranges (PTO / holiday / sick / other). Many rows per member.
 create table if not exists member_time_off (
@@ -504,6 +524,33 @@ create table if not exists decisions (
   unique (team_id, project_id, row_key)
 );
 create index if not exists decisions_team_date_idx on decisions (team_id, decided_at desc);
+
+-- Meeting notes: the rich metadata layer over a transcript. The full text lives as a normal
+-- `items` row (kind='transcript', written through the existing lib/ingest single writer) so it's
+-- searchable/queryable through the existing FTS/retrieve pipeline for free; this table holds what
+-- `items` has no columns for (who submitted it, who attended, an LLM-written summary). Sole writer:
+-- lib/meetings/notes.ts.
+create table if not exists meeting_notes (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  source_item_id uuid not null references items(id) on delete cascade,
+  submitted_by uuid references members(id) on delete set null,
+  title text not null,
+  summary text not null default '',
+  occurred_at date,
+  created_at timestamptz not null default now(),
+  unique (source_item_id)
+);
+create index if not exists meeting_notes_team_idx on meeting_notes (team_id, created_at desc);
+
+-- LLM-matched roster attendees (many-to-many; an unmatched name in the transcript is simply
+-- dropped, never blocks the note from saving).
+create table if not exists meeting_note_attendees (
+  meeting_note_id uuid not null references meeting_notes(id) on delete cascade,
+  member_id uuid not null references members(id) on delete cascade,
+  primary key (meeting_note_id, member_id)
+);
+create index if not exists meeting_note_attendees_member_idx on meeting_note_attendees (member_id);
 
 create table if not exists graph_entities (
   id uuid primary key default gen_random_uuid(),
@@ -849,7 +896,7 @@ create index if not exists subscriptions_team_idx on subscriptions (team_id);
 create table if not exists integrations (
   id uuid primary key default gen_random_uuid(),
   team_id uuid not null references teams(id) on delete cascade,
-  type text not null check (type in ('github','granola','slack','wise','linear','plane','openai','anthropic','google','openrouter')),
+  type text not null check (type in ('github','granola','slack','wise','linear','plane','openai','anthropic','google','openrouter','typefully')),
   name text not null,
   config jsonb not null default '{}',
   secret_ciphertext text,                 -- AES-256-GCM blob (base64); null if no secret set
@@ -879,6 +926,21 @@ create table if not exists graph_episodes (
   unique (team_id, source_table, source_id)
 );
 create index if not exists graph_episodes_team_idx on graph_episodes (team_id, projected_at desc);
+
+-- Narrative-arc synthesis cache (Layer 3, lib/graph/arcs). Arcs are an LLM synthesis over the last
+-- 7d of the graph — expensive to compute and identical for everyone sharing a tier-visible group set.
+-- This persists the result across restarts/deploys and shares it across instances (the in-memory
+-- cache did neither). `group_key` is the sorted visible-group set (already the in-memory cache key);
+-- `arcs` is the fully-attributed NarrativeArc[] JSON. Read serves-stale-while-revalidate (a stale row
+-- is returned immediately while a background recompute refreshes it) — see getArcs. Regenerable cache,
+-- not a source of truth. Sole writer: lib/graph/arc-cache (via lib/graph/arcs).
+create table if not exists arc_cache (
+  team_id uuid not null references teams(id) on delete cascade,
+  group_key text not null,                       -- sorted visible-group set, e.g. 'acme_external,acme_team'
+  arcs jsonb not null default '[]'::jsonb,        -- NarrativeArc[] (already human-attributed)
+  computed_at timestamptz not null default now(),
+  primary key (team_id, group_key)
+);
 
 -- ── chat conversations (persistent, owner-scoped chat history) ────────────────
 -- ChatGPT-style threads persisted server-side so history survives across sessions AND interfaces
@@ -943,3 +1005,212 @@ create table if not exists ingest_runs (
 );
 create index if not exists ingest_runs_team_source_idx on ingest_runs (team_id, source, finished_at desc);
 create index if not exists ingest_runs_finished_idx on ingest_runs (finished_at desc);
+
+-- ── Social Brain durable job/outbox (M0) ─────────────────────────────────────
+-- The one durable async primitive: work that survives a redeploy and retries on failure
+-- (media renders, provider polling, scheduled publishing, publish/analytics retries). The
+-- in-process poller (lib/jobs/scheduler) claims due rows, runs the handler registered for the
+-- `kind`, and on failure requeues with exponential backoff until `max_attempts` → 'dead'.
+-- `run_after` doubles as the scheduled-publish time. Single writer: lib/jobs/store.ts. No RLS
+-- — team scoping is app-code. Claim is a conditional UPDATE under the poller's single-flight
+-- guard (one instance today); the documented multi-instance upgrade is FOR UPDATE SKIP LOCKED.
+create table if not exists social_jobs (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  kind text not null,                         -- 'generate_image' | 'poll_render' | 'publish' | 'collect_analytics' | …
+  payload jsonb not null default '{}',        -- kind-specific input (no secrets — those stay in integrations)
+  status social_job_status not null default 'queued',
+  attempts integer not null default 0,        -- times a worker has started this job
+  max_attempts integer not null default 5,    -- after this many failed attempts → 'dead'
+  run_after timestamptz not null default now(), -- earliest eligible run time (scheduling + backoff)
+  locked_at timestamptz,                       -- when the current worker claimed it (null unless running)
+  last_error text,                             -- most recent failure message (surfaced, never thrown)
+  dedup_key text,                              -- optional idempotency key; unique per team when set
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+create index if not exists social_jobs_due_idx on social_jobs (status, run_after);
+create index if not exists social_jobs_team_idx on social_jobs (team_id, created_at desc);
+create unique index if not exists social_jobs_dedup_idx
+  on social_jobs (team_id, dedup_key) where dedup_key is not null;
+
+-- ── Brand Brain (Social Brain M1) ────────────────────────────────────────────
+-- One persistent per-team brand config the Social Brain enforces: voice (vocabulary/tone/
+-- formatting/preferred+prohibited phrases), company knowledge (products/positioning/audiences/
+-- claims/roadmap visibility), and governance (confidential topics, legal/pricing/disclosure
+-- rules, approval thresholds). Non-secret config only — credentials stay in `integrations`.
+-- One row per team (team_id PK). Single writer: lib/brand/manage.ts. No RLS — the /admin area
+-- is admin-gated in app code.
+create table if not exists brand_profiles (
+  team_id uuid primary key references teams(id) on delete cascade,
+  voice jsonb not null default '{}',
+  knowledge jsonb not null default '{}',
+  governance jsonb not null default '{}',
+  created_by uuid references members(id) on delete set null,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+-- Brand assets: per-team reference library (website/URLs, logo/image links, reference examples)
+-- the Brand Brain layers into generation. Non-secret. Single writer: lib/brand/assets.ts.
+create table if not exists brand_assets (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  kind text not null check (kind in ('url', 'asset', 'reference')),
+  label text not null,
+  url text,
+  notes text not null default '',
+  created_by uuid references members(id) on delete set null,
+  created_at timestamptz not null default now()
+);
+create index if not exists brand_assets_team_idx on brand_assets (team_id, created_at desc);
+
+-- ── Social Brain content domain (M2 foundation) ──────────────────────────────
+-- The durable data model + lifecycle for opportunity → plan → variant. Each row carries an
+-- `access` tier inherited from its source evidence, so tier isolation (CLAUDE.md §5) propagates
+-- down the chain. Schema only in M2 — discovery-scoring + brand-aware planning are a later
+-- product-steered milestone. Single writer: lib/social/store.ts. No RLS — app-code enforced.
+create table if not exists social_opportunities (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  access access_tier not null,
+  source_type text not null,                -- 'manual' | 'item' | 'commit' | 'decision' | …
+  title text not null,
+  summary text not null default '',
+  evidence jsonb not null default '[]',     -- [{item_id, path, note}] — provenance to brain knowledge
+  topics jsonb not null default '[]',
+  audiences jsonb not null default '[]',
+  novelty_score numeric(4, 3) not null default 0,
+  relevance_score numeric(4, 3) not null default 0,
+  urgency_score numeric(4, 3) not null default 0,
+  confidence_score numeric(4, 3) not null default 0,
+  status opportunity_status not null default 'discovered',
+  dedup_key text,
+  created_by uuid references members(id) on delete set null,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+create index if not exists social_opportunities_team_status_idx on social_opportunities (team_id, status, created_at desc);
+create index if not exists social_opportunities_team_access_idx on social_opportunities (team_id, access);
+create unique index if not exists social_opportunities_dedup_idx
+  on social_opportunities (team_id, dedup_key) where dedup_key is not null;
+
+create table if not exists content_plans (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  opportunity_id uuid not null references social_opportunities(id) on delete cascade,
+  access access_tier not null,
+  objective text not null default '',
+  audience text not null default '',
+  status text not null default 'planned' check (status in ('planned', 'active', 'archived')),
+  created_by uuid references members(id) on delete set null,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+create index if not exists content_plans_team_opp_idx on content_plans (team_id, opportunity_id);
+create index if not exists content_plans_team_access_idx on content_plans (team_id, access);
+
+create table if not exists content_variants (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  plan_id uuid not null references content_plans(id) on delete cascade,
+  access access_tier not null,
+  platform text not null,                   -- 'x' | 'linkedin' | 'threads' | …
+  format text not null,                     -- 'text' | 'image' | 'carousel' | …
+  tone text not null default '',
+  body text not null default '',
+  status content_status not null default 'planned',
+  validation jsonb not null default '{}',   -- governance gate result (violations/warnings), lib/social/validate
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+alter table content_variants add column if not exists validation jsonb not null default '{}';
+create index if not exists content_variants_team_plan_idx on content_variants (team_id, plan_id);
+create index if not exists content_variants_team_status_idx on content_variants (team_id, status);
+
+-- Generated media (images) for a variant. Opt-in + rate-capped (lib/media/generate-image); bytes
+-- inline as base64 for V1. Single writer: lib/media/store.ts. Tier inherited from the variant.
+create table if not exists media_assets (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  variant_id uuid not null references content_variants(id) on delete cascade,
+  access access_tier not null,
+  kind text not null default 'image' check (kind in ('image')),
+  provider text not null,
+  model text not null,
+  prompt text not null default '',
+  data_base64 text not null,
+  cost_usd numeric(10, 5) not null default 0,
+  created_by uuid references members(id) on delete set null,
+  created_at timestamptz not null default now()
+);
+create index if not exists media_assets_variant_idx on media_assets (variant_id, created_at desc);
+create index if not exists media_assets_team_day_idx on media_assets (team_id, created_at);
+
+-- Social Brain approval workflow (M4). Per-team autonomy gate + the content-approval queue.
+-- Single writers: lib/social/settings.ts (autonomy), lib/social/approvals.ts (queue).
+create table if not exists social_settings (
+  team_id uuid primary key references teams(id) on delete cascade,
+  autonomy text not null default 'draft_only'
+    check (autonomy in ('draft_only', 'approval_required', 'auto_publish_low_risk', 'fully_autonomous')),
+  publish_dry_run boolean not null default true,   -- no live posts until an admin flips this off
+  updated_at timestamptz not null default now()
+);
+alter table social_settings add column if not exists publish_dry_run boolean not null default true;
+
+-- Publication ledger (M5): one row per publish attempt of a variant. Single writer:
+-- lib/social/publications.ts. Tier inherited from the variant. Publishing rides the M0 job runner.
+create table if not exists social_publications (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  variant_id uuid not null references content_variants(id) on delete cascade,
+  access access_tier not null,
+  provider text not null default 'typefully',
+  status text not null default 'scheduled'
+    check (status in ('scheduled', 'publishing', 'published', 'failed', 'cancelled')),
+  dry_run boolean not null default true,
+  scheduled_at timestamptz,
+  published_at timestamptz,
+  external_id text,
+  external_url text,
+  last_error text,
+  created_by uuid references members(id) on delete set null,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+create index if not exists social_publications_team_idx on social_publications (team_id, created_at desc);
+create index if not exists social_publications_variant_idx on social_publications (variant_id);
+
+-- Normalized per-publication analytics (M6). One row per publication (latest snapshot). Typefully
+-- exposes X-only metrics. Single writer: lib/social/analytics.ts. Tier inherited from publication.
+create table if not exists publication_analytics (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  publication_id uuid not null unique references social_publications(id) on delete cascade,
+  access access_tier not null,
+  provider text not null default 'typefully',
+  impressions integer,
+  likes integer,
+  comments integer,
+  shares integer,
+  saves integer,
+  clicks integer,
+  raw jsonb not null default '{}',
+  collected_at timestamptz not null default now(),
+  created_at timestamptz not null default now()
+);
+create index if not exists publication_analytics_team_idx on publication_analytics (team_id, collected_at desc);
+
+create table if not exists content_approvals (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  variant_id uuid not null references content_variants(id) on delete cascade,
+  access access_tier not null,
+  status approval_status not null default 'pending',
+  decided_by uuid references members(id) on delete set null,
+  decided_at timestamptz,
+  decision_note text not null default '',
+  created_at timestamptz not null default now()
+);
+create index if not exists content_approvals_team_status_idx on content_approvals (team_id, status, created_at desc);
+create index if not exists content_approvals_variant_idx on content_approvals (variant_id);

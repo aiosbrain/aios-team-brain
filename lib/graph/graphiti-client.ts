@@ -13,6 +13,23 @@ import "server-only";
  * `fetchImpl`/`baseUrl` are injectable so the client is unit-testable without a live Graphiti.
  */
 
+/**
+ * Is `url` a USABLE Graphiti endpoint? A valid http(s) URL with a host. This is stricter than
+ * "non-empty" on purpose: prod once carried a malformed `GRAPHITI_URL = "http://"`, which the old
+ * `base.length > 0` check treated as configured → every query + scheduler tick fired a doomed HTTP
+ * call and swallowed the error. Shared with the Admin retrieval-health card so the runtime and the
+ * dashboard agree on whether the graph leg is on. Pure — unit-tested.
+ */
+export function graphitiConfigured(url: string | undefined): boolean {
+  if (!url) return false;
+  try {
+    const u = new URL(url);
+    return (u.protocol === "http:" || u.protocol === "https:") && u.hostname.length > 0;
+  } catch {
+    return false;
+  }
+}
+
 export interface GraphEpisode {
   /** The episode text Graphiti extracts entities/relationships from. */
   content: string;
@@ -61,7 +78,28 @@ export class GraphitiClient {
   }
 
   get configured(): boolean {
-    return this.base.length > 0;
+    return graphitiConfigured(this.base);
+  }
+
+  /**
+   * Liveness probe for the admin health card — `GET /healthcheck` with a SHORT timeout (independent of
+   * the 30s call timeout; a dashboard render must not hang on a dead service). Best-effort: returns
+   * false on any error (unconfigured, unreachable, timeout, non-2xx) so a set-but-down Graphiti reads
+   * as *degraded* on the dashboard instead of a false "on" — Graphiti's worker dies silently, so a
+   * configured URL alone is not evidence the leg actually works. Never throws.
+   */
+  async healthcheck(timeoutMs = 2500): Promise<boolean> {
+    if (!this.configured) return false;
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+      const res = await this.fetch(`${this.base}/healthcheck`, { method: "GET", signal: ctrl.signal });
+      return res.ok;
+    } catch {
+      return false;
+    } finally {
+      clearTimeout(t);
+    }
   }
 
   private async request<T>(method: string, path: string, body?: unknown): Promise<T> {

@@ -5,6 +5,17 @@ import { Client } from "pg";
 // before each test. One dedicated connection (separate from the app's pool) so
 // truncation can't deadlock against in-flight adapter queries.
 const DATA_TABLES = [
+  "publication_analytics",
+  "social_publications",
+  "content_approvals",
+  "social_settings",
+  "media_assets",
+  "content_variants",
+  "content_plans",
+  "social_opportunities",
+  "brand_assets",
+  "brand_profiles",
+  "social_jobs",
   "integrations",
   "actions",
   "approval_requests",

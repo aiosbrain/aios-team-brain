@@ -59,10 +59,24 @@ real test") the moment the gap is closed. So the count of `it.fails` in these fi
 
 ## Status
 
-Gaps **#1, #3, #4, #5, #6 are fixed** and #2's ranking facet is fixed — the multi-channel adversarial
-suite is green except one remaining `it.fails`: the **recall ceiling** (a query legitimately matching
-50+ items returns only ~28). That's the one gap keyword search can't close on its own; the durable fix
-is **dense/pgvector retrieval + a reranker + query-scoped caps** (the `EMBEDDINGS_URL` leg already
-exists but is off by default). Everything else — short-token recall, `ts_rank` ordering, IDF grounding,
-channel scoping, full-corpus task counts, decision keyword search — now holds as channels multiply. The
-tests make each fix *provable*: each closed gap's `it.fails` flipped to a green `it()`.
+**All six gaps are addressed** — the multi-channel adversarial data-mechanics suite is fully green
+(every `it.fails` flipped to a green `it()`):
+
+- #1 short-token recall, #2 `ts_rank` ordering, #3 IDF grounding, #4 channel scoping, #5 full-corpus
+  task counts, #6 decision keyword search — all fixed as above.
+- **#2 recall facet** — the FTS candidate cap was raised 20 → `FTS_CANDIDATE_LIMIT` (50). A realistic
+  broad query no longer loses half its evidence; `MAX_TOTAL_CHARS` is still the real output ceiling, so
+  large corpora truncate best-ranked-first rather than blowing the token budget.
+- **Dense grounding** — `denseSearch` now applies a distance floor (`DENSE_MAX_DISTANCE`), so far
+  nearest-neighbors don't false-ground (they were silently overriding the IDF signal once dense went live).
+- **Conjunctive intent** — an explicit upper-cased `AND` (`buildFtsQuery` / `conjunctiveTerms`) is now an
+  opt-in precision operator: "auth AND payments" narrows to docs about BOTH topics instead of OR-matching
+  either. `websearch_to_tsquery` already reads space/"and" as AND, so the join word alone flips the
+  operator — no SQL change. Upper-case only, so ordinary lowercase "and" (a stopword) never guts recall.
+  Proven at the FTS leg on real Postgres (retrieve()'s recency net always pads recent docs, so the
+  narrowing is only cleanly observable on the ranked candidates the operator controls).
+
+**What remains (intentionally, for the large-collective-data future, not this scale):** the recall
+ceiling BEYOND the candidate cap (a query matching *hundreds* of items) and true relevance beyond
+lexical rank — both the job of **dense/pgvector + a reranker**, whose leg exists (`EMBEDDINGS_URL`,
+`RERANK_URL`) and is now grounded safely.

@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { retrieve } from "@/lib/query/retrieve";
+import { retrieve, buildFtsQuery } from "@/lib/query/retrieve";
+import { rankedFtsSearch } from "@/lib/query/fts-search";
 import { db, ingest, seedTeam, type Seed } from "./helpers";
 
 /**
@@ -114,12 +115,12 @@ describe("multi-channel adversarial retrieval (real Postgres)", () => {
     expect(await paths("scheduled security review")).toContain("slack/incidents/target.md");
   });
 
-  it.fails("GAP: a broad-but-legitimate query matches more items than the caps allow, unranked", async () => {
-    // Across 6 channels, 50 genuinely on-topic items about the payments migration. The unique-source
-    // ceiling is ~28 (FTS 20 + recency 8), so retrieval returns a bounded, UNRANKED subset — and with
-    // no ts_rank there's no guarantee it's the most relevant ~28. "Summarize the payments migration"
-    // then silently sees roughly half the real evidence. Desired: full recall for a topic this focused
-    // (or at least a *ranked* best-N, so what's dropped is provably the least relevant).
+  it("STRENGTH: a broad query gets full recall up to the raised candidate cap (Gap #2 recall facet)", async () => {
+    // Across 6 channels, 50 genuinely on-topic items about the payments migration. The FTS candidate
+    // cap was 20 (+8 recency) → ~half were silently dropped. Raised to FTS_CANDIDATE_LIMIT (50), all
+    // 50 now come through (they're small, so the char budget doesn't bind), best-ranked first. The
+    // ceiling still exists far higher — a corpus with hundreds of matches needs dense/rerank — but a
+    // realistic multi-channel broad query no longer loses half its evidence.
     const posted: string[] = [];
     for (let i = 0; i < 50; i++) {
       await post(`slack/ch${i % 6}`, `payments-${i}`, `Payments migration note ${i}: Stripe webhook cutover step ${i} discussed.`);
@@ -225,5 +226,34 @@ describe("multi-channel adversarial retrieval (real Postgres)", () => {
     }
     const ctx = await retrieve(db(), seed.teamId, "team", "which vendor did we pick for the data warehouse?");
     expect(ctx.structured).toContain("DEC-000");
+  });
+
+  it("STRENGTH: an explicit AND narrows the FTS candidate set to docs about BOTH topics", async () => {
+    // Conjunctive intent is an FTS-leg property: retrieve()'s recency net ALWAYS pads in recent docs
+    // regardless of the query operator, so the narrowing is only cleanly observable on the ranked FTS
+    // candidates — the leg the operator actually controls. We pass the raw question through the SAME
+    // builder retrieve() uses (buildFtsQuery), so this proves the operator end-to-end at the DB.
+    await post("slack/security", "auth-only", "The auth login flow token rotation and session cookie hardening were shipped.");
+    await post("slack/finance", "payments-only", "The payments billing invoices and the payout schedule were reconciled this week.");
+    await post("slack/platform", "both", "The auth token is now verified inside the payments checkout flow before charging.");
+
+    const fts = async (question: string) => {
+      const { query } = buildFtsQuery(question);
+      const hits = await rankedFtsSearch(seed.teamId, "team", query, 50);
+      return hits.map((h) => h.path);
+    };
+
+    // AND operator → only the both-topics doc matches; the single-topic docs are excluded.
+    const andHits = await fts("auth AND payments");
+    expect(andHits).toContain("slack/platform/both.md");
+    expect(andHits).not.toContain("slack/security/auth-only.md");
+    expect(andHits).not.toContain("slack/finance/payments-only.md");
+
+    // Contrast — the plain OR query DOES surface every single-topic doc (proves the AND exclusion is
+    // the operator narrowing, not the docs being unfindable).
+    const orHits = await fts("auth payments");
+    expect(orHits).toContain("slack/security/auth-only.md");
+    expect(orHits).toContain("slack/finance/payments-only.md");
+    expect(orHits).toContain("slack/platform/both.md");
   });
 });

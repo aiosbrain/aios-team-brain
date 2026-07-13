@@ -21,6 +21,12 @@ export type { Source, RetrievedContext };
 
 const MAX_SOURCE_CHARS = 8_000;
 const MAX_TOTAL_CHARS = 160_000; // ~40k tokens context cap
+// How many ranked keyword candidates to pull before the char budget truncates. Was 20 — too small
+// once many channels make a broad query legitimately match dozens of items; the top-20 then dropped
+// relevant evidence. `MAX_TOTAL_CHARS` is the real output ceiling (it truncates large corpora), so a
+// larger candidate pool just lets more of a many-small-item corpus through, best-ranked first. Tune
+// via FTS_CANDIDATE_LIMIT. (The recall CEILING beyond this is the dense/rerank job, not keyword FTS.)
+const FTS_CANDIDATE_LIMIT = Number(process.env.FTS_CANDIDATE_LIMIT ?? 50);
 const GIT_WINDOW_DAYS = 90; // recency window for the per-contributor git-activity digest
 const PEOPLE_WINDOW_DAYS = 90; // recency window for the per-person cross-tool activity digest
 
@@ -190,9 +196,41 @@ export function significantTerms(question: string): string[] {
   return [...new Set(terms)];
 }
 
+/**
+ * Conjunctive intent (Gap: OR-semantics can't require BOTH topics). An explicit upper-cased `AND`
+ * between topics is an opt-in precision operator (like a search engine's AND): narrow to docs that
+ * contain ALL the named topics, instead of the OR default's recall bias. Returns the de-duped term
+ * list when the operator is present with a real topic on each side, else null (→ OR path unchanged).
+ *
+ * Deliberately ONLY upper-cased `AND`, never lowercase "and": "and" is a ubiquitous stopword (it is
+ * in FTS_STOP), so treating every "and" as a hard conjunction would gut recall on ordinary questions
+ * ("what did john and mary decide"). Conservative, mirroring parseChannelScope (Gap #4) — no false
+ * positives. Multi-word sides collapse to a flat AND of every significant term (websearch_to_tsquery
+ * has no grouping), so "auth flow AND payments" requires auth+flow+payments; single-word sides (the
+ * common "auth AND payments") are exact. Pure + unit-tested.
+ */
+export function conjunctiveTerms(question: string): string[] | null {
+  if (!/\bAND\b/.test(question)) return null; // case-sensitive: only the upper-cased operator
+  const sides = question.split(/\bAND\b/).map(significantTerms);
+  if (sides.length < 2 || sides.some((s) => s.length === 0)) return null; // a real topic each side
+  const all = [...new Set(sides.flat())];
+  return all.length >= 2 ? all : null;
+}
+
+/**
+ * The FTS query the retrieval leg runs. `websearch_to_tsquery('english', …)` reads the literal word
+ * "or" as OR and space/"and" as AND, so the join word alone flips the operator — no SQL change. OR by
+ * default (recall bias; the LLM filters relevance); AND only when `conjunctiveTerms` fires (precision).
+ */
+export function buildFtsQuery(question: string): { query: string; terms: string[]; conjunctive: boolean } {
+  const conj = conjunctiveTerms(question);
+  if (conj) return { query: conj.join(" and "), terms: conj, conjunctive: true };
+  const terms = significantTerms(question);
+  return { query: terms.length ? terms.join(" or ") : question, terms, conjunctive: false };
+}
+
 export function toOrQuery(question: string): string {
-  const unique = significantTerms(question);
-  return unique.length ? unique.join(" or ") : question;
+  return buildFtsQuery(question).query;
 }
 
 /**
@@ -403,16 +441,17 @@ async function nativeRetrieve(
   // 1. Recall-friendly, RANKED FTS over items (OR of significant terms; see toOrQuery). Ordered by
   //    ts_rank so the capped top-20 is the most relevant 20, not an arbitrary 20 (Gap #2). Raw SQL
   //    (fts-search) because the builder emits an unordered `@@` filter.
-  const terms = significantTerms(q);
-  const orQuery = terms.length ? terms.join(" or ") : q;
-  const ftsP = rankedFtsSearch(teamId, tier, orQuery, 20, channel);
+  // OR of significant terms by default; AND when the query carries an explicit `AND` operator
+  // (conjunctive intent — narrows to docs about ALL topics). Same string flows to every FTS leg.
+  const { query: ftsQuery, terms } = buildFtsQuery(q);
+  const ftsP = rankedFtsSearch(teamId, tier, ftsQuery, FTS_CANDIDATE_LIMIT, channel);
   // Grounding specificity (Gap #3) — runs concurrently; combined with hadFtsHit below.
   const specificityP = analyzeTermSpecificity(teamId, tier, terms);
   // Structured-context scaling (Gaps #5/#6): a FULL-corpus task count (aggregates survive the 80-row
   // cap) + a keyword search over ALL decisions (an old-but-relevant decision survives the 50-row
   // recency window). Both run concurrently; folded into the structured block below.
   const taskCountsP = taskStatusCounts(teamId, tier);
-  const matchedDecisionsP = terms.length ? matchingDecisions(teamId, tier, orQuery, 10) : Promise.resolve([]);
+  const matchedDecisionsP = terms.length ? matchingDecisions(teamId, tier, ftsQuery, 10) : Promise.resolve([]);
 
   // 2. Recency: most recent items (a fallback so fresh content always has a shot).
   let recentB = db

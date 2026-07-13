@@ -9,4 +9,4 @@
  * Guarded by `test/guards/contract-version.test.ts` (asserts shape + agreement with the
  * architecture doc). Bumping the contract = bump this constant + the doc in the same PR.
  */
-export const BRAIN_API_VERSION = "1.7";
+export const BRAIN_API_VERSION = "1.8";

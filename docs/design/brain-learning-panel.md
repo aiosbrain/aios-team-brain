@@ -135,12 +135,19 @@ see `lib/ingest/run.ts`'s `resolveConnectorAuth`/`is_connector`), so `getArcs`/`
 (`lib/graph/arcs.ts`) resolve it in **two places**, not one:
 
 1. **The synthesis PROMPT (input)** — before calling the LLM, every numbered fact `[F12] …` fed to
-   the arc-synthesis prompt is attributed: if a fact's `subject` is a recognized AI-agent name, its
-   text is prefixed `"(Chetan Nandakumar, via Claude Code) Claude Code refactored the auth module"`
-   (`attributedFactTexts` in `lib/graph/arc-attribution.ts`, pure). This grounds the LLM's summary
-   text in a human from the start, instead of only patching the arc's `participants` array after the
-   fact — a summary that used to read "Claude Code is refactoring auth" now has the human in its own
-   input to draw from.
+   the arc-synthesis prompt is attributed with the human behind its source item
+   (`attributedFactTexts` in `lib/graph/arc-attribution.ts`, pure):
+   - AI-agent subject → `"(Chetan Nandakumar, via Claude Code) Claude Code refactored the auth module"`;
+   - **any other subject with a resolvable human** → `"(Chetan Nandakumar) the checklist evaluator was added"`;
+   - subject that already names the human (first-name → full-name) → left as-is (no `"(Chetan Nandakumar) Chetan shipped X"` redundancy, via `subjectNamesAHuman`);
+   - no resolvable human and not an agent → unchanged.
+
+   **This is the fix (2026-07-10) for arcs with no person's name** — e.g. "Context-Management System
+   Enhancements" or "Deterministic Checklist Evaluator", whose facts have technical/component subjects.
+   Previously only AI-agent-subject facts were attributed, so those arcs reached synthesis with no
+   human at all and rendered nameless; now the human (always known via `items.member_id`) is surfaced
+   into the prompt regardless of the subject's shape, so the summary is grounded in a person from the
+   start rather than only patching the arc's `participants` after the fact.
 2. **The arc OUTPUT (`participants`)** — `attributeParticipants` still rewrites a recognized AI-agent
    participant name to `"Claude Code (Chetan Nandakumar)"`, or `"Claude Code (unattributed AI agent)"`
    when no human resolves, as a backstop in case the LLM still echoes a bare agent name into
@@ -174,6 +181,37 @@ the raw evidence trail underneath — are collapsed by default behind a single `
 arc's evidence list (`components/learning/arcs-panel.tsx`). Rationale: an arc's own clickable evidence
 links are the primary "verify this" path; the full unfiltered Layer 1/2 feed is there for the rare
 deeper dive, not as permanently-stacked primary UI.
+
+## Arc cache — persistent + serve-stale-while-revalidate (added 2026-07-10)
+
+Arc synthesis is an LLM call over the last 7d of the graph — expensive, and identical for everyone
+sharing a tier-visible group set. It was cached **in memory for 10 min** (`lib/graph/arcs.ts`), which
+meant: lost on every deploy/restart, not shared across instances, and the first request after each
+expiry blocked on the LLM. Now there's a two-tier cache:
+
+- **`arc_cache` Postgres table** `(team_id, group_key, arcs jsonb, computed_at)` — `group_key` is the
+  sorted `visibleGroupIds(tier)` set (so a row is inherently tier-scoped; an `external` viewer only
+  ever touches the external-group row). Sole writer: `lib/graph/arc-cache` via `lib/graph/arcs`.
+  Regenerable — safe to truncate. `arcs` is written with an explicit `JSON.stringify` because the pg
+  adapter only auto-casts non-array *objects* to jsonb; a top-level array would otherwise bind as a
+  Postgres array literal (`invalid input syntax for type json`).
+- **`getArcs` read path is serve-stale-while-revalidate:** (1) fresh in-memory (this process) → return
+  instantly; (2) Postgres `arc_cache` — fresh (< 10 min) → return; **stale → return the stale arcs
+  immediately AND kick off a fire-and-forget recompute** (in-flight-deduped via a module `Set`, so N
+  concurrent stale reads fire ONE LLM call), using its own `adminClient` so it doesn't depend on the
+  request's client lifecycle; (3) cold miss → compute inline, persist to both caches. `recomputeArcs`
+  (the human-correction path) always recomputes and writes both caches.
+
+**Why SWR over a timer-driven global refresh** (the other option considered): a scheduler that
+recomputes every team's arcs on an interval would fire LLM calls for teams nobody is looking at (a
+cost multiplier) and would need each team's provider keys available in the background. SWR only ever
+recomputes a team **that is actually being viewed**, still gives warm reads (the viewer sees the
+previous arcs instantly while the refresh runs behind them), and needs no background key access. The
+one tradeoff: the arcs a viewer sees can be up to one refresh-cycle stale — fine for a 7-day-window,
+10-min-TTL summary that is explicitly "as of" a timestamp, not real-time. If proactive warming is ever
+wanted (e.g. a nightly warm for the whole org), the timer variant is recorded as a follow-up in
+`docs/TODO.md`. This runs on a persistent Node server (the in-process ingest scheduler already relies
+on that), so the fire-and-forget promise is not at risk of serverless request-teardown.
 
 ## Risks & mitigations
 - **Schema coupling** — we depend on Graphiti's internal Neo4j labels/props, which can change across

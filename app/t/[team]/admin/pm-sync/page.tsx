@@ -1,6 +1,10 @@
 import type { Metadata } from "next";
 import { serverClient } from "@/lib/db/server";
+import { adminClient } from "@/lib/db/admin";
 import { classifyInboundRow, loadInboundRows } from "@/lib/pm-sync/inbound";
+import { getProjectionHealth, listRecentProjectionRuns } from "@/lib/pm-sync/runs";
+import { ProjectionHealthCard } from "@/components/admin/projection-health-card";
+import { IngestRunsPanel } from "@/components/admin/ingest-runs-panel";
 import { ProjectBoardButton } from "./project-board-button";
 import { ReconcileButton } from "./reconcile-button";
 
@@ -16,7 +20,7 @@ export default async function PmSyncPage({ params }: { params: Promise<{ team: s
     .maybeSingle();
   if (!team) return null;
 
-  const [{ data: unresolved }, { data: failedLinks }, inboundRows] = await Promise.all([
+  const [{ data: unresolved }, { data: failedLinks }, inboundRows, projectionHealth, projectionRuns] = await Promise.all([
     db
       .from("work_events")
       .select("row_key, repo, merged_sha, pr_url, pr_title, error, created_at")
@@ -35,6 +39,10 @@ export default async function PmSyncPage({ params }: { params: Promise<{ team: s
     // links + task rows + the exact brain-status baseline — so the page deterministically
     // recomputes "conflict (both changed)" vs "pending apply" from persisted data alone.
     loadInboundRows(db, team.id),
+    // AIO-357: last-run + staleness for the outbound projection engine itself, read via the
+    // service-role client (ingest_runs has no per-team RLS-equivalent read helper besides this).
+    getProjectionHealth(adminClient(), team.id),
+    listRecentProjectionRuns(adminClient(), team.id, 20),
   ]);
 
   const divergences = inboundRows
@@ -51,6 +59,19 @@ export default async function PmSyncPage({ params }: { params: Promise<{ team: s
 
   return (
     <div className="flex flex-col gap-5">
+      <ProjectionHealthCard health={projectionHealth} />
+
+      <section className="prism-card p-4" data-section="recent-projection-runs">
+        <h2 className="text-lg font-semibold text-ink">Recent projection runs</h2>
+        <p className="mt-1 text-sm text-ink-secondary">
+          Every reactive push-triggered projection, every manual <span className="font-medium text-ink">Project board now</span>,
+          and every CLI <code>project</code> run, with its outcome — so a task edit that didn&apos;t reach the PM tool is diagnosable here.
+        </p>
+        <div className="mt-4">
+          <IngestRunsPanel runs={projectionRuns} />
+        </div>
+      </section>
+
       <section className="prism-card p-4">
         <h2 className="text-lg font-semibold text-ink">Project board</h2>
         <p className="mt-1 text-sm text-ink-secondary">

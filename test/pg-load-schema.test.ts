@@ -95,6 +95,7 @@ describe("pg-load-schema", () => {
 
     expect(clients).toHaveLength(1);
     expect(clients[0].queries).toEqual([
+      "SET lock_timeout = 15000",
       "create table base();",
       "alter table base add column first text;",
       "alter table base add column second text;",
@@ -151,8 +152,9 @@ describe("pg-load-schema", () => {
       loadSchema({
         cwd: root,
         databaseUrl: "postgres://app:app@localhost:5432/app",
+        // Index 0 is `SET lock_timeout`, 1 is schema.sql; fail on the first migration (index 2).
         createClient: (config) => {
-          const client = new FakeClient(config, 1);
+          const client = new FakeClient(config, 2);
           clients.push(client);
           return client;
         },
@@ -161,7 +163,7 @@ describe("pg-load-schema", () => {
     ).rejects.toThrow("query failed");
 
     expect(clients).toHaveLength(1);
-    expect(clients[0].queries).toEqual(["create table base();"]);
+    expect(clients[0].queries).toEqual(["SET lock_timeout = 15000", "create table base();"]);
     expect(clients[0].ended).toBe(true);
   });
 });

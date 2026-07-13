@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Ask a question / start a discussion
+    url: https://github.com/aiosbrain/aios-team-brain/discussions
+    about: Open-ended questions, ideas, and general discussion — not a specific bug or feature.
+  - name: AIOS Workspace (the contributor repo)
+    url: https://github.com/aiosbrain/aios-workspace
+    about: If your issue is about the individual workspace toolkit or the aios CLI rather than the Brain itself, file it there.

@@ -1,5 +1,6 @@
 import "server-only";
 import { runSql } from "@/lib/db/pg/pool";
+import { graphitiConfigured, GraphitiClient } from "@/lib/graph/graphiti-client";
 
 /**
  * Retrieval-stack health for the admin dashboard (Phase 1 of the retrieval-observability plan).
@@ -15,6 +16,10 @@ import { runSql } from "@/lib/db/pg/pool";
 
 export type LegState = "on" | "off";
 export type DenseState = "off" | "healthy" | "building" | "degraded";
+// Graph is externally-dependent like dense, so it gets the same "configured-but-broken" middle state:
+// "degraded" = GRAPHITI_URL set but the service didn't answer /healthcheck (down/misconfigured). A
+// configured URL alone isn't proof the leg works — Graphiti's worker dies silently.
+export type GraphState = "off" | "on" | "degraded";
 
 export interface DenseHealth {
   state: DenseState;
@@ -30,22 +35,29 @@ export interface DenseHealth {
 export interface RetrievalHealth {
   keyword: LegState; // always "on"
   dense: DenseHealth;
-  graph: LegState;
+  graph: GraphState;
   rerank: LegState;
 }
 
 const COVERAGE_FLOOR = 0.9; // ≥90% embedded = healthy
 const STALE_MS = 2 * 60 * 60 * 1000; // no embed activity in 2h + incomplete = stalled, not "building"
 
-/** True when GRAPHITI_URL is a usable http(s) URL with a host (prod had a malformed "http://"). */
-export function graphConfigured(url: string | undefined): boolean {
-  if (!url) return false;
-  try {
-    const u = new URL(url);
-    return (u.protocol === "http:" || u.protocol === "https:") && u.hostname.length > 0;
-  } catch {
-    return false;
-  }
+/**
+ * True when GRAPHITI_URL is a usable http(s) URL with a host (prod had a malformed "http://").
+ * Single source of truth with the runtime GraphitiClient, so the health card and the code that
+ * actually calls Graphiti agree on whether the leg is on.
+ */
+export const graphConfigured = graphitiConfigured;
+
+/**
+ * Derive the graph-leg state from its raw signals. Pure + unit-tested:
+ *   • not configured (no/malformed GRAPHITI_URL)         → "off"
+ *   • configured AND /healthcheck answered                → "on"
+ *   • configured BUT /healthcheck failed (down/unreachable) → "degraded"
+ */
+export function deriveGraphState(input: { configured: boolean; reachable: boolean }): GraphState {
+  if (!input.configured) return "off";
+  return input.reachable ? "on" : "degraded";
 }
 
 /**
@@ -72,11 +84,16 @@ export function deriveDenseState(input: {
 }
 
 export async function getRetrievalHealth(teamId: string): Promise<RetrievalHealth> {
-  const graph: LegState = graphConfigured(process.env.GRAPHITI_URL) ? "on" : "off";
   const rerank: LegState = process.env.RERANK_URL ? "on" : "off";
   const configured = !!process.env.EMBEDDINGS_URL;
 
-  const dense = await denseHealth(teamId, configured);
+  // Graph + dense both hit the network — run them concurrently so the card render isn't serialized.
+  const graphConfiguredNow = graphConfigured(process.env.GRAPHITI_URL);
+  const [dense, graphReachable] = await Promise.all([
+    denseHealth(teamId, configured),
+    graphConfiguredNow ? new GraphitiClient().healthcheck() : Promise.resolve(false),
+  ]);
+  const graph = deriveGraphState({ configured: graphConfiguredNow, reachable: graphReachable });
   return { keyword: "on", dense, graph, rerank };
 }
 

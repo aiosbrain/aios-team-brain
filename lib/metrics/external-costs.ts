@@ -37,6 +37,7 @@ export interface ExternalMemberCosts {
   member_id: string | null;
   member_name: string;
   avatar_url: string | null;
+  avatar_data_url: string | null;
   providers: ProviderCostRow[];
   cost_usd: number;
   total_tokens: number;
@@ -121,6 +122,7 @@ type MemberMeta = {
   display_name: string | null;
   actor_handle: string | null;
   avatar_url: string | null;
+  avatar_data_url: string | null;
 };
 
 const UNATTRIBUTED = "Unattributed";
@@ -143,7 +145,7 @@ export async function getExternalCosts(
     .toISOString()
     .slice(0, 10);
 
-  const [costRes, membersRes] = await Promise.all([
+  const [costRes, membersRes, profilesRes] = await Promise.all([
     scopeUsageCosts(
       db
         .from("usage_costs")
@@ -160,15 +162,24 @@ export async function getExternalCosts(
       .from("members")
       .select("id, display_name, actor_handle, avatar_url")
       .eq("team_id", teamId),
+    // Uploaded avatars live on member_profiles (1:1, separate table) — sibling query, merged in JS.
+    db.from("member_profiles").select("member_id, avatar_data_url").eq("team_id", teamId),
   ]);
 
   const rows = (costRes.data ?? []) as UsageCostRow[];
+  const avatarDataByMember = new Map(
+    ((profilesRes.data ?? []) as { member_id: string; avatar_data_url: string | null }[]).map((p) => [
+      p.member_id,
+      p.avatar_data_url,
+    ])
+  );
   const members = new Map<string, MemberMeta>();
-  for (const m of (membersRes.data ?? []) as ({ id: string } & MemberMeta)[]) {
+  for (const m of (membersRes.data ?? []) as ({ id: string } & Omit<MemberMeta, "avatar_data_url">)[]) {
     members.set(m.id, {
       display_name: m.display_name,
       actor_handle: m.actor_handle,
       avatar_url: m.avatar_url,
+      avatar_data_url: avatarDataByMember.get(m.id) ?? null,
     });
   }
 
@@ -197,6 +208,7 @@ export async function getExternalCosts(
           meta?.actor_handle ??
           (r.member_id ? "Unknown" : UNATTRIBUTED),
         avatar_url: meta?.avatar_url ?? null,
+        avatar_data_url: meta?.avatar_data_url ?? null,
         providers: [],
         cost_usd: 0,
         total_tokens: 0,
