@@ -45,7 +45,7 @@
     "neo4j-driver": "^6.2.0",
     "next": "16.2.9",
     "next-themes": "^0.4.6",
-    "nodemailer": "^9.0.0",
+    "nodemailer": "^9.0.3",
     "pg": "^8.22.0",
     "react": "19.2.7",
     "react-dom": "19.2.7",
