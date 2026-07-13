@@ -9,7 +9,7 @@ import { SlackClient, fetchSlackChannel } from "./sources/slack";
 import { normalizeThread } from "./sources/slack-normalize";
 import { syncSlackIdentities } from "./sources/slack-identity";
 import { syncProviderIdentities } from "@/lib/identity/provider-sync";
-import { buildIdentityMap, resolveByProviderId } from "@/lib/identity/resolve";
+import { buildIdentityMap, resolveByProviderId, resolveMember } from "@/lib/identity/resolve";
 import { fetchPlaneProject } from "./sources/plane";
 import { normalizePlaneProject, normalizePlaneDocs } from "./sources/plane-normalize";
 import type { PlaneConnection } from "@/lib/pm-sync/plane-client";
@@ -516,13 +516,22 @@ export async function runGithubIngestion(opts: { teamId?: string } = {}): Promis
           } catch (err) {
             summary.errors.push(`${full} issues: ${err instanceof Error ? err.message : "import failed"}`);
           }
-          // Repo files → deliverable items (one per file, idempotent by path+sha).
+          // Repo files → deliverable items (one per file, idempotent by path+sha). Each file is
+          // attributed to its last-commit author (resolved via the identity map by git email, then
+          // login), NOT the ingesting connector — else arcs/events built on repo docs name no human.
+          // Unresolved author → authorMemberId:null (honestly unattributed), never the connector.
           try {
             const fetched = await fetchGithubRepoFiles({ owner, repo, token, globs: fileGlobs });
             const payloads = normalizeGithubFiles(fetched);
             summary.items += payloads.length;
+            const idMap = await buildIdentityMap(db, auth.teamId);
             for (const payload of payloads) {
-              const res = await ingestItem(db, auth, payload, "team");
+              const fm = payload.frontmatter ?? {};
+              const authorMemberId = resolveMember(idMap, {
+                email: typeof fm.author_email === "string" ? fm.author_email : undefined,
+                key: typeof fm.author_login === "string" ? fm.author_login : undefined,
+              });
+              const res = await ingestItem(db, auth, payload, "team", { authorMemberId });
               if (res.status === "created") summary.created++;
               else if (res.status === "updated") summary.updated++;
               else summary.unchanged++;

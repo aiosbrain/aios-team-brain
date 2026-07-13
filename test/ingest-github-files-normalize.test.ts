@@ -37,4 +37,21 @@ describe("normalizeGithubFiles", () => {
     const mk = (body: string) => normalizeGithubFiles({ ...base, files: [{ path: "a.md", body }] })[0];
     expect(mk("v1").content_sha256).not.toBe(mk("v2").content_sha256);
   });
+
+  it("carries the file's last-commit author into actor + frontmatter (the resolution keys)", () => {
+    const [it] = normalizeGithubFiles({
+      ...base,
+      files: [{ path: "docs/x.md", body: "b", authorName: "Chetan", authorEmail: "c@acme.dev", authorLogin: "chetan-gh" }],
+    });
+    expect(it.actor).toBe("Chetan");
+    expect(it.frontmatter.author_email).toBe("c@acme.dev"); // reliable member-resolution key
+    expect(it.frontmatter.author_login).toBe("chetan-gh");
+    expect(() => itemPayloadSchema.parse(it)).not.toThrow();
+  });
+
+  it("omits author frontmatter keys when the commit-author lookup came up empty (unattributed, not connector)", () => {
+    const [it] = normalizeGithubFiles({ ...base, files: [{ path: "a.md", body: "b" }] });
+    expect(it.actor).toBe("");
+    expect(it.frontmatter.author_email).toBeUndefined();
+  });
 });
