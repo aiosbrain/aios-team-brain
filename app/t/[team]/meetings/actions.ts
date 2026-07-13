@@ -7,10 +7,27 @@ import { serverClient } from "@/lib/db/server";
 import { adminClient } from "@/lib/db/admin";
 import { currentMember } from "@/lib/auth/guard";
 import { getProviderKey } from "@/lib/integrations/manage";
-import { createMeetingNote, canSeeMeetingNotes, MEETING_NOTES_PROJECT_SLUG } from "@/lib/meetings/notes";
+import {
+  createMeetingNote,
+  canSeeMeetingNotes,
+  getMeetingNote,
+  MEETING_NOTES_PROJECT_SLUG,
+} from "@/lib/meetings/notes";
 import { extractFromTranscript, type RosterPerson } from "@/lib/meetings/llm-extract";
-import { extractMeetingTodosForTeam } from "@/lib/meetings/extract-todos";
+import { extractActionItems } from "@/lib/meetings/action-items";
+import {
+  extractMeetingTodosForTeam,
+  toExtractedTodoRows,
+  createMeetingTodoTasks,
+  MEETING_TODO_PROJECT_SLUG,
+} from "@/lib/meetings/extract-todos";
 import { backfillMeetingNotesFromItems } from "@/lib/meetings/from-items";
+import {
+  projectRows,
+  resolvePrimaryProvider,
+  PROJECTION_TASK_COLS,
+  type ProjectionTaskRow,
+} from "@/lib/pm-sync/project";
 
 const uploadSchema = z.object({
   teamSlug: z.string().min(1),
@@ -115,4 +132,177 @@ export async function importPushedMeetingsAction(
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "import failed" };
   }
+}
+
+/**
+ * Pull action items out of a single meeting note's transcript and materialize them as tasks (LLM
+ * pass with a markdown-scanner fallback — see lib/meetings/action-items). On-demand because the
+ * CLI/ingest import path (`aios push`) never extracted todos, so a pushed meeting shows none until
+ * this runs. Idempotent (tasks upsert on a stable row_key), team-tier only.
+ */
+export async function extractMeetingActionItemsAction(
+  teamSlug: string,
+  noteId: string
+): Promise<{ ok: boolean; error?: string; extracted?: number }> {
+  const team = await resolveTeam(teamSlug);
+  if (!team) return { ok: false, error: "team not found" };
+
+  const me = await currentMember(team.id);
+  if (!me) return { ok: false, error: "not a member of this team" };
+  if (!canSeeMeetingNotes(me.tier)) return { ok: false, error: "team-tier membership required" };
+
+  const admin = adminClient();
+
+  // Resolve the note → its transcript item (id/path/access + body). getMeetingNote enforces the
+  // team-tier gate and confirms the note belongs to this team.
+  const note = await getMeetingNote(admin, team.id, noteId, me.tier);
+  if (!note) return { ok: false, error: "meeting note not found" };
+
+  const { data: noteRow } = await admin
+    .from("meeting_notes")
+    .select("source_item_id")
+    .eq("team_id", team.id)
+    .eq("id", noteId)
+    .maybeSingle();
+  const sourceItemId = (noteRow as { source_item_id: string } | null)?.source_item_id;
+  if (!sourceItemId) return { ok: false, error: "meeting note not found" };
+
+  // tier-ok: meeting notes are team-tier-only content (canSeeMeetingNotes) and this action is gated
+  // on it above; the item id is resolved from a meeting_note the viewer can already see, and only
+  // its path/access are read (to derive stable todo row_keys) — never surfaced to an external tier.
+  const { data: item } = await admin
+    .from("items")
+    .select("id, path, access")
+    .eq("id", sourceItemId)
+    .maybeSingle();
+  const itemRow = item as { id: string; path: string; access: "team" | "external" } | null;
+  if (!itemRow) return { ok: false, error: "transcript item not found" };
+
+  const [{ data: rosterRows }, openaiKey, anthropicKey] = await Promise.all([
+    admin.from("members").select("id, display_name").eq("team_id", team.id).eq("status", "active"),
+    getProviderKey(admin, team.id, "openai"),
+    getProviderKey(admin, team.id, "anthropic"),
+  ]);
+  const roster: RosterPerson[] = ((rosterRows ?? []) as { id: string; display_name: string }[]).map((m) => ({
+    id: m.id,
+    displayName: m.display_name,
+  }));
+
+  try {
+    const todos = await extractActionItems(note.rawText, roster, { openaiKey, anthropicKey });
+    const rows = toExtractedTodoRows(itemRow, todos);
+    if (rows.length) await createMeetingTodoTasks(admin, team.id, rows);
+    revalidatePath(`/t/${team.slug}/meetings/${noteId}`);
+    return { ok: true, extracted: rows.length };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "extraction failed" };
+  }
+}
+
+export interface PushTaskResult {
+  taskId: string;
+  status: "synced" | "skipped" | "failed";
+  url?: string;
+  error?: string;
+}
+
+/**
+ * Project the selected meeting-extracted tasks into the team's primary PM tool (Linear/Plane) via
+ * the shared projection engine (brain-wins; creates/updates the provider work item and records the
+ * task_pm_links row). Only tasks in the "Extracted from Meetings" project that belong to THIS note's
+ * transcript are eligible — the ids are re-validated server-side, never trusted from the client.
+ */
+export async function pushMeetingTasksAction(
+  teamSlug: string,
+  noteId: string,
+  taskIds: string[]
+): Promise<{ ok: boolean; error?: string; provider?: string; results?: PushTaskResult[] }> {
+  const team = await resolveTeam(teamSlug);
+  if (!team) return { ok: false, error: "team not found" };
+
+  const me = await currentMember(team.id);
+  if (!me) return { ok: false, error: "not a member of this team" };
+  if (!canSeeMeetingNotes(me.tier)) return { ok: false, error: "team-tier membership required" };
+
+  const ids = [...new Set(taskIds)].filter((id) => typeof id === "string" && id.length > 0);
+  if (!ids.length) return { ok: false, error: "no tasks selected" };
+
+  const admin = adminClient();
+
+  const primary = await resolvePrimaryProvider(admin, team.id);
+  if (primary.provider === null) {
+    return { ok: false, error: primary.reason };
+  }
+  if (primary.integration === null) {
+    return { ok: false, provider: primary.provider, error: primary.reason };
+  }
+
+  // Resolve the note's transcript item so we can bind eligible tasks to THIS meeting.
+  const { data: noteRow } = await admin
+    .from("meeting_notes")
+    .select("source_item_id")
+    .eq("team_id", team.id)
+    .eq("id", noteId)
+    .maybeSingle();
+  const sourceItemId = (noteRow as { source_item_id: string } | null)?.source_item_id;
+  if (!sourceItemId) return { ok: false, error: "meeting note not found" };
+
+  // Load only the requested tasks that are genuinely meeting-extracted tasks for this note.
+  const { data: taskRows } = await admin
+    .from("tasks")
+    .select(`${PROJECTION_TASK_COLS}, source_item_id, projects(slug)`)
+    .eq("team_id", team.id)
+    .in("id", ids);
+  const eligible = ((taskRows ?? []) as (ProjectionTaskRow & {
+    source_item_id: string | null;
+    projects?: { slug?: string } | null;
+  })[]).filter((t) => t.source_item_id === sourceItemId && t.projects?.slug === MEETING_TODO_PROJECT_SLUG && t.row_key);
+  if (!eligible.length) return { ok: false, provider: primary.provider, error: "no eligible tasks to push" };
+
+  const rows: ProjectionTaskRow[] = eligible.map((t) => ({
+    id: t.id,
+    team_id: t.team_id,
+    project_id: t.project_id,
+    row_key: t.row_key,
+    title: t.title,
+    status: t.status,
+    sprint: t.sprint,
+    priority: t.priority,
+    labels: t.labels,
+    body: t.body,
+    parent_row_key: t.parent_row_key,
+    assignee: t.assignee,
+  }));
+
+  const reports = await projectRows(admin, primary, rows);
+
+  // Reload the links to surface each task's provider URL (the report carries status, not the URL).
+  const { data: links } = await admin
+    .from("task_pm_links")
+    .select("task_id, provider_url, last_error")
+    .eq("team_id", team.id)
+    .in(
+      "task_id",
+      eligible.map((t) => t.id)
+    );
+  const linkByTask = new Map(
+    ((links ?? []) as { task_id: string; provider_url: string; last_error: string | null }[]).map((l) => [l.task_id, l])
+  );
+  const reportByRowKey = new Map(reports.map((r) => [r.row_key, r]));
+
+  const results: PushTaskResult[] = eligible.map((t) => {
+    const report = reportByRowKey.get(t.row_key);
+    const link = linkByTask.get(t.id);
+    const status: PushTaskResult["status"] =
+      report?.status === "synced" || report?.status === "skipped" ? report.status : "failed";
+    return {
+      taskId: t.id,
+      status,
+      url: link?.provider_url || undefined,
+      error: status === "failed" ? report?.error ?? link?.last_error ?? "push failed" : undefined,
+    };
+  });
+
+  revalidatePath(`/t/${team.slug}/meetings/${noteId}`);
+  return { ok: true, provider: primary.provider, results };
 }

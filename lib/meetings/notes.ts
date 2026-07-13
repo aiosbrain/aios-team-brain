@@ -55,8 +55,13 @@ export interface MeetingNoteSummary {
 
 export interface ExtractedTodoRef {
   taskId: string;
+  rowKey: string;
   title: string;
+  assignee: string;
+  due: string | null;
   status: string;
+  /** Set once the task has been projected into the team's primary PM tool (Linear/Plane). */
+  pushed: { provider: string; url: string } | null;
 }
 
 export interface MeetingNoteDetail extends MeetingNoteSummary {
@@ -328,12 +333,49 @@ export async function getMeetingNote(
   // shared "Extracted from Meetings" project — so the UI can link straight to where each landed.
   const { data: todoTasks } = await db
     .from("tasks")
-    .select("id, title, status, source_item_id, projects(slug)")
+    .select("id, title, status, assignee, due_date, row_key, source_item_id, projects(slug)")
     .eq("team_id", teamId)
-    .eq("source_item_id", row.source_item_id);
-  const extractedTodos = ((todoTasks ?? []) as { id: string; title: string; status: string; projects?: { slug?: string } | null }[])
-    .filter((t) => t.projects?.slug === MEETING_TODO_PROJECT_SLUG)
-    .map((t) => ({ taskId: t.id, title: t.title, status: t.status }));
+    .eq("source_item_id", row.source_item_id)
+    .order("created_at", { ascending: true });
+  type TodoTaskRow = {
+    id: string;
+    title: string;
+    status: string;
+    assignee: string | null;
+    due_date: string | null;
+    row_key: string | null;
+    projects?: { slug?: string } | null;
+  };
+  const meetingTodos = ((todoTasks ?? []) as TodoTaskRow[]).filter(
+    (t) => t.projects?.slug === MEETING_TODO_PROJECT_SLUG
+  );
+
+  // Which of those tasks have already been projected into the primary PM tool (task_pm_links carries
+  // the provider URL) — so the UI can mark them "pushed" and not offer to push again.
+  const pushedByTask = new Map<string, { provider: string; url: string }>();
+  if (meetingTodos.length) {
+    const { data: links } = await db
+      .from("task_pm_links")
+      .select("task_id, provider, provider_url")
+      .eq("team_id", teamId)
+      .in(
+        "task_id",
+        meetingTodos.map((t) => t.id)
+      );
+    for (const l of (links ?? []) as { task_id: string; provider: string; provider_url: string }[]) {
+      if (l.task_id && l.provider_url) pushedByTask.set(l.task_id, { provider: l.provider, url: l.provider_url });
+    }
+  }
+
+  const extractedTodos: ExtractedTodoRef[] = meetingTodos.map((t) => ({
+    taskId: t.id,
+    rowKey: t.row_key ?? "",
+    title: t.title,
+    assignee: t.assignee ?? "",
+    due: t.due_date,
+    status: t.status,
+    pushed: pushedByTask.get(t.id) ?? null,
+  }));
 
   return {
     id: row.id,

@@ -140,7 +140,10 @@ export function extractTodosFromNotes(markdown: string): ExtractedTodo[] {
   return rows;
 }
 
-export function toExtractedTodoRows(item: ItemRow, todos: ExtractedTodo[]): ExtractedTodoRow[] {
+export function toExtractedTodoRows(
+  item: Pick<ItemRow, "id" | "path" | "access">,
+  todos: ExtractedTodo[]
+): ExtractedTodoRow[] {
   const sourceHash = stableHash(item.id, 10);
   return todos.map((todo, index) => ({
     ...todo,
