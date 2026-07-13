@@ -53,6 +53,15 @@ export async function loadSchema({
   });
   await client.connect();
   try {
+    // Bound how long any DDL below will WAIT for a table lock (not how long it runs once acquired —
+    // a legit long CREATE INDEX is unaffected). This runs on every deploy (Railway preDeployCommand),
+    // so without it a single stuck reader holding ACCESS SHARE makes an `ALTER` wait forever at the
+    // head of the lock queue, and every ordinary query then queues behind that ALTER — the mechanism
+    // behind the 2026-07-13 outage. With a bounded lock_timeout the migration fails fast, the release
+    // aborts (schema ahead of app is never shipped), Railway retries, and live traffic keeps flowing.
+    const lockTimeoutMs = Number(env.PG_MIGRATION_LOCK_TIMEOUT_MS ?? 15_000);
+    await client.query(`SET lock_timeout = ${Math.max(0, Math.trunc(lockTimeoutMs))}`);
+
     await client.query(sql);
     logger.log("✓ postgres/schema.sql loaded");
 
