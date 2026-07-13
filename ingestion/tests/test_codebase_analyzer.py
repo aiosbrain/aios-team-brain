@@ -133,7 +133,7 @@ def test_live_scan_carries_scored_readiness(tmp_path):
     assert m["readiness_level"] == "L1"             # README + manifest
     assert isinstance(m["readiness_pct"], float)
     assert m["readiness_pillars"]["docs"]["passed"] == 1
-    assert m["readiness_rubric_version"] == "1.0.0"
+    assert m["readiness_rubric_version"] == "1.1.0"
 
 
 def test_history_points_carry_null_readiness(tmp_path):
