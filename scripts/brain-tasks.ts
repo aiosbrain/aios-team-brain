@@ -31,7 +31,7 @@ import { readFileSync } from "node:fs";
 import { adminClient } from "@/lib/db/admin";
 import { uiRowKey } from "@/lib/ids";
 import { normalizeTaskPriority } from "@/lib/api/schemas";
-import { projectAllTasks } from "@/lib/pm-sync";
+import { projectAllTasks, recordProjectionRun } from "@/lib/pm-sync";
 import { getEnabledIntegrationsWithSecrets } from "@/lib/integrations/manage";
 import { linearGraphql } from "@/lib/pm-sync/linear-client";
 import {
@@ -228,7 +228,10 @@ async function main() {
         projectIds = ((data ?? []) as { id: string }[]).map((p) => p.id);
       }
       for (const pid of projectIds) {
+        const startedAt = Date.now();
         const { provider, reports, reason } = await projectAllTasks(admin, team.id, pid);
+        // AIO-357: record this CLI run too — the same log the admin panel reads from.
+        await recordProjectionRun(admin, { teamId: team.id, provider: provider ?? null, trigger: "cli", reports, reason, startedAt });
         if (reason) {
           console.log(`• project ${pid}: no projection (${reason})`);
           continue;
@@ -270,7 +273,9 @@ async function main() {
       if (res.rows.length > 25) console.log(`  … ${res.rows.length - 25} more`);
 
       if (!flags["dry-run"] && flags["project-to-linear"] && res.projectId) {
+        const startedAt = Date.now();
         const { provider, reports, reason } = await projectAllTasks(admin, team.id, res.projectId);
+        await recordProjectionRun(admin, { teamId: team.id, provider: provider ?? null, trigger: "cli", reports, reason, startedAt });
         if (reason) {
           console.log(`• Linear projection skipped: ${reason}`);
           break;

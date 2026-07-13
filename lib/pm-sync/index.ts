@@ -10,6 +10,16 @@ export type { ProjectionReport, ProjectionTaskRow } from "@/lib/pm-sync/project"
 export { projectTaskByIdAfterWrite, projectChangedTasksAfterWrite } from "@/lib/pm-sync/after-write";
 export { runInboundForTeam, runLinearInbound, loadInboundRows, classifyInboundRow } from "@/lib/pm-sync/inbound";
 export type { InboundResult, InboundRunSummary, InboundRow, InboundRowState } from "@/lib/pm-sync/inbound";
+export {
+  recordProjectionRun,
+  listRecentProjectionRuns,
+  computeProjectionHealth,
+  getProjectionHealth,
+  summarizeProjectionReports,
+  PM_SYNC_SOURCE,
+  PROJECTION_STALE_AFTER_HOURS,
+} from "@/lib/pm-sync/runs";
+export type { ProjectionHealth, ProjectionHealthStatus, ProjectionRunSummary } from "@/lib/pm-sync/runs";
 
 export interface TaskForPmSync {
   id: string;
