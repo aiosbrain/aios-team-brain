@@ -7,6 +7,7 @@ import { listMeetingNotesForTeam } from "@/lib/meetings/notes";
 import { EmptyState } from "@/components/empty-state";
 import { MemberAvatar } from "@/components/people/member-avatar";
 import { NewMeetingNoteButton } from "@/components/meetings/new-meeting-note-button";
+import { ImportPushedMeetingsButton } from "@/components/meetings/import-pushed-meetings-button";
 import { timeAgo } from "@/components/format";
 
 export const metadata: Metadata = { title: "Meeting notes" };
@@ -34,7 +35,12 @@ export default async function MeetingsPage({ params }: { params: Promise<{ team:
             action items land in Tasks.
           </p>
         </div>
-        {me.tier === "team" ? <NewMeetingNoteButton teamSlug={teamSlug} /> : null}
+        {me.tier === "team" ? (
+          <div className="flex items-center gap-2">
+            <ImportPushedMeetingsButton teamSlug={teamSlug} />
+            <NewMeetingNoteButton teamSlug={teamSlug} />
+          </div>
+        ) : null}
       </div>
 
       {notes.length === 0 ? (
