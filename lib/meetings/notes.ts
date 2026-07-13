@@ -138,6 +138,70 @@ export async function createMeetingNote(
   return noteId;
 }
 
+export interface MeetingNoteFromItemInput {
+  /** The already-ingested transcript `items` row this note describes. */
+  sourceItemId: string;
+  title: string;
+  occurredAt?: string | null;
+  summary?: string;
+  submittedByMemberId?: string | null;
+  attendeeMemberIds?: string[];
+}
+
+/**
+ * Attach a meeting note to an EXISTING transcript item — the bridge for meetings that arrived through
+ * the CLI/ingest path (`aios push`) rather than the dashboard upload button. Unlike
+ * `createMeetingNote`, it does NOT ingest a new item (the transcript is already in `items`); it only
+ * writes the metadata layer. Idempotent on `source_item_id` (unique): if a note already exists for
+ * the item, returns it with `created:false`, so re-runs (every scheduler tick) never duplicate.
+ */
+export async function createMeetingNoteFromItem(
+  admin: DbClient,
+  teamId: string,
+  input: MeetingNoteFromItemInput
+): Promise<{ id: string; created: boolean }> {
+  const { data: existing } = await admin
+    .from("meeting_notes")
+    .select("id")
+    .eq("team_id", teamId)
+    .eq("source_item_id", input.sourceItemId)
+    .maybeSingle();
+  if (existing) return { id: (existing as { id: string }).id, created: false };
+
+  const title = input.title.trim() || "Meeting";
+  const noteId = randomUUID();
+  const { error } = await admin.from("meeting_notes").insert({
+    id: noteId,
+    team_id: teamId,
+    source_item_id: input.sourceItemId,
+    submitted_by: input.submittedByMemberId ?? null,
+    title,
+    summary: (input.summary ?? "").trim(),
+    occurred_at: input.occurredAt || null,
+  });
+  if (error) throw new Error(`meeting note (from item) insert failed: ${error.message}`);
+
+  const attendeeIds = [...new Set(input.attendeeMemberIds ?? [])];
+  if (attendeeIds.length) {
+    const { error: attErr } = await admin
+      .from("meeting_note_attendees")
+      .insert(attendeeIds.map((memberId) => ({ meeting_note_id: noteId, member_id: memberId })));
+    if (attErr) throw new Error(`meeting note attendees insert failed: ${attErr.message}`);
+  }
+
+  await audit(admin, {
+    team_id: teamId,
+    actor_kind: "system",
+    member_id: input.submittedByMemberId ?? null,
+    action: "meeting_note.created",
+    target_type: "meeting_note",
+    target_id: noteId,
+    meta: { title, attendees: attendeeIds.length, from_item: input.sourceItemId },
+  });
+
+  return { id: noteId, created: true };
+}
+
 type MemberRow = {
   id: string;
   display_name: string;
