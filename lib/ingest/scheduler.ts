@@ -33,6 +33,10 @@ export function startIngestScheduler(): void {
     await runInbound(db);
     await runImport(db, "github", runGithubIngestion);
     await runAuthCleanup(db);
+    // Turn freshly-synced meeting transcripts (source granola/zoom/… — never slack) into meeting
+    // notes, so CLI-pushed meetings show up on the Meetings page automatically. Idempotent + cheap
+    // when nothing new (finds 0 candidates → returns); best-effort, never fails the tick.
+    await runMeetingNotesBackfill(db);
     // Incremental dense (semantic) indexing of newly-synced items. No-op unless dense retrieval is
     // configured (EMBEDDINGS_URL + pgvector schema); best-effort — never fails the tick. A batch where
     // items were SCANNED but all FAILED (e.g. embeddings quota/outage) records an ERROR run so the
@@ -196,6 +200,30 @@ export function startIngestScheduler(): void {
       const msg = err instanceof Error ? err.message : String(err);
       console.error("[ingest] auth-cleanup tick failed:", msg);
       await recordIngestRun(db, { source: "auth_cleanup", trigger: "scheduler", ok: false, errors: [msg], startedAt });
+    }
+  }
+
+  // Create meeting notes for freshly-synced meeting transcripts, per team. Best-effort; idempotent
+  // (already-noted items are skipped), so this is a cheap no-op once caught up.
+  async function runMeetingNotesBackfill(db: ReturnType<typeof adminClient>): Promise<void> {
+    try {
+      const { backfillMeetingNotesFromItems } = await import("@/lib/meetings/from-items");
+      const { getProviderKey } = await import("@/lib/integrations/manage");
+      const { data: teams } = await db.from("teams").select("id");
+      for (const t of ((teams ?? []) as { id: string }[])) {
+        try {
+          const [openaiKey, anthropicKey] = await Promise.all([
+            getProviderKey(db, t.id, "openai"),
+            getProviderKey(db, t.id, "anthropic"),
+          ]);
+          const s = await backfillMeetingNotesFromItems(db, t.id, { keys: { openaiKey, anthropicKey } });
+          if (s.created) console.info(`[ingest] meeting-notes: created ${s.created} for team ${t.id}`);
+        } catch (err) {
+          console.error(`[ingest] meeting-notes backfill (team ${t.id}) failed:`, err instanceof Error ? err.message : err);
+        }
+      }
+    } catch (err) {
+      console.error("[ingest] meeting-notes backfill tick failed:", err instanceof Error ? err.message : err);
     }
   }
 

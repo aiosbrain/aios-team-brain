@@ -104,15 +104,20 @@ describe("validateIntegrationConfig()", () => {
     expect(() => validateIntegrationConfig("github", { org: "acme", token: "ghp_x" })).toThrow(/secret-like key/i);
   });
 
-  it("treats LLM provider keys as secret-only (empty config; the key lives in secret_ciphertext)", () => {
-    for (const type of ["openai", "anthropic", "google"] as const) {
-      // No non-secret config — empty object is the only valid config.
+  it("keeps the key itself in secret_ciphertext — config holds only the optional answer model", () => {
+    for (const type of ["openai", "anthropic", "openrouter", "google"] as const) {
+      // Empty config is always valid (the key lives in secret_ciphertext).
       expect(validateIntegrationConfig(type, {})).toEqual({});
-      // Any non-empty config is rejected by the strict empty-object allowlist…
-      expect(() => validateIntegrationConfig(type, { model: "gpt-4" })).toThrow(IntegrationConfigError);
-      // …and a key-like field is caught by the secret-key scan before the allowlist.
+      // A key-like field is caught by the secret-key scan before the allowlist.
       expect(() => validateIntegrationConfig(type, { apiKey: "sk-1" })).toThrow(/secret-like key/i);
+      // Unknown non-secret keys are still rejected by the strict allowlist.
+      expect(() => validateIntegrationConfig(type, { temperature: 0.5 })).toThrow(IntegrationConfigError);
     }
+    // openai/anthropic/openrouter carry a NON-secret answer-model slug; google stays config-less.
+    for (const type of ["openai", "anthropic", "openrouter"] as const) {
+      expect(validateIntegrationConfig(type, { model: "some-model" })).toEqual({ model: "some-model" });
+    }
+    expect(() => validateIntegrationConfig("google", { model: "gemini" })).toThrow(IntegrationConfigError);
   });
 });
 

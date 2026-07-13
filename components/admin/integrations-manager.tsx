@@ -2,7 +2,7 @@
 
 import { useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
-import { Plug, Plus, Trash2, KeyRound, RefreshCw, Network } from "lucide-react";
+import { Plug, Plus, Trash2, KeyRound, RefreshCw, Network, Sparkles } from "lucide-react";
 import {
   saveIntegration,
   toggleIntegration,
@@ -14,8 +14,34 @@ import {
   syncGithubNow,
   projectToGraphNow,
   setPrimaryPmProvider,
+  saveProviderModel,
+  setAnsweringProvider,
   type PrimaryPmProvider,
 } from "@/app/t/[team]/admin/integrations/actions";
+import type { AnsweringProvider } from "@/lib/query/llm-backend";
+
+/** "Active answering model" state computed server-side (page.tsx) from the team's config + env. */
+export interface AnsweringState {
+  /** The explicit override (teams.answering_provider), or null for auto precedence. */
+  provider: AnsweringProvider | null;
+  /** Chosen answer-model slug per editable provider key (null → provider default). */
+  models: Record<"anthropic" | "openai", string | null>;
+  /** The backend actually resolved (provider + model) — what's answering right now. */
+  effective: { provider: AnsweringProvider; model: string };
+  /** True when the override wasn't configured and the resolver fell back to auto. */
+  usedFallback: boolean;
+  /** Whether each override target is configured (drives selectability + hints). */
+  localConfigured: boolean;
+  openrouterConfigured: boolean;
+  openaiConfigured: boolean;
+}
+
+const PROVIDER_LABEL: Record<AnsweringProvider, string> = {
+  anthropic: "Anthropic",
+  openai: "OpenAI",
+  openrouter: "OpenRouter",
+  local: "Local (LLM_BASE_URL)",
+};
 
 type IntegrationType =
   | "github"
@@ -91,10 +117,12 @@ export function IntegrationsManager({
   teamSlug,
   integrations,
   primaryPmProvider,
+  answering,
 }: {
   teamSlug: string;
   integrations: IntegrationRow[];
   primaryPmProvider: PrimaryPmProvider;
+  answering: AnsweringState;
 }) {
   const router = useRouter();
   const [pending, startTransition] = useTransition();
@@ -172,6 +200,30 @@ export function IntegrationsManager({
       !(PROVIDER_TYPES as readonly string[]).includes(i.type)
   );
 
+  // Answer-model drafts for the editable provider keys (anthropic/openai), seeded from saved config.
+  const [modelDraft, setModelDraft] = useState<Record<"anthropic" | "openai", string>>({
+    anthropic: answering.models.anthropic ?? "",
+    openai: answering.models.openai ?? "",
+  });
+
+  function saveModel(p: "anthropic" | "openai") {
+    run(() => saveProviderModel(teamSlug, p, modelDraft[p].trim()));
+  }
+
+  function chooseBackend(p: AnsweringProvider | null) {
+    run(() => setAnsweringProvider(teamSlug, p));
+  }
+
+  // The override options, in precedence order. `configured` gates whether forcing it actually sticks
+  // (an unconfigured pick falls back to auto — the effective line makes that visible).
+  const backendOptions: { value: AnsweringProvider | null; label: string; configured: boolean }[] = [
+    { value: null, label: "Auto", configured: true },
+    { value: "anthropic", label: "Anthropic", configured: true },
+    { value: "openai", label: "OpenAI", configured: answering.openaiConfigured },
+    { value: "openrouter", label: "OpenRouter", configured: answering.openrouterConfigured },
+    { value: "local", label: "Local", configured: answering.localConfigured },
+  ];
+
   function setProviderKey(p: ProviderType, existing: IntegrationRow | undefined) {
     const key = window.prompt(`${PROVIDER_META[p].label} API key (${PROVIDER_META[p].placeholder}):`);
     if (!key) return;
@@ -186,6 +238,54 @@ export function IntegrationsManager({
     <div className="flex flex-col gap-6">
       <div className="prism-card flex flex-col gap-3 p-4">
         <p className="flex items-center gap-2 text-sm font-medium text-ink">
+          <Sparkles className="size-4 text-violet" /> Active answering model
+        </p>
+        <p className="text-xs text-ink-secondary">
+          Which backend answers in the Query box. <strong>Auto</strong> picks the highest configured
+          (OpenRouter → Local → Anthropic); choosing a provider forces it. Each key&apos;s model is set
+          below (OpenRouter in its own panel). If a forced backend isn&apos;t configured, answers fall
+          back to Auto.
+        </p>
+        <div className="flex flex-wrap gap-2">
+          {backendOptions.map((opt) => {
+            const active = answering.provider === opt.value;
+            return (
+              <button
+                key={opt.label}
+                type="button"
+                disabled={pending || active}
+                onClick={() => chooseBackend(opt.value)}
+                title={!opt.configured && opt.value ? `${opt.label} isn't configured yet` : undefined}
+                className={`rounded-md border px-3 py-1.5 text-sm ${
+                  active
+                    ? "border-violet bg-violet/10 text-ink"
+                    : "border-ink/15 text-ink-secondary hover:border-ink/30"
+                }`}
+              >
+                {opt.label}
+                {!opt.configured && opt.value ? (
+                  <span className="ml-1 text-[10px] text-ink-tertiary">· not set</span>
+                ) : null}
+              </button>
+            );
+          })}
+        </div>
+        <p className="text-sm text-ink">
+          Answering with{" "}
+          <span className="font-medium text-violet">{PROVIDER_LABEL[answering.effective.provider]}</span>{" "}
+          · <span className="font-mono text-xs text-ink">{answering.effective.model}</span>
+        </p>
+        {answering.usedFallback ? (
+          <p className="rounded-lg border border-amber/30 bg-amber/5 px-3 py-2 text-xs text-amber-700">
+            {answering.provider ? PROVIDER_LABEL[answering.provider] : "The selected backend"} isn&apos;t
+            configured — using {PROVIDER_LABEL[answering.effective.provider]} instead. Set its key/model
+            below (or in the OpenRouter panel) to activate it.
+          </p>
+        ) : null}
+      </div>
+
+      <div className="prism-card flex flex-col gap-3 p-4">
+        <p className="flex items-center gap-2 text-sm font-medium text-ink">
           <KeyRound className="size-4 text-violet" /> AI provider keys
         </p>
         <p className="text-xs text-ink-secondary">
@@ -196,41 +296,69 @@ export function IntegrationsManager({
           {PROVIDER_TYPES.map((p) => {
             const row = integrations.find((i) => i.type === p);
             const isSet = !!row?.hasSecret;
+            const hasModel = p === "anthropic" || p === "openai";
+            const savedModel = hasModel ? (answering.models[p] ?? "") : "";
+            const modelDirty = hasModel && modelDraft[p].trim() !== savedModel.trim();
             return (
               <div
                 key={p}
-                className="flex flex-wrap items-center gap-3 rounded-lg border border-border-subtle px-3 py-2"
+                className="flex flex-col gap-2 rounded-lg border border-border-subtle px-3 py-2"
               >
-                <span className="font-medium text-ink">{PROVIDER_META[p].label}</span>
-                <span className="text-xs text-ink-tertiary">{PROVIDER_META[p].note}</span>
-                <span className={`text-xs ${isSet ? "text-emerald-700" : "text-ink-tertiary"}`}>
-                  {isSet ? "key set ✓" : "not set"}
-                </span>
-                <div className="ml-auto flex items-center gap-2">
-                  <button
-                    type="button"
-                    disabled={pending}
-                    onClick={() => setProviderKey(p, row)}
-                    className="rounded-lg border border-violet/40 bg-violet/10 px-3 py-1 text-xs font-medium text-violet disabled:opacity-50"
-                  >
-                    {isSet ? "Replace key" : "Set key"}
-                  </button>
-                  {row ? (
+                <div className="flex flex-wrap items-center gap-3">
+                  <span className="font-medium text-ink">{PROVIDER_META[p].label}</span>
+                  <span className="text-xs text-ink-tertiary">{PROVIDER_META[p].note}</span>
+                  <span className={`text-xs ${isSet ? "text-emerald-700" : "text-ink-tertiary"}`}>
+                    {isSet ? "key set ✓" : "not set"}
+                  </span>
+                  <div className="ml-auto flex items-center gap-2">
                     <button
                       type="button"
                       disabled={pending}
-                      onClick={() => {
-                        if (window.confirm(`Remove ${PROVIDER_META[p].label} key?`)) {
-                          run(() => removeIntegration(teamSlug, row.id));
-                        }
-                      }}
-                      className="rounded-lg border border-border-default p-1.5 text-ink-secondary hover:text-red"
-                      aria-label={`Remove ${PROVIDER_META[p].label} key`}
+                      onClick={() => setProviderKey(p, row)}
+                      className="rounded-lg border border-violet/40 bg-violet/10 px-3 py-1 text-xs font-medium text-violet disabled:opacity-50"
                     >
-                      <Trash2 className="size-4" />
+                      {isSet ? "Replace key" : "Set key"}
                     </button>
-                  ) : null}
+                    {row ? (
+                      <button
+                        type="button"
+                        disabled={pending}
+                        onClick={() => {
+                          if (window.confirm(`Remove ${PROVIDER_META[p].label} key?`)) {
+                            run(() => removeIntegration(teamSlug, row.id));
+                          }
+                        }}
+                        className="rounded-lg border border-border-default p-1.5 text-ink-secondary hover:text-red"
+                        aria-label={`Remove ${PROVIDER_META[p].label} key`}
+                      >
+                        <Trash2 className="size-4" />
+                      </button>
+                    ) : null}
+                  </div>
                 </div>
+                {hasModel ? (
+                  <div className="flex items-center gap-2">
+                    <label className="text-xs text-ink-tertiary" htmlFor={`model-${p}`}>
+                      model
+                    </label>
+                    <input
+                      id={`model-${p}`}
+                      className="prism-input flex-1 font-mono text-xs"
+                      placeholder={p === "anthropic" ? "claude-opus-4-8 (default)" : "gpt-4o (default)"}
+                      value={modelDraft[p]}
+                      onChange={(e) => setModelDraft({ ...modelDraft, [p]: e.target.value })}
+                      aria-label={`${PROVIDER_META[p].label} answer model`}
+                    />
+                    <button
+                      type="button"
+                      disabled={pending || !modelDirty}
+                      onClick={() => saveModel(p)}
+                      className="rounded-lg border border-border-default px-3 py-1 text-xs font-medium text-ink-secondary disabled:opacity-40 hover:text-ink"
+                    >
+                      Save model
+                    </button>
+                  </div>
+                ) : null}
               </div>
             );
           })}

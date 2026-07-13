@@ -8,7 +8,9 @@ import {
   setIntegrationSecret,
   setIntegrationStatus,
   deleteIntegration,
+  saveProviderModel as saveProviderModel_,
 } from "@/lib/integrations/manage";
+import type { AnsweringProvider } from "@/lib/query/llm-backend";
 import { runSlackIngestion, runPlaneIngestion, runLinearIngestion, runGithubIngestion } from "@/lib/ingest/run";
 import { runGraphProjection } from "@/lib/graph/run";
 import {
@@ -340,6 +342,59 @@ export async function saveProvisioningSettings(
     if (e instanceof IntegrationConfigError) return { ok: false, error: e.message };
     return { ok: false, error: e instanceof Error ? e.message : "could not save settings" };
   }
+  revalidatePath(`/t/${teamSlug}/admin/integrations`);
+  return { ok: true };
+}
+
+/**
+ * Set (or clear, with an empty string) the answer model for a provider key (admins only). Stored as
+ * the NON-secret `config.model` on the provider's integration row; the answer path reads it via
+ * resolveAnsweringKeys. Independent of the key itself — change the model without re-entering the key.
+ */
+export async function saveProviderModel(
+  teamSlug: string,
+  provider: "anthropic" | "openai",
+  model: string
+): Promise<{ ok: boolean; error?: string }> {
+  const ctx = await requireAdmin(teamSlug);
+  if (!ctx) return { ok: false, error: "admins only" };
+  if (provider !== "anthropic" && provider !== "openai") return { ok: false, error: "invalid provider" };
+  try {
+    await saveProviderModel_(adminClient(), { teamId: ctx.teamId, memberId: ctx.memberId }, provider, model);
+  } catch (e) {
+    if (e instanceof IntegrationConfigError) return { ok: false, error: e.message };
+    return { ok: false, error: e instanceof Error ? e.message : "could not save model" };
+  }
+  revalidatePath(`/t/${teamSlug}/admin/integrations`);
+  return { ok: true };
+}
+
+/**
+ * Choose the explicit answering backend for the Query box (admins only; audited). Mirrors
+ * setPrimaryPmProvider. Pass `null` to clear it → auto precedence (OpenRouter → LLM_BASE_URL →
+ * Anthropic). The answer path reads `teams.answering_provider`; if the chosen backend isn't
+ * configured, selectLlmBackend falls back to auto (surfaced in the admin indicator).
+ */
+export async function setAnsweringProvider(
+  teamSlug: string,
+  provider: AnsweringProvider | null
+): Promise<{ ok: boolean; error?: string }> {
+  const ctx = await requireAdmin(teamSlug);
+  if (!ctx) return { ok: false, error: "admins only" };
+  const allowed: (AnsweringProvider | null)[] = [null, "anthropic", "openai", "openrouter", "local"];
+  if (!allowed.includes(provider)) return { ok: false, error: "invalid provider" };
+  const db = adminClient();
+  const { error } = await db.from("teams").update({ answering_provider: provider }).eq("id", ctx.teamId);
+  if (error) return { ok: false, error: error.message };
+  await audit(db, {
+    team_id: ctx.teamId,
+    actor_kind: "member",
+    member_id: ctx.memberId,
+    action: "team.answering_provider_set",
+    target_type: "team",
+    target_id: ctx.teamId,
+    meta: { provider },
+  });
   revalidatePath(`/t/${teamSlug}/admin/integrations`);
   return { ok: true };
 }

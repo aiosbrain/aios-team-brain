@@ -10,6 +10,7 @@ import { getProviderKey } from "@/lib/integrations/manage";
 import { createMeetingNote, canSeeMeetingNotes, MEETING_NOTES_PROJECT_SLUG } from "@/lib/meetings/notes";
 import { extractFromTranscript, type RosterPerson } from "@/lib/meetings/llm-extract";
 import { extractMeetingTodosForTeam } from "@/lib/meetings/extract-todos";
+import { backfillMeetingNotesFromItems } from "@/lib/meetings/from-items";
 
 const uploadSchema = z.object({
   teamSlug: z.string().min(1),
@@ -85,4 +86,33 @@ export async function uploadMeetingNoteAction(
 
   revalidatePath(`/t/${team.slug}/meetings`);
   return { ok: true, id: noteId };
+}
+
+/**
+ * Import meetings that arrived via the CLI/ingest (`aios push`) into the Meetings page. Scans this
+ * team's meeting-source transcript `items` that don't yet have a note and creates one for each
+ * (summary/attendees extracted, idempotent). Team-tier only, matching `canSeeMeetingNotes`.
+ */
+export async function importPushedMeetingsAction(
+  teamSlug: string
+): Promise<{ ok: boolean; error?: string; created?: number; scanned?: number }> {
+  const team = await resolveTeam(teamSlug);
+  if (!team) return { ok: false, error: "team not found" };
+
+  const me = await currentMember(team.id);
+  if (!me) return { ok: false, error: "not a member of this team" };
+  if (!canSeeMeetingNotes(me.tier)) return { ok: false, error: "team-tier membership required" };
+
+  const admin = adminClient();
+  const [openaiKey, anthropicKey] = await Promise.all([
+    getProviderKey(admin, team.id, "openai"),
+    getProviderKey(admin, team.id, "anthropic"),
+  ]);
+  try {
+    const s = await backfillMeetingNotesFromItems(admin, team.id, { keys: { openaiKey, anthropicKey } });
+    revalidatePath(`/t/${team.slug}/meetings`);
+    return { ok: true, created: s.created, scanned: s.scanned };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "import failed" };
+  }
 }
