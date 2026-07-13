@@ -1,11 +1,13 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
-import { ArrowLeft, CheckSquare, Square } from "lucide-react";
+import { ArrowLeft, ChevronRight } from "lucide-react";
 import { serverClient } from "@/lib/db/server";
 import { currentMember } from "@/lib/auth/guard";
 import { getMeetingNote } from "@/lib/meetings/notes";
+import { resolvePrimaryProvider } from "@/lib/pm-sync/project";
 import { MemberAvatar } from "@/components/people/member-avatar";
+import { MeetingActionItems } from "@/components/meetings/meeting-action-items";
 
 export const metadata: Metadata = { title: "Meeting note" };
 
@@ -26,6 +28,9 @@ export default async function MeetingNotePage({
   // getMeetingNote enforces the team-tier gate itself (external → null).
   const note = await getMeetingNote(db, team.id, id, me.tier);
   if (!note) notFound();
+
+  // The team's primary PM tool — labels the "Push to …" control and gates it when none is set.
+  const primary = await resolvePrimaryProvider(db, team.id);
 
   return (
     <div className="mx-auto flex max-w-3xl flex-col gap-5">
@@ -71,50 +76,32 @@ export default async function MeetingNotePage({
         </div>
       ) : null}
 
-      {note.summary ? (
-        <div className="prism-card flex flex-col gap-2 px-5 py-4">
-          <h2 className="text-xs font-semibold uppercase tracking-wider text-ink-tertiary">
-            Summary
-          </h2>
-          <p className="text-sm text-ink-secondary">{note.summary}</p>
-        </div>
-      ) : null}
-
-      {note.extractedTodos.length ? (
-        <div className="prism-card flex flex-col gap-2 px-5 py-4">
-          <div className="flex items-center justify-between">
-            <h2 className="text-xs font-semibold uppercase tracking-wider text-ink-tertiary">
-              Extracted todos
-            </h2>
-            <Link href={`/t/${teamSlug}/tasks`} className="text-xs text-violet hover:underline">
-              View in Tasks
-            </Link>
-          </div>
-          <ul className="flex flex-col gap-1.5">
-            {note.extractedTodos.map((t) => (
-              <li key={t.taskId} className="flex items-center gap-2 text-sm text-ink">
-                {t.status === "done" ? (
-                  <CheckSquare className="size-4 shrink-0 text-emerald-500" />
-                ) : (
-                  <Square className="size-4 shrink-0 text-ink-tertiary" />
-                )}
-                <span className={t.status === "done" ? "text-ink-tertiary line-through" : ""}>
-                  {t.title}
-                </span>
-              </li>
-            ))}
-          </ul>
-        </div>
-      ) : null}
-
       <div className="prism-card flex flex-col gap-2 px-5 py-4">
-        <h2 className="text-xs font-semibold uppercase tracking-wider text-ink-tertiary">
+        <h2 className="text-xs font-semibold uppercase tracking-wider text-ink-tertiary">Summary</h2>
+        {note.summary ? (
+          <p className="text-sm text-ink-secondary">{note.summary}</p>
+        ) : (
+          <p className="text-sm italic text-ink-tertiary">No summary available.</p>
+        )}
+      </div>
+
+      {/* Full transcript: collapsed by default so the summary + action items lead. */}
+      <details className="prism-card group px-5 py-4">
+        <summary className="flex w-fit cursor-pointer list-none items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-ink-tertiary transition-colors hover:text-ink">
+          <ChevronRight className="size-3.5 transition-transform group-open:rotate-90" />
           Full transcript
-        </h2>
-        <pre className="whitespace-pre-wrap break-words font-mono text-xs text-ink-secondary">
+        </summary>
+        <pre className="mt-3 whitespace-pre-wrap break-words font-mono text-xs text-ink-secondary">
           {note.rawText}
         </pre>
-      </div>
+      </details>
+
+      <MeetingActionItems
+        teamSlug={teamSlug}
+        noteId={note.id}
+        todos={note.extractedTodos}
+        provider={primary.provider}
+      />
     </div>
   );
 }

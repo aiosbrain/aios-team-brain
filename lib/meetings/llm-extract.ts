@@ -40,7 +40,7 @@ const SYSTEM_PROMPT =
   '{"summary":"...","attendees":["Full Name", ...]}. No prose, no markdown code fences — the raw ' +
   "JSON object only. If you can't tell who attended, return an empty attendees array — never guess.";
 
-function extractJsonObject(raw: string): string {
+export function extractJsonObject(raw: string): string {
   const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
   const body = (fenced ? fenced[1] : raw).trim();
   const start = body.indexOf("{");
@@ -48,7 +48,7 @@ function extractJsonObject(raw: string): string {
   return start !== -1 && end !== -1 && end > start ? body.slice(start, end + 1) : body;
 }
 
-async function callOpenAICompatible(userContent: string, apiKey?: string | null): Promise<string | null> {
+async function callOpenAICompatible(system: string, userContent: string, apiKey?: string | null): Promise<string | null> {
   const res = await fetch(`${LLM_BASE_URL!.replace(/\/$/, "")}/chat/completions`, {
     method: "POST",
     headers: {
@@ -59,7 +59,7 @@ async function callOpenAICompatible(userContent: string, apiKey?: string | null)
       model: LLM_MODEL,
       response_format: { type: "json_object" },
       messages: [
-        { role: "system", content: SYSTEM_PROMPT },
+        { role: "system", content: system },
         { role: "user", content: userContent },
       ],
     }),
@@ -76,23 +76,28 @@ async function callOpenAICompatible(userContent: string, apiKey?: string | null)
   return data.choices?.[0]?.message?.content ?? null;
 }
 
-async function callAnthropic(userContent: string, apiKey?: string | null): Promise<string | null> {
+async function callAnthropic(system: string, userContent: string, apiKey?: string | null): Promise<string | null> {
   const client = new Anthropic(apiKey ? { apiKey } : undefined);
   const msg = await client.messages.create({
     model: ANTHROPIC_MODEL,
     max_tokens: 1024,
-    system: SYSTEM_PROMPT,
+    system,
     messages: [{ role: "user", content: `${userContent}\n\nReturn ONLY the JSON object.` }],
   });
   const block = msg.content.find((b) => b.type === "text");
   return block && block.type === "text" ? block.text : null;
 }
 
-async function callLLMRaw(userContent: string, keys: ProviderKeys): Promise<string | null> {
+/**
+ * Shared best-effort transport for the meetings LLM passes (summary/attendees AND action items):
+ * OpenAI-compatible `chat/completions` when LLM_BASE_URL is set, else the Anthropic Messages API.
+ * Never throws — any transport failure returns null so a caller degrades gracefully.
+ */
+export async function callMeetingsLLM(system: string, userContent: string, keys: ProviderKeys): Promise<string | null> {
   try {
     return LLM_BASE_URL
-      ? await callOpenAICompatible(userContent, keys.openaiKey)
-      : await callAnthropic(userContent, keys.anthropicKey);
+      ? await callOpenAICompatible(system, userContent, keys.openaiKey)
+      : await callAnthropic(system, userContent, keys.anthropicKey);
   } catch (err) {
     console.error("[meetings] LLM call failed:", err instanceof Error ? err.message : err);
     return null;
@@ -143,7 +148,7 @@ export async function extractFromTranscript(
   const rosterHint = roster.length
     ? `\n\nKnown team members (for reference, not exhaustive): ${roster.map((p) => p.displayName).join(", ")}.`
     : "";
-  const raw = await callLLMRaw(`Transcript:\n\n${truncated}${rosterHint}`, keys);
+  const raw = await callMeetingsLLM(SYSTEM_PROMPT, `Transcript:\n\n${truncated}${rosterHint}`, keys);
   if (!raw) return empty;
 
   let parsed: unknown;
