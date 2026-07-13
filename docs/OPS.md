@@ -1,7 +1,7 @@
 # Ops hardening — Sentry, CodeRabbit, BugBot
 
 This note covers the observability + automated-review stack added in **W1.4**. The Sentry
-*code* is wired in this repo; CodeRabbit and BugBot are GitHub/Cursor apps that a human org
+_code_ is wired in this repo; CodeRabbit and BugBot are GitHub/Cursor apps that a human org
 owner must approve (they cannot be enabled from code).
 
 ---
@@ -10,14 +10,14 @@ owner must approve (they cannot be enabled from code).
 
 ### What's wired
 
-| File | Role |
-|------|------|
-| `instrumentation-client.ts` | Browser SDK init (`NEXT_PUBLIC_SENTRY_DSN`); exports `onRouterTransitionStart` for App Router nav tracing. |
-| `sentry.server.config.ts` | Node.js runtime init (`SENTRY_DSN`). |
-| `sentry.edge.config.ts` | Edge runtime init (`SENTRY_DSN`). |
-| `instrumentation.ts` | `register()` imports the right config per `NEXT_RUNTIME`; exports `onRequestError = Sentry.captureRequestError` to forward server errors. |
-| `app/global-error.tsx` | Root error boundary; calls `Sentry.captureException` and renders fallback UI. |
-| `next.config.ts` | Wrapped with `withSentryConfig(...)` for build-time source-map upload. |
+| File                        | Role                                                                                                                                      |
+| --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `instrumentation-client.ts` | Browser SDK init (`NEXT_PUBLIC_SENTRY_DSN`); exports `onRouterTransitionStart` for App Router nav tracing.                                |
+| `sentry.server.config.ts`   | Node.js runtime init (`SENTRY_DSN`).                                                                                                      |
+| `sentry.edge.config.ts`     | Edge runtime init (`SENTRY_DSN`).                                                                                                         |
+| `instrumentation.ts`        | `register()` imports the right config per `NEXT_RUNTIME`; exports `onRequestError = Sentry.captureRequestError` to forward server errors. |
+| `app/global-error.tsx`      | Root error boundary; calls `Sentry.captureException` and renders fallback UI.                                                             |
+| `next.config.ts`            | Wrapped with `withSentryConfig(...)` for build-time source-map upload.                                                                    |
 
 **Everything is env-driven and inert when unset.** With no DSN the SDK `init` is a no-op and
 sends nothing; with no `SENTRY_AUTH_TOKEN` the build skips source-map upload. So local/CI
@@ -51,9 +51,13 @@ not have resolved frames.
 
 2. **Trigger a client (browser) error.** Add a temporary throw behind a button, or in the
    browser devtools console of any dashboard page run:
+
    ```js
-   setTimeout(() => { throw new Error("sentry client smoke test"); });
+   setTimeout(() => {
+     throw new Error("sentry client smoke test");
+   });
    ```
+
    (A thrown error in a React render will surface `app/global-error.tsx`.) In Sentry → Issues,
    confirm a new event titled `sentry client smoke test` appears, and that the stack trace
    shows **original `.tsx` file + line numbers** (not minified `chunk-….js`). Resolved frames
@@ -61,11 +65,15 @@ not have resolved frames.
 
 3. **Trigger a server error.** Hit a route that throws on the server. Easiest: add a temporary
    route that throws, e.g. `app/api/_sentry-smoke/route.ts`:
+
    ```ts
-   export function GET() { throw new Error("sentry server smoke test"); }
+   export function GET() {
+     throw new Error("sentry server smoke test");
+   }
    ```
+
    Request it (`curl https://<host>/api/_sentry-smoke`). In Sentry, confirm a `sentry server
-   smoke test` event with a resolved server stack trace. This exercises the `onRequestError`
+smoke test` event with a resolved server stack trace. This exercises the `onRequestError`
    hook in `instrumentation.ts`.
 
 4. **Clean up.** Remove the temporary throw / smoke route.
@@ -110,10 +118,11 @@ No env vars or secrets in this repo are required.
 
 **Incident:** the Railway CLI links each directory to a project in `~/.railway/config.json`
 (keyed by absolute path). `railway up`/`redeploy` deploys the **current directory's code to that
-linked project**. A Conductor worktree for *this* repo had drifted to the **Kula** project's link,
+linked project**. A Conductor worktree for _this_ repo had drifted to the **Kula** project's link,
 so a deploy from it shipped aios-team-brain into Kula and took Kula down.
 
 ### The rule (enforced)
+
 Production deploys happen **only by merging to `main`** → Railway's GitHub integration auto-builds
 **AIOS → `aios-team-brain`** (bound in the dashboard; cannot target another project). The Railway
 CLI is **read-only** here. The destructive verbs are **blocked** by `.claude/settings.json`
@@ -121,6 +130,7 @@ CLI is **read-only** here. The destructive verbs are **blocked** by `.claude/set
 `cd other && <deploy>` form). See CLAUDE.md §6.
 
 ### Runtime backstop (defense in depth)
+
 The hook only fires inside the agent's shell. The **runtime** guard covers everything else (a human
 `railway up`, or any path that lands this code on a foreign service): the schema loaders
 (`pg-load-schema.mjs` = the `preDeployCommand`, `pg-load-vector.mjs`) call `assertServiceIdentity`
@@ -131,6 +141,7 @@ This mirrors Kula's `src/lib/service-guard.ts`; both apps carrying it is what ma
 symmetric. Guarded by `test/guards/service-guard.test.ts`.
 
 ### After creating a new worktree
+
 Conductor spawns worktrees that can inherit a wrong link. Audit + fix:
 
 ```bash
@@ -140,6 +151,7 @@ bash scripts/railway-link-check.sh   # flags any aios dir not linked to AIOS
 ```
 
 ### Strongest guard — a project-scoped token (recommended) — HUMAN STEP
+
 A **project token** scopes the CLI to a single project + environment, so even a stray deploy from a
 mislinked directory physically cannot reach another project (e.g. Kula).
 
@@ -169,7 +181,7 @@ current security model. Everything below is verified against what exists in this
 ## 5. Postgres backup & restore
 
 **There is no built-in backup command in this repo.** `npm run pg:schema` (`scripts/pg-load-schema.mjs`)
-only *loads* `postgres/schema.sql` + `postgres/migrations/*` into a target database — it is a
+only _loads_ `postgres/schema.sql` + `postgres/migrations/*` into a target database — it is a
 forward-rollout step, not a backup/export tool. There is no `pg:dump`, `pg:backup`, or similar
 script anywhere in `package.json` or `scripts/`. Use `pg_dump`/`pg_restore` directly against the
 same connection the app itself uses.
@@ -215,7 +227,7 @@ railway run -s Postgres bash -lc \
 
 - `--clean --if-exists` drops existing objects before recreating them, so this is destructive to
   whatever is currently in the target database — never point it at prod without a fresh backup
-  of prod's *current* state taken first, and confirm with a human before restoring over a live
+  of prod's _current_ state taken first, and confirm with a human before restoring over a live
   service.
 - `--no-owner` avoids failing on role/owner mismatches between the environment the dump was taken
   in and the one being restored into (Railway-managed Postgres roles can differ across projects).
@@ -223,7 +235,7 @@ railway run -s Postgres bash -lc \
   in a Railway shell, or the CLI's own `pg:schema` subcommand — see §6) once more to reapply any
   migration that postdates the dump. `postgres/schema.sql` and every file in `postgres/migrations/`
   are idempotent by design (`create table if not exists`, `alter table … add column if not
-  exists` — see `postgres/migrations/README.md`), so re-running it after a restore is always safe.
+exists` — see `postgres/migrations/README.md`), so re-running it after a restore is always safe.
 
 ---
 
@@ -295,32 +307,32 @@ The brain-api wire contract is versioned in **`aios-workspace/docs/brain-api.md`
 **v1.8**) — the single pinned contract both `aios-workspace` (the CLI/MCP client) and
 `aios-team-brain` (this server) build against. Per that doc's own change policy: a **breaking**
 change requires a **major version bump** (`/api/v2`); **additive** changes (new endpoints, new
-item kinds, new optional fields) stay within the current major *only if both directions degrade
-gracefully* — the server keeps old endpoints, and clients tolerate a `404` on anything they call
+item kinds, new optional fields) stay within the current major _only if both directions degrade
+gracefully_ — the server keeps old endpoints, and clients tolerate a `404` on anything they call
 that an older brain doesn't yet serve.
 
 ### Where the version is pinned, in lockstep, on the brain side
 
-| File | Role |
-|------|------|
-| `aios-workspace/docs/brain-api.md` | Source of truth for the wire contract; states the version in its first line (`**Version: 1.8**`) and carries a dated *Revisions* changelog for every additive change. |
-| `docs/ARCHITECTURE.md` (this repo, §"Auth & access tiers") | Carries the canonical implemented-version claim in prose: `"This server implements brain-api v1.8"`. |
-| `lib/api/version.ts` | `export const BRAIN_API_VERSION = "1.8"` — the single server-side declaration of which contract version this codebase targets. |
-| `test/guards/contract-version.test.ts` | Fails the build if `BRAIN_API_VERSION` and the `ARCHITECTURE.md` prose claim drift apart — forces both to move together. |
-| `aios-workspace/docs/contract/brain-contract.json` | Canonical conformance fixture (`version`, `tierAliases`, `sse.frames`, `provisioningTools`, `contentHash`). |
-| `test/fixtures/contract/brain-contract.json` (this repo) | A vendored **copy** of the file above — must match byte-for-byte (`contentHash` pins the content) or `test/guards/contract-conformance.test.ts` fails. |
+| File                                                       | Role                                                                                                                                                                  |
+| ---------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `aios-workspace/docs/brain-api.md`                         | Source of truth for the wire contract; states the version in its first line (`**Version: 1.8**`) and carries a dated _Revisions_ changelog for every additive change. |
+| `docs/ARCHITECTURE.md` (this repo, §"Auth & access tiers") | Carries the canonical implemented-version claim in prose: `"This server implements brain-api v1.9"`.                                                                  |
+| `lib/api/version.ts`                                       | `export const BRAIN_API_VERSION = "1.9"` — the single server-side declaration of which contract version this codebase targets.                                        |
+| `test/guards/contract-version.test.ts`                     | Fails the build if `BRAIN_API_VERSION` and the `ARCHITECTURE.md` prose claim drift apart — forces both to move together.                                              |
+| `aios-workspace/docs/contract/brain-contract.json`         | Canonical conformance fixture (`version`, `tierAliases`, `sse.frames`, `provisioningTools`, `contentHash`).                                                           |
+| `test/fixtures/contract/brain-contract.json` (this repo)   | A vendored **copy** of the file above — must match byte-for-byte (`contentHash` pins the content) or `test/guards/contract-conformance.test.ts` fails.                |
 
 ### The upgrade sequence
 
 1. **Land the contract change in `aios-workspace/docs/brain-api.md` first** — bump the version
-   line, add a dated bullet under *Revisions*, and (per the doc's own rule) update
+   line, add a dated bullet under _Revisions_, and (per the doc's own rule) update
    `aios-workspace/docs/contract/brain-contract.json` (`version` field, plus whichever of
    `tierAliases` / `sse.frames` / `provisioningTools` actually changed, then regenerate
    `contentHash` via that repo's `scripts/gen-contract-fixture.mjs`).
 2. **Re-vendor the fixture into this repo**: copy the updated `brain-contract.json` into
    `test/fixtures/contract/brain-contract.json` verbatim so the `contentHash` matches.
 3. **Bump `lib/api/version.ts`**'s `BRAIN_API_VERSION` to the new value.
-4. **Update the prose claim in `docs/ARCHITECTURE.md`** ("...implements brain-api v1.8...") to
+4. **Update the prose claim in `docs/ARCHITECTURE.md`** ("...implements brain-api v1.9...") to
    the new version — `test/guards/contract-version.test.ts` matches that exact sentence.
 5. **Implement the actual endpoint/field change** in this codebase (new route, new optional
    field, etc.), keeping old behavior intact if the bump is additive.
@@ -349,7 +361,7 @@ invariant"):
   organization (each org runs its own instance against its own database — there is no shared
   multi-tenant DB, so cross-organization isolation is not a concern here). But **tier isolation**
   (an `external`-tier principal — e.g. a client/consultant collaborator — must never read
-  `team`/`admin` content) is a real, live product feature that RLS does *not* enforce. It is
+  `team`/`admin` content) is a real, live product feature that RLS does _not_ enforce. It is
   enforced **entirely in application code**: the `lib/auth/visibility` choke-point plus re-applied
   tier filters in `/api/v1/items*` and `lib/query/retrieve.ts`. **A missing tier filter on a new
   read path has no database backstop** — this is a standing invariant every new dashboard surface
@@ -372,7 +384,7 @@ invariant"):
   restricted value, so a malformed or future tier string that isn't in the `ViewerTier` union
   falls through to the **unfiltered** branch instead of being denied. (`canSeeAccess` already
   fails closed — `tier === "team"` — and is the pattern the other four need to adopt.) Because
-  there is no RLS backstop, this file is the *sole* enforcement point, which is exactly why the
+  there is no RLS backstop, this file is the _sole_ enforcement point, which is exactly why the
   fail-open behavior matters. Not yet fixed as of this writing — treat the app-code enforcement
   above as the complete picture until AIO-349 lands, and do not assume RLS-equivalent protection
   exists anywhere in this schema.
