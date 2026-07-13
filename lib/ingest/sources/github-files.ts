@@ -33,6 +33,36 @@ function matchesAny(path: string, globs: RegExp[]): boolean {
   return globs.some((re) => re.test(path));
 }
 
+/**
+ * The file's last-commit author (login + git email + name), or undefined on any failure. GitHub has
+ * no per-file author field, so we take the most recent commit touching the path — the honest
+ * git-blame answer for "who owns this file". Best-effort: a failure leaves the file unattributed
+ * (never mis-attributed to the ingesting connector). One extra API call per file — bounded by the
+ * glob'd file count and the PAT's 5000/hr limit.
+ */
+async function fetchFileLastAuthor(
+  base: string,
+  path: string,
+  ref: string,
+  headers: Record<string, string>,
+  fetchImpl: typeof fetch
+): Promise<{ login?: string; email?: string; name?: string } | undefined> {
+  try {
+    const url = `${base}/commits?path=${encodeURIComponent(path)}&sha=${encodeURIComponent(ref)}&per_page=1`;
+    const res = await fetchImpl(url, { headers });
+    if (!res.ok) return undefined;
+    const arr = (await res.json()) as {
+      author?: { login?: string } | null;
+      commit?: { author?: { email?: string; name?: string } | null } | null;
+    }[];
+    const c = Array.isArray(arr) ? arr[0] : undefined;
+    if (!c) return undefined;
+    return { login: c.author?.login, email: c.commit?.author?.email, name: c.commit?.author?.name };
+  } catch {
+    return undefined;
+  }
+}
+
 export async function fetchGithubRepoFiles(opts: {
   owner: string;
   repo: string;
@@ -84,7 +114,16 @@ export async function fetchGithubRepoFiles(opts: {
       continue; // binary / undecodable — skip
     }
     if (Buffer.byteLength(body, "utf-8") > MAX_FILE_BYTES) continue;
-    files.push({ path, body, htmlUrl: data.html_url });
+    // Attribute the file to its last-commit author (best-effort; undefined → left unattributed).
+    const author = await fetchFileLastAuthor(base, path, ref, headers, fetchImpl);
+    files.push({
+      path,
+      body,
+      htmlUrl: data.html_url,
+      authorLogin: author?.login,
+      authorEmail: author?.email,
+      authorName: author?.name,
+    });
   }
 
   return { owner: opts.owner, repo: opts.repo, ref, files };

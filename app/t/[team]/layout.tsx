@@ -62,9 +62,9 @@ export default async function TeamLayout({
   const base = `/t/${team.slug}`;
 
   // Settings groups the low-frequency config surfaces; Admin is appended only for admins.
+  // "Team tools" (/team-tools) removed from the nav (2026-07-13, product call) — route still resolves.
   const settingsChildren: NavLeaf[] = [
     { icon: "account", label: "Account", href: `${base}/account` },
-    { icon: "teamtools", label: "Team tools", href: `${base}/team-tools` },
   ];
   if (me.role === "admin") {
     settingsChildren.push({ icon: "admin", label: "Admin", href: `${base}/admin` });

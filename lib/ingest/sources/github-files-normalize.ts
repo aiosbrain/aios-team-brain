@@ -16,6 +16,11 @@ export interface GithubFileRaw {
   path: string; // repo-relative path, e.g. "docs/guide.md"
   body: string;
   htmlUrl?: string;
+  // Last-commit author of this file (best-effort; absent when the commits lookup fails). The EMAIL
+  // is the reliable key for author→member resolution (matches how commits are attributed).
+  authorLogin?: string;
+  authorEmail?: string;
+  authorName?: string;
 }
 
 export interface NormalizeGithubFilesInput {
@@ -43,7 +48,10 @@ export function normalizeGithubFiles(input: NormalizeGithubFilesInput): ItemPayl
     path: `github/${ownerSeg}-${repoSeg}/${f.path}`.slice(0, 500),
     kind: "deliverable" as const,
     content_sha256: sha256(f.body),
-    actor: "",
+    // `actor` = the file's last-committer name (display only). `author_email`/`author_login` in
+    // frontmatter are the resolution keys the runner + a backfill use to attribute to a member —
+    // persisted so re-attribution never needs to re-hit GitHub. Mirrors commits-to-items.
+    actor: f.authorName ?? "",
     access: "team",
     frontmatter: {
       source: "github",
@@ -51,6 +59,9 @@ export function normalizeGithubFiles(input: NormalizeGithubFilesInput): ItemPayl
       ref: input.ref,
       repo_path: f.path,
       url: f.htmlUrl ?? "",
+      ...(f.authorName ? { author: f.authorName } : {}),
+      ...(f.authorEmail ? { author_email: f.authorEmail } : {}),
+      ...(f.authorLogin ? { author_login: f.authorLogin } : {}),
     },
     body: f.body,
   }));
