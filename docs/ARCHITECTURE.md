@@ -548,6 +548,17 @@ guard enforces it, it's named.
   types them all as `string`. The type parsers set in `lib/db/pg/pool.ts` (OIDs 1082/1114/1184)
   are the single normalization point; every PgQuery consumer gets the raw wire-format string.
   _Guard:_ `test/datamechanics/timestamptz-string.datamechanics.test.ts` (real PG).
+- **DB connections have liveness timeouts — a wedged one can't hold locks forever** (2026-07-13
+  outage). A pooled backend got stuck holding `tasks` ACCESS SHARE with a transaction open; with no
+  server/pool timeout it held that lock indefinitely, the next deploy's schema `ALTER` queued behind
+  it, and every query then queued behind the ALTER → full outage. The pool
+  (`lib/db/pg/pool.buildPoolConfig`) now sets `idle_in_transaction_session_timeout` (reaps a
+  leaked/zombie open transaction — the healthy `withTransaction` never idles, so only a stuck one is
+  killed), `statement_timeout`, `connectionTimeoutMillis` (fail-fast checkout when the pool is
+  exhausted — blast-radius containment), and TCP `keepAlive`; all env-overridable, `0` disables. The
+  schema loader (`scripts/pg-load-schema.mjs`, the Railway `preDeployCommand`) sets `lock_timeout`
+  so a migration fails fast instead of wedging the lock queue behind a stuck reader.
+  _Guards:_ `test/pg-pool-config.test.ts` + `test/pg-load-schema.test.ts`.
 
 ## Changing X? read this
 
