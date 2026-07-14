@@ -18,6 +18,19 @@ import { gatewayScope, seedGateway } from "./gateway-helpers";
 const KEY = Buffer.alloc(32, 43);
 
 describe("gateway-tenant-isolation", () => {
+  async function createMember(
+    teamId: string,
+    over: { status?: "active" | "disabled"; tier?: "team" | "external" } = {}
+  ) {
+    const id = randomUUID();
+    await getPool().query(
+      `insert into members (id, team_id, email, display_name, actor_handle, role, tier, status)
+       values ($1,$2,$3,'Gateway approver',$4,'member',$5,$6)`,
+      [id, teamId, `${randomUUID()}@test.local`, `approver-${randomUUID()}`, over.tier ?? "team", over.status ?? "active"]
+    );
+    return id;
+  }
+
   it("denies cross-team, cross-member, cross-tenant, and cross-subject connection lookup", async () => {
     const seed = await seedGateway();
     const other = await seedTeam();
@@ -84,6 +97,43 @@ describe("gateway-tenant-isolation", () => {
     await expect(claimApprovedExecution({
       ...scope, executionId, toolkit: "aios-github-readonly", correlationId: randomUUID(), idempotencyKey: randomUUID(),
     })).rejects.toMatchObject({ code: "gateway_execution_not_claimable" });
+  });
+
+  it("accepts only an active same-team approver and records complete audit scope", async () => {
+    const seed = await seedGateway();
+    const scope = gatewayScope(seed);
+    const issued = await issueResolutionLease({
+      ...scope, connectionRef: seed.connectionRef, audience: "executor", correlationId: randomUUID(),
+    });
+    const executionId = randomUUID();
+    await consumeLeaseAndCreateExecution({
+      ...scope, lease: issued.lease, audience: "executor", executionId,
+      encryptedRequestEnvelope: encryptGatewayRequestEnvelope({ owner: "acme", repo: "repo" },
+        { executionId, serviceIdentityId: seed.serviceIdentityId }, KEY),
+      toolkit: "aios-github-readonly", tool: "github.repository.get", requestHash: "3".repeat(64),
+      correlationId: randomUUID(), idempotencyKey: randomUUID(), decision: "require_approval",
+    });
+    const inactiveApprover = await createMember(seed.teamId, { status: "disabled" });
+    const externalApprover = await createMember(seed.teamId, { tier: "external" });
+    const otherTeam = await seedTeam();
+    for (const approverMemberId of [inactiveApprover, externalApprover, otherTeam.memberId]) {
+      await expect(approveGatewayExecution({
+        ...scope, executionId, approverMemberId, correlationId: randomUUID(),
+      })).rejects.toMatchObject({ code: "gateway_approval_not_pending" });
+    }
+
+    const activeApprover = await createMember(seed.teamId);
+    const correlationId = randomUUID();
+    await approveGatewayExecution({ ...scope, executionId, approverMemberId: activeApprover, correlationId });
+    const audit = await getPool().query(
+      `select subject_binding_id, connection_id from gateway_audit_log
+       where execution_id=$1 and event='approval_approved' and correlation_id=$2`,
+      [executionId, correlationId]
+    );
+    expect(audit.rows[0]).toMatchObject({
+      subject_binding_id: seed.subjectBindingId,
+      connection_id: seed.connectionId,
+    });
   });
 
   it("refuses to bind an external member or connect through a revoked service", async () => {

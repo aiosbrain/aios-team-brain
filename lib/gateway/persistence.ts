@@ -229,13 +229,14 @@ export async function approveGatewayExecution(input: Scope & {
   correlationId: string;
 }): Promise<void> {
   await withTransaction(async (client) => {
-    const approval = await client.query<{ id: string }>(
-      `select a.id from gateway_approvals a
+    const approval = await client.query<{ id: string; subject_binding_id: string; connection_id: string }>(
+      `select a.id, e.subject_binding_id, e.connection_id from gateway_approvals a
        join gateway_executions e on e.id=a.execution_id and e.team_id=a.team_id
        join executor_subject_bindings b on b.id=e.subject_binding_id and b.team_id=e.team_id
        join gateway_service_identities s on s.id=e.service_identity_id and s.team_id=e.team_id
        join gateway_connections c on c.id=e.connection_id and c.team_id=e.team_id
        join members m on m.id=e.member_id and m.team_id=e.team_id
+       join members approver on approver.id=$7 and approver.team_id=e.team_id
        where e.id=$1 and e.team_id=$2 and e.member_id=$3 and e.service_identity_id=$4
          and b.executor_tenant_id=$5 and b.executor_subject_id=$6
          and a.status='pending' and a.expires_at > now()
@@ -244,9 +245,10 @@ export async function approveGatewayExecution(input: Scope & {
          and c.enabled and c.revoked_at is null
          and (c.credential_expires_at is null or c.credential_expires_at > now())
          and m.status='active' and m.tier='team'
-       for update of a, e`,
+         and approver.status='active' and approver.tier='team'
+       for update of a, e, approver`,
       [input.executionId, input.teamId, input.memberId, input.serviceIdentityId,
-       input.executorTenantId, input.executorSubjectId]
+       input.executorTenantId, input.executorSubjectId, input.approverMemberId]
     );
     if (!approval.rows[0]) throw new GatewayPersistenceError("gateway_approval_not_pending");
     await client.query(
@@ -256,9 +258,11 @@ export async function approveGatewayExecution(input: Scope & {
     await client.query(`update gateway_executions set state='approved', updated_at=now() where id=$1`, [input.executionId]);
     await client.query(
       `insert into gateway_audit_log
-       (team_id, member_id, service_identity_id, execution_id, approval_id, event, correlation_id)
-       values ($1,$2,$3,$4,$5,'approval_approved',$6)`,
-      [input.teamId, input.memberId, input.serviceIdentityId, input.executionId, approval.rows[0].id, input.correlationId]
+       (team_id, member_id, service_identity_id, subject_binding_id, connection_id,
+        execution_id, approval_id, event, correlation_id)
+       values ($1,$2,$3,$4,$5,$6,$7,'approval_approved',$8)`,
+      [input.teamId, input.memberId, input.serviceIdentityId, approval.rows[0].subject_binding_id,
+       approval.rows[0].connection_id, input.executionId, approval.rows[0].id, input.correlationId]
     );
   });
 }

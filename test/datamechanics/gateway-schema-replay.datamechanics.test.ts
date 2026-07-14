@@ -15,7 +15,7 @@ const gatewayTables = [
 ];
 
 async function isolatedSchema(run: (client: Client, schema: string) => Promise<void>) {
-  const client = new Client({ connectionString: process.env.DATABASE_URL });
+  const client = new Client({ connectionString: process.env.DATABASE_TEST_URL });
   const schema = `gateway_replay_${randomUUID().replaceAll("-", "")}`;
   await client.connect();
   try {
