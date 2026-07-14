@@ -342,8 +342,8 @@ create table if not exists gateway_service_identities (
   id uuid primary key default gen_random_uuid(),
   team_id uuid not null references teams(id) on delete restrict,
   environment text not null check (environment <> ''),
-  credential_id text not null unique check (credential_id <> ''),
-  credential_hash text not null check (credential_hash <> ''),
+  credential_id text not null unique check (credential_id ~ '^[A-Za-z0-9_-]{22}$'),
+  credential_hash text not null check (credential_hash ~ '^[0-9a-f]{64}$'),
   credential_version integer not null default 1 check (credential_version > 0),
   rotated_from_id uuid references gateway_service_identities(id) on delete restrict,
   activated_at timestamptz not null default now(),
@@ -422,6 +422,7 @@ create table if not exists gateway_resolution_leases (
   service_identity_id uuid not null,
   subject_binding_id uuid not null,
   connection_id uuid not null,
+  policy_version text not null check (policy_version ~ '^[0-9a-f]{64}$'),
   created_at timestamptz not null default now(),
   expires_at timestamptz not null,
   consumed_at timestamptz,
@@ -550,6 +551,15 @@ create table if not exists gateway_audit_log (
 );
 create index if not exists gateway_audit_log_team_time_idx
   on gateway_audit_log (team_id, created_at desc);
+create unique index if not exists gateway_audit_log_outcome_execution_unq
+  on gateway_audit_log (execution_id) where event='outcome_recorded';
+
+create table if not exists gateway_rate_limits (
+  bucket text not null,
+  window_start timestamptz not null,
+  count integer not null check (count > 0),
+  primary key (bucket, window_start)
+);
 
 create or replace function gateway_audit_protect()
 returns trigger language plpgsql as $$
@@ -668,7 +678,8 @@ begin
     or new.team_id is distinct from old.team_id or new.member_id is distinct from old.member_id
     or new.service_identity_id is distinct from old.service_identity_id
     or new.subject_binding_id is distinct from old.subject_binding_id
-    or new.connection_id is distinct from old.connection_id or new.created_at is distinct from old.created_at
+    or new.connection_id is distinct from old.connection_id or new.policy_version is distinct from old.policy_version
+    or new.created_at is distinct from old.created_at
     or new.expires_at is distinct from old.expires_at then
     raise exception 'gateway resolution lease identity fields are immutable';
   end if; return new;

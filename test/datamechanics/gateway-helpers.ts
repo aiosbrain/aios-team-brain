@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { seedTeam, type Seed } from "./helpers";
 import {
   bindExecutorSubject,
@@ -22,8 +22,8 @@ export async function seedGateway(): Promise<GatewaySeed> {
   const service = await registerGatewayServiceIdentity({
     teamId: team.teamId,
     environment: "test",
-    credentialId: `svc-${randomUUID()}`,
-    credential: `synthetic-service-credential-${randomUUID()}`,
+    credentialId: randomBytes(16).toString("base64url"),
+    credential: randomBytes(32).toString("base64url"),
   });
   const binding = await bindExecutorSubject({
     ...team,

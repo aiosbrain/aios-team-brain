@@ -12,6 +12,7 @@ const TABLES = [
   "gateway_executions",
   "gateway_approvals",
   "gateway_audit_log",
+  "gateway_rate_limits",
 ];
 const SECRET_FIELDS = [
   "credential_hash",
