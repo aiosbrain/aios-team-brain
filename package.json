@@ -31,6 +31,8 @@
     "test:datamechanics": "vitest run --config vitest.datamechanics.config.ts",
     "test:datamechanics:local": "DATABASE_TEST_URL=postgres://app:app@localhost:5434/app_test vitest run --config vitest.datamechanics.config.ts",
     "test:http": "vitest run --config vitest.http.config.ts",
+    "test:gateway-contracts": "vitest run test/gateway/gateway-contracts.test.ts",
+    "test:gateway-api": "vitest run test/gateway test/guards/gateway-writers.test.ts",
     "test:http:local": "npm run build && DATABASE_TEST_URL=postgres://app:app@localhost:5434/app_test vitest run --config vitest.http.config.ts"
   },
   "dependencies": {

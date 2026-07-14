@@ -10,3 +10,6 @@
  * architecture doc). Bumping the contract = bump this constant + the doc in the same PR.
  */
 export const BRAIN_API_VERSION = "1.9";
+
+/** Server-only Executor gateway negotiation; independent of the member API surface. */
+export const GATEWAY_CONTRACT_VERSION = "1.10";

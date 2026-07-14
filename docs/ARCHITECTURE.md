@@ -58,8 +58,8 @@ Reason from this table, not from a random call site.
 
 | State | Store | Sole writer | Readers | Access/retention |
 |---|---|---|---|---|
-| Gateway service credentials and Executor subjects | `gateway_service_identities`, `executor_subject_bindings` | `lib/gateway/persistence.ts` | later internal gateway routes only | exact team + service + tenant + subject binding; hashed credentials; revoke rather than delete |
-| Member GitHub connection and one-use lease | `gateway_connections`, `gateway_resolution_leases` | `lib/gateway/persistence.ts` | later resolver/authorization routes only | exact team + member + subject; GitHub-only; opaque refs; lease hashes only; 30-second maximum TTL; single transactional consumption |
+| Gateway service credentials and Executor subjects | `gateway_service_identities`, `executor_subject_bindings` | `lib/gateway/persistence.ts` | internal gateway routes | exact team + service + tenant + subject binding; hashed credentials; revoke rather than delete |
+| Member GitHub connection, one-use lease, and limiter | `gateway_connections`, `gateway_resolution_leases`, `gateway_rate_limits` | `lib/gateway/persistence.ts` | internal resolver/authorization routes | exact team + member + subject; GitHub-only; opaque refs; lease hashes only; 30-second maximum TTL; single transactional consumption; fail-closed DB-time buckets |
 | Durable request, approval, and claim state | `gateway_executions`, `gateway_approvals` | `lib/gateway/persistence.ts` | later authorization/resume routes only | encrypted request envelope (64 KiB sealed maximum); retained identity/request fields; 15-minute maximum approval TTL; exclusive row-lock claim |
 | Strict gateway compliance audit | `gateway_audit_log` | `lib/gateway/persistence.ts` in the same transaction as authorization state | admin compliance surfaces in later slices | append-only trigger; fixed non-secret columns only; no JSON escape hatch; team deletion is restricted while retained records exist |
 
@@ -614,6 +614,9 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 
 <!-- drift:routes -->
 
+- `POST /api/internal/executor-gateway/v1/resolve-lease` — service-authenticated, version-pinned, one-use 30-second credential-resolution lease
+- `POST /api/internal/executor-gateway/v1/authorize-and-redeem` — exact-call policy decision and post-audit request-local PAT sealing
+- `POST /api/internal/executor-gateway/v1/record-outcome` — idempotent execution settlement with one immutable outcome audit
 - `POST /api/v1/items` — upsert synced content
 - `GET /api/v1/items` — tier-filtered, keyset-paginated pull
 - `GET /api/v1/items/:id` — single item fetch
@@ -666,7 +669,7 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 
 `auth_users` · `auth_tokens` · `oauth_states` · `teams` · `members` · `api_keys` · `audit_log` ·
 `gateway_service_identities` · `executor_subject_bindings` · `gateway_connections` · `gateway_resolution_leases` ·
-`gateway_executions` · `gateway_approvals` · `gateway_audit_log` · `rate_limits` ·
+`gateway_executions` · `gateway_approvals` · `gateway_audit_log` · `gateway_rate_limits` · `rate_limits` ·
 `projects` · `items` · `item_versions` · `tasks` · `decisions` · `graph_entities` ·
 `graph_relationships` · `query_log` · `policies` · `approval_requests` · `actions` ·
 `codebases` · `code_metrics` · `code_contributions` · `github_issues` · `member_emails` ·

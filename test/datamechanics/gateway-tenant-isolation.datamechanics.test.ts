@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { encryptGatewayRequestEnvelope } from "@/lib/gateway/envelope";
 import { getPool } from "@/lib/db/pg/pool";
@@ -139,8 +139,8 @@ describe("gateway-tenant-isolation", () => {
   it("refuses to bind an external member or connect through a revoked service", async () => {
     const external = await seedTeam();
     const service = await registerGatewayServiceIdentity({
-      teamId: external.teamId, environment: "test", credentialId: `svc-${randomUUID()}`,
-      credential: `synthetic-${randomUUID()}`,
+      teamId: external.teamId, environment: "test", credentialId: randomBytes(16).toString("base64url"),
+      credential: randomBytes(32).toString("base64url"),
     });
     await getPool().query(`update members set tier='external' where id=$1`, [external.memberId]);
     await expect(bindExecutorSubject({
@@ -150,8 +150,8 @@ describe("gateway-tenant-isolation", () => {
 
     const active = await seedTeam();
     const activeService = await registerGatewayServiceIdentity({
-      teamId: active.teamId, environment: "test", credentialId: `svc-${randomUUID()}`,
-      credential: `synthetic-${randomUUID()}`,
+      teamId: active.teamId, environment: "test", credentialId: randomBytes(16).toString("base64url"),
+      credential: randomBytes(32).toString("base64url"),
     });
     const binding = await bindExecutorSubject({
       teamId: active.teamId, memberId: active.memberId, serviceIdentityId: activeService.id,
