@@ -50,6 +50,8 @@ export interface MeetingNoteSummary {
   occurredAt: string | null;
   createdAt: string;
   submittedBy: PersonRef | null;
+  /** All submitters (≥1 after a merge). Includes `submittedBy`; use this to render credit. */
+  submitters: PersonRef[];
   attendees: PersonRef[];
 }
 
@@ -207,6 +209,26 @@ export async function createMeetingNoteFromItem(
   return { id: noteId, created: true };
 }
 
+/** Add submitters to a note (idempotent) — used by the merge path to credit both uploaders. */
+export async function addMeetingNoteSubmitters(admin: DbClient, noteId: string, memberIds: string[]): Promise<void> {
+  const ids = [...new Set(memberIds.filter(Boolean))];
+  if (!ids.length) return;
+  const { error } = await admin
+    .from("meeting_note_submitters")
+    .upsert(ids.map((member_id) => ({ meeting_note_id: noteId, member_id })), { onConflict: "meeting_note_id,member_id" });
+  if (error) throw new Error(`meeting note submitters insert failed: ${error.message}`);
+}
+
+/** Add attendees to a note (idempotent) — used by the merge path to union both transcripts' rosters. */
+export async function addMeetingNoteAttendees(admin: DbClient, noteId: string, memberIds: string[]): Promise<void> {
+  const ids = [...new Set(memberIds.filter(Boolean))];
+  if (!ids.length) return;
+  const { error } = await admin
+    .from("meeting_note_attendees")
+    .upsert(ids.map((member_id) => ({ meeting_note_id: noteId, member_id })), { onConflict: "meeting_note_id,member_id" });
+  if (error) throw new Error(`meeting note attendees insert failed: ${error.message}`);
+}
+
 /** Replace a note's summary (e.g. after a "regenerate summary" pass). Single writer for the column. */
 export async function updateMeetingSummary(
   admin: DbClient,
@@ -286,37 +308,42 @@ export async function listMeetingNotesForTeam(
   const rows = (notes ?? []) as NoteRow[];
   if (!rows.length) return [];
 
-  const { data: attendeeRows } = await db
-    .from("meeting_note_attendees")
-    .select("meeting_note_id, member_id")
-    .in(
-      "meeting_note_id",
-      rows.map((r) => r.id)
-    );
-  const attendeesByNote = new Map<string, string[]>();
-  for (const a of (attendeeRows ?? []) as { meeting_note_id: string; member_id: string }[]) {
-    const arr = attendeesByNote.get(a.meeting_note_id) ?? [];
-    arr.push(a.member_id);
-    attendeesByNote.set(a.meeting_note_id, arr);
-  }
+  const noteIds = rows.map((r) => r.id);
+  const [{ data: attendeeRows }, { data: submitterRows }] = await Promise.all([
+    db.from("meeting_note_attendees").select("meeting_note_id, member_id").in("meeting_note_id", noteIds),
+    db.from("meeting_note_submitters").select("meeting_note_id, member_id").in("meeting_note_id", noteIds),
+  ]);
+  const groupByNote = (arr: { meeting_note_id: string; member_id: string }[]) => {
+    const m = new Map<string, string[]>();
+    for (const a of arr) m.set(a.meeting_note_id, [...(m.get(a.meeting_note_id) ?? []), a.member_id]);
+    return m;
+  };
+  const attendeesByNote = groupByNote((attendeeRows ?? []) as { meeting_note_id: string; member_id: string }[]);
+  const submittersByNote = groupByNote((submitterRows ?? []) as { meeting_note_id: string; member_id: string }[]);
 
   const allMemberIds = [
     ...new Set([
       ...rows.flatMap((r) => (r.submitted_by ? [r.submitted_by] : [])),
       ...[...attendeesByNote.values()].flat(),
+      ...[...submittersByNote.values()].flat(),
     ]),
   ];
   const people = await loadPeople(db, teamId, allMemberIds);
 
-  return rows.map((r) => ({
-    id: r.id,
-    title: r.title,
-    summary: r.summary,
-    occurredAt: r.occurred_at,
-    createdAt: r.created_at,
-    submittedBy: r.submitted_by ? (people.get(r.submitted_by) ?? null) : null,
-    attendees: (attendeesByNote.get(r.id) ?? []).map((id) => people.get(id)).filter((p): p is PersonRef => !!p),
-  }));
+  return rows.map((r) => {
+    // Submitters = the primary submitted_by plus any recorded via a merge, deduped, submitter first.
+    const submitterIds = [...new Set([...(r.submitted_by ? [r.submitted_by] : []), ...(submittersByNote.get(r.id) ?? [])])];
+    return {
+      id: r.id,
+      title: r.title,
+      summary: r.summary,
+      occurredAt: r.occurred_at,
+      createdAt: r.created_at,
+      submittedBy: r.submitted_by ? (people.get(r.submitted_by) ?? null) : null,
+      submitters: submitterIds.map((id) => people.get(id)).filter((p): p is PersonRef => !!p),
+      attendees: (attendeesByNote.get(r.id) ?? []).map((id) => people.get(id)).filter((p): p is PersonRef => !!p),
+    };
+  });
 }
 
 /** Team-tier only (see canSeeMeetingNotes) — returns null for an external caller or a miss. */
@@ -337,12 +364,19 @@ export async function getMeetingNote(
   const row = note as NoteRow | null;
   if (!row) return null;
 
-  const [{ data: item }, { data: attendeeRows }] = await Promise.all([
+  const [{ data: item }, { data: attendeeRows }, { data: submitterRows }] = await Promise.all([
     db.from("items").select("body").eq("id", row.source_item_id).maybeSingle(),
     db.from("meeting_note_attendees").select("member_id").eq("meeting_note_id", row.id),
+    db.from("meeting_note_submitters").select("member_id").eq("meeting_note_id", row.id),
   ]);
   const attendeeIds = ((attendeeRows ?? []) as { member_id: string }[]).map((a) => a.member_id);
-  const people = await loadPeople(db, teamId, row.submitted_by ? [...attendeeIds, row.submitted_by] : attendeeIds);
+  const submitterIds = [
+    ...new Set([
+      ...(row.submitted_by ? [row.submitted_by] : []),
+      ...((submitterRows ?? []) as { member_id: string }[]).map((s) => s.member_id),
+    ]),
+  ];
+  const people = await loadPeople(db, teamId, [...new Set([...attendeeIds, ...submitterIds])]);
 
   // Extracted todos: tasks materialized from this note's item (lib/meetings/extract-todos), in the
   // shared "Extracted from Meetings" project — so the UI can link straight to where each landed.
@@ -399,6 +433,7 @@ export async function getMeetingNote(
     occurredAt: row.occurred_at,
     createdAt: row.created_at,
     submittedBy: row.submitted_by ? (people.get(row.submitted_by) ?? null) : null,
+    submitters: submitterIds.map((id) => people.get(id)).filter((p): p is PersonRef => !!p),
     attendees: attendeeIds.map((mid) => people.get(mid)).filter((p): p is PersonRef => !!p),
     rawText: (item as { body: string } | null)?.body ?? "",
     extractedTodos,
