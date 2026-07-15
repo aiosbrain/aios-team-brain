@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState, useTransition } from "react";
+import { useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
 import { CheckSquare, ExternalLink, ListChecks, Loader2, Sparkles, Square } from "lucide-react";
 
@@ -44,9 +44,17 @@ export function MeetingActionItems({ teamSlug, noteId, todos, provider }: Meetin
   const [pushing, startPush] = useTransition();
   const [msg, setMsg] = useState<string | null>(null);
   const [results, setResults] = useState<Map<string, PushTaskResult>>(new Map());
+  const [pushedProvider, setPushedProvider] = useState<string | null>(null);
+  const [selected, setSelected] = useState<Set<string>>(() => new Set(todos.filter((t) => !t.pushed).map((t) => t.taskId)));
 
-  const pushable = useMemo(() => todos.filter((t) => !t.pushed), [todos]);
-  const [selected, setSelected] = useState<Set<string>>(() => new Set(pushable.map((t) => t.taskId)));
+  // A task counts as pushed if the server already recorded it OR we pushed it this session — so the
+  // UI reflects a push immediately, WITHOUT a router.refresh() (which would re-render the whole route).
+  function pushedInfo(t: ActionItemView): { provider: string; url: string } | null {
+    if (t.pushed) return t.pushed;
+    const r = results.get(t.taskId);
+    return r && r.url && r.status !== "failed" ? { provider: pushedProvider ?? provider ?? "", url: r.url } : null;
+  }
+  const pushable = todos.filter((t) => !pushedInfo(t));
 
   function toggle(taskId: string) {
     setSelected((prev) => {
@@ -78,14 +86,17 @@ export function MeetingActionItems({ teamSlug, noteId, todos, provider }: Meetin
     startPush(async () => {
       const res = await pushMeetingTasksAction(teamSlug, noteId, ids);
       if (!res.ok) return setMsg(res.error ?? "push failed");
-      const byId = new Map((res.results ?? []).map((r) => [r.taskId, r]));
-      setResults(byId);
-      const synced = (res.results ?? []).filter((r) => r.status === "synced" || r.status === "skipped").length;
-      const failed = (res.results ?? []).filter((r) => r.status === "failed").length;
+      const list = res.results ?? [];
+      // Merge the returned results into local state — the render marks these pushed from here, so no
+      // router.refresh() (2nd round-trip + full-route re-render) is needed to show the new status.
+      setResults((prev) => new Map([...prev, ...list.map((r) => [r.taskId, r] as const)]));
+      setPushedProvider(res.provider ?? provider ?? null);
+      const doneIds = new Set(list.filter((r) => r.status === "synced" || r.status === "skipped").map((r) => r.taskId));
+      setSelected((prev) => new Set([...prev].filter((id) => !doneIds.has(id)))); // drop pushed from selection
+      const failed = list.filter((r) => r.status === "failed").length;
       setMsg(
-        `Sent ${synced} to ${providerLabel(res.provider ?? provider)}${failed ? ` · ${failed} failed` : ""}.`
+        `Sent ${doneIds.size} to ${providerLabel(res.provider ?? provider)}${failed ? ` · ${failed} failed` : ""}.`
       );
-      router.refresh();
     });
   }
 
@@ -120,10 +131,11 @@ export function MeetingActionItems({ teamSlug, noteId, todos, provider }: Meetin
           <ul className="flex flex-col gap-1.5">
             {todos.map((t) => {
               const result = results.get(t.taskId);
+              const pushed = pushedInfo(t);
               const isSelected = selected.has(t.taskId);
               return (
                 <li key={t.taskId} className="flex items-start gap-2 text-sm">
-                  {t.pushed ? (
+                  {pushed ? (
                     <CheckSquare className="mt-0.5 size-4 shrink-0 text-emerald-500" />
                   ) : (
                     <button
@@ -145,28 +157,18 @@ export function MeetingActionItems({ teamSlug, noteId, todos, provider }: Meetin
                     <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-ink-tertiary">
                       {t.assignee ? <span>{t.assignee}</span> : null}
                       {t.due ? <span>· due {t.due}</span> : null}
-                      {t.pushed ? (
+                      {pushed ? (
                         <a
-                          href={t.pushed.url}
+                          href={pushed.url}
                           target="_blank"
                           rel="noreferrer"
                           className="inline-flex items-center gap-0.5 text-violet hover:underline"
                         >
-                          in {providerLabel(t.pushed.provider)}
+                          in {providerLabel(pushed.provider)}
                           <ExternalLink className="size-3" />
                         </a>
                       ) : result?.status === "failed" ? (
                         <span className="text-rose-500">{result.error ?? "push failed"}</span>
-                      ) : result?.url ? (
-                        <a
-                          href={result.url}
-                          target="_blank"
-                          rel="noreferrer"
-                          className="inline-flex items-center gap-0.5 text-violet hover:underline"
-                        >
-                          pushed
-                          <ExternalLink className="size-3" />
-                        </a>
                       ) : null}
                     </div>
                   </div>

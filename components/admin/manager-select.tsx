@@ -1,7 +1,6 @@
 "use client";
 
 import { useState, useTransition } from "react";
-import { useRouter } from "next/navigation";
 import { setMemberManager } from "@/app/t/[team]/admin/members/actions";
 
 /**
@@ -21,7 +20,6 @@ export function ManagerSelect({
   managerMemberId: string | null;
   candidates: { id: string; displayName: string }[];
 }) {
-  const router = useRouter();
   const [pending, startTransition] = useTransition();
   const [value, setValue] = useState<string>(managerMemberId ?? "");
   const [error, setError] = useState<string | null>(null);
@@ -29,16 +27,16 @@ export function ManagerSelect({
   function change(next: string) {
     if (next === value) return;
     const prev = value;
-    setValue(next);
+    setValue(next); // optimistic: reflect the new manager instantly
     setError(null);
     startTransition(async () => {
       const res = await setMemberManager(teamSlug, memberId, next || null);
+      // No router.refresh(): this select is the only surface showing the assignment on the page
+      // (the company-graph is rebuilt server-side on read, not from a page re-render).
       if (!res.ok) {
-        setValue(prev);
+        setValue(prev); // revert on server rejection (self / cross-team / disabled / connector)
         setError(res.error ?? "could not set manager");
-        return;
       }
-      router.refresh();
     });
   }
 
