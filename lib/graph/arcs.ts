@@ -1,6 +1,7 @@
 import "server-only";
 import { createHash } from "node:crypto";
-import Anthropic from "@anthropic-ai/sdk";
+import { completeTextOrNull } from "@/lib/llm/complete";
+import type { LlmBackendKeys } from "@/lib/query/llm-backend";
 import type { DbClient } from "@/lib/db/types";
 import { adminClient } from "@/lib/db/admin";
 import { recentFacts, resolveEpisodeItems, type AtomicFact } from "./learning";
@@ -44,14 +45,9 @@ export interface ArcCorrection {
   corrected_text: string;
 }
 
-export interface ProviderKeys {
-  openaiKey?: string | null;
-  anthropicKey?: string | null;
-}
+/** Full backend keys — resolve via `lib/query/answering.resolveAnsweringKeys` at the call site. */
+export type ProviderKeys = LlmBackendKeys;
 
-const LLM_BASE_URL = process.env.LLM_BASE_URL;
-const LLM_MODEL = process.env.LLM_MODEL ?? "gpt-4o";
-const ANTHROPIC_MODEL = process.env.ARCS_ANTHROPIC_MODEL ?? "claude-sonnet-5";
 const WINDOW_DAYS = 7;
 const MAX_FACTS = 200;
 const CACHE_TTL_MS = 10 * 60_000;
@@ -188,60 +184,14 @@ function extractJsonObject(raw: string): string {
 }
 
 /** Ask the configured LLM for the raw arcs JSON; null on any transport failure (best-effort — an LLM
- *  outage or a stale model id must degrade to "no arcs" instead of failing the whole request). */
+ *  outage or a stale model id must degrade to "no arcs" instead of failing the whole request). Routes
+ *  through the shared settings-aware primitive, so arcs honor the team's answering-provider (incl.
+ *  OpenRouter) exactly like the Query box. */
 async function callLLMRaw(userContent: string, keys: ProviderKeys): Promise<string | null> {
-  try {
-    return LLM_BASE_URL
-      ? await callOpenAICompatible(userContent, keys.openaiKey)
-      : await callAnthropic(userContent, keys.anthropicKey);
-  } catch (err) {
-    console.error("[arcs] LLM call failed:", err instanceof Error ? err.message : err);
-    return null;
-  }
-}
-
-async function callOpenAICompatible(userContent: string, apiKey?: string | null): Promise<string | null> {
-  const res = await fetch(`${LLM_BASE_URL!.replace(/\/$/, "")}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey ?? process.env.OPENAI_API_KEY ?? "local"}`,
-    },
-    body: JSON.stringify({
-      model: LLM_MODEL,
-      response_format: { type: "json_object" },
-      messages: [
-        { role: "system", content: SYSTEM_PROMPT },
-        { role: "user", content: userContent },
-      ],
-    }),
-  });
-  if (!res.ok) {
-    // Silent before this fix: a down/misconfigured LLM_BASE_URL endpoint (Ollama/local model —
-    // a first-class deployment option, see docs/PROVIDERS.md) degraded to "no arcs" with NO trace
-    // anywhere, indistinguishable from every other empty-arcs cause. Log the actual HTTP status +
-    // body so this is diagnosable instead of silent.
-    const body = await res.text().catch(() => "");
-    console.error(
-      `[arcs] LLM_BASE_URL call failed: ${res.status} ${res.statusText} —`,
-      body.slice(0, 300)
-    );
-    return null;
-  }
-  const data = (await res.json()) as { choices?: { message?: { content?: string } }[] };
-  return data.choices?.[0]?.message?.content ?? null;
-}
-
-async function callAnthropic(userContent: string, apiKey?: string | null): Promise<string | null> {
-  const client = new Anthropic(apiKey ? { apiKey } : undefined);
-  const msg = await client.messages.create({
-    model: ANTHROPIC_MODEL,
-    max_tokens: 2048,
-    system: SYSTEM_PROMPT,
-    messages: [{ role: "user", content: `${userContent}\n\nReturn ONLY the JSON object.` }],
-  });
-  const block = msg.content.find((b) => b.type === "text");
-  return block && block.type === "text" ? block.text : null;
+  return completeTextOrNull(
+    { system: SYSTEM_PROMPT, prompt: userContent },
+    { keys, jsonObject: true, maxTokens: 2048 }
+  );
 }
 
 /**

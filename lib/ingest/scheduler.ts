@@ -208,15 +208,12 @@ export function startIngestScheduler(): void {
   async function runMeetingNotesBackfill(db: ReturnType<typeof adminClient>): Promise<void> {
     try {
       const { backfillMeetingNotesFromItems } = await import("@/lib/meetings/from-items");
-      const { getProviderKey } = await import("@/lib/integrations/manage");
+      const { resolveAnsweringKeys } = await import("@/lib/query/answering");
       const { data: teams } = await db.from("teams").select("id");
       for (const t of ((teams ?? []) as { id: string }[])) {
         try {
-          const [openaiKey, anthropicKey] = await Promise.all([
-            getProviderKey(db, t.id, "openai"),
-            getProviderKey(db, t.id, "anthropic"),
-          ]);
-          const s = await backfillMeetingNotesFromItems(db, t.id, { keys: { openaiKey, anthropicKey } });
+          const keys = await resolveAnsweringKeys(db, t.id);
+          const s = await backfillMeetingNotesFromItems(db, t.id, { keys });
           if (s.created) console.info(`[ingest] meeting-notes: created ${s.created} for team ${t.id}`);
         } catch (err) {
           console.error(`[ingest] meeting-notes backfill (team ${t.id}) failed:`, err instanceof Error ? err.message : err);
