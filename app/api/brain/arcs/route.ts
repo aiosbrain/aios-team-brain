@@ -4,7 +4,7 @@ import { serverClient } from "@/lib/db/server";
 import { adminClient } from "@/lib/db/admin";
 import { getSessionUser } from "@/lib/auth/session";
 import { errorResponse } from "@/lib/api/schemas";
-import { getProviderKey } from "@/lib/integrations/manage";
+import { resolveAnsweringKeys } from "@/lib/query/answering";
 import { visibleGroupIds } from "@/lib/graph/group";
 import { getArcs } from "@/lib/graph/arcs";
 
@@ -41,14 +41,8 @@ export async function POST(req: NextRequest) {
 
   const tier = (me as { tier: "team" | "external" }).tier;
   const admin = adminClient();
-  const [openaiKey, anthropicKey] = await Promise.all([
-    getProviderKey(admin, team.id, "openai"),
-    getProviderKey(admin, team.id, "anthropic"),
-  ]);
-  const arcs = await getArcs(admin, team.id, teamSlug, tier, visibleGroupIds(teamSlug, tier), {
-    openaiKey,
-    anthropicKey,
-  });
+  const keys = await resolveAnsweringKeys(admin, team.id);
+  const arcs = await getArcs(admin, team.id, teamSlug, tier, visibleGroupIds(teamSlug, tier), keys);
 
   return Response.json({ arcs, as_of: new Date().toISOString() });
 }

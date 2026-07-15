@@ -3,7 +3,7 @@
 import { revalidatePath } from "next/cache";
 import { adminClient } from "@/lib/db/admin";
 import { requireTeamAdmin as requireAdmin } from "@/lib/auth/guard";
-import { getProviderKey } from "@/lib/integrations/manage";
+import { resolveAnsweringKeys } from "@/lib/query/answering";
 import { visibleGroupIds } from "@/lib/graph/group";
 import { discoverOpportunities } from "@/lib/social/discover";
 import { discoverOpportunitiesFromArcs } from "@/lib/social/discover-arcs";
@@ -42,12 +42,9 @@ export async function discoverFromArcsNow(teamSlug: string): Promise<DiscoverRes
   if (!ctx) return { ok: false, error: "admins only" };
   try {
     const db = adminClient();
-    const [openaiKey, anthropicKey] = await Promise.all([
-      getProviderKey(db, ctx.teamId, "openai"),
-      getProviderKey(db, ctx.teamId, "anthropic"),
-    ]);
+    const keys = await resolveAnsweringKeys(db, ctx.teamId);
     const groups = visibleGroupIds(teamSlug, "team");
-    const s = await discoverOpportunitiesFromArcs(db, ctx.teamId, teamSlug, "team", groups, { openaiKey, anthropicKey }, {
+    const s = await discoverOpportunitiesFromArcs(db, ctx.teamId, teamSlug, "team", groups, keys, {
       actor: { memberId: ctx.memberId },
     });
     revalidatePath(`/t/${teamSlug}/social`);

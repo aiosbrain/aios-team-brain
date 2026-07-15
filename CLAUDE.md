@@ -107,6 +107,19 @@ is therefore a **standing invariant** that the app code must guarantee on every 
   (Postgres on Railway). LLM/reranker are provider-configurable (`docs/PROVIDERS.md`).
 - **Sidecar:** `ingestion/` — Python connector service (LlamaHub/Unstructured), HTTP-only to the brain.
 
+> **LLM routing convention (REQUIRED).** Never hardcode or pick an LLM provider/model inside a feature.
+> Every text-**generation** task (Q&A, chat titles, meeting summary/attendee/action-item extraction,
+> narrative arcs, social content, …) MUST go through the shared settings-aware primitive
+> **`lib/llm/complete.ts`** (`completeText` / `completeTextOrNull`), with keys resolved via
+> **`lib/query/answering.resolveAnsweringKeys`** and the backend chosen by **`selectLlmBackend`**. Do
+> **not** open an Anthropic client, POST to `/chat/completions`, or read `LLM_BASE_URL`/model env
+> directly in a feature — that bypasses the team's one global switch (**Admin → Active answering
+> model** = `teams.answering_provider`, incl. OpenRouter) and silently pins a provider. The only
+> sanctioned raw-transport files are `lib/llm/complete.ts`, the streaming answer path
+> `lib/query/claude.ts`, and the cheap-title path `lib/chat/title.ts`; this is build-enforced by
+> `test/guards/llm-single-caller.test.ts`. Embeddings / image generation / reranker are a **different
+> model class** with their own config (`getProviderKey`/env) and are intentionally outside this path.
+
 ```bash
 npm run dev            # next dev
 npm test               # vitest (unit tier)

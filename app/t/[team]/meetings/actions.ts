@@ -6,7 +6,7 @@ import { z } from "zod";
 import { serverClient } from "@/lib/db/server";
 import { adminClient } from "@/lib/db/admin";
 import { currentMember } from "@/lib/auth/guard";
-import { getProviderKey } from "@/lib/integrations/manage";
+import { resolveAnsweringKeys } from "@/lib/query/answering";
 import {
   createMeetingNote,
   canSeeMeetingNotes,
@@ -63,17 +63,16 @@ export async function uploadMeetingNoteAction(
   if (!canSeeMeetingNotes(me.tier)) return { ok: false, error: "team-tier membership required" };
 
   const admin = adminClient();
-  const [{ data: rosterRows }, openaiKey, anthropicKey] = await Promise.all([
+  const [{ data: rosterRows }, keys] = await Promise.all([
     admin.from("members").select("id, display_name").eq("team_id", team.id).eq("status", "active"),
-    getProviderKey(admin, team.id, "openai"),
-    getProviderKey(admin, team.id, "anthropic"),
+    resolveAnsweringKeys(admin, team.id),
   ]);
   const roster: RosterPerson[] = ((rosterRows ?? []) as { id: string; display_name: string }[]).map((m) => ({
     id: m.id,
     displayName: m.display_name,
   }));
 
-  const extraction = await extractFromTranscript(parsed.data.rawText, roster, { openaiKey, anthropicKey });
+  const extraction = await extractFromTranscript(parsed.data.rawText, roster, keys);
 
   // Duplicate detection: if this is the same meeting someone already uploaded (same date + enough
   // content overlap), merge the transcripts into that note and credit both submitters instead of
@@ -86,7 +85,7 @@ export async function uploadMeetingNoteAction(
         newSubmitterId: me.id,
         newAttendeeIds: extraction.attendeeMemberIds,
         roster,
-        keys: { openaiKey, anthropicKey },
+        keys,
       });
       revalidatePath(`/t/${team.slug}/meetings`);
       return { ok: true, id: mergedNoteId, merged: true };
@@ -123,7 +122,7 @@ export async function uploadMeetingNoteAction(
       const { data: item } = await admin.from("items").select("id, path, access").eq("id", sourceItemId).maybeSingle();
       const itemRow = item as { id: string; path: string; access: "team" | "external" } | null;
       if (itemRow) {
-        await extractAndStoreActionItems(admin, team.id, itemRow, parsed.data.rawText, roster, { openaiKey, anthropicKey });
+        await extractAndStoreActionItems(admin, team.id, itemRow, parsed.data.rawText, roster, keys);
       }
     }
   } catch {
@@ -150,12 +149,9 @@ export async function importPushedMeetingsAction(
   if (!canSeeMeetingNotes(me.tier)) return { ok: false, error: "team-tier membership required" };
 
   const admin = adminClient();
-  const [openaiKey, anthropicKey] = await Promise.all([
-    getProviderKey(admin, team.id, "openai"),
-    getProviderKey(admin, team.id, "anthropic"),
-  ]);
+  const keys = await resolveAnsweringKeys(admin, team.id);
   try {
-    const s = await backfillMeetingNotesFromItems(admin, team.id, { keys: { openaiKey, anthropicKey } });
+    const s = await backfillMeetingNotesFromItems(admin, team.id, { keys });
     revalidatePath(`/t/${team.slug}/meetings`);
     return { ok: true, created: s.created, scanned: s.scanned };
   } catch (e) {
@@ -207,10 +203,9 @@ export async function extractMeetingActionItemsAction(
   const itemRow = item as { id: string; path: string; access: "team" | "external" } | null;
   if (!itemRow) return { ok: false, error: "transcript item not found" };
 
-  const [{ data: rosterRows }, openaiKey, anthropicKey] = await Promise.all([
+  const [{ data: rosterRows }, keys] = await Promise.all([
     admin.from("members").select("id, display_name").eq("team_id", team.id).eq("status", "active"),
-    getProviderKey(admin, team.id, "openai"),
-    getProviderKey(admin, team.id, "anthropic"),
+    resolveAnsweringKeys(admin, team.id),
   ]);
   const roster: RosterPerson[] = ((rosterRows ?? []) as { id: string; display_name: string }[]).map((m) => ({
     id: m.id,
@@ -224,7 +219,7 @@ export async function extractMeetingActionItemsAction(
       itemRow,
       note.rawText,
       roster,
-      { openaiKey, anthropicKey }
+      keys
     );
     revalidatePath(`/t/${team.slug}/meetings/${noteId}`);
     return { ok: true, extracted };
@@ -253,17 +248,16 @@ export async function regenerateMeetingSummaryAction(
   const note = await getMeetingNote(admin, team.id, noteId, me.tier);
   if (!note) return { ok: false, error: "meeting note not found" };
 
-  const [{ data: rosterRows }, openaiKey, anthropicKey] = await Promise.all([
+  const [{ data: rosterRows }, keys] = await Promise.all([
     admin.from("members").select("id, display_name").eq("team_id", team.id).eq("status", "active"),
-    getProviderKey(admin, team.id, "openai"),
-    getProviderKey(admin, team.id, "anthropic"),
+    resolveAnsweringKeys(admin, team.id),
   ]);
   const roster: RosterPerson[] = ((rosterRows ?? []) as { id: string; display_name: string }[]).map((m) => ({
     id: m.id,
     displayName: m.display_name,
   }));
 
-  const ex = await extractFromTranscript(note.rawText, roster, { openaiKey, anthropicKey });
+  const ex = await extractFromTranscript(note.rawText, roster, keys);
   if (!ex.summary.trim()) return { ok: false, error: "could not regenerate summary (LLM unavailable)" };
 
   try {

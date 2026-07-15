@@ -1,18 +1,17 @@
 import "server-only";
-import Anthropic from "@anthropic-ai/sdk";
+import { completeTextOrNull } from "@/lib/llm/complete";
+import type { LlmBackendKeys } from "@/lib/query/llm-backend";
 
 /**
  * LLM-assisted meeting-note parsing: a short summary + which roster members were likely present,
- * inferred from the transcript text. Mirrors lib/graph/arcs.ts's provider pattern exactly
- * (OpenAI-compatible `chat/completions` when LLM_BASE_URL is set, else Anthropic Messages API) —
- * see that file for the rationale. Never throws: any transport failure or unparseable response
- * degrades to "no summary, no attendees" so an upload never fails because the LLM is unavailable.
+ * inferred from the transcript text. Routes through the shared, settings-aware `lib/llm/complete`
+ * primitive, so it honors the team's answering-provider setting (incl. OpenRouter) exactly like the
+ * Query box. Never throws: any transport failure or unparseable response degrades to "no summary,
+ * no attendees" so an upload never fails because the LLM is unavailable.
  */
 
-export interface ProviderKeys {
-  openaiKey?: string | null;
-  anthropicKey?: string | null;
-}
+/** Full backend keys — resolve via `lib/query/answering.resolveAnsweringKeys` at the call site. */
+export type ProviderKeys = LlmBackendKeys;
 
 export interface RosterPerson {
   id: string;
@@ -24,9 +23,6 @@ export interface TranscriptExtraction {
   attendeeMemberIds: string[];
 }
 
-const LLM_BASE_URL = process.env.LLM_BASE_URL;
-const LLM_MODEL = process.env.LLM_MODEL ?? "gpt-4o";
-const ANTHROPIC_MODEL = process.env.MEETINGS_ANTHROPIC_MODEL ?? "claude-sonnet-5";
 // Keep the prompt bounded — a meeting transcript can be very long, and this is a one-shot
 // summary/attendee pass, not a full-fidelity read (the full text is still stored verbatim in
 // `items` regardless of what the LLM sees).
@@ -52,60 +48,13 @@ export function extractJsonObject(raw: string): string {
   return start !== -1 && end !== -1 && end > start ? body.slice(start, end + 1) : body;
 }
 
-async function callOpenAICompatible(system: string, userContent: string, apiKey?: string | null): Promise<string | null> {
-  const res = await fetch(`${LLM_BASE_URL!.replace(/\/$/, "")}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey ?? process.env.OPENAI_API_KEY ?? "local"}`,
-    },
-    body: JSON.stringify({
-      model: LLM_MODEL,
-      response_format: { type: "json_object" },
-      messages: [
-        { role: "system", content: system },
-        { role: "user", content: userContent },
-      ],
-    }),
-  });
-  if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    console.error(
-      `[meetings] LLM_BASE_URL call failed: ${res.status} ${res.statusText} —`,
-      body.slice(0, 300)
-    );
-    return null;
-  }
-  const data = (await res.json()) as { choices?: { message?: { content?: string } }[] };
-  return data.choices?.[0]?.message?.content ?? null;
-}
-
-async function callAnthropic(system: string, userContent: string, apiKey?: string | null): Promise<string | null> {
-  const client = new Anthropic(apiKey ? { apiKey } : undefined);
-  const msg = await client.messages.create({
-    model: ANTHROPIC_MODEL,
-    max_tokens: 1024,
-    system,
-    messages: [{ role: "user", content: `${userContent}\n\nReturn ONLY the JSON object.` }],
-  });
-  const block = msg.content.find((b) => b.type === "text");
-  return block && block.type === "text" ? block.text : null;
-}
-
 /**
- * Shared best-effort transport for the meetings LLM passes (summary/attendees AND action items):
- * OpenAI-compatible `chat/completions` when LLM_BASE_URL is set, else the Anthropic Messages API.
- * Never throws — any transport failure returns null so a caller degrades gracefully.
+ * Best-effort JSON completion for the meetings LLM passes (summary/attendees AND action items),
+ * through the shared settings-aware primitive. Never throws — any transport failure returns null so
+ * a caller degrades gracefully.
  */
 export async function callMeetingsLLM(system: string, userContent: string, keys: ProviderKeys): Promise<string | null> {
-  try {
-    return LLM_BASE_URL
-      ? await callOpenAICompatible(system, userContent, keys.openaiKey)
-      : await callAnthropic(system, userContent, keys.anthropicKey);
-  } catch (err) {
-    console.error("[meetings] LLM call failed:", err instanceof Error ? err.message : err);
-    return null;
-  }
+  return completeTextOrNull({ system, prompt: userContent }, { keys, jsonObject: true, maxTokens: 1024 });
 }
 
 /** Normalize a name for tolerant matching: lowercase, collapse whitespace, drop punctuation. */
