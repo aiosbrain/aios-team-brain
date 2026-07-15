@@ -143,7 +143,7 @@ describe("scopeQueryLog", () => {
   });
 });
 
-describe("unknown/missing tier — inconsistent default across the choke-point (documented current behavior)", () => {
+describe("unknown/missing tier — fail-closed across the choke-point", () => {
   // `ViewerTier` is typed as the closed union "team" | "external", so a correctly-typed caller
   // can never construct anything else. But every one of these functions is a plain runtime
   // string check, and the real call sites feed them a DB-sourced or request-derived value cast
@@ -151,51 +151,63 @@ describe("unknown/missing tier — inconsistent default across the choke-point (
   // `auth.memberTier` off an API key row) — nothing stops a corrupt/legacy/typo'd tier value from
   // reaching these functions at the type boundary.
   //
-  // The six functions do NOT agree on a default for an unrecognized tier:
-  //   - visibleItems / visibleDecisions / visibleTasks / visibleByAccess check `tier !== "external"`
-  //     — an ALLOW-list of exactly one restricted value. Any other string ("admin", "", "TEAM", a
-  //     future tier nobody's added a branch for) falls through to the UNFILTERED branch: fail-OPEN.
-  //   - canSeeAccess checks `tier === "team"` — a DENY-by-default for team-tier content; an
-  //     unrecognized tier only sees rows explicitly marked `access === "external"`: fail-CLOSED.
-  // This suite documents the behavior as-is (not asserted as correct or incorrect) — see the PR
-  // description's "surprising" note on this asymmetry.
-  const unknownTiers = ["admin", "", "TEAM", "external ", "unknown"] as unknown as ViewerTier[];
-
-  it.each(unknownTiers)("visibleItems treats tier=%j as unrestricted (fail-open)", (tier) => {
-    const q = fakeQuery();
-    visibleItems(q, tier);
-    expect(q.calls).toEqual([]); // no filter applied — full visibility granted
-  });
-
-  it.each(unknownTiers)("visibleDecisions treats tier=%j as unrestricted (fail-open)", (tier) => {
-    const q = fakeQuery();
-    visibleDecisions(q, tier);
-    expect(q.calls).toEqual([]);
-  });
-
-  it.each(unknownTiers)("visibleTasks treats tier=%j as unrestricted (fail-open)", (tier) => {
-    const q = fakeQuery();
-    visibleTasks(q, tier);
-    expect(q.calls).toEqual([]);
-  });
-
-  it.each(unknownTiers)("visibleByAccess treats tier=%j as unrestricted (fail-open)", (tier) => {
-    const q = fakeQuery();
-    visibleByAccess(q, tier);
-    expect(q.calls).toEqual([]);
-  });
+  // Only the exact runtime value `team` is trusted with an unfiltered query. Corrupt, legacy,
+  // mistyped, or future tiers receive external-only visibility, matching canSeeAccess.
+  const unknownTiers = [
+    "admin",
+    "",
+    "TEAM",
+    "external ",
+    "unknown",
+  ] as unknown as ViewerTier[];
 
   it.each(unknownTiers)(
-    "canSeeAccess(tier=%j, 'team') denies team-tier content (fail-closed — inconsistent with the visibleX family above)",
+    "visibleItems filters tier=%j to external rows",
+    (tier) => {
+      const q = fakeQuery();
+      visibleItems(q, tier);
+      expect(q.calls).toEqual([{ column: "access", value: "external" }]);
+    },
+  );
+
+  it.each(unknownTiers)(
+    "visibleDecisions filters tier=%j to external rows",
+    (tier) => {
+      const q = fakeQuery();
+      visibleDecisions(q, tier);
+      expect(q.calls).toEqual([{ column: "audience", value: "external" }]);
+    },
+  );
+
+  it.each(unknownTiers)(
+    "visibleTasks filters tier=%j to external rows",
+    (tier) => {
+      const q = fakeQuery();
+      visibleTasks(q, tier);
+      expect(q.calls).toEqual([{ column: "audience", value: "external" }]);
+    },
+  );
+
+  it.each(unknownTiers)(
+    "visibleByAccess filters tier=%j to external rows",
+    (tier) => {
+      const q = fakeQuery();
+      visibleByAccess(q, tier);
+      expect(q.calls).toEqual([{ column: "access", value: "external" }]);
+    },
+  );
+
+  it.each(unknownTiers)(
+    "canSeeAccess(tier=%j, 'team') denies team-tier content",
     (tier) => {
       expect(canSeeAccess(tier, "team")).toBe(false);
-    }
+    },
   );
 
   it.each(unknownTiers)(
     "canSeeAccess(tier=%j, 'external') still grants external-access content regardless of tier (by design — external content is universally readable)",
     (tier) => {
       expect(canSeeAccess(tier, "external")).toBe(true);
-    }
+    },
   );
 });
