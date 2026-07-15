@@ -229,6 +229,12 @@ export async function addMeetingNoteAttendees(admin: DbClient, noteId: string, m
   if (error) throw new Error(`meeting note attendees insert failed: ${error.message}`);
 }
 
+/** Point a duplicate note at the survivor it was merged into (hides it from the list). */
+export async function setMeetingNoteMergedInto(admin: DbClient, noteId: string, targetNoteId: string): Promise<void> {
+  const { error } = await admin.from("meeting_notes").update({ merged_into: targetNoteId }).eq("id", noteId);
+  if (error) throw new Error(`meeting note merged_into update failed: ${error.message}`);
+}
+
 /** Replace a note's summary (e.g. after a "regenerate summary" pass). Single writer for the column. */
 export async function updateMeetingSummary(
   admin: DbClient,
@@ -303,6 +309,7 @@ export async function listMeetingNotesForTeam(
     .from("meeting_notes")
     .select("id, source_item_id, submitted_by, title, summary, occurred_at, created_at")
     .eq("team_id", teamId)
+    .is("merged_into", null) // hide notes that were merged into another (deduped)
     .order("created_at", { ascending: false })
     .limit(200);
   const rows = (notes ?? []) as NoteRow[];
