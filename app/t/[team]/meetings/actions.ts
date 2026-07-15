@@ -11,6 +11,7 @@ import {
   createMeetingNote,
   canSeeMeetingNotes,
   getMeetingNote,
+  updateMeetingSummary,
   MEETING_NOTES_PROJECT_SLUG,
 } from "@/lib/meetings/notes";
 import { extractFromTranscript, type RosterPerson } from "@/lib/meetings/llm-extract";
@@ -200,6 +201,48 @@ export async function extractMeetingActionItemsAction(
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "extraction failed" };
   }
+}
+
+/**
+ * Re-run the LLM summary pass on an existing note and replace its summary — so older meetings with a
+ * prose paragraph can be refreshed to the new detailed bulleted format. Team-tier only; best-effort
+ * (a failed LLM call leaves the existing summary untouched).
+ */
+export async function regenerateMeetingSummaryAction(
+  teamSlug: string,
+  noteId: string
+): Promise<{ ok: boolean; error?: string }> {
+  const team = await resolveTeam(teamSlug);
+  if (!team) return { ok: false, error: "team not found" };
+
+  const me = await currentMember(team.id);
+  if (!me) return { ok: false, error: "not a member of this team" };
+  if (!canSeeMeetingNotes(me.tier)) return { ok: false, error: "team-tier membership required" };
+
+  const admin = adminClient();
+  const note = await getMeetingNote(admin, team.id, noteId, me.tier);
+  if (!note) return { ok: false, error: "meeting note not found" };
+
+  const [{ data: rosterRows }, openaiKey, anthropicKey] = await Promise.all([
+    admin.from("members").select("id, display_name").eq("team_id", team.id).eq("status", "active"),
+    getProviderKey(admin, team.id, "openai"),
+    getProviderKey(admin, team.id, "anthropic"),
+  ]);
+  const roster: RosterPerson[] = ((rosterRows ?? []) as { id: string; display_name: string }[]).map((m) => ({
+    id: m.id,
+    displayName: m.display_name,
+  }));
+
+  const ex = await extractFromTranscript(note.rawText, roster, { openaiKey, anthropicKey });
+  if (!ex.summary.trim()) return { ok: false, error: "could not regenerate summary (LLM unavailable)" };
+
+  try {
+    await updateMeetingSummary(admin, team.id, noteId, ex.summary);
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "could not save summary" };
+  }
+  revalidatePath(`/t/${team.slug}/meetings/${noteId}`);
+  return { ok: true };
 }
 
 export interface PushTaskResult {

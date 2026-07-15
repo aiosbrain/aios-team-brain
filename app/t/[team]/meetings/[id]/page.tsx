@@ -60,6 +60,8 @@ export default async function MeetingNotePage({
       </div>
 
       <MeetingDetailTabs
+        teamSlug={teamSlug}
+        noteId={note.id}
         summary={note.summary}
         rawText={note.rawText}
         actionItems={
