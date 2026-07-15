@@ -12,14 +12,10 @@ import {
   canSeeMeetingNotes,
   getMeetingNote,
   updateMeetingSummary,
-  MEETING_NOTES_PROJECT_SLUG,
 } from "@/lib/meetings/notes";
 import { extractFromTranscript, type RosterPerson } from "@/lib/meetings/llm-extract";
 import { extractAndStoreActionItems } from "@/lib/meetings/action-items";
-import {
-  extractMeetingTodosForTeam,
-  MEETING_TODO_PROJECT_SLUG,
-} from "@/lib/meetings/extract-todos";
+import { MEETING_TODO_PROJECT_SLUG } from "@/lib/meetings/extract-todos";
 import { backfillMeetingNotesFromItems } from "@/lib/meetings/from-items";
 import {
   projectRows,
@@ -48,8 +44,9 @@ async function resolveTeam(teamSlug: string): Promise<{ id: string; slug: string
 /**
  * Upload a meeting transcript: resolves the submitter + team roster, runs the LLM
  * summary/attendee pass (best-effort — never blocks the upload, see lib/meetings/llm-extract),
- * writes the note via the single writer, then auto-extracts todo items scoped to just this note's
- * transcript. Team-tier only, matching lib/meetings/notes.canSeeMeetingNotes.
+ * writes the note via the single writer, then auto-extracts action items with the SAME LLM-first
+ * extractor the CLI/import path uses (`extractAndStoreActionItems`) — so prose commitments ("Alex
+ * will send the deck Friday") are caught, not just checkbox-style todos. Team-tier only.
  */
 export async function uploadMeetingNoteAction(
   input: z.input<typeof uploadSchema>
@@ -92,12 +89,24 @@ export async function uploadMeetingNoteAction(
   }
 
   try {
-    await extractMeetingTodosForTeam(admin, team.id, {
-      sourceProject: MEETING_NOTES_PROJECT_SLUG,
-      pathPrefix: `meetings/${noteId}`,
-    });
+    // Resolve the just-ingested transcript item so we can materialize its action items (LLM-first,
+    // same as the CLI import path). Best-effort — the note itself already saved.
+    const { data: nr } = await admin
+      .from("meeting_notes")
+      .select("source_item_id")
+      .eq("team_id", team.id)
+      .eq("id", noteId)
+      .maybeSingle();
+    const sourceItemId = (nr as { source_item_id: string } | null)?.source_item_id;
+    if (sourceItemId) {
+      const { data: item } = await admin.from("items").select("id, path, access").eq("id", sourceItemId).maybeSingle();
+      const itemRow = item as { id: string; path: string; access: "team" | "external" } | null;
+      if (itemRow) {
+        await extractAndStoreActionItems(admin, team.id, itemRow, parsed.data.rawText, roster, { openaiKey, anthropicKey });
+      }
+    }
   } catch {
-    // Todo extraction is best-effort — the note itself already saved successfully.
+    // Action-item extraction is best-effort — the note itself already saved successfully.
   }
 
   revalidatePath(`/t/${team.slug}/meetings`);
