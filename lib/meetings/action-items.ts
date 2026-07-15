@@ -1,7 +1,13 @@
 import "server-only";
 
+import type { DbClient } from "@/lib/db/types";
 import { callMeetingsLLM, extractJsonObject, type ProviderKeys, type RosterPerson } from "./llm-extract";
-import { extractTodosFromNotes, type ExtractedTodo } from "./extract-todos";
+import {
+  extractTodosFromNotes,
+  toExtractedTodoRows,
+  createMeetingTodoTasks,
+  type ExtractedTodo,
+} from "./extract-todos";
 
 /**
  * Pull concrete action items / follow-up tasks out of a meeting transcript. An LLM pass is the
@@ -94,4 +100,27 @@ export async function extractActionItems(
   // An empty LLM result on a transcript that clearly has checkbox todos would be a regression — fall
   // back to the markdown scanner so we never show fewer items than the deterministic path would.
   return items.length ? items : fallback();
+}
+
+/**
+ * Extract a transcript's action items and materialize them as tasks in the "Extracted from Meetings"
+ * project — the ONE place both the on-demand button (`extractMeetingActionItemsAction`) and the
+ * import/backfill path (`backfillMeetingNotesFromItems`) go through, so pushed meetings arrive with
+ * their action items already filled in rather than empty until someone clicks "extract". Idempotent
+ * (tasks upsert on a stable row_key). Returns the number of tasks materialized.
+ */
+export async function extractAndStoreActionItems(
+  db: DbClient,
+  teamId: string,
+  item: { id: string; path: string; access: "team" | "external" },
+  rawText: string,
+  roster: RosterPerson[],
+  keys: ProviderKeys,
+  // Injectable so the backfill/tests can stub the LLM step; defaults to the real extractor.
+  extract: (rawText: string, roster: RosterPerson[], keys: ProviderKeys) => Promise<ExtractedTodo[]> = extractActionItems
+): Promise<number> {
+  const todos = await extract(rawText, roster, keys);
+  const rows = toExtractedTodoRows(item, todos);
+  if (rows.length) await createMeetingTodoTasks(db, teamId, rows);
+  return rows.length;
 }

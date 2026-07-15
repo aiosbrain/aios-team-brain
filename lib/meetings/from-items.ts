@@ -1,6 +1,8 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { extractFromTranscript, type ProviderKeys, type RosterPerson } from "./llm-extract";
+import { extractAndStoreActionItems } from "./action-items";
+import type { ExtractedTodo } from "./extract-todos";
 import { createMeetingNoteFromItem } from "./notes";
 
 /**
@@ -66,6 +68,7 @@ export function deriveOccurredAt(frontmatter: Record<string, unknown> | null | u
 interface CandidateMeta {
   id: string;
   path: string;
+  access: "team" | "external";
   member_id: string | null;
   frontmatter: Record<string, unknown> | null;
 }
@@ -74,8 +77,10 @@ export interface BackfillOptions {
   keys?: ProviderKeys;
   /** Max items to process this run (default 50). */
   limit?: number;
-  /** Inject the extractor (tests avoid a real LLM). */
+  /** Inject the summary/attendee extractor (tests avoid a real LLM). */
   extract?: (rawText: string, roster: RosterPerson[]) => Promise<{ summary: string; attendeeMemberIds: string[] }>;
+  /** Inject the action-item extractor (tests avoid a real LLM). */
+  extractActionItems?: (rawText: string, roster: RosterPerson[], keys: ProviderKeys) => Promise<ExtractedTodo[]>;
 }
 
 export interface BackfillSummary {
@@ -105,7 +110,7 @@ export async function backfillMeetingNotesFromItems(
   // Candidate metadata only (no bodies — transcripts can be large). Filter to meeting sources here.
   const { data: rows } = await admin
     .from("items")
-    .select("id, path, member_id, frontmatter")
+    .select("id, path, access, member_id, frontmatter")
     .eq("team_id", teamId)
     .eq("kind", "transcript")
     .order("synced_at", { ascending: false })
@@ -148,8 +153,24 @@ export async function backfillMeetingNotesFromItems(
         submittedByMemberId: c.member_id,
         attendeeMemberIds: ex.attendeeMemberIds,
       });
-      if (res.created) summary.created++;
-      else summary.skipped++;
+      if (res.created) {
+        summary.created++;
+        // Pre-compute action items so a pushed meeting opens with its todos already filled in
+        // (not empty until someone clicks "extract"). Best-effort — never fail the note over it.
+        try {
+          await extractAndStoreActionItems(
+            admin,
+            teamId,
+            { id: c.id, path: c.path, access: c.access },
+            body,
+            roster,
+            opts.keys ?? {},
+            opts.extractActionItems
+          );
+        } catch {
+          // action-item extraction is a bonus on top of the saved note
+        }
+      } else summary.skipped++;
     } catch {
       summary.skipped++; // best-effort — one bad item never fails the batch
     }

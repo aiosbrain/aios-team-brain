@@ -14,11 +14,9 @@ import {
   MEETING_NOTES_PROJECT_SLUG,
 } from "@/lib/meetings/notes";
 import { extractFromTranscript, type RosterPerson } from "@/lib/meetings/llm-extract";
-import { extractActionItems } from "@/lib/meetings/action-items";
+import { extractAndStoreActionItems } from "@/lib/meetings/action-items";
 import {
   extractMeetingTodosForTeam,
-  toExtractedTodoRows,
-  createMeetingTodoTasks,
   MEETING_TODO_PROJECT_SLUG,
 } from "@/lib/meetings/extract-todos";
 import { backfillMeetingNotesFromItems } from "@/lib/meetings/from-items";
@@ -189,11 +187,16 @@ export async function extractMeetingActionItemsAction(
   }));
 
   try {
-    const todos = await extractActionItems(note.rawText, roster, { openaiKey, anthropicKey });
-    const rows = toExtractedTodoRows(itemRow, todos);
-    if (rows.length) await createMeetingTodoTasks(admin, team.id, rows);
+    const extracted = await extractAndStoreActionItems(
+      admin,
+      team.id,
+      itemRow,
+      note.rawText,
+      roster,
+      { openaiKey, anthropicKey }
+    );
     revalidatePath(`/t/${team.slug}/meetings/${noteId}`);
-    return { ok: true, extracted: rows.length };
+    return { ok: true, extracted };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "extraction failed" };
   }
