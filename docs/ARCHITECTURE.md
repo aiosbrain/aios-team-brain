@@ -530,9 +530,12 @@ guard enforces it, it's named.
   places, all verified on real PG: the retrieval path (`retrieve.ts`), the API routes (they
   re-apply the filter), and the dashboard reads (`app/t/[team]/*`) — which now route every
   `items` read through the **`lib/auth/visibility` choke-point** (`visibleItems`/`canSeeAccess`).
+  That choke-point grants an unfiltered query only to the exact runtime tier `team`; malformed,
+  missing, or future tier strings fail closed to external-only rows rather than inheriting team
+  visibility.
   _Guard:_ `test/guards/dashboard-tier-filter.test.ts` fails the build if a dashboard page reads
-  `items` without the choke-point. _Verified:_ `access-isolation` + `dashboard-visibility`
-  data-mechanics tests.
+  `items` without the choke-point. _Verified:_ `lib/auth/visibility.test.ts` plus the
+  `access-isolation` + `dashboard-visibility` data-mechanics tests.
   🟡 **Not yet built — within-team privacy.** The tier model is binary (`team`/`external`); a
   `team` member sees _all_ `team` content. "Private to a subset of the team" (e.g. an ingested
   private Slack thread hidden from other team members) needs a finer-grained ACL (per-member or

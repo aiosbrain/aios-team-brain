@@ -15,7 +15,7 @@ export type ViewerTier = "team" | "external";
  * recursive type doesn't trigger TS2589; the `.eq` shape is asserted by a localized cast.
  */
 export function visibleItems<Q>(query: Q, tier: ViewerTier): Q {
-  if (tier !== "external") return query;
+  if (tier === "team") return query;
   return (query as { eq(column: string, value: string): Q }).eq("access", "external");
 }
 
@@ -30,7 +30,7 @@ export function canSeeAccess(tier: ViewerTier, access: string): boolean {
  * rule as items on the postgres target (no RLS). Route dashboard decision reads through here.
  */
 export function visibleDecisions<Q>(query: Q, tier: ViewerTier): Q {
-  if (tier !== "external") return query;
+  if (tier === "team") return query;
   return (query as { eq(column: string, value: string): Q }).eq("audience", "external");
 }
 
@@ -41,7 +41,7 @@ export function visibleDecisions<Q>(query: Q, tier: ViewerTier): Q {
  * Route every tier-scoped task read (retrieval, the v1 pull API, dashboard boxes) through here.
  */
 export function visibleTasks<Q>(query: Q, tier: ViewerTier): Q {
-  if (tier !== "external") return query;
+  if (tier === "team") return query;
   return (query as { eq(column: string, value: string): Q }).eq("audience", "external");
 }
 
@@ -53,7 +53,7 @@ export function visibleTasks<Q>(query: Q, tier: ViewerTier): Q {
  * see team-sourced content. Route every tier-scoped Social read through here (no RLS backstop).
  */
 export function visibleByAccess<Q>(query: Q, tier: ViewerTier): Q {
-  if (tier !== "external") return query;
+  if (tier === "team") return query;
   return (query as { eq(column: string, value: string): Q }).eq("access", "external");
 }
 
