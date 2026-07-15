@@ -1,7 +1,6 @@
 "use client";
 
 import { useState, useTransition } from "react";
-import { useRouter } from "next/navigation";
 import { setMemberRole } from "@/app/t/[team]/admin/members/actions";
 
 type Role = "admin" | "lead" | "member";
@@ -26,7 +25,6 @@ export function MemberRoleSelect({
   memberId: string;
   role: Role;
 }) {
-  const router = useRouter();
   const [pending, startTransition] = useTransition();
   const [value, setValue] = useState<Role>(role);
   const [error, setError] = useState<string | null>(null);
@@ -34,16 +32,16 @@ export function MemberRoleSelect({
   function change(next: Role) {
     if (next === value) return;
     const prev = value;
-    setValue(next);
+    setValue(next); // optimistic: reflect the new role instantly
     setError(null);
     startTransition(async () => {
       const res = await setMemberRole(teamSlug, memberId, next);
+      // No router.refresh(): the select is the only surface showing role, and it's already updated.
+      // Skipping the full-route re-render (2nd round-trip + layout re-query) is what removes the lag.
       if (!res.ok) {
-        setValue(prev);
+        setValue(prev); // revert on server rejection (e.g. demoting the last admin)
         setError(res.error ?? "could not change role");
-        return;
       }
-      router.refresh();
     });
   }
 
