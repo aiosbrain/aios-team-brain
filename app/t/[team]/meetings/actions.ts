@@ -5,7 +5,7 @@ import { z } from "zod";
 
 import { serverClient } from "@/lib/db/server";
 import { adminClient } from "@/lib/db/admin";
-import { currentMember } from "@/lib/auth/guard";
+import { currentMember, requireTeamAdmin } from "@/lib/auth/guard";
 import { resolveAnsweringKeys } from "@/lib/query/answering";
 import {
   createMeetingNote,
@@ -16,7 +16,7 @@ import {
 import { extractFromTranscript, type RosterPerson } from "@/lib/meetings/llm-extract";
 import { extractAndStoreActionItems } from "@/lib/meetings/action-items";
 import { MEETING_TODO_PROJECT_SLUG } from "@/lib/meetings/extract-todos";
-import { findDuplicateMeeting, mergeIntoMeetingNote } from "@/lib/meetings/merge";
+import { findDuplicateMeeting, mergeIntoMeetingNote, backfillMergeDuplicateMeetings } from "@/lib/meetings/merge";
 import { backfillMeetingNotesFromItems } from "@/lib/meetings/from-items";
 import {
   projectRows,
@@ -131,6 +131,27 @@ export async function uploadMeetingNoteAction(
 
   revalidatePath(`/t/${team.slug}/meetings`);
   return { ok: true, id: noteId };
+}
+
+/**
+ * One-time cleanup: merge already-created duplicate meetings (same date + overlapping transcripts)
+ * into one note each, crediting all submitters and hiding the folded-away copies. Admin-only (it's a
+ * bulk, content-mutating operation). Uses the same LLM merge as the live upload path.
+ */
+export async function mergeDuplicateMeetingsAction(
+  teamSlug: string
+): Promise<{ ok: boolean; merged?: number; clusters?: number; error?: string }> {
+  const ctx = await requireTeamAdmin(teamSlug);
+  if (!ctx) return { ok: false, error: "admins only" };
+  const admin = adminClient();
+  const keys = await resolveAnsweringKeys(admin, ctx.teamId);
+  try {
+    const s = await backfillMergeDuplicateMeetings(admin, ctx.teamId, { keys, actorMemberId: ctx.memberId });
+    revalidatePath(`/t/${teamSlug}/meetings`);
+    return { ok: true, merged: s.merged, clusters: s.clusters };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "merge failed" };
+  }
 }
 
 /**

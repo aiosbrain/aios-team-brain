@@ -7,7 +7,7 @@ import { completeTextOrNull } from "@/lib/llm/complete";
 import { extractFromTranscript, type ProviderKeys, type RosterPerson } from "./llm-extract";
 import { extractAndStoreActionItems } from "./action-items";
 import { canLlmMerge, mergeTranscripts, transcriptOverlap } from "./merge-format";
-import { addMeetingNoteAttendees, addMeetingNoteSubmitters, updateMeetingSummary } from "./notes";
+import { addMeetingNoteAttendees, addMeetingNoteSubmitters, setMeetingNoteMergedInto, updateMeetingSummary } from "./notes";
 
 const MERGE_SYSTEM =
   "You are given two transcripts of the SAME meeting, captured by different note-takers. They " +
@@ -127,10 +127,13 @@ export async function findDuplicateMeeting(
 
 export interface MergeInput {
   newRawText: string;
-  newSubmitterId: string;
+  /** The incoming upload's submitter to credit (null for a CLI-imported note with no submitter). */
+  newSubmitterId: string | null;
   newAttendeeIds?: string[];
   roster: RosterPerson[];
   keys: ProviderKeys;
+  /** A valid member to attribute the re-ingest to when neither note has a submitter (e.g. backfill). */
+  authorFallbackMemberId?: string | null;
   /** Injectable merge (tests). Defaults to LLM merge with a deterministic union fallback. */
   mergeTranscript?: (existing: string, incoming: string) => Promise<string>;
 }
@@ -152,7 +155,8 @@ export async function mergeIntoMeetingNote(
     ? await input.mergeTranscript(match.existingRawText, input.newRawText)
     : (await mergeTranscriptsLLM(match.existingRawText, input.newRawText, input.keys).catch(() => null)) ??
       mergeTranscripts(match.existingRawText, input.newRawText);
-  const author = match.primarySubmitterId ?? input.newSubmitterId;
+  const author = match.primarySubmitterId ?? input.newSubmitterId ?? input.authorFallbackMemberId ?? null;
+  if (!author) throw new Error("mergeIntoMeetingNote: no member to attribute the merged transcript to");
 
   // Re-ingest the merged transcript into the SAME item (team+project+path upsert → new sha/body).
   await ingestItem(
@@ -208,4 +212,123 @@ export async function mergeIntoMeetingNote(
   });
 
   return match.noteId;
+}
+
+/** Build a fresh DuplicateMatch for a note by re-reading its (possibly just-merged) transcript. */
+async function loadMatchForNote(admin: DbClient, teamId: string, noteId: string): Promise<DuplicateMatch | null> {
+  const { data: n } = await admin
+    .from("meeting_notes")
+    .select("id, source_item_id, submitted_by, title")
+    .eq("team_id", teamId)
+    .eq("id", noteId)
+    .maybeSingle();
+  const note = n as { id: string; source_item_id: string; submitted_by: string | null; title: string } | null;
+  if (!note) return null;
+  const { data: item } = await admin
+    .from("items")
+    .select("id, path, access, body, projects(slug)")
+    .eq("id", note.source_item_id)
+    .maybeSingle();
+  const it = item as { path: string; access: "team" | "external"; body: string; projects?: { slug?: string } } | null;
+  if (!it?.body) return null;
+  return {
+    noteId: note.id,
+    sourceItemId: note.source_item_id,
+    itemPath: it.path,
+    itemProject: it.projects?.slug ?? "meeting-notes",
+    itemAccess: it.access,
+    title: note.title,
+    existingRawText: it.body,
+    primarySubmitterId: note.submitted_by,
+    overlap: 1,
+  };
+}
+
+export interface BackfillMergeSummary {
+  scanned: number;
+  clusters: number;
+  merged: number;
+}
+
+/**
+ * One-time cleanup: find already-created duplicate meeting notes (same date + overlapping
+ * transcripts) and merge each cluster into its EARLIEST note, crediting all submitters and hiding
+ * the folded-away copies (`merged_into`). Uses the same LLM merge as the live upload path. Bounded,
+ * best-effort per cluster. `actorMemberId` attributes the re-ingest when a note has no submitter.
+ */
+export async function backfillMergeDuplicateMeetings(
+  admin: DbClient,
+  teamId: string,
+  opts: { keys: ProviderKeys; actorMemberId: string; threshold?: number }
+): Promise<BackfillMergeSummary> {
+  const threshold = opts.threshold ?? DEFAULT_MERGE_THRESHOLD;
+  const summary: BackfillMergeSummary = { scanned: 0, clusters: 0, merged: 0 };
+
+  const { data: notes } = await admin
+    .from("meeting_notes")
+    .select("id, source_item_id, submitted_by, occurred_at, created_at")
+    .eq("team_id", teamId)
+    .is("merged_into", null);
+  type Row = { id: string; source_item_id: string; submitted_by: string | null; occurred_at: string | null; created_at: string };
+  const rows = ((notes ?? []) as Row[]).filter((r) => r.occurred_at);
+  summary.scanned = rows.length;
+  if (rows.length < 2) return summary;
+
+  const { data: items } = await admin
+    .from("items")
+    .select("id, body")
+    .in("id", rows.map((r) => r.source_item_id));
+  const bodyById = new Map(((items ?? []) as { id: string; body: string }[]).map((i) => [i.id, i.body ?? ""]));
+
+  const roster: RosterPerson[] = await admin
+    .from("members")
+    .select("id, display_name")
+    .eq("team_id", teamId)
+    .eq("status", "active")
+    .then(({ data }) => ((data ?? []) as { id: string; display_name: string }[]).map((m) => ({ id: m.id, displayName: m.display_name })));
+
+  // Group by date.
+  const byDate = new Map<string, Row[]>();
+  for (const r of rows) byDate.set(r.occurred_at!, [...(byDate.get(r.occurred_at!) ?? []), r]);
+
+  for (const group of byDate.values()) {
+    if (group.length < 2) continue;
+    group.sort((a, b) => (a.created_at < b.created_at ? -1 : a.created_at > b.created_at ? 1 : 0));
+
+    // Greedy cluster by overlap against each cluster's (earliest) primary.
+    const clusters: Row[][] = [];
+    for (const note of group) {
+      const body = bodyById.get(note.source_item_id) ?? "";
+      if (!body.trim()) continue;
+      const target = clusters.find((cl) => transcriptOverlap(body, bodyById.get(cl[0].source_item_id) ?? "") >= threshold);
+      if (target) target.push(note);
+      else clusters.push([note]);
+    }
+
+    for (const cl of clusters) {
+      if (cl.length < 2) continue;
+      summary.clusters++;
+      const primary = cl[0];
+      for (const dup of cl.slice(1)) {
+        const match = await loadMatchForNote(admin, teamId, primary.id);
+        if (!match) continue;
+        const { data: att } = await admin.from("meeting_note_attendees").select("member_id").eq("meeting_note_id", dup.id);
+        try {
+          await mergeIntoMeetingNote(admin, teamId, match, {
+            newRawText: bodyById.get(dup.source_item_id) ?? "",
+            newSubmitterId: dup.submitted_by,
+            newAttendeeIds: ((att ?? []) as { member_id: string }[]).map((a) => a.member_id),
+            roster,
+            keys: opts.keys,
+            authorFallbackMemberId: opts.actorMemberId,
+          });
+          await setMeetingNoteMergedInto(admin, dup.id, primary.id);
+          summary.merged++;
+        } catch {
+          // one bad cluster member never fails the whole backfill
+        }
+      }
+    }
+  }
+  return summary;
 }

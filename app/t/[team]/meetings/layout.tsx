@@ -7,6 +7,7 @@ import { listMeetingNotesForTeam, type MeetingNoteSummary } from "@/lib/meetings
 import { EmptyState } from "@/components/empty-state";
 import { NewMeetingNoteButton } from "@/components/meetings/new-meeting-note-button";
 import { ImportPushedMeetingsButton } from "@/components/meetings/import-pushed-meetings-button";
+import { MergeDuplicatesButton } from "@/components/meetings/merge-duplicates-button";
 import { MeetingListPane } from "@/components/meetings/meeting-list-pane";
 
 /** When the meeting happened, if known, else when it was ingested — the sort key for the list. */
@@ -55,6 +56,7 @@ export default async function MeetingsLayout({
         </div>
         {canManage ? (
           <div className="flex items-center gap-2">
+            {me.role === "admin" ? <MergeDuplicatesButton teamSlug={teamSlug} /> : null}
             <ImportPushedMeetingsButton teamSlug={teamSlug} />
             <NewMeetingNoteButton teamSlug={teamSlug} />
           </div>

@@ -902,10 +902,14 @@ create table if not exists meeting_notes (
   title text not null,
   summary text not null default '',
   occurred_at date,
+  -- Set when this note was merged into another (same meeting, deduped); readers hide these.
+  merged_into uuid references meeting_notes(id) on delete set null,
   created_at timestamptz not null default now(),
   unique (source_item_id)
 );
 create index if not exists meeting_notes_team_idx on meeting_notes (team_id, created_at desc);
+alter table meeting_notes add column if not exists merged_into uuid references meeting_notes(id) on delete set null;
+create index if not exists meeting_notes_merged_into_idx on meeting_notes (merged_into);
 
 -- LLM-matched roster attendees (many-to-many; an unmatched name in the transcript is simply
 -- dropped, never blocks the note from saving).
