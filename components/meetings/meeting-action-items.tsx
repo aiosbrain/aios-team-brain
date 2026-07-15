@@ -83,7 +83,7 @@ export function MeetingActionItems({ teamSlug, noteId, todos, provider }: Meetin
       const synced = (res.results ?? []).filter((r) => r.status === "synced" || r.status === "skipped").length;
       const failed = (res.results ?? []).filter((r) => r.status === "failed").length;
       setMsg(
-        `Pushed ${synced} to ${providerLabel(res.provider ?? provider)}${failed ? ` · ${failed} failed` : ""}.`
+        `Sent ${synced} to ${providerLabel(res.provider ?? provider)}${failed ? ` · ${failed} failed` : ""}.`
       );
       router.refresh();
     });
@@ -190,7 +190,7 @@ export function MeetingActionItems({ teamSlug, noteId, todos, provider }: Meetin
                   title={!provider ? "Configure a PM integration in Admin → Integrations" : undefined}
                 >
                   {pushing ? <Loader2 className="size-4 animate-spin" /> : <ExternalLink className="size-4" />}
-                  Push to {label}
+                  Send to {label}
                 </button>
               </div>
             </div>
