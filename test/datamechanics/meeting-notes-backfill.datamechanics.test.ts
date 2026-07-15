@@ -70,4 +70,32 @@ describe("meeting-notes backfill (data-mechanics)", () => {
     const s = await backfillMeetingNotesFromItems(db(), seed.teamId, { extract: stubExtract });
     expect(s).toEqual({ scanned: 0, created: 0, skipped: 0 });
   });
+
+  // Spec: a pushed meeting arrives with its action items ALREADY materialized as tasks, not empty
+  // until someone clicks "extract" on the note. The backfill runs the action-item extractor per
+  // created note and stores the results, so getMeetingNote surfaces them immediately.
+  it("pre-computes action items when it creates the note", async () => {
+    const seed = await seedTeam();
+    await seedTranscript(seed, "granola", {
+      path: "t/action.md",
+      body: "# Launch sync\n\nWe aligned on the rollout.",
+    });
+
+    const stubActionItems = async () => [
+      { title: "Ship the migration", assignee: "", due: "2026-07-20", line: 1, sourceText: "Ship the migration" },
+      { title: "Email the customer list", assignee: "", due: null, line: 2, sourceText: "Email the customer list" },
+    ];
+
+    const s = await backfillMeetingNotesFromItems(db(), seed.teamId, {
+      extract: stubExtract,
+      extractActionItems: stubActionItems,
+    });
+    expect(s.created).toBe(1);
+
+    const notes = await listMeetingNotesForTeam(db(), seed.teamId, "team");
+    const detail = await getMeetingNote(db(), seed.teamId, notes[0].id, "team");
+    const titles = detail!.extractedTodos.map((t) => t.title).sort();
+    expect(titles).toEqual(["Email the customer list", "Ship the migration"]);
+    expect(detail!.extractedTodos.every((t) => t.pushed === null)).toBe(true);
+  });
 });
