@@ -33,12 +33,16 @@ const ANTHROPIC_MODEL = process.env.MEETINGS_ANTHROPIC_MODEL ?? "claude-sonnet-5
 const MAX_TRANSCRIPT_CHARS = 15_000;
 
 const SYSTEM_PROMPT =
-  "You are reading a meeting transcript or notes document. Write a concise 2-3 sentence summary " +
-  "(present tense, specific — what was discussed/decided, not generic filler), and list the full " +
-  "names of every person who appears to have attended or spoken, exactly as they're referred to in " +
-  "the text. Return ONLY a JSON object of the form " +
-  '{"summary":"...","attendees":["Full Name", ...]}. No prose, no markdown code fences — the raw ' +
-  "JSON object only. If you can't tell who attended, return an empty attendees array — never guess.";
+  "You are reading a meeting transcript or notes document. Produce two things:\n" +
+  "(1) A DETAILED but SKIMMABLE summary as a bulleted list — 4 to 8 bullets. Each bullet is ONE " +
+  "specific point: a topic discussed, a decision made, a problem or blocker raised, or a next step. " +
+  "Present tense, concrete, no filler or generic phrasing. Each bullet MUST start with '- ' and be " +
+  "on its own line.\n" +
+  "(2) The full names of every person who appears to have attended or spoken, exactly as they're " +
+  "referred to in the text.\n" +
+  'Return ONLY a JSON object of the form {"summary":"- ...\\n- ...","attendees":["Full Name", ...]}. ' +
+  "No prose outside the JSON, no markdown code fences. If you can't tell who attended, return an " +
+  "empty attendees array — never guess.";
 
 export function extractJsonObject(raw: string): string {
   const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);

@@ -207,6 +207,21 @@ export async function createMeetingNoteFromItem(
   return { id: noteId, created: true };
 }
 
+/** Replace a note's summary (e.g. after a "regenerate summary" pass). Single writer for the column. */
+export async function updateMeetingSummary(
+  admin: DbClient,
+  teamId: string,
+  noteId: string,
+  summary: string
+): Promise<void> {
+  const { error } = await admin
+    .from("meeting_notes")
+    .update({ summary: summary.trim() })
+    .eq("team_id", teamId)
+    .eq("id", noteId);
+  if (error) throw new Error(`meeting summary update failed: ${error.message}`);
+}
+
 type MemberRow = {
   id: string;
   display_name: string;
