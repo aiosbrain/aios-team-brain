@@ -676,7 +676,7 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 `member_identities` · `member_secrets` · `member_profiles` · `member_time_off` · `member_goals` · `member_provisioning` · `integrations` ·
 `agentic_maturity_snapshots` · `task_pm_links` · `work_events` · `usage_costs` · `subscriptions` · `graph_episodes` · `arc_cache` ·
 `conversations` · `chat_messages` · `ingest_runs` · `social_jobs` · `brand_profiles` · `brand_assets` · `social_opportunities` · `content_plans` · `content_variants` · `media_assets` · `social_settings` · `content_approvals` · `social_publications` · `publication_analytics` ·
-`meeting_notes` · `meeting_note_attendees`
+`meeting_notes` · `meeting_note_attendees` · `meeting_note_submitters`
 
 <!-- /drift:tables -->
 

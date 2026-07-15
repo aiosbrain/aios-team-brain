@@ -13,7 +13,7 @@ import { join } from "node:path";
 const ROOT = join(import.meta.dirname, "..", "..");
 const SCAN_DIRS = ["app", "lib", "scripts"];
 const OWNER = join("lib", "meetings", "notes.ts");
-const TABLES = ["meeting_notes", "meeting_note_attendees"] as const;
+const TABLES = ["meeting_notes", "meeting_note_attendees", "meeting_note_submitters"] as const;
 const writeRe = (table: string) =>
   new RegExp(`from\\(\\s*["']${table}["']\\s*\\)\\s*\\.\\s*(insert|update|upsert|delete)\\b`, "g");
 

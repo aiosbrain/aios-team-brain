@@ -916,6 +916,15 @@ create table if not exists meeting_note_attendees (
 );
 create index if not exists meeting_note_attendees_member_idx on meeting_note_attendees (member_id);
 
+-- Multiple submitters per note (Meetings merge): when two people upload the same meeting, both are
+-- credited. `meeting_notes.submitted_by` stays the primary; this holds the full set. Writer: notes.ts.
+create table if not exists meeting_note_submitters (
+  meeting_note_id uuid not null references meeting_notes(id) on delete cascade,
+  member_id uuid not null references members(id) on delete cascade,
+  primary key (meeting_note_id, member_id)
+);
+create index if not exists meeting_note_submitters_member_idx on meeting_note_submitters (member_id);
+
 create table if not exists graph_entities (
   id uuid primary key default gen_random_uuid(),
   team_id uuid not null references teams(id) on delete cascade,

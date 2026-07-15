@@ -16,6 +16,7 @@ import {
 import { extractFromTranscript, type RosterPerson } from "@/lib/meetings/llm-extract";
 import { extractAndStoreActionItems } from "@/lib/meetings/action-items";
 import { MEETING_TODO_PROJECT_SLUG } from "@/lib/meetings/extract-todos";
+import { findDuplicateMeeting, mergeIntoMeetingNote } from "@/lib/meetings/merge";
 import { backfillMeetingNotesFromItems } from "@/lib/meetings/from-items";
 import {
   projectRows,
@@ -50,7 +51,7 @@ async function resolveTeam(teamSlug: string): Promise<{ id: string; slug: string
  */
 export async function uploadMeetingNoteAction(
   input: z.input<typeof uploadSchema>
-): Promise<{ ok: boolean; error?: string; id?: string }> {
+): Promise<{ ok: boolean; error?: string; id?: string; merged?: boolean }> {
   const parsed = uploadSchema.safeParse(input);
   if (!parsed.success) return { ok: false, error: parsed.error.issues[0]?.message ?? "invalid upload" };
 
@@ -73,6 +74,26 @@ export async function uploadMeetingNoteAction(
   }));
 
   const extraction = await extractFromTranscript(parsed.data.rawText, roster, { openaiKey, anthropicKey });
+
+  // Duplicate detection: if this is the same meeting someone already uploaded (same date + enough
+  // content overlap), merge the transcripts into that note and credit both submitters instead of
+  // creating a second copy.
+  const dup = await findDuplicateMeeting(admin, team.id, parsed.data.occurredAt ?? null, parsed.data.rawText);
+  if (dup) {
+    try {
+      const mergedNoteId = await mergeIntoMeetingNote(admin, team.id, dup, {
+        newRawText: parsed.data.rawText,
+        newSubmitterId: me.id,
+        newAttendeeIds: extraction.attendeeMemberIds,
+        roster,
+        keys: { openaiKey, anthropicKey },
+      });
+      revalidatePath(`/t/${team.slug}/meetings`);
+      return { ok: true, id: mergedNoteId, merged: true };
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : "could not merge into the existing meeting" };
+    }
+  }
 
   let noteId: string;
   try {

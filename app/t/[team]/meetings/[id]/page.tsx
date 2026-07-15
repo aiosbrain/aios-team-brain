@@ -37,10 +37,12 @@ export default async function MeetingNotePage({
         <h2 className="font-display text-2xl text-ink">{note.title}</h2>
         <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-ink-tertiary">
           {note.occurredAt ? <span>{note.occurredAt}</span> : null}
-          {note.submittedBy ? (
+          {note.submitters.length ? (
             <span className="flex items-center gap-1.5">
-              <MemberAvatar person={note.submittedBy} size={16} />
-              Submitted by {note.submittedBy.displayName}
+              {note.submitters.map((s) => (
+                <MemberAvatar key={s.id} person={s} size={16} />
+              ))}
+              Submitted by {note.submitters.map((s) => s.displayName).join(" and ")}
             </span>
           ) : null}
         </div>
