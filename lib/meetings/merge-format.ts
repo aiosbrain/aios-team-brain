@@ -10,6 +10,14 @@
 
 const SHINGLE_SIZE = 5;
 
+/** Per-transcript char budget for the LLM merge; over it we use the lossless deterministic union. */
+export const LLM_MERGE_MAX_CHARS = 12_000;
+
+/** LLM merge is viable only when both transcripts are non-empty and within the char budget. Pure. */
+export function canLlmMerge(a: string, b: string, cap = LLM_MERGE_MAX_CHARS): boolean {
+  return a.trim().length > 0 && b.trim().length > 0 && a.length <= cap && b.length <= cap;
+}
+
 function normalizeWords(text: string): string[] {
   return text
     .toLowerCase()

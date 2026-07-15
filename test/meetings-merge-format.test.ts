@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { transcriptOverlap, mergeTranscripts } from "@/lib/meetings/merge-format";
+import { transcriptOverlap, mergeTranscripts, canLlmMerge, LLM_MERGE_MAX_CHARS } from "@/lib/meetings/merge-format";
 
 /**
  * Spec for duplicate-meeting detection + merge. Derived from the scenario: two people upload the
@@ -35,5 +35,17 @@ describe("mergeTranscripts", () => {
   it("returns the base unchanged when the other adds nothing new", () => {
     const base = "a\nb\nc";
     expect(mergeTranscripts(base, "b\nc")).toBe(base);
+  });
+});
+
+describe("canLlmMerge", () => {
+  it("allows two in-budget non-empty transcripts", () => {
+    expect(canLlmMerge("some text", "other text")).toBe(true);
+  });
+  it("rejects when either is empty", () => {
+    expect(canLlmMerge("", "text")).toBe(false);
+  });
+  it("rejects when either exceeds the char budget (falls back to lossless union)", () => {
+    expect(canLlmMerge("x".repeat(LLM_MERGE_MAX_CHARS + 1), "y")).toBe(false);
   });
 });

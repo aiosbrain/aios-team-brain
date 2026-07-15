@@ -74,6 +74,27 @@ describe("duplicate meeting merge (real Postgres)", () => {
     expect(note!.rawText).toContain("launch deadline is next Friday");
   });
 
+  it("uses the (LLM) merge function to produce the merged transcript body", async () => {
+    const { teamId, memberId: chetan } = await seedTeam();
+    const john = await secondMember(teamId);
+    const noteId = await createMeetingNote(db(), teamId, { title: "AIOS sync", rawText: A, submittedByMemberId: chetan, occurredAt: DATE });
+
+    const match = await findDuplicateMeeting(db(), teamId, DATE, B);
+    // Inject the "LLM" merge — proves the orchestration stores exactly what the merge returns (not
+    // the deterministic union), so the real settings-aware LLM merge slots in here.
+    await mergeIntoMeetingNote(db(), teamId, match!, {
+      newRawText: B,
+      newSubmitterId: john,
+      roster: [],
+      keys: {},
+      mergeTranscript: async () => "MERGED BY LLM: full combined transcript with both perspectives.",
+    });
+
+    const note = await getMeetingNote(db(), teamId, noteId, "team");
+    expect(note!.rawText).toBe("MERGED BY LLM: full combined transcript with both perspectives.");
+    expect(note!.submitters.map((s) => s.id).sort()).toEqual([chetan, john].sort());
+  });
+
   it("does not match an unrelated transcript or a different date", async () => {
     const { teamId, memberId } = await seedTeam();
     await createMeetingNote(db(), teamId, { title: "AIOS sync", rawText: A, submittedByMemberId: memberId, occurredAt: DATE });

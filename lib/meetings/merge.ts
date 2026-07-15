@@ -3,10 +3,47 @@ import { createHash, randomUUID } from "node:crypto";
 import type { DbClient } from "@/lib/db/types";
 import { ingestItem } from "@/lib/ingest";
 import { audit } from "@/lib/api/audit";
+import { completeTextOrNull } from "@/lib/llm/complete";
 import { extractFromTranscript, type ProviderKeys, type RosterPerson } from "./llm-extract";
 import { extractAndStoreActionItems } from "./action-items";
-import { mergeTranscripts, transcriptOverlap } from "./merge-format";
+import { canLlmMerge, mergeTranscripts, transcriptOverlap } from "./merge-format";
 import { addMeetingNoteAttendees, addMeetingNoteSubmitters, updateMeetingSummary } from "./notes";
+
+const MERGE_SYSTEM =
+  "You are given two transcripts of the SAME meeting, captured by different note-takers. They " +
+  "overlap heavily, but each may contain passages the other missed. Produce ONE clean, complete " +
+  "merged transcript that combines BOTH: keep every unique statement, remove duplicated/overlapping " +
+  "passages, and preserve chronological + speaker structure where discernible. Do NOT summarize, " +
+  "shorten, or omit substance — this is a MERGE, not a summary. Output ONLY the merged transcript " +
+  "text, with no preamble or commentary.";
+
+/**
+ * LLM-merge two overlapping transcripts of the same meeting into one clean transcript, via the
+ * settings-aware completion primitive (honors the team's answering provider). Best-effort: returns
+ * null when no LLM is configured, when the transcripts are too long for a single pass (caller falls
+ * back to the lossless deterministic union), or when the model degrades to a summary (much shorter
+ * than the longer input) — so a bad result never silently drops content.
+ */
+export async function mergeTranscriptsLLM(a: string, b: string, keys: ProviderKeys): Promise<string | null> {
+  const hasLlm = !!(
+    keys.openaiKey ||
+    keys.anthropicKey ||
+    keys.openrouterKey ||
+    process.env.OPENAI_API_KEY ||
+    process.env.ANTHROPIC_API_KEY ||
+    process.env.LLM_BASE_URL
+  );
+  if (!hasLlm || !canLlmMerge(a, b)) return null;
+
+  const prompt = `Transcript A:\n\n${a}\n\n=====\n\nTranscript B:\n\n${b}`;
+  const raw = await completeTextOrNull({ system: MERGE_SYSTEM, prompt }, { keys, jsonObject: false, maxTokens: 8192 });
+  const text = raw?.trim();
+  if (!text) return null;
+  // A merge should be at least as long as the longer source; a much shorter result means the model
+  // summarized instead of merging — reject so the deterministic union is used instead.
+  if (text.length < Math.max(a.length, b.length) * 0.6) return null;
+  return text;
+}
 
 /**
  * Duplicate-meeting detection + merge (Meetings merge). When someone uploads a meeting that already
@@ -94,6 +131,8 @@ export interface MergeInput {
   newAttendeeIds?: string[];
   roster: RosterPerson[];
   keys: ProviderKeys;
+  /** Injectable merge (tests). Defaults to LLM merge with a deterministic union fallback. */
+  mergeTranscript?: (existing: string, incoming: string) => Promise<string>;
 }
 
 /**
@@ -107,7 +146,12 @@ export async function mergeIntoMeetingNote(
   match: DuplicateMatch,
   input: MergeInput
 ): Promise<string> {
-  const merged = mergeTranscripts(match.existingRawText, input.newRawText);
+  // Intelligent merge: LLM-combine the overlapping transcripts (dedupes overlaps, keeps unique
+  // content), falling back to the lossless deterministic union if the LLM is unavailable/too long.
+  const merged = input.mergeTranscript
+    ? await input.mergeTranscript(match.existingRawText, input.newRawText)
+    : (await mergeTranscriptsLLM(match.existingRawText, input.newRawText, input.keys).catch(() => null)) ??
+      mergeTranscripts(match.existingRawText, input.newRawText);
   const author = match.primarySubmitterId ?? input.newSubmitterId;
 
   // Re-ingest the merged transcript into the SAME item (team+project+path upsert → new sha/body).
