@@ -108,7 +108,7 @@ export function ArcsPanel({ teamSlug }: { teamSlug: string }) {
       <div className="prism-card flex flex-col items-center gap-2 px-4 py-8 text-center">
         <Sparkles className="size-5 text-violet" />
         <p className="max-w-sm text-sm text-ink-secondary">
-          No active narrative arcs yet — they emerge once the graph has a week of activity to synthesize.
+          No active narrative arcs yet — they emerge once the graph has enough team activity to synthesize.
         </p>
       </div>
     );

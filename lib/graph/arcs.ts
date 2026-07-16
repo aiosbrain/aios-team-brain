@@ -48,7 +48,6 @@ export interface ArcCorrection {
 /** Full backend keys — resolve via `lib/query/answering.resolveAnsweringKeys` at the call site. */
 export type ProviderKeys = LlmBackendKeys;
 
-const WINDOW_DAYS = 7;
 const MAX_FACTS = 200;
 const CACHE_TTL_MS = 10 * 60_000;
 
@@ -249,8 +248,10 @@ async function synthesizeArcs(
   correctionTexts: string[],
   keys: ProviderKeys
 ): Promise<NarrativeArc[]> {
-  const since = new Date(Date.now() - WINDOW_DAYS * 86_400_000).toISOString();
-  const facts = await recentFacts(groups, since, MAX_FACTS);
+  // Arcs are NOT time-boxed — synthesize from the most-recent facts regardless of age (a quiet week,
+  // or a stalled projector, must not blank the panel). `null` = no window; recentFacts still caps at
+  // MAX_FACTS, newest first.
+  const facts = await recentFacts(groups, null, MAX_FACTS);
   // No facts and nothing to correct → nothing to synthesize. (A correction with no facts still runs
   // the LLM, preserving the pre-cache recompute behavior.)
   if (facts.length === 0 && correctionTexts.length === 0) return [];
@@ -268,6 +269,34 @@ const cache = new Map<string, { arcs: NarrativeArc[]; at: number }>();
 // recompute (and thus one LLM call), not N.
 const refreshing = new Set<string>();
 
+/**
+ * Persist a freshly-synthesized arc set to both caches — but NEVER let an EMPTY result clobber a
+ * non-empty one. An empty synthesis is almost always a transient upstream failure (LLM outage, a
+ * reasoning model starving its own output, a graph blip), and a stale-but-real arc set beats a blank
+ * panel. On that case we keep the prior value and DON'T refresh its timestamp, so the next view
+ * retries until synthesis recovers. This is the guard that stops one bad LLM call from pinning the
+ * Learning page empty for hours (2026-07 incident). Returns what's now authoritative for the key.
+ */
+export async function commitArcs(
+  db: DbClient,
+  teamId: string,
+  key: string,
+  next: NarrativeArc[]
+): Promise<NarrativeArc[]> {
+  if (next.length === 0) {
+    const prior = cache.get(key)?.arcs ?? (await readArcCache(db, teamId, key))?.arcs;
+    if (prior && prior.length > 0) {
+      console.warn(
+        `[arcs] synthesis returned 0 arcs for ${key}; keeping ${prior.length} cached (likely transient upstream failure)`
+      );
+      return prior;
+    }
+  }
+  cache.set(key, { arcs: next, at: Date.now() });
+  await writeArcCache(db, teamId, key, next);
+  return next;
+}
+
 /** Fire-and-forget background recompute for a stale cache key (serve-stale-while-revalidate). Uses
  *  its own adminClient so it doesn't depend on the request's client lifecycle. Deduped via
  *  `refreshing`; errors are logged, never thrown (nothing awaits this). */
@@ -278,8 +307,7 @@ function refreshArcsInBackground(teamId: string, key: string, groups: string[], 
     const bg = adminClient();
     try {
       const arcs = await synthesizeArcs(bg, teamId, groups, [], keys);
-      cache.set(key, { arcs, at: Date.now() });
-      await writeArcCache(bg, teamId, key, arcs);
+      await commitArcs(bg, teamId, key, arcs);
     } catch (err) {
       console.error("[arcs] background refresh failed:", err instanceof Error ? err.message : err);
     } finally {
@@ -324,9 +352,7 @@ export async function getArcs(
 
   // 3. Cold miss — first-ever load for this key. Compute inline so the user gets a real answer.
   const arcs = await synthesizeArcs(db, teamId, groups, [], keys);
-  cache.set(key, { arcs, at: Date.now() });
-  await writeArcCache(db, teamId, key, arcs);
-  return arcs;
+  return commitArcs(db, teamId, key, arcs);
 }
 
 /**
@@ -345,9 +371,8 @@ export async function recomputeArcs(
 ): Promise<NarrativeArc[]> {
   if (groups.length === 0) return [];
   const key = groups.slice().sort().join(",");
-  const arcs = await synthesizeArcs(db, teamId, groups, corrections.map((c) => c.corrected_text), keys);
-  cache.set(key, { arcs, at: Date.now() });
-  await writeArcCache(db, teamId, key, arcs);
+  const synthesized = await synthesizeArcs(db, teamId, groups, corrections.map((c) => c.corrected_text), keys);
+  const arcs = await commitArcs(db, teamId, key, synthesized);
 
   // Persist corrections as first-class episodes (team-tier group; corrections are internal).
   const client = new GraphitiClient();
