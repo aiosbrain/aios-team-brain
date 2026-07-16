@@ -196,7 +196,11 @@ async function callLLMRaw(
     {
       keys,
       jsonObject: true,
-      maxTokens: 2048,
+      // Arc synthesis reasons over ~200 facts to find storylines — the one task that genuinely
+      // benefits from a reasoning model. Route it to the team's reasoning model (falls back to the
+      // query model when unset), with reasoning left ON and extra headroom for it.
+      role: "reasoning",
+      maxTokens: 4096,
       // Record the outcome so a broken answering model (e.g. a reasoning model returning empty) shows
       // as "degraded" on the dashboard instead of silently blanking the Learning page.
       record: record ? { db: record.db, teamId: record.teamId, task: "arcs" } : undefined,

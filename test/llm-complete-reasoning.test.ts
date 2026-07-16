@@ -42,4 +42,23 @@ describe("completeText reasoning control", () => {
     const body = JSON.parse(String((fetchMock.mock.calls[0] as [string, RequestInit])[1].body));
     expect(body.reasoning).toBeUndefined();
   });
+
+  it("the reasoning role leaves reasoning ON and uses the reasoning model", async () => {
+    const fetchMock = mock('{"arcs":[]}');
+    await completeText(
+      { system: "s", prompt: "p" },
+      {
+        role: "reasoning",
+        keys: {
+          openrouterKey: "or",
+          openrouterModel: "openai/gpt-4o-mini",
+          reasoningModel: "qwen/qwen3.7-plus",
+          activeProvider: "openrouter",
+        },
+      }
+    );
+    const body = JSON.parse(String((fetchMock.mock.calls[0] as [string, RequestInit])[1].body));
+    expect(body.reasoning).toBeUndefined(); // NOT disabled — reasoning is the point of this role
+    expect(body.model).toBe("qwen/qwen3.7-plus"); // the reasoning model, not the query model
+  });
 });

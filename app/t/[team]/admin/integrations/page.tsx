@@ -33,7 +33,7 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ t
   const user = await getSessionUser();
   const { data: team } = await sessionDb
     .from("teams")
-    .select("id, primary_pm_provider, answering_provider")
+    .select("id, primary_pm_provider, answering_provider, reasoning_model")
     .eq("slug", teamSlug)
     .maybeSingle();
   if (!team) return null;
@@ -136,6 +136,7 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ t
           localConfigured,
           openrouterConfigured: hasKey("openrouter"),
           openaiConfigured: hasKey("openai"),
+          reasoningModel: (team.reasoning_model as string | null) ?? null,
         }}
       />
       <MemberOnboardingPanel teamSlug={teamSlug} values={onboardingValues} />
