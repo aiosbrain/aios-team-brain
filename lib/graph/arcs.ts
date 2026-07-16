@@ -186,10 +186,21 @@ function extractJsonObject(raw: string): string {
  *  outage or a stale model id must degrade to "no arcs" instead of failing the whole request). Routes
  *  through the shared settings-aware primitive, so arcs honor the team's answering-provider (incl.
  *  OpenRouter) exactly like the Query box. */
-async function callLLMRaw(userContent: string, keys: ProviderKeys): Promise<string | null> {
+async function callLLMRaw(
+  userContent: string,
+  keys: ProviderKeys,
+  record?: { db: DbClient; teamId: string }
+): Promise<string | null> {
   return completeTextOrNull(
     { system: SYSTEM_PROMPT, prompt: userContent },
-    { keys, jsonObject: true, maxTokens: 2048 }
+    {
+      keys,
+      jsonObject: true,
+      maxTokens: 2048,
+      // Record the outcome so a broken answering model (e.g. a reasoning model returning empty) shows
+      // as "degraded" on the dashboard instead of silently blanking the Learning page.
+      record: record ? { db: record.db, teamId: record.teamId, task: "arcs" } : undefined,
+    }
   );
 }
 
@@ -258,7 +269,11 @@ async function synthesizeArcs(
   const epToItem = await resolveEpisodeItems(groups, facts.flatMap((f) => f.episodeUuids));
   const allItemIds = [...new Set([...epToItem.values()].map((v) => v.itemId).filter((id): id is string => !!id))];
   const humanByItem = await resolveHumanActorsByItem(db, teamId, allItemIds);
-  const raw = await callLLMRaw(buildPrompt(attributedFactTexts(facts, epToItem, humanByItem), correctionTexts), keys);
+  const raw = await callLLMRaw(
+    buildPrompt(attributedFactTexts(facts, epToItem, humanByItem), correctionTexts),
+    keys,
+    { db, teamId }
+  );
   return attributeArcs(parseArcsJson(raw, { facts, epToItem }), humanByItem);
 }
 
