@@ -1,6 +1,8 @@
 import type { Metadata } from "next";
+import { notFound } from "next/navigation";
 import { serverClient } from "@/lib/db/server";
 import { adminClient } from "@/lib/db/admin";
+import { requireTeamAdmin } from "@/lib/auth/guard";
 import { classifyInboundRow, loadInboundRows } from "@/lib/pm-sync/inbound";
 import { getProjectionHealth, listRecentProjectionRuns } from "@/lib/pm-sync/runs";
 import { ProjectionHealthCard } from "@/components/admin/projection-health-card";
@@ -12,6 +14,10 @@ export const metadata: Metadata = { title: "PM sync" };
 
 export default async function PmSyncPage({ params }: { params: Promise<{ team: string }> }) {
   const { team: teamSlug } = await params;
+  // Self-gate at the page (not just the admin layout): this page reads sensitive PM data via the
+  // service-role client, which has no RLS backstop. Next's layout gate isn't guaranteed to re-run on
+  // client-side partial navigation, so re-check admin here (matches the PM-sync server actions).
+  if (!(await requireTeamAdmin(teamSlug))) notFound();
   const db = await serverClient();
   const { data: team } = await db
     .from("teams")

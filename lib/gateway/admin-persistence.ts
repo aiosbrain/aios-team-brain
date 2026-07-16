@@ -77,6 +77,11 @@ async function expireGatewayApprovals(
          from gateway_approvals a
          join gateway_executions e on e.id=a.execution_id and e.team_id=a.team_id
         where a.team_id=$1 and a.status in ('pending','approved') and a.expires_at<=now()
+          -- Only expire executions still AWAITING a decision. A claim leaves the approval row
+          -- 'approved' (claims don't retire it), so without this the sweep would flip an already
+          -- claimed/succeeded/failed execution back to 'expired' + write a false approval_expired
+          -- audit row (audit-integrity bug). Mirrors the resume path's state guard.
+          and e.state in ('approval_required','approved')
         for update of a,e
      ), approvals as (
        update gateway_approvals a
@@ -132,13 +137,14 @@ export async function decideGatewayApproval(
     const found = await client.query<{
       execution_id: string;
       status: string;
+      execution_state: string;
       expired: boolean;
       member_id: string;
       service_identity_id: string;
       subject_binding_id: string;
       connection_id: string;
     }>(
-      `select a.execution_id,a.status,(a.expires_at<=now()) expired,
+      `select a.execution_id,a.status,e.state execution_state,(a.expires_at<=now()) expired,
               e.member_id,e.service_identity_id,e.subject_binding_id,e.connection_id
          from gateway_approvals a
          join gateway_executions e on e.id=a.execution_id and e.team_id=a.team_id
@@ -148,25 +154,35 @@ export async function decideGatewayApproval(
     const row = found.rows[0];
     if (!row) throw new GatewayAdminError("gateway_not_found", 404);
     if (row.expired) {
+      // Record the approval's own expiry (it IS expired) — but only from a pre-decision state. The
+      // `gateway_approval_protect` trigger only permits pending/approved → expired, so an already
+      // denied/cancelled approval would raise a raw trigger error (500); the status guard makes that
+      // a clean no-op (the caller still gets the 410 below). Mirrors persistence.ts:637.
       await client.query(
         `update gateway_approvals set status='expired',decided_at=coalesce(decided_at,now()),
            decision_correlation_id=coalesce(decision_correlation_id,$1),updated_at=now()
-         where id=$2`,
+         where id=$2 and status in ('pending','approved')`,
         [correlationId, approvalId],
       );
-      await client.query(
-        `update gateway_executions set state='expired',updated_at=now() where id=$1`,
-        [row.execution_id],
-      );
-      await client.query(
-        `insert into gateway_audit_log(
-          team_id,member_id,service_identity_id,subject_binding_id,connection_id,
-          execution_id,approval_id,event,correlation_id
-        ) values($1,$2,$3,$4,$5,$6,$7,'approval_expired',$8)
-        on conflict do nothing`,
-        [ctx.teamId,row.member_id,row.service_identity_id,row.subject_binding_id,
-         row.connection_id,row.execution_id,approvalId,correlationId],
-      );
+      // … but only expire the EXECUTION (and write the approval_expired audit) when it's still
+      // awaiting a decision. If it was already claimed/succeeded/failed, that terminal state is the
+      // source of truth and must not be clobbered back to 'expired' with a false audit row.
+      if (row.execution_state === "approval_required" || row.execution_state === "approved") {
+        await client.query(
+          `update gateway_executions set state='expired',updated_at=now()
+             where id=$1 and state in ('approval_required','approved')`,
+          [row.execution_id],
+        );
+        await client.query(
+          `insert into gateway_audit_log(
+            team_id,member_id,service_identity_id,subject_binding_id,connection_id,
+            execution_id,approval_id,event,correlation_id
+          ) values($1,$2,$3,$4,$5,$6,$7,'approval_expired',$8)
+          on conflict do nothing`,
+          [ctx.teamId,row.member_id,row.service_identity_id,row.subject_binding_id,
+           row.connection_id,row.execution_id,approvalId,correlationId],
+        );
+      }
       return { expired: true as const };
     }
     if (row.status !== "pending")
