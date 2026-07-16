@@ -59,6 +59,14 @@ export function extractJsonObject(raw: string): string {
 export const MEETINGS_LLM_TIMEOUT_MS = 60_000;
 
 /**
+ * Token budget for the meetings passes. A detailed 4–8 bullet summary + attendees on a long
+ * transcript can run past 1024 tokens; when it did, the JSON was cut off mid-string and `JSON.parse`
+ * threw → the note saved blank. 2048 gives headroom, and `salvageSummaryBullets` backstops the rare
+ * overrun that still truncates.
+ */
+export const MEETINGS_LLM_MAX_TOKENS = 2048;
+
+/**
  * Best-effort JSON completion for the meetings LLM passes (summary/attendees AND action items),
  * through the shared settings-aware primitive. Never throws — any transport failure returns null so
  * a caller degrades gracefully.
@@ -69,7 +77,33 @@ export async function callMeetingsLLM(
   keys: ProviderKeys,
   timeoutMs: number = MEETINGS_LLM_TIMEOUT_MS
 ): Promise<string | null> {
-  return completeTextOrNull({ system, prompt: userContent }, { keys, jsonObject: true, maxTokens: 1024, timeoutMs });
+  return completeTextOrNull(
+    { system, prompt: userContent },
+    { keys, jsonObject: true, maxTokens: MEETINGS_LLM_MAX_TOKENS, timeoutMs }
+  );
+}
+
+/**
+ * Recover complete bullet lines from a malformed or truncated meetings JSON response. Some models
+ * emit the summary as bare comma-separated strings (`{"summary":"- a","- b"}`, invalid JSON) or
+ * overrun the token limit and cut off mid-string. Both make `JSON.parse` throw. This scavenges every
+ * COMPLETE double-quoted string that reads as a bullet (a truncated trailing string has no closing
+ * quote, so it's naturally excluded) — enough to still show a summary instead of a blank.
+ */
+export function salvageSummaryBullets(raw: string): string[] {
+  const bullets: string[] = [];
+  const stringLiteral = /"(?:[^"\\]|\\.)*"/g; // complete quoted strings only
+  let m: RegExpExecArray | null;
+  while ((m = stringLiteral.exec(raw)) !== null) {
+    let value: unknown;
+    try {
+      value = JSON.parse(m[0]); // unescape \n, \" etc.
+    } catch {
+      continue;
+    }
+    if (typeof value === "string" && /^\s*[-*•]\s+/.test(value)) bullets.push(value.trim());
+  }
+  return bullets;
 }
 
 /** Normalize a name for tolerant matching: lowercase, collapse whitespace, drop punctuation. */
@@ -134,6 +168,13 @@ export function parseTranscriptExtraction(raw: string, roster: RosterPerson[]): 
   try {
     parsed = JSON.parse(extractJsonObject(raw));
   } catch (err) {
+    // Malformed (bullets as bare comma-separated strings) or token-truncated JSON — recover whatever
+    // complete bullets we can rather than saving the note blank. Need ≥2 to count as a real summary.
+    const salvaged = salvageSummaryBullets(raw);
+    if (salvaged.length >= 2) {
+      console.warn(`[meetings] recovered summary from malformed/truncated JSON (${salvaged.length} bullets)`);
+      return { summary: normalizeSummaryField(salvaged), attendeeMemberIds: [] };
+    }
     console.error("[meetings] LLM response was not valid JSON:", err instanceof Error ? err.message : err, raw.slice(0, 300));
     return empty;
   }
