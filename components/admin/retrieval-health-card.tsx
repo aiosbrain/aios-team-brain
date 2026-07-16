@@ -63,6 +63,19 @@ export function RetrievalHealthCard({ health }: { health: RetrievalHealth }) {
   const graphDegraded = health.graph === "degraded";
   const worst = d.state === "degraded" || health.graph === "off";
 
+  // Answering-model leg: map the LLM health state onto the shared leg vocabulary (unknown → the grey
+  // "off" dot, since nothing's been recorded yet). This is the leg that was missing when a reasoning
+  // model silently blanked Learning.
+  const llm = health.llm;
+  const llmLeg: DenseState | LegState =
+    llm.state === "healthy" ? "healthy" : llm.state === "degraded" ? "degraded" : "off";
+  const llmDetail =
+    llm.state === "healthy"
+      ? `${llm.lastModel ?? "model"}${llm.lastOkAt ? ` · last ok ${timeAgo(llm.lastOkAt)}` : ""}`
+      : llm.state === "degraded"
+        ? `${llm.lastModel ?? "model"} returned no output${llm.lastFailedAt ? ` · ${timeAgo(llm.lastFailedAt)}` : ""}`
+        : "no recent activity recorded";
+
   return (
     <div className="prism-card flex flex-col gap-1 p-4">
       <div className="flex items-center justify-between">
@@ -74,11 +87,17 @@ export function RetrievalHealthCard({ health }: { health: RetrievalHealth }) {
         depend on external services, so a quiet failure is flagged here.
       </p>
 
+      <Leg name="Answering model" state={llmLeg} detail={llmDetail} />
       <Leg name="Keyword" state="on" detail="always on (local Postgres FTS)" />
       <Leg name="Semantic" state={d.state} detail={denseDetail} />
       <Leg name="Graph memory" state={health.graph} detail={graphDetail} />
       <Leg name="Reranker" state={health.rerank} detail={health.rerank === "off" ? "not configured" : undefined} />
 
+      {llm.state === "degraded" && llm.note ? (
+        <p className="mt-2 rounded-lg border border-red-400/30 bg-red-400/10 px-3 py-2 text-xs text-red-600 dark:text-red-300">
+          {llm.note}
+        </p>
+      ) : null}
       {graphDegraded ? (
         <p className="mt-2 rounded-lg border border-red-400/30 bg-red-400/10 px-3 py-2 text-xs text-red-600 dark:text-red-300">
           {graphStalled ? (

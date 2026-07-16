@@ -1,6 +1,7 @@
 import "server-only";
 import { runSql } from "@/lib/db/pg/pool";
 import { graphitiConfigured, GraphitiClient } from "@/lib/graph/graphiti-client";
+import { getLlmHealth, type LlmHealth } from "@/lib/query/llm-health";
 
 /**
  * Retrieval-stack health for the admin dashboard (Phase 1 of the retrieval-observability plan).
@@ -40,6 +41,7 @@ export interface RetrievalHealth {
   graphLastProjectedAt: string | null; // most recent successful projection (null = never)
   graphStalled: boolean; // degraded specifically because the projector stopped writing (vs unreachable)
   rerank: LegState;
+  llm: LlmHealth; // answering-model health — did the configured model recently produce output?
 }
 
 const COVERAGE_FLOOR = 0.9; // ≥90% embedded = healthy
@@ -111,10 +113,11 @@ export async function getRetrievalHealth(teamId: string): Promise<RetrievalHealt
 
   // Graph + dense both hit the network — run them concurrently so the card render isn't serialized.
   const graphConfiguredNow = graphConfigured(process.env.GRAPHITI_URL);
-  const [dense, graphReachable, graphFresh] = await Promise.all([
+  const [dense, graphReachable, graphFresh, llm] = await Promise.all([
     denseHealth(teamId, configured),
     graphConfiguredNow ? new GraphitiClient().healthcheck() : Promise.resolve(false),
     graphConfiguredNow ? graphFreshness(teamId) : Promise.resolve({ episodes: null, lastProjectedAt: null }),
+    getLlmHealth(teamId),
   ]);
   const lastProjectedAtMs = graphFresh.lastProjectedAt ? Date.parse(graphFresh.lastProjectedAt) : null;
   const nowMs = Date.now();
@@ -130,6 +133,7 @@ export async function getRetrievalHealth(teamId: string): Promise<RetrievalHealt
     graphLastProjectedAt: graphFresh.lastProjectedAt,
     graphStalled,
     rerank,
+    llm,
   };
 }
 
