@@ -7,6 +7,7 @@ import { errorResponse } from "@/lib/api/schemas";
 import { resolveAnsweringKeys } from "@/lib/query/answering";
 import { visibleGroupIds } from "@/lib/graph/group";
 import { getArcs } from "@/lib/graph/arcs";
+import { getLlmHealth } from "@/lib/query/llm-health";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -44,5 +45,10 @@ export async function POST(req: NextRequest) {
   const keys = await resolveAnsweringKeys(admin, team.id);
   const arcs = await getArcs(admin, team.id, teamSlug, tier, visibleGroupIds(teamSlug, tier), keys);
 
-  return Response.json({ arcs, as_of: new Date().toISOString() });
+  // Empty arcs are ambiguous: a genuinely quiet week vs. a broken answering model. When there are
+  // none AND the LLM leg is degraded, tell the client so the panel shows "the model is failing"
+  // instead of a benign "no arcs yet" — the silent-blank case that started all this.
+  const degraded = arcs.length === 0 ? (await getLlmHealth(team.id)).state === "degraded" : false;
+
+  return Response.json({ arcs, degraded, as_of: new Date().toISOString() });
 }

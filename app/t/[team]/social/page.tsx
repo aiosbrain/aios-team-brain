@@ -6,6 +6,7 @@ import { listOpportunities } from "@/lib/social/store";
 import { listTeamMediaMeta } from "@/lib/media/store";
 import { imageBudget } from "@/lib/media/generate-image";
 import { getAutonomy, getPublishDryRun } from "@/lib/social/settings";
+import { getSocialJobsHealth } from "@/lib/jobs/store";
 import { listPendingApprovals } from "@/lib/social/approvals";
 import { listPublications } from "@/lib/social/publications";
 import { listTeamAnalytics, teamAnalyticsSummary } from "@/lib/social/analytics";
@@ -65,6 +66,7 @@ export default async function SocialPage({ params }: { params: Promise<{ team: s
   for (const m of media) (mediaByVariant[m.variant_id] ??= []).push(m.id);
   const budget = await imageBudget(db, team.id);
 
+  const jobsHealth = await getSocialJobsHealth(db, team.id);
   const autonomy = await getAutonomy(db, team.id);
   const pendingRows = await listPendingApprovals(db, team.id);
   const variantCtx: Record<string, { platform: string; body: string; oppTitle: string }> = {};
@@ -121,6 +123,17 @@ export default async function SocialPage({ params }: { params: Promise<{ team: s
           Brand settings
         </Link>
       </div>
+
+      {jobsHealth.dead > 0 ? (
+        <p className="rounded-lg border border-red-400/30 bg-red-400/10 px-3 py-2 text-xs text-red-600 dark:text-red-300">
+          <strong>
+            {jobsHealth.dead} background job{jobsHealth.dead === 1 ? "" : "s"} failed permanently
+          </strong>{" "}
+          (dead-lettered after retries) — image generation, publishing, or analytics may not be
+          running.
+          {jobsHealth.lastDeadError ? ` Most recent error: ${jobsHealth.lastDeadError}` : ""}
+        </p>
+      ) : null}
 
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
         <Kpi label="Opportunities" value={opportunities.length} />
