@@ -17,6 +17,34 @@ import { nextRunAfter } from "./backoff";
 const COLS =
   "id, team_id, kind, payload, status, attempts, max_attempts, run_after, locked_at, last_error, dedup_key, created_at, updated_at";
 
+export interface SocialJobsHealth {
+  dead: number; // jobs that exhausted max_attempts and gave up (permanently failed)
+  queued: number; // jobs waiting to run
+  lastDeadError: string | null; // the most recent dead job's error, for an actionable banner
+}
+
+/**
+ * Dead-letter / queue health for the Social admin surface. `social_jobs` already persists a `dead`
+ * status + `last_error`, but nothing read it — a fully dead queue (images never generate, nothing
+ * publishes) was invisible. Best-effort: zeros on any error so it never breaks the page render.
+ */
+export async function getSocialJobsHealth(db: DbClient, teamId: string): Promise<SocialJobsHealth> {
+  try {
+    const { data } = await db
+      .from("social_jobs")
+      .select("status, last_error, updated_at")
+      .eq("team_id", teamId)
+      .in("status", ["dead", "queued"]);
+    const rows = (data ?? []) as { status: string; last_error: string | null; updated_at: string }[];
+    const dead = rows.filter((r) => r.status === "dead");
+    const lastDeadError =
+      [...dead].sort((a, b) => (a.updated_at < b.updated_at ? 1 : -1))[0]?.last_error ?? null;
+    return { dead: dead.length, queued: rows.filter((r) => r.status === "queued").length, lastDeadError };
+  } catch {
+    return { dead: 0, queued: 0, lastDeadError: null };
+  }
+}
+
 /**
  * Enqueue a job. Idempotent when `dedupKey` is set: a second enqueue for the same (team, key)
  * returns the existing job instead of creating a duplicate (the partial unique index is the
