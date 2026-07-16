@@ -1,5 +1,6 @@
 import "server-only";
 import { completeTextOrNull } from "@/lib/llm/complete";
+import { normalizeSummaryField } from "@/lib/meetings/summary-format";
 import type { LlmBackendKeys } from "@/lib/query/llm-backend";
 
 /**
@@ -103,7 +104,17 @@ export async function extractFromTranscript(
     : "";
   const raw = await callMeetingsLLM(SYSTEM_PROMPT, `Transcript:\n\n${truncated}${rosterHint}`, keys);
   if (!raw) return empty;
+  return parseTranscriptExtraction(raw, roster);
+}
 
+/**
+ * Pure parse of the meetings LLM response into a summary + matched attendees. Split out from the
+ * transport so it's unit-testable without a live model and so the summary/attendee shape handling
+ * (see `normalizeSummaryField` — models differ on string-vs-array `summary`) has one home. Never
+ * throws: unparseable/oddly-shaped responses degrade to an empty extraction.
+ */
+export function parseTranscriptExtraction(raw: string, roster: RosterPerson[]): TranscriptExtraction {
+  const empty: TranscriptExtraction = { summary: "", attendeeMemberIds: [] };
   let parsed: unknown;
   try {
     parsed = JSON.parse(extractJsonObject(raw));
@@ -113,7 +124,7 @@ export async function extractFromTranscript(
   }
   if (typeof parsed !== "object" || parsed === null) return empty;
   const obj = parsed as { summary?: unknown; attendees?: unknown };
-  const summary = typeof obj.summary === "string" ? obj.summary.trim() : "";
+  const summary = normalizeSummaryField(obj.summary);
   const names = Array.isArray(obj.attendees) ? obj.attendees.filter((n): n is string => typeof n === "string") : [];
 
   return { summary, attendeeMemberIds: matchAttendees(names, roster) };
