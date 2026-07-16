@@ -10,21 +10,25 @@ import type { MeetingNoteSummary } from "@/lib/meetings/notes";
 interface MeetingListPaneProps {
   teamSlug: string;
   notes: MeetingNoteSummary[];
+  /** Note the index route shows by default (newest) — highlighted when the path has no explicit id. */
+  defaultActiveId?: string | null;
 }
 
 /**
  * The left rail of the two-pane Meetings view: every meeting the viewer can see, newest first, with
  * the currently-open one highlighted (derived from the path, so it stays in sync across navigation).
+ * On the bare index path (no id) the default note the index renders is highlighted instead.
  * The parent layout owns sorting; this component only renders + marks the active row.
  */
-export function MeetingListPane({ teamSlug, notes }: MeetingListPaneProps) {
+export function MeetingListPane({ teamSlug, notes, defaultActiveId = null }: MeetingListPaneProps) {
   const pathname = usePathname();
+  const onIndex = pathname === `/t/${teamSlug}/meetings`;
 
   return (
     <nav aria-label="Meetings" className="flex w-full flex-col gap-1.5">
       {notes.map((note) => {
         const href = `/t/${teamSlug}/meetings/${note.id}`;
-        const active = pathname === href;
+        const active = pathname === href || (onIndex && note.id === defaultActiveId);
         return (
           <Link
             key={note.id}

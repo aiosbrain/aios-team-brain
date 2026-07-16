@@ -1,27 +1,19 @@
 import type { ReactNode } from "react";
 import { NotebookText } from "lucide-react";
 
-import { serverClient } from "@/lib/db/server";
-import { currentMember } from "@/lib/auth/guard";
-import { listMeetingNotesForTeam, type MeetingNoteSummary } from "@/lib/meetings/notes";
+import { loadTeamId, loadViewer, loadMeetingNotes, sortedMeetingNotes } from "@/lib/meetings/loaders";
 import { EmptyState } from "@/components/empty-state";
 import { NewMeetingNoteButton } from "@/components/meetings/new-meeting-note-button";
 import { ImportPushedMeetingsButton } from "@/components/meetings/import-pushed-meetings-button";
 import { MergeDuplicatesButton } from "@/components/meetings/merge-duplicates-button";
 import { MeetingListPane } from "@/components/meetings/meeting-list-pane";
 
-/** When the meeting happened, if known, else when it was ingested — the sort key for the list. */
-function meetingTime(note: MeetingNoteSummary): number {
-  const stamp = note.occurredAt ?? note.createdAt;
-  const t = new Date(stamp).getTime();
-  return Number.isNaN(t) ? 0 : t;
-}
-
 /**
  * Two-pane Meetings shell shared by the index and the per-note detail route: the meeting list lives
  * on the left (newest first), the selected meeting's summary/transcript/action-items render on the
  * right (`children`). Rendered once and preserved across navigation between meetings, so switching
- * meetings only re-renders the right pane.
+ * meetings only re-renders the right pane. All loads are `cache()`d, so the page rendered as
+ * `children` this request reuses these results instead of re-querying.
  */
 export default async function MeetingsLayout({
   children,
@@ -31,17 +23,15 @@ export default async function MeetingsLayout({
   params: Promise<{ team: string }>;
 }) {
   const { team: teamSlug } = await params;
-  const db = await serverClient();
 
-  const { data: team } = await db.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
-  if (!team) return null;
+  const teamId = await loadTeamId(teamSlug);
+  if (!teamId) return null;
 
-  const me = await currentMember(team.id);
+  const me = await loadViewer(teamId);
   if (!me) return null;
 
-  // listMeetingNotesForTeam enforces the team-tier gate itself (external → []).
-  const notes = await listMeetingNotesForTeam(db, team.id, me.tier);
-  const sorted = [...notes].sort((a, b) => meetingTime(b) - meetingTime(a));
+  // loadMeetingNotes enforces the team-tier gate itself (external → []).
+  const sorted = sortedMeetingNotes(await loadMeetingNotes(teamId, me.tier));
   const canManage = me.tier === "team";
 
   return (
@@ -72,7 +62,7 @@ export default async function MeetingsLayout({
       ) : (
         <div className="flex flex-col gap-5 sm:flex-row sm:items-start sm:gap-6">
           <div className="w-full shrink-0 self-start sm:sticky sm:top-6 sm:w-72 lg:w-80">
-            <MeetingListPane teamSlug={teamSlug} notes={sorted} />
+            <MeetingListPane teamSlug={teamSlug} notes={sorted} defaultActiveId={sorted[0]?.id ?? null} />
           </div>
           <div className="min-w-0 flex-1">{children}</div>
         </div>
