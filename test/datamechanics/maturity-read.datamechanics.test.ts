@@ -103,4 +103,49 @@ describe("agentic-maturity dashboard reads (real Postgres)", () => {
     expect(ext.members).toEqual([]);
     expect(await getMemberMaturity(db(), seed.teamId, "alex", "external")).toBeNull();
   });
+
+  function contextHealth(score: number, over: Record<string, unknown> = {}) {
+    return {
+      score, mode: "workspace", drift_count: 0, versions_behind: 0,
+      coverage_pct: 100, broken_link_count: 0, checked_at: "2026-06-18", ...over,
+    };
+  }
+
+  it("exposes context_health_score on cards + averages it across the team (latest per member)", async () => {
+    const seed = await seedTeam();
+    const alex = await createMember(db(), seed.teamId, { email: "a@x.test", displayName: "Alex", actorHandle: "alex", role: "member" });
+    const sam = await createMember(db(), seed.teamId, { email: "s@x.test", displayName: "Sam", actorHandle: "sam", role: "member" });
+
+    // alex: earlier snapshot has no scan, the latest carries a score of 4 (latest wins).
+    await ingest(seed.teamId, alex.id, snap("alex", "2026-06-16"));
+    await ingest(seed.teamId, alex.id, snap("alex", "2026-06-18", { context_health: contextHealth(4) }));
+    await ingest(seed.teamId, sam.id, snap("sam", "2026-06-18", { context_health: contextHealth(2) }));
+
+    const team = await getTeamMaturity(db(), seed.teamId, "team");
+    expect(team.members.find((mm) => mm.handle === "alex")!.context_health_score).toBe(4);
+    expect(team.members.find((mm) => mm.handle === "sam")!.context_health_score).toBe(2);
+    // Mean of the latest-per-member non-null scores: (4 + 2) / 2.
+    expect(team.averageContextHealth).toBe(3);
+
+    const m = await getMemberMaturity(db(), seed.teamId, "alex", "team");
+    expect(m!.latest.context_health_score).toBe(4);
+  });
+
+  it("averageContextHealth is null until a member scans, and skips members with no scan", async () => {
+    const seed = await seedTeam();
+    const alex = await createMember(db(), seed.teamId, { email: "a@x.test", displayName: "Alex", actorHandle: "alex", role: "member" });
+    const sam = await createMember(db(), seed.teamId, { email: "s@x.test", displayName: "Sam", actorHandle: "sam", role: "member" });
+
+    // No scans yet → no scores to average.
+    await ingest(seed.teamId, alex.id, snap("alex", "2026-06-18"));
+    await ingest(seed.teamId, sam.id, snap("sam", "2026-06-18"));
+    const before = await getTeamMaturity(db(), seed.teamId, "team");
+    expect(before.members.every((mm) => mm.context_health_score == null)).toBe(true);
+    expect(before.averageContextHealth).toBeNull();
+
+    // Only alex scans → the average reflects alex alone (unscanned sam is skipped, not counted as 0).
+    await ingest(seed.teamId, alex.id, snap("alex", "2026-06-18", { context_health: contextHealth(3) }));
+    const after = await getTeamMaturity(db(), seed.teamId, "team");
+    expect(after.averageContextHealth).toBe(3);
+  });
 });

@@ -33,12 +33,9 @@ function CeShadowBadge() {
   );
 }
 
-function fmtCeBand(band: number | null): string {
-  return band == null ? "—" : `${band}/4`;
-}
-
-function fmtContextHealth(score: number | null): string {
-  return score == null ? "—" : `${score}/4`;
+/** Shared 0–4 band renderer (CE band, context-health score, team average). */
+function fmtBand(value: number | null): string {
+  return value == null ? "—" : `${value}/4`;
 }
 
 function radarData(axes: AemAxes): RadarDatum[] {
@@ -56,16 +53,28 @@ export default async function MaturityPage({ params }: { params: Promise<{ team:
   if (!me) return null;
 
   // Read helper enforces the team-tier gate (external → empty board).
-  const { members, teamAxes, spineDistribution, asOf } = await getTeamMaturity(db, team.id, me.tier);
+  const { members, teamAxes, spineDistribution, asOf, averageContextHealth } = await getTeamMaturity(
+    db,
+    team.id,
+    me.tier
+  );
 
   return (
     <div className="mx-auto flex max-w-6xl flex-col gap-5">
-      <div>
-        <h1 className="text-2xl font-semibold text-ink">Individual Maturity</h1>
-        <p className="text-sm text-ink-secondary">
-          Per-person AEM placement from local agent sessions (Claude Code · Codex · Cursor).
-          {asOf ? ` Latest snapshot ${asOf}.` : ""}
-        </p>
+      <div className="flex items-end justify-between gap-3">
+        <div>
+          <h1 className="text-2xl font-semibold text-ink">Individual Maturity</h1>
+          <p className="text-sm text-ink-secondary">
+            Per-person AEM placement from local agent sessions (Claude Code · Codex · Cursor).
+            {asOf ? ` Latest snapshot ${asOf}.` : ""}
+          </p>
+        </div>
+        {averageContextHealth != null && (
+          <div className="text-right">
+            <div className="text-xs uppercase tracking-wide text-ink-subtle">Team context health</div>
+            <div className="text-lg tabular-nums text-ink">{fmtBand(averageContextHealth)}</div>
+          </div>
+        )}
       </div>
 
       {members.length === 0 ? (
@@ -133,11 +142,11 @@ export default async function MaturityPage({ params }: { params: Promise<{ team:
                     </td>
                     <td className="px-4 py-3 tabular-nums text-ink-secondary">{m.overall.toFixed(2)}</td>
                     <td className="px-4 py-3 tabular-nums text-ink-secondary">
-                      {fmtCeBand(m.ce_band)}
+                      {fmtBand(m.ce_band)}
                       <CeShadowBadge />
                     </td>
                     <td className="px-4 py-3 tabular-nums text-ink-secondary">
-                      {fmtContextHealth(m.context_health_score)}
+                      {fmtBand(m.context_health_score)}
                     </td>
                     <td className="px-4 py-3 text-ink-secondary">
                       {AXIS_META.find((a) => a.key === m.weakest)?.label}
