@@ -50,12 +50,26 @@ export function extractJsonObject(raw: string): string {
 }
 
 /**
+ * Meetings extraction is a background, best-effort pass — not the interactive query box — so it gets
+ * a more generous timeout than `completeText`'s 30s default. Reasoning models a team may select
+ * (e.g. qwen via OpenRouter) can spend 30–45s on a full transcript; at 30s the call was aborted and
+ * the summary/attendees/action-items silently came back empty. 60s covers the observed latency while
+ * still bounding a truly wedged provider. The backfill can pass a larger value for slow networks.
+ */
+export const MEETINGS_LLM_TIMEOUT_MS = 60_000;
+
+/**
  * Best-effort JSON completion for the meetings LLM passes (summary/attendees AND action items),
  * through the shared settings-aware primitive. Never throws — any transport failure returns null so
  * a caller degrades gracefully.
  */
-export async function callMeetingsLLM(system: string, userContent: string, keys: ProviderKeys): Promise<string | null> {
-  return completeTextOrNull({ system, prompt: userContent }, { keys, jsonObject: true, maxTokens: 1024 });
+export async function callMeetingsLLM(
+  system: string,
+  userContent: string,
+  keys: ProviderKeys,
+  timeoutMs: number = MEETINGS_LLM_TIMEOUT_MS
+): Promise<string | null> {
+  return completeTextOrNull({ system, prompt: userContent }, { keys, jsonObject: true, maxTokens: 1024, timeoutMs });
 }
 
 /** Normalize a name for tolerant matching: lowercase, collapse whitespace, drop punctuation. */
@@ -95,14 +109,15 @@ export function matchAttendees(names: string[], roster: RosterPerson[]): string[
 export async function extractFromTranscript(
   rawText: string,
   roster: RosterPerson[],
-  keys: ProviderKeys
+  keys: ProviderKeys,
+  timeoutMs?: number
 ): Promise<TranscriptExtraction> {
   const empty: TranscriptExtraction = { summary: "", attendeeMemberIds: [] };
   const truncated = rawText.slice(0, MAX_TRANSCRIPT_CHARS);
   const rosterHint = roster.length
     ? `\n\nKnown team members (for reference, not exhaustive): ${roster.map((p) => p.displayName).join(", ")}.`
     : "";
-  const raw = await callMeetingsLLM(SYSTEM_PROMPT, `Transcript:\n\n${truncated}${rosterHint}`, keys);
+  const raw = await callMeetingsLLM(SYSTEM_PROMPT, `Transcript:\n\n${truncated}${rosterHint}`, keys, timeoutMs);
   if (!raw) return empty;
   return parseTranscriptExtraction(raw, roster);
 }

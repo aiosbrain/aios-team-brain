@@ -71,7 +71,8 @@ function dedupe(todos: ExtractedTodo[]): ExtractedTodo[] {
 export async function extractActionItems(
   rawText: string,
   roster: RosterPerson[],
-  keys: ProviderKeys
+  keys: ProviderKeys,
+  timeoutMs?: number
 ): Promise<ExtractedTodo[]> {
   const fallback = () => dedupe(extractTodosFromNotes(rawText));
 
@@ -79,7 +80,7 @@ export async function extractActionItems(
   const rosterHint = roster.length
     ? `\n\nKnown team members (resolve first-name mentions against these full names): ${roster.map((p) => p.displayName).join(", ")}.`
     : "";
-  const raw = await callMeetingsLLM(SYSTEM_PROMPT, `Transcript:\n\n${truncated}${rosterHint}`, keys);
+  const raw = await callMeetingsLLM(SYSTEM_PROMPT, `Transcript:\n\n${truncated}${rosterHint}`, keys, timeoutMs);
   if (!raw) return fallback();
 
   let parsed: unknown;
@@ -117,9 +118,12 @@ export async function extractAndStoreActionItems(
   roster: RosterPerson[],
   keys: ProviderKeys,
   // Injectable so the backfill/tests can stub the LLM step; defaults to the real extractor.
-  extract: (rawText: string, roster: RosterPerson[], keys: ProviderKeys) => Promise<ExtractedTodo[]> = extractActionItems
+  extract?: (rawText: string, roster: RosterPerson[], keys: ProviderKeys) => Promise<ExtractedTodo[]>,
+  // Extra timeout for the default extractor (background/backfill can allow a slower model).
+  timeoutMs?: number
 ): Promise<number> {
-  const todos = await extract(rawText, roster, keys);
+  const run = extract ?? ((t: string, r: RosterPerson[], k: ProviderKeys) => extractActionItems(t, r, k, timeoutMs));
+  const todos = await run(rawText, roster, keys);
   const rows = toExtractedTodoRows(item, todos);
   if (rows.length) await createMeetingTodoTasks(db, teamId, rows);
   return rows.length;

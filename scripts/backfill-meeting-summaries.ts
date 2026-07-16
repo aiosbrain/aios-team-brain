@@ -23,6 +23,10 @@ async function main() {
   const onlyBlank = argv.includes("--only-blank");
   const limitArg = argv.find((a) => a.startsWith("--limit="));
   const limit = limitArg ? Number(limitArg.split("=")[1]) : undefined;
+  const timeoutArg = argv.find((a) => a.startsWith("--timeout="));
+  // The app LLM path over a slow local network can take ~45s per call; default generously so a
+  // successful-but-slow response isn't aborted mid-backfill. In prod the default 60s is plenty.
+  const timeoutMs = timeoutArg ? Number(timeoutArg.split("=")[1]) : 120_000;
   const teamSlug = argv.find((a) => !a.startsWith("--"));
 
   const admin = adminClient();
@@ -47,7 +51,7 @@ async function main() {
     const provider = keys.activeProvider ?? "auto";
     process.stdout.write(`• ${t.name} (${t.slug}) — answering=${provider} … `);
     try {
-      const res = await refreshMeetingNoteExtraction(admin, t.id, { keys, onlyBlank, limit });
+      const res = await refreshMeetingNoteExtraction(admin, t.id, { keys, onlyBlank, limit, timeoutMs });
       totalSummarized += res.summarized;
       totalActionItems += res.actionItems;
       console.log(

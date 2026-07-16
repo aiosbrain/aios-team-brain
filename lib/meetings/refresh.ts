@@ -36,6 +36,9 @@ export interface RefreshOptions {
   /** Only heal notes whose summary is currently blank; skip ones that already have one. Default false
    *  (a full refresh — every note re-extracted, matching "as if just uploaded"). */
   onlyBlank?: boolean;
+  /** Override the per-note LLM timeout (default: the meetings 60s). A backfill over a slow network
+   *  can raise it so a genuinely-slow-but-successful model response isn't aborted. */
+  timeoutMs?: number;
   /** Inject the summary/attendee extractor (tests avoid a real LLM). */
   extract?: (rawText: string, roster: RosterPerson[]) => Promise<{ summary: string; attendeeMemberIds: string[] }>;
   /** Inject the action-item extractor (tests avoid a real LLM). */
@@ -91,7 +94,8 @@ export async function refreshMeetingNoteExtraction(
   }));
 
   const extract =
-    opts.extract ?? ((rawText: string, r: RosterPerson[]) => extractFromTranscript(rawText, r, opts.keys ?? {}));
+    opts.extract ??
+    ((rawText: string, r: RosterPerson[]) => extractFromTranscript(rawText, r, opts.keys ?? {}, opts.timeoutMs));
 
   for (const note of notes) {
     result.scanned++;
@@ -126,7 +130,8 @@ export async function refreshMeetingNoteExtraction(
           body,
           roster,
           opts.keys ?? {},
-          opts.extractActionItems
+          opts.extractActionItems,
+          opts.timeoutMs
         );
       } catch {
         // action-item extraction is a bonus on top of the refreshed summary
