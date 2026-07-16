@@ -1,20 +1,9 @@
 import Link from "next/link";
 import { CircleAlert } from "lucide-react";
-import { serverClient } from "@/lib/db/server";
-import { getSessionUser } from "@/lib/auth/session";
 import { activateInvitedMembership } from "@/lib/auth/pg-login";
+import { resolveTeamContext } from "@/lib/auth/team-context";
 import { TeamNav, type NavEntry, type NavLeaf } from "@/components/team-nav";
 import { SignOutButton } from "@/components/account/sign-out-button";
-
-/** The caller's membership row + its embedded team, as returned by the single collapsed auth query. */
-type MembershipRow = {
-  id: string;
-  role: "admin" | "lead" | "member";
-  display_name: string;
-  tier: "team" | "external";
-  status: string;
-  teams: { id: string; slug: string; name: string } | null;
-};
 
 function NoTeamScreen({ slug }: { slug: string }) {
   return (
@@ -43,27 +32,16 @@ export default async function TeamLayout({
   params: Promise<{ team: string }>;
 }) {
   const { team: teamSlug } = await params;
-  const db = await serverClient();
 
-  const user = await getSessionUser();
-  if (!user) return <NoTeamScreen slug={teamSlug} />;
-
-  // One round-trip for auth: the caller's membership for THIS team + the team itself (embedded),
-  // instead of two sequential queries (team-by-slug, then member-by-team). This runs on every nav
-  // AND every router.refresh(), so collapsing it directly cuts the per-refresh latency. A user is
-  // normally in one team (self-hosted per org), so this returns a tiny row set we filter by slug.
-  const { data: memberships } = await db
-    .from("members")
-    .select("id, role, display_name, tier, status, teams(id, slug, name)")
-    .eq("auth_user_id", user.id)
-    .neq("status", "disabled");
-  const me = ((memberships ?? []) as MembershipRow[]).find((m) => m.teams?.slug === teamSlug);
-  if (!me?.teams) return <NoTeamScreen slug={teamSlug} />;
-  const team = me.teams;
+  // Shared, request-scoped auth: one collapsed query, memoized so the page rendered as `children`
+  // this request reuses it instead of re-resolving team + member itself.
+  const ctx = await resolveTeamContext(teamSlug);
+  if (!ctx) return <NoTeamScreen slug={teamSlug} />;
+  const { team, me } = ctx;
   // Team-scoped activation, deferred half: signing in never activates memberships in teams the
   // login carried no context for (see linkMemberByEmail) — the invited row flips to active here,
   // on the member's own first visit to this team.
-  if (me.status === "invited") await activateInvitedMembership(team.id, user.id);
+  if (me.status === "invited") await activateInvitedMembership(team.id, ctx.userId);
 
   const base = `/t/${team.slug}`;
 
@@ -107,7 +85,7 @@ export default async function TeamLayout({
         </div>
         <TeamNav items={items} />
         <div className="mt-auto border-t border-border-subtle px-3 pt-4">
-          <p className="truncate text-sm font-medium text-ink">{me.display_name}</p>
+          <p className="truncate text-sm font-medium text-ink">{me.displayName}</p>
           <p className="text-xs capitalize text-ink-tertiary">
             {me.role} · {me.tier} tier
           </p>

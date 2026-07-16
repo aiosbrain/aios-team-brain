@@ -2,7 +2,7 @@ import Link from "next/link";
 import { Rocket } from "lucide-react";
 import { serverClient } from "@/lib/db/server";
 import { visibleItems, visibleDecisions } from "@/lib/auth/visibility";
-import { getSessionUser } from "@/lib/auth/session";
+import { resolveTeamContext } from "@/lib/auth/team-context";
 import { CopySnippet } from "@/components/copy-snippet";
 import { getPulseMetrics } from "@/lib/metrics/pulse";
 import { parseRange } from "@/lib/metrics/range";
@@ -104,43 +104,29 @@ export default async function TeamHome({
   const range = parseRange(rangeParam);
   const db = await serverClient();
 
-  const [{ data: team }, user] = await Promise.all([
-    db.from("teams").select("id, name").eq("slug", teamSlug).maybeSingle(),
-    getSessionUser(),
-  ]);
-  if (!team) return null; // layout already rendered the no-team screen
+  // Shared request-scoped auth — reuses the team layout's resolution (no extra team/member queries).
+  const ctx = await resolveTeamContext(teamSlug);
+  if (!ctx) return null; // layout already rendered the no-team screen
+  const { team, me } = ctx;
+  const isAdmin = me.role === "admin";
+  const tier = me.tier;
+  const memberId = me.id;
+  const firstName = me.displayName.trim().split(/\s+/)[0] || "there";
 
-  const { data: me } = await db
-    .from("members")
-    .select("id, role, tier, display_name")
-    .eq("team_id", team.id)
-    .eq("auth_user_id", user?.id ?? "")
-    .eq("status", "active")
-    .maybeSingle();
-  const isAdmin = me?.role === "admin";
-  const tier = (me?.tier as "team" | "external" | undefined) ?? "external";
-  const memberId = (me?.id as string | undefined) ?? "";
-  const firstName =
-    ((me?.display_name as string | undefined) ?? "").trim().split(/\s+/)[0] ||
-    "there";
-
-  // Tier-filtered count (no RLS backstop in postgres mode).
-  const { count: itemCount } = await visibleItems(
+  // Both counts are independent — run them together. itemCount is the tier-filtered visible-items
+  // count (no RLS backstop in postgres mode); ownKeyCount is whether this member has EVER issued
+  // their own key (the proxy for "has their workstation setup even started").
+  const [{ count: itemCount }, { count: ownKeyCount }] = await Promise.all([
+    visibleItems(
+      db.from("items").select("id", { count: "exact", head: true }).eq("team_id", team.id),
+      tier,
+    ),
     db
-      .from("items")
+      .from("api_keys")
       .select("id", { count: "exact", head: true })
-      .eq("team_id", team.id),
-    tier,
-  );
-
-  // Has this member EVER issued their own key (revoked or not) — the proxy for "has this
-  // person's workstation setup even started," independent of whether the TEAM has synced
-  // anything yet (a member invited into an already-active team must still see this).
-  const { count: ownKeyCount } = await db
-    .from("api_keys")
-    .select("id", { count: "exact", head: true })
-    .eq("team_id", team.id)
-    .eq("member_id", memberId);
+      .eq("team_id", team.id)
+      .eq("member_id", memberId),
+  ]);
 
   const homeState = pickHomeState({
     isAdmin,
