@@ -68,6 +68,15 @@ export async function completeText(args: CompleteArgs, opts: CompleteOptions = {
         // Answer budget + reasoning headroom (see REASONING_HEADROOM_TOKENS) so a reasoning model's
         // hidden tokens don't starve the answer to empty.
         max_tokens: maxTokens + REASONING_HEADROOM_TOKENS,
+        // These are structured extraction/short-generation tasks (arcs, summaries, social, titles) —
+        // NOT chain-of-thought. On OpenRouter, turn reasoning OFF so a reasoning model (e.g.
+        // qwen/qwen3.7-plus) can't spend the whole budget on hidden thinking and return empty content
+        // (what blanked the Learning page). Headroom stays as a belt-and-suspenders. The streaming
+        // Query path (lib/query/claude.ts) is separate and can still reason. Ignored by non-reasoning
+        // models. Override with LLM_DISABLE_REASONING=0.
+        ...(backend.kind === "openrouter" && process.env.LLM_DISABLE_REASONING !== "0"
+          ? { reasoning: { enabled: false } }
+          : {}),
         ...(opts.jsonObject ? { response_format: { type: "json_object" } } : {}),
         messages: [
           { role: "system", content: args.system },
