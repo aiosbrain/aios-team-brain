@@ -37,6 +37,10 @@ function fmtCeBand(band: number | null): string {
   return band == null ? "—" : `${band}/4`;
 }
 
+function fmtContextHealth(score: number | null): string {
+  return score == null ? "—" : `${score}/4`;
+}
+
 function radarData(axes: AemAxes): RadarDatum[] {
   return AXIS_META.map((a) => ({ axis: a.label, you: axes[a.key] }));
 }
@@ -108,6 +112,7 @@ export default async function MaturityPage({ params }: { params: Promise<{ team:
                   <th className="px-4 py-3 font-medium">Spine</th>
                   <th className="px-4 py-3 font-medium">Overall</th>
                   <th className="px-4 py-3 font-medium">CE</th>
+                  <th className="px-4 py-3 font-medium">Context</th>
                   <th className="px-4 py-3 font-medium">Weakest axis</th>
                   <th className="px-4 py-3 text-right font-medium">Tasks</th>
                   <th className="px-4 py-3 text-right font-medium">Est. spend</th>
@@ -130,6 +135,9 @@ export default async function MaturityPage({ params }: { params: Promise<{ team:
                     <td className="px-4 py-3 tabular-nums text-ink-secondary">
                       {fmtCeBand(m.ce_band)}
                       <CeShadowBadge />
+                    </td>
+                    <td className="px-4 py-3 tabular-nums text-ink-secondary">
+                      {fmtContextHealth(m.context_health_score)}
                     </td>
                     <td className="px-4 py-3 text-ink-secondary">
                       {AXIS_META.find((a) => a.key === m.weakest)?.label}

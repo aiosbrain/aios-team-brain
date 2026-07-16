@@ -1387,6 +1387,12 @@ create table if not exists agentic_maturity_snapshots (
   -- Client-derived, provenance-only: never recomputed here, never feeds placement().
   -- Shadow / uncalibrated — never a canonical scorer input.
   ce_band smallint check (ce_band is null or ce_band between 0 and 4),
+  -- context-health scan summary (v1.11, optional, nullable, no default). Scalars only
+  -- (score, mode, drift_count, versions_behind, coverage_pct, broken_link_count, checked_at) —
+  -- never content/paths. context_health_score mirrors ce_band's shape for team-rollup queries;
+  -- context_health carries the full summary object. Provenance-only — never recomputed here.
+  context_health_score smallint check (context_health_score is null or context_health_score between 0 and 4),
+  context_health jsonb,
   created_at timestamptz not null default now(),
   unique (team_id, member_id, snapshot_date, metric)
 );

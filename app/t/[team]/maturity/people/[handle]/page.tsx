@@ -61,7 +61,7 @@ export default async function MemberMaturityPage({
         </div>
       </div>
 
-      <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-6">
         <div className="card p-4">
           <div className="text-xs uppercase tracking-wide text-ink-subtle">Tasks</div>
           <div className="mt-1 text-xl tabular-nums text-ink">{latest.tasks}</div>
@@ -76,6 +76,12 @@ export default async function MemberMaturityPage({
             {latest.ce_band == null ? "—" : `${latest.ce_band}/4`}
           </div>
           <CeShadowBadge />
+        </div>
+        <div className="card p-4">
+          <div className="text-xs uppercase tracking-wide text-ink-subtle">Context</div>
+          <div className="mt-1 text-xl tabular-nums text-ink">
+            {latest.context_health_score == null ? "—" : `${latest.context_health_score}/4`}
+          </div>
         </div>
         <div className="card p-4">
           <div className="text-xs uppercase tracking-wide text-ink-subtle">Est. spend</div>
