@@ -92,6 +92,11 @@ export function RetrievalHealthCard({ health }: { health: RetrievalHealth }) {
       <Leg name="Semantic" state={d.state} detail={denseDetail} />
       <Leg name="Graph memory" state={health.graph} detail={graphDetail} />
       <Leg name="Reranker" state={health.rerank} detail={health.rerank === "off" ? "not configured" : undefined} />
+      <Leg
+        name="Augment"
+        state={health.augment}
+        detail={health.augment === "off" ? "no external augment service" : undefined}
+      />
 
       {llm.state === "degraded" && llm.note ? (
         <p className="mt-2 rounded-lg border border-red-400/30 bg-red-400/10 px-3 py-2 text-xs text-red-600 dark:text-red-300">
@@ -131,6 +136,13 @@ export function RetrievalHealthCard({ health }: { health: RetrievalHealth }) {
         <p className="mt-2 rounded-lg border border-amber-400/25 bg-amber-400/10 px-3 py-2 text-xs text-amber-600 dark:text-amber-300">
           Some retrieval legs are off — answers rely on keyword search alone. That&apos;s fine at small
           scale but weaker for paraphrased questions across a large corpus.
+        </p>
+      ) : null}
+      {!health.emailDeliverable ? (
+        <p className="mt-2 rounded-lg border border-amber-400/25 bg-amber-400/10 px-3 py-2 text-xs text-amber-600 dark:text-amber-300">
+          No email provider is configured (<code>RESEND_API_KEY</code> / <code>SMTP_URL</code>) — member
+          invites and the degraded-stack ops alerts above can&apos;t be delivered, so a problem here
+          won&apos;t reach anyone by email. Password login still works.
         </p>
       ) : null}
     </div>
