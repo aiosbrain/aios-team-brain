@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "requiredMarkers": [
+    "Inspect before installing.",
+    "Explain what you found.",
+    "Personal / Join / Create",
+    "repair or upgrade",
+    "canonical Brain origin",
+    "human gate",
+    "Never run `aios push`",
+    "What AIOS now understands.",
+    "What stays private.",
+    "What can be shared.",
+    "Your best next step."
+  ]
+}
