@@ -6,8 +6,18 @@ import { audit } from "@/lib/api/audit";
 import { completeTextOrNull } from "@/lib/llm/complete";
 import { extractFromTranscript, type ProviderKeys, type RosterPerson } from "./llm-extract";
 import { extractAndStoreActionItems } from "./action-items";
+import { remapMeetingTodoSourceItem } from "./extract-todos";
 import { canLlmMerge, mergeTranscripts, transcriptOverlap } from "./merge-format";
-import { addMeetingNoteAttendees, addMeetingNoteSubmitters, setMeetingNoteMergedInto, updateMeetingSummary } from "./notes";
+import {
+  MEETING_NOTES_PROJECT_SLUG,
+  addMeetingNoteAttendees,
+  addMeetingNoteSubmitters,
+  createMeetingNoteFromItem,
+  notePath,
+  setMeetingNoteMergedInto,
+  setMeetingNoteSourceItem,
+  updateMeetingSummary,
+} from "./notes";
 
 const MERGE_SYSTEM =
   "You are given two transcripts of the SAME meeting, captured by different note-takers. They " +
@@ -89,7 +99,10 @@ export async function findDuplicateMeeting(
     .from("meeting_notes")
     .select("id, source_item_id, submitted_by, title")
     .eq("team_id", teamId)
-    .eq("occurred_at", occurredAt);
+    .eq("occurred_at", occurredAt)
+    // Never match a note that's already been folded away (`merged_into` set) — merging into a hidden
+    // note makes the upload vanish (it inherits the tombstone and never shows on the Meetings page).
+    .is("merged_into", null);
   const noteRows = (notes ?? []) as { id: string; source_item_id: string; submitted_by: string | null; title: string }[];
   if (!noteRows.length) return null;
 
@@ -129,6 +142,10 @@ export interface MergeInput {
   newRawText: string;
   /** The incoming upload's submitter to credit (null for a CLI-imported note with no submitter). */
   newSubmitterId: string | null;
+  /** The incoming upload's tier. The merged body is floored to the MOST RESTRICTIVE of this and the
+   *  existing item's access, so a team-tier upload can't be widened to external by the merge. GUI
+   *  uploads are always "team"; defaults to "team" (fail-safe — never widens). */
+  newAccess?: "team" | "external";
   newAttendeeIds?: string[];
   roster: RosterPerson[];
   keys: ProviderKeys;
@@ -158,23 +175,57 @@ export async function mergeIntoMeetingNote(
   const author = match.primarySubmitterId ?? input.newSubmitterId ?? input.authorFallbackMemberId ?? null;
   if (!author) throw new Error("mergeIntoMeetingNote: no member to attribute the merged transcript to");
 
-  // Re-ingest the merged transcript into the SAME item (team+project+path upsert → new sha/body).
-  await ingestItem(
+  // Tier floor (M1): the merged body is only as widely visible as its MOST RESTRICTIVE source —
+  // "team" is more restrictive than "external", so if either side is team-tier the result is team.
+  // A team-tier upload folded into an external item must not become externally readable.
+  const newAccess = input.newAccess ?? "team";
+  const mergedAccess: "team" | "external" =
+    match.itemAccess === "team" || newAccess === "team" ? "team" : "external";
+
+  // Write the merged transcript to a MERGE-OWNED item (C1): `meetings/<noteId>.md`, the same synthetic
+  // path GUI notes use. NEVER back into the matched item's path — if that item is connector-owned
+  // (a CLI/GitHub-synced transcript), the next sync re-pushes the ORIGINAL file, its sha != the merged
+  // body's, and the merge is silently overwritten. Keying on the surviving note id makes re-merges
+  // upsert the same item.
+  const mergedPath = notePath(match.noteId);
+  const mergedItem = await ingestItem(
     admin,
     { teamId, memberId: author, apiKeyId: randomUUID() },
     {
-      project: match.itemProject,
-      path: match.itemPath,
+      project: MEETING_NOTES_PROJECT_SLUG,
+      path: mergedPath,
       kind: "transcript",
       content_sha256: sha256(merged),
       actor: "meeting-notes-merge",
-      access: match.itemAccess,
+      access: mergedAccess,
       frontmatter: { title: match.title },
       body: merged,
     },
-    match.itemAccess,
+    mergedAccess,
     { authorMemberId: author }
   );
+
+  // If the survivor was pointing at a foreign (connector-owned) item, move it onto the merge-owned
+  // item and RETIRE the old one with a hidden tombstone note — otherwise the meetings backfill, which
+  // notes every un-noted transcript item, would resurrect the original as a separate meeting.
+  if (mergedItem.id !== match.sourceItemId) {
+    await setMeetingNoteSourceItem(admin, match.noteId, mergedItem.id);
+    // Move already-extracted action items onto the new item's namespace (H1) so re-extraction upserts
+    // over them (no duplicates / no broken PM links) and the note still shows them.
+    await remapMeetingTodoSourceItem(admin, teamId, match.sourceItemId, mergedItem.id);
+    // Retire the old item with a note that's hidden ATOMICALLY (inserted with merged_into set) — so it's
+    // never briefly visible and a crash can't leave a dangling-visible duplicate — keeping the meetings
+    // backfill (which notes every un-noted transcript item) from resurrecting it as a separate meeting.
+    await createMeetingNoteFromItem(admin, teamId, {
+      sourceItemId: match.sourceItemId,
+      title: match.title,
+      occurredAt: null,
+      summary: "",
+      submittedByMemberId: match.primarySubmitterId,
+      attendeeMemberIds: [],
+      mergedInto: match.noteId,
+    });
+  }
 
   // Credit both submitters + union attendees from the new upload.
   await addMeetingNoteSubmitters(admin, match.noteId, [match.primarySubmitterId, input.newSubmitterId].filter((x): x is string => !!x));
@@ -192,7 +243,7 @@ export async function mergeIntoMeetingNote(
     await extractAndStoreActionItems(
       admin,
       teamId,
-      { id: match.sourceItemId, path: match.itemPath, access: match.itemAccess },
+      { id: mergedItem.id, path: mergedPath, access: mergedAccess },
       merged,
       input.roster,
       input.keys
@@ -208,7 +259,13 @@ export async function mergeIntoMeetingNote(
     action: "meeting_note.merged",
     target_type: "meeting_note",
     target_id: match.noteId,
-    meta: { overlap: Math.round(match.overlap * 100) / 100, merged_from_item: match.sourceItemId },
+    meta: {
+      overlap: Math.round(match.overlap * 100) / 100,
+      merged_from_item: match.sourceItemId,
+      merged_item: mergedItem.id,
+      // Set only when the note was moved off a foreign (connector-owned) item and it was retired.
+      retired_item: mergedItem.id !== match.sourceItemId ? match.sourceItemId : null,
+    },
   });
 
   return match.noteId;
@@ -276,9 +333,11 @@ export async function backfillMergeDuplicateMeetings(
 
   const { data: items } = await admin
     .from("items")
-    .select("id, body")
+    .select("id, body, access")
     .in("id", rows.map((r) => r.source_item_id));
-  const bodyById = new Map(((items ?? []) as { id: string; body: string }[]).map((i) => [i.id, i.body ?? ""]));
+  const itemRows = (items ?? []) as { id: string; body: string; access: "team" | "external" }[];
+  const bodyById = new Map(itemRows.map((i) => [i.id, i.body ?? ""]));
+  const accessById = new Map(itemRows.map((i) => [i.id, i.access]));
 
   const roster: RosterPerson[] = await admin
     .from("members")
@@ -317,6 +376,7 @@ export async function backfillMergeDuplicateMeetings(
           await mergeIntoMeetingNote(admin, teamId, match, {
             newRawText: bodyById.get(dup.source_item_id) ?? "",
             newSubmitterId: dup.submitted_by,
+            newAccess: accessById.get(dup.source_item_id) ?? "team",
             newAttendeeIds: ((att ?? []) as { member_id: string }[]).map((a) => a.member_id),
             roster,
             keys: opts.keys,

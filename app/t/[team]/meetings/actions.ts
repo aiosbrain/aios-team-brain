@@ -83,6 +83,7 @@ export async function uploadMeetingNoteAction(
       const mergedNoteId = await mergeIntoMeetingNote(admin, team.id, dup, {
         newRawText: parsed.data.rawText,
         newSubmitterId: me.id,
+        newAccess: "team", // GUI uploads are always team-tier (createMeetingNote hard-codes it)
         newAttendeeIds: extraction.attendeeMemberIds,
         roster,
         keys,
