@@ -201,6 +201,11 @@ async function callLLMRaw(
       // query model when unset), with reasoning left ON and extra headroom for it.
       role: "reasoning",
       maxTokens: 4096,
+      // A reasoning model reasoning over ~200 facts routinely needs far more than completeText's 30s
+      // default — at 30s the call was aborted (timeout) and arcs came back empty. 110s covers the
+      // observed latency while staying under the route's 120s maxDuration; the fire-and-forget
+      // background refresh (SWR) isn't route-bound, so it can use the full window.
+      timeoutMs: 110_000,
       // Record the outcome so a broken answering model (e.g. a reasoning model returning empty) shows
       // as "degraded" on the dashboard instead of silently blanking the Learning page.
       record: record ? { db: record.db, teamId: record.teamId, task: "arcs" } : undefined,

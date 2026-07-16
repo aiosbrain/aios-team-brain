@@ -54,6 +54,21 @@ const STALE_MS = 2 * 60 * 60 * 1000; // no embed activity in 2h + incomplete = s
  */
 export const graphConfigured = graphitiConfigured;
 
+/** Whether the graph has any projected episodes for this team — the proxy for "facts exist to
+ *  synthesize arcs from." Empty ⇒ the projector never populated the graph (a graph/projector issue),
+ *  as opposed to a synthesis/model failure. Best-effort: false on any error. */
+export async function graphHasFacts(teamId: string): Promise<boolean> {
+  try {
+    const res = await runSql<{ n: number }>(
+      "select count(*)::int as n from graph_episodes where team_id = $1",
+      [teamId]
+    );
+    return (res.rows[0]?.n ?? 0) > 0;
+  } catch {
+    return false;
+  }
+}
+
 // Reachable but no projection in this long ⇒ the graph is going stale even though /healthcheck is
 // green. This is the 2026-07 failure a healthcheck-only probe MISSED: Graphiti's write endpoint
 // 422'd for days (projector wedged) while the service kept answering /healthcheck, so the card read
