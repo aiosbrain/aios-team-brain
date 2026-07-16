@@ -16,6 +16,7 @@ import {
   setPrimaryPmProvider,
   saveProviderModel,
   setAnsweringProvider,
+  setReasoningModel,
   type PrimaryPmProvider,
 } from "@/app/t/[team]/admin/integrations/actions";
 import type { AnsweringProvider } from "@/lib/query/llm-backend";
@@ -34,6 +35,8 @@ export interface AnsweringState {
   localConfigured: boolean;
   openrouterConfigured: boolean;
   openaiConfigured: boolean;
+  /** The team's distinct reasoning-model slug (teams.reasoning_model), or null to reuse the query model. */
+  reasoningModel: string | null;
 }
 
 const PROVIDER_LABEL: Record<AnsweringProvider, string> = {
@@ -210,6 +213,12 @@ export function IntegrationsManager({
     run(() => saveProviderModel(teamSlug, p, modelDraft[p].trim()));
   }
 
+  // Distinct reasoning model (teams.reasoning_model) — used for reasoning-heavy tasks (arc synthesis).
+  const [reasoningDraft, setReasoningDraft] = useState(answering.reasoningModel ?? "");
+  function saveReasoning() {
+    run(() => setReasoningModel(teamSlug, reasoningDraft.trim()));
+  }
+
   function chooseBackend(p: AnsweringProvider | null) {
     run(() => setAnsweringProvider(teamSlug, p));
   }
@@ -282,6 +291,33 @@ export function IntegrationsManager({
             below (or in the OpenRouter panel) to activate it.
           </p>
         ) : null}
+
+        <div className="mt-1 flex flex-col gap-1.5 border-t border-border-subtle pt-3">
+          <p className="text-xs font-medium text-ink">Reasoning model (optional)</p>
+          <p className="text-xs text-ink-secondary">
+            A distinct model for reasoning-heavy tasks (narrative arc synthesis), on the same provider.
+            Leave blank to reuse the answering model above. Extraction tasks (summaries, action items,
+            drafts) always use the answering model with reasoning off, so a reasoning model here can
+            improve arcs without blanking the rest.
+          </p>
+          <div className="flex items-center gap-2">
+            <input
+              value={reasoningDraft}
+              onChange={(e) => setReasoningDraft(e.target.value)}
+              placeholder="e.g. qwen/qwen3.7-plus (blank = same as answering model)"
+              disabled={pending}
+              className="min-w-0 flex-1 rounded-md border border-ink/15 bg-transparent px-2.5 py-1.5 font-mono text-xs text-ink outline-none focus:border-ink/30 disabled:opacity-50"
+            />
+            <button
+              type="button"
+              onClick={saveReasoning}
+              disabled={pending || reasoningDraft.trim() === (answering.reasoningModel ?? "")}
+              className="btn-prism shrink-0 text-xs disabled:opacity-50"
+            >
+              Save
+            </button>
+          </div>
+        </div>
       </div>
 
       <div className="prism-card flex flex-col gap-3 p-4">

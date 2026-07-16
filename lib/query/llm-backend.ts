@@ -46,7 +46,16 @@ export interface LlmBackendKeys {
   openrouterModel?: string | null;
   /** Explicit override (`teams.answering_provider`); null/undefined = auto precedence. */
   activeProvider?: AnsweringProvider | null;
+  /**
+   * Optional distinct model for reasoning-heavy tasks (`teams.reasoning_model`). When set, a
+   * `role: "reasoning"` selection uses it (on whatever provider answers) instead of the query model.
+   * Null/undefined → reasoning tasks reuse the query model.
+   */
+  reasoningModel?: string | null;
 }
+
+/** Which model to select: the default interactive/extraction model, or the reasoning model. */
+export type LlmRole = "query" | "reasoning";
 
 export type LlmBackend =
   | { kind: "openrouter"; provider: "openrouter"; baseUrl: string; model: string; apiKey: string; headers: Record<string, string> }
@@ -113,16 +122,23 @@ function candidate(
  * auto precedence (OpenRouter → LLM_BASE_URL → Anthropic). `anthropic` is always available, so
  * auto never returns null.
  */
-export function selectLlmBackend(env: LlmBackendEnv, keys: LlmBackendKeys): LlmBackend {
-  if (keys.activeProvider) {
-    const forced = candidate(keys.activeProvider, env, keys);
-    if (forced) return forced;
-  }
-  return (
+export function selectLlmBackend(
+  env: LlmBackendEnv,
+  keys: LlmBackendKeys,
+  opts?: { role?: LlmRole }
+): LlmBackend {
+  const backend =
+    (keys.activeProvider ? candidate(keys.activeProvider, env, keys) : null) ??
     candidate("openrouter", env, keys) ??
     candidate("local", env, keys) ??
-    candidate("anthropic", env, keys)!
-  );
+    candidate("anthropic", env, keys)!;
+
+  // For a reasoning-role task, swap in the team's distinct reasoning model (on whatever provider
+  // answers). Unset → the query model already on `backend` stands, so reasoning falls back cleanly.
+  if (opts?.role === "reasoning" && nonEmpty(keys.reasoningModel)) {
+    return { ...backend, model: keys.reasoningModel.trim() };
+  }
+  return backend;
 }
 
 /**

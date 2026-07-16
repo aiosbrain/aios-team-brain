@@ -399,6 +399,37 @@ export async function setAnsweringProvider(
   return { ok: true };
 }
 
+/**
+ * Set (or clear) the team's distinct REASONING model (`teams.reasoning_model`) — the model used for
+ * reasoning-heavy tasks (narrative arc synthesis) on whatever provider answers. Empty string clears
+ * it → reasoning tasks reuse the query model. Admins only; audited.
+ */
+export async function setReasoningModel(
+  teamSlug: string,
+  model: string
+): Promise<{ ok: boolean; error?: string }> {
+  const ctx = await requireAdmin(teamSlug);
+  if (!ctx) return { ok: false, error: "admins only" };
+  const trimmed = model.trim().slice(0, 200);
+  const db = adminClient();
+  const { error } = await db
+    .from("teams")
+    .update({ reasoning_model: trimmed || null })
+    .eq("id", ctx.teamId);
+  if (error) return { ok: false, error: error.message };
+  await audit(db, {
+    team_id: ctx.teamId,
+    actor_kind: "member",
+    member_id: ctx.memberId,
+    action: "team.reasoning_model_set",
+    target_type: "team",
+    target_id: ctx.teamId,
+    meta: { model: trimmed || null },
+  });
+  revalidatePath(`/t/${teamSlug}/admin/integrations`);
+  return { ok: true };
+}
+
 export async function removeIntegration(
   teamSlug: string,
   id: string

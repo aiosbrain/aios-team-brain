@@ -1,6 +1,6 @@
 import "server-only";
 import Anthropic from "@anthropic-ai/sdk";
-import { selectLlmBackend, type LlmBackendKeys } from "@/lib/query/llm-backend";
+import { selectLlmBackend, type LlmBackendKeys, type LlmRole } from "@/lib/query/llm-backend";
 import { recordIngestRun } from "@/lib/ingest/runs";
 import type { DbClient } from "@/lib/db/types";
 
@@ -44,6 +44,13 @@ export interface CompleteOptions {
   /** Ask for strict JSON: sets `response_format` on OpenAI-compatible + nudges every provider. */
   jsonObject?: boolean;
   /**
+   * Which team model to use. `"query"` (default) = the direct/extraction model, with reasoning turned
+   * OFF on OpenRouter (extraction doesn't need chain-of-thought and a reasoning model would starve
+   * the answer). `"reasoning"` = the team's distinct reasoning model (`teams.reasoning_model`) with
+   * reasoning left ON — for genuinely reasoning-heavy tasks like narrative arc synthesis.
+   */
+  role?: LlmRole;
+  /**
    * Durably record this call's outcome (ok/fail + model) to `ingest_runs` (source `llm`), so the
    * answering-model health leg on the dashboard can show when the model is failing (empty output /
    * transport / auth) instead of the failure being an invisible `null`. Opt-in per caller (needs a
@@ -74,7 +81,7 @@ export async function completeText(args: CompleteArgs, opts: CompleteOptions = {
   const keys = opts.keys ?? {};
   const maxTokens = opts.maxTokens ?? 1024;
   const timeoutMs = opts.timeoutMs ?? 30_000;
-  const backend = selectLlmBackend({ LLM_BASE_URL, LLM_MODEL }, keys);
+  const backend = selectLlmBackend({ LLM_BASE_URL, LLM_MODEL }, keys, { role: opts.role });
   const startedAt = Date.now();
 
   // For JSON mode, nudge every provider (OpenAI's json_object mode also requires "json" in the
@@ -97,13 +104,14 @@ export async function completeText(args: CompleteArgs, opts: CompleteOptions = {
           // Answer budget + reasoning headroom (see REASONING_HEADROOM_TOKENS) so a reasoning model's
           // hidden tokens don't starve the answer to empty.
           max_tokens: maxTokens + REASONING_HEADROOM_TOKENS,
-          // These are structured extraction/short-generation tasks (arcs, summaries, social, titles) —
-          // NOT chain-of-thought. On OpenRouter, turn reasoning OFF so a reasoning model (e.g.
-          // qwen/qwen3.7-plus) can't spend the whole budget on hidden thinking and return empty content
-          // (what blanked the Learning page). Headroom stays as a belt-and-suspenders. The streaming
-          // Query path (lib/query/claude.ts) is separate and can still reason. Ignored by non-reasoning
-          // models. Override with LLM_DISABLE_REASONING=0.
-          ...(backend.kind === "openrouter" && process.env.LLM_DISABLE_REASONING !== "0"
+          // For the QUERY role (the default — extraction/short generation), turn reasoning OFF on
+          // OpenRouter so a reasoning model can't spend the whole budget on hidden thinking and return
+          // empty content (what blanked the Learning page). The REASONING role deliberately leaves it
+          // ON — that's the point of the separate reasoning model (e.g. arc synthesis). Ignored by
+          // non-reasoning models. Override with LLM_DISABLE_REASONING=0.
+          ...(backend.kind === "openrouter" &&
+          opts.role !== "reasoning" &&
+          process.env.LLM_DISABLE_REASONING !== "0"
             ? { reasoning: { enabled: false } }
             : {}),
           ...(opts.jsonObject ? { response_format: { type: "json_object" } } : {}),
