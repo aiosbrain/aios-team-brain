@@ -42,14 +42,24 @@ export function RetrievalHealthCard({ health }: { health: RetrievalHealth }) {
     d.state === "off"
       ? undefined
       : `${d.coveragePct}% embedded (${d.embeddedItems}/${d.embeddableItems})${d.pendingItems ? `, ${d.pendingItems} pending` : ""}${d.lastEmbeddedAt ? `, last ${timeAgo(d.lastEmbeddedAt)}` : ""}`;
+  // Reachable but no projection in > 6h ⇒ the projector has stalled even though /healthcheck answers
+  // (the 2026-07 failure: writes 422'd for days while the service stayed "up"). The server flags this
+  // (`graphStalled`) so the banner tells the admin which failure it actually is.
+  const graphStalled = health.graphStalled;
+  const graphFreshness =
+    health.graphEpisodes != null
+      ? `${health.graphEpisodes} episodes${health.graphLastProjectedAt ? ` · last projected ${timeAgo(health.graphLastProjectedAt)}` : " · none projected yet"}`
+      : undefined;
   const graphDetail =
     health.graph === "off"
       ? "not configured"
-      : health.graph === "degraded"
-        ? "configured but unreachable"
-        : undefined;
-  // A configured-but-unreachable graph is a real failure (set GRAPHITI_URL but the service is down),
-  // distinct from simply "off" — flag it loudly (red), like a degraded semantic leg.
+      : graphStalled
+        ? `projector stalled — ${graphFreshness}`
+        : health.graph === "degraded"
+          ? "configured but unreachable"
+          : graphFreshness;
+  // A configured-but-unreachable OR stalled-projector graph is a real failure — flag it loudly (red),
+  // like a degraded semantic leg.
   const graphDegraded = health.graph === "degraded";
   const worst = d.state === "degraded" || health.graph === "off";
 
@@ -71,9 +81,20 @@ export function RetrievalHealthCard({ health }: { health: RetrievalHealth }) {
 
       {graphDegraded ? (
         <p className="mt-2 rounded-lg border border-red-400/30 bg-red-400/10 px-3 py-2 text-xs text-red-600 dark:text-red-300">
-          Graph memory is configured but not responding — <code>GRAPHITI_URL</code> is set, but its
-          <code> /healthcheck</code> failed (service down or unreachable). Keyword and semantic search
-          are unaffected; check the Graphiti service.
+          {graphStalled ? (
+            <>
+              Graph memory is reachable but the <strong>projector has stalled</strong> — no new episodes
+              since {timeAgo(health.graphLastProjectedAt!)}. New activity isn&apos;t reaching the graph
+              (writes may be failing — check the logs for a Graphiti <code>422</code>). Existing memory
+              still answers; keyword and semantic search are unaffected.
+            </>
+          ) : (
+            <>
+              Graph memory is configured but not responding — <code>GRAPHITI_URL</code> is set, but its
+              <code> /healthcheck</code> failed (service down or unreachable). Keyword and semantic search
+              are unaffected; check the Graphiti service.
+            </>
+          )}
         </p>
       ) : null}
       {d.note ? (

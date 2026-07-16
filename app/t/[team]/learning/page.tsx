@@ -35,7 +35,7 @@ export default async function LearningPage({ params }: { params: Promise<{ team:
 
       <section className="flex flex-col gap-2">
         <h2 className="text-sm font-semibold uppercase tracking-wider text-ink-tertiary">
-          Narrative arcs · last 7 days
+          Narrative arcs · most recent
         </h2>
         <ArcsPanel teamSlug={teamSlug} />
       </section>

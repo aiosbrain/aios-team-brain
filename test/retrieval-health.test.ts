@@ -56,14 +56,24 @@ describe("graphConfigured", () => {
 });
 
 describe("deriveGraphState", () => {
+  const now = Date.parse("2026-07-15T12:00:00Z");
+  const fresh = Date.parse("2026-07-15T11:00:00Z"); // 1h ago
+  const stale = Date.parse("2026-07-08T12:00:00Z"); // 7d ago
   it("off when not configured (regardless of reachability)", () => {
-    expect(deriveGraphState({ configured: false, reachable: false })).toBe("off");
-    expect(deriveGraphState({ configured: false, reachable: true })).toBe("off");
+    expect(deriveGraphState({ configured: false, reachable: false, lastProjectedAtMs: null, nowMs: now })).toBe("off");
+    expect(deriveGraphState({ configured: false, reachable: true, lastProjectedAtMs: fresh, nowMs: now })).toBe("off");
   });
-  it("on when configured AND /healthcheck answered", () => {
-    expect(deriveGraphState({ configured: true, reachable: true })).toBe("on");
+  it("on when reachable AND recently projected", () => {
+    expect(deriveGraphState({ configured: true, reachable: true, lastProjectedAtMs: fresh, nowMs: now })).toBe("on");
+  });
+  it("on when reachable and nothing has projected yet (null = fresh install, not a stall)", () => {
+    expect(deriveGraphState({ configured: true, reachable: true, lastProjectedAtMs: null, nowMs: now })).toBe("on");
   });
   it("degraded when configured BUT unreachable — the silent-failure case reviving must surface", () => {
-    expect(deriveGraphState({ configured: true, reachable: false })).toBe("degraded");
+    expect(deriveGraphState({ configured: true, reachable: false, lastProjectedAtMs: fresh, nowMs: now })).toBe("degraded");
+  });
+  it("degraded when reachable BUT projector stalled — the 2026-07 healthcheck-only blind spot", () => {
+    // /healthcheck answers (reachable) yet no episode has landed in a week → writes are failing silently.
+    expect(deriveGraphState({ configured: true, reachable: true, lastProjectedAtMs: stale, nowMs: now })).toBe("degraded");
   });
 });

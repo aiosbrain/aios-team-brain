@@ -35,7 +35,7 @@ export interface AtomicFact {
  */
 export async function recentFacts(
   groups: string[],
-  sinceISO: string,
+  sinceISO: string | null,
   limit = 15
 ): Promise<AtomicFact[]> {
   if (!neo4jConfigured() || groups.length === 0) return [];
@@ -73,9 +73,11 @@ export async function recentFacts(
     }));
   };
   try {
+    // `sinceISO === null` means "no time box — just the most-recent N" (arcs aren't time-boxed).
+    // With a window, fall back to most-recent-N (still tier-scoped) only when the window is empty —
+    // preserves the "recent" intent when the graph is fresh, degrades gracefully when it's stale/sparse.
+    if (sinceISO === null) return await query(false);
     const windowed = await query(true);
-    // Fall back to most-recent-N (still tier-scoped) only when the window is empty — preserves the
-    // "recent" intent when the graph is fresh, degrades gracefully when it's stale/sparse.
     return windowed.length > 0 ? windowed : await query(false);
   } catch {
     return []; // degrade — panel shows empty rather than erroring

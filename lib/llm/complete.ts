@@ -17,6 +17,18 @@ import { selectLlmBackend, type LlmBackendKeys } from "@/lib/query/llm-backend";
 const LLM_BASE_URL = process.env.LLM_BASE_URL;
 const LLM_MODEL = process.env.LLM_MODEL;
 
+/**
+ * Reasoning models (e.g. OpenRouter's `qwen/qwen3.7-plus`, o-series) spend completion tokens on
+ * HIDDEN reasoning BEFORE emitting any answer, and `max_tokens` caps reasoning+answer TOGETHER. With
+ * only the caller's answer-sized budget, reasoning can consume all of it → empty `content` → callers
+ * silently degrade (this is exactly what blanked the Learning page in 2026-07). So we give the
+ * OpenAI-compatible/OpenRouter path headroom ON TOP of the requested answer budget: you're billed only
+ * for tokens actually generated, so this is free for non-reasoning models and makes any model choice
+ * work. Override with LLM_REASONING_HEADROOM_TOKENS. (The Anthropic path uses a separate thinking
+ * budget and isn't affected.)
+ */
+const REASONING_HEADROOM_TOKENS = Number(process.env.LLM_REASONING_HEADROOM_TOKENS ?? 6000);
+
 export interface CompleteArgs {
   system: string;
   prompt: string;
@@ -53,7 +65,9 @@ export async function completeText(args: CompleteArgs, opts: CompleteOptions = {
       },
       body: JSON.stringify({
         model: backend.model,
-        max_tokens: maxTokens,
+        // Answer budget + reasoning headroom (see REASONING_HEADROOM_TOKENS) so a reasoning model's
+        // hidden tokens don't starve the answer to empty.
+        max_tokens: maxTokens + REASONING_HEADROOM_TOKENS,
         ...(opts.jsonObject ? { response_format: { type: "json_object" } } : {}),
         messages: [
           { role: "system", content: args.system },
@@ -65,9 +79,19 @@ export async function completeText(args: CompleteArgs, opts: CompleteOptions = {
     if (!res.ok) {
       throw new Error(`LLM ${backend.model} @ ${backend.baseUrl}: ${res.status} ${await res.text().catch(() => "")}`);
     }
-    const j = (await res.json()) as { choices?: { message?: { content?: string } }[] };
-    const text = j.choices?.[0]?.message?.content ?? "";
-    if (!text.trim()) throw new Error("LLM returned empty content");
+    const j = (await res.json()) as {
+      choices?: { message?: { content?: string }; finish_reason?: string }[];
+    };
+    const choice = j.choices?.[0];
+    const text = choice?.message?.content ?? "";
+    if (!text.trim()) {
+      // Name WHY it's empty — `finish_reason:"length"` on empty content is the reasoning-model
+      // starvation signature (all of max_tokens went to hidden reasoning). Loud so a blank panel is
+      // never a silent, undiagnosable one.
+      throw new Error(
+        `LLM returned empty content (model=${backend.model}, finish_reason=${choice?.finish_reason ?? "?"})`
+      );
+    }
     return text.trim();
   }
 
