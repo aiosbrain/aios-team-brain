@@ -1,35 +1,27 @@
 import type { Metadata } from "next";
-import { redirect } from "next/navigation";
 
-import { serverClient } from "@/lib/db/server";
-import { currentMember } from "@/lib/auth/guard";
-import { listMeetingNotesForTeam, type MeetingNoteSummary } from "@/lib/meetings/notes";
+import { loadTeamId, loadViewer, loadMeetingNotes, sortedMeetingNotes } from "@/lib/meetings/loaders";
+import { MeetingDetailView } from "@/components/meetings/meeting-detail-view";
 
 export const metadata: Metadata = { title: "Meetings" };
 
-function meetingTime(note: MeetingNoteSummary): number {
-  const t = new Date(note.occurredAt ?? note.createdAt).getTime();
-  return Number.isNaN(t) ? 0 : t;
-}
-
 /**
- * Meetings index: there's no standalone index UI in the two-pane view — the list is the layout's left
- * rail. If any meeting exists we redirect to the most recent one so the right pane is populated on
- * arrival; if none exist the layout renders the empty state (this returns nothing).
+ * Meetings index: the list is the layout's left rail. Rather than REDIRECT to the newest note (a
+ * second full request), render its detail inline here — so arriving at /meetings is one request. If
+ * no meeting exists the layout shows the empty state (this returns nothing). All loads are the same
+ * `cache()`d calls the layout already made this request, so they don't re-query.
  */
 export default async function MeetingsIndexPage({ params }: { params: Promise<{ team: string }> }) {
   const { team: teamSlug } = await params;
-  const db = await serverClient();
+  const teamId = await loadTeamId(teamSlug);
+  if (!teamId) return null;
 
-  const { data: team } = await db.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
-  if (!team) return null;
-
-  const me = await currentMember(team.id);
+  const me = await loadViewer(teamId);
   if (!me) return null;
 
-  const notes = await listMeetingNotesForTeam(db, team.id, me.tier);
+  const notes = await loadMeetingNotes(teamId, me.tier);
   if (notes.length === 0) return null; // layout shows the empty state
 
-  const newest = [...notes].sort((a, b) => meetingTime(b) - meetingTime(a))[0];
-  redirect(`/t/${teamSlug}/meetings/${newest.id}`);
+  const newest = sortedMeetingNotes(notes)[0];
+  return <MeetingDetailView teamSlug={teamSlug} teamId={teamId} noteId={newest.id} tier={me.tier} />;
 }
