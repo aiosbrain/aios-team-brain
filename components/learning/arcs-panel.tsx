@@ -34,7 +34,9 @@ type Status = "loading" | "ready" | "error";
 export function ArcsPanel({ teamSlug }: { teamSlug: string }) {
   const [arcs, setArcs] = useState<Arc[]>([]);
   const [status, setStatus] = useState<Status>("loading");
-  const [degraded, setDegraded] = useState(false); // empty because the answering model is failing
+  // Why the panel is empty (server-diagnosed): no_facts | model_failing | synthesis_empty | null.
+  const [emptyReason, setEmptyReason] = useState<string | null>(null);
+  const [emptyNote, setEmptyNote] = useState<string | null>(null);
   const [edited, setEdited] = useState<Record<string, string>>({}); // arc_id → corrected text
   const [editing, setEditing] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
@@ -50,10 +52,11 @@ export function ArcsPanel({ teamSlug }: { teamSlug: string }) {
           body: JSON.stringify({ team: teamSlug }),
         });
         if (!res.ok) throw new Error();
-        const data = (await res.json()) as { arcs?: Arc[]; degraded?: boolean };
+        const data = (await res.json()) as { arcs?: Arc[]; reason?: string | null; note?: string | null };
         if (alive) {
           setArcs(data.arcs ?? []);
-          setDegraded(!!data.degraded);
+          setEmptyReason(data.reason ?? null);
+          setEmptyNote(data.note ?? null);
           setStatus("ready");
         }
       } catch {
@@ -105,24 +108,23 @@ export function ArcsPanel({ teamSlug }: { teamSlug: string }) {
       </p>
     );
   }
-  if (arcs.length === 0 && degraded) {
-    // Empty because the answering model is failing (not a quiet week) — say so and point to the fix,
-    // instead of the benign "no arcs yet" that made a broken model look like normal emptiness.
-    return (
-      <div className="rounded-lg border border-red-400/30 bg-red-400/10 px-4 py-3 text-sm text-red-600 dark:text-red-300">
-        Arcs can&apos;t be generated right now — the answering model is failing to produce output. An
-        admin can check <span className="font-medium">Admin → Integrations → Retrieval health</span> and
-        the <span className="font-medium">Active answering model</span> (a reasoning model can starve
-        its own answer; try a non-reasoning one).
-      </div>
-    );
-  }
   if (arcs.length === 0) {
+    // A real problem (no graph facts, or a failing model) is shown as an actionable red card; a
+    // transient/quiet-week empty stays a benign note. The server diagnoses which (see the arcs route).
+    const isProblem = emptyReason === "no_facts" || emptyReason === "model_failing";
+    if (isProblem && emptyNote) {
+      return (
+        <div className="rounded-lg border border-red-400/30 bg-red-400/10 px-4 py-3 text-sm text-red-600 dark:text-red-300">
+          {emptyNote}
+        </div>
+      );
+    }
     return (
       <div className="prism-card flex flex-col items-center gap-2 px-4 py-8 text-center">
         <Sparkles className="size-5 text-violet" />
         <p className="max-w-sm text-sm text-ink-secondary">
-          No active narrative arcs yet — they emerge once the graph has enough team activity to synthesize.
+          {emptyNote ??
+            "No active narrative arcs yet — they emerge once the graph has enough team activity to synthesize."}
         </p>
       </div>
     );

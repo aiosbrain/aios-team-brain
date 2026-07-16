@@ -8,9 +8,15 @@ import { resolveAnsweringKeys } from "@/lib/query/answering";
 import { visibleGroupIds } from "@/lib/graph/group";
 import { getArcs } from "@/lib/graph/arcs";
 import { getLlmHealth } from "@/lib/query/llm-health";
+import { graphHasFacts } from "@/lib/query/retrieval-health";
 
 export const runtime = "nodejs";
-export const maxDuration = 60;
+// Arc synthesis with a reasoning model can be slow (it reasons over ~200 facts). Give the inline
+// cold-compute path headroom; the SWR background refresh isn't bound by this anyway.
+export const maxDuration = 120;
+
+/** Why the arc panel is empty — so the UI shows the actual cause instead of a benign "no arcs yet". */
+type EmptyReason = "no_facts" | "model_failing" | "synthesis_empty" | null;
 
 const schema = z.object({ team: z.string().min(1).max(120) });
 
@@ -45,10 +51,35 @@ export async function POST(req: NextRequest) {
   const keys = await resolveAnsweringKeys(admin, team.id);
   const arcs = await getArcs(admin, team.id, teamSlug, tier, visibleGroupIds(teamSlug, tier), keys);
 
-  // Empty arcs are ambiguous: a genuinely quiet week vs. a broken answering model. When there are
-  // none AND the LLM leg is degraded, tell the client so the panel shows "the model is failing"
-  // instead of a benign "no arcs yet" — the silent-blank case that started all this.
-  const degraded = arcs.length === 0 ? (await getLlmHealth(team.id)).state === "degraded" : false;
+  // Empty arcs are ambiguous — tell the client the ACTUAL cause so the panel stops showing a benign
+  // "no arcs yet" for what is really a broken graph or a failing model:
+  //   • no facts in the graph        → the projector hasn't populated it (graph/projector issue)
+  //   • facts exist + LLM degraded   → the answering/reasoning model is failing (empty/timeout)
+  //   • facts exist + LLM ok         → synthesis produced nothing this time (usually transient)
+  let reason: EmptyReason = null;
+  let note: string | undefined;
+  if (arcs.length === 0) {
+    const [hasFacts, llm] = await Promise.all([graphHasFacts(team.id), getLlmHealth(team.id)]);
+    if (!hasFacts) {
+      reason = "no_facts";
+      note =
+        "The knowledge graph has no facts yet, so there's nothing to synthesize. The graph projector may not have run or is failing — an admin can check Admin → Integrations → Retrieval health (Graph memory).";
+    } else if (llm.state === "degraded") {
+      reason = "model_failing";
+      note =
+        llm.note ??
+        "The answering model recently failed to produce output — check Admin → Integrations and the Active answering model.";
+    } else {
+      reason = "synthesis_empty";
+      note = "The graph has facts but synthesis returned nothing this time — this is usually transient; try again shortly.";
+    }
+  }
 
-  return Response.json({ arcs, degraded, as_of: new Date().toISOString() });
+  return Response.json({
+    arcs,
+    degraded: reason === "model_failing", // back-compat flag
+    reason,
+    note,
+    as_of: new Date().toISOString(),
+  });
 }
