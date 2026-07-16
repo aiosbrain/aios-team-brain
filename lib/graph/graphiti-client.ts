@@ -113,7 +113,13 @@ export class GraphitiClient {
         body: body !== undefined ? JSON.stringify(body) : undefined,
         signal: ctrl.signal,
       });
-      if (!res.ok) throw new Error(`graphiti ${method} ${path} → ${res.status}`);
+      if (!res.ok) {
+        // Capture the response body — a FastAPI 422 carries the exact Pydantic validation detail
+        // (which field/why). Without it, a wedged projector is an undiagnosable "→ 422". Bounded so a
+        // huge error page can't blow up the log line.
+        const detail = await res.text().catch(() => "");
+        throw new Error(`graphiti ${method} ${path} → ${res.status}${detail ? `: ${detail.slice(0, 400)}` : ""}`);
+      }
       // /messages returns 202 with no useful body; /search + /episodes return JSON; DELETE returns
       // a small ack body.
       const text = await res.text();
