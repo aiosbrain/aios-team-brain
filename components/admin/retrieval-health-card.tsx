@@ -42,9 +42,9 @@ export function RetrievalHealthCard({ health }: { health: RetrievalHealth }) {
     d.state === "off"
       ? undefined
       : `${d.coveragePct}% embedded (${d.embeddedItems}/${d.embeddableItems})${d.pendingItems ? `, ${d.pendingItems} pending` : ""}${d.lastEmbeddedAt ? `, last ${timeAgo(d.lastEmbeddedAt)}` : ""}`;
-  // Reachable but no projection in > 6h ⇒ the projector has stalled even though /healthcheck answers
-  // (the 2026-07 failure: writes 422'd for days while the service stayed "up"). The server flags this
-  // (`graphStalled`) so the banner tells the admin which failure it actually is.
+  // Reachable but the projector's LAST RUN failed ⇒ writes are erroring even though /healthcheck
+  // answers (the 2026-07 failure: Graphiti 422'd every write while the service stayed "up"). The
+  // server flags this (`graphStalled`) so the banner tells the admin which failure it actually is.
   const graphStalled = health.graphStalled;
   const graphFreshness =
     health.graphEpisodes != null
@@ -83,10 +83,10 @@ export function RetrievalHealthCard({ health }: { health: RetrievalHealth }) {
         <p className="mt-2 rounded-lg border border-red-400/30 bg-red-400/10 px-3 py-2 text-xs text-red-600 dark:text-red-300">
           {graphStalled ? (
             <>
-              Graph memory is reachable but the <strong>projector has stalled</strong> — no new episodes
-              since {timeAgo(health.graphLastProjectedAt!)}. New activity isn&apos;t reaching the graph
-              (writes may be failing — check the logs for a Graphiti <code>422</code>). Existing memory
-              still answers; keyword and semantic search are unaffected.
+              Graph memory is reachable but the <strong>projector&apos;s last run failed</strong> — new
+              activity isn&apos;t reaching the graph (writes may be failing — check the logs for a
+              Graphiti <code>422</code>){health.graphLastProjectedAt ? `; last successful projection ${timeAgo(health.graphLastProjectedAt)}` : ""}. Existing
+              memory still answers; keyword and semantic search are unaffected.
             </>
           ) : (
             <>

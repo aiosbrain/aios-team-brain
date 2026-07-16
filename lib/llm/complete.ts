@@ -14,20 +14,10 @@ import { selectLlmBackend, type LlmBackendKeys } from "@/lib/query/llm-backend";
  * (arc/meeting extraction degrade to "no result" rather than failing the request).
  */
 
+import { completionMaxTokens, looksLikeTokenLimitError } from "./limits";
+
 const LLM_BASE_URL = process.env.LLM_BASE_URL;
 const LLM_MODEL = process.env.LLM_MODEL;
-
-/**
- * Reasoning models (e.g. OpenRouter's `qwen/qwen3.7-plus`, o-series) spend completion tokens on
- * HIDDEN reasoning BEFORE emitting any answer, and `max_tokens` caps reasoning+answer TOGETHER. With
- * only the caller's answer-sized budget, reasoning can consume all of it → empty `content` → callers
- * silently degrade (this is exactly what blanked the Learning page in 2026-07). So we give the
- * OpenAI-compatible/OpenRouter path headroom ON TOP of the requested answer budget: you're billed only
- * for tokens actually generated, so this is free for non-reasoning models and makes any model choice
- * work. Override with LLM_REASONING_HEADROOM_TOKENS. (The Anthropic path uses a separate thinking
- * budget and isn't affected.)
- */
-const REASONING_HEADROOM_TOKENS = Number(process.env.LLM_REASONING_HEADROOM_TOKENS ?? 6000);
 
 export interface CompleteArgs {
   system: string;
@@ -56,28 +46,41 @@ export async function completeText(args: CompleteArgs, opts: CompleteOptions = {
 
   if (backend.kind !== "anthropic") {
     const apiKey = backend.apiKey ?? process.env.OPENAI_API_KEY ?? "local";
-    const res = await fetch(`${backend.baseUrl.replace(/\/$/, "")}/chat/completions`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-        ...(backend.kind === "openrouter" ? backend.headers : {}),
-      },
-      body: JSON.stringify({
-        model: backend.model,
-        // Answer budget + reasoning headroom (see REASONING_HEADROOM_TOKENS) so a reasoning model's
-        // hidden tokens don't starve the answer to empty.
-        max_tokens: maxTokens + REASONING_HEADROOM_TOKENS,
-        ...(opts.jsonObject ? { response_format: { type: "json_object" } } : {}),
-        messages: [
-          { role: "system", content: args.system },
-          { role: "user", content: prompt },
-        ],
-      }),
-      signal: AbortSignal.timeout(timeoutMs),
-    });
+    const postChat = (maxTokensToSend: number): Promise<Response> =>
+      fetch(`${backend.baseUrl.replace(/\/$/, "")}/chat/completions`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${apiKey}`,
+          ...(backend.kind === "openrouter" ? backend.headers : {}),
+        },
+        body: JSON.stringify({
+          model: backend.model,
+          max_tokens: maxTokensToSend,
+          ...(opts.jsonObject ? { response_format: { type: "json_object" } } : {}),
+          messages: [
+            { role: "system", content: args.system },
+            { role: "user", content: prompt },
+          ],
+        }),
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+
+    // Send the answer budget + reasoning headroom so a reasoning model's hidden tokens don't starve
+    // the answer to empty. If that pushes max_tokens past a small model's ceiling (a 4xx naming the
+    // token limit), retry ONCE with just the answer budget — so headroom never turns a working config
+    // into a hard failure (M6).
+    let res = await postChat(completionMaxTokens(maxTokens));
     if (!res.ok) {
-      throw new Error(`LLM ${backend.model} @ ${backend.baseUrl}: ${res.status} ${await res.text().catch(() => "")}`);
+      const body = await res.text().catch(() => "");
+      if (looksLikeTokenLimitError(res.status, body)) {
+        res = await postChat(maxTokens);
+        if (!res.ok) {
+          throw new Error(`LLM ${backend.model} @ ${backend.baseUrl}: ${res.status} ${await res.text().catch(() => "")}`);
+        }
+      } else {
+        throw new Error(`LLM ${backend.model} @ ${backend.baseUrl}: ${res.status} ${body}`);
+      }
     }
     const j = (await res.json()) as {
       choices?: { message?: { content?: string }; finish_reason?: string }[];

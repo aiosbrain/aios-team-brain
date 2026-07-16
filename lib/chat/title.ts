@@ -3,6 +3,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import type { DbClient } from "@/lib/db/types";
 import type { ProviderKeys } from "@/lib/query/claude";
 import { selectLlmBackend } from "@/lib/query/llm-backend";
+import { completionMaxTokens, looksLikeTokenLimitError } from "@/lib/llm/limits";
 import { setTitle } from "@/lib/chat/store";
 
 /**
@@ -42,24 +43,32 @@ export async function generateTitle(
     const backend = selectLlmBackend({ LLM_BASE_URL, LLM_MODEL }, keys);
     if (backend.kind !== "anthropic") {
       const apiKey = backend.apiKey ?? process.env.OPENAI_API_KEY ?? "local";
-      const res = await fetch(`${backend.baseUrl.replace(/\/$/, "")}/chat/completions`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${apiKey}`,
-          ...(backend.kind === "openrouter" ? backend.headers : {}),
-        },
-        body: JSON.stringify({
-          model: backend.model,
-          max_tokens: 24,
-          messages: [
-            { role: "system", content: TITLE_SYSTEM },
-            { role: "user", content: prompt },
-          ],
-        }),
-        signal: AbortSignal.timeout(6000), // never hold the response open on a slow title call
-      });
-      if (!res.ok) return null;
+      const postChat = (maxTokensToSend: number): Promise<Response> =>
+        fetch(`${backend.baseUrl.replace(/\/$/, "")}/chat/completions`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${apiKey}`,
+            ...(backend.kind === "openrouter" ? backend.headers : {}),
+          },
+          body: JSON.stringify({
+            model: backend.model,
+            max_tokens: maxTokensToSend,
+            messages: [
+              { role: "system", content: TITLE_SYSTEM },
+              { role: "user", content: prompt },
+            ],
+          }),
+          signal: AbortSignal.timeout(6000), // never hold the response open on a slow title call
+        });
+      // A title is ~24 output tokens, but a reasoning model burns its whole budget on hidden reasoning
+      // first → empty title; add headroom so it isn't starved. If the headroom overshoots a small
+      // model's ceiling (a token-limit 4xx), retry once without it rather than silently killing titles.
+      let res = await postChat(completionMaxTokens(24));
+      if (!res.ok) {
+        if (looksLikeTokenLimitError(res.status, await res.text().catch(() => ""))) res = await postChat(24);
+        if (!res.ok) return null;
+      }
       const j = (await res.json()) as { choices?: { message?: { content?: string } }[] };
       return cleanTitle(j.choices?.[0]?.message?.content ?? "") || null;
     }

@@ -13,6 +13,8 @@ import {
 import type { AnsweringProvider } from "@/lib/query/llm-backend";
 import { runSlackIngestion, runPlaneIngestion, runLinearIngestion, runGithubIngestion } from "@/lib/ingest/run";
 import { runGraphProjection } from "@/lib/graph/run";
+import { projectionRunInput } from "@/lib/graph/projection-run";
+import { recordIngestRun } from "@/lib/ingest/runs";
 import {
   linkGithubRepo,
   unlinkGithubRepo,
@@ -301,11 +303,15 @@ export async function projectToGraphNow(
 ): Promise<{ ok: boolean; error?: string; message?: string }> {
   const ctx = await requireAdmin(teamSlug);
   if (!ctx) return { ok: false, error: "admins only" };
+  const startedAt = Date.now();
   try {
     const s = await runGraphProjection({ teamId: ctx.teamId });
     if (!s.configured) {
       return { ok: false, error: "Graph memory is not configured (set GRAPHITI_URL on the brain)." };
     }
+    // Record the manual run to ingest_runs (like the scheduler) so a successful re-projection clears
+    // the "projector's last run failed" health signal, and a failing one surfaces on the dashboard.
+    await recordIngestRun(adminClient(), projectionRunInput(s, "manual", startedAt, Date.now()));
     if (!s.ok && s.errors.length) return { ok: false, error: s.errors.join("; ") };
     revalidatePath(`/t/${teamSlug}/admin/integrations`);
     return {

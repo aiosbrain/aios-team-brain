@@ -247,18 +247,21 @@ async function synthesizeArcs(
   groups: string[],
   correctionTexts: string[],
   keys: ProviderKeys
-): Promise<NarrativeArc[]> {
+): Promise<NarrativeArc[] | null> {
+  // Returns `null` on an LLM TRANSPORT FAILURE (outage / reasoning starvation) vs `[]` on a genuine
+  // empty verdict — the caller needs the difference: an explicit recompute applies an empty verdict
+  // but must NOT let a failed call blank the panel.
   // Arcs are NOT time-boxed — synthesize from the most-recent facts regardless of age (a quiet week,
   // or a stalled projector, must not blank the panel). `null` = no window; recentFacts still caps at
   // MAX_FACTS, newest first.
   const facts = await recentFacts(groups, null, MAX_FACTS);
-  // No facts and nothing to correct → nothing to synthesize. (A correction with no facts still runs
-  // the LLM, preserving the pre-cache recompute behavior.)
+  // No facts and nothing to correct → nothing to synthesize (a genuine empty, not a failure).
   if (facts.length === 0 && correctionTexts.length === 0) return [];
   const epToItem = await resolveEpisodeItems(groups, facts.flatMap((f) => f.episodeUuids));
   const allItemIds = [...new Set([...epToItem.values()].map((v) => v.itemId).filter((id): id is string => !!id))];
   const humanByItem = await resolveHumanActorsByItem(db, teamId, allItemIds);
   const raw = await callLLMRaw(buildPrompt(attributedFactTexts(facts, epToItem, humanByItem), correctionTexts), keys);
+  if (raw === null) return null; // transport failure — not a "zero arcs" verdict
   return attributeArcs(parseArcsJson(raw, { facts, epToItem }), humanByItem);
 }
 
@@ -277,19 +280,33 @@ const refreshing = new Set<string>();
  * retries until synthesis recovers. This is the guard that stops one bad LLM call from pinning the
  * Learning page empty for hours (2026-07 incident). Returns what's now authoritative for the key.
  */
+/** How long a good prior may shield an empty result. Past this, an empty synthesis is taken at face
+ *  value (a graph genuinely emptied — content deleted / group migrated — must eventually clear, and
+ *  arcs derived from since-deleted content shouldn't serve forever). */
+const MAX_KEEP_STALE_MS = 24 * 60 * 60 * 1000;
+
 export async function commitArcs(
   db: DbClient,
   teamId: string,
   key: string,
-  next: NarrativeArc[]
+  next: NarrativeArc[],
+  opts: { allowEmpty?: boolean } = {}
 ): Promise<NarrativeArc[]> {
-  if (next.length === 0) {
-    const prior = cache.get(key)?.arcs ?? (await readArcCache(db, teamId, key))?.arcs;
-    if (prior && prior.length > 0) {
+  // An empty result usually means a transient upstream failure (LLM outage / reasoning starvation), so
+  // keep a good prior rather than blanking the panel — BUT only if it's fresh, and NEVER for an
+  // explicit user recompute (`allowEmpty`), whose empty verdict is intentional (a correction that drops
+  // the last arc). Otherwise a failed correction would silently no-op and a genuinely-emptied graph
+  // could serve stale arcs forever.
+  if (next.length === 0 && !opts.allowEmpty) {
+    const priorMem = cache.get(key);
+    const prior =
+      priorMem ??
+      (await readArcCache(db, teamId, key).then((r) => (r ? { arcs: r.arcs, at: r.computedAt } : null)));
+    if (prior && prior.arcs.length > 0 && Date.now() - prior.at < MAX_KEEP_STALE_MS) {
       console.warn(
-        `[arcs] synthesis returned 0 arcs for ${key}; keeping ${prior.length} cached (likely transient upstream failure)`
+        `[arcs] synthesis returned 0 arcs for ${key}; keeping ${prior.arcs.length} cached (likely transient upstream failure)`
       );
-      return prior;
+      return prior.arcs;
     }
   }
   cache.set(key, { arcs: next, at: Date.now() });
@@ -306,8 +323,10 @@ function refreshArcsInBackground(teamId: string, key: string, groups: string[], 
   void (async () => {
     const bg = adminClient();
     try {
+      // Background refresh: a failure (null) or empty verdict both keep the prior (shield) — never
+      // allowEmpty here, so a transient outage can't blank a good cache.
       const arcs = await synthesizeArcs(bg, teamId, groups, [], keys);
-      await commitArcs(bg, teamId, key, arcs);
+      await commitArcs(bg, teamId, key, arcs ?? []);
     } catch (err) {
       console.error("[arcs] background refresh failed:", err instanceof Error ? err.message : err);
     } finally {
@@ -351,8 +370,9 @@ export async function getArcs(
   }
 
   // 3. Cold miss — first-ever load for this key. Compute inline so the user gets a real answer.
+  // A failure (null) → [] (nothing to shield yet; next view retries).
   const arcs = await synthesizeArcs(db, teamId, groups, [], keys);
-  return commitArcs(db, teamId, key, arcs);
+  return commitArcs(db, teamId, key, arcs ?? []);
 }
 
 /**
@@ -372,7 +392,10 @@ export async function recomputeArcs(
   if (groups.length === 0) return [];
   const key = groups.slice().sort().join(",");
   const synthesized = await synthesizeArcs(db, teamId, groups, corrections.map((c) => c.corrected_text), keys);
-  const arcs = await commitArcs(db, teamId, key, synthesized);
+  // Explicit user recompute: apply an empty VERDICT (synthesized === [], e.g. a correction that drops
+  // the last arc) — but if the LLM call FAILED (synthesized === null), keep the prior rather than
+  // blanking the panel on a transient outage. `allowEmpty` iff it wasn't a failure.
+  const arcs = await commitArcs(db, teamId, key, synthesized ?? [], { allowEmpty: synthesized !== null });
 
   // Persist corrections as first-class episodes (team-tier group; corrections are internal).
   const client = new GraphitiClient();

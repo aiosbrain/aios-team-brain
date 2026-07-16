@@ -56,24 +56,22 @@ describe("graphConfigured", () => {
 });
 
 describe("deriveGraphState", () => {
-  const now = Date.parse("2026-07-15T12:00:00Z");
-  const fresh = Date.parse("2026-07-15T11:00:00Z"); // 1h ago
-  const stale = Date.parse("2026-07-08T12:00:00Z"); // 7d ago
   it("off when not configured (regardless of reachability)", () => {
-    expect(deriveGraphState({ configured: false, reachable: false, lastProjectedAtMs: null, nowMs: now })).toBe("off");
-    expect(deriveGraphState({ configured: false, reachable: true, lastProjectedAtMs: fresh, nowMs: now })).toBe("off");
+    expect(deriveGraphState({ configured: false, reachable: false, lastRunFailed: false })).toBe("off");
+    expect(deriveGraphState({ configured: false, reachable: true, lastRunFailed: true })).toBe("off");
   });
-  it("on when reachable AND recently projected", () => {
-    expect(deriveGraphState({ configured: true, reachable: true, lastProjectedAtMs: fresh, nowMs: now })).toBe("on");
-  });
-  it("on when reachable and nothing has projected yet (null = fresh install, not a stall)", () => {
-    expect(deriveGraphState({ configured: true, reachable: true, lastProjectedAtMs: null, nowMs: now })).toBe("on");
+  it("on when reachable AND the projector isn't erroring", () => {
+    expect(deriveGraphState({ configured: true, reachable: true, lastRunFailed: false })).toBe("on");
   });
   it("degraded when configured BUT unreachable — the silent-failure case reviving must surface", () => {
-    expect(deriveGraphState({ configured: true, reachable: false, lastProjectedAtMs: fresh, nowMs: now })).toBe("degraded");
+    expect(deriveGraphState({ configured: true, reachable: false, lastRunFailed: false })).toBe("degraded");
   });
-  it("degraded when reachable BUT projector stalled — the 2026-07 healthcheck-only blind spot", () => {
-    // /healthcheck answers (reachable) yet no episode has landed in a week → writes are failing silently.
-    expect(deriveGraphState({ configured: true, reachable: true, lastProjectedAtMs: stale, nowMs: now })).toBe("degraded");
+  it("degraded when reachable BUT the last projection run errored — the 2026-07 healthcheck-only blind spot", () => {
+    // /healthcheck answers (reachable) yet the projector's last tick failed (e.g. Graphiti 422 on writes).
+    expect(deriveGraphState({ configured: true, reachable: true, lastRunFailed: true })).toBe("degraded");
+  });
+  it("does NOT degrade a quiet team (reachable, no failing runs) — the false-positive H7 guards against", () => {
+    // Nothing new to project for hours ≠ broken. Only an actual run FAILURE degrades.
+    expect(deriveGraphState({ configured: true, reachable: true, lastRunFailed: false })).toBe("on");
   });
 });

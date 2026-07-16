@@ -39,6 +39,25 @@ describe("completeText (OpenAI-compatible path)", () => {
     expect(body.model).toBe("reasoning-model");
   });
 
+  it("retries WITHOUT headroom when the headroom'd request hits the model's token ceiling (M6)", async () => {
+    // A small ceiling-constrained model 400s when max_tokens exceeds its output limit. The fix must not
+    // turn that into a hard failure: retry once with just the answer budget.
+    const ceiling400 = { ok: false, status: 400, text: async () => "max_tokens is greater than the maximum allowed", json: async () => ({}) } as unknown as Response;
+    fetchMock.mockResolvedValueOnce(ceiling400).mockResolvedValueOnce(okResponse("recovered"));
+    const out = await completeText({ system: "s", prompt: "p" }, { maxTokens: 100 });
+    expect(out).toBe("recovered");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const retryBody = JSON.parse((fetchMock.mock.calls[1][1] as RequestInit).body as string);
+    expect(retryBody.max_tokens).toBe(100); // no headroom on the retry
+  });
+
+  it("does NOT retry a non-ceiling error (e.g. auth) — surfaces it once", async () => {
+    const auth401 = { ok: false, status: 401, text: async () => "invalid api key", json: async () => ({}) } as unknown as Response;
+    fetchMock.mockResolvedValue(auth401);
+    await expect(completeText({ system: "s", prompt: "p" })).rejects.toThrow(/401/);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
   it("throws NAMING finish_reason when content is empty — the reasoning-starvation signature, made loud", async () => {
     // 200 OK but empty content + finish_reason:length = all of max_tokens went to hidden reasoning.
     fetchMock.mockResolvedValue(okResponse("", "length"));

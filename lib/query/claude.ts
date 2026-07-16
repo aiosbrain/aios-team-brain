@@ -2,6 +2,7 @@ import "server-only";
 import Anthropic from "@anthropic-ai/sdk";
 import type { RetrievedContext } from "./retrieve";
 import { selectLlmBackend, type LlmBackend, type LlmBackendKeys } from "./llm-backend";
+import { completionMaxTokens, looksLikeTokenLimitError } from "@/lib/llm/limits";
 
 /**
  * Thin adapter around the Claude API so a future agent backend (e.g. Hermes)
@@ -302,27 +303,44 @@ async function* streamOpenAICompatible(
     `Question: ${question}`;
 
   const apiKey = backend.apiKey ?? process.env.OPENAI_API_KEY ?? "local";
-  const res = await fetch(`${backend.baseUrl.replace(/\/$/, "")}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-      ...(backend.kind === "openrouter" ? backend.headers : {}),
-    },
-    body: JSON.stringify({
-      model: backend.model,
-      max_tokens: 4096,
-      stream: true,
-      stream_options: { include_usage: true },
-      messages: [
-        { role: "system", content: SYSTEM_PROMPT },
-        { role: "user", content: userContent },
-      ],
-    }),
-  });
+  const postChat = (maxTokensToSend: number): Promise<Response> =>
+    fetch(`${backend.baseUrl.replace(/\/$/, "")}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+        ...(backend.kind === "openrouter" ? backend.headers : {}),
+      },
+      body: JSON.stringify({
+        model: backend.model,
+        // Answer budget + reasoning headroom so a reasoning model doesn't spend the whole budget on
+        // hidden reasoning and stream back an empty answer (the 2026-07 starvation, streaming path).
+        max_tokens: maxTokensToSend,
+        stream: true,
+        stream_options: { include_usage: true },
+        messages: [
+          { role: "system", content: SYSTEM_PROMPT },
+          { role: "user", content: userContent },
+        ],
+      }),
+    });
 
-  if (!res.ok || !res.body) {
-    throw new Error(`LLM ${backend.model} @ ${backend.baseUrl}: ${res.status} ${await res.text().catch(() => "")}`);
+  let res = await postChat(completionMaxTokens(4096));
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    // If headroom pushed max_tokens past this model's ceiling, retry once with just the answer budget;
+    // any other error surfaces immediately (with its own body).
+    if (looksLikeTokenLimitError(res.status, body)) {
+      res = await postChat(4096);
+      if (!res.ok) {
+        throw new Error(`LLM ${backend.model} @ ${backend.baseUrl}: ${res.status} ${await res.text().catch(() => "")}`);
+      }
+    } else {
+      throw new Error(`LLM ${backend.model} @ ${backend.baseUrl}: ${res.status} ${body}`);
+    }
+  }
+  if (!res.body) {
+    throw new Error(`LLM ${backend.model} @ ${backend.baseUrl}: ${res.status} no stream body`);
   }
 
   const reader = res.body.getReader();
@@ -331,6 +349,7 @@ async function* streamOpenAICompatible(
   let inThink = false;
   let prompt = 0;
   let completion = 0;
+  let emittedChars = 0;
 
   while (true) {
     const { done, value } = await reader.read();
@@ -374,8 +393,21 @@ async function* streamOpenAICompatible(
           inThink = true;
         }
       }
-      if (out) yield { type: "delta", text: out };
+      if (out) {
+        emittedChars += out.length;
+        yield { type: "delta", text: out };
+      }
     }
+  }
+
+  // Zero visible answer text is a silent blank answer — make it diagnosable. The usual cause is a
+  // reasoning model spending the whole budget on hidden reasoning (raise LLM_REASONING_HEADROOM_TOKENS);
+  // a mid-stream error frame (no usage) also lands here. Logged regardless of the token count.
+  if (emittedChars === 0) {
+    console.error(
+      `[query] streamed answer was EMPTY (model=${backend.model}, completion_tokens=${completion}) — ` +
+        `likely a reasoning model starved by max_tokens, or a mid-stream provider error`
+    );
   }
 
   yield {

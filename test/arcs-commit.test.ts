@@ -5,15 +5,14 @@ import type { DbClient } from "@/lib/db/types";
 
 /** Minimal fake DbClient covering exactly the arc_cache read (select→eq→eq→maybeSingle) and write
  *  (upsert) paths. Records upserts so we can assert whether a clobber happened. */
-function fakeDb(existing: NarrativeArc[] | null) {
+function fakeDb(existing: NarrativeArc[] | null, computedAt = new Date().toISOString()) {
   const upserts: unknown[] = [];
   const db = {
     from: () => ({
       select: () => ({
         eq: () => ({
           eq: () => ({
-            maybeSingle: async () =>
-              existing ? { data: { arcs: existing, computed_at: new Date().toISOString() } } : { data: null },
+            maybeSingle: async () => (existing ? { data: { arcs: existing, computed_at: computedAt } } : { data: null }),
           }),
         }),
       }),
@@ -61,5 +60,21 @@ describe("commitArcs — an empty synthesis must never clobber a good cache", ()
     const out = await commitArcs(db, "team-1", "cold-empty-1", []);
     expect(out).toEqual([]);
     expect(upserts).toHaveLength(1); // first-ever load may legitimately be empty
+  });
+
+  it("APPLIES an empty result for an explicit recompute (allowEmpty) — a correction that drops the last arc", async () => {
+    const { db, upserts } = fakeDb([arc("stale")]);
+    const out = await commitArcs(db, "team-1", "allow-empty-1", [], { allowEmpty: true });
+    expect(out).toEqual([]); // the user's empty verdict is honored, not silently no-op'd
+    expect(upserts).toHaveLength(1);
+  });
+
+  it("lets an empty result through once the good prior is older than the keep window (no stale-forever)", async () => {
+    // Prior computed 2 days ago (> MAX_KEEP_STALE_MS) — a genuinely-emptied graph must eventually clear.
+    const twoDaysAgo = new Date(Date.parse("2026-07-15T00:00:00Z") - 2 * 24 * 60 * 60 * 1000).toISOString();
+    const { db, upserts } = fakeDb([arc("ancient")], twoDaysAgo);
+    const out = await commitArcs(db, "team-1", "stale-prior-1", []);
+    expect(out).toEqual([]); // stale prior no longer shields the empty
+    expect(upserts).toHaveLength(1);
   });
 });

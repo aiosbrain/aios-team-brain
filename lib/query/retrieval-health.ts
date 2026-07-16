@@ -52,34 +52,26 @@ const STALE_MS = 2 * 60 * 60 * 1000; // no embed activity in 2h + incomplete = s
  */
 export const graphConfigured = graphitiConfigured;
 
-// Reachable but no projection in this long ⇒ the graph is going stale even though /healthcheck is
-// green. This is the 2026-07 failure a healthcheck-only probe MISSED: Graphiti's write endpoint
-// 422'd for days (projector wedged) while the service kept answering /healthcheck, so the card read
-// "on" while the Learning page slowly emptied. Freshness of the write path is the real signal.
-const GRAPH_STALE_MS = 6 * 60 * 60 * 1000;
-
-/** A projector that hasn't written in > GRAPH_STALE_MS is stalled. `null` = nothing has ever projected
- *  (fresh install / nothing to project) → NOT a stall. Pure + unit-tested. */
-export function isGraphStale(lastProjectedAtMs: number | null, nowMs: number): boolean {
-  return lastProjectedAtMs !== null && nowMs - lastProjectedAtMs > GRAPH_STALE_MS;
-}
-
 /**
  * Derive the graph-leg state from its raw signals. Pure + unit-tested:
  *   • not configured (no/malformed GRAPHITI_URL)             → "off"
  *   • configured BUT /healthcheck failed (down/unreachable)   → "degraded"
- *   • reachable BUT projector hasn't written in > GRAPH_STALE_MS (writes failing) → "degraded"
- *   • reachable AND recently projected (or nothing to project yet) → "on"
+ *   • reachable BUT the last projection RUN errored (writes failing, e.g. Graphiti 422) → "degraded"
+ *   • reachable AND the projector isn't erroring                → "on"
+ *
+ * Keyed on the last `graph_project` run's ok-flag, NOT time-since-last-projection: a team with nothing
+ * new to ingest is quiet, not broken, so a pure "no writes in 6h" staleness would cry wolf every idle
+ * night/weekend. The run flag only goes false when a projection tick actually errored — which is the
+ * 2026-07 failure (Graphiti 422'd every write while `/healthcheck` stayed green).
  */
 export function deriveGraphState(input: {
   configured: boolean;
   reachable: boolean;
-  lastProjectedAtMs: number | null;
-  nowMs: number;
+  lastRunFailed: boolean;
 }): GraphState {
   if (!input.configured) return "off";
   if (!input.reachable) return "degraded";
-  return isGraphStale(input.lastProjectedAtMs, input.nowMs) ? "degraded" : "on";
+  return input.lastRunFailed ? "degraded" : "on";
 }
 
 /**
@@ -111,17 +103,16 @@ export async function getRetrievalHealth(teamId: string): Promise<RetrievalHealt
 
   // Graph + dense both hit the network — run them concurrently so the card render isn't serialized.
   const graphConfiguredNow = graphConfigured(process.env.GRAPHITI_URL);
-  const [dense, graphReachable, graphFresh] = await Promise.all([
+  const [dense, graphReachable, graphFresh, graphRunFailed] = await Promise.all([
     denseHealth(teamId, configured),
     graphConfiguredNow ? new GraphitiClient().healthcheck() : Promise.resolve(false),
     graphConfiguredNow ? graphFreshness(teamId) : Promise.resolve({ episodes: null, lastProjectedAt: null }),
+    graphConfiguredNow ? lastGraphProjectRunFailed() : Promise.resolve(false),
   ]);
-  const lastProjectedAtMs = graphFresh.lastProjectedAt ? Date.parse(graphFresh.lastProjectedAt) : null;
-  const nowMs = Date.now();
-  const graph = deriveGraphState({ configured: graphConfiguredNow, reachable: graphReachable, lastProjectedAtMs, nowMs });
-  // Degraded specifically because the projector went quiet (reachable, but a stale write path) — the
-  // card renders a different, more actionable banner for this than for a hard-unreachable service.
-  const graphStalled = graph === "degraded" && graphReachable && isGraphStale(lastProjectedAtMs, nowMs);
+  const graph = deriveGraphState({ configured: graphConfiguredNow, reachable: graphReachable, lastRunFailed: graphRunFailed });
+  // Degraded specifically because the projector's last run errored (reachable, but writes failing) —
+  // the card renders a different, more actionable banner for this than for a hard-unreachable service.
+  const graphStalled = graph === "degraded" && graphReachable && graphRunFailed;
   return {
     keyword: "on",
     dense,
@@ -136,6 +127,26 @@ export async function getRetrievalHealth(teamId: string): Promise<RetrievalHealt
 /** Projection freshness from the `graph_episodes` ledger (Postgres, no Graphiti round-trip): how many
  *  episodes this team has projected and when the projector last succeeded. Drives the "reachable but
  *  stalled" degraded state. Best-effort — nulls on any error so the card still renders. */
+/** Is the projector failing RIGHT NOW? The scheduler records each tick with a signal to `ingest_runs`
+ *  (source='graph_project', global). A persistent failure (e.g. Graphiti 422 on every write) re-records
+ *  `ok=false` every tick, so it stays "recent"; a single transient failure ages out of the window (a
+ *  quiet team records nothing on healthy ticks, so without the window one old failure would latch
+ *  "degraded" forever — the false-alarm H7 exists to avoid). Window = a few projector intervals.
+ *  No recent run ⇒ not failing. Best-effort. */
+async function lastGraphProjectRunFailed(): Promise<boolean> {
+  try {
+    const intervalMin = Math.max(1, Number(process.env.GRAPH_PROJECT_MINUTES ?? 60));
+    const windowMin = Math.max(3 * intervalMin, 180);
+    const res = await runSql<{ ok: boolean }>(
+      "select ok from ingest_runs where source = 'graph_project' and finished_at > now() - ($1::int * interval '1 minute') order by finished_at desc limit 1",
+      [windowMin]
+    );
+    return res.rows[0]?.ok === false;
+  } catch {
+    return false;
+  }
+}
+
 async function graphFreshness(teamId: string): Promise<{ episodes: number | null; lastProjectedAt: string | null }> {
   try {
     const res = await runSql<{ n: string; mx: string | null }>(
