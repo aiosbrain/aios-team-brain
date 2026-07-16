@@ -41,7 +41,9 @@ export interface RetrievalHealth {
   graphLastProjectedAt: string | null; // most recent successful projection (null = never)
   graphStalled: boolean; // degraded specifically because the projector stopped writing (vs unreachable)
   rerank: LegState;
+  augment: LegState; // optional external retrieval-augment service (RETRIEVAL_AUGMENT_URL)
   llm: LlmHealth; // answering-model health — did the configured model recently produce output?
+  emailDeliverable: boolean; // a provider is configured (RESEND_API_KEY/SMTP_URL) so alerts/invites can actually send
 }
 
 const COVERAGE_FLOOR = 0.9; // ≥90% embedded = healthy
@@ -124,6 +126,8 @@ export function deriveDenseState(input: {
 
 export async function getRetrievalHealth(teamId: string): Promise<RetrievalHealth> {
   const rerank: LegState = process.env.RERANK_URL ? "on" : "off";
+  const augment: LegState = process.env.RETRIEVAL_AUGMENT_URL ? "on" : "off";
+  const emailDeliverable = !!(process.env.RESEND_API_KEY || process.env.SMTP_URL);
   const configured = !!process.env.EMBEDDINGS_URL;
 
   // Graph + dense both hit the network — run them concurrently so the card render isn't serialized.
@@ -148,7 +152,9 @@ export async function getRetrievalHealth(teamId: string): Promise<RetrievalHealt
     graphLastProjectedAt: graphFresh.lastProjectedAt,
     graphStalled,
     rerank,
+    augment,
     llm,
+    emailDeliverable,
   };
 }
 
