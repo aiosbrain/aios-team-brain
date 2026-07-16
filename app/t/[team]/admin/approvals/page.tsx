@@ -1,5 +1,14 @@
 import { serverClient } from "@/lib/db/server";
 import { ApprovalsQueue, type ApprovalRow, type DecidedRow } from "@/components/admin/approvals-queue";
+import {
+  ManagedGatewayApprovals,
+  type ManagedGatewayApprovalRow,
+} from "@/components/admin/managed-gateway-approvals";
+import { getSessionUser } from "@/lib/auth/session";
+import {
+  authorizeGatewayAdmin,
+  listGatewayApprovals,
+} from "@/lib/gateway/admin-persistence";
 
 export default async function ApprovalsAdminPage({ params }: { params: Promise<{ team: string }> }) {
   const { team: teamSlug } = await params;
@@ -23,6 +32,19 @@ export default async function ApprovalsAdminPage({ params }: { params: Promise<{
     .order("decided_at", { ascending: false })
     .limit(10);
 
+  let managed: ManagedGatewayApprovalRow[] | null = null;
+  if (process.env.AIOS_GATEWAY_INTERNAL_ENABLED === "true") {
+    const user = await getSessionUser();
+    if (user) {
+      try {
+        const ctx = await authorizeGatewayAdmin(teamSlug, user.id);
+        managed = (await listGatewayApprovals(ctx)) as ManagedGatewayApprovalRow[];
+      } catch {
+        managed = null;
+      }
+    }
+  }
+
   return (
     <div className="flex flex-col gap-4">
       <p className="text-sm text-ink-secondary">
@@ -34,6 +56,11 @@ export default async function ApprovalsAdminPage({ params }: { params: Promise<{
         pending={(pending ?? []) as ApprovalRow[]}
         recent={(recent ?? []) as DecidedRow[]}
       />
+      {managed ? (
+        <div className="mt-3 border-t border-border-subtle pt-6">
+          <ManagedGatewayApprovals teamSlug={teamSlug} approvals={managed} />
+        </div>
+      ) : null}
     </div>
   );
 }

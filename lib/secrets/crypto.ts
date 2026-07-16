@@ -20,7 +20,9 @@ export function secretsKey(): Buffer {
   }
   const key = decodeKey(raw);
   if (key.length !== KEY_LEN) {
-    throw new Error(`SECRETS_KEY must decode to ${KEY_LEN} bytes (got ${key.length}).`);
+    const length = key.length;
+    key.fill(0);
+    throw new Error(`SECRETS_KEY must decode to ${KEY_LEN} bytes (got ${length}).`);
   }
   return key;
 }
@@ -40,16 +42,32 @@ export function encryptSecret(plaintext: string, key: Buffer = secretsKey()): st
   return Buffer.concat([iv, tag, ct]).toString("base64");
 }
 
-/** Decrypt a base64(iv|tag|ciphertext) blob. Throws on a bad key or tampered data. */
-export function decryptSecret(blob: string, key: Buffer = secretsKey()): string {
+/** Decrypt into caller-owned bytes. A default environment key is always zeroed. */
+export function decryptSecretBytes(blob: string, key?: Buffer): Buffer {
+  const resolvedKey = key ?? secretsKey();
   const buf = Buffer.from(blob, "base64");
-  if (buf.length < IV_LEN + TAG_LEN) throw new Error("ciphertext too short / malformed");
-  const iv = buf.subarray(0, IV_LEN);
-  const tag = buf.subarray(IV_LEN, IV_LEN + TAG_LEN);
-  const ct = buf.subarray(IV_LEN + TAG_LEN);
-  const decipher = createDecipheriv("aes-256-gcm", key, iv);
-  decipher.setAuthTag(tag);
-  return Buffer.concat([decipher.update(ct), decipher.final()]).toString("utf8");
+  try {
+    if (buf.length < IV_LEN + TAG_LEN) throw new Error("ciphertext too short / malformed");
+    const iv = buf.subarray(0, IV_LEN);
+    const tag = buf.subarray(IV_LEN, IV_LEN + TAG_LEN);
+    const ct = buf.subarray(IV_LEN + TAG_LEN);
+    const decipher = createDecipheriv("aes-256-gcm", resolvedKey, iv);
+    decipher.setAuthTag(tag);
+    return Buffer.concat([decipher.update(ct), decipher.final()]);
+  } finally {
+    buf.fill(0);
+    if (!key) resolvedKey.fill(0);
+  }
+}
+
+/** Decrypt a base64(iv|tag|ciphertext) blob. Throws on a bad key or tampered data. */
+export function decryptSecret(blob: string, key?: Buffer): string {
+  const plaintext = decryptSecretBytes(blob, key);
+  try {
+    return plaintext.toString("utf8");
+  } finally {
+    plaintext.fill(0);
+  }
 }
 
 /** Generate a fresh base64 SECRETS_KEY (for provisioning a deployment). */

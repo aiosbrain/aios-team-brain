@@ -9,7 +9,7 @@ portable: plain SQL migrations, Postgres-backed rate limiting, no Vercel-only de
 > ingestion sources) are guarded against drift by `scripts/check-docs-drift.mjs` — see
 > [Docs drift guard](#docs-drift-guard).
 >
-> **Last verified against code: 2026-06-22.** If a flow here disagrees with the code, the
+> **Last verified against code: 2026-07-16.** If a flow here disagrees with the code, the
 > code wins — fix the doc (same PR).
 
 ## Sources of truth
@@ -58,17 +58,21 @@ Reason from this table, not from a random call site.
 
 | State | Store | Sole writer | Readers | Access/retention |
 |---|---|---|---|---|
-| Gateway service credentials and Executor subjects | `gateway_service_identities`, `executor_subject_bindings` | `lib/gateway/persistence.ts` | internal gateway routes | exact team + service + tenant + subject binding; hashed credentials; revoke rather than delete |
+| Gateway service identity, independently rotatable credentials, and Executor subjects | `gateway_service_identities`, `gateway_service_credentials`, `executor_subject_bindings` | `lib/gateway/persistence.ts`; admin mutations in `lib/gateway/admin-persistence.ts` | internal gateway and strict admin-session routes | stable identity remains the binding authority; authentication reads only active credential rows; legacy identity digests are immutable compatibility data; exact team + service + tenant + subject binding; revoke rather than delete |
 | Member GitHub connection, one-use lease, and limiter | `gateway_connections`, `gateway_resolution_leases`, `gateway_rate_limits` | `lib/gateway/persistence.ts` | internal resolver/authorization routes | exact team + member + subject; GitHub-only; opaque refs; lease hashes only; 30-second maximum TTL; single transactional consumption; fail-closed DB-time buckets |
-| Durable request, approval, and claim state | `gateway_executions`, `gateway_approvals` | `lib/gateway/persistence.ts` | later authorization/resume routes only | encrypted request envelope (64 KiB sealed maximum); retained identity/request fields; 15-minute maximum approval TTL; exclusive row-lock claim |
-| Strict gateway compliance audit | `gateway_audit_log` | `lib/gateway/persistence.ts` in the same transaction as authorization state | admin compliance surfaces in later slices | append-only trigger; fixed non-secret columns only; no JSON escape hatch; team deletion is restricted while retained records exist |
+| Durable request, approval, and claim state | `gateway_executions`, `gateway_approvals` | `lib/gateway/persistence.ts`; decisions in `lib/gateway/admin-persistence.ts` | resume route and managed Approvals admin section | encrypted request envelope plus immutable hash/principal/resource snapshots; 15-minute maximum approval TTL; database-time expiry; credential-scoped advisory lock remains held from committed winning claim through the one request-local decrypt/seal callback |
+| Strict gateway compliance audit | `gateway_audit_log` | `lib/gateway/persistence.ts` and `lib/gateway/admin-persistence.ts`, in the same transaction as state | managed admin routes and compliance review | append-only trigger; partial uniqueness for decision/claim/expiry/rotation/revocation/settlement; fixed non-secret columns only; no JSON escape hatch; team deletion is restricted while retained records exist |
 
-The gateway writer guard is `node scripts/check-gateway-writers.mjs`. The persistence owner uses a
+The gateway writer guard is `node scripts/check-gateway-writers.mjs`. Its only approved owners are
+`lib/gateway/persistence.ts` and the narrowly scoped `lib/gateway/admin-persistence.ts`. They use a
 dedicated pooled transaction for every lease/decision/approval/claim transition. A failed audit
 insert rolls back the state transition. Cross-team, cross-member, and cross-subject lookups return
 the same typed not-found/denied class before any credential lookup. Request envelopes use
 AES-256-GCM with execution/service identity as authenticated additional data; wrong keys, tampering,
 or binding changes produce the same typed fail-closed error and never fall back to plaintext.
+Credential rotation accepts client-generated material, stores only its digest, never returns the
+secret, and leaves both versions independently active until expiry or explicit revocation. Claim
+and revocation take the same credential-scoped PostgreSQL advisory lock.
 
 Operational rows are revoked, not deleted. `gateway_audit_log`, `gateway_executions`, and
 `gateway_approvals` are retained compliance history; UPDATE/DELETE triggers protect their immutable
@@ -620,6 +624,16 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 - `POST /api/internal/executor-gateway/v1/resolve-lease` — service-authenticated, version-pinned, one-use 30-second credential-resolution lease
 - `POST /api/internal/executor-gateway/v1/authorize-and-redeem` — exact-call policy decision and post-audit request-local PAT sealing
 - `POST /api/internal/executor-gateway/v1/record-outcome` — idempotent execution settlement with one immutable outcome audit
+- `POST /api/internal/executor-gateway/v1/executions/:executionId/resume-claim` — service-authenticated, idempotent approved-execution claim; only the committed winner receives normalized arguments and a credential sealed to the authenticating credential row
+- `GET /api/internal/executor-gateway/v1/admin/:teamSlug/approvals` — strict same-team admin-session managed gateway queue
+- `POST /api/internal/executor-gateway/v1/admin/:teamSlug/approvals/:approvalId/decision` — database-time approve/deny transition with strict audit
+- `GET /api/internal/executor-gateway/v1/admin/:teamSlug/policies` — list gateway-prefixed policy rules
+- `POST /api/internal/executor-gateway/v1/admin/:teamSlug/policies` — create a tagged-subject gateway policy
+- `PATCH /api/internal/executor-gateway/v1/admin/:teamSlug/policies/:policyId` — update a same-team gateway policy
+- `DELETE /api/internal/executor-gateway/v1/admin/:teamSlug/policies/:policyId` — delete a same-team gateway policy
+- `GET /api/internal/executor-gateway/v1/admin/:teamSlug/service-identities/:serviceIdentityId/credentials` — list non-secret credential metadata
+- `POST /api/internal/executor-gateway/v1/admin/:teamSlug/service-identities/:serviceIdentityId/credentials` — add a client-generated overlapping credential without returning its secret
+- `POST /api/internal/executor-gateway/v1/admin/:teamSlug/service-identities/:serviceIdentityId/credentials/:credentialId/revoke` — advisory-lock-linearized credential revocation
 - `POST /api/v1/items` — upsert synced content
 - `GET /api/v1/items` — tier-filtered, keyset-paginated pull
 - `GET /api/v1/items/:id` — single item fetch
@@ -671,7 +685,7 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 <!-- drift:tables -->
 
 `auth_users` · `auth_tokens` · `oauth_states` · `teams` · `members` · `api_keys` · `audit_log` ·
-`gateway_service_identities` · `executor_subject_bindings` · `gateway_connections` · `gateway_resolution_leases` ·
+`gateway_service_identities` · `gateway_service_credentials` · `executor_subject_bindings` · `gateway_connections` · `gateway_resolution_leases` ·
 `gateway_executions` · `gateway_approvals` · `gateway_audit_log` · `gateway_rate_limits` · `rate_limits` ·
 `projects` · `items` · `item_versions` · `tasks` · `decisions` · `graph_entities` ·
 `graph_relationships` · `query_log` · `policies` · `approval_requests` · `actions` ·

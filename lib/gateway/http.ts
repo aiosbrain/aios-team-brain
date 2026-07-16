@@ -11,6 +11,7 @@ import {
 export const GATEWAY_MAX_RAW_BODY_BYTES = 65_536;
 const messages: Record<string, string> = {
   gateway_unauthorized: "Unauthorized",
+  gateway_forbidden: "Forbidden",
   gateway_version_mismatch: "Gateway version mismatch",
   gateway_invalid_request: "Invalid request",
   gateway_payload_too_large: "Request body too large",
@@ -18,6 +19,7 @@ const messages: Record<string, string> = {
   gateway_rate_limited: "Rate limit exceeded",
   gateway_not_found: "Not found",
   gateway_scope_not_found: "Gateway scope not found",
+  gateway_approval_expired: "Approval expired",
   gateway_lease_invalid: "Invalid lease",
   gateway_policy_stale: "Gateway policy changed",
   gateway_allow_already_committed: "Allow already committed",

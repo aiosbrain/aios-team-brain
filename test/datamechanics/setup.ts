@@ -6,6 +6,7 @@ import { Client } from "pg";
 // truncation can't deadlock against in-flight adapter queries.
 const DATA_TABLES = [
   "gateway_audit_log",
+  "gateway_service_credentials",
   "gateway_approvals",
   "gateway_executions",
   "gateway_resolution_leases",

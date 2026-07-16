@@ -64,6 +64,7 @@ jobs:
           node-version: "20"
           cache: "npm"
       - run: npm ci
+      - run: npm run test:gateway-approval-contracts
       - run: npm test
       # Coverage gate: thresholds in vitest.config.ts (lib/** scope). Fails the job
       # if coverage drops below the floor. Ratchet thresholds up as tests improve.
@@ -95,6 +96,7 @@ jobs:
       - run: npm ci
       # migrate-from-zero into the service DB (also the replay guard)
       - run: DATABASE_URL="$DATABASE_TEST_URL" npm run pg:schema
+      - run: npm run test:gateway-approval
       - run: npm run test:datamechanics
 
   http-tests:
@@ -128,6 +130,7 @@ jobs:
       # Production build first; global-setup spawns `next start` against .next.
       - run: npm run build
       - run: npm run test:http
+      - run: npm run test:http:gateway-approval
 
   ingestion-tests:
     name: Ingestion tests (pytest)

@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { spawnSync } from "node:child_process";
 
 describe("gateway approved writers", () => {
-  it("node scripts/check-gateway-writers.mjs accepts only the domain owner", () => {
+  it("accepts only the two reviewed gateway persistence owners", () => {
     const result = spawnSync(process.execPath, ["scripts/check-gateway-writers.mjs"], {
       cwd: process.cwd(), encoding: "utf8",
     });

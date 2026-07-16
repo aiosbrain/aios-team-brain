@@ -119,7 +119,10 @@ export type GatewayPersistenceErrorCode =
   | "gateway_scope_not_found"
   | "gateway_lease_invalid"
   | "gateway_execution_not_claimable"
-  | "gateway_approval_not_pending";
+  | "gateway_approval_not_pending"
+  | "gateway_not_found"
+  | "gateway_approval_expired"
+  | "gateway_idempotency_conflict";
 
 export class GatewayPersistenceError extends Error {
   constructor(readonly code: GatewayPersistenceErrorCode) {

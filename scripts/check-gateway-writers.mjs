@@ -3,9 +3,13 @@ import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
 
 const ROOT = process.cwd();
-const OWNER = join("lib", "gateway", "persistence.ts");
+const OWNERS = new Set([
+  join("lib", "gateway", "persistence.ts"),
+  join("lib", "gateway", "admin-persistence.ts"),
+]);
 const TABLES = [
   "gateway_service_identities",
+  "gateway_service_credentials",
   "executor_subject_bindings",
   "gateway_connections",
   "gateway_resolution_leases",
@@ -16,6 +20,7 @@ const TABLES = [
 ];
 const SECRET_FIELDS = [
   "credential_hash",
+  "secret_hash",
   "credential_ciphertext",
   "lease_hash",
   "encrypted_request_envelope",
@@ -35,7 +40,7 @@ const violations = [];
 for (const top of scanDirs) {
   for (const file of walk(join(ROOT, top))) {
     const rel = relative(ROOT, file);
-    if (rel === OWNER || rel === join("scripts", "check-gateway-writers.mjs")) continue;
+    if (OWNERS.has(rel) || rel === join("scripts", "check-gateway-writers.mjs")) continue;
     const source = readFileSync(file, "utf8");
     for (const table of TABLES) {
       const queryBuilder = new RegExp(`from\\(\\s*["']${table}["']\\s*\\)\\s*\\.\\s*(?:insert|update|upsert|delete)\\b`, "i");
@@ -54,4 +59,4 @@ if (violations.length) {
   console.error("Gateway writer boundary violated:\n" + violations.sort().join("\n"));
   process.exit(1);
 }
-console.log(`gateway writer guard: OK (${TABLES.length} tables, ${SECRET_FIELDS.length} secret fields)`);
+console.log(`gateway writer guard: OK (${OWNERS.size} owners, ${TABLES.length} tables, ${SECRET_FIELDS.length} secret fields)`);

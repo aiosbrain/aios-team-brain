@@ -13,17 +13,21 @@ export type GatewaySeed = Seed & {
   connectionRef: string;
   executorTenantId: string;
   executorSubjectId: string;
+  credentialId: string;
+  credentialSecret: string;
 };
 
 export async function seedGateway(): Promise<GatewaySeed> {
   const team = await seedTeam();
   const executorTenantId = `tenant-${randomUUID()}`;
   const executorSubjectId = `subject-${randomUUID()}`;
+  const credentialId = randomBytes(16).toString("base64url");
+  const credentialSecret = randomBytes(32).toString("base64url");
   const service = await registerGatewayServiceIdentity({
     teamId: team.teamId,
     environment: "test",
-    credentialId: randomBytes(16).toString("base64url"),
-    credential: randomBytes(32).toString("base64url"),
+    credentialId,
+    credential: credentialSecret,
   });
   const binding = await bindExecutorSubject({
     ...team,
@@ -45,6 +49,8 @@ export async function seedGateway(): Promise<GatewaySeed> {
     connectionRef: connection.connectionRef,
     executorTenantId,
     executorSubjectId,
+    credentialId,
+    credentialSecret,
   };
 }
 
