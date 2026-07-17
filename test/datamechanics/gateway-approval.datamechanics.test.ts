@@ -568,4 +568,53 @@ describe("gateway durable approval and resume", () => {
     expect(row.rows[0]).toEqual({ state: "expired", status: "expired", audits: 1 });
     service.secretBytes.fill(0);
   });
+
+  // A claim leaves the approval row 'approved' (claims never retire it). Model that end-state directly:
+  // an approved-then-expired approval whose execution advanced to a claimed/terminal state.
+  async function claimedThenExpired() {
+    const res = await approvedExecution({ approve: true, approvalTtlMilliseconds: 400 });
+    await new Promise((r) => setTimeout(r, 500)); // approval now past its TTL
+    // The execution was claimed while the approval was still valid (executions permit state transitions).
+    await getPool().query(`update gateway_executions set state='claimed',updated_at=now() where id=$1`, [res.executionId]);
+    return res;
+  }
+  const stateAndFalseAudits = (executionId: string) =>
+    getPool().query(
+      `select state,
+         (select count(*)::int from gateway_audit_log where execution_id=$1 and event='approval_expired') audits
+       from gateway_executions where id=$1`,
+      [executionId],
+    );
+
+  it("the expiry SWEEP does not clobber an already-claimed execution back to 'expired' (H1 audit-integrity)", async () => {
+    const { ctx, executionId, service } = await claimedThenExpired();
+    await listGatewayApprovals(ctx); // runs the sweep
+    // Pre-fix the sweep flipped it to 'expired' + wrote a false approval_expired row; both must not happen.
+    expect((await stateAndFalseAudits(executionId)).rows[0]).toEqual({ state: "claimed", audits: 0 });
+    service.secretBytes.fill(0);
+  });
+
+  it("deciding an expired approval does not clobber an already-claimed execution (H1 audit-integrity)", async () => {
+    const { ctx, executionId, approvalId, service } = await claimedThenExpired();
+    // decide() enters its expired branch (it rejects with 410 after committing) — but must leave the
+    // claimed execution's terminal state alone.
+    await expect(decideGatewayApproval(ctx, approvalId, "approve", randomUUID())).rejects.toMatchObject({
+      code: "gateway_approval_expired",
+    });
+    expect((await stateAndFalseAudits(executionId)).rows[0]).toEqual({ state: "claimed", audits: 0 });
+    service.secretBytes.fill(0);
+  });
+
+  it("deciding an already-denied approval after expiry returns a clean 410, not a raw trigger 500", async () => {
+    const { ctx, approvalId, service } = await approvedExecution({ approve: false, approvalTtlMilliseconds: 400 });
+    await decideGatewayApproval(ctx, approvalId, "deny", randomUUID()); // pending → denied (while valid)
+    await new Promise((r) => setTimeout(r, 500)); // now past TTL
+    // The expired branch must NOT attempt a denied → expired transition (trigger-illegal → 500); the
+    // status-guarded no-op keeps it a clean 410.
+    await expect(decideGatewayApproval(ctx, approvalId, "approve", randomUUID())).rejects.toMatchObject({
+      code: "gateway_approval_expired",
+      status: 410,
+    });
+    service.secretBytes.fill(0);
+  });
 });
