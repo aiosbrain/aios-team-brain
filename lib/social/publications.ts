@@ -76,6 +76,43 @@ export async function setPublicationState(
   if (error) throw new Error(`setPublicationState failed: ${error.message}`);
 }
 
+/**
+ * Cancel a PENDING publication so its queued `publish` job won't post it (2026-07-16 audit #6 — a
+ * scheduled live post previously could not be stopped). Conditional on the row still being cancellable
+ * (`scheduled`/`failed`) — you can't un-publish an already-posted one, and a row already `publishing`
+ * is mid-provider-call: cancelling it would be false assurance (the in-flight call may still land and
+ * overwrite the row), so it's NOT cancellable here (a clean stop of an in-flight post needs the
+ * idempotency/reclaim work, audit #2/#4). Reports whether it actually cancelled.
+ */
+export async function cancelPublication(
+  db: DbClient,
+  teamId: string,
+  id: string,
+  actor: { memberId?: string | null } = {}
+): Promise<{ cancelled: boolean }> {
+  const { data, error } = await db
+    .from("social_publications")
+    .update({ status: "cancelled", updated_at: new Date().toISOString() })
+    .eq("team_id", teamId)
+    .eq("id", id)
+    .in("status", ["scheduled", "failed"])
+    .select("id");
+  if (error) throw new Error(`cancelPublication failed: ${error.message}`);
+  const cancelled = ((data ?? []) as { id: string }[]).length > 0;
+  if (cancelled) {
+    await audit(db, {
+      team_id: teamId,
+      actor_kind: "member",
+      member_id: actor.memberId ?? null,
+      action: "content.publish_cancelled",
+      target_type: "social_publication",
+      target_id: id,
+      meta: {},
+    });
+  }
+  return { cancelled };
+}
+
 export async function getPublication(db: DbClient, teamId: string, id: string): Promise<PublicationRow | null> {
   const { data } = await db.from("social_publications").select(COLS).eq("team_id", teamId).eq("id", id).maybeSingle();
   return (data as PublicationRow) ?? null;
