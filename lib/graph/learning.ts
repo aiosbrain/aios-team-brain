@@ -1,5 +1,6 @@
 import "server-only";
 import { runRead, neo4jConfigured } from "./neo4j";
+import { itemIdFromEpisodeName } from "./episode-name";
 
 /**
  * "What the Brain is Learning" reads over Graphiti's Neo4j graph. Every query is scoped to the
@@ -107,7 +108,7 @@ export async function resolveEpisodeItems(
     for (const r of rows) {
       const name = r.name ?? "";
       out.set(r.uuid, {
-        itemId: name.startsWith("items:") ? name.slice("items:".length) : undefined,
+        itemId: itemIdFromEpisodeName(name), // tolerant of the `#<chunk>` suffix on split items
         source: r.source ? r.source.toLowerCase() : undefined,
       });
     }
@@ -169,7 +170,7 @@ export async function recentEvents(
       const facts = (r.facts ?? []).filter((x): x is string => !!x);
       return {
         id: r.id,
-        itemId: name.startsWith("items:") ? name.slice("items:".length) : null,
+        itemId: itemIdFromEpisodeName(name) ?? null, // tolerant of the `#<chunk>` suffix on split items
         source: (r.source ?? "").toLowerCase(),
         title: r.title ?? name,
         at: r.at,
