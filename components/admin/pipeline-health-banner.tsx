@@ -34,8 +34,8 @@ export function PipelineHealthBanner({ health, href }: { health: PipelineHealth;
       <div className="flex items-center gap-2">
         <AlertTriangle className="size-4 shrink-0" />
         <p className="text-sm font-semibold">
-          {health.failing.length} ingestion {health.failing.length === 1 ? "leg is" : "legs are"} broken
-          — the brain isn&apos;t getting fresh data
+          {health.failing.length} ingestion {health.failing.length === 1 ? "leg is broken" : "legs are broken"} —
+          the brain isn&apos;t getting fresh data
         </p>
       </div>
       <ul className="mt-2 flex flex-col gap-1 pl-6">
@@ -43,7 +43,7 @@ export function PipelineHealthBanner({ health, href }: { health: PipelineHealth;
           <li key={l.source} className="text-xs">
             <span className="font-medium">{LABEL[l.source] ?? l.source}</span>{" "}
             {l.stale && l.ok ? (
-              <span>— no successful run in {timeAgo(l.at)} (may have stopped)</span>
+              <span>— last successful run {timeAgo(l.at)} (may have stopped)</span>
             ) : (
               <span>
                 — failing{l.at ? ` since ${timeAgo(l.at)}` : ""}

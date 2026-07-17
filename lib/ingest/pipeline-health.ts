@@ -13,15 +13,31 @@ import { getGraphExtractionHealth } from "@/lib/graph/extraction-health";
  * Best-effort: a healthy/empty verdict on any error, so it never breaks a page render.
  */
 
-/** A leg is stale if its newest run is older than this — it was running, then went quiet (poller
- *  wedged / a source that silently stopped). Comfortably past the 30m ingest + 60m graph cadence. */
-const STALE_MS = 3 * 60 * 60 * 1000; // 3h
+/** A leg is stale if its newest run is older than its cadence — it was running, then went quiet
+ *  (poller wedged / a source that silently stopped). Default comfortably past the 30m ingest + 60m
+ *  graph cadence. */
+const STALE_MS = 3 * 60 * 60 * 1000; // 3h default
 
-/** Sources WITHOUT a fixed poll schedule — a long gap is normal, not a stall (would cry wolf). Their
- *  real failures still surface via `ok=false`; we just don't flag them on age. `llm` is event-driven
- *  (already on the retrieval card); `scan` is manual/CI; `pm_sync` is reactive (its own staleness
- *  heuristic lives in `lib/pm-sync/runs`). Everything else is a scheduled poller and IS stale-able. */
-const UNSCHEDULED_SOURCES = new Set(["llm", "scan", "pm_sync"]);
+/**
+ * Per-source staleness overrides. A blanket 3h threshold cries wolf on legs that legitimately run
+ * less often (a 24h housekeeping job is "stale" 21h/day under 3h). So each infrequent/irregular leg
+ * gets its OWN threshold = its cadence + grace, and `null` means "never flag on age" (unscheduled /
+ * reactive / event-driven — real failures still surface via `ok=false`). Anything not listed uses the
+ * 3h default. `auth_cleanup` runs every 24h (`lib/ingest/scheduler` housekeeping) — 3h was the bug
+ * that fired this banner on a healthy job.
+ */
+const STALE_MS_BY_SOURCE: Record<string, number | null> = {
+  llm: null, // event-driven (also surfaced on the retrieval-health card)
+  scan: null, // manual / CI
+  pm_sync: null, // reactive — its own staleness heuristic lives in lib/pm-sync/runs
+  auth_cleanup: 26 * 60 * 60 * 1000, // 24h cadence + 2h grace (genuinely-stuck still surfaces)
+};
+
+/** The age past which `source` is considered stale, or `null` to never flag it on age. Exported for
+ *  unit tests (a wrong threshold here fires the loud banner on a healthy job — the auth_cleanup bug). */
+export function staleThresholdMs(source: string): number | null {
+  return source in STALE_MS_BY_SOURCE ? STALE_MS_BY_SOURCE[source] : STALE_MS;
+}
 
 export interface PipelineLeg {
   source: string;
@@ -74,8 +90,9 @@ export async function getPipelineHealth(teamId: string): Promise<PipelineHealth>
     ]);
     const legs: PipelineLeg[] = res.rows.map((r) => {
       const at = r.finished_at instanceof Date ? r.finished_at.toISOString() : String(r.finished_at);
-      // Only SCHEDULED pollers can be "stale" — a reactive/manual source with a long gap is normal.
-      const stale = !UNSCHEDULED_SOURCES.has(r.source) && now - Date.parse(at) > STALE_MS;
+      // Stale only past THIS source's own cadence — a 24h job isn't stale at 3h (would cry wolf).
+      const threshold = staleThresholdMs(r.source);
+      const stale = threshold !== null && now - Date.parse(at) > threshold;
       return { source: r.source, ok: r.ok, error: r.ok ? null : firstError(r.errors), at, stale };
     });
 
