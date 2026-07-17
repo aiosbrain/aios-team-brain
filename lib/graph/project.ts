@@ -18,15 +18,21 @@ import { episodeGroupId, type AccessTier } from "./group";
 const SOURCE_TABLE = "items";
 
 /**
- * Max episode content length pushed to Graphiti. getzep's ingest worker has NO per-job exception
- * handling (`graph_service/routers/ingest.py` catches only `CancelledError`), so ANY exception from
- * `add_episode` permanently kills the worker and wedges the whole queue. A large episode whose
- * entity/edge extraction overflows the LLM's output-token cap raises exactly such an exception (seen
- * in prod 2026-06-25 and again 2026-07-03: `Output length exceeded max tokens 8192`). Capping content
- * keeps extraction output well under that limit. Full item text still lives in `items`/pgvector/FTS —
- * only the graph episode is truncated (affects a handful of outlier docs; median item is ~240 chars).
+ * Max episode content length pushed to Graphiti. Graphiti extracts entities/edges from each episode
+ * with its OWN LLM, and that call's OUTPUT is hard-capped at 8192 tokens by the pinned `zepai/graphiti`
+ * image (graphiti_core's `DEFAULT_MAX_TOKENS`). The image's `graph_service` exposes NO env to raise it
+ * (verified 2026-07-17 against getzep/graphiti `config.py`: only api_key/base_url/model_name/embedding
+ * are configurable) — so the ONLY app-side lever is to keep extraction output under 8192 by bounding
+ * what we send. A richer/longer episode extracts more nodes → larger structured output → overflow:
+ *   `Output length exceeded max tokens 8192` in `resolve_extracted_nodes` (prod 2026-06-25, 07-03, and
+ *   again 07-17 where a 6000-char cap STILL overflowed and stalled the whole backlog — no facts, blank
+ *   arcs). 2000 chars (~500 tokens) keeps extraction output comfortably bounded. Full item text still
+ *   lives in `items`/pgvector/FTS — only the graph episode is truncated (median item is ~240 chars, so
+ *   this clips only outlier docs). Tunable via `GRAPH_MAX_EPISODE_CHARS` without a redeploy; the deeper
+ *   durable fix (a newer image that raises the cap / handles the length error) is a Graphiti-service
+ *   bump, which carries rebuild/schema-coupling risk — see docs/ARCHITECTURE.md + the graphiti memory.
  */
-export const MAX_EPISODE_CHARS = 6000;
+export const MAX_EPISODE_CHARS = Number(process.env.GRAPH_MAX_EPISODE_CHARS ?? 2000);
 
 /** Item kinds worth projecting as graph episodes — content-bearing knowledge, not raw config.
  * `skill`/`blueprint` are configuration manifests, not events/knowledge, so they're excluded. */

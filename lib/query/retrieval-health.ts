@@ -2,6 +2,7 @@ import "server-only";
 import { runSql } from "@/lib/db/pg/pool";
 import { graphitiConfigured, GraphitiClient } from "@/lib/graph/graphiti-client";
 import { getLlmHealth, type LlmHealth } from "@/lib/query/llm-health";
+import { countGraphFacts, deriveGraphExtractionStalled } from "@/lib/graph/extraction-health";
 
 /**
  * Retrieval-stack health for the admin dashboard (Phase 1 of the retrieval-observability plan).
@@ -40,6 +41,8 @@ export interface RetrievalHealth {
   graphEpisodes: number | null; // projected episodes for this team (null when graph off/unreadable)
   graphLastProjectedAt: string | null; // most recent successful projection (null = never)
   graphStalled: boolean; // degraded specifically because the projector stopped writing (vs unreachable)
+  graphExtractionStalled: boolean; // episodes are reaching Graphiti (202) but its extractor makes no facts
+  graphFacts: number | null; // extracted RELATES_TO facts in Neo4j (null = unreadable)
   rerank: LegState;
   augment: LegState; // optional external retrieval-augment service (RETRIEVAL_AUGMENT_URL)
   llm: LlmHealth; // answering-model health — did the configured model recently produce output?
@@ -88,17 +91,21 @@ export function isGraphStale(lastProjectedAtMs: number | null, nowMs: number): b
  *   • not configured (no/malformed GRAPHITI_URL)             → "off"
  *   • configured BUT /healthcheck failed (down/unreachable)   → "degraded"
  *   • reachable BUT projector hasn't written in > GRAPH_STALE_MS (writes failing) → "degraded"
+ *   • reachable + writing BUT the extractor makes no facts from projected episodes → "degraded"
  *   • reachable AND recently projected (or nothing to project yet) → "on"
  */
 export function deriveGraphState(input: {
   configured: boolean;
   reachable: boolean;
   lastProjectedAtMs: number | null;
+  extractionStalled: boolean;
   nowMs: number;
 }): GraphState {
   if (!input.configured) return "off";
   if (!input.reachable) return "degraded";
-  return isGraphStale(input.lastProjectedAtMs, input.nowMs) ? "degraded" : "on";
+  if (isGraphStale(input.lastProjectedAtMs, input.nowMs)) return "degraded";
+  if (input.extractionStalled) return "degraded"; // accepting episodes but extracting no facts
+  return "on";
 }
 
 /**
@@ -132,15 +139,25 @@ export async function getRetrievalHealth(teamId: string): Promise<RetrievalHealt
 
   // Graph + dense both hit the network — run them concurrently so the card render isn't serialized.
   const graphConfiguredNow = graphConfigured(process.env.GRAPHITI_URL);
-  const [dense, graphReachable, graphFresh, llm] = await Promise.all([
+  const [dense, graphReachable, graphFresh, graphFacts, llm] = await Promise.all([
     denseHealth(teamId, configured),
     graphConfiguredNow ? new GraphitiClient().healthcheck() : Promise.resolve(false),
     graphConfiguredNow ? graphFreshness(teamId) : Promise.resolve({ episodes: null, lastProjectedAt: null }),
+    graphConfiguredNow ? countGraphFacts() : Promise.resolve(null),
     getLlmHealth(teamId),
   ]);
   const lastProjectedAtMs = graphFresh.lastProjectedAt ? Date.parse(graphFresh.lastProjectedAt) : null;
   const nowMs = Date.now();
-  const graph = deriveGraphState({ configured: graphConfiguredNow, reachable: graphReachable, lastProjectedAtMs, nowMs });
+  // Reachable + writing, but projected episodes aren't becoming facts (Graphiti's extractor is failing
+  // on every job). Only meaningful when reachable — an unreachable service reports facts=null.
+  const graphExtractionStalled = graphReachable && deriveGraphExtractionStalled(graphFresh.episodes, graphFacts);
+  const graph = deriveGraphState({
+    configured: graphConfiguredNow,
+    reachable: graphReachable,
+    lastProjectedAtMs,
+    extractionStalled: graphExtractionStalled,
+    nowMs,
+  });
   // Degraded specifically because the projector went quiet (reachable, but a stale write path) — the
   // card renders a different, more actionable banner for this than for a hard-unreachable service.
   const graphStalled = graph === "degraded" && graphReachable && isGraphStale(lastProjectedAtMs, nowMs);
@@ -151,6 +168,8 @@ export async function getRetrievalHealth(teamId: string): Promise<RetrievalHealt
     graphEpisodes: graphFresh.episodes,
     graphLastProjectedAt: graphFresh.lastProjectedAt,
     graphStalled,
+    graphExtractionStalled,
+    graphFacts,
     rerank,
     augment,
     llm,

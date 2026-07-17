@@ -49,12 +49,15 @@ export interface ArcCorrection {
 export type ProviderKeys = LlmBackendKeys;
 
 const MAX_FACTS = 200;
+const MAX_ARCS = 8;
 const CACHE_TTL_MS = 10 * 60_000;
 
 const SYSTEM_PROMPT =
-  "You are analyzing a team knowledge graph. Identify 3-5 active narrative arcs — ongoing storylines " +
-  "about what this team is working through. Each fact below is numbered [F1], [F2], … — for every arc, " +
-  "cite the 2-5 fact numbers that support it in `supporting_facts`. Return ONLY a JSON object of the form " +
+  `You are analyzing a team knowledge graph. Identify ${MAX_ARCS} active narrative arcs — ongoing ` +
+  "storylines about what this team is working through. Favor RECENT activity and give every active " +
+  "contributor visible representation — don't let one person's arcs crowd out others who've been " +
+  "working. Each fact below is numbered [F1], [F2], … — for every arc, cite the 2-5 fact numbers that " +
+  "support it in `supporting_facts`. Return ONLY a JSON object of the form " +
   '{"arcs":[{"title":"short","confidence":"high|medium|low","summary":"2-3 sentences, present tense, ' +
   'specific","participants":["names"],"supporting_facts":[1,2,3]}]}. Use only fact numbers that appear ' +
   "below. No prose, no markdown code fences — the raw JSON object only.";
@@ -77,6 +80,45 @@ export function stripTaskKeys(text: string): string {
     .replace(/\(\s*\)/g, "") // empty parens left behind
     .replace(/\s{2,}/g, " ")
     .trim();
+}
+
+const CONFIDENCE_WEIGHT: Record<NarrativeArc["confidence"], number> = { high: 3, medium: 2, low: 1 };
+
+/** The newest dated evidence timestamp in an arc (ms), or -Infinity if it cites no dated evidence.
+ *  This is the arc's "recency" — how recently the work it describes actually happened. Pure. */
+export function newestEvidenceAt(arc: NarrativeArc): number {
+  let max = -Infinity;
+  for (const e of arc.evidence) {
+    if (!e.at) continue;
+    const t = Date.parse(e.at);
+    if (!Number.isNaN(t) && t > max) max = t;
+  }
+  return max;
+}
+
+/**
+ * Order arcs for display by RECENCY then RELEVANCE, so a contributor's recent work surfaces above
+ * stale storylines instead of being buried under whoever was loudest weeks ago:
+ *   1. newest cited evidence first (recency — arcs with no dated evidence sort last),
+ *   2. then confidence high→low (relevance),
+ *   3. then more supporting evidence first (depth),
+ *   4. stable on the model's original order as the final tiebreak.
+ * Pure + unit-tested.
+ */
+export function rankArcs(arcs: NarrativeArc[]): NarrativeArc[] {
+  return arcs
+    .map((arc, i) => ({ arc, i }))
+    .sort((a, b) => {
+      const ra = newestEvidenceAt(a.arc);
+      const rb = newestEvidenceAt(b.arc);
+      if (rb !== ra) return rb - ra; // recency desc
+      const ca = CONFIDENCE_WEIGHT[a.arc.confidence];
+      const cb = CONFIDENCE_WEIGHT[b.arc.confidence];
+      if (cb !== ca) return cb - ca; // confidence desc
+      if (b.arc.evidence.length !== a.arc.evidence.length) return b.arc.evidence.length - a.arc.evidence.length;
+      return a.i - b.i; // stable
+    })
+    .map((x) => x.arc);
 }
 
 /** Options for `parseArcsJson`: the numbered facts + episode→item map used to resolve cited evidence. */
@@ -136,7 +178,7 @@ export function parseArcsJson(raw: string | null, opts: ParseArcsOptions = {}): 
       arcs?: (Partial<NarrativeArc> & { supporting_facts?: unknown })[];
     };
     if (!Array.isArray(obj.arcs)) return [];
-    return obj.arcs.slice(0, 5).map((a) => {
+    return obj.arcs.slice(0, MAX_ARCS).map((a) => {
       const supporting_sources = Array.isArray(a.supporting_sources) ? a.supporting_sources.map(String) : [];
       const cited = buildEvidence(a.supporting_facts, facts, epToItem);
       // Fall back to free-text sources (unlinked) if the model didn't cite fact numbers.
@@ -283,7 +325,9 @@ async function synthesizeArcs(
     keys,
     { db, teamId }
   );
-  return attributeArcs(parseArcsJson(raw, { facts, epToItem }), humanByItem);
+  // Rank by recency → relevance so recent contributors' arcs lead, then attribute AI-agent names to
+  // the humans behind each arc's own evidence.
+  return rankArcs(attributeArcs(parseArcsJson(raw, { facts, epToItem }), humanByItem));
 }
 
 // In-memory cache (per process). Keyed by the tier-visible group set. Fronts the Postgres `arc_cache`

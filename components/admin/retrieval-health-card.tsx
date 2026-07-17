@@ -46,6 +46,10 @@ export function RetrievalHealthCard({ health }: { health: RetrievalHealth }) {
   // (the 2026-07 failure: writes 422'd for days while the service stayed "up"). The server flags this
   // (`graphStalled`) so the banner tells the admin which failure it actually is.
   const graphStalled = health.graphStalled;
+  // Reachable + writing episodes, but the extractor turns none of them into facts (Graphiti's
+  // entity-extraction worker is failing on every job). A distinct, more specific cause than a stalled
+  // projector, so it gets its own detail + banner and takes priority.
+  const graphExtractionStalled = health.graphExtractionStalled;
   const graphFreshness =
     health.graphEpisodes != null
       ? `${health.graphEpisodes} episodes${health.graphLastProjectedAt ? ` · last projected ${timeAgo(health.graphLastProjectedAt)}` : " · none projected yet"}`
@@ -53,11 +57,13 @@ export function RetrievalHealthCard({ health }: { health: RetrievalHealth }) {
   const graphDetail =
     health.graph === "off"
       ? "not configured"
-      : graphStalled
-        ? `projector stalled — ${graphFreshness}`
-        : health.graph === "degraded"
-          ? "configured but unreachable"
-          : graphFreshness;
+      : graphExtractionStalled
+        ? `accepting episodes but extracting 0 facts — ${graphFreshness}`
+        : graphStalled
+          ? `projector stalled — ${graphFreshness}`
+          : health.graph === "degraded"
+            ? "configured but unreachable"
+            : graphFreshness;
   // A configured-but-unreachable OR stalled-projector graph is a real failure — flag it loudly (red),
   // like a degraded semantic leg.
   const graphDegraded = health.graph === "degraded";
@@ -105,7 +111,16 @@ export function RetrievalHealthCard({ health }: { health: RetrievalHealth }) {
       ) : null}
       {graphDegraded ? (
         <p className="mt-2 rounded-lg border border-red-400/30 bg-red-400/10 px-3 py-2 text-xs text-red-600 dark:text-red-300">
-          {graphStalled ? (
+          {graphExtractionStalled ? (
+            <>
+              Graph memory is reachable and <strong>accepting episodes, but its extractor is producing no
+              facts</strong> ({health.graphEpisodes} projected · {health.graphFacts ?? 0} facts). Graphiti
+              returns <code>202</code> then fails entity extraction on every job — commonly the LLM
+              output-token cap (<code>Output length exceeded max tokens</code>). New activity isn&apos;t
+              becoming graph facts, so narrative arcs can&apos;t update. Check the Graphiti service logs.
+              Keyword and semantic search are unaffected.
+            </>
+          ) : graphStalled ? (
             <>
               Graph memory is reachable but the <strong>projector has stalled</strong> — no new episodes
               since {timeAgo(health.graphLastProjectedAt!)}. New activity isn&apos;t reaching the graph

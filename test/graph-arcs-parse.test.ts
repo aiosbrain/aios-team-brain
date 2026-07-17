@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { parseArcsJson, stripTaskKeys } from "@/lib/graph/arcs";
+import { parseArcsJson, stripTaskKeys, rankArcs, newestEvidenceAt, type NarrativeArc } from "@/lib/graph/arcs";
 
 /**
  * Spec for the arc JSON normalizer (the fragile bit — an LLM's JSON is untrusted). Derived from the
- * contract the panel needs: safe defaults, capped at 5, coerced confidence, stable ids, never throws.
+ * contract the panel needs: safe defaults, capped at 8, coerced confidence, stable ids, never throws.
  */
 
 describe("stripTaskKeys", () => {
@@ -63,9 +63,9 @@ describe("parseArcsJson", () => {
     expect(arc.supporting_sources).toEqual([]);
   });
 
-  it("caps at 5 arcs", () => {
-    const arcs = Array.from({ length: 9 }, (_, i) => ({ title: `A${i}`, confidence: "low" }));
-    expect(parseArcsJson(JSON.stringify({ arcs }), { now: NOW })).toHaveLength(5);
+  it("caps at 8 arcs", () => {
+    const arcs = Array.from({ length: 12 }, (_, i) => ({ title: `A${i}`, confidence: "low" }));
+    expect(parseArcsJson(JSON.stringify({ arcs }), { now: NOW })).toHaveLength(8);
   });
 
   it("returns [] for null, malformed JSON, or a missing arcs array (never throws)", () => {
@@ -143,5 +143,46 @@ describe("parseArcsJson evidence (verifiable, linkable)", () => {
     const raw = JSON.stringify({ arcs: [{ title: "T", confidence: "low", supporting_sources: ["Slack #eng", "a PR"] }] });
     const [arc] = parseArcsJson(raw, { facts, epToItem, now: NOW });
     expect(arc.evidence).toEqual([{ fact: "Slack #eng" }, { fact: "a PR" }]);
+  });
+});
+
+describe("rankArcs — recency then relevance (surfaces recent contributors' work)", () => {
+  const arc = (title: string, confidence: NarrativeArc["confidence"], ats: (string | undefined)[]): NarrativeArc => ({
+    id: `arc-${title}`,
+    title,
+    confidence,
+    summary: "",
+    participants: [],
+    supporting_sources: [],
+    evidence: ats.map((at) => ({ fact: `f-${title}`, at })),
+    derived_at: "2026-07-17T00:00:00.000Z",
+  });
+
+  it("newestEvidenceAt returns the max dated evidence, -Infinity when none is dated", () => {
+    expect(newestEvidenceAt(arc("a", "low", ["2026-07-01T00:00:00Z", "2026-07-10T00:00:00Z"]))).toBe(
+      Date.parse("2026-07-10T00:00:00Z")
+    );
+    expect(newestEvidenceAt(arc("b", "low", [undefined]))).toBe(-Infinity);
+  });
+
+  it("orders the most-recent arc first even when it's lower confidence (recency wins)", () => {
+    const stale = arc("stale-high", "high", ["2026-06-01T00:00:00Z"]);
+    const recent = arc("recent-low", "low", ["2026-07-16T00:00:00Z"]);
+    expect(rankArcs([stale, recent]).map((a) => a.title)).toEqual(["recent-low", "stale-high"]);
+  });
+
+  it("breaks recency ties by confidence, then by evidence depth", () => {
+    const day = "2026-07-15T00:00:00Z";
+    const lowThin = arc("low-thin", "low", [day]);
+    const highAny = arc("high", "high", [day]);
+    const lowDeep = arc("low-deep", "low", [day, day]);
+    expect(rankArcs([lowThin, highAny, lowDeep]).map((a) => a.title)).toEqual(["high", "low-deep", "low-thin"]);
+  });
+
+  it("sorts arcs with no dated evidence last, stably", () => {
+    const dated = arc("dated", "low", ["2026-07-10T00:00:00Z"]);
+    const undated1 = arc("undated1", "high", [undefined]);
+    const undated2 = arc("undated2", "high", [undefined]);
+    expect(rankArcs([undated1, dated, undated2]).map((a) => a.title)).toEqual(["dated", "undated1", "undated2"]);
   });
 });
