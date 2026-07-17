@@ -33,7 +33,32 @@ const SOURCE_TABLE = "items";
  * regardless; median item ~240 chars, so this only clips outliers). Env-tunable via
  * `GRAPH_MAX_EPISODE_CHARS`. See the "202 ≠ extracted" note + extraction-health probe in docs/ARCHITECTURE.md.
  */
-export const MAX_EPISODE_CHARS = Number(process.env.GRAPH_MAX_EPISODE_CHARS ?? 4000);
+const DEFAULT_MAX_EPISODE_CHARS = 4000;
+
+/**
+ * A malformed `GRAPH_MAX_EPISODE_CHARS` override must NOT silently blank all projection: `Number("")`
+ * is 0 and `Number("abc")` is NaN, either of which would slice every episode's content to "" and make
+ * the projector "succeed" while feeding the graph nothing. Fall back to the default unless the value
+ * parses to a finite, positive number. Pure + exported so the landmine is unit-tested.
+ */
+export function resolveMaxEpisodeChars(raw: string | undefined | null): number {
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_MAX_EPISODE_CHARS;
+}
+export const MAX_EPISODE_CHARS = resolveMaxEpisodeChars(process.env.GRAPH_MAX_EPISODE_CHARS);
+
+/**
+ * "When it happened" for an episode: prefer the item's own `source_ts`, but only if it actually parses.
+ * A present-but-garbage `source_ts` must fall back to `synced_at` (always a real timestamptz), NOT to
+ * graphiti-client's last-resort now() — otherwise an old/undated doc gets stamped "today" and floats to
+ * the top of the recency-ranked arcs (rankArcs). (Locale-ambiguous strings like "09/07/2026" still parse
+ * — wrongly — under JS Date; we can't disambiguate DD/MM here, so connectors should emit ISO.) Pure +
+ * exported for tests.
+ */
+export function pickEpisodeTimestamp(sourceTs: unknown, syncedAt: string): string {
+  const raw = typeof sourceTs === "string" ? sourceTs : syncedAt;
+  return Number.isNaN(new Date(raw).getTime()) ? syncedAt : raw;
+}
 
 /** Item kinds worth projecting as graph episodes — content-bearing knowledge, not raw config.
  * `skill`/`blueprint` are configuration manifests, not events/knowledge, so they're excluded. */
@@ -94,7 +119,7 @@ function toEpisode(item: ItemRow): GraphEpisode {
   const fm = item.frontmatter ?? {};
   const title = typeof fm.title === "string" ? fm.title : undefined;
   const url = typeof fm.source_url === "string" ? fm.source_url : undefined;
-  const ts = typeof fm.source_ts === "string" ? fm.source_ts : item.synced_at; // when it happened
+  const ts = pickEpisodeTimestamp(fm.source_ts, item.synced_at); // when it happened (see helper)
   const label = KIND_LABEL[item.kind] ?? "Item";
   return {
     // Cap content so a large episode can't overflow extraction and wedge getzep's worker (see

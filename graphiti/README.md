@@ -34,10 +34,12 @@ Two callers: the admin **"Project to graph"** button on the Integrations page (o
 `lib/graph/scheduler` (an interval poller registered in `instrumentation.ts`). Both are inert
 unless `GRAPHITI_URL` is set. Tune with `GRAPH_PROJECT_MINUTES` (default 60), `GRAPH_PROJECT_LIMIT`
 (default 500 items/run), `GRAPH_PROJECT_ENABLED=false` to disable, and `GRAPH_MAX_EPISODE_CHARS`
-(default 6000) — the per-episode content cap. A bigger episode extracts more nodes → larger structured
-output; the extractor's output ceiling is raised to 16384 by the patched image (see `Dockerfile` +
-the "202 ≠ extracted" gotcha in `docs/ARCHITECTURE.md`), so 6000 is safe. The env is a safety valve if
-you run the stock (8192-cap) image instead.
+(default **4000**) — the per-episode content cap. A bigger episode extracts more nodes → larger
+structured output; the extractor's output ceiling is raised to 16384 by the patched image (see
+`Dockerfile` + the "202 ≠ extracted" gotcha in `docs/ARCHITECTURE.md`). The cap was lowered 6000→4000
+because a dense 6000-char episode's structured output could still overflow even the 16384 ceiling and
+silently kill getzep's (per-job-exception-less) ingest worker. A malformed `GRAPH_MAX_EPISODE_CHARS`
+(empty/non-numeric/≤0) falls back to 4000 rather than blanking projection.
 
 ## LLM note
 Extraction quality depends on structured-output support. Start with a strong cloud model; a local

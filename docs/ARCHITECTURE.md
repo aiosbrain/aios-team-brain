@@ -605,8 +605,10 @@ guard enforces it, it's named.
   **patched image** — `graphiti/Dockerfile` builds FROM the exact prod-pinned digest and bumps only that
   constant to 16384 (gpt-4o's max output). No version jump ⇒ the Neo4j schema our `lib/graph/learning`
   Cypher reads and the REST API the projector uses stay byte-identical; only the token ceiling moves.
-  `MAX_EPISODE_CHARS` stays at 6000 (its intended size; `GRAPH_MAX_EPISODE_CHARS`-tunable as a safety
-  valve). Deploying the patched image is a `graphiti`-service rebuild (roll back to deployment `6208aed5`
+  `MAX_EPISODE_CHARS` default is **4000** (lowered from 6000: a dense 6000-char episode's structured
+  output could still overflow even the 16384 ceiling and silently kill getzep's per-job-exception-less
+  ingest worker; `GRAPH_MAX_EPISODE_CHARS`-tunable, and a malformed value falls back to 4000 rather than
+  blanking projection). Deploying the patched image is a `graphiti`-service rebuild (roll back to deployment `6208aed5`
   if unhealthy). _Guards:_ `test/graph-extraction-health.test.ts` + the `deriveGraphState` extraction-stall
   case in `test/retrieval-health.test.ts`.
 

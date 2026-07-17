@@ -31,6 +31,19 @@ const STALE_MS_BY_SOURCE: Record<string, number | null> = {
   scan: null, // manual / CI
   pm_sync: null, // reactive — its own staleness heuristic lives in lib/pm-sync/runs
   auth_cleanup: 26 * 60 * 60 * 1000, // 24h cadence + 2h grace (genuinely-stuck still surfaces)
+  // Record-only-when-active legs: their scheduler writes an `ingest_runs` row ONLY when the tick did
+  // something (indexed/projected/applied/created) or errored — a quiet pass writes nothing. So the
+  // newest row's age reflects "last time there was work", NOT "last time the poller ran", and an
+  // age-based staleness check cries wolf on any normal quiet window (a weekend, an idle board). Real
+  // failures still surface via `ok=false` on their actual runs, plus the dedicated probes: `dense`
+  // via the retrieval-health card, `graph_project` via the `graph_extract` synthetic leg below.
+  // (Contrast slack/plane/linear/github, which DO record every configured poll — see lib/ingest/
+  // scheduler.runImport "still record configured sources (proves the poller ran)" — so they keep the
+  // meaningful 3h default.)
+  dense: null,
+  linear_inbound: null,
+  graph_project: null,
+  meeting_notes: null,
 };
 
 /** The age past which `source` is considered stale, or `null` to never flag it on age. Exported for
