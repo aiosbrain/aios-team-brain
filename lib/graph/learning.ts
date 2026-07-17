@@ -91,10 +91,11 @@ export async function recentFacts(
  */
 export async function resolveEpisodeItems(
   groups: string[],
-  uuids: string[]
+  uuids: string[],
+  maxUuids = 500
 ): Promise<Map<string, { itemId?: string; source?: string }>> {
   const out = new Map<string, { itemId?: string; source?: string }>();
-  const unique = [...new Set(uuids.filter(Boolean))].slice(0, 500);
+  const unique = [...new Set(uuids.filter(Boolean))].slice(0, maxUuids);
   if (!neo4jConfigured() || groups.length === 0 || unique.length === 0) return out;
   try {
     const rows = await runRead<{ uuid: string; name: string | null; source: string | null }>(

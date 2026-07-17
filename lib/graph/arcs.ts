@@ -50,6 +50,9 @@ export type ProviderKeys = LlmBackendKeys;
 
 const MAX_FACTS = 200;
 const MAX_ARCS = 8;
+// Fetch a much deeper pool than we feed the model, so lower-volume contributors' facts are reachable
+// for balancing (a high-volume person's recent burst can otherwise push everyone else past MAX_FACTS).
+const FACT_POOL = MAX_FACTS * 6;
 const CACHE_TTL_MS = 10 * 60_000;
 
 const SYSTEM_PROMPT =
@@ -80,6 +83,39 @@ export function stripTaskKeys(text: string): string {
     .replace(/\(\s*\)/g, "") // empty parens left behind
     .replace(/\s{2,}/g, " ")
     .trim();
+}
+
+/**
+ * Balance a fact pool ACROSS its contributors so synthesis input represents everyone active — not just
+ * whoever pushed the most recent volume. Without this, arc synthesis fed the globally-newest MAX_FACTS
+ * facts, so a high-volume contributor's recent burst crowded every lower-volume person out of the
+ * prompt entirely (their work then never appeared in Learning even though it's in the graph). We group
+ * the pool by the human behind each fact and round-robin one-per-contributor per round (each person's
+ * facts consumed newest-first) until `budget` is filled. Unattributed facts ("") are their own bucket.
+ * Pure + unit-tested; `humanOf` is injected so the DB/Neo4j resolution stays in the caller.
+ */
+export function balanceFactsByContributor<T>(facts: T[], humanOf: (f: T) => string, budget: number): T[] {
+  const buckets = new Map<string, T[]>();
+  for (const f of facts) {
+    const key = humanOf(f);
+    const arr = buckets.get(key);
+    if (arr) arr.push(f);
+    else buckets.set(key, [f]);
+  }
+  const lists = [...buckets.values()]; // insertion order ≈ first-seen recency, newest bucket first
+  const out: T[] = [];
+  for (let round = 0; out.length < budget; round++) {
+    let progressed = false;
+    for (const list of lists) {
+      if (out.length >= budget) break;
+      if (round < list.length) {
+        out.push(list[round]);
+        progressed = true;
+      }
+    }
+    if (!progressed) break; // every bucket exhausted
+  }
+  return out;
 }
 
 const CONFIDENCE_WEIGHT: Record<NarrativeArc["confidence"], number> = { high: 3, medium: 2, low: 1 };
@@ -311,15 +347,29 @@ async function synthesizeArcs(
   keys: ProviderKeys
 ): Promise<NarrativeArc[]> {
   // Arcs are NOT time-boxed — synthesize from the most-recent facts regardless of age (a quiet week,
-  // or a stalled projector, must not blank the panel). `null` = no window; recentFacts still caps at
-  // MAX_FACTS, newest first.
-  const facts = await recentFacts(groups, null, MAX_FACTS);
+  // or a stalled projector, must not blank the panel). `null` = no window. Fetch a DEEP pool (not just
+  // MAX_FACTS), so we can balance it across contributors — otherwise the globally-newest MAX_FACTS are
+  // dominated by whoever pushed the most volume and everyone else's work is invisible in Learning.
+  const pool = await recentFacts(groups, null, FACT_POOL);
   // No facts and nothing to correct → nothing to synthesize. (A correction with no facts still runs
   // the LLM, preserving the pre-cache recompute behavior.)
-  if (facts.length === 0 && correctionTexts.length === 0) return [];
-  const epToItem = await resolveEpisodeItems(groups, facts.flatMap((f) => f.episodeUuids));
+  if (pool.length === 0 && correctionTexts.length === 0) return [];
+  // Resolve attribution for the WHOLE pool (higher uuid cap to match) so balancing sees each fact's
+  // human. epToItem/humanByItem stay supersets of the balanced set — safe for evidence + attribution.
+  const epToItem = await resolveEpisodeItems(groups, pool.flatMap((f) => f.episodeUuids), FACT_POOL * 3);
   const allItemIds = [...new Set([...epToItem.values()].map((v) => v.itemId).filter((id): id is string => !!id))];
   const humanByItem = await resolveHumanActorsByItem(db, teamId, allItemIds);
+  // The human behind a fact = the first resolvable human among its source episodes' items ("" if none).
+  const humanOfFact = (f: AtomicFact): string => {
+    for (const u of f.episodeUuids) {
+      const itemId = epToItem.get(u)?.itemId;
+      const h = itemId ? humanByItem.get(itemId) : undefined;
+      if (h) return h;
+    }
+    return "";
+  };
+  // Balance the deep pool → a representative MAX_FACTS so every active contributor is in the prompt.
+  const facts = balanceFactsByContributor(pool, humanOfFact, MAX_FACTS);
   const raw = await callLLMRaw(
     buildPrompt(attributedFactTexts(facts, epToItem, humanByItem), correctionTexts),
     keys,

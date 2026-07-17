@@ -25,12 +25,15 @@ const SOURCE_TABLE = "items";
  * stalled the queue (prod 2026-06-25, 07-03, 07-17). The ROOT FIX is on the Graphiti side: bump the
  * image to one where `DEFAULT_MAX_TOKENS` is 16384 (current graphiti_core) — done in graphiti's
  * docker-compose + the prod service — so extraction has 2× the headroom instead of us shrinking input.
- * With the cap raised, 6000 is the intended episode size (full item text still lives in
- * `items`/pgvector/FTS regardless; median item ~240 chars, so this only clips outliers). Still
- * env-tunable via `GRAPH_MAX_EPISODE_CHARS` as a safety valve. See the "202 ≠ extracted" note +
- * extraction-health probe in docs/ARCHITECTURE.md.
+ * With the cap raised to 16384, most episodes extract — but the densest 6000-char ones can STILL
+ * overflow even 16384 (`Output length exceeded max tokens 16384`, prod 2026-07-17), especially while a
+ * backlog reprojection bloats Graphiti's previous-episode context. gpt-4o's output ceiling IS 16384,
+ * so we can't raise the cap further; 4000 keeps the densest episodes' extraction output under it while
+ * staying far more faithful than the 2000 stop-gap (full item text still lives in `items`/pgvector/FTS
+ * regardless; median item ~240 chars, so this only clips outliers). Env-tunable via
+ * `GRAPH_MAX_EPISODE_CHARS`. See the "202 ≠ extracted" note + extraction-health probe in docs/ARCHITECTURE.md.
  */
-export const MAX_EPISODE_CHARS = Number(process.env.GRAPH_MAX_EPISODE_CHARS ?? 6000);
+export const MAX_EPISODE_CHARS = Number(process.env.GRAPH_MAX_EPISODE_CHARS ?? 4000);
 
 /** Item kinds worth projecting as graph episodes — content-bearing knowledge, not raw config.
  * `skill`/`blueprint` are configuration manifests, not events/knowledge, so they're excluded. */
