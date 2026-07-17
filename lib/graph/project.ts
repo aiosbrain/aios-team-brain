@@ -19,20 +19,18 @@ const SOURCE_TABLE = "items";
 
 /**
  * Max episode content length pushed to Graphiti. Graphiti extracts entities/edges from each episode
- * with its OWN LLM, and that call's OUTPUT is hard-capped at 8192 tokens by the pinned `zepai/graphiti`
- * image (graphiti_core's `DEFAULT_MAX_TOKENS`). The image's `graph_service` exposes NO env to raise it
- * (verified 2026-07-17 against getzep/graphiti `config.py`: only api_key/base_url/model_name/embedding
- * are configurable) — so the ONLY app-side lever is to keep extraction output under 8192 by bounding
- * what we send. A richer/longer episode extracts more nodes → larger structured output → overflow:
- *   `Output length exceeded max tokens 8192` in `resolve_extracted_nodes` (prod 2026-06-25, 07-03, and
- *   again 07-17 where a 6000-char cap STILL overflowed and stalled the whole backlog — no facts, blank
- *   arcs). 2000 chars (~500 tokens) keeps extraction output comfortably bounded. Full item text still
- *   lives in `items`/pgvector/FTS — only the graph episode is truncated (median item is ~240 chars, so
- *   this clips only outlier docs). Tunable via `GRAPH_MAX_EPISODE_CHARS` without a redeploy; the deeper
- *   durable fix (a newer image that raises the cap / handles the length error) is a Graphiti-service
- *   bump, which carries rebuild/schema-coupling risk — see docs/ARCHITECTURE.md + the graphiti memory.
+ * with its OWN LLM; that call's OUTPUT was hard-capped at 8192 tokens by the OLD pinned `zepai/graphiti`
+ * image (graphiti_core `DEFAULT_MAX_TOKENS` was 8192 there), so a rich/long episode whose extraction
+ * overflowed that cap raised `Output length exceeded max tokens 8192` in `resolve_extracted_nodes` and
+ * stalled the queue (prod 2026-06-25, 07-03, 07-17). The ROOT FIX is on the Graphiti side: bump the
+ * image to one where `DEFAULT_MAX_TOKENS` is 16384 (current graphiti_core) — done in graphiti's
+ * docker-compose + the prod service — so extraction has 2× the headroom instead of us shrinking input.
+ * With the cap raised, 6000 is the intended episode size (full item text still lives in
+ * `items`/pgvector/FTS regardless; median item ~240 chars, so this only clips outliers). Still
+ * env-tunable via `GRAPH_MAX_EPISODE_CHARS` as a safety valve. See the "202 ≠ extracted" note +
+ * extraction-health probe in docs/ARCHITECTURE.md.
  */
-export const MAX_EPISODE_CHARS = Number(process.env.GRAPH_MAX_EPISODE_CHARS ?? 2000);
+export const MAX_EPISODE_CHARS = Number(process.env.GRAPH_MAX_EPISODE_CHARS ?? 6000);
 
 /** Item kinds worth projecting as graph episodes — content-bearing knowledge, not raw config.
  * `skill`/`blueprint` are configuration manifests, not events/knowledge, so they're excluded. */

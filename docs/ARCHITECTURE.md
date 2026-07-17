@@ -598,15 +598,17 @@ guard enforces it, it's named.
   comparing projected episodes (Postgres ledger) vs extracted facts (Neo4j `count(RELATES_TO)`): many
   projected + zero extracted ⇒ **degraded**, surfaced on the Admin retrieval-health card (Graph memory
   leg) **and** the loud pipeline-health banner (synthetic `graph_extract` leg) on Home + Integrations.
-  The extractor's 8192 output-token cap is **not** raisable via env on the pinned `zepai/graphiti` image
-  (verified 2026-07-17 against getzep/graphiti `config.py` — only api_key/base_url/model_name/embedding
-  are configurable; `zep_graphiti.py` overrides nothing else). So the only app-side lever is
-  `MAX_EPISODE_CHARS` in `lib/graph/project` (2000, `GRAPH_MAX_EPISODE_CHARS`-tunable) — a smaller
-  episode extracts fewer nodes → smaller structured output → stays under the cap. The deeper durable fix
-  (a newer image that raises the cap or handles the length error) is a Graphiti-service image bump, which
-  carries rebuild + Neo4j-schema-coupling risk — see the graphiti memory note. _Guards:_
-  `test/graph-extraction-health.test.ts` + the `deriveGraphState` extraction-stall case in
-  `test/retrieval-health.test.ts` + the `MAX_EPISODE_CHARS` cap spec in the graph-project data-mechanics tier.
+  **Root fix — raise the cap (not shrink episodes).** The extractor's output cap is graphiti_core's
+  `DEFAULT_MAX_TOKENS`, which is **8192 in every published `zepai/graphiti` image** (verified 2026-07-17
+  through v0.22.0) and is **not** settable by env (getzep's `graph_service/config.py` exposes only
+  api_key/base_url/model_name/embedding; the 16384 default lives only on unreleased `main`). So we run a
+  **patched image** — `graphiti/Dockerfile` builds FROM the exact prod-pinned digest and bumps only that
+  constant to 16384 (gpt-4o's max output). No version jump ⇒ the Neo4j schema our `lib/graph/learning`
+  Cypher reads and the REST API the projector uses stay byte-identical; only the token ceiling moves.
+  `MAX_EPISODE_CHARS` stays at 6000 (its intended size; `GRAPH_MAX_EPISODE_CHARS`-tunable as a safety
+  valve). Deploying the patched image is a `graphiti`-service rebuild (roll back to deployment `6208aed5`
+  if unhealthy). _Guards:_ `test/graph-extraction-health.test.ts` + the `deriveGraphState` extraction-stall
+  case in `test/retrieval-health.test.ts`.
 
 ## Changing X? read this
 
