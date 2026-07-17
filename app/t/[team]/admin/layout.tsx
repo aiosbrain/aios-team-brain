@@ -13,13 +13,12 @@ export default async function AdminLayout({
   const { team: teamSlug } = await params;
   const db = await serverClient();
 
-  const user = await getSessionUser();
-
-  const { data: team } = await db
-    .from("teams")
-    .select("id")
-    .eq("slug", teamSlug)
-    .maybeSingle();
+  // The session and the team lookup are independent — resolve them together so the admin shell's
+  // own auth doesn't add a serial round-trip on top of each tab's queries.
+  const [user, { data: team }] = await Promise.all([
+    getSessionUser(),
+    db.from("teams").select("id").eq("slug", teamSlug).maybeSingle(),
+  ]);
 
   const { data: me } = team
     ? await db

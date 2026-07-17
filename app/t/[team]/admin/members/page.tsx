@@ -27,14 +27,22 @@ export default async function MembersAdminPage({
     .maybeSingle();
   if (!team) return null;
 
-  const { data: members } = await db
-    .from("members")
-    .select(
-      "id, display_name, email, actor_handle, role, tier, status, github_login, avatar_url, created_at, manager_member_id"
-    )
-    .eq("team_id", team.id)
-    .eq("is_connector", false)
-    .order("created_at");
+  const adminDb = adminClient();
+
+  // The member roster and the per-tool provisioning availability (invite checkboxes) are
+  // independent, so load them concurrently rather than one-after-the-other.
+  const [membersRes, provisioningAvailability] = await Promise.all([
+    db
+      .from("members")
+      .select(
+        "id, display_name, email, actor_handle, role, tier, status, github_login, avatar_url, created_at, manager_member_id"
+      )
+      .eq("team_id", team.id)
+      .eq("is_connector", false)
+      .order("created_at"),
+    getProvisioningAvailabilityAction(teamSlug),
+  ]);
+  const members = membersRes.data;
 
   // Candidate managers for the "Reports to" selector: any other non-disabled, non-connector
   // member (setMemberManager rejects disabled/connector targets server-side too).
@@ -42,21 +50,19 @@ export default async function MembersAdminPage({
     .filter((m) => m.status !== "disabled")
     .map((m) => ({ id: m.id as string, displayName: m.display_name as string }));
 
-  // Per-tool provisioning availability (drives the invite checkboxes) + each member's current
-  // provisioning rows (drives the compact retry badges). Reads go through the admin service client
-  // and the single-writer's read helpers — the members subtree is already admin-gated by the layout.
-  const adminDb = adminClient();
-  const provisioningAvailability = await getProvisioningAvailabilityAction(teamSlug);
-  const provisioningByMember = new Map(
-    await Promise.all(
+  // Each member's provisioning rows (compact retry badges) and the linked-identities panel are
+  // independent once the roster is known — fan out the per-member reads and the identities read
+  // together. Reads go through the admin service client + single-writer read helpers; the members
+  // subtree is already admin-gated by the layout.
+  const [provisioningEntries, identities] = await Promise.all([
+    Promise.all(
       (members ?? []).map(
         async (m) => [m.id, await getMemberProvisioning(adminDb, team.id, m.id as string)] as const
       )
-    )
-  );
-
-  // All linked identities (email aliases + slack/linear/plane provider ids) for the panel.
-  const identities = await listMemberIdentities(db, team.id);
+    ),
+    listMemberIdentities(db, team.id),
+  ]);
+  const provisioningByMember = new Map(provisioningEntries);
   const providerOf = (memberId: string, provider: string): ProviderLink | null => {
     const p = identities.get(memberId)?.providers.find((x) => x.provider === provider);
     return p ? { externalId: p.externalId, handle: p.handle } : null;
