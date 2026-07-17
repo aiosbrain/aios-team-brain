@@ -44,15 +44,46 @@ export default async function SocialPage({ params }: { params: Promise<{ team: s
     );
   }
 
-  const opportunities = await listOpportunities(db, team.id, "team", 100);
+  // Every read below is independent — all the derived structures are pure JS post-processing done
+  // after the awaits — so fire them concurrently instead of in a ~13-deep request waterfall (each
+  // round-trip to Railway Postgres has real latency; serial they stacked into most of the render).
+  const [
+    opportunities,
+    plansRes,
+    variantsRes,
+    media,
+    budget,
+    jobsHealth,
+    autonomy,
+    pendingRows,
+    tf,
+    publishDryRun,
+    pubs,
+    analyticsRows,
+    analytics,
+  ] = await Promise.all([
+    listOpportunities(db, team.id, "team", 100),
+    db.from("content_plans").select("id, opportunity_id").eq("team_id", team.id),
+    db
+      .from("content_variants")
+      .select("id, plan_id, platform, status, body, validation")
+      .eq("team_id", team.id)
+      .order("created_at", { ascending: true }),
+    listTeamMediaMeta(db, team.id, 200),
+    imageBudget(db, team.id),
+    getSocialJobsHealth(db, team.id),
+    getAutonomy(db, team.id),
+    listPendingApprovals(db, team.id),
+    typefullyStatus(db, team.id),
+    getPublishDryRun(db, team.id),
+    listPublications(db, team.id, 200),
+    listTeamAnalytics(db, team.id, 500),
+    teamAnalyticsSummary(db, team.id),
+  ]);
 
-  const { data: plans } = await db.from("content_plans").select("id, opportunity_id").eq("team_id", team.id);
+  const plans = plansRes.data;
+  const variants = variantsRes.data;
   const planToOpp = new Map((plans ?? []).map((p: { id: string; opportunity_id: string }) => [p.id, p.opportunity_id]));
-  const { data: variants } = await db
-    .from("content_variants")
-    .select("id, plan_id, platform, status, body, validation")
-    .eq("team_id", team.id)
-    .order("created_at", { ascending: true });
 
   const byOpportunity: Record<string, VariantView[]> = {};
   const allVariants = (variants ?? []) as (VariantView & { plan_id: string })[];
@@ -61,14 +92,9 @@ export default async function SocialPage({ params }: { params: Promise<{ team: s
     if (oppId) (byOpportunity[oppId] ??= []).push(v);
   }
 
-  const media = await listTeamMediaMeta(db, team.id, 200);
   const mediaByVariant: Record<string, string[]> = {};
   for (const m of media) (mediaByVariant[m.variant_id] ??= []).push(m.id);
-  const budget = await imageBudget(db, team.id);
 
-  const jobsHealth = await getSocialJobsHealth(db, team.id);
-  const autonomy = await getAutonomy(db, team.id);
-  const pendingRows = await listPendingApprovals(db, team.id);
   const variantCtx: Record<string, { platform: string; body: string; oppTitle: string }> = {};
   for (const [oppId, vs] of Object.entries(byOpportunity)) {
     const oppTitle = opportunities.find((o) => o.id === oppId)?.title ?? "";
@@ -83,12 +109,6 @@ export default async function SocialPage({ params }: { params: Promise<{ team: s
     oppTitle: variantCtx[a.variant_id]?.oppTitle ?? "",
   }));
 
-  const [tf, publishDryRun, pubs] = await Promise.all([
-    typefullyStatus(db, team.id),
-    getPublishDryRun(db, team.id),
-    listPublications(db, team.id, 200),
-  ]);
-  const analyticsRows = await listTeamAnalytics(db, team.id, 500);
   const analyticsByPublication = new Map(analyticsRows.map((a) => [a.publication_id, a]));
   const publicationsByVariant: Record<string, PublicationView[]> = {};
   for (const p of pubs) {
@@ -105,7 +125,6 @@ export default async function SocialPage({ params }: { params: Promise<{ team: s
   }
 
   const publishedCount = pubs.filter((p) => p.status === "published").length;
-  const analytics = await teamAnalyticsSummary(db, team.id);
 
   return (
     <div className="flex flex-col gap-5">
