@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { parseArcsJson, stripTaskKeys, rankArcs, newestEvidenceAt, type NarrativeArc } from "@/lib/graph/arcs";
+import {
+  parseArcsJson,
+  stripTaskKeys,
+  rankArcs,
+  newestEvidenceAt,
+  balanceFactsByContributor,
+  type NarrativeArc,
+} from "@/lib/graph/arcs";
 
 /**
  * Spec for the arc JSON normalizer (the fragile bit — an LLM's JSON is untrusted). Derived from the
@@ -184,5 +191,38 @@ describe("rankArcs — recency then relevance (surfaces recent contributors' wor
     const undated1 = arc("undated1", "high", [undefined]);
     const undated2 = arc("undated2", "high", [undefined]);
     expect(rankArcs([undated1, dated, undated2]).map((a) => a.title)).toEqual(["dated", "undated1", "undated2"]);
+  });
+});
+
+describe("balanceFactsByContributor — fair representation (the fix for a contributor going invisible)", () => {
+  const f = (id: string, who: string) => ({ id, who });
+  const humanOf = (x: { who: string }) => x.who;
+
+  it("round-robins so a high-volume contributor can't crowd out a low-volume one", () => {
+    // John has 5 facts, Chetan 1. With the OLD global-newest slice(0,4) Chetan would be dropped;
+    // balancing must keep him in.
+    const facts = [
+      f("j1", "John"), f("j2", "John"), f("j3", "John"), f("j4", "John"), f("j5", "John"),
+      f("c1", "Chetan"),
+    ];
+    const out = balanceFactsByContributor(facts, humanOf, 4);
+    expect(out.map((x) => x.id)).toContain("c1");
+    expect(out.map((x) => x.id)).toEqual(["j1", "c1", "j2", "j3"]);
+  });
+
+  it("consumes each contributor's facts newest-first (per-bucket input order preserved)", () => {
+    const facts = [f("j1", "John"), f("j2", "John"), f("c1", "Chetan"), f("c2", "Chetan")];
+    expect(balanceFactsByContributor(facts, humanOf, 4).map((x) => x.id)).toEqual(["j1", "c1", "j2", "c2"]);
+  });
+
+  it("respects the budget and returns [] for an empty pool", () => {
+    const facts = Array.from({ length: 20 }, (_, i) => f(`x${i}`, i % 2 ? "A" : "B"));
+    expect(balanceFactsByContributor(facts, humanOf, 5)).toHaveLength(5);
+    expect(balanceFactsByContributor([], humanOf, 5)).toEqual([]);
+  });
+
+  it("unattributed facts ('') are their own bucket and still get a fair share", () => {
+    const facts = [f("j1", "John"), f("j2", "John"), f("u1", ""), f("u2", "")];
+    expect(balanceFactsByContributor(facts, humanOf, 4).map((x) => x.id)).toEqual(["j1", "u1", "j2", "u2"]);
   });
 });
