@@ -34,9 +34,10 @@ Two callers: the admin **"Project to graph"** button on the Integrations page (o
 `lib/graph/scheduler` (an interval poller registered in `instrumentation.ts`). Both are inert
 unless `GRAPHITI_URL` is set. Tune with `GRAPH_PROJECT_MINUTES` (default 60), `GRAPH_PROJECT_LIMIT`
 (default 500 items/run), `GRAPH_PROJECT_ENABLED=false` to disable, and `GRAPH_MAX_EPISODE_CHARS`
-(default 2000) — the per-episode content cap that keeps Graphiti's extraction output under its
-hard-coded 8192-token limit (a bigger episode extracts more nodes → overflow → the extractor fails
-and no facts are created; see the "202 ≠ extracted" gotcha in `docs/ARCHITECTURE.md`).
+(default 6000) — the per-episode content cap. A bigger episode extracts more nodes → larger structured
+output; the extractor's output ceiling is raised to 16384 by the patched image (see `Dockerfile` +
+the "202 ≠ extracted" gotcha in `docs/ARCHITECTURE.md`), so 6000 is safe. The env is a safety valve if
+you run the stock (8192-cap) image instead.
 
 ## LLM note
 Extraction quality depends on structured-output support. Start with a strong cloud model; a local
