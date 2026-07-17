@@ -26,6 +26,26 @@ who reads it**. The map only pays off if it's trustworthy, so:
 
 ---
 
+## ⚠️ Review gate — ALWAYS Fable-review before pushing a PR (REQUIRED)
+
+Many sessions/worktrees ship into this repo in parallel and merge fast — **a Fable review is the
+pre-merge safety net** that catches tier leaks, sync-contract drift, and correctness bugs the async
+bots (CodeRabbit/Cursor) miss. It is **not optional**.
+
+- **Before you `git push` a PR branch:** run a Fable review of the branch diff — spawn the
+  **`code-reviewer` agent on the Fable model** (`Agent(subagent_type: "code-reviewer", model: "fable")`)
+  pointed at `git diff origin/main...HEAD`. Give it the change's intent and let it apply the AIOS
+  invariants (this file + the agent's own checklist).
+- **Address its findings first.** Fix every blocker/HIGH; fix or consciously defer MEDIUM/LOW with a
+  one-line reason. Only push once Fable's verdict is *sound / ship it* (or its blockers are resolved).
+- **Record it in the PR body** — a short `## Review — Reviewed by **Fable** — verdict …` line (with the
+  findings it caught + how you resolved them), so it's auditable which PRs were Fable-reviewed and
+  which weren't. Absence of that line means the gate was skipped.
+- Fable reviews the **diff you're about to ship**, not the bots' comments — it adds its own analysis.
+  This is in addition to CI and the async bot reviews, never a replacement.
+
+---
+
 ## 2. Four operating principles (internalize these)
 
 1. **Spec-first testing, never characterization-first.** Write the assertion from what the
