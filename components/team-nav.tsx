@@ -1,6 +1,6 @@
 "use client";
 
-import Link from "next/link";
+import Link, { useLinkStatus } from "next/link";
 import { usePathname } from "next/navigation";
 import { ThemeToggle } from "@/components/theme-toggle";
 import {
@@ -13,6 +13,7 @@ import {
   GitBranch,
   Home,
   ListTodo,
+  Loader2,
   Megaphone,
   NotebookText,
   Shield,
@@ -55,6 +56,18 @@ function isSection(entry: NavEntry): entry is NavSection {
   return (entry as NavSection).children !== undefined;
 }
 
+/**
+ * Immediate feedback on the clicked tab while its route renders. `useLinkStatus` is `pending` for
+ * the enclosing `<Link>` during a client-side transition; the spinner debounces its own appearance
+ * via `.nav-pending-in` (fades in after ~140ms) so a fast tab never flashes it. Must be rendered
+ * inside the `<Link>` subtree — that's how the hook scopes to that link.
+ */
+function NavPending() {
+  const { pending } = useLinkStatus();
+  if (!pending) return null;
+  return <Loader2 aria-hidden className="nav-pending-in size-3.5 shrink-0 animate-spin text-ink-tertiary" />;
+}
+
 function Leaf({ item, indent = false }: { item: NavLeaf; indent?: boolean }) {
   const pathname = usePathname();
   const active = item.exact
@@ -72,8 +85,9 @@ function Leaf({ item, indent = false }: { item: NavLeaf; indent?: boolean }) {
           : "text-ink-secondary hover:bg-surface-card-hover hover:text-ink"
       }`}
     >
-      <Icon className="size-4" strokeWidth={active ? 2 : 1.5} />
-      {item.label}
+      <Icon className="size-4 shrink-0" strokeWidth={active ? 2 : 1.5} />
+      <span className="min-w-0 flex-1 truncate">{item.label}</span>
+      <NavPending />
     </Link>
   );
 }
