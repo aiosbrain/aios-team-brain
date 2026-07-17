@@ -588,6 +588,25 @@ guard enforces it, it's named.
   schema loader (`scripts/pg-load-schema.mjs`, the Railway `preDeployCommand`) sets `lock_timeout`
   so a migration fails fast instead of wedging the lock queue behind a stuck reader.
   _Guards:_ `test/pg-pool-config.test.ts` + `test/pg-load-schema.test.ts`.
+- **A 202 from Graphiti does NOT mean facts were extracted.** The projector POSTs episodes and
+  records `graph_project`=OK on a `202 Accepted`, but 202 only means "queued" — Graphiti then runs
+  its own LLM to extract entities/`RELATES_TO` facts asynchronously. When that step fails on every
+  job (prod 2026-07: `Output length exceeded max tokens 8192` in `resolve_extracted_nodes`, ~800 jobs
+  backed up), episodes are accepted while zero facts are created, and `graph_project`=OK,
+  `/healthcheck`=green, and projector-freshness all stay green — a fully silent failure that blanks
+  narrative arcs. `lib/graph/extraction-health.getGraphExtractionHealth` closes the blind spot by
+  comparing projected episodes (Postgres ledger) vs extracted facts (Neo4j `count(RELATES_TO)`): many
+  projected + zero extracted ⇒ **degraded**, surfaced on the Admin retrieval-health card (Graph memory
+  leg) **and** the loud pipeline-health banner (synthetic `graph_extract` leg) on Home + Integrations.
+  The extractor's 8192 output-token cap is **not** raisable via env on the pinned `zepai/graphiti` image
+  (verified 2026-07-17 against getzep/graphiti `config.py` — only api_key/base_url/model_name/embedding
+  are configurable; `zep_graphiti.py` overrides nothing else). So the only app-side lever is
+  `MAX_EPISODE_CHARS` in `lib/graph/project` (2000, `GRAPH_MAX_EPISODE_CHARS`-tunable) — a smaller
+  episode extracts fewer nodes → smaller structured output → stays under the cap. The deeper durable fix
+  (a newer image that raises the cap or handles the length error) is a Graphiti-service image bump, which
+  carries rebuild + Neo4j-schema-coupling risk — see the graphiti memory note. _Guards:_
+  `test/graph-extraction-health.test.ts` + the `deriveGraphState` extraction-stall case in
+  `test/retrieval-health.test.ts` + the `MAX_EPISODE_CHARS` cap spec in the graph-project data-mechanics tier.
 
 ## Changing X? read this
 

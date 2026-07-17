@@ -12,6 +12,8 @@ import { listRecentIngestRuns } from "@/lib/ingest/runs";
 import { IngestRunsPanel } from "@/components/admin/ingest-runs-panel";
 import { getRetrievalHealth } from "@/lib/query/retrieval-health";
 import { RetrievalHealthCard } from "@/components/admin/retrieval-health-card";
+import { getPipelineHealth } from "@/lib/ingest/pipeline-health";
+import { PipelineHealthBanner } from "@/components/admin/pipeline-health-banner";
 import { describeAnswering } from "@/lib/query/llm-backend";
 import { normalizeAnsweringProvider } from "@/lib/query/answering";
 
@@ -48,9 +50,10 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ t
     : { data: null };
 
   const db = adminClient();
-  const [integrations, ingestRuns, freshness, retrievalHealth] = await Promise.all([
+  const [integrations, ingestRuns, pipelineHealth, freshness, retrievalHealth] = await Promise.all([
     listIntegrations(db, team.id, { role: me?.role as string | undefined }) as Promise<IntegrationRow[]>,
     listRecentIngestRuns(db, team.id, 30),
+    getPipelineHealth(team.id),
     // Already-scanned repos (from codebase scans) → offered as one-click link suggestions. Read
     // through the tier-gated codebases choke point (CLAUDE.md §5), never the table directly.
     getCodebaseFreshness(db, team.id, (me?.tier as "team" | "external") ?? "external"),
@@ -105,6 +108,7 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ t
 
   return (
     <div className="flex flex-col gap-4">
+      <PipelineHealthBanner health={pipelineHealth} href={`/t/${teamSlug}/admin/integrations`} />
       <div>
         <h1 className="text-xl font-semibold text-ink">Integrations</h1>
         <p className="mt-1 text-sm text-ink-secondary">

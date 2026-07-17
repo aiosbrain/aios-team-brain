@@ -3,6 +3,8 @@ import { Rocket } from "lucide-react";
 import { serverClient } from "@/lib/db/server";
 import { visibleItems, visibleDecisions } from "@/lib/auth/visibility";
 import { resolveTeamContext } from "@/lib/auth/team-context";
+import { getPipelineHealth } from "@/lib/ingest/pipeline-health";
+import { PipelineHealthBanner } from "@/components/admin/pipeline-health-banner";
 import { CopySnippet } from "@/components/copy-snippet";
 import { getPulseMetrics } from "@/lib/metrics/pulse";
 import { parseRange } from "@/lib/metrics/range";
@@ -168,7 +170,7 @@ export default async function TeamHome({
     );
   }
 
-  const [pulse, { data: decisions }] = await Promise.all([
+  const [pulse, { data: decisions }, pipelineHealth] = await Promise.all([
     getPulseMetrics(db, team.id, range, { isAdmin, memberId }),
     visibleDecisions(
       db
@@ -179,10 +181,16 @@ export default async function TeamHome({
         .limit(8),
       tier,
     ),
+    // Admins see a loud banner here (the landing page) if any ingestion leg is broken — so a wedged
+    // pipeline surfaces without digging into Admin. Non-admins don't fetch it.
+    isAdmin ? getPipelineHealth(team.id) : Promise.resolve(null),
   ]);
 
   return (
     <div className="mx-auto flex max-w-6xl flex-col gap-6">
+      {pipelineHealth ? (
+        <PipelineHealthBanner health={pipelineHealth} href={`/t/${teamSlug}/admin/integrations`} />
+      ) : null}
       <div className="flex items-center justify-between gap-4">
         <h1 className="text-2xl font-semibold text-ink">Home</h1>
         <RangeSelector value={range} />

@@ -59,21 +59,29 @@ describe("deriveGraphState", () => {
   const now = Date.parse("2026-07-15T12:00:00Z");
   const fresh = Date.parse("2026-07-15T11:00:00Z"); // 1h ago
   const stale = Date.parse("2026-07-08T12:00:00Z"); // 7d ago
+  const base = { extractionStalled: false as boolean, nowMs: now };
   it("off when not configured (regardless of reachability)", () => {
-    expect(deriveGraphState({ configured: false, reachable: false, lastProjectedAtMs: null, nowMs: now })).toBe("off");
-    expect(deriveGraphState({ configured: false, reachable: true, lastProjectedAtMs: fresh, nowMs: now })).toBe("off");
+    expect(deriveGraphState({ ...base, configured: false, reachable: false, lastProjectedAtMs: null })).toBe("off");
+    expect(deriveGraphState({ ...base, configured: false, reachable: true, lastProjectedAtMs: fresh })).toBe("off");
   });
   it("on when reachable AND recently projected", () => {
-    expect(deriveGraphState({ configured: true, reachable: true, lastProjectedAtMs: fresh, nowMs: now })).toBe("on");
+    expect(deriveGraphState({ ...base, configured: true, reachable: true, lastProjectedAtMs: fresh })).toBe("on");
   });
   it("on when reachable and nothing has projected yet (null = fresh install, not a stall)", () => {
-    expect(deriveGraphState({ configured: true, reachable: true, lastProjectedAtMs: null, nowMs: now })).toBe("on");
+    expect(deriveGraphState({ ...base, configured: true, reachable: true, lastProjectedAtMs: null })).toBe("on");
   });
   it("degraded when configured BUT unreachable — the silent-failure case reviving must surface", () => {
-    expect(deriveGraphState({ configured: true, reachable: false, lastProjectedAtMs: fresh, nowMs: now })).toBe("degraded");
+    expect(deriveGraphState({ ...base, configured: true, reachable: false, lastProjectedAtMs: fresh })).toBe("degraded");
   });
   it("degraded when reachable BUT projector stalled — the 2026-07 healthcheck-only blind spot", () => {
     // /healthcheck answers (reachable) yet no episode has landed in a week → writes are failing silently.
-    expect(deriveGraphState({ configured: true, reachable: true, lastProjectedAtMs: stale, nowMs: now })).toBe("degraded");
+    expect(deriveGraphState({ ...base, configured: true, reachable: true, lastProjectedAtMs: stale })).toBe("degraded");
+  });
+  it("degraded when reachable + writing BUT the extractor makes no facts — the 202-then-silent-fail case", () => {
+    // Projector is fresh (writing episodes) and the service is up, but Graphiti's extractor fails every
+    // job so nothing becomes a fact. This is the blind spot ingest_runs=graph_project(ok) can't see.
+    expect(
+      deriveGraphState({ configured: true, reachable: true, lastProjectedAtMs: fresh, extractionStalled: true, nowMs: now })
+    ).toBe("degraded");
   });
 });
