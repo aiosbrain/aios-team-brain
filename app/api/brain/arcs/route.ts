@@ -75,11 +75,16 @@ export async function POST(req: NextRequest) {
     }
   }
 
+  // The diagnostic `note` names internal admin surfaces and — for `model_failing` — embeds the raw
+  // provider error (`llm.note` → internal LLM base URL, model slug, and the provider's error body).
+  // That's team-internal infra detail: redact it for `external`-tier collaborators (who can't act on it
+  // and shouldn't see the config), keeping only the coarse `reason` category. Team tier still gets the
+  // actionable note.
   return Response.json({
     arcs,
     degraded: reason === "model_failing", // back-compat flag
     reason,
-    note,
+    note: tier === "external" ? undefined : note,
     as_of: new Date().toISOString(),
   });
 }

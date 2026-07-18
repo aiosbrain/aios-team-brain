@@ -57,6 +57,20 @@ export interface LlmBackendKeys {
 /** Which model to select: the default interactive/extraction model, or the reasoning model. */
 export type LlmRole = "query" | "reasoning";
 
+/**
+ * Whether chain-of-thought reasoning should be left ON for this call. TRUE only when a reasoning-role
+ * task actually resolved to a DISTINCT reasoning model (`teams.reasoning_model` set). When it's unset,
+ * `role:"reasoning"` falls back to the QUERY model (see selectLlmBackend) — and if that model is itself
+ * a reasoning model, leaving reasoning on lets it spend the whole token budget on hidden thinking and
+ * return empty (the starvation that blanks the Learning arcs; the query role turns reasoning off for
+ * exactly this reason). So a fallen-back reasoning role is treated like the query role: reasoning OFF.
+ * Single source of truth for the reasoning toggle — used by both selectLlmBackend (model swap) and the
+ * completion primitive (the `reasoning:{enabled:false}` flag).
+ */
+export function reasoningActive(role: LlmRole | undefined, keys: LlmBackendKeys): boolean {
+  return role === "reasoning" && nonEmpty(keys.reasoningModel);
+}
+
 export type LlmBackend =
   | { kind: "openrouter"; provider: "openrouter"; baseUrl: string; model: string; apiKey: string; headers: Record<string, string> }
   | { kind: "openai-compatible"; provider: "openai" | "local"; baseUrl: string; model: string; apiKey: string | null }
@@ -134,9 +148,11 @@ export function selectLlmBackend(
     candidate("anthropic", env, keys)!;
 
   // For a reasoning-role task, swap in the team's distinct reasoning model (on whatever provider
-  // answers). Unset → the query model already on `backend` stands, so reasoning falls back cleanly.
-  if (opts?.role === "reasoning" && nonEmpty(keys.reasoningModel)) {
-    return { ...backend, model: keys.reasoningModel.trim() };
+  // answers). Unset → `reasoningActive` is false, the query model already on `backend` stands, and the
+  // completion primitive turns reasoning OFF (so a query model that happens to be a reasoning model
+  // can't starve the answer — the whole point).
+  if (reasoningActive(opts?.role, keys)) {
+    return { ...backend, model: keys.reasoningModel!.trim() };
   }
   return backend;
 }

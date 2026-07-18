@@ -1,6 +1,7 @@
 import "server-only";
 import Anthropic from "@anthropic-ai/sdk";
-import { selectLlmBackend, type LlmBackendKeys, type LlmRole } from "@/lib/query/llm-backend";
+import { selectLlmBackend, reasoningActive, type LlmBackendKeys, type LlmRole } from "@/lib/query/llm-backend";
+import { looksLikeTokenLimit } from "@/lib/query/claude";
 import { recordIngestRun } from "@/lib/ingest/runs";
 import type { DbClient } from "@/lib/db/types";
 
@@ -92,38 +93,53 @@ export async function completeText(args: CompleteArgs, opts: CompleteOptions = {
     let text: string;
     if (backend.kind !== "anthropic") {
       const apiKey = backend.apiKey ?? process.env.OPENAI_API_KEY ?? "local";
-      const res = await fetch(`${backend.baseUrl.replace(/\/$/, "")}/chat/completions`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${apiKey}`,
-          ...(backend.kind === "openrouter" ? backend.headers : {}),
-        },
-        body: JSON.stringify({
-          model: backend.model,
-          // Answer budget + reasoning headroom (see REASONING_HEADROOM_TOKENS) so a reasoning model's
-          // hidden tokens don't starve the answer to empty.
-          max_tokens: maxTokens + REASONING_HEADROOM_TOKENS,
-          // For the QUERY role (the default — extraction/short generation), turn reasoning OFF on
-          // OpenRouter so a reasoning model can't spend the whole budget on hidden thinking and return
-          // empty content (what blanked the Learning page). The REASONING role deliberately leaves it
-          // ON — that's the point of the separate reasoning model (e.g. arc synthesis). Ignored by
-          // non-reasoning models. Override with LLM_DISABLE_REASONING=0.
-          ...(backend.kind === "openrouter" &&
-          opts.role !== "reasoning" &&
-          process.env.LLM_DISABLE_REASONING !== "0"
-            ? { reasoning: { enabled: false } }
-            : {}),
-          ...(opts.jsonObject ? { response_format: { type: "json_object" } } : {}),
-          messages: [
-            { role: "system", content: args.system },
-            { role: "user", content: prompt },
-          ],
-        }),
-        signal: AbortSignal.timeout(timeoutMs),
-      });
+      const doPost = (maxTokensToSend: number) =>
+        fetch(`${backend.baseUrl.replace(/\/$/, "")}/chat/completions`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${apiKey}`,
+            ...(backend.kind === "openrouter" ? backend.headers : {}),
+          },
+          body: JSON.stringify({
+            model: backend.model,
+            max_tokens: maxTokensToSend,
+            // Turn reasoning OFF on OpenRouter unless it's genuinely ACTIVE (`reasoningActive`: a
+            // reasoning-role task that resolved to a DISTINCT reasoning model). This covers the query
+            // role (extraction/short generation) AND — critically — a reasoning role that fell back to
+            // the query model because `teams.reasoning_model` is unset: if that model is itself a
+            // reasoning model, leaving reasoning on would spend the whole budget on hidden thinking and
+            // return empty (what blanked the Learning arcs). Only a real distinct reasoning model keeps
+            // reasoning on. Ignored by non-reasoning models. Override with LLM_DISABLE_REASONING=0.
+            ...(backend.kind === "openrouter" &&
+            !reasoningActive(opts.role, keys) &&
+            process.env.LLM_DISABLE_REASONING !== "0"
+              ? { reasoning: { enabled: false } }
+              : {}),
+            ...(opts.jsonObject ? { response_format: { type: "json_object" } } : {}),
+            messages: [
+              { role: "system", content: args.system },
+              { role: "user", content: prompt },
+            ],
+          }),
+          signal: AbortSignal.timeout(timeoutMs),
+        });
+
+      // First attempt: answer budget + reasoning headroom (so a reasoning model's hidden tokens don't
+      // starve the answer to empty). If the headroom pushes max_tokens past a SMALL model's ceiling
+      // (400), retry once with just the answer budget — mirrors the streaming path (lib/query/claude);
+      // without this, every non-streaming task 400s on a small local backend while Query still works.
+      let res = await doPost(maxTokens + REASONING_HEADROOM_TOKENS);
       if (!res.ok) {
-        throw new Error(`LLM ${backend.model} @ ${backend.baseUrl}: ${res.status} ${await res.text().catch(() => "")}`);
+        const firstErrBody = await res.text().catch(() => "");
+        if (looksLikeTokenLimit(res.status, firstErrBody)) {
+          res = await doPost(maxTokens);
+          if (!res.ok) {
+            throw new Error(`LLM ${backend.model} @ ${backend.baseUrl}: ${res.status} ${await res.text().catch(() => "")}`);
+          }
+        } else {
+          throw new Error(`LLM ${backend.model} @ ${backend.baseUrl}: ${res.status} ${firstErrBody}`);
+        }
       }
       const j = (await res.json()) as {
         choices?: { message?: { content?: string }; finish_reason?: string }[];
