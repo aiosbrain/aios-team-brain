@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseTranscriptExtraction, salvageSummaryBullets } from "@/lib/meetings/llm-extract";
+import { parseTranscriptExtraction, salvageSummaryBullets, salvageAttendeeNames } from "@/lib/meetings/llm-extract";
 import { summaryBullets } from "@/lib/meetings/summary-format";
 
 /**
@@ -68,5 +68,38 @@ describe("parseTranscriptExtraction recovers a summary from malformed/truncated 
   it("well-formed JSON is unaffected (no regression through the salvage path)", () => {
     const raw = '{"summary":"- a\\n- b","attendees":[]}';
     expect(summaryBullets(parseTranscriptExtraction(raw, []).summary)).toEqual(["a", "b"]);
+  });
+});
+
+describe("salvageAttendeeNames — attendees survive the salvage path, not just the summary", () => {
+  it("recovers names from the attendees array in a malformed response", () => {
+    const raw = '{"summary":"- a","- b","attendees":["Alex Rivera","John Ellison"]}';
+    expect(salvageAttendeeNames(raw)).toEqual(["Alex Rivera", "John Ellison"]);
+  });
+
+  it("recovers the complete names when the attendees array is token-truncated", () => {
+    const raw = '{"summary":"- a","attendees":["Alex Rivera","John Elli';
+    expect(salvageAttendeeNames(raw)).toEqual(["Alex Rivera"]);
+  });
+
+  it("returns [] when there is no attendees array", () => {
+    expect(salvageAttendeeNames('{"summary":"- a","- b"}')).toEqual([]);
+  });
+
+  it("does not mistake summary bullets for names (scoped to the attendees array)", () => {
+    const raw = '{"summary":"- bullet one","- bullet two","attendees":["Real Person"]}';
+    expect(salvageAttendeeNames(raw)).toEqual(["Real Person"]);
+  });
+
+  it("parseTranscriptExtraction matches salvaged names against the roster (was dropping them)", () => {
+    const roster = [
+      { id: "m1", displayName: "Alex Rivera" },
+      { id: "m2", displayName: "John Ellison" },
+    ];
+    const raw =
+      '{"summary":"- Point one is complete.","- Point two is complete.",' +
+      '"attendees":["Alex Rivera","John Ellison"]}';
+    const out = parseTranscriptExtraction(raw, roster);
+    expect([...out.attendeeMemberIds].sort()).toEqual(["m1", "m2"]);
   });
 });

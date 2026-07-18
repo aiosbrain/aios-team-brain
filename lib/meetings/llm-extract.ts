@@ -106,6 +106,33 @@ export function salvageSummaryBullets(raw: string): string[] {
   return bullets;
 }
 
+/**
+ * Recover attendee names from a malformed/truncated meetings JSON response — the companion to
+ * `salvageSummaryBullets`. Without this, a salvaged upload kept its summary but silently lost attendee
+ * linking even when the `attendees` array was complete in the response. Scoped to the strings inside
+ * the `"attendees":[ … ]` array (bounded at the first `]`, else whatever arrived before truncation) so
+ * summary bullets aren't mistaken for names; a truncated trailing name has no closing quote and is
+ * dropped. Returned names are still filtered against the real roster by `matchAttendees`, so junk can't
+ * invent an attendee. Pure + exported for tests.
+ */
+export function salvageAttendeeNames(raw: string): string[] {
+  const marker = raw.search(/"attendees"\s*:\s*\[/);
+  if (marker === -1) return [];
+  const afterOpen = raw.slice(raw.indexOf("[", marker) + 1);
+  const close = afterOpen.indexOf("]");
+  const body = close === -1 ? afterOpen : afterOpen.slice(0, close);
+  const names: string[] = [];
+  for (const m of body.matchAll(/"(?:[^"\\]|\\.)*"/g)) {
+    try {
+      const v: unknown = JSON.parse(m[0]);
+      if (typeof v === "string" && v.trim()) names.push(v.trim());
+    } catch {
+      /* skip an unparseable literal */
+    }
+  }
+  return names;
+}
+
 /** Normalize a name for tolerant matching: lowercase, collapse whitespace, drop punctuation. */
 function normalizeName(name: string): string {
   return name.toLowerCase().replace(/[^a-z0-9\s]/g, "").replace(/\s+/g, " ").trim();
@@ -172,8 +199,13 @@ export function parseTranscriptExtraction(raw: string, roster: RosterPerson[]): 
     // complete bullets we can rather than saving the note blank. Need ≥2 to count as a real summary.
     const salvaged = salvageSummaryBullets(raw);
     if (salvaged.length >= 2) {
-      console.warn(`[meetings] recovered summary from malformed/truncated JSON (${salvaged.length} bullets)`);
-      return { summary: normalizeSummaryField(salvaged), attendeeMemberIds: [] };
+      // Salvage attendees too — they're often complete even when the summary string was truncated;
+      // matchAttendees still filters to the real roster, so nothing is invented.
+      const names = salvageAttendeeNames(raw);
+      console.warn(
+        `[meetings] recovered from malformed/truncated JSON (${salvaged.length} bullets, ${names.length} attendee names)`
+      );
+      return { summary: normalizeSummaryField(salvaged), attendeeMemberIds: matchAttendees(names, roster) };
     }
     console.error("[meetings] LLM response was not valid JSON:", err instanceof Error ? err.message : err, raw.slice(0, 300));
     return empty;
