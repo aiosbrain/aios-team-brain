@@ -57,7 +57,12 @@ const CACHE_TTL_MS = 10 * 60_000;
 // How long the empty-clobber guard keeps trusting a prior non-empty arc set. Within this window an
 // empty synthesis is treated as a transient failure (keep the prior); beyond it, a persistently-empty
 // result is accepted as genuine so the panel can't be pinned to ancient arcs forever (Fable review).
-const EMPTY_CLOBBER_MAX_AGE_MS = Number(process.env.ARCS_EMPTY_CLOBBER_MAX_AGE_MS ?? 48 * 60 * 60_000);
+const EMPTY_CLOBBER_MAX_AGE_MS = (() => {
+  // Guard the parse: a garbage/empty env yields NaN/0, and `ageMs < NaN` is always false → EVERY empty
+  // synthesis would clobber, silently reverting the incident fix. Fall back unless it's finite and >0.
+  const n = Number(process.env.ARCS_EMPTY_CLOBBER_MAX_AGE_MS);
+  return Number.isFinite(n) && n > 0 ? n : 48 * 60 * 60_000;
+})();
 
 const SYSTEM_PROMPT =
   `You are analyzing a team knowledge graph. Identify ${MAX_ARCS} active narrative arcs — ongoing ` +
