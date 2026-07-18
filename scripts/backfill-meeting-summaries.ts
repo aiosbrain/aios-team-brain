@@ -5,11 +5,13 @@
  * model (incl. OpenRouter) exactly like a live upload, and uses the same single-writer writers, so
  * there is no second write path. Idempotent and safe to re-run.
  *
- * Run (all teams, full refresh):
+ * Run (all teams, heal only blank summaries — the SAFE default):
  *   DATABASE_URL=… SECRETS_KEY=… npx tsx --conditions react-server scripts/backfill-meeting-summaries.ts
  * Options:
  *   [teamSlug]     limit to one team
- *   --only-blank   only heal notes whose summary is currently blank (skip ones already populated)
+ *   --all / --full re-run over EVERY note, OVERWRITING existing summaries with fresh LLM output
+ *                  (nondeterministic — can replace good summaries with worse ones; opt in deliberately)
+ *   --only-blank   accepted as a no-op (this is now the default)
  *   --limit=N      cap notes processed per team
  */
 import { adminClient } from "@/lib/db/admin";
@@ -20,7 +22,11 @@ type TeamRow = { id: string; slug: string; name: string };
 
 async function main() {
   const argv = process.argv.slice(2);
-  const onlyBlank = argv.includes("--only-blank");
+  // Default to the SAFE mode: heal only notes whose summary is currently blank. A full refresh re-runs
+  // the LLM over EVERY note and overwrites good summaries with fresh (nondeterministic) output, so it
+  // must be opted into explicitly (`--all`/`--full`). `--only-blank` remains accepted as a no-op.
+  const fullRefresh = argv.includes("--all") || argv.includes("--full");
+  const onlyBlank = !fullRefresh;
   const limitArg = argv.find((a) => a.startsWith("--limit="));
   const limit = limitArg ? Number(limitArg.split("=")[1]) : undefined;
   const timeoutArg = argv.find((a) => a.startsWith("--timeout="));
