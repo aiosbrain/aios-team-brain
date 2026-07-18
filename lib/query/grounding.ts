@@ -1,5 +1,6 @@
 import "server-only";
 import { runSql } from "@/lib/db/pg/pool";
+import { isRestrictedTier } from "@/lib/auth/visibility";
 
 /**
  * Term-specificity analysis for the grounding signal (Gap #3). The old signal was
@@ -33,7 +34,7 @@ export async function analyzeTermSpecificity(
 ): Promise<TermSpecificity> {
   if (terms.length === 0) return { specificMatching: false, allCommon: true };
   try {
-    const access = tier === "external" ? "and access = 'external'" : "";
+    const access = isRestrictedTier(tier) ? "and access = 'external'" : "";
     // One row per term: corpus total + that term's document frequency, both tier-scoped.
     const sql = `
       select t.term,

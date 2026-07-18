@@ -1,6 +1,7 @@
 import { NextRequest, after } from "next/server";
 import { adminClient } from "@/lib/db/admin";
 import { authenticateApiKey } from "@/lib/api/auth";
+import { isRestrictedTier } from "@/lib/auth/visibility";
 import { rateLimit } from "@/lib/api/rate-limit";
 import {
   itemPayloadSchema,
@@ -120,7 +121,7 @@ export async function GET(req: NextRequest) {
     .order("updated_at", { ascending: true })
     .order("id", { ascending: true })
     .limit(PAGE_SIZE);
-  if (auth.memberTier === "external") q = q.eq("access", "external");
+  if (isRestrictedTier(auth.memberTier)) q = q.eq("access", "external");
   if (kinds?.length) q = q.in("kind", kinds);
   // On-demand fetch of one skill/deliverable folder: match path by prefix.
   if (pathPrefix) q = q.like("path", `${pathPrefix.replace(/[%_\\]/g, "\\$&")}%`);

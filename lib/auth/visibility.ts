@@ -10,6 +10,18 @@ import "server-only";
 export type ViewerTier = "team" | "external";
 
 /**
+ * Fail-CLOSED tier check (audit #275 hardening). Only the `team` tier is unrestricted; EVERY other
+ * value — `external` today, and any future/unknown tier the enum might grow (e.g. `admin`) or a bad
+ * cast might smuggle in — is treated as restricted and gets the external-only filter. Use this at every
+ * tier-scoped read that can't route through the query-builder choke-points above (raw-SQL builders,
+ * API routes), instead of the fail-OPEN `tier === "external"` idiom (which leaves an unknown tier
+ * unfiltered → leak). There is no RLS backstop, so this is sole enforcement.
+ */
+export function isRestrictedTier(tier: string): boolean {
+  return tier !== "team";
+}
+
+/**
  * Restrict an items query to what `tier` may see: external → only `access='external'`.
  * `Q` is a free generic (no recursive constraint) so the supabase-js builder's deeply
  * recursive type doesn't trigger TS2589; the `.eq` shape is asserted by a localized cast.

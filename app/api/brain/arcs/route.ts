@@ -3,6 +3,7 @@ import { z } from "zod";
 import { serverClient } from "@/lib/db/server";
 import { adminClient } from "@/lib/db/admin";
 import { getSessionUser } from "@/lib/auth/session";
+import { isRestrictedTier } from "@/lib/auth/visibility";
 import { errorResponse } from "@/lib/api/schemas";
 import { resolveAnsweringKeys } from "@/lib/query/answering";
 import { visibleGroupIds } from "@/lib/graph/group";
@@ -84,7 +85,7 @@ export async function POST(req: NextRequest) {
     arcs,
     degraded: reason === "model_failing", // back-compat flag
     reason,
-    note: tier === "external" ? undefined : note,
+    note: isRestrictedTier(tier) ? undefined : note,
     as_of: new Date().toISOString(),
   });
 }
