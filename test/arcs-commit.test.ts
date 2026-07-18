@@ -5,7 +5,7 @@ import type { DbClient } from "@/lib/db/types";
 
 /** Minimal fake DbClient covering exactly the arc_cache read (select→eq→eq→maybeSingle) and write
  *  (upsert) paths. Records upserts so we can assert whether a clobber happened. */
-function fakeDb(existing: NarrativeArc[] | null) {
+function fakeDb(existing: NarrativeArc[] | null, computedAtMs = Date.now()) {
   const upserts: unknown[] = [];
   const db = {
     from: () => ({
@@ -13,7 +13,9 @@ function fakeDb(existing: NarrativeArc[] | null) {
         eq: () => ({
           eq: () => ({
             maybeSingle: async () =>
-              existing ? { data: { arcs: existing, computed_at: new Date().toISOString() } } : { data: null },
+              existing
+                ? { data: { arcs: existing, computed_at: new Date(computedAtMs).toISOString() } }
+                : { data: null },
           }),
         }),
       }),
@@ -25,6 +27,8 @@ function fakeDb(existing: NarrativeArc[] | null) {
   } as unknown as DbClient;
   return { db, upserts };
 }
+
+const HOUR = 60 * 60 * 1000;
 
 const arc = (title: string): NarrativeArc => ({
   id: "arc-" + title,
@@ -61,5 +65,17 @@ describe("commitArcs — an empty synthesis must never clobber a good cache", ()
     const out = await commitArcs(db, "team-1", "cold-empty-1", []);
     expect(out).toEqual([]);
     expect(upserts).toHaveLength(1); // first-ever load may legitimately be empty
+  });
+
+  it("ACCEPTS empty when the prior is older than the clobber cap (persistently-empty is genuine)", async () => {
+    // A prior beyond the 48h cap is no longer trustworthy as transient-failure cover — a quiet team /
+    // deleted content / graph reset should be allowed to blank the panel instead of pinning stale arcs.
+    const { db, upserts } = fakeDb([arc("ancient migration")], Date.now() - 50 * HOUR);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const out = await commitArcs(db, "team-1", "old-prior-1", []);
+    expect(out).toEqual([]); // empty accepted
+    expect(upserts).toHaveLength(1); // written through, not kept
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("accepting empty"));
+    warn.mockRestore();
   });
 });

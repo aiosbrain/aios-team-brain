@@ -54,6 +54,10 @@ const MAX_ARCS = 8;
 // for balancing (a high-volume person's recent burst can otherwise push everyone else past MAX_FACTS).
 const FACT_POOL = MAX_FACTS * 6;
 const CACHE_TTL_MS = 10 * 60_000;
+// How long the empty-clobber guard keeps trusting a prior non-empty arc set. Within this window an
+// empty synthesis is treated as a transient failure (keep the prior); beyond it, a persistently-empty
+// result is accepted as genuine so the panel can't be pinned to ancient arcs forever (Fable review).
+const EMPTY_CLOBBER_MAX_AGE_MS = Number(process.env.ARCS_EMPTY_CLOBBER_MAX_AGE_MS ?? 48 * 60 * 60_000);
 
 const SYSTEM_PROMPT =
   `You are analyzing a team knowledge graph. Identify ${MAX_ARCS} active narrative arcs — ongoing ` +
@@ -402,12 +406,28 @@ export async function commitArcs(
   next: NarrativeArc[]
 ): Promise<NarrativeArc[]> {
   if (next.length === 0) {
-    const prior = cache.get(key)?.arcs ?? (await readArcCache(db, teamId, key))?.arcs;
-    if (prior && prior.length > 0) {
+    const mem = cache.get(key);
+    const prior =
+      mem ??
+      (await readArcCache(db, teamId, key).then((r) => (r ? { arcs: r.arcs, at: r.computedAt } : null)));
+    if (prior && prior.arcs.length > 0) {
+      const ageMs = Date.now() - prior.at;
+      if (ageMs < EMPTY_CLOBBER_MAX_AGE_MS) {
+        // Recent prior → an empty synthesis is almost always a transient upstream failure (LLM outage,
+        // a reasoning model starving its output, a graph blip). Keep the stale-but-real set and DON'T
+        // refresh the timestamp, so the next view retries until synthesis recovers.
+        console.warn(
+          `[arcs] synthesis returned 0 arcs for ${key}; keeping ${prior.arcs.length} cached (${Math.round(ageMs / 3_600_000)}h old; likely transient)`
+        );
+        return prior.arcs;
+      }
+      // Prior is too old to keep trusting as "transient-failure cover": a persistently-empty synthesis
+      // over this long is more likely GENUINE (quiet team, content deleted, graph reset, or the model
+      // correctly concluding "no active arcs"). Let the empty through so the panel reflects reality
+      // instead of pinning ancient arcs — and re-arming the background refresh loop — forever.
       console.warn(
-        `[arcs] synthesis returned 0 arcs for ${key}; keeping ${prior.length} cached (likely transient upstream failure)`
+        `[arcs] synthesis returned 0 arcs for ${key}; prior ${prior.arcs.length} arcs are ${Math.round(ageMs / 3_600_000)}h old (> cap) — accepting empty`
       );
-      return prior;
     }
   }
   cache.set(key, { arcs: next, at: Date.now() });
