@@ -1735,6 +1735,11 @@ create table if not exists social_publications (
 );
 create index if not exists social_publications_team_idx on social_publications (team_id, created_at desc);
 create index if not exists social_publications_variant_idx on social_publications (variant_id);
+-- At most ONE active (scheduled/publishing) publication per variant — the DB backstop against a
+-- double-submit race creating two live posts (audit #5). Cancelled/failed/published are unconstrained.
+create unique index if not exists social_publications_active_variant_idx
+  on social_publications (variant_id)
+  where status in ('scheduled', 'publishing');
 
 -- Normalized per-publication analytics (M6). One row per publication (latest snapshot). Typefully
 -- exposes X-only metrics. Single writer: lib/social/analytics.ts. Tier inherited from publication.

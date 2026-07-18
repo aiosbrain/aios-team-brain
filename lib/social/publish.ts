@@ -91,6 +91,31 @@ async function abortPublication(
   }
 }
 
+/**
+ * Finalize an already-posted publication as `published` (idempotent re-entry, audit #2) — keeps the
+ * external id already persisted, advances the variant, and (best-effort) schedules analytics. Used
+ * when a prior attempt posted but crashed before marking published, so we never re-post. The variant
+ * is stamped `published` ONLY if it's still mid-publish — if it left the lifecycle between attempts
+ * (regenerated → `generated`/`rejected`), the publication record stays honest but we don't clobber the
+ * variant with a `published` status whose body no longer matches what actually posted.
+ */
+async function finalizePublished(
+  db: DbClient,
+  teamId: string,
+  publicationId: string,
+  variant: VariantRow
+): Promise<void> {
+  await setPublicationState(db, teamId, publicationId, {
+    status: "published",
+    published_at: new Date().toISOString(),
+    last_error: null,
+  });
+  if (PUBLISHABLE_STATUSES.has(variant.status)) {
+    await setVariantStatus(db, teamId, variant.id, "published");
+  }
+  await scheduleAnalyticsCollection(db, teamId, publicationId).catch(() => {});
+}
+
 /** Schedule an approved variant for publishing. Returns the created publication. */
 export async function scheduleVariant(
   db: DbClient,
@@ -147,6 +172,17 @@ export async function runPublication(
   const variant = await getVariant(db, teamId, pub.variant_id);
   if (!variant) throw new Error(`runPublication: variant ${pub.variant_id} not found`);
 
+  // ── Idempotent re-entry (audit #2): a PRIOR attempt already got an external id from the provider
+  // (persisted below, before we mark 'published') but then crashed/failed mid-finalize. The post is
+  // already live — do NOT re-post; just finalize with the id we have. Keyed on `!pub.dry_run` (our
+  // own column), NOT the id string: a live row's id is always non-empty (a no-id provider response
+  // still persists a sentinel below), and a dry-run row only ever gets an id atomically WITH
+  // `status='published'` (caught by the terminal check), so it never reaches here mid-flight. ──
+  if (pub.external_id && !pub.dry_run) {
+    await finalizePublished(db, teamId, publicationId, variant);
+    return;
+  }
+
   // ── Fail-closed door: re-verify tier + status + governance at FIRE time (audit #1/#3/#6). A
   // refusal is a policy stop — cancel (terminal), do NOT throw (a throw would requeue and retry).
   // Rewind the variant to `rejected` (needs a fresh, gate-passing regenerate before it can re-enter
@@ -171,10 +207,10 @@ export async function runPublication(
   await setPublicationState(db, teamId, publicationId, { status: "publishing" });
   await setVariantStatus(db, teamId, pub.variant_id, "publishing");
 
+  // Hoisted so the catch can persist an id the provider already returned (defense-in-depth, audit #2).
+  let externalId = "dry-run";
+  let url: string | null = null;
   try {
-    let externalId = "dry-run";
-    let url: string | null = null;
-
     if (!dryRun) {
       let provider = opts.provider;
       let socialSetId = "";
@@ -185,9 +221,21 @@ export async function runPublication(
         provider = typefullyProvider(creds.key);
         socialSetId = creds.socialSetId;
       }
-      const res = await provider.publish({ text: variant.body, platforms: PLATFORMS, scheduleAt: pub.scheduled_at, socialSetId });
-      externalId = res.externalId;
+      const res = await provider.publish({
+        text: variant.body,
+        platforms: PLATFORMS,
+        scheduleAt: pub.scheduled_at,
+        socialSetId,
+        idempotencyKey: `publish:${pub.id}`,
+      });
+      // A no-id / non-JSON 2xx (the adapter's verify-at-build case) MUST still arm the re-entry guard,
+      // else a crash-window retry re-posts. Persist a non-empty sentinel keyed to this publication.
+      externalId = res.externalId || `accepted:${pub.id}`;
       url = res.url;
+      // Persist the external id FIRST, in its own write (audit #2). If we crash before marking
+      // 'published', the re-entry guard above sees this id next attempt and finalizes WITHOUT
+      // re-posting — no duplicate live post.
+      await setPublicationState(db, teamId, publicationId, { external_id: externalId, external_url: url });
     }
 
     await setPublicationState(db, teamId, publicationId, {
@@ -202,8 +250,14 @@ export async function runPublication(
     await scheduleAnalyticsCollection(db, teamId, publicationId).catch(() => {});
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    await setPublicationState(db, teamId, publicationId, { status: "failed", last_error: msg.slice(0, 2000) });
-    await setVariantStatus(db, teamId, pub.variant_id, "failed");
+    // If the provider already accepted (we have an id) but a later write threw, persist that id
+    // alongside 'failed' so the retry short-circuits instead of re-posting (audit #2 defense).
+    const fields: Parameters<typeof setPublicationState>[3] =
+      !dryRun && externalId !== "dry-run"
+        ? { status: "failed", external_id: externalId, external_url: url, last_error: msg.slice(0, 2000) }
+        : { status: "failed", last_error: msg.slice(0, 2000) };
+    await setPublicationState(db, teamId, publicationId, fields).catch(() => {});
+    await setVariantStatus(db, teamId, pub.variant_id, "failed").catch(() => {});
     throw new Error(`publish failed: ${msg}`); // rethrow → M0 retries with backoff
   }
 }

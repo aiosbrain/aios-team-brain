@@ -24,7 +24,12 @@ export function typefullyProvider(apiKey: string, fetchImpl: Fetch = fetch): Soc
 
       const res = await fetchImpl(`${BASE_URL}/social-sets/${req.socialSetId}/drafts`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${apiKey}`,
+          // Dedupe a retried POST server-side (audit #2). Standard header; harmless if unsupported.
+          ...(req.idempotencyKey ? { "Idempotency-Key": req.idempotencyKey } : {}),
+        },
         body: JSON.stringify({
           scratchpad_text: req.text,
           platforms,

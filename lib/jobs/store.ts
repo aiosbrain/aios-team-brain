@@ -115,12 +115,72 @@ export async function claimDueJobs(
   return claimed;
 }
 
+/** How long a `running` job may hold its lock before it's considered abandoned (worker vanished). */
+const STALE_JOB_DEFAULT_MS = 5 * 60_000;
+const STALE_JOB_ENV = Number(process.env.SOCIAL_JOB_STALE_MS);
+// A garbage env value must not NaN-poison the reclaim (→ `new Date(NaN)` throws → every tick dies).
+export const STALE_JOB_MS = Number.isFinite(STALE_JOB_ENV) && STALE_JOB_ENV > 0 ? STALE_JOB_ENV : STALE_JOB_DEFAULT_MS;
+
+/**
+ * Reclaim jobs stuck in `running` because their worker vanished mid-job — a redeploy (this repo
+ * deploys on every merge to main) or crash between claim and terminal transition. Without this a
+ * `publish`/`collect_analytics` job silently never completes (audit #4). Any `running` row whose
+ * `locked_at` is older than `staleAfterMs` is returned to `queued` (re-claimable), or dead-lettered
+ * if it already exhausted `max_attempts`.
+ *
+ * SAFE only because handlers are idempotent (audit #2 landed first): a reclaimed `publish` re-run
+ * short-circuits on the persisted `external_id` / the provider idempotency key, so it never
+ * double-posts. Each write is conditional on `status='running'` so it can't clobber a worker that is
+ * just now finishing. `attempts` was already incremented at claim time, so the vanished try counts.
+ */
+export async function reclaimStaleJobs(
+  db: DbClient,
+  opts?: { now?: Date; staleAfterMs?: number }
+): Promise<{ reclaimed: number; deadLettered: number }> {
+  const now = opts?.now ?? new Date();
+  const cutoff = new Date(now.getTime() - (opts?.staleAfterMs ?? STALE_JOB_MS)).toISOString();
+
+  const { data } = await db
+    .from("social_jobs")
+    .select("id, attempts, max_attempts")
+    .eq("status", "running")
+    .lt("locked_at", cutoff);
+
+  let reclaimed = 0;
+  let deadLettered = 0;
+  for (const j of (data ?? []) as { id: string; attempts: number; max_attempts: number }[]) {
+    if (j.attempts >= j.max_attempts) {
+      const { data: upd } = await db
+        .from("social_jobs")
+        .update({ status: "dead", locked_at: null, last_error: "reclaimed: worker vanished after exhausting attempts", updated_at: now })
+        .eq("id", j.id)
+        .eq("status", "running")
+        .select("id");
+      if (((upd ?? []) as unknown[]).length) deadLettered++;
+    } else {
+      const { data: upd } = await db
+        .from("social_jobs")
+        .update({ status: "queued", run_after: now, locked_at: null, last_error: "reclaimed: worker vanished mid-run — requeued", updated_at: now })
+        .eq("id", j.id)
+        .eq("status", "running")
+        .select("id");
+      if (((upd ?? []) as unknown[]).length) reclaimed++;
+    }
+  }
+  return { reclaimed, deadLettered };
+}
+
+// Terminal transitions are guarded on `status='running'` so a resurrected worker that finishes AFTER
+// its job was reclaimed can't clobber the reclaim's requeue/claim (overlapping old+new processes are
+// real on a Railway redeploy — audit #4 review).
+
 /** Mark a claimed job successfully completed. */
 export async function markJobDone(db: DbClient, id: string, now = new Date()): Promise<void> {
   await db
     .from("social_jobs")
     .update({ status: "done", locked_at: null, last_error: null, updated_at: now })
-    .eq("id", id);
+    .eq("id", id)
+    .eq("status", "running");
 }
 
 /**
@@ -143,7 +203,8 @@ export async function requeueJob(
       last_error: error.slice(0, 2000),
       updated_at: now,
     })
-    .eq("id", id);
+    .eq("id", id)
+    .eq("status", "running");
 }
 
 /** A terminal failure: retries exhausted (or a permanently-unhandleable job). */
@@ -156,7 +217,8 @@ export async function markJobDead(
   await db
     .from("social_jobs")
     .update({ status: "dead", locked_at: null, last_error: error.slice(0, 2000), updated_at: now })
-    .eq("id", id);
+    .eq("id", id)
+    .eq("status", "running");
 }
 
 /** Read one job by id (reads are unrestricted; the caller applies team scoping). */
