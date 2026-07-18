@@ -2,7 +2,7 @@ import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { getProviderKey } from "@/lib/integrations/manage";
 import { getOpportunity, getPlan, getVariant } from "@/lib/social/store";
-import { addMediaAsset, countTodayImages, type MediaAssetMeta } from "./store";
+import { addMediaAsset, getImageUsage, reserveImageSlot, releaseImageSlot, type MediaAssetMeta } from "./store";
 import { generateOpenAiImage } from "./providers/openai-image";
 
 /**
@@ -12,7 +12,9 @@ import { generateOpenAiImage } from "./providers/openai-image";
  * provider call is injectable so the data-mechanics tier can stub the model.
  */
 
-export const DAILY_IMAGE_CAP = Number(process.env.SOCIAL_IMAGE_DAILY_CAP ?? 10);
+const CAP_ENV = Number(process.env.SOCIAL_IMAGE_DAILY_CAP);
+// Integer, positive; a garbage/fractional env value falls back to 10 rather than degrading the cap.
+export const DAILY_IMAGE_CAP = Number.isFinite(CAP_ENV) && CAP_ENV > 0 ? Math.floor(CAP_ENV) : 10;
 // Rough per-image estimate for gpt-image-1.5 at 1024² (token-billed; refine against the live meter).
 const EST_COST_USD = 0.04;
 
@@ -45,9 +47,9 @@ export interface ImageBudget {
   remaining: number;
 }
 
-/** Today's image budget for a team. */
+/** Today's image budget for a team (from the atomic reservation counter — the enforced source). */
 export async function imageBudget(db: DbClient, teamId: string, now = new Date()): Promise<ImageBudget> {
-  const used = await countTodayImages(db, teamId, now);
+  const used = await getImageUsage(db, teamId, now);
   return { used, cap: DAILY_IMAGE_CAP, remaining: Math.max(0, DAILY_IMAGE_CAP - used) };
 }
 
@@ -66,33 +68,46 @@ export async function generateVariantImage(
   const opp = await getOpportunity(db, teamId, plan.opportunity_id);
   if (!opp) throw new Error(`generateVariantImage: opportunity ${plan.opportunity_id} not found`);
 
-  // Cost guard — enforced BEFORE any spend.
-  const used = await countTodayImages(db, teamId, now);
-  if (used >= DAILY_IMAGE_CAP) {
-    throw new ImageBudgetError(`daily image cap reached (${used}/${DAILY_IMAGE_CAP}); try again tomorrow`);
+  // Cost guard — ATOMICALLY reserve a slot BEFORE any spend (audit #8). Check-then-act raced: two
+  // concurrent requests could both pass a count() and both generate, over-running the cap.
+  const reserved = await reserveImageSlot(db, teamId, DAILY_IMAGE_CAP, now);
+  if (!reserved) {
+    throw new ImageBudgetError(`daily image cap reached (${DAILY_IMAGE_CAP}/${DAILY_IMAGE_CAP}); try again tomorrow`);
   }
 
-  const apiKey = await getProviderKey(db, teamId, "openai");
-  if (!apiKey && !opts.generate) {
-    throw new Error("no OpenAI key configured — add one in Admin → Integrations");
+  // Once the provider has actually produced an image (money spent), a LATER failure (e.g. the DB
+  // store) must NOT release the slot — releasing it would let another request spend, exceeding the
+  // cap in real dollars. Only a PRE-spend failure (bad key, provider/moderation error) releases.
+  let spent = false;
+  try {
+    const apiKey = await getProviderKey(db, teamId, "openai");
+    if (!apiKey && !opts.generate) {
+      throw new Error("no OpenAI key configured — add one in Admin → Integrations");
+    }
+    const generate = opts.generate ?? (async ({ prompt, apiKey: key }) => generateOpenAiImage({ prompt, apiKey: key }));
+
+    const prompt = buildImagePrompt(opp.title);
+    const { b64, model } = await generate({ prompt, apiKey: apiKey ?? "" });
+    spent = true; // the provider was paid — the slot is legitimately consumed from here on
+
+    return await addMediaAsset(
+      db,
+      teamId,
+      {
+        variantId,
+        access: variant.access, // inherited — image is as restricted as its variant
+        provider: "openai",
+        model,
+        prompt,
+        dataBase64: b64,
+        costUsd: EST_COST_USD,
+      },
+      opts.actor ?? {}
+    );
+  } catch (e) {
+    if (!spent) {
+      await releaseImageSlot(db, teamId, now).catch((err) => console.error("[media] releaseImageSlot failed:", err));
+    }
+    throw e;
   }
-  const generate = opts.generate ?? (async ({ prompt, apiKey: key }) => generateOpenAiImage({ prompt, apiKey: key }));
-
-  const prompt = buildImagePrompt(opp.title);
-  const { b64, model } = await generate({ prompt, apiKey: apiKey ?? "" });
-
-  return addMediaAsset(
-    db,
-    teamId,
-    {
-      variantId,
-      access: variant.access, // inherited — image is as restricted as its variant
-      provider: "openai",
-      model,
-      prompt,
-      dataBase64: b64,
-      costUsd: EST_COST_USD,
-    },
-    opts.actor ?? {}
-  );
 }

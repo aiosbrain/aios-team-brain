@@ -1,5 +1,6 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
+import { runSql } from "@/lib/db/pg/pool";
 import { audit } from "@/lib/api/audit";
 import type { AccessTier } from "@/lib/social/types";
 
@@ -98,15 +99,47 @@ export async function getMediaBytes(
   return (data as { access: AccessTier; data_base64: string }) ?? null;
 }
 
-/** Count images generated for a team on the UTC day of `now` — the cost-cap counter. */
-export async function countTodayImages(db: DbClient, teamId: string, now: Date): Promise<number> {
-  const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
-  const end = new Date(start.getTime() + 24 * 3_600_000);
-  const { count } = await db
-    .from("media_assets")
-    .select("id", { count: "exact", head: true })
+/** The UTC calendar day (YYYY-MM-DD) that owns `now` — the cost-cap bucket key. */
+function utcDay(now: Date): string {
+  return now.toISOString().slice(0, 10);
+}
+
+/** Images reserved for a team on the UTC day of `now` — the authoritative cost-cap usage counter. */
+export async function getImageUsage(db: DbClient, teamId: string, now: Date): Promise<number> {
+  const { data } = await db
+    .from("social_image_usage")
+    .select("count")
     .eq("team_id", teamId)
-    .gte("created_at", start.toISOString())
-    .lt("created_at", end.toISOString());
-  return count ?? 0;
+    .eq("day", utcDay(now))
+    .maybeSingle();
+  return Number((data as { count?: number } | null)?.count ?? 0);
+}
+
+/**
+ * ATOMICALLY reserve one image slot for the team's UTC day, or return false if the daily cap is
+ * reached (audit #8). A single conditional `INSERT … ON CONFLICT DO UPDATE … WHERE count < cap`
+ * row-locks the one (team, day) counter row, so two concurrent requests can't both pass the cap —
+ * unlike the old check-then-act on `count(media_assets)`. Reserve BEFORE any provider spend; call
+ * `releaseImageSlot` if the generation then fails so a failed attempt doesn't burn the cap.
+ */
+export async function reserveImageSlot(_db: DbClient, teamId: string, cap: number, now: Date): Promise<boolean> {
+  if (cap <= 0) return false;
+  const { rows } = await runSql<{ count: number }>(
+    `insert into social_image_usage (team_id, day, count) values ($1, $2, 1)
+       on conflict (team_id, day) do update
+         set count = social_image_usage.count + 1, updated_at = now()
+         where social_image_usage.count < $3
+       returning count`,
+    [teamId, utcDay(now), cap]
+  );
+  return rows.length > 0;
+}
+
+/** Release a previously-reserved slot (a generation that then failed) — best-effort, floored at 0. */
+export async function releaseImageSlot(_db: DbClient, teamId: string, now: Date): Promise<void> {
+  await runSql(
+    `update social_image_usage set count = greatest(count - 1, 0), updated_at = now()
+       where team_id = $1 and day = $2`,
+    [teamId, utcDay(now)]
+  );
 }

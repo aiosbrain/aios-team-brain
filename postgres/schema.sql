@@ -1702,6 +1702,19 @@ create table if not exists media_assets (
 create index if not exists media_assets_variant_idx on media_assets (variant_id, created_at desc);
 create index if not exists media_assets_team_day_idx on media_assets (team_id, created_at);
 
+-- Per-team-per-UTC-day image-generation counter — the atomic reservation backing the daily cost cap
+-- (audit #8). The old check-then-act on count(media_assets) raced: concurrent requests could both
+-- pass the count and both spend, over-running the cap. One row per (team, day); a slot is reserved by
+-- an atomic conditional increment (`… where count < cap`) BEFORE any provider spend, and released if
+-- the generation then fails. Single writer: lib/media/store.ts.
+create table if not exists social_image_usage (
+  team_id uuid not null references teams(id) on delete cascade,
+  day date not null,
+  count integer not null default 0,
+  updated_at timestamptz not null default now(),
+  primary key (team_id, day)
+);
+
 -- Social Brain approval workflow (M4). Per-team autonomy gate + the content-approval queue.
 -- Single writers: lib/social/settings.ts (autonomy), lib/social/approvals.ts (queue).
 create table if not exists social_settings (
