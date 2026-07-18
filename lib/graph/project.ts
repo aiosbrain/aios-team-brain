@@ -42,8 +42,10 @@ const DEFAULT_MAX_EPISODE_CHARS = 4000;
  * parses to a finite, positive number. Pure + exported so the landmine is unit-tested.
  */
 export function resolveMaxEpisodeChars(raw: string | undefined | null): number {
-  const n = Number(raw);
-  return Number.isFinite(n) && n > 0 ? n : DEFAULT_MAX_EPISODE_CHARS;
+  // `Math.floor` closes the fractional hole: a value like `0.5` is finite and >0 but `slice(0, 0.5)`
+  // truncates the end index to 0 → every episode blanks. Require an integer ≥ 1.
+  const n = Math.floor(Number(raw));
+  return Number.isFinite(n) && n >= 1 ? n : DEFAULT_MAX_EPISODE_CHARS;
 }
 export const MAX_EPISODE_CHARS = resolveMaxEpisodeChars(process.env.GRAPH_MAX_EPISODE_CHARS);
 

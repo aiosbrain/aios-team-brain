@@ -25,15 +25,16 @@ describe("staleThresholdMs — per-source staleness cadence", () => {
   });
 
   it("record-every-poll pollers use the 3h default and DO go stale when quiet", () => {
-    // slack/plane/linear/github record a run every configured tick (scheduler.runImport "still record
-    // configured sources"), so last-run age == last-poll age → age-based staleness is meaningful.
-    for (const s of ["slack", "plane", "linear", "github"]) {
+    // slack/plane/linear/github record every configured tick (scheduler.runImport "still record
+    // configured sources"); meeting_notes records unconditionally per team every tick (scheduler.ts:222).
+    // Last-run age == last-poll age → age-based staleness is meaningful (a wedged scheduler flags in 3h).
+    for (const s of ["slack", "plane", "linear", "github", "meeting_notes"]) {
       expect(staleThresholdMs(s)).toBe(3 * H);
     }
   });
 
   it("record-only-when-active legs are never age-stale (age ≠ poll age; failures show via ok=false + probes)", () => {
-    for (const s of ["dense", "linear_inbound", "graph_project", "meeting_notes"]) {
+    for (const s of ["dense", "linear_inbound", "graph_project"]) {
       expect(staleThresholdMs(s)).toBeNull();
     }
   });

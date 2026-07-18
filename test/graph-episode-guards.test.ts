@@ -9,15 +9,17 @@ import { resolveMaxEpisodeChars, pickEpisodeTimestamp } from "@/lib/graph/projec
  *    floating it to the top of the recency-ranked arcs.
  */
 describe("resolveMaxEpisodeChars — malformed env can't blank projection", () => {
-  it("falls back to 4000 on empty / non-numeric / zero / negative / nullish", () => {
-    for (const bad of ["", "abc", "0", "-100", "  ", undefined, null, "NaN"]) {
+  it("falls back to 4000 on empty / non-numeric / zero / negative / fractional<1 / nullish", () => {
+    // `0.5` is the sneaky one: finite and >0, but slice(0, 0.5) truncates to 0 → blank episodes.
+    for (const bad of ["", "abc", "0", "-100", "  ", "0.5", "0.9", undefined, null, "NaN"]) {
       expect(resolveMaxEpisodeChars(bad)).toBe(4000);
     }
   });
 
-  it("honors a finite positive override", () => {
+  it("honors a finite positive override (floored to an integer)", () => {
     expect(resolveMaxEpisodeChars("6000")).toBe(6000);
     expect(resolveMaxEpisodeChars("500")).toBe(500);
+    expect(resolveMaxEpisodeChars("4000.9")).toBe(4000); // floored, still ≥1
   });
 });
 
