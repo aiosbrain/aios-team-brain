@@ -49,7 +49,15 @@ export async function createPublication(
     })
     .select(COLS)
     .single();
-  if (error || !data) throw new Error(`createPublication failed: ${error?.message ?? "no row"}`);
+  if (error || !data) {
+    // The partial unique index (audit #5) rejects a SECOND active publication for the same variant —
+    // surface it as the actionable "already scheduled" case, not a raw DB error. Anchored on the index
+    // name only, so a future unique constraint on this table can't be mis-mapped to this message.
+    if (error && /social_publications_active_variant_idx/i.test(error.message)) {
+      throw new Error("this variant already has an active publication — cancel it before scheduling again");
+    }
+    throw new Error(`createPublication failed: ${error?.message ?? "no row"}`);
+  }
   await audit(db, {
     team_id: teamId,
     actor_kind: "member",

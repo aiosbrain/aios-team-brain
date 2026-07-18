@@ -13,6 +13,12 @@ export interface PublishRequest {
   scheduleAt?: string | null;
   /** Provider-specific destination (e.g. the Typefully social-set id). */
   socialSetId: string;
+  /**
+   * Stable per-publication idempotency token (audit #2). A provider that honors it dedupes a retried
+   * POST server-side, so a crash after the provider accepted but before we persisted its id can't
+   * create a SECOND live post. Sent as an `Idempotency-Key` header where supported; best-effort.
+   */
+  idempotencyKey?: string;
 }
 
 export interface PublishResult {
