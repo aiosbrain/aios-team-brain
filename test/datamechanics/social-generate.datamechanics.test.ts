@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createOpportunity, getVariant } from "@/lib/social/store";
+import { createOpportunity, getVariant, setVariantGeneration, setVariantStatus } from "@/lib/social/store";
 import { planOpportunity } from "@/lib/social/plan";
 import { generateVariantText, generatePlanDrafts } from "@/lib/social/generate";
 import { saveBrandProfile } from "@/lib/brand/manage";
@@ -75,5 +75,49 @@ describe("content generation + gate (real Postgres, stubbed model)", () => {
     expect(s.generated).toBe(2); // X + LinkedIn
     expect(s.blocked).toBe(0);
     expect(s.variants.every((v) => v.status === "generated")).toBe(true);
+  });
+
+  // audit #7: the evidence→tier ceiling is re-asserted when bodies are re-read at generation, so an
+  // item narrowed external→team AFTER the opportunity was created can't leak into an external draft.
+  it("#7 re-asserts the evidence tier at generation — a narrowed item can't leak into an external draft", async () => {
+    const seed = await seedTeam();
+    const ev = await ingest(seed, {
+      kind: "deliverable",
+      access: "external",
+      path: "notes/leak.md",
+      body: "SECRETMARKER confidential internal roadmap details",
+    });
+    const opp = await createOpportunity(db(), seed.teamId, {
+      access: "external",
+      sourceType: "deliverable",
+      title: "Public post",
+      evidence: [{ itemId: ev.id }],
+    });
+    const { variants } = await planOpportunity(db(), seed.teamId, opp.id, { memberId: seed.memberId });
+    // The cited item is later narrowed to internal — it must vanish from the external draft's evidence.
+    await db().from("items").update({ access: "team" }).eq("team_id", seed.teamId).eq("id", ev.id);
+
+    let seenPrompt = "";
+    await generateVariantText(db(), seed.teamId, variants[0].id, {
+      complete: async (a) => {
+        seenPrompt = a.prompt;
+        return "a clean grounded post about the launch";
+      },
+    });
+    expect(seenPrompt).not.toContain("SECRETMARKER");
+  });
+
+  // audit #3: generatePlanDrafts must never overwrite an already-approved variant — a regenerated,
+  // possibly gate-rejected body could otherwise replace a body that can still fire.
+  it("#3 does not regenerate an already-approved variant (its fireable body is preserved)", async () => {
+    const { seed, opp, variant } = await plannedVariant("external");
+    await setVariantGeneration(db(), seed.teamId, variant.id, { body: "APPROVED BODY", status: "generated", validation: {} });
+    await setVariantStatus(db(), seed.teamId, variant.id, "approved");
+
+    await generatePlanDrafts(db(), seed.teamId, opp.id, { complete: async () => "REGENERATED DIFFERENT BODY" });
+
+    const after = await getVariant(db(), seed.teamId, variant.id);
+    expect(after!.status).toBe("approved"); // untouched
+    expect(after!.body).toBe("APPROVED BODY"); // NOT overwritten
   });
 });

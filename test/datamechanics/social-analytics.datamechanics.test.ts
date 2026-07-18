@@ -15,7 +15,8 @@ import { db, seedTeam } from "./helpers";
  * stored normalized, one snapshot per publication; dry-run records an empty snapshot; the team
  * summary aggregates. Store-and-display only.
  */
-async function approvedVariant(access: "team" | "external" = "team") {
+// External by default — only public content is publishable (audit #1), and analytics ride publishing.
+async function approvedVariant(access: "team" | "external" = "external") {
   const seed = await seedTeam();
   const opp = await createOpportunity(db(), seed.teamId, { access, sourceType: "manual", title: "Shipped the queue" });
   const { variants } = await planOpportunity(db(), seed.teamId, opp.id, { memberId: seed.memberId });
