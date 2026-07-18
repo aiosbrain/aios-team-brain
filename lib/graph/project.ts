@@ -37,7 +37,7 @@ const SOURCE_TABLE = "items";
  * 0/NaN chunk CAP makes it emit none — either way the projector "succeeds" feeding the graph nothing
  * (or garbage). `Math.floor` also closes the fractional hole (0.5 → 0). Pure + exported, unit-tested.
  */
-export function resolvePositiveInt(raw: string | undefined | null, fallback: number): number {
+export function resolvePositiveInt(raw: unknown, fallback: number): number {
   const n = Math.floor(Number(raw));
   return Number.isFinite(n) && n >= 1 ? n : fallback;
 }
@@ -66,9 +66,13 @@ export function pickEpisodeTimestamp(sourceTs: unknown, syncedAt: string): strin
 export function chunkContent(body: string, chunkChars = CHUNK_CHARS, maxChunks = MAX_EPISODE_CHUNKS): string[] {
   const text = body ?? "";
   if (!text.trim()) return [];
+  // Clamp the params too (not just the env at module load) so a direct caller passing 0/NaN can't
+  // emit empty/garbage chunks or stall the loop — belt-and-suspenders around the same landmine.
+  const size = resolvePositiveInt(chunkChars, CHUNK_CHARS);
+  const cap = resolvePositiveInt(maxChunks, MAX_EPISODE_CHUNKS);
   const chunks: string[] = [];
-  for (let i = 0; i < text.length && chunks.length < maxChunks; i += chunkChars) {
-    chunks.push(text.slice(i, i + chunkChars));
+  for (let i = 0; i < text.length && chunks.length < cap; i += size) {
+    chunks.push(text.slice(i, i + size));
   }
   return chunks;
 }
