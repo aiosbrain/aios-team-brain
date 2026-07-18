@@ -31,6 +31,21 @@ const STALE_MS_BY_SOURCE: Record<string, number | null> = {
   scan: null, // manual / CI
   pm_sync: null, // reactive — its own staleness heuristic lives in lib/pm-sync/runs
   auth_cleanup: 26 * 60 * 60 * 1000, // 24h cadence + 2h grace (genuinely-stuck still surfaces)
+  // Record-only-when-active legs: their scheduler writes an `ingest_runs` row ONLY when the tick did
+  // something (indexed/projected/applied) or errored — a quiet pass writes nothing. So the newest
+  // row's age reflects "last time there was work", NOT "last time the poller ran", and an age-based
+  // staleness check cries wolf on any normal quiet window (a weekend, an idle board). Real failures
+  // still surface via `ok=false` on their actual runs, plus the residual probes on the retrieval-health
+  // card: `dense` via its `pendingItems` backlog, `graph_project` via `isGraphStale` (6h-no-writes →
+  // degraded). `linear_inbound` has no dedicated probe (a silently-wedged inbound lock is invisible) —
+  // an accepted tradeoff since it's per-team opt-in and any throw records `ok=false`.
+  // (Contrast slack/plane/linear/github AND meeting_notes, which record EVERY tick — the first four via
+  // scheduler.runImport "still record configured sources (proves the poller ran)", meeting_notes
+  // unconditionally per team (scheduler.ts:222) — so last-row age == last-poll age and the 3h default
+  // is meaningful there; nulling meeting_notes would have removed a real dead-scheduler heartbeat.)
+  dense: null,
+  linear_inbound: null,
+  graph_project: null,
 };
 
 /** The age past which `source` is considered stale, or `null` to never flag it on age. Exported for

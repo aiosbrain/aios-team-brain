@@ -30,8 +30,32 @@ const SOURCE_TABLE = "items";
  * regardless; median item ~240 chars = a single chunk, unchanged from before). Both env-tunable. See
  * the "202 ≠ extracted" note in docs/ARCHITECTURE.md.
  */
-export const CHUNK_CHARS = Number(process.env.GRAPH_CHUNK_CHARS ?? 2500);
-export const MAX_EPISODE_CHUNKS = Number(process.env.GRAPH_MAX_EPISODE_CHUNKS ?? 16);
+/**
+ * Parse a positive-integer env knob, falling back to `fallback` on anything malformed. A bad
+ * `GRAPH_CHUNK_CHARS`/`GRAPH_MAX_EPISODE_CHUNKS` must NOT silently break projection: `Number("")` is 0
+ * and `Number("abc")` is NaN. A 0/NaN chunk SIZE makes `chunkContent` emit empty-content episodes; a
+ * 0/NaN chunk CAP makes it emit none — either way the projector "succeeds" feeding the graph nothing
+ * (or garbage). `Math.floor` also closes the fractional hole (0.5 → 0). Pure + exported, unit-tested.
+ */
+export function resolvePositiveInt(raw: unknown, fallback: number): number {
+  const n = Math.floor(Number(raw));
+  return Number.isFinite(n) && n >= 1 ? n : fallback;
+}
+export const CHUNK_CHARS = resolvePositiveInt(process.env.GRAPH_CHUNK_CHARS, 2500);
+export const MAX_EPISODE_CHUNKS = resolvePositiveInt(process.env.GRAPH_MAX_EPISODE_CHUNKS, 16);
+
+/**
+ * "When it happened" for an episode: prefer the item's own `source_ts`, but only if it actually parses.
+ * A present-but-garbage `source_ts` must fall back to `synced_at` (always a real timestamptz), NOT to
+ * graphiti-client's last-resort now() — otherwise an old/undated doc gets stamped "today" and floats to
+ * the top of the recency-ranked arcs (rankArcs). (Locale-ambiguous strings like "09/07/2026" still parse
+ * — wrongly — under JS Date; we can't disambiguate DD/MM here, so connectors should emit ISO.) Pure +
+ * exported for tests.
+ */
+export function pickEpisodeTimestamp(sourceTs: unknown, syncedAt: string): string {
+  const raw = typeof sourceTs === "string" ? sourceTs : syncedAt;
+  return Number.isNaN(new Date(raw).getTime()) ? syncedAt : raw;
+}
 
 /**
  * Split an item's body into ≤ `maxChunks` chunks of ≤ `chunkChars` each, preserving every character
@@ -42,9 +66,13 @@ export const MAX_EPISODE_CHUNKS = Number(process.env.GRAPH_MAX_EPISODE_CHUNKS ??
 export function chunkContent(body: string, chunkChars = CHUNK_CHARS, maxChunks = MAX_EPISODE_CHUNKS): string[] {
   const text = body ?? "";
   if (!text.trim()) return [];
+  // Clamp the params too (not just the env at module load) so a direct caller passing 0/NaN can't
+  // emit empty/garbage chunks or stall the loop — belt-and-suspenders around the same landmine.
+  const size = resolvePositiveInt(chunkChars, CHUNK_CHARS);
+  const cap = resolvePositiveInt(maxChunks, MAX_EPISODE_CHUNKS);
   const chunks: string[] = [];
-  for (let i = 0; i < text.length && chunks.length < maxChunks; i += chunkChars) {
-    chunks.push(text.slice(i, i + chunkChars));
+  for (let i = 0; i < text.length && chunks.length < cap; i += size) {
+    chunks.push(text.slice(i, i + size));
   }
   return chunks;
 }
@@ -109,7 +137,7 @@ function toEpisodes(item: ItemRow): GraphEpisode[] {
   const fm = item.frontmatter ?? {};
   const title = typeof fm.title === "string" ? fm.title : undefined;
   const url = typeof fm.source_url === "string" ? fm.source_url : undefined;
-  const ts = typeof fm.source_ts === "string" ? fm.source_ts : item.synced_at; // when it happened
+  const ts = pickEpisodeTimestamp(fm.source_ts, item.synced_at); // when it happened (see helper)
   const label = KIND_LABEL[item.kind] ?? "Item";
   const chunks = chunkContent(item.body ?? "");
   const total = chunks.length;

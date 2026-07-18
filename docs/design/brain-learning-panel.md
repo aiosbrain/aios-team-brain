@@ -226,9 +226,11 @@ on that), so the fire-and-forget promise is not at risk of serverless request-te
   `add_episode` permanently kills the worker and freezes the whole ingest queue (silent — the HTTP API
   keeps 202-ing). The trigger seen twice in prod (2026-06-25, 2026-07-03) is a large episode whose
   entity/edge extraction overflows the LLM output-token cap (`Output length exceeded max tokens 8192`).
-  *Mitigate (our side, since we can't patch their image):* `lib/graph/project.ts` caps episode content
-  at `MAX_EPISODE_CHARS` (6000) so extraction output stays under the limit; full item text still lives
-  in `items`/pgvector/FTS. Only a few outlier docs are truncated (median item ~240 chars). If the worker
+  *Mitigate (our side, since we can't patch their image):* `lib/graph/project.ts` **chunks** a large
+  item into ≤`GRAPH_MAX_EPISODE_CHUNKS` (16) episodes of ≤`GRAPH_CHUNK_CHARS` (2500) chars each
+  (superseded the old single-episode truncation cap in #305 — chunking preserves all content instead of
+  losing it), so each chunk's extraction output stays under the limit; full item text still lives in
+  `items`/pgvector/FTS. Median item ~240 chars = a single chunk. If the worker
   ever wedges anyway, restart graphiti (it's an image-based service; the Custom Start Command below persists).
 - **Graphiti start command (Railway)** — the `zepai/graphiti:latest` image declares a non-root `USER app`
   but its default CMD launches via `uv` at `/root/.local/bin/uv`, which `app` can't exec once Railway
