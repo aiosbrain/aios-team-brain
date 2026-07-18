@@ -1,25 +1,28 @@
 import { describe, it, expect } from "vitest";
-import { resolveMaxEpisodeChars, pickEpisodeTimestamp } from "@/lib/graph/project";
+import { resolvePositiveInt, pickEpisodeTimestamp } from "@/lib/graph/project";
 
 /**
  * Two silent-corruption landmines in the projector, both flagged by review:
- *  - a malformed `GRAPH_MAX_EPISODE_CHARS` env would slice every episode to "" (projector "succeeds"
- *    while feeding the graph nothing);
+ *  - a malformed `GRAPH_CHUNK_CHARS`/`GRAPH_MAX_EPISODE_CHUNKS` env would make `chunkContent` emit
+ *    empty-content episodes (chunk size 0/NaN) or none at all (chunk cap 0/NaN) — the projector
+ *    "succeeds" while feeding the graph nothing or garbage;
  *  - a present-but-garbage `source_ts` would fall through to now(), stamping an old doc "today" and
  *    floating it to the top of the recency-ranked arcs.
  */
-describe("resolveMaxEpisodeChars — malformed env can't blank projection", () => {
-  it("falls back to 4000 on empty / non-numeric / zero / negative / fractional<1 / nullish", () => {
-    // `0.5` is the sneaky one: finite and >0, but slice(0, 0.5) truncates to 0 → blank episodes.
+describe("resolvePositiveInt — malformed size/cap env can't break projection", () => {
+  it("falls back on empty / non-numeric / zero / negative / fractional<1 / nullish", () => {
+    // `0.5` is the sneaky one: finite and >0, but Math.floor → 0 (a 0 chunk size blanks episodes).
     for (const bad of ["", "abc", "0", "-100", "  ", "0.5", "0.9", undefined, null, "NaN"]) {
-      expect(resolveMaxEpisodeChars(bad)).toBe(4000);
+      expect(resolvePositiveInt(bad, 2500)).toBe(2500);
+      expect(resolvePositiveInt(bad, 16)).toBe(16);
     }
   });
 
   it("honors a finite positive override (floored to an integer)", () => {
-    expect(resolveMaxEpisodeChars("6000")).toBe(6000);
-    expect(resolveMaxEpisodeChars("500")).toBe(500);
-    expect(resolveMaxEpisodeChars("4000.9")).toBe(4000); // floored, still ≥1
+    expect(resolvePositiveInt("6000", 2500)).toBe(6000);
+    expect(resolvePositiveInt("500", 2500)).toBe(500);
+    expect(resolvePositiveInt("2500.9", 2500)).toBe(2500); // floored, still ≥1
+    expect(resolvePositiveInt("16", 16)).toBe(16);
   });
 });
 

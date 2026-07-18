@@ -33,13 +33,13 @@ may see. See `lib/graph/group.ts`.
 Two callers: the admin **"Project to graph"** button on the Integrations page (on-demand) and
 `lib/graph/scheduler` (an interval poller registered in `instrumentation.ts`). Both are inert
 unless `GRAPHITI_URL` is set. Tune with `GRAPH_PROJECT_MINUTES` (default 60), `GRAPH_PROJECT_LIMIT`
-(default 500 items/run), `GRAPH_PROJECT_ENABLED=false` to disable, and `GRAPH_MAX_EPISODE_CHARS`
-(default **4000**) — the per-episode content cap. A bigger episode extracts more nodes → larger
-structured output; the extractor's output ceiling is raised to 16384 by the patched image (see
-`Dockerfile` + the "202 ≠ extracted" gotcha in `docs/ARCHITECTURE.md`). The cap was lowered 6000→4000
-because a dense 6000-char episode's structured output could still overflow even the 16384 ceiling and
-silently kill getzep's (per-job-exception-less) ingest worker. A malformed `GRAPH_MAX_EPISODE_CHARS`
-(empty/non-numeric/≤0) falls back to 4000 rather than blanking projection.
+(default 500 items/run), `GRAPH_PROJECT_ENABLED=false` to disable, and the episode-sizing knobs
+`GRAPH_CHUNK_CHARS` (default 2500) / `GRAPH_MAX_EPISODE_CHUNKS` (default 16). A large item is split into
+≤16 chunks of ≤2500 chars, each projected as its own episode (`items:<id>#k`), so every chunk's
+extraction output stays under Graphiti's ceiling (16384 on the patched image — see `Dockerfile` + the
+"202 ≠ extracted" gotcha in `docs/ARCHITECTURE.md`). Chunking replaced the old single-episode char cap:
+truncating to fit LOSES content, whereas chunking preserves all of it. A malformed value
+(empty/non-numeric/≤0/fractional) falls back to the default rather than emitting empty/garbage episodes.
 
 ## LLM note
 Extraction quality depends on structured-output support. Start with a strong cloud model; a local

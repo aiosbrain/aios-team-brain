@@ -1,6 +1,7 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { GraphitiClient } from "./graphiti-client";
+import { itemIdFromEpisodeName } from "./episode-name";
 
 /**
  * Reconcile pass for the brain→Graphiti seam (audit H3, Option B — chosen over blocking-confirm
@@ -10,7 +11,7 @@ import { GraphitiClient } from "./graphiti-client";
  * ACTUALLY landed in Graphiti (via `GET /episodes/{group}`, matched by our stable `name`). Anything
  * that never landed (a worker crash before/while extracting it) is cleared so the next projector run
  * treats it as unprojected and re-pushes — self-healing, off the hot ingest/push path. Confirmed
- * rows get their `episode_uuid` backfilled (used later for targeted deletes — see deleteEpisodeByName).
+ * rows get their `episode_uuid` backfilled (used later for targeted deletes — see deleteItemEpisodes).
  */
 
 const GRACE_MS = 5 * 60_000; // don't judge a row pushed in the last 5 min — extraction may still be running
@@ -58,11 +59,17 @@ export async function reconcileProjectedEpisodes(
     // treating "couldn't check" as "never landed" and re-pushing everything.
     const episodes = await client.listEpisodes(groupId, 5000).catch(() => null);
     if (episodes === null) continue;
-    const uuidByName = new Map(episodes.map((e) => [e.name, e.uuid]));
+    // An item is projected as one OR MANY chunk episodes (`items:<id>` / `items:<id>#k`) — it "landed"
+    // if ANY of its chunks is present. Map each item id → one of its episode uuids.
+    const uuidByItemId = new Map<string, string>();
+    for (const e of episodes) {
+      const itemId = itemIdFromEpisodeName(e.name);
+      if (itemId && !uuidByItemId.has(itemId)) uuidByItemId.set(itemId, e.uuid);
+    }
 
     for (const row of groupRows) {
       if (new Date(row.projected_at).getTime() > cutoff) continue; // too recent, still may be processing
-      const uuid = uuidByName.get(`items:${row.source_id}`);
+      const uuid = uuidByItemId.get(row.source_id);
       if (uuid) {
         confirmed++;
         if (!row.episode_uuid) {
