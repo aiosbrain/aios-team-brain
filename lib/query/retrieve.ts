@@ -2,7 +2,7 @@ import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { GraphitiClient, type GraphFact } from "@/lib/graph/graphiti-client";
 import { visibleGroupIds } from "@/lib/graph/group";
-import { visibleTasks } from "@/lib/auth/visibility";
+import { visibleTasks, isRestrictedTier } from "@/lib/auth/visibility";
 import {
   selectedProviderName,
   type RetrievalProvider,
@@ -460,7 +460,7 @@ async function nativeRetrieve(
     .eq("team_id", teamId)
     .order("synced_at", { ascending: false })
     .limit(8);
-  if (tier === "external") recentB = recentB.eq("access", "external");
+  if (isRestrictedTier(tier)) recentB = recentB.eq("access", "external");
   // Channel scope (Gap #4) — keep the recency fallback inside the same channel. LIKE on the 2nd
   // path segment; the FTS leg uses a precise split_part match, this soft filter is fine for padding.
   if (channel) recentB = recentB.like("path", `%/${channel}/%`);
@@ -472,7 +472,7 @@ async function nativeRetrieve(
     .eq("team_id", teamId)
     .order("decided_at", { ascending: false })
     .limit(50);
-  if (tier === "external") decisionsB = decisionsB.eq("audience", "external");
+  if (isRestrictedTier(tier)) decisionsB = decisionsB.eq("audience", "external");
   // ALL statuses (incl. `done`), most-recently-updated first — so "what got completed today?"
   // can ground on finished tasks. `tasks.updated_at` is bumped on every sync upsert (incl. a
   // status→done transition), so recency ordering surfaces today's completions. (Was active-only:
@@ -493,7 +493,7 @@ async function nativeRetrieve(
   // internal commitments/actors/reporting lines. `emptyRows` resolves to the same `{ data }` shape.
   const emptyRows = Promise.resolve({ data: [] as unknown[] });
   const commitmentsB =
-    tier === "external"
+    isRestrictedTier(tier)
       ? emptyRows
       : db
           .from("graph_entities")
@@ -502,7 +502,7 @@ async function nativeRetrieve(
           .eq("entity_type", "commitment")
           .limit(30);
   const relsB =
-    tier === "external"
+    isRestrictedTier(tier)
       ? emptyRows
       : db
           .from("graph_relationships")
@@ -511,7 +511,7 @@ async function nativeRetrieve(
           .in("relationship_type", ["REPORTS_TO", "OWNS", "BLOCKS"])
           .limit(80);
   const actorsB =
-    tier === "external"
+    isRestrictedTier(tier)
       ? emptyRows
       : db
           .from("graph_entities")

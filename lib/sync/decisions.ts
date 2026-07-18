@@ -1,5 +1,6 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
+import { isRestrictedTier } from "@/lib/auth/visibility";
 
 /** Tier of the pulling principal (the API key's member tier). */
 export type ViewerTier = "team" | "external";
@@ -45,7 +46,7 @@ export async function getDecisionWriteback(
     .gt("updated_at", since)
     .order("updated_at", { ascending: true })
     .limit(500);
-  if (tier === "external") query = query.eq("audience", "external");
+  if (isRestrictedTier(tier)) query = query.eq("audience", "external");
 
   const { data, error } = await query;
   if (error) throw new Error(error.message);
