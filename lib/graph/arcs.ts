@@ -7,7 +7,7 @@ import { adminClient } from "@/lib/db/admin";
 import { recentFacts, resolveEpisodeItems, type AtomicFact } from "./learning";
 import { GraphitiClient } from "./graphiti-client";
 import { episodeGroupId, type AccessTier } from "./group";
-import { attributeParticipants, attributedFactTexts } from "./arc-attribution";
+import { attributeParticipants, attributedFactTexts, withEvidenceParticipants } from "./arc-attribution";
 import { resolveHumanActorsByItem } from "./human-actors";
 import { readArcCache, writeArcCache } from "./arc-cache";
 
@@ -69,7 +69,10 @@ const SYSTEM_PROMPT =
   "storylines about what this team is working through. Favor RECENT activity and give every active " +
   "contributor visible representation — don't let one person's arcs crowd out others who've been " +
   "working. Each fact below is numbered [F1], [F2], … — for every arc, cite the 2-5 fact numbers that " +
-  "support it in `supporting_facts`. Return ONLY a JSON object of the form " +
+  "support it in `supporting_facts`. A parenthesized name at the START of a fact — e.g. \"(Chetan) …\" " +
+  "— is the human RESPONSIBLE for that work (it may not appear in the fact text itself): include those " +
+  "humans in `participants` for every arc citing their facts. Never invent names not present in the " +
+  "facts or their attributions. Return ONLY a JSON object of the form " +
   '{"arcs":[{"title":"short","confidence":"high|medium|low","summary":"2-3 sentences, present tense, ' +
   'specific","participants":["names"],"supporting_facts":[1,2,3]}]}. Use only fact numbers that appear ' +
   "below. No prose, no markdown code fences — the raw JSON object only.";
@@ -327,17 +330,23 @@ function humansForItems(itemIds: (string | undefined)[], humanByItem: Map<string
   ];
 }
 
-/** Rewrite each arc's `participants` to tag recognized AI-agent names with the human(s) behind that
- *  arc's own evidence items (never cross-arc — an arc's attribution must trace to ITS OWN work).
- *  Pure over an already-resolved `humanByItem` map — no DB access here. */
+/** Attribute each arc's `participants` from its OWN evidence (never cross-arc — an arc's attribution
+ *  must trace to ITS OWN work): first tag recognized AI-agent names with the human(s) behind the
+ *  evidence items, then UNION in any evidence human the model didn't name (`withEvidenceParticipants`)
+ *  — so a contributor whose facts an arc cites is on the chip even when their name never appears in
+ *  the fact text (commit-shaped work), and an arc the model returned with `participants: []` still
+ *  names the people it's actually about. Pure over an already-resolved `humanByItem` map. */
 function attributeArcs(arcs: NarrativeArc[], humanByItem: Map<string, string>): NarrativeArc[] {
-  return arcs.map((arc) => ({
-    ...arc,
-    participants: attributeParticipants(
-      arc.participants,
-      humansForItems(arc.evidence.map((e) => e.itemId), humanByItem)
-    ),
-  }));
+  return arcs.map((arc) => {
+    const evidenceHumans = humansForItems(arc.evidence.map((e) => e.itemId), humanByItem);
+    return {
+      ...arc,
+      participants: withEvidenceParticipants(
+        attributeParticipants(arc.participants, evidenceHumans),
+        evidenceHumans
+      ),
+    };
+  });
 }
 
 /**

@@ -134,6 +134,29 @@ export function attributedFactTexts(
   });
 }
 
+/**
+ * Union an arc's LLM-written `participants` with the humans resolved from the arc's OWN cited
+ * evidence (via `items.member_id`) — so being named on an arc is STRUCTURAL, not LLM luck. Without
+ * this, a participant chip appears only when the model happens to echo a name out of the fact text:
+ * fine for people whose docs literally say "John is coordinating…", invisible for people whose work
+ * is commit-shaped (fact subjects are features/repos; the human exists only in the `(Name)`
+ * attribution prefix). It also puts names on arcs the model returned with `participants: []`.
+ *
+ * A human is skipped when their name already appears (case-insensitive) INSIDE any existing
+ * participant string — covering the exact name and the rewritten agent tag "Claude Code (Name)"
+ * from `attributeParticipants` — so no duplicate chips. LLM participants keep their order; evidence
+ * humans append after. Pure; evidence humans come from the roster (`members.display_name`,
+ * connectors already excluded), so nothing here can invent a person.
+ */
+export function withEvidenceParticipants(participants: string[], evidenceHumans: string[]): string[] {
+  const out = [...participants];
+  for (const human of [...new Set(evidenceHumans.map((h) => (h ?? "").trim()).filter(Boolean))]) {
+    const needle = human.toLowerCase();
+    if (!out.some((p) => p.toLowerCase().includes(needle))) out.push(human);
+  }
+  return out;
+}
+
 /** The minimal shape of a Layer-2 event `attributeEventParticipants` needs — structurally compatible
  *  with `GraphEvent` (lib/graph/learning.ts) without importing it. */
 export interface EventParticipantsRef {
