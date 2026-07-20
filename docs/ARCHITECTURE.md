@@ -123,9 +123,10 @@ flowchart LR
 
 ## Auth & access tiers
 
-This server **implements brain-api v1.9** (the wire contract; source of truth:
+This server **implements brain-api v1.11** (the wire contract; source of truth:
 `aios-workspace/docs/brain-api.md`; v1.8 added the subscriptions endpoint,
-`POST /api/v1/subscriptions`). That version is pinned in code as `BRAIN_API_VERSION`
+`POST /api/v1/subscriptions`; v1.11 added the optional `context_health` scan summary
+on `POST /api/v1/metrics`). That version is pinned in code as `BRAIN_API_VERSION`
 (`lib/api/version.ts`), asserted against this sentence by
 `test/guards/contract-version.test.ts`, and mirrored by the vendored
 `test/fixtures/contract/brain-contract.json` (regenerated in lockstep with the canonical

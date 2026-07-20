@@ -14,6 +14,11 @@ function radarData(axes: AemAxes, team: AemAxes): RadarDatum[] {
   return AXIS_META.map((a) => ({ axis: a.label, you: axes[a.key], team: team[a.key] }));
 }
 
+/** Shared 0–4 band renderer (CE band, context-health score). */
+function fmtBand(value: number | null): string {
+  return value == null ? "—" : `${value}/4`;
+}
+
 function CeShadowBadge() {
   return (
     <span className="mt-1 inline-flex rounded-full bg-amber/10 px-2 py-0.5 text-[10px] font-medium text-amber-700">
@@ -61,7 +66,7 @@ export default async function MemberMaturityPage({
         </div>
       </div>
 
-      <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-6">
         <div className="card p-4">
           <div className="text-xs uppercase tracking-wide text-ink-subtle">Tasks</div>
           <div className="mt-1 text-xl tabular-nums text-ink">{latest.tasks}</div>
@@ -73,9 +78,15 @@ export default async function MemberMaturityPage({
         <div className="card p-4">
           <div className="text-xs uppercase tracking-wide text-ink-subtle">CE</div>
           <div className="mt-1 text-xl tabular-nums text-ink">
-            {latest.ce_band == null ? "—" : `${latest.ce_band}/4`}
+            {fmtBand(latest.ce_band)}
           </div>
           <CeShadowBadge />
+        </div>
+        <div className="card p-4">
+          <div className="text-xs uppercase tracking-wide text-ink-subtle">Context</div>
+          <div className="mt-1 text-xl tabular-nums text-ink">
+            {fmtBand(latest.context_health_score)}
+          </div>
         </div>
         <div className="card p-4">
           <div className="text-xs uppercase tracking-wide text-ink-subtle">Est. spend</div>

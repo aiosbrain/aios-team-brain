@@ -176,4 +176,82 @@ describe("agentic-maturity snapshot ingest (real Postgres)", () => {
       expect((await metaFor(seedNull.teamId)).ce_band).toBeNull();
     });
   });
+
+  describe("context_health (v1.11 scan summary)", () => {
+    function contextHealth(over: Record<string, unknown> = {}) {
+      return {
+        score: 3,
+        mode: "workspace",
+        drift_count: 2,
+        versions_behind: 1,
+        coverage_pct: 80,
+        broken_link_count: 0,
+        checked_at: "2026-06-18",
+        ...over,
+      };
+    }
+
+    it("persists both the score column and the full jsonb summary", async () => {
+      const seed = await seedTeam();
+      await ingest(seed, snapshot({ context_health: contextHealth() }));
+      const row = await rowFor(seed.teamId, seed.memberId, "2026-06-18");
+      expect(row!.context_health_score).toBe(3);
+      expect(row!.context_health).toMatchObject(contextHealth());
+    });
+
+    it("stays NULL when the field is omitted (older client / no scan yet)", async () => {
+      const seed = await seedTeam();
+      await ingest(seed, snapshot());
+      const row = await rowFor(seed.teamId, seed.memberId, "2026-06-18");
+      expect(row!.context_health_score).toBeNull();
+      expect(row!.context_health).toBeNull();
+    });
+
+    it("column-wise merge: push-with-summary then re-push-without leaves it intact", async () => {
+      const seed = await seedTeam();
+      await ingest(seed, snapshot({ context_health: contextHealth() }));
+      await ingest(seed, snapshot({ tasks: 999 })); // no context_health key at all
+      const row = await rowFor(seed.teamId, seed.memberId, "2026-06-18");
+      expect(row!.context_health_score).toBe(3);
+      expect(Number(row!.tasks)).toBe(999); // the re-push's other fields DID apply
+    });
+
+    it("canonical_* columns are identical with and without context_health", async () => {
+      const seed = await seedTeam();
+      const withSummary = await ingest(seed, snapshot({ context_health: contextHealth() }));
+      const rowWith = await rowFor(seed.teamId, seed.memberId, "2026-06-18");
+
+      const seed2 = await seedTeam();
+      const withoutSummary = await ingest(seed2, snapshot());
+      const rowWithout = await rowFor(seed2.teamId, seed2.memberId, "2026-06-18");
+
+      expect(withSummary.canonical).toEqual(withoutSummary.canonical);
+      expect(rowWith!.canonical_spine).toBe(rowWithout!.canonical_spine);
+      expect(Number(rowWith!.canonical_overall)).toBe(Number(rowWithout!.canonical_overall));
+    });
+
+    // Regression: the audit trail must not collapse "omitted" and "explicit push" into the
+    // same logged value — that would hide whether a re-push actually updated the summary.
+    it("audit meta distinguishes omitted (unchanged) from an explicit push", async () => {
+      async function metaFor(teamId: string) {
+        const { data } = await db()
+          .from("audit_log")
+          .select("meta")
+          .eq("team_id", teamId)
+          .eq("action", "maturity.snapshot")
+          .order("created_at", { ascending: false })
+          .limit(1)
+          .single();
+        return (data as { meta: Record<string, unknown> }).meta;
+      }
+
+      const seedOmitted = await seedTeam();
+      await ingest(seedOmitted, snapshot());
+      expect((await metaFor(seedOmitted.teamId)).context_health).toBe("unchanged");
+
+      const seedPushed = await seedTeam();
+      await ingest(seedPushed, snapshot({ context_health: contextHealth() }));
+      expect((await metaFor(seedPushed.teamId)).context_health).toBe(3);
+    });
+  });
 });

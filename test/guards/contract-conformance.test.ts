@@ -35,10 +35,13 @@ const canonical = (v: Json): Json =>
 
 describe("brain-api tier + SSE conformance", () => {
   it("fixture contentHash is intact (no out-of-band edit)", () => {
-    // v1.7 added provisioningTools (the member-invite tool vocabulary) to the pinned content.
-    const { version, tierAliases, sse, provisioningTools } = fixture;
+    // v1.7 added provisioningTools (the member-invite tool vocabulary); v1.10 added
+    // gatewayContract (AIO-407) to the pinned content.
+    const { version, tierAliases, sse, provisioningTools, gatewayContract } = fixture;
     const recomputed = createHash("sha256")
-      .update(JSON.stringify(canonical({ version, tierAliases, sse, provisioningTools })))
+      .update(
+        JSON.stringify(canonical({ version, tierAliases, sse, provisioningTools, gatewayContract })),
+      )
       .digest("hex");
     expect(recomputed).toBe(fixture.contentHash);
   });
