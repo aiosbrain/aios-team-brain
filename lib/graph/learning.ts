@@ -19,6 +19,21 @@ import { itemIdFromEpisodeName } from "./episode-name";
  * group_id tier filter is NEVER dropped — only the time bound is — so tier isolation still holds.
  */
 
+/**
+ * Two noise filters ANDed onto EVERY RELATES_TO read (Layer 1 facts AND Layer 2 event fact-lists), so
+ * a third of this team's graph — non-knowledge that was flooding the recency pool and starving real
+ * work of representation — never reaches any layer (measured: ~26% IS_DUPLICATE_OF, ~8% expired):
+ *   • `r.name <> 'IS_DUPLICATE_OF'` — Graphiti records entity-dedup as a RELATES_TO edge whose fact
+ *     text is literally "<x> is a duplicate of <x>"; it carries a fresh created_at so it rides the top
+ *     of the newest-first pool. Bookkeeping, never knowledge → drop it. (`r.name IS NULL` kept
+ *     defensively so a graph without the property still returns real facts.)
+ *   • `r.expired_at IS NULL` — Graphiti's temporal model invalidates superseded edges by stamping
+ *     expired_at but leaves them in the graph; a "recent" read must not resurface stale copies.
+ * A leading AND is baked in — always used inside an existing `WHERE r.group_id IN $groups …`.
+ */
+const FACT_NOISE_FILTER =
+  "AND (r.name IS NULL OR r.name <> 'IS_DUPLICATE_OF') AND r.expired_at IS NULL";
+
 /** Layer 1 — one recently-extracted fact (a RELATES_TO edge). */
 export interface AtomicFact {
   id: string; // edge uuid
@@ -43,7 +58,8 @@ export async function recentFacts(
   // `withSince` gates ONLY the time bound; the group_id tier filter is present either way.
   const factsCypher = (withSince: boolean) =>
     `MATCH (a:Entity)-[r:RELATES_TO]->(b:Entity)
-     WHERE r.group_id IN $groups${withSince ? " AND r.created_at >= datetime($since)" : ""}
+     WHERE r.group_id IN $groups
+       ${FACT_NOISE_FILTER}${withSince ? " AND r.created_at >= datetime($since)" : ""}
      RETURN r.uuid AS id,
             r.fact AS fact,
             toString(r.created_at) AS at,
@@ -147,7 +163,7 @@ export async function recentEvents(
      WHERE ep.group_id IN $groups${withSince ? " AND ep.created_at >= datetime($since)" : ""}
      OPTIONAL MATCH (ep)-[:MENTIONS]->(p:Entity)
      OPTIONAL MATCH (a:Entity)-[r:RELATES_TO]->(b:Entity)
-       WHERE r.group_id IN $groups AND ep.uuid IN r.episodes
+       WHERE r.group_id IN $groups AND ep.uuid IN r.episodes ${FACT_NOISE_FILTER}
      RETURN ep.uuid AS id, ep.name AS name, ep.source AS source,
             ep.source_description AS title, toString(ep.created_at) AS at,
             collect(DISTINCT p.name) AS participants,

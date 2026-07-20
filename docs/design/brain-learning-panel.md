@@ -70,8 +70,34 @@ ORDER BY ep.created_at DESC
 `ep.name = "items:<id>"` → join to `items`/`members` for the real source icon, avatars, and a link
 into the library. This is the ladder rung Layer 3 consumes.
 
-**Layer 3 — narrative arcs:** gather the 7-day node+edge substrate (Cypher), send to Claude with the
+**Layer 3 — narrative arcs:** gather the recent fact substrate (Cypher), send to Claude with the
 arc-synthesis prompt, cache 10 min. Arcs = `{id, title, confidence, summary, participants, sources}`.
+
+**Fair representation (why a contributor's varied work must not vanish).** Synthesis feeds the model a
+bounded set of `MAX_FACTS` facts. Getting that set right is the whole game — a contributor invisible in
+the input is invisible in the arcs. Four safeguards, all in `lib/graph/arcs.ts` unless noted:
+
+- **De-noise at the source** (`lib/graph/learning.ts` `recentFacts`): Graphiti records entity-dedup as
+  `RELATES_TO {name:'IS_DUPLICATE_OF'}` edges ("_x_ is a duplicate of _x_") and leaves superseded edges
+  in the graph stamped `expired_at`. Both carry fresh `created_at`, so they flood a newest-first read
+  (measured ~26% + ~8% of one team's edges). A shared `FACT_NOISE_FILTER` is ANDed onto BOTH graph
+  reads (Layer 1 `recentFacts` and Layer 2 `recentEvents`' fact-lists), so no layer surfaces the noise.
+- **Deep pool, not the newest slice** (`FACT_POOL`): fetch far more than `MAX_FACTS`, because the
+  newest-N is dominated by whoever extracted the most recently — others fall off the cliff *before*
+  balancing runs.
+- **Two-level balance — contributor → item** (`balanceFacts`): round-robin across contributors so a
+  high-volume person can't crowd out a low-volume one, AND within each contributor round-robin across
+  their source items (capped at `PER_ITEM_CAP`) so one huge document (a 257k-char `ARCHITECTURE.md`
+  extracted into 159 facts) can't BE its author's entire share and bury their real varied work.
+- **Request arcs ∝ contributors + split distinct threads** (`arcsRequested`, `buildSystemPrompt`): the
+  requested arc count scales with the number of distinct contributors in the balanced set (not a flat
+  ceiling), and the prompt tells the model to split ONE person's distinct workstreams into separate arcs
+  rather than merging them.
+
+Note attribution vs. narrative: a fact is attributed to the item's `member_id` (its author), which is
+correct for authorship but means a big reference doc's facts describe the *system*, not the author's
+*work* — the per-item cap blunts this; a fuller fix (down-weighting reference docs; ingesting per-PR
+narrative rather than thin per-commit facts) is the follow-up substrate work.
 
 ---
 
