@@ -37,7 +37,7 @@ jobs:
 
       # Produce coverage/coverage-summary.json (lib/** lines pct) for the scanner to read.
       # `|| true`: this is a metrics source, not a gate — never block the scan on coverage.
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: "20"
           cache: "npm"
