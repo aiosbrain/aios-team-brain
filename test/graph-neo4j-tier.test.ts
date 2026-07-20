@@ -68,6 +68,36 @@ live("Graphiti Neo4j tier isolation (real Neo4j)", () => {
     expect(await recentFacts([], since)).toEqual([]);
   });
 
+  // Noise filter (measured ~1/3 of a real team's edges): Graphiti records entity-dedup as a
+  // RELATES_TO edge named IS_DUPLICATE_OF with fact text "<x> is a duplicate of <x>", and stamps
+  // superseded edges with expired_at but leaves them in the graph. Both carry fresh created_at and were
+  // flooding the recency pool → recentFacts must drop both while keeping real facts. Red before A1.
+  it("drops IS_DUPLICATE_OF bookkeeping + expired edges, keeps real facts", async () => {
+    const s = driver.session();
+    try {
+      await s.run(
+        `MATCH (a1:Entity {name:'Alice'}), (b1:Entity {name:'Payments'})
+         CREATE (a1)-[:RELATES_TO {uuid:'f-dup', name:'IS_DUPLICATE_OF', fact:'user is a duplicate of user', created_at:datetime(), group_id:$team, episodes:['ep1']}]->(b1)
+         CREATE (a1)-[:RELATES_TO {uuid:'f-exp', name:'OWNS', fact:'Alice used to own Billing', created_at:datetime(), expired_at:datetime(), group_id:$team, episodes:['ep1']}]->(b1)
+         CREATE (a1)-[:RELATES_TO {uuid:'f-named', name:'MENTORS', fact:'Alice mentors Bob', created_at:datetime(), group_id:$team, episodes:['ep1']}]->(b1)`,
+        { team: TEAM }
+      );
+      const facts = await recentFacts([TEAM], since);
+      const texts = facts.map((f) => f.fact);
+      expect(texts).toContain("Alice owns Payments"); // real fact survives (no name property)
+      // A named, non-expired edge MUST survive — guards against an over-broad filter (e.g. dropping
+      // every named edge, which would blank a prod graph where every real edge carries a name).
+      expect(texts).toContain("Alice mentors Bob");
+      expect(texts).not.toContain("user is a duplicate of user"); // IS_DUPLICATE_OF dropped
+      expect(texts).not.toContain("Alice used to own Billing"); // expired dropped
+      expect(facts.map((f) => f.id)).not.toContain("f-dup");
+      expect(facts.map((f) => f.id)).not.toContain("f-exp");
+    } finally {
+      await s.run("MATCH ()-[r:RELATES_TO]->() WHERE r.uuid IN ['f-dup','f-exp','f-named'] DELETE r");
+      await s.close();
+    }
+  });
+
   it("events: returns the team's events with participants + grouped facts, item link", async () => {
     const events = await recentEvents([TEAM], since);
     const ev = events.find((e) => e.id === "ep1")!;

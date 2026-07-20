@@ -49,10 +49,19 @@ export interface ArcCorrection {
 export type ProviderKeys = LlmBackendKeys;
 
 const MAX_FACTS = 200;
-const MAX_ARCS = 8;
-// Fetch a much deeper pool than we feed the model, so lower-volume contributors' facts are reachable
-// for balancing (a high-volume person's recent burst can otherwise push everyone else past MAX_FACTS).
-const FACT_POOL = MAX_FACTS * 6;
+// HARD ceiling on arcs parsed from the model. The count actually REQUESTED is derived per-synthesis
+// from the number of distinct contributors (see `arcsRequested`), so a varied team isn't pinned to a
+// flat 8 — one person working six distinct threads can get six arcs instead of one merged blob.
+const MAX_ARCS = 12;
+// Fetch a MUCH deeper pool than we feed the model, so a lower-volume contributor's facts are reachable
+// for balancing. Measured too shallow at MAX_FACTS*6 (1200): one high-volume contributor held 84% of
+// the newest-1200 and everyone below the cut fell off the cliff BEFORE balancing could run. A deeper
+// pool + a per-item cap keeps the whole active team reachable.
+const FACT_POOL = MAX_FACTS * 20;
+// Cap the facts any ONE source item contributes to a person's balanced share, BEFORE balancing — so a
+// single huge document (a 257k-char ARCHITECTURE.md extracted into 159 facts) can't BE its author's
+// entire representation and bury their actual varied work.
+const PER_ITEM_CAP = 20;
 const CACHE_TTL_MS = 10 * 60_000;
 // How long the empty-clobber guard keeps trusting a prior non-empty arc set. Within this window an
 // empty synthesis is treated as a transient failure (keep the prior); beyond it, a persistently-empty
@@ -64,18 +73,33 @@ const EMPTY_CLOBBER_MAX_AGE_MS = (() => {
   return Number.isFinite(n) && n > 0 ? n : 48 * 60 * 60_000;
 })();
 
-const SYSTEM_PROMPT =
-  `You are analyzing a team knowledge graph. Identify ${MAX_ARCS} active narrative arcs — ongoing ` +
-  "storylines about what this team is working through. Favor RECENT activity and give every active " +
-  "contributor visible representation — don't let one person's arcs crowd out others who've been " +
-  "working. Each fact below is numbered [F1], [F2], … — for every arc, cite the 2-5 fact numbers that " +
-  "support it in `supporting_facts`. A parenthesized name at the START of a fact — e.g. \"(Chetan) …\" " +
-  "— is the human RESPONSIBLE for that work (it may not appear in the fact text itself): include those " +
-  "humans in `participants` for every arc citing their facts. Never invent names not present in the " +
-  "facts or their attributions. Return ONLY a JSON object of the form " +
-  '{"arcs":[{"title":"short","confidence":"high|medium|low","summary":"2-3 sentences, present tense, ' +
-  'specific","participants":["names"],"supporting_facts":[1,2,3]}]}. Use only fact numbers that appear ' +
-  "below. No prose, no markdown code fences — the raw JSON object only.";
+/** Requested arc count for one synthesis: scale with the number of distinct contributors in the
+ *  balanced facts (≈2 arcs each) so a varied, multi-person team isn't pinned to a flat number —
+ *  floored at 6, capped at MAX_ARCS. Pure + unit-tested. */
+export function arcsRequested(contributorCount: number): number {
+  return Math.min(MAX_ARCS, Math.max(6, 2 * contributorCount));
+}
+
+/** The synthesis system prompt, parameterized by how many arcs to request. Explicitly instructs the
+ *  model to split ONE contributor's distinct workstreams into separate arcs (the fix for a person's
+ *  varied work collapsing into a single arc) rather than merging them. */
+function buildSystemPrompt(requested: number): string {
+  return (
+    `You are analyzing a team knowledge graph. Identify up to ${requested} active narrative arcs — ongoing ` +
+    "storylines about what this team is working through. Favor RECENT activity and give every active " +
+    "contributor visible representation — don't let one person's arcs crowd out others who've been " +
+    "working. If ONE contributor's facts span multiple DISTINCT workstreams (e.g. social vs security vs " +
+    "meetings vs graph vs performance), produce a SEPARATE arc per workstream — never merge one person's " +
+    "unrelated efforts into a single arc. Each fact below is numbered [F1], [F2], … — for every arc, cite " +
+    "the 2-5 fact numbers that support it in `supporting_facts`. A parenthesized name at the START of a " +
+    'fact — e.g. "(Chetan) …" — is the human RESPONSIBLE for that work (it may not appear in the fact ' +
+    "text itself): include those humans in `participants` for every arc citing their facts. Never invent " +
+    "names not present in the facts or their attributions. Return ONLY a JSON object of the form " +
+    '{"arcs":[{"title":"short","confidence":"high|medium|low","summary":"2-3 sentences, present tense, ' +
+    'specific","participants":["names"],"supporting_facts":[1,2,3]}]}. Use only fact numbers that appear ' +
+    "below. No prose, no markdown code fences — the raw JSON object only."
+  );
+}
 
 function stableId(title: string): string {
   return "arc-" + createHash("sha256").update(title.trim().toLowerCase()).digest("hex").slice(0, 10);
@@ -97,35 +121,92 @@ export function stripTaskKeys(text: string): string {
     .trim();
 }
 
-/**
- * Balance a fact pool ACROSS its contributors so synthesis input represents everyone active — not just
- * whoever pushed the most recent volume. Without this, arc synthesis fed the globally-newest MAX_FACTS
- * facts, so a high-volume contributor's recent burst crowded every lower-volume person out of the
- * prompt entirely (their work then never appeared in Learning even though it's in the graph). We group
- * the pool by the human behind each fact and round-robin one-per-contributor per round (each person's
- * facts consumed newest-first) until `budget` is filled. Unattributed facts ("") are their own bucket.
- * Pure + unit-tested; `humanOf` is injected so the DB/Neo4j resolution stays in the caller.
- */
-export function balanceFactsByContributor<T>(facts: T[], humanOf: (f: T) => string, budget: number): T[] {
+/** Group items by a string key, preserving first-seen order of both the keys and each key's members.
+ *  Pure — the shared primitive under both balancing levels. */
+function groupByKey<T>(items: T[], key: (t: T) => string): T[][] {
   const buckets = new Map<string, T[]>();
-  for (const f of facts) {
-    const key = humanOf(f);
-    const arr = buckets.get(key);
-    if (arr) arr.push(f);
-    else buckets.set(key, [f]);
+  for (const it of items) {
+    const k = key(it);
+    const arr = buckets.get(k);
+    if (arr) arr.push(it);
+    else buckets.set(k, [it]);
   }
-  const lists = [...buckets.values()]; // insertion order ≈ first-seen recency, newest bucket first
+  return [...buckets.values()];
+}
+
+/** Interleave a set of buckets one-per-bucket-per-round until `budget` is filled or all exhaust,
+ *  preserving each bucket's internal order. Pure. */
+function roundRobin<T>(buckets: T[][], budget: number): T[] {
   const out: T[] = [];
   for (let round = 0; out.length < budget; round++) {
     let progressed = false;
-    for (const list of lists) {
+    for (const b of buckets) {
       if (out.length >= budget) break;
-      if (round < list.length) {
-        out.push(list[round]);
+      if (round < b.length) {
+        out.push(b[round]);
         progressed = true;
       }
     }
     if (!progressed) break; // every bucket exhausted
+  }
+  return out;
+}
+
+/**
+ * Balance a fact pool ACROSS its contributors so synthesis input represents everyone active — not just
+ * whoever pushed the most recent volume (the #303 fix). Group by the human behind each fact and
+ * round-robin one-per-contributor per round (each person's facts newest-first) until `budget` is
+ * filled. Unattributed facts ("") are their own bucket. Pure; `humanOf` injected so DB/Neo4j resolution
+ * stays in the caller. Superseded by `balanceFacts` in the synthesis path (kept for direct callers/tests).
+ */
+export function balanceFactsByContributor<T>(facts: T[], humanOf: (f: T) => string, budget: number): T[] {
+  return roundRobin(groupByKey(facts, humanOf), budget);
+}
+
+/**
+ * Two-level balance — contributor → item. Round-robining by contributor alone is blind to a person
+ * whose facts are dominated by ONE giant document: a 257k-char ARCHITECTURE.md extracted into 159 facts
+ * would fill that author's entire balanced share and bury their actual varied work. So within each
+ * contributor we FIRST cap every source item at `perItemCap` and interleave the person's facts ACROSS
+ * their items, THEN round-robin across contributors. The result: each person's slice is a diverse spread
+ * of their real items, and no single doc can be someone's whole story. Pure; `itemOf` returns a stable
+ * per-item key ("" when unresolved — those share one bucket, matching the unattributed convention).
+ */
+export function balanceFacts<T>(
+  facts: T[],
+  humanOf: (f: T) => string,
+  itemOf: (f: T) => string,
+  budget: number,
+  perItemCap = Infinity
+): T[] {
+  const perContributor = groupByKey(facts, humanOf).map((hb) => {
+    const items = groupByKey(hb, itemOf).map((ib) =>
+      perItemCap === Infinity ? ib : ib.slice(0, perItemCap)
+    );
+    // Reorder this contributor's (capped) facts interleaved by item, so item diversity leads.
+    return roundRobin(items, Number.POSITIVE_INFINITY);
+  });
+  return roundRobin(perContributor, budget);
+}
+
+/**
+ * Drop facts that add no signal before they're numbered into the prompt: (1) self-referential noise
+ * where subject === object (Graphiti's "user is a duplicate of user" bookkeeping — a defense-in-depth
+ * backstop even though `recentFacts` already filters `IS_DUPLICATE_OF` at the query), and (2) exact
+ * repeats of an already-seen fact text (keep the first = newest, since the pool is newest-first). Each
+ * duplicate would otherwise consume a numbered slot and hand the model redundant input. Pure + tested.
+ */
+export function dedupeFacts(facts: AtomicFact[]): AtomicFact[] {
+  const seen = new Set<string>();
+  const out: AtomicFact[] = [];
+  for (const f of facts) {
+    const subj = (f.subject ?? "").trim().toLowerCase();
+    const obj = (f.object ?? "").trim().toLowerCase();
+    if (subj && subj === obj) continue; // self-referential noise
+    const key = (f.fact ?? "").trim().toLowerCase().replace(/\s+/g, " ");
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(f);
   }
   return out;
 }
@@ -213,7 +294,7 @@ function buildEvidence(
 }
 
 /**
- * Parse + normalize the LLM's JSON into safe arcs: caps at 5, coerces confidence, defaults missing
+ * Parse + normalize the LLM's JSON into safe arcs: caps at MAX_ARCS, coerces confidence, defaults missing
  * fields, assigns a stable id from the title, stamps `derived_at`, and resolves cited `supporting_facts`
  * indices → verifiable `evidence` (falls back to any free-text `supporting_sources` as unlinked
  * evidence). Returns [] on malformed input. Pure + exported so the fragile parsing is unit-tested.
@@ -277,12 +358,13 @@ function extractJsonObject(raw: string): string {
  *  through the shared settings-aware primitive, so arcs honor the team's answering-provider (incl.
  *  OpenRouter) exactly like the Query box. */
 async function callLLMRaw(
+  system: string,
   userContent: string,
   keys: ProviderKeys,
   record?: { db: DbClient; teamId: string }
 ): Promise<string | null> {
   return completeTextOrNull(
-    { system: SYSTEM_PROMPT, prompt: userContent },
+    { system, prompt: userContent },
     {
       keys,
       jsonObject: true,
@@ -368,7 +450,9 @@ async function synthesizeArcs(
   // or a stalled projector, must not blank the panel). `null` = no window. Fetch a DEEP pool (not just
   // MAX_FACTS), so we can balance it across contributors — otherwise the globally-newest MAX_FACTS are
   // dominated by whoever pushed the most volume and everyone else's work is invisible in Learning.
-  const pool = await recentFacts(groups, null, FACT_POOL);
+  // Dedupe the raw pool up front — drops exact-repeat fact texts and self-referential noise so neither
+  // balancing counts nor prompt slots are wasted on redundant/garbage facts.
+  const pool = dedupeFacts(await recentFacts(groups, null, FACT_POOL));
   // No facts and nothing to correct → nothing to synthesize. (A correction with no facts still runs
   // the LLM, preserving the pre-cache recompute behavior.)
   if (pool.length === 0 && correctionTexts.length === 0) return [];
@@ -377,18 +461,42 @@ async function synthesizeArcs(
   const epToItem = await resolveEpisodeItems(groups, pool.flatMap((f) => f.episodeUuids), FACT_POOL * 3);
   const allItemIds = [...new Set([...epToItem.values()].map((v) => v.itemId).filter((id): id is string => !!id))];
   const humanByItem = await resolveHumanActorsByItem(db, teamId, allItemIds);
-  // The human behind a fact = the first resolvable human among its source episodes' items ("" if none).
-  const humanOfFact = (f: AtomicFact): string => {
+  // Resolve a fact's (item, human) TOGETHER, preferring the first source item that resolves a HUMAN and
+  // only falling back to the first resolvable item when none has one. Resolving them independently would
+  // regress attribution: a fact whose episodes are [connector item (no human), John's item] must be
+  // balanced under John — not dropped into the unattributed bucket because a human-less item came first
+  // (which would also undercount `contributorCount` and disagree with `attributedFactTexts`, which
+  // unions humans across ALL episodes). Memoized per fact — both closures below read the same result.
+  const actorCache = new Map<string, { item: string; human: string }>();
+  const actorOfFact = (f: AtomicFact): { item: string; human: string } => {
+    const cached = actorCache.get(f.id);
+    if (cached) return cached;
+    let firstItem = "";
+    let resolved = { item: "", human: "" };
     for (const u of f.episodeUuids) {
-      const itemId = epToItem.get(u)?.itemId;
-      const h = itemId ? humanByItem.get(itemId) : undefined;
-      if (h) return h;
+      const id = epToItem.get(u)?.itemId;
+      if (!id) continue;
+      if (!firstItem) firstItem = id;
+      const h = humanByItem.get(id);
+      if (h) {
+        resolved = { item: id, human: h };
+        break;
+      }
     }
-    return "";
+    if (!resolved.item) resolved = { item: firstItem, human: "" };
+    actorCache.set(f.id, resolved);
+    return resolved;
   };
-  // Balance the deep pool → a representative MAX_FACTS so every active contributor is in the prompt.
-  const facts = balanceFactsByContributor(pool, humanOfFact, MAX_FACTS);
+  const itemOfFact = (f: AtomicFact): string => actorOfFact(f).item;
+  const humanOfFact = (f: AtomicFact): string => actorOfFact(f).human;
+  // Two-level balance (contributor → item, per-item capped) → a representative MAX_FACTS so every active
+  // contributor is in the prompt AND no single giant document dominates its author's share.
+  const facts = balanceFacts(pool, humanOfFact, itemOfFact, MAX_FACTS, PER_ITEM_CAP);
+  // Request arcs proportional to how many distinct contributors actually made the balanced cut, so a
+  // varied team gets more than a flat ceiling and each person's distinct threads have room to surface.
+  const contributorCount = new Set(facts.map(humanOfFact).filter(Boolean)).size;
   const raw = await callLLMRaw(
+    buildSystemPrompt(arcsRequested(contributorCount)),
     buildPrompt(attributedFactTexts(facts, epToItem, humanByItem), correctionTexts),
     keys,
     { db, teamId }

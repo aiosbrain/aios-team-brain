@@ -5,12 +5,16 @@ import {
   rankArcs,
   newestEvidenceAt,
   balanceFactsByContributor,
+  balanceFacts,
+  dedupeFacts,
+  arcsRequested,
   type NarrativeArc,
 } from "@/lib/graph/arcs";
+import type { AtomicFact } from "@/lib/graph/learning";
 
 /**
  * Spec for the arc JSON normalizer (the fragile bit — an LLM's JSON is untrusted). Derived from the
- * contract the panel needs: safe defaults, capped at 8, coerced confidence, stable ids, never throws.
+ * contract the panel needs: safe defaults, capped at MAX_ARCS, coerced confidence, stable ids, never throws.
  */
 
 describe("stripTaskKeys", () => {
@@ -70,9 +74,9 @@ describe("parseArcsJson", () => {
     expect(arc.supporting_sources).toEqual([]);
   });
 
-  it("caps at 8 arcs", () => {
-    const arcs = Array.from({ length: 12 }, (_, i) => ({ title: `A${i}`, confidence: "low" }));
-    expect(parseArcsJson(JSON.stringify({ arcs }), { now: NOW })).toHaveLength(8);
+  it("caps at MAX_ARCS (12) arcs", () => {
+    const arcs = Array.from({ length: 16 }, (_, i) => ({ title: `A${i}`, confidence: "low" }));
+    expect(parseArcsJson(JSON.stringify({ arcs }), { now: NOW })).toHaveLength(12);
   });
 
   it("returns [] for null, malformed JSON, or a missing arcs array (never throws)", () => {
@@ -224,5 +228,78 @@ describe("balanceFactsByContributor — fair representation (the fix for a contr
   it("unattributed facts ('') are their own bucket and still get a fair share", () => {
     const facts = [f("j1", "John"), f("j2", "John"), f("u1", ""), f("u2", "")];
     expect(balanceFactsByContributor(facts, humanOf, 4).map((x) => x.id)).toEqual(["j1", "u1", "j2", "u2"]);
+  });
+});
+
+describe("balanceFacts — contributor→item (one giant doc can't BE a person's whole share)", () => {
+  const f = (id: string, who: string, item: string) => ({ id, who, item });
+  const humanOf = (x: { who: string }) => x.who;
+  const itemOf = (x: { item: string }) => x.item;
+
+  it("a single dominant item does NOT crowd out a contributor's other items in their share", () => {
+    // Chetan: 6 facts from one huge doc (ARCHITECTURE.md) + 1 fact each from 3 real work items.
+    // Per-CONTRIBUTOR balancing alone would fill his slice doc-first; per-ITEM must interleave so his
+    // varied work leads. Budget 4 (single contributor) → one from each of his 4 items, doc no more than
+    // its round-robin share.
+    const facts = [
+      f("d1", "C", "arch"), f("d2", "C", "arch"), f("d3", "C", "arch"),
+      f("d4", "C", "arch"), f("d5", "C", "arch"), f("d6", "C", "arch"),
+      f("w1", "C", "social"), f("w2", "C", "security"), f("w3", "C", "meetings"),
+    ];
+    const out = balanceFacts(facts, humanOf, itemOf, 4).map((x) => x.id);
+    // First four picks are one-per-item (item diversity leads), NOT four arch chunks.
+    expect(out).toEqual(["d1", "w1", "w2", "w3"]);
+    expect(out.filter((id) => id.startsWith("d"))).toHaveLength(1); // the doc contributes ONE, not four
+  });
+
+  it("perItemCap bounds how many facts any one item can contribute before balancing", () => {
+    const facts = [
+      f("d1", "C", "arch"), f("d2", "C", "arch"), f("d3", "C", "arch"), f("d4", "C", "arch"),
+      f("w1", "C", "work"),
+    ];
+    // Cap arch at 2 → arch may appear at most twice regardless of budget.
+    const out = balanceFacts(facts, humanOf, itemOf, 10, 2).map((x) => x.id);
+    expect(out.filter((id) => id.startsWith("d"))).toEqual(["d1", "d2"]);
+    expect(out).toContain("w1");
+  });
+
+  it("still balances ACROSS contributors (a high-volume person can't crowd out a low one)", () => {
+    const facts = [
+      f("j1", "John", "a"), f("j2", "John", "b"), f("j3", "John", "c"),
+      f("c1", "Chetan", "x"),
+    ];
+    const out = balanceFacts(facts, humanOf, itemOf, 2).map((x) => x.id);
+    expect(out).toContain("c1"); // Chetan present despite John's 3:1 volume
+  });
+});
+
+describe("dedupeFacts — no wasted prompt slots on repeats / self-referential noise", () => {
+  const mk = (id: string, fact: string, subject = "s", object = "o"): AtomicFact => ({
+    id, fact, at: "2026-07-20T00:00:00Z", subjectType: "entity", subject, object, episodeUuids: [],
+  });
+
+  it("drops exact-repeat fact text, keeping the first (newest) occurrence", () => {
+    const out = dedupeFacts([mk("1", "Chetan fixed observability"), mk("2", "Chetan fixed observability")]);
+    expect(out.map((f) => f.id)).toEqual(["1"]);
+  });
+
+  it("is case/space-insensitive on the repeat check", () => {
+    const out = dedupeFacts([mk("1", "Chetan  fixed  X"), mk("2", "chetan fixed x")]);
+    expect(out).toHaveLength(1);
+  });
+
+  it("drops self-referential subject===object noise (the 'user is a duplicate of user' backstop)", () => {
+    const out = dedupeFacts([mk("1", "user is a duplicate of user", "user", "user"), mk("2", "real fact", "a", "b")]);
+    expect(out.map((f) => f.id)).toEqual(["2"]);
+  });
+});
+
+describe("arcsRequested — scale requested arcs with distinct contributors (not a flat ceiling)", () => {
+  it("floors at 6 for a small team and scales ~2 per contributor up to the cap", () => {
+    expect(arcsRequested(1)).toBe(6); // floor
+    expect(arcsRequested(2)).toBe(6); // floor still
+    expect(arcsRequested(4)).toBe(8);
+    expect(arcsRequested(6)).toBe(12); // cap (MAX_ARCS)
+    expect(arcsRequested(20)).toBe(12); // never exceeds the cap
   });
 });
