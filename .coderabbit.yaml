@@ -1,4 +1,4 @@
-version: "2"
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
 language: "en-US"
 
 reviews:
@@ -9,8 +9,11 @@ reviews:
   review_status: true
   collapse_walkthrough: false
   auto_review:
-    enabled: true
+    enabled: false
     drafts: false
+    labels:
+      - ready-for-review
+    auto_incremental_review: false
     base_branches:
       - main
 

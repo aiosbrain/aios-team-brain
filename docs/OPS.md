@@ -1,8 +1,8 @@
 # Ops hardening — Sentry, CodeRabbit, BugBot
 
-This note covers the observability + automated-review stack added in **W1.4**. The Sentry
-_code_ is wired in this repo; CodeRabbit and BugBot are GitHub/Cursor apps that a human org
-owner must approve (they cannot be enabled from code).
+This note covers the observability + automated-review stack added in **W1.4**. Sentry is wired in
+code; CodeRabbit is configured in-repository but installed as a GitHub App, and the per-repository
+Cursor Bugbot setting is managed manually in Cursor.
 
 ---
 
@@ -83,34 +83,37 @@ stack traces pointing at the original source files.
 
 ---
 
-## 2. CodeRabbit (automated PR review) — W1.4.2 — HUMAN STEP
+## 2. CodeRabbit (label-gated PR review) — W1.4.2
 
-CodeRabbit is a GitHub App; it is **free for public repos**. It cannot be enabled from code —
-an org owner must install it.
+CodeRabbit remains installed on the `aiosbrain` repositories, but `.coderabbit.yaml` disables
+automatic and incremental review. The positive `ready-for-review` label triggers an initial review.
 
-1. Go to <https://github.com/apps/coderabbitai> and click **Install** (or sign in at
-   <https://coderabbit.ai> with GitHub).
-2. Install it on the **AIOS-alpha** org and select the public AIOS repos
-   (`aios-team-brain`, `aios-workspace`, `aios-website`), or "All repositories".
-3. CodeRabbit then auto-reviews new PRs. Optional: add a `.coderabbit.yaml` at repo root later
-   to tune review behavior; the defaults are fine to start.
+1. Ensure the repository label exists:
 
-No env vars or secrets in this repo are required.
+   ```bash
+   gh label create ready-for-review --repo aiosbrain/aios-team-brain \
+     --description "Trigger CodeRabbit review for the current PR head" --color 0E8A16
+   ```
+
+2. Apply it only when CodeRabbit is explicitly selected, or whenever the diff is safety-sensitive.
+3. After any later push, comment `@coderabbitai review`; the label does not trigger incremental
+   reviews while `auto_incremental_review: false`.
+4. Accept only substantive comments/reviews created at or after the latest PR commit. A green check
+   run without review text is not evidence.
+
+No repository secret is required.
 
 ---
 
-## 3. BugBot (Cursor) — W1.4.3 — HUMAN STEP
+## 3. Cursor Bugbot — W1.4.3 — HUMAN STEP
 
-BugBot is Cursor's automated PR bug-finder. Enabling it requires approving the Cursor app for
-the org (John is the **AIOS-alpha** org owner).
+Remote Cursor Bugbot must be disabled for this repository to avoid duplicating the mandatory Local
+Bugbot gate. In the Cursor dashboard, open the GitHub/Bugbot installations list and disable Bugbot
+for `aiosbrain/aios-team-brain` specifically.
 
-1. In Cursor, enable BugBot for the org (Cursor dashboard → BugBot / GitHub integration),
-   which initiates a GitHub App authorization for **AIOS-alpha**.
-2. Approve the Cursor app at **GitHub → AIOS-alpha org → Settings → Third-party Access**
-   (GitHub Apps / OAuth app access). As org owner, John approves the pending Cursor request.
-3. Grant it access to the public AIOS repos. BugBot then comments on PRs with potential bugs.
-
-No env vars or secrets in this repo are required.
+Do not use an undocumented API and do not uninstall the all-repository Cursor GitHub App: other
+Cursor integration access remains in use. After changing the setting, verify on a non-draft PR that
+no `cursor[bot]` review activity appears.
 
 ---
 

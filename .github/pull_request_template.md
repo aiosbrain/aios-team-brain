@@ -8,6 +8,7 @@
      No task yet, and this work should be tracked? Create one FIRST in the Team Brain dashboard
      (→ Tasks; it projects to Linear), then put its key here. Don't hand-edit the Linear issue —
      the brain is the source of truth, Linear is a one-way projection. -->
+
 AIOS-Work: <!-- e.g. AIO-72 -->
 
 ## Checklist
@@ -18,8 +19,12 @@ AIOS-Work: <!-- e.g. AIO-72 -->
 - [ ] Ingestion tests pass if Python changed: `cd ingestion && pytest -q`
 - [ ] `brain-api.md` version bumped if sync protocol changed
 - [ ] No secrets or admin-tier content in diff
+- [ ] Mandatory Fable diff review is recorded below
+- [ ] Exact-head Local Bugbot is clear when workspace ship tooling is used
+- [ ] If safety-sensitive or explicitly selected: `ready-for-review` is applied and current-head CodeRabbit evidence exists
+- [ ] Safety-sensitive PRs use the operator merge gate (never `--auto-merge`)
 
-## Bot review summary
+## Review summary
 
-<!-- After Bugbot + CodeRabbit post, paste a one-line summary of their findings here,
-     or write "no blocking findings." Helps reviewers scan quickly. -->
+<!-- Include: Reviewed by Fable — verdict …; Local Bugbot; and CodeRabbit when required.
+     After a fix push, refresh CodeRabbit with `@coderabbitai review`. -->

@@ -12,6 +12,7 @@ tracks its progress in **Linear** (the canonical PM tool; the brain-tasks CLI is
 projection path) — that's the workflow we're testing.
 
 ## Parallelization waves (respect dependencies)
+
 - **Wave A — start in parallel now (no cross-deps):** `F3`, `W1.1`, `W1.2`, `W1.4`
 - **Wave B — after `F3` merges:** `F4`, `F5`
 - **Wave C — after `F5` merges:** `W1.3`
@@ -23,6 +24,7 @@ projection path) — that's the workflow we're testing.
   `aios-workspace/docs/v1-operator-loop/` for the V1.0 roadmap that superseded Wave 2.
 
 ## Shared caveats for parallel runs
+
 - **Worktrees:** name each uniquely — `../aios-team-brain-<epic>` (e.g. `-f3`, `-w1.1`).
 - **Shared test Postgres:** `npm run db:test:up` **resets** the shared DB on port 5434. Don't run it
   concurrently from two agents. Either (a) one agent brings it up and others just run
@@ -43,6 +45,7 @@ projection path) — that's the workflow we're testing.
 > Postgres via `lib/db/pg`). **First, read** the root `~/Projects/aios/CLAUDE.md`
 > (it MANDATES git worktrees — follow it), this repo's `CLAUDE.md` + `AGENTS.md`, and
 > `docs/ARCHITECTURE.md` §1. Then set up your worktree:
+>
 > ```bash
 > cd ~/Projects/aios/aios-team-brain
 > git fetch origin
@@ -50,6 +53,7 @@ projection path) — that's the workflow we're testing.
 > cd ../aios-team-brain-<epic>
 > ln -sfn ~/Projects/aios/aios-team-brain/node_modules node_modules
 > ```
+>
 > **Linear tracking (brain-tasks CLI, brain→Linear projection):** find the issue and its sub-issues;
 > assign them to yourself; move the issue to **In Progress** when you start; move each sub-issue to
 > **Done** as you finish it; when you open the PR, **reference the issue key** in the PR body (see
@@ -65,7 +69,7 @@ projection path) — that's the workflow we're testing.
 
 ---
 
-## F3 — Integrations auth surfaces + contract bump  (Wave A)
+## F3 — Integrations auth surfaces + contract bump (Wave A)
 
 ```
 You are a senior engineer on AIOS Team Brain (Next.js 16 App Router, React 19, TypeScript, Postgres via lib/db/pg). Read ~/Projects/aios/CLAUDE.md (it MANDATES git worktrees — follow it), this repo's CLAUDE.md + AGENTS.md, and docs/ARCHITECTURE.md §1 before coding.
@@ -92,7 +96,7 @@ CONSTRAINTS: single-writer stays lib/integrations/manage.ts; tier/role isolation
 VERIFY: npx tsc --noEmit; npm run lint; npm test; npm run check:docs; npm run db:test:up && npm run test:datamechanics:local. Then open a PR from feat/f3-integrations-auth against main referencing the Linear issue key.
 ```
 
-## F4 — Sidecar consumes selections  (Wave B — after F3 merges)
+## F4 — Sidecar consumes selections (Wave B — after F3 merges)
 
 ```
 You are a senior engineer on AIOS (the Python ingestion sidecar in aios-team-brain/ingestion + the brain). Read ~/Projects/aios/CLAUDE.md (MANDATES worktrees), this repo's CLAUDE.md/AGENTS.md, docs/ARCHITECTURE.md §1, and the ingestion source pattern (ingestion/aios_ingest/sources/registry.py, engine.py, brain_client.py). Requires F3 (GET /api/v1/integrations) merged to main — confirm it exists before starting.
@@ -115,7 +119,7 @@ SCOPE:
 VERIFY: run the ingestion Python tests; npm run check:docs if you touch ARCHITECTURE. PR from feat/f4-sidecar-selections → main referencing the Linear issue key.
 ```
 
-## F5 — Admin Integrations UI + tier guards  (Wave B — after F3 merges)
+## F5 — Admin Integrations UI + tier guards (Wave B — after F3 merges)
 
 ```
 You are a senior engineer on AIOS Team Brain. Read ~/Projects/aios/CLAUDE.md (MANDATES worktrees), this repo's CLAUDE.md/AGENTS.md, docs/ARCHITECTURE.md §1 and §5 (tier isolation), and these existing patterns: components/admin/admin-tabs.tsx, app/t/[team]/admin/layout.tsx (admin gate), lib/auth/visibility.ts, test/guards/codebases-tier-filter.test.ts. Requires F3 merged.
@@ -140,7 +144,7 @@ SCOPE:
 VERIFY: npx tsc --noEmit; npm run lint; npm test; npm run check:docs; npm run db:test:up && npm run test:datamechanics:local. PR from feat/f5-integrations-ui → main referencing the Linear issue key.
 ```
 
-## W1.1 — Granola → decisions (sanitized, consented)  (Wave A)
+## W1.1 — Granola → decisions (sanitized, consented) (Wave A)
 
 ```
 You are a senior engineer on AIOS (the Python ingestion sidecar + the transcript→decision workflow). Read ~/Projects/aios/CLAUDE.md (MANDATES worktrees), this repo's CLAUDE.md/AGENTS.md, the source pattern (ingestion/aios_ingest/sources/registry.py + base.py + an existing source like slack.py), and the existing granola-digest + transcript-decisions skills. There is already a granola-mcp server configured — reuse its pull/parse logic; do not re-write transcript fetching.
@@ -165,7 +169,7 @@ SCOPE:
 VERIFY: ingestion Python tests; npm run check:docs (drift:sources). PR from feat/w1.1-granola → main referencing the Linear issue key.
 ```
 
-## W1.2 — Token + cost per member (brain spend)  (Wave A)
+## W1.2 — Token + cost per member (brain spend) (Wave A)
 
 ```
 You are a senior engineer on AIOS Team Brain. Read ~/Projects/aios/CLAUDE.md (MANDATES worktrees), this repo's CLAUDE.md/AGENTS.md, and these SHIPPED pieces you build on: lib/auth/visibility.ts (scopeQueryLog — query_log is role-scoped), lib/identity/resolve.ts (shared identity resolver), lib/metrics/pulse.ts (JS day-bucketing pattern), and the codebases contributor-table/chart components.
@@ -189,7 +193,7 @@ SCOPE:
 VERIFY: npx tsc --noEmit; npm run lint; npm test; npm run db:test:up && npm run test:datamechanics:local. PR from feat/w1.2-cost-per-member → main referencing the Linear issue key.
 ```
 
-## W1.3 — GitHub native UI (selection + manual scan)  (Wave C — after F5 merges)
+## W1.3 — GitHub native UI (selection + manual scan) (Wave C — after F5 merges)
 
 ```
 You are a senior engineer on AIOS Team Brain. Read ~/Projects/aios/CLAUDE.md (MANDATES worktrees), this repo's CLAUDE.md/AGENTS.md, and reuse (do NOT fork): lib/codebases/github.ts (fetchGithubUser/listOrgMembers/linkGithub), lib/codebases/ingest.ts (single writer), lib/codebases/visibility.ts (canSeeCodebases). Requires F5 (integrations UI) and F4 (sidecar consumes selections) merged. Heed memory codebase-scan-deploy-race.
@@ -213,7 +217,7 @@ SCOPE:
 VERIFY: npx tsc --noEmit; npm run lint; npm test; npm run check:docs; data-mechanics if persistence touched. PR from feat/w1.3-github-ui → main referencing the Linear issue key.
 ```
 
-## W1.4 — Ops hardening (Sentry, CodeRabbit, BugBot)  (Wave A)
+## W1.4 — Ops hardening (Sentry, CodeRabbit, BugBot) (Wave A)
 
 ```
 You are a senior engineer on AIOS Team Brain (Next.js 16 + Turbopack). Read ~/Projects/aios/CLAUDE.md (MANDATES worktrees) and this repo's CLAUDE.md/AGENTS.md. AGENTS.md warns this Next.js has breaking changes — read node_modules/next/dist/docs as needed.
@@ -231,7 +235,7 @@ OBJECTIVE: error logging + AI code review.
 SCOPE:
 - W1.4.1 Sentry: @sentry/nextjs >=10.13 (Turbopack source-map upload). Add instrumentation-client.ts, sentry.server.config.ts, sentry.edge.config.ts, onRequestError in instrumentation.ts, app/global-error.tsx (app root), withSentryConfig in next.config.ts. DSN + source-map auth token via env (.env.example entries; do NOT commit secrets). Confirm no custom webpack plugins (Turbopack ignores them).
 - W1.4.2 CodeRabbit: document installing the GitHub App on the public AIOS repos (free for public repos). This is a config/ops step — capture instructions in the PR.
-- W1.4.3 BugBot: document John (org owner) approving the Cursor app at AIOS-alpha → Settings → Third-party Access (manual).
+- W1.4.3 BugBot: document the per-repository Cursor setting for the `aiosbrain` organization (manual).
 - W1.4.4 Sentry smoke: a client error and a server error both produce events with resolved source maps (note how to verify).
 
 VERIFY: npx tsc --noEmit; npm run lint; npm run build (Turbopack) succeeds with Sentry wired. PR from feat/w1.4-ops → main referencing the Linear issue key.
