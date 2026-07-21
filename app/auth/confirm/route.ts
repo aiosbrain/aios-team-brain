@@ -1,6 +1,7 @@
 import { type NextRequest, NextResponse } from "next/server";
 import { redeemMagicToken } from "@/lib/auth/pg-login";
 import { signSession, SESSION_COOKIE, sessionCookieOptions } from "@/lib/auth/pg-session";
+import { safeNextPath } from "@/lib/auth/next-path";
 
 export const runtime = "nodejs";
 
@@ -25,9 +26,9 @@ export async function GET(request: NextRequest) {
   if (token) {
     const result = await redeemMagicToken(token);
     if (result) {
-      const dest = result.nextPath.startsWith("/") && !result.nextPath.startsWith("//")
-        ? result.nextPath
-        : "/";
+      // Re-sanitize on redeem too: the token's next_path is attacker-influenced at request time and
+      // may predate the request-route's own check (or be minted by another issuer).
+      const dest = safeNextPath(result.nextPath);
       // First login (an invite being activated): route through the welcome screen
       // instead of dropping straight onto the dashboard. Later logins are unaffected.
       const target = result.firstLogin ? `/auth/welcome?next=${encodeURIComponent(dest)}` : dest;

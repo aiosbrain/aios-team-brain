@@ -184,18 +184,19 @@ Two principals, one tier model:
     email is unknown, has no password set, or the password is wrong, so login can't be used to
     enumerate members. Needs no email infrastructure.
   - **Magic link sign-in (OPTIONAL secondary path, needs a domain).** `POST /api/auth/request-magic-link`
-    returns the same 200 `{ ok: true }` response for every syntactically valid email. After the
-    response finishes, recognized emails get a single-use token issued and emailed
-    (`issueMagicToken`/`sendMagicLink`); unknown emails stop after the member lookup. Moving the
-    lookup, token insertion, and provider I/O off the response path prevents response-shape and
-    timing-based account enumeration. The route never sets a session cookie itself; only `GET /auth/confirm`
-    (`redeemMagicToken`) does that, once the link is clicked. The login form only offers this option
-    when `magicLinkAvailable()` (`lib/auth/mailer`) is true — `APP_URL` set AND a mail provider
-    configured — since a link can't work without a stable domain to build it against or anything to
-    deliver it with; the route itself stays reachable regardless (degrades to the mailer's existing
-    dev-log/drop-silently behavior without a provider). `issueMagicToken`/
-    `redeemMagicToken` also back the admin-CLI one-time-login-link tool (`scripts/admin.ts
-login-link`).
+    returns the same 200 `{ ok: true }` response for every syntactically valid email (per-IP
+    rate-limited, `magic-link:<ip>`, 5/min → 429). After the response finishes, recognized emails get
+    a single-use token issued and emailed (`issueMagicToken`/`sendMagicLink`); unknown emails stop
+    after the member lookup. Moving the lookup, token insertion, and provider I/O off the response
+    path removes the response-shape enumeration oracle (and any first-order timing difference). The
+    emailed link is always built against the trusted `APP_URL` (`appBaseUrl()`), never the spoofable
+    request `Host`; with no `APP_URL` set the after-job no-ops (nothing safe to send). The route never
+    sets a session cookie itself; only `GET /auth/confirm` (`redeemMagicToken`) does that, once the
+    link is clicked. The login form only offers this option when `magicLinkAvailable()`
+    (`lib/auth/mailer`) is true — `APP_URL` set AND a mail provider configured — since a link can't
+    work without a stable domain to build it against or anything to deliver it with; the route itself
+    stays reachable regardless. `issueMagicToken`/`redeemMagicToken` also back the admin-CLI
+    one-time-login-link tool (`scripts/admin.ts login-link`).
   - Either mechanism's **first** successful login (an invite's first activation) routes through
     `/auth/welcome` — name, team, and inviter (resolved from the append-only `audit_log`, no
     `invited_by` column needed) — before landing on the dashboard; magic-link-only accounts can
@@ -210,11 +211,17 @@ login-link`).
   are rejected with **422** at the API and never reach the database.
 
 **Uniform magic-link response.** `POST /api/auth/request-magic-link` returns 200 `{ ok: true }` for
-every syntactically valid email. It schedules member lookup, token issuance, and delivery with
-Next.js `after()`, so recognized and unknown emails share the same response path and cannot be
-distinguished through status, payload, or provider/DB latency. Invalid payloads still return 422.
-`POST /api/auth/login` likewise keeps a uniform 401 `invalid_credentials` response for every
-credential failure.
+every syntactically valid email (invalid payloads still return 422; per-IP flooding returns 429). It
+schedules member lookup, token issuance, and delivery with Next.js `after()`, so recognized and
+unknown emails share the same response **shape** — verified over a real socket in
+`test/http/auth.http.test.ts` (both the unknown- and known-email cases return the identical 200 body
+and set no cookie). Because all DB/provider I/O runs off the response path, there is no first-order
+timing difference either; note that timing uniformity is a property of `after()` deferral, not
+something a test asserts on wall-clock latency, and an attacker with mail-provider-side visibility can
+still observe that a send happens only for recognized emails (inherent to any email-delivery flow).
+The emailed link is built only from the trusted `APP_URL`, never the request `Host`. `POST
+/api/auth/login` likewise keeps a uniform 401 `invalid_credentials` response for every credential
+failure.
 
 ## Key flows
 
@@ -675,7 +682,7 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 - `DELETE /api/dashboard/conversations/:id` — soft-archive a thread (owner-only)
 - `GET /api/dashboard/team-work` — dashboard "Working On": per-person summary (narrative arcs) + open tasks + recent accomplishments; session-authed; tier-scoped
 - `POST /api/auth/login` — email+password sign-in, the DEFAULT path (invite-only; uniform 401 on any failure)
-- `POST /api/auth/request-magic-link` — OPTIONAL secondary sign-in: uniform 200 for every syntactically valid email; recognized emails get a single-use magic link issued + emailed after the response; never sets a session cookie itself; the login form only offers it when `magicLinkAvailable()` (a domain + mail provider are configured)
+- `POST /api/auth/request-magic-link` — OPTIONAL secondary sign-in: uniform 200 for every syntactically valid email (per-IP rate-limited, 429 on flood); recognized emails get a single-use magic link issued + emailed after the response, built against the trusted `APP_URL`; never sets a session cookie itself; the login form only offers it when `magicLinkAvailable()` (a domain + mail provider are configured)
 - `GET /api/dashboard/social/media/:id` — serve a generated image's bytes (session-authed, admin-only; team resolved from the asset)
 
 <!-- /drift:routes -->
