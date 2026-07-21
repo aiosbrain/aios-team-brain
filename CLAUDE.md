@@ -26,6 +26,26 @@ who reads it**. The map only pays off if it's trustworthy, so:
 
 ---
 
+## ⚠️ Review gate — ALWAYS Fable-review before pushing a PR (REQUIRED)
+
+Many sessions/worktrees ship into this repo in parallel and merge fast — **a Fable review is the
+pre-merge safety net** that catches tier leaks, sync-contract drift, and correctness bugs the async
+bots (CodeRabbit/Cursor) miss. It is **not optional**.
+
+- **Before you `git push` a PR branch:** run a Fable review of the branch diff — spawn the
+  **`code-reviewer` agent on the Fable model** (`Agent(subagent_type: "code-reviewer", model: "fable")`)
+  pointed at `git diff origin/main...HEAD`. Give it the change's intent and let it apply the AIOS
+  invariants (this file + the agent's own checklist).
+- **Address its findings first.** Fix every blocker/HIGH; fix or consciously defer MEDIUM/LOW with a
+  one-line reason. Only push once Fable's verdict is *sound / ship it* (or its blockers are resolved).
+- **Record it in the PR body** — a short `## Review — Reviewed by **Fable** — verdict …` line (with the
+  findings it caught + how you resolved them), so it's auditable which PRs were Fable-reviewed and
+  which weren't. Absence of that line means the gate was skipped.
+- Fable reviews the **diff you're about to ship**, not the bots' comments — it adds its own analysis.
+  This is in addition to CI and the async bot reviews, never a replacement.
+
+---
+
 ## 2. Four operating principles (internalize these)
 
 1. **Spec-first testing, never characterization-first.** Write the assertion from what the
@@ -145,8 +165,18 @@ bash scripts/e2e.sh    # system-level integration: seed → push → materialize
   against prod for any schema change, and **confirm the platform started a new build** (`railway deployment
   list`; CI webhooks can be silently dropped) — re-trigger via the Railway dashboard if the latest deploy
   predates the merge.
+- **Inspecting the prod DB (read-only, for diagnostics).** The internal `DATABASE_URL`
+  (`postgres.railway.internal`) is unreachable from a laptop; use the **public TCP proxy** the Railway
+  Postgres service exposes. Always confirm `railway status` shows **Project: AIOS** first, then:
+  ```bash
+  PUBURL=$(railway variables -s Postgres --json | python3 -c "import sys,json;print(json.load(sys.stdin)['DATABASE_PUBLIC_URL'])")
+  psql "$PUBURL" -c "select count(*) from members;"     # e.g. host thomas.proxy.rlwy.net:33781
+  ```
+  This is the same DB the app uses (self-host = one Postgres). **Read-only for diagnosis** — do NOT
+  run schema loads or migrations through it (that's `npm run pg:schema` as the deploy step). Treat any
+  write as production data mutation: confirm with the user first.
 - **⛔ NEVER run `railway up` / `railway redeploy` / `railway down` / `railway delete`.** The Railway CLI is
-  **read-only** here (`status`, `logs`, `variables`, `deployment list`). `railway up` deploys the current
+  **read-only** here (`status`, `logs`, `variables`, `deployment list`, `connect`). `railway up` deploys the current
   worktree's code to whatever project that directory is *linked* to (`~/.railway/config.json`, keyed by
   absolute path) — and a Conductor worktree that drifted to the wrong link (an aios worktree linked to the
   **Kula** project) once shipped this repo's code into Kula and took it down. The GitHub-merge path is bound

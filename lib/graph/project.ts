@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import type { DbClient } from "@/lib/db/types";
 import { GraphitiClient, type GraphEpisode } from "./graphiti-client";
 import { episodeGroupId, type AccessTier } from "./group";
+import { episodeName, itemIdFromEpisodeName } from "./episode-name";
 
 /**
  * Brain → Graphiti projector. Reads already-normalized, tier-tagged rows from the brain (`items` —
@@ -18,15 +19,63 @@ import { episodeGroupId, type AccessTier } from "./group";
 const SOURCE_TABLE = "items";
 
 /**
- * Max episode content length pushed to Graphiti. getzep's ingest worker has NO per-job exception
- * handling (`graph_service/routers/ingest.py` catches only `CancelledError`), so ANY exception from
- * `add_episode` permanently kills the worker and wedges the whole queue. A large episode whose
- * entity/edge extraction overflows the LLM's output-token cap raises exactly such an exception (seen
- * in prod 2026-06-25 and again 2026-07-03: `Output length exceeded max tokens 8192`). Capping content
- * keeps extraction output well under that limit. Full item text still lives in `items`/pgvector/FTS —
- * only the graph episode is truncated (affects a handful of outlier docs; median item is ~240 chars).
+ * Graphiti extracts entities/edges from each episode with its OWN LLM, and that call's OUTPUT is
+ * hard-capped (graphiti_core `DEFAULT_MAX_TOKENS`; 16384 on the patched image — gpt-4o's ceiling, can't
+ * go higher). A dense episode whose extraction output overflows that cap raises `Output length exceeded
+ * max tokens` in `resolve_extracted_nodes`, so it's accepted (202) but never becomes facts — the item's
+ * work then never appears in the graph or narrative arcs (prod 2026-06/07). Truncating to fit LOSES
+ * content, so instead we CHUNK: a large item is projected as several small episodes (`items:<id>#0`,
+ * `#1`, …), each ≤ `CHUNK_CHARS`, preserving all content while keeping every episode extractable.
+ * `MAX_EPISODE_CHUNKS` caps a pathologically huge item (full text still lives in `items`/pgvector/FTS
+ * regardless; median item ~240 chars = a single chunk, unchanged from before). Both env-tunable. See
+ * the "202 ≠ extracted" note in docs/ARCHITECTURE.md.
  */
-export const MAX_EPISODE_CHARS = 6000;
+/**
+ * Parse a positive-integer env knob, falling back to `fallback` on anything malformed. A bad
+ * `GRAPH_CHUNK_CHARS`/`GRAPH_MAX_EPISODE_CHUNKS` must NOT silently break projection: `Number("")` is 0
+ * and `Number("abc")` is NaN. A 0/NaN chunk SIZE makes `chunkContent` emit empty-content episodes; a
+ * 0/NaN chunk CAP makes it emit none — either way the projector "succeeds" feeding the graph nothing
+ * (or garbage). `Math.floor` also closes the fractional hole (0.5 → 0). Pure + exported, unit-tested.
+ */
+export function resolvePositiveInt(raw: unknown, fallback: number): number {
+  const n = Math.floor(Number(raw));
+  return Number.isFinite(n) && n >= 1 ? n : fallback;
+}
+export const CHUNK_CHARS = resolvePositiveInt(process.env.GRAPH_CHUNK_CHARS, 2500);
+export const MAX_EPISODE_CHUNKS = resolvePositiveInt(process.env.GRAPH_MAX_EPISODE_CHUNKS, 16);
+
+/**
+ * "When it happened" for an episode: prefer the item's own `source_ts`, but only if it actually parses.
+ * A present-but-garbage `source_ts` must fall back to `synced_at` (always a real timestamptz), NOT to
+ * graphiti-client's last-resort now() — otherwise an old/undated doc gets stamped "today" and floats to
+ * the top of the recency-ranked arcs (rankArcs). (Locale-ambiguous strings like "09/07/2026" still parse
+ * — wrongly — under JS Date; we can't disambiguate DD/MM here, so connectors should emit ISO.) Pure +
+ * exported for tests.
+ */
+export function pickEpisodeTimestamp(sourceTs: unknown, syncedAt: string): string {
+  const raw = typeof sourceTs === "string" ? sourceTs : syncedAt;
+  return Number.isNaN(new Date(raw).getTime()) ? syncedAt : raw;
+}
+
+/**
+ * Split an item's body into ≤ `maxChunks` chunks of ≤ `chunkChars` each, preserving every character
+ * (content beyond `chunkChars * maxChunks` is dropped — a runaway-size backstop, not the common path).
+ * Whitespace-only bodies yield `[]` (nothing to extract). Pure + unit-tested; the chunk boundaries are
+ * deterministic so the content hash (taken over the full body) stays stable across runs.
+ */
+export function chunkContent(body: string, chunkChars = CHUNK_CHARS, maxChunks = MAX_EPISODE_CHUNKS): string[] {
+  const text = body ?? "";
+  if (!text.trim()) return [];
+  // Clamp the params too (not just the env at module load) so a direct caller passing 0/NaN can't
+  // emit empty/garbage chunks or stall the loop — belt-and-suspenders around the same landmine.
+  const size = resolvePositiveInt(chunkChars, CHUNK_CHARS);
+  const cap = resolvePositiveInt(maxChunks, MAX_EPISODE_CHUNKS);
+  const chunks: string[] = [];
+  for (let i = 0; i < text.length && chunks.length < cap; i += size) {
+    chunks.push(text.slice(i, i + size));
+  }
+  return chunks;
+}
 
 /** Item kinds worth projecting as graph episodes — content-bearing knowledge, not raw config.
  * `skill`/`blueprint` are configuration manifests, not events/knowledge, so they're excluded. */
@@ -67,36 +116,37 @@ function sha(content: string): string {
 }
 
 /**
- * Resolve our stable episode `name` to Graphiti's server-assigned uuid within `groupId`, then
- * delete it. `/messages` is fire-and-forget and never returns a uuid, so this is the only way to
- * target a specific episode for deletion (audit M6). A no-op if the episode isn't found (already
- * gone, or the async worker never got to it) — the caller treats this as best-effort.
+ * Delete ALL of an item's episodes (every chunk: `items:<id>` and `items:<id>#k`) from `groupId`.
+ * `/messages` is fire-and-forget and never returns a uuid, so we resolve names→uuids via
+ * `listEpisodes` (audit M6). Best-effort: a chunk the async worker never created just isn't found.
  */
-export async function deleteEpisodeByName(
-  client: GraphitiClient,
-  groupId: string,
-  name: string
-): Promise<void> {
+export async function deleteItemEpisodes(client: GraphitiClient, groupId: string, itemId: string): Promise<void> {
   const episodes = await client.listEpisodes(groupId);
-  const match = episodes.find((e) => e.name === name);
-  if (match) await client.deleteEpisode(match.uuid);
+  for (const e of episodes) {
+    if (itemIdFromEpisodeName(e.name) === itemId) await client.deleteEpisode(e.uuid);
+  }
 }
 
-/** Episode content + provenance from an item, labeled by kind. */
-function toEpisode(item: ItemRow): GraphEpisode {
+/**
+ * The episode(s) + provenance for an item, labeled by kind. A normal item → ONE episode (plain
+ * `items:<id>` name, unchanged from before); a large item → SEVERAL chunk episodes (`items:<id>#k`,
+ * each ≤ CHUNK_CHARS, "(part k/N)" in the description) so every chunk stays under Graphiti's extraction
+ * cap. Empty body → `[]` (skipped upstream — nothing to extract).
+ */
+function toEpisodes(item: ItemRow): GraphEpisode[] {
   const fm = item.frontmatter ?? {};
   const title = typeof fm.title === "string" ? fm.title : undefined;
   const url = typeof fm.source_url === "string" ? fm.source_url : undefined;
-  const ts = typeof fm.source_ts === "string" ? fm.source_ts : item.synced_at; // when it happened
+  const ts = pickEpisodeTimestamp(fm.source_ts, item.synced_at); // when it happened (see helper)
   const label = KIND_LABEL[item.kind] ?? "Item";
-  return {
-    // Cap content so a large episode can't overflow extraction and wedge getzep's worker (see
-    // MAX_EPISODE_CHARS). The content hash is taken over this capped value, so idempotency holds.
-    content: (item.body ?? "").slice(0, MAX_EPISODE_CHARS),
+  const chunks = chunkContent(item.body ?? "");
+  const total = chunks.length;
+  return chunks.map((content, i) => ({
+    content,
     timestamp: ts,
-    sourceDescription: `${label} — ${title ?? item.path}${url ? ` (${url})` : ""}`,
-    name: `${SOURCE_TABLE}:${item.id}`,
-  };
+    sourceDescription: `${label} — ${title ?? item.path}${total > 1 ? ` (part ${i + 1}/${total})` : ""}${url ? ` (${url})` : ""}`,
+    name: episodeName(item.id, i, total),
+  }));
 }
 
 /**
@@ -135,12 +185,14 @@ export async function projectItemsToGraph(
   let projected = 0;
   let skipped = 0;
   for (const item of rows) {
-    const episode = toEpisode(item);
-    if (!episode.content.trim()) {
+    const episodes = toEpisodes(item);
+    if (episodes.length === 0) {
       skipped++;
-      continue; // nothing to extract
+      continue; // empty body → nothing to extract
     }
-    const contentSha = sha(episode.content);
+    // Idempotency key = the FULL body (chunk boundaries derive deterministically from it), so an
+    // unchanged item is a no-op regardless of how many chunks it splits into.
+    const contentSha = sha(item.body ?? "");
     const groupId = episodeGroupId(args.teamSlug, item.access);
 
     const { data: existing } = await db
@@ -157,15 +209,15 @@ export async function projectItemsToGraph(
       continue; // unchanged content, same tier → no-op (idempotent)
     }
 
-    // Audit M6: a tier reclassification (e.g. external→team) must not leave the old episode
-    // searchable in the old group forever — delete it there before projecting into the new group.
-    // Best-effort: Graphiti's async worker may not have created the node yet, or it may already be
-    // gone; either way we still proceed with the new-group push so projection isn't blocked on it.
+    // Audit M6: a tier reclassification (e.g. external→team) must not leave the old episodes
+    // searchable in the old group forever — delete ALL the item's chunks there before projecting into
+    // the new group. Best-effort: the async worker may not have created a node yet, or it's already
+    // gone; either way we proceed with the new-group push so projection isn't blocked on it.
     if (tierChanged && existingRow) {
-      await deleteEpisodeByName(client, existingRow.group_id, episode.name!).catch(() => {});
+      await deleteItemEpisodes(client, existingRow.group_id, item.id).catch(() => {});
     }
 
-    await client.addEpisodes(groupId, [episode]);
+    await client.addEpisodes(groupId, episodes);
 
     await db.from("graph_episodes").upsert(
       {

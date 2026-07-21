@@ -1,7 +1,7 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
-import { buildIdentityMap, resolveByProviderId, resolveMember, type IdentityMap } from "@/lib/identity/resolve";
-import { parseAuthorIdentity } from "@/lib/codebases/commits-to-items";
+import { buildIdentityMap } from "@/lib/identity/resolve";
+import { resolveItemAuthorMember } from "@/lib/attribution/resolve-authors";
 
 /**
  * Re-attribute existing items to the CURRENT identity mappings. `ingestItem` only stamps
@@ -25,32 +25,20 @@ export interface ReattributeSummary {
   updated: number;
 }
 
-/** Resolve the author member for one item from its frontmatter, by source. Null when not resolvable. */
-function resolveItemAuthor(idMap: IdentityMap, fm: Record<string, unknown>): string | null {
-  const s = (k: string): string => (typeof fm[k] === "string" ? (fm[k] as string) : "");
-  switch (s("source")) {
-    case "slack":
-      return resolveByProviderId(idMap, "slack", s("author_id"));
-    case "linear":
-      return resolveByProviderId(idMap, "linear", s("assignee_id"));
-    case "plane":
-      return resolveByProviderId(idMap, "plane", s("assignee_id"));
-    case "git":
-      return resolveMember(idMap, parseAuthorIdentity(s("author")));
-    default:
-      return null;
-  }
-}
-
 export async function reattributeItems(
   db: DbClient,
   teamId: string
 ): Promise<ReattributeSummary> {
   const idMap = await buildIdentityMap(db, teamId);
+  // EXCLUDE external-tier rows. Frontmatter is free-form on the wire, so an external (client) key can
+  // push an item whose frontmatter names a team member; the ingest route already refuses to resolve
+  // author for external keys (keeps actor attribution), and this batch must not become the way back in
+  // — re-resolving that frontmatter here would attribute the client's content to the named team member.
   const { data: items } = await db
     .from("items")
     .select("id, member_id, frontmatter")
-    .eq("team_id", teamId);
+    .eq("team_id", teamId)
+    .neq("access", "external");
   const { data: connectors } = await db
     .from("members")
     .select("id")
@@ -66,7 +54,7 @@ export async function reattributeItems(
 
   let updated = 0;
   for (const it of rows) {
-    const resolved = resolveItemAuthor(idMap, it.frontmatter ?? {});
+    const resolved = resolveItemAuthorMember(idMap, it.frontmatter ?? {}, connectorIds);
     if (resolved && resolved !== it.member_id) {
       const { error } = await db.from("items").update({ member_id: resolved }).eq("id", it.id);
       if (error) throw new Error(`reattribute item ${it.id}: ${error.message}`);

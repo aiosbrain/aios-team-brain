@@ -7,7 +7,7 @@ import { adminClient } from "@/lib/db/admin";
 import { recentFacts, resolveEpisodeItems, type AtomicFact } from "./learning";
 import { GraphitiClient } from "./graphiti-client";
 import { episodeGroupId, type AccessTier } from "./group";
-import { attributeParticipants, attributedFactTexts } from "./arc-attribution";
+import { attributeParticipants, attributedFactTexts, withEvidenceParticipants } from "./arc-attribution";
 import { resolveHumanActorsByItem } from "./human-actors";
 import { readArcCache, writeArcCache } from "./arc-cache";
 
@@ -48,17 +48,58 @@ export interface ArcCorrection {
 /** Full backend keys — resolve via `lib/query/answering.resolveAnsweringKeys` at the call site. */
 export type ProviderKeys = LlmBackendKeys;
 
-const WINDOW_DAYS = 7;
 const MAX_FACTS = 200;
+// HARD ceiling on arcs parsed from the model. The count actually REQUESTED is derived per-synthesis
+// from the number of distinct contributors (see `arcsRequested`), so a varied team isn't pinned to a
+// flat 8 — one person working six distinct threads can get six arcs instead of one merged blob.
+const MAX_ARCS = 12;
+// Fetch a MUCH deeper pool than we feed the model, so a lower-volume contributor's facts are reachable
+// for balancing. Measured too shallow at MAX_FACTS*6 (1200): one high-volume contributor held 84% of
+// the newest-1200 and everyone below the cut fell off the cliff BEFORE balancing could run. A deeper
+// pool + a per-item cap keeps the whole active team reachable.
+const FACT_POOL = MAX_FACTS * 20;
+// Cap the facts any ONE source item contributes to a person's balanced share, BEFORE balancing — so a
+// single huge document (a 257k-char ARCHITECTURE.md extracted into 159 facts) can't BE its author's
+// entire representation and bury their actual varied work.
+const PER_ITEM_CAP = 20;
 const CACHE_TTL_MS = 10 * 60_000;
+// How long the empty-clobber guard keeps trusting a prior non-empty arc set. Within this window an
+// empty synthesis is treated as a transient failure (keep the prior); beyond it, a persistently-empty
+// result is accepted as genuine so the panel can't be pinned to ancient arcs forever (Fable review).
+const EMPTY_CLOBBER_MAX_AGE_MS = (() => {
+  // Guard the parse: a garbage/empty env yields NaN/0, and `ageMs < NaN` is always false → EVERY empty
+  // synthesis would clobber, silently reverting the incident fix. Fall back unless it's finite and >0.
+  const n = Number(process.env.ARCS_EMPTY_CLOBBER_MAX_AGE_MS);
+  return Number.isFinite(n) && n > 0 ? n : 48 * 60 * 60_000;
+})();
 
-const SYSTEM_PROMPT =
-  "You are analyzing a team knowledge graph. Identify 3-5 active narrative arcs — ongoing storylines " +
-  "about what this team is working through. Each fact below is numbered [F1], [F2], … — for every arc, " +
-  "cite the 2-5 fact numbers that support it in `supporting_facts`. Return ONLY a JSON object of the form " +
-  '{"arcs":[{"title":"short","confidence":"high|medium|low","summary":"2-3 sentences, present tense, ' +
-  'specific","participants":["names"],"supporting_facts":[1,2,3]}]}. Use only fact numbers that appear ' +
-  "below. No prose, no markdown code fences — the raw JSON object only.";
+/** Requested arc count for one synthesis: scale with the number of distinct contributors in the
+ *  balanced facts (≈2 arcs each) so a varied, multi-person team isn't pinned to a flat number —
+ *  floored at 6, capped at MAX_ARCS. Pure + unit-tested. */
+export function arcsRequested(contributorCount: number): number {
+  return Math.min(MAX_ARCS, Math.max(6, 2 * contributorCount));
+}
+
+/** The synthesis system prompt, parameterized by how many arcs to request. Explicitly instructs the
+ *  model to split ONE contributor's distinct workstreams into separate arcs (the fix for a person's
+ *  varied work collapsing into a single arc) rather than merging them. */
+function buildSystemPrompt(requested: number): string {
+  return (
+    `You are analyzing a team knowledge graph. Identify up to ${requested} active narrative arcs — ongoing ` +
+    "storylines about what this team is working through. Favor RECENT activity and give every active " +
+    "contributor visible representation — don't let one person's arcs crowd out others who've been " +
+    "working. If ONE contributor's facts span multiple DISTINCT workstreams (e.g. social vs security vs " +
+    "meetings vs graph vs performance), produce a SEPARATE arc per workstream — never merge one person's " +
+    "unrelated efforts into a single arc. Each fact below is numbered [F1], [F2], … — for every arc, cite " +
+    "the 2-5 fact numbers that support it in `supporting_facts`. A parenthesized name at the START of a " +
+    'fact — e.g. "(Chetan) …" — is the human RESPONSIBLE for that work (it may not appear in the fact ' +
+    "text itself): include those humans in `participants` for every arc citing their facts. Never invent " +
+    "names not present in the facts or their attributions. Return ONLY a JSON object of the form " +
+    '{"arcs":[{"title":"short","confidence":"high|medium|low","summary":"2-3 sentences, present tense, ' +
+    'specific","participants":["names"],"supporting_facts":[1,2,3]}]}. Use only fact numbers that appear ' +
+    "below. No prose, no markdown code fences — the raw JSON object only."
+  );
+}
 
 function stableId(title: string): string {
   return "arc-" + createHash("sha256").update(title.trim().toLowerCase()).digest("hex").slice(0, 10);
@@ -78,6 +119,135 @@ export function stripTaskKeys(text: string): string {
     .replace(/\(\s*\)/g, "") // empty parens left behind
     .replace(/\s{2,}/g, " ")
     .trim();
+}
+
+/** Group items by a string key, preserving first-seen order of both the keys and each key's members.
+ *  Pure — the shared primitive under both balancing levels. */
+function groupByKey<T>(items: T[], key: (t: T) => string): T[][] {
+  const buckets = new Map<string, T[]>();
+  for (const it of items) {
+    const k = key(it);
+    const arr = buckets.get(k);
+    if (arr) arr.push(it);
+    else buckets.set(k, [it]);
+  }
+  return [...buckets.values()];
+}
+
+/** Interleave a set of buckets one-per-bucket-per-round until `budget` is filled or all exhaust,
+ *  preserving each bucket's internal order. Pure. */
+function roundRobin<T>(buckets: T[][], budget: number): T[] {
+  const out: T[] = [];
+  for (let round = 0; out.length < budget; round++) {
+    let progressed = false;
+    for (const b of buckets) {
+      if (out.length >= budget) break;
+      if (round < b.length) {
+        out.push(b[round]);
+        progressed = true;
+      }
+    }
+    if (!progressed) break; // every bucket exhausted
+  }
+  return out;
+}
+
+/**
+ * Balance a fact pool ACROSS its contributors so synthesis input represents everyone active — not just
+ * whoever pushed the most recent volume (the #303 fix). Group by the human behind each fact and
+ * round-robin one-per-contributor per round (each person's facts newest-first) until `budget` is
+ * filled. Unattributed facts ("") are their own bucket. Pure; `humanOf` injected so DB/Neo4j resolution
+ * stays in the caller. Superseded by `balanceFacts` in the synthesis path (kept for direct callers/tests).
+ */
+export function balanceFactsByContributor<T>(facts: T[], humanOf: (f: T) => string, budget: number): T[] {
+  return roundRobin(groupByKey(facts, humanOf), budget);
+}
+
+/**
+ * Two-level balance — contributor → item. Round-robining by contributor alone is blind to a person
+ * whose facts are dominated by ONE giant document: a 257k-char ARCHITECTURE.md extracted into 159 facts
+ * would fill that author's entire balanced share and bury their actual varied work. So within each
+ * contributor we FIRST cap every source item at `perItemCap` and interleave the person's facts ACROSS
+ * their items, THEN round-robin across contributors. The result: each person's slice is a diverse spread
+ * of their real items, and no single doc can be someone's whole story. Pure; `itemOf` returns a stable
+ * per-item key ("" when unresolved — those share one bucket, matching the unattributed convention).
+ */
+export function balanceFacts<T>(
+  facts: T[],
+  humanOf: (f: T) => string,
+  itemOf: (f: T) => string,
+  budget: number,
+  perItemCap = Infinity
+): T[] {
+  const perContributor = groupByKey(facts, humanOf).map((hb) => {
+    const items = groupByKey(hb, itemOf).map((ib) =>
+      perItemCap === Infinity ? ib : ib.slice(0, perItemCap)
+    );
+    // Reorder this contributor's (capped) facts interleaved by item, so item diversity leads.
+    return roundRobin(items, Number.POSITIVE_INFINITY);
+  });
+  return roundRobin(perContributor, budget);
+}
+
+/**
+ * Drop facts that add no signal before they're numbered into the prompt: (1) self-referential noise
+ * where subject === object (Graphiti's "user is a duplicate of user" bookkeeping — a defense-in-depth
+ * backstop even though `recentFacts` already filters `IS_DUPLICATE_OF` at the query), and (2) exact
+ * repeats of an already-seen fact text (keep the first = newest, since the pool is newest-first). Each
+ * duplicate would otherwise consume a numbered slot and hand the model redundant input. Pure + tested.
+ */
+export function dedupeFacts(facts: AtomicFact[]): AtomicFact[] {
+  const seen = new Set<string>();
+  const out: AtomicFact[] = [];
+  for (const f of facts) {
+    const subj = (f.subject ?? "").trim().toLowerCase();
+    const obj = (f.object ?? "").trim().toLowerCase();
+    if (subj && subj === obj) continue; // self-referential noise
+    const key = (f.fact ?? "").trim().toLowerCase().replace(/\s+/g, " ");
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(f);
+  }
+  return out;
+}
+
+const CONFIDENCE_WEIGHT: Record<NarrativeArc["confidence"], number> = { high: 3, medium: 2, low: 1 };
+
+/** The newest dated evidence timestamp in an arc (ms), or -Infinity if it cites no dated evidence.
+ *  This is the arc's "recency" — how recently the work it describes actually happened. Pure. */
+export function newestEvidenceAt(arc: NarrativeArc): number {
+  let max = -Infinity;
+  for (const e of arc.evidence) {
+    if (!e.at) continue;
+    const t = Date.parse(e.at);
+    if (!Number.isNaN(t) && t > max) max = t;
+  }
+  return max;
+}
+
+/**
+ * Order arcs for display by RECENCY then RELEVANCE, so a contributor's recent work surfaces above
+ * stale storylines instead of being buried under whoever was loudest weeks ago:
+ *   1. newest cited evidence first (recency — arcs with no dated evidence sort last),
+ *   2. then confidence high→low (relevance),
+ *   3. then more supporting evidence first (depth),
+ *   4. stable on the model's original order as the final tiebreak.
+ * Pure + unit-tested.
+ */
+export function rankArcs(arcs: NarrativeArc[]): NarrativeArc[] {
+  return arcs
+    .map((arc, i) => ({ arc, i }))
+    .sort((a, b) => {
+      const ra = newestEvidenceAt(a.arc);
+      const rb = newestEvidenceAt(b.arc);
+      if (rb !== ra) return rb - ra; // recency desc
+      const ca = CONFIDENCE_WEIGHT[a.arc.confidence];
+      const cb = CONFIDENCE_WEIGHT[b.arc.confidence];
+      if (cb !== ca) return cb - ca; // confidence desc
+      if (b.arc.evidence.length !== a.arc.evidence.length) return b.arc.evidence.length - a.arc.evidence.length;
+      return a.i - b.i; // stable
+    })
+    .map((x) => x.arc);
 }
 
 /** Options for `parseArcsJson`: the numbered facts + episode→item map used to resolve cited evidence. */
@@ -124,7 +294,7 @@ function buildEvidence(
 }
 
 /**
- * Parse + normalize the LLM's JSON into safe arcs: caps at 5, coerces confidence, defaults missing
+ * Parse + normalize the LLM's JSON into safe arcs: caps at MAX_ARCS, coerces confidence, defaults missing
  * fields, assigns a stable id from the title, stamps `derived_at`, and resolves cited `supporting_facts`
  * indices → verifiable `evidence` (falls back to any free-text `supporting_sources` as unlinked
  * evidence). Returns [] on malformed input. Pure + exported so the fragile parsing is unit-tested.
@@ -137,7 +307,7 @@ export function parseArcsJson(raw: string | null, opts: ParseArcsOptions = {}): 
       arcs?: (Partial<NarrativeArc> & { supporting_facts?: unknown })[];
     };
     if (!Array.isArray(obj.arcs)) return [];
-    return obj.arcs.slice(0, 5).map((a) => {
+    return obj.arcs.slice(0, MAX_ARCS).map((a) => {
       const supporting_sources = Array.isArray(a.supporting_sources) ? a.supporting_sources.map(String) : [];
       const cited = buildEvidence(a.supporting_facts, facts, epToItem);
       // Fall back to free-text sources (unlinked) if the model didn't cite fact numbers.
@@ -187,10 +357,31 @@ function extractJsonObject(raw: string): string {
  *  outage or a stale model id must degrade to "no arcs" instead of failing the whole request). Routes
  *  through the shared settings-aware primitive, so arcs honor the team's answering-provider (incl.
  *  OpenRouter) exactly like the Query box. */
-async function callLLMRaw(userContent: string, keys: ProviderKeys): Promise<string | null> {
+async function callLLMRaw(
+  system: string,
+  userContent: string,
+  keys: ProviderKeys,
+  record?: { db: DbClient; teamId: string }
+): Promise<string | null> {
   return completeTextOrNull(
-    { system: SYSTEM_PROMPT, prompt: userContent },
-    { keys, jsonObject: true, maxTokens: 2048 }
+    { system, prompt: userContent },
+    {
+      keys,
+      jsonObject: true,
+      // Arc synthesis reasons over ~200 facts to find storylines — the one task that genuinely
+      // benefits from a reasoning model. Route it to the team's reasoning model (falls back to the
+      // query model when unset), with reasoning left ON and extra headroom for it.
+      role: "reasoning",
+      maxTokens: 4096,
+      // A reasoning model reasoning over ~200 facts routinely needs far more than completeText's 30s
+      // default — at 30s the call was aborted (timeout) and arcs came back empty. 110s covers the
+      // observed latency while staying under the route's 120s maxDuration; the fire-and-forget
+      // background refresh (SWR) isn't route-bound, so it can use the full window.
+      timeoutMs: 110_000,
+      // Record the outcome so a broken answering model (e.g. a reasoning model returning empty) shows
+      // as "degraded" on the dashboard instead of silently blanking the Learning page.
+      record: record ? { db: record.db, teamId: record.teamId, task: "arcs" } : undefined,
+    }
   );
 }
 
@@ -221,17 +412,23 @@ function humansForItems(itemIds: (string | undefined)[], humanByItem: Map<string
   ];
 }
 
-/** Rewrite each arc's `participants` to tag recognized AI-agent names with the human(s) behind that
- *  arc's own evidence items (never cross-arc — an arc's attribution must trace to ITS OWN work).
- *  Pure over an already-resolved `humanByItem` map — no DB access here. */
+/** Attribute each arc's `participants` from its OWN evidence (never cross-arc — an arc's attribution
+ *  must trace to ITS OWN work): first tag recognized AI-agent names with the human(s) behind the
+ *  evidence items, then UNION in any evidence human the model didn't name (`withEvidenceParticipants`)
+ *  — so a contributor whose facts an arc cites is on the chip even when their name never appears in
+ *  the fact text (commit-shaped work), and an arc the model returned with `participants: []` still
+ *  names the people it's actually about. Pure over an already-resolved `humanByItem` map. */
 function attributeArcs(arcs: NarrativeArc[], humanByItem: Map<string, string>): NarrativeArc[] {
-  return arcs.map((arc) => ({
-    ...arc,
-    participants: attributeParticipants(
-      arc.participants,
-      humansForItems(arc.evidence.map((e) => e.itemId), humanByItem)
-    ),
-  }));
+  return arcs.map((arc) => {
+    const evidenceHumans = humansForItems(arc.evidence.map((e) => e.itemId), humanByItem);
+    return {
+      ...arc,
+      participants: withEvidenceParticipants(
+        attributeParticipants(arc.participants, evidenceHumans),
+        evidenceHumans
+      ),
+    };
+  });
 }
 
 /**
@@ -249,16 +446,64 @@ async function synthesizeArcs(
   correctionTexts: string[],
   keys: ProviderKeys
 ): Promise<NarrativeArc[]> {
-  const since = new Date(Date.now() - WINDOW_DAYS * 86_400_000).toISOString();
-  const facts = await recentFacts(groups, since, MAX_FACTS);
+  // Arcs are NOT time-boxed — synthesize from the most-recent facts regardless of age (a quiet week,
+  // or a stalled projector, must not blank the panel). `null` = no window. Fetch a DEEP pool (not just
+  // MAX_FACTS), so we can balance it across contributors — otherwise the globally-newest MAX_FACTS are
+  // dominated by whoever pushed the most volume and everyone else's work is invisible in Learning.
+  // Dedupe the raw pool up front — drops exact-repeat fact texts and self-referential noise so neither
+  // balancing counts nor prompt slots are wasted on redundant/garbage facts.
+  const pool = dedupeFacts(await recentFacts(groups, null, FACT_POOL));
   // No facts and nothing to correct → nothing to synthesize. (A correction with no facts still runs
   // the LLM, preserving the pre-cache recompute behavior.)
-  if (facts.length === 0 && correctionTexts.length === 0) return [];
-  const epToItem = await resolveEpisodeItems(groups, facts.flatMap((f) => f.episodeUuids));
+  if (pool.length === 0 && correctionTexts.length === 0) return [];
+  // Resolve attribution for the WHOLE pool (higher uuid cap to match) so balancing sees each fact's
+  // human. epToItem/humanByItem stay supersets of the balanced set — safe for evidence + attribution.
+  const epToItem = await resolveEpisodeItems(groups, pool.flatMap((f) => f.episodeUuids), FACT_POOL * 3);
   const allItemIds = [...new Set([...epToItem.values()].map((v) => v.itemId).filter((id): id is string => !!id))];
   const humanByItem = await resolveHumanActorsByItem(db, teamId, allItemIds);
-  const raw = await callLLMRaw(buildPrompt(attributedFactTexts(facts, epToItem, humanByItem), correctionTexts), keys);
-  return attributeArcs(parseArcsJson(raw, { facts, epToItem }), humanByItem);
+  // Resolve a fact's (item, human) TOGETHER, preferring the first source item that resolves a HUMAN and
+  // only falling back to the first resolvable item when none has one. Resolving them independently would
+  // regress attribution: a fact whose episodes are [connector item (no human), John's item] must be
+  // balanced under John — not dropped into the unattributed bucket because a human-less item came first
+  // (which would also undercount `contributorCount` and disagree with `attributedFactTexts`, which
+  // unions humans across ALL episodes). Memoized per fact — both closures below read the same result.
+  const actorCache = new Map<string, { item: string; human: string }>();
+  const actorOfFact = (f: AtomicFact): { item: string; human: string } => {
+    const cached = actorCache.get(f.id);
+    if (cached) return cached;
+    let firstItem = "";
+    let resolved = { item: "", human: "" };
+    for (const u of f.episodeUuids) {
+      const id = epToItem.get(u)?.itemId;
+      if (!id) continue;
+      if (!firstItem) firstItem = id;
+      const h = humanByItem.get(id);
+      if (h) {
+        resolved = { item: id, human: h };
+        break;
+      }
+    }
+    if (!resolved.item) resolved = { item: firstItem, human: "" };
+    actorCache.set(f.id, resolved);
+    return resolved;
+  };
+  const itemOfFact = (f: AtomicFact): string => actorOfFact(f).item;
+  const humanOfFact = (f: AtomicFact): string => actorOfFact(f).human;
+  // Two-level balance (contributor → item, per-item capped) → a representative MAX_FACTS so every active
+  // contributor is in the prompt AND no single giant document dominates its author's share.
+  const facts = balanceFacts(pool, humanOfFact, itemOfFact, MAX_FACTS, PER_ITEM_CAP);
+  // Request arcs proportional to how many distinct contributors actually made the balanced cut, so a
+  // varied team gets more than a flat ceiling and each person's distinct threads have room to surface.
+  const contributorCount = new Set(facts.map(humanOfFact).filter(Boolean)).size;
+  const raw = await callLLMRaw(
+    buildSystemPrompt(arcsRequested(contributorCount)),
+    buildPrompt(attributedFactTexts(facts, epToItem, humanByItem), correctionTexts),
+    keys,
+    { db, teamId }
+  );
+  // Rank by recency → relevance so recent contributors' arcs lead, then attribute AI-agent names to
+  // the humans behind each arc's own evidence.
+  return rankArcs(attributeArcs(parseArcsJson(raw, { facts, epToItem }), humanByItem));
 }
 
 // In-memory cache (per process). Keyed by the tier-visible group set. Fronts the Postgres `arc_cache`
@@ -267,6 +512,50 @@ const cache = new Map<string, { arcs: NarrativeArc[]; at: number }>();
 // Group keys currently being recomputed in the background, so concurrent stale reads fire ONE
 // recompute (and thus one LLM call), not N.
 const refreshing = new Set<string>();
+
+/**
+ * Persist a freshly-synthesized arc set to both caches — but NEVER let an EMPTY result clobber a
+ * non-empty one. An empty synthesis is almost always a transient upstream failure (LLM outage, a
+ * reasoning model starving its own output, a graph blip), and a stale-but-real arc set beats a blank
+ * panel. On that case we keep the prior value and DON'T refresh its timestamp, so the next view
+ * retries until synthesis recovers. This is the guard that stops one bad LLM call from pinning the
+ * Learning page empty for hours (2026-07 incident). Returns what's now authoritative for the key.
+ */
+export async function commitArcs(
+  db: DbClient,
+  teamId: string,
+  key: string,
+  next: NarrativeArc[]
+): Promise<NarrativeArc[]> {
+  if (next.length === 0) {
+    const mem = cache.get(key);
+    const prior =
+      mem ??
+      (await readArcCache(db, teamId, key).then((r) => (r ? { arcs: r.arcs, at: r.computedAt } : null)));
+    if (prior && prior.arcs.length > 0) {
+      const ageMs = Date.now() - prior.at;
+      if (ageMs < EMPTY_CLOBBER_MAX_AGE_MS) {
+        // Recent prior → an empty synthesis is almost always a transient upstream failure (LLM outage,
+        // a reasoning model starving its output, a graph blip). Keep the stale-but-real set and DON'T
+        // refresh the timestamp, so the next view retries until synthesis recovers.
+        console.warn(
+          `[arcs] synthesis returned 0 arcs for ${key}; keeping ${prior.arcs.length} cached (${Math.round(ageMs / 3_600_000)}h old; likely transient)`
+        );
+        return prior.arcs;
+      }
+      // Prior is too old to keep trusting as "transient-failure cover": a persistently-empty synthesis
+      // over this long is more likely GENUINE (quiet team, content deleted, graph reset, or the model
+      // correctly concluding "no active arcs"). Let the empty through so the panel reflects reality
+      // instead of pinning ancient arcs — and re-arming the background refresh loop — forever.
+      console.warn(
+        `[arcs] synthesis returned 0 arcs for ${key}; prior ${prior.arcs.length} arcs are ${Math.round(ageMs / 3_600_000)}h old (> cap) — accepting empty`
+      );
+    }
+  }
+  cache.set(key, { arcs: next, at: Date.now() });
+  await writeArcCache(db, teamId, key, next);
+  return next;
+}
 
 /** Fire-and-forget background recompute for a stale cache key (serve-stale-while-revalidate). Uses
  *  its own adminClient so it doesn't depend on the request's client lifecycle. Deduped via
@@ -278,8 +567,7 @@ function refreshArcsInBackground(teamId: string, key: string, groups: string[], 
     const bg = adminClient();
     try {
       const arcs = await synthesizeArcs(bg, teamId, groups, [], keys);
-      cache.set(key, { arcs, at: Date.now() });
-      await writeArcCache(bg, teamId, key, arcs);
+      await commitArcs(bg, teamId, key, arcs);
     } catch (err) {
       console.error("[arcs] background refresh failed:", err instanceof Error ? err.message : err);
     } finally {
@@ -324,9 +612,7 @@ export async function getArcs(
 
   // 3. Cold miss — first-ever load for this key. Compute inline so the user gets a real answer.
   const arcs = await synthesizeArcs(db, teamId, groups, [], keys);
-  cache.set(key, { arcs, at: Date.now() });
-  await writeArcCache(db, teamId, key, arcs);
-  return arcs;
+  return commitArcs(db, teamId, key, arcs);
 }
 
 /**
@@ -345,9 +631,8 @@ export async function recomputeArcs(
 ): Promise<NarrativeArc[]> {
   if (groups.length === 0) return [];
   const key = groups.slice().sort().join(",");
-  const arcs = await synthesizeArcs(db, teamId, groups, corrections.map((c) => c.corrected_text), keys);
-  cache.set(key, { arcs, at: Date.now() });
-  await writeArcCache(db, teamId, key, arcs);
+  const synthesized = await synthesizeArcs(db, teamId, groups, corrections.map((c) => c.corrected_text), keys);
+  const arcs = await commitArcs(db, teamId, key, synthesized);
 
   // Persist corrections as first-class episodes (team-tier group; corrections are internal).
   const client = new GraphitiClient();

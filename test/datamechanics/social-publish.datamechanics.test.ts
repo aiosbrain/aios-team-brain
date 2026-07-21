@@ -13,10 +13,14 @@ import { db, seedTeam } from "./helpers";
  * approved variant records a publication and enqueues a durable M0 `publish` job; the job runs it
  * (dry-run posts nothing); the live path calls the provider; failures mark the publication failed
  * and rethrow so the M0 runner retries. Nothing goes live in dry-run (the default).
+ *
+ * The happy path uses an EXTERNAL variant — only public content is publishable (audit #1); the
+ * fail-closed door for internal/regenerated/dry-run-flipped content lives in
+ * social-publish-door.datamechanics.test.ts.
  */
 async function approvedVariant() {
   const seed = await seedTeam();
-  const opp = await createOpportunity(db(), seed.teamId, { access: "team", sourceType: "manual", title: "Shipped the queue" });
+  const opp = await createOpportunity(db(), seed.teamId, { access: "external", sourceType: "manual", title: "Shipped the queue" });
   const { variants } = await planOpportunity(db(), seed.teamId, opp.id, { memberId: seed.memberId });
   await setVariantGenerationBody(seed.teamId, variants[0].id);
   await setVariantStatus(db(), seed.teamId, variants[0].id, "approved");

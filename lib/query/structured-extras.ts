@@ -1,5 +1,6 @@
 import "server-only";
 import { runSql } from "@/lib/db/pg/pool";
+import { isRestrictedTier } from "@/lib/auth/visibility";
 
 /**
  * Structured-context helpers that fix the "digests are recency-capped" scaling gaps (Gaps #5, #6).
@@ -21,7 +22,7 @@ export interface TaskCounts {
 /** Count ALL tasks by status (uncapped), tier-scoped. Powers a correct "how many open tasks" answer. */
 export async function taskStatusCounts(teamId: string, tier: "team" | "external"): Promise<TaskCounts> {
   try {
-    const access = tier === "external" ? "and audience = 'external'" : "";
+    const access = isRestrictedTier(tier) ? "and audience = 'external'" : "";
     const sql = `select status, count(*)::int as n from tasks where team_id = $1 ${access} group by status`;
     const res = await runSql<{ status: string; n: number }>(sql, [teamId]);
     const byStatus: Record<string, number> = {};
@@ -62,7 +63,7 @@ export async function matchingDecisions(
 ): Promise<DecisionMatch[]> {
   if (!orQuery.trim()) return [];
   try {
-    const access = tier === "external" ? "and d.audience = 'external'" : "";
+    const access = isRestrictedTier(tier) ? "and d.audience = 'external'" : "";
     const params: unknown[] = [orQuery, teamId, limit];
     const sql = `
       select d.row_key, d.decided_at, d.title, d.decided_by, d.still_valid, coalesce(p.slug, '') as slug,

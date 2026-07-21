@@ -111,11 +111,15 @@ create table if not exists teams (
   -- Explicit answering-backend override for the Query box. Null = auto precedence
   -- (OpenRouter → LLM_BASE_URL → Anthropic); otherwise force that backend (lib/query/llm-backend).
   answering_provider text check (answering_provider in ('anthropic', 'openai', 'openrouter', 'local')),
+  -- Optional distinct model for reasoning-heavy tasks (narrative arc synthesis). Null = reuse the
+  -- query model (the active provider's config.model). See lib/query/llm-backend (role="reasoning").
+  reasoning_model text,
   created_at timestamptz not null default now()
 );
 -- Additive columns for existing deployments.
 alter table teams add column if not exists primary_pm_provider text;
 alter table teams add column if not exists answering_provider text;
+alter table teams add column if not exists reasoning_model text;
 do $$ begin
   if not exists (select 1 from pg_constraint where conname = 'teams_primary_pm_provider_check') then
     alter table teams add constraint teams_primary_pm_provider_check check (primary_pm_provider in ('plane', 'linear'));
@@ -1698,6 +1702,19 @@ create table if not exists media_assets (
 create index if not exists media_assets_variant_idx on media_assets (variant_id, created_at desc);
 create index if not exists media_assets_team_day_idx on media_assets (team_id, created_at);
 
+-- Per-team-per-UTC-day image-generation counter — the atomic reservation backing the daily cost cap
+-- (audit #8). The old check-then-act on count(media_assets) raced: concurrent requests could both
+-- pass the count and both spend, over-running the cap. One row per (team, day); a slot is reserved by
+-- an atomic conditional increment (`… where count < cap`) BEFORE any provider spend, and released if
+-- the generation then fails. Single writer: lib/media/store.ts.
+create table if not exists social_image_usage (
+  team_id uuid not null references teams(id) on delete cascade,
+  day date not null,
+  count integer not null default 0,
+  updated_at timestamptz not null default now(),
+  primary key (team_id, day)
+);
+
 -- Social Brain approval workflow (M4). Per-team autonomy gate + the content-approval queue.
 -- Single writers: lib/social/settings.ts (autonomy), lib/social/approvals.ts (queue).
 create table if not exists social_settings (
@@ -1731,6 +1748,11 @@ create table if not exists social_publications (
 );
 create index if not exists social_publications_team_idx on social_publications (team_id, created_at desc);
 create index if not exists social_publications_variant_idx on social_publications (variant_id);
+-- At most ONE active (scheduled/publishing) publication per variant — the DB backstop against a
+-- double-submit race creating two live posts (audit #5). Cancelled/failed/published are unconstrained.
+create unique index if not exists social_publications_active_variant_idx
+  on social_publications (variant_id)
+  where status in ('scheduled', 'publishing');
 
 -- Normalized per-publication analytics (M6). One row per publication (latest snapshot). Typefully
 -- exposes X-only metrics. Single writer: lib/social/analytics.ts. Tier inherited from publication.

@@ -1,0 +1,78 @@
+/**
+ * Backfill: re-run the upload-time extraction (summary + attendees + action items) over meeting
+ * notes that ALREADY exist, so notes saved with a blank summary (the array-shaped-summary parser
+ * bug) show up "as if they'd just been uploaded". Routes through the team's configured answering
+ * model (incl. OpenRouter) exactly like a live upload, and uses the same single-writer writers, so
+ * there is no second write path. Idempotent and safe to re-run.
+ *
+ * Run (all teams, heal only blank summaries — the SAFE default):
+ *   DATABASE_URL=… SECRETS_KEY=… npx tsx --conditions react-server scripts/backfill-meeting-summaries.ts
+ * Options:
+ *   [teamSlug]     limit to one team
+ *   --all / --full re-run over EVERY note, OVERWRITING existing summaries with fresh LLM output
+ *                  (nondeterministic — can replace good summaries with worse ones; opt in deliberately)
+ *   --only-blank   accepted as a no-op (this is now the default)
+ *   --limit=N      cap notes processed per team
+ */
+import { adminClient } from "@/lib/db/admin";
+import { resolveAnsweringKeys } from "@/lib/query/answering";
+import { refreshMeetingNoteExtraction } from "@/lib/meetings/refresh";
+
+type TeamRow = { id: string; slug: string; name: string };
+
+async function main() {
+  const argv = process.argv.slice(2);
+  // Default to the SAFE mode: heal only notes whose summary is currently blank. A full refresh re-runs
+  // the LLM over EVERY note and overwrites good summaries with fresh (nondeterministic) output, so it
+  // must be opted into explicitly (`--all`/`--full`). `--only-blank` remains accepted as a no-op.
+  const fullRefresh = argv.includes("--all") || argv.includes("--full");
+  const onlyBlank = !fullRefresh;
+  const limitArg = argv.find((a) => a.startsWith("--limit="));
+  const limit = limitArg ? Number(limitArg.split("=")[1]) : undefined;
+  const timeoutArg = argv.find((a) => a.startsWith("--timeout="));
+  // The app LLM path over a slow local network can take ~45s per call; default generously so a
+  // successful-but-slow response isn't aborted mid-backfill. In prod the default 60s is plenty.
+  const timeoutMs = timeoutArg ? Number(timeoutArg.split("=")[1]) : 120_000;
+  const teamSlug = argv.find((a) => !a.startsWith("--"));
+
+  const admin = adminClient();
+  const q = admin.from("teams").select("id, slug, name");
+  const { data: teamData, error } = teamSlug ? await q.eq("slug", teamSlug) : await q;
+  if (error) throw new Error(`load teams failed: ${error.message}`);
+  const teams = (teamData ?? []) as TeamRow[];
+  if (teams.length === 0) {
+    console.error(teamSlug ? `no team with slug "${teamSlug}"` : "no teams found");
+    process.exit(1);
+  }
+
+  console.log(
+    `refreshing meeting notes for ${teams.length} team(s)` +
+      `${onlyBlank ? " [only blank summaries]" : " [full refresh]"}${limit ? ` [limit ${limit}/team]` : ""}\n`
+  );
+
+  let totalSummarized = 0;
+  let totalActionItems = 0;
+  for (const t of teams) {
+    const keys = await resolveAnsweringKeys(admin, t.id);
+    const provider = keys.activeProvider ?? "auto";
+    process.stdout.write(`• ${t.name} (${t.slug}) — answering=${provider} … `);
+    try {
+      const res = await refreshMeetingNoteExtraction(admin, t.id, { keys, onlyBlank, limit, timeoutMs });
+      totalSummarized += res.summarized;
+      totalActionItems += res.actionItems;
+      console.log(
+        `scanned ${res.scanned}, summarized ${res.summarized}, action items ${res.actionItems}, skipped ${res.skipped}`
+      );
+    } catch (e) {
+      console.log(`FAILED — ${e instanceof Error ? e.message : e}`);
+    }
+  }
+
+  console.log(`\n✓ done: ${totalSummarized} note(s) summarized, ${totalActionItems} action item(s) materialized`);
+  process.exit(0);
+}
+
+main().catch((e) => {
+  console.error(e instanceof Error ? e.message : e);
+  process.exit(1);
+});

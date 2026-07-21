@@ -5,6 +5,7 @@ import { adminClient } from "@/lib/db/admin";
 import { getSessionUser } from "@/lib/auth/session";
 import { rateLimit } from "@/lib/api/rate-limit";
 import { errorResponse } from "@/lib/api/schemas";
+import { isRestrictedTier } from "@/lib/auth/visibility";
 import { formatSseFrame } from "@/lib/api/sse";
 import { retrieve } from "@/lib/query/retrieve";
 import { streamAnswer } from "@/lib/query/claude";
@@ -137,7 +138,7 @@ export async function POST(req: NextRequest) {
   // connector instead of asking the LLM. team-tier only (external collaborators can't trigger a
   // sync of internal data); its own tighter rate limit; doesn't consume the daily LLM query budget.
   if (isSyncCommand(question)) {
-    if (memberTier === "external") {
+    if (isRestrictedTier(memberTier)) {
       return errorResponse("forbidden", "scraping is available to team members only", 403);
     }
     if (!(await rateLimit(db, `${me.id}:sync`, 2))) {

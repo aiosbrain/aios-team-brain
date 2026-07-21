@@ -1,7 +1,6 @@
 import type { Metadata } from "next";
 import { ChevronRight } from "lucide-react";
-import { serverClient } from "@/lib/db/server";
-import { currentMember } from "@/lib/auth/guard";
+import { resolveTeamContext } from "@/lib/auth/team-context";
 import { FactsFeed } from "@/components/learning/facts-feed";
 import { EventsFeed } from "@/components/learning/events-feed";
 import { ArcsPanel } from "@/components/learning/arcs-panel";
@@ -17,11 +16,9 @@ export const metadata: Metadata = { title: "Learning" };
  */
 export default async function LearningPage({ params }: { params: Promise<{ team: string }> }) {
   const { team: teamSlug } = await params;
-  const db = await serverClient();
-  const { data: team } = await db.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
-  if (!team) return null;
-  const me = await currentMember(team.id);
-  if (!me) return null;
+  // Shared request-scoped auth — reuses the team layout's resolution (no extra team/member queries).
+  const ctx = await resolveTeamContext(teamSlug);
+  if (!ctx) return null;
 
   return (
     <div className="mx-auto flex max-w-4xl flex-col gap-6">
@@ -35,7 +32,7 @@ export default async function LearningPage({ params }: { params: Promise<{ team:
 
       <section className="flex flex-col gap-2">
         <h2 className="text-sm font-semibold uppercase tracking-wider text-ink-tertiary">
-          Narrative arcs · last 7 days
+          Narrative arcs · most recent
         </h2>
         <ArcsPanel teamSlug={teamSlug} />
       </section>

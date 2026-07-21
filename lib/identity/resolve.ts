@@ -89,24 +89,39 @@ export function resolveByProviderId(map: IdentityMap, provider: string, external
   return map.byProviderId.get(providerKey(provider, externalId)) ?? null;
 }
 
+/** How an identity resolved — the attribution CONFIDENCE. `email`/`handle` are exact matches;
+ *  `heuristic` is the softer email-local-part → team-handle guess; `unresolved` is no match. */
+export type ResolveMethod = "email" | "handle" | "heuristic" | "unresolved";
+
 /**
- * Resolve one author identity to a roster member_id, or null. Exact email match first; only
- * derive a handle from an email local-part when that email's domain is already in the roster
- * (otherwise external contributors like alex@gmail.com could be misattributed to an internal
- * actor_handle "alex"); then an explicit non-email handle key.
+ * Resolve one author identity to a roster member_id AND report HOW it matched (the confidence the
+ * attribution-health layer surfaces). Precedence — exact email match first; only derive a handle from
+ * an email local-part when that email's domain is already in the roster (otherwise external
+ * contributors like alex@gmail.com could be misattributed to an internal actor_handle "alex"); then an
+ * explicit non-email handle key. `resolveMember` delegates here, so the resolution logic lives once.
  */
-export function resolveMember(map: IdentityMap, identity: AuthorIdentity): string | null {
+export function resolveMemberDetailed(
+  map: IdentityMap,
+  identity: AuthorIdentity
+): { memberId: string | null; method: ResolveMethod } {
   const email = (identity.email ?? "").trim().toLowerCase();
   const keyLc = (identity.key ?? "").trim().toLowerCase();
   const [localPart, domain] = email.includes("@") ? email.split("@", 2) : ["", ""];
-  const handleFromTeamDomain =
-    localPart && domain && map.emailDomains.has(domain) ? map.byHandle.get(localPart) : undefined;
-  const explicitHandle = keyLc && !keyLc.includes("@") ? map.byHandle.get(keyLc) : undefined;
-  return (
-    map.byEmail.get(email) ??
-    map.byEmail.get(keyLc) ??
-    handleFromTeamDomain ??
-    explicitHandle ??
-    null
-  );
+  const byEmail = map.byEmail.get(email) ?? (keyLc ? map.byEmail.get(keyLc) : undefined);
+  if (byEmail) return { memberId: byEmail, method: "email" };
+  if (localPart && domain && map.emailDomains.has(domain)) {
+    const h = map.byHandle.get(localPart);
+    if (h) return { memberId: h, method: "heuristic" };
+  }
+  if (keyLc && !keyLc.includes("@")) {
+    const h = map.byHandle.get(keyLc);
+    if (h) return { memberId: h, method: "handle" };
+  }
+  return { memberId: null, method: "unresolved" };
+}
+
+/** Resolve one author identity to a roster member_id, or null. Thin wrapper over
+ *  `resolveMemberDetailed` — same precedence, result unchanged. */
+export function resolveMember(map: IdentityMap, identity: AuthorIdentity): string | null {
+  return resolveMemberDetailed(map, identity).memberId;
 }

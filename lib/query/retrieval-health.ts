@@ -1,6 +1,8 @@
 import "server-only";
 import { runSql } from "@/lib/db/pg/pool";
 import { graphitiConfigured, GraphitiClient } from "@/lib/graph/graphiti-client";
+import { getLlmHealth, type LlmHealth } from "@/lib/query/llm-health";
+import { countGraphFacts, deriveGraphExtractionStalled } from "@/lib/graph/extraction-health";
 
 /**
  * Retrieval-stack health for the admin dashboard (Phase 1 of the retrieval-observability plan).
@@ -36,7 +38,15 @@ export interface RetrievalHealth {
   keyword: LegState; // always "on"
   dense: DenseHealth;
   graph: GraphState;
+  graphEpisodes: number | null; // projected episodes for this team (null when graph off/unreadable)
+  graphLastProjectedAt: string | null; // most recent successful projection (null = never)
+  graphStalled: boolean; // degraded specifically because the projector stopped writing (vs unreachable)
+  graphExtractionStalled: boolean; // episodes are reaching Graphiti (202) but its extractor makes no facts
+  graphFacts: number | null; // extracted RELATES_TO facts in Neo4j (null = unreadable)
   rerank: LegState;
+  augment: LegState; // optional external retrieval-augment service (RETRIEVAL_AUGMENT_URL)
+  llm: LlmHealth; // answering-model health — did the configured model recently produce output?
+  emailDeliverable: boolean; // a provider is configured (RESEND_API_KEY/SMTP_URL) so alerts/invites can actually send
 }
 
 const COVERAGE_FLOOR = 0.9; // ≥90% embedded = healthy
@@ -49,15 +59,53 @@ const STALE_MS = 2 * 60 * 60 * 1000; // no embed activity in 2h + incomplete = s
  */
 export const graphConfigured = graphitiConfigured;
 
+/** Whether the graph has any projected episodes for this team — the proxy for "facts exist to
+ *  synthesize arcs from." Empty ⇒ the projector never populated the graph (a graph/projector issue),
+ *  as opposed to a synthesis/model failure. Best-effort: false on any error. */
+export async function graphHasFacts(teamId: string): Promise<boolean> {
+  try {
+    const res = await runSql<{ n: number }>(
+      "select count(*)::int as n from graph_episodes where team_id = $1",
+      [teamId]
+    );
+    return (res.rows[0]?.n ?? 0) > 0;
+  } catch {
+    return false;
+  }
+}
+
+// Reachable but no projection in this long ⇒ the graph is going stale even though /healthcheck is
+// green. This is the 2026-07 failure a healthcheck-only probe MISSED: Graphiti's write endpoint
+// 422'd for days (projector wedged) while the service kept answering /healthcheck, so the card read
+// "on" while the Learning page slowly emptied. Freshness of the write path is the real signal.
+const GRAPH_STALE_MS = 6 * 60 * 60 * 1000;
+
+/** A projector that hasn't written in > GRAPH_STALE_MS is stalled. `null` = nothing has ever projected
+ *  (fresh install / nothing to project) → NOT a stall. Pure + unit-tested. */
+export function isGraphStale(lastProjectedAtMs: number | null, nowMs: number): boolean {
+  return lastProjectedAtMs !== null && nowMs - lastProjectedAtMs > GRAPH_STALE_MS;
+}
+
 /**
  * Derive the graph-leg state from its raw signals. Pure + unit-tested:
- *   • not configured (no/malformed GRAPHITI_URL)         → "off"
- *   • configured AND /healthcheck answered                → "on"
- *   • configured BUT /healthcheck failed (down/unreachable) → "degraded"
+ *   • not configured (no/malformed GRAPHITI_URL)             → "off"
+ *   • configured BUT /healthcheck failed (down/unreachable)   → "degraded"
+ *   • reachable BUT projector hasn't written in > GRAPH_STALE_MS (writes failing) → "degraded"
+ *   • reachable + writing BUT the extractor makes no facts from projected episodes → "degraded"
+ *   • reachable AND recently projected (or nothing to project yet) → "on"
  */
-export function deriveGraphState(input: { configured: boolean; reachable: boolean }): GraphState {
+export function deriveGraphState(input: {
+  configured: boolean;
+  reachable: boolean;
+  lastProjectedAtMs: number | null;
+  extractionStalled: boolean;
+  nowMs: number;
+}): GraphState {
   if (!input.configured) return "off";
-  return input.reachable ? "on" : "degraded";
+  if (!input.reachable) return "degraded";
+  if (isGraphStale(input.lastProjectedAtMs, input.nowMs)) return "degraded";
+  if (input.extractionStalled) return "degraded"; // accepting episodes but extracting no facts
+  return "on";
 }
 
 /**
@@ -85,16 +133,64 @@ export function deriveDenseState(input: {
 
 export async function getRetrievalHealth(teamId: string): Promise<RetrievalHealth> {
   const rerank: LegState = process.env.RERANK_URL ? "on" : "off";
+  const augment: LegState = process.env.RETRIEVAL_AUGMENT_URL ? "on" : "off";
+  const emailDeliverable = !!(process.env.RESEND_API_KEY || process.env.SMTP_URL);
   const configured = !!process.env.EMBEDDINGS_URL;
 
   // Graph + dense both hit the network — run them concurrently so the card render isn't serialized.
   const graphConfiguredNow = graphConfigured(process.env.GRAPHITI_URL);
-  const [dense, graphReachable] = await Promise.all([
+  const [dense, graphReachable, graphFresh, graphFacts, llm] = await Promise.all([
     denseHealth(teamId, configured),
     graphConfiguredNow ? new GraphitiClient().healthcheck() : Promise.resolve(false),
+    graphConfiguredNow ? graphFreshness(teamId) : Promise.resolve({ episodes: null, lastProjectedAt: null }),
+    graphConfiguredNow ? countGraphFacts() : Promise.resolve(null),
+    getLlmHealth(teamId),
   ]);
-  const graph = deriveGraphState({ configured: graphConfiguredNow, reachable: graphReachable });
-  return { keyword: "on", dense, graph, rerank };
+  const lastProjectedAtMs = graphFresh.lastProjectedAt ? Date.parse(graphFresh.lastProjectedAt) : null;
+  const nowMs = Date.now();
+  // Reachable + writing, but projected episodes aren't becoming facts (Graphiti's extractor is failing
+  // on every job). Only meaningful when reachable — an unreachable service reports facts=null.
+  const graphExtractionStalled = graphReachable && deriveGraphExtractionStalled(graphFresh.episodes, graphFacts);
+  const graph = deriveGraphState({
+    configured: graphConfiguredNow,
+    reachable: graphReachable,
+    lastProjectedAtMs,
+    extractionStalled: graphExtractionStalled,
+    nowMs,
+  });
+  // Degraded specifically because the projector went quiet (reachable, but a stale write path) — the
+  // card renders a different, more actionable banner for this than for a hard-unreachable service.
+  const graphStalled = graph === "degraded" && graphReachable && isGraphStale(lastProjectedAtMs, nowMs);
+  return {
+    keyword: "on",
+    dense,
+    graph,
+    graphEpisodes: graphFresh.episodes,
+    graphLastProjectedAt: graphFresh.lastProjectedAt,
+    graphStalled,
+    graphExtractionStalled,
+    graphFacts,
+    rerank,
+    augment,
+    llm,
+    emailDeliverable,
+  };
+}
+
+/** Projection freshness from the `graph_episodes` ledger (Postgres, no Graphiti round-trip): how many
+ *  episodes this team has projected and when the projector last succeeded. Drives the "reachable but
+ *  stalled" degraded state. Best-effort — nulls on any error so the card still renders. */
+async function graphFreshness(teamId: string): Promise<{ episodes: number | null; lastProjectedAt: string | null }> {
+  try {
+    const res = await runSql<{ n: string; mx: string | null }>(
+      "select count(*)::int as n, max(projected_at) as mx from graph_episodes where team_id = $1",
+      [teamId]
+    );
+    const row = res.rows[0];
+    return { episodes: row ? Number(row.n) : 0, lastProjectedAt: row?.mx ?? null };
+  } catch {
+    return { episodes: null, lastProjectedAt: null };
+  }
 }
 
 async function denseHealth(teamId: string, configured: boolean): Promise<DenseHealth> {

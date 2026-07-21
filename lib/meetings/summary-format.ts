@@ -7,6 +7,28 @@
 
 const BULLET_RE = /^\s*[-*•]\s+/;
 
+/**
+ * Normalize the LLM's raw `summary` field into the canonical newline-joined bullet STRING that
+ * `summaryBullets` (and the stored `meeting_notes.summary` column) expect. The prompt asks for a
+ * `"- ...\n- ..."` string, and most models comply — but some a team can pick as their answering
+ * provider (observed live: `qwen/qwen3.7-plus` via OpenRouter) return `summary` as a JSON ARRAY of
+ * bullet strings. Both shapes must render identically, so an array is joined with every element
+ * forced to a single leading "- " marker (any pre-existing bullet marker is stripped first so it's
+ * never doubled). A string is passed through trimmed; anything else becomes "" (no usable summary).
+ */
+export function normalizeSummaryField(raw: unknown): string {
+  if (typeof raw === "string") return raw.trim();
+  if (Array.isArray(raw)) {
+    return raw
+      .filter((s): s is string => typeof s === "string")
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .map((s) => `- ${s.replace(/^[-*•]\s*/, "").trim()}`)
+      .join("\n");
+  }
+  return "";
+}
+
 export function summaryBullets(summary: string): string[] {
   const lines = summary.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
   const bullets = lines.filter((l) => BULLET_RE.test(l));

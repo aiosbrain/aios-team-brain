@@ -10,10 +10,15 @@ name: aios-graphiti
 # depends on structured-output support — start with a strong cloud model, swap later via env.
 services:
   graph:
-    # Pinned to the digest verified running in prod on 2026-07-06 (audit M5 — an unpinned `latest`
-    # tag is a reproducibility/supply-chain risk: the exact same tag can resolve to different code
-    # over time with no signal). Bump deliberately; check the new digest against prod before/after.
-    image: zepai/graphiti@sha256:76d14f30afc65d2f914637d67d0c0631a7e779e2740be1ae99b9dc0c5876d2da
+    # Built from ./Dockerfile = the digest verified running in prod on 2026-07-06 (audit M5 — an
+    # unpinned `latest` tag is a reproducibility/supply-chain risk) + ONE surgical patch: raise the
+    # LLM extraction output cap 8192 → 16384 (graphiti_core `DEFAULT_MAX_TOKENS`), because every
+    # published image caps at 8192 and the server exposes no env for it. The base digest stays pinned
+    # inside the Dockerfile, so reproducibility holds; only the token ceiling changes. Bump the base
+    # digest deliberately and re-check against prod before/after. See ./Dockerfile for the full why.
+    build:
+      context: .
+      dockerfile: Dockerfile
     ports:
       - "${GRAPHITI_PORT:-8000}:8000"
     depends_on:

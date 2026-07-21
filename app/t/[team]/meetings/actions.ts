@@ -83,6 +83,7 @@ export async function uploadMeetingNoteAction(
       const mergedNoteId = await mergeIntoMeetingNote(admin, team.id, dup, {
         newRawText: parsed.data.rawText,
         newSubmitterId: me.id,
+        newAccess: "team", // GUI uploads are always team-tier (createMeetingNote hard-codes it)
         newAttendeeIds: extraction.attendeeMemberIds,
         roster,
         keys,
@@ -279,7 +280,12 @@ export async function regenerateMeetingSummaryAction(
   }));
 
   const ex = await extractFromTranscript(note.rawText, roster, keys);
-  if (!ex.summary.trim()) return { ok: false, error: "could not regenerate summary (LLM unavailable)" };
+  if (!ex.summary.trim()) {
+    // The model may be unreachable OR may have answered in a shape we couldn't read — don't assert
+    // "unavailable" (misleading: it often IS available; see normalizeSummaryField). Server logs carry
+    // the specific transport/parse reason.
+    return { ok: false, error: "could not regenerate summary — the model returned an empty or unreadable response" };
+  }
 
   try {
     await updateMeetingSummary(admin, team.id, noteId, ex.summary);

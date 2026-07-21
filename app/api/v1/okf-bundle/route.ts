@@ -1,6 +1,7 @@
 import { NextRequest } from "next/server";
 import { adminClient } from "@/lib/db/admin";
 import { authenticateApiKey } from "@/lib/api/auth";
+import { isRestrictedTier } from "@/lib/auth/visibility";
 import { rateLimit } from "@/lib/api/rate-limit";
 import { errorResponse } from "@/lib/api/schemas";
 import { extractLinks, extractTitle, resolveLink } from "@/lib/okf/links";
@@ -83,7 +84,7 @@ export async function GET(req: NextRequest) {
     .order("updated_at", { ascending: true })
     .order("path", { ascending: true })
     .limit(PAGE_SIZE);
-  if (effectiveTier === "external") q = q.eq("access", "external");
+  if (isRestrictedTier(effectiveTier)) q = q.eq("access", "external");
   if (projectId) q = q.eq("project_id", projectId);
   const { data: rows, error } = await q;
   if (error) return errorResponse("internal", error.message, 500);

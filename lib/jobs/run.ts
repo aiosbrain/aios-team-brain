@@ -3,7 +3,7 @@ import type { DbClient } from "@/lib/db/types";
 import { adminClient } from "@/lib/db/admin";
 import type { JobHandler, JobKind, JobRunSummary } from "./types";
 import { getJobHandler } from "./registry";
-import { claimDueJobs, markJobDead, markJobDone, requeueJob } from "./store";
+import { claimDueJobs, markJobDead, markJobDone, requeueJob, reclaimStaleJobs } from "./store";
 
 /**
  * The job runner — one pass over due jobs. Mirrors lib/graph/run: a module-level single-flight
@@ -39,7 +39,13 @@ async function runDueJobsInner(opts?: RunDueJobsOptions): Promise<JobRunSummary>
   const db = opts?.db ?? adminClient();
   const now = opts?.now ?? new Date();
   const resolve = opts?.getHandler ?? getJobHandler;
-  const summary: JobRunSummary = { claimed: 0, succeeded: 0, requeued: 0, dead: 0, errors: [] };
+  const summary: JobRunSummary = { claimed: 0, succeeded: 0, requeued: 0, dead: 0, reclaimed: 0, errors: [] };
+
+  // Reclaim abandoned `running` jobs (worker vanished mid-run) BEFORE claiming, so a deploy/crash
+  // can't silently strand a publish forever (audit #4). Safe because handlers are idempotent (#2).
+  const reclaim = await reclaimStaleJobs(db, { now });
+  summary.reclaimed = reclaim.reclaimed;
+  summary.dead += reclaim.deadLettered; // a stale job past its attempts is dead-lettered by the reclaim
 
   const jobs = await claimDueJobs(db, { limit: opts?.limit, now });
   summary.claimed = jobs.length;

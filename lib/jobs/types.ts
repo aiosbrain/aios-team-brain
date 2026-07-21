@@ -60,6 +60,8 @@ export interface JobRunSummary {
   succeeded: number;
   requeued: number;
   dead: number;
+  /** Stale `running` jobs (worker vanished mid-run) returned to the queue this tick (audit #4). */
+  reclaimed: number;
   /** Human-readable errors for the tick log; failures are recorded on the row, not thrown. */
   errors: string[];
 }

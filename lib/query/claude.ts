@@ -23,6 +23,26 @@ const CACHE_READ_PER_TOKEN = 0.5 / 1_000_000;
 const LLM_BASE_URL = process.env.LLM_BASE_URL;
 const LLM_MODEL = process.env.LLM_MODEL ?? "llama3.1-8b-64k:latest";
 
+// A reasoning model spends completion tokens on HIDDEN reasoning before any answer, and `max_tokens`
+// caps reasoning+answer together — so a bare answer budget can be fully consumed by reasoning, leaving
+// an EMPTY streamed answer (the 2026-07 starvation, on the streaming Query path #285 left able to
+// reason). Add headroom on top of the answer budget: free for non-reasoning models (billed only for
+// tokens generated). Mirrors lib/llm/complete.ts's constant/env; kept local to avoid coupling this
+// streaming path to that churny module. Override with LLM_REASONING_HEADROOM_TOKENS.
+const STREAM_REASONING_HEADROOM = (() => {
+  const n = Number(process.env.LLM_REASONING_HEADROOM_TOKENS);
+  return Number.isFinite(n) && n >= 0 ? n : 6000;
+})();
+
+/** A non-OK completion whose status+body say the request exceeded the model's output/context ceiling —
+ *  i.e. the headroom pushed max_tokens past what this small model accepts. Retry once WITHOUT headroom. */
+export function looksLikeTokenLimit(status: number, body: string): boolean {
+  if (status !== 400 && status !== 422) return false;
+  return /max[_ ]?tokens|max_completion_tokens|maximum context|context length|too many tokens|reduce (?:the )?(?:length|tokens)/i.test(
+    body
+  );
+}
+
 const SYSTEM_PROMPT = `You are the Team Brain — the shared memory and coordination assistant for a team using AIOS.
 
 Rules:
@@ -278,7 +298,7 @@ export async function* streamAnswer(
  * path. Strips any `<think>…</think>` reasoning spans so the answer stays clean on reasoning models.
  * Cost is reported as $0 here (token counts are accurate); per-model OpenRouter cost is a follow-up.
  */
-async function* streamOpenAICompatible(
+export async function* streamOpenAICompatible(
   backend: Extract<LlmBackend, { kind: "openrouter" | "openai-compatible" }>,
   note: string,
   who: string,
@@ -302,27 +322,46 @@ async function* streamOpenAICompatible(
     `Question: ${question}`;
 
   const apiKey = backend.apiKey ?? process.env.OPENAI_API_KEY ?? "local";
-  const res = await fetch(`${backend.baseUrl.replace(/\/$/, "")}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-      ...(backend.kind === "openrouter" ? backend.headers : {}),
-    },
-    body: JSON.stringify({
-      model: backend.model,
-      max_tokens: 4096,
-      stream: true,
-      stream_options: { include_usage: true },
-      messages: [
-        { role: "system", content: SYSTEM_PROMPT },
-        { role: "user", content: userContent },
-      ],
-    }),
-  });
+  const ANSWER_BUDGET = 4096;
+  const postChat = (maxTokensToSend: number): Promise<Response> =>
+    fetch(`${backend.baseUrl.replace(/\/$/, "")}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+        ...(backend.kind === "openrouter" ? backend.headers : {}),
+      },
+      body: JSON.stringify({
+        model: backend.model,
+        // Caller passes answer-budget + headroom on the first attempt, bare answer-budget on retry —
+        // headroom keeps a reasoning model from spending the whole budget on hidden reasoning and
+        // streaming back an empty answer.
+        max_tokens: maxTokensToSend,
+        stream: true,
+        stream_options: { include_usage: true },
+        messages: [
+          { role: "system", content: SYSTEM_PROMPT },
+          { role: "user", content: userContent },
+        ],
+      }),
+    });
 
-  if (!res.ok || !res.body) {
-    throw new Error(`LLM ${backend.model} @ ${backend.baseUrl}: ${res.status} ${await res.text().catch(() => "")}`);
+  let res = await postChat(ANSWER_BUDGET + STREAM_REASONING_HEADROOM);
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    // If headroom pushed max_tokens past this model's ceiling, retry once with just the answer budget;
+    // any other error surfaces immediately (with its own body).
+    if (looksLikeTokenLimit(res.status, body)) {
+      res = await postChat(ANSWER_BUDGET);
+      if (!res.ok) {
+        throw new Error(`LLM ${backend.model} @ ${backend.baseUrl}: ${res.status} ${await res.text().catch(() => "")}`);
+      }
+    } else {
+      throw new Error(`LLM ${backend.model} @ ${backend.baseUrl}: ${res.status} ${body}`);
+    }
+  }
+  if (!res.body) {
+    throw new Error(`LLM ${backend.model} @ ${backend.baseUrl}: ${res.status} no stream body`);
   }
 
   const reader = res.body.getReader();
@@ -331,6 +370,7 @@ async function* streamOpenAICompatible(
   let inThink = false;
   let prompt = 0;
   let completion = 0;
+  let emittedChars = 0;
 
   while (true) {
     const { done, value } = await reader.read();
@@ -374,8 +414,21 @@ async function* streamOpenAICompatible(
           inThink = true;
         }
       }
-      if (out) yield { type: "delta", text: out };
+      if (out) {
+        emittedChars += out.length;
+        yield { type: "delta", text: out };
+      }
     }
+  }
+
+  // Zero visible answer text is a silent blank answer — make it diagnosable. Usual cause: a reasoning
+  // model spent the whole budget on hidden reasoning (raise LLM_REASONING_HEADROOM_TOKENS); a mid-stream
+  // provider error frame also lands here.
+  if (emittedChars === 0) {
+    console.error(
+      `[query] streamed answer was EMPTY (model=${backend.model}, completion_tokens=${completion}) — ` +
+        `likely a reasoning model starved by max_tokens, or a mid-stream provider error`
+    );
   }
 
   yield {

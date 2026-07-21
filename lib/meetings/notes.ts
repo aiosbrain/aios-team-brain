@@ -75,8 +75,18 @@ function stableHash(input: string): string {
   return createHash("sha256").update(input).digest("hex");
 }
 
-function notePath(noteId: string): string {
+/** The merge-owned item path for a note — `meetings/<noteId>.md` in the meeting-notes project. No
+ *  connector syncs this path, so a body written here is never clobbered by an external sync. */
+export function notePath(noteId: string): string {
   return `meetings/${noteId}.md`;
+}
+
+/** Re-point a meeting note at a different source item. Used by merge to move a note off a
+ *  connector-owned item onto a merge-owned one (`notePath`), so the connector's next sync can't
+ *  overwrite the merged transcript. Single writer for `meeting_notes.source_item_id`. */
+export async function setMeetingNoteSourceItem(db: DbClient, noteId: string, sourceItemId: string): Promise<void> {
+  const { error } = await db.from("meeting_notes").update({ source_item_id: sourceItemId }).eq("id", noteId);
+  if (error) throw new Error(`meeting note re-point failed: ${error.message}`);
 }
 
 /**
@@ -153,6 +163,9 @@ export interface MeetingNoteFromItemInput {
   summary?: string;
   submittedByMemberId?: string | null;
   attendeeMemberIds?: string[];
+  /** Insert the note already folded into another (a `merged_into` tombstone) — atomic, so it's never
+   *  briefly visible and can't be left dangling-visible by a crash before a separate hide step. */
+  mergedInto?: string | null;
 }
 
 /**
@@ -185,6 +198,7 @@ export async function createMeetingNoteFromItem(
     title,
     summary: (input.summary ?? "").trim(),
     occurred_at: input.occurredAt || null,
+    merged_into: input.mergedInto ?? null,
   });
   if (error) throw new Error(`meeting note (from item) insert failed: ${error.message}`);
 
