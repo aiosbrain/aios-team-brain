@@ -143,7 +143,11 @@ re-attributes affected items. Sits on top of the existing reattribution engine (
    the who-is-doing-what layer instead. (Carries forward old B4 speaker-attribution + reference-doc
    down-weighting.)
 6. **Unresolved-identity + unparseable-stream alerts** (§5).
-7. **NL correction box** (§7).
+7. ✅ **NL correction box** (§7) — **Admin → Attribution** box: an admin describes a fix in plain
+   language → the team LLM (`completeTextOrNull`) parses it into a closed, scoped `CorrectionPlan`
+   (`lib/attribution/correction`) → read-only preview of the exact items → apply through the audited
+   single-writer (`lib/ingest/attribution-correction`). MVP = `reassign` (scoped match → member, or clear
+   to nobody); markSignal/identity-mapping corrections are future kinds on the same union.
 
 Substrate items from the earlier plan folded in: full commit bodies + per-PR narrative ingestion land as
 part of step 4's code-source normalizers; reference-doc down-weighting lands with step 5.
