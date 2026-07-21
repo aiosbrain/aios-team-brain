@@ -124,7 +124,9 @@ re-attributes affected items. Sits on top of the existing reattribution engine (
 1. ✅ **Attribution-health data layer + read** (no contract change) — durable version of the §1
    measurement: per-source + per-person breakdown, confidence, unresolved identities. Backs §5 + §6.
    *(Shipped: `lib/attribution/health.ts`, PR #316.)*
-2. **Per-person dashboard visual** (§6) on that read.
+2. ✅ **Per-person dashboard visual** (§6) on that read — **Admin → Attribution**
+   (`app/t/[team]/admin/attribution`), per-source health bars + per-person source breakdown; admin-gated
+   by the admin layout, enforced by `test/guards/attribution-health-admin-only`.
 3. ✅ **Resolve-at-ingest choke-point** (§2) — `lib/attribution/resolve-authors.attributeIncomingItem`
    resolves an incoming push's author from its frontmatter at ingest and passes the real member through
    (unresolved ⇒ `null`, **never the connector**); the same resolver replaced the per-source `switch` in

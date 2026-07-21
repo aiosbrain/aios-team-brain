@@ -173,3 +173,20 @@ corpus), or if a manual backfill alongside the scheduler becomes routine.
 **How:** Make the replace atomic — wrap DELETE+INSERT in a transaction and/or take a per-item
 advisory lock (`pg_advisory_xact_lock(hashtext(item_id))`), or switch to an upsert on
 `(item_id, chunk_idx)` with a trailing delete of now-excess chunk indexes.
+
+---
+
+## Admin pages that rely on the layout alone for authz (harden to self-check)
+
+**Status:** flagged (Fable review of #attribution-dashboard). Pre-existing, not introduced by that PR.
+
+Several `app/t/[team]/admin/*` pages (`members`, `data`, `keys`, …) gate solely on `admin/layout.tsx`'s
+role check. Per Next.js's own bundled docs (`authentication.md`, "Layouts and auth checks"), a layout is
+NOT a reliable auth boundary — it doesn't re-render on client-side navigation, so a page segment can be
+rendered/served without the layout's check re-running. With no RLS backstop (CLAUDE §5), a non-admin who
+soft-navigates from `/admin` to one of these tabs could get the page's flight payload (roster
+emails/roles on `members` — worse than the attribution page's names+counts).
+
+**Fix:** each admin page should self-check via `requireTeamAdmin(teamSlug)` before any privileged read
+(as `app/t/[team]/admin/attribution/page.tsx` now does), returning null when it's null. A guard test that
+every `admin/*/page.tsx` calls `requireTeamAdmin` would make it build-enforced.
