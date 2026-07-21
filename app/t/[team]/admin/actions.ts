@@ -52,7 +52,7 @@ export type InviteMemberResult =
  * Create a member and get them working sign-in access, one of two ways depending on this
  * deployment:
  *  - **Magic-link** (default when `magicLinkAvailable()` — mail delivery is configured): email a
- *    one-click, single-use sign-in link, valid 7 days. No password is set.
+ *    one-click, single-use sign-in link, valid 14 days. No password is set.
  *  - **Manual** (mail delivery isn't configured, or the admin explicitly typed `form.password`):
  *    set a password directly and return a complete, ready-to-paste invite (team brain URL,
  *    sign-in email, password) for the admin to share out-of-band (Slack, DM, etc) — this is the

@@ -109,7 +109,7 @@ export function InviteMember({
       <div className="prism-card flex flex-col gap-3 border border-violet/40 p-4">
         <p className="text-sm font-medium text-ink">
           {issued.emailDelivered
-            ? `Invite email sent to ${issued.email} with a one-time sign-in link (valid 7 days).`
+            ? `Invite email sent to ${issued.email} with a one-time sign-in link (valid 14 days).`
             : `Member created for ${issued.email}, but we couldn't confirm the invite email was delivered.`}
         </p>
         {!issued.emailDelivered && issued.loginUrl && (

@@ -13,12 +13,14 @@ const schema = z.object({
 /**
  * Request a magic sign-in link — an OPTIONAL secondary sign-in path (email+password at
  * POST /api/auth/login is the default; see that route's docblock). Never sets a session cookie
- * itself; only GET /auth/confirm does that, once the emailed link is actually clicked. Keeps the
- * explicit 403 for an unrecognized email (invite-only, no password to brute-force here — not a
- * meaningful enumeration risk for this self-hosted, small known-member product). The login form
- * only offers this option when a domain + mail provider are configured (`magicLinkAvailable`); the
- * route itself stays reachable regardless — with no provider configured, `sendMagicLink` degrades
- * to its existing dev-log/drop-and-log behavior (lib/auth/mailer), same as every other email here.
+ * itself; only GET /auth/confirm does that, once the emailed link is actually clicked. Always
+ * returns the same `{ ok: true }` shape whether or not the email belongs to a recognized member,
+ * and regardless of whether the provider actually accepted the send — telling the caller either
+ * fact would let them enumerate which emails have accounts here. (Superseded the earlier explicit
+ * 403 `not_recognized` response; see docs/ARCHITECTURE.md.) The login form only offers this option
+ * when a domain + mail provider are configured (`magicLinkAvailable`); the route itself stays
+ * reachable regardless — with no provider configured, `sendMagicLink` degrades to its existing
+ * dev-log/drop-and-log behavior (lib/auth/mailer), same as every other email here.
  */
 export async function POST(req: NextRequest) {
   let body: unknown;
@@ -35,12 +37,12 @@ export async function POST(req: NextRequest) {
   const safeNext = nextParam.startsWith("/") && !nextParam.startsWith("//") ? nextParam : "/";
 
   const raw = await issueMagicToken(email, safeNext);
-  if (!raw) {
-    // Not a recognized member — invite-only.
-    return NextResponse.json({ error: "not_recognized" }, { status: 403 });
+  if (raw) {
+    const appUrl = (process.env.APP_URL ?? new URL(req.url).origin).replace(/\/$/, "");
+    await sendMagicLink(email, `${appUrl}/auth/confirm?token=${raw}`);
   }
-
-  const appUrl = (process.env.APP_URL ?? new URL(req.url).origin).replace(/\/$/, "");
-  await sendMagicLink(email, `${appUrl}/auth/confirm?token=${raw}`);
+  // Uniform response for recognized/unrecognized email and for send success/failure alike —
+  // any divergence here is an enumeration or delivery-status oracle. Actual send failures are
+  // still visible to operators via console.error in lib/auth/mailer's deliver().
   return NextResponse.json({ ok: true });
 }

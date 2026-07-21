@@ -25,8 +25,9 @@ import type { ActorContext } from "./members";
  */
 
 // Generous window for an admin-issued invite (vs. the 15-minute TTL for a self-service login link)
-// — the invitee may not open their email right away.
-export const INVITE_LINK_TTL_MINUTES = 7 * 24 * 60;
+// — the invitee may not open their email right away. Bumped from 7 to 14 days (2026-07-21): a
+// week was proving too short in practice for invitees who don't check email right after an invite.
+export const INVITE_LINK_TTL_MINUTES = 14 * 24 * 60;
 
 export interface IssueInviteMember {
   id: string;

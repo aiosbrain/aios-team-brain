@@ -130,7 +130,7 @@ export interface InviteEmailContext {
   teamName: string;
   inviterName: string;
   /**
-   * Ready-to-click sign-in link (single-use, 7-day magic-link token). Present whenever
+   * Ready-to-click sign-in link (single-use, 14-day magic-link token). Present whenever
    * `magicLinkAvailable()` is true — the invite flow only calls `sendInviteEmail` in that case, since
    * without a link there's nothing useful to email (the manual copy-paste path handles that case
    * instead). Kept optional here, with the old "ask your admin" copy as a defensive fallback, so this
@@ -163,7 +163,7 @@ export async function sendInviteEmail(email: string, ctx: InviteEmailContext): P
   const explainer = inviteExplainer(ctx);
 
   const textAction = ctx.loginUrl
-    ? `Get started: ${ctx.loginUrl}\n\nThis link is single-use and valid for 7 days.`
+    ? `Get started: ${ctx.loginUrl}\n\nThis link is single-use and valid for 14 days.`
     : `Ask your admin for your sign-in password, then open the team brain and sign in with this email address.`;
 
   const t = ctx.tools;
@@ -183,7 +183,7 @@ export async function sendInviteEmail(email: string, ctx: InviteEmailContext): P
   const htmlAction = ctx.loginUrl
     ? `<p><a href="${escapeHtml(ctx.loginUrl)}" style="display:inline-block;background:#7c3aed;color:#fff;padding:10px 20px;border-radius:8px;text-decoration:none;font-weight:600;">Get started</a></p>
        <p style="font-size:13px;color:#666;">Or paste this link into your browser:<br>${escapeHtml(ctx.loginUrl)}</p>
-       <p style="font-size:13px;color:#666;">This link is single-use and valid for 7 days.</p>`
+       <p style="font-size:13px;color:#666;">This link is single-use and valid for 14 days.</p>`
     : `<p>Ask your admin for your sign-in password, then open the team brain and sign in with this email address.</p>`;
 
   let toolsHtml = "";
