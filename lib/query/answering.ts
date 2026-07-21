@@ -25,9 +25,13 @@ export async function resolveAnsweringKeys(db: DbClient, teamId: string): Promis
     getProviderSettings(db, teamId, "anthropic"),
     getProviderSettings(db, teamId, "openai"),
     getProviderSettings(db, teamId, "openrouter"),
-    db.from("teams").select("answering_provider, reasoning_model").eq("id", teamId).maybeSingle(),
+    db.from("teams").select("answering_provider, reasoning_model, reasoning_provider").eq("id", teamId).maybeSingle(),
   ]);
-  const teamRow = teamRes.data as { answering_provider: string | null; reasoning_model: string | null } | null;
+  const teamRow = teamRes.data as {
+    answering_provider: string | null;
+    reasoning_model: string | null;
+    reasoning_provider: string | null;
+  } | null;
   return {
     anthropicKey: anthropic.key,
     anthropicModel: anthropic.model,
@@ -37,5 +41,6 @@ export async function resolveAnsweringKeys(db: DbClient, teamId: string): Promis
     openrouterModel: openrouter.model,
     activeProvider: normalizeAnsweringProvider(teamRow?.answering_provider),
     reasoningModel: teamRow?.reasoning_model ?? null,
+    reasoningProvider: normalizeAnsweringProvider(teamRow?.reasoning_provider),
   };
 }

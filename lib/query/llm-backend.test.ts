@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   selectLlmBackend,
   describeAnswering,
+  describeReasoning,
   reasoningActive,
   OPENROUTER_BASE_URL,
   OPENAI_BASE_URL,
@@ -165,5 +166,69 @@ describe("reasoningActive — reasoning stays ON only for a DISTINCT reasoning m
     // reasoning role but NO reasoning model → falls back to the query model (reasoning off downstream)
     const noReasoning = { openrouterKey: "sk-or", openrouterModel: "openai/gpt-4o-mini" };
     expect(selectLlmBackend({}, noReasoning, { role: "reasoning" }).model).toBe("openai/gpt-4o-mini");
+  });
+});
+
+describe("selectLlmBackend — reasoning runs on its OWN provider when set", () => {
+  it("routes the reasoning role to reasoning_provider's backend + reasoning model (answer ≠ reason)", () => {
+    const keys = {
+      activeProvider: "openai" as const,
+      openaiKey: "sk-oai",
+      openaiModel: "gpt-4o",
+      openrouterKey: "sk-or",
+      reasoningProvider: "openrouter" as const,
+      reasoningModel: "qwen/qwen3.7-plus",
+    };
+    // Answering stays on OpenAI…
+    const answer = selectLlmBackend({}, keys, { role: "query" });
+    expect(answer.provider).toBe("openai");
+    expect(answer.model).toBe("gpt-4o");
+    // …reasoning runs on OpenRouter with the reasoning model.
+    const reason = selectLlmBackend({}, keys, { role: "reasoning" });
+    expect(reason.provider).toBe("openrouter");
+    expect(reason.model).toBe("qwen/qwen3.7-plus");
+  });
+
+  it("falls back to the ANSWERING backend when the reasoning provider isn't configured (keeps the model)", () => {
+    const keys = {
+      activeProvider: "openai" as const,
+      openaiKey: "sk-oai",
+      openaiModel: "gpt-4o",
+      reasoningProvider: "openrouter" as const, // but no openrouterKey → not configured
+      reasoningModel: "qwen/qwen3.7-plus",
+    };
+    const reason = selectLlmBackend({}, keys, { role: "reasoning" });
+    expect(reason.provider).toBe("openai"); // fell back to the answering provider
+    expect(reason.model).toBe("qwen/qwen3.7-plus"); // still the reasoning model
+  });
+
+  it("null reasoning provider = same provider as answering, just a different model (unchanged behavior)", () => {
+    const keys = { activeProvider: "openrouter" as const, openrouterKey: "sk-or", openrouterModel: "m", reasoningModel: "r" };
+    const reason = selectLlmBackend({}, keys, { role: "reasoning" });
+    expect(reason.provider).toBe("openrouter");
+    expect(reason.model).toBe("r");
+  });
+});
+
+describe("describeReasoning — the admin indicator", () => {
+  it("disabled when no distinct reasoning model is set (reasoning reuses the query model)", () => {
+    const d = describeReasoning({}, { activeProvider: "openai", openaiKey: "sk" });
+    expect(d.enabled).toBe(false);
+  });
+
+  it("reports the effective reasoning provider+model, and no fallback when configured", () => {
+    const d = describeReasoning(
+      {},
+      { activeProvider: "openai", openaiKey: "sk", openrouterKey: "sk-or", reasoningProvider: "openrouter", reasoningModel: "qwen/qwen3.7-plus" }
+    );
+    expect(d).toMatchObject({ enabled: true, provider: "openrouter", model: "qwen/qwen3.7-plus", usedFallback: false });
+  });
+
+  it("flags usedFallback when the requested reasoning provider isn't configured", () => {
+    const d = describeReasoning(
+      {},
+      { activeProvider: "openai", openaiKey: "sk", reasoningProvider: "openrouter", reasoningModel: "qwen/qwen3.7-plus" }
+    );
+    expect(d).toMatchObject({ enabled: true, requested: "openrouter", provider: "openai", usedFallback: true });
   });
 });
