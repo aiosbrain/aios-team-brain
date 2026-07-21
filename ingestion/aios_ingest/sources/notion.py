@@ -11,6 +11,7 @@ from typing import Iterator
 from ..normalize import RawDoc
 from .base import PullOnlySource, Source
 from ._llamahub import docs_to_raw, lazy_reader
+from .notion_authors import NotionAuthorClient
 
 
 class NotionSource(PullOnlySource, Source):
@@ -32,6 +33,14 @@ class NotionSource(PullOnlySource, Source):
             docs = reader.load_data(database_id=self._database_id)
         else:
             docs = reader.load_data(page_ids=self._page_ids)
-        yield from docs_to_raw(
-            docs, source=self.name, id_keys=("page_id", "id"), fallback_prefix="notion"
-        )
+        raws = docs_to_raw(docs, source=self.name, id_keys=("page_id", "id"), fallback_prefix="notion")
+        # Enrich each page with its Notion authors (created_by/last_edited_by → email) so items attribute
+        # to real people. One reused client (user cache + 429 retry); a page whose id we only have as the
+        # "notion-<i>" fallback can't be looked up, so we skip the API call for it.
+        with NotionAuthorClient(self._token) as authors:
+            for raw in raws:
+                if not raw.external_id.startswith("notion-"):
+                    found = authors.page_authors(raw.external_id)
+                    if found:
+                        raw.authors = found
+                yield raw

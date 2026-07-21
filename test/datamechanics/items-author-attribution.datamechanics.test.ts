@@ -92,4 +92,30 @@ describe("author attribution at ingest → stored member_id (real Postgres)", ()
     const { opts } = await attributeIncomingItem(db(), seed.teamId, p, seed.memberId);
     expect(opts).toBeUndefined();
   });
+
+  it("heals an UNATTRIBUTED item on an unchanged re-push, but never re-points/clears an attributed one", async () => {
+    // content_sha256 covers body+title only, so an author resolved AFTER first ingest (late source
+    // enrichment / a first-ingest flake) must still land on an unchanged re-push — but ONLY when the
+    // item is currently unattributed. A routine re-push must never revert an existing attribution (a
+    // manual NL correction, or a human self-push) — that stays the admin-triggered reattribute batch's job.
+    const seed = await seedTeam();
+    const other = await addConnector(seed.teamId); // any other member id to stand in as "a different author"
+    const auth = { teamId: seed.teamId, memberId: seed.memberId, apiKeyId: randomUUID() };
+    const p = payload({ source: "notion" }); // one payload → identical sha across pushes
+    const stored = async () =>
+      ((await db().from("items").select("member_id").eq("id", r1.id).single()).data as { member_id: string | null }).member_id;
+
+    const r1 = await ingestItem(db(), auth, p, "team", { authorMemberId: null }); // first ingest: unattributed
+    expect(await stored()).toBeNull();
+
+    const r2 = await ingestItem(db(), auth, p, "team", { authorMemberId: seed.memberId }); // unchanged + now resolved
+    expect(r2.status).toBe("unchanged");
+    expect(await stored()).toBe(seed.memberId); // null → healed
+
+    await ingestItem(db(), auth, p, "team", { authorMemberId: other }); // unchanged, resolves to a DIFFERENT member
+    expect(await stored()).toBe(seed.memberId); // NOT re-pointed (would revert a manual correction)
+
+    await ingestItem(db(), auth, p, "team", { authorMemberId: null }); // unchanged, unresolved
+    expect(await stored()).toBe(seed.memberId); // NOT cleared
+  });
 });

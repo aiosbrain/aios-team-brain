@@ -69,7 +69,7 @@ export async function ingestItem(
   // 2. existing item?
   const { data: existing } = await db
     .from("items")
-    .select("id, content_sha256")
+    .select("id, content_sha256, member_id")
     .eq("team_id", auth.teamId)
     .eq("project_id", project.id)
     .eq("path", payload.path)
@@ -82,7 +82,34 @@ export async function ingestItem(
     // re-pushes every unchanged item, so an `item.unchanged` audit here added ~one row/item/tick
     // (~24k/day at 500 items) — unbounded audit_log growth with no diagnostic value. The synced_at
     // bump is the freshness signal; create/update/delete stay audited on the paths below.
-    await db.from("items").update({ synced_at: now }).eq("id", existing.id);
+    //
+    // HEAL ATTRIBUTION on an unchanged re-push: `content_sha256` covers only body+title, so a resolved
+    // author that arrived AFTER first ingest (a source that only later exposes authorship, e.g. Notion
+    // enrichment, or a first-ingest API flake) would otherwise be discarded here forever. Rescue it —
+    // but ONLY when the item is currently UNATTRIBUTED (`member_id` null). We never RE-POINT an
+    // already-attributed item on a routine unchanged re-push: doing so would auto-revert a deliberate
+    // admin re-attribution (the NL correction / "Re-attribute content") on the very next sync, and
+    // clobber a human self-push's own attribution. Re-pointing an existing (wrong) attribution stays the
+    // job of the explicit, admin-triggered `reattributeItems` batch. Never clears to null either (a
+    // connector's unresolved re-push passes `authorMemberId: null`).
+    const patch: { synced_at: string; member_id?: string } = { synced_at: now };
+    if (opts?.authorMemberId && existing.member_id === null) {
+      patch.member_id = opts.authorMemberId;
+    }
+    await db.from("items").update(patch).eq("id", existing.id);
+    // Audit the rare heal (a genuine attribution change — unlike the per-tick synced_at bump, so it
+    // doesn't reintroduce the M4 unbounded-growth problem), so the change isn't a silent DB mutation.
+    if (patch.member_id) {
+      await audit(db, {
+        team_id: auth.teamId,
+        actor_kind: "system",
+        member_id: null,
+        action: "item.attribution_healed",
+        target_type: "items",
+        target_id: existing.id,
+        meta: { to: patch.member_id, source: payload.frontmatter?.source ?? null },
+      });
+    }
     // No projection on an unchanged push (the route also guards status !== "unchanged").
     return { status: "unchanged", id: existing.id, projectId: project.id };
   }
