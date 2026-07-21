@@ -54,14 +54,14 @@ describe("POST /api/auth/login (HTTP)", () => {
 });
 
 describe("POST /api/auth/request-magic-link (HTTP)", () => {
-  it("rejects an unknown email with 403 and never sets a cookie", async () => {
+  it("accepts an unknown email with the same 200 shape and never sets a cookie", async () => {
     const res = await fetch(`${BASE_URL}/api/auth/request-magic-link`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ email: `nobody-${randomUUID().slice(0, 8)}@nope.test` }),
     });
-    expect(res.status).toBe(403);
-    expect((await res.json()).error).toBe("not_recognized");
+    expect(res.status).toBe(200);
+    expect((await res.json()).ok).toBe(true);
     expect(res.headers.get("set-cookie")).toBeNull();
   });
 

@@ -184,13 +184,16 @@ Two principals, one tier model:
     email is unknown, has no password set, or the password is wrong, so login can't be used to
     enumerate members. Needs no email infrastructure.
   - **Magic link sign-in (OPTIONAL secondary path, needs a domain).** `POST /api/auth/request-magic-link`
-    issues + emails a single-use token (`issueMagicToken`/`sendMagicLink`; unknown emails get an
-    explicit 403) and never sets a session cookie itself; only `GET /auth/confirm`
-    (`redeemMagicToken`) does that, once the link is clicked. The login form only offers this
-    option when `magicLinkAvailable()` (`lib/auth/mailer`) is true — `APP_URL` set AND a mail
-    provider configured — since a link can't work without a stable domain to build it against or
-    anything to deliver it with; the route itself stays reachable regardless (degrades to the
-    mailer's existing dev-log/drop-silently behavior without a provider). `issueMagicToken`/
+    returns the same 200 `{ ok: true }` response for every syntactically valid email. After the
+    response finishes, recognized emails get a single-use token issued and emailed
+    (`issueMagicToken`/`sendMagicLink`); unknown emails stop after the member lookup. Moving the
+    lookup, token insertion, and provider I/O off the response path prevents response-shape and
+    timing-based account enumeration. The route never sets a session cookie itself; only `GET /auth/confirm`
+    (`redeemMagicToken`) does that, once the link is clicked. The login form only offers this option
+    when `magicLinkAvailable()` (`lib/auth/mailer`) is true — `APP_URL` set AND a mail provider
+    configured — since a link can't work without a stable domain to build it against or anything to
+    deliver it with; the route itself stays reachable regardless (degrades to the mailer's existing
+    dev-log/drop-silently behavior without a provider). `issueMagicToken`/
     `redeemMagicToken` also back the admin-CLI one-time-login-link tool (`scripts/admin.ts
 login-link`).
   - Either mechanism's **first** successful login (an invite's first activation) routes through
@@ -206,15 +209,12 @@ login-link`).
 - **Tiers** — `team` (sees all) vs `external` (sees only external). `admin`/`private`
   are rejected with **422** at the API and never reach the database.
 
-**Accepted behavior — the magic-link enumeration oracle.** `POST /api/auth/request-magic-link`'s
-explicit 403 `not_recognized` for an unknown email is a deliberate, disclosed design choice, not an
-oversight: this is an invite-only, self-hosted surface with a small known-member set, so confirming
-"does this email have an account" carries little practical risk, and the alternative (a fake-success
-response for a typo'd email) would silently break the sign-in UX with no way to recover. `POST
-/api/auth/login` — the default, always-available sign-in path — deliberately does NOT make the same
-tradeoff: its failure response stays a uniform 401 `invalid_credentials` regardless of cause, because
-password login is reachable unconditionally while the magic-link route is only ever offered by the
-login form when an admin has opted into mail delivery (`magicLinkAvailable()`).
+**Uniform magic-link response.** `POST /api/auth/request-magic-link` returns 200 `{ ok: true }` for
+every syntactically valid email. It schedules member lookup, token issuance, and delivery with
+Next.js `after()`, so recognized and unknown emails share the same response path and cannot be
+distinguished through status, payload, or provider/DB latency. Invalid payloads still return 422.
+`POST /api/auth/login` likewise keeps a uniform 401 `invalid_credentials` response for every
+credential failure.
 
 ## Key flows
 
@@ -675,7 +675,7 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 - `DELETE /api/dashboard/conversations/:id` — soft-archive a thread (owner-only)
 - `GET /api/dashboard/team-work` — dashboard "Working On": per-person summary (narrative arcs) + open tasks + recent accomplishments; session-authed; tier-scoped
 - `POST /api/auth/login` — email+password sign-in, the DEFAULT path (invite-only; uniform 401 on any failure)
-- `POST /api/auth/request-magic-link` — OPTIONAL secondary sign-in: issues + emails a single-use magic link (invite-only; 403 if unknown); never sets a session cookie itself; the login form only offers it when `magicLinkAvailable()` (a domain + mail provider are configured)
+- `POST /api/auth/request-magic-link` — OPTIONAL secondary sign-in: uniform 200 for every syntactically valid email; recognized emails get a single-use magic link issued + emailed after the response; never sets a session cookie itself; the login form only offers it when `magicLinkAvailable()` (a domain + mail provider are configured)
 - `GET /api/dashboard/social/media/:id` — serve a generated image's bytes (session-authed, admin-only; team resolved from the asset)
 
 <!-- /drift:routes -->
