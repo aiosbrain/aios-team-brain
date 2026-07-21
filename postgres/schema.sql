@@ -114,18 +114,25 @@ create table if not exists teams (
   -- Optional distinct model for reasoning-heavy tasks (narrative arc synthesis). Null = reuse the
   -- query model (the active provider's config.model). See lib/query/llm-backend (role="reasoning").
   reasoning_model text,
+  -- Optional distinct PROVIDER for the reasoning model. Null = reuse the answering provider; set =
+  -- reasoning runs on its own backend (answer on one provider, reason on another).
+  reasoning_provider text check (reasoning_provider in ('anthropic', 'openai', 'openrouter', 'local')),
   created_at timestamptz not null default now()
 );
 -- Additive columns for existing deployments.
 alter table teams add column if not exists primary_pm_provider text;
 alter table teams add column if not exists answering_provider text;
 alter table teams add column if not exists reasoning_model text;
+alter table teams add column if not exists reasoning_provider text;
 do $$ begin
   if not exists (select 1 from pg_constraint where conname = 'teams_primary_pm_provider_check') then
     alter table teams add constraint teams_primary_pm_provider_check check (primary_pm_provider in ('plane', 'linear'));
   end if;
   if not exists (select 1 from pg_constraint where conname = 'teams_answering_provider_check') then
     alter table teams add constraint teams_answering_provider_check check (answering_provider in ('anthropic', 'openai', 'openrouter', 'local'));
+  end if;
+  if not exists (select 1 from pg_constraint where conname = 'teams_reasoning_provider_check') then
+    alter table teams add constraint teams_reasoning_provider_check check (reasoning_provider in ('anthropic', 'openai', 'openrouter', 'local'));
   end if;
 end $$;
 

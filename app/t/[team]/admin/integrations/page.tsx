@@ -14,7 +14,7 @@ import { getRetrievalHealth } from "@/lib/query/retrieval-health";
 import { RetrievalHealthCard } from "@/components/admin/retrieval-health-card";
 import { getPipelineHealth } from "@/lib/ingest/pipeline-health";
 import { PipelineHealthBanner } from "@/components/admin/pipeline-health-banner";
-import { describeAnswering } from "@/lib/query/llm-backend";
+import { describeAnswering, describeReasoning } from "@/lib/query/llm-backend";
 import { normalizeAnsweringProvider } from "@/lib/query/answering";
 
 export const metadata: Metadata = { title: "Integrations" };
@@ -35,7 +35,7 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ t
   const user = await getSessionUser();
   const { data: team } = await sessionDb
     .from("teams")
-    .select("id, primary_pm_provider, answering_provider, reasoning_model")
+    .select("id, primary_pm_provider, answering_provider, reasoning_model, reasoning_provider")
     .eq("slug", teamSlug)
     .maybeSingle();
   if (!team) return null;
@@ -71,22 +71,29 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ t
   const hasKey = (type: "anthropic" | "openai" | "openrouter") =>
     !!integrations.find((i) => i.type === type)?.hasSecret;
   const answeringProvider = normalizeAnsweringProvider(team.answering_provider);
+  const reasoningProvider = normalizeAnsweringProvider(team.reasoning_provider);
+  const reasoningModel = (team.reasoning_model as string | null) ?? null;
   const localBaseUrl = process.env.LLM_BASE_URL ?? undefined;
-  const answering = describeAnswering(
-    { LLM_BASE_URL: localBaseUrl, LLM_MODEL: process.env.LLM_MODEL },
-    {
-      anthropicKey: "env-or-set", // anthropic answers via env key even when no team key is stored
-      anthropicModel: modelOf("anthropic"),
-      openaiKey: hasKey("openai") ? "set" : null,
-      openaiModel: modelOf("openai"),
-      openrouterKey: hasKey("openrouter") ? "set" : null,
-      openrouterModel: modelOf("openrouter"),
-      activeProvider: answeringProvider,
-    }
-  );
-  const answeringModels: Record<"anthropic" | "openai", string | null> = {
+  // One key set drives both the answering + reasoning indicators (no key is decrypted — a non-empty
+  // sentinel stands in for "key is set" since the resolver only checks presence).
+  const answeringKeys = {
+    anthropicKey: "env-or-set", // anthropic answers via env key even when no team key is stored
+    anthropicModel: modelOf("anthropic"),
+    openaiKey: hasKey("openai") ? "set" : null,
+    openaiModel: modelOf("openai"),
+    openrouterKey: hasKey("openrouter") ? "set" : null,
+    openrouterModel: modelOf("openrouter"),
+    activeProvider: answeringProvider,
+    reasoningModel,
+    reasoningProvider,
+  };
+  const llmEnv = { LLM_BASE_URL: localBaseUrl, LLM_MODEL: process.env.LLM_MODEL };
+  const answering = describeAnswering(llmEnv, answeringKeys);
+  const reasoning = describeReasoning(llmEnv, answeringKeys);
+  const answeringModels: Record<"anthropic" | "openai" | "openrouter", string | null> = {
     anthropic: modelOf("anthropic"),
     openai: modelOf("openai"),
+    openrouter: modelOf("openrouter"),
   };
   const localConfigured = !!localBaseUrl;
   const scannedRepos = Array.from(
@@ -138,9 +145,15 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ t
           effective: { provider: answering.provider, model: answering.model },
           usedFallback: answering.usedFallback,
           localConfigured,
+          anthropicConfigured: true, // anthropic answers via the env key even without a team key
           openrouterConfigured: hasKey("openrouter"),
           openaiConfigured: hasKey("openai"),
-          reasoningModel: (team.reasoning_model as string | null) ?? null,
+          reasoning: {
+            provider: reasoningProvider,
+            model: reasoningModel,
+            effective: reasoning.enabled ? { provider: reasoning.provider, model: reasoning.model } : null,
+            usedFallback: reasoning.usedFallback,
+          },
         }}
       />
       <MemberOnboardingPanel teamSlug={teamSlug} values={onboardingValues} />
