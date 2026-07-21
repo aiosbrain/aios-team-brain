@@ -1,6 +1,7 @@
 import { requireTeamAdmin } from "@/lib/auth/guard";
 import { getAttributionHealth } from "@/lib/attribution/health";
 import { AttributionHealthView } from "@/components/admin/attribution-health-view";
+import { AttributionCorrectionBox } from "@/components/admin/attribution-correction-box";
 
 /**
  * Admin → Attribution. Per-source + per-person attribution health (who each data stream lands on), so
@@ -24,6 +25,7 @@ export default async function AttributionAdminPage({ params }: { params: Promise
         <h2 className="text-lg font-semibold text-ink">Attribution health</h2>
         <p className="text-sm text-ink-secondary">Is each data stream landing on the right person?</p>
       </div>
+      <AttributionCorrectionBox teamSlug={teamSlug} />
       <AttributionHealthView health={health} />
     </div>
   );
