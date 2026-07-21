@@ -121,12 +121,22 @@ re-attributes affected items. Sits on top of the existing reattribution engine (
 
 ## 8. Build order
 
-1. **Attribution-health data layer + read** (no contract change) — durable version of the §1
+1. ✅ **Attribution-health data layer + read** (no contract change) — durable version of the §1
    measurement: per-source + per-person breakdown, confidence, unresolved identities. Backs §5 + §6.
+   *(Shipped: `lib/attribution/health.ts`, PR #316.)*
 2. **Per-person dashboard visual** (§6) on that read.
-3. **`authors[]` contract + resolve-at-ingest choke-point** (§2) — the structural fix; **guarded**
-   brain-api contract change.
-4. **Per-source normalizers**, sequenced to rollout: **Notion → Google Docs** first (per Chetan).
+3. ✅ **Resolve-at-ingest choke-point** (§2) — `lib/attribution/resolve-authors.attributeIncomingItem`
+   resolves an incoming push's author from its frontmatter at ingest and passes the real member through
+   (unresolved ⇒ `null`, **never the connector**); the same resolver replaced the per-source `switch` in
+   `lib/ingest/reattribute`, so live + batch can't drift. **Decision: attribution is carried in
+   `frontmatter` (structured `authors[]` + source-specific keys), NOT a new wire field** — the wire
+   contract's prose source (`brain-api.md`) lives in the `aios-workspace` repo, so a first-class wire
+   `authors[]` would need a coordinated cross-repo `brain-api.md` + `BRAIN_API_VERSION` bump. Frontmatter
+   is already free-form on the wire, so this delivers the same outcome with no guarded-seam change.
+   First-classing `authors[]` on the wire (validation/discoverability) remains a future coordinated bump.
+4. **Per-source normalizers** — each connector populates `frontmatter.authors[]`. Sequenced to rollout:
+   **Notion → Google Docs** first (per Chetan). (The resolver already accepts them; this is the sidecar
+   work to emit the author signal.)
 5. **Signal-source reclassification** (§3): meetings/calendar stop counting as one person's output; feed
    the who-is-doing-what layer instead. (Carries forward old B4 speaker-attribution + reference-doc
    down-weighting.)
