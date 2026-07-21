@@ -137,8 +137,12 @@ re-attributes affected items. Sits on top of the existing reattribution engine (
    is already free-form on the wire, so this delivers the same outcome with no guarded-seam change.
    First-classing `authors[]` on the wire (validation/discoverability) remains a future coordinated bump.
 4. **Per-source normalizers** — each connector populates `frontmatter.authors[]`. Sequenced to rollout:
-   **Notion → Google Docs** first (per Chetan). (The resolver already accepts them; this is the sidecar
-   work to emit the author signal.)
+   - ✅ **Notion** — `ingestion/.../sources/notion_authors.py` fetches each page's `created_by`/
+     `last_edited_by` (Notion API) → email/name → structured `authors[]`; the shared RawDoc→frontmatter
+     plumbing (`normalize.py`) carries `authors[]` for any document source. Users with a visible email
+     resolve against the roster automatically; user-id-only ones need a `member_identities` notion
+     mapping (surfaced by the attribution-health read).
+   - **Google Docs** next (owner + revision/comment authors → `authors[]`).
 5. **Signal-source reclassification** (§3): meetings/calendar stop counting as one person's output; feed
    the who-is-doing-what layer instead. (Carries forward old B4 speaker-attribution + reference-doc
    down-weighting.)
@@ -151,3 +155,25 @@ re-attributes affected items. Sits on top of the existing reattribution engine (
 
 Substrate items from the earlier plan folded in: full commit bodies + per-PR narrative ingestion land as
 part of step 4's code-source normalizers; reference-doc down-weighting lands with step 5.
+
+## 9. Known gap — attribution authority (manual vs resolved)
+
+`items.member_id` has no "who set this" marker, so the layers that write it can't tell a **deliberate
+admin correction** from an **auto-resolved** value. Two consequences (both narrow, documented, deferred):
+
+- **Unchanged-repush heal is fill-only.** `ingestItem`'s fast-path heals attribution on an unchanged
+  re-push ONLY when the item is currently unattributed (`member_id === null`) — it never re-points an
+  already-attributed item, precisely so a routine sync can't auto-revert a manual NL correction. The
+  cost: an item auto-attributed to the *wrong* member isn't corrected by the live path (the
+  admin-triggered `reattributeItems` batch / the NL box remain the way to re-point).
+- **"Correct to nobody" can be refilled.** An admin correcting an author-bearing synced item to *nobody*
+  sets `member_id = null`; the next sync's fill-only heal (null → resolved) can refill it. A correction
+  to a real person is safe (non-null → heal skips); only the "nobody" case is exposed.
+
+**Durable fix (follow-up):** an authority marker on the shared layer — `items.attributed_via:
+'manual' | 'resolved'` — where `manual` (NL correction / admin) always wins and the heal/batch only
+touch `resolved` rows. That closes both gaps at the data layer for every surface at once. Also: the
+unchanged-repush path doesn't persist changed `frontmatter`, so a pre-enrichment item's stored
+`authors[]` stays empty until a body edit — the reattribute *button* (reads stored frontmatter) can't
+see it, though the live heal does; persisting frontmatter on the unchanged-when-differs path would
+converge them.

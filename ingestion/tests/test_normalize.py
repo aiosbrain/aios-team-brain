@@ -61,3 +61,13 @@ def test_same_doc_hashes_identically_idempotent():
     a = normalize(_doc(), NormalizeConfig())
     b = normalize(_doc(), NormalizeConfig())
     assert a.content_sha256 == b.content_sha256
+
+
+def test_structured_authors_emitted_to_frontmatter():
+    authors = [{"role": "author", "provider": "notion", "external_id": "u1", "email": "a@corp.com"}]
+    item = normalize(_doc(authors=authors), NormalizeConfig())
+    assert item.frontmatter["authors"] == authors
+
+
+def test_no_authors_key_when_absent():
+    assert "authors" not in normalize(_doc(), NormalizeConfig()).frontmatter
