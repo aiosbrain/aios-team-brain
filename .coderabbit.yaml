@@ -1,53 +1,288 @@
-version: "2"
+# yaml-language-server: $schema=https://storage.googleapis.com/coderabbit_public_assets/schema.v2.json
+#
+# CodeRabbit — aios-team-brain
+# ---------------------------------------------------------------------------
+# NOTE: there is no `version:` key. The schema root is additionalProperties:false
+# and `version` is not one of the ten permitted keys — the previous config here
+# carried it and was likely failing validation. Do not reintroduce it.
+#
+# PLAN. Org is on Pro ($30/seat/mo), but this repo is PUBLIC and CodeRabbit's
+# plans page states public repos receive Pro+ features free (its older KB says
+# Pro-only; the two conflict, unresolved). Pro+-gated blocks are included
+# because on plain Pro they parse and simply never run.
+#   >> Blocks marked "PRO+ ONLY" may be silently inert. Verify with
+#   >> `@coderabbitai configuration` on a PR before relying on them.
+#
+# RATE LIMITS. Pro = 5 reviews/dev/hour, plus a 7-day fair-use throttle (60+
+# reviews in 7 days => 1/hour). This repo runs ~285 PRs/month, so auto-review is
+# ON but filtered hard; auto_pause_after_reviewed_commits is the decisive lever.
+# `@coderabbitai rate limit` reports remaining budget without consuming one.
+#
+# DIVISION OF LABOUR. CI owns lint/typecheck/tests; local Bugbot, Cursor Bugbot
+# and Claude reviews own diff-local correctness. CodeRabbit is pointed at what
+# they cannot see: cross-PR memory, intent-vs-issue, tier-boundary enforcement,
+# and unsafe Postgres migrations.
+# ---------------------------------------------------------------------------
+
 language: "en-US"
+tone_instructions: "Be terse. No praise, no restating the diff. Only report what would change the merge decision."
 
 reviews:
   profile: "chill"
-  request_changes_workflow: false
+  request_changes_workflow: false   # `mode: error` is cosmetic until this is true
+
   high_level_summary: true
   poem: false
-  review_status: true
-  collapse_walkthrough: false
+  in_progress_fortune: false
+  sequence_diagrams: false
+  changed_files_summary: false
+  suggested_reviewers: false
+  suggested_labels: false
+  review_status: false
+  estimate_code_review_effort: false
+  collapse_walkthrough: true
+  abort_on_close: true
+  enable_prompt_for_ai_agents: true
+
+  assess_linked_issues: true
+  related_prs: true
+  related_issues: true
+
   auto_review:
     enabled: true
     drafts: false
+    auto_incremental_review: true
+    auto_pause_after_reviewed_commits: 1    # THE rate-limit lever
     base_branches:
-      - main
+      - "^main$"                            # regex, not glob; extends default
+    ignore_title_keywords:
+      - "WIP"
+      - "DO NOT MERGE"
+      - "[skip review]"
+      - "chore"
+      - "docs:"
+      - "deps"
+      - "release"
+      - "bump"
+    ignore_usernames:
+      - "dependabot[bot]"
+      - "renovate[bot]"
+      - "github-actions[bot]"
 
   path_filters:
+    - "!node_modules/**"
     - "!.next/**"
     - "!ingestion/.venv/**"
     - "!ingestion/**/*.pyc"
     - "!coverage/**"
-    - "!node_modules/**"
-    - "!*.lock"
+    - "!fixtures/**"
+    - "!**/*.lock"
+    - "!package-lock.json"
+    - "!code-review-*.md"
 
   path_instructions:
-    - path: "app/api/**"
-      instructions: |
-        Check that every new route is documented in the <!-- drift:routes --> block of
-        docs/ARCHITECTURE.md. Flag if not.
-    - path: "postgres/schema.sql"
-      instructions: |
-        Check that every new table is documented in the <!-- drift:tables --> block of
-        docs/ARCHITECTURE.md. Flag if not.
-    - path: "ingestion/**"
-      instructions: |
-        Check that any new ingest source is registered in sources/registry.py and
-        documented in the <!-- drift:sources --> block of docs/ARCHITECTURE.md.
     - path: "lib/**"
       instructions: |
-        Verify tier access: functions that return data must filter by the caller's
-        access tier (admin/team/external). The brain rejects admin-tier at the API
-        boundary (422) — never expose admin content to team-tier callers.
+        Tier access is the safety boundary. Functions returning data MUST filter
+        by the caller's access tier (admin/team/external). The brain rejects
+        admin-tier at the API boundary with 422, but that must never be the only
+        defence — a lib function that returns unfiltered rows is a real leak even
+        if a route happens to filter later. Flag any query path that widens what
+        a team-tier or external-tier caller can see.
+
+    - path: "app/api/**"
+      instructions: |
+        Every new route must be documented in the <!-- drift:routes --> block of
+        docs/ARCHITECTURE.md — flag if not. Also verify: the route authenticates
+        before reading any tier-scoped data, and admin-tier content is rejected
+        with 422 rather than silently filtered.
+
+    - path: "postgres/schema.sql"
+      instructions: |
+        Every new table must be documented in the <!-- drift:tables --> block of
+        docs/ARCHITECTURE.md — flag if not. Flag destructive migrations (DROP,
+        ALTER ... TYPE, NOT NULL without a default) that would lock or lose data
+        on a live table, and any table holding tier-scoped content that lacks a
+        tier/access column.
+
+    - path: "ingestion/**"
+      instructions: |
+        Any new ingest source must be registered in sources/registry.py and
+        documented in the <!-- drift:sources --> block of docs/ARCHITECTURE.md.
+        Flag ingestion paths that store content without an explicit access tier —
+        untagged content must default to the most restrictive tier, never to team.
+
     - path: "**/*.test.ts"
       instructions: |
-        Tests should be spec-first. datamechanics tests must use the real Postgres
-        test DB (DATABASE_TEST_URL) — no mocks for persistence or RLS checks.
+        Tests are spec-first. datamechanics tests MUST use the real Postgres test
+        DB (DATABASE_TEST_URL) — no mocks for persistence or RLS checks, since a
+        mocked RLS test proves nothing. Flag any new mock standing in for a tier
+        or RLS boundary.
+
+    - path: "**/*.{ts,tsx}"
+      instructions: |
+        Do NOT comment on formatting or import order — ESLint and Prettier own
+        those in CI. Focus on: unawaited promises, swallowed errors, `any`
+        escapes on data crossing a tier boundary, and unclosed DB connections.
+
+    - path: "**/*.md"
+      instructions: |
+        No prose, grammar, or style nits. Only flag statements that are factually
+        wrong about the code or reference removed APIs, routes, or tables.
+
+  pre_merge_checks:
+    override_requested_reviewers_only: false
+    title:
+      mode: "warning"
+      requirements: |
+        Conventional Commits: <type>(<scope>): <subject>. Imperative mood, under
+        72 chars. Types: feat, fix, chore, docs, refactor, test, ci, perf.
+        Feature work should carry a Linear ID (AIO-NNN) in the title or body.
+    description:
+      mode: "off"
+    issue_assessment:
+      mode: "warning"     # scope-creep detection against the linked Linear issue
+    docstrings:
+      mode: "off"
+      threshold: 80
+
+    # ----- PRO+ ONLY — may be silently inert on plain Pro. See header. -----
+    custom_checks:
+      - name: "tier filtering on data-returning paths"
+        mode: "warning"
+        instructions: |
+          Pass: the diff adds no new data-returning function or route, OR every
+          new one filters by the caller's access tier before returning rows.
+          Fail: a new query, lib function, or API route returns content without
+          applying a tier filter, or relies solely on the 422 boundary check
+          rather than filtering at the query layer.
+
+      - name: "brain-api contract version bump"
+        mode: "warning"
+        instructions: |
+          Applies when the diff touches sync endpoints under app/api/ that
+          implement the brain-api contract shared with aios-workspace.
+          Pass: no sync-contract surface changed, OR the change is additive and
+          backward compatible, OR the PR description names the brain-api revision
+          it targets and states that aios-workspace needs a matching change.
+          Fail: request/response shapes, item kinds, or endpoint paths change with
+          no mention of the contract version in the PR description.
+
+      - name: "unsafe migration guard"
+        mode: "warning"
+        instructions: |
+          Applies only to changes under postgres/ or any migration file.
+          Pass: no schema change, OR the change is additive (new table, new
+          nullable column, new index built concurrently).
+          Fail: a column or table is dropped or renamed, a NOT NULL constraint is
+          added without a default, or a column type is altered in place, without
+          the PR description explaining the migration and rollback plan.
 
   finishing_touches:
     docstrings:
       enabled: false
+    autofix:
+      enabled: true
+    unit_tests:
+      enabled: false      # PRO+ ONLY
+    simplify:
+      enabled: false      # PRO+ ONLY
+
+  # ----- PRO+ ONLY — may be silently inert on plain Pro. -----
+  post_merge_actions:
+    - name: "Flag architecture doc drift"
+      enabled: true
+      prompt: |
+        If this merge added an API route, a Postgres table, or an ingest source
+        without a corresponding entry in the matching <!-- drift:* --> block of
+        docs/ARCHITECTURE.md, emit a short text report naming exactly what is
+        missing. If nothing is missing, do nothing.
+
+  tools:
+    # --- disabled: CI owns these ---
+    eslint:
+      enabled: false        # npm run lint
+    biome:
+      enabled: false
+    oxc:
+      enabled: false
+    markdownlint:
+      enabled: false
+    languagetool:
+      enabled: false
+    # --- enabled: not covered by this repo's CI ---
+    gitleaks:
+      enabled: true
+    trufflehog:
+      enabled: true
+    semgrep:
+      enabled: true
+    osvScanner:
+      enabled: true
+    actionlint:
+      enabled: true
+    zizmor:
+      enabled: true
+    shellcheck:
+      enabled: true
+    # Unsafe Postgres migration detector — high value against postgres/schema.sql.
+    squawk:
+      enabled: true
+    # The Python ingestion path is not linted by CI; ruff is the cheapest cover.
+    ruff:
+      enabled: true
+    presidio:
+      enabled: true         # PII detection on an ingestion-heavy repo
+    skillspector:
+      enabled: true
+
+  slop_detection:
+    enabled: true
 
 chat:
+  art: false
   auto_reply: true
+  integrations:
+    linear:
+      usage: "enabled"      # "auto" would disable this on a public repo
+
+knowledge_base:
+  opt_out: false
+  web_search:
+    enabled: true
+  code_guidelines:
+    enabled: true
+    filePatterns:
+      - "RESOLVER.md"
+      - "docs/ARCHITECTURE.md"
+      - "DEVELOPMENT.md"
+      - "CONTRIBUTING.md"
+  learnings:
+    scope: "local"
+    approval_delay: 0
+  issues:
+    scope: "local"
+  pull_requests:
+    scope: "local"
+  linear:
+    usage: "enabled"
+    team_keys:
+      - "AIO"
+  # Pro allows exactly 1 linked repo — spent on the client half of the contract.
+  linked_repositories:
+    - repository: "aiosbrain/aios-workspace"
+      instructions: |
+        The individual workspace toolkit and client side of the pinned sync
+        contract (its docs/brain-api.md is the authoritative document). When
+        reviewing changes to sync endpoints here, check the client's expectations
+        in that file. Clients must ignore unrecognised item kinds, so additive
+        changes are safe; shape changes are not.
+
+code_generation:
+  docstrings:
+    language: "en-US"
+    path_instructions:
+      - path: "**/*.{ts,tsx}"
+        instructions: "TSDoc with @param/@returns. State the access tier a function's return value is scoped to."
+      - path: "ingestion/**/*.py"
+        instructions: "Google-style docstrings. Document the source system and the access tier assigned on ingest."
