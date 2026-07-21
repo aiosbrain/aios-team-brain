@@ -56,12 +56,12 @@ Reason from this table, not from a random call site.
 
 ### Managed GitHub gateway sources of truth (contract v1.10; feature disabled)
 
-| State | Store | Sole writer | Readers | Access/retention |
-|---|---|---|---|---|
-| Gateway service identity, independently rotatable credentials, and Executor subjects | `gateway_service_identities`, `gateway_service_credentials`, `executor_subject_bindings` | `lib/gateway/persistence.ts`; admin mutations in `lib/gateway/admin-persistence.ts` | internal gateway and strict admin-session routes | stable identity remains the binding authority; authentication reads only active credential rows; legacy identity digests are immutable compatibility data; exact team + service + tenant + subject binding; revoke rather than delete |
-| Member GitHub connection, one-use lease, and limiter | `gateway_connections`, `gateway_resolution_leases`, `gateway_rate_limits` | `lib/gateway/persistence.ts` | internal resolver/authorization routes | exact team + member + subject; GitHub-only; opaque refs; lease hashes only; 30-second maximum TTL; single transactional consumption; fail-closed DB-time buckets |
-| Durable request, approval, and claim state | `gateway_executions`, `gateway_approvals` | `lib/gateway/persistence.ts`; decisions in `lib/gateway/admin-persistence.ts` | resume route and managed Approvals admin section | encrypted request envelope plus immutable hash/principal/resource snapshots; 15-minute maximum approval TTL; database-time expiry; credential-scoped advisory lock remains held from committed winning claim through the one request-local decrypt/seal callback |
-| Strict gateway compliance audit | `gateway_audit_log` | `lib/gateway/persistence.ts` and `lib/gateway/admin-persistence.ts`, in the same transaction as state | managed admin routes and compliance review | append-only trigger; partial uniqueness for decision/claim/expiry/rotation/revocation/settlement; fixed non-secret columns only; no JSON escape hatch; team deletion is restricted while retained records exist |
+| State                                                                                | Store                                                                                    | Sole writer                                                                                           | Readers                                          | Access/retention                                                                                                                                                                                                                                                 |
+| ------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- | ------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Gateway service identity, independently rotatable credentials, and Executor subjects | `gateway_service_identities`, `gateway_service_credentials`, `executor_subject_bindings` | `lib/gateway/persistence.ts`; admin mutations in `lib/gateway/admin-persistence.ts`                   | internal gateway and strict admin-session routes | stable identity remains the binding authority; authentication reads only active credential rows; legacy identity digests are immutable compatibility data; exact team + service + tenant + subject binding; revoke rather than delete                            |
+| Member GitHub connection, one-use lease, and limiter                                 | `gateway_connections`, `gateway_resolution_leases`, `gateway_rate_limits`                | `lib/gateway/persistence.ts`                                                                          | internal resolver/authorization routes           | exact team + member + subject; GitHub-only; opaque refs; lease hashes only; 30-second maximum TTL; single transactional consumption; fail-closed DB-time buckets                                                                                                 |
+| Durable request, approval, and claim state                                           | `gateway_executions`, `gateway_approvals`                                                | `lib/gateway/persistence.ts`; decisions in `lib/gateway/admin-persistence.ts`                         | resume route and managed Approvals admin section | encrypted request envelope plus immutable hash/principal/resource snapshots; 15-minute maximum approval TTL; database-time expiry; credential-scoped advisory lock remains held from committed winning claim through the one request-local decrypt/seal callback |
+| Strict gateway compliance audit                                                      | `gateway_audit_log`                                                                      | `lib/gateway/persistence.ts` and `lib/gateway/admin-persistence.ts`, in the same transaction as state | managed admin routes and compliance review       | append-only trigger; partial uniqueness for decision/claim/expiry/rotation/revocation/settlement; fixed non-secret columns only; no JSON escape hatch; team deletion is restricted while retained records exist                                                  |
 
 The gateway writer guard is `node scripts/check-gateway-writers.mjs`. Its only approved owners are
 `lib/gateway/persistence.ts` and the narrowly scoped `lib/gateway/admin-persistence.ts`. They use a
@@ -123,7 +123,7 @@ flowchart LR
 
 ## Auth & access tiers
 
-This server **implements brain-api v1.9** (the wire contract; source of truth:
+This server **implements brain-api v1.9** (the shipped member-facing wire contract; source of truth:
 `aios-workspace/docs/brain-api.md`; v1.8 added the subscriptions endpoint,
 `POST /api/v1/subscriptions`). That version is pinned in code as `BRAIN_API_VERSION`
 (`lib/api/version.ts`), asserted against this sentence by
@@ -184,15 +184,19 @@ Two principals, one tier model:
     email is unknown, has no password set, or the password is wrong, so login can't be used to
     enumerate members. Needs no email infrastructure.
   - **Magic link sign-in (OPTIONAL secondary path, needs a domain).** `POST /api/auth/request-magic-link`
-    issues + emails a single-use token (`issueMagicToken`/`sendMagicLink`; unknown emails get an
-    explicit 403) and never sets a session cookie itself; only `GET /auth/confirm`
-    (`redeemMagicToken`) does that, once the link is clicked. The login form only offers this
-    option when `magicLinkAvailable()` (`lib/auth/mailer`) is true — `APP_URL` set AND a mail
-    provider configured — since a link can't work without a stable domain to build it against or
-    anything to deliver it with; the route itself stays reachable regardless (degrades to the
-    mailer's existing dev-log/drop-silently behavior without a provider). `issueMagicToken`/
-    `redeemMagicToken` also back the admin-CLI one-time-login-link tool (`scripts/admin.ts
-login-link`).
+    returns the same 200 `{ ok: true }` response for every syntactically valid email (per-IP
+    rate-limited, `magic-link:<ip>`, 5/min → 429). After the response finishes, recognized emails get
+    a single-use token issued and emailed (`issueMagicToken`/`sendMagicLink`); unknown emails stop
+    after the member lookup. Moving the lookup, token insertion, and provider I/O off the response
+    path removes the response-shape enumeration oracle (and any first-order timing difference). The
+    emailed link is always built against the trusted `APP_URL` (`appBaseUrl()`), never the spoofable
+    request `Host`; with no `APP_URL` set the after-job no-ops (nothing safe to send). The route never
+    sets a session cookie itself; only `GET /auth/confirm` (`redeemMagicToken`) does that, once the
+    link is clicked. The login form only offers this option when `magicLinkAvailable()`
+    (`lib/auth/mailer`) is true — `APP_URL` set AND a mail provider configured — since a link can't
+    work without a stable domain to build it against or anything to deliver it with; the route itself
+    stays reachable regardless. `issueMagicToken`/`redeemMagicToken` also back the admin-CLI
+    one-time-login-link tool (`scripts/admin.ts login-link`).
   - Either mechanism's **first** successful login (an invite's first activation) routes through
     `/auth/welcome` — name, team, and inviter (resolved from the append-only `audit_log`, no
     `invited_by` column needed) — before landing on the dashboard; magic-link-only accounts can
@@ -206,15 +210,18 @@ login-link`).
 - **Tiers** — `team` (sees all) vs `external` (sees only external). `admin`/`private`
   are rejected with **422** at the API and never reach the database.
 
-**Accepted behavior — the magic-link enumeration oracle.** `POST /api/auth/request-magic-link`'s
-explicit 403 `not_recognized` for an unknown email is a deliberate, disclosed design choice, not an
-oversight: this is an invite-only, self-hosted surface with a small known-member set, so confirming
-"does this email have an account" carries little practical risk, and the alternative (a fake-success
-response for a typo'd email) would silently break the sign-in UX with no way to recover. `POST
-/api/auth/login` — the default, always-available sign-in path — deliberately does NOT make the same
-tradeoff: its failure response stays a uniform 401 `invalid_credentials` regardless of cause, because
-password login is reachable unconditionally while the magic-link route is only ever offered by the
-login form when an admin has opted into mail delivery (`magicLinkAvailable()`).
+**Uniform magic-link response.** `POST /api/auth/request-magic-link` returns 200 `{ ok: true }` for
+every syntactically valid email (invalid payloads still return 422; per-IP flooding returns 429). It
+schedules member lookup, token issuance, and delivery with Next.js `after()`, so recognized and
+unknown emails share the same response **shape** — verified over a real socket in
+`test/http/auth.http.test.ts` (both the unknown- and known-email cases return the identical 200 body
+and set no cookie). Because all DB/provider I/O runs off the response path, there is no first-order
+timing difference either; note that timing uniformity is a property of `after()` deferral, not
+something a test asserts on wall-clock latency, and an attacker with mail-provider-side visibility can
+still observe that a send happens only for recognized emails (inherent to any email-delivery flow).
+The emailed link is built only from the trusted `APP_URL`, never the request `Host`. `POST
+/api/auth/login` likewise keeps a uniform 401 `invalid_credentials` response for every credential
+failure.
 
 ## Key flows
 
@@ -700,7 +707,7 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 - `DELETE /api/dashboard/conversations/:id` — soft-archive a thread (owner-only)
 - `GET /api/dashboard/team-work` — dashboard "Working On": per-person summary (narrative arcs) + open tasks + recent accomplishments; session-authed; tier-scoped
 - `POST /api/auth/login` — email+password sign-in, the DEFAULT path (invite-only; uniform 401 on any failure)
-- `POST /api/auth/request-magic-link` — OPTIONAL secondary sign-in: issues + emails a single-use magic link (invite-only; 403 if unknown); never sets a session cookie itself; the login form only offers it when `magicLinkAvailable()` (a domain + mail provider are configured)
+- `POST /api/auth/request-magic-link` — OPTIONAL secondary sign-in: uniform 200 for every syntactically valid email (per-IP rate-limited, 429 on flood); recognized emails get a single-use magic link issued + emailed after the response, built against the trusted `APP_URL`; never sets a session cookie itself; the login form only offers it when `magicLinkAvailable()` (a domain + mail provider are configured)
 - `GET /api/dashboard/social/media/:id` — serve a generated image's bytes (session-authed, admin-only; team resolved from the asset)
 
 <!-- /drift:routes -->

@@ -4,6 +4,7 @@ import { loginWithPassword } from "@/lib/auth/pg-login";
 import { signSession, SESSION_COOKIE, sessionCookieOptions } from "@/lib/auth/pg-session";
 import { adminClient } from "@/lib/db/admin";
 import { rateLimit } from "@/lib/api/rate-limit";
+import { safeNextPath } from "@/lib/auth/next-path";
 
 export const runtime = "nodejs";
 
@@ -48,8 +49,7 @@ export async function POST(req: NextRequest) {
   }
 
   const email = parsed.data.email.trim().toLowerCase();
-  const nextParam = parsed.data.next ?? "/";
-  const safeNext = nextParam.startsWith("/") && !nextParam.startsWith("//") ? nextParam : "/";
+  const safeNext = safeNextPath(parsed.data.next);
 
   const result = await loginWithPassword(email, parsed.data.password);
   if (!result) {

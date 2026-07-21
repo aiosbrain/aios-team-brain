@@ -19,7 +19,13 @@ import { ALL_TOOLS } from "@/lib/provisioning/run";
  * /docs-sync contentHash compare.
  */
 
-const FIXTURE = join(import.meta.dirname, "..", "fixtures", "contract", "brain-contract.json");
+const FIXTURE = join(
+  import.meta.dirname,
+  "..",
+  "fixtures",
+  "contract",
+  "brain-contract.json",
+);
 const fixture = JSON.parse(readFileSync(FIXTURE, "utf8"));
 
 // Same canonicalization the workspace test + generator use (recursive key sort → stable JSON).
@@ -30,15 +36,29 @@ const canonical = (v: Json): Json =>
     : v && typeof v === "object"
       ? Object.keys(v)
           .sort()
-          .reduce<Record<string, Json>>((o, k) => ((o[k] = canonical(v[k])), o), {})
+          .reduce<Record<string, Json>>(
+            (o, k) => ((o[k] = canonical(v[k])), o),
+            {},
+          )
       : v;
 
 describe("brain-api tier + SSE conformance", () => {
   it("fixture contentHash is intact (no out-of-band edit)", () => {
     // v1.7 added provisioningTools (the member-invite tool vocabulary) to the pinned content.
-    const { version, tierAliases, sse, provisioningTools } = fixture;
+    const { version, tierAliases, sse, provisioningTools, gatewayContract } =
+      fixture;
     const recomputed = createHash("sha256")
-      .update(JSON.stringify(canonical({ version, tierAliases, sse, provisioningTools })))
+      .update(
+        JSON.stringify(
+          canonical({
+            version,
+            tierAliases,
+            sse,
+            provisioningTools,
+            gatewayContract,
+          }),
+        ),
+      )
       .digest("hex");
     expect(recomputed).toBe(fixture.contentHash);
   });
@@ -59,20 +79,27 @@ describe("brain-api tier + SSE conformance", () => {
   });
 
   it("server normalizeTier matches every shared alias row", () => {
-    for (const [input, expected] of Object.entries(fixture.tierAliases.shared)) {
+    for (const [input, expected] of Object.entries(
+      fixture.tierAliases.shared,
+    )) {
       expect(normalizeTier(input), `shared: ${input}`).toBe(expected);
     }
   });
 
   it("server normalizeTier matches the server column of every divergent row (admin/private/unknown → null)", () => {
     for (const [input, cols] of Object.entries(fixture.tierAliases.divergent)) {
-      expect(normalizeTier(input), `divergent(server): ${input}`).toBe((cols as { server: unknown }).server);
+      expect(normalizeTier(input), `divergent(server): ${input}`).toBe(
+        (cols as { server: unknown }).server,
+      );
     }
   });
 
   it("formatSseFrame reproduces every contract frame byte-for-byte", () => {
     for (const frame of fixture.sse.frames) {
-      expect(formatSseFrame(frame.event, frame.data), `frame: ${frame.name}`).toBe(frame.raw);
+      expect(
+        formatSseFrame(frame.event, frame.data),
+        `frame: ${frame.name}`,
+      ).toBe(frame.raw);
     }
   });
 });
