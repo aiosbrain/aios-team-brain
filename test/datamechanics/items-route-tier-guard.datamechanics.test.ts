@@ -39,7 +39,7 @@ async function issueKeyFor(seed: Seed, tier: "team" | "external") {
   }
   const { key, keyId } = await issueApiKey(db(), seed.teamId, memberId, `${tier} key`);
   const { data: row } = await db().from("api_keys").select("id").eq("key_id", keyId).single();
-  return { key, apiKeyId: (row as { id: string }).id };
+  return { key, apiKeyId: (row as { id: string }).id, memberId };
 }
 
 function post(key: string, teamSlug: string, body: unknown) {
@@ -125,6 +125,45 @@ describe("items route tier guard (real handler, real Postgres — the boundary l
       .single();
     expect((teamItem as { access: string }).access).toBe("team");
     expect((extItem as { access: string }).access).toBe("external");
+  });
+
+  // Attribution spoof gate: the route resolves author-from-frontmatter ONLY for trusted team-tier
+  // keys. An external (client) key must NOT be able to attribute its content to a team member by
+  // naming them in frontmatter — sole enforcement (no RLS backstop, §5).
+  it("an EXTERNAL key cannot attribute content to a team member via frontmatter authors[]", async () => {
+    const seed = await seedTeam();
+    const team = await issueKeyFor(seed, "team");
+    const ext = await issueKeyFor(seed, "external");
+    // Give the team member a resolvable email, then have the external key name it as the author.
+    await db().from("member_emails").insert({ team_id: seed.teamId, member_id: team.memberId, email: "victim@corp.com" });
+    const authored = { ...itemBody("external", "d/spoof.md"), frontmatter: { source: "gdrive", authors: [{ role: "author", email: "victim@corp.com" }] } };
+
+    const res = await post(ext.key, seed.teamSlug, authored);
+    expect(res.status).toBe(201);
+    const { data } = await db().from("items").select("member_id").eq("team_id", seed.teamId).eq("path", "d/spoof.md").single();
+    // Attributed to the external PUSHER (actor), never the named team member.
+    expect((data as { member_id: string }).member_id).toBe(ext.memberId);
+    expect((data as { member_id: string }).member_id).not.toBe(team.memberId);
+  });
+
+  it("a TEAM key resolves a frontmatter author to a DIFFERENT member than the pusher (positive control)", async () => {
+    const seed = await seedTeam();
+    const team = await issueKeyFor(seed, "team"); // pusher = seed.memberId
+    // A distinct real author on the roster (not the pushing key's member).
+    const { data: author } = await db()
+      .from("members")
+      .insert({ team_id: seed.teamId, email: `auth-${randomUUID()}@test.local`, display_name: "Real Author", actor_handle: `ra-${randomUUID().slice(0, 8)}`, role: "member", tier: "team", status: "active" })
+      .select("id")
+      .single();
+    const authorId = (author as { id: string }).id;
+    await db().from("member_emails").insert({ team_id: seed.teamId, member_id: authorId, email: "realauthor@corp.com" });
+    const authored = { ...itemBody("team", "d/authored.md"), frontmatter: { source: "notion", authors: [{ role: "author", email: "realauthor@corp.com" }] } };
+
+    const res = await post(team.key, seed.teamSlug, authored);
+    expect(res.status).toBe(201);
+    const { data } = await db().from("items").select("member_id").eq("team_id", seed.teamId).eq("path", "d/authored.md").single();
+    expect((data as { member_id: string }).member_id).toBe(authorId); // resolved to the author, NOT the pusher
+    expect((data as { member_id: string }).member_id).not.toBe(team.memberId);
   });
 
   it("legacy outward aliases ('client', 'company') normalize to external, not rejected", async () => {

@@ -42,9 +42,12 @@ export async function ingestItem(
   auth: { teamId: string; memberId: string; apiKeyId: string },
   payload: ItemPayload,
   access: "team" | "external",
-  // INTERNAL-only attribution override (NOT on the wire ItemPayload, so external pushers can't
-  // spoof authorship). When an internal caller already knows the content's author — e.g. the
-  // codebase scanner attributing a commit to a resolved member — it passes that here; otherwise
+  // Attribution override, set by the CALLER (never a raw wire field). Internal callers that already
+  // know the author pass it (the codebase scanner; the pm-sync per-author paths). The `/api/v1/items`
+  // route DERIVES it from the push's frontmatter via `attributeIncomingItem` — but ONLY for trusted
+  // TEAM-tier keys (it skips external-tier keys), so an untrusted external pusher still can't spoof
+  // authorship onto a team member. When an internal caller already knows the content's author it
+  // passes that here; otherwise
   // (opts omitted entirely) the item is attributed to the ingesting actor (`auth.memberId`). A
   // caller that HAS attempted resolution but come up empty must pass `authorMemberId: null`
   // explicitly (not omit opts) — that's the only way to say "leave this unattributed" rather than
