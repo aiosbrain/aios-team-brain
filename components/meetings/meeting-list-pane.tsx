@@ -33,6 +33,12 @@ export function MeetingListPane({ teamSlug, notes, defaultActiveId = null }: Mee
           <Link
             key={note.id}
             href={href}
+            // Full prefetch (data, not just the loading skeleton) so clicking a meeting is served
+            // from the client cache instead of a fresh ~0.5s+ server round-trip. Fires in the
+            // background as items enter the viewport; a full prefetch is cached under the `static`
+            // staleTimes bucket (300s). Meeting notes are near-immutable, so 5-min freshness is fine;
+            // any edit calls revalidatePath and purges the entry anyway.
+            prefetch
             aria-current={active ? "page" : undefined}
             className={`flex flex-col gap-1.5 rounded-lg border px-3.5 py-3 transition-colors ${
               active

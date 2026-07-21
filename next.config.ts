@@ -45,6 +45,18 @@ const nextConfig: NextConfig = {
   // Trust both so the dashboard works regardless of which host you open.
   allowedDevOrigins: ["127.0.0.1", "localhost"],
   ...(turbopackRoot ? { turbopack: { root: turbopackRoot } } : {}),
+  experimental: {
+    // The app is served from Railway (US edge) with a ~0.9s round-trip floor for far-away users —
+    // measured identical for a static favicon and a 307 redirect, so it's the network path, not the
+    // DB (sub-ms) or render. Every client navigation that hits the server therefore feels slow. Cache
+    // visited page segments in the client Router Cache so revisiting a route (back/forward, or
+    // clicking around a set of meetings) is served locally and instant. Within the window the cache
+    // is reused with NO request (it doesn't SWR-revalidate); it only refetches on the next navigation
+    // after the entry expires. Next 15 changed the `dynamic` default to 0 (no caching); restore a
+    // modest window. Mutations call `router.refresh()` / `revalidatePath`, which purge this cache, so
+    // a stale read can't linger past an edit.
+    staleTimes: { dynamic: 30, static: 300 },
+  },
 };
 
 // Wrap with Sentry. This build-time wrapper enables source-map upload (so
