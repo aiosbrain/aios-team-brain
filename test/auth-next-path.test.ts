@@ -28,5 +28,17 @@ describe("safeNextPath", () => {
     // tab/newline stripped by the parser before resolving
     expect(safeNextPath("/\t/evil.com")).toBe("/");
     expect(safeNextPath("/\n/evil.com")).toBe("/");
+    // dot-segment normalization that collapses to a protocol-relative path (the login route feeds the
+    // result straight into window.location.href single-pass, so this MUST NOT return "//evil.com").
+    expect(safeNextPath("/..//evil.com")).toBe("/");
+    expect(safeNextPath("/./..//evil.com")).toBe("/");
+    expect(safeNextPath("/foo/../..//evil.com")).toBe("/");
+  });
+
+  it("is idempotent — feeding its own output back always re-validates to itself", () => {
+    for (const raw of ["/dashboard", "/t/acme?x=1#h", "/..//evil.com", "//evil.com", "/\\evil.com", "/"]) {
+      const once = safeNextPath(raw);
+      expect(safeNextPath(once)).toBe(once);
+    }
   });
 });

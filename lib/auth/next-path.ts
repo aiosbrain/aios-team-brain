@@ -14,7 +14,12 @@ export function safeNextPath(raw: string | null | undefined): string {
     const base = "https://internal.invalid";
     const u = new URL(raw, base);
     if (u.origin !== base) return "/";
-    return u.pathname + u.search + u.hash;
+    const path = u.pathname + u.search + u.hash;
+    // `new URL` can collapse e.g. `/..//evil.com` to the protocol-relative `//evil.com`, which stays
+    // same-origin under this dummy base but navigates OFF-origin the moment it's assigned to
+    // `window.location.href` (login) or resolved against the real host (confirm). Reject it so the
+    // function is idempotent — its own output always re-validates to itself.
+    return path.startsWith("//") ? "/" : path;
   } catch {
     return "/";
   }
