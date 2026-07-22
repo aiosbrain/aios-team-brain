@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { creditedContributorIds } from "@/lib/attribution/contributor-credit";
+import { creditedContributorIds, creditedPrimaryId } from "@/lib/attribution/contributor-credit";
 
 /**
  * Spec for the evidence-gated credit rule: credit everyone who produced WORK (a version) on an item, not
@@ -28,5 +28,29 @@ describe("creditedContributorIds", () => {
   it("LOCKED (an admin correction) overrides evidence → ONLY the corrected owner", () => {
     expect(creditedContributorIds({ locked: true, currentMemberId: B, versionMemberIds: [A, B] })).toEqual([B]);
     expect(creditedContributorIds({ locked: true, currentMemberId: null, versionMemberIds: [A] })).toEqual([]); // corrected to nobody
+  });
+});
+
+describe("creditedPrimaryId — the single BALANCING representative", () => {
+  it("keeps the current owner when they actually worked (unchanged normal case)", () => {
+    expect(creditedPrimaryId({ locked: false, currentMemberId: A, versionMemberIds: [A], latestWorkerId: A })).toBe(A);
+    expect(creditedPrimaryId({ locked: false, currentMemberId: B, versionMemberIds: [A, B], latestWorkerId: B })).toBe(B);
+  });
+
+  it("shifts to the LATEST actual worker when the current owner did NO work (a pure reassignment)", () => {
+    // Owner is B (reassigned) but only A ever produced a version → A gets the balancing share, not B.
+    expect(creditedPrimaryId({ locked: false, currentMemberId: B, versionMemberIds: [A], latestWorkerId: A })).toBe(A);
+  });
+
+  it("LOCKED → the corrected owner regardless of who worked", () => {
+    expect(creditedPrimaryId({ locked: true, currentMemberId: B, versionMemberIds: [A], latestWorkerId: A })).toBe(B);
+  });
+
+  it("leaves an unattributed item unattributed (no owner → null, unchanged balancing behavior)", () => {
+    expect(creditedPrimaryId({ locked: false, currentMemberId: null, versionMemberIds: [A], latestWorkerId: A })).toBe(null);
+  });
+
+  it("falls back to the current owner when there is no work ledger", () => {
+    expect(creditedPrimaryId({ locked: false, currentMemberId: A, versionMemberIds: [], latestWorkerId: null })).toBe(A);
   });
 });

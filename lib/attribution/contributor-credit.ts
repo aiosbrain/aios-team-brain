@@ -32,17 +32,46 @@ export function creditedContributorIds(item: {
 }
 
 /**
- * item id → evidence-gated contributor DISPLAY NAMES (non-connector), for a batch of item ids. Batches
+ * The single PRIMARY contributor for BALANCING a fact (arc synthesis needs one representative per item).
+ * Tightly scoped to the reassignment case — behavior is UNCHANGED except when the current owner exists but
+ * did NO work:
+ *  - LOCKED → the corrected owner (authoritative).
+ *  - no current owner → null (unchanged: an unattributed item stays unattributed for balancing).
+ *  - current owner produced a version (they worked) → the current owner (unchanged normal case).
+ *  - current owner did NOT work (a pure reassignment / phantom label) → the LATEST actual worker, so a
+ *    reassigned-away contributor gets their OWN balanced share, not the non-working new owner.
+ */
+export function creditedPrimaryId(item: {
+  locked: boolean;
+  currentMemberId: string | null;
+  versionMemberIds: string[]; // distinct non-connector version authors
+  latestWorkerId: string | null; // the latest non-connector version author (most-recent work)
+}): string | null {
+  if (item.locked) return item.currentMemberId;
+  if (item.currentMemberId === null) return null;
+  if (item.versionMemberIds.includes(item.currentMemberId)) return item.currentMemberId;
+  return item.latestWorkerId ?? item.currentMemberId;
+}
+
+/** Evidence-gated credit for one item: the full `contributors` SET (for arc participants) + the single
+ *  `primary` worker (for balancing one fact under one representative). Display names, non-connector. */
+export interface ItemCredit {
+  contributors: string[];
+  primary: string | null;
+}
+
+/**
+ * item id → `ItemCredit` (contributor DISPLAY NAMES + primary), for a batch of item ids. Batches
  * items + item_versions + members. Best-effort (empty map on failure): an unattributed arc is more honest
  * than a thrown error — mirrors `resolveHumanActorsByItem`, which this generalizes from "current owner" to
- * "everyone who did the work".
+ * "everyone who did the work" (+ a work-based primary).
  */
-export async function resolveContributorsByItem(
+export async function resolveItemCredit(
   db: DbClient,
   teamId: string,
   itemIds: string[]
-): Promise<Map<string, string[]>> {
-  const out = new Map<string, string[]>();
+): Promise<Map<string, ItemCredit>> {
+  const out = new Map<string, ItemCredit>();
   const ids = [...new Set(itemIds.filter(Boolean))];
   if (ids.length === 0) return out;
   try {
@@ -52,7 +81,10 @@ export async function resolveContributorsByItem(
         .from("item_versions")
         .select("item_id, member_id, created_at")
         .in("item_id", ids)
-        .order("created_at", { ascending: true }),
+        // `id` tiebreak: versions written in the same txn share `created_at` (Postgres `now()` is
+        // txn-constant), so order deterministically → a stable `latestWorkerId`.
+        .order("created_at", { ascending: true })
+        .order("id", { ascending: true }),
     ]);
     const items = (itemsRes.data ?? []) as { id: string; member_id: string | null; member_id_locked: boolean | null }[];
     const versions = (versionsRes.data ?? []) as { item_id: string; member_id: string | null }[];
@@ -78,23 +110,31 @@ export async function resolveContributorsByItem(
       return m && !m.connector && m.name ? m.name : null;
     };
 
-    // Distinct non-connector version authors per item, in work (created_at) order.
+    // Per item: distinct non-connector version authors (work order) + the LATEST non-connector author
+    // (versions are created_at ASC, so the last human author seen is the most recent).
     const versionMembersByItem = new Map<string, string[]>();
+    const latestWorkerByItem = new Map<string, string>();
     for (const v of versions) {
       if (!v.member_id || !humanName(v.member_id)) continue;
       const list = versionMembersByItem.get(v.item_id) ?? [];
       if (!list.includes(v.member_id)) list.push(v.member_id);
       versionMembersByItem.set(v.item_id, list);
+      latestWorkerByItem.set(v.item_id, v.member_id); // overwrite → ends at the latest
     }
 
     for (const it of items) {
-      const creditedIds = creditedContributorIds({
-        locked: it.member_id_locked === true,
-        currentMemberId: humanName(it.member_id) ? it.member_id : null,
-        versionMemberIds: versionMembersByItem.get(it.id) ?? [],
-      });
-      const names = [...new Set(creditedIds.map(humanName).filter((n): n is string => !!n))];
-      if (names.length) out.set(it.id, names);
+      const currentMemberId = humanName(it.member_id) ? it.member_id : null;
+      const versionMemberIds = versionMembersByItem.get(it.id) ?? [];
+      const locked = it.member_id_locked === true;
+      const contributors = [
+        ...new Set(
+          creditedContributorIds({ locked, currentMemberId, versionMemberIds }).map(humanName).filter((n): n is string => !!n)
+        ),
+      ];
+      const primary = humanName(
+        creditedPrimaryId({ locked, currentMemberId, versionMemberIds, latestWorkerId: latestWorkerByItem.get(it.id) ?? null })
+      );
+      if (contributors.length || primary) out.set(it.id, { contributors, primary });
     }
   } catch {
     // best-effort — empty map on failure
