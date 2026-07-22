@@ -194,6 +194,10 @@ export function normalizeLinearDocs(input: NormalizeLinearInput): ItemPayload[] 
           team_key: input.teamKey,
           url: it.url ?? "",
           state: it.state?.name ?? "",
+          // Canonical Linear workflow-state TYPE (backlog|unstarted|started|completed|canceled) — the
+          // team-vocabulary-agnostic signal for arc eligibility (`started` = active work). Preferred over
+          // the display-name regex; the name stays as fallback for rows ingested before this field.
+          state_type: it.state?.type ?? "",
           assignee: it.assignee?.displayName ?? "",
           // Assignee's Linear user id → resolved to a person at ingest (lib/ingest/run).
           assignee_id: it.assignee?.id ?? "",

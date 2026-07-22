@@ -279,3 +279,5 @@ on that), so the fire-and-forget promise is not at risk of serverless request-te
 - **Fallback** — if direct Neo4j proves unviable in prod, Layer 2 can fall back to `GET /episodes` +
   `items`/`graph_episodes` (event = item, participants = `member_id`), and Layer 1 to `/search`; Layer 3
   synthesis is unaffected. Kept as the degrade path, not the primary.
+
+**Arc eligibility (Layer 3 only).** Not all graph facts inform arcs. A Linear issue informs arcs only while it's ACTIVE work — gated on the canonical Linear workflow-state `type` (`started`; persisted as `frontmatter.state_type`), with the display-name regex (`ARCS_LINEAR_ACTIVE_STATE_RE`, default `progress|review`) as fallback for rows ingested before `state_type`. Backlog/Todo/Done/Canceled — and the terse `kind:"task"` board mirror (`issues.md`, which carries no state) — stay in the graph + facts panel as context but are filtered from the arc substrate at synthesis (`lib/graph/arc-eligibility`). A fact dedup'd across sources is kept if ANY of its items is eligible (a Done ticket co-cited with a meeting stays). Non-Linear content is unaffected.

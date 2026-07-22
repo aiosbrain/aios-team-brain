@@ -172,8 +172,7 @@ admin correction** from an **auto-resolved** value. Two consequences (both narro
 
 **Durable fix (follow-up):** an authority marker on the shared layer — `items.attributed_via:
 'manual' | 'resolved'` — where `manual` (NL correction / admin) always wins and the heal/batch only
-touch `resolved` rows. That closes both gaps at the data layer for every surface at once. Also: the
-unchanged-repush path doesn't persist changed `frontmatter`, so a pre-enrichment item's stored
-`authors[]` stays empty until a body edit — the reattribute *button* (reads stored frontmatter) can't
-see it, though the live heal does; persisting frontmatter on the unchanged-when-differs path would
-converge them.
+touch `resolved` rows. That closes both gaps at the data layer for every surface at once. Also **RESOLVED**: the unchanged-repush
+fast-path now heals `frontmatter` when the source metadata changed even though the body didn't (a
+Linear state transition, a source later exposing `authors[]`), so stored frontmatter no longer freezes
+at first ingest — the reattribute *button* + status-gated reads (arc eligibility) see current metadata.
