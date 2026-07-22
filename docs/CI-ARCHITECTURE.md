@@ -13,10 +13,12 @@ flowchart TD
     subgraph AgentLoop["Multi-Agent Dev Loop (local)"]
         A1[Opus — Planner\nCreates spec / Linear issue] --> A2[Codex — Critic\nReviews plan]
         A2 --> A3[Opus — Planner\nFinalizes plan]
-        A3 --> A4[Opus — Builder\nImplements, commits\nopens PR via gh]
-        A4 -->|wait-for-bots.mjs\npoll every 30s ≤10 min| A4W{Bots landed?}
-        A4W -->|yes| A5[AIOS Code Reviewer\nReads CI + Bugbot\n+ CodeRabbit findings]
+        A3 --> A4["Opus — Builder\nImplements + local review\n(Local Bugbot or Fable)"]
+        A4 --> A4P[Opens PR via gh]
+        A4P -->|ready-for-review label| A4W{Current-head\nCodeRabbit landed?}
+        A4W -->|yes| A5["AIOS Code Reviewer\nReads CI + local review\n+ CodeRabbit evidence"]
         A4W -->|timeout| A5
+        A4P -->|no label| A5
         A5 -->|findings| A4
         A5 -->|clear| MERGE[Human approves\n+ merges]
     end
@@ -31,9 +33,7 @@ flowchart TD
     end
 
     subgraph BotReviews["Async Bot Reviews — GitHub Apps"]
-        C1["Cursor Bugbot\nGeneral LLM review\n1–5 min after PR opens"]
-        C2["CodeRabbit\nWalkthrough + inline\n~2 min after PR opens"]
-        C3["Cursor Security Reviewer\nSecurity-focused analysis\n~2–5 min after PR opens"]
+        C1["CodeRabbit\nready-for-review label-gated\ncurrent-head text only"]
     end
 
     subgraph GitHubPR["GitHub PR"]
@@ -42,7 +42,7 @@ flowchart TD
         D3["Security tab\n(SAST — not yet wired)"]
     end
 
-    A4 -->|gh pr create| GitHubPR
+    A4P --> GitHubPR
     GitHubPR --> GitHubActions
     GitHubPR --> BotReviews
     GitHubActions --> D1
@@ -56,13 +56,13 @@ flowchart TD
 
 ### `ci.yml` — required gate on every PR and push to `main`
 
-| Job | What it runs | Blocks merge? |
-|---|---|---|
-| `docs-drift` | `node scripts/check-docs-drift.mjs` — validates routes, tables, sources against `docs/ARCHITECTURE.md` markers | Yes |
-| `brain-tests` | `npm test` — vitest unit tests (pure logic, parse/format, contract guards) | Yes |
-| `datamechanics-tests` | `npm run test:datamechanics` against real Postgres 16 (port 5434) — RLS, persistence, access control | Yes |
-| `http-tests` | `npm run build` + `npm run test:http` — the API over a real socket against Postgres 16: TCP fetch, the Next.js route runtime (cookies/headers), JSON wire format | No (advisory) |
-| `ingestion-tests` | `pytest -q` inside `ingestion/` — Python ingest pipeline | Yes |
+| Job                   | What it runs                                                                                                                                                     | Blocks merge? |
+| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------- |
+| `docs-drift`          | `node scripts/check-docs-drift.mjs` — validates routes, tables, sources against `docs/ARCHITECTURE.md` markers                                                   | Yes           |
+| `brain-tests`         | `npm test` — vitest unit tests (pure logic, parse/format, contract guards)                                                                                       | Yes           |
+| `datamechanics-tests` | `npm run test:datamechanics` against real Postgres 16 (port 5434) — RLS, persistence, access control                                                             | Yes           |
+| `http-tests`          | `npm run build` + `npm run test:http` — the API over a real socket against Postgres 16: TCP fetch, the Next.js route runtime (cookies/headers), JSON wire format | No (advisory) |
+| `ingestion-tests`     | `pytest -q` inside `ingestion/` — Python ingest pipeline                                                                                                         | Yes           |
 
 The four required jobs (`docs-drift`, `brain-tests`, `datamechanics-tests`, `ingestion-tests`) must pass for a PR to merge (enforced via branch protection). `http-tests` runs `continue-on-error` (advisory) until it proves stable — see Branch Protection below.
 
@@ -74,31 +74,40 @@ Extracts `AIOS-Work: <KEY>` from the PR title/body and POSTs a merge event to `/
 
 ---
 
-## Async Bot Reviews
+## Review evidence
 
-These run outside GitHub Actions and post comments to the PR conversation. They are not required checks — they are signals for the Code Reviewer agent.
+The team is small and members use different local reviewers — **John runs Local Bugbot (Cursor)**,
+**Chetan runs Fable** (`Agent(subagent_type: "code-reviewer", model: "fable")` from the
+`aios-workspace` ship tooling). Whichever ran is the local evidence, recorded as one line in the
+PR body. Local review evidence is scoped to the branch head it reviewed — treat it as stale after
+a fix commit or base movement. **None of this blocks a push or merge; only the required CI checks
+do.**
 
-| Bot | GitHub user | Typical delay | What it covers |
-|---|---|---|---|
-| Cursor Bugbot | `cursor[bot]` | 1–5 min | General logic, naming, patterns |
-| CodeRabbit | `coderabbitai[bot]` | ~2 min | Walkthrough summary + inline suggestions |
-| Cursor Security Reviewer | `cursor[bot]` | 2–5 min | Auth, injection, secrets, access control |
+CodeRabbit runs outside GitHub Actions and posts to the PR conversation. `.coderabbit.yaml` keeps
+`auto_review.enabled: true` but restricts it with `labels: [ready-for-review]` — auto-review fires
+only on PRs carrying that label (`labels` filters automatic reviews; it is not a trigger on its
+own). Incremental review is off, so after a fix push post `@coderabbitai review` for fresh
+evidence. Apply the label when no local reviewer was available, or whenever you want the extra
+pass.
 
-**Polling:** The builder agent runs `wait-for-bots.mjs` from the `aios-workspace` repo, passing `--repo` explicitly to target any AIOS-alpha repo:
+To wait for CodeRabbit, use the shared waiter from `aios-workspace` **with the `--bots` flag** —
+its default gates on `cursor[bot]` too (remote Bugbot is disabled here, so the default would just
+time out), and a completed check run can satisfy it, so read the printed signal and prefer comment
+or review text as evidence:
 
 ```bash
 node /path/to/aios-workspace/scripts/wait-for-bots.mjs \
-  --pr <n> --repo AIOS-alpha/aios-team-brain
+  --pr <n> --repo aiosbrain/aios-team-brain --bots 'coderabbitai[bot]'
 ```
 
-The script lives only in `aios-workspace` (not duplicated here) — it is a shared cross-repo tool. It blocks until `cursor[bot]` and `coderabbitai[bot]` have both posted substantive feedback after the latest push (rate-limit stubs and pre-push comments are rejected), then prints a summary before the Code Reviewer agent runs.
+Rate-limit stubs and pre-push text are rejected by the waiter automatically.
 
 ---
 
 ## Local Development Hooks
 
-| Hook | When | What |
-|---|---|---|
+| Hook                 | When             | What                                                              |
+| -------------------- | ---------------- | ----------------------------------------------------------------- |
 | `.githooks/pre-push` | Every `git push` | Runs `check-docs-drift.mjs` — blocks push if docs are out of sync |
 
 Installed automatically via `npm prepare` → `git config core.hooksPath .githooks`.
@@ -119,7 +128,7 @@ If you add an API route, table, or ingest source, update the corresponding `<!--
 
 ## Branch Protection (required — verify in GitHub Settings)
 
-Repo: `AIOS-alpha/aios-team-brain` → Settings → Branches → `main`
+Repo: `aiosbrain/aios-team-brain` → Settings → Branches → `main`
 
 - [x] Require status checks: `docs-drift`, `brain-tests`, `datamechanics-tests`, `ingestion-tests`
 - [ ] `http-tests` — currently advisory (`continue-on-error`). Graduate to required after 5 consecutive green runs on `main`: drop `continue-on-error` in `ci.yml` and add it to this list.
@@ -135,12 +144,12 @@ Repo: `AIOS-alpha/aios-team-brain` → Settings → Branches → `main`
 1. Opus (Planner)  → creates spec from Linear issue
 2. Codex (Critic)  → reviews plan, requests changes
 3. Opus (Planner)  → finalizes, hands off to builder
-4. Opus (Builder)  → implements, commits, opens PR
-5.                   GitHub Actions CI fires (parallel jobs)
-6.                   Cursor Bugbot + CodeRabbit fire async
-7. wait-for-bots   → polls every 30s until both bots have posted (≤10 min)
-8. Code Reviewer   → reads CI status + all bot comments → structured findings
-9. Opus (Builder)  → addresses findings, pushes fix commits if needed
-10. Human          → approves + merges
+4. Local review    → Local Bugbot (John) or Fable (Chetan) on the branch diff; recorded in PR body
+5. Opus (Builder)  → commits, opens PR
+6.                   GitHub Actions CI fires (parallel jobs)
+7. CodeRabbit      → fires only on PRs labeled ready-for-review (auto_review label filter)
+8. Code Reviewer   → reads CI + whatever local review ran + current-head CodeRabbit evidence
+9. Opus (Builder)  → addresses findings; a push makes prior review evidence stale
+10. Human          → approves + merges (only required CI checks block)
 11.                  aios-work-sync fires → Linear issue closed
 ```

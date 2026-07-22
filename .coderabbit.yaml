@@ -1,4 +1,4 @@
-version: "2"
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
 language: "en-US"
 
 reviews:
@@ -9,8 +9,14 @@ reviews:
   review_status: true
   collapse_walkthrough: false
   auto_review:
+    # Label-gated: `labels` filters AUTOMATIC reviews, so enabled must stay true —
+    # with enabled:false the label never triggers anything. Reviews fire only on
+    # PRs carrying `ready-for-review`; use `@coderabbitai review` after fix pushes.
     enabled: true
     drafts: false
+    labels:
+      - ready-for-review
+    auto_incremental_review: false
     base_branches:
       - main
 

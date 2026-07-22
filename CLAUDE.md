@@ -20,36 +20,36 @@ who reads it**. The map only pays off if it's trustworthy, so:
   flow. Reason from the source of truth, never from a random call site.
 - **AFTER building:** update the map **in the same PR**. A wrong map is worse than none.
 - The enumerable surfaces (API routes, DB tables, ingestion sources) are **machine-guarded**
-  by `scripts/check-docs-drift.mjs` (CI job *Docs drift guard* + the local `.githooks/pre-push`
+  by `scripts/check-docs-drift.mjs` (CI job _Docs drift guard_ + the local `.githooks/pre-push`
   hook). If you add/remove a route, table, or source, update the `<!-- drift:* -->` blocks in
   the same change or the build fails. Hand-maintained prose/diagrams are on you — keep them honest.
 
 ---
 
-## ⚠️ Review gate — ALWAYS Fable-review before pushing a PR (REQUIRED)
+## Review gate — local review before pushing a PR (flexible, non-blocking)
 
-Many sessions/worktrees ship into this repo in parallel and merge fast — **a Fable review is the
-pre-merge safety net** that catches tier leaks, sync-contract drift, and correctness bugs the async
-bots (CodeRabbit/Cursor) miss. It is **not optional**.
+Many sessions/worktrees ship into this repo in parallel and merge fast — a pre-push review of the
+branch diff catches tier leaks, sync-contract drift, and correctness bugs before they land. We are
+a small team on different local tools, so the gate is **tool-flexible and never blocks a push**:
 
-- **Before you `git push` a PR branch:** run a Fable review of the branch diff — spawn the
-  **`code-reviewer` agent on the Fable model** (`Agent(subagent_type: "code-reviewer", model: "fable")`)
-  pointed at `git diff origin/main...HEAD`. Give it the change's intent and let it apply the AIOS
-  invariants (this file + the agent's own checklist).
-- **Address its findings first.** Fix every blocker/HIGH; fix or consciously defer MEDIUM/LOW with a
-  one-line reason. Only push once Fable's verdict is *sound / ship it* (or its blockers are resolved).
-- **Record it in the PR body** — a short `## Review — Reviewed by **Fable** — verdict …` line (with the
-  findings it caught + how you resolved them), so it's auditable which PRs were Fable-reviewed and
-  which weren't. Absence of that line means the gate was skipped.
-- Fable reviews the **diff you're about to ship**, not the bots' comments — it adds its own analysis.
-  This is in addition to CI and the async bot reviews, never a replacement.
+- **Before you `git push` a PR branch:** review `git diff origin/main...HEAD` with whichever local
+  reviewer you have — **Local Bugbot** (John, via Cursor) or a **Fable `code-reviewer` run**
+  (Chetan — `Agent(subagent_type: "code-reviewer", model: "fable")`). Any equivalent local diff
+  review counts; use what's available.
+- **Address blocker/HIGH findings before pushing**; fix or consciously defer MEDIUM/LOW with a
+  one-line reason.
+- **Record what reviewed the diff in the PR body** — one `## Review — Reviewed by <tool> — verdict …`
+  line so it's auditable. If no local reviewer was available, say so and apply the
+  `ready-for-review` label so CodeRabbit reviews the PR instead.
+- The local review examines the **diff you're about to ship**, not the bots' comments. It
+  complements CI and label-gated CodeRabbit; only the required CI checks block a merge.
 
 ---
 
 ## 2. Four operating principles (internalize these)
 
 1. **Spec-first testing, never characterization-first.** Write the assertion from what the
-   product *should* do (the brain-api contract, the tier intent, a scenario), then run it.
+   product _should_ do (the brain-api contract, the tier intent, a scenario), then run it.
    A spec-derived test that goes **red** found a real gap — that's the point. Tests that read
    the implementation and assert what it already does are green by construction and forbidden
    as the default. For a confirmed-but-unfixed gap, use `it.fails(...)` so it stays green until
@@ -59,7 +59,7 @@ bots (CodeRabbit/Cursor) miss. It is **not optional**.
    matters ("only `lib/ingest` writes `items`"), make ONE owner the only legal writer and add a
    test that **fails the build** when anything else violates it.
 3. **Verify to the observable outcome.** A claim isn't real until a red test reproduces the bad
-   *outcome* (wrong row in the DB, a leaked cross-tier row, wrong state) — not a name, a proxy,
+   _outcome_ (wrong row in the DB, a leaked cross-tier row, wrong state) — not a name, a proxy,
    or a call-site reading. Treat audits and AI-suggested bugs as hypotheses to re-derive.
 4. **The architecture map is a required step in the build loop** (§1).
 
@@ -76,14 +76,14 @@ the near-term-satisfaction shortcut.
 
 ## 4. Test tiers — which failure mode each catches
 
-Put a spec-derived test in the tier that catches *its* failure mode:
+Put a spec-derived test in the tier that catches _its_ failure mode:
 
-| Tier | Runs against | Catches |
-|---|---|---|
-| **unit** (`vitest.config.ts`) | nothing (pure) | parse/format boundaries, pure logic, **all drift/contract guards** |
-| **data-mechanics** (`vitest.datamechanics.config.ts`) | **real Postgres, stubbed model** | persistence & access: write→store→read, dedup, diff-sync, tier isolation |
+| Tier                                                           | Runs against                                                                                      | Catches                                                                                     |
+| -------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| **unit** (`vitest.config.ts`)                                  | nothing (pure)                                                                                    | parse/format boundaries, pure logic, **all drift/contract guards**                          |
+| **data-mechanics** (`vitest.datamechanics.config.ts`)          | **real Postgres, stubbed model**                                                                  | persistence & access: write→store→read, dedup, diff-sync, tier isolation                    |
 | **integration** (`vitest.http.config.ts`, `npm run test:http`) | the API over a **real socket** (`next start` + real Postgres) + the system-level `scripts/e2e.sh` | routing, auth, tier-422, cookies/headers, the JSON wire format, the cross-process sync loop |
-| **eval** *(not built)* | real model API | model judgment (grounded-answer quality) — exercised live in `e2e.sh` step 9 |
+| **eval** _(not built)_                                         | real model API                                                                                    | model judgment (grounded-answer quality) — exercised live in `e2e.sh` step 9                |
 
 Mental model: **unit = parse/guards · data-mechanics = persistence + access · integration =
 routing/auth · eval = model judgment.** Don't let a tier that stubs the model + clean inputs give
@@ -101,7 +101,7 @@ cannot verify persistence or access to the observable outcome. The real-Postgres
 **Deployment model:** AIOS is **self-hosted per organization** — each org runs its own instance
 against its own database; all rows belong to that one org. So there is **no shared multi-tenant
 DB**, and cross-organization isolation is **not** a concern. The `team_id` scoping is purely
-*internal* (separating teams *within* one org's DB) and only matters if an instance hosts more
+_internal_ (separating teams _within_ one org's DB) and only matters if an instance hosts more
 than one team.
 
 **What still matters regardless of multi-tenancy: TIER isolation.** An `external`-tier principal
@@ -163,7 +163,7 @@ bash scripts/e2e.sh    # system-level integration: seed → push → materialize
 - **Deploy:** Postgres on Railway (self-host portable). **Deploys happen ONLY by merging to `main`** —
   Railway's GitHub integration auto-builds AIOS → `aios-team-brain`. After a merge, run `npm run pg:schema`
   against prod for any schema change, and **confirm the platform started a new build** (`railway deployment
-  list`; CI webhooks can be silently dropped) — re-trigger via the Railway dashboard if the latest deploy
+list`; CI webhooks can be silently dropped) — re-trigger via the Railway dashboard if the latest deploy
   predates the merge.
 - **Inspecting the prod DB (read-only, for diagnostics).** The internal `DATABASE_URL`
   (`postgres.railway.internal`) is unreachable from a laptop; use the **public TCP proxy** the Railway
@@ -177,12 +177,12 @@ bash scripts/e2e.sh    # system-level integration: seed → push → materialize
   write as production data mutation: confirm with the user first.
 - **⛔ NEVER run `railway up` / `railway redeploy` / `railway down` / `railway delete`.** The Railway CLI is
   **read-only** here (`status`, `logs`, `variables`, `deployment list`, `connect`). `railway up` deploys the current
-  worktree's code to whatever project that directory is *linked* to (`~/.railway/config.json`, keyed by
+  worktree's code to whatever project that directory is _linked_ to (`~/.railway/config.json`, keyed by
   absolute path) — and a Conductor worktree that drifted to the wrong link (an aios worktree linked to the
   **Kula** project) once shipped this repo's code into Kula and took it down. The GitHub-merge path is bound
   to the right project and cannot do that. This is **guarded**: `.claude/settings.json` denies those verbs +
   a PreToolUse hook (`scripts/railway-deploy-guard.sh`) blocks them (incl. `cd other && railway up`). Before
-  *any* Railway command, confirm `railway status` shows **Project: AIOS**; audit all worktrees with
+  _any_ Railway command, confirm `railway status` shows **Project: AIOS**; audit all worktrees with
   `bash scripts/railway-link-check.sh`.
 - **Runtime backstop (`scripts/service-guard.mjs`).** The hook above only fires inside the agent's shell; it
   can't stop a human `railway up` or any other path that lands this code on a foreign service. So the schema
@@ -198,5 +198,5 @@ bash scripts/e2e.sh    # system-level integration: seed → push → materialize
 
 Build scaffolding upfront; build **guards and invariants reactively** — each must trace to a real
 bug or a real contract. A guard with no failure mode behind it is ceremony. When you change a
-class of thing the docs/contract describe, ask: *"is there a guard that would catch this drift,
-and if not, that's what to build."*
+class of thing the docs/contract describe, ask: _"is there a guard that would catch this drift,
+and if not, that's what to build."_
