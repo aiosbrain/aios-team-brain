@@ -1,9 +1,11 @@
 import type { Metadata } from "next";
-import { ChevronRight } from "lucide-react";
+import { Suspense } from "react";
+import { ChevronRight, Loader2 } from "lucide-react";
 import { resolveTeamContext } from "@/lib/auth/team-context";
 import { FactsFeed } from "@/components/learning/facts-feed";
 import { EventsFeed } from "@/components/learning/events-feed";
 import { ArcsPanel } from "@/components/learning/arcs-panel";
+import { TimelinePanel } from "@/components/learning/timeline-panel";
 
 export const metadata: Metadata = { title: "Learning" };
 
@@ -36,6 +38,26 @@ export default async function LearningPage({ params }: { params: Promise<{ team:
         </h2>
         <ArcsPanel teamSlug={teamSlug} />
       </section>
+
+      <details className="group/timeline rounded-lg border border-border-subtle px-4 py-3">
+        <summary className="flex cursor-pointer list-none items-center gap-2 text-sm font-semibold uppercase tracking-wider text-ink-tertiary">
+          <ChevronRight className="size-3.5 shrink-0 transition-transform group-open/timeline:rotate-90" />
+          Timeline — recent work, by day
+        </summary>
+        <div className="mt-4">
+          {/* Streamed in its own boundary so a slow/unreachable graph never blocks the page shell
+              (incl. the arcs above) on this collapsed-by-default section. */}
+          <Suspense
+            fallback={
+              <p className="flex items-center gap-2 px-1 py-4 text-sm text-ink-tertiary">
+                <Loader2 className="size-4 animate-spin" /> building timeline…
+              </p>
+            }
+          >
+            <TimelinePanel teamSlug={teamSlug} teamId={ctx.team.id} tier={ctx.me.tier} />
+          </Suspense>
+        </div>
+      </details>
 
       <details className="group/activity rounded-lg border border-border-subtle px-4 py-3">
         <summary className="flex cursor-pointer list-none items-center gap-2 text-sm font-semibold uppercase tracking-wider text-ink-tertiary">
