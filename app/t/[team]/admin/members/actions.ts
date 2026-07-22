@@ -169,7 +169,10 @@ export async function reattributeIdentitiesNow(
     const s = await reattributeItems(adminClient(), ctx.teamId);
     await bustTeamArcs(adminClient(), ctx.teamId, teamSlug);
     revalidatePath(`/t/${teamSlug}/admin/members`);
-    return { ok: true, message: `Re-attributed ${s.updated} of ${s.scanned} item(s) to current identity mappings.` };
+    return {
+      ok: true,
+      message: `Re-attributed ${s.updated} of ${s.scanned} item(s)${s.versionsUpdated ? ` + ${s.versionsUpdated} version(s)` : ""} to current identity mappings.`,
+    };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "re-attribution failed" };
   }

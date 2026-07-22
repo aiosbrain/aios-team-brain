@@ -1,6 +1,7 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
-import { buildIdentityMap } from "@/lib/identity/resolve";
+import { runSql } from "@/lib/db/pg/pool";
+import { buildIdentityMap, type IdentityMap } from "@/lib/identity/resolve";
 import { resolveItemAuthorMember } from "@/lib/attribution/resolve-authors";
 
 /**
@@ -23,6 +24,8 @@ import { resolveItemAuthorMember } from "@/lib/attribution/resolve-authors";
 export interface ReattributeSummary {
   scanned: number;
   updated: number;
+  /** item_versions rows re-pointed too (the work ledger — see `reattributeVersions`). */
+  versionsUpdated: number;
 }
 
 export async function reattributeItems(
@@ -74,5 +77,52 @@ export async function reattributeItems(
       updated++;
     }
   }
-  return { scanned: rows.length, updated };
+  const versionsUpdated = await reattributeVersions(db, teamId, idMap, connectorIds);
+  return { scanned: rows.length, updated, versionsUpdated };
+}
+
+/**
+ * Heal the WORK LEDGER (`item_versions.member_id`) alongside the item. A version's author is stamped at
+ * push time, so a version whose author signal was PRESENT but UNMAPPED then (a mapping added later) keeps a
+ * stale author — which skews evidence-gated arc credit (`lib/attribution/contributor-credit`, #342/#343).
+ * We re-resolve each version from its OWN stored frontmatter (same resolver, same conservative bar), so:
+ *   • a version whose frontmatter genuinely names a person resolves to the SAME member → untouched — a real
+ *     HANDOFF's per-version history is preserved (we never blind-copy the item's current owner onto versions);
+ *   • a version whose author became resolvable only after a mapping change → re-pointed to the real author;
+ *   • a version still standing on a CONNECTOR with no resolvable author → cleared to null (never good credit).
+ * Scoped to the SAME rows as the item pass (non-external, non-locked — a locked item's credit is the lock's
+ * job) via the join. Idempotent. Best-effort per row via the shared conservative rule.
+ */
+async function reattributeVersions(
+  db: DbClient,
+  teamId: string,
+  idMap: IdentityMap,
+  connectorIds: ReadonlySet<string>
+): Promise<number> {
+  // The item↔version join isn't expressible in the compat builder, so the READ (a SELECT) goes straight to
+  // the pool via `runSql` — Postgres-only path, one `DATABASE_URL`. The WRITE stays a single-table builder
+  // update by version id: an `UPDATE … FROM items` re-check deadlocks against the item-pass writes under
+  // concurrency, and isn't worth it — the mid-scan-lock TOCTOU window is benign here (unlike the item pass,
+  // a version re-point never feeds credit while the item is locked: `contributor-credit` ignores versions
+  // for a locked item and reads the current owner). So we snapshot-filter locked at read time and accept the
+  // window; the durable lock protection lives on `items.member_id`.
+  const { rows } = await runSql<{ id: string; member_id: string | null; frontmatter: Record<string, unknown> | null }>(
+    `select v.id, v.member_id, v.frontmatter
+       from item_versions v
+       join items i on i.id = v.item_id
+      where i.team_id = $1 and i.access::text <> 'external' and i.member_id_locked = false`,
+    [teamId]
+  );
+  let updated = 0;
+  for (const v of rows) {
+    const resolved = resolveItemAuthorMember(idMap, v.frontmatter ?? {}, connectorIds);
+    let next: string | null | undefined;
+    if (resolved && resolved !== v.member_id) next = resolved; // re-point to the positively-resolved author
+    else if (!resolved && v.member_id && connectorIds.has(v.member_id)) next = null; // clear a connector-standing row
+    if (next === undefined) continue;
+    const { error } = await db.from("item_versions").update({ member_id: next }).eq("id", v.id);
+    if (error) throw new Error(`reattribute version ${v.id}: ${error.message}`);
+    updated++;
+  }
+  return updated;
 }
