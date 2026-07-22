@@ -45,7 +45,8 @@ export function MeetingActionItems({ teamSlug, noteId, todos: initialTodos, prov
   const [todos, setTodos] = useState<ActionItemView[]>(initialTodos);
   const [results, setResults] = useState<Map<string, PushTaskResult>>(new Map());
   const [pushedProvider, setPushedProvider] = useState<string | null>(null);
-  const [selected, setSelected] = useState<Set<string>>(() => new Set(initialTodos.filter((t) => !t.pushed).map((t) => t.taskId)));
+  // Nothing is selected by default — the user opts in per item (or "Select all") before pushing.
+  const [selected, setSelected] = useState<Set<string>>(new Set());
 
   // A task counts as pushed if the server already recorded it OR we pushed it this session — so the
   // UI reflects a push immediately, WITHOUT a router.refresh() (which would re-render the whole route).
@@ -65,6 +66,12 @@ export function MeetingActionItems({ teamSlug, noteId, todos: initialTodos, prov
     });
   }
 
+  // "Select all" toggles: select every pushable item, or clear when they're all already selected.
+  const allSelected = pushable.length > 0 && selected.size === pushable.length;
+  function toggleSelectAll() {
+    setSelected(allSelected ? new Set() : new Set(pushable.map((t) => t.taskId)));
+  }
+
   function runExtract() {
     setMsg(null);
     startExtract(async () => {
@@ -74,7 +81,7 @@ export function MeetingActionItems({ teamSlug, noteId, todos: initialTodos, prov
       // none are found, the list stays empty and the message below explains why (never a blank reload).
       const items = res.items ?? [];
       setTodos(items);
-      setSelected(new Set(items.filter((t) => !t.pushed).map((t) => t.taskId)));
+      setSelected(new Set()); // fresh extraction starts unchecked — the user opts in before pushing
       setMsg(
         res.extracted
           ? `Extracted ${res.extracted} action item${res.extracted === 1 ? "" : "s"}.`
@@ -191,9 +198,19 @@ export function MeetingActionItems({ teamSlug, noteId, todos: initialTodos, prov
 
           {pushable.length ? (
             <div className="flex items-center justify-between gap-3 border-t border-border-subtle pt-3">
-              <span className="text-xs text-ink-tertiary">
-                {selected.size} of {pushable.length} selected
-              </span>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={toggleSelectAll}
+                  disabled={pushing}
+                  className="text-xs font-medium text-violet hover:underline disabled:opacity-50"
+                >
+                  {allSelected ? "Deselect all" : "Select all"}
+                </button>
+                <span className="text-xs text-ink-tertiary">
+                  {selected.size} of {pushable.length} selected
+                </span>
+              </div>
               <div className="flex items-center gap-2">
                 <button
                   type="button"
