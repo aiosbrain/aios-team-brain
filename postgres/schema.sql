@@ -1049,6 +1049,25 @@ alter table task_pm_links add column if not exists projection_fingerprint text;
 alter table task_pm_links add column if not exists provider_seen_status text;
 alter table task_pm_links add column if not exists last_projected_brain_status text;
 
+-- Task ↔ evidence links (work-timeline context layer): which items (commits, docs, Slack threads)
+-- are the actual WORK behind a task. Populated deterministically by issue-key references in the item's
+-- text (a commit/PR/branch/doc that cites `AIO-123`) via lib/dashboard/timeline-evidence (sole writer);
+-- a lower-confidence LLM grouping pass is a later addition (hence the `method`/`confidence` columns).
+-- Regenerable — safe to truncate. Tier is INHERITED from the item (`items.access`) + the task
+-- (`tasks.audience`); reads re-apply both filters (no per-row tier column, no RLS backstop, CLAUDE.md §5).
+create table if not exists task_evidence (
+  team_id uuid not null references teams(id) on delete cascade,
+  task_id uuid not null references tasks(id) on delete cascade,
+  item_id uuid not null references items(id) on delete cascade,
+  method text not null check (method in ('issue_ref', 'llm', 'manual')),
+  confidence real not null default 1.0,   -- deterministic issue_ref = 1.0; llm = the model's score
+  detail text,                            -- reserved: the matched key / LLM rationale (currently unset)
+  created_at timestamptz not null default now(),
+  primary key (team_id, task_id, item_id)
+);
+create index if not exists task_evidence_item_idx on task_evidence (team_id, item_id);
+create index if not exists task_evidence_task_idx on task_evidence (team_id, task_id);
+
 -- Observable work events from code repos. The initial event is "merged": after a PR
 -- lands on main, the matching task row moves to done and provider sync is attempted.
 create table if not exists work_events (

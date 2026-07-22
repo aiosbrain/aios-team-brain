@@ -1,4 +1,4 @@
-import { SquareCheckBig, SquareKanban, Hash, FileText, Mic, HardDrive, UserPlus } from "lucide-react";
+import { SquareCheckBig, SquareKanban, Hash, FileText, Mic, HardDrive } from "lucide-react";
 import type { ComponentType } from "react";
 
 /**
@@ -23,7 +23,6 @@ const MAP: Record<string, { Icon: IconCmp; color: string; label: string }> = {
   linear: { Icon: SquareCheckBig, color: "text-[#5E6AD2]", label: "Linear" },
   plane: { Icon: SquareKanban, color: "text-[#3f76ff]", label: "Plane" },
   tasks: { Icon: SquareCheckBig, color: "text-violet", label: "Tasks" }, // PM tasks, no provider configured
-  "newly-assigned": { Icon: UserPlus, color: "text-amber-600", label: "Newly assigned" }, // tasks just assigned to this person
   slack: { Icon: Hash, color: "text-[#611f69] dark:text-[#e01e5a]", label: "Slack" },
   notion: { Icon: FileText, color: "text-ink", label: "Notion" },
   confluence: { Icon: FileText, color: "text-[#1868db]", label: "Confluence" },

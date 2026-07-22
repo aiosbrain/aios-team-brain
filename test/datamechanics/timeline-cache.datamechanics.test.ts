@@ -41,16 +41,16 @@ describe("work-timeline cache layer (real Postgres)", () => {
     await seedCommit(seed, "shipped-the-thing", recentIso());
 
     const days = await getCachedWorkTimeline(db(), seed.teamId, "team");
-    // The build found the commit → a day with the seed member and a github group.
+    // The build found the commit → a day with the seed member; unlinked → the "Other" bucket.
     expect(days.length).toBeGreaterThan(0);
     const people = days.flatMap((d) => d.people);
-    expect(people.some((p) => p.sources.some((s) => s.source === "github"))).toBe(true);
+    expect(people.some((p) => p.other.some((s) => s.source === "github"))).toBe(true);
 
-    // It persisted the payload to the 'team' row (jsonb array), matching what was returned.
+    // It persisted the versioned payload { v, days } to the 'team' row, matching what was returned.
     const row = await readRow(seed.teamId, "team");
     expect(row?.group_key).toBe("team");
-    expect(Array.isArray(row?.payload)).toBe(true);
-    expect((row?.payload as unknown[]).length).toBe(days.length);
+    expect((row?.payload as { v: number; days: unknown[] }).v).toBe(2);
+    expect((row?.payload as { days: unknown[] }).days.length).toBe(days.length);
 
     // readTimelineCache round-trips it.
     const cached = await readTimelineCache(db(), seed.teamId, "team");
@@ -70,16 +70,18 @@ describe("work-timeline cache layer (real Postgres)", () => {
     // Two distinct rows, one per tier — the external payload is empty, the team payload is not.
     const teamRow = await readRow(seed.teamId, "team");
     const extRow = await readRow(seed.teamId, "external");
-    expect((teamRow?.payload as unknown[]).length).toBeGreaterThan(0);
-    expect((extRow?.payload as unknown[]).length).toBe(0);
+    expect((teamRow?.payload as { days: unknown[] }).days.length).toBeGreaterThan(0);
+    expect((extRow?.payload as { days: unknown[] }).days.length).toBe(0);
   });
 
   it("SWR: a stale row is served immediately, and the background rebuild picks up new work", async () => {
     const seed = await seedTeam();
     await seedCommit(seed, "commit-a", recentIso());
     const first = await getCachedWorkTimeline(db(), seed.teamId, "team"); // cold miss → builds [A], persists
-    const firstCount = first.flatMap((d) => d.people).flatMap((p) => p.sources).reduce((n, s) => n + s.count, 0);
-    expect(firstCount).toBe(1);
+    // Unlinked commits land in "Other"; count evidence items across tasks + other.
+    const evCount = (people: { tasks: { evidenceCount: number }[]; other: { count: number }[] }[]): number =>
+      people.reduce((n, p) => n + p.tasks.reduce((a, t) => a + t.evidenceCount, 0) + p.other.reduce((a, g) => a + g.count, 0), 0);
+    expect(evCount(first.flatMap((d) => d.people))).toBe(1);
 
     // New work lands, then the row is marked stale (+ in-memory evicted) — the re-attribution path.
     await seedCommit(seed, "commit-b", recentIso());
@@ -87,18 +89,14 @@ describe("work-timeline cache layer (real Postgres)", () => {
 
     // Next read returns the STALE payload immediately (still 1 item) and fires the background rebuild.
     const staleServe = await getCachedWorkTimeline(db(), seed.teamId, "team");
-    const staleCount = staleServe.flatMap((d) => d.people).flatMap((p) => p.sources).reduce((n, s) => n + s.count, 0);
-    expect(staleCount).toBe(1); // served stale, not yet rebuilt
+    expect(evCount(staleServe.flatMap((d) => d.people))).toBe(1); // served stale, not yet rebuilt
 
     // The deduped background rebuild lands the new payload (2 items) into the persisted row.
     await vi.waitFor(
       async () => {
         const row = await readRow(seed.teamId, "team");
-        const count = ((row?.payload as { people: { sources: { count: number }[] }[] }[]) ?? [])
-          .flatMap((d) => d.people)
-          .flatMap((p) => p.sources)
-          .reduce((n, s) => n + s.count, 0);
-        expect(count).toBe(2);
+        const days = ((row?.payload as { days?: { people: { tasks: { evidenceCount: number }[]; other: { count: number }[] }[] }[] })?.days) ?? [];
+        expect(evCount(days.flatMap((d) => d.people))).toBe(2);
       },
       { timeout: 3_000, interval: 50 }
     );
