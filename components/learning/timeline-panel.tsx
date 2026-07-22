@@ -1,127 +1,93 @@
 import { adminClient } from "@/lib/db/admin";
-import { visibleGroupIds } from "@/lib/graph/group";
-import { recentEvents } from "@/lib/graph/learning";
-import { resolveHumanActorsByItem } from "@/lib/graph/human-actors";
-import { attributeEventParticipants } from "@/lib/graph/arc-attribution";
-import { groupEventsByDay } from "@/lib/graph/timeline";
+import { getWorkTimeline } from "@/lib/dashboard/work-timeline";
+import type { PersonDay } from "@/lib/dashboard/timeline-group";
+import { MemberAvatar } from "@/components/people/member-avatar";
+import { SourceIcon, sourceLabel } from "@/components/icons/source-icon";
 
 /**
- * Timeline — the team's recent work on a WORK-time axis (events grouped by work day, newest first),
- * now that facts/events order by when the work happened, not when it was extracted (see
- * docs/design/arcs-work-time-chronology.md). Tier-scoped via `visibleGroupIds` (sole enforcement,
- * CLAUDE §5). Best-effort — an empty/unreachable graph renders the empty state. All time formatting
- * happens in `loadTimeline` (not during render, so the server component stays a pure render).
+ * Timeline — the team's recent work as a human-readable day → person → evidence ledger over the last
+ * 7 days (GitHub commits, Linear/Plane tasks, dated docs), each with a brand source icon + link. Reads
+ * Postgres `items`+`tasks` (via `getWorkTimeline`, tier-gated through the §5 choke-points), NOT the
+ * graph — so it shows real per-person work instead of chunked extraction episodes. Best-effort: an
+ * empty week renders the empty state. `adminClient` is safe here because `visibleItems`/`visibleTasks`
+ * apply the tier filter inside the query regardless of the client.
  */
-
-const WINDOW_DAYS = 30;
-const LIMIT = 120;
-
-const SOURCE_ICON: Record<string, string> = {
-  slack: "💬",
-  github: "🐙",
-  git: "🔗",
-  linear: "📐",
-  plane: "📐",
-  notion: "📝",
-  granola: "🎙️",
-  gdrive: "📄",
-  confluence: "📘",
-  web: "🌐",
-};
-
-interface TimelineEventView {
-  id: string;
-  icon: string;
-  title: string;
-  time: string;
-  meta: string;
-}
-interface TimelineDayView {
-  date: string;
-  label: string;
-  events: TimelineEventView[];
-}
-
-function dayLabel(date: string, today: string, yest: string): string {
-  if (date === today) return "Today";
-  if (date === yest) return "Yesterday";
-  const t = Date.parse(date);
-  if (Number.isNaN(t)) return "Undated";
-  return new Date(t).toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
-}
 
 function timeOf(at: string): string {
   const t = Date.parse(at);
   return Number.isNaN(t) ? "" : new Date(t).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
 }
 
-/** Fetch + group + format — all `Date`/`Date.now` usage lives here, off the render path. */
-async function loadTimeline(teamSlug: string, teamId: string, tier: "team" | "external"): Promise<TimelineDayView[]> {
-  const today = new Date().toISOString().slice(0, 10);
-  const yest = new Date(Date.now() - 86400_000).toISOString().slice(0, 10);
-  const since = new Date(Date.now() - WINDOW_DAYS * 86400_000).toISOString();
-
-  const events = await recentEvents(visibleGroupIds(teamSlug, tier), since, LIMIT);
-  const itemIds = [...new Set(events.map((e) => e.itemId).filter((id): id is string => !!id))];
-  const humanByItem = await resolveHumanActorsByItem(adminClient(), teamId, itemIds);
-  const days = groupEventsByDay(attributeEventParticipants(events, humanByItem));
-
-  return days.map((day) => ({
-    date: day.date,
-    label: dayLabel(day.date, today, yest),
-    events: day.events.map((ev) => ({
-      id: ev.id,
-      icon: SOURCE_ICON[ev.source] ?? "📌",
-      title: ev.title || "(untitled event)",
-      time: timeOf(ev.at),
-      meta:
-        `${ev.source || "source"} · ${ev.factCount} fact${ev.factCount === 1 ? "" : "s"}` +
-        (ev.participants.length ? ` · ${ev.participants.join(", ")}` : ""),
-    })),
-  }));
+/** "12 items · GitHub, Linear" — the distinct sources a person touched that day. */
+function personSummary(p: PersonDay): string {
+  const sources = [...new Set(p.sources.map((s) => sourceLabel(s.source)))];
+  return `${p.total} item${p.total === 1 ? "" : "s"} · ${sources.join(", ")}`;
 }
 
-export async function TimelinePanel({
-  teamSlug,
-  teamId,
-  tier,
-}: {
-  teamSlug: string;
-  teamId: string;
-  tier: "team" | "external";
-}) {
-  const days = await loadTimeline(teamSlug, teamId, tier);
+export async function TimelinePanel({ teamId, tier }: { teamId: string; tier: "team" | "external" }) {
+  const days = await getWorkTimeline(adminClient(), teamId, tier);
 
   if (days.length === 0) {
     return (
       <p className="rounded-lg border border-border-subtle px-4 py-6 text-center text-sm text-ink-tertiary">
-        No recent activity to chart yet — the timeline fills in as the brain extracts events from your team&apos;s work.
+        No recent work to show — the timeline fills in as commits, tasks, and docs land over the last 7 days.
       </p>
     );
   }
 
   return (
-    <div className="flex flex-col gap-5">
+    <div className="flex flex-col gap-6">
       {days.map((day) => (
-        <div key={day.date}>
-          <h3 className="mb-2 text-xs font-semibold uppercase tracking-wider text-ink-tertiary">{day.label}</h3>
-          <ol className="ml-2 flex flex-col border-l border-border-subtle">
-            {day.events.map((ev) => (
-              <li key={ev.id} className="relative ml-4 pb-4 last:pb-0">
-                <span className="absolute -left-[22px] top-1.5 size-2 rounded-full border-2 border-surface bg-violet" aria-hidden />
-                <div className="flex items-start gap-2">
-                  <span className="mt-0.5 text-sm leading-none">{ev.icon}</span>
-                  <div className="min-w-0 flex-1">
-                    <p className="truncate text-sm text-ink">{ev.title}</p>
-                    <p className="mt-0.5 text-[11px] text-ink-tertiary">
-                      {ev.time ? `${ev.time} · ` : ""}
-                      {ev.meta}
-                    </p>
+        <div key={day.date} className="flex flex-col gap-3">
+          <h3 className="text-xs font-semibold uppercase tracking-wider text-ink-tertiary">{day.label}</h3>
+
+          <div className="flex flex-col gap-3">
+            {day.people.map((p) => (
+              <div key={p.memberId} className="prism-card flex flex-col gap-3 p-4">
+                <div className="flex items-center gap-2.5">
+                  <MemberAvatar person={{ displayName: p.name, avatarUrl: p.avatarUrl }} size={32} />
+                  <div className="min-w-0">
+                    <p className="truncate text-sm font-medium text-ink">{p.name}</p>
+                    <p className="text-[11px] text-ink-tertiary">{personSummary(p)}</p>
                   </div>
                 </div>
-              </li>
+
+                <div className="flex flex-col gap-3">
+                  {p.sources.map((g) => (
+                    <div key={g.source} className="flex flex-col gap-1.5">
+                      <div className="flex items-center gap-1.5 text-[11px] font-medium uppercase tracking-wide text-ink-secondary">
+                        <SourceIcon source={g.source} className="size-3.5" />
+                        {sourceLabel(g.source)}
+                        <span className="font-normal text-ink-tertiary/70">· {g.count}</span>
+                      </div>
+                      <ul className="flex flex-col gap-1 border-l border-border-subtle pl-3">
+                        {g.items.map((it) => (
+                          <li key={it.id} className="flex items-baseline justify-between gap-3">
+                            {it.url ? (
+                              <a
+                                href={it.url}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="truncate text-sm text-ink hover:text-violet"
+                              >
+                                {it.title}
+                              </a>
+                            ) : (
+                              <span className="truncate text-sm text-ink">{it.title}</span>
+                            )}
+                            <span className="shrink-0 text-[11px] text-ink-tertiary">{timeOf(it.at)}</span>
+                          </li>
+                        ))}
+                        {g.count > g.items.length ? (
+                          <li className="text-[11px] text-ink-tertiary">+{g.count - g.items.length} more</li>
+                        ) : null}
+                      </ul>
+                    </div>
+                  ))}
+                </div>
+              </div>
             ))}
-          </ol>
+          </div>
         </div>
       ))}
     </div>

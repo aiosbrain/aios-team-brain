@@ -54,7 +54,7 @@ export default async function LearningPage({ params }: { params: Promise<{ team:
               </p>
             }
           >
-            <TimelinePanel teamSlug={teamSlug} teamId={ctx.team.id} tier={ctx.me.tier} />
+            <TimelinePanel teamId={ctx.team.id} tier={ctx.me.tier} />
           </Suspense>
         </div>
       </details>
