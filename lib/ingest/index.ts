@@ -37,6 +37,24 @@ export interface IngestResult {
   changedTaskRowKeys?: string[];
 }
 
+/** Order-insensitive JSON for comparing frontmatter to its jsonb-stored form (Postgres normalizes
+ *  object key order; the normalizers emit insertion order). Recursively sorts object keys; array order
+ *  is preserved (meaningful + jsonb-preserved). So `canonicalJson(a) === canonicalJson(b)` iff the two
+ *  frontmatters are semantically equal, avoiding a needless rewrite on every unchanged re-push. */
+function canonicalJson(value: unknown): string {
+  const norm = (v: unknown): unknown => {
+    if (Array.isArray(v)) return v.map(norm);
+    if (v && typeof v === "object") {
+      const o = v as Record<string, unknown>;
+      return Object.keys(o)
+        .sort()
+        .reduce<Record<string, unknown>>((acc, k) => ((acc[k] = norm(o[k])), acc), {});
+    }
+    return v;
+  };
+  return JSON.stringify(norm(value));
+}
+
 export async function ingestItem(
   db: DbClient,
   auth: { teamId: string; memberId: string; apiKeyId: string },
@@ -69,7 +87,7 @@ export async function ingestItem(
   // 2. existing item?
   const { data: existing } = await db
     .from("items")
-    .select("id, content_sha256, member_id")
+    .select("id, content_sha256, member_id, frontmatter")
     .eq("team_id", auth.teamId)
     .eq("project_id", project.id)
     .eq("path", payload.path)
@@ -92,9 +110,27 @@ export async function ingestItem(
     // clobber a human self-push's own attribution. Re-pointing an existing (wrong) attribution stays the
     // job of the explicit, admin-triggered `reattributeItems` batch. Never clears to null either (a
     // connector's unresolved re-push passes `authorMemberId: null`).
-    const patch: { synced_at: string; member_id?: string } = { synced_at: now };
+    const patch: { synced_at: string; member_id?: string; frontmatter?: Record<string, unknown> } = { synced_at: now };
     if (opts?.authorMemberId && existing.member_id === null) {
       patch.member_id = opts.authorMemberId;
+    }
+    // HEAL FRONTMATTER on an unchanged re-push: `content_sha256` covers only the body, but source-derived
+    // metadata in frontmatter can change while the body doesn't — a Linear issue transitions Backlog →
+    // In Progress (its prose unchanged), or a source later exposes richer `authors[]`. Without this, the
+    // stored frontmatter is frozen at first ingest, so status-gated reads (arc eligibility) and the
+    // reattribute batch (reads stored frontmatter) act on stale metadata forever.
+    const existingFm = (existing as { frontmatter: Record<string, unknown> | null }).frontmatter ?? {};
+    const healedFm: Record<string, unknown> = { ...(payload.frontmatter ?? {}) };
+    // Preserve BEST-EFFORT/backfilled author keys the store has but this push omits (e.g. github-files'
+    // commits-lookup or the author backfill script populated them, and a transient lookup failure this
+    // tick left them off the payload) — refreshing must not wipe them.
+    for (const k of ["author", "author_email", "author_login"]) {
+      if (existingFm[k] !== undefined && healedFm[k] === undefined) healedFm[k] = existingFm[k];
+    }
+    // Compare canonically (jsonb normalizes object key order; the normalizer emits insertion order), so we
+    // write ONLY on a real metadata change — not every tick on a key-order-only mismatch.
+    if (canonicalJson(existingFm) !== canonicalJson(healedFm)) {
+      patch.frontmatter = healedFm;
     }
     await db.from("items").update(patch).eq("id", existing.id);
     // Audit the rare heal (a genuine attribution change — unlike the per-tick synced_at bump, so it

@@ -10,6 +10,7 @@ import { episodeGroupId, type AccessTier } from "./group";
 import { attributeParticipants, attributedFactTexts, withEvidenceParticipants } from "./arc-attribution";
 import { resolveHumanActorsByItem } from "./human-actors";
 import { readArcCache, writeArcCache } from "./arc-cache";
+import { arcIneligibleItemIds } from "./arc-eligibility";
 
 /**
  * Layer 3 — narrative arcs. Gathers the recent graph substrate (facts, last 7d, tier-scoped),
@@ -197,18 +198,30 @@ export function balanceFacts<T>(
  * duplicate would otherwise consume a numbered slot and hand the model redundant input. Pure + tested.
  */
 export function dedupeFacts(facts: AtomicFact[]): AtomicFact[] {
-  const seen = new Set<string>();
-  const out: AtomicFact[] = [];
+  const byKey = new Map<string, { fact: AtomicFact; eps: Set<string> }>();
+  const order: string[] = [];
   for (const f of facts) {
     const subj = (f.subject ?? "").trim().toLowerCase();
     const obj = (f.object ?? "").trim().toLowerCase();
     if (subj && subj === obj) continue; // self-referential noise
     const key = (f.fact ?? "").trim().toLowerCase().replace(/\s+/g, " ");
-    if (!key || seen.has(key)) continue;
-    seen.add(key);
-    out.push(f);
+    if (!key) continue;
+    const kept = byKey.get(key);
+    if (kept) {
+      // Same fact text from another source → keep the first (newest) but UNION its source episodes, so
+      // downstream (arc eligibility, evidence) sees ALL of the fact's sources, not just the first copy's
+      // (e.g. a fact cited by both a Done Linear ticket AND a meeting must retain the meeting episode).
+      for (const u of f.episodeUuids) kept.eps.add(u);
+      continue;
+    }
+    byKey.set(key, { fact: f, eps: new Set(f.episodeUuids) });
+    order.push(key);
   }
-  return out;
+  // New objects (immutability) with the unioned episode set.
+  return order.map((k) => {
+    const e = byKey.get(k)!;
+    return { ...e.fact, episodeUuids: [...e.eps] };
+  });
 }
 
 const CONFIDENCE_WEIGHT: Record<NarrativeArc["confidence"], number> = { high: 3, medium: 2, low: 1 };
@@ -489,9 +502,28 @@ async function synthesizeArcs(
   };
   const itemOfFact = (f: AtomicFact): string => actorOfFact(f).item;
   const humanOfFact = (f: AtomicFact): string => actorOfFact(f).human;
+  // Drop facts whose evidence is ONLY non-active Linear issues (arcs are "what the team is working
+  // through", so backlog/todo/done tickets are context, not narrative). A fact dedup'd across sources is
+  // KEPT if ANY of its source items is eligible (or none resolve) — e.g. a fact cited by both a Done
+  // Linear issue AND a meeting transcript stays, since the meeting is eligible evidence (filtering on the
+  // single attribution item would wrongly drop it). Arc-synthesis-only; excluded content stays in the
+  // graph + facts panel. Non-Linear facts pass through.
+  const ineligible = await arcIneligibleItemIds(teamId, allItemIds);
+  const factItemIds = (f: AtomicFact): string[] =>
+    f.episodeUuids.map((u) => epToItem.get(u)?.itemId).filter((id): id is string => !!id);
+  const eligiblePool = ineligible.size
+    ? pool.filter((f) => {
+        const items = factItemIds(f);
+        return items.length === 0 || items.some((id) => !ineligible.has(id));
+      })
+    : pool;
+  // If every recent fact traces ONLY to non-active Linear work, there's nothing to synthesize — return
+  // [] so it flows into the empty-clobber guard (keep a recent prior, else honest blank), rather than
+  // firing a zero-fact LLM call whose fabricated (evidence-less) arcs would clobber the real prior set.
+  if (eligiblePool.length === 0 && correctionTexts.length === 0) return [];
   // Two-level balance (contributor → item, per-item capped) → a representative MAX_FACTS so every active
   // contributor is in the prompt AND no single giant document dominates its author's share.
-  const facts = balanceFacts(pool, humanOfFact, itemOfFact, MAX_FACTS, PER_ITEM_CAP);
+  const facts = balanceFacts(eligiblePool, humanOfFact, itemOfFact, MAX_FACTS, PER_ITEM_CAP);
   // Request arcs proportional to how many distinct contributors actually made the balanced cut, so a
   // varied team gets more than a flat ceiling and each person's distinct threads have room to surface.
   const contributorCount = new Set(facts.map(humanOfFact).filter(Boolean)).size;

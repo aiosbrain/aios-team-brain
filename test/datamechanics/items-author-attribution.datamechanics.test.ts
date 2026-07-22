@@ -118,4 +118,21 @@ describe("author attribution at ingest → stored member_id (real Postgres)", ()
     await ingestItem(db(), auth, p, "team", { authorMemberId: null }); // unchanged, unresolved
     expect(await stored()).toBe(seed.memberId); // NOT cleared
   });
+
+  it("frontmatter heal refreshes changed keys but PRESERVES best-effort author keys the re-push omits", async () => {
+    const seed = await seedTeam();
+    const auth = { teamId: seed.teamId, memberId: seed.memberId, apiKeyId: randomUUID() };
+    const p1 = payload({ source: "github", state: "old", author: "Alice", author_email: "alice@corp.com", author_login: "alice" });
+    const r1 = await ingestItem(db(), auth, p1, "team"); // first ingest WITH best-effort author keys
+    const fmOf = async () =>
+      ((await db().from("items").select("frontmatter").eq("id", r1.id).single()).data as { frontmatter: Record<string, unknown> }).frontmatter;
+
+    // same body (unchanged) but a real key changed AND the author keys are omitted (transient lookup miss)
+    const r2 = await ingestItem(db(), auth, { ...p1, frontmatter: { source: "github", state: "new" } }, "team");
+    expect(r2.status).toBe("unchanged");
+    const fm = await fmOf();
+    expect(fm.state).toBe("new"); // real change healed
+    expect(fm.author_email).toBe("alice@corp.com"); // best-effort author key PRESERVED, not wiped
+    expect(fm.author).toBe("Alice");
+  });
 });

@@ -274,13 +274,20 @@ describe("balanceFacts — contributor→item (one giant doc can't BE a person's
 });
 
 describe("dedupeFacts — no wasted prompt slots on repeats / self-referential noise", () => {
-  const mk = (id: string, fact: string, subject = "s", object = "o"): AtomicFact => ({
-    id, fact, at: "2026-07-20T00:00:00Z", subjectType: "entity", subject, object, episodeUuids: [],
+  const mk = (id: string, fact: string, subject = "s", object = "o", episodeUuids: string[] = []): AtomicFact => ({
+    id, fact, at: "2026-07-20T00:00:00Z", subjectType: "entity", subject, object, episodeUuids,
   });
 
   it("drops exact-repeat fact text, keeping the first (newest) occurrence", () => {
     const out = dedupeFacts([mk("1", "Chetan fixed observability"), mk("2", "Chetan fixed observability")]);
     expect(out.map((f) => f.id)).toEqual(["1"]);
+  });
+
+  it("UNIONS the source episodes of the dropped duplicate into the kept fact", () => {
+    const out = dedupeFacts([mk("1", "same fact", "s", "o", ["epA"]), mk("2", "same fact", "s", "o", ["epB"])]);
+    expect(out).toHaveLength(1);
+    expect(out[0].id).toBe("1"); // first kept
+    expect([...out[0].episodeUuids].sort()).toEqual(["epA", "epB"]); // both sources retained
   });
 
   it("is case/space-insensitive on the repeat check", () => {
