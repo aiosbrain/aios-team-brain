@@ -23,6 +23,8 @@ import { saveProvisioningSettings as saveProvisioningSettings_ } from "@/lib/pro
 import { validateGithubToken, checkRepoAccess, type RepoAccess } from "@/lib/integrations/github-validate";
 import { RepoFormatError } from "@/lib/integrations/github-repos";
 import { validateOpenrouterKey, saveOpenrouterSettings } from "@/lib/integrations/openrouter";
+import { MEETING_TASK_STATUSES, type MeetingTaskStatus } from "@/lib/meetings/target-status";
+import { setMeetingTaskStatus as setMeetingTaskStatusDb } from "@/lib/meetings/target-status-db";
 import { IntegrationConfigError, type IntegrationType } from "@/lib/api/schemas";
 import { buildConfig, toList } from "@/lib/integrations/build-config";
 import { audit } from "@/lib/api/audit";
@@ -498,6 +500,38 @@ export async function removeIntegration(
  * Pass `null` to clear it. The projection engine reads `teams.primary_pm_provider`; with it unset it
  * no-ops (or falls back to the sole enabled PM integration).
  */
+/**
+ * Set the category extracted MEETING action items land in when pushed to the PM tool (admins only).
+ * A brain task status (backlog/ready/in_progress/done) mapped to the provider's state group on push.
+ */
+export async function setMeetingTaskStatus(
+  teamSlug: string,
+  status: MeetingTaskStatus
+): Promise<{ ok: boolean; error?: string }> {
+  const ctx = await requireAdmin(teamSlug);
+  if (!ctx) return { ok: false, error: "admins only" };
+  if (!(MEETING_TASK_STATUSES as readonly string[]).includes(status)) {
+    return { ok: false, error: "invalid category" };
+  }
+  const db = adminClient();
+  try {
+    await setMeetingTaskStatusDb(db, ctx.teamId, status);
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "could not save" };
+  }
+  await audit(db, {
+    team_id: ctx.teamId,
+    actor_kind: "member",
+    member_id: ctx.memberId,
+    action: "team.meeting_task_status_set",
+    target_type: "team",
+    target_id: ctx.teamId,
+    meta: { status },
+  });
+  revalidatePath(`/t/${teamSlug}/admin/integrations`);
+  return { ok: true };
+}
+
 export async function setPrimaryPmProvider(
   teamSlug: string,
   provider: PrimaryPmProvider

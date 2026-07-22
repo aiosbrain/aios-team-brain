@@ -92,6 +92,15 @@ describe("meeting GUI upload → action items (real Postgres, stubbed extractor)
     expect(await meetingTaskTitles(teamId, item.id)).toEqual(["Alpha", "Beta"]);
   });
 
+  it("new todos take the team's configured target category (teams.meeting_task_status)", async () => {
+    const { teamId, item } = await seedMeeting("A");
+    await db().from("teams").update({ meeting_task_status: "in_progress" }).eq("id", teamId);
+    await extractAndStoreActionItems(db(), teamId, item, "A", [], {}, async () => [todo("Alpha")]);
+    const { data } = await db()
+      .from("tasks").select("status").eq("team_id", teamId).eq("title", "Alpha").maybeSingle();
+    expect((data as { status: string }).status).toBe("in_progress"); // → Linear "In Progress" on push
+  });
+
   it("an EMPTY re-extraction never prunes (indistinguishable from a failed extraction)", async () => {
     const { teamId, item } = await seedMeeting("A B");
     await extractAndStoreActionItems(db(), teamId, item, "A B", [], {}, async () => [todo("Alpha"), todo("Beta")]);

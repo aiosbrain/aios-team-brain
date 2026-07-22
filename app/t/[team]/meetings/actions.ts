@@ -17,6 +17,7 @@ import {
 import { extractFromTranscript, type RosterPerson } from "@/lib/meetings/llm-extract";
 import { extractAndStoreActionItems } from "@/lib/meetings/action-items";
 import { MEETING_TODO_PROJECT_SLUG } from "@/lib/meetings/extract-todos";
+import { MEETING_TASK_STATUSES, type MeetingTaskStatus } from "@/lib/meetings/target-status";
 import { findDuplicateMeeting, mergeIntoMeetingNote, backfillMergeDuplicateMeetings } from "@/lib/meetings/merge";
 import { backfillMeetingNotesFromItems } from "@/lib/meetings/from-items";
 import {
@@ -316,7 +317,9 @@ export interface PushTaskResult {
 export async function pushMeetingTasksAction(
   teamSlug: string,
   noteId: string,
-  taskIds: string[]
+  taskIds: string[],
+  // Optional per-meeting override of the target category (else each task's current status is used).
+  targetStatus?: MeetingTaskStatus
 ): Promise<{ ok: boolean; error?: string; provider?: string; results?: PushTaskResult[] }> {
   const team = await resolveTeam(teamSlug);
   if (!team) return { ok: false, error: "team not found" };
@@ -360,13 +363,22 @@ export async function pushMeetingTasksAction(
   })[]).filter((t) => t.source_item_id === sourceItemId && t.projects?.slug === MEETING_TODO_PROJECT_SLUG && t.row_key);
   if (!eligible.length) return { ok: false, provider: primary.provider, error: "no eligible tasks to push" };
 
+  // Per-meeting category override: persist the chosen status on the tasks (so the brain + a later
+  // status re-sync stay consistent) and project with it. Falls through to each task's current status.
+  const applied = (MEETING_TASK_STATUSES as readonly string[]).includes(targetStatus ?? "")
+    ? (targetStatus as MeetingTaskStatus)
+    : null;
+  if (applied) {
+    await admin.from("tasks").update({ status: applied }).eq("team_id", team.id).in("id", eligible.map((t) => t.id));
+  }
+
   const rows: ProjectionTaskRow[] = eligible.map((t) => ({
     id: t.id,
     team_id: t.team_id,
     project_id: t.project_id,
     row_key: t.row_key,
     title: t.title,
-    status: t.status,
+    status: applied ?? t.status,
     sprint: t.sprint,
     priority: t.priority,
     labels: t.labels,

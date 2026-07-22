@@ -2,7 +2,7 @@
 
 import { useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
-import { Plug, Plus, Trash2, KeyRound, RefreshCw, Network, Sparkles } from "lucide-react";
+import { Plug, Plus, Trash2, KeyRound, RefreshCw, Network, Sparkles, ListChecks } from "lucide-react";
 import {
   saveIntegration,
   toggleIntegration,
@@ -18,9 +18,15 @@ import {
   setAnsweringProvider,
   setAnsweringModel,
   setReasoningModel,
+  setMeetingTaskStatus,
   type PrimaryPmProvider,
 } from "@/app/t/[team]/admin/integrations/actions";
 import type { AnsweringProvider } from "@/lib/query/llm-backend";
+import {
+  MEETING_TASK_STATUSES,
+  MEETING_CATEGORY_LABEL,
+  type MeetingTaskStatus,
+} from "@/lib/meetings/target-status";
 
 /** Answering + reasoning model state computed server-side (page.tsx) from the team's config + env. */
 export interface AnsweringState {
@@ -202,11 +208,13 @@ export function IntegrationsManager({
   teamSlug,
   integrations,
   primaryPmProvider,
+  meetingTaskStatus,
   answering,
 }: {
   teamSlug: string;
   integrations: IntegrationRow[];
   primaryPmProvider: PrimaryPmProvider;
+  meetingTaskStatus: MeetingTaskStatus;
   answering: AnsweringState;
 }) {
   const router = useRouter();
@@ -501,6 +509,35 @@ export function IntegrationsManager({
           })}
         </div>
       </div>
+
+      <div className="prism-card flex flex-col gap-2 p-4">
+        <p className="flex items-center gap-2 text-sm font-medium text-ink">
+          <ListChecks className="size-4 text-violet" /> Meeting action items → category
+        </p>
+        <p className="text-xs text-ink-secondary">
+          Which category extracted meeting action items land in when pushed to your PM tool. The
+          meeting page shows this default and lets the pusher change it per meeting.
+        </p>
+        <div className="flex flex-col gap-1.5">
+          {MEETING_TASK_STATUSES.map((s) => {
+            const active = meetingTaskStatus === s;
+            return (
+              <label key={s} className="flex cursor-pointer items-center gap-2 text-sm text-ink">
+                <input
+                  type="radio"
+                  name="meeting-task-status"
+                  checked={active}
+                  disabled={pending || active}
+                  onChange={() => run(() => setMeetingTaskStatus(teamSlug, s))}
+                  className="accent-violet"
+                />
+                {MEETING_CATEGORY_LABEL[s]}
+              </label>
+            );
+          })}
+        </div>
+      </div>
+
       <div className="prism-card flex flex-col gap-2 p-4">
         <p className="flex items-center gap-2 text-sm font-medium text-ink">
           <Network className="size-4 text-violet" /> Graph memory (Graphiti)

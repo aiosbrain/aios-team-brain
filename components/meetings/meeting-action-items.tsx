@@ -8,6 +8,11 @@ import {
   pushMeetingTasksAction,
   type PushTaskResult,
 } from "@/app/t/[team]/meetings/actions";
+import {
+  MEETING_TASK_STATUSES,
+  MEETING_CATEGORY_LABEL,
+  type MeetingTaskStatus,
+} from "@/lib/meetings/target-status";
 
 export interface ActionItemView {
   taskId: string;
@@ -24,6 +29,8 @@ interface MeetingActionItemsProps {
   todos: ActionItemView[];
   /** The team's primary PM provider (e.g. "linear"), or null if none is configured. */
   provider: string | null;
+  /** Team default category (admin setting) extracted items land in — overridable here per meeting. */
+  defaultStatus: MeetingTaskStatus;
 }
 
 function providerLabel(provider: string | null): string {
@@ -37,7 +44,7 @@ function providerLabel(provider: string | null): string {
  * link out and can't be re-selected. When no tasks have been extracted yet, offers to extract them
  * (the CLI/ingest import path doesn't do it automatically).
  */
-export function MeetingActionItems({ teamSlug, noteId, todos: initialTodos, provider }: MeetingActionItemsProps) {
+export function MeetingActionItems({ teamSlug, noteId, todos: initialTodos, provider, defaultStatus }: MeetingActionItemsProps) {
   const [extracting, startExtract] = useTransition();
   const [pushing, startPush] = useTransition();
   const [msg, setMsg] = useState<string | null>(null);
@@ -45,7 +52,10 @@ export function MeetingActionItems({ teamSlug, noteId, todos: initialTodos, prov
   const [todos, setTodos] = useState<ActionItemView[]>(initialTodos);
   const [results, setResults] = useState<Map<string, PushTaskResult>>(new Map());
   const [pushedProvider, setPushedProvider] = useState<string | null>(null);
-  const [selected, setSelected] = useState<Set<string>>(() => new Set(initialTodos.filter((t) => !t.pushed).map((t) => t.taskId)));
+  // Nothing is selected by default — the user opts in per item (or "Select all") before pushing.
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  // The category pushed items land in — seeded from the team default (admin), changeable per meeting.
+  const [targetStatus, setTargetStatus] = useState<MeetingTaskStatus>(defaultStatus);
 
   // A task counts as pushed if the server already recorded it OR we pushed it this session — so the
   // UI reflects a push immediately, WITHOUT a router.refresh() (which would re-render the whole route).
@@ -65,6 +75,12 @@ export function MeetingActionItems({ teamSlug, noteId, todos: initialTodos, prov
     });
   }
 
+  // "Select all" toggles: select every pushable item, or clear when they're all already selected.
+  const allSelected = pushable.length > 0 && selected.size === pushable.length;
+  function toggleSelectAll() {
+    setSelected(allSelected ? new Set() : new Set(pushable.map((t) => t.taskId)));
+  }
+
   function runExtract() {
     setMsg(null);
     startExtract(async () => {
@@ -74,7 +90,7 @@ export function MeetingActionItems({ teamSlug, noteId, todos: initialTodos, prov
       // none are found, the list stays empty and the message below explains why (never a blank reload).
       const items = res.items ?? [];
       setTodos(items);
-      setSelected(new Set(items.filter((t) => !t.pushed).map((t) => t.taskId)));
+      setSelected(new Set()); // fresh extraction starts unchecked — the user opts in before pushing
       setMsg(
         res.extracted
           ? `Extracted ${res.extracted} action item${res.extracted === 1 ? "" : "s"}.`
@@ -88,7 +104,7 @@ export function MeetingActionItems({ teamSlug, noteId, todos: initialTodos, prov
     if (!ids.length) return;
     setMsg(null);
     startPush(async () => {
-      const res = await pushMeetingTasksAction(teamSlug, noteId, ids);
+      const res = await pushMeetingTasksAction(teamSlug, noteId, ids, targetStatus);
       if (!res.ok) return setMsg(res.error ?? "push failed");
       const list = res.results ?? [];
       // Merge the returned results into local state — the render marks these pushed from here, so no
@@ -191,10 +207,34 @@ export function MeetingActionItems({ teamSlug, noteId, todos: initialTodos, prov
 
           {pushable.length ? (
             <div className="flex items-center justify-between gap-3 border-t border-border-subtle pt-3">
-              <span className="text-xs text-ink-tertiary">
-                {selected.size} of {pushable.length} selected
-              </span>
               <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={toggleSelectAll}
+                  disabled={pushing}
+                  className="text-xs font-medium text-violet hover:underline disabled:opacity-50"
+                >
+                  {allSelected ? "Deselect all" : "Select all"}
+                </button>
+                <span className="text-xs text-ink-tertiary">
+                  {selected.size} of {pushable.length} selected
+                </span>
+              </div>
+              <div className="flex items-center gap-2">
+                <label className="flex items-center gap-1 text-xs text-ink-tertiary">
+                  into
+                  <select
+                    value={targetStatus}
+                    onChange={(e) => setTargetStatus(e.target.value as MeetingTaskStatus)}
+                    disabled={pushing || !provider}
+                    title="Which category these land in when pushed (default from Admin → Integrations)"
+                    className="rounded-md border border-ink/15 bg-transparent px-2 py-1 text-xs text-ink outline-none focus:border-ink/30 disabled:opacity-50"
+                  >
+                    {MEETING_TASK_STATUSES.map((s) => (
+                      <option key={s} value={s}>{MEETING_CATEGORY_LABEL[s]}</option>
+                    ))}
+                  </select>
+                </label>
                 <button
                   type="button"
                   onClick={runPush}
