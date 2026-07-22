@@ -121,7 +121,12 @@ export async function extractAndStoreActionItems(
   // Injectable so the backfill/tests can stub the LLM step; defaults to the real extractor.
   extract?: (rawText: string, roster: RosterPerson[], keys: ProviderKeys) => Promise<ExtractedTodo[]>,
   // Extra timeout for the default extractor (background/backfill can allow a slower model).
-  timeoutMs?: number
+  timeoutMs?: number,
+  // Pruning stale todos is OPT-IN — only the deliberate on-demand re-extract (the "Extract action
+  // items" button) sets `reconcile`. The additive callers (upload, import/backfill, refresh, merge)
+  // MUST NOT prune: they all funnel through here, and a merge/refresh reworking one title would
+  // otherwise delete another path's freshly-created (or just-re-pointed) todo.
+  opts: { reconcile?: boolean } = {}
 ): Promise<number> {
   const run = extract ?? ((t: string, r: RosterPerson[], k: ProviderKeys) => extractActionItems(t, r, k, timeoutMs));
   const todos = await run(rawText, roster, keys);
@@ -134,7 +139,10 @@ export async function extractAndStoreActionItems(
   // team's configured target category so a later push lands them there.
   if (rows.length) {
     const status = await getMeetingTaskStatus(db, teamId);
-    await createMeetingTodoTasks(db, teamId, rows, { pruneSourceItemIds: [item.id], status });
+    await createMeetingTodoTasks(db, teamId, rows, {
+      pruneSourceItemIds: opts.reconcile ? [item.id] : undefined,
+      status,
+    });
   }
   return rows.length;
 }

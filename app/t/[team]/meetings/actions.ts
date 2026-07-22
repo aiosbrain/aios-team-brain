@@ -243,7 +243,11 @@ export async function extractMeetingActionItemsAction(
       itemRow,
       note.rawText,
       roster,
-      keys
+      keys,
+      undefined,
+      undefined,
+      // Deliberate re-extract: reconcile this transcript's todos (prune stale, un-pushed ones).
+      { reconcile: true }
     );
     // Revalidate so a later navigation shows fresh data, AND return the freshly-stored items so the
     // client can render them in place — no router.refresh() / full-route reload on the current view.

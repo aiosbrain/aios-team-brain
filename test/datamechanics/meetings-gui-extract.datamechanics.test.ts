@@ -69,9 +69,37 @@ describe("meeting GUI upload → action items (real Postgres, stubbed extractor)
     await extractAndStoreActionItems(db(), teamId, item, "A B", [], {}, async () => [todo("Alpha"), todo("Beta")]);
     expect(await meetingTaskTitles(teamId, item.id)).toEqual(["Alpha", "Beta"]);
 
-    // Re-extract now yields only Alpha → Beta is stale + un-pushed → deleted.
-    await extractAndStoreActionItems(db(), teamId, item, "A", [], {}, async () => [todo("Alpha")]);
+    // Re-extract now yields only Alpha → Beta is stale + un-pushed → deleted (reconcile opt-in).
+    await extractAndStoreActionItems(db(), teamId, item, "A", [], {}, async () => [todo("Alpha")], undefined, {
+      reconcile: true,
+    });
     expect(await meetingTaskTitles(teamId, item.id)).toEqual(["Alpha"]);
+  });
+
+  it("WITHOUT reconcile (upload/refresh/merge paths), a shrunk re-run does NOT prune", async () => {
+    const { teamId, item } = await seedMeeting("A B");
+    await extractAndStoreActionItems(db(), teamId, item, "A B", [], {}, async () => [todo("Alpha"), todo("Beta")]);
+
+    // A refresh/merge-style re-run (no reconcile flag) that yields fewer todos must keep the rest —
+    // only the deliberate on-demand re-extract is allowed to delete. Guards Fable finding #4.
+    await extractAndStoreActionItems(db(), teamId, item, "A", [], {}, async () => [todo("Alpha")]);
+    expect(await meetingTaskTitles(teamId, item.id)).toEqual(["Alpha", "Beta"]);
+  });
+
+  it("re-extract PRESERVES a progressed task's status (status is insert-only)", async () => {
+    const { teamId, item } = await seedMeeting("A");
+    await db().from("teams").update({ meeting_task_status: "backlog" }).eq("id", teamId);
+    await extractAndStoreActionItems(db(), teamId, item, "A", [], {}, async () => [todo("Alpha")]);
+
+    // A human (or inbound PM sync) moves Alpha to in_progress.
+    await db().from("tasks").update({ status: "in_progress" }).eq("team_id", teamId).eq("title", "Alpha");
+
+    // Re-extracting the same todo must NOT reset it back to the configured default category.
+    await extractAndStoreActionItems(db(), teamId, item, "A", [], {}, async () => [todo("Alpha")], undefined, {
+      reconcile: true,
+    });
+    const { data } = await db().from("tasks").select("status").eq("team_id", teamId).eq("title", "Alpha").maybeSingle();
+    expect((data as { status: string }).status).toBe("in_progress");
   });
 
   it("a task already pushed to a PM tool is PRESERVED on a re-extract that drops it", async () => {
@@ -88,7 +116,9 @@ describe("meeting GUI upload → action items (real Postgres, stubbed extractor)
     });
 
     // Re-extract drops Beta — but it's pushed, so it stays; Alpha remains too.
-    await extractAndStoreActionItems(db(), teamId, item, "A", [], {}, async () => [todo("Alpha")]);
+    await extractAndStoreActionItems(db(), teamId, item, "A", [], {}, async () => [todo("Alpha")], undefined, {
+      reconcile: true,
+    });
     expect(await meetingTaskTitles(teamId, item.id)).toEqual(["Alpha", "Beta"]);
   });
 
@@ -105,8 +135,9 @@ describe("meeting GUI upload → action items (real Postgres, stubbed extractor)
     const { teamId, item } = await seedMeeting("A B");
     await extractAndStoreActionItems(db(), teamId, item, "A B", [], {}, async () => [todo("Alpha"), todo("Beta")]);
 
-    // Extractor returns nothing (a timeout/failure looks identical) → keep both, don't wipe real tasks.
-    await extractAndStoreActionItems(db(), teamId, item, "A B", [], {}, async () => []);
+    // Extractor returns nothing (a timeout/failure looks identical) → keep both, don't wipe real
+    // tasks — even when reconcile is requested (an empty result never prunes).
+    await extractAndStoreActionItems(db(), teamId, item, "A B", [], {}, async () => [], undefined, { reconcile: true });
     expect(await meetingTaskTitles(teamId, item.id)).toEqual(["Alpha", "Beta"]);
   });
 });
