@@ -47,6 +47,7 @@ const ISSUES_QUERY = `query ImportIssues($teamId: String!, $after: String) {
         labels { nodes { name } }
         project { name }
         cycle { name number }
+        startedAt completedAt canceledAt
       }
     }
   }

@@ -16,7 +16,8 @@ export interface EvidenceItem {
   /** Normalized source slug (github/linear/plane/slack/notion/granola/gdrive/other) → drives the icon. */
   source: string;
   kind: string;
-  /** WORK time (committed_at/source_ts for items, updated_at for tasks) — ISO. Its date places the row. */
+  /** WORK time — ISO. Items: committed_at/source_ts. Tasks: worked_at (state transition) / assigned_at
+   *  (newly assigned) / updated_at (a real edit). Its date places the row on a day. */
   at: string;
 }
 
@@ -61,6 +62,11 @@ export function normalizeSource(raw: string | null | undefined): string {
 }
 
 const DEFAULT_PER_SOURCE_CAP = 6;
+
+/** The synthetic source slug for tasks freshly assigned to a person — floated above real work sources
+ *  (which rank by count). Set by `lib/dashboard/work-timeline`; rendered by `components/icons/source-icon`. */
+export const NEWLY_ASSIGNED_SOURCE = "newly-assigned";
+const sourceRank = (source: string): number => (source === NEWLY_ASSIGNED_SOURCE ? 0 : 1);
 
 /** YYYY-MM-DD one day before `todayISO` (UTC). Pure given the input. */
 function yesterdayOf(todayISO: string): string {
@@ -122,7 +128,10 @@ export function groupTimeline(
           const sorted = items.slice().sort((x, y) => (x.at < y.at ? 1 : x.at > y.at ? -1 : 0)); // newest-first
           return { source, count: sorted.length, items: sorted.slice(0, perSourceCap) };
         })
-        .sort((a, b) => b.count - a.count || (a.source < b.source ? -1 : 1));
+        .sort(
+          (a, b) =>
+            sourceRank(a.source) - sourceRank(b.source) || b.count - a.count || (a.source < b.source ? -1 : 1)
+        );
       const total = groups.reduce((n, g) => n + g.count, 0);
       personDays.push({ memberId, name: m.name, handle: m.handle, avatarUrl: m.avatarUrl, total, sources: groups });
     }

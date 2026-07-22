@@ -75,3 +75,29 @@ export function projectableChanged(
     sameLabels(snapshot.labels ?? [], effective.labels ?? [])
   );
 }
+
+/** Normalize a due value (Date | ISO | 'YYYY-MM-DD' | null) to a `YYYY-MM-DD` key for comparison. */
+export function normalizeDue(due: string | Date | null | undefined): string {
+  if (!due) return "";
+  if (due instanceof Date) return Number.isNaN(due.getTime()) ? "" : due.toISOString().slice(0, 10);
+  return due.slice(0, 10);
+}
+
+/**
+ * True when a *persisted* field changed — the wider set that gates `tasks.updated_at` (distinct from
+ * `projectableChanged`, which gates PM projection and deliberately ignores `due_date`). This is the
+ * projected set PLUS `due_date`, so a due-date-only edit bumps `updated_at` (a real edit) WITHOUT
+ * re-projecting to the PM tool. `body` is excluded — it never travels the push contract. A brand-new
+ * row (no snapshot) is always changed. `worked_at`/`assigned_at` are NOT here: they are their own
+ * signals and are written unconditionally / on assignee-change respectively (see materializeTasks).
+ */
+export function persistedChanged(
+  snapshot: ProjectableSnapshot | null,
+  effective: ProjectableSnapshot,
+  snapshotDue: string | Date | null | undefined,
+  effectiveDue: string | Date | null | undefined
+): boolean {
+  if (!snapshot) return true;
+  if (projectableChanged(snapshot, effective)) return true;
+  return normalizeDue(snapshotDue) !== normalizeDue(effectiveDue);
+}

@@ -42,6 +42,9 @@ export interface PlaneWorkItemRaw {
   parent?: string | null; // parent work-item id
   external_id?: string | null;
   external_source?: string | null;
+  // Completion time → tasks.worked_at (timeline "did work" signal). Plane returns it on the work-item
+  // list by default. A pure state-transition signal — no updated_at fallback (see planeWorkedAt).
+  completed_at?: string | null;
 }
 
 export interface NormalizePlaneInput {
@@ -72,6 +75,15 @@ export interface PlaneTaskRow {
   assignee: string;
   sprint: string;
   parent?: string | null;
+  // The work-item's work time → tasks.worked_at (timeline "did work" signal). ISO or "".
+  worked_at?: string;
+}
+
+/** Plane work-item WORK time = `completed_at` (a pure state transition). No `updated_at` fallback —
+ *  see linearWorkedAt for why. An incomplete item returns "" (→ NULL); timeline dates it by updated_at. */
+export function planeWorkedAt(it: PlaneWorkItemRaw): string {
+  const ms = it.completed_at ? Date.parse(it.completed_at) : NaN;
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : "";
 }
 
 function sha256(s: string): string {
@@ -150,6 +162,7 @@ export function normalizePlaneProject(input: NormalizePlaneInput): ItemPayload {
       labels,
       assignee,
       sprint: moduleByItem[it.id] ?? "",
+      worked_at: planeWorkedAt(it),
     };
     if (it.parent) {
       // Resolve only within the imported set; a parent that was skipped/absent is nulled (never dangling).
@@ -158,11 +171,12 @@ export function normalizePlaneProject(input: NormalizePlaneInput): ItemPayload {
     return row;
   });
 
-  // Serialize every projectable field so any change shifts the sha (writer never short-circuits a real change).
+  // Serialize every projectable field — PLUS worked_at — so any change shifts the sha (the writer never
+  // short-circuits a real change, and a completion that moves worked_at re-materializes the row).
   const lines = rows.map(
     (r) =>
       `| ${r.row_key} | ${r.title} | ${r.status} | ${r.priority} | ${r.sprint} | ${r.assignee} | ` +
-      `${JSON.stringify(r.labels)} | ${r.parent ?? ""} |`
+      `${JSON.stringify(r.labels)} | ${r.parent ?? ""} | ${r.worked_at ?? ""} |`
   );
   const body = `# Plane import — ${input.workspaceSlug}/${slugSeg}\n\n${lines.join("\n")}\n`;
 

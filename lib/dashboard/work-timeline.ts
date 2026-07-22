@@ -3,7 +3,7 @@ import type { DbClient } from "@/lib/db/types";
 import { visibleItems, visibleTasks, type ViewerTier } from "@/lib/auth/visibility";
 import { subjectMatchesMember, type RosterPerson } from "./people-match";
 import { commitSubject } from "./team-work";
-import { groupTimeline, normalizeSource, type EvidenceWithMember, type TimelineDay, type TimelineMember } from "./timeline-group";
+import { groupTimeline, normalizeSource, NEWLY_ASSIGNED_SOURCE, type EvidenceWithMember, type TimelineDay, type TimelineMember } from "./timeline-group";
 
 /**
  * Server-only fetch for the Learning "Timeline" — the team's recent work as a day → person → evidence
@@ -24,10 +24,12 @@ import { groupTimeline, normalizeSource, type EvidenceWithMember, type TimelineD
  *    frontmatter — avoids pulling large doc bodies.
  *  • Tasks come from the `tasks` table (the only per-assignee source), attributed via the proven
  *    `subjectMatchesMember`; unmatched tasks are dropped, never mis-attributed. `kind='task'` ITEMS are
- *    excluded (file-level, attributed to the pusher — the double-count/mis-attribution trap). KNOWN v1
- *    noise: task `updated_at` is bulk-bumped when any row in a pushed tasks.md changes (materializeTasks)
- *    or on PM-sync writeback, so editing one row can list its whole file's tasks under "today". Deferred
- *    (the durable fix — only bump changed rows — lives in `lib/ingest`, out of this view's scope).
+ *    excluded (file-level, attributed to the pusher — the double-count/mis-attribution trap). A task's
+ *    work signal is `worked_at` (a PURE provider state transition), `assigned_at` (when the assignee
+ *    changed → the "Newly assigned" group), or a real `updated_at` edit — the durable fix in `lib/ingest`
+ *    now bumps `updated_at` only on a real persisted change, so a routine re-sync (which re-materializes
+ *    every row in a tasks file) no longer lists a whole file's tasks under "today". Dormant tickets with
+ *    no in-window signal are dropped.
  *  • Meetings (granola / transcripts) are team signal, not one person's output → excluded from the
  *    per-person view in v1 (a granola item's member_id is the recorder, not the participants).
  */
@@ -45,7 +47,14 @@ type ItemRow = {
   path?: string | null;
   synced_at: string | Date;
 };
-type TaskRow = { id: string; title: string; assignee: string | null; updated_at: string | Date };
+type TaskRow = {
+  id: string;
+  title: string;
+  assignee: string | null;
+  updated_at: string | Date;
+  worked_at: string | Date | null;
+  assigned_at: string | Date | null;
+};
 
 /** WORK time from an item's frontmatter — `committed_at` ?? `source_ts`, normalized to ISO. Null when
  *  neither is present/parseable (the item is then dropped — see the synced_at note above). */
@@ -59,8 +68,11 @@ function itemWorkTime(fm: Record<string, unknown> | null): string | null {
   return Number.isNaN(t) ? null : new Date(t).toISOString();
 }
 
-function toIso(v: string | Date): string {
-  return typeof v === "string" ? v : new Date(v).toISOString();
+/** A nullable timestamp (ISO string | Date | null) → epoch ms, or null when absent/unparseable. */
+function tsMs(v: string | Date | null | undefined): number | null {
+  if (v === null || v === undefined) return null;
+  const ms = v instanceof Date ? v.getTime() : Date.parse(v);
+  return Number.isFinite(ms) ? ms : null;
 }
 
 function basename(path: string): string {
@@ -150,8 +162,11 @@ export async function getWorkTimeline(
     visibleTasks(
       db
         .from("tasks")
-        .select("id, title, assignee, updated_at")
+        .select("id, title, assignee, updated_at, worked_at, assigned_at")
         .eq("team_id", teamId)
+        // `updated_at` is the outer bound: worked_at/assigned_at only move via a persisted change that
+        // also bumps updated_at (or a fresh import that sets updated_at=now), so this is a valid
+        // superset. The real in-window decision is made per-row in JS below (worked_at/assigned_at).
         .gte("updated_at", sinceIso)
         .order("updated_at", { ascending: false })
         .limit(TASK_LIMIT),
@@ -201,16 +216,39 @@ export async function getWorkTimeline(
     if (!assignee) continue;
     const person = roster.find((p) => subjectMatchesMember(assignee, p));
     if (!person) continue; // drop, never mis-attribute
-    const at = toIso(t.updated_at);
-    if (Date.parse(at) < windowStartMs) continue;
-    evidence.push({
-      id: `task:${t.id}`,
-      memberId: person.memberId,
-      source: pmSource,
-      kind: "task",
-      title: t.title || "(untitled task)",
-      at,
-    });
+
+    // A task appears ONLY with a real in-window signal, in priority order:
+    //   1. worked (transition) — worked_at (a PURE provider state transition) in-window → PM source.
+    //   2. newly assigned      — assigned_at in-window & no transition → its own "Newly assigned"
+    //                            group (freshly on their plate, not yet worked). Checked BEFORE the
+    //                            updated_at fallback so a just-created assigned ticket reads as newly
+    //                            assigned, not "worked".
+    //   3. worked (edited)     — updated_at in-window (a persisted change that's neither a transition
+    //                            nor a new assignment, e.g. a workspace task whose status advanced).
+    //   4. (evidence-backed — a linked work item; arrives in a later PR — not wired here.)
+    // An old task with none of these is DROPPED — "if it's old and has no evidence, don't list it"
+    // (a routine re-sync no longer bumps updated_at on unchanged rows, so case 3 is real work).
+    const inWin = (ms: number | null): ms is number => ms !== null && ms >= windowStartMs;
+    const workedTransition = tsMs(t.worked_at); // pure transition — NO updated_at fallback here
+    const assignedAt = tsMs(t.assigned_at);
+    const editedAt = tsMs(t.updated_at);
+    const push = (source: string, atMs: number) =>
+      evidence.push({
+        id: `task:${t.id}`,
+        memberId: person.memberId,
+        source,
+        kind: "task",
+        title: t.title || "(untitled task)",
+        at: new Date(atMs).toISOString(),
+      });
+    if (inWin(workedTransition)) push(pmSource, workedTransition);
+    else if (inWin(assignedAt)) push(NEWLY_ASSIGNED_SOURCE, assignedAt);
+    else if (inWin(editedAt)) push(pmSource, editedAt);
+    // else: dormant assigned ticket, no in-window signal → dropped.
+    // KNOWN, deferred (PR-B): the FIRST import of a provider team stamps assigned_at=now on every
+    // pre-existing assigned row, so a whole backlog transiently floods "Newly assigned" for 7 days.
+    // The durable fix (a per-team first-seen watermark, or gating on the provider's own assignment
+    // time) lands with the persisted work_timeline layer; it's one-time, self-resolving onboarding noise.
   }
 
   return groupTimeline(evidence, members, todayISO);

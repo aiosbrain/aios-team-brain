@@ -25,6 +25,12 @@ export const taskRowSchema = z.object({
   pm_provider: z.enum(["plane", "linear"]).nullable().optional(),
   pm_external_id: z.string().max(200).nullable().optional(),
   pm_url: z.string().max(500).nullable().optional(),
+  // Provider work-signal time (brain-api v1.12): the task's last STATE-TRANSITION timestamp
+  // (Linear startedAt/completedAt/canceledAt; falls back to updatedAt). Optional — mirror-imported
+  // Linear/Plane rows carry it immediately; workspace-pushed tasks stay null until the CLI ships it.
+  // Absent key ⇒ preserve the stored value (partial-write, like assignee/parent). Materialized into
+  // tasks.worked_at; the timeline uses it as the "did work on it" signal instead of updated_at.
+  worked_at: z.string().nullable().optional(),
 });
 
 export const decisionRowSchema = z.object({

@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   effectiveProjectable,
   projectableChanged,
+  persistedChanged,
+  normalizeDue,
   type ProjectableSnapshot,
 } from "@/lib/ingest/projectable-diff";
 import { taskRowSchema } from "@/lib/api/schemas";
@@ -102,5 +104,42 @@ describe("projectable-diff (changed-rows predicate)", () => {
   it("a null-priority snapshot vs an absent priority key is unchanged (none ≡ null)", () => {
     const s = snap({ priority: "none" });
     expect(projectableChanged(s, effectiveProjectable({ title: "T" }, s))).toBe(false);
+  });
+});
+
+// Spec: `persistedChanged` is the WIDER predicate that gates tasks.updated_at — the projected set
+// PLUS due_date. A due-only edit is a real edit (bumps updated_at) but must NOT re-project.
+describe("persistedChanged (updated_at gate = projected ∪ due_date)", () => {
+  it("a brand-new row is always persisted-changed", () => {
+    expect(persistedChanged(null, effectiveProjectable({ title: "x" }, null), null, null)).toBe(true);
+  });
+
+  it("a due-only change: NOT projectable, but IS persisted (so updated_at bumps, projection doesn't)", () => {
+    const s = snap({ title: "T", status: "ready" });
+    const eff = effectiveProjectable({ title: "T", status: "ready" }, s);
+    expect(projectableChanged(s, eff)).toBe(false); // no board re-projection
+    expect(persistedChanged(s, eff, "2026-07-01", "2026-07-09")).toBe(true); // but a real edit
+  });
+
+  it("nothing changed (same projected + same due) is NOT persisted-changed → updated_at preserved", () => {
+    const s = snap({ title: "T", status: "ready" });
+    const eff = effectiveProjectable({ title: "T", status: "ready" }, s);
+    expect(persistedChanged(s, eff, "2026-07-01", "2026-07-01")).toBe(false);
+  });
+
+  it("a projected change implies a persisted change", () => {
+    const s = snap({ status: "backlog" });
+    const eff = effectiveProjectable({ title: "T", status: "in_progress" }, s);
+    expect(persistedChanged(s, eff, null, null)).toBe(true);
+  });
+
+  it("due comparison is date-granular and tolerates Date | ISO | null", () => {
+    expect(normalizeDue(new Date("2026-07-09T13:00:00Z"))).toBe("2026-07-09");
+    expect(normalizeDue("2026-07-09")).toBe("2026-07-09");
+    expect(normalizeDue(null)).toBe("");
+    const s = snap({ title: "T" });
+    const eff = effectiveProjectable({ title: "T" }, s);
+    // same calendar day, different representations → not a change
+    expect(persistedChanged(s, eff, new Date("2026-07-09T00:00:00Z"), "2026-07-09")).toBe(false);
   });
 });
