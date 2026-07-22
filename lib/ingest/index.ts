@@ -11,6 +11,7 @@ import {
 } from "@/lib/api/schemas";
 import { audit } from "@/lib/api/audit";
 import { decideReattribution } from "@/lib/ingest/reattribution-decision";
+import { recordReassignment, ownerWindowStart } from "@/lib/ingest/reassignment-log";
 import {
   effectiveProjectable,
   projectableChanged,
@@ -139,20 +140,29 @@ export async function ingestItem(
     // Audit the rare attribution change (unlike the per-tick synced_at bump, so it doesn't reintroduce
     // the M4 unbounded-growth problem), so the mutation isn't silent — a source REASSIGNMENT (A→B) and a
     // first-time HEAL (null→member) are distinct facts.
-    if (patch.member_id) {
+    if (reattr.reassignedFrom) {
+      // A genuine SOURCE reassignment (A→B) on the unchanged path is ALWAYS author-signal-driven (the only
+      // trigger). Record it on the uniform item.reassigned stream with the outgoing owner's window start.
+      await recordReassignment(db, {
+        teamId: auth.teamId,
+        itemId: existing.id,
+        from: reattr.reassignedFrom,
+        to: patch.member_id ?? null,
+        source: typeof payload.frontmatter?.source === "string" ? payload.frontmatter.source : null,
+        via: "author_signal",
+        actor: { kind: "system", memberId: null },
+        fromOwnedSince: await ownerWindowStart(db, auth.teamId, existing.id),
+      });
+    } else if (patch.member_id) {
+      // null → member: a first-time attribution HEAL (not a reassignment).
       await audit(db, {
         team_id: auth.teamId,
         actor_kind: "system",
         member_id: null,
-        action: reattr.reassignedFrom ? "item.reassigned" : "item.attribution_healed",
+        action: "item.attribution_healed",
         target_type: "items",
         target_id: existing.id,
-        // `via: author_signal` — an unchanged-path re-point is ALWAYS driven by the resolved frontmatter
-        // author (the only trigger), i.e. a genuine SOURCE reassignment. Lets consumers separate these
-        // from a pusher-takeover (see the changed path).
-        meta: reattr.reassignedFrom
-          ? { from: reattr.reassignedFrom, to: patch.member_id, source: payload.frontmatter?.source ?? null, via: "author_signal" }
-          : { to: patch.member_id, source: payload.frontmatter?.source ?? null },
+        meta: { to: patch.member_id, source: payload.frontmatter?.source ?? null },
       });
     }
     // No projection on an unchanged push (the route also guards status !== "unchanged").
@@ -266,12 +276,17 @@ export async function ingestItem(
     const prior = (existing as { member_id: string | null }).member_id;
     const lockedExisting = (existing as { member_id_locked?: boolean | null }).member_id_locked === true;
     if (!lockedExisting && prior && itemRecord.member_id && prior !== itemRecord.member_id) {
-      await audit(db, {
-        team_id: auth.teamId, actor_kind: "api_key",
-        member_id: auth.memberId, api_key_id: auth.apiKeyId,
-        action: "item.reassigned",
-        target_type: "items", target_id: itemId,
-        meta: { from: prior, to: itemRecord.member_id, source: payload.frontmatter?.source ?? null, via: opts ? "author_signal" : "pusher_default" },
+      await recordReassignment(db, {
+        teamId: auth.teamId,
+        itemId,
+        from: prior,
+        to: itemRecord.member_id,
+        source: typeof payload.frontmatter?.source === "string" ? payload.frontmatter.source : null,
+        // author_signal = a true source reassignment (the frontmatter author moved); pusher_default = a
+        // collaborative takeover (a different key re-pushed with no author signal → attributed to it).
+        via: opts ? "author_signal" : "pusher_default",
+        actor: { kind: "api_key", memberId: auth.memberId, apiKeyId: auth.apiKeyId },
+        fromOwnedSince: await ownerWindowStart(db, auth.teamId, itemId),
       });
     }
   }

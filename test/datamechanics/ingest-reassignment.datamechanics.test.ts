@@ -84,7 +84,19 @@ describe("source reassignment on re-push (real Postgres)", () => {
       .eq("action", "item.reassigned")
       .eq("target_id", first.id)
       .single();
-    expect((full as { meta: { source: string; via: string } }).meta).toMatchObject({ source: "linear", via: "author_signal" });
+    const meta = (full as { meta: { source: string; via: string; from_owned_since?: string } }).meta;
+    expect(meta).toMatchObject({ source: "linear", via: "author_signal" });
+    // The outgoing owner's window start is the item.created audit's timestamp (A owned it from creation) —
+    // pin the VALUE, so a regression that anchors to the wrong event (e.g. item.updated) fails.
+    const { data: created } = await db()
+      .from("audit_log")
+      .select("created_at")
+      .eq("team_id", seed.teamId)
+      .eq("action", "item.created")
+      .eq("target_id", first.id)
+      .single();
+    expect(typeof meta.from_owned_since).toBe("string");
+    expect(new Date(meta.from_owned_since!).getTime()).toBe(new Date((created as { created_at: string }).created_at).getTime());
 
     // A THIRD identical push once converged is a NO-OP — no per-tick re-audit (guards the M4 growth concern).
     const third = await ingestItem(db(), auth, p, "team", { authorMemberId: b });
