@@ -1,14 +1,14 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
-import { ArrowLeft, Star, GitFork, CircleDot } from "lucide-react";
+import { ArrowLeft, Star, GitFork, CircleDot, ChevronRight } from "lucide-react";
 import { serverClient } from "@/lib/db/server";
 import { currentMember } from "@/lib/auth/guard";
 import { getCodebaseDetail } from "@/lib/metrics/codebases";
 import { parseRange } from "@/lib/metrics/range";
 import { timeAgo } from "@/components/format";
 import { RangeSelector } from "@/components/dashboard/range-selector";
-import { AgenticBreakdownCard } from "@/components/codebases/agentic-breakdown";
+import { AgenticScoreCard, AgentReadinessCard } from "@/components/codebases/agentic-breakdown";
 import { ContributorTable } from "@/components/codebases/contributor-table";
 import { IssuesList } from "@/components/codebases/issues-list";
 import { AgenticTrend } from "@/components/charts/agentic-trend";
@@ -97,10 +97,19 @@ export default async function CodebaseDetailPage({
         </div>
       ) : null}
 
-      <div className="grid grid-cols-1 gap-5 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.4fr)]">
-        {cb.breakdown ? <AgenticBreakdownCard b={cb.breakdown} /> : null}
-        <AgenticTrend data={cb.trend} />
-      </div>
+      {/* Trend spans the full page width; the score + readiness bar cards sit side-by-side below it. */}
+      <AgenticTrend data={cb.trend} />
+
+      {cb.breakdown ? (
+        cb.breakdown.readiness_level ? (
+          <div className="grid grid-cols-1 gap-5 md:grid-cols-2">
+            <AgenticScoreCard b={cb.breakdown} />
+            <AgentReadinessCard b={cb.breakdown} />
+          </div>
+        ) : (
+          <AgenticScoreCard b={cb.breakdown} />
+        )
+      ) : null}
 
       <ContributionsTrend data={cb.commitVolume} />
 
@@ -111,12 +120,17 @@ export default async function CodebaseDetailPage({
         <ContributorTable rows={cb.contributors} teamSlug={teamSlug} codebaseSlug={cb.slug} />
       </section>
 
-      <section className="flex flex-col gap-3">
-        <h2 className="text-sm font-semibold uppercase tracking-wider text-ink-tertiary">
+      {/* Issues & PRs collapsed by default (native <details> — no client JS). */}
+      <details className="group flex flex-col gap-3">
+        <summary className="flex cursor-pointer list-none items-center gap-2 text-sm font-semibold uppercase tracking-wider text-ink-tertiary hover:text-ink-secondary">
+          <ChevronRight className="size-4 shrink-0 transition-transform group-open:rotate-90" />
           Issues &amp; PRs
-        </h2>
-        <IssuesList issues={cb.issues} />
-      </section>
+          <span className="font-normal normal-case text-ink-tertiary/70">({cb.issues.length})</span>
+        </summary>
+        <div className="mt-3">
+          <IssuesList issues={cb.issues} />
+        </div>
+      </details>
     </div>
   );
 }
