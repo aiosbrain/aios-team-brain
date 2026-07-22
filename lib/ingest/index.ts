@@ -10,6 +10,8 @@ import {
   IngestValidationError,
 } from "@/lib/api/schemas";
 import { audit } from "@/lib/api/audit";
+import { decideReattribution } from "@/lib/ingest/reattribution-decision";
+import { recordReassignment, ownerWindowStart } from "@/lib/ingest/reassignment-log";
 import {
   effectiveProjectable,
   projectableChanged,
@@ -101,22 +103,21 @@ export async function ingestItem(
     // (~24k/day at 500 items) — unbounded audit_log growth with no diagnostic value. The synced_at
     // bump is the freshness signal; create/update/delete stay audited on the paths below.
     //
-    // HEAL ATTRIBUTION on an unchanged re-push: `content_sha256` covers only body+title, so a resolved
-    // author that arrived AFTER first ingest (a source that only later exposes authorship, e.g. Notion
-    // enrichment, or a first-ingest API flake) would otherwise be discarded here forever. Rescue it —
-    // but ONLY when the item is currently UNATTRIBUTED (`member_id` null). We never RE-POINT an
-    // already-attributed item on a routine unchanged re-push: doing so would auto-revert a deliberate
-    // admin re-attribution (the NL correction / "Re-attribute content") on the very next sync, and
-    // clobber a human self-push's own attribution. Re-pointing an existing (wrong) attribution stays the
-    // job of the explicit, admin-triggered `reattributeItems` batch. Never clears to null either (a
-    // connector's unresolved re-push passes `authorMemberId: null`).
-    // …and NEVER when the attribution is LOCKED (a deliberate correction — incl. a "correct-to-nobody"
-    // whose member_id is null): the lock is what stops this null→member fill from refilling it.
+    // RE-ATTRIBUTE on an unchanged re-push: `content_sha256` covers only body+title, so an author signal
+    // that changed in FRONTMATTER without touching the prose would otherwise be discarded here. Two cases,
+    // both decided by `decideReattribution` (which leans on the `member_id_locked` guard, #333):
+    //   • null → member: a resolved author that arrived AFTER first ingest (a source that only later
+    //     exposes authorship, e.g. Notion enrichment, or a first-ingest API flake) — a HEAL.
+    //   • member A → member B: a genuine SOURCE reassignment (a Linear/Plane issue's `assignee` changed
+    //     but its description didn't) — RE-POINT + log `item.reassigned`, so a reassignment propagates on
+    //     sync instead of waiting for the manual "Re-attribute content" batch.
+    // NEVER touches a LOCKED item (a deliberate admin correction — incl. correct-to-nobody), and never
+    // auto-clears a set owner to null (a connector's unresolved re-push passes `authorMemberId: null`).
+    // The lock is what makes source-driven re-pointing safe (it protects corrections + human self-pushes).
     const locked = (existing as { member_id_locked?: boolean | null }).member_id_locked === true;
     const patch: { synced_at: string; member_id?: string; frontmatter?: Record<string, unknown> } = { synced_at: now };
-    if (opts?.authorMemberId && existing.member_id === null && !locked) {
-      patch.member_id = opts.authorMemberId;
-    }
+    const reattr = decideReattribution(existing.member_id, opts?.authorMemberId ?? null, locked);
+    if (reattr.memberId) patch.member_id = reattr.memberId;
     // HEAL FRONTMATTER on an unchanged re-push: `content_sha256` covers only the body, but source-derived
     // metadata in frontmatter can change while the body doesn't — a Linear issue transitions Backlog →
     // In Progress (its prose unchanged), or a source later exposes richer `authors[]`. Without this, the
@@ -136,9 +137,24 @@ export async function ingestItem(
       patch.frontmatter = healedFm;
     }
     await db.from("items").update(patch).eq("id", existing.id);
-    // Audit the rare heal (a genuine attribution change — unlike the per-tick synced_at bump, so it
-    // doesn't reintroduce the M4 unbounded-growth problem), so the change isn't a silent DB mutation.
-    if (patch.member_id) {
+    // Audit the rare attribution change (unlike the per-tick synced_at bump, so it doesn't reintroduce
+    // the M4 unbounded-growth problem), so the mutation isn't silent — a source REASSIGNMENT (A→B) and a
+    // first-time HEAL (null→member) are distinct facts.
+    if (reattr.reassignedFrom) {
+      // A genuine SOURCE reassignment (A→B) on the unchanged path is ALWAYS author-signal-driven (the only
+      // trigger). Record it on the uniform item.reassigned stream with the outgoing owner's window start.
+      await recordReassignment(db, {
+        teamId: auth.teamId,
+        itemId: existing.id,
+        from: reattr.reassignedFrom,
+        to: patch.member_id ?? null,
+        source: typeof payload.frontmatter?.source === "string" ? payload.frontmatter.source : null,
+        via: "author_signal",
+        actor: { kind: "system", memberId: null },
+        fromOwnedSince: await ownerWindowStart(db, auth.teamId, existing.id),
+      });
+    } else if (patch.member_id) {
+      // null → member: a first-time attribution HEAL (not a reassignment).
       await audit(db, {
         team_id: auth.teamId,
         actor_kind: "system",
@@ -249,6 +265,31 @@ export async function ingestItem(
     target_type: "item", target_id: itemId,
     meta: { path: payload.path, kind: payload.kind, access, rows: payload.rows?.length ?? 0 },
   });
+
+  // A content edit already re-resolved member_id (unless LOCKED — then updateRecord dropped it). If that
+  // moved an already-attributed item to a DIFFERENT member, log the ownership delta too: the audit above
+  // records the edit; this records the reassignment (same `item.reassigned` fact as the unchanged path).
+  // `via` disambiguates a true SOURCE reassignment (`author_signal` — the frontmatter author moved) from a
+  // pusher-takeover (`pusher_default` — a different key re-pushed with no author signal → attributed to the
+  // pusher), so a consumer counting "the source reassigned this" doesn't over-count collaborative edits.
+  if (existing) {
+    const prior = (existing as { member_id: string | null }).member_id;
+    const lockedExisting = (existing as { member_id_locked?: boolean | null }).member_id_locked === true;
+    if (!lockedExisting && prior && itemRecord.member_id && prior !== itemRecord.member_id) {
+      await recordReassignment(db, {
+        teamId: auth.teamId,
+        itemId,
+        from: prior,
+        to: itemRecord.member_id,
+        source: typeof payload.frontmatter?.source === "string" ? payload.frontmatter.source : null,
+        // author_signal = a true source reassignment (the frontmatter author moved); pusher_default = a
+        // collaborative takeover (a different key re-pushed with no author signal → attributed to it).
+        via: opts ? "author_signal" : "pusher_default",
+        actor: { kind: "api_key", memberId: auth.memberId, apiKeyId: auth.apiKeyId },
+        fromOwnedSince: await ownerWindowStart(db, auth.teamId, itemId),
+      });
+    }
+  }
 
   return { status: existing ? "updated" : "created", id: itemId, projectId: project.id, changedTaskRowKeys };
 }

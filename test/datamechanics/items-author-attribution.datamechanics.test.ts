@@ -93,11 +93,13 @@ describe("author attribution at ingest → stored member_id (real Postgres)", ()
     expect(opts).toBeUndefined();
   });
 
-  it("heals an UNATTRIBUTED item on an unchanged re-push, but never re-points/clears an attributed one", async () => {
-    // content_sha256 covers body+title only, so an author resolved AFTER first ingest (late source
-    // enrichment / a first-ingest flake) must still land on an unchanged re-push — but ONLY when the
-    // item is currently unattributed. A routine re-push must never revert an existing attribution (a
-    // manual NL correction, or a human self-push) — that stays the admin-triggered reattribute batch's job.
+  it("on an unchanged re-push: heals null→member, RE-POINTS a source reassignment (unlocked), never clears to null", async () => {
+    // content_sha256 covers body+title only, so an author signal that changes in FRONTMATTER (late source
+    // enrichment, or a Linear/Plane assignee reassignment) must still land on an unchanged re-push:
+    //   • null → member = a heal;
+    //   • member A → member B (UNLOCKED) = a source reassignment → re-point (the lock, tested below +
+    //     in ingest-reassignment, is what protects a deliberate correction);
+    //   • → null is NEVER auto-applied (an unassignment stays the manual batch's / mismatch-flag's job).
     const seed = await seedTeam();
     const other = await addConnector(seed.teamId); // any other member id to stand in as "a different author"
     const auth = { teamId: seed.teamId, memberId: seed.memberId, apiKeyId: randomUUID() };
@@ -113,10 +115,10 @@ describe("author attribution at ingest → stored member_id (real Postgres)", ()
     expect(await stored()).toBe(seed.memberId); // null → healed
 
     await ingestItem(db(), auth, p, "team", { authorMemberId: other }); // unchanged, resolves to a DIFFERENT member
-    expect(await stored()).toBe(seed.memberId); // NOT re-pointed (would revert a manual correction)
+    expect(await stored()).toBe(other); // RE-POINTED — a source reassignment propagates (item not locked)
 
     await ingestItem(db(), auth, p, "team", { authorMemberId: null }); // unchanged, unresolved
-    expect(await stored()).toBe(seed.memberId); // NOT cleared
+    expect(await stored()).toBe(other); // NOT cleared to null
   });
 
   it("frontmatter heal refreshes changed keys but PRESERVES best-effort author keys the re-push omits", async () => {
