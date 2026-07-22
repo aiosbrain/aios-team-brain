@@ -125,6 +125,11 @@ export async function extractAndStoreActionItems(
   const run = extract ?? ((t: string, r: RosterPerson[], k: ProviderKeys) => extractActionItems(t, r, k, timeoutMs));
   const todos = await run(rawText, roster, keys);
   const rows = toExtractedTodoRows(item, todos);
-  if (rows.length) await createMeetingTodoTasks(db, teamId, rows);
+  // Only reconcile when the extraction actually returned items: upsert what's present + prune THIS
+  // transcript's stale, un-pushed todos (already-pushed ones are preserved — see
+  // pruneStaleMeetingTodos). A 0-item result is NOT pruned — an empty result is indistinguishable
+  // from a failed/timed-out extraction, so deleting on it could wipe real tasks (e.g. tasks a merge
+  // just re-pointed onto this item). Better a stale row than a destroyed one.
+  if (rows.length) await createMeetingTodoTasks(db, teamId, rows, { pruneSourceItemIds: [item.id] });
   return rows.length;
 }
