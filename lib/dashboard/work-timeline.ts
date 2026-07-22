@@ -3,7 +3,17 @@ import type { DbClient } from "@/lib/db/types";
 import { visibleItems, visibleTasks, type ViewerTier } from "@/lib/auth/visibility";
 import { subjectMatchesMember, type RosterPerson } from "./people-match";
 import { commitSubject } from "./team-work";
-import { groupTimeline, normalizeSource, NEWLY_ASSIGNED_SOURCE, type EvidenceWithMember, type TimelineDay, type TimelineMember } from "./timeline-group";
+import {
+  groupTimeline,
+  normalizeSource,
+  type EvidenceItem,
+  type EvidenceWithMember,
+  type TaskInfo,
+  type TaskSignal,
+  type TimelineDay,
+  type TimelineMember,
+} from "./timeline-group";
+import { computeTaskLinks } from "./issue-ref";
 
 /**
  * Server-only fetch for the Learning "Timeline" — the team's recent work as a day → person → evidence
@@ -49,7 +59,9 @@ type ItemRow = {
 };
 type TaskRow = {
   id: string;
+  row_key: string | null;
   title: string;
+  status: string | null;
   assignee: string | null;
   updated_at: string | Date;
   worked_at: string | Date | null;
@@ -167,16 +179,14 @@ export async function getWorkTimeline(
         .limit(ITEM_LIMIT),
       tier
     ),
+    // Recent tasks — NOT window-filtered: evidence may reference a task last touched >7d ago, and we
+    // need its title/status/row_key to render the header + resolve issue-key links. The in-window SIGNAL
+    // (worked/newly-assigned) is decided per-row in JS below.
     visibleTasks(
       db
         .from("tasks")
-        .select("id, title, assignee, updated_at, worked_at, assigned_at")
+        .select("id, row_key, title, assignee, status, updated_at, worked_at, assigned_at")
         .eq("team_id", teamId)
-        // (error check on all three results below, after the Promise.all)
-        // `updated_at` is the outer bound: worked_at/assigned_at only move via a persisted change that
-        // also bumps updated_at (or a fresh import that sets updated_at=now), so this is a valid
-        // superset. The real in-window decision is made per-row in JS below (worked_at/assigned_at).
-        .gte("updated_at", sinceIso)
         .order("updated_at", { ascending: false })
         .limit(TASK_LIMIT),
       tier
@@ -188,82 +198,75 @@ export async function getWorkTimeline(
   if (otherRes.error) throw new Error(`work-timeline items: ${otherRes.error.message}`);
   if (taskRes.error) throw new Error(`work-timeline tasks: ${taskRes.error.message}`);
 
-  const evidence: EvidenceWithMember[] = [];
+  const tasks = (taskRes.data ?? []) as TaskRow[];
+  const inWin = (ms: number | null): ms is number => ms !== null && ms >= windowStartMs;
 
+  // Task display info (any evidence may reference a task) + per-person in-window signals (the "headers").
+  const taskInfo = new Map<string, TaskInfo>();
+  const taskSignals: TaskSignal[] = [];
+  for (const t of tasks) {
+    taskInfo.set(t.id, { title: t.title || "(untitled task)", status: t.status || "backlog", source: pmSource });
+    const assignee = (t.assignee ?? "").trim();
+    if (!assignee) continue;
+    const person = roster.find((p) => subjectMatchesMember(assignee, p));
+    if (!person) continue; // drop, never mis-attribute
+    // Signal priority (PR-A): a worked_at transition, else a fresh assigned_at ("newly assigned"),
+    // else a real updated_at edit. A dormant assigned ticket with none of these produces NO header —
+    // it only appears if in-window EVIDENCE links to it (below). "If it's old and has no evidence,
+    // don't list it." (KNOWN, deferred: a provider's FIRST import stamps assigned_at=now on the whole
+    // backlog → a transient "Newly assigned" flood for 7 days; a first-seen watermark is a follow-up.)
+    const workedTransition = tsMs(t.worked_at);
+    const assignedAt = tsMs(t.assigned_at);
+    const editedAt = tsMs(t.updated_at);
+    if (inWin(workedTransition))
+      taskSignals.push({ memberId: person.memberId, taskId: t.id, at: new Date(workedTransition).toISOString(), newlyAssigned: false });
+    else if (inWin(assignedAt))
+      taskSignals.push({ memberId: person.memberId, taskId: t.id, at: new Date(assignedAt).toISOString(), newlyAssigned: true });
+    else if (inWin(editedAt))
+      taskSignals.push({ memberId: person.memberId, taskId: t.id, at: new Date(editedAt).toISOString(), newlyAssigned: false });
+  }
+
+  // In-window evidence items (commits + docs) with the text an issue key would appear in. A git
+  // commit's key is in its BODY; other items' in the title/path (no large-body fetch — see the
+  // otherRes select). `kind='task'` items + meetings/transcripts are excluded (Slack evidence is PR-E).
+  type Ev = EvidenceItem & { memberId: string; text: string };
+  const evItems: Ev[] = [];
   for (const r of (gitRes.data ?? []) as ItemRow[]) {
     if (!r.member_id || !members.has(r.member_id)) continue;
     const at = itemWorkTime(r.frontmatter);
     if (!at || Date.parse(at) < windowStartMs) continue;
     const fm = r.frontmatter ?? {};
-    evidence.push({
-      id: r.id,
-      memberId: r.member_id,
-      source: "github",
-      kind: "commit",
-      title: str(fm.title) || commitSubject(r.body ?? "") || "commit",
-      url: httpUrl(fm.source_url),
-      at,
-    });
+    const title = str(fm.title) || commitSubject(r.body ?? "") || "commit";
+    evItems.push({ id: r.id, memberId: r.member_id, source: "github", kind: "commit", title, url: httpUrl(fm.source_url), at, text: `${title}\n${r.body ?? ""}` });
   }
-
   for (const r of (otherRes.data ?? []) as ItemRow[]) {
     if (!r.member_id || !members.has(r.member_id)) continue;
     const fm = r.frontmatter ?? {};
-    if (str(fm.source) === "git") continue; // git commits are handled by gitRes — no double-count
+    if (str(fm.source) === "git") continue; // handled by gitRes — no double-count
     const source = normalizeSource(str(fm.source));
-    if (source === "granola" || r.kind === "transcript") continue; // meetings = team signal (v1)
+    if (source === "granola" || r.kind === "transcript") continue; // meetings/Slack = not per-person work (v1)
     const at = itemWorkTime(fm);
     if (!at || Date.parse(at) < windowStartMs) continue;
-    evidence.push({
-      id: r.id,
-      memberId: r.member_id,
-      source,
-      kind: r.kind ?? "item",
-      title: str(fm.title) || (r.path ? basename(r.path) : "") || "(untitled)",
-      url: httpUrl(fm.source_url),
-      at,
-    });
+    const title = str(fm.title) || (r.path ? basename(r.path) : "") || "(untitled)";
+    evItems.push({ id: r.id, memberId: r.member_id, source, kind: r.kind ?? "item", title, url: httpUrl(fm.source_url), at, text: `${title}\n${r.path ?? ""}` });
   }
 
-  for (const t of (taskRes.data ?? []) as TaskRow[]) {
-    const assignee = (t.assignee ?? "").trim();
-    if (!assignee) continue;
-    const person = roster.find((p) => subjectMatchesMember(assignee, p));
-    if (!person) continue; // drop, never mis-attribute
+  // Deterministic issue-key links, computed INLINE so the Timeline is always fresh (the persisted
+  // task_evidence table is written separately off the scheduler for other surfaces).
+  const links = computeTaskLinks(
+    tasks.map((t) => ({ id: t.id, row_key: t.row_key })),
+    evItems.map((e) => ({ id: e.id, text: e.text }))
+  );
 
-    // A task appears ONLY with a real in-window signal, in priority order:
-    //   1. worked (transition) — worked_at (a PURE provider state transition) in-window → PM source.
-    //   2. newly assigned      — assigned_at in-window & no transition → its own "Newly assigned"
-    //                            group (freshly on their plate, not yet worked). Checked BEFORE the
-    //                            updated_at fallback so a just-created assigned ticket reads as newly
-    //                            assigned, not "worked".
-    //   3. worked (edited)     — updated_at in-window (a persisted change that's neither a transition
-    //                            nor a new assignment, e.g. a workspace task whose status advanced).
-    //   4. (evidence-backed — a linked work item; arrives in a later PR — not wired here.)
-    // An old task with none of these is DROPPED — "if it's old and has no evidence, don't list it"
-    // (a routine re-sync no longer bumps updated_at on unchanged rows, so case 3 is real work).
-    const inWin = (ms: number | null): ms is number => ms !== null && ms >= windowStartMs;
-    const workedTransition = tsMs(t.worked_at); // pure transition — NO updated_at fallback here
-    const assignedAt = tsMs(t.assigned_at);
-    const editedAt = tsMs(t.updated_at);
-    const push = (source: string, atMs: number) =>
-      evidence.push({
-        id: `task:${t.id}`,
-        memberId: person.memberId,
-        source,
-        kind: "task",
-        title: t.title || "(untitled task)",
-        at: new Date(atMs).toISOString(),
-      });
-    if (inWin(workedTransition)) push(pmSource, workedTransition);
-    else if (inWin(assignedAt)) push(NEWLY_ASSIGNED_SOURCE, assignedAt);
-    else if (inWin(editedAt)) push(pmSource, editedAt);
-    // else: dormant assigned ticket, no in-window signal → dropped.
-    // KNOWN, deferred (PR-B): the FIRST import of a provider team stamps assigned_at=now on every
-    // pre-existing assigned row, so a whole backlog transiently floods "Newly assigned" for 7 days.
-    // The durable fix (a per-team first-seen watermark, or gating on the provider's own assignment
-    // time) lands with the persisted work_timeline layer; it's one-time, self-resolving onboarding noise.
+  // One evidence row per (item, linked task); unlinked items carry taskId=null (→ the "Other" bucket).
+  // A commit citing two issues appears under both.
+  const evidence: EvidenceWithMember[] = [];
+  for (const e of evItems) {
+    const base: EvidenceItem & { memberId: string } = { id: e.id, memberId: e.memberId, source: e.source, kind: e.kind, title: e.title, url: e.url, at: e.at };
+    const taskIds = links.get(e.id);
+    if (taskIds && taskIds.length) for (const taskId of taskIds) evidence.push({ ...base, taskId });
+    else evidence.push({ ...base, taskId: null });
   }
 
-  return groupTimeline(evidence, members, todayISO);
+  return groupTimeline(evidence, taskInfo, taskSignals, members, todayISO);
 }

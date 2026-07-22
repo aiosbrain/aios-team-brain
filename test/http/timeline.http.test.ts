@@ -36,8 +36,12 @@ describe("GET /api/v1/timeline (HTTP)", () => {
     const body = await res.json();
     expect(body.window_days).toBe(7);
     expect(Array.isArray(body.days)).toBe(true);
-    const people = body.days.flatMap((d: { people: unknown[] }) => d.people);
+    const people = body.days.flatMap((d: { people: unknown[] }) => d.people) as { tasks: unknown[]; other: unknown[] }[];
     expect(people.length).toBeGreaterThan(0);
+    // Pin the v1.12 nested wire shape: each person carries `tasks` + `other` (not the old `sources`).
+    expect(Array.isArray(people[0].tasks)).toBe(true);
+    expect(Array.isArray(people[0].other)).toBe(true);
+    expect((people[0] as Record<string, unknown>).sources).toBeUndefined();
   });
 
   it("tier isolation: an external-tier key gets 200 but NO team-tier work", async () => {

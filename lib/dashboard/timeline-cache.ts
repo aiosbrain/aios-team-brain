@@ -25,6 +25,9 @@ import type { TimelineDay } from "./timeline-group";
  */
 
 const TTL_MS = 5 * 60_000; // 5-min freshness; the ledger is cheap, so refresh often.
+// Bump when the TimelineDay[] SHAPE changes (e.g. PR-D's task→evidence nesting): a cached row from an
+// older deploy is then treated as a cache MISS (rebuilt), so the panel never renders a stale wrong shape.
+const PAYLOAD_VERSION = 2;
 
 interface CacheEntry {
   days: TimelineDay[];
@@ -54,7 +57,11 @@ export async function readTimelineCache(
       .maybeSingle();
     if (!data) return null;
     const row = data as { payload: unknown; computed_at: string | Date };
-    const days = Array.isArray(row.payload) ? (row.payload as TimelineDay[]) : [];
+    // Payload is `{ v, days }`. A missing/older version = a shape from a previous deploy → treat as a
+    // MISS so the caller rebuilds (never render a stale wrong shape).
+    const p = row.payload as { v?: number; days?: unknown } | null;
+    if (!p || p.v !== PAYLOAD_VERSION || !Array.isArray(p.days)) return null;
+    const days = p.days as TimelineDay[];
     const at =
       typeof row.computed_at === "string" ? Date.parse(row.computed_at) : new Date(row.computed_at).getTime();
     return { days, at: Number.isFinite(at) ? at : 0 };
@@ -75,7 +82,7 @@ export async function writeTimelineCache(
     // `payload` is a top-level JSON array — serialize it ourselves (the pg adapter binds a raw JS array
     // as a Postgres array literal, which the jsonb column rejects); a text param assignment-casts to jsonb.
     await db.from("work_timeline_cache").upsert(
-      { team_id: teamId, group_key: tier, payload: JSON.stringify(days), computed_at: new Date().toISOString() },
+      { team_id: teamId, group_key: tier, payload: JSON.stringify({ v: PAYLOAD_VERSION, days }), computed_at: new Date().toISOString() },
       { onConflict: "team_id,group_key" }
     );
   } catch {
