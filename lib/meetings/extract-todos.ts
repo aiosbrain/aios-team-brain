@@ -265,7 +265,9 @@ export async function createMeetingTodoTasks(
   // OPT-IN reconcile: for each transcript id here, delete its stale (no-longer-extracted, un-pushed)
   // todos after upserting. Only the deliberate on-demand re-extract of a SINGLE transcript passes
   // this; the additive backfill paths omit it so they never prune another path's todos.
-  opts: { pruneSourceItemIds?: string[] } = {}
+  // `status` sets the brain status new/re-extracted todos get (default 'backlog') — the team's
+  // configured target category (teams.meeting_task_status) so they land there when pushed.
+  opts: { pruneSourceItemIds?: string[]; status?: string } = {}
 ): Promise<{ projectId: string; upserted: number; deleted: number }> {
   const projectId = await ensureMeetingTodoProject(db, teamId);
   let upserted = 0;
@@ -281,7 +283,7 @@ export async function createMeetingTodoTasks(
           row_key: row.rowKey,
           title: row.title,
           assignee: row.assignee,
-          status: "backlog",
+          status: opts.status ?? "backlog",
           raw_status: "extracted",
           sprint: MEETING_TODO_LABEL,
           due_date: row.due,

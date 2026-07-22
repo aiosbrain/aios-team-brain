@@ -16,6 +16,7 @@ import { getPipelineHealth } from "@/lib/ingest/pipeline-health";
 import { PipelineHealthBanner } from "@/components/admin/pipeline-health-banner";
 import { describeAnswering, describeReasoning } from "@/lib/query/llm-backend";
 import { normalizeAnsweringProvider } from "@/lib/query/answering";
+import { normalizeMeetingTaskStatus } from "@/lib/meetings/target-status";
 
 export const metadata: Metadata = { title: "Integrations" };
 
@@ -35,7 +36,7 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ t
   const user = await getSessionUser();
   const { data: team } = await sessionDb
     .from("teams")
-    .select("id, primary_pm_provider, answering_provider, reasoning_model, reasoning_provider")
+    .select("id, primary_pm_provider, answering_provider, reasoning_model, reasoning_provider, meeting_task_status")
     .eq("slug", teamSlug)
     .maybeSingle();
   if (!team) return null;
@@ -139,6 +140,7 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ t
         teamSlug={teamSlug}
         integrations={integrations}
         primaryPmProvider={(team.primary_pm_provider as "plane" | "linear" | null) ?? null}
+        meetingTaskStatus={normalizeMeetingTaskStatus(team.meeting_task_status)}
         answering={{
           provider: answeringProvider,
           models: answeringModels,

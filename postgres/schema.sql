@@ -117,6 +117,10 @@ create table if not exists teams (
   -- Optional distinct PROVIDER for the reasoning model. Null = reuse the answering provider; set =
   -- reasoning runs on its own backend (answer on one provider, reason on another).
   reasoning_provider text check (reasoning_provider in ('anthropic', 'openai', 'openrouter', 'local')),
+  -- Which category extracted MEETING action items land in when pushed to the PM tool (Linear/Plane):
+  -- a brain task status mapped to the provider's workflow-state group by desiredStateForStatus.
+  -- Null → 'backlog' (the historical default). Admin → Integrations picks it (radio).
+  meeting_task_status text check (meeting_task_status in ('backlog', 'ready', 'in_progress', 'done')),
   created_at timestamptz not null default now()
 );
 -- Additive columns for existing deployments.

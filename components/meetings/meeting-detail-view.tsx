@@ -2,6 +2,7 @@ import { notFound } from "next/navigation";
 import { serverClient } from "@/lib/db/server";
 import { getMeetingNote, type ViewerTier } from "@/lib/meetings/notes";
 import { resolvePrimaryProvider } from "@/lib/pm-sync/project";
+import { getMeetingTaskStatus } from "@/lib/meetings/target-status-db";
 import { MemberAvatar } from "@/components/people/member-avatar";
 import { MeetingActionItems } from "@/components/meetings/meeting-action-items";
 import { MeetingDetailTabs } from "@/components/meetings/meeting-detail-tabs";
@@ -28,7 +29,11 @@ export async function MeetingDetailView({
   if (!note) notFound();
 
   // The team's primary PM tool — labels the "Push to …" control and gates it when none is set.
-  const primary = await resolvePrimaryProvider(db, teamId);
+  // + the default target category for extracted items (the pusher can override it per meeting).
+  const [primary, defaultStatus] = await Promise.all([
+    resolvePrimaryProvider(db, teamId),
+    getMeetingTaskStatus(db, teamId),
+  ]);
 
   return (
     <div className="flex flex-col gap-4">
@@ -71,6 +76,7 @@ export async function MeetingDetailView({
             noteId={note.id}
             todos={note.extractedTodos}
             provider={primary.provider}
+            defaultStatus={defaultStatus}
           />
         }
       />
