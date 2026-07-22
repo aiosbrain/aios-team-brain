@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   lowAttribution,
   isSignalSource,
+  deriveItemTitle,
   type SourceAttribution,
 } from "@/lib/attribution/health";
 
@@ -50,5 +51,23 @@ describe("lowAttribution — the banner's alert list", () => {
     const mid = src({ source: "mid", items: 10, human: 6, pctHuman: 60 });
     expect(lowAttribution([empty, mid])).toEqual([]); // 60 ≥ default 50, empty skipped
     expect(lowAttribution([mid], 70).map((s) => s.source)).toEqual(["mid"]); // 60 < 70
+  });
+});
+
+describe("deriveItemTitle — the drill-down title fallback ladder", () => {
+  it("prefers the frontmatter title when present", () => {
+    expect(deriveItemTitle("Weekly sync notes", "# Some heading", "granola/abc.md")).toBe("Weekly sync notes");
+    expect(deriveItemTitle("  trimmed  ", null, "x/y.md")).toBe("trimmed");
+  });
+
+  it("falls back to the first markdown heading when there is no frontmatter title", () => {
+    expect(deriveItemTitle(null, "\n\n## Design doc\nbody…", "notion/xyz.md")).toBe("Design doc");
+    expect(deriveItemTitle("", "# Top heading", "notion/xyz.md")).toBe("Top heading");
+  });
+
+  it("falls back to the path tail (extension stripped) when there is no title or heading", () => {
+    expect(deriveItemTitle(null, "plain body, no heading", "notion/deep/my-note.md")).toBe("my-note");
+    expect(deriveItemTitle(null, null, "git/README.txt")).toBe("README");
+    expect(deriveItemTitle(undefined, undefined, "loose")).toBe("loose");
   });
 });

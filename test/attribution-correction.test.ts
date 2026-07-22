@@ -19,6 +19,21 @@ describe("correctionPlanSchema — the closed, scoped contract the LLM must prod
     expect(correctionPlanSchema.safeParse({ kind: "reassign", match: { source: "linear" }, toMember: "x", danger: "drop" }).success).toBe(false);
     expect(correctionPlanSchema.safeParse({ kind: "reassign", match: { source: "linear" } }).success).toBe(false);
   });
+
+  it("accepts an itemId match (the drill-down 'correct this one' affordance) as a valid scope", () => {
+    const ok = correctionPlanSchema.safeParse({
+      kind: "reassign",
+      match: { itemId: "550e8400-e29b-41d4-a716-446655440000" },
+      toMember: "Fatma",
+    });
+    expect(ok.success).toBe(true);
+  });
+
+  it("rejects a non-UUID itemId (it targets a single row by id — never a free string)", () => {
+    expect(
+      correctionPlanSchema.safeParse({ kind: "reassign", match: { itemId: "not-a-uuid" }, toMember: "Fatma" }).success
+    ).toBe(false);
+  });
 });
 
 describe("resolveTarget — fail loud, never mis-apply", () => {

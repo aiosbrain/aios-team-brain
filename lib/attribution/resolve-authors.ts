@@ -65,8 +65,18 @@ function roleRank(role: string | undefined): number {
 
 const str = (v: unknown): string => (typeof v === "string" ? v.trim() : "");
 
+/** The role-ranked PRIMARY ref (strongest role wins; stable by original order for ties) — the SAME
+ *  ordering `resolveAuthors` uses to pick a primary, so a "why is this theirs?" signal built from this
+ *  reflects the resolver's choice rather than raw frontmatter order. Null for an empty list. */
+export function primaryAuthorRef(refs: AuthorRef[]): AuthorRef | null {
+  if (refs.length === 0) return null;
+  return refs
+    .map((ref, i) => ({ ref, i }))
+    .sort((a, b) => roleRank(a.ref.role) - roleRank(b.ref.role) || a.i - b.i)[0].ref;
+}
+
 /** A human-readable label for an unresolved author (for the review queue / logs). */
-function describe(ref: AuthorRef): string {
+export function describeAuthorRef(ref: AuthorRef): string {
   return (
     ref.email ||
     (ref.provider && ref.externalId ? `${ref.provider}:${ref.externalId}` : "") ||
@@ -169,7 +179,7 @@ export function resolveAuthors(
       if (!resolvedMemberIds.includes(memberId)) resolvedMemberIds.push(memberId);
       if (!primary) primary = { memberId, method };
     } else {
-      unresolved.push(describe(ref));
+      unresolved.push(describeAuthorRef(ref));
     }
   }
   return {

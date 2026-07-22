@@ -1,5 +1,6 @@
 import "server-only";
 import { runSql } from "@/lib/db/pg/pool";
+import { parseAuthorRefs, describeAuthorRef, primaryAuthorRef } from "@/lib/attribution/resolve-authors";
 
 /**
  * Attribution health — "is each data stream landing on the right person?" Every learning/arc surface
@@ -156,6 +157,86 @@ export async function getMemberAttribution(teamId: string): Promise<MemberAttrib
     console.error("[attribution] getMemberAttribution failed:", err instanceof Error ? err.message : err);
     return [];
   }
+}
+
+/** One attributed item in the per-person drill-down (the actual piece of context, not a count). */
+export interface MemberItem {
+  id: string;
+  path: string;
+  title: string;
+  kind: string;
+  source: string;
+  updatedAt: string;
+  /** member_id was set by a deliberate correction → a "manual" badge (signal is suppressed). */
+  locked: boolean;
+  /** The author signal that resolves this item (the resolver's own view) — the "why is this theirs?".
+   *  Null when locked (the manual override supersedes it) or when there's no signal. */
+  signal: string | null;
+}
+
+/** Title fallback ladder: frontmatter `title` → first markdown heading → path tail. Pure + unit-tested. */
+export function deriveItemTitle(fmTitle: string | null | undefined, bodyHead: string | null | undefined, path: string): string {
+  const t = (fmTitle ?? "").trim();
+  if (t) return t;
+  const heading = (bodyHead ?? "").match(/^#{1,6}\s+(.+)$/m);
+  if (heading) return heading[1].trim();
+  const tail = path.split("/").pop() ?? path;
+  return tail.replace(/\.(md|txt)$/i, "") || path;
+}
+
+/**
+ * The actual items attributed to a member — the drill-down behind the per-person counts. `memberId: null`
+ * is the UNATTRIBUTED bucket (the biggest triage target). Reuses `SOURCE_EXPR` (so totals reconcile with
+ * the chips) and the resolver's `parseAuthorRefs`/`primaryAuthorRef`/`describeAuthorRef` for the "why"
+ * signal — the SAME role-ranked primary the resolver picks, not raw frontmatter order. Newest-updated
+ * first, capped at `limit` (the caller knows the authoritative count and shows "N of total" when capped —
+ * full keyset pagination is a follow-up, `arcs-work-time-chronology.md`). UNLIKE the counts reads it
+ * THROWS on error — a chip that says "14" whose expand silently returned [] would make the dashboard
+ * contradict itself. Admin-only (callers gate via `requireTeamAdmin`; see the module-header AUTHZ note).
+ */
+export async function getMemberItems(
+  teamId: string,
+  memberId: string | null,
+  opts: { source?: string; limit?: number } = {}
+): Promise<MemberItem[]> {
+  const limit = Math.min(Math.max(opts.limit ?? 200, 1), 500);
+  const where: string[] = ["i.team_id = $1"];
+  const params: unknown[] = [teamId];
+  where.push(memberId === null ? "i.member_id is null" : `i.member_id = $${params.push(memberId)}`);
+  if (opts.source) where.push(`${SOURCE_EXPR} = $${params.push(opts.source.toLowerCase())}`);
+  const { rows } = await runSql<{
+    id: string;
+    path: string;
+    kind: string;
+    source: string;
+    updated_at: string | Date;
+    member_id_locked: boolean | null;
+    fm_title: string | null;
+    body_head: string | null;
+    frontmatter: Record<string, unknown> | null;
+  }>(
+    `select i.id, i.path, i.kind::text as kind, ${SOURCE_EXPR} as source, i.updated_at,
+            i.member_id_locked, i.frontmatter->>'title' as fm_title, left(i.body, 500) as body_head, i.frontmatter
+       from items i
+      where ${where.join(" and ")}
+      order by i.updated_at desc, i.id desc
+      limit ${limit}`,
+    params
+  );
+  return rows.map((r) => {
+    const locked = r.member_id_locked === true;
+    const primary = locked ? null : primaryAuthorRef(parseAuthorRefs(r.frontmatter ?? {}));
+    return {
+      id: r.id,
+      path: r.path,
+      kind: r.kind,
+      source: r.source,
+      updatedAt: r.updated_at instanceof Date ? r.updated_at.toISOString() : String(r.updated_at),
+      title: deriveItemTitle(r.fm_title, r.body_head, r.path),
+      locked,
+      signal: primary ? describeAuthorRef(primary) : null,
+    };
+  });
 }
 
 /** The full attribution-health read for a team (both breakdowns + the alert list). Best-effort. */
