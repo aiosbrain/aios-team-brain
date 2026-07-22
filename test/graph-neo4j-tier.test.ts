@@ -132,3 +132,90 @@ live("Graphiti Neo4j tier isolation (real Neo4j)", () => {
     expect(events.map((e) => e.id)).not.toContain("ep2"); // external event never leaks
   });
 });
+
+/**
+ * Work-time ordering (docs/design/arcs-work-time-chronology.md): facts/events order + timestamp by
+ * WORK time (`valid_at` clamped to `created_at`), not extraction time — so "recent" means recent work
+ * and a re-projected old doc stops looking new. Self-skips unless NEO4J_TEST is set (local-only tier).
+ */
+live("Brain-Learning work-time ordering (real Neo4j)", () => {
+  const WT = "wt_order";
+  let driver: Driver;
+
+  beforeAll(async () => {
+    driver = neo4j.driver(
+      process.env.NEO4J_URL as string,
+      neo4j.auth.basic(process.env.NEO4J_USER as string, process.env.NEO4J_PASSWORD as string)
+    );
+    const s = driver.session();
+    try {
+      await s.run("MATCH (n) WHERE n.group_id = $wt DETACH DELETE n", { wt: WT });
+      // Realistic: work (valid_at) precedes extraction (created_at). created-order (desc): A,B,D,C —
+      // but WORK-order (desc, by valid_at; D's future date clamped to its created_at; C has no valid_at
+      // → created_at): D(Jun8), A(Jun4), B(Jun3), C(Jun2). The two orders differ → proves work-time sort.
+      await s.run(
+        `CREATE (:Entity {name:'sA',group_id:$wt})-[:RELATES_TO {uuid:'wA',fact:'fact A',group_id:$wt,episodes:[],created_at:datetime('2026-06-10T00:00:00Z'),valid_at:datetime('2026-06-04T00:00:00Z')}]->(:Entity {name:'oA',group_id:$wt})
+         CREATE (:Entity {name:'sB',group_id:$wt})-[:RELATES_TO {uuid:'wB',fact:'fact B',group_id:$wt,episodes:[],created_at:datetime('2026-06-09T00:00:00Z'),valid_at:datetime('2026-06-03T00:00:00Z')}]->(:Entity {name:'oB',group_id:$wt})
+         CREATE (:Entity {name:'sC',group_id:$wt})-[:RELATES_TO {uuid:'wC',fact:'fact C',group_id:$wt,episodes:[],created_at:datetime('2026-06-02T00:00:00Z')}]->(:Entity {name:'oC',group_id:$wt})
+         CREATE (:Entity {name:'sD',group_id:$wt})-[:RELATES_TO {uuid:'wD',fact:'fact D',group_id:$wt,episodes:[],created_at:datetime('2026-06-08T00:00:00Z'),valid_at:datetime('2030-01-01T00:00:00Z')}]->(:Entity {name:'oD',group_id:$wt})`,
+        { wt: WT }
+      );
+    } finally {
+      await s.close();
+    }
+  });
+
+  afterAll(async () => {
+    await driver?.close();
+    await closeNeo4j();
+  });
+
+  it("orders by WORK time (valid_at), returns it as `at`, falls back to created_at, clamps a future valid_at", async () => {
+    const facts = await recentFacts([WT], null);
+    expect(facts.map((f) => f.fact)).toEqual(["fact D", "fact A", "fact B", "fact C"]); // work-order, not created-order (A,B,D,C)
+    expect(facts.find((f) => f.fact === "fact A")!.at).toMatch(/^2026-06-04/); // valid_at (not created 2026-06-10)
+    expect(facts.find((f) => f.fact === "fact C")!.at).toMatch(/^2026-06-02/); // no valid_at → created_at fallback
+    expect(facts.find((f) => f.fact === "fact D")!.at).toMatch(/^2026-06-08/); // future valid_at (2030) clamped to created_at
+  });
+
+  it("a WORK-time window excludes a re-projected old fact (extracted now, worked 8d ago)", async () => {
+    const WW = "wt_window";
+    const now = new Date().toISOString();
+    const d8 = new Date(Date.now() - 8 * 86400_000).toISOString();
+    const d1h = new Date(Date.now() - 3600_000).toISOString();
+    const s = driver.session();
+    try {
+      await s.run("MATCH (n) WHERE n.group_id=$wt DETACH DELETE n", { wt: WW });
+      await s.run(
+        `CREATE (:Entity {name:'se',group_id:$wt})-[:RELATES_TO {uuid:'wE',fact:'reprojected old',group_id:$wt,episodes:[],created_at:datetime($now),valid_at:datetime($d8)}]->(:Entity {name:'oe',group_id:$wt})
+         CREATE (:Entity {name:'sf',group_id:$wt})-[:RELATES_TO {uuid:'wF',fact:'fresh work',group_id:$wt,episodes:[],created_at:datetime($now),valid_at:datetime($d1h)}]->(:Entity {name:'of',group_id:$wt})`,
+        { wt: WW, now, d8, d1h }
+      );
+    } finally {
+      await s.close();
+    }
+    const facts = await recentFacts([WW], new Date(Date.now() - 86400_000).toISOString());
+    expect(facts.map((f) => f.fact)).toContain("fresh work");
+    expect(facts.map((f) => f.fact)).not.toContain("reprojected old"); // worked 8d ago → outside the 24h WORK window
+  });
+
+  it("recentEvents orders by the work-time INSTANT, not the raw offset string", async () => {
+    const WE = "wt_events";
+    const now = new Date().toISOString();
+    const s = driver.session();
+    try {
+      // epX valid = 10:00+02:00 = 08:00Z; epY valid = 09:00Z → epY is the later INSTANT. A raw-string
+      // sort ("10:00+02:00" > "09:00Z") would wrongly put epX first; the datetime sort key must not.
+      await s.run("MATCH (n) WHERE n.group_id=$wt DETACH DELETE n", { wt: WE });
+      await s.run(
+        `CREATE (:Episodic {uuid:'epX',name:'items:x',source:'notion',source_description:'X',group_id:$wt,created_at:datetime($now),valid_at:datetime('2026-06-01T10:00:00+02:00')})
+         CREATE (:Episodic {uuid:'epY',name:'items:y',source:'notion',source_description:'Y',group_id:$wt,created_at:datetime($now),valid_at:datetime('2026-06-01T09:00:00Z')})`,
+        { wt: WE, now }
+      );
+    } finally {
+      await s.close();
+    }
+    const events = await recentEvents([WE], "2026-01-01T00:00:00Z");
+    expect(events.map((e) => e.id)).toEqual(["epY", "epX"]); // later instant first, offset-safe
+  });
+});

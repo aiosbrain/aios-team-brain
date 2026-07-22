@@ -9,8 +9,9 @@ import { itemIdFromEpisodeName } from "./episode-name";
  * from seeing team facts (no RLS backstop, CLAUDE.md §5). Guarded by test/guards/graph-tier-filter.
  *
  * Best-effort: returns [] when Neo4j is unconfigured/unreachable so the panel degrades gracefully.
- * Graphiti schema: `(:Entity)-[:RELATES_TO {fact, created_at, group_id, episodes}]->(:Entity)`,
- * `(:Episodic {name:"items:<id>", created_at, group_id})`, `(:Episodic)-[:MENTIONS]->(:Entity)`.
+ * Graphiti schema: `(:Entity)-[:RELATES_TO {fact, created_at, valid_at, group_id, episodes}]->(:Entity)`,
+ * `(:Episodic {name:"items:<id>", created_at, valid_at, group_id})`, `(:Episodic)-[:MENTIONS]->(:Entity)`.
+ * We order/timestamp by WORK time (`valid_at` clamped to `created_at`, see `workTs`), not extraction time.
  *
  * SPARSE-DATA FALLBACK: the `sinceISO` window is a SOFT preference, not a hard cutoff. When the
  * windowed query returns nothing (a stale graph — e.g. Graphiti's extractor stalled and the newest
@@ -34,11 +35,23 @@ import { itemIdFromEpisodeName } from "./episode-name";
 const FACT_NOISE_FILTER =
   "AND (r.name IS NULL OR r.name <> 'IS_DUPLICATE_OF') AND r.expired_at IS NULL";
 
+/**
+ * WORK time for ordering/timestamping — so "recent" means recent WORK, not recent extraction (a
+ * re-projected old doc no longer looks new; see docs/design/arcs-work-time-chronology.md). Uses the
+ * Graphiti `valid_at` (the episode reference we set from the item's `source_ts`), CLAMPED to
+ * `created_at` (extraction) as an upper bound: work always precedes extraction, so this both supplies
+ * the null fallback AND forecloses a future-dated `valid_at` (a bad `source_ts` or an LLM-extracted
+ * planning date) from pinning the top of the recency-ranked pool. `v` is the pattern variable
+ * (`r` for a fact edge, `ep` for an episode). Returns a Cypher datetime expression.
+ */
+const workTs = (v: string): string =>
+  `(CASE WHEN ${v}.valid_at IS NULL OR ${v}.valid_at > ${v}.created_at THEN ${v}.created_at ELSE ${v}.valid_at END)`;
+
 /** Layer 1 — one recently-extracted fact (a RELATES_TO edge). */
 export interface AtomicFact {
   id: string; // edge uuid
   fact: string;
-  at: string; // ISO created_at
+  at: string; // ISO WORK time (valid_at clamped to created_at; see workTs) — NOT extraction time
   subjectType: string; // subject entity's label → the type badge
   subject: string;
   object: string;
@@ -46,8 +59,9 @@ export interface AtomicFact {
 }
 
 /**
- * Layer 1 — recent atomic facts for the given tier-visible groups, newest first. `groups` MUST be
- * the caller's `visibleGroupIds(teamSlug, tier)`. `sinceISO` bounds the window (e.g. last 24h).
+ * Layer 1 — recent atomic facts for the given tier-visible groups, newest WORK first (`workTs`, not
+ * extraction time). `groups` MUST be the caller's `visibleGroupIds(teamSlug, tier)`. `sinceISO` bounds
+ * the window (e.g. last 24h of work).
  */
 export async function recentFacts(
   groups: string[],
@@ -59,15 +73,15 @@ export async function recentFacts(
   const factsCypher = (withSince: boolean) =>
     `MATCH (a:Entity)-[r:RELATES_TO]->(b:Entity)
      WHERE r.group_id IN $groups
-       ${FACT_NOISE_FILTER}${withSince ? " AND r.created_at >= datetime($since)" : ""}
+       ${FACT_NOISE_FILTER}${withSince ? ` AND ${workTs("r")} >= datetime($since)` : ""}
      RETURN r.uuid AS id,
             r.fact AS fact,
-            toString(r.created_at) AS at,
+            toString(${workTs("r")}) AS at,
             head([l IN labels(a) WHERE l <> 'Entity']) AS subjectType,
             a.name AS subject,
             b.name AS object,
             r.episodes AS episodeUuids
-     ORDER BY r.created_at DESC
+     ORDER BY ${workTs("r")} DESC
      LIMIT toInteger($limit)`;
   const query = async (withSince: boolean): Promise<AtomicFact[]> => {
     const rows = await runRead<{
@@ -160,15 +174,16 @@ export async function recentEvents(
   // `withSince` gates ONLY the time bound; both group_id tier filters are present either way.
   const eventsCypher = (withSince: boolean) =>
     `MATCH (ep:Episodic)
-     WHERE ep.group_id IN $groups${withSince ? " AND ep.created_at >= datetime($since)" : ""}
+     WHERE ep.group_id IN $groups${withSince ? ` AND ${workTs("ep")} >= datetime($since)` : ""}
      OPTIONAL MATCH (ep)-[:MENTIONS]->(p:Entity)
      OPTIONAL MATCH (a:Entity)-[r:RELATES_TO]->(b:Entity)
        WHERE r.group_id IN $groups AND ep.uuid IN r.episodes ${FACT_NOISE_FILTER}
      RETURN ep.uuid AS id, ep.name AS name, ep.source AS source,
-            ep.source_description AS title, toString(ep.created_at) AS at,
+            ep.source_description AS title, toString(${workTs("ep")}) AS at,
+            ${workTs("ep")} AS sortAt,
             collect(DISTINCT p.name) AS participants,
             collect(DISTINCT r.fact) AS facts
-     ORDER BY at DESC
+     ORDER BY sortAt DESC
      LIMIT toInteger($limit)`;
   const query = async (withSince: boolean): Promise<GraphEvent[]> => {
     const rows = await runRead<{
