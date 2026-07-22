@@ -1522,6 +1522,22 @@ create table if not exists arc_cache (
   primary key (team_id, group_key)
 );
 
+-- ── work-timeline cache (the persisted, queryable work-timeline context layer) ──
+-- The day → person → work ledger (from `items` + `tasks`) assembled by lib/dashboard/work-timeline,
+-- persisted so the dashboard panel, the CLI, and the LLM read it identically (not recomputed per
+-- render). Serve-stale-while-revalidate like arc_cache; regenerable, never a source of truth — safe to
+-- truncate. Sole writer: lib/dashboard/timeline-cache. `group_key` = the viewer TIER ('team' |
+-- 'external'); the (team_id, group_key) PK already scopes by team, so the tier alone separates what a
+-- team viewer (team+external work) vs an external viewer (external only) may read — no cross-tier bleed,
+-- no RLS backstop (CLAUDE.md §5). Fixed 7-day window in v1 (not part of the key).
+create table if not exists work_timeline_cache (
+  team_id uuid not null references teams(id) on delete cascade,
+  group_key text not null,                       -- viewer tier: 'team' | 'external'
+  payload jsonb not null default '[]'::jsonb,     -- TimelineDay[] (already attributed + grouped)
+  computed_at timestamptz not null default now(),
+  primary key (team_id, group_key)
+);
+
 -- ── chat conversations (persistent, owner-scoped chat history) ────────────────
 -- ChatGPT-style threads persisted server-side so history survives across sessions AND interfaces
 -- (web, mobile, CLI, Telegram/Hermes). Owner-scoped: a member reads only their own conversations

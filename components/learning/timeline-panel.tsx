@@ -1,5 +1,5 @@
 import { adminClient } from "@/lib/db/admin";
-import { getWorkTimeline } from "@/lib/dashboard/work-timeline";
+import { getCachedWorkTimeline } from "@/lib/dashboard/timeline-cache";
 import type { PersonDay } from "@/lib/dashboard/timeline-group";
 import { MemberAvatar } from "@/components/people/member-avatar";
 import { SourceIcon, sourceLabel } from "@/components/icons/source-icon";
@@ -7,10 +7,10 @@ import { SourceIcon, sourceLabel } from "@/components/icons/source-icon";
 /**
  * Timeline — the team's recent work as a human-readable day → person → evidence ledger over the last
  * 7 days (GitHub commits, Linear/Plane tasks, dated docs), each with a brand source icon + link. Reads
- * Postgres `items`+`tasks` (via `getWorkTimeline`, tier-gated through the §5 choke-points), NOT the
- * graph — so it shows real per-person work instead of chunked extraction episodes. Best-effort: an
- * empty week renders the empty state. `adminClient` is safe here because `visibleItems`/`visibleTasks`
- * apply the tier filter inside the query regardless of the client.
+ * the persisted work-timeline LAYER (`getCachedWorkTimeline` → `work_timeline_cache`, SWR), the same
+ * payload the CLI + machines read at `GET /api/v1/timeline` — built from Postgres `items`+`tasks`
+ * (tier-gated through the §5 choke-points), NOT the graph. Best-effort: an empty week renders the empty
+ * state. `adminClient` is safe because `visibleItems`/`visibleTasks` apply the tier filter regardless.
  */
 
 function timeOf(at: string): string {
@@ -25,7 +25,7 @@ function personSummary(p: PersonDay): string {
 }
 
 export async function TimelinePanel({ teamId, tier }: { teamId: string; tier: "team" | "external" }) {
-  const days = await getWorkTimeline(adminClient(), teamId, tier);
+  const days = await getCachedWorkTimeline(adminClient(), teamId, tier);
 
   if (days.length === 0) {
     return (

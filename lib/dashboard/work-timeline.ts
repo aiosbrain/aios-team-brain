@@ -102,6 +102,14 @@ export async function getWorkTimeline(
     db.from("members").select("id, display_name, actor_handle, avatar_url, email").eq("team_id", teamId).eq("status", "active"),
     db.from("teams").select("primary_pm_provider").eq("id", teamId).maybeSingle(),
   ]);
+  // THROW on a query error — never treat a DB failure (pool contention, #249) as "empty". The pg
+  // adapter returns {data:null,error} instead of throwing, so an unchecked `?? []` would silently
+  // yield an empty/partial ledger — which `getCachedWorkTimeline` would then persist as a "fresh"
+  // row and serve everywhere. The persisted layer's "empty = a quiet week" contract only holds if a
+  // real error propagates instead: a cold-miss build 500s the route (and the panel's error boundary
+  // catches it), and a background rebuild's throw is caught WITHOUT writing, keeping the good prior.
+  // (teamRes only degrades the pmSource label, so a null there is cosmetic — not fatal.)
+  if (memberRes.error) throw new Error(`work-timeline members: ${memberRes.error.message}`);
 
   // Real people only — connectors author sync noise, not work (mirrors team-work-live.toRoster).
   const humans = ((memberRes.data ?? []) as {
@@ -164,6 +172,7 @@ export async function getWorkTimeline(
         .from("tasks")
         .select("id, title, assignee, updated_at, worked_at, assigned_at")
         .eq("team_id", teamId)
+        // (error check on all three results below, after the Promise.all)
         // `updated_at` is the outer bound: worked_at/assigned_at only move via a persisted change that
         // also bumps updated_at (or a fresh import that sets updated_at=now), so this is a valid
         // superset. The real in-window decision is made per-row in JS below (worked_at/assigned_at).
@@ -173,6 +182,11 @@ export async function getWorkTimeline(
       tier
     ),
   ]);
+  // THROW on any evidence-query error too — a partial ledger (one of the three legs failed) must not
+  // be cached/served as complete. See the members-error note above.
+  if (gitRes.error) throw new Error(`work-timeline git: ${gitRes.error.message}`);
+  if (otherRes.error) throw new Error(`work-timeline items: ${otherRes.error.message}`);
+  if (taskRes.error) throw new Error(`work-timeline tasks: ${taskRes.error.message}`);
 
   const evidence: EvidenceWithMember[] = [];
 
