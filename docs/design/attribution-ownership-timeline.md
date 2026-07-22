@@ -81,11 +81,13 @@ corrected owner; unattributed stays unattributed (balancing behavior unchanged t
 ## Out of scope (follow-ups)
 - Consuming the `item.reassigned` stream + `from_owned_since` directly (the version ledger covers the arc
   case; the transition stream matters for finer window boundaries + the short-tenure heuristic).
-- **Heal `item_versions.member_id` on a re-point/heal.** A heal/source-re-point updates `items.member_id`
-  but writes no new version and no lock, so a stale/mis-resolved version author (e.g. a doc pushed via the
-  wrong key pre-#329) keeps its old `member_id`. Version-based credit then credits that stale author over
-  the healed owner (the inverse of the bug this fixes). Today the admin **lock** (a correction) is the
-  override; the durable fix is to re-point the matching `item_versions.member_id` rows when
-  `decideReattribution` re-points, so the work ledger tracks the corrected author.
+- **Heal `item_versions.member_id`** — BUILT (`reattributeItems.reattributeVersions`). Naively copying the
+  item's new owner onto its versions would DESTROY a genuine handoff's per-version history (A's real past
+  work → credited to B). Instead the reattribute batch re-resolves EACH version from its OWN stored
+  frontmatter (same resolver, same conservative bar): a version whose author became resolvable only after a
+  mapping change heals; a genuinely-authored version resolves to the same person → untouched (handoff
+  preserved). Scoped to non-external, non-locked items. (This runs in the admin/auto-reconcile batch, not the
+  ingest hot path — a pure reassignment on re-push still leaves versions as-is, which is correct: the past
+  work was the prior owner's.)
 - The exact source-event timestamp (we use the sync-time `created_at`; a source history API would sharpen
   `from_owned_since`).
