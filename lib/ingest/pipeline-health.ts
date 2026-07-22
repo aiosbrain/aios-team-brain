@@ -54,6 +54,27 @@ export function staleThresholdMs(source: string): number | null {
   return source in STALE_MS_BY_SOURCE ? STALE_MS_BY_SOURCE[source] : STALE_MS;
 }
 
+/**
+ * The ingestion legs that map 1:1 to a configured `integrations` row (source slug == integration
+ * `type`). When such an integration is DELETED or DISABLED, the scheduler stops polling it and
+ * (per `runImport`) records no new `ingest_runs` row — so its LAST row is frozen forever. If that
+ * frozen row was a failure (a timeout, a since-revoked key), `distinct on (source)` keeps surfacing
+ * it and the loud banner cries wolf about a source the team intentionally removed. These sources are
+ * therefore suppressed from `failing` when no ENABLED integration of that type remains. Already-
+ * ingested `items` are untouched — we only stop EXPECTING fresh syncs. Non-connector legs (llm,
+ * dense, graph_*, meeting_notes, …) aren't integration-scoped and are never suppressed here.
+ */
+const CONNECTOR_SOURCES: ReadonlySet<string> = new Set(["slack", "plane", "linear", "github"]);
+
+/** A connector leg is "orphaned" when its integration type is no longer enabled (deleted/disabled).
+ *  Its frozen last-failure row is a fossil the scheduler can't overwrite — not a live break.
+ *  `enabledTypes === null` means the config read FAILED — we don't know what's configured, so we fail
+ *  OPEN (suppress nothing, keep every failing leg loud) rather than silencing a genuine break. */
+function isOrphanedConnector(source: string, enabledTypes: ReadonlySet<string> | null): boolean {
+  if (enabledTypes === null) return false;
+  return CONNECTOR_SOURCES.has(source) && !enabledTypes.has(source);
+}
+
 export interface PipelineLeg {
   source: string;
   ok: boolean;
@@ -92,8 +113,10 @@ export async function getPipelineHealth(teamId: string): Promise<PipelineHealth>
   try {
     const now = Date.now();
     // Latest run per source for this team (team-scoped rows) OR global (team_id is null, e.g. dense).
-    // The graph-extraction probe hits Neo4j, so run it concurrently with the ledger read.
-    const [res, extraction] = await Promise.all([
+    // The graph-extraction probe hits Neo4j, so run it concurrently with the ledger read. Also read
+    // the team's currently-enabled integration types, so a connector leg whose integration was
+    // deleted/disabled (its last run frozen as a failure) is suppressed instead of crying wolf.
+    const [res, extraction, enabled] = await Promise.all([
       runSql<Row>(
         `select distinct on (source) source, ok, errors, finished_at
            from ingest_runs
@@ -102,7 +125,13 @@ export async function getPipelineHealth(teamId: string): Promise<PipelineHealth>
         [teamId]
       ),
       getGraphExtractionHealth(teamId).catch(() => null),
+      runSql<{ type: string }>(
+        `select distinct type from integrations where team_id = $1 and status = 'enabled'`,
+        [teamId]
+      ).catch(() => null),
     ]);
+    // null = the enabled-integrations read failed → unknown config → fail OPEN (suppress nothing).
+    const enabledTypes: ReadonlySet<string> | null = enabled ? new Set(enabled.rows.map((r) => r.type)) : null;
     const legs: PipelineLeg[] = res.rows.map((r) => {
       const at = r.finished_at instanceof Date ? r.finished_at.toISOString() : String(r.finished_at);
       // Stale only past THIS source's own cadence — a 24h job isn't stale at 3h (would cry wolf).
@@ -125,7 +154,9 @@ export async function getPipelineHealth(teamId: string): Promise<PipelineHealth>
       });
     }
 
-    const failing = legs.filter((l) => !l.ok || l.stale);
+    // A leg is "failing" if its latest run failed or it went stale — EXCEPT an orphaned connector
+    // (integration deleted/disabled), whose frozen last-failure isn't a live break to alert on.
+    const failing = legs.filter((l) => (!l.ok || l.stale) && !isOrphanedConnector(l.source, enabledTypes));
     return { legs, failing, healthy: failing.length === 0 };
   } catch {
     return empty;
