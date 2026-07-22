@@ -65,6 +65,13 @@ const FACT_POOL = MAX_FACTS * 20;
 // entire representation and bury their actual varied work.
 const PER_ITEM_CAP = 20;
 const CACHE_TTL_MS = 10 * 60_000;
+// LLM timeout for arc synthesis, split by call path. A reasoning model over ~200 facts is genuinely
+// slow, so a single tight timeout either (a) blocks the /arcs route to its 120s maxDuration or (b)
+// aborts the healthy-but-slow model and records a bogus "timeout" on the answering-model health leg.
+// So the INLINE cold-miss path (route-bound) stays under 120s, while the fire-and-forget BACKGROUND
+// refresh — served-stale-while-revalidate, NOT route-bound — gets a much wider window. Env-overridable.
+const INLINE_ARC_TIMEOUT_MS = Math.max(1_000, Number(process.env.ARC_INLINE_TIMEOUT_MS) || 110_000);
+const BG_ARC_TIMEOUT_MS = Math.max(INLINE_ARC_TIMEOUT_MS, Number(process.env.ARC_BG_TIMEOUT_MS) || 280_000);
 // How long the empty-clobber guard keeps trusting a prior non-empty arc set. Within this window an
 // empty synthesis is treated as a transient failure (keep the prior); beyond it, a persistently-empty
 // result is accepted as genuine so the panel can't be pinned to ancient arcs forever (Fable review).
@@ -375,7 +382,8 @@ async function callLLMRaw(
   system: string,
   userContent: string,
   keys: ProviderKeys,
-  record?: { db: DbClient; teamId: string }
+  record?: { db: DbClient; teamId: string },
+  timeoutMs: number = INLINE_ARC_TIMEOUT_MS
 ): Promise<string | null> {
   return completeTextOrNull(
     { system, prompt: userContent },
@@ -388,10 +396,12 @@ async function callLLMRaw(
       role: "reasoning",
       maxTokens: 4096,
       // A reasoning model reasoning over ~200 facts routinely needs far more than completeText's 30s
-      // default — at 30s the call was aborted (timeout) and arcs came back empty. 110s covers the
-      // observed latency while staying under the route's 120s maxDuration; the fire-and-forget
-      // background refresh (SWR) isn't route-bound, so it can use the full window.
-      timeoutMs: 110_000,
+      // default — at 30s the call was aborted (timeout) and arcs came back empty. The INLINE cold-miss
+      // path must stay under the route's 120s maxDuration, but the fire-and-forget background refresh
+      // (SWR) isn't route-bound, so it gets a much longer window (BG_ARC_TIMEOUT_MS) — otherwise a
+      // slow-but-healthy reasoning model records a "timeout" on the answering-model leg and fires the
+      // loud pipeline banner even though the panel is served fine from cache.
+      timeoutMs,
       // Record the outcome so a broken answering model (e.g. a reasoning model returning empty) shows
       // as "degraded" on the dashboard instead of silently blanking the Learning page.
       record: record ? { db: record.db, teamId: record.teamId, task: "arcs" } : undefined,
@@ -460,7 +470,10 @@ async function synthesizeArcs(
   teamId: string,
   groups: string[],
   correctionTexts: string[],
-  keys: ProviderKeys
+  keys: ProviderKeys,
+  // Route-bound cold-miss callers keep the default (under the 120s route budget); the non-route-bound
+  // background refresh passes BG_ARC_TIMEOUT_MS so a slow reasoning model doesn't false-alarm as a timeout.
+  llmTimeoutMs: number = INLINE_ARC_TIMEOUT_MS
 ): Promise<NarrativeArc[]> {
   // Arcs are NOT time-boxed — synthesize from the most-recent facts regardless of age (a quiet week,
   // or a stalled projector, must not blank the panel). `null` = no window. Fetch a DEEP pool (not just
@@ -540,7 +553,8 @@ async function synthesizeArcs(
     buildSystemPrompt(arcsRequested(contributorCount)),
     buildPrompt(attributedFactTexts(facts, epToItem, humanByItem), correctionTexts),
     keys,
-    { db, teamId }
+    { db, teamId },
+    llmTimeoutMs
   );
   // Rank by recency → relevance so recent contributors' arcs lead, then attribute AI-agent names to
   // the humans behind each arc's own evidence.
@@ -627,7 +641,8 @@ function refreshArcsInBackground(teamId: string, key: string, groups: string[], 
   void (async () => {
     const bg = adminClient();
     try {
-      const arcs = await synthesizeArcs(bg, teamId, groups, [], keys);
+      // Not route-bound → give the reasoning model the full window (BG_ARC_TIMEOUT_MS).
+      const arcs = await synthesizeArcs(bg, teamId, groups, [], keys, BG_ARC_TIMEOUT_MS);
       await commitArcs(bg, teamId, key, arcs);
     } catch (err) {
       console.error("[arcs] background refresh failed:", err instanceof Error ? err.message : err);

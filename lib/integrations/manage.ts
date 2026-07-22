@@ -4,6 +4,7 @@ import { audit } from "@/lib/api/audit";
 import { encryptSecret, decryptSecret } from "@/lib/secrets/crypto";
 import {
   validateIntegrationConfig,
+  PROVIDER_INTEGRATION_TYPES,
   type IntegrationInput,
   type IntegrationType,
   type ProviderIntegrationType,
@@ -65,6 +66,11 @@ export async function setIntegrationStatus(
   id: string,
   status: "enabled" | "disabled"
 ): Promise<void> {
+  // NOTE: disabling the last enabled provider key does NOT clear a `teams.answering_provider` pointer
+  // (unlike deleteIntegration's cascade). Disable is REVERSIBLE — re-enabling should restore the
+  // team's choice, and clearing it would silently lose that choice — and the fallback is already
+  // surfaced live in the admin picker via `describeAnswering().usedFallback` (getProviderSettings
+  // filters status='enabled'). Deletion is permanent, so only it resets the stored pointer.
   const { error } = await db
     .from("integrations")
     .update({ status, updated_at: new Date().toISOString() })
@@ -87,6 +93,16 @@ export async function deleteIntegration(
   auth: IntegrationAuth,
   id: string
 ): Promise<void> {
+  // Read the type BEFORE deleting — the answering/reasoning pointer cascade below needs to know which
+  // provider (if any) this key backed, and the row is gone after the delete.
+  const { data: existing } = await db
+    .from("integrations")
+    .select("type")
+    .eq("id", id)
+    .eq("team_id", auth.teamId)
+    .maybeSingle();
+  const deletedType = (existing as { type: string } | null)?.type ?? null;
+
   const { error } = await db
     .from("integrations")
     .delete()
@@ -101,6 +117,83 @@ export async function deleteIntegration(
     target_type: "integration",
     target_id: id,
   });
+
+  // Cascade: `teams.answering_provider` / `reasoning_provider` are POINTERS at a provider-key
+  // integration. Deleting the last enabled key of that provider would leave the pointer dangling —
+  // the answer path silently falls back (Anthropic/env) while the Admin picker keeps claiming the
+  // deleted provider is active. Reset the matching pointer(s) back to auto so the stored state stops
+  // lying. Provider-key deletes only; connectors never touch these.
+  if (deletedType && (PROVIDER_INTEGRATION_TYPES as readonly string[]).includes(deletedType)) {
+    await clearDanglingProviderPointers(db, auth, deletedType as ProviderIntegrationType);
+  }
+}
+
+/**
+ * After a provider key is deleted, null any team answering/reasoning pointer that referenced it —
+ * BUT only when no ENABLED key of that provider remains (a redundant/backup key keeps the pointer
+ * valid). Best-effort + audited: a cleanup hiccup must not fail the delete the user already committed.
+ */
+async function clearDanglingProviderPointers(
+  db: DbClient,
+  auth: IntegrationAuth,
+  deletedType: ProviderIntegrationType
+): Promise<void> {
+  try {
+    const { data: remaining, error: remErr } = await db
+      .from("integrations")
+      .select("id")
+      .eq("team_id", auth.teamId)
+      .eq("type", deletedType)
+      .eq("status", "enabled")
+      .limit(1)
+      .maybeSingle();
+    // Can't confirm the provider is gone (read error) → keep the pointer (fail-safe: never flip a
+    // still-valid override to AUTO on a transient blip).
+    if (remErr) return;
+    if (remaining) return; // an enabled backup key of this type remains → pointer isn't dangling
+
+    const { data: team, error: teamErr } = await db
+      .from("teams")
+      .select("answering_provider, reasoning_provider, reasoning_model")
+      .eq("id", auth.teamId)
+      .maybeSingle();
+    if (teamErr) return;
+    const row = team as {
+      answering_provider: string | null;
+      reasoning_provider: string | null;
+      reasoning_model: string | null;
+    } | null;
+    const updates: { answering_provider?: null; reasoning_provider?: null; reasoning_model?: null } = {};
+    if (row?.answering_provider === deletedType) updates.answering_provider = null;
+    if (row?.reasoning_provider === deletedType) {
+      // provider+model are a coupled pair (see setReasoningModel) — an orphaned model on a nulled
+      // provider would run on the ANSWERING backend (llm-backend selectLlmBackend), sending e.g. an
+      // OpenAI slug to Anthropic → a hard error on every arc synthesis. Null both.
+      updates.reasoning_provider = null;
+      updates.reasoning_model = null;
+    }
+    if (Object.keys(updates).length === 0) return; // nothing pointed at the deleted provider
+
+    const { error } = await db.from("teams").update(updates).eq("id", auth.teamId);
+    if (error) throw new Error(error.message);
+    await audit(db, {
+      team_id: auth.teamId,
+      actor_kind: "member",
+      member_id: auth.memberId,
+      action: "team.answering_provider_reset",
+      target_type: "team",
+      target_id: auth.teamId,
+      meta: { reason: "provider_key_deleted", provider: deletedType, cleared: Object.keys(updates) },
+    });
+  } catch (err) {
+    // Best-effort: a cleanup hiccup must not fail the delete the user already committed. The dangling
+    // pointer still degrades gracefully — selectLlmBackend falls back to AUTO and the admin picker
+    // shows `usedFallback` (describeAnswering) — so log and move on rather than surfacing a false error.
+    console.error(
+      "[integrations] answering-provider cascade failed:",
+      err instanceof Error ? err.message : err
+    );
+  }
 }
 
 /**

@@ -7,7 +7,7 @@ import { resolveAnsweringKeys } from "@/lib/query/answering";
 import { getTeamWork } from "@/lib/dashboard/team-work-live";
 
 export const runtime = "nodejs";
-export const maxDuration = 60; // arc synthesis (LLM) can be slow on a cold cache
+export const maxDuration = 120; // arc synthesis (LLM) inline path can take up to ~110s on a cold cache
 
 /**
  * Dashboard "Working On" data: per-person summary (narrative arcs), open tasks, and recent
