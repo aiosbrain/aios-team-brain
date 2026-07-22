@@ -13,12 +13,12 @@ flowchart TD
     subgraph AgentLoop["Multi-Agent Dev Loop (local)"]
         A1[Opus — Planner\nCreates spec / Linear issue] --> A2[Codex — Critic\nReviews plan]
         A2 --> A3[Opus — Planner\nFinalizes plan]
-        A3 --> A4[Opus — Builder\nImplements + mandatory\nlocal/Fable review]
+        A3 --> A4["Opus — Builder\nImplements + local review\n(Local Bugbot or Fable)"]
         A4 --> A4P[Opens PR via gh]
-        A4P -->|when selected or safety-required| A4W{Current-head\nCodeRabbit landed?}
-        A4W -->|yes| A5[AIOS Code Reviewer\nReads CI + Local Bugbot\n+ CodeRabbit + Fable]
-        A4W -->|timeout| BLOCK[Block; do not merge]
-        A4P -->|Standard without label| A5
+        A4P -->|ready-for-review label| A4W{Current-head\nCodeRabbit landed?}
+        A4W -->|yes| A5["AIOS Code Reviewer\nReads CI + local review\n+ CodeRabbit evidence"]
+        A4W -->|timeout| A5
+        A4P -->|no label| A5
         A5 -->|findings| A4
         A5 -->|clear| MERGE[Human approves\n+ merges]
     end
@@ -76,25 +76,31 @@ Extracts `AIOS-Work: <KEY>` from the PR title/body and POSTs a merge event to `/
 
 ## Review evidence
 
-Local Bugbot is the canonical automated review when the workspace ship tooling drives the change.
-Its markdown artifact is valid only for the exact branch head and verified base SHA. This repository
-also requires the independent Fable diff review before push, recorded in the PR body.
+The team is small and members use different local reviewers — **John runs Local Bugbot (Cursor)**,
+**Chetan runs Fable** (`Agent(subagent_type: "code-reviewer", model: "fable")` from the
+`aios-workspace` ship tooling). Whichever ran is the local evidence, recorded as one line in the
+PR body. Local review evidence is scoped to the branch head it reviewed — treat it as stale after
+a fix commit or base movement. **None of this blocks a push or merge; only the required CI checks
+do.**
 
-CodeRabbit runs outside GitHub Actions and posts to the PR conversation. `.coderabbit.yaml` disables
-automatic review and incremental review; applying `ready-for-review` triggers the initial review.
-CodeRabbit is optional for Standard PRs and mandatory for safety-sensitive PRs. After a fix push,
-post `@coderabbitai review` to obtain fresh evidence.
+CodeRabbit runs outside GitHub Actions and posts to the PR conversation. `.coderabbit.yaml` keeps
+`auto_review.enabled: true` but restricts it with `labels: [ready-for-review]` — auto-review fires
+only on PRs carrying that label (`labels` filters automatic reviews; it is not a trigger on its
+own). Incremental review is off, so after a fix push post `@coderabbitai review` for fresh
+evidence. Apply the label when no local reviewer was available, or whenever you want the extra
+pass.
 
-The shared waiter lives in `aios-workspace` and accepts only substantive `coderabbitai[bot]` issue
-comments, inline comments, or submitted reviews at or after the latest PR commit:
+To wait for CodeRabbit, use the shared waiter from `aios-workspace` **with the `--bots` flag** —
+its default gates on `cursor[bot]` too (remote Bugbot is disabled here, so the default would just
+time out), and a completed check run can satisfy it, so read the printed signal and prefer comment
+or review text as evidence:
 
 ```bash
 node /path/to/aios-workspace/scripts/wait-for-bots.mjs \
-  --pr <n> --repo aiosbrain/aios-team-brain
+  --pr <n> --repo aiosbrain/aios-team-brain --bots 'coderabbitai[bot]'
 ```
 
-A successful check run alone, a rate-limit stub, or pre-push text does not satisfy the gate. The
-tool does not query or wait for `cursor[bot]`.
+Rate-limit stubs and pre-push text are rejected by the waiter automatically.
 
 ---
 
@@ -138,12 +144,12 @@ Repo: `aiosbrain/aios-team-brain` → Settings → Branches → `main`
 1. Opus (Planner)  → creates spec from Linear issue
 2. Codex (Critic)  → reviews plan, requests changes
 3. Opus (Planner)  → finalizes, hands off to builder
-4. Opus (Builder)  → implements, commits, opens PR
-5.                   GitHub Actions CI fires (parallel jobs)
-6. Fable           → reviews the exact branch diff before push; verdict recorded in PR
-7. CodeRabbit      → label-triggered when selected/safety-required; current-head text required
-8. Code Reviewer   → reads CI + Local Bugbot + current-head CodeRabbit + Fable evidence
-9. Opus (Builder)  → addresses findings; a push invalidates prior review evidence
-10. Human/operator → approves + merges (safety work cannot use `--auto-merge`)
+4. Local review    → Local Bugbot (John) or Fable (Chetan) on the branch diff; recorded in PR body
+5. Opus (Builder)  → commits, opens PR
+6.                   GitHub Actions CI fires (parallel jobs)
+7. CodeRabbit      → fires only on PRs labeled ready-for-review (auto_review label filter)
+8. Code Reviewer   → reads CI + whatever local review ran + current-head CodeRabbit evidence
+9. Opus (Builder)  → addresses findings; a push makes prior review evidence stale
+10. Human          → approves + merges (only required CI checks block)
 11.                  aios-work-sync fires → Linear issue closed
 ```

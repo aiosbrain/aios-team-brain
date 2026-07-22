@@ -9,7 +9,10 @@ reviews:
   review_status: true
   collapse_walkthrough: false
   auto_review:
-    enabled: false
+    # Label-gated: `labels` filters AUTOMATIC reviews, so enabled must stay true —
+    # with enabled:false the label never triggers anything. Reviews fire only on
+    # PRs carrying `ready-for-review`; use `@coderabbitai review` after fix pushes.
+    enabled: true
     drafts: false
     labels:
       - ready-for-review

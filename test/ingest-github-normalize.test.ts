@@ -8,8 +8,9 @@ import { itemPayloadSchema, taskRowSchema } from "@/lib/api/schemas";
 // Spec (GitHub inbound import): a repo's issues → ONE kind="task" ItemPayload, rows keyed GH-<number>.
 // PRs excluded; open→backlog (or a workflow label), closed→done; milestone→sprint; assignees→assignee.
 
+// Mixed-case owner on purpose: keeps the slug lowercasing in normalizeGithubRepo covered.
 const base: NormalizeGithubInput = {
-  owner: "aiosbrain",
+  owner: "AIOSbrain",
   repo: "aios-team-brain",
   issues: [],
 };

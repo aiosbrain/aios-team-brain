@@ -26,23 +26,23 @@ who reads it**. The map only pays off if it's trustworthy, so:
 
 ---
 
-## ⚠️ Review gate — ALWAYS Fable-review before pushing a PR (REQUIRED)
+## Review gate — local review before pushing a PR (flexible, non-blocking)
 
-Many sessions/worktrees ship into this repo in parallel and merge fast — **a Fable review is the
-pre-merge safety net** that catches tier leaks, sync-contract drift, and correctness bugs the
-mandatory Local Bugbot and label-gated CodeRabbit review may miss. It is **not optional**.
+Many sessions/worktrees ship into this repo in parallel and merge fast — a pre-push review of the
+branch diff catches tier leaks, sync-contract drift, and correctness bugs before they land. We are
+a small team on different local tools, so the gate is **tool-flexible and never blocks a push**:
 
-- **Before you `git push` a PR branch:** run a Fable review of the branch diff — spawn the
-  **`code-reviewer` agent on the Fable model** (`Agent(subagent_type: "code-reviewer", model: "fable")`)
-  pointed at `git diff origin/main...HEAD`. Give it the change's intent and let it apply the AIOS
-  invariants (this file + the agent's own checklist).
-- **Address its findings first.** Fix every blocker/HIGH; fix or consciously defer MEDIUM/LOW with a
-  one-line reason. Only push once Fable's verdict is _sound / ship it_ (or its blockers are resolved).
-- **Record it in the PR body** — a short `## Review — Reviewed by **Fable** — verdict …` line (with the
-  findings it caught + how you resolved them), so it's auditable which PRs were Fable-reviewed and
-  which weren't. Absence of that line means the gate was skipped.
-- Fable reviews the **diff you're about to ship**, not the bots' comments — it adds its own analysis.
-  This is in addition to CI, Local Bugbot, and current-head CodeRabbit when required, never a replacement.
+- **Before you `git push` a PR branch:** review `git diff origin/main...HEAD` with whichever local
+  reviewer you have — **Local Bugbot** (John, via Cursor) or a **Fable `code-reviewer` run**
+  (Chetan — `Agent(subagent_type: "code-reviewer", model: "fable")`). Any equivalent local diff
+  review counts; use what's available.
+- **Address blocker/HIGH findings before pushing**; fix or consciously defer MEDIUM/LOW with a
+  one-line reason.
+- **Record what reviewed the diff in the PR body** — one `## Review — Reviewed by <tool> — verdict …`
+  line so it's auditable. If no local reviewer was available, say so and apply the
+  `ready-for-review` label so CodeRabbit reviews the PR instead.
+- The local review examines the **diff you're about to ship**, not the bots' comments. It
+  complements CI and label-gated CodeRabbit; only the required CI checks block a merge.
 
 ---
 

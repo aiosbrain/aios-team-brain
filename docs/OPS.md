@@ -85,8 +85,10 @@ stack traces pointing at the original source files.
 
 ## 2. CodeRabbit (label-gated PR review) — W1.4.2
 
-CodeRabbit remains installed on the `aiosbrain` repositories, but `.coderabbit.yaml` disables
-automatic and incremental review. The positive `ready-for-review` label triggers an initial review.
+CodeRabbit remains installed on the `aiosbrain` repositories. `.coderabbit.yaml` keeps
+`auto_review.enabled: true` but restricts it with `labels: [ready-for-review]` — the `labels`
+setting **filters automatic reviews** (it is not an independent trigger, which is why `enabled`
+must stay `true`). Result: CodeRabbit auto-reviews only PRs carrying the label.
 
 1. Ensure the repository label exists:
 
@@ -95,11 +97,12 @@ automatic and incremental review. The positive `ready-for-review` label triggers
      --description "Trigger CodeRabbit review for the current PR head" --color 0E8A16
    ```
 
-2. Apply it only when CodeRabbit is explicitly selected, or whenever the diff is safety-sensitive.
+2. Apply it when no local reviewer (Local Bugbot / Fable) was available for the PR, or whenever an
+   extra automated pass is wanted. It never blocks — only the required CI checks gate a merge.
 3. After any later push, comment `@coderabbitai review`; the label does not trigger incremental
    reviews while `auto_incremental_review: false`.
-4. Accept only substantive comments/reviews created at or after the latest PR commit. A green check
-   run without review text is not evidence.
+4. Prefer substantive comments/reviews created at or after the latest PR commit as evidence. A
+   green check run without review text is weak evidence.
 
 No repository secret is required.
 
@@ -107,8 +110,9 @@ No repository secret is required.
 
 ## 3. Cursor Bugbot — W1.4.3 — HUMAN STEP
 
-Remote Cursor Bugbot must be disabled for this repository to avoid duplicating the mandatory Local
-Bugbot gate. In the Cursor dashboard, open the GitHub/Bugbot installations list and disable Bugbot
+Remote Cursor Bugbot should be disabled for this repository — John already runs **Local Bugbot**
+in Cursor as his pre-push reviewer (Chetan uses Fable), so the remote bot only duplicates that
+signal. In the Cursor dashboard, open the GitHub/Bugbot installations list and disable Bugbot
 for `aiosbrain/aios-team-brain` specifically.
 
 Do not use an undocumented API and do not uninstall the all-repository Cursor GitHub App: other
