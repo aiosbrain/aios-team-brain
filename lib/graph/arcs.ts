@@ -193,7 +193,7 @@ export function balanceFacts<T>(
  * Drop facts that add no signal before they're numbered into the prompt: (1) self-referential noise
  * where subject === object (Graphiti's "user is a duplicate of user" bookkeeping — a defense-in-depth
  * backstop even though `recentFacts` already filters `IS_DUPLICATE_OF` at the query), and (2) exact
- * repeats of an already-seen fact text (keep the first = newest, since the pool is newest-first). Each
+ * repeats of an already-seen fact text (keep the first = newest WORK, since the pool is work-time-first). Each
  * duplicate would otherwise consume a numbered slot and hand the model redundant input. Pure + tested.
  */
 export function dedupeFacts(facts: AtomicFact[]): AtomicFact[] {
