@@ -140,18 +140,32 @@ export function extractTodosFromNotes(markdown: string): ExtractedTodo[] {
   return rows;
 }
 
+/** Normalize a todo title for stable identity: lowercased, whitespace-collapsed, trimmed. */
+function normalizeTitle(title: string): string {
+  return title.toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Map extracted todos → task rows, keyed by CONTENT (transcript id + normalized title), NOT ordinal
+ * position. So re-extracting the same transcript maps each todo to the SAME `row_key`/task
+ * regardless of the LLM's order or count — preserving any PM-tool (Linear/Plane) push link on it,
+ * and letting the caller prune todos that genuinely disappeared. Identical titles within one
+ * extraction collapse to a single row (dedup) — the same action item stated twice is one task.
+ */
 export function toExtractedTodoRows(
   item: Pick<ItemRow, "id" | "path" | "access">,
   todos: ExtractedTodo[]
 ): ExtractedTodoRow[] {
   const sourceHash = stableHash(item.id, 10);
-  return todos.map((todo, index) => ({
-    ...todo,
-    rowKey: `${ROW_PREFIX}-${sourceHash}-${String(index + 1).padStart(3, "0")}`,
-    sourceItemId: item.id,
-    sourcePath: item.path,
-    audience: item.access,
-  }));
+  const seen = new Set<string>();
+  const out: ExtractedTodoRow[] = [];
+  for (const todo of todos) {
+    const rowKey = `${ROW_PREFIX}-${sourceHash}-${stableHash(normalizeTitle(todo.title), 12)}`;
+    if (seen.has(rowKey)) continue; // identical titles in one transcript → one task
+    seen.add(rowKey);
+    out.push({ ...todo, rowKey, sourceItemId: item.id, sourcePath: item.path, audience: item.access });
+  }
+  return out;
 }
 
 function taskBody(row: ExtractedTodoRow): string {
@@ -209,11 +223,50 @@ export async function ensureMeetingTodoProject(db: DbClient, teamId: string): Pr
   return (project as { id: string }).id;
 }
 
+/**
+ * Delete a transcript's meeting-todo tasks that are NOT in `keepKeys` — EXCEPT any already pushed to
+ * a PM tool (a `task_pm_links` row), which are preserved so a re-extract never orphans a live Linear/
+ * Plane issue's local mirror. Scoped to (team, project, source_item_id). Returns the count deleted.
+ */
+async function pruneStaleMeetingTodos(
+  db: DbClient,
+  teamId: string,
+  projectId: string,
+  sourceItemId: string,
+  keepKeys: Set<string>
+): Promise<number> {
+  const { data: existing } = await db
+    .from("tasks")
+    .select("id, row_key")
+    .eq("team_id", teamId)
+    .eq("project_id", projectId)
+    .eq("source_item_id", sourceItemId);
+  const stale = ((existing ?? []) as { id: string; row_key: string }[]).filter((t) => !keepKeys.has(t.row_key));
+  if (!stale.length) return 0;
+  const staleIds = stale.map((t) => t.id);
+  // Preserve any pushed to a PM tool — never delete the local mirror of a live Linear/Plane issue.
+  const { data: links } = await db
+    .from("task_pm_links")
+    .select("task_id")
+    .eq("team_id", teamId)
+    .in("task_id", staleIds);
+  const pushed = new Set(((links ?? []) as { task_id: string | null }[]).map((l) => l.task_id));
+  const toDelete = staleIds.filter((id) => !pushed.has(id));
+  if (!toDelete.length) return 0;
+  const { error } = await db.from("tasks").delete().eq("team_id", teamId).in("id", toDelete);
+  if (error) throw new Error(`prune stale meeting todos: ${error.message}`);
+  return toDelete.length;
+}
+
 export async function createMeetingTodoTasks(
   db: DbClient,
   teamId: string,
-  rows: ExtractedTodoRow[]
-): Promise<{ projectId: string; upserted: number }> {
+  rows: ExtractedTodoRow[],
+  // OPT-IN reconcile: for each transcript id here, delete its stale (no-longer-extracted, un-pushed)
+  // todos after upserting. Only the deliberate on-demand re-extract of a SINGLE transcript passes
+  // this; the additive backfill paths omit it so they never prune another path's todos.
+  opts: { pruneSourceItemIds?: string[] } = {}
+): Promise<{ projectId: string; upserted: number; deleted: number }> {
   const projectId = await ensureMeetingTodoProject(db, teamId);
   let upserted = 0;
 
@@ -245,7 +298,12 @@ export async function createMeetingTodoTasks(
     upserted++;
   }
 
-  return { projectId, upserted };
+  let deleted = 0;
+  for (const sourceItemId of opts.pruneSourceItemIds ?? []) {
+    const keepKeys = new Set(rows.filter((r) => r.sourceItemId === sourceItemId).map((r) => r.rowKey));
+    deleted += await pruneStaleMeetingTodos(db, teamId, projectId, sourceItemId, keepKeys);
+  }
+  return { projectId, upserted, deleted };
 }
 
 /**
