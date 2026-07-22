@@ -12,6 +12,7 @@ import {
   canSeeMeetingNotes,
   getMeetingNote,
   updateMeetingSummary,
+  type ExtractedTodoRef,
 } from "@/lib/meetings/notes";
 import { extractFromTranscript, type RosterPerson } from "@/lib/meetings/llm-extract";
 import { extractAndStoreActionItems } from "@/lib/meetings/action-items";
@@ -190,7 +191,7 @@ export async function importPushedMeetingsAction(
 export async function extractMeetingActionItemsAction(
   teamSlug: string,
   noteId: string
-): Promise<{ ok: boolean; error?: string; extracted?: number }> {
+): Promise<{ ok: boolean; error?: string; extracted?: number; items?: ExtractedTodoRef[] }> {
   const team = await resolveTeam(teamSlug);
   if (!team) return { ok: false, error: "team not found" };
 
@@ -243,8 +244,11 @@ export async function extractMeetingActionItemsAction(
       roster,
       keys
     );
+    // Revalidate so a later navigation shows fresh data, AND return the freshly-stored items so the
+    // client can render them in place — no router.refresh() / full-route reload on the current view.
     revalidatePath(`/t/${team.slug}/meetings/${noteId}`);
-    return { ok: true, extracted };
+    const fresh = await getMeetingNote(admin, team.id, noteId, me.tier);
+    return { ok: true, extracted, items: fresh?.extractedTodos ?? [] };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "extraction failed" };
   }

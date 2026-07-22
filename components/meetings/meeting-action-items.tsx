@@ -1,7 +1,6 @@
 "use client";
 
 import { useState, useTransition } from "react";
-import { useRouter } from "next/navigation";
 import { CheckSquare, ExternalLink, ListChecks, Loader2, Sparkles, Square } from "lucide-react";
 
 import {
@@ -38,14 +37,15 @@ function providerLabel(provider: string | null): string {
  * link out and can't be re-selected. When no tasks have been extracted yet, offers to extract them
  * (the CLI/ingest import path doesn't do it automatically).
  */
-export function MeetingActionItems({ teamSlug, noteId, todos, provider }: MeetingActionItemsProps) {
-  const router = useRouter();
+export function MeetingActionItems({ teamSlug, noteId, todos: initialTodos, provider }: MeetingActionItemsProps) {
   const [extracting, startExtract] = useTransition();
   const [pushing, startPush] = useTransition();
   const [msg, setMsg] = useState<string | null>(null);
+  // Held locally so an extract updates the list in place — no router.refresh()/full-route reload.
+  const [todos, setTodos] = useState<ActionItemView[]>(initialTodos);
   const [results, setResults] = useState<Map<string, PushTaskResult>>(new Map());
   const [pushedProvider, setPushedProvider] = useState<string | null>(null);
-  const [selected, setSelected] = useState<Set<string>>(() => new Set(todos.filter((t) => !t.pushed).map((t) => t.taskId)));
+  const [selected, setSelected] = useState<Set<string>>(() => new Set(initialTodos.filter((t) => !t.pushed).map((t) => t.taskId)));
 
   // A task counts as pushed if the server already recorded it OR we pushed it this session — so the
   // UI reflects a push immediately, WITHOUT a router.refresh() (which would re-render the whole route).
@@ -70,12 +70,16 @@ export function MeetingActionItems({ teamSlug, noteId, todos, provider }: Meetin
     startExtract(async () => {
       const res = await extractMeetingActionItemsAction(teamSlug, noteId);
       if (!res.ok) return setMsg(res.error ?? "extraction failed");
+      // Render the freshly-extracted items from the action's response — no full-page refresh. When
+      // none are found, the list stays empty and the message below explains why (never a blank reload).
+      const items = res.items ?? [];
+      setTodos(items);
+      setSelected(new Set(items.filter((t) => !t.pushed).map((t) => t.taskId)));
       setMsg(
         res.extracted
           ? `Extracted ${res.extracted} action item${res.extracted === 1 ? "" : "s"}.`
           : "No action items found in this transcript."
       );
-      router.refresh();
     });
   }
 
@@ -120,6 +124,14 @@ export function MeetingActionItems({ teamSlug, noteId, todos, provider }: Meetin
           {todos.length ? "Re-extract" : "Extract action items"}
         </button>
       </div>
+
+      {/* Extraction/push feedback — shown in BOTH the empty and populated states (so a "no items
+          found" or "extraction failed" result is never a silent, blank full-page refresh). */}
+      {msg ? (
+        <p className="rounded-md border border-border-subtle bg-surface-overlay/50 px-3 py-2 text-xs text-ink-secondary">
+          {msg}
+        </p>
+      ) : null}
 
       {todos.length === 0 ? (
         <p className="text-sm text-ink-tertiary">
@@ -183,7 +195,6 @@ export function MeetingActionItems({ teamSlug, noteId, todos, provider }: Meetin
                 {selected.size} of {pushable.length} selected
               </span>
               <div className="flex items-center gap-2">
-                {msg ? <span className="text-xs text-ink-tertiary">{msg}</span> : null}
                 <button
                   type="button"
                   onClick={runPush}
