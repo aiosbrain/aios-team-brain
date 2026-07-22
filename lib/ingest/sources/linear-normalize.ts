@@ -33,6 +33,10 @@ export interface LinearImportIssue {
   labels?: { nodes: { name: string }[] } | null;
   project?: { name?: string } | null;
   cycle?: { name?: string; number?: number } | null;
+  // State-transition timestamps → tasks.worked_at (the timeline "did work" signal). ISO or null.
+  startedAt?: string | null;
+  completedAt?: string | null;
+  canceledAt?: string | null;
 }
 
 export interface NormalizeLinearInput {
@@ -58,6 +62,23 @@ export interface LinearTaskRow {
   assignee: string;
   sprint: string;
   parent?: string | null;
+  // The task's last state-transition time → tasks.worked_at (timeline "did work" signal). ISO or "".
+  worked_at?: string;
+}
+
+/**
+ * The task's WORK time = its last state transition (`max(startedAt, completedAt, canceledAt)`) — a
+ * PURE transition signal. Deliberately NO fallback to `updatedAt` (which bumps on any relabel/cycle
+ * rotation): a fallback would (a) let `worked_at` move in-window while the brain `updated_at` stays
+ * out-of-window, silently breaking the timeline's `updated_at` outer bound, and (b) churn the whole
+ * team file's sha + a new item_version on every unrelated Linear edit. An unstarted/backlog issue has
+ * no transition → returns "" (→ NULL); the timeline then dates it by the honest brain `updated_at`.
+ */
+export function linearWorkedAt(it: LinearImportIssue): string {
+  const transitions = [it.startedAt, it.completedAt, it.canceledAt]
+    .map((t) => (typeof t === "string" ? Date.parse(t) : NaN))
+    .filter((n) => Number.isFinite(n)) as number[];
+  return transitions.length > 0 ? new Date(Math.max(...transitions)).toISOString() : "";
 }
 
 function sha256(s: string): string {
@@ -134,6 +155,7 @@ export function normalizeLinearTeam(input: NormalizeLinearInput): ItemPayload {
       labels,
       assignee: it.assignee?.displayName ?? "",
       sprint: it.project?.name ?? "",
+      worked_at: linearWorkedAt(it),
     };
     if (it.parent?.identifier) {
       // Resolve only within the imported set; a parent that was skipped/absent is nulled (never dangling).
@@ -142,11 +164,12 @@ export function normalizeLinearTeam(input: NormalizeLinearInput): ItemPayload {
     return row;
   });
 
-  // Serialize every projectable field so any change shifts the sha (writer never short-circuits a real change).
+  // Serialize every projectable field — PLUS worked_at — so any change shifts the sha (the writer never
+  // short-circuits a real change, and a state transition that moves worked_at re-materializes the row).
   const lines = rows.map(
     (r) =>
       `| ${r.row_key} | ${r.title} | ${r.status} | ${r.priority} | ${r.sprint} | ${r.assignee} | ` +
-      `${JSON.stringify(r.labels)} | ${r.parent ?? ""} |`
+      `${JSON.stringify(r.labels)} | ${r.parent ?? ""} | ${r.worked_at ?? ""} |`
   );
   const body = `# Linear import — ${slugSeg}\n\n${lines.join("\n")}\n`;
 

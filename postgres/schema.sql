@@ -975,6 +975,15 @@ create table if not exists tasks (
   -- internal task boards. Mirrors `decisions.audience`.
   audience access_tier not null default 'team',
   created_by uuid references members(id) on delete set null,
+  -- Timeline work-signal timestamps (work-timeline context layer). Both nullable; distinct from
+  -- `updated_at` (any edit — now gated to real changes, see lib/ingest materializeTasks):
+  --   • worked_at   = the provider's last STATE-TRANSITION time (Linear startedAt/completedAt/
+  --                   canceledAt; falls back to updatedAt). The "did work on it" signal — NOT
+  --                   updatedAt, which bumps on any relabel and would resurface dormant tickets.
+  --   • assigned_at = when the assignee last CHANGED (materializeTasks stamps it only on a real
+  --                   assignee change). Powers the timeline "newly assigned" bucket.
+  worked_at timestamptz,
+  assigned_at timestamptz,
   updated_at timestamptz not null default now(),
   created_at timestamptz not null default now()
 );
@@ -986,6 +995,8 @@ alter table tasks add column if not exists labels text[] not null default '{}';
 alter table tasks add column if not exists priority text not null default 'none';
 alter table tasks add column if not exists body text not null default '';
 alter table tasks add column if not exists audience access_tier not null default 'team';
+alter table tasks add column if not exists worked_at timestamptz;
+alter table tasks add column if not exists assigned_at timestamptz;
 do $$ begin
   if not exists (select 1 from pg_constraint where conname = 'tasks_priority_check') then
     alter table tasks add constraint tasks_priority_check check (priority in ('none', 'low', 'medium', 'high', 'urgent'));

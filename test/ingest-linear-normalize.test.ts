@@ -1,7 +1,34 @@
 import { describe, it, expect } from "vitest";
-import { normalizeLinearTeam, normalizeLinearDocs, type NormalizeLinearInput } from "@/lib/ingest/sources/linear-normalize";
+import { normalizeLinearTeam, normalizeLinearDocs, linearWorkedAt, type NormalizeLinearInput } from "@/lib/ingest/sources/linear-normalize";
 import { itemPayloadSchema, taskRowSchema } from "@/lib/api/schemas";
 import { withFooter } from "@/lib/pm-sync/linear-client";
+
+// Spec (worked_at): the task's WORK time is its last state transition — max(startedAt, completedAt,
+// canceledAt) — a PURE transition signal with NO updatedAt fallback (a fallback would move worked_at
+// on any relabel, breaking the timeline's updated_at bound and churning versions). An unstarted issue
+// has no transition → "". Flows to tasks.worked_at → the timeline signal.
+describe("linearWorkedAt", () => {
+  it("picks the latest state transition", () => {
+    expect(
+      linearWorkedAt({
+        id: "u",
+        identifier: "ENG-1",
+        startedAt: "2026-07-01T00:00:00Z",
+        completedAt: "2026-07-05T00:00:00Z",
+      })
+    ).toBe("2026-07-05T00:00:00.000Z");
+  });
+
+  it("returns '' for an unstarted issue with no transition (NO updatedAt fallback)", () => {
+    expect(linearWorkedAt({ id: "u", identifier: "ENG-2" })).toBe("");
+  });
+
+  it("a canceled issue's canceledAt counts as a transition", () => {
+    expect(
+      linearWorkedAt({ id: "u", identifier: "ENG-5", startedAt: "2026-07-02T00:00:00Z", canceledAt: "2026-07-08T00:00:00Z" })
+    ).toBe("2026-07-08T00:00:00.000Z");
+  });
+});
 
 // Spec (Linear inbound import): a team's issues → ONE kind="task" ItemPayload, rows keyed by the
 // Linear identifier. One-directional (Linear → brain); issues the brain projected OUT (carrying the

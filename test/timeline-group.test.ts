@@ -94,4 +94,19 @@ describe("groupTimeline", () => {
     );
     expect(days[0].people.map((p) => p.name)).toEqual(["Chetan", "John"]); // 2 vs 1
   });
+
+  it("floats the 'newly-assigned' group above real work sources, even at a lower count", () => {
+    const days = groupTimeline(
+      [
+        ev({ memberId: "m1", source: "github" }),
+        ev({ memberId: "m1", source: "github" }),
+        ev({ memberId: "m1", source: "github" }), // github ×3
+        ev({ memberId: "m1", source: "newly-assigned", kind: "task" }), // newly-assigned ×1
+      ],
+      members,
+      today
+    );
+    // Despite github having a higher count, "Newly assigned" ranks first.
+    expect(days[0].people[0].sources.map((s) => s.source)).toEqual(["newly-assigned", "github"]);
+  });
 });
