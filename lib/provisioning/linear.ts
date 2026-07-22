@@ -1,5 +1,6 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
+import { isRestrictedTier } from "@/lib/auth/visibility";
 import { linearGraphql } from "@/lib/pm-sync/linear-client";
 import { enabledIntegration } from "./integration";
 import type { ProvisioningAdapter, ProvisioningMember, ProvisioningResult } from "./types";
@@ -43,7 +44,7 @@ export const linearAdapter: ProvisioningAdapter = {
     const config = integ.config ?? {};
     const role =
       (typeof config.inviteRole === "string" && config.inviteRole) ||
-      (member.tier === "external" ? "guest" : "user");
+      (isRestrictedTier(member.tier) ? "guest" : "user"); // unknown/future tier → least-privileged guest
     const teamIds = Array.isArray(config.inviteTeamIds) ? (config.inviteTeamIds as string[]) : [];
     const input: Record<string, unknown> = { email: member.email, role };
     if (teamIds.length) input.teamIds = teamIds; // omit the field entirely when unset/empty

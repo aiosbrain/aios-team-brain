@@ -3,8 +3,9 @@
 Produces the payload for POST /api/v1/codebases. With ONE deliberate exception
 (``readiness`` — see below) it computes no scores; the brain derives ``agentic_score`` /
 ``health_score`` from these raw inputs (one scoring implementation, unit-tested in TS). The
-key AI-transformation signal is the ``Co-Authored-By: Claude`` commit trailer — treated
-as a heuristic for AI-*assisted* commits, not exact AI-authored lines.
+key AI-transformation signal is a ``Co-Authored-By: <tool>`` commit trailer (Claude, Codex,
+Cursor, OpenCode, GitHub Copilot, Devin — see ``_AI_TRAILER`` below) or a generated-with
+banner — treated as a heuristic for AI-*assisted* commits, not exact AI-authored lines.
 
 **The readiness exception:** AEM agent-readiness is scored HERE (``analyzers/readiness.py``)
 against the vendored rubric, because its checks are filesystem questions only the scanner can
@@ -33,7 +34,15 @@ log = logging.getLogger(__name__)
 # unit/record separators that won't appear in commit metadata
 _RS = "\x1e"
 _FS = "\x1f"
-_AI_TRAILER = re.compile(r"co-authored-by:\s*claude", re.IGNORECASE)
+# Commit-message markers left by AI coding agents (case-insensitive). Mirrors
+# lib/codebases/github-api-scan.ts's AI_MARKERS — keep both in sync; the shared
+# fixture at test/fixtures/ai-trailer-cases.json pins every case both sides must pass.
+_AI_TRAILER = re.compile(
+    r"co-authored-by:\s*(claude|codex|cursor|opencode|github copilot|devin)\b"
+    r"|generated with \[claude code\]"
+    r"|🤖 generated with",
+    re.IGNORECASE,
+)
 _CODE_EXT = {
     ".ts", ".tsx", ".js", ".jsx", ".py", ".go", ".rs", ".java", ".rb", ".php",
     ".c", ".h", ".cpp", ".cs", ".sql", ".sh", ".mjs", ".cjs", ".svelte", ".vue",

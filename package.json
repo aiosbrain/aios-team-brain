@@ -31,6 +31,12 @@
     "test:datamechanics": "vitest run --config vitest.datamechanics.config.ts",
     "test:datamechanics:local": "DATABASE_TEST_URL=postgres://app:app@localhost:5434/app_test vitest run --config vitest.datamechanics.config.ts",
     "test:http": "vitest run --config vitest.http.config.ts",
+    "test:http:gateway-approval": "AIOS_GATEWAY_INTERNAL_ENABLED=true vitest run --config vitest.http.config.ts gateway-approval-enabled",
+    "test:gateway-contracts": "vitest run test/gateway/gateway-contracts.test.ts",
+    "test:gateway-approval-contracts": "vitest run test/gateway/gateway-approval-contracts.test.ts",
+    "test:gateway-api": "vitest run test/gateway test/guards/gateway-writers.test.ts",
+    "test:gateway-approval:unit": "vitest run test/gateway/gateway-approval-contracts.test.ts test/gateway/gateway-approval.test.ts test/guards/gateway-writers.test.ts",
+    "test:gateway-approval": "npm run test:gateway-approval:unit && vitest run --config vitest.datamechanics.config.ts gateway-approval",
     "test:http:local": "npm run build && DATABASE_TEST_URL=postgres://app:app@localhost:5434/app_test vitest run --config vitest.http.config.ts"
   },
   "dependencies": {

@@ -1,7 +1,7 @@
 {
   "$schema": "./agent-readiness.schema.json",
   "id": "aios.agent-readiness",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "title": "Codebase Agent-Readiness Rubric",
   "description": "Machine-readable scoring rubric for how ready a repository is for agents to work in it effectively and verifiably. Consumed by the aios-workspace validator (OGR10) and the aios-team-brain codebase scan. Each check is a binary, automatable signal (file existence + lightweight config parse). A repo's level is the highest level for which >= advanceThreshold of that level's cumulative checks pass. The Spine level is CAPPED at L3 when the Verification pillar scores 0 passing checks (the core AEM rule: no real agentic maturity without verification).",
   "advanceThreshold": 0.8,
@@ -136,7 +136,7 @@
       "level": "L4",
       "title": "Logging / monitoring present",
       "rationale": "Agent actions and runtime behavior are inspectable.",
-      "signal": { "anyFileExists": ["**/logger.*", "**/logging.*"], "orDependency": ["pino", "winston", "structlog", "loguru", "opentelemetry", "@opentelemetry/api", "sentry-sdk", "@sentry/node"] }
+      "signal": { "anyFileExists": ["**/logger.*", "**/logging.*", "**/telemetry/**", "**/*telemetry*.{ts,tsx,js,mjs,py,go,rb}"], "orDependency": ["pino", "winston", "structlog", "loguru", "opentelemetry", "@opentelemetry/api", "sentry-sdk", "@sentry/node"] }
     },
     {
       "id": "eval_harness",
@@ -144,7 +144,7 @@
       "level": "L4",
       "title": "Eval suite or LLM-as-judge harness",
       "rationale": "Verification becomes a first-class, measured artifact (EDD).",
-      "signal": { "anyPathMatches": ["**/evals/**", "**/eval/**", "**/*.eval.*", "**/promptfoo*.{yml,yaml,json}", "**/braintrust*", "**/.promptfoo*"], "orDependency": ["promptfoo", "braintrust", "deepeval", "ragas"] }
+      "signal": { "anyPathMatches": ["**/evals/**", "**/eval/**", "**/*.eval.*", "**/*-eval.*", "**/*-eval-*", "**/promptfoo*.{yml,yaml,json}", "**/braintrust*", "**/.promptfoo*"], "orDependency": ["promptfoo", "braintrust", "deepeval", "ragas"] }
     },
     {
       "id": "compounding_instructions",

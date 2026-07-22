@@ -46,10 +46,24 @@ export interface PolicyActor {
 
 function validate(input: PolicyInput): void {
   if (!input.action?.trim()) throw new Error("action is required (e.g. \"code.run\" or \"item.*\")");
+  if (input.action.trim().startsWith("gateway."))
+    throw new Error("gateway policies must be managed from Managed gateway administration");
   if (!EFFECTS.includes(input.effect)) throw new Error(`invalid effect "${input.effect}"`);
   if (input.subjectRole && !ROLES.includes(input.subjectRole)) throw new Error("invalid subject role");
   if (input.subjectTier && !TIERS.includes(input.subjectTier)) throw new Error("invalid subject tier");
   if (input.priority != null && !Number.isInteger(input.priority)) throw new Error("priority must be an integer");
+}
+
+async function assertNonGatewayPolicy(db: DbClient, teamId: string, id: string): Promise<void> {
+  const { data, error } = await db
+    .from("policies")
+    .select("action")
+    .eq("team_id", teamId)
+    .eq("id", id)
+    .maybeSingle();
+  if (error) throw new Error(`policy lookup failed: ${error.message}`);
+  if ((data as { action?: string } | null)?.action?.startsWith("gateway."))
+    throw new Error("gateway policies must be managed from Managed gateway administration");
 }
 
 /** The mutable rule fields (shared by create + update). */
@@ -75,7 +89,9 @@ export async function listAllPolicies(db: DbClient, teamId: string): Promise<Pol
     .order("priority", { ascending: false })
     .order("created_at", { ascending: true });
   if (error) throw new Error(`policy list failed: ${error.message}`);
-  return (data ?? []) as PolicyRecord[];
+  return ((data ?? []) as PolicyRecord[]).filter(
+    (policy) => !policy.action.startsWith("gateway."),
+  );
 }
 
 export async function createPolicy(
@@ -107,6 +123,7 @@ export async function updatePolicy(
   actor: PolicyActor = {}
 ): Promise<void> {
   validate(input);
+  await assertNonGatewayPolicy(db, teamId, id);
   const { error } = await db
     .from("policies")
     .update({ ...fields(input), updated_at: new Date().toISOString() })
@@ -127,6 +144,7 @@ export async function setPolicyEnabled(
   enabled: boolean,
   actor: PolicyActor = {}
 ): Promise<void> {
+  await assertNonGatewayPolicy(db, teamId, id);
   const { error } = await db
     .from("policies")
     .update({ enabled, updated_at: new Date().toISOString() })
@@ -145,6 +163,7 @@ export async function deletePolicy(
   id: string,
   actor: PolicyActor = {}
 ): Promise<void> {
+  await assertNonGatewayPolicy(db, teamId, id);
   const { error } = await db.from("policies").delete().eq("team_id", teamId).eq("id", id);
   if (error) throw new Error(`policy delete failed: ${error.message}`);
   await audit(db, {

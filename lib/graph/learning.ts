@@ -1,5 +1,6 @@
 import "server-only";
 import { runRead, neo4jConfigured } from "./neo4j";
+import { itemIdFromEpisodeName } from "./episode-name";
 
 /**
  * "What the Brain is Learning" reads over Graphiti's Neo4j graph. Every query is scoped to the
@@ -8,8 +9,9 @@ import { runRead, neo4jConfigured } from "./neo4j";
  * from seeing team facts (no RLS backstop, CLAUDE.md §5). Guarded by test/guards/graph-tier-filter.
  *
  * Best-effort: returns [] when Neo4j is unconfigured/unreachable so the panel degrades gracefully.
- * Graphiti schema: `(:Entity)-[:RELATES_TO {fact, created_at, group_id, episodes}]->(:Entity)`,
- * `(:Episodic {name:"items:<id>", created_at, group_id})`, `(:Episodic)-[:MENTIONS]->(:Entity)`.
+ * Graphiti schema: `(:Entity)-[:RELATES_TO {fact, created_at, valid_at, group_id, episodes}]->(:Entity)`,
+ * `(:Episodic {name:"items:<id>", created_at, valid_at, group_id})`, `(:Episodic)-[:MENTIONS]->(:Entity)`.
+ * We order/timestamp by WORK time (`valid_at` clamped to `created_at`, see `workTs`), not extraction time.
  *
  * SPARSE-DATA FALLBACK: the `sinceISO` window is a SOFT preference, not a hard cutoff. When the
  * windowed query returns nothing (a stale graph — e.g. Graphiti's extractor stalled and the newest
@@ -18,11 +20,38 @@ import { runRead, neo4jConfigured } from "./neo4j";
  * group_id tier filter is NEVER dropped — only the time bound is — so tier isolation still holds.
  */
 
+/**
+ * Two noise filters ANDed onto EVERY RELATES_TO read (Layer 1 facts AND Layer 2 event fact-lists), so
+ * a third of this team's graph — non-knowledge that was flooding the recency pool and starving real
+ * work of representation — never reaches any layer (measured: ~26% IS_DUPLICATE_OF, ~8% expired):
+ *   • `r.name <> 'IS_DUPLICATE_OF'` — Graphiti records entity-dedup as a RELATES_TO edge whose fact
+ *     text is literally "<x> is a duplicate of <x>"; it carries a fresh created_at so it rides the top
+ *     of the newest-first pool. Bookkeeping, never knowledge → drop it. (`r.name IS NULL` kept
+ *     defensively so a graph without the property still returns real facts.)
+ *   • `r.expired_at IS NULL` — Graphiti's temporal model invalidates superseded edges by stamping
+ *     expired_at but leaves them in the graph; a "recent" read must not resurface stale copies.
+ * A leading AND is baked in — always used inside an existing `WHERE r.group_id IN $groups …`.
+ */
+const FACT_NOISE_FILTER =
+  "AND (r.name IS NULL OR r.name <> 'IS_DUPLICATE_OF') AND r.expired_at IS NULL";
+
+/**
+ * WORK time for ordering/timestamping — so "recent" means recent WORK, not recent extraction (a
+ * re-projected old doc no longer looks new; see docs/design/arcs-work-time-chronology.md). Uses the
+ * Graphiti `valid_at` (the episode reference we set from the item's `source_ts`), CLAMPED to
+ * `created_at` (extraction) as an upper bound: work always precedes extraction, so this both supplies
+ * the null fallback AND forecloses a future-dated `valid_at` (a bad `source_ts` or an LLM-extracted
+ * planning date) from pinning the top of the recency-ranked pool. `v` is the pattern variable
+ * (`r` for a fact edge, `ep` for an episode). Returns a Cypher datetime expression.
+ */
+const workTs = (v: string): string =>
+  `(CASE WHEN ${v}.valid_at IS NULL OR ${v}.valid_at > ${v}.created_at THEN ${v}.created_at ELSE ${v}.valid_at END)`;
+
 /** Layer 1 — one recently-extracted fact (a RELATES_TO edge). */
 export interface AtomicFact {
   id: string; // edge uuid
   fact: string;
-  at: string; // ISO created_at
+  at: string; // ISO WORK time (valid_at clamped to created_at; see workTs) — NOT extraction time
   subjectType: string; // subject entity's label → the type badge
   subject: string;
   object: string;
@@ -30,27 +59,29 @@ export interface AtomicFact {
 }
 
 /**
- * Layer 1 — recent atomic facts for the given tier-visible groups, newest first. `groups` MUST be
- * the caller's `visibleGroupIds(teamSlug, tier)`. `sinceISO` bounds the window (e.g. last 24h).
+ * Layer 1 — recent atomic facts for the given tier-visible groups, newest WORK first (`workTs`, not
+ * extraction time). `groups` MUST be the caller's `visibleGroupIds(teamSlug, tier)`. `sinceISO` bounds
+ * the window (e.g. last 24h of work).
  */
 export async function recentFacts(
   groups: string[],
-  sinceISO: string,
+  sinceISO: string | null,
   limit = 15
 ): Promise<AtomicFact[]> {
   if (!neo4jConfigured() || groups.length === 0) return [];
   // `withSince` gates ONLY the time bound; the group_id tier filter is present either way.
   const factsCypher = (withSince: boolean) =>
     `MATCH (a:Entity)-[r:RELATES_TO]->(b:Entity)
-     WHERE r.group_id IN $groups${withSince ? " AND r.created_at >= datetime($since)" : ""}
+     WHERE r.group_id IN $groups
+       ${FACT_NOISE_FILTER}${withSince ? ` AND ${workTs("r")} >= datetime($since)` : ""}
      RETURN r.uuid AS id,
             r.fact AS fact,
-            toString(r.created_at) AS at,
+            toString(${workTs("r")}) AS at,
             head([l IN labels(a) WHERE l <> 'Entity']) AS subjectType,
             a.name AS subject,
             b.name AS object,
             r.episodes AS episodeUuids
-     ORDER BY r.created_at DESC
+     ORDER BY ${workTs("r")} DESC
      LIMIT toInteger($limit)`;
   const query = async (withSince: boolean): Promise<AtomicFact[]> => {
     const rows = await runRead<{
@@ -73,9 +104,11 @@ export async function recentFacts(
     }));
   };
   try {
+    // `sinceISO === null` means "no time box — just the most-recent N" (arcs aren't time-boxed).
+    // With a window, fall back to most-recent-N (still tier-scoped) only when the window is empty —
+    // preserves the "recent" intent when the graph is fresh, degrades gracefully when it's stale/sparse.
+    if (sinceISO === null) return await query(false);
     const windowed = await query(true);
-    // Fall back to most-recent-N (still tier-scoped) only when the window is empty — preserves the
-    // "recent" intent when the graph is fresh, degrades gracefully when it's stale/sparse.
     return windowed.length > 0 ? windowed : await query(false);
   } catch {
     return []; // degrade — panel shows empty rather than erroring
@@ -89,10 +122,11 @@ export async function recentFacts(
  */
 export async function resolveEpisodeItems(
   groups: string[],
-  uuids: string[]
+  uuids: string[],
+  maxUuids = 500
 ): Promise<Map<string, { itemId?: string; source?: string }>> {
   const out = new Map<string, { itemId?: string; source?: string }>();
-  const unique = [...new Set(uuids.filter(Boolean))].slice(0, 500);
+  const unique = [...new Set(uuids.filter(Boolean))].slice(0, maxUuids);
   if (!neo4jConfigured() || groups.length === 0 || unique.length === 0) return out;
   try {
     const rows = await runRead<{ uuid: string; name: string | null; source: string | null }>(
@@ -104,7 +138,7 @@ export async function resolveEpisodeItems(
     for (const r of rows) {
       const name = r.name ?? "";
       out.set(r.uuid, {
-        itemId: name.startsWith("items:") ? name.slice("items:".length) : undefined,
+        itemId: itemIdFromEpisodeName(name), // tolerant of the `#<chunk>` suffix on split items
         source: r.source ? r.source.toLowerCase() : undefined,
       });
     }
@@ -140,15 +174,16 @@ export async function recentEvents(
   // `withSince` gates ONLY the time bound; both group_id tier filters are present either way.
   const eventsCypher = (withSince: boolean) =>
     `MATCH (ep:Episodic)
-     WHERE ep.group_id IN $groups${withSince ? " AND ep.created_at >= datetime($since)" : ""}
+     WHERE ep.group_id IN $groups${withSince ? ` AND ${workTs("ep")} >= datetime($since)` : ""}
      OPTIONAL MATCH (ep)-[:MENTIONS]->(p:Entity)
      OPTIONAL MATCH (a:Entity)-[r:RELATES_TO]->(b:Entity)
-       WHERE r.group_id IN $groups AND ep.uuid IN r.episodes
+       WHERE r.group_id IN $groups AND ep.uuid IN r.episodes ${FACT_NOISE_FILTER}
      RETURN ep.uuid AS id, ep.name AS name, ep.source AS source,
-            ep.source_description AS title, toString(ep.created_at) AS at,
+            ep.source_description AS title, toString(${workTs("ep")}) AS at,
+            ${workTs("ep")} AS sortAt,
             collect(DISTINCT p.name) AS participants,
             collect(DISTINCT r.fact) AS facts
-     ORDER BY at DESC
+     ORDER BY sortAt DESC
      LIMIT toInteger($limit)`;
   const query = async (withSince: boolean): Promise<GraphEvent[]> => {
     const rows = await runRead<{
@@ -166,7 +201,7 @@ export async function recentEvents(
       const facts = (r.facts ?? []).filter((x): x is string => !!x);
       return {
         id: r.id,
-        itemId: name.startsWith("items:") ? name.slice("items:".length) : null,
+        itemId: itemIdFromEpisodeName(name) ?? null, // tolerant of the `#<chunk>` suffix on split items
         source: (r.source ?? "").toLowerCase(),
         title: r.title ?? name,
         at: r.at,

@@ -41,6 +41,12 @@ class RawDoc:
     title: str | None = None
     url: str | None = None
     author: str | None = None
+    # Structured author signal → the brain resolves each to a roster member at ingest
+    # (lib/attribution/resolve-authors). Each entry: {role, email?, handle?, provider?, external_id?,
+    # display_name?}. Preferred over the bare `author` string (which the brain only resolves as an
+    # email); a document source that knows its authors (Notion created_by/last_edited_by, GDrive owner)
+    # should populate this so its items attribute to real people, not the connector.
+    authors: list[dict[str, str]] | None = None
     source_ts: str | None = None  # ISO timestamp of the source event, if known
     kind: ItemKind | None = None  # override DEFAULT_KIND_BY_SOURCE
     access: AccessTier | None = None  # override the connection default
@@ -87,6 +93,9 @@ def normalize(doc: RawDoc, cfg: NormalizeConfig) -> ItemPayload:
     if doc.source_ts:
         frontmatter["source_ts"] = doc.source_ts
     frontmatter.update(doc.extra_frontmatter)
+    # Structured authors last, so scalar extra_frontmatter can never clobber the resolvable signal.
+    if doc.authors:
+        frontmatter["authors"] = doc.authors
 
     # Prepend the title so identical bodies under different titles hash distinctly and
     # the indexed text leads with the title.

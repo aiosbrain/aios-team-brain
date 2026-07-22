@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { randomBytes } from "node:crypto";
-import { encryptSecret, decryptSecret, generateSecretsKey } from "@/lib/secrets/crypto";
+import {
+  decryptSecret,
+  decryptSecretBytes,
+  encryptSecret,
+  generateSecretsKey,
+} from "@/lib/secrets/crypto";
 
 const KEY = randomBytes(32);
 
@@ -8,6 +13,14 @@ describe("connector secret crypto (AES-256-GCM)", () => {
   it("round-trips plaintext", () => {
     const token = "xoxb-1234567890-abcdefABCDEF";
     expect(decryptSecret(encryptSecret(token, KEY), KEY)).toBe(token);
+  });
+
+  it("can return caller-owned plaintext bytes without consuming a supplied key", () => {
+    const key = Buffer.from(KEY);
+    const plaintext = decryptSecretBytes(encryptSecret("gateway-pat", key), key);
+    expect(plaintext.toString("utf8")).toBe("gateway-pat");
+    expect(key).toEqual(KEY);
+    plaintext.fill(0);
   });
 
   it("produces a different ciphertext each time (random IV)", () => {

@@ -1,7 +1,7 @@
 {
   "$schema": "aios-brain-contract/v1",
   "_note": "Canonical conformance fixture for the workspace<->brain seam (AIO-314). Home: aios-workspace/docs/contract. Vendored into aios-team-brain/test/fixtures/contract. contentHash pins the content; /docs-sync compares the two copies. Regenerate: node scripts/gen-contract-fixture.mjs.",
-  "version": "1.8",
+  "version": "1.9",
   "tierAliases": {
     "shared": {
       "team": "team",
@@ -83,5 +83,10 @@
     "slack",
     "github"
   ],
-  "contentHash": "65cf8bbe18270f8c720c99e1790992746f99b611d2d38e5569cb1929e8ee8ded"
+  "gatewayContract": {
+    "path": "gateway-v1.10.json",
+    "version": "1.10",
+    "sha256": "4ddd6495fa505b76118080865d60255bfba94a9ccda249defe428babb3d0c205"
+  },
+  "contentHash": "4eeca151ecb4fd1cf68be5f3c6da4b9a1113b15009647d6fab0dd50d76d962f7"
 }

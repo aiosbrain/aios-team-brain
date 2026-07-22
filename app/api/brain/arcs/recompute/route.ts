@@ -4,7 +4,7 @@ import { serverClient } from "@/lib/db/server";
 import { adminClient } from "@/lib/db/admin";
 import { getSessionUser } from "@/lib/auth/session";
 import { errorResponse } from "@/lib/api/schemas";
-import { getProviderKey } from "@/lib/integrations/manage";
+import { resolveAnsweringKeys } from "@/lib/query/answering";
 import { visibleGroupIds } from "@/lib/graph/group";
 import { recomputeArcs } from "@/lib/graph/arcs";
 
@@ -46,10 +46,7 @@ export async function POST(req: NextRequest) {
   if (tier !== "team") return errorResponse("forbidden", "corrections are team-tier only", 403);
 
   const admin = adminClient();
-  const [openaiKey, anthropicKey] = await Promise.all([
-    getProviderKey(admin, team.id, "openai"),
-    getProviderKey(admin, team.id, "anthropic"),
-  ]);
+  const keys = await resolveAnsweringKeys(admin, team.id);
   const arcs = await recomputeArcs(
     admin,
     team.id,
@@ -57,7 +54,7 @@ export async function POST(req: NextRequest) {
     tier,
     visibleGroupIds(teamSlug, tier),
     corrections,
-    { openaiKey, anthropicKey }
+    keys
   );
 
   return Response.json({ arcs, as_of: new Date().toISOString() });

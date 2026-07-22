@@ -3,7 +3,7 @@
 import { revalidatePath } from "next/cache";
 import { adminClient } from "@/lib/db/admin";
 import { requireTeamAdmin as requireAdmin } from "@/lib/auth/guard";
-import { getProviderKey } from "@/lib/integrations/manage";
+import { resolveAnsweringKeys } from "@/lib/query/answering";
 import { visibleGroupIds } from "@/lib/graph/group";
 import { discoverOpportunities } from "@/lib/social/discover";
 import { discoverOpportunitiesFromArcs } from "@/lib/social/discover-arcs";
@@ -12,7 +12,7 @@ import { generatePlanDrafts } from "@/lib/social/generate";
 import { generateVariantImage, imageBudget } from "@/lib/media/generate-image";
 import { setAutonomy, setPublishDryRun } from "@/lib/social/settings";
 import { submitForApproval, decideApproval } from "@/lib/social/approvals";
-import { scheduleVariant } from "@/lib/social/publish";
+import { scheduleVariant, cancelScheduledPublication } from "@/lib/social/publish";
 import { runCollectAnalytics } from "@/lib/social/collect-analytics";
 import { saveTypefully } from "@/lib/integrations/typefully";
 import type { AutonomyLevel } from "@/lib/social/autonomy";
@@ -42,12 +42,9 @@ export async function discoverFromArcsNow(teamSlug: string): Promise<DiscoverRes
   if (!ctx) return { ok: false, error: "admins only" };
   try {
     const db = adminClient();
-    const [openaiKey, anthropicKey] = await Promise.all([
-      getProviderKey(db, ctx.teamId, "openai"),
-      getProviderKey(db, ctx.teamId, "anthropic"),
-    ]);
+    const keys = await resolveAnsweringKeys(db, ctx.teamId);
     const groups = visibleGroupIds(teamSlug, "team");
-    const s = await discoverOpportunitiesFromArcs(db, ctx.teamId, teamSlug, "team", groups, { openaiKey, anthropicKey }, {
+    const s = await discoverOpportunitiesFromArcs(db, ctx.teamId, teamSlug, "team", groups, keys, {
       actor: { memberId: ctx.memberId },
     });
     revalidatePath(`/t/${teamSlug}/social`);
@@ -173,7 +170,7 @@ export async function scheduleVariantAction(
   teamSlug: string,
   variantId: string,
   at?: string
-): Promise<{ ok: boolean; dryRun?: boolean; error?: string }> {
+): Promise<{ ok: boolean; dryRun?: boolean; warning?: string; error?: string }> {
   const ctx = await requireAdmin(teamSlug);
   if (!ctx) return { ok: false, error: "admins only" };
   try {
@@ -181,9 +178,33 @@ export async function scheduleVariantAction(
     if (when && Number.isNaN(when.getTime())) return { ok: false, error: "invalid schedule time" };
     const pub = await scheduleVariant(adminClient(), ctx.teamId, variantId, { at: when, actor: { memberId: ctx.memberId } });
     revalidatePath(`/t/${teamSlug}/social`);
-    return { ok: true, dryRun: pub.dry_run };
+    // audit #9: a job was enqueued, but nothing drains the queue unless the poller is enabled — so a
+    // "scheduled" post would silently never go out. Surface that instead of a false success.
+    const warning =
+      process.env.SOCIAL_JOBS_ENABLED === "true"
+        ? undefined
+        : "scheduled, but the job poller is off (SOCIAL_JOBS_ENABLED unset) — this post will not run until it's enabled";
+    return { ok: true, dryRun: pub.dry_run, warning };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "could not schedule" };
+  }
+}
+
+/** Cancel a scheduled/pending publication so it never posts (admins only). audit #6. */
+export async function cancelPublicationAction(
+  teamSlug: string,
+  publicationId: string
+): Promise<{ ok: boolean; cancelled?: boolean; error?: string }> {
+  const ctx = await requireAdmin(teamSlug);
+  if (!ctx) return { ok: false, error: "admins only" };
+  try {
+    const { cancelled } = await cancelScheduledPublication(adminClient(), ctx.teamId, publicationId, {
+      memberId: ctx.memberId,
+    });
+    revalidatePath(`/t/${teamSlug}/social`);
+    return { ok: true, cancelled };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "could not cancel" };
   }
 }
 

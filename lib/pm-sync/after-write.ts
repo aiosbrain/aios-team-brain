@@ -94,7 +94,18 @@ export async function projectChangedTasksAfterWrite(
     // changed-rows tail) that the "task edit doesn't appear in Linear" gap was about.
     await recordProjectionRun(db, { teamId, provider: primary.provider, trigger: "api", reports, startedAt });
     return reports;
-  } catch {
+  } catch (err) {
+    // A throw BEFORE recordProjectionRun (e.g. resolvePrimaryProvider / the tasks select) would
+    // otherwise make a failed projection invisible. Record it so "the edit never reached Linear/Plane"
+    // is diagnosable on the PM-sync health card instead of a silent empty return.
+    await recordProjectionRun(db, {
+      teamId,
+      provider: null,
+      trigger: "api",
+      reports: [],
+      reason: err instanceof Error ? err.message : String(err),
+      startedAt,
+    });
     return [];
   }
 }

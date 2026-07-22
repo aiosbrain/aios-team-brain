@@ -37,14 +37,35 @@ export interface IngestResult {
   changedTaskRowKeys?: string[];
 }
 
+/** Order-insensitive JSON for comparing frontmatter to its jsonb-stored form (Postgres normalizes
+ *  object key order; the normalizers emit insertion order). Recursively sorts object keys; array order
+ *  is preserved (meaningful + jsonb-preserved). So `canonicalJson(a) === canonicalJson(b)` iff the two
+ *  frontmatters are semantically equal, avoiding a needless rewrite on every unchanged re-push. */
+function canonicalJson(value: unknown): string {
+  const norm = (v: unknown): unknown => {
+    if (Array.isArray(v)) return v.map(norm);
+    if (v && typeof v === "object") {
+      const o = v as Record<string, unknown>;
+      return Object.keys(o)
+        .sort()
+        .reduce<Record<string, unknown>>((acc, k) => ((acc[k] = norm(o[k])), acc), {});
+    }
+    return v;
+  };
+  return JSON.stringify(norm(value));
+}
+
 export async function ingestItem(
   db: DbClient,
   auth: { teamId: string; memberId: string; apiKeyId: string },
   payload: ItemPayload,
   access: "team" | "external",
-  // INTERNAL-only attribution override (NOT on the wire ItemPayload, so external pushers can't
-  // spoof authorship). When an internal caller already knows the content's author — e.g. the
-  // codebase scanner attributing a commit to a resolved member — it passes that here; otherwise
+  // Attribution override, set by the CALLER (never a raw wire field). Internal callers that already
+  // know the author pass it (the codebase scanner; the pm-sync per-author paths). The `/api/v1/items`
+  // route DERIVES it from the push's frontmatter via `attributeIncomingItem` — but ONLY for trusted
+  // TEAM-tier keys (it skips external-tier keys), so an untrusted external pusher still can't spoof
+  // authorship onto a team member. When an internal caller already knows the content's author it
+  // passes that here; otherwise
   // (opts omitted entirely) the item is attributed to the ingesting actor (`auth.memberId`). A
   // caller that HAS attempted resolution but come up empty must pass `authorMemberId: null`
   // explicitly (not omit opts) — that's the only way to say "leave this unattributed" rather than
@@ -66,7 +87,7 @@ export async function ingestItem(
   // 2. existing item?
   const { data: existing } = await db
     .from("items")
-    .select("id, content_sha256")
+    .select("id, content_sha256, member_id, member_id_locked, frontmatter")
     .eq("team_id", auth.teamId)
     .eq("project_id", project.id)
     .eq("path", payload.path)
@@ -79,7 +100,55 @@ export async function ingestItem(
     // re-pushes every unchanged item, so an `item.unchanged` audit here added ~one row/item/tick
     // (~24k/day at 500 items) — unbounded audit_log growth with no diagnostic value. The synced_at
     // bump is the freshness signal; create/update/delete stay audited on the paths below.
-    await db.from("items").update({ synced_at: now }).eq("id", existing.id);
+    //
+    // HEAL ATTRIBUTION on an unchanged re-push: `content_sha256` covers only body+title, so a resolved
+    // author that arrived AFTER first ingest (a source that only later exposes authorship, e.g. Notion
+    // enrichment, or a first-ingest API flake) would otherwise be discarded here forever. Rescue it —
+    // but ONLY when the item is currently UNATTRIBUTED (`member_id` null). We never RE-POINT an
+    // already-attributed item on a routine unchanged re-push: doing so would auto-revert a deliberate
+    // admin re-attribution (the NL correction / "Re-attribute content") on the very next sync, and
+    // clobber a human self-push's own attribution. Re-pointing an existing (wrong) attribution stays the
+    // job of the explicit, admin-triggered `reattributeItems` batch. Never clears to null either (a
+    // connector's unresolved re-push passes `authorMemberId: null`).
+    // …and NEVER when the attribution is LOCKED (a deliberate correction — incl. a "correct-to-nobody"
+    // whose member_id is null): the lock is what stops this null→member fill from refilling it.
+    const locked = (existing as { member_id_locked?: boolean | null }).member_id_locked === true;
+    const patch: { synced_at: string; member_id?: string; frontmatter?: Record<string, unknown> } = { synced_at: now };
+    if (opts?.authorMemberId && existing.member_id === null && !locked) {
+      patch.member_id = opts.authorMemberId;
+    }
+    // HEAL FRONTMATTER on an unchanged re-push: `content_sha256` covers only the body, but source-derived
+    // metadata in frontmatter can change while the body doesn't — a Linear issue transitions Backlog →
+    // In Progress (its prose unchanged), or a source later exposes richer `authors[]`. Without this, the
+    // stored frontmatter is frozen at first ingest, so status-gated reads (arc eligibility) and the
+    // reattribute batch (reads stored frontmatter) act on stale metadata forever.
+    const existingFm = (existing as { frontmatter: Record<string, unknown> | null }).frontmatter ?? {};
+    const healedFm: Record<string, unknown> = { ...(payload.frontmatter ?? {}) };
+    // Preserve BEST-EFFORT/backfilled author keys the store has but this push omits (e.g. github-files'
+    // commits-lookup or the author backfill script populated them, and a transient lookup failure this
+    // tick left them off the payload) — refreshing must not wipe them.
+    for (const k of ["author", "author_email", "author_login"]) {
+      if (existingFm[k] !== undefined && healedFm[k] === undefined) healedFm[k] = existingFm[k];
+    }
+    // Compare canonically (jsonb normalizes object key order; the normalizer emits insertion order), so we
+    // write ONLY on a real metadata change — not every tick on a key-order-only mismatch.
+    if (canonicalJson(existingFm) !== canonicalJson(healedFm)) {
+      patch.frontmatter = healedFm;
+    }
+    await db.from("items").update(patch).eq("id", existing.id);
+    // Audit the rare heal (a genuine attribution change — unlike the per-tick synced_at bump, so it
+    // doesn't reintroduce the M4 unbounded-growth problem), so the change isn't a silent DB mutation.
+    if (patch.member_id) {
+      await audit(db, {
+        team_id: auth.teamId,
+        actor_kind: "system",
+        member_id: null,
+        action: "item.attribution_healed",
+        target_type: "items",
+        target_id: existing.id,
+        meta: { to: patch.member_id, source: payload.frontmatter?.source ?? null },
+      });
+    }
     // No projection on an unchanged push (the route also guards status !== "unchanged").
     return { status: "unchanged", id: existing.id, projectId: project.id };
   }
@@ -120,7 +189,12 @@ export async function ingestItem(
 
   let itemId: string;
   if (existing) {
-    const { error } = await db.from("items").update(itemRecord).eq("id", existing.id);
+    // A LOCKED item's attribution was set by a deliberate correction — preserve it even across a real
+    // content edit (dropping member_id from the update keeps the stored, corrected value). Without this
+    // the changed-body path would re-resolve member_id from frontmatter and silently undo the correction.
+    const updateRecord: Partial<typeof itemRecord> = { ...itemRecord };
+    if ((existing as { member_id_locked?: boolean | null }).member_id_locked) delete updateRecord.member_id;
+    const { error } = await db.from("items").update(updateRecord).eq("id", existing.id);
     if (error) throw new Error(`item update failed: ${error.message}`);
     itemId = existing.id;
   } else {

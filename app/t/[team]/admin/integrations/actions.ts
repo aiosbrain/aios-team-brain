@@ -399,6 +399,85 @@ export async function setAnsweringProvider(
   return { ok: true };
 }
 
+/**
+ * Set the answering role as a PROVIDER + MODEL pair (admins only; audited). Writes both in one action:
+ * `teams.answering_provider` = provider, and the provider's `config.model` = model (cloud providers —
+ * anthropic/openai/openrouter; `local`'s model is env-driven so its model box is ignored). This is the
+ * unified control behind the Admin "Answering model" picker. If the chosen backend isn't configured,
+ * selectLlmBackend falls back to auto (surfaced in the admin indicator).
+ */
+export async function setAnsweringModel(
+  teamSlug: string,
+  provider: AnsweringProvider,
+  model: string
+): Promise<{ ok: boolean; error?: string }> {
+  const ctx = await requireAdmin(teamSlug);
+  if (!ctx) return { ok: false, error: "admins only" };
+  const allowed: AnsweringProvider[] = ["anthropic", "openai", "openrouter", "local"];
+  if (!allowed.includes(provider)) return { ok: false, error: "invalid provider" };
+  const db = adminClient();
+  try {
+    // Persist the model on the provider's integration (local's model comes from env, so skip it).
+    if (provider !== "local") {
+      await saveProviderModel_(db, { teamId: ctx.teamId, memberId: ctx.memberId }, provider, model);
+    }
+    const { error } = await db.from("teams").update({ answering_provider: provider }).eq("id", ctx.teamId);
+    if (error) return { ok: false, error: error.message };
+    await audit(db, {
+      team_id: ctx.teamId,
+      actor_kind: "member",
+      member_id: ctx.memberId,
+      action: "team.answering_provider_set",
+      target_type: "team",
+      target_id: ctx.teamId,
+      meta: { provider, model: model.trim() || null },
+    });
+  } catch (e) {
+    if (e instanceof IntegrationConfigError) return { ok: false, error: e.message };
+    return { ok: false, error: e instanceof Error ? e.message : "could not save answering model" };
+  }
+  revalidatePath(`/t/${teamSlug}/admin/integrations`);
+  return { ok: true };
+}
+
+/**
+ * Set the reasoning role as a PROVIDER + MODEL pair (admins only; audited). Both live on `teams`:
+ * `reasoning_model` + `reasoning_provider`. An empty model clears BOTH → reasoning-role tasks reuse
+ * the query model. A null provider (with a model set) means "same provider as answering, different
+ * model" (the pre-existing behavior); a set provider runs reasoning on its own backend.
+ */
+export async function setReasoningModel(
+  teamSlug: string,
+  provider: AnsweringProvider | null,
+  model: string
+): Promise<{ ok: boolean; error?: string }> {
+  const ctx = await requireAdmin(teamSlug);
+  if (!ctx) return { ok: false, error: "admins only" };
+  const allowed: (AnsweringProvider | null)[] = [null, "anthropic", "openai", "openrouter", "local"];
+  if (!allowed.includes(provider)) return { ok: false, error: "invalid provider" };
+  const trimmed = model.trim().slice(0, 200);
+  const reasoningModel = trimmed || null;
+  // Clearing the model clears the provider too — no orphaned "reason on X" with no model to run.
+  const reasoningProvider = reasoningModel ? provider : null;
+  const db = adminClient();
+  const { error } = await db
+    .from("teams")
+    .update({ reasoning_model: reasoningModel, reasoning_provider: reasoningProvider })
+    .eq("id", ctx.teamId);
+  if (error) return { ok: false, error: error.message };
+  await audit(db, {
+    team_id: ctx.teamId,
+    actor_kind: "member",
+    member_id: ctx.memberId,
+    action: "team.reasoning_model_set",
+    target_type: "team",
+    target_id: ctx.teamId,
+    meta: { provider: reasoningProvider, model: reasoningModel },
+  });
+  revalidatePath(`/t/${teamSlug}/admin/integrations`);
+  return { ok: true };
+}
+
 export async function removeIntegration(
   teamSlug: string,
   id: string

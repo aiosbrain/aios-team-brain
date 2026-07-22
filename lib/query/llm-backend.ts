@@ -46,6 +46,36 @@ export interface LlmBackendKeys {
   openrouterModel?: string | null;
   /** Explicit override (`teams.answering_provider`); null/undefined = auto precedence. */
   activeProvider?: AnsweringProvider | null;
+  /**
+   * Optional distinct model for reasoning-heavy tasks (`teams.reasoning_model`). When set, a
+   * `role: "reasoning"` selection uses it instead of the query model. Null/undefined → reasoning
+   * tasks reuse the query model.
+   */
+  reasoningModel?: string | null;
+  /**
+   * Optional distinct PROVIDER for the reasoning model (`teams.reasoning_provider`). When set (and
+   * configured), a reasoning-role call runs on THIS provider's backend+key with `reasoningModel` —
+   * so reasoning can run on a different provider than answering (e.g. answer on OpenAI, reason on
+   * OpenRouter). Null/undefined → reasoning reuses the ANSWERING backend, just swapping the model.
+   */
+  reasoningProvider?: AnsweringProvider | null;
+}
+
+/** Which model to select: the default interactive/extraction model, or the reasoning model. */
+export type LlmRole = "query" | "reasoning";
+
+/**
+ * Whether chain-of-thought reasoning should be left ON for this call. TRUE only when a reasoning-role
+ * task actually resolved to a DISTINCT reasoning model (`teams.reasoning_model` set). When it's unset,
+ * `role:"reasoning"` falls back to the QUERY model (see selectLlmBackend) — and if that model is itself
+ * a reasoning model, leaving reasoning on lets it spend the whole token budget on hidden thinking and
+ * return empty (the starvation that blanks the Learning arcs; the query role turns reasoning off for
+ * exactly this reason). So a fallen-back reasoning role is treated like the query role: reasoning OFF.
+ * Single source of truth for the reasoning toggle — used by both selectLlmBackend (model swap) and the
+ * completion primitive (the `reasoning:{enabled:false}` flag).
+ */
+export function reasoningActive(role: LlmRole | undefined, keys: LlmBackendKeys): boolean {
+  return role === "reasoning" && nonEmpty(keys.reasoningModel);
 }
 
 export type LlmBackend =
@@ -113,16 +143,28 @@ function candidate(
  * auto precedence (OpenRouter → LLM_BASE_URL → Anthropic). `anthropic` is always available, so
  * auto never returns null.
  */
-export function selectLlmBackend(env: LlmBackendEnv, keys: LlmBackendKeys): LlmBackend {
-  if (keys.activeProvider) {
-    const forced = candidate(keys.activeProvider, env, keys);
-    if (forced) return forced;
-  }
-  return (
+export function selectLlmBackend(
+  env: LlmBackendEnv,
+  keys: LlmBackendKeys,
+  opts?: { role?: LlmRole }
+): LlmBackend {
+  const backend =
+    (keys.activeProvider ? candidate(keys.activeProvider, env, keys) : null) ??
     candidate("openrouter", env, keys) ??
     candidate("local", env, keys) ??
-    candidate("anthropic", env, keys)!
-  );
+    candidate("anthropic", env, keys)!;
+
+  // For a reasoning-role task, use the team's distinct reasoning model. It runs on its OWN provider
+  // (`reasoning_provider`) when that provider is configured, so reasoning can differ from answering in
+  // BOTH provider and model; otherwise it reuses the answering `backend`, just swapping the model.
+  // Unset reasoning model → `reasoningActive` is false, the query model on `backend` stands, and the
+  // completion primitive turns reasoning OFF (so a query model that happens to be a reasoning model
+  // can't starve the answer — the whole point).
+  if (reasoningActive(opts?.role, keys)) {
+    const reasoningBackend = (keys.reasoningProvider ? candidate(keys.reasoningProvider, env, keys) : null) ?? backend;
+    return { ...reasoningBackend, model: keys.reasoningModel!.trim() };
+  }
+  return backend;
 }
 
 /**
@@ -137,6 +179,31 @@ export function describeAnswering(
   const backend = selectLlmBackend(env, keys);
   const requested = keys.activeProvider ?? null;
   return {
+    requested,
+    provider: backend.provider,
+    model: backend.model,
+    usedFallback: requested !== null && backend.provider !== requested,
+  };
+}
+
+/**
+ * Describe the effective REASONING backend for the admin indicator. `enabled` is false when no
+ * distinct reasoning model is set (reasoning-role tasks reuse the query model — nothing to show).
+ * When enabled, returns the provider+model actually used for reasoning and whether the requested
+ * reasoning provider fell back (its backend wasn't configured, so it borrowed the answering provider).
+ */
+export function describeReasoning(
+  env: LlmBackendEnv,
+  keys: LlmBackendKeys
+): { enabled: boolean; requested: AnsweringProvider | null; provider: AnsweringProvider; model: string; usedFallback: boolean } {
+  const answering = selectLlmBackend(env, keys).provider;
+  if (!reasoningActive("reasoning", keys)) {
+    return { enabled: false, requested: null, provider: answering, model: "", usedFallback: false };
+  }
+  const backend = selectLlmBackend(env, keys, { role: "reasoning" });
+  const requested = keys.reasoningProvider ?? null;
+  return {
+    enabled: true,
     requested,
     provider: backend.provider,
     model: backend.model,

@@ -3,9 +3,11 @@ idempotency, and graceful behavior without a GitHub token."""
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from aios_ingest.analyzers.codebase import (
     _detect_scaffolding,
@@ -133,7 +135,32 @@ def test_live_scan_carries_scored_readiness(tmp_path):
     assert m["readiness_level"] == "L1"             # README + manifest
     assert isinstance(m["readiness_pct"], float)
     assert m["readiness_pillars"]["docs"]["passed"] == 1
-    assert m["readiness_rubric_version"] == "1.0.0"
+    assert m["readiness_rubric_version"] == "1.1.0"
+
+
+def test_ai_commit_detection_is_model_agnostic(tmp_path):
+    """_AI_TRAILER must recognize every AI coding tool's trailer, not just Claude's.
+
+    Shared with test/github-api-scan.test.ts's isAiAssisted suite — both detectors must
+    agree on every case in the fixture, so they can't silently diverge again the way the
+    Python-only "claude" regex and the TS AI_MARKERS list already had."""
+    fixture_path = Path(__file__).resolve().parents[2] / "test" / "fixtures" / "ai-trailer-cases.json"
+    cases = json.loads(fixture_path.read_text())
+
+    repo = _init(tmp_path)
+    (repo / "seed.txt").write_text("x")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "seed")
+
+    expected_ai_commits = 0
+    for i, case in enumerate(cases):
+        (repo / f"f{i}.txt").write_text(str(i))
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-m", case["message"])
+        expected_ai_commits += 1 if case["expected"] else 0
+
+    m = analyze_repo(str(repo), slug="x")["metrics"]
+    assert m["ai_commits_window"] == expected_ai_commits
 
 
 def test_history_points_carry_null_readiness(tmp_path):

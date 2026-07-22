@@ -6,9 +6,10 @@ import { submitForApproval, decideApproval, listPendingApprovals, ApprovalError 
 import { db, seedTeam } from "./helpers";
 
 /**
- * Spec for the approval workflow + autonomy on real Postgres (M4). Derived from the policy:
- * draft_only blocks; approval_required queues for a human decision that advances the variant;
- * auto_publish_low_risk auto-approves clean + internal content only; deciding is idempotent.
+ * Spec for the approval workflow + autonomy on real Postgres (M4, hardened by audit #1). Derived
+ * from the policy: draft_only blocks; approval_required queues for a human decision that advances the
+ * variant; auto_publish_low_risk auto-approves clean + EXTERNAL content only (internal is never
+ * auto-approved — it can't be published); deciding is idempotent.
  */
 async function generatedVariant(access: "team" | "external" = "team") {
   const seed = await seedTeam();
@@ -53,17 +54,18 @@ describe("content approvals + autonomy (real Postgres)", () => {
     expect((await getVariant(db(), seed.teamId, variantId))!.status).toBe("rejected");
   });
 
-  it("auto-approves clean internal content under auto_publish_low_risk, but queues external", async () => {
-    const internal = await generatedVariant("team");
-    await setAutonomy(db(), internal.seed.teamId, "auto_publish_low_risk");
-    const ri = await submitForApproval(db(), internal.seed.teamId, internal.variantId, { memberId: internal.seed.memberId });
-    expect(ri.outcome).toBe("auto_approved");
-    expect((await getVariant(db(), internal.seed.teamId, internal.variantId))!.status).toBe("approved");
-
+  it("auto-approves clean EXTERNAL content under auto_publish_low_risk, but queues internal", async () => {
     const external = await generatedVariant("external");
     await setAutonomy(db(), external.seed.teamId, "auto_publish_low_risk");
-    const re = await submitForApproval(db(), external.seed.teamId, external.variantId);
-    expect(re.outcome).toBe("pending");
+    const re = await submitForApproval(db(), external.seed.teamId, external.variantId, { memberId: external.seed.memberId });
+    expect(re.outcome).toBe("auto_approved");
+    expect((await getVariant(db(), external.seed.teamId, external.variantId))!.status).toBe("approved");
+
+    // Internal content is never auto-approved for publish — it routes to a human even here.
+    const internal = await generatedVariant("team");
+    await setAutonomy(db(), internal.seed.teamId, "auto_publish_low_risk");
+    const ri = await submitForApproval(db(), internal.seed.teamId, internal.variantId);
+    expect(ri.outcome).toBe("pending");
   });
 
   it("is idempotent on submit and refuses a second decision", async () => {

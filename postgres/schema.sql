@@ -111,17 +111,28 @@ create table if not exists teams (
   -- Explicit answering-backend override for the Query box. Null = auto precedence
   -- (OpenRouter → LLM_BASE_URL → Anthropic); otherwise force that backend (lib/query/llm-backend).
   answering_provider text check (answering_provider in ('anthropic', 'openai', 'openrouter', 'local')),
+  -- Optional distinct model for reasoning-heavy tasks (narrative arc synthesis). Null = reuse the
+  -- query model (the active provider's config.model). See lib/query/llm-backend (role="reasoning").
+  reasoning_model text,
+  -- Optional distinct PROVIDER for the reasoning model. Null = reuse the answering provider; set =
+  -- reasoning runs on its own backend (answer on one provider, reason on another).
+  reasoning_provider text check (reasoning_provider in ('anthropic', 'openai', 'openrouter', 'local')),
   created_at timestamptz not null default now()
 );
 -- Additive columns for existing deployments.
 alter table teams add column if not exists primary_pm_provider text;
 alter table teams add column if not exists answering_provider text;
+alter table teams add column if not exists reasoning_model text;
+alter table teams add column if not exists reasoning_provider text;
 do $$ begin
   if not exists (select 1 from pg_constraint where conname = 'teams_primary_pm_provider_check') then
     alter table teams add constraint teams_primary_pm_provider_check check (primary_pm_provider in ('plane', 'linear'));
   end if;
   if not exists (select 1 from pg_constraint where conname = 'teams_answering_provider_check') then
     alter table teams add constraint teams_answering_provider_check check (answering_provider in ('anthropic', 'openai', 'openrouter', 'local'));
+  end if;
+  if not exists (select 1 from pg_constraint where conname = 'teams_reasoning_provider_check') then
+    alter table teams add constraint teams_reasoning_provider_check check (reasoning_provider in ('anthropic', 'openai', 'openrouter', 'local'));
   end if;
 end $$;
 
@@ -331,6 +342,537 @@ create trigger audit_log_protect
   before update or delete on audit_log
   for each row execute function audit_protect();
 
+-- ── managed execution gateway (brain-api v1.10; disabled until later slices) ─
+-- These tables are server-only. There is no RLS backstop: every application lookup
+-- must bind team + member + Executor subject through lib/gateway/persistence.ts.
+-- Gateway audit and execution history are compliance records. Their team/member FKs
+-- intentionally RESTRICT deletion; operators revoke operational rows instead.
+create unique index if not exists members_team_id_id_unq on members (team_id, id);
+
+create table if not exists gateway_service_identities (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete restrict,
+  environment text not null check (environment <> ''),
+  credential_id text not null unique check (credential_id ~ '^[A-Za-z0-9_-]{22}$'),
+  credential_hash text not null check (credential_hash ~ '^[0-9a-f]{64}$'),
+  credential_version integer not null default 1 check (credential_version > 0),
+  rotated_from_id uuid references gateway_service_identities(id) on delete restrict,
+  activated_at timestamptz not null default now(),
+  expires_at timestamptz,
+  revoked_at timestamptz,
+  last_authenticated_at timestamptz,
+  created_at timestamptz not null default now(),
+  unique (team_id, id),
+  check (expires_at is null or expires_at > activated_at),
+  check (revoked_at is null or revoked_at >= activated_at)
+);
+create index if not exists gateway_service_identities_team_env_idx
+  on gateway_service_identities (team_id, environment);
+
+do $$
+declare legacy record;
+begin
+  for legacy in
+    select credential_id,credential_hash,credential_version
+      from gateway_service_identities
+  loop
+    begin
+      if legacy.credential_id !~ '^[A-Za-z0-9_-]{22}$'
+        or legacy.credential_hash !~ '^[0-9a-f]{64}$'
+        or legacy.credential_version <= 0
+        or octet_length(decode(translate(legacy.credential_id,'-_','+/') || '==','base64')) <> 16
+        or translate(rtrim(encode(
+             decode(translate(legacy.credential_id,'-_','+/') || '==','base64'),
+             'base64'
+           ),'='),'+/','-_') <> legacy.credential_id then
+        raise exception 'gateway_service_identity_legacy_preflight';
+      end if;
+    exception when others then
+      raise exception 'gateway_service_identity_legacy_preflight';
+    end;
+  end loop;
+end $$;
+
+create table if not exists gateway_service_credentials (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null,
+  service_identity_id uuid not null,
+  credential_id text not null unique check (credential_id ~ '^[A-Za-z0-9_-]{22}$'),
+  version integer not null check (version > 0),
+  secret_hash text not null check (secret_hash ~ '^[0-9a-f]{64}$'),
+  replaces_credential_id text,
+  activated_at timestamptz not null default now(),
+  expires_at timestamptz,
+  revoked_at timestamptz,
+  last_authenticated_at timestamptz,
+  created_by_member_id uuid,
+  created_at timestamptz not null default now(),
+  unique (team_id, id),
+  unique (service_identity_id, version),
+  foreign key (team_id, service_identity_id)
+    references gateway_service_identities(team_id, id) on delete restrict,
+  foreign key (team_id, created_by_member_id)
+    references members(team_id, id) on delete restrict,
+  check (expires_at is null or expires_at > activated_at),
+  check (revoked_at is null or revoked_at >= activated_at)
+);
+create index if not exists gateway_service_credentials_identity_idx
+  on gateway_service_credentials (team_id, service_identity_id, created_at desc);
+
+create table if not exists executor_subject_bindings (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null,
+  member_id uuid not null,
+  service_identity_id uuid not null,
+  executor_tenant_id text not null check (executor_tenant_id <> ''),
+  executor_subject_id text not null check (executor_subject_id <> ''),
+  bound_at timestamptz not null default now(),
+  expires_at timestamptz,
+  revoked_at timestamptz,
+  created_at timestamptz not null default now(),
+  unique (team_id, id),
+  unique (team_id, member_id, id),
+  unique (team_id, member_id, service_identity_id, id),
+  unique (service_identity_id, executor_tenant_id, executor_subject_id),
+  foreign key (team_id, member_id) references members(team_id, id) on delete restrict,
+  foreign key (team_id, service_identity_id)
+    references gateway_service_identities(team_id, id) on delete restrict,
+  check (expires_at is null or expires_at > bound_at),
+  check (revoked_at is null or revoked_at >= bound_at)
+);
+create unique index if not exists executor_subject_bindings_active_member_unq
+  on executor_subject_bindings (team_id, member_id, service_identity_id)
+  where revoked_at is null;
+
+create table if not exists gateway_connections (
+  id uuid primary key default gen_random_uuid(),
+  connection_ref text not null unique check (connection_ref <> ''),
+  team_id uuid not null,
+  member_id uuid not null,
+  service_identity_id uuid not null,
+  subject_binding_id uuid not null,
+  provider text not null default 'github' check (provider = 'github'),
+  credential_ciphertext text not null check (credential_ciphertext <> ''),
+  enabled boolean not null default true,
+  credential_expires_at timestamptz,
+  validated_at timestamptz,
+  revoked_at timestamptz,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  unique (team_id, id),
+  unique (team_id, member_id, id),
+  unique (team_id, member_id, service_identity_id, id),
+  foreign key (team_id, member_id) references members(team_id, id) on delete restrict,
+  foreign key (team_id, service_identity_id)
+    references gateway_service_identities(team_id, id) on delete restrict,
+  foreign key (team_id, member_id, service_identity_id, subject_binding_id)
+    references executor_subject_bindings(team_id, member_id, service_identity_id, id) on delete restrict,
+  check ((enabled and revoked_at is null) or (not enabled))
+);
+create unique index if not exists gateway_connections_active_member_unq
+  on gateway_connections (team_id, member_id)
+  where enabled and revoked_at is null;
+
+create table if not exists gateway_resolution_leases (
+  id uuid primary key default gen_random_uuid(),
+  lease_hash text not null unique check (lease_hash ~ '^[0-9a-f]{64}$'),
+  nonce uuid not null default gen_random_uuid(),
+  audience text not null check (audience <> ''),
+  team_id uuid not null,
+  member_id uuid not null,
+  service_identity_id uuid not null,
+  subject_binding_id uuid not null,
+  connection_id uuid not null,
+  policy_version text not null check (policy_version ~ '^[0-9a-f]{64}$'),
+  created_at timestamptz not null default now(),
+  expires_at timestamptz not null,
+  consumed_at timestamptz,
+  revoked_at timestamptz,
+  unique (team_id, id),
+  unique (team_id, member_id, service_identity_id, subject_binding_id, connection_id, id),
+  foreign key (team_id, member_id) references members(team_id, id) on delete restrict,
+  foreign key (team_id, service_identity_id)
+    references gateway_service_identities(team_id, id) on delete restrict,
+  foreign key (team_id, member_id, service_identity_id, subject_binding_id)
+    references executor_subject_bindings(team_id, member_id, service_identity_id, id) on delete restrict,
+  foreign key (team_id, member_id, service_identity_id, connection_id)
+    references gateway_connections(team_id, member_id, service_identity_id, id) on delete restrict,
+  check (expires_at > created_at and expires_at <= created_at + interval '30 seconds'),
+  check (consumed_at is null or consumed_at >= created_at),
+  check (revoked_at is null or revoked_at >= created_at)
+);
+create index if not exists gateway_resolution_leases_scope_idx
+  on gateway_resolution_leases (team_id, member_id, subject_binding_id, connection_id);
+
+create table if not exists gateway_executions (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null,
+  member_id uuid not null,
+  service_identity_id uuid not null,
+  subject_binding_id uuid not null,
+  connection_id uuid not null,
+  lease_id uuid not null unique,
+  correlation_id uuid not null,
+  idempotency_key text not null check (idempotency_key <> ''),
+  toolkit text not null check (toolkit <> ''),
+  tool text not null check (tool <> ''),
+  request_hash text not null check (request_hash ~ '^[0-9a-f]{64}$'),
+  encrypted_request_envelope bytea not null
+    check (octet_length(encrypted_request_envelope) between 1 and 65536),
+  actor_snapshot text not null,
+  role_snapshot text not null check (role_snapshot in ('admin', 'lead', 'member')),
+  tier_snapshot text not null check (tier_snapshot in ('team', 'external')),
+  policy_resource text not null,
+  request_envelope_hash text not null check (request_envelope_hash ~ '^[0-9a-f]{64}$'),
+  resume_fingerprint text check (resume_fingerprint is null or resume_fingerprint ~ '^[0-9a-f]{64}$'),
+  claim_idempotency_key text,
+  claimed_credential_id uuid,
+  decision text not null check (decision in ('block', 'require_approval', 'allow')),
+  state text not null check (state in
+    ('blocked', 'approval_required', 'approved', 'claimed', 'succeeded', 'failed', 'cancelled', 'expired')),
+  policy_version text,
+  policy_rule_id text,
+  claimed_at timestamptz,
+  claimed_by_correlation_id uuid,
+  outcome_classification text check (outcome_classification in
+    ('success', 'blocked', 'approval_required', 'credential', 'network', 'upstream',
+     'response_too_large', 'internal')),
+  upstream_status_class text check (upstream_status_class in ('2xx', '3xx', '4xx', '5xx')),
+  response_bytes bigint check (response_bytes is null or response_bytes >= 0),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  unique (service_identity_id, idempotency_key),
+  unique (team_id, id),
+  unique (team_id, member_id, id),
+  foreign key (team_id, member_id) references members(team_id, id) on delete restrict,
+  foreign key (team_id, service_identity_id)
+    references gateway_service_identities(team_id, id) on delete restrict,
+  foreign key (team_id, member_id, subject_binding_id)
+    references executor_subject_bindings(team_id, member_id, id) on delete restrict,
+  foreign key (team_id, member_id, connection_id)
+    references gateway_connections(team_id, member_id, id) on delete restrict,
+  foreign key (team_id, member_id, service_identity_id, subject_binding_id, connection_id, lease_id)
+    references gateway_resolution_leases(team_id, member_id, service_identity_id, subject_binding_id, connection_id, id)
+    on delete restrict
+);
+create index if not exists gateway_executions_scope_idx
+  on gateway_executions (team_id, member_id, subject_binding_id, created_at desc);
+
+-- Additive replay path for deployments whose gateway_executions table predates AIO-407.
+alter table gateway_executions add column if not exists actor_snapshot text;
+alter table gateway_executions add column if not exists role_snapshot text;
+alter table gateway_executions add column if not exists tier_snapshot text;
+alter table gateway_executions add column if not exists policy_resource text;
+alter table gateway_executions add column if not exists request_envelope_hash text;
+alter table gateway_executions add column if not exists resume_fingerprint text;
+alter table gateway_executions add column if not exists claim_idempotency_key text;
+alter table gateway_executions add column if not exists claimed_credential_id uuid;
+update gateway_executions e
+   set actor_snapshot=coalesce(e.actor_snapshot,m.actor_handle),
+       role_snapshot=coalesce(e.role_snapshot,m.role::text),
+       tier_snapshot=coalesce(e.tier_snapshot,m.tier::text),
+       policy_resource=coalesce(e.policy_resource,'github.repository:*'),
+       request_envelope_hash=coalesce(e.request_envelope_hash,
+         encode(sha256(e.encrypted_request_envelope),'hex'))
+  from members m where m.id=e.member_id and m.team_id=e.team_id
+    and (e.actor_snapshot is null or e.role_snapshot is null or e.tier_snapshot is null
+      or e.policy_resource is null or e.request_envelope_hash is null);
+alter table gateway_executions alter column actor_snapshot set not null;
+alter table gateway_executions alter column role_snapshot set not null;
+alter table gateway_executions alter column tier_snapshot set not null;
+alter table gateway_executions alter column policy_resource set not null;
+alter table gateway_executions alter column request_envelope_hash set not null;
+alter table gateway_executions drop constraint if exists gateway_executions_role_snapshot_check;
+alter table gateway_executions add constraint gateway_executions_role_snapshot_check
+  check (role_snapshot in ('admin','lead','member'));
+alter table gateway_executions drop constraint if exists gateway_executions_tier_snapshot_check;
+alter table gateway_executions add constraint gateway_executions_tier_snapshot_check
+  check (tier_snapshot in ('team','external'));
+alter table gateway_executions drop constraint if exists gateway_executions_request_envelope_hash_check;
+alter table gateway_executions add constraint gateway_executions_request_envelope_hash_check
+  check (request_envelope_hash ~ '^[0-9a-f]{64}$');
+alter table gateway_executions drop constraint if exists gateway_executions_resume_fingerprint_check;
+alter table gateway_executions add constraint gateway_executions_resume_fingerprint_check
+  check (resume_fingerprint is null or resume_fingerprint ~ '^[0-9a-f]{64}$');
+alter table gateway_executions drop constraint if exists gateway_executions_claimed_credential_fk;
+alter table gateway_executions add constraint gateway_executions_claimed_credential_fk
+  foreign key (team_id,claimed_credential_id)
+  references gateway_service_credentials(team_id,id) on delete restrict;
+
+create table if not exists gateway_approvals (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null,
+  execution_id uuid not null unique,
+  status text not null default 'pending'
+    check (status in ('pending', 'approved', 'denied', 'expired', 'cancelled')),
+  expires_at timestamptz not null,
+  approver_member_id uuid,
+  decided_at timestamptz,
+  decision_correlation_id uuid,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  unique (team_id, id),
+  foreign key (team_id, execution_id) references gateway_executions(team_id, id) on delete restrict,
+  foreign key (team_id, approver_member_id) references members(team_id, id) on delete restrict,
+  check (expires_at > created_at and expires_at <= created_at + interval '15 minutes'),
+  check ((status = 'pending' and decided_at is null and approver_member_id is null)
+      or (status <> 'pending' and decided_at is not null))
+);
+alter table gateway_approvals add column if not exists decision_correlation_id uuid;
+
+create table if not exists gateway_audit_log (
+  id bigint generated always as identity primary key,
+  team_id uuid not null references teams(id) on delete restrict,
+  member_id uuid,
+  service_identity_id uuid,
+  subject_binding_id uuid,
+  connection_id uuid,
+  execution_id uuid,
+  approval_id uuid,
+  credential_row_id uuid,
+  event text not null check (event in
+    ('lease_issued', 'decision_blocked', 'decision_approval_required', 'decision_allowed',
+     'approval_approved', 'approval_denied', 'approval_expired', 'approval_cancelled',
+     'execution_claimed', 'outcome_recorded', 'connection_revoked',
+     'service_identity_revoked', 'credential_rotated', 'credential_revoked',
+     'policy_created', 'policy_updated', 'policy_deleted')),
+  toolkit text,
+  tool text,
+  request_hash text check (request_hash is null or request_hash ~ '^[0-9a-f]{64}$'),
+  policy_version text,
+  policy_rule_id text,
+  decision text check (decision is null or decision in ('block', 'require_approval', 'allow')),
+  correlation_id uuid not null,
+  idempotency_key text,
+  outcome_classification text check (outcome_classification is null or outcome_classification in
+    ('success', 'blocked', 'approval_required', 'credential', 'network', 'upstream',
+     'response_too_large', 'internal')),
+  upstream_status_class text check (upstream_status_class is null or upstream_status_class in
+    ('2xx', '3xx', '4xx', '5xx')),
+  response_bytes bigint check (response_bytes is null or response_bytes >= 0),
+  duration_ms integer check (duration_ms is null or duration_ms >= 0),
+  created_at timestamptz not null default now(),
+  foreign key (team_id, member_id) references members(team_id, id) on delete restrict,
+  foreign key (team_id, service_identity_id)
+    references gateway_service_identities(team_id, id) on delete restrict,
+  foreign key (team_id, subject_binding_id)
+    references executor_subject_bindings(team_id, id) on delete restrict,
+  foreign key (team_id, connection_id)
+    references gateway_connections(team_id, id) on delete restrict,
+  foreign key (team_id, execution_id)
+    references gateway_executions(team_id, id) on delete restrict,
+  foreign key (team_id, approval_id)
+    references gateway_approvals(team_id, id) on delete restrict
+);
+alter table gateway_audit_log add column if not exists credential_row_id uuid;
+alter table gateway_audit_log drop constraint if exists gateway_audit_log_credential_row_fk;
+alter table gateway_audit_log add constraint gateway_audit_log_credential_row_fk
+  foreign key (team_id,credential_row_id)
+  references gateway_service_credentials(team_id,id) on delete restrict;
+alter table gateway_audit_log drop constraint if exists gateway_audit_log_event_check;
+alter table gateway_audit_log add constraint gateway_audit_log_event_check check (event in
+  ('lease_issued','decision_blocked','decision_approval_required','decision_allowed',
+   'approval_approved','approval_denied','approval_expired','approval_cancelled',
+   'execution_claimed','outcome_recorded','connection_revoked',
+   'service_identity_revoked','credential_rotated','credential_revoked',
+   'policy_created','policy_updated','policy_deleted'));
+create index if not exists gateway_audit_log_team_time_idx
+  on gateway_audit_log (team_id, created_at desc);
+create unique index if not exists gateway_audit_log_outcome_execution_unq
+  on gateway_audit_log (execution_id) where event='outcome_recorded';
+create unique index if not exists gateway_audit_log_decision_approval_unq
+  on gateway_audit_log (approval_id) where event in ('approval_approved','approval_denied');
+create unique index if not exists gateway_audit_log_claim_execution_unq
+  on gateway_audit_log (execution_id) where event='execution_claimed';
+create unique index if not exists gateway_audit_log_expiry_approval_unq
+  on gateway_audit_log (approval_id) where event='approval_expired';
+create unique index if not exists gateway_audit_log_cancel_approval_unq
+  on gateway_audit_log (approval_id) where event='approval_cancelled';
+create unique index if not exists gateway_audit_log_rotation_credential_unq
+  on gateway_audit_log (credential_row_id) where event='credential_rotated';
+create unique index if not exists gateway_audit_log_revocation_credential_unq
+  on gateway_audit_log (credential_row_id) where event='credential_revoked';
+
+create table if not exists gateway_rate_limits (
+  bucket text not null,
+  window_start timestamptz not null,
+  count integer not null check (count > 0),
+  primary key (bucket, window_start)
+);
+
+create or replace function gateway_audit_protect()
+returns trigger language plpgsql as $$
+begin
+  raise exception 'gateway_audit_log is append-only';
+end $$;
+drop trigger if exists gateway_audit_log_protect on gateway_audit_log;
+create trigger gateway_audit_log_protect
+  before update or delete on gateway_audit_log
+  for each row execute function gateway_audit_protect();
+
+create or replace function gateway_execution_protect()
+returns trigger language plpgsql as $$
+begin
+  if tg_op = 'DELETE' then
+    raise exception 'gateway_executions are retained';
+  end if;
+  if new.team_id is distinct from old.team_id
+    or new.member_id is distinct from old.member_id
+    or new.service_identity_id is distinct from old.service_identity_id
+    or new.subject_binding_id is distinct from old.subject_binding_id
+    or new.connection_id is distinct from old.connection_id
+    or new.lease_id is distinct from old.lease_id
+    or new.correlation_id is distinct from old.correlation_id
+    or new.idempotency_key is distinct from old.idempotency_key
+    or new.toolkit is distinct from old.toolkit
+    or new.tool is distinct from old.tool
+    or new.request_hash is distinct from old.request_hash
+    or new.encrypted_request_envelope is distinct from old.encrypted_request_envelope
+    or new.actor_snapshot is distinct from old.actor_snapshot
+    or new.role_snapshot is distinct from old.role_snapshot
+    or new.tier_snapshot is distinct from old.tier_snapshot
+    or new.policy_resource is distinct from old.policy_resource
+    or new.request_envelope_hash is distinct from old.request_envelope_hash
+    or (old.resume_fingerprint is not null and new.resume_fingerprint is distinct from old.resume_fingerprint)
+    or (old.claim_idempotency_key is not null and new.claim_idempotency_key is distinct from old.claim_idempotency_key)
+    or (old.claimed_credential_id is not null and new.claimed_credential_id is distinct from old.claimed_credential_id)
+    or new.decision is distinct from old.decision
+    or new.policy_version is distinct from old.policy_version
+    or new.policy_rule_id is distinct from old.policy_rule_id
+    or new.created_at is distinct from old.created_at then
+    raise exception 'gateway execution identity/request fields are immutable';
+  end if;
+  return new;
+end $$;
+drop trigger if exists gateway_executions_protect on gateway_executions;
+create trigger gateway_executions_protect
+  before update or delete on gateway_executions
+  for each row execute function gateway_execution_protect();
+
+create or replace function gateway_approval_protect()
+returns trigger language plpgsql as $$
+begin
+  if tg_op = 'DELETE' then
+    raise exception 'gateway_approvals are retained';
+  end if;
+  if new.team_id is distinct from old.team_id
+    or new.execution_id is distinct from old.execution_id
+    or new.expires_at is distinct from old.expires_at
+    or (old.approver_member_id is not null
+        and new.approver_member_id is distinct from old.approver_member_id)
+    or (old.decided_at is not null and new.decided_at is distinct from old.decided_at)
+    or (old.decision_correlation_id is not null
+        and new.decision_correlation_id is distinct from old.decision_correlation_id)
+    or new.created_at is distinct from old.created_at then
+    raise exception 'gateway approval identity/expiry fields are immutable';
+  end if;
+  if new.status is distinct from old.status
+    and not (
+      (old.status='pending' and new.status in ('approved','denied','expired','cancelled'))
+      or (old.status='approved' and new.status in ('expired','cancelled'))
+    ) then
+    raise exception 'gateway approval transition is invalid';
+  end if;
+  return new;
+end $$;
+drop trigger if exists gateway_approvals_protect on gateway_approvals;
+create trigger gateway_approvals_protect
+  before update or delete on gateway_approvals
+  for each row execute function gateway_approval_protect();
+
+create or replace function gateway_service_identity_protect()
+returns trigger language plpgsql as $$
+begin
+  if tg_op = 'DELETE' then raise exception 'gateway service identities must be revoked, not deleted'; end if;
+  if new.id is distinct from old.id or new.team_id is distinct from old.team_id
+    or new.environment is distinct from old.environment or new.credential_id is distinct from old.credential_id
+    or new.credential_hash is distinct from old.credential_hash or new.credential_version is distinct from old.credential_version
+    or new.rotated_from_id is distinct from old.rotated_from_id or new.activated_at is distinct from old.activated_at
+    or new.created_at is distinct from old.created_at then
+    raise exception 'gateway service identity fields are immutable';
+  end if; return new;
+end $$;
+drop trigger if exists gateway_service_identities_protect on gateway_service_identities;
+create trigger gateway_service_identities_protect before update or delete on gateway_service_identities
+  for each row execute function gateway_service_identity_protect();
+
+create or replace function gateway_service_credential_protect()
+returns trigger language plpgsql as $$
+begin
+  if tg_op = 'DELETE' then
+    raise exception 'gateway service credentials must be revoked, not deleted';
+  end if;
+  if new.id is distinct from old.id
+    or new.team_id is distinct from old.team_id
+    or new.service_identity_id is distinct from old.service_identity_id
+    or new.credential_id is distinct from old.credential_id
+    or new.version is distinct from old.version
+    or new.secret_hash is distinct from old.secret_hash
+    or new.replaces_credential_id is distinct from old.replaces_credential_id
+    or new.activated_at is distinct from old.activated_at
+    or new.expires_at is distinct from old.expires_at
+    or new.created_by_member_id is distinct from old.created_by_member_id
+    or (old.revoked_at is not null and new.revoked_at is distinct from old.revoked_at)
+    or new.created_at is distinct from old.created_at then
+    raise exception 'gateway service credential identity fields are immutable';
+  end if;
+  return new;
+end $$;
+drop trigger if exists gateway_service_credentials_protect on gateway_service_credentials;
+create trigger gateway_service_credentials_protect before update or delete on gateway_service_credentials
+  for each row execute function gateway_service_credential_protect();
+
+create or replace function executor_subject_binding_protect()
+returns trigger language plpgsql as $$
+begin
+  if tg_op = 'DELETE' then raise exception 'executor subject bindings must be revoked, not deleted'; end if;
+  if new.id is distinct from old.id or new.team_id is distinct from old.team_id
+    or new.member_id is distinct from old.member_id or new.service_identity_id is distinct from old.service_identity_id
+    or new.executor_tenant_id is distinct from old.executor_tenant_id
+    or new.executor_subject_id is distinct from old.executor_subject_id
+    or new.bound_at is distinct from old.bound_at or new.created_at is distinct from old.created_at then
+    raise exception 'executor subject binding identity fields are immutable';
+  end if; return new;
+end $$;
+drop trigger if exists executor_subject_bindings_protect on executor_subject_bindings;
+create trigger executor_subject_bindings_protect before update or delete on executor_subject_bindings
+  for each row execute function executor_subject_binding_protect();
+
+create or replace function gateway_connection_protect()
+returns trigger language plpgsql as $$
+begin
+  if tg_op = 'DELETE' then raise exception 'gateway connections must be revoked, not deleted'; end if;
+  if new.id is distinct from old.id or new.connection_ref is distinct from old.connection_ref
+    or new.team_id is distinct from old.team_id or new.member_id is distinct from old.member_id
+    or new.service_identity_id is distinct from old.service_identity_id
+    or new.subject_binding_id is distinct from old.subject_binding_id or new.provider is distinct from old.provider
+    or new.created_at is distinct from old.created_at then
+    raise exception 'gateway connection identity fields are immutable';
+  end if; return new;
+end $$;
+drop trigger if exists gateway_connections_protect on gateway_connections;
+create trigger gateway_connections_protect before update or delete on gateway_connections
+  for each row execute function gateway_connection_protect();
+
+create or replace function gateway_resolution_lease_protect()
+returns trigger language plpgsql as $$
+begin
+  if tg_op = 'DELETE' then raise exception 'gateway resolution leases must be revoked, not deleted'; end if;
+  if new.id is distinct from old.id or new.lease_hash is distinct from old.lease_hash
+    or new.nonce is distinct from old.nonce or new.audience is distinct from old.audience
+    or new.team_id is distinct from old.team_id or new.member_id is distinct from old.member_id
+    or new.service_identity_id is distinct from old.service_identity_id
+    or new.subject_binding_id is distinct from old.subject_binding_id
+    or new.connection_id is distinct from old.connection_id or new.policy_version is distinct from old.policy_version
+    or new.created_at is distinct from old.created_at
+    or new.expires_at is distinct from old.expires_at then
+    raise exception 'gateway resolution lease identity fields are immutable';
+  end if; return new;
+end $$;
+drop trigger if exists gateway_resolution_leases_protect on gateway_resolution_leases;
+create trigger gateway_resolution_leases_protect before update or delete on gateway_resolution_leases
+  for each row execute function gateway_resolution_lease_protect();
+
 create table if not exists rate_limits (
   bucket text not null,
   window_start timestamptz not null,
@@ -375,6 +917,9 @@ create table if not exists items (
   content_sha256 text not null,
   actor text not null default '',
   member_id uuid references members(id) on delete set null,
+  -- true when member_id was set by a deliberate admin action (NL correction / re-attribution); locked
+  -- items are skipped by auto re-attribution + the unchanged-repush heal (docs/design/attribution-propagation.md).
+  member_id_locked boolean not null default false,
   synced_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   search tsvector generated always as
@@ -545,10 +1090,14 @@ create table if not exists meeting_notes (
   title text not null,
   summary text not null default '',
   occurred_at date,
+  -- Set when this note was merged into another (same meeting, deduped); readers hide these.
+  merged_into uuid references meeting_notes(id) on delete set null,
   created_at timestamptz not null default now(),
   unique (source_item_id)
 );
 create index if not exists meeting_notes_team_idx on meeting_notes (team_id, created_at desc);
+alter table meeting_notes add column if not exists merged_into uuid references meeting_notes(id) on delete set null;
+create index if not exists meeting_notes_merged_into_idx on meeting_notes (merged_into);
 
 -- LLM-matched roster attendees (many-to-many; an unmatched name in the transcript is simply
 -- dropped, never blocks the note from saving).
@@ -558,6 +1107,15 @@ create table if not exists meeting_note_attendees (
   primary key (meeting_note_id, member_id)
 );
 create index if not exists meeting_note_attendees_member_idx on meeting_note_attendees (member_id);
+
+-- Multiple submitters per note (Meetings merge): when two people upload the same meeting, both are
+-- credited. `meeting_notes.submitted_by` stays the primary; this holds the full set. Writer: notes.ts.
+create table if not exists meeting_note_submitters (
+  meeting_note_id uuid not null references meeting_notes(id) on delete cascade,
+  member_id uuid not null references members(id) on delete cascade,
+  primary key (meeting_note_id, member_id)
+);
+create index if not exists meeting_note_submitters_member_idx on meeting_note_submitters (member_id);
 
 create table if not exists graph_entities (
   id uuid primary key default gen_random_uuid(),
@@ -1154,6 +1712,19 @@ create table if not exists media_assets (
 create index if not exists media_assets_variant_idx on media_assets (variant_id, created_at desc);
 create index if not exists media_assets_team_day_idx on media_assets (team_id, created_at);
 
+-- Per-team-per-UTC-day image-generation counter — the atomic reservation backing the daily cost cap
+-- (audit #8). The old check-then-act on count(media_assets) raced: concurrent requests could both
+-- pass the count and both spend, over-running the cap. One row per (team, day); a slot is reserved by
+-- an atomic conditional increment (`… where count < cap`) BEFORE any provider spend, and released if
+-- the generation then fails. Single writer: lib/media/store.ts.
+create table if not exists social_image_usage (
+  team_id uuid not null references teams(id) on delete cascade,
+  day date not null,
+  count integer not null default 0,
+  updated_at timestamptz not null default now(),
+  primary key (team_id, day)
+);
+
 -- Social Brain approval workflow (M4). Per-team autonomy gate + the content-approval queue.
 -- Single writers: lib/social/settings.ts (autonomy), lib/social/approvals.ts (queue).
 create table if not exists social_settings (
@@ -1187,6 +1758,11 @@ create table if not exists social_publications (
 );
 create index if not exists social_publications_team_idx on social_publications (team_id, created_at desc);
 create index if not exists social_publications_variant_idx on social_publications (variant_id);
+-- At most ONE active (scheduled/publishing) publication per variant — the DB backstop against a
+-- double-submit race creating two live posts (audit #5). Cancelled/failed/published are unconstrained.
+create unique index if not exists social_publications_active_variant_idx
+  on social_publications (variant_id)
+  where status in ('scheduled', 'publishing');
 
 -- Normalized per-publication analytics (M6). One row per publication (latest snapshot). Typefully
 -- exposes X-only metrics. Single writer: lib/social/analytics.ts. Tier inherited from publication.

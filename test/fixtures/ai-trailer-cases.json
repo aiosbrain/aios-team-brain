@@ -1,0 +1,12 @@
+[
+  {"message": "fix: thing\n\nCo-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>", "expected": true},
+  {"message": "feat: x\n\n🤖 Generated with [Claude Code]", "expected": true},
+  {"message": "fix: thing\n\nCo-authored-by: Codex <noreply@openai.com>", "expected": true},
+  {"message": "fix: thing\n\nCo-authored-by: Cursor <cursoragent@cursor.com>", "expected": true},
+  {"message": "fix: thing\n\nCo-authored-by: OpenCode <noreply@opencode.ai>", "expected": true},
+  {"message": "chore\n\nco-authored-by: github copilot", "expected": true},
+  {"message": "fix\n\nCo-Authored-By: Devin <devin@cognition.ai>", "expected": true},
+  {"message": "fix: correct off-by-one in pager", "expected": false},
+  {"message": "Co-authored-by: Jane Dev <jane@acme.com>", "expected": false},
+  {"message": "docs: mention codex in the README", "expected": false}
+]

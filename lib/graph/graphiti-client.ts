@@ -44,6 +44,21 @@ export interface GraphEpisode {
   role?: string | null;
 }
 
+/**
+ * Coerce a timestamp to strict ISO-8601 (what Graphiti's Pydantic `datetime` accepts). Postgres
+ * `timestamptz` strings ("2026-07-09 10:39:17.281+00" — space separator, 2-digit offset) parse fine
+ * in JS `Date` but are rejected by Pydantic → 422. `new Date(...).toISOString()` yields a canonical
+ * `…Z` instant. Unparseable input falls back to now() so one bad row never wedges the whole push.
+ * Pure + exported so the fix is unit-tested.
+ */
+export function toIsoTimestamp(v: string | undefined | null): string {
+  if (v) {
+    const d = new Date(v);
+    if (!Number.isNaN(d.getTime())) return d.toISOString();
+  }
+  return new Date().toISOString();
+}
+
 /** An episode as listed by Graphiti — enough to resolve our stable `name` to its server uuid. */
 export interface GraphEpisodeRef {
   uuid: string;
@@ -113,7 +128,13 @@ export class GraphitiClient {
         body: body !== undefined ? JSON.stringify(body) : undefined,
         signal: ctrl.signal,
       });
-      if (!res.ok) throw new Error(`graphiti ${method} ${path} → ${res.status}`);
+      if (!res.ok) {
+        // Capture the response body — a FastAPI 422 carries the exact Pydantic validation detail
+        // (which field/why). Without it, a wedged projector is an undiagnosable "→ 422". Bounded so a
+        // huge error page can't blow up the log line.
+        const detail = await res.text().catch(() => "");
+        throw new Error(`graphiti ${method} ${path} → ${res.status}${detail ? `: ${detail.slice(0, 400)}` : ""}`);
+      }
       // /messages returns 202 with no useful body; /search + /episodes return JSON; DELETE returns
       // a small ack body.
       const text = await res.text();
@@ -134,7 +155,11 @@ export class GraphitiClient {
       group_id: groupId,
       messages: episodes.map((e) => ({
         content: e.content,
-        timestamp: e.timestamp,
+        // Graphiti's Message schema parses `timestamp` with strict Pydantic ISO-8601. A raw Postgres
+        // `timestamptz` string (space separator + `+00` offset, e.g. "2026-07-09 10:39:17.281+00")
+        // fails with "unexpected extra characters" → HTTP 422 on EVERY push, wedging the projector
+        // (2026-07 incident). Normalize to a real ISO-8601 instant; fall back to now() if unparseable.
+        timestamp: toIsoTimestamp(e.timestamp),
         source_description: e.sourceDescription,
         name: e.name,
         role_type: e.roleType ?? "user",

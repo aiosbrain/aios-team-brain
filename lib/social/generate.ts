@@ -2,11 +2,18 @@ import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { getBrandProfile } from "@/lib/brand/manage";
 import { listBrandAssets } from "@/lib/brand/assets";
+import { visibleByAccess } from "@/lib/auth/visibility";
 import { completeText, resolveProviderKeys, type CompleteArgs } from "./llm";
 import { governanceFromBrand, validateContent, type ContentFinding } from "./validate";
 import { getOpportunity, getPlan, getVariant, listVariants, setVariantGeneration, setVariantStatus } from "./store";
 import type { BrandProfileRecord } from "@/lib/brand/manage";
-import type { Evidence, VariantRow } from "./types";
+import type { AccessTier, ContentStatus, Evidence, VariantRow } from "./types";
+
+// A variant may (re)generate only from these statuses. Anything further along — generated,
+// awaiting_approval, approved, scheduled, publishing, published — must NOT be overwritten: doing so
+// let a governance-REJECTED regenerated body replace an already-approved one that could still fire
+// (2026-07-16 audit #3). First generation is from `planned`; `failed`/`rejected` may be retried.
+const REGENERATABLE_STATUSES: ReadonlySet<ContentStatus> = new Set(["planned", "failed", "rejected"]);
 
 /**
  * Text generation (Social Brain). Fills a planned variant's body with a draft written IN the brand
@@ -81,10 +88,26 @@ export function buildGenerationPrompt(ctx: PromptContext): CompleteArgs {
   return { system: systemLines.join(" "), prompt: userLines.join("\n") };
 }
 
-async function loadEvidenceBodies(db: DbClient, teamId: string, evidence: Evidence[]): Promise<string[]> {
+/**
+ * Load the evidence item bodies for a draft — re-asserting the tier ceiling at generation time
+ * (2026-07-16 audit #7). The evidence→tier invariant is enforced when the opportunity is created,
+ * but bodies are re-read HERE, later, so an item narrowed `external→team` (or edited to add
+ * sensitive content) after that point would otherwise leak into an `external` draft. Filtering the
+ * lookup through `visibleByAccess(access)` means an external variant only ever sees external
+ * evidence — the same choke-point the dashboard reads use.
+ */
+async function loadEvidenceBodies(
+  db: DbClient,
+  teamId: string,
+  access: AccessTier,
+  evidence: Evidence[]
+): Promise<string[]> {
   const ids = [...new Set(evidence.map((e) => e.itemId).filter((id): id is string => !!id && UUID_RE.test(id)))];
   if (ids.length === 0) return [];
-  const { data } = await db.from("items").select("id, body").eq("team_id", teamId).in("id", ids);
+  const { data } = await visibleByAccess(
+    db.from("items").select("id, body, access").eq("team_id", teamId).in("id", ids),
+    access
+  );
   return ((data ?? []) as { body: string }[]).map((r) => (r.body ?? "").replace(/\s+/g, " ").trim().slice(0, 800)).filter(Boolean);
 }
 
@@ -102,6 +125,14 @@ export async function generateVariantText(
 ): Promise<GenerateResult> {
   const variant = await getVariant(db, teamId, variantId);
   if (!variant) throw new Error(`generateVariantText: variant ${variantId} not found for team`);
+  // Guard at the writer, not just the caller loop (CLAUDE.md §2): never overwrite a variant that has
+  // advanced past drafting — a regenerated, possibly gate-rejected body must not replace one that can
+  // still fire (audit #3). First generation is from `planned`; `failed`/`rejected` may be retried.
+  if (!REGENERATABLE_STATUSES.has(variant.status)) {
+    throw new Error(
+      `generateVariantText: variant is '${variant.status}'; only ${[...REGENERATABLE_STATUSES].join("/")} may (re)generate`
+    );
+  }
   const plan = await getPlan(db, teamId, variant.plan_id);
   if (!plan) throw new Error(`generateVariantText: plan ${variant.plan_id} not found`);
   const opp = await getOpportunity(db, teamId, plan.opportunity_id);
@@ -109,7 +140,7 @@ export async function generateVariantText(
 
   const brand = opts.brand !== undefined ? opts.brand : await getBrandProfile(db, teamId);
   const assets = await listBrandAssets(db, teamId);
-  const evidence = await loadEvidenceBodies(db, teamId, opp.evidence);
+  const evidence = await loadEvidenceBodies(db, teamId, variant.access, opp.evidence);
 
   const args = buildGenerationPrompt({
     platform: variant.platform,
@@ -175,7 +206,9 @@ export async function generatePlanDrafts(
   const summary: PlanDraftsSummary = { generated: 0, blocked: 0, failed: 0, variants: [] };
 
   for (const v of variants) {
-    if (v.status === "generated") continue; // already drafted
+    // Only (re)generate from a safe status. Skipping approved/scheduled/published (and generated)
+    // prevents a regenerated, possibly gate-rejected body from replacing content that can fire (#3).
+    if (!REGENERATABLE_STATUSES.has(v.status)) continue;
     try {
       const r = await generateVariantText(db, teamId, v.id, opts);
       if (r.status === "generated") summary.generated++;

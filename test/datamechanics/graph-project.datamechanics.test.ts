@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { GraphitiClient, GraphEpisode, GraphEpisodeRef } from "@/lib/graph/graphiti-client";
-import { projectSlackToGraph, projectItemsToGraph, MAX_EPISODE_CHARS } from "@/lib/graph/project";
+import { projectSlackToGraph, projectItemsToGraph, CHUNK_CHARS, MAX_EPISODE_CHUNKS } from "@/lib/graph/project";
 import { runGraphProjection } from "@/lib/graph/run";
 import { reconcileProjectedEpisodes } from "@/lib/graph/reconcile";
 import { db, ingest, seedTeam } from "./helpers";
@@ -120,22 +120,25 @@ describe("projectItemsToGraph — all ingestions (real Postgres, mocked Graphiti
     expect(fake.pushes).toHaveLength(4);
   });
 
-  // Spec: a large item must be pushed with capped content — getzep's worker dies on any extraction
-  // exception (no per-job catch), and an oversized episode overflows the LLM output-token cap and
-  // wedges the whole queue (prod stalls 2026-06-25 / 2026-07-03). See MAX_EPISODE_CHARS.
-  it("caps oversized episode content so extraction can't overflow and wedge the worker", async () => {
+  // Spec: a large item is CHUNKED into several small episodes (not truncated to one) so each stays
+  // under Graphiti's extraction output cap — an oversized episode overflows it and never becomes facts
+  // (prod 2026-06/07), so its work would be invisible in the graph + arcs. Chunking preserves content.
+  it("chunks an oversized item into ≤ MAX_EPISODE_CHUNKS small episodes so extraction can't overflow", async () => {
     const seed = await seedTeam();
     const slug = await teamSlugFor(seed.teamId);
-    const huge = "x ".repeat(40_000); // ~80k chars, far above the cap
+    const huge = "x ".repeat(40_000); // ~80k chars, far beyond one chunk
     await ingest(seed, { kind: "deliverable", path: "notion/huge.md", body: huge, access: "team" });
 
     const fake = new FakeGraphiti();
     await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(fake) });
 
-    expect(fake.pushes).toHaveLength(1);
-    const pushed = fake.pushes[0].episodes[0].content;
-    expect(pushed.length).toBe(MAX_EPISODE_CHARS); // truncated to the cap
-    expect(huge.length).toBeGreaterThan(MAX_EPISODE_CHARS); // guard: the input really was oversized
+    expect(fake.pushes).toHaveLength(1); // one addEpisodes call for the item…
+    const eps = fake.pushes[0].episodes;
+    expect(eps.length).toBe(MAX_EPISODE_CHUNKS); // …carrying several chunk episodes, capped
+    for (const e of eps) expect(e.content.length).toBeLessThanOrEqual(CHUNK_CHARS); // each fits the extractor
+    // Multi-chunk items get the `#k` suffix; each chunk still resolves back to the one item.
+    expect(eps[0].name).toMatch(/^items:.+#0$/);
+    expect(eps[1].name).toMatch(/^items:.+#1$/);
   });
 });
 

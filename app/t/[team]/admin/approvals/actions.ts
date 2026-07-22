@@ -5,6 +5,13 @@ import { adminClient } from "@/lib/db/admin";
 import { requireTeamAdmin as requireAdmin } from "@/lib/auth/guard";
 import { resolveApproval } from "@/lib/actions";
 import { createE2BSandbox } from "@/lib/actions/sandbox/e2b";
+import { getSessionUser } from "@/lib/auth/session";
+import {
+  authorizeGatewayAdmin,
+  decideGatewayApproval,
+  GatewayAdminError,
+} from "@/lib/gateway/admin-persistence";
+import { isUuid } from "@/lib/gateway/http";
 
 /**
  * Decide a queued approval (admins only). Approve → `resolveApproval` resumes & runs the action's
@@ -33,5 +40,42 @@ export async function decideApproval(
     return { ok: true, message: `Approved${outcome.actionStatus ? ` — action ${outcome.actionStatus}` : ""}.` };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "could not decide" };
+  }
+}
+
+export async function decideManagedGatewayApproval(
+  teamSlug: string,
+  approvalId: string,
+  decision: "approve" | "deny",
+  correlationId: string,
+): Promise<{ ok: boolean; error?: string }> {
+  if (process.env.AIOS_GATEWAY_INTERNAL_ENABLED !== "true")
+    return { ok: false, error: "approval not found" };
+  if (
+    !isUuid(approvalId) ||
+    !isUuid(correlationId) ||
+    (decision !== "approve" && decision !== "deny")
+  )
+    return { ok: false, error: "invalid request" };
+  const user = await getSessionUser();
+  if (!user) return { ok: false, error: "admins only" };
+  try {
+    const ctx = await authorizeGatewayAdmin(teamSlug, user.id);
+    await decideGatewayApproval(
+      ctx,
+      approvalId,
+      decision,
+      correlationId,
+    );
+    revalidatePath(`/t/${teamSlug}/admin/approvals`);
+    return { ok: true };
+  } catch (error) {
+    return {
+      ok: false,
+      error:
+        error instanceof GatewayAdminError
+          ? error.code
+          : "could not decide",
+    };
   }
 }

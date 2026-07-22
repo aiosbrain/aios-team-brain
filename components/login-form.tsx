@@ -62,11 +62,6 @@ export function LoginForm({ next, magicLinkAvailable }: { next?: string; magicLi
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email, next }),
       });
-      if (res.status === 403) {
-        setState("error");
-        setError("That email isn't recognized. Team Brain is invite-only — ask your admin to add you.");
-        return;
-      }
       if (res.status === 429) {
         setState("error");
         setError("Too many attempts — try again in a minute.");
@@ -86,8 +81,8 @@ export function LoginForm({ next, magicLinkAvailable }: { next?: string; magicLi
         <Mail className="size-8 text-violet" strokeWidth={1.5} />
         <p className="text-sm font-medium text-ink">Check your email</p>
         <p className="text-sm text-ink-secondary">
-          We sent a sign-in link to <span className="text-ink">{email}</span>. It&apos;s single-use and
-          expires in 15 minutes.
+          If <span className="text-ink">{email}</span> belongs to a member, we&apos;ve sent a single-use
+          sign-in link that expires in 15 minutes. Double-check the address if it doesn&apos;t arrive.
         </p>
       </div>
     );

@@ -3,7 +3,7 @@ import { serverClient } from "@/lib/db/server";
 import { adminClient } from "@/lib/db/admin";
 import { getSessionUser } from "@/lib/auth/session";
 import { errorResponse } from "@/lib/api/schemas";
-import { getProviderKey } from "@/lib/integrations/manage";
+import { resolveAnsweringKeys } from "@/lib/query/answering";
 import { getTeamWork } from "@/lib/dashboard/team-work-live";
 
 export const runtime = "nodejs";
@@ -36,11 +36,7 @@ export async function GET(req: NextRequest) {
 
   const tier = (me as { tier: "team" | "external" }).tier;
   const admin = adminClient();
-  const [openaiKey, anthropicKey] = await Promise.all([
-    getProviderKey(admin, team.id, "openai"),
-    getProviderKey(admin, team.id, "anthropic"),
-  ]);
-
-  const people = await getTeamWork(admin, team.id, teamSlug, tier, { openaiKey, anthropicKey });
+  const keys = await resolveAnsweringKeys(admin, team.id);
+  const people = await getTeamWork(admin, team.id, teamSlug, tier, keys);
   return Response.json({ people, as_of: new Date().toISOString() });
 }

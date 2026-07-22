@@ -6,19 +6,16 @@ import {
   aggregateContributions,
   type ApiCommit,
 } from "@/lib/codebases/github-api-scan";
+import aiTrailerCases from "@/test/fixtures/ai-trailer-cases.json";
 
 // Spec: the GitHub-API sync must derive per-(author, day) contributions and AI-assist counts
 // from a commit list WITHOUT a checkout, tolerating the messy shapes GitHub returns.
 
 describe("isAiAssisted", () => {
-  it("detects known agent trailers (case-insensitive)", () => {
-    expect(isAiAssisted("fix: thing\n\nCo-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>")).toBe(true);
-    expect(isAiAssisted("feat: x\n\n🤖 Generated with [Claude Code]")).toBe(true);
-    expect(isAiAssisted("chore\n\nco-authored-by: github copilot")).toBe(true);
-  });
-  it("is false for ordinary human commits", () => {
-    expect(isAiAssisted("fix: correct off-by-one in pager")).toBe(false);
-    expect(isAiAssisted("Co-authored-by: Jane Dev <jane@acme.com>")).toBe(false);
+  // Shared with ingestion/tests/test_codebase_analyzer.py's _AI_TRAILER test — both
+  // detectors must agree on every case in the fixture, so they can't silently diverge.
+  it.each(aiTrailerCases)("$message -> $expected", ({ message, expected }) => {
+    expect(isAiAssisted(message)).toBe(expected);
   });
 });
 

@@ -98,6 +98,18 @@ export function mailerConfigured(): boolean {
   return Boolean(process.env.RESEND_API_KEY || process.env.SMTP_URL);
 }
 
+/**
+ * The trusted base URL for building emailed links (magic links, invites), from `APP_URL` only —
+ * NEVER the request Host / `x-forwarded-host`, which an attacker can spoof to point a real one-time
+ * token at their own domain (account-takeover oracle). Returns null when unset: callers must then
+ * skip delivery rather than email a link built against an untrusted host. This mirrors
+ * `magicLinkAvailable()`, which already requires `APP_URL` before the login form offers magic-link.
+ */
+export function appBaseUrl(): string | null {
+  const raw = process.env.APP_URL?.trim();
+  return raw ? raw.replace(/\/$/, "") : null;
+}
+
 /** Magic-link sign-in email (login flow). Never throws. */
 export async function sendMagicLink(email: string, link: string): Promise<void> {
   await deliver(email, "Your AIOS Team Brain sign-in link", {

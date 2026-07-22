@@ -16,24 +16,38 @@ import {
   setPrimaryPmProvider,
   saveProviderModel,
   setAnsweringProvider,
+  setAnsweringModel,
+  setReasoningModel,
   type PrimaryPmProvider,
 } from "@/app/t/[team]/admin/integrations/actions";
 import type { AnsweringProvider } from "@/lib/query/llm-backend";
 
-/** "Active answering model" state computed server-side (page.tsx) from the team's config + env. */
+/** Answering + reasoning model state computed server-side (page.tsx) from the team's config + env. */
 export interface AnsweringState {
-  /** The explicit override (teams.answering_provider), or null for auto precedence. */
+  /** The explicit answering override (teams.answering_provider), or null for auto precedence. */
   provider: AnsweringProvider | null;
-  /** Chosen answer-model slug per editable provider key (null → provider default). */
-  models: Record<"anthropic" | "openai", string | null>;
+  /** Saved answer-model slug per editable provider key (null → provider default). */
+  models: Record<"anthropic" | "openai" | "openrouter", string | null>;
   /** The backend actually resolved (provider + model) — what's answering right now. */
   effective: { provider: AnsweringProvider; model: string };
-  /** True when the override wasn't configured and the resolver fell back to auto. */
+  /** True when the answering override wasn't configured and the resolver fell back to auto. */
   usedFallback: boolean;
-  /** Whether each override target is configured (drives selectability + hints). */
+  /** Whether each provider is configured (drives selectability + hints). */
   localConfigured: boolean;
+  anthropicConfigured: boolean;
   openrouterConfigured: boolean;
   openaiConfigured: boolean;
+  /** The distinct reasoning role (teams.reasoning_provider + reasoning_model). */
+  reasoning: {
+    /** Chosen reasoning provider, or null = "same as answering". */
+    provider: AnsweringProvider | null;
+    /** Chosen reasoning model (teams.reasoning_model), or null = reuse the answering model. */
+    model: string | null;
+    /** The backend reasoning resolves to, or null when no distinct reasoning model is set. */
+    effective: { provider: AnsweringProvider; model: string } | null;
+    /** True when the requested reasoning provider wasn't configured and it fell back. */
+    usedFallback: boolean;
+  };
 }
 
 const PROVIDER_LABEL: Record<AnsweringProvider, string> = {
@@ -42,6 +56,77 @@ const PROVIDER_LABEL: Record<AnsweringProvider, string> = {
   openrouter: "OpenRouter",
   local: "Local (LLM_BASE_URL)",
 };
+
+const ROLE_PROVIDERS: AnsweringProvider[] = ["anthropic", "openai", "openrouter", "local"];
+
+/** One role's control: a provider dropdown + model input + Save, with the effective backend shown.
+ *  Used for both the Answering and Reasoning roles so they read identically. `local`'s model is
+ *  env-driven (LLM_MODEL), so its model box is disabled. */
+function RolePicker(props: {
+  title: string;
+  help: string;
+  autoLabel: string; // label for the null option ("Auto" / "Same as answering")
+  provider: AnsweringProvider | null;
+  model: string;
+  configured: Record<AnsweringProvider, boolean>;
+  onProvider: (p: AnsweringProvider | null) => void;
+  onModel: (m: string) => void;
+  onSave: () => void;
+  pending: boolean;
+  effective: string;
+  fallback: boolean;
+}) {
+  const modelEditable = props.provider !== null && props.provider !== "local";
+  return (
+    <div className="flex flex-col gap-1.5 border-t border-border-subtle pt-3 first:border-t-0 first:pt-0">
+      <p className="text-xs font-medium text-ink">{props.title}</p>
+      <p className="text-xs text-ink-secondary">{props.help}</p>
+      <div className="flex flex-wrap items-center gap-2">
+        <select
+          value={props.provider ?? ""}
+          disabled={props.pending}
+          onChange={(e) => props.onProvider(e.target.value ? (e.target.value as AnsweringProvider) : null)}
+          className="rounded-md border border-ink/15 bg-transparent px-2.5 py-1.5 text-sm text-ink outline-none focus:border-ink/30 disabled:opacity-50"
+        >
+          <option value="">{props.autoLabel}</option>
+          {ROLE_PROVIDERS.map((p) => (
+            <option key={p} value={p}>
+              {PROVIDER_LABEL[p]}
+              {props.configured[p] ? "" : " · not set"}
+            </option>
+          ))}
+        </select>
+        <input
+          value={modelEditable ? props.model : ""}
+          onChange={(e) => props.onModel(e.target.value)}
+          placeholder={
+            modelEditable
+              ? "model id, e.g. qwen/qwen3.6-plus"
+              : props.provider === "local"
+                ? "set via LLM_MODEL env"
+                : "—"
+          }
+          disabled={props.pending || !modelEditable}
+          className="min-w-0 flex-1 rounded-md border border-ink/15 bg-transparent px-2.5 py-1.5 font-mono text-xs text-ink outline-none focus:border-ink/30 disabled:opacity-50"
+        />
+        <button
+          type="button"
+          onClick={props.onSave}
+          disabled={props.pending}
+          className="btn-prism shrink-0 text-xs disabled:opacity-50"
+        >
+          Save
+        </button>
+      </div>
+      <p className="text-xs text-ink-secondary">
+        Effective: <span className="font-medium text-violet">{props.effective}</span>
+        {props.fallback ? (
+          <span className="ml-1 text-amber-700">· requested backend not configured, fell back</span>
+        ) : null}
+      </p>
+    </div>
+  );
+}
 
 type IntegrationType =
   | "github"
@@ -210,19 +295,36 @@ export function IntegrationsManager({
     run(() => saveProviderModel(teamSlug, p, modelDraft[p].trim()));
   }
 
-  function chooseBackend(p: AnsweringProvider | null) {
-    run(() => setAnsweringProvider(teamSlug, p));
+  // Provider configured-state shared by both role pickers.
+  const providerConfigured: Record<AnsweringProvider, boolean> = {
+    anthropic: answering.anthropicConfigured,
+    openai: answering.openaiConfigured,
+    openrouter: answering.openrouterConfigured,
+    local: answering.localConfigured,
+  };
+
+  // Answering role (provider + model). Switching provider seeds the model box from that provider's
+  // saved model (each provider has its own); "Auto" (null) clears the override — no model to set.
+  const [ansProvider, setAnsProvider] = useState<AnsweringProvider | null>(answering.provider);
+  const [ansModel, setAnsModel] = useState(
+    answering.provider && answering.provider !== "local" ? (answering.models[answering.provider] ?? "") : ""
+  );
+  function chooseAnsProvider(p: AnsweringProvider | null) {
+    setAnsProvider(p);
+    setAnsModel(p && p !== "local" ? (answering.models[p] ?? "") : "");
+  }
+  function saveAnswering() {
+    if (!ansProvider) run(() => setAnsweringProvider(teamSlug, null)); // Auto → clear override
+    else run(() => setAnsweringModel(teamSlug, ansProvider, ansModel.trim()));
   }
 
-  // The override options, in precedence order. `configured` gates whether forcing it actually sticks
-  // (an unconfigured pick falls back to auto — the effective line makes that visible).
-  const backendOptions: { value: AnsweringProvider | null; label: string; configured: boolean }[] = [
-    { value: null, label: "Auto", configured: true },
-    { value: "anthropic", label: "Anthropic", configured: true },
-    { value: "openai", label: "OpenAI", configured: answering.openaiConfigured },
-    { value: "openrouter", label: "OpenRouter", configured: answering.openrouterConfigured },
-    { value: "local", label: "Local", configured: answering.localConfigured },
-  ];
+  // Reasoning role (own provider + model). Provider null = "same as answering"; the model is a single
+  // team value (teams.reasoning_model), so switching provider doesn't reseed it. Blank model clears both.
+  const [resProvider, setResProvider] = useState<AnsweringProvider | null>(answering.reasoning.provider);
+  const [resModel, setResModel] = useState(answering.reasoning.model ?? "");
+  function saveReasoning() {
+    run(() => setReasoningModel(teamSlug, resProvider, resModel.trim()));
+  }
 
   function setProviderKey(p: ProviderType, existing: IntegrationRow | undefined) {
     const key = window.prompt(`${PROVIDER_META[p].label} API key (${PROVIDER_META[p].placeholder}):`);
@@ -236,52 +338,51 @@ export function IntegrationsManager({
 
   return (
     <div className="flex flex-col gap-6">
-      <div className="prism-card flex flex-col gap-3 p-4">
+      <div className="prism-card flex flex-col gap-4 p-4">
         <p className="flex items-center gap-2 text-sm font-medium text-ink">
-          <Sparkles className="size-4 text-violet" /> Active answering model
+          <Sparkles className="size-4 text-violet" /> Answering &amp; reasoning models
         </p>
         <p className="text-xs text-ink-secondary">
-          Which backend answers in the Query box. <strong>Auto</strong> picks the highest configured
-          (OpenRouter → Local → Anthropic); choosing a provider forces it. Each key&apos;s model is set
-          below (OpenRouter in its own panel). If a forced backend isn&apos;t configured, answers fall
-          back to Auto.
+          Pick the <strong>provider and model</strong> for each role. The <strong>answering</strong> model
+          runs the Query box + all extraction (summaries, action items, drafts) with reasoning off. The
+          optional <strong>reasoning</strong> model runs reasoning-heavy work (narrative arc synthesis) —
+          it can use a different provider entirely. If a chosen backend isn&apos;t configured, it falls
+          back (shown below the picker).
         </p>
-        <div className="flex flex-wrap gap-2">
-          {backendOptions.map((opt) => {
-            const active = answering.provider === opt.value;
-            return (
-              <button
-                key={opt.label}
-                type="button"
-                disabled={pending || active}
-                onClick={() => chooseBackend(opt.value)}
-                title={!opt.configured && opt.value ? `${opt.label} isn't configured yet` : undefined}
-                className={`rounded-md border px-3 py-1.5 text-sm ${
-                  active
-                    ? "border-violet bg-violet/10 text-ink"
-                    : "border-ink/15 text-ink-secondary hover:border-ink/30"
-                }`}
-              >
-                {opt.label}
-                {!opt.configured && opt.value ? (
-                  <span className="ml-1 text-[10px] text-ink-tertiary">· not set</span>
-                ) : null}
-              </button>
-            );
-          })}
-        </div>
-        <p className="text-sm text-ink">
-          Answering with{" "}
-          <span className="font-medium text-violet">{PROVIDER_LABEL[answering.effective.provider]}</span>{" "}
-          · <span className="font-mono text-xs text-ink">{answering.effective.model}</span>
-        </p>
-        {answering.usedFallback ? (
-          <p className="rounded-lg border border-amber/30 bg-amber/5 px-3 py-2 text-xs text-amber-700">
-            {answering.provider ? PROVIDER_LABEL[answering.provider] : "The selected backend"} isn&apos;t
-            configured — using {PROVIDER_LABEL[answering.effective.provider]} instead. Set its key/model
-            below (or in the OpenRouter panel) to activate it.
-          </p>
-        ) : null}
+
+        <RolePicker
+          title="Answering model"
+          help="Provider that answers + does extraction. “Auto” picks the highest configured (OpenRouter → Local → Anthropic)."
+          autoLabel="Auto"
+          provider={ansProvider}
+          model={ansModel}
+          configured={providerConfigured}
+          onProvider={chooseAnsProvider}
+          onModel={setAnsModel}
+          onSave={saveAnswering}
+          pending={pending}
+          effective={`${PROVIDER_LABEL[answering.effective.provider]} · ${answering.effective.model}`}
+          fallback={answering.usedFallback}
+        />
+
+        <RolePicker
+          title="Reasoning model (optional)"
+          help="A distinct model for reasoning-heavy tasks (narrative arc synthesis). Leave the model blank to reuse the answering model. “Same as answering” keeps the answering provider."
+          autoLabel="Same as answering"
+          provider={resProvider}
+          model={resModel}
+          configured={providerConfigured}
+          onProvider={setResProvider}
+          onModel={setResModel}
+          onSave={saveReasoning}
+          pending={pending}
+          effective={
+            answering.reasoning.effective
+              ? `${PROVIDER_LABEL[answering.reasoning.effective.provider]} · ${answering.reasoning.effective.model}`
+              : "reuses the answering model"
+          }
+          fallback={answering.reasoning.usedFallback}
+        />
       </div>
 
       <div className="prism-card flex flex-col gap-3 p-4">

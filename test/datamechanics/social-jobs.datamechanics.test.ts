@@ -122,4 +122,55 @@ describe("social_jobs durable queue (real Postgres)", () => {
     expect(dead!.status).toBe("dead");
     expect(dead!.last_error).toContain("no handler");
   });
+
+  // audit #4: a worker that vanished mid-run (deploy/crash) leaves a job stuck 'running' forever.
+  // The runner reclaims a stale-locked 'running' job back to the queue and re-runs it (safe because
+  // handlers are idempotent, audit #2), or dead-letters it if its attempts are already exhausted.
+  it("reclaims a stale 'running' job (worker vanished) and re-runs it in the same pass", async () => {
+    const { teamId } = await seedTeam();
+    const job = await enqueueJob(db(), { teamId, kind: "resumable", runAfter: BASE });
+    // A worker claimed it (attempts 1) then vanished 10 minutes ago — well past the 5-min stale window.
+    await db()
+      .from("social_jobs")
+      .update({ status: "running", attempts: 1, locked_at: at(-10 * 60_000).toISOString(), updated_at: at(-10 * 60_000).toISOString() })
+      .eq("id", job.id);
+
+    let ran = 0;
+    const summary = await runDueJobs({ db: db(), now: BASE, getHandler: handlerMap({ resumable: async () => { ran++; } }) });
+    expect(summary.reclaimed).toBe(1);
+    expect(ran).toBe(1); // reclaimed → re-claimed → ran, all in one pass
+    const after = await getJob(db(), job.id);
+    expect(after!.status).toBe("done");
+    expect(after!.attempts).toBe(2); // the vanished attempt (1) still counts; this run made it 2
+  });
+
+  it("dead-letters a stale 'running' job that already exhausted its attempts (never re-runs it)", async () => {
+    const { teamId } = await seedTeam();
+    const job = await enqueueJob(db(), { teamId, kind: "resumable", runAfter: BASE, maxAttempts: 3 });
+    await db()
+      .from("social_jobs")
+      .update({ status: "running", attempts: 3, max_attempts: 3, locked_at: at(-10 * 60_000).toISOString() })
+      .eq("id", job.id);
+
+    let ran = 0;
+    const summary = await runDueJobs({ db: db(), now: BASE, getHandler: handlerMap({ resumable: async () => { ran++; } }) });
+    expect(summary.reclaimed).toBe(0); // not requeued
+    expect(summary.dead).toBe(1); // surfaced in the tick summary (reclaim dead-letters count into `dead`)
+    expect(ran).toBe(0);
+    expect((await getJob(db(), job.id))!.status).toBe("dead");
+  });
+
+  it("does NOT reclaim a 'running' job still within its lock window", async () => {
+    const { teamId } = await seedTeam();
+    const job = await enqueueJob(db(), { teamId, kind: "resumable", runAfter: BASE });
+    // Claimed only a minute ago — a live worker is presumably still on it; leave it alone.
+    await db()
+      .from("social_jobs")
+      .update({ status: "running", attempts: 1, locked_at: at(-60_000).toISOString() })
+      .eq("id", job.id);
+
+    const summary = await runDueJobs({ db: db(), now: BASE, getHandler: handlerMap({ resumable: async () => {} }) });
+    expect(summary.reclaimed).toBe(0);
+    expect((await getJob(db(), job.id))!.status).toBe("running"); // untouched
+  });
 });

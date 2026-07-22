@@ -1,11 +1,19 @@
 import { describe, it, expect } from "vitest";
-import { normalizeGithubRepo, type NormalizeGithubInput } from "@/lib/ingest/sources/github-normalize";
+import {
+  normalizeGithubRepo,
+  type NormalizeGithubInput,
+} from "@/lib/ingest/sources/github-normalize";
 import { itemPayloadSchema, taskRowSchema } from "@/lib/api/schemas";
 
 // Spec (GitHub inbound import): a repo's issues → ONE kind="task" ItemPayload, rows keyed GH-<number>.
 // PRs excluded; open→backlog (or a workflow label), closed→done; milestone→sprint; assignees→assignee.
 
-const base: NormalizeGithubInput = { owner: "AIOS-alpha", repo: "aios-team-brain", issues: [] };
+// Mixed-case owner on purpose: keeps the slug lowercasing in normalizeGithubRepo covered.
+const base: NormalizeGithubInput = {
+  owner: "AIOSbrain",
+  repo: "aios-team-brain",
+  issues: [],
+};
 
 describe("normalizeGithubRepo", () => {
   it("maps issues to one valid kind=task ItemPayload in a dedicated repo project", () => {
@@ -24,8 +32,8 @@ describe("normalizeGithubRepo", () => {
     });
     expect(() => itemPayloadSchema.parse(p)).not.toThrow();
     expect(p.kind).toBe("task");
-    expect(p.project).toBe("github-aios-alpha-aios-team-brain");
-    expect(p.path).toBe("github/aios-alpha-aios-team-brain/issues.md");
+    expect(p.project).toBe("github-aiosbrain-aios-team-brain");
+    expect(p.path).toBe("github/aiosbrain-aios-team-brain/issues.md");
     expect(p.rows).toHaveLength(1);
 
     const row = p.rows![0] as Record<string, unknown>;
@@ -43,7 +51,12 @@ describe("normalizeGithubRepo", () => {
       ...base,
       issues: [
         { number: 1, title: "Real issue", state: "open" },
-        { number: 2, title: "A PR", state: "open", pull_request: { url: "https://..." } },
+        {
+          number: 2,
+          title: "A PR",
+          state: "open",
+          pull_request: { url: "https://..." },
+        },
       ],
     });
     const keys = (p.rows as Record<string, unknown>[]).map((r) => r.row_key);
@@ -55,11 +68,18 @@ describe("normalizeGithubRepo", () => {
       ...base,
       issues: [
         { number: 1, title: "Closed", state: "closed" },
-        { number: 2, title: "Working", state: "open", labels: [{ name: "In Progress" }] },
+        {
+          number: 2,
+          title: "Working",
+          state: "open",
+          labels: [{ name: "In Progress" }],
+        },
         { number: 3, title: "Stuck", state: "open", labels: ["blocked"] },
       ],
     });
-    const byKey = Object.fromEntries((p.rows as Record<string, unknown>[]).map((r) => [r.row_key, r]));
+    const byKey = Object.fromEntries(
+      (p.rows as Record<string, unknown>[]).map((r) => [r.row_key, r]),
+    );
     expect(byKey["GH-1"].status).toBe("done");
     expect(byKey["GH-2"].status).toBe("in_progress");
     expect(byKey["GH-3"].status).toBe("blocked");
@@ -67,7 +87,10 @@ describe("normalizeGithubRepo", () => {
 
   it("serializes projectable fields so a changed field shifts content_sha256", () => {
     const mk = (state: string) =>
-      normalizeGithubRepo({ ...base, issues: [{ number: 1, title: "T", state }] });
+      normalizeGithubRepo({
+        ...base,
+        issues: [{ number: 1, title: "T", state }],
+      });
     expect(mk("open").content_sha256).not.toBe(mk("closed").content_sha256);
   });
 });

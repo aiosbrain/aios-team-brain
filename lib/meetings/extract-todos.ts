@@ -140,7 +140,10 @@ export function extractTodosFromNotes(markdown: string): ExtractedTodo[] {
   return rows;
 }
 
-export function toExtractedTodoRows(item: ItemRow, todos: ExtractedTodo[]): ExtractedTodoRow[] {
+export function toExtractedTodoRows(
+  item: Pick<ItemRow, "id" | "path" | "access">,
+  todos: ExtractedTodo[]
+): ExtractedTodoRow[] {
   const sourceHash = stableHash(item.id, 10);
   return todos.map((todo, index) => ({
     ...todo,
@@ -243,6 +246,44 @@ export async function createMeetingTodoTasks(
   }
 
   return { projectId, upserted };
+}
+
+/**
+ * Move already-extracted meeting-todo tasks from one source item's namespace to another — used when a
+ * merge re-points a note onto a merge-owned item (audit H1). The row_key is namespaced by a hash of
+ * the item id, so a re-point would otherwise orphan the old tasks: re-extraction on the new item would
+ * mint DUPLICATES, `getMeetingNote` (which filters by the note's source_item_id) would stop showing the
+ * originals, and pushing the new copies would create duplicate PM issues. Rewriting source_item_id +
+ * row_key IN PLACE (same task id) keeps re-extraction upserting over them; the task's `task_pm_links`
+ * row_key is moved too (the projection engine resolves links by row_key). No-op when item unchanged.
+ */
+export async function remapMeetingTodoSourceItem(
+  db: DbClient,
+  teamId: string,
+  oldItemId: string,
+  newItemId: string
+): Promise<void> {
+  if (oldItemId === newItemId) return;
+  const oldPrefix = `${ROW_PREFIX}-${stableHash(oldItemId, 10)}-`;
+  const newPrefix = `${ROW_PREFIX}-${stableHash(newItemId, 10)}-`;
+  const { data } = await db.from("tasks").select("id, row_key").eq("team_id", teamId).eq("source_item_id", oldItemId);
+  const rows = ((data ?? []) as { id: string; row_key: string }[]).filter((t) => t.row_key.startsWith(oldPrefix));
+  const now = new Date().toISOString();
+  for (const t of rows) {
+    const newKey = newPrefix + t.row_key.slice(oldPrefix.length);
+    const { error } = await db.from("tasks").update({ source_item_id: newItemId, row_key: newKey }).eq("id", t.id);
+    if (error) throw new Error(`meeting-todo remap ${t.row_key}: ${error.message}`);
+    // Follow the task's PM links to the new row_key — the projection engine resolves links by
+    // (team_id, project_id, row_key, provider), so a stale key would make the next projection miss
+    // the link and mint a DUPLICATE Linear/Plane issue. resource/external ids stay put so the
+    // existing provider issue keeps updating.
+    const { error: linkErr } = await db
+      .from("task_pm_links")
+      .update({ row_key: newKey, updated_at: now })
+      .eq("team_id", teamId)
+      .eq("task_id", t.id);
+    if (linkErr) throw new Error(`meeting-todo link remap ${t.row_key}: ${linkErr.message}`);
+  }
 }
 
 export async function extractMeetingTodosForTeam(

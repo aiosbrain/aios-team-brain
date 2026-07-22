@@ -62,12 +62,16 @@ export interface ApiContribution {
 
 // ── pure helpers (unit-tested) ────────────────────────────────────────────────
 
-// Commit-message markers left by AI coding agents (case-insensitive). Mirrors the trailers
-// this repo's own tooling emits; extend as new agents appear.
+// Commit-message markers left by AI coding agents (case-insensitive). Mirrors
+// ingestion/aios_ingest/analyzers/codebase.py's _AI_TRAILER — keep both in sync; the
+// shared fixture at test/fixtures/ai-trailer-cases.json pins every case both sides must
+// pass. Extend as new agents appear.
 const AI_MARKERS = [
   "co-authored-by: claude",
   "generated with [claude code]",
+  "co-authored-by: codex",
   "co-authored-by: cursor",
+  "co-authored-by: opencode",
   "co-authored-by: github copilot",
   "co-authored-by: devin",
   "🤖 generated with",

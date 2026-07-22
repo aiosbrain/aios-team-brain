@@ -1,6 +1,7 @@
 import { NextRequest } from "next/server";
 import { adminClient } from "@/lib/db/admin";
 import { authenticateApiKey } from "@/lib/api/auth";
+import { isRestrictedTier } from "@/lib/auth/visibility";
 import { rateLimit } from "@/lib/api/rate-limit";
 import { errorResponse } from "@/lib/api/schemas";
 
@@ -25,7 +26,7 @@ export async function GET(req: NextRequest, ctx: { params: Promise<{ id: string 
     .eq("team_id", auth.teamId)
     .eq("id", id)
     .limit(1);
-  if (auth.memberTier === "external") q = q.eq("access", "external");
+  if (isRestrictedTier(auth.memberTier)) q = q.eq("access", "external");
 
   const { data, error } = await q;
   if (error) return errorResponse("internal", error.message, 500);

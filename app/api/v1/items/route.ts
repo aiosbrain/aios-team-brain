@@ -1,6 +1,7 @@
 import { NextRequest, after } from "next/server";
 import { adminClient } from "@/lib/db/admin";
 import { authenticateApiKey } from "@/lib/api/auth";
+import { isRestrictedTier } from "@/lib/auth/visibility";
 import { rateLimit } from "@/lib/api/rate-limit";
 import {
   itemPayloadSchema,
@@ -9,6 +10,7 @@ import {
   IngestValidationError,
 } from "@/lib/api/schemas";
 import { ingestItem } from "@/lib/ingest";
+import { attributeIncomingItem } from "@/lib/attribution/resolve-authors";
 import { projectChangedTasksAfterWrite } from "@/lib/pm-sync";
 
 export const runtime = "nodejs";
@@ -60,7 +62,13 @@ export async function POST(req: NextRequest) {
   }
 
   try {
-    const result = await ingestItem(db, auth, parsed.data, tier);
+    // Resolve the item's author from its frontmatter at INGEST → attribute to the real human, never
+    // silently to the ingesting connector. ONLY for trusted team-tier keys: an external (client) key
+    // must not be able to attribute content to a team member (spoofing) — it keeps actor attribution.
+    const { opts } = isRestrictedTier(auth.memberTier)
+      ? {}
+      : await attributeIncomingItem(db, auth.teamId, parsed.data, auth.memberId);
+    const result = await ingestItem(db, auth, parsed.data, tier, opts);
 
     // Reactive auto-projection (brain-api v1.2 Phase 2): on a task push that actually changed
     // projected fields, schedule a bounded projection of ONLY the changed rows into the team's
@@ -120,7 +128,7 @@ export async function GET(req: NextRequest) {
     .order("updated_at", { ascending: true })
     .order("id", { ascending: true })
     .limit(PAGE_SIZE);
-  if (auth.memberTier === "external") q = q.eq("access", "external");
+  if (isRestrictedTier(auth.memberTier)) q = q.eq("access", "external");
   if (kinds?.length) q = q.in("kind", kinds);
   // On-demand fetch of one skill/deliverable folder: match path by prefix.
   if (pathPrefix) q = q.like("path", `${pathPrefix.replace(/[%_\\]/g, "\\$&")}%`);

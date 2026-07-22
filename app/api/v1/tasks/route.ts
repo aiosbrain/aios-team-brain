@@ -8,13 +8,14 @@ import { visibleTasks } from "@/lib/auth/visibility";
 export const runtime = "nodejs";
 
 /**
- * Task writeback for `aios pull`: rows created or modified IN THE DASHBOARD
- * since the cursor — origin='ui' rows, plus sync rows whose updated_at moved
- * after their source item's synced_at (i.e. a Kanban drag).
+ * Task writeback for `aios pull`: rows created or modified IN THE DASHBOARD since the cursor.
+ * `?all=1` is the explicit tier-filtered full tasks-table read (brain-api v1.9); without it this
+ * endpoint remains the writeback feed and must not be interpreted as the complete task table.
  */
 export async function GET(req: NextRequest) {
   const auth = await authenticateApiKey(req);
-  if (!auth) return errorResponse("unauthorized", "invalid API key or team", 401);
+  if (!auth)
+    return errorResponse("unauthorized", "invalid API key or team", 401);
 
   const db = adminClient();
   if (!(await rateLimit(db, `${auth.apiKeyId}:tasks:get`, 60))) {
@@ -22,7 +23,10 @@ export async function GET(req: NextRequest) {
   }
 
   const url = new URL(req.url);
-  const since = url.searchParams.get("since") || "1970-01-01T00:00:00Z";
+  const all = url.searchParams.get("all") === "1";
+  const since = all
+    ? "1970-01-01T00:00:00Z"
+    : url.searchParams.get("since") || "1970-01-01T00:00:00Z";
 
   // Tier isolation (audit H1): an external-tier key must never pull internal task boards. `tasks`
   // carries `audience` (inherited from the source item's access) — filter it via the choke-point.
@@ -30,20 +34,22 @@ export async function GET(req: NextRequest) {
     db
       .from("tasks")
       .select(
-        "row_key, title, assignee, status, sprint, due_date, parent_row_key, labels, priority, origin, updated_at, projects(slug), items:source_item_id(synced_at)"
+        "row_key, title, assignee, status, sprint, due_date, parent_row_key, labels, priority, origin, updated_at, projects(slug), items:source_item_id(synced_at)",
       )
       .eq("team_id", auth.teamId)
       .gt("updated_at", since)
       .not("row_key", "is", null)
       .order("updated_at", { ascending: true })
       .limit(500),
-    auth.memberTier
+    auth.memberTier,
   );
   if (error) return errorResponse("internal", error.message, 500);
 
-  const uiChanged = (data ?? []).filter((t) => {
+  const selected = (data ?? []).filter((t) => {
+    if (all) return true;
     if (t.origin === "ui") return true;
-    const synced = (t.items as unknown as { synced_at: string } | null)?.synced_at;
+    const synced = (t.items as unknown as { synced_at: string } | null)
+      ?.synced_at;
     return synced ? new Date(t.updated_at) > new Date(synced) : false;
   });
 
@@ -61,7 +67,7 @@ export async function GET(req: NextRequest) {
       priority: string;
     }[]
   >();
-  for (const t of uiChanged) {
+  for (const t of selected) {
     const slug = (t.projects as unknown as { slug: string })?.slug ?? "unknown";
     if (!byProject.has(slug)) byProject.set(slug, []);
     byProject.get(slug)!.push({
@@ -79,7 +85,11 @@ export async function GET(req: NextRequest) {
   }
 
   return Response.json({
-    tasks: [...byProject.entries()].map(([project, rows]) => ({ project, rows })),
+    mode: all ? "table" : "writeback",
+    tasks: [...byProject.entries()].map(([project, rows]) => ({
+      project,
+      rows,
+    })),
     next_cursor: null,
   });
 }

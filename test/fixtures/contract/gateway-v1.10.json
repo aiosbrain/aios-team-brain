@@ -1,0 +1,171 @@
+{
+  "$schema": "aios-gateway-contract/v1.10",
+  "version": "1.10",
+  "serviceAuthentication": {
+    "bearerPattern": "^aios_gw_([A-Za-z0-9_-]{22})_([A-Za-z0-9_-]{43})$",
+    "credentialId": { "sourceBytes": 16, "encodedLength": 22 },
+    "secret": { "sourceBytes": 32, "encodedLength": 43, "storedDigest": "sha256-secret-bytes-lowercase-hex" },
+    "constantTimeDigestComparison": true,
+    "uniformFailure": { "status": 401, "code": "gateway_unauthorized", "message": "Unauthorized" },
+    "requiredHeaders": {
+      "X-AIOS-Executor-Version": "1.5.33",
+      "X-AIOS-Companion-Version": "0.1.0",
+      "X-AIOS-Contract-Version": "1.10"
+    },
+    "ordering": ["service_authentication", "version_check", "subject_connection_lease_pat_lookup"],
+    "overlap": "multiple independently active credential rows are accepted",
+    "responseKeyBinding": "the credential row that authenticated the request",
+    "preflight": "legacy rows that predate this grammar require explicit rotation",
+    "vector": {
+      "credentialId": "AAECAwQFBgcICQoLDA0ODw",
+      "materialBase64url": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+      "bearer": "aios_gw_AAECAwQFBgcICQoLDA0ODw_AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+      "storedDigest": "630dcd2966c4336691125448bbb25b4ff412a49c732db2c8abc1b8581bd710dd"
+    }
+  },
+  "transport": {
+    "featureFlag": { "name": "AIOS_GATEWAY_INTERNAL_ENABLED", "enabledValue": "true", "default": false },
+    "disabledResponse": { "status": 404, "beforeAuthenticationOrBodyParsing": true },
+    "rawRequestLimitBytes": 65536,
+    "acceptedContentEncodings": ["identity"],
+    "errors": {
+      "schema": { "error": { "code": "string", "message": "allowlisted-string", "request_id": "uuid", "correlation_id": "uuid-or-null" } },
+      "headers": { "Cache-Control": "no-store" },
+      "union": {
+        "gateway_not_found": { "status": 404, "message": "Not found" },
+        "gateway_unauthorized": { "status": 401, "message": "Unauthorized" },
+        "gateway_version_mismatch": { "status": 409, "message": "Gateway version mismatch" },
+        "gateway_invalid_request": { "status": 400, "message": "Invalid request" },
+        "gateway_payload_too_large": { "status": 413, "message": "Request body too large" },
+        "gateway_unsupported_content_encoding": { "status": 415, "message": "Unsupported content encoding" },
+        "gateway_rate_limited": { "status": 429, "message": "Rate limit exceeded" },
+        "gateway_scope_not_found": { "status": 422, "message": "Gateway scope not found" },
+        "gateway_lease_invalid": { "status": 409, "message": "Invalid lease" },
+        "gateway_policy_stale": { "status": 409, "message": "Gateway policy changed" },
+        "gateway_allow_already_committed": { "status": 409, "message": "Allow already committed" },
+        "gateway_idempotency_conflict": { "status": 409, "message": "Idempotency conflict" },
+        "gateway_outcome_conflict": { "status": 409, "message": "Outcome conflict" },
+        "gateway_credential_failure": { "status": 500, "message": "Credential unavailable" },
+        "gateway_internal": { "status": 500, "message": "Internal gateway error" }
+      }
+    }
+  },
+  "routes": {
+    "resolveLease": {
+      "method": "POST",
+      "path": "/api/internal/executor-gateway/v1/resolve-lease",
+      "request": { "required": ["executorTenantId", "executorSubjectId", "connectionRef", "correlationId"], "additionalProperties": false },
+      "responses": { "200": { "required": ["lease", "expiresAt"], "additionalProperties": false } },
+      "lease": { "ttlSeconds": 30, "oneUse": true, "stored": "sha256-lowercase-hex" },
+      "rateLimitPerMinute": 120
+    },
+    "authorizeAndRedeem": {
+      "method": "POST",
+      "path": "/api/internal/executor-gateway/v1/authorize-and-redeem",
+      "request": { "required": ["lease", "toolkit", "tool", "normalizedArgs", "requestHash", "correlationId", "idempotencyKey"], "additionalProperties": false },
+      "responses": {
+        "200": { "decision": "allow", "required": ["decision", "executionId", "sealedCredential", "credentialExpiresAt"], "additionalProperties": false },
+        "202": { "decision": "require_approval", "required": ["decision", "executionId", "approvalId", "expiresAt"], "additionalProperties": false },
+        "403": { "decision": "block", "required": ["decision", "code", "executionId"], "additionalProperties": false }
+      },
+      "rateLimitPerMinute": { "service": 120, "reboundMember": 120 }
+    },
+    "recordOutcome": {
+      "method": "POST",
+      "path": "/api/internal/executor-gateway/v1/record-outcome",
+      "request": {
+        "required": ["executionId", "correlationId", "classification"],
+        "optional": ["upstreamStatusClass", "responseBytes"],
+        "additionalProperties": false
+      },
+      "responses": { "204": { "body": null } },
+      "rateLimitPerMinute": 240
+    }
+  },
+  "tools": {
+    "toolkit": "aios-github-readonly",
+    "definitions": {
+      "github.repository.get": { "fields": ["owner", "repo"] },
+      "github.contents.get": { "fields": ["owner", "repo", "path", "ref"] },
+      "github.issues.list": { "fields": ["owner", "repo", "state", "page", "perPage"] },
+      "github.issue.get": { "fields": ["owner", "repo", "issueNumber"] },
+      "github.pull_requests.list": { "fields": ["owner", "repo", "state", "page", "perPage"] },
+      "github.pull_request.get": { "fields": ["owner", "repo", "pullNumber"] },
+      "github.pull_request.files.list": { "fields": ["owner", "repo", "pullNumber", "page", "perPage"] }
+    },
+    "normalization": {
+      "unknownFields": "reject",
+      "strings": "trim-surrounding-ascii-whitespace-preserve-case-and-unicode",
+      "owner": "1-39 GitHub-compatible characters",
+      "repo": "1-100 chars; no control, slash, backslash, or dot-only name",
+      "path": "0-1024 UTF-8 bytes; no NUL, backslash, absolute path, dot, or dot-dot segment",
+      "ref": "required 1-255 UTF-8 bytes; no control characters",
+      "state": { "values": ["open", "closed", "all"], "default": "open" },
+      "page": { "jsonType": "integer", "default": 1, "minimum": 1, "maximum": 10000 },
+      "perPage": { "jsonType": "integer", "default": 30, "minimum": 1, "maximum": 100 },
+      "issueNumber": { "jsonType": "integer", "minimum": 1 },
+      "pullNumber": { "jsonType": "integer", "minimum": 1 },
+      "requestHash": "lowercase-hex-sha256-of-rfc8785-jcs-normalizedArgs"
+    },
+    "hashVectors": [
+      { "name": "repository-unicode-and-trim", "tool": "github.repository.get", "input": { "repo": "répo", "owner": " Octo " }, "normalizedArgs": { "owner": "Octo", "repo": "répo" }, "jcs": "{\"owner\":\"Octo\",\"repo\":\"répo\"}", "requestHash": "bf79950c6e23ff708593ded687e37a7f857aec6862f0e21275414448c7f88707" },
+      { "name": "contents-key-order", "tool": "github.contents.get", "input": { "ref": "main", "path": "src/é.ts", "repo": "project", "owner": "octo" }, "normalizedArgs": { "owner": "octo", "repo": "project", "path": "src/é.ts", "ref": "main" }, "jcs": "{\"owner\":\"octo\",\"path\":\"src/é.ts\",\"ref\":\"main\",\"repo\":\"project\"}", "requestHash": "09d54b8999110c3bf47ce4eaf02c3a9c1ddf70a993676676725c9abbcf27b86c" },
+      { "name": "issues-defaults", "tool": "github.issues.list", "input": { "repo": "project", "owner": "octo" }, "normalizedArgs": { "owner": "octo", "repo": "project", "state": "open", "page": 1, "perPage": 30 }, "jcs": "{\"owner\":\"octo\",\"page\":1,\"perPage\":30,\"repo\":\"project\",\"state\":\"open\"}", "requestHash": "239fab5482414add3f00baeb0dcd80f09c2b848891d109063f14984559a60612" },
+      { "name": "issue-positive-integer", "tool": "github.issue.get", "input": { "issueNumber": 7, "repo": "project", "owner": "octo" }, "normalizedArgs": { "owner": "octo", "repo": "project", "issueNumber": 7 }, "jcs": "{\"issueNumber\":7,\"owner\":\"octo\",\"repo\":\"project\"}", "requestHash": "277ec26803bb97bf219f0c079f050c63ec2d3df315ea6c3c284a6f30ed5a3e1c" },
+      { "name": "pull-list-explicit", "tool": "github.pull_requests.list", "input": { "perPage": 100, "page": 2, "state": "all", "repo": "project", "owner": "octo" }, "normalizedArgs": { "owner": "octo", "repo": "project", "state": "all", "page": 2, "perPage": 100 }, "jcs": "{\"owner\":\"octo\",\"page\":2,\"perPage\":100,\"repo\":\"project\",\"state\":\"all\"}", "requestHash": "957465bb7bda70fc7b248f4ebf617e96bee7d4c6c4e14b532fc3ddda43c64d7c" },
+      { "name": "pull-positive-integer", "tool": "github.pull_request.get", "input": { "pullNumber": 12, "repo": "project", "owner": "octo" }, "normalizedArgs": { "owner": "octo", "repo": "project", "pullNumber": 12 }, "jcs": "{\"owner\":\"octo\",\"pullNumber\":12,\"repo\":\"project\"}", "requestHash": "b04de41b0c3bb076ac84cb4d6074628e70d50828018ed8beb040f5061d9d598d" },
+      { "name": "pull-files", "tool": "github.pull_request.files.list", "input": { "page": 1, "pullNumber": 12, "perPage": 30, "repo": "project", "owner": "octo" }, "normalizedArgs": { "owner": "octo", "repo": "project", "pullNumber": 12, "page": 1, "perPage": 30 }, "jcs": "{\"owner\":\"octo\",\"page\":1,\"perPage\":30,\"pullNumber\":12,\"repo\":\"project\"}", "requestHash": "0f1f6c5d72d2ce3fde55fe65bf7cfb4e4115a392f7d62360000e7a0257e825ac" }
+    ],
+    "negativeVectors": [
+      { "name": "unknown-field", "tool": "github.repository.get", "input": { "owner": "octo", "repo": "project", "extra": true }, "code": "gateway_invalid_arguments" },
+      { "name": "fractional-page", "tool": "github.issues.list", "input": { "owner": "octo", "repo": "project", "page": 1.5 }, "code": "gateway_invalid_arguments" },
+      { "name": "dot-path", "tool": "github.contents.get", "input": { "owner": "octo", "repo": "project", "path": "a/../b", "ref": "main" }, "code": "gateway_invalid_arguments" }
+    ]
+  },
+  "policy": {
+    "actionExactPrefix": "gateway.aios-github-readonly.",
+    "actionWildcard": "gateway.aios-github-readonly.*",
+    "resourceExactPrefix": "github.repository:",
+    "resourceWildcard": "github.repository:*",
+    "precedence": ["subject:actor>role>tier>team", "tool:exact>wildcard", "resource:exact>wildcard", "priority:highest", "effect:block>require_approval>allow", "no-match:block"],
+    "version": "sha256-rfc8785-jcs-active-rows-sorted-by-id"
+  },
+  "sealedCredential": {
+    "patSource": "gateway_connections.credential_ciphertext",
+    "kdf": { "algorithm": "HKDF-SHA-256", "saltInputAscii": "aios-gateway-sealed-credential:v1", "info": "credential-id + NUL + decimal-credential-version", "outputBytes": 32 },
+    "wire": "v1.<base64url(protected-header-jcs)>.<base64url(12-byte-nonce)>.<base64url(ciphertext||16-byte-tag)>",
+    "headerFieldsExactly": ["v", "kid", "sid", "eid", "provider", "iat", "exp"],
+    "maxLifetimeSeconds": 15,
+    "cipher": "AES-256-GCM",
+    "aad": "exact decoded protected-header bytes",
+    "plaintext": "raw PAT bytes only",
+    "vector": {
+      "materialBytesHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "credentialId": "AAECAwQFBgcICQoLDA0ODw",
+      "credentialVersion": 1,
+      "serviceIdentityId": "11111111-1111-4111-8111-111111111111",
+      "executionId": "22222222-2222-4222-8222-222222222222",
+      "iat": 1784044800,
+      "exp": 1784044815,
+      "nonceHex": "000102030405060708090a0b",
+      "plaintextUtf8": "fixture-pat-readonly",
+      "saltHex": "d7b627a066978955646732543aa8e77a8b505b54c9267f2959a1cdd29d970805",
+      "derivedMaterialHex": "052d45f1a582cd2fd07ed3d7a62ff28afd367c788b23b8d14c462234f83a8798",
+      "protectedHeaderJcs": "{\"eid\":\"22222222-2222-4222-8222-222222222222\",\"exp\":1784044815,\"iat\":1784044800,\"kid\":\"AAECAwQFBgcICQoLDA0ODw.v1\",\"provider\":\"github\",\"sid\":\"11111111-1111-4111-8111-111111111111\",\"v\":1}",
+      "sealed": "v1.eyJlaWQiOiIyMjIyMjIyMi0yMjIyLTQyMjItODIyMi0yMjIyMjIyMjIyMjIiLCJleHAiOjE3ODQwNDQ4MTUsImlhdCI6MTc4NDA0NDgwMCwia2lkIjoiQUFFQ0F3UUZCZ2NJQ1FvTERBME9Edy52MSIsInByb3ZpZGVyIjoiZ2l0aHViIiwic2lkIjoiMTExMTExMTEtMTExMS00MTExLTgxMTEtMTExMTExMTExMTExIiwidiI6MX0.AAECAwQFBgcICQoL.nrq3BDy_LZFYaY1w7F5jTB3q8_i_5nR6wN5D9f_-qvhzK4Rh"
+    }
+  },
+  "stateMachine": {
+    "preCommitFailure": "no execution; lease remains retryable",
+    "allowCommit": "consume lease + insert claimed execution + strict audit atomically",
+    "postCommitSealFailure": "settle failed/credential + audit; return no credential",
+    "lostAllowResponse": "same lease or idempotency key => 409 gateway_allow_already_committed; never reseal or decrypt again",
+    "idempotencyConflict": "409 gateway_idempotency_conflict",
+    "outcomes": {
+      "claimed": { "success": "succeeded", "credential": "failed", "network": "failed", "upstream": "failed", "response_too_large": "failed", "internal": "failed" },
+      "blocked": { "blocked": "blocked" },
+      "approval_required": { "approval_required": "approval_required" }
+    },
+    "outcomeReplayIdentity": ["authenticated-service-identity", "executionId", "classification", "upstreamStatusClass", "responseBytes"]
+  }
+}

@@ -164,7 +164,7 @@ def test_pillars_shape_matches_brain_contract(tmp_path):
     for p in pillars.values():
         assert 0 <= p["passed"] <= p["total"]    # brain's passed<=total refine
     assert r["readiness_level"] in {"L0", "L1", "L2", "L3", "L4", "L5"}
-    assert r["readiness_rubric_version"] == "1.0.0"
+    assert r["readiness_rubric_version"] == "1.1.0"
 
 
 # ── failure + safety paths ───────────────────────────────────────────────────────────────
@@ -243,5 +243,5 @@ def test_vendored_rubric_loads_as_package_data():
 
     res = resources.files("aios_ingest.rubric") / "agent-readiness.json"
     data = json.loads(res.read_text(encoding="utf-8"))
-    assert data["version"] == "1.0.0"
+    assert data["version"] == "1.1.0"
     assert len(data["checks"]) == 18

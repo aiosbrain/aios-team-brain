@@ -1,0 +1,610 @@
+{
+  "$schema": "aios-gateway-approval-contract/v1.10",
+  "version": "1.10",
+  "baseContract": {
+    "path": "gateway-v1.10.json",
+    "sha256": "4ddd6495fa505b76118080865d60255bfba94a9ccda249defe428babb3d0c205"
+  },
+  "versionBoundary": {
+    "documentRevision": "1.10",
+    "memberApi": "1.9",
+    "internalGateway": "1.10"
+  },
+  "transport": {
+    "featureFlag": {
+      "name": "AIOS_GATEWAY_INTERNAL_ENABLED",
+      "enabledValue": "true",
+      "default": false,
+      "disabledResponse": {
+        "status": 404,
+        "code": "gateway_not_found",
+        "beforeAuthenticationOrBodyParsing": true
+      }
+    },
+    "headers": {
+      "Cache-Control": "no-store"
+    },
+    "errorEnvelope": {
+      "required": ["error"],
+      "additionalProperties": false,
+      "errorRequired": ["code", "message", "request_id", "correlation_id"],
+      "errorAdditionalProperties": false
+    },
+    "errors": {
+      "gateway_invalid_request": { "status": 400, "message": "Invalid request" },
+      "gateway_unauthorized": { "status": 401, "message": "Unauthorized" },
+      "gateway_forbidden": { "status": 403, "message": "Forbidden" },
+      "gateway_not_found": { "status": 404, "message": "Not found" },
+      "gateway_idempotency_conflict": { "status": 409, "message": "Idempotency conflict" },
+      "gateway_approval_expired": { "status": 410, "message": "Approval expired" },
+      "gateway_payload_too_large": { "status": 413, "message": "Request body too large" },
+      "gateway_unsupported_content_encoding": { "status": 415, "message": "Unsupported content encoding" },
+      "gateway_scope_not_found": { "status": 422, "message": "Gateway scope not found" },
+      "gateway_credential_failure": { "status": 500, "message": "Credential unavailable" },
+      "gateway_internal": { "status": 500, "message": "Internal gateway error" }
+    },
+    "nonEnumerating404": [
+      "foreign_service",
+      "foreign_team",
+      "foreign_subject",
+      "unknown_approval",
+      "unknown_execution",
+      "unknown_policy",
+      "unknown_service_identity",
+      "unknown_credential"
+    ]
+  },
+  "resumeClaim": {
+    "method": "POST",
+    "path": "/api/internal/executor-gateway/v1/executions/{executionId}/resume-claim",
+    "authentication": "gateway-service-credential",
+    "request": {
+      "type": "object",
+      "required": [
+        "executorTenantId",
+        "executorSubjectId",
+        "toolkit",
+        "tool",
+        "requestHash",
+        "correlationId",
+        "idempotencyKey"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "executorTenantId": "non-empty-string",
+        "executorSubjectId": "non-empty-string",
+        "toolkit": { "const": "aios-github-readonly" },
+        "tool": "base-contract-tool",
+        "requestHash": "lowercase-hex-sha256",
+        "correlationId": "uuid",
+        "idempotencyKey": "non-empty-string"
+      }
+    },
+    "responses": {
+      "claimed": {
+        "status": 200,
+        "body": {
+          "required": [
+            "status",
+            "executionId",
+            "toolkit",
+            "tool",
+            "normalizedArgs",
+            "sealedCredential",
+            "credentialExpiresAt"
+          ],
+          "additionalProperties": false,
+          "constants": { "status": "claimed", "toolkit": "aios-github-readonly" }
+        },
+        "credentialBearing": true
+      },
+      "alreadyClaimed": {
+        "status": 200,
+        "body": {
+          "required": ["status", "executionId", "state"],
+          "additionalProperties": false,
+          "constants": { "status": "already_claimed" },
+          "state": ["claimed", "succeeded", "failed"],
+          "forbidden": ["normalizedArgs", "sealedCredential", "credentialExpiresAt"]
+        },
+        "credentialBearing": false
+      }
+    },
+    "failures": {
+      "differentKeyOrFingerprint": "gateway_idempotency_conflict",
+      "foreignServiceTeamOrSubject": "gateway_not_found",
+      "expiredApproval": "gateway_approval_expired",
+      "knownIneligibleScope": "gateway_scope_not_found",
+      "sealFailure": "gateway_credential_failure"
+    },
+    "revalidation": [
+      "authenticating-credential-active",
+      "stable-service-identity",
+      "exact-executor-tenant",
+      "exact-executor-subject",
+      "original-member-active",
+      "original-role",
+      "original-team-tier",
+      "connection-owned-by-member",
+      "connection-provider-github",
+      "toolkit",
+      "tool",
+      "policy-resource",
+      "request-hash",
+      "encrypted-envelope-hash",
+      "current-gateway-policy"
+    ],
+    "custody": {
+      "claimAndAudit": "single-transaction",
+      "credentialScopedAdvisoryLock": "held-on-same-session-through-post-commit-decrypt-and-seal",
+      "revocationUsesSameLock": true,
+      "winningRequestLocalClosureOnly": true,
+      "retryMayDecryptOrReseal": false,
+      "persistCredentialBearingResponse": false,
+      "zeroPlaintextAndKeyBuffers": true
+    }
+  },
+  "admin": {
+    "authentication": "brain-admin-session",
+    "authorizationMatrix": {
+      "activeSameTeamAdmin": 200,
+      "member": 403,
+      "lead": 403,
+      "externalOrIneligible": 422,
+      "unknownOrForeignResource": 404,
+      "unauthenticated": 401
+    },
+    "routes": {
+      "approvalQueue": {
+        "method": "GET",
+        "path": "/api/internal/executor-gateway/v1/admin/{teamSlug}/approvals",
+        "response": {
+          "required": ["approvals"],
+          "additionalProperties": false,
+          "properties": {
+            "approvals": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "approvalId",
+                  "executionId",
+                  "memberId",
+                  "memberName",
+                  "tool",
+                  "resource",
+                  "requestHashPrefix",
+                  "createdAt",
+                  "expiresAt",
+                  "status"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "approvalId": "uuid",
+                  "executionId": "uuid",
+                  "memberId": "uuid",
+                  "memberName": "non-empty-string",
+                  "tool": "base-contract-tool",
+                  "resource": "canonical-github-repository-resource",
+                  "requestHashPrefix": { "pattern": "^[0-9a-f]{12}$" },
+                  "createdAt": "rfc3339-date-time",
+                  "expiresAt": "rfc3339-date-time",
+                  "status": { "const": "pending" }
+                }
+              }
+            }
+          }
+        }
+      },
+      "approvalDecision": {
+        "method": "POST",
+        "path": "/api/internal/executor-gateway/v1/admin/{teamSlug}/approvals/{approvalId}/decision",
+        "request": {
+          "type": "object",
+          "required": ["decision", "correlationId"],
+          "additionalProperties": false,
+          "properties": {
+            "decision": { "enum": ["approve", "deny"] },
+            "correlationId": "uuid"
+          }
+        },
+        "response": {
+          "type": "object",
+          "required": ["approvalId", "executionId", "status", "decidedAt"],
+          "additionalProperties": false,
+          "properties": {
+            "approvalId": "uuid",
+            "executionId": "uuid",
+            "status": { "enum": ["approved", "denied"] },
+            "decidedAt": "rfc3339-date-time"
+          }
+        }
+      },
+      "policyList": {
+        "method": "GET",
+        "path": "/api/internal/executor-gateway/v1/admin/{teamSlug}/policies",
+        "response": {
+          "type": "object",
+          "required": ["policies"],
+          "additionalProperties": false,
+          "properties": {
+            "policies": {
+              "type": "array",
+              "items": { "$ref": "#/admin/schemas/gateway-policy-metadata" }
+            }
+          }
+        }
+      },
+      "policyCreate": {
+        "method": "POST",
+        "path": "/api/internal/executor-gateway/v1/admin/{teamSlug}/policies",
+        "request": { "$ref": "#/admin/schemas/gateway-policy-mutation" },
+        "response": { "$ref": "#/admin/schemas/gateway-policy-metadata" },
+        "status": 201
+      },
+      "policyUpdate": {
+        "method": "PATCH",
+        "path": "/api/internal/executor-gateway/v1/admin/{teamSlug}/policies/{policyId}",
+        "request": { "$ref": "#/admin/schemas/gateway-policy-mutation" },
+        "response": { "$ref": "#/admin/schemas/gateway-policy-metadata" },
+        "status": 200
+      },
+      "policyDelete": {
+        "method": "DELETE",
+        "path": "/api/internal/executor-gateway/v1/admin/{teamSlug}/policies/{policyId}",
+        "request": {
+          "type": "object",
+          "required": ["correlationId"],
+          "additionalProperties": false,
+          "properties": { "correlationId": "uuid" }
+        },
+        "response": {
+          "type": "object",
+          "required": ["deleted"],
+          "additionalProperties": false,
+          "properties": { "deleted": { "const": true } }
+        },
+        "status": 200
+      },
+      "credentialList": {
+        "method": "GET",
+        "path": "/api/internal/executor-gateway/v1/admin/{teamSlug}/service-identities/{serviceIdentityId}/credentials",
+        "response": {
+          "type": "object",
+          "required": ["credentials"],
+          "additionalProperties": false,
+          "properties": {
+            "credentials": {
+              "type": "array",
+              "items": { "$ref": "#/admin/schemas/gateway-credential-metadata" }
+            }
+          }
+        }
+      },
+      "credentialRotate": {
+        "method": "POST",
+        "path": "/api/internal/executor-gateway/v1/admin/{teamSlug}/service-identities/{serviceIdentityId}/credentials",
+        "request": {
+          "type": "object",
+          "required": ["credentialId", "secret", "replacesCredentialId", "correlationId"],
+          "optional": ["expiresAt"],
+          "additionalProperties": false,
+          "properties": {
+            "credentialId": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_-]{22}$",
+              "encoding": "canonical-base64url-no-padding",
+              "decodedBytes": 16
+            },
+            "secret": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_-]{43}$",
+              "encoding": "canonical-base64url-no-padding",
+              "decodedBytes": 32,
+              "minimumEntropyBits": 256
+            },
+            "replacesCredentialId": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_-]{22}$",
+              "encoding": "canonical-base64url-no-padding",
+              "decodedBytes": 16
+            },
+            "correlationId": "uuid",
+            "expiresAt": "optional-rfc3339-future-date-time"
+          }
+        },
+        "response": { "$ref": "#/admin/schemas/gateway-credential-metadata" },
+        "status": 201
+      },
+      "credentialRevoke": {
+        "method": "POST",
+        "path": "/api/internal/executor-gateway/v1/admin/{teamSlug}/service-identities/{serviceIdentityId}/credentials/{credentialId}/revoke",
+        "request": {
+          "type": "object",
+          "required": ["correlationId"],
+          "additionalProperties": false,
+          "properties": { "correlationId": "uuid" }
+        },
+        "response": {
+          "type": "object",
+          "required": ["credentialId", "revoked"],
+          "additionalProperties": false,
+          "properties": {
+            "credentialId": { "pattern": "^[A-Za-z0-9_-]{22}$" },
+            "revoked": { "const": true }
+          }
+        },
+        "status": 200
+      }
+    },
+    "schemas": {
+      "gateway-subject-selector": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": ["type", "memberId"],
+            "additionalProperties": false,
+            "properties": {
+              "type": { "const": "actor" },
+              "memberId": "uuid"
+            }
+          },
+          {
+            "type": "object",
+            "required": ["type", "role"],
+            "additionalProperties": false,
+            "properties": {
+              "type": { "const": "role" },
+              "role": { "enum": ["admin", "lead", "member"] }
+            }
+          },
+          {
+            "type": "object",
+            "required": ["type", "tier"],
+            "additionalProperties": false,
+            "properties": {
+              "type": { "const": "tier" },
+              "tier": { "enum": ["team", "external"] }
+            }
+          },
+          {
+            "type": "object",
+            "required": ["type"],
+            "additionalProperties": false,
+            "properties": { "type": { "const": "team" } }
+          }
+        ]
+      },
+      "gateway-policy-mutation": {
+        "type": "object",
+        "required": ["subject", "tool", "resource", "effect", "priority", "enabled", "correlationId"],
+        "additionalProperties": false,
+        "properties": {
+          "subject": { "$ref": "#/admin/schemas/gateway-subject-selector" },
+          "tool": { "oneOf": ["base-contract-tool", { "const": "*" }] },
+          "resource": "canonical-github-repository-resource-or-wildcard",
+          "effect": { "enum": ["block", "require_approval", "allow"] },
+          "priority": { "type": "integer", "minimum": -2147483648, "maximum": 2147483647 },
+          "enabled": { "type": "boolean" },
+          "correlationId": "uuid"
+        }
+      },
+      "gateway-policy-metadata": {
+        "type": "object",
+        "required": [
+          "id",
+          "priority",
+          "subjectRole",
+          "subjectTier",
+          "subjectActor",
+          "tool",
+          "resource",
+          "effect",
+          "enabled",
+          "createdAt",
+          "updatedAt"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "id": "uuid",
+          "priority": "signed-int32",
+          "subjectRole": "nullable-admin-lead-member",
+          "subjectTier": "nullable-team-external",
+          "subjectActor": "nullable-non-empty-string",
+          "tool": { "oneOf": ["base-contract-tool", { "const": "*" }] },
+          "resource": "canonical-github-repository-resource-or-wildcard",
+          "effect": { "enum": ["block", "require_approval", "allow"] },
+          "enabled": { "type": "boolean" },
+          "createdAt": "rfc3339-date-time",
+          "updatedAt": "rfc3339-date-time"
+        }
+      },
+      "gateway-credential-metadata": {
+        "type": "object",
+        "required": ["credentialId", "version", "createdAt", "expiresAt", "revokedAt", "replacesCredentialId"],
+        "additionalProperties": false,
+        "properties": {
+          "credentialId": { "pattern": "^[A-Za-z0-9_-]{22}$" },
+          "version": { "type": "integer", "minimum": 1 },
+          "createdAt": "rfc3339-date-time",
+          "expiresAt": "nullable-rfc3339-date-time",
+          "revokedAt": "nullable-rfc3339-date-time",
+          "replacesCredentialId": "nullable-canonical-base64url-16-bytes"
+        },
+        "forbidden": ["secret", "secretHash", "credentialHash"]
+      }
+    },
+    "policy": {
+      "toolkit": "aios-github-readonly",
+      "effects": ["block", "require_approval", "allow"],
+      "storedEffectMapping": { "block": "deny", "require_approval": "require_approval", "allow": "allow" },
+      "subjectSelector": {
+        "taggedUnion": [
+          { "type": "actor", "required": ["memberId"] },
+          { "type": "role", "required": ["role"] },
+          { "type": "tier", "required": ["tier"], "tier": ["team", "external"] },
+          { "type": "team", "required": [] }
+        ],
+        "exactlyOne": true
+      },
+      "requestFields": ["subject", "tool", "resource", "effect", "priority", "enabled", "correlationId"]
+    },
+    "credentialMetadataFieldsExactly": [
+      "credentialId",
+      "version",
+      "createdAt",
+      "expiresAt",
+      "revokedAt",
+      "replacesCredentialId"
+    ],
+    "rotation": {
+      "clientGeneratedSecret": true,
+      "secretReturned": false,
+      "overlapUntilExplicitRevocationOrExpiry": true
+    }
+  },
+  "policyPrecedence": {
+    "dimensions": [
+      ["actor", "role", "tier", "team"],
+      ["exact-tool", "wildcard-tool"],
+      ["exact-repository", "wildcard-repository"],
+      ["highest-numeric-priority"],
+      ["block", "require_approval", "allow"],
+      ["no-match-blocks"]
+    ],
+    "vectors": [
+      { "name": "actor-beats-role", "candidates": ["role:block", "actor:allow"], "winner": "actor:allow" },
+      { "name": "role-beats-tier", "candidates": ["tier:block", "role:allow"], "winner": "role:allow" },
+      { "name": "tier-beats-team", "candidates": ["team:block", "tier:allow"], "winner": "tier:allow" },
+      { "name": "exact-tool-beats-wildcard", "candidates": ["wildcard-tool:block", "exact-tool:allow"], "winner": "exact-tool:allow" },
+      { "name": "exact-resource-beats-wildcard", "candidates": ["wildcard-repository:block", "exact-repository:allow"], "winner": "exact-repository:allow" },
+      { "name": "priority-descending", "candidates": ["priority:1:block", "priority:2:allow"], "winner": "priority:2:allow" },
+      { "name": "effect-block", "candidates": ["allow", "require_approval", "block"], "winner": "block" },
+      { "name": "effect-approval", "candidates": ["allow", "require_approval"], "winner": "require_approval" },
+      { "name": "default-deny", "candidates": [], "winner": "block" }
+    ]
+  },
+  "stateMachine": {
+    "initial": { "execution": "approval_required", "approval": "pending" },
+    "transitions": [
+      { "event": "approve", "execution": "approval_required->approved", "approval": "pending->approved" },
+      { "event": "deny", "execution": "approval_required->cancelled", "approval": "pending->denied" },
+      { "event": "database-time-expiry", "execution": "approval_required->expired", "approval": "pending->expired" },
+      { "event": "claim", "execution": "approved->claimed", "approval": "approved->approved" },
+      { "event": "revalidation-failure", "execution": "approved->cancelled", "approval": "approved->cancelled" },
+      { "event": "seal-failure", "execution": "claimed->failed", "approval": "approved->approved", "classification": "credential" },
+      { "event": "outcome-success", "execution": "claimed->succeeded", "approval": "approved->approved", "classification": "success" },
+      { "event": "outcome-credential", "execution": "claimed->failed", "approval": "approved->approved", "classification": "credential" },
+      { "event": "outcome-network", "execution": "claimed->failed", "approval": "approved->approved", "classification": "network" },
+      { "event": "outcome-upstream", "execution": "claimed->failed", "approval": "approved->approved", "classification": "upstream" },
+      { "event": "outcome-response-too-large", "execution": "claimed->failed", "approval": "approved->approved", "classification": "response_too_large" },
+      { "event": "outcome-internal", "execution": "claimed->failed", "approval": "approved->approved", "classification": "internal" }
+    ],
+    "databaseTimeOnly": ["expiry", "decision-timestamp", "claim-timestamp", "credential-expiry"],
+    "oneEventIndexes": ["decision", "claim", "rotation", "revocation", "expiry", "settlement"]
+  },
+  "persistence": {
+    "credentialTable": "gateway_service_credentials",
+    "identityTableRemainsBindingAuthority": "gateway_service_identities",
+    "legacyCredentialColumns": "immutable-compatibility-data-not-authentication-source",
+    "legacyPreflightError": "gateway_service_identity_legacy_preflight",
+    "initialCredentialSource": "copy-existing-digest-never-derive-plaintext",
+    "immutableExecutionSnapshots": [
+      "actor",
+      "role",
+      "tier",
+      "policy-resource",
+      "encrypted-request-envelope",
+      "encrypted-request-envelope-hash",
+      "resume-fingerprint",
+      "claim-idempotency-key"
+    ],
+    "gatewaySqlWriters": ["lib/gateway/persistence.ts", "lib/gateway/admin-persistence.ts"]
+  },
+  "vectors": {
+    "resumeFingerprint": {
+      "fields": [
+        "credentialId",
+        "credentialVersion",
+        "executionId",
+        "executorSubjectId",
+        "executorTenantId",
+        "memberId",
+        "requestHash",
+        "serviceIdentityId",
+        "teamId",
+        "tool",
+        "toolkit"
+      ],
+      "value": {
+        "credentialId": "ICEiIyQlJicoKSorLC0uLw",
+        "credentialVersion": 2,
+        "executionId": "22222222-2222-4222-8222-222222222222",
+        "executorSubjectId": "executor-user-42",
+        "executorTenantId": "executor-tenant-7",
+        "memberId": "44444444-4444-4444-8444-444444444444",
+        "requestHash": "4b18a1b9c0f093f7e46b4410e245fd88f011e6d820b34ef9446296ff9386f310",
+        "serviceIdentityId": "11111111-1111-4111-8111-111111111111",
+        "teamId": "33333333-3333-4333-8333-333333333333",
+        "tool": "github.repository.get",
+        "toolkit": "aios-github-readonly"
+      },
+      "jcs": "{\"credentialId\":\"ICEiIyQlJicoKSorLC0uLw\",\"credentialVersion\":2,\"executionId\":\"22222222-2222-4222-8222-222222222222\",\"executorSubjectId\":\"executor-user-42\",\"executorTenantId\":\"executor-tenant-7\",\"memberId\":\"44444444-4444-4444-8444-444444444444\",\"requestHash\":\"4b18a1b9c0f093f7e46b4410e245fd88f011e6d820b34ef9446296ff9386f310\",\"serviceIdentityId\":\"11111111-1111-4111-8111-111111111111\",\"teamId\":\"33333333-3333-4333-8333-333333333333\",\"tool\":\"github.repository.get\",\"toolkit\":\"aios-github-readonly\"}",
+      "sha256": "0f0369a66660d1030e4104cfd394e001a16d90e0df6511698c6642ea92f7ee45"
+    },
+    "requestEnvelope": {
+      "algorithm": "AES-256-GCM",
+      "keyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "nonceHex": "0c0d0e0f1011121314151617",
+      "aadUtf8": "aios-gateway-request-envelope:v1\u000022222222-2222-4222-8222-222222222222",
+      "normalizedArgsJcs": "{\"owner\":\"octo\",\"repo\":\"project\"}",
+      "requestHash": "4b18a1b9c0f093f7e46b4410e245fd88f011e6d820b34ef9446296ff9386f310",
+      "ciphertextAndTagHex": "e3dc06af11138e710d0827b6e5e404cb7771889e995f0188ebd0958a81c3b4d851ece0082f5e388b03825d26c60672b289",
+      "wire": "v1.DA0ODxAREhMUFRYX.49wGrxETjnENCCe25eQEy3dxiJ6ZXwGI69CVioHDtNhR7OAIL144iwOCXSbGBnKyiQ",
+      "wireSha256": "4d29bfa49a3c514746d0b2feea8acabc1f5291085f8f67dad294a434bcde0b63",
+      "maxPlaintextBytes": 65536,
+      "immutableAfterCreation": true
+    },
+    "rotatedCredentialSeal": {
+      "credentialId": "ICEiIyQlJicoKSorLC0uLw",
+      "credentialVersion": 2,
+      "materialBase64url": "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8",
+      "storedDigest": "72dbb7336c76780023f83da4c355f2eeea85733b13d3477697917790c1229084",
+      "derivedMaterialHex": "12307534b863faaa2da3fce2598dc951616305a733ed581f83df599551e84c6a",
+      "protectedHeaderJcs": "{\"eid\":\"22222222-2222-4222-8222-222222222222\",\"exp\":1784044815,\"iat\":1784044800,\"kid\":\"ICEiIyQlJicoKSorLC0uLw.v2\",\"provider\":\"github\",\"sid\":\"11111111-1111-4111-8111-111111111111\",\"v\":1}",
+      "nonceHex": "202122232425262728292a2b",
+      "plaintextUtf8": "fixture-pat-readonly",
+      "sealed": "v1.eyJlaWQiOiIyMjIyMjIyMi0yMjIyLTQyMjItODIyMi0yMjIyMjIyMjIyMjIiLCJleHAiOjE3ODQwNDQ4MTUsImlhdCI6MTc4NDA0NDgwMCwia2lkIjoiSUNFaUl5UWxKaWNvS1NvckxDMHVMdy52MiIsInByb3ZpZGVyIjoiZ2l0aHViIiwic2lkIjoiMTExMTExMTEtMTExMS00MTExLTgxMTEtMTExMTExMTExMTExIiwidiI6MX0.ICEiIyQlJicoKSor.txZya27eDKroyOMxsvBfPhlFUzBZ_nF4R5NHj_htG1KXgwQ8"
+    }
+  },
+  "security": {
+    "queueFieldsOnly": ["member", "tool", "allowlisted-repository-resource", "request-hash-prefix", "age", "database-expiry"],
+    "neverExpose": [
+      "pat",
+      "service-secret",
+      "credential-ciphertext",
+      "encrypted-request-envelope",
+      "request-envelope-plaintext",
+      "lease",
+      "full-request-hash",
+      "derived-key",
+      "credential-bearing-retry"
+    ],
+    "strictAuditRollback": true,
+    "recursiveCanaryScan": true
+  },
+  "discovery": {
+    "expected": {
+      "resumeRoutes": 1,
+      "adminRoutes": 9,
+      "errors": 11,
+      "nonEnumerating404Families": 8,
+      "authorizationRoles": 6,
+      "policyVectors": 9,
+      "stateTransitions": 12,
+      "outcomeClassifications": 6,
+      "cryptographicVectors": 3,
+      "securityNeverExpose": 9
+    }
+  }
+}

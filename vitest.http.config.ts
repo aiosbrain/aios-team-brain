@@ -28,6 +28,10 @@ process.env.DATABASE_URL = databaseTestUrl;
 process.env.SECRETS_KEY ??= Buffer.alloc(32, 7).toString("base64");
 // The login route signs sessions with AUTH_SECRET (lib/auth/pg-session requires >=16 chars).
 process.env.AUTH_SECRET ??= "http-tier-test-secret-not-for-production";
+// Trusted base URL for emailed magic links (appBaseUrl). Without it the request-magic-link after-job
+// no-ops (no safe link to build), so the known-email delivery assertion needs it set. No mail
+// provider is configured, so sendMagicLink still drops to a dev-log — the token row is what we assert.
+process.env.APP_URL ??= `http://127.0.0.1:${process.env.HTTP_TEST_PORT ?? "3010"}`;
 // Server port override (default 3010 — see test/http/server-url.ts, which derives
 // the URL both the server and clients use). We avoid process.env.BASE_URL: Vite
 // reserves that name and pins it to "/".

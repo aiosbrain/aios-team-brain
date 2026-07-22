@@ -12,7 +12,9 @@ import { listRecentIngestRuns } from "@/lib/ingest/runs";
 import { IngestRunsPanel } from "@/components/admin/ingest-runs-panel";
 import { getRetrievalHealth } from "@/lib/query/retrieval-health";
 import { RetrievalHealthCard } from "@/components/admin/retrieval-health-card";
-import { describeAnswering } from "@/lib/query/llm-backend";
+import { getPipelineHealth } from "@/lib/ingest/pipeline-health";
+import { PipelineHealthBanner } from "@/components/admin/pipeline-health-banner";
+import { describeAnswering, describeReasoning } from "@/lib/query/llm-backend";
 import { normalizeAnsweringProvider } from "@/lib/query/answering";
 
 export const metadata: Metadata = { title: "Integrations" };
@@ -33,7 +35,7 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ t
   const user = await getSessionUser();
   const { data: team } = await sessionDb
     .from("teams")
-    .select("id, primary_pm_provider, answering_provider")
+    .select("id, primary_pm_provider, answering_provider, reasoning_model, reasoning_provider")
     .eq("slug", teamSlug)
     .maybeSingle();
   if (!team) return null;
@@ -48,9 +50,10 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ t
     : { data: null };
 
   const db = adminClient();
-  const [integrations, ingestRuns, freshness, retrievalHealth] = await Promise.all([
+  const [integrations, ingestRuns, pipelineHealth, freshness, retrievalHealth] = await Promise.all([
     listIntegrations(db, team.id, { role: me?.role as string | undefined }) as Promise<IntegrationRow[]>,
     listRecentIngestRuns(db, team.id, 30),
+    getPipelineHealth(team.id),
     // Already-scanned repos (from codebase scans) → offered as one-click link suggestions. Read
     // through the tier-gated codebases choke point (CLAUDE.md §5), never the table directly.
     getCodebaseFreshness(db, team.id, (me?.tier as "team" | "external") ?? "external"),
@@ -68,22 +71,29 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ t
   const hasKey = (type: "anthropic" | "openai" | "openrouter") =>
     !!integrations.find((i) => i.type === type)?.hasSecret;
   const answeringProvider = normalizeAnsweringProvider(team.answering_provider);
+  const reasoningProvider = normalizeAnsweringProvider(team.reasoning_provider);
+  const reasoningModel = (team.reasoning_model as string | null) ?? null;
   const localBaseUrl = process.env.LLM_BASE_URL ?? undefined;
-  const answering = describeAnswering(
-    { LLM_BASE_URL: localBaseUrl, LLM_MODEL: process.env.LLM_MODEL },
-    {
-      anthropicKey: "env-or-set", // anthropic answers via env key even when no team key is stored
-      anthropicModel: modelOf("anthropic"),
-      openaiKey: hasKey("openai") ? "set" : null,
-      openaiModel: modelOf("openai"),
-      openrouterKey: hasKey("openrouter") ? "set" : null,
-      openrouterModel: modelOf("openrouter"),
-      activeProvider: answeringProvider,
-    }
-  );
-  const answeringModels: Record<"anthropic" | "openai", string | null> = {
+  // One key set drives both the answering + reasoning indicators (no key is decrypted — a non-empty
+  // sentinel stands in for "key is set" since the resolver only checks presence).
+  const answeringKeys = {
+    anthropicKey: "env-or-set", // anthropic answers via env key even when no team key is stored
+    anthropicModel: modelOf("anthropic"),
+    openaiKey: hasKey("openai") ? "set" : null,
+    openaiModel: modelOf("openai"),
+    openrouterKey: hasKey("openrouter") ? "set" : null,
+    openrouterModel: modelOf("openrouter"),
+    activeProvider: answeringProvider,
+    reasoningModel,
+    reasoningProvider,
+  };
+  const llmEnv = { LLM_BASE_URL: localBaseUrl, LLM_MODEL: process.env.LLM_MODEL };
+  const answering = describeAnswering(llmEnv, answeringKeys);
+  const reasoning = describeReasoning(llmEnv, answeringKeys);
+  const answeringModels: Record<"anthropic" | "openai" | "openrouter", string | null> = {
     anthropic: modelOf("anthropic"),
     openai: modelOf("openai"),
+    openrouter: modelOf("openrouter"),
   };
   const localConfigured = !!localBaseUrl;
   const scannedRepos = Array.from(
@@ -105,6 +115,7 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ t
 
   return (
     <div className="flex flex-col gap-4">
+      <PipelineHealthBanner health={pipelineHealth} href={`/t/${teamSlug}/admin/integrations`} />
       <div>
         <h1 className="text-xl font-semibold text-ink">Integrations</h1>
         <p className="mt-1 text-sm text-ink-secondary">
@@ -134,8 +145,15 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ t
           effective: { provider: answering.provider, model: answering.model },
           usedFallback: answering.usedFallback,
           localConfigured,
+          anthropicConfigured: true, // anthropic answers via the env key even without a team key
           openrouterConfigured: hasKey("openrouter"),
           openaiConfigured: hasKey("openai"),
+          reasoning: {
+            provider: reasoningProvider,
+            model: reasoningModel,
+            effective: reasoning.enabled ? { provider: reasoning.provider, model: reasoning.model } : null,
+            usedFallback: reasoning.usedFallback,
+          },
         }}
       />
       <MemberOnboardingPanel teamSlug={teamSlug} values={onboardingValues} />

@@ -54,14 +54,14 @@ describe("POST /api/auth/login (HTTP)", () => {
 });
 
 describe("POST /api/auth/request-magic-link (HTTP)", () => {
-  it("rejects an unknown email with 403 and never sets a cookie", async () => {
+  it("accepts an unknown email with the same 200 shape and never sets a cookie", async () => {
     const res = await fetch(`${BASE_URL}/api/auth/request-magic-link`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ email: `nobody-${randomUUID().slice(0, 8)}@nope.test` }),
     });
-    expect(res.status).toBe(403);
-    expect((await res.json()).error).toBe("not_recognized");
+    expect(res.status).toBe(200);
+    expect((await res.json()).ok).toBe(true);
     expect(res.headers.get("set-cookie")).toBeNull();
   });
 
@@ -78,8 +78,38 @@ describe("POST /api/auth/request-magic-link (HTTP)", () => {
     expect((await res.json()).ok).toBe(true);
     // The link still has to be clicked (GET /auth/confirm) before any session exists.
     expect(res.headers.get("set-cookie")).toBeNull();
+
+    // The token is issued in the route's after() job, which runs post-response on the real server.
+    // Poll the shared test DB so we actually exercise that deferred path end-to-end (not just a
+    // mocked after()) and confirm a single-use token row appears for the recognized member.
+    const issued = await pollForAuthToken(email);
+    expect(issued).toBe(true);
+  });
+
+  it("does NOT issue a token for an unknown email (after-job stops at the member lookup)", async () => {
+    const email = `nobody-${randomUUID().slice(0, 8)}@nope.test`;
+    const res = await fetch(`${BASE_URL}/api/auth/request-magic-link`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email }),
+    });
+    expect(res.status).toBe(200);
+    // Give the after() job the same window the positive test polls, then assert nothing was minted.
+    const issued = await pollForAuthToken(email);
+    expect(issued).toBe(false);
   });
 });
+
+/** Poll the shared test DB for a magic-link token row for `email` (issued by the route's after-job). */
+async function pollForAuthToken(email: string, timeoutMs = 4000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const { data } = await db().from("auth_tokens").select("token_hash").eq("email", email);
+    if (data && data.length > 0) return true;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  return false;
+}
 
 describe("GET /auth/confirm (HTTP) — full magic-link round trip", () => {
   it("redeems a token minted for a known member, sets the session cookie, and routes a first login through /auth/welcome", async () => {
