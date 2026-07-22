@@ -8,8 +8,7 @@ import { recentFacts, resolveEpisodeItems, type AtomicFact } from "./learning";
 import { GraphitiClient } from "./graphiti-client";
 import { episodeGroupId, type AccessTier } from "./group";
 import { attributeParticipants, attributedFactTexts, withEvidenceParticipants } from "./arc-attribution";
-import { resolveHumanActorsByItem } from "./human-actors";
-import { resolveContributorsByItem } from "@/lib/attribution/contributor-credit";
+import { resolveItemCredit } from "@/lib/attribution/contributor-credit";
 import { readArcCache, writeArcCache } from "./arc-cache";
 import { arcIneligibleItemIds } from "./arc-eligibility";
 
@@ -486,16 +485,21 @@ async function synthesizeArcs(
   // the LLM, preserving the pre-cache recompute behavior.)
   if (pool.length === 0 && correctionTexts.length === 0) return [];
   // Resolve attribution for the WHOLE pool (higher uuid cap to match) so balancing sees each fact's
-  // human. epToItem/humanByItem stay supersets of the balanced set — safe for evidence + attribution.
+  // human. epToItem/creditByItem stay supersets of the balanced set — safe for evidence + attribution.
   const epToItem = await resolveEpisodeItems(groups, pool.flatMap((f) => f.episodeUuids), FACT_POOL * 3);
   const allItemIds = [...new Set([...epToItem.values()].map((v) => v.itemId).filter((id): id is string => !!id))];
-  // Two attributions per item: the single CURRENT-owner map (drives balancing + the fact prompt below,
-  // where one fact needs one primary human) and the evidence-gated CONTRIBUTOR SET (drives arc
-  // `participants`, so a prior contributor whose item was reassigned away still gets credited on the chip).
-  const [humanByItem, contributorsByItem] = await Promise.all([
-    resolveHumanActorsByItem(db, teamId, allItemIds),
-    resolveContributorsByItem(db, teamId, allItemIds),
-  ]);
+  // Evidence-gated credit per item (one query pass): the `primary` WORKER drives balancing + the fact
+  // prompt (one fact needs one representative — a reassigned-away worker's facts now balance under THEM,
+  // not the non-working new owner), and the `contributors` SET drives arc `participants` (so a prior
+  // contributor is still on the chip). Both come from `item_versions` (the work ledger), not the current
+  // owner alone.
+  const creditByItem = await resolveItemCredit(db, teamId, allItemIds);
+  const primaryByItem = new Map<string, string>();
+  const contributorsByItem = new Map<string, string[]>();
+  for (const [id, credit] of creditByItem) {
+    if (credit.primary) primaryByItem.set(id, credit.primary);
+    if (credit.contributors.length) contributorsByItem.set(id, credit.contributors);
+  }
   // Resolve a fact's (item, human) TOGETHER, preferring the first source item that resolves a HUMAN and
   // only falling back to the first resolvable item when none has one. Resolving them independently would
   // regress attribution: a fact whose episodes are [connector item (no human), John's item] must be
@@ -512,7 +516,7 @@ async function synthesizeArcs(
       const id = epToItem.get(u)?.itemId;
       if (!id) continue;
       if (!firstItem) firstItem = id;
-      const h = humanByItem.get(id);
+      const h = primaryByItem.get(id);
       if (h) {
         resolved = { item: id, human: h };
         break;
@@ -551,7 +555,7 @@ async function synthesizeArcs(
   const contributorCount = new Set(facts.map(humanOfFact).filter(Boolean)).size;
   const raw = await callLLMRaw(
     buildSystemPrompt(arcsRequested(contributorCount)),
-    buildPrompt(attributedFactTexts(facts, epToItem, humanByItem), correctionTexts),
+    buildPrompt(attributedFactTexts(facts, epToItem, primaryByItem), correctionTexts),
     keys,
     { db, teamId },
     llmTimeoutMs

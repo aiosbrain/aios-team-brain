@@ -69,10 +69,16 @@ version authors (unlocked), collapsing to the corrected owner when `member_id_lo
 chip — the `narrative-arcs-representation` fix. `item_versions` naturally starves mislabels (an assigned-but-
 never-worked owner leaves no version) without needing to read the `item.reassigned` stream.
 
+## Second consumer — BUILT: evidence-gated arc BALANCING
+
+`resolveItemCredit` also returns a single `primary` worker per item (`creditedPrimaryId`), and arc synthesis
+now balances each fact + attributes the prompt under that primary instead of the current owner
+(`lib/graph/arcs.ts`). Scoped precisely to the reassignment case: the primary is the current owner when they
+actually produced a version (unchanged), else the **latest actual worker** when the owner did no work — so a
+reassigned-away contributor gets their own balanced arc share, not the non-working new owner. Locked →
+corrected owner; unattributed stays unattributed (balancing behavior unchanged there).
+
 ## Out of scope (follow-ups)
-- **Per-contributor fact BALANCING** (not just participants): a reassigned-away contributor's facts still
-  balance under the current owner, so they appear as a co-participant but don't yet get their own balanced
-  arc share. Next increment.
 - Consuming the `item.reassigned` stream + `from_owned_since` directly (the version ledger covers the arc
   case; the transition stream matters for finer window boundaries + the short-tenure heuristic).
 - **Heal `item_versions.member_id` on a re-point/heal.** A heal/source-re-point updates `items.member_id`
