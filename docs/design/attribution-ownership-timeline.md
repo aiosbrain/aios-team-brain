@@ -59,7 +59,27 @@ Do NOT credit by label. **Credit by evidence, gated, with corrections as a hard 
    surface it in the Admin → Attribution drill-down (the existing human-adjudication surface; its `mismatch`
    badge already flags current drift).
 
-## Out of scope (this doc records the design; the consumer is the follow-up)
-- The windowed-credit computation itself (narrative arcs crediting each evidenced window).
+## First consumer — BUILT: evidence-gated arc participants
+
+`lib/attribution/contributor-credit.resolveContributorsByItem` implements rules 1–3 above over
+**`item_versions`** (each body change = a unit of work, attributed to the then-resolved author — a work-time
+ledger, no sync-vs-work-time reconciliation needed): an item's contributors = its distinct non-connector
+version authors (unlocked), collapsing to the corrected owner when `member_id_locked`. Wired into narrative-arc
+**`participants`** (`lib/graph/arcs.ts`) so a prior contributor whose item was reassigned away is still on the
+chip — the `narrative-arcs-representation` fix. `item_versions` naturally starves mislabels (an assigned-but-
+never-worked owner leaves no version) without needing to read the `item.reassigned` stream.
+
+## Out of scope (follow-ups)
+- **Per-contributor fact BALANCING** (not just participants): a reassigned-away contributor's facts still
+  balance under the current owner, so they appear as a co-participant but don't yet get their own balanced
+  arc share. Next increment.
+- Consuming the `item.reassigned` stream + `from_owned_since` directly (the version ledger covers the arc
+  case; the transition stream matters for finer window boundaries + the short-tenure heuristic).
+- **Heal `item_versions.member_id` on a re-point/heal.** A heal/source-re-point updates `items.member_id`
+  but writes no new version and no lock, so a stale/mis-resolved version author (e.g. a doc pushed via the
+  wrong key pre-#329) keeps its old `member_id`. Version-based credit then credits that stale author over
+  the healed owner (the inverse of the bug this fixes). Today the admin **lock** (a correction) is the
+  override; the durable fix is to re-point the matching `item_versions.member_id` rows when
+  `decideReattribution` re-points, so the work ledger tracks the corrected author.
 - The exact source-event timestamp (we use the sync-time `created_at`; a source history API would sharpen
   `from_owned_since`).

@@ -9,6 +9,7 @@ import { GraphitiClient } from "./graphiti-client";
 import { episodeGroupId, type AccessTier } from "./group";
 import { attributeParticipants, attributedFactTexts, withEvidenceParticipants } from "./arc-attribution";
 import { resolveHumanActorsByItem } from "./human-actors";
+import { resolveContributorsByItem } from "@/lib/attribution/contributor-credit";
 import { readArcCache, writeArcCache } from "./arc-cache";
 import { arcIneligibleItemIds } from "./arc-eligibility";
 
@@ -415,12 +416,14 @@ function buildPrompt(factTexts: string[], corrections: string[]): string {
   return lines.join("\n");
 }
 
-/** Distinct humans behind a set of item ids, looked up in an already-resolved `humanByItem` map
- *  (no DB access) — shared by the per-arc `participants` rewrite below. */
-function humansForItems(itemIds: (string | undefined)[], humanByItem: Map<string, string>): string[] {
+/** Distinct contributors behind a set of item ids, looked up in an already-resolved per-item CONTRIBUTOR
+ *  SET map (no DB access) — shared by the per-arc `participants` rewrite below. The set is evidence-gated
+ *  (everyone who did work on the item, not just its current owner), so a prior contributor whose item was
+ *  later reassigned still shows on the arc chip. */
+function humansForItems(itemIds: (string | undefined)[], contributorsByItem: Map<string, string[]>): string[] {
   return [
     ...new Set(
-      itemIds.filter((id): id is string => !!id).map((id) => humanByItem.get(id)).filter((h): h is string => !!h)
+      itemIds.filter((id): id is string => !!id).flatMap((id) => contributorsByItem.get(id) ?? [])
     ),
   ];
 }
@@ -430,10 +433,10 @@ function humansForItems(itemIds: (string | undefined)[], humanByItem: Map<string
  *  evidence items, then UNION in any evidence human the model didn't name (`withEvidenceParticipants`)
  *  — so a contributor whose facts an arc cites is on the chip even when their name never appears in
  *  the fact text (commit-shaped work), and an arc the model returned with `participants: []` still
- *  names the people it's actually about. Pure over an already-resolved `humanByItem` map. */
-function attributeArcs(arcs: NarrativeArc[], humanByItem: Map<string, string>): NarrativeArc[] {
+ *  names the people it's actually about. Pure over an already-resolved per-item CONTRIBUTOR SET map. */
+function attributeArcs(arcs: NarrativeArc[], contributorsByItem: Map<string, string[]>): NarrativeArc[] {
   return arcs.map((arc) => {
-    const evidenceHumans = humansForItems(arc.evidence.map((e) => e.itemId), humanByItem);
+    const evidenceHumans = humansForItems(arc.evidence.map((e) => e.itemId), contributorsByItem);
     return {
       ...arc,
       participants: withEvidenceParticipants(
@@ -473,7 +476,13 @@ async function synthesizeArcs(
   // human. epToItem/humanByItem stay supersets of the balanced set — safe for evidence + attribution.
   const epToItem = await resolveEpisodeItems(groups, pool.flatMap((f) => f.episodeUuids), FACT_POOL * 3);
   const allItemIds = [...new Set([...epToItem.values()].map((v) => v.itemId).filter((id): id is string => !!id))];
-  const humanByItem = await resolveHumanActorsByItem(db, teamId, allItemIds);
+  // Two attributions per item: the single CURRENT-owner map (drives balancing + the fact prompt below,
+  // where one fact needs one primary human) and the evidence-gated CONTRIBUTOR SET (drives arc
+  // `participants`, so a prior contributor whose item was reassigned away still gets credited on the chip).
+  const [humanByItem, contributorsByItem] = await Promise.all([
+    resolveHumanActorsByItem(db, teamId, allItemIds),
+    resolveContributorsByItem(db, teamId, allItemIds),
+  ]);
   // Resolve a fact's (item, human) TOGETHER, preferring the first source item that resolves a HUMAN and
   // only falling back to the first resolvable item when none has one. Resolving them independently would
   // regress attribution: a fact whose episodes are [connector item (no human), John's item] must be
@@ -535,7 +544,7 @@ async function synthesizeArcs(
   );
   // Rank by recency → relevance so recent contributors' arcs lead, then attribute AI-agent names to
   // the humans behind each arc's own evidence.
-  return rankArcs(attributeArcs(parseArcsJson(raw, { facts, epToItem }), humanByItem));
+  return rankArcs(attributeArcs(parseArcsJson(raw, { facts, epToItem }), contributorsByItem));
 }
 
 // In-memory cache (per process). Keyed by the tier-visible group set. Fronts the Postgres `arc_cache`
