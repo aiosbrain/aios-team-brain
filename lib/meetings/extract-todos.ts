@@ -235,23 +235,29 @@ async function pruneStaleMeetingTodos(
   sourceItemId: string,
   keepKeys: Set<string>
 ): Promise<number> {
-  const { data: existing } = await db
+  // FAIL CLOSED on any read error — an unknown task list or push-state must never let the prune
+  // delete something (a transient DB error must not empty the preserve set; see the #249 pool wedge).
+  const { data: existing, error: tasksErr } = await db
     .from("tasks")
     .select("id, row_key")
     .eq("team_id", teamId)
     .eq("project_id", projectId)
     .eq("source_item_id", sourceItemId);
+  if (tasksErr) throw new Error(`prune: load meeting todos: ${tasksErr.message}`);
   const stale = ((existing ?? []) as { id: string; row_key: string }[]).filter((t) => !keepKeys.has(t.row_key));
   if (!stale.length) return 0;
-  const staleIds = stale.map((t) => t.id);
+  const staleKeys = stale.map((t) => t.row_key);
   // Preserve any pushed to a PM tool — never delete the local mirror of a live Linear/Plane issue.
-  const { data: links } = await db
+  // Match on ROW_KEY (the link's stable identity), so a link whose `task_id` was nulled (FK on-delete
+  // set null) still protects, and a key-scheme change can't silently drop the preservation.
+  const { data: links, error: linksErr } = await db
     .from("task_pm_links")
-    .select("task_id")
+    .select("row_key")
     .eq("team_id", teamId)
-    .in("task_id", staleIds);
-  const pushed = new Set(((links ?? []) as { task_id: string | null }[]).map((l) => l.task_id));
-  const toDelete = staleIds.filter((id) => !pushed.has(id));
+    .in("row_key", staleKeys);
+  if (linksErr) throw new Error(`prune: load pm links: ${linksErr.message}`);
+  const pushedKeys = new Set(((links ?? []) as { row_key: string }[]).map((l) => l.row_key));
+  const toDelete = stale.filter((t) => !pushedKeys.has(t.row_key)).map((t) => t.id);
   if (!toDelete.length) return 0;
   const { error } = await db.from("tasks").delete().eq("team_id", teamId).in("id", toDelete);
   if (error) throw new Error(`prune stale meeting todos: ${error.message}`);
@@ -272,6 +278,24 @@ export async function createMeetingTodoTasks(
   const projectId = await ensureMeetingTodoProject(db, teamId);
   let upserted = 0;
 
+  // `status` is INSERT-ONLY: preserve the CURRENT status of any task that already exists so a
+  // re-extract never resets a todo the user (or an inbound PM-tool sync) already progressed — e.g.
+  // one moved to in_progress/done — back to the configured default category. The pg upsert clobbers
+  // every non-conflict column via EXCLUDED, so we can't exclude `status` in the write; instead we
+  // read the existing status and carry it forward. New rows fall through to the configured default.
+  const rowKeys = [...new Set(rows.map((r) => r.rowKey))];
+  const existingStatus = new Map<string, string>();
+  if (rowKeys.length) {
+    const { data: cur, error: curErr } = await db
+      .from("tasks")
+      .select("row_key, status")
+      .eq("team_id", teamId)
+      .eq("project_id", projectId)
+      .in("row_key", rowKeys);
+    if (curErr) throw new Error(`load existing meeting todos: ${curErr.message}`);
+    for (const t of (cur ?? []) as { row_key: string; status: string }[]) existingStatus.set(t.row_key, t.status);
+  }
+
   for (const row of rows) {
     const { error } = await db
       .from("tasks")
@@ -283,7 +307,7 @@ export async function createMeetingTodoTasks(
           row_key: row.rowKey,
           title: row.title,
           assignee: row.assignee,
-          status: opts.status ?? "backlog",
+          status: existingStatus.get(row.rowKey) ?? opts.status ?? "backlog",
           raw_status: "extracted",
           sprint: MEETING_TODO_LABEL,
           due_date: row.due,
@@ -344,6 +368,130 @@ export async function remapMeetingTodoSourceItem(
       .eq("task_id", t.id);
     if (linkErr) throw new Error(`meeting-todo link remap ${t.row_key}: ${linkErr.message}`);
   }
+}
+
+/** The pre-content-key row_key scheme: `meet-<10-hex source hash>-<3-digit ordinal>`. */
+const ORDINAL_ROW_KEY = /^meet-[0-9a-f]{10}-\d{3}$/;
+
+/** Recompute the CURRENT content-hash row_key for a task from its source item + title. */
+function contentRowKey(sourceItemId: string, title: string): string {
+  return `${ROW_PREFIX}-${stableHash(sourceItemId, 10)}-${stableHash(normalizeTitle(title), 12)}`;
+}
+
+export interface BackfillRowKeysResult {
+  /** Ordinal-keyed tasks examined. */ scanned: number;
+  /** Tasks renamed to their content key (link moved too). */ rekeyed: number;
+  /** Duplicate ordinal tasks (same content key) deleted. */ collapsed: number;
+}
+
+/**
+ * One-time migration for prod data created under the OLD ordinal row_key scheme (`meet-<hash>-001`).
+ * The extractor now keys todos by CONTENT (`meet-<hash>-<titleHash>`); without this, a task pushed to
+ * Linear/Plane BEFORE the switch keeps its ordinal key, so a re-extract mints a NEW content-keyed
+ * task for the same todo — the pushed ordinal row is preserved by the prune, and pushing the new copy
+ * opens a SECOND provider issue (the "duplicate Linear issue" bug Fable caught).
+ *
+ * This rewrites each ordinal-keyed task's `row_key` (and its `task_pm_links` row_key, matched by
+ * task_id — the projection engine resolves links by row_key) to the content key it would get today, so
+ * the next re-extract UPSERTS over it. Collisions (two ordinal rows → same content key; rare, since the
+ * extractor already de-dups titles per transcript) collapse to one survivor, preferring a pushed row so
+ * a live issue is never orphaned; an un-pushed duplicate is deleted. Idempotent — content-keyed rows are
+ * skipped, so it's safe to re-run / replay.
+ */
+export async function backfillMeetingTodoRowKeys(
+  db: DbClient,
+  teamId: string
+): Promise<BackfillRowKeysResult> {
+  const result: BackfillRowKeysResult = { scanned: 0, rekeyed: 0, collapsed: 0 };
+
+  // Resolve the meetings project WITHOUT creating it — nothing to backfill if the team has none.
+  const { data: proj, error: projErr } = await db
+    .from("projects")
+    .select("id")
+    .eq("team_id", teamId)
+    .eq("slug", MEETING_TODO_PROJECT_SLUG)
+    .maybeSingle();
+  if (projErr) throw new Error(`backfill: load project: ${projErr.message}`);
+  const projectId = (proj as { id: string } | null)?.id;
+  if (!projectId) return result;
+
+  const { data: taskRows, error: tasksErr } = await db
+    .from("tasks")
+    .select("id, source_item_id, title, row_key")
+    .eq("team_id", teamId)
+    .eq("project_id", projectId);
+  if (tasksErr) throw new Error(`backfill: load tasks: ${tasksErr.message}`);
+  const allTasks = (taskRows ?? []) as { id: string; source_item_id: string | null; title: string; row_key: string }[];
+  const ordinal = allTasks.filter((t) => t.source_item_id && ORDINAL_ROW_KEY.test(t.row_key));
+  result.scanned = ordinal.length;
+  if (!ordinal.length) return result;
+
+  // Which tasks are already pushed to a PM tool (prefer keeping those on a collision).
+  const { data: linkRows, error: linksErr } = await db
+    .from("task_pm_links")
+    .select("task_id, row_key")
+    .eq("team_id", teamId)
+    .eq("project_id", projectId);
+  if (linksErr) throw new Error(`backfill: load pm links: ${linksErr.message}`);
+  const links = (linkRows ?? []) as { task_id: string | null; row_key: string }[];
+  // A task is "pushed" if a PM link points at it. Match by BOTH task_id AND row_key — the same
+  // reason the prune fix keys on row_key: `task_pm_links.task_id` is nullable (FK on-delete set null),
+  // so a link whose task was deleted+recreated (its task_id nulled) still protects via its row_key,
+  // which the ordinal task still carries. Missing this would treat a pushed task as un-pushed and
+  // delete it / skip its orphaned link → the exact duplicate-issue bug this backfill fixes.
+  const pushedTaskIds = new Set(links.map((l) => l.task_id).filter((id): id is string => Boolean(id)));
+  const pushedRowKeys = new Set(links.map((l) => l.row_key));
+  const isPushed = (t: { id: string; row_key: string }) => pushedTaskIds.has(t.id) || pushedRowKeys.has(t.row_key);
+  // Content keys already taken (by a task a re-extract created) — fold ordinal rows into them, never
+  // rename onto an occupied key (that would violate the (team,project,row_key) unique index).
+  const takenKeys = new Set(allTasks.filter((t) => !ORDINAL_ROW_KEY.test(t.row_key)).map((t) => t.row_key));
+
+  // Group ordinal tasks by the content key they map to.
+  const groups = new Map<string, typeof ordinal>();
+  for (const t of ordinal) {
+    const key = contentRowKey(t.source_item_id as string, t.title);
+    const g = groups.get(key) ?? [];
+    g.push(t);
+    groups.set(key, g);
+  }
+
+  const now = new Date().toISOString();
+  for (const [newKey, group] of groups) {
+    // Survivor is renamed to newKey; the rest are duplicates. If newKey is already occupied by a
+    // content-keyed task, there is NO survivor to rename — every ordinal row is a duplicate.
+    const survivor = takenKeys.has(newKey) ? undefined : group.find(isPushed) ?? group[0];
+
+    if (survivor) {
+      const oldKey = survivor.row_key;
+      // Rekey the LINK FIRST (matched by its stable row_key, scoped to this project+key — so a link
+      // whose task_id was nulled still moves), THEN the task. This ordering is crash-safe: if the
+      // process dies between the two writes, the task is still ordinal, so a re-run reprocesses it and
+      // the already-moved link update is a harmless no-op — no permanently stranded ordinal link.
+      const { error: linkErr } = await db
+        .from("task_pm_links")
+        .update({ row_key: newKey, updated_at: now })
+        .eq("team_id", teamId)
+        .eq("project_id", projectId)
+        .eq("row_key", oldKey);
+      if (linkErr) throw new Error(`backfill: rekey link ${oldKey}: ${linkErr.message}`);
+      const { error: upErr } = await db
+        .from("tasks")
+        .update({ row_key: newKey, updated_at: now })
+        .eq("id", survivor.id);
+      if (upErr) throw new Error(`backfill: rekey task ${oldKey}: ${upErr.message}`);
+      result.rekeyed++;
+    }
+
+    // Delete the un-pushed duplicates; keep a pushed duplicate rather than orphan a live issue.
+    for (const dup of group) {
+      if (dup === survivor) continue;
+      if (isPushed(dup)) continue;
+      const { error: delErr } = await db.from("tasks").delete().eq("team_id", teamId).eq("id", dup.id);
+      if (delErr) throw new Error(`backfill: collapse duplicate ${dup.row_key}: ${delErr.message}`);
+      result.collapsed++;
+    }
+  }
+  return result;
 }
 
 export async function extractMeetingTodosForTeam(
