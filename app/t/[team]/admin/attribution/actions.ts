@@ -1,6 +1,8 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
+import { after } from "next/server";
+import { bustTeamArcs } from "@/lib/ingest/reconcile-attribution";
 import { adminClient } from "@/lib/db/admin";
 import { requireTeamAdmin } from "@/lib/auth/guard";
 import { resolveAnsweringKeys } from "@/lib/query/answering";
@@ -58,7 +60,12 @@ export async function applyAttributionCorrectionAction(
 
   try {
     const result = await applyAttributionCorrection(adminClient(), ctx.teamId, parsed.data, { memberId: ctx.memberId }, expectedCount);
-    if (result.ok && result.updated > 0) revalidatePath(`/t/${teamSlug}/admin/attribution`);
+    if (result.ok && result.updated > 0) {
+      revalidatePath(`/t/${teamSlug}/admin/attribution`);
+      // The correction already re-pointed member_id (+ locked it) — just refresh arcs so the change
+      // shows without the 10-min TTL. No reattribute here (it would fight the correction).
+      after(() => bustTeamArcs(adminClient(), ctx.teamId, teamSlug));
+    }
     return result;
   } catch (e) {
     return { ok: false, updated: 0, target: "", error: e instanceof Error ? e.message : "apply failed" };

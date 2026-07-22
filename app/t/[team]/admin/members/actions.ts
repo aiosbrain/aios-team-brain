@@ -1,7 +1,9 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
+import { after } from "next/server";
 import { adminClient } from "@/lib/db/admin";
+import { reconcileAttribution, bustTeamArcs } from "@/lib/ingest/reconcile-attribution";
 import { requireTeamAdmin as requireAdmin } from "@/lib/auth/guard";
 import { linkGithub } from "@/lib/codebases/github";
 import { setMemberIdentity, removeMemberIdentity } from "@/lib/identity/member-identities";
@@ -40,6 +42,9 @@ export async function linkMemberGithub(
       actor: { kind: "member", memberId: ctx.memberId },
     });
     revalidatePath(`/t/${teamSlug}/admin/members`);
+    // Percolate: re-attribute already-ingested items to this new mapping + refresh arcs, in the
+    // background (snappy action). Idempotent + coalesced; manual "Re-attribute content" stays the fallback.
+    after(() => reconcileAttribution(adminClient(), ctx.teamId, teamSlug));
     return { ok: true, login: res.login, backfilled: res.backfilled };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "could not link github" };
@@ -75,6 +80,7 @@ export async function linkMemberIdentity(
       { force: true, actor: { kind: "member", memberId: ctx.memberId } }
     );
     revalidatePath(`/t/${teamSlug}/admin/members`);
+    after(() => reconcileAttribution(adminClient(), ctx.teamId, teamSlug));
     return { ok: true };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "could not link identity" };
@@ -107,6 +113,9 @@ export async function unlinkMemberIdentity(
       { actor: { kind: "member", memberId: ctx.memberId } }
     );
     revalidatePath(`/t/${teamSlug}/admin/members`);
+    // Unlink is conservative — reattribute never un-attributes, so this only re-points items that now
+    // resolve to a DIFFERENT member (it won't clear attribution). Refreshes arcs either way.
+    after(() => reconcileAttribution(adminClient(), ctx.teamId, teamSlug));
     return { ok: true };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "could not unlink identity" };
@@ -136,6 +145,7 @@ export async function addMemberEmail(
     });
     revalidatePath(`/t/${teamSlug}/admin/members`);
     if (res.collisions && !force) return { ok: false, error: res.note };
+    after(() => reconcileAttribution(adminClient(), ctx.teamId, teamSlug));
     return { ok: true, note: res.note };
   } catch (e2) {
     return { ok: false, error: e2 instanceof Error ? e2.message : "could not add email" };
@@ -153,7 +163,11 @@ export async function reattributeIdentitiesNow(
   const ctx = await requireAdmin(teamSlug);
   if (!ctx) return { ok: false, error: "admins only" };
   try {
+    // Inline (returns a summary the button shows). Bust arcs too so this recovery path ALSO clears the
+    // 10-min arc lag — matching the auto-reconcile hooks (the correction lock protects it from the same
+    // TOCTOU race a concurrent auto-reconcile might hit).
     const s = await reattributeItems(adminClient(), ctx.teamId);
+    await bustTeamArcs(adminClient(), ctx.teamId, teamSlug);
     revalidatePath(`/t/${teamSlug}/admin/members`);
     return { ok: true, message: `Re-attributed ${s.updated} of ${s.scanned} item(s) to current identity mappings.` };
   } catch (e) {
@@ -375,6 +389,7 @@ export async function removeMemberEmail(
       actor: { kind: "member", memberId: ctx.memberId },
     });
     revalidatePath(`/t/${teamSlug}/admin/members`);
+    after(() => reconcileAttribution(adminClient(), ctx.teamId, teamSlug));
     return { ok: true };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "could not remove email" };

@@ -42,6 +42,28 @@ export async function readArcCache(db: DbClient, teamId: string, groupKey: strin
   }
 }
 
+/**
+ * Mark ALL of a team's cached arcs STALE, so the next Learning view serves the stale-but-real prior and
+ * fires the SWR recompute (with the now-corrected `items.member_id`). Used after a re-attribution so arcs
+ * reflect the change immediately instead of after the 10-min TTL. See docs/design/attribution-propagation.md.
+ *
+ * Stale = `computed_at` set to JUST PAST the TTL (10-min TTL + 1-min grace), NEVER epoch: `getArcs` then
+ * treats it stale (SWR fires), but `commitArcs`'s empty-clobber guard still sees a "recent" prior (≈11 min
+ * ≪ `EMPTY_CLOBBER_MAX_AGE_MS` 48h), so if that recompute hiccups and returns [] the real arcs are KEPT,
+ * not blanked. Epoch would trip "prior too old → accept empty" and re-create the 2026-07 blank-panel bug.
+ * Best-effort — a failed stale-mark must never fail the caller.
+ */
+export async function staleArcCache(db: DbClient, teamId: string): Promise<void> {
+  try {
+    // > 10-min TTL, ≪ 48h clobber cap. (If an ops override sets ARCS_EMPTY_CLOBBER_MAX_AGE_MS below ~11min
+    // the two would invert — the forced-stale prior becomes clobber-eligible — so keep that cap ≫ the TTL.)
+    const staleAt = new Date(Date.now() - 11 * 60_000).toISOString();
+    await db.from("arc_cache").update({ computed_at: staleAt }).eq("team_id", teamId);
+  } catch {
+    // best-effort — arcs still refresh on their normal TTL if this fails
+  }
+}
+
 /** Upsert the cached arcs for one team+group_key, stamping `computed_at` now. Best-effort — a failed
  *  cache write must never fail synthesis (the arcs are still returned to the caller). */
 export async function writeArcCache(

@@ -36,7 +36,7 @@ export async function reattributeItems(
   // — re-resolving that frontmatter here would attribute the client's content to the named team member.
   const { data: items } = await db
     .from("items")
-    .select("id, member_id, frontmatter")
+    .select("id, member_id, member_id_locked, frontmatter")
     .eq("team_id", teamId)
     .neq("access", "external");
   const { data: connectors } = await db
@@ -49,21 +49,27 @@ export async function reattributeItems(
   const rows = (items ?? []) as {
     id: string;
     member_id: string | null;
+    member_id_locked: boolean | null;
     frontmatter: Record<string, unknown> | null;
   }[];
 
   let updated = 0;
   for (const it of rows) {
+    // A LOCKED item's member_id was set by a deliberate admin correction — never auto-revert it. The
+    // snapshot check skips already-locked rows; the `.eq("member_id_locked", false)` on the writes below
+    // closes the TOCTOU window — a correction applied MID-SCAN (after this snapshot, before the update)
+    // is protected by the DB re-checking the flag at write time, so the scan can't clobber it.
+    if (it.member_id_locked) continue;
     const resolved = resolveItemAuthorMember(idMap, it.frontmatter ?? {}, connectorIds);
     if (resolved && resolved !== it.member_id) {
-      const { error } = await db.from("items").update({ member_id: resolved }).eq("id", it.id);
+      const { error } = await db.from("items").update({ member_id: resolved }).eq("id", it.id).eq("member_id_locked", false);
       if (error) throw new Error(`reattribute item ${it.id}: ${error.message}`);
       updated++;
     } else if (!resolved && it.member_id && connectorIds.has(it.member_id)) {
       // Never "good attribution" — a pre-fix row still standing on a connector member with no
       // real author resolvable. Clear it, same conservative bar (only touches a strictly-worse
       // value), never applied to a previously-resolved human's attribution.
-      const { error } = await db.from("items").update({ member_id: null }).eq("id", it.id);
+      const { error } = await db.from("items").update({ member_id: null }).eq("id", it.id).eq("member_id_locked", false);
       if (error) throw new Error(`reattribute item ${it.id}: ${error.message}`);
       updated++;
     }
