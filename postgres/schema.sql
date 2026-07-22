@@ -917,6 +917,9 @@ create table if not exists items (
   content_sha256 text not null,
   actor text not null default '',
   member_id uuid references members(id) on delete set null,
+  -- true when member_id was set by a deliberate admin action (NL correction / re-attribution); locked
+  -- items are skipped by auto re-attribution + the unchanged-repush heal (docs/design/attribution-propagation.md).
+  member_id_locked boolean not null default false,
   synced_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   search tsvector generated always as

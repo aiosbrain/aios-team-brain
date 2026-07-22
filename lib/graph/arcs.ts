@@ -546,6 +546,26 @@ const cache = new Map<string, { arcs: NarrativeArc[]; at: number }>();
 const refreshing = new Set<string>();
 
 /**
+ * Evict THIS process's in-memory arc cache for one team, so it stops serving a warm copy after a
+ * re-attribution (the persistent `arc_cache` is separately marked stale — see `staleArcCache`). Keys are
+ * sorted joins of `${teamSlug}_${tier}` group ids, so a key belongs to the team iff any comma-segment
+ * starts with `${teamSlug}_`. Per-process only (the ≤10-min cross-instance bound in the design doc).
+ */
+/** Does an arc-cache key (a comma-joined set of `${slug}_${tier}` group ids) belong to `teamSlug`? The
+ *  `_` separator makes the `${slug}_` prefix test exact — team slugs are `[a-z0-9-]` (no `_`), so
+ *  "acme" never matches "acme-corp_team" or "acmex_team". Pure + unit-tested. */
+export function arcKeyBelongsToTeam(key: string, teamSlug: string): boolean {
+  const prefix = `${teamSlug}_`;
+  return key.split(",").some((g) => g.startsWith(prefix));
+}
+
+export function evictArcMemoryCache(teamSlug: string): void {
+  for (const key of cache.keys()) {
+    if (arcKeyBelongsToTeam(key, teamSlug)) cache.delete(key);
+  }
+}
+
+/**
  * Persist a freshly-synthesized arc set to both caches — but NEVER let an EMPTY result clobber a
  * non-empty one. An empty synthesis is almost always a transient upstream failure (LLM outage, a
  * reasoning model starving its own output, a graph blip), and a stale-but-real arc set beats a blank

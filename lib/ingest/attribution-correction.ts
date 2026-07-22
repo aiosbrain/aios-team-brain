@@ -36,7 +36,14 @@ export async function applyAttributionCorrection(
   if (r.matched.length === 0) return { ok: true, updated: 0, target: r.target.label };
 
   const ids = r.matched.map((m) => m.id);
-  const { error } = await db.from("items").update({ member_id: r.target.memberId }).eq("team_id", teamId).in("id", ids);
+  // LOCK the attribution: a deliberate correction must survive automatic re-attribution + the
+  // unchanged-repush heal (docs/design/attribution-propagation.md). `member_id_locked = true` marks it
+  // manual; `reattributeItems` and the heal skip locked rows.
+  const { error } = await db
+    .from("items")
+    .update({ member_id: r.target.memberId, member_id_locked: true })
+    .eq("team_id", teamId)
+    .in("id", ids);
   if (error) return { ok: false, updated: 0, target: r.target.label, error: error.message };
 
   await audit(db, {

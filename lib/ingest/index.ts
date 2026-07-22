@@ -87,7 +87,7 @@ export async function ingestItem(
   // 2. existing item?
   const { data: existing } = await db
     .from("items")
-    .select("id, content_sha256, member_id, frontmatter")
+    .select("id, content_sha256, member_id, member_id_locked, frontmatter")
     .eq("team_id", auth.teamId)
     .eq("project_id", project.id)
     .eq("path", payload.path)
@@ -110,8 +110,11 @@ export async function ingestItem(
     // clobber a human self-push's own attribution. Re-pointing an existing (wrong) attribution stays the
     // job of the explicit, admin-triggered `reattributeItems` batch. Never clears to null either (a
     // connector's unresolved re-push passes `authorMemberId: null`).
+    // …and NEVER when the attribution is LOCKED (a deliberate correction — incl. a "correct-to-nobody"
+    // whose member_id is null): the lock is what stops this null→member fill from refilling it.
+    const locked = (existing as { member_id_locked?: boolean | null }).member_id_locked === true;
     const patch: { synced_at: string; member_id?: string; frontmatter?: Record<string, unknown> } = { synced_at: now };
-    if (opts?.authorMemberId && existing.member_id === null) {
+    if (opts?.authorMemberId && existing.member_id === null && !locked) {
       patch.member_id = opts.authorMemberId;
     }
     // HEAL FRONTMATTER on an unchanged re-push: `content_sha256` covers only the body, but source-derived
@@ -186,7 +189,12 @@ export async function ingestItem(
 
   let itemId: string;
   if (existing) {
-    const { error } = await db.from("items").update(itemRecord).eq("id", existing.id);
+    // A LOCKED item's attribution was set by a deliberate correction — preserve it even across a real
+    // content edit (dropping member_id from the update keeps the stored, corrected value). Without this
+    // the changed-body path would re-resolve member_id from frontmatter and silently undo the correction.
+    const updateRecord: Partial<typeof itemRecord> = { ...itemRecord };
+    if ((existing as { member_id_locked?: boolean | null }).member_id_locked) delete updateRecord.member_id;
+    const { error } = await db.from("items").update(updateRecord).eq("id", existing.id);
     if (error) throw new Error(`item update failed: ${error.message}`);
     itemId = existing.id;
   } else {
