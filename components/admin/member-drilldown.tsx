@@ -3,7 +3,7 @@
 import { useCallback, useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
-import { ChevronRight, Radio, ExternalLink, Pencil, Lock } from "lucide-react";
+import { ChevronRight, Radio, ExternalLink, Pencil, Lock, ArrowRight } from "lucide-react";
 import {
   getMemberItemsAction,
   previewCorrectionPlanAction,
@@ -30,6 +30,14 @@ function fmtDate(iso: string): string {
   const d = new Date(iso);
   return Number.isNaN(d.getTime()) ? "" : d.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
 }
+
+// How the author signal resolves against the team's mappings — the mapping KIND (where to go fix it).
+const METHOD_LABEL: Record<string, string> = {
+  provider: "provider id",
+  email: "email",
+  handle: "handle",
+  heuristic: "name guess",
+};
 
 interface RowState {
   items: MemberItem[];
@@ -226,8 +234,17 @@ function ItemRow({ teamSlug, item, onCorrected }: { teamSlug: string; item: Memb
         ) : item.signal ? (
           <span className="text-xs text-ink-tertiary" title="The author signal the resolver matched (what resolves now, not necessarily at ingest)">
             · {item.signal}
+            {METHOD_LABEL[item.method] && <span className="text-ink-tertiary/70"> via {METHOD_LABEL[item.method]}</span>}
           </span>
         ) : null}
+        {!item.locked && item.mismatch && (
+          <span
+            className="inline-flex items-center gap-0.5 rounded-full border border-rose/40 bg-rose/10 px-1.5 py-0.5 text-[11px] text-rose"
+            title="The author signal now resolves to a different member than the current attribution — a candidate to reassign."
+          >
+            <ArrowRight className="size-2.5" /> {item.resolvesToName}?
+          </span>
+        )}
         <button
           type="button"
           onClick={() => {

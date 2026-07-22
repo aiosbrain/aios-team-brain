@@ -59,6 +59,33 @@ target: Plane 100% / Linear 78% unattributed), one `where member_id is null` bra
 a deeper join (`member_emails`/`member_identities`) and a fair follow-up; the signal + locked flag already
 answers "is this right, and was it deliberate?" for triage.
 
+**3b. Provenance follow-up (BUILT — this extends §3).** The signal string alone says *what* the frontmatter
+carries, not *whether it still resolves to the right person*. So `getMemberItems` now also RESOLVES each
+non-locked item's refs against the team's identity map — **reusing the one shared resolver**
+(`buildIdentityMap` + `connectorMemberIds` + `resolveAuthors`, the SAME path ingest/re-attribute use, never
+a second copy) — and reports, per item:
+- `method` — HOW the signal resolves NOW (`provider` id / `email` alias / `handle` / `heuristic` / `unresolved`):
+  the mapping *kind* that matched, which tells the admin where to go fix it (a `member_identities` provider
+  row vs a `member_emails` alias vs the roster).
+- `resolvesToName` — the member the signal resolves to now, or null (nobody).
+- `mismatch` — **`resolvesTo` is a real member ≠ the item's CURRENT attribution.** The high-value triage flag:
+  in a person's row it means "attributed here, but the author signal now points to someone else"; in the
+  **unattributed bucket** it means "this SHOULD be `resolvesToName`'s" — the exact rows a re-attribute would
+  fix. (We deliberately do NOT flag "signal resolves to nobody" as a mismatch — many correctly-attributed
+  items have no resolvable frontmatter signal; only a *conflicting* resolution is actionable.)
+- The map/connectors/names are built ONCE per read and resolution runs in-memory — no per-item query. The
+  derivation is a pure helper (`deriveItemProvenance`) so it's unit-tested without a DB.
+- **Resolution is SUPPRESSED for locked rows** (a manual override supersedes the signal) **AND for
+  `access = 'external'` rows** — external frontmatter is untrusted client input, so re-resolving it would
+  invite the exact misattribution `reattributeItems` excludes external rows to prevent (a client naming a
+  team member in frontmatter → a "→ Member?" badge crediting client content). Same exclusion, same reason.
+- `signal` describes the ref that ACTUALLY resolved (via `resolveAuthors`' `primaryRef`), falling back to
+  the role-ranked top claim only when nothing resolves — so "signal via method" is always ONE identity,
+  never a strong-role display-name paired with an email match it had nothing to do with.
+- **Honesty caveat (unchanged):** this is what resolves NOW from current mappings + frontmatter, not what
+  resolved at ingest. The *exact alias-row string* ("matched `member_emails['x@noreply']`") is still deferred
+  — `method` already names the mapping kind, which is the actionable part.
+
 ## Authz / tier
 `getMemberItems` is team-scoped (`team_id = $1 and member_id = $2` or `is null`) and lives in
 `lib/attribution/health`, so the `attribution-health-admin-only` guard covers its import location. **But be
@@ -76,5 +103,6 @@ action inputs (`memberId` uuid-or-null, optional `source`).
 - The UI component is untested (server-rendered/interactive) — acceptable; the read is the tested surface.
 
 ## Out of scope (follow-ups)
-- The which-mapping-resolved-it join (full provenance).
+- The EXACT alias-row string in provenance (`method` names the mapping *kind*; the literal matched row is deferred).
 - An item-centric view (`/library/[id]` → "attributed to X because Y") — the inverse direction.
+- Full keyset pagination past the per-read cap (the UI shows an honest "N of total" today).

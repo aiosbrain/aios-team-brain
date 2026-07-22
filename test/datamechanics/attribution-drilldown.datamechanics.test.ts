@@ -13,13 +13,13 @@ import { db, seedTeam, ingest, type Seed } from "./helpers";
 
 async function seedItem(
   seed: Seed,
-  opts: { source: string; memberId?: string | null; locked?: boolean; frontmatter?: Record<string, unknown> }
+  opts: { source: string; memberId?: string | null; locked?: boolean; access?: "team" | "external"; frontmatter?: Record<string, unknown> }
 ): Promise<string> {
   const path = `${opts.source}/${randomUUID()}.md`;
   const { id } = await ingest(seed, {
     body: `body ${path}`,
     path,
-    access: "team",
+    access: opts.access ?? "team",
     frontmatter: { source: opts.source, ...opts.frontmatter },
   });
   const patch: Record<string, unknown> = {};
@@ -85,5 +85,46 @@ describe("attribution drill-down (real Postgres)", () => {
     const tester = (await getMemberAttribution(seed.teamId)).find((m) => m.memberId === seed.memberId)!;
     const chipCounts = Object.fromEntries(tester.bySource.map((s) => [s.source, s.items]));
     expect(counts).toEqual(chipCounts);
+  });
+
+  it("resolves each item's PROVENANCE against the real identity mappings — method, resolvesTo, and drift", async () => {
+    const seed = await seedTeam(); // member "Tester"
+
+    // A second real member with a known roster email → an author signal for THEM resolves via byEmail.
+    const { error: oErr } = await db()
+      .from("members")
+      .insert({
+        team_id: seed.teamId,
+        email: "other@corp.com",
+        display_name: "Other Person",
+        actor_handle: `other-${randomUUID().slice(0, 8)}`,
+        role: "member",
+        tier: "team",
+        status: "active",
+      });
+    if (oErr) throw new Error(`seed other failed: ${oErr.message}`);
+
+    // An explicit git-author ALIAS for Tester (the member_emails path) → resolves to Tester via email.
+    const { error: aErr } = await db()
+      .from("member_emails")
+      .insert({ team_id: seed.teamId, email: "tester-git@noreply.example", member_id: seed.memberId });
+    if (aErr) throw new Error(`alias insert failed: ${aErr.message}`);
+
+    // P: attributed to Tester, author = Tester's git alias → email mapping, resolves to Tester, NO drift.
+    const p = await seedItem(seed, { source: "git", frontmatter: { authors: [{ email: "tester-git@noreply.example", role: "author" }] } });
+    // Q: UNATTRIBUTED, but the author signal resolves to Other → the "should be Other's" drift flag.
+    const q = await seedItem(seed, { source: "notion", memberId: null, frontmatter: { authors: [{ email: "other@corp.com", role: "author" }] } });
+    // R: EXTERNAL-access item whose (untrusted) frontmatter names a team member → resolution SUPPRESSED,
+    //    so we never surface a "→ Other?" badge that would invite crediting client content to a member
+    //    (the exact misattribution reattributeItems excludes external rows to prevent).
+    const r = await seedItem(seed, { source: "notion", access: "external", frontmatter: { authors: [{ email: "other@corp.com", role: "author" }] } });
+
+    const mine = Object.fromEntries((await getMemberItems(seed.teamId, seed.memberId)).map((i) => [i.id, i]));
+    expect(mine[p]).toMatchObject({ signal: "tester-git@noreply.example", method: "email", resolvesToName: "Tester", mismatch: false });
+    // R is attributed to Tester (the ingesting member) but external → no resolution surfaced.
+    expect(mine[r]).toMatchObject({ signal: null, method: "none", resolvesToName: null, mismatch: false });
+
+    const nulls = Object.fromEntries((await getMemberItems(seed.teamId, null)).map((i) => [i.id, i]));
+    expect(nulls[q]).toMatchObject({ method: "email", resolvesToName: "Other Person", mismatch: true });
   });
 });

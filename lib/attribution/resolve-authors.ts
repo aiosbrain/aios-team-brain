@@ -40,6 +40,10 @@ export interface AuthorResolution {
   /** Primary author → member_id; NEVER a connector; null when nothing resolved. */
   memberId: string | null;
   method: AttributionMethod;
+  /** The ref that BECAME the primary (the one that actually resolved) — so a "why" label describes the
+   *  same identity that produced `memberId`/`method`, not a stronger-role ref that didn't resolve.
+   *  Undefined when nothing resolved. */
+  primaryRef?: AuthorRef;
   /** All distinct resolved members (multi-author credit — a doc's creator + editors). */
   resolvedMemberIds: string[];
   /** Author identities we saw but couldn't map — the raw material for the "add a mapping" queue. */
@@ -172,12 +176,12 @@ export function resolveAuthors(
 
   const resolvedMemberIds: string[] = [];
   const unresolved: string[] = [];
-  let primary: { memberId: string; method: AttributionMethod } | null = null;
+  let primary: { memberId: string; method: AttributionMethod; ref: AuthorRef } | null = null;
   for (const { ref } of ordered) {
     const { memberId, method } = resolveRef(map, ref);
     if (memberId && !excludeMemberIds.has(memberId)) {
       if (!resolvedMemberIds.includes(memberId)) resolvedMemberIds.push(memberId);
-      if (!primary) primary = { memberId, method };
+      if (!primary) primary = { memberId, method, ref };
     } else {
       unresolved.push(describeAuthorRef(ref));
     }
@@ -185,6 +189,7 @@ export function resolveAuthors(
   return {
     memberId: primary?.memberId ?? null,
     method: primary?.method ?? "unresolved",
+    primaryRef: primary?.ref,
     resolvedMemberIds,
     unresolved,
   };

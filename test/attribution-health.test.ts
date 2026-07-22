@@ -3,8 +3,10 @@ import {
   lowAttribution,
   isSignalSource,
   deriveItemTitle,
+  deriveItemProvenance,
   type SourceAttribution,
 } from "@/lib/attribution/health";
+import type { IdentityMap } from "@/lib/identity/resolve";
 
 /**
  * Spec for the attribution-alert logic: which sources should raise the "this stream isn't landing on a
@@ -69,5 +71,66 @@ describe("deriveItemTitle — the drill-down title fallback ladder", () => {
     expect(deriveItemTitle(null, "plain body, no heading", "notion/deep/my-note.md")).toBe("my-note");
     expect(deriveItemTitle(null, null, "git/README.txt")).toBe("README");
     expect(deriveItemTitle(undefined, undefined, "loose")).toBe("loose");
+  });
+});
+
+describe("deriveItemProvenance — resolve the signal NOW + flag drift", () => {
+  const map: IdentityMap = {
+    byEmail: new Map([["chetan@corp.com", "m-chetan"]]),
+    byHandle: new Map(),
+    emailDomains: new Set(["corp.com"]),
+    byProviderId: new Map([["slack:u123", "m-chetan"]]),
+  };
+  const names = new Map([["m-chetan", "Chetan"], ["m-other", "Other"], ["sync", "Notion Sync"]]);
+  const noConn = new Set<string>();
+  const authorFm = { authors: [{ email: "chetan@corp.com", role: "author" }] };
+
+  it("reports the email mapping kind + who it resolves to, no drift when it matches the current attribution", () => {
+    const p = deriveItemProvenance(map, noConn, names, "m-chetan", authorFm, false);
+    expect(p).toEqual({ signal: "chetan@corp.com", method: "email", resolvesToName: "Chetan", mismatch: false });
+  });
+
+  it("flags a MISMATCH when the signal resolves to someone other than the current attribution", () => {
+    const p = deriveItemProvenance(map, noConn, names, "m-other", authorFm, false);
+    expect(p).toMatchObject({ resolvesToName: "Chetan", mismatch: true });
+  });
+
+  it("flags the UNATTRIBUTED bucket item that SHOULD be someone's (resolves to a member, currently null)", () => {
+    const p = deriveItemProvenance(map, noConn, names, null, authorFm, false);
+    expect(p).toMatchObject({ resolvesToName: "Chetan", mismatch: true });
+  });
+
+  it("resolves a provider-id signal (slack) and names the provider mapping kind", () => {
+    const p = deriveItemProvenance(map, noConn, names, "m-chetan", { source: "slack", author_id: "U123" }, false);
+    expect(p).toMatchObject({ method: "provider", resolvesToName: "Chetan", mismatch: false });
+  });
+
+  it("the signal describes the ref that RESOLVED, not a stronger-role ref that didn't (signal agrees with method)", () => {
+    // A stronger-role author that DOESN'T resolve + a weaker-role editor that DOES → the signal must be
+    // the editor's email (what actually matched), never "External Sam via email" (a nonexistent alias).
+    const fm = {
+      authors: [
+        { display_name: "External Sam", role: "author" },
+        { email: "chetan@corp.com", role: "editor" },
+      ],
+    };
+    const p = deriveItemProvenance(map, noConn, names, "m-chetan", fm, false);
+    expect(p).toEqual({ signal: "chetan@corp.com", method: "email", resolvesToName: "Chetan", mismatch: false });
+  });
+
+  it("does NOT flag drift when the signal resolves to nobody (only a conflicting match is actionable)", () => {
+    const p = deriveItemProvenance(map, noConn, names, "m-other", { authors: [{ email: "ghost@nowhere.com", role: "author" }] }, false);
+    expect(p).toMatchObject({ method: "unresolved", resolvesToName: null, mismatch: false });
+  });
+
+  it("treats a connector resolution as unresolved (authorship never lands on a sync account)", () => {
+    const connMap: IdentityMap = { ...map, byEmail: new Map([["chetan@corp.com", "sync"]]) };
+    const p = deriveItemProvenance(connMap, new Set(["sync"]), names, null, authorFm, false);
+    expect(p).toMatchObject({ resolvesToName: null, mismatch: false });
+  });
+
+  it("suppresses everything when suppressed (locked override OR untrusted external-access frontmatter)", () => {
+    const p = deriveItemProvenance(map, noConn, names, "m-other", authorFm, true);
+    expect(p).toEqual({ signal: null, method: "none", resolvesToName: null, mismatch: false });
   });
 });
