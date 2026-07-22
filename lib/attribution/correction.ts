@@ -22,12 +22,15 @@ export const reassignPlanSchema = z
     kind: z.literal("reassign"),
     match: z
       .object({
+        // Exact single item — the "correct this one" affordance from the drill-down (a UUID targets one
+        // row precisely, unlike pathPrefix which is a prefix + can span projects). Not LLM-emitted.
+        itemId: z.string().uuid().optional(),
         source: z.string().max(60).optional(),
         pathPrefix: z.string().max(300).optional(),
         onlyUnattributed: z.boolean().optional(),
         fromMemberName: z.string().max(120).optional(),
       })
-      .refine((m) => !!(m.source || m.pathPrefix || m.onlyUnattributed || m.fromMemberName), {
+      .refine((m) => !!(m.itemId || m.source || m.pathPrefix || m.onlyUnattributed || m.fromMemberName), {
         message: "match must be scoped — refusing an unbounded correction",
       }),
     // Target: an email/handle/name to resolve against the roster, or an explicit "nobody" to clear.
@@ -128,6 +131,7 @@ export async function matchItems(
     params.push(value);
     where.push(clause.replace("$$", `$${params.length}`));
   };
+  if (plan.match.itemId) add("id = $$", plan.match.itemId); // exact single item (drill-down "correct this")
   if (plan.match.source) add("coalesce(nullif(trim(lower(frontmatter->>'source')), ''), kind::text) = $$", plan.match.source.toLowerCase());
   if (plan.match.pathPrefix) add("path like $$", plan.match.pathPrefix.replace(/[%_\\]/g, "\\$&") + "%");
   if (plan.match.onlyUnattributed) where.push("member_id is null");

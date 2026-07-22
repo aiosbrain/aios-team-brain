@@ -40,6 +40,10 @@ export interface AuthorResolution {
   /** Primary author → member_id; NEVER a connector; null when nothing resolved. */
   memberId: string | null;
   method: AttributionMethod;
+  /** The ref that BECAME the primary (the one that actually resolved) — so a "why" label describes the
+   *  same identity that produced `memberId`/`method`, not a stronger-role ref that didn't resolve.
+   *  Undefined when nothing resolved. */
+  primaryRef?: AuthorRef;
   /** All distinct resolved members (multi-author credit — a doc's creator + editors). */
   resolvedMemberIds: string[];
   /** Author identities we saw but couldn't map — the raw material for the "add a mapping" queue. */
@@ -65,8 +69,18 @@ function roleRank(role: string | undefined): number {
 
 const str = (v: unknown): string => (typeof v === "string" ? v.trim() : "");
 
+/** The role-ranked PRIMARY ref (strongest role wins; stable by original order for ties) — the SAME
+ *  ordering `resolveAuthors` uses to pick a primary, so a "why is this theirs?" signal built from this
+ *  reflects the resolver's choice rather than raw frontmatter order. Null for an empty list. */
+export function primaryAuthorRef(refs: AuthorRef[]): AuthorRef | null {
+  if (refs.length === 0) return null;
+  return refs
+    .map((ref, i) => ({ ref, i }))
+    .sort((a, b) => roleRank(a.ref.role) - roleRank(b.ref.role) || a.i - b.i)[0].ref;
+}
+
 /** A human-readable label for an unresolved author (for the review queue / logs). */
-function describe(ref: AuthorRef): string {
+export function describeAuthorRef(ref: AuthorRef): string {
   return (
     ref.email ||
     (ref.provider && ref.externalId ? `${ref.provider}:${ref.externalId}` : "") ||
@@ -162,19 +176,20 @@ export function resolveAuthors(
 
   const resolvedMemberIds: string[] = [];
   const unresolved: string[] = [];
-  let primary: { memberId: string; method: AttributionMethod } | null = null;
+  let primary: { memberId: string; method: AttributionMethod; ref: AuthorRef } | null = null;
   for (const { ref } of ordered) {
     const { memberId, method } = resolveRef(map, ref);
     if (memberId && !excludeMemberIds.has(memberId)) {
       if (!resolvedMemberIds.includes(memberId)) resolvedMemberIds.push(memberId);
-      if (!primary) primary = { memberId, method };
+      if (!primary) primary = { memberId, method, ref };
     } else {
-      unresolved.push(describe(ref));
+      unresolved.push(describeAuthorRef(ref));
     }
   }
   return {
     memberId: primary?.memberId ?? null,
     method: primary?.method ?? "unresolved",
+    primaryRef: primary?.ref,
     resolvedMemberIds,
     unresolved,
   };

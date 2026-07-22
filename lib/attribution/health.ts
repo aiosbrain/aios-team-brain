@@ -1,5 +1,15 @@
 import "server-only";
 import { runSql } from "@/lib/db/pg/pool";
+import { adminClient } from "@/lib/db/admin";
+import { buildIdentityMap, type IdentityMap } from "@/lib/identity/resolve";
+import {
+  parseAuthorRefs,
+  primaryAuthorRef,
+  describeAuthorRef,
+  resolveAuthors,
+  connectorMemberIds,
+  type AttributionMethod,
+} from "@/lib/attribution/resolve-authors";
 
 /**
  * Attribution health — "is each data stream landing on the right person?" Every learning/arc surface
@@ -156,6 +166,150 @@ export async function getMemberAttribution(teamId: string): Promise<MemberAttrib
     console.error("[attribution] getMemberAttribution failed:", err instanceof Error ? err.message : err);
     return [];
   }
+}
+
+/** One attributed item in the per-person drill-down (the actual piece of context, not a count). */
+export interface MemberItem {
+  id: string;
+  path: string;
+  title: string;
+  kind: string;
+  source: string;
+  updatedAt: string;
+  /** member_id was set by a deliberate correction → a "manual" badge (signal is suppressed). */
+  locked: boolean;
+  /** The author signal that resolves this item (the resolver's own view) — the "why is this theirs?".
+   *  Null when locked (the manual override supersedes it) or when there's no signal. */
+  signal: string | null;
+  /** HOW that signal resolves against the team's identity mappings NOW — the mapping KIND that matched
+   *  (`provider` id / `email` alias / `handle` / `heuristic` / `unresolved` / `none`). Tells the admin
+   *  WHERE to fix a bad mapping. `none` when locked or no signal. */
+  method: AttributionMethod;
+  /** The member the signal resolves to NOW (display name), or null (nobody / locked / no signal). */
+  resolvesToName: string | null;
+  /** The signal resolves to a real member OTHER than this item's current attribution — the actionable
+   *  drift (in a person's row: "attributed here but points elsewhere"; in the unattributed bucket:
+   *  "should be `resolvesToName`'s"). We do NOT flag "resolves to nobody" — only a conflicting match. */
+  mismatch: boolean;
+}
+
+/** The resolution provenance for one item — pure over an already-built identity map/roster so it's
+ *  unit-tested without a DB. Reuses the ONE shared resolver (`resolveAuthors`) — never a second copy.
+ *  `suppressed` = the resolution must NOT be surfaced: a LOCKED row (a manual override supersedes the
+ *  signal) OR an EXTERNAL-access row (its frontmatter is untrusted client input — re-resolving it would
+ *  invite the exact misattribution `reattributeItems` excludes external rows to prevent, so no
+ *  signal/method/mismatch here either). `signal` describes the ref that ACTUALLY resolved (falling back
+ *  to the role-ranked top claim only when nothing resolves), so it always agrees with `method`. */
+export function deriveItemProvenance(
+  map: IdentityMap,
+  connectors: ReadonlySet<string>,
+  namesById: Map<string, string>,
+  currentMemberId: string | null,
+  frontmatter: Record<string, unknown>,
+  suppressed: boolean
+): { signal: string | null; method: AttributionMethod; resolvesToName: string | null; mismatch: boolean } {
+  if (suppressed) return { signal: null, method: "none", resolvesToName: null, mismatch: false };
+  const refs = parseAuthorRefs(frontmatter);
+  const res = resolveAuthors(map, refs, connectors);
+  const signalRef = res.primaryRef ?? primaryAuthorRef(refs); // the resolving ref, else the top claim
+  return {
+    signal: signalRef ? describeAuthorRef(signalRef) : null,
+    method: res.method,
+    resolvesToName: res.memberId ? namesById.get(res.memberId) ?? "(unknown)" : null,
+    mismatch: res.memberId !== null && res.memberId !== currentMemberId,
+  };
+}
+
+/** Title fallback ladder: frontmatter `title` → first markdown heading → path tail. Pure + unit-tested. */
+export function deriveItemTitle(fmTitle: string | null | undefined, bodyHead: string | null | undefined, path: string): string {
+  const t = (fmTitle ?? "").trim();
+  if (t) return t;
+  const heading = (bodyHead ?? "").match(/^#{1,6}\s+(.+)$/m);
+  if (heading) return heading[1].trim();
+  const tail = path.split("/").pop() ?? path;
+  return tail.replace(/\.(md|txt)$/i, "") || path;
+}
+
+/**
+ * The actual items attributed to a member — the drill-down behind the per-person counts. `memberId: null`
+ * is the UNATTRIBUTED bucket (the biggest triage target). Reuses `SOURCE_EXPR` (so totals reconcile with
+ * the chips) and the ONE shared resolver for each item's PROVENANCE — the role-ranked primary signal, HOW
+ * it resolves now (`method`), who it resolves to (`resolvesToName`), and whether that conflicts with the
+ * current attribution (`mismatch`). The identity map/roster are built ONCE per read; resolution runs
+ * in-memory (no per-item query). Newest-updated first, capped at `limit` (the caller knows the
+ * authoritative count and shows "N of total" when capped — full keyset pagination is a follow-up). UNLIKE
+ * the counts reads it THROWS on error — a chip that says "14" whose expand silently returned [] would make
+ * the dashboard contradict itself. Admin-only (callers gate via `requireTeamAdmin`; module-header AUTHZ).
+ */
+export async function getMemberItems(
+  teamId: string,
+  memberId: string | null,
+  opts: { source?: string; limit?: number } = {}
+): Promise<MemberItem[]> {
+  const limit = Math.min(Math.max(opts.limit ?? 200, 1), 500);
+  const where: string[] = ["i.team_id = $1"];
+  const params: unknown[] = [teamId];
+  where.push(memberId === null ? "i.member_id is null" : `i.member_id = $${params.push(memberId)}`);
+  if (opts.source) where.push(`${SOURCE_EXPR} = $${params.push(opts.source.toLowerCase())}`);
+
+  const db = adminClient();
+  const [{ rows }, map, connectors, namesById] = await Promise.all([
+    runSql<{
+      id: string;
+      path: string;
+      kind: string;
+      source: string;
+      updated_at: string | Date;
+      member_id: string | null;
+      member_id_locked: boolean | null;
+      access: string;
+      fm_title: string | null;
+      body_head: string | null;
+      frontmatter: Record<string, unknown> | null;
+    }>(
+      `select i.id, i.path, i.kind::text as kind, ${SOURCE_EXPR} as source, i.updated_at, i.member_id,
+              i.member_id_locked, i.access::text as access,
+              i.frontmatter->>'title' as fm_title, left(i.body, 500) as body_head, i.frontmatter
+         from items i
+        where ${where.join(" and ")}
+        order by i.updated_at desc, i.id desc
+        limit ${limit}`,
+      params
+    ),
+    buildIdentityMap(db, teamId),
+    connectorMemberIds(db, teamId),
+    memberNames(teamId),
+  ]);
+
+  return rows.map((r) => {
+    const locked = r.member_id_locked === true;
+    // Suppress resolution for locked (override wins) AND external-access rows (untrusted client
+    // frontmatter — mirrors the reattribute batch's external exclusion; never invite that misattribution).
+    const suppressed = locked || r.access === "external";
+    const prov = deriveItemProvenance(map, connectors, namesById, r.member_id, r.frontmatter ?? {}, suppressed);
+    return {
+      id: r.id,
+      path: r.path,
+      kind: r.kind,
+      source: r.source,
+      updatedAt: r.updated_at instanceof Date ? r.updated_at.toISOString() : String(r.updated_at),
+      title: deriveItemTitle(r.fm_title, r.body_head, r.path),
+      locked,
+      signal: prov.signal,
+      method: prov.method,
+      resolvesToName: prov.resolvesToName,
+      mismatch: prov.mismatch,
+    };
+  });
+}
+
+/** memberId → display_name for a team (for provenance's `resolvesToName`). */
+async function memberNames(teamId: string): Promise<Map<string, string>> {
+  const { rows } = await runSql<{ id: string; display_name: string | null }>(
+    `select id, display_name from members where team_id = $1`,
+    [teamId]
+  );
+  return new Map(rows.map((r) => [r.id, r.display_name ?? "(unknown)"]));
 }
 
 /** The full attribution-health read for a team (both breakdowns + the alert list). Best-effort. */

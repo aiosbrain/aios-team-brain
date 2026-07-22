@@ -1,5 +1,6 @@
 import { AlertTriangle, Radio } from "lucide-react";
 import type { AttributionHealth, SourceAttribution } from "@/lib/attribution/health";
+import { MemberDrilldown } from "@/components/admin/member-drilldown";
 
 /**
  * Admin → Attribution. Renders the attribution-health read (per-source + per-person) so misattribution
@@ -26,8 +27,13 @@ function AttributionBar({ s }: { s: SourceAttribution }) {
   );
 }
 
-export function AttributionHealthView({ health }: { health: AttributionHealth }) {
+export function AttributionHealthView({ health, teamSlug }: { health: AttributionHealth; teamSlug: string }) {
   const { bySource, byMember, lowAttributionSources } = health;
+  const unattributedTotal = bySource.reduce((n, s) => n + s.unattributed, 0);
+  // The null bucket's per-source chips = each source's unattributed count (so it's filterable too).
+  const unattributedChips = bySource
+    .filter((s) => s.unattributed > 0)
+    .map((s) => ({ source: s.source, isSignal: s.isSignal, items: s.unattributed }));
 
   if (bySource.length === 0) {
     return <p className="text-sm text-ink-secondary">No ingested content yet — attribution health will appear once items are synced.</p>;
@@ -92,36 +98,11 @@ export function AttributionHealthView({ health }: { health: AttributionHealth })
         </div>
       </section>
 
-      {/* Per-person */}
+      {/* Per-person — expand a row to the actual items (each linkable), filter by source chip, correct inline. */}
       <section>
         <h2 className="mb-2 text-sm font-semibold text-ink">By person</h2>
-        <p className="mb-3 text-xs text-ink-tertiary">What each member owns, by source — a person carrying the wrong kind of work (e.g. many meeting transcripts) is a misattribution clue.</p>
-        {byMember.length === 0 ? (
-          <p className="text-sm text-ink-secondary">Nothing is attributed to a person yet — every ingested item resolved to a connector or nobody.</p>
-        ) : (
-        <div className="flex flex-col gap-2">
-          {byMember.map((m) => (
-            <div key={m.memberId} className="prism-card flex flex-wrap items-center gap-x-3 gap-y-1.5 px-4 py-3">
-              <span className="font-medium text-ink">{m.displayName}</span>
-              <span className="text-xs tabular-nums text-ink-tertiary">{m.total} items</span>
-              <span className="ml-auto flex flex-wrap gap-1.5">
-                {m.bySource.map((b) => (
-                  <span
-                    key={b.source}
-                    className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs ${
-                      b.isSignal ? "border-border-subtle text-ink-tertiary" : "border-border-subtle text-ink-secondary"
-                    }`}
-                  >
-                    {b.isSignal && <Radio className="size-2.5" />}
-                    {b.source}
-                    <span className="tabular-nums text-ink-tertiary">{b.items}</span>
-                  </span>
-                ))}
-              </span>
-            </div>
-          ))}
-        </div>
-        )}
+        <p className="mb-3 text-xs text-ink-tertiary">What each member owns, by source — a person carrying the wrong kind of work (e.g. many meeting transcripts) is a misattribution clue. Expand a row to see the actual items, or click a source to filter.</p>
+        <MemberDrilldown teamSlug={teamSlug} members={byMember} unattributedTotal={unattributedTotal} unattributedChips={unattributedChips} />
       </section>
     </div>
   );

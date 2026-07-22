@@ -26,7 +26,7 @@ export default async function AttributionAdminPage({ params }: { params: Promise
         <p className="text-sm text-ink-secondary">Is each data stream landing on the right person?</p>
       </div>
       <AttributionCorrectionBox teamSlug={teamSlug} />
-      <AttributionHealthView health={health} />
+      <AttributionHealthView health={health} teamSlug={teamSlug} />
     </div>
   );
 }
