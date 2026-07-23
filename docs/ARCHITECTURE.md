@@ -673,6 +673,7 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 - `GET /api/v1/items/:id` — single item fetch
 - `GET /api/v1/tasks` — dashboard task changes for `aios pull` writeback; `?all=1` selects the tier-filtered full tasks-table read
 - `GET /api/v1/timeline` — the work-timeline context layer (v1.12): last 7d day→person→work ledger, the same payload the dashboard panel reads (SWR `work_timeline_cache`); API-key + tier-scoped (`getCachedWorkTimeline` → `visibleItems`/`visibleTasks`)
+- `GET /api/v1/attribution` — attribution health (brain-api v1.13): the SAME derived read as Admin → Attribution (`lib/attribution/health`), so the CLI/LLM read it too — summary (`bySource`/`byMember`/`lowAttributionSources`), or `?member=<uuid>|unattributed` [+ `?source=`/`?limit=`] for the per-item provenance drill-down. **Team-tier ADMIN only** (all-tier read, member names + admin-content counts, no RLS backstop) — external/non-admin → 403
 - `GET /api/v1/pm-sync/health` — team-tier projection health and recent runs for CLI/agent observability
 - `GET /api/v1/decisions` — dashboard decision changes for `aios pull` writeback (tier-scoped)
 - `GET /api/v1/projects` — team project list for `aios pull` brain-project registration (team-tier only)
