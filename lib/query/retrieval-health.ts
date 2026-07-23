@@ -3,6 +3,7 @@ import { runSql } from "@/lib/db/pg/pool";
 import { graphitiConfigured, GraphitiClient } from "@/lib/graph/graphiti-client";
 import { getLlmHealth, type LlmHealth } from "@/lib/query/llm-health";
 import { countGraphFacts, deriveGraphExtractionStalled } from "@/lib/graph/extraction-health";
+import { resolveEmbeddingBackend } from "@/lib/query/embedding-key";
 
 /**
  * Retrieval-stack health for the admin dashboard (Phase 1 of the retrieval-observability plan).
@@ -135,7 +136,10 @@ export async function getRetrievalHealth(teamId: string): Promise<RetrievalHealt
   const rerank: LegState = process.env.RERANK_URL ? "on" : "off";
   const augment: LegState = process.env.RETRIEVAL_AUGMENT_URL ? "on" : "off";
   const emailDeliverable = !!(process.env.RESEND_API_KEY || process.env.SMTP_URL);
-  const configured = !!process.env.EMBEDDINGS_URL;
+  // Dense is "configured" when the team has a RESOLVED embeddings backend — the Admin pick
+  // (teams.embedding_provider) OR env EMBEDDINGS_URL — not env alone, else a team-configured install
+  // reads "off" and never alerts on an outage.
+  const configured = (await resolveEmbeddingBackend(teamId)) !== null;
 
   // Graph + dense both hit the network — run them concurrently so the card render isn't serialized.
   const graphConfiguredNow = graphConfigured(process.env.GRAPHITI_URL);
@@ -203,7 +207,11 @@ async function denseHealth(teamId: string, configured: boolean): Promise<DenseHe
     lastEmbeddedAt: null,
     lastRunFailed: false,
   };
-  if (!configured) return { ...empty, note: "EMBEDDINGS_URL not set — semantic search is off; keyword search still works." };
+  if (!configured)
+    return {
+      ...empty,
+      note: "No embeddings model configured (Admin → Integrations) and EMBEDDINGS_URL not set — semantic search is off; keyword search still works.",
+    };
 
   try {
     // Coverage: embeddable items (non-empty body) vs those with an up-to-date chunk. Throws if the

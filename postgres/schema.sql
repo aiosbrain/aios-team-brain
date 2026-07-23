@@ -117,6 +117,13 @@ create table if not exists teams (
   -- Optional distinct PROVIDER for the reasoning model. Null = reuse the answering provider; set =
   -- reasoning runs on its own backend (answer on one provider, reason on another).
   reasoning_provider text check (reasoning_provider in ('anthropic', 'openai', 'openrouter', 'local')),
+  -- Explicit embeddings-backend override for the semantic index. Null = auto (env EMBEDDINGS_URL for
+  -- self-host, else dense off). Constrained to the providers that serve a 1536-dim OpenAI-compatible
+  -- /embeddings model matching the item_chunks vector(1536) column — openai/openrouter only (Anthropic
+  -- has no embeddings API; Google's are 768-dim). See lib/query/embeddings-backend.
+  embedding_provider text check (embedding_provider in ('openai', 'openrouter')),
+  -- Optional embedding model slug for the chosen provider (curated 1536-dim list). Null = provider default.
+  embedding_model text,
   -- Which category extracted MEETING action items land in when pushed to the PM tool (Linear/Plane):
   -- a brain task status mapped to the provider's workflow-state group by desiredStateForStatus.
   -- Null → 'backlog' (the historical default). Admin → Integrations picks it (radio).
@@ -128,6 +135,8 @@ alter table teams add column if not exists primary_pm_provider text;
 alter table teams add column if not exists answering_provider text;
 alter table teams add column if not exists reasoning_model text;
 alter table teams add column if not exists reasoning_provider text;
+alter table teams add column if not exists embedding_provider text;
+alter table teams add column if not exists embedding_model text;
 do $$ begin
   if not exists (select 1 from pg_constraint where conname = 'teams_primary_pm_provider_check') then
     alter table teams add constraint teams_primary_pm_provider_check check (primary_pm_provider in ('plane', 'linear'));
@@ -137,6 +146,9 @@ do $$ begin
   end if;
   if not exists (select 1 from pg_constraint where conname = 'teams_reasoning_provider_check') then
     alter table teams add constraint teams_reasoning_provider_check check (reasoning_provider in ('anthropic', 'openai', 'openrouter', 'local'));
+  end if;
+  if not exists (select 1 from pg_constraint where conname = 'teams_embedding_provider_check') then
+    alter table teams add constraint teams_embedding_provider_check check (embedding_provider in ('openai', 'openrouter'));
   end if;
 end $$;
 

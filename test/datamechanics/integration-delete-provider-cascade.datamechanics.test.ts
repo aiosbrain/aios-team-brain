@@ -19,28 +19,42 @@ function auth(teamId: string, memberId: string) {
 
 async function setPointers(
   teamId: string,
-  patch: { answering_provider?: string | null; reasoning_provider?: string | null; reasoning_model?: string | null }
+  patch: {
+    answering_provider?: string | null;
+    reasoning_provider?: string | null;
+    reasoning_model?: string | null;
+    embedding_provider?: string | null;
+    embedding_model?: string | null;
+  }
 ): Promise<void> {
   await db().from("teams").update(patch).eq("id", teamId);
 }
 
-async function pointers(
-  teamId: string
-): Promise<{ answering: string | null; reasoning: string | null; reasoningModel: string | null }> {
+async function pointers(teamId: string): Promise<{
+  answering: string | null;
+  reasoning: string | null;
+  reasoningModel: string | null;
+  embedding: string | null;
+  embeddingModel: string | null;
+}> {
   const { data } = await db()
     .from("teams")
-    .select("answering_provider, reasoning_provider, reasoning_model")
+    .select("answering_provider, reasoning_provider, reasoning_model, embedding_provider, embedding_model")
     .eq("id", teamId)
     .maybeSingle();
   const row = data as {
     answering_provider: string | null;
     reasoning_provider: string | null;
     reasoning_model: string | null;
+    embedding_provider: string | null;
+    embedding_model: string | null;
   } | null;
   return {
     answering: row?.answering_provider ?? null,
     reasoning: row?.reasoning_provider ?? null,
     reasoningModel: row?.reasoning_model ?? null,
+    embedding: row?.embedding_provider ?? null,
+    embeddingModel: row?.embedding_model ?? null,
   };
 }
 
@@ -69,6 +83,22 @@ describe("integration delete — provider pointer cascade (data-mechanics)", () 
     const p = await pointers(seed.teamId);
     expect(p.reasoning).toBeNull();
     expect(p.reasoningModel).toBeNull();
+  });
+
+  it("clears embedding_provider AND embedding_model when the (openrouter) key is deleted", async () => {
+    const seed = await seedTeam();
+    const a = auth(seed.teamId, seed.memberId);
+    const { id } = await upsertIntegration(db(), a, { type: "openrouter", name: "or", config: {} });
+    await setPointers(seed.teamId, {
+      embedding_provider: "openrouter",
+      embedding_model: "openai/text-embedding-3-small",
+    });
+
+    await deleteIntegration(db(), a, id);
+
+    const p = await pointers(seed.teamId);
+    expect(p.embedding).toBeNull();
+    expect(p.embeddingModel).toBeNull();
   });
 
   it("does NOT clear the pointer if another ENABLED key of the same provider remains", async () => {

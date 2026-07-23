@@ -2,8 +2,9 @@ import "server-only";
 import { runSql } from "@/lib/db/pg/pool";
 import { isRestrictedTier } from "@/lib/auth/visibility";
 import { embed, toVectorLiteral } from "./embeddings";
-import { denseIndexAvailable } from "./dense-index";
-import { resolveEmbeddingKey } from "./embedding-key";
+import { itemChunksTablePresent } from "./dense-index";
+import { resolveEmbeddingBackend } from "./embedding-key";
+import type { EmbeddingBackend } from "./embeddings-backend";
 import type { Source } from "./provider";
 
 /**
@@ -38,14 +39,16 @@ export async function denseSearch(
   question: string,
   projectSlug?: string | null,
   limit = 20,
-  apiKey?: string | null
+  backend?: EmbeddingBackend | null
 ): Promise<DenseHit[]> {
-  if (!question.trim() || !(await denseIndexAvailable())) return [];
+  if (!question.trim() || !(await itemChunksTablePresent())) return [];
   try {
-    // Key from AI model settings (integrations store), same as the LLM; embed() falls back to env.
-    const key = apiKey ?? (await resolveEmbeddingKey(teamId));
-    const vecs = await embed([question], key);
-    if (!vecs || !vecs[0]) return [];
+    // Resolve the team's embeddings backend (Admin pick or env); off → no dense leg. The QUERY
+    // embedding uses the SAME backend that indexed the chunks, so the vector spaces match.
+    const b = backend ?? (await resolveEmbeddingBackend(teamId));
+    if (!b) return [];
+    const vecs = await embed([question], b);
+    if (!vecs[0]) return [];
     const qv = toVectorLiteral(vecs[0]);
 
     const params: unknown[] = [qv, teamId];

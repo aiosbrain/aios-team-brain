@@ -18,10 +18,12 @@ import {
   setAnsweringProvider,
   setAnsweringModel,
   setReasoningModel,
+  setEmbeddingModel,
   setMeetingTaskStatus,
   type PrimaryPmProvider,
 } from "@/app/t/[team]/admin/integrations/actions";
 import type { AnsweringProvider } from "@/lib/query/llm-backend";
+import { EMBEDDING_MODELS, EMBEDDING_PROVIDER_TYPES, type EmbeddingProvider } from "@/lib/api/schemas";
 import {
   MEETING_TASK_STATUSES,
   MEETING_CATEGORY_LABEL,
@@ -62,6 +64,97 @@ const PROVIDER_LABEL: Record<AnsweringProvider, string> = {
   openrouter: "OpenRouter",
   local: "Local (LLM_BASE_URL)",
 };
+
+/** Embeddings state computed server-side (page.tsx) from teams.embedding_provider + provider keys + env. */
+export interface EmbeddingState {
+  provider: EmbeddingProvider | null; // teams.embedding_provider (null = auto: env / off)
+  model: string | null; // teams.embedding_model
+  effective: { provider: EmbeddingProvider | "env"; model: string } | null; // resolved backend, or null = off
+  usedFallback: boolean;
+  openaiConfigured: boolean;
+  openrouterConfigured: boolean;
+}
+
+const EMBEDDING_PROVIDER_LABEL: Record<EmbeddingProvider, string> = { openai: "OpenAI", openrouter: "OpenRouter" };
+
+/** The embeddings-model control: provider dropdown + a CURATED model dropdown (not free text, so a
+ *  dim-incompatible model can't be typed) + Save. Only OpenAI/OpenRouter because the vector index is
+ *  fixed at 1536 dims — the inline note explains that so users know why the list is short. */
+function EmbeddingPicker(props: {
+  provider: EmbeddingProvider | null;
+  model: string;
+  configured: Record<EmbeddingProvider, boolean>;
+  onProvider: (p: EmbeddingProvider | null) => void;
+  onModel: (m: string) => void;
+  onSave: () => void;
+  pending: boolean;
+  effective: string;
+  fallback: boolean;
+}) {
+  const models = props.provider ? EMBEDDING_MODELS[props.provider] : [];
+  return (
+    <div className="prism-card flex flex-col gap-3 p-4">
+      <p className="flex items-center gap-2 text-sm font-medium text-ink">
+        <Sparkles className="size-4 text-violet" /> Embeddings model (semantic search)
+      </p>
+      <p className="text-xs text-ink-secondary">
+        The model that powers <strong>semantic (vector) search</strong>. <strong>Only OpenAI and OpenRouter
+        are listed</strong> because the semantic index is built at <strong>1536 dimensions</strong>: both
+        serve OpenAI&apos;s <code>text-embedding-3-small</code> (1536d), which is the only model that fits
+        the existing index. Other providers (Anthropic has no embeddings; Google&apos;s are 768d) or a
+        different-dimension model would require re-indexing every document. Switching OpenAI ↔ OpenRouter on
+        the same model is safe (identical vectors) and doesn&apos;t re-embed anything. &ldquo;Auto&rdquo;
+        uses the server&apos;s <code>EMBEDDINGS_URL</code> (self-host) or turns semantic search off.
+      </p>
+      <div className="flex flex-wrap items-center gap-2">
+        <select
+          value={props.provider ?? ""}
+          disabled={props.pending}
+          onChange={(e) => props.onProvider(e.target.value ? (e.target.value as EmbeddingProvider) : null)}
+          className="rounded-md border border-ink/15 bg-transparent px-2.5 py-1.5 text-sm text-ink outline-none focus:border-ink/30 disabled:opacity-50"
+        >
+          <option value="">Auto (env / off)</option>
+          {EMBEDDING_PROVIDER_TYPES.map((p) => (
+            <option key={p} value={p}>
+              {EMBEDDING_PROVIDER_LABEL[p]}
+              {props.configured[p] ? "" : " · no key"}
+            </option>
+          ))}
+        </select>
+        <select
+          value={props.model}
+          disabled={props.pending || !props.provider}
+          onChange={(e) => props.onModel(e.target.value)}
+          className="min-w-0 flex-1 rounded-md border border-ink/15 bg-transparent px-2.5 py-1.5 font-mono text-xs text-ink outline-none focus:border-ink/30 disabled:opacity-50"
+        >
+          {props.provider ? (
+            models.map((m) => (
+              <option key={m.model} value={m.model}>
+                {m.label}
+              </option>
+            ))
+          ) : (
+            <option value="">—</option>
+          )}
+        </select>
+        <button
+          type="button"
+          onClick={props.onSave}
+          disabled={props.pending}
+          className="btn-prism shrink-0 text-xs disabled:opacity-50"
+        >
+          Save
+        </button>
+      </div>
+      <p className="text-xs text-ink-secondary">
+        Effective: <span className="font-medium text-violet">{props.effective}</span>
+        {props.fallback ? (
+          <span className="ml-1 text-amber-700">· requested provider has no key, fell back</span>
+        ) : null}
+      </p>
+    </div>
+  );
+}
 
 const ROLE_PROVIDERS: AnsweringProvider[] = ["anthropic", "openai", "openrouter", "local"];
 
@@ -210,12 +303,14 @@ export function IntegrationsManager({
   primaryPmProvider,
   meetingTaskStatus,
   answering,
+  embedding,
 }: {
   teamSlug: string;
   integrations: IntegrationRow[];
   primaryPmProvider: PrimaryPmProvider;
   meetingTaskStatus: MeetingTaskStatus;
   answering: AnsweringState;
+  embedding: EmbeddingState;
 }) {
   const router = useRouter();
   const [pending, startTransition] = useTransition();
@@ -334,6 +429,27 @@ export function IntegrationsManager({
     run(() => setReasoningModel(teamSlug, resProvider, resModel.trim()));
   }
 
+  // Embeddings role (provider + curated 1536-dim model). "Auto" (null) clears both → env/off. Switching
+  // provider seeds the model to that provider's single curated model. Blank provider sends "" model.
+  const embConfigured: Record<EmbeddingProvider, boolean> = {
+    openai: embedding.openaiConfigured,
+    openrouter: embedding.openrouterConfigured,
+  };
+  const [embProvider, setEmbProvider] = useState<EmbeddingProvider | null>(embedding.provider);
+  const [embModel, setEmbModel] = useState(
+    embedding.provider ? (embedding.model ?? EMBEDDING_MODELS[embedding.provider][0].model) : ""
+  );
+  function chooseEmbProvider(p: EmbeddingProvider | null) {
+    setEmbProvider(p);
+    setEmbModel(p ? EMBEDDING_MODELS[p][0].model : "");
+  }
+  function saveEmbedding() {
+    run(() => setEmbeddingModel(teamSlug, embProvider, embProvider ? embModel : ""));
+  }
+  const embEffective = embedding.effective
+    ? `${embedding.effective.provider === "env" ? "Env (EMBEDDINGS_URL)" : EMBEDDING_PROVIDER_LABEL[embedding.effective.provider]} · ${embedding.effective.model}`
+    : "off — semantic search disabled";
+
   function setProviderKey(p: ProviderType, existing: IntegrationRow | undefined) {
     const key = window.prompt(`${PROVIDER_META[p].label} API key (${PROVIDER_META[p].placeholder}):`);
     if (!key) return;
@@ -392,6 +508,18 @@ export function IntegrationsManager({
           fallback={answering.reasoning.usedFallback}
         />
       </div>
+
+      <EmbeddingPicker
+        provider={embProvider}
+        model={embModel}
+        configured={embConfigured}
+        onProvider={chooseEmbProvider}
+        onModel={setEmbModel}
+        onSave={saveEmbedding}
+        pending={pending}
+        effective={embEffective}
+        fallback={embedding.usedFallback}
+      />
 
       <div className="prism-card flex flex-col gap-3 p-4">
         <p className="flex items-center gap-2 text-sm font-medium text-ink">

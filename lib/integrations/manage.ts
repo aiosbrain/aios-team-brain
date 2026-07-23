@@ -154,7 +154,7 @@ async function clearDanglingProviderPointers(
 
     const { data: team, error: teamErr } = await db
       .from("teams")
-      .select("answering_provider, reasoning_provider, reasoning_model")
+      .select("answering_provider, reasoning_provider, reasoning_model, embedding_provider, embedding_model")
       .eq("id", auth.teamId)
       .maybeSingle();
     if (teamErr) return;
@@ -162,8 +162,16 @@ async function clearDanglingProviderPointers(
       answering_provider: string | null;
       reasoning_provider: string | null;
       reasoning_model: string | null;
+      embedding_provider: string | null;
+      embedding_model: string | null;
     } | null;
-    const updates: { answering_provider?: null; reasoning_provider?: null; reasoning_model?: null } = {};
+    const updates: {
+      answering_provider?: null;
+      reasoning_provider?: null;
+      reasoning_model?: null;
+      embedding_provider?: null;
+      embedding_model?: null;
+    } = {};
     if (row?.answering_provider === deletedType) updates.answering_provider = null;
     if (row?.reasoning_provider === deletedType) {
       // provider+model are a coupled pair (see setReasoningModel) — an orphaned model on a nulled
@@ -171,6 +179,12 @@ async function clearDanglingProviderPointers(
       // OpenAI slug to Anthropic → a hard error on every arc synthesis. Null both.
       updates.reasoning_provider = null;
       updates.reasoning_model = null;
+    }
+    if (row?.embedding_provider === deletedType) {
+      // Same coupling for the semantic index: a nulled embeddings provider with an orphaned model
+      // would fall back to the env endpoint with a wrong model slug. Null both (see setEmbeddingModel).
+      updates.embedding_provider = null;
+      updates.embedding_model = null;
     }
     if (Object.keys(updates).length === 0) return; // nothing pointed at the deleted provider
 
