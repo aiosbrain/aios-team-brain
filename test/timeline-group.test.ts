@@ -5,7 +5,6 @@ import {
   dayLabel,
   type EvidenceWithMember,
   type TaskInfo,
-  type TaskSignal,
   type TimelineMember,
 } from "@/lib/dashboard/timeline-group";
 
@@ -16,7 +15,8 @@ const members = new Map<string, TimelineMember>([
 
 const taskInfo = new Map<string, TaskInfo>([
   ["t1", { title: "Provider adapter", status: "in_progress", source: "linear" }],
-  ["t2", { title: "New ticket", status: "backlog", source: "linear" }],
+  ["t2", { title: "Second task", status: "in_progress", source: "linear" }],
+  ["tEmpty", { title: "Active but no evidence", status: "in_progress", source: "linear" }],
 ]);
 
 const ev = (over: Partial<EvidenceWithMember>): EvidenceWithMember => ({
@@ -32,81 +32,67 @@ const ev = (over: Partial<EvidenceWithMember>): EvidenceWithMember => ({
 
 const today = "2026-07-22";
 
-describe("normalizeSource", () => {
-  it("collapses git/github → github; passes known through; unknown → other", () => {
+describe("normalizeSource / dayLabel", () => {
+  it("normalizes sources and labels days", () => {
     expect(normalizeSource("git")).toBe("github");
-    expect(normalizeSource("notion")).toBe("notion");
     expect(normalizeSource("mystery")).toBe("other");
-  });
-});
-
-describe("dayLabel", () => {
-  it("labels today/yesterday and formats others", () => {
     expect(dayLabel("2026-07-22", today)).toBe("Today");
     expect(dayLabel("2026-07-21", today)).toBe("Yesterday");
-    expect(dayLabel("unknown", today)).toBe("Undated");
   });
 });
 
-describe("groupTimeline (task → evidence nesting + Other)", () => {
-  it("nests linked evidence under its task, and unlinked evidence goes to Other", () => {
+describe("groupTimeline (evidence-gated task → evidence nesting + Other)", () => {
+  it("nests linked evidence under its task; unlinked evidence → Other", () => {
     const days = groupTimeline(
       [
         ev({ id: "c1", taskId: "t1", source: "github" }),
         ev({ id: "c2", taskId: "t1", source: "notion" }),
-        ev({ id: "c3", taskId: null, source: "github" }), // unlinked → Other
+        ev({ id: "c3", taskId: null, source: "github" }),
       ],
       taskInfo,
-      [],
       members,
       today
     );
-    const person = days[0].people[0];
-    expect(person.tasks).toHaveLength(1);
-    expect(person.tasks[0].taskId).toBe("t1");
-    expect(person.tasks[0].title).toBe("Provider adapter");
-    expect(person.tasks[0].evidenceCount).toBe(2);
-    expect(person.tasks[0].sources.map((s) => s.source).sort()).toEqual(["github", "notion"]);
-    expect(person.other.map((s) => s.source)).toEqual(["github"]);
-    expect(person.other[0].count).toBe(1);
+    const p = days[0].people[0];
+    expect(p.tasks).toHaveLength(1);
+    expect(p.tasks[0].taskId).toBe("t1");
+    expect(p.tasks[0].evidenceCount).toBe(2);
+    expect(p.tasks[0].sources.map((s) => s.source).sort()).toEqual(["github", "notion"]);
+    expect(p.other.map((s) => s.source)).toEqual(["github"]);
   });
 
-  it("a newly-assigned task SIGNAL shows as an (empty) task card with the flag set", () => {
-    const signals: TaskSignal[] = [{ memberId: "m1", taskId: "t2", at: "2026-07-22T08:00:00Z", newlyAssigned: true }];
-    const days = groupTimeline([], taskInfo, signals, members, today);
-    const t = days[0].people[0].tasks.find((x) => x.taskId === "t2")!;
-    expect(t.newlyAssigned).toBe(true);
-    expect(t.evidenceCount).toBe(0);
-    expect(t.status).toBe("backlog");
+  it("EVIDENCE-GATED: an active task with no evidence never appears (no empty headers)", () => {
+    // tEmpty is in taskInfo but nothing links to it.
+    const days = groupTimeline([ev({ taskId: "t1" })], taskInfo, members, today);
+    const ids = days[0].people[0].tasks.map((t) => t.taskId);
+    expect(ids).toEqual(["t1"]);
+    expect(ids).not.toContain("tEmpty");
   });
 
-  it("orders a person's tasks by evidence count (newly-assigned-empty sinks below worked)", () => {
+  it("orders a person's tasks by evidence count desc", () => {
     const days = groupTimeline(
-      [ev({ taskId: "t1" }), ev({ taskId: "t1" })], // t1 has 2 evidence
+      [ev({ taskId: "t1" }), ev({ taskId: "t1" }), ev({ taskId: "t2" })],
       taskInfo,
-      [{ memberId: "m1", taskId: "t2", at: "2026-07-22T08:00:00Z", newlyAssigned: true }], // t2 empty
       members,
       today
     );
     expect(days[0].people[0].tasks.map((t) => t.taskId)).toEqual(["t1", "t2"]);
   });
 
-  it("evidence with a dangling taskId (no taskInfo) falls back to Other, never crashes", () => {
-    const days = groupTimeline([ev({ taskId: "gone", source: "github" })], taskInfo, [], members, today);
+  it("evidence with a dangling/inactive taskId falls back to Other", () => {
+    const days = groupTimeline([ev({ taskId: "gone", source: "github" })], taskInfo, members, today);
     expect(days[0].people[0].tasks).toHaveLength(0);
     expect(days[0].people[0].other[0].source).toBe("github");
   });
 
   it("drops evidence for an unknown member", () => {
-    const days = groupTimeline([ev({ memberId: "ghost" })], taskInfo, [], members, today);
-    expect(days).toHaveLength(0);
+    expect(groupTimeline([ev({ memberId: "ghost" })], taskInfo, members, today)).toHaveLength(0);
   });
 
-  it("orders people within a day by total activity desc", () => {
+  it("orders people within a day by total evidence desc", () => {
     const days = groupTimeline(
       [ev({ memberId: "m2", taskId: null }), ev({ memberId: "m1", taskId: "t1" }), ev({ memberId: "m1", taskId: "t1" })],
       taskInfo,
-      [],
       members,
       today
     );

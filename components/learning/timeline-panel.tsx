@@ -78,9 +78,6 @@ function TaskCard({ task }: { task: TaskGroup }) {
       <div className="flex items-center gap-2">
         <SourceIcon source={task.source} className="size-4" />
         <span className="min-w-0 flex-1 truncate text-sm font-medium text-ink">{task.title}</span>
-        {task.newlyAssigned ? (
-          <span className="rounded bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-700">Newly assigned</span>
-        ) : null}
         <StatusPill status={task.status} />
       </div>
       {task.sources.length ? (

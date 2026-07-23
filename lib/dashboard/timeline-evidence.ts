@@ -5,9 +5,10 @@ import { computeTaskLinks } from "./issue-ref";
 /**
  * The sole writer of `task_evidence` — persists the deterministic task↔evidence links (which items are
  * the actual work behind a task, by issue-key reference) for surfaces BEYOND the timeline (Query/CLI:
- * "what work went into AIO-123?"). The pure link core is `computeTaskLinks` (lib/dashboard/issue-ref),
- * which the timeline builder also uses inline (always fresh, no dependency on this background pass). An
- * LLM grouping pass (method='llm') is a later, lower-confidence addition.
+ * "what work went into AIO-123?"). Links ALL tasks (not just active ones) — a query surface must still
+ * answer for a ticket that later went Done, unlike the timeline DISPLAY which links active tasks only.
+ * The pure link core is `computeTaskLinks` (lib/dashboard/issue-ref). An LLM grouping pass
+ * (method='llm') is a later, lower-confidence addition.
  */
 
 const LINK_TASK_LIMIT = 5000;

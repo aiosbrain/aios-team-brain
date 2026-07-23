@@ -1,7 +1,6 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { visibleItems, visibleTasks, type ViewerTier } from "@/lib/auth/visibility";
-import { subjectMatchesMember, type RosterPerson } from "./people-match";
 import { commitSubject } from "./team-work";
 import {
   groupTimeline,
@@ -9,11 +8,14 @@ import {
   type EvidenceItem,
   type EvidenceWithMember,
   type TaskInfo,
-  type TaskSignal,
   type TimelineDay,
   type TimelineMember,
 } from "./timeline-group";
 import { computeTaskLinks } from "./issue-ref";
+
+// Only ACTIVE tasks are considered work "in progress" — Linear In Progress/In Review both normalize to
+// `in_progress`; `blocked` is active-but-stuck. Backlog/ready/done are context, excluded from the timeline.
+const ACTIVE_TASK_STATUSES = new Set(["in_progress", "blocked"]);
 
 /**
  * Server-only fetch for the Learning "Timeline" — the team's recent work as a day → person → evidence
@@ -30,18 +32,17 @@ import { computeTaskLinks } from "./issue-ref";
  *    Caveat: re-pushes bump synced_at, so at scale the real bound is `ITEM_LIMIT` ordered by synced_at;
  *    a >2000-live-item team could clip in-window work. Fine at current scale — a follow-up is to push
  *    the work-time filter into SQL (needs a computed/indexed work-time column).
- *  • Body fetched ONLY for git commits (their title is the commit subject); other items title from
- *    frontmatter — avoids pulling large doc bodies.
- *  • Tasks come from the `tasks` table (the only per-assignee source), attributed via the proven
- *    `subjectMatchesMember`; unmatched tasks are dropped, never mis-attributed. `kind='task'` ITEMS are
- *    excluded (file-level, attributed to the pusher — the double-count/mis-attribution trap). A task's
- *    work signal is `worked_at` (a PURE provider state transition), `assigned_at` (when the assignee
- *    changed → the "Newly assigned" group), or a real `updated_at` edit — the durable fix in `lib/ingest`
- *    now bumps `updated_at` only on a real persisted change, so a routine re-sync (which re-materializes
- *    every row in a tasks file) no longer lists a whole file's tasks under "today". Dormant tickets with
- *    no in-window signal are dropped.
+ *  • Body fetched ONLY for git commits (the issue key lives in the commit message); other items match
+ *    on title + path — avoids pulling large doc bodies.
+ *  • Tasks are ACTIVE-only + EVIDENCE-GATED (product): a task appears iff its status is in-progress
+ *    (`ACTIVE_TASK_STATUSES`) AND ≥1 of the person's in-window evidence references its issue key. So the
+ *    timeline lists the in-progress work someone actually touched — NOT the whole backlog, and NOT empty
+ *    headers. A task is placed under the EVIDENCE author (who did the work), not its assignee — so a
+ *    commit citing someone else's ticket shows the contribution correctly. Evidence referencing a
+ *    backlog/done issue (not in the active set) falls to "Other".
  *  • Meetings (granola / transcripts) are team signal, not one person's output → excluded from the
- *    per-person view in v1 (a granola item's member_id is the recorder, not the participants).
+ *    per-person view in v1 (a granola item's member_id is the recorder, not the participants). Slack
+ *    evidence is a later PR.
  */
 
 const WINDOW_DAYS = 7;
@@ -62,10 +63,6 @@ type TaskRow = {
   row_key: string | null;
   title: string;
   status: string | null;
-  assignee: string | null;
-  updated_at: string | Date;
-  worked_at: string | Date | null;
-  assigned_at: string | Date | null;
 };
 
 /** WORK time from an item's frontmatter — `committed_at` ?? `source_ts`, normalized to ISO. Null when
@@ -78,13 +75,6 @@ function itemWorkTime(fm: Record<string, unknown> | null): string | null {
   if (!raw) return null;
   const t = Date.parse(raw);
   return Number.isNaN(t) ? null : new Date(t).toISOString();
-}
-
-/** A nullable timestamp (ISO string | Date | null) → epoch ms, or null when absent/unparseable. */
-function tsMs(v: string | Date | null | undefined): number | null {
-  if (v === null || v === undefined) return null;
-  const ms = v instanceof Date ? v.getTime() : Date.parse(v);
-  return Number.isFinite(ms) ? ms : null;
 }
 
 function basename(path: string): string {
@@ -132,14 +122,12 @@ export async function getWorkTimeline(
     email: string | null;
   }[]).filter((m) => !(m.email ?? "").endsWith("@connector.local"));
   const members = new Map<string, TimelineMember>();
-  const roster: RosterPerson[] = [];
   for (const m of humans) {
     members.set(m.id, {
       name: m.display_name ?? m.actor_handle ?? "Unknown",
       handle: m.actor_handle ?? "",
       avatarUrl: m.avatar_url,
     });
-    roster.push({ memberId: m.id, displayName: m.display_name ?? "", handle: m.actor_handle ?? "" });
   }
   if (members.size === 0) return [];
 
@@ -179,14 +167,15 @@ export async function getWorkTimeline(
         .limit(ITEM_LIMIT),
       tier
     ),
-    // Recent tasks — NOT window-filtered: evidence may reference a task last touched >7d ago, and we
-    // need its title/status/row_key to render the header + resolve issue-key links. The in-window SIGNAL
-    // (worked/newly-assigned) is decided per-row in JS below.
+    // ACTIVE tasks only — filtered in SQL so a backlog-heavy team can't push active tasks past
+    // TASK_LIMIT. NOT window-filtered (evidence may reference a task last touched >7d ago; we need its
+    // title/row_key). Evidence-gated in the grouper.
     visibleTasks(
       db
         .from("tasks")
-        .select("id, row_key, title, assignee, status, updated_at, worked_at, assigned_at")
+        .select("id, row_key, title, status")
         .eq("team_id", teamId)
+        .in("status", [...ACTIVE_TASK_STATUSES])
         .order("updated_at", { ascending: false })
         .limit(TASK_LIMIT),
       tier
@@ -198,33 +187,13 @@ export async function getWorkTimeline(
   if (otherRes.error) throw new Error(`work-timeline items: ${otherRes.error.message}`);
   if (taskRes.error) throw new Error(`work-timeline tasks: ${taskRes.error.message}`);
 
+  // ONLY ACTIVE tasks (filtered in SQL above) are the link-target set: a commit citing a backlog/done
+  // issue's key won't link → its evidence goes to "Other", and the backlog/done task never appears.
+  // Tasks are then EVIDENCE-GATED in the grouper (no empty headers).
   const tasks = (taskRes.data ?? []) as TaskRow[];
-  const inWin = (ms: number | null): ms is number => ms !== null && ms >= windowStartMs;
 
-  // Task display info (any evidence may reference a task) + per-person in-window signals (the "headers").
   const taskInfo = new Map<string, TaskInfo>();
-  const taskSignals: TaskSignal[] = [];
-  for (const t of tasks) {
-    taskInfo.set(t.id, { title: t.title || "(untitled task)", status: t.status || "backlog", source: pmSource });
-    const assignee = (t.assignee ?? "").trim();
-    if (!assignee) continue;
-    const person = roster.find((p) => subjectMatchesMember(assignee, p));
-    if (!person) continue; // drop, never mis-attribute
-    // Signal priority (PR-A): a worked_at transition, else a fresh assigned_at ("newly assigned"),
-    // else a real updated_at edit. A dormant assigned ticket with none of these produces NO header —
-    // it only appears if in-window EVIDENCE links to it (below). "If it's old and has no evidence,
-    // don't list it." (KNOWN, deferred: a provider's FIRST import stamps assigned_at=now on the whole
-    // backlog → a transient "Newly assigned" flood for 7 days; a first-seen watermark is a follow-up.)
-    const workedTransition = tsMs(t.worked_at);
-    const assignedAt = tsMs(t.assigned_at);
-    const editedAt = tsMs(t.updated_at);
-    if (inWin(workedTransition))
-      taskSignals.push({ memberId: person.memberId, taskId: t.id, at: new Date(workedTransition).toISOString(), newlyAssigned: false });
-    else if (inWin(assignedAt))
-      taskSignals.push({ memberId: person.memberId, taskId: t.id, at: new Date(assignedAt).toISOString(), newlyAssigned: true });
-    else if (inWin(editedAt))
-      taskSignals.push({ memberId: person.memberId, taskId: t.id, at: new Date(editedAt).toISOString(), newlyAssigned: false });
-  }
+  for (const t of tasks) taskInfo.set(t.id, { title: t.title || "(untitled task)", status: t.status || "in_progress", source: pmSource });
 
   // In-window evidence items (commits + docs) with the text an issue key would appear in. A git
   // commit's key is in its BODY; other items' in the title/path (no large-body fetch — see the
@@ -251,15 +220,16 @@ export async function getWorkTimeline(
     evItems.push({ id: r.id, memberId: r.member_id, source, kind: r.kind ?? "item", title, url: httpUrl(fm.source_url), at, text: `${title}\n${r.path ?? ""}` });
   }
 
-  // Deterministic issue-key links, computed INLINE so the Timeline is always fresh (the persisted
-  // task_evidence table is written separately off the scheduler for other surfaces).
+  // Deterministic issue-key links to the ACTIVE tasks only (computed INLINE so the Timeline is always
+  // fresh). A commit citing a backlog/done issue won't match (it's not in the active set) → "Other".
   const links = computeTaskLinks(
     tasks.map((t) => ({ id: t.id, row_key: t.row_key })),
     evItems.map((e) => ({ id: e.id, text: e.text }))
   );
 
-  // One evidence row per (item, linked task); unlinked items carry taskId=null (→ the "Other" bucket).
-  // A commit citing two issues appears under both.
+  // One evidence row per (item, linked active task); unlinked items carry taskId=null (→ the "Other"
+  // bucket). A commit citing two issues appears under both. The grouper then evidence-gates: a task
+  // shows ONLY where it has ≥1 of this person's evidence that day (no empty headers).
   const evidence: EvidenceWithMember[] = [];
   for (const e of evItems) {
     const base: EvidenceItem & { memberId: string } = { id: e.id, memberId: e.memberId, source: e.source, kind: e.kind, title: e.title, url: e.url, at: e.at };
@@ -268,5 +238,5 @@ export async function getWorkTimeline(
     else evidence.push({ ...base, taskId: null });
   }
 
-  return groupTimeline(evidence, taskInfo, taskSignals, members, todayISO);
+  return groupTimeline(evidence, taskInfo, members, todayISO);
 }
