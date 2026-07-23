@@ -81,6 +81,73 @@ describe("work timeline (real Postgres)", () => {
     expect(otherTitles(days)).toContain("feat: finish it (AIO-11)"); // its commit → Other
   });
 
+  it("Slack: an unmapped ROOT still surfaces the thread for a MAPPED replier; unmapped participants drop", async () => {
+    const seed = await seedTeam(); // seed.memberId = "Tester"
+    // Map ONE slack user id → the seeded member. The thread ROOT ("U_root") is deliberately unmapped.
+    await db()
+      .from("member_identities")
+      .insert({ team_id: seed.teamId, member_id: seed.memberId, provider: "slack", external_id: "U_REPLIER" });
+
+    // A slack thread: root by an unmapped user, a reply by the mapped member. participants[] carries the
+    // per-contributor ledger the timeline reads (the ingest frontmatter-heal writes this in prod).
+    await ingest(seed, {
+      kind: "transcript", path: `slack/eng/${randomUUID()}.md`, access: "team", body: "slack thread body",
+      frontmatter: {
+        source: "slack", channel: "eng", title: "#eng: dual-backend rollout plan",
+        participants: [
+          { author_id: "U_root", display_name: "Outsider", message_count: 1, first_ts: recentIso, last_ts: recentIso },
+          { author_id: "U_REPLIER", display_name: "Tester", message_count: 2, first_ts: recentIso, last_ts: recentIso },
+          // A duplicate entry (stored frontmatter is pusher-shaped) must NOT yield two rows for one person.
+          { author_id: "U_REPLIER", display_name: "Tester", message_count: 2, first_ts: recentIso, last_ts: recentIso },
+        ],
+      },
+    });
+
+    const days = await getWorkTimeline(db(), seed.teamId, "team");
+    // The mapped replier gets the thread in THEIR day (no issue key → "Other"), exactly ONCE (dedup).
+    expect(otherTitles(days).filter((t) => t === "#eng: dual-backend rollout plan")).toHaveLength(1);
+    // Only the mapped member appears — the unmapped root ("Outsider") is dropped, never guessed.
+    const names = days.flatMap((d) => d.people.map((p) => p.name));
+    expect(names).toContain("Tester");
+    expect(names).not.toContain("Outsider");
+  });
+
+  it("Slack: a thread whose title cites an active issue key nests under that task", async () => {
+    const seed = await seedTeam();
+    const anchor = await commit(seed, "seed");
+    await db()
+      .from("member_identities")
+      .insert({ team_id: seed.teamId, member_id: seed.memberId, provider: "slack", external_id: "U_REPLIER" });
+    await insertTask(seed, anchor.projectId!, { row_key: "AIO-42", title: "Rollout task", status: "in_progress" });
+    await ingest(seed, {
+      kind: "transcript", path: `slack/eng/${randomUUID()}.md`, access: "team", body: "b",
+      frontmatter: {
+        source: "slack", channel: "eng", title: "#eng: shipping AIO-42 today",
+        participants: [{ author_id: "U_REPLIER", display_name: "Tester", message_count: 1, first_ts: recentIso, last_ts: recentIso }],
+      },
+    });
+
+    const days = await getWorkTimeline(db(), seed.teamId, "team");
+    expect(nestedUnder(days, "Rollout task")).toContain("#eng: shipping AIO-42 today");
+  });
+
+  it("Slack: tier isolation — an external viewer never receives a team-tier thread", async () => {
+    const seed = await seedTeam();
+    await db()
+      .from("member_identities")
+      .insert({ team_id: seed.teamId, member_id: seed.memberId, provider: "slack", external_id: "U_REPLIER" });
+    await ingest(seed, {
+      kind: "transcript", path: `slack/eng/${randomUUID()}.md`, access: "team", body: "b",
+      frontmatter: {
+        source: "slack", channel: "eng", title: "#eng: team-only slack thread",
+        participants: [{ author_id: "U_REPLIER", display_name: "Tester", message_count: 1, first_ts: recentIso, last_ts: recentIso }],
+      },
+    });
+
+    const extTitles = evidenceTitles(await getWorkTimeline(db(), seed.teamId, "external"));
+    expect(extTitles).not.toContain("#eng: team-only slack thread");
+  });
+
   it("tier isolation: an external viewer never receives team-tier work", async () => {
     const seed = await seedTeam();
     await commit(seed, "Secret team-only commit");

@@ -40,9 +40,13 @@ const ACTIVE_TASK_STATUSES = new Set(["in_progress", "blocked"]);
  *    headers. A task is placed under the EVIDENCE author (who did the work), not its assignee — so a
  *    commit citing someone else's ticket shows the contribution correctly. Evidence referencing a
  *    backlog/done issue (not in the active set) falls to "Other".
- *  • Meetings (granola / transcripts) are team signal, not one person's output → excluded from the
- *    per-person view in v1 (a granola item's member_id is the recorder, not the participants). Slack
- *    evidence is a later PR.
+ *  • Meetings (granola) are team signal, not one person's output → excluded from the per-person view
+ *    (a granola item's member_id is the recorder, not the participants).
+ *  • SLACK is included PER-PARTICIPANT: threads carry a `participants[]` frontmatter ledger (distinct
+ *    authors + first/last contribution time, written by `lib/ingest/sources/slack-normalize`, kept OUT
+ *    of `authors[]` so a replier can't steal thread ownership). Slack items are queried SEPARATELY (no
+ *    `member_id` filter) so a thread whose ROOT is unmapped still surfaces for its mapped repliers; each
+ *    contributor sees the thread in their day, dated by their last message. Unmapped participants drop.
  */
 
 const WINDOW_DAYS = 7;
@@ -100,9 +104,12 @@ export async function getWorkTimeline(
   const sinceIso = new Date(windowStartMs).toISOString();
   const todayISO = new Date().toISOString().slice(0, 10);
 
-  const [memberRes, teamRes] = await Promise.all([
+  const [memberRes, teamRes, slackIdRes] = await Promise.all([
     db.from("members").select("id, display_name, actor_handle, avatar_url, email").eq("team_id", teamId).eq("status", "active"),
     db.from("teams").select("primary_pm_provider").eq("id", teamId).maybeSingle(),
+    // Slack user id → member, for per-participant Slack attribution. Best-effort ENRICHMENT (a missing
+    // map just means no Slack rows), so — unlike the core ledger legs — a failure here isn't fatal.
+    db.from("member_identities").select("external_id, member_id").eq("team_id", teamId).eq("provider", "slack"),
   ]);
   // THROW on a query error — never treat a DB failure (pool contention, #249) as "empty". The pg
   // adapter returns {data:null,error} instead of throwing, so an unchecked `?? []` would silently
@@ -131,12 +138,21 @@ export async function getWorkTimeline(
   }
   if (members.size === 0) return [];
 
+  // Slack user id → member (lowercased, matching the identity resolver's case-folding). Best-effort —
+  // a failure isn't fatal, but WARN so a systemic break (renamed column, adapter change) that silently
+  // kills all Slack evidence forever leaves a signal instead of an undiagnosable blank.
+  if (slackIdRes.error) console.warn("[work-timeline] slack identities read failed:", slackIdRes.error.message);
+  const slackIdToMember = new Map<string, string>();
+  for (const r of (slackIdRes.data ?? []) as { external_id: string | null; member_id: string | null }[]) {
+    if (r.external_id && r.member_id) slackIdToMember.set(r.external_id.toLowerCase(), r.member_id);
+  }
+
   // A task's source = the team's PM provider (linear/plane). With none configured, use a generic
   // "tasks" slug (check icon + "Tasks" label) rather than "other" (which reads as "Files").
   const pmProvider = str((teamRes.data as { primary_pm_provider: string | null } | null)?.primary_pm_provider);
   const pmSource = pmProvider ? normalizeSource(pmProvider) : "tasks";
 
-  const [gitRes, otherRes, taskRes] = await Promise.all([
+  const [gitRes, otherRes, taskRes, slackRes] = await Promise.all([
     // Git commits (title = commit subject → needs body; commit bodies are small).
     visibleItems(
       db
@@ -180,9 +196,26 @@ export async function getWorkTimeline(
         .limit(TASK_LIMIT),
       tier
     ),
+    // SLACK threads — fetched SEPARATELY (no `member_id` filter, unlike gitRes/otherRes) so a thread
+    // whose ROOT author is unmapped or a connector is still processed for its MAPPED repliers: per-
+    // participant attribution reads `frontmatter.participants[]`, not the item's single `member_id`.
+    // Tier-gated through the same §5 choke-point. `participants`/`title` are backfilled onto existing
+    // items by the ingest frontmatter-heal, so this is empty until the first Slack sync post-deploy.
+    visibleItems(
+      db
+        .from("items")
+        .select("id, frontmatter, synced_at")
+        .eq("team_id", teamId)
+        .eq("frontmatter->>source", "slack")
+        .gte("synced_at", sinceIso)
+        .order("synced_at", { ascending: false })
+        .limit(ITEM_LIMIT),
+      tier
+    ),
   ]);
-  // THROW on any evidence-query error too — a partial ledger (one of the three legs failed) must not
-  // be cached/served as complete. See the members-error note above.
+  // THROW on any evidence-query error too — a partial ledger (one of the legs failed) must not
+  // be cached/served as complete. See the members-error note above. Slack is best-effort ENRICHMENT
+  // (a failure just means no Slack rows), so it does NOT throw — never fail the whole ledger over it.
   if (gitRes.error) throw new Error(`work-timeline git: ${gitRes.error.message}`);
   if (otherRes.error) throw new Error(`work-timeline items: ${otherRes.error.message}`);
   if (taskRes.error) throw new Error(`work-timeline tasks: ${taskRes.error.message}`);
@@ -197,7 +230,7 @@ export async function getWorkTimeline(
 
   // In-window evidence items (commits + docs) with the text an issue key would appear in. A git
   // commit's key is in its BODY; other items' in the title/path (no large-body fetch — see the
-  // otherRes select). `kind='task'` items + meetings/transcripts are excluded (Slack evidence is PR-E).
+  // otherRes select). `kind='task'` items + granola meetings are excluded; Slack is its own leg below.
   type Ev = EvidenceItem & { memberId: string; text: string };
   const evItems: Ev[] = [];
   for (const r of (gitRes.data ?? []) as ItemRow[]) {
@@ -213,11 +246,35 @@ export async function getWorkTimeline(
     const fm = r.frontmatter ?? {};
     if (str(fm.source) === "git") continue; // handled by gitRes — no double-count
     const source = normalizeSource(str(fm.source));
-    if (source === "granola" || r.kind === "transcript") continue; // meetings/Slack = not per-person work (v1)
+    if (source === "slack" || source === "granola" || r.kind === "transcript") continue; // slack: own query; meetings: excluded
     const at = itemWorkTime(fm);
     if (!at || Date.parse(at) < windowStartMs) continue;
     const title = str(fm.title) || (r.path ? basename(r.path) : "") || "(untitled)";
     evItems.push({ id: r.id, memberId: r.member_id, source, kind: r.kind ?? "item", title, url: httpUrl(fm.source_url), at, text: `${title}\n${r.path ?? ""}` });
+  }
+
+  // SLACK — per PARTICIPANT (its own query so a thread whose ROOT is unmapped is still processed for its
+  // mapped repliers). Each contributor sees the thread in their day, dated by when THEY last messaged;
+  // an unmapped/connector participant is dropped (never guessed). `title` is the topic snippet.
+  // Best-effort — WARN (don't throw) so a systemic slack-read failure is visible, not a silent blank.
+  if (slackRes.error) console.warn("[work-timeline] slack items read failed:", slackRes.error.message);
+  for (const r of (slackRes.data ?? []) as ItemRow[]) {
+    const fm = r.frontmatter ?? {};
+    const title = str(fm.title) || `#${str(fm.channel) ?? "slack"} thread`;
+    const participants = Array.isArray(fm.participants) ? (fm.participants as { author_id?: unknown; last_ts?: unknown }[]) : [];
+    const seen = new Set<string>(); // stored frontmatter is pusher-shaped — dedup so a duplicate author entry can't emit two rows with the same synthetic id (React key collision).
+    for (const p of participants) {
+      const authorId = str(p?.author_id);
+      const memberId = authorId ? slackIdToMember.get(authorId.toLowerCase()) : undefined;
+      if (!memberId || !members.has(memberId)) continue;
+      if (seen.has(authorId!)) continue;
+      seen.add(authorId!);
+      const at = str(p?.last_ts);
+      if (!at || Number.isNaN(Date.parse(at)) || Date.parse(at) < windowStartMs) continue;
+      // One row per (thread, participant); text = title (no body fetch — a thread citing an issue key in
+      // its first line still links to a task, else it lands in "Other").
+      evItems.push({ id: `${r.id}:${authorId}`, memberId, source: "slack", kind: "slack", title, at, text: title });
+    }
   }
 
   // Deterministic issue-key links to the ACTIVE tasks only (computed INLINE so the Timeline is always
