@@ -38,6 +38,26 @@ export async function issueKeyFor(seed: Seed, tier: "team" | "external"): Promis
   return { key };
 }
 
+/** Issue a key for a fresh team-tier ADMIN member on the seeded team (for admin-gated route tests). */
+export async function issueAdminKey(seed: Seed): Promise<{ key: string }> {
+  const { data, error } = await db()
+    .from("members")
+    .insert({
+      team_id: seed.teamId,
+      email: `admin-${randomUUID().slice(0, 8)}@test.local`,
+      display_name: "Admin",
+      actor_handle: `admin-${randomUUID().slice(0, 8)}`,
+      role: "admin",
+      tier: "team",
+      status: "active",
+    })
+    .select("id")
+    .single();
+  if (error || !data) throw new Error(`admin member seed failed: ${error?.message}`);
+  const { key } = await issueApiKey(db(), seed.teamId, (data as { id: string }).id, "admin key");
+  return { key };
+}
+
 /** Seed a member with a known email + password under the seeded team (for login tests). */
 export async function seedMemberEmail(seed: Seed): Promise<{ email: string; password: string }> {
   const email = `login-${randomUUID().slice(0, 8)}@test.local`;
