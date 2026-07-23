@@ -3,6 +3,7 @@ import { adminClient } from "@/lib/db/admin";
 import type { DbClient } from "@/lib/db/types";
 import type { ViewerTier } from "@/lib/auth/visibility";
 import { getWorkTimeline } from "./work-timeline";
+import { attachPersonDaySummaries } from "./timeline-summary";
 import type { TimelineDay } from "./timeline-group";
 
 /**
@@ -25,9 +26,18 @@ import type { TimelineDay } from "./timeline-group";
  */
 
 const TTL_MS = 5 * 60_000; // 5-min freshness; the ledger is cheap, so refresh often.
-// Bump when the TimelineDay[] SHAPE changes (e.g. PR-D's task→evidence nesting): a cached row from an
-// older deploy is then treated as a cache MISS (rebuilt), so the panel never renders a stale wrong shape.
+// Bump when the TimelineDay[] SHAPE changes: a cached row from an older deploy is then treated as a
+// cache MISS (rebuilt), so the panel never renders a stale wrong shape. `summary` is ADDITIVE + optional
+// (the panel falls back to counts), so it needs NO bump — a v3 row renders fine and the background
+// refresh fills summaries in within a TTL, avoiding a post-deploy inline LLM fan-out on the first view.
 const PAYLOAD_VERSION = 3;
+
+/** The timeline WITH the per-person-day synopsis attached. Runs the (up to 7d × roster) best-effort LLM
+ *  calls — so it's used ONLY on the BACKGROUND refresh path, never inline on a request (a cold miss
+ *  returns the pure ledger fast and schedules this). Never in the raw builder the data-mechanics tier calls. */
+async function buildTimeline(db: DbClient, teamId: string, tier: ViewerTier): Promise<TimelineDay[]> {
+  return attachPersonDaySummaries(db, teamId, await getWorkTimeline(db, teamId, tier));
+}
 
 interface CacheEntry {
   days: TimelineDay[];
@@ -116,7 +126,7 @@ function refreshInBackground(teamId: string, tier: ViewerTier): void {
   void (async () => {
     const bg = adminClient();
     try {
-      const days = await getWorkTimeline(bg, teamId, tier);
+      const days = await buildTimeline(bg, teamId, tier);
       mem.set(key, { days, at: Date.now() });
       await writeTimelineCache(bg, teamId, tier, days);
     } catch (err) {
@@ -154,9 +164,13 @@ export async function getCachedWorkTimeline(
     return persisted.days;
   }
 
-  // Cold miss — build inline so the first viewer gets a real answer, then persist.
+  // Cold miss — return the PURE ledger FAST (no inline LLM), persist it so there's always a row, then
+  // add the per-person-day synopsis in the background. The first viewer sees the timeline immediately;
+  // summaries appear on the next view once the background pass writes them (kept off the request path so
+  // a big team's fan-out can't blow the page / route budget).
   const days = await getWorkTimeline(db, teamId, tier);
   mem.set(key, { days, at: Date.now() });
   await writeTimelineCache(db, teamId, tier, days);
+  refreshInBackground(teamId, tier);
   return days;
 }

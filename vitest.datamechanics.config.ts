@@ -18,6 +18,7 @@ if (!databaseTestUrl) {
 // The pg adapter (lib/db/pg/pool) reads DATABASE_URL; the backend selector reads
 // DB_BACKEND. Pin both to the test DB for every worker before any module loads.
 process.env.DB_BACKEND = "postgres";
+process.env.LLM_BASE_URL = ""; // no summary LLM in the data-mechanics tier
 process.env.NEXT_PUBLIC_DB_BACKEND = "postgres";
 process.env.DATABASE_URL = databaseTestUrl;
 // Fixed test key for integration-secret crypto (lib/secrets); not a real secret.

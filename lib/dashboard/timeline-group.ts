@@ -61,6 +61,10 @@ export interface PersonDay {
   handle: string;
   avatarUrl?: string | null;
   total: number; // evidence items — orders people within a day
+  /** A 1–3 sentence human synopsis of what this person did that day (LLM; optional — the panel falls
+   *  back to a counts line). Added in the cache-build path (`lib/dashboard/timeline-summary`), not the
+   *  pure builder, so it's computed once per rebuild and never runs in the data-mechanics tier. */
+  summary?: string;
   tasks: TaskGroup[];
   other: SourceGroup[]; // evidence linked to no active task
 }
@@ -75,6 +79,30 @@ export interface TimelineMember {
   name: string;
   handle: string;
   avatarUrl?: string | null;
+}
+
+/**
+ * Pure: the LLM input describing one person's day — their in-progress tasks (with the work items nested
+ * under each) + any "Other" work. Fed to `lib/dashboard/timeline-summary` to produce a 1–3 sentence
+ * synopsis. Returns "" when there's nothing to summarize (caller skips the LLM call). Per-source items
+ * are capped so a huge day can't blow the prompt.
+ */
+export function summaryPromptFor(p: PersonDay, dayLabel: string, itemCap = 8): string {
+  const titles = (g: SourceGroup): string => g.items.slice(0, itemCap).map((i) => i.title).join("; ");
+  const lines: string[] = [];
+  if (p.tasks.length) {
+    lines.push("In-progress tasks (with the work done on each):");
+    for (const t of p.tasks) {
+      const work = t.sources.map((g) => `${g.source}: ${titles(g)}`).join(" · ");
+      lines.push(`- ${t.title} [${t.status}]${work ? ` — ${work}` : ""}`);
+    }
+  }
+  if (p.other.length) {
+    lines.push("Other work (not tied to a task):");
+    for (const g of p.other) lines.push(`- ${g.source}: ${titles(g)}`);
+  }
+  if (lines.length === 0) return "";
+  return `${p.name} on ${dayLabel}:\n${lines.join("\n")}`;
 }
 
 /** github/git → github; a known source passes through; anything else → "other" (generic icon). */

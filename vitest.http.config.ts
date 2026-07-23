@@ -22,6 +22,7 @@ if (!databaseTestUrl) {
 // Pin the backend for this process (the seed helpers run the real app code) AND,
 // by inheritance through spawn, for the server child started in global-setup.
 process.env.DB_BACKEND = "postgres";
+process.env.LLM_BASE_URL = ""; // no summary LLM in the http tier
 process.env.NEXT_PUBLIC_DB_BACKEND = "postgres";
 process.env.DATABASE_URL = databaseTestUrl;
 // Fixed test key for integration-secret crypto (lib/secrets); not a real secret.
