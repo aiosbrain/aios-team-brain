@@ -9,12 +9,12 @@ import { GraphitiClient } from "./graphiti-client";
 import { episodeGroupId, type AccessTier } from "./group";
 import { attributedFactTexts, groundParticipants } from "./arc-attribution";
 import { resolveItemCredit } from "@/lib/attribution/contributor-credit";
-import { readArcCache, writeArcCache } from "./arc-cache";
+import { readArcCache, writeArcCache, ARC_CACHE_TTL_MS as CACHE_TTL_MS } from "./arc-cache";
 import { arcIneligibleItemIds } from "./arc-eligibility";
 
 /**
  * Layer 3 — narrative arcs. Gathers the recent graph substrate (facts, last 7d, tier-scoped),
- * asks the team's LLM to synthesize 3–5 ongoing storylines, and caches them for 10 min. Human edits
+ * asks the team's LLM to synthesize 3–5 ongoing storylines, and caches them for 4h. Human edits
  * are fed back on recompute (both into the prompt AND written to Graphiti as correction episodes, so
  * they persist and inform future synthesis). See docs/design/brain-learning-panel.md.
  *
@@ -63,7 +63,7 @@ const FACT_POOL = MAX_FACTS * 20;
 // single huge document (a 257k-char ARCHITECTURE.md extracted into 159 facts) can't BE its author's
 // entire representation and bury their actual varied work.
 const PER_ITEM_CAP = 20;
-const CACHE_TTL_MS = 10 * 60_000;
+// Arc SWR window (4h) lives in ./arc-cache (ARC_CACHE_TTL_MS) so `staleArcCache` shares it — imported above.
 // LLM timeout for arc synthesis, split by call path. A reasoning model over ~200 facts is genuinely
 // slow, so a single tight timeout either (a) blocks the /arcs route to its 120s maxDuration or (b)
 // aborts the healthy-but-slow model and records a bogus "timeout" on the answering-model health leg.
@@ -78,7 +78,11 @@ const EMPTY_CLOBBER_MAX_AGE_MS = (() => {
   // Guard the parse: a garbage/empty env yields NaN/0, and `ageMs < NaN` is always false → EVERY empty
   // synthesis would clobber, silently reverting the incident fix. Fall back unless it's finite and >0.
   const n = Number(process.env.ARCS_EMPTY_CLOBBER_MAX_AGE_MS);
-  return Number.isFinite(n) && n > 0 ? n : 48 * 60 * 60_000;
+  const parsed = Number.isFinite(n) && n > 0 ? n : 48 * 60 * 60_000;
+  // CLAMP to ≫ the SWR TTL: `staleArcCache` forces a re-attribution's prior to age `TTL+1min`, so a cap
+  // at/below the TTL (a plausible ops value like "2h") would make that forced-stale prior clobber-eligible
+  // — one transient empty synthesis would then blank real arcs (the 2026-07 incident). Never let that invert.
+  return Math.max(parsed, CACHE_TTL_MS + 2 * 60_000);
 })();
 
 /** Requested arc count for one synthesis: scale with the number of distinct contributors in the
@@ -468,7 +472,7 @@ export interface SynthesisResult {
 /** Pure: may the background refresh REUSE the prior arcs instead of re-running the (non-deterministic)
  *  LLM? Only when the exact LLM input is byte-identical (`factsHash` match), there's no human correction
  *  to apply, and the prior actually had arcs. This is the stability guard — arcs then change only when the
- *  underlying work does, not on every 10-min recompute. A null/empty prior hash never reuses. */
+ *  underlying work does, not on every recompute. A null/empty prior hash never reuses. */
 export function canReuseArcs(
   prior: { factsHash: string | null; arcCount: number } | null,
   factsHash: string,
@@ -613,7 +617,7 @@ const refreshing = new Set<string>();
  * Evict THIS process's in-memory arc cache for one team, so it stops serving a warm copy after a
  * re-attribution (the persistent `arc_cache` is separately marked stale — see `staleArcCache`). Keys are
  * sorted joins of `${teamSlug}_${tier}` group ids, so a key belongs to the team iff any comma-segment
- * starts with `${teamSlug}_`. Per-process only (the ≤10-min cross-instance bound in the design doc).
+ * starts with `${teamSlug}_`. Per-process only (the ≤4h cross-instance bound in the design doc).
  */
 /** Does an arc-cache key (a comma-joined set of `${slug}_${tier}` group ids) belong to `teamSlug`? The
  *  `_` separator makes the `${slug}_` prefix test exact — team slugs are `[a-z0-9-]` (no `_`), so

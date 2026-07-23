@@ -8,7 +8,7 @@ import { assembleTeamWork, commitSubject, type TaskLite, type CommitLite, type P
 
 /**
  * Live wiring for the consolidated "Working On" box: roster (members) + tasks (one query) + arcs
- * (LLM, cached 10 min), handed to the pure `assembleTeamWork`. Kept apart from team-work.ts so that
+ * (LLM, cached 4h), handed to the pure `assembleTeamWork`. Kept apart from team-work.ts so that
  * pure assembler stays free of the server-only / Neo4j / LLM import chain (and unit-tests cleanly).
  */
 

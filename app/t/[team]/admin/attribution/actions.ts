@@ -112,7 +112,7 @@ export async function applyAttributionCorrectionAction(
     if (result.ok && result.updated > 0) {
       revalidatePath(`/t/${teamSlug}/admin/attribution`);
       // The correction already re-pointed member_id (+ locked it) — just refresh arcs so the change
-      // shows without the 10-min TTL. No reattribute here (it would fight the correction).
+      // shows without waiting out the 4h TTL. No reattribute here (it would fight the correction).
       after(() => bustTeamLearningCaches(adminClient(), ctx.teamId, teamSlug));
     }
     return result;
