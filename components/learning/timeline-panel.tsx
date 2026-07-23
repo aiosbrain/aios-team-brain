@@ -119,6 +119,10 @@ export async function TimelinePanel({ teamId, tier }: { teamId: string; tier: "t
                   </div>
                 </div>
 
+                {p.summary ? (
+                  <p className="text-[13px] leading-snug text-ink-secondary">{p.summary}</p>
+                ) : null}
+
                 {p.tasks.length ? (
                   <div className="flex flex-col gap-2">
                     {p.tasks.map((t) => (
