@@ -11,7 +11,7 @@ export const maxDuration = 60;
 
 /**
  * Dashboard "Working On" data — each person's MOST RECENT day of work, collapsed from the SAME
- * work-timeline the Learning → Timeline panel renders (`getCachedWorkTimeline` → `work_timeline_cache`,
+ * work-timeline the Pulse Timeline disclosure renders (`getCachedWorkTimeline` → `work_timeline_cache`,
  * SWR), so Home and the Timeline are identical. Fetched by the client card so a cold-cache rebuild never
  * blocks the home SSR. Session-authed; tier decides visibility (`visibleItems`/`visibleTasks`, the sole
  * enforcement). Best-effort empty when there's no recent work.

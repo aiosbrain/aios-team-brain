@@ -7,8 +7,8 @@ import { PersonWorkCard } from "@/components/dashboard/person-work-card";
 
 /**
  * Consolidated "Working On" — one card per person showing what they were MOST RECENTLY working on.
- * Fetches `/api/dashboard/team-work`, which collapses the SAME work-timeline the Learning → Timeline
- * panel renders to each person's most recent day — so the two surfaces are IDENTICAL (shared
+ * Fetches `/api/dashboard/team-work`, which collapses the SAME work-timeline the Pulse Timeline
+ * disclosure renders to each person's most recent day — so the two surfaces are IDENTICAL (shared
  * `PersonWorkCard`). Client-fetched so a cold-cache rebuild never blocks the home page render.
  */
 export function WorkingOn({ teamSlug }: { teamSlug: string }) {
