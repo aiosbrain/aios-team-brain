@@ -13,17 +13,15 @@ interface MeetingDetailTabsProps {
   noteId: string;
   summary: string;
   rawText: string;
-  /** The action-items section, rendered under the summary (it owns its own server actions). */
-  actionItems: ReactNode;
 }
 
 /**
- * Right-pane tabs for a meeting: "Summary" (the LLM summary plus the action-items section beneath it)
- * and "Transcript" (the full raw text). Summary leads because it's the digest; the transcript is the
- * evidence you drop into on demand. A bulleted summary renders as a list; a prose one (older notes)
- * stays a paragraph, with a "Regenerate" control to refresh it to the detailed bulleted format.
+ * Right-pane tabs for a meeting: "Summary" (the LLM digest) and "Transcript" (the full raw text).
+ * Summary leads because it's the digest; the transcript is the evidence you drop into on demand. A
+ * bulleted summary renders as a list; a prose one (older notes) stays a paragraph, with a "Regenerate"
+ * control to refresh it to the detailed bulleted format.
  */
-export function MeetingDetailTabs({ teamSlug, noteId, summary, rawText, actionItems }: MeetingDetailTabsProps) {
+export function MeetingDetailTabs({ teamSlug, noteId, summary, rawText }: MeetingDetailTabsProps) {
   const [tab, setTab] = useState<TabKey>("summary");
   const router = useRouter();
   const [regenerating, startRegen] = useTransition();
@@ -83,7 +81,6 @@ export function MeetingDetailTabs({ teamSlug, noteId, summary, rawText, actionIt
             )}
             {regenError ? <p className="text-xs text-rose-500">{regenError}</p> : null}
           </div>
-          {actionItems}
         </div>
       ) : (
         <div className="prism-card px-5 py-4">

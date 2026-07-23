@@ -1,16 +1,13 @@
 import { notFound } from "next/navigation";
 import { serverClient } from "@/lib/db/server";
 import { getMeetingNote, type ViewerTier } from "@/lib/meetings/notes";
-import { resolvePrimaryProvider } from "@/lib/pm-sync/project";
-import { getMeetingTaskStatus } from "@/lib/meetings/target-status-db";
 import { MemberAvatar } from "@/components/people/member-avatar";
-import { MeetingActionItems } from "@/components/meetings/meeting-action-items";
 import { MeetingDetailTabs } from "@/components/meetings/meeting-detail-tabs";
 
 /**
- * The right-pane detail for one meeting (header + Summary/Transcript tabs + action items). Shared by
- * BOTH the detail route (`/meetings/[id]`) and the index (`/meetings`, which renders the newest note
- * inline instead of redirecting) — so opening Meetings is a single request, not a request + redirect.
+ * The right-pane detail for one meeting (header + Summary/Transcript tabs). Shared by BOTH the detail
+ * route (`/meetings/[id]`) and the index (`/meetings`, which renders the newest note inline instead of
+ * redirecting) — so opening Meetings is a single request, not a request + redirect.
  */
 export async function MeetingDetailView({
   teamSlug,
@@ -27,13 +24,6 @@ export async function MeetingDetailView({
   // getMeetingNote enforces the team-tier gate itself (external → null).
   const note = await getMeetingNote(db, teamId, noteId, tier);
   if (!note) notFound();
-
-  // The team's primary PM tool — labels the "Push to …" control and gates it when none is set.
-  // + the default target category for extracted items (the pusher can override it per meeting).
-  const [primary, defaultStatus] = await Promise.all([
-    resolvePrimaryProvider(db, teamId),
-    getMeetingTaskStatus(db, teamId),
-  ]);
 
   return (
     <div className="flex flex-col gap-4">
@@ -65,21 +55,7 @@ export async function MeetingDetailView({
         ) : null}
       </div>
 
-      <MeetingDetailTabs
-        teamSlug={teamSlug}
-        noteId={note.id}
-        summary={note.summary}
-        rawText={note.rawText}
-        actionItems={
-          <MeetingActionItems
-            teamSlug={teamSlug}
-            noteId={note.id}
-            todos={note.extractedTodos}
-            provider={primary.provider}
-            defaultStatus={defaultStatus}
-          />
-        }
-      />
+      <MeetingDetailTabs teamSlug={teamSlug} noteId={note.id} summary={note.summary} rawText={note.rawText} />
     </div>
   );
 }

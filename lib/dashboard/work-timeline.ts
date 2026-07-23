@@ -120,7 +120,7 @@ export async function getWorkTimeline(
   // (teamRes only degrades the pmSource label, so a null there is cosmetic — not fatal.)
   if (memberRes.error) throw new Error(`work-timeline members: ${memberRes.error.message}`);
 
-  // Real people only — connectors author sync noise, not work (mirrors team-work-live.toRoster).
+  // Real people only — connectors author sync noise, not work (excludes connector/service members).
   const humans = ((memberRes.data ?? []) as {
     id: string;
     display_name: string | null;

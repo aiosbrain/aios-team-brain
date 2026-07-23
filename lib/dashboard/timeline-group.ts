@@ -105,6 +105,32 @@ export function summaryPromptFor(p: PersonDay, dayLabel: string, itemCap = 8): s
   return `${p.name} on ${dayLabel}:\n${lines.join("\n")}`;
 }
 
+/**
+ * Collapse the day-grouped timeline to ONE entry per person — their MOST RECENT day of work — for the
+ * Home "Working on" section ("what each person was most recently working on"). Days are ordered
+ * newest-first ("unknown"/undated last); the first time a person appears wins, so the result is each
+ * person's latest active day, ordered by recency (then that day's within-day `total` order). Pure +
+ * unit-tested. The card that renders each entry is identical to a Timeline day's, so the two surfaces match.
+ */
+export function mostRecentPerPerson(days: TimelineDay[]): PersonDay[] {
+  const ordered = [...days].sort((a, b) => {
+    if (a.date === b.date) return 0;
+    if (a.date === "unknown") return 1;
+    if (b.date === "unknown") return -1;
+    return a.date < b.date ? 1 : -1; // newest date first
+  });
+  const seen = new Set<string>();
+  const out: PersonDay[] = [];
+  for (const day of ordered) {
+    for (const p of day.people) {
+      if (seen.has(p.memberId)) continue;
+      seen.add(p.memberId);
+      out.push(p);
+    }
+  }
+  return out;
+}
+
 /** github/git → github; a known source passes through; anything else → "other" (generic icon). */
 export function normalizeSource(raw: string | null | undefined): string {
   const s = (raw ?? "").trim().toLowerCase();

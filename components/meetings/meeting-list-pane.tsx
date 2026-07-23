@@ -5,6 +5,7 @@ import { usePathname } from "next/navigation";
 
 import { MemberAvatar } from "@/components/people/member-avatar";
 import { timeAgo } from "@/components/format";
+import { meetingSynopsis } from "@/lib/meetings/summary-format";
 import type { MeetingNoteSummary } from "@/lib/meetings/notes";
 
 interface MeetingListPaneProps {
@@ -29,6 +30,7 @@ export function MeetingListPane({ teamSlug, notes, defaultActiveId = null }: Mee
       {notes.map((note) => {
         const href = `/t/${teamSlug}/meetings/${note.id}`;
         const active = pathname === href || (onIndex && note.id === defaultActiveId);
+        const synopsis = meetingSynopsis(note.summary);
         return (
           <Link
             key={note.id}
@@ -54,6 +56,11 @@ export function MeetingListPane({ teamSlug, notes, defaultActiveId = null }: Mee
                 {note.occurredAt ?? timeAgo(note.createdAt)}
               </span>
             </div>
+            {synopsis ? (
+              <p className={`line-clamp-3 text-xs leading-snug ${active ? "text-ink-secondary" : "text-ink-tertiary"}`}>
+                {synopsis}
+              </p>
+            ) : null}
             {note.attendees.length ? (
               <div className="flex -space-x-1.5">
                 {note.attendees.slice(0, 5).map((a) => (

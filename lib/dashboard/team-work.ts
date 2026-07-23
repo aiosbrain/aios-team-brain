@@ -11,7 +11,9 @@ import { subjectMatchesMember, type RosterPerson } from "./people-match";
  * "two Johns" / "Chetan" vs "Chetan Nandakumar" onto one row via subjectMatchesMember).
  *
  * This module is PURE (no server-only / Neo4j / LLM imports) so `assembleTeamWork` unit-tests in
- * isolation; the live wiring (roster + tasks + arcs) lives in team-work-live.ts.
+ * isolation. NOTE: the Home "Working on" section now renders the work-timeline (each person's most
+ * recent day, shared with Learning → Timeline) — `commitSubject` here is still used by the timeline
+ * builder; the arc-based `assembleTeamWork` is retained for reuse/tests.
  */
 
 export interface TaskLite {
