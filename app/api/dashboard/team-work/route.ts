@@ -3,17 +3,18 @@ import { serverClient } from "@/lib/db/server";
 import { adminClient } from "@/lib/db/admin";
 import { getSessionUser } from "@/lib/auth/session";
 import { errorResponse } from "@/lib/api/schemas";
-import { resolveAnsweringKeys } from "@/lib/query/answering";
-import { getTeamWork } from "@/lib/dashboard/team-work-live";
+import { getCachedWorkTimeline } from "@/lib/dashboard/timeline-cache";
+import { mostRecentPerPerson } from "@/lib/dashboard/timeline-group";
 
 export const runtime = "nodejs";
-export const maxDuration = 120; // arc synthesis (LLM) inline path can take up to ~110s on a cold cache
+export const maxDuration = 60;
 
 /**
- * Dashboard "Working On" data: per-person summary (narrative arcs), open tasks, and recent
- * accomplishments — assembled server-side and fetched by the client card so the LLM arc synthesis
- * never blocks the home page SSR. Session-authed; tier decides the visible group_ids
- * (`visibleGroupIds`, sole enforcement). Best-effort empty when Graphiti/LLM is unavailable.
+ * Dashboard "Working On" data — each person's MOST RECENT day of work, collapsed from the SAME
+ * work-timeline the Learning → Timeline panel renders (`getCachedWorkTimeline` → `work_timeline_cache`,
+ * SWR), so Home and the Timeline are identical. Fetched by the client card so a cold-cache rebuild never
+ * blocks the home SSR. Session-authed; tier decides visibility (`visibleItems`/`visibleTasks`, the sole
+ * enforcement). Best-effort empty when there's no recent work.
  */
 export async function GET(req: NextRequest) {
   const rls = await serverClient();
@@ -35,8 +36,7 @@ export async function GET(req: NextRequest) {
   if (!me) return errorResponse("forbidden", "not a member of this team", 403);
 
   const tier = (me as { tier: "team" | "external" }).tier;
-  const admin = adminClient();
-  const keys = await resolveAnsweringKeys(admin, team.id);
-  const people = await getTeamWork(admin, team.id, teamSlug, tier, keys);
+  const days = await getCachedWorkTimeline(adminClient(), team.id, tier);
+  const people = mostRecentPerPerson(days);
   return Response.json({ people, as_of: new Date().toISOString() });
 }

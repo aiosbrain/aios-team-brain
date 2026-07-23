@@ -350,9 +350,11 @@ export function QueryChat({
               ask(question);
             }
           }}
-          rows={1}
+          rows={variant === "page" ? 4 : 1}
           placeholder="Ask the brain…  (or /sync to pull latest · Enter to send, Shift+Enter for newline)"
-          className="max-h-40 min-h-[2.5rem] w-full resize-none rounded-xl border border-border-default bg-surface-base px-3 py-2 text-sm text-ink outline-none placeholder:text-ink-tertiary focus:border-violet/50"
+          className={`w-full resize-none rounded-xl border border-border-default bg-surface-base px-3 py-2 text-sm text-ink outline-none placeholder:text-ink-tertiary focus:border-violet/50 ${
+            variant === "page" ? "min-h-[7rem] max-h-72" : "min-h-[2.5rem] max-h-40"
+          }`}
         />
         <button
           type="submit"

@@ -66,10 +66,7 @@ export default async function TeamLayout({
     { icon: "learning", label: "Learning", href: `${base}/learning` },
     { icon: "query", label: "Query", href: `${base}/query` },
   ];
-  // Social Brain — an operator surface (discovers, generates, spends, publishes), so admin-only.
-  if (me.role === "admin") {
-    items.push({ icon: "social", label: "Social", href: `${base}/social` });
-  }
+  // "Social" removed from the left nav (product call) — the /social route still resolves by direct URL.
   items.push({ label: "Settings", children: settingsChildren });
 
   return (

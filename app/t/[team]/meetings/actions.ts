@@ -188,6 +188,11 @@ export async function importPushedMeetingsAction(
  * pass with a markdown-scanner fallback — see lib/meetings/action-items). On-demand because the
  * CLI/ingest import path (`aios push`) never extracted todos, so a pushed meeting shows none until
  * this runs. Idempotent (tasks upsert on a stable row_key), team-tier only.
+ *
+ * NOTE: no UI caller after the meeting-detail action-items section was removed — retained (exercised
+ * by `test/datamechanics/meeting-tasks-push`, and the natural per-meeting re-extract if it's ever
+ * re-surfaced). The active extraction UI is **Tasks → Extract** (`scanMeetingTodosAction` /
+ * `createMeetingTodosAction` in `app/actions/meeting-todos.ts`).
  */
 export async function extractMeetingActionItemsAction(
   teamSlug: string,
@@ -317,6 +322,10 @@ export interface PushTaskResult {
  * the shared projection engine (brain-wins; creates/updates the provider work item and records the
  * task_pm_links row). Only tasks in the "Extracted from Meetings" project that belong to THIS note's
  * transcript are eligible — the ids are re-validated server-side, never trusted from the client.
+ *
+ * NOTE: no UI caller after the meeting-detail action-items section was removed — retained (exercised
+ * by `test/datamechanics/meeting-tasks-push`). The active push-to-PM UI is **Tasks → Extract**
+ * (`createMeetingTodosAction` → `projectAllTasks`, `app/actions/meeting-todos.ts`).
  */
 export async function pushMeetingTasksAction(
   teamSlug: string,

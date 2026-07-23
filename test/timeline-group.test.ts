@@ -3,9 +3,12 @@ import {
   groupTimeline,
   normalizeSource,
   dayLabel,
+  mostRecentPerPerson,
   type EvidenceWithMember,
   type TaskInfo,
   type TimelineMember,
+  type PersonDay,
+  type TimelineDay,
 } from "@/lib/dashboard/timeline-group";
 
 const members = new Map<string, TimelineMember>([
@@ -97,5 +100,40 @@ describe("groupTimeline (evidence-gated task → evidence nesting + Other)", () 
       today
     );
     expect(days[0].people.map((p) => p.name)).toEqual(["Chetan", "John"]);
+  });
+});
+
+/**
+ * Spec for the Home "Working on" collapse: one entry per person = their MOST RECENT day of work,
+ * ordered by recency. This is what makes "Working on" identical to (a slice of) the Timeline.
+ */
+describe("mostRecentPerPerson", () => {
+  const person = (memberId: string, name: string, total: number): PersonDay => ({
+    memberId,
+    name,
+    handle: name.toLowerCase(),
+    total,
+    tasks: [],
+    other: [],
+  });
+
+  it("keeps each person's newest day and drops their older appearances", () => {
+    const days: TimelineDay[] = [
+      { date: "2026-07-23", label: "Today", people: [person("m1", "Chetan", 5), person("m2", "John", 3)] },
+      { date: "2026-07-22", label: "Yesterday", people: [person("m1", "Chetan", 9), person("m3", "Dana", 2)] },
+    ];
+    const out = mostRecentPerPerson(days);
+    // Chetan+John from today (most recent), Dana only appears yesterday → included once.
+    expect(out.map((p) => p.name)).toEqual(["Chetan", "John", "Dana"]);
+    // Chetan's entry is TODAY's (total 5), not yesterday's (9).
+    expect(out.find((p) => p.memberId === "m1")!.total).toBe(5);
+  });
+
+  it("sorts undated ('unknown') last regardless of input order", () => {
+    const days: TimelineDay[] = [
+      { date: "unknown", label: "Undated", people: [person("m9", "Ghost", 1)] },
+      { date: "2026-07-23", label: "Today", people: [person("m1", "Chetan", 5)] },
+    ];
+    expect(mostRecentPerPerson(days).map((p) => p.name)).toEqual(["Chetan", "Ghost"]);
   });
 });
