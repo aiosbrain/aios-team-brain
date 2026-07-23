@@ -19,6 +19,8 @@ export interface ArcCacheEntry {
   arcs: NarrativeArc[];
   /** epoch ms of when this cache row was computed (for TTL/staleness checks in `arcs.ts`). */
   computedAt: number;
+  /** Hash of the LLM synthesis input at that compute — the fact-set-hash skip compares against it. */
+  factsHash: string | null;
 }
 
 /** Read the cached arcs for one team+group_key. Null on miss or any error (best-effort — a cache
@@ -27,16 +29,16 @@ export async function readArcCache(db: DbClient, teamId: string, groupKey: strin
   try {
     const { data } = await db
       .from("arc_cache")
-      .select("arcs, computed_at")
+      .select("arcs, computed_at, facts_hash")
       .eq("team_id", teamId)
       .eq("group_key", groupKey)
       .maybeSingle();
     if (!data) return null;
-    const row = data as { arcs: unknown; computed_at: string | Date };
+    const row = data as { arcs: unknown; computed_at: string | Date; facts_hash: string | null };
     const arcs = Array.isArray(row.arcs) ? (row.arcs as NarrativeArc[]) : [];
     const computedAt =
       typeof row.computed_at === "string" ? Date.parse(row.computed_at) : new Date(row.computed_at).getTime();
-    return { arcs, computedAt: Number.isFinite(computedAt) ? computedAt : 0 };
+    return { arcs, computedAt: Number.isFinite(computedAt) ? computedAt : 0, factsHash: row.facts_hash ?? null };
   } catch {
     return null;
   }
@@ -70,14 +72,15 @@ export async function writeArcCache(
   db: DbClient,
   teamId: string,
   groupKey: string,
-  arcs: NarrativeArc[]
+  arcs: NarrativeArc[],
+  factsHash: string | null
 ): Promise<void> {
   try {
     // `arcs` is a top-level JSON array. The pg adapter only auto-casts non-array objects to jsonb, so
     // serialize it ourselves — a string param binds as text and Postgres assignment-casts it into the
     // jsonb column (a raw JS array would otherwise be bound as a Postgres array literal → json error).
     await db.from("arc_cache").upsert(
-      { team_id: teamId, group_key: groupKey, arcs: JSON.stringify(arcs), computed_at: new Date().toISOString() },
+      { team_id: teamId, group_key: groupKey, arcs: JSON.stringify(arcs), facts_hash: factsHash, computed_at: new Date().toISOString() },
       { onConflict: "team_id,group_key" }
     );
   } catch {

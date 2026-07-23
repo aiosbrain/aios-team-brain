@@ -70,7 +70,7 @@ describe("attribution propagation (real Postgres)", () => {
   it("staleArcCache marks arcs stale (past the 10-min TTL) but within the 48h empty-clobber cap", async () => {
     const seed = await seedTeam();
     const arc: NarrativeArc = { id: "a", title: "t", confidence: "low", summary: "", participants: [], supporting_sources: [], evidence: [], derived_at: new Date().toISOString() };
-    await writeArcCache(db(), seed.teamId, "k", [arc]);
+    await writeArcCache(db(), seed.teamId, "k", [arc], null);
     await staleArcCache(db(), seed.teamId);
 
     const { data } = await db().from("arc_cache").select("computed_at").eq("team_id", seed.teamId).single();

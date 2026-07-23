@@ -81,7 +81,7 @@ export async function recentFacts(
             a.name AS subject,
             b.name AS object,
             r.episodes AS episodeUuids
-     ORDER BY ${workTs("r")} DESC
+     ORDER BY ${workTs("r")} DESC, r.uuid DESC
      LIMIT toInteger($limit)`;
   const query = async (withSince: boolean): Promise<AtomicFact[]> => {
     const rows = await runRead<{

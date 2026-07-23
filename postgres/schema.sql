@@ -1537,9 +1537,14 @@ create table if not exists arc_cache (
   team_id uuid not null references teams(id) on delete cascade,
   group_key text not null,                       -- sorted visible-group set, e.g. 'acme_external,acme_team'
   arcs jsonb not null default '[]'::jsonb,        -- NarrativeArc[] (already human-attributed)
+  -- Hash of the exact LLM synthesis input (the attributed fact prompt). The background refresh SKIPS the
+  -- (non-deterministic) LLM re-synthesis when this is unchanged — so arcs only change when the underlying
+  -- work does, killing day-to-day churn. Nullable: pre-existing rows have none until the next recompute.
+  facts_hash text,
   computed_at timestamptz not null default now(),
   primary key (team_id, group_key)
 );
+alter table arc_cache add column if not exists facts_hash text;
 
 -- ── work-timeline cache (the persisted, queryable work-timeline context layer) ──
 -- The day → person → work ledger (from `items` + `tasks`) assembled by lib/dashboard/work-timeline,
