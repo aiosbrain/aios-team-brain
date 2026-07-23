@@ -1,14 +1,16 @@
 /**
  * Backfill dense embeddings for existing items (optional pgvector retrieval). Idempotent — skips
- * items whose chunk set already matches their content hash, so it's safe to re-run. Requires
- * EMBEDDINGS_URL + the pgvector schema (`npm run pg:schema:vector`). Postgres target only.
+ * items whose chunk set already matches their content hash, so it's safe to re-run. Requires the
+ * pgvector schema (`npm run pg:schema:vector`) + a resolvable embeddings backend per team — either a
+ * team's Admin "Embeddings model" pick (teams.embedding_provider) or env EMBEDDINGS_URL. Postgres only.
  *
- * Run: EMBEDDINGS_URL=… OPENAI_API_KEY=… DATABASE_URL=… \
+ * Run: DATABASE_URL=… [EMBEDDINGS_URL=… OPENAI_API_KEY=…] \
  *        npx tsx --conditions react-server scripts/embed-backfill.ts [teamSlug]
  */
 import { runSql } from "@/lib/db/pg/pool";
-import { indexItem, denseIndexAvailable } from "@/lib/query/dense-index";
-import { resolveEmbeddingKey } from "@/lib/query/embedding-key";
+import { indexItem, itemChunksTablePresent } from "@/lib/query/dense-index";
+import { resolveEmbeddingBackend } from "@/lib/query/embedding-key";
+import type { EmbeddingBackend } from "@/lib/query/embeddings-backend";
 
 type ItemRow = {
   id: string;
@@ -19,8 +21,8 @@ type ItemRow = {
 };
 
 async function main() {
-  if (!(await denseIndexAvailable())) {
-    console.error("dense retrieval unavailable: set EMBEDDINGS_URL and run `npm run pg:schema:vector` first");
+  if (!(await itemChunksTablePresent())) {
+    console.error("dense retrieval unavailable: run `npm run pg:schema:vector` to load the pgvector schema first");
     process.exit(1);
   }
   const teamSlug = process.argv[2];
@@ -37,17 +39,21 @@ async function main() {
   let chunks = 0;
   let skipped = 0;
   let failed = 0;
-  const keyByTeam = new Map<string, string | null>(); // resolve each team's embedding key once
+  const backendByTeam = new Map<string, EmbeddingBackend | null>(); // resolve each team's backend once
   for (const it of items.rows) {
     try {
-      let key = keyByTeam.get(it.team_id);
-      if (key === undefined) {
-        key = await resolveEmbeddingKey(it.team_id);
-        keyByTeam.set(it.team_id, key);
+      let backend = backendByTeam.get(it.team_id);
+      if (backend === undefined) {
+        backend = await resolveEmbeddingBackend(it.team_id);
+        backendByTeam.set(it.team_id, backend);
+      }
+      if (!backend) {
+        skipped++; // team has no embeddings backend configured — nothing to embed against
+        continue;
       }
       const r = await indexItem(
         { id: it.id, teamId: it.team_id, body: it.body, access: it.access, contentSha256: it.content_sha256 },
-        key
+        backend
       );
       if (r.skipped) skipped++;
       else {
