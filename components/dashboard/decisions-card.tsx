@@ -1,6 +1,6 @@
 import Link from "next/link";
 import { Gavel } from "lucide-react";
-import { fmtDate, truncate } from "@/components/format";
+import { fmtDate, truncate, stripMarkdown } from "@/components/format";
 import type { DecisionRow } from "./types";
 
 const TIER_LABEL: Record<number, string> = { 1: "1-way", 2: "2-way", 3: "minor" };
@@ -30,18 +30,27 @@ export function DecisionsCard({
         </p>
       ) : (
         <ul className="flex flex-col gap-2.5">
-          {decisions.map((d) => (
-            <li key={d.id} className="flex items-start justify-between gap-2">
-              <span
-                className={`text-sm ${d.still_valid ? "text-ink-secondary" : "text-ink-tertiary line-through"}`}
-              >
-                {truncate(d.title, 64)}
-              </span>
-              <span className="shrink-0 text-[11px] text-ink-tertiary">
-                {d.tier ? TIER_LABEL[d.tier] ?? `T${d.tier}` : ""} · {fmtDate(d.decided_at)}
-              </span>
-            </li>
-          ))}
+          {decisions.map((d) => {
+            // Link to the source it was recorded in (decision-log doc / meeting); fall back to the log.
+            const href = d.source_item_id
+              ? `/t/${teamSlug}/library/${d.source_item_id}`
+              : `/t/${teamSlug}/decisions`;
+            return (
+              <li key={d.id} className="flex items-start justify-between gap-2">
+                <Link
+                  href={href}
+                  className={`text-sm transition-colors hover:text-violet ${
+                    d.still_valid ? "text-ink-secondary" : "text-ink-tertiary line-through"
+                  }`}
+                >
+                  {truncate(stripMarkdown(d.title), 64)}
+                </Link>
+                <span className="shrink-0 text-[11px] text-ink-tertiary">
+                  {d.tier ? TIER_LABEL[d.tier] ?? `T${d.tier}` : ""} · {fmtDate(d.decided_at)}
+                </span>
+              </li>
+            );
+          })}
         </ul>
       )}
     </section>
