@@ -177,7 +177,7 @@ export default async function TeamHome({
   const [pulse, { data: decisions }, pipelineHealth] = await Promise.all([
     getPulseMetrics(db, team.id, range, { isAdmin, memberId }),
     visibleDecisions(
-      db.from("decisions").select("id, title, decided_at, tier, still_valid").eq("team_id", team.id).order("decided_at", { ascending: false }).limit(8),
+      db.from("decisions").select("id, title, decided_at, tier, still_valid, source_item_id").eq("team_id", team.id).order("decided_at", { ascending: false }).limit(8),
       tier,
     ),
     // Admins see a loud banner here (the landing page) if any ingestion leg is broken — so a wedged
