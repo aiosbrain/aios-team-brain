@@ -7,7 +7,7 @@ import { adminClient } from "@/lib/db/admin";
 import { recentFacts, resolveEpisodeItems, type AtomicFact } from "./learning";
 import { GraphitiClient } from "./graphiti-client";
 import { episodeGroupId, type AccessTier } from "./group";
-import { attributeParticipants, attributedFactTexts, withEvidenceParticipants } from "./arc-attribution";
+import { attributedFactTexts, groundParticipants } from "./arc-attribution";
 import { resolveItemCredit } from "@/lib/attribution/contributor-credit";
 import { readArcCache, writeArcCache } from "./arc-cache";
 import { arcIneligibleItemIds } from "./arc-eligibility";
@@ -438,21 +438,15 @@ function humansForItems(itemIds: (string | undefined)[], contributorsByItem: Map
 }
 
 /** Attribute each arc's `participants` from its OWN evidence (never cross-arc — an arc's attribution
- *  must trace to ITS OWN work): first tag recognized AI-agent names with the human(s) behind the
- *  evidence items, then UNION in any evidence human the model didn't name (`withEvidenceParticipants`)
- *  — so a contributor whose facts an arc cites is on the chip even when their name never appears in
- *  the fact text (commit-shaped work), and an arc the model returned with `participants: []` still
- *  names the people it's actually about. Pure over an already-resolved per-item CONTRIBUTOR SET map. */
+ *  must trace to ITS OWN work): the participants are the humans who AUTHORED the arc's cited evidence
+ *  (`evidenceHumans` — the version-author set, so a reassigned-away contributor stays visible). Names the
+ *  model merely echoed from fact prose but that authored none of the cited evidence are DROPPED — a
+ *  participant did work the arc cites, not just got mentioned (the misattribution fix). See
+ *  `groundParticipants`. Pure over an already-resolved per-item CONTRIBUTOR SET map. */
 function attributeArcs(arcs: NarrativeArc[], contributorsByItem: Map<string, string[]>): NarrativeArc[] {
   return arcs.map((arc) => {
     const evidenceHumans = humansForItems(arc.evidence.map((e) => e.itemId), contributorsByItem);
-    return {
-      ...arc,
-      participants: withEvidenceParticipants(
-        attributeParticipants(arc.participants, evidenceHumans),
-        evidenceHumans
-      ),
-    };
+    return { ...arc, participants: groundParticipants(arc.participants, evidenceHumans) };
   });
 }
 
