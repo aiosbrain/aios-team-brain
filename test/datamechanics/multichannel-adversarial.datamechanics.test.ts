@@ -257,3 +257,41 @@ describe("multi-channel adversarial retrieval (real Postgres)", () => {
     expect(orHits).toContain("slack/platform/both.md");
   });
 });
+
+describe("source-scope recency leg (real Postgres — the 'we ingest Slack but the answer said we don't' fix)", () => {
+  beforeEach(async () => {
+    seed = await seedTeam();
+  });
+
+  it("STRENGTH: a source-scoped query surfaces a recent Slack thread the keyword+recency legs miss", async () => {
+    // Slack thread: OLDEST item, and its BODY carries none of the query's content terms — so neither the
+    // FTS leg (no term overlap) nor the generic 8-item recency (it's the oldest) can surface it. The ONLY
+    // thing that can is the source-scoped recency leg (filters on frontmatter.source='slack').
+    await post("slack/general", "thread", "# general\n\n**Ada**: shipping the onboarding flow, who can review it?");
+    // Newer non-slack docs that own the content terms → they win FTS and the recency window.
+    for (let i = 0; i < 30; i++) {
+      await ingest(seed, {
+        kind: "deliverable",
+        path: `notion/doc-${i}.md`,
+        body: `conversation design notes ${i}: a conversation about conversation patterns`,
+        access: "team",
+        frontmatter: { source: "notion" },
+      });
+    }
+
+    // Contrast — a NON-source query sharing the "conversation" term does NOT surface the Slack thread
+    // (its body doesn't match, and it's not recent), proving the leg is what makes the difference.
+    const plain = await paths("conversation design patterns");
+    expect(plain.some((p) => p.startsWith("slack/general/"))).toBe(false);
+
+    // WITH the source scope, the recency leg pulls the latest Slack thread in regardless of keyword rank.
+    const scoped = await paths("what's the conversation in slack right now?");
+    expect(scoped.some((p) => p.startsWith("slack/general/"))).toBe(true);
+  });
+
+  it("tier isolation: an external viewer's source-scoped Slack query never returns team-tier threads", async () => {
+    await post("slack/general", "internal", "# #general — Slack thread\n\n internal-only chatter", "team");
+    const ext = await paths("what's the conversation in slack right now?", "external");
+    expect(ext.some((p) => p.startsWith("slack/general/"))).toBe(false);
+  });
+});

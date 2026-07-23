@@ -183,6 +183,13 @@ returns `{ sources, structured, grounded }`.
 - **Conjunctive AND** (`conjunctiveTerms`, `retrieve.ts:212`): an explicit **upper-cased** `AND` is an
   opt-in precision operator ("auth AND payments" → docs about both). Only upper-case, because lowercase
   "and" is a ubiquitous stopword and treating it as conjunction would gut recall.
+- **Source scoping** (`parseSourceScope`): when a question names an ingestion source with a recency/
+  content intent ("what's the conversation in **slack** right now", "latest **notion** docs"), a
+  source-scoped recency leg pulls that source's newest items **regardless of keyword rank**. Fixes the
+  "we ingest Slack but the answer says we don't" failure — a Slack thread matches such a query only on
+  the word "slack" in its heading, so it ranks below `FTS_CANDIDATE_LIMIT` and never reaches the model.
+  Conservative (concrete source name + a recency/scope signal), and it counts as grounding evidence so
+  the stay-quiet guard can't abstain the answer away.
 - **First-person + timezone** — "how about me?" resolves to the signed-in member; relative dates
   ("today" = last 24h) resolve in the asker's timezone.
 
@@ -200,7 +207,9 @@ returns `{ sources, structured, grounded }`.
    with no surface-term overlap; we harvest salient entity/fact words (≤ `MAX_EXPANSION_TERMS = 24`) and
    run a second FTS pass to reach the *source items* a literal search missed (paraphrase/synonym recall).
 4. **Recency net** — newest 8 items (`synced_at DESC`), so fresh content always has a shot even when
-   FTS is capped/unranked. This is why single-topic queries feel reliable.
+   FTS is capped/unranked. This is why single-topic queries feel reliable. A **source-scoped** variant
+   (`SOURCE_RECENCY_LIMIT = 8`, when `parseSourceScope` fires) pulls a named source's newest items ahead
+   of the generic net, so "what's in slack" surfaces recent Slack threads the keyword rank buries.
 5. **Structured extras** — always-included compact blocks (below).
 6. **Graph temporal facts** — up to `GRAPH_FACTS_LIMIT = 12` Graphiti facts, tier-scoped by group id.
 
