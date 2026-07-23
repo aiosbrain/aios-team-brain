@@ -4,6 +4,7 @@ import { extractFromTranscript, type ProviderKeys, type RosterPerson } from "./l
 import { extractAndStoreActionItems } from "./action-items";
 import type { ExtractedTodo } from "./extract-todos";
 import { createMeetingNoteFromItem } from "./notes";
+import { backfillMergeDuplicateMeetings } from "./merge";
 
 /**
  * Bridge: turn transcript `items` that arrived through the CLI/ingest path (`aios push`) into
@@ -87,6 +88,8 @@ export interface BackfillSummary {
   scanned: number;
   created: number;
   skipped: number;
+  /** Same-day duplicate meetings auto-merged after creation (see backfillMergeDuplicateMeetings). */
+  merged: number;
 }
 
 /**
@@ -101,7 +104,7 @@ export async function backfillMeetingNotesFromItems(
   opts: BackfillOptions = {}
 ): Promise<BackfillSummary> {
   const limit = opts.limit ?? 50;
-  const summary: BackfillSummary = { scanned: 0, created: 0, skipped: 0 };
+  const summary: BackfillSummary = { scanned: 0, created: 0, skipped: 0, merged: 0 };
 
   // Which transcript items already have a note — exclude them.
   const { data: noted } = await admin.from("meeting_notes").select("source_item_id").eq("team_id", teamId);
@@ -119,8 +122,8 @@ export async function backfillMeetingNotesFromItems(
     (r) => isMeetingTranscript("transcript", (r.frontmatter?.source as string) ?? null) && !hasNote.has(r.id)
   );
 
-  if (candidates.length === 0) return summary;
-
+  // NOTE: no early-return on an empty candidate set — the create loop below no-ops, and the
+  // auto-merge at the end still runs so pre-existing duplicates get cleaned up each tick.
   const { data: rosterRows } = await admin
     .from("members")
     .select("id, display_name")
@@ -174,6 +177,17 @@ export async function backfillMeetingNotesFromItems(
     } catch {
       summary.skipped++; // best-effort — one bad item never fails the batch
     }
+  }
+
+  // Auto-merge same-day duplicate meetings — a re-record / re-push creates a second note for the same
+  // meeting. Runs the SAME merge as the live-upload path, now on the CLI/ingest path too, so duplicates
+  // never accumulate and no manual "Merge duplicates" button is needed. No human actor here — the merge
+  // falls back to an active member for attribution. Best-effort; a merge hiccup never fails note creation.
+  try {
+    const m = await backfillMergeDuplicateMeetings(admin, teamId, { keys: opts.keys ?? {} });
+    summary.merged = m.merged;
+  } catch {
+    // merge is a cleanup on top of the created notes
   }
   return summary;
 }

@@ -15,9 +15,11 @@ interface OpenrouterPanelProps {
 
 /**
  * Admin → Integrations · OpenRouter. Makes OpenRouter — an OpenAI-compatible gateway to many models
- * (OpenAI, Anthropic, Google, Llama, …) — a first-class, admin-selectable answering backend. Connect
- * a validated key + pick a model slug; once set, the query LLM routes through OpenRouter ahead of the
- * Anthropic default (see selectLlmBackend). The key is validated on save and stored encrypted.
+ * (OpenAI, Anthropic, Google, Llama, …) — a first-class answering backend. This panel manages ONLY the
+ * KEY (validated + stored encrypted); WHICH model answers/reasons is chosen in the "Answering & reasoning
+ * models" picker above (a key-only save preserves that model — `saveOpenrouterSettings` leaves
+ * `config.model` untouched when no model is passed). Once connected, the query LLM routes through
+ * OpenRouter ahead of the Anthropic default (see selectLlmBackend).
  */
 export function OpenrouterPanel({ teamSlug, connected, model }: OpenrouterPanelProps) {
   const router = useRouter();
@@ -25,11 +27,9 @@ export function OpenrouterPanel({ teamSlug, connected, model }: OpenrouterPanelP
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [key, setKey] = useState("");
-  const [modelInput, setModelInput] = useState(model ?? "");
 
   function save() {
     const k = key.trim();
-    const m = modelInput.trim();
     if (!k && !connected) {
       setError("enter an OpenRouter key to connect");
       return;
@@ -37,13 +37,11 @@ export function OpenrouterPanel({ teamSlug, connected, model }: OpenrouterPanelP
     setError(null);
     setNotice(null);
     startTransition(async () => {
-      const res = await saveOpenrouter(teamSlug, { key: k || undefined, model: m || undefined });
+      const res = await saveOpenrouter(teamSlug, { key: k || undefined });
       if (!res.ok) setError(res.error ?? "could not save");
       else {
         setKey("");
-        setNotice(
-          res.label ? `Connected (${res.label}) · answering with ${m || model || DEFAULT_OPENROUTER_MODEL}` : "Saved."
-        );
+        setNotice(res.label ? `Connected (${res.label}).` : "Saved.");
         router.refresh();
       }
     });
@@ -66,30 +64,19 @@ export function OpenrouterPanel({ teamSlug, connected, model }: OpenrouterPanelP
           OpenRouter
         </a>{" "}
         — one key for many models (OpenAI, Anthropic, Google, Llama, …). When connected it takes
-        precedence over the default Anthropic backend. Pick a{" "}
-        <a href="https://openrouter.ai/models" target="_blank" rel="noreferrer" className="text-violet hover:underline">
-          model slug
-        </a>{" "}
-        like <span className="font-mono text-ink">anthropic/claude-sonnet-4</span> or{" "}
-        <span className="font-mono text-ink">openai/gpt-4o-mini</span>.
+        precedence over the default Anthropic backend. Choose <em>which</em> model answers/reasons in the{" "}
+        <span className="font-medium text-ink">Answering &amp; reasoning models</span> picker above.
       </p>
 
-      <input
-        className="prism-input"
-        type="password"
-        autoComplete="off"
-        placeholder={connected ? "replace key — sk-or-… (leave blank to keep current)" : "sk-or-…"}
-        value={key}
-        onChange={(e) => setKey(e.target.value)}
-        aria-label="OpenRouter API key"
-      />
       <div className="flex flex-col gap-2 sm:flex-row">
         <input
-          className="prism-input flex-1 font-mono"
-          placeholder={`model slug (default ${DEFAULT_OPENROUTER_MODEL})`}
-          value={modelInput}
-          onChange={(e) => setModelInput(e.target.value)}
-          aria-label="OpenRouter model"
+          className="prism-input flex-1"
+          type="password"
+          autoComplete="off"
+          placeholder={connected ? "replace key — sk-or-… (leave blank to keep current)" : "sk-or-…"}
+          value={key}
+          onChange={(e) => setKey(e.target.value)}
+          aria-label="OpenRouter API key"
         />
         <button type="button" onClick={save} disabled={pending} className="btn-prism justify-center">
           <ShieldCheck className="size-4" /> {connected ? "Save" : "Validate & connect"}

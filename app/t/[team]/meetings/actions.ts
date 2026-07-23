@@ -5,7 +5,7 @@ import { z } from "zod";
 
 import { serverClient } from "@/lib/db/server";
 import { adminClient } from "@/lib/db/admin";
-import { currentMember, requireTeamAdmin } from "@/lib/auth/guard";
+import { currentMember } from "@/lib/auth/guard";
 import { resolveAnsweringKeys } from "@/lib/query/answering";
 import {
   createMeetingNote,
@@ -18,7 +18,7 @@ import { extractFromTranscript, type RosterPerson } from "@/lib/meetings/llm-ext
 import { extractAndStoreActionItems } from "@/lib/meetings/action-items";
 import { MEETING_TODO_PROJECT_SLUG } from "@/lib/meetings/extract-todos";
 import { MEETING_TASK_STATUSES, type MeetingTaskStatus } from "@/lib/meetings/target-status";
-import { findDuplicateMeeting, mergeIntoMeetingNote, backfillMergeDuplicateMeetings } from "@/lib/meetings/merge";
+import { findDuplicateMeeting, mergeIntoMeetingNote } from "@/lib/meetings/merge";
 import { backfillMeetingNotesFromItems } from "@/lib/meetings/from-items";
 import {
   projectRows,
@@ -136,26 +136,8 @@ export async function uploadMeetingNoteAction(
   return { ok: true, id: noteId };
 }
 
-/**
- * One-time cleanup: merge already-created duplicate meetings (same date + overlapping transcripts)
- * into one note each, crediting all submitters and hiding the folded-away copies. Admin-only (it's a
- * bulk, content-mutating operation). Uses the same LLM merge as the live upload path.
- */
-export async function mergeDuplicateMeetingsAction(
-  teamSlug: string
-): Promise<{ ok: boolean; merged?: number; clusters?: number; error?: string }> {
-  const ctx = await requireTeamAdmin(teamSlug);
-  if (!ctx) return { ok: false, error: "admins only" };
-  const admin = adminClient();
-  const keys = await resolveAnsweringKeys(admin, ctx.teamId);
-  try {
-    const s = await backfillMergeDuplicateMeetings(admin, ctx.teamId, { keys, actorMemberId: ctx.memberId });
-    revalidatePath(`/t/${teamSlug}/meetings`);
-    return { ok: true, merged: s.merged, clusters: s.clusters };
-  } catch (e) {
-    return { ok: false, error: e instanceof Error ? e.message : "merge failed" };
-  }
-}
+// NOTE: the manual "Merge duplicates" action/button was removed — duplicate-meeting merge now runs
+// automatically on ingest (lib/meetings/from-items.backfillMeetingNotesFromItems → backfillMergeDuplicateMeetings).
 
 /**
  * Import meetings that arrived via the CLI/ingest (`aios push`) into the Meetings page. Scans this
