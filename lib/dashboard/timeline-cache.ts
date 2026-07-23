@@ -27,7 +27,7 @@ import type { TimelineDay } from "./timeline-group";
 const TTL_MS = 5 * 60_000; // 5-min freshness; the ledger is cheap, so refresh often.
 // Bump when the TimelineDay[] SHAPE changes (e.g. PR-D's task→evidence nesting): a cached row from an
 // older deploy is then treated as a cache MISS (rebuilt), so the panel never renders a stale wrong shape.
-const PAYLOAD_VERSION = 2;
+const PAYLOAD_VERSION = 3;
 
 interface CacheEntry {
   days: TimelineDay[];

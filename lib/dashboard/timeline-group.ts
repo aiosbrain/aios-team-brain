@@ -1,16 +1,17 @@
 /**
  * Pure grouping for the Learning "Timeline" — a human-readable day → person → work chronology where a
  * person's evidence (commits, docs) nests UNDER the task it contributes to, with an "Other" bucket for
- * evidence linked to no task. Fed already-attributed evidence + task signals by `lib/dashboard/work-
+ * evidence linked to no task. Fed already-attributed, task-linked evidence by `lib/dashboard/work-
  * timeline`; NO server-only/DB imports so it unit-tests cleanly.
  *
  * Structure per (day, person):
- *   • tasks[]  — each task the person had activity on that day (a worked_at/assigned_at signal, OR ≥1
- *                evidence item that references its issue key), with that day's linked evidence nested
- *                and grouped by source. A newly-assigned task shows even with no evidence yet.
- *   • other[]  — that day's evidence that referenced no task, grouped by source.
+ *   • tasks[]  — ONLY tasks that have ≥1 of the person's evidence items that day (evidence-gated: a
+ *                task with no evidence never appears). Only ACTIVE tasks are ever link targets (the
+ *                builder filters backlog/done out), so this is "the in-progress work they touched,"
+ *                each with that day's evidence nested + grouped by source.
+ *   • other[]  — that day's evidence that referenced no active task, grouped by source.
  * Ordering: days DESC (undated last); within a day, people by activity DESC; a person's tasks by
- * evidence count DESC (newly-assigned-with-no-evidence last); items newest-first, capped per source.
+ * evidence count DESC; items newest-first, capped per source.
  */
 
 /** One piece of a person's work — a commit or a dated deliverable. `taskId` links it to a task. */
@@ -27,23 +28,15 @@ export interface EvidenceItem {
 
 export interface EvidenceWithMember extends EvidenceItem {
   memberId: string;
-  /** The task this evidence references (via issue key), if any. Unlinked → the "Other" bucket. */
+  /** The active task this evidence references (via issue key), if any. Unlinked → the "Other" bucket. */
   taskId?: string | null;
 }
 
-/** Display info for a task, resolved once per in-window task (id → this). */
+/** Display info for an active task, resolved once per in-window task (id → this). */
 export interface TaskInfo {
   title: string;
-  status: string; // task_status (backlog/ready/in_progress/done/…)
+  status: string; // task_status (in_progress / blocked — active only)
   source: string; // pm source slug: linear | plane | tasks
-}
-
-/** A per-(day,person) signal that a task was worked or freshly assigned that day (a task "header"). */
-export interface TaskSignal {
-  memberId: string;
-  taskId: string;
-  at: string; // ISO — worked_at or assigned_at
-  newlyAssigned: boolean;
 }
 
 export interface SourceGroup {
@@ -52,13 +45,12 @@ export interface SourceGroup {
   items: EvidenceItem[]; // newest-first, capped
 }
 
-/** A task with its day's evidence nested under it. */
+/** A task with its day's evidence nested under it (only ever present when it HAS evidence). */
 export interface TaskGroup {
   taskId: string;
   title: string;
   status: string;
   source: string; // pm source slug (icon)
-  newlyAssigned: boolean;
   sources: SourceGroup[]; // evidence grouped by source under this task
   evidenceCount: number; // total nested evidence items (uncapped)
 }
@@ -68,9 +60,9 @@ export interface PersonDay {
   name: string;
   handle: string;
   avatarUrl?: string | null;
-  total: number; // evidence items + task headers — orders people within a day
+  total: number; // evidence items — orders people within a day
   tasks: TaskGroup[];
-  other: SourceGroup[]; // evidence linked to no task
+  other: SourceGroup[]; // evidence linked to no active task
 }
 
 export interface TimelineDay {
@@ -122,7 +114,7 @@ function sortDaysDesc(a: string, b: string): number {
 
 const dayOf = (at: string): string => (at ?? "").slice(0, 10) || "unknown";
 
-/** Group evidence into SourceGroups (by source, count DESC, newest-first, per-source capped). */
+/** Group evidence items into SourceGroups (by source, count DESC, newest-first, per-source capped). */
 function toSourceGroups(items: EvidenceItem[], cap: number): SourceGroup[] {
   const bySource = new Map<string, EvidenceItem[]>();
   for (const it of items) {
@@ -139,50 +131,38 @@ function toSourceGroups(items: EvidenceItem[], cap: number): SourceGroup[] {
 }
 
 /**
- * Group attributed evidence + task signals into the day → person → (tasks + other) structure the panel
- * renders. `taskInfo` supplies each task's display fields; `members` resolves memberId → display; work
- * for an unknown member (or an evidence taskId with no taskInfo) is handled gracefully (evidence with a
- * dangling taskId falls back to "Other"). `todayISO` is passed in — no Date.now here (deterministic).
+ * Group attributed, task-linked evidence into the day → person → (tasks + other) structure the panel
+ * renders. EVIDENCE-GATED: a task group exists only where the person has evidence referencing it that
+ * day — there are no empty task headers. `taskInfo` supplies each active task's display fields; evidence
+ * whose `taskId` isn't in `taskInfo` (unlinked, or linked to a now-inactive task) falls to "Other".
+ * `todayISO` is passed in (no Date.now — deterministic).
  */
 export function groupTimeline(
   evidence: EvidenceWithMember[],
   taskInfo: Map<string, TaskInfo>,
-  taskSignals: TaskSignal[],
   members: Map<string, TimelineMember>,
   todayISO: string,
   perSourceCap: number = DEFAULT_PER_SOURCE_CAP
 ): TimelineDay[] {
-  // day -> memberId -> { tasks: Map<taskId,{newlyAssigned, ev[]}>, other: EvidenceItem[] }
-  type PersonBucket = { tasks: Map<string, { newlyAssigned: boolean; ev: EvidenceItem[] }>; other: EvidenceItem[] };
+  // day -> memberId -> { tasks: Map<taskId, EvidenceItem[]>, other: EvidenceItem[] }
+  type PersonBucket = { tasks: Map<string, EvidenceItem[]>; other: EvidenceItem[] };
   const byDay = new Map<string, Map<string, PersonBucket>>();
 
-  const bucketFor = (date: string, memberId: string): PersonBucket => {
-    const people = byDay.get(date) ?? new Map<string, PersonBucket>();
-    byDay.set(date, people);
-    const b = people.get(memberId) ?? { tasks: new Map(), other: [] };
-    people.set(memberId, b);
-    return b;
-  };
-  const taskEntry = (b: PersonBucket, taskId: string) => {
-    const e = b.tasks.get(taskId) ?? { newlyAssigned: false, ev: [] };
-    b.tasks.set(taskId, e);
-    return e;
-  };
-
-  // Task signals → (possibly empty) task headers on their signal day.
-  for (const sig of taskSignals) {
-    if (!members.has(sig.memberId) || !taskInfo.has(sig.taskId)) continue;
-    const e = taskEntry(bucketFor(dayOf(sig.at), sig.memberId), sig.taskId);
-    if (sig.newlyAssigned) e.newlyAssigned = true;
-  }
-
-  // Evidence → nested under its linked task (if the task is known), else the Other bucket.
   for (const ev of evidence) {
     if (!members.has(ev.memberId)) continue; // unknown member → drop, don't guess
-    const b = bucketFor(dayOf(ev.at), ev.memberId);
+    const date = dayOf(ev.at);
+    const people = byDay.get(date) ?? new Map<string, PersonBucket>();
+    byDay.set(date, people);
+    const b: PersonBucket = people.get(ev.memberId) ?? { tasks: new Map<string, EvidenceItem[]>(), other: [] };
+    people.set(ev.memberId, b);
     const item: EvidenceItem = { id: ev.id, title: ev.title, url: ev.url, source: ev.source, kind: ev.kind, at: ev.at };
-    if (ev.taskId && taskInfo.has(ev.taskId)) taskEntry(b, ev.taskId).ev.push(item);
-    else b.other.push(item);
+    if (ev.taskId && taskInfo.has(ev.taskId)) {
+      const arr = b.tasks.get(ev.taskId) ?? [];
+      arr.push(item);
+      b.tasks.set(ev.taskId, arr);
+    } else {
+      b.other.push(item);
+    }
   }
 
   const days: TimelineDay[] = [];
@@ -191,23 +171,13 @@ export function groupTimeline(
     for (const [memberId, b] of people.entries()) {
       const m = members.get(memberId)!;
       const tasks: TaskGroup[] = [...b.tasks.entries()]
-        .map(([taskId, t]) => {
+        .map(([taskId, ev]) => {
           const info = taskInfo.get(taskId)!;
-          return {
-            taskId,
-            title: info.title,
-            status: info.status,
-            source: info.source,
-            newlyAssigned: t.newlyAssigned,
-            sources: toSourceGroups(t.ev, perSourceCap),
-            evidenceCount: t.ev.length,
-          };
+          return { taskId, title: info.title, status: info.status, source: info.source, sources: toSourceGroups(ev, perSourceCap), evidenceCount: ev.length };
         })
-        // most-evidenced tasks first; a newly-assigned-with-no-evidence sinks below worked ones.
         .sort((x, y) => y.evidenceCount - x.evidenceCount || (x.title < y.title ? -1 : 1));
       const other = toSourceGroups(b.other, perSourceCap);
-      const total =
-        tasks.reduce((n, t) => n + t.evidenceCount, 0) + tasks.length + other.reduce((n, g) => n + g.count, 0);
+      const total = tasks.reduce((n, t) => n + t.evidenceCount, 0) + other.reduce((n, g) => n + g.count, 0);
       personDays.push({ memberId, name: m.name, handle: m.handle, avatarUrl: m.avatarUrl, total, tasks, other });
     }
     personDays.sort((a, b) => b.total - a.total || (a.name < b.name ? -1 : 1));

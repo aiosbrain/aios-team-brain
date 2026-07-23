@@ -49,7 +49,7 @@ describe("work-timeline cache layer (real Postgres)", () => {
     // It persisted the versioned payload { v, days } to the 'team' row, matching what was returned.
     const row = await readRow(seed.teamId, "team");
     expect(row?.group_key).toBe("team");
-    expect((row?.payload as { v: number; days: unknown[] }).v).toBe(2);
+    expect((row?.payload as { v: number; days: unknown[] }).v).toBe(3);
     expect((row?.payload as { days: unknown[] }).days.length).toBe(days.length);
 
     // readTimelineCache round-trips it.
