@@ -22,7 +22,7 @@ type EmptyReason = "no_facts" | "model_failing" | "synthesis_empty" | null;
 const schema = z.object({ team: z.string().min(1).max(120) });
 
 /**
- * Layer 3 — narrative arcs (synthesized from the last 7d of the Graphiti graph, cached 10 min).
+ * Layer 3 — narrative arcs (synthesized from the last 7d of the Graphiti graph, cached 4h).
  * Session-authed; tier decides the visible group_ids (`visibleGroupIds`, sole enforcement). The LLM
  * key comes from the team's AI model settings (same as the Q&A path). Best-effort empty when the
  * graph/LLM is unavailable.

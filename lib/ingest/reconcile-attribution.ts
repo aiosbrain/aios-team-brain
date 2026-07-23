@@ -8,7 +8,7 @@ import { bustTeamTimeline } from "@/lib/dashboard/timeline-cache";
 /**
  * Make a re-association PERCOLATE: after an identity mapping changes (or an NL correction is applied),
  * re-point every affected item's `member_id` and refresh the arcs so the change sticks everywhere
- * immediately — not on the manual "Re-attribute content" button + the 10-min arc TTL. Lives in
+ * immediately — not on the manual "Re-attribute content" button + the 4h arc TTL. Lives in
  * `lib/ingest` because `reattributeItems` writes `items` (single-writer guard). Best-effort: never
  * throws (callers run it in `after()`). See docs/design/attribution-propagation.md.
  */
