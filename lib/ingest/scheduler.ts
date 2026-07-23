@@ -228,7 +228,7 @@ export function startIngestScheduler(): void {
             trigger: "scheduler",
             ok: true,
             created: s.created ?? 0,
-            meta: { scanned: s.scanned ?? 0 },
+            meta: { scanned: s.scanned ?? 0, merged: s.merged ?? 0 },
             startedAt,
           });
         } catch (err) {

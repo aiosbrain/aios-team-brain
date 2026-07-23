@@ -68,7 +68,7 @@ describe("meeting-notes backfill (data-mechanics)", () => {
     const seed = await seedTeam();
     await seedTranscript(seed, "slack", { path: "slack/x.md", body: "# thread\n\nchat" });
     const s = await backfillMeetingNotesFromItems(db(), seed.teamId, { extract: stubExtract });
-    expect(s).toEqual({ scanned: 0, created: 0, skipped: 0 });
+    expect(s).toEqual({ scanned: 0, created: 0, skipped: 0, merged: 0 });
   });
 
   // Spec: a pushed meeting arrives with its action items ALREADY materialized as tasks, not empty
