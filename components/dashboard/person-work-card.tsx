@@ -5,7 +5,7 @@ import { SourceIcon, sourceLabel } from "@/components/icons/source-icon";
 import type { PersonDay, SourceGroup, TaskGroup } from "@/lib/dashboard/timeline-group";
 
 /**
- * One person's work card — the shared presentational unit behind BOTH the Learning → Timeline panel
+ * One person's work card — the shared presentational unit behind BOTH the Pulse Timeline panel
  * (day → person → work) and the Home → "Working on" section (each person's most recent day). Keeping a
  * single component is what makes the two surfaces identical. Pure/client-safe: renders a `PersonDay`,
  * no data fetching. Evidence (commits, docs, …) nests under the task it contributes to, with an "Other"

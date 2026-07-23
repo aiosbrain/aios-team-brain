@@ -368,13 +368,18 @@ Intelligence baked into arcs:
 
 ## 7. Part VI — The views, mapped to the data model
 
-### Home / dashboard — `app/t/[team]/page.tsx`
-Gated into `admin-bootstrap` / `member-setup` / full dashboard by `pickHomeState`. Full view:
+### Pulse (home) — `app/t/[team]/page.tsx`
+The flagship narrative surface (renamed from "Home", absorbed the old "Learning" tab). Gated into
+`admin-bootstrap` / `member-setup` / full view by `pickHomeState`. Full view, top → bottom:
 - **Pipeline-health banner** (admins) → `getPipelineHealth` → `ingest_runs` + graph extraction + enabled `integrations`.
-- **Ask box** → embeds `QueryChat` (see below).
-- **KPI band / Knowledge growth / Usage / Task funnel** → `getPulseMetrics` over `items.synced_at`, `query_log` (scoped), `tasks.status`.
-- **Working On** → `/api/dashboard/team-work` → `getTeamWork` = roster + open `tasks` + `getArcs` summaries + accomplished items.
-- **Decisions card** → tier-scoped `decisions`.
+- **Ask bar** (`components/dashboard/ask-bar`) → a slim line that routes to the Query chat (`/query?q=…`), not an embedded hero.
+- **Narrative arcs (HERO)** → `ArcsPanel` → `POST /api/brain/arcs` → `getArcs` (`arc_cache`).
+- **Working on** → `components/dashboard/working-on` → `/api/dashboard/team-work` → `getCachedWorkTimeline` + `mostRecentPerPerson`
+  (each person's most recent day of the SAME work-timeline the Timeline renders, via the shared `PersonWorkCard`; the old
+  assignee-based `getTeamWork`/`assembleTeamWork` was repointed in #358).
+- **Timeline** (collapsed disclosure) → `TimelinePanel` → `getCachedWorkTimeline` (full day → person → task → evidence).
+- **Metrics** (collapsed; open for admins) → `getPulseMetrics` (KPI band / knowledge growth / usage / task funnel) + tier-scoped `decisions`.
+- **Evidence trail** (collapsed) → Events/Facts feeds (`/api/brain/events`, `/api/brain/facts`).
 
 ### Query / Ask — `app/t/[team]/query/page.tsx` → `components/query-chat.tsx`, `app/api/dashboard/query/route.ts`
 Streaming SSE chat. `retrieve()` fuses keyword + dense + graph + structured extras → `streamAnswer`
@@ -383,14 +388,13 @@ citation chips linking to `/library/[itemId]`), `done`/`error`. Grounding is a s
 signal, not a visible badge. Left rail = saved `conversations` (owner-scoped FTS). `/sync` short-circuits
 to a manual sync.
 
-### Learning — `app/t/[team]/learning/page.tsx`
-- **Narrative arcs (Layer 3)** → `POST /api/brain/arcs` → `getArcs` → recent Graphiti facts synthesized
-  + cached in `arc_cache`. Shows title, confidence, participants, evidence drill-down (each fact →
-  `/library/<itemId>`). Empty state diagnosed as `no_facts` / `model_failing` / `synthesis_empty`.
-  Inline edit → `/api/brain/arcs/recompute`.
-- **Timeline (work-time)** → `getWorkTimeline` over Postgres `items` + `tasks` (not the graph), grouped
-  day → person → source with brand icons.
-- **Events (Layer 2)** / **Atomic facts (Layer 1)** → `/api/brain/events`, `/api/brain/facts`.
+### Learning — absorbed into Pulse
+`app/t/[team]/learning/page.tsx` now `redirect()`s to the team Pulse home (above). Its content moved
+there: **narrative arcs** (Layer 3, the hero — `POST /api/brain/arcs` → `getArcs`, cached in `arc_cache`,
+inline-editable → `/api/brain/arcs/recompute`, empty state diagnosed `no_facts`/`model_failing`/
+`synthesis_empty`), the **Timeline** (work-time, `getWorkTimeline` over Postgres `items` + `tasks`, day →
+person → task → evidence), and **Events (Layer 2)** / **Atomic facts (Layer 1)** (`/api/brain/events`,
+`/api/brain/facts`) in the Evidence-trail disclosure.
 
 ### Library / Data — `app/t/[team]/library/[itemId]/page.tsx`, `app/t/[team]/admin/data/page.tsx`
 Item detail renders one `items` row (body, kind, access, SHA-256, version count, joined project/member),
@@ -422,7 +426,7 @@ box (preview → apply → lock).
 ### How the views interrelate
 `items`/`item_chunks` are the root — browsed in Library, searched by Query, charted on Home, rolled into
 the Timeline, attributed in Attribution health, and the target of every `[S#]` / arc-evidence link. The
-graph (`graph_episodes` + Graphiti/`arc_cache`) powers Learning arcs + the Working On card; its health
+graph (`graph_episodes` + Graphiti/`arc_cache`) powers the Pulse arcs hero; its health
 shows in the Retrieval card. `ingest_runs` feeds both the Pipeline banner and the Retrieval card.
 `tasks` appear in the funnel, Working On, and are the Meetings extraction target. `members`/
 `items.member_id` are the attribution backbone tying arcs, timeline, and profiles together.
