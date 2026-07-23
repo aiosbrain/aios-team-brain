@@ -27,7 +27,7 @@ describe("arc_cache persistence (data-mechanics)", () => {
     const seed = await seedTeam();
     const arcs = [arc("arc-1", "Context-Management Enhancements")];
     const before = Date.now();
-    await writeArcCache(db(), seed.teamId, KEY, arcs);
+    await writeArcCache(db(), seed.teamId, KEY, arcs, null);
 
     const got = await readArcCache(db(), seed.teamId, KEY);
     expect(got).not.toBeNull();
@@ -37,10 +37,18 @@ describe("arc_cache persistence (data-mechanics)", () => {
     expect(got!.computedAt).toBeLessThanOrEqual(Date.now() + 1000);
   });
 
+  it("round-trips facts_hash (the stability key) — null and a real hash", async () => {
+    const seed = await seedTeam();
+    await writeArcCache(db(), seed.teamId, KEY, [arc("a", "A")], null);
+    expect((await readArcCache(db(), seed.teamId, KEY))!.factsHash).toBeNull();
+    await writeArcCache(db(), seed.teamId, KEY, [arc("a", "A")], "deadbeef");
+    expect((await readArcCache(db(), seed.teamId, KEY))!.factsHash).toBe("deadbeef");
+  });
+
   it("upserts in place — a second write replaces, not duplicates", async () => {
     const seed = await seedTeam();
-    await writeArcCache(db(), seed.teamId, KEY, [arc("arc-1", "First")]);
-    await writeArcCache(db(), seed.teamId, KEY, [arc("arc-2", "Second"), arc("arc-3", "Third")]);
+    await writeArcCache(db(), seed.teamId, KEY, [arc("arc-1", "First")], null);
+    await writeArcCache(db(), seed.teamId, KEY, [arc("arc-2", "Second"), arc("arc-3", "Third")], null);
 
     const got = await readArcCache(db(), seed.teamId, KEY);
     expect(got!.arcs.map((a) => a.title)).toEqual(["Second", "Third"]);
@@ -56,7 +64,7 @@ describe("arc_cache persistence (data-mechanics)", () => {
   it("is team-scoped — another team's key never resolves", async () => {
     const a = await seedTeam();
     const b = await seedTeam();
-    await writeArcCache(db(), a.teamId, KEY, [arc("arc-1", "Team A")]);
+    await writeArcCache(db(), a.teamId, KEY, [arc("arc-1", "Team A")], null);
 
     expect(await readArcCache(db(), b.teamId, KEY)).toBeNull();
   });
@@ -68,8 +76,8 @@ describe("arc_cache persistence (data-mechanics)", () => {
 
   it("distinct group_keys under one team are independent rows", async () => {
     const seed = await seedTeam();
-    await writeArcCache(db(), seed.teamId, "acme_team", [arc("arc-t", "Team view")]);
-    await writeArcCache(db(), seed.teamId, "acme_external", [arc("arc-e", "External view")]);
+    await writeArcCache(db(), seed.teamId, "acme_team", [arc("arc-t", "Team view")], null);
+    await writeArcCache(db(), seed.teamId, "acme_external", [arc("arc-e", "External view")], null);
 
     expect((await readArcCache(db(), seed.teamId, "acme_team"))!.arcs[0].title).toBe("Team view");
     expect((await readArcCache(db(), seed.teamId, "acme_external"))!.arcs[0].title).toBe("External view");

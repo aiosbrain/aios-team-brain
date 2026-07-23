@@ -458,6 +458,25 @@ function attributeArcs(arcs: NarrativeArc[], contributorsByItem: Map<string, str
  * latency cost, traded for a synthesis input grounded in a human from the start rather than patched
  * after the fact.
  */
+/** The synthesis result: the arcs + a hash of the exact LLM input, so the caller can persist the hash
+ *  and the next background refresh can skip an unchanged re-synthesis. */
+export interface SynthesisResult {
+  arcs: NarrativeArc[];
+  factsHash: string | null;
+}
+
+/** Pure: may the background refresh REUSE the prior arcs instead of re-running the (non-deterministic)
+ *  LLM? Only when the exact LLM input is byte-identical (`factsHash` match), there's no human correction
+ *  to apply, and the prior actually had arcs. This is the stability guard — arcs then change only when the
+ *  underlying work does, not on every 10-min recompute. A null/empty prior hash never reuses. */
+export function canReuseArcs(
+  prior: { factsHash: string | null; arcCount: number } | null,
+  factsHash: string,
+  hasCorrections: boolean
+): boolean {
+  return !hasCorrections && !!prior && !!prior.factsHash && prior.factsHash === factsHash && prior.arcCount > 0;
+}
+
 async function synthesizeArcs(
   db: DbClient,
   teamId: string,
@@ -466,8 +485,11 @@ async function synthesizeArcs(
   keys: ProviderKeys,
   // Route-bound cold-miss callers keep the default (under the 120s route budget); the non-route-bound
   // background refresh passes BG_ARC_TIMEOUT_MS so a slow reasoning model doesn't false-alarm as a timeout.
-  llmTimeoutMs: number = INLINE_ARC_TIMEOUT_MS
-): Promise<NarrativeArc[]> {
+  llmTimeoutMs: number = INLINE_ARC_TIMEOUT_MS,
+  // The prior cached arcs + their fact hash (background refresh only). When the freshly-built prompt hashes
+  // identically AND there's no correction, we KEEP the prior arcs and skip the LLM (the stability guard).
+  prior?: { arcs: NarrativeArc[]; factsHash: string | null } | null
+): Promise<SynthesisResult> {
   // Arcs are NOT time-boxed — synthesize from the most-recent facts regardless of age (a quiet week,
   // or a stalled projector, must not blank the panel). `null` = no window. Fetch a DEEP pool (not just
   // MAX_FACTS), so we can balance it across contributors — otherwise the globally-newest MAX_FACTS are
@@ -477,7 +499,7 @@ async function synthesizeArcs(
   const pool = dedupeFacts(await recentFacts(groups, null, FACT_POOL));
   // No facts and nothing to correct → nothing to synthesize. (A correction with no facts still runs
   // the LLM, preserving the pre-cache recompute behavior.)
-  if (pool.length === 0 && correctionTexts.length === 0) return [];
+  if (pool.length === 0 && correctionTexts.length === 0) return { arcs: [], factsHash: null };
   // Resolve attribution for the WHOLE pool (higher uuid cap to match) so balancing sees each fact's
   // human. epToItem/creditByItem stay supersets of the balanced set — safe for evidence + attribution.
   const epToItem = await resolveEpisodeItems(groups, pool.flatMap((f) => f.episodeUuids), FACT_POOL * 3);
@@ -540,28 +562,49 @@ async function synthesizeArcs(
   // If every recent fact traces ONLY to non-active Linear work, there's nothing to synthesize — return
   // [] so it flows into the empty-clobber guard (keep a recent prior, else honest blank), rather than
   // firing a zero-fact LLM call whose fabricated (evidence-less) arcs would clobber the real prior set.
-  if (eligiblePool.length === 0 && correctionTexts.length === 0) return [];
+  if (eligiblePool.length === 0 && correctionTexts.length === 0) return { arcs: [], factsHash: null };
   // Two-level balance (contributor → item, per-item capped) → a representative MAX_FACTS so every active
   // contributor is in the prompt AND no single giant document dominates its author's share.
   const facts = balanceFacts(eligiblePool, humanOfFact, itemOfFact, MAX_FACTS, PER_ITEM_CAP);
   // Request arcs proportional to how many distinct contributors actually made the balanced cut, so a
   // varied team gets more than a flat ceiling and each person's distinct threads have room to surface.
   const contributorCount = new Set(facts.map(humanOfFact).filter(Boolean)).size;
-  const raw = await callLLMRaw(
-    buildSystemPrompt(arcsRequested(contributorCount)),
-    buildPrompt(attributedFactTexts(facts, epToItem, primaryByItem), correctionTexts),
-    keys,
-    { db, teamId },
-    llmTimeoutMs
-  );
+  const systemPrompt = buildSystemPrompt(arcsRequested(contributorCount));
+  const userPrompt = buildPrompt(attributedFactTexts(facts, epToItem, primaryByItem), correctionTexts);
+
+  // The stability key must cover EVERYTHING that determines the arcs' displayed content:
+  //  • systemPrompt — so a deploy that edits the prompt / arc count re-synthesizes (not just fact churn);
+  //  • userPrompt   — the attributed fact texts (a re-attribution rewrites the "(Name)" prefixes → new hash);
+  //  • contribDigest — the per-item CONTRIBUTOR SET (arc `participants` come from this, NOT the prompt), so a
+  //    contributor-set-only correction (e.g. locking to the SAME primary to drop a spurious credit) still
+  //    changes the hash and re-synthesizes instead of pinning the wrong chip. All three are deterministic
+  //    for an unchanged graph (fact order is uuid-tiebroken; contributor sets are version work order).
+  const balancedItems = [...new Set(facts.map(itemOfFact).filter(Boolean))].sort();
+  const contribDigest = balancedItems.map((id) => `${id}:${(contributorsByItem.get(id) ?? []).join(",")}`).join("\n");
+  const factsHash = createHash("sha256")
+    .update(systemPrompt)
+    .update("\n--facts--\n")
+    .update(userPrompt)
+    .update("\n--contributors--\n")
+    .update(contribDigest)
+    .digest("hex");
+
+  // STABILITY GUARD: identical input (+ no correction, + a real prior) → keep the prior arcs and SKIP the
+  // LLM. This is what stops the day-to-day churn (same facts producing different arcs every recompute from
+  // LLM non-determinism). The background refresh still runs (fetch/balance/hash), just not the model.
+  if (canReuseArcs(prior ? { factsHash: prior.factsHash, arcCount: prior.arcs.length } : null, factsHash, correctionTexts.length > 0)) {
+    return { arcs: prior!.arcs, factsHash };
+  }
+
+  const raw = await callLLMRaw(systemPrompt, userPrompt, keys, { db, teamId }, llmTimeoutMs);
   // Rank by recency → relevance so recent contributors' arcs lead, then attribute AI-agent names to
   // the humans behind each arc's own evidence.
-  return rankArcs(attributeArcs(parseArcsJson(raw, { facts, epToItem }), contributorsByItem));
+  return { arcs: rankArcs(attributeArcs(parseArcsJson(raw, { facts, epToItem }), contributorsByItem)), factsHash };
 }
 
 // In-memory cache (per process). Keyed by the tier-visible group set. Fronts the Postgres `arc_cache`
 // (lib/graph/arc-cache) — the persistent, cross-instance layer that survives restarts.
-const cache = new Map<string, { arcs: NarrativeArc[]; at: number }>();
+const cache = new Map<string, { arcs: NarrativeArc[]; at: number; factsHash: string | null }>();
 // Group keys currently being recomputed in the background, so concurrent stale reads fire ONE
 // recompute (and thus one LLM call), not N.
 const refreshing = new Set<string>();
@@ -598,7 +641,8 @@ export async function commitArcs(
   db: DbClient,
   teamId: string,
   key: string,
-  next: NarrativeArc[]
+  next: NarrativeArc[],
+  factsHash: string | null
 ): Promise<NarrativeArc[]> {
   if (next.length === 0) {
     const mem = cache.get(key);
@@ -625,23 +669,30 @@ export async function commitArcs(
       );
     }
   }
-  cache.set(key, { arcs: next, at: Date.now() });
-  await writeArcCache(db, teamId, key, next);
+  cache.set(key, { arcs: next, at: Date.now(), factsHash });
+  await writeArcCache(db, teamId, key, next, factsHash);
   return next;
 }
 
 /** Fire-and-forget background recompute for a stale cache key (serve-stale-while-revalidate). Uses
  *  its own adminClient so it doesn't depend on the request's client lifecycle. Deduped via
  *  `refreshing`; errors are logged, never thrown (nothing awaits this). */
-function refreshArcsInBackground(teamId: string, key: string, groups: string[], keys: ProviderKeys): void {
+function refreshArcsInBackground(
+  teamId: string,
+  key: string,
+  groups: string[],
+  keys: ProviderKeys,
+  prior: { arcs: NarrativeArc[]; factsHash: string | null } | null
+): void {
   if (refreshing.has(key)) return;
   refreshing.add(key);
   void (async () => {
     const bg = adminClient();
     try {
-      // Not route-bound → give the reasoning model the full window (BG_ARC_TIMEOUT_MS).
-      const arcs = await synthesizeArcs(bg, teamId, groups, [], keys, BG_ARC_TIMEOUT_MS);
-      await commitArcs(bg, teamId, key, arcs);
+      // Not route-bound → give the reasoning model the full window (BG_ARC_TIMEOUT_MS). `prior` lets the
+      // fact-set-hash guard skip the LLM when nothing changed since the last compute (stability).
+      const { arcs, factsHash } = await synthesizeArcs(bg, teamId, groups, [], keys, BG_ARC_TIMEOUT_MS, prior);
+      await commitArcs(bg, teamId, key, arcs, factsHash);
     } catch (err) {
       console.error("[arcs] background refresh failed:", err instanceof Error ? err.message : err);
     } finally {
@@ -677,16 +728,17 @@ export async function getArcs(
   // 2. Persistent cache (survives restart, shared across instances).
   const persisted = await readArcCache(db, teamId, key);
   if (persisted) {
-    cache.set(key, { arcs: persisted.arcs, at: persisted.computedAt });
+    cache.set(key, { arcs: persisted.arcs, at: persisted.computedAt, factsHash: persisted.factsHash });
     if (now - persisted.computedAt < CACHE_TTL_MS) return persisted.arcs;
-    // Stale — hand back the stale arcs immediately and refresh behind the request.
-    refreshArcsInBackground(teamId, key, groups, keys);
+    // Stale — hand back the stale arcs immediately and refresh behind the request, passing the prior so
+    // the refresh can skip the LLM if the facts are unchanged.
+    refreshArcsInBackground(teamId, key, groups, keys, { arcs: persisted.arcs, factsHash: persisted.factsHash });
     return persisted.arcs;
   }
 
   // 3. Cold miss — first-ever load for this key. Compute inline so the user gets a real answer.
-  const arcs = await synthesizeArcs(db, teamId, groups, [], keys);
-  return commitArcs(db, teamId, key, arcs);
+  const { arcs, factsHash } = await synthesizeArcs(db, teamId, groups, [], keys);
+  return commitArcs(db, teamId, key, arcs, factsHash);
 }
 
 /**
@@ -705,8 +757,8 @@ export async function recomputeArcs(
 ): Promise<NarrativeArc[]> {
   if (groups.length === 0) return [];
   const key = groups.slice().sort().join(",");
-  const synthesized = await synthesizeArcs(db, teamId, groups, corrections.map((c) => c.corrected_text), keys);
-  const arcs = await commitArcs(db, teamId, key, synthesized);
+  const { arcs: synthesized, factsHash } = await synthesizeArcs(db, teamId, groups, corrections.map((c) => c.corrected_text), keys);
+  const arcs = await commitArcs(db, teamId, key, synthesized, factsHash);
 
   // Persist corrections as first-class episodes (team-tier group; corrections are internal).
   const client = new GraphitiClient();

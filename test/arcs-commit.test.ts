@@ -46,7 +46,7 @@ describe("commitArcs — an empty synthesis must never clobber a good cache", ()
     const { db, upserts } = fakeDb([arc("payments migration")]);
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     // Unique key so the module-level in-memory cache from other tests can't leak in.
-    const out = await commitArcs(db, "team-1", "keep-good-1", []);
+    const out = await commitArcs(db, "team-1", "keep-good-1", [], null);
     expect(out.map((a) => a.title)).toEqual(["payments migration"]); // prior kept
     expect(upserts).toHaveLength(0); // NOT overwritten
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("keeping 1 cached"));
@@ -55,14 +55,14 @@ describe("commitArcs — an empty synthesis must never clobber a good cache", ()
 
   it("writes through when synthesis returns real arcs", async () => {
     const { db, upserts } = fakeDb(null);
-    const out = await commitArcs(db, "team-1", "write-good-1", [arc("a"), arc("b")]);
+    const out = await commitArcs(db, "team-1", "write-good-1", [arc("a"), arc("b")], "h1");
     expect(out).toHaveLength(2);
     expect(upserts).toHaveLength(1); // persisted
   });
 
   it("writes empty on a genuine cold miss (no prior to protect)", async () => {
     const { db, upserts } = fakeDb(null);
-    const out = await commitArcs(db, "team-1", "cold-empty-1", []);
+    const out = await commitArcs(db, "team-1", "cold-empty-1", [], null);
     expect(out).toEqual([]);
     expect(upserts).toHaveLength(1); // first-ever load may legitimately be empty
   });
@@ -72,7 +72,7 @@ describe("commitArcs — an empty synthesis must never clobber a good cache", ()
     // deleted content / graph reset should be allowed to blank the panel instead of pinning stale arcs.
     const { db, upserts } = fakeDb([arc("ancient migration")], Date.now() - 50 * HOUR);
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const out = await commitArcs(db, "team-1", "old-prior-1", []);
+    const out = await commitArcs(db, "team-1", "old-prior-1", [], null);
     expect(out).toEqual([]); // empty accepted
     expect(upserts).toHaveLength(1); // written through, not kept
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("accepting empty"));
