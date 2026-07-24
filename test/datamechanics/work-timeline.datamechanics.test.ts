@@ -162,6 +162,21 @@ describe("work timeline (real Postgres)", () => {
     expect(extTitles).not.toContain("Secret team-only commit");
     expect(extTitles).toContain("Public external commit");
   });
+
+  // Spec: `windowDays` widens the lookback ("Show earlier days"). A commit dated 10 days ago is OUT of the
+  // default 7-day window but appears once the window expands to cover it — proving the param drives both
+  // the fetch bound and the in-window filter (not just a display slice).
+  it("windowDays expands the lookback: a 10-day-old commit is excluded at 7 days, included at 14", async () => {
+    const seed = await seedTeam();
+    const tenDaysAgo = new Date(Date.now() - 10 * 86_400_000).toISOString();
+    await ingest(seed, {
+      kind: "artifact", path: `commits/repo/${randomUUID()}.md`, access: "team",
+      body: "Ten-day-old commit", frontmatter: { source: "git", committed_at: tenDaysAgo },
+    });
+
+    expect(evidenceTitles(await getWorkTimeline(db(), seed.teamId, "team"))).not.toContain("Ten-day-old commit");
+    expect(evidenceTitles(await getWorkTimeline(db(), seed.teamId, "team", 14))).toContain("Ten-day-old commit");
+  });
 });
 
 describe("work timeline — attributed docs (Notion / Google Docs / deliverables) by edit time (real Postgres)", () => {

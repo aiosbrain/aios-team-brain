@@ -54,7 +54,11 @@ const ACTIVE_TASK_STATUSES = new Set(["in_progress", "blocked"]);
  *    contributor sees the thread in their day, dated by their last message. Unmapped participants drop.
  */
 
-const WINDOW_DAYS = 7;
+/** Default lookback for the timeline ledger — what every cached surface (panel, CLI) shows. */
+export const WINDOW_DAYS = 7;
+/** Hard cap on an on-demand "show earlier days" expansion. Bounds the fetch cost (ITEM_LIMIT is the
+ *  real ceiling at scale) and keeps an uncached expand build cheap enough to run on a request. */
+export const MAX_WINDOW_DAYS = 30;
 const ITEM_LIMIT = 2000;
 const TASK_LIMIT = 2000;
 
@@ -93,9 +97,13 @@ const httpUrl = (v: unknown): string | undefined => {
 export async function getWorkTimeline(
   db: DbClient,
   teamId: string,
-  tier: ViewerTier
+  tier: ViewerTier,
+  windowDays: number = WINDOW_DAYS
 ): Promise<TimelineDay[]> {
-  const windowStartMs = Date.now() - WINDOW_DAYS * 86_400_000;
+  // Clamp to [1, MAX] — the window drives both the DB fetch bound (`sinceIso`) and the in-window filter,
+  // so an unbounded caller value can't widen the query past the cost cap.
+  const days = Math.max(1, Math.min(Math.floor(windowDays) || WINDOW_DAYS, MAX_WINDOW_DAYS));
+  const windowStartMs = Date.now() - days * 86_400_000;
   const sinceIso = new Date(windowStartMs).toISOString();
   // Upper bound (+1d clock/timezone skew): a hand-authored doc can carry a FUTURE `date`/`updated`
   // (a plan dated next month). Without this it'd create a future day bucket that sorts first and pins as
