@@ -79,7 +79,9 @@ export async function generateTitle(
           inputTokens: j.usage?.prompt_tokens ?? 0,
           outputTokens: j.usage?.completion_tokens ?? 0,
           costUsd: typeof j.usage?.cost === "number" ? j.usage.cost : 0,
-          estimated: false,
+          // OpenRouter cost is metered; a paid OpenAI-cloud backend gives no cost → flag not-authoritative
+          // (a bare local endpoint is genuinely free, so it stays metered $0).
+          estimated: typeof j.usage?.cost !== "number" && backend.provider !== "local",
         });
       }
       return cleanTitle(j.choices?.[0]?.message?.content ?? "") || null;

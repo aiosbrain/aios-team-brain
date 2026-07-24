@@ -148,6 +148,23 @@ describe("completeText — meters inference into llm_usage", () => {
     expect(body.usage).toEqual({ include: true });
   });
 
+  it("flags a paid OpenAI-cloud call that returns no cost as estimated (not an authoritative $0)", async () => {
+    // OpenAI's /chat/completions returns usage tokens but no dollar charge; we have no price table, so
+    // the row must NOT read as a metered $0 (which would silently undercount) — it's flagged estimated.
+    fetchMock.mockResolvedValue(
+      jsonResponse({ choices: [{ message: { content: "ok" } }], usage: { prompt_tokens: 40, completion_tokens: 8 } })
+    );
+    const { db, rows } = captureDb();
+    await completeText(
+      { system: "s", prompt: "p" },
+      {
+        keys: { activeProvider: "openai", openaiKey: "sk-test", openaiModel: "gpt-4o" },
+        meter: { db, teamId: "t", source: "arcs" },
+      }
+    );
+    expect(rows[0]).toMatchObject({ provider: "openai", cost_usd: 0, estimated: true });
+  });
+
   it("does not meter when opts.meter is absent (opt-in)", async () => {
     fetchMock.mockResolvedValue(
       jsonResponse({ choices: [{ message: { content: "ok" } }], usage: { cost: 0.1 } })

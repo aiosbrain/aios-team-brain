@@ -166,9 +166,17 @@ export async function completeText(args: CompleteArgs, opts: CompleteOptions = {
       };
       inTok = j.usage?.prompt_tokens ?? 0;
       outTok = j.usage?.completion_tokens ?? 0;
-      // OpenRouter reports the real charge in `usage.cost` (metered — not an estimate). A bare local /
-      // OpenAI-compatible endpoint reports no cost, so it stays $0 (correct: self-run is free).
-      if (typeof j.usage?.cost === "number") costUsd = j.usage.cost;
+      if (typeof j.usage?.cost === "number") {
+        // OpenRouter reports the real charge here — metered, authoritative.
+        costUsd = j.usage.cost;
+        estimated = false;
+      } else {
+        // No provider-reported charge. A bare LOCAL endpoint is genuinely free ($0, authoritative).
+        // An OpenAI-cloud backend IS paid but we have no price table for it — record $0 but flag it as
+        // NOT a real charge so it doesn't read as an authoritative $0 and silently undercount spend.
+        costUsd = 0;
+        estimated = backend.provider !== "local";
+      }
       const choice = j.choices?.[0];
       text = (choice?.message?.content ?? "").trim();
       if (!text) {

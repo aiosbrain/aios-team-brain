@@ -463,9 +463,10 @@ export async function* streamOpenAICompatible(
       cost_usd: Math.round(cost * 100000) / 100000,
       provider: backend.provider,
       model: backend.model,
-      // OpenRouter reports the real charge (metered); a bare local endpoint reports none (cost 0). Not
-      // an estimate either way — so leave estimated=false.
-      estimated: false,
+      // OpenRouter reports the real charge (metered); a bare local endpoint is genuinely free ($0).
+      // A paid OpenAI-cloud backend returns no cost here and we have no price table → flag it as NOT
+      // authoritative so a $0 doesn't silently undercount spend.
+      estimated: cost === 0 && backend.provider === "openai",
     },
   };
 }

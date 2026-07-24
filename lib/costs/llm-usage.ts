@@ -9,8 +9,13 @@ import type { DbClient } from "@/lib/db/types";
  * spend pushed from workstations).
  *
  * SINGLE WRITER: this file is the only legal writer of `llm_usage` — guarded by
- * `test/guards/llm-usage-single-writer.test.ts`. Everything that spends brain inference records here.
+ * `test/guards/single-writer-llm-usage.test.ts`. Everything that spends brain inference records here.
  */
+
+/** Coerce a possibly-NaN/Infinity number to a finite, non-negative value (never lose a row to bad math). */
+function safeNum(n: number): number {
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
 
 /** Feature that spent the tokens — the `source` slice on the costs breakdown. */
 export type LlmUsageSource =
@@ -62,10 +67,10 @@ export async function recordLlmUsage(db: DbClient, rec: LlmUsageRecord): Promise
       source: rec.source,
       provider: rec.provider,
       model: rec.model,
-      input_tokens: Math.max(0, Math.round(rec.inputTokens)),
-      output_tokens: Math.max(0, Math.round(rec.outputTokens)),
-      // Match the numeric(12,5) column scale; never persist a negative.
-      cost_usd: Math.max(0, Math.round(rec.costUsd * 100000) / 100000),
+      input_tokens: Math.round(safeNum(rec.inputTokens)),
+      output_tokens: Math.round(safeNum(rec.outputTokens)),
+      // Match the numeric(12,5) column scale; never persist a negative or NaN.
+      cost_usd: Math.round(safeNum(rec.costUsd) * 100000) / 100000,
       estimated: rec.estimated,
     });
     if (error) console.error("[llm_usage] insert failed:", error.message);
