@@ -1,0 +1,274 @@
+{
+  "$schema": "aios-item-payload-fixtures/v1",
+  "version": "1.12",
+  "valid": [
+    {
+      "name": "legacy task row remains compatible",
+      "payload": {
+        "project": "synthetic-project",
+        "path": "3-log/tasks-team.md",
+        "kind": "task",
+        "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "actor": "alex",
+        "access": "team",
+        "frontmatter": {
+          "access": "team"
+        },
+        "body": "# Tasks",
+        "rows": [
+          {
+            "row_key": "TT1",
+            "title": "Publish the synthetic release note",
+            "assignee": "Alex",
+            "status": "Todo",
+            "sprint": "S1",
+            "due": null,
+            "parent": null,
+            "labels": [
+              "docs"
+            ],
+            "priority": "high",
+            "pm_provider": "linear",
+            "pm_external_id": "SYN-1",
+            "pm_url": "https://example.invalid/SYN-1"
+          }
+        ]
+      }
+    },
+    {
+      "name": "legacy decision row remains compatible",
+      "payload": {
+        "project": "synthetic-project",
+        "path": "3-log/decision-log.md",
+        "kind": "decision",
+        "content_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "access": "team",
+        "body": "# Decisions",
+        "rows": [
+          {
+            "row_key": "1",
+            "title": "Use the synthetic launch window",
+            "decided_at": "2026-07-24",
+            "rationale": "The fixture is deterministic.",
+            "decided_by": "Alex",
+            "impact": "No production data.",
+            "tier": 2,
+            "audience": "team"
+          }
+        ]
+      }
+    },
+    {
+      "name": "approved fact row",
+      "payload": {
+        "project": "synthetic-project",
+        "path": "3-log/facts-team.md",
+        "kind": "fact",
+        "content_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "access": "team",
+        "body": "# Approved facts",
+        "rows": [
+          {
+            "row_key": "fact-4f11",
+            "title": "The synthetic beta has 24 participants",
+            "occurred_at": "2026-07-24",
+            "fact_type": "fact",
+            "source_path": "1-inbox/transcripts/synthetic-beta.md",
+            "source_quote": "The synthetic beta has 24 participants."
+          }
+        ]
+      }
+    },
+    {
+      "name": "approved stakeholder mention row",
+      "payload": {
+        "project": "synthetic-project",
+        "path": "4-shared/stakeholder-mentions.md",
+        "kind": "stakeholder_mention",
+        "content_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "access": "external",
+        "body": "# Approved stakeholder mentions",
+        "rows": [
+          {
+            "row_key": "stakeholder-91a2",
+            "name": "Morgan Lee",
+            "role": "Synthetic launch reviewer",
+            "context": "Requested the accessibility checklist.",
+            "source_path": "1-inbox/transcripts/synthetic-launch.md",
+            "source_quote": "Morgan Lee requested the accessibility checklist."
+          }
+        ]
+      }
+    },
+    {
+      "name": "non-row item remains compatible",
+      "payload": {
+        "project": "synthetic-project",
+        "path": "2-work/brief.md",
+        "kind": "deliverable",
+        "content_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "access": "team",
+        "body": "# Synthetic brief"
+      }
+    }
+  ],
+  "invalid": [
+    {
+      "name": "fact row rejects unknown key",
+      "payload": {
+        "project": "synthetic-project",
+        "path": "3-log/facts-team.md",
+        "kind": "fact",
+        "content_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+        "access": "team",
+        "body": "# Facts",
+        "rows": [
+          {
+            "row_key": "fact-bad-1",
+            "title": "Synthetic fact",
+            "fact_type": "fact",
+            "source_path": "1-inbox/transcripts/synthetic.md",
+            "source_quote": "Synthetic fact.",
+            "unexpected": true
+          }
+        ]
+      }
+    },
+    {
+      "name": "fact row rejects blank source quote",
+      "payload": {
+        "project": "synthetic-project",
+        "path": "3-log/facts-team.md",
+        "kind": "fact",
+        "content_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+        "access": "team",
+        "body": "# Facts",
+        "rows": [
+          {
+            "row_key": "fact-bad-2",
+            "title": "Synthetic fact",
+            "fact_type": "fact",
+            "source_path": "1-inbox/transcripts/synthetic.md",
+            "source_quote": ""
+          }
+        ]
+      }
+    },
+    {
+      "name": "fact row rejects invalid fact type",
+      "payload": {
+        "project": "synthetic-project",
+        "path": "3-log/facts-team.md",
+        "kind": "fact",
+        "content_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+        "access": "team",
+        "body": "# Facts",
+        "rows": [
+          {
+            "row_key": "fact-bad-3",
+            "title": "Synthetic fact",
+            "fact_type": "opinion",
+            "source_path": "1-inbox/transcripts/synthetic.md",
+            "source_quote": "Synthetic fact."
+          }
+        ]
+      }
+    },
+    {
+      "name": "stakeholder row rejects missing source path",
+      "payload": {
+        "project": "synthetic-project",
+        "path": "4-shared/stakeholder-mentions.md",
+        "kind": "stakeholder_mention",
+        "content_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+        "access": "external",
+        "body": "# Stakeholders",
+        "rows": [
+          {
+            "row_key": "stakeholder-bad-1",
+            "name": "Morgan Lee",
+            "source_quote": "Morgan Lee joined."
+          }
+        ]
+      }
+    },
+    {
+      "name": "fact kind rejects stakeholder row",
+      "payload": {
+        "project": "synthetic-project",
+        "path": "3-log/facts-team.md",
+        "kind": "fact",
+        "content_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+        "access": "team",
+        "body": "# Facts",
+        "rows": [
+          {
+            "row_key": "fact-bad-4",
+            "name": "Morgan Lee",
+            "source_path": "1-inbox/transcripts/synthetic.md",
+            "source_quote": "Morgan Lee joined."
+          }
+        ]
+      }
+    },
+    {
+      "name": "non-row kind rejects rows",
+      "payload": {
+        "project": "synthetic-project",
+        "path": "2-work/brief.md",
+        "kind": "artifact",
+        "content_sha256": "6666666666666666666666666666666666666666666666666666666666666666",
+        "access": "team",
+        "body": "# Brief",
+        "rows": []
+      }
+    },
+    {
+      "name": "payload rejects unknown root key",
+      "payload": {
+        "project": "synthetic-project",
+        "path": "2-work/brief.md",
+        "kind": "artifact",
+        "content_sha256": "7777777777777777777777777777777777777777777777777777777777777777",
+        "access": "team",
+        "body": "# Brief",
+        "raw_transcript": "must never be accepted"
+      }
+    },
+    {
+      "name": "payload rejects unknown kind",
+      "payload": {
+        "project": "synthetic-project",
+        "path": "3-log/unknown.md",
+        "kind": "person",
+        "content_sha256": "8888888888888888888888888888888888888888888888888888888888888888",
+        "access": "team",
+        "body": "# Unknown"
+      }
+    },
+    {
+      "name": "fact kind rejects empty rows",
+      "payload": {
+        "project": "synthetic-project",
+        "path": "3-log/facts-team.md",
+        "kind": "fact",
+        "content_sha256": "9999999999999999999999999999999999999999999999999999999999999999",
+        "access": "team",
+        "body": "# Facts",
+        "rows": []
+      }
+    },
+    {
+      "name": "stakeholder kind rejects empty rows",
+      "payload": {
+        "project": "synthetic-project",
+        "path": "4-shared/stakeholder-mentions.md",
+        "kind": "stakeholder_mention",
+        "content_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "access": "external",
+        "body": "# Stakeholders",
+        "rows": []
+      }
+    }
+  ]
+}

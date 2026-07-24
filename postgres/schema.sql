@@ -29,8 +29,20 @@ do $$ begin
   create type access_tier as enum ('team', 'external');
 exception when duplicate_object then null; end $$;
 do $$ begin
-  create type item_kind as enum ('deliverable', 'transcript', 'decision', 'task', 'artifact', 'skill', 'blueprint');
+  create type item_kind as enum (
+    'deliverable',
+    'transcript',
+    'decision',
+    'task',
+    'artifact',
+    'skill',
+    'blueprint',
+    'fact',
+    'stakeholder_mention'
+  );
 exception when duplicate_object then null; end $$;
+alter type item_kind add value if not exists 'fact';
+alter type item_kind add value if not exists 'stakeholder_mention';
 do $$ begin
   create type task_status as enum ('backlog', 'ready', 'in_progress', 'blocked', 'done');
 exception when duplicate_object then null; end $$;
@@ -1076,6 +1088,60 @@ create table if not exists decisions (
   unique (team_id, project_id, row_key)
 );
 create index if not exists decisions_team_date_idx on decisions (team_id, decided_at desc);
+
+-- Approved transcript evidence. These are projections of structured item rows, never raw
+-- transcript uploads. Audience is inherited from the containing item by lib/ingest.
+create table if not exists extracted_facts (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  project_id uuid not null references projects(id) on delete cascade,
+  source_item_id uuid not null references items(id) on delete cascade,
+  row_key text not null,
+  title text not null,
+  occurred_at timestamptz,
+  fact_type text not null check (fact_type in ('fact', 'event')),
+  source_path text not null,
+  source_quote text not null,
+  audience access_tier not null,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  unique (team_id, project_id, row_key)
+);
+create index if not exists extracted_facts_team_project_idx
+  on extracted_facts (team_id, project_id);
+create index if not exists extracted_facts_source_item_idx
+  on extracted_facts (source_item_id);
+create index if not exists extracted_facts_audience_idx
+  on extracted_facts (team_id, audience);
+create index if not exists extracted_facts_occurred_at_idx
+  on extracted_facts (team_id, occurred_at desc);
+
+-- Model-extracted people remain evidence mentions. They never write members or company graph
+-- tables, whose existing guarded writers remain the only canonical identity mutation paths.
+create table if not exists stakeholder_mentions (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  project_id uuid not null references projects(id) on delete cascade,
+  source_item_id uuid not null references items(id) on delete cascade,
+  row_key text not null,
+  name text not null,
+  role text,
+  context text,
+  source_path text not null,
+  source_quote text not null,
+  audience access_tier not null,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  unique (team_id, project_id, row_key)
+);
+create index if not exists stakeholder_mentions_team_project_idx
+  on stakeholder_mentions (team_id, project_id);
+create index if not exists stakeholder_mentions_source_item_idx
+  on stakeholder_mentions (source_item_id);
+create index if not exists stakeholder_mentions_audience_idx
+  on stakeholder_mentions (team_id, audience);
+create index if not exists stakeholder_mentions_name_idx
+  on stakeholder_mentions (team_id, lower(name));
 
 -- Meeting notes: the rich metadata layer over a transcript. The full text lives as a normal
 -- `items` row (kind='transcript', written through the existing lib/ingest single writer) so it's

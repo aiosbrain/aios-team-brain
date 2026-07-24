@@ -1,0 +1,414 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aios.dev/contracts/brain-api/1.12/item-payload.schema.json",
+  "title": "AIOS Brain API 1.12 item payload",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "project",
+    "path",
+    "kind",
+    "content_sha256",
+    "access",
+    "body"
+  ],
+  "properties": {
+    "project": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120
+    },
+    "path": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 500
+    },
+    "kind": {
+      "enum": [
+        "deliverable",
+        "transcript",
+        "decision",
+        "task",
+        "artifact",
+        "skill",
+        "blueprint",
+        "fact",
+        "stakeholder_mention"
+      ]
+    },
+    "content_sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "actor": {
+      "type": "string",
+      "maxLength": 120
+    },
+    "access": {
+      "enum": [
+        "team",
+        "external",
+        "client",
+        "company",
+        "admin",
+        "private"
+      ]
+    },
+    "frontmatter": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "body": {
+      "type": "string",
+      "maxLength": 1000000
+    },
+    "rows": {
+      "type": "array"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "task"
+          }
+        },
+        "required": [
+          "kind"
+        ]
+      },
+      "then": {
+        "properties": {
+          "rows": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/taskRow"
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "decision"
+          }
+        },
+        "required": [
+          "kind"
+        ]
+      },
+      "then": {
+        "properties": {
+          "rows": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/decisionRow"
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "fact"
+          }
+        },
+        "required": [
+          "kind"
+        ]
+      },
+      "then": {
+        "required": [
+          "rows"
+        ],
+        "properties": {
+          "rows": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "$ref": "#/$defs/factRow"
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "stakeholder_mention"
+          }
+        },
+        "required": [
+          "kind"
+        ]
+      },
+      "then": {
+        "required": [
+          "rows"
+        ],
+        "properties": {
+          "rows": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "$ref": "#/$defs/stakeholderMentionRow"
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "enum": [
+              "deliverable",
+              "transcript",
+              "artifact",
+              "skill",
+              "blueprint"
+            ]
+          }
+        },
+        "required": [
+          "kind"
+        ]
+      },
+      "then": {
+        "not": {
+          "required": [
+            "rows"
+          ]
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "taskRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "row_key",
+        "title"
+      ],
+      "properties": {
+        "row_key": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 2000
+        },
+        "assignee": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "status": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "sprint": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "due": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 64
+        },
+        "parent": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 200
+        },
+        "labels": {
+          "type": "array",
+          "maxItems": 50,
+          "items": {
+            "type": "string",
+            "maxLength": 80
+          }
+        },
+        "priority": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 20
+        },
+        "pm_provider": {
+          "enum": [
+            "plane",
+            "linear",
+            null
+          ]
+        },
+        "pm_external_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 200
+        },
+        "pm_url": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 500
+        }
+      }
+    },
+    "decisionRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "row_key",
+        "title"
+      ],
+      "properties": {
+        "row_key": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 2000
+        },
+        "decided_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 64
+        },
+        "rationale": {
+          "type": "string",
+          "maxLength": 4000
+        },
+        "decided_by": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "impact": {
+          "type": "string",
+          "maxLength": 4000
+        },
+        "tier": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1,
+          "maximum": 3
+        },
+        "audience": {
+          "enum": [
+            "team",
+            "external"
+          ]
+        }
+      }
+    },
+    "factRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "row_key",
+        "title",
+        "fact_type",
+        "source_path",
+        "source_quote"
+      ],
+      "properties": {
+        "row_key": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "occurred_at": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}(?:T[^\\s]+)?$"
+        },
+        "fact_type": {
+          "enum": [
+            "fact",
+            "event"
+          ]
+        },
+        "source_path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "source_quote": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4000
+        }
+      }
+    },
+    "stakeholderMentionRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "row_key",
+        "name",
+        "source_path",
+        "source_quote"
+      ],
+      "properties": {
+        "row_key": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "role": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "context": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000
+        },
+        "source_path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "source_quote": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4000
+        }
+      }
+    }
+  }
+}
