@@ -936,14 +936,27 @@ create table if not exists items (
   -- true when member_id was set by a deliberate admin action (NL correction / re-attribution); locked
   -- items are skipped by auto re-attribution + the unchanged-repush heal (docs/design/attribution-propagation.md).
   member_id_locked boolean not null default false,
+  -- First-seen: set once on insert, never bumped on re-sync (unlike synced_at, which every 30-min tick
+  -- bumps). The honest "new knowledge / day" signal for the dashboard; see lib/metrics/pulse.ts.
+  created_at timestamptz not null default now(),
   synced_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   search tsvector generated always as
     (to_tsvector('english', coalesce(path, '') || ' ' || coalesce(body, ''))) stored,
   unique (team_id, project_id, path)
 );
+-- Additive columns for existing deployments (idempotent rollout via `npm run pg:schema`). Run BEFORE
+-- any index that references them so an existing DB (where the column arrives via ALTER, because the
+-- create-table body above is not re-run for an existing table) can build the index.
+alter table items add column if not exists member_id_locked boolean not null default false;
+-- created_at is added NULLABLE, NO DEFAULT here on purpose: on an existing DB it leaves old rows NULL so
+-- the migration's `where created_at is null` backfill targets exactly them and is a NO-OP on every replay
+-- (the migration then sets the default + not-null). The create-table body above carries the real
+-- `not null default now()` for from-zero. See postgres/migrations/20260724120000_items_created_at.sql.
+alter table items add column if not exists created_at timestamptz;
 create index if not exists items_team_updated_idx on items (team_id, updated_at desc);
 create index if not exists items_team_synced_idx on items (team_id, synced_at desc);
+create index if not exists items_team_created_idx on items (team_id, created_at desc);
 create index if not exists items_search_idx on items using gin (search);
 create index if not exists items_kind_idx on items (team_id, kind);
 

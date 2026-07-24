@@ -151,12 +151,16 @@ export async function getPulseMetrics(
   // Fetch each source once over the combined [prior, now] window where a delta
   // is needed, then split current vs. prior in JS.
   const [itemsRes, queryRes, tasksRes] = await Promise.all([
+    // Knowledge growth reads `created_at` (first-seen), NOT `synced_at`: the scheduler bumps synced_at
+    // on every 30-min tick, so windowing on it plots re-sync churn (≈all items look "new") rather than
+    // real growth. created_at is set once on insert and never bumped. See postgres migration items_created_at.
+    // Only the current window is needed (the prior-window delta died with the removed "Items synced" KPI).
     db
       .from("items")
-      .select("kind, synced_at")
+      .select("kind, created_at")
       .eq("team_id", teamId)
-      .gte("synced_at", priorStart.toISOString())
-      .order("synced_at", { ascending: false })
+      .gte("created_at", windowStart.toISOString())
+      .order("created_at", { ascending: false })
       .limit(10_000),
     scopeQueryLog(
       db
@@ -176,14 +180,14 @@ export async function getPulseMetrics(
   ]);
 
   // NB: the pg adapter returns timestamptz as Date (legacy Supabase-js returned string). Normalize via toIso below.
-  const itemRows = (itemsRes.data ?? []) as { kind: string; synced_at: string | Date }[];
+  const itemRows = (itemsRes.data ?? []) as { kind: string; created_at: string | Date }[];
   const queryRows = (queryRes.data ?? []) as { cost_usd: number | string; created_at: string | Date }[];
   const taskRows = (tasksRes.data ?? []) as { status: string; updated_at: string | Date }[];
 
   const winStartIso = windowStart.toISOString();
   const inWindow = (iso: string) => iso >= winStartIso;
 
-  // ── knowledge growth + items KPI ──
+  // ── knowledge growth (new items / day, by first-seen created_at) ──
   const knowledge: KnowledgePoint[] = buckets.map((b) => ({
     date: b.label,
     deliverable: 0,
@@ -193,23 +197,15 @@ export async function getPulseMetrics(
     artifact: 0,
     skill: 0,
   }));
-  const itemSpark = new Array(order.length).fill(0);
-  let itemsCurrent = 0;
-  let itemsPrior = 0;
   for (const row of itemRows) {
-    const syncedIso = toIso(row.synced_at);
-    if (inWindow(syncedIso)) {
-      itemsCurrent++;
-      const i = index.get(syncedIso.slice(0, 10));
-      if (i !== undefined) {
-        itemSpark[i]++;
-        const kind = (ITEM_KINDS as readonly string[]).includes(row.kind)
-          ? (row.kind as ItemKind)
-          : "artifact";
-        knowledge[i][kind]++;
-      }
-    } else {
-      itemsPrior++;
+    const createdIso = toIso(row.created_at);
+    if (!inWindow(createdIso)) continue;
+    const i = index.get(createdIso.slice(0, 10));
+    if (i !== undefined) {
+      const kind = (ITEM_KINDS as readonly string[]).includes(row.kind)
+        ? (row.kind as ItemKind)
+        : "artifact";
+      knowledge[i][kind]++;
     }
   }
 
@@ -261,16 +257,11 @@ export async function getPulseMetrics(
   const usageLabel = isAdmin ? "Team queries" : "Your queries";
   const spendLabel = isAdmin ? "Team spend" : "Your spend";
 
+  // KPI band = the meaningful set only. "Items synced" was dropped: it counted synced_at (re-sync
+  // churn), so it read ≈the whole corpus every window — no signal. Real new-knowledge is the
+  // "Knowledge growth" chart (created_at). What's left are the numbers that actually move: adoption
+  // (queries), spend, and work-in-flight.
   const kpis: Kpi[] = [
-    {
-      key: "items",
-      label: "Items synced",
-      value: fmtNum(itemsCurrent),
-      delta: pctDelta(itemsCurrent, itemsPrior),
-      spark: itemSpark,
-      hint: `last ${days}d`,
-      accent: "violet",
-    },
     {
       key: "queries",
       label: usageLabel,
