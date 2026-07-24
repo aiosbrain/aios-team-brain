@@ -107,31 +107,60 @@ describe("approved transcript evidence materialization (real Postgres)", () => {
       source_item_id: first.id,
     });
 
-    const emptyBody = "| Row Key | Fact | Occurred At | Type | Source Path | Source Quote |";
+    // diff-delete: introduce a second fact on this item, then re-push a NON-EMPTY subset that omits
+    // it. The contract requires >=1 row per fact push (canonical minItems:1), so a set can only be
+    // SHRUNK, never fully cleared — fact-two is diff-deleted, fact-one survives on the same item.
+    const twoBody = "| fact-one | Annual operating plan is approved | fact-two | Budget ratified |";
     await ingestEvidence(seed, {
       kind: "fact",
       path,
       access: "team",
-      body: emptyBody,
-      content_sha256: hash(emptyBody),
-      rows: [],
+      body: twoBody,
+      content_sha256: hash(twoBody),
+      rows: [
+        {
+          row_key: "fact-one",
+          title: "Annual operating plan is approved",
+          fact_type: "fact",
+          source_path: "1-context/transcripts/planning.md",
+          source_quote: "We approved the annual plan today.",
+        },
+        {
+          row_key: "fact-two",
+          title: "Budget ratified",
+          fact_type: "event",
+          source_path: "1-context/transcripts/planning.md",
+          source_quote: "The budget was ratified.",
+        },
+      ],
     });
-    const { count } = await db()
+    const shrunkBody = "| fact-one | Annual operating plan is approved |";
+    await ingestEvidence(seed, {
+      kind: "fact",
+      path,
+      access: "team",
+      body: shrunkBody,
+      content_sha256: hash(shrunkBody),
+      rows: [
+        {
+          row_key: "fact-one",
+          title: "Annual operating plan is approved",
+          fact_type: "fact",
+          source_path: "1-context/transcripts/planning.md",
+          source_quote: "We approved the annual plan today.",
+        },
+      ],
+    });
+    const { data: survivors } = await db()
       .from("extracted_facts")
-      .select("id", { count: "exact", head: true })
+      .select("row_key")
       .eq("team_id", seed.teamId);
-    expect(count).toBe(0);
+    expect(survivors).toEqual([{ row_key: "fact-one" }]);
   });
 
   it("diff-deletes only rows originating from the synced item", async () => {
     const seed = await seedTeam();
-    const row = {
-      row_key: "fact-source-two",
-      title: "Second source survives",
-      fact_type: "fact",
-      source_path: "1-context/transcripts/two.md",
-      source_quote: "The second source survives.",
-    };
+    // Item B (external) — its row must survive a diff-delete run on item A.
     const secondBody = "| fact-source-two | Second source survives |";
     await ingestEvidence(seed, {
       kind: "fact",
@@ -139,32 +168,70 @@ describe("approved transcript evidence materialization (real Postgres)", () => {
       access: "external",
       body: secondBody,
       content_sha256: hash(secondBody),
-      rows: [row],
+      rows: [
+        {
+          row_key: "fact-source-two",
+          title: "Second source survives",
+          fact_type: "fact",
+          source_path: "1-context/transcripts/two.md",
+          source_quote: "The second source survives.",
+        },
+      ],
     });
-    const firstBody = "| fact-source-one | First source |";
+    // Item A (team) starts with TWO rows...
+    const firstBody = "| fact-source-one | First source | fact-source-oneb | Kept on item A |";
     await ingestEvidence(seed, {
       kind: "fact",
       path: "3-log/facts-team.md",
       access: "team",
       body: firstBody,
       content_sha256: hash(firstBody),
-      rows: [{ ...row, row_key: "fact-source-one" }],
+      rows: [
+        {
+          row_key: "fact-source-one",
+          title: "First source",
+          fact_type: "fact",
+          source_path: "1-context/transcripts/one.md",
+          source_quote: "The first source.",
+        },
+        {
+          row_key: "fact-source-oneb",
+          title: "Kept on item A",
+          fact_type: "fact",
+          source_path: "1-context/transcripts/one.md",
+          source_quote: "Kept on item A.",
+        },
+      ],
     });
-    const emptied = "| Row Key | Fact |";
+    // ...then re-push a subset omitting fact-source-one. It is diff-deleted (same source item), while
+    // fact-source-oneb (same item) and fact-source-two (a DIFFERENT item) are both untouched.
+    const shrunk = "| fact-source-oneb | Kept on item A |";
     await ingestEvidence(seed, {
       kind: "fact",
       path: "3-log/facts-team.md",
       access: "team",
-      body: emptied,
-      content_sha256: hash(emptied),
-      rows: [],
+      body: shrunk,
+      content_sha256: hash(shrunk),
+      rows: [
+        {
+          row_key: "fact-source-oneb",
+          title: "Kept on item A",
+          fact_type: "fact",
+          source_path: "1-context/transcripts/one.md",
+          source_quote: "Kept on item A.",
+        },
+      ],
     });
 
     const { data } = await db()
       .from("extracted_facts")
       .select("row_key, audience")
-      .eq("team_id", seed.teamId);
-    expect(data).toEqual([{ row_key: "fact-source-two", audience: "external" }]);
+      .eq("team_id", seed.teamId)
+      .order("row_key");
+    expect(data).toEqual([
+      { row_key: "fact-source-oneb", audience: "team" },
+      { row_key: "fact-source-two", audience: "external" },
+    ]);
   });
 
   it("stores stakeholder mentions without mutating canonical identity or company graph", async () => {
