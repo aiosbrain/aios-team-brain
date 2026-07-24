@@ -47,7 +47,23 @@ export async function ingestItem(
   auth: { teamId: string; memberId: string; apiKeyId: string },
   rawPayload: ItemPayload,
   access: "team" | "external",
-  opts?: { authorMemberId: string | null }
+  // Attribution override, set by the CALLER (never a raw wire field). Internal callers that already
+  // know the author pass it (the codebase scanner; the pm-sync per-author paths). The `/api/v1/items`
+  // route DERIVES it from the push's frontmatter via `attributeIncomingItem` — but ONLY for trusted
+  // TEAM-tier keys (it skips external-tier keys), so an untrusted external pusher still can't spoof
+  // authorship onto a team member. When an internal caller already knows the content's author it
+  // passes that here; otherwise (opts omitted entirely) the item is attributed to the ingesting actor
+  // (`auth.memberId`). A caller that HAS attempted resolution but come up empty must pass
+  // `authorMemberId: null` explicitly (not omit opts) — that's the only way to say "leave this
+  // unattributed" rather than "attribute to whoever's pushing," so a connector ingesting on behalf of
+  // an unresolved human never silently falls back to the connector's own member_id.
+  opts?: { authorMemberId: string | null },
+  // Tier of the PRINCIPAL pushing this item. Only a trusted (`team`) pusher may change an existing
+  // item's `access` (reclassification) — an `external`-tier key must never RAISE a team item's
+  // visibility by re-pushing it (see the access-heal on the unchanged path). Defaults to `team`
+  // because every INTERNAL caller (connectors, scanner, meetings) is trusted; ONLY the public
+  // `/api/v1/items` route passes the real key tier, so an untrusted external key is gated out.
+  pusherTier: "team" | "external" = "team"
 ): Promise<IngestResult> {
   const parsedPayload = itemPayloadSchema.safeParse({
     ...rawPayload,
@@ -78,7 +94,7 @@ export async function ingestItem(
 
   const { data: existing } = await db
     .from("items")
-    .select("id, content_sha256, member_id, member_id_locked, frontmatter")
+    .select("id, content_sha256, member_id, member_id_locked, frontmatter, access")
     .eq("team_id", auth.teamId)
     .eq("project_id", project.id)
     .eq("path", payload.path)
@@ -108,6 +124,7 @@ export async function ingestItem(
       synced_at: string;
       member_id?: string;
       frontmatter?: Record<string, unknown>;
+      access?: "team" | "external";
     } = { synced_at: now };
     const reattr = decideReattribution(
       existing.member_id,
@@ -115,6 +132,21 @@ export async function ingestItem(
       locked
     );
     if (reattr.memberId) patch.member_id = reattr.memberId;
+    // HEAL ACCESS on an unchanged re-push: `content_sha256` covers only body+title, so a source that
+    // RECLASSIFIES an item's tier without touching its prose (a doc shared narrower/wider upstream)
+    // would otherwise keep the first-ingest `access` forever. With no RLS backstop (CLAUDE.md §5) a
+    // stale `access='external'` on a now-internal item silently keeps serving the body to an external
+    // principal on EVERY read path. Heal it here (like the frontmatter heal) and cascade to the tasks
+    // that inherit it (materialize does NOT run on the unchanged path).
+    //
+    // TRUST GATE: only a `team`-tier pusher may change tier. An `external` key re-pushing the identical
+    // body of a known team item must NOT be able to flip its `access` (widening it to `external` would
+    // leak the real team content it preserves). Internal callers default to `team` (trusted); the public
+    // route passes the real key tier, so an untrusted external pusher leaves the stored tier untouched.
+    const existingAccess =
+      (existing as { access?: "team" | "external" | null }).access ?? null;
+    const accessChanged = existingAccess !== access && pusherTier === "team";
+    if (accessChanged) patch.access = access;
 
     // HEAL FRONTMATTER on an unchanged re-push: `content_sha256` covers only the body, but source-derived
     // metadata in frontmatter can change while the body doesn't. Preserve BEST-EFFORT/backfilled author
@@ -178,6 +210,34 @@ export async function ingestItem(
         },
       });
     }
+    // Cascade a healed tier to the rows that inherit it. Tasks carry the item's `access` as their
+    // `audience` (materialize sets it on the changed path; here it's stale). Decisions are excluded
+    // deliberately — a decision row's audience is per-row (its own wire field), not inherited from
+    // the item (see the decisions-audience data-mechanics test).
+    if (accessChanged) {
+      const { error: cascadeErr } = await db
+        .from("tasks")
+        .update({ audience: access })
+        .eq("source_item_id", existing.id);
+      if (cascadeErr)
+        throw new Error(`task audience cascade failed: ${cascadeErr.message}`);
+      // Audit the rare reclassification so the tier change isn't silent (like the reassignment/heal
+      // audits above; rare enough not to reintroduce the M4 per-tick unbounded-growth problem).
+      await audit(db, {
+        team_id: auth.teamId,
+        actor_kind: "system",
+        member_id: null,
+        action: "item.access_healed",
+        target_type: "items",
+        target_id: existing.id,
+        meta: {
+          from: existingAccess,
+          to: access,
+          source: payload.frontmatter?.source ?? null,
+        },
+      });
+    }
+    // No projection on an unchanged push (the route also guards status !== "unchanged").
     return {
       status: "unchanged",
       id: existing.id,

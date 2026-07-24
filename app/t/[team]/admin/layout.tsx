@@ -1,6 +1,7 @@
 import { Shield } from "lucide-react";
 import { serverClient } from "@/lib/db/server";
 import { getSessionUser } from "@/lib/auth/session";
+import { canAccessAdmin } from "@/lib/auth/admin-access";
 import { AdminTabs } from "@/components/admin/admin-tabs";
 
 export default async function AdminLayout({
@@ -23,14 +24,16 @@ export default async function AdminLayout({
   const { data: me } = team
     ? await db
         .from("members")
-        .select("role")
+        .select("role, tier")
         .eq("team_id", team.id)
         .eq("auth_user_id", user?.id ?? "")
         .eq("status", "active")
         .maybeSingle()
     : { data: null };
 
-  if (me?.role !== "admin") {
+  // Admin AND team-tier — an external-tier admin must not reach the internal admin surface (no RLS
+  // backstop, CLAUDE.md §5). See lib/auth/admin-access.
+  if (!canAccessAdmin(me ?? {})) {
     return (
       <div className="mx-auto max-w-md pt-16">
         <div className="prism-card flex flex-col items-center gap-3 px-8 py-12 text-center">
