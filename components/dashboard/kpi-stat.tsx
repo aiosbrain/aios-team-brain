@@ -11,14 +11,14 @@ const ACCENT_TEXT: Record<KpiAccent, string> = {
   emerald: "text-emerald",
 };
 
-export function KpiStat({ kpi }: { kpi: Kpi }) {
+export function KpiStat({ kpi, helpAlign = "left" }: { kpi: Kpi; helpAlign?: "left" | "right" }) {
   const accent = ACCENT_TEXT[kpi.accent];
   return (
     <div className="prism-card prism-card-hover flex flex-col gap-2 px-4 py-3.5">
       <p className="flex items-center gap-1 text-[11px] font-semibold uppercase tracking-wider text-ink-tertiary">
         {kpi.label}
         {kpi.help ? (
-          <HelpHint label={`About ${kpi.label}`} align="left">
+          <HelpHint label={`About ${kpi.label}`} align={helpAlign}>
             {kpi.help}
           </HelpHint>
         ) : null}

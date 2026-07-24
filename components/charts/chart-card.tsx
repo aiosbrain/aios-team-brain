@@ -5,6 +5,7 @@ export function ChartCard({
   title,
   hint,
   help,
+  helpAlign = "left",
   empty,
   emptyLabel = "No data in this window.",
   children,
@@ -13,6 +14,8 @@ export function ChartCard({
   hint?: string;
   /** Optional "?" popover in the corner explaining what the metric is and how it's computed. */
   help?: ReactNode;
+  /** Edge the help popover aligns to — use "right" for a card in the right column so it can't overflow. */
+  helpAlign?: "left" | "right";
   empty?: boolean;
   emptyLabel?: string;
   children: ReactNode;
@@ -22,7 +25,7 @@ export function ChartCard({
       <div className="mb-3 flex items-baseline justify-between gap-2">
         <h2 className="flex items-center gap-1.5 text-sm font-semibold uppercase tracking-wider text-ink-tertiary">
           {title}
-          {help ? <HelpHint label={`About ${title}`}>{help}</HelpHint> : null}
+          {help ? <HelpHint label={`About ${title}`} align={helpAlign}>{help}</HelpHint> : null}
         </h2>
         {hint ? <span className="text-[11px] text-ink-tertiary">{hint}</span> : null}
       </div>

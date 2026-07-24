@@ -31,6 +31,7 @@ export function KnowledgeGrowth({ data }: { data: KnowledgePoint[] }) {
     <ChartCard
       title="Knowledge growth"
       hint="new items / day"
+      helpAlign="right"
       help={
         <>
           <span className="font-medium text-ink">What this is</span>

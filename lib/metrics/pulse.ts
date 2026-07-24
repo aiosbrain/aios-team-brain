@@ -282,7 +282,7 @@ export async function getPulseMetrics(
       delta: null,
       spark: taskSpark,
       hint: blocked > 0 ? `${blocked} blocked` : "none blocked",
-      help: "Open tasks that are actively moving — those in Ready, In progress, or Blocked (Backlog and Done are excluded). It's a live snapshot across all the team's tasks, so the date range doesn't change it; the sparkline shows task activity per day. \"N blocked\" calls out how many of these are stuck.",
+      help: "Open tasks that are actively moving — those in Ready, In progress, or Blocked (Backlog and Done are excluded). The number is a live snapshot across all the team's tasks, so the date range doesn't change it (only the sparkline, which tracks recent task activity per day, does). \"N blocked\" calls out how many of these are stuck.",
       accent: "cyan",
     },
     {
@@ -292,7 +292,7 @@ export async function getPulseMetrics(
       delta: pctDelta(Math.round(spendCurrent * 1000), Math.round(spendPrior * 1000)),
       spark: querySpark,
       hint: `last ${days}d`,
-      help: `LLM answer cost over the last ${days} days (${scopeWord} spend). Each query records the real cost the model provider reports for that answer (e.g. OpenRouter's usage.cost); this sums them. Only queries made after this shipped carry a cost — older answers weren't metered and count as $0.`,
+      help: `LLM answer cost over the last ${days} days (${scopeWord} spend). Each query records the cost of its answer — on OpenRouter the real charge the provider reports (usage.cost), on Anthropic an estimate from list prices — and this sums them. OpenRouter answers from before cost metering shipped weren't captured and count as $0.`,
       accent: "emerald",
     },
   ];

@@ -29,8 +29,7 @@ export function UsageChart({ data, scope }: { data: UsagePoint[]; scope: string 
           <br />
           <br />
           Scope follows who&apos;s looking: admins see the whole team&apos;s queries, everyone else
-          sees only their own (there&apos;s no shared row-level DB filter, so it&apos;s applied in
-          app code).
+          sees only their own.
         </>
       }
       empty={empty}
