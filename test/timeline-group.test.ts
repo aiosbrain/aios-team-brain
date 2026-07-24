@@ -5,7 +5,9 @@ import {
   itemWorkTime,
   dayLabel,
   mostRecentPerPerson,
+  summaryPromptFor,
   type EvidenceWithMember,
+  type SignalWithMember,
   type TaskInfo,
   type TimelineMember,
   type PersonDay,
@@ -137,6 +139,7 @@ describe("mostRecentPerPerson", () => {
     total,
     tasks: [],
     other: [],
+    signals: [],
   });
 
   it("keeps each person's newest day and drops their older appearances", () => {
@@ -159,3 +162,42 @@ describe("mostRecentPerPerson", () => {
     expect(mostRecentPerPerson(days).map((p) => p.name)).toEqual(["Chetan", "Ghost"]);
   });
 });
+
+describe("signals lane — decisions are SIGNAL: shown, never counted as work", () => {
+  const sig = (over: Partial<SignalWithMember>): SignalWithMember => ({
+    id: Math.random().toString(36).slice(2),
+    memberId: "m1",
+    kind: "decision",
+    title: "picked Postgres",
+    at: "2026-07-22",
+    ...over,
+  });
+
+  it("a decision lands in `signals`, not tasks/other, and does NOT enter the work total", () => {
+    const days = groupTimeline([ev({ memberId: "m1", source: "github" })], taskInfo, members, today, undefined, [sig({})]);
+    const p = days[0].people.find((x) => x.memberId === "m1")!;
+    expect(p.total).toBe(1); // the commit only — the decision is NOT counted
+    expect(p.signals.flatMap((g) => g.items).map((s) => s.title)).toEqual(["picked Postgres"]);
+    expect(p.other.flatMap((g) => g.items).map((i) => i.title)).not.toContain("picked Postgres");
+  });
+
+  it("a person with ONLY signals appears (total 0) but summaryPromptFor ignores signals (no work-synopsis leak)", () => {
+    const days = groupTimeline([], taskInfo, members, today, undefined, [sig({ memberId: "m2", title: "chose SWR" })]);
+    const p = days[0].people.find((x) => x.memberId === "m2")!;
+    expect(p.total).toBe(0);
+    expect(p.signals.flatMap((g) => g.items)).toHaveLength(1);
+    expect(summaryPromptFor(p, "Wed")).toBe(""); // no tasks/other → empty; decisions never enter the prompt
+  });
+});
+
+describe("mostRecentPerPerson skips signal-only days (Home 'Working on' is about WORK)", () => {
+  it("a decision-only later day never displaces a person's real most-recent-work day", () => {
+    const workMon = groupTimeline([ev({ memberId: "m1", at: "2026-07-20T09:00:00Z", source: "github" })], taskInfo, members, "2026-07-22");
+    const sigWed = groupTimeline([], taskInfo, members, "2026-07-22", undefined, [{ id: "d1", memberId: "m1", kind: "decision", title: "a call", at: "2026-07-22" }]);
+    const days: TimelineDay[] = [...sigWed, ...workMon]; // Wed (signal-only) is newer
+    const out = mostRecentPerPerson(days);
+    const m1 = out.find((p) => p.memberId === "m1")!;
+    expect(m1.total).toBe(1); // Monday's WORK day, not Wednesday's signal-only day
+    expect(m1.signals).toEqual([]);
+  });
+})

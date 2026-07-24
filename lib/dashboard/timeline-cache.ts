@@ -27,10 +27,11 @@ import type { TimelineDay } from "./timeline-group";
 
 const TTL_MS = 5 * 60_000; // 5-min freshness; the ledger is cheap, so refresh often.
 // Bump when the TimelineDay[] SHAPE changes: a cached row from an older deploy is then treated as a
-// cache MISS (rebuilt), so the panel never renders a stale wrong shape. `summary` is ADDITIVE + optional
-// (the panel falls back to counts), so it needs NO bump — a v3 row renders fine and the background
-// refresh fills summaries in within a TTL, avoiding a post-deploy inline LLM fan-out on the first view.
-const PAYLOAD_VERSION = 3;
+// cache MISS (rebuilt), so the panel never renders a stale wrong shape. `summary` was ADDITIVE + optional
+// (no bump — a v3 row renders fine). v4 adds a REQUIRED `PersonDay.signals[]` (the Context lane): an old
+// row lacking it would TypeError the card's `.map`, and it's part of the stable `GET /api/v1/timeline`
+// shape, so it MUST bump — the cold rebuild is the cheap pure builder (no inline LLM).
+const PAYLOAD_VERSION = 4;
 
 /** The timeline WITH the per-person-day synopsis attached. Runs the (up to 7d × roster) best-effort LLM
  *  calls — so it's used ONLY on the BACKGROUND refresh path, never inline on a request (a cold miss
