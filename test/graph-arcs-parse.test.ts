@@ -8,9 +8,27 @@ import {
   balanceFacts,
   dedupeFacts,
   arcsRequested,
+  parseOffTopicIds,
+  pruneEvidenceByIds,
   type NarrativeArc,
 } from "@/lib/graph/arcs";
 import type { AtomicFact } from "@/lib/graph/learning";
+
+/** Minimal NarrativeArc fixture for the coherence-prune tests. */
+function makeArc(over: Partial<NarrativeArc>): NarrativeArc {
+  return {
+    id: "arc-x",
+    title: "t",
+    confidence: "medium",
+    summary: "s",
+    participants: [],
+    supporting_sources: [],
+    evidence: [],
+    derived_at: "2026-07-24T00:00:00.000Z",
+    ...over,
+  };
+}
+const ev = (fact: string, itemId?: string) => ({ fact, itemId });
 
 /**
  * Spec for the arc JSON normalizer (the fragile bit — an LLM's JSON is untrusted). Derived from the
@@ -308,5 +326,70 @@ describe("arcsRequested — scale requested arcs with distinct contributors (not
     expect(arcsRequested(4)).toBe(8);
     expect(arcsRequested(6)).toBe(12); // cap (MAX_ARCS)
     expect(arcsRequested(20)).toBe(12); // never exceeds the cap
+  });
+});
+
+describe("parseOffTopicIds — the coherence LLM's reply", () => {
+  it("parses {off_topic:[…]} and uppercases the ids", () => {
+    expect(parseOffTopicIds('{"off_topic":["A1F3","a2f1"]}')).toEqual(new Set(["A1F3", "A2F1"]));
+  });
+  it("accepts a bare array too", () => {
+    expect(parseOffTopicIds('["A1F1"]')).toEqual(new Set(["A1F1"]));
+  });
+  it("drops nothing on garbage / wrong shape / empty (never prunes on uncertainty)", () => {
+    expect(parseOffTopicIds("not json")).toEqual(new Set());
+    expect(parseOffTopicIds('{"off_topic":"A1F1"}')).toEqual(new Set()); // not an array
+    expect(parseOffTopicIds('{"off_topic":[]}')).toEqual(new Set());
+    expect(parseOffTopicIds('{"other":["A1F1"]}')).toEqual(new Set());
+  });
+});
+
+describe("pruneEvidenceByIds — drop a cross-topic outlier before participant attribution", () => {
+  // contributorsByItem: the version-author map attributeArcs uses. Every item here resolves ≥1 human
+  // unless a test needs the empty-human edge.
+  const credit = new Map([
+    ["i-chetan", ["Chetan"]], ["i-fatma", ["Fatma"]],
+    ["b1", ["A"]], ["b2", ["A"]], ["c1", ["B"]], ["c2", ["B"]], ["s1", ["S"]],
+  ]);
+
+  it("drops the flagged evidence from a ≥2-evidence arc (so its author is no longer cited)", () => {
+    // Arc A1 cites Chetan's on-topic fact + Fatma's off-topic doc; the coherence pass flags A1F2 (Fatma's).
+    const arc = makeArc({ evidence: [ev("chetan: arc runtime hardening", "i-chetan"), ev("fatma: goal-setting theory", "i-fatma")] });
+    const [out] = pruneEvidenceByIds([arc], new Set(["A1F2"]), credit);
+    expect(out.evidence.map((e) => e.itemId)).toEqual(["i-chetan"]); // Fatma's item gone → she won't be a participant
+  });
+
+  it("never strips an arc's LAST evidence (all-flagged = an incoherent arc, left intact)", () => {
+    const arc = makeArc({ evidence: [ev("f1", "i-chetan"), ev("f2", "i-fatma")] });
+    expect(pruneEvidenceByIds([arc], new Set(["A1F1", "A1F2"]), credit)[0].evidence).toHaveLength(2);
+  });
+
+  it("keeps the arc when pruning would empty its evidence-HUMAN set (avoids the model-name fallback)", () => {
+    // Survivor F1 is connector-authored (resolves NO human); F2 is Fatma's off-topic doc. Flagging F2
+    // would leave zero human evidence → groundParticipants would fall back to the model's names. Keep it.
+    const arc = makeArc({ evidence: [ev("f1", "i-connector"), ev("f2", "i-fatma")] });
+    expect(pruneEvidenceByIds([arc], new Set(["A1F2"]), credit)[0].evidence).toHaveLength(2); // i-connector has no human
+  });
+
+  it("ignores single-evidence arcs (not prune candidates) and numbers only candidates", () => {
+    const big = makeArc({ id: "big", evidence: [ev("b1", "b1"), ev("b2", "b2")] });
+    const small = makeArc({ id: "small", evidence: [ev("s1", "s1")] });
+    const big2 = makeArc({ id: "big2", evidence: [ev("c1", "c1"), ev("c2", "c2")] });
+    // candidates are [big, big2] → A1, A2 (small is skipped). Flag A2F1 → big2 loses c1 only.
+    const out = pruneEvidenceByIds([big, small, big2], new Set(["A2F1"]), credit);
+    expect(out[0].evidence).toHaveLength(2); // big untouched
+    expect(out[1].evidence).toHaveLength(1); // small untouched
+    expect(out[2].evidence.map((e) => e.itemId)).toEqual(["c2"]); // big2 lost c1
+  });
+
+  it("ignores an out-of-range or unknown-arc flag (harmless no-op)", () => {
+    const arc = makeArc({ evidence: [ev("f1", "i-chetan"), ev("f2", "i-fatma")] });
+    // A1F5 (no 5th fact) and A9F1 (no 9th arc) match nothing → both facts kept.
+    expect(pruneEvidenceByIds([arc], new Set(["A1F5", "A9F1"]), credit)[0].evidence).toHaveLength(2);
+  });
+
+  it("is a no-op when nothing is flagged", () => {
+    const arc = makeArc({ evidence: [ev("f1"), ev("f2")] });
+    expect(pruneEvidenceByIds([arc], new Set(), credit)).toEqual([arc]);
   });
 });
