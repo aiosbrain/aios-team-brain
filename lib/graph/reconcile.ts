@@ -16,6 +16,13 @@ import { GROUP_SCAN_DEPTH } from "./project";
  */
 
 const GRACE_MS = 5 * 60_000; // don't judge a row pushed in the last 5 min — extraction may still be running
+// Clearing a tier-cleanup flag is a tier-isolation decision (no RLS backstop), so it uses a LONGER,
+// dedicated grace: a straggler chunk of the pre-reclassification push that's still sitting in Graphiti's
+// extraction queue (which demonstrably backs up — the oversized-episode wedge) could land AFTER a short
+// grace cleared the flag and leak the old tier permanently. Cleanup is rare + off the hot path, so we
+// can afford to wait an hour before declaring an old group durably empty. (The purge of any episode we
+// DO see still runs every pass; only the flag-CLEAR waits out this window.)
+const CLEANUP_GRACE_MS = 60 * 60_000;
 
 export interface ReconcileSummary {
   groupsChecked: number;
@@ -60,8 +67,10 @@ export async function reconcileProjectedEpisodes(
 
   for (const [groupId, groupRows] of byGroup) {
     // Graphiti unreachable this pass — leave these rows alone and try again next tick, rather than
-    // treating "couldn't check" as "never landed" and re-pushing everything.
-    const episodes = await client.listEpisodes(groupId, 5000).catch(() => null);
+    // treating "couldn't check" as "never landed" and re-pushing everything. Scan deep (same depth as
+    // the cleanup) so a >5000-episode group can't push an item's chunks outside the window and trigger
+    // a spurious "never landed" re-queue (which, for a flagged row, would also churn its cleanup).
+    const episodes = await client.listEpisodes(groupId, GROUP_SCAN_DEPTH).catch(() => null);
     if (episodes === null) continue;
     // An item is projected as one OR MANY chunk episodes (`items:<id>` / `items:<id>#k`) — it "landed"
     // if ANY of its chunks is present. Map each item id → one of its episode uuids.
@@ -79,6 +88,15 @@ export async function reconcileProjectedEpisodes(
         if (!row.episode_uuid) {
           await db.from("graph_episodes").update({ episode_uuid: uuid }).eq("id", row.id);
         }
+      } else if (row.pending_delete_group_id) {
+        // This row still owes an OLD-group cleanup. DELETING it (the normal re-queue) would lose the
+        // `pending_delete_group_id` flag → the old tier stays searchable forever with nothing to retry
+        // it (the exact leak B2 closes, resurrected via a new-group worker crash). Instead, reset the
+        // content hash so the projector re-pushes it (same re-queue effect), while the row — and its
+        // pending flag — survive for the cleanup loop below to finish. The re-push's upsert omits the
+        // pending column (its tier didn't change), so the flag is retained.
+        await db.from("graph_episodes").update({ content_sha256: "" }).eq("id", row.id);
+        reQueued++;
       } else {
         await db.from("graph_episodes").delete().eq("id", row.id);
         reQueued++;
@@ -128,10 +146,10 @@ export async function reconcileProjectedEpisodes(
         }
       }
       // Clear the flag ONLY when the old group is confirmed empty of this item AND enough time has
-      // passed that a late-extracting worker won't still create a straggler chunk (same grace as the
-      // landed-check). If we purged some this pass, leave it set so the next pass re-verifies empty.
-      const pastGrace = new Date(row.projected_at).getTime() <= cutoff;
-      if (uuids.length === 0 && !deleteFailed && pastGrace && !saturated) {
+      // passed (the LONGER cleanup grace) that a late-extracting worker won't still create a straggler
+      // chunk. If we purged some this pass, leave it set so the next pass re-verifies empty.
+      const pastCleanupGrace = new Date(row.projected_at).getTime() <= Date.now() - CLEANUP_GRACE_MS;
+      if (uuids.length === 0 && !deleteFailed && pastCleanupGrace && !saturated) {
         await db.from("graph_episodes").update({ pending_delete_group_id: null }).eq("id", row.id);
         cleaned++;
       }

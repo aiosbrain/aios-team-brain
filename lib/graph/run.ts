@@ -27,6 +27,10 @@ export interface GraphProjectionSummary {
   /** Episodes recorded as projected but never found in Graphiti — cleared so the next run
    * re-pushes them (a worker crash between accept and extraction; audit H3). */
   requeued: number;
+  /** Tier-reclassified items whose OLD-group cleanup was verified complete this run (B2). Worth
+   * surfacing: while it stays 0 with reclassifications outstanding, old-tier episodes are still
+   * purgeable-but-unpurged — a tier-isolation signal, not just bookkeeping. */
+  cleaned: number;
   errors: string[];
 }
 
@@ -84,6 +88,7 @@ async function runGraphProjectionInner(opts?: {
     skipped: 0,
     reconciled: 0,
     requeued: 0,
+    cleaned: 0,
     errors: [],
   };
   if (!client.configured) return summary; // nowhere to project — skip cleanly
@@ -119,6 +124,7 @@ async function runGraphProjectionInner(opts?: {
       const r = await reconcileProjectedEpisodes(db, client, t.id);
       summary.reconciled += r.confirmed;
       summary.requeued += r.reQueued;
+      summary.cleaned += r.cleaned;
     } catch (e) {
       summary.ok = false;
       summary.errors.push(`${t.slug}: ${e instanceof Error ? e.message : "projection failed"}`);
