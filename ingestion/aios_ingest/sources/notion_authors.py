@@ -71,6 +71,8 @@ class NotionAuthorClient:
             timeout=timeout, headers={"Authorization": f"Bearer {token}", "Notion-Version": version}
         )
         self._user_cache: dict[str, dict[str, Any]] = {}
+        # Pages are fetched for authors AND for the edit time; memoize so that's one HTTP call.
+        self._page_cache: dict[str, dict[str, Any]] = {}
 
     def close(self) -> None:
         self._client.close()
@@ -94,7 +96,11 @@ class NotionAuthorClient:
         return r.json()
 
     def get_page(self, page_id: str) -> dict[str, Any]:
-        return self._get(f"/pages/{page_id}")
+        if page_id in self._page_cache:
+            return self._page_cache[page_id]
+        data = self._get(f"/pages/{page_id}")
+        self._page_cache[page_id] = data
+        return data
 
     def get_user(self, user_id: str) -> dict[str, Any]:
         if user_id in self._user_cache:
@@ -105,3 +111,16 @@ class NotionAuthorClient:
 
     def page_authors(self, page_id: str) -> list[dict[str, str]]:
         return resolve_page_authors(page_id, get_page=self.get_page, get_user=self.get_user)
+
+    def page_edit_time(self, page_id: str) -> str | None:
+        """The page's ``last_edited_time`` (ISO-8601) — its WORK-TIME.
+
+        The NotionPageReader's document metadata carries only ``page_id``, no timestamps, so without
+        this the page reaches the brain with no work-time at all: resolvable to null, and therefore
+        silently DROPPED from the timeline despite being ingested and attributed. The page object we
+        already fetch for authorship has the field; ``get_page`` is memoized so this is free."""
+        try:
+            value = self.get_page(page_id).get("last_edited_time")
+        except Exception:
+            return None
+        return str(value) if value else None

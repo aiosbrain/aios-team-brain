@@ -34,7 +34,10 @@ function matchesAny(path: string, globs: RegExp[]): boolean {
 }
 
 /**
- * The file's last-commit author (login + git email + name), or undefined on any failure. GitHub has
+ * The file's last-commit author (login + git email + name) AND that commit's date, or undefined on
+ * any failure. The DATE is the file's work-time: without it a repo doc has no `WORK_TIME_KEYS` value
+ * at all, so it resolves to null work-time and is silently DROPPED from the timeline / "working on"
+ * even though it was correctly attributed. GitHub has
  * no per-file author field, so we take the most recent commit touching the path — the honest
  * git-blame answer for "who owns this file". Best-effort: a failure leaves the file unattributed
  * (never mis-attributed to the ingesting connector). One extra API call per file — bounded by the
@@ -46,18 +49,23 @@ async function fetchFileLastAuthor(
   ref: string,
   headers: Record<string, string>,
   fetchImpl: typeof fetch
-): Promise<{ login?: string; email?: string; name?: string } | undefined> {
+): Promise<{ login?: string; email?: string; name?: string; date?: string } | undefined> {
   try {
     const url = `${base}/commits?path=${encodeURIComponent(path)}&sha=${encodeURIComponent(ref)}&per_page=1`;
     const res = await fetchImpl(url, { headers });
     if (!res.ok) return undefined;
     const arr = (await res.json()) as {
       author?: { login?: string } | null;
-      commit?: { author?: { email?: string; name?: string } | null } | null;
+      commit?: { author?: { email?: string; name?: string; date?: string } | null } | null;
     }[];
     const c = Array.isArray(arr) ? arr[0] : undefined;
     if (!c) return undefined;
-    return { login: c.author?.login, email: c.commit?.author?.email, name: c.commit?.author?.name };
+    return {
+      login: c.author?.login,
+      email: c.commit?.author?.email,
+      name: c.commit?.author?.name,
+      date: c.commit?.author?.date,
+    };
   } catch {
     return undefined;
   }
@@ -122,6 +130,7 @@ export async function fetchGithubRepoFiles(opts: {
       htmlUrl: data.html_url,
       authorLogin: author?.login,
       authorEmail: author?.email,
+      committedAt: author?.date,
       authorName: author?.name,
     });
   }

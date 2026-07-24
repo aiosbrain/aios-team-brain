@@ -43,4 +43,8 @@ class NotionSource(PullOnlySource, Source):
                     found = authors.page_authors(raw.external_id)
                     if found:
                         raw.authors = found
+                    # WORK-TIME: the reader's metadata has no timestamp, so without this the page is
+                    # ingested and attributed but has no work-time — and the timeline drops it.
+                    if not raw.source_ts:
+                        raw.source_ts = authors.page_edit_time(raw.external_id)
                 yield raw

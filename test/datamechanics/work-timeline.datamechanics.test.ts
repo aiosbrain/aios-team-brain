@@ -210,6 +210,28 @@ describe("work timeline — attributed docs (Notion / Google Docs / deliverables
     expect(titles).not.toContain("Next-month plan"); // future-dated → not in a future bucket
   });
 
+  it("dates a doc whose source spells its edit time differently (previously dropped)", async () => {
+    const seed = await seedTeam();
+    const day1ago = new Date(Date.now() - 86_400_000).toISOString();
+
+    // Each reader spells its timestamp its own way. Work-time matched EXACT key names, so a spelling
+    // the list didn't enumerate resolved to null and the doc was silently DROPPED — ingested,
+    // attributed, and invisible. Keys are now matched on a normalized form.
+    await ingest(seed, { kind: "deliverable", path: `drive/spaced-${randomUUID()}.md`, access: "team", body: "d",
+      frontmatter: { source: "gdrive", title: "Drive doc spaced key", "modified at": day1ago } });
+    await ingest(seed, { kind: "deliverable", path: `conf/updatedat-${randomUUID()}.md`, access: "team", body: "c",
+      frontmatter: { source: "confluence", title: "Confluence doc updatedAt", updated_at: day1ago } });
+    // A repo file's work-time is its last commit — github-files fetched that commit for the author
+    // but threw the DATE away, so every repo doc was undated and dropped from the timeline.
+    await ingest(seed, { kind: "deliverable", path: `github/o-r/readme-${randomUUID()}.md`, access: "team", body: "r",
+      frontmatter: { source: "github", title: "Repo readme", committed_at: day1ago } });
+
+    const titles = evidenceTitles(await getWorkTimeline(db(), seed.teamId, "team"));
+    expect(titles).toContain("Drive doc spaced key");
+    expect(titles).toContain("Confluence doc updatedAt");
+    expect(titles).toContain("Repo readme");
+  });
+
   it("tier isolation: an external viewer never sees a team-tier doc", async () => {
     const seed = await seedTeam();
     await ingest(seed, { kind: "deliverable", path: `notion/int-${randomUUID()}.md`, access: "team", body: "x",

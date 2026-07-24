@@ -21,6 +21,9 @@ export interface GithubFileRaw {
   authorLogin?: string;
   authorEmail?: string;
   authorName?: string;
+  /** ISO date of the file's last commit — its WORK-TIME. Without it the doc has no work-time key and
+   *  is dropped from the timeline (correctly attributed but invisible). */
+  committedAt?: string;
 }
 
 export interface NormalizeGithubFilesInput {
@@ -62,6 +65,9 @@ export function normalizeGithubFiles(input: NormalizeGithubFilesInput): ItemPayl
       ...(f.authorName ? { author: f.authorName } : {}),
       ...(f.authorEmail ? { author_email: f.authorEmail } : {}),
       ...(f.authorLogin ? { author_login: f.authorLogin } : {}),
+      // WORK-TIME: the last commit that touched this file. Frozen at the real edit, so a re-scan
+      // never resurfaces the doc as "today's work" the way `synced_at` would.
+      ...(f.committedAt ? { committed_at: f.committedAt } : {}),
     },
     body: f.body,
   }));
