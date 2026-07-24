@@ -45,6 +45,16 @@ export const CHUNK_CHARS = resolvePositiveInt(process.env.GRAPH_CHUNK_CHARS, 250
 export const MAX_EPISODE_CHUNKS = resolvePositiveInt(process.env.GRAPH_MAX_EPISODE_CHUNKS, 16);
 
 /**
+ * How many episodes to scan when resolving an item's chunk names → uuids for a delete (tier-cleanup)
+ * or an emptiness check. `listEpisodes` defaults to the most-recent 1000; in a group past that, a
+ * reclassified item's episodes fall outside the window, so the delete finds nothing and SILENTLY
+ * no-ops — leaving the old-tier facts searchable (Pass-1 review B2). We scan deep so the delete is
+ * real for any realistic group; a group larger than this keeps its `pending_delete_group_id` set
+ * (reconcile never confirms it empty) rather than reporting a false success.
+ */
+export const GROUP_SCAN_DEPTH = resolvePositiveInt(process.env.GRAPH_GROUP_SCAN_DEPTH, 100_000);
+
+/**
  * "When it happened" for an episode: prefer the item's own `source_ts`, but only if it actually parses.
  * A present-but-garbage `source_ts` must fall back to `synced_at` (always a real timestamptz), NOT to
  * graphiti-client's last-resort now() — otherwise an old/undated doc gets stamped "today" and floats to
@@ -116,15 +126,27 @@ function sha(content: string): string {
 }
 
 /**
- * Delete ALL of an item's episodes (every chunk: `items:<id>` and `items:<id>#k`) from `groupId`.
- * `/messages` is fire-and-forget and never returns a uuid, so we resolve names→uuids via
- * `listEpisodes` (audit M6). Best-effort: a chunk the async worker never created just isn't found.
+ * Delete ALL of an item's episodes (every chunk: `items:<id>` and `items:<id>#k`) from `groupId`, and
+ * return how many were deleted. `/messages` is fire-and-forget and never returns a uuid, so we resolve
+ * names→uuids via `listEpisodes` (audit M6), scanning `GROUP_SCAN_DEPTH` deep so the delete doesn't
+ * silently no-op on a large group. Throws on a Graphiti error (list or delete) — the caller decides
+ * whether to retry (the projector records the group as pending-delete; reconcile finishes it). A chunk
+ * the async worker never created simply isn't found and doesn't count.
  */
-export async function deleteItemEpisodes(client: GraphitiClient, groupId: string, itemId: string): Promise<void> {
-  const episodes = await client.listEpisodes(groupId);
+export async function deleteItemEpisodes(
+  client: GraphitiClient,
+  groupId: string,
+  itemId: string
+): Promise<number> {
+  const episodes = await client.listEpisodes(groupId, GROUP_SCAN_DEPTH);
+  let deleted = 0;
   for (const e of episodes) {
-    if (itemIdFromEpisodeName(e.name) === itemId) await client.deleteEpisode(e.uuid);
+    if (itemIdFromEpisodeName(e.name) === itemId) {
+      await client.deleteEpisode(e.uuid);
+      deleted++;
+    }
   }
+  return deleted;
 }
 
 /**
@@ -209,11 +231,16 @@ export async function projectItemsToGraph(
       continue; // unchanged content, same tier → no-op (idempotent)
     }
 
-    // Audit M6: a tier reclassification (e.g. external→team) must not leave the old episodes
-    // searchable in the old group forever — delete ALL the item's chunks there before projecting into
-    // the new group. Best-effort: the async worker may not have created a node yet, or it's already
-    // gone; either way we proceed with the new-group push so projection isn't blocked on it.
+    // Audit M6 (durability hardened — Pass-1 review B2): a tier reclassification (e.g. external→team)
+    // must not leave the old episodes searchable in the old group. We RECORD the old group as
+    // pending-delete regardless of the inline attempt below, because the inline delete is best-effort
+    // and can silently fail (a Graphiti blip) or miss a chunk the async worker creates AFTER it runs —
+    // and once the ledger flips `group_id` to the new group, nothing would ever retry, leaving the old
+    // tier searchable forever. `reconcile` retries the cleanup until the old group is verified empty and
+    // only then clears `pending_delete_group_id`. The inline delete stays as the fast path.
+    let pendingDeleteGroup: string | null = null;
     if (tierChanged && existingRow) {
+      pendingDeleteGroup = existingRow.group_id;
       await deleteItemEpisodes(client, existingRow.group_id, item.id).catch(() => {});
     }
 
@@ -227,6 +254,9 @@ export async function projectItemsToGraph(
         group_id: groupId,
         content_sha256: contentSha,
         projected_at: new Date().toISOString(),
+        // Only written on a tier change (the common no-op projection leaves the stored value — null —
+        // untouched, since the pg upsert only SETs columns present in the object).
+        ...(tierChanged ? { pending_delete_group_id: pendingDeleteGroup } : {}),
       },
       { onConflict: "team_id,source_table,source_id" }
     );

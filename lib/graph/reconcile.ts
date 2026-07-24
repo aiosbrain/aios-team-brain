@@ -2,6 +2,7 @@ import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { GraphitiClient } from "./graphiti-client";
 import { itemIdFromEpisodeName } from "./episode-name";
+import { GROUP_SCAN_DEPTH } from "./project";
 
 /**
  * Reconcile pass for the brain→Graphiti seam (audit H3, Option B — chosen over blocking-confirm
@@ -20,6 +21,8 @@ export interface ReconcileSummary {
   groupsChecked: number;
   confirmed: number;
   reQueued: number;
+  /** Rows whose OLD-group cleanup (after a tier change) was verified complete this pass. */
+  cleaned: number;
 }
 
 type EpisodeRow = {
@@ -28,6 +31,7 @@ type EpisodeRow = {
   group_id: string;
   projected_at: string;
   episode_uuid: string | null;
+  pending_delete_group_id: string | null;
 };
 
 export async function reconcileProjectedEpisodes(
@@ -35,11 +39,11 @@ export async function reconcileProjectedEpisodes(
   client: GraphitiClient,
   teamId: string
 ): Promise<ReconcileSummary> {
-  if (!client.configured) return { groupsChecked: 0, confirmed: 0, reQueued: 0 };
+  if (!client.configured) return { groupsChecked: 0, confirmed: 0, reQueued: 0, cleaned: 0 };
 
   const { data } = await db
     .from("graph_episodes")
-    .select("id, source_id, group_id, projected_at, episode_uuid")
+    .select("id, source_id, group_id, projected_at, episode_uuid, pending_delete_group_id")
     .eq("team_id", teamId);
   const rows = (data ?? []) as EpisodeRow[];
 
@@ -82,5 +86,57 @@ export async function reconcileProjectedEpisodes(
     }
   }
 
-  return { groupsChecked: byGroup.size, confirmed, reQueued };
+  // Tier-reclassification cleanup (audit M6 durability, Pass-1 review B2). A row with
+  // `pending_delete_group_id` had its tier changed; its OLD-group episodes must be purged, but the
+  // projector's inline delete is best-effort (a swallowed Graphiti error, or the async worker creating
+  // a straggler chunk after it ran). Retry the delete here until the old group is verified empty, THEN
+  // clear the flag. Independent of the landed-check above (that confirms the NEW group).
+  let cleaned = 0;
+  const pendingByGroup = new Map<string, EpisodeRow[]>();
+  for (const row of rows) {
+    if (!row.pending_delete_group_id) continue;
+    const arr = pendingByGroup.get(row.pending_delete_group_id) ?? [];
+    arr.push(row);
+    pendingByGroup.set(row.pending_delete_group_id, arr);
+  }
+  for (const [oldGroup, groupRows] of pendingByGroup) {
+    // List the old group once (deep — a large group must not hide the item's episodes past the default
+    // window). Graphiti unreachable → leave the flags set and retry next tick.
+    const episodes = await client.listEpisodes(oldGroup, GROUP_SCAN_DEPTH).catch(() => null);
+    if (episodes === null) continue;
+    // If the scan hit the cap, the item's episodes MIGHT be beyond the window — treat "not found" as
+    // inconclusive and never clear the flag on a saturated scan (else we'd false-clear while old-tier
+    // episodes still exist — the very bug this fixes, just at a larger N). The flag then stays set +
+    // observable rather than silently declaring a phantom cleanup.
+    const saturated = episodes.length >= GROUP_SCAN_DEPTH;
+    const uuidsByItem = new Map<string, string[]>();
+    for (const e of episodes) {
+      const itemId = itemIdFromEpisodeName(e.name);
+      if (!itemId) continue;
+      const arr = uuidsByItem.get(itemId) ?? [];
+      arr.push(e.uuid);
+      uuidsByItem.set(itemId, arr);
+    }
+    for (const row of groupRows) {
+      const uuids = uuidsByItem.get(row.source_id) ?? [];
+      let deleteFailed = false;
+      for (const uuid of uuids) {
+        try {
+          await client.deleteEpisode(uuid);
+        } catch {
+          deleteFailed = true; // keep the flag; retry next pass
+        }
+      }
+      // Clear the flag ONLY when the old group is confirmed empty of this item AND enough time has
+      // passed that a late-extracting worker won't still create a straggler chunk (same grace as the
+      // landed-check). If we purged some this pass, leave it set so the next pass re-verifies empty.
+      const pastGrace = new Date(row.projected_at).getTime() <= cutoff;
+      if (uuids.length === 0 && !deleteFailed && pastGrace && !saturated) {
+        await db.from("graph_episodes").update({ pending_delete_group_id: null }).eq("id", row.id);
+        cleaned++;
+      }
+    }
+  }
+
+  return { groupsChecked: byGroup.size, confirmed, reQueued, cleaned };
 }

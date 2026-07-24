@@ -1641,10 +1641,15 @@ create table if not exists graph_episodes (
   group_id text not null,                      -- '<teamSlug>:<tier>' (tier-scoped, see lib/graph/group)
   content_sha256 text not null,                -- hash of the episode content we sent
   episode_uuid text,                           -- Graphiti's episode id, if returned
+  pending_delete_group_id text,                -- an OLD group still needing cleanup after a tier change (reconcile retries until empty; see lib/graph/reconcile)
   projected_at timestamptz not null default now(),
   unique (team_id, source_table, source_id)
 );
 create index if not exists graph_episodes_team_idx on graph_episodes (team_id, projected_at desc);
+-- NB: the partial index on `pending_delete_group_id` lives ONLY in the migration
+-- (20260724180000_graph_episodes_pending_delete.sql), which runs AFTER schema.sql and adds the column
+-- first. A bare partial-index statement here would fail on an existing DB, where the table already
+-- exists (so its declaration above is a no-op) and the column isn't present until the migration runs.
 
 -- Narrative-arc synthesis cache (Layer 3, lib/graph/arcs). Arcs are an LLM synthesis over the last
 -- 7d of the graph — expensive to compute and identical for everyone sharing a tier-visible group set.

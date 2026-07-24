@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { GraphitiClient, GraphEpisode, GraphEpisodeRef } from "@/lib/graph/graphiti-client";
-import { projectSlackToGraph, projectItemsToGraph, CHUNK_CHARS, MAX_EPISODE_CHUNKS } from "@/lib/graph/project";
+import { projectSlackToGraph, projectItemsToGraph, deleteItemEpisodes, CHUNK_CHARS, MAX_EPISODE_CHUNKS, GROUP_SCAN_DEPTH } from "@/lib/graph/project";
 import { runGraphProjection } from "@/lib/graph/run";
 import { reconcileProjectedEpisodes } from "@/lib/graph/reconcile";
 import { db, ingest, seedTeam } from "./helpers";
@@ -19,6 +19,10 @@ class FakeGraphiti {
   store = new Map<string, Map<string, GraphEpisodeRef>>();
   // Names that should be treated as "never landed" (simulates a worker crash before extraction).
   neverLands = new Set<string>();
+  // When true, deleteEpisode throws — simulates a Graphiti blip so cleanup fails (B2).
+  failDeletes = false;
+  // Records the `lastN` each listEpisodes call requested, so a test can assert the deep scan (B2).
+  listCalls: { groupId: string; lastN?: number }[] = [];
   readonly configured = true;
 
   async addEpisodes(groupId: string, episodes: GraphEpisode[]): Promise<void> {
@@ -32,11 +36,13 @@ class FakeGraphiti {
     this.store.set(groupId, group);
   }
 
-  async listEpisodes(groupId: string): Promise<GraphEpisodeRef[]> {
+  async listEpisodes(groupId: string, lastN?: number): Promise<GraphEpisodeRef[]> {
+    this.listCalls.push({ groupId, lastN });
     return [...(this.store.get(groupId)?.values() ?? [])];
   }
 
   async deleteEpisode(uuid: string): Promise<void> {
+    if (this.failDeletes) throw new Error("simulated Graphiti delete failure");
     for (const group of this.store.values()) group.delete(uuid);
   }
 }
@@ -220,6 +226,76 @@ describe("tier reclassification cleans up the stale episode (audit M6)", () => {
       .eq("team_id", seed.teamId)
       .maybeSingle();
     expect((state as { group_id: string }).group_id).toBe(teamGroup);
+  });
+});
+
+// Spec for Pass-1 review B2: the tier-reclassification cleanup must be DURABLE. The projector's inline
+// delete is best-effort; if it silently fails (or misses a late-created chunk) and the ledger flips to
+// the new group, the old-tier episodes must not stay searchable forever. `pending_delete_group_id`
+// records the old group and reconcile retries the purge until the old group is verified empty.
+describe("tier reclassification cleanup is durable across a failed inline delete (Pass-1 review B2)", () => {
+  it("records the old group as pending-delete and reconcile finishes the purge after an inline delete failure", async () => {
+    const seed = await seedTeam();
+    const slug = await teamSlugFor(seed.teamId);
+    const externalGroup = `${slug}_external`;
+    const teamGroup = `${slug}_team`;
+    await ingest(seed, { kind: "deliverable", path: "docs/spec.md", body: "the spec", access: "external" });
+
+    const fake = new FakeGraphiti();
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(fake) });
+    expect(await fake.listEpisodes(externalGroup)).toHaveLength(1);
+
+    // Reclassify external→team, but the inline delete of the OLD group FAILS (a Graphiti blip).
+    fake.failDeletes = true;
+    await ingest(seed, { kind: "deliverable", path: "docs/spec.md", body: "the spec, now team-tier", access: "team" });
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(fake) });
+
+    // New group has the episode; the OLD group STILL has it (inline delete failed) — pre-B2 this leaked
+    // forever because the ledger flipped group_id and nothing retried.
+    expect(await fake.listEpisodes(teamGroup)).toHaveLength(1);
+    expect(await fake.listEpisodes(externalGroup)).toHaveLength(1);
+
+    // The ledger points at the new group AND records the old group as pending cleanup.
+    const { data: row } = await db()
+      .from("graph_episodes")
+      .select("id, group_id, pending_delete_group_id")
+      .eq("team_id", seed.teamId)
+      .maybeSingle();
+    const r = row as { id: string; group_id: string; pending_delete_group_id: string | null };
+    expect(r.group_id).toBe(teamGroup);
+    expect(r.pending_delete_group_id).toBe(externalGroup);
+
+    // Backdate projected_at past the 5-min grace so reconcile may finalize (not premature).
+    await db().from("graph_episodes").update({ projected_at: "2020-01-01T00:00:00Z" }).eq("id", r.id);
+
+    // Graphiti recovers. Pass 1 purges the old-group straggler (leak closed) but keeps the flag…
+    fake.failDeletes = false;
+    await reconcileProjectedEpisodes(db(), client(fake), seed.teamId);
+    expect(await fake.listEpisodes(externalGroup)).toHaveLength(0);
+
+    // …and pass 2 confirms the old group empty and clears the flag (converges).
+    const pass2 = await reconcileProjectedEpisodes(db(), client(fake), seed.teamId);
+    expect(pass2.cleaned).toBe(1);
+    const { data: after } = await db()
+      .from("graph_episodes")
+      .select("pending_delete_group_id")
+      .eq("team_id", seed.teamId)
+      .maybeSingle();
+    expect((after as { pending_delete_group_id: string | null }).pending_delete_group_id).toBeNull();
+  });
+
+  it("deleteItemEpisodes scans the group deep (not the 1000-episode default) so a large group can't hide the item", async () => {
+    const seed = await seedTeam();
+    const slug = await teamSlugFor(seed.teamId);
+    const group = `${slug}_team`;
+    const fake = new FakeGraphiti();
+    await fake.addEpisodes(group, [{ content: "x", timestamp: "2020-01-01T00:00:00Z", sourceDescription: "x", name: "items:abc" }]);
+
+    fake.listCalls = [];
+    await deleteItemEpisodes(client(fake), group, "abc");
+    // The default listEpisodes(lastN=1000) would silently miss an item beyond the newest 1000 in a large
+    // group — the delete would "succeed" deleting nothing. The cleanup must request the deep scan.
+    expect(fake.listCalls.some((c) => c.groupId === group && c.lastN === GROUP_SCAN_DEPTH)).toBe(true);
   });
 });
 
