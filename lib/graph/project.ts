@@ -4,6 +4,7 @@ import type { DbClient } from "@/lib/db/types";
 import { GraphitiClient, type GraphEpisode } from "./graphiti-client";
 import { episodeGroupId, type AccessTier } from "./group";
 import { episodeName, itemIdFromEpisodeName } from "./episode-name";
+import { resolveWorkTime } from "@/lib/ingest/work-time";
 
 /**
  * Brain → Graphiti projector. Reads already-normalized, tier-tagged rows from the brain (`items` —
@@ -55,16 +56,32 @@ export const MAX_EPISODE_CHUNKS = resolvePositiveInt(process.env.GRAPH_MAX_EPISO
 export const GROUP_SCAN_DEPTH = resolvePositiveInt(process.env.GRAPH_GROUP_SCAN_DEPTH, 100_000);
 
 /**
- * "When it happened" for an episode: prefer the item's own `source_ts`, but only if it actually parses.
- * A present-but-garbage `source_ts` must fall back to `synced_at` (always a real timestamptz), NOT to
- * graphiti-client's last-resort now() — otherwise an old/undated doc gets stamped "today" and floats to
- * the top of the recency-ranked arcs (rankArcs). (Locale-ambiguous strings like "09/07/2026" still parse
- * — wrongly — under JS Date; we can't disambiguate DD/MM here, so connectors should emit ISO.) Pure +
+ * "When it happened" for an episode: the item's own work-time via the SHARED resolver
+ * (`lib/ingest/work-time`), falling back to `synced_at` when the source gave nothing parseable.
+ *
+ * It now reads the same key list as the timeline. It previously read `frontmatter.source_ts` ALONE,
+ * which silently mis-dated every source that expresses work-time another way — most importantly git
+ * commits, which carry `committed_at`: linking a year-old repo ingests 90 days of commits in one tick
+ * and stamped them all "today", so work-time-ordered arcs narrated months-old work as this week's
+ * storyline while the timeline (reading `committed_at`) disagreed about the very same commits.
+ *
+ * The `synced_at` fallback is deliberate: never graphiti-client's last-resort now(), which would let
+ * an undated doc float to the top of the recency-ranked arcs (rankArcs). (Locale-ambiguous strings
+ * like "09/07/2026" still parse — wrongly — under JS Date, so connectors must emit ISO.) Pure +
  * exported for tests.
+ *
+ * FORWARD-ONLY: episode idempotency is keyed on `sha(item.body)` (+ tier), NOT on the timestamp, so
+ * an item already projected under the old sync-time stamp is `skipped` and KEEPS it until its body
+ * changes — which a commit never does. Arc impact ages out on its own (arcs read a 7-day window),
+ * but historical `valid_at` stays wrong until a backfill re-projects: it must `deleteItemEpisodes`
+ * FIRST (a bare `graph_episodes` delete re-pushes duplicates under the same names) and reset the
+ * runner's `synced_at` cursor so old rows are re-scanned. Tracked as follow-up, not done here.
  */
-export function pickEpisodeTimestamp(sourceTs: unknown, syncedAt: string): string {
-  const raw = typeof sourceTs === "string" ? sourceTs : syncedAt;
-  return Number.isNaN(new Date(raw).getTime()) ? syncedAt : raw;
+export function pickEpisodeTimestamp(
+  frontmatter: Record<string, unknown> | null | undefined,
+  syncedAt: string
+): string {
+  return resolveWorkTime(frontmatter) ?? syncedAt;
 }
 
 /**
@@ -159,7 +176,7 @@ function toEpisodes(item: ItemRow): GraphEpisode[] {
   const fm = item.frontmatter ?? {};
   const title = typeof fm.title === "string" ? fm.title : undefined;
   const url = typeof fm.source_url === "string" ? fm.source_url : undefined;
-  const ts = pickEpisodeTimestamp(fm.source_ts, item.synced_at); // when it happened (see helper)
+  const ts = pickEpisodeTimestamp(fm, item.synced_at); // when it happened (see helper)
   const label = KIND_LABEL[item.kind] ?? "Item";
   const chunks = chunkContent(item.body ?? "");
   const total = chunks.length;

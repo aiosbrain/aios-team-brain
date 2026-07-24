@@ -1,0 +1,95 @@
+/**
+ * THE canonical "when did this work actually happen" resolver — one definition shared by every
+ * surface that orders, buckets, or narrates work.
+ *
+ * Why this module exists: work-time was defined in two places that disagreed. The timeline read a
+ * list of frontmatter keys; the graph projector read `frontmatter.source_ts` ALONE. So a git commit
+ * (which carries `committed_at`, not `source_ts`) was correctly dated on the timeline but stamped
+ * with `synced_at` in the graph — linking a year-old repo made months-old commits narrate as this
+ * week's storyline, and the two surfaces disagreed about the same work. Worse, the key list had
+ * grown to include names NO connector emits (`last_edited_time`, `modifiedTime`, …), so every
+ * document source that relied on them resolved to null and was silently DROPPED from the timeline.
+ *
+ * Two rules follow from that history:
+ *  1. There is exactly one key list and one parser — here. Callers choose only what to do with a
+ *     null (the timeline drops the item; the projector falls back to `synced_at`).
+ *  2. Key matching is SPELLING-TOLERANT. Frontmatter arrives from sources we do not control (the
+ *     LlamaHub readers alone spell it `last_edited_time`, `modifiedTime`, and `modified at`), and a
+ *     generic/MCP connector may spell it any way at all. Matching on a normalized form means a new
+ *     source plugs in without another hardcoded alias — the alternative is one silent drop per source.
+ *
+ * `synced_at` is deliberately NOT a work-time: it is bumped on every re-scan, so using it would
+ * resurface old content as "today's work" (the mtime/re-sync class of bug).
+ *
+ * SCOPE: this is the resolver for an ITEM's work-time (timeline + graph projector). `lib/meetings/
+ * from-items` keeps its own, deliberately different order (creation before `source_ts`) because a
+ * meeting is dated by when it OCCURRED, not when its notes were last touched.
+ */
+
+/**
+ * Canonical work-time keys in PRIORITY order, as normalized forms (see `normalizeKey`).
+ * Ordering encodes intent: an explicit source timestamp beats an edit time, which beats a creation
+ * time — "when the work happened", not "when the record first existed".
+ */
+const WORK_TIME_KEYS_NORMALIZED: readonly string[] = [
+  // Explicit "when it happened" signals from a source that knows.
+  "committedat", // git commit time (commits-to-items)
+  "sourcets", // the contract's explicit work-time (Slack, sidecar docs)
+  "occurredat", // events / meetings
+  // Edit time — the work-shaped signal for documents.
+  "lasteditedtime", // Notion
+  "lastmodifiedtime",
+  "lastmodified",
+  "modifiedtime", // Google Drive (also spelled "modified at" → "modifiedat")
+  "modifiedat",
+  "modified",
+  "updatedat",
+  "updated",
+  // Weakest: creation / nominal date. A doc that was never edited still happened when it was made.
+  "date",
+  "createdtime",
+  "createdat",
+  "created",
+  "timestamp",
+];
+
+/** Lowercase + drop every non-alphanumeric char, so `last_edited_time` / `lastEditedTime` /
+ *  `"Last Edited Time"` / `modified at` all collapse to one comparable token. */
+function normalizeKey(key: string): string {
+  return key.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+/**
+ * Parse a frontmatter value into an ISO instant, or null. Strings only: a bare number is ambiguous
+ * (epoch seconds vs milliseconds vs a year) and guessing wrong silently mis-dates work, which is the
+ * exact failure class this module exists to prevent — a source with an epoch must normalize it.
+ *
+ * NOTE: locale-ambiguous strings ("09/07/2026") still parse — wrongly — under JS `Date`; we cannot
+ * disambiguate DD/MM here, so connectors must emit ISO-8601.
+ */
+function parseInstant(value: unknown): string | null {
+  if (typeof value !== "string" || !value.trim()) return null;
+  const t = Date.parse(value);
+  return Number.isNaN(t) ? null : new Date(t).toISOString();
+}
+
+/**
+ * The work-time of an item, from its frontmatter — the highest-priority present-and-parseable
+ * key, ISO-normalized. Null when the source gave us nothing usable, which callers must handle
+ * explicitly (drop vs fall back) rather than silently defaulting to now()/sync-time. Pure.
+ */
+export function resolveWorkTime(fm: Record<string, unknown> | null | undefined): string | null {
+  if (!fm) return null;
+  // Index the item's own keys by normalized form once, so an unknown spelling still matches.
+  const byNormalized = new Map<string, unknown>();
+  for (const [key, value] of Object.entries(fm)) {
+    const norm = normalizeKey(key);
+    // First spelling wins if a payload somehow carries two spellings of the same concept.
+    if (!byNormalized.has(norm)) byNormalized.set(norm, value);
+  }
+  for (const canonical of WORK_TIME_KEYS_NORMALIZED) {
+    const parsed = parseInstant(byNormalized.get(canonical));
+    if (parsed) return parsed;
+  }
+  return null;
+}
