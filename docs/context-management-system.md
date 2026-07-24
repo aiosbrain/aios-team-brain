@@ -356,7 +356,7 @@ Intelligence baked into arcs:
 | Task with self-parent / missing parent / cycle | Rejected *before* any item mutation (422, no half-write) |
 | Oversized item vs Graphiti extraction cap | Chunked into ≤16 episodes of ≤2500 chars each; overflow dropped as backstop |
 | Undated document | Episode timestamp prefers `frontmatter.source_ts` then `synced_at`, never `now()` (won't float to top of recency-ranked arcs) |
-| Tier reclassification (external→team) | Episodes deleted from the old group before re-push; old tier no longer searchable |
+| Tier reclassification (external→team) | Applies on an UNCHANGED re-push too (`content_sha256` covers only body+title): `ingestItem` heals `items.access` + cascades `tasks.audience`, so the Postgres read paths (retrieval, `/api/v1/items`, dashboard `visibleItems`/`visibleTasks`) stop serving the old tier immediately. The graph follows on the next projector tick — the healed `access` yields a new `group_id` → `tierChanged` → episodes deleted from the old group before re-push; old tier no longer searchable. |
 | Deleted source item | `deleteItemEpisodes` best-effort; a chunk the async worker never created is simply not found |
 | Episode 202-accepted but never extracted | Reconcile deletes the never-landed row → next run re-pushes; extraction-health flags `episodes≥25 && facts==0` |
 | Deleted / disabled integration | Pipeline-health suppresses its frozen last-failure; ingested data untouched |

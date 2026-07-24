@@ -175,7 +175,7 @@ export default async function TeamHome({
   }
 
   const [pulse, { data: decisions }, pipelineHealth] = await Promise.all([
-    getPulseMetrics(db, team.id, range, { isAdmin, memberId }),
+    getPulseMetrics(db, team.id, range, { isAdmin, memberId, tier }),
     visibleDecisions(
       db.from("decisions").select("id, title, decided_at, tier, still_valid, source_item_id").eq("team_id", team.id).order("decided_at", { ascending: false }).limit(8),
       tier,

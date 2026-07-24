@@ -2,6 +2,7 @@ import Link from "next/link";
 import { CircleAlert } from "lucide-react";
 import { serverClient } from "@/lib/db/server";
 import { currentMember } from "@/lib/auth/guard";
+import { canAccessAdmin } from "@/lib/auth/admin-access";
 import { listOpportunities } from "@/lib/social/store";
 import { listTeamMediaMeta } from "@/lib/media/store";
 import { imageBudget } from "@/lib/media/generate-image";
@@ -29,9 +30,10 @@ export default async function SocialPage({ params }: { params: Promise<{ team: s
   const { data: team } = await db.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
   if (!team) return null;
 
-  // Operator surface — spends money + posts publicly, so admin-only (matches the nav gate).
+  // Operator surface — spends money + posts publicly, so admin-only (matches the nav gate). Admin AND
+  // team-tier: an external-tier admin must not reach it (no RLS backstop, CLAUDE.md §5).
   const me = await currentMember(team.id);
-  if (!me || me.role !== "admin") {
+  if (!me || !canAccessAdmin(me)) {
     return (
       <div className="prism-card flex max-w-lg flex-col items-start gap-2 p-6">
         <CircleAlert className="size-6 text-violet" strokeWidth={1.5} />
