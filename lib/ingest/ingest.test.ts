@@ -16,7 +16,18 @@ import type { ItemPayload } from "@/lib/api/schemas";
 
 const AUTH = { teamId: "team-1", memberId: "mem-1", apiKeyId: "key-1" };
 
+/**
+ * Every real task producer SERIALIZES the projectable row fields into the body — linear/plane/github
+ * all render `rows` as a markdown table, explicitly "so any change shifts the sha". Since the writer
+ * hashes the body it stores (the change key is server-computed, not client-asserted), a payload whose
+ * rows changed while its body stayed byte-identical is a shape no connector can emit. So derive the
+ * body from `rows` here, keeping these fixtures faithful to the contract; a test that specifically
+ * needs "the body changed elsewhere, rows unchanged" passes an explicit `body`.
+ */
 function payload(over: Partial<ItemPayload> = {}): ItemPayload {
+  const rows = over.rows as unknown[] | undefined;
+  const body =
+    over.body ?? (rows ? `# board\n\n${rows.map((r) => JSON.stringify(r)).join("\n")}\n` : "hello");
   return {
     project: "acme",
     path: "github/o/r/x.md",
@@ -25,8 +36,8 @@ function payload(over: Partial<ItemPayload> = {}): ItemPayload {
     access: "team",
     actor: "github-sync",
     frontmatter: {},
-    body: "hello",
     ...over,
+    body,
   } as ItemPayload;
 }
 
@@ -274,12 +285,13 @@ describe("ingestItem idempotent re-push", () => {
       payload({ kind: "task", path: "b.md", content_sha256: "a".repeat(64), rows }),
       "team"
     );
-    // A different sha (body changed elsewhere) but identical row set re-materializes; row_key is
-    // the diff-sync identity, so re-processing the same rows must not create duplicates.
+    // The body changed elsewhere (a touched header/comment) but the row set is identical, so the
+    // item is "changed" and rows re-materialize; row_key is the diff-sync identity, so re-processing
+    // the same rows must not create duplicates.
     await ingestItem(
       supa,
       AUTH,
-      payload({ kind: "task", path: "b.md", content_sha256: "b".repeat(64), rows }),
+      payload({ kind: "task", path: "b.md", body: "# board (header touched)\n\nsame rows", rows }),
       "team"
     );
     expect(fake.tables.tasks).toHaveLength(2);

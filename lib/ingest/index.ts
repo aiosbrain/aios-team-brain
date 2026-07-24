@@ -1,5 +1,6 @@
 import "server-only";
 
+import { createHash } from "node:crypto";
 import { audit } from "@/lib/api/audit";
 import { decideReattribution } from "@/lib/ingest/reattribution-decision";
 import { recordReassignment, ownerWindowStart } from "@/lib/ingest/reassignment-log";
@@ -22,6 +23,23 @@ export interface IngestResult {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+/**
+ * THE change key: sha256 over the body exactly as we are about to store it. Every producer already
+ * computes `sha256(utf8(body))` (TS normalizers + the Python sidecar's `sha256_hex`), so for a
+ * correct client this equals the wire `content_sha256` and nothing changes.
+ *
+ * It is computed HERE, server-side, because the wire field is untrusted input and dedup integrity is
+ * the contract's own invariant — not something to delegate to every present and future connector. A
+ * client that hashes a slightly different normalization (CRLF, NFC/NFD) would otherwise mark every
+ * push "changed" (endless version/embed/projection churn); worse, a client that repeats a STALE sha
+ * while the body changed would hit the unchanged fast-path and the stored body would silently never
+ * update — permanently stale content served to retrieval with no error anywhere. Hashing the body we
+ * hold makes both impossible by construction.
+ */
+export function contentHash(body: string): string {
+  return createHash("sha256").update(body, "utf8").digest("hex");
 }
 
 function canonicalJson(value: unknown): string {
@@ -75,6 +93,12 @@ export async function ingestItem(
     );
   }
   const payload = parsedPayload.data;
+  // Authoritative change key (see contentHash). The wire `content_sha256` is advisory from here on:
+  // a mismatch means the pushing client hashes something other than the body it sent, which we record
+  // on the item's audit row (below) so a buggy connector is diagnosable instead of silently corrupting
+  // dedup. It is NOT rejected — the body is the source of truth and we can always hash it correctly.
+  const contentSha = contentHash(payload.body);
+  const shaMismatch = contentSha !== payload.content_sha256;
   const now = new Date().toISOString();
   const { data: project, error: projectError } = await db
     .from("projects")
@@ -100,13 +124,13 @@ export async function ingestItem(
     .eq("path", payload.path)
     .maybeSingle();
 
-  if (existing && existing.content_sha256 === payload.content_sha256) {
+  if (existing && existing.content_sha256 === contentSha) {
     // Refresh "last seen this sync"; do NOT write an audit row (audit M4). Every 30-min sync tick
     // re-pushes every unchanged item, so an `item.unchanged` audit here added ~one row/item/tick
     // (~24k/day at 500 items) — unbounded audit_log growth with no diagnostic value. The synced_at
     // bump is the freshness signal; create/update/delete stay audited on the paths below.
     //
-    // RE-ATTRIBUTE on an unchanged re-push: `content_sha256` covers only body+title, so an author signal
+    // RE-ATTRIBUTE on an unchanged re-push: `content_sha256` covers only the body, so an author signal
     // that changed in FRONTMATTER without touching the prose would otherwise be discarded here. Two cases,
     // both decided by `decideReattribution` (which leans on the `member_id_locked` guard, #333):
     //   • null → member: a resolved author that arrived AFTER first ingest (a source that only later
@@ -132,7 +156,7 @@ export async function ingestItem(
       locked
     );
     if (reattr.memberId) patch.member_id = reattr.memberId;
-    // HEAL ACCESS on an unchanged re-push: `content_sha256` covers only body+title, so a source that
+    // HEAL ACCESS on an unchanged re-push: `content_sha256` covers only the body, so a source that
     // RECLASSIFIES an item's tier without touching its prose (a doc shared narrower/wider upstream)
     // would otherwise keep the first-ingest `access` forever. With no RLS backstop (CLAUDE.md §5) a
     // stale `access='external'` on a now-internal item silently keeps serving the body to an external
@@ -288,7 +312,7 @@ export async function ingestItem(
 
   const { error: versionError } = await db.from("item_versions").insert({
     item_id: itemId,
-    content_sha256: payload.content_sha256,
+    content_sha256: contentSha,
     frontmatter: payload.frontmatter,
     body: payload.body,
     member_id: opts ? opts.authorMemberId : auth.memberId,
@@ -341,7 +365,7 @@ export async function ingestItem(
 
   const { error: shaError } = await db
     .from("items")
-    .update({ content_sha256: payload.content_sha256 })
+    .update({ content_sha256: contentSha })
     .eq("id", itemId);
   if (shaError) throw new Error(`item sha commit failed: ${shaError.message}`);
 
@@ -358,6 +382,10 @@ export async function ingestItem(
       kind: payload.kind,
       access,
       rows: payload.rows?.length ?? 0,
+      // Only present when the pusher's `content_sha256` disagreed with the body it sent — a client
+      // bug worth chasing. Recorded on the EXISTING create/update audit row (never its own row, and
+      // never on the unchanged fast-path) so a systematically-wrong connector can't grow audit_log.
+      ...(shaMismatch ? { sha_mismatch: true, client_sha: payload.content_sha256 } : {}),
     },
   });
 
