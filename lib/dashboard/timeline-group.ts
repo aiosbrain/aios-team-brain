@@ -40,6 +40,9 @@ export interface EvidenceItem {
 
 export interface EvidenceWithMember extends EvidenceItem {
   memberId: string;
+  /** How this evidence got its task: the item's OWN cited issue key, or inherited from the PR that merged
+   *  it (`work_events`). Provenance so an inherited (lower-precision) link is diagnosable. */
+  linkVia?: "commit-text" | "pr";
   /** The active task this evidence references (via issue key), if any. Unlinked → the "Other" bucket. */
   taskId?: string | null;
 }

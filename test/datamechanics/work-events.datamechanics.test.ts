@@ -220,3 +220,75 @@ describe("work events (real Postgres)", () => {
     );
   });
 });
+
+describe("work events — the project-scope fix (LINK-ONLY, no Linear write-back)", () => {
+  /** Create a task in an EXPLICIT project (mirrors how Linear issues land in `linear-<teamKey>`). */
+  async function taskInProject(seed: { teamId: string }, projectSlug: string, rowKey: string, title = "mirrored issue") {
+    const { data: proj } = await db()
+      .from("projects")
+      .upsert({ team_id: seed.teamId, slug: projectSlug }, { onConflict: "team_id,slug" })
+      .select("id")
+      .single();
+    const projectId = (proj as { id: string }).id;
+    const { data: task, error } = await db()
+      .from("tasks")
+      .insert({ team_id: seed.teamId, project_id: projectId, row_key: rowKey, title, status: "in_progress", origin: "sync", audience: "team" })
+      .select("id")
+      .single();
+    if (error) throw new Error(`task insert failed: ${error.message}`);
+    return (task as { id: string }).id;
+  }
+
+  const prPayload = (over: Record<string, unknown> = {}) => ({
+    project: "the-repo", // the REPO's project — deliberately NOT where the mirrored task lives
+    event_kind: "merged" as const,
+    repo: "aiosbrain/aios-team-brain",
+    merged_sha: "deadbeef00112233445566778899aabbccddeeff",
+    pr_url: "https://example.test/pr/9",
+    pr_title: "fix: something (AIO-494)",
+    pr_body: "",
+    branch: "",
+    work_keys: ["AIO-494"],
+    actor: "alex",
+    ...over,
+  });
+
+  it("THE FIX: resolves a task in a DIFFERENT project — status `linked`, task NOT completed", async () => {
+    const seed = await seedTeam();
+    const taskId = await taskInProject(seed, "linear-aio", "AIO-494");
+    // The repo's project must exist so the pushed-project lookup is a real (missing) match, not a null.
+    await db().from("projects").upsert({ team_id: seed.teamId, slug: "the-repo" }, { onConflict: "team_id,slug" });
+
+    const res = await ingestWorkEvent(
+      db(),
+      { teamId: seed.teamId, memberId: seed.memberId, apiKeyId: "api-key" },
+      prPayload(),
+      { syncPm: false }
+    );
+
+    // Linked (the bug fix), NOT applied.
+    expect(res.linked).toEqual([{ row_key: "AIO-494", task_id: taskId }]);
+    expect(res.applied).toEqual([]);
+    const { data: ev } = await db().from("work_events").select("status, task_id").eq("team_id", seed.teamId).maybeSingle();
+    expect(ev).toMatchObject({ status: "linked", task_id: taskId });
+
+    // THE BLAST-RADIUS GUARANTEE: the task must NOT be completed (a completion here would also trigger the
+    // Linear write-back that can duplicate issues). This assertion is what stops a refactor re-arming it.
+    expect(await taskStatus("AIO-494")).toBe("in_progress");
+  });
+
+  it("does NOT team-wide-match a junk key (V1) — project scope keeps precision", async () => {
+    const seed = await seedTeam();
+    await taskInProject(seed, "linear-aio", "V1", "a slug-keyed row");
+    await db().from("projects").upsert({ team_id: seed.teamId, slug: "the-repo" }, { onConflict: "team_id,slug" });
+
+    const res = await ingestWorkEvent(
+      db(),
+      { teamId: seed.teamId, memberId: seed.memberId, apiKeyId: "api-key" },
+      prPayload({ work_keys: ["V1"], merged_sha: "1111111111222222222233333333334444444444" }),
+      { syncPm: false }
+    );
+    expect(res.linked).toEqual([]);
+    expect(res.unresolved).toEqual([{ row_key: "V1" }]);
+  });
+});
