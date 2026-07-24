@@ -4,6 +4,8 @@ import type { DbClient } from "@/lib/db/types";
 import type { ProviderKeys } from "@/lib/query/claude";
 import { selectLlmBackend } from "@/lib/query/llm-backend";
 import { setTitle } from "@/lib/chat/store";
+import { recordLlmUsage, type LlmMeterCtx } from "@/lib/costs/llm-usage";
+import { estimateAnthropicCostUsd } from "@/lib/llm/cost";
 
 /**
  * Background conversation-title generator. After a conversation's first exchange we replace the
@@ -34,7 +36,8 @@ export function cleanTitle(raw: string, max = 60): string {
 export async function generateTitle(
   question: string,
   answer: string,
-  keys: ProviderKeys = {}
+  keys: ProviderKeys = {},
+  meter?: LlmMeterCtx
 ): Promise<string | null> {
   const prompt = `Question: ${question.trim()}\n\nAnswer: ${answer.trim().slice(0, 600)}\n\nTitle:`;
   try {
@@ -52,6 +55,8 @@ export async function generateTitle(
         body: JSON.stringify({
           model: backend.model,
           max_tokens: 24,
+          // Ask OpenRouter for the real cost so even the cheap title call is metered into llm_usage.
+          ...(backend.kind === "openrouter" ? { usage: { include: true } } : {}),
           messages: [
             { role: "system", content: TITLE_SYSTEM },
             { role: "user", content: prompt },
@@ -60,7 +65,25 @@ export async function generateTitle(
         signal: AbortSignal.timeout(6000), // never hold the response open on a slow title call
       });
       if (!res.ok) return null;
-      const j = (await res.json()) as { choices?: { message?: { content?: string } }[] };
+      const j = (await res.json()) as {
+        choices?: { message?: { content?: string } }[];
+        usage?: { prompt_tokens?: number; completion_tokens?: number; cost?: number };
+      };
+      if (meter) {
+        await recordLlmUsage(meter.db, {
+          teamId: meter.teamId,
+          memberId: meter.memberId ?? null,
+          source: "chat-title",
+          provider: backend.provider,
+          model: backend.model,
+          inputTokens: j.usage?.prompt_tokens ?? 0,
+          outputTokens: j.usage?.completion_tokens ?? 0,
+          costUsd: typeof j.usage?.cost === "number" ? j.usage.cost : 0,
+          // OpenRouter cost is metered; a paid OpenAI-cloud backend gives no cost → flag not-authoritative
+          // (a bare local endpoint is genuinely free, so it stays metered $0).
+          estimated: typeof j.usage?.cost !== "number" && backend.provider !== "local",
+        });
+      }
       return cleanTitle(j.choices?.[0]?.message?.content ?? "") || null;
     }
     const client = new Anthropic(keys.anthropicKey ? { apiKey: keys.anthropicKey } : undefined);
@@ -73,6 +96,21 @@ export async function generateTitle(
       },
       { timeout: 6000, maxRetries: 0 }
     );
+    if (meter) {
+      const inTok = msg.usage?.input_tokens ?? 0;
+      const outTok = msg.usage?.output_tokens ?? 0;
+      await recordLlmUsage(meter.db, {
+        teamId: meter.teamId,
+        memberId: meter.memberId ?? null,
+        source: "chat-title",
+        provider: backend.provider,
+        model: backend.model,
+        inputTokens: inTok,
+        outputTokens: outTok,
+        costUsd: estimateAnthropicCostUsd(inTok, outTok),
+        estimated: true,
+      });
+    }
     const text = msg.content.map((b) => (b.type === "text" ? b.text : "")).join("");
     return cleanTitle(text) || null;
   } catch {
@@ -90,7 +128,11 @@ export async function generateAndSetTitle(
   keys: ProviderKeys = {}
 ): Promise<void> {
   try {
-    const title = await generateTitle(question, answer, keys);
+    const title = await generateTitle(question, answer, keys, {
+      db,
+      teamId: owner.teamId,
+      memberId: owner.memberId,
+    });
     if (title) await setTitle(db, owner, conversationId, title);
   } catch {
     // keep the derived title

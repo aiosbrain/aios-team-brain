@@ -16,6 +16,8 @@ import { getPipelineHealth } from "@/lib/ingest/pipeline-health";
 import { PipelineHealthBanner } from "@/components/admin/pipeline-health-banner";
 import { describeAnswering, describeReasoning } from "@/lib/query/llm-backend";
 import { normalizeAnsweringProvider } from "@/lib/query/answering";
+import { describeEmbedding, normalizeEmbeddingProvider } from "@/lib/query/embeddings-backend";
+import { normalizeMeetingTaskStatus } from "@/lib/meetings/target-status";
 
 export const metadata: Metadata = { title: "Integrations" };
 
@@ -35,7 +37,9 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ t
   const user = await getSessionUser();
   const { data: team } = await sessionDb
     .from("teams")
-    .select("id, primary_pm_provider, answering_provider, reasoning_model, reasoning_provider")
+    .select(
+      "id, primary_pm_provider, answering_provider, reasoning_model, reasoning_provider, embedding_provider, embedding_model, meeting_task_status"
+    )
     .eq("slug", teamSlug)
     .maybeSingle();
   if (!team) return null;
@@ -68,8 +72,12 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ t
   // checks presence). LLM_BASE_URL comes from the server env (the self-hosted "local" backend).
   const modelOf = (type: "anthropic" | "openai" | "openrouter") =>
     (integrations.find((i) => i.type === type)?.config.model as string | undefined) ?? null;
-  const hasKey = (type: "anthropic" | "openai" | "openrouter") =>
-    !!integrations.find((i) => i.type === type)?.hasSecret;
+  // A provider key is usable only when it's stored AND enabled — getProviderKey (and thus the resolvers)
+  // filter status='enabled', so the indicators must too, else the "Effective" line claims a disabled key.
+  const hasKey = (type: "anthropic" | "openai" | "openrouter") => {
+    const i = integrations.find((r) => r.type === type);
+    return !!i?.hasSecret && i.status === "enabled";
+  };
   const answeringProvider = normalizeAnsweringProvider(team.answering_provider);
   const reasoningProvider = normalizeAnsweringProvider(team.reasoning_provider);
   const reasoningModel = (team.reasoning_model as string | null) ?? null;
@@ -96,6 +104,21 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ t
     openrouter: modelOf("openrouter"),
   };
   const localConfigured = !!localBaseUrl;
+
+  // Embeddings model state: the team's pick (teams.embedding_provider/model) resolved against provider
+  // keys (presence sentinels) + the env EMBEDDINGS_URL self-host tier — so the picker shows exactly what
+  // the semantic index is embedding with, and whether a pick fell back (key missing → env/off).
+  const embeddingProviderPick = normalizeEmbeddingProvider(team.embedding_provider);
+  const embedding = describeEmbedding({
+    openaiKey: hasKey("openai") ? "set" : null,
+    openrouterKey: hasKey("openrouter") ? "set" : null,
+    activeProvider: embeddingProviderPick,
+    model: (team.embedding_model as string | null) ?? null,
+    envUrl: process.env.EMBEDDINGS_URL ?? null,
+    envModel: process.env.EMBEDDINGS_MODEL ?? null,
+    envKey: "set",
+  });
+
   const scannedRepos = Array.from(
     new Set(freshness.map((c) => c.full_name).filter((n): n is string => !!n))
   );
@@ -139,6 +162,7 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ t
         teamSlug={teamSlug}
         integrations={integrations}
         primaryPmProvider={(team.primary_pm_provider as "plane" | "linear" | null) ?? null}
+        meetingTaskStatus={normalizeMeetingTaskStatus(team.meeting_task_status)}
         answering={{
           provider: answeringProvider,
           models: answeringModels,
@@ -154,6 +178,14 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ t
             effective: reasoning.enabled ? { provider: reasoning.provider, model: reasoning.model } : null,
             usedFallback: reasoning.usedFallback,
           },
+        }}
+        embedding={{
+          provider: embeddingProviderPick,
+          model: (team.embedding_model as string | null) ?? null,
+          effective: embedding.configured ? { provider: embedding.provider!, model: embedding.model } : null,
+          usedFallback: embedding.usedFallback,
+          openaiConfigured: hasKey("openai"),
+          openrouterConfigured: hasKey("openrouter"),
         }}
       />
       <MemberOnboardingPanel teamSlug={teamSlug} values={onboardingValues} />

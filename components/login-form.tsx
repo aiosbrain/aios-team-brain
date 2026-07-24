@@ -81,7 +81,7 @@ export function LoginForm({ next, magicLinkAvailable }: { next?: string; magicLi
         <Mail className="size-8 text-violet" strokeWidth={1.5} />
         <p className="text-sm font-medium text-ink">Check your email</p>
         <p className="text-sm text-ink-secondary">
-          If <span className="text-ink">{email}</span> belongs to a member, we&apos;ve sent a single-use
+          If <span className="text-ink">{email}</span>{" "}belongs to a member, we&apos;ve sent a single-use
           sign-in link that expires in 15 minutes. Double-check the address if it doesn&apos;t arrive.
         </p>
       </div>

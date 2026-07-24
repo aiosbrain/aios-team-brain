@@ -405,6 +405,46 @@ export type ProviderIntegrationType = (typeof PROVIDER_INTEGRATION_TYPES)[number
 export type IntegrationType = (typeof INTEGRATION_TYPES)[number];
 export const INTEGRATION_STATUSES = ["enabled", "disabled"] as const;
 
+/**
+ * Embeddings-provider config for the per-team "Embeddings model" Admin picker.
+ *
+ * ONLY openai + openrouter: the semantic index column is `item_chunks.embedding vector(1536)`
+ * (fixed at load time), so the model MUST emit 1536 dims. Both providers serve OpenAI's
+ * `text-embedding-3-small` (1536) over an OpenAI-compatible `/embeddings` endpoint. Anthropic has no
+ * embeddings API; Google's are 768-dim — either would need a column rebuild + full re-index. The
+ * curated list is a SINGLE model per provider so the UI can never introduce a second vector space
+ * (see `canonicalEmbeddingModel` + the save-time space check in setEmbeddingModel).
+ */
+export const EMBEDDING_PROVIDER_TYPES = ["openai", "openrouter"] as const;
+export type EmbeddingProvider = (typeof EMBEDDING_PROVIDER_TYPES)[number];
+
+/** The vector dimension the `item_chunks` column is built at — every curated model must match it. */
+export const EMBEDDING_DIM = 1536;
+
+/** Curated 1536-dim models per provider (label shown in the picker). Widening this needs a re-index flow. */
+export const EMBEDDING_MODELS: Record<EmbeddingProvider, { model: string; label: string }[]> = {
+  openai: [{ model: "text-embedding-3-small", label: "text-embedding-3-small (1536d)" }],
+  openrouter: [{ model: "openai/text-embedding-3-small", label: "openai/text-embedding-3-small (1536d)" }],
+};
+
+/**
+ * Canonical vector-SPACE identity for an embedding model slug — provider prefix stripped, lowercased.
+ * `openai/text-embedding-3-small` and `text-embedding-3-small` are the SAME underlying model → same
+ * space → interchangeable with no re-embed. A different model (e.g. `text-embedding-ada-002`) is a
+ * different space even at the same 1536 dims, so switching to it silently corrupts a 3-small index —
+ * the save-time check compares canonical spaces to block exactly that. Pure + unit-tested.
+ */
+export function canonicalEmbeddingModel(model: string): string {
+  const slug = (model ?? "").trim().toLowerCase();
+  const slash = slug.lastIndexOf("/");
+  return slash >= 0 ? slug.slice(slash + 1) : slug;
+}
+
+/** Is `model` an allowed 1536-dim model for `provider`? (Save-time corruption guard.) */
+export function isCuratedEmbeddingModel(provider: EmbeddingProvider, model: string): boolean {
+  return EMBEDDING_MODELS[provider].some((m) => m.model === model);
+}
+
 /** Per-type NON-SECRET config allowlists. `.strict()` rejects any key not listed. */
 const integrationConfigSchemas: Record<IntegrationType, z.ZodType> = {
   github: z

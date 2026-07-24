@@ -37,6 +37,9 @@ export function startIngestScheduler(): void {
     // notes, so CLI-pushed meetings show up on the Meetings page automatically. Idempotent + cheap
     // when nothing new (finds 0 candidates → returns); best-effort, never fails the tick.
     await runMeetingNotesBackfill(db);
+    // Recompute the persisted task↔evidence links (which items are the work behind each task) so
+    // surfaces beyond the timeline (Query/CLI) can read them. Best-effort, per team; cheap when quiet.
+    await runTaskEvidenceLinking(db);
     // Incremental dense (semantic) indexing of newly-synced items. No-op unless dense retrieval is
     // configured (EMBEDDINGS_URL + pgvector schema); best-effort — never fails the tick. A batch where
     // items were SCANNED but all FAILED (e.g. embeddings quota/outage) records an ERROR run so the
@@ -225,7 +228,7 @@ export function startIngestScheduler(): void {
             trigger: "scheduler",
             ok: true,
             created: s.created ?? 0,
-            meta: { scanned: s.scanned ?? 0 },
+            meta: { scanned: s.scanned ?? 0, merged: s.merged ?? 0 },
             startedAt,
           });
         } catch (err) {
@@ -242,6 +245,21 @@ export function startIngestScheduler(): void {
       }
     } catch (err) {
       console.error("[ingest] meeting-notes backfill tick failed:", err instanceof Error ? err.message : err);
+    }
+  }
+
+  // Persist deterministic task↔evidence links per team (issue-key references in item text). A
+  // regenerable cache like arc_cache — not recorded to ingest_runs (not a monitored leg). Best-effort.
+  async function runTaskEvidenceLinking(db: ReturnType<typeof adminClient>): Promise<void> {
+    try {
+      const { linkTaskEvidence } = await import("@/lib/dashboard/timeline-evidence");
+      const { data: teams } = await db.from("teams").select("id");
+      for (const t of ((teams ?? []) as { id: string }[])) {
+        const r = await linkTaskEvidence(db, t.id); // best-effort; never throws
+        if (r.linked) console.info(`[ingest] task-evidence: linked ${r.linked} for team ${t.id}`);
+      }
+    } catch (err) {
+      console.error("[ingest] task-evidence linking tick failed:", err instanceof Error ? err.message : err);
     }
   }
 

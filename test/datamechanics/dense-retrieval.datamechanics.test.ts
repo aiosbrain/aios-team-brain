@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createServer, type Server } from "node:http";
 import { retrieve } from "@/lib/query/retrieve";
 import { indexItem, indexPendingItems, resetDenseIndexProbe } from "@/lib/query/dense-index";
+import { resolveEmbeddingBackend } from "@/lib/query/embedding-key";
 import { db, ingest, seedTeam } from "./helpers";
 
 /**
@@ -109,8 +110,9 @@ live("dense retrieval (real pgvector + stub embeddings)", () => {
       .from("items")
       .select("id, team_id, body, access, content_sha256")
       .eq("team_id", seed.teamId);
+    const backend = await resolveEmbeddingBackend(seed.teamId);
     for (const it of (items ?? []) as Array<{ id: string; team_id: string; body: string; access: "team" | "external"; content_sha256: string }>) {
-      await indexItem({ id: it.id, teamId: it.team_id, body: it.body, access: it.access, contentSha256: it.content_sha256 });
+      await indexItem({ id: it.id, teamId: it.team_id, body: it.body, access: it.access, contentSha256: it.content_sha256 }, backend!);
     }
     const ctx = await retrieve(db(), seed.teamId, "external", "authentication credentials");
     expect(ctx.sources.map((s) => s.path)).not.toContain("deliverables/secret-auth.md");

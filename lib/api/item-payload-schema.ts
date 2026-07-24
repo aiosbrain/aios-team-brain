@@ -13,6 +13,15 @@ export const taskRowSchema = z.strictObject({
   pm_provider: z.enum(["plane", "linear"]).nullable().optional(),
   pm_external_id: z.string().max(200).nullable().optional(),
   pm_url: z.string().max(500).nullable().optional(),
+  // Provider work-signal time (the task's last STATE-TRANSITION timestamp; Linear
+  // startedAt/completedAt/canceledAt, falling back to updatedAt). Brain-INTERNAL: the mirror
+  // importers (lib/ingest/sources/{linear,plane}-normalize) build `task` payloads carrying it and
+  // re-enter through this same strict parser, so it must be accepted here. It is deliberately NOT in
+  // the published wire schema (item-payload-1.12.schema.json, additionalProperties:false) — the
+  // workspace CLI does not send it yet, so the Zod parser is a superset of the wire contract for the
+  // task kind. Absent key ⇒ preserve the stored value (partial-write, like assignee/parent);
+  // materialized into tasks.worked_at as the timeline "did work on it" signal.
+  worked_at: z.string().max(64).nullable().optional(),
 });
 
 export const decisionRowSchema = z.strictObject({

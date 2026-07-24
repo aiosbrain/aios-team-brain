@@ -5,7 +5,7 @@ import { z } from "zod";
 
 import { serverClient } from "@/lib/db/server";
 import { adminClient } from "@/lib/db/admin";
-import { currentMember, requireTeamAdmin } from "@/lib/auth/guard";
+import { currentMember } from "@/lib/auth/guard";
 import { resolveAnsweringKeys } from "@/lib/query/answering";
 import {
   createMeetingNote,
@@ -17,7 +17,8 @@ import {
 import { extractFromTranscript, type RosterPerson } from "@/lib/meetings/llm-extract";
 import { extractAndStoreActionItems } from "@/lib/meetings/action-items";
 import { MEETING_TODO_PROJECT_SLUG } from "@/lib/meetings/extract-todos";
-import { findDuplicateMeeting, mergeIntoMeetingNote, backfillMergeDuplicateMeetings } from "@/lib/meetings/merge";
+import { MEETING_TASK_STATUSES, type MeetingTaskStatus } from "@/lib/meetings/target-status";
+import { findDuplicateMeeting, mergeIntoMeetingNote } from "@/lib/meetings/merge";
 import { backfillMeetingNotesFromItems } from "@/lib/meetings/from-items";
 import {
   projectRows,
@@ -73,7 +74,11 @@ export async function uploadMeetingNoteAction(
     displayName: m.display_name,
   }));
 
-  const extraction = await extractFromTranscript(parsed.data.rawText, roster, keys);
+  const extraction = await extractFromTranscript(parsed.data.rawText, roster, keys, undefined, {
+    db: admin,
+    teamId: team.id,
+    memberId: me.id,
+  });
 
   // Duplicate detection: if this is the same meeting someone already uploaded (same date + enough
   // content overlap), merge the transcripts into that note and credit both submitters instead of
@@ -135,26 +140,8 @@ export async function uploadMeetingNoteAction(
   return { ok: true, id: noteId };
 }
 
-/**
- * One-time cleanup: merge already-created duplicate meetings (same date + overlapping transcripts)
- * into one note each, crediting all submitters and hiding the folded-away copies. Admin-only (it's a
- * bulk, content-mutating operation). Uses the same LLM merge as the live upload path.
- */
-export async function mergeDuplicateMeetingsAction(
-  teamSlug: string
-): Promise<{ ok: boolean; merged?: number; clusters?: number; error?: string }> {
-  const ctx = await requireTeamAdmin(teamSlug);
-  if (!ctx) return { ok: false, error: "admins only" };
-  const admin = adminClient();
-  const keys = await resolveAnsweringKeys(admin, ctx.teamId);
-  try {
-    const s = await backfillMergeDuplicateMeetings(admin, ctx.teamId, { keys, actorMemberId: ctx.memberId });
-    revalidatePath(`/t/${teamSlug}/meetings`);
-    return { ok: true, merged: s.merged, clusters: s.clusters };
-  } catch (e) {
-    return { ok: false, error: e instanceof Error ? e.message : "merge failed" };
-  }
-}
+// NOTE: the manual "Merge duplicates" action/button was removed — duplicate-meeting merge now runs
+// automatically on ingest (lib/meetings/from-items.backfillMeetingNotesFromItems → backfillMergeDuplicateMeetings).
 
 /**
  * Import meetings that arrived via the CLI/ingest (`aios push`) into the Meetings page. Scans this
@@ -187,6 +174,11 @@ export async function importPushedMeetingsAction(
  * pass with a markdown-scanner fallback — see lib/meetings/action-items). On-demand because the
  * CLI/ingest import path (`aios push`) never extracted todos, so a pushed meeting shows none until
  * this runs. Idempotent (tasks upsert on a stable row_key), team-tier only.
+ *
+ * NOTE: no UI caller after the meeting-detail action-items section was removed — retained (exercised
+ * by `test/datamechanics/meeting-tasks-push`, and the natural per-meeting re-extract if it's ever
+ * re-surfaced). The active extraction UI is **Tasks → Extract** (`scanMeetingTodosAction` /
+ * `createMeetingTodosAction` in `app/actions/meeting-todos.ts`).
  */
 export async function extractMeetingActionItemsAction(
   teamSlug: string,
@@ -242,7 +234,11 @@ export async function extractMeetingActionItemsAction(
       itemRow,
       note.rawText,
       roster,
-      keys
+      keys,
+      undefined,
+      undefined,
+      // Deliberate re-extract: reconcile this transcript's todos (prune stale, un-pushed ones).
+      { reconcile: true }
     );
     // Revalidate so a later navigation shows fresh data, AND return the freshly-stored items so the
     // client can render them in place — no router.refresh() / full-route reload on the current view.
@@ -283,7 +279,11 @@ export async function regenerateMeetingSummaryAction(
     displayName: m.display_name,
   }));
 
-  const ex = await extractFromTranscript(note.rawText, roster, keys);
+  const ex = await extractFromTranscript(note.rawText, roster, keys, undefined, {
+    db: admin,
+    teamId: team.id,
+    memberId: me.id,
+  });
   if (!ex.summary.trim()) {
     // The model may be unreachable OR may have answered in a shape we couldn't read — don't assert
     // "unavailable" (misleading: it often IS available; see normalizeSummaryField). Server logs carry
@@ -312,11 +312,17 @@ export interface PushTaskResult {
  * the shared projection engine (brain-wins; creates/updates the provider work item and records the
  * task_pm_links row). Only tasks in the "Extracted from Meetings" project that belong to THIS note's
  * transcript are eligible — the ids are re-validated server-side, never trusted from the client.
+ *
+ * NOTE: no UI caller after the meeting-detail action-items section was removed — retained (exercised
+ * by `test/datamechanics/meeting-tasks-push`). The active push-to-PM UI is **Tasks → Extract**
+ * (`createMeetingTodosAction` → `projectAllTasks`, `app/actions/meeting-todos.ts`).
  */
 export async function pushMeetingTasksAction(
   teamSlug: string,
   noteId: string,
-  taskIds: string[]
+  taskIds: string[],
+  // Optional per-meeting override of the target category (else each task's current status is used).
+  targetStatus?: MeetingTaskStatus
 ): Promise<{ ok: boolean; error?: string; provider?: string; results?: PushTaskResult[] }> {
   const team = await resolveTeam(teamSlug);
   if (!team) return { ok: false, error: "team not found" };
@@ -360,13 +366,22 @@ export async function pushMeetingTasksAction(
   })[]).filter((t) => t.source_item_id === sourceItemId && t.projects?.slug === MEETING_TODO_PROJECT_SLUG && t.row_key);
   if (!eligible.length) return { ok: false, provider: primary.provider, error: "no eligible tasks to push" };
 
+  // Per-meeting category override: persist the chosen status on the tasks (so the brain + a later
+  // status re-sync stay consistent) and project with it. Falls through to each task's current status.
+  const applied = (MEETING_TASK_STATUSES as readonly string[]).includes(targetStatus ?? "")
+    ? (targetStatus as MeetingTaskStatus)
+    : null;
+  if (applied) {
+    await admin.from("tasks").update({ status: applied }).eq("team_id", team.id).in("id", eligible.map((t) => t.id));
+  }
+
   const rows: ProjectionTaskRow[] = eligible.map((t) => ({
     id: t.id,
     team_id: t.team_id,
     project_id: t.project_id,
     row_key: t.row_key,
     title: t.title,
-    status: t.status,
+    status: applied ?? t.status,
     sprint: t.sprint,
     priority: t.priority,
     labels: t.labels,

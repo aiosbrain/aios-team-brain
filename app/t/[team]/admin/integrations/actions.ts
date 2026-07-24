@@ -23,7 +23,16 @@ import { saveProvisioningSettings as saveProvisioningSettings_ } from "@/lib/pro
 import { validateGithubToken, checkRepoAccess, type RepoAccess } from "@/lib/integrations/github-validate";
 import { RepoFormatError } from "@/lib/integrations/github-repos";
 import { validateOpenrouterKey, saveOpenrouterSettings } from "@/lib/integrations/openrouter";
-import { IntegrationConfigError, type IntegrationType } from "@/lib/api/schemas";
+import { MEETING_TASK_STATUSES, type MeetingTaskStatus } from "@/lib/meetings/target-status";
+import { setMeetingTaskStatus as setMeetingTaskStatusDb } from "@/lib/meetings/target-status-db";
+import {
+  IntegrationConfigError,
+  type IntegrationType,
+  EMBEDDING_PROVIDER_TYPES,
+  isCuratedEmbeddingModel,
+  canonicalEmbeddingModel,
+  type EmbeddingProvider,
+} from "@/lib/api/schemas";
 import { buildConfig, toList } from "@/lib/integrations/build-config";
 import { audit } from "@/lib/api/audit";
 
@@ -478,6 +487,64 @@ export async function setReasoningModel(
   return { ok: true };
 }
 
+/**
+ * Set the EMBEDDINGS role as a PROVIDER + MODEL pair (admins only; audited). Both live on `teams`:
+ * `embedding_provider` + `embedding_model`. A null provider clears BOTH → the semantic index falls
+ * back to env `EMBEDDINGS_URL` (self-host) or off. Only openai/openrouter, and only curated 1536-dim
+ * models (the `item_chunks.embedding vector(1536)` column is fixed), so the picker can't corrupt the
+ * index. A save-time vector-SPACE guard additionally refuses a model whose canonical space differs
+ * from the index's existing baseline (env `EMBEDDINGS_MODEL`), since mixing spaces silently degrades
+ * search and the sha-based dedup would make it permanent — switching that needs a re-index (future).
+ */
+export async function setEmbeddingModel(
+  teamSlug: string,
+  provider: EmbeddingProvider | null,
+  model: string
+): Promise<{ ok: boolean; error?: string }> {
+  const ctx = await requireAdmin(teamSlug);
+  if (!ctx) return { ok: false, error: "admins only" };
+  const allowed: (EmbeddingProvider | null)[] = [null, ...EMBEDDING_PROVIDER_TYPES];
+  if (!allowed.includes(provider)) return { ok: false, error: "invalid provider" };
+
+  let embeddingProvider: EmbeddingProvider | null = null;
+  let embeddingModel: string | null = null;
+  if (provider) {
+    const picked = model.trim();
+    // Dimension guard: only curated 1536-dim models are storable (bypass-proof, not just UI).
+    if (!isCuratedEmbeddingModel(provider, picked)) {
+      return { ok: false, error: "unsupported embedding model — only 1536-dim models are allowed" };
+    }
+    // Vector-space guard: refuse a model in a different space than the existing index baseline.
+    const baseline = canonicalEmbeddingModel(process.env.EMBEDDINGS_MODEL || "text-embedding-3-small");
+    if (process.env.EMBEDDINGS_URL && canonicalEmbeddingModel(picked) !== baseline) {
+      return {
+        ok: false,
+        error: `the semantic index was built with "${baseline}"; switching the embedding space needs a re-index (not yet supported)`,
+      };
+    }
+    embeddingProvider = provider;
+    embeddingModel = picked;
+  }
+
+  const db = adminClient();
+  const { error } = await db
+    .from("teams")
+    .update({ embedding_provider: embeddingProvider, embedding_model: embeddingModel })
+    .eq("id", ctx.teamId);
+  if (error) return { ok: false, error: error.message };
+  await audit(db, {
+    team_id: ctx.teamId,
+    actor_kind: "member",
+    member_id: ctx.memberId,
+    action: "team.embedding_provider_set",
+    target_type: "team",
+    target_id: ctx.teamId,
+    meta: { provider: embeddingProvider, model: embeddingModel },
+  });
+  revalidatePath(`/t/${teamSlug}/admin/integrations`);
+  return { ok: true };
+}
+
 export async function removeIntegration(
   teamSlug: string,
   id: string
@@ -498,6 +565,38 @@ export async function removeIntegration(
  * Pass `null` to clear it. The projection engine reads `teams.primary_pm_provider`; with it unset it
  * no-ops (or falls back to the sole enabled PM integration).
  */
+/**
+ * Set the category extracted MEETING action items land in when pushed to the PM tool (admins only).
+ * A brain task status (backlog/ready/in_progress/done) mapped to the provider's state group on push.
+ */
+export async function setMeetingTaskStatus(
+  teamSlug: string,
+  status: MeetingTaskStatus
+): Promise<{ ok: boolean; error?: string }> {
+  const ctx = await requireAdmin(teamSlug);
+  if (!ctx) return { ok: false, error: "admins only" };
+  if (!(MEETING_TASK_STATUSES as readonly string[]).includes(status)) {
+    return { ok: false, error: "invalid category" };
+  }
+  const db = adminClient();
+  try {
+    await setMeetingTaskStatusDb(db, ctx.teamId, status);
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "could not save" };
+  }
+  await audit(db, {
+    team_id: ctx.teamId,
+    actor_kind: "member",
+    member_id: ctx.memberId,
+    action: "team.meeting_task_status_set",
+    target_type: "team",
+    target_id: ctx.teamId,
+    meta: { status },
+  });
+  revalidatePath(`/t/${teamSlug}/admin/integrations`);
+  return { ok: true };
+}
+
 export async function setPrimaryPmProvider(
   teamSlug: string,
   provider: PrimaryPmProvider

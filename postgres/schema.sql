@@ -129,6 +129,17 @@ create table if not exists teams (
   -- Optional distinct PROVIDER for the reasoning model. Null = reuse the answering provider; set =
   -- reasoning runs on its own backend (answer on one provider, reason on another).
   reasoning_provider text check (reasoning_provider in ('anthropic', 'openai', 'openrouter', 'local')),
+  -- Explicit embeddings-backend override for the semantic index. Null = auto (env EMBEDDINGS_URL for
+  -- self-host, else dense off). Constrained to the providers that serve a 1536-dim OpenAI-compatible
+  -- /embeddings model matching the item_chunks vector(1536) column — openai/openrouter only (Anthropic
+  -- has no embeddings API; Google's are 768-dim). See lib/query/embeddings-backend.
+  embedding_provider text check (embedding_provider in ('openai', 'openrouter')),
+  -- Optional embedding model slug for the chosen provider (curated 1536-dim list). Null = provider default.
+  embedding_model text,
+  -- Which category extracted MEETING action items land in when pushed to the PM tool (Linear/Plane):
+  -- a brain task status mapped to the provider's workflow-state group by desiredStateForStatus.
+  -- Null → 'backlog' (the historical default). Admin → Integrations picks it (radio).
+  meeting_task_status text check (meeting_task_status in ('backlog', 'ready', 'in_progress', 'done')),
   created_at timestamptz not null default now()
 );
 -- Additive columns for existing deployments.
@@ -136,6 +147,8 @@ alter table teams add column if not exists primary_pm_provider text;
 alter table teams add column if not exists answering_provider text;
 alter table teams add column if not exists reasoning_model text;
 alter table teams add column if not exists reasoning_provider text;
+alter table teams add column if not exists embedding_provider text;
+alter table teams add column if not exists embedding_model text;
 do $$ begin
   if not exists (select 1 from pg_constraint where conname = 'teams_primary_pm_provider_check') then
     alter table teams add constraint teams_primary_pm_provider_check check (primary_pm_provider in ('plane', 'linear'));
@@ -145,6 +158,9 @@ do $$ begin
   end if;
   if not exists (select 1 from pg_constraint where conname = 'teams_reasoning_provider_check') then
     alter table teams add constraint teams_reasoning_provider_check check (reasoning_provider in ('anthropic', 'openai', 'openrouter', 'local'));
+  end if;
+  if not exists (select 1 from pg_constraint where conname = 'teams_embedding_provider_check') then
+    alter table teams add constraint teams_embedding_provider_check check (embedding_provider in ('openai', 'openrouter'));
   end if;
 end $$;
 
@@ -932,14 +948,27 @@ create table if not exists items (
   -- true when member_id was set by a deliberate admin action (NL correction / re-attribution); locked
   -- items are skipped by auto re-attribution + the unchanged-repush heal (docs/design/attribution-propagation.md).
   member_id_locked boolean not null default false,
+  -- First-seen: set once on insert, never bumped on re-sync (unlike synced_at, which every 30-min tick
+  -- bumps). The honest "new knowledge / day" signal for the dashboard; see lib/metrics/pulse.ts.
+  created_at timestamptz not null default now(),
   synced_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   search tsvector generated always as
     (to_tsvector('english', coalesce(path, '') || ' ' || coalesce(body, ''))) stored,
   unique (team_id, project_id, path)
 );
+-- Additive columns for existing deployments (idempotent rollout via `npm run pg:schema`). Run BEFORE
+-- any index that references them so an existing DB (where the column arrives via ALTER, because the
+-- create-table body above is not re-run for an existing table) can build the index.
+alter table items add column if not exists member_id_locked boolean not null default false;
+-- created_at is added NULLABLE, NO DEFAULT here on purpose: on an existing DB it leaves old rows NULL so
+-- the migration's `where created_at is null` backfill targets exactly them and is a NO-OP on every replay
+-- (the migration then sets the default + not-null). The create-table body above carries the real
+-- `not null default now()` for from-zero. See postgres/migrations/20260724120000_items_created_at.sql.
+alter table items add column if not exists created_at timestamptz;
 create index if not exists items_team_updated_idx on items (team_id, updated_at desc);
 create index if not exists items_team_synced_idx on items (team_id, synced_at desc);
+create index if not exists items_team_created_idx on items (team_id, created_at desc);
 create index if not exists items_search_idx on items using gin (search);
 create index if not exists items_kind_idx on items (team_id, kind);
 
@@ -983,6 +1012,15 @@ create table if not exists tasks (
   -- internal task boards. Mirrors `decisions.audience`.
   audience access_tier not null default 'team',
   created_by uuid references members(id) on delete set null,
+  -- Timeline work-signal timestamps (work-timeline context layer). Both nullable; distinct from
+  -- `updated_at` (any edit — now gated to real changes, see lib/ingest materializeTasks):
+  --   • worked_at   = the provider's last STATE-TRANSITION time (Linear startedAt/completedAt/
+  --                   canceledAt; falls back to updatedAt). The "did work on it" signal — NOT
+  --                   updatedAt, which bumps on any relabel and would resurface dormant tickets.
+  --   • assigned_at = when the assignee last CHANGED (materializeTasks stamps it only on a real
+  --                   assignee change). Powers the timeline "newly assigned" bucket.
+  worked_at timestamptz,
+  assigned_at timestamptz,
   updated_at timestamptz not null default now(),
   created_at timestamptz not null default now()
 );
@@ -994,6 +1032,8 @@ alter table tasks add column if not exists labels text[] not null default '{}';
 alter table tasks add column if not exists priority text not null default 'none';
 alter table tasks add column if not exists body text not null default '';
 alter table tasks add column if not exists audience access_tier not null default 'team';
+alter table tasks add column if not exists worked_at timestamptz;
+alter table tasks add column if not exists assigned_at timestamptz;
 do $$ begin
   if not exists (select 1 from pg_constraint where conname = 'tasks_priority_check') then
     alter table tasks add constraint tasks_priority_check check (priority in ('none', 'low', 'medium', 'high', 'urgent'));
@@ -1045,6 +1085,25 @@ alter table task_pm_links add column if not exists last_projected_status text;
 alter table task_pm_links add column if not exists projection_fingerprint text;
 alter table task_pm_links add column if not exists provider_seen_status text;
 alter table task_pm_links add column if not exists last_projected_brain_status text;
+
+-- Task ↔ evidence links (work-timeline context layer): which items (commits, docs, Slack threads)
+-- are the actual WORK behind a task. Populated deterministically by issue-key references in the item's
+-- text (a commit/PR/branch/doc that cites `AIO-123`) via lib/dashboard/timeline-evidence (sole writer);
+-- a lower-confidence LLM grouping pass is a later addition (hence the `method`/`confidence` columns).
+-- Regenerable — safe to truncate. Tier is INHERITED from the item (`items.access`) + the task
+-- (`tasks.audience`); reads re-apply both filters (no per-row tier column, no RLS backstop, CLAUDE.md §5).
+create table if not exists task_evidence (
+  team_id uuid not null references teams(id) on delete cascade,
+  task_id uuid not null references tasks(id) on delete cascade,
+  item_id uuid not null references items(id) on delete cascade,
+  method text not null check (method in ('issue_ref', 'llm', 'manual')),
+  confidence real not null default 1.0,   -- deterministic issue_ref = 1.0; llm = the model's score
+  detail text,                            -- reserved: the matched key / LLM rationale (currently unset)
+  created_at timestamptz not null default now(),
+  primary key (team_id, task_id, item_id)
+);
+create index if not exists task_evidence_item_idx on task_evidence (team_id, item_id);
+create index if not exists task_evidence_task_idx on task_evidence (team_id, task_id);
 
 -- Observable work events from code repos. The initial event is "merged": after a PR
 -- lands on main, the matching task row moves to done and provider sync is attempted.
@@ -1500,6 +1559,31 @@ create index if not exists usage_costs_team_date_idx
 create index if not exists usage_costs_member_date_idx
   on usage_costs (member_id, cost_date desc);
 
+-- The brain's OWN LLM inference spend — every generation the product makes, not just the Query box:
+-- Q&A answers, meeting extraction, narrative arcs, timeline summaries, social content, chat titles,
+-- attribution corrections, cron/background jobs. One row PER CALL (per-event, not a daily rollup) so
+-- the costs breakdown page can slice by `source` (feature) / provider / model precisely. This is the
+-- lowest shared layer for "what is our inference costing" — Pulse Spend and the costs page both read
+-- it. Distinct from `usage_costs` (external dev-tool spend pushed from workstations). `member_id` is
+-- NULL for system/background calls that have no human initiator. `cost_usd` is provider-metered on
+-- OpenRouter (`usage.cost`, estimated=false) and a price-table estimate on Anthropic (estimated=true);
+-- a bare local endpoint reports no cost and stays $0. Single-writer: `lib/costs/llm-usage`.
+create table if not exists llm_usage (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  member_id uuid references members(id) on delete set null,
+  source text not null,
+  provider text not null,
+  model text not null default '',
+  input_tokens integer not null default 0,
+  output_tokens integer not null default 0,
+  cost_usd numeric(12, 5) not null default 0,
+  estimated boolean not null default false,
+  created_at timestamptz not null default now()
+);
+create index if not exists llm_usage_team_time_idx on llm_usage (team_id, created_at desc);
+create index if not exists llm_usage_member_time_idx on llm_usage (member_id, created_at desc);
+
 -- Flat AI-tool subscriptions (Claude Max/Pro, Cursor, …). One current plan per
 -- member+provider — the real recurring spend, distinct from per-token usage_costs.
 -- Written only by lib/subscriptions/ingest via POST /api/v1/subscriptions (v1.8).
@@ -1569,6 +1653,27 @@ create table if not exists arc_cache (
   team_id uuid not null references teams(id) on delete cascade,
   group_key text not null,                       -- sorted visible-group set, e.g. 'acme_external,acme_team'
   arcs jsonb not null default '[]'::jsonb,        -- NarrativeArc[] (already human-attributed)
+  -- Hash of the exact LLM synthesis input (the attributed fact prompt). The background refresh SKIPS the
+  -- (non-deterministic) LLM re-synthesis when this is unchanged — so arcs only change when the underlying
+  -- work does, killing day-to-day churn. Nullable: pre-existing rows have none until the next recompute.
+  facts_hash text,
+  computed_at timestamptz not null default now(),
+  primary key (team_id, group_key)
+);
+alter table arc_cache add column if not exists facts_hash text;
+
+-- ── work-timeline cache (the persisted, queryable work-timeline context layer) ──
+-- The day → person → work ledger (from `items` + `tasks`) assembled by lib/dashboard/work-timeline,
+-- persisted so the dashboard panel, the CLI, and the LLM read it identically (not recomputed per
+-- render). Serve-stale-while-revalidate like arc_cache; regenerable, never a source of truth — safe to
+-- truncate. Sole writer: lib/dashboard/timeline-cache. `group_key` = the viewer TIER ('team' |
+-- 'external'); the (team_id, group_key) PK already scopes by team, so the tier alone separates what a
+-- team viewer (team+external work) vs an external viewer (external only) may read — no cross-tier bleed,
+-- no RLS backstop (CLAUDE.md §5). Fixed 7-day window in v1 (not part of the key).
+create table if not exists work_timeline_cache (
+  team_id uuid not null references teams(id) on delete cascade,
+  group_key text not null,                       -- viewer tier: 'team' | 'external'
+  payload jsonb not null default '[]'::jsonb,     -- TimelineDay[] (already attributed + grouped)
   computed_at timestamptz not null default now(),
   primary key (team_id, group_key)
 );

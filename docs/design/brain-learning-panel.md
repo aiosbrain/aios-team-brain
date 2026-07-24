@@ -71,7 +71,7 @@ ORDER BY ep.created_at DESC
 into the library. This is the ladder rung Layer 3 consumes.
 
 **Layer 3 — narrative arcs:** gather the recent fact substrate (Cypher), send to Claude with the
-arc-synthesis prompt, cache 10 min. Arcs = `{id, title, confidence, summary, participants, sources}`.
+arc-synthesis prompt, cache 4h. Arcs = `{id, title, confidence, summary, participants, sources}`.
 
 **Fair representation (why a contributor's varied work must not vanish).** Synthesis feeds the model a
 bounded set of `MAX_FACTS` facts. Getting that set right is the whole game — a contributor invisible in
@@ -222,7 +222,7 @@ expiry blocked on the LLM. Now there's a two-tier cache:
   adapter only auto-casts non-array *objects* to jsonb; a top-level array would otherwise bind as a
   Postgres array literal (`invalid input syntax for type json`).
 - **`getArcs` read path is serve-stale-while-revalidate:** (1) fresh in-memory (this process) → return
-  instantly; (2) Postgres `arc_cache` — fresh (< 10 min) → return; **stale → return the stale arcs
+  instantly; (2) Postgres `arc_cache` — fresh (< 4h) → return; **stale → return the stale arcs
   immediately AND kick off a fire-and-forget recompute** (in-flight-deduped via a module `Set`, so N
   concurrent stale reads fire ONE LLM call), using its own `adminClient` so it doesn't depend on the
   request's client lifecycle; (3) cold miss → compute inline, persist to both caches. `recomputeArcs`
@@ -234,7 +234,7 @@ cost multiplier) and would need each team's provider keys available in the backg
 recomputes a team **that is actually being viewed**, still gives warm reads (the viewer sees the
 previous arcs instantly while the refresh runs behind them), and needs no background key access. The
 one tradeoff: the arcs a viewer sees can be up to one refresh-cycle stale — fine for a 7-day-window,
-10-min-TTL summary that is explicitly "as of" a timestamp, not real-time. If proactive warming is ever
+4h-TTL summary that is explicitly "as of" a timestamp, not real-time. If proactive warming is ever
 wanted (e.g. a nightly warm for the whole org), the timer variant is recorded as a follow-up in
 `docs/TODO.md`. This runs on a persistent Node server (the in-process ingest scheduler already relies
 on that), so the fire-and-forget promise is not at risk of serverless request-teardown.

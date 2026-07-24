@@ -9,7 +9,7 @@ import { visibleGroupIds } from "@/lib/graph/group";
 import { recomputeArcs } from "@/lib/graph/arcs";
 
 export const runtime = "nodejs";
-export const maxDuration = 60;
+export const maxDuration = 120; // arc synthesis (LLM) inline path can take up to ~110s on a cold cache
 
 const schema = z.object({
   team: z.string().min(1).max(120),

@@ -5,7 +5,7 @@ import {
   attributeFactText,
   attributeEventParticipants,
   isAiAgentName,
-  withEvidenceParticipants,
+  groundParticipants,
 } from "@/lib/graph/arc-attribution";
 
 /**
@@ -188,27 +188,30 @@ describe("attributeEventParticipants (Layer 2)", () => {
   });
 });
 
-describe("withEvidenceParticipants — evidence humans are on the chip, structurally", () => {
-  it("appends evidence humans the model didn't name (commit-shaped work: name absent from fact text)", () => {
-    expect(withEvidenceParticipants(["John Ellison"], ["Chetan"])).toEqual(["John Ellison", "Chetan"]);
+describe("groundParticipants — participants are the EVIDENCE authors, not merely-mentioned names", () => {
+  it("drops a name the model echoed from fact prose that authored NONE of the cited evidence (the fix)", () => {
+    // The real bug: evidence authored by John + Fatma; the model also named Chetan (a fact mentioned him).
+    expect(groundParticipants(["John Ellison", "Fatma", "Chetan"], ["John Ellison", "Fatma"])).toEqual([
+      "John Ellison",
+      "Fatma",
+    ]);
   });
 
-  it("names the people behind an arc the model returned with participants: [] (the blank-chip arcs)", () => {
-    expect(withEvidenceParticipants([], ["Chetan", "John Ellison"])).toEqual(["Chetan", "John Ellison"]);
+  it("uses the evidence humans even when the model named nobody (commit-shaped work)", () => {
+    expect(groundParticipants([], ["Chetan", "John Ellison"])).toEqual(["Chetan", "John Ellison"]);
   });
 
-  it("never duplicates: exact, case-insensitive, and embedded in a rewritten agent tag", () => {
-    expect(withEvidenceParticipants(["Chetan"], ["Chetan"])).toEqual(["Chetan"]);
-    expect(withEvidenceParticipants(["chetan"], ["Chetan"])).toEqual(["chetan"]);
-    // attributeParticipants may have rewritten an agent name to embed the human — no extra chip then.
-    expect(withEvidenceParticipants(["Claude Code (Chetan)"], ["Chetan"])).toEqual(["Claude Code (Chetan)"]);
+  it("when a human resolves, an AI-agent chip is replaced by the plain human (not 'Claude Code (Chetan)')", () => {
+    expect(groundParticipants(["Claude Code"], ["Chetan"])).toEqual(["Chetan"]);
+    expect(groundParticipants(["Claude Code", "Chetan"], ["John Ellison"])).toEqual(["John Ellison"]);
   });
 
-  it("keeps LLM participant order first, dedupes evidence humans, drops blanks", () => {
-    expect(withEvidenceParticipants(["Fatma"], ["Chetan", "Chetan", "", "  "])).toEqual(["Fatma", "Chetan"]);
+  it("dedupes evidence humans + drops blanks", () => {
+    expect(groundParticipants(["Fatma"], ["Chetan", "Chetan", "", "  "])).toEqual(["Chetan"]);
   });
 
-  it("no evidence humans → participants unchanged", () => {
-    expect(withEvidenceParticipants(["John Ellison"], [])).toEqual(["John Ellison"]);
+  it("no resolvable evidence human → falls back to the model's names (with AI-agent tags) so it isn't nameless", () => {
+    expect(groundParticipants(["John Ellison"], [])).toEqual(["John Ellison"]);
+    expect(groundParticipants(["Claude Code"], [])).toEqual(["Claude Code (unattributed AI agent)"]);
   });
 });

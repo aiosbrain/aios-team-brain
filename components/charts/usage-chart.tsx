@@ -20,6 +20,18 @@ export function UsageChart({ data, scope }: { data: UsagePoint[]; scope: string 
     <ChartCard
       title="Brain usage"
       hint={`${scope} queries / day`}
+      help={
+        <>
+          <span className="font-medium text-ink">What this is</span>
+          <br />
+          Questions asked to the brain, bucketed by the day they were asked, across the selected
+          range. Each answered query writes one row to the query log; this counts those rows per day.
+          <br />
+          <br />
+          Scope follows who&apos;s looking: admins see the whole team&apos;s queries, everyone else
+          sees only their own.
+        </>
+      }
       empty={empty}
       emptyLabel="No queries in this window."
     >

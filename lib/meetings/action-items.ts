@@ -2,12 +2,14 @@ import "server-only";
 
 import type { DbClient } from "@/lib/db/types";
 import { callMeetingsLLM, extractJsonObject, type ProviderKeys, type RosterPerson } from "./llm-extract";
+import type { LlmMeterCtx } from "@/lib/costs/llm-usage";
 import {
   extractTodosFromNotes,
   toExtractedTodoRows,
   createMeetingTodoTasks,
   type ExtractedTodo,
 } from "./extract-todos";
+import { getMeetingTaskStatus } from "./target-status-db";
 
 /**
  * Pull concrete action items / follow-up tasks out of a meeting transcript. An LLM pass is the
@@ -72,7 +74,8 @@ export async function extractActionItems(
   rawText: string,
   roster: RosterPerson[],
   keys: ProviderKeys,
-  timeoutMs?: number
+  timeoutMs?: number,
+  meter?: LlmMeterCtx
 ): Promise<ExtractedTodo[]> {
   const fallback = () => dedupe(extractTodosFromNotes(rawText));
 
@@ -80,7 +83,7 @@ export async function extractActionItems(
   const rosterHint = roster.length
     ? `\n\nKnown team members (resolve first-name mentions against these full names): ${roster.map((p) => p.displayName).join(", ")}.`
     : "";
-  const raw = await callMeetingsLLM(SYSTEM_PROMPT, `Transcript:\n\n${truncated}${rosterHint}`, keys, timeoutMs);
+  const raw = await callMeetingsLLM(SYSTEM_PROMPT, `Transcript:\n\n${truncated}${rosterHint}`, keys, timeoutMs, meter);
   if (!raw) return fallback();
 
   let parsed: unknown;
@@ -120,16 +123,29 @@ export async function extractAndStoreActionItems(
   // Injectable so the backfill/tests can stub the LLM step; defaults to the real extractor.
   extract?: (rawText: string, roster: RosterPerson[], keys: ProviderKeys) => Promise<ExtractedTodo[]>,
   // Extra timeout for the default extractor (background/backfill can allow a slower model).
-  timeoutMs?: number
+  timeoutMs?: number,
+  // Pruning stale todos is OPT-IN — only the deliberate on-demand re-extract (the "Extract action
+  // items" button) sets `reconcile`. The additive callers (upload, import/backfill, refresh, merge)
+  // MUST NOT prune: they all funnel through here, and a merge/refresh reworking one title would
+  // otherwise delete another path's freshly-created (or just-re-pointed) todo.
+  opts: { reconcile?: boolean } = {}
 ): Promise<number> {
-  const run = extract ?? ((t: string, r: RosterPerson[], k: ProviderKeys) => extractActionItems(t, r, k, timeoutMs));
+  const run =
+    extract ?? ((t: string, r: RosterPerson[], k: ProviderKeys) => extractActionItems(t, r, k, timeoutMs, { db, teamId }));
   const todos = await run(rawText, roster, keys);
   const rows = toExtractedTodoRows(item, todos);
   // Only reconcile when the extraction actually returned items: upsert what's present + prune THIS
   // transcript's stale, un-pushed todos (already-pushed ones are preserved — see
   // pruneStaleMeetingTodos). A 0-item result is NOT pruned — an empty result is indistinguishable
   // from a failed/timed-out extraction, so deleting on it could wipe real tasks (e.g. tasks a merge
-  // just re-pointed onto this item). Better a stale row than a destroyed one.
-  if (rows.length) await createMeetingTodoTasks(db, teamId, rows, { pruneSourceItemIds: [item.id] });
+  // just re-pointed onto this item). Better a stale row than a destroyed one. New todos get the
+  // team's configured target category so a later push lands them there.
+  if (rows.length) {
+    const status = await getMeetingTaskStatus(db, teamId);
+    await createMeetingTodoTasks(db, teamId, rows, {
+      pruneSourceItemIds: opts.reconcile ? [item.id] : undefined,
+      status,
+    });
+  }
   return rows.length;
 }

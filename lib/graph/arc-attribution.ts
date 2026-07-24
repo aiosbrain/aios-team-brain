@@ -140,21 +140,22 @@ export function attributedFactTexts(
  * this, a participant chip appears only when the model happens to echo a name out of the fact text:
  * fine for people whose docs literally say "John is coordinating…", invisible for people whose work
  * is commit-shaped (fact subjects are features/repos; the human exists only in the `(Name)`
- * attribution prefix). It also puts names on arcs the model returned with `participants: []`.
+ * attribution prefix).
  *
- * A human is skipped when their name already appears (case-insensitive) INSIDE any existing
- * participant string — covering the exact name and the rewritten agent tag "Claude Code (Name)"
- * from `attributeParticipants` — so no duplicate chips. LLM participants keep their order; evidence
- * humans append after. Pure; evidence humans come from the roster (`members.display_name`,
- * connectors already excluded), so nothing here can invent a person.
+ * EVIDENCE-GROUNDED participants — the fix for "a person merely MENTIONED in a fact becomes a
+ * participant" (e.g. Chetan named on an arc whose evidence was all authored by Fatma/John, because a
+ * fact's prose said "align with Chetan"). An arc's participants are the humans who ACTUALLY authored its
+ * cited evidence (`evidenceHumans` = the version-author SET, so a reassigned-away contributor still
+ * shows). Free-text names the model extracted from fact prose but that authored NONE of the cited
+ * evidence are DROPPED — a participant did work the arc cites, not just got mentioned. Only when no
+ * evidence human resolves (an attribution gap) do we fall back to the model's names (with AI-agent tags
+ * via `attributeParticipants`) so the arc isn't left nameless. Pure; evidence humans come from the
+ * roster (`members.display_name`, connectors already excluded), so nothing here can invent a person.
  */
-export function withEvidenceParticipants(participants: string[], evidenceHumans: string[]): string[] {
-  const out = [...participants];
-  for (const human of [...new Set(evidenceHumans.map((h) => (h ?? "").trim()).filter(Boolean))]) {
-    const needle = human.toLowerCase();
-    if (!out.some((p) => p.toLowerCase().includes(needle))) out.push(human);
-  }
-  return out;
+export function groundParticipants(llmParticipants: string[], evidenceHumans: string[]): string[] {
+  const humans = [...new Set(evidenceHumans.map((h) => (h ?? "").trim()).filter(Boolean))];
+  if (humans.length > 0) return humans;
+  return attributeParticipants(llmParticipants, humans); // humans is [] here — the fallback runs iff no evidence human resolved
 }
 
 /** The minimal shape of a Layer-2 event `attributeEventParticipants` needs — structurally compatible

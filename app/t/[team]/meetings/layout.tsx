@@ -5,7 +5,6 @@ import { loadTeamId, loadViewer, loadMeetingNotes, sortedMeetingNotes } from "@/
 import { EmptyState } from "@/components/empty-state";
 import { NewMeetingNoteButton } from "@/components/meetings/new-meeting-note-button";
 import { ImportPushedMeetingsButton } from "@/components/meetings/import-pushed-meetings-button";
-import { MergeDuplicatesButton } from "@/components/meetings/merge-duplicates-button";
 import { MeetingListPane } from "@/components/meetings/meeting-list-pane";
 
 /**
@@ -40,13 +39,13 @@ export default async function MeetingsLayout({
         <div>
           <h1 className="text-2xl font-semibold text-ink">Meetings</h1>
           <p className="text-sm text-ink-secondary">
-            Pick a meeting to read its summary, open the transcript, and push action items to your
-            task tool.
+            Pick a meeting to read its summary and open the full transcript.
           </p>
         </div>
         {canManage ? (
           <div className="flex items-center gap-2">
-            {me.role === "admin" ? <MergeDuplicatesButton teamSlug={teamSlug} /> : null}
+            {/* Duplicate-meeting merge is now automatic on ingest (backfillMeetingNotesFromItems →
+                backfillMergeDuplicateMeetings) — the manual "Merge duplicates" button was removed. */}
             <ImportPushedMeetingsButton teamSlug={teamSlug} />
             <NewMeetingNoteButton teamSlug={teamSlug} />
           </div>
@@ -61,7 +60,7 @@ export default async function MeetingsLayout({
         />
       ) : (
         <div className="flex flex-col gap-5 sm:flex-row sm:items-start sm:gap-6">
-          <div className="w-full shrink-0 self-start sm:sticky sm:top-6 sm:w-72 lg:w-80">
+          <div className="w-full shrink-0 self-start sm:sticky sm:top-6 sm:w-80 lg:w-96 xl:w-[28rem]">
             <MeetingListPane teamSlug={teamSlug} notes={sorted} defaultActiveId={sorted[0]?.id ?? null} />
           </div>
           <div className="min-w-0 flex-1">{children}</div>

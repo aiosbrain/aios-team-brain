@@ -28,8 +28,28 @@ export function KnowledgeGrowth({ data }: { data: KnowledgePoint[] }) {
   );
 
   return (
-    <ChartCard title="Knowledge growth" hint="items synced / day" empty={empty}>
-      <ResponsiveContainer width="100%" height={200}>
+    <ChartCard
+      title="Knowledge growth"
+      hint="new items / day"
+      helpAlign="right"
+      help={
+        <>
+          <span className="font-medium text-ink">What this is</span>
+          <br />
+          New items the brain learned each day, stacked by kind (deliverable, transcript, decision,
+          task, skill, artifact).
+          <br />
+          <br />
+          Each item is counted on the day it was{" "}
+          <span className="font-medium text-ink">first seen</span> (its <code>created_at</code>, set
+          once on insert) — not when it was last re-synced. That&apos;s the difference between real
+          growth and churn: the sync scheduler touches most items every 30 minutes, so bucketing on
+          sync time would make almost everything look brand-new every day.
+        </>
+      }
+      empty={empty}
+    >
+      <ResponsiveContainer width="100%" height={140}>
         <AreaChart data={data} margin={{ top: 4, right: 4, left: -20, bottom: 0 }}>
           <CartesianGrid vertical={false} stroke={GRID_STROKE} />
           <XAxis

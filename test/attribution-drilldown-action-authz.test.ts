@@ -18,7 +18,7 @@ vi.mock("@/lib/attribution/health", async (orig) => ({ ...(await orig<Record<str
 vi.mock("@/lib/attribution/correction", async (orig) => ({ ...(await orig<Record<string, unknown>>()), previewCorrection }));
 // The action module pulls in server-only write/LLM deps we don't exercise here — stub them out.
 vi.mock("@/lib/ingest/attribution-correction", () => ({ applyAttributionCorrection: vi.fn() }));
-vi.mock("@/lib/ingest/reconcile-attribution", () => ({ bustTeamArcs: vi.fn() }));
+vi.mock("@/lib/ingest/reconcile-attribution", () => ({ bustTeamLearningCaches: vi.fn() }));
 vi.mock("@/lib/db/admin", () => ({ adminClient: vi.fn() }));
 vi.mock("@/lib/query/answering", () => ({ resolveAnsweringKeys: vi.fn() }));
 vi.mock("next/cache", () => ({ revalidatePath: vi.fn() }));

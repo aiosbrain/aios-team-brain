@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { toOrQuery, parseChannelScope } from "@/lib/query/retrieve";
+import { toOrQuery, parseChannelScope, parseSourceScope } from "@/lib/query/retrieve";
 
 /**
  * ADVERSARIAL — query-transformation limits (pure, deterministic). These probe the FTS query builder
@@ -93,6 +93,33 @@ describe("adversarial: a channel name is treated as a content term, not a scope"
 
   it("documents: the channel name leaks in as a plain search term", () => {
     expect(toOrQuery("what was decided in the payments channel").split(" or ")).toContain("payments");
+  });
+});
+
+describe("source scope parsing (recency leg — 'we ingest Slack but the answer said we don't')", () => {
+  it("scopes on <prep> <source> (brand names) or <source> <content-noun> (any source)", () => {
+    expect(parseSourceScope("what's the conversation in slack right now?").source).toBe("slack"); // in slack
+    expect(parseSourceScope("recent messages in slack").source).toBe("slack"); // in slack
+    expect(parseSourceScope("latest notion docs?").source).toBe("notion"); // notion docs
+    expect(parseSourceScope("any new linear issues this week?").source).toBe("linear"); // linear issues
+    expect(parseSourceScope("what changed in the slack threads?").source).toBe("slack"); // slack threads
+  });
+  it("does NOT scope on ordinary prose where the source word is a common English word (adjacency guard)", () => {
+    // These all contain a source word but NOT in an adjacency form → no false scope (Fable's cases).
+    expect(parseSourceScope("explain the notion of causality").source).toBeNull();
+    expect(parseSourceScope("help me with my linear algebra homework").source).toBeNull();
+    expect(parseSourceScope("is our growth linear in Q3?").source).toBeNull();
+    expect(parseSourceScope("any updates on the linear regression model?").source).toBeNull();
+    expect(parseSourceScope("book a plane ticket for the offsite today").source).toBeNull();
+  });
+  it("does NOT scope the common-word sources via a bare preposition (only brand names take a prep)", () => {
+    // "on linear" alone is too ambiguous (linear regression/algebra) — it needs a content noun.
+    expect(parseSourceScope("what's happening on linear?").source).toBeNull();
+    expect(parseSourceScope("in the plane of the UI grid").source).toBeNull();
+  });
+  it("does NOT scope when no source is named", () => {
+    expect(parseSourceScope("what's the latest on the Atlas launch?").source).toBeNull();
+    expect(parseSourceScope("who is working on payments right now?").source).toBeNull();
   });
 });
 

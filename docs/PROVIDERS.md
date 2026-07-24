@@ -30,13 +30,25 @@ rather than breaking the query.
 
 By default the native provider retrieves with **keyword FTS + Graphiti facts** and runs on stock
 Postgres (no extensions). You can add **dense passage retrieval** (embeddings + HNSW + RRF fusion
-with the keyword hits) as an opt-in upgrade:
+with the keyword hits) as an opt-in upgrade.
+
+**Two ways to point embeddings at a provider:**
+
+1. **Admin → Integrations → "Embeddings model"** (recommended, no env vars) — a per-team picker
+   (`teams.embedding_provider`/`embedding_model`) exactly like the answering/reasoning pickers. It offers
+   **OpenAI** and **OpenRouter** only, on **`text-embedding-3-small`** — because the shipped
+   `item_chunks` column is `vector(1536)` and those are the 1536-dim, OpenAI-compatible options that fit
+   it. Switching OpenAI ↔ OpenRouter on that model is re-embed-free (identical vectors), so a team whose
+   OpenAI quota is exhausted can move embeddings onto OpenRouter from the UI. Uses that provider's key
+   from the AI-provider-keys panel. A save-time guard refuses a model in a different vector space than
+   the existing index.
+2. **Env vars** (self-host / custom dimension) — the picker's "Auto" falls back to these:
 
 | Env | Default | Purpose |
 |-----|---------|---------|
-| `EMBEDDINGS_URL` | unset → dense OFF | OpenAI-compatible base, e.g. `https://api.openai.com/v1`, `http://localhost:11434/v1` (Ollama) |
+| `EMBEDDINGS_URL` | unset → dense OFF (unless a team picked a provider) | OpenAI-compatible base, e.g. `https://api.openai.com/v1`, `http://localhost:11434/v1` (Ollama) |
 | `EMBEDDINGS_MODEL` | `text-embedding-3-small` | any embedding model the endpoint serves |
-| `EMBEDDINGS_DIM` | `1536` | MUST equal the `vector(N)` column in `postgres/optional/pgvector.sql` |
+| `EMBEDDINGS_DIM` | `1536` | MUST equal the `vector(N)` column in `postgres/optional/pgvector.sql`; the env tier honors a custom value (e.g. `768` for `nomic-embed-text`), the Admin picker is fixed at 1536 |
 
 Enable it in three steps (needs a Postgres with the `vector` extension — Railway/Supabase/pgvector image):
 

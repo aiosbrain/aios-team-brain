@@ -46,6 +46,18 @@ async function memberOf(teamId: string, path: string): Promise<string | null> {
   return (data as { member_id: string | null } | null)?.member_id ?? null;
 }
 
+/** The item_versions.member_id ledger for an item, in work (created_at) order. */
+async function versionMembersOf(teamId: string, path: string): Promise<(string | null)[]> {
+  const { data: item } = await db().from("items").select("id").eq("team_id", teamId).eq("path", path).single();
+  const { data } = await db()
+    .from("item_versions")
+    .select("member_id, created_at")
+    .eq("item_id", (item as { id: string }).id)
+    .order("created_at", { ascending: true })
+    .order("id", { ascending: true });
+  return ((data ?? []) as { member_id: string | null }[]).map((r) => r.member_id);
+}
+
 /** Ingest via a connector, author unresolved at ingest time (opts.authorMemberId: null explicitly). */
 async function putUnresolved(
   seed: Seed,
@@ -168,5 +180,43 @@ describe("reattributeItems (real Postgres)", () => {
     const s = await reattributeItems(db(), seed.teamId);
     expect(s.updated).toBe(1);
     expect(await memberOf(seed.teamId, "slack/eng/3.md")).toBeNull(); // cleared, not left on the connector
+  });
+
+  it("heals the WORK LEDGER too — a version author unmapped at push is re-pointed once the mapping arrives", async () => {
+    const seed = await seedTeam();
+    const connector = await addMember(seed.teamId, { connector: true });
+    const author = await addMember(seed.teamId);
+    // Ingested via a connector with the slack author unmapped → item AND its version are unattributed.
+    await putUnresolved(seed, connector, "slack/eng/led.md", { source: "slack", author_id: "U-led" });
+    expect(await versionMembersOf(seed.teamId, "slack/eng/led.md")).toEqual([null]);
+
+    await setMemberIdentity(db(), seed.teamId, author, { provider: "slack", externalId: "U-led" }); // mapping arrives
+    const s = await reattributeItems(db(), seed.teamId);
+    expect(s.versionsUpdated).toBe(1);
+    expect(await memberOf(seed.teamId, "slack/eng/led.md")).toBe(author);
+    expect(await versionMembersOf(seed.teamId, "slack/eng/led.md")).toEqual([author]); // ledger healed, not just the item
+    expect((await reattributeItems(db(), seed.teamId)).versionsUpdated).toBe(0); // idempotent
+  });
+
+  it("PRESERVES a genuine handoff — each version re-resolves to ITS OWN author, never the current owner", async () => {
+    const seed = await seedTeam();
+    const a = await addMember(seed.teamId);
+    const b = await addMember(seed.teamId);
+    await setMemberIdentity(db(), seed.teamId, a, { provider: "slack", externalId: "U-a" });
+    await setMemberIdentity(db(), seed.teamId, b, { provider: "slack", externalId: "U-b" });
+    const auth = { teamId: seed.teamId, memberId: a, apiKeyId: randomUUID() };
+    const path = "slack/eng/handoff.md";
+    const mk = (body: string, sid: string) => ({
+      project: "acme", kind: "transcript" as const, actor: "", content_sha256: sha(body), access: "team" as const,
+      path, body, frontmatter: { source: "slack", author_id: sid },
+    });
+    // v1 authored by A, v2 (changed body) authored by B — a real handoff, both versions kept.
+    await ingestItem(db(), auth, mk("v1", "U-a"), "team", { authorMemberId: a });
+    await ingestItem(db(), auth, mk("v2", "U-b"), "team", { authorMemberId: b });
+    expect(await versionMembersOf(seed.teamId, path)).toEqual([a, b]);
+
+    const s = await reattributeItems(db(), seed.teamId);
+    expect(s.versionsUpdated).toBe(0); // each version already resolves to its own author → untouched
+    expect(await versionMembersOf(seed.teamId, path)).toEqual([a, b]); // handoff history intact (NOT both → B)
   });
 });

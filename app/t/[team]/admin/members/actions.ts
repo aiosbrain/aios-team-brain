@@ -3,7 +3,7 @@
 import { revalidatePath } from "next/cache";
 import { after } from "next/server";
 import { adminClient } from "@/lib/db/admin";
-import { reconcileAttribution, bustTeamArcs } from "@/lib/ingest/reconcile-attribution";
+import { reconcileAttribution, bustTeamLearningCaches } from "@/lib/ingest/reconcile-attribution";
 import { requireTeamAdmin as requireAdmin } from "@/lib/auth/guard";
 import { linkGithub } from "@/lib/codebases/github";
 import { setMemberIdentity, removeMemberIdentity } from "@/lib/identity/member-identities";
@@ -167,9 +167,12 @@ export async function reattributeIdentitiesNow(
     // 10-min arc lag — matching the auto-reconcile hooks (the correction lock protects it from the same
     // TOCTOU race a concurrent auto-reconcile might hit).
     const s = await reattributeItems(adminClient(), ctx.teamId);
-    await bustTeamArcs(adminClient(), ctx.teamId, teamSlug);
+    await bustTeamLearningCaches(adminClient(), ctx.teamId, teamSlug);
     revalidatePath(`/t/${teamSlug}/admin/members`);
-    return { ok: true, message: `Re-attributed ${s.updated} of ${s.scanned} item(s) to current identity mappings.` };
+    return {
+      ok: true,
+      message: `Re-attributed ${s.updated} of ${s.scanned} item(s)${s.versionsUpdated ? ` + ${s.versionsUpdated} version(s)` : ""} to current identity mappings.`,
+    };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "re-attribution failed" };
   }

@@ -18,6 +18,12 @@ if (!databaseTestUrl) {
 // The pg adapter (lib/db/pg/pool) reads DATABASE_URL; the backend selector reads
 // DB_BACKEND. Pin both to the test DB for every worker before any module loads.
 process.env.DB_BACKEND = "postgres";
+// Stubbed-model tier: blank EVERY LLM transport so a dev shell exporting a provider key can't turn
+// these into live-network calls (the meeting merge/extract paths resolve the Anthropic SDK env key /
+// OpenAI otherwise). Tests inject their own extractors or rely on the deterministic fallbacks.
+process.env.LLM_BASE_URL = "";
+process.env.OPENAI_API_KEY = "";
+process.env.ANTHROPIC_API_KEY = "";
 process.env.NEXT_PUBLIC_DB_BACKEND = "postgres";
 process.env.DATABASE_URL = databaseTestUrl;
 // Fixed test key for integration-secret crypto (lib/secrets); not a real secret.

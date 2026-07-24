@@ -10,6 +10,7 @@ import {
 import type { DbClient } from "@/lib/db/types";
 import {
   effectiveProjectable,
+  persistedChanged,
   projectableChanged,
   type ProjectableSnapshot,
 } from "@/lib/ingest/projectable-diff";
@@ -30,6 +31,7 @@ const taskSnapshotsSchema = z.array(
     labels: z.array(z.string()).nullish(),
     parent_row_key: z.string().nullish(),
     assignee: z.string().nullish(),
+    due_date: z.string().nullish(),
   })
 );
 const currentTasksSchema = z.array(
@@ -111,10 +113,14 @@ export async function materializeTasks(
 ): Promise<string[]> {
   const incomingKeys = new Set(rows.map((row) => row.row_key));
   const snapshotByKey = new Map<string, ProjectableSnapshot>();
+  // Parallel to the projectable snapshot: the stored `due_date` per row, so `persistedChanged` (which
+  // gates `updated_at`) can see a due-only edit without adding due_date to the *projectable* set
+  // (which gates PM projection and must stay due-insensitive).
+  const dueByKey = new Map<string, string | null>();
   if (incomingKeys.size) {
     const { data, error } = await db
       .from("tasks")
-      .select("row_key, title, status, sprint, priority, labels, parent_row_key, assignee")
+      .select("row_key, title, status, sprint, priority, labels, parent_row_key, assignee, due_date")
       .eq("team_id", teamId)
       .eq("project_id", projectId)
       .not("row_key", "is", null);
@@ -130,16 +136,28 @@ export async function materializeTasks(
         parent_row_key: task.parent_row_key ?? null,
         assignee: task.assignee ?? "",
       });
+      dueByKey.set(task.row_key, task.due_date ?? null);
     }
   }
 
   const changed = new Set<string>();
   for (const row of rows) {
-    const { status, raw_status } = normalizeTaskStatus(row.status);
+    const { status, raw_status } = normalizeTaskStatus(row.status || "");
     const snapshot = snapshotByKey.get(row.row_key) ?? null;
-    if (projectableChanged(snapshot, effectiveProjectable(row, snapshot))) {
+    const effective = effectiveProjectable(row, snapshot);
+    // Projected-field change detection gates reactive PM projection — deliberately due/body-insensitive.
+    if (projectableChanged(snapshot, effective)) {
       changed.add(row.row_key);
     }
+    // A *persisted* change (projected set PLUS due_date) gates `updated_at`. Only bump on a real change
+    // so a routine re-sync (which re-materializes every row) isn't mistaken for "worked on today" and the
+    // writeback contract (updated_at > synced_at ⇒ emit) stays honest.
+    const persisted = persistedChanged(
+      snapshot,
+      effective,
+      dueByKey.get(row.row_key) ?? null,
+      row.due || null
+    );
     const upsertRow: Record<string, unknown> = {
       team_id: teamId,
       project_id: projectId,
@@ -148,17 +166,31 @@ export async function materializeTasks(
       title: row.title,
       status,
       raw_status,
-      sprint: row.sprint,
+      sprint: row.sprint ?? "",
       due_date: row.due || null,
       origin: "sync",
       audience,
-      updated_at: syncedAt,
     };
+    // Omit `updated_at` when nothing persisted-changed: the pg upsert only SETs columns present in the
+    // object, so an omitted column retains its stored value on update; on insert the schema default
+    // now() applies. `persisted` is true for new rows, so inserts still stamp it.
+    if (persisted) upsertRow.updated_at = syncedAt;
     if ("assignee" in row) upsertRow.assignee = (row.assignee ?? "").trim();
     else if (!snapshot) upsertRow.assignee = "";
     if ("parent" in row) upsertRow.parent_row_key = parentOf(row) || null;
     if ("labels" in row) upsertRow.labels = row.labels ?? [];
     if ("priority" in row) upsertRow.priority = normalizeTaskPriority(row.priority);
+    // worked_at (provider state-transition time): partial-write like the fields above — present key is
+    // authoritative, absent key preserves the stored value (workspace-pushed rows omit it for now).
+    if ("worked_at" in row)
+      upsertRow.worked_at =
+        (row as { worked_at?: string | null }).worked_at || null;
+    // assigned_at: stamp only when the assignee actually CHANGED to a non-empty person (a brand-new
+    // assigned row counts). Clearing an assignee, or an unchanged assignee, preserves the stored value.
+    const effAssignee = effective.assignee;
+    const prevAssignee = snapshot?.assignee ?? "";
+    if (effAssignee && effAssignee !== prevAssignee)
+      upsertRow.assigned_at = syncedAt;
     const { data, error } = await db
       .from("tasks")
       .upsert(upsertRow, { onConflict: "team_id,project_id,row_key" })

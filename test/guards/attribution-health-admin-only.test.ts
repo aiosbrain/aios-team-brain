@@ -15,6 +15,13 @@ import { join } from "node:path";
 const ROOT = join(import.meta.dirname, "..", "..");
 const SCAN_DIRS = [join(ROOT, "app"), join(ROOT, "components")];
 const ADMIN_PREFIX = join("app", "t", "[team]", "admin") + "/";
+// The single non-page exception — the admin-gated attribution API route (posix path for matching). It's
+// allowlisted ONLY because it self-gates to a team-tier ADMIN key (asserted in the last test below), so
+// the CLI/LLM can read the same data as the web view (brain-api v1.13) without opening a non-admin leak.
+const ADMIN_API_ROUTE = "app/api/v1/attribution/route.ts";
+const posix = (f: string): string => f.replaceAll("\\", "/");
+const isAllowed = (f: string): boolean =>
+  posix(f).includes(posix(ADMIN_PREFIX)) || posix(f).endsWith(ADMIN_API_ROUTE);
 // A VALUE import of the health module — `import { getAttributionHealth } …`. Excludes `import type …`
 // (a component taking the AttributionHealth shape never touches the tier-spanning read).
 const VALUE_IMPORT = /import\s+(?!type\s)[^;]*?from\s+["']@\/lib\/attribution\/health["']/;
@@ -52,8 +59,19 @@ describe("attribution-health read is admin-gated", () => {
     expect(valueImporters.some((f) => f.includes(join("admin", "attribution")))).toBe(true);
   });
 
-  it("is CALLED only from under app/t/[team]/admin/ (self-gated pages), never an api route or shared component", () => {
-    const offenders = valueImporters.filter((f) => !f.replaceAll("\\", "/").includes(ADMIN_PREFIX.replaceAll("\\", "/")));
+  it("is CALLED only from the allowlist (self-gated admin pages + the admin-gated attribution API route)", () => {
+    const offenders = valueImporters.filter((f) => !isAllowed(f));
     expect(offenders).toEqual([]);
+  });
+
+  it("the attribution API route exception genuinely gates to a team-tier ADMIN key (the allowlist can't become a leak)", () => {
+    const route = valueImporters.find((f) => posix(f).endsWith(ADMIN_API_ROUTE));
+    // If the route is present in the tree, it MUST self-gate; if it's absent, the allowlist entry is
+    // simply dormant (no leak). Either way the tier-spanning read stays admin-only.
+    if (route) {
+      const src = readFileSync(route, "utf8");
+      expect(src).toMatch(/memberRole\s*!==\s*["']admin["']/);
+      expect(src).toMatch(/memberTier\s*!==\s*["']team["']/);
+    }
   });
 });

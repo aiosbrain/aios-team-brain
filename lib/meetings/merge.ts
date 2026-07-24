@@ -5,6 +5,7 @@ import { ingestItem } from "@/lib/ingest";
 import { audit } from "@/lib/api/audit";
 import { completeTextOrNull } from "@/lib/llm/complete";
 import { extractFromTranscript, type ProviderKeys, type RosterPerson } from "./llm-extract";
+import type { LlmMeterCtx } from "@/lib/costs/llm-usage";
 import { extractAndStoreActionItems } from "./action-items";
 import { remapMeetingTodoSourceItem } from "./extract-todos";
 import { canLlmMerge, mergeTranscripts, transcriptOverlap } from "./merge-format";
@@ -34,7 +35,12 @@ const MERGE_SYSTEM =
  * back to the lossless deterministic union), or when the model degrades to a summary (much shorter
  * than the longer input) — so a bad result never silently drops content.
  */
-export async function mergeTranscriptsLLM(a: string, b: string, keys: ProviderKeys): Promise<string | null> {
+export async function mergeTranscriptsLLM(
+  a: string,
+  b: string,
+  keys: ProviderKeys,
+  meter?: LlmMeterCtx
+): Promise<string | null> {
   const hasLlm = !!(
     keys.openaiKey ||
     keys.anthropicKey ||
@@ -46,7 +52,10 @@ export async function mergeTranscriptsLLM(a: string, b: string, keys: ProviderKe
   if (!hasLlm || !canLlmMerge(a, b)) return null;
 
   const prompt = `Transcript A:\n\n${a}\n\n=====\n\nTranscript B:\n\n${b}`;
-  const raw = await completeTextOrNull({ system: MERGE_SYSTEM, prompt }, { keys, jsonObject: false, maxTokens: 8192 });
+  const raw = await completeTextOrNull(
+    { system: MERGE_SYSTEM, prompt },
+    { keys, jsonObject: false, maxTokens: 8192, meter: meter ? { ...meter, source: "meeting-merge" } : undefined }
+  );
   const text = raw?.trim();
   if (!text) return null;
   // A merge should be at least as long as the longer source; a much shorter result means the model
@@ -166,14 +175,19 @@ export async function mergeIntoMeetingNote(
   match: DuplicateMatch,
   input: MergeInput
 ): Promise<string> {
+  // Resolve the attribution FIRST — before the (possibly LLM-backed) transcript merge — so an
+  // unattributable pair fails cheaply instead of burning a merge call that's then discarded. On the
+  // automatic ingest path both submitters can be null (e.g. a member was deleted → `submitted_by` set
+  // null); the caller supplies `authorFallbackMemberId` (an active member) so those still merge.
+  const author = match.primarySubmitterId ?? input.newSubmitterId ?? input.authorFallbackMemberId ?? null;
+  if (!author) throw new Error("mergeIntoMeetingNote: no member to attribute the merged transcript to");
+
   // Intelligent merge: LLM-combine the overlapping transcripts (dedupes overlaps, keeps unique
   // content), falling back to the lossless deterministic union if the LLM is unavailable/too long.
   const merged = input.mergeTranscript
     ? await input.mergeTranscript(match.existingRawText, input.newRawText)
-    : (await mergeTranscriptsLLM(match.existingRawText, input.newRawText, input.keys).catch(() => null)) ??
+    : (await mergeTranscriptsLLM(match.existingRawText, input.newRawText, input.keys, { db: admin, teamId }).catch(() => null)) ??
       mergeTranscripts(match.existingRawText, input.newRawText);
-  const author = match.primarySubmitterId ?? input.newSubmitterId ?? input.authorFallbackMemberId ?? null;
-  if (!author) throw new Error("mergeIntoMeetingNote: no member to attribute the merged transcript to");
 
   // Tier floor (M1): the merged body is only as widely visible as its MOST RESTRICTIVE source —
   // "team" is more restrictive than "external", so if either side is team-tier the result is team.
@@ -233,7 +247,7 @@ export async function mergeIntoMeetingNote(
 
   // Refresh summary + attendees + action items on the merged text — best-effort (never fail merge).
   try {
-    const ex = await extractFromTranscript(merged, input.roster, input.keys);
+    const ex = await extractFromTranscript(merged, input.roster, input.keys, undefined, { db: admin, teamId });
     if (ex.summary.trim()) await updateMeetingSummary(admin, teamId, match.noteId, ex.summary);
     if (ex.attendeeMemberIds.length) await addMeetingNoteAttendees(admin, match.noteId, ex.attendeeMemberIds);
   } catch {
@@ -308,15 +322,17 @@ export interface BackfillMergeSummary {
 }
 
 /**
- * One-time cleanup: find already-created duplicate meeting notes (same date + overlapping
- * transcripts) and merge each cluster into its EARLIEST note, crediting all submitters and hiding
- * the folded-away copies (`merged_into`). Uses the same LLM merge as the live upload path. Bounded,
- * best-effort per cluster. `actorMemberId` attributes the re-ingest when a note has no submitter.
+ * Find already-created duplicate meeting notes (same date + overlapping transcripts) and merge each
+ * cluster into its EARLIEST note, crediting all submitters and hiding the folded-away copies
+ * (`merged_into`). Runs on EVERY ingest tick (via `backfillMeetingNotesFromItems`) — cheap when there
+ * are no same-date pairs (metadata-only scan, no bodies loaded). Uses the same LLM merge as the live
+ * upload path. Bounded, best-effort per cluster. `actorMemberId` attributes the re-ingest when a note
+ * has no submitter — OPTIONAL: the automatic path passes none, falling back to an active member.
  */
 export async function backfillMergeDuplicateMeetings(
   admin: DbClient,
   teamId: string,
-  opts: { keys: ProviderKeys; actorMemberId: string; threshold?: number }
+  opts: { keys: ProviderKeys; actorMemberId?: string | null; threshold?: number }
 ): Promise<BackfillMergeSummary> {
   const threshold = opts.threshold ?? DEFAULT_MERGE_THRESHOLD;
   const summary: BackfillMergeSummary = { scanned: 0, clusters: 0, merged: 0 };
@@ -331,10 +347,17 @@ export async function backfillMergeDuplicateMeetings(
   summary.scanned = rows.length;
   if (rows.length < 2) return summary;
 
-  const { data: items } = await admin
-    .from("items")
-    .select("id, body, access")
-    .in("id", rows.map((r) => r.source_item_id));
+  // Group by date on the CHEAP metadata FIRST — only a date with ≥2 notes can hold a duplicate. This
+  // runs every scheduler tick, so we must NOT load transcript bodies for the whole corpus each time:
+  // at steady state (all distinct dates), there are no dup-dates and we return here having loaded zero
+  // bodies. Bodies (+ roster) are fetched below ONLY for the candidate dates.
+  const byDate = new Map<string, Row[]>();
+  for (const r of rows) byDate.set(r.occurred_at!, [...(byDate.get(r.occurred_at!) ?? []), r]);
+  const dupDateGroups = [...byDate.values()].filter((g) => g.length >= 2);
+  if (dupDateGroups.length === 0) return summary;
+
+  const candidateItemIds = dupDateGroups.flatMap((g) => g.map((r) => r.source_item_id));
+  const { data: items } = await admin.from("items").select("id, body, access").in("id", candidateItemIds);
   const itemRows = (items ?? []) as { id: string; body: string; access: "team" | "external" }[];
   const bodyById = new Map(itemRows.map((i) => [i.id, i.body ?? ""]));
   const accessById = new Map(itemRows.map((i) => [i.id, i.access]));
@@ -344,14 +367,10 @@ export async function backfillMergeDuplicateMeetings(
     .select("id, display_name")
     .eq("team_id", teamId)
     .eq("status", "active")
+    .order("created_at", { ascending: true }) // deterministic: roster[0] is the earliest active member (authorless-pair fallback)
     .then(({ data }) => ((data ?? []) as { id: string; display_name: string }[]).map((m) => ({ id: m.id, displayName: m.display_name })));
 
-  // Group by date.
-  const byDate = new Map<string, Row[]>();
-  for (const r of rows) byDate.set(r.occurred_at!, [...(byDate.get(r.occurred_at!) ?? []), r]);
-
-  for (const group of byDate.values()) {
-    if (group.length < 2) continue;
+  for (const group of dupDateGroups) {
     group.sort((a, b) => (a.created_at < b.created_at ? -1 : a.created_at > b.created_at ? 1 : 0));
 
     // Greedy cluster by overlap against each cluster's (earliest) primary.
@@ -380,7 +399,9 @@ export async function backfillMergeDuplicateMeetings(
             newAttendeeIds: ((att ?? []) as { member_id: string }[]).map((a) => a.member_id),
             roster,
             keys: opts.keys,
-            authorFallbackMemberId: opts.actorMemberId,
+            // Automatic path has no human actor; fall back to an active member so a pair whose
+            // submitters are both null (deleted members) still merges instead of retrying forever.
+            authorFallbackMemberId: opts.actorMemberId ?? roster[0]?.id ?? null,
           });
           await setMeetingNoteMergedInto(admin, dup.id, primary.id);
           summary.merged++;

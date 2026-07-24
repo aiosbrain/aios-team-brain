@@ -65,8 +65,12 @@ export async function getLlmHealth(teamId: string): Promise<LlmHealth> {
   };
   try {
     const res = await runSql<{ ok: boolean; meta: unknown; errors: unknown; finished_at: string | Date }>(
+      // Tie-break by `id desc`: two runs can share a millisecond `finished_at` (a fast fail then a retry
+      // in the same tick), and without the tie-break "the latest run" is arbitrary — the row's `ok` then
+      // flickers between degraded/healthy. `id` is the bigserial PK, so the most-recently-inserted run
+      // wins deterministically (the correct "latest").
       `select ok, meta, errors, finished_at from ingest_runs
-       where source = 'llm' and team_id = $1 order by finished_at desc limit 1`,
+       where source = 'llm' and team_id = $1 order by finished_at desc, id desc limit 1`,
       [teamId]
     );
     const row = res.rows[0];

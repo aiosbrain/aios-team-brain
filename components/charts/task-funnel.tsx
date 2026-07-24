@@ -20,6 +20,19 @@ export function TaskFunnel({ data }: { data: FunnelPoint[] }) {
     <ChartCard
       title="Execution"
       hint="tasks by status"
+      help={
+        <>
+          <span className="font-medium text-ink">What this is</span>
+          <br />
+          Every task the brain knows about, grouped by its current status — Backlog, Ready, In
+          progress, Blocked, Done.
+          <br />
+          <br />
+          This is a <span className="font-medium text-ink">live snapshot</span>, not a windowed
+          count: it reflects each task&apos;s status right now, so the date range above doesn&apos;t
+          change it.
+        </>
+      }
       empty={empty}
       emptyLabel="No tasks yet."
     >

@@ -27,3 +27,25 @@ export function fmtDate(iso: string | null | undefined): string {
 export function truncate(s: string, n: number): string {
   return s.length > n ? `${s.slice(0, n - 1)}…` : s;
 }
+
+/**
+ * Flatten inline markdown to plain text for compact UI (e.g. decision titles arrive from a markdown
+ * decision log, so `**Pause GUI**` must render as "Pause GUI", not with literal asterisks). Handles
+ * links/images → their text, inline code, bold/italic/strikethrough, and leading block markers.
+ * Strip BEFORE truncating so a cut title can't leave a dangling `**`. Pure + unit-tested.
+ */
+export function stripMarkdown(s: string | null | undefined): string {
+  return (s ?? "")
+    .replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1") // images → alt text
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1") // links → link text
+    .replace(/`+([^`]*)`+/g, "$1") // inline code
+    .replace(/(\*\*|__)(.*?)\1/g, "$2") // bold (** or __)
+    .replace(/\*([^*]+?)\*/g, "$1") // italic (*)
+    // italic (_) ONLY at word boundaries, so mid-word underscores in identifiers (snake_case, MY_VAR)
+    // aren't treated as emphasis and mangled to snakecase / MYVAR (Fable review).
+    .replace(/(^|[^\w])_([^_]+?)_(?=\W|$)/g, "$1$2")
+    .replace(/~~(.*?)~~/g, "$1") // strikethrough
+    .replace(/^\s{0,3}(?:#{1,6}|>|[-*+]|\d+\.)\s+/gm, "") // leading heading/quote/list markers
+    .replace(/\s+/g, " ")
+    .trim();
+}

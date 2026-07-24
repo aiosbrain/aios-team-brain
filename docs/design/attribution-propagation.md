@@ -13,9 +13,9 @@ do arcs recompute?" Answer today: **partially, and with a lag.** This closes bot
   `addMemberEmail` / `removeMemberEmail` / `unlinkMemberIdentity` / `linkMemberGithub`
   (`app/t/[team]/admin/members/actions.ts`) only `revalidatePath` — they do **not** call
   `reattributeItems`. Propagation is the **manual** "Re-attribute content" button.
-- **And arcs lag.** `arc_cache` (Postgres, 10-min TTL + in-memory front, `lib/graph/arcs.ts` `cache`) is
+- **And arcs lag.** `arc_cache` (Postgres, 4h TTL + in-memory front, `lib/graph/arcs.ts` `cache`) is
   **not invalidated** when `member_id` changes. Even after a re-attribution, the Learning panel shows
-  the old arcs until the SWR TTL lapses (≤10 min) or a manual recompute.
+  the old arcs until the SWR TTL lapses (≤4h) or a manual recompute.
 
 ## Prerequisite — a durable authority marker (`items.member_id_locked`)
 
@@ -45,7 +45,7 @@ single-writer batch):
 snappily and the reconcile happens post-response:
 - the six identity/email/github member actions above,
 - the **NL correction box** (`applyAttributionCorrection` already writes `member_id` directly → after it,
-  `staleArcCache` so arcs reflect the correction without the 10-min wait; no `reattributeItems` needed
+  `staleArcCache` so arcs reflect the correction without the 4h wait; no `reattributeItems` needed
   there since the items are already re-pointed).
 
 **`staleArcCache(db, teamId)`** (in `lib/graph/arc-cache`, the sole writer):
@@ -68,7 +68,7 @@ snappily and the reconcile happens post-response:
   precedent). Non-durable across a mid-callback deploy/restart — acceptable: reconcile is idempotent and the
   manual "Re-attribute content" button remains the recovery path.
 - **In-flight-refresh race (bounded, documented):** a background arc refresh already running when reconcile
-  fires can `commitArcs` pre-correction arcs with a fresh timestamp, re-pinning them ≤10 min; self-heals at
+  fires can `commitArcs` pre-correction arcs with a fresh timestamp, re-pinning them ≤4h; self-heals at
   the next TTL.
 
 **Explicit exclusions (do NOT hook):**
@@ -83,10 +83,10 @@ snappily and the reconcile happens post-response:
 
 The **persistent** `arc_cache` goes stale immediately → any instance doing a cold/expired read serves the
 stale prior and background-recomputes with the fresh attribution on the next Learning view. The **only**
-lag: another app instance whose *in-memory* cache is still warm serves its copy for up to its 10-min TTL
-(`evictArcMemoryCache` only clears the acting process). Full cross-instance consistency ≤10 min; the
+lag: another app instance whose *in-memory* cache is still warm serves its copy for up to its 4h TTL
+(`evictArcMemoryCache` only clears the acting process). Full cross-instance consistency ≤4h; the
 authoritative store and the acting instance are immediate. (A cross-instance bust — e.g. a `pg_notify`
-channel the in-memory layer listens on — is a clean follow-up if the ≤10-min tail ever matters; today the
+channel the in-memory layer listens on — is a clean follow-up if the ≤4h tail ever matters; today the
 self-host deployment is typically single-instance so the tail is usually zero.)
 
 ## Not in scope

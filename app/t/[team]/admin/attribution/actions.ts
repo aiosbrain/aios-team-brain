@@ -3,7 +3,7 @@
 import { z } from "zod";
 import { revalidatePath } from "next/cache";
 import { after } from "next/server";
-import { bustTeamArcs } from "@/lib/ingest/reconcile-attribution";
+import { bustTeamLearningCaches } from "@/lib/ingest/reconcile-attribution";
 import { adminClient } from "@/lib/db/admin";
 import { requireTeamAdmin } from "@/lib/auth/guard";
 import { resolveAnsweringKeys } from "@/lib/query/answering";
@@ -39,7 +39,7 @@ export async function previewAttributionCorrectionAction(
       buildCorrectionContext(ctx.teamId),
       resolveAnsweringKeys(db, ctx.teamId),
     ]);
-    const plan = await parseCorrectionPlan(trimmed, context, keys);
+    const plan = await parseCorrectionPlan(trimmed, context, keys, { db, teamId: ctx.teamId });
     if (!plan) return { ok: false, error: "couldn't turn that into a scoped correction — try naming a source, a path, or a person (e.g. \"the linear docs are Fatma's\")." };
 
     const preview = await previewCorrection(ctx.teamId, plan);
@@ -112,8 +112,8 @@ export async function applyAttributionCorrectionAction(
     if (result.ok && result.updated > 0) {
       revalidatePath(`/t/${teamSlug}/admin/attribution`);
       // The correction already re-pointed member_id (+ locked it) — just refresh arcs so the change
-      // shows without the 10-min TTL. No reattribute here (it would fight the correction).
-      after(() => bustTeamArcs(adminClient(), ctx.teamId, teamSlug));
+      // shows without waiting out the 4h TTL. No reattribute here (it would fight the correction).
+      after(() => bustTeamLearningCaches(adminClient(), ctx.teamId, teamSlug));
     }
     return result;
   } catch (e) {

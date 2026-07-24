@@ -6,4 +6,6 @@ export interface DecisionRow {
   decided_at: string | null;
   tier: number | null;
   still_valid: boolean;
+  /** The item (decision-log doc / meeting) this decision was recorded in — links to /library/<id>. */
+  source_item_id: string | null;
 }

@@ -59,17 +59,16 @@ export default async function TeamLayout({
   // (/decisions, empty + unused). "Data" moved under Admin → Data (verification/debug view, now
   // admin-gated). The "Work" group is dropped (nothing left in it; Projects stays commented out).
   // "Meetings" stays a top-level entry — a new, actively-used surface, not part of the trim.
+  // "Pulse" (home) is now the flagship narrative surface: it absorbed the old "Learning" tab (arcs +
+  // timeline + facts/events), so that entry was removed and `/learning` redirects here. The Brain icon
+  // fronts Pulse to signal it's the synthesized-understanding surface, not a generic dashboard home.
   const items: NavEntry[] = [
-    { icon: "home", label: "Home", href: base, exact: true },
+    { icon: "learning", label: "Pulse", href: base, exact: true },
     { icon: "codebases", label: "Codebases", href: `${base}/codebases` },
     { icon: "meetings", label: "Meetings", href: `${base}/meetings` },
-    { icon: "learning", label: "Learning", href: `${base}/learning` },
     { icon: "query", label: "Query", href: `${base}/query` },
   ];
-  // Social Brain — an operator surface (discovers, generates, spends, publishes), so admin-only.
-  if (me.role === "admin") {
-    items.push({ icon: "social", label: "Social", href: `${base}/social` });
-  }
+  // "Social" removed from the left nav (product call) — the /social route still resolves by direct URL.
   items.push({ label: "Settings", children: settingsChildren });
 
   return (

@@ -196,6 +196,11 @@ export type QueryUsage = {
   output_tokens: number;
   cache_read_tokens: number;
   cost_usd: number;
+  /** Backend that answered — so the caller can meter this spend into `llm_usage` (provider/model slices). */
+  provider: string;
+  model: string;
+  /** true = `cost_usd` is a price-table estimate (Anthropic); false = provider-metered (OpenRouter). */
+  estimated: boolean;
 };
 
 /**
@@ -288,6 +293,10 @@ export async function* streamAnswer(
       output_tokens: u.output_tokens ?? 0,
       cache_read_tokens: u.cache_read_input_tokens ?? 0,
       cost_usd: Math.round(cost * 100000) / 100000,
+      provider: backend.provider,
+      model: backend.model,
+      // Anthropic doesn't return a charge — this cost is estimated from the list-price constants above.
+      estimated: true,
     },
   };
 }
@@ -296,7 +305,11 @@ export async function* streamAnswer(
  * Stream from an OpenAI-compatible chat endpoint — OpenRouter (per-team gateway) OR a local
  * endpoint (Ollama/Hermes/llama.cpp via LLM_BASE_URL). Same `delta`/`done` contract as the Anthropic
  * path. Strips any `<think>…</think>` reasoning spans so the answer stays clean on reasoning models.
- * Cost is reported as $0 here (token counts are accurate); per-model OpenRouter cost is a follow-up.
+ *
+ * Cost: OpenRouter returns the ACTUAL charge for the generation in the streamed `usage.cost` field
+ * (USD credits, 1:1 with USD) — we read it so the dashboard "Brain spend" KPI reflects real spend
+ * instead of $0. A bare local/self-hosted OpenAI-compatible endpoint (Ollama/llama.cpp) has no cost
+ * to report, so `usage.cost` is absent and cost stays $0 there (correct — it's free/self-run).
  */
 export async function* streamOpenAICompatible(
   backend: Extract<LlmBackend, { kind: "openrouter" | "openai-compatible" }>,
@@ -339,6 +352,9 @@ export async function* streamOpenAICompatible(
         max_tokens: maxTokensToSend,
         stream: true,
         stream_options: { include_usage: true },
+        // OpenRouter surfaces the real generation cost in the streamed usage; ask for it explicitly
+        // (harmless no-op on providers that already include usage). Read below as `usage.cost`.
+        ...(backend.kind === "openrouter" ? { usage: { include: true } } : {}),
         messages: [
           { role: "system", content: SYSTEM_PROMPT },
           { role: "user", content: userContent },
@@ -370,6 +386,7 @@ export async function* streamOpenAICompatible(
   let inThink = false;
   let prompt = 0;
   let completion = 0;
+  let cost = 0;
   let emittedChars = 0;
 
   while (true) {
@@ -385,7 +402,7 @@ export async function* streamOpenAICompatible(
       if (data === "[DONE]") continue;
       let j: {
         choices?: { delta?: { content?: string } }[];
-        usage?: { prompt_tokens?: number; completion_tokens?: number };
+        usage?: { prompt_tokens?: number; completion_tokens?: number; cost?: number };
       };
       try {
         j = JSON.parse(data);
@@ -395,6 +412,11 @@ export async function* streamOpenAICompatible(
       if (j.usage) {
         prompt = j.usage.prompt_tokens ?? prompt;
         completion = j.usage.completion_tokens ?? completion;
+        // OpenRouter reports the real generation cost here (USD). Absent on plain local endpoints.
+        // NB: on a BYOK OpenRouter key the upstream inference charge lands in
+        // usage.cost_details.upstream_inference_cost (not `cost`) — this team is on credits, so `cost`
+        // is the full spend; revisit if a BYOK provider key is ever attached.
+        if (typeof j.usage.cost === "number") cost = j.usage.cost;
       }
       let piece: string = j.choices?.[0]?.delta?.content ?? "";
       if (!piece) continue;
@@ -437,7 +459,14 @@ export async function* streamOpenAICompatible(
       input_tokens: prompt,
       output_tokens: completion,
       cache_read_tokens: 0,
-      cost_usd: 0,
+      // Round to the query_log column scale (numeric(10,5)); 0 when the provider reports no cost.
+      cost_usd: Math.round(cost * 100000) / 100000,
+      provider: backend.provider,
+      model: backend.model,
+      // OpenRouter reports the real charge (metered); a bare local endpoint is genuinely free ($0).
+      // A paid OpenAI-cloud backend returns no cost here and we have no price table → flag it as NOT
+      // authoritative so a $0 doesn't silently undercount spend.
+      estimated: cost === 0 && backend.provider === "openai",
     },
   };
 }

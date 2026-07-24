@@ -27,6 +27,9 @@ const MAX_TOTAL_CHARS = 160_000; // ~40k tokens context cap
 // larger candidate pool just lets more of a many-small-item corpus through, best-ranked first. Tune
 // via FTS_CANDIDATE_LIMIT. (The recall CEILING beyond this is the dense/rerank job, not keyword FTS.)
 const FTS_CANDIDATE_LIMIT = Number(process.env.FTS_CANDIDATE_LIMIT ?? 50);
+// When the question names a source (`parseSourceScope`), how many of its MOST-RECENT items to pull in
+// by recency (bypassing FTS rank) so "what's the conversation in slack" surfaces the latest threads.
+const SOURCE_RECENCY_LIMIT = Number(process.env.SOURCE_RECENCY_LIMIT ?? 8);
 const GIT_WINDOW_DAYS = 90; // recency window for the per-contributor git-activity digest
 const PEOPLE_WINDOW_DAYS = 90; // recency window for the per-person cross-tool activity digest
 
@@ -252,6 +255,45 @@ export function parseChannelScope(question: string): { channel: string | null; c
   return { channel: null, cleaned: question };
 }
 
+/**
+ * Detect an explicit SOURCE scope — a query naming an ingestion source it wants the recent content
+ * FROM ("what's the conversation in slack right now", "latest notion docs", "what's on linear"). Generic
+ * content-similarity ranking BURIES such items: a Slack thread matches the query only on the single word
+ * "slack" in its `— Slack thread` heading, so it ranks below the FTS candidate cut (`FTS_CANDIDATE_LIMIT`)
+ * and never reaches the model — which then truthfully says it has no Slack, even though we ingest it.
+ * When a source is named, `nativeRetrieve` adds a RECENCY leg for it (most-recent items of that source,
+ * by `synced_at`, bypassing FTS rank). The source word is NOT stripped from the query (unlike a channel
+ * scope) — it's also a legit content term. Conservative: a concrete source brand-name as a whole word
+ * AND a recency/scope signal ("in/on/from/latest/recent/now/conversation/messages/…"), so ordinary prose
+ * ("the notion of causality", "linear algebra") never wrongly scopes. Returns the `frontmatter.source`
+ * value to filter on, or null. Pure + unit-tested.
+ */
+const SOURCE_SCOPE: Record<string, string> = {
+  slack: "slack",
+  notion: "notion",
+  granola: "granola",
+  linear: "linear",
+  plane: "plane",
+  confluence: "confluence",
+};
+// Scope requires ADJACENCY, not just a source word somewhere (a bare-word gate scoped "growth linear in
+// Q3" / "linear regression" / "plane ticket"). Two forms:
+//   • `<prep> [the] <source>`     — "in slack", "from notion"          (BRAND-only sources)
+//   • `<source> <content-noun>`   — "notion docs", "linear issues"     (ALL sources)
+// `linear`/`notion`/`plane` are also common English words, so they scope ONLY via the content-noun form
+// (never bare "on the linear regression"); the brand-only names (slack/granola/confluence) also take a
+// preposition. Deliberately NOT scopeable yet: gdrive, git/github (github activity is served by the
+// per-contributor git digest). Pure + unit-tested (positives + the common-word false-positives).
+const BRAND_ONLY_SOURCES = ["slack", "granola", "confluence"];
+const SOURCE_NOUNS = "conversations?|messages?|threads?|chats?|discussions?|posts?|docs?|notes?|updates?|channels?|activity|issues?";
+const PREP_SOURCE_RE = new RegExp(`\\b(?:in|on|from|to)\\s+(?:the\\s+)?(${BRAND_ONLY_SOURCES.join("|")})\\b`, "i");
+const SOURCE_NOUN_RE = new RegExp(`\\b(${Object.keys(SOURCE_SCOPE).join("|")})\\s+(?:${SOURCE_NOUNS})\\b`, "i");
+
+export function parseSourceScope(question: string): { source: string | null } {
+  const m = question.match(PREP_SOURCE_RE) ?? question.match(SOURCE_NOUN_RE);
+  return { source: m ? SOURCE_SCOPE[m[1].toLowerCase()] : null };
+}
+
 const MAX_EXPANSION_TERMS = 24;
 
 /**
@@ -425,6 +467,10 @@ async function nativeRetrieve(
   // item retrieval to it and strip the phrase so the channel word isn't also a content search term.
   const { channel, cleaned } = parseChannelScope(question);
   const q = channel ? cleaned : question;
+  // Source scope (this fix): if the question names a source it wants recent content FROM ("what's the
+  // conversation in slack"), we add a recency leg for that source below — such items are buried by
+  // content-ranking (they match only on the source word in their heading) and never reach the model.
+  const { source: scopedSource } = parseSourceScope(question);
 
   // Kick off the Graphiti graph-memory search concurrently with Postgres retrieval.
   const graphFactsP = fetchGraphFacts(db, teamId, tier, q);
@@ -464,6 +510,23 @@ async function nativeRetrieve(
   // Channel scope (Gap #4) — keep the recency fallback inside the same channel. LIKE on the 2nd
   // path segment; the FTS leg uses a precise split_part match, this soft filter is fine for padding.
   if (channel) recentB = recentB.like("path", `%/${channel}/%`);
+
+  // 2a. SOURCE-scoped recency: when the question names a source, pull its most-recent items by
+  // `synced_at` REGARDLESS of keyword rank (the recall fix for "what's the conversation in slack" —
+  // Slack threads rank below the FTS cut, so they never reached the model). Tier-filtered like every
+  // leg; also channel-scoped when both are named. `null` → no source query (resolves to empty rows).
+  let sourceRecencyB: typeof recentB | null = null;
+  if (scopedSource) {
+    sourceRecencyB = db
+      .from("items")
+      .select("id, path, kind, body, synced_at, projects(slug)")
+      .eq("team_id", teamId)
+      .eq("frontmatter->>source", scopedSource)
+      .order("synced_at", { ascending: false })
+      .limit(SOURCE_RECENCY_LIMIT);
+    if (isRestrictedTier(tier)) sourceRecencyB = sourceRecencyB.eq("access", "external");
+    if (channel) sourceRecencyB = sourceRecencyB.like("path", `%/${channel}/%`);
+  }
 
   // 3. Structured-context query builders (awaited together with the above).
   let decisionsB = db
@@ -523,6 +586,7 @@ async function nativeRetrieve(
   const [
     ftsHits,
     { data: recentHits },
+    { data: sourceRecentHits },
     { data: decisions },
     { data: tasks },
     { data: commitments },
@@ -532,6 +596,7 @@ async function nativeRetrieve(
   ] = await Promise.all([
     ftsP,
     recentB,
+    sourceRecencyB ?? Promise.resolve({ data: [] as unknown[] }),
     decisionsB,
     tasksB,
     commitmentsB,
@@ -546,14 +611,18 @@ async function nativeRetrieve(
   type MergeHit = { id: string; path: string; kind: string; body: string; synced_at: string; slug: string };
   const iso = (v: string | Date): string => (v instanceof Date ? v.toISOString() : String(v ?? ""));
   const rankedHits: MergeHit[] = ftsHits.map((h) => ({ id: h.id, path: h.path, kind: h.kind, body: h.body, synced_at: h.synced_at, slug: h.project }));
-  const recencyHits: MergeHit[] = ((recentHits ?? []) as { id: string; path: string; kind: string; body: string | null; synced_at: string | Date; projects: unknown }[]).map(
-    (h) => ({ id: h.id, path: h.path, kind: h.kind, body: h.body ?? "", synced_at: iso(h.synced_at), slug: (h.projects as { slug: string })?.slug ?? "" })
-  );
+  type RecencyRow = { id: string; path: string; kind: string; body: string | null; synced_at: string | Date; projects: unknown };
+  const toMergeHit = (h: RecencyRow): MergeHit => ({ id: h.id, path: h.path, kind: h.kind, body: h.body ?? "", synced_at: iso(h.synced_at), slug: (h.projects as { slug: string })?.slug ?? "" });
+  const recencyHits: MergeHit[] = ((recentHits ?? []) as RecencyRow[]).map(toMergeHit);
+  // Source-scoped recent items (when the question named a source) — placed AHEAD of the generic recency
+  // padding so a named source's latest content beats arbitrary fresh items, but AFTER the ranked FTS
+  // hits so query-specific relevance still leads. Dedup by id handles any overlap.
+  const sourceRecencyHits: MergeHit[] = ((sourceRecentHits ?? []) as RecencyRow[]).map(toMergeHit);
   const seen = new Set<string>();
   const sources: Source[] = [];
   let total = 0;
   let n = 1;
-  for (const hit of [...rankedHits, ...recencyHits]) {
+  for (const hit of [...rankedHits, ...sourceRecencyHits, ...recencyHits]) {
     if (seen.has(hit.id)) continue;
     seen.add(hit.id);
     if (projectSlug && hit.slug !== projectSlug) continue;
@@ -602,6 +671,13 @@ async function nativeRetrieve(
   const hadFtsHit = ftsHits.length > 0;
   const spec = await specificityP;
   let grounded = spec.specificMatching ? true : spec.allCommon ? hadFtsHit : false;
+  // A named-source recency item that actually made it INTO `sources` (survived the project filter + char
+  // budget — not merely returned by the leg) IS query-specific evidence: the user asked about that source
+  // and its recent content reached the model, so don't let the IDF grounding abstain it away (that would
+  // reproduce the "we ingest Slack but the answer says we don't" bug this leg fixes). Checking membership
+  // in `sources`, not the raw leg length, avoids claiming grounded when every scoped hit was filtered out.
+  const includedItemIds = new Set(sources.map((s) => s.item_id).filter(Boolean));
+  if (sourceRecencyHits.some((h) => includedItemIds.has(h.id))) grounded = true;
 
   // 2c. Semantic expansion via Graphiti (the graph search ran in parallel above). Use the facts'
   // entity/relationship terms to expand the FTS and surface items the literal keyword search missed.

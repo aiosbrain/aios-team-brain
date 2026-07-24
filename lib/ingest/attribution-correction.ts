@@ -1,6 +1,7 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { audit } from "@/lib/api/audit";
+import { recordCorrectionReassignments } from "@/lib/ingest/reassignment-log";
 import { resolveCorrection, type CorrectionPlan } from "@/lib/attribution/correction";
 
 /**
@@ -36,6 +37,17 @@ export async function applyAttributionCorrection(
   if (r.matched.length === 0) return { ok: true, updated: 0, target: r.target.label };
 
   const ids = r.matched.map((m) => m.id);
+  // Read the OUTGOING owners BEFORE the update, so each item's mislabel-fix transition (A→target) can be
+  // logged on the uniform item.reassigned stream (`via: correction`) — one query, not per-item.
+  const { data: priorRows } = await db
+    .from("items")
+    .select("id, member_id")
+    .eq("team_id", teamId)
+    .in("id", ids);
+  const priorOwner = new Map(
+    ((priorRows ?? []) as { id: string; member_id: string | null }[]).map((p) => [p.id, p.member_id])
+  );
+
   // LOCK the attribution: a deliberate correction must survive automatic re-attribution + the
   // unchanged-repush heal (docs/design/attribution-propagation.md). `member_id_locked = true` marks it
   // manual; `reattributeItems` and the heal skip locked rows.
@@ -46,6 +58,14 @@ export async function applyAttributionCorrection(
     .in("id", ids);
   if (error) return { ok: false, updated: 0, target: r.target.label, error: error.message };
 
+  // Record the per-item ownership transitions this correction caused — ONLY items with a real prior owner
+  // that actually changed (a null→target fill isn't a reassignment). `via: correction` marks these as
+  // authoritative mislabel-fixes (the outgoing owner's window is void). See attribution-ownership-timeline.
+  const changes = ids
+    .map((id) => ({ itemId: id, from: priorOwner.get(id) ?? null, to: r.target.memberId }))
+    .filter((c): c is { itemId: string; from: string; to: string | null } => c.from !== null && c.from !== r.target.memberId);
+  await recordCorrectionReassignments(db, teamId, actor.memberId, changes);
+
   await audit(db, {
     team_id: teamId,
     actor_kind: "member",
@@ -53,7 +73,7 @@ export async function applyAttributionCorrection(
     action: "attribution.corrected",
     target_type: "items",
     target_id: null,
-    meta: { plan, updated: ids.length, target: r.target.clear ? null : r.target.memberId },
+    meta: { plan, updated: ids.length, reassigned: changes.length, target: r.target.clear ? null : r.target.memberId },
   });
   return { ok: true, updated: ids.length, target: r.target.label, capped: r.capped };
 }

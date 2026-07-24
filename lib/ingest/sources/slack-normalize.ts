@@ -45,6 +45,45 @@ function renderMessage(m: SlackMessage, opts: NormalizeOpts): string {
   return `**${author}**${when ? ` · ${when}` : ""}\n\n${renderText(m.text ?? "", opts.users)}`;
 }
 
+/** One thread PARTICIPANT — a distinct message author across the root + replies, with how much and when
+ *  they contributed. Structured signal (kept OUT of `authors[]`, which would let a resolvable replier steal
+ *  thread ownership via the attribution resolver): the timeline reads this to show a Slack conversation in
+ *  EACH contributor's day, not only the thread starter's. */
+export interface SlackParticipant {
+  author_id: string;
+  display_name: string;
+  message_count: number;
+  first_ts: string; // ISO — their first message in the thread
+  last_ts: string; // ISO — their last message (their "contribution time" for the timeline)
+}
+
+/** Distinct message authors → participants, message-counted, with first/last contribution time. Pure. */
+export function threadParticipants(thread: FetchedThread, users: Record<string, string>): SlackParticipant[] {
+  const by = new Map<string, SlackParticipant>();
+  for (const m of [thread.root, ...thread.replies]) {
+    const uid = m.user;
+    if (!uid) continue;
+    const iso = tsToIso(m.ts);
+    const cur = by.get(uid);
+    if (cur) {
+      cur.message_count++;
+      if (iso && (!cur.last_ts || iso > cur.last_ts)) cur.last_ts = iso;
+      if (iso && (!cur.first_ts || iso < cur.first_ts)) cur.first_ts = iso;
+    } else {
+      by.set(uid, { author_id: uid, display_name: users[uid] ?? uid, message_count: 1, first_ts: iso, last_ts: iso });
+    }
+  }
+  return [...by.values()];
+}
+
+/** A readable thread title from the root message (first line, capped) — so the timeline shows the
+ *  conversation topic rather than a raw `slack/<channel>/<ts>` path. */
+function threadTitle(thread: FetchedThread, opts: NormalizeOpts): string {
+  const rootText = renderText(thread.root.text ?? "", opts.users).replace(/\s+/g, " ").trim();
+  const snippet = rootText.slice(0, 100);
+  return snippet ? `#${opts.channelName}: ${snippet}` : `#${opts.channelName} thread`;
+}
+
 export function normalizeThread(thread: FetchedThread, opts: NormalizeOpts): ItemPayload {
   const { root, replies } = thread;
   const channelSeg = safeSegment(opts.channelName || opts.channelId);
@@ -72,6 +111,11 @@ export function normalizeThread(thread: FetchedThread, opts: NormalizeOpts): Ite
       author_id: root.user ?? "",
       source_ts: tsToIso(root.ts),
       reply_count: replies.length,
+      // A readable topic + the per-participant contribution ledger (structured, NOT authors[]). The
+      // timeline surfaces this thread in each participant's day; content_sha256 covers only the body, so
+      // adding these frontmatter keys creates no new version — the frontmatter heal refreshes them.
+      title: threadTitle(thread, opts),
+      participants: threadParticipants(thread, opts.users),
     },
     body,
   };

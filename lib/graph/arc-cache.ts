@@ -15,10 +15,18 @@ import type { NarrativeArc } from "./arcs";
  * touches the external-group row, with no cross-tier bleed.
  */
 
+/** How long a synthesized arc set is served before the next view triggers a background recompute
+ *  (serve-stale-while-revalidate). 4h — arcs are a slow, expensive, once-a-day-ish narrative; a shorter
+ *  window just burns LLM calls (the fact-set-hash skip already keeps unchanged facts from re-synthesizing).
+ *  Shared with `staleArcCache` below so a re-attribution's forced-stale mark stays PAST this window. */
+export const ARC_CACHE_TTL_MS = 4 * 60 * 60_000;
+
 export interface ArcCacheEntry {
   arcs: NarrativeArc[];
   /** epoch ms of when this cache row was computed (for TTL/staleness checks in `arcs.ts`). */
   computedAt: number;
+  /** Hash of the LLM synthesis input at that compute — the fact-set-hash skip compares against it. */
+  factsHash: string | null;
 }
 
 /** Read the cached arcs for one team+group_key. Null on miss or any error (best-effort — a cache
@@ -27,16 +35,16 @@ export async function readArcCache(db: DbClient, teamId: string, groupKey: strin
   try {
     const { data } = await db
       .from("arc_cache")
-      .select("arcs, computed_at")
+      .select("arcs, computed_at, facts_hash")
       .eq("team_id", teamId)
       .eq("group_key", groupKey)
       .maybeSingle();
     if (!data) return null;
-    const row = data as { arcs: unknown; computed_at: string | Date };
+    const row = data as { arcs: unknown; computed_at: string | Date; facts_hash: string | null };
     const arcs = Array.isArray(row.arcs) ? (row.arcs as NarrativeArc[]) : [];
     const computedAt =
       typeof row.computed_at === "string" ? Date.parse(row.computed_at) : new Date(row.computed_at).getTime();
-    return { arcs, computedAt: Number.isFinite(computedAt) ? computedAt : 0 };
+    return { arcs, computedAt: Number.isFinite(computedAt) ? computedAt : 0, factsHash: row.facts_hash ?? null };
   } catch {
     return null;
   }
@@ -45,19 +53,19 @@ export async function readArcCache(db: DbClient, teamId: string, groupKey: strin
 /**
  * Mark ALL of a team's cached arcs STALE, so the next Learning view serves the stale-but-real prior and
  * fires the SWR recompute (with the now-corrected `items.member_id`). Used after a re-attribution so arcs
- * reflect the change immediately instead of after the 10-min TTL. See docs/design/attribution-propagation.md.
+ * reflect the change immediately instead of waiting out the 4h TTL. See docs/design/attribution-propagation.md.
  *
- * Stale = `computed_at` set to JUST PAST the TTL (10-min TTL + 1-min grace), NEVER epoch: `getArcs` then
- * treats it stale (SWR fires), but `commitArcs`'s empty-clobber guard still sees a "recent" prior (≈11 min
- * ≪ `EMPTY_CLOBBER_MAX_AGE_MS` 48h), so if that recompute hiccups and returns [] the real arcs are KEPT,
- * not blanked. Epoch would trip "prior too old → accept empty" and re-create the 2026-07 blank-panel bug.
+ * Stale = `computed_at` set to JUST PAST the TTL (TTL + 1-min grace), NEVER epoch: `getArcs` then treats
+ * it stale (SWR fires), but `commitArcs`'s empty-clobber guard still sees a "recent" prior (TTL+1min ≪
+ * `EMPTY_CLOBBER_MAX_AGE_MS` 48h), so if that recompute hiccups and returns [] the real arcs are KEPT, not
+ * blanked. Epoch would trip "prior too old → accept empty" and re-create the 2026-07 blank-panel bug.
  * Best-effort — a failed stale-mark must never fail the caller.
  */
 export async function staleArcCache(db: DbClient, teamId: string): Promise<void> {
   try {
-    // > 10-min TTL, ≪ 48h clobber cap. (If an ops override sets ARCS_EMPTY_CLOBBER_MAX_AGE_MS below ~11min
-    // the two would invert — the forced-stale prior becomes clobber-eligible — so keep that cap ≫ the TTL.)
-    const staleAt = new Date(Date.now() - 11 * 60_000).toISOString();
+    // > the TTL (so getArcs sees it stale), ≪ the 48h clobber cap. Tied to ARC_CACHE_TTL_MS so a TTL
+    // change can't silently break the re-attribution→refresh guarantee. (Keep the clobber cap ≫ the TTL.)
+    const staleAt = new Date(Date.now() - (ARC_CACHE_TTL_MS + 60_000)).toISOString();
     await db.from("arc_cache").update({ computed_at: staleAt }).eq("team_id", teamId);
   } catch {
     // best-effort — arcs still refresh on their normal TTL if this fails
@@ -70,14 +78,15 @@ export async function writeArcCache(
   db: DbClient,
   teamId: string,
   groupKey: string,
-  arcs: NarrativeArc[]
+  arcs: NarrativeArc[],
+  factsHash: string | null
 ): Promise<void> {
   try {
     // `arcs` is a top-level JSON array. The pg adapter only auto-casts non-array objects to jsonb, so
     // serialize it ourselves — a string param binds as text and Postgres assignment-casts it into the
     // jsonb column (a raw JS array would otherwise be bound as a Postgres array literal → json error).
     await db.from("arc_cache").upsert(
-      { team_id: teamId, group_key: groupKey, arcs: JSON.stringify(arcs), computed_at: new Date().toISOString() },
+      { team_id: teamId, group_key: groupKey, arcs: JSON.stringify(arcs), facts_hash: factsHash, computed_at: new Date().toISOString() },
       { onConflict: "team_id,group_key" }
     );
   } catch {

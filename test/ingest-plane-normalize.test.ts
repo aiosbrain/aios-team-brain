@@ -1,6 +1,17 @@
 import { describe, it, expect } from "vitest";
-import { normalizePlaneProject, normalizePlaneDocs, type NormalizePlaneInput } from "@/lib/ingest/sources/plane-normalize";
+import { normalizePlaneProject, normalizePlaneDocs, planeWorkedAt, type NormalizePlaneInput } from "@/lib/ingest/sources/plane-normalize";
 import { itemPayloadSchema, taskRowSchema } from "@/lib/api/schemas";
+
+// Spec (worked_at): a Plane work-item's WORK time = completed_at (a pure state transition). NO
+// updated_at fallback. Flows to tasks.worked_at → the timeline "did work" signal.
+describe("planeWorkedAt", () => {
+  it("uses completed_at", () => {
+    expect(planeWorkedAt({ id: "w", completed_at: "2026-07-05T00:00:00Z" })).toBe("2026-07-05T00:00:00.000Z");
+  });
+  it("returns '' for an incomplete item (no completed_at, no fallback)", () => {
+    expect(planeWorkedAt({ id: "w" })).toBe("");
+  });
+});
 
 // Spec (Plane inbound import): a Plane project's work-items normalize to ONE kind="task"
 // ItemPayload whose rows diff-sync by a stable row_key. The import is one-directional

@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { applyAttributionCorrection } from "@/lib/ingest/attribution-correction";
 import { reattributeItems } from "@/lib/ingest/reattribute";
-import { staleArcCache, writeArcCache } from "@/lib/graph/arc-cache";
+import { staleArcCache, writeArcCache, ARC_CACHE_TTL_MS } from "@/lib/graph/arc-cache";
 import type { NarrativeArc } from "@/lib/graph/arcs";
 import { db, seedTeam, ingest } from "./helpers";
 
@@ -67,15 +67,15 @@ describe("attribution propagation (real Postgres)", () => {
     expect((i2 as { body: string }).body).toContain("edited"); // the edit DID land (only member_id was preserved)
   });
 
-  it("staleArcCache marks arcs stale (past the 10-min TTL) but within the 48h empty-clobber cap", async () => {
+  it("staleArcCache marks arcs stale (past the SWR TTL) but within the 48h empty-clobber cap", async () => {
     const seed = await seedTeam();
     const arc: NarrativeArc = { id: "a", title: "t", confidence: "low", summary: "", participants: [], supporting_sources: [], evidence: [], derived_at: new Date().toISOString() };
-    await writeArcCache(db(), seed.teamId, "k", [arc]);
+    await writeArcCache(db(), seed.teamId, "k", [arc], null);
     await staleArcCache(db(), seed.teamId);
 
     const { data } = await db().from("arc_cache").select("computed_at").eq("team_id", seed.teamId).single();
     const ageMs = Date.now() - new Date((data as { computed_at: string }).computed_at).getTime();
-    expect(ageMs).toBeGreaterThan(10 * 60_000); // stale → getArcs fires the SWR recompute
+    expect(ageMs).toBeGreaterThan(ARC_CACHE_TTL_MS); // stale > TTL → getArcs fires the SWR recompute
     expect(ageMs).toBeLessThan(48 * 3_600_000); // but a hiccup-empty recompute still KEEPS the prior
   });
 });
