@@ -27,6 +27,18 @@ export interface GraphProjectionSummary {
   /** Episodes recorded as projected but never found in Graphiti — cleared so the next run
    * re-pushes them (a worker crash between accept and extraction; audit H3). */
   requeued: number;
+  /** Tier-reclassified items whose OLD-group cleanup was verified complete this run (B2). */
+  cleaned: number;
+  /** Tier cleanups STILL outstanding across all teams after this run (B2). This is the number that
+   * matters: while it is non-zero, old-tier episodes are purgeable-but-unpurged — a tier-isolation
+   * signal, not bookkeeping. A count that never returns to 0 means the cleanup is stuck (a saturated
+   * group scan, or Graphiti persistently refusing the delete), which the code deliberately produces
+   * instead of falsely clearing the flag — so it has to be visible. */
+  pendingCleanups: number;
+  /** Graphiti groups that have outgrown the reconcile scan window, so their landed-check was skipped
+   * this run. Non-zero means self-healing has quietly stopped for those groups — surfaced rather than
+   * swallowed, per the no-silent-caps rule (raise `GRAPH_LANDED_SCAN_DEPTH`). */
+  saturatedGroups: number;
   errors: string[];
 }
 
@@ -84,6 +96,9 @@ async function runGraphProjectionInner(opts?: {
     skipped: 0,
     reconciled: 0,
     requeued: 0,
+    cleaned: 0,
+    pendingCleanups: 0,
+    saturatedGroups: 0,
     errors: [],
   };
   if (!client.configured) return summary; // nowhere to project — skip cleanly
@@ -119,6 +134,9 @@ async function runGraphProjectionInner(opts?: {
       const r = await reconcileProjectedEpisodes(db, client, t.id);
       summary.reconciled += r.confirmed;
       summary.requeued += r.reQueued;
+      summary.cleaned += r.cleaned;
+      summary.pendingCleanups += r.pendingCleanups;
+      summary.saturatedGroups += r.saturatedGroups;
     } catch (e) {
       summary.ok = false;
       summary.errors.push(`${t.slug}: ${e instanceof Error ? e.message : "projection failed"}`);
