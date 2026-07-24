@@ -67,18 +67,40 @@ export interface TaskGroup {
   evidenceCount: number; // total nested evidence items (uncapped)
 }
 
+/** SIGNAL — data ABOUT work (a decision now; meetings later), shown in the Context lane, NEVER counted as
+ *  work. Kept a DISTINCT type from `EvidenceItem` so "signal never enters the work total/ordering/synopsis"
+ *  is true by construction, not a runtime flag. `at` is a bare `YYYY-MM-DD` (decisions have no time). */
+export type SignalKind = "decision";
+export interface SignalItem {
+  id: string;
+  kind: SignalKind;
+  title: string;
+  at: string; // bare YYYY-MM-DD — placed on that day, rendered with NO time
+  url?: string; // /library/<source_item_id> when present (dashboard-created decisions have none)
+  stillValid?: boolean; // false = later superseded (a "superseded" hint; NOT a filter — it WAS decided that day)
+}
+export interface SignalWithMember extends SignalItem {
+  memberId: string;
+}
+export interface SignalGroup {
+  kind: SignalKind;
+  count: number;
+  items: SignalItem[]; // newest-first, capped
+}
+
 export interface PersonDay {
   memberId: string;
   name: string;
   handle: string;
   avatarUrl?: string | null;
-  total: number; // evidence items — orders people within a day
+  total: number; // WORK evidence items ONLY — orders people within a day (signals never counted here)
   /** A 1–3 sentence human synopsis of what this person did that day (LLM; optional — the panel falls
    *  back to a counts line). Added in the cache-build path (`lib/dashboard/timeline-summary`), not the
    *  pure builder, so it's computed once per rebuild and never runs in the data-mechanics tier. */
   summary?: string;
   tasks: TaskGroup[];
-  other: SourceGroup[]; // evidence linked to no active task
+  other: SourceGroup[]; // WORK evidence linked to no active task
+  signals: SignalGroup[]; // Context lane — decisions etc. (about work); shown, never counted as work
 }
 
 export interface TimelineDay {
@@ -123,6 +145,10 @@ export function summaryPromptFor(p: PersonDay, dayLabel: string, itemCap = 8): s
  * newest-first ("unknown"/undated last); the first time a person appears wins, so the result is each
  * person's latest active day, ordered by recency (then that day's within-day `total` order). Pure +
  * unit-tested. The card that renders each entry is identical to a Timeline day's, so the two surfaces match.
+ *
+ * "Working on" is about WORK, so it selects each person's most recent day WITH real work (`total > 0`) — a
+ * signals-only day (a decision logged with no commits) must NOT displace their actual most-recent-work day.
+ * A person with only signals therefore doesn't appear on Home (they're not "working on" anything there).
  */
 export function mostRecentPerPerson(days: TimelineDay[]): PersonDay[] {
   const ordered = [...days].sort((a, b) => {
@@ -135,7 +161,7 @@ export function mostRecentPerPerson(days: TimelineDay[]): PersonDay[] {
   const out: PersonDay[] = [];
   for (const day of ordered) {
     for (const p of day.people) {
-      if (seen.has(p.memberId)) continue;
+      if (seen.has(p.memberId) || p.total === 0) continue; // skip already-seen AND signal-only days
       seen.add(p.memberId);
       out.push(p);
     }
@@ -239,19 +265,23 @@ export function groupTimeline(
   taskInfo: Map<string, TaskInfo>,
   members: Map<string, TimelineMember>,
   todayISO: string,
-  perSourceCap: number = DEFAULT_PER_SOURCE_CAP
+  perSourceCap: number = DEFAULT_PER_SOURCE_CAP,
+  signals: SignalWithMember[] = [], // Context lane — never counted as work
 ): TimelineDay[] {
-  // day -> memberId -> { tasks: Map<taskId, EvidenceItem[]>, other: EvidenceItem[] }
-  type PersonBucket = { tasks: Map<string, EvidenceItem[]>; other: EvidenceItem[] };
+  // day -> memberId -> { tasks, other (WORK), signals (SIGNAL) }
+  type PersonBucket = { tasks: Map<string, EvidenceItem[]>; other: EvidenceItem[]; signals: SignalItem[] };
   const byDay = new Map<string, Map<string, PersonBucket>>();
+  const bucket = (date: string, memberId: string): PersonBucket => {
+    const people = byDay.get(date) ?? new Map<string, PersonBucket>();
+    byDay.set(date, people);
+    const b = people.get(memberId) ?? { tasks: new Map<string, EvidenceItem[]>(), other: [], signals: [] };
+    people.set(memberId, b);
+    return b;
+  };
 
   for (const ev of evidence) {
     if (!members.has(ev.memberId)) continue; // unknown member → drop, don't guess
-    const date = dayOf(ev.at);
-    const people = byDay.get(date) ?? new Map<string, PersonBucket>();
-    byDay.set(date, people);
-    const b: PersonBucket = people.get(ev.memberId) ?? { tasks: new Map<string, EvidenceItem[]>(), other: [] };
-    people.set(ev.memberId, b);
+    const b = bucket(dayOf(ev.at), ev.memberId);
     const item: EvidenceItem = { id: ev.id, title: ev.title, url: ev.url, source: ev.source, kind: ev.kind, at: ev.at, linkedTask: ev.linkedTask };
     if (ev.taskId && taskInfo.has(ev.taskId)) {
       const arr = b.tasks.get(ev.taskId) ?? [];
@@ -260,6 +290,12 @@ export function groupTimeline(
     } else {
       b.other.push(item);
     }
+  }
+  // Signals bucket per (day, person) SEPARATELY — a signal can create a person-day (so "made decisions, no
+  // commits" is visible) but never touches tasks/other/total.
+  for (const s of signals) {
+    if (!members.has(s.memberId)) continue;
+    bucket(dayOf(s.at), s.memberId).signals.push({ id: s.id, kind: s.kind, title: s.title, at: s.at, url: s.url, stillValid: s.stillValid });
   }
 
   const days: TimelineDay[] = [];
@@ -274,11 +310,22 @@ export function groupTimeline(
         })
         .sort((x, y) => y.evidenceCount - x.evidenceCount || (x.title < y.title ? -1 : 1));
       const other = toSourceGroups(b.other, perSourceCap);
+      // `total` = WORK only (tasks + other). Signals are grouped by kind, newest-first, capped — never counted.
       const total = tasks.reduce((n, t) => n + t.evidenceCount, 0) + other.reduce((n, g) => n + g.count, 0);
-      personDays.push({ memberId, name: m.name, handle: m.handle, avatarUrl: m.avatarUrl, total, tasks, other });
+      const signalGroups: SignalGroup[] = [...groupByKind(b.signals).entries()]
+        .map(([kind, items]) => ({ kind, count: items.length, items: [...items].sort((x, y) => (x.at < y.at ? 1 : x.at > y.at ? -1 : 0)).slice(0, perSourceCap) }))
+        .sort((x, y) => y.count - x.count);
+      personDays.push({ memberId, name: m.name, handle: m.handle, avatarUrl: m.avatarUrl, total, tasks, other, signals: signalGroups });
     }
+    // Order by WORK; a signals-only person (total 0) ranks last but still shows in the day view.
     personDays.sort((a, b) => b.total - a.total || (a.name < b.name ? -1 : 1));
     days.push({ date, label: dayLabel(date, todayISO), people: personDays });
   }
   return days;
+}
+
+function groupByKind(items: SignalItem[]): Map<SignalKind, SignalItem[]> {
+  const m = new Map<SignalKind, SignalItem[]>();
+  for (const s of items) (m.get(s.kind) ?? m.set(s.kind, []).get(s.kind)!).push(s);
+  return m;
 }

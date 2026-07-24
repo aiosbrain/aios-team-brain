@@ -1,7 +1,8 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
-import { visibleItems, visibleTasks, type ViewerTier } from "@/lib/auth/visibility";
+import { visibleItems, visibleTasks, visibleDecisions, type ViewerTier } from "@/lib/auth/visibility";
 import { commitSubject } from "./team-work";
+import { subjectMatchesMember, type RosterPerson } from "./people-match";
 import {
   groupTimeline,
   normalizeSource,
@@ -9,6 +10,7 @@ import {
   type EvidenceItem,
   type EvidenceTaskRef,
   type EvidenceWithMember,
+  type SignalWithMember,
   type TaskInfo,
   type TimelineDay,
   type TimelineMember,
@@ -62,6 +64,7 @@ export const WINDOW_DAYS = 7;
 export const MAX_WINDOW_DAYS = 30;
 const ITEM_LIMIT = 2000;
 const TASK_LIMIT = 2000;
+const DECISION_LIMIT = 500;
 
 type ItemRow = {
   id: string;
@@ -141,12 +144,14 @@ export async function getWorkTimeline(
     email: string | null;
   }[]).filter((m) => !(m.email ?? "").endsWith("@connector.local"));
   const members = new Map<string, TimelineMember>();
+  const roster: RosterPerson[] = [];
   for (const m of humans) {
     members.set(m.id, {
       name: m.display_name ?? m.actor_handle ?? "Unknown",
       handle: m.actor_handle ?? "",
       avatarUrl: m.avatar_url,
     });
+    roster.push({ memberId: m.id, displayName: m.display_name ?? "", handle: m.actor_handle ?? "" });
   }
   if (members.size === 0) return [];
 
@@ -164,7 +169,7 @@ export async function getWorkTimeline(
   const pmProvider = str((teamRes.data as { primary_pm_provider: string | null } | null)?.primary_pm_provider);
   const pmSource = pmProvider ? normalizeSource(pmProvider) : "tasks";
 
-  const [gitRes, otherRes, taskRes, slackRes] = await Promise.all([
+  const [gitRes, otherRes, taskRes, slackRes, decisionRes] = await Promise.all([
     // Git commits (title = commit subject → needs body; commit bodies are small).
     visibleItems(
       db
@@ -222,6 +227,18 @@ export async function getWorkTimeline(
         .gte("synced_at", sinceIso)
         .order("synced_at", { ascending: false })
         .limit(ITEM_LIMIT),
+      tier
+    ),
+    // DECISIONS — the CONTEXT lane (signal, never counted as work). Dated by `decided_at` (a DATE).
+    // Tier-gated by the decision's own `audience` via the §5 choke-point.
+    visibleDecisions(
+      db
+        .from("decisions")
+        .select("id, title, decided_by, decided_at, source_item_id, still_valid, audience")
+        .eq("team_id", teamId)
+        .gte("decided_at", sinceIso.slice(0, 10))
+        .order("decided_at", { ascending: false })
+        .limit(DECISION_LIMIT),
       tier
     ),
   ]);
@@ -359,5 +376,37 @@ export async function getWorkTimeline(
     }
   }
 
-  return groupTimeline(evidence, taskInfo, members, todayISO);
+  // SIGNAL lane — decisions (data ABOUT work, never counted as work). WARN, not throw: this is a context
+  // enrichment leg (like Slack), so a decisions read failure must not blank the WORK timeline.
+  if (decisionRes.error) console.warn("[work-timeline] decisions read failed:", decisionRes.error.message);
+  const signals: SignalWithMember[] = [];
+  for (const d of (decisionRes.data ?? []) as {
+    id: string;
+    title: string | null;
+    decided_by: string | null;
+    decided_at: string | null;
+    source_item_id: string | null;
+    still_valid: boolean | null;
+  }[]) {
+    if (!d.decided_at) continue; // no day to place it on (mirrors the undated-work drop)
+    const by = (d.decided_by ?? "").trim();
+    if (!by) continue; // empty / group-level decided_by → dropped (a later team-signal lane's job)
+    // MULTI-person decided_by ("Chetan + John", "A & B", "Dana and Lee") → drop: crediting one is wrong,
+    // and `subjectMatchesMember` folds "Chetan + John" onto a bare-first-name member (would falsely match 1).
+    if (/[+&,/]|\band\b/i.test(by)) continue;
+    // Attribute to a member — but DROP on AMBIGUOUS (≥2 roster matches) or NO match: never guess.
+    const matched = roster.filter((p) => subjectMatchesMember(by, p));
+    if (matched.length !== 1) continue;
+    signals.push({
+      id: d.id,
+      memberId: matched[0].memberId,
+      kind: "decision",
+      title: d.title || "(untitled decision)",
+      at: d.decided_at.slice(0, 10), // bare YYYY-MM-DD — rendered with no time
+      url: d.source_item_id ? `/library/${d.source_item_id}` : undefined,
+      stillValid: d.still_valid ?? true,
+    });
+  }
+
+  return groupTimeline(evidence, taskInfo, members, todayISO, undefined, signals);
 }
