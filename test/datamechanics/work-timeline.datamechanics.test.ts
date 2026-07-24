@@ -237,4 +237,47 @@ describe("work timeline — attribution oracle (credits the worker, not the reas
     expect(names).not.toContain("Person B"); // B never worked → not credited
     expect(evidenceTitles(days)).toContain("feat: did the actual work");
   });
+
+  it("chips a commit that references a DONE task (association shown in Other, not nested — #350 stays active-only)", async () => {
+    const seed = await seedTeam();
+    const anchor = await commit(seed, "seed");
+    // A task that just shipped (Done) — excluded from the active nesting headers by #350.
+    await insertTask(seed, anchor.projectId!, { row_key: "AIO-777", title: "Ship the widget", status: "done" });
+    // A commit for it, landing today.
+    await commit(seed, "fix: polish the widget (AIO-777)");
+
+    const days = await getWorkTimeline(db(), seed.teamId, "team");
+    // The done task is NOT a nesting header…
+    expect(taskTitles(days)).not.toContain("Ship the widget");
+    // …but the commit still shows the association as a chip in the Other bucket.
+    const chips = days
+      .flatMap((d) => d.people)
+      .flatMap((p) => p.other.flatMap((g) => g.items))
+      .filter((i) => i.title.includes("polish the widget"))
+      .map((i) => i.linkedTask);
+    expect(chips).toEqual([{ key: "AIO-777", title: "Ship the widget", status: "done" }]);
+  });
+
+  it("TIER: a chip never leaks a team-audience task to an external viewer (but an external task DOES chip)", async () => {
+    const seed = await seedTeam();
+    const anchor = await commit(seed, "seed");
+    // A TEAM-audience done task and a PUBLIC (external-audience) done task, both referenced by
+    // external-ACCESS commits (so the commit itself is visible to an external viewer).
+    await insertTask(seed, anchor.projectId!, { row_key: "SEC-99", title: "Team secret ticket", status: "done", audience: "team" });
+    await insertTask(seed, anchor.projectId!, { row_key: "PUB-1", title: "Public ticket", status: "done", audience: "external" });
+    const extCommit = (body: string) =>
+      ingest(seed, { kind: "artifact", path: `commits/repo/${randomUUID()}.md`, access: "external", body, frontmatter: { source: "git", committed_at: recentIso } });
+    await extCommit("fix: touch the secret (SEC-99)");
+    await extCommit("fix: touch the public thing (PUB-1)");
+
+    const chipKeys = (days: TimelineDay[]): (string | undefined)[] =>
+      days.flatMap((d) => d.people).flatMap((p) => p.other.flatMap((g) => g.items)).map((i) => i.linkedTask?.key);
+
+    const asExternal = await getWorkTimeline(db(), seed.teamId, "external");
+    expect(chipKeys(asExternal)).toContain("PUB-1"); // external task → external viewer DOES get the chip (non-vacuous)
+    expect(chipKeys(asExternal)).not.toContain("SEC-99"); // team task → NEVER leaked to an external viewer
+
+    const asTeam = await getWorkTimeline(db(), seed.teamId, "team");
+    expect(chipKeys(asTeam)).toEqual(expect.arrayContaining(["SEC-99", "PUB-1"])); // team viewer sees both
+  });
 });

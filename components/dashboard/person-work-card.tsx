@@ -1,5 +1,6 @@
 "use client";
 
+import { GitBranch } from "lucide-react";
 import { MemberAvatar } from "@/components/people/member-avatar";
 import { SourceIcon, sourceLabel } from "@/components/icons/source-icon";
 import type { PersonDay, SourceGroup, TaskGroup } from "@/lib/dashboard/timeline-group";
@@ -51,15 +52,28 @@ function EvidenceList({ group }: { group: SourceGroup }) {
       </div>
       <ul className="flex flex-col gap-1 border-l border-border-subtle pl-3">
         {group.items.map((it) => (
-          <li key={it.id} className="flex items-baseline justify-between gap-3">
-            {it.url ? (
-              <a href={it.url} target="_blank" rel="noreferrer" className="truncate text-sm text-ink hover:text-violet">
-                {it.title}
-              </a>
-            ) : (
-              <span className="truncate text-sm text-ink">{it.title}</span>
-            )}
-            <span className="shrink-0 text-[11px] text-ink-tertiary">{timeOf(it.at)}</span>
+          <li key={it.id} className="flex flex-col gap-0.5">
+            <div className="flex items-baseline justify-between gap-3">
+              {it.url ? (
+                <a href={it.url} target="_blank" rel="noreferrer" className="truncate text-sm text-ink hover:text-violet">
+                  {it.title}
+                </a>
+              ) : (
+                <span className="truncate text-sm text-ink">{it.title}</span>
+              )}
+              <span className="shrink-0 text-[11px] text-ink-tertiary">{timeOf(it.at)}</span>
+            </div>
+            {it.linkedTask ? (
+              <span
+                className="inline-flex max-w-full items-center gap-1 self-start rounded border border-border-subtle bg-surface-sunken px-1.5 py-0.5 text-[11px] text-ink-secondary"
+                title={`References ${it.linkedTask.key} (${it.linkedTask.status}): ${it.linkedTask.title}`}
+              >
+                <GitBranch className="size-3 shrink-0 text-ink-tertiary" />
+                <span className="shrink-0 font-medium text-ink-secondary">{it.linkedTask.key}</span>
+                <span className="truncate text-ink-tertiary">· {it.linkedTask.title}</span>
+                {it.linkedTask.status ? <span className="shrink-0 text-ink-tertiary/70">· {it.linkedTask.status}</span> : null}
+              </span>
+            ) : null}
           </li>
         ))}
         {group.count > group.items.length ? (
