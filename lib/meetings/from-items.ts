@@ -136,7 +136,8 @@ export async function backfillMeetingNotesFromItems(
 
   const extract =
     opts.extract ??
-    ((rawText: string, r: RosterPerson[]) => extractFromTranscript(rawText, r, opts.keys ?? {}));
+    ((rawText: string, r: RosterPerson[]) =>
+      extractFromTranscript(rawText, r, opts.keys ?? {}, undefined, { db: admin, teamId }));
 
   for (const c of candidates.slice(0, limit)) {
     summary.scanned++;

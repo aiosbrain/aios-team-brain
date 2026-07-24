@@ -2,6 +2,7 @@ import "server-only";
 
 import type { DbClient } from "@/lib/db/types";
 import { callMeetingsLLM, extractJsonObject, type ProviderKeys, type RosterPerson } from "./llm-extract";
+import type { LlmMeterCtx } from "@/lib/costs/llm-usage";
 import {
   extractTodosFromNotes,
   toExtractedTodoRows,
@@ -73,7 +74,8 @@ export async function extractActionItems(
   rawText: string,
   roster: RosterPerson[],
   keys: ProviderKeys,
-  timeoutMs?: number
+  timeoutMs?: number,
+  meter?: LlmMeterCtx
 ): Promise<ExtractedTodo[]> {
   const fallback = () => dedupe(extractTodosFromNotes(rawText));
 
@@ -81,7 +83,7 @@ export async function extractActionItems(
   const rosterHint = roster.length
     ? `\n\nKnown team members (resolve first-name mentions against these full names): ${roster.map((p) => p.displayName).join(", ")}.`
     : "";
-  const raw = await callMeetingsLLM(SYSTEM_PROMPT, `Transcript:\n\n${truncated}${rosterHint}`, keys, timeoutMs);
+  const raw = await callMeetingsLLM(SYSTEM_PROMPT, `Transcript:\n\n${truncated}${rosterHint}`, keys, timeoutMs, meter);
   if (!raw) return fallback();
 
   let parsed: unknown;
@@ -128,7 +130,8 @@ export async function extractAndStoreActionItems(
   // otherwise delete another path's freshly-created (or just-re-pointed) todo.
   opts: { reconcile?: boolean } = {}
 ): Promise<number> {
-  const run = extract ?? ((t: string, r: RosterPerson[], k: ProviderKeys) => extractActionItems(t, r, k, timeoutMs));
+  const run =
+    extract ?? ((t: string, r: RosterPerson[], k: ProviderKeys) => extractActionItems(t, r, k, timeoutMs, { db, teamId }));
   const todos = await run(rawText, roster, keys);
   const rows = toExtractedTodoRows(item, todos);
   // Only reconcile when the extraction actually returned items: upsert what's present + prune THIS

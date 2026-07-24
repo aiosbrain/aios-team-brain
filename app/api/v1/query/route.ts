@@ -15,6 +15,7 @@ import {
   appendMessage,
 } from "@/lib/chat/store";
 import { generateAndSetTitle } from "@/lib/chat/title";
+import { recordLlmUsage } from "@/lib/costs/llm-usage";
 
 export const runtime = "nodejs";
 export const maxDuration = 120;
@@ -148,6 +149,20 @@ export async function POST(req: NextRequest) {
               cache_read_tokens: chunk.usage.cache_read_tokens,
               cost_usd: chunk.usage.cost_usd,
               latency_ms: Date.now() - started,
+            });
+
+            // Meter this answer's spend into the unified brain-inference ledger (source "query"), so
+            // the Pulse Spend KPI + costs breakdown see it alongside every background LLM task.
+            await recordLlmUsage(db, {
+              teamId: auth.teamId,
+              memberId: auth.memberId,
+              source: "query",
+              provider: chunk.usage.provider,
+              model: chunk.usage.model,
+              inputTokens: chunk.usage.input_tokens,
+              outputTokens: chunk.usage.output_tokens,
+              costUsd: chunk.usage.cost_usd,
+              estimated: chunk.usage.estimated,
             });
           }
         }

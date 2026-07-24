@@ -65,7 +65,10 @@ export async function attachPersonDaySummaries(db: DbClient, teamId: string, day
       jobs.push(async () => ({
         di,
         pi,
-        text: await completeTextOrNull({ system: SYSTEM, prompt }, { keys, maxTokens: MAX_TOKENS, timeoutMs: TIMEOUT_MS }).catch(() => null),
+        text: await completeTextOrNull(
+          { system: SYSTEM, prompt },
+          { keys, maxTokens: MAX_TOKENS, timeoutMs: TIMEOUT_MS, meter: { db, teamId, source: "timeline-summary" } }
+        ).catch(() => null),
       }));
     })
   );

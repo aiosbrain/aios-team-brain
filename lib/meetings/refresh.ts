@@ -95,7 +95,8 @@ export async function refreshMeetingNoteExtraction(
 
   const extract =
     opts.extract ??
-    ((rawText: string, r: RosterPerson[]) => extractFromTranscript(rawText, r, opts.keys ?? {}, opts.timeoutMs));
+    ((rawText: string, r: RosterPerson[]) =>
+      extractFromTranscript(rawText, r, opts.keys ?? {}, opts.timeoutMs, { db: admin, teamId }));
 
   for (const note of notes) {
     result.scanned++;

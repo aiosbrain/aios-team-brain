@@ -5,6 +5,7 @@ import { ingestItem } from "@/lib/ingest";
 import { audit } from "@/lib/api/audit";
 import { completeTextOrNull } from "@/lib/llm/complete";
 import { extractFromTranscript, type ProviderKeys, type RosterPerson } from "./llm-extract";
+import type { LlmMeterCtx } from "@/lib/costs/llm-usage";
 import { extractAndStoreActionItems } from "./action-items";
 import { remapMeetingTodoSourceItem } from "./extract-todos";
 import { canLlmMerge, mergeTranscripts, transcriptOverlap } from "./merge-format";
@@ -34,7 +35,12 @@ const MERGE_SYSTEM =
  * back to the lossless deterministic union), or when the model degrades to a summary (much shorter
  * than the longer input) — so a bad result never silently drops content.
  */
-export async function mergeTranscriptsLLM(a: string, b: string, keys: ProviderKeys): Promise<string | null> {
+export async function mergeTranscriptsLLM(
+  a: string,
+  b: string,
+  keys: ProviderKeys,
+  meter?: LlmMeterCtx
+): Promise<string | null> {
   const hasLlm = !!(
     keys.openaiKey ||
     keys.anthropicKey ||
@@ -46,7 +52,10 @@ export async function mergeTranscriptsLLM(a: string, b: string, keys: ProviderKe
   if (!hasLlm || !canLlmMerge(a, b)) return null;
 
   const prompt = `Transcript A:\n\n${a}\n\n=====\n\nTranscript B:\n\n${b}`;
-  const raw = await completeTextOrNull({ system: MERGE_SYSTEM, prompt }, { keys, jsonObject: false, maxTokens: 8192 });
+  const raw = await completeTextOrNull(
+    { system: MERGE_SYSTEM, prompt },
+    { keys, jsonObject: false, maxTokens: 8192, meter: meter ? { ...meter, source: "meeting-merge" } : undefined }
+  );
   const text = raw?.trim();
   if (!text) return null;
   // A merge should be at least as long as the longer source; a much shorter result means the model
@@ -177,7 +186,7 @@ export async function mergeIntoMeetingNote(
   // content), falling back to the lossless deterministic union if the LLM is unavailable/too long.
   const merged = input.mergeTranscript
     ? await input.mergeTranscript(match.existingRawText, input.newRawText)
-    : (await mergeTranscriptsLLM(match.existingRawText, input.newRawText, input.keys).catch(() => null)) ??
+    : (await mergeTranscriptsLLM(match.existingRawText, input.newRawText, input.keys, { db: admin, teamId }).catch(() => null)) ??
       mergeTranscripts(match.existingRawText, input.newRawText);
 
   // Tier floor (M1): the merged body is only as widely visible as its MOST RESTRICTIVE source —
@@ -238,7 +247,7 @@ export async function mergeIntoMeetingNote(
 
   // Refresh summary + attendees + action items on the merged text — best-effort (never fail merge).
   try {
-    const ex = await extractFromTranscript(merged, input.roster, input.keys);
+    const ex = await extractFromTranscript(merged, input.roster, input.keys, undefined, { db: admin, teamId });
     if (ex.summary.trim()) await updateMeetingSummary(admin, teamId, match.noteId, ex.summary);
     if (ex.attendeeMemberIds.length) await addMeetingNoteAttendees(admin, match.noteId, ex.attendeeMemberIds);
   } catch {

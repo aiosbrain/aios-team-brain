@@ -74,7 +74,11 @@ export async function uploadMeetingNoteAction(
     displayName: m.display_name,
   }));
 
-  const extraction = await extractFromTranscript(parsed.data.rawText, roster, keys);
+  const extraction = await extractFromTranscript(parsed.data.rawText, roster, keys, undefined, {
+    db: admin,
+    teamId: team.id,
+    memberId: me.id,
+  });
 
   // Duplicate detection: if this is the same meeting someone already uploaded (same date + enough
   // content overlap), merge the transcripts into that note and credit both submitters instead of
@@ -275,7 +279,11 @@ export async function regenerateMeetingSummaryAction(
     displayName: m.display_name,
   }));
 
-  const ex = await extractFromTranscript(note.rawText, roster, keys);
+  const ex = await extractFromTranscript(note.rawText, roster, keys, undefined, {
+    db: admin,
+    teamId: team.id,
+    memberId: me.id,
+  });
   if (!ex.summary.trim()) {
     // The model may be unreachable OR may have answered in a shape we couldn't read — don't assert
     // "unavailable" (misleading: it often IS available; see normalizeSummaryField). Server logs carry

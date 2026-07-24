@@ -196,6 +196,11 @@ export type QueryUsage = {
   output_tokens: number;
   cache_read_tokens: number;
   cost_usd: number;
+  /** Backend that answered — so the caller can meter this spend into `llm_usage` (provider/model slices). */
+  provider: string;
+  model: string;
+  /** true = `cost_usd` is a price-table estimate (Anthropic); false = provider-metered (OpenRouter). */
+  estimated: boolean;
 };
 
 /**
@@ -288,6 +293,10 @@ export async function* streamAnswer(
       output_tokens: u.output_tokens ?? 0,
       cache_read_tokens: u.cache_read_input_tokens ?? 0,
       cost_usd: Math.round(cost * 100000) / 100000,
+      provider: backend.provider,
+      model: backend.model,
+      // Anthropic doesn't return a charge — this cost is estimated from the list-price constants above.
+      estimated: true,
     },
   };
 }
@@ -452,6 +461,11 @@ export async function* streamOpenAICompatible(
       cache_read_tokens: 0,
       // Round to the query_log column scale (numeric(10,5)); 0 when the provider reports no cost.
       cost_usd: Math.round(cost * 100000) / 100000,
+      provider: backend.provider,
+      model: backend.model,
+      // OpenRouter reports the real charge (metered); a bare local endpoint reports none (cost 0). Not
+      // an estimate either way — so leave estimated=false.
+      estimated: false,
     },
   };
 }
