@@ -1,13 +1,16 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
-import { visibleItems, visibleTasks, type ViewerTier } from "@/lib/auth/visibility";
+import { visibleItems, visibleTasks, visibleDecisions, type ViewerTier } from "@/lib/auth/visibility";
 import { commitSubject } from "./team-work";
+import { subjectMatchesMember, type RosterPerson } from "./people-match";
 import {
   groupTimeline,
   normalizeSource,
   itemWorkTime,
   type EvidenceItem,
+  type EvidenceTaskRef,
   type EvidenceWithMember,
+  type SignalWithMember,
   type TaskInfo,
   type TimelineDay,
   type TimelineMember,
@@ -61,6 +64,7 @@ export const WINDOW_DAYS = 7;
 export const MAX_WINDOW_DAYS = 30;
 const ITEM_LIMIT = 2000;
 const TASK_LIMIT = 2000;
+const DECISION_LIMIT = 500;
 
 type ItemRow = {
   id: string;
@@ -140,12 +144,14 @@ export async function getWorkTimeline(
     email: string | null;
   }[]).filter((m) => !(m.email ?? "").endsWith("@connector.local"));
   const members = new Map<string, TimelineMember>();
+  const roster: RosterPerson[] = [];
   for (const m of humans) {
     members.set(m.id, {
       name: m.display_name ?? m.actor_handle ?? "Unknown",
       handle: m.actor_handle ?? "",
       avatarUrl: m.avatar_url,
     });
+    roster.push({ memberId: m.id, displayName: m.display_name ?? "", handle: m.actor_handle ?? "" });
   }
   if (members.size === 0) return [];
 
@@ -163,7 +169,7 @@ export async function getWorkTimeline(
   const pmProvider = str((teamRes.data as { primary_pm_provider: string | null } | null)?.primary_pm_provider);
   const pmSource = pmProvider ? normalizeSource(pmProvider) : "tasks";
 
-  const [gitRes, otherRes, taskRes, slackRes] = await Promise.all([
+  const [gitRes, otherRes, taskRes, slackRes, decisionRes] = await Promise.all([
     // Git commits (title = commit subject → needs body; commit bodies are small).
     visibleItems(
       db
@@ -221,6 +227,18 @@ export async function getWorkTimeline(
         .gte("synced_at", sinceIso)
         .order("synced_at", { ascending: false })
         .limit(ITEM_LIMIT),
+      tier
+    ),
+    // DECISIONS — the CONTEXT lane (signal, never counted as work). Dated by `decided_at` (a DATE).
+    // Tier-gated by the decision's own `audience` via the §5 choke-point.
+    visibleDecisions(
+      db
+        .from("decisions")
+        .select("id, title, decided_by, decided_at, source_item_id, still_valid, audience")
+        .eq("team_id", teamId)
+        .gte("decided_at", sinceIso.slice(0, 10))
+        .order("decided_at", { ascending: false })
+        .limit(DECISION_LIMIT),
       tier
     ),
   ]);
@@ -316,16 +334,79 @@ export async function getWorkTimeline(
     evItems.map((e) => ({ id: e.id, text: e.text }))
   );
 
+  // CHIP linkage for the "Other" bucket: a commit often cites a task that just went DONE/backlog, which
+  // #350 keeps out of the active nesting headers — so it lands in "Other" looking unassociated. Resolve
+  // those references against ALL tasks (any status, tier-gated) so the commit↔task link is still SHOWN as
+  // a chip, WITHOUT reintroducing done/backlog tasks as headers (nesting still uses `links`/active only).
+  const allTaskRes = await visibleTasks(
+    db
+      .from("tasks")
+      .select("id, row_key, title, status")
+      .eq("team_id", teamId)
+      .not("row_key", "is", null)
+      .order("updated_at", { ascending: false })
+      .limit(TASK_LIMIT),
+    tier
+  );
+  // Chips are ENRICHMENT (not a core ledger leg) — a failed read must NOT blank the ledger, but it also
+  // must not be silent (the swallowed-error trap this file warns about). WARN, like the Slack leg.
+  if (allTaskRes.error) console.warn("[work-timeline] chip-task read failed:", allTaskRes.error.message);
+  const allTasks = (allTaskRes.data ?? []) as TaskRow[];
+  const chipInfo = new Map<string, EvidenceTaskRef>();
+  for (const t of allTasks) if (t.row_key) chipInfo.set(t.id, { key: t.row_key.toUpperCase(), title: t.title || "(untitled task)", status: t.status ?? "" });
+  const allLinks = computeTaskLinks(
+    allTasks.map((t) => ({ id: t.id, row_key: t.row_key })),
+    evItems.map((e) => ({ id: e.id, text: e.text }))
+  );
+
   // One evidence row per (item, linked active task); unlinked items carry taskId=null (→ the "Other"
-  // bucket). A commit citing two issues appears under both. The grouper then evidence-gates: a task
-  // shows ONLY where it has ≥1 of this person's evidence that day (no empty headers).
+  // bucket) + a `linkedTask` chip when they reference a real non-active task. A commit citing two issues
+  // appears under both active tasks. The grouper then evidence-gates: a task shows ONLY where it has ≥1 of
+  // this person's evidence that day (no empty headers).
   const evidence: EvidenceWithMember[] = [];
   for (const e of evItems) {
     const base: EvidenceItem & { memberId: string } = { id: e.id, memberId: e.memberId, source: e.source, kind: e.kind, title: e.title, url: e.url, at: e.at };
     const taskIds = links.get(e.id);
-    if (taskIds && taskIds.length) for (const taskId of taskIds) evidence.push({ ...base, taskId });
-    else evidence.push({ ...base, taskId: null });
+    if (taskIds && taskIds.length) {
+      for (const taskId of taskIds) evidence.push({ ...base, taskId });
+    } else {
+      // In "Other" (no ACTIVE task): chip the first non-active task it references (done/backlog), if any.
+      const chip = (allLinks.get(e.id) ?? []).map((id) => chipInfo.get(id)).find((c): c is EvidenceTaskRef => !!c);
+      evidence.push({ ...base, taskId: null, ...(chip ? { linkedTask: chip } : {}) });
+    }
   }
 
-  return groupTimeline(evidence, taskInfo, members, todayISO);
+  // SIGNAL lane — decisions (data ABOUT work, never counted as work). WARN, not throw: this is a context
+  // enrichment leg (like Slack), so a decisions read failure must not blank the WORK timeline.
+  if (decisionRes.error) console.warn("[work-timeline] decisions read failed:", decisionRes.error.message);
+  const signals: SignalWithMember[] = [];
+  for (const d of (decisionRes.data ?? []) as {
+    id: string;
+    title: string | null;
+    decided_by: string | null;
+    decided_at: string | null;
+    source_item_id: string | null;
+    still_valid: boolean | null;
+  }[]) {
+    if (!d.decided_at) continue; // no day to place it on (mirrors the undated-work drop)
+    const by = (d.decided_by ?? "").trim();
+    if (!by) continue; // empty / group-level decided_by → dropped (a later team-signal lane's job)
+    // MULTI-person decided_by ("Chetan + John", "A & B", "Dana and Lee") → drop: crediting one is wrong,
+    // and `subjectMatchesMember` folds "Chetan + John" onto a bare-first-name member (would falsely match 1).
+    if (/[+&,/]|\band\b/i.test(by)) continue;
+    // Attribute to a member — but DROP on AMBIGUOUS (≥2 roster matches) or NO match: never guess.
+    const matched = roster.filter((p) => subjectMatchesMember(by, p));
+    if (matched.length !== 1) continue;
+    signals.push({
+      id: d.id,
+      memberId: matched[0].memberId,
+      kind: "decision",
+      title: d.title || "(untitled decision)",
+      at: d.decided_at.slice(0, 10), // bare YYYY-MM-DD — rendered with no time
+      url: d.source_item_id ? `/library/${d.source_item_id}` : undefined,
+      stillValid: d.still_valid ?? true,
+    });
+  }
+
+  return groupTimeline(evidence, taskInfo, members, todayISO, undefined, signals);
 }

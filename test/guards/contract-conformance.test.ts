@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { normalizeTier, PROVISIONING_TOOLS } from "@/lib/api/schemas";
+import { itemPayloadSchema } from "@/lib/api/schemas";
 import { formatSseFrame } from "@/lib/api/sse";
 import { BRAIN_API_VERSION } from "@/lib/api/version";
 import { ALL_TOOLS } from "@/lib/provisioning/run";
@@ -27,6 +28,27 @@ const FIXTURE = join(
   "brain-contract.json",
 );
 const fixture = JSON.parse(readFileSync(FIXTURE, "utf8"));
+const itemFixtures = JSON.parse(
+  readFileSync(
+    join(
+      import.meta.dirname,
+      "..",
+      "fixtures",
+      "contract",
+      "item-payload-1.12-fixtures.json",
+    ),
+    "utf8",
+  ),
+) as {
+  readonly valid: readonly {
+    readonly name: string;
+    readonly payload: unknown;
+  }[];
+  readonly invalid: readonly {
+    readonly name: string;
+    readonly payload: unknown;
+  }[];
+};
 
 // Same canonicalization the workspace test + generator use (recursive key sort → stable JSON).
 type Json = null | boolean | number | string | Json[] | { [k: string]: Json };
@@ -45,8 +67,14 @@ const canonical = (v: Json): Json =>
 describe("brain-api tier + SSE conformance", () => {
   it("fixture contentHash is intact (no out-of-band edit)", () => {
     // v1.7 added provisioningTools (the member-invite tool vocabulary) to the pinned content.
-    const { version, tierAliases, sse, provisioningTools, gatewayContract } =
-      fixture;
+    const {
+      version,
+      tierAliases,
+      sse,
+      provisioningTools,
+      gatewayContract,
+      itemPayloadContract,
+    } = fixture;
     const recomputed = createHash("sha256")
       .update(
         JSON.stringify(
@@ -56,6 +84,7 @@ describe("brain-api tier + SSE conformance", () => {
             sse,
             provisioningTools,
             gatewayContract,
+            itemPayloadContract,
           }),
         ),
       )
@@ -65,6 +94,35 @@ describe("brain-api tier + SSE conformance", () => {
 
   it("fixture version tracks BRAIN_API_VERSION", () => {
     expect(fixture.version).toBe(BRAIN_API_VERSION);
+  });
+
+  it("content-addresses the Brain API 1.12 item schema and fixtures", () => {
+    expect(fixture.version).toBe("1.12");
+    expect(fixture.itemPayloadContract.version).toBe("1.12");
+    for (const key of ["schema", "fixtures"] as const) {
+      const ref = fixture.itemPayloadContract[key] as {
+        readonly path: string;
+        readonly sha256: string;
+      };
+      const bytes = readFileSync(join(import.meta.dirname, "..", "fixtures", "contract", ref.path));
+      expect(createHash("sha256").update(bytes).digest("hex")).toBe(ref.sha256);
+    }
+  });
+
+  it("accepts every canonical Brain API 1.12 item fixture", () => {
+    for (const entry of itemFixtures.valid) {
+      expect(itemPayloadSchema.safeParse(entry.payload).success, entry.name).toBe(
+        true,
+      );
+    }
+  });
+
+  it("rejects every canonical Brain API 1.12 invalid fixture", () => {
+    for (const entry of itemFixtures.invalid) {
+      expect(itemPayloadSchema.safeParse(entry.payload).success, entry.name).toBe(
+        false,
+      );
+    }
   });
 
   it("provisioning tool vocabulary matches the fixture (adapters registry + invite request schema)", () => {

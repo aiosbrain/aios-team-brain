@@ -10,7 +10,7 @@ import { summaryPromptFor, type PersonDay, type TimelineDay } from "@/lib/dashbo
 import { llmConfigured, attachPersonDaySummaries } from "@/lib/dashboard/timeline-summary";
 
 const person = (over: Partial<PersonDay> = {}): PersonDay => ({
-  memberId: "m1", name: "Chetan", handle: "chetan", total: 1,
+  memberId: "m1", name: "Chetan", handle: "chetan", total: 1, signals: [],
   tasks: [], other: [{ source: "github", count: 1, items: [{ id: "c1", title: "did a thing", source: "github", kind: "commit", at: "2026-07-22T09:00:00Z" }] }],
   ...over,
 });

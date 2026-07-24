@@ -12,6 +12,7 @@ import { readFileSync, writeFileSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
 import { ingestItem } from "../lib/ingest";
 import { normalizeTier } from "../lib/api/schemas";
+import type { DecisionRow } from "../lib/api/item-payload-schema";
 import { pgClient } from "../lib/db/pg/client";
 import type { DbClient } from "../lib/db/types";
 
@@ -19,7 +20,7 @@ if (!process.env.DATABASE_URL) {
   console.error("set DATABASE_URL (try: npx dotenvx run -f .env.local -- …, or export it)");
   process.exit(1);
 }
-const db = pgClient() as unknown as DbClient;
+const db: DbClient = pgClient();
 
 const FIXTURES = path.resolve(__dirname, "..", "fixtures");
 const PROJECT_SLUG = "northwind-aios";
@@ -64,22 +65,31 @@ function parseTaskRows(body: string) {
   })).filter((r) => r.row_key);
 }
 
-function parseDecisionRows(body: string) {
+function parseDecisionRows(body: string): DecisionRow[] {
   const rows = tableRows(body);
   if (!rows.length) return [];
   const h = rows[0].map((x) => x.toLowerCase());
   const i = (pfx: string) => h.findIndex((x) => x.startsWith(pfx));
   if (i("decision") < 0) return [];
-  return rows.slice(1).map((c) => ({
-    row_key: c[i("#")] ?? c[0] ?? "",
-    decided_at: i("date") >= 0 ? c[i("date")] || null : null,
-    title: c[i("decision")] ?? "",
-    rationale: i("rationale") >= 0 ? c[i("rationale")] ?? "" : "",
-    decided_by: i("decided") >= 0 ? c[i("decided")] ?? "" : "",
-    impact: i("impact") >= 0 ? c[i("impact")] ?? "" : "",
-    tier: i("type") >= 0 ? parseInt(c[i("type")], 10) || null : null,
-    audience: i("audience") >= 0 ? c[i("audience")] || "team" : "team",
-  })).filter((r) => r.row_key);
+  return rows
+    .slice(1)
+    .map((c) => {
+      const audience: DecisionRow["audience"] =
+        i("audience") >= 0 && c[i("audience")] === "external"
+          ? "external"
+          : "team";
+      return {
+        row_key: c[i("#")] ?? c[0] ?? "",
+        decided_at: i("date") >= 0 ? c[i("date")] || null : null,
+        title: c[i("decision")] ?? "",
+        rationale: i("rationale") >= 0 ? c[i("rationale")] ?? "" : "",
+        decided_by: i("decided") >= 0 ? c[i("decided")] ?? "" : "",
+        impact: i("impact") >= 0 ? c[i("impact")] ?? "" : "",
+        tier: i("type") >= 0 ? parseInt(c[i("type")], 10) || null : null,
+        audience,
+      };
+    })
+    .filter((row) => row.row_key);
 }
 
 function classifyKind(rel: string, fm: Record<string, string>) {
@@ -152,26 +162,32 @@ async function main() {
     const tier = normalizeTier(fm.access || "");
     if (!tier) { skipped++; continue; } // default-deny: untagged/admin never ingests
     const kind = classifyKind(rel, fm);
-    const rows =
-      kind === "task" ? parseTaskRows(body)
-      : kind === "decision" ? parseDecisionRows(body)
-      : undefined;
-    await ingestItem(
-      db,
-      auth,
-      {
-        project: PROJECT_SLUG,
-        path: rel,
-        kind,
-        content_sha256: createHash("sha256").update(raw).digest("hex"),
-        actor: fm.owner || "alex",
-        access: tier,
-        frontmatter: fm,
-        body,
-        rows,
-      },
-      tier
-    );
+    const commonPayload = {
+      project: PROJECT_SLUG,
+      path: rel,
+      content_sha256: createHash("sha256").update(raw).digest("hex"),
+      actor: fm.owner || "alex",
+      access: tier,
+      frontmatter: fm,
+      body,
+    };
+    if (kind === "task") {
+      await ingestItem(
+        db,
+        auth,
+        { ...commonPayload, kind, rows: parseTaskRows(body) },
+        tier
+      );
+    } else if (kind === "decision") {
+      await ingestItem(
+        db,
+        auth,
+        { ...commonPayload, kind, rows: parseDecisionRows(body) },
+        tier
+      );
+    } else {
+      await ingestItem(db, auth, { ...commonPayload, kind }, tier);
+    }
     pushed++;
   }
 

@@ -29,4 +29,7 @@ regexes = [
   '''1234567890''',
   '''abcdefABCDEF''',
   '''(?i)(example|placeholder|dummy|changeme|redacted|your[-_]?(api[-_]?)?(key|token|secret))''',
+  # 1.12 contract-fixture row keys ("stakeholder-91a2" etc.) — synthetic identifiers in the
+  # vendored, SHA-pinned item-payload fixtures; a real secret never starts with this prefix.
+  '''\bstakeholder-[0-9a-zA-Z-]{1,24}\b''',
 ]

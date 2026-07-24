@@ -1,69 +1,26 @@
 import { z } from "zod";
 
+export {
+  decisionRowSchema,
+  factRowSchema,
+  itemPayloadSchema,
+  stakeholderMentionRowSchema,
+  taskRowSchema,
+} from "./item-payload-schema";
+export type {
+  DecisionRow,
+  FactRow,
+  ItemPayload,
+  StakeholderMentionRow,
+  TaskRow,
+} from "./item-payload-schema";
+
 /**
  * Zod schemas mirroring the pinned contract:
  * aios-workspace/docs/brain-api.md (v1).
  * Tier vocabulary: canonical admin|team|external; `client` is a legacy alias
  * normalized to external on ingest; `admin` is rejected with 422.
  */
-
-export const taskRowSchema = z.object({
-  row_key: z.string().min(1),
-  title: z.string(),
-  // Optional without a default so ingest can distinguish "omitted" (preserve existing assignee)
-  // from an explicit empty string (clear assignee).
-  assignee: z.string().optional(),
-  status: z.string().optional().default(""),
-  sprint: z.string().optional().default(""),
-  due: z.string().nullable().optional(),
-  // Hierarchy fields (brain-api v1.2, all optional). `parent` is the epic's row_key; `labels` is a
-  // string array; `priority` is sent verbatim and normalized server-side. `body` is intentionally
-  // absent — it is dashboard/DB-only and never travels through the contract.
-  parent: z.string().nullable().optional(),
-  labels: z.array(z.string().max(80)).max(50).optional(),
-  priority: z.string().max(20).nullable().optional(),
-  pm_provider: z.enum(["plane", "linear"]).nullable().optional(),
-  pm_external_id: z.string().max(200).nullable().optional(),
-  pm_url: z.string().max(500).nullable().optional(),
-  // Provider work-signal time (brain-api v1.12): the task's last STATE-TRANSITION timestamp
-  // (Linear startedAt/completedAt/canceledAt; falls back to updatedAt). Optional — mirror-imported
-  // Linear/Plane rows carry it immediately; workspace-pushed tasks stay null until the CLI ships it.
-  // Absent key ⇒ preserve the stored value (partial-write, like assignee/parent). Materialized into
-  // tasks.worked_at; the timeline uses it as the "did work on it" signal instead of updated_at.
-  worked_at: z.string().nullable().optional(),
-});
-
-export const decisionRowSchema = z.object({
-  row_key: z.string().min(1),
-  decided_at: z.string().nullable().optional(),
-  title: z.string(),
-  rationale: z.string().optional().default(""),
-  decided_by: z.string().optional().default(""),
-  impact: z.string().optional().default(""),
-  tier: z.number().int().nullable().optional(),
-  audience: z.string().optional().default("team"),
-});
-
-export const itemPayloadSchema = z.object({
-  project: z.string().min(1).max(120),
-  path: z.string().min(1).max(500),
-  kind: z.enum([
-    "deliverable",
-    "transcript",
-    "decision",
-    "task",
-    "artifact",
-    "skill",
-    "blueprint",
-  ]),
-  content_sha256: z.string().regex(/^[a-f0-9]{64}$/),
-  actor: z.string().max(120).optional().default(""),
-  access: z.string(),
-  frontmatter: z.record(z.string(), z.unknown()).optional().default({}),
-  body: z.string().max(1_000_000),
-  rows: z.array(z.unknown()).optional(),
-});
-export type ItemPayload = z.infer<typeof itemPayloadSchema>;
 
 // ── codebase scan ingest (POST /api/v1/codebases) ────────────────────────────
 // The Python scanner pushes RAW metrics only; the brain computes scores at ingest

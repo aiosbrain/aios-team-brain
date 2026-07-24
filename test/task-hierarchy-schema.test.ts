@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { taskRowSchema, normalizeTaskPriority, TASK_PRIORITIES } from "@/lib/api/schemas";
 
-// Spec (brain-api v1.2): task rows gain optional parent/labels/priority; `body` is NOT a contract
-// field (dashboard/DB-only) and must be stripped from a pushed row. Priority normalizes to the
+// Spec (brain-api v1.12): task rows keep optional parent/labels/priority; `body` is NOT a contract
+// field (dashboard/DB-only) and strict row parsing must reject it. Priority normalizes to the
 // allowed set with a few common aliases.
 
 describe("normalizeTaskPriority", () => {
@@ -42,13 +42,14 @@ describe("taskRowSchema (v1.2 hierarchy)", () => {
     expect(r.priority).toBe("high");
   });
 
-  it("strips `body` — it is not a contract field", () => {
-    const r = taskRowSchema.parse({
-      row_key: "T-1",
-      title: "x",
-      body: "this should not survive",
-    } as Record<string, unknown>);
-    expect("body" in r).toBe(false);
+  it("rejects `body` because it is not a contract field", () => {
+    expect(() =>
+      taskRowSchema.parse({
+        row_key: "T-1",
+        title: "x",
+        body: "this must be rejected",
+      }),
+    ).toThrow();
   });
 
   it("omitting hierarchy fields is valid (six-column rows)", () => {

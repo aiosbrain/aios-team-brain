@@ -1,8 +1,9 @@
 "use client";
 
+import { GitBranch, Scale } from "lucide-react";
 import { MemberAvatar } from "@/components/people/member-avatar";
 import { SourceIcon, sourceLabel } from "@/components/icons/source-icon";
-import type { PersonDay, SourceGroup, TaskGroup } from "@/lib/dashboard/timeline-group";
+import type { PersonDay, SignalGroup, SourceGroup, TaskGroup } from "@/lib/dashboard/timeline-group";
 
 /**
  * One person's work card — the shared presentational unit behind BOTH the Pulse Timeline panel
@@ -17,12 +18,15 @@ function timeOf(at: string): string {
   return Number.isNaN(t) ? "" : new Date(t).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
 }
 
-/** "3 tasks · 12 items" — a person's activity at a glance. */
+/** "3 tasks · 12 items · 2 decisions" — activity at a glance. Decisions are SIGNAL (context), so they're a
+ *  SEPARATE, labelled count — never folded into the work "items" tally (that would credit signal as work). */
 export function personSummary(p: PersonDay): string {
   const items = p.tasks.reduce((n, t) => n + t.evidenceCount, 0) + p.other.reduce((n, g) => n + g.count, 0);
+  const decisions = p.signals.reduce((n, g) => n + g.count, 0);
   const parts: string[] = [];
   if (p.tasks.length) parts.push(`${p.tasks.length} task${p.tasks.length === 1 ? "" : "s"}`);
   parts.push(`${items} item${items === 1 ? "" : "s"}`);
+  if (decisions) parts.push(`${decisions} decision${decisions === 1 ? "" : "s"}`);
   return parts.join(" · ");
 }
 
@@ -51,15 +55,28 @@ function EvidenceList({ group }: { group: SourceGroup }) {
       </div>
       <ul className="flex flex-col gap-1 border-l border-border-subtle pl-3">
         {group.items.map((it) => (
-          <li key={it.id} className="flex items-baseline justify-between gap-3">
-            {it.url ? (
-              <a href={it.url} target="_blank" rel="noreferrer" className="truncate text-sm text-ink hover:text-violet">
-                {it.title}
-              </a>
-            ) : (
-              <span className="truncate text-sm text-ink">{it.title}</span>
-            )}
-            <span className="shrink-0 text-[11px] text-ink-tertiary">{timeOf(it.at)}</span>
+          <li key={it.id} className="flex flex-col gap-0.5">
+            <div className="flex items-baseline justify-between gap-3">
+              {it.url ? (
+                <a href={it.url} target="_blank" rel="noreferrer" className="truncate text-sm text-ink hover:text-violet">
+                  {it.title}
+                </a>
+              ) : (
+                <span className="truncate text-sm text-ink">{it.title}</span>
+              )}
+              <span className="shrink-0 text-[11px] text-ink-tertiary">{timeOf(it.at)}</span>
+            </div>
+            {it.linkedTask ? (
+              <span
+                className="inline-flex max-w-full items-center gap-1 self-start rounded border border-border-subtle bg-surface-sunken px-1.5 py-0.5 text-[11px] text-ink-secondary"
+                title={`References ${it.linkedTask.key} (${it.linkedTask.status}): ${it.linkedTask.title}`}
+              >
+                <GitBranch className="size-3 shrink-0 text-ink-tertiary" />
+                <span className="shrink-0 font-medium text-ink-secondary">{it.linkedTask.key}</span>
+                <span className="truncate text-ink-tertiary">· {it.linkedTask.title}</span>
+                {it.linkedTask.status ? <span className="shrink-0 text-ink-tertiary/70">· {it.linkedTask.status}</span> : null}
+              </span>
+            ) : null}
           </li>
         ))}
         {group.count > group.items.length ? (
@@ -124,6 +141,36 @@ export function PersonWorkCard({ person }: { person: PersonDay }) {
           </div>
         </div>
       ) : null}
+
+      {p.signals.length ? <ContextLane signals={p.signals} /> : null}
+    </div>
+  );
+}
+
+/** The Context lane — data ABOUT work (decisions), shown dimmer + clearly separate from the work above, so
+ *  it's never read as the person's output. No timestamp (signals are bare-date). */
+function ContextLane({ signals }: { signals: SignalGroup[] }) {
+  return (
+    <div className="flex flex-col gap-1.5 border-t border-border-subtle/60 pt-2">
+      <div className="text-[11px] font-semibold uppercase tracking-wider text-ink-tertiary/70">
+        Context · not counted as work
+      </div>
+      <ul className="flex flex-col gap-1 pl-1">
+        {signals.flatMap((g) => g.items).map((s) => (
+          <li key={s.id} className="flex items-start gap-1.5 text-[13px] text-ink-tertiary">
+            <Scale className="mt-0.5 size-3 shrink-0 text-ink-tertiary/70" />
+            <span className="truncate">
+              decided:{" "}
+              {s.url ? (
+                <a href={s.url} className="text-ink-secondary hover:text-violet">{s.title}</a>
+              ) : (
+                <span className="text-ink-secondary">{s.title}</span>
+              )}
+              {s.stillValid === false ? <span className="text-ink-tertiary/60"> · superseded</span> : null}
+            </span>
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }
