@@ -1,7 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { getMemberItems, getMemberAttribution } from "@/lib/attribution/health";
-import { db, seedTeam, ingest, type Seed } from "./helpers";
+import { ingestItem } from "@/lib/ingest";
+import type { ItemPayload } from "@/lib/api/schemas";
+import { db, seedTeam, ingest, sha, type Seed } from "./helpers";
 
 /**
  * Spec: the per-person drill-down (`getMemberItems`) returns the ACTUAL items behind a per-person count —
@@ -127,4 +129,23 @@ describe("attribution drill-down (real Postgres)", () => {
     const nulls = Object.fromEntries((await getMemberItems(seed.teamId, null)).map((i) => [i.id, i]));
     expect(nulls[q]).toMatchObject({ method: "email", resolvesToName: "Other Person", mismatch: true });
   });
+
+  it("surfaces the CREDITED contributors (the shared oracle) on each drill-down item", async () => {
+    const seed = await seedTeam(); // A = "Tester"
+    const { data: bRow, error } = await db().from("members").insert({
+      team_id: seed.teamId, email: `${randomUUID()}@test.local`, display_name: "Person B",
+      actor_handle: `b-${randomUUID().slice(0, 8)}`, role: "member", tier: "team", status: "active", is_connector: false,
+    }).select("id").single();
+    if (error || !bRow) throw new Error(`seed B failed: ${error?.message}`);
+    const b = (bRow as { id: string }).id;
+    const path = `notion/${randomUUID()}.md`;
+    const pl = (body: string): ItemPayload => ({ project: "acme", kind: "deliverable", actor: "x", frontmatter: { source: "notion" }, content_sha256: sha(body), body, path } as ItemPayload);
+    const first = await ingestItem(db(), { teamId: seed.teamId, memberId: seed.memberId, apiKeyId: randomUUID() }, pl("v1"), "team", { authorMemberId: seed.memberId });
+    await ingestItem(db(), { teamId: seed.teamId, memberId: seed.memberId, apiKeyId: randomUUID() }, pl("v2"), "team", { authorMemberId: b }); // B now owns + worked
+
+    const items = await getMemberItems(seed.teamId, b); // B is the current owner
+    const row = items.find((x) => x.id === first.id)!;
+    expect(new Set(row.credited)).toEqual(new Set(["Tester", "Person B"])); // both credited (mirrors Timeline/arcs)
+  });
+
 });
