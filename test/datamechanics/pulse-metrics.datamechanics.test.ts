@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { getPulseMetrics } from "@/lib/metrics/pulse";
+import { recordLlmUsage } from "@/lib/costs/llm-usage";
 import { db, seedTeam, ingest } from "./helpers";
 
 /**
@@ -23,6 +24,26 @@ async function seedQuery(teamId: string, memberId: string, cost: number): Promis
   if (error) throw new Error(`seed query_log failed: ${error.message}`);
 }
 
+/** Spend is now metered in llm_usage (ALL inference), not query_log — seed a ledger row for it. */
+async function seedSpend(
+  teamId: string,
+  memberId: string | null,
+  source: "query" | "arcs" | "meeting-extract",
+  cost: number
+): Promise<void> {
+  await recordLlmUsage(db(), {
+    teamId,
+    memberId,
+    source,
+    provider: "openrouter",
+    model: "test/model",
+    inputTokens: 100,
+    outputTokens: 20,
+    costUsd: cost,
+    estimated: false,
+  });
+}
+
 describe("getPulseMetrics (real Postgres date windowing)", () => {
   it("counts freshly-synced items and recent queries as CURRENT (not prior)", async () => {
     const seed = await seedTeam();
@@ -32,6 +53,11 @@ describe("getPulseMetrics (real Postgres date windowing)", () => {
     await ingest(seed, { path: "c.md", body: "charlie", access: "team", kind: "transcript" });
     await seedQuery(seed.teamId, seed.memberId, 0.42);
     await seedQuery(seed.teamId, seed.memberId, 0.08);
+    // Spend now comes from llm_usage (ALL inference), so seed the ledger — including a system/background
+    // arc row (null member) that only shows in the ADMIN (team-wide) view.
+    await seedSpend(seed.teamId, seed.memberId, "query", 0.42);
+    await seedSpend(seed.teamId, seed.memberId, "query", 0.08);
+    await seedSpend(seed.teamId, null, "arcs", 0.5);
 
     const pulse = await getPulseMetrics(db(), seed.teamId, "30d", {
       isAdmin: true,
@@ -43,10 +69,10 @@ describe("getPulseMetrics (real Postgres date windowing)", () => {
     // KPI band is the trimmed meaningful set — Queries / Tasks in flight / Spend. "Items synced"
     // was removed (it counted synced_at churn, not real growth), so it must NOT be present.
     expect(pulse.kpis.map((k) => k.key)).toEqual(["queries", "tasks", "spend"]);
-    // Queries KPI: 2 recent queries, not 0.
+    // Queries KPI: 2 recent queries, not 0 (still counts query_log — interactive adoption).
     expect(Number(kpi("queries")!.value)).toBe(2);
-    // Spend rolls up the recent queries' cost.
-    expect(kpi("spend")!.value).toBe("$0.50");
+    // Spend rolls up ALL inference from llm_usage: $0.42 + $0.08 (queries) + $0.50 (background arc) = $1.00.
+    expect(kpi("spend")!.value).toBe("$1.00");
 
     // Time-series charts must have data in the window (they showed "No data in this window").
     // These items were just ingested, so created_at = now() → all 3 count as new knowledge in-window.

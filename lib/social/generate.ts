@@ -159,7 +159,12 @@ export async function generateVariantText(
   const platform = PLATFORM[variant.platform];
   const complete: Completer =
     opts.complete ??
-    (async (a) => completeText(a, { keys: await resolveProviderKeys(db, teamId), maxTokens: platform?.maxTokens ?? 400 }));
+    (async (a) =>
+      completeText(a, {
+        keys: await resolveProviderKeys(db, teamId),
+        maxTokens: platform?.maxTokens ?? 400,
+        meter: { db, teamId, source: "social" },
+      }));
 
   let body: string;
   try {

@@ -408,6 +408,9 @@ async function callLLMRaw(
       // Record the outcome so a broken answering model (e.g. a reasoning model returning empty) shows
       // as "degraded" on the dashboard instead of silently blanking the Learning page.
       record: record ? { db: record.db, teamId: record.teamId, task: "arcs" } : undefined,
+      // Meter the (often reasoning-model, ~200-fact) spend into llm_usage — arcs are a system task
+      // with no human initiator, so memberId stays null.
+      meter: record ? { db: record.db, teamId: record.teamId, source: "arcs" } : undefined,
     }
   );
 }

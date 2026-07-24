@@ -1493,6 +1493,31 @@ create index if not exists usage_costs_team_date_idx
 create index if not exists usage_costs_member_date_idx
   on usage_costs (member_id, cost_date desc);
 
+-- The brain's OWN LLM inference spend — every generation the product makes, not just the Query box:
+-- Q&A answers, meeting extraction, narrative arcs, timeline summaries, social content, chat titles,
+-- attribution corrections, cron/background jobs. One row PER CALL (per-event, not a daily rollup) so
+-- the costs breakdown page can slice by `source` (feature) / provider / model precisely. This is the
+-- lowest shared layer for "what is our inference costing" — Pulse Spend and the costs page both read
+-- it. Distinct from `usage_costs` (external dev-tool spend pushed from workstations). `member_id` is
+-- NULL for system/background calls that have no human initiator. `cost_usd` is provider-metered on
+-- OpenRouter (`usage.cost`, estimated=false) and a price-table estimate on Anthropic (estimated=true);
+-- a bare local endpoint reports no cost and stays $0. Single-writer: `lib/costs/llm-usage`.
+create table if not exists llm_usage (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  member_id uuid references members(id) on delete set null,
+  source text not null,
+  provider text not null,
+  model text not null default '',
+  input_tokens integer not null default 0,
+  output_tokens integer not null default 0,
+  cost_usd numeric(12, 5) not null default 0,
+  estimated boolean not null default false,
+  created_at timestamptz not null default now()
+);
+create index if not exists llm_usage_team_time_idx on llm_usage (team_id, created_at desc);
+create index if not exists llm_usage_member_time_idx on llm_usage (member_id, created_at desc);
+
 -- Flat AI-tool subscriptions (Claude Max/Pro, Cursor, …). One current plan per
 -- member+provider — the real recurring spend, distinct from per-token usage_costs.
 -- Written only by lib/subscriptions/ingest via POST /api/v1/subscriptions (v1.8).

@@ -39,7 +39,7 @@ export async function previewAttributionCorrectionAction(
       buildCorrectionContext(ctx.teamId),
       resolveAnsweringKeys(db, ctx.teamId),
     ]);
-    const plan = await parseCorrectionPlan(trimmed, context, keys);
+    const plan = await parseCorrectionPlan(trimmed, context, keys, { db, teamId: ctx.teamId });
     if (!plan) return { ok: false, error: "couldn't turn that into a scoped correction — try naming a source, a path, or a person (e.g. \"the linear docs are Fatma's\")." };
 
     const preview = await previewCorrection(ctx.teamId, plan);

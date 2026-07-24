@@ -88,3 +88,14 @@ export function scopeQueryLog<Q>(query: Q, viewer: QueryLogViewer): Q {
   if (viewer.isAdmin) return query;
   return (query as { eq(column: string, value: string): Q }).eq("member_id", viewer.memberId);
 }
+
+/**
+ * Same role-scoping for the brain-inference ledger (`llm_usage`): an admin sees the whole team's
+ * spend (including system/background rows with a null `member_id`), a non-admin sees only the spend
+ * they personally initiated (`member_id = them`) — so background arc/meeting/cron spend is admin-only.
+ * No RLS backstop; this app-code filter IS the gate on every `llm_usage` read.
+ */
+export function scopeLlmUsage<Q>(query: Q, viewer: QueryLogViewer): Q {
+  if (viewer.isAdmin) return query;
+  return (query as { eq(column: string, value: string): Q }).eq("member_id", viewer.memberId);
+}

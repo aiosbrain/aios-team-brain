@@ -227,7 +227,7 @@ export default async function TeamHome({
           <div className="flex items-center justify-end">
             <RangeSelector value={range} />
           </div>
-          <KpiBand kpis={pulse.kpis} />
+          <KpiBand kpis={pulse.kpis} teamSlug={teamSlug} />
           {/* Brain usage (queries + spend) is the primary signal, so it gets the width; knowledge
               growth is a smaller secondary visual beside it. */}
           <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">

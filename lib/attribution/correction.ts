@@ -3,6 +3,7 @@ import { z } from "zod";
 import { runSql } from "@/lib/db/pg/pool";
 import { completeTextOrNull } from "@/lib/llm/complete";
 import type { LlmBackendKeys } from "@/lib/query/llm-backend";
+import type { LlmMeterCtx } from "@/lib/costs/llm-usage";
 
 /**
  * Natural-language attribution CORRECTION. An admin describes a fix in plain language ("the Linear
@@ -79,14 +80,18 @@ const SYSTEM = [
 export async function parseCorrectionPlan(
   instruction: string,
   ctx: CorrectionContext,
-  keys: LlmBackendKeys
+  keys: LlmBackendKeys,
+  meter?: LlmMeterCtx
 ): Promise<CorrectionPlan | null> {
   const user = [
     `Known members: ${ctx.members.map((m) => (m.email ? `${m.name} <${m.email}>` : m.name)).join("; ") || "(none)"}`,
     `Known sources: ${ctx.sources.join(", ") || "(none)"}`,
     `Instruction: ${instruction}`,
   ].join("\n");
-  const raw = await completeTextOrNull({ system: SYSTEM, prompt: user }, { keys, jsonObject: true, maxTokens: 400 });
+  const raw = await completeTextOrNull(
+    { system: SYSTEM, prompt: user },
+    { keys, jsonObject: true, maxTokens: 400, meter: meter ? { ...meter, source: "attribution" } : undefined }
+  );
   if (!raw) return null;
   try {
     const parsed = correctionPlanSchema.safeParse(JSON.parse(raw));

@@ -1,7 +1,7 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { rangeDays, type Range } from "./range";
-import { scopeQueryLog } from "@/lib/auth/visibility";
+import { scopeQueryLog, scopeLlmUsage } from "@/lib/auth/visibility";
 
 /**
  * Range-aware dashboard metrics. In postgres mode there is NO RLS, so query_log row-level
@@ -31,6 +31,8 @@ export interface Kpi {
   hint?: string;
   /** Plain-language "what is this / how is it computed" copy for the "?" popover. */
   help?: string;
+  /** When set, the whole stat card links here (e.g. Spend → the costs breakdown page). */
+  href?: string;
   accent: KpiAccent;
 }
 
@@ -152,7 +154,7 @@ export async function getPulseMetrics(
 
   // Fetch each source once over the combined [prior, now] window where a delta
   // is needed, then split current vs. prior in JS.
-  const [itemsRes, queryRes, tasksRes] = await Promise.all([
+  const [itemsRes, queryRes, tasksRes, spendRes] = await Promise.all([
     // Knowledge growth reads `created_at` (first-seen), NOT `synced_at`: the scheduler bumps synced_at
     // on every 30-min tick, so windowing on it plots re-sync churn (≈all items look "new") rather than
     // real growth. created_at is set once on insert and never bumped. See postgres migration items_created_at.
@@ -179,12 +181,26 @@ export async function getPulseMetrics(
       .select("status, updated_at")
       .eq("team_id", teamId)
       .limit(5_000),
+    // Brain SPEND is ALL inference (Q&A + arcs + meetings + timeline + social + titles + cron), read
+    // from the `llm_usage` ledger — NOT `query_log`, which only meters the interactive Query box. The
+    // Queries KPI above still counts query_log (adoption); spend is the total cost of running the brain.
+    scopeLlmUsage(
+      db
+        .from("llm_usage")
+        .select("cost_usd, created_at")
+        .eq("team_id", teamId)
+        .gte("created_at", priorStart.toISOString())
+        .order("created_at", { ascending: false })
+        .limit(50_000),
+      viewer
+    ),
   ]);
 
   // NB: the pg adapter returns timestamptz as Date (legacy Supabase-js returned string). Normalize via toIso below.
   const itemRows = (itemsRes.data ?? []) as { kind: string; created_at: string | Date }[];
   const queryRows = (queryRes.data ?? []) as { cost_usd: number | string; created_at: string | Date }[];
   const taskRows = (tasksRes.data ?? []) as { status: string; updated_at: string | Date }[];
+  const spendRows = (spendRes.data ?? []) as { cost_usd: number | string; created_at: string | Date }[];
 
   const winStartIso = windowStart.toISOString();
   const inWindow = (iso: string) => iso >= winStartIso;
@@ -211,27 +227,42 @@ export async function getPulseMetrics(
     }
   }
 
-  // ── brain usage + queries / spend KPIs ──
+  // ── brain usage: queries per day (adoption) from query_log ──
   const usage: UsagePoint[] = buckets.map((b) => ({ date: b.label, queries: 0, cost: 0 }));
   const querySpark = new Array(order.length).fill(0);
   let queriesCurrent = 0;
   let queriesPrior = 0;
-  let spendCurrent = 0;
-  let spendPrior = 0;
   for (const row of queryRows) {
-    const cost = Number(row.cost_usd) || 0;
     const createdIso = toIso(row.created_at);
     if (inWindow(createdIso)) {
       queriesCurrent++;
-      spendCurrent += cost;
       const i = index.get(createdIso.slice(0, 10));
       if (i !== undefined) {
         querySpark[i]++;
         usage[i].queries++;
-        usage[i].cost += cost;
       }
     } else {
       queriesPrior++;
+    }
+  }
+
+  // ── brain SPEND: total inference cost per day from llm_usage (all sources, not just Q&A) ──
+  const spendSpark = new Array(order.length).fill(0);
+  let spendCurrent = 0;
+  let spendPrior = 0;
+  for (const row of spendRows) {
+    const cost = Number(row.cost_usd) || 0;
+    const createdIso = toIso(row.created_at);
+    if (inWindow(createdIso)) {
+      spendCurrent += cost;
+      const i = index.get(createdIso.slice(0, 10));
+      if (i !== undefined) {
+        // Daily $ spend for the sparkline (the Sparkline normalizes, so raw dollars are fine — it
+        // shows the shape of spend under the Spend KPI).
+        spendSpark[i] += cost;
+        usage[i].cost += cost;
+      }
+    } else {
       spendPrior += cost;
     }
   }
@@ -290,9 +321,9 @@ export async function getPulseMetrics(
       label: spendLabel,
       value: fmtUsd(spendCurrent),
       delta: pctDelta(Math.round(spendCurrent * 1000), Math.round(spendPrior * 1000)),
-      spark: querySpark,
+      spark: spendSpark,
       hint: `last ${days}d`,
-      help: `LLM answer cost over the last ${days} days (${scopeWord} spend). Each query records the cost of its answer — on OpenRouter the real charge the provider reports (usage.cost), on Anthropic an estimate from list prices — and this sums them. OpenRouter answers from before cost metering shipped weren't captured and count as $0.`,
+      help: `Total LLM inference cost over the last ${days} days (${scopeWord} spend) — every generation the brain makes, not just the Query box: Q&A, meeting extraction, narrative arcs, timeline summaries, social content, chat titles. Each call records its cost — the real charge on OpenRouter (usage.cost), a list-price estimate on Anthropic. Click for the full breakdown by what's costing what. Only spend after metering shipped is captured.`,
       accent: "emerald",
     },
   ];

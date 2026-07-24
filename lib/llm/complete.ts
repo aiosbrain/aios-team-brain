@@ -3,6 +3,8 @@ import Anthropic from "@anthropic-ai/sdk";
 import { selectLlmBackend, reasoningActive, type LlmBackendKeys, type LlmRole } from "@/lib/query/llm-backend";
 import { looksLikeTokenLimit } from "@/lib/query/claude";
 import { recordIngestRun } from "@/lib/ingest/runs";
+import { recordLlmUsage, type LlmUsageSource } from "@/lib/costs/llm-usage";
+import { estimateAnthropicCostUsd } from "@/lib/llm/cost";
 import type { DbClient } from "@/lib/db/types";
 
 /**
@@ -58,6 +60,14 @@ export interface CompleteOptions {
    * db + teamId), so high-frequency incidental calls (e.g. chat titles) don't flood the ledger.
    */
   record?: { db: DbClient; teamId: string; task: string };
+  /**
+   * Meter this call's token spend into the `llm_usage` ledger (the brain-spend meter that feeds the
+   * Pulse Spend KPI + the costs breakdown page). Opt-in per caller (needs a db + teamId). `source` is
+   * the feature slice ("arcs", "meeting-extract", …); `memberId` is the human initiator, or omitted /
+   * null for a system/background call. Cost is provider-metered on OpenRouter and a price estimate on
+   * Anthropic; captured best-effort so it can never break the generation.
+   */
+  meter?: { db: DbClient; teamId: string; source: LlmUsageSource; memberId?: string | null };
 }
 
 /** Best-effort durable record of one LLM outcome — never throws (observability can't break the call). */
@@ -89,6 +99,12 @@ export async function completeText(args: CompleteArgs, opts: CompleteOptions = {
   // messages, which this satisfies) — harmless when the system prompt already asks for JSON.
   const prompt = opts.jsonObject ? `${args.prompt}\n\nReturn ONLY the JSON object.` : args.prompt;
 
+  // Token/cost capture for the llm_usage meter (opts.meter). Populated per-branch below.
+  let inTok = 0;
+  let outTok = 0;
+  let costUsd = 0;
+  let estimated = false;
+
   try {
     let text: string;
     if (backend.kind !== "anthropic") {
@@ -104,6 +120,9 @@ export async function completeText(args: CompleteArgs, opts: CompleteOptions = {
           body: JSON.stringify({
             model: backend.model,
             max_tokens: maxTokensToSend,
+            // Ask OpenRouter for the real generation cost (mirrors the streaming answer path); read
+            // below as `usage.cost`. Harmless no-op on providers that already include usage.
+            ...(backend.kind === "openrouter" ? { usage: { include: true } } : {}),
             // Turn reasoning OFF on OpenRouter unless it's genuinely ACTIVE (`reasoningActive`: a
             // reasoning-role task that resolved to a DISTINCT reasoning model). This covers the query
             // role (extraction/short generation) AND — critically — a reasoning role that fell back to
@@ -143,7 +162,21 @@ export async function completeText(args: CompleteArgs, opts: CompleteOptions = {
       }
       const j = (await res.json()) as {
         choices?: { message?: { content?: string }; finish_reason?: string }[];
+        usage?: { prompt_tokens?: number; completion_tokens?: number; cost?: number };
       };
+      inTok = j.usage?.prompt_tokens ?? 0;
+      outTok = j.usage?.completion_tokens ?? 0;
+      if (typeof j.usage?.cost === "number") {
+        // OpenRouter reports the real charge here — metered, authoritative.
+        costUsd = j.usage.cost;
+        estimated = false;
+      } else {
+        // No provider-reported charge. A bare LOCAL endpoint is genuinely free ($0, authoritative).
+        // An OpenAI-cloud backend IS paid but we have no price table for it — record $0 but flag it as
+        // NOT a real charge so it doesn't read as an authoritative $0 and silently undercount spend.
+        costUsd = 0;
+        estimated = backend.provider !== "local";
+      }
       const choice = j.choices?.[0];
       text = (choice?.message?.content ?? "").trim();
       if (!text) {
@@ -167,8 +200,26 @@ export async function completeText(args: CompleteArgs, opts: CompleteOptions = {
       );
       text = msg.content.map((b) => (b.type === "text" ? b.text : "")).join("").trim();
       if (!text) throw new Error("LLM returned empty content");
+      // Anthropic doesn't hand back a dollar charge — estimate from list prices (estimated=true).
+      inTok = msg.usage?.input_tokens ?? 0;
+      outTok = msg.usage?.output_tokens ?? 0;
+      costUsd = estimateAnthropicCostUsd(inTok, outTok);
+      estimated = true;
     }
     await recordLlmOutcome(opts.record, { ok: true, model: backend.model, startedAt });
+    if (opts.meter) {
+      await recordLlmUsage(opts.meter.db, {
+        teamId: opts.meter.teamId,
+        memberId: opts.meter.memberId ?? null,
+        source: opts.meter.source,
+        provider: backend.provider,
+        model: backend.model,
+        inputTokens: inTok,
+        outputTokens: outTok,
+        costUsd,
+        estimated,
+      });
+    }
     return text;
   } catch (err) {
     await recordLlmOutcome(opts.record, {

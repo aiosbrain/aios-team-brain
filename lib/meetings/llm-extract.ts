@@ -2,6 +2,7 @@ import "server-only";
 import { completeTextOrNull } from "@/lib/llm/complete";
 import { normalizeSummaryField } from "@/lib/meetings/summary-format";
 import type { LlmBackendKeys } from "@/lib/query/llm-backend";
+import type { LlmMeterCtx } from "@/lib/costs/llm-usage";
 
 /**
  * LLM-assisted meeting-note parsing: a short summary + which roster members were likely present,
@@ -75,11 +76,18 @@ export async function callMeetingsLLM(
   system: string,
   userContent: string,
   keys: ProviderKeys,
-  timeoutMs: number = MEETINGS_LLM_TIMEOUT_MS
+  timeoutMs: number = MEETINGS_LLM_TIMEOUT_MS,
+  meter?: LlmMeterCtx
 ): Promise<string | null> {
   return completeTextOrNull(
     { system, prompt: userContent },
-    { keys, jsonObject: true, maxTokens: MEETINGS_LLM_MAX_TOKENS, timeoutMs }
+    {
+      keys,
+      jsonObject: true,
+      maxTokens: MEETINGS_LLM_MAX_TOKENS,
+      timeoutMs,
+      meter: meter ? { ...meter, source: "meeting-extract" } : undefined,
+    }
   );
 }
 
@@ -171,14 +179,15 @@ export async function extractFromTranscript(
   rawText: string,
   roster: RosterPerson[],
   keys: ProviderKeys,
-  timeoutMs?: number
+  timeoutMs?: number,
+  meter?: LlmMeterCtx
 ): Promise<TranscriptExtraction> {
   const empty: TranscriptExtraction = { summary: "", attendeeMemberIds: [] };
   const truncated = rawText.slice(0, MAX_TRANSCRIPT_CHARS);
   const rosterHint = roster.length
     ? `\n\nKnown team members (for reference, not exhaustive): ${roster.map((p) => p.displayName).join(", ")}.`
     : "";
-  const raw = await callMeetingsLLM(SYSTEM_PROMPT, `Transcript:\n\n${truncated}${rosterHint}`, keys, timeoutMs);
+  const raw = await callMeetingsLLM(SYSTEM_PROMPT, `Transcript:\n\n${truncated}${rosterHint}`, keys, timeoutMs, meter);
   if (!raw) return empty;
   return parseTranscriptExtraction(raw, roster);
 }
