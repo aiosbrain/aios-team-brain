@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { ingestWorkEvent } from "@/lib/work-events/ingest";
+import { relinkUnresolvedWorkEvents } from "@/lib/work-events/relink";
 import { db, ingest, seedTeam } from "./helpers";
 
 async function taskStatus(rowKey: string): Promise<string | null> {
@@ -290,5 +291,56 @@ describe("work events — the project-scope fix (LINK-ONLY, no Linear write-back
     );
     expect(res.linked).toEqual([]);
     expect(res.unresolved).toEqual([{ row_key: "V1" }]);
+  });
+
+  describe("the LINK-ONLY backfill (historical rows stranded by the same bug)", () => {
+    /** A work_event as the buggy ingest wrote it: unresolved, no task_id — the task existed all along. */
+    async function strandedEvent(seed: { teamId: string }, rowKey: string, sha: string) {
+      const { error } = await db().from("work_events").insert({
+        team_id: seed.teamId, row_key: rowKey, event_kind: "merged", repo: "aiosbrain/aios-team-brain",
+        merged_sha: sha, task_id: null, status: "unresolved", error: "no matching task row", actor: "alex",
+      });
+      if (error) throw new Error(`work_event insert failed: ${error.message}`);
+    }
+
+    it("links a stranded event to its cross-project task — and still never completes it", async () => {
+      const seed = await seedTeam();
+      const taskId = await taskInProject(seed, "linear-aio", "AIO-777");
+      await strandedEvent(seed, "AIO-777", "aaaaaaaa00112233445566778899aabbccddeeff");
+
+      const first = await relinkUnresolvedWorkEvents(db(), seed.teamId);
+      expect(first).toEqual({ scanned: 1, linked: 1 });
+      const { data: ev } = await db()
+        .from("work_events").select("status, task_id, error").eq("team_id", seed.teamId).maybeSingle();
+      expect(ev).toMatchObject({ status: "linked", task_id: taskId, error: null });
+      // Same blast-radius guarantee as the live path: a backfill must never complete a task.
+      expect(await taskStatus("AIO-777")).toBe("in_progress");
+
+      // Idempotent — nothing is left `unresolved` to scan on a second run.
+      expect(await relinkUnresolvedWorkEvents(db(), seed.teamId)).toEqual({ scanned: 0, linked: 0 });
+    });
+
+    it("leaves a junk-key event alone (never team-wide-matches `V1`)", async () => {
+      const seed = await seedTeam();
+      await taskInProject(seed, "linear-aio", "V1", "a slug-keyed row");
+      await strandedEvent(seed, "V1", "bbbbbbbb00112233445566778899aabbccddeeff");
+
+      expect(await relinkUnresolvedWorkEvents(db(), seed.teamId)).toEqual({ scanned: 0, linked: 0 });
+      const { data: ev } = await db()
+        .from("work_events").select("status, task_id").eq("team_id", seed.teamId).maybeSingle();
+      expect(ev).toMatchObject({ status: "unresolved", task_id: null });
+    });
+
+    it("does not link across TEAMS — another team's task with the same key is invisible", async () => {
+      const mine = await seedTeam();
+      const other = await seedTeam();
+      await taskInProject(other, "linear-aio", "AIO-778"); // the ONLY task carrying this key
+      await strandedEvent(mine, "AIO-778", "cccccccc00112233445566778899aabbccddeeff");
+
+      expect(await relinkUnresolvedWorkEvents(db(), mine.teamId)).toEqual({ scanned: 1, linked: 0 });
+      const { data: ev } = await db()
+        .from("work_events").select("status, task_id").eq("team_id", mine.teamId).maybeSingle();
+      expect(ev).toMatchObject({ status: "unresolved", task_id: null });
+    });
   });
 });

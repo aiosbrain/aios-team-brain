@@ -86,11 +86,16 @@ Today the Timeline links a commit only when the commit's **own text** cites a ke
 (`issue-ref.computeTaskLinks`). The key usually lives on the **PR**. Since 88% of commits match a
 work_event by sha, a commit inherits its PR's resolved task:
 
-- **Join:** `left(work_events.merged_sha, 10) = items.frontmatter->>'sha'` (merged_sha is 40 chars;
-  `frontmatter.sha` is 10 chars for all 448 prod rows). Scope the join to `(team_id, repo)` where the item
-  carries repo, to avoid cross-repo prefix accidents. 10 hex chars = 40 bits → collision risk ~1e-7 at this
-  scale (acceptable). **Follow-up:** store the full 40-char sha at ingest going forward and keep the prefix
-  join only for historical rows.
+- **Join:** `left(work_events.merged_sha, 10) = left(items.frontmatter->>'sha', 10)` (merged_sha is 40 chars;
+  `frontmatter.sha` is 10 chars for all 448 prod rows — but `normalizeCommit` stores whatever the CLI sends,
+  so BOTH sides are normalized to the prefix rather than assuming the short form). 10 hex chars = 40 bits →
+  collision risk ~1e-7 at this scale (acceptable).
+  **Repo-scoping the join — considered, DROPPED (build note).** The draft said to scope by `(team_id, repo)`.
+  It isn't directly available: a commit item carries `frontmatter.codebase` (a codebase **slug**), not the
+  `owner/repo` string `work_events.repo` holds — scoping would need an extra `codebases.full_name` lookup to
+  translate. Buying a ~1e-7 collision defence with a new join is the ceremony §7 warns against, so the join
+  stays sha-only and this records why. **Follow-up:** store the full 40-char sha at ingest going forward and
+  keep the prefix join only for historical rows — that closes the collision case outright.
 - **Coverage limit (known, not a bug):** squash-merge makes this 1 commit ↔ 1 PR (why 88% match). A
   merge-commit PR's individual commits won't inherit.
 - **Precedence:** the commit's OWN cited key wins (most specific). The PR link is used **only** when
@@ -98,8 +103,9 @@ work_event by sha, a commit inherits its PR's resolved task:
 - **≥2 tasks per PR:** one `merged_sha` can have several work_events rows (one per key). If >1 distinct
   resolved `task_id`, **link the commit to ALL of them** — the evidence model already supports one item under
   multiple tasks (`work-timeline.ts`), and the PR genuinely touched both.
-- **Provenance:** mark the link `via: "pr"` vs `via: "commit-text"`, so an inherited link is distinguishable
-  and a wrong inheritance is diagnosable.
+- **Provenance:** mark the link `linkVia: "pr"` vs `"commit-text"` — carried through the grouper onto the
+  persisted `EvidenceItem`, so an inherited (lower-precision) link is diagnosable from every surface that
+  reads the ledger (incl. `GET /api/v1/timeline`), not just inside the builder. Additive optional field.
 - **Tier (the mechanism, not just the requirement):** an inherited `task_id` is resolved ONLY against the
   task maps the builder already fetched through **`visibleTasks`** (the active-task map for nesting;
   `chipInfo`/all-tasks for the #373 done-chip). An id not in those maps → **no link, silently**. We never
@@ -109,7 +115,7 @@ work_event by sha, a commit inherits its PR's resolved task:
 - **Cache:** inherited links change the persisted ledger content → **bump `work_timeline_cache`
   `PAYLOAD_VERSION`** so stale rows rebuild instead of serving link-less data for a TTL.
 
-### Backfill — IN SCOPE, link-only
+### Backfill — IN SCOPE, link-only (`scripts/backfill-work-event-links.ts`)
 Existing `work_events` are stuck `unresolved` with `task_id = null`. A **link-only** backfill (re-run the
 fixed lookup for `status='unresolved'` + issue-shaped `row_key`, writing ONLY `task_id` + `status='linked'`)
 has **zero Linear writes**, so the objection in my first draft doesn't apply — it's the same code path as

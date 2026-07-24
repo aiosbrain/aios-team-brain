@@ -65,6 +65,9 @@ export const MAX_WINDOW_DAYS = 30;
 const ITEM_LIMIT = 2000;
 const TASK_LIMIT = 2000;
 const DECISION_LIMIT = 500;
+/** Commit↔PR join width. `work_events.merged_sha` is the full 40 chars; the CLI pushes a 10-char
+ *  `frontmatter.sha`, so both sides normalize to this prefix. 40 bits — collision risk ~1e-7 at our scale. */
+const SHA_JOIN_LEN = 10;
 
 type ItemRow = {
   id: string;
@@ -362,26 +365,28 @@ export async function getWorkTimeline(
 
   // PR-INHERITED links: the issue key usually lives on the PULL REQUEST, not on each commit message — so a
   // commit whose own text cites nothing still belongs to its PR's task. `work_events` already records that
-  // PR→task resolution; join it by sha (`merged_sha` is 40 chars, `frontmatter.sha` is 10 → prefix match).
-  // Squash-merge makes this 1 commit ↔ 1 PR (a merge-commit PR's individual commits won't inherit — a known
-  // coverage limit, not a bug). Enrichment → WARN, never throw.
-  const commitShas = [...new Set(evItems.map((e) => e.sha).filter((s): s is string => !!s))];
+  // PR→task resolution; join it by sha. `merged_sha` is the FULL 40 chars; the CLI pushes a 10-char
+  // `frontmatter.sha`, so BOTH sides are normalized to the 10-char prefix — a future CLI that pushes the
+  // full sha then still joins instead of silently missing. Squash-merge makes this 1 commit ↔ 1 PR (a
+  // merge-commit PR's individual commits won't inherit — a known coverage limit, not a bug).
+  // Enrichment → WARN, never throw.
+  const shaKey = (s: string) => s.trim().toLowerCase().slice(0, SHA_JOIN_LEN);
+  const commitShas = new Set(evItems.map((e) => e.sha).filter((s): s is string => !!s).map(shaKey));
   const prTaskIdsBySha = new Map<string, string[]>();
-  if (commitShas.length > 0) {
+  if (commitShas.size > 0) {
     const weRes = await db
       .from("work_events")
       .select("merged_sha, task_id")
       .eq("team_id", teamId)
       .not("task_id", "is", null);
     if (weRes.error) console.warn("[work-timeline] work-events read failed:", weRes.error.message);
-    const shaSet = new Set(commitShas);
     for (const w of (weRes.data ?? []) as { merged_sha: string | null; task_id: string | null }[]) {
       if (!w.merged_sha || !w.task_id) continue;
-      const prefix = w.merged_sha.slice(0, 10);
-      if (!shaSet.has(prefix)) continue;
-      const list = prTaskIdsBySha.get(prefix) ?? [];
+      const key = shaKey(w.merged_sha);
+      if (!commitShas.has(key)) continue;
+      const list = prTaskIdsBySha.get(key) ?? [];
       if (!list.includes(w.task_id)) list.push(w.task_id); // a PR can resolve to >1 task — keep them all
-      prTaskIdsBySha.set(prefix, list);
+      prTaskIdsBySha.set(key, list);
     }
   }
 
@@ -395,7 +400,7 @@ export async function getWorkTimeline(
     const ownTaskIds = links.get(e.id);
     // TIER: an inherited id is only ever resolved against the maps already fetched through `visibleTasks`
     // (`taskInfo` = active tasks; `chipInfo` = all visible tasks). An id outside them → no link, silently.
-    const inherited = e.sha ? prTaskIdsBySha.get(e.sha) ?? [] : [];
+    const inherited = e.sha ? prTaskIdsBySha.get(shaKey(e.sha)) ?? [] : [];
     if (ownTaskIds && ownTaskIds.length) {
       // The commit's OWN cited key wins — most specific.
       for (const taskId of ownTaskIds) evidence.push({ ...base, taskId, linkVia: "commit-text" });
