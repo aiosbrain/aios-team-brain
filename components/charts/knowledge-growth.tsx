@@ -28,8 +28,8 @@ export function KnowledgeGrowth({ data }: { data: KnowledgePoint[] }) {
   );
 
   return (
-    <ChartCard title="Knowledge growth" hint="items synced / day" empty={empty}>
-      <ResponsiveContainer width="100%" height={200}>
+    <ChartCard title="Knowledge growth" hint="new items / day" empty={empty}>
+      <ResponsiveContainer width="100%" height={140}>
         <AreaChart data={data} margin={{ top: 4, right: 4, left: -20, bottom: 0 }}>
           <CartesianGrid vertical={false} stroke={GRID_STROKE} />
           <XAxis

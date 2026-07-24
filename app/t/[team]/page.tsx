@@ -228,11 +228,13 @@ export default async function TeamHome({
             <RangeSelector value={range} />
           </div>
           <KpiBand kpis={pulse.kpis} />
+          {/* Brain usage (queries + spend) is the primary signal, so it gets the width; knowledge
+              growth is a smaller secondary visual beside it. */}
           <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
             <div className="lg:col-span-2">
-              <KnowledgeGrowth data={pulse.knowledge} />
+              <UsageChart data={pulse.usage} scope={isAdmin ? "team" : "your"} />
             </div>
-            <UsageChart data={pulse.usage} scope={isAdmin ? "team" : "your"} />
+            <KnowledgeGrowth data={pulse.knowledge} />
           </div>
           <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
             <DecisionsCard teamSlug={teamSlug} decisions={(decisions ?? []) as DecisionRow[]} />

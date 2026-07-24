@@ -40,14 +40,16 @@ describe("getPulseMetrics (real Postgres date windowing)", () => {
 
     const kpi = (key: string) => pulse.kpis.find((k) => k.key === key);
 
-    // Items KPI: the bug reported 0 here. Now it must reflect the 3 in-window items.
-    expect(Number(kpi("items")!.value)).toBe(3);
+    // KPI band is the trimmed meaningful set — Queries / Tasks in flight / Spend. "Items synced"
+    // was removed (it counted synced_at churn, not real growth), so it must NOT be present.
+    expect(pulse.kpis.map((k) => k.key)).toEqual(["queries", "tasks", "spend"]);
     // Queries KPI: 2 recent queries, not 0.
     expect(Number(kpi("queries")!.value)).toBe(2);
     // Spend rolls up the recent queries' cost.
     expect(kpi("spend")!.value).toBe("$0.50");
 
     // Time-series charts must have data in the window (they showed "No data in this window").
+    // These items were just ingested, so created_at = now() → all 3 count as new knowledge in-window.
     const knowledgeTotal = pulse.knowledge.reduce(
       (s, p) => s + p.deliverable + p.transcript + p.decision + p.task + p.artifact + p.skill,
       0
@@ -57,6 +59,32 @@ describe("getPulseMetrics (real Postgres date windowing)", () => {
     expect(usageTotal).toBe(2);
 
     // Sanity: a −100% delta is the exact bug signature (current=0, prior>0); must NOT reproduce.
-    expect(kpi("items")!.delta).not.toBe(-100);
+    expect(kpi("queries")!.delta).not.toBe(-100);
+  });
+
+  it("buckets knowledge growth by first-seen created_at, NOT by re-sync churn (synced_at)", async () => {
+    const seed = await seedTeam();
+    // An item first seen 10 days ago, then re-synced TODAY (the 30-min scheduler bumps synced_at every
+    // tick). The old code bucketed on synced_at, so this old item wrongly counted as "new" today.
+    const { id } = await ingest(seed, { path: "old.md", body: "seen long ago", access: "team", kind: "deliverable" });
+    const tenDaysAgo = new Date(Date.now() - 10 * 86_400_000).toISOString();
+    const now = new Date().toISOString();
+    const { error } = await db()
+      .from("items")
+      .update({ created_at: tenDaysAgo, synced_at: now, updated_at: now })
+      .eq("id", id);
+    if (error) throw new Error(`backdate failed: ${error.message}`);
+
+    const pulse = await getPulseMetrics(db(), seed.teamId, "30d", {
+      isAdmin: true,
+      memberId: seed.memberId,
+    });
+
+    // It's still within the 30d window (created 10d ago), so exactly one item lands in knowledge growth…
+    const total = pulse.knowledge.reduce((s, p) => s + p.deliverable, 0);
+    expect(total).toBe(1);
+    // …but on its CREATION day (10 days ago), never on today (synced_at). Today's bucket is the last one.
+    const today = pulse.knowledge[pulse.knowledge.length - 1];
+    expect(today.deliverable).toBe(0);
   });
 });
