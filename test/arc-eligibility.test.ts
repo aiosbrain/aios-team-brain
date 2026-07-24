@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { isArcActiveLinearState, isArcEligible } from "@/lib/graph/arc-eligibility";
+import { isArcActiveLinearState, isArcEligible, isGithubIssueBacklog } from "@/lib/graph/arc-eligibility";
 
 /**
  * Spec: only ACTIVE Linear work (In Progress / In Review) informs narrative arcs; other states are
@@ -39,5 +39,23 @@ describe("isArcEligible", () => {
     expect(isArcEligible("linear", "Backlog")).toBe(false);
     expect(isArcEligible("linear", null)).toBe(false); // Linear + no type + no state → not active
     expect(isArcEligible("LINEAR", "Backlog")).toBe(false); // source case-insensitive
+  });
+});
+
+/**
+ * Spec: the GitHub issues-backlog aggregate (`github/<repo>/issues.md`, one connector-owned kind=task
+ * doc) is author-less machine context, not narrative — excluded from arcs (the "no person assigned" arc).
+ */
+describe("isGithubIssueBacklog", () => {
+  it("matches the connector issues.md aggregate (github + task + issues.md path)", () => {
+    expect(isGithubIssueBacklog("github", "task", "github/aiosbrain-aios-team-brain/issues.md")).toBe(true);
+    expect(isGithubIssueBacklog("GitHub", "task", "github/acme-repo/ISSUES.MD")).toBe(true); // case-insensitive
+  });
+  it("leaves other GitHub content alone (repo-file deliverables, commit artifacts, other tasks)", () => {
+    expect(isGithubIssueBacklog("github", "deliverable", "github/acme/readme.md")).toBe(false); // repo file
+    expect(isGithubIssueBacklog("git", "artifact", "commits/abc.md")).toBe(false); // commit
+    expect(isGithubIssueBacklog("github", "task", "github/acme/roadmap.md")).toBe(false); // not the issues digest
+    expect(isGithubIssueBacklog("linear", "task", "issues.md")).toBe(false); // not github
+    expect(isGithubIssueBacklog(null, null, null)).toBe(false);
   });
 });
