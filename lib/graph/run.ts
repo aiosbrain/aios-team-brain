@@ -35,6 +35,10 @@ export interface GraphProjectionSummary {
    * group scan, or Graphiti persistently refusing the delete), which the code deliberately produces
    * instead of falsely clearing the flag — so it has to be visible. */
   pendingCleanups: number;
+  /** Graphiti groups that have outgrown the reconcile scan window, so their landed-check was skipped
+   * this run. Non-zero means self-healing has quietly stopped for those groups — surfaced rather than
+   * swallowed, per the no-silent-caps rule (raise `GRAPH_LANDED_SCAN_DEPTH`). */
+  saturatedGroups: number;
   errors: string[];
 }
 
@@ -94,6 +98,7 @@ async function runGraphProjectionInner(opts?: {
     requeued: 0,
     cleaned: 0,
     pendingCleanups: 0,
+    saturatedGroups: 0,
     errors: [],
   };
   if (!client.configured) return summary; // nowhere to project — skip cleanly
@@ -131,6 +136,7 @@ async function runGraphProjectionInner(opts?: {
       summary.requeued += r.reQueued;
       summary.cleaned += r.cleaned;
       summary.pendingCleanups += r.pendingCleanups;
+      summary.saturatedGroups += r.saturatedGroups;
     } catch (e) {
       summary.ok = false;
       summary.errors.push(`${t.slug}: ${e instanceof Error ? e.message : "projection failed"}`);

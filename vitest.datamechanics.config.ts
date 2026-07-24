@@ -33,6 +33,7 @@ process.env.SECRETS_KEY ??= Buffer.alloc(32, 7).toString("base64");
 // "the old group is empty" — without materializing 100k fake episodes. The code reads the exported
 // GROUP_SCAN_DEPTH, and so do the tests, so the assertions stay honest at any window size.
 process.env.GRAPH_GROUP_SCAN_DEPTH = "200";
+process.env.GRAPH_LANDED_SCAN_DEPTH = "100";
 
 export default defineConfig({
   test: {

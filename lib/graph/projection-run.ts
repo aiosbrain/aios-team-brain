@@ -33,6 +33,9 @@ export function projectionRunInput(
       // Outstanding tier cleanups — old-tier episodes still purgeable-but-unpurged. Non-zero here is a
       // tier-isolation signal (B2), so it belongs in the durable record, not just an ephemeral log.
       pendingCleanups: summary.pendingCleanups,
+      // Groups that outgrew the reconcile scan window — self-healing has stopped for them. A cap that
+      // saturates must never be silent.
+      saturatedGroups: summary.saturatedGroups,
     },
     startedAt,
     finishedAt,

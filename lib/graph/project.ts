@@ -287,8 +287,16 @@ export async function projectItemsToGraph(
     // only then clears `pending_delete_group_id`. The inline delete stays as the fast path.
     if (tierChanged && existingRow) {
       await deleteItemEpisodes(client, existingRow.group_id, item.id).catch(() => {});
-    } else if (purgeBeforeRepush) {
-      await deleteItemEpisodes(client, groupId, item.id).catch(() => {});
+    }
+    // Independent of the tier check, NOT an else-arm: on a double flip (A→B→A while A's cleanup is
+    // still outstanding) both are true, and the push target is exactly the group holding the stale
+    // episodes the flag was recorded for. Skipping it there would leave them beside the fresh push.
+    let purgeFailed = false;
+    if (purgeBeforeRepush) {
+      purgeFailed = await deleteItemEpisodes(client, groupId, item.id).then(
+        () => false,
+        () => true
+      );
     }
 
     await client.addEpisodes(groupId, episodes);
@@ -297,11 +305,17 @@ export async function projectItemsToGraph(
     // Pending-delete bookkeeping for THIS push. Written only when it changes; an ordinary content
     // re-push omits both columns, so the pg upsert (which only SETs keys present in the object) leaves
     // an outstanding cleanup intact — that retention is what makes the flag durable.
+    //
+    // The flag is cleared ONLY on a purge we watched succeed. If that delete threw (a Graphiti blip),
+    // clearing it would silently abandon the cleanup — the pre-redaction episodes would sit in the
+    // group forever with nothing to retry and `pendingCleanups` reading 0, which is the failure mode
+    // this whole mechanism exists to prevent. Keeping it set is safe: reconcile purges the group and
+    // the landed-check's sentinel re-queue re-pushes, so the row converges to fresh-content-only.
     const pending: Record<string, string | null> =
       tierChanged && existingRow
         ? { pending_delete_group_id: existingRow.group_id, pending_delete_at: projectedAt }
-        : purgeBeforeRepush
-          ? { pending_delete_group_id: null, pending_delete_at: null } // just purged + re-pushed here
+        : purgeBeforeRepush && !purgeFailed
+          ? { pending_delete_group_id: null, pending_delete_at: null } // purge confirmed + re-pushed
           : {};
 
     await db.from("graph_episodes").upsert(

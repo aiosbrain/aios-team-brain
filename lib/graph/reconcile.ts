@@ -2,7 +2,7 @@ import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { GraphitiClient } from "./graphiti-client";
 import { itemIdFromEpisodeName } from "./episode-name";
-import { GROUP_SCAN_DEPTH } from "./project";
+import { GROUP_SCAN_DEPTH, resolvePositiveInt } from "./project";
 
 /**
  * Reconcile pass for the brain→Graphiti seam (audit H3, Option B — chosen over blocking-confirm
@@ -12,7 +12,8 @@ import { GROUP_SCAN_DEPTH } from "./project";
  * ACTUALLY landed in Graphiti (via `GET /episodes/{group}`, matched by our stable `name`). Anything
  * that never landed (a worker crash before/while extracting it) is cleared so the next projector run
  * treats it as unprojected and re-pushes — self-healing, off the hot ingest/push path. Confirmed
- * rows get their `episode_uuid` backfilled (used later for targeted deletes — see deleteItemEpisodes).
+ * rows get their `episode_uuid` backfilled as provenance only — the deletes resolve names→uuids through
+ * `listEpisodes` themselves, so nothing reads the stored value.
  */
 
 const GRACE_MS = 5 * 60_000; // don't judge a row pushed in the last 5 min — extraction may still be running
@@ -24,6 +25,14 @@ const GRACE_MS = 5 * 60_000; // don't judge a row pushed in the last 5 min — e
 // DO see still runs every pass; only the flag-CLEAR waits out this window.)
 const CLEANUP_GRACE_MS = 60 * 60_000;
 
+/**
+ * How deep the LANDED-check lists each group. Deliberately smaller than `GROUP_SCAN_DEPTH` (which the
+ * rare tier cleanup uses): this runs for EVERY group on EVERY pass, so the window is a payload cost
+ * paid hourly, not a one-off. A group past this window is not judged at all (see `saturated` below)
+ * rather than judged wrongly, so the depth trades latency-to-heal for transfer size — not correctness.
+ */
+export const LANDED_SCAN_DEPTH = resolvePositiveInt(process.env.GRAPH_LANDED_SCAN_DEPTH, 5000);
+
 export interface ReconcileSummary {
   groupsChecked: number;
   confirmed: number;
@@ -33,12 +42,17 @@ export interface ReconcileSummary {
   /** Cleanups STILL outstanding after this pass — old-tier episodes that are purgeable but not yet
    * verified purged. A number that never returns to 0 is a stuck tier cleanup, not bookkeeping. */
   pendingCleanups: number;
+  /** Groups whose episode list came back FULL, so nothing in them could be judged this pass. Reported
+   * rather than swallowed: it means the group has outgrown the scan window and self-healing has
+   * quietly stopped for it (raise `GRAPH_LANDED_SCAN_DEPTH`). */
+  saturatedGroups: number;
 }
 
 type EpisodeRow = {
   id: string;
   source_id: string;
   group_id: string;
+  content_sha256: string;
   projected_at: string;
   episode_uuid: string | null;
   pending_delete_group_id: string | null;
@@ -50,12 +64,13 @@ export async function reconcileProjectedEpisodes(
   client: GraphitiClient,
   teamId: string
 ): Promise<ReconcileSummary> {
-  if (!client.configured) return { groupsChecked: 0, confirmed: 0, reQueued: 0, cleaned: 0, pendingCleanups: 0 };
+  if (!client.configured)
+    return { groupsChecked: 0, confirmed: 0, reQueued: 0, cleaned: 0, pendingCleanups: 0, saturatedGroups: 0 };
 
   const { data } = await db
     .from("graph_episodes")
     .select(
-      "id, source_id, group_id, projected_at, episode_uuid, pending_delete_group_id, pending_delete_at"
+      "id, source_id, group_id, content_sha256, projected_at, episode_uuid, pending_delete_group_id, pending_delete_at"
     )
     .eq("team_id", teamId);
   const rows = (data ?? []) as EpisodeRow[];
@@ -70,14 +85,21 @@ export async function reconcileProjectedEpisodes(
   const cutoff = Date.now() - GRACE_MS;
   let confirmed = 0;
   let reQueued = 0;
+  let saturatedGroups = 0;
 
   for (const [groupId, groupRows] of byGroup) {
     // Graphiti unreachable this pass — leave these rows alone and try again next tick, rather than
-    // treating "couldn't check" as "never landed" and re-pushing everything. Scan deep (same depth as
-    // the cleanup) so a >5000-episode group can't push an item's chunks outside the window and trigger
-    // a spurious "never landed" re-queue (which, for a flagged row, would also churn its cleanup).
-    const episodes = await client.listEpisodes(groupId, GROUP_SCAN_DEPTH).catch(() => null);
+    // treating "couldn't check" as "never landed" and re-pushing everything.
+    const episodes = await client.listEpisodes(groupId, LANDED_SCAN_DEPTH).catch(() => null);
     if (episodes === null) continue;
+    // A FULL window is inconclusive the same way an unreachable Graphiti is: an item's chunks may sit
+    // just beyond it, and reading that as "never landed" would re-push the ENTIRE group every pass —
+    // growing the group, pushing more rows out of the window, re-pushing more next pass. That
+    // self-amplifying loop is worse than not healing, so a saturated group is skipped and counted.
+    if (episodes.length >= LANDED_SCAN_DEPTH) {
+      saturatedGroups++;
+      continue;
+    }
     // An item is projected as one OR MANY chunk episodes (`items:<id>` / `items:<id>#k`) — it "landed"
     // if ANY of its chunks is present. Map each item id → one of its episode uuids.
     const uuidByItemId = new Map<string, string>();
@@ -101,8 +123,14 @@ export async function reconcileProjectedEpisodes(
         // content hash so the projector re-pushes it (same re-queue effect), while the row — and its
         // pending flag — survive for the cleanup loop below to finish. The re-push's upsert omits the
         // pending column (its tier didn't change), so the flag is retained.
-        await db.from("graph_episodes").update({ content_sha256: "" }).eq("id", row.id);
-        reQueued++;
+        //
+        // Already on the sentinel → nothing to re-queue (a redacted item parks here for the whole
+        // grace window). Writing and counting it every pass would inflate `requeued` in the logs and
+        // the ingest_runs meta with work that isn't happening.
+        if (row.content_sha256 !== "") {
+          await db.from("graph_episodes").update({ content_sha256: "" }).eq("id", row.id);
+          reQueued++;
+        }
       } else {
         await db.from("graph_episodes").delete().eq("id", row.id);
         reQueued++;
@@ -186,5 +214,6 @@ export async function reconcileProjectedEpisodes(
     reQueued,
     cleaned,
     pendingCleanups: (pendingRows ?? []).length,
+    saturatedGroups,
   };
 }
