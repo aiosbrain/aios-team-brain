@@ -19,11 +19,33 @@ Non-git, non-GitHub WORK items attributed to a member, last 30 days, by source �
 | plane | deliverable | 43 | 0 |
 | granola / tweet | deliverable | 5 | 5 |
 
-**The corpus is the `(none)`-source deliverables** — documents pushed through the aios CLI daily loop
-(`2-work/…`, `1-inbox/…`). **72 of 78 already have a work-time and already reach the timeline**, and they
-carry no issue key in title or path, so they land in the "Other" bucket. That is ~18 documents/week of real,
-attributed document work sitting unassociated. This is exactly what the ask describes, and **nothing needs
-to be unblocked first.**
+**Corpus (a) — CLI daily-loop docs.** The `(none)`-source deliverables pushed through the aios CLI
+(`2-work/…`, `1-inbox/…`): 127 items all-time, **127 of 127 attributed**, 76 with a work-time. They carry no
+issue key in title or path, so they land in the "Other" bucket. ~18/week. **Live today, nothing to unblock.**
+Attribution is normally the pusher — with exceptions, which is why the pass must read the item's resolved
+credit (the shared attribution oracle), never assume "pusher = author".
+
+**Corpus (b) — Notion + Google Docs. Supported, but NOT CONNECTED — zero items from either.**
+`notion` and `gdrive` are first-class ingestion sources (ARCHITECTURE `drift:sources`) with Python
+connectors (`ingestion/aios_ingest/sources/{notion,gdrive}.py`), but prod has **0 rows** from both, and the
+team's enabled integrations are only `github · linear · slack · openai · openrouter`. So the half of the ask
+about Notion/GDoc association **has no data to act on yet**. Two separate prerequisites, neither of which
+blocks building the pass itself:
+
+1. **Connect the two connectors** (ops/config). Note `integrations.type`'s CHECK
+   (`postgres/schema.sql:1618`) allows `google` but has **no `notion`** value — confirm where Notion
+   credentials are meant to live before wiring it.
+2. **Google Drive has no owner enrichment.** Notion's already exists and is exactly the "owners of the doc"
+   signal — `ingestion/aios_ingest/sources/notion_authors.py` maps `created_by` → role `author` and
+   `last_edited_by` → role `editor` into the structured `authors[]` that `lib/attribution/resolve-authors`
+   resolves to a roster member (bots excluded). `gdrive.py` is a 50-line llama-index wrapper with **no
+   equivalent**, so a Drive doc arrives ownerless. A `gdrive_authors` pass mirroring the Notion one
+   (Drive API `owners` / `lastModifyingUser`) is needed before Drive docs can be attributed at all.
+
+**Design consequence: the pass must be SOURCE-AGNOSTIC** — it scores any attributed WORK doc that has a
+work-time and no deterministic link, at the shared layer. CLI docs exercise it today; Notion and Drive docs
+flow through the identical path the moment their connectors are on, with no second implementation. (This is
+the "lowest shared layer, every surface reads it identically" rule applied to ingestion sources.)
 
 The Linear/Plane "deliverables" (416 rows, zero work-times) are **PM mirrors**, not authored documents —
 correctly out of scope.
@@ -128,6 +150,13 @@ the timeline computes links **inline**. So this feature must also add the **firs
   ~20 `single-writer-*` guards; this table has none).
 - Inferred links become viewer-visible → add `task_evidence` to `bustTeamLearningCaches`
   (`lib/ingest/reconcile-attribution.ts:20-27`), which evicts arcs + timeline but not this table.
+
+## Prerequisites for the Notion/GDoc half (separate work, tracked here so it isn't lost)
+1. Connect the **Notion** and **Google Drive** connectors (and settle where Notion credentials live —
+   `integrations.type` has `google` but no `notion`).
+2. Build **`gdrive_authors`** mirroring `notion_authors.py`, so a Drive doc carries its owners
+   (`owners`/`lastModifyingUser` → `authors[]`) and can be attributed at all. Without it a Drive doc is
+   ownerless and this pass will never see it (it only scores attributed items).
 
 ## Out of scope
 - GitHub repo files as timeline evidence (see "What I got wrong") — a separate, lower-value follow-up that
