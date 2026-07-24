@@ -29,6 +29,8 @@ export interface Kpi {
   /** Daily series across the window, for a sparkline. */
   spark: number[];
   hint?: string;
+  /** Plain-language "what is this / how is it computed" copy for the "?" popover. */
+  help?: string;
   accent: KpiAccent;
 }
 
@@ -256,6 +258,7 @@ export async function getPulseMetrics(
 
   const usageLabel = isAdmin ? "Team queries" : "Your queries";
   const spendLabel = isAdmin ? "Team spend" : "Your spend";
+  const scopeWord = isAdmin ? "the whole team's" : "your";
 
   // KPI band = the meaningful set only. "Items synced" was dropped: it counted synced_at (re-sync
   // churn), so it read ≈the whole corpus every window — no signal. Real new-knowledge is the
@@ -269,6 +272,7 @@ export async function getPulseMetrics(
       delta: pctDelta(queriesCurrent, queriesPrior),
       spark: querySpark,
       hint: `last ${days}d`,
+      help: `How many questions were asked to the brain in the last ${days} days (${scopeWord} queries — admins see the team's, everyone else their own). Every answered query writes one row to the query log; this counts them. The arrow is the change vs. the previous ${days}-day window.`,
       accent: "blue",
     },
     {
@@ -278,6 +282,7 @@ export async function getPulseMetrics(
       delta: null,
       spark: taskSpark,
       hint: blocked > 0 ? `${blocked} blocked` : "none blocked",
+      help: "Open tasks that are actively moving — those in Ready, In progress, or Blocked (Backlog and Done are excluded). The number is a live snapshot across all the team's tasks, so the date range doesn't change it (only the sparkline, which tracks recent task activity per day, does). \"N blocked\" calls out how many of these are stuck.",
       accent: "cyan",
     },
     {
@@ -287,6 +292,7 @@ export async function getPulseMetrics(
       delta: pctDelta(Math.round(spendCurrent * 1000), Math.round(spendPrior * 1000)),
       spark: querySpark,
       hint: `last ${days}d`,
+      help: `LLM answer cost over the last ${days} days (${scopeWord} spend). Each query records the cost of its answer — on OpenRouter the real charge the provider reports (usage.cost), on Anthropic an estimate from list prices — and this sums them. OpenRouter answers from before cost metering shipped weren't captured and count as $0.`,
       accent: "emerald",
     },
   ];
