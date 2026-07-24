@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { Gavel } from "lucide-react";
 import { fmtDate, truncate, stripMarkdown } from "@/components/format";
+import { HelpHint } from "@/components/help-hint";
 import type { DecisionRow } from "./types";
 
 const TIER_LABEL: Record<number, string> = { 1: "1-way", 2: "2-way", 3: "minor" };
@@ -16,6 +17,20 @@ export function DecisionsCard({
     <section className="prism-card px-5 py-4">
       <h2 className="mb-3 flex items-center gap-2 text-sm font-semibold uppercase tracking-wider text-ink-tertiary">
         <Gavel className="size-3.5 text-amber" /> Recent decisions
+        <HelpHint label="How these decisions are made">
+          <span className="font-medium text-ink">How these are made</span>
+          <br />
+          Decisions aren&apos;t auto-detected from raw meetings. A person reviews the meeting
+          transcripts and records each decision in a decision log that syncs to the brain — so what
+          you see here is human-curated, not machine-guessed.
+          <br />
+          <br />
+          The <span className="font-medium text-ink">1-way / 2-way</span> tag is the decision&apos;s
+          reversibility, set by that reviewer: <span className="font-medium text-ink">1-way</span> = a
+          hard-to-reverse call, <span className="font-medium text-ink">2-way</span> = easily
+          reversible, <span className="font-medium text-ink">minor</span> = trivial. A struck-through
+          title means the decision was later superseded.
+        </HelpHint>
       </h2>
       {decisions.length === 0 ? (
         <p className="text-sm text-ink-tertiary">
