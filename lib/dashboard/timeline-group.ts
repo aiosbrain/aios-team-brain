@@ -131,6 +131,37 @@ export function mostRecentPerPerson(days: TimelineDay[]): PersonDay[] {
   return out;
 }
 
+// SOURCE-derived work-time fields, in priority order. All are frozen at the source's real
+// commit/edit/create time, so — unlike `synced_at` (bumped on every re-scan) — they never resurface a
+// re-scanned item as "today's work". `committed_at` (git) / `source_ts` (Slack/generic) first, then a
+// DOC's own edit/create time so attributed docs (Notion `last_edited_time`, Google Drive `modifiedTime`,
+// hand-authored deliverables' `updated`/`date`/`created`) are INCLUDED, not dropped for lacking a
+// git-style timestamp. `synced_at` is deliberately absent (it would resurface re-scanned items).
+export const WORK_TIME_KEYS = [
+  "committed_at",
+  "source_ts",
+  "updated",
+  "last_edited_time",
+  "modifiedTime",
+  "modified_time",
+  "date",
+  "created",
+  "created_time",
+  "createdTime",
+] as const;
+
+/** WORK time from an item's frontmatter — the first present + parseable `WORK_TIME_KEYS` value, ISO-
+ *  normalized. Null when none is present/parseable (the item is then dropped by the builder). Pure. */
+export function itemWorkTime(fm: Record<string, unknown> | null): string | null {
+  for (const key of WORK_TIME_KEYS) {
+    const v = fm?.[key];
+    if (typeof v !== "string" || !v) continue;
+    const t = Date.parse(v);
+    if (!Number.isNaN(t)) return new Date(t).toISOString();
+  }
+  return null;
+}
+
 /** github/git → github; a known source passes through; anything else → "other" (generic icon). */
 export function normalizeSource(raw: string | null | undefined): string {
   const s = (raw ?? "").trim().toLowerCase();
