@@ -53,6 +53,14 @@ const WORK_TIME_KEYS_NORMALIZED: readonly string[] = [
   "timestamp",
 ];
 
+/**
+ * The exact spellings our OWN producers emit, in the same priority order — checked as direct
+ * property lookups before the normalized fallback so the common case allocates nothing.
+ * MUST stay a subset of (and ordered consistently with) `WORK_TIME_KEYS_NORMALIZED`; the unit test
+ * pins that relationship.
+ */
+const COMMON_WORK_TIME_KEYS = ["committed_at", "source_ts", "occurred_at"] as const;
+
 /** Lowercase + drop every non-alphanumeric char, so `last_edited_time` / `lastEditedTime` /
  *  `"Last Edited Time"` / `modified at` all collapse to one comparable token. */
 function normalizeKey(key: string): string {
@@ -80,7 +88,17 @@ function parseInstant(value: unknown): string | null {
  */
 export function resolveWorkTime(fm: Record<string, unknown> | null | undefined): string | null {
   if (!fm) return null;
-  // Index the item's own keys by normalized form once, so an unknown spelling still matches.
+
+  // FAST PATH: the spellings our own connectors actually emit, as direct property lookups. This runs
+  // for every item of every timeline/projection build, so it must not allocate — the exact-spelling
+  // hit covers essentially all real payloads.
+  for (const key of COMMON_WORK_TIME_KEYS) {
+    const parsed = parseInstant(fm[key]);
+    if (parsed) return parsed;
+  }
+
+  // SLOW PATH: only for a source spelling it some other way. Index the item's keys by normalized
+  // form, then walk the canonical list in priority order.
   const byNormalized = new Map<string, unknown>();
   for (const [key, value] of Object.entries(fm)) {
     const norm = normalizeKey(key);
