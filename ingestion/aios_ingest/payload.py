@@ -21,8 +21,10 @@ _SHA256_HEX = 64
 
 
 def sha256_hex(body: str) -> str:
-    """content_sha256 over the normalized body. Computed caller-side per contract;
-    the brain only validates the ``^[a-f0-9]{64}$`` format and uses it for dedup."""
+    """content_sha256 over the normalized body. Sent caller-side per contract, but ADVISORY:
+    the brain recomputes this hash server-side over the body it stores and uses THAT as the dedup
+    key, so a client hashing a different normalization can neither churn every push nor freeze a
+    stale body. Keep sending it — a disagreement is recorded server-side for diagnosis."""
     return hashlib.sha256(body.encode("utf-8")).hexdigest()
 
 

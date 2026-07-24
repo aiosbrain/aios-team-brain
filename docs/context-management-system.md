@@ -71,10 +71,19 @@ validation (before any mutation) → item + version + derived-row materializatio
 
 ### 2.1 Deduplication — content-addressed, at every layer
 
-- **`content_sha256` fast-path** (`index.ts:100`). The hash covers **body + title only** (not
-  frontmatter — `reattribution-decision.ts:2`). If the incoming sha equals the stored sha, we take the
-  "unchanged" branch: no new version, no re-projection, no re-embed. Every connector re-pushes every
-  item every 30-minute tick, so this is what stops a re-sync storm from doing real work.
+- **`content_sha256` fast-path** (`index.ts:127`). The key is computed **server-side** over the
+  **body** the writer is about to store (`contentHash`, `index.ts:31`) — the wire `content_sha256` is
+  **advisory**. Producers all send `sha256(utf8(body))`, so for a correct client the two agree and
+  nothing changes; a disagreement is recorded as `sha_mismatch` in the item's create/update audit meta.
+  Integrity of the change key is the contract's own invariant, not something delegated to each
+  connector: a client hashing a different normalization would mark every push "changed" (endless
+  version/embed/projection churn), and one repeating a **stale** sha while the body changed would hit
+  the unchanged branch and freeze the stored body forever (stale content served with no error).
+  The key covers the **body only** (titles reach it only because producers embed them as a heading;
+  frontmatter is excluded — `reattribution-decision.ts:2`, hence the explicit heal paths below). If the
+  body's hash equals the stored sha, we take the "unchanged" branch: no new version, no re-projection,
+  no re-embed. Every connector re-pushes every item every 30-minute tick, so this is what stops a
+  re-sync storm from doing real work.
 - **Identity constraint** — `items` is unique on `(team_id, project_id, path)` (`schema.sql:931`): one
   live row per path. New content **replaces in place**; history goes to `item_versions`.
 - **Derived-row diff-sync** by `row_key` — `tasks`/`decisions` upsert on `(team_id, project_id,
@@ -148,7 +157,7 @@ identity resolution) can disagree with a human's deliberate correction. The reso
 
 ### 2.5 Crash-safety & integrity
 
-- **PENDING_SHA sentinel** (`index.ts:190`): a brand-new item's `content_sha256` is withheld as `""`
+- **PENDING_SHA sentinel** (`index.ts:277`): a brand-new item's `content_sha256` is withheld as `""`
   and committed **last**. Item write and derived-row materialization aren't one transaction, so a
   mid-materialize crash leaves the old/empty sha → the unchanged fast-path won't fire on retry → rows
   re-materialize. Self-healing.
