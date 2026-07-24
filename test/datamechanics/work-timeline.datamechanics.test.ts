@@ -7,8 +7,8 @@ import { db, seedTeam, ingest, type Seed } from "./helpers";
 // Spec: the Learning Timeline reads Postgres items+tasks into a day → person → (tasks + Other) ledger.
 // A task appears ONLY when it is ACTIVE (in_progress/blocked) AND has ≥1 of the person's evidence
 // referencing it (evidence-gated) — backlog/done tasks and empty headers never show; evidence linked to
-// no active task falls to "Other". Dated by WORK time (committed_at/source_ts, never synced_at);
-// meetings excluded; tier isolated. Verified on real Postgres.
+// no active task falls to "Other". Dated by WORK time (git committed_at / Slack source_ts / a doc's own
+// edit-create time — WORK_TIME_KEYS, never synced_at); meetings excluded; tier isolated. Real Postgres.
 
 const recentIso = new Date(Date.now() - 2 * 86_400_000).toISOString(); // within the 7-day window
 
@@ -161,5 +161,45 @@ describe("work timeline (real Postgres)", () => {
     expect(teamTitles).toEqual(expect.arrayContaining(["Secret team-only commit", "Public external commit"]));
     expect(extTitles).not.toContain("Secret team-only commit");
     expect(extTitles).toContain("Public external commit");
+  });
+});
+
+describe("work timeline — attributed docs (Notion / Google Docs / deliverables) by edit time (real Postgres)", () => {
+  it("includes a doc dated by its own edit/create time; drops ones with no work-time or out of window", async () => {
+    const seed = await seedTeam();
+    const days2ago = new Date(Date.now() - 2 * 86_400_000).toISOString();
+    const day1ago = new Date(Date.now() - 86_400_000).toISOString();
+    const days30ago = new Date(Date.now() - 30 * 86_400_000).toISOString();
+
+    // Notion doc edited 2d ago (last_edited_time) → appears (in "Other", no issue key).
+    await ingest(seed, { kind: "deliverable", path: `notion/spec-${randomUUID()}.md`, access: "team", body: "spec",
+      frontmatter: { source: "notion", title: "Auth rollout spec", last_edited_time: days2ago } });
+    // Hand-authored deliverable with only `updated` 1d ago → appears.
+    await ingest(seed, { kind: "deliverable", path: `docs/plan-${randomUUID()}.md`, access: "team", body: "plan",
+      frontmatter: { title: "Q3 plan", updated: day1ago } });
+    // Doc edited 30d ago → outside the 7d work window → excluded (even though synced_at is now).
+    await ingest(seed, { kind: "deliverable", path: `notion/old-${randomUUID()}.md`, access: "team", body: "old",
+      frontmatter: { source: "notion", title: "Ancient doc", last_edited_time: days30ago } });
+    // Doc with NO source work-time (only synced_at) → dropped (synced_at must never resurface it).
+    await ingest(seed, { kind: "deliverable", path: `notion/undated-${randomUUID()}.md`, access: "team", body: "u",
+      frontmatter: { source: "notion", title: "Undated doc" } });
+    // Hand-authored doc dated in the FUTURE (a plan for next month) → dropped (no future day bucket).
+    await ingest(seed, { kind: "deliverable", path: `docs/future-${randomUUID()}.md`, access: "team", body: "f",
+      frontmatter: { title: "Next-month plan", date: new Date(Date.now() + 30 * 86_400_000).toISOString() } });
+
+    const titles = evidenceTitles(await getWorkTimeline(db(), seed.teamId, "team"));
+    expect(titles).toContain("Auth rollout spec");
+    expect(titles).toContain("Q3 plan");
+    expect(titles).not.toContain("Ancient doc");
+    expect(titles).not.toContain("Undated doc");
+    expect(titles).not.toContain("Next-month plan"); // future-dated → not in a future bucket
+  });
+
+  it("tier isolation: an external viewer never sees a team-tier doc", async () => {
+    const seed = await seedTeam();
+    await ingest(seed, { kind: "deliverable", path: `notion/int-${randomUUID()}.md`, access: "team", body: "x",
+      frontmatter: { source: "notion", title: "Internal notion doc", last_edited_time: new Date(Date.now() - 86_400_000).toISOString() } });
+    const ext = evidenceTitles(await getWorkTimeline(db(), seed.teamId, "external"));
+    expect(ext).not.toContain("Internal notion doc");
   });
 });

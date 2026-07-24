@@ -5,6 +5,7 @@ import { commitSubject } from "./team-work";
 import {
   groupTimeline,
   normalizeSource,
+  itemWorkTime,
   type EvidenceItem,
   type EvidenceWithMember,
   type TaskInfo,
@@ -24,9 +25,12 @@ const ACTIVE_TASK_STATUSES = new Set(["in_progress", "blocked"]);
  * `visibleItems`/`visibleTasks` §5 choke-points; the pure grouping is `./timeline-group`.
  *
  * Design decisions (Fable spec review):
- *  • WORK time = `committed_at` ?? `source_ts` ONLY — never `synced_at`. A re-scanned doc gets a fresh
- *    synced_at, so a synced_at fallback would resurface it as "today's work" every rescan. Items with
- *    no real work time are DROPPED (mirrors lib/graph/learning `workTs`).
+ *  • WORK time = the first present of `WORK_TIME_KEYS` (git `committed_at` → generic/Slack `source_ts` →
+ *    a doc's own edit/create time: `updated`/`last_edited_time`/`modifiedTime`/`date`/`created`/…) —
+ *    NEVER `synced_at`. Every listed field is source-frozen, so a re-scan can't resurface an item as
+ *    "today's work"; `synced_at` would. This is what INCLUDES attributed docs (Notion/Google Docs/
+ *    deliverables) that carry an edit time but no git-style timestamp — previously dropped. Items with
+ *    no real work time at all are still DROPPED (mirrors lib/graph/learning `workTs`).
  *  • `.gte("synced_at", sinceIso)` bounds the fetch: sync is always at-or-after the work, so a 7-day
  *    synced_at window is a complete superset of the 7-day work window (and hits `items_team_synced_idx`).
  *    Caveat: re-pushes bump synced_at, so at scale the real bound is `ITEM_LIMIT` ordered by synced_at;
@@ -69,17 +73,6 @@ type TaskRow = {
   status: string | null;
 };
 
-/** WORK time from an item's frontmatter — `committed_at` ?? `source_ts`, normalized to ISO. Null when
- *  neither is present/parseable (the item is then dropped — see the synced_at note above). */
-function itemWorkTime(fm: Record<string, unknown> | null): string | null {
-  const raw =
-    (typeof fm?.committed_at === "string" && fm.committed_at) ||
-    (typeof fm?.source_ts === "string" && fm.source_ts) ||
-    null;
-  if (!raw) return null;
-  const t = Date.parse(raw);
-  return Number.isNaN(t) ? null : new Date(t).toISOString();
-}
 
 function basename(path: string): string {
   const parts = path.split("/").filter(Boolean);
@@ -102,6 +95,14 @@ export async function getWorkTimeline(
 ): Promise<TimelineDay[]> {
   const windowStartMs = Date.now() - WINDOW_DAYS * 86_400_000;
   const sinceIso = new Date(windowStartMs).toISOString();
+  // Upper bound (+1d clock/timezone skew): a hand-authored doc can carry a FUTURE `date`/`updated`
+  // (a plan dated next month). Without this it'd create a future day bucket that sorts first and pins as
+  // a person's "most recent day" until the date passes. Git/Slack times are never future; this guards docs.
+  const futureBoundMs = Date.now() + 86_400_000;
+  const inWindow = (at: string): boolean => {
+    const t = Date.parse(at);
+    return !Number.isNaN(t) && t >= windowStartMs && t <= futureBoundMs;
+  };
   const todayISO = new Date().toISOString().slice(0, 10);
 
   const [memberRes, teamRes, slackIdRes] = await Promise.all([
@@ -236,7 +237,7 @@ export async function getWorkTimeline(
   for (const r of (gitRes.data ?? []) as ItemRow[]) {
     if (!r.member_id || !members.has(r.member_id)) continue;
     const at = itemWorkTime(r.frontmatter);
-    if (!at || Date.parse(at) < windowStartMs) continue;
+    if (!at || !inWindow(at)) continue;
     const fm = r.frontmatter ?? {};
     const title = str(fm.title) || commitSubject(r.body ?? "") || "commit";
     evItems.push({ id: r.id, memberId: r.member_id, source: "github", kind: "commit", title, url: httpUrl(fm.source_url), at, text: `${title}\n${r.body ?? ""}` });
@@ -248,7 +249,7 @@ export async function getWorkTimeline(
     const source = normalizeSource(str(fm.source));
     if (source === "slack" || source === "granola" || r.kind === "transcript") continue; // slack: own query; meetings: excluded
     const at = itemWorkTime(fm);
-    if (!at || Date.parse(at) < windowStartMs) continue;
+    if (!at || !inWindow(at)) continue;
     const title = str(fm.title) || (r.path ? basename(r.path) : "") || "(untitled)";
     evItems.push({ id: r.id, memberId: r.member_id, source, kind: r.kind ?? "item", title, url: httpUrl(fm.source_url), at, text: `${title}\n${r.path ?? ""}` });
   }
@@ -270,7 +271,7 @@ export async function getWorkTimeline(
       if (seen.has(authorId!)) continue;
       seen.add(authorId!);
       const at = str(p?.last_ts);
-      if (!at || Number.isNaN(Date.parse(at)) || Date.parse(at) < windowStartMs) continue;
+      if (!at || !inWindow(at)) continue;
       // One row per (thread, participant); text = title (no body fetch — a thread citing an issue key in
       // its first line still links to a task, else it lands in "Other").
       evItems.push({ id: `${r.id}:${authorId}`, memberId, source: "slack", kind: "slack", title, at, text: title });
