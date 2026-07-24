@@ -9,7 +9,7 @@ portable: plain SQL migrations, Postgres-backed rate limiting, no Vercel-only de
 > ingestion sources) are guarded against drift by `scripts/check-docs-drift.mjs` — see
 > [Docs drift guard](#docs-drift-guard).
 >
-> **Last verified against code: 2026-07-16.** If a flow here disagrees with the code, the
+> **Last verified against code: 2026-07-24.** If a flow here disagrees with the code, the
 > code wins — fix the doc (same PR).
 
 ## Sources of truth
@@ -82,6 +82,22 @@ Operational rows are revoked, not deleted. `gateway_audit_log`, `gateway_executi
 fields and their `ON DELETE RESTRICT` references intentionally block team/member deletion until a
 future explicit compliance-retention process is designed. No destructive down-migration exists.
 
+### Approved transcript evidence (Brain API 1.12)
+
+`fact` and `stakeholder_mention` items are structured projections of locally reviewed
+transcript candidates. The raw transcript is not part of this flow. `lib/ingest` is the
+only writer: it validates the complete item payload before any item/version write, stores
+the approved item, and materializes rows into `extracted_facts` or
+`stakeholder_mentions`. Each row inherits the containing item's normalized
+`team`/`external` audience. Upserts key on `(team_id, project_id, row_key)`, while
+diff-deletion is limited to rows whose `source_item_id` is the item currently syncing.
+
+Stakeholder mentions are evidence, not verified identities. Ingestion never writes
+`members`, `graph_entities`, or `graph_relationships`; the company-graph single-writer
+guard remains unchanged. The existing meeting-note action-item extractor is a separate
+server-side producer. It does not authorize this local approval flow to upload raw
+transcripts.
+
 ## System context
 
 ```mermaid
@@ -126,7 +142,7 @@ flowchart LR
 
 ## Auth & access tiers
 
-This server **implements brain-api v1.9** (the shipped member-facing wire contract; source of truth:
+This server **implements brain-api v1.12** (the shipped member-facing wire contract; source of truth:
 `aios-workspace/docs/brain-api.md`; v1.8 added the subscriptions endpoint,
 `POST /api/v1/subscriptions`). That version is pinned in code as `BRAIN_API_VERSION`
 (`lib/api/version.ts`), asserted against this sentence by
@@ -726,7 +742,7 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 `auth_users` · `auth_tokens` · `oauth_states` · `teams` · `members` · `api_keys` · `audit_log` ·
 `gateway_service_identities` · `gateway_service_credentials` · `executor_subject_bindings` · `gateway_connections` · `gateway_resolution_leases` ·
 `gateway_executions` · `gateway_approvals` · `gateway_audit_log` · `gateway_rate_limits` · `rate_limits` ·
-`projects` · `items` · `item_versions` · `tasks` · `decisions` · `graph_entities` ·
+`projects` · `items` · `item_versions` · `tasks` · `decisions` · `extracted_facts` · `stakeholder_mentions` · `graph_entities` ·
 `graph_relationships` · `query_log` · `policies` · `approval_requests` · `actions` ·
 `codebases` · `code_metrics` · `code_contributions` · `github_issues` · `member_emails` ·
 `member_identities` · `member_secrets` · `member_profiles` · `member_time_off` · `member_goals` · `member_provisioning` · `integrations` ·
