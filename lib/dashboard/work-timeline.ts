@@ -7,6 +7,7 @@ import {
   normalizeSource,
   itemWorkTime,
   type EvidenceItem,
+  type EvidenceTaskRef,
   type EvidenceWithMember,
   type TaskInfo,
   type TimelineDay,
@@ -308,15 +309,46 @@ export async function getWorkTimeline(
     evItems.map((e) => ({ id: e.id, text: e.text }))
   );
 
+  // CHIP linkage for the "Other" bucket: a commit often cites a task that just went DONE/backlog, which
+  // #350 keeps out of the active nesting headers — so it lands in "Other" looking unassociated. Resolve
+  // those references against ALL tasks (any status, tier-gated) so the commit↔task link is still SHOWN as
+  // a chip, WITHOUT reintroducing done/backlog tasks as headers (nesting still uses `links`/active only).
+  const allTaskRes = await visibleTasks(
+    db
+      .from("tasks")
+      .select("id, row_key, title, status")
+      .eq("team_id", teamId)
+      .not("row_key", "is", null)
+      .order("updated_at", { ascending: false })
+      .limit(TASK_LIMIT),
+    tier
+  );
+  // Chips are ENRICHMENT (not a core ledger leg) — a failed read must NOT blank the ledger, but it also
+  // must not be silent (the swallowed-error trap this file warns about). WARN, like the Slack leg.
+  if (allTaskRes.error) console.warn("[work-timeline] chip-task read failed:", allTaskRes.error.message);
+  const allTasks = (allTaskRes.data ?? []) as TaskRow[];
+  const chipInfo = new Map<string, EvidenceTaskRef>();
+  for (const t of allTasks) if (t.row_key) chipInfo.set(t.id, { key: t.row_key.toUpperCase(), title: t.title || "(untitled task)", status: t.status ?? "" });
+  const allLinks = computeTaskLinks(
+    allTasks.map((t) => ({ id: t.id, row_key: t.row_key })),
+    evItems.map((e) => ({ id: e.id, text: e.text }))
+  );
+
   // One evidence row per (item, linked active task); unlinked items carry taskId=null (→ the "Other"
-  // bucket). A commit citing two issues appears under both. The grouper then evidence-gates: a task
-  // shows ONLY where it has ≥1 of this person's evidence that day (no empty headers).
+  // bucket) + a `linkedTask` chip when they reference a real non-active task. A commit citing two issues
+  // appears under both active tasks. The grouper then evidence-gates: a task shows ONLY where it has ≥1 of
+  // this person's evidence that day (no empty headers).
   const evidence: EvidenceWithMember[] = [];
   for (const e of evItems) {
     const base: EvidenceItem & { memberId: string } = { id: e.id, memberId: e.memberId, source: e.source, kind: e.kind, title: e.title, url: e.url, at: e.at };
     const taskIds = links.get(e.id);
-    if (taskIds && taskIds.length) for (const taskId of taskIds) evidence.push({ ...base, taskId });
-    else evidence.push({ ...base, taskId: null });
+    if (taskIds && taskIds.length) {
+      for (const taskId of taskIds) evidence.push({ ...base, taskId });
+    } else {
+      // In "Other" (no ACTIVE task): chip the first non-active task it references (done/backlog), if any.
+      const chip = (allLinks.get(e.id) ?? []).map((id) => chipInfo.get(id)).find((c): c is EvidenceTaskRef => !!c);
+      evidence.push({ ...base, taskId: null, ...(chip ? { linkedTask: chip } : {}) });
+    }
   }
 
   return groupTimeline(evidence, taskInfo, members, todayISO);

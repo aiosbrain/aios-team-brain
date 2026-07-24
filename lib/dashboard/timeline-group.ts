@@ -15,6 +15,15 @@
  */
 
 /** One piece of a person's work — a commit or a dated deliverable. `taskId` links it to a task. */
+/** A PM task an "Other"-bucket item references but which is NOT active (done/backlog), so it can't be a
+ *  nesting header (#350 keeps headers active-only). Shown as a chip so the commit↔task association is still
+ *  visible — e.g. a commit for a ticket that just went Done. */
+export interface EvidenceTaskRef {
+  key: string; // the task's issue key / row_key, e.g. AIO-138
+  title: string;
+  status: string; // done / backlog / ready — why it isn't a nesting header
+}
+
 export interface EvidenceItem {
   id: string;
   title: string;
@@ -24,6 +33,9 @@ export interface EvidenceItem {
   kind: string;
   /** WORK time — ISO. Its date places the row on a day. */
   at: string;
+  /** Set only for an "Other"-bucket item that references a real but NON-active task (done/backlog) — the
+   *  commit↔task association shown as a chip, since the task can't be an active nesting header. */
+  linkedTask?: EvidenceTaskRef;
 }
 
 export interface EvidenceWithMember extends EvidenceItem {
@@ -240,7 +252,7 @@ export function groupTimeline(
     byDay.set(date, people);
     const b: PersonBucket = people.get(ev.memberId) ?? { tasks: new Map<string, EvidenceItem[]>(), other: [] };
     people.set(ev.memberId, b);
-    const item: EvidenceItem = { id: ev.id, title: ev.title, url: ev.url, source: ev.source, kind: ev.kind, at: ev.at };
+    const item: EvidenceItem = { id: ev.id, title: ev.title, url: ev.url, source: ev.source, kind: ev.kind, at: ev.at, linkedTask: ev.linkedTask };
     if (ev.taskId && taskInfo.has(ev.taskId)) {
       const arr = b.tasks.get(ev.taskId) ?? [];
       arr.push(item);
