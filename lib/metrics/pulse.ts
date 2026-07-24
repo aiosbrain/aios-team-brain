@@ -1,14 +1,24 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { rangeDays, type Range } from "./range";
-import { scopeQueryLog, scopeLlmUsage } from "@/lib/auth/visibility";
+import {
+  scopeQueryLog,
+  scopeLlmUsage,
+  visibleItems,
+  visibleTasks,
+  type ViewerTier,
+} from "@/lib/auth/visibility";
 
 /**
- * Range-aware dashboard metrics. In postgres mode there is NO RLS, so query_log row-level
- * scoping is NOT automatic — it is applied here in app code via `scopeQueryLog`: members see
- * only their own queries/spend, admins see the whole team's (CLAUDE.md §5). The items/tasks
- * aggregates are team-wide counts shown only to a team-tier viewer (the home page gates the
- * page on a tier-filtered item count first).
+ * Range-aware dashboard metrics. In postgres mode there is NO RLS, so row-level scoping is NOT
+ * automatic — it is all applied here in app code (CLAUDE.md §5):
+ *   • query_log / llm_usage via `scopeQueryLog` / `scopeLlmUsage` — a member sees only their own
+ *     queries/spend, an admin the whole team's (role-scoped).
+ *   • items / tasks via `visibleItems` / `visibleTasks` — a restricted (`external`) viewer sees only
+ *     `access='external'` items and `audience='external'` tasks (tier-scoped). The home page routes
+ *     any member with their own API key into the dashboard, INCLUDING an external one, so these
+ *     aggregates MUST be tier-scoped — an unfiltered team-wide count quantifies internal activity
+ *     (knowledge growth by kind, the task funnel) to a client collaborator.
  *
  * Aggregation is done in JS over rows fetched within the window. That is fine
  * at MVP volumes; if the corpus grows large, move the day-bucketing into SQL
@@ -141,9 +151,9 @@ export async function getPulseMetrics(
   db: DbClient,
   teamId: string,
   range: Range,
-  viewer: { isAdmin: boolean; memberId: string }
+  viewer: { isAdmin: boolean; memberId: string; tier: ViewerTier }
 ): Promise<PulseMetrics> {
-  const { isAdmin } = viewer;
+  const { isAdmin, tier } = viewer;
   const days = rangeDays(range);
   const now = new Date();
   const windowStart = new Date(now.getTime() - days * 86_400_000);
@@ -159,13 +169,16 @@ export async function getPulseMetrics(
     // on every 30-min tick, so windowing on it plots re-sync churn (≈all items look "new") rather than
     // real growth. created_at is set once on insert and never bumped. See postgres migration items_created_at.
     // Only the current window is needed (the prior-window delta died with the removed "Items synced" KPI).
-    db
-      .from("items")
-      .select("kind, created_at")
-      .eq("team_id", teamId)
-      .gte("created_at", windowStart.toISOString())
-      .order("created_at", { ascending: false })
-      .limit(10_000),
+    visibleItems(
+      db
+        .from("items")
+        .select("kind, created_at")
+        .eq("team_id", teamId)
+        .gte("created_at", windowStart.toISOString())
+        .order("created_at", { ascending: false })
+        .limit(10_000),
+      tier
+    ),
     scopeQueryLog(
       db
         .from("query_log")
@@ -176,11 +189,14 @@ export async function getPulseMetrics(
         .limit(10_000),
       viewer
     ),
-    db
-      .from("tasks")
-      .select("status, updated_at")
-      .eq("team_id", teamId)
-      .limit(5_000),
+    visibleTasks(
+      db
+        .from("tasks")
+        .select("status, updated_at")
+        .eq("team_id", teamId)
+        .limit(5_000),
+      tier
+    ),
     // Brain SPEND is ALL inference (Q&A + arcs + meetings + timeline + social + titles + cron), read
     // from the `llm_usage` ledger — NOT `query_log`, which only meters the interactive Query box. The
     // Queries KPI above still counts query_log (adoption); spend is the total cost of running the brain.

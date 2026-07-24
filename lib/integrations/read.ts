@@ -2,6 +2,7 @@ import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import type { IntegrationType } from "@/lib/api/schemas";
 import { canManageIntegrations } from "@/lib/integrations/visibility";
+import { canAccessAdmin } from "@/lib/auth/admin-access";
 
 /**
  * DASHBOARD integration reads — METADATA only (never the secret value, only `hasSecret`).
@@ -72,11 +73,14 @@ export async function resolveIntegrationsAdmin(
   if (!team) return null;
   const { data: me } = await db
     .from("members")
-    .select("id, role")
+    .select("id, role, tier")
     .eq("team_id", team.id)
     .eq("auth_user_id", userId)
     .eq("status", "active")
     .maybeSingle();
-  if (!me || me.role !== "admin") return null;
+  // Admin AND team-tier — the single write-side admin gate for six admin actions.ts files. An
+  // external-tier admin must not perform internal admin mutations (member mgmt, key issuance) — no
+  // RLS backstop (CLAUDE.md §5). See lib/auth/admin-access.
+  if (!me || !canAccessAdmin(me)) return null;
   return { teamId: team.id as string, memberId: me.id as string };
 }

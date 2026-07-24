@@ -68,7 +68,10 @@ export async function POST(req: NextRequest) {
     const { opts } = isRestrictedTier(auth.memberTier)
       ? {}
       : await attributeIncomingItem(db, auth.teamId, parsed.data, auth.memberId);
-    const result = await ingestItem(db, auth, parsed.data, tier, opts);
+    // Pass the key's tier so ingestItem's access-heal (on an unchanged re-push) only trusts a team-tier
+    // pusher — an external key must not be able to raise an existing team item's visibility.
+    const pusherTier = isRestrictedTier(auth.memberTier) ? "external" : "team";
+    const result = await ingestItem(db, auth, parsed.data, tier, opts, pusherTier);
 
     // Reactive auto-projection (brain-api v1.2 Phase 2): on a task push that actually changed
     // projected fields, schedule a bounded projection of ONLY the changed rows into the team's
