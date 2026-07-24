@@ -10,6 +10,7 @@ import {
   connectorMemberIds,
   type AttributionMethod,
 } from "@/lib/attribution/resolve-authors";
+import { resolveItemCredit } from "@/lib/attribution/contributor-credit";
 
 /**
  * Attribution health — "is each data stream landing on the right person?" Every learning/arc surface
@@ -74,6 +75,10 @@ export interface AttributionHealth {
   byMember: MemberAttribution[];
   /** Non-signal sources whose human-attribution rate is below `threshold` — the banner's alert list. */
   lowAttributionSources: SourceAttribution[];
+  /** MONITOR: items whose credited contributors (the oracle) differ from the raw owner — reassignment +
+   *  co-authorship. Near-zero at small-team scale; watch it climb to know when to build the full
+   *  multi-contributor timeline UI. See docs/design/attribution-oracle-unification.md. */
+  divergentItems: number;
 }
 
 /** Default: a non-signal source under 50% human-attributed is worth surfacing (Plane=0, Linear=22 today). */
@@ -191,6 +196,11 @@ export interface MemberItem {
    *  drift (in a person's row: "attributed here but points elsewhere"; in the unattributed bucket:
    *  "should be `resolvesToName`'s"). We do NOT flag "resolves to nobody" — only a conflicting match. */
   mismatch: boolean;
+  /** The CREDITED contributors (display names) from the shared attribution oracle (`resolveItemCredit`) —
+   *  i.e. what the Timeline + arcs actually show for this item (everyone who produced a version, or the
+   *  corrected owner when locked). Shown next to the raw `owner`/provenance so an admin sees BOTH what
+   *  they're correcting (the owner) AND what users see (the credit). Empty when the oracle has no opinion. */
+  credited: string[];
 }
 
 /** The resolution provenance for one item — pure over an already-built identity map/roster so it's
@@ -281,6 +291,11 @@ export async function getMemberItems(
     memberNames(teamId),
   ]);
 
+  // CREDITED contributors from the shared oracle (best-effort names) — what the Timeline + arcs display
+  // for each item. Surfaced alongside the raw owner/provenance so this page mirrors the data layer every
+  // other surface reads (a correction here — set member_id + lock — collapses this credit everywhere).
+  const creditByItem = await resolveItemCredit(db, teamId, rows.map((r) => r.id));
+
   return rows.map((r) => {
     const locked = r.member_id_locked === true;
     // Suppress resolution for locked (override wins) AND external-access rows (untrusted client
@@ -299,6 +314,7 @@ export async function getMemberItems(
       method: prov.method,
       resolvesToName: prov.resolvesToName,
       mismatch: prov.mismatch,
+      credited: creditByItem.get(r.id)?.contributors ?? [],
     };
   });
 }
@@ -312,11 +328,43 @@ async function memberNames(teamId: string): Promise<Map<string, string>> {
   return new Map(rows.map((r) => [r.id, r.display_name ?? "(unknown)"]));
 }
 
-/** The full attribution-health read for a team (both breakdowns + the alert list). Best-effort. */
+/**
+ * MONITOR: count items whose CREDITED contributors (human `item_versions` authors) differ from the raw
+ * current owner — i.e. reassignment or co-authorship, the divergence that grows with team size. Excludes
+ * locked items (credit == corrected owner by rule) and connector authors. This is the tripwire for "when
+ * does the timeline/arcs multi-contributor gap start to matter" (near-zero today). Best-effort (0 on error).
+ */
+export async function countCreditDivergence(teamId: string): Promise<number> {
+  try {
+    const { rows } = await runSql<{ n: number }>(
+      `with hva as (
+         select v.item_id, array_agg(distinct v.member_id) as human_version_members
+         from item_versions v
+         join items i on i.id = v.item_id and i.team_id = $1
+         join members m on m.id = v.member_id and m.is_connector is not true
+         where v.member_id is not null
+         group by v.item_id
+       )
+       select count(*)::int as n
+       from items i
+       join hva on hva.item_id = i.id
+       where i.team_id = $1 and i.member_id_locked is not true
+         and not (hva.human_version_members <@ array[i.member_id] and array[i.member_id] <@ hva.human_version_members)`,
+      [teamId]
+    );
+    return rows[0]?.n ?? 0;
+  } catch (err) {
+    console.error("[attribution] countCreditDivergence failed:", err instanceof Error ? err.message : err);
+    return 0;
+  }
+}
+
+/** The full attribution-health read for a team (both breakdowns + the alert list + the divergence monitor). Best-effort. */
 export async function getAttributionHealth(teamId: string): Promise<AttributionHealth> {
-  const [bySource, byMember] = await Promise.all([
+  const [bySource, byMember, divergentItems] = await Promise.all([
     getSourceAttribution(teamId),
     getMemberAttribution(teamId),
+    countCreditDivergence(teamId),
   ]);
-  return { bySource, byMember, lowAttributionSources: lowAttribution(bySource) };
+  return { bySource, byMember, lowAttributionSources: lowAttribution(bySource), divergentItems };
 }

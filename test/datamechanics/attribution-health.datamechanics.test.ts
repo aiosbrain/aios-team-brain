@@ -1,7 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { getAttributionHealth } from "@/lib/attribution/health";
-import { db, seedTeam, ingest, type Seed } from "./helpers";
+import { ingestItem } from "@/lib/ingest";
+import type { ItemPayload } from "@/lib/api/schemas";
+import { db, seedTeam, ingest, sha, type Seed } from "./helpers";
 
 /**
  * Spec: the attribution-health read reports, per source, how much lands on a real human vs a connector
@@ -73,4 +75,21 @@ describe("attribution health (real Postgres)", () => {
     expect(tester.bySource.find((s) => s.source === "git")?.items).toBe(2);
     expect(health.byMember.some((m) => m.memberId === connectorId)).toBe(false);
   });
+
+  it("MONITOR: counts credit divergence (an item reassigned away from its worker)", async () => {
+    const seed = await seedTeam(); // A = Tester
+    const { data: bRow, error } = await db().from("members").insert({
+      team_id: seed.teamId, email: `${randomUUID()}@test.local`, display_name: "Person B",
+      actor_handle: `b-${randomUUID().slice(0, 8)}`, role: "member", tier: "team", status: "active", is_connector: false,
+    }).select("id").single();
+    if (error || !bRow) throw new Error(`seed B failed: ${error?.message}`);
+    const path = `notion/${randomUUID()}.md`;
+    const pl: ItemPayload = { project: "acme", kind: "deliverable", actor: "x", frontmatter: { source: "notion" }, content_sha256: sha("v1"), body: "v1", path } as ItemPayload;
+    const first = await ingestItem(db(), { teamId: seed.teamId, memberId: seed.memberId, apiKeyId: randomUUID() }, pl, "team", { authorMemberId: seed.memberId });
+    await db().from("items").update({ member_id: (bRow as { id: string }).id }).eq("id", first.id); // pure reassign → owner B, worker A
+
+    const h = await getAttributionHealth(seed.teamId);
+    expect(h.divergentItems).toBeGreaterThanOrEqual(1); // credit (A) != owner (B) → counted
+  });
+
 });

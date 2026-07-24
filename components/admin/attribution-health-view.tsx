@@ -28,7 +28,7 @@ function AttributionBar({ s }: { s: SourceAttribution }) {
 }
 
 export function AttributionHealthView({ health, teamSlug }: { health: AttributionHealth; teamSlug: string }) {
-  const { bySource, byMember, lowAttributionSources } = health;
+  const { bySource, byMember, lowAttributionSources, divergentItems } = health;
   const unattributedTotal = bySource.reduce((n, s) => n + s.unattributed, 0);
   // The null bucket's per-source chips = each source's unattributed count (so it's filterable too).
   const unattributedChips = bySource
@@ -46,6 +46,13 @@ export function AttributionHealthView({ health, teamSlug }: { health: Attributio
         <span className="text-amber">amber</span> = a connector service-account, <span className="text-rose">red</span> = nobody.
         Meeting/calendar streams are <span className="inline-flex items-center gap-0.5"><Radio className="size-3" />signal</span> — evidence about who is doing what, not one person&apos;s output.
       </p>
+
+      {divergentItems > 0 && (
+        <p className="text-xs text-ink-tertiary">
+          {divergentItems} item{divergentItems === 1 ? "" : "s"} credited to a different (or additional) person than their current owner —
+          reassignments &amp; co-authored work. The Timeline and arcs show the <em>credit</em>; this page lets you correct the <em>owner</em>.
+        </p>
+      )}
 
       {lowAttributionSources.length > 0 && (
         <div className="prism-card flex items-start gap-3 border-amber/40 px-4 py-3">

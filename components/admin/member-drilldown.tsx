@@ -257,6 +257,15 @@ function ItemRow({ teamSlug, item, onCorrected }: { teamSlug: string; item: Memb
         </button>
       </div>
 
+      {item.credited.length > 0 && (
+        <span
+          className="pl-1 text-[11px] text-ink-tertiary"
+          title="Who the Timeline and arcs credit for this item (everyone who produced a version, or the corrected owner when locked) — the shared attribution oracle. Correcting the owner above collapses this everywhere."
+        >
+          credited to the team as: {item.credited.join(", ")}
+        </span>
+      )}
+
       {editing && (
         <div className="flex flex-wrap items-center gap-2 pl-1 pt-1">
           <input
