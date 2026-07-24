@@ -1,6 +1,7 @@
 import { ArrowDownRight, ArrowUpRight } from "lucide-react";
 import type { Kpi, KpiAccent } from "@/lib/metrics/pulse";
 import { Sparkline } from "@/components/sparkline";
+import { HelpHint } from "@/components/help-hint";
 
 const ACCENT_TEXT: Record<KpiAccent, string> = {
   violet: "text-violet",
@@ -14,8 +15,13 @@ export function KpiStat({ kpi }: { kpi: Kpi }) {
   const accent = ACCENT_TEXT[kpi.accent];
   return (
     <div className="prism-card prism-card-hover flex flex-col gap-2 px-4 py-3.5">
-      <p className="text-[11px] font-semibold uppercase tracking-wider text-ink-tertiary">
+      <p className="flex items-center gap-1 text-[11px] font-semibold uppercase tracking-wider text-ink-tertiary">
         {kpi.label}
+        {kpi.help ? (
+          <HelpHint label={`About ${kpi.label}`} align="left">
+            {kpi.help}
+          </HelpHint>
+        ) : null}
       </p>
       <div className="flex items-end justify-between gap-2">
         <span className="font-display text-2xl leading-none text-ink">
