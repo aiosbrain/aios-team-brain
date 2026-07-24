@@ -4,6 +4,7 @@ import type { DbClient } from "@/lib/db/types";
 import { audit } from "@/lib/api/audit";
 import type { WorkEventPayload } from "@/lib/api/schemas";
 import { extractWorkKeys } from "@/lib/pm-sync/work-keys";
+import { resolveWorkEventTask, type TaskCandidate } from "./resolve-task";
 import { projectTask, projectionToSyncReport, type ProjectionTaskRow, type TaskPmSyncReport } from "@/lib/pm-sync";
 
 export interface WorkEventAuth {
@@ -20,6 +21,9 @@ export interface AppliedWorkEvent {
 export interface WorkEventIngestResult {
   status: "ok";
   applied: AppliedWorkEvent[];
+  /** Matched TEAM-WIDE (the project-scope fix): `task_id` recorded, but the task was NOT completed and
+   *  NOT written back to the PM tool. Additive to the response — `applied` keeps its exact meaning. */
+  linked: AppliedWorkEvent[];
   unresolved: { row_key: string }[];
   pm_sync: TaskPmSyncReport[];
 }
@@ -48,22 +52,26 @@ export async function ingestWorkEvent(
 
   const projectId = (project as { id: string } | null)?.id ?? null;
   const applied: AppliedWorkEvent[] = [];
+  const linked: AppliedWorkEvent[] = [];
   const unresolved: { row_key: string }[] = [];
   const pm_sync: TaskPmSyncReport[] = [];
 
   for (const rowKey of eventKeys(payload)) {
-    const { data: task } = projectId
-      ? await db
-          .from("tasks")
-          .select("id, team_id, project_id, row_key")
-          .eq("team_id", auth.teamId)
-          .eq("project_id", projectId)
-          .eq("row_key", rowKey)
-          .maybeSingle()
-      : { data: null };
+    // TEAM-WIDE candidate fetch (the project-scope fix): a work-key identifies one issue within a TEAM,
+    // and Linear-mirrored tasks live in `linear-<teamKey>`, not the repo's project. `resolveWorkEventTask`
+    // then decides: pushed-project hit → `applied` (legacy behavior, completes + projects); team-wide hit →
+    // `linked` (records task_id ONLY — no completion, no PM write-back); else `unresolved`.
+    const { data: candidateRows } = await db
+      .from("tasks")
+      .select("id, project_id, projects(slug)")
+      .eq("team_id", auth.teamId)
+      .eq("row_key", rowKey);
+    const candidates: TaskCandidate[] = (
+      (candidateRows ?? []) as { id: string; project_id: string; projects?: { slug: string | null } | null }[]
+    ).map((r) => ({ id: r.id, project_id: r.project_id, projectSlug: r.projects?.slug ?? null }));
 
-    const found = task as { id: string; team_id: string; project_id: string; row_key: string } | null;
-    const status = found ? "applied" : "unresolved";
+    const outcome = resolveWorkEventTask(rowKey, candidates, projectId);
+    const status = outcome.status;
 
     const { data: event, error: eventErr } = await db
       .from("work_events")
@@ -71,7 +79,8 @@ export async function ingestWorkEvent(
         {
           team_id: auth.teamId,
           project_id: projectId,
-          task_id: found?.id ?? null,
+          // `linked` records the task too — that id is what lets the Timeline nest a PR's commits under it.
+          task_id: outcome.status === "unresolved" ? null : outcome.taskId,
           row_key: rowKey,
           event_kind: payload.event_kind,
           repo: payload.repo,
@@ -81,7 +90,7 @@ export async function ingestWorkEvent(
           pr_body: payload.pr_body,
           actor: payload.actor,
           status,
-          error: found ? null : "no matching task row",
+          error: outcome.status === "unresolved" ? outcome.error : null,
           updated_at: now,
         },
         { onConflict: "team_id,repo,merged_sha,row_key,event_kind" }
@@ -90,7 +99,7 @@ export async function ingestWorkEvent(
       .single();
     if (eventErr || !event) throw new Error(`work event upsert failed: ${eventErr?.message}`);
 
-    if (!found) {
+    if (outcome.status === "unresolved") {
       unresolved.push({ row_key: rowKey });
       await audit(db, {
         team_id: auth.teamId,
@@ -100,7 +109,25 @@ export async function ingestWorkEvent(
         action: "work_event.unresolved",
         target_type: "work_event",
         target_id: (event as { id: string }).id,
-        meta: { row_key: rowKey, repo: payload.repo, merged_sha: payload.merged_sha },
+        meta: { row_key: rowKey, repo: payload.repo, merged_sha: payload.merged_sha, reason: outcome.error },
+      });
+      continue;
+    }
+
+    if (outcome.status === "linked") {
+      // LINK-ONLY: the task is recorded but deliberately NOT completed and NOT projected back to the PM
+      // tool (see resolve-task.ts for why: duplicate-issue, edit-clobber, and mention-vs-fix hazards).
+      // Audit what completion WOULD have done, so a week of real data can be reviewed before enabling it.
+      linked.push({ row_key: rowKey, task_id: outcome.taskId });
+      await audit(db, {
+        team_id: auth.teamId,
+        actor_kind: "api_key",
+        member_id: auth.memberId,
+        api_key_id: auth.apiKeyId,
+        action: "work_event.would_complete",
+        target_type: "task",
+        target_id: outcome.taskId,
+        meta: { row_key: rowKey, repo: payload.repo, merged_sha: payload.merged_sha, pr_url: payload.pr_url },
       });
       continue;
     }
@@ -108,10 +135,10 @@ export async function ingestWorkEvent(
     const { error: taskErr } = await db
       .from("tasks")
       .update({ status: "done", updated_at: now })
-      .eq("id", found.id)
+      .eq("id", outcome.taskId)
       .eq("team_id", auth.teamId);
     if (taskErr) throw new Error(`task completion update failed: ${taskErr.message}`);
-    applied.push({ row_key: rowKey, task_id: found.id });
+    applied.push({ row_key: rowKey, task_id: outcome.taskId });
 
     await audit(db, {
       team_id: auth.teamId,
@@ -120,7 +147,7 @@ export async function ingestWorkEvent(
       api_key_id: auth.apiKeyId,
       action: "work_event.applied",
       target_type: "task",
-      target_id: found.id,
+      target_id: outcome.taskId,
       meta: { row_key: rowKey, repo: payload.repo, merged_sha: payload.merged_sha, pr_url: payload.pr_url },
     });
 
@@ -130,7 +157,7 @@ export async function ingestWorkEvent(
       const { data: fullRow } = await db
         .from("tasks")
         .select("id, team_id, project_id, row_key, title, status, sprint, priority, labels, body, parent_row_key")
-        .eq("id", found.id)
+        .eq("id", outcome.taskId)
         .maybeSingle();
       if (fullRow) {
         const report = await projectTask(db, fullRow as ProjectionTaskRow, { fetchImpl: opts.fetchImpl });
@@ -139,5 +166,5 @@ export async function ingestWorkEvent(
     }
   }
 
-  return { status: "ok", applied, unresolved, pm_sync };
+  return { status: "ok", applied, linked, unresolved, pm_sync };
 }

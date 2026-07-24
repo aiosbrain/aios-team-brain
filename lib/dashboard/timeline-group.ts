@@ -36,6 +36,10 @@ export interface EvidenceItem {
   /** Set only for an "Other"-bucket item that references a real but NON-active task (done/backlog) — the
    *  commit↔task association shown as a chip, since the task can't be an active nesting header. */
   linkedTask?: EvidenceTaskRef;
+  /** How this evidence got its task: the item's OWN cited issue key, or inherited from the PR that merged
+   *  it (`work_events`). Provenance carried in the payload so an inherited (lower-precision) link is
+   *  diagnosable from every surface that reads the ledger, not just inside the builder. */
+  linkVia?: "commit-text" | "pr";
 }
 
 export interface EvidenceWithMember extends EvidenceItem {
@@ -282,7 +286,7 @@ export function groupTimeline(
   for (const ev of evidence) {
     if (!members.has(ev.memberId)) continue; // unknown member → drop, don't guess
     const b = bucket(dayOf(ev.at), ev.memberId);
-    const item: EvidenceItem = { id: ev.id, title: ev.title, url: ev.url, source: ev.source, kind: ev.kind, at: ev.at, linkedTask: ev.linkedTask };
+    const item: EvidenceItem = { id: ev.id, title: ev.title, url: ev.url, source: ev.source, kind: ev.kind, at: ev.at, linkedTask: ev.linkedTask, linkVia: ev.linkVia };
     if (ev.taskId && taskInfo.has(ev.taskId)) {
       const arr = b.tasks.get(ev.taskId) ?? [];
       arr.push(item);

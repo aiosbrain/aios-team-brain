@@ -31,7 +31,9 @@ const TTL_MS = 5 * 60_000; // 5-min freshness; the ledger is cheap, so refresh o
 // (no bump — a v3 row renders fine). v4 adds a REQUIRED `PersonDay.signals[]` (the Context lane): an old
 // row lacking it would TypeError the card's `.map`, and it's part of the stable `GET /api/v1/timeline`
 // shape, so it MUST bump — the cold rebuild is the cheap pure builder (no inline LLM).
-const PAYLOAD_VERSION = 4;
+// v5: commits inherit their PR's task (work_events), so a cached v4 ledger would serve link-less rows for
+// a full TTL after deploy — bump so it rebuilds with the new links.
+const PAYLOAD_VERSION = 5;
 
 /** The timeline WITH the per-person-day synopsis attached. Runs the (up to 7d × roster) best-effort LLM
  *  calls — so it's used ONLY on the BACKGROUND refresh path, never inline on a request (a cold miss

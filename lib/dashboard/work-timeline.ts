@@ -65,6 +65,11 @@ export const MAX_WINDOW_DAYS = 30;
 const ITEM_LIMIT = 2000;
 const TASK_LIMIT = 2000;
 const DECISION_LIMIT = 500;
+/** Resolved PR→task links pulled for the commit-inheritance join (prod today: ~1k work_events total). */
+const WORK_EVENT_LIMIT = 5000;
+/** Commit↔PR join width. `work_events.merged_sha` is the full 40 chars; the CLI pushes a 10-char
+ *  `frontmatter.sha`, so both sides normalize to this prefix. 40 bits — collision risk ~1e-7 at our scale. */
+const SHA_JOIN_LEN = 10;
 
 type ItemRow = {
   id: string;
@@ -279,7 +284,8 @@ export async function getWorkTimeline(
   // In-window evidence items (commits + docs) with the text an issue key would appear in. A git
   // commit's key is in its BODY; other items' in the title/path (no large-body fetch — see the
   // otherRes select). `kind='task'` items + granola meetings are excluded; Slack is its own leg below.
-  type Ev = EvidenceItem & { memberId: string; text: string };
+  // `sha` is set for git commits only — the join key to the PR that merged them (work_events.merged_sha).
+  type Ev = EvidenceItem & { memberId: string; text: string; sha?: string };
   const evItems: Ev[] = [];
   for (const r of (gitRes.data ?? []) as ItemRow[]) {
     const memberId = primaryOf(r);
@@ -288,7 +294,7 @@ export async function getWorkTimeline(
     if (!at || !inWindow(at)) continue;
     const fm = r.frontmatter ?? {};
     const title = str(fm.title) || commitSubject(r.body ?? "") || "commit";
-    evItems.push({ id: r.id, memberId, source: "github", kind: "commit", title, url: httpUrl(fm.source_url), at, text: `${title}\n${r.body ?? ""}` });
+    evItems.push({ id: r.id, memberId, source: "github", kind: "commit", title, url: httpUrl(fm.source_url), at, text: `${title}\n${r.body ?? ""}`, sha: str(fm.sha) });
   }
   for (const r of (otherRes.data ?? []) as ItemRow[]) {
     const fm = r.frontmatter ?? {};
@@ -359,6 +365,37 @@ export async function getWorkTimeline(
     evItems.map((e) => ({ id: e.id, text: e.text }))
   );
 
+  // PR-INHERITED links: the issue key usually lives on the PULL REQUEST, not on each commit message — so a
+  // commit whose own text cites nothing still belongs to its PR's task. `work_events` already records that
+  // PR→task resolution; join it by sha. `merged_sha` is the FULL 40 chars; the CLI pushes a 10-char
+  // `frontmatter.sha`, so BOTH sides are normalized to the 10-char prefix — a future CLI that pushes the
+  // full sha then still joins instead of silently missing. Squash-merge makes this 1 commit ↔ 1 PR (a
+  // merge-commit PR's individual commits won't inherit — a known coverage limit, not a bug).
+  // Enrichment → WARN, never throw.
+  const shaKey = (s: string) => s.trim().toLowerCase().slice(0, SHA_JOIN_LEN);
+  const commitShas = new Set(evItems.map((e) => e.sha).filter((s): s is string => !!s).map(shaKey));
+  const prTaskIdsBySha = new Map<string, string[]>();
+  if (commitShas.size > 0) {
+    const weRes = await db
+      .from("work_events")
+      .select("merged_sha, task_id")
+      .eq("team_id", teamId)
+      .not("task_id", "is", null)
+      // Bounded like every other leg. NEWEST-first so truncation sheds the OLDEST links — those belong to
+      // PRs merged long before the window, which by construction can't match an in-window commit's sha.
+      .order("updated_at", { ascending: false })
+      .limit(WORK_EVENT_LIMIT);
+    if (weRes.error) console.warn("[work-timeline] work-events read failed:", weRes.error.message);
+    for (const w of (weRes.data ?? []) as { merged_sha: string | null; task_id: string | null }[]) {
+      if (!w.merged_sha || !w.task_id) continue;
+      const key = shaKey(w.merged_sha);
+      if (!commitShas.has(key)) continue;
+      const list = prTaskIdsBySha.get(key) ?? [];
+      if (!list.includes(w.task_id)) list.push(w.task_id); // a PR can resolve to >1 task — keep them all
+      prTaskIdsBySha.set(key, list);
+    }
+  }
+
   // One evidence row per (item, linked active task); unlinked items carry taskId=null (→ the "Other"
   // bucket) + a `linkedTask` chip when they reference a real non-active task. A commit citing two issues
   // appears under both active tasks. The grouper then evidence-gates: a task shows ONLY where it has ≥1 of
@@ -366,14 +403,31 @@ export async function getWorkTimeline(
   const evidence: EvidenceWithMember[] = [];
   for (const e of evItems) {
     const base: EvidenceItem & { memberId: string } = { id: e.id, memberId: e.memberId, source: e.source, kind: e.kind, title: e.title, url: e.url, at: e.at };
-    const taskIds = links.get(e.id);
-    if (taskIds && taskIds.length) {
-      for (const taskId of taskIds) evidence.push({ ...base, taskId });
-    } else {
-      // In "Other" (no ACTIVE task): chip the first non-active task it references (done/backlog), if any.
-      const chip = (allLinks.get(e.id) ?? []).map((id) => chipInfo.get(id)).find((c): c is EvidenceTaskRef => !!c);
-      evidence.push({ ...base, taskId: null, ...(chip ? { linkedTask: chip } : {}) });
+    const ownTaskIds = links.get(e.id);
+    // TIER: an inherited id is only ever resolved against the maps already fetched through `visibleTasks`
+    // (`taskInfo` = active tasks; `chipInfo` = all visible tasks). An id outside them → no link, silently.
+    const inherited = e.sha ? prTaskIdsBySha.get(shaKey(e.sha)) ?? [] : [];
+    if (ownTaskIds && ownTaskIds.length) {
+      // The commit's OWN cited key wins — most specific.
+      for (const taskId of ownTaskIds) evidence.push({ ...base, taskId, linkVia: "commit-text" });
+      continue;
     }
+    const inheritedActive = inherited.filter((id) => taskInfo.has(id));
+    if (inheritedActive.length) {
+      for (const taskId of inheritedActive) evidence.push({ ...base, taskId, linkVia: "pr" });
+      continue;
+    }
+    // In "Other" (no ACTIVE task): chip the first non-active task it references (own text first, then the
+    // PR's), so a commit for a just-shipped ticket still shows the association. The chip carries the same
+    // `linkVia` provenance as a nested link — an inherited chip must be distinguishable from an own-text one.
+    const ownChip = (allLinks.get(e.id) ?? []).map((id) => chipInfo.get(id)).find((c): c is EvidenceTaskRef => !!c);
+    const prChip = ownChip ? undefined : inherited.map((id) => chipInfo.get(id)).find((c): c is EvidenceTaskRef => !!c);
+    const chip = ownChip ?? prChip;
+    evidence.push({
+      ...base,
+      taskId: null,
+      ...(chip ? { linkedTask: chip, linkVia: ownChip ? ("commit-text" as const) : ("pr" as const) } : {}),
+    });
   }
 
   // SIGNAL lane — decisions (data ABOUT work, never counted as work). WARN, not throw: this is a context

@@ -1120,7 +1120,11 @@ create table if not exists work_events (
   pr_title text not null default '',
   pr_body text not null default '',
   actor text not null default '',
-  status text not null default 'unresolved' check (status in ('applied', 'unresolved')),
+  -- 'applied'    = matched in the PUSHED project → task completed + projected back to the PM tool.
+  -- 'linked'     = matched TEAM-WIDE (the project-scope fix): task_id recorded, but deliberately NOT
+  --                completed and NOT written back (docs/design/pr-task-link-propagation.md).
+  -- 'unresolved' = no task found, or ambiguous across projects.
+  status text not null default 'unresolved' check (status in ('applied', 'unresolved', 'linked')),
   error text,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),

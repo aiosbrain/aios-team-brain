@@ -337,3 +337,60 @@ describe("work timeline — attribution oracle (credits the worker, not the reas
     expect(signalTitles).toContain("unambiguous"); // one distinct match → kept (non-vacuous)
   });
 });
+
+describe("PR-inherited task links (the commit's key lives on the PULL REQUEST)", () => {
+  /** A work_event as the PR-merge ingest would have written it: merged_sha is FULL 40 chars. */
+  async function workEvent(seed: Seed, fullSha: string, taskId: string) {
+    const { error } = await db().from("work_events").insert({
+      team_id: seed.teamId, row_key: "AIO-900", event_kind: "merged", repo: "aiosbrain/aios-team-brain",
+      merged_sha: fullSha, task_id: taskId, status: "linked", pr_title: "feat: thing (AIO-900)", actor: "Tester",
+    });
+    if (error) throw new Error(`work_event insert failed: ${error.message}`);
+  }
+  /** A commit item whose OWN text cites no key; frontmatter.sha is the 10-char prefix (as prod stores it). */
+  async function commitWithSha(seed: Seed, fullSha: string, message: string) {
+    return ingest(seed, {
+      kind: "artifact", path: `commits/repo/${randomUUID()}.md`, access: "team",
+      body: message, frontmatter: { source: "git", committed_at: recentIso, sha: fullSha.slice(0, 10) },
+    });
+  }
+
+  it("a commit with NO key in its message nests under the task its PR resolved to", async () => {
+    const seed = await seedTeam();
+    const anchor = await commit(seed, "seed");
+    const { data: task } = await db().from("tasks").insert({
+      team_id: seed.teamId, project_id: anchor.projectId!, row_key: "AIO-900", title: "Inherited task",
+      status: "in_progress", origin: "sync", audience: "team", assignee: "Tester",
+    }).select("id").single();
+    const taskId = (task as { id: string }).id;
+    const fullSha = "abcdef0123456789abcdef0123456789abcdef01";
+    await workEvent(seed, fullSha, taskId);
+    await commitWithSha(seed, fullSha, "chore: no ticket key anywhere in this message");
+
+    const days = await getWorkTimeline(db(), seed.teamId, "team");
+    // The task appears as a nesting header, with the key-less commit nested under it.
+    expect(taskTitles(days)).toContain("Inherited task");
+    expect(nestedUnder(days, "Inherited task")).toContain("chore: no ticket key anywhere in this message");
+  });
+
+  it("TIER: an inherited link never surfaces a task the viewer can't see", async () => {
+    const seed = await seedTeam();
+    const anchor = await commit(seed, "seed");
+    const { data: task } = await db().from("tasks").insert({
+      team_id: seed.teamId, project_id: anchor.projectId!, row_key: "AIO-901", title: "Team-only inherited",
+      status: "in_progress", origin: "sync", audience: "team", assignee: "Tester", // TEAM audience
+    }).select("id").single();
+    const fullSha = "bbbbbb0123456789abcdef0123456789abcdef01";
+    await workEvent(seed, fullSha, (task as { id: string }).id);
+    // The commit itself is external-visible; only the TASK is team-only.
+    await ingest(seed, {
+      kind: "artifact", path: `commits/repo/${randomUUID()}.md`, access: "external",
+      body: "chore: external-visible commit, no key", frontmatter: { source: "git", committed_at: recentIso, sha: fullSha.slice(0, 10) },
+    });
+
+    const ext = await getWorkTimeline(db(), seed.teamId, "external");
+    expect(taskTitles(ext)).not.toContain("Team-only inherited"); // never leaked via the inherited link
+    const team = await getWorkTimeline(db(), seed.teamId, "team");
+    expect(taskTitles(team)).toContain("Team-only inherited"); // non-vacuous: the team viewer does see it
+  });
+});
