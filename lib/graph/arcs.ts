@@ -71,6 +71,9 @@ const PER_ITEM_CAP = 20;
 // refresh — served-stale-while-revalidate, NOT route-bound — gets a much wider window. Env-overridable.
 const INLINE_ARC_TIMEOUT_MS = Math.max(1_000, Number(process.env.ARC_INLINE_TIMEOUT_MS) || 110_000);
 const BG_ARC_TIMEOUT_MS = Math.max(INLINE_ARC_TIMEOUT_MS, Number(process.env.ARC_BG_TIMEOUT_MS) || 280_000);
+// The evidence-coherence pass is a short classification, and runs ONLY on the non-route-bound background
+// refresh — a tight ceiling keeps a wedged provider from stalling the recompute.
+const COHERENCE_TIMEOUT_MS = Math.max(1_000, Number(process.env.ARC_COHERENCE_TIMEOUT_MS) || 30_000);
 // How long the empty-clobber guard keeps trusting a prior non-empty arc set. Within this window an
 // empty synthesis is treated as a transient failure (keep the prior); beyond it, a persistently-empty
 // result is accepted as genuine so the panel can't be pinned to ancient arcs forever (Fable review).
@@ -457,6 +460,113 @@ function attributeArcs(arcs: NarrativeArc[], contributorsByItem: Map<string, str
   });
 }
 
+/** Only arcs with ≥2 evidence facts are prunable — we never strip an arc's SOLE support (an incoherent
+ *  single-evidence arc is a different problem; dropping its one fact would leave it evidence-less). */
+function pruneCandidates(arcs: NarrativeArc[]): NarrativeArc[] {
+  return arcs.filter((a) => a.evidence.length >= 2);
+}
+
+/** The evidence-coherence citation id for candidate arc #ai (1-based), fact #ei (1-based): `A2F3`. */
+function coherenceId(ai: number, ei: number): string {
+  return `A${ai + 1}F${ei + 1}`;
+}
+
+/** Parse the coherence LLM's reply → the set of off-topic citation ids (`A2F3`). Tolerant: accepts
+ *  `{off_topic:[…]}` or a bare array; ignores non-string entries; `{}` on garbage → drop nothing. Pure. */
+export function parseOffTopicIds(raw: string): Set<string> {
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    const arr = Array.isArray(parsed)
+      ? parsed
+      : Array.isArray((parsed as { off_topic?: unknown })?.off_topic)
+        ? (parsed as { off_topic: unknown[] }).off_topic
+        : [];
+    return new Set(arr.filter((x): x is string => typeof x === "string").map((s) => s.trim().toUpperCase()));
+  } catch {
+    return new Set();
+  }
+}
+
+/**
+ * Apply a coherence pruning: drop each flagged off-topic fact from its arc's evidence. PURE + guarded.
+ * Only `pruneCandidates` (≥2 evidence) are eligible, keyed the SAME way the prompt numbers them. Two guards
+ * keep the prune from doing harm:
+ *  • never drops an arc's LAST evidence (all-flagged = an incoherent-arc signal, not a prune → left intact);
+ *  • never empties the arc's evidence-HUMAN set — if the survivors resolve NO human (connector-authored or
+ *    unlinked evidence), keep the arc as-is. Otherwise `groundParticipants` would fall back to the model's
+ *    free-text names and RE-INTRODUCE the very noise we're removing (Fable). `contributorsByItem` is the
+ *    same version-author map `attributeArcs` uses, so "still has a human" is measured identically.
+ */
+export function pruneEvidenceByIds(
+  arcs: NarrativeArc[],
+  offTopic: Set<string>,
+  contributorsByItem: Map<string, string[]>
+): NarrativeArc[] {
+  if (offTopic.size === 0) return arcs;
+  const candidates = pruneCandidates(arcs);
+  const idxOf = new Map(candidates.map((a, i) => [a, i]));
+  const hasHuman = (evs: ArcEvidence[]): boolean =>
+    evs.some((e) => !!e.itemId && (contributorsByItem.get(e.itemId)?.length ?? 0) > 0);
+  return arcs.map((arc) => {
+    const ai = idxOf.get(arc);
+    if (ai === undefined) return arc;
+    const kept = arc.evidence.filter((_, ei) => !offTopic.has(coherenceId(ai, ei)));
+    if (kept.length === 0 || kept.length === arc.evidence.length) return arc; // all-flagged / no-op
+    if (!hasHuman(kept)) return arc; // would empty the human set → keep (avoid the model-name fallback)
+    return { ...arc, evidence: kept };
+  });
+}
+
+const COHERENCE_SYSTEM = [
+  "You verify that each cited fact actually supports its narrative arc. Given arcs and their cited facts,",
+  "return the citation ids of facts that are OFF-TOPIC for THAT arc — the fact is clearly about a DIFFERENT",
+  "subject than the arc's title/summary (e.g. a management-framework or meeting fact cited under a",
+  "technical-infrastructure arc). Be CONSERVATIVE: only flag a fact that plainly belongs to another subject;",
+  "when in doubt, keep it. Return ONLY JSON of the form {\"off_topic\":[\"A1F3\",\"A2F1\"]} — an empty array",
+  "when every fact fits its arc.",
+].join(" ");
+
+/**
+ * Post-synthesis EVIDENCE-COHERENCE pass (the fix for a cross-topic outlier citation). To give every
+ * contributor representation the synthesis prompt injects everyone's facts; the model then sometimes cites
+ * a DIFFERENT person's unrelated fact as support for an arc — which drags that person onto the arc as a
+ * `participant` (they authored the cited evidence). This asks the model, in ONE batched call, to flag the
+ * cited facts that don't support their arc, and drops them BEFORE `attributeArcs` re-derives participants —
+ * so the outlier is neither shown as evidence nor credited as a participant. Best-effort: on any failure
+ * (LLM null / unparseable) it's a NO-OP — evidence is never dropped on uncertainty.
+ */
+async function pruneIncoherentEvidence(
+  arcs: NarrativeArc[],
+  keys: ProviderKeys,
+  ctx: { db: DbClient; teamId: string; contributorsByItem: Map<string, string[]> }
+): Promise<NarrativeArc[]> {
+  const candidates = pruneCandidates(arcs);
+  if (candidates.length === 0) return arcs;
+  const userPrompt = candidates
+    .map((a, ai) =>
+      [`Arc A${ai + 1}: "${a.title}" — ${a.summary}`, ...a.evidence.map((e, ei) => `  [${coherenceId(ai, ei)}] ${e.fact}`)].join("\n")
+    )
+    .join("\n\n");
+  const raw = await completeTextOrNull(
+    { system: COHERENCE_SYSTEM, prompt: userPrompt },
+    {
+      keys,
+      jsonObject: true,
+      // A narrow binary relevance check (not the ~200-fact reasoning of synthesis) → the default query
+      // model is enough; keep it cheap. Metered into the same ledger as synthesis (system task, no member).
+      // ~800 output headroom (up to MAX_ARCS×~8 ids) so a heavily-off-topic batch isn't silently truncated.
+      maxTokens: 800,
+      // Bound it hard: this is a fast classification, and it only ever runs on the non-route-bound
+      // background refresh — but a small ceiling keeps a wedged provider from stalling the recompute.
+      timeoutMs: COHERENCE_TIMEOUT_MS,
+      record: { db: ctx.db, teamId: ctx.teamId, task: "arc-coherence" },
+      meter: { db: ctx.db, teamId: ctx.teamId, source: "arcs" },
+    }
+  );
+  if (!raw) return arcs;
+  return pruneEvidenceByIds(arcs, parseOffTopicIds(raw), ctx.contributorsByItem);
+}
+
 /**
  * Core synthesis pipeline (no caching): recent facts → attributed prompt → LLM → attributed arcs.
  * `correctionTexts` is empty for a normal derive, populated for the human-correction recompute.
@@ -495,7 +605,11 @@ async function synthesizeArcs(
   llmTimeoutMs: number = INLINE_ARC_TIMEOUT_MS,
   // The prior cached arcs + their fact hash (background refresh only). When the freshly-built prompt hashes
   // identically AND there's no correction, we KEEP the prior arcs and skip the LLM (the stability guard).
-  prior?: { arcs: NarrativeArc[]; factsHash: string | null } | null
+  prior?: { arcs: NarrativeArc[]; factsHash: string | null } | null,
+  // Run the extra evidence-COHERENCE LLM pass? Only the non-route-bound BACKGROUND refresh sets this — the
+  // route-bound cold-miss + correction paths skip it (a second LLM call would blow the 120s route budget).
+  // A cold-miss arc may briefly show a spurious participant; the next SWR refresh prunes it.
+  runCoherence: boolean = false
 ): Promise<SynthesisResult> {
   // Arcs are NOT time-boxed — synthesize from the most-recent facts regardless of age (a quiet week,
   // or a stalled projector, must not blank the panel). `null` = no window. Fetch a DEEP pool (not just
@@ -604,9 +718,16 @@ async function synthesizeArcs(
   }
 
   const raw = await callLLMRaw(systemPrompt, userPrompt, keys, { db, teamId }, llmTimeoutMs);
+  // EVIDENCE-COHERENCE pass BEFORE attribution: drop a cited fact that's a cross-topic outlier (a different
+  // person's unrelated work the model loosely cited), so `attributeArcs` re-derives participants from the
+  // surviving evidence — an off-topic citation can't drag its author onto the arc as a spurious participant.
+  const parsed = parseArcsJson(raw, { facts, epToItem });
+  const coherent = runCoherence
+    ? await pruneIncoherentEvidence(parsed, keys, { db, teamId, contributorsByItem })
+    : parsed;
   // Rank by recency → relevance so recent contributors' arcs lead, then attribute AI-agent names to
   // the humans behind each arc's own evidence.
-  return { arcs: rankArcs(attributeArcs(parseArcsJson(raw, { facts, epToItem }), contributorsByItem)), factsHash };
+  return { arcs: rankArcs(attributeArcs(coherent, contributorsByItem)), factsHash };
 }
 
 // In-memory cache (per process). Keyed by the tier-visible group set. Fronts the Postgres `arc_cache`
@@ -697,8 +818,9 @@ function refreshArcsInBackground(
     const bg = adminClient();
     try {
       // Not route-bound → give the reasoning model the full window (BG_ARC_TIMEOUT_MS). `prior` lets the
-      // fact-set-hash guard skip the LLM when nothing changed since the last compute (stability).
-      const { arcs, factsHash } = await synthesizeArcs(bg, teamId, groups, [], keys, BG_ARC_TIMEOUT_MS, prior);
+      // fact-set-hash guard skip the LLM when nothing changed. Run the extra evidence-COHERENCE pass HERE
+      // (background only — the route-bound cold-miss/correction paths can't afford the second LLM call).
+      const { arcs, factsHash } = await synthesizeArcs(bg, teamId, groups, [], keys, BG_ARC_TIMEOUT_MS, prior, true);
       await commitArcs(bg, teamId, key, arcs, factsHash);
     } catch (err) {
       console.error("[arcs] background refresh failed:", err instanceof Error ? err.message : err);
