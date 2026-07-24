@@ -14,8 +14,14 @@
 -- no-op after the first. Mirrored into postgres/schema.sql for the from-zero path.
 alter table graph_episodes add column if not exists pending_delete_group_id text;
 
--- Reconcile scans for rows needing cleanup; a partial index keeps that scan cheap (the column is null
--- for all but the handful of rows in mid-reclassification).
+-- WHEN that cleanup was recorded. The straggler grace (reconcile only declares an old group durably
+-- empty once it has elapsed) anchors HERE, not on `projected_at`: every ordinary content re-push bumps
+-- `projected_at`, so an item edited more often than the grace window would keep its flag forever.
+alter table graph_episodes add column if not exists pending_delete_at timestamptz;
+
+-- Backs the outstanding-cleanup count the projection run reports (`pendingCleanups` in the
+-- `graph_project` ingest_runs meta): a `where pending_delete_group_id is not null` scan per team, over
+-- a column that is null for all but the handful of rows in mid-reclassification.
 create index if not exists graph_episodes_pending_delete_idx
   on graph_episodes (team_id)
   where pending_delete_group_id is not null;

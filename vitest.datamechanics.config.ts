@@ -28,6 +28,11 @@ process.env.NEXT_PUBLIC_DB_BACKEND = "postgres";
 process.env.DATABASE_URL = databaseTestUrl;
 // Fixed test key for integration-secret crypto (lib/secrets); not a real secret.
 process.env.SECRETS_KEY ??= Buffer.alloc(32, 7).toString("base64");
+// Shrink the graph group-scan window so the tier-cleanup specs can exercise the REAL outcomes at both
+// ends of it — an item found beyond the naive default, and a SATURATED scan that must never be read as
+// "the old group is empty" — without materializing 100k fake episodes. The code reads the exported
+// GROUP_SCAN_DEPTH, and so do the tests, so the assertions stay honest at any window size.
+process.env.GRAPH_GROUP_SCAN_DEPTH = "200";
 
 export default defineConfig({
   test: {

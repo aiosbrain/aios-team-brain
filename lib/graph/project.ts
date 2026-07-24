@@ -190,15 +190,20 @@ export async function projectItemsToGraph(
 ): Promise<ProjectSummary> {
   const client = args.client ?? new GraphitiClient();
   const limit = args.limit ?? 50;
-  const kinds = args.kinds ?? PROJECTABLE_KINDS;
+  const kinds: readonly string[] = args.kinds ?? PROJECTABLE_KINDS;
 
   let q = db
     .from("items")
     .select("id, kind, access, body, path, synced_at, frontmatter")
     .eq("team_id", args.teamId)
-    .in("kind", kinds as string[])
     .order("synced_at", { ascending: true })
     .limit(limit);
+  // The DEFAULT (full) projection scans EVERY kind and decides projectability per row below, so an item
+  // whose kind changed to a non-projectable one (deliverable → skill) still reaches the cleanup branch
+  // instead of dropping out of the projector's view with its old episodes stranded in the graph — a
+  // permanent tier leak by the same mechanism B2 closes. A caller that names `kinds` explicitly
+  // (projectSlackToGraph) keeps its exact scope: it must not touch other kinds' episodes.
+  if (args.kinds) q = q.in("kind", args.kinds as string[]);
   if (args.since) q = q.gt("synced_at", args.since);
   const { data, error } = await q;
   if (error) throw new Error(`project: load items failed: ${error.message}`);
@@ -207,26 +212,68 @@ export async function projectItemsToGraph(
   let projected = 0;
   let skipped = 0;
   for (const item of rows) {
-    const episodes = toEpisodes(item);
-    if (episodes.length === 0) {
-      skipped++;
-      continue; // empty body → nothing to extract
-    }
+    const episodes = kinds.includes(item.kind) ? toEpisodes(item) : [];
     // Idempotency key = the FULL body (chunk boundaries derive deterministically from it), so an
     // unchanged item is a no-op regardless of how many chunks it splits into.
     const contentSha = sha(item.body ?? "");
     const groupId = episodeGroupId(args.teamSlug, item.access);
 
+    // Read the ledger BEFORE the "nothing to project" skip: an item that stops projecting still owns
+    // episodes we put in the graph, and they have to come back out (see the branch below).
     const { data: existing } = await db
       .from("graph_episodes")
-      .select("content_sha256, group_id")
+      .select("content_sha256, group_id, pending_delete_group_id")
       .eq("team_id", args.teamId)
       .eq("source_table", SOURCE_TABLE)
       .eq("source_id", item.id)
       .maybeSingle();
-    const existingRow = existing as { content_sha256: string; group_id: string } | null;
-    const tierChanged = existingRow && existingRow.group_id !== groupId;
-    if (existingRow && existingRow.content_sha256 === contentSha && !tierChanged) {
+    const existingRow = existing as {
+      content_sha256: string;
+      group_id: string;
+      pending_delete_group_id: string | null;
+    } | null;
+
+    if (episodes.length === 0) {
+      // Nothing to extract NOW — but if we projected this item before, its old episodes are still in
+      // the graph. This is the redaction/blanking path (a body emptied upstream, with or without a tier
+      // flip) and the kind-change path: both used to `continue` straight past the tier-change block
+      // below, so the ledger kept pointing at the old group, `pending_delete_group_id` was never set,
+      // and the pre-redaction episodes stayed searchable by the OLD tier forever with nothing to retry
+      // — the exact leak B2 closes, arriving by a door B2 didn't cover. Record the holding group as
+      // pending-delete (reconcile purges it durably) and park the row on the "" sentinel sha so the
+      // projector re-pushes if the body ever comes back.
+      //
+      // Only when no cleanup is already outstanding: re-recording every pass would reset
+      // `pending_delete_at` and the grace would never elapse. The single flag slot converges — the
+      // outstanding one is cleaned and cleared, then the next pass records this one.
+      if (existingRow && !existingRow.pending_delete_group_id) {
+        await deleteItemEpisodes(client, existingRow.group_id, item.id).catch(() => {});
+        const at = new Date().toISOString();
+        await db.from("graph_episodes").upsert(
+          {
+            team_id: args.teamId,
+            source_table: SOURCE_TABLE,
+            source_id: item.id,
+            group_id: existingRow.group_id, // nothing was pushed to the new group — don't claim it
+            content_sha256: "",
+            projected_at: at,
+            pending_delete_group_id: existingRow.group_id,
+            pending_delete_at: at,
+          },
+          { onConflict: "team_id,source_table,source_id" }
+        );
+      }
+      skipped++;
+      continue;
+    }
+
+    const tierChanged = existingRow !== null && existingRow.group_id !== groupId;
+    // Pushing back INTO a group we still owe a purge on (a redaction that was undone before reconcile
+    // finished): the pending purge deletes by item id, so leaving the flag set would delete the episodes
+    // we're about to push and silently drop the item from the graph. Purge the stale ones first, then
+    // this push is authoritative and the flag clears below.
+    const purgeBeforeRepush = existingRow?.pending_delete_group_id === groupId;
+    if (existingRow && existingRow.content_sha256 === contentSha && !tierChanged && !purgeBeforeRepush) {
       skipped++;
       continue; // unchanged content, same tier → no-op (idempotent)
     }
@@ -238,13 +285,24 @@ export async function projectItemsToGraph(
     // and once the ledger flips `group_id` to the new group, nothing would ever retry, leaving the old
     // tier searchable forever. `reconcile` retries the cleanup until the old group is verified empty and
     // only then clears `pending_delete_group_id`. The inline delete stays as the fast path.
-    let pendingDeleteGroup: string | null = null;
     if (tierChanged && existingRow) {
-      pendingDeleteGroup = existingRow.group_id;
       await deleteItemEpisodes(client, existingRow.group_id, item.id).catch(() => {});
+    } else if (purgeBeforeRepush) {
+      await deleteItemEpisodes(client, groupId, item.id).catch(() => {});
     }
 
     await client.addEpisodes(groupId, episodes);
+
+    const projectedAt = new Date().toISOString();
+    // Pending-delete bookkeeping for THIS push. Written only when it changes; an ordinary content
+    // re-push omits both columns, so the pg upsert (which only SETs keys present in the object) leaves
+    // an outstanding cleanup intact — that retention is what makes the flag durable.
+    const pending: Record<string, string | null> =
+      tierChanged && existingRow
+        ? { pending_delete_group_id: existingRow.group_id, pending_delete_at: projectedAt }
+        : purgeBeforeRepush
+          ? { pending_delete_group_id: null, pending_delete_at: null } // just purged + re-pushed here
+          : {};
 
     await db.from("graph_episodes").upsert(
       {
@@ -253,10 +311,8 @@ export async function projectItemsToGraph(
         source_id: item.id,
         group_id: groupId,
         content_sha256: contentSha,
-        projected_at: new Date().toISOString(),
-        // Only written on a tier change (the common no-op projection leaves the stored value — null —
-        // untouched, since the pg upsert only SETs columns present in the object).
-        ...(tierChanged ? { pending_delete_group_id: pendingDeleteGroup } : {}),
+        projected_at: projectedAt,
+        ...pending,
       },
       { onConflict: "team_id,source_table,source_id" }
     );

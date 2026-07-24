@@ -30,6 +30,9 @@ export interface ReconcileSummary {
   reQueued: number;
   /** Rows whose OLD-group cleanup (after a tier change) was verified complete this pass. */
   cleaned: number;
+  /** Cleanups STILL outstanding after this pass — old-tier episodes that are purgeable but not yet
+   * verified purged. A number that never returns to 0 is a stuck tier cleanup, not bookkeeping. */
+  pendingCleanups: number;
 }
 
 type EpisodeRow = {
@@ -39,6 +42,7 @@ type EpisodeRow = {
   projected_at: string;
   episode_uuid: string | null;
   pending_delete_group_id: string | null;
+  pending_delete_at: string | null;
 };
 
 export async function reconcileProjectedEpisodes(
@@ -46,11 +50,13 @@ export async function reconcileProjectedEpisodes(
   client: GraphitiClient,
   teamId: string
 ): Promise<ReconcileSummary> {
-  if (!client.configured) return { groupsChecked: 0, confirmed: 0, reQueued: 0, cleaned: 0 };
+  if (!client.configured) return { groupsChecked: 0, confirmed: 0, reQueued: 0, cleaned: 0, pendingCleanups: 0 };
 
   const { data } = await db
     .from("graph_episodes")
-    .select("id, source_id, group_id, projected_at, episode_uuid, pending_delete_group_id")
+    .select(
+      "id, source_id, group_id, projected_at, episode_uuid, pending_delete_group_id, pending_delete_at"
+    )
     .eq("team_id", teamId);
   const rows = (data ?? []) as EpisodeRow[];
 
@@ -148,13 +154,37 @@ export async function reconcileProjectedEpisodes(
       // Clear the flag ONLY when the old group is confirmed empty of this item AND enough time has
       // passed (the LONGER cleanup grace) that a late-extracting worker won't still create a straggler
       // chunk. If we purged some this pass, leave it set so the next pass re-verifies empty.
-      const pastCleanupGrace = new Date(row.projected_at).getTime() <= Date.now() - CLEANUP_GRACE_MS;
+      //
+      // Anchored on `pending_delete_at` (when the cleanup was recorded), NOT `projected_at`: every
+      // ordinary content re-push bumps `projected_at`, so an item edited more often than the grace
+      // window would never become eligible and its flag would stick forever. `?? projected_at` covers
+      // rows written before the column existed.
+      const flaggedAt = new Date(row.pending_delete_at ?? row.projected_at).getTime();
+      const pastCleanupGrace = flaggedAt <= Date.now() - CLEANUP_GRACE_MS;
       if (uuids.length === 0 && !deleteFailed && pastCleanupGrace && !saturated) {
-        await db.from("graph_episodes").update({ pending_delete_group_id: null }).eq("id", row.id);
+        await db
+          .from("graph_episodes")
+          .update({ pending_delete_group_id: null, pending_delete_at: null })
+          .eq("id", row.id);
         cleaned++;
       }
     }
   }
 
-  return { groupsChecked: byGroup.size, confirmed, reQueued, cleaned };
+  // Outstanding cleanups AFTER this pass — the tier-isolation signal worth alerting on (old-tier
+  // episodes that are purgeable but not yet verified purged). Re-read rather than derived from the
+  // in-memory rows so a concurrent projector's new flags are counted. Uses the partial index.
+  const { data: pendingRows } = await db
+    .from("graph_episodes")
+    .select("id")
+    .eq("team_id", teamId)
+    .not("pending_delete_group_id", "is", null);
+
+  return {
+    groupsChecked: byGroup.size,
+    confirmed,
+    reQueued,
+    cleaned,
+    pendingCleanups: (pendingRows ?? []).length,
+  };
 }

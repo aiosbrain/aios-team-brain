@@ -29,16 +29,20 @@ export function startGraphScheduler(): void {
     const startedAt = Date.now();
     try {
       const s = await runGraphProjection();
-      if (s.projected || s.errors.length) {
+      if (s.projected || s.errors.length || s.pendingCleanups) {
         console.info(
           `[graph] projected +${s.projected} =${s.skipped} (${s.scanned} scanned, ${s.teams} teams)` +
+            (s.cleaned || s.pendingCleanups
+              ? ` tier-cleanup: ${s.cleaned} done, ${s.pendingCleanups} outstanding`
+              : "") +
             (s.errors.length ? ` errors: ${s.errors.join("; ")}` : "")
         );
       }
-      // Record any tick with a signal (projected / errors / requeued) to ingest_runs so a silently-
-      // failing projector — e.g. Graphiti 422'ing every write — is visible on the dashboard, not just
-      // in ephemeral logs. recordIngestRun is best-effort (swallows its own errors).
-      if (s.projected || s.errors.length || s.requeued) {
+      // Record any tick with a signal (projected / errors / requeued / an outstanding-or-completed tier
+      // cleanup) to ingest_runs so a silently-failing projector — e.g. Graphiti 422'ing every write, or
+      // a tier cleanup that never converges — is visible on the dashboard, not just in ephemeral logs.
+      // A cleanup-only tick used to record nothing at all. recordIngestRun is best-effort.
+      if (s.projected || s.errors.length || s.requeued || s.cleaned || s.pendingCleanups) {
         await recordIngestRun(adminClient(), projectionRunInput(s, "scheduler", startedAt, Date.now()));
       }
     } catch (err) {

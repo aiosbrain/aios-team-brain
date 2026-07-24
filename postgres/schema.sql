@@ -1642,6 +1642,7 @@ create table if not exists graph_episodes (
   content_sha256 text not null,                -- hash of the episode content we sent
   episode_uuid text,                           -- Graphiti's episode id, if returned
   pending_delete_group_id text,                -- an OLD group still needing cleanup after a tier change (reconcile retries until empty; see lib/graph/reconcile)
+  pending_delete_at timestamptz,               -- when that cleanup was recorded — anchors reconcile's straggler grace (projected_at is bumped by every content re-push)
   projected_at timestamptz not null default now(),
   unique (team_id, source_table, source_id)
 );

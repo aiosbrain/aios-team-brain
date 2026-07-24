@@ -29,6 +29,10 @@ export function projectionRunInput(
       teams: summary.teams,
       reconciled: summary.reconciled,
       requeued: summary.requeued,
+      cleaned: summary.cleaned,
+      // Outstanding tier cleanups — old-tier episodes still purgeable-but-unpurged. Non-zero here is a
+      // tier-isolation signal (B2), so it belongs in the durable record, not just an ephemeral log.
+      pendingCleanups: summary.pendingCleanups,
     },
     startedAt,
     finishedAt,
