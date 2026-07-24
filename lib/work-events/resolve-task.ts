@@ -22,8 +22,10 @@ import { linearMirrorProject } from "@/lib/ingest/sources/linear-normalize";
  */
 
 /** An issue-key-shaped token (`AIO-494`, `GH-12`) — the ONLY shape eligible for the team-wide fallback.
- *  Junk keys the extractor emits (`V1`, `C1`, `GPT-5`) stay project-scoped, where they harmlessly miss;
- *  searching those team-wide could collide with an arbitrary slug `row_key`. Mirrors `issue-ref`'s shape. */
+ *  Bare junk the extractor emits (`V1`, `C1`, `M2`) stays project-scoped, where it harmlessly misses;
+ *  searching those team-wide could collide with an arbitrary slug `row_key`. Mirrors `issue-ref`'s shape.
+ *  NOTE: this shape can't tell `GPT-5` from a real key — it's issue-SHAPED. That's acceptable: a false link
+ *  would need a task literally keyed `GPT-5`. The shape filter stops the bare-token junk, not every guess. */
 const ISSUE_KEY_SHAPE = /^[A-Za-z][A-Za-z0-9]{0,9}-\d+$/;
 
 export function isIssueShapedKey(rowKey: string): boolean {

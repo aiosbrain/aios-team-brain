@@ -17,6 +17,10 @@ Commit → `work_events` (the PR that merged it) joins **fine**: **104 of 118 co
 | **issue-shaped key** (`AIO-494`) | 24 (23%) | **19 of these tasks EXIST** but only **1** resolved ← the bug |
 | junk key (`V1`, `GPT-5`) | 13 (12%) | correctly unresolved |
 
+**Precision note (build):** `ISSUE_KEY_SHAPE` blocks the BARE junk (`V1`, `C1`, `M2`) from the team-wide
+fallback, but it is a *shape* — `GPT-5` matches it and is eligible. Harmless: a false link would require a
+task literally keyed `GPT-5`. Tightening `KEY_RE` at the extractor remains the real fix (follow-up below).
+
 **The bug (`lib/work-events/ingest.ts:55-63`):** the task lookup is scoped to the pushed project —
 `.eq("project_id", projectId)` from `payload.project` (the **repo's** project). Linear-mirrored tasks live
 in the **`linear-<teamKey>`** project:

@@ -65,6 +65,8 @@ export const MAX_WINDOW_DAYS = 30;
 const ITEM_LIMIT = 2000;
 const TASK_LIMIT = 2000;
 const DECISION_LIMIT = 500;
+/** Resolved PR→task links pulled for the commit-inheritance join (prod today: ~1k work_events total). */
+const WORK_EVENT_LIMIT = 5000;
 /** Commit↔PR join width. `work_events.merged_sha` is the full 40 chars; the CLI pushes a 10-char
  *  `frontmatter.sha`, so both sides normalize to this prefix. 40 bits — collision risk ~1e-7 at our scale. */
 const SHA_JOIN_LEN = 10;
@@ -378,7 +380,11 @@ export async function getWorkTimeline(
       .from("work_events")
       .select("merged_sha, task_id")
       .eq("team_id", teamId)
-      .not("task_id", "is", null);
+      .not("task_id", "is", null)
+      // Bounded like every other leg. NEWEST-first so truncation sheds the OLDEST links — those belong to
+      // PRs merged long before the window, which by construction can't match an in-window commit's sha.
+      .order("updated_at", { ascending: false })
+      .limit(WORK_EVENT_LIMIT);
     if (weRes.error) console.warn("[work-timeline] work-events read failed:", weRes.error.message);
     for (const w of (weRes.data ?? []) as { merged_sha: string | null; task_id: string | null }[]) {
       if (!w.merged_sha || !w.task_id) continue;
@@ -412,11 +418,16 @@ export async function getWorkTimeline(
       continue;
     }
     // In "Other" (no ACTIVE task): chip the first non-active task it references (own text first, then the
-    // PR's), so a commit for a just-shipped ticket still shows the association.
-    const chip =
-      (allLinks.get(e.id) ?? []).map((id) => chipInfo.get(id)).find((c): c is EvidenceTaskRef => !!c) ??
-      inherited.map((id) => chipInfo.get(id)).find((c): c is EvidenceTaskRef => !!c);
-    evidence.push({ ...base, taskId: null, ...(chip ? { linkedTask: chip } : {}) });
+    // PR's), so a commit for a just-shipped ticket still shows the association. The chip carries the same
+    // `linkVia` provenance as a nested link — an inherited chip must be distinguishable from an own-text one.
+    const ownChip = (allLinks.get(e.id) ?? []).map((id) => chipInfo.get(id)).find((c): c is EvidenceTaskRef => !!c);
+    const prChip = ownChip ? undefined : inherited.map((id) => chipInfo.get(id)).find((c): c is EvidenceTaskRef => !!c);
+    const chip = ownChip ?? prChip;
+    evidence.push({
+      ...base,
+      taskId: null,
+      ...(chip ? { linkedTask: chip, linkVia: ownChip ? ("commit-text" as const) : ("pr" as const) } : {}),
+    });
   }
 
   // SIGNAL lane — decisions (data ABOUT work, never counted as work). WARN, not throw: this is a context

@@ -340,8 +340,7 @@ describe("work timeline — attribution oracle (credits the worker, not the reas
 
 describe("PR-inherited task links (the commit's key lives on the PULL REQUEST)", () => {
   /** A work_event as the PR-merge ingest would have written it: merged_sha is FULL 40 chars. */
-  async function workEvent(seed: Seed, fullSha: string, taskId: string, audience = "team") {
-    void audience;
+  async function workEvent(seed: Seed, fullSha: string, taskId: string) {
     const { error } = await db().from("work_events").insert({
       team_id: seed.teamId, row_key: "AIO-900", event_kind: "merged", repo: "aiosbrain/aios-team-brain",
       merged_sha: fullSha, task_id: taskId, status: "linked", pr_title: "feat: thing (AIO-900)", actor: "Tester",

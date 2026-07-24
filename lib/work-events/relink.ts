@@ -11,7 +11,7 @@ import { resolveWorkEventTask, isIssueShapedKey, type TaskCandidate } from "./re
  * tool — so re-resolving historical PRs cannot mass-mutate a live Linear workspace (the hazard that made a
  * naive backfill unshippable). Idempotent: a second run finds nothing left `unresolved` to link.
  *
- * Scoped to ISSUE-SHAPED keys — the extractor emits junk (`V1`, `GPT-5`) that must never match team-wide.
+ * Scoped to ISSUE-SHAPED keys — the extractor emits bare junk (`V1`, `M2`) that must never match team-wide.
  */
 
 export interface RelinkSummary {
