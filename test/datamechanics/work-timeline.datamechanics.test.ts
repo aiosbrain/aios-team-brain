@@ -203,3 +203,23 @@ describe("work timeline — attributed docs (Notion / Google Docs / deliverables
     expect(ext).not.toContain("Internal notion doc");
   });
 });
+
+describe("work timeline — attribution oracle (credits the worker, not the reassigned owner)", () => {
+  it("a commit worked by A but reassigned to B shows under A (the actual worker), never B", async () => {
+    const seed = await seedTeam(); // A = "Tester"
+    const { data: bRow, error } = await db().from("members").insert({
+      team_id: seed.teamId, email: `${randomUUID()}@test.local`, display_name: "Person B",
+      actor_handle: `b-${randomUUID().slice(0, 8)}`, role: "member", tier: "team", status: "active", is_connector: false,
+    }).select("id").single();
+    if (error || !bRow) throw new Error(`seed B failed: ${error?.message}`);
+
+    const c = await commit(seed, "feat: did the actual work"); // A authors the commit (+ its version)
+    await db().from("items").update({ member_id: (bRow as { id: string }).id }).eq("id", c.id); // pure reassign → B, no B version
+
+    const days = await getWorkTimeline(db(), seed.teamId, "team");
+    const names = days.flatMap((d) => d.people.map((p) => p.name));
+    expect(names).toContain("Tester"); // A, the worker
+    expect(names).not.toContain("Person B"); // B never worked → not credited
+    expect(evidenceTitles(days)).toContain("feat: did the actual work");
+  });
+});

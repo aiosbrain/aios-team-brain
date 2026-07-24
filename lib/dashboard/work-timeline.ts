@@ -13,6 +13,7 @@ import {
   type TimelineMember,
 } from "./timeline-group";
 import { computeTaskLinks } from "./issue-ref";
+import { resolveItemCreditIds } from "@/lib/attribution/contributor-credit";
 
 // Only ACTIVE tasks are considered work "in progress" — Linear In Progress/In Review both normalize to
 // `in_progress`; `blocked` is active-but-stuck. Backlog/ready/done are context, excluded from the timeline.
@@ -61,6 +62,7 @@ type ItemRow = {
   id: string;
   kind?: string;
   member_id: string | null;
+  member_id_locked?: boolean | null;
   frontmatter: Record<string, unknown> | null;
   body?: string | null;
   path?: string | null;
@@ -158,7 +160,7 @@ export async function getWorkTimeline(
     visibleItems(
       db
         .from("items")
-        .select("id, member_id, frontmatter, body, synced_at")
+        .select("id, member_id, member_id_locked, frontmatter, body, synced_at")
         .eq("team_id", teamId)
         .eq("frontmatter->>source", "git")
         .not("member_id", "is", null)
@@ -175,7 +177,7 @@ export async function getWorkTimeline(
     visibleItems(
       db
         .from("items")
-        .select("id, kind, member_id, frontmatter, path, synced_at")
+        .select("id, kind, member_id, member_id_locked, frontmatter, path, synced_at")
         .eq("team_id", teamId)
         .neq("kind", "task")
         .not("member_id", "is", null)
@@ -229,29 +231,50 @@ export async function getWorkTimeline(
   const taskInfo = new Map<string, TaskInfo>();
   for (const t of tasks) taskInfo.set(t.id, { title: t.title || "(untitled task)", status: t.status || "in_progress", source: pmSource });
 
+  // ATTRIBUTION ORACLE (single source of truth): credit each evidence item to its PRIMARY contributor —
+  // the actual worker, via `item_versions` — not merely the current `member_id` owner. So a reassigned
+  // item shows under who did the work, matching arcs + the admin page (they all read this oracle → they
+  // can't drift; guarded by test/guards/attribution-single-source). STRICT: a versions-read failure THROWS
+  // (never cache an empty ledger as fresh — same contract as the leg queries above). At current scale
+  // primary == owner for ~all items, so this is a near-no-op today but correct as handoffs grow. Slack is
+  // EXEMPT — its per-participant `participants[]` ledger IS its evidence-gated credit (see its leg below).
+  const gitOtherRows = [...((gitRes.data ?? []) as ItemRow[]), ...((otherRes.data ?? []) as ItemRow[])];
+  // Pass the already-fetched rows so the oracle skips a redundant `items` re-read (it only needs
+  // id/member_id/member_id_locked, all selected above); it still reads item_versions + members.
+  const credit = await resolveItemCreditIds(db, teamId, gitOtherRows.map((r) => r.id), {
+    strict: true,
+    items: gitOtherRows.map((r) => ({ id: r.id, member_id: r.member_id, member_id_locked: r.member_id_locked ?? null })),
+  });
+  // Primary contributor for an item, falling back to the current owner when the oracle has no opinion
+  // (e.g. no human version history). Kept the `.not("member_id","is",null)` prefetch prefilter on the leg
+  // queries: an owner-null but version-authored item stays hidden (documented — matches prior behavior).
+  const primaryOf = (r: ItemRow): string | null => credit.get(r.id)?.primaryId ?? r.member_id;
+
   // In-window evidence items (commits + docs) with the text an issue key would appear in. A git
   // commit's key is in its BODY; other items' in the title/path (no large-body fetch — see the
   // otherRes select). `kind='task'` items + granola meetings are excluded; Slack is its own leg below.
   type Ev = EvidenceItem & { memberId: string; text: string };
   const evItems: Ev[] = [];
   for (const r of (gitRes.data ?? []) as ItemRow[]) {
-    if (!r.member_id || !members.has(r.member_id)) continue;
+    const memberId = primaryOf(r);
+    if (!memberId || !members.has(memberId)) continue;
     const at = itemWorkTime(r.frontmatter);
     if (!at || !inWindow(at)) continue;
     const fm = r.frontmatter ?? {};
     const title = str(fm.title) || commitSubject(r.body ?? "") || "commit";
-    evItems.push({ id: r.id, memberId: r.member_id, source: "github", kind: "commit", title, url: httpUrl(fm.source_url), at, text: `${title}\n${r.body ?? ""}` });
+    evItems.push({ id: r.id, memberId, source: "github", kind: "commit", title, url: httpUrl(fm.source_url), at, text: `${title}\n${r.body ?? ""}` });
   }
   for (const r of (otherRes.data ?? []) as ItemRow[]) {
-    if (!r.member_id || !members.has(r.member_id)) continue;
     const fm = r.frontmatter ?? {};
     if (str(fm.source) === "git") continue; // handled by gitRes — no double-count
     const source = normalizeSource(str(fm.source));
     if (source === "slack" || source === "granola" || r.kind === "transcript") continue; // slack: own query; meetings: excluded
+    const memberId = primaryOf(r);
+    if (!memberId || !members.has(memberId)) continue;
     const at = itemWorkTime(fm);
     if (!at || !inWindow(at)) continue;
     const title = str(fm.title) || (r.path ? basename(r.path) : "") || "(untitled)";
-    evItems.push({ id: r.id, memberId: r.member_id, source, kind: r.kind ?? "item", title, url: httpUrl(fm.source_url), at, text: `${title}\n${r.path ?? ""}` });
+    evItems.push({ id: r.id, memberId, source, kind: r.kind ?? "item", title, url: httpUrl(fm.source_url), at, text: `${title}\n${r.path ?? ""}` });
   }
 
   // SLACK — per PARTICIPANT (its own query so a thread whose ROOT is unmapped is still processed for its

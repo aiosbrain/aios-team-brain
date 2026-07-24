@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { ingestItem } from "@/lib/ingest";
 import type { ItemPayload } from "@/lib/api/schemas";
-import { resolveItemCredit } from "@/lib/attribution/contributor-credit";
+import { resolveItemCredit, resolveItemCreditIds } from "@/lib/attribution/contributor-credit";
 import { db, seedTeam, sha, type Seed } from "./helpers";
 
 /**
@@ -124,5 +124,54 @@ describe("resolveItemCredit (real Postgres item_versions)", () => {
 
     const c = (await resolveItemCredit(db(), seed.teamId, [first.id])).get(first.id)!;
     expect(c.contributors).toEqual(["Tester"]); // connector excluded
+  });
+});
+
+describe("resolveItemCreditIds (the ID oracle every surface reads)", () => {
+  it("returns member IDs (contributorIds + primaryId) for a handed-off item", async () => {
+    const seed = await seedTeam();
+    const a = seed.memberId;
+    const b = await addMember(seed, "Person B");
+    const auth = { teamId: seed.teamId, memberId: a, apiKeyId: randomUUID() };
+    const path = `linear/${randomUUID()}.md`;
+    const first = await ingestItem(db(), auth, payload("v1", path), "team", { authorMemberId: a });
+    await ingestItem(db(), auth, payload("v2", path), "team", { authorMemberId: b });
+
+    const c = (await resolveItemCreditIds(db(), seed.teamId, [first.id])).get(first.id)!;
+    expect(new Set(c.contributorIds)).toEqual(new Set([a, b]));
+    expect(c.primaryId).toBe(b);
+  });
+
+  it("credits a HUMAN member with a BLANK display_name (via actor_handle) — was excluded before", async () => {
+    const seed = await seedTeam();
+    // A human whose display_name is empty (NOT NULL column, but blank) with a real handle.
+    const { data, error } = await db().from("members").insert({
+      team_id: seed.teamId, email: `${randomUUID()}@test.local`, display_name: "",
+      actor_handle: `nameless-${randomUUID().slice(0, 8)}`, role: "member", tier: "team", status: "active", is_connector: false,
+    }).select("id, actor_handle").single();
+    if (error || !data) throw new Error(`nameless member failed: ${error?.message}`);
+    const nameless = (data as { id: string; actor_handle: string });
+    const auth = { teamId: seed.teamId, memberId: nameless.id, apiKeyId: randomUUID() };
+    const path = `linear/${randomUUID()}.md`;
+    const first = await ingestItem(db(), auth, payload("v1", path), "team", { authorMemberId: nameless.id });
+
+    const ids = (await resolveItemCreditIds(db(), seed.teamId, [first.id])).get(first.id)!;
+    expect(ids.contributorIds).toEqual([nameless.id]); // nameless human IS credited by id
+    const names = (await resolveItemCredit(db(), seed.teamId, [first.id])).get(first.id)!;
+    expect(names.contributors).toEqual([nameless.actor_handle]); // name projection falls back to handle
+  });
+
+  it("prefetched `items` option skips the items read and yields the same credit", async () => {
+    const seed = await seedTeam();
+    const a = seed.memberId;
+    const auth = { teamId: seed.teamId, memberId: a, apiKeyId: randomUUID() };
+    const path = `linear/${randomUUID()}.md`;
+    const first = await ingestItem(db(), auth, payload("v1", path), "team", { authorMemberId: a });
+
+    const viaPrefetch = (await resolveItemCreditIds(db(), seed.teamId, [first.id], {
+      items: [{ id: first.id, member_id: a, member_id_locked: false }],
+    })).get(first.id)!;
+    expect(viaPrefetch.primaryId).toBe(a);
+    expect(viaPrefetch.contributorIds).toEqual([a]);
   });
 });

@@ -53,30 +53,57 @@ export function creditedPrimaryId(item: {
   return item.latestWorkerId ?? item.currentMemberId;
 }
 
-/** Evidence-gated credit for one item: the full `contributors` SET (for arc participants) + the single
- *  `primary` worker (for balancing one fact under one representative). Display names, non-connector. */
+/** Evidence-gated credit for one item, as member IDs: the full `contributorIds` SET (arc participants /
+ *  a surface's per-person rows) + the single `primaryId` worker (one representative). Non-connector. This
+ *  is THE canonical attribution shape — every surface that answers "who did the work" resolves through it,
+ *  so they can't drift (guarded by `test/guards/attribution-single-source`). */
+export interface ItemCreditIds {
+  contributorIds: string[];
+  primaryId: string | null;
+}
+
+/** Display-name projection of `ItemCreditIds` (arcs render names; the admin drill-down shows them). */
 export interface ItemCredit {
   contributors: string[];
   primary: string | null;
 }
 
+/** Prefetched item shape a caller can pass so the oracle skips its own `items` read (the timeline already
+ *  holds these rows). `id, member_id, member_id_locked` — the only item fields the credit rule needs. */
+export interface CreditItemRow {
+  id: string;
+  member_id: string | null;
+  member_id_locked: boolean | null;
+}
+
+interface CreditCore {
+  byItem: Map<string, ItemCreditIds>;
+  /** member id → display label (`display_name ?? actor_handle`), non-connector only. */
+  nameOf: (id: string | null) => string | null;
+}
+
 /**
- * item id → `ItemCredit` (contributor DISPLAY NAMES + primary), for a batch of item ids. Batches
- * items + item_versions + members. Best-effort (empty map on failure): an unattributed arc is more honest
- * than a thrown error — mirrors `resolveHumanActorsByItem`, which this generalizes from "current owner" to
- * "everyone who did the work" (+ a work-based primary).
+ * The shared core: resolve per-item credit as member IDs + a name projector, from one batched read of
+ * items + item_versions + members. `strict` propagates DB errors (the timeline must THROW so an empty
+ * ledger is never cached as fresh — #249); non-strict swallows to an empty result (arcs/admin degrade to
+ * "unattributed" rather than failing the page). `items` can be prefetched to skip the items read.
  */
-export async function resolveItemCredit(
+async function resolveCreditCore(
   db: DbClient,
   teamId: string,
-  itemIds: string[]
-): Promise<Map<string, ItemCredit>> {
-  const out = new Map<string, ItemCredit>();
+  itemIds: string[],
+  opts: { strict?: boolean; items?: CreditItemRow[] } = {}
+): Promise<CreditCore> {
+  const empty: CreditCore = { byItem: new Map(), nameOf: () => null };
   const ids = [...new Set(itemIds.filter(Boolean))];
-  if (ids.length === 0) return out;
-  try {
+  if (ids.length === 0) return empty;
+
+  const run = async (): Promise<CreditCore> => {
+    const itemsP = opts.items
+      ? Promise.resolve({ data: opts.items, error: null })
+      : db.from("items").select("id, member_id, member_id_locked").eq("team_id", teamId).in("id", ids);
     const [itemsRes, versionsRes] = await Promise.all([
-      db.from("items").select("id, member_id, member_id_locked").eq("team_id", teamId).in("id", ids),
+      itemsP,
       db
         .from("item_versions")
         .select("item_id, member_id, created_at")
@@ -86,58 +113,102 @@ export async function resolveItemCredit(
         .order("created_at", { ascending: true })
         .order("id", { ascending: true }),
     ]);
-    const items = (itemsRes.data ?? []) as { id: string; member_id: string | null; member_id_locked: boolean | null }[];
+    // In strict mode a query error must surface (never treat a failed read as "no work").
+    if (opts.strict && (itemsRes.error || versionsRes.error)) {
+      throw new Error(`resolveItemCredit: ${(itemsRes.error ?? versionsRes.error)?.message}`);
+    }
+    const items = (itemsRes.data ?? []) as CreditItemRow[];
     const versions = (versionsRes.data ?? []) as { item_id: string; member_id: string | null }[];
 
-    // members → {display_name, is_connector} for every referenced id (current owners + version authors).
+    // members → {label, is_connector} for every referenced id (current owners + version authors). Label =
+    // display_name ?? actor_handle, so a HUMAN with no display name is still credited (was excluded).
     const memberIds = [
       ...new Set([...items.map((i) => i.member_id), ...versions.map((v) => v.member_id)].filter((m): m is string => !!m)),
     ];
-    const memberMap = new Map<string, { name: string | null; connector: boolean }>();
+    const memberMap = new Map<string, { label: string; connector: boolean }>();
     if (memberIds.length) {
-      const { data } = await db
+      const membersRes = await db
         .from("members")
-        .select("id, display_name, is_connector")
+        .select("id, display_name, actor_handle, is_connector")
         .eq("team_id", teamId)
         .in("id", memberIds);
-      for (const m of (data ?? []) as { id: string; display_name: string | null; is_connector: boolean }[]) {
-        memberMap.set(m.id, { name: m.display_name, connector: m.is_connector });
+      if (opts.strict && membersRes.error) throw new Error(`resolveItemCredit members: ${membersRes.error.message}`);
+      for (const m of (membersRes.data ?? []) as { id: string; display_name: string | null; actor_handle: string | null; is_connector: boolean }[]) {
+        // `||` (not `??`): display_name is NOT NULL but can be EMPTY — fall through to the handle so a
+        // human with a blank name is still credited (the old has-name gate excluded them entirely).
+        memberMap.set(m.id, { label: m.display_name?.trim() || m.actor_handle?.trim() || "(unknown)", connector: m.is_connector });
       }
     }
-    const humanName = (id: string | null): string | null => {
-      if (!id) return null;
-      const m = memberMap.get(id);
-      return m && !m.connector && m.name ? m.name : null;
-    };
+    // A HUMAN member id (exists + not a connector). No name gate — nameless humans still count.
+    const isHuman = (id: string | null): boolean => !!id && !!memberMap.get(id) && !memberMap.get(id)!.connector;
+    const nameOf = (id: string | null): string | null => (id && isHuman(id) ? memberMap.get(id)!.label : null);
 
-    // Per item: distinct non-connector version authors (work order) + the LATEST non-connector author
-    // (versions are created_at ASC, so the last human author seen is the most recent).
+    // Per item: distinct HUMAN version authors (work order) + the LATEST human author (versions are
+    // created_at ASC, so the last human author seen is the most recent).
     const versionMembersByItem = new Map<string, string[]>();
     const latestWorkerByItem = new Map<string, string>();
     for (const v of versions) {
-      if (!v.member_id || !humanName(v.member_id)) continue;
+      if (!isHuman(v.member_id)) continue;
       const list = versionMembersByItem.get(v.item_id) ?? [];
-      if (!list.includes(v.member_id)) list.push(v.member_id);
+      if (!list.includes(v.member_id!)) list.push(v.member_id!);
       versionMembersByItem.set(v.item_id, list);
-      latestWorkerByItem.set(v.item_id, v.member_id); // overwrite → ends at the latest
+      latestWorkerByItem.set(v.item_id, v.member_id!); // overwrite → ends at the latest
     }
 
+    const byItem = new Map<string, ItemCreditIds>();
     for (const it of items) {
-      const currentMemberId = humanName(it.member_id) ? it.member_id : null;
+      const currentMemberId = isHuman(it.member_id) ? it.member_id : null;
       const versionMemberIds = versionMembersByItem.get(it.id) ?? [];
       const locked = it.member_id_locked === true;
-      const contributors = [
-        ...new Set(
-          creditedContributorIds({ locked, currentMemberId, versionMemberIds }).map(humanName).filter((n): n is string => !!n)
-        ),
-      ];
-      const primary = humanName(
-        creditedPrimaryId({ locked, currentMemberId, versionMemberIds, latestWorkerId: latestWorkerByItem.get(it.id) ?? null })
-      );
-      if (contributors.length || primary) out.set(it.id, { contributors, primary });
+      const contributorIds = [...new Set(creditedContributorIds({ locked, currentMemberId, versionMemberIds }))];
+      const primaryId = creditedPrimaryId({
+        locked,
+        currentMemberId,
+        versionMemberIds,
+        latestWorkerId: latestWorkerByItem.get(it.id) ?? null,
+      });
+      if (contributorIds.length || primaryId) byItem.set(it.id, { contributorIds, primaryId });
     }
+    return { byItem, nameOf };
+  };
+
+  if (opts.strict) return run();
+  try {
+    return await run();
   } catch {
-    // best-effort — empty map on failure
+    return empty; // best-effort — empty result on failure
+  }
+}
+
+/**
+ * item id → `{contributorIds, primaryId}` (member IDs), for a batch of item ids. THE canonical oracle.
+ * `strict` throws on any DB error (for the timeline's throw-on-error contract); default swallows to an
+ * empty map. `items` may be prefetched to skip the items read.
+ */
+export async function resolveItemCreditIds(
+  db: DbClient,
+  teamId: string,
+  itemIds: string[],
+  opts: { strict?: boolean; items?: CreditItemRow[] } = {}
+): Promise<Map<string, ItemCreditIds>> {
+  return (await resolveCreditCore(db, teamId, itemIds, opts)).byItem;
+}
+
+/**
+ * item id → `ItemCredit` (contributor DISPLAY NAMES + primary) — the name projection of the ID oracle,
+ * for callers that render names (arcs, the admin drill-down). Best-effort (empty map on failure).
+ */
+export async function resolveItemCredit(
+  db: DbClient,
+  teamId: string,
+  itemIds: string[]
+): Promise<Map<string, ItemCredit>> {
+  const { byItem, nameOf } = await resolveCreditCore(db, teamId, itemIds);
+  const out = new Map<string, ItemCredit>();
+  for (const [id, credit] of byItem) {
+    const contributors = [...new Set(credit.contributorIds.map(nameOf).filter((n): n is string => !!n))];
+    const primary = nameOf(credit.primaryId);
+    if (contributors.length || primary) out.set(id, { contributors, primary });
   }
   return out;
 }
