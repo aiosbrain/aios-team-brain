@@ -171,7 +171,19 @@ export async function runSlackIngestion(opts: { teamId?: string } = {}): Promise
         if (channelIds.length === 0) continue;
 
         const client = new SlackClient(token);
-        const detailed = await client.usersDetailed(); // one pass per integration token (incl. emails when scoped)
+        // One pass per integration token (incl. emails when scoped). A TRANSIENT failure here now
+        // throws (a missing scope still returns []): rendering raw ids for one tick would rewrite
+        // EVERY thread body in every channel — a version + re-embed + re-projection each, churned
+        // back on the next good tick. Skip the integration instead; the existing items stand.
+        let detailed;
+        try {
+          detailed = await client.usersDetailed();
+        } catch (err) {
+          summary.errors.push(
+            `integration "${integ.name}": slack users lookup failed — skipped this tick (${err instanceof Error ? err.message : "unknown"})`
+          );
+          continue;
+        }
         // Best-effort reconcile Slack users → members by email, then build the resolver map so
         // each thread's author is attributed to the real person (manual mappings included).
         try {
@@ -185,6 +197,15 @@ export async function runSlackIngestion(opts: { teamId?: string } = {}): Promise
           summary.channels++;
           try {
             const channel = await fetchSlackChannel(client, channelId, { users, maxMessages: 300 });
+            // A thread whose replies couldn't be fetched is dropped rather than truncated — make that
+            // visible so a systematic failure doesn't read as a quiet channel.
+            if (channel.skippedThreads > 0) {
+              summary.errors.push(
+                `${channelId}: ${channel.skippedThreads} thread(s) skipped — replies fetch failed` +
+                  `${channel.skippedThreadsReason ? ` (${channel.skippedThreadsReason})` : ""}` +
+                  ` — any already-stored version stands`
+              );
+            }
             for (const thread of channel.threads) {
               const payload = normalizeThread(thread, {
                 channelId: channel.channelId,

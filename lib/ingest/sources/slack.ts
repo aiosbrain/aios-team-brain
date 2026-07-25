@@ -33,9 +33,33 @@ export interface FetchedChannel {
   threads: FetchedThread[];
   /** user id → display name (best-effort) */
   users: Record<string, string>;
+  /** Threads DROPPED this tick because their replies couldn't be fetched — see fetchSlackChannel.
+   *  Surfaced so a systematic failure is visible in the run log instead of looking like a quiet sync. */
+  skippedThreads: number;
+  /** One sample cause for `skippedThreads`. Carries the real Slack code so an operator can tell
+   *  "wait a tick" (`ratelimited`) from "frozen forever" (lost access / `thread_not_found`) — which
+   *  is the entire triage question a skip raises. */
+  skippedThreadsReason?: string;
 }
 
 export class SlackError extends Error {}
+
+/**
+ * True when a users.list failure means the TOKEN LACKS THE SCOPE — a stable, expected configuration
+ * (the workspace simply never gets display names; `normalizeThread` renders raw ids consistently, so
+ * bodies don't churn). Every OTHER failure is transient (network, rate limit, 5xx, timeout) and must
+ * NOT be treated as "no users": rendering ids for one tick rewrites every thread body in the channel
+ * → a new sha → a new version + re-embed + re-projection for the whole channel, which the next
+ * successful tick churns straight back. Callers skip instead.
+ */
+function isMissingScopeError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  // ONLY genuine scope/permission conditions. Token-dead codes (`invalid_auth`, `account_inactive`,
+  // `token_revoked`, …) are deliberately NOT here: nothing renders at all under a dead token, so
+  // calling it a graceful degrade would be a lie — they rethrow and the integration is skipped with
+  // one crisp error instead of a per-channel pile of downstream failures.
+  return /missing_scope|not_allowed_token_type|no_permission/i.test(msg);
+}
 
 export class SlackClient {
   constructor(private readonly token: string) {}
@@ -60,8 +84,14 @@ export class SlackClient {
         channel: channelId,
       });
       return r.channel.name ?? channelId;
-    } catch {
-      return channelId; // private channel without scope, or renamed — fall back to id
+    } catch (err) {
+      // A missing scope is stable: this channel always resolves to its id, so its thread paths are
+      // consistent tick over tick. A TRANSIENT failure is not — and the blast radius here is worse
+      // than anywhere else in this client, because the name is the PATH KEY: falling back to the id
+      // for one tick re-keys every thread to `slack/<C0123>/…` and CREATES a duplicate item per
+      // thread. Nothing diff-deletes those, so unlike a churned body they pollute retrieval forever.
+      if (!isMissingScopeError(err)) throw err;
+      return channelId; // private channel without the scope — a stable fallback
     }
   }
 
@@ -121,8 +151,10 @@ export class SlackClient {
         }
         cursor = r.response_metadata?.next_cursor || undefined;
       } while (cursor);
-    } catch {
-      // users:read[.email] not granted — caller degrades gracefully.
+    } catch (err) {
+      // users:read[.email] not granted — caller degrades gracefully to ids (stable across ticks).
+      // A TRANSIENT failure must surface so the caller can skip rather than rewrite every body.
+      if (!isMissingScopeError(err)) throw err;
     }
     return out;
   }
@@ -145,8 +177,9 @@ export class SlackClient {
         }
         cursor = r.response_metadata?.next_cursor || undefined;
       } while (cursor);
-    } catch {
-      // users:read not granted — fall back to ids at normalize time.
+    } catch (err) {
+      // users:read not granted — fall back to ids at normalize time (stable across ticks).
+      if (!isMissingScopeError(err)) throw err; // transient → caller skips, never a churned rewrite
     }
     return map;
   }
@@ -179,16 +212,25 @@ export async function fetchSlackChannel(
   const roots = history.filter((m) => isContentMessage(m) && (!m.thread_ts || m.thread_ts === m.ts));
 
   const threads: FetchedThread[] = [];
+  let skippedThreads = 0;
+  let skippedThreadsReason: string | undefined;
   for (const root of roots) {
     let replies: SlackMessage[] = [];
     if (root.reply_count && root.reply_count > 0) {
       try {
         replies = (await client.replies(channelId, root.ts)).filter(isContentMessage);
-      } catch {
-        replies = [];
+      } catch (err) {
+        // SKIP the thread this tick — do NOT fall back to root-only. A thread's body is the whole
+        // conversation, so ingesting it without its replies is a CONTENT REGRESSION: the stored item
+        // is rewritten to a truncated body (a real version), retrieval serves the shortened thread,
+        // and the next successful tick writes another version restoring it. Freshness costs nothing
+        // here — the existing full item simply stands until the next tick.
+        skippedThreads++;
+        skippedThreadsReason ??= err instanceof Error ? err.message : String(err);
+        continue;
       }
     }
     threads.push({ root, replies });
   }
-  return { channelId, channelName, threads, users };
+  return { channelId, channelName, threads, users, skippedThreads, skippedThreadsReason };
 }
