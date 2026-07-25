@@ -348,17 +348,10 @@ export async function getWorkTimeline(
     }
   }
 
-  // Deterministic issue-key links to the ACTIVE tasks only (computed INLINE so the Timeline is always
-  // fresh). A commit citing a backlog/done issue won't match (it's not in the active set) → "Other".
-  const links = computeTaskLinks(
-    tasks.map((t) => ({ id: t.id, row_key: t.row_key })),
-    evItems.map((e) => ({ id: e.id, text: e.text }))
-  );
-
-  // CHIP linkage for the "Other" bucket: a commit often cites a task that just went DONE/backlog, which
-  // #350 keeps out of the active nesting headers — so it lands in "Other" looking unassociated. Resolve
-  // those references against ALL tasks (any status, tier-gated) so the commit↔task link is still SHOWN as
-  // a chip, WITHOUT reintroducing done/backlog tasks as headers (nesting still uses `links`/active only).
+  // Deterministic issue-key links, computed INLINE against ALL visible tasks (any status) so the Timeline
+  // is always fresh AND a just-shipped ticket can head its own group. (Previously a second, active-only
+  // pass drove nesting; that produced "Other · not linked to a task" rows each carrying a chip naming the
+  // task they were linked to. Evidence-gating in the grouper is what keeps the backlog out.)
   const allTaskRes = await visibleTasks(
     db
       .from("tasks")
@@ -375,6 +368,18 @@ export async function getWorkTimeline(
   const allTasks = (allTaskRes.data ?? []) as TaskRow[];
   const chipInfo = new Map<string, EvidenceTaskRef>();
   for (const t of allTasks) if (t.row_key) chipInfo.set(t.id, { key: t.row_key.toUpperCase(), title: t.title || "(untitled task)", status: t.status ?? "" });
+
+  // A REFERENCED task is a nesting header whatever its status. Previously only ACTIVE tasks could head a
+  // group, so a commit citing a just-shipped ticket landed in "Other · not linked to a task" — while
+  // carrying a chip naming that very task. The header contradicted the row beneath it. Evidence-gating
+  // (a task appears only where someone's in-window evidence references it) is what keeps the backlog out;
+  // "active-only" was a second, redundant filter that only produced the contradiction. So: merge every
+  // referenced task into `taskInfo`, and "Other" goes back to meaning what it says — no task at all.
+  // The active fetch is still kept above so active tasks survive even if this all-status read clips at
+  // TASK_LIMIT. Tier: `allTasks` came through the same `visibleTasks` choke-point as the active set.
+  for (const t of allTasks) {
+    if (!taskInfo.has(t.id)) taskInfo.set(t.id, { title: t.title || "(untitled task)", status: t.status || "", source: pmSource });
+  }
   const allLinks = computeTaskLinks(
     allTasks.map((t) => ({ id: t.id, row_key: t.row_key })),
     evItems.map((e) => ({ id: e.id, text: e.text }))
@@ -411,30 +416,32 @@ export async function getWorkTimeline(
     }
   }
 
-  // One evidence row per (item, linked active task); unlinked items carry taskId=null (→ the "Other"
-  // bucket) + a `linkedTask` chip when they reference a real non-active task. A commit citing two issues
-  // appears under both active tasks. The grouper then evidence-gates: a task shows ONLY where it has ≥1 of
-  // this person's evidence that day (no empty headers).
+  // One evidence row per (item, referenced task). An item that references NO task carries taskId=null and
+  // is the only thing that lands in "Other". A commit citing two issues appears under both. The grouper
+  // then evidence-gates: a task shows ONLY where it has ≥1 of this person's evidence that day (no empty
+  // headers) — that gate, not a status filter, is what keeps the backlog off the timeline.
   const evidence: EvidenceWithMember[] = [];
   for (const e of evItems) {
     const base: EvidenceItem & { memberId: string } = { id: e.id, memberId: e.memberId, source: e.source, kind: e.kind, title: e.title, url: e.url, at: e.at };
-    const ownTaskIds = links.get(e.id);
-    // TIER: an inherited id is only ever resolved against the maps already fetched through `visibleTasks`
-    // (`taskInfo` = active tasks; `chipInfo` = all visible tasks). An id outside them → no link, silently.
+    // Resolve against ALL referenced tasks (`allLinks`), not just the active ones, so a just-shipped
+    // ticket heads its own group instead of its evidence falling to "Other" with a contradicting chip.
+    const ownTaskIds = (allLinks.get(e.id) ?? []).filter((id) => taskInfo.has(id));
+    // TIER: every id here — own-text or inherited — is resolved ONLY against `taskInfo`, which was built
+    // entirely from reads through the `visibleTasks` choke-point. An id outside it links nothing, silently.
     const inherited = e.sha ? prTaskIdsBySha.get(shaKey(e.sha)) ?? [] : [];
-    if (ownTaskIds && ownTaskIds.length) {
-      // The commit's OWN cited key wins — most specific.
+    if (ownTaskIds.length) {
+      // The item's OWN cited key wins — most specific.
       for (const taskId of ownTaskIds) evidence.push({ ...base, taskId, linkVia: "commit-text" });
       continue;
     }
-    const inheritedActive = inherited.filter((id) => taskInfo.has(id));
-    if (inheritedActive.length) {
-      for (const taskId of inheritedActive) evidence.push({ ...base, taskId, linkVia: "pr" });
+    const inheritedVisible = inherited.filter((id) => taskInfo.has(id));
+    if (inheritedVisible.length) {
+      for (const taskId of inheritedVisible) evidence.push({ ...base, taskId, linkVia: "pr" });
       continue;
     }
-    // In "Other" (no ACTIVE task): chip the first non-active task it references (own text first, then the
-    // PR's), so a commit for a just-shipped ticket still shows the association. The chip carries the same
-    // `linkVia` provenance as a nested link — an inherited chip must be distinguishable from an own-text one.
+    // Genuinely no task → "Other". No chip is needed any more: a referenced task is now a header, so a
+    // chip could only ever name a task outside `taskInfo` (clipped by TASK_LIMIT) — keep it for exactly
+    // that residual case rather than dropping the association entirely.
     const ownChip = (allLinks.get(e.id) ?? []).map((id) => chipInfo.get(id)).find((c): c is EvidenceTaskRef => !!c);
     const prChip = ownChip ? undefined : inherited.map((id) => chipInfo.get(id)).find((c): c is EvidenceTaskRef => !!c);
     const chip = ownChip ?? prChip;

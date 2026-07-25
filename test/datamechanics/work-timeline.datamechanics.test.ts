@@ -24,6 +24,9 @@ const nestedUnder = (days: TimelineDay[], taskTitle: string): string[] =>
     .flatMap((t) => t.sources.flatMap((g) => g.items.map((i) => i.title)));
 const otherTitles = (days: TimelineDay[]): string[] =>
   days.flatMap((d) => d.people).flatMap((p) => p.other.flatMap((g) => g.items.map((i) => i.title)));
+/** taskTitle → the status carried on its header (so a `done` ticket can be labelled as such, not implied open). */
+const taskStatuses = (days: TimelineDay[]): Map<string, string> =>
+  new Map(days.flatMap((d) => d.people).flatMap((p) => p.tasks).map((t) => [t.title, t.status]));
 
 async function insertTask(seed: Seed, projectId: string, over: Record<string, unknown>) {
   await db()
@@ -38,14 +41,14 @@ async function commit(seed: Seed, body: string) {
 }
 
 describe("work timeline (real Postgres)", () => {
-  it("active task WITH evidence appears (nested); backlog excluded; empty/unlinked → Other; meetings/undated dropped", async () => {
+  it("a REFERENCED task appears (nested) whatever its status; unreferenced → hidden; unlinked → Other; meetings/undated dropped", async () => {
     const seed = await seedTeam();
     const anchor = await commit(seed, "seed");
 
     // Active task with a citing commit → shows, nested.
     await insertTask(seed, anchor.projectId!, { row_key: "AIO-1", title: "Active adapter", status: "in_progress" });
     await commit(seed, "feat: adapter (AIO-1)");
-    // BACKLOG task with a citing commit → task excluded, commit → Other.
+    // BACKLOG task with a citing commit → NOW heads its own group (evidence-gating, not status, is the gate).
     await insertTask(seed, anchor.projectId!, { row_key: "AIO-2", title: "Backlog thing", status: "backlog" });
     await commit(seed, "chore: poke AIO-2");
     // Active task with NO evidence → never appears (evidence-gated).
@@ -59,14 +62,17 @@ describe("work timeline (real Postgres)", () => {
     const days = await getWorkTimeline(db(), seed.teamId, "team");
     expect(taskTitles(days)).toContain("Active adapter"); // active + evidence
     expect(nestedUnder(days, "Active adapter")).toContain("feat: adapter (AIO-1)");
-    expect(taskTitles(days)).not.toContain("Backlog thing"); // backlog excluded
+    expect(taskTitles(days)).toContain("Backlog thing"); // referenced → heads its group, status irrelevant
+    expect(nestedUnder(days, "Backlog thing")).toContain("chore: poke AIO-2");
     expect(taskTitles(days)).not.toContain("Active but idle"); // active but no evidence → hidden
-    expect(otherTitles(days)).toEqual(expect.arrayContaining(["chore: poke AIO-2", "chore: unrelated cleanup"]));
+    // "Other" now means exactly what it says: evidence referencing NO task.
+    expect(otherTitles(days)).toContain("chore: unrelated cleanup");
+    expect(otherTitles(days)).not.toContain("chore: poke AIO-2");
     expect(evidenceTitles(days)).not.toContain("No work time"); // undated → dropped
     expect(evidenceTitles(days)).not.toContain("Standup"); // meeting → excluded
   });
 
-  it("the active set is {in_progress, blocked}: blocked shows, done is excluded (→ Other)", async () => {
+  it("a task that shipped TODAY still heads its group, carrying its `done` status", async () => {
     const seed = await seedTeam();
     const anchor = await commit(seed, "seed");
     await insertTask(seed, anchor.projectId!, { row_key: "AIO-10", title: "Blocked work", status: "blocked" });
@@ -75,10 +81,13 @@ describe("work timeline (real Postgres)", () => {
     await commit(seed, "feat: finish it (AIO-11)");
 
     const days = await getWorkTimeline(db(), seed.teamId, "team");
-    expect(taskTitles(days)).toContain("Blocked work"); // blocked = active
+    expect(taskTitles(days)).toContain("Blocked work");
     expect(nestedUnder(days, "Blocked work")).toContain("wip: unblock (AIO-10)");
-    expect(taskTitles(days)).not.toContain("Shipped work"); // done excluded
-    expect(otherTitles(days)).toContain("feat: finish it (AIO-11)"); // its commit → Other
+    // A ticket that shipped TODAY is still work someone did today — it heads its own group, and its
+    // status travels with it so the UI can label it "done" rather than implying it's still open.
+    expect(taskTitles(days)).toContain("Shipped work");
+    expect(nestedUnder(days, "Shipped work")).toContain("feat: finish it (AIO-11)");
+    expect(taskStatuses(days).get("Shipped work")).toBe("done");
   });
 
   it("Slack: an unmapped ROOT still surfaces the thread for a MAPPED replier; unmapped participants drop", async () => {
@@ -274,27 +283,41 @@ describe("work timeline — attribution oracle (credits the worker, not the reas
     expect(evidenceTitles(days)).toContain("feat: did the actual work");
   });
 
-  it("chips a commit that references a DONE task (association shown in Other, not nested — #350 stays active-only)", async () => {
+  it("a DONE task referenced by in-window evidence HEADS its own group (it is not dumped into Other)", async () => {
+    // The old rule made only ACTIVE tasks nesting headers, so a commit for a just-shipped ticket landed
+    // under "Other · not linked to a task" while carrying a chip naming that very task — the header
+    // contradicted the row beneath it. A referenced task now heads its group whatever its status.
     const seed = await seedTeam();
     const anchor = await commit(seed, "seed");
-    // A task that just shipped (Done) — excluded from the active nesting headers by #350.
     await insertTask(seed, anchor.projectId!, { row_key: "AIO-777", title: "Ship the widget", status: "done" });
-    // A commit for it, landing today.
     await commit(seed, "fix: polish the widget (AIO-777)");
 
     const days = await getWorkTimeline(db(), seed.teamId, "team");
-    // The done task is NOT a nesting header…
-    expect(taskTitles(days)).not.toContain("Ship the widget");
-    // …but the commit still shows the association as a chip in the Other bucket.
-    const chips = days
+    expect(taskTitles(days)).toContain("Ship the widget");
+    expect(nestedUnder(days, "Ship the widget")).toContain("fix: polish the widget (AIO-777)");
+    // …and it is NOT also sitting in the "Other" bucket (no double-representation).
+    const otherTitles = days
       .flatMap((d) => d.people)
       .flatMap((p) => p.other.flatMap((g) => g.items))
-      .filter((i) => i.title.includes("polish the widget"))
-      .map((i) => i.linkedTask);
-    expect(chips).toEqual([{ key: "AIO-777", title: "Ship the widget", status: "done" }]);
+      .map((i) => i.title);
+    expect(otherTitles).not.toContain("fix: polish the widget (AIO-777)");
   });
 
-  it("TIER: a chip never leaks a team-audience task to an external viewer (but an external task DOES chip)", async () => {
+  it("EVIDENCE-GATING, not status, is what keeps the backlog out: an untouched task never appears", async () => {
+    // Non-vacuous counterpart to the test above — dropping the active-only filter must not let the whole
+    // backlog onto the timeline. A task with no in-window evidence stays invisible whatever its status.
+    const seed = await seedTeam();
+    const anchor = await commit(seed, "seed");
+    await insertTask(seed, anchor.projectId!, { row_key: "AIO-888", title: "Untouched backlog item", status: "backlog" });
+    await insertTask(seed, anchor.projectId!, { row_key: "AIO-889", title: "Touched backlog item", status: "backlog" });
+    await commit(seed, "chore: start on it (AIO-889)");
+
+    const days = await getWorkTimeline(db(), seed.teamId, "team");
+    expect(taskTitles(days)).not.toContain("Untouched backlog item"); // no evidence → absent
+    expect(taskTitles(days)).toContain("Touched backlog item"); // evidence → present
+  });
+
+  it("TIER: a referenced task never leaks to an external viewer (but an external-audience one DOES show)", async () => {
     const seed = await seedTeam();
     const anchor = await commit(seed, "seed");
     // A TEAM-audience done task and a PUBLIC (external-audience) done task, both referenced by
@@ -306,15 +329,21 @@ describe("work timeline — attribution oracle (credits the worker, not the reas
     await extCommit("fix: touch the secret (SEC-99)");
     await extCommit("fix: touch the public thing (PUB-1)");
 
-    const chipKeys = (days: TimelineDay[]): (string | undefined)[] =>
-      days.flatMap((d) => d.people).flatMap((p) => p.other.flatMap((g) => g.items)).map((i) => i.linkedTask?.key);
+    // Referenced tasks now surface as HEADERS, so the leak surface is the header set (plus any residual
+    // chip). Assert over both so the tier guarantee can't be sidestepped by whichever one renders.
+    const exposed = (days: TimelineDay[]): (string | undefined)[] => [
+      ...taskTitles(days),
+      ...days.flatMap((d) => d.people).flatMap((p) => p.other.flatMap((g) => g.items)).map((i) => i.linkedTask?.title),
+    ];
 
     const asExternal = await getWorkTimeline(db(), seed.teamId, "external");
-    expect(chipKeys(asExternal)).toContain("PUB-1"); // external task → external viewer DOES get the chip (non-vacuous)
-    expect(chipKeys(asExternal)).not.toContain("SEC-99"); // team task → NEVER leaked to an external viewer
+    expect(exposed(asExternal)).toContain("Public ticket"); // non-vacuous: an external task DOES surface
+    expect(exposed(asExternal)).not.toContain("Team secret ticket"); // NEVER leaked to an external viewer
+    // The commit itself is external-visible — so the task really was filtered, not the whole row.
+    expect(evidenceTitles(asExternal)).toContain("fix: touch the secret (SEC-99)");
 
     const asTeam = await getWorkTimeline(db(), seed.teamId, "team");
-    expect(chipKeys(asTeam)).toEqual(expect.arrayContaining(["SEC-99", "PUB-1"])); // team viewer sees both
+    expect(exposed(asTeam)).toEqual(expect.arrayContaining(["Team secret ticket", "Public ticket"]));
   });
 
   it("SIGNAL: a decision appears in the Context lane (attributed via decided_by), never counted as work; unmatched dropped", async () => {
