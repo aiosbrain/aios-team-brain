@@ -2,9 +2,9 @@ name: CI
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, staging]
   push:
-    branches: [main]
+    branches: [main, staging]
 
 # Cancel superseded runs on the same ref so rapid pushes don't pile up parallel
 # Postgres/build jobs. Each job already caches npm via setup-node (cache: "npm").
