@@ -21,7 +21,8 @@ describe("normalizeThread", () => {
     // conforms to the brain contract
     expect(() => itemPayloadSchema.parse(p)).not.toThrow();
     expect(p.kind).toBe("transcript");
-    expect(p.path).toBe("slack/eng/1718900000.000100.md");
+    // Keyed on the immutable channel ID, not the display name (which is mutable — see the rename spec).
+    expect(p.path).toBe("slack/c0b8v119g4d/1718900000.000100.md");
     expect(p.content_sha256).toMatch(/^[a-f0-9]{64}$/);
     expect(p.actor).toBe("Alex");
     expect(p.body).toContain("shipping the dual-backend today");
@@ -116,5 +117,35 @@ describe("threadParticipants", () => {
       users
     );
     expect(parts.map((p) => p.author_id)).toEqual(["U1"]);
+  });
+});
+
+/**
+ * Spec: an item's PATH is its identity, so it must be keyed on something immutable. The Slack display
+ * name is neither immutable nor lossless, and both properties caused real corruption:
+ *  • RENAME — every thread re-keys to a new path, creating a duplicate item per thread. Nothing
+ *    diff-deletes those, so both copies live on in retrieval, credit and the timeline forever.
+ *  • NON-LATIN — `safeSegment` strips everything outside [a-z0-9_-], so a CJK/emoji name collapsed to
+ *    a shared fallback folder; Slack `ts` is unique only WITHIN a channel, so two such channels could
+ *    land on the SAME path and overwrite each other's content every tick.
+ * The display name lives in `frontmatter.channel`, which is what surfaces render.
+ */
+describe("normalizeThread path identity", () => {
+  const thread = { root: { ts: "1718900000.000100", user: "U1", text: "hi" }, replies: [] };
+
+  it("is STABLE across a channel rename", () => {
+    const before = normalizeThread(thread, { channelId: "C0B8V119G4D", channelName: "growth", users: {} });
+    const after = normalizeThread(thread, { channelId: "C0B8V119G4D", channelName: "marketing", users: {} });
+    expect(after.path).toBe(before.path); // same thread → same item, no duplicate
+    expect(after.frontmatter.channel).toBe("marketing"); // the new name still surfaces for display
+  });
+
+  it("keeps two non-Latin-named channels on DISTINCT paths", () => {
+    // Same thread ts in two different channels — previously both collapsed to one folder and could
+    // overwrite each other, because ts is only unique within a channel.
+    const a = normalizeThread(thread, { channelId: "C0AAA", channelName: "日本語", users: {} });
+    const b = normalizeThread(thread, { channelId: "C0BBB", channelName: "🚀", users: {} });
+    expect(a.path).not.toBe(b.path);
+    expect(a.frontmatter.channel).toBe("日本語"); // the real name is preserved for display
   });
 });

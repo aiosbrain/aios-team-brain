@@ -69,3 +69,33 @@ describe("previewLine", () => {
     expect(out.length).toBeLessThanOrEqual(51);
   });
 });
+
+/**
+ * Slack keys its item paths on the immutable channel ID (a rename must not re-key every thread into
+ * duplicate items), so `slack/c0b8v119g4d` has no readable segment. The real `#name` rides on the
+ * item's `frontmatter.channel` and is passed through as `label` — otherwise the Data page would list
+ * a raw Slack ID. Sources whose path segment is already readable pass no label and are unaffected.
+ */
+describe("groupChannels — display label", () => {
+  it("shows the source's real name instead of an opaque path segment", () => {
+    const [ch] = groupChannels([
+      { path: "slack/c0b8v119g4d/1.md", synced_at: "2026-07-01T00:00:00Z", label: "all-vibrana" },
+    ]);
+    expect(ch.name).toBe("all-vibrana");
+    expect(ch.key).toBe("slack/c0b8v119g4d"); // key stays the PATH prefix — it's the feed query
+  });
+
+  it("prefers the most recently synced name, so a rename surfaces", () => {
+    const [ch] = groupChannels([
+      { path: "slack/c1/2.md", synced_at: "2026-07-02T00:00:00Z", label: "marketing" }, // newer
+      { path: "slack/c1/1.md", synced_at: "2026-07-01T00:00:00Z", label: "growth" }, // older
+    ]);
+    expect(ch.name).toBe("marketing");
+    expect(ch.count).toBe(2); // one channel, not two — the rename did NOT split it
+  });
+
+  it("falls back to the path segment when no label is supplied", () => {
+    const [ch] = groupChannels([{ path: "linear/aio/AIO-1.md", synced_at: "2026-07-01T00:00:00Z" }]);
+    expect(ch.name).toBe("aio");
+  });
+});

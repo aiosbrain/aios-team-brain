@@ -36,9 +36,15 @@ export async function rankedFtsSearch(
   let where = "i.team_id = $2 and i.search @@ websearch_to_tsquery('english', $1)";
   if (isRestrictedTier(tier)) where += " and i.access = 'external'";
   if (channel) {
-    // Channel scope (Gap #4): the channel is a path's 2nd segment, `<source>/<name>/…`.
+    // Channel scope (Gap #4). The channel NAME appears in a path's 2nd segment for sources that key
+    // paths by name (`linear/aio/…`) — but NOT for Slack, whose path is keyed on the immutable
+    // channel ID so a rename can't re-key every thread into duplicate items. Slack carries its
+    // readable name in `frontmatter.channel`, so match EITHER. Without the frontmatter arm a
+    // "#growth" question silently retrieves zero Slack threads (and the scope phrase is stripped
+    // from the query, so the word doesn't even survive as a content term).
     params.push(channel);
-    where += ` and split_part(i.path, '/', 2) = $${params.length}`;
+    const idx = params.length;
+    where += ` and (split_part(i.path, '/', 2) = $${idx} or lower(i.frontmatter->>'channel') = lower($${idx}))`;
   }
   params.push(limit);
   const limitIdx = params.length;
