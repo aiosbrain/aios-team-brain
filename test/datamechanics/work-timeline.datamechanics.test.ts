@@ -232,6 +232,20 @@ describe("work timeline — attributed docs (Notion / Google Docs / deliverables
     expect(titles).toContain("Repo readme");
   });
 
+  it("a PM issue's own description doc is NOT evidence (the evidence gate stays honest)", async () => {
+    const seed = await seedTeam();
+    const day1ago = new Date(Date.now() - 86_400_000).toISOString();
+    // These docs are now DATED (so the graph stops stamping them at sync time), which without an
+    // explicit exclusion would make each ticket its own evidence — its path/title carry its own issue
+    // key — so every assigned ticket would self-satisfy the gate and the timeline would become a
+    // backlog dump. The ticket belongs in the timeline as a TASK, not as work done on itself.
+    await ingest(seed, { kind: "deliverable", path: `linear/aio/AIO-901-${randomUUID()}.md`, access: "team", body: "ticket prose",
+      frontmatter: { source: "linear", identifier: "AIO-901", title: "Ticket description doc", source_ts: day1ago } });
+
+    const titles = evidenceTitles(await getWorkTimeline(db(), seed.teamId, "team"));
+    expect(titles).not.toContain("Ticket description doc");
+  });
+
   it("tier isolation: an external viewer never sees a team-tier doc", async () => {
     const seed = await seedTeam();
     await ingest(seed, { kind: "deliverable", path: `notion/int-${randomUUID()}.md`, access: "team", body: "x",

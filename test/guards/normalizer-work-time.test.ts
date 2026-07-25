@@ -3,6 +3,8 @@ import { resolveWorkTime } from "@/lib/ingest/work-time";
 import { normalizeThread } from "@/lib/ingest/sources/slack-normalize";
 import { normalizeGithubFiles } from "@/lib/ingest/sources/github-files-normalize";
 import { normalizeCommit } from "@/lib/codebases/commits-to-items";
+import { normalizeLinearDocs } from "@/lib/ingest/sources/linear-normalize";
+import { normalizePlaneDocs } from "@/lib/ingest/sources/plane-normalize";
 
 /**
  * BUILD-FAILING GUARD: each connector's normalized payload either carries a resolvable WORK-TIME or
@@ -27,8 +29,8 @@ import { normalizeCommit } from "@/lib/codebases/commits-to-items";
 /** Producers that emit NO work-time today. Each entry is a known timeline-invisibility bug, not an
  *  exemption on principle — removing an entry (by making the producer emit a time) is the goal. */
 const KNOWN_UNDATED = [
-  "linear-normalize: per-issue doc items (normalizeLinearDocs)",
-  "plane-normalize: per-issue doc items (normalizePlaneDocs)",
+  // The aggregate issues-table item for a repo: one row per repo, not one person's dated work. Arcs
+  // already exclude it (#363) and the timeline never showed it, so it has no work-time to give.
   "github-normalize: the issues table item",
 ] as const;
 
@@ -81,7 +83,38 @@ describe("guard: every normalizer emits a resolvable work-time", () => {
   it("pins the producers that are still undated, so the gap stays visible", () => {
     // Asserting the LIST is the point: shrinking it requires deleting an entry here, which forces the
     // change to be reviewed rather than a producer quietly staying invisible in the product.
-    expect(KNOWN_UNDATED).toHaveLength(3);
+    expect(KNOWN_UNDATED).toHaveLength(1);
+  });
+
+  it("linear issue docs are dated by their state transition, undated when unstarted", () => {
+    const [started] = normalizeLinearDocs({
+      teamKey: "AIO",
+      issues: [{ id: "1", identifier: "AIO-1", title: "t", startedAt: "2026-06-20T10:00:00Z" }],
+    });
+    expect(resolveWorkTime(started.frontmatter as Record<string, unknown>)).toBe("2026-06-20T10:00:00.000Z");
+
+    // An unstarted ticket has no transition: nobody has worked it, so it stays honestly undated
+    // rather than being back-dated (which would date it to sync time in the graph).
+    const [backlog] = normalizeLinearDocs({
+      teamKey: "AIO",
+      issues: [{ id: "2", identifier: "AIO-2", title: "t" }],
+    });
+    expect(resolveWorkTime(backlog.frontmatter as Record<string, unknown>)).toBeNull();
+  });
+
+  it("plane issue docs are dated by completion, undated while incomplete", () => {
+    const base = { projectId: "p1", projectIdentifier: "ENG", workspaceSlug: "w", baseUrl: "https://plane.example", states: [] };
+    const [done] = normalizePlaneDocs({
+      ...base,
+      items: [{ id: "i1", sequence_id: 1, name: "done item", completed_at: "2026-06-22T09:00:00Z" }],
+    } as Parameters<typeof normalizePlaneDocs>[0]);
+    expect(resolveWorkTime(done.frontmatter as Record<string, unknown>)).toBe("2026-06-22T09:00:00.000Z");
+
+    const [open] = normalizePlaneDocs({
+      ...base,
+      items: [{ id: "i2", sequence_id: 2, name: "open item" }],
+    } as Parameters<typeof normalizePlaneDocs>[0]);
+    expect(resolveWorkTime(open.frontmatter as Record<string, unknown>)).toBeNull();
   });
 
   it("a repo file whose last commit could not be fetched stays honestly undated", () => {
