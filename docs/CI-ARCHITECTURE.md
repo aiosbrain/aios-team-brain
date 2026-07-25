@@ -138,6 +138,62 @@ Repo: `aiosbrain/aios-team-brain` → Settings → Branches → `main`
 
 ---
 
+## Environments — `production` and `staging` (AIO-483)
+
+Railway project **AIOS** holds **two environments**, each with its **own Postgres, own volumes,
+and own variables**. Nothing is shared between them.
+
+| | `production` | `staging` |
+| --- | --- | --- |
+| Deploy trigger branch | `main` | `staging` |
+| App URL | `aios-team-brain-production.up.railway.app` | `aios-team-brain-staging.up.railway.app` |
+| Postgres | own instance | **separate** instance (empty at creation) |
+| Services | `aios-team-brain`, `graphiti`, `neo4j`, `Postgres` | same four, duplicated |
+
+**How a deploy happens (unchanged model): only by pushing/merging to the branch.** Railway's GitHub
+integration auto-deploys `main` → `production` and `staging` → `staging`. There is no GitHub Actions
+deploy job, and the Railway CLI stays read-only in this repo (see `CLAUDE.md` §6).
+
+`ci.yml` runs on PRs and pushes to **both** `main` and `staging`, so `staging` carries the same
+required-check bar. `aios-work-sync.yml` stays scoped to `main` only — a staging merge must not
+close Linear issues.
+
+### Staging variable boundary
+
+`DATABASE_URL` is a Railway **reference** (`${{Postgres.DATABASE_URL}}`), so each environment
+resolves it to its own database — staging can never write to the production DB. Staging overrides
+`APP_URL` and `SLACK_OAUTH_REDIRECT` to the staging domain and carries **its own freshly generated
+`AUTH_SECRET` and `SECRETS_KEY`** (never production's). The `SLACK_*` credentials are **deleted**
+from staging so it cannot act on the real Slack workspace.
+
+### Staging membership is the access gate
+
+Staging is invite-only through the app's existing membership system — the staging DB is seeded with
+only the repo's collaborators. Seeding uses the existing admin CLI (no bespoke script), pointed at
+the staging database:
+
+```bash
+# DATABASE_URL = the staging Postgres DATABASE_PUBLIC_URL (Railway → staging → Postgres)
+npx tsx --conditions react-server scripts/admin.ts create-team aios --name AIOS
+npx tsx --conditions react-server scripts/admin.ts create-member <email> \
+  --name "<Name>" --handle <handle> --role <admin|lead|member> --team aios --upsert
+npx tsx --conditions react-server scripts/admin.ts login-link <email> --team aios \
+  --base-url https://aios-team-brain-staging.up.railway.app
+```
+
+A seeded member is `status=invited` and **cannot authenticate until first login flips it to
+`active`** (`lib/api/auth.ts` requires `active`) — that is the invite gate, and it applies to API
+keys too.
+
+### Branch protection on `staging`
+
+Settings → Branches → `staging` mirrors `main`'s required status checks and PR requirement, and
+additionally **restricts who can push** to the named repo collaborators. Note GitHub silently drops
+any user without write access from that restriction list, so a read-only collaborator must be
+granted write before they appear.
+
+---
+
 ## Optimized Agent Pipeline Sequencing
 
 ```
