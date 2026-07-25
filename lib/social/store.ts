@@ -360,7 +360,8 @@ async function idsIn(
  * past their guards since a variable table name doesn't match the literal-`from("x")` regexes, but
  * that's evading the rule rather than following it.
  *
- * Scope note: the candidate scan is every `external` opportunity for the team, filtered on the evidence
+ * Scope note: the candidate scan is every opportunity for the team (see the anchor note above),
+ * filtered on the evidence
  * jsonb in JS because the pg adapter has no containment operator. Opportunities are a low-cardinality,
  * human-reviewed set and this runs only on the rare reclassification path; if that stops being true,
  * this wants a `jsonb_path_exists` index instead of a scan.
@@ -390,12 +391,39 @@ export async function narrowSocialChainForItem(
   if (citing.length === 0) return 0;
 
   const affected = citing.map((row) => row.id);
-  // Only the ones actually moving THIS pass get audited + counted, so a retry that re-walks an
-  // already-narrowed chain is silent instead of emitting a duplicate `social.tier_narrowed` row.
+  // Opportunities actually moving THIS pass — a retry re-walking an already-narrowed chain is silent
+  // rather than re-recording it.
   const moving = citing.filter((row) => row.access === "external").map((row) => row.id);
 
   const planIds = await idsIn(db, "content_plans", teamId, "opportunity_id", affected);
   const variantIds = await idsIn(db, "content_variants", teamId, "plan_id", planIds);
+
+  // AUDIT FIRST, before any narrowing write. This is a leak-remediation trail, so it must OVER-record
+  // rather than under-record — and the audit loop running last lost it exactly when it mattered most:
+  // opportunity narrows → plan update throws → the loop is never reached → the retry sees the
+  // opportunity already at `team`, computes `moving = []`, and heals the rest of the chain with ZERO
+  // `social.tier_narrowed` rows, permanently. Recording up front instead means a crash between here and
+  // the writes can leave one duplicate row for a narrowing the retry redoes; a duplicate is cheap, a
+  // silently-unrecorded tier remediation is not.
+  //
+  // `chain_*` counts are for the WHOLE walk, not this opportunity's subtree — when two opportunities
+  // cite the same item they share the numbers, so the prefix says so rather than implying per-row scope.
+  for (const opportunityId of moving) {
+    await audit(db, {
+      team_id: teamId,
+      actor_kind: "system",
+      member_id: null,
+      action: "social.tier_narrowed",
+      target_type: "social_opportunities",
+      target_id: opportunityId,
+      meta: {
+        reason: "evidence_item_narrowed",
+        item_id: itemId,
+        chain_plans: planIds.length,
+        chain_variants: variantIds.length,
+      },
+    });
+  }
 
   const { error: oppErr } = await db
     .from("social_opportunities")
@@ -427,22 +455,5 @@ export async function narrowSocialChainForItem(
   const publicationIds = await narrowPublicationsForVariants(db, teamId, variantIds);
   await narrowAnalyticsForPublications(db, teamId, publicationIds);
 
-  for (const opportunityId of moving) {
-    await audit(db, {
-      team_id: teamId,
-      actor_kind: "system",
-      member_id: null,
-      action: "social.tier_narrowed",
-      target_type: "social_opportunities",
-      target_id: opportunityId,
-      meta: {
-        reason: "evidence_item_narrowed",
-        item_id: itemId,
-        plans: planIds.length,
-        variants: variantIds.length,
-        publications: publicationIds.length,
-      },
-    });
-  }
   return moving.length;
 }

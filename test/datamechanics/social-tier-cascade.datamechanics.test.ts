@@ -6,6 +6,7 @@ import {
   listOpportunities,
   narrowSocialChainForItem,
 } from "@/lib/social/store";
+import { Client } from "pg";
 import { db, ingest, seedTeam } from "./helpers";
 
 /**
@@ -162,6 +163,44 @@ describe("social chain follows a narrowed evidence item (real Postgres)", () => 
     // Nothing MOVED at the opportunity level this pass, so the audit stream stays quiet rather than
     // emitting a duplicate `social.tier_narrowed` for a chain that was already recorded.
     expect(moved).toBe(0);
+  });
+
+  it("records the remediation even when the chain writes then fail", async () => {
+    // The observability half of the crash path above. With the audit emitted LAST, the dominant crash
+    // window (opportunity narrowed, plan update throws) left NO `social.tier_narrowed` row at all — and
+    // the retry, seeing the opportunity already at `team`, had nothing left to record. The chain healed
+    // silently, so the one durable trace that internal content had been retracted from a client-facing
+    // surface was gone forever. A leak-remediation trail has to over-record, not under-record.
+    const seed = await seedTeam();
+    const item = await ingest(seed, {
+      kind: "deliverable",
+      path: "docs/spec.md",
+      body: "the client-visible spec",
+      access: "external",
+    });
+    await seedChain(seed.teamId, "external", item.id, "opp-audit");
+
+    const raw = new Client({ connectionString: process.env.DATABASE_URL });
+    await raw.connect();
+    await raw.query(
+      `create or replace function _fail_plans() returns trigger as $$ begin raise exception 'simulated plan failure'; end $$ language plpgsql;
+       create trigger _t_fail_plans before update on content_plans for each row execute function _fail_plans();`
+    );
+    try {
+      await expect(narrowSocialChainForItem(db(), seed.teamId, item.id)).rejects.toThrow();
+    } finally {
+      await raw
+        .query(`drop trigger if exists _t_fail_plans on content_plans; drop function if exists _fail_plans();`)
+        .catch(() => {});
+      await raw.end().catch(() => {});
+    }
+
+    const { data } = await db()
+      .from("audit_log")
+      .select("action")
+      .eq("team_id", seed.teamId)
+      .eq("action", "social.tier_narrowed");
+    expect((data ?? []).length).toBe(1); // recorded despite the failure that followed
   });
 
   it("stops serving it on the external read path — the observable leak", async () => {
