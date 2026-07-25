@@ -115,7 +115,7 @@ async function runGraphProjectionInner(opts?: {
       // synced_at scanned until a batch comes back short (fewer rows than the limit = tail reached).
       // MAX_BATCHES caps the loop as a runaway guard. (audit H2)
       let since: string | undefined;
-      let tierMoved = 0;
+      let externalVacated = 0;
       for (let batch = 0; batch < MAX_BATCHES; batch++) {
         const s = await projectItemsToGraph(db, {
           teamId: t.id,
@@ -127,7 +127,7 @@ async function runGraphProjectionInner(opts?: {
         summary.scanned += s.scanned;
         summary.projected += s.projected;
         summary.skipped += s.skipped;
-        tierMoved += s.tierChanges;
+        externalVacated += s.externalGroupVacated;
         if (s.scanned < limit || !s.lastSyncedAt || s.lastSyncedAt === since) break;
         since = s.lastSyncedAt;
       }
@@ -141,13 +141,17 @@ async function runGraphProjectionInner(opts?: {
       summary.pendingCleanups += r.pendingCleanups;
       summary.saturatedGroups += r.saturatedGroups;
 
-      // A reclassification only finishes leaving the graph HERE. `lib/ingest` purged the external-tier
-      // caches when it healed `items.access`, but arcs are synthesized from the external Graphiti group,
-      // which is only cleaned by the projection/cleanup above — so any arc rebuild in between re-read the
+      // A NARROWING only finishes leaving the graph HERE. `lib/ingest` purged the external-tier caches
+      // when it healed `items.access`, but arcs are synthesized from the external Graphiti group, which
+      // is only cleaned by the projection/cleanup above — so any arc rebuild in between re-read the
       // old-tier facts and `commitArcs` stamped that result FRESH for a full TTL. Purge again now that
       // the group is actually clean; this is the call that closes the window (and mops up an SWR rebuild
       // that was already in flight when ingest purged).
-      if (tierMoved || r.cleaned) {
+      //
+      // Both signals are direction-aware: a WIDENING also moves episodes between groups, but it leaks
+      // nothing, and purging for it would force a cold LLM re-synthesis with no prior for the
+      // empty-clobber guard to protect — the blank-panel failure the ingest side deliberately avoids.
+      if (externalVacated || r.cleanedExternal) {
         await purgeExternalTierCaches(db, t.id, t.slug);
       }
     } catch (e) {

@@ -313,16 +313,17 @@ export async function ingestItem(
     };
   }
 
-  // Phase 1 of a reclassification on the CHANGED path, before the item row (which carries `access`) is
-  // written — same fail-closed ordering as the unchanged path above.
-  if (accessChanged && existing) {
-    await cascadeInheritedAudience(db, existing.id, effectiveAccess);
-  }
-
   const taskRows =
     payload.kind === "task" && payload.rows
       ? await validateTaskRows(db, auth.teamId, project.id, payload.rows)
       : undefined;
+
+  // Phase 1 of a reclassification on the CHANGED path: before the item row (which carries `access`) is
+  // written — same fail-closed ordering as the unchanged path — but AFTER row validation, so a push that
+  // 422s on invalid rows doesn't mutate anything first.
+  if (accessChanged && existing) {
+    await cascadeInheritedAudience(db, existing.id, effectiveAccess);
+  }
 
   const pendingSha = "";
   const itemRecord = {

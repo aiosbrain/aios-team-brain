@@ -225,8 +225,14 @@ describe("a half-applied reclassification is recoverable, not permanent (real Po
       const { data } = await db().from("items").select("access").eq("id", item.id).maybeSingle();
       expect((data as { access: string }).access).toBe("external");
     } finally {
-      await raw.query(`drop trigger _t_fail_ef on extracted_facts; drop function _fail_ef();`);
-      await raw.end();
+      // `if exists` + tolerated failure: a drop that silently failed would poison EVERY later
+      // `extracted_facts` update in the tier with "simulated cascade failure".
+      await raw
+        .query(
+          `drop trigger if exists _t_fail_ef on extracted_facts; drop function if exists _fail_ef();`
+        )
+        .catch(() => {});
+      await raw.end().catch(() => {});
     }
 
     // The retry (a later sync tick) still sees the tier as changed and completes the whole thing.

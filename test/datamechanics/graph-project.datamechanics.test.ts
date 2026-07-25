@@ -230,6 +230,45 @@ describe("runGraphProjection runner (real Postgres, mocked Graphiti)", () => {
     expect(run.ok).toBe(true);
   });
 
+  it("does NOT purge the external arc cache when the tier move was a WIDENING", async () => {
+    // The direction-awareness the ingest side is built on has to hold here too. A team→external move also
+    // shuffles episodes between groups, but nothing leaked — the external payload is merely incomplete.
+    // Hard-purging would force a cold LLM re-synthesis with no prior for the empty-clobber guard to
+    // protect, which is the blank-panel failure mode (2026-07) we deliberately avoid.
+    const seed = await seedTeam();
+    const slug = await teamSlugFor(seed.teamId);
+    const externalArcKey = `${slug}_external`;
+    await ingest(seed, { kind: "deliverable", path: "docs/spec.md", body: "the internal spec", access: "team" });
+
+    const fake = new FakeGraphiti();
+    await runGraphProjection({ teamId: seed.teamId, client: client(fake), db: db() });
+    await ingest(seed, { kind: "deliverable", path: "docs/spec.md", body: "the internal spec", access: "external" });
+
+    await db()
+      .from("arc_cache")
+      .upsert(
+        {
+          team_id: seed.teamId,
+          group_key: externalArcKey,
+          arcs: JSON.stringify([{ title: "an arc an external viewer may see" }]),
+          facts_hash: "h",
+          computed_at: new Date().toISOString(),
+        },
+        { onConflict: "team_id,group_key" }
+      );
+
+    await runGraphProjection({ teamId: seed.teamId, client: client(fake), db: db() });
+    expect(await fake.listEpisodes(externalArcKey)).toHaveLength(1); // episodes moved INTO external…
+
+    const { data } = await db()
+      .from("arc_cache")
+      .select("group_key")
+      .eq("team_id", seed.teamId)
+      .eq("group_key", externalArcKey)
+      .maybeSingle();
+    expect(data).not.toBeNull(); // …and the row survives, to be refreshed on its TTL
+  });
+
   // Spec for audit H2: the runner must PAGE through the whole backlog. Before the fix it re-scanned
   // only the oldest `limit` rows every run, so items beyond that window were never projected.
   it("pages the full backlog beyond a single batch limit (audit H2)", async () => {

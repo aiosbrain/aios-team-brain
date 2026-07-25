@@ -23,15 +23,20 @@ import { bustTeamTimeline } from "@/lib/dashboard/timeline-cache";
  *   1. `cascadeInheritedAudience(...)`  ← BEFORE it writes `items.access`
  *   2. write `items.access`
  *   3. `settleReclassification(...)`    ← AFTER
- * Run in that order, every failure is FAIL-CLOSED and self-healing:
+ * Run in that order:
  *   • step 1 throws → `items.access` is untouched, so the next sync tick still sees the tier as changed
  *     and retries the whole thing. (The other order strands the inheriting rows at the OLD tier
- *     permanently: the retry reads the already-committed `access`, computes `accessChanged = false`, and
- *     never repairs them — a leak with no repair path and no signal beyond one 500.)
- *   • step 2 throws → the inheriting rows are already at the NEW (narrower) tier while the item is still
- *     at the old one. More restrictive than required, never less; the next tick converges.
- *   • step 3 throws → the caches are stale rather than purged; bounded by their TTL, and the next tick
- *     retries. Worst case here is staleness, so it's the only phase that may run last.
+ *     PERMANENTLY: the retry reads the already-committed `access`, computes `accessChanged = false`, and
+ *     never repairs them — a leak with no repair path and no signal beyond one 500. That is the whole
+ *     reason for the split.)
+ *   • step 2 throws → the inheriting rows are already at the new tier while the item is still at the old
+ *     one. For a NARROWING that's stricter than required (fail-closed); for a WIDENING it's briefly
+ *     wider than the item, which the source already authorized. Either way the next tick converges.
+ *   • step 3 is last because it CANNOT be retried by a later push (the retry would compute
+ *     `accessChanged = false`), so it must not be able to block the tier commit. It is safe there
+ *     precisely because it can barely fail: every purge/stale helper swallows its own errors, the worst
+ *     outcome is a cache that expires on its TTL instead of being purged, and when the graph is
+ *     configured `lib/graph/run` re-purges once the tier move has left the Graphiti group anyway.
  */
 
 /** Tier-carrying tables whose rows inherit the containing item's `access`, keyed by `source_item_id`.
