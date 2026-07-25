@@ -136,3 +136,25 @@ export async function listPublications(db: DbClient, teamId: string, limit = 100
     .limit(limit);
   return (data ?? []) as PublicationRow[];
 }
+
+/**
+ * Narrow publications to `team` for a set of variants, returning the ids touched so the analytics rows
+ * below them can follow. Called by the social tier cascade (`lib/social/store.narrowSocialChainForItem`)
+ * when an evidence item is reclassified external→team. Lives here because `social_publications` is this
+ * module's table (single-writer, CLAUDE.md §2). Narrowing only; nothing here ever widens.
+ */
+export async function narrowPublicationsForVariants(
+  db: DbClient,
+  teamId: string,
+  variantIds: string[]
+): Promise<string[]> {
+  if (variantIds.length === 0) return [];
+  const { data, error } = await db
+    .from("social_publications")
+    .update({ access: "team" })
+    .eq("team_id", teamId)
+    .in("variant_id", variantIds)
+    .select("id");
+  if (error) throw new Error(`narrowPublicationsForVariants failed: ${error.message}`);
+  return ((data ?? []) as { id: string }[]).map((r) => r.id);
+}

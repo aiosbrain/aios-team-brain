@@ -250,7 +250,7 @@ export async function ingestItem(
     // stored tier unchanged and the next tick retries the whole change (see reclassify.ts's ordering note
     // — the other order strands the inheriting rows at the old tier permanently).
     if (accessChanged) {
-      await cascadeInheritedAudience(db, existing.id, effectiveAccess);
+      await cascadeInheritedAudience(db, auth.teamId, existing.id, effectiveAccess);
     }
 
     const { error: healError } = await db
@@ -322,7 +322,7 @@ export async function ingestItem(
   // written — same fail-closed ordering as the unchanged path — but AFTER row validation, so a push that
   // 422s on invalid rows doesn't mutate anything first.
   if (accessChanged && existing) {
-    await cascadeInheritedAudience(db, existing.id, effectiveAccess);
+    await cascadeInheritedAudience(db, auth.teamId, existing.id, effectiveAccess);
   }
 
   const pendingSha = "";

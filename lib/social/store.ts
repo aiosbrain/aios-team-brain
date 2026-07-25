@@ -1,6 +1,11 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { visibleByAccess, type ViewerTier } from "@/lib/auth/visibility";
+import { audit } from "@/lib/api/audit";
+import { narrowMediaAssetsForVariants } from "@/lib/media/store";
+import { narrowApprovalsForVariants } from "./approvals";
+import { narrowPublicationsForVariants } from "./publications";
+import { narrowAnalyticsForPublications } from "./analytics";
 import { TierLeakError, violatesEvidenceTier } from "./tier";
 import type {
   AccessTier,
@@ -307,4 +312,148 @@ export async function listVariants(
   );
   const { data } = await q.order("created_at", { ascending: true });
   return (data ?? []) as VariantRow[];
+}
+
+// ── reclassification ───────────────────────────────────────────────────────────
+
+/** Child ids under a set of parents, for walking the derived chain down. Read-only. */
+async function idsIn(
+  db: DbClient,
+  table: string,
+  teamId: string,
+  parentCol: string,
+  parentIds: string[]
+): Promise<string[]> {
+  if (parentIds.length === 0) return [];
+  const { data, error } = await db
+    .from(table)
+    .select("id")
+    .eq("team_id", teamId)
+    .in(parentCol, parentIds);
+  if (error) throw new Error(`narrowSocialChain: ${table} lookup failed: ${error.message}`);
+  return ((data ?? []) as { id: string }[]).map((r) => r.id);
+}
+
+/**
+ * Re-apply the evidence→tier ceiling (`lib/social/tier`) after an evidence item has been narrowed to
+ * `team`, and narrow every row derived from it. Returns how many opportunities moved.
+ *
+ * WHY this exists: `assertEvidenceTier` enforces the ceiling only at CREATE. An opportunity's title and
+ * summary — and every plan, variant, generated image and publication below it — are written FROM the
+ * evidence item's content, so when that item is reclassified external→team an existing `external`
+ * opportunity is retroactively a leak: internal knowledge still readable on the client-facing surface,
+ * and still eligible to be published. Unlike the arc/timeline caches there is no TTL here and nothing
+ * recomputes the ceiling, so without this the exposure is PERMANENT.
+ *
+ * ONE DIRECTION ONLY. A widening (team→external) raises the ceiling but must NOT auto-widen anything:
+ * the ceiling is a limit, not a target, and turning internal-derived narrative public is a human
+ * decision. Nothing on this path ever sets `access = 'external'`.
+ *
+ * NOT best-effort: a row left at the old tier IS the leak, so failures propagate to the caller — and
+ * because the walk is anchored on the evidence match rather than on the rows' current tier, it is
+ * IDEMPOTENT: whatever a failed attempt already narrowed, the retry simply re-narrows. That, not the
+ * write order, is what makes a partial failure recoverable (each statement autocommits; there is no
+ * enclosing transaction).
+ *
+ * Each table is narrowed by ITS OWN single-writer module (`lib/media/store`, `lib/social/publications`,
+ * `lib/social/analytics`) rather than from here — writing them directly would work, and would even slip
+ * past their guards since a variable table name doesn't match the literal-`from("x")` regexes, but
+ * that's evading the rule rather than following it.
+ *
+ * Scope note: the candidate scan is every opportunity for the team (see the anchor note above),
+ * filtered on the evidence
+ * jsonb in JS because the pg adapter has no containment operator. Opportunities are a low-cardinality,
+ * human-reviewed set and this runs only on the rare reclassification path; if that stops being true,
+ * this wants a `jsonb_path_exists` index instead of a scan.
+ */
+export async function narrowSocialChainForItem(
+  db: DbClient,
+  teamId: string,
+  itemId: string
+): Promise<number> {
+  // The scan is anchored on the EVIDENCE MATCH ALONE — deliberately NOT on `access = 'external'`.
+  //
+  // These statements each autocommit (no enclosing transaction), so a mid-walk failure is real: the
+  // opportunity narrows, then the plan update throws. If the anchor also required the opportunity to be
+  // `external`, the retry would find nothing citing this item, return 0, and leave the plan/variant —
+  // the actual derived post body, still publishable — at `external` FOREVER. Anchoring on the evidence
+  // makes the whole walk idempotent, so every retry re-narrows the full chain regardless of how far the
+  // previous attempt got. (Verified to that outcome by a spec that simulates the crash point.)
+  const { data, error } = await db
+    .from("social_opportunities")
+    .select("id, evidence, access")
+    .eq("team_id", teamId);
+  if (error) throw new Error(`narrowSocialChain: opportunity scan failed: ${error.message}`);
+
+  const citing = ((data ?? []) as { id: string; evidence: unknown; access: AccessTier }[]).filter((row) =>
+    (Array.isArray(row.evidence) ? (row.evidence as Evidence[]) : []).some((e) => e?.itemId === itemId)
+  );
+  if (citing.length === 0) return 0;
+
+  const affected = citing.map((row) => row.id);
+  // Opportunities actually moving THIS pass — a retry re-walking an already-narrowed chain is silent
+  // rather than re-recording it.
+  const moving = citing.filter((row) => row.access === "external").map((row) => row.id);
+
+  const planIds = await idsIn(db, "content_plans", teamId, "opportunity_id", affected);
+  const variantIds = await idsIn(db, "content_variants", teamId, "plan_id", planIds);
+
+  // AUDIT FIRST, before any narrowing write. This is a leak-remediation trail, so it must OVER-record
+  // rather than under-record — and the audit loop running last lost it exactly when it mattered most:
+  // opportunity narrows → plan update throws → the loop is never reached → the retry sees the
+  // opportunity already at `team`, computes `moving = []`, and heals the rest of the chain with ZERO
+  // `social.tier_narrowed` rows, permanently. Recording up front instead means a crash between here and
+  // the writes can leave one duplicate row for a narrowing the retry redoes; a duplicate is cheap, a
+  // silently-unrecorded tier remediation is not.
+  //
+  // `chain_*` counts are for the WHOLE walk, not this opportunity's subtree — when two opportunities
+  // cite the same item they share the numbers, so the prefix says so rather than implying per-row scope.
+  for (const opportunityId of moving) {
+    await audit(db, {
+      team_id: teamId,
+      actor_kind: "system",
+      member_id: null,
+      action: "social.tier_narrowed",
+      target_type: "social_opportunities",
+      target_id: opportunityId,
+      meta: {
+        reason: "evidence_item_narrowed",
+        item_id: itemId,
+        chain_plans: planIds.length,
+        chain_variants: variantIds.length,
+      },
+    });
+  }
+
+  const { error: oppErr } = await db
+    .from("social_opportunities")
+    .update({ access: "team" })
+    .eq("team_id", teamId)
+    .in("id", affected);
+  if (oppErr) throw new Error(`narrowSocialChain: opportunity update failed: ${oppErr.message}`);
+
+  if (planIds.length) {
+    const { error: planErr } = await db
+      .from("content_plans")
+      .update({ access: "team" })
+      .eq("team_id", teamId)
+      .in("id", planIds);
+    if (planErr) throw new Error(`narrowSocialChain: plan update failed: ${planErr.message}`);
+  }
+  if (variantIds.length) {
+    const { error: varErr } = await db
+      .from("content_variants")
+      .update({ access: "team" })
+      .eq("team_id", teamId)
+      .in("id", variantIds);
+    if (varErr) throw new Error(`narrowSocialChain: variant update failed: ${varErr.message}`);
+  }
+
+  // Below the variant, each table has a different owner — call theirs.
+  await narrowApprovalsForVariants(db, teamId, variantIds);
+  await narrowMediaAssetsForVariants(db, teamId, variantIds);
+  const publicationIds = await narrowPublicationsForVariants(db, teamId, variantIds);
+  await narrowAnalyticsForPublications(db, teamId, publicationIds);
+
+  return moving.length;
 }

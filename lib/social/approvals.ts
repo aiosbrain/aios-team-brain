@@ -157,3 +157,27 @@ export async function listPendingApprovals(db: DbClient, teamId: string, limit =
     .limit(limit);
   return (data ?? []) as ApprovalRow[];
 }
+
+/**
+ * Narrow approval rows to `team` for a set of variants. Called by the social tier cascade
+ * (`lib/social/store.narrowSocialChainForItem`) when an evidence item is reclassified external→team.
+ * Lives here because `content_approvals` is this module's table (single-writer, CLAUDE.md §2).
+ *
+ * Not a live leak today — the queue reader is team-facing and `decideApproval` ignores `access`, and the
+ * publish door re-checks the VARIANT's tier at schedule and fire time. It's narrowed anyway because a
+ * stale denormalized tier with no repair path is the whole bug class this cascade removes, and the next
+ * surface to read this table tier-scoped would inherit the leak silently. Narrowing only.
+ */
+export async function narrowApprovalsForVariants(
+  db: DbClient,
+  teamId: string,
+  variantIds: string[]
+): Promise<void> {
+  if (variantIds.length === 0) return;
+  const { error } = await db
+    .from("content_approvals")
+    .update({ access: "team" })
+    .eq("team_id", teamId)
+    .in("variant_id", variantIds);
+  if (error) throw new Error(`narrowApprovalsForVariants failed: ${error.message}`);
+}
