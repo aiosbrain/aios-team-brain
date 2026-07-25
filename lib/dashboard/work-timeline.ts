@@ -270,11 +270,18 @@ export async function getWorkTimeline(
   // primary == owner for ~all items, so this is a near-no-op today but correct as handoffs grow. Slack is
   // EXEMPT — its per-participant `participants[]` ledger IS its evidence-gated credit (see its leg below).
   const gitOtherRows = [...((gitRes.data ?? []) as ItemRow[]), ...((otherRes.data ?? []) as ItemRow[])];
-  // Pass the already-fetched rows so the oracle skips a redundant `items` re-read (it only needs
-  // id/member_id/member_id_locked, all selected above); it still reads item_versions + members.
+  // Pass the already-fetched rows so the oracle skips a redundant `items` re-read; it still reads
+  // item_versions + members. `frontmatter` is forwarded (already selected, so it costs nothing): a
+  // CONVERSATION source keeps its work ledger there, and omitting it would silently hand the oracle
+  // the root-stamped version authors instead — wrong credit with no signal.
   const credit = await resolveItemCreditIds(db, teamId, gitOtherRows.map((r) => r.id), {
     strict: true,
-    items: gitOtherRows.map((r) => ({ id: r.id, member_id: r.member_id, member_id_locked: r.member_id_locked ?? null })),
+    items: gitOtherRows.map((r) => ({
+      id: r.id,
+      member_id: r.member_id,
+      member_id_locked: r.member_id_locked ?? null,
+      frontmatter: r.frontmatter ?? null,
+    })),
   });
   // Primary contributor for an item, falling back to the current owner when the oracle has no opinion
   // (e.g. no human version history). Kept the `.not("member_id","is",null)` prefetch prefilter on the leg

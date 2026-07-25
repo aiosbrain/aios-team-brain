@@ -12,6 +12,11 @@ import type { DbClient } from "@/lib/db/types";
  * the ownership-timeline design calls for (docs/design/attribution-ownership-timeline.md) — a mislabeled
  * assigned-but-never-worked owner leaves no version, so it earns no credit automatically. A LOCKED
  * attribution (an admin correction) is the authoritative override: credit collapses to the corrected owner.
+ *
+ * EXCEPTION — CONVERSATION sources: a Slack thread is one item rewritten on every reply, and each of
+ * those versions is stamped with the thread-ROOT author, so version authors there are NOT the workers.
+ * Such a source carries its own ledger in frontmatter (`participants[]`) which takes precedence — see
+ * `slackContributors`.
  */
 
 /**
@@ -69,11 +74,50 @@ export interface ItemCredit {
 }
 
 /** Prefetched item shape a caller can pass so the oracle skips its own `items` read (the timeline already
- *  holds these rows). `id, member_id, member_id_locked` — the only item fields the credit rule needs. */
+ *  holds these rows). `frontmatter` is optional — supply it for CONVERSATION sources, whose work ledger
+ *  lives there rather than in `item_versions` (see `slackContributors`). */
 export interface CreditItemRow {
   id: string;
   member_id: string | null;
   member_id_locked: boolean | null;
+  frontmatter?: Record<string, unknown> | null;
+}
+
+/** One entry of a Slack thread's `participants[]` ledger (written by `lib/ingest/sources/slack-normalize`). */
+interface SlackParticipantRef {
+  author_id?: unknown;
+  last_ts?: unknown;
+}
+
+/**
+ * The CONTRIBUTION ledger for a Slack thread, in work order (earliest last-message first), as Slack
+ * user ids. Empty for a non-Slack item or one carrying no participants ledger.
+ *
+ * Why conversations need their own ledger: a Slack thread is ONE item whose body is REWRITTEN on every
+ * new reply, and every one of those versions is stamped with the THREAD-ROOT author. So the
+ * `item_versions` premise this module rests on — "distinct version authors ARE the people who produced
+ * work" — is FALSE here: someone who posts a one-line question and receives twenty substantive replies
+ * absorbs all twenty versions, while every replier stays invisible in arcs, credit, and the admin page.
+ * `participants[]` records each distinct author with their first/last message time, so it is the honest
+ * work ledger for a thread — and unlike version-stamping it can't lose people when one sync tick happens
+ * to pick up several repliers at once. The Timeline already reads it; reading it HERE means arcs, the
+ * credit oracle, and the admin drill-down agree instead of drifting. Pure.
+ */
+export function slackContributors(fm: Record<string, unknown> | null | undefined): string[] {
+  if (!fm || fm.source !== "slack") return [];
+  const raw = fm.participants;
+  if (!Array.isArray(raw)) return [];
+  const entries: { id: string; last: string }[] = [];
+  for (const p of raw as SlackParticipantRef[]) {
+    const id = typeof p?.author_id === "string" ? p.author_id.trim() : "";
+    if (!id) continue;
+    entries.push({ id, last: typeof p?.last_ts === "string" ? p.last_ts : "" });
+  }
+  // Work order — oldest contribution first — so the LAST entry is the most recent worker, matching how
+  // version order is consumed downstream (`latestWorkerId`).
+  entries.sort((a, b) => (a.last < b.last ? -1 : a.last > b.last ? 1 : 0));
+  const seen = new Set<string>();
+  return entries.filter((e) => (seen.has(e.id) ? false : (seen.add(e.id), true))).map((e) => e.id);
 }
 
 interface CreditCore {
@@ -101,7 +145,8 @@ async function resolveCreditCore(
   const run = async (): Promise<CreditCore> => {
     const itemsP = opts.items
       ? Promise.resolve({ data: opts.items, error: null })
-      : db.from("items").select("id, member_id, member_id_locked").eq("team_id", teamId).in("id", ids);
+      : // `frontmatter` carries the CONVERSATION work ledger (Slack `participants[]`) — see below.
+        db.from("items").select("id, member_id, member_id_locked, frontmatter").eq("team_id", teamId).in("id", ids);
     const [itemsRes, versionsRes] = await Promise.all([
       itemsP,
       db
@@ -122,8 +167,46 @@ async function resolveCreditCore(
 
     // members → {label, is_connector} for every referenced id (current owners + version authors). Label =
     // display_name ?? actor_handle, so a HUMAN with no display name is still credited (was excluded).
+    // CONVERSATION ledger: Slack threads keep their real contributor list in `participants[]` because
+    // every version is root-stamped (see `slackContributors`). Resolve those Slack user ids to members
+    // once, for all items, via the same `member_identities` map the Timeline uses — so the two surfaces
+    // credit identically. Best-effort ENRICHMENT: a failed/absent map just leaves versions in charge.
+    const slackIdsByItem = new Map<string, string[]>();
+    for (const it of items) {
+      const authors = slackContributors(it.frontmatter);
+      if (authors.length) slackIdsByItem.set(it.id, authors);
+    }
+    let memberBySlackId = new Map<string, string>();
+    if (slackIdsByItem.size) {
+      const identRes = await db
+        .from("member_identities")
+        .select("external_id, member_id")
+        .eq("team_id", teamId)
+        .eq("provider", "slack");
+      if (opts.strict && identRes.error) {
+        throw new Error(`resolveItemCredit slack identities: ${identRes.error.message}`);
+      }
+      // Case-FOLDED on both sides, matching `lib/identity/resolve.providerKey` and the Timeline leg.
+      // `setMemberIdentity` stores the id case-preserved and an admin can type it any way, so a raw
+      // comparison silently drops that person from credit — reviving this very bug per-identity, and
+      // (if the ROOT is the mismatched one) flipping `primary` to a replier.
+      memberBySlackId = new Map(
+        ((identRes.data ?? []) as { external_id: string | null; member_id: string | null }[])
+          .filter((r) => r.external_id && r.member_id)
+          .map((r) => [r.external_id!.trim().toLowerCase(), r.member_id!])
+      );
+    }
+
     const memberIds = [
-      ...new Set([...items.map((i) => i.member_id), ...versions.map((v) => v.member_id)].filter((m): m is string => !!m)),
+      ...new Set(
+        [
+          ...items.map((i) => i.member_id),
+          ...versions.map((v) => v.member_id),
+          // Slack participants own nothing and write no version, so without this a replier is absent
+          // from memberMap and `isHuman` would silently reject them — the very bug this fixes.
+          ...memberBySlackId.values(),
+        ].filter((m): m is string => !!m)
+      ),
     ];
     const memberMap = new Map<string, { label: string; connector: boolean }>();
     if (memberIds.length) {
@@ -158,14 +241,27 @@ async function resolveCreditCore(
     const byItem = new Map<string, ItemCreditIds>();
     for (const it of items) {
       const currentMemberId = isHuman(it.member_id) ? it.member_id : null;
-      const versionMemberIds = versionMembersByItem.get(it.id) ?? [];
+      // Slack: the participants ledger REPLACES the (root-stamped, therefore wrong) version authors —
+      // it is the honest record of who spoke. The root is normally a participant too, so in practice
+      // repliers are gained and nobody is lost; the exception is a root whose Slack identity is absent
+      // (unlinked after the fact), who then drops out despite owning the item. Falls back to versions
+      // when a thread predates the ledger or no participant maps to a member.
+      const slackMemberIds = (slackIdsByItem.get(it.id) ?? [])
+        .map((sid) => memberBySlackId.get(sid.trim().toLowerCase()) ?? null)
+        .filter((m): m is string => isHuman(m));
+      const versionMemberIds = slackMemberIds.length
+        ? [...new Set(slackMemberIds)]
+        : versionMembersByItem.get(it.id) ?? [];
       const locked = it.member_id_locked === true;
       const contributorIds = [...new Set(creditedContributorIds({ locked, currentMemberId, versionMemberIds }))];
       const primaryId = creditedPrimaryId({
         locked,
         currentMemberId,
         versionMemberIds,
-        latestWorkerId: latestWorkerByItem.get(it.id) ?? null,
+        // Slack: work order is oldest-last-message first, so the final entry is the most recent worker.
+        latestWorkerId: slackMemberIds.length
+          ? versionMemberIds[versionMemberIds.length - 1]
+          : latestWorkerByItem.get(it.id) ?? null,
       });
       if (contributorIds.length || primaryId) byItem.set(it.id, { contributorIds, primaryId });
     }

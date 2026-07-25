@@ -175,3 +175,150 @@ describe("resolveItemCreditIds (the ID oracle every surface reads)", () => {
     expect(viaPrefetch.contributorIds).toEqual([a]);
   });
 });
+
+/**
+ * Spec for SLACK credit on real Postgres. A thread is ONE item whose body is rewritten on every new
+ * reply, and every version is stamped with the thread-ROOT author — so the version ledger says the root
+ * did all the work. The observable bug: someone posts a one-line question, a colleague writes the
+ * substantive replies, and the replier is credited NOWHERE (arcs, credit oracle, admin drill-down all
+ * read this one function). The `participants[]` ledger is the honest record and must drive credit.
+ */
+async function addSlackIdentity(seed: Seed, memberId: string, slackUserId: string): Promise<void> {
+  const { error } = await db()
+    .from("member_identities")
+    .insert({ team_id: seed.teamId, member_id: memberId, provider: "slack", external_id: slackUserId });
+  if (error) throw new Error(`addSlackIdentity failed: ${error.message}`);
+}
+
+function slackPayload(
+  body: string,
+  path: string,
+  participants: { author_id: string; last_ts: string }[]
+): ItemPayload {
+  return {
+    project: "slack",
+    kind: "transcript",
+    actor: "slack-sync",
+    frontmatter: { source: "slack", author_id: participants[0]?.author_id ?? "", participants },
+    content_sha256: sha(body),
+    body,
+    path,
+  } as ItemPayload;
+}
+
+describe("resolveItemCredit — Slack threads credit every participant, not just the root", () => {
+  it("credits a REPLIER whose messages only ever produced root-stamped versions", async () => {
+    const seed = await seedTeam(); // root author = "Tester"
+    const root = seed.memberId;
+    const replier = await addMember(seed, "Replier");
+    await addSlackIdentity(seed, root, "UROOT");
+    await addSlackIdentity(seed, replier, "UREPLY");
+    const auth = { teamId: seed.teamId, memberId: root, apiKeyId: randomUUID() };
+    const path = `slack/general/${randomUUID()}.md`;
+
+    // v1: the root's one-line question. Every version is attributed to the ROOT (as the connector does).
+    const first = await ingestItem(
+      db(), auth,
+      slackPayload("root question", path, [{ author_id: "UROOT", last_ts: "2026-07-01T10:00:00Z" }]),
+      "team", { authorMemberId: root }
+    );
+    // v2: the replier's substantive answer rewrites the thread — still stamped to the ROOT.
+    await ingestItem(
+      db(), auth,
+      slackPayload("root question\nreplier's long answer", path, [
+        { author_id: "UROOT", last_ts: "2026-07-01T10:00:00Z" },
+        { author_id: "UREPLY", last_ts: "2026-07-02T10:00:00Z" },
+      ]),
+      "team", { authorMemberId: root }
+    );
+
+    const c = (await resolveItemCredit(db(), seed.teamId, [first.id])).get(first.id)!;
+    expect(new Set(c.contributors)).toEqual(new Set(["Tester", "Replier"])); // the replier is NOT invisible
+    // PRIMARY is unchanged by this fix: the root owns the thread AND genuinely contributed (the root
+    // message), so they stay the single balancing representative — same rule as every other source.
+    // Only the CONTRIBUTOR set was wrong before, and that's what H1 was about.
+    expect(c.primary).toBe("Tester");
+  });
+
+  it("still credits a mapped replier when the thread ROOT doesn't map to a member", async () => {
+    // A thread started by someone outside the roster (or an unmapped Slack id) previously credited
+    // NOBODY. The participants ledger still names the mapped replier, so their work is no longer lost.
+    const seed = await seedTeam();
+    const replier = await addMember(seed, "Only Replier");
+    await addSlackIdentity(seed, replier, "UREPLY3");
+    const auth = { teamId: seed.teamId, memberId: seed.memberId, apiKeyId: randomUUID() };
+    const path = `slack/general/${randomUUID()}.md`;
+    const res = await ingestItem(
+      db(), auth,
+      slackPayload("outsider question\nreplier answer", path, [
+        { author_id: "UNMAPPED_ROOT", last_ts: "2026-07-01T10:00:00Z" },
+        { author_id: "UREPLY3", last_ts: "2026-07-02T10:00:00Z" },
+      ]),
+      "team", { authorMemberId: null } // root unresolved → honestly unattributed owner
+    );
+
+    const c = (await resolveItemCredit(db(), seed.teamId, [res.id])).get(res.id)!;
+    expect(c.contributors).toEqual(["Only Replier"]); // the work is credited
+    // PRIMARY stays null: the pure rule is "no current owner → unattributed for balancing", shared by
+    // every source, and this PR deliberately doesn't widen it. So an owner-less thread credits its
+    // contributors but represents nobody in arc balancing — a real remaining gap, tracked separately.
+    expect(c.primary).toBeNull();
+  });
+
+  it("a LOCKED admin correction still wins over the participants ledger", async () => {
+    const seed = await seedTeam();
+    const root = seed.memberId;
+    const replier = await addMember(seed, "Replier2");
+    await addSlackIdentity(seed, root, "UROOT2");
+    await addSlackIdentity(seed, replier, "UREPLY2");
+    const auth = { teamId: seed.teamId, memberId: root, apiKeyId: randomUUID() };
+    const path = `slack/general/${randomUUID()}.md`;
+    const res = await ingestItem(
+      db(), auth,
+      slackPayload("q\na", path, [
+        { author_id: "UROOT2", last_ts: "2026-07-01T10:00:00Z" },
+        { author_id: "UREPLY2", last_ts: "2026-07-02T10:00:00Z" },
+      ]),
+      "team", { authorMemberId: root }
+    );
+    await db().from("items").update({ member_id: root, member_id_locked: true }).eq("id", res.id);
+
+    const c = (await resolveItemCredit(db(), seed.teamId, [res.id])).get(res.id)!;
+    expect(c.contributors).toEqual(["Tester"]); // the correction is authoritative
+  });
+
+  it("resolves a participant whose stored Slack id differs in CASE from the thread's", async () => {
+    // Identities are stored case-preserved (an admin may type them by hand), and every other resolver
+    // in the repo case-folds. A raw comparison here would drop that person from credit — resurrecting
+    // this very bug per-identity, and flipping `primary` when it's the ROOT that mismatches.
+    const seed = await seedTeam();
+    const root = seed.memberId;
+    const replier = await addMember(seed, "Cased Replier");
+    await addSlackIdentity(seed, root, "uroot4"); // stored lower-case…
+    await addSlackIdentity(seed, replier, "ureply4");
+    const auth = { teamId: seed.teamId, memberId: root, apiKeyId: randomUUID() };
+    const path = `slack/general/${randomUUID()}.md`;
+    const res = await ingestItem(
+      db(), auth,
+      slackPayload("q\na", path, [
+        { author_id: "UROOT4", last_ts: "2026-07-01T10:00:00Z" }, // …thread reports UPPER-case
+        { author_id: "UREPLY4", last_ts: "2026-07-02T10:00:00Z" },
+      ]),
+      "team", { authorMemberId: root }
+    );
+
+    const c = (await resolveItemCredit(db(), seed.teamId, [res.id])).get(res.id)!;
+    expect(new Set(c.contributors)).toEqual(new Set(["Tester", "Cased Replier"]));
+    expect(c.primary).toBe("Tester"); // the root is still recognized → primary does NOT flip
+  });
+
+  it("falls back to the version ledger for a thread with no participants (pre-ledger items)", async () => {
+    const seed = await seedTeam();
+    const root = seed.memberId;
+    const auth = { teamId: seed.teamId, memberId: root, apiKeyId: randomUUID() };
+    const path = `slack/general/${randomUUID()}.md`;
+    const res = await ingestItem(db(), auth, slackPayload("old thread", path, []), "team", { authorMemberId: root });
+    const c = (await resolveItemCredit(db(), seed.teamId, [res.id])).get(res.id)!;
+    expect(c.contributors).toEqual(["Tester"]);
+  });
+});
