@@ -55,13 +55,24 @@ export async function DataBrowser({
   // 1) Channel list — group a bounded recent window of visible items by path prefix.
   let chQuery = db
     .from("items")
-    .select("path, synced_at")
+    // `frontmatter` supplies the channel's DISPLAY name: Slack paths are keyed on the immutable
+    // channel ID (so a rename can't re-key threads into duplicates), which means the path segment is
+    // an opaque id and the readable `#name` lives in frontmatter.
+    .select("path, synced_at, frontmatter")
     .eq("team_id", team.id)
     .order("synced_at", { ascending: false })
     .limit(CHANNEL_SCAN_CAP);
   chQuery = visibleItems(chQuery, tier); // external viewers never see team/admin content
   const { data: chRows } = await chQuery;
-  const channels = groupChannels((chRows ?? []) as ChannelRow[]);
+  const channels = groupChannels(
+    ((chRows ?? []) as { path: string; synced_at: string | Date; frontmatter: Record<string, unknown> | null }[]).map(
+      (r) => ({
+        path: r.path,
+        synced_at: r.synced_at,
+        label: typeof r.frontmatter?.channel === "string" ? r.frontmatter.channel : null,
+      })
+    ) as ChannelRow[]
+  );
 
   const selected =
     channelParam && channels.some((c) => c.key === channelParam) ? channelParam : channels[0]?.key ?? null;

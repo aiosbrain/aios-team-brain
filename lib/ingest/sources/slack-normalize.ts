@@ -86,7 +86,18 @@ function threadTitle(thread: FetchedThread, opts: NormalizeOpts): string {
 
 export function normalizeThread(thread: FetchedThread, opts: NormalizeOpts): ItemPayload {
   const { root, replies } = thread;
-  const channelSeg = safeSegment(opts.channelName || opts.channelId);
+  // PATH IDENTITY = the immutable channel ID, never the display name. The name is mutable and
+  // lossy, and the path is the item's identity, so keying on it meant:
+  //  • a channel RENAME re-keyed every thread → a duplicate item per thread, and nothing ever
+  //    diff-deletes those, so both copies persist in retrieval, credit and the timeline forever;
+  //  • `safeSegment` strips everything outside [a-z0-9_-], so a CJK/emoji channel name collapsed to
+  //    the empty string and fell back to a shared folder — and Slack `ts` is unique only WITHIN a
+  //    channel, so two such channels could collide on one path and overwrite each other's content.
+  // The display name stays in `frontmatter.channel` (what the Data page and titles render).
+  // `safeSegment` already supplies its own non-empty fallback, so this is the whole identity: a
+  // channel id that somehow stripped to nothing lands in the shared fallback folder (unreachable —
+  // channelIds is schema-validated non-empty and Slack ids are uppercase alphanumeric).
+  const channelSeg = safeSegment(opts.channelId);
 
   const parts = [renderMessage(root, opts)];
   for (const r of replies) parts.push(renderMessage(r, opts));

@@ -256,6 +256,36 @@ export function parseChannelScope(question: string): { channel: string | null; c
 }
 
 /**
+ * The PATH SEGMENT a channel name lives under, for the soft recency legs.
+ *
+ * `parseChannelScope` yields a NAME ("#growth" → `growth`), and for sources that key paths by name
+ * (`linear/aio/…`) that name IS the 2nd path segment. Slack is different: its paths are keyed on the
+ * immutable channel ID so a rename can't re-key every thread into duplicate items, which leaves the
+ * segment opaque (`slack/c0b8v119g4d/…`) and the readable name in `frontmatter.channel`. So resolve
+ * name → segment once; a name that resolves to nothing (non-Slack sources) falls back to itself,
+ * preserving the previous behavior exactly.
+ *
+ * One small indexed lookup, and ONLY when the question actually names a channel. It exists because
+ * the pg adapter has no `.or()` — the precise FTS leg matches both arms in one SQL predicate.
+ */
+async function resolveChannelSegment(
+  db: DbClient,
+  teamId: string,
+  tier: "team" | "external",
+  channel: string
+): Promise<string> {
+  // Tier-filtered like every other read (CLAUDE.md §5 — no RLS backstop). The legs this feeds are
+  // themselves tier-scoped, so nothing leaks either way; re-applying it here keeps the invariant
+  // "every items read carries the filter" true by inspection rather than by argument.
+  let q = db.from("items").select("path").eq("team_id", teamId).eq("frontmatter->>channel", channel).limit(1);
+  if (isRestrictedTier(tier)) q = q.eq("access", "external");
+  const { data } = await q;
+  const path = (data as { path: string }[] | null)?.[0]?.path;
+  const seg = path ? path.split("/")[1] : "";
+  return seg || channel;
+}
+
+/**
  * Detect an explicit SOURCE scope — a query naming an ingestion source it wants the recent content
  * FROM ("what's the conversation in slack right now", "latest notion docs", "what's on linear"). Generic
  * content-similarity ranking BURIES such items: a Slack thread matches the query only on the single word
@@ -507,9 +537,11 @@ async function nativeRetrieve(
     .order("synced_at", { ascending: false })
     .limit(8);
   if (isRestrictedTier(tier)) recentB = recentB.eq("access", "external");
-  // Channel scope (Gap #4) — keep the recency fallback inside the same channel. LIKE on the 2nd
-  // path segment; the FTS leg uses a precise split_part match, this soft filter is fine for padding.
-  if (channel) recentB = recentB.like("path", `%/${channel}/%`);
+  // Channel scope (Gap #4) — keep the recency fallback inside the same channel. LIKE on the 2nd path
+  // segment, resolved from the name first (Slack's segment is its channel ID — see
+  // resolveChannelSegment); the FTS leg does the precise matching, this soft filter is padding.
+  const channelSeg = channel ? await resolveChannelSegment(db, teamId, tier, channel) : null;
+  if (channelSeg) recentB = recentB.like("path", `%/${channelSeg}/%`);
 
   // 2a. SOURCE-scoped recency: when the question names a source, pull its most-recent items by
   // `synced_at` REGARDLESS of keyword rank (the recall fix for "what's the conversation in slack" —
@@ -525,7 +557,7 @@ async function nativeRetrieve(
       .order("synced_at", { ascending: false })
       .limit(SOURCE_RECENCY_LIMIT);
     if (isRestrictedTier(tier)) sourceRecencyB = sourceRecencyB.eq("access", "external");
-    if (channel) sourceRecencyB = sourceRecencyB.like("path", `%/${channel}/%`);
+    if (channelSeg) sourceRecencyB = sourceRecencyB.like("path", `%/${channelSeg}/%`);
   }
 
   // 3. Structured-context query builders (awaited together with the above).

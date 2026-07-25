@@ -85,11 +85,11 @@ export class SlackClient {
       });
       return r.channel.name ?? channelId;
     } catch (err) {
-      // A missing scope is stable: this channel always resolves to its id, so its thread paths are
-      // consistent tick over tick. A TRANSIENT failure is not — and the blast radius here is worse
-      // than anywhere else in this client, because the name is the PATH KEY: falling back to the id
-      // for one tick re-keys every thread to `slack/<C0123>/…` and CREATES a duplicate item per
-      // thread. Nothing diff-deletes those, so unlike a churned body they pollute retrieval forever.
+      // Paths are keyed on the immutable channel ID now, so a name flake no longer re-keys threads —
+      // it only affects the DISPLAY name (`frontmatter.channel`, the thread title, the Data page). We
+      // still skip on a transient failure rather than persist a wrong name: the frontmatter heal
+      // rewrites `channel` on every unchanged re-push, so one bad tick would relabel the whole
+      // channel's items (and the Data page picks the most recently synced name).
       if (!isMissingScopeError(err)) throw err;
       return channelId; // private channel without the scope — a stable fallback
     }

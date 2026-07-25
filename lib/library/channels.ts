@@ -13,6 +13,14 @@ export interface ChannelRow {
   // The pg adapter returns timestamptz as a Date, not an ISO string (the #134 gotcha) — accept
   // both so the caller can pass rows straight through. Normalized to an ISO string internally.
   synced_at: string | Date;
+  /**
+   * Human display name for the channel, when the source knows one the PATH doesn't carry. Slack keys
+   * its paths on the immutable channel ID (a rename must not re-key every thread into duplicate
+   * items), so `slack/c0b8v119g4d` has no readable segment — the real `#all-vibrana` comes from the
+   * item's `frontmatter.channel`. Sources whose segment is already readable (linear/github/plane)
+   * pass nothing and keep deriving the name from the path.
+   */
+  label?: string | null;
 }
 
 export interface Channel {
@@ -23,7 +31,8 @@ export interface Channel {
   lastSyncedAt: string;
 }
 
-/** `slack/eng/123.md` → { key: "slack/eng", source: "slack", name: "eng" }. */
+/** `slack/eng/123.md` → { key: "slack/eng", source: "slack", name: "eng" }. `key` stays the PATH
+ *  prefix (it's also the feed query `<key>/%`); only the display `name` may be overridden by a label. */
 export function parseChannel(path: string): { key: string; source: string; name: string } {
   const segs = path.split("/").filter(Boolean);
   if (segs.length >= 2) return { key: `${segs[0]}/${segs[1]}`, source: segs[0], name: segs[1] };
@@ -39,16 +48,27 @@ function isoOf(v: string | Date): string {
 /** Group rows into channels with item counts + most-recent arrival, sorted by recency (newest first). */
 export function groupChannels(rows: ChannelRow[]): Channel[] {
   const byKey = new Map<string, Channel>();
+  // Tracks WHEN each channel's current display label was observed, so the most recently synced name
+  // wins. Input order is not assumed (a caller may pass rows in any order), and after a rename the
+  // older rows still carry the old name — picking by recency is what makes the new name show.
+  const labelAt = new Map<string, number>();
   for (const row of rows) {
     const { key, source, name } = parseChannel(row.path);
+    const label = row.label?.trim() || "";
     const syncedAt = isoOf(row.synced_at);
+    const ms = Date.parse(syncedAt);
     const existing = byKey.get(key);
     if (!existing) {
-      byKey.set(key, { key, source, name, count: 1, lastSyncedAt: syncedAt });
+      byKey.set(key, { key, source, name: label || name, count: 1, lastSyncedAt: syncedAt });
+      if (label) labelAt.set(key, ms);
     } else {
       existing.count += 1;
+      if (label && ms >= (labelAt.get(key) ?? -Infinity)) {
+        existing.name = label;
+        labelAt.set(key, ms);
+      }
       // Compare by epoch ms — mixed "Z"/offset ISO forms don't sort lexicographically.
-      if (Date.parse(syncedAt) > Date.parse(existing.lastSyncedAt)) existing.lastSyncedAt = syncedAt;
+      if (ms > Date.parse(existing.lastSyncedAt)) existing.lastSyncedAt = syncedAt;
     }
   }
   return [...byKey.values()].sort((a, b) => Date.parse(b.lastSyncedAt) - Date.parse(a.lastSyncedAt));
