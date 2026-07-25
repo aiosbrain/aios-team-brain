@@ -22,10 +22,23 @@ import { join } from "node:path";
 const ROOT = join(import.meta.dirname, "..", "..");
 const SCAN_DIRS = ["app", "lib", "scripts"];
 
-/** `.from(<identifier or member expression>)` immediately followed by a mutating verb. A string literal
- *  is deliberately NOT matched — that's what the per-table single-writer guards already cover. */
+/**
+ * `.from(<anything that isn't a plain string literal>)` followed by a mutating verb.
+ *
+ * Written as an EXCLUSION rather than a list of expression shapes on purpose. The first version matched
+ * only bare identifiers and member expressions, which left `from(TABLES[i])`, `from(tbl as string)`,
+ * `from(getTable())` and `from(\`${t}\`)` walking straight through — and a bracket-indexed loop is one of
+ * the most natural ways to write the very thing this guard exists to catch. Anything that isn't a
+ * literal is now suspicious by default; literals are left to the per-table single-writer guards.
+ *
+ * The first character may not be `'` or `"` (those are the plain string literals the per-table guards
+ * own) but a BACKTICK is fair game: a template literal is dynamic, and no per-table guard matches one
+ * either, so `from(\`${prefix}_items\`)` would otherwise be unguarded by everything. The optional
+ * newline lets the verb sit on the next line (prettier wraps these), and one level of nested parens is
+ * tolerated so a call expression (`from(getTable())`) doesn't terminate the match early.
+ */
 const DYNAMIC_WRITE_RE =
-  /\.from\(\s*([A-Za-z_$][\w$]*(?:\.[\w$]+)*)\s*\)\s*(?:\r?\n\s*)?\.\s*(insert|update|upsert|delete)\b/g;
+  /\.from\(\s*([^)'"\s](?:[^()]|\([^()]*\))*?)\s*\)\s*(?:\r?\n\s*)?\.\s*(insert|update|upsert|delete)\b/g;
 
 const ALLOWED: { file: string; why: string }[] = [
   {
@@ -79,13 +92,29 @@ describe("guard: dynamic-table writes can't bypass the single-writer guards", ()
     ).toEqual([]);
   });
 
-  it("is non-vacuous: the pattern it looks for is actually detectable", () => {
+  it("is non-vacuous: catches every dynamic shape, and leaves literals to the per-table guards", () => {
     // Pins the regex itself. A refactor that broke the match would otherwise make this guard silently
-    // pass forever — the exact failure mode it exists to prevent, one level up.
-    const sample = `await db.from(table).update({ access: "team" }).eq("id", id);`;
-    expect([...sample.matchAll(DYNAMIC_WRITE_RE)]).toHaveLength(1);
-    // …and that a literal table name is left to the per-table guards.
-    const literal = `await db.from("media_assets").update({ access: "team" });`;
-    expect([...literal.matchAll(DYNAMIC_WRITE_RE)]).toHaveLength(0);
+    // pass forever — the exact failure mode it exists to prevent, one level up. Each shape below is one
+    // a real refactor could plausibly produce; the first version of this guard missed all but the first.
+    const caught = [
+      `await db.from(table).update({ access: "team" }).eq("id", id);`,
+      `await db.from(TABLES[i]).update({ access: "team" });`,
+      `await db.from(tbl as string).delete();`,
+      `await db.from(getTable()).insert(row);`,
+      "await db.from(`${prefix}_items`).upsert(row);",
+      `await db\n  .from(cfg.table)\n  .update({ access: "team" });`,
+    ];
+    for (const src of caught) {
+      expect([...src.matchAll(DYNAMIC_WRITE_RE)], src).toHaveLength(1);
+    }
+
+    const ignored = [
+      `await db.from("media_assets").update({ access: "team" });`, // literal → per-table guards
+      `await db.from('media_assets').delete();`,
+      `const rows = await db.from(table).select("id");`, // a READ can't break an invariant
+    ];
+    for (const src of ignored) {
+      expect([...src.matchAll(DYNAMIC_WRITE_RE)], src).toHaveLength(0);
+    }
   });
 });

@@ -1823,7 +1823,7 @@ create table if not exists social_opportunities (
   source_type text not null,                -- 'manual' | 'item' | 'commit' | 'decision' | …
   title text not null,
   summary text not null default '',
-  evidence jsonb not null default '[]',     -- [{item_id, path, note}] — provenance to brain knowledge
+  evidence jsonb not null default '[]',     -- [{itemId, path, note}] — provenance to brain knowledge. camelCase: every producer serializes the TS `Evidence` type verbatim, and lib/social/store's reclassification cascade matches on `itemId`
   topics jsonb not null default '[]',
   audiences jsonb not null default '[]',
   novelty_score numeric(4, 3) not null default 0,

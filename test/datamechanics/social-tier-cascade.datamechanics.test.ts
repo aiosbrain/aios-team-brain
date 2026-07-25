@@ -4,6 +4,7 @@ import {
   createPlan,
   addVariant,
   listOpportunities,
+  narrowSocialChainForItem,
 } from "@/lib/social/store";
 import { db, ingest, seedTeam } from "./helpers";
 
@@ -31,6 +32,7 @@ async function chainAccess(teamId: string) {
     opportunities: await pick("social_opportunities"),
     plans: await pick("content_plans"),
     variants: await pick("content_variants"),
+    approvals: await pick("content_approvals"),
     media: await pick("media_assets"),
     publications: await pick("social_publications"),
     analytics: await pick("publication_analytics"),
@@ -40,6 +42,9 @@ async function chainAccess(teamId: string) {
 /** The three tables below the variant, each owned by a different module. Seeded directly because their
  *  creation paths need a provider/generation round-trip this spec doesn't care about. */
 async function seedBelowVariant(teamId: string, variantId: string, access: "team" | "external") {
+  await db()
+    .from("content_approvals")
+    .insert({ team_id: teamId, variant_id: variantId, access, status: "pending" });
   await db()
     .from("media_assets")
     .insert({ team_id: teamId, variant_id: variantId, access, provider: "test", model: "m", data_base64: "x" });
@@ -93,6 +98,7 @@ describe("social chain follows a narrowed evidence item (real Postgres)", () => 
       opportunities: ["external"],
       plans: ["external"],
       variants: ["external"],
+      approvals: ["external"],
       media: ["external"],
       publications: ["external"],
       analytics: ["external"],
@@ -111,10 +117,51 @@ describe("social chain follows a narrowed evidence item (real Postgres)", () => 
       opportunities: ["team"],
       plans: ["team"],
       variants: ["team"],
+      approvals: ["team"],
       media: ["team"],
       publications: ["team"],
       analytics: ["team"],
     });
+  });
+
+  it("finishes the walk after a crash partway through it (idempotent, not anchored on the current tier)", async () => {
+    // The statements autocommit — there is no enclosing transaction — so a mid-walk failure is real:
+    // the opportunity narrows, then the plan update throws. If the candidate scan were anchored on
+    // `access = 'external'` AT THE OPPORTUNITY (the obvious way to write it), the retry would find
+    // nothing citing this item, return 0, and leave the plan and variant — the actual derived post body,
+    // still publishable — at `external` FOREVER. That is the same permanent over-exposure this whole
+    // cascade exists to remove, reintroduced by the cascade's own failure path.
+    //
+    // Simulated here by narrowing ONLY the opportunity (the exact state a crash at that point leaves)
+    // and then asking the cascade to finish.
+    const seed = await seedTeam();
+    const item = await ingest(seed, {
+      kind: "deliverable",
+      path: "docs/spec.md",
+      body: "the client-visible spec",
+      access: "external",
+    });
+    const { opp } = await seedChain(seed.teamId, "external", item.id, "opp-crash");
+    await db()
+      .from("social_opportunities")
+      .update({ access: "team" })
+      .eq("team_id", seed.teamId)
+      .eq("id", opp.id);
+
+    const moved = await narrowSocialChainForItem(db(), seed.teamId, item.id);
+
+    expect(await chainAccess(seed.teamId)).toEqual({
+      opportunities: ["team"],
+      plans: ["team"],
+      variants: ["team"],
+      approvals: ["team"],
+      media: ["team"],
+      publications: ["team"],
+      analytics: ["team"],
+    });
+    // Nothing MOVED at the opportunity level this pass, so the audit stream stays quiet rather than
+    // emitting a duplicate `social.tier_narrowed` for a chain that was already recorded.
+    expect(moved).toBe(0);
   });
 
   it("stops serving it on the external read path — the observable leak", async () => {
@@ -176,6 +223,7 @@ describe("social chain follows a narrowed evidence item (real Postgres)", () => 
       opportunities: ["team"],
       plans: ["team"],
       variants: ["team"],
+      approvals: ["team"],
       media: ["team"],
       publications: ["team"],
       analytics: ["team"],
@@ -193,6 +241,7 @@ describe("social chain follows a narrowed evidence item (real Postgres)", () => 
       opportunities: ["team"],
       plans: ["team"],
       variants: ["team"],
+      approvals: ["team"],
       media: ["team"],
       publications: ["team"],
       analytics: ["team"],

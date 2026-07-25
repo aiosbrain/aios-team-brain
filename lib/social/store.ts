@@ -3,6 +3,7 @@ import type { DbClient } from "@/lib/db/types";
 import { visibleByAccess, type ViewerTier } from "@/lib/auth/visibility";
 import { audit } from "@/lib/api/audit";
 import { narrowMediaAssetsForVariants } from "@/lib/media/store";
+import { narrowApprovalsForVariants } from "./approvals";
 import { narrowPublicationsForVariants } from "./publications";
 import { narrowAnalyticsForPublications } from "./analytics";
 import { TierLeakError, violatesEvidenceTier } from "./tier";
@@ -348,7 +349,11 @@ async function idsIn(
  * the ceiling is a limit, not a target, and turning internal-derived narrative public is a human
  * decision. Nothing on this path ever sets `access = 'external'`.
  *
- * NOT best-effort: a row left at the old tier IS the leak, so failures propagate to the caller.
+ * NOT best-effort: a row left at the old tier IS the leak, so failures propagate to the caller — and
+ * because the walk is anchored on the evidence match rather than on the rows' current tier, it is
+ * IDEMPOTENT: whatever a failed attempt already narrowed, the retry simply re-narrows. That, not the
+ * write order, is what makes a partial failure recoverable (each statement autocommits; there is no
+ * enclosing transaction).
  *
  * Each table is narrowed by ITS OWN single-writer module (`lib/media/store`, `lib/social/publications`,
  * `lib/social/analytics`) rather than from here — writing them directly would work, and would even slip
@@ -365,25 +370,33 @@ export async function narrowSocialChainForItem(
   teamId: string,
   itemId: string
 ): Promise<number> {
+  // The scan is anchored on the EVIDENCE MATCH ALONE — deliberately NOT on `access = 'external'`.
+  //
+  // These statements each autocommit (no enclosing transaction), so a mid-walk failure is real: the
+  // opportunity narrows, then the plan update throws. If the anchor also required the opportunity to be
+  // `external`, the retry would find nothing citing this item, return 0, and leave the plan/variant —
+  // the actual derived post body, still publishable — at `external` FOREVER. Anchoring on the evidence
+  // makes the whole walk idempotent, so every retry re-narrows the full chain regardless of how far the
+  // previous attempt got. (Verified to that outcome by a spec that simulates the crash point.)
   const { data, error } = await db
     .from("social_opportunities")
-    .select("id, evidence")
-    .eq("team_id", teamId)
-    .eq("access", "external");
+    .select("id, evidence, access")
+    .eq("team_id", teamId);
   if (error) throw new Error(`narrowSocialChain: opportunity scan failed: ${error.message}`);
 
-  const affected = ((data ?? []) as { id: string; evidence: unknown }[])
-    .filter((row) =>
-      (Array.isArray(row.evidence) ? (row.evidence as Evidence[]) : []).some((e) => e?.itemId === itemId)
-    )
-    .map((row) => row.id);
-  if (affected.length === 0) return 0;
+  const citing = ((data ?? []) as { id: string; evidence: unknown; access: AccessTier }[]).filter((row) =>
+    (Array.isArray(row.evidence) ? (row.evidence as Evidence[]) : []).some((e) => e?.itemId === itemId)
+  );
+  if (citing.length === 0) return 0;
+
+  const affected = citing.map((row) => row.id);
+  // Only the ones actually moving THIS pass get audited + counted, so a retry that re-walks an
+  // already-narrowed chain is silent instead of emitting a duplicate `social.tier_narrowed` row.
+  const moving = citing.filter((row) => row.access === "external").map((row) => row.id);
 
   const planIds = await idsIn(db, "content_plans", teamId, "opportunity_id", affected);
   const variantIds = await idsIn(db, "content_variants", teamId, "plan_id", planIds);
 
-  // Ancestors first, so a failure partway leaves the chain narrowed from the TOP down — the fail-closed
-  // direction, and the next reclassification of the same item retries the whole walk.
   const { error: oppErr } = await db
     .from("social_opportunities")
     .update({ access: "team" })
@@ -409,11 +422,12 @@ export async function narrowSocialChainForItem(
   }
 
   // Below the variant, each table has a different owner — call theirs.
+  await narrowApprovalsForVariants(db, teamId, variantIds);
   await narrowMediaAssetsForVariants(db, teamId, variantIds);
   const publicationIds = await narrowPublicationsForVariants(db, teamId, variantIds);
   await narrowAnalyticsForPublications(db, teamId, publicationIds);
 
-  for (const opportunityId of affected) {
+  for (const opportunityId of moving) {
     await audit(db, {
       team_id: teamId,
       actor_kind: "system",
@@ -430,5 +444,5 @@ export async function narrowSocialChainForItem(
       },
     });
   }
-  return affected.length;
+  return moving.length;
 }
