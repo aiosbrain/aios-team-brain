@@ -49,8 +49,9 @@ interface CacheEntry {
 
 // In-memory cache (per process), fronting the Postgres row. Keyed by `${teamId}:${tier}`.
 const mem = new Map<string, CacheEntry>();
-// Keys refreshing in the background, so N concurrent stale reads fire ONE rebuild.
-const refreshing = new Set<string>();
+// Keys refreshing in the background, so N concurrent stale reads fire ONE rebuild. The PROMISE is
+// retained (not just the key) so an in-flight rebuild can be awaited — see `settleTimelineRefreshes`.
+const refreshing = new Map<string, Promise<void>>();
 
 const memKey = (teamId: string, tier: ViewerTier): string => `${teamId}:${tier}`;
 
@@ -125,10 +126,13 @@ export async function bustTeamTimeline(db: DbClient, teamId: string): Promise<vo
 function refreshInBackground(teamId: string, tier: ViewerTier): void {
   const key = memKey(teamId, tier);
   if (refreshing.has(key)) return;
-  refreshing.add(key);
-  void (async () => {
-    const bg = adminClient();
+  const task = (async () => {
+    // EVERYTHING inside the try, including client construction: the promise must not settle before
+    // `refreshing.set(key, task)` below runs. A synchronous throw here would settle it immediately,
+    // stranding a settled promise in the map — which would suppress that key's rebuilds for the life
+    // of the process and make `settleTimelineRefreshes` reject. Cheap to make structurally impossible.
     try {
+      const bg = adminClient();
       const days = await buildTimeline(bg, teamId, tier);
       mem.set(key, { days, at: Date.now() });
       await writeTimelineCache(bg, teamId, tier, days);
@@ -138,6 +142,19 @@ function refreshInBackground(teamId: string, tier: ViewerTier): void {
       refreshing.delete(key);
     }
   })();
+  refreshing.set(key, task);
+}
+
+/**
+ * Await every in-flight background rebuild. Callers of `getCachedWorkTimeline` never need this — the
+ * whole point of SWR is that they don't wait — but a test asserting the REBUILT payload otherwise has
+ * to poll on a timeout, which is a race dressed up as a test (it failed ~1 in 3 on a loaded runner,
+ * costing real CI cycles). Awaiting the actual promise makes that deterministic. Also the honest hook
+ * for a graceful shutdown that wants in-flight writes to land. Never throws: the task swallows its own
+ * errors, so this resolves even when a rebuild failed.
+ */
+export async function settleTimelineRefreshes(): Promise<void> {
+  await Promise.all([...refreshing.values()]);
 }
 
 /**

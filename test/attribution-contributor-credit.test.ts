@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { creditedContributorIds, creditedPrimaryId, resolveItemCreditIds, slackContributors } from "@/lib/attribution/contributor-credit";
+import { creditedContributorIds, creditedPrimaryId, resolveItemCreditIds } from "@/lib/attribution/contributor-credit";
 import type { DbClient } from "@/lib/db/types";
 
 /** Minimal chainable fake db: each `from(table)` resolves to a preset `{data, error}` for that table. */
@@ -84,40 +84,5 @@ describe("resolveItemCreditIds strict vs best-effort error handling", () => {
     const out = await resolveItemCreditIds(db, "team", ["i1"]); // no strict
     // Versions unreadable → treated as no version history → credit falls back to the current owner.
     expect(out.get("i1")?.primaryId).toBe("m1");
-  });
-});
-
-/**
- * Spec for the CONVERSATION work ledger. A Slack thread is ONE item rewritten on every reply, and each
- * version is stamped with the thread-ROOT author — so version authors are not the people who worked.
- * `participants[]` is, and this pins the extraction the credit oracle relies on.
- */
-describe("slackContributors (the conversation work ledger)", () => {
-  it("returns every distinct participant in work order (oldest last-message first)", () => {
-    expect(
-      slackContributors({
-        source: "slack",
-        participants: [
-          { author_id: "UROOT", last_ts: "2026-07-01T10:00:00Z" },
-          { author_id: "UREPLY", last_ts: "2026-07-03T10:00:00Z" },
-          { author_id: "UMID", last_ts: "2026-07-02T10:00:00Z" },
-        ],
-      })
-    ).toEqual(["UROOT", "UMID", "UREPLY"]);
-  });
-
-  it("is empty for a non-Slack item (versions stay in charge)", () => {
-    expect(slackContributors({ source: "github", participants: [{ author_id: "U1" }] })).toEqual([]);
-  });
-
-  it("is empty for a Slack thread with no participants ledger (pre-ledger items)", () => {
-    expect(slackContributors({ source: "slack" })).toEqual([]);
-    expect(slackContributors(null)).toEqual([]);
-  });
-
-  it("ignores malformed entries rather than crediting a blank", () => {
-    expect(
-      slackContributors({ source: "slack", participants: [{ author_id: "" }, { author_id: 42 }, { author_id: "U9" }] })
-    ).toEqual(["U9"]);
   });
 });

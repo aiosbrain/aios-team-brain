@@ -1,7 +1,8 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import { db, ingest, seedTeam, type Seed } from "./helpers";
 import {
   getCachedWorkTimeline,
+  settleTimelineRefreshes,
   readTimelineCache,
   bustTeamTimeline,
 } from "@/lib/dashboard/timeline-cache";
@@ -84,6 +85,13 @@ describe("work-timeline cache layer (real Postgres)", () => {
       people.reduce((n, p) => n + p.tasks.reduce((a, t) => a + t.evidenceCount, 0) + p.other.reduce((a, g) => a + g.count, 0), 0);
     expect(evCount(first.flatMap((d) => d.people))).toBe(1);
 
+    // Settle the COLD-MISS path's own background pass (it adds per-person synopses) before going on.
+    // Rebuilds are deduped by key, so a still-in-flight one makes the next stale read a NO-OP — the
+    // payload would then never pick up commit-b and this test would fail ~1 in 5 for a reason that has
+    // nothing to do with what it asserts. (That dedup is deliberate SWR behavior in production: the
+    // work lands on the following read instead.)
+    await settleTimelineRefreshes();
+
     // New work lands, then the row is marked stale (+ in-memory evicted) — the re-attribution path.
     await seedCommit(seed, "commit-b", recentIso());
     await bustTeamTimeline(db(), seed.teamId);
@@ -92,15 +100,13 @@ describe("work-timeline cache layer (real Postgres)", () => {
     const staleServe = await getCachedWorkTimeline(db(), seed.teamId, "team");
     expect(evCount(staleServe.flatMap((d) => d.people))).toBe(1); // served stale, not yet rebuilt
 
-    // The deduped background rebuild lands the new payload (2 items) into the persisted row.
-    await vi.waitFor(
-      async () => {
-        const row = await readRow(seed.teamId, "team");
-        const days = ((row?.payload as { days?: { people: { tasks: { evidenceCount: number }[]; other: { count: number }[] }[] }[] })?.days) ?? [];
-        expect(evCount(days.flatMap((d) => d.people))).toBe(2);
-      },
-      { timeout: 3_000, interval: 50 }
-    );
+    // The deduped background rebuild lands the new payload (2 items) into the persisted row. Await the
+    // actual in-flight promise rather than polling a timeout — the rebuild does real DB work, so a fixed
+    // budget is a race, not an assertion (this failed ~1 in 3 on a loaded runner).
+    await settleTimelineRefreshes();
+    const row = await readRow(seed.teamId, "team");
+    const days = ((row?.payload as { days?: { people: { tasks: { evidenceCount: number }[]; other: { count: number }[] }[] }[] })?.days) ?? [];
+    expect(evCount(days.flatMap((d) => d.people))).toBe(2);
   });
 
   it("bustTeamTimeline marks the row stale (computed_at older than the TTL)", async () => {

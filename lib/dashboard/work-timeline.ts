@@ -17,6 +17,7 @@ import {
 } from "./timeline-group";
 import { computeTaskLinks } from "./issue-ref";
 import { resolveItemCreditIds } from "@/lib/attribution/contributor-credit";
+import { slackParticipations, foldProviderId } from "@/lib/ingest/slack-participants";
 
 // Only ACTIVE tasks are considered work "in progress" — Linear In Progress/In Review both normalize to
 // `in_progress`; `blocked` is active-but-stuck. Backlog/ready/done are context, excluded from the timeline.
@@ -166,7 +167,7 @@ export async function getWorkTimeline(
   if (slackIdRes.error) console.warn("[work-timeline] slack identities read failed:", slackIdRes.error.message);
   const slackIdToMember = new Map<string, string>();
   for (const r of (slackIdRes.data ?? []) as { external_id: string | null; member_id: string | null }[]) {
-    if (r.external_id && r.member_id) slackIdToMember.set(r.external_id.toLowerCase(), r.member_id);
+    if (r.external_id && r.member_id) slackIdToMember.set(foldProviderId(r.external_id), r.member_id);
   }
 
   // A task's source = the team's PM provider (linear/plane). With none configured, use a generic
@@ -324,15 +325,15 @@ export async function getWorkTimeline(
   for (const r of (slackRes.data ?? []) as ItemRow[]) {
     const fm = r.frontmatter ?? {};
     const title = str(fm.title) || `#${str(fm.channel) ?? "slack"} thread`;
-    const participants = Array.isArray(fm.participants) ? (fm.participants as { author_id?: unknown; last_ts?: unknown }[]) : [];
-    const seen = new Set<string>(); // stored frontmatter is pusher-shaped — dedup so a duplicate author entry can't emit two rows with the same synthetic id (React key collision).
-    for (const p of participants) {
-      const authorId = str(p?.author_id);
-      const memberId = authorId ? slackIdToMember.get(authorId.toLowerCase()) : undefined;
+    // Parsed by the SHARED ledger reader (`lib/ingest/slack-participants`) — the same one the credit
+    // oracle uses, so the two surfaces can't drift on dedup or id case again. It already returns one
+    // entry per distinct author (their latest contribution time), which also keeps the synthetic row
+    // id unique per (thread, participant).
+    for (const p of slackParticipations(fm)) {
+      const authorId = p.authorId;
+      const memberId = slackIdToMember.get(foldProviderId(authorId));
       if (!memberId || !members.has(memberId)) continue;
-      if (seen.has(authorId!)) continue;
-      seen.add(authorId!);
-      const at = str(p?.last_ts);
+      const at = p.lastTs;
       if (!at || !inWindow(at)) continue;
       // One row per (thread, participant); text = title (no body fetch — a thread citing an issue key in
       // its first line still links to a task, else it lands in "Other").
