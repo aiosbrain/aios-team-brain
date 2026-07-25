@@ -3,6 +3,7 @@ import type { DbClient } from "@/lib/db/types";
 import { audit } from "@/lib/api/audit";
 import type { AccessTier } from "@/lib/graph/group";
 import { purgeExternalTierCaches } from "@/lib/cache/tier-invalidation";
+import { narrowSocialChainForItem } from "@/lib/social/store";
 import { staleArcCache } from "@/lib/graph/arc-cache";
 import { bustTeamTimeline } from "@/lib/dashboard/timeline-cache";
 
@@ -44,12 +45,11 @@ import { bustTeamTimeline } from "@/lib/dashboard/timeline-cache";
  *  `decisions` is deliberately absent: a decision row's audience is a per-row wire field, not inherited
  *  (see the decisions-audience data-mechanics test).
  *
- *  KNOWN GAP — the social chain (`social_opportunities` and the `content_plans`/`content_variants`/
- *  `social_publications`/`publication_analytics` rows below it) also carries a denormalized `access`
- *  derived from its evidence items, and is NOT cascaded here: its evidence is a jsonb `[{item_id,…}]`
- *  array rather than a `source_item_id` column, so it needs a different query shape. An opportunity
- *  whose summary derives from an item later narrowed external→team therefore keeps serving that derived
- *  text externally, with no TTL to bound it. Tracked, not fixed here — do not read this list as complete.
+ *  The social chain (`social_opportunities` → plans/variants/media/publications/analytics) also carries
+ *  a denormalized `access`, but it is NOT in this list: it inherits from EVIDENCE (a jsonb
+ *  `[{itemId,…}]` array), not from a `source_item_id` column, so it needs a different query shape and
+ *  a re-application of the evidence CEILING rather than a straight copy. `narrowSocialChainForItem`
+ *  handles it, called below.
  */
 const INHERITING_TABLES = ["tasks", "extracted_facts", "stakeholder_mentions"] as const;
 
@@ -69,6 +69,7 @@ export interface Reclassification {
  */
 export async function cascadeInheritedAudience(
   db: DbClient,
+  teamId: string,
   itemId: string,
   to: AccessTier
 ): Promise<void> {
@@ -76,6 +77,11 @@ export async function cascadeInheritedAudience(
     const { error } = await db.from(table).update({ audience: to }).eq("source_item_id", itemId);
     if (error) throw new Error(`${table} audience cascade failed: ${error.message}`);
   }
+  // The social chain inherits its tier from EVIDENCE rather than a `source_item_id` column, so it can't
+  // join the loop above — its own writer re-applies the evidence ceiling and walks the derived rows down
+  // (`lib/social/store`, keeping that table's single-writer rule intact). Narrowing only: the ceiling is
+  // a limit, not a target, so widening an item never auto-publishes anything derived from it.
+  if (to === "team") await narrowSocialChainForItem(db, teamId, itemId);
 }
 
 /**

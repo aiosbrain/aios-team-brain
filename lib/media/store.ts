@@ -143,3 +143,24 @@ export async function releaseImageSlot(_db: DbClient, teamId: string, now: Date)
     [teamId, utcDay(now)]
   );
 }
+
+/**
+ * Narrow generated media to `team` for a set of variants. Called by the social tier cascade
+ * (`lib/social/store.narrowSocialChainForItem`) when an evidence item is reclassified external→team:
+ * an image generated from now-internal knowledge must stop being readable on the client-facing surface.
+ * Lives here because `media_assets` is this module's table (single-writer, CLAUDE.md §2) — the cascade
+ * calls in rather than reaching across. Narrowing only; nothing here ever widens.
+ */
+export async function narrowMediaAssetsForVariants(
+  db: DbClient,
+  teamId: string,
+  variantIds: string[]
+): Promise<void> {
+  if (variantIds.length === 0) return;
+  const { error } = await db
+    .from("media_assets")
+    .update({ access: "team" })
+    .eq("team_id", teamId)
+    .in("variant_id", variantIds);
+  if (error) throw new Error(`narrowMediaAssetsForVariants failed: ${error.message}`);
+}

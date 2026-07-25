@@ -100,3 +100,23 @@ export async function teamAnalyticsSummary(db: DbClient, teamId: string): Promis
     shares: sum("shares"),
   };
 }
+
+/**
+ * Narrow analytics rows to `team` for a set of publications. Called by the social tier cascade
+ * (`lib/social/store.narrowSocialChainForItem`) when an evidence item is reclassified external→team.
+ * Lives here because `publication_analytics` is this module's table (single-writer, CLAUDE.md §2).
+ * Narrowing only; nothing here ever widens.
+ */
+export async function narrowAnalyticsForPublications(
+  db: DbClient,
+  teamId: string,
+  publicationIds: string[]
+): Promise<void> {
+  if (publicationIds.length === 0) return;
+  const { error } = await db
+    .from("publication_analytics")
+    .update({ access: "team" })
+    .eq("team_id", teamId)
+    .in("publication_id", publicationIds);
+  if (error) throw new Error(`narrowAnalyticsForPublications failed: ${error.message}`);
+}
