@@ -49,3 +49,17 @@ describe("buildConfig()", () => {
     });
   });
 });
+
+describe("notion — the token is the secret, the selection is what to pull", () => {
+  it("treats plain entries as page ids", () => {
+    expect(buildConfig("notion", "abc123, def456")).toEqual({ pageIds: ["abc123", "def456"] });
+  });
+
+  it("`databaseId=<id>` selects a whole database INSTEAD of pages (the connector takes one or the other)", () => {
+    expect(buildConfig("notion", "databaseId=db_42")).toEqual({ databaseId: "db_42" });
+  });
+
+  it("an empty selection is savable — a half-configured integration must not be un-persistable", () => {
+    expect(buildConfig("notion", "")).toEqual({ pageIds: [] });
+  });
+});

@@ -11,4 +11,4 @@
 -- test/guards/integrations-type-check-replay.test.ts fails the build if these ever drift apart.
 alter table integrations drop constraint if exists integrations_type_check;
 alter table integrations add constraint integrations_type_check
-  check (type in ('github','granola','slack','wise','linear','plane','openai','anthropic','google','openrouter','typefully'));
+  check (type in ('github','granola','slack','wise','linear','plane','openai','anthropic','google','openrouter','typefully','notion'));
