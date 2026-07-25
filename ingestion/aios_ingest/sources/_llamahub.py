@@ -8,10 +8,13 @@ lazy-import-with-helpful-error pattern so each adapter stays tiny.
 from __future__ import annotations
 
 import importlib
+import logging
 from typing import Any, Iterable
 
 from ..normalize import RawDoc
 from .base import MissingExtraError
+
+logger = logging.getLogger(__name__)
 
 
 def lazy_reader(module: str, cls: str, extra: str, package: str):
@@ -70,11 +73,24 @@ def docs_to_raw(
     id_keys: tuple[str, ...],
     fallback_prefix: str,
 ) -> list[RawDoc]:
-    """Convert LlamaHub Documents to RawDocs, deriving a stable external_id."""
+    """Convert LlamaHub Documents to RawDocs, deriving a stable external_id.
+
+    A document with NO id in its metadata is SKIPPED, not given a positional id. `external_id`
+    becomes the item's PATH, i.e. its identity: a positional `<prefix>-<i>` makes that identity
+    depend on iteration order, so deleting one document shifts every later one down a slot — each
+    then overwrites its neighbour's item, swapping bodies and mis-attributing version history across
+    unrelated documents. Skipping loses one document (loudly, in the run log); the fallback silently
+    corrupts the rest. Readers we use today always carry an id, so this is a trap for the NEXT
+    reader someone adds, not a live path.
+    """
     out: list[RawDoc] = []
-    for i, d in enumerate(documents):
+    skipped = 0
+    for d in documents:
         meta: dict[str, Any] = getattr(d, "metadata", None) or {}
-        external_id = _first(meta, *id_keys) or f"{fallback_prefix}-{i}"
+        external_id = _first(meta, *id_keys)
+        if not external_id:
+            skipped += 1
+            continue
         out.append(
             RawDoc(
                 source=source,
@@ -103,5 +119,14 @@ def docs_to_raw(
                 ),
                 extra_frontmatter={k: v for k, v in meta.items() if isinstance(v, (str, int, float, bool))},
             )
+        )
+    if skipped:
+        # Loud, not silent: a reader that stops emitting ids would otherwise look like a quiet source.
+        logger.warning(
+            "%s: skipped %d document(s) with no stable id in metadata (looked for %s) — "
+            "a positional fallback would corrupt item identity, so they are not ingested",
+            fallback_prefix,
+            skipped,
+            ", ".join(id_keys),
         )
     return out

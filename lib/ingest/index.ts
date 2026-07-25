@@ -231,7 +231,11 @@ export async function ingestItem(
       const healedFrontmatter: Record<string, unknown> = {
         ...(payload.frontmatter ?? {}),
       };
-      for (const key of ["author", "author_email", "author_login"]) {
+      // Author signals a connector may LOSE on a later tick. `authors[]` matters most: Notion's
+      // author enrichment is best-effort (the API returns [] on any hiccup), so without preserving it
+      // an unchanged re-push ERASES the structured authors we already resolved — and the
+      // re-attribution pass then has no raw material until the API happens to succeed again.
+      for (const key of ["author", "author_email", "author_login", "authors"]) {
         if (
           existingFrontmatter[key] !== undefined &&
           healedFrontmatter[key] === undefined

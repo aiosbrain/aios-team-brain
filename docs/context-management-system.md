@@ -87,8 +87,10 @@ validation (before any mutation) → item + version + derived-row materializatio
 - **Identity constraint** — `items` is unique on `(team_id, project_id, path)` (`schema.sql:931`): one
   live row per path. New content **replaces in place**; history goes to `item_versions`.
 - **Derived-row diff-sync** by `row_key` — `tasks`/`decisions` upsert on `(team_id, project_id,
-  row_key)`; sync-originated rows absent from a push are **diff-deleted**, but `origin='ui'` rows
-  survive (`index.ts:455`).
+  row_key)`; sync-originated rows absent from a push are **diff-deleted** (`lib/ingest/tasks`,
+  `lib/ingest/decisions`), so a retracted row stops being served as current. Hand-made rows survive:
+  tasks by `origin='ui'`, decisions by `source_item_id IS NULL` (a decision's diff is scoped to the
+  item that produced it).
 - **Semantic chunks** — `item_chunks` unique on `(item_id, chunk_idx)`; `indexItem` is idempotent on
   the item's sha and only re-embeds when the sha moved (never re-charges the embedding API for
   unchanged text — `dense-index.ts:62`).

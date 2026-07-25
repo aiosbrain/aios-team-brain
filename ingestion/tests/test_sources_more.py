@@ -49,3 +49,19 @@ def test_web_fetch_mocked(monkeypatch):
     assert len(docs) == 1
     assert docs[0].external_id == "https://example.com/a"
     assert "Content here" in docs[0].body
+
+
+def test_sidecar_slack_source_is_a_registered_no_op():
+    """Slack is synced by the brain's IN-APP runner (one item per THREAD). This sidecar source models
+    a whole CHANNEL as one document, so enabling both double-ingests every conversation under two
+    incompatible units of knowledge.
+
+    It must stay REGISTERED — an existing `type: "slack"` connection would otherwise fail the
+    operator's entire sidecar run with "unknown source" — but ingest nothing. Without this test a
+    future "fix" that restores the reader would silently reintroduce the double-ingest.
+    """
+    from aios_ingest.sources.registry import build_source
+
+    src = build_source("slack", {"token": "xoxb-x", "channel_ids": ["C1"]})
+    assert list(src.fetch()) == []          # ingests nothing
+    assert src.supports_webhook is False    # and doesn't accept-then-discard webhook payloads
