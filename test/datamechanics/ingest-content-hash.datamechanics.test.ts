@@ -112,3 +112,27 @@ describe("ingest content hash (server-authoritative change key)", () => {
     expect(await countVersions(first.id)).toBe(1);
   });
 });
+
+/**
+ * Spec: the unchanged-push frontmatter heal must not ERASE author signals a connector already
+ * resolved. Notion's author enrichment is best-effort (the API returns [] on any hiccup), so a push
+ * whose `authors[]` came back empty would otherwise wipe the structured authors already stored —
+ * leaving the re-attribution pass with no raw material until the API happens to succeed again.
+ */
+describe("frontmatter heal preserves resolved author signals", () => {
+  it("keeps a previously-stored authors[] when a later push omits it", async () => {
+    const seed = await seedTeam();
+    const body = "notion page body";
+    const path = `notion/${sha(body).slice(0, 8)}.md`;
+    const authors = [{ provider: "notion", external_id: "u1", email: "a@corp.com", role: "author" }];
+
+    await ingest(seed, { path, body, access: "team", frontmatter: { source: "notion", authors } });
+    // Same body → unchanged path → the heal runs. This push lost its authors (API hiccup).
+    const second = await ingest(seed, { path, body, access: "team", frontmatter: { source: "notion" } });
+    expect(second.status).toBe("unchanged");
+
+    const { data } = await db().from("items").select("frontmatter").eq("id", second.id).maybeSingle();
+    const fm = (data as { frontmatter: Record<string, unknown> }).frontmatter;
+    expect(fm.authors).toEqual(authors); // preserved, not erased
+  });
+});

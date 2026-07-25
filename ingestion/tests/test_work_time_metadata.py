@@ -46,3 +46,14 @@ def test_creation_time_used_when_never_edited():
 def test_no_timestamp_metadata_stays_honestly_undated():
     # We must NOT invent a time (that would date the doc to sync-time and resurface old content).
     assert _one({"page_id": "p6"}).source_ts is None
+
+
+def test_document_without_a_stable_id_is_skipped_not_positionally_numbered():
+    """`external_id` becomes the item's PATH, i.e. its identity. A positional `<prefix>-<i>` makes
+    that identity depend on ITERATION ORDER: delete one document and every later one shifts down a
+    slot, overwriting its neighbour's item — bodies swap and version history is mis-attributed
+    across unrelated documents. Losing one document loudly beats corrupting the rest silently."""
+    docs = [FakeDoc("a", {"page_id": "p1"}), FakeDoc("b", {}), FakeDoc("c", {"page_id": "p3"})]
+    out = docs_to_raw(docs, source="notion", id_keys=("page_id",), fallback_prefix="notion")
+    assert [r.external_id for r in out] == ["p1", "p3"]  # no "notion-1" invented
+    assert [r.body for r in out] == ["a", "c"]  # and the survivors keep THEIR own bodies

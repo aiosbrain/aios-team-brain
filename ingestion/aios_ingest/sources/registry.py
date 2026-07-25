@@ -20,6 +20,11 @@ from .web import WebSource
 
 Builder = Callable[..., Source]
 
+# "slack" stays registered but is a DEPRECATED NO-OP (see SlackSource.fetch). Slack is ingested by
+# the IN-APP runner, which models a thread as one item; the sidecar source models a whole CHANNEL as
+# one item, so running both double-ingests Slack under two incompatible units of knowledge. It is
+# kept in the registry (rather than removed) so an existing `type: "slack"` connection degrades to a
+# warning instead of failing the operator's entire sidecar run with "unknown source".
 _REGISTRY: dict[str, Builder] = {
     "slack": SlackSource,
     "notion": NotionSource,

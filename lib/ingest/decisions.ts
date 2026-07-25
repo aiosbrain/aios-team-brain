@@ -31,4 +31,23 @@ export async function materializeDecisions(
     );
     if (error) throw new Error(`decision row ${row.row_key}: ${error.message}`);
   }
+
+  // DIFF-DELETE, mirroring tasks: a decision this item used to carry but no longer does is gone at the
+  // source, so it must stop being served as CURRENT. Without this a removed/retracted decision lived
+  // forever — still cited by retrieval and still shown on the dashboard — and the docs already claimed
+  // the behavior existed. Scoped to THIS item's own rows (`source_item_id`), so a UI-created decision
+  // (`source_item_id` null) and other items' rows are never touched.
+  const incomingKeys = new Set(rows.map((r) => r.row_key));
+  const { data: current, error: readError } = await db
+    .from("decisions")
+    .select("id, row_key")
+    .eq("team_id", teamId)
+    .eq("project_id", projectId)
+    .eq("source_item_id", itemId);
+  if (readError) throw new Error(`decision diff read: ${readError.message}`);
+  for (const existing of (current ?? []) as { id: string; row_key: string | null }[]) {
+    if (!existing.row_key || incomingKeys.has(existing.row_key)) continue;
+    const { error: deleteError } = await db.from("decisions").delete().eq("id", existing.id);
+    if (deleteError) throw new Error(`decision delete ${existing.row_key}: ${deleteError.message}`);
+  }
 }
