@@ -33,7 +33,7 @@ const TTL_MS = 5 * 60_000; // 5-min freshness; the ledger is cheap, so refresh o
 // shape, so it MUST bump — the cold rebuild is the cheap pure builder (no inline LLM).
 // v5: commits inherit their PR's task (work_events), so a cached v4 ledger would serve link-less rows for
 // a full TTL after deploy — bump so it rebuilds with the new links.
-const PAYLOAD_VERSION = 5;
+export const PAYLOAD_VERSION = 5;
 
 /** The timeline WITH the per-person-day synopsis attached. Runs the (up to 7d × roster) best-effort LLM
  *  calls — so it's used ONLY on the BACKGROUND refresh path, never inline on a request (a cold miss

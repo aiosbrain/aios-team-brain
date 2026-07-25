@@ -1,10 +1,10 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { audit } from "@/lib/api/audit";
-import { visibleGroupIds, type AccessTier } from "@/lib/graph/group";
-import { purgeArcCacheKey, staleArcCache } from "@/lib/graph/arc-cache";
-import { bustTeamTimeline, purgeTimelineCacheTier } from "@/lib/dashboard/timeline-cache";
-import { evictArcMemoryCache } from "@/lib/graph/arcs";
+import type { AccessTier } from "@/lib/graph/group";
+import { purgeExternalTierCaches } from "@/lib/cache/tier-invalidation";
+import { staleArcCache } from "@/lib/graph/arc-cache";
+import { bustTeamTimeline } from "@/lib/dashboard/timeline-cache";
 
 /**
  * The single place a tier reclassification fans out from (Pass-1 review M1).
@@ -17,11 +17,35 @@ import { evictArcMemoryCache } from "@/lib/graph/arcs";
  *
  * Both `ingestItem` paths (unchanged re-push and changed body) route through here, so the fan-out can't
  * drift between them — the changed path is exactly where the previous fix forgot to look.
+ *
+ * ── Why this is TWO functions ────────────────────────────────────────────────────────────────────────
+ * The split is an ordering requirement, not decomposition for its own sake. `ingestItem` must:
+ *   1. `cascadeInheritedAudience(...)`  ← BEFORE it writes `items.access`
+ *   2. write `items.access`
+ *   3. `settleReclassification(...)`    ← AFTER
+ * Run in that order, every failure is FAIL-CLOSED and self-healing:
+ *   • step 1 throws → `items.access` is untouched, so the next sync tick still sees the tier as changed
+ *     and retries the whole thing. (The other order strands the inheriting rows at the OLD tier
+ *     permanently: the retry reads the already-committed `access`, computes `accessChanged = false`, and
+ *     never repairs them — a leak with no repair path and no signal beyond one 500.)
+ *   • step 2 throws → the inheriting rows are already at the NEW (narrower) tier while the item is still
+ *     at the old one. More restrictive than required, never less; the next tick converges.
+ *   • step 3 throws → the caches are stale rather than purged; bounded by their TTL, and the next tick
+ *     retries. Worst case here is staleness, so it's the only phase that may run last.
  */
 
-/** Tier-carrying tables whose rows inherit the containing item's `access` (keyed by `source_item_id`).
+/** Tier-carrying tables whose rows inherit the containing item's `access`, keyed by `source_item_id`.
+ *
  *  `decisions` is deliberately absent: a decision row's audience is a per-row wire field, not inherited
- *  (see the decisions-audience data-mechanics test). Anything added here must be tier-filtered on read. */
+ *  (see the decisions-audience data-mechanics test).
+ *
+ *  KNOWN GAP — the social chain (`social_opportunities` and the `content_plans`/`content_variants`/
+ *  `social_publications`/`publication_analytics` rows below it) also carries a denormalized `access`
+ *  derived from its evidence items, and is NOT cascaded here: its evidence is a jsonb `[{item_id,…}]`
+ *  array rather than a `source_item_id` column, so it needs a different query shape. An opportunity
+ *  whose summary derives from an item later narrowed external→team therefore keeps serving that derived
+ *  text externally, with no TTL to bound it. Tracked, not fixed here — do not read this list as complete.
+ */
 const INHERITING_TABLES = ["tasks", "extracted_facts", "stakeholder_mentions"] as const;
 
 export interface Reclassification {
@@ -34,45 +58,42 @@ export interface Reclassification {
 }
 
 /**
- * Cascade a tier change to the rows that inherit it, invalidate the tier-scoped caches, and audit it.
+ * PHASE 1 — move the rows that inherit the item's tier. Call BEFORE committing `items.access` (see the
+ * ordering note above). NOT best-effort: a row left at the old tier in a tier-filtered table IS the
+ * leak, so a failure propagates and the push fails rather than reporting success over half a change.
+ */
+export async function cascadeInheritedAudience(
+  db: DbClient,
+  itemId: string,
+  to: AccessTier
+): Promise<void> {
+  for (const table of INHERITING_TABLES) {
+    const { error } = await db.from(table).update({ audience: to }).eq("source_item_id", itemId);
+    if (error) throw new Error(`${table} audience cascade failed: ${error.message}`);
+  }
+}
+
+/**
+ * PHASE 2 — invalidate the tier-scoped caches and audit the change. Call AFTER `items.access` is
+ * committed, so a rebuild triggered by the invalidation reads the NEW tier.
  *
  * The cache handling is ASYMMETRIC, and that asymmetry is the whole point:
  *   • NARROWING (external→team) — the external-tier payloads contain content that must no longer be
- *     visible there. They are PURGED, because both cache layers serve stale-while-revalidate: a mere
- *     stale-mark still hands the old payload to the next external viewer.
+ *     visible there, and both cache layers serve stale-while-revalidate, so they are PURGED.
  *   • WIDENING (team→external) — the external payloads are merely INCOMPLETE. Nothing leaked, so a
  *     stale-mark is right; purging would force a cold LLM re-synthesis for no isolation gain.
- * The team-tier rows never need purging in either direction: a team viewer may see both tiers, so the
- * set of content they may read is unchanged by a reclassification.
  */
-export async function propagateReclassification(
+export async function settleReclassification(
   db: DbClient,
   teamSlug: string,
   change: Reclassification
 ): Promise<void> {
-  for (const table of INHERITING_TABLES) {
-    const { error } = await db
-      .from(table)
-      .update({ audience: change.to })
-      .eq("source_item_id", change.itemId);
-    // NOT best-effort: a row left at the old tier in a tier-filtered table IS the leak. Fail the push
-    // so the connector retries, rather than reporting success over a half-applied reclassification.
-    if (error) throw new Error(`${table} audience cascade failed: ${error.message}`);
+  if (change.from === "external" && change.to === "team") {
+    await purgeExternalTierCaches(db, change.teamId, teamSlug);
+  } else {
+    await staleArcCache(db, change.teamId);
+    await bustTeamTimeline(db, change.teamId);
   }
-
-  const narrowing = change.from === "external" && change.to === "team";
-  // Per-process memory fronts both Postgres caches; evict for the whole team either way (a needless
-  // recompute is cheap, and the eviction is the only thing that stops THIS process serving a warm copy).
-  evictArcMemoryCache(teamSlug);
-  if (narrowing) {
-    const externalArcKey = visibleGroupIds(teamSlug, "external").slice().sort().join(",");
-    await purgeArcCacheKey(db, change.teamId, externalArcKey);
-    await purgeTimelineCacheTier(db, change.teamId, "external");
-  }
-  // Both directions, and a backstop under the purges above (they swallow their own errors): a stale
-  // mark bounds any surviving row to a single TTL instead of a full 4h/5min window of serving it.
-  await staleArcCache(db, change.teamId);
-  await bustTeamTimeline(db, change.teamId);
 
   // Audit the rare reclassification so the tier change isn't silent. Rare enough not to reintroduce the
   // per-tick unbounded audit growth that removed the `item.unchanged` row (audit M4).

@@ -69,8 +69,8 @@ export async function POST(req: NextRequest) {
     const { opts } = isRestrictedTier(auth.memberTier)
       ? {}
       : await attributeIncomingItem(db, auth.teamId, parsed.data, auth.memberId);
-    // Pass the key's tier so ingestItem's access-heal (on an unchanged re-push) only trusts a team-tier
-    // pusher — an external key must not be able to raise an existing team item's visibility.
+    // Pass the key's tier: ingestItem resolves the item's tier from it on BOTH write paths, so an
+    // external key can neither reclassify an existing item nor declare `team` on a new one.
     const pusherTier = isRestrictedTier(auth.memberTier) ? "external" : "team";
     const result = await ingestItem(db, auth, parsed.data, tier, opts, pusherTier);
 

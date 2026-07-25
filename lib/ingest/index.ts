@@ -17,7 +17,10 @@ import {
   materializeStakeholderMentions,
 } from "@/lib/ingest/evidence";
 import { materializeTasks, validateTaskRows } from "@/lib/ingest/tasks";
-import { propagateReclassification } from "@/lib/ingest/reclassify";
+import {
+  cascadeInheritedAudience,
+  settleReclassification,
+} from "@/lib/ingest/reclassify";
 
 export interface IngestResult {
   status: "created" | "updated" | "unchanged";
@@ -152,10 +155,16 @@ export async function ingestItem(
       `an external-tier key may not modify the team-tier item at '${payload.path}'`
     );
   }
-  // A brand-new item takes the pusher's declared tier (an external key can only ever declare `external`,
-  // since the route derives the tier from the payload and this key's own content is external by nature).
-  const effectiveAccess: "team" | "external" =
-    existingAccess !== null && untrustedPusher ? existingAccess : access;
+  // An untrusted pusher NEVER sets a tier — not on an existing item (keep the stored one) and not on a
+  // new one (its own tier). The route derives the tier from the PAYLOAD, so without this clamp an
+  // external key could simply declare `access: "team"` on a fresh path and land its content on every
+  // internal surface — retrieval context, dashboard `visibleItems`, team arcs and timeline. That's a
+  // content-injection channel into the team tier (and, since retrieval grounds LLM answers, a
+  // prompt-injection one). Clamped rather than refused: "an external key's content is external" is the
+  // correct reading of the push, and the `item.created` audit records the tier actually stored.
+  const effectiveAccess: "team" | "external" = untrustedPusher
+    ? (existingAccess ?? "external")
+    : access;
   const accessChanged = existingAccess !== null && existingAccess !== effectiveAccess;
   /** Only looked up when a reclassification actually fires (rare) — the cache keys need the slug. */
   const teamSlug = async (): Promise<string> => {
@@ -208,22 +217,40 @@ export async function ingestItem(
     // HEAL FRONTMATTER on an unchanged re-push: `content_sha256` covers only the body, but source-derived
     // metadata in frontmatter can change while the body doesn't. Preserve BEST-EFFORT/backfilled author
     // keys the store has but this push omits, so refreshing never wipes them.
-    const existingFrontmatter = isRecord(existing.frontmatter)
-      ? existing.frontmatter
-      : {};
-    const healedFrontmatter: Record<string, unknown> = {
-      ...(payload.frontmatter ?? {}),
-    };
-    for (const key of ["author", "author_email", "author_login"]) {
-      if (
-        existingFrontmatter[key] !== undefined &&
-        healedFrontmatter[key] === undefined
-      ) {
-        healedFrontmatter[key] = existingFrontmatter[key];
+    //
+    // NOT for an untrusted pusher at a TEAM item. That combination reaches this path only via the
+    // identical-body carve-out above, and the heal writes `payload.frontmatter` WHOLESALE (existing keys
+    // survive only where this push omits them) — so a client key holding the body of a since-narrowed doc
+    // could rewrite `author`/`source`/`source_ts` on an internal item: attribution and audit-trail
+    // poisoning, and a skewed episode timestamp. It gets the `synced_at` bump and nothing else.
+    const metadataWritable = !(untrustedPusher && existingAccess === "team");
+    if (metadataWritable) {
+      const existingFrontmatter = isRecord(existing.frontmatter)
+        ? existing.frontmatter
+        : {};
+      const healedFrontmatter: Record<string, unknown> = {
+        ...(payload.frontmatter ?? {}),
+      };
+      for (const key of ["author", "author_email", "author_login"]) {
+        if (
+          existingFrontmatter[key] !== undefined &&
+          healedFrontmatter[key] === undefined
+        ) {
+          healedFrontmatter[key] = existingFrontmatter[key];
+        }
       }
+      if (canonicalJson(existingFrontmatter) !== canonicalJson(healedFrontmatter)) {
+        patch.frontmatter = healedFrontmatter;
+      }
+    } else {
+      delete patch.member_id; // no reattribution from an untrusted pusher either
     }
-    if (canonicalJson(existingFrontmatter) !== canonicalJson(healedFrontmatter)) {
-      patch.frontmatter = healedFrontmatter;
+
+    // Phase 1 of the reclassification BEFORE `items.access` is committed, so a cascade failure leaves the
+    // stored tier unchanged and the next tick retries the whole change (see reclassify.ts's ordering note
+    // — the other order strands the inheriting rows at the old tier permanently).
+    if (accessChanged) {
+      await cascadeInheritedAudience(db, existing.id, effectiveAccess);
     }
 
     const { error: healError } = await db
@@ -267,10 +294,10 @@ export async function ingestItem(
         },
       });
     }
-    // Fan the tier change out to the inheriting rows and the tier-scoped caches (shared with the
+    // Phase 2: the tier is committed, so invalidate the tier-scoped caches and audit (shared with the
     // changed-body path below, so the two can't drift).
     if (accessChanged) {
-      await propagateReclassification(db, await teamSlug(), {
+      await settleReclassification(db, await teamSlug(), {
         teamId: auth.teamId,
         itemId: existing.id,
         from: existingAccess,
@@ -284,6 +311,12 @@ export async function ingestItem(
       id: existing.id,
       projectId: project.id,
     };
+  }
+
+  // Phase 1 of a reclassification on the CHANGED path, before the item row (which carries `access`) is
+  // written — same fail-closed ordering as the unchanged path above.
+  if (accessChanged && existing) {
+    await cascadeInheritedAudience(db, existing.id, effectiveAccess);
   }
 
   const taskRows =
@@ -386,11 +419,11 @@ export async function ingestItem(
     .eq("id", itemId);
   if (shaError) throw new Error(`item sha commit failed: ${shaError.message}`);
 
-  // A body edit can carry a tier change with it, and this path is where the previous fix stopped
-  // looking: `materialize*` re-stamps the audience of the rows IN THIS PUSH, but nothing cascaded to
-  // rows the push omits and nothing touched the tier-scoped caches. Same fan-out as the unchanged path.
+  // Phase 2. A body edit can carry a tier change with it, and this path is where the previous fix
+  // stopped looking: `materialize*` re-stamps the audience of the rows IN THIS PUSH, but nothing
+  // cascaded to rows the push omits and nothing touched the tier-scoped caches.
   if (accessChanged) {
-    await propagateReclassification(db, await teamSlug(), {
+    await settleReclassification(db, await teamSlug(), {
       teamId: auth.teamId,
       itemId,
       from: existingAccess,

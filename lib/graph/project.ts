@@ -123,6 +123,11 @@ export interface ProjectSummary {
   scanned: number;
   projected: number;
   skipped: number;
+  /** Items whose episodes MOVED between tier groups this batch (a reclassification reaching the graph).
+   * The caller uses it to invalidate the external-tier caches: arcs are synthesized FROM the external
+   * Graphiti group, so purging them at reclassification time isn't enough — a rebuild between then and
+   * this cleanup re-synthesizes over the still-dirty group and stamps the result FRESH. */
+  tierChanges: number;
   /** `synced_at` of the last row scanned this batch — the cursor the runner pages forward from
    * (audit H2). `undefined` when the batch was empty (nothing left to scan). */
   lastSyncedAt?: string;
@@ -228,6 +233,7 @@ export async function projectItemsToGraph(
 
   let projected = 0;
   let skipped = 0;
+  let tierChanges = 0;
   for (const item of rows) {
     const episodes = kinds.includes(item.kind) ? toEpisodes(item) : [];
     // Idempotency key = the FULL body (chunk boundaries derive deterministically from it), so an
@@ -303,6 +309,7 @@ export async function projectItemsToGraph(
     // tier searchable forever. `reconcile` retries the cleanup until the old group is verified empty and
     // only then clears `pending_delete_group_id`. The inline delete stays as the fast path.
     if (tierChanged && existingRow) {
+      tierChanges++;
       await deleteItemEpisodes(client, existingRow.group_id, item.id).catch(() => {});
     }
     // Independent of the tier check, NOT an else-arm: on a double flip (A→B→A while A's cleanup is
@@ -354,7 +361,7 @@ export async function projectItemsToGraph(
   // mark to page past next batch (audit H2). Without this the runner only ever re-scanned the oldest
   // `limit` rows and never reached items beyond that window.
   const lastSyncedAt = rows.length ? rows[rows.length - 1].synced_at : undefined;
-  return { scanned: rows.length, projected, skipped, lastSyncedAt };
+  return { scanned: rows.length, projected, skipped, tierChanges, lastSyncedAt };
 }
 
 /** Back-compat: project only Slack transcripts. Prefer `projectItemsToGraph` (all ingestions). */
