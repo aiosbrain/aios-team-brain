@@ -5,7 +5,11 @@ import { audit } from "@/lib/api/audit";
 import { decideReattribution } from "@/lib/ingest/reattribution-decision";
 import { recordReassignment, ownerWindowStart } from "@/lib/ingest/reassignment-log";
 import type { ItemPayload } from "@/lib/api/item-payload-schema";
-import { itemPayloadSchema, IngestValidationError } from "@/lib/api/schemas";
+import {
+  itemPayloadSchema,
+  IngestValidationError,
+  TierViolationError,
+} from "@/lib/api/schemas";
 import type { DbClient } from "@/lib/db/types";
 import { materializeDecisions } from "@/lib/ingest/decisions";
 import {
@@ -13,6 +17,7 @@ import {
   materializeStakeholderMentions,
 } from "@/lib/ingest/evidence";
 import { materializeTasks, validateTaskRows } from "@/lib/ingest/tasks";
+import { propagateReclassification } from "@/lib/ingest/reclassify";
 
 export interface IngestResult {
   status: "created" | "updated" | "unchanged";
@@ -124,6 +129,42 @@ export async function ingestItem(
     .eq("path", payload.path)
     .maybeSingle();
 
+  // ── Who may set this item's tier ────────────────────────────────────────────────────────────────
+  // Tier is an access-control decision, so it is resolved ONCE here and both write paths below use the
+  // result. #374 gated only the unchanged path, which left the changed path free to take the payload's
+  // tier from any principal.
+  //
+  // Two different answers for an `external` pusher at an existing TEAM item's path, split on whether it
+  // is actually trying to CHANGE anything:
+  //   • identical body → ignore the tier and take the normal unchanged path. This is the benign race
+  //     (a client connector re-pushing a doc that was narrowed upstream between syncs); erroring every
+  //     tick would wedge that connector's loop over a no-op.
+  //   • different body → REFUSE. Accepting it would let a client key overwrite internal content and
+  //     carry the row's tier with it. Refused rather than silently clamped: it's a misconfigured
+  //     connector or a probe, and both want an error the caller can see.
+  // Either way the pusher's payload tier is advisory for an item that already exists, so it can't
+  // promote its own external content into the team tier and inject it onto internal surfaces.
+  const existingAccess = (existing as { access?: "team" | "external" | null } | null)?.access ?? null;
+  const untrustedPusher = pusherTier === "external";
+  const bodyUnchanged = Boolean(existing) && existing!.content_sha256 === contentSha;
+  if (existing && untrustedPusher && existingAccess === "team" && !bodyUnchanged) {
+    throw new TierViolationError(
+      `an external-tier key may not modify the team-tier item at '${payload.path}'`
+    );
+  }
+  // A brand-new item takes the pusher's declared tier (an external key can only ever declare `external`,
+  // since the route derives the tier from the payload and this key's own content is external by nature).
+  const effectiveAccess: "team" | "external" =
+    existingAccess !== null && untrustedPusher ? existingAccess : access;
+  const accessChanged = existingAccess !== null && existingAccess !== effectiveAccess;
+  /** Only looked up when a reclassification actually fires (rare) — the cache keys need the slug. */
+  const teamSlug = async (): Promise<string> => {
+    const { data } = await db.from("teams").select("slug").eq("id", auth.teamId).maybeSingle();
+    const slug = (data as { slug?: string } | null)?.slug;
+    if (!slug) throw new Error("reclassification: team slug not found");
+    return slug;
+  };
+
   if (existing && existing.content_sha256 === contentSha) {
     // Refresh "last seen this sync"; do NOT write an audit row (audit M4). Every 30-min sync tick
     // re-pushes every unchanged item, so an `item.unchanged` audit here added ~one row/item/tick
@@ -160,17 +201,9 @@ export async function ingestItem(
     // RECLASSIFIES an item's tier without touching its prose (a doc shared narrower/wider upstream)
     // would otherwise keep the first-ingest `access` forever. With no RLS backstop (CLAUDE.md §5) a
     // stale `access='external'` on a now-internal item silently keeps serving the body to an external
-    // principal on EVERY read path. Heal it here (like the frontmatter heal) and cascade to the tasks
-    // that inherit it (materialize does NOT run on the unchanged path).
-    //
-    // TRUST GATE: only a `team`-tier pusher may change tier. An `external` key re-pushing the identical
-    // body of a known team item must NOT be able to flip its `access` (widening it to `external` would
-    // leak the real team content it preserves). Internal callers default to `team` (trusted); the public
-    // route passes the real key tier, so an untrusted external pusher leaves the stored tier untouched.
-    const existingAccess =
-      (existing as { access?: "team" | "external" | null }).access ?? null;
-    const accessChanged = existingAccess !== access && pusherTier === "team";
-    if (accessChanged) patch.access = access;
+    // principal on EVERY read path. The trust gate that decides whether this pusher may change tier
+    // at all is resolved once, above, for both write paths.
+    if (accessChanged) patch.access = effectiveAccess;
 
     // HEAL FRONTMATTER on an unchanged re-push: `content_sha256` covers only the body, but source-derived
     // metadata in frontmatter can change while the body doesn't. Preserve BEST-EFFORT/backfilled author
@@ -234,31 +267,15 @@ export async function ingestItem(
         },
       });
     }
-    // Cascade a healed tier to the rows that inherit it. Tasks carry the item's `access` as their
-    // `audience` (materialize sets it on the changed path; here it's stale). Decisions are excluded
-    // deliberately — a decision row's audience is per-row (its own wire field), not inherited from
-    // the item (see the decisions-audience data-mechanics test).
+    // Fan the tier change out to the inheriting rows and the tier-scoped caches (shared with the
+    // changed-body path below, so the two can't drift).
     if (accessChanged) {
-      const { error: cascadeErr } = await db
-        .from("tasks")
-        .update({ audience: access })
-        .eq("source_item_id", existing.id);
-      if (cascadeErr)
-        throw new Error(`task audience cascade failed: ${cascadeErr.message}`);
-      // Audit the rare reclassification so the tier change isn't silent (like the reassignment/heal
-      // audits above; rare enough not to reintroduce the M4 per-tick unbounded-growth problem).
-      await audit(db, {
-        team_id: auth.teamId,
-        actor_kind: "system",
-        member_id: null,
-        action: "item.access_healed",
-        target_type: "items",
-        target_id: existing.id,
-        meta: {
-          from: existingAccess,
-          to: access,
-          source: payload.frontmatter?.source ?? null,
-        },
+      await propagateReclassification(db, await teamSlug(), {
+        teamId: auth.teamId,
+        itemId: existing.id,
+        from: existingAccess,
+        to: effectiveAccess,
+        source: payload.frontmatter?.source ?? null,
       });
     }
     // No projection on an unchanged push (the route also guards status !== "unchanged").
@@ -280,7 +297,7 @@ export async function ingestItem(
     project_id: project.id,
     path: payload.path,
     kind: payload.kind,
-    access,
+    access: effectiveAccess,
     frontmatter: payload.frontmatter,
     body: payload.body,
     content_sha256: existing ? existing.content_sha256 : pendingSha,
@@ -330,7 +347,7 @@ export async function ingestItem(
       itemId,
       taskRows,
       now,
-      access
+      effectiveAccess
     );
   } else if (payload.kind === "decision" && payload.rows) {
     await materializeDecisions(
@@ -349,7 +366,7 @@ export async function ingestItem(
       itemId,
       payload.rows,
       now,
-      access
+      effectiveAccess
     );
   } else if (payload.kind === "stakeholder_mention") {
     await materializeStakeholderMentions(
@@ -359,7 +376,7 @@ export async function ingestItem(
       itemId,
       payload.rows,
       now,
-      access
+      effectiveAccess
     );
   }
 
@@ -368,6 +385,19 @@ export async function ingestItem(
     .update({ content_sha256: contentSha })
     .eq("id", itemId);
   if (shaError) throw new Error(`item sha commit failed: ${shaError.message}`);
+
+  // A body edit can carry a tier change with it, and this path is where the previous fix stopped
+  // looking: `materialize*` re-stamps the audience of the rows IN THIS PUSH, but nothing cascaded to
+  // rows the push omits and nothing touched the tier-scoped caches. Same fan-out as the unchanged path.
+  if (accessChanged) {
+    await propagateReclassification(db, await teamSlug(), {
+      teamId: auth.teamId,
+      itemId,
+      from: existingAccess,
+      to: effectiveAccess,
+      source: payload.frontmatter?.source ?? null,
+    });
+  }
 
   await audit(db, {
     team_id: auth.teamId,
@@ -380,7 +410,7 @@ export async function ingestItem(
     meta: {
       path: payload.path,
       kind: payload.kind,
-      access,
+      access: effectiveAccess,
       rows: payload.rows?.length ?? 0,
       // Only present when the pusher's `content_sha256` disagreed with the body it sent — a client
       // bug worth chasing. Recorded on the EXISTING create/update audit row (never its own row, and

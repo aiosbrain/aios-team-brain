@@ -8,6 +8,7 @@ import {
   normalizeTier,
   errorResponse,
   IngestValidationError,
+  TierViolationError,
 } from "@/lib/api/schemas";
 import { ingestItem } from "@/lib/ingest";
 import { attributeIncomingItem } from "@/lib/attribution/resolve-authors";
@@ -101,6 +102,11 @@ export async function POST(req: NextRequest) {
     // not 500 — the CLI needs a structured signal to fix the markdown and retry.
     if (e instanceof IngestValidationError) {
       return errorResponse("invalid_payload", e.message, 422);
+    }
+    // The payload is fine; the PRINCIPAL isn't allowed to write this item's tier — 403, not 422, so a
+    // client key gets an unambiguous "not yours" instead of hunting for a markdown problem.
+    if (e instanceof TierViolationError) {
+      return errorResponse("forbidden_tier", e.message, 403);
     }
     return errorResponse("internal", e instanceof Error ? e.message : "ingest failed", 500);
   }

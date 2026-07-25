@@ -121,6 +121,26 @@ export async function bustTeamTimeline(db: DbClient, teamId: string): Promise<vo
   }
 }
 
+/**
+ * HARD-DELETE one team+tier row (and this process's in-memory copy). The counterpart to
+ * `bustTeamTimeline`, for when the cached ledger is not merely stale but no longer ALLOWED to be
+ * served: it holds item/task TITLES and the LLM per-person-day summaries built from the tier-filtered
+ * set at compute time, so after an item is narrowed external→team the external row still names it.
+ * A stale-mark won't do — the read path serves the stale ledger first and rebuilds behind it.
+ */
+export async function purgeTimelineCacheTier(
+  db: DbClient,
+  teamId: string,
+  tier: ViewerTier
+): Promise<void> {
+  mem.delete(memKey(teamId, tier));
+  try {
+    await db.from("work_timeline_cache").delete().eq("team_id", teamId).eq("group_key", tier);
+  } catch {
+    // best-effort — the caller's stale-mark backstop still bounds the exposure to one TTL
+  }
+}
+
 /** Fire-and-forget background rebuild for a stale key (SWR). Uses its own adminClient (not request-
  *  bound). Deduped via `refreshing`; errors logged, never thrown. */
 function refreshInBackground(teamId: string, tier: ViewerTier): void {
