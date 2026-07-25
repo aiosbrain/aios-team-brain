@@ -138,3 +138,25 @@ describe("author attribution at ingest → stored member_id (real Postgres)", ()
     expect(fm.author).toBe("Alice");
   });
 });
+
+/**
+ * Spec: the never-connector invariant must also hold when a push carries NO author signal at all —
+ * the common shape for web / Google Drive / Confluence documents, which often have no author field.
+ * Previously the resolver returned early on an empty signal, so the item was attributed to the
+ * PUSHER: a sync account claimed every author-less document it ingested, and because credit flows
+ * from `items.member_id`, that content surfaced as a real person's work in their timeline and arcs.
+ */
+describe("author-less pushes (real Postgres)", () => {
+  it("leaves a CONNECTOR's author-less document unattributed, never claimed by the sync account", async () => {
+    const seed = await seedTeam();
+    const connectorId = await addConnector(seed.teamId);
+    const stored = await ingestAs(seed, connectorId, { source: "web" }); // no author key at all
+    expect(stored).toBeNull();
+  });
+
+  it("still attributes a HUMAN's own author-less push to that human (it IS their work)", async () => {
+    const seed = await seedTeam();
+    const stored = await ingestAs(seed, seed.memberId, { source: "local" });
+    expect(stored).toBe(seed.memberId);
+  });
+});
