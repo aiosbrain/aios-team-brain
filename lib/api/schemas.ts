@@ -525,6 +525,15 @@ export class IntegrationConfigError extends Error {}
  */
 export class IngestValidationError extends Error {}
 
+/**
+ * The pushing principal's tier forbids this write. Distinct from `IngestValidationError` because the
+ * payload is well-formed — it's the PRINCIPAL that isn't allowed, so the wire answer is 403 (`forbidden_tier`),
+ * not 422. Tier isolation is enforced entirely in app code (no RLS, CLAUDE.md §5), which is exactly why a
+ * refusal here has to be loud rather than a silent clamp: an external key that finds itself pushing at a
+ * team item's path is either misconfigured or probing, and both deserve an error the caller can see.
+ */
+export class TierViolationError extends Error {}
+
 function collectKeys(value: unknown, out: string[] = []): string[] {
   if (value && typeof value === "object" && !Array.isArray(value)) {
     for (const [k, v] of Object.entries(value)) {

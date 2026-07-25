@@ -26,6 +26,16 @@ export function episodeGroupId(teamSlug: string, access: AccessTier): string {
 }
 
 /**
+ * Is this the EXTERNAL group? Used to make tier-cleanup side effects DIRECTION-AWARE: only a move OUT
+ * of the external group can have leaked, so only that one justifies hard-purging the external caches
+ * (purging on a widening would force a cold LLM re-synthesis for no isolation gain). The suffix test is
+ * exact because a team slug is `[a-z0-9-]` and never contains `_` — see `episodeGroupId`. Pure.
+ */
+export function isExternalGroupId(groupId: string): boolean {
+  return groupId.endsWith("_external");
+}
+
+/**
  * The group_ids a viewer of `tier` may search. An `external` viewer sees ONLY external content;
  * a `team` viewer sees both. Never widen this without re-checking the tier-isolation invariant.
  */

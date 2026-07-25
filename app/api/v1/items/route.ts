@@ -8,6 +8,7 @@ import {
   normalizeTier,
   errorResponse,
   IngestValidationError,
+  TierViolationError,
 } from "@/lib/api/schemas";
 import { ingestItem } from "@/lib/ingest";
 import { attributeIncomingItem } from "@/lib/attribution/resolve-authors";
@@ -68,8 +69,8 @@ export async function POST(req: NextRequest) {
     const { opts } = isRestrictedTier(auth.memberTier)
       ? {}
       : await attributeIncomingItem(db, auth.teamId, parsed.data, auth.memberId);
-    // Pass the key's tier so ingestItem's access-heal (on an unchanged re-push) only trusts a team-tier
-    // pusher — an external key must not be able to raise an existing team item's visibility.
+    // Pass the key's tier: ingestItem resolves the item's tier from it on BOTH write paths, so an
+    // external key can neither reclassify an existing item nor declare `team` on a new one.
     const pusherTier = isRestrictedTier(auth.memberTier) ? "external" : "team";
     const result = await ingestItem(db, auth, parsed.data, tier, opts, pusherTier);
 
@@ -101,6 +102,11 @@ export async function POST(req: NextRequest) {
     // not 500 — the CLI needs a structured signal to fix the markdown and retry.
     if (e instanceof IngestValidationError) {
       return errorResponse("invalid_payload", e.message, 422);
+    }
+    // The payload is fine; the PRINCIPAL isn't allowed to write this item's tier — 403, not 422, so a
+    // client key gets an unambiguous "not yours" instead of hunting for a markdown problem.
+    if (e instanceof TierViolationError) {
+      return errorResponse("forbidden_tier", e.message, 403);
     }
     return errorResponse("internal", e instanceof Error ? e.message : "ingest failed", 500);
   }

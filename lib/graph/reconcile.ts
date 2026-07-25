@@ -3,6 +3,7 @@ import type { DbClient } from "@/lib/db/types";
 import { GraphitiClient } from "./graphiti-client";
 import { itemIdFromEpisodeName } from "./episode-name";
 import { GROUP_SCAN_DEPTH, resolvePositiveInt } from "./project";
+import { isExternalGroupId } from "./group";
 
 /**
  * Reconcile pass for the brain→Graphiti seam (audit H3, Option B — chosen over blocking-confirm
@@ -39,6 +40,9 @@ export interface ReconcileSummary {
   reQueued: number;
   /** Rows whose OLD-group cleanup (after a tier change) was verified complete this pass. */
   cleaned: number;
+  /** Of those, the ones whose old group was the EXTERNAL one — i.e. a NARROWING has now fully left the
+   * graph. Direction-aware because only that case justifies hard-purging the external caches. */
+  cleanedExternal: number;
   /** Cleanups STILL outstanding after this pass — old-tier episodes that are purgeable but not yet
    * verified purged. A number that never returns to 0 is a stuck tier cleanup, not bookkeeping. */
   pendingCleanups: number;
@@ -65,7 +69,15 @@ export async function reconcileProjectedEpisodes(
   teamId: string
 ): Promise<ReconcileSummary> {
   if (!client.configured)
-    return { groupsChecked: 0, confirmed: 0, reQueued: 0, cleaned: 0, pendingCleanups: 0, saturatedGroups: 0 };
+    return {
+      groupsChecked: 0,
+      confirmed: 0,
+      reQueued: 0,
+      cleaned: 0,
+      cleanedExternal: 0,
+      pendingCleanups: 0,
+      saturatedGroups: 0,
+    };
 
   const { data } = await db
     .from("graph_episodes")
@@ -144,6 +156,7 @@ export async function reconcileProjectedEpisodes(
   // a straggler chunk after it ran). Retry the delete here until the old group is verified empty, THEN
   // clear the flag. Independent of the landed-check above (that confirms the NEW group).
   let cleaned = 0;
+  let cleanedExternal = 0;
   const pendingByGroup = new Map<string, EpisodeRow[]>();
   for (const row of rows) {
     if (!row.pending_delete_group_id) continue;
@@ -195,6 +208,7 @@ export async function reconcileProjectedEpisodes(
           .update({ pending_delete_group_id: null, pending_delete_at: null })
           .eq("id", row.id);
         cleaned++;
+        if (isExternalGroupId(oldGroup)) cleanedExternal++;
       }
     }
   }
@@ -213,6 +227,7 @@ export async function reconcileProjectedEpisodes(
     confirmed,
     reQueued,
     cleaned,
+    cleanedExternal,
     pendingCleanups: (pendingRows ?? []).length,
     saturatedGroups,
   };

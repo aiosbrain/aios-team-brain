@@ -33,7 +33,7 @@ const TTL_MS = 5 * 60_000; // 5-min freshness; the ledger is cheap, so refresh o
 // shape, so it MUST bump — the cold rebuild is the cheap pure builder (no inline LLM).
 // v5: commits inherit their PR's task (work_events), so a cached v4 ledger would serve link-less rows for
 // a full TTL after deploy — bump so it rebuilds with the new links.
-const PAYLOAD_VERSION = 5;
+export const PAYLOAD_VERSION = 5;
 
 /** The timeline WITH the per-person-day synopsis attached. Runs the (up to 7d × roster) best-effort LLM
  *  calls — so it's used ONLY on the BACKGROUND refresh path, never inline on a request (a cold miss
@@ -118,6 +118,26 @@ export async function bustTeamTimeline(db: DbClient, teamId: string): Promise<vo
     await db.from("work_timeline_cache").update({ computed_at: staleAt }).eq("team_id", teamId);
   } catch {
     // best-effort — the ledger still refreshes on its normal TTL if this fails
+  }
+}
+
+/**
+ * HARD-DELETE one team+tier row (and this process's in-memory copy). The counterpart to
+ * `bustTeamTimeline`, for when the cached ledger is not merely stale but no longer ALLOWED to be
+ * served: it holds item/task TITLES and the LLM per-person-day summaries built from the tier-filtered
+ * set at compute time, so after an item is narrowed external→team the external row still names it.
+ * A stale-mark won't do — the read path serves the stale ledger first and rebuilds behind it.
+ */
+export async function purgeTimelineCacheTier(
+  db: DbClient,
+  teamId: string,
+  tier: ViewerTier
+): Promise<void> {
+  mem.delete(memKey(teamId, tier));
+  try {
+    await db.from("work_timeline_cache").delete().eq("team_id", teamId).eq("group_key", tier);
+  } catch {
+    // best-effort — the caller's stale-mark backstop still bounds the exposure to one TTL
   }
 }
 

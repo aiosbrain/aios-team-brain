@@ -72,6 +72,26 @@ export async function staleArcCache(db: DbClient, teamId: string): Promise<void>
   }
 }
 
+/**
+ * HARD-DELETE one team+group_key row. Used only when the cached arcs are not merely stale but no longer
+ * ALLOWED to be served: an item narrowed external→team leaves LLM prose synthesized from it sitting in
+ * the external-tier row, and `staleArcCache` is not enough there — `getArcs` is serve-stale-while-
+ * revalidate, so a stale row is still handed to the next external viewer (and every one after, until the
+ * background recompute lands). Deleting forces a miss.
+ *
+ * The cost is deliberate: with no prior row, `commitArcs`'s empty-clobber guard has nothing to protect,
+ * so a recompute that comes back empty is accepted and the external panel is blank until synthesis
+ * recovers. Tier isolation outranks panel continuity — a blank panel is a UX regression, serving
+ * retracted content is a leak with no DB backstop (CLAUDE.md §5).
+ */
+export async function purgeArcCacheKey(db: DbClient, teamId: string, groupKey: string): Promise<void> {
+  try {
+    await db.from("arc_cache").delete().eq("team_id", teamId).eq("group_key", groupKey);
+  } catch {
+    // best-effort — but see the caller: the purge failing is why the stale-mark runs as a backstop
+  }
+}
+
 /** Upsert the cached arcs for one team+group_key, stamping `computed_at` now. Best-effort — a failed
  *  cache write must never fail synthesis (the arcs are still returned to the caller). */
 export async function writeArcCache(

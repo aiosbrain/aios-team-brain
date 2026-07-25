@@ -197,6 +197,40 @@ describe("POST /api/v1/items (HTTP)", () => {
   });
 });
 
+describe("POST /api/v1/items (HTTP) — an external key may not modify a team item", () => {
+  it("answers 403 forbidden_tier over the wire, and the team item is untouched", async () => {
+    // The wire contract for the write-side tier gate. Belongs at this tier because what's under test is
+    // the status code and error shape a client CLI has to react to — an external connector must be able
+    // to tell "not yours" (403) from "your markdown is malformed" (422).
+    const seed = await seedTeam();
+    const { key: teamKey } = await issueKeyFor(seed, "team");
+    const path = "2-work/internal-plan.md";
+    const created = await fetch(ITEMS, {
+      method: "POST",
+      headers: keyHeaders(teamKey, seed.teamSlug),
+      body: JSON.stringify(itemBody({ path, access: "team", body: "internal-only plan" })),
+    });
+    expect(created.status).toBe(201);
+
+    const { key: extKey } = await issueKeyFor(seed, "external");
+    const refused = await fetch(ITEMS, {
+      method: "POST",
+      headers: keyHeaders(extKey, seed.teamSlug),
+      body: JSON.stringify(itemBody({ path, access: "external", body: "client-supplied body" })),
+    });
+    expect(refused.status).toBe(403);
+    expect((await refused.json()).error.code).toBe("forbidden_tier");
+
+    const { data } = await db()
+      .from("items")
+      .select("access, body")
+      .eq("team_id", seed.teamId)
+      .eq("path", path)
+      .maybeSingle();
+    expect(data).toMatchObject({ access: "team", body: "internal-only plan" });
+  });
+});
+
 describe("GET /api/v1/items (HTTP) — tier filter over the wire", () => {
   it("a team key sees team+external items; an external key sees only external", async () => {
     const seed = await seedTeam();
