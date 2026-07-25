@@ -5,10 +5,11 @@ import type { TimelineDay } from "@/lib/dashboard/timeline-group";
 import { db, seedTeam, ingest, type Seed } from "./helpers";
 
 // Spec: the Learning Timeline reads Postgres items+tasks into a day → person → (tasks + Other) ledger.
-// A task appears ONLY when it is ACTIVE (in_progress/blocked) AND has ≥1 of the person's evidence
-// referencing it (evidence-gated) — backlog/done tasks and empty headers never show; evidence linked to
-// no active task falls to "Other". Dated by WORK time (git committed_at / Slack source_ts / a doc's own
-// edit-create time — WORK_TIME_KEYS, never synced_at); meetings excluded; tier isolated. Real Postgres.
+// A task appears iff ≥1 of the person's in-window evidence references it (EVIDENCE-GATED) — empty headers
+// never show. Status does NOT gate it: a ticket that shipped today still heads its group, carrying its
+// status. Only evidence referencing NO task falls to "Other". Dated by WORK time (git committed_at /
+// Slack source_ts / a doc's own edit-create time — WORK_TIME_KEYS, never synced_at); meetings excluded;
+// tier isolated. Real Postgres.
 
 const recentIso = new Date(Date.now() - 2 * 86_400_000).toISOString(); // within the 7-day window
 

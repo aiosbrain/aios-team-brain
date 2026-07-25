@@ -43,12 +43,12 @@ const ACTIVE_TASK_STATUSES = new Set(["in_progress", "blocked"]);
  *    the work-time filter into SQL (needs a computed/indexed work-time column).
  *  • Body fetched ONLY for git commits (the issue key lives in the commit message); other items match
  *    on title + path — avoids pulling large doc bodies.
- *  • Tasks are ACTIVE-only + EVIDENCE-GATED (product): a task appears iff its status is in-progress
- *    (`ACTIVE_TASK_STATUSES`) AND ≥1 of the person's in-window evidence references its issue key. So the
- *    timeline lists the in-progress work someone actually touched — NOT the whole backlog, and NOT empty
- *    headers. A task is placed under the EVIDENCE author (who did the work), not its assignee — so a
- *    commit citing someone else's ticket shows the contribution correctly. Evidence referencing a
- *    backlog/done issue (not in the active set) falls to "Other".
+ *  • Tasks are EVIDENCE-GATED (product): a task appears iff ≥1 of the person's in-window evidence
+ *    references its issue key — so the timeline lists the work someone actually touched, NOT the whole
+ *    backlog and NOT empty headers. Status does NOT gate it: a ticket that shipped today still heads its
+ *    group (its status rides on the header). A task is placed under the EVIDENCE author (who did the
+ *    work), not its assignee — so a commit citing someone else's ticket shows the contribution correctly.
+ *    Only evidence referencing NO visible task falls to "Other".
  *  • Meetings (granola) are team signal, not one person's output → excluded from the per-person view
  *    (a granola item's member_id is the recorder, not the participants).
  *  • SLACK is included PER-PARTICIPANT: threads carry a `participants[]` frontmatter ledger (distinct
@@ -255,13 +255,13 @@ export async function getWorkTimeline(
   if (otherRes.error) throw new Error(`work-timeline items: ${otherRes.error.message}`);
   if (taskRes.error) throw new Error(`work-timeline tasks: ${taskRes.error.message}`);
 
-  // ONLY ACTIVE tasks (filtered in SQL above) are the link-target set: a commit citing a backlog/done
-  // issue's key won't link → its evidence goes to "Other", and the backlog/done task never appears.
-  // Tasks are then EVIDENCE-GATED in the grouper (no empty headers).
+  // The ACTIVE set. It is no longer the whole link-target set (any referenced task can head a group —
+  // see the union at `linkTargets`), but it is still fetched separately so active tasks are guaranteed
+  // present even when the all-status read clips at TASK_LIMIT. Evidence-gated in the grouper.
   const tasks = (taskRes.data ?? []) as TaskRow[];
 
   const taskInfo = new Map<string, TaskInfo>();
-  for (const t of tasks) taskInfo.set(t.id, { title: t.title || "(untitled task)", status: t.status || "in_progress", source: pmSource });
+  for (const t of tasks) taskInfo.set(t.id, { title: t.title || "(untitled task)", status: t.status || "", source: pmSource });
 
   // ATTRIBUTION ORACLE (single source of truth): credit each evidence item to its PRIMARY contributor —
   // the actual worker, via `item_versions` — not merely the current `member_id` owner. So a reassigned
@@ -380,8 +380,12 @@ export async function getWorkTimeline(
   for (const t of allTasks) {
     if (!taskInfo.has(t.id)) taskInfo.set(t.id, { title: t.title || "(untitled task)", status: t.status || "", source: pmSource });
   }
+  // Link targets = the UNION of both fetches, deduped. The all-status read orders by `updated_at DESC`, so
+  // on a busy backlog an ACTIVE task can be pushed past TASK_LIMIT and vanish from `allTasks` — without the
+  // union, a commit citing that active task's key would nest nowhere. The active fetch is the guarantee.
+  const linkTargets = [...new Map([...allTasks, ...tasks].map((t) => [t.id, t])).values()];
   const allLinks = computeTaskLinks(
-    allTasks.map((t) => ({ id: t.id, row_key: t.row_key })),
+    linkTargets.map((t) => ({ id: t.id, row_key: t.row_key })),
     evItems.map((e) => ({ id: e.id, text: e.text }))
   );
 
@@ -439,17 +443,13 @@ export async function getWorkTimeline(
       for (const taskId of inheritedVisible) evidence.push({ ...base, taskId, linkVia: "pr" });
       continue;
     }
-    // Genuinely no task → "Other". No chip is needed any more: a referenced task is now a header, so a
-    // chip could only ever name a task outside `taskInfo` (clipped by TASK_LIMIT) — keep it for exactly
-    // that residual case rather than dropping the association entirely.
-    const ownChip = (allLinks.get(e.id) ?? []).map((id) => chipInfo.get(id)).find((c): c is EvidenceTaskRef => !!c);
-    const prChip = ownChip ? undefined : inherited.map((id) => chipInfo.get(id)).find((c): c is EvidenceTaskRef => !!c);
-    const chip = ownChip ?? prChip;
-    evidence.push({
-      ...base,
-      taskId: null,
-      ...(chip ? { linkedTask: chip, linkVia: ownChip ? ("commit-text" as const) : ("pr" as const) } : {}),
-    });
+    // Genuinely no task → "Other", with no chip. The #373 chip existed ONLY because a done/backlog task
+    // couldn't be a header; now that any referenced task heads its own group, the chip is unreachable by
+    // construction — every id `allLinks` can yield comes from `linkTargets`, all of which are in
+    // `taskInfo`, so reaching here means the item references no visible task at all and there is nothing
+    // to chip. (`EvidenceTaskRef`/`linkedTask` stay in the payload type so cached rows written by the
+    // previous build still render during their TTL; nothing populates them any more.)
+    evidence.push({ ...base, taskId: null });
   }
 
   // SIGNAL lane — decisions (data ABOUT work, never counted as work). WARN, not throw: this is a context

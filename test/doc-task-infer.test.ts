@@ -81,6 +81,7 @@ describe("candidatesFor — the person's tasks first, but never hard-restricted"
 
 describe("applyInferredLinks — the trust boundary", () => {
   const visibleIds = new Set(["t1", "t2"]);
+  const offeredDocs = new Set(["item-1"]);
   const choice = (over: Partial<ModelChoice> = {}): ModelChoice => ({
     docId: "item-1",
     taskId: "t1",
@@ -90,28 +91,39 @@ describe("applyInferredLinks — the trust boundary", () => {
   });
 
   it("links a confident choice that is inside the visible set", () => {
-    const out = applyInferredLinks([choice()], visibleIds);
+    const out = applyInferredLinks([choice()], visibleIds, offeredDocs);
     expect(out).toEqual([
       { itemId: "item-1", taskId: "t1", method: "llm", confidence: 0.9, detail: "describes the ownership timeline work" },
     ]);
   });
 
   it("an explicit NO MATCH produces no link (the expected outcome, not a failure)", () => {
-    expect(applyInferredLinks([choice({ taskId: null })], visibleIds)).toEqual([]);
+    expect(applyInferredLinks([choice({ taskId: null })], visibleIds, offeredDocs)).toEqual([]);
   });
 
   it("a BELOW-THRESHOLD match produces no link", () => {
-    expect(applyInferredLinks([choice({ confidence: MIN_CONFIDENCE - 0.01 })], visibleIds)).toEqual([]);
+    expect(applyInferredLinks([choice({ confidence: MIN_CONFIDENCE - 0.01 })], visibleIds, offeredDocs)).toEqual([]);
   });
 
   it("TIER: a task id outside the visible set links nothing, silently", () => {
     // The model can only be handed visible candidates, but a hallucinated/stale id must never resolve.
-    expect(applyInferredLinks([choice({ taskId: "t-secret" })], visibleIds)).toEqual([]);
+    expect(applyInferredLinks([choice({ taskId: "t-secret" })], visibleIds, offeredDocs)).toEqual([]);
+  });
+
+  it("a docId we never OFFERED links nothing — both sides of the pair are validated", () => {
+    // Guarantees 1 and 4 (deterministic-wins, external-excluded) are enforced by what we put IN the
+    // batch; validating only the task id would let an echoed/hallucinated docId smuggle a link back out.
+    expect(applyInferredLinks([choice({ docId: "item-never-offered" })], visibleIds, offeredDocs)).toEqual([]);
+  });
+
+  it("collapses duplicate choices for the same (doc, task) pair — the table's PK", () => {
+    const out = applyInferredLinks([choice(), choice({ confidence: 0.95 })], visibleIds, offeredDocs);
+    expect(out).toHaveLength(1);
   });
 
   it("drops a malformed confidence rather than trusting it", () => {
-    expect(applyInferredLinks([choice({ confidence: Number.NaN })], visibleIds)).toEqual([]);
-    expect(applyInferredLinks([choice({ confidence: 42 })], visibleIds)).toEqual([]);
+    expect(applyInferredLinks([choice({ confidence: Number.NaN })], visibleIds, offeredDocs)).toEqual([]);
+    expect(applyInferredLinks([choice({ confidence: 42 })], visibleIds, offeredDocs)).toEqual([]);
   });
 });
 
@@ -135,6 +147,12 @@ describe("inferenceInputsHash — re-running must not re-spend", () => {
 
   it("changes when the PROMPT changes — a deploy that edits it re-runs, never serves stale judgments", () => {
     expect(inferenceInputsHash(docs, cands, "SYSTEM v2")).not.toBe(inferenceInputsHash(docs, cands, prompt));
+  });
+
+  it("cannot be spoofed by a title containing the field separator", () => {
+    const a = [cand("t1", { title: "plain" })];
+    const b = [cand("t1", { title: "plain\nsmuggled" })];
+    expect(inferenceInputsHash(docs, a, prompt)).not.toBe(inferenceInputsHash(docs, b, prompt));
   });
 
   it("is order-independent (the same set fetched in a different order is the same work)", () => {
