@@ -151,6 +151,11 @@ the timeline computes links **inline**. So this feature must also add the **firs
 - Inferred links become viewer-visible → add `task_evidence` to `bustTeamLearningCaches`
   (`lib/ingest/reconcile-attribution.ts:20-27`), which evicts arcs + timeline but not this table.
 
+## Status of the Notion half (shipped separately)
+Notion credentials now have a home: **PR #384** adds `notion` to `integrations.type` (+ the config schema
+and the Admin → Integrations form), so the existing connector finally has a token to read. Google Drive is
+deliberately excluded — see below.
+
 ## Prerequisites for the Notion/GDoc half (separate work, tracked here so it isn't lost)
 1. Connect the **Notion** and **Google Drive** connectors (and settle where Notion credentials live —
    `integrations.type` has `google` but no `notion`).
