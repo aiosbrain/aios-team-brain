@@ -6,22 +6,22 @@
  *
  * Structure per (day, person):
  *   • tasks[]  — ONLY tasks that have ≥1 of the person's evidence items that day (evidence-gated: a
- *                task with no evidence never appears). Only ACTIVE tasks are ever link targets (the
- *                builder filters backlog/done out), so this is "the in-progress work they touched,"
+ *                task with no evidence never appears). STATUS does not gate it — a ticket that shipped
+ *                today still heads its group, carrying its status — so this is "the work they touched",
  *                each with that day's evidence nested + grouped by source.
- *   • other[]  — that day's evidence that referenced no active task, grouped by source.
+ *   • other[]  — that day's evidence that referenced NO task at all, grouped by source.
  * Ordering: days DESC (undated last); within a day, people by activity DESC; a person's tasks by
  * evidence count DESC; items newest-first, capped per source.
  */
 
-/** One piece of a person's work — a commit or a dated deliverable. `taskId` links it to a task. */
-/** A PM task an "Other"-bucket item references but which is NOT active (done/backlog), so it can't be a
- *  nesting header (#350 keeps headers active-only). Shown as a chip so the commit↔task association is still
- *  visible — e.g. a commit for a ticket that just went Done. */
+/** LEGACY (no longer populated). This described a task an "Other"-bucket item referenced but which was
+ *  barred from being a nesting header by the old ACTIVE-only rule, shown as a chip so the association
+ *  stayed visible. Now that ANY referenced task heads its own group, the chip is unreachable — the type
+ *  is retained only so payloads cached by the previous build still render during their TTL. */
 export interface EvidenceTaskRef {
   key: string; // the task's issue key / row_key, e.g. AIO-138
   title: string;
-  status: string; // done / backlog / ready — why it isn't a nesting header
+  status: string;
 }
 
 export interface EvidenceItem {
@@ -33,8 +33,8 @@ export interface EvidenceItem {
   kind: string;
   /** WORK time — ISO. Its date places the row on a day. */
   at: string;
-  /** Set only for an "Other"-bucket item that references a real but NON-active task (done/backlog) — the
-   *  commit↔task association shown as a chip, since the task can't be an active nesting header. */
+  /** LEGACY chip — no longer populated (any referenced task now heads its own group). Kept so cached
+   *  payloads from the previous build still render during their TTL. */
   linkedTask?: EvidenceTaskRef;
   /** How this evidence got its task: the item's OWN cited issue key, or inherited from the PR that merged
    *  it (`work_events`). Provenance carried in the payload so an inherited (lower-precision) link is
@@ -44,14 +44,14 @@ export interface EvidenceItem {
 
 export interface EvidenceWithMember extends EvidenceItem {
   memberId: string;
-  /** The active task this evidence references (via issue key), if any. Unlinked → the "Other" bucket. */
+  /** The task this evidence references (via issue key or PR inheritance), any status. Unlinked → "Other". */
   taskId?: string | null;
 }
 
-/** Display info for an active task, resolved once per in-window task (id → this). */
+/** Display info for a referenced task, resolved once per in-window task (id → this). */
 export interface TaskInfo {
   title: string;
-  status: string; // task_status (in_progress / blocked — active only)
+  status: string; // task_status (the task's status, e.g. in_progress / blocked / done)
   source: string; // pm source slug: linear | plane | tasks
 }
 
@@ -103,7 +103,7 @@ export interface PersonDay {
    *  pure builder, so it's computed once per rebuild and never runs in the data-mechanics tier. */
   summary?: string;
   tasks: TaskGroup[];
-  other: SourceGroup[]; // WORK evidence linked to no active task
+  other: SourceGroup[]; // WORK evidence linked to no task at all
   signals: SignalGroup[]; // Context lane — decisions etc. (about work); shown, never counted as work
 }
 
@@ -120,7 +120,7 @@ export interface TimelineMember {
 }
 
 /**
- * Pure: the LLM input describing one person's day — their in-progress tasks (with the work items nested
+ * Pure: the LLM input describing one person's day — the tasks they touched (with the work items nested
  * under each) + any "Other" work. Fed to `lib/dashboard/timeline-summary` to produce a 1–3 sentence
  * synopsis. Returns "" when there's nothing to summarize (caller skips the LLM call). Per-source items
  * are capped so a huge day can't blow the prompt.
@@ -129,7 +129,7 @@ export function summaryPromptFor(p: PersonDay, dayLabel: string, itemCap = 8): s
   const titles = (g: SourceGroup): string => g.items.slice(0, itemCap).map((i) => i.title).join("; ");
   const lines: string[] = [];
   if (p.tasks.length) {
-    lines.push("In-progress tasks (with the work done on each):");
+    lines.push("Tasks touched (with the work done on each):");
     for (const t of p.tasks) {
       const work = t.sources.map((g) => `${g.source}: ${titles(g)}`).join(" · ");
       lines.push(`- ${t.title} [${t.status}]${work ? ` — ${work}` : ""}`);

@@ -33,7 +33,10 @@ const TTL_MS = 5 * 60_000; // 5-min freshness; the ledger is cheap, so refresh o
 // shape, so it MUST bump — the cold rebuild is the cheap pure builder (no inline LLM).
 // v5: commits inherit their PR's task (work_events), so a cached v4 ledger would serve link-less rows for
 // a full TTL after deploy — bump so it rebuilds with the new links.
-const PAYLOAD_VERSION = 5;
+// v6: a referenced task now heads its own group whatever its status. The SHAPE is unchanged, but the
+// MEANING is: a v5 row would keep serving the old "Other · not linked to a task" grouping (with its
+// self-contradicting chips) for a full TTL after deploy. Same rule as v5 — bump on a meaning change.
+const PAYLOAD_VERSION = 6;
 
 /** The timeline WITH the per-person-day synopsis attached. Runs the (up to 7d × roster) best-effort LLM
  *  calls — so it's used ONLY on the BACKGROUND refresh path, never inline on a request (a cold miss
@@ -51,6 +54,9 @@ interface CacheEntry {
 const mem = new Map<string, CacheEntry>();
 // Keys refreshing in the background, so N concurrent stale reads fire ONE rebuild.
 const refreshing = new Set<string>();
+// Keys whose inputs changed WHILE a rebuild was in flight — that rebuild's result is already stale, so
+// one more pass runs when it finishes (trailing edge). Without this a mid-rebuild bust is lost.
+const dirty = new Set<string>();
 
 const memKey = (teamId: string, tier: ViewerTier): string => `${teamId}:${tier}`;
 
@@ -111,7 +117,15 @@ export async function writeTimelineCache(
  * no empty-clobber cap). Best-effort.
  */
 export async function bustTeamTimeline(db: DbClient, teamId: string): Promise<void> {
-  for (const tier of ["team", "external"] as const) mem.delete(memKey(teamId, tier));
+  for (const tier of ["team", "external"] as const) {
+    const key = memKey(teamId, tier);
+    mem.delete(key);
+    // Invalidate an ALREADY-RUNNING rebuild too. It read its inputs before this bust, so its result is
+    // wrong the moment it lands — and it lands stamped `computed_at = now`, which would make the stale
+    // payload look FRESH and suppress the next read's refresh entirely (the re-attribution would then be
+    // invisible for a full TTL). Marking dirty makes the in-flight pass run once more with the new data.
+    if (refreshing.has(key)) dirty.add(key);
+  }
   try {
     const staleAt = new Date(Date.now() - TTL_MS - 60_000).toISOString();
     await db.from("work_timeline_cache").update({ computed_at: staleAt }).eq("team_id", teamId);
@@ -124,17 +138,30 @@ export async function bustTeamTimeline(db: DbClient, teamId: string): Promise<vo
  *  bound). Deduped via `refreshing`; errors logged, never thrown. */
 function refreshInBackground(teamId: string, tier: ViewerTier): void {
   const key = memKey(teamId, tier);
-  if (refreshing.has(key)) return;
+  // TRAILING EDGE, not plain dedup. A request arriving DURING a rebuild must not be dropped: the running
+  // pass already read its inputs, so it cannot contain whatever just changed — yet it finishes by writing
+  // `computed_at = now`, marking that stale-by-then payload FRESH for a full TTL. That silently discarded
+  // a `bustTeamTimeline` (i.e. a re-attribution) landing mid-rebuild. So mark the key dirty and re-run
+  // once when the in-flight pass finishes. Mirrors the running/dirty coalescer in
+  // `lib/ingest/reconcile-attribution.ts`. N concurrent stale reads still collapse to ≤2 rebuilds.
+  if (refreshing.has(key)) {
+    dirty.add(key);
+    return;
+  }
   refreshing.add(key);
   void (async () => {
     const bg = adminClient();
     try {
-      const days = await buildTimeline(bg, teamId, tier);
-      mem.set(key, { days, at: Date.now() });
-      await writeTimelineCache(bg, teamId, tier, days);
+      do {
+        dirty.delete(key); // claim the current request; anything arriving from here re-dirties the key
+        const days = await buildTimeline(bg, teamId, tier);
+        mem.set(key, { days, at: Date.now() });
+        await writeTimelineCache(bg, teamId, tier, days);
+      } while (dirty.has(key));
     } catch (err) {
       console.error("[timeline] background refresh failed:", err instanceof Error ? err.message : err);
     } finally {
+      dirty.delete(key);
       refreshing.delete(key);
     }
   })();
