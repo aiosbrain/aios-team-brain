@@ -309,6 +309,13 @@ export async function getWorkTimeline(
     if (str(fm.source) === "git") continue; // handled by gitRes — no double-count
     const source = normalizeSource(str(fm.source));
     if (source === "slack" || source === "granola" || r.kind === "transcript") continue; // slack: own query; meetings: excluded
+    // A PM issue's own description doc is the TICKET, not work done on it — and its path/title carry
+    // the issue's own key, so admitting it as evidence would let every assigned ticket self-satisfy
+    // the evidence gate and turn the timeline back into a backlog dump (the property "never the whole
+    // backlog" exists to prevent). The ticket already appears as a TASK; real work on it arrives as
+    // commits/docs that cite the key. (These docs are dated for the GRAPH's sake — see the linear/plane
+    // normalizers — so this exclusion is what keeps the timeline's behavior unchanged.)
+    if (str(fm.identifier) && (source === "linear" || source === "plane")) continue;
     const memberId = primaryOf(r);
     if (!memberId || !members.has(memberId)) continue;
     const at = itemWorkTime(fm);

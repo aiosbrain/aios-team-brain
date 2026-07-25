@@ -226,6 +226,13 @@ export function normalizeLinearDocs(input: NormalizeLinearInput): ItemPayload[] 
           assignee_id: it.assignee?.id ?? "",
           priority: PRIORITY_BY_INT[it.priority ?? 0] ?? "none",
           project_name: it.project?.name ?? "",
+          // WORK-TIME = the real state transition (the same signal the task row's `worked_at` uses).
+          // Without it the doc resolves to null and the GRAPH stamps the episode `synced_at`, so
+          // first-linking a Linear team dates every issue "today" and arcs narrate old tickets as this
+          // week (the H3 skew). An unstarted/backlog issue has no transition and stays honestly
+          // UNDATED — nobody has worked it yet — rather than being back-dated to its creation.
+          // Deliberately NOT `updatedAt`: that moves on any unrelated field edit (the #346 churn).
+          source_ts: linearWorkedAt(it),
         },
         body,
       };

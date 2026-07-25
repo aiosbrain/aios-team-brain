@@ -233,6 +233,10 @@ export function normalizePlaneDocs(input: NormalizePlaneInput): ItemPayload[] {
           project_id: input.projectId,
           // First assignee's Plane member id → resolved to a person at ingest (lib/ingest/run).
           assignee_id: (it.assignees ?? [])[0] ?? "",
+          // WORK-TIME = the state transition (same signal the task row's `worked_at` uses). Without it
+          // the GRAPH stamps the episode `synced_at`, dating every issue of a freshly-linked project
+          // "today" (the H3 skew). An incomplete item has no transition and stays honestly UNDATED.
+          source_ts: planeWorkedAt(it),
         },
         body,
       };
