@@ -234,7 +234,16 @@ export async function attributeIncomingItem(
   actorMemberId: string
 ): Promise<{ opts?: { authorMemberId: string | null } }> {
   const refs = parseAuthorRefs(payload.frontmatter ?? {});
-  if (refs.length === 0) return {};
+  if (refs.length === 0) {
+    // NO author signal at all — common for web/gdrive/confluence, which often carry no author.
+    // The never-connector invariant has to hold here too, not just when a signal exists but fails to
+    // resolve: otherwise a sync account claims every author-less document it ingests, and (because
+    // credit flows from `items.member_id`) that content lands in a real person's timeline and arcs.
+    // A HUMAN push with no signal keeps its own attribution — that IS their work (`aios push` on
+    // their own notes); only an automated actor is barred from claiming it.
+    const connectors = await connectorMemberIds(db, teamId);
+    return connectors.has(actorMemberId) ? { opts: { authorMemberId: null } } : {};
+  }
   const [map, connectors] = await Promise.all([buildIdentityMap(db, teamId), connectorMemberIds(db, teamId)]);
   const res = resolveAuthors(map, refs, connectors);
   if (res.memberId) return { opts: { authorMemberId: res.memberId } };
