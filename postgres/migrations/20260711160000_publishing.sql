@@ -5,7 +5,7 @@
 
 alter table integrations drop constraint if exists integrations_type_check;
 alter table integrations add constraint integrations_type_check
-  check (type in ('github','granola','slack','wise','linear','plane','openai','anthropic','google','openrouter','typefully'));
+  check (type in ('github','granola','slack','wise','linear','plane','openai','anthropic','google','openrouter','typefully','notion'));
 
 alter table social_settings add column if not exists publish_dry_run boolean not null default true;
 

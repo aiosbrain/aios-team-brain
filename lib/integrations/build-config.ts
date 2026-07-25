@@ -45,6 +45,9 @@ export function buildConfig(
       return { matchKeywords: list };
     case "wise":
       return list[0] ? { profileId: list[0] } : {};
+    case "notion":
+      // `databaseId=<id>` selects a whole database; otherwise the entries are page ids.
+      return kv.databaseId ? { databaseId: kv.databaseId } : { pageIds: list };
     case "linear": {
       const base = Object.keys(kv).length
         ? { teamId: kv.teamId, projectId: kv.projectId, doneStateName: kv.doneStateName }

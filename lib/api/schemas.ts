@@ -385,6 +385,10 @@ export const INTEGRATION_TYPES = [
   "github",
   "granola",
   "slack",
+  // Notion: the token is the SECRET; the non-secret selection is which pages (or one database) to pull.
+  // The connector already exists (ingestion/aios_ingest/sources/notion.py + notion_authors.py, which
+  // resolves created_by/last_edited_by → the item's authors) — it just had nowhere to read a token from.
+  "notion",
   "wise",
   "linear",
   "plane",
@@ -477,6 +481,14 @@ const integrationConfigSchemas: Record<IntegrationType, z.ZodType> = {
     })
     .strict(),
   wise: z.object({ profileId: z.string().max(64).optional() }).strict(),
+  // Either pageIds OR databaseId — the connector requires one (it raises if both are absent). Not
+  // enforced here: a half-configured integration must be savable, and the connector reports the error.
+  notion: z
+    .object({
+      pageIds: z.array(z.string().min(1).max(120)).max(200).default([]),
+      databaseId: z.string().max(120).optional(),
+    })
+    .strict(),
   linear: z
     .object({
       teamId: z.string().max(64).optional(),
