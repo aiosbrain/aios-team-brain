@@ -99,14 +99,35 @@ export async function writeArcCache(
   teamId: string,
   groupKey: string,
   arcs: NarrativeArc[],
-  factsHash: string | null
+  factsHash: string | null,
+  /**
+   * Write the row already PAST its TTL, so the next read treats it as stale and recomputes.
+   *
+   * For a result we don't trust enough to serve for a full window but still want persisted — a synthesis
+   * that produced nothing although facts existed (the model failed), or one whose inputs were degraded.
+   * Stamping those `now` is what pinned an empty arc panel for 4h with no retry: SWR only re-fires on a
+   * stale row, so "fresh and wrong" is the one state that can't self-heal.
+   *
+   * Aged by TTL + 1min, the same offset `staleArcCache` uses — past the TTL so it re-fires, but far
+   * inside `EMPTY_CLOBBER_MAX_AGE_MS` so the next attempt still treats this row as recent
+   * transient-failure cover rather than "persistently empty, accept it".
+   */
+  opts: { staleOnArrival?: boolean } = {}
 ): Promise<void> {
   try {
     // `arcs` is a top-level JSON array. The pg adapter only auto-casts non-array objects to jsonb, so
     // serialize it ourselves — a string param binds as text and Postgres assignment-casts it into the
     // jsonb column (a raw JS array would otherwise be bound as a Postgres array literal → json error).
     await db.from("arc_cache").upsert(
-      { team_id: teamId, group_key: groupKey, arcs: JSON.stringify(arcs), facts_hash: factsHash, computed_at: new Date().toISOString() },
+      {
+        team_id: teamId,
+        group_key: groupKey,
+        arcs: JSON.stringify(arcs),
+        facts_hash: factsHash,
+        computed_at: new Date(
+          opts.staleOnArrival ? Date.now() - (ARC_CACHE_TTL_MS + 60_000) : Date.now()
+        ).toISOString(),
+      },
       { onConflict: "team_id,group_key" }
     );
   } catch {

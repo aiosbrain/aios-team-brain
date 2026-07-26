@@ -118,16 +118,23 @@ export async function recentFacts(
 /**
  * Resolve a set of episode UUIDs → their source item id + source, tier-scoped. Episodes are named
  * `items:<id>`, so this lets a fact (which carries `episodeUuids`) link back to the brain item that
- * produced it — the provenance behind a narrative arc's evidence. Best-effort empty map on failure.
+ * produced it — the provenance behind a narrative arc's evidence.
+ *
+ * Returns `ok: false` when the lookup FAILED, as distinct from legitimately finding nothing. The
+ * difference matters upstream: with no items resolved, every fact goes unattributed and nothing can be
+ * filtered by eligibility, so arc synthesis still produces a plausible — and wrong — set of arcs. It
+ * used to swallow the error into an empty map, which made that indistinguishable from "this window has
+ * no episodes" and let the bad set overwrite good arcs as fresh (H11).
  */
 export async function resolveEpisodeItems(
   groups: string[],
   uuids: string[],
   maxUuids = 500
-): Promise<Map<string, { itemId?: string; source?: string }>> {
+): Promise<{ items: Map<string, { itemId?: string; source?: string }>; ok: boolean }> {
   const out = new Map<string, { itemId?: string; source?: string }>();
   const unique = [...new Set(uuids.filter(Boolean))].slice(0, maxUuids);
-  if (!neo4jConfigured() || groups.length === 0 || unique.length === 0) return out;
+  // Not configured / nothing to ask about is a legitimate empty, not a failure.
+  if (!neo4jConfigured() || groups.length === 0 || unique.length === 0) return { items: out, ok: true };
   try {
     const rows = await runRead<{ uuid: string; name: string | null; source: string | null }>(
       `MATCH (ep:Episodic)
@@ -142,9 +149,13 @@ export async function resolveEpisodeItems(
         source: r.source ? r.source.toLowerCase() : undefined,
       });
     }
-    return out;
-  } catch {
-    return out; // degrade — evidence just won't carry links
+    return { items: out, ok: true };
+  } catch (err) {
+    console.error(
+      "[arcs] resolveEpisodeItems failed — synthesis inputs are incomplete:",
+      err instanceof Error ? err.message : err
+    );
+    return { items: out, ok: false };
   }
 }
 

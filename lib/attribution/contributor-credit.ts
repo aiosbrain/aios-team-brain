@@ -261,9 +261,13 @@ export async function resolveItemCreditIds(
 export async function resolveItemCredit(
   db: DbClient,
   teamId: string,
-  itemIds: string[]
+  itemIds: string[],
+  /** `strict` propagates a failed read instead of returning an empty map — see the note on
+   *  `resolveItemCreditIds`. Arc synthesis passes it so a DB blip can't silently unattribute every
+   *  fact and then overwrite good arcs with the attribution-less result (H11). */
+  opts: { strict?: boolean } = {}
 ): Promise<Map<string, ItemCredit>> {
-  const { byItem, nameOf } = await resolveCreditCore(db, teamId, itemIds);
+  const { byItem, nameOf } = await resolveCreditCore(db, teamId, itemIds, opts);
   const out = new Map<string, ItemCredit>();
   for (const [id, credit] of byItem) {
     const contributors = [...new Set(credit.contributorIds.map(nameOf).filter((n): n is string => !!n))];
