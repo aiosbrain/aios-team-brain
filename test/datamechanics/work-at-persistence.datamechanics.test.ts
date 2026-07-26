@@ -16,8 +16,9 @@ import { db, ingest, seedTeam } from "./helpers";
  *   • `work_at_from_source` — whether the SOURCE told us, or we fell back. Surfaces differ on what to do
  *                             with a guess (the timeline drops it, the projector accepts it), and that
  *                             difference is legitimate — so it has to be readable, not re-derived.
- *   • `first_seen_at`       — when this row first existed here. The honest fallback, and unlike
- *                             `synced_at` it never moves.
+ * The honest fallback is the EXISTING `items.created_at` — set once on insert and never bumped, so it
+ * already IS the "when did this first exist here" column. No new one for it; these specs say
+ * `created_at` wherever the review report says "first-seen".
  */
 
 describe("items.work_at is persisted at ingest (real Postgres)", () => {
@@ -55,7 +56,7 @@ describe("items.work_at is persisted at ingest (real Postgres)", () => {
     expect(ms(row.synced_at) - ms(row.work_at)).toBeGreaterThan(24 * 60 * 60_000);
   });
 
-  it("does NOT move work_at or first_seen_at when a re-sync tick re-pushes the same item", async () => {
+  it("does NOT move work_at or created_at when a re-sync tick re-pushes the same item", async () => {
     // The core of R1. Every connector re-pushes every item every 30 minutes; `synced_at` moves each
     // time. Anything derived from it therefore ages forward, which is how months-old work resurfaces as
     // "today". Both persisted timestamps must be immune.
@@ -80,7 +81,7 @@ describe("items.work_at is persisted at ingest (real Postgres)", () => {
     expect(ms(second.synced_at)).toBeGreaterThanOrEqual(ms(first.synced_at)); // …while sync time did move
   });
 
-  it("falls back to first_seen_at — never the bumped synced_at — when the source dates nothing", async () => {
+  it("falls back to created_at — never the bumped synced_at — when the source dates nothing", async () => {
     const seed = await seedTeam();
     await ingest(seed, { kind: "deliverable", path: "docs/undated.md", body: "no date anywhere", access: "team" });
 
@@ -111,6 +112,50 @@ describe("items.work_at is persisted at ingest (real Postgres)", () => {
 
     const row = await stored(seed.teamId, "docs/spec.md");
     expect(new Date(row.work_at).toISOString()).toBe("2026-06-15T00:00:00.000Z");
+    expect(row.work_at_from_source).toBe(true);
+  });
+
+  it("converges a BACKFILLED row to its real work-time on the next sync tick", async () => {
+    // The migration deliberately doesn't parse dates out of source-controlled jsonb (no `try_cast` in
+    // PG16, and one bad row would fail the whole deploy). It backfills every existing row to
+    // `created_at`/not-from-source and relies on THIS to fix them: every connector re-pushes every item
+    // each 30-minute tick, and the unchanged-path heal recomputes through the one resolver. If that
+    // didn't hold, the entire existing corpus would sit at first-seen forever — so the migration's
+    // safety argument rests on this spec.
+    const seed = await seedTeam();
+    const sourceTs = "2026-03-14T12:00:00.000Z";
+    await ingest(seed, {
+      kind: "deliverable",
+      path: "docs/spec.md",
+      body: "the spec",
+      access: "team",
+      frontmatter: { source_ts: sourceTs },
+    });
+
+    // Reproduce the exact post-migration state: the row's frontmatter ALREADY carries its date, but
+    // work_at sits at the backfilled fallback because no code had resolved it when the column landed.
+    const { data: before } = await db()
+      .from("items")
+      .select("created_at")
+      .eq("team_id", seed.teamId)
+      .maybeSingle();
+    const firstSeen = new Date((before as { created_at: string | Date }).created_at).toISOString();
+    await db()
+      .from("items")
+      .update({ work_at: firstSeen, work_at_from_source: false })
+      .eq("team_id", seed.teamId);
+
+    // One ordinary re-sync tick — same body, nothing else changed.
+    await ingest(seed, {
+      kind: "deliverable",
+      path: "docs/spec.md",
+      body: "the spec",
+      access: "team",
+      frontmatter: { source_ts: sourceTs },
+    });
+
+    const row = await stored(seed.teamId, "docs/spec.md");
+    expect(new Date(row.work_at).toISOString()).toBe(sourceTs);
     expect(row.work_at_from_source).toBe(true);
   });
 

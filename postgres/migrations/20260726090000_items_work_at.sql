@@ -18,12 +18,12 @@
 alter table items add column if not exists work_at timestamptz;
 alter table items add column if not exists work_at_from_source boolean not null default false;
 
--- DEFAULT BEFORE BACKFILL, and both before SET NOT NULL — the ordering is load-bearing. `pg:schema` is
--- the pre-deploy step, so the OLD app is still serving while this runs and its inserts don't know the
--- column. Without the default already in place, any row inserted between the UPDATE below and the SET
--- NOT NULL lands NULL and fails the constraint — i.e. fails the deploy, intermittently and only under
--- live traffic. (Note this is `alter column set default`, which does NOT backfill, so existing rows are
--- still handled by the UPDATE below and get `created_at` rather than now().)
+-- Default set BEFORE the backfill. Belt-and-braces rather than load-bearing: `pg-load-schema` runs each
+-- migration file as ONE implicit transaction, and the first `alter table` here takes ACCESS EXCLUSIVE
+-- until commit, so no concurrent insert can slip a NULL between the UPDATE and the SET NOT NULL anyway.
+-- It matters for the OTHER window — `pg:schema` is the pre-deploy step, so the old app keeps serving
+-- afterwards with code that doesn't know the column, and the default is what makes its inserts valid.
+-- (`alter column set default` does NOT backfill, so existing rows still take `created_at` below.)
 alter table items alter column work_at set default now();
 
 -- Backfill to the honest fallback, NOT to a guessed parse of frontmatter. A SQL date-parse over
@@ -34,8 +34,9 @@ alter table items alter column work_at set default now();
 -- So the imprecise state lasts one sync cycle for live sources, and for a disconnected source
 -- `created_at` is the honest answer anyway.
 update items set work_at = created_at where work_at is null;
--- Safe now: the default above means nothing new can be NULL. (Takes a brief ACCESS EXCLUSIVE lock to
--- validate — fine at this table's size; a very large `items` would want NOT VALID + VALIDATE instead.)
+-- `created_at` is already NOT NULL (20260724120000), so this cannot propagate a NULL. Validating the
+-- constraint scans the table under ACCESS EXCLUSIVE — fine at this size; a very large `items` would
+-- want the NOT VALID + VALIDATE dance instead.
 alter table items alter column work_at set not null;
 
 -- The point of persisting it: SQL-native work windows and ordering (the timeline's day buckets, the
