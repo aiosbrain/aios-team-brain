@@ -221,6 +221,9 @@ export function normalizeLinearDocs(input: NormalizeLinearInput): ItemPayload[] 
           // team-vocabulary-agnostic signal for arc eligibility (`started` = active work). Preferred over
           // the display-name regex; the name stays as fallback for rows ingested before this field.
           state_type: it.state?.type ?? "",
+          // The BRAIN-normalized status, same value as this issue's task row — the provider-agnostic
+          // field arc eligibility gates on (H6). `state`/`state_type` stay for rows ingested earlier.
+          status: linearStatus(it.state?.name, it.state?.type),
           assignee: it.assignee?.displayName ?? "",
           // Assignee's Linear user id → resolved to a person at ingest (lib/ingest/run).
           assignee_id: it.assignee?.id ?? "",

@@ -209,10 +209,13 @@ export function normalizePlaneDocs(input: NormalizePlaneInput): ItemPayload[] {
   const aiosSources = input.aiosSources ?? ["aios", "aios-backlog"];
   const identifier = input.projectIdentifier;
   const slugSeg = safeSegment(identifier || input.projectId.slice(0, 8)) || "project";
+  // Same lookup the task-row normalizer uses — the issue doc needs the state to carry a canonical status.
+  const stateById = new Map(input.states.map((s) => [s.id, s]));
   return input.items
     .filter((it) => !isAiosOrigin(it.external_source, aiosSources))
     .map((it) => {
       const rk = rowKeyFor(it, identifier);
+      const st = it.state ? stateById.get(it.state) : undefined;
       const title = it.name?.trim() || "(untitled)";
       // htmlToPlainText handles block tags + entities; strip any remaining inline tags so the
       // searchable body is clean prose.
@@ -237,6 +240,12 @@ export function normalizePlaneDocs(input: NormalizePlaneInput): ItemPayload[] {
           // the GRAPH stamps the episode `synced_at`, dating every issue of a freshly-linked project
           // "today" (the H3 skew). An incomplete item has no transition and stays honestly UNDATED.
           source_ts: planeWorkedAt(it),
+          // The BRAIN-normalized status (the same value this issue's task row carries). Arc eligibility
+          // gates on this one canonical field for every provider — without it Plane had no state in its
+          // frontmatter at all, so the gate could not see it and Done/Backlog Plane tickets shaped arcs
+          // (H6). Emitting it here rather than teaching the gate Plane's vocabulary is what stops the
+          // next provider from silently opting out of the rule.
+          status: planeStatus(st?.name, st?.group),
         },
         body,
       };
