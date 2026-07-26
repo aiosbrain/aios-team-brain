@@ -31,6 +31,18 @@ function fakeDb(existing: NarrativeArc[] | null, computedAtMs = Date.now()) {
 
 const HOUR = 60 * 60 * 1000;
 
+/**
+ * An untrustworthy result must be persisted with a SHORT life — fresh for a few minutes, then stale so
+ * the next view retries. Both extremes are bugs: a full TTL pins a failure for 4h with no retry (H12),
+ * while "already stale" makes every page view fire another recompute for as long as the failure lasts.
+ */
+function expectShortLived(row: unknown): void {
+  const at = Date.parse((row as { computed_at: string }).computed_at);
+  const remaining = ARC_CACHE_TTL_MS - (Date.now() - at);
+  expect(remaining).toBeGreaterThan(0); // not already stale — a persistent failure must not thrash
+  expect(remaining).toBeLessThanOrEqual(10 * 60_000); // …but it retries within minutes, not hours
+}
+
 const arc = (title: string): NarrativeArc => ({
   id: "arc-" + title,
   title,
@@ -78,9 +90,7 @@ describe("commitArcs — an empty synthesis must never clobber a good cache", ()
 
     expect(out).toEqual([]); // nothing to show right now — honest
     expect(upserts).toHaveLength(1);
-    const at = Date.parse((upserts[0] as { computed_at: string }).computed_at);
-    // Older than the TTL ⇒ the very next read treats it as stale and recomputes.
-    expect(Date.now() - at).toBeGreaterThan(ARC_CACHE_TTL_MS);
+    expectShortLived(upserts[0]);
   });
 
   it("…but a genuinely empty window (no facts at all) is written FRESH", async () => {
@@ -90,8 +100,9 @@ describe("commitArcs — an empty synthesis must never clobber a good cache", ()
     const { db, upserts } = fakeDb(null);
     await commitArcs(db, "team-1", "h12-genuinely-empty", [], null);
     expect(upserts).toHaveLength(1);
-    const at = Date.parse((upserts[0] as { computed_at: string }).computed_at);
-    expect(Date.now() - at).toBeLessThan(ARC_CACHE_TTL_MS);
+    // Fresh: it should settle for the full window, not re-run the model on every view of a quiet team.
+    const remaining = ARC_CACHE_TTL_MS - (Date.now() - Date.parse((upserts[0] as { computed_at: string }).computed_at));
+    expect(remaining).toBeGreaterThan(ARC_CACHE_TTL_MS / 2);
   });
 
   it("H11: a DEGRADED result never freshens over a healthy prior", async () => {
@@ -115,8 +126,7 @@ describe("commitArcs — an empty synthesis must never clobber a good cache", ()
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     await commitArcs(db, "team-1", "h11-degraded-cold", [arc("partial")], "h9", { degraded: true });
     expect(upserts).toHaveLength(1);
-    const at = Date.parse((upserts[0] as { computed_at: string }).computed_at);
-    expect(Date.now() - at).toBeGreaterThan(ARC_CACHE_TTL_MS);
+    expectShortLived(upserts[0]);
     warn.mockRestore();
   });
 

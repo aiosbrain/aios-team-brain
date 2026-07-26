@@ -77,6 +77,11 @@ const COHERENCE_TIMEOUT_MS = Math.max(1_000, Number(process.env.ARC_COHERENCE_TI
 // How long the empty-clobber guard keeps trusting a prior non-empty arc set. Within this window an
 // empty synthesis is treated as a transient failure (keep the prior); beyond it, a persistently-empty
 // result is accepted as genuine so the panel can't be pinned to ancient arcs forever (Fable review).
+/** How long an UNTRUSTWORTHY arc result is served before the next view retries it. Short enough that a
+ *  transient LLM/graph failure self-heals in minutes rather than hours, long enough that a persistent one
+ *  doesn't turn every page view into a recompute. */
+const UNTRUSTED_RETRY_AFTER_MS = 5 * 60_000;
+
 const EMPTY_CLOBBER_MAX_AGE_MS = (() => {
   // Guard the parse: a garbage/empty env yields NaN/0, and `ageMs < NaN` is always false → EVERY empty
   // synthesis would clobber, silently reverting the incident fix. Fall back unless it's finite and >0.
@@ -703,6 +708,15 @@ async function synthesizeArcs(
     console.error("[arcs] eligibility gate unavailable:", err instanceof Error ? err.message : err);
     degraded = true;
   }
+  // STOP HERE if the inputs are degraded. `commitArcs` will refuse to publish this result anyway, so
+  // running the model would buy nothing and cost a real (reasoning-model) call — and with a persistent
+  // failure, one per retry. Returning the hash-less empty lets commitArcs apply the same rule it applies
+  // to a model failure: keep a healthy prior, else persist a short-lived row that retries soon.
+  if (degraded) {
+    console.warn("[arcs] synthesis inputs degraded — skipping the model and keeping whatever is cached");
+    return { arcs: [], factsHash: null, degraded: true };
+  }
+
   const factItemIds = (f: AtomicFact): string[] =>
     f.episodeUuids.map((u) => epToItem.get(u)?.itemId).filter((id): id is string => !!id);
   const eligiblePool = ineligible.size
@@ -852,15 +866,20 @@ export async function commitArcs(
     }
   }
   // An untrustworthy result still gets PERSISTED (something beats a blank panel when there is no prior),
-  // but stamped past its TTL so the very next view recomputes instead of trusting it for 4h.
-  const at = untrustworthy ? Date.now() - (CACHE_TTL_MS + 60_000) : Date.now();
+  // but with a deliberately SHORT life so the next attempt comes soon instead of 4h later.
+  //
+  // Not "already stale": that would make every page view fire another recompute for as long as the
+  // underlying failure lasted — a rebuild (and, before the early return above, an LLM call) per viewer.
+  // Aging it by `TTL - RETRY_AFTER_MS` instead means the row reads fresh for RETRY_AFTER_MS and then goes
+  // stale, which bounds retries to roughly one per that window while still being far short of the full TTL.
+  const at = untrustworthy ? Date.now() - (CACHE_TTL_MS - UNTRUSTED_RETRY_AFTER_MS) : Date.now();
   if (untrustworthy) {
     console.warn(
-      `[arcs] ${modelFailed ? "synthesis produced no arcs from a non-empty fact set" : "degraded synthesis"} for ${key}; persisting stale-on-arrival so the next view retries`
+      `[arcs] ${modelFailed ? "synthesis produced no arcs from a non-empty fact set" : "degraded synthesis"} for ${key}; persisting with a ${Math.round(UNTRUSTED_RETRY_AFTER_MS / 60_000)}min life so it retries soon`
     );
   }
   cache.set(key, { arcs: next, at, factsHash });
-  await writeArcCache(db, teamId, key, next, factsHash, { staleOnArrival: untrustworthy });
+  await writeArcCache(db, teamId, key, next, factsHash, { retryAfterMs: untrustworthy ? UNTRUSTED_RETRY_AFTER_MS : undefined });
   return next;
 }
 
