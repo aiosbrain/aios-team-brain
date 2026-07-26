@@ -56,6 +56,15 @@ const BODY_READ_CHARS = 2000;
 const ITEM_SCAN = 500;
 const MAX_TOKENS = 900;
 const TIMEOUT_MS = 45_000;
+/**
+ * Minimum gap between two paid runs for one team, whichever trigger fires. This leg is offered BOTH the
+ * scheduler tick (every `INGEST_POLL_MINUTES`, default 30) and the timeline's background rebuild (i.e. a
+ * page view), and neither cadence is the right one to pay a model at: inferences only need to be as fresh
+ * as a person's reading of them, and the underlying docs change on the order of days, not minutes.
+ * The clock is the last recorded run's `finished_at` — see `lastRun`.
+ */
+const COOLDOWN_MS = Math.max(1, Number(process.env.DOC_TASK_INFER_INTERVAL_HOURS) || 12) * 3_600_000;
+
 /** `ingest_runs.source` for this leg — also the key used to find the previous run's inputs hash. */
 export const DOC_TASK_INFER_SOURCE = "doc_task_infer";
 
@@ -65,7 +74,7 @@ export interface InferRunResult {
   /** Confident, in-set links persisted. */
   linked: number;
   /** Set when the pass deliberately did nothing. */
-  skipped?: "no-llm" | "unchanged" | "nothing-to-score" | "no-candidates" | "model-null";
+  skipped?: "cooldown" | "no-llm" | "unchanged" | "nothing-to-score" | "no-candidates" | "model-null";
 }
 
 type ItemRow = {
@@ -89,6 +98,12 @@ const str = (v: unknown): string | undefined => (typeof v === "string" && v ? v 
 export async function runDocTaskInference(db: DbClient, teamId: string): Promise<InferRunResult> {
   const startedAt = Date.now();
   try {
+    // COOLDOWN first — one indexed query, and the cheapest possible way to decide not to spend. Both
+    // triggers (scheduler tick, timeline rebuild) share this clock, so they can never double-charge:
+    // whichever fires first sets `finished_at`, and that resets the timer for the other.
+    const prior = await lastRun(db, teamId);
+    if (prior && Date.now() - prior.finishedAt < COOLDOWN_MS) return { scored: 0, linked: 0, skipped: "cooldown" };
+
     // Spend nothing when the team has no model configured (every data-mechanics team, most self-hosts).
     const keys = await resolveAnsweringKeys(db, teamId).catch(() => null);
     if (!keys || !llmConfigured(keys)) return { scored: 0, linked: 0, skipped: "no-llm" };
@@ -189,7 +204,7 @@ export async function runDocTaskInference(db: DbClient, teamId: string): Promise
     // The hash keys on `content_sha256`, NOT on the prose — so this decision needs no bodies, which is
     // what lets the body read stay behind it.
     const inputsHash = inferenceInputsHash(scoreable, candidates, DOC_TASK_SYSTEM);
-    if (await lastInputsHash(db, teamId) === inputsHash) return { scored: 0, linked: 0, skipped: "unchanged" };
+    if (prior?.inputsHash === inputsHash) return { scored: 0, linked: 0, skipped: "unchanged" };
 
     // Only NOW pull prose, and only for the ≤MAX_DOCS docs actually being scored.
     const withBodies = await attachBodies(db, teamId, scoreable);
@@ -276,23 +291,36 @@ async function attachBodies(db: DbClient, teamId: string, docs: InferDoc[]): Pro
   }
 }
 
-/** The inputs hash carried on this team's most recent SUCCESSFUL run, or null. */
-async function lastInputsHash(db: DbClient, teamId: string): Promise<string | null> {
+/**
+ * This team's most recent run of THIS leg — the shared clock for both triggers. `ingest_runs` already
+ * persists it, so there is no separate "last refreshed" state to keep in sync.
+ *
+ *  • `finishedAt` drives the COOLDOWN, and counts a FAILED run too: a team whose provider is erroring
+ *    must not re-attempt every tick.
+ *  • `inputsHash` drives the skip-if-unchanged, and counts only a SUCCESSFUL run: a failure's hash would
+ *    suppress the retry that fixes it.
+ */
+async function lastRun(db: DbClient, teamId: string): Promise<{ finishedAt: number; inputsHash: string | null } | null> {
   try {
     const { data } = await db
       .from("ingest_runs")
-      .select("meta, ok")
+      .select("meta, ok, finished_at")
       .eq("team_id", teamId)
       .eq("source", DOC_TASK_INFER_SOURCE)
       .order("finished_at", { ascending: false })
       .limit(1)
       .maybeSingle();
-    const row = data as { meta?: { inputs_hash?: unknown } | null; ok?: boolean } | null;
-    if (!row?.ok) return null; // a failed run must not suppress the retry
-    const h = row.meta?.inputs_hash;
-    return typeof h === "string" && h ? h : null;
+    const row = data as { meta?: { inputs_hash?: unknown } | null; ok?: boolean; finished_at?: string | Date } | null;
+    if (!row) return null;
+    const raw = row.finished_at;
+    const finishedAt = raw ? (typeof raw === "string" ? Date.parse(raw) : new Date(raw).getTime()) : 0;
+    const h = row.ok ? row.meta?.inputs_hash : null;
+    return {
+      finishedAt: Number.isFinite(finishedAt) ? finishedAt : 0,
+      inputsHash: typeof h === "string" && h ? h : null,
+    };
   } catch {
-    return null; // unreadable history → re-run (spending once beats silently never running again)
+    return null; // unreadable history → run (spending once beats silently never running again)
   }
 }
 

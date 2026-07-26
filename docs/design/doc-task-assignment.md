@@ -198,5 +198,15 @@ Built with these decisions — including two deliberate deviations from the spec
   inference ever becomes person-dependent.
 - **Commits are excluded from scoring:** their own message and their PR already resolve deterministically
   (#377), so an inference could only be worse than what the timeline already has.
+- **Two triggers, one clock (added after the first build).** Running on every 30-minute scheduler tick was
+  the wrong cadence to pay a model at — inferences only need to be as fresh as somebody's reading of them,
+  and the underlying docs change on the order of days. The pass is now ALSO offered by the timeline's
+  background rebuild (a page view), and BOTH triggers share a per-team **cooldown**
+  (`DOC_TASK_INFER_INTERVAL_HOURS`, default 12h) measured from the last recorded run's `finished_at`. No new
+  state: `ingest_runs` already persists that timestamp, so whichever trigger fires first resets the timer
+  for the other and they cannot double-charge. The cooldown is the FIRST gate — one indexed query, ahead of
+  key resolution and any item scan — and a FAILED run starts it too, so a broken provider isn't retried
+  every tick. Net effect: a team that nobody looks at spends nothing, and an actively-read team pays at
+  most twice a day.
 - **Metering reuses the `timeline-summary` `LlmUsageSource` slice** rather than widening that closed union
   — the same call the arcs coherence pass makes by reusing `"arcs"`.
