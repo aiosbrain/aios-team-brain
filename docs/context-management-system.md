@@ -48,7 +48,7 @@ narrative arcs.
 
 | Table | Role | Sole writer |
 |---|---|---|
-| `items` | The ingested corpus (Slack, docs, commits, transcripts, tasks-as-items). Has the `search` tsvector generated column. | `lib/ingest.ingestItem` |
+| `items` | The ingested corpus (Slack, docs, commits, transcripts, tasks-as-items). Has the `search` tsvector generated column, and the persisted **work-time** (`work_at` / `work_at_from_source`) every surface orders and windows by — never `synced_at`, which each re-sync tick bumps. | `lib/ingest.ingestItem` |
 | `item_versions` | Append-only history of every changed push (body + frontmatter + sha + author). **Old content is kept here.** | `lib/ingest.ingestItem` |
 | `item_chunks` *(optional, pgvector)* | Semantic passages: `vector(1536)` embeddings, HNSW cosine index. | `lib/query/dense-index.indexItem` |
 | `tasks` | Structured task rows, diff-synced from item frontmatter; `audience` tier gate. | `lib/ingest` (materialize) |
