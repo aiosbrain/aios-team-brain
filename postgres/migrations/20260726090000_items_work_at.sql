@@ -18,6 +18,14 @@
 alter table items add column if not exists work_at timestamptz;
 alter table items add column if not exists work_at_from_source boolean not null default false;
 
+-- DEFAULT BEFORE BACKFILL, and both before SET NOT NULL — the ordering is load-bearing. `pg:schema` is
+-- the pre-deploy step, so the OLD app is still serving while this runs and its inserts don't know the
+-- column. Without the default already in place, any row inserted between the UPDATE below and the SET
+-- NOT NULL lands NULL and fails the constraint — i.e. fails the deploy, intermittently and only under
+-- live traffic. (Note this is `alter column set default`, which does NOT backfill, so existing rows are
+-- still handled by the UPDATE below and get `created_at` rather than now().)
+alter table items alter column work_at set default now();
+
 -- Backfill to the honest fallback, NOT to a guessed parse of frontmatter. A SQL date-parse over
 -- source-controlled jsonb would need per-key casting with no `try_cast` in PG16, and a bad value in one
 -- row would fail the whole deploy — the migration-replay lesson. Instead every existing row starts at
@@ -26,8 +34,9 @@ alter table items add column if not exists work_at_from_source boolean not null 
 -- So the imprecise state lasts one sync cycle for live sources, and for a disconnected source
 -- `created_at` is the honest answer anyway.
 update items set work_at = created_at where work_at is null;
+-- Safe now: the default above means nothing new can be NULL. (Takes a brief ACCESS EXCLUSIVE lock to
+-- validate — fine at this table's size; a very large `items` would want NOT VALID + VALIDATE instead.)
 alter table items alter column work_at set not null;
-alter table items alter column work_at set default now();
 
 -- The point of persisting it: SQL-native work windows and ordering (the timeline's day buckets, the
 -- retrieval recency legs) instead of fetching by `synced_at` and filtering in JS.
