@@ -82,6 +82,19 @@ function parseInstant(value: unknown): string | null {
 }
 
 /**
+ * The keys of `fm` that PARTICIPATE in work-time resolution — its actual spellings, not the
+ * canonical forms. Exported so the writer can act on a per-source rule about work-time (see
+ * `lib/ingest/source-rules`) without re-deriving which keys those are: a second list would drift
+ * from this one, and the drift would be silent in exactly the way the H2 vacuous-key-list bug was.
+ * Pure.
+ */
+export function workTimeKeysIn(fm: Record<string, unknown> | null | undefined): string[] {
+  if (!fm) return [];
+  const canonical = new Set(WORK_TIME_KEYS_NORMALIZED);
+  return Object.keys(fm).filter((key) => canonical.has(normalizeKey(key)));
+}
+
+/**
  * The work-time of an item, from its frontmatter — the highest-priority present-and-parseable
  * key, ISO-normalized. Null when the source gave us nothing usable, which callers must handle
  * explicitly (drop vs fall back) rather than silently defaulting to now()/sync-time. Pure.

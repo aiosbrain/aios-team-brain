@@ -99,6 +99,16 @@ validation (before any mutation) → item + version + derived-row materializatio
   changed (`project.ts:194`).
 - **Meeting notes** — unique on `source_item_id` (`schema.sql:1100`); a re-run returns
   `{created:false}` rather than duplicating (`notes.ts:178`).
+- **Per-source rules** — `lib/ingest/source-rules.ts` is the one table saying how a source's metadata
+  should be READ, consulted by the writer. The ingest contract is uniform; sources are not, and the
+  same wire field carries different evidence depending on who emitted it. Today it answers one
+  question — *is a work-time that moved on an unchanged body evidence of work?* `local` emits mtime
+  (moved by `touch`/`rsync`/`chmod`, no author, no edit → **noise**, so the stored `work_at` stands);
+  Linear/Plane emit the issue's last state transition (a ticket reaching `completed` is **work** with
+  a byte-identical body). One behaviour is right for one source and wrong for the other — the shape
+  that needs a rules layer, not a patch (audit M2). A new source must add a row:
+  `test/guards/source-rules-complete.test.ts` discovers producers from the sidecar registry and the
+  normalizers' `source:` literals and fails the build until its policy is stated.
 - **Removal** — `lib/ingest/purge.ts` is the counterpart to `ingestItem` (same single-writer rule) and
   the only way content LEAVES the brain. Versions/chunks/facts/mentions cascade; `graph_episodes` and
   the facts in Graphiti are retired explicitly (`lib/graph.retireEpisodesForItems`) with a
