@@ -26,6 +26,17 @@ function safeSegment(s: string): string {
   return s.toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") || "channel";
 }
 
+/**
+ * The path PREFIX every item of one Slack channel lives under (`slack/<channel-seg>/`). Exported so
+ * the removal path (`purgeItemsByPathPrefix`) derives it from the SAME function that writes it —
+ * hand-rolling `slack/${channelId.toLowerCase()}/` at a call site would silently stop matching the
+ * day `safeSegment` changes, and a purge that matches nothing fails as a no-op, not as an error.
+ * Always ends in `/` so it can't catch a sibling channel whose id merely starts the same.
+ */
+export function slackChannelPathPrefix(channelId: string): string {
+  return `slack/${safeSegment(channelId)}/`;
+}
+
 function tsToIso(ts: string): string {
   const ms = Math.round(parseFloat(ts) * 1000);
   return Number.isFinite(ms) ? new Date(ms).toISOString() : "";

@@ -766,6 +766,60 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 > and decisions reach the `decisions` table solely through the human-reviewed
 > decision-log.md → `aios push` → `materializeDecisions` flow. See `docs/GRANOLA.md`.
 
+> **`slack` public-channel invariant:** the in-app Slack connector ingests **only channels that are
+> public within the workspace**. There are exactly two tiers (`team` / `external`) and no stricter
+> one, so anything ingested from a private channel becomes readable by the whole team — which is not
+> what "private" means to the people in it. Enforced in two places, both **fail-closed**:
+> `SlackClient.channelInfo` (`lib/ingest/sources/slack.ts`) resolves `is_private`/`is_im`/`is_mpim`
+> and `fetchSlackChannel` returns **before reading any message**, so private content never enters the
+> process; and the admin save path (`lib/integrations/slack-validate.ts`) rejects a private channel id
+> at the moment it's added. A channel we cannot *prove* is public is treated as private and skipped
+> (unverifiable ≠ public), but only a **confirmed**-private channel triggers the purge below — deleting
+> a public channel's history on a transient scope failure would be the worse error.
+>
+> **Stated residue:** because the purge needs proof, content ingested from a channel the bot can no
+> longer describe (kicked from it, `channel_not_found`, or the channel removed from the config) is
+> **retained**, not removed — the run log says so per channel rather than implying the store is clean.
+> Restore the bot's access, or purge deliberately. When *every* configured channel comes back
+> unverifiable the runner emits one integration-level error ("no channel could be verified public")
+> instead of N per-channel lines, because that shape is almost always a missing `channels:read` scope
+> and it means Slack ingestion has stopped entirely.
+
+### Removal — `lib/ingest/purge.ts`
+
+Sync only ever adds or replaces, so until now nothing could leave the brain: a private channel added
+by mistake, or a message deleted at the source, stayed in the store, in retrieval, in credit, and in
+the graph forever (`item_versions` retains every superseded body, so a deleted message survives the
+re-render that drops it from the current body). `purgeItemsByPathPrefix` / `purgeItemIds` are the
+counterpart to `ingestItem` and live under the same single-writer rule — `lib/ingest` is the only
+writer of `items`, deletes included.
+
+Removal is a fan-out, because an item's derivatives have three different lifetimes:
+
+| Derivative                                                                                  | On purge                                                                                                                                       |
+| ------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| `item_versions`, `item_chunks`, `extracted_facts`, `stakeholder_mentions`, `task_evidence`, `meeting_notes` | FK **cascade** — the body and its whole history go with the row                                                                                |
+| `graph_episodes` **+ the facts in Graphiti**                                                | Explicit, via `lib/graph.retireEpisodesForItems` — no FK, and the facts live outside Postgres. Deletes inline, then leaves a `pending_delete_group_id` **tombstone** so `reconcileProjectedEpisodes` retries a Graphiti blip and drops the row only once the group is verified empty |
+| `tasks.source_item_id`, `decisions.source_item_id`                                          | `set null` — deliberately kept: independently authored records that merely cite the item                                                       |
+
+Every purge is audited (`items.purged`, with its reason and scope). Callers derive a path prefix from
+the same helper that writes the path (e.g. `slackChannelPathPrefix`); a hand-formatted prefix that
+stops matching fails as a silent no-op, not an error. LIKE wildcards in a prefix are escaped, so a
+path segment containing `_` can never widen a purge onto a neighbouring source.
+
+**Orphan-ness, not a marker, is the invariant.** `reconcileProjectedEpisodes` re-flags every
+unflagged ledger row whose item no longer exists and purges its group. That is deliberate: the
+projector runs on its own scheduler, so it can hold an item in memory when the purge deletes it and
+then re-push the body — clearing the pending flag and leaving a row that *looks* healthy. Detecting
+the missing item catches that race, and any other path that deletes an item, without a marker column.
+There is only ONE flag slot, so an orphan that already owed a *different* group's cleanup is
+converged over two passes (the old group is verified, then the flag re-points at the row's own group)
+rather than dropped after checking only one.
+
+**Eventually consistent downstream.** A purge removes the item, its versions/chunks/facts and its
+graph episodes. Derived snapshots recomputed on a schedule — `work_timeline_cache`, narrative-arc
+snapshots — can still quote purged content until their next recompute.
+
 ## Docs drift guard
 
 `scripts/check-docs-drift.mjs` derives the three inventories above from code

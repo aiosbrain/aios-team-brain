@@ -4,9 +4,10 @@ import { timeoutFetch } from "@/lib/http";
 import type { DbClient } from "@/lib/db/types";
 import { adminClient } from "@/lib/db/admin";
 import { ingestItem } from "@/lib/ingest";
+import { purgeItemsByPathPrefix } from "@/lib/ingest/purge";
 import { getEnabledIntegrationsWithSecrets } from "@/lib/integrations/manage";
-import { SlackClient, fetchSlackChannel } from "./sources/slack";
-import { normalizeThread } from "./sources/slack-normalize";
+import { SlackClient, fetchSlackChannel, privateChannelAction } from "./sources/slack";
+import { normalizeThread, slackChannelPathPrefix } from "./sources/slack-normalize";
 import { syncSlackIdentities } from "./sources/slack-identity";
 import { syncProviderIdentities } from "@/lib/identity/provider-sync";
 import { buildIdentityMap, resolveByProviderId, resolveMember } from "@/lib/identity/resolve";
@@ -193,10 +194,39 @@ export async function runSlackIngestion(opts: { teamId?: string } = {}): Promise
         }
         const idMap = await buildIdentityMap(db, teamId);
         const users = Object.fromEntries(detailed.map((u) => [u.id, u.displayName]));
+        let unverifiable = 0; // channels this token couldn't establish as public, per integration
         for (const channelId of channelIds) {
           summary.channels++;
           try {
             const channel = await fetchSlackChannel(client, channelId, { users, maxMessages: 300 });
+            // A channel the brain refuses to read is deliberately not ingested — say so, or the admin
+            // sees a channel in the list that silently never produces anything.
+            if (channel.skippedPrivate) {
+              const action = privateChannelAction(channel);
+              summary.errors.push(action.message);
+              if (!action.purge) unverifiable++;
+              if (action.purge) {
+                try {
+                  const purged = await purgeItemsByPathPrefix(
+                    db,
+                    teamId,
+                    slackChannelPathPrefix(channelId),
+                    "slack channel is private",
+                    { actor: { memberId: auth.memberId, apiKeyId: auth.apiKeyId } }
+                  );
+                  if (purged.items > 0) {
+                    summary.errors.push(
+                      `${channelId}: purged ${purged.items} previously-ingested private item(s)`
+                    );
+                  }
+                } catch (err) {
+                  summary.errors.push(
+                    `${channelId}: private-channel purge failed — ${err instanceof Error ? err.message : "unknown"}`
+                  );
+                }
+              }
+              continue;
+            }
             // A thread whose replies couldn't be fetched is dropped rather than truncated — make that
             // visible so a systematic failure doesn't read as a quiet channel.
             if (channel.skippedThreads > 0) {
@@ -225,6 +255,16 @@ export async function runSlackIngestion(opts: { teamId?: string } = {}): Promise
               `${channelId}: ${err instanceof Error ? err.message : "fetch failed"}`
             );
           }
+        }
+        // EVERY channel unverifiable is one diagnosis, not N: the token almost certainly lacks
+        // `channels:read`, and Slack ingestion for this integration has stopped entirely. Left as N
+        // per-channel lines it reads as N unrelated permission oddities, which is how a fail-closed
+        // check turns into a silent outage.
+        if (unverifiable > 0 && unverifiable === channelIds.length) {
+          summary.errors.push(
+            `integration "${integ.name}": NO channel could be verified public (${unverifiable}/${channelIds.length}) — ` +
+              `nothing was ingested. The bot token most likely lacks the channels:read scope.`
+          );
         }
       }
     }
