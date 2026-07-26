@@ -102,22 +102,31 @@ describe("arc eligibility (real Postgres)", () => {
 
     const raw = new Client({ connectionString: process.env.DATABASE_URL });
     await raw.connect();
-    await raw.query(
-      `create or replace function _fail_items_select() returns trigger as $$ begin raise exception 'simulated lookup failure'; end $$ language plpgsql;
-       create trigger _t_fail_items before update on items for each row execute function _fail_items_select();`
-    );
     try {
-      // The gate reads `items`; break it by making the read path fail via a broken generated dependency.
-      await raw.query(`drop view if exists _nope`);
+      // The gate only SELECTs, so the injector is a broken read: rename the column its query names and
+      // the statement errors. (A trigger wouldn't fire — nothing here writes.)
       await raw.query(`alter table items rename column frontmatter to frontmatter_moved`);
       await expect(arcIneligibleItemIds(seed.teamId, [id])).rejects.toThrow(/arc-eligibility/);
     } finally {
-      await raw.query(`alter table items rename column frontmatter_moved to frontmatter`).catch(() => {});
-      await raw
-        .query(`drop trigger if exists _t_fail_items on items; drop function if exists _fail_items_select();`)
-        .catch(() => {});
+      // NOT swallowed: if the rename-back fails, every later test in this tier fails against a table
+      // whose column is missing, and the cause would look like anything but this line.
+      await raw.query(`alter table items rename column frontmatter_moved to frontmatter`);
       await raw.end().catch(() => {});
     }
+  });
+
+  it("treats a Plane row with NO status as not-active — the deploy-window direction, stated", async () => {
+    // Rows ingested before the connector emitted `status` have no status, no state and no state_type.
+    // Linear can fall back on `state_type`/`state`; Plane cannot, so it lands ineligible: briefly absent
+    // from arcs beats the Done/Backlog noise this gate exists to remove, and it self-corrects on the next
+    // sync (frontmatter-only change → the unchanged-path heal stores `status`, no new version).
+    //
+    // The consequence worth knowing: a team whose Plane integration is DISABLED never re-syncs, so its
+    // Plane rows stay arc-ineligible indefinitely. That is a deliberate flip from today's behaviour
+    // (where they shape arcs) and the right call for stale PM data — but it is a flip, so it's specced.
+    const seed = await seedTeam();
+    const legacyPlane = await seedItem(seed, "plane", null);
+    expect((await arcIneligibleItemIds(seed.teamId, [legacyPlane])).has(legacyPlane)).toBe(true);
   });
 
   it("returns an empty set for no items", async () => {

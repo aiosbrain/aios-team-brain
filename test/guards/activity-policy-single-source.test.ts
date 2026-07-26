@@ -14,6 +14,13 @@ import { ACTIVE_STATUSES, OPEN_STATUSES } from "@/lib/tasks/activity-policy";
  *
  * So the failure mode this guards is DRIFT, and drift can't be caught by testing behaviour on one
  * surface — you have to notice a second definition appearing. This looks for one being written down.
+ *
+ * KNOWN BLIND SPOTS (a regex over source can't be complete, so they're named rather than implied):
+ *   • `components/` is not scanned. It holds the status VOCABULARY for the kanban board, which would
+ *     need its own exemption; a client-side activity subset would slip past. None exists today.
+ *   • Raw-SQL filters (`status in ('in_progress','blocked')` inside a `runSql` template) don't match the
+ *     bracketed-list shape. This codebase does write raw SQL elsewhere.
+ * Both are places a reviewer should still look by hand.
  */
 
 const ROOT = join(import.meta.dirname, "..", "..");
@@ -27,7 +34,10 @@ const OWNER = join("lib", "tasks", "activity-policy.ts");
  * readable check; a LIST of statuses is a policy, and policies belong in one place.
  */
 const STATUS = "(?:backlog|ready|in_progress|blocked|done)";
-const STATUS_LIST_RE = new RegExp(`\\[\\s*(?:"${STATUS}"|'${STATUS}')\\s*,\\s*(?:"${STATUS}"|'${STATUS}')`, "g");
+const QUOTED = `(?:"${STATUS}"|'${STATUS}'|\`${STATUS}\`)`;
+// `\s` spans newlines, so a set written one status per line is caught too. Backticks are included
+// because a template literal is just as much a second definition and no other guard would see it.
+const STATUS_LIST_RE = new RegExp(`\\[\\s*${QUOTED}\\s*,\\s*${QUOTED}`, "g");
 
 function walk(dir: string, out: string[] = []): string[] {
   let entries: string[];
@@ -84,6 +94,19 @@ describe("guard: one activity policy", () => {
     expect([...drifted.matchAll(STATUS_LIST_RE)]).toHaveLength(1);
     const singleCheck = `if (row.status === "done") return;`; // legitimate, must NOT match
     expect([...singleCheck.matchAll(STATUS_LIST_RE)]).toHaveLength(0);
+    // Shapes a refactor could plausibly reach for — each must still be caught.
+    for (const drift of [
+      `new Set<TaskStatusValue>(["ready", "in_progress"])`,
+      `const X = ["in_progress", "blocked"] as const;`,
+      `.in("status", ["ready", "in_progress"])`,
+      "const X = new Set([\n  \"ready\",\n  \"in_progress\",\n]);",
+      "const X = [`ready`, `in_progress`];",
+    ]) {
+      expect([...drift.matchAll(STATUS_LIST_RE)], drift).toHaveLength(1);
+    }
+    // Composing FROM the policy is the encouraged pattern, not drift.
+    const composed = `new Set([...ACTIVE_STATUSES, "ready"])`;
+    expect([...composed.matchAll(STATUS_LIST_RE)]).toHaveLength(0);
   });
 
   it("keeps the two sets in the relationship the doc claims (OPEN ⊃ ACTIVE, and ready is the only delta)", () => {

@@ -46,7 +46,14 @@ export function isArcActiveLinearState(state: string): boolean {
  * display-name regex for rows ingested before `state_type` was persisted. A Linear item with neither a
  * type nor a matching state name is NOT active (arcs = active work). Pure.
  */
-const PM_SOURCES = new Set(["linear", "plane"]);
+/**
+ * The PM providers whose issues are status-gated. Deliberately exported and used BOTH by the predicate
+ * below and as a query PARAMETER — spelling it twice is how H6 happened: the gate and its SQL filter
+ * disagreed about which sources it applied to, and Plane fell through the gap. A provider #3 is added
+ * here, once, and both halves follow.
+ */
+export const PM_SOURCES = ["linear", "plane"] as const;
+const PM_SOURCE_SET: ReadonlySet<string> = new Set(PM_SOURCES);
 
 export function isArcEligible(
   source: string | null | undefined,
@@ -54,7 +61,7 @@ export function isArcEligible(
   stateType?: string | null,
   status?: string | null
 ): boolean {
-  if (!PM_SOURCES.has((source ?? "").trim().toLowerCase())) return true;
+  if (!PM_SOURCE_SET.has((source ?? "").trim().toLowerCase())) return true;
   // Preferred: the brain-normalized status every connector now emits — one vocabulary for every
   // provider, so the policy lives in ONE place (lib/tasks/activity-policy) instead of being re-derived
   // from each provider's state names here.
@@ -112,9 +119,9 @@ export async function arcIneligibleItemIds(
               frontmatter->>'status' as status
          from items
         where team_id = $1 and id::text = any($2)
-          and (frontmatter->>'source' in ('linear', 'plane')
+          and (frontmatter->>'source' = any($3)
                or (frontmatter->>'source' = 'github' and kind = 'task'))`,
-      [teamId, ids]
+      [teamId, ids, [...PM_SOURCES]]
     );
     const out = new Set<string>();
     for (const r of rows) {
