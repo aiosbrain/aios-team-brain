@@ -1,18 +1,6 @@
 import { describe, it, expect } from "vitest";
-import {
-  groupTimeline,
-  normalizeSource,
-  itemWorkTime,
-  dayLabel,
-  mostRecentPerPerson,
-  summaryPromptFor,
-  type EvidenceWithMember,
-  type SignalWithMember,
-  type TaskInfo,
-  type TimelineMember,
-  type PersonDay,
-  type TimelineDay,
-} from "@/lib/dashboard/timeline-group";
+import { groupTimeline, normalizeSource, dayLabel, mostRecentPerPerson, summaryPromptFor, type EvidenceWithMember, type SignalWithMember, type TaskInfo, type TimelineMember, type PersonDay, type TimelineDay } from "@/lib/dashboard/timeline-group";
+import { resolveWorkTime } from "@/lib/ingest/work-time";
 
 const members = new Map<string, TimelineMember>([
   ["m1", { name: "Chetan", handle: "chetan" }],
@@ -38,24 +26,24 @@ const ev = (over: Partial<EvidenceWithMember>): EvidenceWithMember => ({
 
 const today = "2026-07-22";
 
-describe("itemWorkTime (includes attributed docs, never synced_at)", () => {
+describe("resolveWorkTime (includes attributed docs, never synced_at)", () => {
   it("prefers git committed_at, then generic source_ts", () => {
-    expect(itemWorkTime({ committed_at: "2026-07-01T00:00:00Z", source_ts: "2026-06-01T00:00:00Z" })).toBe("2026-07-01T00:00:00.000Z");
-    expect(itemWorkTime({ source_ts: "2026-06-02T00:00:00Z" })).toBe("2026-06-02T00:00:00.000Z");
+    expect(resolveWorkTime({ committed_at: "2026-07-01T00:00:00Z", source_ts: "2026-06-01T00:00:00Z" })).toBe("2026-07-01T00:00:00.000Z");
+    expect(resolveWorkTime({ source_ts: "2026-06-02T00:00:00Z" })).toBe("2026-06-02T00:00:00.000Z");
   });
   it("falls back to a doc's edit/create time (the fix — docs were dropped before)", () => {
     // A Notion doc: last_edited_time. A Google Drive doc: modifiedTime. A hand-authored deliverable: updated/date/created.
-    expect(itemWorkTime({ last_edited_time: "2026-07-10T12:00:00Z" })).toBe("2026-07-10T12:00:00.000Z");
-    expect(itemWorkTime({ modifiedTime: "2026-07-11T12:00:00Z" })).toBe("2026-07-11T12:00:00.000Z");
-    expect(itemWorkTime({ updated: "2026-07-12", created: "2026-01-01" })).toBe("2026-07-12T00:00:00.000Z"); // updated wins over created
-    expect(itemWorkTime({ date: "2026-07-13" })).toBe("2026-07-13T00:00:00.000Z");
-    expect(itemWorkTime({ created: "2026-07-14T00:00:00Z" })).toBe("2026-07-14T00:00:00.000Z");
+    expect(resolveWorkTime({ last_edited_time: "2026-07-10T12:00:00Z" })).toBe("2026-07-10T12:00:00.000Z");
+    expect(resolveWorkTime({ modifiedTime: "2026-07-11T12:00:00Z" })).toBe("2026-07-11T12:00:00.000Z");
+    expect(resolveWorkTime({ updated: "2026-07-12", created: "2026-01-01" })).toBe("2026-07-12T00:00:00.000Z"); // updated wins over created
+    expect(resolveWorkTime({ date: "2026-07-13" })).toBe("2026-07-13T00:00:00.000Z");
+    expect(resolveWorkTime({ created: "2026-07-14T00:00:00Z" })).toBe("2026-07-14T00:00:00.000Z");
   });
   it("NEVER uses synced_at, and returns null when no source work-time exists", () => {
-    expect(itemWorkTime({ synced_at: "2026-07-20T00:00:00Z", title: "a doc" })).toBeNull(); // synced_at ignored → dropped
-    expect(itemWorkTime({})).toBeNull();
-    expect(itemWorkTime(null)).toBeNull();
-    expect(itemWorkTime({ committed_at: "not-a-date" })).toBeNull(); // unparseable → null
+    expect(resolveWorkTime({ synced_at: "2026-07-20T00:00:00Z", title: "a doc" })).toBeNull(); // synced_at ignored → dropped
+    expect(resolveWorkTime({})).toBeNull();
+    expect(resolveWorkTime(null)).toBeNull();
+    expect(resolveWorkTime({ committed_at: "not-a-date" })).toBeNull(); // unparseable → null
   });
 });
 

@@ -182,7 +182,6 @@ export function mostRecentPerPerson(days: TimelineDay[]): PersonDay[] {
  * disagreed: a git commit was dated by `committed_at` here but fell back to `synced_at` in the graph.
  * Re-exported under the local name so timeline callers keep an intention-revealing import.
  */
-export { resolveWorkTime as itemWorkTime } from "@/lib/ingest/work-time";
 
 /** github/git → github; a known source passes through; anything else → "other" (generic icon). */
 export function normalizeSource(raw: string | null | undefined): string {
