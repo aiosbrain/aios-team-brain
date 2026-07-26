@@ -102,7 +102,10 @@ validation (before any mutation) → item + version + derived-row materializatio
 - **Per-source rules** — `lib/ingest/source-rules.ts` is the one table saying how a source's metadata
   should be READ, consulted by the writer. The ingest contract is uniform; sources are not, and the
   same wire field carries different evidence depending on who emitted it. Today it answers one
-  question — *is a work-time that moved on an unchanged body evidence of work?* `local` emits mtime
+  question — *is a work-time that moved on an unchanged body evidence of work?* — plus
+  *may superseded bodies be retained?* (`slack` says no: its item body is a re-render of retractable
+  source-owned content, so a message deleted in Slack would otherwise survive verbatim in
+  `item_versions` forever; only the body is cleared, the ledger rows stay). `local` emits mtime
   (moved by `touch`/`rsync`/`chmod`, no author, no edit → **noise**, so the stored `work_at` stands);
   Linear/Plane emit the issue's last state transition (a ticket reaching `completed` is **work** with
   a byte-identical body). One behaviour is right for one source and wrong for the other — the shape

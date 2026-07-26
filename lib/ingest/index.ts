@@ -13,6 +13,7 @@ import {
 import type { DbClient } from "@/lib/db/types";
 import { materializeDecisions } from "@/lib/ingest/decisions";
 import { sourceRules } from "@/lib/ingest/source-rules";
+import { forgetSupersededBodies } from "@/lib/ingest/forget-bodies";
 import { workTimeKeysIn } from "@/lib/ingest/work-time";
 import {
   materializeFacts,
@@ -445,6 +446,20 @@ export async function ingestItem(
   });
   if (versionError) {
     throw new Error(`item version insert failed: ${versionError.message}`);
+  }
+
+  // FORGET the bodies this push just superseded, where the source's rule says they may not be
+  // retained (`lib/ingest/source-rules`). Slack is the case: one item holds a whole conversation and
+  // is re-rendered every sync, so a message deleted at the source disappears from the current body
+  // while every retained body still quotes it verbatim, forever.
+  //
+  // Structural rather than event-driven ON PURPOSE. The obvious trigger — "did the reply count
+  // drop?" — has two silent holes: a delete and a new reply in the same 30-minute tick cancel out,
+  // and once the count heals there is no signal left to retry on, so a single failed attempt strands
+  // the text permanently. Forgetting on every body change has neither, and costs nothing: only the
+  // BODY is cleared (the rows are the work ledger that attributes credit) and nothing reads it.
+  if (!sourceRules(payload.frontmatter?.source).retainSupersededBodies) {
+    await forgetSupersededBodies(db, itemId, contentSha);
   }
 
   let changedTaskRowKeys: string[] | undefined;
