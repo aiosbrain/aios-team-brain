@@ -5,6 +5,7 @@ import {
   SlackError,
   SlackClient as SlackClientCtor,
   type SlackClient,
+  type SlackMessage,
 } from "@/lib/ingest/sources/slack";
 
 /**
@@ -319,6 +320,260 @@ describe("SlackClient.channelInfo — unverifiable vs transient", () => {
     for (const error of ["channel_not_found", "not_in_channel"]) {
       const info = await withError(error, () => new SlackClientCtor("xoxb-test").channelInfo("C0123"));
       expect(info).toEqual({ name: "C0123", isPrivate: true, verified: false });
+    }
+  });
+});
+
+/**
+ * Spec: the DELETION WINDOW that `fetchSlackChannel` hands to `planSlackDeletions`.
+ *
+ * `planSlackDeletions` is pure and well-tested, but it is only as safe as the inputs assembled here —
+ * and every one of these is a way to delete a LIVE thread. A refactor to
+ * `liveRootTs: threads.map(...)` would pass every test in the deletion suite and start destroying
+ * data, which is exactly why the wiring is pinned at this layer too.
+ */
+describe("fetchSlackChannel — the deletion window", () => {
+  const msg = (ts: string, over: Partial<SlackMessage> = {}): SlackMessage => ({
+    ts,
+    user: "U1",
+    text: "hello",
+    ...over,
+  });
+
+  it("reports the OLDEST message read as the window floor (history is newest→oldest)", async () => {
+    const channel = await fetchSlackChannel(
+      stubClient({ history: async () => [msg("300.0"), msg("200.0"), msg("100.0")] }),
+      "C1",
+      { users: {} }
+    );
+    expect(channel.oldestTs).toBe("100.0");
+  });
+
+  it("counts a thread whose REPLIES failed as ALIVE (it is only unsafe to ingest, not gone)", async () => {
+    const channel = await fetchSlackChannel(
+      stubClient({
+        history: async () => [rootWithReplies],
+        replies: async () => {
+          throw new SlackError("slack conversations.replies failed: ratelimited");
+        },
+      }),
+      "C1",
+      { users: {} }
+    );
+    expect(channel.threads).toHaveLength(0); // not ingested this tick…
+    expect(channel.liveRootTs).toContain(rootWithReplies.ts); // …but NOT deletable
+  });
+
+  it("counts a TOMBSTONED root as alive — deleting a root must not purge its repliers' ledger", async () => {
+    // Slack leaves the parent in history when a thread root is deleted while replies live on. It
+    // fails the render filter, so judging existence by that filter would purge the whole item —
+    // taking `item_versions` with it and destroying the credit of every replier whose messages are
+    // still in Slack.
+    const channel = await fetchSlackChannel(
+      stubClient({ history: async () => [msg("500.0", { subtype: "tombstone", text: "" })] }),
+      "C1",
+      { users: {} }
+    );
+    expect(channel.liveRootTs).toEqual(["500.0"]); // the thread EXISTS
+  });
+
+  it("counts a root edited down to no text (a file-only message) as alive", async () => {
+    const channel = await fetchSlackChannel(
+      stubClient({ history: async () => [msg("500.0", { text: "" })] }),
+      "C1",
+      { users: {} }
+    );
+    expect(channel.liveRootTs).toEqual(["500.0"]);
+  });
+
+  it("still INGESTS a thread whose root was deleted, so the live body stops serving it", async () => {
+    // Keeping the thread (above) is only half the answer. If it is never re-normalized it is never
+    // re-rendered either, so `items.body` — the surface retrieval and answers read — goes on quoting
+    // the deleted root forever, with no future trigger. That is a worse leak than the version
+    // history this feature is about, and it is the one the tombstone fix would otherwise create.
+    const channel = await fetchSlackChannel(
+      stubClient({
+        history: async () => [msg("500.0", { subtype: "tombstone", text: "", reply_count: 2 })],
+        replies: async () => [msg("501.0", { text: "a reply that still exists" })],
+      }),
+      "C1",
+      { users: {} }
+    );
+    expect(channel.threads).toHaveLength(1);
+    expect(channel.threads[0].replies).toHaveLength(1);
+  });
+
+  it("does NOT invent an item for a text-less message that is not a conversation", () => {
+    // A bare text-less top-level message (a file post with no caption) has no thread to maintain;
+    // rendering it would create an item that never existed. Bounded by `reply_count`.
+    return fetchSlackChannel(
+      stubClient({ history: async () => [msg("500.0", { text: "" })] }),
+      "C1",
+      { users: {} }
+    ).then((channel) => expect(channel.threads).toHaveLength(0));
+  });
+
+  it("excludes replies from the live set — only top-level messages are threads", async () => {
+    const channel = await fetchSlackChannel(
+      stubClient({
+        history: async () => [msg("500.0"), msg("450.0", { thread_ts: "400.0" }), msg("400.0")],
+      }),
+      "C1",
+      { users: {} }
+    );
+    expect(channel.liveRootTs).toEqual(["500.0", "400.0"]);
+  });
+
+  it("has NO floor when the channel returned nothing (deletion must be disabled)", async () => {
+    const channel = await fetchSlackChannel(stubClient({ history: async () => [] }), "C1", { users: {} });
+    expect(channel.oldestTs).toBeUndefined();
+  });
+});
+
+/**
+ * A SUCCESSFUL but truncated replies page is the one way a "message was deleted" signal can be
+ * forged, and the one way a thread body can still be stored short — `#388` only closed the THROWN
+ * case. `has_more` with no cursor to follow means we cannot complete the thread, so it must fail
+ * like a fetch error (the caller then skips the thread) rather than return what it happens to have.
+ */
+describe("SlackClient.replies — completeness", () => {
+  function pagedFetch(pages: { messages: unknown[]; has_more?: boolean; cursor?: string }[]) {
+    let i = 0;
+    return (async () => {
+      const p = pages[Math.min(i++, pages.length - 1)];
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          ok: true,
+          messages: p.messages,
+          has_more: p.has_more,
+          response_metadata: p.cursor ? { next_cursor: p.cursor } : {},
+        }),
+      };
+    }) as unknown as typeof fetch;
+  }
+
+  async function withFetch<T>(f: typeof fetch, fn: () => Promise<T>): Promise<T> {
+    const orig = globalThis.fetch;
+    globalThis.fetch = f;
+    try {
+      return await fn();
+    } finally {
+      globalThis.fetch = orig;
+    }
+  }
+
+  it("follows the cursor to the end instead of storing a short thread", async () => {
+    const replies = await withFetch(
+      pagedFetch([
+        { messages: [{ ts: "1.0" }, { ts: "2.0" }], has_more: true, cursor: "c1" },
+        { messages: [{ ts: "3.0" }] },
+      ]),
+      () => new SlackClientCtor("xoxb-test").replies("C1", "1.0")
+    );
+    // Root excluded; both pages present — a single-page read would silently drop "3.0".
+    expect(replies.map((m) => m.ts)).toEqual(["2.0", "3.0"]);
+  });
+
+  it("THROWS when Slack says there is more but gives no cursor (incomplete, not empty)", async () => {
+    await withFetch(pagedFetch([{ messages: [{ ts: "1.0" }, { ts: "2.0" }], has_more: true }]), async () => {
+      await expect(new SlackClientCtor("xoxb-test").replies("C1", "1.0")).rejects.toThrow(/incomplete/);
+    });
+  });
+});
+
+/**
+ * `isRedactedRoot` decides whether a thread whose root was deleted still gets RE-RENDERED. It must not
+ * hinge on a single Slack field: `reply_count` is the obvious signal but Slack doesn't promise to keep
+ * it on a tombstone, and losing the signal means the live body silently keeps serving the deleted
+ * message. `thread_ts === ts` marks a thread root independently (a standalone message has no
+ * `thread_ts` at all), so either signal suffices.
+ */
+describe("fetchSlackChannel — a redacted root is recognised by either thread signal", () => {
+  it("re-renders AND fetches replies when only thread_ts identifies it as a root", async () => {
+    const channel = await fetchSlackChannel(
+      stubClient({
+        history: async () => [{ ts: "500.0", user: "U1", text: "", thread_ts: "500.0" }],
+        replies: async () => [{ ts: "501.0", user: "U2", text: "a reply that still exists" }],
+      }),
+      "C1",
+      { users: {} }
+    );
+    expect(channel.threads).toHaveLength(1);
+    // Asserting the REPLIES land is the whole point. Admitting the root without fetching them is
+    // worse than not admitting it: the re-render would be placeholder-only, overwrite the stored
+    // conversation, and the forget pass would then blank the superseded body — erasing replies that
+    // are still live in Slack. Stopping at `threads.length === 1` passed while that bug was present.
+    expect(channel.threads[0].replies).toHaveLength(1);
+  });
+
+  it("recognises Slack's REAL tombstone payload, which carries text", async () => {
+    // The actual wire format is `{subtype: "tombstone", text: "This message was deleted."}` — a
+    // `!text` test never fires on it, so the thread would be kept alive but never re-rendered and
+    // `items.body` would serve the deleted root forever. Testing the subtype tests what Slack says,
+    // not what we assumed it says.
+    const channel = await fetchSlackChannel(
+      stubClient({
+        history: async () => [
+          { ts: "500.0", user: "USLACKBOT", text: "This message was deleted.", subtype: "tombstone", reply_count: 1 },
+        ],
+        replies: async () => [{ ts: "501.0", user: "U2", text: "reply still here" }],
+      }),
+      "C1",
+      { users: {} }
+    );
+    expect(channel.threads).toHaveLength(1);
+    expect(channel.threads[0].replies).toHaveLength(1);
+    expect(channel.liveRootTs).toEqual(["500.0"]); // and still counted as alive
+  });
+});
+
+/**
+ * `threadExists` is the ONLY thing that authorizes deleting stored content, so its failure direction
+ * is the whole safety property.
+ *
+ * The trap it exists to avoid: `replies()` strips the root (callers want the replies *around* a root
+ * they already hold), and reusing it here would read a LIVE STANDALONE message — which
+ * `conversations.replies` returns as exactly one message, the root — as "nothing there", confirming a
+ * deletion that never happened. That is precisely the case the confirmation is for.
+ */
+describe("SlackClient.threadExists — the deletion confirmation", () => {
+  const resp = (body: unknown) => ({ ok: true, status: 200, json: async () => body });
+  async function withBody<T>(body: unknown, fn: (c: SlackClientCtor) => Promise<T>): Promise<T> {
+    const orig = globalThis.fetch;
+    globalThis.fetch = (async () => resp(body)) as unknown as typeof fetch;
+    try {
+      return await fn(new SlackClientCtor("xoxb-test"));
+    } finally {
+      globalThis.fetch = orig;
+    }
+  }
+
+  it("says a LIVE STANDALONE message exists — the root alone counts", async () => {
+    const alive = await withBody({ ok: true, messages: [{ ts: "500.0", user: "U1", text: "solo" }] }, (c) =>
+      c.threadExists("C1", "500.0")
+    );
+    expect(alive).toBe(true);
+  });
+
+  it("says a thread with replies exists", async () => {
+    const alive = await withBody(
+      { ok: true, messages: [{ ts: "500.0", text: "root" }, { ts: "501.0", text: "reply" }] },
+      (c) => c.threadExists("C1", "500.0")
+    );
+    expect(alive).toBe(true);
+  });
+
+  it("confirms deletion ONLY when Slack says the content is gone", async () => {
+    for (const error of ["thread_not_found", "message_not_found"]) {
+      expect(await withBody({ ok: false, error }, (c) => c.threadExists("C1", "500.0"))).toBe(false);
+    }
+  });
+
+  it("THROWS on any other failure — not being able to ask is not evidence", async () => {
+    for (const error of ["ratelimited", "invalid_auth", "internal_error"]) {
+      await expect(withBody({ ok: false, error }, (c) => c.threadExists("C1", "500.0"))).rejects.toThrow();
     }
   });
 });

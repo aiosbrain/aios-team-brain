@@ -132,12 +132,22 @@ export function startIngestScheduler(): void {
       // Source-specific extras: slack reports channels; the task importers report items/projects.
       const meta: Record<string, unknown> =
         "channels" in s
-          ? { integrations: s.integrations, channels: s.channels }
+          ? // `deleted` counts REMOVALS of stored content (threads deleted at the source).
+            // Recorded because destructive work must
+            // never be the one outcome the run log can't show — a purge that fires wrongly would
+            // otherwise be indistinguishable from a quiet sync.
+            {
+              integrations: s.integrations,
+              channels: s.channels,
+              ...(s.deleted ? { deleted: s.deleted } : {}),
+            }
           : { integrations: s.integrations, items: s.items, projects: s.projects };
-      if (s.created || s.updated || s.errors.length) {
+      const removed = "channels" in s ? s.deleted : 0;
+      if (s.created || s.updated || removed || s.errors.length) {
         const detail = "channels" in s ? `${s.channels} channels` : `${s.items} items, ${s.projects} projects`;
+        const removedNote = removed ? ` -${removed} deleted` : "";
         console.info(
-          `[ingest] ${label}: +${s.created} ~${s.updated} =${s.unchanged} (${detail}, ${s.integrations} integrations)` +
+          `[ingest] ${label}: +${s.created} ~${s.updated} =${s.unchanged}${removedNote} (${detail}, ${s.integrations} integrations)` +
             (s.errors.length ? ` errors: ${s.errors.join("; ")}` : "")
         );
       }

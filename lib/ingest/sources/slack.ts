@@ -46,9 +46,22 @@ export interface FetchedChannel {
    *  "wait a tick" (`ratelimited`) from "frozen forever" (lost access / `thread_not_found`) — which
    *  is the entire triage question a skip raises. */
   skippedThreadsReason?: string;
+  /** EVERY top-level message seen in this window's history — the "still EXISTS at the source" set
+   *  the deletion diff reads. Deliberately wider than `threads` (which drops a thread whose replies
+   *  wouldn't fetch) and wider than the render filter (a tombstoned or text-less root is still a
+   *  thread): either narrower list would delete live data. */
+  liveRootTs?: string[];
+  /** Timestamp of the OLDEST message read this tick — the deletion diff's floor. Undefined when the
+   *  channel returned no history at all, which must disable deletion entirely. */
+  oldestTs?: string;
 }
 
 export class SlackError extends Error {}
+
+/** Page cap for a single thread's replies — a backstop against a pathological thread, not a limit
+ *  we expect to reach (200 replies per page). Hitting it throws, so the thread is skipped rather
+ *  than stored truncated. */
+const REPLIES_MAX_PAGES = 25;
 
 /** What the runner does about a channel `fetchSlackChannel` refused to read. */
 export interface PrivateChannelAction {
@@ -196,13 +209,66 @@ export class SlackClient {
     return out;
   }
 
-  /** Thread replies (excludes the root message). */
+  /**
+   * Thread replies (excludes the root message), PAGINATED to completion.
+   *
+   * Following the cursor is not an optimization — a thread's body is the whole conversation, so a
+   * short page is a silent content regression: the stored item is rewritten missing its tail, and
+   * (worse, now) the shrink it fakes looks exactly like someone deleting messages at the source.
+   * That is the same failure #388 closed for a THROWN replies error, arriving through a successful
+   * response. A page cap bounds a pathological thread rather than looping forever; hitting it throws,
+   * so the caller skips the thread instead of storing a truncated body.
+   */
   async replies(channelId: string, threadTs: string): Promise<SlackMessage[]> {
-    const r = await this.call<{ messages: SlackMessage[] }>("conversations.replies", {
-      channel: channelId,
-      ts: threadTs,
-    });
-    return (r.messages ?? []).filter((m) => m.ts !== threadTs);
+    const out: SlackMessage[] = [];
+    let cursor: string | undefined;
+    for (let page = 0; page < REPLIES_MAX_PAGES; page++) {
+      const params: Record<string, string> = { channel: channelId, ts: threadTs, limit: "200" };
+      if (cursor) params.cursor = cursor;
+      const r = await this.call<{
+        messages: SlackMessage[];
+        has_more?: boolean;
+        response_metadata?: { next_cursor?: string };
+      }>("conversations.replies", params);
+      out.push(...(r.messages ?? []));
+      cursor = r.response_metadata?.next_cursor || undefined;
+      if (!cursor) {
+        // `has_more` with no cursor to follow means we CANNOT complete the thread. Throwing routes
+        // it into the existing skip-the-thread path rather than storing what we happen to have.
+        if (r.has_more) throw new SlackError(`slack conversations.replies incomplete: has_more with no cursor`);
+        return out.filter((m) => m.ts !== threadTs);
+      }
+    }
+    throw new SlackError(`slack conversations.replies exceeded ${REPLIES_MAX_PAGES} pages`);
+  }
+
+  /**
+   * Does anything still exist at `ts` in this channel? The DELETION CONFIRMATION — the only thing
+   * that authorizes removing stored content, so it is deliberately a separate method rather than a
+   * flag on `replies()`.
+   *
+   * The distinction matters and is easy to get wrong: `replies()` strips the root (`m.ts !== threadTs`)
+   * because callers want the replies *around* a root they already hold. Reusing it here would read a
+   * LIVE STANDALONE message — which `conversations.replies` returns as exactly one message, the root —
+   * as "nothing there", and confirm a deletion that never happened. That is the precise case the
+   * confirmation exists to prevent, so this counts the RAW response.
+   *
+   * `thread_not_found` / `message_not_found` is Slack stating the content is gone → false. Every other
+   * error propagates: not being able to ask is never evidence, and the caller must spare the thread.
+   */
+  async threadExists(channelId: string, ts: string): Promise<boolean> {
+    try {
+      const r = await this.call<{ messages?: SlackMessage[] }>("conversations.replies", {
+        channel: channelId,
+        ts,
+        limit: "1",
+      });
+      return (r.messages ?? []).length > 0;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "";
+      if (/thread_not_found|message_not_found/i.test(msg)) return false;
+      throw err;
+    }
   }
 
   /**
@@ -307,15 +373,50 @@ export async function fetchSlackChannel(
   }
 
   const history = await client.history(channelId, max);
-  // Top-level messages only (a reply has thread_ts !== ts). Roots keep their thread.
-  const roots = history.filter((m) => isContentMessage(m) && (!m.thread_ts || m.thread_ts === m.ts));
+  const isTopLevel = (m: SlackMessage) => !m.thread_ts || m.thread_ts === m.ts;
+  // A top-level message that still EXISTS but has no renderable text: Slack leaves this behind when
+  // a thread's root is deleted while its replies live on (a tombstone), or when the author edits the
+  // text away. It must stay INGESTIBLE — the item's body is the served surface, so a thread that is
+  // kept (correctly) but never re-rendered would go on quoting the deleted root forever, which is a
+  // worse leak than the version history this feature is about. `reply_count > 0` bounds it to threads
+  // that actually exist: a bare text-less message is not a conversation and must not become an item.
+  // Slack's structural events (channel_join/topic/…) all carry text, so they are excluded already.
+  //
+  // Recognised by ANY of three signals, because none is guaranteed and requiring all of them drops
+  // silently back to the frozen-body bug:
+  //  • `subtype === "tombstone"` — Slack's own marker, and the one that matters most: a REAL tombstone
+  //    carries `text: "This message was deleted."`, so a `!text` test alone never fires on the actual
+  //    payload. Testing the text was an assumption about the wire format; this tests what Slack says.
+  //  • no renderable text — a root edited down to a file/attachment with no caption.
+  //  • `reply_count > 0` / `thread_ts === ts` — "this is a conversation, not a bare message". A
+  //    standalone message carries no `thread_ts` at all (see `isTopLevel`), so the self-reference is
+  //    an independent root signal for the case where Slack drops `reply_count`.
+  // Structural events (channel_join/topic/…) carry text and a non-tombstone subtype, so they stay out.
+  const isThreadRoot = (m: SlackMessage) => (m.reply_count ?? 0) > 0 || m.thread_ts === m.ts;
+  const isRedactedRoot = (m: SlackMessage) =>
+    (m.subtype === "tombstone" || !m.text?.trim()) && isThreadRoot(m);
+  // Two DIFFERENT questions, and conflating them deletes live data:
+  //  • `liveTopLevelTs` — "does this thread still EXIST at the source?" Every top-level message
+  //    counts, with NO content filter. Slack leaves a tombstone in history when a thread root is
+  //    deleted while its replies live on, and an author can edit a root down to a file with no text
+  //    — both fail `isContentMessage`. Judging existence by the render filter would purge those
+  //    threads, taking `item_versions` with them and destroying the credit of every replier whose
+  //    messages are still in Slack.
+  //  • `roots` — "is this thread INGESTIBLE this tick?" That one is content-filtered, as before.
+  const liveTopLevelTs = history.filter(isTopLevel).map((m) => m.ts);
+  const roots = history.filter((m) => isTopLevel(m) && (isContentMessage(m) || isRedactedRoot(m)));
 
   const threads: FetchedThread[] = [];
   let skippedThreads = 0;
   let skippedThreadsReason: string | undefined;
   for (const root of roots) {
     let replies: SlackMessage[] = [];
-    if (root.reply_count && root.reply_count > 0) {
+    // Admitting a root WITHOUT fetching its replies is worse than not admitting it at all: the
+    // re-render would produce a placeholder-only body, overwrite the stored full conversation, and
+    // `forgetSupersededBodies` would then blank the superseded body — erasing replies that are still
+    // live in Slack from every stored surface. A redacted root is admitted precisely when
+    // `reply_count` may be missing, so it must drive the fetch too.
+    if ((root.reply_count ?? 0) > 0 || isRedactedRoot(root)) {
       try {
         replies = (await client.replies(channelId, root.ts)).filter(isContentMessage);
       } catch (err) {
@@ -331,5 +432,24 @@ export async function fetchSlackChannel(
     }
     threads.push({ root, replies });
   }
-  return { channelId, channelName, threads, users, skippedThreads, skippedThreadsReason };
+  // The DELETION WINDOW. A thread stored under this channel but absent from `liveRootTs` is either
+  // (a) deleted at the source or (b) simply older than the `maxMessages` window — and treating (b)
+  // as (a) would delete the channel's entire history on every tick. `oldestTs` is what separates
+  // them: only a stored thread NEWER than the oldest message we actually read can be judged.
+  //
+  // `liveRootTs` is EVERY top-level message in history, not `threads` and not even `roots` — a
+  // thread whose replies failed to fetch is skipped from `threads` but is demonstrably still alive,
+  // and a tombstoned/text-less root is still a thread that exists. Both narrower lists would delete
+  // live data.
+  const oldest = history.length > 0 ? history[history.length - 1].ts : undefined;
+  return {
+    channelId,
+    channelName,
+    threads,
+    users,
+    skippedThreads,
+    skippedThreadsReason,
+    liveRootTs: liveTopLevelTs,
+    oldestTs: oldest,
+  };
 }

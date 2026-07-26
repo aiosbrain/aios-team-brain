@@ -820,6 +820,78 @@ rather than dropped after checking only one.
 graph episodes. Derived snapshots recomputed on a schedule — `work_timeline_cache`, narrative-arc
 snapshots — can still quote purged content until their next recompute.
 
+### Slack deletions — `lib/ingest/slack-cleanup.ts` + `sources/slack-deletions.ts`
+
+What Slack no longer has, the brain no longer has. Two halves, because a Slack thread is ONE item
+whose body is the whole conversation:
+
+**A deleted THREAD** → the item is purged. Slack emits no deletion event, so the only signal is
+"stored here, absent there" — and read naively that signal is catastrophic, because a thread is
+*also* absent for the innocent reason that it is older than the 300-message window we read. Guards
+(`planSlackDeletions`, pure + unit-tested), each tracing to a way live data would be destroyed:
+
+- the stored thread must be strictly **newer than the oldest message actually read**;
+- the live set is **every top-level message in `history`** — NOT the ingestible `threads` (a thread
+  whose replies failed to fetch is skipped from ingestion while demonstrably alive) and NOT the
+  content-filtered roots (a **tombstoned** root — what Slack leaves when a thread's first message is
+  deleted while its replies live on — or one edited down to a file with no text still *exists*;
+  purging those would take `item_versions` with them and destroy the credit of every replier whose
+  messages are still in Slack). Keeping such a thread is only half the answer, though: it must also
+  stay **ingestible**, or it is never re-rendered and `items.body` — the served surface — goes on
+  quoting the deleted root forever. A text-less root that still has replies is therefore normalized
+  with a `_[message deleted]_` placeholder; a bare text-less message is not a conversation and never
+  becomes an item. A real tombstone carries `text: "This message was deleted."`, so the marker tested
+  is `subtype`, not emptiness — testing the text was an assumption about the wire format;
+- a channel that returned no history, or wasn't read at all, disables deletion entirely.
+
+**Absence is the candidate, not the verdict.** Every condition above still only *infers* deletion from
+a thread being missing, and that inference rests on our model of what Slack puts in `history` — an
+assumption about a wire format, holding up an irreversible cascade through `item_versions`. So before
+anything is removed, each candidate is confirmed against the source: **`SlackClient.threadExists`**
+asks Slack directly, and only a definite "gone" (`thread_not_found` / `message_not_found`) authorizes
+the delete. A live thread, a rate-limit, a lost scope — all spare it, and an unconfirmable candidate
+is reported rather than silently kept. The client parameter is **required, not optional**, so no
+caller can quietly fall back to inference alone.
+
+> `threadExists` counts the **raw** `conversations.replies` response and must never be "hardened" into
+> matching the requested `ts`. `SlackClient.replies` strips the root by design (callers want the
+> replies *around* a root they already hold), and reusing it here read a **live standalone message** —
+> which Slack returns as exactly one message, the root — as "nothing there", confirming a deletion that
+> never happened. Non-empty is the correct asymmetry: if Slack ever hides a deleted parent while its
+> replies live on, identity matching would delete a thread that still has live content.
+
+
+**A deleted MESSAGE** → the current body self-heals on the next sync (it is re-rendered without it),
+but `item_versions` retains every superseded body, so the erased text would live on. Handled in the
+writer by the per-source rule **`retainSupersededBodies`** (`lib/ingest/source-rules`): for a source
+whose body is a re-render of retractable, source-owned content — Slack, the only one today — every
+push clears the bodies it supersedes (`lib/ingest/forget-bodies`). The **rows are kept**:
+`item_versions` is the work ledger (`member_id` + `created_at`) behind contributor credit, the
+timeline and arcs, so deleting them would silently rewrite who did what. Both content columns go —
+`body` **and** `frontmatter`, because Slack's `title` is the root message's first 100 characters —
+and nothing reads either; they are history, not a served surface.
+
+The graph is the third place the text lives, and it *is* served: `addEpisodes` does not overwrite by
+name, so Graphiti keeps the pre-deletion episode and the facts extracted from it. The projector
+therefore calls `deleteItemEpisodes` before re-pushing an item from a `retainSupersededBodies: false`
+source — otherwise a deleted message keeps answering questions through the graph after Postgres has
+forgotten it. That delete is **watched, not fire-and-forget**: `addEpisodes` lands regardless, so a
+swallowed failure would leave the pre-deletion episode behind a fresh sha where nothing revisits it
+(the landed check is satisfied by the new push; orphan repair needs the item to be gone). A failure
+records `pending_delete_group_id`, which routes into the `purgeBeforeRepush` retry on the next pass. (`item_chunks` needs no special handling: `dense-index` already deletes an item's
+chunks before re-inserting.)
+
+That trigger is **structural, not event-driven, on purpose.** The obvious version — "did the reply
+count drop?" — has two silent holes: a delete and a new reply within the same 30-minute tick cancel
+out, and once the count heals there is no signal left to retry on, so one failed attempt strands the
+text permanently. Relatedly, `SlackClient.replies` now **paginates to completion** and treats
+`has_more` with no cursor as a failure: a short page would otherwise store a truncated thread body
+(the `#388` class, arriving through a *successful* response).
+
+Deletions land in the run's `ingest_runs.meta` as `deleted` — destructive work must not be the one
+outcome the run log can't show. Threads too old to judge are counted inside the plan
+(`outOfWindow`) but not yet surfaced in the run log.
+
 ## Docs drift guard
 
 `scripts/check-docs-drift.mjs` derives the three inventories above from code

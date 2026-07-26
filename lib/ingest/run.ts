@@ -5,6 +5,7 @@ import type { DbClient } from "@/lib/db/types";
 import { adminClient } from "@/lib/db/admin";
 import { ingestItem } from "@/lib/ingest";
 import { purgeItemsByPathPrefix } from "@/lib/ingest/purge";
+import { purgeDeletedSlackThreads } from "@/lib/ingest/slack-cleanup";
 import { getEnabledIntegrationsWithSecrets } from "@/lib/integrations/manage";
 import { SlackClient, fetchSlackChannel, privateChannelAction } from "./sources/slack";
 import { normalizeThread, slackChannelPathPrefix } from "./sources/slack-normalize";
@@ -41,6 +42,8 @@ export interface IngestSummary {
   created: number;
   updated: number;
   unchanged: number;
+  /** Items REMOVED because the source no longer has them (a deleted Slack thread). */
+  deleted: number;
   errors: string[];
   skipped?: boolean;
 }
@@ -127,6 +130,7 @@ export async function runSlackIngestion(opts: { teamId?: string } = {}): Promise
     created: 0,
     updated: 0,
     unchanged: 0,
+    deleted: 0,
     errors: [],
   };
   if (running) return { ...empty, skipped: true };
@@ -249,6 +253,23 @@ export async function runSlackIngestion(opts: { teamId?: string } = {}): Promise
               if (res.status === "created") summary.created++;
               else if (res.status === "updated") summary.updated++;
               else summary.unchanged++;
+            }
+            // DELETED THREADS. Slack reports no deletion event, so "stored here, absent there" is
+            // the only signal — and it is trustworthy ONLY inside the window we actually read
+            // (see `planSlackDeletions`, where every guard is a bug that would otherwise happen).
+            try {
+              summary.deleted += await purgeDeletedSlackThreads(
+                db,
+                teamId,
+                channel,
+                client,
+                { memberId: auth.memberId, apiKeyId: auth.apiKeyId },
+                (notice) => summary.errors.push(notice)
+              );
+            } catch (err) {
+              summary.errors.push(
+                `${channelId}: deleted-thread cleanup failed — ${err instanceof Error ? err.message : "unknown"}`
+              );
             }
           } catch (err) {
             summary.errors.push(

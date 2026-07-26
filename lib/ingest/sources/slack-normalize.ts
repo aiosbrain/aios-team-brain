@@ -50,10 +50,16 @@ function renderText(text: string, users: Record<string, string>): string {
     .replace(/<(https?:[^>]+)>/g, (_m, url: string) => url);
 }
 
+/** Stands in for a message that exists at the source but whose text is gone (deleted, or edited
+ *  away). Rendering the placeholder — rather than skipping the message — is what makes the stored
+ *  body stop serving retracted text while keeping the conversation's shape and its repliers. */
+export const REDACTED_MESSAGE = "_[message deleted]_";
+
 function renderMessage(m: SlackMessage, opts: NormalizeOpts): string {
   const author = (m.user && opts.users[m.user]) || m.user || "unknown";
   const when = tsToIso(m.ts);
-  return `**${author}**${when ? ` · ${when}` : ""}\n\n${renderText(m.text ?? "", opts.users)}`;
+  const text = m.text?.trim() ? renderText(m.text, opts.users) : REDACTED_MESSAGE;
+  return `**${author}**${when ? ` · ${when}` : ""}\n\n${text}`;
 }
 
 /** One thread PARTICIPANT — a distinct message author across the root + replies, with how much and when

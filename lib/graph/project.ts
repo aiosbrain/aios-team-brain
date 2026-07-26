@@ -5,6 +5,7 @@ import { GraphitiClient, type GraphEpisode } from "./graphiti-client";
 import { episodeGroupId, isExternalGroupId, type AccessTier } from "./group";
 import { episodeName, itemIdFromEpisodeName } from "./episode-name";
 import { resolvePositiveInt } from "@/lib/util/env";
+import { sourceRules } from "@/lib/ingest/source-rules";
 // Re-exported so the graph module's existing importers (and their specs) keep one import path.
 export { resolvePositiveInt };
 
@@ -419,6 +420,42 @@ export async function projectItemsToGraph(
       if (isExternalGroupId(existingRow.group_id)) externalGroupVacated++;
       await deleteItemEpisodes(client, existingRow.group_id, item.id).catch(() => {});
     }
+    // RETRACTABLE SOURCES: replace, don't append. `addEpisodes` does not overwrite by name — Graphiti
+    // keeps the old episode and the facts extracted from it — so for a source whose body is a
+    // re-render of content the source can retract (Slack: `retainSupersededBodies: false`), a deleted
+    // message would go on answering questions through the graph after Postgres had forgotten it. That
+    // is the same leak `forget-bodies` closes in `item_versions`, on the surface that is actually
+    // served. Shrinking past a chunk boundary is worse still: the orphan tail episode isn't even
+    // overwritten in name. Best-effort like the other inline deletes; the re-push below is
+    // authoritative and reconcile re-derives anything left behind.
+    // Skipped when `purgeBeforeRepush` already deletes from this exact group below — that branch
+    // watches its own result to decide whether the pending flag may clear, and a redundant deep scan
+    // here would only cost a second full listing of the group.
+    let retractFailed = false;
+    if (
+      existingRow &&
+      !purgeBeforeRepush &&
+      !sourceRules((item.frontmatter ?? {}).source).retainSupersededBodies
+    ) {
+      // WATCHED, not fire-and-forget. Every other inline delete here is backed by a durable flag,
+      // and this one needs it most: `addEpisodes` below lands regardless, so a swallowed failure
+      // leaves the pre-deletion episode in the graph with a fresh sha on the ledger — the landed
+      // check is satisfied by the new push, orphan repair needs the item to be GONE, and no flag was
+      // recorded. Nothing would ever revisit it, so one blip (and `deleteItemEpisodes` opens with a
+      // deep `listEpisodes`, which is exactly what times out under load) strands retracted text
+      // answering questions forever. Recording the group (see `pending` below) routes it into
+      // `purgeBeforeRepush` on the next pass, which retries and converges.
+      //
+      // `tierChanged` can in principle also be true here and wins the `pending` ternary below,
+      // dropping this debt — considered, and empty in practice: for both to be live the item must
+      // already have resided in the NEW group, and any outstanding debt for that group would have set
+      // `purgeBeforeRepush`, which skips this branch entirely. What's left is the straggler-chunk
+      // residue the module documents already.
+      retractFailed = await deleteItemEpisodes(client, groupId, item.id).then(
+        () => false,
+        () => true
+      );
+    }
     // Independent of the tier check, NOT an else-arm: on a double flip (A→B→A while A's cleanup is
     // still outstanding) both are true, and the push target is exactly the group holding the stale
     // episodes the flag was recorded for. Skipping it there would leave them beside the fresh push.
@@ -430,7 +467,17 @@ export async function projectItemsToGraph(
       );
     }
 
-    await client.addEpisodes(groupId, episodes);
+    // A failed purge with UNCHANGED content must not re-push. The prior push is still in the group
+    // (that is why the delete was attempted), so pushing again adds a duplicate — and because the
+    // flag stays set, the next pass forces past the sha skip and does it again: one duplicate per
+    // item per hourly pass while Graphiti's delete path is unhealthy, growing the group until the
+    // deep `listEpisodes` times out and the delete can never succeed. That self-amplifying shape is
+    // exactly what reconcile's saturated-group guard refuses to feed. Skipping the push leaves the
+    // existing episodes and the outstanding flag, so the retry converges instead of compounding.
+    const contentUnchanged = existingRow?.content_sha256 === contentSha;
+    if (!(purgeFailed && contentUnchanged)) {
+      await client.addEpisodes(groupId, episodes);
+    }
 
     const projectedAt = new Date().toISOString();
     // Pending-delete bookkeeping for THIS push. Written only when it changes; an ordinary content
@@ -445,9 +492,14 @@ export async function projectItemsToGraph(
     const pending: Record<string, string | null> =
       tierChanged && existingRow
         ? { pending_delete_group_id: existingRow.group_id, pending_delete_at: projectedAt }
-        : purgeBeforeRepush && !purgeFailed
-          ? { pending_delete_group_id: null, pending_delete_at: null } // purge confirmed + re-pushed
-          : {};
+        : // A retract-delete we watched FAIL records this group as owing a cleanup, so the pre-deletion
+          // episode isn't stranded. It routes into `purgeBeforeRepush` on the next pass, which retries
+          // the delete and only then clears the flag — the same convergence the tier path uses.
+          retractFailed
+          ? { pending_delete_group_id: groupId, pending_delete_at: projectedAt }
+          : purgeBeforeRepush && !purgeFailed
+            ? { pending_delete_group_id: null, pending_delete_at: null } // purge confirmed + re-pushed
+            : {};
 
     await db.from("graph_episodes").upsert(
       {

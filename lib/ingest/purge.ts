@@ -47,7 +47,7 @@ export interface PurgeOptions {
  * recovery, so the escaping is unconditional rather than left to each caller. Postgres' default
  * LIKE escape character is `\`, which is why it needs escaping first.
  */
-function escapeLike(literal: string): string {
+export function escapeLike(literal: string): string {
   return literal.replace(/[\\%_]/g, (c) => `\\${c}`);
 }
 

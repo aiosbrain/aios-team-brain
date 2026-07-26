@@ -976,3 +976,93 @@ describe("purge vs a racing projector (real Postgres, mocked Graphiti)", () => {
     expect(r.group_id).not.toBe(externalGroup);
   });
 });
+
+/**
+ * Spec: for a source whose body is a re-render of content the source can RETRACT (Slack), a re-push
+ * must REPLACE its episodes, not append to them.
+ *
+ * `addEpisodes` does not overwrite by name — Graphiti keeps the old episode and the facts extracted
+ * from it. So a message deleted in Slack would keep answering questions through the graph after
+ * Postgres had forgotten it, on the surface that is actually served. Shrinking past a chunk boundary
+ * is worse: the orphan tail episode isn't even overwritten in name.
+ */
+describe("retractable sources replace their episodes (real Postgres, mocked Graphiti)", () => {
+  it("drops the pre-edit episode when a slack thread's body changes", async () => {
+    const seed = await seedTeam();
+    const slug = await teamSlugFor(seed.teamId);
+    const group = `${slug}_team`;
+    const fake = new FakeGraphiti();
+
+    await ingest(seed, {
+      kind: "transcript", path: "slack/c0pub/1.md", access: "team",
+      body: "root\n\n---\n\nsecret reply", frontmatter: { source: "slack" },
+    });
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(fake) });
+    expect(await fake.listEpisodes(group)).toHaveLength(1);
+
+    // The reply is deleted at the source; the next sync re-renders the thread without it.
+    await ingest(seed, {
+      kind: "transcript", path: "slack/c0pub/1.md", access: "team",
+      body: "root", frontmatter: { source: "slack" },
+    });
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(fake) });
+
+    const after = await fake.listEpisodes(group);
+    expect(after).toHaveLength(1); // replaced, not appended
+    expect(fake.pushes.at(-1)?.episodes[0].content).toContain("root");
+    expect(fake.pushes.at(-1)?.episodes[0].content).not.toContain("secret reply");
+  });
+
+  it("records a pending cleanup when the retract-delete FAILS, so it isn't stranded", async () => {
+    // `addEpisodes` lands regardless, so a swallowed failure leaves the pre-deletion episode in the
+    // graph with a fresh sha on the ledger: the landed check is satisfied by the new push, orphan
+    // repair needs the item to be GONE, and no flag was recorded — nothing would ever revisit it, and
+    // the retracted text keeps answering questions forever.
+    const seed = await seedTeam();
+    const slug = await teamSlugFor(seed.teamId);
+    const group = `${slug}_team`;
+    const fake = new FakeGraphiti();
+
+    await ingest(seed, {
+      kind: "transcript", path: "slack/c0pub/1.md", access: "team",
+      body: "root\n\n---\n\nsecret reply", frontmatter: { source: "slack" },
+    });
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(fake) });
+
+    fake.failDeletes = true; // Graphiti blips exactly when the retract-delete runs
+    await ingest(seed, {
+      kind: "transcript", path: "slack/c0pub/1.md", access: "team",
+      body: "root", frontmatter: { source: "slack" },
+    });
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(fake) });
+
+    const { data: row } = await db()
+      .from("graph_episodes")
+      .select("pending_delete_group_id")
+      .eq("team_id", seed.teamId)
+      .maybeSingle();
+    expect((row as { pending_delete_group_id: string | null }).pending_delete_group_id).toBe(group);
+
+    // …and it converges: the next pass retries the delete and only then clears the flag.
+    fake.failDeletes = false;
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(fake) });
+    const remaining = await fake.listEpisodes(group);
+    expect(remaining).toHaveLength(1);
+    expect(fake.pushes.at(-1)?.episodes[0].content).not.toContain("secret reply");
+  });
+
+  it("keeps appending for an ordinary source (the rule is per-source, not global)", async () => {
+    const seed = await seedTeam();
+    const slug = await teamSlugFor(seed.teamId);
+    const group = `${slug}_team`;
+    const fake = new FakeGraphiti();
+
+    await ingest(seed, { kind: "deliverable", path: "docs/spec.md", access: "team", body: "v1", frontmatter: { source: "notion" } });
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(fake) });
+    await ingest(seed, { kind: "deliverable", path: "docs/spec.md", access: "team", body: "v2", frontmatter: { source: "notion" } });
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(fake) });
+
+    // Unchanged behaviour: a document's revisions are genuine history, so nothing is retracted.
+    expect(await fake.listEpisodes(group)).toHaveLength(2);
+  });
+});

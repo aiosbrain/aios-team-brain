@@ -35,6 +35,24 @@ export type WorkTimeEvidence = "work" | "noise";
 
 export interface SourceRules {
   workTimeOnUnchangedBody: WorkTimeEvidence;
+  /**
+   * May superseded bodies be RETAINED in `item_versions`?
+   *
+   * The default is `true` — history is worth keeping, and for a document whose old revisions were
+   * genuinely authored, the retained body is a real record.
+   *
+   * `false` is for sources whose item body is a **re-render of live, source-owned content that the
+   * source can retract**. A Slack thread is one item holding the whole conversation, rewritten every
+   * sync: delete a message and the current body self-heals, but every retained body still contains
+   * it — so the brain keeps, verbatim and indefinitely, text the author erased at the source. That
+   * isn't history, it's a copy the source no longer consents to.
+   *
+   * Only the BODY is cleared; the rows stay. `item_versions` is the work ledger — `member_id` +
+   * `created_at` attribute contributor credit, the timeline and arcs — and dropping rows would
+   * silently rewrite who did what. Nothing reads `item_versions.body`; it is history, not a served
+   * surface.
+   */
+  retainSupersededBodies: boolean;
 }
 
 /**
@@ -46,32 +64,37 @@ export interface SourceRules {
  */
 export const SOURCE_RULES: Readonly<Record<string, SourceRules>> = {
   // ── Event-shaped timestamps: the move IS the work ──────────────────────────────────────────────
-  /** Thread `ts` — immutable per thread; a new message changes the body anyway. */
-  slack: { workTimeOnUnchangedBody: "work" },
+  /** Thread `ts` — immutable per thread; a new message changes the body anyway.
+   *
+   *  `retainSupersededBodies: false` — the ONLY source that opts out today, and the reason is
+   *  deletion, not tidiness: one item holds the whole conversation and is re-rendered every sync, so
+   *  a message deleted at the source vanishes from the current body while every retained body still
+   *  quotes it verbatim, forever. */
+  slack: { workTimeOnUnchangedBody: "work", retainSupersededBodies: false },
   /** `committed_at` — immutable per commit. */
-  git: { workTimeOnUnchangedBody: "work" },
+  git: { workTimeOnUnchangedBody: "work", retainSupersededBodies: true },
   /** Issue activity / a repo file's last commit. */
-  github: { workTimeOnUnchangedBody: "work" },
+  github: { workTimeOnUnchangedBody: "work", retainSupersededBodies: true },
   /** `linearWorkedAt` = last state transition. A ticket reaching `completed` is work, and its doc
    *  body is unchanged — the exact case that makes "always preserve" wrong. */
-  linear: { workTimeOnUnchangedBody: "work" },
+  linear: { workTimeOnUnchangedBody: "work", retainSupersededBodies: true },
   /** `planeWorkedAt` — same shape as Linear. */
-  plane: { workTimeOnUnchangedBody: "work" },
+  plane: { workTimeOnUnchangedBody: "work", retainSupersededBodies: true },
   /** Meeting occurrence time. */
-  granola: { workTimeOnUnchangedBody: "work" },
+  granola: { workTimeOnUnchangedBody: "work", retainSupersededBodies: true },
   /** The feed entry's own published/updated time — an event, not the scan's clock. */
-  radar: { workTimeOnUnchangedBody: "work" },
+  radar: { workTimeOnUnchangedBody: "work", retainSupersededBodies: true },
 
   // ── Edit-shaped timestamps: a human edited the document, so still work ─────────────────────────
   // These bump on a metadata-only edit too (a Notion property, a Drive rename), which is weaker
   // evidence — but a human did touch the document, and demoting them would hide real editing work.
   // Left as "work" deliberately rather than guessed into "noise".
-  notion: { workTimeOnUnchangedBody: "work" },
-  gdrive: { workTimeOnUnchangedBody: "work" },
-  confluence: { workTimeOnUnchangedBody: "work" },
+  notion: { workTimeOnUnchangedBody: "work", retainSupersededBodies: true },
+  gdrive: { workTimeOnUnchangedBody: "work", retainSupersededBodies: true },
+  confluence: { workTimeOnUnchangedBody: "work", retainSupersededBodies: true },
   /** Moot today — `web.py` emits no timestamp at all. Classified so the guard stays satisfied;
    *  revisit if it ever grows one, since a FETCH time would be noise-shaped, not work-shaped. */
-  web: { workTimeOnUnchangedBody: "work" },
+  web: { workTimeOnUnchangedBody: "work", retainSupersededBodies: true },
 
   // ── Storage-shaped timestamps: not evidence of anything ────────────────────────────────────────
   /** mtime. `touch`, `rsync`, `chmod`, a checkout, a backup restore — all move it with no author and
@@ -81,7 +104,7 @@ export const SOURCE_RULES: Readonly<Record<string, SourceRules>> = {
    *  freeze is direction-agnostic, so an item whose stored frontmatter carries NO work-time (a row
    *  pushed before `local.py` emitted `source_ts`) stays on the `created_at` fallback until someone
    *  actually edits the file. A backward correction is refused for the same reason. */
-  local: { workTimeOnUnchangedBody: "noise" },
+  local: { workTimeOnUnchangedBody: "noise", retainSupersededBodies: true },
 };
 
 /**
@@ -92,5 +115,5 @@ export const SOURCE_RULES: Readonly<Record<string, SourceRules>> = {
  */
 export function sourceRules(source: unknown): SourceRules {
   const key = typeof source === "string" ? source.toLowerCase().trim() : "";
-  return SOURCE_RULES[key] ?? { workTimeOnUnchangedBody: "work" };
+  return SOURCE_RULES[key] ?? { workTimeOnUnchangedBody: "work", retainSupersededBodies: true };
 }

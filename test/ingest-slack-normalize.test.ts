@@ -174,3 +174,35 @@ describe("slackChannelPathPrefix", () => {
     expect(slackChannelPathPrefix("C0AAA").endsWith("/")).toBe(true);
   });
 });
+
+/**
+ * A message that still EXISTS at the source but whose text is gone (deleted, or edited away) renders
+ * as a placeholder rather than being dropped. Dropping it would keep the stored body quoting the
+ * retracted text; rendering it keeps the conversation's shape and every replier's contribution.
+ */
+describe("normalizeThread — a retracted message renders as a placeholder", () => {
+  it("replaces a deleted ROOT's text while keeping the replies", () => {
+    const payload = normalizeThread(
+      {
+        root: { ts: "1719878400.000100", user: "U1", text: "", subtype: "tombstone", reply_count: 1 },
+        replies: [{ ts: "1719878500.000200", user: "U2", text: "still here" }],
+      },
+      opts
+    );
+    expect(payload.body).toContain("_[message deleted]_");
+    expect(payload.body).toContain("still here");
+    expect(payload.body).not.toContain("tombstone");
+  });
+
+  it("replaces a deleted REPLY's text", () => {
+    const payload = normalizeThread(
+      {
+        root: { ts: "1719878400.000100", user: "U1", text: "question?" },
+        replies: [{ ts: "1719878500.000200", user: "U2", text: "   " }],
+      },
+      opts
+    );
+    expect(payload.body).toContain("question?");
+    expect(payload.body).toContain("_[message deleted]_");
+  });
+});
