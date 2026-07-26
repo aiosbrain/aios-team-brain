@@ -496,9 +496,10 @@ describe("INFERRED task links (the LLM doc→task pass — the first reader of t
     expect(via).toEqual(["inferred"]);
   });
 
-  it("a BELOW-THRESHOLD row is stored but never becomes a link (the gate is honoured on READ too)", async () => {
-    // The writer persists low-confidence answers as an audit trail of what the model thought. If only the
-    // writer gated, a hand-written or older row would silently become a real link on the next read.
+  it("a BELOW-THRESHOLD row never becomes a link — the gate is enforced on READ too", async () => {
+    // Defence in depth: the pass already drops sub-threshold answers before writing, so this row stands in
+    // for every OTHER way one can appear (a backfill, a manual insert, a row written when the threshold was
+    // lower). None of them may promote a guess just by existing.
     const seed = await seedTeam();
     const anchor = await commit(seed, "seed");
     await insertTask(seed, anchor.projectId!, { row_key: "AIO-501", title: "Low confidence task" });

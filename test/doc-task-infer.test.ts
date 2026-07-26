@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   MIN_CONFIDENCE,
+  isScoreableSource,
   candidatesFor,
   inferenceInputsHash,
   scoreableDocs,
@@ -53,6 +54,24 @@ describe("scoreableDocs — what the model is allowed to see", () => {
 
   it("skips an unattributed doc — there is no person to reason about", () => {
     expect(scoreableDocs([doc({ id: "orphan", memberId: null })])).toEqual([]);
+  });
+});
+
+describe("isScoreableSource — only AUTHORED DOCUMENTS are worth paying a model to classify", () => {
+  it("scores real documents", () => {
+    for (const s of ["notion", "gdrive", "confluence", "other", ""]) expect(isScoreableSource(s)).toBe(true);
+  });
+
+  it("NEVER scores a commit — its own message and its PR already resolve deterministically (#377)", () => {
+    expect(isScoreableSource("github")).toBe(false);
+  });
+
+  it("NEVER scores a CONVERSATION — a Slack thread would defeat the skip and starve the real corpus", () => {
+    // Every reply re-syncs the thread and changes its content hash, so the inputs-hash skip would miss on
+    // nearly every tick during working hours — a paid call ~48x/day — and the freshly-synced threads would
+    // occupy the per-run doc slots ahead of the design docs this feature exists for.
+    expect(isScoreableSource("slack")).toBe(false);
+    expect(isScoreableSource("tweet")).toBe(false);
   });
 });
 
@@ -119,6 +138,18 @@ describe("applyInferredLinks — the trust boundary", () => {
   it("collapses duplicate choices for the same (doc, task) pair — the table's PK", () => {
     const out = applyInferredLinks([choice(), choice({ confidence: 0.95 })], visibleIds, offeredDocs);
     expect(out).toHaveLength(1);
+  });
+
+  it("keeps ONE task per doc — its highest-confidence answer, never two placements", () => {
+    // The prompt asks for a single task. A model that answers twice must NARROW to its best answer; two
+    // links would file one doc under two different task headers on the timeline.
+    const out = applyInferredLinks(
+      [choice({ taskId: "t1", confidence: 0.75 }), choice({ taskId: "t2", confidence: 0.95 })],
+      visibleIds,
+      offeredDocs
+    );
+    expect(out).toHaveLength(1);
+    expect(out[0].taskId).toBe("t2");
   });
 
   it("drops a malformed confidence rather than trusting it", () => {

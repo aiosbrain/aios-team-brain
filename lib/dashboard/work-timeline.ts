@@ -458,10 +458,11 @@ export async function getWorkTimeline(
   // that cites no issue key anywhere in its title or path is exactly what the deterministic matcher can
   // never catch, so without this the pass's output would be invisible.
   //
-  // The confidence gate is re-applied HERE, not just in the writer. The writer persists below-threshold
-  // answers deliberately (an audit trail of what the model thought), and `method='llm'` rows can also be
-  // written by a future admin/backfill path — so a reader that trusted every row would silently promote
-  // a guess the writer had already rejected.
+  // The confidence gate is re-applied HERE as DEFENCE IN DEPTH, not because the writer is unreliable:
+  // `applyInferredLinks` already drops sub-threshold answers, so today nothing below the bar reaches the
+  // table via the pass. It matters for every OTHER way an `llm` row can appear — a backfill, a manual
+  // insert, an older row written when the threshold was lower — none of which should be able to promote
+  // a guess just by existing. One constant, enforced on both sides.
   //
   // Enrichment, like the chips/work-events legs: WARN on failure, never throw — an unreadable inference
   // table must not blank the factual ledger.

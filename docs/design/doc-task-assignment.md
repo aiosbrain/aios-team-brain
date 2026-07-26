@@ -172,7 +172,7 @@ deliberately excluded — see below.
 
 ## Build notes (as shipped)
 
-Built as specced, with these decisions made during the build:
+Built with these decisions — including two deliberate deviations from the spec above:
 
 - **Idempotency store:** the inputs hash lives on the recorded `ingest_runs.meta.inputs_hash` for
   `source='doc_task_infer'` — no new table, and the same row that proves the run happened is what makes the
@@ -184,9 +184,18 @@ Built as specced, with these decisions made during the build:
 - **The model never sees a real id.** Docs and tasks are relabelled to synthetic `D1`/`T1` refs; we map
   them back. A hallucinated ref resolves to nothing, which is a stronger guarantee than validating UUIDs
   after the fact — and `applyInferredLinks` still validates both sides as defence in depth.
-- **Confidence gate is applied twice** — writer AND reader. Below-threshold rows are persisted on purpose
-  (the audit trail of what the model thought), so a reader that trusted every row would promote a guess the
-  writer had already rejected.
+- **Confidence gate is applied twice** — writer AND reader — but NOT as specced. The design said
+  below-threshold answers would be PERSISTED as an audit trail and filtered on read; as built,
+  `applyInferredLinks` drops them before the write, so nothing sub-threshold reaches the table via the pass.
+  The read-side gate is therefore **defence in depth** against every other way an `llm` row can appear (a
+  backfill, a manual insert, a row written when the threshold was lower), not a filter on the writer's own
+  output. Persisting the audit trail remains a cheap follow-up if the model's near-misses turn out to be
+  worth inspecting.
+- **`bustTeamLearningCaches` was NOT extended** (the design's build-loop checklist asked for it). Analysed
+  and deliberately skipped: inferred edges are (task, item) CONTENT links, and the inputs hash covers
+  neither `memberId` nor attribution — so a re-attribution neither invalidates nor should refresh them (a
+  re-credited doc keeps its link and the timeline simply re-files it under the new worker). Revisit if the
+  inference ever becomes person-dependent.
 - **Commits are excluded from scoring:** their own message and their PR already resolve deterministically
   (#377), so an inference could only be worse than what the timeline already has.
 - **Metering reuses the `timeline-summary` `LlmUsageSource` slice** rather than widening that closed union

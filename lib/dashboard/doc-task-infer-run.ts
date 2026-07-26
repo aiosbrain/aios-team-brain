@@ -7,13 +7,14 @@ import { llmConfigured } from "./timeline-summary";
 import { resolveItemCreditIds } from "@/lib/attribution/contributor-credit";
 import { computeTaskLinks } from "./issue-ref";
 import { classifyWork } from "./work-classification";
-import { itemWorkTime } from "./timeline-group";
+import { itemWorkTime, normalizeSource } from "./timeline-group";
 import {
   DOC_TASK_SYSTEM,
   applyInferredLinks,
   buildInferPrompt,
   candidatesFor,
   inferenceInputsHash,
+  isScoreableSource,
   parseInferResponse,
   scoreableDocs,
   type InferCandidate,
@@ -51,6 +52,8 @@ const MAX_DOCS = 40;
 const TASK_LIMIT = 200;
 /** Body chars READ per doc (the prompt truncates further) — keeps a big doc off the wire. */
 const BODY_READ_CHARS = 2000;
+/** Rows scanned for candidate docs. Bounds the wide (body-less) read. */
+const ITEM_SCAN = 500;
 const MAX_TOKENS = 900;
 const TIMEOUT_MS = 45_000;
 /** `ingest_runs.source` for this leg — also the key used to find the previous run's inputs hash. */
@@ -108,12 +111,16 @@ export async function runDocTaskInference(db: DbClient, teamId: string): Promise
       visibleItems(
         db
           .from("items")
-          .select("id, member_id, member_id_locked, kind, path, body, content_sha256, access, frontmatter")
+          // NO `body` here: this read is wide (up to ITEM_SCAN) and a design doc runs 10-100KB, so
+          // pulling prose for rows the hash check is about to discard would move tens of MB per team per
+          // tick for a pass that then does nothing. Bodies are fetched by id AFTER the skip check, for the
+          // ≤MAX_DOCS docs actually being scored. (`timeline-evidence` avoids the same trap.)
+          .select("id, member_id, member_id_locked, kind, path, content_sha256, access, frontmatter")
           .eq("team_id", teamId)
           .not("member_id", "is", null)
           .gte("synced_at", sinceIso)
           .order("synced_at", { ascending: false })
-          .limit(500),
+          .limit(ITEM_SCAN),
         "team"
       ),
     ]);
@@ -125,12 +132,12 @@ export async function runDocTaskInference(db: DbClient, teamId: string): Promise
     const items = (itemRes.data ?? []) as ItemRow[];
     if (!tasks.length) return { scored: 0, linked: 0, skipped: "no-candidates" };
 
-    // WORK docs only — a decision or a meeting is data ABOUT work, never a doc that "belongs to" a task.
-    // Commits are excluded too: their own message and their PR already resolve deterministically (#377),
-    // so an inference could only ever be worse than what the timeline already has.
+    // AUTHORED DOCUMENTS only — `isScoreableSource` carries the reasoning for each exclusion, and
+    // `classifyWork` drops SIGNAL (a decision, a meeting: data ABOUT work).
     const docRows = items.filter((r) => {
       const fm = r.frontmatter ?? {};
-      if (str(fm.source) === "git") return false;
+      const source = normalizeSource(str(fm.source));
+      if (!isScoreableSource(source)) return false;
       if (classifyWork(r.kind, str(fm.source)) !== "work") return false;
       return !!itemWorkTime(fm); // no work-time → the timeline drops it anyway; don't pay to score it
     });
@@ -161,7 +168,7 @@ export async function runDocTaskInference(db: DbClient, teamId: string): Promise
       contentSha: r.content_sha256 ?? "",
       access: r.access === "external" ? "external" : "team",
       hasDeterministicLink: (deterministic.get(r.id) ?? []).length > 0,
-      body: (r.body ?? "").slice(0, BODY_READ_CHARS),
+      // `body` is attached later — only for the docs that survive the skip check (see below).
     }));
 
     const scoreable = scoreableDocs(docs).slice(0, MAX_DOCS);
@@ -179,13 +186,18 @@ export async function runDocTaskInference(db: DbClient, teamId: string): Promise
 
     // SKIP-IF-UNCHANGED: same docs (by content), same candidates, same prompt → the previous answers
     // still hold, so re-running would re-spend for an identical result.
+    // The hash keys on `content_sha256`, NOT on the prose — so this decision needs no bodies, which is
+    // what lets the body read stay behind it.
     const inputsHash = inferenceInputsHash(scoreable, candidates, DOC_TASK_SYSTEM);
     if (await lastInputsHash(db, teamId) === inputsHash) return { scored: 0, linked: 0, skipped: "unchanged" };
 
+    // Only NOW pull prose, and only for the ≤MAX_DOCS docs actually being scored.
+    const withBodies = await attachBodies(db, teamId, scoreable);
+
     // Rank candidates per the FIRST doc's author, then send one batch. Per-doc candidate sets would mean
     // one call per doc; the ranking only tilts ordering, and the model still sees every visible task.
-    const ranked = candidatesFor(scoreable[0], candidates);
-    const { prompt, docByRef, taskByRef } = buildInferPrompt(scoreable, ranked);
+    const ranked = candidatesFor(withBodies[0], candidates);
+    const { prompt, docByRef, taskByRef } = buildInferPrompt(withBodies, ranked);
 
     const raw = await completeTextOrNull(
       { system: DOC_TASK_SYSTEM, prompt },
@@ -208,7 +220,7 @@ export async function runDocTaskInference(db: DbClient, teamId: string): Promise
     const links = applyInferredLinks(
       choices,
       new Set(ranked.map((c) => c.id)),
-      new Set(scoreable.map((d) => d.id))
+      new Set(withBodies.map((d) => d.id))
     );
 
     // Replace THIS pass's edges only — `method='llm'`. The deterministic writer's `issue_ref` rows are
@@ -224,6 +236,11 @@ export async function runDocTaskInference(db: DbClient, teamId: string): Promise
         confidence: l.confidence,
         detail: l.detail,
       }));
+      // NOTE the PK is `(team_id, task_id, item_id)` — `method` is NOT in it, so this upsert would
+      // overwrite an `issue_ref` row's method on a collision. Unreachable today (a scored doc is by
+      // construction one with NO deterministic link, so the pair can't already be an issue_ref edge), but
+      // that safety is emergent from the filters above rather than structural — stated here so a future
+      // change to what gets scored doesn't silently start downgrading deterministic edges to guesses.
       const ins = await db.from("task_evidence").upsert(rows, { onConflict: "team_id,task_id,item_id" });
       if (ins.error) throw new Error(`insert failed: ${ins.error.message}`);
     }
@@ -235,6 +252,27 @@ export async function runDocTaskInference(db: DbClient, teamId: string): Promise
     console.error("[doc-task-infer] pass failed:", message);
     await record(db, teamId, startedAt, false, {}, [message]);
     return { scored: 0, linked: 0 };
+  }
+}
+
+/**
+ * Fetch prose for exactly the docs being scored, head-truncated. Separate from the wide scan so an
+ * "unchanged" tick reads no bodies at all. A body that fails to load leaves the doc title-only — still
+ * judgeable, just weaker evidence — rather than dropping it.
+ */
+async function attachBodies(db: DbClient, teamId: string, docs: InferDoc[]): Promise<InferDoc[]> {
+  try {
+    const { data } = await db
+      .from("items")
+      .select("id, body")
+      .eq("team_id", teamId)
+      .in("id", docs.map((d) => d.id));
+    const bodyById = new Map(
+      ((data ?? []) as { id: string; body: string | null }[]).map((r) => [r.id, (r.body ?? "").slice(0, BODY_READ_CHARS)])
+    );
+    return docs.map((d) => ({ ...d, body: bodyById.get(d.id) ?? "" }));
+  } catch {
+    return docs; // title-only is a valid, weaker input — never a reason to abort the pass
   }
 }
 
