@@ -628,10 +628,16 @@ async function synthesizeArcs(
   // dominated by whoever pushed the most volume and everyone else's work is invisible in Learning.
   // Dedupe the raw pool up front — drops exact-repeat fact texts and self-referential noise so neither
   // balancing counts nor prompt slots are wasted on redundant/garbage facts.
-  const pool = dedupeFacts(await recentFacts(groups, null, FACT_POOL));
+  const factsRead = await recentFacts(groups, null, FACT_POOL);
+  const pool = dedupeFacts(factsRead.facts);
   // No facts and nothing to correct → nothing to synthesize. (A correction with no facts still runs
   // the LLM, preserving the pre-cache recompute behavior.)
-  if (pool.length === 0 && correctionTexts.length === 0) return { arcs: [], factsHash: null, degraded: false };
+  // An empty pool means one of two very different things, and only one of them is an answer: the window
+  // was genuinely quiet (`ok`), or the fact read FAILED. Reporting the second as a clean empty is how a
+  // Neo4j outage on a cold miss writes a blank panel stamped fresh for 4h — H12's shape, on the leg that
+  // still conflated them.
+  if (pool.length === 0 && correctionTexts.length === 0)
+    return { arcs: [], factsHash: null, degraded: !factsRead.ok };
   // Resolve attribution for the WHOLE pool (higher uuid cap to match) so balancing sees each fact's
   // human. epToItem/creditByItem stay supersets of the balanced set — safe for evidence + attribution.
   // Degradation is tracked, not swallowed: any leg below that fails leaves the synthesis inputs
@@ -641,7 +647,19 @@ async function synthesizeArcs(
   const episodeItems = await resolveEpisodeItems(groups, pool.flatMap((f) => f.episodeUuids), FACT_POOL * 3);
   if (!episodeItems.ok) degraded = true;
   const epToItem = episodeItems.items;
-  const allItemIds = [...new Set([...epToItem.values()].map((v) => v.itemId).filter((id): id is string => !!id))];
+  // Shape-filtered before it reaches a uuid column. These ids are parsed verbatim out of Graphiti
+  // episode NAMES, and `resolveItemCredit` (now strict) binds them into `id IN (…)`: one malformed value
+  // raises 22P02 on every retry, so strict would throw forever — degraded permanently, model never
+  // called, panel frozen until the 48h cap. A bad name should cost that one fact its attribution, not
+  // the whole learning layer. (`arcIneligibleItemIds` already sidesteps this with `id::text = any(...)`.)
+  const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  const allItemIds = [
+    ...new Set(
+      [...epToItem.values()]
+        .map((v) => v.itemId)
+        .filter((id): id is string => !!id && UUID_RE.test(id))
+    ),
+  ];
   // Evidence-gated credit per item (one query pass): the `primary` WORKER drives balancing + the fact
   // prompt (one fact needs one representative — a reassigned-away worker's facts now balance under THEM,
   // not the non-working new owner), and the `contributors` SET drives arc `participants` (so a prior

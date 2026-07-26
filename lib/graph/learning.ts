@@ -67,8 +67,12 @@ export async function recentFacts(
   groups: string[],
   sinceISO: string | null,
   limit = 15
-): Promise<AtomicFact[]> {
-  if (!neo4jConfigured() || groups.length === 0) return [];
+): Promise<{ facts: AtomicFact[]; ok: boolean }> {
+  // Not configured / no groups is a legitimate empty, not a failure — same distinction as
+  // `resolveEpisodeItems`. Keeping the two legs of this module symmetric is the point: they feed the
+  // same synthesis, and one of them conflating "the graph is down" with "the week was quiet" is enough
+  // to pin an empty arc panel as if it were the truth.
+  if (!neo4jConfigured() || groups.length === 0) return { facts: [], ok: true };
   // `withSince` gates ONLY the time bound; the group_id tier filter is present either way.
   const factsCypher = (withSince: boolean) =>
     `MATCH (a:Entity)-[r:RELATES_TO]->(b:Entity)
@@ -107,11 +111,15 @@ export async function recentFacts(
     // `sinceISO === null` means "no time box — just the most-recent N" (arcs aren't time-boxed).
     // With a window, fall back to most-recent-N (still tier-scoped) only when the window is empty —
     // preserves the "recent" intent when the graph is fresh, degrades gracefully when it's stale/sparse.
-    if (sinceISO === null) return await query(false);
+    if (sinceISO === null) return { facts: await query(false), ok: true };
     const windowed = await query(true);
-    return windowed.length > 0 ? windowed : await query(false);
-  } catch {
-    return []; // degrade — panel shows empty rather than erroring
+    return { facts: windowed.length > 0 ? windowed : await query(false), ok: true };
+  } catch (err) {
+    console.error(
+      "[graph] recentFacts failed — treating as degraded, not as an empty window:",
+      err instanceof Error ? err.message : err
+    );
+    return { facts: [], ok: false };
   }
 }
 

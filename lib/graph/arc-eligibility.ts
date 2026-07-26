@@ -132,9 +132,12 @@ export async function arcIneligibleItemIds(
   } catch (err) {
     // FAIL CLOSED. This used to return an empty set, i.e. "nothing is ineligible" — so one transient DB
     // error flooded the arc pool with the exact backlog/done noise this gate exists to remove, and the
-    // result was then committed as a fresh 4h arc set. Throwing is the safe direction: the BACKGROUND
-    // refresh path wraps synthesis in try/catch and does NOT commit on error, so the previous arcs
-    // stand. (A cold miss with no prior surfaces the error instead — degraded, but never wrong data.)
+    // result was then committed as a fresh 4h arc set.
+    //
+    // The throw is this module refusing to GUESS; what happens next is the caller's call.
+    // `lib/graph/arcs` catches it and marks the synthesis `degraded`, which means: don't run the model,
+    // don't overwrite good arcs, and persist a short-lived row so the next view retries in minutes. The
+    // invariant this gate cares about — never publish a possibly-noise-filled set — holds either way.
     const message = err instanceof Error ? err.message : String(err);
     console.error("[arcs] arc-eligibility lookup failed — refusing to synthesize:", message);
     throw new Error(`arc-eligibility lookup failed: ${message}`);
