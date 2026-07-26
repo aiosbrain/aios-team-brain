@@ -21,6 +21,7 @@ export interface DenseHit {
   path: string;
   kind: string;
   synced_at: string;
+  work_at: string;
   project: string;
   dist: number; // cosine distance to the query (0 = identical … 2 = opposite); lower = more relevant
 }
@@ -64,9 +65,9 @@ export async function denseSearch(
     const limitIdx = params.length;
 
     const sql = `
-      select item_id, content, path, kind, synced_at, project, dist from (
+      select item_id, content, path, kind, synced_at, work_at, project, dist from (
         select distinct on (c.item_id)
-          c.item_id, c.content, i.path, i.kind, i.synced_at, coalesce(p.slug, '') as project,
+          c.item_id, c.content, i.path, i.kind, i.synced_at, i.work_at, coalesce(p.slug, '') as project,
           (c.embedding <=> $1::vector) as dist
         from item_chunks c
         join items i on i.id = c.item_id
@@ -84,6 +85,7 @@ export async function denseSearch(
       path: string;
       kind: string;
       synced_at: string | Date;
+      work_at: string | Date;
       project: string;
       dist: number | string;
     }>(sql, params);
@@ -95,6 +97,7 @@ export async function denseSearch(
       kind: r.kind,
       synced_at:
         r.synced_at instanceof Date ? r.synced_at.toISOString() : String(r.synced_at ?? ""),
+      work_at: r.work_at instanceof Date ? r.work_at.toISOString() : String(r.work_at ?? ""),
       project: r.project,
       dist: typeof r.dist === "number" ? r.dist : Number(r.dist) || 0,
     }));

@@ -229,7 +229,7 @@ export async function* streamAnswer(
   const sourcesBlock = ctx.sources
     .map(
       (s) =>
-        `<source id="${s.sid}" project="${s.project}" path="${s.path}" kind="${s.kind}" synced="${s.synced_at}">\n${s.text}\n</source>`
+        `<source id="${s.sid}" project="${s.project}" path="${s.path}" kind="${s.kind}" worked="${s.work_at || s.synced_at}">\n${s.text}\n</source>`
     )
     .join("\n\n");
 

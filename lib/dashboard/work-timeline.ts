@@ -32,15 +32,17 @@ const ACTIVE_TASK_STATUSES = new Set(["in_progress", "blocked"]);
  * Design decisions (Fable spec review):
  *  • WORK time = the first present of `WORK_TIME_KEYS` (git `committed_at` → generic/Slack `source_ts` →
  *    a doc's own edit/create time: `updated`/`last_edited_time`/`modifiedTime`/`date`/`created`/…) —
- *    NEVER `synced_at`. Every listed field is source-frozen, so a re-scan can't resurface an item as
- *    "today's work"; `synced_at` would. This is what INCLUDES attributed docs (Notion/Google Docs/
+ *    NEVER `synced_at`. Resolved ONCE at ingest and read from `items.work_at` here — not re-derived,
+ *    so a SQL window and a TS caller cannot disagree. This is what INCLUDES attributed docs (Notion/Google Docs/
  *    deliverables) that carry an edit time but no git-style timestamp — previously dropped. Items with
  *    no real work time at all are still DROPPED (mirrors lib/graph/learning `workTs`).
- *  • `.gte("synced_at", sinceIso)` bounds the fetch: sync is always at-or-after the work, so a 7-day
- *    synced_at window is a complete superset of the 7-day work window (and hits `items_team_synced_idx`).
- *    Caveat: re-pushes bump synced_at, so at scale the real bound is `ITEM_LIMIT` ordered by synced_at;
- *    a >2000-live-item team could clip in-window work. Fine at current scale — a follow-up is to push
- *    the work-time filter into SQL (needs a computed/indexed work-time column).
+ *  • The window is SQL-NATIVE on the persisted `items.work_at` (`work_at >= since ORDER BY work_at, id`,
+ *    gated on `work_at_from_source`), hitting `items_team_work_at_idx`. It used to bound on `synced_at`
+ *    — but every re-sync tick bumps that, so after one tick the whole corpus sat inside the window and
+ *    the query really returned "the ITEM_LIMIT most recently PUSHED rows", ties broken by query plan:
+ *    a re-scan of an old corpus could fill the page with out-of-window docs and silently evict the
+ *    week's real work, differently on each rebuild. `id` is the tiebreak that makes the page stable.
+ *    SLACK is the one exception — see the comment on its leg.
  *  • Body fetched ONLY for git commits (the issue key lives in the commit message); other items match
  *    on title + path — avoids pulling large doc bodies.
  *  • Tasks are EVIDENCE-GATED (product): a task appears iff ≥1 of the person's in-window evidence
@@ -244,11 +246,20 @@ export async function getWorkTimeline(
     visibleItems(
       db
         .from("items")
-        .select("id, frontmatter, work_at")
+        .select("id, frontmatter, synced_at")
         .eq("team_id", teamId)
         .eq("frontmatter->>source", "slack")
-        .gte("work_at", sinceIso)
-        .order("work_at", { ascending: false })
+        // DELIBERATE EXCEPTION: this leg keeps the `synced_at` bound while the others moved to
+        // `work_at`. A Slack row's `work_at` is the thread ROOT's `source_ts`, which replies never
+        // bump — but the builder dates each participant by their OWN last message. So a thread
+        // rooted 10 days ago with a reply yesterday has an out-of-window `work_at` and an in-window
+        // contribution: bounding on `work_at` silently drops exactly the long-running threads people
+        // are actively working in. `synced_at` is a valid superset here (a live thread re-syncs every
+        // tick), and the REAL filter is the per-participant window in the loop below.
+        // The principled fix is for slack-normalize to date a thread by its LAST activity rather than
+        // its root; that changes the graph's episode dating too, so it's deliberately not in this PR.
+        .gte("synced_at", sinceIso)
+        .order("synced_at", { ascending: false })
         .order("id", { ascending: false })
         .limit(ITEM_LIMIT),
       tier

@@ -20,6 +20,8 @@ export interface FtsHit {
   kind: string;
   body: string;
   synced_at: string;
+  /** Persisted work-time (R1) — what the answering prompt shows, and the rank tiebreak. */
+  work_at: string;
   project: string;
   rank: number;
 }
@@ -50,12 +52,12 @@ export async function rankedFtsSearch(
   const limitIdx = params.length;
 
   const sql = `
-    select i.id, i.path, i.kind, i.body, i.synced_at, coalesce(p.slug, '') as project,
+    select i.id, i.path, i.kind, i.body, i.synced_at, i.work_at, coalesce(p.slug, '') as project,
            ts_rank(i.search, websearch_to_tsquery('english', $1)) as rank
     from items i
     left join projects p on p.id = i.project_id
     where ${where}
-    order by rank desc, i.synced_at desc
+    order by rank desc, i.work_at desc, i.id desc
     limit $${limitIdx}`;
 
   const res = await runSql<{
@@ -64,6 +66,7 @@ export async function rankedFtsSearch(
     kind: string;
     body: string | null;
     synced_at: string | Date;
+    work_at: string | Date;
     project: string;
     rank: number | string;
   }>(sql, params);
@@ -74,6 +77,7 @@ export async function rankedFtsSearch(
     kind: r.kind,
     body: r.body ?? "",
     synced_at: r.synced_at instanceof Date ? r.synced_at.toISOString() : String(r.synced_at ?? ""),
+    work_at: r.work_at instanceof Date ? r.work_at.toISOString() : String(r.work_at ?? ""),
     project: r.project,
     rank: typeof r.rank === "number" ? r.rank : Number(r.rank) || 0,
   }));

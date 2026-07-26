@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { randomUUID } from "node:crypto";
 import { getWorkTimeline, ITEM_LIMIT } from "@/lib/dashboard/work-timeline";
 import { retrieve } from "@/lib/query/retrieve";
 import { db, ingest, seedTeam } from "./helpers";
@@ -68,6 +69,9 @@ describe("the timeline windows on work_at, not sync time (real Postgres)", () =>
     // never gets fetched at all — silently, and differently on each rebuild (no secondary sort).
     //
     // Ordering and filtering by `work_at` makes the cap bite only on genuinely in-window work.
+    // Guards the guard: if ITEM_LIMIT ever stops being exported, `ITEM_LIMIT + 5` is NaN, the flood
+    // loop seeds nothing, and this spec passes while testing nothing.
+    expect(Number.isInteger(ITEM_LIMIT)).toBe(true);
     const seed = await seedTeam();
     await itemWorkedDaysAgo(seed, "docs/real-work.md", 1);
     for (let i = 0; i < ITEM_LIMIT + 5; i++) await itemWorkedDaysAgo(seed, `docs/old-${i}.md`, 200 + i);
@@ -95,6 +99,37 @@ describe("the timeline windows on work_at, not sync time (real Postgres)", () =>
 
     const titles = evidenceTitles(await getWorkTimeline(db(), seed.teamId, "team"));
     expect(titles).not.toContain("docs/undated.md");
+  });
+
+  it("keeps a Slack thread rooted BEFORE the window when a participant replied inside it", async () => {
+    // The one leg that must NOT window on `work_at`. A Slack row's work-time is the thread ROOT's
+    // `source_ts` and replies never bump it, but the builder dates each participant by their OWN last
+    // message — so bounding the fetch on `work_at` drops exactly the long-running threads people are
+    // actively working in. Caught in review; this is that repro.
+    const seed = await seedTeam();
+    await db()
+      .from("member_identities")
+      .insert({ team_id: seed.teamId, member_id: seed.memberId, provider: "slack", external_id: "U_REPLIER" });
+    const rootTs = new Date(Date.now() - 10 * 86_400_000).toISOString(); // thread opened 10 days ago
+    const replyTs = new Date(Date.now() - 86_400_000).toISOString(); // …still being worked yesterday
+    await ingest(seed, {
+      kind: "transcript",
+      path: `slack/eng/${randomUUID()}.md`,
+      access: "team",
+      body: "old thread, fresh reply",
+      frontmatter: {
+        source: "slack",
+        channel: "eng",
+        title: "#eng: long-running incident thread",
+        source_ts: rootTs,
+        participants: [
+          { author_id: "U_REPLIER", display_name: "Tester", message_count: 3, first_ts: rootTs, last_ts: replyTs },
+        ],
+      },
+    });
+
+    const titles = evidenceTitles(await getWorkTimeline(db(), seed.teamId, "team"));
+    expect(titles).toContain("#eng: long-running incident thread");
   });
 });
 

@@ -22,7 +22,11 @@ export type Source = {
   project: string;
   path: string;
   kind: string;
+  /** When we last SYNCED it. Kept for provenance; it is NOT a work-time (every tick bumps it). */
   synced_at: string;
+  /** When the WORK happened (R1, `items.work_at`) — this is what the answering prompt shows and what
+   *  the recency legs order by. Empty only for a source an external provider supplied. */
+  work_at: string;
   text: string;
 };
 

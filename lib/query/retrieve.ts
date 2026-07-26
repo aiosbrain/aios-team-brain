@@ -550,7 +550,7 @@ async function nativeRetrieve(
   if (channelSeg) recentB = recentB.like("path", `%/${channelSeg}/%`);
 
   // 2a. SOURCE-scoped recency: when the question names a source, pull its most-recent items by
-  // `synced_at` REGARDLESS of keyword rank (the recall fix for "what's the conversation in slack" —
+  // WORK time (`work_at`, like the leg above) REGARDLESS of keyword rank (the recall fix for "what's the conversation in slack" —
   // Slack threads rank below the FTS cut, so they never reached the model). Tier-filtered like every
   // leg; also channel-scoped when both are named. `null` → no source query (resolves to empty rows).
   let sourceRecencyB: typeof recentB | null = null;
@@ -647,11 +647,11 @@ async function nativeRetrieve(
   // Merge, dedupe by id, cap sizes. Ranked FTS hits (already ordered by relevance) come first, then
   // recency padding. Normalize the two row shapes (FTS carries `project` as a slug string; the
   // recency builder embeds `projects(slug)`).
-  type MergeHit = { id: string; path: string; kind: string; body: string; synced_at: string; slug: string };
+  type MergeHit = { id: string; path: string; kind: string; body: string; synced_at: string; work_at: string; slug: string };
   const iso = (v: string | Date): string => (v instanceof Date ? v.toISOString() : String(v ?? ""));
-  const rankedHits: MergeHit[] = ftsHits.map((h) => ({ id: h.id, path: h.path, kind: h.kind, body: h.body, synced_at: h.synced_at, slug: h.project }));
-  type RecencyRow = { id: string; path: string; kind: string; body: string | null; synced_at: string | Date; projects: unknown };
-  const toMergeHit = (h: RecencyRow): MergeHit => ({ id: h.id, path: h.path, kind: h.kind, body: h.body ?? "", synced_at: iso(h.synced_at), slug: (h.projects as { slug: string })?.slug ?? "" });
+  const rankedHits: MergeHit[] = ftsHits.map((h) => ({ id: h.id, path: h.path, kind: h.kind, body: h.body, synced_at: h.synced_at, work_at: h.work_at, slug: h.project }));
+  type RecencyRow = { id: string; path: string; kind: string; body: string | null; synced_at: string | Date; work_at: string | Date; projects: unknown };
+  const toMergeHit = (h: RecencyRow): MergeHit => ({ id: h.id, path: h.path, kind: h.kind, body: h.body ?? "", synced_at: iso(h.synced_at), work_at: iso(h.work_at), slug: (h.projects as { slug: string })?.slug ?? "" });
   const recencyHits: MergeHit[] = ((recentHits ?? []) as RecencyRow[]).map(toMergeHit);
   // Source-scoped recent items (when the question named a source) — placed AHEAD of the generic recency
   // padding so a named source's latest content beats arbitrary fresh items, but AFTER the ranked FTS
@@ -675,6 +675,7 @@ async function nativeRetrieve(
       path: hit.path,
       kind: hit.kind,
       synced_at: hit.synced_at,
+      work_at: hit.work_at,
       text,
     });
   }
@@ -698,6 +699,7 @@ async function nativeRetrieve(
       path,
       kind: hit.kind ?? "brain",
       synced_at: "",
+      work_at: "",
       text,
     });
   }
@@ -733,7 +735,7 @@ async function nativeRetrieve(
       const text = (hit.body || "").slice(0, MAX_SOURCE_CHARS);
       if (total + text.length > MAX_TOTAL_CHARS) break;
       total += text.length;
-      sources.push({ sid: `S${n++}`, item_id: hit.id, project: hit.project, path: hit.path, kind: hit.kind, synced_at: hit.synced_at, text });
+      sources.push({ sid: `S${n++}`, item_id: hit.id, project: hit.project, path: hit.path, kind: hit.kind, synced_at: hit.synced_at, work_at: hit.work_at, text });
     }
   }
 
@@ -763,6 +765,7 @@ async function nativeRetrieve(
         path: h.path,
         kind: h.kind,
         synced_at: h.synced_at,
+        work_at: h.work_at,
         text,
       });
     }

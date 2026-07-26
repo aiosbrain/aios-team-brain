@@ -51,6 +51,8 @@ export const externalProvider: RetrievalProvider = {
           path: h.path ?? `ext:${i + 1}`,
           kind: h.kind ?? "brain",
           synced_at: "",
+          // An external provider gives us no work-time; the prompt falls back to `synced_at` (also "").
+          work_at: "",
           text: h.text as string,
         }));
       return { sources, structured: data.structured ?? "", grounded: sources.length > 0 };
