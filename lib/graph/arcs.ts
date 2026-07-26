@@ -10,6 +10,7 @@ import { episodeGroupId, type AccessTier } from "./group";
 import { attributedFactTexts, groundParticipants } from "./arc-attribution";
 import { resolveItemCredit } from "@/lib/attribution/contributor-credit";
 import { readArcCache, writeArcCache, ARC_CACHE_TTL_MS as CACHE_TTL_MS } from "./arc-cache";
+import { listArcCorrections, recordArcCorrections } from "./arc-corrections";
 import { arcIneligibleItemIds } from "./arc-eligibility";
 
 /**
@@ -44,6 +45,9 @@ export interface NarrativeArc {
 export interface ArcCorrection {
   arc_id: string;
   corrected_text: string;
+  /** The arc's title at correction time. `arc_id` is sha(title) and churns on every recompute (M7), so
+   *  without this a stored correction becomes an un-diagnosable orphan as soon as arcs re-rank. */
+  arc_title?: string;
 }
 
 /** Full backend keys — resolve via `lib/query/answering.resolveAnsweringKeys` at the call site. */
@@ -628,6 +632,12 @@ async function synthesizeArcs(
   // dominated by whoever pushed the most volume and everyone else's work is invisible in Learning.
   // Dedupe the raw pool up front — drops exact-repeat fact texts and self-referential noise so neither
   // balancing counts nor prompt slots are wasted on redundant/garbage facts.
+  // Stored corrections inform EVERY synthesis, not only the recompute that produced one (H13). They used
+  // to reach later synthesis only by having become a Graphiti fact — so a graph wipe didn't merely lose
+  // the record, it lost the influence, and arcs quietly reverted to the version a human had rejected.
+  const stored = (await listArcCorrections(db, teamId)).map((c) => c.corrected_text);
+  const allCorrections = [...new Set([...correctionTexts, ...stored])];
+
   const factsRead = await recentFacts(groups, null, FACT_POOL);
   const pool = dedupeFacts(factsRead.facts);
   // No facts and nothing to correct → nothing to synthesize. (A correction with no facts still runs
@@ -636,7 +646,7 @@ async function synthesizeArcs(
   // was genuinely quiet (`ok`), or the fact read FAILED. Reporting the second as a clean empty is how a
   // Neo4j outage on a cold miss writes a blank panel stamped fresh for 4h — H12's shape, on the leg that
   // still conflated them.
-  if (pool.length === 0 && correctionTexts.length === 0)
+  if (pool.length === 0 && allCorrections.length === 0)
     return { arcs: [], factsHash: null, degraded: !factsRead.ok };
   // Resolve attribution for the WHOLE pool (higher uuid cap to match) so balancing sees each fact's
   // human. epToItem/creditByItem stay supersets of the balanced set — safe for evidence + attribution.
@@ -746,7 +756,7 @@ async function synthesizeArcs(
   // If every recent fact traces ONLY to non-active Linear work, there's nothing to synthesize — return
   // [] so it flows into the empty-clobber guard (keep a recent prior, else honest blank), rather than
   // firing a zero-fact LLM call whose fabricated (evidence-less) arcs would clobber the real prior set.
-  if (eligiblePool.length === 0 && correctionTexts.length === 0) return { arcs: [], factsHash: null, degraded };
+  if (eligiblePool.length === 0 && allCorrections.length === 0) return { arcs: [], factsHash: null, degraded };
   // Two-level balance (contributor → item, per-item capped) → a representative MAX_FACTS so every active
   // contributor is in the prompt AND no single giant document dominates its author's share.
   const facts = balanceFacts(eligiblePool, humanOfFact, itemOfFact, MAX_FACTS, PER_ITEM_CAP);
@@ -754,7 +764,7 @@ async function synthesizeArcs(
   // varied team gets more than a flat ceiling and each person's distinct threads have room to surface.
   const contributorCount = new Set(facts.map(humanOfFact).filter(Boolean)).size;
   const systemPrompt = buildSystemPrompt(arcsRequested(contributorCount));
-  const userPrompt = buildPrompt(attributedFactTexts(facts, epToItem, primaryByItem), correctionTexts);
+  const userPrompt = buildPrompt(attributedFactTexts(facts, epToItem, primaryByItem), allCorrections);
 
   // The stability key must cover EVERYTHING that determines the arcs' displayed content:
   //  • systemPrompt — so a deploy that edits the prompt / arc count re-synthesizes (not just fact churn);
@@ -776,7 +786,7 @@ async function synthesizeArcs(
   // STABILITY GUARD: identical input (+ no correction, + a real prior) → keep the prior arcs and SKIP the
   // LLM. This is what stops the day-to-day churn (same facts producing different arcs every recompute from
   // LLM non-determinism). The background refresh still runs (fetch/balance/hash), just not the model.
-  if (canReuseArcs(prior ? { factsHash: prior.factsHash, arcCount: prior.arcs.length } : null, factsHash, correctionTexts.length > 0)) {
+  if (canReuseArcs(prior ? { factsHash: prior.factsHash, arcCount: prior.arcs.length } : null, factsHash, allCorrections.length > 0)) {
     return { arcs: prior!.arcs, factsHash, degraded };
   }
 
@@ -993,14 +1003,34 @@ export async function recomputeArcs(
   tier: AccessTier,
   groups: string[],
   corrections: ArcCorrection[],
-  keys: ProviderKeys
+  keys: ProviderKeys,
+  /** Who made the edit — stored for attribution. Null only if the caller genuinely has no member. */
+  memberId: string | null = null
 ): Promise<NarrativeArc[]> {
   if (groups.length === 0) return [];
   const key = groups.slice().sort().join(",");
+
+  // PERSIST FIRST, and let a failure surface. Everything else on this path degrades quietly because a
+  // cache can be recomputed; a person's edit cannot. If this throws the route answers with an error and
+  // the user knows to retry — which beats the old behaviour of showing corrected arcs that silently
+  // revert on the next refresh.
+  await recordArcCorrections(
+    db,
+    teamId,
+    memberId,
+    corrections.map((c) => ({
+      arc_id: c.arc_id,
+      arc_title: c.arc_title ?? "",
+      corrected_text: c.corrected_text,
+    }))
+  );
+
   const { arcs: synthesized, factsHash, degraded } = await synthesizeArcs(db, teamId, groups, corrections.map((c) => c.corrected_text), keys);
   const arcs = await commitArcs(db, teamId, key, synthesized, factsHash, { degraded });
 
-  // Persist corrections as first-class episodes (team-tier group; corrections are internal).
+  // Project the corrections into the graph so they also read as facts to future extraction. This is now
+  // a DERIVED copy — Postgres above is the record — so it stays best-effort: losing it costs some graph
+  // context, not the correction itself.
   const client = new GraphitiClient();
   if (client.configured && corrections.length) {
     const now = new Date().toISOString();

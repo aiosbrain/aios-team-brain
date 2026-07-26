@@ -25,6 +25,7 @@ const llmMock = vi.hoisted(() => ({ completeTextOrNull: vi.fn() }));
 // (The control case caught exactly that.)
 const gateMock = vi.hoisted(() => ({ arcIneligibleItemIds: vi.fn() }));
 const creditMock = vi.hoisted(() => ({ resolveItemCredit: vi.fn() }));
+const correctionsMock = vi.hoisted(() => ({ listArcCorrections: vi.fn(), recordArcCorrections: vi.fn() }));
 
 vi.mock("@/lib/graph/learning", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/graph/learning")>()),
@@ -38,6 +39,11 @@ vi.mock("@/lib/graph/arc-eligibility", async (importOriginal) => ({
 vi.mock("@/lib/attribution/contributor-credit", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/attribution/contributor-credit")>()),
   resolveItemCredit: creditMock.resolveItemCredit,
+}));
+vi.mock("@/lib/graph/arc-corrections", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/graph/arc-corrections")>()),
+  listArcCorrections: correctionsMock.listArcCorrections,
+  recordArcCorrections: correctionsMock.recordArcCorrections,
 }));
 vi.mock("@/lib/llm/complete", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/llm/complete")>()),
@@ -88,6 +94,8 @@ describe("a degraded synthesis never reaches the model", () => {
     llmMock.completeTextOrNull.mockResolvedValue('{"arcs":[]}');
     gateMock.arcIneligibleItemIds.mockResolvedValue(new Set());
     creditMock.resolveItemCredit.mockResolvedValue(new Map());
+    correctionsMock.listArcCorrections.mockResolvedValue([]);
+    correctionsMock.recordArcCorrections.mockResolvedValue(undefined);
   });
 
   it("skips the LLM entirely when the episode→item leg failed", async () => {
@@ -152,5 +160,40 @@ describe("a degraded synthesis never reaches the model", () => {
     await getArcs(db, "team-1", "acme", "external", [`acme_healthy_${Math.random()}`], KEYS);
 
     expect(llmMock.completeTextOrNull).toHaveBeenCalled();
+  });
+});
+
+
+describe("H13: a stored correction reaches synthesis even with the graph wiped", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    llmMock.completeTextOrNull.mockResolvedValue('{"arcs":[]}');
+    gateMock.arcIneligibleItemIds.mockResolvedValue(new Set());
+    creditMock.resolveItemCredit.mockResolvedValue(new Map());
+    correctionsMock.recordArcCorrections.mockResolvedValue(undefined);
+  });
+
+  it("puts the correction in the prompt on an ORDINARY synthesis, not just the recompute that made it", async () => {
+    // The rebuild test the review report asked for. A correction used to influence later synthesis only
+    // by having become a Graphiti fact, so resetting the graph didn't just lose the record — it lost the
+    // influence, and arcs quietly reverted to the version a human had already rejected. Reading the
+    // corrections from Postgres on every synthesis is what makes a rebuilt graph still produce corrected
+    // arcs. Nothing here goes near Graphiti: the facts leg is mocked and GRAPHITI_URL is unset.
+    correctionsMock.listArcCorrections.mockResolvedValue([
+      { arc_id: "a1", arc_title: "Payments", corrected_text: "Dana led this, not Alex.", created_by: null, updated_at: "" },
+    ]);
+    factsMock.recentFacts.mockResolvedValue({ facts: [FACT], ok: true });
+    factsMock.resolveEpisodeItems.mockResolvedValue({
+      items: new Map([["ep-1", { itemId: "11111111-1111-4111-8111-111111111111", source: "github" }]]),
+      ok: true,
+    });
+
+    const { getArcs } = await import("@/lib/graph/arcs");
+    const { db } = fakeDb();
+    await getArcs(db, "team-1", "acme", "external", [`acme_h13_${Math.random()}`], KEYS);
+
+    expect(llmMock.completeTextOrNull).toHaveBeenCalled();
+    const prompt = JSON.stringify(llmMock.completeTextOrNull.mock.calls[0]);
+    expect(prompt).toContain("Dana led this, not Alex.");
   });
 });

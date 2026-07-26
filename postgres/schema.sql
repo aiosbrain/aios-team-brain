@@ -1670,6 +1670,25 @@ create index if not exists graph_episodes_team_idx on graph_episodes (team_id, p
 -- `arcs` is the fully-attributed NarrativeArc[] JSON. Read serves-stale-while-revalidate (a stale row
 -- is returned immediately while a background recompute refreshes it) — see getArcs. Regenerable cache,
 -- not a source of truth. Sole writer: lib/graph/arc-cache (via lib/graph/arcs).
+-- Human corrections to narrative arcs — the ONLY human-authored input in the learning layer, and the
+-- reason it needs a real home. These used to exist solely as Graphiti episodes written inside a
+-- swallowed catch: a graph rollback destroyed them permanently, and a failed write silently reverted the
+-- user's edit within one cache TTL. Postgres is the record; the graph episode is a derived projection.
+-- Team-tier by construction (the recompute route refuses an external principal). Sole writer:
+-- lib/graph/arc-corrections.
+create table if not exists arc_corrections (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  arc_id text not null,                        -- sha(title) today, and it CHURNS every recompute (M7)
+  arc_title text not null default '',          -- …so the title is kept to stay diagnosable past that churn
+  corrected_text text not null check (corrected_text <> ''),
+  created_by uuid references members(id) on delete set null,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  unique (team_id, arc_id)                     -- latest take per arc wins
+);
+create index if not exists arc_corrections_team_idx on arc_corrections (team_id, updated_at desc);
+
 create table if not exists arc_cache (
   team_id uuid not null references teams(id) on delete cascade,
   group_key text not null,                       -- sorted visible-group set, e.g. 'acme_external,acme_team'
