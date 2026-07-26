@@ -1,4 +1,5 @@
 import { subjectMatchesMember, type RosterPerson } from "./people-match";
+import { isOpenStatus } from "@/lib/tasks/activity-policy";
 
 /**
  * "Working On" — one consolidated per-person view for the dashboard, assembled from the CONTEXT
@@ -67,7 +68,7 @@ export interface PersonWork {
   accomplished: { id: string; title: string; at: string }[];
 }
 
-const OPEN_STATUSES = new Set(["ready", "in_progress", "blocked"]);
+
 const CONFIDENCE_RANK: Record<string, number> = { high: 3, medium: 2, low: 1 };
 const MAX_OPEN = 6;
 const MAX_DONE = 6;
@@ -96,7 +97,7 @@ export function assembleTeamWork(
   return roster.map((person) => {
     const mine = tasks.filter((t) => assignedPerson(t.assignee)?.memberId === person.memberId);
     const openTasks = mine
-      .filter((t) => OPEN_STATUSES.has(t.status))
+      .filter((t) => isOpenStatus(t.status))
       .slice(0, MAX_OPEN)
       .map((t) => ({ id: t.id, title: t.title, status: t.status }));
 

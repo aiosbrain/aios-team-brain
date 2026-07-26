@@ -1,4 +1,5 @@
 import "server-only";
+import { ACTIVE_STATUSES } from "@/lib/tasks/activity-policy";
 import { resolvePositiveInt } from "@/lib/util/env";
 import type { DbClient } from "@/lib/db/types";
 import { visibleItems, visibleTasks, visibleDecisions, type ViewerTier } from "@/lib/auth/visibility";
@@ -21,7 +22,7 @@ import { slackParticipations, foldProviderId } from "@/lib/ingest/slack-particip
 
 // Only ACTIVE tasks are considered work "in progress" — Linear In Progress/In Review both normalize to
 // `in_progress`; `blocked` is active-but-stuck. Backlog/ready/done are context, excluded from the timeline.
-const ACTIVE_TASK_STATUSES = new Set(["in_progress", "blocked"]);
+
 
 /**
  * Server-only fetch for the Learning "Timeline" — the team's recent work as a day → person → evidence
@@ -233,7 +234,7 @@ export async function getWorkTimeline(
         .from("tasks")
         .select("id, row_key, title, status")
         .eq("team_id", teamId)
-        .in("status", [...ACTIVE_TASK_STATUSES])
+        .in("status", [...ACTIVE_STATUSES])
         .order("updated_at", { ascending: false })
         .limit(TASK_LIMIT),
       tier

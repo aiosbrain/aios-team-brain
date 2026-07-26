@@ -1,4 +1,5 @@
 import "server-only";
+import { isOpenStatus } from "@/lib/tasks/activity-policy";
 import type { DbClient } from "@/lib/db/types";
 import { rangeDays, type Range } from "./range";
 import {
@@ -143,7 +144,7 @@ const FUNNEL_ORDER: { status: string; label: string }[] = [
   { status: "done", label: "Done" },
 ];
 
-const IN_FLIGHT = new Set(["ready", "in_progress", "blocked"]);
+
 
 // ── main ─────────────────────────────────────────────────────────────────────
 
@@ -290,7 +291,7 @@ export async function getPulseMetrics(
   let blocked = 0;
   for (const row of taskRows) {
     statusCounts.set(row.status, (statusCounts.get(row.status) ?? 0) + 1);
-    if (IN_FLIGHT.has(row.status)) inFlight++;
+    if (isOpenStatus(row.status)) inFlight++;
     if (row.status === "blocked") blocked++;
     const updatedIso = toIso(row.updated_at);
     if (inWindow(updatedIso)) {
