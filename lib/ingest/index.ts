@@ -17,6 +17,7 @@ import {
   materializeStakeholderMentions,
 } from "@/lib/ingest/evidence";
 import { materializeTasks, validateTaskRows } from "@/lib/ingest/tasks";
+import { resolvePersistedWorkTime } from "@/lib/ingest/work-time";
 import {
   cascadeInheritedAudience,
   settleReclassification,
@@ -31,6 +32,13 @@ export interface IngestResult {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+/** The pg adapter returns timestamptz as a Date; normalize to the ISO strings we compare and store. */
+function isoOf(value: string | Date | null | undefined): string | null {
+  if (!value) return null;
+  const d = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(d.getTime()) ? null : d.toISOString();
 }
 
 /**
@@ -126,7 +134,7 @@ export async function ingestItem(
 
   const { data: existing } = await db
     .from("items")
-    .select("id, content_sha256, member_id, member_id_locked, frontmatter, access")
+    .select("id, content_sha256, member_id, member_id_locked, frontmatter, access, created_at, work_at, work_at_from_source")
     .eq("team_id", auth.teamId)
     .eq("project_id", project.id)
     .eq("path", payload.path)
@@ -199,6 +207,8 @@ export async function ingestItem(
       member_id?: string;
       frontmatter?: Record<string, unknown>;
       access?: "team" | "external";
+      work_at?: string;
+      work_at_from_source?: boolean;
     } = { synced_at: now };
     const reattr = decideReattribution(
       existing.member_id,
@@ -248,6 +258,27 @@ export async function ingestItem(
       }
     } else {
       delete patch.member_id; // no reattribution from an untrusted pusher either
+    }
+
+    // HEAL WORK-TIME on an unchanged re-push, for the same reason as the frontmatter heal above:
+    // `content_sha256` covers the body alone, so a source that corrects or first supplies its own
+    // timestamp without touching the prose would otherwise keep its first-ingest work-time forever.
+    // This is also what CONVERGES the migration's backfill — every existing row starts at the
+    // `created_at` fallback and gets its real work-time on the source's next tick.
+    //
+    // Resolved from the HEALED frontmatter (`patch.frontmatter ?? existing.frontmatter`), not the raw
+    // push: the heal preserves author keys this push omitted, and the work-time must be read off the
+    // same merged view that gets stored.
+    const healedFm = (patch.frontmatter ?? existing.frontmatter ?? {}) as Record<string, unknown>;
+    const firstSeen = isoOf((existing as { created_at?: string | Date }).created_at) ?? now;
+    const resolvedWork = resolvePersistedWorkTime(healedFm, firstSeen);
+    const storedWork = existing as { work_at?: string | Date | null; work_at_from_source?: boolean | null };
+    if (
+      isoOf(storedWork.work_at) !== resolvedWork.workAt ||
+      Boolean(storedWork.work_at_from_source) !== resolvedWork.fromSource
+    ) {
+      patch.work_at = resolvedWork.workAt;
+      patch.work_at_from_source = resolvedWork.fromSource;
     }
 
     // Phase 1 of the reclassification BEFORE `items.access` is committed, so a cascade failure leaves the
@@ -330,6 +361,10 @@ export async function ingestItem(
   }
 
   const pendingSha = "";
+  const changedWork = resolvePersistedWorkTime(
+    payload.frontmatter,
+    isoOf((existing as { created_at?: string | Date } | null)?.created_at) ?? now
+  );
   const itemRecord = {
     team_id: auth.teamId,
     project_id: project.id,
@@ -338,6 +373,10 @@ export async function ingestItem(
     access: effectiveAccess,
     frontmatter: payload.frontmatter,
     body: payload.body,
+    // Work-time resolved through the ONE resolver and written down (R1). An existing row keeps its
+    // `created_at` as the fallback anchor; a brand-new one has none yet, so `now` is its first-seen.
+    work_at: changedWork.workAt,
+    work_at_from_source: changedWork.fromSource,
     content_sha256: existing ? existing.content_sha256 : pendingSha,
     actor: payload.actor,
     member_id: opts ? opts.authorMemberId : auth.memberId,
@@ -358,7 +397,13 @@ export async function ingestItem(
   } else {
     const { data, error } = await db
       .from("items")
-      .insert(itemRecord)
+      // `created_at` is stamped explicitly (rather than left to the column default) ONLY here, on the
+      // insert: for an item the source didn't date, `work_at` falls back to first-seen, and that claim
+      // has to hold EXACTLY — a DB-side `now()` lands a millisecond or two after the app's, which is
+      // enough to make "work_at === created_at" false for every undated item. Deliberately not part of
+      // `itemRecord`, which the update path spreads: re-stamping it there would turn first-seen into
+      // last-changed and quietly corrupt the knowledge-growth metric that reads it.
+      .insert({ ...itemRecord, created_at: now })
       .select("id")
       .single();
     if (error || !data) throw new Error(`item insert failed: ${error?.message}`);

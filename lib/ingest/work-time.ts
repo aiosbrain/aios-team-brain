@@ -111,3 +111,29 @@ export function resolveWorkTime(fm: Record<string, unknown> | null | undefined):
   }
   return null;
 }
+
+/** What gets STORED on the item: the work-time plus whether the source actually told us (R1). */
+export interface PersistedWorkTime {
+  /** Never null and never `synced_at` — the source's own timestamp, else `firstSeenAt`. */
+  workAt: string;
+  /** False when we fell back. The timeline drops those; the projector accepts them. */
+  fromSource: boolean;
+}
+
+/**
+ * Resolve the work-time to STORE on an item (`items.work_at` / `work_at_from_source`).
+ *
+ * The fallback is deliberately `firstSeenAt` (`items.created_at`, set once on insert) and never
+ * `synced_at`: every connector re-pushes every item on each 30-minute tick, so a `synced_at` fallback
+ * ages forward and re-dates old work as today — the R1 bug class this column exists to end.
+ *
+ * Callers persist the pair rather than re-deriving, so a SQL window or ORDER BY gets the same answer as
+ * a TS caller. Pure.
+ */
+export function resolvePersistedWorkTime(
+  fm: Record<string, unknown> | null | undefined,
+  firstSeenAt: string
+): PersistedWorkTime {
+  const fromSource = resolveWorkTime(fm);
+  return fromSource ? { workAt: fromSource, fromSource: true } : { workAt: firstSeenAt, fromSource: false };
+}
