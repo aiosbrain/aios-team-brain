@@ -67,8 +67,12 @@ export async function recentFacts(
   groups: string[],
   sinceISO: string | null,
   limit = 15
-): Promise<AtomicFact[]> {
-  if (!neo4jConfigured() || groups.length === 0) return [];
+): Promise<{ facts: AtomicFact[]; ok: boolean }> {
+  // Not configured / no groups is a legitimate empty, not a failure — same distinction as
+  // `resolveEpisodeItems`. Keeping the two legs of this module symmetric is the point: they feed the
+  // same synthesis, and one of them conflating "the graph is down" with "the week was quiet" is enough
+  // to pin an empty arc panel as if it were the truth.
+  if (!neo4jConfigured() || groups.length === 0) return { facts: [], ok: true };
   // `withSince` gates ONLY the time bound; the group_id tier filter is present either way.
   const factsCypher = (withSince: boolean) =>
     `MATCH (a:Entity)-[r:RELATES_TO]->(b:Entity)
@@ -107,27 +111,38 @@ export async function recentFacts(
     // `sinceISO === null` means "no time box — just the most-recent N" (arcs aren't time-boxed).
     // With a window, fall back to most-recent-N (still tier-scoped) only when the window is empty —
     // preserves the "recent" intent when the graph is fresh, degrades gracefully when it's stale/sparse.
-    if (sinceISO === null) return await query(false);
+    if (sinceISO === null) return { facts: await query(false), ok: true };
     const windowed = await query(true);
-    return windowed.length > 0 ? windowed : await query(false);
-  } catch {
-    return []; // degrade — panel shows empty rather than erroring
+    return { facts: windowed.length > 0 ? windowed : await query(false), ok: true };
+  } catch (err) {
+    console.error(
+      "[graph] recentFacts failed — treating as degraded, not as an empty window:",
+      err instanceof Error ? err.message : err
+    );
+    return { facts: [], ok: false };
   }
 }
 
 /**
  * Resolve a set of episode UUIDs → their source item id + source, tier-scoped. Episodes are named
  * `items:<id>`, so this lets a fact (which carries `episodeUuids`) link back to the brain item that
- * produced it — the provenance behind a narrative arc's evidence. Best-effort empty map on failure.
+ * produced it — the provenance behind a narrative arc's evidence.
+ *
+ * Returns `ok: false` when the lookup FAILED, as distinct from legitimately finding nothing. The
+ * difference matters upstream: with no items resolved, every fact goes unattributed and nothing can be
+ * filtered by eligibility, so arc synthesis still produces a plausible — and wrong — set of arcs. It
+ * used to swallow the error into an empty map, which made that indistinguishable from "this window has
+ * no episodes" and let the bad set overwrite good arcs as fresh (H11).
  */
 export async function resolveEpisodeItems(
   groups: string[],
   uuids: string[],
   maxUuids = 500
-): Promise<Map<string, { itemId?: string; source?: string }>> {
+): Promise<{ items: Map<string, { itemId?: string; source?: string }>; ok: boolean }> {
   const out = new Map<string, { itemId?: string; source?: string }>();
   const unique = [...new Set(uuids.filter(Boolean))].slice(0, maxUuids);
-  if (!neo4jConfigured() || groups.length === 0 || unique.length === 0) return out;
+  // Not configured / nothing to ask about is a legitimate empty, not a failure.
+  if (!neo4jConfigured() || groups.length === 0 || unique.length === 0) return { items: out, ok: true };
   try {
     const rows = await runRead<{ uuid: string; name: string | null; source: string | null }>(
       `MATCH (ep:Episodic)
@@ -142,9 +157,13 @@ export async function resolveEpisodeItems(
         source: r.source ? r.source.toLowerCase() : undefined,
       });
     }
-    return out;
-  } catch {
-    return out; // degrade — evidence just won't carry links
+    return { items: out, ok: true };
+  } catch (err) {
+    console.error(
+      "[arcs] resolveEpisodeItems failed — synthesis inputs are incomplete:",
+      err instanceof Error ? err.message : err
+    );
+    return { items: out, ok: false };
   }
 }
 

@@ -39,7 +39,7 @@ export async function GET(req: NextRequest) {
   const tier = (me as { tier: "team" | "external" }).tier;
   const groups = visibleGroupIds(teamSlug, tier);
   const since = new Date(Date.now() - WINDOW_HOURS * 3600 * 1000).toISOString();
-  const facts = await recentFacts(groups, since, LIMIT);
+  const { facts } = await recentFacts(groups, since, LIMIT);
 
   return Response.json({ facts, as_of: new Date().toISOString(), window_hours: WINDOW_HOURS });
 }

@@ -77,6 +77,11 @@ const COHERENCE_TIMEOUT_MS = Math.max(1_000, Number(process.env.ARC_COHERENCE_TI
 // How long the empty-clobber guard keeps trusting a prior non-empty arc set. Within this window an
 // empty synthesis is treated as a transient failure (keep the prior); beyond it, a persistently-empty
 // result is accepted as genuine so the panel can't be pinned to ancient arcs forever (Fable review).
+/** How long an UNTRUSTWORTHY arc result is served before the next view retries it. Short enough that a
+ *  transient LLM/graph failure self-heals in minutes rather than hours, long enough that a persistent one
+ *  doesn't turn every page view into a recompute. */
+const UNTRUSTED_RETRY_AFTER_MS = 5 * 60_000;
+
 const EMPTY_CLOBBER_MAX_AGE_MS = (() => {
   // Guard the parse: a garbage/empty env yields NaN/0, and `ageMs < NaN` is always false → EVERY empty
   // synthesis would clobber, silently reverting the incident fix. Fall back unless it's finite and >0.
@@ -579,7 +584,13 @@ async function pruneIncoherentEvidence(
  *  and the next background refresh can skip an unchanged re-synthesis. */
 export interface SynthesisResult {
   arcs: NarrativeArc[];
+  /** Non-null when the window HAD facts. `null` = genuinely nothing to synthesize from — which is why
+   *  `arcs: []` with a non-null hash is a model failure rather than the truth (see `commitArcs`). */
   factsHash: string | null;
+  /** A dependency this synthesis needed failed (episode→item resolution, credit, the eligibility gate),
+   *  so the arcs are plausible but wrong — typically unattributed, or unfiltered backlog noise. Reported
+   *  as DATA so `commitArcs` can refuse to overwrite good arcs and refuse to stamp this fresh (H11). */
+  degraded: boolean;
 }
 
 /** Pure: may the background refresh REUSE the prior arcs instead of re-running the (non-deterministic)
@@ -617,20 +628,53 @@ async function synthesizeArcs(
   // dominated by whoever pushed the most volume and everyone else's work is invisible in Learning.
   // Dedupe the raw pool up front — drops exact-repeat fact texts and self-referential noise so neither
   // balancing counts nor prompt slots are wasted on redundant/garbage facts.
-  const pool = dedupeFacts(await recentFacts(groups, null, FACT_POOL));
+  const factsRead = await recentFacts(groups, null, FACT_POOL);
+  const pool = dedupeFacts(factsRead.facts);
   // No facts and nothing to correct → nothing to synthesize. (A correction with no facts still runs
   // the LLM, preserving the pre-cache recompute behavior.)
-  if (pool.length === 0 && correctionTexts.length === 0) return { arcs: [], factsHash: null };
+  // An empty pool means one of two very different things, and only one of them is an answer: the window
+  // was genuinely quiet (`ok`), or the fact read FAILED. Reporting the second as a clean empty is how a
+  // Neo4j outage on a cold miss writes a blank panel stamped fresh for 4h — H12's shape, on the leg that
+  // still conflated them.
+  if (pool.length === 0 && correctionTexts.length === 0)
+    return { arcs: [], factsHash: null, degraded: !factsRead.ok };
   // Resolve attribution for the WHOLE pool (higher uuid cap to match) so balancing sees each fact's
   // human. epToItem/creditByItem stay supersets of the balanced set — safe for evidence + attribution.
-  const epToItem = await resolveEpisodeItems(groups, pool.flatMap((f) => f.episodeUuids), FACT_POOL * 3);
-  const allItemIds = [...new Set([...epToItem.values()].map((v) => v.itemId).filter((id): id is string => !!id))];
+  // Degradation is tracked, not swallowed: any leg below that fails leaves the synthesis inputs
+  // incomplete, and `commitArcs` must then refuse to overwrite good arcs with the plausible-but-wrong
+  // result that follows (H11). Each leg says whether it worked.
+  let degraded = false;
+  const episodeItems = await resolveEpisodeItems(groups, pool.flatMap((f) => f.episodeUuids), FACT_POOL * 3);
+  if (!episodeItems.ok) degraded = true;
+  const epToItem = episodeItems.items;
+  // Shape-filtered before it reaches a uuid column. These ids are parsed verbatim out of Graphiti
+  // episode NAMES, and `resolveItemCredit` (now strict) binds them into `id IN (…)`: one malformed value
+  // raises 22P02 on every retry, so strict would throw forever — degraded permanently, model never
+  // called, panel frozen until the 48h cap. A bad name should cost that one fact its attribution, not
+  // the whole learning layer. (`arcIneligibleItemIds` already sidesteps this with `id::text = any(...)`.)
+  const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  const allItemIds = [
+    ...new Set(
+      [...epToItem.values()]
+        .map((v) => v.itemId)
+        .filter((id): id is string => !!id && UUID_RE.test(id))
+    ),
+  ];
   // Evidence-gated credit per item (one query pass): the `primary` WORKER drives balancing + the fact
   // prompt (one fact needs one representative — a reassigned-away worker's facts now balance under THEM,
   // not the non-working new owner), and the `contributors` SET drives arc `participants` (so a prior
   // contributor is still on the chip). Both come from `item_versions` (the work ledger), not the current
   // owner alone.
-  const creditByItem = await resolveItemCredit(db, teamId, allItemIds);
+  // STRICT (the timeline's setting, #249): a failed versions/identities read must not read as "nobody
+  // worked on any of this". Non-strict returned an empty map, so every fact went unattributed, the fact
+  // hash changed, the LLM re-ran, and an attribution-less arc set overwrote correct arcs for 4h.
+  let creditByItem: Awaited<ReturnType<typeof resolveItemCredit>> = new Map();
+  try {
+    creditByItem = await resolveItemCredit(db, teamId, allItemIds, { strict: true });
+  } catch (err) {
+    console.error("[arcs] credit resolution failed — arcs would be unattributed:", err instanceof Error ? err.message : err);
+    degraded = true;
+  }
   const primaryByItem = new Map<string, string>();
   const contributorsByItem = new Map<string, string[]>();
   for (const [id, credit] of creditByItem) {
@@ -671,7 +715,26 @@ async function synthesizeArcs(
   // Linear issue AND a meeting transcript stays, since the meeting is eligible evidence (filtering on the
   // single attribution item would wrongly drop it). Arc-synthesis-only; excluded content stays in the
   // graph + facts panel. Non-Linear facts pass through.
-  const ineligible = await arcIneligibleItemIds(teamId, allItemIds);
+  // The gate THROWS rather than returning "nothing is ineligible" (#400). Catch it here and degrade:
+  // the alternative — letting it propagate — 500s a cold-miss arcs panel, where degrading persists a
+  // stale-on-arrival result that the next view retries. Either way we refuse to publish a set that may
+  // be full of backlog noise.
+  let ineligible = new Set<string>();
+  try {
+    ineligible = await arcIneligibleItemIds(teamId, allItemIds);
+  } catch (err) {
+    console.error("[arcs] eligibility gate unavailable:", err instanceof Error ? err.message : err);
+    degraded = true;
+  }
+  // STOP HERE if the inputs are degraded. `commitArcs` will refuse to publish this result anyway, so
+  // running the model would buy nothing and cost a real (reasoning-model) call — and with a persistent
+  // failure, one per retry. Returning the hash-less empty lets commitArcs apply the same rule it applies
+  // to a model failure: keep a healthy prior, else persist a short-lived row that retries soon.
+  if (degraded) {
+    console.warn("[arcs] synthesis inputs degraded — skipping the model and keeping whatever is cached");
+    return { arcs: [], factsHash: null, degraded: true };
+  }
+
   const factItemIds = (f: AtomicFact): string[] =>
     f.episodeUuids.map((u) => epToItem.get(u)?.itemId).filter((id): id is string => !!id);
   const eligiblePool = ineligible.size
@@ -683,7 +746,7 @@ async function synthesizeArcs(
   // If every recent fact traces ONLY to non-active Linear work, there's nothing to synthesize — return
   // [] so it flows into the empty-clobber guard (keep a recent prior, else honest blank), rather than
   // firing a zero-fact LLM call whose fabricated (evidence-less) arcs would clobber the real prior set.
-  if (eligiblePool.length === 0 && correctionTexts.length === 0) return { arcs: [], factsHash: null };
+  if (eligiblePool.length === 0 && correctionTexts.length === 0) return { arcs: [], factsHash: null, degraded };
   // Two-level balance (contributor → item, per-item capped) → a representative MAX_FACTS so every active
   // contributor is in the prompt AND no single giant document dominates its author's share.
   const facts = balanceFacts(eligiblePool, humanOfFact, itemOfFact, MAX_FACTS, PER_ITEM_CAP);
@@ -714,7 +777,7 @@ async function synthesizeArcs(
   // LLM. This is what stops the day-to-day churn (same facts producing different arcs every recompute from
   // LLM non-determinism). The background refresh still runs (fetch/balance/hash), just not the model.
   if (canReuseArcs(prior ? { factsHash: prior.factsHash, arcCount: prior.arcs.length } : null, factsHash, correctionTexts.length > 0)) {
-    return { arcs: prior!.arcs, factsHash };
+    return { arcs: prior!.arcs, factsHash, degraded };
   }
 
   const raw = await callLLMRaw(systemPrompt, userPrompt, keys, { db, teamId }, llmTimeoutMs);
@@ -727,7 +790,7 @@ async function synthesizeArcs(
     : parsed;
   // Rank by recency → relevance so recent contributors' arcs lead, then attribute AI-agent names to
   // the humans behind each arc's own evidence.
-  return { arcs: rankArcs(attributeArcs(coherent, contributorsByItem)), factsHash };
+  return { arcs: rankArcs(attributeArcs(coherent, contributorsByItem)), factsHash, degraded };
 }
 
 // In-memory cache (per process). Keyed by the tier-visible group set. Fronts the Postgres `arc_cache`
@@ -770,13 +833,36 @@ export async function commitArcs(
   teamId: string,
   key: string,
   next: NarrativeArc[],
-  factsHash: string | null
+  factsHash: string | null,
+  opts: { degraded?: boolean } = {}
 ): Promise<NarrativeArc[]> {
+  // ── Is this result trustworthy enough to serve for a full TTL? ────────────────────────────────────
+  // Two ways it isn't, and both used to be committed as FRESH — which is the one state SWR can never
+  // heal from, because it only re-fires on a stale row.
+  //
+  //  • MODEL FAILED (H12) — zero arcs while `factsHash` is non-null means there WERE facts in the window
+  //    and synthesis produced nothing from them. That's a timeout / bad JSON / a reasoning model starving
+  //    its own output, not the truth. A genuinely quiet window carries `factsHash === null`, so the
+  //    distinguishing signal was already being computed and thrown away.
+  //  • DEGRADED (H11) — a dependency the synthesis needed failed, so the result is plausible but wrong:
+  //    typically every fact unattributed, which is NON-empty and therefore sailed straight past the
+  //    empty-clobber guard below and overwrote correct arcs for 4h.
+  const modelFailed = next.length === 0 && factsHash !== null;
+  const untrustworthy = modelFailed || opts.degraded === true;
+
+  if (untrustworthy && next.length > 0) {
+    // A degraded but non-empty result: the empty guard below won't look at it, so check the prior here.
+    const prior = await priorArcs(db, teamId, key);
+    if (prior && prior.arcs.length > 0 && Date.now() - prior.at < EMPTY_CLOBBER_MAX_AGE_MS) {
+      console.warn(
+        `[arcs] degraded synthesis for ${key}; keeping ${prior.arcs.length} cached arcs rather than overwriting them with a partial set`
+      );
+      return prior.arcs;
+    }
+  }
+
   if (next.length === 0) {
-    const mem = cache.get(key);
-    const prior =
-      mem ??
-      (await readArcCache(db, teamId, key).then((r) => (r ? { arcs: r.arcs, at: r.computedAt } : null)));
+    const prior = await priorArcs(db, teamId, key);
     if (prior && prior.arcs.length > 0) {
       const ageMs = Date.now() - prior.at;
       if (ageMs < EMPTY_CLOBBER_MAX_AGE_MS) {
@@ -797,9 +883,34 @@ export async function commitArcs(
       );
     }
   }
-  cache.set(key, { arcs: next, at: Date.now(), factsHash });
-  await writeArcCache(db, teamId, key, next, factsHash);
+  // An untrustworthy result still gets PERSISTED (something beats a blank panel when there is no prior),
+  // but with a deliberately SHORT life so the next attempt comes soon instead of 4h later.
+  //
+  // Not "already stale": that would make every page view fire another recompute for as long as the
+  // underlying failure lasted — a rebuild (and, before the early return above, an LLM call) per viewer.
+  // Aging it by `TTL - RETRY_AFTER_MS` instead means the row reads fresh for RETRY_AFTER_MS and then goes
+  // stale, which bounds retries to roughly one per that window while still being far short of the full TTL.
+  const at = untrustworthy ? Date.now() - (CACHE_TTL_MS - UNTRUSTED_RETRY_AFTER_MS) : Date.now();
+  if (untrustworthy) {
+    console.warn(
+      `[arcs] ${modelFailed ? "synthesis produced no arcs from a non-empty fact set" : "degraded synthesis"} for ${key}; persisting with a ${Math.round(UNTRUSTED_RETRY_AFTER_MS / 60_000)}min life so it retries soon`
+    );
+  }
+  cache.set(key, { arcs: next, at, factsHash });
+  await writeArcCache(db, teamId, key, next, factsHash, { retryAfterMs: untrustworthy ? UNTRUSTED_RETRY_AFTER_MS : undefined });
   return next;
+}
+
+/** The arcs currently cached for a key — in-memory first, then the persisted row. */
+async function priorArcs(
+  db: DbClient,
+  teamId: string,
+  key: string
+): Promise<{ arcs: NarrativeArc[]; at: number } | null> {
+  const mem = cache.get(key);
+  if (mem) return { arcs: mem.arcs, at: mem.at };
+  const row = await readArcCache(db, teamId, key);
+  return row ? { arcs: row.arcs, at: row.computedAt } : null;
 }
 
 /** Fire-and-forget background recompute for a stale cache key (serve-stale-while-revalidate). Uses
@@ -820,8 +931,8 @@ function refreshArcsInBackground(
       // Not route-bound → give the reasoning model the full window (BG_ARC_TIMEOUT_MS). `prior` lets the
       // fact-set-hash guard skip the LLM when nothing changed. Run the extra evidence-COHERENCE pass HERE
       // (background only — the route-bound cold-miss/correction paths can't afford the second LLM call).
-      const { arcs, factsHash } = await synthesizeArcs(bg, teamId, groups, [], keys, BG_ARC_TIMEOUT_MS, prior, true);
-      await commitArcs(bg, teamId, key, arcs, factsHash);
+      const { arcs, factsHash, degraded } = await synthesizeArcs(bg, teamId, groups, [], keys, BG_ARC_TIMEOUT_MS, prior, true);
+      await commitArcs(bg, teamId, key, arcs, factsHash, { degraded });
     } catch (err) {
       console.error("[arcs] background refresh failed:", err instanceof Error ? err.message : err);
     } finally {
@@ -866,8 +977,8 @@ export async function getArcs(
   }
 
   // 3. Cold miss — first-ever load for this key. Compute inline so the user gets a real answer.
-  const { arcs, factsHash } = await synthesizeArcs(db, teamId, groups, [], keys);
-  return commitArcs(db, teamId, key, arcs, factsHash);
+  const { arcs, factsHash, degraded } = await synthesizeArcs(db, teamId, groups, [], keys);
+  return commitArcs(db, teamId, key, arcs, factsHash, { degraded });
 }
 
 /**
@@ -886,8 +997,8 @@ export async function recomputeArcs(
 ): Promise<NarrativeArc[]> {
   if (groups.length === 0) return [];
   const key = groups.slice().sort().join(",");
-  const { arcs: synthesized, factsHash } = await synthesizeArcs(db, teamId, groups, corrections.map((c) => c.corrected_text), keys);
-  const arcs = await commitArcs(db, teamId, key, synthesized, factsHash);
+  const { arcs: synthesized, factsHash, degraded } = await synthesizeArcs(db, teamId, groups, corrections.map((c) => c.corrected_text), keys);
+  const arcs = await commitArcs(db, teamId, key, synthesized, factsHash, { degraded });
 
   // Persist corrections as first-class episodes (team-tier group; corrections are internal).
   const client = new GraphitiClient();
