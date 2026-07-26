@@ -12,6 +12,8 @@ import {
 } from "@/lib/api/schemas";
 import type { DbClient } from "@/lib/db/types";
 import { materializeDecisions } from "@/lib/ingest/decisions";
+import { sourceRules } from "@/lib/ingest/source-rules";
+import { workTimeKeysIn } from "@/lib/ingest/work-time";
 import {
   materializeFacts,
   materializeStakeholderMentions,
@@ -252,6 +254,30 @@ export async function ingestItem(
         ) {
           healedFrontmatter[key] = existingFrontmatter[key];
         }
+      }
+      // WORK-TIME, per the source's rule (`lib/ingest/source-rules`). We are on the unchanged-body
+      // path by definition, so for a source whose timestamp tracks STORAGE rather than activity
+      // (`local`'s mtime — moved by touch/rsync/chmod/a checkout) letting the incoming value through
+      // re-dates the item and resurfaces a file nobody has opened in a year as today's work. The
+      // stored value is authoritative instead.
+      //
+      // Not applied globally, which is the point of the rules layer: Linear/Plane emit the issue's
+      // last STATE TRANSITION here, and a ticket reaching `completed` is real work with an unchanged
+      // doc body — freezing that would make completions invisible.
+      //
+      // Incoming work-time keys are dropped before the stored ones are restored, so a source that
+      // changes spelling can't reintroduce the moved value under a new (higher-priority) key.
+      // The STORED source decides, not the incoming one: a push must not be able to relabel an item
+      // out of its own rule. That only holds if `source` itself is pinned too — the heal writes
+      // `payload.frontmatter` wholesale, so without this the relabel is refused for one tick and then
+      // stored, and the next tick reads the new label.
+      const ruleSource = existingFrontmatter.source ?? payload.frontmatter?.source;
+      if (sourceRules(ruleSource).workTimeOnUnchangedBody === "noise") {
+        for (const key of workTimeKeysIn(healedFrontmatter)) delete healedFrontmatter[key];
+        for (const key of workTimeKeysIn(existingFrontmatter)) {
+          healedFrontmatter[key] = existingFrontmatter[key];
+        }
+        if (existingFrontmatter.source !== undefined) healedFrontmatter.source = existingFrontmatter.source;
       }
       if (canonicalJson(existingFrontmatter) !== canonicalJson(healedFrontmatter)) {
         patch.frontmatter = healedFrontmatter;
