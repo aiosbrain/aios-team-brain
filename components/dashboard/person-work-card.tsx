@@ -1,6 +1,8 @@
 "use client";
 
-import { GitBranch, Scale } from "lucide-react";
+// `Gavel` is the decisions glyph — the SAME one the Pulse "Recent decisions" card and the decisions page
+// use, so a decision reads identically wherever it appears (the Context lane used to diverge on `Scale`).
+import { GitBranch, Gavel } from "lucide-react";
 import { MemberAvatar } from "@/components/people/member-avatar";
 import { SourceIcon, sourceLabel } from "@/components/icons/source-icon";
 import type { PersonDay, SignalGroup, SourceGroup, TaskGroup } from "@/lib/dashboard/timeline-group";
@@ -158,7 +160,7 @@ function ContextLane({ signals }: { signals: SignalGroup[] }) {
       <ul className="flex flex-col gap-1 pl-1">
         {signals.flatMap((g) => g.items).map((s) => (
           <li key={s.id} className="flex items-start gap-1.5 text-[13px] text-ink-tertiary">
-            <Scale className="mt-0.5 size-3 shrink-0 text-ink-tertiary/70" />
+            <Gavel className="mt-0.5 size-3 shrink-0 text-amber" />
             <span className="truncate">
               decided:{" "}
               {s.url ? (
