@@ -4,7 +4,6 @@ import type { DbClient } from "@/lib/db/types";
 import { GraphitiClient, type GraphEpisode } from "./graphiti-client";
 import { episodeGroupId, isExternalGroupId, type AccessTier } from "./group";
 import { episodeName, itemIdFromEpisodeName } from "./episode-name";
-import { resolveWorkTime } from "@/lib/ingest/work-time";
 
 /**
  * Brain → Graphiti projector. Reads already-normalized, tier-tagged rows from the brain (`items` —
@@ -56,19 +55,17 @@ export const MAX_EPISODE_CHUNKS = resolvePositiveInt(process.env.GRAPH_MAX_EPISO
 export const GROUP_SCAN_DEPTH = resolvePositiveInt(process.env.GRAPH_GROUP_SCAN_DEPTH, 100_000);
 
 /**
- * "When it happened" for an episode: the item's own work-time via the SHARED resolver
- * (`lib/ingest/work-time`), falling back to `synced_at` when the source gave nothing parseable.
+ * "When it happened" for an episode: the item's PERSISTED `work_at` (Pass-1 review R1).
  *
- * It now reads the same key list as the timeline. It previously read `frontmatter.source_ts` ALONE,
- * which silently mis-dated every source that expresses work-time another way — most importantly git
- * commits, which carry `committed_at`: linking a year-old repo ingests 90 days of commits in one tick
- * and stamped them all "today", so work-time-ordered arcs narrated months-old work as this week's
- * storyline while the timeline (reading `committed_at`) disagreed about the very same commits.
+ * This used to re-derive from frontmatter and fall back to `synced_at`, and the fallback was the bug:
+ * `synced_at` is bumped by every 30-minute re-sync tick, so an item the source never dated — a Linear
+ * or Plane deliverable, the issues aggregate, any sidecar doc whose metadata key we don't know — was
+ * re-stamped "now" on EVERY tick. Backfilling an old corpus flooded the newest-facts pool and pinned
+ * arcs about months-old docs at the top of Pulse; a mere tier reclassification re-dated old work as
+ * today. The doc's "never now()" claim was technically true and practically false.
  *
- * The `synced_at` fallback is deliberate: never graphiti-client's last-resort now(), which would let
- * an undated doc float to the top of the recency-ranked arcs (rankArcs). (Locale-ambiguous strings
- * like "09/07/2026" still parse — wrongly — under JS Date, so connectors must emit ISO.) Pure +
- * exported for tests.
+ * `work_at` is resolved once at ingest through the same resolver and written down, with `created_at`
+ * (never bumped) as its fallback — so an undated item is dated when we FIRST saw it, and stays there.
  *
  * FORWARD-ONLY: episode idempotency is keyed on `sha(item.body)` (+ tier), NOT on the timestamp, so
  * an item already projected under the old sync-time stamp is `skipped` and KEEPS it until its body
@@ -77,11 +74,12 @@ export const GROUP_SCAN_DEPTH = resolvePositiveInt(process.env.GRAPH_GROUP_SCAN_
  * FIRST (a bare `graph_episodes` delete re-pushes duplicates under the same names) and reset the
  * runner's `synced_at` cursor so old rows are re-scanned. Tracked as follow-up, not done here.
  */
-export function pickEpisodeTimestamp(
-  frontmatter: Record<string, unknown> | null | undefined,
-  syncedAt: string
-): string {
-  return resolveWorkTime(frontmatter) ?? syncedAt;
+export function pickEpisodeTimestamp(item: { work_at?: string | Date | null; synced_at: string }): string {
+  // `?? synced_at` is a belt-and-braces path for a row written before the column existed; the migration
+  // backfills every row, so it should be unreachable in practice.
+  if (!item.work_at) return item.synced_at;
+  const d = item.work_at instanceof Date ? item.work_at : new Date(item.work_at);
+  return Number.isNaN(d.getTime()) ? item.synced_at : d.toISOString();
 }
 
 /**
@@ -136,6 +134,8 @@ export interface ProjectSummary {
 
 type ItemRow = {
   id: string;
+  /** Persisted work-time (R1) — the episode's `valid_at`. */
+  work_at?: string | Date | null;
   kind: string;
   access: AccessTier;
   body: string | null;
@@ -182,7 +182,7 @@ function toEpisodes(item: ItemRow): GraphEpisode[] {
   const fm = item.frontmatter ?? {};
   const title = typeof fm.title === "string" ? fm.title : undefined;
   const url = typeof fm.source_url === "string" ? fm.source_url : undefined;
-  const ts = pickEpisodeTimestamp(fm, item.synced_at); // when it happened (see helper)
+  const ts = pickEpisodeTimestamp(item); // when it happened (see helper)
   const label = KIND_LABEL[item.kind] ?? "Item";
   const chunks = chunkContent(item.body ?? "");
   const total = chunks.length;
@@ -217,7 +217,7 @@ export async function projectItemsToGraph(
 
   let q = db
     .from("items")
-    .select("id, kind, access, body, path, synced_at, frontmatter")
+    .select("id, kind, access, body, path, synced_at, work_at, frontmatter")
     .eq("team_id", args.teamId)
     .order("synced_at", { ascending: true })
     .limit(limit);

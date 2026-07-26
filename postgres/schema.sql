@@ -951,6 +951,13 @@ create table if not exists items (
   -- First-seen: set once on insert, never bumped on re-sync (unlike synced_at, which every 30-min tick
   -- bumps). The honest "new knowledge / day" signal for the dashboard; see lib/metrics/pulse.ts.
   created_at timestamptz not null default now(),
+  -- WHEN THE WORK HAPPENED (Pass-1 review R1) — resolved once at ingest by lib/ingest/work-time and
+  -- written down, so SQL windows/ORDER BY read it instead of falling back to `synced_at` (which every
+  -- re-sync tick bumps, re-dating old work as today). `work_at_from_source` says whether the SOURCE
+  -- dated it or we fell back to `created_at`: the timeline drops an undated item, the graph projector
+  -- accepts it, and that difference is legitimate — so it's data, not a per-call-site re-derivation.
+  work_at timestamptz not null default now(),
+  work_at_from_source boolean not null default false,
   synced_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   search tsvector generated always as
@@ -968,6 +975,10 @@ alter table items add column if not exists member_id_locked boolean not null def
 alter table items add column if not exists created_at timestamptz;
 create index if not exists items_team_updated_idx on items (team_id, updated_at desc);
 create index if not exists items_team_synced_idx on items (team_id, synced_at desc);
+-- NB: the (team_id, work_at desc) index lives ONLY in the migration
+-- (20260726090000_items_work_at.sql), which runs AFTER schema.sql and adds the column first. A bare
+-- index statement here would fail on an existing DB, where the table already exists (so its declaration
+-- above is a no-op) and the column isn't present until the migration runs.
 create index if not exists items_team_created_idx on items (team_id, created_at desc);
 create index if not exists items_search_idx on items using gin (search);
 create index if not exists items_kind_idx on items (team_id, kind);

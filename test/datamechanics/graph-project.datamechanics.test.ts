@@ -187,6 +187,65 @@ describe("runGraphProjection runner (real Postgres, mocked Graphiti)", () => {
     expect(second.skipped).toBe(2); // idempotent across the runner too
   });
 
+  it("dates an episode by the item's persisted work_at, and a re-sync tick does NOT re-date it (H4)", async () => {
+    // The failure this closes: the projector fell back to `synced_at` for any item the source didn't
+    // date, and every 30-minute tick bumps `synced_at`. So a months-old doc was stamped "now" on every
+    // pass — flooding the newest-facts pool and pinning arcs about old work at the top of Pulse. The
+    // episode's `valid_at` must come from the stored work-time and stay put across re-syncs.
+    const seed = await seedTeam();
+    const slug = await teamSlugFor(seed.teamId);
+    const workedAt = "2026-05-02T08:00:00.000Z";
+    await ingest(seed, {
+      kind: "artifact",
+      path: "commits/abc.md",
+      body: "fix the payment retry",
+      access: "team",
+      frontmatter: { committed_at: workedAt },
+    });
+
+    const fake = new FakeGraphiti();
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(fake) });
+    expect(fake.pushes[0].episodes[0].timestamp).toBe(workedAt);
+
+    // A later re-sync tick bumps synced_at corpus-wide. Force the body to change so the item actually
+    // re-projects (an unchanged one is skipped, which would pass vacuously).
+    await ingest(seed, {
+      kind: "artifact",
+      path: "commits/abc.md",
+      body: "fix the payment retry (amended)",
+      access: "team",
+      frontmatter: { committed_at: workedAt },
+    });
+    const second = new FakeGraphiti();
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(second) });
+    expect(second.pushes[0].episodes[0].timestamp).toBe(workedAt); // still the WORK time, not now
+  });
+
+  it("dates an UNDATED item by when we first saw it — not by the tick that re-synced it", async () => {
+    // The other half of H4: a Linear/Plane deliverable or any doc whose metadata key we don't know has
+    // no work-time at all. Falling back to `synced_at` re-dated it on every tick; falling back to
+    // first-seen dates it once and leaves it there.
+    const seed = await seedTeam();
+    const slug = await teamSlugFor(seed.teamId);
+    await ingest(seed, { kind: "deliverable", path: "docs/undated.md", body: "no date anywhere", access: "team" });
+
+    const { data } = await db()
+      .from("items")
+      .select("created_at")
+      .eq("team_id", seed.teamId)
+      .eq("path", "docs/undated.md")
+      .maybeSingle();
+    const firstSeen = new Date((data as { created_at: string | Date }).created_at).toISOString();
+
+    // Age synced_at as a later tick would, then re-project with a changed body.
+    await db().from("items").update({ synced_at: new Date().toISOString() }).eq("team_id", seed.teamId);
+    await ingest(seed, { kind: "deliverable", path: "docs/undated.md", body: "still no date, edited", access: "team" });
+
+    const fake = new FakeGraphiti();
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(fake) });
+    expect(fake.pushes[0].episodes[0].timestamp).toBe(firstSeen);
+  });
+
   it("re-purges the external arc cache once a tier move has actually left the graph", async () => {
     // The window `lib/ingest`'s purge cannot close on its own: arcs are synthesized from the external
     // Graphiti GROUP, which only this run cleans. Between the ingest-time purge and here, any arc rebuild
