@@ -2,7 +2,7 @@ import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { GraphitiClient } from "./graphiti-client";
 import { itemIdFromEpisodeName } from "./episode-name";
-import { GROUP_SCAN_DEPTH, resolvePositiveInt } from "./project";
+import { GROUP_SCAN_DEPTH, IN_CLAUSE_BATCH, chunk, resolvePositiveInt } from "./project";
 import { isExternalGroupId } from "./group";
 
 /**
@@ -55,6 +55,7 @@ export interface ReconcileSummary {
 type EpisodeRow = {
   id: string;
   source_id: string;
+  source_table: string;
   group_id: string;
   content_sha256: string;
   projected_at: string;
@@ -62,6 +63,68 @@ type EpisodeRow = {
   pending_delete_group_id: string | null;
   pending_delete_at: string | null;
 };
+
+/**
+ * The `source_id`s in `rows` whose row in `items` is GONE — the orphan set (see the call site).
+ *
+ * Returns an EMPTY set when the lookup fails, and only ever classifies `source_table='items'` rows:
+ * "couldn't check" must stay inconclusive here, exactly as an unreachable Graphiti does below. A
+ * swallowed DB error would otherwise read as "every pending row is an orphan" and delete healthy
+ * tier-cleanup bookkeeping, which the projector would answer by re-pushing — duplicate episodes,
+ * double-weighted facts.
+ */
+async function findOrphanSourceIds(
+  db: DbClient,
+  teamId: string,
+  rows: readonly EpisodeRow[]
+): Promise<Set<string>> {
+  const ids = [...new Set(rows.filter((r) => r.source_table === "items").map((r) => r.source_id))];
+  if (ids.length === 0) return new Set();
+  const alive = new Set<string>();
+  // Chunked: this passes EVERY projected item's id, and the pg adapter binds one per element — past
+  // Postgres' 65535-bind ceiling the statement is refused outright, which would silently switch off
+  // the whole orphan-repair safety net at exactly the corpus size where it matters.
+  for (const batch of chunk(ids, IN_CLAUSE_BATCH)) {
+    const { data, error } = await db.from("items").select("id").eq("team_id", teamId).in("id", batch);
+    if (error) {
+      // LOUD: returning an empty set is the right direction (nothing is judged an orphan), but a
+      // silent one means the repair is off and no signal says so.
+      console.error(`[graph] orphan check failed — orphan repair skipped this pass: ${error.message}`);
+      return new Set();
+    }
+    for (const r of (data ?? []) as { id: string }[]) alive.add(r.id);
+  }
+  return new Set(ids.filter((id) => !alive.has(id)));
+}
+
+/**
+ * Flag every orphan row that isn't already carrying a cleanup, and return the rows as they now stand
+ * (new objects — the caller's snapshot must not silently disagree with the DB). The flag reuses the
+ * tier-cleanup mechanism wholesale: the loop below purges the group and drops the row once it's
+ * verified empty, retrying across passes if Graphiti is down.
+ */
+async function repairOrphans(
+  db: DbClient,
+  rows: readonly EpisodeRow[],
+  orphans: ReadonlySet<string>
+): Promise<EpisodeRow[]> {
+  const at = new Date().toISOString();
+  const out: EpisodeRow[] = [];
+  for (const row of rows) {
+    if (!orphans.has(row.source_id) || row.pending_delete_group_id) {
+      out.push(row);
+      continue;
+    }
+    const patch = {
+      content_sha256: "", // no longer a live projection
+      pending_delete_group_id: row.group_id,
+      pending_delete_at: at,
+    };
+    const { error } = await db.from("graph_episodes").update(patch).eq("id", row.id);
+    out.push(error ? row : { ...row, ...patch });
+  }
+  return out;
+}
 
 export async function reconcileProjectedEpisodes(
   db: DbClient,
@@ -82,10 +145,25 @@ export async function reconcileProjectedEpisodes(
   const { data } = await db
     .from("graph_episodes")
     .select(
-      "id, source_id, group_id, content_sha256, projected_at, episode_uuid, pending_delete_group_id, pending_delete_at"
+      "id, source_id, source_table, group_id, content_sha256, projected_at, episode_uuid, pending_delete_group_id, pending_delete_at"
     )
     .eq("team_id", teamId);
-  const rows = (data ?? []) as EpisodeRow[];
+  const rawRows = (data ?? []) as EpisodeRow[];
+
+  // ── Orphan repair, BEFORE anything else judges these rows ────────────────────────────────────
+  // A ledger row whose ITEM is gone is an orphan, and an orphan's episodes are content the brain no
+  // longer holds still answering questions in Graphiti. `lib/ingest/purge` retires what it can see,
+  // but it cannot see a projector batch already in flight: the projector loads an item, the purge
+  // deletes it, and the projector then re-pushes the body it still holds in memory AND clears the
+  // pending-delete flag (the `purgeBeforeRepush` branch). That row looks perfectly healthy
+  // afterwards — fresh sha, no flag — so nothing would ever revisit it and the purged content would
+  // stay searchable forever.
+  //
+  // So orphan-ness, not the flag, is the invariant: any row with no item is re-flagged here and the
+  // ordinary cleanup loop below purges it and drops the row. This also covers orphans from any other
+  // door (a hand-deleted item, a future diff-delete) for free.
+  const orphans = await findOrphanSourceIds(db, teamId, rawRows);
+  const rows = await repairOrphans(db, rawRows, orphans);
 
   const byGroup = new Map<string, EpisodeRow[]>();
   for (const row of rows) {
@@ -203,10 +281,27 @@ export async function reconcileProjectedEpisodes(
       const flaggedAt = new Date(row.pending_delete_at ?? row.projected_at).getTime();
       const pastCleanupGrace = flaggedAt <= Date.now() - CLEANUP_GRACE_MS;
       if (uuids.length === 0 && !deleteFailed && pastCleanupGrace && !saturated) {
-        await db
-          .from("graph_episodes")
-          .update({ pending_delete_group_id: null, pending_delete_at: null })
-          .eq("id", row.id);
+        if (orphans.has(row.source_id) && oldGroup === row.group_id) {
+          // Orphan, cleanup verified: the item is gone and the group it lives in is empty of it, so
+          // the ledger row has nothing left to describe. Clearing the flag instead would leave the
+          // row forever (the projector only ever visits rows whose item still exists).
+          await db.from("graph_episodes").delete().eq("id", row.id);
+        } else if (orphans.has(row.source_id)) {
+          // Orphan whose flag pointed at a DIFFERENT group (a tier move whose cleanup was still
+          // outstanding when the item was purged). That group is now verified empty — but the row's
+          // OWN group has never been checked, and dropping the row here would delete the only pointer
+          // to those episodes. Re-point the flag instead; the next pass verifies the second group and
+          // then takes the branch above.
+          await db
+            .from("graph_episodes")
+            .update({ pending_delete_group_id: row.group_id, pending_delete_at: new Date().toISOString() })
+            .eq("id", row.id);
+        } else {
+          await db
+            .from("graph_episodes")
+            .update({ pending_delete_group_id: null, pending_delete_at: null })
+            .eq("id", row.id);
+        }
         cleaned++;
         if (isExternalGroupId(oldGroup)) cleanedExternal++;
       }

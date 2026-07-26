@@ -20,6 +20,20 @@ import { resolveWorkTime } from "@/lib/ingest/work-time";
 const SOURCE_TABLE = "items";
 
 /**
+ * How many ids go into one `.in(...)` filter. The pg adapter binds each element separately and
+ * Postgres hard-caps a statement at 65535 binds, so an unbounded list is a query that simply stops
+ * working once a team's corpus grows — silently, at exactly the scale where it matters most.
+ */
+export const IN_CLAUSE_BATCH = 1000;
+
+/** Split into fixed-size batches. Pure. */
+export function chunk<T>(items: readonly T[], size: number): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
+  return out;
+}
+
+/**
  * Graphiti extracts entities/edges from each episode with its OWN LLM, and that call's OUTPUT is
  * hard-capped (graphiti_core `DEFAULT_MAX_TOKENS`; 16384 on the patched image — gpt-4o's ceiling, can't
  * go higher). A dense episode whose extraction output overflows that cap raises `Output length exceeded
@@ -146,6 +160,99 @@ type ItemRow = {
 
 function sha(content: string): string {
   return createHash("sha256").update(content).digest("hex");
+}
+
+/**
+ * RETIRE the graph episodes of items being REMOVED from the brain (the purge path). `graph_episodes`
+ * is written only from this module (single-writer guarded), so removal lives here too and
+ * `lib/ingest/purge` calls in.
+ *
+ * Deleting the `items` rows alone is not enough, and the ledger row is the smaller half of why:
+ * `graph_episodes` has no FK to `items`, so the row is orphaned — but the real leak is that the
+ * extracted FACTS stay searchable in Graphiti forever. For a private channel or a message the author
+ * deleted at the source, removing the brain's copy while the graph still answers questions from it
+ * is not a removal at all.
+ *
+ * Durability follows the tier-reclassification cleanup (Pass-1 B2) exactly, for the same reason: the
+ * inline delete is best-effort — Graphiti can blip, and its async worker can create a straggler chunk
+ * AFTER we listed the group. So the ledger row is KEPT and flagged `pending_delete_group_id`;
+ * `reconcileProjectedEpisodes` retries until the group is verified empty and only then drops the row
+ * (it recognises a purge tombstone by the item being gone). Deleting the row here would leave nothing
+ * to retry — the failure mode B2 exists to prevent, arriving through a new door.
+ *
+ * Returns the number of ledger rows retired.
+ */
+export async function retireEpisodesForItems(
+  db: DbClient,
+  teamId: string,
+  itemIds: string[],
+  opts: { client?: GraphitiClient } = {}
+): Promise<number> {
+  if (itemIds.length === 0) return 0;
+  type LedgerRow = {
+    id: string;
+    source_id: string;
+    group_id: string;
+    pending_delete_group_id: string | null;
+  };
+  // Chunked: the pg adapter expands `.in()` to one bind per element, and Postgres refuses a statement
+  // past 65535 of them. A whole-channel purge can easily exceed a single readable batch.
+  const rows: LedgerRow[] = [];
+  for (const batch of chunk(itemIds, IN_CLAUSE_BATCH)) {
+    const { data, error: readError } = await db
+      .from("graph_episodes")
+      .select("id, source_id, group_id, pending_delete_group_id")
+      .eq("team_id", teamId)
+      .eq("source_table", SOURCE_TABLE)
+      .in("source_id", batch);
+    if (readError) throw new Error(`episode ledger read: ${readError.message}`);
+    rows.push(...((data ?? []) as LedgerRow[]));
+  }
+  if (rows.length === 0) return 0;
+
+  const client = opts.client ?? new GraphitiClient();
+  // No Graphiti configured → nothing was ever pushed, so there is nothing to retry and no reconcile
+  // pass will ever run to clear a tombstone. Drop the rows outright instead of parking flags that
+  // would sit "pending" forever and read as a stuck cleanup.
+  //
+  // Narrow residue, stated rather than hidden: if Graphiti was configured EARLIER and has since been
+  // unset, episodes it holds outlive the ledger row that pointed at them. Re-configuring the same
+  // Graphiti and re-projecting is the recovery; there is no in-band way to reach a service the
+  // process has no address for.
+  if (!client.configured) {
+    for (const r of rows) {
+      const { error } = await db.from("graph_episodes").delete().eq("id", r.id);
+      if (error) throw new Error(`episode ledger delete ${r.id}: ${error.message}`);
+    }
+    return rows.length;
+  }
+
+  const at = new Date().toISOString();
+  for (const r of rows) {
+    await deleteItemEpisodes(client, r.group_id, r.source_id).catch(() => {});
+    // There is exactly ONE flag slot, so a row that already owed a cleanup for a DIFFERENT group is
+    // about to have that debt overwritten. Purge that group first: otherwise an item reclassified
+    // external→team (whose inline delete blipped) and then purged would clean the team group, lose
+    // the pointer to the external one, and leave the purged content searchable at the OLD tier
+    // forever with nothing to retry. Best-effort like the rest; if it fails, reconcile re-derives the
+    // orphan every pass and the flag is re-pointed there once this group verifies empty.
+    if (r.pending_delete_group_id && r.pending_delete_group_id !== r.group_id) {
+      await deleteItemEpisodes(client, r.pending_delete_group_id, r.source_id).catch(() => {});
+    }
+    const { error } = await db
+      .from("graph_episodes")
+      .update({
+        // The "" sentinel marks the content as no longer projected (same as the redaction path), so
+        // nothing treats this row as a live projection while the cleanup is outstanding.
+        content_sha256: "",
+        projected_at: at,
+        pending_delete_group_id: r.group_id,
+        pending_delete_at: at,
+      })
+      .eq("id", r.id);
+    if (error) throw new Error(`episode retire ${r.id}: ${error.message}`);
+  }
+  return rows.length;
 }
 
 /**

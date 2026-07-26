@@ -1,5 +1,10 @@
 import { describe, it, expect } from "vitest";
-import { normalizeThread, threadParticipants, type NormalizeOpts } from "@/lib/ingest/sources/slack-normalize";
+import {
+  normalizeThread,
+  threadParticipants,
+  slackChannelPathPrefix,
+  type NormalizeOpts,
+} from "@/lib/ingest/sources/slack-normalize";
 import { itemPayloadSchema } from "@/lib/api/schemas";
 import type { FetchedThread } from "@/lib/ingest/sources/slack";
 
@@ -147,5 +152,25 @@ describe("normalizeThread path identity", () => {
     const b = normalizeThread(thread, { channelId: "C0BBB", channelName: "🚀", users: {} });
     expect(a.path).not.toBe(b.path);
     expect(a.frontmatter.channel).toBe("日本語"); // the real name is preserved for display
+  });
+});
+
+/**
+ * The removal path finds a channel's items by PATH PREFIX, so the prefix helper and the path writer
+ * must agree exactly. They did not, once: the caller hand-rolled `slack/${channelId.toLowerCase()}/`
+ * while the path came from `safeSegment`. A prefix that stops matching doesn't error — the purge
+ * reports "0 items" and the content it was supposed to remove quietly stays.
+ */
+describe("slackChannelPathPrefix", () => {
+  const thread = { root: { ts: "1719878400.000100", user: "U1", text: "hi" }, replies: [] };
+  it("is a prefix of the path the normalizer writes", () => {
+    for (const channelId of ["C0B8V119G4D", "c0lower", "C-weird.id"]) {
+      const path = normalizeThread(thread, { channelId, channelName: "n", users: {} }).path;
+      expect(path.startsWith(slackChannelPathPrefix(channelId))).toBe(true);
+    }
+  });
+
+  it("always ends in '/' so a purge can't reach a sibling channel", () => {
+    expect(slackChannelPathPrefix("C0AAA").endsWith("/")).toBe(true);
   });
 });

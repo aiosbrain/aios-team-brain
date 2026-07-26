@@ -3,6 +3,7 @@ import type { GraphitiClient, GraphEpisode, GraphEpisodeRef } from "@/lib/graph/
 import { projectSlackToGraph, projectItemsToGraph, deleteItemEpisodes, CHUNK_CHARS, MAX_EPISODE_CHUNKS, GROUP_SCAN_DEPTH } from "@/lib/graph/project";
 import { runGraphProjection } from "@/lib/graph/run";
 import { reconcileProjectedEpisodes, LANDED_SCAN_DEPTH } from "@/lib/graph/reconcile";
+import { purgeItemsByPathPrefix } from "@/lib/ingest/purge";
 import { db, ingest, seedTeam } from "./helpers";
 
 // Spec: the projector reads Slack transcripts from the brain and pushes them to Graphiti as
@@ -789,5 +790,130 @@ describe("reconcileProjectedEpisodes (audit H3, real Postgres)", () => {
 
     const { data } = await db().from("graph_episodes").select("id").eq("team_id", seed.teamId).eq("source_id", item.id).maybeSingle();
     expect(data).not.toBeNull();
+  });
+});
+
+/**
+ * Spec: content PURGED from the brain must leave the graph too, durably.
+ *
+ * `graph_episodes` has no FK to `items`, so deleting an item on its own strands the ledger row — and,
+ * far worse, leaves the extracted facts answering questions in Graphiti with nothing pointing at
+ * them. For a private channel or a message the author deleted at the source, a removal that stops at
+ * Postgres is not a removal. The purge therefore deletes the episodes inline and leaves a TOMBSTONE
+ * (the same `pending_delete_group_id` mechanism the tier cleanup uses) so a Graphiti blip is retried
+ * rather than silently abandoned.
+ */
+describe("purge → graph cleanup (real Postgres, mocked Graphiti)", () => {
+  it("retires the episodes and converges — even when the inline delete fails", async () => {
+    const seed = await seedTeam();
+    const slug = await teamSlugFor(seed.teamId);
+    const group = `${slug}_team`;
+    const item = await ingest(seed, { kind: "transcript", path: "slack/c0priv/1.md", body: "private thread", access: "team" });
+
+    const fake = new FakeGraphiti();
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(fake) });
+    expect(await fake.listEpisodes(group)).toHaveLength(1);
+
+    // Purge while Graphiti is blipping: the inline delete fails, so the facts are STILL in the graph.
+    fake.failDeletes = true;
+    await purgeItemsByPathPrefix(db(), seed.teamId, "slack/c0priv/", "slack channel is private", {
+      client: client(fake),
+    });
+    expect(await fake.listEpisodes(group)).toHaveLength(1); // not gone yet — this is the leak window
+
+    // The item is gone from the brain, but the ledger row SURVIVES carrying the cleanup debt.
+    const { data: gone } = await db().from("items").select("id").eq("id", item.id).maybeSingle();
+    expect(gone).toBeNull();
+    const { data: row } = await db()
+      .from("graph_episodes")
+      .select("pending_delete_group_id")
+      .eq("team_id", seed.teamId)
+      .maybeSingle();
+    expect((row as { pending_delete_group_id: string | null }).pending_delete_group_id).toBe(group);
+
+    // Graphiti recovers: reconcile finishes the delete, and once the group is verified empty the
+    // tombstone itself is dropped (clearing the flag instead would orphan the row forever — the
+    // projector only ever revisits rows whose item still exists).
+    fake.failDeletes = false;
+    await backdateCleanup(seed.teamId);
+    await reconcileProjectedEpisodes(db(), client(fake), seed.teamId);
+    expect(await fake.listEpisodes(group)).toHaveLength(0); // facts gone from the graph
+    await reconcileProjectedEpisodes(db(), client(fake), seed.teamId);
+    const { data: after } = await db().from("graph_episodes").select("id").eq("team_id", seed.teamId);
+    expect(after ?? []).toHaveLength(0); // no orphan ledger row left behind
+  });
+});
+
+/**
+ * Spec: the purge must survive a CONCURRENT projector batch.
+ *
+ * The projector runs on its own scheduler, so it can already hold an item's body in memory when the
+ * ingest tick purges that item. It then re-pushes the content and — via the `purgeBeforeRepush`
+ * branch — CLEARS the pending-delete flag. The ledger row afterwards looks perfectly healthy (fresh
+ * sha, no flag), the projector never revisits it (its item is gone), and the purged content stays
+ * searchable in Graphiti forever with nothing to retry. Flag-based detection can't see this; only
+ * orphan-ness can.
+ */
+describe("purge vs a racing projector (real Postgres, mocked Graphiti)", () => {
+  it("re-purges an orphan whose episodes were re-pushed after the item was deleted", async () => {
+    const seed = await seedTeam();
+    const slug = await teamSlugFor(seed.teamId);
+    const group = `${slug}_team`;
+    const item = await ingest(seed, { kind: "transcript", path: "slack/c0priv/1.md", body: "private thread", access: "team" });
+
+    const fake = new FakeGraphiti();
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(fake) });
+    await purgeItemsByPathPrefix(db(), seed.teamId, "slack/c0priv/", "private", { client: client(fake) });
+    expect(await fake.listEpisodes(group)).toHaveLength(0);
+
+    // The racing projector lands: it re-pushes the body it still held and clears the flag. Written
+    // directly because the projector can no longer reach this item (its row is gone) — this is the
+    // exact end state of `projectItemsToGraph`'s `purgeBeforeRepush` branch: `addEpisodes(groupId, …)`
+    // followed by the upsert whose `pending` object is `{pending_delete_group_id: null,
+    // pending_delete_at: null}`. If that branch's bookkeeping changes, this must change with it.
+    await fake.addEpisodes(group, [ep(`items:${item.id}`)]);
+    await db()
+      .from("graph_episodes")
+      .update({ content_sha256: "f".repeat(64), pending_delete_group_id: null, pending_delete_at: null })
+      .eq("team_id", seed.teamId);
+    expect(await fake.listEpisodes(group)).toHaveLength(1); // private content is BACK in the graph
+
+    // Reconcile notices the row has no item and retires it again.
+    await reconcileProjectedEpisodes(db(), client(fake), seed.teamId);
+    expect(await fake.listEpisodes(group)).toHaveLength(0);
+
+    // …and converges: once the group is verified empty past the grace, the row goes too.
+    await backdateCleanup(seed.teamId);
+    await reconcileProjectedEpisodes(db(), client(fake), seed.teamId);
+    const { data: after } = await db().from("graph_episodes").select("id").eq("team_id", seed.teamId);
+    expect(after ?? []).toHaveLength(0);
+  });
+
+  it("leaves a HEALTHY tier-cleanup row alone (orphan detection must not misfire)", async () => {
+    const seed = await seedTeam();
+    const slug = await teamSlugFor(seed.teamId);
+    const externalGroup = `${slug}_external`;
+    await ingest(seed, { kind: "deliverable", path: "docs/spec.md", body: "the spec", access: "external" });
+
+    const fake = new FakeGraphiti();
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(fake) });
+    fake.failDeletes = true;
+    await ingest(seed, { kind: "deliverable", path: "docs/spec.md", body: "the spec, team-tier", access: "team" });
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(fake) });
+    fake.failDeletes = false;
+    await backdateCleanup(seed.teamId);
+
+    // The item is ALIVE, so this is a tier cleanup, not an orphan: the flag clears and the row STAYS.
+    await reconcileProjectedEpisodes(db(), client(fake), seed.teamId);
+    await reconcileProjectedEpisodes(db(), client(fake), seed.teamId);
+    const { data } = await db()
+      .from("graph_episodes")
+      .select("group_id, pending_delete_group_id")
+      .eq("team_id", seed.teamId)
+      .maybeSingle();
+    expect(data).not.toBeNull();
+    const r = data as { group_id: string; pending_delete_group_id: string | null };
+    expect(r.pending_delete_group_id).toBeNull();
+    expect(r.group_id).not.toBe(externalGroup);
   });
 });

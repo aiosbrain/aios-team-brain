@@ -45,3 +45,6 @@ next-env.d.ts
 
 # Tessera: local direnv config, not committed
 .envrc
+
+# Supabase CLI local stack artifacts — this repo is Postgres-only (see CLAUDE.md §6)
+supabase/

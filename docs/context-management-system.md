@@ -99,6 +99,15 @@ validation (before any mutation) → item + version + derived-row materializatio
   changed (`project.ts:194`).
 - **Meeting notes** — unique on `source_item_id` (`schema.sql:1100`); a re-run returns
   `{created:false}` rather than duplicating (`notes.ts:178`).
+- **Removal** — `lib/ingest/purge.ts` is the counterpart to `ingestItem` (same single-writer rule) and
+  the only way content LEAVES the brain. Versions/chunks/facts/mentions cascade; `graph_episodes` and
+  the facts in Graphiti are retired explicitly (`lib/graph.retireEpisodesForItems`) with a
+  `pending_delete_group_id` tombstone so a Graphiti blip is retried by `reconcileProjectedEpisodes`
+  rather than silently abandoned; `tasks`/`decisions` citations are `set null`, not deleted. Every
+  purge is audited (`items.purged`) with its reason and scope. Wired today to the **private Slack
+  channel** case — a channel that turns out to be private is skipped AND anything ingested from it
+  before is removed, but only on a **confirmed**-private answer (an unverifiable channel is skipped,
+  never purged).
 
 ### 2.2 Chunking — two independent strategies for two indexes
 

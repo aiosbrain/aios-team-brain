@@ -8,6 +8,7 @@ import {
   setIntegrationSecret,
   setIntegrationStatus,
   deleteIntegration,
+  getEnabledIntegrationsWithSecrets,
   saveProviderModel as saveProviderModel_,
 } from "@/lib/integrations/manage";
 import type { AnsweringProvider } from "@/lib/query/llm-backend";
@@ -21,6 +22,7 @@ import {
 } from "@/lib/integrations/github-link";
 import { saveProvisioningSettings as saveProvisioningSettings_ } from "@/lib/provisioning/settings";
 import { validateGithubToken, checkRepoAccess, type RepoAccess } from "@/lib/integrations/github-validate";
+import { checkSlackChannels, privateChannelRejection } from "@/lib/integrations/slack-validate";
 import { RepoFormatError } from "@/lib/integrations/github-repos";
 import { validateOpenrouterKey, saveOpenrouterSettings } from "@/lib/integrations/openrouter";
 import { MEETING_TASK_STATUSES, type MeetingTaskStatus } from "@/lib/meetings/target-status";
@@ -37,6 +39,36 @@ import { buildConfig, toList } from "@/lib/integrations/build-config";
 import { audit } from "@/lib/api/audit";
 
 export type PrimaryPmProvider = "plane" | "linear" | null;
+
+/**
+ * The admin-facing error when a Slack save names a private channel, or null to let it through.
+ *
+ * Token resolution mirrors the ingester's (`runSlackIngestion`): the secret being submitted, else the
+ * one already stored for this integration, else `SLACK_BOT_TOKEN`. With no token we cannot ask Slack,
+ * so the save proceeds — the ingester fails closed on every channel it can't PROVE is public, which
+ * is where the rule is actually enforced. Never throws: a Slack outage must not block admin work.
+ */
+async function rejectPrivateSlackChannels(
+  teamId: string,
+  name: string,
+  submittedSecret: string,
+  config: Record<string, unknown>
+): Promise<string | null> {
+  const channelIds = (config.channelIds as string[] | undefined) ?? [];
+  if (channelIds.length === 0) return null;
+  try {
+    let token = submittedSecret.trim();
+    if (!token) {
+      const existing = await getEnabledIntegrationsWithSecrets(adminClient(), teamId);
+      token = existing.find((i) => i.type === "slack" && i.name === name)?.secret ?? "";
+    }
+    if (!token) token = process.env.SLACK_BOT_TOKEN ?? "";
+    if (!token) return null;
+    return privateChannelRejection(await checkSlackChannels(token, channelIds));
+  } catch {
+    return null; // couldn't verify → not evidence of privacy; the ingester still fails closed
+  }
+}
 
 export async function saveIntegration(
   teamSlug: string,
@@ -55,10 +87,17 @@ export async function saveIntegration(
   if (!name) return { ok: false, error: "name is required" };
   const auth = { teamId: ctx.teamId, memberId: ctx.memberId };
   try {
+    const config = buildConfig(form.type, form.selection, { inboundApply: form.inboundApply });
+    // Only channels PUBLIC to the workspace may be ingested — refuse the save rather than accept a
+    // private channel the ingester will silently skip forever (see `slack-validate`).
+    if (form.type === "slack") {
+      const rejection = await rejectPrivateSlackChannels(ctx.teamId, name, form.secret, config);
+      if (rejection) return { ok: false, error: rejection };
+    }
     const { id } = await upsertIntegration(adminClient(), auth, {
       type: form.type,
       name,
-      config: buildConfig(form.type, form.selection, { inboundApply: form.inboundApply }),
+      config,
       status: "enabled",
     });
     if (form.secret) await setIntegrationSecret(adminClient(), auth, id, form.secret);
@@ -115,8 +154,16 @@ export async function syncSlackNow(
   if (!ctx) return { ok: false, error: "admins only" };
   try {
     const s = await runSlackIngestion({ teamId: ctx.teamId });
-    if (!s.ok && s.errors.length) return { ok: false, error: s.errors.join("; ") };
+    // Revalidate BEFORE the error return: a failed run is not a no-op run — a confirmed-private
+    // channel reports as an error AND purges its items, so skipping the revalidation would show the
+    // admin the pre-purge data alongside the error.
     revalidatePath(`/t/${teamSlug}/admin/integrations`);
+    if (!s.ok && s.errors.length) return { ok: false, error: s.errors.join("; ") };
+    // NOTE: `s.ok` is `errors.length === 0`, so a private/unverifiable channel among otherwise
+    // healthy ones makes the whole run report as failed above, with the per-channel lines as the
+    // error text. That is the intended loudness — a configured channel the brain refuses to ingest
+    // is a configuration error the admin has to resolve, not a notice to file away — and it's why
+    // the messages from `privateChannelAction` say what to do, not just what happened.
     return {
       ok: true,
       message: `Synced ${s.channels} channel(s): +${s.created} new, ~${s.updated} updated, =${s.unchanged} unchanged.`,
