@@ -143,4 +143,24 @@ describe("purgeItemsByPathPrefix (real Postgres)", () => {
     expect(row?.meta?.reason).toBe("slack channel is private");
     expect(row?.meta?.items).toBe(1);
   });
+
+  it("records WHICH paths went, not just how many", async () => {
+    // The rows are the only record of their own paths, so a count-and-prefix audit makes the question
+    // "what did this purge remove?" unanswerable the moment the cascade runs. That's the wrong trade
+    // for the one irreversible operation in the ingest path.
+    const seed = await seedTeam();
+    for (const p of ["slack/c0x/2.md", "slack/c0x/1.md"]) {
+      await ingest(seed, { path: p, project: "slack", kind: "transcript", access: "team", body: p });
+    }
+    await ingest(seed, { path: "slack/c0keep/1.md", project: "slack", kind: "transcript", access: "team", body: "keep" });
+
+    await purgeItemsByPathPrefix(db(), seed.teamId, "slack/c0x/", "deleted at the source (slack)");
+
+    const { data } = await db().from("audit_log").select("action, meta").eq("team_id", seed.teamId);
+    const row = (data ?? []).find((r) => (r as { action: string }).action === "items.purged") as
+      | { meta: Record<string, unknown> }
+      | undefined;
+    expect(row?.meta?.paths).toEqual(["slack/c0x/1.md", "slack/c0x/2.md"]); // sorted, and only these
+    expect(row?.meta?.paths_truncated).toBeUndefined();
+  });
 });
