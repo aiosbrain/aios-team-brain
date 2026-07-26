@@ -17,6 +17,7 @@ import {
   type TimelineMember,
 } from "./timeline-group";
 import { computeTaskLinks } from "./issue-ref";
+import { MIN_CONFIDENCE } from "./doc-task-infer";
 import { resolveItemCreditIds } from "@/lib/attribution/contributor-credit";
 import { slackParticipations, foldProviderId } from "@/lib/ingest/slack-participants";
 
@@ -77,6 +78,8 @@ const WORK_EVENT_LIMIT = 5000;
 /** Commit↔PR join width. `work_events.merged_sha` is the full 40 chars; the CLI pushes a 10-char
  *  `frontmatter.sha`, so both sides normalize to this prefix. 40 bits — collision risk ~1e-7 at our scale. */
 const SHA_JOIN_LEN = 10;
+/** Inferred (LLM) task↔item edges pulled per build. Bounded like every other leg. */
+const TASK_EVIDENCE_LIMIT = 5000;
 
 /** The pg adapter hands timestamptz back as a string or a Date depending on the driver path; both
  *  become the ISO string the day-bucketing expects. Null only for a row written before `work_at`. */
@@ -450,6 +453,35 @@ export async function getWorkTimeline(
     }
   }
 
+  // INFERRED links — the LLM doc→task pass (`lib/dashboard/doc-task-infer-run`) persists its confident
+  // answers as `task_evidence` rows with `method='llm'`. This is that table's FIRST reader: a design doc
+  // that cites no issue key anywhere in its title or path is exactly what the deterministic matcher can
+  // never catch, so without this the pass's output would be invisible.
+  //
+  // The confidence gate is re-applied HERE, not just in the writer. The writer persists below-threshold
+  // answers deliberately (an audit trail of what the model thought), and `method='llm'` rows can also be
+  // written by a future admin/backfill path — so a reader that trusted every row would silently promote
+  // a guess the writer had already rejected.
+  //
+  // Enrichment, like the chips/work-events legs: WARN on failure, never throw — an unreadable inference
+  // table must not blank the factual ledger.
+  const inferredTaskIds = new Map<string, string[]>();
+  {
+    const teRes = await db
+      .from("task_evidence")
+      .select("item_id, task_id, confidence")
+      .eq("team_id", teamId)
+      .eq("method", "llm")
+      .gte("confidence", MIN_CONFIDENCE)
+      .limit(TASK_EVIDENCE_LIMIT);
+    if (teRes.error) console.warn("[work-timeline] inferred-link read failed:", teRes.error.message);
+    for (const r of (teRes.data ?? []) as { item_id: string; task_id: string; confidence: number }[]) {
+      const list = inferredTaskIds.get(r.item_id) ?? [];
+      if (!list.includes(r.task_id)) list.push(r.task_id);
+      inferredTaskIds.set(r.item_id, list);
+    }
+  }
+
   // One evidence row per (item, referenced task). An item that references NO task carries taskId=null and
   // is the only thing that lands in "Other". A commit citing two issues appears under both. The grouper
   // then evidence-gates: a task shows ONLY where it has ≥1 of this person's evidence that day (no empty
@@ -471,6 +503,14 @@ export async function getWorkTimeline(
     const inheritedVisible = inherited.filter((id) => taskInfo.has(id));
     if (inheritedVisible.length) {
       for (const taskId of inheritedVisible) evidence.push({ ...base, taskId, linkVia: "pr" });
+      continue;
+    }
+    // Then, and only then, a model INFERENCE — least specific, so it never outranks a real citation.
+    // Same tier mechanism as the two above: resolved solely against `taskInfo`, which was built from
+    // `visibleTasks` reads, so an inferred id the viewer may not see links nothing, silently.
+    const inferredVisible = (inferredTaskIds.get(e.id) ?? []).filter((id) => taskInfo.has(id));
+    if (inferredVisible.length) {
+      for (const taskId of inferredVisible) evidence.push({ ...base, taskId, linkVia: "inferred" });
       continue;
     }
     // Genuinely no task → "Other", with no chip. The #373 chip existed ONLY because a done/backlog task

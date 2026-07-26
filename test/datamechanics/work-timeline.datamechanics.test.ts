@@ -460,3 +460,84 @@ describe("PR-inherited task links (the commit's key lives on the PULL REQUEST)",
     expect(taskTitles(team)).toContain("Team-only inherited"); // non-vacuous: the team viewer does see it
   });
 });
+
+describe("INFERRED task links (the LLM doc→task pass — the first reader of task_evidence)", () => {
+  /** A `task_evidence` row exactly as `lib/dashboard/doc-task-infer-run` persists one. */
+  async function inferredLink(seed: Seed, taskId: string, itemId: string, confidence = 0.9) {
+    const { error } = await db().from("task_evidence").insert({
+      team_id: seed.teamId, task_id: taskId, item_id: itemId,
+      method: "llm", confidence, detail: "describes the same subject",
+    });
+    if (error) throw new Error(`task_evidence insert failed: ${error.message}`);
+  }
+  /** A doc that cites NO issue key — exactly what the pass exists to rescue from "Other". */
+  async function keylessDoc(seed: Seed, title: string, access: "team" | "external" = "team") {
+    return ingest(seed, {
+      kind: "deliverable", path: `2-work/${randomUUID()}.md`, access,
+      body: "prose about the work", frontmatter: { source: "", title, updated: recentIso },
+    });
+  }
+  async function taskId(rowKey: string): Promise<string> {
+    const { data } = await db().from("tasks").select("id").eq("row_key", rowKey).maybeSingle();
+    return (data as { id: string }).id;
+  }
+
+  it("nests a keyless doc under its inferred task, tagged linkVia:'inferred'", async () => {
+    const seed = await seedTeam();
+    const anchor = await commit(seed, "seed");
+    await insertTask(seed, anchor.projectId!, { row_key: "AIO-500", title: "Ownership timeline" });
+    const doc = await keylessDoc(seed, "Attribution ownership design");
+    await inferredLink(seed, await taskId("AIO-500"), doc.id);
+
+    const days = await getWorkTimeline(db(), seed.teamId, "team");
+    expect(nestedUnder(days, "Ownership timeline")).toContain("Attribution ownership design");
+    const via = days.flatMap((d) => d.people).flatMap((p) => p.tasks).flatMap((t) => t.sources.flatMap((g) => g.items))
+      .filter((i) => i.title === "Attribution ownership design").map((i) => i.linkVia);
+    expect(via).toEqual(["inferred"]);
+  });
+
+  it("a BELOW-THRESHOLD row is stored but never becomes a link (the gate is honoured on READ too)", async () => {
+    // The writer persists low-confidence answers as an audit trail of what the model thought. If only the
+    // writer gated, a hand-written or older row would silently become a real link on the next read.
+    const seed = await seedTeam();
+    const anchor = await commit(seed, "seed");
+    await insertTask(seed, anchor.projectId!, { row_key: "AIO-501", title: "Low confidence task" });
+    const doc = await keylessDoc(seed, "Vaguely related doc");
+    await inferredLink(seed, await taskId("AIO-501"), doc.id, 0.4);
+
+    const days = await getWorkTimeline(db(), seed.teamId, "team");
+    expect(taskTitles(days)).not.toContain("Low confidence task");
+    expect(otherTitles(days)).toContain("Vaguely related doc"); // stays in "Other"
+  });
+
+  it("DETERMINISTIC WINS: an own-key doc ignores a contradicting inferred row", async () => {
+    const seed = await seedTeam();
+    const anchor = await commit(seed, "seed");
+    await insertTask(seed, anchor.projectId!, { row_key: "AIO-502", title: "The cited task" });
+    await insertTask(seed, anchor.projectId!, { row_key: "AIO-503", title: "The inferred task" });
+    // The doc's title cites AIO-502; a stale inferred row points at AIO-503.
+    const doc = await keylessDoc(seed, "Design for AIO-502");
+    await inferredLink(seed, await taskId("AIO-503"), doc.id);
+
+    const days = await getWorkTimeline(db(), seed.teamId, "team");
+    expect(nestedUnder(days, "The cited task")).toContain("Design for AIO-502");
+    expect(taskTitles(days)).not.toContain("The inferred task");
+  });
+
+  it("TIER: an inferred link never surfaces a team task to an external viewer", async () => {
+    const seed = await seedTeam();
+    const anchor = await commit(seed, "seed");
+    await insertTask(seed, anchor.projectId!, { row_key: "SEC-1", title: "Team-only task", audience: "team" });
+    await insertTask(seed, anchor.projectId!, { row_key: "PUB-2", title: "Public task", audience: "external" });
+    const secret = await keylessDoc(seed, "Doc pointing at the team task", "external");
+    const pub = await keylessDoc(seed, "Doc pointing at the public task", "external");
+    await inferredLink(seed, await taskId("SEC-1"), secret.id);
+    await inferredLink(seed, await taskId("PUB-2"), pub.id);
+
+    const ext = await getWorkTimeline(db(), seed.teamId, "external");
+    expect(taskTitles(ext)).not.toContain("Team-only task"); // never leaked
+    expect(taskTitles(ext)).toContain("Public task"); // non-vacuous: the read path DOES work for external
+    const team = await getWorkTimeline(db(), seed.teamId, "team");
+    expect(taskTitles(team)).toEqual(expect.arrayContaining(["Team-only task", "Public task"]));
+  });
+});

@@ -36,7 +36,9 @@ const TTL_MS = 5 * 60_000; // 5-min freshness; the ledger is cheap, so refresh o
 // v6: a referenced task now heads its own group whatever its status. The SHAPE is unchanged, but the
 // MEANING is: a v5 row would keep serving the old "Other · not linked to a task" grouping (with its
 // self-contradicting chips) for a full TTL after deploy. Same rule as v5 — bump on a meaning change.
-export const PAYLOAD_VERSION = 6;
+// v7: evidence can now be linked by the LLM doc→task pass (`linkVia:"inferred"`). A v6 row would keep
+// serving those docs in "Other" for a full TTL after deploy — same meaning-change rule as v5/v6.
+export const PAYLOAD_VERSION = 7;
 
 /** The timeline WITH the per-person-day synopsis attached. Runs the (up to 7d × roster) best-effort LLM
  *  calls — so it's used ONLY on the BACKGROUND refresh path, never inline on a request (a cold miss

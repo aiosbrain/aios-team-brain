@@ -1,6 +1,6 @@
 # Attributing documents to the task they belong to (LLM assignment)
 
-**Status:** design v2 (pre-build). v1 proposed a GitHub-file work-time change as a prerequisite; **measuring
+**Status:** SHIPPED (design v3 → built). v1 proposed a GitHub-file work-time change as a prerequisite; **measuring
 prod killed that** — see "What I got wrong". **Ask:** "when attributing different types of documents to
 different Linear tasks, you're going to need to do an LLM-based assignment by looking at the content of the
 document to see which Linear tasks are assigned to the person, and which doc is most appropriate or none at
@@ -169,3 +169,25 @@ deliberately excluded — see below.
 - Inferring links for **commits** — the deterministic key plus #377's PR inheritance already cover them.
 - Linear/Plane mirror "deliverables" — PM rows, not authored documents.
 - Changing the active-only nesting rule; `KEY_RE` junk-key tightening.
+
+## Build notes (as shipped)
+
+Built as specced, with these decisions made during the build:
+
+- **Idempotency store:** the inputs hash lives on the recorded `ingest_runs.meta.inputs_hash` for
+  `source='doc_task_infer'` — no new table, and the same row that proves the run happened is what makes the
+  skip work. A FAILED run's hash is ignored, so a failure never suppresses the retry.
+- **Attribution:** the doc's worker resolves through `resolveItemCreditIds` **strict, with no raw
+  `member_id` fallback**. A fallback would rank against a second opinion about who did the work — exactly
+  the drift `test/guards/attribution-single-source` exists to prevent — so an oracle failure aborts the
+  tick instead (background pass: spending nothing beats disagreeing with the timeline).
+- **The model never sees a real id.** Docs and tasks are relabelled to synthetic `D1`/`T1` refs; we map
+  them back. A hallucinated ref resolves to nothing, which is a stronger guarantee than validating UUIDs
+  after the fact — and `applyInferredLinks` still validates both sides as defence in depth.
+- **Confidence gate is applied twice** — writer AND reader. Below-threshold rows are persisted on purpose
+  (the audit trail of what the model thought), so a reader that trusted every row would promote a guess the
+  writer had already rejected.
+- **Commits are excluded from scoring:** their own message and their PR already resolve deterministically
+  (#377), so an inference could only be worse than what the timeline already has.
+- **Metering reuses the `timeline-summary` `LlmUsageSource` slice** rather than widening that closed union
+  — the same call the arcs coherence pass makes by reusing `"arcs"`.
