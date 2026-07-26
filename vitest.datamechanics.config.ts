@@ -34,6 +34,10 @@ process.env.SECRETS_KEY ??= Buffer.alloc(32, 7).toString("base64");
 // GROUP_SCAN_DEPTH, and so do the tests, so the assertions stay honest at any window size.
 process.env.GRAPH_GROUP_SCAN_DEPTH = "200";
 process.env.GRAPH_LANDED_SCAN_DEPTH = "100";
+// Same trick for the timeline's per-leg row cap: H5 is about what happens when that cap BITES, and
+// seeding 2000 rows per spec would make the tier unusable. The builder and the specs both read the
+// exported ITEM_LIMIT, so the assertions stay honest at any size.
+process.env.TIMELINE_ITEM_LIMIT = "20";
 
 export default defineConfig({
   test: {

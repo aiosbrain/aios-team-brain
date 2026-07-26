@@ -1,4 +1,5 @@
 import "server-only";
+import { resolvePositiveInt } from "@/lib/util/env";
 import type { DbClient } from "@/lib/db/types";
 import { visibleItems, visibleTasks, visibleDecisions, type ViewerTier } from "@/lib/auth/visibility";
 import { commitSubject } from "./team-work";
@@ -6,7 +7,6 @@ import { subjectMatchesMember, type RosterPerson } from "./people-match";
 import {
   groupTimeline,
   normalizeSource,
-  itemWorkTime,
   type EvidenceItem,
   type EvidenceTaskRef,
   type EvidenceWithMember,
@@ -63,7 +63,10 @@ export const WINDOW_DAYS = 7;
 /** Hard cap on an on-demand "show earlier days" expansion. Bounds the fetch cost (ITEM_LIMIT is the
  *  real ceiling at scale) and keeps an uncached expand build cheap enough to run on a request. */
 export const MAX_WINDOW_DAYS = 30;
-const ITEM_LIMIT = 2000;
+/** Rows fetched per item leg. Env-tunable so the data-mechanics tier can exercise SATURATION (the cap
+ *  actually biting) without seeding thousands of rows — the tests read this same constant, so the
+ *  assertions stay honest at any window size. */
+export const ITEM_LIMIT = resolvePositiveInt(process.env.TIMELINE_ITEM_LIMIT, 2000);
 const TASK_LIMIT = 2000;
 const DECISION_LIMIT = 500;
 /** Resolved PR→task links pulled for the commit-inheritance join (prod today: ~1k work_events total). */
@@ -71,6 +74,14 @@ const WORK_EVENT_LIMIT = 5000;
 /** Commit↔PR join width. `work_events.merged_sha` is the full 40 chars; the CLI pushes a 10-char
  *  `frontmatter.sha`, so both sides normalize to this prefix. 40 bits — collision risk ~1e-7 at our scale. */
 const SHA_JOIN_LEN = 10;
+
+/** The pg adapter hands timestamptz back as a string or a Date depending on the driver path; both
+ *  become the ISO string the day-bucketing expects. Null only for a row written before `work_at`. */
+function isoOrNull(value: string | Date | null | undefined): string | null {
+  if (!value) return null;
+  const d = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(d.getTime()) ? null : d.toISOString();
+}
 
 type ItemRow = {
   id: string;
@@ -80,7 +91,9 @@ type ItemRow = {
   frontmatter: Record<string, unknown> | null;
   body?: string | null;
   path?: string | null;
-  synced_at: string | Date;
+  /** Persisted work-time (R1) — read, never re-derived. */
+  work_at?: string | Date | null;
+  synced_at?: string | Date;
 };
 type TaskRow = {
   id: string;
@@ -180,12 +193,14 @@ export async function getWorkTimeline(
     visibleItems(
       db
         .from("items")
-        .select("id, member_id, member_id_locked, frontmatter, body, synced_at")
+        .select("id, member_id, member_id_locked, frontmatter, body, work_at")
         .eq("team_id", teamId)
         .eq("frontmatter->>source", "git")
         .not("member_id", "is", null)
-        .gte("synced_at", sinceIso)
-        .order("synced_at", { ascending: false })
+        .eq("work_at_from_source", true)
+        .gte("work_at", sinceIso)
+        .order("work_at", { ascending: false })
+        .order("id", { ascending: false })
         .limit(ITEM_LIMIT),
       tier
     ),
@@ -197,12 +212,14 @@ export async function getWorkTimeline(
     visibleItems(
       db
         .from("items")
-        .select("id, kind, member_id, member_id_locked, frontmatter, path, synced_at")
+        .select("id, kind, member_id, member_id_locked, frontmatter, path, work_at")
         .eq("team_id", teamId)
         .neq("kind", "task")
         .not("member_id", "is", null)
-        .gte("synced_at", sinceIso)
-        .order("synced_at", { ascending: false })
+        .eq("work_at_from_source", true)
+        .gte("work_at", sinceIso)
+        .order("work_at", { ascending: false })
+        .order("id", { ascending: false })
         .limit(ITEM_LIMIT),
       tier
     ),
@@ -227,11 +244,12 @@ export async function getWorkTimeline(
     visibleItems(
       db
         .from("items")
-        .select("id, frontmatter, synced_at")
+        .select("id, frontmatter, work_at")
         .eq("team_id", teamId)
         .eq("frontmatter->>source", "slack")
-        .gte("synced_at", sinceIso)
-        .order("synced_at", { ascending: false })
+        .gte("work_at", sinceIso)
+        .order("work_at", { ascending: false })
+        .order("id", { ascending: false })
         .limit(ITEM_LIMIT),
       tier
     ),
@@ -298,7 +316,7 @@ export async function getWorkTimeline(
   for (const r of (gitRes.data ?? []) as ItemRow[]) {
     const memberId = primaryOf(r);
     if (!memberId || !members.has(memberId)) continue;
-    const at = itemWorkTime(r.frontmatter);
+    const at = isoOrNull(r.work_at);
     if (!at || !inWindow(at)) continue;
     const fm = r.frontmatter ?? {};
     const title = str(fm.title) || commitSubject(r.body ?? "") || "commit";
@@ -318,7 +336,7 @@ export async function getWorkTimeline(
     if (str(fm.identifier) && (source === "linear" || source === "plane")) continue;
     const memberId = primaryOf(r);
     if (!memberId || !members.has(memberId)) continue;
-    const at = itemWorkTime(fm);
+    const at = isoOrNull(r.work_at);
     if (!at || !inWindow(at)) continue;
     const title = str(fm.title) || (r.path ? basename(r.path) : "") || "(untitled)";
     evItems.push({ id: r.id, memberId, source, kind: r.kind ?? "item", title, url: httpUrl(fm.source_url), at, text: `${title}\n${r.path ?? ""}` });

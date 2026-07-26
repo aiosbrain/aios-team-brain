@@ -427,10 +427,10 @@ async function peopleActivityDigest(db: DbClient, teamId: string): Promise<strin
   const since = new Date(Date.now() - PEOPLE_WINDOW_DAYS * 86_400_000).toISOString();
   const { data: items } = await db
     .from("items")
-    .select("member_id, kind, frontmatter, synced_at")
+    .select("member_id, kind, frontmatter, work_at")
     .eq("team_id", teamId)
-    .gte("synced_at", since)
-    .order("synced_at", { ascending: false })
+    .gte("work_at", since)
+    .order("work_at", { ascending: false })
     .limit(5000);
   if (!items?.length) return "";
 
@@ -453,14 +453,16 @@ async function peopleActivityDigest(db: DbClient, teamId: string): Promise<strin
     member_id: string | null;
     kind: string | null;
     frontmatter: Record<string, unknown> | null;
-    synced_at: string | Date;
+    work_at: string | Date;
   }[]) {
     if (!it.member_id || isConnector(it.member_id)) continue;
     const fm = it.frontmatter ?? {};
     const source = typeof fm.source === "string" && fm.source ? fm.source : it.kind ?? "item";
     if (source === "git") continue; // code activity has its own section
-    // synced_at comes back as a Date on the pg adapter; normalize to an ISO string.
-    const ts = typeof it.synced_at === "string" ? it.synced_at : new Date(it.synced_at).toISOString();
+    // Work-time (R1), not sync time: this digest reports when each person LAST DID something, and a
+    // re-sync tick would otherwise make everyone look active today. Comes back as a Date on the pg
+    // adapter; normalize to an ISO string.
+    const ts = typeof it.work_at === "string" ? it.work_at : new Date(it.work_at).toISOString();
     const m = memById.get(it.member_id);
     const a = byPerson.get(it.member_id) ?? { name: m?.name ?? "unknown", email: m?.email ?? "", bySource: new Map(), last: "" };
     a.bySource.set(source, (a.bySource.get(source) ?? 0) + 1);
@@ -529,12 +531,16 @@ async function nativeRetrieve(
   const taskCountsP = taskStatusCounts(teamId, tier);
   const matchedDecisionsP = terms.length ? matchingDecisions(teamId, tier, ftsQuery, 10) : Promise.resolve([]);
 
-  // 2. Recency: most recent items (a fallback so fresh content always has a shot).
+  // 2. Recency: most recent items (a fallback so fresh content always has a shot). Ordered by the
+  //    persisted WORK time, not `synced_at` (R1/M3): every re-sync tick bumps `synced_at`, so ordering
+  //    by it made "latest" mean "most recently re-scanned" — a backfill of an old corpus would answer
+  //    "what's the latest" with months-old documents. `id` breaks ties so the page is deterministic.
   let recentB = db
     .from("items")
-    .select("id, path, kind, body, synced_at, projects(slug)")
+    .select("id, path, kind, body, synced_at, work_at, projects(slug)")
     .eq("team_id", teamId)
-    .order("synced_at", { ascending: false })
+    .order("work_at", { ascending: false })
+    .order("id", { ascending: false })
     .limit(8);
   if (isRestrictedTier(tier)) recentB = recentB.eq("access", "external");
   // Channel scope (Gap #4) — keep the recency fallback inside the same channel. LIKE on the 2nd path
@@ -551,10 +557,11 @@ async function nativeRetrieve(
   if (scopedSource) {
     sourceRecencyB = db
       .from("items")
-      .select("id, path, kind, body, synced_at, projects(slug)")
+      .select("id, path, kind, body, synced_at, work_at, projects(slug)")
       .eq("team_id", teamId)
       .eq("frontmatter->>source", scopedSource)
-      .order("synced_at", { ascending: false })
+      .order("work_at", { ascending: false })
+      .order("id", { ascending: false })
       .limit(SOURCE_RECENCY_LIMIT);
     if (isRestrictedTier(tier)) sourceRecencyB = sourceRecencyB.eq("access", "external");
     if (channelSeg) sourceRecencyB = sourceRecencyB.like("path", `%/${channelSeg}/%`);

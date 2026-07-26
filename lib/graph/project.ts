@@ -4,6 +4,9 @@ import type { DbClient } from "@/lib/db/types";
 import { GraphitiClient, type GraphEpisode } from "./graphiti-client";
 import { episodeGroupId, isExternalGroupId, type AccessTier } from "./group";
 import { episodeName, itemIdFromEpisodeName } from "./episode-name";
+import { resolvePositiveInt } from "@/lib/util/env";
+// Re-exported so the graph module's existing importers (and their specs) keep one import path.
+export { resolvePositiveInt };
 
 /**
  * Brain → Graphiti projector. Reads already-normalized, tier-tagged rows from the brain (`items` —
@@ -37,10 +40,6 @@ const SOURCE_TABLE = "items";
  * 0/NaN chunk CAP makes it emit none — either way the projector "succeeds" feeding the graph nothing
  * (or garbage). `Math.floor` also closes the fractional hole (0.5 → 0). Pure + exported, unit-tested.
  */
-export function resolvePositiveInt(raw: unknown, fallback: number): number {
-  const n = Math.floor(Number(raw));
-  return Number.isFinite(n) && n >= 1 ? n : fallback;
-}
 export const CHUNK_CHARS = resolvePositiveInt(process.env.GRAPH_CHUNK_CHARS, 2500);
 export const MAX_EPISODE_CHUNKS = resolvePositiveInt(process.env.GRAPH_MAX_EPISODE_CHUNKS, 16);
 
