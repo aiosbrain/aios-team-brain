@@ -2,7 +2,13 @@ import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { GraphitiClient } from "./graphiti-client";
 import { itemIdFromEpisodeName } from "./episode-name";
-import { GROUP_SCAN_DEPTH, IN_CLAUSE_BATCH, chunk, resolvePositiveInt } from "./project";
+import {
+  GROUP_SCAN_DEPTH,
+  IN_CLAUSE_BATCH,
+  PROJECTION_INTERVAL_MS,
+  chunk,
+  resolvePositiveInt,
+} from "./project";
 import { isExternalGroupId } from "./group";
 
 /**
@@ -17,7 +23,62 @@ import { isExternalGroupId } from "./group";
  * `listEpisodes` themselves, so nothing reads the stored value.
  */
 
-const GRACE_MS = 5 * 60_000; // don't judge a row pushed in the last 5 min — extraction may still be running
+/**
+ * Floor on "too recent to judge". Extraction is asynchronous, so a just-pushed episode legitimately
+ * isn't in the group yet.
+ */
+export const GRACE_MS = 5 * 60_000;
+
+/**
+ * The grace actually applied: at least one full projection cycle (H7).
+ *
+ * Five minutes was the amplifier. Graphiti's queue drains at LLM speed, so any backlog deeper than the
+ * grace made reconcile read every still-queued episode as "never landed" — it deleted the ledger row,
+ * the projector re-pushed on its next tick, and that deepened the very backlog causing the
+ * misjudgement. Positive feedback, and a large backfill trips it deterministically: unbounded duplicate
+ * episodes and extraction spend.
+ *
+ * Waiting a full cycle costs almost no healing latency, which is what makes this a floor rather than a
+ * compromise: a re-queued row can't be re-pushed until the projector's next run anyway, so judging it
+ * sooner mostly buys nothing while risking judging it wrongly. Two honest exceptions, both accepted:
+ *   • Phase offset. A row pushed mid-run is aged ~one interval by the NEXT reconcile; land fractionally
+ *     under and it waits one more cycle, so a genuinely crashed episode can take ~2 cycles to heal.
+ *   • The admin "Project to graph" action used to double as a fast manual heal (push, wait 5 min, click).
+ *     It now judges nothing younger than a full cycle. Recovering sooner means lowering the cadence.
+ *
+ * `PROJECTION_INTERVAL_MS` is imported, not re-read from the env, so this can't drift from the cadence
+ * the scheduler actually runs at — the whole argument above is false if the two numbers disagree.
+ */
+export const LANDED_GRACE_MS = Math.max(GRACE_MS, PROJECTION_INTERVAL_MS);
+
+/**
+ * Most ledger rows one pass may re-queue FOR ONE TEAM. Defence in depth behind `LANDED_GRACE_MS` — the
+ * grace removes the misjudgement that drives the loop; this bounds the damage if something still does.
+ *
+ * A crashed worker loses ONE episode. A wedged queue, an outage, or a Graphiti restart makes EVERY row
+ * look absent at once, so "many rows absent simultaneously" is evidence about the SERVICE rather than
+ * about N independent rows. The cap does a bounded number and reports the remainder; the un-judged rows
+ * keep their ledger entry and come round next pass, by which time the service has usually recovered and
+ * they confirm instead.
+ *
+ * The cost is real and worth stating: a team that genuinely needs 1000 rows re-pushed heals at 20 per
+ * projection cycle — at the default hourly cadence, ~50 hours. In the case this cap exists for that is
+ * the RIGHT speed: when Graphiti accepted the pushes and never extracted them, re-pushing all 1000 at
+ * once just re-creates the wedge, and drip-feeding is what you'd want a human to do by hand.
+ *
+ * But that is not the only way a thousand rows go absent at once. A Neo4j rollback or a rebuilt-image
+ * recovery (both of which have happened here) loses landed episodes while the service is perfectly
+ * HEALTHY — every row is legitimately gone, re-pushing all of them is correct, and 50 hours is simply
+ * slow. That case is a deliberate operator action, so the intended response is to raise
+ * `GRAPH_REQUEUE_MAX_PER_PASS` for the recovery; `requeueThrottled` is the signal that tells an operator
+ * this is the situation they're in, rather than leaving it to be inferred from the graph looking thin.
+ *
+ * LIMITATION: the bound is per team, and Graphiti's extraction queue is shared across all of them, so a
+ * many-team instance can still exceed it in aggregate on one pass. Making the budget global means
+ * threading it through `runGraphProjection`'s team loop; not done, because the grace is the actual fix
+ * and no instance today has the team count for this to bite.
+ */
+export const REQUEUE_MAX_PER_PASS = resolvePositiveInt(process.env.GRAPH_REQUEUE_MAX_PER_PASS, 20);
 // Clearing a tier-cleanup flag is a tier-isolation decision (no RLS backstop), so it uses a LONGER,
 // dedicated grace: a straggler chunk of the pre-reclassification push that's still sitting in Graphiti's
 // extraction queue (which demonstrably backs up — the oversized-episode wedge) could land AFTER a short
@@ -46,6 +107,10 @@ export interface ReconcileSummary {
   /** Cleanups STILL outstanding after this pass — old-tier episodes that are purgeable but not yet
    * verified purged. A number that never returns to 0 is a stuck tier cleanup, not bookkeeping. */
   pendingCleanups: number;
+  /** Rows this pass WANTED to re-queue but didn't, because the per-pass cap says a mass disappearance is
+   * a service problem rather than N crashed workers. Non-zero means Graphiti is probably unhealthy; the
+   * rows are untouched and retried next pass. */
+  requeueThrottled: number;
   /** Groups whose episode list came back FULL, so nothing in them could be judged this pass. Reported
    * rather than swallowed: it means the group has outgrown the scan window and self-healing has
    * quietly stopped for it (raise `GRAPH_LANDED_SCAN_DEPTH`). */
@@ -129,7 +194,15 @@ async function repairOrphans(
 export async function reconcileProjectedEpisodes(
   db: DbClient,
   client: GraphitiClient,
-  teamId: string
+  teamId: string,
+  /**
+   * Re-queue budget for THIS pass, defaulting to the per-team constant. A parameter rather than a bare
+   * module constant for two reasons: it lets a test exercise the throttle at a size it can actually
+   * seed (depending on the env-derived value means the fixture grows with the knob), and it is the seam
+   * a future global budget would use to spend one allowance across `runGraphProjection`'s team loop —
+   * the LIMITATION named on `REQUEUE_MAX_PER_PASS`.
+   */
+  maxRequeuePerPass: number = REQUEUE_MAX_PER_PASS
 ): Promise<ReconcileSummary> {
   if (!client.configured)
     return {
@@ -139,6 +212,7 @@ export async function reconcileProjectedEpisodes(
       cleaned: 0,
       cleanedExternal: 0,
       pendingCleanups: 0,
+      requeueThrottled: 0,
       saturatedGroups: 0,
     };
 
@@ -172,10 +246,11 @@ export async function reconcileProjectedEpisodes(
     byGroup.set(row.group_id, arr);
   }
 
-  const cutoff = Date.now() - GRACE_MS;
+  const cutoff = Date.now() - LANDED_GRACE_MS;
   let confirmed = 0;
   let reQueued = 0;
   let saturatedGroups = 0;
+  let requeueThrottled = 0;
 
   for (const [groupId, groupRows] of byGroup) {
     // Graphiti unreachable this pass — leave these rows alone and try again next tick, rather than
@@ -218,10 +293,22 @@ export async function reconcileProjectedEpisodes(
         // grace window). Writing and counting it every pass would inflate `requeued` in the logs and
         // the ingest_runs meta with work that isn't happening.
         if (row.content_sha256 !== "") {
+          // Throttled (H7) — see REQUEUE_MAX_PER_PASS. Checked here rather than above the branch so a
+          // row already on the sentinel doesn't consume budget it isn't using.
+          if (reQueued >= maxRequeuePerPass) {
+            requeueThrottled++;
+            continue;
+          }
           await db.from("graph_episodes").update({ content_sha256: "" }).eq("id", row.id);
           reQueued++;
         }
       } else {
+        // Throttled (H7) — see REQUEUE_MAX_PER_PASS. Past the cap the pass stops judging and reports
+        // the remainder; the rows are untouched and come round again next pass.
+        if (reQueued >= maxRequeuePerPass) {
+          requeueThrottled++;
+          continue;
+        }
         await db.from("graph_episodes").delete().eq("id", row.id);
         reQueued++;
       }
@@ -324,6 +411,7 @@ export async function reconcileProjectedEpisodes(
     cleaned,
     cleanedExternal,
     pendingCleanups: (pendingRows ?? []).length,
+    requeueThrottled,
     saturatedGroups,
   };
 }

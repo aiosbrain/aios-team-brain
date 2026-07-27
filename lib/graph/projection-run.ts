@@ -36,6 +36,9 @@ export function projectionRunInput(
       // Groups that outgrew the reconcile scan window — self-healing has stopped for them. A cap that
       // saturates must never be silent.
       saturatedGroups: summary.saturatedGroups,
+      // Re-queues declined because a mass disappearance reads as a wedged Graphiti (H7). Recorded so a
+      // throttle that persists across runs is visible rather than inferred from logs.
+      requeueThrottled: summary.requeueThrottled,
     },
     startedAt,
     finishedAt,

@@ -1,5 +1,6 @@
 import "server-only";
 import { GraphitiClient } from "./graphiti-client";
+import { PROJECTION_INTERVAL_MS, PROJECTION_MINUTES } from "./project";
 import { runGraphProjection } from "./run";
 import { projectionRunInput } from "./projection-run";
 import { recordIngestRun } from "@/lib/ingest/runs";
@@ -22,20 +23,23 @@ export function startGraphScheduler(): void {
   if (!new GraphitiClient().configured) return;
   started = true;
 
-  const minutes = Number(process.env.GRAPH_PROJECT_MINUTES ?? 60);
-  const intervalMs = Math.max(1, minutes) * 60_000;
+  // One owner for the cadence (`lib/graph/project`): reconcile derives its "never landed" grace from
+  // this same number (H7), and a second local parse of the env is how those two silently disagree.
+  const minutes = PROJECTION_MINUTES;
+  const intervalMs = PROJECTION_INTERVAL_MS;
 
   const tick = async () => {
     const startedAt = Date.now();
     try {
       const s = await runGraphProjection();
-      if (s.projected || s.errors.length || s.pendingCleanups || s.saturatedGroups) {
+      if (s.projected || s.errors.length || s.pendingCleanups || s.saturatedGroups || s.requeueThrottled) {
         console.info(
           `[graph] projected +${s.projected} =${s.skipped} (${s.scanned} scanned, ${s.teams} teams)` +
             (s.cleaned || s.pendingCleanups
               ? ` tier-cleanup: ${s.cleaned} done, ${s.pendingCleanups} outstanding`
               : "") +
             (s.saturatedGroups ? ` ${s.saturatedGroups} group(s) past the reconcile scan window` : "") +
+            (s.requeueThrottled ? ` ${s.requeueThrottled} re-queue(s) throttled — Graphiti may be wedged` : "") +
             (s.errors.length ? ` errors: ${s.errors.join("; ")}` : "")
         );
       }
@@ -43,7 +47,7 @@ export function startGraphScheduler(): void {
       // cleanup) to ingest_runs so a silently-failing projector — e.g. Graphiti 422'ing every write, or
       // a tier cleanup that never converges — is visible on the dashboard, not just in ephemeral logs.
       // A cleanup-only tick used to record nothing at all. recordIngestRun is best-effort.
-      if (s.projected || s.errors.length || s.requeued || s.cleaned || s.pendingCleanups || s.saturatedGroups) {
+      if (s.projected || s.errors.length || s.requeued || s.cleaned || s.pendingCleanups || s.saturatedGroups || s.requeueThrottled) {
         await recordIngestRun(adminClient(), projectionRunInput(s, "scheduler", startedAt, Date.now()));
       }
     } catch (err) {
