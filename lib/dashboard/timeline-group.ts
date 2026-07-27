@@ -38,9 +38,6 @@ export interface EvidenceItem {
   /** LEGACY chip — no longer populated (any referenced task now heads its own group). Kept so cached
    *  payloads from the previous build still render during their TTL. */
   linkedTask?: EvidenceTaskRef;
-  /** How this evidence got its task: the item's OWN cited issue key, or inherited from the PR that merged
-   *  it (`work_events`). Provenance carried in the payload so an inherited (lower-precision) link is
-   *  diagnosable from every surface that reads the ledger, not just inside the builder. */
   /** How this evidence got its task, in DESCENDING precision: the item's OWN cited issue key, inherited
    *  from the PR that merged it (`work_events`), or `inferred` by the LLM doc→task pass (`task_evidence`
    *  `method='llm'`). Carried in the payload so a lower-precision link is diagnosable — and correctable —
