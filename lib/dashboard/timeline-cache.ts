@@ -38,7 +38,16 @@ const TTL_MS = 5 * 60_000; // 5-min freshness; the ledger is cheap, so refresh o
 // self-contradicting chips) for a full TTL after deploy. Same rule as v5 — bump on a meaning change.
 // v7: evidence can now be linked by the LLM doc→task pass (`linkVia:"inferred"`). A v6 row would keep
 // serving those docs in "Other" for a full TTL after deploy — same meaning-change rule as v5/v6.
-export const PAYLOAD_VERSION = 7;
+// v8: `PersonDay.other[]` is REPLACED by `unlinked: number` — unlinked evidence is omitted, `total`
+// counts only rendered work, and a person-day with nothing left is dropped. A v7 row therefore carries
+// a shape this build does not render AND person-days it would have dropped, so the card shows a name
+// with an empty body under it — the exact thing the omission was meant to prevent.
+//
+// This bump was MISSED once and it is worth saying why: the change was authored on v6→v7, then rebased
+// onto a branch that had already taken 7 for its own shape change, so two incompatible payloads shipped
+// under one version and prod served a stale row as a HIT. When rebasing, re-check that the version you
+// bumped TO is still unclaimed on the new base.
+export const PAYLOAD_VERSION = 8;
 
 /** The timeline WITH the per-person-day synopsis attached. Runs the (up to 7d × roster) best-effort LLM
  *  calls — so it's used ONLY on the BACKGROUND refresh path, never inline on a request (a cold miss
