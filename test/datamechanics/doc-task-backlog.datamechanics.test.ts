@@ -87,7 +87,16 @@ describe("doc→task inference: never scores across people (real Postgres)", () 
     // One call per worker means one worker's provider timeout must not settle the batch. If it did,
     // the prune (batch-scoped) would delete that worker's existing links AND `markScored` would record
     // their docs, so a transient blip would eat a person's links permanently.
-    const { seed } = await seedTeamWithTask();
+    //
+    // The discriminating parts, learned the hard way — an earlier version of this test asserted only
+    // "the failed worker is unscored", which is ALSO true of the broken code (an empty `links` array
+    // short-circuits before the prune), so it was green on the bug:
+    //   1. the SUCCEEDING worker returns a real match, so `links` is non-empty and the old code falls
+    //      through to the batch-wide prune + markScored;
+    //   2. a pre-existing llm edge for the FAILING worker must SURVIVE — the half that loses user data;
+    //   3. the succeeding worker IS scored — a positive control, so a run that silently did nothing
+    //      (cooldown, no-llm, a throw) cannot pass.
+    const { seed, taskId } = await seedTeamWithTask();
     const { data: other } = await db().from("members").insert({
       team_id: seed.teamId, email: `${randomUUID()}@test.local`, display_name: "Other Person",
       actor_handle: `o-${randomUUID().slice(0, 8)}`, role: "member", tier: "team", status: "active",
@@ -99,14 +108,21 @@ describe("doc→task inference: never scores across people (real Postgres)", () 
       title: "Other Person's ticket about widgets", status: "in_progress", assignee: "Other Person",
       origin: "sync", audience: "team",
     });
-    await keylessDoc(seed, "mine");
+    const mine = await keylessDoc(seed, "mine");
     const theirs = await keylessDoc(seed, "theirs");
     await db().from("items").update({ member_id: otherId }).eq("id", theirs.id);
     await db().from("item_versions").update({ member_id: otherId }).eq("item_id", theirs.id);
 
-    // The OTHER person's call fails; the seed member's succeeds with no match.
+    // An edge the failing worker already has — this is what a batch-wide prune would destroy.
+    await db().from("task_evidence").insert({
+      team_id: seed.teamId, task_id: taskId, item_id: theirs.id, method: "llm", confidence: 0.9,
+    });
+
+    // The OTHER person's call fails; the seed member's succeeds WITH A MATCH.
     completeTextOrNull.mockImplementation(async (args?: { prompt?: string }) =>
-      (args?.prompt ?? "").includes("theirs") ? null : JSON.stringify({ matches: [] })
+      (args?.prompt ?? "").includes("theirs")
+        ? null
+        : JSON.stringify({ matches: [{ doc: "D1", task: "T1", confidence: 0.95, why: "r" }] })
     );
     await runDocTaskInference(db(), seed.teamId, { maxDocs: 10 });
 
@@ -114,7 +130,10 @@ describe("doc→task inference: never scores across people (real Postgres)", () 
       const { data } = await db().from("doc_task_inference").select("item_id").eq("item_id", itemId);
       return (data ?? []).length > 0;
     };
+    expect(await scored(mine.id)).toBe(true); // positive control: the run really did work
     expect(await scored(theirs.id)).toBe(false); // failed worker → re-asked next run
+    // …and their existing edge is intact. This is the assertion that goes red on a batch-wide prune.
+    expect(await llmLinkedItemIds(seed.teamId)).toContain(theirs.id);
   });
 
   it("offers each worker only their OWN tasks, in separate calls", async () => {

@@ -277,7 +277,7 @@ export function startIngestScheduler(): void {
   }
 
   // LLM doc→task assignment: the docs a deterministic issue-key match can never catch (a design doc
-  // rarely cites AIO-494). Per team, ONE batched call, and it short-circuits before spending anything
+  // rarely cites AIO-494). Per team, one batched call PER WORKER in the batch, and it short-circuits before spending anything
   // when the team has no model configured or its inputs are unchanged since the last run. Unlike the
   // deterministic sibling above this IS recorded to ingest_runs — it spends money, and the recorded
   // `meta.inputs_hash` is also what makes the skip work. Best-effort; never fails the tick.

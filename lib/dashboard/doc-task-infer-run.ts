@@ -293,8 +293,13 @@ export async function runDocTaskInference(
     // `links`: a worker that legitimately answered "no match" HAS settled, and discarding that would
     // re-pay for the same answer every cycle.
     if (!settled.length) {
-      await record(db, teamId, startedAt, true, { inputs_hash: inputsHash, scored: scoreable.length, linked: 0, note: "model returned null" });
-      return { scored: scoreable.length, linked: 0, skipped: "model-null" };
+      // ok=FALSE: nothing was answered, so the health card must not read this as a healthy pass. The
+      // cooldown applies either way (`lastRun` doesn't filter on ok), so this only affects honesty.
+      // `scored: 0` for the same reason — the batch size is not what was scored.
+      await record(db, teamId, startedAt, false, { inputs_hash: inputsHash, scored: 0, linked: 0 }, [
+        "model returned null for every worker",
+      ]);
+      return { scored: 0, linked: 0, skipped: "model-null" };
     }
 
     // Replace THIS BATCH's edges — scoped by `method='llm'` AND by the item ids just scored.

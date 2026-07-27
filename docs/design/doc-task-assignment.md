@@ -96,12 +96,14 @@ the timeline computes links **inline**. So this feature must also add the **firs
   outcome. The failure mode to design against is a model that always picks something.
 - **Confidence gate.** Below threshold the row is still written (the audit trail of what the model thought)
   but is **not** used as a link. One constant, one place.
-- **Candidates: ONLY the person's own assigned tasks (hard-restricted).** Ranking-with-fallback was the original design; it shipped and was reversed, because a model GUESS that reaches across people puts a teammate's ticket on your day and nothing distinguishes it from a real cross-assignment. A deterministic link may still cross people — there the author said which ticket it was. `taskInfo` is the
-  **team-wide** active set — the timeline has no assignee filter by design (a task is placed under the
-  *evidence author*, not its assignee, `work-timeline.ts:48-49`), and prod assignee strings are messy
-  (`Chetan`/`chetan.nandakumar`, `John Ellison`/`john`/`John`). Hard-scoping on those strings would silently
-  drop the real case of a doc about a teammate's ticket. Resolve through the identity mapping, rank the
-  person's own tasks first, and let the model still answer "none".
+- **Candidates: ONLY the person's own assigned tasks (hard-restricted).** Ranking-with-fallback was the original design; it shipped and was reversed, because a model GUESS that reaches across people puts a teammate's ticket on your day and nothing distinguishes it from a real cross-assignment. A deterministic link may still cross people — there the author said which ticket it was. Note this is the ONE
+  place the timeline scopes by assignee: a task is still *placed* under the evidence author, not its
+  assignee (`work-timeline.ts:48-49`), because an explicit citation is an authored fact. Only the guess is
+  restricted. Prod assignee strings are messy (`Chetan`/`chetan.nandakumar`, `John Ellison`/`john`/`John`),
+  which is exactly why the identity mapping is load-bearing here rather than an optimisation — the
+  restriction is only safe if "assigned to me" resolves correctly, so a raw string compare would drop real
+  candidates. Resolve through the mapping, offer only the resolved owner's tasks, and let the model still
+  answer "none".
 - **Tier (no RLS — app code is the only enforcement).** Candidates come only from maps fetched through the
   **`visibleTasks`** choke-point; an inferred `task_id` outside `taskInfo`/`chipInfo` links nothing,
   silently (`work-timeline.ts:407-408`). **`access='external'` items are never scored** — untrusted client
