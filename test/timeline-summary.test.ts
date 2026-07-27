@@ -9,20 +9,25 @@ vi.mock("@/lib/llm/complete", () => ({ completeTextOrNull: (...a: unknown[]) => 
 import { summaryPromptFor, type PersonDay, type TimelineDay } from "@/lib/dashboard/timeline-group";
 import { llmConfigured, attachPersonDaySummaries } from "@/lib/dashboard/timeline-summary";
 
+// The card only ever describes TASK-LINKED work now, so the default fixture is task-linked: a person
+// whose work is all unlinked has nothing for the summariser to narrate.
 const person = (over: Partial<PersonDay> = {}): PersonDay => ({
-  memberId: "m1", name: "Chetan", handle: "chetan", total: 1, signals: [],
-  tasks: [], other: [{ source: "github", count: 1, items: [{ id: "c1", title: "did a thing", source: "github", kind: "commit", at: "2026-07-22T09:00:00Z" }] }],
+  memberId: "m1", name: "Chetan", handle: "chetan", total: 1, signals: [], unlinked: 0,
+  tasks: [{
+    taskId: "t1", title: "Adapter", status: "in_progress", evidenceCount: 1,
+    sources: [{ source: "github", count: 1, items: [{ id: "c1", title: "did a thing", source: "github", kind: "commit", at: "2026-07-22T09:00:00Z" }] }],
+  }],
   ...over,
 });
 const fakeDb = {} as never;
 
 describe("summaryPromptFor (pure LLM input)", () => {
   it("returns '' when the person has no work (caller skips the LLM call)", () => {
-    expect(summaryPromptFor(person({ tasks: [], other: [] }), "Today")).toBe("");
+    expect(summaryPromptFor(person({ tasks: [] }), "Today")).toBe("");
   });
-  it("lists in-progress tasks with nested work + Other, capping per-source items", () => {
+  it("lists tasks with their nested work, capping per-source items", () => {
     const items = Array.from({ length: 20 }, (_, i) => ({ id: `c${i}`, title: `commit ${i}`, source: "github", kind: "commit", at: "2026-07-22T09:00:00Z" }));
-    const p = person({ tasks: [{ taskId: "t1", title: "Adapter", status: "in_progress", evidenceCount: 1, sources: [{ source: "github", count: 20, items }] }], other: [] });
+    const p = person({ tasks: [{ taskId: "t1", title: "Adapter", status: "in_progress", evidenceCount: 1, sources: [{ source: "github", count: 20, items }] }] });
     const prompt = summaryPromptFor(p, "Today", 3);
     expect(prompt).toContain("Chetan on Today:");
     expect(prompt).toContain("Adapter [in_progress]");

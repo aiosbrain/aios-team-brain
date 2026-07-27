@@ -191,7 +191,16 @@ export async function runDocTaskInference(db: DbClient, teamId: string): Promise
       // `body` is attached later — only for the docs that survive the skip check (see below).
     }));
 
-    const scoreable = scoreableDocs(docs).slice(0, MAX_DOCS);
+    // OLDEST-FIRST within the batch cap. The cap and the skip-if-unchanged hash interact badly the other
+    // way round: slice the NEWEST 40, have the model decline them all, and the hash never moves again —
+    // so docs 41+ are never scored at all. That was survivable while unlinked work still rendered in an
+    // "Other" lane; now that it is omitted from the card, an unscored doc is INVISIBLE, so the pass has
+    // to be able to reach the back of the queue. Oldest-first drains it: anything scored either gains a
+    // link (leaving `scoreable`) or ages behind the newer docs, and the set keeps changing until empty.
+    // `docs` preserves the SQL order (`work_at DESC`), so the tail is the OLDEST — take the batch from
+    // there and reverse it back to newest-first for the prompt.
+    const pending = scoreableDocs(docs);
+    const scoreable = pending.slice(Math.max(0, pending.length - MAX_DOCS)).reverse();
     if (!scoreable.length) return { scored: 0, linked: 0, skipped: "nothing-to-score" };
 
     // Resolve each task's assignee to a member so ranking uses the identity mapping, not the raw string

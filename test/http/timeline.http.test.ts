@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { BASE_URL, issueKeyFor, keyHeaders, seedTeam } from "./http-helpers";
-import { ingest } from "../datamechanics/helpers";
+import { db, ingest } from "../datamechanics/helpers";
+import { randomUUID } from "node:crypto";
 
 // HTTP edge of GET /api/v1/timeline (the work-timeline context layer, v1.12): auth, the JSON wire
 // shape ({ window_days, days }), and tier isolation over a real socket — an external-tier key must
@@ -8,14 +9,25 @@ import { ingest } from "../datamechanics/helpers";
 
 const TIMELINE = `${BASE_URL}/api/v1/timeline`;
 
+/** A commit that CITES a task, plus the task itself — evidence linked to no task is omitted from the
+ *  ledger, so an unlinked fixture would produce an empty payload and this suite would pass vacuously. */
 async function seedCommit(seed: Awaited<ReturnType<typeof seedTeam>>, title: string) {
   const at = new Date(Date.now() - 3_600_000).toISOString(); // 1h ago, in the 7-day window
+  const { data: proj } = await db()
+    .from("projects")
+    .insert({ team_id: seed.teamId, slug: `p-${randomUUID().slice(0, 6)}`, name: "P" })
+    .select("id")
+    .single();
+  await db().from("tasks").insert({
+    team_id: seed.teamId, project_id: (proj as { id: string }).id, row_key: "HTTP-1",
+    title: "Wire-shape task", status: "in_progress", assignee: "Tester", origin: "sync", audience: "team",
+  });
   await ingest(seed, {
     path: `commits/x/${title}.md`,
     project: "commits",
     kind: "artifact",
     frontmatter: { source: "git", title, committed_at: at, source_url: "https://example.com/c" },
-    body: `# ${title}`,
+    body: `# ${title} (HTTP-1)`,
     access: "team",
   });
 }
@@ -36,11 +48,17 @@ describe("GET /api/v1/timeline (HTTP)", () => {
     const body = await res.json();
     expect(body.window_days).toBe(7);
     expect(Array.isArray(body.days)).toBe(true);
-    const people = body.days.flatMap((d: { people: unknown[] }) => d.people) as { tasks: unknown[]; other: unknown[] }[];
+    const people = body.days.flatMap((d: { people: unknown[] }) => d.people) as {
+      tasks: { sources: unknown[] }[];
+      unlinked: number;
+    }[];
     expect(people.length).toBeGreaterThan(0);
-    // Pin the v1.12 nested wire shape: each person carries `tasks` + `other` (not the old `sources`).
+    // Pin the wire shape: a person carries `tasks` (each with its nested evidence `sources`) and an
+    // `unlinked` COUNT — not an `other` lane, and not the pre-v1.12 flat `sources`.
     expect(Array.isArray(people[0].tasks)).toBe(true);
-    expect(Array.isArray(people[0].other)).toBe(true);
+    expect(Array.isArray(people[0].tasks[0].sources)).toBe(true); // evidence nests UNDER the task
+    expect(typeof people[0].unlinked).toBe("number");
+    expect((people[0] as Record<string, unknown>).other).toBeUndefined();
     expect((people[0] as Record<string, unknown>).sources).toBeUndefined();
   });
 

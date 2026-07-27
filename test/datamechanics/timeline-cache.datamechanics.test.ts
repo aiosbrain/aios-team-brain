@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { db, ingest, seedTeam, type Seed } from "./helpers";
 import {
@@ -13,13 +14,30 @@ import {
 // read back from Postgres. bustTeamTimeline marks it stale for the next view.
 
 // A git-commit item attributed to the seed member (a real human), dated in-window → one timeline row.
+/** A team carrying the task `seedCommit` cites, so its evidence is RENDERED (unlinked work is omitted).
+ *  The task is EXTERNAL audience deliberately: the tier test must fail on the ITEM's access, not on the
+ *  task being invisible — otherwise it passes even with `visibleItems` deleted. Verified by mutation. */
+async function seedLinkedTeam(): Promise<Seed> {
+  const seed = await seedTeam();
+  const { data: proj } = await db()
+    .from("projects")
+    .insert({ team_id: seed.teamId, slug: `p-${randomUUID().slice(0, 6)}`, name: "P" })
+    .select("id")
+    .single();
+  await db().from("tasks").insert({
+    team_id: seed.teamId, project_id: (proj as { id: string }).id, row_key: "CACHE-1",
+    title: "Cached work", status: "in_progress", assignee: "Tester", origin: "sync", audience: "external",
+  });
+  return seed;
+}
+
 async function seedCommit(seed: Seed, title: string, whenIso: string) {
   return ingest(seed, {
     path: `commits/x/${title}.md`,
     project: "commits",
     kind: "artifact",
     frontmatter: { source: "git", title, committed_at: whenIso, source_url: "https://example.com/c" },
-    body: `# ${title}`,
+    body: `# ${title} (CACHE-1)`,
     access: "team",
   });
 }
@@ -38,14 +56,14 @@ async function readRow(teamId: string, tier: "team" | "external") {
 
 describe("work-timeline cache layer (real Postgres)", () => {
   it("cold miss builds, persists a row, and the cache matches the returned ledger", async () => {
-    const seed = await seedTeam();
+    const seed = await seedLinkedTeam();
     await seedCommit(seed, "shipped-the-thing", recentIso());
 
     const days = await getCachedWorkTimeline(db(), seed.teamId, "team");
-    // The build found the commit → a day with the seed member; unlinked → the "Other" bucket.
+    // The build found the commit → a day with the seed member, nested under the task it cites.
     expect(days.length).toBeGreaterThan(0);
     const people = days.flatMap((d) => d.people);
-    expect(people.some((p) => p.other.some((s) => s.source === "github"))).toBe(true);
+    expect(people.some((p) => p.tasks.some((t) => t.sources.some((s) => s.source === "github")))).toBe(true);
 
     // It persisted the versioned payload { v, days } to the 'team' row, matching what was returned.
     const row = await readRow(seed.teamId, "team");
@@ -60,7 +78,7 @@ describe("work-timeline cache layer (real Postgres)", () => {
   });
 
   it("tier isolation: an external viewer gets no team-tier work and writes a SEPARATE row", async () => {
-    const seed = await seedTeam();
+    const seed = await seedLinkedTeam();
     await seedCommit(seed, "internal-work", recentIso()); // team-tier item
 
     const teamDays = await getCachedWorkTimeline(db(), seed.teamId, "team");
@@ -77,12 +95,12 @@ describe("work-timeline cache layer (real Postgres)", () => {
   });
 
   it("SWR: a stale row is served immediately, and the background rebuild picks up new work", async () => {
-    const seed = await seedTeam();
+    const seed = await seedLinkedTeam();
     await seedCommit(seed, "commit-a", recentIso());
     const first = await getCachedWorkTimeline(db(), seed.teamId, "team"); // cold miss → builds [A], persists
-    // Unlinked commits land in "Other"; count evidence items across tasks + other.
-    const evCount = (people: { tasks: { evidenceCount: number }[]; other: { count: number }[] }[]): number =>
-      people.reduce((n, p) => n + p.tasks.reduce((a, t) => a + t.evidenceCount, 0) + p.other.reduce((a, g) => a + g.count, 0), 0);
+    // Count the RENDERED evidence — task-nested only.
+    const evCount = (people: { tasks: { evidenceCount: number }[] }[]): number =>
+      people.reduce((n, p) => n + p.tasks.reduce((a, t) => a + t.evidenceCount, 0), 0);
     expect(evCount(first.flatMap((d) => d.people))).toBe(1);
 
     // Settle the COLD-MISS path's own background pass (it adds per-person synopses) before going on.
@@ -105,12 +123,12 @@ describe("work-timeline cache layer (real Postgres)", () => {
     // budget is a race, not an assertion (this failed ~1 in 3 on a loaded runner).
     await settleTimelineRefreshes();
     const row = await readRow(seed.teamId, "team");
-    const days = ((row?.payload as { days?: { people: { tasks: { evidenceCount: number }[]; other: { count: number }[] }[] }[] })?.days) ?? [];
+    const days = ((row?.payload as { days?: { people: { tasks: { evidenceCount: number }[] }[] }[] })?.days) ?? [];
     expect(evCount(days.flatMap((d) => d.people))).toBe(2);
   });
 
   it("bustTeamTimeline marks the row stale (computed_at older than the TTL)", async () => {
-    const seed = await seedTeam();
+    const seed = await seedLinkedTeam();
     await seedCommit(seed, "x", recentIso());
     await getCachedWorkTimeline(db(), seed.teamId, "team"); // populate
 

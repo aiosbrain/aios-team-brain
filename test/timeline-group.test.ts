@@ -56,8 +56,8 @@ describe("normalizeSource / dayLabel", () => {
   });
 });
 
-describe("groupTimeline (evidence-gated task → evidence nesting + Other)", () => {
-  it("nests linked evidence under its task; unlinked evidence → Other", () => {
+describe("groupTimeline (evidence-gated task → evidence nesting; unlinked work omitted)", () => {
+  it("nests linked evidence under its task and OMITS unlinked evidence, keeping its count", () => {
     const days = groupTimeline(
       [
         ev({ id: "c1", taskId: "t1", source: "github" }),
@@ -73,7 +73,11 @@ describe("groupTimeline (evidence-gated task → evidence nesting + Other)", () 
     expect(p.tasks[0].taskId).toBe("t1");
     expect(p.tasks[0].evidenceCount).toBe(2);
     expect(p.tasks[0].sources.map((s) => s.source).sort()).toEqual(["github", "notion"]);
-    expect(p.other.map((s) => s.source)).toEqual(["github"]);
+    // The unlinked row is NOT rendered — the card's contract is task → evidence, and a taskless lane
+    // out-competed the tasks for attention in prod (20 unlinked rows against 1 nested).
+    expect(p).not.toHaveProperty("other");
+    expect(p.unlinked).toBe(1); // …but it is still counted, so coverage stays measurable
+    expect(p.total).toBe(2); // total = work the card actually shows
   });
 
   it("EVIDENCE-GATED: an active task with no evidence never appears (no empty headers)", () => {
@@ -94,10 +98,11 @@ describe("groupTimeline (evidence-gated task → evidence nesting + Other)", () 
     expect(days[0].people[0].tasks.map((t) => t.taskId)).toEqual(["t1", "t2"]);
   });
 
-  it("evidence with a dangling/inactive taskId falls back to Other", () => {
+  it("evidence with a dangling/inactive taskId counts as unlinked, and a person with ONLY that is dropped", () => {
+    // A taskId we can't resolve is not a task; with nothing else that day the person has nothing to show,
+    // and an empty card with a name on it is worse than no card.
     const days = groupTimeline([ev({ taskId: "gone", source: "github" })], taskInfo, members, today);
-    expect(days[0].people[0].tasks).toHaveLength(0);
-    expect(days[0].people[0].other[0].source).toBe("github");
+    expect(days).toHaveLength(0);
   });
 
   it("drops evidence for an unknown member", () => {
@@ -106,7 +111,7 @@ describe("groupTimeline (evidence-gated task → evidence nesting + Other)", () 
 
   it("orders people within a day by total evidence desc", () => {
     const days = groupTimeline(
-      [ev({ memberId: "m2", taskId: null }), ev({ memberId: "m1", taskId: "t1" }), ev({ memberId: "m1", taskId: "t1" })],
+      [ev({ memberId: "m2", taskId: "t2" }), ev({ memberId: "m1", taskId: "t1" }), ev({ memberId: "m1", taskId: "t1" })],
       taskInfo,
       members,
       today
@@ -161,12 +166,13 @@ describe("signals lane — decisions are SIGNAL: shown, never counted as work", 
     ...over,
   });
 
-  it("a decision lands in `signals`, not tasks/other, and does NOT enter the work total", () => {
-    const days = groupTimeline([ev({ memberId: "m1", source: "github" })], taskInfo, members, today, undefined, [sig({})]);
+  it("a decision lands in `signals`, not tasks, and does NOT enter the work total", () => {
+    // Task-linked so the person has visible work; the decision must not inflate its count.
+    const days = groupTimeline([ev({ memberId: "m1", taskId: "t1", source: "github" })], taskInfo, members, today, undefined, [sig({})]);
     const p = days[0].people.find((x) => x.memberId === "m1")!;
     expect(p.total).toBe(1); // the commit only — the decision is NOT counted
     expect(p.signals.flatMap((g) => g.items).map((s) => s.title)).toEqual(["picked Postgres"]);
-    expect(p.other.flatMap((g) => g.items).map((i) => i.title)).not.toContain("picked Postgres");
+    expect(p.tasks.flatMap((t) => t.sources).flatMap((g) => g.items).map((i) => i.title)).not.toContain("picked Postgres");
   });
 
   it("a person with ONLY signals appears (total 0) but summaryPromptFor ignores signals (no work-synopsis leak)", () => {
@@ -180,7 +186,7 @@ describe("signals lane — decisions are SIGNAL: shown, never counted as work", 
 
 describe("mostRecentPerPerson skips signal-only days (Home 'Working on' is about WORK)", () => {
   it("a decision-only later day never displaces a person's real most-recent-work day", () => {
-    const workMon = groupTimeline([ev({ memberId: "m1", at: "2026-07-20T09:00:00Z", source: "github" })], taskInfo, members, "2026-07-22");
+    const workMon = groupTimeline([ev({ memberId: "m1", taskId: "t1", at: "2026-07-20T09:00:00Z", source: "github" })], taskInfo, members, "2026-07-22");
     const sigWed = groupTimeline([], taskInfo, members, "2026-07-22", undefined, [{ id: "d1", memberId: "m1", kind: "decision", title: "a call", at: "2026-07-22" }]);
     const days: TimelineDay[] = [...sigWed, ...workMon]; // Wed (signal-only) is newer
     const out = mostRecentPerPerson(days);

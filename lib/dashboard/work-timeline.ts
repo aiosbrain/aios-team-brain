@@ -4,6 +4,7 @@ import { resolvePositiveInt } from "@/lib/util/env";
 import type { DbClient } from "@/lib/db/types";
 import { visibleItems, visibleTasks, visibleDecisions, type ViewerTier } from "@/lib/auth/visibility";
 import { commitSubject } from "./team-work";
+import { sourceRules } from "@/lib/ingest/source-rules";
 import { subjectMatchesMember, type RosterPerson } from "./people-match";
 import {
   groupTimeline,
@@ -346,9 +347,10 @@ export async function getWorkTimeline(
     // the issue's own key, so admitting it as evidence would let every assigned ticket self-satisfy
     // the evidence gate and turn the timeline back into a backlog dump (the property "never the whole
     // backlog" exists to prevent). The ticket already appears as a TASK; real work on it arrives as
-    // commits/docs that cite the key. (These docs are dated for the GRAPH's sake — see the linear/plane
-    // normalizers — so this exclusion is what keeps the timeline's behavior unchanged.)
-    if (str(fm.identifier) && (source === "linear" || source === "plane")) continue;
+    // commits/docs that cite the key. WHICH sources those are is a FACT ABOUT THE SOURCE
+    // (`emitsTicketDocuments`), not a list of tracker names here — the brain is self-hosted per org and
+    // the next one's tracker must work without editing this file. Guarded.
+    if (str(fm.identifier) && sourceRules(source).emitsTicketDocuments) continue;
     const memberId = primaryOf(r);
     if (!memberId || !members.has(memberId)) continue;
     const at = isoOrNull(r.work_at);
