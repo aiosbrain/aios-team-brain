@@ -5,7 +5,7 @@ import type { DbClient } from "@/lib/db/types";
 import { visibleItems, visibleTasks, visibleDecisions, type ViewerTier } from "@/lib/auth/visibility";
 import { commitSubject } from "./team-work";
 import { sourceRules } from "@/lib/ingest/source-rules";
-import { subjectMatchesMember, type RosterPerson } from "./people-match";
+import { decisionActors, type RosterPerson } from "./people-match";
 import {
   groupTimeline,
   normalizeSource,
@@ -540,21 +540,22 @@ export async function getWorkTimeline(
     if (!d.decided_at) continue; // no day to place it on (mirrors the undated-work drop)
     const by = (d.decided_by ?? "").trim();
     if (!by) continue; // empty / group-level decided_by → dropped (a later team-signal lane's job)
-    // MULTI-person decided_by ("Chetan + John", "A & B", "Dana and Lee") → drop: crediting one is wrong,
-    // and `subjectMatchesMember` folds "Chetan + John" onto a bare-first-name member (would falsely match 1).
-    if (/[+&,/]|\band\b/i.test(by)) continue;
-    // Attribute to a member — but DROP on AMBIGUOUS (≥2 roster matches) or NO match: never guess.
-    const matched = roster.filter((p) => subjectMatchesMember(by, p));
-    if (matched.length !== 1) continue;
-    signals.push({
-      id: d.id,
-      memberId: matched[0].memberId,
-      kind: "decision",
-      title: d.title || "(untitled decision)",
-      at: d.decided_at.slice(0, 10), // bare YYYY-MM-DD — rendered with no time
-      url: d.source_item_id ? `/library/${d.source_item_id}` : undefined,
-      stillValid: d.still_valid ?? true,
-    });
+    // EVERY member named, not just a lone one. A joint or qualified `decided_by` used to be dropped
+    // outright, which hid 48% of prod's decision log — and hid precisely the calls two people made
+    // TOGETHER. A decision appears in each named person's day, the same way a Slack thread credits each
+    // participant; an unmatched or ambiguous fragment still contributes nothing.
+    const actorIds = decisionActors(by, roster);
+    for (const memberId of actorIds) {
+      signals.push({
+        id: actorIds.length > 1 ? `${d.id}:${memberId}` : d.id, // unique per person-row, like Slack's
+        memberId,
+        kind: "decision",
+        title: d.title || "(untitled decision)",
+        at: d.decided_at.slice(0, 10), // bare YYYY-MM-DD — rendered with no time
+        url: d.source_item_id ? `/library/${d.source_item_id}` : undefined,
+        stillValid: d.still_valid ?? true,
+      });
+    }
   }
 
   return groupTimeline(evidence, taskInfo, members, todayISO, undefined, signals);

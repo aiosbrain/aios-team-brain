@@ -14,10 +14,17 @@ jobs:
   work-key:
     name: PR references a brain task
     runs-on: ubuntu-latest
+    env:
+      AIOS_BRAIN_URL: ${{ secrets.AIOS_BRAIN_URL }}
+      AIOS_API_KEY: ${{ secrets.AIOS_API_KEY }}
+      AIOS_TEAM: ${{ secrets.AIOS_TEAM }}
     steps:
       - name: Check for an AIOS work-key
         run: |
           node <<'NODE'
+          // Wrapped in an async IIFE: this heredoc runs as CommonJS, where top-level `await` is a
+          // syntax error. A `.catch` keeps the job advisory — an unexpected throw must not fail a PR.
+          (async () => {
           const fs = require("node:fs");
           const ev = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, "utf8"));
           const pr = ev.pull_request || {};
@@ -31,8 +38,41 @@ jobs:
           const re = /\b(?:AIOS-Work:\s*)?([A-Z][A-Z0-9]+-\d+|[A-Z]\d+(?:\.\d+)*)\b/g;
           const keys = [...new Set([...text.matchAll(re)].map((m) => m[1]))];
           if (keys.length) {
-            console.log(`Found work key(s): ${keys.join(", ")} — merge will advance the matching brain task to Done.`);
+            console.log(`Found work key(s): ${keys.join(", ")}`);
+            // A key that matches the PATTERN is not a key that EXISTS. Every PR in one recent session
+            // carried an invented `AIO-48x` that no task had: the work looked tracked, this check went
+            // green, and none of it could ever link to a task on the timeline. Shape alone is not a
+            // check, so ask the brain whether the key is real.
+            const brain = process.env.AIOS_BRAIN_URL;
+            const key = process.env.AIOS_API_KEY;
+            const team = process.env.AIOS_TEAM;
+            if (!brain || !key || !team) {
+              console.log("::warning title=Work key not verified::brain credentials not configured — only the FORMAT was checked.");
+            } else {
+              const res = await fetch(`${brain.replace(/\/$/, "")}/api/v1/tasks?all=1`, {
+                headers: { Authorization: `Bearer ${key}`, "X-AIOS-Team": team },
+              });
+              if (!res.ok) {
+                // Couldn't ask ≠ the key is fake. Advisory job, so never fail on OUR outage.
+                console.log(`::warning title=Work key not verified::brain returned ${res.status} — only the FORMAT was checked.`);
+              } else {
+                const body = await res.json();
+                const rows = Array.isArray(body) ? body : (body.tasks ?? body.data ?? []);
+                const known = new Set(rows.map((t) => String(t.row_key ?? t.rowKey ?? "")).filter(Boolean));
+                const invented = keys.filter((k) => !known.has(k));
+                if (invented.length) {
+                  console.log(
+                    `::warning title=Work key does not exist::${invented.join(", ")} matches the key format but ` +
+                      `no task in the brain has it, so this work will link to nothing on the timeline. ` +
+                      `Use a real key or create the task. (${known.size} task keys checked.)`
+                  );
+                } else {
+                  console.log(`All work key(s) exist in the brain — merge will advance the matching task(s) to Done.`);
+                }
+              }
+            }
           } else {
             console.log("::warning title=No brain task linked::This PR has no AIOS work-key (e.g. `AIOS-Work: W2.5.8`). Merge won't auto-close a task in Linear. If this work should be tracked, link or create a brain task first. (Advisory — not blocking.)");
           }
+          })().catch((err) => console.log(`::warning title=Work-key check errored::${err && err.message}`));
           NODE

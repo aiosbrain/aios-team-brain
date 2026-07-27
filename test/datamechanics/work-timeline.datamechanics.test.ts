@@ -399,7 +399,7 @@ describe("work timeline — attribution oracle (credits the worker, not the reas
     expect(extSignals).not.toContain("chose Postgres over the graph"); // team-audience → not leaked
   });
 
-  it("SIGNAL: drops an AMBIGUOUS or MULTI-person decided_by (never credits the wrong person)", async () => {
+  it("SIGNAL: credits EVERY resolvable decider, and never guesses on an ambiguous one", async () => {
     const seed = await seedTeam(); // member "Tester"
     const addMember = (name: string) =>
       db().from("members").insert({
@@ -415,14 +415,22 @@ describe("work timeline — attribution oracle (credits the worker, not the reas
         title: "decision", decided_at: recentIso.slice(0, 10), decided_by: "Tester", audience: "team", ...over,
       });
     await dec({ title: "ambiguous first name", decided_by: "Tester" }); // matches Tester + Tester Two → dropped
-    await dec({ title: "a joint call", decided_by: "Tester + Dana Rivers" }); // multi-person → dropped
+    // A JOINT call: "Tester" is still ambiguous and contributes nothing, but Dana resolves — so the
+    // decision lands in Dana's day instead of vanishing. Dropping these hid 48% of prod's decision log,
+    // and specifically the calls two people made together.
+    await dec({ title: "a joint call", decided_by: "Tester + Dana Rivers" });
     await dec({ title: "unambiguous", decided_by: "Dana Rivers" }); // one distinct match → attributed
 
     const days = await getWorkTimeline(db(), seed.teamId, "team");
     const signalTitles = days.flatMap((d) => d.people).flatMap((p) => p.signals.flatMap((g) => g.items.map((i) => i.title)));
-    expect(signalTitles).not.toContain("ambiguous first name"); // ≥2 roster matches → dropped
-    expect(signalTitles).not.toContain("a joint call"); // multi-person separator → dropped
+    expect(signalTitles).not.toContain("ambiguous first name"); // ≥2 roster matches → still dropped
+    expect(signalTitles).toContain("a joint call"); // the resolvable half is credited, not discarded
     expect(signalTitles).toContain("unambiguous"); // one distinct match → kept (non-vacuous)
+
+    // …and the ambiguous name is NOT credited: the joint call appears only in Dana's day.
+    const dayOf = (title: string) =>
+      days.flatMap((d) => d.people).filter((p) => p.signals.some((g) => g.items.some((i) => i.title === title)));
+    expect(dayOf("a joint call").map((p) => p.name)).toEqual(["Dana Rivers"]);
   });
 });
 

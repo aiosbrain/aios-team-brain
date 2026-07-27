@@ -50,3 +50,40 @@ export function subjectMatchesMember(subject: string, person: RosterPerson): boo
   // surname, require full equality (already checked above → false here) to avoid surname collisions.
   return sTokens.length === 1 || dnTokens.length === 1;
 }
+
+/**
+ * Every roster member named in a `decisions.decided_by` string.
+ *
+ * Written because the timeline DROPPED anything that wasn't exactly one name. Prod: 27 of 56 decisions
+ * (48%) carry a joint or qualified attribution — `"John Ellison & Chetan"`, `"Chetan (agreed by John)"`,
+ * `"John Ellison (fix by Fable)"` — so nearly half the decision log was invisible on the timeline, and
+ * silently: the decisions two people made TOGETHER were exactly the ones that vanished.
+ *
+ * Crediting one of them would have been wrong (whose day does a joint call belong in?), which is why the
+ * old code refused — but the answer is BOTH, the same way a Slack thread credits every participant. So
+ * the string is split on the separators that mean "and also", role prefixes are stripped (`agreed by
+ * Chetan` → `Chetan`), and each fragment is matched independently.
+ *
+ * Conservative in the same direction as before: a fragment that matches no member (an AI agent, an
+ * outside party) contributes nothing, and a fragment matching TWO members is ambiguous and contributes
+ * nothing — never a guess. Order is the order named, so the first is the primary decider. Pure.
+ */
+export function decisionActors(decidedBy: string, roster: readonly RosterPerson[]): string[] {
+  // `&`, `+`, `/`, `,`, ` and ` all mean "and also"; parentheses delimit a qualifying clause whose
+  // CONTENT still names a person ("(agreed by Chetan)"), so they are separators, not deletions.
+  const fragments = (decidedBy ?? "")
+    .split(/[&+,/()]|\band\b/i)
+    .map((f) =>
+      // Role prefixes: keep the person, drop the verb.
+      f.replace(/^\s*(agreed|approved|confirmed|proposed|reviewed|fixed|fix|prompted|suggested)\s+by\s+/i, "").trim()
+    )
+    .filter(Boolean);
+
+  const out: string[] = [];
+  for (const fragment of fragments) {
+    const matched = roster.filter((p) => subjectMatchesMember(fragment, p));
+    if (matched.length !== 1) continue; // no match, or ambiguous → contribute nothing
+    if (!out.includes(matched[0].memberId)) out.push(matched[0].memberId);
+  }
+  return out;
+}
