@@ -40,6 +40,9 @@ export function startIngestScheduler(): void {
     // Recompute the persisted task↔evidence links (which items are the work behind each task) so
     // surfaces beyond the timeline (Query/CLI) can read them. Best-effort, per team; cheap when quiet.
     await runTaskEvidenceLinking(db);
+    // Then the LOWER-confidence half: ask the model which UNLINKED docs belong to which task. Sequenced
+    // AFTER the deterministic pass so a doc that just gained a real issue-key link is never scored.
+    await runDocTaskInference(db);
     // Incremental dense (semantic) indexing of newly-synced items. No-op unless dense retrieval is
     // configured (EMBEDDINGS_URL + pgvector schema); best-effort — never fails the tick. A batch where
     // items were SCANNED but all FAILED (e.g. embeddings quota/outage) records an ERROR run so the
@@ -270,6 +273,24 @@ export function startIngestScheduler(): void {
       }
     } catch (err) {
       console.error("[ingest] task-evidence linking tick failed:", err instanceof Error ? err.message : err);
+    }
+  }
+
+  // LLM doc→task assignment: the docs a deterministic issue-key match can never catch (a design doc
+  // rarely cites AIO-494). Per team, ONE batched call, and it short-circuits before spending anything
+  // when the team has no model configured or its inputs are unchanged since the last run. Unlike the
+  // deterministic sibling above this IS recorded to ingest_runs — it spends money, and the recorded
+  // `meta.inputs_hash` is also what makes the skip work. Best-effort; never fails the tick.
+  async function runDocTaskInference(db: ReturnType<typeof adminClient>): Promise<void> {
+    try {
+      const { runDocTaskInference: runOne } = await import("@/lib/dashboard/doc-task-infer-run");
+      const { data: teams } = await db.from("teams").select("id");
+      for (const t of ((teams ?? []) as { id: string }[])) {
+        const r = await runOne(db, t.id); // best-effort; never throws
+        if (r.linked) console.info(`[ingest] doc-task-infer: linked ${r.linked}/${r.scored} for team ${t.id}`);
+      }
+    } catch (err) {
+      console.error("[ingest] doc-task inference tick failed:", err instanceof Error ? err.message : err);
     }
   }
 

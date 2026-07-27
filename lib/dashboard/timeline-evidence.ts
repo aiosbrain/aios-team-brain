@@ -3,12 +3,14 @@ import type { DbClient } from "@/lib/db/types";
 import { computeTaskLinks } from "./issue-ref";
 
 /**
- * The sole writer of `task_evidence` — persists the deterministic task↔evidence links (which items are
+ * ONE OF TWO writers of `task_evidence` — persists the DETERMINISTIC task↔evidence links (which items are
  * the actual work behind a task, by issue-key reference) for surfaces BEYOND the timeline (Query/CLI:
  * "what work went into AIO-123?"). Links ALL tasks (not just active ones) — a query surface must still
  * answer for a ticket that later went Done, unlike the timeline DISPLAY which links active tasks only.
  * The pure link core is `computeTaskLinks` (lib/dashboard/issue-ref). An LLM grouping pass
- * (method='llm') is a later, lower-confidence addition.
+ * (`method='llm'`) is the other writer, `lib/dashboard/doc-task-infer-run`. The two are safe together
+ * ONLY because each prunes exclusively its own `method` — widening either delete would wipe the other's
+ * edges on the next tick. Build-enforced by `test/guards/single-writer-task-evidence`.
  */
 
 const LINK_TASK_LIMIT = 5000;
@@ -17,8 +19,8 @@ const LINK_ITEM_LIMIT = 4000;
 /**
  * Recompute + persist `task_evidence` for a team from deterministic issue-key references. Fetches the
  * team's issue-shaped tasks + recent items, computes links, and REPLACES this team's `issue_ref` edges
- * (delete-then-insert, so a removed reference prunes). Leaves `llm`/`manual` edges untouched. Sole
- * writer of `task_evidence`. Best-effort — never throws (the scheduler must not fail on this).
+ * (delete-then-insert, so a removed reference prunes). Leaves `llm`/`manual` edges untouched.
+ * Best-effort — never throws (the scheduler must not fail on this).
  *
  * Text source per item mirrors the timeline builder (the pg adapter's `.select` can't do `left(body,n)`,
  * and full doc bodies are large): a git commit's issue key lives in its BODY (small — fetched), every
@@ -58,9 +60,11 @@ export async function linkTaskEvidence(db: DbClient, teamId: string): Promise<{ 
       .map((r) => ({ id: r.id, text: `${(r.frontmatter?.title as string) ?? ""}\n${r.path ?? ""}` }));
     const links = computeTaskLinks(tasks, [...gitItems, ...otherItems]);
 
-    // Replace this team's deterministic edges: drop all issue_ref rows, re-insert the current set. If the
+    // Replace this team's deterministic edges: drop all issue_ref rows, re-insert the current set. The
+    // `method` filter is load-bearing — it is what keeps this writer from wiping the LLM pass's edges. If the
     // delete errored, skip the insert so we don't append duplicates onto a stale set (best-effort; the
-    // next tick reconverges). Non-transactional is acceptable while nothing reads the table yet.
+    // next tick reconverges). Non-transactional: a reader can briefly see this team's issue_ref edges
+    // mid-replace and lose a link for one build — acceptable for a regenerable cache the next tick fixes.
     const del = await db.from("task_evidence").delete().eq("team_id", teamId).eq("method", "issue_ref");
     if (del.error) return { linked: 0 };
     const rows: { team_id: string; task_id: string; item_id: string; method: string; confidence: number }[] = [];

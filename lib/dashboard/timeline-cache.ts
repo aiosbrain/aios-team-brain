@@ -36,12 +36,29 @@ const TTL_MS = 5 * 60_000; // 5-min freshness; the ledger is cheap, so refresh o
 // v6: a referenced task now heads its own group whatever its status. The SHAPE is unchanged, but the
 // MEANING is: a v5 row would keep serving the old "Other · not linked to a task" grouping (with its
 // self-contradicting chips) for a full TTL after deploy. Same rule as v5 — bump on a meaning change.
-export const PAYLOAD_VERSION = 6;
+// v7: evidence can now be linked by the LLM doc→task pass (`linkVia:"inferred"`). A v6 row would keep
+// serving those docs in "Other" for a full TTL after deploy — same meaning-change rule as v5/v6.
+export const PAYLOAD_VERSION = 7;
 
 /** The timeline WITH the per-person-day synopsis attached. Runs the (up to 7d × roster) best-effort LLM
  *  calls — so it's used ONLY on the BACKGROUND refresh path, never inline on a request (a cold miss
  *  returns the pure ledger fast and schedules this). Never in the raw builder the data-mechanics tier calls. */
 async function buildTimeline(db: DbClient, teamId: string, tier: ViewerTier): Promise<TimelineDay[]> {
+  // Refresh the INFERRED doc→task links first, so anything new lands in the payload we're about to write
+  // rather than one cycle later. This is the VIEW-DRIVEN trigger: a rebuild happens because somebody
+  // looked, which is exactly when an inference is worth paying for — an unread team's timeline shouldn't
+  // spend anything. The pass enforces its OWN cooldown against the last recorded run (shared with the
+  // scheduler's clock, so the two triggers can't double-charge) and is a cheap indexed no-op otherwise.
+  //
+  // Deliberately only on this BACKGROUND path — never the cold-miss request path, whose whole job is to
+  // return the pure ledger fast. Imported lazily so the LLM pass isn't pulled into modules that only read
+  // the cache, and fully swallowed: a rebuild must never fail because an inference did.
+  try {
+    const { runDocTaskInference } = await import("./doc-task-infer-run");
+    await runDocTaskInference(db, teamId);
+  } catch (err) {
+    console.warn("[timeline] doc-task inference skipped:", err instanceof Error ? err.message : err);
+  }
   return attachPersonDaySummaries(db, teamId, await getWorkTimeline(db, teamId, tier));
 }
 

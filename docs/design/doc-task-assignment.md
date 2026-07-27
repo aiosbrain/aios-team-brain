@@ -1,6 +1,6 @@
 # Attributing documents to the task they belong to (LLM assignment)
 
-**Status:** design v2 (pre-build). v1 proposed a GitHub-file work-time change as a prerequisite; **measuring
+**Status:** SHIPPED (design v3 → built). v1 proposed a GitHub-file work-time change as a prerequisite; **measuring
 prod killed that** — see "What I got wrong". **Ask:** "when attributing different types of documents to
 different Linear tasks, you're going to need to do an LLM-based assignment by looking at the content of the
 document to see which Linear tasks are assigned to the person, and which doc is most appropriate or none at
@@ -169,3 +169,44 @@ deliberately excluded — see below.
 - Inferring links for **commits** — the deterministic key plus #377's PR inheritance already cover them.
 - Linear/Plane mirror "deliverables" — PM rows, not authored documents.
 - Changing the active-only nesting rule; `KEY_RE` junk-key tightening.
+
+## Build notes (as shipped)
+
+Built with these decisions — including two deliberate deviations from the spec above:
+
+- **Idempotency store:** the inputs hash lives on the recorded `ingest_runs.meta.inputs_hash` for
+  `source='doc_task_infer'` — no new table, and the same row that proves the run happened is what makes the
+  skip work. A FAILED run's hash is ignored, so a failure never suppresses the retry.
+- **Attribution:** the doc's worker resolves through `resolveItemCreditIds` **strict, with no raw
+  `member_id` fallback**. A fallback would rank against a second opinion about who did the work — exactly
+  the drift `test/guards/attribution-single-source` exists to prevent — so an oracle failure aborts the
+  tick instead (background pass: spending nothing beats disagreeing with the timeline).
+- **The model never sees a real id.** Docs and tasks are relabelled to synthetic `D1`/`T1` refs; we map
+  them back. A hallucinated ref resolves to nothing, which is a stronger guarantee than validating UUIDs
+  after the fact — and `applyInferredLinks` still validates both sides as defence in depth.
+- **Confidence gate is applied twice** — writer AND reader — but NOT as specced. The design said
+  below-threshold answers would be PERSISTED as an audit trail and filtered on read; as built,
+  `applyInferredLinks` drops them before the write, so nothing sub-threshold reaches the table via the pass.
+  The read-side gate is therefore **defence in depth** against every other way an `llm` row can appear (a
+  backfill, a manual insert, a row written when the threshold was lower), not a filter on the writer's own
+  output. Persisting the audit trail remains a cheap follow-up if the model's near-misses turn out to be
+  worth inspecting.
+- **`bustTeamLearningCaches` was NOT extended** (the design's build-loop checklist asked for it). Analysed
+  and deliberately skipped: inferred edges are (task, item) CONTENT links, and the inputs hash covers
+  neither `memberId` nor attribution — so a re-attribution neither invalidates nor should refresh them (a
+  re-credited doc keeps its link and the timeline simply re-files it under the new worker). Revisit if the
+  inference ever becomes person-dependent.
+- **Commits are excluded from scoring:** their own message and their PR already resolve deterministically
+  (#377), so an inference could only be worse than what the timeline already has.
+- **Two triggers, one clock (added after the first build).** Running on every 30-minute scheduler tick was
+  the wrong cadence to pay a model at — inferences only need to be as fresh as somebody's reading of them,
+  and the underlying docs change on the order of days. The pass is now ALSO offered by the timeline's
+  background rebuild (a page view), and BOTH triggers share a per-team **cooldown**
+  (`DOC_TASK_INFER_INTERVAL_HOURS`, default 12h) measured from the last recorded run's `finished_at`. No new
+  state: `ingest_runs` already persists that timestamp, so whichever trigger fires first resets the timer
+  for the other and they cannot double-charge. The cooldown is the FIRST gate — one indexed query, ahead of
+  key resolution and any item scan — and a FAILED run starts it too, so a broken provider isn't retried
+  every tick. Net effect: a team that nobody looks at spends nothing, and an actively-read team pays at
+  most twice a day.
+- **Metering reuses the `timeline-summary` `LlmUsageSource` slice** rather than widening that closed union
+  — the same call the arcs coherence pass makes by reusing `"arcs"`.

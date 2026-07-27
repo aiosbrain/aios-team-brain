@@ -50,9 +50,8 @@ describe("work-timeline cache layer (real Postgres)", () => {
     // It persisted the versioned payload { v, days } to the 'team' row, matching what was returned.
     const row = await readRow(seed.teamId, "team");
     expect(row?.group_key).toBe("team");
-    // v6: a referenced task heads its own group whatever its status — a v5 row would serve the old
-    // "Other · not linked to a task" grouping for a full TTL.
-    expect((row?.payload as { v: number; days: unknown[] }).v).toBe(6);
+    // v7: inferred (LLM) links join the ledger — a v6 row would keep serving those docs in "Other".
+    expect((row?.payload as { v: number; days: unknown[] }).v).toBe(7);
     expect((row?.payload as { days: unknown[] }).days.length).toBe(days.length);
 
     // readTimelineCache round-trips it.

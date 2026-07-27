@@ -29,7 +29,10 @@ const REFS_MEMBER_ID = /member_id/;
 //     evidence-gated credit), and the oracle-fallback — all legitimate.
 //   • human-actors.ts — pre-existing owner-based event attribution (feeds /api/brain/events). Documented
 //     exception; migrating it onto the oracle is a tracked fast-follow.
-const ALLOW = ["lib/dashboard/work-timeline.ts", "lib/graph/human-actors.ts"];
+//   • doc-task-infer-run.ts — attributes via `resolveItemCreditIds` (STRICT, no raw fallback). Its
+//     remaining `member_id` refs are the not-null query prefilter and the row shape it FEEDS the oracle
+//     as input — never a second opinion about who did the work.
+const ALLOW = ["lib/dashboard/work-timeline.ts", "lib/graph/human-actors.ts", "lib/dashboard/doc-task-infer-run.ts"];
 
 const posix = (f: string): string => f.replaceAll("\\", "/");
 const stripComments = (src: string): string =>
