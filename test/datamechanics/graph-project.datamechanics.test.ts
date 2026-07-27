@@ -2,7 +2,13 @@ import { describe, expect, it } from "vitest";
 import type { GraphitiClient, GraphEpisode, GraphEpisodeRef } from "@/lib/graph/graphiti-client";
 import { projectSlackToGraph, projectItemsToGraph, deleteItemEpisodes, CHUNK_CHARS, MAX_EPISODE_CHUNKS, GROUP_SCAN_DEPTH } from "@/lib/graph/project";
 import { runGraphProjection } from "@/lib/graph/run";
-import { reconcileProjectedEpisodes, LANDED_SCAN_DEPTH } from "@/lib/graph/reconcile";
+import {
+  reconcileProjectedEpisodes,
+  LANDED_SCAN_DEPTH,
+  GRACE_MS,
+  LANDED_GRACE_MS,
+  REQUEUE_MAX_PER_PASS,
+} from "@/lib/graph/reconcile";
 import { purgeItemsByPathPrefix } from "@/lib/ingest/purge";
 import { db, ingest, seedTeam } from "./helpers";
 
@@ -703,6 +709,96 @@ describe("tier reclassification cleanup is durable across a failed inline delete
     const last = await reconcileProjectedEpisodes(db(), client(fake), seed.teamId);
     expect(last.pendingCleanups).toBe(0);
     expect(await fake.listEpisodes(teamGroup)).toHaveLength(1); // only the sanitized content survives
+  });
+
+  it("does not judge a row younger than the PROJECTION INTERVAL (H7's feedback loop)", async () => {
+    // The amplifier. The grace was 5 minutes against a queue whose drain rate is LLM-bound: a backlog
+    // deeper than that made reconcile read every still-queued episode as "never landed", delete its
+    // ledger row, and hand it back to the projector — which re-pushed it, deepening the very backlog
+    // that caused the misjudgement. Positive feedback, and a large backfill trips it deterministically.
+    //
+    // Re-queuing sooner than the projector's own interval buys nothing anyway (the row can't be
+    // re-pushed until that tick), so the grace is at least one full projection cycle. That removes the
+    // loop for almost no healing latency — "almost" because phase offset can push a genuinely crashed
+    // episode to the cycle after next.
+    const seed = await seedTeam();
+    const slug = await teamSlugFor(seed.teamId);
+    await ingest(seed, { kind: "deliverable", path: "docs/spec.md", body: "the spec", access: "team" });
+
+    const fake = new FakeGraphiti();
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(fake) });
+    fake.store.clear(); // the group reads empty, exactly as a queued-but-unextracted push does
+
+    // Older than the old 5-min grace, younger than one projection cycle — the window where the loop
+    // used to live. Asserted rather than assumed: with a short GRAPH_PROJECT_MINUTES the two graces
+    // coincide and there'd be no such window, which would make the test below vacuously green.
+    const ageMs = GRACE_MS + 60_000;
+    expect(ageMs).toBeGreaterThan(GRACE_MS);
+    expect(ageMs).toBeLessThan(LANDED_GRACE_MS);
+    const between = new Date(Date.now() - ageMs).toISOString();
+    await db().from("graph_episodes").update({ projected_at: between }).eq("team_id", seed.teamId);
+
+    const res = await reconcileProjectedEpisodes(db(), client(fake), seed.teamId);
+    expect(res.reQueued).toBe(0); // still within one projection cycle — not yet evidence of a crash
+    const { data } = await db().from("graph_episodes").select("id").eq("team_id", seed.teamId);
+    expect((data ?? []).length).toBe(1); // the ledger row survives
+  });
+
+  it("THROTTLES re-queues: many absent rows at once is a backlog, not many crashed workers", async () => {
+    // The blast-radius cap. One crashed worker loses one episode; a wedged queue or an outage makes
+    // EVERY row look absent at once. Re-queuing all of them is what turns an incident into a re-push
+    // storm, so a pass that wants to re-queue more than the cap does the cap and reports the rest —
+    // the ledger rows survive for the next pass, and nothing is lost.
+    // The cap is passed EXPLICITLY rather than read from `REQUEUE_MAX_PER_PASS`. Sizing the fixture off
+    // the env-derived constant means the seed count grows with the knob — and a large value turns this
+    // into a multi-thousand-row ingest (or, if a mutation sets it to MAX_SAFE_INTEGER, an unbounded
+    // loop that times out instead of failing on behaviour). A small explicit cap tests the same branch.
+    const cap = 3;
+    const overBy = 2;
+    const seed = await seedTeam();
+    const slug = await teamSlugFor(seed.teamId);
+    for (let i = 0; i < cap + overBy; i++) {
+      await ingest(seed, { kind: "deliverable", path: `docs/d${i}.md`, body: `doc ${i}`, access: "team" });
+    }
+    const fake = new FakeGraphiti();
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(fake) });
+    fake.store.clear(); // the whole group reads empty — a wedge, not N independent crashes
+    await db()
+      .from("graph_episodes")
+      .update({ projected_at: "2020-01-01T00:00:00Z" })
+      .eq("team_id", seed.teamId);
+
+    const res = await reconcileProjectedEpisodes(db(), client(fake), seed.teamId, cap);
+    expect(res.reQueued).toBe(cap);
+    expect(res.requeueThrottled).toBe(overBy); // reported, not silently dropped
+    const { data } = await db().from("graph_episodes").select("id").eq("team_id", seed.teamId);
+    expect((data ?? []).length).toBe(overBy); // the un-judged rows are still there for the next pass
+
+    // …and the DEFAULT path throttles too. Without this the spec above only ever exercises a parameter
+    // production never passes: a regression that unbound the default from the constant — or set it to
+    // Infinity — would keep every assertion above green while the real call path had no cap at all. So
+    // this half runs with NO cap argument and must see the constant bite.
+    //
+    // Bounding the fixture on the constant is what made the earlier version of this test explode under a
+    // MAX_SAFE_INTEGER mutation, so the size is asserted sane BEFORE it's used as a loop bound.
+    expect(Number.isInteger(REQUEUE_MAX_PER_PASS)).toBe(true);
+    expect(REQUEUE_MAX_PER_PASS).toBeGreaterThanOrEqual(1);
+    expect(REQUEUE_MAX_PER_PASS).toBeLessThanOrEqual(1000);
+    const fresh = await seedTeam();
+    const freshSlug = await teamSlugFor(fresh.teamId);
+    for (let i = 0; i < REQUEUE_MAX_PER_PASS + 1; i++) {
+      await ingest(fresh, { kind: "deliverable", path: `docs/e${i}.md`, body: `doc ${i}`, access: "team" });
+    }
+    const fake2 = new FakeGraphiti();
+    await projectItemsToGraph(db(), { teamId: fresh.teamId, teamSlug: freshSlug, client: client(fake2) });
+    fake2.store.clear();
+    await db()
+      .from("graph_episodes")
+      .update({ projected_at: "2020-01-01T00:00:00Z" })
+      .eq("team_id", fresh.teamId);
+    const dflt = await reconcileProjectedEpisodes(db(), client(fake2), fresh.teamId);
+    expect(dflt.reQueued).toBe(REQUEUE_MAX_PER_PASS);
+    expect(dflt.requeueThrottled).toBe(1); // one over the default cap — pinned, not merely "under it"
   });
 
   it("a landed-check on a SATURATED group re-queues nothing and reports the saturation", async () => {

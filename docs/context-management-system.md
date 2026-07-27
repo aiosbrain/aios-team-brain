@@ -188,8 +188,21 @@ identity resolution) can disagree with a human's deliberate correction. The reso
 - **Task-row validation before any item mutation** (`index.ts:172`): self-parent, missing parent, and
   parent-cycle checks run *before* the item is touched, so a 422 never leaves a half-written item/version.
 - **Never-landed episode reconcile** (`lib/graph/reconcile.ts`): optimistically-recorded episodes are
-  checked against Graphiti after a `GRACE_MS = 5min` window; a row whose chunks never landed is
-  **deleted so the next run re-pushes** (self-healing); Graphiti unreachable this pass → left alone.
+  checked against Graphiti after `LANDED_GRACE_MS`; a row whose chunks never landed is **deleted so the
+  next run re-pushes** (self-healing); Graphiti unreachable this pass → left alone. The grace is
+  `max(5min, one projection cycle)` — **not** a flat 5 minutes (Pass-1 review H7). Graphiti's queue
+  drains at LLM speed, so any backlog deeper than the grace made reconcile read every *still-queued*
+  episode as never-landed, re-push it, and thereby deepen the backlog that caused the misjudgement —
+  positive feedback that a large backfill trips deterministically. Waiting a full cycle costs almost no
+  healing latency, since a re-queued row can't be re-pushed before the projector's next run anyway — the
+  exceptions being phase offset (~2 cycles worst case) and the admin "Project to graph" action, which no
+  longer doubles as a 5-minute manual heal. Two further
+  bounds: the per-pass re-queue cap (`GRAPH_REQUEUE_MAX_PER_PASS`, default 20/team — many rows absent at
+  once is evidence about the *service*, not about N independent rows; the remainder is reported as
+  `requeueThrottled`, never silently dropped), and the saturated-group skip (a full scan window is
+  inconclusive, not "none landed"). The cadence is owned once by `lib/graph/project.PROJECTION_INTERVAL_MS`
+  and consumed by both the scheduler and this grace — a second read of `GRAPH_PROJECT_MINUTES` would let
+  them drift and silently reopen the loop, so it's build-guarded.
 - **Single-flight** — each connector runner and the projector hold a module-level in-flight guard so a
   scheduler tick and an admin action can't duplicate work.
 

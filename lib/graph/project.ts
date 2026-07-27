@@ -69,6 +69,17 @@ export const MAX_EPISODE_CHUNKS = resolvePositiveInt(process.env.GRAPH_MAX_EPISO
 export const GROUP_SCAN_DEPTH = resolvePositiveInt(process.env.GRAPH_GROUP_SCAN_DEPTH, 100_000);
 
 /**
+ * The projector's cadence — how long a pushed episode has to land before the NEXT run could re-push it.
+ *
+ * Owned here rather than in the scheduler because it has two consumers that must agree: the scheduler
+ * (which sets the timer) and reconcile (whose "never landed" grace is derived from it — H7). Two
+ * independent readings of one env var is the H6 shape: the copies drift and nothing fails loudly.
+ * Guarded by `test/guards/graph-interval-single-source.test.ts`.
+ */
+export const PROJECTION_MINUTES = resolvePositiveInt(process.env.GRAPH_PROJECT_MINUTES, 60);
+export const PROJECTION_INTERVAL_MS = PROJECTION_MINUTES * 60_000;
+
+/**
  * "When it happened" for an episode: the item's PERSISTED `work_at` (Pass-1 review R1).
  *
  * This used to re-derive from frontmatter and fall back to `synced_at`, and the fallback was the bug:
