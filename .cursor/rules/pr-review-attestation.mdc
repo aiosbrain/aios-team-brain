@@ -8,8 +8,10 @@ description: >
   reviewer subagent, adversarially double-check any HIGH/blocker finding before
   trusting it, then record a `## Review — Reviewed by <tool> — verdict …` line in
   the PR body (or apply `ready-for-review` if no reviewer is available). Use
-  before pushing a PR branch in aios-team-brain, or when asked "did this get
-  reviewed", "attest this PR", or /pr-review-attestation.
+  before pushing a PR branch in aios-team-brain — and again right after
+  `gh pr create`, which is when the attestation line can actually be written —
+  or when asked "did this get reviewed", "attest this PR", or
+  /pr-review-attestation.
 ---
 
 # PR review attestation
@@ -28,13 +30,38 @@ This gate is **flexible and never blocks a push** — it complements CI and
 label-gated CodeRabbit; only required CI checks actually block a merge. Never
 refuse to push because of an unresolved MEDIUM/LOW finding.
 
+## When this runs
+
+The review happens **before you push** — that's the point of the gate: findings
+get fixed while the branch is still yours. But the attestation is recorded *on a
+PR*, and before `gh pr create` there is no PR number. So the skill straddles the
+push:
+
+| Phase | Steps | Requires a PR? |
+| --- | --- | --- |
+| Pre-push | 1–4 (diff → review → adversarial check → fix) | no |
+| Push + open the PR | `git push` then `gh pr create` | — |
+| Post-create | 5–6 (write the attestation / label) | yes |
+
+If the PR already exists (re-review of a pushed branch, or someone asks "did
+this get reviewed"), run 1–4 then go straight to 5. Either way, **do not stall
+at step 5 waiting for a PR number that doesn't exist yet** — create the PR
+first. You can also fold the attestation into creation in one shot
+(`gh pr create --body "$BODY"$'\n\n'"$ATTESTATION_LINE"`) once steps 1–4 are
+genuinely done.
+
 ## Steps
 
-1. **Get the diff.**
+1. **Get the diff — against a fresh `origin/main`.**
    ```bash
+   git fetch origin main
    git diff origin/main...HEAD
    ```
-   If it's empty, stop — there's nothing to review or attest.
+   The fetch is not optional. PRs merge fast in this repo, so a checkout whose
+   `origin/main` ref is a few hours stale produces a diff carrying other
+   people's already-merged commits — the reviewer then raises HIGH findings on
+   code that isn't yours, and step 3 burns a skeptic pass per phantom finding.
+   If the diff is empty, stop — there's nothing to review or attest.
 
 2. **Primary review (subagent).** Spawn one independent review subagent against
    the diff — prefer `Agent(subagent_type: "code-reviewer", model: "fable")` (the

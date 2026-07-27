@@ -27,13 +27,38 @@ This gate is **flexible and never blocks a push** — it complements CI and
 label-gated CodeRabbit; only required CI checks actually block a merge. Never
 refuse to push because of an unresolved MEDIUM/LOW finding.
 
+## When this runs
+
+The review happens **before you push** — that's the point of the gate: findings
+get fixed while the branch is still yours. But the attestation is recorded *on a
+PR*, and before `gh pr create` there is no PR number. So the skill straddles the
+push:
+
+| Phase | Steps | Requires a PR? |
+| --- | --- | --- |
+| Pre-push | 1–4 (diff → review → adversarial check → fix) | no |
+| Push + open the PR | `git push` then `gh pr create` | — |
+| Post-create | 5–6 (write the attestation / label) | yes |
+
+If the PR already exists (re-review of a pushed branch, or someone asks "did
+this get reviewed"), run 1–4 then go straight to 5. Either way, **do not stall
+at step 5 waiting for a PR number that doesn't exist yet** — create the PR
+first. You can also fold the attestation into creation in one shot
+(`gh pr create --body "$BODY"$'\n\n'"$ATTESTATION_LINE"`) once steps 1–4 are
+genuinely done.
+
 ## Steps
 
-1. **Get the diff.**
+1. **Get the diff — against a fresh `origin/main`.**
    ```bash
+   git fetch origin main
    git diff origin/main...HEAD
    ```
-   If it's empty, stop — there's nothing to review or attest.
+   The fetch is not optional. PRs merge fast in this repo, so a checkout whose
+   `origin/main` ref is a few hours stale produces a diff carrying other
+   people's already-merged commits — the reviewer then raises HIGH findings on
+   code that isn't yours, and step 3 burns a skeptic pass per phantom finding.
+   If the diff is empty, stop — there's nothing to review or attest.
 
 2. **Primary review (subagent).** Spawn one independent review subagent against
    the diff — prefer `Agent(subagent_type: "code-reviewer", model: "fable")` (the
@@ -60,8 +85,9 @@ refuse to push because of an unresolved MEDIUM/LOW finding.
      or add a one-line reason for deferring it — put that reason in the PR body
      near the attestation line, not just in chat.
 
-5. **Record the attestation.** Append **exactly** this line to the PR body
-   (preserve the existing body — read it first, then write body + line back):
+5. **Record the attestation (needs the PR to exist — push and
+   `gh pr create` first if it doesn't).** Append **exactly** this line to the
+   PR body:
    ```
    ## Review — Reviewed by <tool> — verdict <one-line summary>
    ```
@@ -70,14 +96,27 @@ refuse to push because of an unresolved MEDIUM/LOW finding.
    - `<one-line summary>` names the outcome plainly, e.g. "no blockers, 1 LOW
      deferred (see below)" or "fixed 1 HIGH (SQL injection in query.ts), clean
      otherwise".
+
+   `gh pr edit --body` **replaces** the body, so you must capture the existing
+   one into a shell variable in the *same shell* and guard against it being
+   empty — reading the body into your context is not enough, and running the
+   edit with an unset variable wipes the summary and test plan:
    ```bash
-   gh pr edit <number> --body "$(printf '%s\n\n%s' "$EXISTING_BODY" "$ATTESTATION_LINE")"
+   PR=<number>
+   EXISTING_BODY="$(gh pr view "$PR" --json body -q .body)"
+   : "${EXISTING_BODY:?refusing to edit: could not read the existing PR body}"
+   ATTESTATION_LINE='## Review — Reviewed by <tool> — verdict <one-line summary>'
+   gh pr edit "$PR" --body "$(printf '%s\n\n%s' "$EXISTING_BODY" "$ATTESTATION_LINE")"
    ```
+   Then re-read the body (`gh pr view "$PR" --json body -q .body`) and confirm
+   the original content survived alongside the new line.
+
    Never fabricate this line — only write it after a review subagent actually
    ran in this session against this diff.
 
 6. **No reviewer available.** If step 2 found no reviewer of any kind in the
-   current runtime, say so explicitly to the user and instead:
+   current runtime, say so explicitly to the user and instead (again, on the
+   PR once it exists):
    ```bash
    gh pr edit <number> --add-label ready-for-review
    ```
@@ -93,3 +132,8 @@ refuse to push because of an unresolved MEDIUM/LOW finding.
   actually having run against the current diff in this session.
 - Adversarial verification is per-finding — never batch-refute a whole review
   with one skeptic call.
+- Never call `gh pr edit --body` without having captured the existing body into
+  a variable in the same shell and asserted it's non-empty. `--body` replaces,
+  it does not append; an unset variable silently destroys the PR description.
+- Never invent or guess a PR number to satisfy step 5. If no PR exists yet,
+  push and create it — the review from steps 1–4 still stands.
