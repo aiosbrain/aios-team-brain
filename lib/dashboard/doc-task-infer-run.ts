@@ -274,6 +274,11 @@ export async function runDocTaskInference(
     // earlier batch's links on each run — and those docs are recorded as scored, so they are never
     // re-asked and never come back. Coverage would cap at one batch forever, and since unlinked work is
     // omitted from the card, the wiped docs would go invisible rather than merely unlinked.
+    // ONE definition of "the batch" — `withBodies` is what was offered to the model, what gets pruned,
+    // and what is recorded as scored. Deriving any of the three from `scoreable` instead would be
+    // identical today (`attachBodies` is id-preserving) and a landmine the moment it isn't: a doc
+    // recorded as scored but never offered is permanently skipped, never linked, and — since unlinked
+    // work is omitted — invisible. Exactly this PR's failure class, one line further down.
     const batchIds = withBodies.map((d) => d.id);
     const del = await db
       .from("task_evidence")
@@ -303,7 +308,7 @@ export async function runDocTaskInference(
     // Mark the batch scored AFTER the pass succeeded — including the docs the model declined, because
     // "no match" is a real answer and re-asking for it every cycle is the spend this table prevents. A
     // FAILED pass records nothing here, so it retries.
-    await markScored(db, teamId, scoreable, inputsHash);
+    await markScored(db, teamId, withBodies, inputsHash);
     await record(db, teamId, startedAt, true, { inputs_hash: inputsHash, scored: scoreable.length, linked: links.length });
     return { scored: scoreable.length, linked: links.length };
   } catch (err) {
@@ -318,6 +323,9 @@ export async function runDocTaskInference(
  * Fetch prose for exactly the docs being scored, head-truncated. Separate from the wide scan so an
  * "unchanged" tick reads no bodies at all. A body that fails to load leaves the doc title-only — still
  * judgeable, just weaker evidence — rather than dropping it.
+ *
+ * MUST be id-preserving: its output defines the batch that is offered to the model, pruned, and recorded
+ * as scored. Dropping a doc here would record it as answered without ever asking about it.
  */
 async function attachBodies(db: DbClient, teamId: string, docs: InferDoc[]): Promise<InferDoc[]> {
   try {
@@ -342,9 +350,8 @@ async function attachBodies(db: DbClient, teamId: string, docs: InferDoc[]): Pro
  *  • `finishedAt` drives the COOLDOWN, and counts a FAILED run too: a team whose provider is erroring
  *    must not re-attempt every tick.
  *  • The skip-if-unchanged is now PER ITEM (`doc_task_inference`), so only `finishedAt` is read here.
- *    The recorded `meta.inputs_hash` stays as run provenance — it answers "what question did this run
- *    ask?" when reading the ledger — but nothing branches on it. It previously drove the skip, and
- *    suppress the retry that fixes it.
+ *    The recorded `meta.inputs_hash` stays as run PROVENANCE — it answers "what question did this run
+ *    ask?" when reading the ledger — but nothing branches on it any more.
  */
 async function lastRun(db: DbClient, teamId: string): Promise<{ finishedAt: number; inputsHash: string | null } | null> {
   try {

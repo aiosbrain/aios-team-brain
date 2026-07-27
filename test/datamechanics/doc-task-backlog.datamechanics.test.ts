@@ -76,38 +76,46 @@ function answerMatchingOfferedDocs(): void {
 describe("doc→task inference: links accumulate across batches (real Postgres)", () => {
   beforeEach(() => completeTextOrNull.mockReset());
 
-  it("a later batch does NOT wipe an earlier batch's links", async () => {
+  it("the batch CAP bites, and the next run accumulates rather than replacing", async () => {
+    // BOTH docs exist up front, so `maxDocs: 1` is load-bearing: the cap is what leaves one for the
+    // next run. (Seeding them one-per-run would pass with no cap at all, testing nothing about the
+    // batch-rotation interaction this whole redesign is about.)
     const { seed } = await seedTeamWithTask();
-    const first = await keylessDoc(seed, "batch one doc");
+    const a = await keylessDoc(seed, "backlog doc one");
+    const b = await keylessDoc(seed, "backlog doc two");
     answerMatchingOfferedDocs();
 
-    // Run 1 — cap the batch at 1 so the second doc is left for the next run.
-    await runDocTaskInference(db(), seed.teamId, { maxDocs: 1 });
+    const run1 = await runDocTaskInference(db(), seed.teamId, { maxDocs: 1 });
+    expect(run1.skipped).toBeUndefined(); // it really ran — not a cooldown/no-llm short-circuit
+    expect(run1.linked).toBe(1);
     const afterFirst = await llmLinkedItemIds(seed.teamId);
-    expect(afterFirst).toEqual([first.id]); // non-vacuous: run 1 really linked something
+    expect(afterFirst).toHaveLength(1); // the CAP bit: only one of the two was scored
 
-    // A second doc arrives and is scored by the NEXT run.
-    const second = await keylessDoc(seed, "batch two doc");
     await clearCooldown(seed.teamId);
-    await runDocTaskInference(db(), seed.teamId, { maxDocs: 1 });
+    const run2 = await runDocTaskInference(db(), seed.teamId, { maxDocs: 1 });
+    expect(run2.skipped).toBeUndefined();
+    expect(run2.linked).toBe(1); // the OTHER doc — the batch rotated
 
     // BOTH links must exist. A team-wide prune leaves only the second — and because the first doc is
     // recorded as scored, it is never re-asked, so its link never comes back.
-    expect(await llmLinkedItemIds(seed.teamId)).toEqual([first.id, second.id].sort());
+    expect(await llmLinkedItemIds(seed.teamId)).toEqual([a.id, b.id].sort());
   });
 
   it("a batch the model DECLINES leaves earlier links intact", async () => {
     const { seed } = await seedTeamWithTask();
     const kept = await keylessDoc(seed, "linked doc");
     answerMatchingOfferedDocs();
-    await runDocTaskInference(db(), seed.teamId, { maxDocs: 1 });
+    const run1 = await runDocTaskInference(db(), seed.teamId, { maxDocs: 1 });
+    expect(run1.skipped).toBeUndefined();
     expect(await llmLinkedItemIds(seed.teamId)).toEqual([kept.id]);
 
     await keylessDoc(seed, "unmatchable doc");
     await clearCooldown(seed.teamId);
     completeTextOrNull.mockResolvedValue(JSON.stringify({ matches: [] })); // no match — the normal case
 
-    await runDocTaskInference(db(), seed.teamId, { maxDocs: 1 });
+    const run2 = await runDocTaskInference(db(), seed.teamId, { maxDocs: 1 });
+    expect(run2.skipped).toBeUndefined(); // it asked, and the answer was "none"
+    expect(run2.linked).toBe(0);
 
     // An all-declined batch inserts nothing; it must also delete nothing outside itself.
     expect(await llmLinkedItemIds(seed.teamId)).toEqual([kept.id]);
