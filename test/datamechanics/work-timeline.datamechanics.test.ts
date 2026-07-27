@@ -387,7 +387,9 @@ describe("work timeline — attribution oracle (credits the worker, not the reas
     // …and it's SIGNAL, not work: the decision is not in tasks/total for the person.
     const tester = days.flatMap((d) => d.people).find((p) => p.name === "Tester")!;
     expect(evidenceTitles(days)).not.toContain("chose Postgres over the graph");
-    expect(tester.total).toBe(tester.tasks.reduce((n, t) => n + t.evidenceCount, 0)); // rendered work only
+    expect(tester.total).toBe(
+      tester.tasks.reduce((n, t) => n + t.evidenceCount, 0) + tester.other.reduce((n, g) => n + g.count, 0)
+    ); // work only — signals excluded
 
     // TIER: an external viewer never gets a team-audience decision (public one DOES show — non-vacuous).
     await insertDecision({ title: "public decision", decided_by: "Tester", audience: "external" });

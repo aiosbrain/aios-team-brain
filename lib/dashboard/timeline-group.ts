@@ -9,7 +9,7 @@
  *                task with no evidence never appears). STATUS does not gate it — a ticket that shipped
  *                today still heads its group, carrying its status — so this is "the work they touched",
  *                each with that day's evidence nested + grouped by source.
- *   • unlinked — how many of that day's evidence rows referenced NO task (counted, not rendered).
+ *   • other[]  — that day's evidence that referenced NO task, grouped by source (rendered below).
  * Ordering: days DESC (undated last); within a day, people by activity DESC; a person's tasks by
  * evidence count DESC; items newest-first, capped per source.
  */
@@ -106,9 +106,14 @@ export interface PersonDay {
    *  pure builder, so it's computed once per rebuild and never runs in the data-mechanics tier. */
   summary?: string;
   tasks: TaskGroup[];
-  /** How many of this person's evidence rows that day referenced NO task. Counted, never rendered: the
-   *  card's contract is task → evidence, and a lane of taskless work out-competed the tasks for attention.
-   *  Retained as the coverage metric for the doc→task assignment pass. */
+  /** That day's evidence that referenced NO task, grouped by source — rendered BELOW the tasks.
+   *
+   *  This was omitted entirely for one deploy, and that was wrong. Omitting taskless work is the right
+   *  end state — but only once linking works. Measured on prod the day it shipped: 220 items of real
+   *  work in 7 days, NINE linked. The omission hid ~96% of two people's week, which is a far worse
+   *  failure than a lane competing for attention. Subordinate, not absent, until coverage earns it. */
+  other: SourceGroup[];
+  /** How many rows are in `other` — the coverage metric for the doc→task assignment pass. */
   unlinked: number;
   signals: SignalGroup[]; // Context lane — decisions etc. (about work); shown, never counted as work
 }
@@ -300,22 +305,20 @@ export function groupTimeline(
           return { taskId, title: info.title, status: info.status, source: info.source, sources: toSourceGroups(ev, perSourceCap), evidenceCount: ev.length };
         })
         .sort((x, y) => y.evidenceCount - x.evidenceCount || (x.title < y.title ? -1 : 1));
-      // UNLINKED work is COUNTED but not carried as renderable groups. The card's contract is
-      // task → evidence: a lane of work that belongs to no task competes with the tasks for attention and,
-      // in prod, dwarfed them (one task-nested row against twenty unlinked on the same person-day), which
-      // is what made a task-parented card read as evidence-parented. Keeping the number means the omission
-      // is measurable — coverage is the health metric for the doc→task pass — without re-creating the lane.
+      // UNLINKED work is rendered, BELOW the tasks. Omitting it is the right end state and shipped one
+      // deploy too early: with linking at 9/220 items it hid ~96% of the team's week. `unlinked` stays
+      // as the coverage metric that says when omission becomes safe.
+      const other = toSourceGroups(b.other, perSourceCap);
       const unlinked = b.other.length;
-      // `total` = WORK the timeline actually stands behind, i.e. evidence attached to a task. Signals are
-      // grouped by kind, newest-first, capped — never counted.
-      const total = tasks.reduce((n, t) => n + t.evidenceCount, 0);
+      // `total` = all WORK the card shows, so the header count and the body agree. Signals are grouped by
+      // kind, newest-first, capped — never counted.
+      const total = tasks.reduce((n, t) => n + t.evidenceCount, 0) + other.reduce((n, g) => n + g.count, 0);
       const signalGroups: SignalGroup[] = [...groupByKind(b.signals).entries()]
         .map(([kind, items]) => ({ kind, count: items.length, items: [...items].sort((x, y) => (x.at < y.at ? 1 : x.at > y.at ? -1 : 0)).slice(0, perSourceCap) }))
         .sort((x, y) => y.count - x.count);
-      // A person-day with no task-linked work and no signals has nothing to say — dropping it beats an
-      // empty card with a name on it.
-      if (tasks.length === 0 && signalGroups.length === 0) continue;
-      personDays.push({ memberId, name: m.name, handle: m.handle, avatarUrl: m.avatarUrl, total, tasks, unlinked, signals: signalGroups });
+      // Only a person-day with NOTHING at all is dropped — unlinked work counts as something to say.
+      if (tasks.length === 0 && other.length === 0 && signalGroups.length === 0) continue;
+      personDays.push({ memberId, name: m.name, handle: m.handle, avatarUrl: m.avatarUrl, total, tasks, other, unlinked, signals: signalGroups });
     }
     // Order by WORK; a signals-only person (total 0) ranks last but still shows in the day view.
     personDays.sort((a, b) => b.total - a.total || (a.name < b.name ? -1 : 1));

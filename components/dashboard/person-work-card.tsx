@@ -23,9 +23,9 @@ function timeOf(at: string): string {
 /** "3 tasks · 12 items · 2 decisions" — activity at a glance. Decisions are SIGNAL (context), so they're a
  *  SEPARATE, labelled count — never folded into the work "items" tally (that would credit signal as work). */
 export function personSummary(p: PersonDay): string {
-  // Counts only what the card SHOWS. Folding in unlinked work would put a number in the header that the
-  // body never accounts for — "23 items" above five visible rows is how a summary stops being trusted.
-  const items = p.tasks.reduce((n, t) => n + t.evidenceCount, 0);
+  // Counts what the card SHOWS — tasks plus the unlinked lane below them. The header and the body must
+  // agree: "23 items" above five visible rows is how a summary stops being trusted.
+  const items = p.tasks.reduce((n, t) => n + t.evidenceCount, 0) + p.other.reduce((n, g) => n + g.count, 0);
   const decisions = p.signals.reduce((n, g) => n + g.count, 0);
   const parts: string[] = [];
   if (p.tasks.length) parts.push(`${p.tasks.length} task${p.tasks.length === 1 ? "" : "s"}`);
@@ -130,6 +130,19 @@ export function PersonWorkCard({ person }: { person: PersonDay }) {
           {p.tasks.map((t) => (
             <TaskCard key={t.taskId} task={t} />
           ))}
+        </div>
+      ) : null}
+
+      {p.other.length ? (
+        <div className="flex flex-col gap-2">
+          <div className="text-[11px] font-semibold uppercase tracking-wider text-ink-tertiary/80">
+            Other · not yet linked to a task
+          </div>
+          <div className="flex flex-col gap-2 pl-1">
+            {p.other.map((g) => (
+              <EvidenceList key={g.source} group={g} />
+            ))}
+          </div>
         </div>
       ) : null}
 

@@ -43,11 +43,15 @@ const TTL_MS = 5 * 60_000; // 5-min freshness; the ledger is cheap, so refresh o
 // a shape this build does not render AND person-days it would have dropped, so the card shows a name
 // with an empty body under it — the exact thing the omission was meant to prevent.
 //
-// This bump was MISSED once and it is worth saying why: the change was authored on v6→v7, then rebased
+// v9: `other[]` is BACK (rendered below the tasks) after v8 omitted it. v8 was correct in principle and
+// a deploy too early in practice — linking was at 9/220 items, so it hid ~96% of the team's week. A v8
+// row would keep serving that hidden state, so it must read as a miss.
+//
+// The v8 bump was MISSED once and it is worth saying why: the change was authored on v6→v7, then rebased
 // onto a branch that had already taken 7 for its own shape change, so two incompatible payloads shipped
 // under one version and prod served a stale row as a HIT. When rebasing, re-check that the version you
 // bumped TO is still unclaimed on the new base.
-export const PAYLOAD_VERSION = 8;
+export const PAYLOAD_VERSION = 9;
 
 /** The timeline WITH the per-person-day synopsis attached. Runs the (up to 7d × roster) best-effort LLM
  *  calls — so it's used ONLY on the BACKGROUND refresh path, never inline on a request (a cold miss
