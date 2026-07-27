@@ -64,6 +64,13 @@ it isn't forgotten, not scheduled.
 ## Arc-cache proactive warming (timer-driven) — deferred follow-up
 
 **Status:** Deferred (2026-07-10). SWR (demand-driven refresh, #217) covers the common case.
+**Re-confirmed 2026-07-27** on closing **#327** ("narrative arcs as a precomputed background layer"),
+which proposed exactly this. Its *problem* — an ~80s synthesis on the read path blocking the Learning
+page — is solved on main by SWR + `refreshArcsInBackground` + the 4h TTL + the facts-hash skip, and
+`lib/social/discover-arcs` reads the same cached layer, so Learning and Social Brain already share it.
+The single residual is below: `getArcs`'s **cold-miss branch still synthesizes inline**, so a
+first-ever load for a group-key waits on the model. #327 was closed rather than merged because its
+88-line doc described the plan as unbuilt — a stale map next to shipped behavior is worse than none.
 
 **What:** A scheduled job that proactively recomputes each active team's arcs on an interval so even a
 team's *first* view of the day is warm (SWR only warms a team once someone has viewed it). **Why
