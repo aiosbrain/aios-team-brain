@@ -105,7 +105,7 @@ export function scoreableDocs(docs: readonly InferDoc[]): InferDoc[] {
  *
  * This was briefly hard-restricted to the worker's own tasks, because a cross-person guess put a
  * teammate's ticket on your day with nothing to distinguish it from your own. That was the right
- * diagnosis and the wrong remedy: the problem was LEGIBILITY, not the link. `TaskGroup.assigneeName`
+ * diagnosis and the wrong remedy: the problem was LEGIBILITY, not the link. `TaskGroup.assignee`
  * now names the owner on the card ("contributing to John's task"), so a cross-person association is
  * visible rather than misleading — and removing the capability would have dropped the real case of a
  * doc about a teammate's ticket instead of explaining it.

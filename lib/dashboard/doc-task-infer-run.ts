@@ -30,8 +30,9 @@ import { recordIngestRun } from "@/lib/ingest/runs";
  *
  * A design doc rarely cites `AIO-494` in its title or path, so the deterministic matcher leaves it in the
  * timeline's "Other" bucket even when it is plainly the work behind a ticket. This reads those unlinked
- * docs plus each worker's OWN candidate tasks and asks the model, one batched call per worker, which belongs to which —
- * or, expectedly, neither. Confident answers are persisted as `task_evidence` rows with `method='llm'`.
+ * docs plus the team's candidate tasks — the worker's OWN ranked and MARKED first, then everyone else's —
+ * and asks the model, one batched call per worker, which belongs to which — or, expectedly, neither.
+ * Confident answers are persisted as `task_evidence` rows with `method='llm'`.
  *
  * SECOND WRITER of `task_evidence`, alongside `./timeline-evidence` (`method='issue_ref'`). The two are
  * disjoint by construction: each prunes only its OWN method, and this one never scores a doc that already
@@ -41,8 +42,9 @@ import { recordIngestRun } from "@/lib/ingest/runs";
  *   • BACKGROUND only — the ingest scheduler, never a request path.
  *   • Short-circuits before spending anything when the team has no LLM configured (`llmConfigured`).
  *   • ONE batched call PER WORKER in the batch (2-3 in practice), with capped docs, capped candidates and a
- *     capped body excerpt. Per worker, not per team, because candidates are scoped to the doc's own
- *     assignee — a single team-wide call would score everyone's docs against one person's backlog.
+ *     capped body excerpt. Per worker, not per team, because the candidate list is ORDERED and MARKED for
+ *     one person ("assigned to this document's author") — a single team-wide call would hand everyone
+ *     else a prompt ranked, and labelled, for the wrong person.
  *   • Skips entirely when the inputs are unchanged since the last run — the hash covers doc CONTENT, the
  *     candidate set and the system prompt, and is carried on the recorded `ingest_runs` row.
  *   • Never throws: a failure records an unhealthy run and leaves the previous edges in place.
@@ -244,11 +246,11 @@ export async function runDocTaskInference(
     // Only NOW pull prose, and only for the ≤MAX_DOCS docs actually being scored.
     const withBodies = await attachBodies(db, teamId, scoreable);
 
-    // ONE CALL PER WORKER, not one per batch. `candidatesFor` now offers only the tasks assigned to the
-    // doc's own worker, so a single call built from the FIRST doc's author would score everyone else's
-    // docs against THAT person's tasks — which is precisely the cross-assignment this restriction
-    // exists to stop, made worse. Grouping by worker keeps each doc scored against its own backlog; the
-    // call count is the number of distinct people in the batch (2–3 in practice), not the doc count.
+    // ONE CALL PER WORKER, not one per batch. Every worker is offered the same tasks, but `candidatesFor`
+    // RANKS their own first and `buildInferPrompt` MARKS those as the author's — both derived from one
+    // person. A single call built from the FIRST doc's author would therefore label John's tickets as
+    // Chetan's to the model, actively arguing for the cross-person link the ordering exists to discourage.
+    // The call count is the number of distinct people in the batch (2–3 in practice), not the doc count.
     const byWorker = new Map<string, InferDoc[]>();
     for (const doc of withBodies) {
       if (!doc.memberId) continue; // `scoreableDocs` already drops these; belt-and-braces
@@ -264,8 +266,11 @@ export async function runDocTaskInference(
     let workersFailed = 0;
     for (const docs of byWorker.values()) {
       const ranked = candidatesFor(docs[0], candidates);
-      // No assigned tasks → nothing to ask, and that IS the answer: settle them, or they occupy the
-      // oldest-first batch slots forever and the backlog never drains past them.
+      // UNREACHABLE today — `candidates` is non-empty (the run returns `no-candidates` above when the team
+      // has no tasks) and `candidatesFor` no longer filters, so `ranked` always has something. Kept because
+      // the alternative to settling an empty list is asking the model to match against zero tasks: a paid
+      // call that can only answer "no match", every run, for docs that then never leave the batch. If the
+      // candidate list is ever narrowed again, that regression is silent — this branch is what stops it.
       if (!ranked.length) {
         settled.push(...docs);
         continue;

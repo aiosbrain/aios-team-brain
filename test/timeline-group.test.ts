@@ -7,10 +7,13 @@ const members = new Map<string, TimelineMember>([
   ["m2", { name: "John", handle: "john" }],
 ]);
 
+// `assigneeMemberId` is spelled out rather than left off: `test/` is excluded from `tsconfig.json`, so a
+// fixture missing a REQUIRED field of the type it claims to be compiles silently and reads as "unassigned"
+// at runtime. These are unassigned on purpose — the owner-marker case has its own fixture below.
 const taskInfo = new Map<string, TaskInfo>([
-  ["t1", { title: "Provider adapter", status: "in_progress", source: "linear" }],
-  ["t2", { title: "Second task", status: "in_progress", source: "linear" }],
-  ["tEmpty", { title: "Active but no evidence", status: "in_progress", source: "linear" }],
+  ["t1", { title: "Provider adapter", status: "in_progress", source: "linear", assigneeMemberId: null }],
+  ["t2", { title: "Second task", status: "in_progress", source: "linear", assigneeMemberId: null }],
+  ["tEmpty", { title: "Active but no evidence", status: "in_progress", source: "linear", assigneeMemberId: null }],
 ]);
 
 const ev = (over: Partial<EvidenceWithMember>): EvidenceWithMember => ({
@@ -56,7 +59,7 @@ describe("normalizeSource / dayLabel", () => {
   });
 });
 
-describe("groupTimeline (evidence-gated task → evidence nesting; unlinked work omitted)", () => {
+describe("groupTimeline (evidence-gated task → evidence nesting; unlinked work in a subordinate lane)", () => {
   it("nests linked evidence under its task and puts unlinked evidence in a subordinate lane", () => {
     const days = groupTimeline(
       [

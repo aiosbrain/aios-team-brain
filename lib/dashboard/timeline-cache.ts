@@ -47,13 +47,17 @@ const TTL_MS = 5 * 60_000; // 5-min freshness; the ledger is cheap, so refresh o
 // a deploy too early in practice — linking was at 9/220 items, so it hid ~96% of the team's week. A v8
 // row would keep serving that hidden state, so it must read as a miss.
 //
-// v10: `TaskGroup.assigneeName` — a task that belongs to SOMEONE ELSE now says so on the card. A v9 row
-// has no such field, so a teammate's ticket would keep rendering as if it were yours.
+// v10: `TaskGroup.assignee` (`{ name, avatarUrl }`) — a task that belongs to SOMEONE ELSE now says so on
+// the card. A v9 row has no such field, so a teammate's ticket would keep rendering as if it were yours.
 //
 // The v8 bump was MISSED once and it is worth saying why: the change was authored on v6→v7, then rebased
 // onto a branch that had already taken 7 for its own shape change, so two incompatible payloads shipped
 // under one version and prod served a stale row as a HIT. When rebasing, re-check that the version you
 // bumped TO is still unclaimed on the new base.
+//
+// v10 also found the hole in the guard built for that miss: it pinned only `PersonDay`'s own keys, so a
+// change one level down (`TaskGroup`) passed it untouched. `test/guards/timeline-payload-shape.test.ts`
+// now pins EVERY node in the tree — a nested field can strand a stale row just as badly as a top-level one.
 export const PAYLOAD_VERSION = 10;
 
 /** The timeline WITH the per-person-day synopsis attached. Runs the (up to 7d × roster) best-effort LLM

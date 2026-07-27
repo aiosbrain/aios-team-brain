@@ -88,7 +88,7 @@ describe("candidatesFor — the worker's OWN tasks first, then a teammate's", ()
 
   it("STILL offers a teammate's task, so a doc about someone else's ticket can link", () => {
     // Briefly hard-restricted, because a cross-person guess was indistinguishable from a real
-    // cross-assignment. The remedy is legibility (`TaskGroup.assigneeName` names the owner on the
+    // cross-assignment. The remedy is legibility (`TaskGroup.assignee` names the owner on the
     // card), not removing the capability — which would have dropped the real case silently.
     expect(candidatesFor(doc(), visible).map((c) => c.id).sort()).toEqual(["t1", "t2", "t3"]);
   });
