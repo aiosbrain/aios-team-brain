@@ -53,12 +53,12 @@ describe("GET /api/v1/timeline (HTTP)", () => {
       unlinked: number;
     }[];
     expect(people.length).toBeGreaterThan(0);
-    // Pin the wire shape: a person carries `tasks` (each with its nested evidence `sources`) and an
-    // `unlinked` COUNT — not an `other` lane, and not the pre-v1.12 flat `sources`.
+    // Pin the wire shape: a person carries `tasks` (each with its nested evidence `sources`), the
+    // subordinate `other` lane, and an `unlinked` COUNT — not the pre-v1.12 flat `sources`.
     expect(Array.isArray(people[0].tasks)).toBe(true);
     expect(Array.isArray(people[0].tasks[0].sources)).toBe(true); // evidence nests UNDER the task
+    expect(Array.isArray((people[0] as Record<string, unknown>).other)).toBe(true);
     expect(typeof people[0].unlinked).toBe("number");
-    expect((people[0] as Record<string, unknown>).other).toBeUndefined();
     expect((people[0] as Record<string, unknown>).sources).toBeUndefined();
   });
 

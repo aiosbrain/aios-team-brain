@@ -69,9 +69,9 @@ describe("work-timeline cache layer (real Postgres)", () => {
     const row = await readRow(seed.teamId, "team");
     expect(row?.group_key).toBe("team");
     // A LITERAL, deliberately: it forces a conscious edit every time the version moves, which is the
-    // moment to ask "did the payload shape or meaning change?". v8 = unlinked evidence omitted
-    // (`other[]` → `unlinked`), so a v7 row carries a shape this build does not render.
-    expect((row?.payload as { v: number; days: unknown[] }).v).toBe(8);
+    // moment to ask "did the payload shape or meaning change?". v9 restores `other[]` (v8 omitted it a
+    // deploy too early), so a v8 row would keep serving the hidden state.
+    expect((row?.payload as { v: number; days: unknown[] }).v).toBe(9);
     expect((row?.payload as { days: unknown[] }).days.length).toBe(days.length);
 
     // readTimelineCache round-trips it.

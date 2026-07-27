@@ -57,7 +57,7 @@ describe("normalizeSource / dayLabel", () => {
 });
 
 describe("groupTimeline (evidence-gated task → evidence nesting; unlinked work omitted)", () => {
-  it("nests linked evidence under its task and OMITS unlinked evidence, keeping its count", () => {
+  it("nests linked evidence under its task and puts unlinked evidence in a subordinate lane", () => {
     const days = groupTimeline(
       [
         ev({ id: "c1", taskId: "t1", source: "github" }),
@@ -73,11 +73,11 @@ describe("groupTimeline (evidence-gated task → evidence nesting; unlinked work
     expect(p.tasks[0].taskId).toBe("t1");
     expect(p.tasks[0].evidenceCount).toBe(2);
     expect(p.tasks[0].sources.map((s) => s.source).sort()).toEqual(["github", "notion"]);
-    // The unlinked row is NOT rendered — the card's contract is task → evidence, and a taskless lane
-    // out-competed the tasks for attention in prod (20 unlinked rows against 1 nested).
-    expect(p).not.toHaveProperty("other");
-    expect(p.unlinked).toBe(1); // …but it is still counted, so coverage stays measurable
-    expect(p.total).toBe(2); // total = work the card actually shows
+    // Unlinked work is SHOWN, below the tasks — omitting it hid ~96% of real work in prod. It is also
+    // counted, so coverage stays measurable and we can tell when omitting becomes safe.
+    expect(p.other.map((g) => g.source)).toEqual(["github"]);
+    expect(p.unlinked).toBe(1);
+    expect(p.total).toBe(3); // header must match the body: 2 nested + 1 unlinked
   });
 
   it("EVIDENCE-GATED: an active task with no evidence never appears (no empty headers)", () => {
@@ -98,11 +98,14 @@ describe("groupTimeline (evidence-gated task → evidence nesting; unlinked work
     expect(days[0].people[0].tasks.map((t) => t.taskId)).toEqual(["t1", "t2"]);
   });
 
-  it("evidence with a dangling/inactive taskId counts as unlinked, and a person with ONLY that is dropped", () => {
-    // A taskId we can't resolve is not a task; with nothing else that day the person has nothing to show,
-    // and an empty card with a name on it is worse than no card.
+  it("evidence with a dangling/inactive taskId counts as unlinked, and still shows", () => {
+    // A taskId we can't resolve is not a task — but the work happened, so it belongs in the unlinked
+    // lane rather than vanishing.
     const days = groupTimeline([ev({ taskId: "gone", source: "github" })], taskInfo, members, today);
-    expect(days).toHaveLength(0);
+    const p = days[0].people[0];
+    expect(p.tasks).toHaveLength(0);
+    expect(p.other[0].source).toBe("github");
+    expect(p.unlinked).toBe(1);
   });
 
   it("drops evidence for an unknown member", () => {
