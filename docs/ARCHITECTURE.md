@@ -813,9 +813,14 @@ There is only ONE flag slot, so an orphan that already owed a *different* group'
 converged over two passes (the old group is verified, then the flag re-points at the row's own group)
 rather than dropped after checking only one.
 
-**Eventually consistent downstream.** A purge removes the item, its versions/chunks/facts and its
-graph episodes. Derived snapshots recomputed on a schedule — `work_timeline_cache`, narrative-arc
-snapshots — can still quote purged content until their next recompute.
+**Derived caches are busted too.** `work_timeline_cache` and the narrative-arc snapshots are
+precomputed FROM `items`, so removing the rows alone leaves both quoting content the brain no longer
+has until their next scheduled recompute — for a private channel purged by mistake, exactly the
+window the purge exists to close. The purge routes through the shared `bustTeamLearningCaches`
+choke-point (rather than staling the two tables itself, so a cache added there later is busted too),
+marking them stale so the next read rebuilds from what survives. Best-effort and LOUD: the content is
+already gone, so a bust failure must not fail or retry the purge — but it is logged, because the
+visible symptom is purged content still on screen and the caches otherwise self-heal only on TTL.
 
 ### Slack deletions — `lib/ingest/slack-cleanup.ts` + `sources/slack-deletions.ts`
 
