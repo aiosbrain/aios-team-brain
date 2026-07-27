@@ -1,0 +1,45 @@
+{
+  "skill_name": "pr-review-attestation",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Attest this PR before I push it. The branch diff (git diff origin/main...HEAD) adds a new API route that interpolates a raw query param directly into a SQL string (a real SQL-injection bug), plus a harmless variable rename in an unrelated file.",
+      "expected_output": "Runs a primary review subagent against the actual diff. Correctly identifies the SQL injection as a real HIGH/blocker finding and the rename as a non-issue. Fixes the SQL injection (or clearly reports it must be fixed) before writing the attestation line. Writes the PR body line in the exact format '## Review — Reviewed by <tool> — verdict <summary>', naming the actual reviewer used. Does not block the push over the rename.",
+      "assertions": [
+        "Reviewed the real diff, not a summary of it",
+        "Correctly ranks the SQL injection as HIGH/blocker",
+        "Does not fabricate a finding on the harmless rename",
+        "Fixes or explicitly flags the SQL injection before attesting",
+        "PR body line matches '## Review — Reviewed by <tool> — verdict ...' exactly",
+        "Named tool in the line is the reviewer actually used this session",
+        "Never claims the gate blocks the push"
+      ],
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "Attest this PR. No code-review subagent or local reviewer tool is available in this environment.",
+      "expected_output": "Explicitly says no reviewer was available. Applies the ready-for-review label via gh pr edit --add-label ready-for-review. Does NOT write a '## Review — Reviewed by ...' attestation line, since no review actually happened.",
+      "assertions": [
+        "States plainly that no reviewer was available",
+        "Applies the ready-for-review label",
+        "Does not fabricate a Review attestation line",
+        "Does not claim a review occurred"
+      ],
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "Attest this PR. The diff is a small, genuinely clean refactor (renaming a function and updating its call sites, no behavior change). A primary reviewer subagent nonetheless raises a HIGH finding claiming the rename 'breaks backward compatibility' — but nothing in this repo or diff supports that (no public API surface, no external caller, no test relying on the old name).",
+      "expected_output": "Runs the adversarial verification step: spawns an independent skeptic subagent against the specific HIGH finding. The skeptic correctly refutes the finding since it doesn't hold up against the actual diff. The finding is downgraded to MEDIUM/deferred with a one-line reason rather than triggering unnecessary rework (e.g. reverting the rename or adding a compat shim nobody needs). The attestation line reflects the true outcome (no real blockers).",
+      "assertions": [
+        "Runs a distinct adversarial/skeptic check on the HIGH finding, not just the primary review",
+        "The false-positive finding is downgraded rather than blindly acted on",
+        "No unnecessary code change (e.g. compat shim) is made to satisfy a refuted finding",
+        "A one-line deferral reason is recorded for the downgraded finding",
+        "Attestation line reflects the true, no-real-blocker outcome"
+      ],
+      "files": []
+    }
+  ]
+}
