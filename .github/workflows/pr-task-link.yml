@@ -3,6 +3,20 @@ name: PR task link (advisory)
 # Nudge, not a gate: warns when a PR has no brain task work-key, so untracked work is
 # visible at review time. The actual close happens on merge via aios-work-sync.yml
 # (→ POST /api/v1/work-events → tasks.status=done → pm-sync projects to Linear).
+#
+# The matching and the response parsing live in `scripts/pr-work-keys.mjs`, shared with
+# aios-work-sync.yml and unit-tested. They used to be inline here, where no tier could
+# reach them — and shipped reading the tasks response in a shape it never returns, so the
+# check reported a REAL key as nonexistent on its first run.
+#
+# ⛔ THIS MUST STAY ON `pull_request`. NEVER `pull_request_target`.
+# The job checks out the PR's head and EXECUTES a script from it (`scripts/pr-work-keys.mjs`)
+# with `AIOS_API_KEY` in the environment. On `pull_request`, GitHub withholds secrets from
+# fork-PR runs, so a fork that edits that script gets an empty key and there is nothing to
+# steal. `pull_request_target` runs with secrets AND the base repo's permissions — switching
+# it would turn this into a textbook pwn-request: edit the script in a fork, exfiltrate the
+# key. Fork PRs correctly reporting "credentials not configured" is the intended behaviour,
+# not a bug to fix by changing the trigger. (This repo is public.)
 on:
   pull_request:
     types: [opened, edited, synchronize, reopened]
@@ -19,6 +33,7 @@ jobs:
       AIOS_API_KEY: ${{ secrets.AIOS_API_KEY }}
       AIOS_TEAM: ${{ secrets.AIOS_TEAM }}
     steps:
+      - uses: actions/checkout@v4
       - name: Check for an AIOS work-key
         run: |
           node <<'NODE'
@@ -26,53 +41,51 @@ jobs:
           // syntax error. A `.catch` keeps the job advisory — an unexpected throw must not fail a PR.
           (async () => {
           const fs = require("node:fs");
+          const { extractWorkKeys, knownKeysFrom, taskRowsFrom, verifyKeys, TASKS_PAGE_BOUND } = await import("./scripts/pr-work-keys.mjs");
           const ev = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, "utf8"));
-          const pr = ev.pull_request || {};
-          // Strip HTML comments first so PR-template placeholders (e.g. `<!-- e.g. AIO-72 -->`) aren't matched.
-          const text = [
-            pr.title || "",
-            (pr.body || "").replace(/<!--[\s\S]*?-->/g, " "),
-            pr.head?.ref || "",
-          ].join("\n");
-          // Same matcher aios-work-sync uses (lib/pm-sync/work-keys): AIO-12 / W2.5.8 / etc.
-          const re = /\b(?:AIOS-Work:\s*)?([A-Z][A-Z0-9]+-\d+|[A-Z]\d+(?:\.\d+)*)\b/g;
-          const keys = [...new Set([...text.matchAll(re)].map((m) => m[1]))];
-          if (keys.length) {
-            console.log(`Found work key(s): ${keys.join(", ")}`);
-            // A key that matches the PATTERN is not a key that EXISTS. Every PR in one recent session
-            // carried an invented `AIO-48x` that no task had: the work looked tracked, this check went
-            // green, and none of it could ever link to a task on the timeline. Shape alone is not a
-            // check, so ask the brain whether the key is real.
-            const brain = process.env.AIOS_BRAIN_URL;
-            const key = process.env.AIOS_API_KEY;
-            const team = process.env.AIOS_TEAM;
-            if (!brain || !key || !team) {
-              console.log("::warning title=Work key not verified::brain credentials not configured — only the FORMAT was checked.");
-            } else {
-              const res = await fetch(`${brain.replace(/\/$/, "")}/api/v1/tasks?all=1`, {
-                headers: { Authorization: `Bearer ${key}`, "X-AIOS-Team": team },
-              });
-              if (!res.ok) {
-                // Couldn't ask ≠ the key is fake. Advisory job, so never fail on OUR outage.
-                console.log(`::warning title=Work key not verified::brain returned ${res.status} — only the FORMAT was checked.`);
-              } else {
-                const body = await res.json();
-                const rows = Array.isArray(body) ? body : (body.tasks ?? body.data ?? []);
-                const known = new Set(rows.map((t) => String(t.row_key ?? t.rowKey ?? "")).filter(Boolean));
-                const invented = keys.filter((k) => !known.has(k));
-                if (invented.length) {
-                  console.log(
-                    `::warning title=Work key does not exist::${invented.join(", ")} matches the key format but ` +
-                      `no task in the brain has it, so this work will link to nothing on the timeline. ` +
-                      `Use a real key or create the task. (${known.size} task keys checked.)`
-                  );
-                } else {
-                  console.log(`All work key(s) exist in the brain — merge will advance the matching task(s) to Done.`);
-                }
-              }
-            }
-          } else {
+          const keys = extractWorkKeys(ev.pull_request || {});
+          if (!keys.length) {
             console.log("::warning title=No brain task linked::This PR has no AIOS work-key (e.g. `AIOS-Work: W2.5.8`). Merge won't auto-close a task in Linear. If this work should be tracked, link or create a brain task first. (Advisory — not blocking.)");
+            return;
+          }
+          console.log(`Found work key(s): ${keys.join(", ")}`);
+          // A key that matches the PATTERN is not a key that EXISTS. Every PR in one recent session
+          // carried an invented `AIO-48x` that no task had: the work looked tracked, this check went
+          // green, and none of it could ever link to a task on the timeline. Shape alone is not a
+          // check, so ask the brain whether the key is real.
+          const brain = process.env.AIOS_BRAIN_URL;
+          const key = process.env.AIOS_API_KEY;
+          const team = process.env.AIOS_TEAM;
+          if (!brain || !key || !team) {
+            console.log("::warning title=Work key not verified::brain credentials not configured — only the FORMAT was checked.");
+            return;
+          }
+          const res = await fetch(`${brain.replace(/\/$/, "")}/api/v1/tasks?all=1`, {
+            headers: { Authorization: `Bearer ${key}`, "X-AIOS-Team": team },
+          });
+          if (!res.ok) {
+            // Couldn't ask ≠ the key is fake. Advisory job, so never fail on OUR outage.
+            console.log(`::warning title=Work key not verified::brain returned ${res.status} — only the FORMAT was checked.`);
+            return;
+          }
+          const body = await res.json();
+          // `?all=1` is bounded at 500 rows (documented) and does NOT paginate, so a full page is a
+          // PREFIX of the table — the stalest rows, since it orders `updated_at` ascending. Absence from
+          // a prefix is not absence from the table; presence in it is still proof.
+          const truncated = taskRowsFrom(body).length >= TASKS_PAGE_BOUND;
+          const verdict = verifyKeys(keys, knownKeysFrom(body), { truncated });
+          if (verdict.status === "unverified" && verdict.reason === "truncated") {
+            console.log(`::warning title=Work key not verified::${verdict.keys.join(", ")} was not in the ${verdict.checked} tasks the brain returned — but that response is capped at ${TASKS_PAGE_BOUND} rows and returns the STALEST first, so the key may simply be past the cap. Only the FORMAT was verified. (To make this provable, the tasks endpoint needs a by-key lookup or a table-mode cursor.)`);
+          } else if (verdict.status === "unverified") {
+            console.log(`::warning title=Work key not verified::the brain returned no task keys, so ${verdict.keys.join(", ")} could not be checked — only the FORMAT was verified. (If the brain really has tasks, this check is misreading the response.)`);
+          } else if (verdict.status === "invented") {
+            console.log(
+              `::warning title=Work key does not exist::${verdict.invented.join(", ")} matches the key format but ` +
+                `no task in the brain has it, so this work will link to nothing on the timeline. ` +
+                `Use a real key or create the task. (${verdict.checked} task keys checked.)`
+            );
+          } else {
+            console.log(`All work key(s) exist in the brain (${verdict.checked} checked) — merge will advance the matching task(s) to Done.`);
           }
           })().catch((err) => console.log(`::warning title=Work-key check errored::${err && err.message}`));
           NODE

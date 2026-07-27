@@ -68,9 +68,18 @@ The four required jobs (`docs-drift`, `brain-tests`, `datamechanics-tests`, `ing
 
 ### `aios-work-sync.yml` — fires on merge to `main`
 
-Extracts `AIOS-Work: <KEY>` from the PR title/body and POSTs a merge event to `/api/v1/work-events`. This closes the matching issue in the team's primary PM tool automatically — currently **Linear** (the brain projects the merge event to whichever provider `teams.primary_pm_provider` names; the sync path itself is provider-neutral).
+Extracts work keys from the PR **title, body and branch ref** and POSTs a merge event to `/api/v1/work-events`. This closes the matching issue in the team's primary PM tool automatically — currently **Linear** (the brain projects the merge event to whichever provider `teams.primary_pm_provider` names; the sync path itself is provider-neutral).
 
 **Required secrets:** `AIOS_BRAIN_URL`, `AIOS_API_KEY`, `AIOS_TEAM`
+
+### Work-key extraction — `scripts/pr-work-keys.mjs` (ONE copy)
+
+Both this workflow and `pr-task-link.yml` (advisory) read a PR for the ticket it cites, and both call the same module — guarded by `test/guards/work-key-single-matcher.test.ts`, which discovers workflows from disk so a new one can't inline its own copy. They used to have one each, so the advisory check could clear a PR whose keys the merge step then read differently.
+
+Two behaviours worth knowing:
+
+- **Quoted keys don't count.** HTML comments, fenced blocks and inline code are stripped from the body before matching, so prose like ``supersedes `AIO-100` `` is not a citation. That direction is deliberate: `/api/v1/work-events` sets `status='done'` on a key matching a task in the pushed project, so over-matching closes the **wrong** ticket silently, while under-matching only leaves the board stale — and the advisory check announces that at open time.
+- **The existence check can say "I don't know."** `GET /api/v1/tasks?all=1` is capped at 500 rows and does not paginate, so on a team with more tasks the answer is a prefix of the stalest ones. A key found there is confirmed; a key absent from a **full** page reports `unverified`, never "invented" — the check is not allowed to accuse on data it never saw. Making it provable for every key needs a by-key lookup or a table-mode cursor on the tasks endpoint.
 
 ---
 

@@ -18,10 +18,17 @@ jobs:
       AIOS_TEAM: ${{ secrets.AIOS_TEAM }}
       AIOS_PROJECT: aios-team-brain
     steps:
+      - uses: actions/checkout@v4
       - name: Post merged work event
         run: |
           node <<'NODE'
+          // Async IIFE so the shared ESM helper can be `await import`ed from this CommonJS heredoc.
+          (async () => {
           const fs = require("node:fs");
+          // ONE matcher, shared with pr-task-link.yml (`scripts/pr-work-keys.mjs`) and unit-tested. These
+          // were two inline copies: the advisory check could clear a PR whose keys THIS step — the one
+          // that actually closes tickets — then read differently.
+          const { extractWorkKeys } = await import("./scripts/pr-work-keys.mjs");
 
           const brain = process.env.AIOS_BRAIN_URL;
           const key = process.env.AIOS_API_KEY;
@@ -33,14 +40,7 @@ jobs:
 
           const event = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, "utf8"));
           const pr = event.pull_request;
-          // Strip HTML comments first so PR-template placeholders (e.g. `<!-- e.g. AIO-72 -->`) aren't matched.
-          const text = [
-            pr.title || "",
-            (pr.body || "").replace(/<!--[\s\S]*?-->/g, " "),
-            pr.head?.ref || "",
-          ].join("\n");
-          const re = /\b(?:AIOS-Work:\s*)?([A-Z][A-Z0-9]+-\d+|[A-Z]\d+(?:\.\d+)*)\b/g;
-          const workKeys = [...new Set([...text.matchAll(re)].map((m) => m[1]))];
+          const workKeys = extractWorkKeys(pr);
 
           const payload = {
             project: process.env.AIOS_PROJECT,
@@ -56,7 +56,10 @@ jobs:
           };
 
           const url = `${brain.replace(/\/$/, "")}/api/v1/work-events`;
-          fetch(url, {
+          // AWAITED. An un-awaited fetch does keep the loop alive, so this worked — but it worked by
+          // relying on an in-flight socket being an active handle, which is not a property to bet the
+          // only task-closing step on. Now the IIFE cannot resolve before the POST has answered.
+          await fetch(url, {
             method: "POST",
             headers: {
               "Authorization": `Bearer ${key}`,
@@ -75,4 +78,7 @@ jobs:
             console.error(err);
             process.exit(1);
           });
+          // Unlike the advisory check, this step FAILS loudly: it is the only thing that closes a task, so
+          // a silent skip would leave the board wrong with a green tick next to it.
+          })().catch((err) => { console.error(err); process.exit(1); });
           NODE
