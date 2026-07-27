@@ -96,6 +96,20 @@ function TaskCard({ task }: { task: TaskGroup }) {
   return (
     <div className="flex flex-col gap-2 rounded-md border border-border-subtle/60 p-2.5">
       <div className="flex items-center gap-2">
+        {/* WHOSE task — shown only when it ISN'T yours. The timeline credits work to whoever DID it, so a
+            teammate's ticket legitimately lands on your day, and nothing distinguished it from your own.
+            A miniature avatar on the left reads as "this one is theirs" at a glance, without a row of
+            explanatory text on every task. Carries a title + SR-only name because a face is not text. */}
+        {task.assignee ? (
+          <span className="flex shrink-0 items-center" title={`${task.assignee.name}'s task`}>
+            <MemberAvatar
+              person={{ displayName: task.assignee.name, avatarUrl: task.assignee.avatarUrl }}
+              size={16}
+              className="ring-1 ring-border-subtle"
+            />
+            <span className="sr-only">{task.assignee.name}&rsquo;s task —</span>
+          </span>
+        ) : null}
         <SourceIcon source={task.source} className="size-4" />
         <span className="min-w-0 flex-1 truncate text-sm font-medium text-ink">{task.title}</span>
         <StatusPill status={task.status} />

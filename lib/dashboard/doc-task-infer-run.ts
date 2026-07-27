@@ -6,6 +6,7 @@ import { resolveAnsweringKeys } from "@/lib/query/answering";
 import { llmConfigured } from "./timeline-summary";
 import { resolveItemCreditIds } from "@/lib/attribution/contributor-credit";
 import { computeTaskLinks } from "./issue-ref";
+import { assigneeMember, type RosterPerson } from "./people-match";
 import { classifyWork } from "./work-classification";
 import { normalizeSource } from "./timeline-group";
 import {
@@ -29,8 +30,9 @@ import { recordIngestRun } from "@/lib/ingest/runs";
  *
  * A design doc rarely cites `AIO-494` in its title or path, so the deterministic matcher leaves it in the
  * timeline's "Other" bucket even when it is plainly the work behind a ticket. This reads those unlinked
- * docs plus each worker's OWN candidate tasks and asks the model, one batched call per worker, which belongs to which —
- * or, expectedly, neither. Confident answers are persisted as `task_evidence` rows with `method='llm'`.
+ * docs plus the team's candidate tasks — the worker's OWN ranked and MARKED first, then everyone else's —
+ * and asks the model, one batched call per worker, which belongs to which — or, expectedly, neither.
+ * Confident answers are persisted as `task_evidence` rows with `method='llm'`.
  *
  * SECOND WRITER of `task_evidence`, alongside `./timeline-evidence` (`method='issue_ref'`). The two are
  * disjoint by construction: each prunes only its OWN method, and this one never scores a doc that already
@@ -40,8 +42,9 @@ import { recordIngestRun } from "@/lib/ingest/runs";
  *   • BACKGROUND only — the ingest scheduler, never a request path.
  *   • Short-circuits before spending anything when the team has no LLM configured (`llmConfigured`).
  *   • ONE batched call PER WORKER in the batch (2-3 in practice), with capped docs, capped candidates and a
- *     capped body excerpt. Per worker, not per team, because candidates are scoped to the doc's own
- *     assignee — a single team-wide call would score everyone's docs against one person's backlog.
+ *     capped body excerpt. Per worker, not per team, because the candidate list is ORDERED and MARKED for
+ *     one person ("assigned to this document's author") — a single team-wide call would hand everyone
+ *     else a prompt ranked, and labelled, for the wrong person.
  *   • Skips entirely when the inputs are unchanged since the last run — the hash covers doc CONTENT, the
  *     candidate set and the system prompt, and is carried on the recorded `ingest_runs` row.
  *   • Never throws: a failure records an unhealthy run and leaves the previous edges in place.
@@ -206,12 +209,16 @@ export async function runDocTaskInference(
 
     // Resolve each task's assignee to a member so ranking uses the identity mapping, not the raw string
     // (prod carries `Chetan` / `chetan.nandakumar` / `John Ellison` / `john` for two people).
-    const assigneeToMember = await resolveAssigneeMembers(db, teamId, tasks.map((t) => t.assignee));
+    // ONE resolver, shared with the timeline (`people-match.assigneeMember`). Two differently-fuzzy
+    // copies is how the card and this pass came to disagree about who owns a task: an exact-match copy
+    // resolved `"Chetan"` against display name "Chetan Nandakumar" to null, so his own task was ranked
+    // as someone else's here while the card called it his.
+    const roster = await teamRoster(db, teamId);
     const candidates: InferCandidate[] = tasks.map((t) => ({
       id: t.id,
       rowKey: t.row_key,
       title: t.title || "(untitled task)",
-      assigneeMemberId: assigneeToMember.get((t.assignee ?? "").trim().toLowerCase()) ?? null,
+      assigneeMemberId: assigneeMember(t.assignee, roster),
     }));
 
     // SKIP-IF-ALREADY-SCORED, **per item**. Same doc content + same question → the previous answer still
@@ -239,11 +246,11 @@ export async function runDocTaskInference(
     // Only NOW pull prose, and only for the ≤MAX_DOCS docs actually being scored.
     const withBodies = await attachBodies(db, teamId, scoreable);
 
-    // ONE CALL PER WORKER, not one per batch. `candidatesFor` now offers only the tasks assigned to the
-    // doc's own worker, so a single call built from the FIRST doc's author would score everyone else's
-    // docs against THAT person's tasks — which is precisely the cross-assignment this restriction
-    // exists to stop, made worse. Grouping by worker keeps each doc scored against its own backlog; the
-    // call count is the number of distinct people in the batch (2–3 in practice), not the doc count.
+    // ONE CALL PER WORKER, not one per batch. Every worker is offered the same tasks, but `candidatesFor`
+    // RANKS their own first and `buildInferPrompt` MARKS those as the author's — both derived from one
+    // person. A single call built from the FIRST doc's author would therefore label John's tickets as
+    // Chetan's to the model, actively arguing for the cross-person link the ordering exists to discourage.
+    // The call count is the number of distinct people in the batch (2–3 in practice), not the doc count.
     const byWorker = new Map<string, InferDoc[]>();
     for (const doc of withBodies) {
       if (!doc.memberId) continue; // `scoreableDocs` already drops these; belt-and-braces
@@ -259,8 +266,11 @@ export async function runDocTaskInference(
     let workersFailed = 0;
     for (const docs of byWorker.values()) {
       const ranked = candidatesFor(docs[0], candidates);
-      // No assigned tasks → nothing to ask, and that IS the answer: settle them, or they occupy the
-      // oldest-first batch slots forever and the backlog never drains past them.
+      // UNREACHABLE today — `candidates` is non-empty (the run returns `no-candidates` above when the team
+      // has no tasks) and `candidatesFor` no longer filters, so `ranked` always has something. Kept because
+      // the alternative to settling an empty list is asking the model to match against zero tasks: a paid
+      // call that can only answer "no match", every run, for docs that then never leave the batch. If the
+      // candidate list is ever narrowed again, that regression is silent — this branch is what stops it.
       if (!ranked.length) {
         settled.push(...docs);
         continue;
@@ -482,32 +492,24 @@ async function record(
   });
 }
 
-/** assignee string (lowercased) → member id, via the roster. Best-effort; unmatched names stay null. */
-async function resolveAssigneeMembers(
-  db: DbClient,
-  teamId: string,
-  assignees: readonly (string | null)[]
-): Promise<Map<string, string>> {
-  const out = new Map<string, string>();
-  const wanted = new Set(assignees.map((a) => (a ?? "").trim().toLowerCase()).filter(Boolean));
-  if (!wanted.size) return out;
-  // THROWS on a read failure — no longer best-effort, because this is no longer a ranking nicety.
-  // Candidates are now scoped to the doc's own worker, so an empty map means EVERY worker gets zero
-  // candidates, every group is settled as "nothing to ask", and the run prunes the batch's links and
-  // records the docs as scored — a transient `members` hiccup silently eating the team's inferred links
-  // and skipping those docs until their content changes. A thrown error records a failed run instead,
-  // and the cooldown retries it.
+/**
+ * The team's active roster, for `assigneeMember`.
+ *
+ * THROWS on a read failure — deliberately not best-effort. Ownership now decides candidate RANKING (own
+ * tasks first, and the prompt marks them as the author's), so an empty roster silently downgrades every
+ * task to "someone else's" and the product rule stops applying with no signal. A thrown error records a
+ * failed run instead, and the cooldown retries it.
+ */
+async function teamRoster(db: DbClient, teamId: string): Promise<RosterPerson[]> {
   const { data, error } = await db
     .from("members")
-    .select("id, display_name, actor_handle, email")
+    .select("id, display_name, actor_handle")
     .eq("team_id", teamId)
     .eq("status", "active");
-  if (error) throw new Error(`assignee resolution failed: ${error.message}`);
-  for (const m of (data ?? []) as { id: string; display_name: string | null; actor_handle: string | null; email: string | null }[]) {
-    for (const key of [m.display_name, m.actor_handle, m.email]) {
-      const k = (key ?? "").trim().toLowerCase();
-      if (k && wanted.has(k) && !out.has(k)) out.set(k, m.id);
-    }
-  }
-  return out;
+  if (error) throw new Error(`roster read failed: ${error.message}`);
+  return ((data ?? []) as { id: string; display_name: string | null; actor_handle: string | null }[]).map((m) => ({
+    memberId: m.id,
+    displayName: m.display_name ?? "",
+    handle: m.actor_handle ?? "",
+  }));
 }

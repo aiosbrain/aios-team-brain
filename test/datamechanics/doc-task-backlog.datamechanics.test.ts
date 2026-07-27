@@ -136,7 +136,7 @@ describe("doc→task inference: never scores across people (real Postgres)", () 
     expect(await llmLinkedItemIds(seed.teamId)).toContain(theirs.id);
   });
 
-  it("offers each worker only their OWN tasks, in separate calls", async () => {
+  it("gives each worker their OWN tasks FIRST, in separate calls", async () => {
     const { seed } = await seedTeamWithTask(); // task AIO-900 assigned to "Tester" (the seed member)
     // A second person with their own task and their own doc.
     const { data: other } = await db().from("members").insert({
@@ -160,7 +160,9 @@ describe("doc→task inference: never scores across people (real Postgres)", () 
     completeTextOrNull.mockResolvedValue(JSON.stringify({ matches: [] }));
     await runDocTaskInference(db(), seed.teamId, { maxDocs: 10 });
 
-    // TWO calls, one per worker — and neither prompt may contain the other person's task title.
+    // TWO calls, one per worker. Per-worker matters even though candidates are no longer restricted:
+    // the ORDER is per-worker ("own tasks first"), so a single call built from one author's ranking
+    // would hand everyone else a prompt ranked for the wrong person.
     const prompts = completeTextOrNull.mock.calls.map((c: unknown[]) => (c[0] as { prompt: string }).prompt);
     expect(prompts.length).toBe(2);
     // The prompt carries synthetic `D1`/`T1` refs, never real ids (the hallucination defence), so the
@@ -169,8 +171,12 @@ describe("doc→task inference: never scores across people (real Postgres)", () 
     const theirsCall = prompts.find((p: string) => p.includes("their doc"));
     expect(mineCall).toBeDefined();
     expect(theirsCall).toBeDefined();
-    expect(mineCall).not.toContain("Other Person's ticket about widgets"); // never offered a teammate's ticket
-    expect(theirsCall).not.toContain("The task"); // …and vice versa
+    // A teammate's ticket IS offered — a doc about someone else's work is a real case, and the card
+    // now names the owner so the association is legible. What must hold is the ORDER: your own first.
+    const ownFirst = (prompt: string, own: string, other: string) =>
+      prompt.indexOf(own) >= 0 && (prompt.indexOf(other) < 0 || prompt.indexOf(own) < prompt.indexOf(other));
+    expect(ownFirst(mineCall!, "The task", "Other Person's ticket about widgets")).toBe(true);
+    expect(ownFirst(theirsCall!, "Other Person's ticket about widgets", "The task")).toBe(true);
   });
 });
 
