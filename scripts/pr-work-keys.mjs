@@ -34,10 +34,11 @@ const WORK_KEY_RE = /\b(?:AIOS-Work:\s*)?([A-Z][A-Z0-9]+-\d+|[A-Z]\d+(?:\.\d+)*)
 export function prSearchText(pr) {
   const prose = String(pr?.body ?? "")
     .replace(/<!--[\s\S]*?-->/g, " ")
-    // Fences: ``` or ~~~, and an UNCLOSED fence swallows the rest of the body. A lazy `[\s\S]*?` needs a
-    // closing fence, so one stray ``` left everything after it matchable — failing toward over-match,
-    // which is the direction that closes someone else's ticket.
-    .replace(/(^|\n)(```|~~~)[\s\S]*?(\n\2|$)/g, " ")
+    // Fences: ``` or ~~~, indented up to 3 spaces (GitHub still renders those as a fence — a block nested
+    // under a list item is the common case), and an UNCLOSED fence swallows the rest of the body. A lazy
+    // `[\s\S]*?` needs a closing fence, so one stray ``` left everything after it matchable. Both gaps
+    // failed toward OVER-match, the direction that closes someone else's ticket on merge.
+    .replace(/(^|\n)[ ]{0,3}(```|~~~)[\s\S]*?(\n[ ]{0,3}\2|$)/g, " ")
     .replace(/`[^`\n]*`/g, " ");
   return [String(pr?.title ?? ""), prose, String(pr?.head?.ref ?? "")].join("\n");
 }
@@ -88,7 +89,15 @@ export const TASKS_PAGE_BOUND = 500;
  * indistinguishable from a brain with no tasks. Accusing the author on no evidence is exactly what makes
  * an advisory warning worthless.
  */
-export function verifyKeys(keys, known, { truncated = false } = {}) {
+export function verifyKeys(keys, known, opts) {
+  // MANDATORY, and it throws rather than defaulting. `truncated = false` would be a default that ACCUSES:
+  // drop the argument — a plausible merge-conflict resolution, in glue code that lives in a YAML heredoc —
+  // and the false accusation comes back with every test still green. That is the exact class this module
+  // exists to end, so the omission has to fail loudly instead of quietly picking the unsafe branch.
+  if (typeof opts?.truncated !== "boolean") {
+    throw new Error("verifyKeys requires an explicit { truncated } — defaulting it would silently accuse");
+  }
+  const truncated = opts.truncated;
   if (!keys.length) return { status: "none" };
   if (!known.size) return { status: "unverified", keys, reason: "empty" };
   const invented = keys.filter((k) => !known.has(k));

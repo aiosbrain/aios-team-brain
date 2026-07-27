@@ -45,8 +45,27 @@ describe("extractWorkKeys — what the PR CLAIMS, not what it discusses", () => 
     expect(extractWorkKeys({ title: "", body: "x:\n~~~\nAIO-999\n~~~\n", head: { ref: "" } })).toEqual([]);
   });
 
+  it("ignores keys inside an INDENTED fence (a block nested under a list item)", () => {
+    // GitHub renders up to 3 spaces of indentation as a fence. Missing them is the over-match direction:
+    // a key merely quoted in a nested example would be POSTed on merge and could close the wrong ticket.
+    expect(extractWorkKeys({ title: "", body: "- example:\n  ```\n  AIOS-Work: AIO-999\n  ```\n", head: { ref: "" } })).toEqual([]);
+  });
+
   it("ignores the PR template's commented-out placeholder", () => {
     expect(extractWorkKeys({ title: "", body: "<!-- e.g. AIO-72 -->", head: { ref: "" } })).toEqual([]);
+  });
+
+  it("does NOT over-strip: a real claim between two fenced blocks survives", () => {
+    // The stripping must only remove the quoted parts. Over-stripping is the direction that silently
+    // stops closing tasks on merge, with a green tick — so it gets its own tests, not just the under
+    // -stripping ones above.
+    const body = "```\nAIO-900\n```\n\nAIOS-Work: AIO-1\n\n```\nAIO-901\n```";
+    expect(extractWorkKeys({ title: "", body, head: { ref: "" } })).toEqual(["AIO-1"]);
+  });
+
+  it("does NOT over-strip: a key AFTER a closed fence, or BEFORE an unclosed one, survives", () => {
+    expect(extractWorkKeys({ title: "", body: "```\nx\n```\nAIOS-Work: AIO-7", head: { ref: "" } })).toEqual(["AIO-7"]);
+    expect(extractWorkKeys({ title: "", body: "AIOS-Work: AIO-8\n\n```\nAIO-999 blah", head: { ref: "" } })).toEqual(["AIO-8"]);
   });
 
   it("still finds a real key in a body that ALSO discusses keys in code spans", () => {
@@ -87,19 +106,19 @@ describe("verifyKeys — 'we couldn't ask' is NOT 'your key is fake'", () => {
     // failure that trains everyone to ignore the warning.
     // `reason` distinguishes the two ways we can fail to know: nothing came back at all vs. a full page
     // that may not contain it. The warning text differs, because the fix differs.
-    expect(verifyKeys(["AIO-484"], new Set())).toEqual({ status: "unverified", keys: ["AIO-484"], reason: "empty" });
+    expect(verifyKeys(["AIO-484"], new Set(), { truncated: false })).toEqual({ status: "unverified", keys: ["AIO-484"], reason: "empty" });
   });
 
   it("reports INVENTED only when the brain demonstrably has other keys", () => {
-    expect(verifyKeys(["AIO-999"], new Set(["AIO-484"]))).toEqual({ status: "invented", invented: ["AIO-999"], checked: 1 });
+    expect(verifyKeys(["AIO-999"], new Set(["AIO-484"]), { truncated: false })).toEqual({ status: "invented", invented: ["AIO-999"], checked: 1 });
   });
 
   it("reports OK when every cited key exists", () => {
-    expect(verifyKeys(["AIO-484"], new Set(["AIO-484", "AIO-537"]))).toEqual({ status: "ok", checked: 2 });
+    expect(verifyKeys(["AIO-484"], new Set(["AIO-484", "AIO-537"]), { truncated: false })).toEqual({ status: "ok", checked: 2 });
   });
 
   it("reports NONE when the PR cites nothing", () => {
-    expect(verifyKeys([], new Set(["AIO-484"]))).toEqual({ status: "none" });
+    expect(verifyKeys([], new Set(["AIO-484"]), { truncated: false })).toEqual({ status: "none" });
   });
 });
 
@@ -138,6 +157,14 @@ describe("a truncated read cannot prove a key is fake", () => {
     // detecting truncation and goes back to accusing.
     const route = readFileSync(join(process.cwd(), "app", "api", "v1", "tasks", "route.ts"), "utf8");
     expect(route).toContain(`const PAGE = ${TASKS_PAGE_BOUND};`);
+  });
+
+  it("THROWS if the caller omits `truncated` — a default would silently accuse", () => {
+    // The glue that computes `truncated` lives in a YAML heredoc, which is where this whole bug came
+    // from. Dropping the argument is a plausible merge-conflict resolution; with a `false` default that
+    // brings the false accusation back with every test still green. It has to fail loudly instead.
+    expect(() => verifyKeys(["AIO-484"], new Set(["X-1"]))).toThrow(/explicit \{ truncated \}/);
+    expect(() => verifyKeys(["AIO-484"], new Set(["X-1"]), {})).toThrow(/explicit \{ truncated \}/);
   });
 
   it("taskRowsFrom counts rows across project groups, so truncation is detectable", () => {
