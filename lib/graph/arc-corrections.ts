@@ -42,9 +42,13 @@ export async function recordArcCorrections(
   corrections: readonly ArcCorrectionInput[]
 ): Promise<void> {
   if (corrections.length === 0) return;
+  // Last write wins within a batch. Postgres refuses an ON CONFLICT that would touch the same row twice
+  // ("cannot affect row a second time"), and the API takes an array — so a caller that isn't the UI can
+  // send two takes on one arc and get a 500 instead of a save.
+  const byArc = new Map(corrections.map((c) => [c.arc_id, c]));
   const now = new Date().toISOString();
   const { error } = await db.from("arc_corrections").upsert(
-    corrections.map((c) => ({
+    [...byArc.values()].map((c) => ({
       team_id: teamId,
       arc_id: c.arc_id,
       arc_title: c.arc_title,
@@ -65,24 +69,32 @@ export async function recordArcCorrections(
  * fact, so wiping the graph didn't just lose the record — it lost the influence. Reading from Postgres
  * means a rebuilt graph still produces corrected arcs.
  *
- * Best-effort: a correction that can't be read should not take the arcs panel down with it. It degrades
- * to "synthesis without corrections", which is the pre-correction behaviour, and the row is still there
- * for the next attempt.
+ * Reports `ok: false` rather than degrading quietly. "Synthesis without corrections" sounds like a safe
+ * fallback and is not: pre-correction behaviour IS the version a human rejected. Swallowing the error
+ * would drop them from `userPrompt`, change `factsHash`, re-run the model, and stamp the uncorrected
+ * arcs FRESH for 4h — H13's exact user-visible symptom (the edit reverts on its own) coming back through
+ * a new door, and H11's shape besides. The caller marks the synthesis degraded instead, which keeps the
+ * corrected prior and retries soon.
  */
 export async function listArcCorrections(
   db: DbClient,
   teamId: string,
   limit = CORRECTION_PROMPT_LIMIT
-): Promise<StoredArcCorrection[]> {
+): Promise<{ corrections: StoredArcCorrection[]; ok: boolean }> {
   try {
     const { data, error } = await db
       .from("arc_corrections")
       .select("arc_id, arc_title, corrected_text, created_by, updated_at")
       .eq("team_id", teamId)
       .order("updated_at", { ascending: false })
+      // A whole batch is written with ONE `now`, so `updated_at` alone leaves equal-timestamp rows in
+      // whatever order the plan returns. That flips the prompt's order between refreshes, which flips
+      // `factsHash`, which intermittently defeats the reuse skip — the same reason `recentFacts` is
+      // uuid-tiebroken.
+      .order("arc_id", { ascending: true })
       .limit(limit);
     if (error) throw new Error(error.message);
-    return ((data ?? []) as Record<string, unknown>[]).map((r) => ({
+    const corrections = ((data ?? []) as Record<string, unknown>[]).map((r) => ({
       arc_id: String(r.arc_id ?? ""),
       arc_title: String(r.arc_title ?? ""),
       corrected_text: String(r.corrected_text ?? ""),
@@ -90,11 +102,12 @@ export async function listArcCorrections(
       updated_at:
         r.updated_at instanceof Date ? r.updated_at.toISOString() : String(r.updated_at ?? ""),
     }));
+    return { corrections, ok: true };
   } catch (err) {
     console.error(
-      "[arcs] could not read stored corrections — synthesizing without them:",
+      "[arcs] could not read stored corrections — refusing to synthesize without them:",
       err instanceof Error ? err.message : err
     );
-    return [];
+    return { corrections: [], ok: false };
   }
 }

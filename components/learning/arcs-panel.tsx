@@ -41,6 +41,7 @@ export function ArcsPanel({ teamSlug }: { teamSlug: string }) {
   const [editing, setEditing] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
   const [recomputing, setRecomputing] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
 
   useEffect(() => {
     let alive = true;
@@ -75,9 +76,17 @@ export function ArcsPanel({ teamSlug }: { teamSlug: string }) {
   }
 
   async function recompute() {
-    const corrections = Object.entries(edited).map(([arc_id, corrected_text]) => ({ arc_id, corrected_text }));
+    const corrections = Object.entries(edited).map(([arc_id, corrected_text]) => ({
+      arc_id,
+      corrected_text,
+      // `arc_id` is a hash of the title and churns on every recompute, so the server stores the title
+      // beside it to keep the correction diagnosable afterwards. Sending it is what makes that work —
+      // without it every stored row has an empty title and the column is decoration.
+      arc_title: arcs.find((a) => a.id === arc_id)?.title ?? "",
+    }));
     if (!corrections.length) return;
     setRecomputing(true);
+    setSaveError(null);
     try {
       const res = await fetch("/api/brain/arcs/recompute", {
         method: "POST",
@@ -88,7 +97,14 @@ export function ArcsPanel({ teamSlug }: { teamSlug: string }) {
         const data = (await res.json()) as { arcs?: Arc[] };
         setArcs(data.arcs ?? []);
         setEdited({});
+      } else {
+        // Say so. A failed save used to stop the spinner and leave the old arcs, which reads exactly
+        // like "nothing happened" — the same silent-revert experience H13 is about, one layer up. The
+        // edits stay in `edited`, so the retry is one click.
+        setSaveError("Could not save your correction — it has not been applied. Try again.");
       }
+    } catch {
+      setSaveError("Could not reach the server — your correction has not been saved.");
     } finally {
       setRecomputing(false);
     }
@@ -236,6 +252,11 @@ export function ArcsPanel({ teamSlug }: { teamSlug: string }) {
             Recompute
           </button>
         </div>
+      ) : null}
+      {saveError ? (
+        <p role="alert" className="px-1 pt-2 text-sm text-rose-500">
+          {saveError}
+        </p>
       ) : null}
     </div>
   );

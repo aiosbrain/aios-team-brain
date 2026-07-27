@@ -1670,6 +1670,19 @@ create index if not exists graph_episodes_team_idx on graph_episodes (team_id, p
 -- `arcs` is the fully-attributed NarrativeArc[] JSON. Read serves-stale-while-revalidate (a stale row
 -- is returned immediately while a background recompute refreshes it) — see getArcs. Regenerable cache,
 -- not a source of truth. Sole writer: lib/graph/arc-cache (via lib/graph/arcs).
+create table if not exists arc_cache (
+  team_id uuid not null references teams(id) on delete cascade,
+  group_key text not null,                       -- sorted visible-group set, e.g. 'acme_external,acme_team'
+  arcs jsonb not null default '[]'::jsonb,        -- NarrativeArc[] (already human-attributed)
+  -- Hash of the exact LLM synthesis input (the attributed fact prompt). The background refresh SKIPS the
+  -- (non-deterministic) LLM re-synthesis when this is unchanged — so arcs only change when the underlying
+  -- work does, killing day-to-day churn. Nullable: pre-existing rows have none until the next recompute.
+  facts_hash text,
+  computed_at timestamptz not null default now(),
+  primary key (team_id, group_key)
+);
+alter table arc_cache add column if not exists facts_hash text;
+
 -- Human corrections to narrative arcs — the ONLY human-authored input in the learning layer, and the
 -- reason it needs a real home. These used to exist solely as Graphiti episodes written inside a
 -- swallowed catch: a graph rollback destroyed them permanently, and a failed write silently reverted the
@@ -1688,19 +1701,6 @@ create table if not exists arc_corrections (
   unique (team_id, arc_id)                     -- latest take per arc wins
 );
 create index if not exists arc_corrections_team_idx on arc_corrections (team_id, updated_at desc);
-
-create table if not exists arc_cache (
-  team_id uuid not null references teams(id) on delete cascade,
-  group_key text not null,                       -- sorted visible-group set, e.g. 'acme_external,acme_team'
-  arcs jsonb not null default '[]'::jsonb,        -- NarrativeArc[] (already human-attributed)
-  -- Hash of the exact LLM synthesis input (the attributed fact prompt). The background refresh SKIPS the
-  -- (non-deterministic) LLM re-synthesis when this is unchanged — so arcs only change when the underlying
-  -- work does, killing day-to-day churn. Nullable: pre-existing rows have none until the next recompute.
-  facts_hash text,
-  computed_at timestamptz not null default now(),
-  primary key (team_id, group_key)
-);
-alter table arc_cache add column if not exists facts_hash text;
 
 -- ── work-timeline cache (the persisted, queryable work-timeline context layer) ──
 -- The day → person → work ledger (from `items` + `tasks`) assembled by lib/dashboard/work-timeline,

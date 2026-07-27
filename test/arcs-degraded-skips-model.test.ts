@@ -126,7 +126,7 @@ describe("a degraded synthesis never reaches the model", () => {
     llmMock.completeTextOrNull.mockResolvedValue('{"arcs":[]}');
     gateMock.arcIneligibleItemIds.mockResolvedValue(new Set());
     creditMock.resolveItemCredit.mockResolvedValue(new Map());
-    correctionsMock.listArcCorrections.mockResolvedValue([]);
+    correctionsMock.listArcCorrections.mockResolvedValue({ corrections: [], ok: true });
     correctionsMock.recordArcCorrections.mockResolvedValue(undefined);
   });
 
@@ -211,9 +211,12 @@ describe("H13: a stored correction reaches synthesis even with the graph wiped",
     // influence, and arcs quietly reverted to the version a human had already rejected. Reading the
     // corrections from Postgres on every synthesis is what makes a rebuilt graph still produce corrected
     // arcs. Nothing here goes near Graphiti: the facts leg is mocked and GRAPHITI_URL is unset.
-    correctionsMock.listArcCorrections.mockResolvedValue([
-      { arc_id: "a1", arc_title: "Payments", corrected_text: "Dana led this, not Alex.", created_by: null, updated_at: "" },
-    ]);
+    correctionsMock.listArcCorrections.mockResolvedValue({
+      corrections: [
+        { arc_id: "a1", arc_title: "Payments", corrected_text: "Dana led this, not Alex.", created_by: null, updated_at: "" },
+      ],
+      ok: true,
+    });
     factsMock.recentFacts.mockResolvedValue({ facts: [FACT], ok: true });
     factsMock.resolveEpisodeItems.mockResolvedValue({
       items: new Map([["ep-1", { itemId: "11111111-1111-4111-8111-111111111111", source: "github" }]]),
@@ -227,6 +230,8 @@ describe("H13: a stored correction reaches synthesis even with the graph wiped",
     expect(llmMock.completeTextOrNull).toHaveBeenCalled();
     const prompt = JSON.stringify(llmMock.completeTextOrNull.mock.calls[0]);
     expect(prompt).toContain("Dana led this, not Alex.");
+    // …and read for THIS team. The mock answers any argument, so without this a wrong teamId would pass.
+    expect(correctionsMock.listArcCorrections).toHaveBeenCalledWith(expect.anything(), "team-1");
   });
 });
 
@@ -242,15 +247,18 @@ describe("H13 tier: corrections are team-authored and must not reach an EXTERNAL
       items: new Map([["ep-1", { itemId: "11111111-1111-4111-8111-111111111111", source: "github" }]]),
       ok: true,
     });
-    correctionsMock.listArcCorrections.mockResolvedValue([
-      {
-        arc_id: "a1",
-        arc_title: "Payments",
-        corrected_text: "INTERNAL: Dana is leaving, reassign this before the client hears.",
-        created_by: null,
-        updated_at: "",
-      },
-    ]);
+    correctionsMock.listArcCorrections.mockResolvedValue({
+      corrections: [
+        {
+          arc_id: "a1",
+          arc_title: "Payments",
+          corrected_text: "INTERNAL: Dana is leaving, reassign this before the client hears.",
+          created_by: null,
+          updated_at: "",
+        },
+      ],
+      ok: true,
+    });
   });
 
   it("keeps correction text out of an external viewer's prompt", async () => {
@@ -291,9 +299,10 @@ describe("a STORED correction must not disable the stability skip", () => {
     gateMock.arcIneligibleItemIds.mockResolvedValue(new Set());
     creditMock.resolveItemCredit.mockResolvedValue(new Map());
     correctionsMock.recordArcCorrections.mockResolvedValue(undefined);
-    correctionsMock.listArcCorrections.mockResolvedValue([
-      { arc_id: "a1", arc_title: "P", corrected_text: "Dana led this.", created_by: null, updated_at: "" },
-    ]);
+    correctionsMock.listArcCorrections.mockResolvedValue({
+      corrections: [{ arc_id: "a1", arc_title: "P", corrected_text: "Dana led this.", created_by: null, updated_at: "" }],
+      ok: true,
+    });
     factsMock.recentFacts.mockResolvedValue({ facts: [FACT], ok: true });
     factsMock.resolveEpisodeItems.mockResolvedValue({
       items: new Map([["ep-1", { itemId: "11111111-1111-4111-8111-111111111111", source: "github" }]]),

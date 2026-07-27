@@ -645,8 +645,18 @@ async function synthesizeArcs(
   // Derived from `groups` rather than a second tier argument on purpose: `groups` is already THE
   // tier-scoping input, and a parallel parameter is one more thing that can disagree with it.
   const teamTier = groups.some((g) => !isExternalGroupId(g));
-  const stored = teamTier ? (await listArcCorrections(db, teamId)).map((c) => c.corrected_text) : [];
-  const allCorrections = [...new Set([...correctionTexts, ...stored])];
+  const correctionsRead = teamTier
+    ? await listArcCorrections(db, teamId)
+    : { corrections: [], ok: true };
+  const allCorrections = [
+    ...new Set([...correctionTexts, ...correctionsRead.corrections.map((c) => c.corrected_text)]),
+  ];
+
+  // Degradation is tracked from the FIRST leg that can fail, not swallowed: any leg leaving the
+  // synthesis inputs incomplete means `commitArcs` must refuse to overwrite good arcs with the
+  // plausible-but-wrong result that follows (H11). A failed corrections read is one of them —
+  // synthesizing without them would republish the very version a human rejected.
+  let degraded = !correctionsRead.ok;
 
   const factsRead = await recentFacts(groups, null, FACT_POOL);
   const pool = dedupeFacts(factsRead.facts);
@@ -657,13 +667,12 @@ async function synthesizeArcs(
   // Neo4j outage on a cold miss writes a blank panel stamped fresh for 4h — H12's shape, on the leg that
   // still conflated them.
   if (pool.length === 0 && allCorrections.length === 0)
-    return { arcs: [], factsHash: null, degraded: !factsRead.ok };
+    return { arcs: [], factsHash: null, degraded: degraded || !factsRead.ok };
   // Resolve attribution for the WHOLE pool (higher uuid cap to match) so balancing sees each fact's
   // human. epToItem/creditByItem stay supersets of the balanced set — safe for evidence + attribution.
   // Degradation is tracked, not swallowed: any leg below that fails leaves the synthesis inputs
   // incomplete, and `commitArcs` must then refuse to overwrite good arcs with the plausible-but-wrong
   // result that follows (H11). Each leg says whether it worked.
-  let degraded = false;
   const episodeItems = await resolveEpisodeItems(groups, pool.flatMap((f) => f.episodeUuids), FACT_POOL * 3);
   if (!episodeItems.ok) degraded = true;
   const epToItem = episodeItems.items;

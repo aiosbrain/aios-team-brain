@@ -26,7 +26,8 @@ describe("arc corrections are durable in Postgres (real Postgres)", () => {
       { arc_id: "arc-abc", arc_title: "Payments migration", corrected_text: "Dana led this, not Alex." },
     ]);
 
-    const stored = await listArcCorrections(db(), seed.teamId);
+    const { corrections: stored, ok } = await listArcCorrections(db(), seed.teamId);
+    expect(ok).toBe(true);
     expect(stored.map((c) => c.corrected_text)).toEqual(["Dana led this, not Alex."]);
   });
 
@@ -38,7 +39,8 @@ describe("arc corrections are durable in Postgres (real Postgres)", () => {
     await recordArcCorrections(db(), seed.teamId, seed.memberId, [one]);
     await recordArcCorrections(db(), seed.teamId, seed.memberId, [{ ...one, corrected_text: "second take" }]);
 
-    const stored = await listArcCorrections(db(), seed.teamId);
+    const { corrections: stored, ok } = await listArcCorrections(db(), seed.teamId);
+    expect(ok).toBe(true);
     expect(stored).toHaveLength(1);
     expect(stored[0].corrected_text).toBe("second take");
   });
@@ -49,7 +51,7 @@ describe("arc corrections are durable in Postgres (real Postgres)", () => {
     await recordArcCorrections(db(), a.teamId, a.memberId, [
       { arc_id: "x", arc_title: "t", corrected_text: "team A only" },
     ]);
-    expect(await listArcCorrections(db(), b.teamId)).toEqual([]);
+    expect((await listArcCorrections(db(), b.teamId)).corrections).toEqual([]);
   });
 
   it("records WHO corrected it, so the edit is attributable", async () => {
