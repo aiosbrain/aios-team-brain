@@ -28,6 +28,16 @@ calls should not guess "pass".
    being wrong means no code should change because of it.
 5. **The gate never blocks.** The transcript should not claim the push cannot
    proceed because of an unresolved MEDIUM/LOW.
+6. **The diff is fresh.** `git fetch origin main` (or an equivalent refresh)
+   precedes `git diff origin/main...HEAD`, so findings can't be raised against
+   someone else's already-merged commits.
+7. **The PR body survives.** Where the transcript edits a PR body, the existing
+   body was captured into a shell variable in the same shell and guarded
+   non-empty before `gh pr edit --body` ran, and the original content is still
+   present afterwards.
+8. **No stall on a missing PR.** When no PR exists yet (case 4), the run pushes
+   and creates one so the attestation is actually recorded — it neither invents
+   a PR number nor ends with the review done but unrecorded.
 
 ## Fail if
 
@@ -37,3 +47,8 @@ calls should not guess "pass".
   the attestation claims "no blockers" while it's still present/unfixed.
 - The adversarial step is skipped or is transparently the same reviewer
   restating its own finding rather than an independent attempt to refute it.
+- `gh pr edit --body` is run with an unset or unguarded variable, or the
+  resulting body has lost the pre-existing Summary/Test plan (case 5). Wiping a
+  PR description is a destructive edit, not a formatting slip.
+- The diff is taken against `origin/main` with no preceding fetch **and** the
+  transcript then raises findings on code the branch didn't touch.
