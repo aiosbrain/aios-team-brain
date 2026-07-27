@@ -5,7 +5,7 @@ import type { DbClient } from "@/lib/db/types";
 import { visibleItems, visibleTasks, visibleDecisions, type ViewerTier } from "@/lib/auth/visibility";
 import { commitSubject } from "./team-work";
 import { sourceRules } from "@/lib/ingest/source-rules";
-import { decisionActors, subjectMatchesMember, type RosterPerson } from "./people-match";
+import { assigneeMember, decisionActors, type RosterPerson } from "./people-match";
 import {
   groupTimeline,
   normalizeSource,
@@ -295,16 +295,16 @@ export async function getWorkTimeline(
   // present even when the all-status read clips at TASK_LIMIT. Evidence-gated in the grouper.
   const tasks = (taskRes.data ?? []) as TaskRow[];
 
-  // Assignee → member id, through the roster matcher: `tasks.assignee` is a free-text string the PM tool
-  // supplied and prod carries several spellings per person, so a raw compare would silently mark a
-  // teammate's task as unowned. Unresolved → null, and the card then says nothing rather than guessing.
-  const memberForAssignee = (assignee: string | null): string | null =>
-    assignee ? roster.find((p) => subjectMatchesMember(assignee, p))?.memberId ?? null : null;
+  // Assignee → member id, via the SHARED resolver (`assigneeMember`): `tasks.assignee` is a free-text
+  // string the PM tool supplied and prod carries several spellings per person, so a raw compare would
+  // mark a teammate's task as unowned — and a second, differently-fuzzy copy of this logic is how the
+  // card and the inference came to disagree about who owns a task. Ambiguous or unresolved → null, and
+  // the card then says nothing rather than showing the wrong face.
   const infoFor = (t: TaskRow): TaskInfo => ({
     title: t.title || "(untitled task)",
     status: t.status || "",
     source: pmSource,
-    assigneeMemberId: memberForAssignee(t.assignee),
+    assigneeMemberId: assigneeMember(t.assignee, roster),
   });
 
   const taskInfo = new Map<string, TaskInfo>();

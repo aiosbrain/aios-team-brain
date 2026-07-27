@@ -6,6 +6,7 @@ import { resolveAnsweringKeys } from "@/lib/query/answering";
 import { llmConfigured } from "./timeline-summary";
 import { resolveItemCreditIds } from "@/lib/attribution/contributor-credit";
 import { computeTaskLinks } from "./issue-ref";
+import { assigneeMember, type RosterPerson } from "./people-match";
 import { classifyWork } from "./work-classification";
 import { normalizeSource } from "./timeline-group";
 import {
@@ -206,12 +207,16 @@ export async function runDocTaskInference(
 
     // Resolve each task's assignee to a member so ranking uses the identity mapping, not the raw string
     // (prod carries `Chetan` / `chetan.nandakumar` / `John Ellison` / `john` for two people).
-    const assigneeToMember = await resolveAssigneeMembers(db, teamId, tasks.map((t) => t.assignee));
+    // ONE resolver, shared with the timeline (`people-match.assigneeMember`). Two differently-fuzzy
+    // copies is how the card and this pass came to disagree about who owns a task: an exact-match copy
+    // resolved `"Chetan"` against display name "Chetan Nandakumar" to null, so his own task was ranked
+    // as someone else's here while the card called it his.
+    const roster = await teamRoster(db, teamId);
     const candidates: InferCandidate[] = tasks.map((t) => ({
       id: t.id,
       rowKey: t.row_key,
       title: t.title || "(untitled task)",
-      assigneeMemberId: assigneeToMember.get((t.assignee ?? "").trim().toLowerCase()) ?? null,
+      assigneeMemberId: assigneeMember(t.assignee, roster),
     }));
 
     // SKIP-IF-ALREADY-SCORED, **per item**. Same doc content + same question → the previous answer still
@@ -482,32 +487,24 @@ async function record(
   });
 }
 
-/** assignee string (lowercased) → member id, via the roster. Best-effort; unmatched names stay null. */
-async function resolveAssigneeMembers(
-  db: DbClient,
-  teamId: string,
-  assignees: readonly (string | null)[]
-): Promise<Map<string, string>> {
-  const out = new Map<string, string>();
-  const wanted = new Set(assignees.map((a) => (a ?? "").trim().toLowerCase()).filter(Boolean));
-  if (!wanted.size) return out;
-  // THROWS on a read failure — no longer best-effort, because this is no longer a ranking nicety.
-  // Candidates are now scoped to the doc's own worker, so an empty map means EVERY worker gets zero
-  // candidates, every group is settled as "nothing to ask", and the run prunes the batch's links and
-  // records the docs as scored — a transient `members` hiccup silently eating the team's inferred links
-  // and skipping those docs until their content changes. A thrown error records a failed run instead,
-  // and the cooldown retries it.
+/**
+ * The team's active roster, for `assigneeMember`.
+ *
+ * THROWS on a read failure — deliberately not best-effort. Ownership now decides candidate RANKING (own
+ * tasks first, and the prompt marks them as the author's), so an empty roster silently downgrades every
+ * task to "someone else's" and the product rule stops applying with no signal. A thrown error records a
+ * failed run instead, and the cooldown retries it.
+ */
+async function teamRoster(db: DbClient, teamId: string): Promise<RosterPerson[]> {
   const { data, error } = await db
     .from("members")
-    .select("id, display_name, actor_handle, email")
+    .select("id, display_name, actor_handle")
     .eq("team_id", teamId)
     .eq("status", "active");
-  if (error) throw new Error(`assignee resolution failed: ${error.message}`);
-  for (const m of (data ?? []) as { id: string; display_name: string | null; actor_handle: string | null; email: string | null }[]) {
-    for (const key of [m.display_name, m.actor_handle, m.email]) {
-      const k = (key ?? "").trim().toLowerCase();
-      if (k && wanted.has(k) && !out.has(k)) out.set(k, m.id);
-    }
-  }
-  return out;
+  if (error) throw new Error(`roster read failed: ${error.message}`);
+  return ((data ?? []) as { id: string; display_name: string | null; actor_handle: string | null }[]).map((m) => ({
+    memberId: m.id,
+    displayName: m.display_name ?? "",
+    handle: m.actor_handle ?? "",
+  }));
 }

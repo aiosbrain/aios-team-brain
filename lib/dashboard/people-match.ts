@@ -87,3 +87,24 @@ export function decisionActors(decidedBy: string, roster: readonly RosterPerson[
   }
   return out;
 }
+
+/**
+ * A task's free-text `assignee` → the roster member it names, or null.
+ *
+ * ONE resolver, because two of them disagreed. The timeline used a fuzzy match to decide whose face to
+ * show on a task; the doc→task pass used an exact match to decide whose tasks to rank first. With
+ * assignee `"Chetan"` and display name "Chetan Nandakumar" the exact one resolved null — so the card
+ * called the task his while the inference treated it as someone else's, and the two halves of "prefer
+ * your own task" disagreed about which tasks were his.
+ *
+ * REFUSES on ambiguity, like `decisionActors`. `subjectMatchesMember` folds a bare first name onto a
+ * full one, so `"John"` matches both "John Ellison" and "John Smith"; taking the first would pick by
+ * whatever order the members query happened to return — a face that flips between rebuilds, and a
+ * marker that silently disappears if the wrong John happens to be the person whose day it is. Pure.
+ */
+export function assigneeMember(assignee: string | null | undefined, roster: readonly RosterPerson[]): string | null {
+  const name = (assignee ?? "").trim();
+  if (!name) return null;
+  const matched = roster.filter((p) => subjectMatchesMember(name, p));
+  return matched.length === 1 ? matched[0].memberId : null;
+}
