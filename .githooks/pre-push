@@ -20,4 +20,21 @@ if [ -f "$guard" ]; then
     exit 1
   fi
 fi
+
+# Same idea for agent skills: .claude/skills/<name>/SKILL.md is the source of truth, and
+# the .agents/.opencode/.cursor copies are generated. An edit that forgets to re-sync
+# leaves the other runtimes on a stale playbook. Also guarded in CI by
+# test/guards/skill-runtime-sync.test.ts; this is the fast local signal.
+skill_sync="$repo_root/scripts/sync-skill-runtimes.sh"
+
+if [ -f "$skill_sync" ]; then
+  echo "pre-push: checking skill runtime sync…"
+  if ! bash "$skill_sync" --check; then
+    echo "" >&2
+    echo "pre-push: BLOCKED — generated skill copies are out of sync with .claude/skills." >&2
+    echo "  Fix with: npm run check:skills:fix   (and bash scripts/sync-skill-runtimes.sh --prune for orphans)" >&2
+    echo "  (To bypass in an emergency: git push --no-verify)" >&2
+    exit 1
+  fi
+fi
 exit 0

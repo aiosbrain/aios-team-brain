@@ -23,6 +23,7 @@ gates (AIOS hub, Tessera root) apply in addition.
 | Any read path or dashboard surface touched | Tier isolation is an app-code invariant (no RLS): route through the `lib/auth/visibility.ts` choke point; guard test `test/guards/dashboard-tier-filter.test.ts` |
 | Any sync-protocol/API change | Pinned contract `../aios-workspace/docs/brain-api.md` — versioned bump there first |
 | Adding a column to an existing table | `postgres/migrations/` (alter) AND mirror into `postgres/schema.sql` (from-zero) — editing create-table alone is a prod no-op |
+| Editing any `.claude/skills/<name>/SKILL.md` | If the skill is published to other runtimes, re-run `npm run check:skills:fix` in the same change — `.agents/`, `.opencode/`, `.cursor/rules/` are generated copies (guard: `test/guards/skill-runtime-sync.test.ts` + pre-push) |
 | Writing any test | Spec-first, never characterization-first; pick the tier by failure mode (unit / data-mechanics / integration / eval — CLAUDE.md §4) |
 | Any PM/board work | `aios-linear` (global skill) — Linear only; **Plane is retired**: never register or use the `lib/pm-sync` Plane adapter (still present for historical rows; removal is a scoped migration, tracked in the resolver audit) |
 
@@ -33,6 +34,8 @@ gates (AIOS hub, Tessera root) apply in addition.
 | Admin/ops tasks on the brain instance | `.claude/skills/admin/SKILL.md` |
 | Branches diverged / reconcile a fork | `.claude/skills/branch-reconciliation/SKILL.md` |
 | "Is this test actually wired into CI" | `.claude/skills/test-ci-wiring-audit/SKILL.md` |
+| About to push a PR branch / "did this get reviewed" / attest a PR | `.claude/skills/pr-review-attestation/SKILL.md` |
+| Just merged to main / "did the deploy go out" / check Railway | `.claude/skills/railway-deploy-verify/SKILL.md` |
 | PM projection questions (brain→Linear) | `lib/pm-sync/` — the brain's tasks table is canonical, projection is one-way; reconcile reads live status surface-only |
 
 ## Agent Roles
