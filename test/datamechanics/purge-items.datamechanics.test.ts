@@ -144,6 +144,35 @@ describe("purgeItemsByPathPrefix (real Postgres)", () => {
     expect(row?.meta?.items).toBe(1);
   });
 
+  /**
+   * Spec: a purge reaches the DERIVED caches, not just the rows.
+   *
+   * `work_timeline_cache` and the arc snapshots are precomputed FROM `items`, so removing the rows
+   * alone leaves both quoting content the brain no longer has until their next scheduled recompute —
+   * for a private channel purged by mistake, exactly the window the purge exists to close. Staleness
+   * is asserted on the stored `computed_at`, which is the thing the readers actually branch on.
+   */
+  it("marks the timeline and arc caches stale so they stop serving purged content", async () => {
+    const seed = await seedTeam();
+    await ingest(seed, { path: "slack/c0priv/1.md", project: "slack", kind: "transcript", access: "team", body: "secret" });
+
+    const fresh = new Date().toISOString();
+    await db().from("work_timeline_cache").insert({ team_id: seed.teamId, group_key: "team", payload: { v: 1, days: [] }, computed_at: fresh });
+    await db().from("arc_cache").insert({ team_id: seed.teamId, group_key: "team", arcs: [], computed_at: fresh });
+
+    await purgeItemsByPathPrefix(db(), seed.teamId, "slack/c0priv/", "slack channel is private");
+
+    const staleness = async (table: string): Promise<number> => {
+      const { data } = await db().from(table).select("computed_at").eq("team_id", seed.teamId).maybeSingle();
+      const at = new Date((data as { computed_at: string | Date }).computed_at).getTime();
+      return Date.now() - at;
+    };
+    // Both are pushed back past their TTL — a bust, not a delete: the stale-but-real payload still
+    // serves while the rebuild runs behind it.
+    expect(await staleness("work_timeline_cache")).toBeGreaterThan(60_000);
+    expect(await staleness("arc_cache")).toBeGreaterThan(60_000);
+  });
+
   it("records WHICH paths went, not just how many", async () => {
     // The rows are the only record of their own paths, so a count-and-prefix audit makes the question
     // "what did this purge remove?" unanswerable the moment the cascade runs. That's the wrong trade

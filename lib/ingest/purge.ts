@@ -188,5 +188,27 @@ export async function purgeItemIds(
     meta: buildPurgeMeta({ reason, items: itemIds.length, episodes, paths, readFailed }),
   });
 
+  // DERIVED CACHES. Removing the rows is not the whole removal: `work_timeline_cache` and the arc
+  // snapshots are precomputed FROM them, so until their next scheduled recompute both still quote
+  // content the brain no longer has — for a private channel purged by mistake, exactly the window the
+  // purge exists to close. Busting them makes the next read rebuild from what survives.
+  //
+  // Routed through the shared `bustTeamLearningCaches` choke-point rather than staling the two tables
+  // here, so a cache added there later is busted by the purge too instead of quietly outliving it.
+  //
+  // Best-effort and LOUD: the content is already gone, so a bust failure must not fail (or retry) the
+  // purge — but it must not be silent either, because the visible symptom is purged content still on
+  // screen, and the caches self-heal only on their own TTL.
+  try {
+    const { data: team } = await db.from("teams").select("slug").eq("id", teamId).maybeSingle();
+    const { bustTeamLearningCaches } = await import("@/lib/ingest/reconcile-attribution");
+    await bustTeamLearningCaches(db, teamId, (team as { slug: string } | null)?.slug ?? "");
+  } catch (err) {
+    console.error(
+      `[purge] derived-cache bust failed for team ${teamId} — timeline/arcs may quote purged content ` +
+        `until their TTL: ${err instanceof Error ? err.message : err}`
+    );
+  }
+
   return { items: itemIds.length, episodes };
 }
