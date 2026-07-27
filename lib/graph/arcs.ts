@@ -6,7 +6,7 @@ import type { DbClient } from "@/lib/db/types";
 import { adminClient } from "@/lib/db/admin";
 import { recentFacts, resolveEpisodeItems, type AtomicFact } from "./learning";
 import { GraphitiClient } from "./graphiti-client";
-import { episodeGroupId, type AccessTier } from "./group";
+import { episodeGroupId, isExternalGroupId, type AccessTier } from "./group";
 import { attributedFactTexts, groundParticipants } from "./arc-attribution";
 import { resolveItemCredit } from "@/lib/attribution/contributor-credit";
 import { readArcCache, writeArcCache, ARC_CACHE_TTL_MS as CACHE_TTL_MS } from "./arc-cache";
@@ -635,7 +635,17 @@ async function synthesizeArcs(
   // Stored corrections inform EVERY synthesis, not only the recompute that produced one (H13). They used
   // to reach later synthesis only by having become a Graphiti fact — so a graph wipe didn't merely lose
   // the record, it lost the influence, and arcs quietly reverted to the version a human had rejected.
-  const stored = (await listArcCorrections(db, teamId)).map((c) => c.corrected_text);
+  // TEAM-TIER ONLY. `groups` is this synthesis's tier scope (an external viewer gets external groups
+  // alone), and corrections are an internal editorial act the recompute route already refuses to an
+  // external principal. Feeding them into an EXTERNAL synthesis would put team-authored prose in the
+  // prompt that writes the external arc row — the model would paraphrase it into client-visible text and
+  // `commitArcs` would persist that under the external group_key. There is no RLS backstop (CLAUDE.md
+  // §5), so the tier check has to be here, at the read.
+  //
+  // Derived from `groups` rather than a second tier argument on purpose: `groups` is already THE
+  // tier-scoping input, and a parallel parameter is one more thing that can disagree with it.
+  const teamTier = groups.some((g) => !isExternalGroupId(g));
+  const stored = teamTier ? (await listArcCorrections(db, teamId)).map((c) => c.corrected_text) : [];
   const allCorrections = [...new Set([...correctionTexts, ...stored])];
 
   const factsRead = await recentFacts(groups, null, FACT_POOL);
@@ -783,10 +793,15 @@ async function synthesizeArcs(
     .update(contribDigest)
     .digest("hex");
 
+  // Note the flag is the REQUEST's corrections, not `allCorrections`: it means "a human just edited this,
+  // re-synthesize regardless". Passing the stored set would make it true forever for any team that has
+  // ever corrected an arc, permanently disabling the stability skip and re-running the LLM on every
+  // background refresh. Stored corrections don't need the flag — they're in `userPrompt`, so changing one
+  // changes `factsHash` and the guard below refuses reuse on its own.
   // STABILITY GUARD: identical input (+ no correction, + a real prior) → keep the prior arcs and SKIP the
   // LLM. This is what stops the day-to-day churn (same facts producing different arcs every recompute from
   // LLM non-determinism). The background refresh still runs (fetch/balance/hash), just not the model.
-  if (canReuseArcs(prior ? { factsHash: prior.factsHash, arcCount: prior.arcs.length } : null, factsHash, allCorrections.length > 0)) {
+  if (canReuseArcs(prior ? { factsHash: prior.factsHash, arcCount: prior.arcs.length } : null, factsHash, correctionTexts.length > 0)) {
     return { arcs: prior!.arcs, factsHash, degraded };
   }
 
