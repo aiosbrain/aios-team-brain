@@ -10,6 +10,7 @@ export const runtime = "nodejs";
 export type TaskFeedMode = "writeback" | "table" | "sync-origin";
 
 const EPOCH = "1970-01-01T00:00:00Z";
+const PAGE = 500;
 
 /**
  * Resolve the feed mode (brain-api 1.13). `mode` is the explicit, versioned selector; the legacy
@@ -27,6 +28,21 @@ export function parseTaskFeedMode(
   if (mode === "writeback" || mode === "table" || mode === "sync-origin")
     return mode;
   return null;
+}
+
+/**
+ * sync-origin PAGES (1.13). The feed is ordered by `updated_at` ascending and capped at `PAGE`, so
+ * a full page may be a truncation — and the client advances its cursor after a merge, which would
+ * skip the remainder forever. Hand back the last row's `updated_at` as `next_cursor` so the client
+ * can drain the backlog; null means "you have everything". The writeback/table modes keep their
+ * historical `next_cursor: null` (pre-1.13 clients never page here).
+ */
+export function nextCursorFor(
+  mode: TaskFeedMode,
+  rows: { updated_at: string }[],
+): string | null {
+  if (mode !== "sync-origin" || rows.length < PAGE) return null;
+  return new Date(rows[rows.length - 1].updated_at).toISOString();
 }
 
 /**
@@ -105,7 +121,7 @@ export async function GET(req: NextRequest) {
   if (mode === "sync-origin") query = query.eq("origin", "sync");
 
   const { data, error } = await visibleTasks(
-    query.order("updated_at", { ascending: true }).limit(500),
+    query.order("updated_at", { ascending: true }).limit(PAGE),
     auth.memberTier,
   );
   if (error) return errorResponse("internal", error.message, 500);
@@ -173,6 +189,6 @@ export async function GET(req: NextRequest) {
       project,
       rows,
     })),
-    next_cursor: null,
+    next_cursor: nextCursorFor(mode, (data ?? []) as { updated_at: string }[]),
   });
 }

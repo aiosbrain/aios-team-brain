@@ -473,7 +473,7 @@ async function adoptInbound(
       // origin 'ui': once owned, ingest excludes this issue from the mirror push, and only
       // origin='sync' rows are diff-deleted — the flip is what makes the adopted task durable.
       await client.query(
-        `update tasks set origin = 'ui', status = $1, body = $2, updated_at = now() where id = $3`,
+        `update tasks set origin = 'ui', status = $1, raw_status = null, body = $2, updated_at = now() where id = $3`,
         [status, body, task.id]
       );
       return true;

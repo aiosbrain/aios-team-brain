@@ -134,7 +134,10 @@ export async function ingestWorkEvent(
 
     const { error: taskErr } = await db
       .from("tasks")
-      .update({ status: "done", updated_at: now })
+      // `raw_status: null` — an authoritative status write must not leave the pushed raw string
+      // behind, or the 1.13 sync-origin return leg reads it as an echo (AIO-537; guarded by
+      // test/guards/task-status-raw-status.test.ts).
+      .update({ status: "done", raw_status: null, updated_at: now })
       .eq("id", outcome.taskId)
       .eq("team_id", auth.teamId);
     if (taskErr) throw new Error(`task completion update failed: ${taskErr.message}`);
