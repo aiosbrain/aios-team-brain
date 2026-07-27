@@ -85,8 +85,9 @@ genuinely done.
      or add a one-line reason for deferring it — put that reason in the PR body
      near the attestation line, not just in chat.
 
-5. **Record the attestation.** Append **exactly** this line to the PR body
-   (preserve the existing body — read it first, then write body + line back):
+5. **Record the attestation (needs the PR to exist — push and
+   `gh pr create` first if it doesn't).** Append **exactly** this line to the
+   PR body:
    ```
    ## Review — Reviewed by <tool> — verdict <one-line summary>
    ```
@@ -95,14 +96,27 @@ genuinely done.
    - `<one-line summary>` names the outcome plainly, e.g. "no blockers, 1 LOW
      deferred (see below)" or "fixed 1 HIGH (SQL injection in query.ts), clean
      otherwise".
+
+   `gh pr edit --body` **replaces** the body, so you must capture the existing
+   one into a shell variable in the *same shell* and guard against it being
+   empty — reading the body into your context is not enough, and running the
+   edit with an unset variable wipes the summary and test plan:
    ```bash
-   gh pr edit <number> --body "$(printf '%s\n\n%s' "$EXISTING_BODY" "$ATTESTATION_LINE")"
+   PR=<number>
+   EXISTING_BODY="$(gh pr view "$PR" --json body -q .body)"
+   : "${EXISTING_BODY:?refusing to edit: could not read the existing PR body}"
+   ATTESTATION_LINE='## Review — Reviewed by <tool> — verdict <one-line summary>'
+   gh pr edit "$PR" --body "$(printf '%s\n\n%s' "$EXISTING_BODY" "$ATTESTATION_LINE")"
    ```
+   Then re-read the body (`gh pr view "$PR" --json body -q .body`) and confirm
+   the original content survived alongside the new line.
+
    Never fabricate this line — only write it after a review subagent actually
    ran in this session against this diff.
 
 6. **No reviewer available.** If step 2 found no reviewer of any kind in the
-   current runtime, say so explicitly to the user and instead:
+   current runtime, say so explicitly to the user and instead (again, on the
+   PR once it exists):
    ```bash
    gh pr edit <number> --add-label ready-for-review
    ```
@@ -118,3 +132,8 @@ genuinely done.
   actually having run against the current diff in this session.
 - Adversarial verification is per-finding — never batch-refute a whole review
   with one skeptic call.
+- Never call `gh pr edit --body` without having captured the existing body into
+  a variable in the same shell and asserted it's non-empty. `--body` replaces,
+  it does not append; an unset variable silently destroys the PR description.
+- Never invent or guess a PR number to satisfy step 5. If no PR exists yet,
+  push and create it — the review from steps 1–4 still stands.

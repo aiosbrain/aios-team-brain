@@ -6,6 +6,7 @@
       "prompt": "Attest this PR before I push it. The branch diff (git diff origin/main...HEAD) adds a new API route that interpolates a raw query param directly into a SQL string (a real SQL-injection bug), plus a harmless variable rename in an unrelated file.",
       "expected_output": "Runs a primary review subagent against the actual diff. Correctly identifies the SQL injection as a real HIGH/blocker finding and the rename as a non-issue. Fixes the SQL injection (or clearly reports it must be fixed) before writing the attestation line. Writes the PR body line in the exact format '## Review — Reviewed by <tool> — verdict <summary>', naming the actual reviewer used. Does not block the push over the rename.",
       "assertions": [
+        "Runs `git fetch origin main` before diffing, so the diff can't carry other people's merged commits",
         "Reviewed the real diff, not a summary of it",
         "Correctly ranks the SQL injection as HIGH/blocker",
         "Does not fabricate a finding on the harmless rename",
@@ -38,6 +39,31 @@
         "No unnecessary code change (e.g. compat shim) is made to satisfy a refuted finding",
         "A one-line deferral reason is recorded for the downgraded finding",
         "Attestation line reflects the true, no-real-blocker outcome"
+      ],
+      "files": []
+    },
+    {
+      "id": 4,
+      "prompt": "Attest this branch before I push it. It hasn't been pushed and no PR exists yet. The diff is clean.",
+      "expected_output": "Runs the pre-push half (fetch, diff, primary review, adversarial check on any HIGH) without needing a PR. Recognises that the attestation line requires a PR, so it pushes and opens the PR (gh pr create) — or folds the attestation into gh pr create --body — rather than stalling on a missing PR number or inventing one.",
+      "assertions": [
+        "Completes the review steps without a PR number",
+        "Does NOT invent, guess, or ask-and-wait-forever for a PR number",
+        "Pushes and creates the PR (or uses gh pr create --body) so the attestation can actually be recorded",
+        "The attestation ends up on the PR — the run does not finish with the review done but unrecorded"
+      ],
+      "files": []
+    },
+    {
+      "id": 5,
+      "prompt": "Attest PR #77. Its body already has a detailed Summary and Test plan section that must survive. The review is clean.",
+      "expected_output": "Captures the existing body into a shell variable with `gh pr view 77 --json body -q .body` in the same shell, asserts it is non-empty (e.g. `: \"${EXISTING_BODY:?}\"`), then appends the attestation line via gh pr edit --body. Re-reads the body afterwards and confirms the Summary and Test plan are still present.",
+      "assertions": [
+        "The existing body is captured into a shell variable in the same shell as the gh pr edit call",
+        "There is a non-empty guard on that variable before --body is passed",
+        "gh pr edit --body is never run with an unset/empty variable",
+        "The final PR body contains BOTH the original Summary/Test plan and the new attestation line",
+        "The result is verified by re-reading the body, not assumed"
       ],
       "files": []
     }
