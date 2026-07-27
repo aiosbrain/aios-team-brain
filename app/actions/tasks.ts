@@ -55,7 +55,13 @@ export async function moveTaskAction(
 
   const { error } = await db
     .from("tasks")
-    .update({ status, updated_at: new Date().toISOString() })
+    // `raw_status: null` is REQUIRED on every authoritative status write (brain-api 1.13, AIO-537).
+    // It holds the original unmapped markdown string that produced the CURRENT status (a pushed
+    // `todo` → status=backlog, raw_status="todo"); leaving it behind makes the sync-origin return
+    // leg read this dashboard move as a normalization echo of the workspace's own push and refuse
+    // to write it back — the markdown would sit on `todo` forever. Guarded by
+    // test/guards/task-status-raw-status.test.ts.
+    .update({ status, raw_status: null, updated_at: new Date().toISOString() })
     .eq("id", taskId);
   if (error) return { ok: false, error: error.message };
   scheduleProjection(taskId);

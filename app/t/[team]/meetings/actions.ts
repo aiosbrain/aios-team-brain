@@ -372,7 +372,13 @@ export async function pushMeetingTasksAction(
     ? (targetStatus as MeetingTaskStatus)
     : null;
   if (applied) {
-    await admin.from("tasks").update({ status: applied }).eq("team_id", team.id).in("id", eligible.map((t) => t.id));
+    // `raw_status: null` — authoritative status write (AIO-537 echo guard; the extract-todos
+    // `"extracted"` marker is intentionally dropped once a real status is chosen).
+    await admin
+      .from("tasks")
+      .update({ status: applied, raw_status: null })
+      .eq("team_id", team.id)
+      .in("id", eligible.map((t) => t.id));
   }
 
   const rows: ProjectionTaskRow[] = eligible.map((t) => ({

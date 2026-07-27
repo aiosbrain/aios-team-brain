@@ -138,6 +138,7 @@ async function seedLinkedTask(
     parentResourceId?: string | null;
     body?: string;
     origin?: string;
+    rawStatus?: string | null;
   }
 ) {
   const baseline = args.baselineStatus === undefined ? args.status : args.baselineStatus;
@@ -149,6 +150,7 @@ async function seedLinkedTask(
       row_key: args.rowKey,
       title: args.rowKey,
       status: args.status,
+      raw_status: args.rawStatus ?? null,
       origin: args.origin ?? "ui",
       body: args.body ?? "",
       parent_row_key: args.parentRowKey ?? null,
@@ -203,8 +205,18 @@ async function readLink(teamId: string, rowKey: string) {
 }
 
 async function readTask(taskId: string) {
-  const { data } = await db().from("tasks").select("status, body, origin, updated_at").eq("id", taskId).single();
-  return data as { status: string; body: string; origin: string; updated_at: string };
+  const { data } = await db()
+    .from("tasks")
+    .select("status, raw_status, body, origin, updated_at")
+    .eq("id", taskId)
+    .single();
+  return data as {
+    status: string;
+    raw_status: string | null;
+    body: string;
+    origin: string;
+    updated_at: string;
+  };
 }
 
 const issue = (id: string, stateId: string, over: Partial<MockIssue> = {}): MockIssue => ({
@@ -246,6 +258,33 @@ describe("inbound apply — pm-wins-if-brain-unchanged (real Postgres)", () => {
     expect(link.projection_fingerprint).toBe(fp({ row_key: "P1", status: "done" }));
     // Apply is inbound-only: zero provider mutations.
     expect(mutations).toEqual([]);
+  });
+
+  // AIO-537 / brain-api 1.13. `raw_status` records the ORIGINAL unmapped markdown string that
+  // produced the current status (a workspace pushing `todo` stores status=backlog,
+  // raw_status="todo"). Once Linear sets the status authoritatively that string is stale, and the
+  // sync-origin return leg would otherwise read `raw_status === "todo"` as "the brain is only
+  // echoing my own push" and refuse to write Done into the markdown — the exact drift AIO-537 closes.
+  it("clears raw_status when a Linear move sets the status authoritatively", async () => {
+    const seed = await seedTeam();
+    await seedLinearPrimary(seed);
+    const project = await seedProject(seed.teamId);
+    const taskId = await seedLinkedTask(seed, project, {
+      rowKey: "P-RAW",
+      resourceId: "li-raw",
+      status: "backlog",
+      rawStatus: "todo", // pushed from a workspace as the free-text `todo`
+      origin: "sync",
+      lastProjected: "Todo",
+    });
+
+    const { fetchImpl } = linearMock([issue("li-raw", "ls-done", { identifier: "P-RAW" })]);
+    const result = await runInboundForTeam(db(), seed.teamId, { fetchImpl });
+    expect(result.applied).toHaveLength(1);
+
+    const task = await readTask(taskId);
+    expect(task.status).toBe("done");
+    expect(task.raw_status).toBeNull();
   });
 
   it("no-echo: the projection pass after an apply makes ZERO provider mutations", async () => {
