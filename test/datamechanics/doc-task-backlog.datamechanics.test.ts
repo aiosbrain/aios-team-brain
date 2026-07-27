@@ -73,6 +73,107 @@ function answerMatchingOfferedDocs(): void {
   });
 }
 
+/**
+ * Spec: a doc is only ever scored against ITS OWN worker's tasks.
+ *
+ * `candidatesFor` restricts candidates to the doc's worker, and the run must respect that per DOC, not
+ * per batch. A single call built from the first doc's author would score everyone else's docs against
+ * THAT person's tasks — the exact cross-assignment the restriction exists to stop, made worse by it.
+ */
+describe("doc→task inference: never scores across people (real Postgres)", () => {
+  beforeEach(() => completeTextOrNull.mockReset());
+
+  it("a worker whose call FAILS keeps their links and is re-asked; the others still settle", async () => {
+    // One call per worker means one worker's provider timeout must not settle the batch. If it did,
+    // the prune (batch-scoped) would delete that worker's existing links AND `markScored` would record
+    // their docs, so a transient blip would eat a person's links permanently.
+    //
+    // The discriminating parts, learned the hard way — an earlier version of this test asserted only
+    // "the failed worker is unscored", which is ALSO true of the broken code (an empty `links` array
+    // short-circuits before the prune), so it was green on the bug:
+    //   1. the SUCCEEDING worker returns a real match, so `links` is non-empty and the old code falls
+    //      through to the batch-wide prune + markScored;
+    //   2. a pre-existing llm edge for the FAILING worker must SURVIVE — the half that loses user data;
+    //   3. the succeeding worker IS scored — a positive control, so a run that silently did nothing
+    //      (cooldown, no-llm, a throw) cannot pass.
+    const { seed, taskId } = await seedTeamWithTask();
+    const { data: other } = await db().from("members").insert({
+      team_id: seed.teamId, email: `${randomUUID()}@test.local`, display_name: "Other Person",
+      actor_handle: `o-${randomUUID().slice(0, 8)}`, role: "member", tier: "team", status: "active",
+    }).select("id").single();
+    const otherId = (other as { id: string }).id;
+    const { data: proj } = await db().from("projects").select("id").eq("team_id", seed.teamId).limit(1).single();
+    await db().from("tasks").insert({
+      team_id: seed.teamId, project_id: (proj as { id: string }).id, row_key: "AIO-902",
+      title: "Other Person's ticket about widgets", status: "in_progress", assignee: "Other Person",
+      origin: "sync", audience: "team",
+    });
+    const mine = await keylessDoc(seed, "mine");
+    const theirs = await keylessDoc(seed, "theirs");
+    await db().from("items").update({ member_id: otherId }).eq("id", theirs.id);
+    await db().from("item_versions").update({ member_id: otherId }).eq("item_id", theirs.id);
+
+    // An edge the failing worker already has — this is what a batch-wide prune would destroy.
+    await db().from("task_evidence").insert({
+      team_id: seed.teamId, task_id: taskId, item_id: theirs.id, method: "llm", confidence: 0.9,
+    });
+
+    // The OTHER person's call fails; the seed member's succeeds WITH A MATCH.
+    completeTextOrNull.mockImplementation(async (args?: { prompt?: string }) =>
+      (args?.prompt ?? "").includes("theirs")
+        ? null
+        : JSON.stringify({ matches: [{ doc: "D1", task: "T1", confidence: 0.95, why: "r" }] })
+    );
+    await runDocTaskInference(db(), seed.teamId, { maxDocs: 10 });
+
+    const scored = async (itemId: string) => {
+      const { data } = await db().from("doc_task_inference").select("item_id").eq("item_id", itemId);
+      return (data ?? []).length > 0;
+    };
+    expect(await scored(mine.id)).toBe(true); // positive control: the run really did work
+    expect(await scored(theirs.id)).toBe(false); // failed worker → re-asked next run
+    // …and their existing edge is intact. This is the assertion that goes red on a batch-wide prune.
+    expect(await llmLinkedItemIds(seed.teamId)).toContain(theirs.id);
+  });
+
+  it("offers each worker only their OWN tasks, in separate calls", async () => {
+    const { seed } = await seedTeamWithTask(); // task AIO-900 assigned to "Tester" (the seed member)
+    // A second person with their own task and their own doc.
+    const { data: other } = await db().from("members").insert({
+      team_id: seed.teamId, email: `${randomUUID()}@test.local`, display_name: "Other Person",
+      actor_handle: `o-${randomUUID().slice(0, 8)}`, role: "member", tier: "team", status: "active",
+    }).select("id").single();
+    const otherId = (other as { id: string }).id;
+    const { data: proj } = await db().from("projects").select("id").eq("team_id", seed.teamId).limit(1).single();
+    await db().from("tasks").insert({
+      team_id: seed.teamId, project_id: (proj as { id: string }).id, row_key: "AIO-901",
+      title: "Other Person's ticket about widgets", status: "in_progress", assignee: "Other Person", origin: "sync", audience: "team",
+    });
+
+    await keylessDoc(seed, "my doc");
+    const theirs = await keylessDoc(seed, "their doc");
+    // Credit runs through the attribution oracle (`item_versions`), not raw `items.member_id` — so the
+    // version's author is what decides whose backlog this doc is scored against.
+    await db().from("items").update({ member_id: otherId }).eq("id", theirs.id);
+    await db().from("item_versions").update({ member_id: otherId }).eq("item_id", theirs.id);
+
+    completeTextOrNull.mockResolvedValue(JSON.stringify({ matches: [] }));
+    await runDocTaskInference(db(), seed.teamId, { maxDocs: 10 });
+
+    // TWO calls, one per worker — and neither prompt may contain the other person's task title.
+    const prompts = completeTextOrNull.mock.calls.map((c: unknown[]) => (c[0] as { prompt: string }).prompt);
+    expect(prompts.length).toBe(2);
+    // The prompt carries synthetic `D1`/`T1` refs, never real ids (the hallucination defence), so the
+    // calls are identified by the doc TITLES they describe.
+    const mineCall = prompts.find((p: string) => p.includes("my doc"));
+    const theirsCall = prompts.find((p: string) => p.includes("their doc"));
+    expect(mineCall).toBeDefined();
+    expect(theirsCall).toBeDefined();
+    expect(mineCall).not.toContain("Other Person's ticket about widgets"); // never offered a teammate's ticket
+    expect(theirsCall).not.toContain("The task"); // …and vice versa
+  });
+});
+
 describe("doc→task inference: links accumulate across batches (real Postgres)", () => {
   beforeEach(() => completeTextOrNull.mockReset());
 
