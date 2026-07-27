@@ -68,9 +68,10 @@ describe("work-timeline cache layer (real Postgres)", () => {
     // It persisted the versioned payload { v, days } to the 'team' row, matching what was returned.
     const row = await readRow(seed.teamId, "team");
     expect(row?.group_key).toBe("team");
-    // v7: unlinked evidence is OMITTED and inferred (LLM) links join the ledger — a v6 row would keep
-    // serving an "other" lane this build no longer renders, so a stale row must read as a MISS.
-    expect((row?.payload as { v: number; days: unknown[] }).v).toBe(7);
+    // A LITERAL, deliberately: it forces a conscious edit every time the version moves, which is the
+    // moment to ask "did the payload shape or meaning change?". v8 = unlinked evidence omitted
+    // (`other[]` → `unlinked`), so a v7 row carries a shape this build does not render.
+    expect((row?.payload as { v: number; days: unknown[] }).v).toBe(8);
     expect((row?.payload as { days: unknown[] }).days.length).toBe(days.length);
 
     // readTimelineCache round-trips it.
