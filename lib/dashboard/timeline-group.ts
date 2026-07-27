@@ -146,10 +146,15 @@ export function summaryPromptFor(p: PersonDay, dayLabel: string, itemCap = 8): s
       lines.push(`- ${t.title} [${t.status}]${work ? ` — ${work}` : ""}`);
     }
   }
-  // Unlinked work is deliberately NOT described to the summariser. It is omitted from the card, so
-  // narrating it would produce a summary about work the reader cannot see — the mismatch the whole
-  // task → evidence contract exists to remove.
-  
+  // Unlinked work IS described. It is rendered on the card (in its own section below the tasks), so
+  // leaving it out of the prompt does not make the summary tidier — it makes it absent: a person-day
+  // with no linked task produces an EMPTY prompt, the caller skips the model, and that person loses
+  // their synopsis entirely. With linking at ~4% that was almost everyone. The rule is simply that the
+  // prompt describes what the card shows.
+  if (p.other.length) {
+    lines.push("Other work that day (not tied to a task):");
+    for (const g of p.other) lines.push(`- ${g.source}: ${titles(g)}`);
+  }
   if (lines.length === 0) return "";
   return `${p.name} on ${dayLabel}:\n${lines.join("\n")}`;
 }
