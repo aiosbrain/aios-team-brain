@@ -9,10 +9,12 @@ vi.mock("@/lib/llm/complete", () => ({ completeTextOrNull: (...a: unknown[]) => 
 import { summaryPromptFor, type PersonDay, type TimelineDay } from "@/lib/dashboard/timeline-group";
 import { llmConfigured, attachPersonDaySummaries } from "@/lib/dashboard/timeline-summary";
 
-// The card only ever describes TASK-LINKED work now, so the default fixture is task-linked: a person
-// whose work is all unlinked has nothing for the summariser to narrate.
+// The prompt describes what the CARD shows — tasks plus the unlinked lane below them — so the default
+// fixture carries both. It once described tasks only, which meant a person with no linked task produced
+// an empty prompt and silently lost their synopsis; at ~4% linking that was nearly everyone.
 const person = (over: Partial<PersonDay> = {}): PersonDay => ({
-  memberId: "m1", name: "Chetan", handle: "chetan", total: 1, signals: [], unlinked: 0,
+  memberId: "m1", name: "Chetan", handle: "chetan", total: 2, signals: [], unlinked: 1,
+  other: [{ source: "github", count: 1, items: [{ id: "u1", title: "unlinked commit", source: "github", kind: "commit", at: "2026-07-22T09:00:00Z" }] }],
   tasks: [{
     taskId: "t1", title: "Adapter", status: "in_progress", evidenceCount: 1,
     sources: [{ source: "github", count: 1, items: [{ id: "c1", title: "did a thing", source: "github", kind: "commit", at: "2026-07-22T09:00:00Z" }] }],
@@ -22,8 +24,30 @@ const person = (over: Partial<PersonDay> = {}): PersonDay => ({
 const fakeDb = {} as never;
 
 describe("summaryPromptFor (pure LLM input)", () => {
-  it("returns '' when the person has no work (caller skips the LLM call)", () => {
-    expect(summaryPromptFor(person({ tasks: [] }), "Today")).toBe("");
+  it("returns '' only when the person has NO work at all (caller skips the LLM call)", () => {
+    expect(summaryPromptFor(person({ tasks: [], other: [], total: 0, unlinked: 0 }), "Today")).toBe("");
+  });
+
+  it("still writes a prompt for a person whose work is ALL unlinked", () => {
+    // The regression this pins: while unlinked work was omitted, the prompt described only tasks — so a
+    // person-day with no linked task produced an empty prompt, the caller skipped the model, and that
+    // person lost their synopsis. At ~4% linking that was almost everyone, every day.
+    const p = person({
+      tasks: [],
+      other: [{ source: "github", count: 2, items: [
+        { id: "c1", title: "fix: the thing", source: "github", kind: "commit", at: "2026-07-22T09:00:00Z" },
+        { id: "c2", title: "docs: the other thing", source: "github", kind: "commit", at: "2026-07-22T10:00:00Z" },
+      ] }],
+    });
+    const prompt = summaryPromptFor(p, "Today");
+    expect(prompt).not.toBe("");
+    expect(prompt).toContain("fix: the thing");
+  });
+
+  it("describes tasks AND unlinked work — the prompt covers what the card shows", () => {
+    const prompt = summaryPromptFor(person({}), "Today");
+    expect(prompt).toContain("Adapter"); // the task
+    expect(prompt).toContain("Other work"); // …and the lane below it
   });
   it("lists tasks with their nested work, capping per-source items", () => {
     const items = Array.from({ length: 20 }, (_, i) => ({ id: `c${i}`, title: `commit ${i}`, source: "github", kind: "commit", at: "2026-07-22T09:00:00Z" }));
