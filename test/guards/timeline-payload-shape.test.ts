@@ -19,7 +19,7 @@ import { groupTimeline } from "@/lib/dashboard/timeline-group";
  */
 
 const SHAPE_BY_VERSION: Record<number, string[]> = {
-  9: ["memberId", "name", "handle", "avatarUrl", "total", "tasks", "other", "unlinked", "signals"],
+  10: ["memberId", "name", "handle", "avatarUrl", "total", "tasks", "other", "unlinked", "signals"],
 };
 
 describe("guard: the cached timeline payload shape matches its PAYLOAD_VERSION", () => {

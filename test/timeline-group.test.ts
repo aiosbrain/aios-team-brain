@@ -80,6 +80,33 @@ describe("groupTimeline (evidence-gated task → evidence nesting; unlinked work
     expect(p.total).toBe(3); // header must match the body: 2 nested + 1 unlinked
   });
 
+  /**
+   * Spec: a task that belongs to SOMEONE ELSE is visibly theirs.
+   *
+   * The timeline credits work to whoever DID it, so a teammate's ticket legitimately appears on your
+   * day — and nothing distinguished it from a ticket you own ("I have a bunch of Linear tasks but I
+   * haven't created Linear tasks in ages — I don't know where these are coming from"). The owner's
+   * miniature avatar is what makes the difference legible; credit is unchanged either way.
+   */
+  it("marks a teammate's task with its OWNER, and says nothing about your own", () => {
+    const owned = new Map([
+      ["t1", { title: "My ticket", status: "in_progress", source: "tasks", assigneeMemberId: "m1" }],
+      ["t2", { title: "Their ticket", status: "in_progress", source: "tasks", assigneeMemberId: "m2" }],
+      ["t3", { title: "Unassigned", status: "in_progress", source: "tasks", assigneeMemberId: null }],
+    ]);
+    const days = groupTimeline(
+      [ev({ memberId: "m1", taskId: "t1" }), ev({ memberId: "m1", taskId: "t2" }), ev({ memberId: "m1", taskId: "t3" })],
+      owned,
+      members,
+      today
+    );
+    const byTitle = new Map(days[0].people[0].tasks.map((t) => [t.title, t]));
+    // m1 did all three pieces of work — credit is unaffected by who owns the ticket.
+    expect(byTitle.get("Their ticket")?.assignee?.name).toBe("John");
+    expect(byTitle.get("My ticket")?.assignee).toBeUndefined(); // yours → nothing to say
+    expect(byTitle.get("Unassigned")?.assignee).toBeUndefined(); // nobody's → nothing TRUE to say
+  });
+
   it("EVIDENCE-GATED: an active task with no evidence never appears (no empty headers)", () => {
     // tEmpty is in taskInfo but nothing links to it.
     const days = groupTimeline([ev({ taskId: "t1" })], taskInfo, members, today);

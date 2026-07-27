@@ -56,6 +56,11 @@ export interface TaskInfo {
   title: string;
   status: string; // task_status (the task's status, e.g. in_progress / blocked / done)
   source: string; // pm source slug: linear | plane | tasks
+  /** The task's ASSIGNEE as a member id, or null when unassigned/unresolvable. Carried so a card can
+   *  say WHOSE task it is. Without it, work you did on a teammate's ticket is indistinguishable from
+   *  your own ticket — the timeline places a task under whoever did the work (by design), so the only
+   *  thing that made it legible was knowing the assignee, and the payload didn't have it. */
+  assigneeMemberId: string | null;
 }
 
 export interface SourceGroup {
@@ -72,6 +77,11 @@ export interface TaskGroup {
   source: string; // pm source slug (icon)
   sources: SourceGroup[]; // evidence grouped by source under this task
   evidenceCount: number; // total nested evidence items (uncapped)
+  /** Set ONLY when the task belongs to SOMEONE ELSE — its owner, for the miniature avatar the card
+   *  renders to the LEFT of the task. You are credited for the work you did; the face says whose ticket
+   *  it was. Undefined for your own task (nothing to say) and for an unassigned one (nothing true to
+   *  say). `name` doubles as the accessible label and hover title, since an avatar alone is not text. */
+  assignee?: { name: string; avatarUrl?: string | null };
 }
 
 /** SIGNAL — data ABOUT work (a decision now; meetings later), shown in the Context lane, NEVER counted as
@@ -307,7 +317,21 @@ export function groupTimeline(
       const tasks: TaskGroup[] = [...b.tasks.entries()]
         .map(([taskId, ev]) => {
           const info = taskInfo.get(taskId)!;
-          return { taskId, title: info.title, status: info.status, source: info.source, sources: toSourceGroups(ev, perSourceCap), evidenceCount: ev.length };
+          // Whose task is it? Only stated when it is SOMEONE ELSE'S — "contributing to John's task" is
+          // information; "contributing to your own task" is noise on every row.
+          const owner =
+            info.assigneeMemberId && info.assigneeMemberId !== memberId
+              ? members.get(info.assigneeMemberId)
+              : undefined;
+          return {
+            taskId,
+            title: info.title,
+            status: info.status,
+            source: info.source,
+            sources: toSourceGroups(ev, perSourceCap),
+            evidenceCount: ev.length,
+            ...(owner ? { assignee: { name: owner.name, avatarUrl: owner.avatarUrl } } : {}),
+          };
         })
         .sort((x, y) => y.evidenceCount - x.evidenceCount || (x.title < y.title ? -1 : 1));
       // UNLINKED work is rendered, BELOW the tasks. Omitting it is the right end state and shipped one

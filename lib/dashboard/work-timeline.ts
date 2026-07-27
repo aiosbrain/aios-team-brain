@@ -5,7 +5,7 @@ import type { DbClient } from "@/lib/db/types";
 import { visibleItems, visibleTasks, visibleDecisions, type ViewerTier } from "@/lib/auth/visibility";
 import { commitSubject } from "./team-work";
 import { sourceRules } from "@/lib/ingest/source-rules";
-import { decisionActors, type RosterPerson } from "./people-match";
+import { decisionActors, subjectMatchesMember, type RosterPerson } from "./people-match";
 import {
   groupTimeline,
   normalizeSource,
@@ -107,6 +107,7 @@ type TaskRow = {
   row_key: string | null;
   title: string;
   status: string | null;
+  assignee: string | null;
 };
 
 
@@ -236,7 +237,7 @@ export async function getWorkTimeline(
     visibleTasks(
       db
         .from("tasks")
-        .select("id, row_key, title, status")
+        .select("id, row_key, title, status, assignee")
         .eq("team_id", teamId)
         .in("status", [...ACTIVE_STATUSES])
         .order("updated_at", { ascending: false })
@@ -294,8 +295,20 @@ export async function getWorkTimeline(
   // present even when the all-status read clips at TASK_LIMIT. Evidence-gated in the grouper.
   const tasks = (taskRes.data ?? []) as TaskRow[];
 
+  // Assignee → member id, through the roster matcher: `tasks.assignee` is a free-text string the PM tool
+  // supplied and prod carries several spellings per person, so a raw compare would silently mark a
+  // teammate's task as unowned. Unresolved → null, and the card then says nothing rather than guessing.
+  const memberForAssignee = (assignee: string | null): string | null =>
+    assignee ? roster.find((p) => subjectMatchesMember(assignee, p))?.memberId ?? null : null;
+  const infoFor = (t: TaskRow): TaskInfo => ({
+    title: t.title || "(untitled task)",
+    status: t.status || "",
+    source: pmSource,
+    assigneeMemberId: memberForAssignee(t.assignee),
+  });
+
   const taskInfo = new Map<string, TaskInfo>();
-  for (const t of tasks) taskInfo.set(t.id, { title: t.title || "(untitled task)", status: t.status || "", source: pmSource });
+  for (const t of tasks) taskInfo.set(t.id, infoFor(t));
 
   // ATTRIBUTION ORACLE (single source of truth): credit each evidence item to its PRIMARY contributor —
   // the actual worker, via `item_versions` — not merely the current `member_id` owner. So a reassigned
@@ -390,7 +403,7 @@ export async function getWorkTimeline(
   const allTaskRes = await visibleTasks(
     db
       .from("tasks")
-      .select("id, row_key, title, status")
+      .select("id, row_key, title, status, assignee")
       .eq("team_id", teamId)
       .not("row_key", "is", null)
       .order("updated_at", { ascending: false })
@@ -413,7 +426,7 @@ export async function getWorkTimeline(
   // The active fetch is still kept above so active tasks survive even if this all-status read clips at
   // TASK_LIMIT. Tier: `allTasks` came through the same `visibleTasks` choke-point as the active set.
   for (const t of allTasks) {
-    if (!taskInfo.has(t.id)) taskInfo.set(t.id, { title: t.title || "(untitled task)", status: t.status || "", source: pmSource });
+    if (!taskInfo.has(t.id)) taskInfo.set(t.id, infoFor(t));
   }
   // Link targets = the UNION of both fetches, deduped. The all-status read orders by `updated_at DESC`, so
   // on a busy backlog an ACTIVE task can be pushed past TASK_LIMIT and vanish from `allTasks` — without the
