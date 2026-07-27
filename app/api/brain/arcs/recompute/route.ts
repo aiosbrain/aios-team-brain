@@ -14,14 +14,24 @@ export const maxDuration = 120; // arc synthesis (LLM) inline path can take up t
 const schema = z.object({
   team: z.string().min(1).max(120),
   corrections: z
-    .array(z.object({ arc_id: z.string().min(1).max(64), corrected_text: z.string().min(1).max(4000) }))
+    .array(
+      z.object({
+        arc_id: z.string().min(1).max(64),
+        // Optional so an older client keeps working; stored so the correction stays diagnosable once
+        // `arc_id` (sha of the title) churns on the next recompute.
+        arc_title: z.string().max(300).optional(),
+        corrected_text: z.string().min(1).max(4000),
+      })
+    )
     .max(10),
 });
 
 /**
- * Re-derive narrative arcs incorporating human corrections, and persist each correction back to
- * Graphiti as a first-class episode so it informs future synthesis. Session-authed + tier-scoped.
- * team-tier only: writing corrections is an internal edit (an external viewer can't reshape the graph).
+ * Re-derive narrative arcs incorporating human corrections. The correction is written to Postgres FIRST
+ * (`arc_corrections`, the record) and only then projected into Graphiti as an episode — it used to exist
+ * solely as that episode, so a graph rollback erased it and a failed write silently reverted the user's
+ * edit within one cache TTL (H13). A failed SAVE now surfaces as an error rather than a lie.
+ * Session-authed + tier-scoped; team-tier only, since correcting an arc is an internal editorial act.
  */
 export async function POST(req: NextRequest) {
   const rls = await serverClient();
@@ -36,13 +46,13 @@ export async function POST(req: NextRequest) {
   if (!team) return errorResponse("forbidden", "not a member of this team", 403);
   const { data: me } = await rls
     .from("members")
-    .select("tier")
+    .select("id, tier")
     .eq("team_id", team.id)
     .eq("auth_user_id", user.id)
     .eq("status", "active")
     .maybeSingle();
   if (!me) return errorResponse("forbidden", "not a member of this team", 403);
-  const tier = (me as { tier: "team" | "external" }).tier;
+  const { id: memberId, tier } = me as { id: string; tier: "team" | "external" };
   if (tier !== "team") return errorResponse("forbidden", "corrections are team-tier only", 403);
 
   const admin = adminClient();
@@ -54,7 +64,8 @@ export async function POST(req: NextRequest) {
     tier,
     visibleGroupIds(teamSlug, tier),
     corrections,
-    keys
+    keys,
+    memberId
   );
 
   return Response.json({ arcs, as_of: new Date().toISOString() });
