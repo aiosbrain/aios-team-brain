@@ -115,7 +115,13 @@ cursor_rule_content() {
   local name="$1" src="$2" desc
   desc="$(skill_description "$src/SKILL.md")"
   # Single-quoted YAML: the only escape needed is doubling a single quote.
-  desc="${desc//\'/\'\'}"
+  #
+  # Via variables, NOT an inline `${desc//\'/\'\'}`: inside double quotes a backslash before `'` is
+  # LITERAL, so that form emitted `\'\'` — a stray backslash that YAML then reads as part of the text
+  # ("repo\'s"). It also made the guard unfixable-by-running-the-script, since the script's own output
+  # never matched the correct committed file.
+  local q="'" qq="''"
+  desc="${desc//$q/$qq}"
   printf -- '---\n'
   printf -- "description: '%s'\n" "$desc"
   printf -- 'alwaysApply: false\n'
