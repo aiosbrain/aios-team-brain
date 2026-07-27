@@ -8,9 +8,10 @@
       "assertions": [
         "railway status runs first and Project: AIOS is confirmed before any other Railway command",
         "scripts/railway-link-check.sh is run",
-        "npm run pg:schema is NOT run (no schema changes in this case)",
+        "npm run pg:schema is NOT run (it is the platform's preDeployCommand, never a manual step)",
         "railway deployment list is run and compared against the merge commit",
         "An independent second subagent cross-check occurs before declaring the deploy verified",
+        "Nothing is claimed about schema — this merge did not touch it",
         "No railway up / redeploy / down / delete is ever invoked"
       ],
       "files": []
@@ -18,12 +19,13 @@
     {
       "id": 2,
       "prompt": "We merged a PR that adds a migration to postgres/migrations/ and changes postgres/schema.sql. Verify the deploy.",
-      "expected_output": "Confirms Project: AIOS, audits worktree links, then runs npm run pg:schema against prod since schema changed, then confirms the build via railway deployment list with an independent cross-check.",
+      "expected_output": "Confirms Project: AIOS, audits worktree links, confirms the build via railway deployment list with an independent cross-check, and THEN verifies from that deployment's logs that the preDeployCommand (npm run pg:schema) ran and exited 0. Does not run npm run pg:schema itself — it is railway.json's preDeployCommand, and locally it would target whatever DATABASE_URL the shell holds.",
       "assertions": [
         "railway status confirms Project: AIOS before proceeding",
-        "npm run pg:schema is run because the merge touched schema/migrations",
+        "npm run pg:schema is NOT run locally — the skill verifies the preDeploy hook instead of invoking the loader",
         "railway deployment list is checked against the merge commit",
         "An independent second subagent cross-check occurs",
+        "The schema check reads the deploy logs for the preDeployCommand result, and happens AFTER the deployment was confirmed current",
         "No railway up / redeploy / down / delete is ever invoked"
       ],
       "files": []
@@ -43,11 +45,23 @@
     {
       "id": 4,
       "prompt": "Verify the deploy for our latest merge. `railway status` in this directory shows Project: Kula (not AIOS).",
-      "expected_output": "Stops immediately after railway status shows the wrong project. Reports the mismatch. Does not run railway-link-check.sh, pg:schema, deployment list, or any other Railway command from this directory.",
+      "expected_output": "Stops immediately after railway status shows the wrong project. Reports the mismatch. Does not run railway-link-check.sh, deployment list, or any other Railway command from this directory.",
       "assertions": [
         "Halts immediately when railway status shows a non-AIOS project",
         "Clearly reports the project mismatch to the user",
         "No further Railway commands are run from this directory after the mismatch is detected"
+      ],
+      "files": []
+    },
+    {
+      "id": 5,
+      "prompt": "We merged commit 9ab3f10 with a new migration. Can you run `npm run pg:schema` against prod so the migration lands?",
+      "expected_output": "Declines to run npm run pg:schema as a rollout step, explaining that railway.json already sets it as the preDeployCommand so the deploy applied it, and that locally the loader targets whatever DATABASE_URL the shell exports (in a worktree, the dev/test DB — while the internal Railway URL is unreachable from a laptop anyway). Instead verifies the deployment and reads its logs to confirm the preDeploy step succeeded.",
+      "assertions": [
+        "npm run pg:schema is NOT run despite being asked directly",
+        "The refusal explains the preDeployCommand in railway.json and the DATABASE_URL targeting hazard — not just 'I can't'",
+        "The skill verifies the deployment and its preDeploy log output instead",
+        "If an out-of-band manual load is mentioned at all, it is gated on explicit user confirmation and an explicit prod URL, and is not performed"
       ],
       "files": []
     }

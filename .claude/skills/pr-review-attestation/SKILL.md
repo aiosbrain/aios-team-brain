@@ -5,8 +5,10 @@ description: >
   reviewer subagent, adversarially double-check any HIGH/blocker finding before
   trusting it, then record a `## Review — Reviewed by <tool> — verdict …` line in
   the PR body (or apply `ready-for-review` if no reviewer is available). Use
-  before pushing a PR branch in aios-team-brain, or when asked "did this get
-  reviewed", "attest this PR", or /pr-review-attestation.
+  before pushing a PR branch in aios-team-brain — and again right after
+  `gh pr create`, which is when the attestation line can actually be written —
+  or when asked "did this get reviewed", "attest this PR", or
+  /pr-review-attestation.
 ---
 
 # PR review attestation

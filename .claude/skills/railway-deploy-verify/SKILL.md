@@ -2,12 +2,13 @@
 name: railway-deploy-verify
 description: >
   Verify a merge to main actually deployed on Railway — confirm the linked
-  project, load prod schema if needed, cross-check the latest deployment
-  against the merge commit with an independent second read, and escalate
-  (dashboard re-trigger, never CLI) if it's stale. Use right after a merge to
-  aios-team-brain's main branch, or when asked "did the deploy go out",
-  "check Railway", or /railway-deploy-verify. Never runs `railway up` /
-  `redeploy` / `down` / `delete` under any framing.
+  project, cross-check the latest deployment against the merge commit with an
+  independent second read, confirm the preDeploy schema hook ran when the merge
+  touched schema, and escalate (dashboard re-trigger, never CLI) if it's stale.
+  Use right after a merge to aios-team-brain's main branch, or when asked "did
+  the deploy go out", "check Railway", or /railway-deploy-verify. Verification
+  only — never runs `railway up` / `redeploy` / `down` / `delete`, and never
+  runs `npm run pg:schema` by hand.
 ---
 
 # Railway deploy verification
@@ -45,28 +46,45 @@ Cursor) that don't have that hook wired.
    directory) — don't run it yourself without the user's go-ahead, since it
    changes another directory's link state.
 
-3. **Schema, only if the merge touched it.** If the merged diff touched
-   `postgres/schema.sql` or `postgres/migrations/`:
-   ```bash
-   npm run pg:schema
-   ```
-   This is the documented prod rollout step for schema changes — not optional
-   when schema changed, not needed otherwise.
-
-4. **Build confirmation.**
+3. **Build confirmation.**
    ```bash
    railway deployment list
    ```
    Compare the newest deployment's timestamp/commit against the merge commit
    SHA you're verifying.
 
-5. **Independent cross-check (subagent).** Don't trust your own read of step 4
+4. **Independent cross-check (subagent).** Don't trust your own read of step 3
    alone. Spawn a second, independent subagent and give it *only* the raw
    `railway deployment list` output and the merge commit SHA — no narrative
    framing about what you already concluded — and ask it to independently
    decide: is the latest deployment current (built at/after the merge, same
    commit) or stale? Only call the deploy verified if your read and the
    subagent's read agree. If they disagree, treat it as stale and go to step 6.
+
+5. **Schema — verify the hook ran, never run the loader yourself.** If the
+   merged diff touched `postgres/schema.sql` or `postgres/migrations/`, the
+   schema has *already* been applied by the platform: `railway.json` sets
+   `"preDeployCommand": "npm run pg:schema"`, so every deploy loads
+   `schema.sql` + `postgres/migrations/` against the service's own
+   `DATABASE_URL` before the release goes live. Your job is to confirm that
+   happened, from the deploy logs of the deployment you verified in step 3:
+   ```bash
+   railway logs --deployment   # then look for the pg:schema / preDeploy output
+   ```
+   Confirm the preDeploy step ran and exited 0 for that deployment. If it
+   failed, the release halted — report the loader error verbatim and stop; the
+   fix is a new commit, not a manual load.
+
+   **Do not run `npm run pg:schema` from a local checkout to "roll out" prod.**
+   `scripts/pg-load-schema.mjs` targets whatever `DATABASE_URL` is exported in
+   the current shell — in a worktree direnv normally exports the local dev/test
+   database, so the command would report success while prod got nothing; and
+   the internal Railway `DATABASE_URL` isn't reachable from a laptop at all.
+   The only case where a manual load is even coherent is a deliberate
+   out-of-band repair against an explicitly-passed public-proxy URL, from a
+   checkout that equals merged `main` — that is a production data mutation and
+   requires the user's explicit go-ahead first (CLAUDE.md § "Inspecting the
+   prod DB"). Never do it as a routine verification step.
 
 6. **Escalate on staleness or disagreement.** Report exactly what's stale
    (expected commit vs. deployed commit/time) and instruct re-triggering the
@@ -82,3 +100,10 @@ Cursor) that don't have that hook wired.
   confirmed `Project: AIOS` in this session.
 - Read-only Railway CLI use only: `status`, `logs`, `variables`,
   `deployment list`, `connect`.
+- **Never run `npm run pg:schema` as part of this skill.** It is the platform's
+  `preDeployCommand`, not a manual step, and run locally it points at whatever
+  `DATABASE_URL` the shell happens to hold. This skill *verifies* the deploy;
+  it does not mutate a database.
+- Order matters: confirm the deployment exists and is current (steps 3–4)
+  before drawing any conclusion about its schema step. There is nothing to
+  verify about the schema of a deploy that never happened.
