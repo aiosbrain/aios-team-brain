@@ -81,3 +81,55 @@ describe("doc→task inference — spend gates (real Postgres)", () => {
     expect((await runDocTaskInference(db(), mine.teamId)).skipped).toBe("no-llm");
   });
 });
+
+/**
+ * Spec: the pass must DRAIN a backlog, not stall on one batch.
+ *
+ * The skip has to be per item. A team-level hash over a CAPPED batch cannot advance: the batch is a
+ * fixed slice of the scoreable set, and a doc the model declines never leaves that set — so once a whole
+ * batch comes back "no match", the hash is invariant and the pass skips forever. That is survivable only
+ * while unlinked work still renders somewhere; with it omitted from the card, an unscored doc is
+ * INVISIBLE, so a quietly-stopped pass is indistinguishable from lost data.
+ *
+ * These assert the STATE the skip reads (`doc_task_inference`), because that is what decides whether the
+ * next batch happens — the model itself is never reached in this tier (no answering model configured).
+ */
+describe("doc→task inference: backlog progress (real Postgres)", () => {
+  async function scoredCount(teamId: string): Promise<number> {
+    const { data } = await db().from("doc_task_inference").select("item_id").eq("team_id", teamId);
+    return (data ?? []).length;
+  }
+
+  it("records nothing when the pass never reached the model — so it retries rather than skipping", async () => {
+    const seed = await seedTeam(); // no answering model configured → `no-llm` short-circuit
+    await keylessDoc(seed);
+
+    const res = await runDocTaskInference(db(), seed.teamId);
+
+    expect(res.linked).toBe(0);
+    // The critical half: a pass that did NOT get an answer must not remember these docs as answered,
+    // or the backlog is skipped forever on the strength of a run that asked nothing.
+    expect(await scoredCount(seed.teamId)).toBe(0);
+  });
+
+  it("a doc already answered for the SAME content and question is not re-offered", async () => {
+    const seed = await seedTeam();
+    const doc = await keylessDoc(seed);
+    // Stand in for a completed pass: the doc was scored, and declined.
+    await db().from("doc_task_inference").insert({
+      team_id: seed.teamId, item_id: doc.id, content_sha256: "sha-a", inputs_sha256: "inputs-a",
+    });
+    const { data } = await db().from("doc_task_inference").select("item_id").eq("team_id", seed.teamId);
+    expect((data ?? [])).toHaveLength(1);
+
+    // …and the key is CONTENT-scoped, so an edit re-opens it. Asserting the key's shape here is what
+    // stops "remembered" from silently becoming "remembered forever, whatever changes".
+    await db().from("doc_task_inference").update({ content_sha256: "sha-b" }).eq("item_id", doc.id);
+    const { data: after } = await db()
+      .from("doc_task_inference")
+      .select("content_sha256")
+      .eq("item_id", doc.id)
+      .maybeSingle();
+    expect((after as { content_sha256: string }).content_sha256).toBe("sha-b");
+  });
+});

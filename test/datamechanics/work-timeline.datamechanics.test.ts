@@ -13,18 +13,19 @@ import { db, seedTeam, ingest, type Seed } from "./helpers";
 
 const recentIso = new Date(Date.now() - 2 * 86_400_000).toISOString(); // within the 7-day window
 
+/** Every evidence title the card RENDERS — task-nested only, since unlinked work is now omitted. */
 const evidenceTitles = (days: TimelineDay[]): string[] =>
-  days.flatMap((d) => d.people).flatMap((p) => [
-    ...p.tasks.flatMap((t) => t.sources.flatMap((g) => g.items.map((i) => i.title))),
-    ...p.other.flatMap((g) => g.items.map((i) => i.title)),
-  ]);
+  days.flatMap((d) => d.people).flatMap((p) =>
+    p.tasks.flatMap((t) => t.sources.flatMap((g) => g.items.map((i) => i.title)))
+  );
 const taskTitles = (days: TimelineDay[]): string[] =>
   days.flatMap((d) => d.people).flatMap((p) => p.tasks.map((t) => t.title));
 const nestedUnder = (days: TimelineDay[], taskTitle: string): string[] =>
   days.flatMap((d) => d.people).flatMap((p) => p.tasks).filter((t) => t.title === taskTitle)
     .flatMap((t) => t.sources.flatMap((g) => g.items.map((i) => i.title)));
-const otherTitles = (days: TimelineDay[]): string[] =>
-  days.flatMap((d) => d.people).flatMap((p) => p.other.flatMap((g) => g.items.map((i) => i.title)));
+/** How many evidence rows were omitted for referencing no task — counted, never rendered. */
+const unlinkedCount = (days: TimelineDay[]): number =>
+  days.flatMap((d) => d.people).reduce((n, p) => n + p.unlinked, 0);
 /** taskTitle → the status carried on its header (so a `done` ticket can be labelled as such, not implied open). */
 const taskStatuses = (days: TimelineDay[]): Map<string, string> =>
   new Map(days.flatMap((d) => d.people).flatMap((p) => p.tasks).map((t) => [t.title, t.status]));
@@ -42,7 +43,7 @@ async function commit(seed: Seed, body: string) {
 }
 
 describe("work timeline (real Postgres)", () => {
-  it("a REFERENCED task appears (nested) whatever its status; unreferenced → hidden; unlinked → Other; meetings/undated dropped", async () => {
+  it("a REFERENCED task appears (nested) whatever its status; unreferenced → hidden; unlinked → OMITTED; meetings/undated dropped", async () => {
     const seed = await seedTeam();
     const anchor = await commit(seed, "seed");
 
@@ -66,9 +67,10 @@ describe("work timeline (real Postgres)", () => {
     expect(taskTitles(days)).toContain("Backlog thing"); // referenced → heads its group, status irrelevant
     expect(nestedUnder(days, "Backlog thing")).toContain("chore: poke AIO-2");
     expect(taskTitles(days)).not.toContain("Active but idle"); // active but no evidence → hidden
-    // "Other" now means exactly what it says: evidence referencing NO task.
-    expect(otherTitles(days)).toContain("chore: unrelated cleanup");
-    expect(otherTitles(days)).not.toContain("chore: poke AIO-2");
+    // Evidence referencing NO task is OMITTED, not bucketed — but still counted, so the omission is
+    // measurable rather than silent.
+    expect(evidenceTitles(days)).not.toContain("chore: unrelated cleanup");
+    expect(unlinkedCount(days)).toBeGreaterThanOrEqual(1);
     expect(evidenceTitles(days)).not.toContain("No work time"); // undated → dropped
     expect(evidenceTitles(days)).not.toContain("Standup"); // meeting → excluded
   });
@@ -97,13 +99,17 @@ describe("work timeline (real Postgres)", () => {
     await db()
       .from("member_identities")
       .insert({ team_id: seed.teamId, member_id: seed.memberId, provider: "slack", external_id: "U_REPLIER" });
+    const anchor = await commit(seed, "seed");
+    await insertTask(seed, anchor.projectId!, { row_key: "AIO-1", title: "Rollout", status: "in_progress" });
 
     // A slack thread: root by an unmapped user, a reply by the mapped member. participants[] carries the
     // per-contributor ledger the timeline reads (the ingest frontmatter-heal writes this in prod).
     await ingest(seed, {
       kind: "transcript", path: `slack/eng/${randomUUID()}.md`, access: "team", body: "slack thread body",
       frontmatter: {
-        source: "slack", channel: "eng", title: "#eng: dual-backend rollout plan",
+        // Cites the task's key so the thread NESTS: unlinked evidence is omitted now, and this test is
+        // about per-participant attribution + dedup, not the linking rule.
+        source: "slack", channel: "eng", title: "#eng: dual-backend rollout plan (AIO-1)",
         participants: [
           { author_id: "U_root", display_name: "Outsider", message_count: 1, first_ts: recentIso, last_ts: recentIso },
           { author_id: "U_REPLIER", display_name: "Tester", message_count: 2, first_ts: recentIso, last_ts: recentIso },
@@ -114,8 +120,8 @@ describe("work timeline (real Postgres)", () => {
     });
 
     const days = await getWorkTimeline(db(), seed.teamId, "team");
-    // The mapped replier gets the thread in THEIR day (no issue key → "Other"), exactly ONCE (dedup).
-    expect(otherTitles(days).filter((t) => t === "#eng: dual-backend rollout plan")).toHaveLength(1);
+    // The mapped replier gets the thread in THEIR day, exactly ONCE (dedup).
+    expect(evidenceTitles(days).filter((t) => t === "#eng: dual-backend rollout plan (AIO-1)")).toHaveLength(1);
     // Only the mapped member appears — the unmapped root ("Outsider") is dropped, never guessed.
     const names = days.flatMap((d) => d.people.map((p) => p.name));
     expect(names).toContain("Tester");
@@ -160,17 +166,23 @@ describe("work timeline (real Postgres)", () => {
 
   it("tier isolation: an external viewer never receives team-tier work", async () => {
     const seed = await seedTeam();
-    await commit(seed, "Secret team-only commit");
+    // BOTH commits cite the SAME external-audience task, so the TASK filter can never be what hides
+    // either one. Load-bearing: with unlinked evidence omitted, a commit citing a TEAM-tier task is
+    // dropped for having no visible task, and this test would pass even with `visibleItems` deleted —
+    // verified by mutation. The item's own `access` is the only variable left.
+    const anchor = await commit(seed, "seed");
+    await insertTask(seed, anchor.projectId!, { row_key: "PUB-9", title: "Public work", status: "in_progress", audience: "external" });
+    await commit(seed, "Secret team-only commit PUB-9");
     await ingest(seed, {
       kind: "artifact", path: `commits/repo/${randomUUID()}.md`, access: "external",
-      body: "Public external commit", frontmatter: { source: "git", committed_at: recentIso },
+      body: "Public external commit PUB-9", frontmatter: { source: "git", committed_at: recentIso },
     });
 
     const teamTitles = evidenceTitles(await getWorkTimeline(db(), seed.teamId, "team"));
     const extTitles = evidenceTitles(await getWorkTimeline(db(), seed.teamId, "external"));
-    expect(teamTitles).toEqual(expect.arrayContaining(["Secret team-only commit", "Public external commit"]));
-    expect(extTitles).not.toContain("Secret team-only commit");
-    expect(extTitles).toContain("Public external commit");
+    expect(teamTitles).toEqual(expect.arrayContaining(["Secret team-only commit PUB-9", "Public external commit PUB-9"]));
+    expect(extTitles).not.toContain("Secret team-only commit PUB-9"); // only the ITEM's tier hides it
+    expect(extTitles).toContain("Public external commit PUB-9");
   });
 
   // Spec: `windowDays` widens the lookback ("Show earlier days"). A commit dated 10 days ago is OUT of the
@@ -178,68 +190,77 @@ describe("work timeline (real Postgres)", () => {
   // the fetch bound and the in-window filter (not just a display slice).
   it("windowDays expands the lookback: a 10-day-old commit is excluded at 7 days, included at 14", async () => {
     const seed = await seedTeam();
+    const anchor = await commit(seed, "seed");
+    await insertTask(seed, anchor.projectId!, { row_key: "AIO-10", title: "Windowed", status: "in_progress" });
     const tenDaysAgo = new Date(Date.now() - 10 * 86_400_000).toISOString();
     await ingest(seed, {
       kind: "artifact", path: `commits/repo/${randomUUID()}.md`, access: "team",
-      body: "Ten-day-old commit", frontmatter: { source: "git", committed_at: tenDaysAgo },
+      body: "Ten-day-old commit AIO-10", frontmatter: { source: "git", committed_at: tenDaysAgo },
     });
 
-    expect(evidenceTitles(await getWorkTimeline(db(), seed.teamId, "team"))).not.toContain("Ten-day-old commit");
-    expect(evidenceTitles(await getWorkTimeline(db(), seed.teamId, "team", 14))).toContain("Ten-day-old commit");
+    expect(evidenceTitles(await getWorkTimeline(db(), seed.teamId, "team"))).not.toContain("Ten-day-old commit AIO-10");
+    expect(evidenceTitles(await getWorkTimeline(db(), seed.teamId, "team", 14))).toContain("Ten-day-old commit AIO-10");
   });
 });
 
 describe("work timeline — attributed docs (Notion / Google Docs / deliverables) by edit time (real Postgres)", () => {
   it("includes a doc dated by its own edit/create time; drops ones with no work-time or out of window", async () => {
     const seed = await seedTeam();
+    // Every doc cites the same task: this test is about WORK-TIME resolution, so each doc must be
+    // renderable for its absence to mean "wrong date" rather than "no task".
+    const anchor = await commit(seed, "seed");
+    await insertTask(seed, anchor.projectId!, { row_key: "AIO-20", title: "Dating", status: "in_progress" });
     const days2ago = new Date(Date.now() - 2 * 86_400_000).toISOString();
     const day1ago = new Date(Date.now() - 86_400_000).toISOString();
     const days30ago = new Date(Date.now() - 30 * 86_400_000).toISOString();
 
     // Notion doc edited 2d ago (last_edited_time) → appears (in "Other", no issue key).
     await ingest(seed, { kind: "deliverable", path: `notion/spec-${randomUUID()}.md`, access: "team", body: "spec",
-      frontmatter: { source: "notion", title: "Auth rollout spec", last_edited_time: days2ago } });
+      frontmatter: { source: "notion", title: "Auth rollout spec AIO-20", last_edited_time: days2ago } });
     // Hand-authored deliverable with only `updated` 1d ago → appears.
     await ingest(seed, { kind: "deliverable", path: `docs/plan-${randomUUID()}.md`, access: "team", body: "plan",
-      frontmatter: { title: "Q3 plan", updated: day1ago } });
+      frontmatter: { title: "Q3 plan AIO-20", updated: day1ago } });
     // Doc edited 30d ago → outside the 7d work window → excluded (even though synced_at is now).
     await ingest(seed, { kind: "deliverable", path: `notion/old-${randomUUID()}.md`, access: "team", body: "old",
-      frontmatter: { source: "notion", title: "Ancient doc", last_edited_time: days30ago } });
+      frontmatter: { source: "notion", title: "Ancient doc AIO-20", last_edited_time: days30ago } });
     // Doc with NO source work-time (only synced_at) → dropped (synced_at must never resurface it).
     await ingest(seed, { kind: "deliverable", path: `notion/undated-${randomUUID()}.md`, access: "team", body: "u",
-      frontmatter: { source: "notion", title: "Undated doc" } });
+      frontmatter: { source: "notion", title: "Undated doc AIO-20" } });
     // Hand-authored doc dated in the FUTURE (a plan for next month) → dropped (no future day bucket).
     await ingest(seed, { kind: "deliverable", path: `docs/future-${randomUUID()}.md`, access: "team", body: "f",
-      frontmatter: { title: "Next-month plan", date: new Date(Date.now() + 30 * 86_400_000).toISOString() } });
+      frontmatter: { title: "Next-month plan AIO-20", date: new Date(Date.now() + 30 * 86_400_000).toISOString() } });
 
     const titles = evidenceTitles(await getWorkTimeline(db(), seed.teamId, "team"));
-    expect(titles).toContain("Auth rollout spec");
-    expect(titles).toContain("Q3 plan");
-    expect(titles).not.toContain("Ancient doc");
-    expect(titles).not.toContain("Undated doc");
-    expect(titles).not.toContain("Next-month plan"); // future-dated → not in a future bucket
+    expect(titles).toContain("Auth rollout spec AIO-20");
+    expect(titles).toContain("Q3 plan AIO-20");
+    expect(titles).not.toContain("Ancient doc AIO-20");
+    expect(titles).not.toContain("Undated doc AIO-20");
+    expect(titles).not.toContain("Next-month plan AIO-20"); // future-dated → not in a future bucket
   });
 
   it("dates a doc whose source spells its edit time differently (previously dropped)", async () => {
     const seed = await seedTeam();
+    // Linked so the assertions test the DATE-KEY spelling, not the linking rule.
+    const anchor = await commit(seed, "seed");
+    await insertTask(seed, anchor.projectId!, { row_key: "AIO-21", title: "Spellings", status: "in_progress" });
     const day1ago = new Date(Date.now() - 86_400_000).toISOString();
 
     // Each reader spells its timestamp its own way. Work-time matched EXACT key names, so a spelling
     // the list didn't enumerate resolved to null and the doc was silently DROPPED — ingested,
     // attributed, and invisible. Keys are now matched on a normalized form.
     await ingest(seed, { kind: "deliverable", path: `drive/spaced-${randomUUID()}.md`, access: "team", body: "d",
-      frontmatter: { source: "gdrive", title: "Drive doc spaced key", "modified at": day1ago } });
+      frontmatter: { source: "gdrive", title: "Drive doc spaced key AIO-21", "modified at": day1ago } });
     await ingest(seed, { kind: "deliverable", path: `conf/updatedat-${randomUUID()}.md`, access: "team", body: "c",
-      frontmatter: { source: "confluence", title: "Confluence doc updatedAt", updated_at: day1ago } });
+      frontmatter: { source: "confluence", title: "Confluence doc updatedAt AIO-21", updated_at: day1ago } });
     // A repo file's work-time is its last commit — github-files fetched that commit for the author
     // but threw the DATE away, so every repo doc was undated and dropped from the timeline.
     await ingest(seed, { kind: "deliverable", path: `github/o-r/readme-${randomUUID()}.md`, access: "team", body: "r",
-      frontmatter: { source: "github", title: "Repo readme", committed_at: day1ago } });
+      frontmatter: { source: "github", title: "Repo readme AIO-21", committed_at: day1ago } });
 
     const titles = evidenceTitles(await getWorkTimeline(db(), seed.teamId, "team"));
-    expect(titles).toContain("Drive doc spaced key");
-    expect(titles).toContain("Confluence doc updatedAt");
-    expect(titles).toContain("Repo readme");
+    expect(titles).toContain("Drive doc spaced key AIO-21");
+    expect(titles).toContain("Confluence doc updatedAt AIO-21");
+    expect(titles).toContain("Repo readme AIO-21");
   });
 
   it("a PM issue's own description doc is NOT evidence (the evidence gate stays honest)", async () => {
@@ -274,17 +295,19 @@ describe("work timeline — attribution oracle (credits the worker, not the reas
     }).select("id").single();
     if (error || !bRow) throw new Error(`seed B failed: ${error?.message}`);
 
-    const c = await commit(seed, "feat: did the actual work"); // A authors the commit (+ its version)
+    const anchor = await commit(seed, "seed");
+    await insertTask(seed, anchor.projectId!, { row_key: "AIO-30", title: "Credited", status: "in_progress" });
+    const c = await commit(seed, "feat: did the actual work AIO-30"); // A authors the commit (+ its version)
     await db().from("items").update({ member_id: (bRow as { id: string }).id }).eq("id", c.id); // pure reassign → B, no B version
 
     const days = await getWorkTimeline(db(), seed.teamId, "team");
     const names = days.flatMap((d) => d.people.map((p) => p.name));
     expect(names).toContain("Tester"); // A, the worker
     expect(names).not.toContain("Person B"); // B never worked → not credited
-    expect(evidenceTitles(days)).toContain("feat: did the actual work");
+    expect(evidenceTitles(days)).toContain("feat: did the actual work AIO-30");
   });
 
-  it("a DONE task referenced by in-window evidence HEADS its own group (it is not dumped into Other)", async () => {
+  it("a DONE task referenced by in-window evidence HEADS its own group (its evidence is not omitted)", async () => {
     // The old rule made only ACTIVE tasks nesting headers, so a commit for a just-shipped ticket landed
     // under "Other · not linked to a task" while carrying a chip naming that very task — the header
     // contradicted the row beneath it. A referenced task now heads its group whatever its status.
@@ -296,12 +319,9 @@ describe("work timeline — attribution oracle (credits the worker, not the reas
     const days = await getWorkTimeline(db(), seed.teamId, "team");
     expect(taskTitles(days)).toContain("Ship the widget");
     expect(nestedUnder(days, "Ship the widget")).toContain("fix: polish the widget (AIO-777)");
-    // …and it is NOT also sitting in the "Other" bucket (no double-representation).
-    const otherTitles = days
-      .flatMap((d) => d.people)
-      .flatMap((p) => p.other.flatMap((g) => g.items))
-      .map((i) => i.title);
-    expect(otherTitles).not.toContain("fix: polish the widget (AIO-777)");
+    // …exactly once. Since unlinked evidence is OMITTED, a status-based regression would now DELETE
+    // this row rather than misfile it — which this catches either way.
+    expect(evidenceTitles(days).filter((t) => t === "fix: polish the widget (AIO-777)")).toHaveLength(1);
   });
 
   it("EVIDENCE-GATING, not status, is what keeps the backlog out: an untouched task never appears", async () => {
@@ -330,18 +350,18 @@ describe("work timeline — attribution oracle (credits the worker, not the reas
     await extCommit("fix: touch the secret (SEC-99)");
     await extCommit("fix: touch the public thing (PUB-1)");
 
-    // Referenced tasks now surface as HEADERS, so the leak surface is the header set (plus any residual
-    // chip). Assert over both so the tier guarantee can't be sidestepped by whichever one renders.
-    const exposed = (days: TimelineDay[]): (string | undefined)[] => [
-      ...taskTitles(days),
-      ...days.flatMap((d) => d.people).flatMap((p) => p.other.flatMap((g) => g.items)).map((i) => i.linkedTask?.title),
-    ];
+    // Referenced tasks surface as HEADERS, and that is now the ONLY place a task title can appear —
+    // unlinked evidence is omitted, so there is no second surface to sidestep the check through.
+    const exposed = (days: TimelineDay[]): (string | undefined)[] => taskTitles(days);
 
     const asExternal = await getWorkTimeline(db(), seed.teamId, "external");
     expect(exposed(asExternal)).toContain("Public ticket"); // non-vacuous: an external task DOES surface
     expect(exposed(asExternal)).not.toContain("Team secret ticket"); // NEVER leaked to an external viewer
-    // The commit itself is external-visible — so the task really was filtered, not the whole row.
-    expect(evidenceTitles(asExternal)).toContain("fix: touch the secret (SEC-99)");
+    // The commit IS external-visible, but its only task is team-tier — so with unlinked evidence omitted
+    // the row is dropped rather than shown taskless. Intended: we cannot say what work it belongs to
+    // without naming a ticket this viewer may not see.
+    expect(evidenceTitles(asExternal)).not.toContain("fix: touch the secret (SEC-99)");
+    expect(evidenceTitles(asExternal)).toContain("fix: touch the public thing (PUB-1)"); // non-vacuous
 
     const asTeam = await getWorkTimeline(db(), seed.teamId, "team");
     expect(exposed(asTeam)).toEqual(expect.arrayContaining(["Team secret ticket", "Public ticket"]));
@@ -364,10 +384,10 @@ describe("work timeline — attribution oracle (credits the worker, not the reas
     expect(signalTitles).toContain("chose Postgres over the graph");
     expect(signalTitles).not.toContain("a call nobody here made"); // unmatched decided_by → dropped
     expect(signalTitles).not.toContain("an anonymous call"); // empty decided_by → dropped
-    // …and it's SIGNAL, not work: the decision is not in tasks/other/total for the person.
+    // …and it's SIGNAL, not work: the decision is not in tasks/total for the person.
     const tester = days.flatMap((d) => d.people).find((p) => p.name === "Tester")!;
     expect(evidenceTitles(days)).not.toContain("chose Postgres over the graph");
-    expect(tester.total).toBe(tester.tasks.reduce((n, t) => n + t.evidenceCount, 0) + tester.other.reduce((n, g) => n + g.count, 0)); // work only
+    expect(tester.total).toBe(tester.tasks.reduce((n, t) => n + t.evidenceCount, 0)); // rendered work only
 
     // TIER: an external viewer never gets a team-audience decision (public one DOES show — non-vacuous).
     await insertDecision({ title: "public decision", decided_by: "Tester", audience: "external" });
@@ -505,10 +525,16 @@ describe("INFERRED task links (the LLM doc→task pass — the first reader of t
     await insertTask(seed, anchor.projectId!, { row_key: "AIO-501", title: "Low confidence task" });
     const doc = await keylessDoc(seed, "Vaguely related doc");
     await inferredLink(seed, await taskId("AIO-501"), doc.id, 0.4);
+    // Give the person one REAL piece of work, so the day renders and the omission count is observable —
+    // otherwise the whole person-day is dropped and the assertion below has nothing to read.
+    await insertTask(seed, anchor.projectId!, { row_key: "AIO-504", title: "Genuine task" });
+    await commit(seed, "feat: real work (AIO-504)");
 
     const days = await getWorkTimeline(db(), seed.teamId, "team");
     expect(taskTitles(days)).not.toContain("Low confidence task");
-    expect(otherTitles(days)).toContain("Vaguely related doc"); // stays in "Other"
+    // …and the doc is OMITTED rather than shown taskless: a sub-threshold guess buys no visibility.
+    expect(evidenceTitles(days)).not.toContain("Vaguely related doc");
+    expect(unlinkedCount(days)).toBeGreaterThanOrEqual(1); // counted, so the omission stays measurable
   });
 
   it("DETERMINISTIC WINS: an own-key doc ignores a contradicting inferred row", async () => {

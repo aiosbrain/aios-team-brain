@@ -95,8 +95,15 @@ const str = (v: unknown): string | undefined => (typeof v === "string" && v ? v 
  * Run the pass for ONE team. Best-effort: returns a result rather than throwing, so a scheduler tick
  * can never fail on it.
  */
-export async function runDocTaskInference(db: DbClient, teamId: string): Promise<InferRunResult> {
+export async function runDocTaskInference(
+  db: DbClient,
+  teamId: string,
+  /** `maxDocs` overrides the batch cap — for tests that need to prove multi-batch behaviour without
+   *  seeding `MAX_DOCS` documents. */
+  opts: { maxDocs?: number } = {}
+): Promise<InferRunResult> {
   const startedAt = Date.now();
+  const batchCap = opts.maxDocs ?? MAX_DOCS;
   try {
     // COOLDOWN first — one indexed query, and the cheapest possible way to decide not to spend. Both
     // triggers (scheduler tick, timeline rebuild) share this clock, so they can never double-charge:
@@ -191,8 +198,8 @@ export async function runDocTaskInference(db: DbClient, teamId: string): Promise
       // `body` is attached later — only for the docs that survive the skip check (see below).
     }));
 
-    const scoreable = scoreableDocs(docs).slice(0, MAX_DOCS);
-    if (!scoreable.length) return { scored: 0, linked: 0, skipped: "nothing-to-score" };
+    const allScoreable = scoreableDocs(docs);
+    if (!allScoreable.length) return { scored: 0, linked: 0, skipped: "nothing-to-score" };
 
     // Resolve each task's assignee to a member so ranking uses the identity mapping, not the raw string
     // (prod carries `Chetan` / `chetan.nandakumar` / `John Ellison` / `john` for two people).
@@ -204,12 +211,27 @@ export async function runDocTaskInference(db: DbClient, teamId: string): Promise
       assigneeMemberId: assigneeToMember.get((t.assignee ?? "").trim().toLowerCase()) ?? null,
     }));
 
-    // SKIP-IF-UNCHANGED: same docs (by content), same candidates, same prompt → the previous answers
-    // still hold, so re-running would re-spend for an identical result.
-    // The hash keys on `content_sha256`, NOT on the prose — so this decision needs no bodies, which is
-    // what lets the body read stay behind it.
-    const inputsHash = inferenceInputsHash(scoreable, candidates, DOC_TASK_SYSTEM);
-    if (prior?.inputsHash === inputsHash) return { scored: 0, linked: 0, skipped: "unchanged" };
+    // SKIP-IF-ALREADY-SCORED, **per item**. Same doc content + same question → the previous answer still
+    // holds, so re-asking re-spends for an identical result.
+    //
+    // Per item, and not one hash per team over the batch, because that cannot drain a backlog: the batch
+    // is a fixed slice of `allScoreable`, and a doc the model DECLINES never leaves that set — so once a
+    // whole batch comes back "no match" the hash is invariant and the pass skips forever. Slicing
+    // newest-first merely hides it (new arrivals keep changing the slice while older docs stay unscored);
+    // slicing oldest-first makes it total, since nothing older ever arrives. Recording what was scored is
+    // what lets the batch advance. Since unlinked work is omitted from the card, an unscored doc is
+    // INVISIBLE rather than merely unlinked, so "the pass quietly stopped" is not a survivable state.
+    //
+    // The key covers the doc's CONTENT and the inputs hash (prompt + candidate set), so an edited doc, an
+    // edited prompt, or a NEW task all re-score — a "no match" is only remembered while the question is.
+    // Keys on `content_sha256`, never the prose, which is what lets the body read stay behind this check.
+    const inputsHash = inferenceInputsHash([], candidates, DOC_TASK_SYSTEM);
+    const alreadyScored = await scoredKeys(db, teamId, allScoreable.map((d) => d.id));
+    const pending = allScoreable.filter((d) => !alreadyScored.has(`${d.id}:${d.contentSha}:${inputsHash}`));
+    if (!pending.length) return { scored: 0, linked: 0, skipped: "unchanged" };
+    // OLDEST-FIRST is now just fairness: the scored ones drop out of `pending`, so the queue drains
+    // whichever end it is taken from. Oldest-first stops a steady drip of new docs starving the tail.
+    const scoreable = pending.slice(-batchCap).reverse();
 
     // Only NOW pull prose, and only for the ≤MAX_DOCS docs actually being scored.
     const withBodies = await attachBodies(db, teamId, scoreable);
@@ -243,9 +265,27 @@ export async function runDocTaskInference(db: DbClient, teamId: string): Promise
       new Set(withBodies.map((d) => d.id))
     );
 
-    // Replace THIS pass's edges only — `method='llm'`. The deterministic writer's `issue_ref` rows are
-    // untouched (and vice-versa: its prune is scoped the same way), so the two writers never clobber.
-    const del = await db.from("task_evidence").delete().eq("team_id", teamId).eq("method", "llm");
+    // Replace THIS BATCH's edges — scoped by `method='llm'` AND by the item ids just scored.
+    //
+    // Both halves of that scope are load-bearing. `method` keeps the two writers off each other (the
+    // deterministic one prunes `issue_ref` the same way). The ITEM filter is what makes the pass
+    // additive across batches: when the batch was a fixed newest-N slice, a team-wide delete was a true
+    // replace, but batches now ROTATE through the backlog, so a team-wide delete would wipe every
+    // earlier batch's links on each run — and those docs are recorded as scored, so they are never
+    // re-asked and never come back. Coverage would cap at one batch forever, and since unlinked work is
+    // omitted from the card, the wiped docs would go invisible rather than merely unlinked.
+    // ONE definition of "the batch" — `withBodies` is what was offered to the model, what gets pruned,
+    // and what is recorded as scored. Deriving any of the three from `scoreable` instead would be
+    // identical today (`attachBodies` is id-preserving) and a landmine the moment it isn't: a doc
+    // recorded as scored but never offered is permanently skipped, never linked, and — since unlinked
+    // work is omitted — invisible. Exactly this PR's failure class, one line further down.
+    const batchIds = withBodies.map((d) => d.id);
+    const del = await db
+      .from("task_evidence")
+      .delete()
+      .eq("team_id", teamId)
+      .eq("method", "llm")
+      .in("item_id", batchIds);
     if (del.error) throw new Error(`prune failed: ${del.error.message}`);
     if (links.length) {
       const rows = links.map((l) => ({
@@ -265,6 +305,10 @@ export async function runDocTaskInference(db: DbClient, teamId: string): Promise
       if (ins.error) throw new Error(`insert failed: ${ins.error.message}`);
     }
 
+    // Mark the batch scored AFTER the pass succeeded — including the docs the model declined, because
+    // "no match" is a real answer and re-asking for it every cycle is the spend this table prevents. A
+    // FAILED pass records nothing here, so it retries.
+    await markScored(db, teamId, withBodies, inputsHash);
     await record(db, teamId, startedAt, true, { inputs_hash: inputsHash, scored: scoreable.length, linked: links.length });
     return { scored: scoreable.length, linked: links.length };
   } catch (err) {
@@ -279,6 +323,9 @@ export async function runDocTaskInference(db: DbClient, teamId: string): Promise
  * Fetch prose for exactly the docs being scored, head-truncated. Separate from the wide scan so an
  * "unchanged" tick reads no bodies at all. A body that fails to load leaves the doc title-only — still
  * judgeable, just weaker evidence — rather than dropping it.
+ *
+ * MUST be id-preserving: its output defines the batch that is offered to the model, pruned, and recorded
+ * as scored. Dropping a doc here would record it as answered without ever asking about it.
  */
 async function attachBodies(db: DbClient, teamId: string, docs: InferDoc[]): Promise<InferDoc[]> {
   try {
@@ -302,8 +349,9 @@ async function attachBodies(db: DbClient, teamId: string, docs: InferDoc[]): Pro
  *
  *  • `finishedAt` drives the COOLDOWN, and counts a FAILED run too: a team whose provider is erroring
  *    must not re-attempt every tick.
- *  • `inputsHash` drives the skip-if-unchanged, and counts only a SUCCESSFUL run: a failure's hash would
- *    suppress the retry that fixes it.
+ *  • The skip-if-unchanged is now PER ITEM (`doc_task_inference`), so only `finishedAt` is read here.
+ *    The recorded `meta.inputs_hash` stays as run PROVENANCE — it answers "what question did this run
+ *    ask?" when reading the ledger — but nothing branches on it any more.
  */
 async function lastRun(db: DbClient, teamId: string): Promise<{ finishedAt: number; inputsHash: string | null } | null> {
   try {
@@ -327,6 +375,49 @@ async function lastRun(db: DbClient, teamId: string): Promise<{ finishedAt: numb
   } catch {
     return null; // unreadable history → run (spending once beats silently never running again)
   }
+}
+
+/** `item:contentSha:inputsHash` for everything this team has already been asked about. */
+async function scoredKeys(db: DbClient, teamId: string, itemIds: string[]): Promise<Set<string>> {
+  if (!itemIds.length) return new Set();
+  const { data, error } = await db
+    .from("doc_task_inference")
+    .select("item_id, content_sha256, inputs_sha256")
+    .eq("team_id", teamId)
+    // Bounded to the docs actually in play — the table grows with corpus age, and only rows for the
+    // current scoreable set can affect this decision.
+    .in("item_id", itemIds);
+  // A read failure means we cannot tell what was scored. Returning an EMPTY set re-asks (costs tokens);
+  // returning a full one would skip everything (costs correctness, silently). Spend is the recoverable
+  // side of that trade, and the cooldown bounds it.
+  if (error) return new Set();
+  return new Set(
+    ((data ?? []) as { item_id: string; content_sha256: string; inputs_sha256: string }[]).map(
+      (r) => `${r.item_id}:${r.content_sha256}:${r.inputs_sha256}`
+    )
+  );
+}
+
+/** Record a scored batch. Best-effort: failing to remember costs a re-ask, never a wrong answer. */
+async function markScored(
+  db: DbClient,
+  teamId: string,
+  docs: readonly { id: string; contentSha: string }[],
+  inputsHash: string
+): Promise<void> {
+  if (!docs.length) return;
+  const at = new Date().toISOString();
+  const { error } = await db.from("doc_task_inference").upsert(
+    docs.map((d) => ({
+      team_id: teamId,
+      item_id: d.id,
+      content_sha256: d.contentSha,
+      inputs_sha256: inputsHash,
+      scored_at: at,
+    })),
+    { onConflict: "team_id,item_id" }
+  );
+  if (error) console.warn("[doc-task] could not record scored batch:", error.message);
 }
 
 async function record(

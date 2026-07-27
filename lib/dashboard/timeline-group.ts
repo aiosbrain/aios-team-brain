@@ -9,10 +9,12 @@
  *                task with no evidence never appears). STATUS does not gate it — a ticket that shipped
  *                today still heads its group, carrying its status — so this is "the work they touched",
  *                each with that day's evidence nested + grouped by source.
- *   • other[]  — that day's evidence that referenced NO task at all, grouped by source.
+ *   • unlinked — how many of that day's evidence rows referenced NO task (counted, not rendered).
  * Ordering: days DESC (undated last); within a day, people by activity DESC; a person's tasks by
  * evidence count DESC; items newest-first, capped per source.
  */
+
+import { SOURCE_RULES } from "@/lib/ingest/source-rules";
 
 /** LEGACY (no longer populated). This described a task an "Other"-bucket item referenced but which was
  *  barred from being a nesting header by the old ACTIVE-only rule, shown as a chip so the association
@@ -104,7 +106,10 @@ export interface PersonDay {
    *  pure builder, so it's computed once per rebuild and never runs in the data-mechanics tier. */
   summary?: string;
   tasks: TaskGroup[];
-  other: SourceGroup[]; // WORK evidence linked to no task at all
+  /** How many of this person's evidence rows that day referenced NO task. Counted, never rendered: the
+   *  card's contract is task → evidence, and a lane of taskless work out-competed the tasks for attention.
+   *  Retained as the coverage metric for the doc→task assignment pass. */
+  unlinked: number;
   signals: SignalGroup[]; // Context lane — decisions etc. (about work); shown, never counted as work
 }
 
@@ -136,10 +141,10 @@ export function summaryPromptFor(p: PersonDay, dayLabel: string, itemCap = 8): s
       lines.push(`- ${t.title} [${t.status}]${work ? ` — ${work}` : ""}`);
     }
   }
-  if (p.other.length) {
-    lines.push("Other work (not tied to a task):");
-    for (const g of p.other) lines.push(`- ${g.source}: ${titles(g)}`);
-  }
+  // Unlinked work is deliberately NOT described to the summariser. It is omitted from the card, so
+  // narrating it would produce a summary about work the reader cannot see — the mismatch the whole
+  // task → evidence contract exists to remove.
+  
   if (lines.length === 0) return "";
   return `${p.name} on ${dayLabel}:\n${lines.join("\n")}`;
 }
@@ -184,13 +189,15 @@ export function mostRecentPerPerson(days: TimelineDay[]): PersonDay[] {
  * Re-exported under the local name so timeline callers keep an intention-revealing import.
  */
 
-/** github/git → github; a known source passes through; anything else → "other" (generic icon). */
+/** github/git → github; any REGISTERED source passes through; anything else → "other" (generic icon).
+ *  The allowlist is the source-rules table itself rather than a second literal list — a new connector
+ *  (or a different task tracker) then gets its own icon without editing this file, which is the same
+ *  reason the ticket-document rule lives there. */
 export function normalizeSource(raw: string | null | undefined): string {
   const s = (raw ?? "").trim().toLowerCase();
   if (s === "git" || s === "github") return "github";
   if (s === "google_drive" || s === "gdrive" || s === "drive") return "gdrive";
-  if (["linear", "plane", "slack", "notion", "granola", "confluence"].includes(s)) return s;
-  return "other";
+  return s in SOURCE_RULES ? s : "other";
 }
 
 const DEFAULT_PER_SOURCE_CAP = 6;
@@ -238,7 +245,7 @@ function toSourceGroups(items: EvidenceItem[], cap: number): SourceGroup[] {
 }
 
 /**
- * Group attributed, task-linked evidence into the day → person → (tasks + other) structure the panel
+ * Group attributed, task-linked evidence into the day → person → tasks → evidence structure the panel
  * renders. EVIDENCE-GATED: a task group exists only where the person has evidence referencing it that
  * day — there are no empty task headers. `taskInfo` supplies each active task's display fields; evidence
  * whose `taskId` isn't in `taskInfo` (unlinked, or linked to a now-inactive task) falls to "Other".
@@ -252,7 +259,7 @@ export function groupTimeline(
   perSourceCap: number = DEFAULT_PER_SOURCE_CAP,
   signals: SignalWithMember[] = [], // Context lane — never counted as work
 ): TimelineDay[] {
-  // day -> memberId -> { tasks, other (WORK), signals (SIGNAL) }
+  // day -> memberId -> { tasks, other (unlinked WORK — counted only), signals (SIGNAL) }
   type PersonBucket = { tasks: Map<string, EvidenceItem[]>; other: EvidenceItem[]; signals: SignalItem[] };
   const byDay = new Map<string, Map<string, PersonBucket>>();
   const bucket = (date: string, memberId: string): PersonBucket => {
@@ -276,7 +283,7 @@ export function groupTimeline(
     }
   }
   // Signals bucket per (day, person) SEPARATELY — a signal can create a person-day (so "made decisions, no
-  // commits" is visible) but never touches tasks/other/total.
+  // commits" is visible) but never touches tasks/total.
   for (const s of signals) {
     if (!members.has(s.memberId)) continue;
     bucket(dayOf(s.at), s.memberId).signals.push({ id: s.id, kind: s.kind, title: s.title, at: s.at, url: s.url, stillValid: s.stillValid });
@@ -293,16 +300,28 @@ export function groupTimeline(
           return { taskId, title: info.title, status: info.status, source: info.source, sources: toSourceGroups(ev, perSourceCap), evidenceCount: ev.length };
         })
         .sort((x, y) => y.evidenceCount - x.evidenceCount || (x.title < y.title ? -1 : 1));
-      const other = toSourceGroups(b.other, perSourceCap);
-      // `total` = WORK only (tasks + other). Signals are grouped by kind, newest-first, capped — never counted.
-      const total = tasks.reduce((n, t) => n + t.evidenceCount, 0) + other.reduce((n, g) => n + g.count, 0);
+      // UNLINKED work is COUNTED but not carried as renderable groups. The card's contract is
+      // task → evidence: a lane of work that belongs to no task competes with the tasks for attention and,
+      // in prod, dwarfed them (one task-nested row against twenty unlinked on the same person-day), which
+      // is what made a task-parented card read as evidence-parented. Keeping the number means the omission
+      // is measurable — coverage is the health metric for the doc→task pass — without re-creating the lane.
+      const unlinked = b.other.length;
+      // `total` = WORK the timeline actually stands behind, i.e. evidence attached to a task. Signals are
+      // grouped by kind, newest-first, capped — never counted.
+      const total = tasks.reduce((n, t) => n + t.evidenceCount, 0);
       const signalGroups: SignalGroup[] = [...groupByKind(b.signals).entries()]
         .map(([kind, items]) => ({ kind, count: items.length, items: [...items].sort((x, y) => (x.at < y.at ? 1 : x.at > y.at ? -1 : 0)).slice(0, perSourceCap) }))
         .sort((x, y) => y.count - x.count);
-      personDays.push({ memberId, name: m.name, handle: m.handle, avatarUrl: m.avatarUrl, total, tasks, other, signals: signalGroups });
+      // A person-day with no task-linked work and no signals has nothing to say — dropping it beats an
+      // empty card with a name on it.
+      if (tasks.length === 0 && signalGroups.length === 0) continue;
+      personDays.push({ memberId, name: m.name, handle: m.handle, avatarUrl: m.avatarUrl, total, tasks, unlinked, signals: signalGroups });
     }
     // Order by WORK; a signals-only person (total 0) ranks last but still shows in the day view.
     personDays.sort((a, b) => b.total - a.total || (a.name < b.name ? -1 : 1));
+    // A day whose every person was dropped has nothing to render — emitting it would put a date header
+    // over an empty column.
+    if (personDays.length === 0) continue;
     days.push({ date, label: dayLabel(date, todayISO), people: personDays });
   }
   return days;

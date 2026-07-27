@@ -1116,6 +1116,27 @@ create table if not exists task_evidence (
 create index if not exists task_evidence_item_idx on task_evidence (team_id, item_id);
 create index if not exists task_evidence_task_idx on task_evidence (team_id, task_id);
 
+-- What the LLM doc→task pass has ALREADY SCORED (lib/dashboard/doc-task-infer-run).
+--
+-- PER ITEM, and that is the whole point. A single team-level "inputs hash" over a CAPPED batch cannot
+-- drain a backlog: the batch is a fixed slice of the scoreable set, a declined doc never leaves that
+-- set, so once the model rejects a whole batch the hash is invariant and the pass skips forever.
+-- Taking the batch newest-first only hides it (new arrivals keep changing the slice while older docs
+-- stay unscored); taking it oldest-first makes it total (nothing older ever arrives, so NOTHING is ever
+-- scored again). Recording what was scored is what lets the batch advance.
+--
+-- Keyed on the doc's CONTENT and on the inputs (prompt + candidate task set), so an edited doc, an
+-- edited prompt, or a NEW task all re-score — a "no match" is only remembered while the question is
+-- unchanged. Regenerable: deleting rows only costs one extra pass.
+create table if not exists doc_task_inference (
+  team_id uuid not null references teams(id) on delete cascade,
+  item_id uuid not null references items(id) on delete cascade,
+  content_sha256 text not null,
+  inputs_sha256 text not null,
+  scored_at timestamptz not null default now(),
+  primary key (team_id, item_id)
+);
+
 -- Observable work events from code repos. The initial event is "merged": after a PR
 -- lands on main, the matching task row moves to done and provider sync is attempted.
 create table if not exists work_events (

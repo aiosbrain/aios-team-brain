@@ -22,11 +22,23 @@ import { db, ingest, seedTeam } from "./helpers";
 /** Every evidence title in the ledger — nested under a task, or in the task-less "other" bucket. */
 function evidenceTitles(days: Awaited<ReturnType<typeof getWorkTimeline>>): string[] {
   return days.flatMap((d) =>
-    d.people.flatMap((p) => [
-      ...p.tasks.flatMap((t) => t.sources.flatMap((sg) => sg.items.map((i) => i.title))),
-      ...p.other.flatMap((sg) => sg.items.map((i) => i.title)),
-    ])
+    d.people.flatMap((p) => p.tasks.flatMap((t) => t.sources.flatMap((sg) => sg.items.map((i) => i.title))))
   );
+}
+
+/** A team carrying the LNK-1 task every fixture below cites, so its evidence is rendered. */
+async function seedLinkedTeam() {
+  const seed = await seedTeam();
+  const { data: proj } = await db()
+    .from("projects")
+    .insert({ team_id: seed.teamId, slug: `p-${randomUUID().slice(0, 6)}`, name: "P" })
+    .select("id")
+    .single();
+  await db().from("tasks").insert({
+    team_id: seed.teamId, project_id: (proj as { id: string }).id, row_key: "LNK-1",
+    title: "Windowed work", status: "in_progress", assignee: "Tester", origin: "sync", audience: "team",
+  });
+  return seed;
 }
 
 /** Push an item whose work happened `daysAgo`, and which is re-synced NOW (the shape that breaks). */
@@ -42,13 +54,15 @@ async function itemWorkedDaysAgo(
     path,
     body: over.body ?? `work from ${daysAgo} days ago`,
     access: "team",
-    frontmatter: { title: path, source_ts: at, ...(over.source ? { source: over.source } : {}) },
+    // Cites LNK-1 so the row is renderable: unlinked evidence is omitted now, and this suite must fail
+    // on the WINDOW, not on the linking rule.
+    frontmatter: { title: `${path} (LNK-1)`, source_ts: at, ...(over.source ? { source: over.source } : {}) },
   });
 }
 
 describe("the timeline windows on work_at, not sync time (real Postgres)", () => {
   it("keeps in-window work that was pushed long ago, and excludes old work re-synced today", async () => {
-    const seed = await seedTeam();
+    const seed = await seedLinkedTeam();
     await itemWorkedDaysAgo(seed, "docs/recent.md", 2);
     await itemWorkedDaysAgo(seed, "docs/ancient.md", 120);
     // Both rows are re-synced NOW, exactly as every 30-minute tick does.
@@ -56,9 +70,9 @@ describe("the timeline windows on work_at, not sync time (real Postgres)", () =>
 
     const titles = evidenceTitles(await getWorkTimeline(db(), seed.teamId, "team"));
 
-    expect(titles).toContain("docs/recent.md");
+    expect(titles).toContain("docs/recent.md (LNK-1)");
     // The point: a shared `synced_at` says these two are equally "recent". Their work times don't.
-    expect(titles).not.toContain("docs/ancient.md");
+    expect(titles).not.toContain("docs/ancient.md (LNK-1)");
   });
 
   it("survives the row cap BITING: a flood of re-synced old items can't evict in-window work (H5)", async () => {
@@ -72,7 +86,7 @@ describe("the timeline windows on work_at, not sync time (real Postgres)", () =>
     // Guards the guard: if ITEM_LIMIT ever stops being exported, `ITEM_LIMIT + 5` is NaN, the flood
     // loop seeds nothing, and this spec passes while testing nothing.
     expect(Number.isInteger(ITEM_LIMIT)).toBe(true);
-    const seed = await seedTeam();
+    const seed = await seedLinkedTeam();
     await itemWorkedDaysAgo(seed, "docs/real-work.md", 1);
     for (let i = 0; i < ITEM_LIMIT + 5; i++) await itemWorkedDaysAgo(seed, `docs/old-${i}.md`, 200 + i);
     // The re-scan: every OLD doc is pushed again now, i.e. newer than the real work's push.
@@ -83,12 +97,12 @@ describe("the timeline windows on work_at, not sync time (real Postgres)", () =>
       .neq("path", "docs/real-work.md");
 
     const titles = evidenceTitles(await getWorkTimeline(db(), seed.teamId, "team"));
-    expect(titles).toContain("docs/real-work.md");
+    expect(titles).toContain("docs/real-work.md (LNK-1)");
     expect(titles.filter((t) => t.startsWith("docs/old-"))).toHaveLength(0);
   });
 
   it("still drops an item the source never dated (unchanged rule, now enforced in SQL)", async () => {
-    const seed = await seedTeam();
+    const seed = await seedLinkedTeam();
     await ingest(seed, {
       kind: "deliverable",
       path: "docs/undated.md",
@@ -106,7 +120,7 @@ describe("the timeline windows on work_at, not sync time (real Postgres)", () =>
     // `source_ts` and replies never bump it, but the builder dates each participant by their OWN last
     // message — so bounding the fetch on `work_at` drops exactly the long-running threads people are
     // actively working in. Caught in review; this is that repro.
-    const seed = await seedTeam();
+    const seed = await seedLinkedTeam();
     await db()
       .from("member_identities")
       .insert({ team_id: seed.teamId, member_id: seed.memberId, provider: "slack", external_id: "U_REPLIER" });
@@ -120,7 +134,7 @@ describe("the timeline windows on work_at, not sync time (real Postgres)", () =>
       frontmatter: {
         source: "slack",
         channel: "eng",
-        title: "#eng: long-running incident thread",
+        title: "#eng: long-running incident thread (LNK-1)",
         source_ts: rootTs,
         participants: [
           { author_id: "U_REPLIER", display_name: "Tester", message_count: 3, first_ts: rootTs, last_ts: replyTs },
@@ -129,7 +143,7 @@ describe("the timeline windows on work_at, not sync time (real Postgres)", () =>
     });
 
     const titles = evidenceTitles(await getWorkTimeline(db(), seed.teamId, "team"));
-    expect(titles).toContain("#eng: long-running incident thread");
+    expect(titles).toContain("#eng: long-running incident thread (LNK-1)");
   });
 });
 
@@ -137,7 +151,7 @@ describe("retrieval recency reads work_at (real Postgres)", () => {
   it("treats the most recently WORKED item as latest, not the most recently re-synced one", async () => {
     // M3, on the path that grounds LLM answers. `retrieveContext`'s recency leg exists so fresh content
     // always has a shot; ordered by `synced_at` it surfaces whatever a re-scan touched last.
-    const seed = await seedTeam();
+    const seed = await seedLinkedTeam();
     await itemWorkedDaysAgo(seed, "docs/fresh.md", 1, { body: "quarterly planning notes, current" });
     await itemWorkedDaysAgo(seed, "docs/stale.md", 300, { body: "quarterly planning notes, ancient" });
     // The re-scan pushes the OLD doc last, making it the most recently synced row.
