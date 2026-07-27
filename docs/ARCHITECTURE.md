@@ -142,7 +142,7 @@ flowchart LR
 
 ## Auth & access tiers
 
-This server **implements brain-api v1.12** (the shipped member-facing wire contract; source of truth:
+This server **implements brain-api v1.13** (the shipped member-facing wire contract; source of truth:
 `aios-workspace/docs/brain-api.md`; v1.8 added the subscriptions endpoint,
 `POST /api/v1/subscriptions`). That version is pinned in code as `BRAIN_API_VERSION`
 (`lib/api/version.ts`), asserted against this sentence by
@@ -375,6 +375,17 @@ surface-only/brain-wins. This is **opt-in per team** (`config.inboundApply` on t
 integration, default off, toggled in Admin) and runs automatically after each ingestion cycle via
 the scheduler (`lib/ingest/scheduler.ts`), plus on manual sync (`lib/ingest/manual-sync.ts`). Full
 two-way write-back for fields beyond status, and PM-triggered agent actions, remain out of scope.
+
+**Return leg to the workspace markdown (brain-api v1.13, AIO-537).** An applied inbound status only
+reached Postgres/Linear — `GET /api/v1/tasks` emitted dashboard-origin rows only, so the workspace
+file that PUSHED the row never learned it moved (field audit: rows reading `todo` while Linear said
+Done). `app/api/v1/tasks/route.ts` now takes an explicit `mode`: `writeback` (default, unchanged),
+`table` (`?all=1`), and **`sync-origin`** — `origin='sync'` rows for ONE `project` slug, tier-filtered
+through `visibleTasks` exactly as before, carrying `raw_status` so the client can tell a real change
+from a normalization echo of its own push. Because that guard depends on `raw_status` describing the
+CURRENT status, `applyStatusTx()` now clears `raw_status` in the same statement that writes the
+provider's status. Old clients are byte-unaffected (they never send `mode`); new clients feature-detect
+on the echoed `mode` and tolerate 400/404.
 
 **Inbound Plane import (Plane → brain, in-app runner).** The _opposite_ direction from the
 projection engine: `lib/ingest/sources/plane.ts` + `plane-normalize.ts` pull a Plane project's

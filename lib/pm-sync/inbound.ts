@@ -239,8 +239,14 @@ async function applyStatusTx(args: {
   );
   return withTransaction(async (client) => {
     if (newStatus !== task.status) {
+      // `raw_status` is cleared with the status write (brain-api 1.13, AIO-537). It holds the
+      // ORIGINAL unmapped markdown string that produced the CURRENT status (e.g. "todo" →
+      // backlog); once the provider sets the status authoritatively, that string no longer
+      // describes this row and keeping it would make the sync-origin return leg misread a REAL
+      // Linear change as a normalization echo of the workspace's own push — the exact drift
+      // (file says `todo`, Linear says Done) AIO-537 closes.
       const res = await client.query(
-        `update tasks set status = $1, updated_at = now() where id = $2 and status = $3`,
+        `update tasks set status = $1, raw_status = null, updated_at = now() where id = $2 and status = $3`,
         [newStatus, task.id, task.status]
       );
       if ((res.rowCount ?? 0) === 0) return false; // concurrent brain edit → conflict, no write

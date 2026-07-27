@@ -96,8 +96,10 @@ describe("brain-api tier + SSE conformance", () => {
     expect(fixture.version).toBe(BRAIN_API_VERSION);
   });
 
+  // The item-payload contract carries its OWN version (last changed at 1.12) and is decoupled from
+  // the API revision: 1.13 (the sync-origin task return leg) changed the tasks feed, not the item
+  // payload, so these fixtures stay pinned at 1.12 while `fixture.version` tracks BRAIN_API_VERSION.
   it("content-addresses the Brain API 1.12 item schema and fixtures", () => {
-    expect(fixture.version).toBe("1.12");
     expect(fixture.itemPayloadContract.version).toBe("1.12");
     for (const key of ["schema", "fixtures"] as const) {
       const ref = fixture.itemPayloadContract[key] as {
