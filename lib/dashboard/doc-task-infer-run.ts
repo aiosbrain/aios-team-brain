@@ -7,7 +7,7 @@ import { llmConfigured } from "./timeline-summary";
 import { resolveItemCreditIds } from "@/lib/attribution/contributor-credit";
 import { computeTaskLinks } from "./issue-ref";
 import { classifyWork } from "./work-classification";
-import { itemWorkTime, normalizeSource } from "./timeline-group";
+import { normalizeSource } from "./timeline-group";
 import {
   DOC_TASK_SYSTEM,
   applyInferredLinks,
@@ -133,8 +133,13 @@ export async function runDocTaskInference(db: DbClient, teamId: string): Promise
           .select("id, member_id, member_id_locked, kind, path, content_sha256, access, frontmatter")
           .eq("team_id", teamId)
           .not("member_id", "is", null)
-          .gte("synced_at", sinceIso)
-          .order("synced_at", { ascending: false })
+          // Window on the PERSISTED work-time (R1/R2), not `synced_at` and not a TS re-derivation — the
+          // same column and the same `work_at_from_source` gate the timeline builder uses, so the pass can
+          // never consider a doc the timeline would drop (or miss one it keeps). `synced_at` ages forward
+          // on every re-push, which is exactly the re-dating bug that column exists to end.
+          .eq("work_at_from_source", true)
+          .gte("work_at", sinceIso)
+          .order("work_at", { ascending: false })
           .limit(ITEM_SCAN),
         "team"
       ),
@@ -153,8 +158,8 @@ export async function runDocTaskInference(db: DbClient, teamId: string): Promise
       const fm = r.frontmatter ?? {};
       const source = normalizeSource(str(fm.source));
       if (!isScoreableSource(source)) return false;
-      if (classifyWork(r.kind, str(fm.source)) !== "work") return false;
-      return !!itemWorkTime(fm); // no work-time → the timeline drops it anyway; don't pay to score it
+      return classifyWork(r.kind, str(fm.source)) === "work";
+      // No work-time check here: the SQL window above already restricted to rows the timeline would keep.
     });
     if (!docRows.length) return { scored: 0, linked: 0, skipped: "nothing-to-score" };
 
