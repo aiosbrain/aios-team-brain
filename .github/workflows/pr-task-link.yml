@@ -8,6 +8,15 @@ name: PR task link (advisory)
 # aios-work-sync.yml and unit-tested. They used to be inline here, where no tier could
 # reach them — and shipped reading the tasks response in a shape it never returns, so the
 # check reported a REAL key as nonexistent on its first run.
+#
+# ⛔ THIS MUST STAY ON `pull_request`. NEVER `pull_request_target`.
+# The job checks out the PR's head and EXECUTES a script from it (`scripts/pr-work-keys.mjs`)
+# with `AIOS_API_KEY` in the environment. On `pull_request`, GitHub withholds secrets from
+# fork-PR runs, so a fork that edits that script gets an empty key and there is nothing to
+# steal. `pull_request_target` runs with secrets AND the base repo's permissions — switching
+# it would turn this into a textbook pwn-request: edit the script in a fork, exfiltrate the
+# key. Fork PRs correctly reporting "credentials not configured" is the intended behaviour,
+# not a bug to fix by changing the trigger. (This repo is public.)
 on:
   pull_request:
     types: [opened, edited, synchronize, reopened]
@@ -32,7 +41,7 @@ jobs:
           // syntax error. A `.catch` keeps the job advisory — an unexpected throw must not fail a PR.
           (async () => {
           const fs = require("node:fs");
-          const { extractWorkKeys, knownKeysFrom, verifyKeys } = await import("./scripts/pr-work-keys.mjs");
+          const { extractWorkKeys, knownKeysFrom, taskRowsFrom, verifyKeys, TASKS_PAGE_BOUND } = await import("./scripts/pr-work-keys.mjs");
           const ev = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, "utf8"));
           const keys = extractWorkKeys(ev.pull_request || {});
           if (!keys.length) {
@@ -59,8 +68,15 @@ jobs:
             console.log(`::warning title=Work key not verified::brain returned ${res.status} — only the FORMAT was checked.`);
             return;
           }
-          const verdict = verifyKeys(keys, knownKeysFrom(await res.json()));
-          if (verdict.status === "unverified") {
+          const body = await res.json();
+          // `?all=1` is bounded at 500 rows (documented) and does NOT paginate, so a full page is a
+          // PREFIX of the table — the stalest rows, since it orders `updated_at` ascending. Absence from
+          // a prefix is not absence from the table; presence in it is still proof.
+          const truncated = taskRowsFrom(body).length >= TASKS_PAGE_BOUND;
+          const verdict = verifyKeys(keys, knownKeysFrom(body), { truncated });
+          if (verdict.status === "unverified" && verdict.reason === "truncated") {
+            console.log(`::warning title=Work key not verified::${verdict.keys.join(", ")} was not in the ${verdict.checked} tasks the brain returned — but that response is capped at ${TASKS_PAGE_BOUND} rows and returns the STALEST first, so the key may simply be past the cap. Only the FORMAT was verified. (To make this provable, the tasks endpoint needs a by-key lookup or a table-mode cursor.)`);
+          } else if (verdict.status === "unverified") {
             console.log(`::warning title=Work key not verified::the brain returned no task keys, so ${verdict.keys.join(", ")} could not be checked — only the FORMAT was verified. (If the brain really has tasks, this check is misreading the response.)`);
           } else if (verdict.status === "invented") {
             console.log(

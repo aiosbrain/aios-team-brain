@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 // @ts-expect-error — plain .mjs shared by the two PR workflows; no types, deliberately dependency-free.
-import { extractWorkKeys, knownKeysFrom, verifyKeys } from "../scripts/pr-work-keys.mjs";
+import { extractWorkKeys, knownKeysFrom, taskRowsFrom, verifyKeys, TASKS_PAGE_BOUND } from "../scripts/pr-work-keys.mjs";
 
 /**
  * The PR work-key check, which shipped broken because it lived in a YAML heredoc no test tier could reach.
@@ -31,6 +33,16 @@ describe("extractWorkKeys — what the PR CLAIMS, not what it discusses", () => 
   it("ignores keys inside a fenced block", () => {
     const keys = extractWorkKeys({ title: "", body: "example:\n```\nAIOS-Work: AIO-999\n```\n", head: { ref: "" } });
     expect(keys).toEqual([]);
+  });
+
+  it("ignores keys after an UNCLOSED fence", () => {
+    // A lazy `[\s\S]*?` needs a closing fence, so one stray ``` used to leave the whole rest of the body
+    // matchable. Failing toward over-match is the direction that closes someone else's ticket on merge.
+    expect(extractWorkKeys({ title: "", body: "example:\n```\nAIOS-Work: AIO-999\nand more prose", head: { ref: "" } })).toEqual([]);
+  });
+
+  it("ignores keys inside a ~~~ fence", () => {
+    expect(extractWorkKeys({ title: "", body: "x:\n~~~\nAIO-999\n~~~\n", head: { ref: "" } })).toEqual([]);
   });
 
   it("ignores the PR template's commented-out placeholder", () => {
@@ -73,7 +85,9 @@ describe("verifyKeys — 'we couldn't ask' is NOT 'your key is fake'", () => {
     // Zero known keys means an empty response, a shape change, or a tier that sees nothing — each
     // indistinguishable from a brain with no tasks. Calling a real key invented on that evidence is the
     // failure that trains everyone to ignore the warning.
-    expect(verifyKeys(["AIO-484"], new Set())).toEqual({ status: "unverified", keys: ["AIO-484"] });
+    // `reason` distinguishes the two ways we can fail to know: nothing came back at all vs. a full page
+    // that may not contain it. The warning text differs, because the fix differs.
+    expect(verifyKeys(["AIO-484"], new Set())).toEqual({ status: "unverified", keys: ["AIO-484"], reason: "empty" });
   });
 
   it("reports INVENTED only when the brain demonstrably has other keys", () => {
@@ -86,5 +100,48 @@ describe("verifyKeys — 'we couldn't ask' is NOT 'your key is fake'", () => {
 
   it("reports NONE when the PR cites nothing", () => {
     expect(verifyKeys([], new Set(["AIO-484"]))).toEqual({ status: "none" });
+  });
+});
+
+/**
+ * The blocker the first version of this fix still had.
+ *
+ * `?all=1` is bounded at 500 rows, ordered `updated_at` ASCENDING, and table mode does not paginate. Prod
+ * had 677 keyed tasks and AIO-484 sat at rank 628 — so the check downloaded the 500 STALEST tasks, never
+ * saw the one it was asked about, and would have announced "AIO-484 does not exist (500 task keys
+ * checked)". Fixing the response SHAPE alone would have re-run the same false accusation with a bigger,
+ * more convincing number attached.
+ */
+describe("a truncated read cannot prove a key is fake", () => {
+  const fullPage = new Set(Array.from({ length: TASKS_PAGE_BOUND }, (_, i) => `OLD-${i}`));
+
+  it("reports UNVERIFIED, not invented, when the page is full and the key wasn't in it", () => {
+    const v = verifyKeys(["AIO-484"], fullPage, { truncated: true });
+    expect(v.status).toBe("unverified");
+    expect(v.reason).toBe("truncated");
+    expect(v.keys).toEqual(["AIO-484"]);
+  });
+
+  it("STILL confirms a key that IS in the truncated page — absence proves nothing, presence proves it", () => {
+    // The check must not degrade to useless: a full page is still positive evidence for what it contains.
+    const withIt = new Set([...fullPage, "AIO-484"]);
+    expect(verifyKeys(["AIO-484"], withIt, { truncated: true }).status).toBe("ok");
+  });
+
+  it("still calls a key invented when the read was NOT truncated", () => {
+    // The whole point of the check survives: a short page is the whole table, so absence is real evidence.
+    expect(verifyKeys(["AIO-999"], new Set(["AIO-484"]), { truncated: false }).status).toBe("invented");
+  });
+
+  it("TASKS_PAGE_BOUND matches the bound the API actually enforces", () => {
+    // Pinned against the route's own constant — if PAGE moves and this doesn't, the check silently stops
+    // detecting truncation and goes back to accusing.
+    const route = readFileSync(join(process.cwd(), "app", "api", "v1", "tasks", "route.ts"), "utf8");
+    expect(route).toContain(`const PAGE = ${TASKS_PAGE_BOUND};`);
+  });
+
+  it("taskRowsFrom counts rows across project groups, so truncation is detectable", () => {
+    const body = { tasks: [{ project: "a", rows: [{ row_key: "X-1" }, { row_key: "X-2" }] }, { project: "b", rows: [{ row_key: "X-3" }] }] };
+    expect(taskRowsFrom(body).length).toBe(3);
   });
 });

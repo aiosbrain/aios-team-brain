@@ -56,7 +56,10 @@ jobs:
           };
 
           const url = `${brain.replace(/\/$/, "")}/api/v1/work-events`;
-          fetch(url, {
+          // AWAITED. An un-awaited fetch does keep the loop alive, so this worked — but it worked by
+          // relying on an in-flight socket being an active handle, which is not a property to bet the
+          // only task-closing step on. Now the IIFE cannot resolve before the POST has answered.
+          await fetch(url, {
             method: "POST",
             headers: {
               "Authorization": `Bearer ${key}`,

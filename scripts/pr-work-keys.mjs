@@ -10,6 +10,14 @@
  *
  * Pure and testable on purpose: the response parser here shipped broken (see `knownKeysFrom`) precisely
  * because it lived in a YAML heredoc that no tier could reach.
+ *
+ * ONE DELIBERATE ASYMMETRY. `prSearchText` NARROWS what counts as a citation, which means a key written
+ * inside backticks stops closing its task on merge. That is the safe direction: over-matching posts a key
+ * the author never claimed, and `/api/v1/work-events` sets `status='done'` on a task that matches in the
+ * pushed project — so prose like "supersedes `AIO-100`" would have CLOSED AIO-100. Under-matching leaves
+ * the board stale, which the advisory check announces at open time ("No brain task linked"). A wrongly
+ * closed ticket is silent; a missed one is warned about. The PR template asks for a bare
+ * `AIOS-Work: AIO-72` line, and the title and branch are never stripped.
  */
 
 /** Same shape `lib/pm-sync/work-keys` accepts: `AIO-12`, `W2.5.8`, optionally after an `AIOS-Work:` label. */
@@ -26,7 +34,10 @@ const WORK_KEY_RE = /\b(?:AIOS-Work:\s*)?([A-Z][A-Z0-9]+-\d+|[A-Z]\d+(?:\.\d+)*)
 export function prSearchText(pr) {
   const prose = String(pr?.body ?? "")
     .replace(/<!--[\s\S]*?-->/g, " ")
-    .replace(/```[\s\S]*?```/g, " ")
+    // Fences: ``` or ~~~, and an UNCLOSED fence swallows the rest of the body. A lazy `[\s\S]*?` needs a
+    // closing fence, so one stray ``` left everything after it matchable — failing toward over-match,
+    // which is the direction that closes someone else's ticket.
+    .replace(/(^|\n)(```|~~~)[\s\S]*?(\n\2|$)/g, " ")
     .replace(/`[^`\n]*`/g, " ");
   return [String(pr?.title ?? ""), prose, String(pr?.head?.ref ?? "")].join("\n");
 }
@@ -46,11 +57,28 @@ export function extractWorkKeys(pr) {
  *
  * Tolerates a flat array and a bare `{rows}` group too: the caller must not care which of those it got.
  */
-export function knownKeysFrom(body) {
+export function taskRowsFrom(body) {
   const groups = Array.isArray(body) ? body : (body?.tasks ?? body?.data ?? []);
-  const rows = (Array.isArray(groups) ? groups : []).flatMap((g) => (Array.isArray(g?.rows) ? g.rows : [g]));
-  return new Set(rows.map((t) => String(t?.row_key ?? t?.rowKey ?? "")).filter(Boolean));
+  return (Array.isArray(groups) ? groups : []).flatMap((g) => (Array.isArray(g?.rows) ? g.rows : [g]));
 }
+
+export function knownKeysFrom(body) {
+  return new Set(taskRowsFrom(body).map((t) => String(t?.row_key ?? t?.rowKey ?? "")).filter(Boolean));
+}
+
+/**
+ * The documented row bound of `GET /api/v1/tasks?all=1` (brain-api: "up to the endpoint's 500-row bound").
+ * Table mode does not paginate — `next_cursor` is null for it by design — so a full page means the answer
+ * we got is a PREFIX of the table, ordered by `updated_at` ASCENDING: the STALEST rows. The tasks people
+ * actually cite in PRs are the recently-touched ones, i.e. exactly the ones missing.
+ *
+ * Measured when this was found: prod had 677 keyed tasks, and AIO-484 — cited by the PR that exposed all
+ * this — sat at rank 628 of 677. It was never in the answer, so "no task has this key" was a confident
+ * statement about data the check had never seen.
+ *
+ * A full page therefore only ever justifies a POSITIVE: a key we DID see is real. Absence proves nothing.
+ */
+export const TASKS_PAGE_BOUND = 500;
 
 /**
  * Verdict for the advisory check: what do we actually know about these keys?
@@ -60,9 +88,14 @@ export function knownKeysFrom(body) {
  * indistinguishable from a brain with no tasks. Accusing the author on no evidence is exactly what makes
  * an advisory warning worthless.
  */
-export function verifyKeys(keys, known) {
+export function verifyKeys(keys, known, { truncated = false } = {}) {
   if (!keys.length) return { status: "none" };
-  if (!known.size) return { status: "unverified", keys };
+  if (!known.size) return { status: "unverified", keys, reason: "empty" };
   const invented = keys.filter((k) => !known.has(k));
-  return invented.length ? { status: "invented", invented, checked: known.size } : { status: "ok", checked: known.size };
+  if (!invented.length) return { status: "ok", checked: known.size };
+  // A missing key is only evidence of a FAKE key when we can see the whole table. On a truncated read the
+  // same absence is equally explained by "it's in the part we didn't get" — and on this team's data that
+  // is what it always was. Verifying the keys we CAN see still works: `ok` above is unaffected.
+  if (truncated) return { status: "unverified", keys: invented, reason: "truncated", checked: known.size };
+  return { status: "invented", invented, checked: known.size };
 }
