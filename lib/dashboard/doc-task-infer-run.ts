@@ -19,6 +19,7 @@ import {
   scoreableDocs,
   type InferCandidate,
   type InferDoc,
+  type InferredLink,
 } from "./doc-task-infer";
 import { recordIngestRun } from "@/lib/ingest/runs";
 
@@ -28,7 +29,7 @@ import { recordIngestRun } from "@/lib/ingest/runs";
  *
  * A design doc rarely cites `AIO-494` in its title or path, so the deterministic matcher leaves it in the
  * timeline's "Other" bucket even when it is plainly the work behind a ticket. This reads those unlinked
- * docs plus the team's candidate tasks and asks the model, in ONE batched call, which belongs to which —
+ * docs plus each worker's OWN candidate tasks and asks the model, one batched call per worker, which belongs to which —
  * or, expectedly, neither. Confident answers are persisted as `task_evidence` rows with `method='llm'`.
  *
  * SECOND WRITER of `task_evidence`, alongside `./timeline-evidence` (`method='issue_ref'`). The two are
@@ -38,7 +39,9 @@ import { recordIngestRun } from "@/lib/ingest/runs";
  * Cost discipline (mirrors the arcs evidence-coherence pass, `lib/graph/arcs.ts`):
  *   • BACKGROUND only — the ingest scheduler, never a request path.
  *   • Short-circuits before spending anything when the team has no LLM configured (`llmConfigured`).
- *   • ONE batched call per team, with capped docs, capped candidates and a capped body excerpt.
+ *   • ONE batched call PER WORKER in the batch (2-3 in practice), with capped docs, capped candidates and a
+ *     capped body excerpt. Per worker, not per team, because candidates are scoped to the doc's own
+ *     assignee — a single team-wide call would score everyone's docs against one person's backlog.
  *   • Skips entirely when the inputs are unchanged since the last run — the hash covers doc CONTENT, the
  *     candidate set and the system prompt, and is carried on the recorded `ingest_runs` row.
  *   • Never throws: a failure records an unhealthy run and leaves the previous edges in place.
@@ -236,34 +239,63 @@ export async function runDocTaskInference(
     // Only NOW pull prose, and only for the ≤MAX_DOCS docs actually being scored.
     const withBodies = await attachBodies(db, teamId, scoreable);
 
-    // Rank candidates per the FIRST doc's author, then send one batch. Per-doc candidate sets would mean
-    // one call per doc; the ranking only tilts ordering, and the model still sees every visible task.
-    const ranked = candidatesFor(withBodies[0], candidates);
-    const { prompt, docByRef, taskByRef } = buildInferPrompt(withBodies, ranked);
+    // ONE CALL PER WORKER, not one per batch. `candidatesFor` now offers only the tasks assigned to the
+    // doc's own worker, so a single call built from the FIRST doc's author would score everyone else's
+    // docs against THAT person's tasks — which is precisely the cross-assignment this restriction
+    // exists to stop, made worse. Grouping by worker keeps each doc scored against its own backlog; the
+    // call count is the number of distinct people in the batch (2–3 in practice), not the doc count.
+    const byWorker = new Map<string, InferDoc[]>();
+    for (const doc of withBodies) {
+      if (!doc.memberId) continue; // `scoreableDocs` already drops these; belt-and-braces
+      byWorker.set(doc.memberId, [...(byWorker.get(doc.memberId) ?? []), doc]);
+    }
 
-    const raw = await completeTextOrNull(
-      { system: DOC_TASK_SYSTEM, prompt },
-      {
-        keys,
-        maxTokens: MAX_TOKENS,
-        timeoutMs: TIMEOUT_MS,
-        jsonObject: true,
-        // Reuse the timeline's ledger slice rather than widening the closed `LlmUsageSource` union —
-        // same call the arcs coherence pass makes by reusing "arcs".
-        meter: { db, teamId, source: "timeline-summary" },
+    const links: InferredLink[] = [];
+    // SETTLED = the docs this run actually has an answer for. The prune and `markScored` derive from
+    // THIS, never from the whole batch: with one call per worker, a single provider timeout on worker B
+    // would otherwise delete B's existing links (the prune covers the batch) AND record B's docs as
+    // scored (so they are never re-asked) — a transient blip silently eating a person's links forever.
+    const settled: InferDoc[] = [];
+    let workersFailed = 0;
+    for (const docs of byWorker.values()) {
+      const ranked = candidatesFor(docs[0], candidates);
+      // No assigned tasks → nothing to ask, and that IS the answer: settle them, or they occupy the
+      // oldest-first batch slots forever and the backlog never drains past them.
+      if (!ranked.length) {
+        settled.push(...docs);
+        continue;
       }
-    );
-    if (!raw) {
+      const { prompt, docByRef, taskByRef } = buildInferPrompt(docs, ranked);
+
+      const raw = await completeTextOrNull(
+        { system: DOC_TASK_SYSTEM, prompt },
+        {
+          keys,
+          maxTokens: MAX_TOKENS,
+          timeoutMs: TIMEOUT_MS,
+          jsonObject: true,
+          // Reuse the timeline's ledger slice rather than widening the closed `LlmUsageSource` union —
+          // same call the arcs coherence pass makes by reusing "arcs".
+          meter: { db, teamId, source: "timeline-summary" },
+        }
+      );
+      if (!raw) {
+        workersFailed++;
+        continue; // NOT settled — these docs keep their links and come round again next run
+      }
+      settled.push(...docs);
+      const choices = parseInferResponse(raw, docByRef, taskByRef);
+      links.push(
+        ...applyInferredLinks(choices, new Set(ranked.map((c) => c.id)), new Set(docs.map((d) => d.id)))
+      );
+    }
+    // Nothing answered at all → a failed run, so the cooldown retries it. Gated on `settled`, not on
+    // `links`: a worker that legitimately answered "no match" HAS settled, and discarding that would
+    // re-pay for the same answer every cycle.
+    if (!settled.length) {
       await record(db, teamId, startedAt, true, { inputs_hash: inputsHash, scored: scoreable.length, linked: 0, note: "model returned null" });
       return { scored: scoreable.length, linked: 0, skipped: "model-null" };
     }
-
-    const choices = parseInferResponse(raw, docByRef, taskByRef);
-    const links = applyInferredLinks(
-      choices,
-      new Set(ranked.map((c) => c.id)),
-      new Set(withBodies.map((d) => d.id))
-    );
 
     // Replace THIS BATCH's edges — scoped by `method='llm'` AND by the item ids just scored.
     //
@@ -274,12 +306,10 @@ export async function runDocTaskInference(
     // earlier batch's links on each run — and those docs are recorded as scored, so they are never
     // re-asked and never come back. Coverage would cap at one batch forever, and since unlinked work is
     // omitted from the card, the wiped docs would go invisible rather than merely unlinked.
-    // ONE definition of "the batch" — `withBodies` is what was offered to the model, what gets pruned,
-    // and what is recorded as scored. Deriving any of the three from `scoreable` instead would be
-    // identical today (`attachBodies` is id-preserving) and a landmine the moment it isn't: a doc
-    // recorded as scored but never offered is permanently skipped, never linked, and — since unlinked
-    // work is omitted — invisible. Exactly this PR's failure class, one line further down.
-    const batchIds = withBodies.map((d) => d.id);
+    // ONE definition of "what this run answered" — `settled`. The prune and `markScored` must agree:
+    // pruning a doc we then fail to record would drop its link and re-ask next run; recording a doc we
+    // did not prune would leave a stale edge behind an un-reaskable key.
+    const batchIds = settled.map((d) => d.id);
     const del = await db
       .from("task_evidence")
       .delete()
@@ -308,9 +338,16 @@ export async function runDocTaskInference(
     // Mark the batch scored AFTER the pass succeeded — including the docs the model declined, because
     // "no match" is a real answer and re-asking for it every cycle is the spend this table prevents. A
     // FAILED pass records nothing here, so it retries.
-    await markScored(db, teamId, withBodies, inputsHash);
-    await record(db, teamId, startedAt, true, { inputs_hash: inputsHash, scored: scoreable.length, linked: links.length });
-    return { scored: scoreable.length, linked: links.length };
+    await markScored(db, teamId, settled, inputsHash);
+    await record(db, teamId, startedAt, true, {
+      inputs_hash: inputsHash,
+      scored: settled.length,
+      linked: links.length,
+      // A partial failure must be visible: `ok` with a silent shortfall is how "the pass is degraded"
+      // becomes indistinguishable from "there was nothing to link".
+      ...(workersFailed ? { workers_failed: workersFailed } : {}),
+    });
+    return { scored: settled.length, linked: links.length };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error("[doc-task-infer] pass failed:", message);
@@ -449,20 +486,23 @@ async function resolveAssigneeMembers(
   const out = new Map<string, string>();
   const wanted = new Set(assignees.map((a) => (a ?? "").trim().toLowerCase()).filter(Boolean));
   if (!wanted.size) return out;
-  try {
-    const { data } = await db
-      .from("members")
-      .select("id, display_name, actor_handle, email")
-      .eq("team_id", teamId)
-      .eq("status", "active");
-    for (const m of (data ?? []) as { id: string; display_name: string | null; actor_handle: string | null; email: string | null }[]) {
-      for (const key of [m.display_name, m.actor_handle, m.email]) {
-        const k = (key ?? "").trim().toLowerCase();
-        if (k && wanted.has(k) && !out.has(k)) out.set(k, m.id);
-      }
+  // THROWS on a read failure — no longer best-effort, because this is no longer a ranking nicety.
+  // Candidates are now scoped to the doc's own worker, so an empty map means EVERY worker gets zero
+  // candidates, every group is settled as "nothing to ask", and the run prunes the batch's links and
+  // records the docs as scored — a transient `members` hiccup silently eating the team's inferred links
+  // and skipping those docs until their content changes. A thrown error records a failed run instead,
+  // and the cooldown retries it.
+  const { data, error } = await db
+    .from("members")
+    .select("id, display_name, actor_handle, email")
+    .eq("team_id", teamId)
+    .eq("status", "active");
+  if (error) throw new Error(`assignee resolution failed: ${error.message}`);
+  for (const m of (data ?? []) as { id: string; display_name: string | null; actor_handle: string | null; email: string | null }[]) {
+    for (const key of [m.display_name, m.actor_handle, m.email]) {
+      const k = (key ?? "").trim().toLowerCase();
+      if (k && wanted.has(k) && !out.has(k)) out.set(k, m.id);
     }
-  } catch {
-    // best-effort — ranking degrades to "no owned tasks first", never a failure
   }
   return out;
 }

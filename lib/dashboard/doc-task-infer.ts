@@ -98,15 +98,27 @@ export function scoreableDocs(docs: readonly InferDoc[]): InferDoc[] {
 }
 
 /**
- * The candidate list for one doc, ranked. The doc author's OWN assigned tasks come first, but the rest of
- * the visible active set is still offered: a doc about a teammate's ticket is a real case, and hard-scoping
- * to the author's assignments would silently drop it. `visible` MUST already have come through the
+ * The candidate list for one doc: ONLY the tasks assigned to the person who did the work.
+ *
+ * This used to rank the author's own tasks first and still offer everyone else's, on the reasoning that
+ * a doc about a teammate's ticket is a real case. In practice that is the wrong trade for a GUESS. An
+ * inference that reaches across people doesn't just mislabel a row — it puts someone else's ticket on
+ * your day, and the reader has no way to tell an inferred cross-assignment from a real one. ("I have a
+ * bunch of Linear tasks but I haven't created Linear tasks in ages — I don't know where these are coming
+ * from.") A deterministic link may still cross people, because there the author SAID which ticket it was;
+ * the model may not say it on their behalf.
+ *
+ * Consequence, accepted: a doc genuinely about a teammate's ticket now stays unlinked unless its text
+ * cites the key. Unlinked work is rendered (in its own lane), so that costs a nesting, not visibility.
+ *
+ * A doc whose worker has no assigned tasks yields NO candidates, and the caller must treat an empty list
+ * as "nothing to ask" rather than sending an empty prompt. `visible` MUST already have come through the
  * `visibleTasks` choke-point — this function does not (and cannot) enforce tier by itself.
  */
 export function candidatesFor(doc: InferDoc, visible: readonly InferCandidate[]): InferCandidate[] {
-  const mine = visible.filter((c) => c.assigneeMemberId && c.assigneeMemberId === doc.memberId);
-  const others = visible.filter((c) => !(c.assigneeMemberId && c.assigneeMemberId === doc.memberId));
-  return [...mine, ...others].slice(0, MAX_CANDIDATES);
+  return visible
+    .filter((c) => c.assigneeMemberId && c.assigneeMemberId === doc.memberId)
+    .slice(0, MAX_CANDIDATES);
 }
 
 /**
@@ -167,7 +179,15 @@ export function inferenceInputsHash(
   // candidate sets hash identically — which would skip a changed set as "unchanged" and serve a stale
   // judgment for a cycle.
   const docPart = docs.map((d) => JSON.stringify([d.id, d.contentSha])).sort().join("\n");
-  const candPart = candidates.map((c) => JSON.stringify([c.id, c.rowKey ?? "", c.title])).sort().join("\n");
+  // `assigneeMemberId` is part of the KEY because it now decides which tasks are offered at all, not
+  // merely their order. Without it: a task reassigned John→Chetan changes nothing in the hash, so
+  // Chetan's already-scored doc skips forever and never links to the task he now owns — and, the day
+  // the own-tasks-only rule shipped, every previously-scored doc kept skipping, so its old
+  // CROSS-PERSON guess was never pruned and stayed on the wrong person's timeline indefinitely.
+  const candPart = candidates
+    .map((c) => JSON.stringify([c.id, c.rowKey ?? "", c.title, c.assigneeMemberId ?? ""]))
+    .sort()
+    .join("\n");
   return createHash("sha256")
     .update(systemPrompt)
     .update("\n--docs--\n")

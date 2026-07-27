@@ -96,7 +96,7 @@ the timeline computes links **inline**. So this feature must also add the **firs
   outcome. The failure mode to design against is a model that always picks something.
 - **Confidence gate.** Below threshold the row is still written (the audit trail of what the model thought)
   but is **not** used as a link. One constant, one place.
-- **Candidates: the person's assigned active tasks first, but not hard-restricted.** `taskInfo` is the
+- **Candidates: ONLY the person's own assigned tasks (hard-restricted).** Ranking-with-fallback was the original design; it shipped and was reversed, because a model GUESS that reaches across people puts a teammate's ticket on your day and nothing distinguishes it from a real cross-assignment. A deterministic link may still cross people — there the author said which ticket it was. `taskInfo` is the
   **team-wide** active set — the timeline has no assignee filter by design (a task is placed under the
   *evidence author*, not its assignee, `work-timeline.ts:48-49`), and prod assignee strings are messy
   (`Chetan`/`chetan.nandakumar`, `John Ellison`/`john`/`John`). Hard-scoping on those strings would silently

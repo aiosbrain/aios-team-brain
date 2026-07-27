@@ -75,25 +75,27 @@ describe("isScoreableSource — only AUTHORED DOCUMENTS are worth paying a model
   });
 });
 
-describe("candidatesFor — the person's tasks first, but never hard-restricted", () => {
+describe("candidatesFor — ONLY the doc worker's own tasks", () => {
   const visible = [
     cand("t1", { assigneeMemberId: "member-b" }),
     cand("t2", { assigneeMemberId: "member-a" }),
     cand("t3", { assigneeMemberId: null }),
   ];
 
-  it("ranks the doc author's own assigned tasks first", () => {
-    expect(candidatesFor(doc(), visible).map((c) => c.id)[0]).toBe("t2");
+  it("offers ONLY the tasks assigned to the doc's own worker", () => {
+    // A model guess that reaches across people doesn't just mislabel a row — it puts a teammate's
+    // ticket on your day, and nothing distinguishes an inferred cross-assignment from a real one.
+    // A DETERMINISTIC link may still cross people: there the author said which ticket it was.
+    expect(candidatesFor(doc(), visible).map((c) => c.id)).toEqual(["t2"]);
   });
 
-  it("still OFFERS a teammate's task — a doc about someone else's ticket is a real case", () => {
-    // The alternative (hard-scoping to the author's assignments) would silently drop it, and prod
-    // assignee strings are too messy to bet correctness on.
-    expect(candidatesFor(doc(), visible).map((c) => c.id).sort()).toEqual(["t1", "t2", "t3"]);
+  it("offers NOTHING when the worker has no assigned tasks — the caller must not ask", () => {
+    const noneMine = [cand("t1", { assigneeMemberId: "member-b" }), cand("t3", { assigneeMemberId: null })];
+    expect(candidatesFor(doc(), noneMine)).toEqual([]);
   });
 
   it("is bounded — a huge backlog can't blow the prompt", () => {
-    const many = Array.from({ length: 500 }, (_, i) => cand(`t${i}`));
+    const many = Array.from({ length: 500 }, (_, i) => cand(`t${i}`, { assigneeMemberId: "member-a" }));
     expect(candidatesFor(doc(), many).length).toBeLessThanOrEqual(50);
   });
 });
