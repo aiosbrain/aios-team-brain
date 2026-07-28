@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 // @ts-expect-error — plain .mjs shared by the two PR workflows; no types, deliberately dependency-free.
-import { extractWorkKeys, knownKeysFrom, taskRowsFrom, unknownKeysFrom, verifyKeys, TASKS_PAGE_BOUND } from "../scripts/pr-work-keys.mjs";
+import { extractWorkKeys, knownKeysFrom, taskRowsFrom, unknownKeysFrom, answersByKey, verifyKeys, TASKS_PAGE_BOUND } from "../scripts/pr-work-keys.mjs";
 
 /**
  * The PR work-key check, which shipped broken because it lived in a YAML heredoc no test tier could reach.
@@ -206,5 +206,22 @@ describe("unknownKeysFrom + the authoritative verdict", () => {
       expect(v.status).toBe("unverified");
       expect(v.reason).toBe("truncated");
     }
+  });
+});
+
+describe("answersByKey — a 200 is not an answer", () => {
+  it("accepts only a TABLE-mode response", () => {
+    expect(answersByKey({ mode: "table", tasks: [], unknown_keys: [] })).toBe(true);
+  });
+
+  it("REJECTS a pre-1.13 brain's writeback feed, which is where the false accusation came from", () => {
+    // A pre-1.13 brain ignores `mode` entirely and answers 200 with the dashboard-origin writeback
+    // slice. Short feed → nothing looks truncated → a real `origin='sync'` key absent from it reads as
+    // INVENTED. Verified by simulation against a stub: with this check reverted to "400 only", citing a
+    // real key produced "AIO-484 … no task in the brain has it".
+    expect(answersByKey({ mode: "writeback", tasks: [] })).toBe(false);
+    expect(answersByKey({ tasks: [] })).toBe(false); // pre-1.13: no `mode` field at all
+    expect(answersByKey({ mode: "sync-origin", tasks: [] })).toBe(false);
+    expect(answersByKey(null)).toBe(false);
   });
 });

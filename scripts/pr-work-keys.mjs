@@ -84,6 +84,22 @@ export function unknownKeysFrom(body) {
 }
 
 /**
+ * Did this response actually answer the BY-KEY question?
+ *
+ * A brain that can't only sometimes says so with a 400. A PRE-1.13 brain has no `mode` param at all:
+ * it ignores `mode=table&keys=…` and returns 200 with the WRITEBACK feed — a short, dashboard-origin
+ * slice. Reading that as a table answer is how a real `origin='sync'` key gets called INVENTED: the
+ * feed is short so nothing looks truncated, and the key simply isn't in it. That is this project's
+ * signature failure, reachable only because we started asking a narrower question.
+ *
+ * So the test is "did I get a TABLE answer", not "did I avoid a 400". Lives here rather than in the
+ * workflow heredoc because the last decision that produced a false accusation lived there.
+ */
+export function answersByKey(body) {
+  return body?.mode === "table";
+}
+
+/**
  * The documented row bound of `GET /api/v1/tasks?all=1` (brain-api: "up to the endpoint's 500-row bound").
  * Table mode does not paginate — `next_cursor` is null for it by design — so a full page means the answer
  * we got is a PREFIX of the table, ordered by `updated_at` ASCENDING: the STALEST rows. The tasks people
