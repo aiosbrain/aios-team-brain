@@ -1,6 +1,7 @@
 import "server-only";
 import { timingSafeEqual } from "node:crypto";
 import type { DbClient } from "@/lib/db/types";
+import { rateLimit } from "@/lib/api/rate-limit";
 import { resolveAnsweringKeys } from "@/lib/query/answering";
 import { selectLlmBackend, type LlmBackend } from "@/lib/query/llm-backend";
 import { resolveEmbeddingBackend } from "@/lib/query/embedding-key";
@@ -20,6 +21,13 @@ import { EMBEDDING_DIM } from "@/lib/api/schemas";
  * So: Graphiti points `OPENAI_BASE_URL` at this app, authenticates with a shared secret, and we
  * resolve the real provider key here. The admin console becomes the one place a key is configured,
  * the provider key never leaves this process, and rotation is one field.
+ *
+ * EXPOSURE — do not soften this. Graphiti reaches these routes over the platform's private network,
+ * but they are NOT private: `proxy.ts` excludes all of `/api/*` from middleware ("routes do their own
+ * auth"), and the app has a public domain, so this path is reachable from the internet. The shared
+ * secret is the ONLY thing between an anonymous caller and the team's LLM budget. Hence: fails closed,
+ * constant-time compare, a length floor, and a rate limit on the authorized path so a leaked secret
+ * is bounded rather than unlimited. Brute force is not the threat at 32+ random chars; leakage is.
  *
  * `MODEL_NAME` ON THE GRAPHITI SERVICE IS DELIBERATELY IGNORED. Whatever the client asks for is
  * discarded and replaced with the model the console resolves. Honouring it would recreate the exact
@@ -168,6 +176,22 @@ export function forwardBody(body: Record<string, unknown>, model: string): Recor
 
 export const isRefusal = (v: unknown): v is ProxyRefusal =>
   typeof v === "object" && v !== null && "status" in v && "code" in v;
+
+/**
+ * Ceiling on authorized proxy calls per minute.
+ *
+ * Not for Graphiti's benefit — its extraction is serial at ~10-20s per episode, so it will never come
+ * close. This bounds the damage if the shared secret ever leaks: without it, one credential turns into
+ * unmetered spend on the team's provider account. Sized well above any legitimate burst (a queue
+ * drain plus the embedding calls that accompany it) so it can never be the thing that wedges the
+ * graph — the failure this whole module exists to stop.
+ */
+const PROXY_CALLS_PER_MINUTE = 120;
+
+/** Shared bucket for both halves of the proxy: one credential, one budget. */
+export async function graphProxyWithinRateLimit(db: DbClient): Promise<boolean> {
+  return rateLimit(db, "graph-llm-proxy", PROXY_CALLS_PER_MINUTE);
+}
 
 /** Resolve the chat target from the team's console settings. */
 export async function resolveGraphChatTarget(db: DbClient, teamId: string): Promise<ProxyTarget | ProxyRefusal> {

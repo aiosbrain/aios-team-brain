@@ -7,6 +7,7 @@ import {
   isRefusal,
   resolveGraphEmbeddingTarget,
   resolveGraphProxyTeamId,
+  graphProxyWithinRateLimit,
 } from "@/lib/llm/graph-proxy";
 
 export const runtime = "nodejs";
@@ -33,6 +34,13 @@ export async function POST(req: NextRequest) {
   }
 
   const db = adminClient();
+  // AFTER auth, so an anonymous flood can't consume the authorized budget — and bounded because this
+  // path is publicly routable (see `lib/llm/graph-proxy`), so a leaked secret must not mean unmetered
+  // spend on the team's provider account.
+  if (!(await graphProxyWithinRateLimit(db))) {
+    return Response.json({ error: { message: "rate limited", type: "rate_limit_error" } }, { status: 429 });
+  }
+
   const team = await resolveGraphProxyTeamId(db);
   if (isRefusal(team)) return refusalResponse(team);
 

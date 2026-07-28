@@ -7,6 +7,7 @@ import {
   isRefusal,
   resolveGraphChatTarget,
   resolveGraphProxyTeamId,
+  graphProxyWithinRateLimit,
 } from "@/lib/llm/graph-proxy";
 
 export const runtime = "nodejs";
@@ -23,9 +24,10 @@ export const maxDuration = 120;
  * secret in `GRAPH_LLM_PROXY_SECRET`; we resolve the real provider key from Admin → Integrations. See
  * `lib/llm/graph-proxy.ts` for why this exists and why `MODEL_NAME` on that service is ignored.
  *
- * NOT a member-facing route: no session, no API key, no tier. It is machine-to-machine on the
- * platform's private network, gated solely on the shared secret — which is why the secret fails
- * closed when unset rather than defaulting to open.
+ * NOT a member-facing route: no session, no API key, no tier. `proxy.ts` excludes all of `/api/*`
+ * from middleware, and this app has a public domain — so this path IS reachable from the internet and
+ * the shared secret is the only gate. That is why it fails closed when unset and why the authorized
+ * path is rate limited.
  */
 export async function POST(req: NextRequest) {
   if (!authorizeGraphProxy(req.headers.get("authorization"))) {
@@ -41,6 +43,13 @@ export async function POST(req: NextRequest) {
   }
 
   const db = adminClient();
+  // AFTER auth, so an anonymous flood can't consume the authorized budget — and bounded because this
+  // path is publicly routable (see `lib/llm/graph-proxy`), so a leaked secret must not mean unmetered
+  // spend on the team's provider account.
+  if (!(await graphProxyWithinRateLimit(db))) {
+    return Response.json({ error: { message: "rate limited", type: "rate_limit_error" } }, { status: 429 });
+  }
+
   const team = await resolveGraphProxyTeamId(db);
   if (isRefusal(team)) return refusalResponse(team);
 
