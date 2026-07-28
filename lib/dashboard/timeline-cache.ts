@@ -88,6 +88,13 @@ async function buildTimeline(db: DbClient, teamId: string, tier: ViewerTier): Pr
  * A salvaged sentence is only defensible as a BRIDGE to the next background refresh — it was written
  * about a day's work as it stood then. Two days is long enough to cover a bump plus a quiet weekend,
  * short enough that nobody reads a stale description of an active day.
+ *
+ * HONEST LIMIT: this measures age since the row was last PERSISTED, not since the sentence was
+ * authored — a cold miss re-stamps `computed_at`, so carrying a summary resets its clock. It is not an
+ * absolute shelf life. What actually bounds it is `attachPersonDaySummaries`, which rebuilds every
+ * person-day's summary from scratch and never preserves an existing one: any completed background pass
+ * either replaces the sentence or drops it. Riding past 48h would need every cycle's deploy to kill the
+ * in-flight LLM fan-out, repeatedly. Bounded in practice, not by this constant.
  */
 const SALVAGE_MAX_AGE_MS = 48 * 3_600_000;
 
@@ -133,9 +140,14 @@ export function attachSalvagedSummaries(days: TimelineDay[], salvaged: SalvagedS
   if (!salvaged.size) return days;
   return days.map((d) => ({
     ...d,
-    people: d.people.map((p) =>
-      p.summary ? p : { ...p, ...(salvaged.get(salvageKey(d.date, p.memberId)) ? { summary: salvaged.get(salvageKey(d.date, p.memberId))! } : {}) }
-    ),
+    people: d.people.map((p) => {
+      if (p.summary) return p;
+      // Read ONCE into a local. A conditional spread that calls `.get` twice is correct and is exactly
+      // the line a later edit turns into `summary: undefined` — which would ADD the key to the payload
+      // and put it out of step with the shape the version pins.
+      const carried = salvaged.get(salvageKey(d.date, p.memberId));
+      return carried ? { ...p, summary: carried } : p;
+    }),
   }));
 }
 
@@ -263,6 +275,13 @@ export async function bustTeamTimeline(db: DbClient, teamId: string): Promise<vo
  * served: it holds item/task TITLES and the LLM per-person-day summaries built from the tier-filtered
  * set at compute time, so after an item is narrowed external→team the external row still names it.
  * A stale-mark won't do — the read path serves the stale ledger first and rebuilds behind it.
+ *
+ * The DELETE is what closes it, and that matters more since `salvageSummaries`: if this delete fails
+ * (swallowed below) the surviving row's summaries are no longer merely served for one TTL — a later
+ * version bump can carry those sentences into the fresh payload and re-stamp them, so the caller's
+ * stale-mark no longer bounds them. Salvage is same-tier, so this is a compound failure (a failed
+ * delete AND a bump) rather than a new path, and the immediate background refresh overwrites it — but
+ * "one TTL" is no longer the true bound, and the comment below used to claim it was.
  */
 export async function purgeTimelineCacheTier(
   db: DbClient,
@@ -273,7 +292,8 @@ export async function purgeTimelineCacheTier(
   try {
     await db.from("work_timeline_cache").delete().eq("team_id", teamId).eq("group_key", tier);
   } catch {
-    // best-effort — the caller's stale-mark backstop still bounds the exposure to one TTL
+    // best-effort — the caller's stale-mark backstop bounds a SERVED stale payload to one TTL (see the
+    // header for why that is no longer the whole story for the summaries)
   }
 }
 

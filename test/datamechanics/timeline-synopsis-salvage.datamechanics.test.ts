@@ -44,14 +44,14 @@ async function seedLinkedTeam(): Promise<Seed> {
   return seed;
 }
 
-async function seedCommit(seed: Seed, title: string, whenIso: string) {
+async function seedCommit(seed: Seed, title: string, whenIso: string, access: "team" | "external" = "team") {
   return ingest(seed, {
     path: `commits/x/${title}.md`,
     project: "commits",
     kind: "artifact",
     frontmatter: { source: "git", title, committed_at: whenIso, source_url: "https://example.com/c" },
     body: `# ${title} (SALV-1)`,
-    access: "team",
+    access,
   });
 }
 
@@ -63,6 +63,7 @@ async function seedPriorRow(args: {
   summary: string;
   version?: number;
   computedAt?: string;
+  tier?: "team" | "external";
 }) {
   const payload = {
     v: args.version ?? PAYLOAD_VERSION - 1,
@@ -89,7 +90,7 @@ async function seedPriorRow(args: {
   const { error } = await db().from("work_timeline_cache").upsert(
     {
       team_id: args.teamId,
-      group_key: "team",
+      group_key: args.tier ?? "team",
       payload: JSON.stringify(payload),
       computed_at: args.computedAt ?? new Date().toISOString(),
     },
@@ -104,9 +105,23 @@ async function seedPriorRow(args: {
 const WHEN = new Date(Date.now() - 3_600_000).toISOString();
 const dayOfWhen = WHEN.slice(0, 10);
 
-function summaryFor(days: Awaited<ReturnType<typeof getCachedWorkTimeline>>, memberId: string): string | undefined {
-  for (const d of days) for (const p of d.people) if (p.memberId === memberId) return p.summary;
+type Days = Awaited<ReturnType<typeof getCachedWorkTimeline>>;
+
+function personDay(days: Days, memberId: string) {
+  for (const d of days) for (const p of d.people) if (p.memberId === memberId) return p;
   return undefined;
+}
+
+/**
+ * ARMS every "no summary" assertion below. Each of those is an ABSENCE, and an absence passes just as
+ * happily when the person-day isn't rendered at all — a fixture or attribution regression would
+ * silently disarm the test rather than fail it. Assert the row EXISTS first, then that it carries no
+ * synopsis, so the only variable left is the one under test.
+ */
+function summaryOfRenderedDay(days: Days, memberId: string): string | undefined {
+  const p = personDay(days, memberId);
+  expect(p, "the member's person-day must be rendered, or this assertion proves nothing").toBeDefined();
+  return p!.summary;
 }
 
 describe("the daily synopsis survives a PAYLOAD_VERSION bump (real Postgres)", () => {
@@ -122,7 +137,7 @@ describe("the daily synopsis survives a PAYLOAD_VERSION bump (real Postgres)", (
 
     // Cold miss by version mismatch — exactly what every deploy that bumps the version produces.
     const days = await getCachedWorkTimeline(db(), seed.teamId, "team");
-    expect(summaryFor(days, seed.memberId)).toBe("Shipped the carried work.");
+    expect(summaryOfRenderedDay(days, seed.memberId)).toBe("Shipped the carried work.");
   });
 
   it("matches a summary to ITS OWN person-day, never another's", async () => {
@@ -137,7 +152,7 @@ describe("the daily synopsis survives a PAYLOAD_VERSION bump (real Postgres)", (
     });
 
     const days = await getCachedWorkTimeline(db(), seed.teamId, "team");
-    expect(summaryFor(days, seed.memberId)).toBeUndefined();
+    expect(summaryOfRenderedDay(days, seed.memberId)).toBeUndefined();
   });
 
   it("does NOT resurrect an ancient synopsis", async () => {
@@ -153,6 +168,26 @@ describe("the daily synopsis survives a PAYLOAD_VERSION bump (real Postgres)", (
     });
 
     const days = await getCachedWorkTimeline(db(), seed.teamId, "team");
-    expect(summaryFor(days, seed.memberId)).toBeUndefined();
+    expect(summaryOfRenderedDay(days, seed.memberId)).toBeUndefined();
+  });
+
+  it("TIER: an external viewer never receives a summary written for the TEAM tier", async () => {
+    // The sharpest risk in this change. `work_timeline_cache` is keyed by tier because the synopsis is
+    // LLM TEXT generated from the tier-filtered set — a team-tier sentence describes work an external
+    // viewer may not see. The salvage read is the newest path that touches those rows, and nothing
+    // else pins its scoping: reading the "team" row here instead of the viewer's own survives the
+    // whole suite. Tier isolation is app-code only; there is no RLS backstop.
+    const seed = await seedLinkedTeam();
+    await seedCommit(seed, "external-work", WHEN, "external");
+    await seedPriorRow({
+      teamId: seed.teamId,
+      memberId: seed.memberId,
+      date: dayOfWhen,
+      summary: "Team-tier sentence about work an external viewer must not learn about.",
+      tier: "team",
+    });
+
+    const days = await getCachedWorkTimeline(db(), seed.teamId, "external");
+    expect(summaryOfRenderedDay(days, seed.memberId)).toBeUndefined();
   });
 });
