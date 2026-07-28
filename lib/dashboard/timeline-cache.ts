@@ -82,6 +82,75 @@ async function buildTimeline(db: DbClient, teamId: string, tier: ViewerTier): Pr
   return attachPersonDaySummaries(db, teamId, await getWorkTimeline(db, teamId, tier));
 }
 
+/**
+ * How old a payload may be and still lend its synopsis across a version bump.
+ *
+ * A salvaged sentence is only defensible as a BRIDGE to the next background refresh — it was written
+ * about a day's work as it stood then. Two days is long enough to cover a bump plus a quiet weekend,
+ * short enough that nobody reads a stale description of an active day.
+ *
+ * HONEST LIMIT: this measures age since the row was last PERSISTED, not since the sentence was
+ * authored — a cold miss re-stamps `computed_at`, so carrying a summary resets its clock. It is not an
+ * absolute shelf life. What actually bounds it is `attachPersonDaySummaries`, which rebuilds every
+ * person-day's summary from scratch and never preserves an existing one: any completed background pass
+ * either replaces the sentence or drops it. Riding past 48h would need every cycle's deploy to kill the
+ * in-flight LLM fan-out, repeatedly. Bounded in practice, not by this constant.
+ */
+const SALVAGE_MAX_AGE_MS = 48 * 3_600_000;
+
+/** `${date}|${memberId}` → that person-day's synopsis. */
+export type SalvagedSummaries = Map<string, string>;
+
+const salvageKey = (date: string, memberId: string): string => `${date}|${memberId}`;
+
+/**
+ * Pull the per-person-day summaries out of a cache payload of ANY version.
+ *
+ * Why this ignores `PAYLOAD_VERSION` when everything else treats a mismatch as a miss: the version
+ * guards the SHAPE the panel renders, and rendering a stale shape is what strands a wrong card. A
+ * `summary` is not shape — it is a sentence about what a person did on a day, and a field moving
+ * elsewhere in the tree doesn't make that sentence untrue. Dropping it is what makes the synopsis
+ * vanish for everyone on every bump.
+ */
+export function salvageSummaries(payload: unknown, computedAtMs: number, nowMs: number): SalvagedSummaries {
+  const out: SalvagedSummaries = new Map();
+  if (!Number.isFinite(computedAtMs) || nowMs - computedAtMs > SALVAGE_MAX_AGE_MS) return out;
+  const days = (payload as { days?: unknown } | null)?.days;
+  if (!Array.isArray(days)) return out;
+  for (const d of days as { date?: unknown; people?: unknown }[]) {
+    if (typeof d?.date !== "string" || !Array.isArray(d.people)) continue;
+    for (const p of d.people as { memberId?: unknown; summary?: unknown }[]) {
+      // Keyed on the PERSON and the DAY together. Keying on either alone would smear one person's
+      // sentence across the team, or one day's across the week — a confidently wrong synopsis is
+      // worse than none, which is the whole reason this is a bridge and not a cache.
+      if (typeof p?.memberId === "string" && typeof p.summary === "string" && p.summary)
+        out.set(salvageKey(d.date, p.memberId), p.summary);
+    }
+  }
+  return out;
+}
+
+/**
+ * Re-attach salvaged summaries to freshly built days. Immutable — returns new objects.
+ *
+ * NEVER overwrites: a day the builder already summarised keeps its own. Only the gap left by the
+ * cold-miss path (which skips the LLM by design) gets filled.
+ */
+export function attachSalvagedSummaries(days: TimelineDay[], salvaged: SalvagedSummaries): TimelineDay[] {
+  if (!salvaged.size) return days;
+  return days.map((d) => ({
+    ...d,
+    people: d.people.map((p) => {
+      if (p.summary) return p;
+      // Read ONCE into a local. A conditional spread that calls `.get` twice is correct and is exactly
+      // the line a later edit turns into `summary: undefined` — which would ADD the key to the payload
+      // and put it out of step with the shape the version pins.
+      const carried = salvaged.get(salvageKey(d.date, p.memberId));
+      return carried ? { ...p, summary: carried } : p;
+    }),
+  }));
+}
+
 interface CacheEntry {
   days: TimelineDay[];
   at: number; // epoch ms computed
@@ -98,6 +167,40 @@ const dirty = new Set<string>();
 
 const memKey = (teamId: string, tier: ViewerTier): string => `${teamId}:${tier}`;
 
+/** The raw persisted row, version and all. Two readers want it for different questions: the ledger
+ *  read below (which rejects a foreign version) and the synopsis salvage (which doesn't care). */
+async function readTimelineCacheRow(
+  db: DbClient,
+  teamId: string,
+  tier: ViewerTier
+): Promise<{ payload: unknown; computed_at: string | Date } | null> {
+  const { data } = await db
+    .from("work_timeline_cache")
+    .select("payload, computed_at")
+    .eq("team_id", teamId)
+    .eq("group_key", tier)
+    .maybeSingle();
+  return (data as { payload: unknown; computed_at: string | Date } | null) ?? null;
+}
+
+/** The previous payload's per-person-day summaries, whatever version wrote them. Empty on any error —
+ *  a missing synopsis is a cosmetic loss and must never fail the panel. */
+async function readSalvageableSummaries(
+  db: DbClient,
+  teamId: string,
+  tier: ViewerTier
+): Promise<SalvagedSummaries> {
+  try {
+    const row = await readTimelineCacheRow(db, teamId, tier);
+    if (!row) return new Map();
+    const at =
+      typeof row.computed_at === "string" ? Date.parse(row.computed_at) : new Date(row.computed_at).getTime();
+    return salvageSummaries(row.payload, at, Date.now());
+  } catch {
+    return new Map();
+  }
+}
+
 /** Read the cached ledger for one team+tier. Null on miss/any error (best-effort — a cache read must
  *  never fail the panel; the caller builds inline). */
 export async function readTimelineCache(
@@ -106,14 +209,8 @@ export async function readTimelineCache(
   tier: ViewerTier
 ): Promise<CacheEntry | null> {
   try {
-    const { data } = await db
-      .from("work_timeline_cache")
-      .select("payload, computed_at")
-      .eq("team_id", teamId)
-      .eq("group_key", tier)
-      .maybeSingle();
-    if (!data) return null;
-    const row = data as { payload: unknown; computed_at: string | Date };
+    const row = await readTimelineCacheRow(db, teamId, tier);
+    if (!row) return null;
     // Payload is `{ v, days }`. A missing/older version = a shape from a previous deploy → treat as a
     // MISS so the caller rebuilds (never render a stale wrong shape).
     const p = row.payload as { v?: number; days?: unknown } | null;
@@ -178,6 +275,13 @@ export async function bustTeamTimeline(db: DbClient, teamId: string): Promise<vo
  * served: it holds item/task TITLES and the LLM per-person-day summaries built from the tier-filtered
  * set at compute time, so after an item is narrowed external→team the external row still names it.
  * A stale-mark won't do — the read path serves the stale ledger first and rebuilds behind it.
+ *
+ * The DELETE is what closes it, and that matters more since `salvageSummaries`: if this delete fails
+ * (swallowed below) the surviving row's summaries are no longer merely served for one TTL — a later
+ * version bump can carry those sentences into the fresh payload and re-stamp them, so the caller's
+ * stale-mark no longer bounds them. Salvage is same-tier, so this is a compound failure (a failed
+ * delete AND a bump) rather than a new path, and the immediate background refresh overwrites it — but
+ * "one TTL" is no longer the true bound, and the comment below used to claim it was.
  */
 export async function purgeTimelineCacheTier(
   db: DbClient,
@@ -188,7 +292,8 @@ export async function purgeTimelineCacheTier(
   try {
     await db.from("work_timeline_cache").delete().eq("team_id", teamId).eq("group_key", tier);
   } catch {
-    // best-effort — the caller's stale-mark backstop still bounds the exposure to one TTL
+    // best-effort — the caller's stale-mark backstop bounds a SERVED stale payload to one TTL (see the
+    // header for why that is no longer the whole story for the summaries)
   }
 }
 
@@ -273,7 +378,14 @@ export async function getCachedWorkTimeline(
   // add the per-person-day synopsis in the background. The first viewer sees the timeline immediately;
   // summaries appear on the next view once the background pass writes them (kept off the request path so
   // a big team's fan-out can't blow the page / route budget).
-  const days = await getWorkTimeline(db, teamId, tier);
+  const built = await getWorkTimeline(db, teamId, tier);
+  // …but a cold miss is USUALLY A VERSION BUMP, not a genuinely empty cache — and that path was
+  // silently deleting the synopsis from every person-day until a background pass finished. Twice the
+  // user's report was "we've lost the summaries at the top of each person's day", both times right
+  // after a deploy of mine. The previous row's sentences still describe those same person-days, so
+  // carry them across as a bridge; the background pass overwrites them with freshly computed ones.
+  // Best-effort by construction: no salvageable row → `built`, unchanged.
+  const days = attachSalvagedSummaries(built, await readSalvageableSummaries(db, teamId, tier));
   mem.set(key, { days, at: Date.now() });
   await writeTimelineCache(db, teamId, tier, days);
   refreshInBackground(teamId, tier);
