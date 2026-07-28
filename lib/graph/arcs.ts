@@ -14,7 +14,10 @@ import { listArcCorrections, recordArcCorrections } from "./arc-corrections";
 import { arcIneligibleItemIds } from "./arc-eligibility";
 
 /**
- * Layer 3 — narrative arcs. Gathers the recent graph substrate (facts, last 7d, tier-scoped),
+ * Layer 3 — narrative arcs. Gathers the recent graph substrate (facts, tier-scoped, and NOT
+ * time-boxed — `recentFacts(groups, null, FACT_POOL)` takes the most-recent N by work time, so a
+ * quiet week still synthesizes rather than emptying the panel; this docstring said "last 7d" for a
+ * while and that was never what the code did),
  * asks the team's LLM to synthesize 3–5 ongoing storylines, and caches them for 4h. Human edits
  * are fed back on recompute (both into the prompt AND written to Graphiti as correction episodes, so
  * they persist and inform future synthesis). See docs/design/brain-learning-panel.md.

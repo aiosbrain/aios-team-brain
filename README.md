@@ -68,7 +68,7 @@ There is no `.nvmrc` or `.node-version` in the repo.
 | **A host for the app** | **Required** | Railway is what we run and the best-supported path. Render, Fly, a VPS with Docker, or Kubernetes all work — it's a plain Next.js app with no platform-specific APIs. |
 | **Postgres 16** | **Required** | Managed (Railway, Neon, RDS…) or your own. Plain SQL schema, no vendor lock-in. |
 | **Neo4j 5.26.2** + **Graphiti** | Optional | Powers narrative arcs, the "what the brain is learning" panel, and graph-grounded answers. Everything else works without it. Self-hosted via `graphiti/docker-compose.yml`. **Neo4j Aura is untested** — no code path references `neo4j+s://`, so treat cloud Aura as unverified. |
-| **Email (Resend or SMTP)** | Recommended | Magic links and invites. Without it, in non-production the login link is printed to the server console; **in production, login mail silently goes nowhere.** |
+| **Email (Resend or SMTP)** | Recommended | Magic links and invites. Without it, in non-production the login link is printed to the server console; **in production the mail is dropped** (logged server-side as `[mailer] no provider`, and nowhere else). |
 
 There is no Supabase dependency. It was removed — if you see Supabase env vars anywhere in your
 notes or in a stale `.env.local`, they are read by nothing.
@@ -158,7 +158,7 @@ Postgres.
 > this repo once loaded its schema into a different project's database and took it down. On a
 > non-Railway host the guard is inert.
 
-Add the graph services (§2.6) later, only if you want narrative arcs.
+Add the graph services (§2.8) later, only if you want narrative arcs.
 
 ### 2.2 — Set the environment variables
 
@@ -182,11 +182,15 @@ Full reference in §3, including everything optional.
 
 ### 2.3 — Deploy, and let the schema load itself
 
-Push to `main`. Your host builds and starts the app. On Railway, `railway.json` is three lines whose
-entire content is:
+Push to `main`. Your host builds and starts the app. On Railway, the whole of `railway.json` is:
 
 ```json
-{ "deploy": { "preDeployCommand": "npm run pg:schema" } }
+{
+  "$schema": "https://railway.com/railway.schema.json",
+  "deploy": {
+    "preDeployCommand": "npm run pg:schema"
+  }
+}
 ```
 
 So **every deploy applies the schema before the new version goes live**, and a schema failure aborts
@@ -297,6 +301,7 @@ git clone https://github.com/aiosbrain/aios-team-brain.git
 cd aios-team-brain
 npm install                 # also runs `prepare`, pointing git at .githooks/
 cp .env.example .env.local  # then fill in DATABASE_URL, AUTH_SECRET, SECRETS_KEY, APP_URL, a model key
+set -a; . ./.env.local; set +a   # required — see the warning below
 npm run pg:schema
 npm run dev:seed            # optional: demo team, fixtures pushed through the REAL ingest path
 npm run dev
@@ -472,7 +477,7 @@ shipping app code ahead of its database.
 | `APP_URL` | Absolute base URL. No throw, but invite/magic links are built in server actions where there is no request origin — without it they come out broken. |
 | `SECRETS_KEY` | 32 bytes, base64 or hex. **Throws** the first time you save a connector secret — not at boot. |
 | One LLM path | `ANTHROPIC_API_KEY`, or `LLM_BASE_URL` (+ `LLM_MODEL`), or an OpenRouter key set per-team in Admin. |
-| One email path | `RESEND_API_KEY` + `RESEND_FROM`, or `SMTP_URL` + `SMTP_FROM`. Dev logs the link to console instead; **production sends nothing**. |
+| One email path | `RESEND_API_KEY` + `RESEND_FROM`, or `SMTP_URL` + `SMTP_FROM`. Dev logs the link to console instead; in production the mail is **dropped**, noted only in the server log. |
 
 ### Optional subsystems
 
@@ -542,9 +547,10 @@ for teams someone is actually looking at:
 - **Work timeline** — 5 min TTL, serve-stale-while-revalidate. A cold miss builds the ledger inline
   and fast, with **no per-person-day summaries**; those arrive on a later view once the background
   pass writes them.
-- **Narrative arcs** — **4 h** TTL, 7-day fact window. A fact-hash check skips the model entirely when
-  nothing relevant changed. Arcs need graph facts, so on a fresh install the panel is legitimately
-  empty until the projector has run.
+- **Narrative arcs** — **4 h** TTL. Not time-boxed: they synthesize from a pool of the most recent
+  facts by work time (4,000 fetched, 200 fed to the model), so a quiet week doesn't empty them. A
+  fact-hash check skips the model entirely when nothing relevant changed. Arcs need graph facts, so
+  on a fresh install the panel is legitimately empty until the projector has run.
 - **PM projection** — reactive, not scheduled: a task write schedules a projection *after* the
   response. Inbound Linear→brain is opt-in per team (`inboundApply`) and runs on the 30-min tick.
 
@@ -564,9 +570,9 @@ for teams someone is actually looking at:
 
 - **Pipeline health banner** — the loud verdict.
 - **Recent ingestion runs** — the last 30 rows of `ingest_runs`, one per scheduler tick, manual sync,
-  and codebase scan, with created/updated/unchanged counts and errors. `slack`/`linear`/`github` rows
-  record on *every* tick, so their age is a genuine heartbeat; `dense`, `graph_project`, `pm_sync`
-  and others record only when they did something, and are never flagged on age.
+  and codebase scan, with created/updated/unchanged counts and errors. `slack`/`plane`/`linear`/`github`
+  rows record on *every* tick once configured, so their age is a genuine heartbeat; `dense`,
+  `graph_project`, `pm_sync` and others record only when they did something, and are never flagged on age.
 - **Retrieval health card** — dense (`off`/`healthy`/`building`/`degraded`) and graph
   (`off`/`on`/`degraded`), including explicit quota wording when embeddings start failing.
 - **Provider keys** — which are stored and enabled, and the *resolved effective* answering, reasoning
@@ -587,15 +593,14 @@ auto-loads `.env.local`. Run `set -a; . ./.env.local; set +a` first.
 
 ### Saving a Slack/GitHub token 500s
 
-`SECRETS_KEY` is missing or isn't 32 bytes. It isn't in `.env.example`. Generate with
+`SECRETS_KEY` is missing or isn't 32 bytes. It ships **empty** in `.env.example`, so a copied file
+looks complete while the value is blank. Generate one with
 `node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"`.
 
 ### Graph accepts everything but no facts appear — arcs blank
 
 **The signature failure of this stack, and it is silent.** Graphiti returns `202` on every episode,
 `graph_project` stays green in `ingest_runs`, the health check is fine — and the graph is empty.
-
-Causes, in the order to check them:
 
 **Read the graphiti service logs first — they name the cause directly:**
 
