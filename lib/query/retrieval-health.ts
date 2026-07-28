@@ -2,7 +2,12 @@ import "server-only";
 import { runSql } from "@/lib/db/pg/pool";
 import { graphitiConfigured, GraphitiClient } from "@/lib/graph/graphiti-client";
 import { getLlmHealth, type LlmHealth } from "@/lib/query/llm-health";
-import { countGraphFacts, deriveGraphExtractionStalled } from "@/lib/graph/extraction-health";
+import {
+  countGraphFacts,
+  deriveGraphExtractionStalled,
+  newestEpisodeAtMs,
+  newestFactAtMs,
+} from "@/lib/graph/extraction-health";
 import { resolveEmbeddingBackend } from "@/lib/query/embedding-key";
 
 /**
@@ -143,18 +148,32 @@ export async function getRetrievalHealth(teamId: string): Promise<RetrievalHealt
 
   // Graph + dense both hit the network — run them concurrently so the card render isn't serialized.
   const graphConfiguredNow = graphConfigured(process.env.GRAPHITI_URL);
-  const [dense, graphReachable, graphFresh, graphFacts, llm] = await Promise.all([
+  const [dense, graphReachable, graphFresh, graphFacts, graphNewestFactAt, graphNewestEpisodeAt, llm] =
+    await Promise.all([
     denseHealth(teamId, configured),
     graphConfiguredNow ? new GraphitiClient().healthcheck() : Promise.resolve(false),
     graphConfiguredNow ? graphFreshness(teamId) : Promise.resolve({ episodes: null, lastProjectedAt: null }),
     graphConfiguredNow ? countGraphFacts() : Promise.resolve(null),
+    graphConfiguredNow ? newestFactAtMs() : Promise.resolve(null),
+    graphConfiguredNow ? newestEpisodeAtMs(teamId) : Promise.resolve(null),
     getLlmHealth(teamId),
   ]);
   const lastProjectedAtMs = graphFresh.lastProjectedAt ? Date.parse(graphFresh.lastProjectedAt) : null;
   const nowMs = Date.now();
   // Reachable + writing, but projected episodes aren't becoming facts (Graphiti's extractor is failing
   // on every job). Only meaningful when reachable — an unreachable service reports facts=null.
-  const graphExtractionStalled = graphReachable && deriveGraphExtractionStalled(graphFresh.episodes, graphFacts);
+  // The lag compares against `graphNewestEpisodeAt`, NOT `lastProjectedAtMs`. They differ by exactly
+  // the thing that matters: `lastProjectedAtMs` counts every ledger touch (correct for `isGraphStale`
+  // — "is the projector alive"), while the lag needs the newest episode actually PUSHED, since a
+  // redaction wave bumps the ledger without producing anything for Graphiti to extract.
+  const graphExtractionStalled =
+    graphReachable &&
+    deriveGraphExtractionStalled({
+      episodes: graphFresh.episodes,
+      facts: graphFacts,
+      newestEpisodeAtMs: graphNewestEpisodeAt,
+      newestFactAtMs: graphNewestFactAt,
+    });
   const graph = deriveGraphState({
     configured: graphConfiguredNow,
     reachable: graphReachable,
