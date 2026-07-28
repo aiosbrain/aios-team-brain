@@ -59,7 +59,7 @@ describe("work-timeline cache layer (real Postgres)", () => {
     const seed = await seedLinkedTeam();
     await seedCommit(seed, "shipped-the-thing", recentIso());
 
-    const days = await getCachedWorkTimeline(db(), seed.teamId, "team");
+    const { days } = await getCachedWorkTimeline(db(), seed.teamId, "team");
     // The build found the commit → a day with the seed member, nested under the task it cites.
     expect(days.length).toBeGreaterThan(0);
     const people = days.flatMap((d) => d.people);
@@ -83,8 +83,8 @@ describe("work-timeline cache layer (real Postgres)", () => {
     const seed = await seedLinkedTeam();
     await seedCommit(seed, "internal-work", recentIso()); // team-tier item
 
-    const teamDays = await getCachedWorkTimeline(db(), seed.teamId, "team");
-    const extDays = await getCachedWorkTimeline(db(), seed.teamId, "external");
+    const { days: teamDays } = await getCachedWorkTimeline(db(), seed.teamId, "team");
+    const { days: extDays } = await getCachedWorkTimeline(db(), seed.teamId, "external");
 
     expect(teamDays.length).toBeGreaterThan(0); // team viewer sees it
     expect(extDays).toEqual([]); // external viewer does NOT see team-tier work
@@ -99,7 +99,7 @@ describe("work-timeline cache layer (real Postgres)", () => {
   it("SWR: a stale row is served immediately, and the background rebuild picks up new work", async () => {
     const seed = await seedLinkedTeam();
     await seedCommit(seed, "commit-a", recentIso());
-    const first = await getCachedWorkTimeline(db(), seed.teamId, "team"); // cold miss → builds [A], persists
+    const { days: first } = await getCachedWorkTimeline(db(), seed.teamId, "team"); // cold miss → builds [A], persists
     // Count the RENDERED evidence — task-nested only.
     const evCount = (people: { tasks: { evidenceCount: number }[] }[]): number =>
       people.reduce((n, p) => n + p.tasks.reduce((a, t) => a + t.evidenceCount, 0), 0);
@@ -117,7 +117,7 @@ describe("work-timeline cache layer (real Postgres)", () => {
     await bustTeamTimeline(db(), seed.teamId);
 
     // Next read returns the STALE payload immediately (still 1 item) and fires the background rebuild.
-    const staleServe = await getCachedWorkTimeline(db(), seed.teamId, "team");
+    const { days: staleServe } = await getCachedWorkTimeline(db(), seed.teamId, "team");
     expect(evCount(staleServe.flatMap((d) => d.people))).toBe(1); // served stale, not yet rebuilt
 
     // The deduped background rebuild lands the new payload (2 items) into the persisted row. Await the

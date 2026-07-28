@@ -10,6 +10,7 @@ import { visibleGroupIds } from "@/lib/graph/group";
 import { getArcs } from "@/lib/graph/arcs";
 import { getLlmHealth } from "@/lib/query/llm-health";
 import { graphHasFacts } from "@/lib/query/retrieval-health";
+import { freshnessWire } from "@/lib/freshness";
 
 export const runtime = "nodejs";
 // Arc synthesis with a reasoning model can be slow (it reasons over ~200 facts). Give the inline
@@ -50,7 +51,7 @@ export async function POST(req: NextRequest) {
   const tier = (me as { tier: "team" | "external" }).tier;
   const admin = adminClient();
   const keys = await resolveAnsweringKeys(admin, team.id);
-  const arcs = await getArcs(admin, team.id, teamSlug, tier, visibleGroupIds(teamSlug, tier), keys);
+  const { arcs, freshness } = await getArcs(admin, team.id, teamSlug, tier, visibleGroupIds(teamSlug, tier), keys);
 
   // Empty arcs are ambiguous — tell the client the ACTUAL cause so the panel stops showing a benign
   // "no arcs yet" for what is really a broken graph or a failing model:
@@ -81,11 +82,22 @@ export async function POST(req: NextRequest) {
   // That's team-internal infra detail: redact it for `external`-tier collaborators (who can't act on it
   // and shouldn't see the config), keeping only the coarse `reason` category. Team tier still gets the
   // actionable note.
+  const wire = freshnessWire(freshness);
   return Response.json({
     arcs,
-    degraded: reason === "model_failing", // back-compat flag
+    // `degraded` is the ENVELOPE's now (R2/M6): "a leg this payload depended on failed". It subsumes the
+    // old back-compat flag, which was `reason === "model_failing"` — i.e. only ever true when arcs were
+    // EMPTY, since `reason` is computed solely on the empty path. The envelope's is strictly wider and
+    // catches the case that flag structurally could not: a NON-empty arc set synthesized from degraded
+    // inputs (H11), which is the dangerous one because it looks fine. Kept truthy-compatible for any
+    // consumer reading the old meaning; the panel reads `reason`, not this.
+    degraded: wire.degraded || reason === "model_failing",
     reason,
     note: isRestrictedTier(tier) ? undefined : note,
-    as_of: new Date().toISOString(),
+    // WAS `new Date().toISOString()` — a lie. `arc_cache` has a 4h TTL and the SWR branch deliberately
+    // serves rows OLDER than that, so this stamped hours-old arcs as current, and destroyed the
+    // backdating H11/H12 built to mark an untrustworthy synthesis. Now the row's real time.
+    as_of: wire.as_of,
+    stale: wire.stale,
   });
 }

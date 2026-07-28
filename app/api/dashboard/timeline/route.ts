@@ -44,9 +44,13 @@ export async function GET(req: NextRequest) {
   if (!me) return errorResponse("forbidden", "not a member of this team", 403);
 
   const tier = (me as { tier: "team" | "external" }).tier;
+  // Both branches must yield a bare `TimelineDay[]`: the cached one now returns `{ days, freshness }`, and
+  // the two arms only have to AGREE for `Response.json` (typed `any`) to accept a nested shape silently.
+  // Note `Number(null) === 0`, so a request with no `days` param clamps to 7 and takes the cached arm —
+  // i.e. the default request is the one that would have broken.
   const timeline =
     days <= WINDOW_DAYS
-      ? await getCachedWorkTimeline(adminClient(), team.id, tier)
+      ? (await getCachedWorkTimeline(adminClient(), team.id, tier)).days
       : await getWorkTimeline(adminClient(), team.id, tier, days);
   return Response.json({ days: timeline, window_days: days });
 }

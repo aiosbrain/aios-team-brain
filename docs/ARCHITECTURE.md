@@ -142,6 +142,26 @@ flowchart LR
 
 ## Auth & access tiers
 
+**Freshness contract (R2/M6).** Any surface served out of a cache table reports `{ as_of, stale, degraded }`
+built by **`lib/freshness.ts`** — `as_of` is the cache row's real `computed_at`, `stale` means past TTL and
+served anyway (SWR), `degraded` means a leg THIS REQUEST's computation depended on failed — it is not
+persisted with the cache row, so it describes the work done for this response, not the payload's permanent
+character (a degraded cold-miss reports `true`; the next read of the row it wrote reports `false` for the
+same bytes). Persisting it — a `degraded` column, which would also stop `computed_at` doubling as a trust
+dial — is the follow-up. It is produced by the DATA layer
+(`getArcs`, `getCachedWorkTimeline`, `commitArcs` all return it beside their payload) and only rendered by
+routes, because only the data layer knows the answer. Before this, four routes answered "how old is this?"
+with `as_of: new Date()` over a cache with a **4-hour** TTL that deliberately serves rows older still — a
+false contract, not a missing one, which also destroyed the deliberate backdating H11/H12 use to mark an
+untrustworthy synthesis. `computedAt` may UNDER-claim freshness (an untrustworthy arc set is pre-aged on
+purpose) but never over-claims it. Guarded by `test/guards/freshness-no-fabricated-as-of.test.ts`, which
+fails the build if a route stamps its own freshness; genuinely live reads are allowlisted there with a
+reason. Envelope fields carry no diagnostic prose, so adding one can't leak internal detail to an
+`external`-tier caller — that redaction stays per-route on the free-text `note`. Currently on the
+unversioned `/api/brain/*` + `/api/dashboard/*` surfaces; `GET /api/v1/timeline` still drops `computed_at`
+and `GET /api/v1/tasks` still discards its computed `truncated` (both need a brain-api bump, so they are
+deliberately not in this change).
+
 This server **implements brain-api v1.14** (the shipped member-facing wire contract; source of truth:
 `aios-workspace/docs/brain-api.md`; see the v1.14 by-key lookup on
 `GET /api/v1/tasks` below; v1.8 added the subscriptions endpoint,

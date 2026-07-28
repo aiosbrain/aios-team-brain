@@ -7,6 +7,7 @@ import { errorResponse } from "@/lib/api/schemas";
 import { resolveAnsweringKeys } from "@/lib/query/answering";
 import { visibleGroupIds } from "@/lib/graph/group";
 import { recomputeArcs } from "@/lib/graph/arcs";
+import { freshnessWire } from "@/lib/freshness";
 
 export const runtime = "nodejs";
 export const maxDuration = 120; // arc synthesis (LLM) inline path can take up to ~110s on a cold cache
@@ -57,7 +58,7 @@ export async function POST(req: NextRequest) {
 
   const admin = adminClient();
   const keys = await resolveAnsweringKeys(admin, team.id);
-  const arcs = await recomputeArcs(
+  const { arcs, freshness } = await recomputeArcs(
     admin,
     team.id,
     teamSlug,
@@ -68,5 +69,8 @@ export async function POST(req: NextRequest) {
     memberId
   );
 
-  return Response.json({ arcs, as_of: new Date().toISOString() });
+  // WAS `new Date()`. A recompute can legitimately return arcs it did NOT compute: `canReuseArcs` skips
+  // the model when facts are unchanged, and a degraded synthesis is refused in favour of the prior (H11).
+  // Stamping "now" told the user their correction had landed in a fresh set when it may not have.
+  return Response.json({ arcs, ...freshnessWire(freshness) });
 }

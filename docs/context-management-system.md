@@ -205,6 +205,14 @@ identity resolution) can disagree with a human's deliberate correction. The reso
   them drift and silently reopen the loop, so it's build-guarded.
 - **Single-flight** — each connector runner and the projector hold a module-level in-flight guard so a
   scheduler tick and an admin action can't duplicate work.
+- **Freshness is data, not a guess** (`lib/freshness.ts`, R2/M6): every cache-backed surface returns
+  `{ computedAt, stale, degraded }` beside its payload, rendered on the wire as `{ as_of, stale, degraded }`.
+  `computedAt` is the row's real `computed_at`; `stale` = past TTL but served (SWR); `degraded` = a leg the
+  payload needed failed. Produced by the data layer (`getArcs`, `getCachedWorkTimeline`, `commitArcs`),
+  never by the route — routes used to write `as_of: new Date()` over a 4h-TTL cache, which reported
+  hours-old arcs as current. Two non-obvious cases it now names: a cold-miss timeline is `degraded` but NOT
+  stale (real work data, prose not computed for it), and a refused degraded synthesis returns the PRIOR's
+  `computedAt`, so "the recompute returned" stops implying "the arcs are new".
 
 ---
 

@@ -5,6 +5,7 @@ import type { ViewerTier } from "@/lib/auth/visibility";
 import { getWorkTimeline } from "./work-timeline";
 import { attachPersonDaySummaries } from "./timeline-summary";
 import type { TimelineDay } from "./timeline-group";
+import { freshness, type Freshness } from "@/lib/freshness";
 
 /**
  * The persisted, queryable work-timeline LAYER. `lib/dashboard/work-timeline.getWorkTimeline` is the
@@ -26,6 +27,9 @@ import type { TimelineDay } from "./timeline-group";
  */
 
 const TTL_MS = 5 * 60_000; // 5-min freshness; the ledger is cheap, so refresh often.
+/** The same TTL, exported: it's the threshold that decides `freshness.stale`, so a consumer reasoning
+ *  about staleness must be able to read the number rather than re-declare it (H6's drift shape). */
+export const TIMELINE_TTL_MS = TTL_MS;
 // Bump when the TimelineDay[] SHAPE changes: a cached row from an older deploy is then treated as a
 // cache MISS (rebuilt), so the panel never renders a stale wrong shape. `summary` was ADDITIVE + optional
 // (no bump — a v3 row renders fine). v4 adds a REQUIRED `PersonDay.signals[]` (the Context lane): an old
@@ -348,6 +352,15 @@ export async function settleTimelineRefreshes(): Promise<void> {
 }
 
 /**
+ * The ledger plus how much it can be trusted (R2/M6). The envelope sits BESIDE `days`, not around it, so
+ * `TimelineDay[]` — and the shape guard that pins it — are untouched.
+ */
+export interface CachedTimeline {
+  days: TimelineDay[];
+  freshness: Freshness;
+}
+
+/**
  * Return the work-timeline for a team+tier, serve-stale-while-revalidate:
  *   1. fresh in-memory → return instantly;
  *   2. Postgres `work_timeline_cache` — fresh → return; stale → return stale NOW + rebuild behind the request;
@@ -359,19 +372,23 @@ export async function getCachedWorkTimeline(
   db: DbClient,
   teamId: string,
   tier: ViewerTier
-): Promise<TimelineDay[]> {
+): Promise<CachedTimeline> {
   const key = memKey(teamId, tier);
   const now = Date.now();
 
   const cached = mem.get(key);
-  if (cached && now - cached.at < TTL_MS) return cached.days;
+  if (cached && now - cached.at < TTL_MS) return { days: cached.days, freshness: freshness(cached.at, TTL_MS, { now }) };
 
   const persisted = await readTimelineCache(db, teamId, tier);
   if (persisted) {
     mem.set(key, { days: persisted.days, at: persisted.at });
-    if (now - persisted.at < TTL_MS) return persisted.days;
+    // ONE envelope for both the fresh and the stale branch — `freshness()` derives `stale` from the same
+    // age comparison the branch below makes, so the reported staleness cannot disagree with the decision
+    // actually taken (they were two separate readings of the clock in every earlier draft of this).
+    const f = freshness(persisted.at, TTL_MS, { now });
+    if (!f.stale) return { days: persisted.days, freshness: f };
     refreshInBackground(teamId, tier); // stale → serve stale, rebuild behind the request
-    return persisted.days;
+    return { days: persisted.days, freshness: f };
   }
 
   // Cold miss — return the PURE ledger FAST (no inline LLM), persist it so there's always a row, then
@@ -386,8 +403,14 @@ export async function getCachedWorkTimeline(
   // carry them across as a bridge; the background pass overwrites them with freshly computed ones.
   // Best-effort by construction: no salvageable row → `built`, unchanged.
   const days = attachSalvagedSummaries(built, await readSalvageableSummaries(db, teamId, tier));
-  mem.set(key, { days, at: Date.now() });
+  const at = Date.now();
+  mem.set(key, { days, at });
   await writeTimelineCache(db, teamId, tier, days);
   refreshInBackground(teamId, tier);
-  return days;
+  // DEGRADED, deliberately. A cold miss returns the pure ledger: its per-person-day synopses are either
+  // absent (the background pass hasn't run) or SALVAGED from an older payload version. Both are "this is
+  // real work data with prose that wasn't computed for it", which is precisely the plausible-but-partial
+  // state R2 exists to name. Freshly computed, so `stale` is false — the two flags are independent, and
+  // this is the case that proves it: newest possible payload, least trustworthy prose.
+  return { days, freshness: freshness(at, TTL_MS, { now: at, degraded: true }) };
 }

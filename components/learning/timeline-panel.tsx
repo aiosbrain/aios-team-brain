@@ -25,7 +25,10 @@ export async function TimelinePanel({
   teamSlug: string;
   tier: "team" | "external";
 }) {
-  const days = await getCachedWorkTimeline(adminClient(), teamId, tier);
+  // Payload only: this panel renders the ledger and has no freshness affordance today. Surfacing
+  // `freshness.stale` here (a "last updated" line) is a UI change, deliberately not bundled with the
+  // wire fix — see the PR's follow-ups.
+  const { days } = await getCachedWorkTimeline(adminClient(), teamId, tier);
   const shownDates = days.map((d) => d.date);
 
   return (

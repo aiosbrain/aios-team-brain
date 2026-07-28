@@ -105,7 +105,7 @@ async function seedPriorRow(args: {
 const WHEN = new Date(Date.now() - 3_600_000).toISOString();
 const dayOfWhen = WHEN.slice(0, 10);
 
-type Days = Awaited<ReturnType<typeof getCachedWorkTimeline>>;
+type Days = Awaited<ReturnType<typeof getCachedWorkTimeline>>["days"];
 
 function personDay(days: Days, memberId: string) {
   for (const d of days) for (const p of d.people) if (p.memberId === memberId) return p;
@@ -136,7 +136,7 @@ describe("the daily synopsis survives a PAYLOAD_VERSION bump (real Postgres)", (
     });
 
     // Cold miss by version mismatch — exactly what every deploy that bumps the version produces.
-    const days = await getCachedWorkTimeline(db(), seed.teamId, "team");
+    const { days } = await getCachedWorkTimeline(db(), seed.teamId, "team");
     expect(summaryOfRenderedDay(days, seed.memberId)).toBe("Shipped the carried work.");
   });
 
@@ -151,7 +151,7 @@ describe("the daily synopsis survives a PAYLOAD_VERSION bump (real Postgres)", (
       summary: "Someone else's day.",
     });
 
-    const days = await getCachedWorkTimeline(db(), seed.teamId, "team");
+    const { days } = await getCachedWorkTimeline(db(), seed.teamId, "team");
     expect(summaryOfRenderedDay(days, seed.memberId)).toBeUndefined();
   });
 
@@ -167,7 +167,7 @@ describe("the daily synopsis survives a PAYLOAD_VERSION bump (real Postgres)", (
       computedAt: new Date(Date.now() - 8 * 24 * 3600_000).toISOString(),
     });
 
-    const days = await getCachedWorkTimeline(db(), seed.teamId, "team");
+    const { days } = await getCachedWorkTimeline(db(), seed.teamId, "team");
     expect(summaryOfRenderedDay(days, seed.memberId)).toBeUndefined();
   });
 
@@ -187,7 +187,7 @@ describe("the daily synopsis survives a PAYLOAD_VERSION bump (real Postgres)", (
       tier: "team",
     });
 
-    const days = await getCachedWorkTimeline(db(), seed.teamId, "external");
+    const { days } = await getCachedWorkTimeline(db(), seed.teamId, "external");
     expect(summaryOfRenderedDay(days, seed.memberId)).toBeUndefined();
   });
 });

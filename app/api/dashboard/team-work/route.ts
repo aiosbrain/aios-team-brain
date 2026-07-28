@@ -3,6 +3,7 @@ import { serverClient } from "@/lib/db/server";
 import { adminClient } from "@/lib/db/admin";
 import { getSessionUser } from "@/lib/auth/session";
 import { errorResponse } from "@/lib/api/schemas";
+import { freshnessWire } from "@/lib/freshness";
 import { getCachedWorkTimeline } from "@/lib/dashboard/timeline-cache";
 import { mostRecentPerPerson } from "@/lib/dashboard/timeline-group";
 
@@ -36,7 +37,9 @@ export async function GET(req: NextRequest) {
   if (!me) return errorResponse("forbidden", "not a member of this team", 403);
 
   const tier = (me as { tier: "team" | "external" }).tier;
-  const days = await getCachedWorkTimeline(adminClient(), team.id, tier);
+  const { days, freshness } = await getCachedWorkTimeline(adminClient(), team.id, tier);
   const people = mostRecentPerPerson(days);
-  return Response.json({ people, as_of: new Date().toISOString() });
+  // WAS `new Date()` over a 5-min-TTL cache that also serves PAST the TTL while rebuilding — so this
+  // reported a stale ledger as current. Now the cache row's own time (R2/M6).
+  return Response.json({ people, ...freshnessWire(freshness) });
 }
