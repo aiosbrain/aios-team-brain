@@ -79,7 +79,9 @@ Both this workflow and `pr-task-link.yml` (advisory) read a PR for the ticket it
 Two behaviours worth knowing:
 
 - **Quoted keys don't count.** HTML comments, fenced blocks and inline code are stripped from the body before matching, so prose like ``supersedes `AIO-100` `` is not a citation. That direction is deliberate: `/api/v1/work-events` sets `status='done'` on a key matching a task in the pushed project, so over-matching closes the **wrong** ticket silently, while under-matching only leaves the board stale — and the advisory check announces that at open time.
-- **The existence check can say "I don't know."** `GET /api/v1/tasks?all=1` is capped at 500 rows and does not paginate, so on a team with more tasks the answer is a prefix of the stalest ones. A key found there is confirmed; a key absent from a **full** page reports `unverified`, never "invented" — the check is not allowed to accuse on data it never saw. Making it provable for every key needs a by-key lookup or a table-mode cursor on the tasks endpoint.
+- **The existence check asks about the keys, not for the table.** It calls `GET /api/v1/tasks?mode=table&keys=A,B` (brain-api 1.14), which is bounded by the keys asked for, so absence is proof and the brain answers `unknown_keys` outright. That is what lets an invented key be *called* invented.
+
+  The fallback matters as much: against a brain that predates 1.14 (400 on `keys`) it re-asks `?all=1`, which is capped at 500 rows ordered stalest-first. There a key found is confirmed, but a key absent from a **full** page reports `unverified`, never "invented" — the check is not allowed to accuse on data it never saw. That distinction exists because the check's first real run told us a real ticket didn't exist; on this team's data (677 tasks) `?all=1` could never have seen it.
 
 ---
 

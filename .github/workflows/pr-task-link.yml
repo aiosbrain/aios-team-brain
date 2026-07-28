@@ -41,7 +41,7 @@ jobs:
           // syntax error. A `.catch` keeps the job advisory — an unexpected throw must not fail a PR.
           (async () => {
           const fs = require("node:fs");
-          const { extractWorkKeys, knownKeysFrom, taskRowsFrom, verifyKeys, TASKS_PAGE_BOUND } = await import("./scripts/pr-work-keys.mjs");
+          const { extractWorkKeys, knownKeysFrom, taskRowsFrom, unknownKeysFrom, verifyKeys, TASKS_PAGE_BOUND } = await import("./scripts/pr-work-keys.mjs");
           const ev = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, "utf8"));
           const keys = extractWorkKeys(ev.pull_request || {});
           if (!keys.length) {
@@ -60,9 +60,15 @@ jobs:
             console.log("::warning title=Work key not verified::brain credentials not configured — only the FORMAT was checked.");
             return;
           }
-          const res = await fetch(`${brain.replace(/\/$/, "")}/api/v1/tasks?all=1`, {
-            headers: { Authorization: `Bearer ${key}`, "X-AIOS-Team": team },
-          });
+          const base = `${brain.replace(/\/$/, "")}/api/v1/tasks`;
+          const headers = { Authorization: `Bearer ${key}`, "X-AIOS-Team": team };
+          // ASK ABOUT THESE KEYS (brain-api 1.14). Bounded by the keys themselves, so absence is proof
+          // and the brain answers `unknown_keys` outright. `?all=1` cannot answer this: it caps at 500
+          // rows ordered STALEST-first, so the recently-touched tickets people actually cite are exactly
+          // the ones missing. Falls back to the full-table read against a pre-1.14 brain, which is why
+          // the truncation reasoning below stays.
+          let res = await fetch(`${base}?mode=table&keys=${encodeURIComponent(keys.join(","))}`, { headers });
+          if (res.status === 400) res = await fetch(`${base}?all=1`, { headers }); // pre-1.14: no `keys`
           if (!res.ok) {
             // Couldn't ask ≠ the key is fake. Advisory job, so never fail on OUR outage.
             console.log(`::warning title=Work key not verified::brain returned ${res.status} — only the FORMAT was checked.`);
@@ -73,7 +79,7 @@ jobs:
           // PREFIX of the table — the stalest rows, since it orders `updated_at` ascending. Absence from
           // a prefix is not absence from the table; presence in it is still proof.
           const truncated = taskRowsFrom(body).length >= TASKS_PAGE_BOUND;
-          const verdict = verifyKeys(keys, knownKeysFrom(body), { truncated });
+          const verdict = verifyKeys(keys, knownKeysFrom(body), { truncated, unknownKeys: unknownKeysFrom(body) });
           if (verdict.status === "unverified" && verdict.reason === "truncated") {
             console.log(`::warning title=Work key not verified::${verdict.keys.join(", ")} was not in the ${verdict.checked} tasks the brain returned — but that response is capped at ${TASKS_PAGE_BOUND} rows and returns the STALEST first, so the key may simply be past the cap. Only the FORMAT was verified. (To make this provable, the tasks endpoint needs a by-key lookup or a table-mode cursor.)`);
           } else if (verdict.status === "unverified") {
