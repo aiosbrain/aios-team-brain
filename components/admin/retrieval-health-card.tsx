@@ -109,6 +109,16 @@ export function RetrievalHealthCard({ health }: { health: RetrievalHealth }) {
           {llm.note}
         </p>
       ) : null}
+      {/* A CONFIG refusal from the graph LLM proxy. Rendered ABOVE the degraded banner and regardless
+          of it, because it is knowable instantly from settings alone — waiting for it to show up as a
+          stall would recreate exactly the "found it in another service's logs, 6h later" failure the
+          proxy was built to end. Amber, not red: extraction is misconfigured, not broken mid-flight. */}
+      {health.graphProxyRefusal ? (
+        <p className="mt-2 rounded-lg border border-amber-400/30 bg-amber-400/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
+          <strong>Graph extraction can&apos;t use the configured model.</strong>{" "}
+          {health.graphProxyRefusal}
+        </p>
+      ) : null}
       {graphDegraded ? (
         <p className="mt-2 rounded-lg border border-red-400/30 bg-red-400/10 px-3 py-2 text-xs text-red-600 dark:text-red-300">
           {graphExtractionStalled ? (

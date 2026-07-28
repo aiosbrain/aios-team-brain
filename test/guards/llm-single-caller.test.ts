@@ -9,7 +9,7 @@ import { join } from "node:path";
  * and `lib/meetings/llm-extract` each had a bespoke `LLM_BASE_URL ? openai : anthropic` transport
  * that ignored `teams.answering_provider`, so a team on OpenRouter still got arcs/meetings from
  * OpenAI. This guard fails the build if raw LLM transport (`new Anthropic(` or a `/chat/completions`
- * POST) appears anywhere outside the three sanctioned transport modules.
+ * POST) appears anywhere outside the sanctioned transport modules.
  *
  * Sanctioned (each MUST route through `selectLlmBackend`, asserted below):
  *   - lib/llm/complete.ts   — the shared non-streaming primitive every feature calls
@@ -23,6 +23,12 @@ const ALLOWLIST = new Set([
   join("lib", "llm", "complete.ts"),
   join("lib", "query", "claude.ts"),
   join("lib", "chat", "title.ts"),
+  // The graph LLM proxy. Admitted for the OPPOSITE reason to a bypass: the Graphiti container cannot
+  // read this database, so before it existed the graph ran on a second provider key that no setting
+  // in this app governed — and that key silently ran out of quota. This module is what forces the
+  // graph leg through the same console settings as everything else, and the assertion below still
+  // holds it to resolving via `selectLlmBackend`.
+  join("lib", "llm", "graph-proxy.ts"),
 ]);
 const RAW_TRANSPORT = [/new\s+Anthropic\s*\(/, /chat\/completions/];
 
