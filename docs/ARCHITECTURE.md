@@ -142,8 +142,9 @@ flowchart LR
 
 ## Auth & access tiers
 
-This server **implements brain-api v1.13** (the shipped member-facing wire contract; source of truth:
-`aios-workspace/docs/brain-api.md`; v1.8 added the subscriptions endpoint,
+This server **implements brain-api v1.14** (the shipped member-facing wire contract; source of truth:
+`aios-workspace/docs/brain-api.md` — **its 1.14 revision entry is still outstanding**, see the
+by-key lookup on `GET /api/v1/tasks` below; v1.8 added the subscriptions endpoint,
 `POST /api/v1/subscriptions`). That version is pinned in code as `BRAIN_API_VERSION`
 (`lib/api/version.ts`), asserted against this sentence by
 `test/guards/contract-version.test.ts`, and mirrored by the vendored
@@ -705,7 +706,7 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 - `POST /api/v1/items` — upsert synced content
 - `GET /api/v1/items` — tier-filtered, keyset-paginated pull
 - `GET /api/v1/items/:id` — single item fetch
-- `GET /api/v1/tasks` — dashboard task changes for `aios pull` writeback; `?all=1` selects the tier-filtered full tasks-table read
+- `GET /api/v1/tasks` — dashboard task changes for `aios pull` writeback; `?all=1` selects the tier-filtered full tasks-table read (bounded at 500 rows, `updated_at` ASC, no cursor — a full page is the STALEST prefix, so it can confirm a key but can never prove one absent); `?mode=table&keys=A,B` (brain-api 1.14) is the by-key lookup that can — bounded by the keys asked for, answering `unknown_keys` outright (`null` = couldn't determine, never a wrong list). Refused outside table mode, since the other modes filter rows and a real key would look missing
 - `GET /api/v1/timeline` — the work-timeline context layer (v1.12): last 7d day→person→work ledger, the same payload the dashboard panel reads (SWR `work_timeline_cache`); API-key + tier-scoped (`getCachedWorkTimeline` → `visibleItems`/`visibleTasks`)
 - `GET /api/v1/attribution` — attribution health (brain-api v1.13): the SAME derived read as Admin → Attribution (`lib/attribution/health`), so the CLI/LLM read it too — summary (`bySource`/`byMember`/`lowAttributionSources`), or `?member=<uuid>|unattributed` [+ `?source=`/`?limit=`] for the per-item provenance drill-down. **Team-tier ADMIN only** (all-tier read, member names + admin-content counts, no RLS backstop) — external/non-admin → 403
 - `GET /api/v1/pm-sync/health` — team-tier projection health and recent runs for CLI/agent observability

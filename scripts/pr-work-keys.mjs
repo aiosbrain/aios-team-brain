@@ -68,6 +68,38 @@ export function knownKeysFrom(body) {
 }
 
 /**
+ * The 1.14 answer, when the brain gives one: which of the keys we asked about do not exist.
+ *
+ * `?mode=table&keys=…` bounds the query by the keys themselves, so absence IS proof and the brain says
+ * so outright in `unknown_keys` — no inferring from a list that might be a truncated prefix. `null` is
+ * the brain admitting it could not determine them, and is treated exactly like a pre-1.14 brain that
+ * never sent the field: fall back to asking the whole table and reasoning about truncation.
+ *
+ * Returns `null` when this answer isn't available, which is what `verifyKeys` needs to tell "the brain
+ * told me these are fake" apart from "I had to guess".
+ */
+export function unknownKeysFrom(body) {
+  const u = body?.unknown_keys;
+  return Array.isArray(u) ? u.map(String) : null;
+}
+
+/**
+ * Did this response actually answer the BY-KEY question?
+ *
+ * A brain that can't only sometimes says so with a 400. A PRE-1.13 brain has no `mode` param at all:
+ * it ignores `mode=table&keys=…` and returns 200 with the WRITEBACK feed — a short, dashboard-origin
+ * slice. Reading that as a table answer is how a real `origin='sync'` key gets called INVENTED: the
+ * feed is short so nothing looks truncated, and the key simply isn't in it. That is this project's
+ * signature failure, reachable only because we started asking a narrower question.
+ *
+ * So the test is "did I get a TABLE answer", not "did I avoid a 400". Lives here rather than in the
+ * workflow heredoc because the last decision that produced a false accusation lived there.
+ */
+export function answersByKey(body) {
+  return body?.mode === "table";
+}
+
+/**
  * The documented row bound of `GET /api/v1/tasks?all=1` (brain-api: "up to the endpoint's 500-row bound").
  * Table mode does not paginate — `next_cursor` is null for it by design — so a full page means the answer
  * we got is a PREFIX of the table, ordered by `updated_at` ASCENDING: the STALEST rows. The tasks people
@@ -90,6 +122,17 @@ export const TASKS_PAGE_BOUND = 500;
  * an advisory warning worthless.
  */
 export function verifyKeys(keys, known, opts) {
+  // THE 1.14 PATH: the brain was asked about these keys specifically and answered. Its list is
+  // authoritative — no truncation reasoning applies, because the query was bounded by the keys. This is
+  // what lets the check do the job it was built for again; without it, on a team with more than 500
+  // tasks every verdict degrades to "couldn't verify", including a genuinely invented key.
+  if (Array.isArray(opts?.unknownKeys)) {
+    if (!keys.length) return { status: "none" };
+    const invented = keys.filter((k) => opts.unknownKeys.includes(k));
+    return invented.length
+      ? { status: "invented", invented, checked: keys.length, authoritative: true }
+      : { status: "ok", checked: keys.length, authoritative: true };
+  }
   // MANDATORY, and it throws rather than defaulting. `truncated = false` would be a default that ACCUSES:
   // drop the argument — a plausible merge-conflict resolution, in glue code that lives in a YAML heredoc —
   // and the false accusation comes back with every test still green. That is the exact class this module

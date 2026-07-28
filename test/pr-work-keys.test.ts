@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 // @ts-expect-error — plain .mjs shared by the two PR workflows; no types, deliberately dependency-free.
-import { extractWorkKeys, knownKeysFrom, taskRowsFrom, verifyKeys, TASKS_PAGE_BOUND } from "../scripts/pr-work-keys.mjs";
+import { extractWorkKeys, knownKeysFrom, taskRowsFrom, unknownKeysFrom, answersByKey, verifyKeys, TASKS_PAGE_BOUND } from "../scripts/pr-work-keys.mjs";
 
 /**
  * The PR work-key check, which shipped broken because it lived in a YAML heredoc no test tier could reach.
@@ -170,5 +170,58 @@ describe("a truncated read cannot prove a key is fake", () => {
   it("taskRowsFrom counts rows across project groups, so truncation is detectable", () => {
     const body = { tasks: [{ project: "a", rows: [{ row_key: "X-1" }, { row_key: "X-2" }] }, { project: "b", rows: [{ row_key: "X-3" }] }] };
     expect(taskRowsFrom(body).length).toBe(3);
+  });
+});
+
+/**
+ * brain-api 1.14 — the brain now ANSWERS "do these exist?" instead of handing back a page to infer from.
+ * `?mode=table&keys=…` is bounded by the keys, so absence is proof and `unknown_keys` says it outright.
+ * This is what restores the check's original job: on a team with >500 tasks every verdict had degraded
+ * to "couldn't verify", including for a genuinely invented key.
+ */
+describe("unknownKeysFrom + the authoritative verdict", () => {
+  it("reads the brain's answer, and distinguishes 'none unknown' from 'no answer'", () => {
+    expect(unknownKeysFrom({ unknown_keys: ["AIO-999"] })).toEqual(["AIO-999"]);
+    expect(unknownKeysFrom({ unknown_keys: [] })).toEqual([]); // answered: everything exists
+    expect(unknownKeysFrom({ unknown_keys: null })).toBeNull(); // brain couldn't determine
+    expect(unknownKeysFrom({})).toBeNull(); // pre-1.14 brain
+  });
+
+  it("calls a key INVENTED on the brain's word, even though the page looks truncated", () => {
+    // The whole point: a bounded query means truncation reasoning does not apply. Before 1.14 this
+    // exact input produced "couldn't verify" and the check caught nothing.
+    const v = verifyKeys(["AIO-999"], new Set(["AIO-484"]), { truncated: true, unknownKeys: ["AIO-999"] });
+    expect(v).toEqual({ status: "invented", invented: ["AIO-999"], checked: 1, authoritative: true });
+  });
+
+  it("confirms a key the brain did not list as unknown", () => {
+    const v = verifyKeys(["AIO-484"], new Set(), { truncated: true, unknownKeys: [] });
+    expect(v).toEqual({ status: "ok", checked: 1, authoritative: true });
+  });
+
+  it("falls back to truncation reasoning when the brain gives no answer", () => {
+    // A pre-1.14 brain, or one that returned `unknown_keys: null` because it could not determine them.
+    for (const unknownKeys of [null, undefined]) {
+      const v = verifyKeys(["AIO-484"], new Set(["OLD-1"]), { truncated: true, unknownKeys });
+      expect(v.status).toBe("unverified");
+      expect(v.reason).toBe("truncated");
+    }
+  });
+});
+
+describe("answersByKey — a 200 is not an answer", () => {
+  it("accepts only a TABLE-mode response", () => {
+    expect(answersByKey({ mode: "table", tasks: [], unknown_keys: [] })).toBe(true);
+  });
+
+  it("REJECTS a pre-1.13 brain's writeback feed, which is where the false accusation came from", () => {
+    // A pre-1.13 brain ignores `mode` entirely and answers 200 with the dashboard-origin writeback
+    // slice. Short feed → nothing looks truncated → a real `origin='sync'` key absent from it reads as
+    // INVENTED. Verified by simulation against a stub: with this check reverted to "400 only", citing a
+    // real key produced "AIO-484 … no task in the brain has it".
+    expect(answersByKey({ mode: "writeback", tasks: [] })).toBe(false);
+    expect(answersByKey({ tasks: [] })).toBe(false); // pre-1.13: no `mode` field at all
+    expect(answersByKey({ mode: "sync-origin", tasks: [] })).toBe(false);
+    expect(answersByKey(null)).toBe(false);
   });
 });

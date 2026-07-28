@@ -11,6 +11,16 @@ export type TaskFeedMode = "writeback" | "table" | "sync-origin";
 
 const EPOCH = "1970-01-01T00:00:00Z";
 const PAGE = 500;
+/**
+ * How many `row_key`s one by-key lookup may ask about (brain-api 1.14).
+ *
+ * Deliberately far below `PAGE`, because the whole value of the lookup is that ABSENCE IS PROOF —
+ * and that only holds while the result cannot be truncated. A key may exist in more than one project
+ * (`unique (team_id, project_id, row_key)`), so the row count is keys × projects; 200 leaves room for
+ * that and still cannot plausibly reach 500. If it somehow does, `unknown_keys` comes back `null`
+ * rather than wrong — see `unknownKeysFor`.
+ */
+const KEYS_MAX = 200;
 
 /**
  * Resolve the feed mode (brain-api 1.13). `mode` is the explicit, versioned selector; the legacy
@@ -45,11 +55,64 @@ export function nextCursorFor(
   return new Date(rows[rows.length - 1].updated_at).toISOString();
 }
 
+/** A rejected `keys` request, with the reason the caller should see. */
+export type TaskKeysParse = { keys: string[] } | { error: string };
+
+/**
+ * Parse `?keys=A,B,C` — the by-key existence lookup (brain-api 1.14).
+ *
+ * REFUSES outside table mode instead of answering. `writeback` hides `origin='sync'` rows and
+ * `sync-origin` hides `origin='ui'` ones, so a real key asked about in either would come back
+ * "unknown" — a confident wrong answer, which is precisely the failure this endpoint exists to end.
+ * A caller that has typed the wrong mode wants to be told, not quietly misled.
+ *
+ * Duplicates are collapsed and blanks dropped, so `keys=A,,A` asks about one key; the caller's
+ * accounting of what it asked for still has to match, which is why `unknown_keys` echoes keys rather
+ * than counts.
+ */
+export function parseTaskKeys(raw: string | null, mode: TaskFeedMode): TaskKeysParse | null {
+  if (raw === null) return null; // not a by-key request at all
+  if (mode !== "table")
+    return { error: "keys requires mode=table (or all=1) — other modes filter rows, so a real key would look missing" };
+  const keys = [...new Set(raw.split(",").map((k) => k.trim()).filter(Boolean))];
+  if (!keys.length) return { error: "keys must name at least one row_key" };
+  if (keys.length > KEYS_MAX) return { error: `keys is limited to ${KEYS_MAX} per request` };
+  return { keys };
+}
+
+/**
+ * Which of the requested keys matched nothing the caller may see — the ANSWER to "does this exist?",
+ * so a client never has to infer it from absence and get it wrong.
+ *
+ * `null` means UNDETERMINABLE, never "none": if the read hit the row cap it is a prefix, and a key
+ * missing from a prefix proves nothing. That case is unreachable at `KEYS_MAX` × realistic project
+ * counts, and it still returns null rather than a list that would be quietly wrong — the same rule
+ * the CI consumer applies, kept on the side that actually knows.
+ *
+ * A key hidden by the caller's tier is reported as unknown, deliberately: "it exists but you may not
+ * see it" is itself a disclosure, and `visibleTasks` is the only enforcement (no RLS).
+ */
+export function unknownKeysFor(
+  requested: string[],
+  rows: { row_key: string | null }[],
+  truncated: boolean,
+): string[] | null {
+  if (truncated) return null;
+  const found = new Set(rows.map((r) => r.row_key).filter(Boolean));
+  return requested.filter((k) => !found.has(k));
+}
+
 /**
  * Task feed for `aios pull`.
  *
  *  • `writeback` (default) — rows created or modified IN THE DASHBOARD since the cursor.
  *  • `table` (`?all=1` or `?mode=table`) — the explicit tier-filtered full tasks-table read.
+ *  • `keys` (`?mode=table&keys=AIO-1,AIO-2`, brain-api 1.14) — a BY-KEY lookup, answering "do these
+ *    tickets exist?" in one request. `table` alone cannot answer it: it caps at 500 rows ordered
+ *    `updated_at` ASCENDING with no cursor, so it returns the STALEST prefix — measured on prod, 677
+ *    keyed tasks with `AIO-484` at rank 628, i.e. permanently invisible to the read that was being
+ *    used to verify it. Here the query is bounded by the keys themselves, so ABSENCE IS PROOF, and
+ *    `unknown_keys` states it outright instead of leaving the client to infer it.
  *  • `sync-origin` (`?mode=sync-origin&project=<slug>`, brain-api 1.13, AIO-537) — the RETURN LEG:
  *    sync-origin rows (pushed from a workspace) for ONE project, so a workspace can merge brain/
  *    Linear status + assignee changes back into its markdown. Without it the markdown decays —
@@ -81,6 +144,11 @@ export async function GET(req: NextRequest) {
     );
   const all = mode === "table";
   const since = all ? EPOCH : url.searchParams.get("since") || EPOCH;
+
+  const keysParse = parseTaskKeys(url.searchParams.get("keys"), mode);
+  if (keysParse && "error" in keysParse)
+    return errorResponse("invalid_request", keysParse.error, 400);
+  const keys = keysParse?.keys ?? null;
 
   // sync-origin is deliberately single-project: the return leg answers "what changed on MY
   // workspace's rows", and a workspace only ever merges its own project's markdown table.
@@ -116,6 +184,9 @@ export async function GET(req: NextRequest) {
     .gt("updated_at", since)
     .not("row_key", "is", null);
   if (projectId) query = query.eq("project_id", projectId);
+  // The by-key filter is what makes absence provable: the result is bounded by what was ASKED for,
+  // not by an arbitrary page of the newest-last table.
+  if (keys) query = query.in("row_key", keys);
   // Only rows a workspace pushed. Dashboard-origin rows stay the writeback feed's job, so the
   // two feeds never double-merge the same row.
   if (mode === "sync-origin") query = query.eq("origin", "sync");
@@ -190,5 +261,15 @@ export async function GET(req: NextRequest) {
       rows,
     })),
     next_cursor: nextCursorFor(mode, (data ?? []) as { updated_at: string }[]),
+    // 1.14, by-key requests ONLY — a caller that didn't ask about keys gets a byte-identical body.
+    ...(keys
+      ? {
+          unknown_keys: unknownKeysFor(
+            keys,
+            selected as { row_key: string | null }[],
+            (data ?? []).length >= PAGE,
+          ),
+        }
+      : {}),
   });
 }
