@@ -44,17 +44,33 @@ async function inBatches<T>(jobs: (() => Promise<T>)[]): Promise<T[]> {
 }
 
 /**
- * Return a copy of `days` with a `summary` on each person-day that has work. Best-effort: a team with no
- * LLM, or a per-call failure, leaves that person-day's `summary` unset (the panel falls back to counts).
+ * Return a copy of `days` with a `summary` on each person-day that has work, plus whether the pass was
+ * DEGRADED. Best-effort as before: a per-call failure just leaves that person-day's `summary` unset (the
+ * panel falls back to counts).
+ *
+ * `degraded` distinguishes the two reasons prose can be missing, which used to be indistinguishable
+ * (R2/M6). A team with NO answering model configured is not degraded — that's a deliberate setup, and
+ * reporting it as degradation would mark every LLM-less install permanently unhealthy. A pass that was
+ * SUPPOSED to produce summaries and couldn't — the key lookup threw, or every call failed — is.
  */
-export async function attachPersonDaySummaries(db: DbClient, teamId: string, days: TimelineDay[]): Promise<TimelineDay[]> {
+export interface SummaryPassResult {
+  days: TimelineDay[];
+  degraded: boolean;
+}
+
+export async function attachPersonDaySummaries(
+  db: DbClient,
+  teamId: string,
+  days: TimelineDay[]
+): Promise<SummaryPassResult> {
   let keys: LlmBackendKeys;
   try {
     keys = await resolveAnsweringKeys(db, teamId);
   } catch {
-    return days;
+    // Couldn't even find out which model to use — a failure, not a configuration choice.
+    return { days, degraded: true };
   }
-  if (!llmConfigured(keys)) return days;
+  if (!llmConfigured(keys)) return { days, degraded: false }; // summaries are off by design
 
   // One job per (day, person) with content. Each resolves to the summary text (or null on skip/failure).
   const jobs: (() => Promise<{ di: number; pi: number; text: string | null }>)[] = [];
@@ -72,18 +88,25 @@ export async function attachPersonDaySummaries(db: DbClient, teamId: string, day
       }));
     })
   );
-  if (jobs.length === 0) return days;
+  if (jobs.length === 0) return { days, degraded: false }; // nothing had content to summarize
 
   const results = await inBatches(jobs);
   const byKey = new Map<string, string>();
   for (const r of results) if (r.text && r.text.trim()) byKey.set(`${r.di}:${r.pi}`, r.text.trim());
-  if (byKey.size === 0) return days;
+  // A SHORTFALL is degradation, not just a total failure: the fan-out is per person-day and each call
+  // catches its own error, so "some people have prose and some don't" is the common outcome of a flaky
+  // or rate-limited provider — and it looks identical to a quiet day unless it's reported.
+  const degraded = byKey.size < jobs.length;
+  if (byKey.size === 0) return { days, degraded };
 
-  return days.map((d, di) => ({
-    ...d,
-    people: d.people.map((p, pi) => {
-      const s = byKey.get(`${di}:${pi}`);
-      return s ? { ...p, summary: s } : p;
-    }),
-  }));
+  return {
+    days: days.map((d, di) => ({
+      ...d,
+      people: d.people.map((p, pi) => {
+        const s = byKey.get(`${di}:${pi}`);
+        return s ? { ...p, summary: s } : p;
+      }),
+    })),
+    degraded,
+  };
 }

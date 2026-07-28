@@ -3,7 +3,7 @@ import { adminClient } from "@/lib/db/admin";
 import type { DbClient } from "@/lib/db/types";
 import type { ViewerTier } from "@/lib/auth/visibility";
 import { getWorkTimeline } from "./work-timeline";
-import { attachPersonDaySummaries } from "./timeline-summary";
+import { attachPersonDaySummaries, type SummaryPassResult } from "./timeline-summary";
 import type { TimelineDay } from "./timeline-group";
 import { freshness, type Freshness } from "@/lib/freshness";
 
@@ -67,7 +67,7 @@ export const PAYLOAD_VERSION = 10;
 /** The timeline WITH the per-person-day synopsis attached. Runs the (up to 7d × roster) best-effort LLM
  *  calls — so it's used ONLY on the BACKGROUND refresh path, never inline on a request (a cold miss
  *  returns the pure ledger fast and schedules this). Never in the raw builder the data-mechanics tier calls. */
-async function buildTimeline(db: DbClient, teamId: string, tier: ViewerTier): Promise<TimelineDay[]> {
+async function buildTimeline(db: DbClient, teamId: string, tier: ViewerTier): Promise<SummaryPassResult> {
   // Refresh the INFERRED doc→task links first, so anything new lands in the payload we're about to write
   // rather than one cycle later. This is the VIEW-DRIVEN trigger: a rebuild happens because somebody
   // looked, which is exactly when an inference is worth paying for — an unread team's timeline shouldn't
@@ -85,6 +85,7 @@ async function buildTimeline(db: DbClient, teamId: string, tier: ViewerTier): Pr
   }
   return attachPersonDaySummaries(db, teamId, await getWorkTimeline(db, teamId, tier));
 }
+
 
 /**
  * How old a payload may be and still lend its synopsis across a version bump.
@@ -158,6 +159,10 @@ export function attachSalvagedSummaries(days: TimelineDay[], salvaged: SalvagedS
 interface CacheEntry {
   days: TimelineDay[];
   at: number; // epoch ms computed
+  /** The synopsis pass didn't produce prose for this ledger. Carried in memory as well as in Postgres:
+   *  this map is read BEFORE the row, so omitting it would report a partial payload as healthy for the
+   *  life of the process (R2/M6). */
+  degraded: boolean;
 }
 
 // In-memory cache (per process), fronting the Postgres row. Keyed by `${teamId}:${tier}`.
@@ -177,14 +182,14 @@ async function readTimelineCacheRow(
   db: DbClient,
   teamId: string,
   tier: ViewerTier
-): Promise<{ payload: unknown; computed_at: string | Date } | null> {
+): Promise<{ payload: unknown; computed_at: string | Date; degraded?: boolean | null } | null> {
   const { data } = await db
     .from("work_timeline_cache")
-    .select("payload, computed_at")
+    .select("payload, computed_at, degraded")
     .eq("team_id", teamId)
     .eq("group_key", tier)
     .maybeSingle();
-  return (data as { payload: unknown; computed_at: string | Date } | null) ?? null;
+  return (data as { payload: unknown; computed_at: string | Date; degraded?: boolean | null } | null) ?? null;
 }
 
 /** The previous payload's per-person-day summaries, whatever version wrote them. Empty on any error —
@@ -222,7 +227,9 @@ export async function readTimelineCache(
     const days = p.days as TimelineDay[];
     const at =
       typeof row.computed_at === "string" ? Date.parse(row.computed_at) : new Date(row.computed_at).getTime();
-    return { days, at: Number.isFinite(at) ? at : 0 };
+    // `=== true` so a row written before the column existed reads false — "no evidence of degradation",
+    // not "verified good". Defaulting the other way would mark every pre-migration team's ledger bad.
+    return { days, at: Number.isFinite(at) ? at : 0, degraded: row.degraded === true };
   } catch {
     return null;
   }
@@ -234,13 +241,23 @@ export async function writeTimelineCache(
   db: DbClient,
   teamId: string,
   tier: ViewerTier,
-  days: TimelineDay[]
+  days: TimelineDay[],
+  /** The per-person-day synopses are missing or carried over, so the prose wasn't computed for this
+   *  ledger. Persisted (R2/M6) so the NEXT reader of this row inherits the verdict instead of being
+   *  handed a partial payload as healthy. Defaults false — the callers that know pass it explicitly. */
+  degraded = false
 ): Promise<void> {
   try {
     // `payload` is a top-level JSON array — serialize it ourselves (the pg adapter binds a raw JS array
     // as a Postgres array literal, which the jsonb column rejects); a text param assignment-casts to jsonb.
     await db.from("work_timeline_cache").upsert(
-      { team_id: teamId, group_key: tier, payload: JSON.stringify({ v: PAYLOAD_VERSION, days }), computed_at: new Date().toISOString() },
+      {
+        team_id: teamId,
+        group_key: tier,
+        payload: JSON.stringify({ v: PAYLOAD_VERSION, days }),
+        computed_at: new Date().toISOString(),
+        degraded,
+      },
       { onConflict: "team_id,group_key" }
     );
   } catch {
@@ -325,9 +342,9 @@ function refreshInBackground(teamId: string, tier: ViewerTier): void {
       const bg = adminClient();
       do {
         dirty.delete(key); // claim the current request; anything arriving from here re-dirties the key
-        const days = await buildTimeline(bg, teamId, tier);
-        mem.set(key, { days, at: Date.now() });
-        await writeTimelineCache(bg, teamId, tier, days);
+        const built = await buildTimeline(bg, teamId, tier);
+        mem.set(key, { days: built.days, at: Date.now(), degraded: built.degraded });
+        await writeTimelineCache(bg, teamId, tier, built.days, built.degraded);
       } while (dirty.has(key));
     } catch (err) {
       console.error("[timeline] background refresh failed:", err instanceof Error ? err.message : err);
@@ -377,15 +394,18 @@ export async function getCachedWorkTimeline(
   const now = Date.now();
 
   const cached = mem.get(key);
-  if (cached && now - cached.at < TTL_MS) return { days: cached.days, freshness: freshness(cached.at, TTL_MS, { now }) };
+  if (cached && now - cached.at < TTL_MS) {
+    return { days: cached.days, freshness: freshness(cached.at, TTL_MS, { now, degraded: cached.degraded }) };
+  }
 
   const persisted = await readTimelineCache(db, teamId, tier);
   if (persisted) {
-    mem.set(key, { days: persisted.days, at: persisted.at });
+    mem.set(key, { days: persisted.days, at: persisted.at, degraded: persisted.degraded });
     // ONE envelope for both the fresh and the stale branch — `freshness()` derives `stale` from the same
     // age comparison the branch below makes, so the reported staleness cannot disagree with the decision
     // actually taken (they were two separate readings of the clock in every earlier draft of this).
-    const f = freshness(persisted.at, TTL_MS, { now });
+    // The PERSISTED verdict — so a reader who didn't do the work still learns the prose is missing.
+    const f = freshness(persisted.at, TTL_MS, { now, degraded: persisted.degraded });
     if (!f.stale) return { days: persisted.days, freshness: f };
     refreshInBackground(teamId, tier); // stale → serve stale, rebuild behind the request
     return { days: persisted.days, freshness: f };
@@ -404,8 +424,12 @@ export async function getCachedWorkTimeline(
   // Best-effort by construction: no salvageable row → `built`, unchanged.
   const days = attachSalvagedSummaries(built, await readSalvageableSummaries(db, teamId, tier));
   const at = Date.now();
-  mem.set(key, { days, at });
-  await writeTimelineCache(db, teamId, tier, days);
+  mem.set(key, { days, at, degraded: true });
+  // PERSISTED as degraded, not just reported. The row this writes is what the next reader gets, and its
+  // prose is either absent or salvaged from an older payload version — so the flag has to live on the row
+  // or the very next request hands the same partial ledger over as healthy. Self-healing: the background
+  // pass below rewrites the row with the real verdict once summaries land.
+  await writeTimelineCache(db, teamId, tier, days, true);
   refreshInBackground(teamId, tier);
   // DEGRADED, deliberately. A cold miss returns the pure ledger: its per-person-day synopses are either
   // absent (the background pass hasn't run) or SALVAGED from an older payload version. Both are "this is

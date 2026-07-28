@@ -85,12 +85,23 @@ describe("attachPersonDaySummaries", () => {
     completeTextOrNull.mockImplementation(async ({ prompt }: { prompt: string }) => (prompt.includes("Alice") ? "Alice shipped X." : null));
     const input = days();
     const out = await attachPersonDaySummaries(fakeDb, "team", input);
-    const [alice, bob] = out[0].people;
+    const [alice, bob] = out.days[0].people;
     expect(alice.summary).toBe("Alice shipped X.");
     expect(bob.summary).toBeUndefined();
+    // A SHORTFALL is degradation (R2/M6): Bob's call failed, so the ledger is persisted with prose for
+    // some people and not others — which is indistinguishable from a quiet day unless it's reported.
+    expect(out.degraded).toBe(true);
     // Immutable — the input array/objects are not mutated.
-    expect(out).not.toBe(input);
+    expect(out.days).not.toBe(input);
     expect(input[0].people[0].summary).toBeUndefined();
+  });
+
+  it("a fully successful pass is NOT degraded", async () => {
+    // The control. Without it the flag could be stuck on and every assertion above would still pass.
+    completeTextOrNull.mockResolvedValue("Everyone shipped things.");
+    const out = await attachPersonDaySummaries(fakeDb, "team", days());
+    expect(out.days[0].people.every((p) => p.summary)).toBe(true);
+    expect(out.degraded).toBe(false);
   });
 
   it("skips entirely (returns the same array) when no LLM is configured", async () => {
@@ -99,8 +110,19 @@ describe("attachPersonDaySummaries", () => {
     resolveAnsweringKeys.mockResolvedValue({});
     const input = days();
     const out = await attachPersonDaySummaries(fakeDb, "team", input);
-    expect(out).toBe(input);
+    expect(out.days).toBe(input);
     expect(completeTextOrNull).not.toHaveBeenCalled();
+    // NOT degraded: having no answering model is a deliberate setup, not a failure. Reporting it as
+    // degradation would mark every LLM-less install permanently unhealthy (R2/M6).
+    expect(out.degraded).toBe(false);
     if (orig) process.env.LLM_BASE_URL = orig;
+  });
+
+  it("IS degraded when the key lookup itself fails — that's a failure, not a choice", async () => {
+    // The distinction the flag exists to draw. Same observable payload (no summaries), opposite meaning.
+    resolveAnsweringKeys.mockRejectedValue(new Error("db down"));
+    const out = await attachPersonDaySummaries(fakeDb, "team", days());
+    expect(out.degraded).toBe(true);
+    expect(out.days[0].people.every((p) => p.summary === undefined)).toBe(true);
   });
 });

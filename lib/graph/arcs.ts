@@ -9,7 +9,13 @@ import { GraphitiClient } from "./graphiti-client";
 import { episodeGroupId, isExternalGroupId, type AccessTier } from "./group";
 import { attributedFactTexts, groundParticipants } from "./arc-attribution";
 import { resolveItemCredit } from "@/lib/attribution/contributor-credit";
-import { readArcCache, writeArcCache, ARC_CACHE_TTL_MS as CACHE_TTL_MS } from "./arc-cache";
+import {
+  readArcCache,
+  writeArcCache,
+  arcTtlMs,
+  ARC_CACHE_TTL_MS as CACHE_TTL_MS,
+  UNTRUSTED_RETRY_AFTER_MS,
+} from "./arc-cache";
 import { freshness, computedNow, type Freshness } from "@/lib/freshness";
 import { listArcCorrections, recordArcCorrections } from "./arc-corrections";
 import { arcIneligibleItemIds } from "./arc-eligibility";
@@ -85,10 +91,8 @@ const COHERENCE_TIMEOUT_MS = Math.max(1_000, Number(process.env.ARC_COHERENCE_TI
 // How long the empty-clobber guard keeps trusting a prior non-empty arc set. Within this window an
 // empty synthesis is treated as a transient failure (keep the prior); beyond it, a persistently-empty
 // result is accepted as genuine so the panel can't be pinned to ancient arcs forever (Fable review).
-/** How long an UNTRUSTWORTHY arc result is served before the next view retries it. Short enough that a
- *  transient LLM/graph failure self-heals in minutes rather than hours, long enough that a persistent one
- *  doesn't turn every page view into a recompute. */
-const UNTRUSTED_RETRY_AFTER_MS = 5 * 60_000;
+// UNTRUSTED_RETRY_AFTER_MS now lives in ./arc-cache beside ARC_CACHE_TTL_MS — the two are one rule
+// ("an untrusted result gets a short life"), expressed once as `arcTtlMs`. Imported above.
 
 const EMPTY_CLOBBER_MAX_AGE_MS = (() => {
   // Guard the parse: a garbage/empty env yields NaN/0, and `ageMs < NaN` is always false → EVERY empty
@@ -606,10 +610,18 @@ export interface SynthesisResult {
  *  to apply, and the prior actually had arcs. This is the stability guard — arcs then change only when the
  *  underlying work does, not on every recompute. A null/empty prior hash never reuses. */
 export function canReuseArcs(
-  prior: { factsHash: string | null; arcCount: number } | null,
+  prior: { factsHash: string | null; arcCount: number; degraded?: boolean } | null,
   factsHash: string,
   hasCorrections: boolean
 ): boolean {
+  // A DEGRADED prior is never reusable, however stable the fact set is. Reuse means "the inputs didn't
+  // change, so keep the previous answer and skip the model" — sound only if that answer was trustworthy.
+  // Reusing an untrustworthy one re-commits the same bad bytes as HEALTHY (and for a full TTL), without
+  // the leg that failed ever getting another chance: the row's `degraded` verdict is laundered away by
+  // the retry that was supposed to heal it. Concretely — an attribution leg throws AFTER the prompt is
+  // built, so the hash is unchanged; unattributed arcs persist degraded; 5 minutes later the retry
+  // hash-skips and stamps them healthy for 4h, with the attribution pass never re-running.
+  if (prior?.degraded) return false;
   return !hasCorrections && !!prior && !!prior.factsHash && prior.factsHash === factsHash && prior.arcCount > 0;
 }
 
@@ -624,7 +636,7 @@ async function synthesizeArcs(
   llmTimeoutMs: number = INLINE_ARC_TIMEOUT_MS,
   // The prior cached arcs + their fact hash (background refresh only). When the freshly-built prompt hashes
   // identically AND there's no correction, we KEEP the prior arcs and skip the LLM (the stability guard).
-  prior?: { arcs: NarrativeArc[]; factsHash: string | null } | null,
+  prior?: { arcs: NarrativeArc[]; factsHash: string | null; degraded?: boolean } | null,
   // Run the extra evidence-COHERENCE LLM pass? Only the non-route-bound BACKGROUND refresh sets this — the
   // route-bound cold-miss + correction paths skip it (a second LLM call would blow the 120s route budget).
   // A cold-miss arc may briefly show a spurious participant; the next SWR refresh prunes it.
@@ -814,7 +826,13 @@ async function synthesizeArcs(
   // STABILITY GUARD: identical input (+ no correction, + a real prior) → keep the prior arcs and SKIP the
   // LLM. This is what stops the day-to-day churn (same facts producing different arcs every recompute from
   // LLM non-determinism). The background refresh still runs (fetch/balance/hash), just not the model.
-  if (canReuseArcs(prior ? { factsHash: prior.factsHash, arcCount: prior.arcs.length } : null, factsHash, correctionTexts.length > 0)) {
+  if (
+    canReuseArcs(
+      prior ? { factsHash: prior.factsHash, arcCount: prior.arcs.length, degraded: prior.degraded } : null,
+      factsHash,
+      correctionTexts.length > 0
+    )
+  ) {
     return { arcs: prior!.arcs, factsHash, degraded };
   }
 
@@ -833,7 +851,12 @@ async function synthesizeArcs(
 
 // In-memory cache (per process). Keyed by the tier-visible group set. Fronts the Postgres `arc_cache`
 // (lib/graph/arc-cache) — the persistent, cross-instance layer that survives restarts.
-const cache = new Map<string, { arcs: NarrativeArc[]; at: number; factsHash: string | null }>();
+// `degraded` is carried here too, not just in Postgres: this map is consulted BEFORE the row, so without
+// it a degraded result would read back healthy — and with the full 4h TTL — for the life of the process.
+const cache = new Map<
+  string,
+  { arcs: NarrativeArc[]; at: number; factsHash: string | null; degraded: boolean }
+>();
 // Group keys currently being recomputed in the background, so concurrent stale reads fire ONE
 // recompute (and thus one LLM call), not N.
 const refreshing = new Set<string>();
@@ -870,10 +893,11 @@ export function evictArcMemoryCache(teamSlug: string): void {
  * on both keep-the-prior branches the arcs handed back date from the earlier synthesis. A caller that
  * assumed "commitArcs returned, so this is current" would re-create exactly the freshness lie R2 removes
  * — one branch deep, where it is hardest to see. `computedAt` is never later than the computation it hands
- * back (an untrustworthy result is deliberately backdated below), so it under-claims freshness rather than
- * over-claiming it. One documented exception: on the `canReuseArcs` revalidation path the row is
- * re-stamped `now()` over arcs the model produced hours earlier — defensible, because the inputs were just
- * hash-verified unchanged (a 304, not a fresh synthesis), but it IS a re-stamp and predates this change.
+ * back, so it names when those bytes were produced rather than when this call ran. On the keep-the-prior
+ * branches that is the PRIOR's time; on a write it is now. One documented exception: on the
+ * `canReuseArcs` revalidation path the row is re-stamped `now()` over arcs the model produced earlier —
+ * defensible, because the inputs were just hash-verified unchanged (a 304, not a fresh synthesis), and
+ * that path now refuses to fire at all when the prior was degraded.
  *
  * `untrustworthy` is returned too, and is BROADER than the caller's `opts.degraded`: it also covers H12's
  * model-failure (empty arcs from a NON-empty fact set), which no input-degradation flag can see. Without
@@ -887,7 +911,17 @@ export async function commitArcs(
   next: NarrativeArc[],
   factsHash: string | null,
   opts: { degraded?: boolean } = {}
-): Promise<{ arcs: NarrativeArc[]; computedAt: number; untrustworthy: boolean }> {
+): Promise<{
+  arcs: NarrativeArc[];
+  computedAt: number;
+  /** THIS attempt was untrustworthy (model failed, or an input leg did) — even if the bytes returned are
+   *  a healthy prior it refused to overwrite. Answers "did the recompute you asked for work?". */
+  untrustworthy: boolean;
+  /** The BYTES returned are untrustworthy. Differs from `untrustworthy` on the keep-the-prior branches,
+   *  where a failed attempt hands back a perfectly good cached set. Answers "can I rely on this payload?"
+   *  — which is what the TTL/staleness must follow. */
+  payloadDegraded: boolean;
+}> {
   // ── Is this result trustworthy enough to serve for a full TTL? ────────────────────────────────────
   // Two ways it isn't, and both used to be committed as FRESH — which is the one state SWR can never
   // heal from, because it only re-fires on a stale row.
@@ -909,7 +943,10 @@ export async function commitArcs(
       console.warn(
         `[arcs] degraded synthesis for ${key}; keeping ${prior.arcs.length} cached arcs rather than overwriting them with a partial set`
       );
-      return { arcs: prior.arcs, computedAt: prior.at, untrustworthy };
+      // `payloadDegraded` is the PRIOR's own verdict, not this computation's: the bytes handed back are
+      // whatever that row was, and their TTL must follow their trust. `untrustworthy` still reports that
+      // THIS attempt failed — the two differ exactly here, which is the point of returning both.
+      return { arcs: prior.arcs, computedAt: prior.at, untrustworthy, payloadDegraded: prior.degraded };
     }
   }
 
@@ -924,7 +961,10 @@ export async function commitArcs(
         console.warn(
           `[arcs] synthesis returned 0 arcs for ${key}; keeping ${prior.arcs.length} cached (${Math.round(ageMs / 3_600_000)}h old; likely transient)`
         );
-        return { arcs: prior.arcs, computedAt: prior.at, untrustworthy };
+        // `payloadDegraded` is the PRIOR's own verdict, not this computation's: the bytes handed back are
+      // whatever that row was, and their TTL must follow their trust. `untrustworthy` still reports that
+      // THIS attempt failed — the two differ exactly here, which is the point of returning both.
+      return { arcs: prior.arcs, computedAt: prior.at, untrustworthy, payloadDegraded: prior.degraded };
       }
       // Prior is too old to keep trusting as "transient-failure cover": a persistently-empty synthesis
       // over this long is more likely GENUINE (quiet team, content deleted, graph reset, or the model
@@ -940,17 +980,22 @@ export async function commitArcs(
   //
   // Not "already stale": that would make every page view fire another recompute for as long as the
   // underlying failure lasted — a rebuild (and, before the early return above, an LLM call) per viewer.
-  // Aging it by `TTL - RETRY_AFTER_MS` instead means the row reads fresh for RETRY_AFTER_MS and then goes
-  // stale, which bounds retries to roughly one per that window while still being far short of the full TTL.
-  const at = untrustworthy ? Date.now() - (CACHE_TTL_MS - UNTRUSTED_RETRY_AFTER_MS) : Date.now();
+  // The short life comes from the persisted `degraded` flag, which `arcTtlMs` turns into a
+  // RETRY_AFTER_MS window: the row reads fresh for that long and then goes stale, bounding retries to
+  // roughly one per window while staying far short of the full TTL. (This used to be done by BACKDATING
+  // the timestamp by `TTL - RETRY_AFTER_MS` — same window, but the row then claimed a computation time
+  // ~4h before it happened, which is the lie R2/M6 removed.)
+  // Honest write time, always. The short life an untrustworthy result needs comes from `arcTtlMs`
+  // reading the persisted `degraded` flag — not from pushing this timestamp into the past (R2/M6).
+  const at = Date.now();
   if (untrustworthy) {
     console.warn(
       `[arcs] ${modelFailed ? "synthesis produced no arcs from a non-empty fact set" : "degraded synthesis"} for ${key}; persisting with a ${Math.round(UNTRUSTED_RETRY_AFTER_MS / 60_000)}min life so it retries soon`
     );
   }
-  cache.set(key, { arcs: next, at, factsHash });
-  await writeArcCache(db, teamId, key, next, factsHash, { retryAfterMs: untrustworthy ? UNTRUSTED_RETRY_AFTER_MS : undefined });
-  return { arcs: next, computedAt: at, untrustworthy };
+  cache.set(key, { arcs: next, at, factsHash, degraded: untrustworthy });
+  await writeArcCache(db, teamId, key, next, factsHash, { degraded: untrustworthy });
+  return { arcs: next, computedAt: at, untrustworthy, payloadDegraded: untrustworthy };
 }
 
 /** The arcs currently cached for a key — in-memory first, then the persisted row. */
@@ -958,11 +1003,11 @@ async function priorArcs(
   db: DbClient,
   teamId: string,
   key: string
-): Promise<{ arcs: NarrativeArc[]; at: number } | null> {
+): Promise<{ arcs: NarrativeArc[]; at: number; degraded: boolean } | null> {
   const mem = cache.get(key);
-  if (mem) return { arcs: mem.arcs, at: mem.at };
+  if (mem) return { arcs: mem.arcs, at: mem.at, degraded: mem.degraded };
   const row = await readArcCache(db, teamId, key);
-  return row ? { arcs: row.arcs, at: row.computedAt } : null;
+  return row ? { arcs: row.arcs, at: row.computedAt, degraded: row.degraded } : null;
 }
 
 /** Fire-and-forget background recompute for a stale cache key (serve-stale-while-revalidate). Uses
@@ -973,7 +1018,7 @@ function refreshArcsInBackground(
   key: string,
   groups: string[],
   keys: ProviderKeys,
-  prior: { arcs: NarrativeArc[]; factsHash: string | null } | null
+  prior: { arcs: NarrativeArc[]; factsHash: string | null; degraded?: boolean } | null
 ): void {
   if (refreshing.has(key)) return;
   refreshing.add(key);
@@ -1026,17 +1071,38 @@ export async function getArcs(
   // 1. In-memory (fastest, same process). `at` is the PERSISTED computed_at (set below), not the time
   //    this process happened to populate its map — so a warm process reports the row's age, not zero.
   const mem = cache.get(key);
-  if (mem && now - mem.at < CACHE_TTL_MS) return { arcs: mem.arcs, freshness: freshness(mem.at, CACHE_TTL_MS, { now }) };
+  if (mem) {
+    // `arcTtlMs(degraded)` — a degraded entry expires in minutes, which is what makes the memo retry as
+    // fast as the row does. Using the flat TTL here would let the process serve an untrustworthy set for
+    // the full 4h while Postgres considered it stale.
+    const f = freshness(mem.at, arcTtlMs(mem.degraded), { now, degraded: mem.degraded });
+    if (!f.stale) return { arcs: mem.arcs, freshness: f };
+  }
 
   // 2. Persistent cache (survives restart, shared across instances).
   const persisted = await readArcCache(db, teamId, key);
   if (persisted) {
-    cache.set(key, { arcs: persisted.arcs, at: persisted.computedAt, factsHash: persisted.factsHash });
-    const f = freshness(persisted.computedAt, CACHE_TTL_MS, { now });
+    cache.set(key, {
+      arcs: persisted.arcs,
+      at: persisted.computedAt,
+      factsHash: persisted.factsHash,
+      degraded: persisted.degraded,
+    });
+    // The persisted verdict, and the TTL derived from it. `degraded` now OUTLIVES the request that
+    // discovered it, so a later reader of the same row is told the payload is untrustworthy instead of
+    // being handed it as healthy.
+    const f = freshness(persisted.computedAt, arcTtlMs(persisted.degraded), {
+      now,
+      degraded: persisted.degraded,
+    });
     if (!f.stale) return { arcs: persisted.arcs, freshness: f };
     // Stale — hand back the stale arcs immediately and refresh behind the request, passing the prior so
     // the refresh can skip the LLM if the facts are unchanged.
-    refreshArcsInBackground(teamId, key, groups, keys, { arcs: persisted.arcs, factsHash: persisted.factsHash });
+    refreshArcsInBackground(teamId, key, groups, keys, {
+      arcs: persisted.arcs,
+      factsHash: persisted.factsHash,
+      degraded: persisted.degraded, // a degraded prior must NOT be hash-reused — see canReuseArcs
+    });
     return { arcs: persisted.arcs, freshness: f };
   }
 
@@ -1052,7 +1118,11 @@ export async function getArcs(
     arcs: committed.arcs,
     // `committed.untrustworthy`, not just `degraded`: H12's model-failure (empty arcs from a NON-empty
     // fact set) is invisible to the input-degradation flag, and that is the commonest failure.
-    freshness: freshness(committed.computedAt, CACHE_TTL_MS, {
+    // TTL follows the PAYLOAD's trust (`payloadDegraded`); `degraded` reports that this ATTEMPT failed.
+    // They differ on the keep-the-prior branches: a refused synthesis hands back a healthy cached set,
+    // which must keep its full 4h life — scoring it against the 5-minute untrusted window would badge a
+    // fresh, good payload as stale and make every viewer re-fire the recompute.
+    freshness: freshness(committed.computedAt, arcTtlMs(committed.payloadDegraded), {
       now: Date.now(),
       degraded: degraded || committed.untrustworthy,
     }),
@@ -1099,7 +1169,10 @@ export async function recomputeArcs(
   // Same rule as getArcs: a recompute whose synthesis was degraded is REFUSED and the prior is kept
   // (H11), so "the user clicked recompute" is not evidence the arcs are new. Report what commitArcs
   // actually made authoritative, and carry `degraded` so the client can tell the edit didn't take.
-  const envelope = freshness(committed.computedAt, CACHE_TTL_MS, {
+  // Same split as getArcs: the window follows the bytes, the flag reports the attempt. This is the path
+  // where it matters most — a refused recompute returns a healthy 1h-old prior, and calling that stale
+  // would tell the user their correction aged the data out.
+  const envelope = freshness(committed.computedAt, arcTtlMs(committed.payloadDegraded), {
     now: Date.now(),
     degraded: degraded || committed.untrustworthy,
   });

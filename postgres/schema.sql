@@ -1700,9 +1700,14 @@ create table if not exists arc_cache (
   -- work does, killing day-to-day churn. Nullable: pre-existing rows have none until the next recompute.
   facts_hash text,
   computed_at timestamptz not null default now(),
+  -- Was this synthesis trustworthy? Its OWN column, so `computed_at` means only "when computed" (R2/M6).
+  -- Before this, an untrusted result was persisted with a BACKDATED `computed_at` to shorten its life —
+  -- which made the timestamp lie by ~4h. The short life is now derived from this flag instead (`arcTtlMs`).
+  degraded boolean not null default false,
   primary key (team_id, group_key)
 );
 alter table arc_cache add column if not exists facts_hash text;
+alter table arc_cache add column if not exists degraded boolean not null default false;
 
 -- Human corrections to narrative arcs — the ONLY human-authored input in the learning layer, and the
 -- reason it needs a real home. These used to exist solely as Graphiti episodes written inside a
@@ -1736,8 +1741,13 @@ create table if not exists work_timeline_cache (
   group_key text not null,                       -- viewer tier: 'team' | 'external'
   payload jsonb not null default '[]'::jsonb,     -- TimelineDay[] (already attributed + grouped)
   computed_at timestamptz not null default now(),
+  -- The per-person-day synopses are missing or were carried over from an older payload, so the ledger is
+  -- real but its prose isn't computed for it. NOT set when the team simply has no answering model
+  -- configured — that's a choice, not a failure (R2/M6).
+  degraded boolean not null default false,
   primary key (team_id, group_key)
 );
+alter table work_timeline_cache add column if not exists degraded boolean not null default false;
 
 -- ── chat conversations (persistent, owner-scoped chat history) ────────────────
 -- ChatGPT-style threads persisted server-side so history survives across sessions AND interfaces

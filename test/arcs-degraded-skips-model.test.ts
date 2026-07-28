@@ -164,18 +164,25 @@ describe("a degraded synthesis never reaches the model", () => {
     // The leg that still conflated the two until this PR. `recentFacts` returning [] because Neo4j is
     // down looked byte-identical to a genuinely quiet window, so on a cold miss it wrote a blank panel
     // stamped fresh for the full TTL with no retry — H12's shape, on the last leg that had it.
-    const { ARC_CACHE_TTL_MS } = await import("@/lib/graph/arc-cache");
+    const { arcTtlMs } = await import("@/lib/graph/arc-cache");
     factsMock.recentFacts.mockResolvedValue({ facts: [], ok: false });
 
     const { getArcs } = await import("@/lib/graph/arcs");
     const { db, upserts } = fakeDb();
-    await getArcs(db, "team-1", "acme", "external", externalGroups(), KEYS);
+    const res = await getArcs(db, "team-1", "acme", "external", externalGroups(), KEYS);
 
     expect(llmMock.completeTextOrNull).not.toHaveBeenCalled();
     expect(upserts).toHaveLength(1);
-    const remaining = ARC_CACHE_TTL_MS - (Date.now() - Date.parse(upserts[0].computed_at as string));
+    // The requirement is unchanged — retried in minutes, not pinned for 4h — but it is now carried by the
+    // `degraded` COLUMN plus the TTL derived from it, rather than by backdating `computed_at` (R2/M6).
+    expect(upserts[0].degraded).toBe(true);
+    const at = Date.parse(upserts[0].computed_at as string);
+    expect(Date.now() - at).toBeLessThan(60_000); // the timestamp is honest now, not pushed into the past
+    const remaining = arcTtlMs(true) - (Date.now() - at);
     expect(remaining).toBeGreaterThan(0); // not already stale — a persistent outage must not thrash
     expect(remaining).toBeLessThanOrEqual(10 * 60_000); // …retried in minutes, not hours
+    // And the caller is TOLD, which the row alone never conveyed before this change.
+    expect(res.freshness.degraded).toBe(true);
   });
 
   it("still reaches the model when the same legs are healthy", async () => {

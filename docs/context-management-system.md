@@ -210,9 +210,13 @@ identity resolution) can disagree with a human's deliberate correction. The reso
   `computedAt` is the row's real `computed_at`; `stale` = past TTL but served (SWR); `degraded` = a leg the
   payload needed failed. Produced by the data layer (`getArcs`, `getCachedWorkTimeline`, `commitArcs`),
   never by the route — routes used to write `as_of: new Date()` over a 4h-TTL cache, which reported
-  hours-old arcs as current. Two non-obvious cases it now names: a cold-miss timeline is `degraded` but NOT
+  hours-old arcs as current. Two non-obvious cases it names: a cold-miss timeline is `degraded` but NOT
   stale (real work data, prose not computed for it), and a refused degraded synthesis returns the PRIOR's
   `computedAt`, so "the recompute returned" stops implying "the arcs are new".
+  **`degraded` is a persisted column** on both cache tables, so a later reader inherits the verdict rather
+  than being handed a partial payload as healthy. It is also what freed `computed_at` from doubling as a
+  trust dial: an untrusted row used to be BACKDATED by `TTL − 5min` to shorten its life, and that short
+  life is now derived from the flag (`arcTtlMs`) — same retry window, honest timestamp.
 
 ---
 
