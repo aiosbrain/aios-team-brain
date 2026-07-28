@@ -22,7 +22,7 @@ every surface, and every agent.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/team-brain-schematic-dark.png">
-  <img alt="Users working in Claude Code, Conductor and Cursor, plus integrations with Slack, Notion, Linear, GitHub, Granola and Google, all feeding one Team Brain (knowledge, memory, reasoning, policy, insights) with a Context Engine beneath it; the brain in turn drives surfaces — a kanban board, a KPI dashboard and a query interface — and actions such as spawning agents, executing tasks and improving the harness" src="docs/images/team-brain-schematic-light.png">
+  <img alt="Users working in Claude Code, Conductor and Cursor, plus integrations with Slack, Notion, Linear, GitHub and Google, all feeding one Team Brain (knowledge, memory, reasoning, policy, insights) with a Context Engine beneath it; the brain in turn drives surfaces — a kanban board, a KPI dashboard and a query interface — and actions such as spawning agents, executing tasks and improving the harness" src="docs/images/team-brain-schematic-light.png">
 </picture>
 
 **MIT licensed. Self-hosted. Private by default.** Postgres is the only required backend. Nothing
