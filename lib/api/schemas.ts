@@ -567,7 +567,15 @@ export function validateIntegrationConfig(
       );
     }
   }
-  const parsed = integrationConfigSchemas[type].safeParse(value);
+  // A RETIRED type (`wise`, `granola`) or any forged value has no schema. The DB CHECK still
+  // tolerates the retired ones so a self-host's legacy row can't break a schema load — but nothing
+  // may CREATE one, and dereferencing the missing schema would surface a raw TypeError instead of
+  // a clean validation failure.
+  const schema = integrationConfigSchemas[type];
+  if (!schema) {
+    throw new IntegrationConfigError(`unknown or retired integration type "${type}"`);
+  }
+  const parsed = schema.safeParse(value);
   if (!parsed.success) {
     throw new IntegrationConfigError(
       parsed.error.issues

@@ -43,12 +43,13 @@ brain admin UI and issue it an API key — that key goes in `AIOS_API_KEY`.
 
 ```bash
 aios-ingest list-sources
-# Backfill one source (e.g. a Notion database):
-aios-ingest backfill --source notion --opt database_id=<id>
+# Backfill one source (e.g. a Notion database) — every option the adapter needs is a --opt:
+aios-ingest backfill --source notion --opt token=$NOTION_TOKEN --opt database_id=<id>
 # Run all configured connections:
 aios-ingest sync --config connections.yaml
 
-# Webhooks (Notion-beta):
+# Webhook receiver — SCAFFOLDING ONLY: every registered source is pull-only
+# (PullOnlySource.supports_webhook = False), so nothing it receives can be ingested yet.
 uvicorn aios_ingest.webhook_app:app --port 8088
 
 # Scheduled polling:

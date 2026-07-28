@@ -5,7 +5,7 @@
 #   When you run `aios-ingest sync --use-brain-selections` (or set
 #   AIOS_BRAIN_SELECTIONS=1), the sidecar fetches the team's enabled integration
 #   selections from the brain (Admin → Integrations) and OVERLAYS their non-secret
-#   selection — slack channel ids, github repos — onto the matching
+#   selection — slack channel ids — onto the matching
 #   local connection. Matching is by (source == brain type) AND (name == brain name).
 #   The brain rejects secret-like keys at write time, so secrets ALWAYS stay local:
 #   the token / signing_secret / webhook_secret / api_key you set below via ${ENV_VAR}
@@ -14,15 +14,19 @@
 #   With the flag OFF (the default), there is NO brain call and behavior is exactly as
 #   the entries below describe — local options are used unchanged.
 connections:
+  # NOTE: there is no sidecar `github` source — GitHub is ingested by the brain's own runner
+  # (Admin → Integrations → GitHub repos). Same for Slack, Linear and Plane.
   - name: eng-handbook
-    source: github
+    source: local
     project: handbook
     access: team
     options:
-      repo: run-llama/llama_index
-      path_glob: "docs/**/*.md"
-      webhook_secret: ${GITHUB_WEBHOOK_SECRET}
+      root: ~/handbook          # a real directory on the machine running the sidecar
+      glob: "**/*.md"
 
+  # DEPRECATED: the sidecar `slack` source is a registered NO-OP — Slack is ingested by the
+  # brain's in-app runner. Kept here only to show how a brain selection merges onto a local
+  # connection (see the header); it ingests nothing.
   - name: eng-slack
     source: slack
     project: slack

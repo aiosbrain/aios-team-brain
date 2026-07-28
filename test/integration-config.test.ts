@@ -35,9 +35,20 @@ describe("validateIntegrationConfig()", () => {
       { client_secret: "c" },
     ]) {
       expect(
-        () => validateIntegrationConfig("wise", bad),
+        () => validateIntegrationConfig("slack", bad),
         JSON.stringify(bad),
       ).toThrow(/secret-like key/i);
+    }
+  });
+
+  it("rejects a RETIRED type with a clean error, not a raw TypeError", () => {
+    // `wise` and `granola` are gone from the app's schema map but remain in the DB CHECK (a
+    // self-host's legacy row must not break its schema load). Nothing may CREATE one — and the
+    // refusal has to be a validation error, not a crash from dereferencing a missing schema.
+    for (const retired of ["wise", "granola"]) {
+      expect(() => validateIntegrationConfig(retired, { anything: "x" })).toThrow(
+        /unknown or retired integration type/i,
+      );
     }
   });
 
