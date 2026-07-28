@@ -41,8 +41,6 @@ export function buildConfig(
       return { channelIds: list };
     case "github":
       return { repos: list };
-    case "granola":
-      return { matchKeywords: list };
     case "wise":
       return list[0] ? { profileId: list[0] } : {};
     case "notion":

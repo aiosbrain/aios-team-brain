@@ -11,7 +11,6 @@ from typing import Any, Callable
 from .base import Source
 from .confluence import ConfluenceSource
 from .gdrive import GoogleDriveSource
-from .granola import GranolaSource
 from .local import LocalSource
 from .notion import NotionSource
 from .radar import RadarSource
@@ -33,7 +32,6 @@ _REGISTRY: dict[str, Builder] = {
     "web": WebSource,
     "local": LocalSource,
     "radar": RadarSource,
-    "granola": GranolaSource,
 }
 
 

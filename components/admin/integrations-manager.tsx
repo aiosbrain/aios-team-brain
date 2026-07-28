@@ -229,7 +229,6 @@ function RolePicker(props: {
 
 type IntegrationType =
   | "github"
-  | "granola"
   | "slack"
   | "wise"
   | "linear"
@@ -252,7 +251,7 @@ export interface IntegrationRow {
 // Data-source connectors shown in the generic "Add an integration" form. Provider keys get their
 // own panel (PROVIDER_TYPES); GitHub gets its own repo panel (GithubReposPanel) — so both are
 // excluded here to avoid two places to manage the same thing.
-const TYPES: IntegrationType[] = ["slack", "notion", "granola", "linear", "plane", "wise"];
+const TYPES: IntegrationType[] = ["slack", "notion", "linear", "plane", "wise"];
 
 // LLM provider API keys — one set for the team, managed in the dedicated "AI provider keys" panel.
 const PROVIDER_TYPES = ["anthropic", "openai", "google"] as const;
@@ -268,7 +267,6 @@ const PROVIDER_META: Record<ProviderType, { label: string; note: string; placeho
 const SELECTION_HINT: Partial<Record<IntegrationType, string>> = {
   slack: "channel IDs (comma-separated)",
   github: "repos owner/name (comma-separated)",
-  granola: "match keywords (comma-separated)",
   // The Notion connector (ingestion/aios_ingest/sources/notion.py) needs a token (stored as the secret)
   // plus EITHER page ids or a database id. Pages are the common case, so that's what this field holds;
   // a `databaseId=<id>` entry is accepted for the whole-database case.
@@ -282,7 +280,6 @@ function summarizeConfig(type: IntegrationType, config: Record<string, unknown>)
   const arr = (k: string) => (Array.isArray(config[k]) ? (config[k] as string[]) : []);
   if (type === "slack") return `${arr("channelIds").length} channel(s)`;
   if (type === "github") return `${arr("repos").length} repo(s)`;
-  if (type === "granola") return `${arr("matchKeywords").length} keyword(s)`;
   if (type === "notion") {
     if (config.databaseId) return `database ${config.databaseId}`;
     return `${arr("pageIds").length} page(s)`;

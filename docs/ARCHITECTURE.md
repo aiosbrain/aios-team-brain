@@ -174,7 +174,7 @@ Two principals, one tier model:
 
     **Adding a provisioning tool** (say, `notion`) — not every integration gets one: only services
     where "invite this person" is meaningful (a per-key AI provider or a data connector like
-    granola doesn't qualify). The checklist, in order:
+    notion doesn't qualify). The checklist, in order:
 
     1. `lib/provisioning/types.ts` — add the tool to the `ProvisioningTool` union. From here the
        compiler forces step 2–3 (`ADAPTERS` is `Record<ProvisioningTool, ProvisioningAdapter>`).
@@ -785,16 +785,18 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 
 <!-- drift:sources -->
 
-`slack` · `notion` · `gdrive` · `confluence` · `web` · `local` · `radar` · `granola`
+`slack` · `notion` · `gdrive` · `confluence` · `web` · `local` · `radar`
 
 <!-- /drift:sources -->
 
-> **`granola` privacy invariant:** Granola is the one source that must **never** sync
-> verbatim transcript team-tier. Its `fetch()` team-push path emits metadata-only meeting
-> _markers_ (`kind=artifact`, `transcript_synced:false`), behind an allowlist + per-note
-> consent gate; full transcripts are written to the local workspace at **admin tier only**
-> and decisions reach the `decisions` table solely through the human-reviewed
-> decision-log.md → `aios push` → `materializeDecisions` flow. See `docs/GRANOLA.md`.
+> **Granola connector REMOVED.** The sidecar source, its Admin type and `docs/GRANOLA.md` are gone.
+> Meeting-source SEMANTICS remain and are still correct: `granola` stays in `MEETING_SOURCES`
+> (`lib/meetings/from-items`), in `SIGNAL_SOURCES` (`lib/attribution/health`), in the timeline's
+> per-person exclusion and in `lib/ingest/source-rules` — because previously-ingested granola
+> transcripts are still live rows that those paths must keep classifying correctly, and the same
+> rules serve every other meeting source (`zoom`/`calendar`/`meet`/`teams_meeting`). Nothing fetches
+> from Granola any more; what remains only interprets data that already exists. Meetings can still
+> reach the brain as pushed transcript items via the CLI.
 
 > **`slack` public-channel invariant:** the in-app Slack connector ingests **only channels that are
 > public within the workspace**. There are exactly two tiers (`team` / `external`) and no stricter

@@ -42,10 +42,10 @@ describe("validateIntegrationConfig()", () => {
   });
 
   it("rejects a secret-like key nested inside an allowed structure", () => {
-    // even within github.repos shape, a nested token key is caught by the recursive scan
+    // even within an allowed shape, a nested token key is caught by the recursive scan
     expect(() =>
-      validateIntegrationConfig("granola", {
-        participantEmails: [],
+      validateIntegrationConfig("slack", {
+        channelIds: [],
         secretToken: "x",
       }),
     ).toThrow(/secret-like key/i);
@@ -56,23 +56,6 @@ describe("validateIntegrationConfig()", () => {
       repos: Array.from({ length: 5000 }, (_, i) => `org/repo-${i}`),
     };
     expect(() => validateIntegrationConfig("github", huge)).toThrow(/exceeds/);
-  });
-
-  it("validates email shape in granola participant allowlist", () => {
-    expect(() =>
-      validateIntegrationConfig("granola", {
-        participantEmails: ["not-an-email"],
-      }),
-    ).toThrow(IntegrationConfigError);
-    expect(
-      validateIntegrationConfig("granola", {
-        participantEmails: ["john@aios.dev"],
-        matchKeywords: ["AIOS"],
-      }),
-    ).toEqual({
-      participantEmails: ["john@aios.dev"],
-      matchKeywords: ["AIOS"],
-    });
   });
 
   it("accepts Plane and Linear PM sync mapping hints", () => {

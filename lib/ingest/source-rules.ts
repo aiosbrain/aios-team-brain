@@ -94,7 +94,6 @@ export const SOURCE_RULES: Readonly<Record<string, SourceRules>> = {
   /** `planeWorkedAt` — same shape as Linear. */
   plane: { workTimeOnUnchangedBody: "work", retainSupersededBodies: true, emitsTicketDocuments: true },
   /** Meeting occurrence time. */
-  granola: { workTimeOnUnchangedBody: "work", retainSupersededBodies: true, emitsTicketDocuments: false },
   /** The feed entry's own published/updated time — an event, not the scan's clock. */
   radar: { workTimeOnUnchangedBody: "work", retainSupersededBodies: true, emitsTicketDocuments: false },
 

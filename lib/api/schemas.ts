@@ -383,7 +383,6 @@ export function errorResponse(code: string, message: string, status: number) {
 
 export const INTEGRATION_TYPES = [
   "github",
-  "granola",
   "slack",
   // Notion: the token is the SECRET; the non-secret selection is which pages (or one database) to pull.
   // The connector already exists (ingestion/aios_ingest/sources/notion.py + notion_authors.py, which
@@ -468,16 +467,6 @@ const integrationConfigSchemas: Record<IntegrationType, z.ZodType> = {
       // Member-onboarding provisioning: a standing workspace join link surfaced to new members
       // (Slack Free/Pro has no invite API — link mode only). NON-secret, so it lives in config.
       inviteLink: z.string().url().max(500).optional(),
-    })
-    .strict(),
-  granola: z
-    .object({
-      // Privacy allowlist: only meetings matching these are candidates for decision extraction.
-      matchKeywords: z.array(z.string().min(1).max(120)).max(50).default([]),
-      participantEmails: z
-        .array(z.string().email().max(200))
-        .max(50)
-        .default([]),
     })
     .strict(),
   wise: z.object({ profileId: z.string().max(64).optional() }).strict(),
