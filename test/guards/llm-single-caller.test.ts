@@ -23,6 +23,12 @@ const ALLOWLIST = new Set([
   join("lib", "llm", "complete.ts"),
   join("lib", "query", "claude.ts"),
   join("lib", "chat", "title.ts"),
+  // The graph LLM proxy. Admitted for the OPPOSITE reason to a bypass: the Graphiti container cannot
+  // read this database, so before it existed the graph ran on a second provider key that no setting
+  // in this app governed — and that key silently ran out of quota. This module is what forces the
+  // graph leg through the same console settings as everything else, and the assertion below still
+  // holds it to resolving via `selectLlmBackend`.
+  join("lib", "llm", "graph-proxy.ts"),
 ]);
 const RAW_TRANSPORT = [/new\s+Anthropic\s*\(/, /chat\/completions/];
 
