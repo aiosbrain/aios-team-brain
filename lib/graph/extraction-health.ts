@@ -28,6 +28,17 @@ import { neo4jConfigured, runRead } from "./neo4j";
  * appears? Both halves are kept — zero-facts catches a broken install, the lag catches a working
  * install that stopped.
  *
+ * WHAT THIS STILL CANNOT SEE — stated because the failure being corrected was over-claiming:
+ *   • PARTIAL failure. Any single success inside the lag budget reads green, so a 90%-failure rate is
+ *     invisible. Graphiti also writes `IS_DUPLICATE_OF` bookkeeping edges with a fresh `created_at`
+ *     (~26% of the graph) — the same behaviour that protects against false positives means a run
+ *     producing no real knowledge still looks alive.
+ *   • SCOPE ASYMMETRY. Episodes are counted per team; facts are counted globally (the fact probe is
+ *     deliberately not tier-scoped). On an instance with more than one group, one group's extraction
+ *     dying is masked by another group's fresh facts.
+ *   • A missing/unparseable timestamp disarms the recency half silently — safe, but invisible.
+ *   • Detection lags by the budget (6h) by construction.
+ *
  * Best-effort: nulls/`stalled:false` on any error so it never breaks a page render.
  */
 
@@ -105,32 +116,55 @@ export async function countGraphFacts(): Promise<number | null> {
  * Unfiltered, like `countGraphFacts`: an `IS_DUPLICATE_OF` edge is noise for display but is still
  * proof the extractor ran, which is the only question here.
  */
+/**
+ * Parse a timestamp from either probe into epoch ms, or null.
+ *
+ * Pure and exported because this seam has two different producers and no compiler between them:
+ * Postgres `timestamptz::text` (`2026-07-28 12:34:56.789+00`) and Neo4j `toString(datetime)`
+ * (`2026-07-28T12:34:56.789000000Z`). If either format shifts — a Neo4j upgrade emitting a bracketed
+ * named zone parses to NaN — the recency check silently disarms while every other test stays green.
+ * That is the same self-disarming class as the bug this file was rewritten to fix, so the formats are
+ * pinned in the unit tier rather than assumed.
+ */
+export function parseProbeTimestamp(raw: string | null | undefined): number | null {
+  if (!raw) return null;
+  const ms = Date.parse(raw);
+  return Number.isFinite(ms) ? ms : null;
+}
+
 export async function newestFactAtMs(): Promise<number | null> {
   if (!neo4jConfigured()) return null;
   try {
     const rows = await runRead<{ at: string | null }>(
       "MATCH ()-[r:RELATES_TO]->() WHERE r.created_at IS NOT NULL RETURN toString(max(r.created_at)) AS at"
     );
-    const at = rows[0]?.at ?? null;
-    if (!at) return null;
-    const ms = Date.parse(at);
-    return Number.isFinite(ms) ? ms : null;
+    return parseProbeTimestamp(rows[0]?.at ?? null);
   } catch {
     return null;
   }
 }
 
-/** When this team last had an episode projected — the other half of the lag comparison. */
-async function newestEpisodeAtMs(teamId: string): Promise<number | null> {
+/**
+ * When this team last actually PUSHED an episode — the other half of the lag comparison.
+ *
+ * `content_sha256 <> ''` is load-bearing, not tidiness. Two paths in `lib/graph/project.ts` bump
+ * `projected_at` while POSTing nothing to Graphiti: the blanking/redaction path and the tier-vacate
+ * path, both of which park the row on a `""` sentinel sha. A plain `max(projected_at)` therefore
+ * counts a redaction wave as "an episode just landed" — and with no extraction to follow it, the lag
+ * check would go red on a completely healthy extractor six hours later. That is the cry-wolf failure
+ * this whole probe is supposed to avoid, so it must not be the probe's own first bug. Real pushes
+ * always store a 64-char digest (even `sha("")`), so the sentinel is an unambiguous discriminator.
+ *
+ * Exported so the retrieval-health card compares against the SAME quantity — two implementations of
+ * one number is how one surface keeps a bug the other one fixed.
+ */
+export async function newestEpisodeAtMs(teamId: string): Promise<number | null> {
   try {
     const res = await runSql<{ at: string | null }>(
-      "select max(projected_at)::text as at from graph_episodes where team_id = $1",
+      "select max(projected_at)::text as at from graph_episodes where team_id = $1 and content_sha256 <> ''",
       [teamId]
     );
-    const at = res.rows[0]?.at ?? null;
-    if (!at) return null;
-    const ms = Date.parse(at);
-    return Number.isFinite(ms) ? ms : null;
+    return parseProbeTimestamp(res.rows[0]?.at ?? null);
   } catch {
     return null;
   }

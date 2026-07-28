@@ -1,6 +1,8 @@
 import { describe, it, expect } from "vitest";
 import {
   deriveGraphExtractionStalled,
+  parseProbeTimestamp,
+  EXTRACTION_LAG_BUDGET_MS,
   MIN_EPISODES_FOR_EXTRACTION_SIGNAL,
 } from "@/lib/graph/extraction-health";
 
@@ -123,5 +125,50 @@ describe("deriveGraphExtractionStalled — extraction that STOPPED, not extracti
     expect(
       deriveGraphExtractionStalled({ episodes: 3, facts: 1, newestEpisodeAtMs: at(0), newestFactAtMs: at(50) })
     ).toBe(false);
+  });
+});
+
+/**
+ * The parsing seam. Two producers, no compiler between them: Postgres `timestamptz::text` and Neo4j
+ * `toString(datetime)`. If either format shifts, the recency check disarms itself silently while every
+ * other test here stays green — the exact class of bug this file was rewritten to fix. So the real
+ * wire formats are pinned rather than assumed.
+ */
+describe("parseProbeTimestamp — the formats the two probes actually emit", () => {
+  it("parses Postgres timestamptz::text, with any offset", () => {
+    expect(parseProbeTimestamp("2026-07-28 12:34:56.789+00")).toBe(Date.parse("2026-07-28T12:34:56.789Z"));
+    expect(parseProbeTimestamp("2026-07-28 05:34:56.789-07")).toBe(Date.parse("2026-07-28T12:34:56.789Z"));
+    expect(parseProbeTimestamp("2026-07-28 18:04:56.789+05:30")).toBe(Date.parse("2026-07-28T12:34:56.789Z"));
+  });
+
+  it("parses Neo4j toString(datetime), including nanosecond precision", () => {
+    expect(parseProbeTimestamp("2026-07-28T12:34:56.789000000Z")).toBe(Date.parse("2026-07-28T12:34:56.789Z"));
+    expect(parseProbeTimestamp("2026-07-28T12:34:56.789+00:00")).toBe(Date.parse("2026-07-28T12:34:56.789Z"));
+  });
+
+  it("returns null — never NaN — for absent or unparseable input", () => {
+    // A bracketed named zone is the realistic future break (a Neo4j upgrade could emit it); it must
+    // read as "don't know", which disarms the check, not as a bogus epoch that fabricates a stall.
+    expect(parseProbeTimestamp("2026-07-28T12:34:56+01:00[Europe/London]")).toBeNull();
+    expect(parseProbeTimestamp(null)).toBeNull();
+    expect(parseProbeTimestamp(undefined)).toBeNull();
+    expect(parseProbeTimestamp("")).toBeNull();
+    expect(parseProbeTimestamp("not a date")).toBeNull();
+  });
+});
+
+describe("the lag budget boundary", () => {
+  const base = { episodes: 1243, facts: 400, newestEpisodeAtMs: 1_000_000_000_000 };
+  it("is exclusive: exactly at budget is healthy, one ms past is stalled", () => {
+    expect(
+      deriveGraphExtractionStalled({ ...base, newestFactAtMs: base.newestEpisodeAtMs - EXTRACTION_LAG_BUDGET_MS })
+    ).toBe(false);
+    expect(
+      deriveGraphExtractionStalled({ ...base, newestFactAtMs: base.newestEpisodeAtMs - EXTRACTION_LAG_BUDGET_MS - 1 })
+    ).toBe(true);
+  });
+
+  it("a fact NEWER than the newest episode is healthy, not negative-lag nonsense", () => {
+    expect(deriveGraphExtractionStalled({ ...base, newestFactAtMs: base.newestEpisodeAtMs + 60_000 })).toBe(false);
   });
 });
