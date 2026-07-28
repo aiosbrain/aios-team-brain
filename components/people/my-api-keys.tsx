@@ -4,6 +4,7 @@ import { useState, useTransition } from "react";
 import { KeyRound, Copy, Check } from "lucide-react";
 import { issueMyApiKey, revokeMyApiKey } from "@/app/t/[team]/people/[handle]/actions";
 import { timeAgo } from "@/components/format";
+import { CopySnippet } from "@/components/copy-snippet";
 
 export interface MyKeyRow {
   id: string;
@@ -20,7 +21,15 @@ export interface MyKeyRow {
  * generating a secret and relaying it over Slack/1Password, you generate your own here once
  * you've signed in via your invite email.
  */
-export function MyApiKeys({ teamSlug, keys }: { teamSlug: string; keys: MyKeyRow[] }) {
+export function MyApiKeys({
+  teamSlug,
+  keys,
+  agentPrompt,
+}: {
+  teamSlug: string;
+  keys: MyKeyRow[];
+  agentPrompt?: string;
+}) {
   return (
     <section className="prism-card flex flex-col gap-3 p-5">
       <div className="flex items-center justify-between">
@@ -33,6 +42,18 @@ export function MyApiKeys({ teamSlug, keys }: { teamSlug: string; keys: MyKeyRow
         Used by the <code>aios</code> CLI to sync this workspace. Secrets are hashed at rest and
         shown exactly once at issue time.
       </p>
+      {agentPrompt ? (
+        <details className="rounded-lg border border-border-subtle px-4 py-3">
+          <summary className="cursor-pointer text-sm font-medium text-ink-secondary">
+            Reopen workstation setup
+          </summary>
+          <p className="mb-3 mt-2 text-xs text-ink-tertiary">
+            Paste this into your coding agent. It inspects first and pauses before updates,
+            secrets, origin trust, or sharing.
+          </p>
+          <CopySnippet label="agent prompt" text={agentPrompt} />
+        </details>
+      ) : null}
       {keys.length ? (
         <div className="overflow-x-auto rounded-lg border border-border-subtle">
           <table className="w-full text-sm">
@@ -70,7 +91,7 @@ export function MyApiKeys({ teamSlug, keys }: { teamSlug: string; keys: MyKeyRow
         </div>
       ) : (
         <p className="rounded-lg border border-dashed border-border-subtle px-4 py-6 text-center text-sm text-ink-tertiary">
-          No keys yet — generate one to run <code>aios push</code> from your workspace.
+          No keys yet — generate one, then let the guided setup validate your workstation.
         </p>
       )}
     </section>

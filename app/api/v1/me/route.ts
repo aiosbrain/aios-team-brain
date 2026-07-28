@@ -1,5 +1,5 @@
 import { NextRequest } from "next/server";
-import { authenticateApiKey } from "@/lib/api/auth";
+import { authenticateApiKey, markApiKeyUsed } from "@/lib/api/auth";
 import { errorResponse } from "@/lib/api/schemas";
 
 export const runtime = "nodejs";
@@ -8,8 +8,11 @@ export const runtime = "nodejs";
 // Lets a client (e.g. the cockpit) tailor the UI — e.g. only leads/admins see the
 // team-blueprint publish surface.
 export async function GET(req: NextRequest) {
-  const auth = await authenticateApiKey(req);
+  const auth = await authenticateApiKey(req, { recordUsage: false });
   if (!auth) return errorResponse("unauthorized", "invalid API key or team", 401);
+  if (!(await markApiKeyUsed(auth.apiKeyId))) {
+    return errorResponse("internal_error", "could not record validated connection", 500);
+  }
   return Response.json({
     actor: auth.actorHandle,
     role: auth.memberRole,

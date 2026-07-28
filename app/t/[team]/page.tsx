@@ -66,17 +66,18 @@ function SetupChecklist({ teamSlug }: { teamSlug: string }) {
       </Link>
     </span>,
     <span key="2">
-      Each teammate generates their own API key from their profile page once signed in (or an admin can issue one for them in{" "}
-      <Link href={`/t/${teamSlug}/admin/keys`} className="text-violet underline underline-offset-2">
-        Admin → Keys
-      </Link>
-      )
+      Give each teammate the workstation setup prompt after they sign in. It inspects first
+      and offers Personal / Join / Create without changing anything.
     </span>,
     <span key="3">
-      Run <code className="rounded bg-surface-overlay px-1 py-0.5 font-mono text-xs">aios push</code> from your project repo
+      Each teammate generates their own API key, approves the exact Brain origin, and
+      validates their identity with{" "}
+      <code className="rounded bg-surface-overlay px-1 py-0.5 font-mono text-xs">GET /api/v1/me</code>
     </span>,
     <span key="4">
-      Ask your first question in{" "}
+      After onboarding, preview the first share with{" "}
+      <code className="rounded bg-surface-overlay px-1 py-0.5 font-mono text-xs">aios push --dry-run</code>,
+      then ask your first question in{" "}
       <Link href={`/t/${teamSlug}/query`} className="text-violet underline underline-offset-2">
         Query
       </Link>
@@ -103,7 +104,7 @@ function SetupChecklist({ teamSlug }: { teamSlug: string }) {
             </li>
           ))}
         </ol>
-        <CopySnippet text="export AIOS_API_KEY=aios_…_… && aios push" />
+        <CopySnippet text="aios onboard --inspect --json" />
       </div>
     </div>
   );
@@ -130,46 +131,43 @@ export default async function TeamHome({
   const memberId = me.id;
   const firstName = me.displayName.trim().split(/\s+/)[0] || "there";
 
-  // Both counts are independent — run them together. itemCount is the tier-filtered visible-items
-  // count (no RLS backstop in postgres mode); ownKeyCount is whether this member has EVER issued
-  // their own key (the proxy for "has their workstation setup even started").
-  const [{ count: itemCount }, { count: ownKeyCount }] = await Promise.all([
+  // Both reads are independent — run them together. itemCount is tier-filtered (there is no
+  // RLS backstop); last_used_at on an active own key proves /me or another authenticated
+  // request actually succeeded. Merely issuing a key is not a completed workstation setup.
+  const [{ count: itemCount }, { data: ownKeyRows }] = await Promise.all([
     visibleItems(db.from("items").select("id", { count: "exact", head: true }).eq("team_id", team.id), tier),
-    db.from("api_keys").select("id", { count: "exact", head: true }).eq("team_id", team.id).eq("member_id", memberId),
+    db
+      .from("api_keys")
+      .select("id, key_id, name, created_at, last_used_at, revoked_at")
+      .eq("team_id", team.id)
+      .eq("member_id", memberId)
+      .order("created_at", { ascending: false }),
   ]);
+  const keys = (ownKeyRows ?? []) as MyKeyRow[];
+  const hasConnectedKey = keys.some((key) => !key.revoked_at && !!key.last_used_at);
+  const agentPrompt = buildAgentOnboardingPrompt({
+    teamSlug,
+    teamName: team.name,
+    brainUrl: (process.env.APP_URL ?? "").replace(/\/$/, ""),
+  });
 
-  const homeState = pickHomeState({ isAdmin, itemCount: itemCount ?? 0, hasOwnKey: (ownKeyCount ?? 0) > 0 });
+  const homeState = pickHomeState({ isAdmin, itemCount: itemCount ?? 0, hasConnectedKey });
 
   if (homeState === "admin-bootstrap") {
     return (
       <div className="mx-auto max-w-3xl pt-8">
         <h1 className="mb-6 text-2xl font-semibold text-ink">Pulse</h1>
-        <SetupChecklist teamSlug={teamSlug} />
-      </div>
-    );
-  }
-
-  if (homeState === "member-setup") {
-    const { data: keyRows } = await db
-      .from("api_keys")
-      .select("id, key_id, name, created_at, last_used_at, revoked_at")
-      .eq("team_id", team.id)
-      .eq("member_id", memberId)
-      .order("created_at", { ascending: false });
-
-    return (
-      <div className="mx-auto max-w-3xl pt-8">
-        <h1 className="mb-6 text-2xl font-semibold text-ink">Pulse</h1>
-        <WorkstationSetup
-          teamSlug={teamSlug}
-          firstName={firstName}
-          agentPrompt={buildAgentOnboardingPrompt({
-            teamSlug,
-            teamName: team.name,
-            brainUrl: (process.env.APP_URL ?? "").replace(/\/$/, ""),
-          })}
-          keys={(keyRows ?? []) as MyKeyRow[]}
-        />
+        <div className="flex flex-col gap-6">
+          <SetupChecklist teamSlug={teamSlug} />
+          {!hasConnectedKey ? (
+            <WorkstationSetup
+              teamSlug={teamSlug}
+              firstName={firstName}
+              agentPrompt={agentPrompt}
+              keys={keys}
+            />
+          ) : null}
+        </div>
       </div>
     );
   }
@@ -193,6 +191,15 @@ export default async function TeamHome({
         <h1 className="text-2xl font-semibold text-ink">Pulse</h1>
         <p className="mt-1 text-sm text-ink-tertiary">What your team is working on, and what the brain is learning.</p>
       </div>
+
+      {homeState === "member-setup" ? (
+        <WorkstationSetup
+          teamSlug={teamSlug}
+          firstName={firstName}
+          agentPrompt={agentPrompt}
+          keys={keys}
+        />
+      ) : null}
 
       <AskBar teamSlug={teamSlug} teamName={team.name} />
 
