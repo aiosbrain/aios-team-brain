@@ -85,7 +85,11 @@ export async function discoverOpportunitiesFromArcs(
   opts: DiscoverArcsOptions = {}
 ): Promise<DiscoverSummary> {
   const now = opts.now ?? new Date();
-  const arcs = opts.arcs ?? (await getArcs(db, teamId, teamSlug, tier, groups, keys));
+  // Discovery only needs the payload — an opportunity is derived from an arc's content, and a stale or
+  // degraded arc set produces fewer/older opportunities rather than wrong ones (each is reviewed before
+  // publish). Called out rather than silently destructured so a future author sees the envelope was
+  // considered and dropped on purpose, not missed.
+  const arcs = opts.arcs ?? (await getArcs(db, teamId, teamSlug, tier, groups, keys)).arcs;
 
   // Resolve every arc's evidence-item tiers in one pass so per-arc access is a pure in-memory calc.
   const allItemIds = arcs.flatMap((a) => a.evidence.map((e) => e.itemId).filter((id): id is string => !!id));

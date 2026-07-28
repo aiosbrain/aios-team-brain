@@ -39,7 +39,17 @@ export async function GET(req: NextRequest) {
   const tier = (me as { tier: "team" | "external" }).tier;
   const groups = visibleGroupIds(teamSlug, tier);
   const since = new Date(Date.now() - WINDOW_HOURS * 3600 * 1000).toISOString();
-  const { facts } = await recentFacts(groups, since, LIMIT);
+  const { facts, ok } = await recentFacts(groups, since, LIMIT);
 
-  return Response.json({ facts, as_of: new Date().toISOString(), window_hours: WINDOW_HOURS });
+  // `as_of` is honest here — this is a live Neo4j read, not a cache. The bug was `ok`: `recentFacts`
+  // already distinguishes "the window is genuinely quiet" from "the read FAILED" (its own comment says
+  // "treating as degraded, not as an empty window"), and the route dropped it — so a Neo4j outage
+  // rendered as a benign empty fact list. `stale` is structurally false for a live read.
+  return Response.json({
+    facts,
+    as_of: new Date().toISOString(),
+    stale: false,
+    degraded: !ok,
+    window_hours: WINDOW_HOURS,
+  });
 }

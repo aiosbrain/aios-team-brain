@@ -10,6 +10,7 @@ import { episodeGroupId, isExternalGroupId, type AccessTier } from "./group";
 import { attributedFactTexts, groundParticipants } from "./arc-attribution";
 import { resolveItemCredit } from "@/lib/attribution/contributor-credit";
 import { readArcCache, writeArcCache, ARC_CACHE_TTL_MS as CACHE_TTL_MS } from "./arc-cache";
+import { freshness, computedNow, type Freshness } from "@/lib/freshness";
 import { listArcCorrections, recordArcCorrections } from "./arc-corrections";
 import { arcIneligibleItemIds } from "./arc-eligibility";
 
@@ -864,6 +865,20 @@ export function evictArcMemoryCache(teamSlug: string): void {
  * panel. On that case we keep the prior value and DON'T refresh its timestamp, so the next view
  * retries until synthesis recovers. This is the guard that stops one bad LLM call from pinning the
  * Learning page empty for hours (2026-07 incident). Returns what's now authoritative for the key.
+ *
+ * Returns `computedAt` alongside, because "what's authoritative" is often NOT what was just computed:
+ * on both keep-the-prior branches the arcs handed back date from the earlier synthesis. A caller that
+ * assumed "commitArcs returned, so this is current" would re-create exactly the freshness lie R2 removes
+ * — one branch deep, where it is hardest to see. `computedAt` is never later than the computation it hands
+ * back (an untrustworthy result is deliberately backdated below), so it under-claims freshness rather than
+ * over-claiming it. One documented exception: on the `canReuseArcs` revalidation path the row is
+ * re-stamped `now()` over arcs the model produced hours earlier — defensible, because the inputs were just
+ * hash-verified unchanged (a 304, not a fresh synthesis), but it IS a re-stamp and predates this change.
+ *
+ * `untrustworthy` is returned too, and is BROADER than the caller's `opts.degraded`: it also covers H12's
+ * model-failure (empty arcs from a NON-empty fact set), which no input-degradation flag can see. Without
+ * it a timed-out recompute answers with the kept prior and `degraded: false` — "your correction landed"
+ * when it didn't.
  */
 export async function commitArcs(
   db: DbClient,
@@ -872,7 +887,7 @@ export async function commitArcs(
   next: NarrativeArc[],
   factsHash: string | null,
   opts: { degraded?: boolean } = {}
-): Promise<NarrativeArc[]> {
+): Promise<{ arcs: NarrativeArc[]; computedAt: number; untrustworthy: boolean }> {
   // ── Is this result trustworthy enough to serve for a full TTL? ────────────────────────────────────
   // Two ways it isn't, and both used to be committed as FRESH — which is the one state SWR can never
   // heal from, because it only re-fires on a stale row.
@@ -894,7 +909,7 @@ export async function commitArcs(
       console.warn(
         `[arcs] degraded synthesis for ${key}; keeping ${prior.arcs.length} cached arcs rather than overwriting them with a partial set`
       );
-      return prior.arcs;
+      return { arcs: prior.arcs, computedAt: prior.at, untrustworthy };
     }
   }
 
@@ -909,7 +924,7 @@ export async function commitArcs(
         console.warn(
           `[arcs] synthesis returned 0 arcs for ${key}; keeping ${prior.arcs.length} cached (${Math.round(ageMs / 3_600_000)}h old; likely transient)`
         );
-        return prior.arcs;
+        return { arcs: prior.arcs, computedAt: prior.at, untrustworthy };
       }
       // Prior is too old to keep trusting as "transient-failure cover": a persistently-empty synthesis
       // over this long is more likely GENUINE (quiet team, content deleted, graph reset, or the model
@@ -935,7 +950,7 @@ export async function commitArcs(
   }
   cache.set(key, { arcs: next, at, factsHash });
   await writeArcCache(db, teamId, key, next, factsHash, { retryAfterMs: untrustworthy ? UNTRUSTED_RETRY_AFTER_MS : undefined });
-  return next;
+  return { arcs: next, computedAt: at, untrustworthy };
 }
 
 /** The arcs currently cached for a key — in-memory first, then the persisted row. */
@@ -969,13 +984,22 @@ function refreshArcsInBackground(
       // fact-set-hash guard skip the LLM when nothing changed. Run the extra evidence-COHERENCE pass HERE
       // (background only — the route-bound cold-miss/correction paths can't afford the second LLM call).
       const { arcs, factsHash, degraded } = await synthesizeArcs(bg, teamId, groups, [], keys, BG_ARC_TIMEOUT_MS, prior, true);
-      await commitArcs(bg, teamId, key, arcs, factsHash, { degraded });
+      await commitArcs(bg, teamId, key, arcs, factsHash, { degraded }); // fire-and-forget: nobody awaits its freshness
     } catch (err) {
       console.error("[arcs] background refresh failed:", err instanceof Error ? err.message : err);
     } finally {
       refreshing.delete(key);
     }
   })();
+}
+
+/**
+ * Arcs plus how much they can be trusted (R2/M6). Beside the payload, not wrapping it, so `NarrativeArc[]`
+ * and everything that reads it are unchanged.
+ */
+export interface CachedArcs {
+  arcs: NarrativeArc[];
+  freshness: Freshness;
 }
 
 /**
@@ -993,29 +1017,46 @@ export async function getArcs(
   tier: AccessTier,
   groups: string[],
   keys: ProviderKeys
-): Promise<NarrativeArc[]> {
-  if (groups.length === 0) return [];
+): Promise<CachedArcs> {
+  // No visible groups is not a degraded read — it's a correct empty answer, computed now.
+  if (groups.length === 0) return { arcs: [], freshness: computedNow() };
   const key = groups.slice().sort().join(",");
   const now = Date.now();
 
-  // 1. In-memory (fastest, same process).
+  // 1. In-memory (fastest, same process). `at` is the PERSISTED computed_at (set below), not the time
+  //    this process happened to populate its map — so a warm process reports the row's age, not zero.
   const mem = cache.get(key);
-  if (mem && now - mem.at < CACHE_TTL_MS) return mem.arcs;
+  if (mem && now - mem.at < CACHE_TTL_MS) return { arcs: mem.arcs, freshness: freshness(mem.at, CACHE_TTL_MS, { now }) };
 
   // 2. Persistent cache (survives restart, shared across instances).
   const persisted = await readArcCache(db, teamId, key);
   if (persisted) {
     cache.set(key, { arcs: persisted.arcs, at: persisted.computedAt, factsHash: persisted.factsHash });
-    if (now - persisted.computedAt < CACHE_TTL_MS) return persisted.arcs;
+    const f = freshness(persisted.computedAt, CACHE_TTL_MS, { now });
+    if (!f.stale) return { arcs: persisted.arcs, freshness: f };
     // Stale — hand back the stale arcs immediately and refresh behind the request, passing the prior so
     // the refresh can skip the LLM if the facts are unchanged.
     refreshArcsInBackground(teamId, key, groups, keys, { arcs: persisted.arcs, factsHash: persisted.factsHash });
-    return persisted.arcs;
+    return { arcs: persisted.arcs, freshness: f };
   }
 
   // 3. Cold miss — first-ever load for this key. Compute inline so the user gets a real answer.
   const { arcs, factsHash, degraded } = await synthesizeArcs(db, teamId, groups, [], keys);
-  return commitArcs(db, teamId, key, arcs, factsHash, { degraded });
+  const committed = await commitArcs(db, teamId, key, arcs, factsHash, { degraded });
+  // `computedAt` comes from commitArcs, NOT from `Date.now()`: on a degraded synthesis it hands back the
+  // healthy PRIOR (H11), which is hours old, and stamping that "now" is the M6 lie one branch deep.
+  // `degraded` is reported from the SYNTHESIS rather than re-derived from the result, because those
+  // deliberately differ — the arcs served can be trustworthy while THIS computation failed, and that is
+  // what tells a consumer "the refresh you triggered didn't work" instead of looking silently fine.
+  return {
+    arcs: committed.arcs,
+    // `committed.untrustworthy`, not just `degraded`: H12's model-failure (empty arcs from a NON-empty
+    // fact set) is invisible to the input-degradation flag, and that is the commonest failure.
+    freshness: freshness(committed.computedAt, CACHE_TTL_MS, {
+      now: Date.now(),
+      degraded: degraded || committed.untrustworthy,
+    }),
+  };
 }
 
 /**
@@ -1033,8 +1074,8 @@ export async function recomputeArcs(
   keys: ProviderKeys,
   /** Who made the edit — stored for attribution. Null only if the caller genuinely has no member. */
   memberId: string | null = null
-): Promise<NarrativeArc[]> {
-  if (groups.length === 0) return [];
+): Promise<CachedArcs> {
+  if (groups.length === 0) return { arcs: [], freshness: computedNow() };
   const key = groups.slice().sort().join(",");
 
   // PERSIST FIRST, and let a failure surface. Everything else on this path degrades quietly because a
@@ -1053,7 +1094,15 @@ export async function recomputeArcs(
   );
 
   const { arcs: synthesized, factsHash, degraded } = await synthesizeArcs(db, teamId, groups, corrections.map((c) => c.corrected_text), keys);
-  const arcs = await commitArcs(db, teamId, key, synthesized, factsHash, { degraded });
+  const committed = await commitArcs(db, teamId, key, synthesized, factsHash, { degraded });
+  const arcs = committed.arcs;
+  // Same rule as getArcs: a recompute whose synthesis was degraded is REFUSED and the prior is kept
+  // (H11), so "the user clicked recompute" is not evidence the arcs are new. Report what commitArcs
+  // actually made authoritative, and carry `degraded` so the client can tell the edit didn't take.
+  const envelope = freshness(committed.computedAt, CACHE_TTL_MS, {
+    now: Date.now(),
+    degraded: degraded || committed.untrustworthy,
+  });
 
   // Project the corrections into the graph so they also read as facts to future extraction. This is now
   // a DERIVED copy — Postgres above is the record — so it stays best-effort: losing it costs some graph
@@ -1075,5 +1124,5 @@ export async function recomputeArcs(
       // writeback is best-effort — the recompute still returns fresh arcs
     }
   }
-  return arcs;
+  return { arcs, freshness: envelope };
 }

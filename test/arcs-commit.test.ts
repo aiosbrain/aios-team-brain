@@ -60,23 +60,64 @@ describe("commitArcs — an empty synthesis must never clobber a good cache", ()
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     // Unique key so the module-level in-memory cache from other tests can't leak in.
     const out = await commitArcs(db, "team-1", "keep-good-1", [], null);
-    expect(out.map((a) => a.title)).toEqual(["payments migration"]); // prior kept
+    expect(out.arcs.map((a) => a.title)).toEqual(["payments migration"]); // prior kept
     expect(upserts).toHaveLength(0); // NOT overwritten
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("keeping 1 cached"));
+    warn.mockRestore();
+  });
+
+  it("reports the PRIOR's computed_at when it keeps the prior — not the commit time (R2/M6)", async () => {
+    // The freshness contract, at the branch most likely to break it. When commitArcs refuses a bad
+    // synthesis and hands back the cached set, those arcs are hours old; a caller that assumed
+    // "commitArcs returned, so this is current" would re-create the exact M6 lie one branch deep —
+    // which is what `getArcs`/`recomputeArcs` build their envelope from.
+    const priorAt = Date.now() - 3 * HOUR;
+    const { db } = fakeDb([arc("payments migration")], priorAt);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const kept = await commitArcs(db, "team-1", "freshness-keep-prior", [], null);
+    expect(kept.arcs.map((a) => a.title)).toEqual(["payments migration"]);
+    expect(kept.computedAt).toBe(priorAt); // the prior's time, to the millisecond
+
+    // Same rule on the DEGRADED keep-prior branch (H11), which is a separate early return.
+    const { db: db2 } = fakeDb([arc("payments migration")], priorAt);
+    const keptDegraded = await commitArcs(db2, "team-1", "freshness-keep-degraded", [arc("noise")], "h9", {
+      degraded: true,
+    });
+    expect(keptDegraded.computedAt).toBe(priorAt);
+    warn.mockRestore();
+  });
+
+  it("never reports a computed_at LATER than the real computation (under-claim, never over-claim)", async () => {
+    // The invariant the whole envelope rests on: an untrustworthy result is deliberately BACKDATED so it
+    // retries soon, so `computedAt` can be earlier than the true moment of computation — but it must
+    // never be later, because that is the direction that makes stale data look current.
+    const { db } = fakeDb(null);
+    const before = Date.now();
+    const healthy = await commitArcs(db, "team-1", "freshness-healthy", [arc("a")], "h1");
+    expect(healthy.computedAt).toBeGreaterThanOrEqual(before);
+    expect(healthy.computedAt).toBeLessThanOrEqual(Date.now());
+
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { db: db2 } = fakeDb(null);
+    const degraded = await commitArcs(db2, "team-1", "freshness-degraded-cold", [arc("b")], "h1", {
+      degraded: true,
+    });
+    expect(degraded.computedAt).toBeLessThan(Date.now()); // pre-aged, i.e. under-claimed
     warn.mockRestore();
   });
 
   it("writes through when synthesis returns real arcs", async () => {
     const { db, upserts } = fakeDb(null);
     const out = await commitArcs(db, "team-1", "write-good-1", [arc("a"), arc("b")], "h1");
-    expect(out).toHaveLength(2);
+    expect(out.arcs).toHaveLength(2);
     expect(upserts).toHaveLength(1); // persisted
   });
 
   it("writes empty on a genuine cold miss (no prior to protect)", async () => {
     const { db, upserts } = fakeDb(null);
     const out = await commitArcs(db, "team-1", "cold-empty-1", [], null);
-    expect(out).toEqual([]);
+    expect(out.arcs).toEqual([]);
     expect(upserts).toHaveLength(1); // first-ever load may legitimately be empty
   });
 
@@ -88,7 +129,7 @@ describe("commitArcs — an empty synthesis must never clobber a good cache", ()
     const { db, upserts } = fakeDb(null);
     const out = await commitArcs(db, "team-1", "h12-model-failed", [], "facts-were-present");
 
-    expect(out).toEqual([]); // nothing to show right now — honest
+    expect(out.arcs).toEqual([]); // nothing to show right now — honest
     expect(upserts).toHaveLength(1);
     expectShortLived(upserts[0]);
   });
@@ -115,7 +156,7 @@ describe("commitArcs — an empty synthesis must never clobber a good cache", ()
     const out = await commitArcs(db, "team-1", "h11-degraded-prior", [arc("unattributed noise")], "h9", {
       degraded: true,
     });
-    expect(out.map((a) => a.title)).toEqual(["payments migration"]); // prior wins
+    expect(out.arcs.map((a) => a.title)).toEqual(["payments migration"]); // prior wins
     expect(upserts).toHaveLength(0);
     warn.mockRestore();
   });
@@ -136,7 +177,7 @@ describe("commitArcs — an empty synthesis must never clobber a good cache", ()
     const { db, upserts } = fakeDb([arc("ancient migration")], Date.now() - 50 * HOUR);
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const out = await commitArcs(db, "team-1", "old-prior-1", [], null);
-    expect(out).toEqual([]); // empty accepted
+    expect(out.arcs).toEqual([]); // empty accepted
     expect(upserts).toHaveLength(1); // written through, not kept
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("accepting empty"));
     warn.mockRestore();

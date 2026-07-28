@@ -27,7 +27,12 @@ export async function GET(req: NextRequest) {
   }
 
   try {
-    const days = await getCachedWorkTimeline(db, auth.teamId, auth.memberTier);
+    // Payload ONLY. `getCachedWorkTimeline` returns `{ days, freshness }`, and the freshness envelope is
+    // deliberately NOT on the v1 wire yet — putting it here is a brain-api change (it needs the 1.15 bump
+    // plus the canonical doc in aios-workspace). Destructured rather than passed through: `Response.json`
+    // takes `any`, so serializing the whole object type-checks and silently nests `days` one level deeper,
+    // breaking every v1.12 consumer (`aios timeline`, MCP). Caught by review, not by tsc.
+    const { days } = await getCachedWorkTimeline(db, auth.teamId, auth.memberTier);
     return Response.json({ window_days: 7, days });
   } catch (err) {
     return errorResponse("internal", err instanceof Error ? err.message : "timeline read failed", 500);
