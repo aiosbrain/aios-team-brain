@@ -15,6 +15,7 @@ from .local import LocalSource
 from .notion import NotionSource
 from .radar import RadarSource
 from .slack import SlackSource
+from .granola import GranolaSource
 from .web import WebSource
 
 Builder = Callable[..., Source]
@@ -24,8 +25,12 @@ Builder = Callable[..., Source]
 # one item, so running both double-ingests Slack under two incompatible units of knowledge. It is
 # kept in the registry (rather than removed) so an existing `type: "slack"` connection degrades to a
 # warning instead of failing the operator's entire sidecar run with "unknown source".
+# "granola" likewise stays registered as a RETIRED no-op (see GranolaSource). The connector was
+# removed, but live `connections.yaml` files still name it, and `build_source` raising "unknown
+# source" would abort the operator's entire one-shot sync — taking every connection after it down.
 _REGISTRY: dict[str, Builder] = {
     "slack": SlackSource,
+    "granola": GranolaSource,
     "notion": NotionSource,
     "gdrive": GoogleDriveSource,
     "confluence": ConfluenceSource,

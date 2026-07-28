@@ -785,9 +785,14 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 
 <!-- drift:sources -->
 
-`slack` · `notion` · `gdrive` · `confluence` · `web` · `local` · `radar`
+`slack` · `granola` · `notion` · `gdrive` · `confluence` · `web` · `local` · `radar`
 
 <!-- /drift:sources -->
+
+> This block is a REGISTRY DUMP, not a capability list — it is derived mechanically from the
+> sidecar's `_REGISTRY` by `scripts/check-docs-drift.mjs`. **`slack` and `granola` are RETIRED
+> no-ops** and ingest nothing; they stay registered only so a live `connections.yaml` naming them
+> degrades to a warning instead of aborting the operator's whole sync run.
 
 > **Granola connector REMOVED.** The sidecar source, its Admin type and `docs/GRANOLA.md` are gone.
 > Meeting-source SEMANTICS remain and are still correct: `granola` stays in `MEETING_SOURCES`
@@ -795,8 +800,14 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 > per-person exclusion and in `lib/ingest/source-rules` — because previously-ingested granola
 > transcripts are still live rows that those paths must keep classifying correctly, and the same
 > rules serve every other meeting source (`zoom`/`calendar`/`meet`/`teams_meeting`). Nothing fetches
-> from Granola any more; what remains only interprets data that already exists. Meetings can still
-> reach the brain as pushed transcript items via the CLI.
+> from Granola any more; what remains only interprets data that already exists. The sidecar keeps
+> `granola` REGISTERED as a retired no-op (as it does the deprecated `slack` source) so a live
+> `connections.yaml` still naming it degrades to a warning instead of aborting the operator's whole
+> sync run — and because it is still a registered source key, `test/guards/source-rules-complete`
+> requires it to keep a stated `source-rules` row. That row's three values are identical to
+> `sourceRules()`'s fallback default, which is why the previously-ingested items were unaffected
+> either way. Meetings can still reach
+> the brain as pushed transcript items via the CLI.
 
 > **`slack` public-channel invariant:** the in-app Slack connector ingests **only channels that are
 > public within the workspace**. There are exactly two tiers (`team` / `external`) and no stricter

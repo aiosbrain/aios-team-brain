@@ -146,14 +146,15 @@ All connector APIs are free. Cost shows up downstream in embeddings and LLM spen
 | **Linear** | API key | Linear → Settings → API → Personal API keys | Admin UI **only** |
 | **Plane** | API token | Plane → Workspace settings → API tokens | Admin UI **only** |
 | **Notion** | Internal integration token | notion.so/my-integrations | **Sidecar** `.env` (`NOTION_TOKEN`) |
-| **Confluence** | API token **plus** `CONFLUENCE_USERNAME` | Atlassian account | **Sidecar** `.env` (`CONFLUENCE_API_TOKEN` + `CONFLUENCE_USERNAME`) — the reader needs both and raises without them |
+| **Confluence** | `CONFLUENCE_USERNAME` (your email) + `CONFLUENCE_PASSWORD` (an API token) for Atlassian Cloud | Atlassian account | **Sidecar** `.env`. The reader takes `CONFLUENCE_API_TOKEN` **alone** OR username+password — never both; with the token set it ignores the username, which on Cloud 401s at request time rather than failing loudly |
 | **Google Drive** | Service-account JSON key | Google Cloud Console | **Sidecar** `connections.yaml` (path option) |
 | **RSS/Radar**, **Web**, **Local files** | none | — | **Sidecar** `connections.yaml` |
 
 **Maturity, honestly.** Slack, GitHub, Linear and Plane are the proven path — each has a real runner
 wired into the scheduler and unit coverage. **Notion, Google Drive and Confluence are wired but
-unproven**: the code is real and registered, but none has a `connections.yaml` example or a test of
-its `fetch()`, so expect to debug your first run. Google Drive's watch-channel *renewal* advertised in
+unproven**: the code is real and registered, but none has a test of its `fetch()`, and Confluence
+has no `connections.yaml` example either (Notion and Google Drive do — see
+`ingestion/connections.yaml.example`). Expect to debug your first run. Google Drive's watch-channel *renewal* advertised in
 `ingestion/README.md` is never constructed by `aios-ingest schedule` — Drive is pull-on-a-schedule
 only. `gdrive`/`confluence`/`web`/`local`/`radar` cannot be stored as brain integrations at all (the
 `integrations.type` CHECK has no such values) — they are `connections.yaml`-only by construction.
