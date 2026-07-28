@@ -3,10 +3,36 @@
 All notable changes to AIOS Team Brain are documented here. Dates are ISO-8601.
 
 The Brain API sync contract (`docs/brain-api.md` in aios-workspace) is versioned
-separately; it remains **v1** for this release. `ce_band` is an additive **v1.3**
-field on the existing `POST /api/v1/metrics` endpoint.
+separately. The current member-facing major remains **v1**, at additive document
+revision **v1.14**.
 
 ## [Unreleased]
+
+## [0.8.0] — 2026-07-28
+
+### Added
+
+- **Onboarding V2 connection validation** — `GET /api/v1/me` is the canonical
+  proof that an approved Brain origin and API key belong to the expected member
+  and team.
+- **Expanded team context surfaces** — additive v1 contract capabilities for
+  subscriptions, company graph, timeline, attribution, task-key lookup,
+  transcript facts, and stakeholder mentions.
+
+### Changed
+
+- Workstation setup remains discoverable for new members and active teams without
+  blocking access to Pulse. Personal and Create remain valid Workspace outcomes.
+- A successful onboarding validation durably records API-key usage so setup
+  completion survives navigation and later sessions.
+
+### Fixed
+
+- Ordinary API authentication stays available if non-critical usage telemetry
+  fails; `/me` reports a persistence failure as a server error instead of a
+  false invalid-key response.
+- Architecture documentation now points at the landed Brain API v1.14 revision
+  instead of calling it outstanding.
 
 ## [0.7.0] — 2026-07-04
 
