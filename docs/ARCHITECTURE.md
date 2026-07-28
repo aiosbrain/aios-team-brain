@@ -230,6 +230,21 @@ Two principals, one tier model:
 - **Tiers** — `team` (sees all) vs `external` (sees only external). `admin`/`private`
   are rejected with **422** at the API and never reach the database.
 
+**Workstation onboarding state.** Pulse chooses its onboarding treatment through the pure
+`lib/dashboard/home-state.pickHomeState` decision. A generated key is not completion:
+an active own key needs a non-null `api_keys.last_used_at`. `/api/v1/me` persists that
+marker before returning success and reports a server failure—not a false invalid-key
+response—if persistence fails; ordinary API usage records the same telemetry without
+making an otherwise valid request depend on it. Until connected, active teams show
+`WorkstationSetup` above the normal, still-usable Pulse; Personal and Create remain valid
+outcomes and never trap a member away from team context. Admins on an empty team see the
+team bootstrap checklist first, with the same workstation guide alongside it until
+connected. The prompt is built only by
+`lib/onboarding/agent-prompt` from authenticated team context; it is inspect-first,
+requires human approval for updates and canonical-origin trust, and never pushes during
+onboarding. The member's own profile keeps a persistent “Reopen workstation setup”
+disclosure after Pulse transitions to the dashboard.
+
 **Uniform magic-link response.** `POST /api/auth/request-magic-link` returns 200 `{ ok: true }` for
 every syntactically valid email (invalid payloads still return 422; per-IP flooding returns 429). It
 schedules member lookup, token issuance, and delivery with Next.js `after()`, so recognized and

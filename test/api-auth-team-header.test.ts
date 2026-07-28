@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const h = vi.hoisted(() => ({
   audit: vi.fn(),
   key: null as null | Record<string, unknown>,
+  updateError: null as null | { message: string },
 }));
 
 vi.mock("server-only", () => ({}));
@@ -19,7 +20,7 @@ vi.mock("@/lib/db/admin", () => ({
         data: table === "api_keys" ? h.key : null,
       }));
       chain.then = (resolve: (value: unknown) => unknown) =>
-        Promise.resolve(resolve({ data: null }));
+        Promise.resolve(resolve({ data: null, error: h.updateError }));
       return chain;
     },
   }),
@@ -40,6 +41,7 @@ function request(team?: string) {
 describe("member API key team identity", () => {
   beforeEach(() => {
     h.audit.mockReset().mockResolvedValue(undefined);
+    h.updateError = null;
     h.key = {
       id: "api-key-row-1",
       team_id: TEAM_ID,
@@ -94,5 +96,23 @@ describe("member API key team identity", () => {
       tier: "team",
       team: TEAM_ID,
     });
+  });
+
+  it("reports a server failure, not a false bad-key response, when /me cannot persist completion", async () => {
+    h.updateError = { message: "write failed" };
+
+    const response = await getMe(request() as Parameters<typeof getMe>[0]);
+
+    expect(response.status).toBe(500);
+    expect(h.audit).not.toHaveBeenCalled();
+  });
+
+  it("keeps ordinary API authentication available when usage telemetry fails", async () => {
+    h.updateError = { message: "write failed" };
+
+    const auth = await authenticateApiKey(request());
+
+    expect(auth?.actorHandle).toBe("alex");
+    expect(h.audit).not.toHaveBeenCalled();
   });
 });

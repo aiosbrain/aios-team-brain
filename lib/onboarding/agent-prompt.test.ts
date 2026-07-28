@@ -16,7 +16,7 @@ const contract = JSON.parse(
     ),
     "utf8",
   ),
-) as { requiredMarkers: string[] };
+) as { version: number; requiredMarkers: string[]; forbiddenMarkers: string[] };
 
 describe("buildAgentOnboardingPrompt", () => {
   it("uses the authenticated dashboard's known team context without treating it as approved", () => {
@@ -74,8 +74,11 @@ describe("buildAgentOnboardingPrompt", () => {
       teamName: "Acme",
       brainUrl: "https://brain.example.com/t/acme",
     });
+    expect(contract.version).toBe(2);
     for (const marker of contract.requiredMarkers)
       expect(prompt).toContain(marker);
+    for (const marker of contract.forbiddenMarkers)
+      expect(prompt).not.toContain(marker);
     expect(prompt).toMatch(/team_id.*optional/i);
     expect(prompt).not.toMatch(/--team-id\s+acme/);
   });

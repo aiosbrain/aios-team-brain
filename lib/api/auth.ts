@@ -14,12 +14,27 @@ export type ApiAuth = {
   email: string | null;
 };
 
+export async function markApiKeyUsed(apiKeyId: string): Promise<boolean> {
+  try {
+    const { error } = await adminClient()
+      .from("api_keys")
+      .update({ last_used_at: new Date().toISOString() })
+      .eq("id", apiKeyId);
+    return !error;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Bearer key auth for the sync API. Key format: aios_<key_id>_<secret>.
  * We look up by key_id and compare sha256(secret) with timingSafeEqual.
  * Returns null on any failure (caller responds 401); failures are audited.
  */
-export async function authenticateApiKey(req: Request): Promise<ApiAuth | null> {
+export async function authenticateApiKey(
+  req: Request,
+  { recordUsage = true }: { recordUsage?: boolean } = {},
+): Promise<ApiAuth | null> {
   const header = req.headers.get("authorization") || "";
   const teamHeader = req.headers.get("x-aios-team") || "";
   const m = header.match(/^Bearer\s+aios_([A-Za-z0-9]+)_([A-Za-z0-9_-]+)$/);
@@ -63,12 +78,9 @@ export async function authenticateApiKey(req: Request): Promise<ApiAuth | null> 
     return fail("team_mismatch");
   }
 
-  // fire-and-forget last_used_at
-  void db
-    .from("api_keys")
-    .update({ last_used_at: new Date().toISOString() })
-    .eq("id", key.id)
-    .then(() => {});
+  // Usage telemetry must not make otherwise-valid API requests fail. The /me validation
+  // route opts out and persists this marker synchronously as its explicit contract.
+  if (recordUsage) void markApiKeyUsed(key.id);
 
   return {
     teamId: key.team_id,

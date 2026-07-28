@@ -15,6 +15,7 @@ import { ContextEditor } from "@/components/people/context-editor";
 import { MyApiKeys, type MyKeyRow } from "@/components/people/my-api-keys";
 import { MemberAvatar } from "@/components/people/member-avatar";
 import { AvatarUpload } from "@/components/people/avatar-upload";
+import { buildAgentOnboardingPrompt } from "@/lib/onboarding/agent-prompt";
 
 export const metadata: Metadata = { title: "Profile" };
 
@@ -39,13 +40,18 @@ export default async function PersonPage({
   const range = parseRange((await searchParams).range);
   const db = await serverClient();
 
-  const { data: team } = await db.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
+  const { data: team } = await db.from("teams").select("id, name").eq("slug", teamSlug).maybeSingle();
   if (!team) return null;
   const me = await currentMember(team.id);
   if (!me) return null;
 
   const decodedHandle = decodeURIComponent(handle);
   const p = await getMemberProfile(db, team.id, decodedHandle, range, me.tier);
+  const agentPrompt = buildAgentOnboardingPrompt({
+    teamSlug,
+    teamName: team.name,
+    brainUrl: (process.env.APP_URL ?? "").replace(/\/$/, ""),
+  });
 
   if (!p) {
     // getMemberProfile gates on canSeeCodebases(tier) — an external-tier member (a client/
@@ -77,7 +83,11 @@ export default async function PersonPage({
     return (
       <div className="mx-auto flex max-w-2xl flex-col gap-5">
         <h1 className="font-display text-2xl font-semibold text-ink">Your account</h1>
-        <MyApiKeys teamSlug={teamSlug} keys={(keyRows ?? []) as MyKeyRow[]} />
+        <MyApiKeys
+          teamSlug={teamSlug}
+          keys={(keyRows ?? []) as MyKeyRow[]}
+          agentPrompt={agentPrompt}
+        />
       </div>
     );
   }
@@ -153,7 +163,7 @@ export default async function PersonPage({
       {canEdit && context ? (
         <ContextEditor teamSlug={teamSlug} memberId={p.member_id} context={context} />
       ) : null}
-      {isSelf ? <MyApiKeys teamSlug={teamSlug} keys={myKeys} /> : null}
+      {isSelf ? <MyApiKeys teamSlug={teamSlug} keys={myKeys} agentPrompt={agentPrompt} /> : null}
 
       <section className="prism-card flex flex-col gap-3 p-5">
         <h2 className="text-sm font-semibold uppercase tracking-wider text-ink-tertiary">
