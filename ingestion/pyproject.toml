@@ -18,16 +18,12 @@ dependencies = [
 # Reader/parsers are heavy and license-varied, so they are opt-in extras.
 # Adapters lazy-import them and raise a clear "install extra" error if missing.
 [project.optional-dependencies]
-github = ["llama-index-readers-github>=0.1"]
-slack = ["llama-index-readers-slack>=0.1"]
 gdrive = ["llama-index-readers-google>=0.1"]
 notion = ["llama-index-readers-notion>=0.1"]
 confluence = ["llama-index-readers-confluence>=0.1"]
 radar = ["feedparser>=6.0"]
 docs = ["unstructured>=0.13"]
 all = [
-  "llama-index-readers-github>=0.1",
-  "llama-index-readers-slack>=0.1",
   "llama-index-readers-google>=0.1",
   "llama-index-readers-notion>=0.1",
   "llama-index-readers-confluence>=0.1",

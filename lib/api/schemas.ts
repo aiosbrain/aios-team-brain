@@ -388,7 +388,6 @@ export const INTEGRATION_TYPES = [
   // The connector already exists (ingestion/aios_ingest/sources/notion.py + notion_authors.py, which
   // resolves created_by/last_edited_by → the item's authors) — it just had nowhere to read a token from.
   "notion",
-  "wise",
   "linear",
   "plane",
   // LLM provider API keys. The key is stored encrypted in secret_ciphertext, same path as the
@@ -469,7 +468,6 @@ const integrationConfigSchemas: Record<IntegrationType, z.ZodType> = {
       inviteLink: z.string().url().max(500).optional(),
     })
     .strict(),
-  wise: z.object({ profileId: z.string().max(64).optional() }).strict(),
   // Either pageIds OR databaseId — the connector requires one (it raises if both are absent). Not
   // enforced here: a half-configured integration must be savable, and the connector reports the error.
   notion: z

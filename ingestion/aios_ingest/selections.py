@@ -32,7 +32,7 @@ def _translate_slack(config: dict[str, Any]) -> dict[str, Any]:
 
 
 def _no_op(config: dict[str, Any]) -> dict[str, Any]:
-    # No consuming adapter field yet (linear teamId/projectId, plane, wise, notion).
+    # No consuming adapter field yet (linear teamId/projectId, plane, notion).
     # Translate to nothing so we never inject a key the adapter would reject.
     # Adapter wiring for these selection fields is future work.
     return {}
@@ -44,7 +44,6 @@ _SELECTION_TRANSLATORS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = 
     "slack": _translate_slack,
     "linear": _no_op,
     "plane": _no_op,
-    "wise": _no_op,
     "notion": _no_op,
 }
 
