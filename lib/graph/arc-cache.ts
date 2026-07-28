@@ -21,12 +21,44 @@ import type { NarrativeArc } from "./arcs";
  *  Shared with `staleArcCache` below so a re-attribution's forced-stale mark stays PAST this window. */
 export const ARC_CACHE_TTL_MS = 4 * 60 * 60_000;
 
+/**
+ * How long an UNTRUSTWORTHY arc set is served before the next view retries it. Short enough that a
+ * transient LLM/graph failure self-heals in minutes rather than hours, long enough that a persistent one
+ * doesn't turn every page view into a recompute.
+ *
+ * Moved here from `arcs.ts` so it sits beside the TTL it is an alternative to — the two are one rule, and
+ * `arcTtlMs` below is the only place that rule is spelled out (H6's drift shape).
+ */
+export const UNTRUSTED_RETRY_AFTER_MS = 5 * 60_000;
+
+/**
+ * The TTL that applies to a row, given whether it is degraded. THE single expression of "an untrusted
+ * result gets a short life".
+ *
+ * This is what replaced backdating `computed_at`. Previously an untrusted row was written with its
+ * timestamp pushed `TTL - RETRY` into the past, so that `now - computed_at >= TTL` came true after
+ * `RETRY` — the same staleness, bought by falsifying the timestamp. Deriving the TTL instead is exactly
+ * equivalent (fresh for `RETRY` either way) and leaves `computed_at` meaning only "when computed".
+ */
+export function arcTtlMs(degraded: boolean): number {
+  return degraded ? UNTRUSTED_RETRY_AFTER_MS : ARC_CACHE_TTL_MS;
+}
+
 export interface ArcCacheEntry {
   arcs: NarrativeArc[];
   /** epoch ms of when this cache row was computed (for TTL/staleness checks in `arcs.ts`). */
   computedAt: number;
   /** Hash of the LLM synthesis input at that compute — the fact-set-hash skip compares against it. */
   factsHash: string | null;
+  /**
+   * The synthesis that produced these arcs could not be trusted — the model failed, or an input leg did.
+   * PERSISTED (R2/M6), so it survives the request that discovered it: before this column, the next reader
+   * of the very same row reported the payload as healthy.
+   *
+   * `false` means "no evidence of degradation", NOT "verified good" — rows predating the column read
+   * false. Also NOT the same as stale: a degraded row can be seconds old.
+   */
+  degraded: boolean;
 }
 
 /** Read the cached arcs for one team+group_key. Null on miss or any error (best-effort — a cache
@@ -35,16 +67,28 @@ export async function readArcCache(db: DbClient, teamId: string, groupKey: strin
   try {
     const { data } = await db
       .from("arc_cache")
-      .select("arcs, computed_at, facts_hash")
+      .select("arcs, computed_at, facts_hash, degraded")
       .eq("team_id", teamId)
       .eq("group_key", groupKey)
       .maybeSingle();
     if (!data) return null;
-    const row = data as { arcs: unknown; computed_at: string | Date; facts_hash: string | null };
+    const row = data as {
+      arcs: unknown;
+      computed_at: string | Date;
+      facts_hash: string | null;
+      degraded?: boolean | null;
+    };
     const arcs = Array.isArray(row.arcs) ? (row.arcs as NarrativeArc[]) : [];
     const computedAt =
       typeof row.computed_at === "string" ? Date.parse(row.computed_at) : new Date(row.computed_at).getTime();
-    return { arcs, computedAt: Number.isFinite(computedAt) ? computedAt : 0, factsHash: row.facts_hash ?? null };
+    return {
+      arcs,
+      computedAt: Number.isFinite(computedAt) ? computedAt : 0,
+      factsHash: row.facts_hash ?? null,
+      // `?? false` covers a row written before the column existed. Defaulting the OTHER way would mark
+      // every pre-migration row untrustworthy and stampede a recompute for every team on deploy.
+      degraded: row.degraded === true,
+    };
   } catch {
     return null;
   }
@@ -101,20 +145,21 @@ export async function writeArcCache(
   arcs: NarrativeArc[],
   factsHash: string | null,
   /**
-   * Give the row a SHORT life instead of the full TTL: `computed_at` is backdated so it reads fresh for
-   * `retryAfterMs` and then goes stale.
+   * `degraded: true` for a result we don't trust enough to serve for a full window but still want
+   * persisted — a synthesis that produced nothing although facts existed (the model failed), or one whose
+   * inputs were degraded. It shortens the row's life via `arcTtlMs`, so the next view retries within
+   * minutes instead of hours: SWR only re-fires on a stale row, so "fresh and wrong" is the one state
+   * that can't self-heal (the H12 incident).
    *
-   * For a result we don't trust enough to serve for a full window but still want persisted — a synthesis
-   * that produced nothing although facts existed (the model failed), or one whose inputs were degraded.
-   * Stamping those `now` is what pinned an empty arc panel for 4h with no retry: SWR only re-fires on a
-   * stale row, so "fresh and wrong" is the one state that can't self-heal. Backdating to *already* stale
-   * would go too far the other way — every page view would fire another recompute for as long as the
-   * failure lasted.
+   * This used to be done by BACKDATING `computed_at` by `TTL - retryAfterMs`, because there was nowhere
+   * to record the fact. Same retry behaviour, but the timestamp lied by ~4 hours — and the flag lived
+   * only for the request that discovered it, so the next reader of the row saw a healthy payload. Now the
+   * timestamp is always the honest write time and the trust verdict is its own column (R2/M6).
    *
-   * The row stays far inside `EMPTY_CLOBBER_MAX_AGE_MS`, so the next attempt still treats it as recent
-   * transient-failure cover rather than "persistently empty, accept it".
+   * `computed_at` stays close to now, so the row remains far inside `EMPTY_CLOBBER_MAX_AGE_MS` and the
+   * next attempt still treats it as recent transient-failure cover rather than "persistently empty".
    */
-  opts: { retryAfterMs?: number } = {}
+  opts: { degraded?: boolean } = {}
 ): Promise<void> {
   try {
     // `arcs` is a top-level JSON array. The pg adapter only auto-casts non-array objects to jsonb, so
@@ -126,11 +171,8 @@ export async function writeArcCache(
         group_key: groupKey,
         arcs: JSON.stringify(arcs),
         facts_hash: factsHash,
-        computed_at: new Date(
-          opts.retryAfterMs === undefined
-            ? Date.now()
-            : Date.now() - Math.max(0, ARC_CACHE_TTL_MS - opts.retryAfterMs)
-        ).toISOString(),
+        computed_at: new Date().toISOString(),
+        degraded: opts.degraded === true,
       },
       { onConflict: "team_id,group_key" }
     );

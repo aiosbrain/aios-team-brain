@@ -144,11 +144,18 @@ flowchart LR
 
 **Freshness contract (R2/M6).** Any surface served out of a cache table reports `{ as_of, stale, degraded }`
 built by **`lib/freshness.ts`** — `as_of` is the cache row's real `computed_at`, `stale` means past TTL and
-served anyway (SWR), `degraded` means a leg THIS REQUEST's computation depended on failed — it is not
-persisted with the cache row, so it describes the work done for this response, not the payload's permanent
-character (a degraded cold-miss reports `true`; the next read of the row it wrote reports `false` for the
-same bytes). Persisting it — a `degraded` column, which would also stop `computed_at` doubling as a trust
-dial — is the follow-up. It is produced by the DATA layer
+served anyway (SWR), `degraded` means a leg the payload's computation depended on failed, and is
+**persisted** on the cache row (`arc_cache.degraded` / `work_timeline_cache.degraded`), so a later reader
+inherits the verdict instead of being handed a partial payload as healthy. That column also ended
+`computed_at`'s double life: `writeArcCache` used to BACKDATE the timestamp by `TTL − 5min` purely to
+shorten an untrusted row's life, so a degraded row claimed a computation time ~4h before it happened. The
+short retry window is now derived from the flag instead (**`arcTtlMs(degraded)`** — the single expression
+of that rule), which reproduces the old window exactly while leaving the timestamp honest. Guarded by
+`test/guards/computed-at-not-a-trust-dial.test.ts`, whose exemption for the legitimate invalidators
+(`staleArcCache`, `bustTeamTimeline`) is scoped per-FUNCTION — a file-level one would have exempted
+`writeArcCache`, which lives in the same file as `staleArcCache` and is where the bug was. For the
+timeline, `degraded` deliberately does NOT fire when a team has no answering model configured (that's a
+setup choice, not a failure) — only when the synopsis pass was expected to produce prose and fell short. It is produced by the DATA layer
 (`getArcs`, `getCachedWorkTimeline`, `commitArcs` all return it beside their payload) and only rendered by
 routes, because only the data layer knows the answer. Before this, four routes answered "how old is this?"
 with `as_of: new Date()` over a cache with a **4-hour** TTL that deliberately serves rows older still — a

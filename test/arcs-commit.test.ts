@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { commitArcs } from "@/lib/graph/arcs";
-import { ARC_CACHE_TTL_MS } from "@/lib/graph/arc-cache";
+import { ARC_CACHE_TTL_MS, arcTtlMs } from "@/lib/graph/arc-cache";
 import type { NarrativeArc } from "@/lib/graph/arcs";
 import type { DbClient } from "@/lib/db/types";
 
@@ -37,8 +37,16 @@ const HOUR = 60 * 60 * 1000;
  * while "already stale" makes every page view fire another recompute for as long as the failure lasts.
  */
 function expectShortLived(row: unknown): void {
-  const at = Date.parse((row as { computed_at: string }).computed_at);
-  const remaining = ARC_CACHE_TTL_MS - (Date.now() - at);
+  const r = row as { computed_at: string; degraded?: boolean };
+  // The mechanism changed (R2/M6) but the REQUIREMENT is identical: an untrustworthy row must go stale in
+  // minutes, not hours. It used to be encoded by backdating `computed_at`; it is now the `degraded`
+  // column plus the shorter TTL `arcTtlMs` derives from it. Asserted through `arcTtlMs` so this test
+  // tracks the rule rather than restating a duration.
+  expect(r.degraded).toBe(true);
+  const at = Date.parse(r.computed_at);
+  // …and the timestamp is now HONEST: written at the time of the write, not pushed into the past.
+  expect(Date.now() - at).toBeLessThan(60_000);
+  const remaining = arcTtlMs(true) - (Date.now() - at);
   expect(remaining).toBeGreaterThan(0); // not already stale — a persistent failure must not thrash
   expect(remaining).toBeLessThanOrEqual(10 * 60_000); // …but it retries within minutes, not hours
 }
@@ -88,22 +96,56 @@ describe("commitArcs — an empty synthesis must never clobber a good cache", ()
     warn.mockRestore();
   });
 
-  it("never reports a computed_at LATER than the real computation (under-claim, never over-claim)", async () => {
-    // The invariant the whole envelope rests on: an untrustworthy result is deliberately BACKDATED so it
-    // retries soon, so `computedAt` can be earlier than the true moment of computation — but it must
-    // never be later, because that is the direction that makes stale data look current.
+  it("reports the HONEST computation time for degraded and healthy alike (R2/M6)", async () => {
+    // This assertion used to allow an untrustworthy result to under-claim its age, because the only way
+    // to shorten its life was to backdate the timestamp. With `degraded` as its own column that trade is
+    // gone: BOTH cases now report when the write actually happened, and the short retry window comes
+    // from `arcTtlMs`. Strictly stronger than the old "never LATER" — this is "exactly right".
     const { db } = fakeDb(null);
     const before = Date.now();
     const healthy = await commitArcs(db, "team-1", "freshness-healthy", [arc("a")], "h1");
+    expect(healthy.untrustworthy).toBe(false);
     expect(healthy.computedAt).toBeGreaterThanOrEqual(before);
     expect(healthy.computedAt).toBeLessThanOrEqual(Date.now());
 
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const { db: db2 } = fakeDb(null);
+    const beforeDegraded = Date.now();
     const degraded = await commitArcs(db2, "team-1", "freshness-degraded-cold", [arc("b")], "h1", {
       degraded: true,
     });
-    expect(degraded.computedAt).toBeLessThan(Date.now()); // pre-aged, i.e. under-claimed
+    expect(degraded.untrustworthy).toBe(true);
+    expect(degraded.computedAt).toBeGreaterThanOrEqual(beforeDegraded); // NOT pushed into the past
+    expect(degraded.computedAt).toBeLessThanOrEqual(Date.now());
+    // …and it still expires in minutes, which is the behaviour the backdating existed to produce.
+    expect(arcTtlMs(degraded.untrustworthy)).toBeLessThanOrEqual(10 * 60_000);
+    warn.mockRestore();
+  });
+
+  it("separates 'this attempt failed' from 'these bytes are bad' on the keep-prior branch", async () => {
+    // A refused synthesis hands back a HEALTHY cached set (H11). Both facts are true at once and they
+    // are not the same fact: the attempt failed, the payload is fine. Collapsing them scores a good 1h-old
+    // prior against the 5-minute untrusted window — so the caller badges fresh data stale and every viewer
+    // re-fires the recompute that just failed.
+    const priorAt = Date.now() - 1 * HOUR;
+    const { db } = fakeDb([arc("payments migration")], priorAt);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const kept = await commitArcs(db, "team-1", "split-keep-prior", [arc("noise")], "h9", { degraded: true });
+    expect(kept.arcs.map((a) => a.title)).toEqual(["payments migration"]);
+    expect(kept.untrustworthy).toBe(true); // the attempt
+    expect(kept.payloadDegraded).toBe(false); // …but the bytes are the healthy prior
+    expect(kept.computedAt).toBe(priorAt);
+    warn.mockRestore();
+  });
+
+  it("…and when there is no prior to keep, the bytes ARE the bad ones", async () => {
+    // The control: without it the split could be hardcoded to `false` and the test above still passes.
+    const { db } = fakeDb(null);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const written = await commitArcs(db, "team-1", "split-no-prior", [arc("partial")], "h9", { degraded: true });
+    expect(written.untrustworthy).toBe(true);
+    expect(written.payloadDegraded).toBe(true); // persisted degraded — nothing healthier to fall back to
     warn.mockRestore();
   });
 

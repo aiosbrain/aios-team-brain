@@ -34,13 +34,22 @@ export interface Freshness {
    * wrong — the case that silently reads as a healthy-but-quiet result. Distinct from `stale`: a degraded
    * payload can be freshly computed, and a stale one can be perfectly trustworthy.
    *
-   * SCOPE, precisely: it describes the computation that ran on THIS request, not the payload's permanent
-   * character, because it is not persisted with the cache row. A request that cold-misses and degrades
-   * reports `degraded: true`; the next request, served the row that computation wrote, reports `false` for
-   * the same bytes. Fixing that means a `degraded` column on `arc_cache`/`work_timeline_cache` — worth
-   * doing (it would also let `computed_at` stop doubling as a trust dial, which is why `writeArcCache`
-   * backdates today) and deliberately not bundled here. Until then, read `degraded: true` as "the work
-   * done for this response was unreliable", and never `degraded: false` as "this payload is verified good".
+   * SCOPE — read it as "don't treat THIS RESPONSE as authoritative". That covers two cases, deliberately:
+   *   • the BYTES are untrustworthy. `arc_cache` and `work_timeline_cache` each carry a `degraded`
+   *     column, so this verdict outlives the computation that discovered it — a later reader of the same
+   *     row is told, instead of being handed the payload as healthy. (It did not always: before that
+   *     column, request A cold-missed and was told `true` while request B, served the row A had just
+   *     written, was told `false` over identical bytes.)
+   *   • the ATTEMPT failed even though the bytes are fine — a refused recompute hands back a healthy
+   *     cached set (H11), and a user who just submitted a correction needs to know it didn't take.
+   *
+   * `stale` does NOT follow the same rule: it always scores the payload against ITS own TTL, so a
+   * healthy prior returned by a failed attempt keeps its full life rather than being aged out by
+   * somebody else's failure.
+   *
+   * Read `degraded: false` as "no evidence of degradation", never as "verified good": rows written
+   * before the column exists read false, and only the failure modes the producer actually checks are
+   * reported.
    */
   degraded: boolean;
 }

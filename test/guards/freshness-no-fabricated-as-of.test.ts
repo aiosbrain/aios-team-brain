@@ -9,8 +9,10 @@ import { freshness, computedNow, freshnessWire } from "@/lib/freshness";
  * The bug this pins was not a missing field, it was a false one. Four routes answered "how old is this?"
  * with `as_of: new Date().toISOString()` over payloads read from a cache table — `arc_cache` has a FOUR
  * HOUR TTL and deliberately serves rows older still. Worse, it destroyed a signal built on purpose
- * underneath it: `commitArcs` backdates `computed_at` so an untrustworthy synthesis reads stale (H11/H12),
- * and the wire overwrote that with "now".
+ * underneath it: at the time, `commitArcs` BACKDATED `computed_at` so an untrustworthy synthesis read
+ * stale (H11/H12), and the wire overwrote that with "now". (That backdating has since been replaced by a
+ * persisted `degraded` column + `arcTtlMs` — see `computed-at-not-a-trust-dial.test.ts` — so the signal
+ * the wire was destroying now lives in its own field. The rule this guard enforces is unchanged.)
  *
  * Why a guard and not just the four fixes: nothing about writing `as_of: new Date()` looks wrong at the
  * call site. It reads like filling in a required field, it is one line, and it type-checks. The next route
