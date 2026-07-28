@@ -2,15 +2,28 @@
 
 **The collective organ of [AIOS](https://aiosbrain.dev) — the operating system for teams of humans and agents.**
 
-Every person on a team runs their own [AIOS Workspace](https://github.com/aiosbrain/aios-workspace):
-a structured, governed, versioned workspace that lives in their terminal, for them and everything
-they run. Team Brain is the other half — **a shared context layer for humans and agents.** Work flows
-up into it from every workspace and every connected tool; that ground truth flows back down to every
-person and every agent.
+Team Brain is **a shared context layer for humans and agents**: one queryable store of what your team
+knows, decided, and shipped. It turns the scattered exhaust of a working team — commits, tickets,
+docs, Slack threads, meeting transcripts, decisions — into something you can ask questions of like a
+colleague, plus a dashboard showing who did what, what it was in service of, and what the team has
+learned.
 
-It turns the scattered exhaust of a working team — commits, tickets, docs, Slack threads, meeting
-transcripts, decisions — into one context layer you can query like a colleague, and a dashboard that
-shows who did what, what it was in service of, and what the team has learned.
+**Content reaches the brain two ways, and you can use either one on its own.** *Ingesters* connect it
+directly to the collective knowledge bases your team already lives in — Slack, Notion, Google Drive,
+Confluence, GitHub, Linear, Plane, Granola meeting transcripts, RSS — pulling on a schedule with no
+change to how anyone works. Separately, the `aios` CLI *pushes* content up from a person's
+[AIOS Workspace](https://github.com/aiosbrain/aios-workspace), the individual organ that lives in
+their terminal. **The workspace is optional.** A team can run Team Brain with connectors alone and
+never install it; a solo user can push from the CLI with no connectors at all. Most teams end up
+doing both.
+
+Whatever the source, it lands in one place — and the ground truth flows back out to every person,
+every surface, and every agent.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/team-brain-schematic-dark.png">
+  <img alt="Users working in Claude Code, Conductor and Cursor, plus integrations with Slack, Notion, Linear, GitHub, Granola and Google, all feeding one Team Brain (knowledge, memory, reasoning, policy, insights) with a Context Engine beneath it; the brain in turn drives surfaces — a kanban board, a KPI dashboard and a query interface — and actions such as spawning agents, executing tasks and improving the harness" src="docs/images/team-brain-schematic-light.png">
+</picture>
 
 **MIT licensed. Self-hosted. Private by default.** Postgres is the only required backend. Nothing
 leaves your instance unless you push it, and it runs fully on-machine at $0 if you want it to.
@@ -30,16 +43,21 @@ leaves your instance unless you push it, and it runs fully on-machine at $0 if y
 
 ## 1. What you need before you start
 
-### 1.1 Local tooling
+### 1.1 Runtime and tooling
 
-| Tool | Version | Why |
+**To deploy it**, your host needs to build a standard Next.js app — **Node ≥ 20** — and give it a
+**Postgres 16** database. Nothing else. Railway and Render detect this automatically.
+
+**On your own machine** you only need tooling if you're going to run the admin CLI, the ingestion
+sidecar, or the app itself:
+
+| Tool | Version | Needed for |
 |---|---|---|
-| **Node** | **≥ 20** (`package.json` engines; CI pins 20) | the app |
-| **npm** | bundled with Node | there is no pnpm/yarn lockfile — `package-lock.json` only |
-| **Postgres** | **16** | the only required backend |
-| **Docker** | any recent | only for the throwaway test database, or to run Postgres locally |
-| **psql** | matching your server | used by `scripts/e2e.sh`; handy for diagnostics |
-| **Python** | **≥ 3.11** (CI uses 3.12), with [`uv`](https://docs.astral.sh/uv/) | **optional** — only for the `ingestion/` sidecar (Notion, Google Drive, Confluence, Granola, RSS, local files) |
+| **Node** | **≥ 20** (`package.json` engines; CI pins 20) | the admin CLI, and local development |
+| **npm** | bundled with Node | no pnpm/yarn lockfile — `package-lock.json` only |
+| **psql** | any recent | diagnostics; required by `scripts/e2e.sh` |
+| **Docker** | any recent | local Postgres, the test tiers, and the Graphiti stack |
+| **Python** | **≥ 3.11** (CI uses 3.12) with [`uv`](https://docs.astral.sh/uv/) | **only** the `ingestion/` sidecar — Notion, Google Drive, Confluence, Granola, RSS, local files |
 
 There is no `.nvmrc` or `.node-version` in the repo.
 
@@ -47,8 +65,8 @@ There is no `.nvmrc` or `.node-version` in the repo.
 
 | Service | Required? | Notes |
 |---|---|---|
-| **Postgres 16** | **Required** | Local Docker, Railway, or any managed provider. Self-host portable — plain SQL schema, no vendor lock-in. |
-| **Railway** | Optional | Our production target. Nothing depends on it; there are no Vercel- or Railway-only APIs. |
+| **A host for the app** | **Required** | Railway is what we run and the best-supported path. Render, Fly, a VPS with Docker, or Kubernetes all work — it's a plain Next.js app with no platform-specific APIs. |
+| **Postgres 16** | **Required** | Managed (Railway, Neon, RDS…) or your own. Plain SQL schema, no vendor lock-in. |
 | **Neo4j 5.26.2** + **Graphiti** | Optional | Powers narrative arcs, the "what the brain is learning" panel, and graph-grounded answers. Everything else works without it. Self-hosted via `graphiti/docker-compose.yml`. **Neo4j Aura is untested** — no code path references `neo4j+s://`, so treat cloud Aura as unverified. |
 | **Email (Resend or SMTP)** | Recommended | Magic links and invites. Without it, in non-production the login link is printed to the server console; **in production, login mail silently goes nowhere.** |
 
@@ -76,8 +94,8 @@ Get **one** text-generation option working. Everything else is optional.
 | `AUTH_SECRET` | Signing session cookies. **Hard requirement, ≥ 16 chars** | `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"` |
 | `SECRETS_KEY` | AES-256-GCM encryption of connector tokens at rest. **Must decode to exactly 32 bytes.** Required the moment you save any connector in Admin → Integrations | `node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"` |
 
-> ⚠️ `SECRETS_KEY` is **absent from `.env.example`** and throws only when you first save a connector
-> secret. If saving a Slack token 500s, this is why.
+> ⚠️ `SECRETS_KEY` **throws only when you first save a connector secret**, not at boot. If saving a
+> Slack token 500s, this is why.
 
 ### 1.4 Connector credentials
 
@@ -113,132 +131,126 @@ by hand). A missing `channels:read` is diagnosed by name in the ingest error.
 
 ## 2. Setup, in dependency order
 
+> **Deploy this to a server, not to your laptop.** It's a *team* brain — everyone on the team needs
+> to reach the same instance, connectors poll on a schedule whether or not you're at your desk, and
+> the background pollers only run while the process is up. A local install is for **developing the
+> brain itself**, not for running your team on. The instructions below are written for a hosted
+> deploy; §2.7 covers running it locally if you're contributing code.
+
+We deploy to **Railway** and that's the best-supported path, but nothing here depends on it — it's a
+standard Next.js app plus a Postgres database, so Render, Fly, a VPS with Docker, or your own
+Kubernetes all work. Only §2.1 is Railway-specific.
+
 Each step explains *why*, so you can tell when something has gone wrong rather than pattern-matching
 on green output.
 
-### Step 0 — Clone and install
+### 2.1 — Create the services
+
+Fork or clone [`aiosbrain/aios-team-brain`](https://github.com/aiosbrain/aios-team-brain) to your own
+GitHub account first — deploys happen by pushing to your `main`.
+
+On Railway: **New Project → Deploy from GitHub repo**, pick your fork, then **New → Database →
+Postgres** in the same project. That's the whole topology for a base install: one web service, one
+Postgres.
+
+> ⚠️ **Name the web service `aios` or `aios-<something>`.** A guard in `scripts/service-guard.mjs`
+> aborts the schema load if `RAILWAY_SERVICE_NAME` doesn't match that pattern — it exists because
+> this repo once loaded its schema into a different project's database and took it down. On a
+> non-Railway host the guard is inert.
+
+Add the graph services (§2.6) later, only if you want narrative arcs.
+
+### 2.2 — Set the environment variables
+
+In your host's variables UI (Railway: service → **Variables**), set at minimum:
 
 ```bash
-git clone https://github.com/aiosbrain/aios-team-brain.git
-cd aios-team-brain
-npm install
+DATABASE_URL=${{Postgres.DATABASE_URL}}   # Railway: reference the Postgres service
+PGSSL=require                             # managed Postgres almost always needs this
+AUTH_SECRET=<64 hex chars>                # node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+SECRETS_KEY=<32 bytes base64>             # node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
+APP_URL=https://your-brain.up.railway.app # your real public URL
+ANTHROPIC_API_KEY=sk-ant-...              # or configure a provider per-team in Admin later
+RESEND_API_KEY=re_...                     # magic links; without a transport, production sends nothing
+RESEND_FROM="AIOS <noreply@yourdomain.com>"
 ```
 
-`npm install` also runs `prepare`, which points git at `.githooks/` — that's what gives you the
-pre-push docs-drift check.
+`APP_URL` matters more than it looks: invite and magic links are built in server actions where there
+is no request origin to fall back on, so without it every login link your team receives is broken.
 
-### Step 1 — Configure the environment
+Full reference in §3, including everything optional.
 
-```bash
-cp .env.example .env.local
+### 2.3 — Deploy, and let the schema load itself
+
+Push to `main`. Your host builds and starts the app. On Railway, `railway.json` is three lines whose
+entire content is:
+
+```json
+{ "deploy": { "preDeployCommand": "npm run pg:schema" } }
 ```
 
-Fill in, at minimum:
+So **every deploy applies the schema before the new version goes live**, and a schema failure aborts
+the release rather than shipping app code ahead of its database. On another host, run
+`npm run pg:schema` as a release/pre-deploy command with `DATABASE_URL` in the environment.
 
-```bash
-DATABASE_URL=postgres://user:pass@host:5432/dbname
-AUTH_SECRET=<64 hex chars from the command in §1.3>
-APP_URL=http://localhost:3000
-ANTHROPIC_API_KEY=sk-ant-...        # or LLM_BASE_URL for a local model
-SECRETS_KEY=<32 bytes base64>       # not in .env.example — add it
-```
-
-> ⚠️ **`.env.local` is only auto-loaded by `next dev`.** This repo has **no `dotenv` dependency**, so
-> `npm run pg:schema`, `npm run admin`, and `npm run embed:backfill` read the *shell* environment and
-> will fail with `DATABASE_URL is required` if you only put it in the file. Export it for your
-> session:
->
-> ```bash
-> set -a; . ./.env.local; set +a
-> ```
->
-> Do this once per terminal before running any of the CLI steps below.
-
-### Step 2 — Provision the database
-
-```bash
-npm run pg:schema
-```
-
-**What this actually does** — and it is not what the command name suggests. It runs
+**What `pg:schema` actually does** — and it is not what the name suggests. It runs
 `postgres/schema.sql` (canonical, every object `create … if not exists`), **then replays every file
 in `postgres/migrations/` in filename order, on every run.** There is no `schema_migrations` ledger
-and no "applied" tracking; all migrations are required to be idempotent.
+and no "applied" tracking; every migration is required to be idempotent. Two consequences:
 
-Two consequences worth internalising:
-
-- **First install and a later upgrade are the same command.** Run it again after every `git pull`
-  that touched the schema.
-- **Adding a column requires two edits.** `schema.sql` is `create table if not exists`, so editing
-  the table body is a no-op against a database that already has the table. You need an
+- **First install and every later upgrade are the same command.** Nothing separate to run when you
+  pull a new version.
+- **Adding a column takes two edits.** `schema.sql` is `create table if not exists`, so editing the
+  table body is a no-op against a database that already has the table. You need an
   `alter table … add column if not exists` file in `postgres/migrations/` *and* the mirrored change
   in `schema.sql` for from-zero installs. See `postgres/migrations/README.md`.
 
-The loader sets a `lock_timeout` (default 15s) before any DDL so a stuck reader fails the release
-fast instead of queueing every query behind it, and it refuses to run against a non-AIOS Railway
-service.
+The loader sets a `lock_timeout` (default 15s) before any DDL, so a stuck reader fails the release
+fast instead of queueing every query in the database behind it.
 
-**pgvector is deliberately not installed by default**, so a stock install needs no extensions. See
-Step 5 if you want semantic search.
+**pgvector is deliberately not installed**, so a stock deploy needs no extensions. See §2.5.
 
-### Step 3 — Create your team and your first admin
+### 2.4 — Create your team and your first admin
 
-```bash
-npm run admin -- create-team acme --name "Acme Robotics"
-npm run admin -- create-member you@acme.com --name "Your Name" --handle you --role admin --team acme
-```
-
-> **`create-member` prints a generated password once and never again.** Copy it. This is the primary
-> way to log in; the docs elsewhere imply magic links are, but the password is what you get by
-> default. Pass `--password` to choose your own.
-
-Other ways in:
+These run against the production database, so run them through your host's shell. On Railway:
 
 ```bash
-npm run admin -- login-link you@acme.com --team acme    # one-time magic link
+railway run -s Postgres bash -lc 'DATABASE_URL=$DATABASE_PUBLIC_URL \
+  npx tsx --conditions react-server scripts/admin.ts create-team acme --name "Acme Robotics"'
+
+railway run -s Postgres bash -lc 'DATABASE_URL=$DATABASE_PUBLIC_URL \
+  npx tsx --conditions react-server scripts/admin.ts create-member you@acme.com \
+  --name "Your Name" --handle you --role admin --team acme'
 ```
 
-And for a machine (the `aios` CLI, CI, the sidecar):
+Anywhere else, export `DATABASE_URL` and run `npm run admin -- <command>`.
+
+> **`create-member` prints a generated password once and never again.** Copy it — that is how you log
+> in. Pass `--password` to choose your own.
+
+Then invite the rest of the team from **Admin → Members** in the UI, or mint links yourself:
 
 ```bash
-npm run admin -- issue-key you@acme.com --name "laptop" --team acme
-# → aios_<key_id>_<secret>   shown once, sha256 at rest
+npm run admin -- login-link teammate@acme.com --team acme   # one-time magic link
+npm run admin -- issue-key teammate@acme.com --name laptop --team acme
+# → aios_<key_id>_<secret>   shown once, sha256 at rest — this is what the `aios` CLI uses
 ```
 
-`npm run admin -- help` lists the rest (`list-members`, `list-keys`, `revoke-key`,
-`link-github`, `link-identity`, …).
+`npm run admin -- help` lists the rest.
 
-### Step 4 — First run
-
-```bash
-npm run dev
-```
-
-Open `http://localhost:3000`. In development only, `http://localhost:3000/auth/dev-login?email=you@acme.com`
-signs you straight in — the route 404s when `NODE_ENV=production`.
-
-**Optional: load the demo dataset** instead of starting empty. It seeds a fictional team
-("Northwind Robotics"), four members, fixtures pushed through the *real* ingest path, and a company
-graph:
-
-```bash
-npm run dev:seed     # sources .env.local for you
-```
-
-It prints an API key once and also writes it to `.aios-demo-key` (gitignored). It asserts that ≥ 8
-tasks and ≥ 20 decisions materialised, so it doubles as a regression test of the write path.
-
-### Step 5 — Semantic search (optional)
+### 2.5 — Semantic search (optional)
 
 Skip this and retrieval still works — it just uses ranked keyword full-text search plus structured
-context. Nothing errors, nothing warns; you simply get lower recall on paraphrased questions.
+context. Nothing errors and nothing warns; you get lower recall on paraphrased questions.
+
+Run once against your database, **after** `pg:schema`:
 
 ```bash
 npm run pg:schema:vector    # loads postgres/optional/pgvector.sql — needs the `vector` extension
 ```
 
-Then set an embeddings backend, either per-team in **Admin → Integrations → Embeddings model**
-(OpenAI or OpenRouter), or by env:
+Railway's Postgres image ships pgvector. Then set an embeddings backend, either per-team in
+**Admin → Integrations → Embeddings model** (OpenAI or OpenRouter), or by env:
 
 ```bash
 EMBEDDINGS_URL=https://api.openai.com/v1
@@ -248,12 +260,64 @@ EMBEDDINGS_API_KEY=sk-...
 
 > **The vector column is hardcoded `vector(1536)`.** To use a different-dimension model you must edit
 > `postgres/optional/pgvector.sql` *before* first loading it and set `EMBEDDINGS_DIM` to match. A
-> model returning the wrong width throws loudly at index time and is counted and surfaced on the
-> retrieval-health card — but at *query* time the same error degrades **silently** to zero dense hits.
+> model returning the wrong width throws loudly at index time and is surfaced on the retrieval-health
+> card — but at *query* time the same error degrades **silently** to zero dense hits.
 
-Backfill existing content: `npm run embed:backfill`.
+Backfill existing content with `npm run embed:backfill`.
 
-### Step 6 — Graph memory: Neo4j + Graphiti (optional)
+### 2.6 — Connect your knowledge bases
+
+This is the part that makes it a team brain rather than an empty database. Go to
+**Admin → Integrations** and add:
+
+| Connector | What you paste |
+|---|---|
+| **Slack** | a bot token `xoxb-…` with `channels:history`, `channels:read`, `users:read`, then the channel IDs to follow |
+| **GitHub** | optionally a PAT, then `owner/repo` entries — public repos work token-free |
+| **Linear** | an API key + the Linear team id |
+| **Plane** | an API token + workspace/project |
+
+They start pulling on the next scheduler tick (≤ 30 min) and every 30 min after.
+
+For **Notion, Google Drive, Confluence, Granola, RSS and local files**, run the Python sidecar in
+`ingestion/` — it pulls on your infrastructure and pushes over the same API, so those credentials
+never touch the brain. It needs `BRAIN_URL`, `AIOS_API_KEY` and `AIOS_TEAM`, and its own
+`connections.yaml`. See [`ingestion/README.md`](ingestion/README.md).
+
+And to push from a person's terminal, they install
+[AIOS Workspace](https://github.com/aiosbrain/aios-workspace), set `brain_url` and `AIOS_API_KEY`,
+and run `aios push`. **Entirely optional** — the connectors above feed the brain on their own.
+
+### 2.7 — Running it locally (contributors only)
+
+If you're changing the brain itself:
+
+```bash
+git clone https://github.com/aiosbrain/aios-team-brain.git
+cd aios-team-brain
+npm install                 # also runs `prepare`, pointing git at .githooks/
+cp .env.example .env.local  # then fill in DATABASE_URL, AUTH_SECRET, SECRETS_KEY, APP_URL, a model key
+npm run pg:schema
+npm run dev:seed            # optional: demo team, fixtures pushed through the REAL ingest path
+npm run dev
+```
+
+In development only, `http://localhost:3000/auth/dev-login?email=you@acme.com` signs you straight in;
+the route 404s when `NODE_ENV=production`.
+
+> ⚠️ **`.env.local` is only auto-loaded by `next dev`.** This repo has **no `dotenv` dependency**, so
+> `npm run pg:schema`, `npm run admin` and `npm run embed:backfill` read the *shell* environment and
+> fail with `DATABASE_URL is required` if you only put it in the file. Run this once per terminal:
+>
+> ```bash
+> set -a; . ./.env.local; set +a
+> ```
+
+`npm run dev:seed` prints an API key once and also writes it to `.aios-demo-key` (gitignored). It
+asserts that ≥ 8 tasks and ≥ 20 decisions materialised, so it doubles as a regression test of the
+write path.
+
+### 2.8 — Graph memory: Neo4j + Graphiti (optional)
 
 This is the most involved part of the setup and the easiest to get subtly wrong. Skip it entirely if
 you don't need narrative arcs or the learning panel — the app is fully functional without it.
@@ -268,12 +332,13 @@ app ──REST──> graphiti ──bolt──> neo4j
  └───────────────bolt (read-only)──┘
 ```
 
-**6a. Configure the graph stack.**
+**Deploy it as two more services** alongside the app — on Railway, **New → Database → Add Neo4j**
+(or a Docker service running `neo4j:5.26.2`), plus a service built from this repo's `graphiti/`
+directory (Settings → Source → set the root directory to `graphiti/` so it builds the Dockerfile
+below). Locally, `cd graphiti && docker compose up -d` brings up both.
 
-```bash
-cd graphiti
-cp .env.example .env
-```
+**2.8a. Configure the graph service.** Set these on the graphiti service (locally:
+`cp graphiti/.env.example graphiti/.env`):
 
 ```bash
 OPENAI_API_KEY=sk-...          # Graphiti's OWN key, for extraction
@@ -287,7 +352,7 @@ NEO4J_PASSWORD=<choose one>
 > commented out. This is exactly why the compose file uses `env_file:` rather than `${VAR:-}`
 > interpolation.
 
-**6b. Build the patched image — do not use the upstream one.**
+**2.8b. Use the patched image — never the upstream one.**
 
 `graphiti/Dockerfile` builds from a **digest-pinned** `zepai/graphiti` and patches one constant:
 
@@ -311,23 +376,28 @@ The `grep -q` before the `sed` is a build gate: if a future base image renames t
 The digest pin is also deliberate — it guarantees the Neo4j schema our Cypher depends on and the REST
 API our projector uses are byte-identical to what's been running; only the token ceiling moves.
 
-```bash
-docker compose up -d          # from graphiti/ — brings up graph + neo4j
-```
+> ⚠️ **If your graphiti service has a Custom Start Command set, leave it alone.** Older docs in this
+> repo prescribe one that wraps the ingest worker so it survives a failed extraction instead of dying
+> silently. It is complementary to the Dockerfile patch, not a replacement — the `sed` above modifies
+> a file *inside the image*, so it applies no matter how the process is launched. To check whether
+> yours has one, see §5.
+>
+> A start command is also the documented fix for a separate trap: the image declares a non-root
+> `USER app` but its default CMD launches via `uv` at `/root/.local/bin/uv`, which `app` cannot
+> execute once the platform runs the container as the declared user. That broke a production restart.
 
-**6c. Point the app at it.** These go in the *brain's* `.env.local`, not `graphiti/.env`, and **none
-of them are in `.env.example`**:
+**2.8c. Point the app at it.** These go in the *brain's* environment, not the graphiti service's:
 
 ```bash
-GRAPHITI_URL=http://localhost:8000
-NEO4J_URL=bolt://localhost:7687
+GRAPHITI_URL=http://graphiti.railway.internal:8000   # or http://localhost:8000 locally
+NEO4J_URL=bolt://neo4j.railway.internal:7687        # or bolt://localhost:7687 locally
 NEO4J_USER=neo4j
 NEO4J_PASSWORD=<same as above>
 ```
 
 `GRAPHITI_URL` is the master switch: unset, the projector never starts and every graph read is inert.
 
-**6d. Understand the extraction limits.** Items are **chunked**, not truncated:
+**2.8d. Understand the extraction limits.** Items are **chunked**, not truncated:
 
 | Constant | Default | Env override |
 |---|---|---|
@@ -341,7 +411,7 @@ each extraction well under the patched 16384-token ceiling.
 > If you have seen `MAX_EPISODE_CHARS` (4000, or 6000, or 2000) referenced anywhere — in older notes
 > or docs — **it no longer exists.** It was deleted and replaced by chunking. Don't set it.
 
-**6e. Know the `group_id` rule.** Tier isolation in the graph is the `group_id` and nothing else —
+**2.8e. Know the `group_id` rule.** Tier isolation in the graph is the `group_id` and nothing else —
 there is no RLS backstop. The format is `<teamSlug>_<tier>`, and the separator is an underscore
 because Graphiti's validator permits only `[A-Za-z0-9_-]`. A `:` raises an error that propagates out
 of the ingest worker and **silently kills it for the whole process**. The code validates before
@@ -350,7 +420,7 @@ posting and throws rather than sending a bad id.
 > `postgres/schema.sql` still documents this column as `'<teamSlug>:<tier>'`. That comment is wrong —
 > the colon form is precisely the one Graphiti rejects.
 
-### Step 7 — Verify it worked
+### 2.9 — Verify it worked
 
 ```bash
 bash scripts/e2e.sh
@@ -375,22 +445,14 @@ npm run lint
 npm run check:docs  # architecture-map drift guard (also runs pre-push)
 ```
 
-### Step 8 — Deploy (Railway)
+### 2.10 — Shipping changes after the first deploy
 
-The only deploy path is **merging to `main`** — Railway's GitHub integration builds automatically.
-`railway.json` is three lines whose entire content is:
+Push to `main`. That's it — your host rebuilds, and the pre-deploy hook applies any new migrations
+before the new version serves traffic. There is no separate migration step to remember.
 
-```json
-{ "deploy": { "preDeployCommand": "npm run pg:schema" } }
-```
-
-So **every deploy applies the schema and all migrations before the new version goes live**, and a
-schema failure aborts the release rather than shipping app code ahead of its database. Set
-`PGSSL=require` for managed Postgres.
-
-Services you need: the app (its Railway service name must be `aios` or `aios-*` — a guard aborts the
-schema load otherwise, so this repo can never inject its schema into another project's database), a
-Postgres service, and optionally `graphiti` + `neo4j`.
+If a deploy appears to do nothing, confirm the platform actually started a build (webhooks do get
+dropped), and check the pre-deploy logs — a schema failure aborts the release by design rather than
+shipping app code ahead of its database.
 
 ---
 
@@ -408,7 +470,7 @@ Postgres service, and optionally `graphiti` + `neo4j`.
 | Var | Notes |
 |---|---|
 | `APP_URL` | Absolute base URL. No throw, but invite/magic links are built in server actions where there is no request origin — without it they come out broken. |
-| `SECRETS_KEY` | 32 bytes, base64 or hex. **Throws** the first time you save a connector secret. Not in `.env.example`. |
+| `SECRETS_KEY` | 32 bytes, base64 or hex. **Throws** the first time you save a connector secret — not at boot. |
 | One LLM path | `ANTHROPIC_API_KEY`, or `LLM_BASE_URL` (+ `LLM_MODEL`), or an OpenRouter key set per-team in Admin. |
 | One email path | `RESEND_API_KEY` + `RESEND_FROM`, or `SMTP_URL` + `SMTP_FROM`. Dev logs the link to console instead; **production sends nothing**. |
 
@@ -443,11 +505,11 @@ Also read but rarely needed: `PG_POOL_MAX`, `PG_STATEMENT_TIMEOUT_MS`, `PG_IDLE_
 `DATABASE_TEST_URL`, `PGVECTOR_TEST`, `NEO4J_TEST`, `HTTP_TEST_PORT` are for the test tiers only.
 `NODE_ENV`, `NEXT_RUNTIME`, `CI`, `RAILWAY_SERVICE_NAME` are set by the platform.
 
-### Known gaps in `.env.example`
+### `.env.example`
 
-It is incomplete and partly stale. It **omits** `SECRETS_KEY`, every `GRAPHITI_*`/`NEO4J_*`/`GRAPH_*`
-var, every `EMBEDDINGS_*` var, and all the connector env fallbacks. Its `PLANE_*` block is **read by
-no code in this repo** — it belongs to `aios-workspace`.
+Covers the required set plus every optional subsystem, with the gotchas inline. It does **not**
+enumerate the low-level tuning knobs (retrieval limits, arc timeouts, social jobs, the gateway) —
+those are in the table above and you are unlikely to need them.
 
 ### Sidecars have their own env files
 
@@ -535,16 +597,40 @@ auto-loads `.env.local`. Run `set -a; . ./.env.local; set +a` first.
 
 Causes, in the order to check them:
 
-1. **Unpatched image.** If `DEFAULT_MAX_TOKENS` is still 8192, a dense episode overflows and kills the
-   worker for the whole process. Rebuild from `graphiti/Dockerfile`, don't use `zepai/graphiti` directly.
-2. **`OPENAI_BASE_URL=""`** in `graphiti/.env`. An empty string reads as *set* and breaks every LLM
-   call, hanging the queue. Comment it out instead.
-3. **Invalid `group_id`.** Anything outside `[A-Za-z0-9_-]` raises inside the worker and kills it.
-4. **Bad timestamp or missing `role`** in a posted episode → `422` on every push, wedging the projector.
+**Read the graphiti service logs first — they name the cause directly:**
 
-The app has a dedicated probe for this: it compares episode count in Postgres against `RELATES_TO`
-count in Neo4j and flags "stalled" at ≥ 25 episodes with 0 facts, with an operator-facing reason
-naming the token cap. Check the `graphiti` service logs for `Output length exceeded max tokens`.
+```bash
+railway logs -s graphiti          # or your host's log viewer
+```
+
+Causes, in the order they actually occur:
+
+1. **The extraction LLM key is out of quota.** Look for `insufficient_quota` / `RateLimitError:
+   Error code: 429`. Graphiti's `OPENAI_API_KEY` is **separate from the app's** and is easy to forget
+   when you top one up. Every episode fails extraction while the HTTP API keeps returning `202`.
+2. **Unpatched image.** If `DEFAULT_MAX_TOKENS` is still 8192, look for `Output length exceeded max
+   tokens`. Rebuild from `graphiti/Dockerfile`; don't deploy `zepai/graphiti` directly.
+3. **`OPENAI_BASE_URL=""`.** An empty string reads as *set* and breaks every LLM call, hanging the
+   queue with no error at all. Comment it out instead of blanking it.
+4. **Invalid `group_id`.** Anything outside `[A-Za-z0-9_-]` raises inside the worker.
+5. **Bad timestamp or missing `role`** in a posted episode → `422` on every push, wedging the projector.
+
+The app has a dedicated probe: it compares episode count in Postgres against `RELATES_TO` count in
+Neo4j and flags "stalled" at ≥ 25 episodes with 0 facts, surfaced on Admin → Integrations.
+
+**Is your worker surviving these failures?** Count the log lines:
+
+```bash
+railway logs -s graphiti | grep -c "Got a job"    # jobs picked up
+railway logs -s graphiti | grep -c "Traceback"    # jobs that failed
+```
+
+Upstream's worker catches only `CancelledError`, so an **unpatched** worker dies on the first
+non-cancelled exception — you'd see one traceback and then silence. If `Got a job` keeps appearing
+*after* tracebacks and the queue drains to 0, a Custom Start Command wrapping the worker loop is in
+effect and doing its job. That is also how to answer "is a Custom Start Command set on this service?"
+without a settings screen — though the definitive check is your host's service settings (Railway:
+service → **Settings → Deploy → Custom Start Command**).
 
 **Recovery:** the graph is fully regenerable from Postgres — clear `graph_episodes` and let the
 projector re-run.
