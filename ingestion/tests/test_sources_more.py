@@ -65,3 +65,24 @@ def test_sidecar_slack_source_is_a_registered_no_op():
     src = build_source("slack", {"token": "xoxb-x", "channel_ids": ["C1"]})
     assert list(src.fetch()) == []          # ingests nothing
     assert src.supports_webhook is False    # and doesn't accept-then-discard webhook payloads
+
+
+def test_removed_granola_source_stays_registered_as_a_no_op():
+    """Granola's connector was REMOVED, but the key must stay registered.
+
+    `build_source` raises "unknown source" for an unregistered key, and the one-shot `sync` path has
+    no per-connection try/except — so an unregistered `granola` would abort an operator's ENTIRE run
+    and silently stop every connection listed after it. Granola blocks are live in the field, so this
+    is an outage, not a hypothesis. Same call as the deprecated `slack` source above.
+
+    The constructor must also swallow a LEGACY block's options verbatim (`api_key`, `topics`,
+    `participants`, `require_consent`) — rejecting them would reintroduce the failure this prevents.
+    """
+    from aios_ingest.sources.registry import build_source
+
+    src = build_source(
+        "granola",
+        {"api_key": "grn-x", "topics": ["AIOS"], "participants": ["a@b.c"], "require_consent": True},
+    )
+    assert list(src.fetch()) == []  # ingests nothing
+    assert src.supports_webhook is False

@@ -32,14 +32,6 @@ def _github_conn() -> Connection:
     )
 
 
-def _granola_conn() -> Connection:
-    return Connection(
-        name="team-granola",
-        source="granola",
-        options={"api_key": "grn-LOCAL", "topics": ["old"], "participants": ["a@x.com"]},
-    )
-
-
 # --- 1 + 2: merge precedence + secrets preserved (slack) --------------------
 
 
@@ -61,25 +53,6 @@ def test_slack_brain_channels_win_local_secrets_preserved():
     # local secrets preserved verbatim
     assert opts["token"] == "xoxb-LOCAL"
     assert opts["signing_secret"] == "s"
-
-
-# --- granola mapping --------------------------------------------------------
-
-
-def test_granola_keywords_and_participants_map():
-    remote = [
-        {
-            "type": "granola",
-            "name": "team-granola",
-            "config": {"matchKeywords": ["aios", "brain"], "participantEmails": ["x@y.com"]},
-            "status": "enabled",
-        }
-    ]
-    merged = merge_selections([_granola_conn()], remote)
-    opts = merged[0].options
-    assert opts["topics"] == ["aios", "brain"]
-    assert opts["participants"] == ["x@y.com"]
-    assert opts["api_key"] == "grn-LOCAL"  # secret preserved
 
 
 # --- build_source compatibility: merged options are adapter-valid -----------

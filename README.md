@@ -10,7 +10,7 @@ learned.
 
 **Content reaches the brain two ways, and you can use either one on its own.** *Ingesters* connect it
 directly to the collective knowledge bases your team already lives in — Slack, Notion, Google Drive,
-Confluence, GitHub, Linear, Plane, Granola meeting transcripts, RSS — pulling on a schedule with no
+Confluence, GitHub, Linear, Plane, RSS — pulling on a schedule with no
 change to how anyone works. Separately, the `aios` CLI *pushes* content up from a person's
 [AIOS Workspace](https://github.com/aiosbrain/aios-workspace), the individual organ that lives in
 their terminal. **The workspace is optional.** A team can run Team Brain with connectors alone and
@@ -22,11 +22,49 @@ every surface, and every agent.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/team-brain-schematic-dark.png">
-  <img alt="Users working in Claude Code, Conductor and Cursor, plus integrations with Slack, Notion, Linear, GitHub, Granola and Google, all feeding one Team Brain (knowledge, memory, reasoning, policy, insights) with a Context Engine beneath it; the brain in turn drives surfaces — a kanban board, a KPI dashboard and a query interface — and actions such as spawning agents, executing tasks and improving the harness" src="docs/images/team-brain-schematic-light.png">
+  <img alt="Users working in Claude Code, Conductor and Cursor, plus integrations with Slack, Notion, Linear, GitHub and Google, all feeding one Team Brain (knowledge, memory, reasoning, policy, insights) with a Context Engine beneath it; the brain in turn drives surfaces — a kanban board, a KPI dashboard and a query interface — and actions such as spawning agents, executing tasks and improving the harness" src="docs/images/team-brain-schematic-light.png">
 </picture>
 
 **MIT licensed. Self-hosted. Private by default.** Postgres is the only required backend. Nothing
 leaves your instance unless you push it, and it runs fully on-machine at $0 if you want it to.
+
+---
+
+## Is this for you? The short version
+
+Full docs live at **[aiosbrain.dev/guides/team-brain](https://aiosbrain.dev/guides/team-brain)** —
+this is the 60-second version so you can decide before reading them.
+
+**What you're standing up:** one Next.js + Postgres service, one instance per team, self-hosted
+anywhere. Not a laptop app — connectors poll on a schedule and everyone on the team hits the same
+instance.
+
+**What you need:**
+
+| | |
+|---|---|
+| **Host** | anything that builds a Next.js app — **Node ≥ 20** + **Postgres 16**. We use Railway; nothing depends on it |
+| **One LLM key** | Anthropic by default. Or point `LLM_BASE_URL` at a local model and run the whole thing for **$0** |
+| **Two secrets** | `AUTH_SECRET` and `SECRETS_KEY`, both generated with one `openssl`/`node` command |
+| **Python ≥ 3.11 + `uv`** | **only** if you want the Notion / Google Drive / Confluence / RSS / web / local-file connectors, which run as a separate sidecar |
+
+**What it costs:** every connector API is free. You pay for embeddings and LLM calls — and if you
+self-host the model, that's zero too.
+
+**How content gets in — you can use either path alone:**
+
+- **Connectors** — Slack, GitHub, Linear and Plane are configured in the Admin UI and start pulling
+  within 30 minutes. Notion, Google Drive, Confluence, RSS, web and local files run through the
+  Python sidecar. See [the integrations guide](https://aiosbrain.dev/guides/integrations).
+- **The `aios` CLI** — each person pushes tier-tagged content from their own workspace. Optional;
+  the connectors feed the brain on their own. See
+  [the quickstart](https://aiosbrain.dev/guides/quickstart).
+
+**Roughly:** deploy the app → set the env vars → load the schema → create the first admin → connect
+one source. Everything below is that, in dependency order, with the failure modes called out.
+
+> **Joining a team that already runs one?** You don't need any of this — you need an invite. See
+> [Onboarding a contributor](https://aiosbrain.dev/guides/quickstart#part-2--connect-to-a-team-brain).
 
 ---
 
@@ -57,7 +95,7 @@ sidecar, or the app itself:
 | **npm** | bundled with Node | no pnpm/yarn lockfile — `package-lock.json` only |
 | **psql** | any recent | diagnostics; required by `scripts/e2e.sh` |
 | **Docker** | any recent | local Postgres, the test tiers, and the Graphiti stack |
-| **Python** | **≥ 3.11** (CI uses 3.12) with [`uv`](https://docs.astral.sh/uv/) | **only** the `ingestion/` sidecar — Notion, Google Drive, Confluence, Granola, RSS, local files |
+| **Python** | **≥ 3.11** (CI uses 3.12) with [`uv`](https://docs.astral.sh/uv/) | **only** the `ingestion/` sidecar — Notion, Google Drive, Confluence, RSS, web, local files |
 
 There is no `.nvmrc` or `.node-version` in the repo.
 
@@ -104,14 +142,22 @@ All connector APIs are free. Cost shows up downstream in embeddings and LLM spen
 | Connector | Credential | Where | Configured in |
 |---|---|---|---|
 | **Slack** | Bot token `xoxb-` | Slack app → OAuth & Permissions | Admin UI (env `SLACK_BOT_TOKEN` as fallback) |
-| **GitHub** | PAT — **optional**; public repos work token-free | github.com → Settings → Developer settings | Admin UI |
+| **GitHub** | PAT — **optional**; public repos work token-free | github.com → Settings → Developer settings | Admin UI → its own **GitHub repos** panel (not the generic "add an integration" dropdown) |
 | **Linear** | API key | Linear → Settings → API → Personal API keys | Admin UI **only** |
 | **Plane** | API token | Plane → Workspace settings → API tokens | Admin UI **only** |
-| **Granola** | `grn_…` API key | Granola | **Sidecar** `.env` (`GRANOLA_API_KEY`) |
 | **Notion** | Internal integration token | notion.so/my-integrations | **Sidecar** `.env` (`NOTION_TOKEN`) |
-| **Confluence** | API token | Atlassian account | **Sidecar** `.env` (`CONFLUENCE_API_TOKEN`) |
+| **Confluence** | `CONFLUENCE_USERNAME` (your email) + `CONFLUENCE_PASSWORD` (an API token) for Atlassian Cloud | Atlassian account | **Sidecar** `.env`. The reader takes `CONFLUENCE_API_TOKEN` **alone** OR username+password — never both; with the token set it ignores the username, which on Cloud 401s at request time rather than failing loudly |
 | **Google Drive** | Service-account JSON key | Google Cloud Console | **Sidecar** `connections.yaml` (path option) |
 | **RSS/Radar**, **Web**, **Local files** | none | — | **Sidecar** `connections.yaml` |
+
+**Maturity, honestly.** Slack, GitHub, Linear and Plane are the proven path — each has a real runner
+wired into the scheduler and unit coverage. **Notion, Google Drive and Confluence are wired but
+unproven**: the code is real and registered, but none has a test of its `fetch()`, and Confluence
+has no `connections.yaml` example either (Notion and Google Drive do — see
+`ingestion/connections.yaml.example`). Expect to debug your first run. Google Drive's watch-channel *renewal* advertised in
+`ingestion/README.md` is never constructed by `aios-ingest schedule` — Drive is pull-on-a-schedule
+only. `gdrive`/`confluence`/`web`/`local`/`radar` cannot be stored as brain integrations at all (the
+`integrations.type` CHECK has no such values) — they are `connections.yaml`-only by construction.
 
 Slack scopes the code actually needs: **`channels:history`**, **`channels:read`**, **`users:read`**,
 and optionally **`users:read.email`** (enables automatic identity mapping; without it you map members
@@ -122,10 +168,12 @@ by hand). A missing `channels:read` is diagnosed by name in the ingest error.
 > `external`) and no stricter one, so anything from a private channel would become readable by the
 > whole team, which isn't what "private" means to the people in it.
 
-> **Notion and Granola tokens pasted into the Admin UI are write-only.** The UI will encrypt and
-> store them, but only the Slack/GitHub/Linear/Plane runners ever read stored secrets. Configure
-> those two in the sidecar's own `.env`. A `wise` option also appears in the Admin dropdown — it has
-> no connector behind it and produces nothing. Ignore it.
+> **A Notion token pasted into the Admin UI is write-only** — and so is its page/database
+> selection. The UI encrypts and stores both, but only the Slack/GitHub/Linear/Plane runners read
+> stored secrets, and the sidecar's selection merge maps Notion to a no-op, so neither the token nor
+> the page IDs reach anything. Configure Notion in the sidecar's own `.env` + `connections.yaml`.
+> A `wise` option also appears in the Admin dropdown — it has no connector behind it and produces
+> nothing. Ignore it.
 
 ---
 
@@ -277,13 +325,13 @@ This is the part that makes it a team brain rather than an empty database. Go to
 | Connector | What you paste |
 |---|---|
 | **Slack** | a bot token `xoxb-…` with `channels:history`, `channels:read`, `users:read`, then the channel IDs to follow |
-| **GitHub** | optionally a PAT, then `owner/repo` entries — public repos work token-free |
+| **GitHub** | optionally a PAT, then `owner/repo` entries — public repos work token-free. GitHub has its **own panel**, not the generic dropdown |
 | **Linear** | an API key + the Linear team id |
 | **Plane** | an API token + workspace/project |
 
 They start pulling on the next scheduler tick (≤ 30 min) and every 30 min after.
 
-For **Notion, Google Drive, Confluence, Granola, RSS and local files**, run the Python sidecar in
+For **Notion, Google Drive, Confluence, RSS, web pages and local files**, run the Python sidecar in
 `ingestion/` — it pulls on your infrastructure and pushes over the same API, so those credentials
 never touch the brain. It needs `BRAIN_URL`, `AIOS_API_KEY` and `AIOS_TEAM`, and its own
 `connections.yaml`. See [`ingestion/README.md`](ingestion/README.md).

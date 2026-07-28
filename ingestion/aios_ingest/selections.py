@@ -31,15 +31,6 @@ def _translate_slack(config: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def _translate_granola(config: dict[str, Any]) -> dict[str, Any]:
-    out: dict[str, Any] = {}
-    if "matchKeywords" in config:
-        out["topics"] = list(config["matchKeywords"])
-    if "participantEmails" in config:
-        out["participants"] = list(config["participantEmails"])
-    return out
-
-
 def _no_op(config: dict[str, Any]) -> dict[str, Any]:
     # No consuming adapter field yet (linear teamId/projectId, plane, wise, notion).
     # Translate to nothing so we never inject a key the adapter would reject.
@@ -51,7 +42,6 @@ def _no_op(config: dict[str, Any]) -> dict[str, Any]:
 # type never injects keys that would make build_source() raise TypeError.
 _SELECTION_TRANSLATORS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "slack": _translate_slack,
-    "granola": _translate_granola,
     "linear": _no_op,
     "plane": _no_op,
     "wise": _no_op,

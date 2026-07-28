@@ -93,7 +93,10 @@ export const SOURCE_RULES: Readonly<Record<string, SourceRules>> = {
   linear: { workTimeOnUnchangedBody: "work", retainSupersededBodies: true, emitsTicketDocuments: true },
   /** `planeWorkedAt` — same shape as Linear. */
   plane: { workTimeOnUnchangedBody: "work", retainSupersededBodies: true, emitsTicketDocuments: true },
-  /** Meeting occurrence time. */
+  /** RETIRED connector, still a registered sidecar key so a live `connections.yaml` naming it
+   *  degrades to a warning rather than aborting the run — so it still needs a stated policy. The
+   *  values are the same three the fallback default returns, which is why previously-ingested
+   *  granola items were unaffected by the removal. Nothing produces new ones. */
   granola: { workTimeOnUnchangedBody: "work", retainSupersededBodies: true, emitsTicketDocuments: false },
   /** The feed entry's own published/updated time — an event, not the scan's clock. */
   radar: { workTimeOnUnchangedBody: "work", retainSupersededBodies: true, emitsTicketDocuments: false },

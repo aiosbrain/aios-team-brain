@@ -18,7 +18,6 @@ from .payload import AccessTier, ItemKind, ItemPayload
 DEFAULT_KIND_BY_SOURCE: dict[str, ItemKind] = {
     "slack": "transcript",
     "meeting": "transcript",
-    "granola": "transcript",
     "gdrive": "deliverable",
     "notion": "deliverable",
     "confluence": "deliverable",
