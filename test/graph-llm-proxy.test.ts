@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   authorizeGraphProxy,
+  resolveGraphProxyTeamId,
   forwardBody,
   graphChatTarget,
   graphEmbeddingTarget,
@@ -143,5 +144,51 @@ describe("forwardBody — one place decides the model", () => {
     const body = { model: "original", messages: [] };
     forwardBody(body, "replaced");
     expect(body.model).toBe("original");
+  });
+});
+
+/**
+ * Team resolution against a stubbed client.
+ *
+ * The DEFAULT production shape — one team, `GRAPH_LLM_TEAM` unset — cannot be tested against the
+ * data-mechanics database, because that database is shared across suites and can never hold exactly
+ * one team. It went untested anywhere: deleting the auto-resolve branch outright left the entire
+ * suite green while a dm test's title claimed to cover it. For a money-spending endpoint, the default
+ * path is the last thing that should be uncovered.
+ */
+describe("resolveGraphProxyTeamId — the default production path", () => {
+  const stub = (rows: { id: string; slug: string }[]) =>
+    ({
+      from: () => ({
+        select: () => ({
+          eq: () => ({ maybeSingle: async () => ({ data: rows[0] ?? null }) }),
+          limit: async (n: number) => ({ data: rows.slice(0, n) }),
+        }),
+      }),
+    }) as unknown as Parameters<typeof resolveGraphProxyTeamId>[0];
+
+  it("auto-resolves when exactly one team exists and no slug is set", async () => {
+    const got = await resolveGraphProxyTeamId(stub([{ id: "team-1", slug: "acme" }]), undefined);
+    expect(isRefusal(got)).toBe(false);
+    if (isRefusal(got)) return;
+    expect(got.teamId).toBe("team-1");
+  });
+
+  it("REFUSES to guess when several teams exist", async () => {
+    const got = await resolveGraphProxyTeamId(
+      stub([
+        { id: "team-1", slug: "acme" },
+        { id: "team-2", slug: "other" },
+      ]),
+      undefined
+    );
+    if (!isRefusal(got)) throw new Error("expected a refusal");
+    expect(got.code).toBe("graph_proxy_team_ambiguous");
+  });
+
+  it("refuses when there is no team at all, rather than resolving to nothing", async () => {
+    const got = await resolveGraphProxyTeamId(stub([]), undefined);
+    if (!isRefusal(got)) throw new Error("expected a refusal");
+    expect(got.code).toBe("graph_proxy_no_team");
   });
 });

@@ -42,10 +42,14 @@ import { EMBEDDING_DIM } from "@/lib/api/schemas";
 /** Minimum shared-secret length. Not a password — a machine credential on a private network. */
 const MIN_SECRET_LEN = 32;
 
-export type ProxyRefusal = { status: number; code: string; message: string };
+/** `__refusal` is a real discriminant, not decoration: `forwardBody` returns a SPREAD of the
+ *  caller's body, so a structural check on `status`+`code` would classify an authenticated caller
+ *  who happens to send those top-level fields as a refusal — and then `Response.json(…, { status })`
+ *  with their value throws a 500. */
+export type ProxyRefusal = { __refusal: true; status: number; code: string; message: string };
 export type ProxyTarget = { url: string; headers: Record<string, string>; model: string };
 
-const refuse = (status: number, code: string, message: string): ProxyRefusal => ({ status, code, message });
+const refuse = (status: number, code: string, message: string): ProxyRefusal => ({ __refusal: true, status, code, message });
 
 /**
  * Constant-time bearer check against `GRAPH_LLM_PROXY_SECRET`.
@@ -175,7 +179,7 @@ export function forwardBody(body: Record<string, unknown>, model: string): Recor
 }
 
 export const isRefusal = (v: unknown): v is ProxyRefusal =>
-  typeof v === "object" && v !== null && "status" in v && "code" in v;
+  typeof v === "object" && v !== null && (v as { __refusal?: unknown }).__refusal === true;
 
 /**
  * Ceiling on authorized proxy calls per minute.
@@ -231,10 +235,15 @@ export async function forwardUpstream(
       signal: ctrl.signal,
     });
     const text = await res.text();
-    return new Response(text, {
-      status: res.status,
-      headers: { "Content-Type": res.headers.get("content-type") ?? "application/json" },
-    });
+    const headers: Record<string, string> = {
+      "Content-Type": res.headers.get("content-type") ?? "application/json",
+    };
+    // Pass the provider's OWN backoff through. Without it a 429 reaches Graphiti's SDK stripped of
+    // `retry-after`, so it falls back to blind exponential retry against a provider that just told us
+    // exactly how long to wait — needless load on the way out of the failure this module exists for.
+    const retryAfter = res.headers.get("retry-after");
+    if (retryAfter) headers["Retry-After"] = retryAfter;
+    return new Response(text, { status: res.status, headers });
   } finally {
     clearTimeout(timer);
   }

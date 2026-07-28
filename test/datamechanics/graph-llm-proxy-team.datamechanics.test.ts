@@ -12,7 +12,12 @@ import { db, seedTeam } from "./helpers";
  * choice about which team's money gets spent. On a multi-team instance that must refuse, not guess.
  */
 describe("graph proxy team resolution (real Postgres)", () => {
-  it("resolves automatically when the instance has exactly one team", async () => {
+  // NOTE the title. An earlier version of this called itself "resolves automatically when the
+  // instance has exactly one team" while passing an explicit slug — so it exercised the explicit
+  // branch and claimed the auto one. Deleting auto-resolve outright left the whole suite green. The
+  // auto branch cannot be tested here (this shared database can never hold exactly one team); it is
+  // covered against a stubbed client in `test/graph-llm-proxy.test.ts`.
+  it("resolves the team named by GRAPH_LLM_TEAM, against the real teams table", async () => {
     // Isolate: this table is shared with every other suite, so pin to a slug we just made.
     const seed = await seedTeam();
     const got = await resolveGraphProxyTeamId(db(), seed.teamSlug);

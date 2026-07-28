@@ -1,7 +1,9 @@
 import "server-only";
 import { runSql } from "@/lib/db/pg/pool";
+import { adminClient } from "@/lib/db/admin";
 import { graphitiConfigured, GraphitiClient } from "@/lib/graph/graphiti-client";
 import { getLlmHealth, type LlmHealth } from "@/lib/query/llm-health";
+import { resolveGraphChatTarget, resolveGraphEmbeddingTarget, isRefusal } from "@/lib/llm/graph-proxy";
 import {
   countGraphFacts,
   deriveGraphExtractionStalled,
@@ -48,6 +50,12 @@ export interface RetrievalHealth {
   graphLastProjectedAt: string | null; // most recent successful projection (null = never)
   graphStalled: boolean; // degraded specifically because the projector stopped writing (vs unreachable)
   graphExtractionStalled: boolean; // episodes are reaching Graphiti (202) but its extractor makes no facts
+  /** A CONFIG refusal from the graph LLM proxy — Anthropic selected, embeddings unset or the wrong
+   *  width, ambiguous team. Resolved from settings only (no upstream call, no spend), so it is free
+   *  to check on every render and lands here INSTANTLY. Without it a misconfiguration is
+   *  indistinguishable from the quota death this proxy was built to prevent: both would surface only
+   *  as a stall, 6h later, with the actionable message buried in another service's logs. */
+  graphProxyRefusal: string | null;
   graphFacts: number | null; // extracted RELATES_TO facts in Neo4j (null = unreadable)
   rerank: LegState;
   augment: LegState; // optional external retrieval-augment service (RETRIEVAL_AUGMENT_URL)
@@ -148,7 +156,16 @@ export async function getRetrievalHealth(teamId: string): Promise<RetrievalHealt
 
   // Graph + dense both hit the network — run them concurrently so the card render isn't serialized.
   const graphConfiguredNow = graphConfigured(process.env.GRAPHITI_URL);
-  const [dense, graphReachable, graphFresh, graphFacts, graphNewestFactAt, graphNewestEpisodeAt, llm] =
+  const [
+    dense,
+    graphReachable,
+    graphFresh,
+    graphFacts,
+    graphNewestFactAt,
+    graphNewestEpisodeAt,
+    graphProxyRefusal,
+    llm,
+  ] =
     await Promise.all([
     denseHealth(teamId, configured),
     graphConfiguredNow ? new GraphitiClient().healthcheck() : Promise.resolve(false),
@@ -156,6 +173,18 @@ export async function getRetrievalHealth(teamId: string): Promise<RetrievalHealt
     graphConfiguredNow ? countGraphFacts() : Promise.resolve(null),
     graphConfiguredNow ? newestFactAtMs() : Promise.resolve(null),
     graphConfiguredNow ? newestEpisodeAtMs(teamId) : Promise.resolve(null),
+    // Config-only resolution: no upstream call, nothing spent. Best-effort — a broken probe must
+    // never fail the admin page.
+    graphConfiguredNow
+      ? Promise.all([
+          resolveGraphChatTarget(adminClient(), teamId),
+          resolveGraphEmbeddingTarget(adminClient(), teamId),
+        ])
+          .then(([chat, embed]) =>
+            isRefusal(chat) ? chat.message : isRefusal(embed) ? embed.message : null
+          )
+          .catch(() => null)
+      : Promise.resolve(null),
     getLlmHealth(teamId),
   ]);
   const lastProjectedAtMs = graphFresh.lastProjectedAt ? Date.parse(graphFresh.lastProjectedAt) : null;
@@ -192,6 +221,7 @@ export async function getRetrievalHealth(teamId: string): Promise<RetrievalHealt
     graphLastProjectedAt: graphFresh.lastProjectedAt,
     graphStalled,
     graphExtractionStalled,
+    graphProxyRefusal,
     graphFacts,
     rerank,
     augment,

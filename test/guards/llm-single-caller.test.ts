@@ -9,7 +9,7 @@ import { join } from "node:path";
  * and `lib/meetings/llm-extract` each had a bespoke `LLM_BASE_URL ? openai : anthropic` transport
  * that ignored `teams.answering_provider`, so a team on OpenRouter still got arcs/meetings from
  * OpenAI. This guard fails the build if raw LLM transport (`new Anthropic(` or a `/chat/completions`
- * POST) appears anywhere outside the three sanctioned transport modules.
+ * POST) appears anywhere outside the sanctioned transport modules.
  *
  * Sanctioned (each MUST route through `selectLlmBackend`, asserted below):
  *   - lib/llm/complete.ts   — the shared non-streaming primitive every feature calls
