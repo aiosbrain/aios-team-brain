@@ -172,8 +172,6 @@ by hand). A missing `channels:read` is diagnosed by name in the ingest error.
 > selection. The UI encrypts and stores both, but only the Slack/GitHub/Linear/Plane runners read
 > stored secrets, and the sidecar's selection merge maps Notion to a no-op, so neither the token nor
 > the page IDs reach anything. Configure Notion in the sidecar's own `.env` + `connections.yaml`.
-> A `wise` option also appears in the Admin dropdown — it has no connector behind it and produces
-> nothing. Ignore it.
 
 ---
 

@@ -2,7 +2,7 @@
 
 Examples:
   aios-ingest list-sources
-  aios-ingest backfill --source github --opt repo=run-llama/llama_index --opt 'path_glob=*.md'
+  aios-ingest backfill --source notion --opt token=$NOTION_TOKEN --opt database_id=<id>
   aios-ingest sync --config connections.yaml
 """
 
@@ -185,10 +185,15 @@ def scan(repo_path, slug, full_name, window_days, backfill, rubric_path) -> None
 @main.command()
 @click.option("--config", "config_path", required=True, help="connections.yaml path")
 @click.option("--poll-interval", default=300, type=int, help="seconds between polls")
-@click.option("--renewal-interval", default=1800, type=int, help="seconds between watch-channel sweeps")
+@click.option("--renewal-interval", default=1800, type=int, help="(inert) reserved for Drive watch-channel sweeps — no watch manager is wired")
 @click.option("--state-db", default="aios_ingest_state.sqlite", help="sqlite path for cursors/channels")
 def schedule(config_path, poll_interval, renewal_interval, state_db) -> None:
-    """Run the background scheduler: poll connections + renew Drive watch channels."""
+    """Run the background scheduler: poll every configured connection on an interval.
+
+    NOTE: Drive watch-channel renewal is NOT wired. `build_scheduler` registers that job only
+    when a `WatchManager` is passed, and this command never constructs one — so Google Drive is
+    pull-on-a-schedule only and `--renewal-interval` is currently inert.
+    """
     from .scheduler import run as run_scheduler
     from .state import StateStore
 

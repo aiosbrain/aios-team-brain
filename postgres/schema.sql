@@ -1647,6 +1647,10 @@ create index if not exists subscriptions_team_idx on subscriptions (team_id);
 create table if not exists integrations (
   id uuid primary key default gen_random_uuid(),
   team_id uuid not null references teams(id) on delete cascade,
+  -- 'wise' and 'granola' are RETIRED: no runner, no source, absent from the Admin dropdown and
+  -- from the app's zod type union, so nothing can create one. The values stay in this CHECK on
+  -- PURPOSE — narrowing an enumerated CHECK is the #251 incident shape, and a self-host holding a
+  -- legacy row would fail its next schema load. Dead here is harmless; a failed deploy is not.
   type text not null check (type in ('github','granola','slack','wise','linear','plane','openai','anthropic','google','openrouter','typefully','notion')),
   name text not null,
   config jsonb not null default '{}',

@@ -5,8 +5,6 @@ permissive (MIT / Apache-2.0 / BSD) and compatible with redistribution under MIT
 
 | Component | Purpose | License |
 |-----------|---------|---------|
-| llama-index-readers-github | GitHub reader (optional alternative path) | MIT |
-| llama-index-readers-slack | Slack reader | MIT |
 | llama-index-readers-google | Google Drive reader | MIT |
 | llama-index-readers-notion | Notion reader | MIT |
 | llama-index-readers-confluence | Confluence reader | MIT |

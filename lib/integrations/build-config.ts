@@ -41,8 +41,6 @@ export function buildConfig(
       return { channelIds: list };
     case "github":
       return { repos: list };
-    case "wise":
-      return list[0] ? { profileId: list[0] } : {};
     case "notion":
       // `databaseId=<id>` selects a whole database; otherwise the entries are page ids.
       return kv.databaseId ? { databaseId: kv.databaseId } : { pageIds: list };

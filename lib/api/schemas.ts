@@ -388,7 +388,6 @@ export const INTEGRATION_TYPES = [
   // The connector already exists (ingestion/aios_ingest/sources/notion.py + notion_authors.py, which
   // resolves created_by/last_edited_by → the item's authors) — it just had nowhere to read a token from.
   "notion",
-  "wise",
   "linear",
   "plane",
   // LLM provider API keys. The key is stored encrypted in secret_ciphertext, same path as the
@@ -469,7 +468,6 @@ const integrationConfigSchemas: Record<IntegrationType, z.ZodType> = {
       inviteLink: z.string().url().max(500).optional(),
     })
     .strict(),
-  wise: z.object({ profileId: z.string().max(64).optional() }).strict(),
   // Either pageIds OR databaseId — the connector requires one (it raises if both are absent). Not
   // enforced here: a half-configured integration must be savable, and the connector reports the error.
   notion: z
@@ -569,7 +567,15 @@ export function validateIntegrationConfig(
       );
     }
   }
-  const parsed = integrationConfigSchemas[type].safeParse(value);
+  // A RETIRED type (`wise`, `granola`) or any forged value has no schema. The DB CHECK still
+  // tolerates the retired ones so a self-host's legacy row can't break a schema load — but nothing
+  // may CREATE one, and dereferencing the missing schema would surface a raw TypeError instead of
+  // a clean validation failure.
+  const schema = integrationConfigSchemas[type];
+  if (!schema) {
+    throw new IntegrationConfigError(`unknown or retired integration type "${type}"`);
+  }
+  const parsed = schema.safeParse(value);
   if (!parsed.success) {
     throw new IntegrationConfigError(
       parsed.error.issues

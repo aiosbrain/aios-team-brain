@@ -230,7 +230,6 @@ function RolePicker(props: {
 type IntegrationType =
   | "github"
   | "slack"
-  | "wise"
   | "linear"
   | "plane"
   | "openai"
@@ -251,7 +250,7 @@ export interface IntegrationRow {
 // Data-source connectors shown in the generic "Add an integration" form. Provider keys get their
 // own panel (PROVIDER_TYPES); GitHub gets its own repo panel (GithubReposPanel) — so both are
 // excluded here to avoid two places to manage the same thing.
-const TYPES: IntegrationType[] = ["slack", "notion", "linear", "plane", "wise"];
+const TYPES: IntegrationType[] = ["slack", "notion", "linear", "plane"];
 
 // LLM provider API keys — one set for the team, managed in the dedicated "AI provider keys" panel.
 const PROVIDER_TYPES = ["anthropic", "openai", "google"] as const;
@@ -273,7 +272,6 @@ const SELECTION_HINT: Partial<Record<IntegrationType, string>> = {
   notion: "page IDs (comma-separated), or databaseId=<id>",
   linear: "teamId=..., projectId=..., doneStateName=Done",
   plane: "workspaceSlug=..., projectId=..., doneStateName=DONE, externalSource=aios-backlog",
-  wise: "profile ID",
 };
 
 function summarizeConfig(type: IntegrationType, config: Record<string, unknown>): string {
