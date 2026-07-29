@@ -6,6 +6,7 @@ import { GitBranch, Gavel } from "lucide-react";
 import { MemberAvatar } from "@/components/people/member-avatar";
 import { SourceIcon, sourceLabel } from "@/components/icons/source-icon";
 import type { PersonDay, SignalGroup, SourceGroup, TaskGroup } from "@/lib/dashboard/timeline-group";
+import { headlineTask } from "@/lib/dashboard/pulse-digest";
 
 /**
  * One person's work card — the shared presentational unit behind BOTH the Pulse Timeline panel
@@ -125,8 +126,40 @@ function TaskCard({ task }: { task: TaskGroup }) {
   );
 }
 
-export function PersonWorkCard({ person }: { person: PersonDay }) {
+/**
+ * The SNAPSHOT row — one person in ~56px instead of the full card's ~300px. Shows who, their counts, and
+ * the single task they're most active on (`headlineTask`); the evidence tree stays in the full card. Both
+ * variants render the same `PersonDay`, so the Pulse roster and the Timeline still agree by construction
+ * (the #358 invariant) — this is the same data at a second density, not a second implementation.
+ */
+function PersonWorkRow({ person }: { person: PersonDay }) {
   const p = person;
+  const lead = headlineTask(p);
+  return (
+    <div className="flex items-center gap-2.5 rounded-md border border-border-subtle/60 px-3 py-2">
+      <MemberAvatar person={{ displayName: p.name, avatarUrl: p.avatarUrl }} size={24} />
+      <div className="min-w-0 flex-1">
+        <div className="flex items-baseline gap-2">
+          <p className="truncate text-sm font-medium text-ink">{p.name}</p>
+          <p className="shrink-0 text-[11px] text-ink-tertiary">{personSummary(p)}</p>
+        </div>
+        {lead ? (
+          <div className="mt-0.5 flex items-center gap-1.5">
+            <SourceIcon source={lead.source} className="size-3 shrink-0" />
+            <span className="min-w-0 flex-1 truncate text-[12px] text-ink-secondary">{lead.title}</span>
+          </div>
+        ) : p.summary ? (
+          <p className="mt-0.5 truncate text-[12px] text-ink-secondary">{p.summary}</p>
+        ) : null}
+      </div>
+      {lead ? <StatusPill status={lead.status} /> : null}
+    </div>
+  );
+}
+
+export function PersonWorkCard({ person, variant = "full" }: { person: PersonDay; variant?: "full" | "row" }) {
+  const p = person;
+  if (variant === "row") return <PersonWorkRow person={p} />;
   return (
     <div className="prism-card flex flex-col gap-3 p-4">
       <div className="flex items-center gap-2.5">
