@@ -47,11 +47,15 @@ export async function POST(req: NextRequest) {
   const target = await resolveGraphEmbeddingTarget(db, team.teamId);
   if (isRefusal(target)) return refusalResponse(target);
 
-  const forwarded = forwardBody(body, target.model);
+  const forwarded = forwardBody(body, target.model, target.provider);
   if (isRefusal(forwarded)) return refusalResponse(forwarded);
 
   try {
-    return await forwardUpstream(target, forwarded);
+    // Meter the graph's embedding spend into `llm_usage` (source `embeddings`). Best-effort inside
+    // `forwardUpstream`; never affects the response.
+    return await forwardUpstream(target, forwarded, {
+      meter: { db, teamId: team.teamId, source: "embeddings", kind: "embedding" },
+    });
   } catch (err) {
     const message = err instanceof Error ? err.message : "upstream request failed";
     return Response.json({ error: { message, type: "api_error" } }, { status: 502 });

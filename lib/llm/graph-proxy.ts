@@ -6,6 +6,8 @@ import { resolveAnsweringKeys } from "@/lib/query/answering";
 import { selectLlmBackend, type LlmBackend } from "@/lib/query/llm-backend";
 import { resolveEmbeddingBackend } from "@/lib/query/embedding-key";
 import { EMBEDDING_DIM } from "@/lib/api/schemas";
+import { recordLlmUsage, type LlmUsageSource } from "@/lib/costs/llm-usage";
+import { meterFromOpenAiResponse } from "@/lib/llm/cost";
 
 /**
  * The GRAPH LLM PROXY — an OpenAI-compatible façade so the Graphiti service uses the key configured
@@ -47,7 +49,9 @@ const MIN_SECRET_LEN = 32;
  *  who happens to send those top-level fields as a refusal — and then `Response.json(…, { status })`
  *  with their value throws a 500. */
 export type ProxyRefusal = { __refusal: true; status: number; code: string; message: string };
-export type ProxyTarget = { url: string; headers: Record<string, string>; model: string };
+/** `provider` (openrouter/openai/local/env) rides along ONLY so the meter can tag the ledger row — it
+ *  never affects transport, which is fully determined by `url`/`headers`/`model`. */
+export type ProxyTarget = { url: string; headers: Record<string, string>; model: string; provider: string };
 
 const refuse = (status: number, code: string, message: string): ProxyRefusal => ({ __refusal: true, status, code, message });
 
@@ -126,7 +130,7 @@ export function graphChatTarget(backend: LlmBackend): ProxyTarget | ProxyRefusal
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (backend.apiKey) headers.Authorization = `Bearer ${backend.apiKey}`;
   if (backend.kind === "openrouter") Object.assign(headers, backend.headers);
-  return { url: `${backend.baseUrl.replace(/\/$/, "")}/chat/completions`, headers, model: backend.model };
+  return { url: `${backend.baseUrl.replace(/\/$/, "")}/chat/completions`, headers, model: backend.model, provider: backend.provider };
 }
 
 /**
@@ -162,7 +166,7 @@ export function graphEmbeddingTarget(
     "Content-Type": "application/json",
     Authorization: `Bearer ${backend.apiKey}`,
   };
-  return { url: `${backend.baseUrl.replace(/\/$/, "")}/embeddings`, headers, model: backend.model };
+  return { url: `${backend.baseUrl.replace(/\/$/, "")}/embeddings`, headers, model: backend.model, provider: backend.provider };
 }
 
 /**
@@ -171,11 +175,22 @@ export function graphEmbeddingTarget(
  * surface area on a path that never uses it — and a silently-ignored `stream: true` would hang a
  * client waiting for chunks that never come.
  */
-export function forwardBody(body: Record<string, unknown>, model: string): Record<string, unknown> | ProxyRefusal {
+export function forwardBody(
+  body: Record<string, unknown>,
+  model: string,
+  provider?: string
+): Record<string, unknown> | ProxyRefusal {
   if (body.stream === true) {
     return refuse(400, "graph_proxy_no_stream", "This proxy does not support streaming; omit `stream`.");
   }
-  return { ...body, model };
+  const forwarded: Record<string, unknown> = { ...body, model };
+  // Ask OpenRouter to include the real `usage.cost` on the response, so the `source=graph`/`embeddings`
+  // meter records the actual charge rather than falling back to tokens-only. This mirrors every other
+  // sanctioned transport (`lib/llm/complete`, `lib/chat/title`, `lib/query/claude`): today's model
+  // returns cost regardless, but a different OpenRouter model can omit it unless asked, so we don't
+  // leave graph metering — the largest consumer — depending on that quirk. Harmless elsewhere.
+  if (provider === "openrouter") forwarded.usage = { include: true };
+  return forwarded;
 }
 
 export const isRefusal = (v: unknown): v is ProxyRefusal =>
@@ -214,17 +229,62 @@ export async function resolveGraphEmbeddingTarget(
 }
 
 /**
+ * The context the proxy needs to meter one forwarded call into `llm_usage`. `kind` selects the cost
+ * shape (chat has `completion_tokens`; an embedding has only `total_tokens`), `source` is the ledger
+ * slice — `graph` for extraction, `embeddings` for the graph's embedding half. All graph spend is
+ * system-initiated, so `member_id` is always null.
+ */
+export interface GraphMeterCtx {
+  db: DbClient;
+  teamId: string;
+  source: Extract<LlmUsageSource, "graph" | "embeddings">;
+  kind: "chat" | "embedding";
+}
+
+/**
+ * Meter one already-received upstream body. BEST-EFFORT and total: the graph leg is the thing this
+ * whole module exists to keep alive, so a metering failure must never affect the response — every
+ * error is swallowed. A non-JSON or usage-less body (a provider error, a stream, an odd shape) simply
+ * records nothing. Before this, ALL Graphiti extraction + embedding spend was invisible to the ledger,
+ * which is why the costs page read near-zero while the biggest LLM consumer ran unmetered.
+ */
+async function meterGraphCall(text: string, status: number, target: ProxyTarget, meter: GraphMeterCtx): Promise<void> {
+  try {
+    if (status < 200 || status >= 300) return; // only a successful call spent tokens
+    const c = meterFromOpenAiResponse(text, target.provider, target.model, meter.kind);
+    if (!c) return;
+    await recordLlmUsage(meter.db, {
+      teamId: meter.teamId,
+      memberId: null,
+      source: meter.source,
+      provider: target.provider,
+      model: target.model,
+      inputTokens: c.inputTokens,
+      outputTokens: c.outputTokens,
+      costUsd: c.costUsd,
+      estimated: c.estimated,
+    });
+  } catch {
+    // Never let metering touch the proxy path.
+  }
+}
+
+/**
  * Forward one already-authorized, already-resolved request upstream and hand back the raw response.
  *
  * Deliberately transparent: the upstream status and JSON pass through untouched, so a 429
  * `insufficient_quota` reaches Graphiti's logs looking exactly like it would have from the provider
  * directly. Rewriting provider errors here would hide the one signal an operator needs.
+ *
+ * When `opts.meter` is set, a successful call's `usage` is recorded to `llm_usage` (best-effort, after
+ * the body is read) — the one capture point both proxy halves share.
  */
 export async function forwardUpstream(
   target: ProxyTarget,
   body: Record<string, unknown>,
-  timeoutMs = 120_000
+  opts: { timeoutMs?: number; meter?: GraphMeterCtx } = {}
 ): Promise<Response> {
+  const { timeoutMs = 120_000, meter } = opts;
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
@@ -235,6 +295,7 @@ export async function forwardUpstream(
       signal: ctrl.signal,
     });
     const text = await res.text();
+    if (meter) await meterGraphCall(text, res.status, target, meter);
     const headers: Record<string, string> = {
       "Content-Type": res.headers.get("content-type") ?? "application/json",
     };

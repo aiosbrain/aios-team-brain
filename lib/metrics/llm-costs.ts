@@ -23,6 +23,8 @@ export const SOURCE_LABEL: Record<string, string> = {
   "timeline-summary": "Timeline summaries",
   social: "Social content",
   attribution: "Attribution",
+  graph: "Graph extraction",
+  embeddings: "Embeddings",
 };
 
 export interface CostSlice {
@@ -42,6 +44,15 @@ export interface LlmCostBreakdown {
   calls: number;
   /** true when ANY row in the window is an estimate — so the page can flag "includes estimates". */
   hasEstimates: boolean;
+  /** ISO timestamp of the EARLIEST metered call for this team, or null if the ledger is empty. The
+   *  ledger only began when cost metering shipped, so a 30d/90d window over a few days of data reads as
+   *  "the brain barely spends anything". The page uses this to say "tracking since <date>" instead of
+   *  letting empty pre-metering days masquerade as real low-spend days. */
+  trackingSince: string | null;
+  /** true when `trackingSince` falls INSIDE the selected window — i.e. metering began mid-window, so the
+   *  window covers fewer than `days` full days. Decided here (server) so the page needn't call `Date.now`
+   *  during render (a React purity violation). */
+  partialWindow: boolean;
   by_source: CostSlice[];
   by_model: CostSlice[];
   by_provider: CostSlice[];
@@ -100,11 +111,27 @@ export async function getLlmCostBreakdown(
   const calls = rows.length;
   const hasEstimates = rows.some((r) => r.estimated);
 
+  // Earliest metered call = when this team's ledger began (i.e. when metering shipped). Team-scoped,
+  // NOT role-scoped: "metering began on X" is an instance-level fact, not per-member spend, and a
+  // member with no rows of their own should still see the honest tracking date. Cheap: one indexed row.
+  const firstRes = await db
+    .from("llm_usage")
+    .select("created_at")
+    .eq("team_id", teamId)
+    .order("created_at", { ascending: true })
+    .limit(1)
+    .maybeSingle();
+  const firstAt = (firstRes.data as { created_at: string | Date } | null)?.created_at ?? null;
+  const trackingSince = firstAt ? new Date(firstAt).toISOString() : null;
+  const partialWindow = trackingSince != null && new Date(trackingSince) > windowStart;
+
   return {
     days,
     total_usd,
     calls,
     hasEstimates,
+    trackingSince,
+    partialWindow,
     by_source: slicesBy(rows, (r) => r.source, (k) => SOURCE_LABEL[k] ?? k),
     by_model: slicesBy(rows, (r) => r.model, (k) => k),
     by_provider: slicesBy(rows, (r) => r.provider, (k) => k),

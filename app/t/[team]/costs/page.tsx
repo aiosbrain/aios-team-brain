@@ -17,6 +17,9 @@ function usd(n: number): string {
   return `$${n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
+const fmtDay = (iso: string): string =>
+  new Date(iso).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+
 /**
  * Costs breakdown — the drill-down from the Pulse Spend KPI. "What is actually costing what": the
  * brain's own LLM inference spend (from `llm_usage`), sliced by feature (source), model, and provider.
@@ -53,6 +56,12 @@ export default async function CostsPage({
   const breakdown = await getLlmCostBreakdown(db, team.id, range, { isAdmin, memberId: me.id });
   const scopeWord = isAdmin ? "Team" : "Your";
 
+  // Show the "tracking since" caption only when metering began INSIDE the selected window — i.e. the
+  // window is wider than the data, so "last 30d" overstates coverage (decided server-side to avoid a
+  // `Date.now` call during render). Once the ledger predates the window the caption would just be noise.
+  const trackingCaption =
+    breakdown.partialWindow && breakdown.trackingSince ? fmtDay(breakdown.trackingSince) : null;
+
   return (
     <div className="mx-auto flex max-w-5xl flex-col gap-6">
       <div className="flex flex-col gap-1">
@@ -67,11 +76,14 @@ export default async function CostsPage({
           <HelpHint label="How costs are computed" align="left">
             The brain&apos;s own LLM inference spend, recorded per call in the <code>llm_usage</code> ledger —
             every generation the product makes: Q&amp;A, meeting extraction, narrative arcs, timeline
-            summaries, social content, chat titles.
+            summaries, social content, chat titles, <strong>graph extraction</strong> (the Graphiti
+            entity/fact pass — usually the largest), and <strong>embeddings</strong> (item indexing +
+            query/graph vectors).
             <br />
             <br />
-            Each call&apos;s cost is the real charge on OpenRouter (<code>usage.cost</code>) or a list-price
-            estimate on Anthropic. {isAdmin ? "You see the whole team's spend, including background jobs." : "You see only the spend you personally initiated."} Spend
+            Each call&apos;s cost is the real charge on OpenRouter (<code>usage.cost</code>), a list-price
+            estimate on Anthropic or OpenAI embeddings, or $0 for a self-hosted endpoint.{" "}
+            {isAdmin ? "You see the whole team's spend, including background jobs." : "You see only the spend you personally initiated."} Spend
             from before metering shipped isn&apos;t captured.
           </HelpHint>
         </h1>
@@ -82,12 +94,20 @@ export default async function CostsPage({
       </div>
 
       <div className="flex items-center justify-between gap-3">
-        <div className="flex items-baseline gap-3">
-          <span className="font-display text-3xl leading-none text-ink">{usd(breakdown.total_usd)}</span>
-          <span className="text-sm text-ink-tertiary">
-            {scopeWord} spend · last {breakdown.days}d · {breakdown.calls.toLocaleString("en-US")} call
-            {breakdown.calls === 1 ? "" : "s"}
-          </span>
+        <div className="flex flex-col gap-0.5">
+          <div className="flex items-baseline gap-3">
+            <span className="font-display text-3xl leading-none text-ink">{usd(breakdown.total_usd)}</span>
+            <span className="text-sm text-ink-tertiary">
+              {scopeWord} spend · last {breakdown.days}d · {breakdown.calls.toLocaleString("en-US")} call
+              {breakdown.calls === 1 ? "" : "s"}
+            </span>
+          </div>
+          {trackingCaption ? (
+            <span className="text-xs text-ink-tertiary/80">
+              Cost metering began {trackingCaption} — spend before then isn&apos;t captured, so this window
+              shows fewer than {breakdown.days} full days.
+            </span>
+          ) : null}
         </div>
         <RangeSelector value={range} />
       </div>
