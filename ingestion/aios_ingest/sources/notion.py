@@ -30,7 +30,9 @@ class NotionSource(PullOnlySource, Source):
         )
         reader = NotionPageReader(integration_token=self._token)
         if self._database_id:
-            docs = reader.load_data(database_id=self._database_id)
+            # `database_ids`, plural and a LIST — the reader has no single-valued `database_id`
+            # kwarg, so passing one is a TypeError that aborts the connection on its first tick.
+            docs = reader.load_data(database_ids=[self._database_id])
         else:
             docs = reader.load_data(page_ids=self._page_ids)
         raws = docs_to_raw(docs, source=self.name, id_keys=("page_id", "id"), fallback_prefix="notion")
