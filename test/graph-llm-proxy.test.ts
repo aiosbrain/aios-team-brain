@@ -267,3 +267,29 @@ describe("resolveGraphProxyTeamId — the default production path", () => {
     expect(got.code).toBe("graph_proxy_no_team");
   });
 });
+
+/**
+ * The timeout that silently broke extraction in production.
+ *
+ * 120s looked generous and was not: Graphiti's extraction prompts carry the episode plus resolution
+ * context, and real ones exceeded it — while a hand-built 16KB probe returned in 32s, so nothing
+ * local reproduced it. The OpenAI SDK then retried twice, so every job burned ~7-9 minutes and died.
+ * The queue drained and NOT ONE fact was created, and the only symptom was an opaque 502 inside
+ * another service's traceback.
+ *
+ * The caller should own the deadline (Graphiti's SDK defaults to 600s non-streaming), so ours must
+ * sit generously below that without being the binding constraint on a legitimately slow extraction.
+ */
+describe("the proxy's upstream timeout", () => {
+  it("is well clear of a slow extraction, and below the caller's own deadline", async () => {
+    const { PROXY_TIMEOUT_MS_FOR_TEST } = (await import("@/lib/llm/graph-proxy")) as unknown as {
+      PROXY_TIMEOUT_MS_FOR_TEST: number;
+    };
+    // Measured in prod: a 16KB structured-output call returns in ~32s. 120s was still too low for
+    // real prompts, so the floor here is deliberately far above the observed happy path.
+    expect(PROXY_TIMEOUT_MS_FOR_TEST).toBeGreaterThan(120_000);
+    // …and strictly under the OpenAI SDK's 600s default, so the CALLER's deadline is the outer bound
+    // and ours only releases a genuinely hung connection.
+    expect(PROXY_TIMEOUT_MS_FOR_TEST).toBeLessThan(600_000);
+  });
+});

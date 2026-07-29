@@ -11,8 +11,9 @@ import {
 } from "@/lib/llm/graph-proxy";
 
 export const runtime = "nodejs";
-/** Graphiti's extraction calls are slow (structured output over a long episode). */
-export const maxDuration = 120;
+/** Graphiti's extraction calls are slow (structured output over a long episode, plus resolution
+ *  context). 120 was too low and silently failed every job in prod — see `PROXY_TIMEOUT_MS`. */
+export const maxDuration = 300;
 
 /**
  * The OpenAI-compatible chat endpoint for the Graphiti service ONLY (its path is this file's
