@@ -39,17 +39,34 @@ this is the 60-second version so you can decide before reading them.
 anywhere. Not a laptop app — connectors poll on a schedule and everyone on the team hits the same
 instance.
 
-**What you need:**
+**What you need** — grouped by what actually breaks without it, because the difference between
+"won't boot" and "flagship feature is silently empty" is the difference between a good first run and
+concluding the product is broken:
+
+**Required — it will not run without these**
 
 | | |
 |---|---|
-| **Host** | anything that builds a Next.js app — **Node ≥ 20** + **Postgres 16**. We use Railway; nothing depends on it |
-| **One LLM key** | Anthropic by default. Or point `LLM_BASE_URL` at a local model and run the whole thing for **$0** |
-| **Two secrets** | `AUTH_SECRET` and `SECRETS_KEY`, both generated with one `openssl`/`node` command |
-| **Python ≥ 3.11 + `uv`** | **only** if you want the Notion / Google Drive / Confluence / RSS / web / local-file connectors, which run as a separate sidecar |
+| **1 · A host** | anything that builds a Next.js app — **Node ≥ 20**. We recommend **Railway**: it detects the app, ships Postgres with pgvector already enabled, and adds Neo4j in one click if you later want the context engine. Nothing in the code depends on it |
+| **2 · Postgres 16** | the source of truth — every item, task, decision and attribution |
+| **3 · Two secrets** | `AUTH_SECRET` signs sessions, `SECRETS_KEY` encrypts connector tokens at rest. Each is one generated command |
 
-**What it costs:** every connector API is free. You pay for embeddings and LLM calls — and if you
-self-host the model, that's zero too.
+**Needed for the brain to answer anything**
+
+| | |
+|---|---|
+| **4 · One LLM key** | Anthropic by default; OpenAI and OpenRouter also work. Or point `LLM_BASE_URL` at a model on your own hardware and run the whole thing for **$0**. Without it the dashboard works, but the query box can't answer |
+| **5 · Embeddings + pgvector** | `npm run pg:schema:vector` once, then an embeddings model (Admin → Integrations, or `EMBEDDINGS_*` env). **Skipping this is quiet:** retrieval silently degrades to keyword-only FTS, so a question whose answer never uses the question's words stops being findable |
+
+**Optional — but each one turns something off**
+
+| | |
+|---|---|
+| **6 · Neo4j + Graphiti** | the **context engine**. Two more services and a **second** LLM key (Graphiti runs its own entity extraction). Powers the **narrative arcs on Pulse**, the learning panel, and graph-grounded answers. Leave it out and timeline, search, tasks and meetings are unaffected — but **Pulse opens without its headline**. §2.8 |
+| **7 · Python ≥ 3.11 + `uv`** | **only** for the sidecar connectors — Notion / Google Drive / Confluence / RSS / web / local files. Slack, GitHub, Linear and Plane run inside the app and need none of it |
+
+**What it costs:** every connector API is free. You pay for embeddings and LLM calls — plus a second
+LLM key if you run the context engine. Self-host the model and all of it is zero.
 
 **How content gets in — you can use either path alone:**
 
@@ -60,8 +77,9 @@ self-host the model, that's zero too.
   the connectors feed the brain on their own. See
   [the quickstart](https://aiosbrain.dev/guides/quickstart).
 
-**Roughly:** deploy the app → set the env vars → load the schema → create the first admin → connect
-one source. Everything below is that, in dependency order, with the failure modes called out.
+**Roughly:** deploy the app → set the env vars → load the schema → load the vector schema → create
+the first admin → connect one source. Add Neo4j + Graphiti later, or never. Everything below is that,
+in dependency order, with the failure modes called out.
 
 > **Joining a team that already runs one?** You don't need any of this — you need an invite. See
 > [Onboarding a contributor](https://aiosbrain.dev/guides/quickstart#part-2--connect-to-a-team-brain).
