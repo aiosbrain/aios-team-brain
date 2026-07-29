@@ -13,6 +13,9 @@
  * with. Skip the whole demo with SEED_DEMO=false.
  */
 import { spawnSync } from "node:child_process";
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import path from "node:path";
+import { randomBytes } from "node:crypto";
 import pg from "pg";
 import { shouldUseSsl } from "../scripts/pg-load-schema.mjs";
 
@@ -71,7 +74,57 @@ async function teamCount() {
   }
 }
 
+/**
+ * Generate AUTH_SECRET / SECRETS_KEY on first boot and persist them, so no fake secret has
+ * to be committed to the repo (the secret scanner is right to reject one, and a committed
+ * "dev" key is the kind of thing that gets copied into a real deploy).
+ *
+ * Persisted, not per-boot, because both must be STABLE: a rotating SECRETS_KEY orphans every
+ * connector token already encrypted with the old one, and a rotating AUTH_SECRET invalidates
+ * every session cookie on each restart. Values supplied by the environment always win and are
+ * never written to disk.
+ *
+ * Written as a shell-sourceable file: bootstrap runs as a child process, so it cannot mutate
+ * the environment of the server the entrypoint goes on to exec — the entrypoint sources this.
+ */
+function ensureDevSecrets() {
+  const file = process.env.DEV_SECRETS_FILE;
+  if (!file) return;
+
+  const existing = existsSync(file) ? parseShellEnv(readFileSync(file, "utf8")) : {};
+  const resolved = {
+    AUTH_SECRET: process.env.AUTH_SECRET || existing.AUTH_SECRET || randomBytes(32).toString("hex"),
+    // Exactly 32 bytes — AES-256-GCM. `npm run doctor` fails a key of any other width.
+    SECRETS_KEY: process.env.SECRETS_KEY || existing.SECRETS_KEY || randomBytes(32).toString("base64"),
+  };
+
+  const fromEnv = Boolean(process.env.AUTH_SECRET && process.env.SECRETS_KEY);
+  if (!fromEnv) {
+    mkdirSync(path.dirname(file), { recursive: true });
+    writeFileSync(file, `AUTH_SECRET='${resolved.AUTH_SECRET}'\nSECRETS_KEY='${resolved.SECRETS_KEY}'\n`, { mode: 0o600 });
+    chmodSync(file, 0o600);
+    console.log(
+      Object.keys(existing).length
+        ? "▶ reusing the generated dev secrets from the appdata volume"
+        : "▶ generated AUTH_SECRET + SECRETS_KEY (persisted to the appdata volume)"
+    );
+  }
+  Object.assign(process.env, resolved);
+}
+
+/** Reads back only what ensureDevSecrets writes: KEY='value', one per line. */
+function parseShellEnv(text) {
+  const out = {};
+  for (const line of text.split(/\r?\n/)) {
+    const m = /^([A-Z_]+)='(.*)'$/.exec(line.trim());
+    if (m) out[m[1]] = m[2];
+  }
+  return out;
+}
+
 async function main() {
+  ensureDevSecrets();
+
   console.log("▶ waiting for postgres…");
   await waitForDatabase();
 
