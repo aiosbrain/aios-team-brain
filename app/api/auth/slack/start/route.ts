@@ -11,8 +11,24 @@ const NO_STORE = { "Cache-Control": "no-store" };
 
 // USER scopes for "act as me" — the OAuth flow yields an `xoxp-` user token (authed_user.access_token),
 // the one-click counterpart of the manual-paste path (POST /api/v1/me/slack-token). `users:read.email`
-// is what lets the by-email identity auto-map work afterward.
-const USER_SCOPES = "chat:write,im:write,users:read,users:read.email,reactions:write,channels:read";
+// is what lets the by-email identity auto-map work afterward. Keep this in sync with the
+// `slack-personal` descriptor in aios-workspace.
+const USER_SCOPES = [
+  "chat:write",
+  "im:write",
+  "im:read",
+  "im:history",
+  "channels:read",
+  "channels:history",
+  "groups:read",
+  "groups:history",
+  "mpim:read",
+  "mpim:history",
+  "users:read",
+  "users:read.email",
+  "reactions:write",
+  "files:write",
+].join(",");
 
 /**
  * Begin one-click Slack OAuth. Member-API-key authed: the member/team come from the key, are bound

@@ -113,7 +113,7 @@ describe("one-click Slack OAuth (start/callback/status, real Postgres)", () => {
     const u = new URL(authorize_url);
     expect(u.origin + u.pathname).toBe("https://slack.com/oauth/v2/authorize");
     expect(u.searchParams.get("user_scope")).toBe(
-      "chat:write,im:write,users:read,users:read.email,reactions:write,channels:read"
+      "chat:write,im:write,im:read,im:history,channels:read,channels:history,groups:read,groups:history,mpim:read,mpim:history,users:read,users:read.email,reactions:write,files:write"
     );
     expect(u.searchParams.get("redirect_uri")).toBe("http://test/api/auth/slack/callback");
     const state = u.searchParams.get("state");
