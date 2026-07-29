@@ -55,7 +55,7 @@ concluding the product is broken:
 
 | | |
 |---|---|
-| **4 · One LLM key** | Anthropic by default; OpenAI and OpenRouter also work. Or point `LLM_BASE_URL` at a model on your own hardware and run the whole thing for **$0**. Without it the dashboard works, but the query box can't answer |
+| **4 · One LLM key — any provider** | The brain is model-agnostic: **Anthropic**, **OpenAI**, **OpenRouter** (one key, hundreds of models from every major lab), or any **OpenAI-compatible endpoint** — including a model on your own hardware for **$0**. Switchable per team from Admin → Integrations with no redeploy, and **answering / reasoning / embeddings are chosen independently**, so a cheap model can do the routine work while a stronger one handles synthesis. Without a key the dashboard works, but the query box can't answer. See [docs/PROVIDERS.md](docs/PROVIDERS.md) |
 | **5 · Embeddings + pgvector** | `npm run pg:schema:vector` once, then an embeddings model (Admin → Integrations, or `EMBEDDINGS_*` env). **Skipping this is quiet:** retrieval silently degrades to keyword-only FTS, so a question whose answer never uses the question's words stops being findable |
 
 **Optional — but each one turns something off**
