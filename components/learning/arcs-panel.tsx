@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { Loader2, Sparkles, RefreshCw, ChevronRight, ExternalLink } from "lucide-react";
+import { digest, DIGEST_ARC_LIMIT } from "@/lib/dashboard/pulse-digest";
 
 interface ArcEvidence {
   fact: string;
@@ -30,9 +31,18 @@ const CONF: Record<string, string> = {
 
 type Status = "loading" | "ready" | "error";
 
-/** Layer 3 — narrative arcs, with inline-editable summaries + human-correction recompute. */
-export function ArcsPanel({ teamSlug }: { teamSlug: string }) {
+/**
+ * Layer 3 — narrative arcs, with inline-editable summaries + human-correction recompute.
+ *
+ * `variant="digest"` is the Pulse SNAPSHOT rendering: the top `DIGEST_ARC_LIMIT` arcs as clamped
+ * headlines, so the band that answers "what's happening" has a fixed height instead of one proportional
+ * to `MAX_ARCS`. It expands to the full editable list in place ("Show all N") — deliberately ONE panel
+ * rather than a digest up top plus a duplicate list below, so there is no second fetch and no way for
+ * the two to disagree. Editing is a full-view affordance: a two-line clamp is not an editing surface.
+ */
+export function ArcsPanel({ teamSlug, variant = "full" }: { teamSlug: string; variant?: "full" | "digest" }) {
   const [arcs, setArcs] = useState<Arc[]>([]);
+  const [expanded, setExpanded] = useState(false);
   const [status, setStatus] = useState<Status>("loading");
   // Why the panel is empty (server-diagnosed): no_facts | model_failing | synthesis_empty | null.
   const [emptyReason, setEmptyReason] = useState<string | null>(null);
@@ -146,6 +156,75 @@ export function ArcsPanel({ teamSlug }: { teamSlug: string }) {
     );
   }
 
+  // Unsaved corrections must follow the user across the collapse. The digest renders `edited[...]` text,
+  // so without this a collapsed panel showed a correction as if it had been applied while the only save
+  // control lived in the expanded view — an in-memory edit with no visible way to commit or discard it.
+  const pendingCount = Object.keys(edited).length;
+  // The failure notice travels WITH the Recompute button. Rendering the control in both densities but the
+  // "it didn't save" alert in only one would recreate the silent-revert the alert exists to prevent.
+  const pendingBanner = (
+    <>
+      {pendingCount > 0 ? (
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-violet/25 bg-violet/5 px-4 py-3">
+          <p className="text-sm text-ink-secondary">
+            {pendingCount} arc{pendingCount > 1 ? "s" : ""} edited — recompute to fold your corrections back
+            into the graph.
+          </p>
+          <button
+            type="button"
+            onClick={recompute}
+            disabled={recomputing}
+            className="btn-prism inline-flex shrink-0 items-center gap-1.5"
+          >
+            {recomputing ? <Loader2 className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
+            Recompute
+          </button>
+        </div>
+      ) : null}
+      {saveError ? (
+        <p role="alert" className="px-1 pt-2 text-sm text-rose-500">
+          {saveError}
+        </p>
+      ) : null}
+    </>
+  );
+
+  // SNAPSHOT — bounded headlines. Height stops tracking arc count, which is the whole point of the
+  // Pulse header; the full list (with editing + evidence) is one click away in the same panel.
+  if (variant === "digest" && !expanded) {
+    const { shown, hidden, total } = digest(arcs, DIGEST_ARC_LIMIT);
+    return (
+      <div className="flex flex-col gap-2">
+        {shown.map((arc) => (
+          <div key={arc.id} className="prism-card flex flex-col gap-1 p-3">
+            <div className="flex items-start justify-between gap-3">
+              <h3 className="text-sm font-medium leading-snug text-ink">{arc.title}</h3>
+              <span className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-medium ${CONF[arc.confidence]}`}>
+                {arc.confidence}
+              </span>
+            </div>
+            <p className="line-clamp-2 text-[13px] leading-snug text-ink-secondary">
+              {edited[arc.id] ?? arc.summary}
+            </p>
+          </div>
+        ))}
+        {/* UNCONDITIONAL — not `hidden > 0`. This panel is mounted in exactly one place (the Pulse
+            snapshot), so gating the only route into the expanded view on "there are more than 3 arcs"
+            made summary editing, human-correction recompute, evidence trails, and the un-clamped
+            prose unreachable ANYWHERE in the product whenever the model returned ≤ 3 arcs. */}
+        <button
+          type="button"
+          onClick={() => setExpanded(true)}
+          aria-expanded={false}
+          className="w-fit text-xs font-medium text-violet hover:underline"
+        >
+          {hidden > 0 ? `Show all ${total} arcs →` : "View & edit arcs →"}
+        </button>
+        {pendingBanner}
+      </div>
+    );
+  }
+
   return (
     <div className="flex flex-col gap-3">
       {arcs.map((arc) => {
@@ -236,28 +315,19 @@ export function ArcsPanel({ teamSlug }: { teamSlug: string }) {
         );
       })}
 
-      {Object.keys(edited).length > 0 ? (
-        <div className="flex items-center justify-between gap-3 rounded-xl border border-violet/25 bg-violet/5 px-4 py-3">
-          <p className="text-sm text-ink-secondary">
-            {Object.keys(edited).length} arc{Object.keys(edited).length > 1 ? "s" : ""} edited — recompute to
-            fold your corrections back into the graph.
-          </p>
-          <button
-            type="button"
-            onClick={recompute}
-            disabled={recomputing}
-            className="btn-prism inline-flex shrink-0 items-center gap-1.5"
-          >
-            {recomputing ? <Loader2 className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
-            Recompute
-          </button>
-        </div>
+      {/* Reversible — an expansion you can't undo turns the snapshot into a one-way trip to the old feed. */}
+      {variant === "digest" ? (
+        <button
+          type="button"
+          onClick={() => setExpanded(false)}
+          aria-expanded={true}
+          className="w-fit text-xs font-medium text-violet hover:underline"
+        >
+          ← Show fewer
+        </button>
       ) : null}
-      {saveError ? (
-        <p role="alert" className="px-1 pt-2 text-sm text-rose-500">
-          {saveError}
-        </p>
-      ) : null}
+
+      {pendingBanner}
     </div>
   );
 }

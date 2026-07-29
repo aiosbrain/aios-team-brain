@@ -39,9 +39,12 @@ import { TaskFunnel } from "@/components/charts/task-funnel";
 export const metadata: Metadata = { title: "Pulse" };
 
 /** A collapsed section that defers its heavy/secondary content behind a disclosure. */
-function Section({ title, subtitle, defaultOpen = false, children }: { title: string; subtitle?: string; defaultOpen?: boolean; children: React.ReactNode }) {
+function Section({ id, title, subtitle, defaultOpen = false, children }: { id?: string; title: string; subtitle?: string; defaultOpen?: boolean; children: React.ReactNode }) {
   return (
-    <details open={defaultOpen} className="group/sec rounded-lg border border-border-subtle px-4 py-3">
+    // `id` is the anchor target for the snapshot's "Full timeline →" — it scrolls the disclosure into
+    // view (still one click to open). Deliberately not auto-opened: fragment auto-expansion of <details>
+    // is not portable across browsers, so relying on it would work in Chrome and silently do nothing else.
+    <details id={id} open={defaultOpen} className="group/sec scroll-mt-4 rounded-lg border border-border-subtle px-4 py-3">
       <summary className="flex cursor-pointer list-none items-center gap-2 text-sm font-semibold uppercase tracking-wider text-ink-tertiary">
         <ChevronRight className="size-3.5 shrink-0 transition-transform group-open/sec:rotate-90" />
         {title}
@@ -184,7 +187,7 @@ export default async function TeamHome({
   ]);
 
   return (
-    <div className="mx-auto flex max-w-5xl flex-col gap-6">
+    <div className="mx-auto flex max-w-6xl flex-col gap-6">
       {pipelineHealth ? <PipelineHealthBanner health={pipelineHealth} href={`/t/${teamSlug}/admin/integrations#ingestion-runs`} /> : null}
 
       <div>
@@ -203,19 +206,37 @@ export default async function TeamHome({
 
       <AskBar teamSlug={teamSlug} teamName={team.name} />
 
-      {/* HERO — narrative arcs: the story of the team right now. */}
+      {/* ── SNAPSHOT ─────────────────────────────────────────────────────────────────────────────────
+          The bounded "one screen" answer to *what's happening right now*. Every band here is capped, so
+          the header's height is CONSTANT regardless of how many arcs/people exist — the property that
+          separates a dashboard from the feed this page used to be. Everything below is a disclosure. */}
+
+      {/* The three numbers, promoted out of the Metrics disclosure. The range selector comes with them
+          because it's what scopes them; the charts it also drives stay collapsed below. */}
       <section className="flex flex-col gap-3">
-        <BandHeading title="Narrative arcs · most recent" />
-        <ArcsPanel teamSlug={teamSlug} />
+        <div className="flex items-center justify-between gap-3">
+          <BandHeading title="At a glance" />
+          <RangeSelector value={range} />
+        </div>
+        <KpiBand kpis={pulse.kpis} teamSlug={teamSlug} />
       </section>
 
-      {/* Who's doing what — reads the SAME work-timeline layer as the Timeline below (shared card), so
-          they agree by construction. The consistency fix (#358) lives inside this component, which
-          renders its own "Working on" heading. */}
-      <WorkingOn teamSlug={teamSlug} />
+      {/* Story beside people, not above them — the single column was leaving ~half the width empty while
+          pushing "who's on what" a full screen down. */}
+      <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
+        <section className="flex flex-col gap-3 lg:col-span-2">
+          <BandHeading title="What's happening" />
+          <ArcsPanel teamSlug={teamSlug} variant="digest" />
+        </section>
+
+        {/* Who's doing what — reads the SAME work-timeline layer as the Timeline below (shared card), so
+            they agree by construction. The consistency fix (#358) lives inside this component, which
+            renders its own "Working on" heading. */}
+        <WorkingOn teamSlug={teamSlug} variant="roster" timelineHref="#timeline" />
+      </div>
 
       {/* Timeline — the per-day drill-down (absorbed from the old Learning tab), collapsed by default. */}
-      <Section title="Timeline" subtitle="recent work, by day">
+      <Section id="timeline" title="Timeline" subtitle="recent work, by day">
         <Suspense
           fallback={
             <p className="flex items-center gap-2 px-1 py-4 text-sm text-ink-tertiary">
@@ -227,14 +248,12 @@ export default async function TeamHome({
         </Suspense>
       </Section>
 
-      {/* Operational metrics — subordinate to the story; open for admins, collapsed for members. The
-          range selector lives here because it only drives these charts. */}
-      <Section title="Metrics" subtitle="knowledge, usage, and tasks" defaultOpen={isAdmin}>
+      {/* Operational charts — subordinate to the story, and now collapsed for EVERYONE. The headline
+          numbers were promoted to the "At a glance" ribbon (with the range selector that scopes them);
+          what's left is ~700px of charts, which is drill-down, not snapshot. Opening it by default for
+          admins was pushing the fold down for exactly the people who look at this page most. */}
+      <Section title="Metrics" subtitle="knowledge, usage, and tasks">
         <div className="flex flex-col gap-6">
-          <div className="flex items-center justify-end">
-            <RangeSelector value={range} />
-          </div>
-          <KpiBand kpis={pulse.kpis} teamSlug={teamSlug} />
           {/* Brain usage (queries + spend) is the primary signal, so it gets the width; knowledge
               growth is a smaller secondary visual beside it. */}
           <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
