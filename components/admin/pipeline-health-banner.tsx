@@ -35,7 +35,11 @@ const LABEL: Record<string, string> = {
  */
 export function PipelineHealthBanner({ health, href }: { health: PipelineHealth; href: string }) {
   const signature = alertSignature(health.failing);
-  const storageKey = `pipeline-alert-dismissed:${href}`;
+  // Key on the PATH, not the whole href: the link now carries a `#ingestion-runs` fragment, and keying
+  // on the full string would silently un-dismiss every already-dismissed banner the moment that anchor
+  // was added (and again on any future fragment change). The fragment picks a scroll position; it isn't
+  // a different surface.
+  const storageKey = `pipeline-alert-dismissed:${href.split("#")[0]}`;
   // `hydrated` false during SSR + first client render (matching markup); the mount effect reads the
   // client-only localStorage to decide if THIS exact alert was already dismissed.
   const [state, setState] = useState<{ hydrated: boolean; dismissed: boolean }>({ hydrated: false, dismissed: false });
