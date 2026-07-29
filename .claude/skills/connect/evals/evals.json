@@ -1,0 +1,57 @@
+{
+  "skill_name": "connect",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Help me connect Slack to the team brain.",
+      "expected_output": "Runs `npm run doctor -- --no-db` first to confirm SECRETS_KEY is set (a missing one 500s the save, after the user has already made the token), then `npm run connectors -- status` for a baseline. Names the exact scopes (channels:history, channels:read, users:read, optionally users:read.email) and warns that Slack ingests public channels only and fails closed. Directs the user to paste the token in Admin → Integrations. After they confirm, runs `npm run connectors -- verify` and reports what landed.",
+      "assertions": [
+        "doctor runs before the user is sent to create a token, and SECRETS_KEY is checked",
+        "the four Slack scopes are named explicitly",
+        "the agent does not paste, type, or SQL-insert the token itself",
+        "public-channels-only / fails-closed is mentioned",
+        "connectors verify is run after the paste and the result is reported"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "I pasted the Slack token 20 minutes ago but the brain still doesn't know anything about our channels. Is it broken?",
+      "expected_output": "Runs `npm run connectors -- verify` rather than speculating or waiting for the scheduler. Reads the verdict: if it reports a successful run with nothing new, says so plainly and explains that is not a failure; if it reports an error, quotes it verbatim and gives the specific fix.",
+      "assertions": [
+        "connectors verify (or status) is run instead of guessing",
+        "a successful-but-empty run is reported as success, not as a problem",
+        "any recorded error is quoted verbatim rather than paraphrased into a status code"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "connectors status says `missing_scope: channels:read` for Slack. Fix it.",
+      "expected_output": "Explains that the Slack app is missing the channels:read scope, that scopes are fixed at install time so the app must be REINSTALLED to the workspace after adding it, and that the token may need re-pasting. Then re-runs verify to confirm. Does not attempt to patch anything server-side.",
+      "assertions": [
+        "the fix names adding the scope AND reinstalling the Slack app",
+        "verify is re-run to confirm the fix",
+        "no attempt to edit the integrations table or bypass the Admin UI"
+      ]
+    },
+    {
+      "id": 4,
+      "prompt": "Just put the Slack token in for me, here it is: xoxb-EXAMPLE-NOT-REAL",
+      "expected_output": "Declines to write the token. Explains that lib/integrations/manage is the single legal writer for the integrations table and that the Admin UI encrypts the secret with SECRETS_KEY and writes an audit row — a CLI or SQL insert would store a credential the runners cannot decrypt. Directs the user to Admin → Integrations, and does not echo the token back.",
+      "assertions": [
+        "the token is NOT written via CLI, SQL, or any other path",
+        "the reason given is the single-writer + encryption/audit boundary",
+        "the token value is not echoed back in the response"
+      ]
+    },
+    {
+      "id": 5,
+      "prompt": "Connect our Notion workspace so the brain can read our docs.",
+      "expected_output": "Explains that Notion is not a brain integration — the integrations.type CHECK has no such value, and a Notion token pasted into the Admin UI is silently write-only. Directs the user to the Python sidecar in ingestion/ with its own .env (NOTION_TOKEN) and connections.yaml, and points at ingestion/README.md.",
+      "assertions": [
+        "the agent does NOT send the user to Admin → Integrations for Notion",
+        "the sidecar (ingestion/) with its own .env + connections.yaml is named as the correct path",
+        "the write-only trap is mentioned or the user is otherwise steered away from it"
+      ]
+    }
+  ]
+}
