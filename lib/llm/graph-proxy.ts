@@ -2,6 +2,7 @@ import "server-only";
 import { timingSafeEqual } from "node:crypto";
 import type { DbClient } from "@/lib/db/types";
 import { rateLimit } from "@/lib/api/rate-limit";
+import { resolvePositiveInt } from "@/lib/util/env";
 import { resolveAnsweringKeys } from "@/lib/query/answering";
 import { selectLlmBackend, type LlmBackend } from "@/lib/query/llm-backend";
 import { resolveEmbeddingBackend } from "@/lib/query/embedding-key";
@@ -207,6 +208,22 @@ export const isRefusal = (v: unknown): v is ProxyRefusal =>
  */
 const PROXY_CALLS_PER_MINUTE = 120;
 
+/**
+ * How long we wait on the provider before giving up.
+ *
+ * Was 120s, and that was WRONG in a way only production showed: Graphiti's extraction prompts carry
+ * the episode plus resolution context, and real ones exceeded it — while a hand-built 16KB probe
+ * returned in 32s, so nothing local reproduced it. The OpenAI SDK then retried twice, so every job
+ * burned ~7-9 minutes and died, the queue drained, and NOT ONE fact was created.
+ *
+ * The caller should own the deadline. Graphiti's client has its own (the OpenAI SDK defaults to
+ * 600s non-streaming), so this sits generously below that: high enough never to be the binding
+ * constraint on a legitimately slow extraction, low enough to release a truly hung connection.
+ */
+const PROXY_TIMEOUT_MS = resolvePositiveInt(process.env.GRAPH_PROXY_TIMEOUT_MS, 300_000);
+/** Exported for the guard test only — the value is a production incident, not a taste preference. */
+export const PROXY_TIMEOUT_MS_FOR_TEST = PROXY_TIMEOUT_MS;
+
 /** Shared bucket for both halves of the proxy: one credential, one budget. */
 export async function graphProxyWithinRateLimit(db: DbClient): Promise<boolean> {
   return rateLimit(db, "graph-llm-proxy", PROXY_CALLS_PER_MINUTE);
@@ -284,9 +301,10 @@ export async function forwardUpstream(
   body: Record<string, unknown>,
   opts: { timeoutMs?: number; meter?: GraphMeterCtx } = {}
 ): Promise<Response> {
-  const { timeoutMs = 120_000, meter } = opts;
+  const { timeoutMs = PROXY_TIMEOUT_MS, meter } = opts;
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  const startedAt = Date.now();
   try {
     const res = await fetch(target.url, {
       method: "POST",
@@ -304,7 +322,18 @@ export async function forwardUpstream(
     // exactly how long to wait — needless load on the way out of the failure this module exists for.
     const retryAfter = res.headers.get("retry-after");
     if (retryAfter) headers["Retry-After"] = retryAfter;
+    // ONE line per call, with the duration. The first real outage on this path took log forensics
+    // across two services to attribute (an abort here surfaced only as an opaque 502 in Graphiti's
+    // traceback); a timing line makes "the proxy timed out" self-evident next time.
+    console.log(`[graph-proxy] ${target.url} -> ${res.status} in ${Date.now() - startedAt}ms`);
     return new Response(text, { status: res.status, headers });
+  } catch (err) {
+    const ms = Date.now() - startedAt;
+    const aborted = err instanceof Error && err.name === "AbortError";
+    console.warn(
+      `[graph-proxy] ${target.url} -> ${aborted ? `ABORTED by our own ${timeoutMs}ms timeout` : "failed"} after ${ms}ms`
+    );
+    throw err;
   } finally {
     clearTimeout(timer);
   }
