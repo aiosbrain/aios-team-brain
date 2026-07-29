@@ -138,7 +138,7 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ t
 
   return (
     <div className="flex flex-col gap-4">
-      <PipelineHealthBanner health={pipelineHealth} href={`/t/${teamSlug}/admin/integrations`} />
+      <PipelineHealthBanner health={pipelineHealth} href={`/t/${teamSlug}/admin/integrations#ingestion-runs`} />
       <div>
         <h1 className="text-xl font-semibold text-ink">Integrations</h1>
         <p className="mt-1 text-sm text-ink-secondary">
@@ -189,7 +189,9 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ t
         }}
       />
       <MemberOnboardingPanel teamSlug={teamSlug} values={onboardingValues} />
-      <div>
+      {/* `scroll-mt-*` so the sticky-ish header doesn't cover the heading when the banner's
+          `#ingestion-runs` link jumps here — without it the anchor lands with the title clipped. */}
+      <div id="ingestion-runs" className="scroll-mt-6">
         <h2 className="text-sm font-semibold text-ink">Recent ingestion runs</h2>
         <p className="mb-2 mt-1 text-xs text-ink-secondary">
           Every scheduler tick, manual <code>/sync</code>, and codebase scan and its outcome — so a

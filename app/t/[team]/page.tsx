@@ -185,7 +185,7 @@ export default async function TeamHome({
 
   return (
     <div className="mx-auto flex max-w-5xl flex-col gap-6">
-      {pipelineHealth ? <PipelineHealthBanner health={pipelineHealth} href={`/t/${teamSlug}/admin/integrations`} /> : null}
+      {pipelineHealth ? <PipelineHealthBanner health={pipelineHealth} href={`/t/${teamSlug}/admin/integrations#ingestion-runs`} /> : null}
 
       <div>
         <h1 className="text-2xl font-semibold text-ink">Pulse</h1>

@@ -46,6 +46,21 @@ const STALE_MS_BY_SOURCE: Record<string, number | null> = {
   dense: null,
   linear_inbound: null,
   graph_project: null,
+  // The record-only-when-active rule in its strongest form. `doc_task_infer` IS polled reliably — the
+  // scheduler calls it every tick for every team (`lib/ingest/scheduler.ts`), alongside the timeline's
+  // background rebuild — so this is NOT a case of "maybe nothing triggered it". It is that FIVE of its
+  // eight outcomes write no `ingest_runs` row at all: `cooldown` (12h, `DOC_TASK_INFER_INTERVAL_HOURS`),
+  // `no-llm`, `no-candidates`, `nothing-to-score`, and `unchanged` all return before `record()`. So on a
+  // quiet corpus — no new scoreable docs in the 7-day window — a perfectly healthy leg polled every 30
+  // minutes still writes nothing for days, and its newest row's age is unbounded at ANY threshold. That
+  // is why this is `null` rather than "12h + grace": no finite number is correct.
+  //
+  // Observed in prod flagging a leg that had never failed, on a measured 12.1–12.4h cadence, while every
+  // connector was running on time — the banner said the brain wasn't getting fresh data when it was.
+  // Real failures still surface: the model-null and thrown-error paths DO record (`ok=false`), and since
+  // the cooldown counts failed runs too, a persistent failure keeps re-recording and stays the newest
+  // row. Shortfalls also show as `workers_failed` in the run meta.
+  doc_task_infer: null,
 };
 
 /** The age past which `source` is considered stale, or `null` to never flag it on age. Exported for
