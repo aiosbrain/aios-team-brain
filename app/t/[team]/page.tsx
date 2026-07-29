@@ -223,8 +223,10 @@ export default async function TeamHome({
 
       {/* Story beside people, not above them — the single column was leaving ~half the width empty while
           pushing "who's on what" a full screen down. */}
-      <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
-        <section className="flex flex-col gap-3 lg:col-span-2">
+      {/* 60/40, and `items-start` so the roster sizes to its content — stretching it to match a taller
+          arcs column produced a card that was mostly void while its text was being clipped. */}
+      <div className="grid grid-cols-1 items-start gap-6 lg:grid-cols-5">
+        <section className="flex flex-col gap-3 lg:col-span-3">
           <BandHeading title="What's happening" />
           <ArcsPanel teamSlug={teamSlug} variant="digest" />
         </section>
@@ -232,7 +234,9 @@ export default async function TeamHome({
         {/* Who's doing what — reads the SAME work-timeline layer as the Timeline below (shared card), so
             they agree by construction. The consistency fix (#358) lives inside this component, which
             renders its own "Working on" heading. */}
-        <WorkingOn teamSlug={teamSlug} variant="roster" timelineHref="#timeline" />
+        <div className="lg:col-span-2">
+          <WorkingOn teamSlug={teamSlug} variant="roster" timelineHref="#timeline" />
+        </div>
       </div>
 
       {/* Timeline — the per-day drill-down (absorbed from the old Learning tab), collapsed by default. */}

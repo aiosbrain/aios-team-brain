@@ -6,7 +6,7 @@ import { GitBranch, Gavel } from "lucide-react";
 import { MemberAvatar } from "@/components/people/member-avatar";
 import { SourceIcon, sourceLabel } from "@/components/icons/source-icon";
 import type { PersonDay, SignalGroup, SourceGroup, TaskGroup } from "@/lib/dashboard/timeline-group";
-import { headlineTask } from "@/lib/dashboard/pulse-digest";
+import { headlineTask, sourceCounts } from "@/lib/dashboard/pulse-digest";
 
 /**
  * One person's work card — the shared presentational unit behind BOTH the Pulse Timeline panel
@@ -126,33 +126,83 @@ function TaskCard({ task }: { task: TaskGroup }) {
   );
 }
 
+/** How many source chips a snapshot row shows before collapsing the rest into "+N". */
+const ROW_SOURCE_CHIPS = 2;
+
 /**
- * The SNAPSHOT row — one person in ~56px instead of the full card's ~300px. Shows who, their counts, and
- * the single task they're most active on (`headlineTask`); the evidence tree stays in the full card. Both
- * variants render the same `PersonDay`, so the Pulse roster and the Timeline still agree by construction
- * (the #358 invariant) — this is the same data at a second density, not a second implementation.
+ * The SNAPSHOT row — one person at reading density, not the full card's evidence tree.
+ *
+ * The first cut of this was task-centric (headline task + status pill, summary as a one-line
+ * `truncate` fallback) and it was wrong about the data: on prod EVERY person had `tasks: 0`, so the
+ * task line never rendered and the row always fell through to a 190-char synopsis clipped to ~45
+ * characters — in a column that had ~250px of unused vertical space. Compressing vertically in the one
+ * place with room to spare, while destroying the only informative field, is the opposite of the trade
+ * that was wanted.
+ *
+ * So the synopsis is now PRIMARY and gets four lines; the task line is the optional extra shown when
+ * linking actually resolves one. Both variants still render the same `PersonDay` (the #358 invariant) —
+ * one component, two densities, not a second implementation.
  */
 function PersonWorkRow({ person }: { person: PersonDay }) {
   const p = person;
   const lead = headlineTask(p);
+  const sources = sourceCounts(p);
+  const chips = sources.slice(0, ROW_SOURCE_CHIPS);
+  const restChips = sources.length - chips.length;
   return (
-    <div className="flex items-center gap-2.5 rounded-md border border-border-subtle/60 px-3 py-2">
+    <div className="flex gap-2.5 rounded-md border border-border-subtle/60 px-3 py-2.5">
       <MemberAvatar person={{ displayName: p.name, avatarUrl: p.avatarUrl }} size={24} />
-      <div className="min-w-0 flex-1">
-        <div className="flex items-baseline gap-2">
+      <div className="flex min-w-0 flex-1 flex-col gap-1">
+        <div className="flex items-baseline justify-between gap-2">
           <p className="truncate text-sm font-medium text-ink">{p.name}</p>
-          <p className="shrink-0 text-[11px] text-ink-tertiary">{personSummary(p)}</p>
+          {/* Where the work happened — the cheap signal that survives when no task resolves. */}
+          <div className="flex shrink-0 items-center gap-1.5">
+            {chips.map((s) => (
+              // The brand glyphs are aria-hidden, so without a label the chip announces as a bare
+              // number ("10"). Matches the sr-only precedent on the TaskCard assignee avatar.
+              <span
+                key={s.source}
+                className="flex items-center gap-1 text-[11px] text-ink-tertiary"
+                title={`${sourceLabel(s.source)}: ${s.count}`}
+                aria-label={`${sourceLabel(s.source)}: ${s.count} items`}
+              >
+                <SourceIcon source={s.source} className="size-3" />
+                {s.count}
+              </span>
+            ))}
+            {/* Counts SOURCES, while its siblings count items — "+1" beside "github 10" otherwise reads
+                as one more item. */}
+            {restChips > 0 ? (
+              <span
+                className="text-[11px] text-ink-tertiary"
+                title={`${restChips} more source${restChips > 1 ? "s" : ""}`}
+                aria-label={`${restChips} more source${restChips > 1 ? "s" : ""}`}
+              >
+                +{restChips}
+              </span>
+            ) : null}
+          </div>
         </div>
+
         {lead ? (
-          <div className="mt-0.5 flex items-center gap-1.5">
+          <div className="flex items-center gap-1.5">
             <SourceIcon source={lead.source} className="size-3 shrink-0" />
             <span className="min-w-0 flex-1 truncate text-[12px] text-ink-secondary">{lead.title}</span>
+            <StatusPill status={lead.status} />
           </div>
-        ) : p.summary ? (
-          <p className="mt-0.5 truncate text-[12px] text-ink-secondary">{p.summary}</p>
+        ) : null}
+
+        {/* The LLM synopsis — the actual answer to "what is this person doing". Clamped, not truncated.
+            Four lines, not three: measured against the real payload at this column's width (~40% of
+            max-w-6xl), prod's longest summary (190 chars) needs four lines and was still losing its last
+            clause at three. The synopsis is 1–3 sentences by construction, so this fits essentially all
+            of them; the clamp stays as the backstop against one long outlier, not as the normal case. */}
+        {p.summary ? (
+          <p className="line-clamp-4 text-[13px] leading-snug text-ink-secondary">{p.summary}</p>
+        ) : !lead ? (
+          <p className="text-[12px] text-ink-tertiary">{personSummary(p)}</p>
         ) : null}
       </div>
-      {lead ? <StatusPill status={lead.status} /> : null}
     </div>
   );
 }
