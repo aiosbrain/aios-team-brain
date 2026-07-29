@@ -88,11 +88,36 @@ vendored so the deployed sidecar is self-contained; every scan records
 - Score against a different rubric ad hoc: `aios-ingest scan … --readiness-rubric PATH`.
 - Readiness is scored on the live scan only; `--backfill` historical points carry null readiness.
 
+## Testing the connectors without an account
+
+We have no Notion / Drive / Confluence org accounts, so the reader-backed connectors are covered in
+two tiers — neither needs a credential, and the pairing is what makes either one worth trusting:
+
+| tier | file | proves |
+|------|------|--------|
+| adapter | `tests/test_reader_adapters.py` | `fetch()` end to end against stand-in readers swapped in at the `lazy_reader` seam — reader construction, branch selection (`space_key` vs `page_ids`, …), and the metadata → `RawDoc` mapping incl. **work-time**, whose absence silently drops a doc from the timeline |
+| conformance | `tests/test_reader_api_conformance.py` | every kwarg those adapters pass **exists on the real installed reader class**, and the stand-ins in `tests/_reader_fakes.py` accept nothing the real class rejects |
+
+The conformance tier needs the reader extras and CI installs them
+(`.[dev,radar,notion,gdrive,confluence]`); locally without them it skips, and a guard fails the
+build if CI ever loses them so the checks can't vanish into a green run. It earns its keep: it
+caught `NotionPageReader.load_data` having no `database_id` (only `database_ids`, a list) — the
+branch `connections.yaml.example` ships, which raised `TypeError` and, since `sync` has no
+per-connection try/except, would have aborted the operator's entire run.
+
+**What neither tier can prove:** that a credential authenticates, that pagination behaves over a
+real corpus, or that the live API returns the metadata keys we map. Recorded-fixture replay is the
+next step (see `docs/TODO.md`).
+
 ## Limitations (MVP)
 
 - **No deletes** — the brain has no DELETE endpoint yet; removing a source doc won't remove the item.
 - **Notion webhooks** (beta) fire on page properties, not block edits → content relies on polling.
 - **Drive watch-channels** expire and must be renewed by the scheduler.
+- **Drive documents are unattributable** — unlike Notion (`sources/notion_authors.py`), `gdrive.py`
+  has no owner-enrichment pass, and the reader's `author` is a bare display string. So a Drive doc
+  is ingested and searchable but credited to nobody, and never appears under a person on the
+  timeline. Tracked in `docs/TODO.md`.
 - Large backfills are throttled under the brain's 120 POST/min/key limit.
 
 See `THIRD_PARTY_LICENSES.md` for imported-dependency licenses. This package is MIT.

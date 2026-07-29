@@ -180,10 +180,16 @@ All connector APIs are free. Cost shows up downstream in embeddings and LLM spen
 | **RSS/Radar**, **Web**, **Local files** | none | — | **Sidecar** `connections.yaml` |
 
 **Maturity, honestly.** Slack, GitHub, Linear and Plane are the proven path — each has a real runner
-wired into the scheduler and unit coverage. **Notion, Google Drive and Confluence are wired but
-unproven**: the code is real and registered, but none has a test of its `fetch()`, and Confluence
-has no `connections.yaml` example either (Notion and Google Drive do — see
-`ingestion/connections.yaml.example`). Expect to debug your first run. Google Drive's watch-channel *renewal* advertised in
+wired into the scheduler and unit coverage. **Notion, Google Drive and Confluence are tested but not
+account-proven.** Their `fetch()` now runs in CI against stand-in readers, and every kwarg the
+adapters pass is checked against the real installed reader classes — which is what caught a live
+`TypeError` in Notion's *database* branch, the one `connections.yaml.example` ships. What no test
+here can cover is a credential actually authenticating, real pagination, or the live API returning
+the metadata keys we map; expect to debug your first run for those. Confluence also has no
+`connections.yaml` example (Notion and Google Drive do — see `ingestion/connections.yaml.example`).
+**Google Drive additionally has no owner enrichment** — unlike Notion it emits no mappable
+`authors[]`, so a Drive doc is ingested and searchable but credited to nobody: it never appears
+under a person on the timeline. Google Drive's watch-channel *renewal* advertised in
 `ingestion/README.md` is never constructed by `aios-ingest schedule` — Drive is pull-on-a-schedule
 only. `gdrive`/`confluence`/`web`/`local`/`radar` cannot be stored as brain integrations at all (the
 `integrations.type` CHECK has no such values) — they are `connections.yaml`-only by construction.

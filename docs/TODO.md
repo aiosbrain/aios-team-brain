@@ -197,3 +197,60 @@ emails/roles on `members` — worse than the attribution page's names+counts).
 **Fix:** each admin page should self-check via `requireTeamAdmin(teamSlug)` before any privileged read
 (as `app/t/[team]/admin/attribution/page.tsx` now does), returning null when it's null. A guard test that
 every `admin/*/page.tsx` calls `requireTeamAdmin` would make it build-enforced.
+
+---
+
+## Google Drive docs arrive unattributable (no owner enrichment) — the real Drive gap
+
+**Status:** open, and it is the blocker for Drive, not the missing test. Surfaced while adding the
+reader-adapter tests (`ingestion/tests/test_reader_adapters.py`).
+
+Notion has `sources/notion_authors.py`: it resolves `created_by` / `last_edited_by` to a name +
+email and emits the structured `authors[]` the brain maps to a roster member. **Drive has no
+equivalent.** `GoogleDriveReader`'s document metadata is exactly six keys — `file id`, `author`,
+`file path`, `mime type`, `created at`, `modified at` — and its `author` is a bare display string,
+not an email or a stable id, so `lib/attribution/resolve-authors` cannot map it to a person.
+
+**Why that matters more than it sounds:** a Drive document therefore lands with no credited worker.
+It is ingested and searchable, but it never appears under anyone on the timeline, never counts
+toward a person's work, and can never be picked up by the LLM doc→task pass (#394), which only
+scores *attributed* work docs. So "connect Drive" currently buys retrieval and nothing else — and
+the fetch tests now passing must not be read as "Drive works".
+
+**Why deferred:** it needs Drive API fields the reader does not surface (`owners[]`,
+`lastModifyingUser`), which means a second API pass with its own credentials — mirroring
+`notion_authors.py` — and we have no Drive account to develop it against.
+
+**When to revisit:** the moment a Drive account exists to test with, or before Drive is recommended
+to anyone as a work-attribution source.
+
+**How:** add `sources/gdrive_authors.py` mirroring the Notion pass — `files.get(fileId, fields=
+"owners(displayName,emailAddress),lastModifyingUser(displayName,emailAddress)")` → `authors[]` with
+`role: "author"` / `"editor"`, `provider: "google"`, and the email as the mappable key. Same
+best-effort contract: any API failure yields no authors and never breaks the sync.
+
+**Two smaller mapping gaps in the same place**, worth fixing in that PR rather than alone:
+`docs_to_raw` reads `url` from `file_path` and `title` from `file_name`, but the reader spells the
+former `file path` (with a space) and omits a name entirely — so every Drive item has a **null
+title and null URL**. (`source_ts` is fine: the work-time lookup is spelling-insensitive and
+matches `modified at`.)
+
+---
+
+## Connector proof that genuinely needs a live account
+
+**Status:** open by necessity. `ingestion/tests/test_reader_adapters.py` +
+`test_reader_api_conformance.py` (2026-07-29) close the part that can be tested without one — the
+adapter body, branch selection, metadata → `RawDoc` mapping, and the kwargs we pass checked against
+the real installed reader classes. That pairing already caught a live TypeError in Notion's
+database branch.
+
+**Still unproven, and not provable without credentials:** that a token/service-account key actually
+authenticates, that the documented Confluence credential recipe works against Atlassian Cloud, that
+pagination behaves over a real corpus, and that the live APIs return the metadata keys the fakes
+assert. Read the green suite as "our code is right given the reader's shape", not "the connector
+works end to end".
+
+**When to revisit:** when an org account exists for any of the three. **How:** record one real
+response per connector with `respx` (already a dev dependency) and replay it — the fake-reader seam
+in `tests/_reader_fakes.py` is where a recorded fixture drops in.

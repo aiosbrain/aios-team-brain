@@ -144,5 +144,16 @@ jobs:
         with:
           python-version: "3.12"
       - uses: astral-sh/setup-uv@v7
-      - run: uv pip install --system -e '.[dev,radar]'
+      # The reader extras are opt-in for operators but REQUIRED here: tests/test_reader_api_conformance.py
+      # checks the kwargs our Notion/Drive/Confluence adapters pass against the real installed classes,
+      # which is the only tier that catches a reader renaming a kwarg (we have no accounts to test against).
+      # Without them those checks turn into silent skips — which `test_conformance_is_not_silently_skipped_in_ci`
+      # fails the build for, via CI=true.
+      #
+      # DELIBERATELY UNPINNED (pyproject says `>=0.1`), which means a new reader release can turn this
+      # job red on an UNRELATED PR. That is the intended trade: an operator installing today gets the
+      # latest reader, so testing anything else would prove nothing about what they run. Such a red is
+      # real information — the connector is broken against the current library. Fix the adapter (or pin
+      # the reader in pyproject and say why); do not just re-run.
+      - run: uv pip install --system -e '.[dev,radar,notion,gdrive,confluence]'
       - run: pytest -q
