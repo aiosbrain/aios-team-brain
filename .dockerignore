@@ -1,0 +1,23 @@
+# Keep the build context small and secret-free.
+# node_modules matters twice over: it's huge, AND in a git worktree it's a symlink to the
+# primary checkout (see next.config.ts) which Docker cannot follow out of the context.
+node_modules
+.next
+.git
+.github
+
+# Never bake secrets into an image layer. .env.example is documentation and stays.
+.env
+.env.*
+!.env.example
+.aios-demo-key
+
+# Local/dev noise
+.claude
+.agents
+.conductor
+coverage
+*.log
+.DS_Store
+ingestion/.venv
+graphiti/.env

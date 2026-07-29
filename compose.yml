@@ -1,0 +1,63 @@
+# AIOS Team Brain — one-command local stack.
+#
+#   docker compose up          → http://localhost:3000, schema loaded, demo team seeded,
+#                                and a printed login. No host Node, no Postgres, no keys.
+#
+# This is for EVALUATING the brain and for contributors who want a disposable database.
+# It is not how a team runs one: the brain is a shared service with background pollers
+# that only tick while the process is up (README §2). For that, deploy it.
+#
+# No secrets are committed here. AUTH_SECRET and SECRETS_KEY are generated on first boot
+# and persisted in the `appdata` volume, so every install gets its own and they stay stable
+# across restarts (a rotating SECRETS_KEY would orphan encrypted connector tokens; a rotating
+# AUTH_SECRET would log everyone out). Export either one to override.
+name: aios-brain
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: app
+    # 5435, not 5432/5433/5434: leaves a host Postgres, another project's dev DB, and the
+    # data-mechanics tier in compose.test.yml all free to run at the same time.
+    ports: ["5435:5432"]
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d app"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  app:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Host port is overridable because 3000 is the most contended port on a dev machine
+    # (any other Next/Vite app already running will take it): APP_PORT=3100 docker compose up
+    ports: ["${APP_PORT:-3000}:3000"]
+    volumes: ["appdata:/var/lib/aios"]
+    environment:
+      DATABASE_URL: postgres://app:app@postgres:5432/app
+      # Must match the published port — it's what invite/magic links are built from.
+      APP_URL: http://localhost:${APP_PORT:-3000}
+      # Left empty on purpose: generated on first boot and persisted to DEV_SECRETS_FILE.
+      # Set them in your shell to bring your own.
+      AUTH_SECRET: ${AUTH_SECRET:-}
+      SECRETS_KEY: ${SECRETS_KEY:-}
+      DEV_SECRETS_FILE: /var/lib/aios/dev-secrets.env
+      # Optional: answer queries. Everything else works without them.
+      # Exported on the host → picked up here; unset → left empty.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      LLM_BASE_URL: ${LLM_BASE_URL:-}
+      LLM_MODEL: ${LLM_MODEL:-}
+      # SEED_DEMO=false for an empty brain.
+      SEED_DEMO: ${SEED_DEMO:-true}
+      DEMO_EMAIL: ${DEMO_EMAIL:-admin@demo.local}
+      DEMO_PASSWORD: ${DEMO_PASSWORD:-aios-demo-password}
+
+volumes:
+  pgdata:
+  appdata:

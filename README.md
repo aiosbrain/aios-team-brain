@@ -30,6 +30,39 @@ leaves your instance unless you push it, and it runs fully on-machine at $0 if y
 
 ---
 
+## Try it in two minutes
+
+To *see* it — with the demo team loaded — you need Docker and nothing else. No accounts, no
+API keys, no Postgres, no Node on your machine:
+
+```bash
+git clone https://github.com/aiosbrain/aios-team-brain.git
+cd aios-team-brain
+docker compose up
+```
+
+That loads the schema, seeds the Northwind Robotics demo, and prints a login for
+**http://localhost:3000**. Answering questions needs a model — `export ANTHROPIC_API_KEY=…`
+before `up` (or `LLM_BASE_URL` for a local endpoint); everything else works without one.
+
+```bash
+docker compose down                 # stop  (data persists in the pgdata volume)
+npm run up:reset                    # wipe and start over
+APP_PORT=3100 docker compose up     # if something already owns port 3000
+SEED_DEMO=false docker compose up   # empty brain instead of the demo
+```
+
+Re-running `up` is safe: the schema load is idempotent and seeding is skipped once a team
+exists. Postgres is published on **5435** so it can't collide with a local Postgres or the
+test tier in `compose.test.yml`.
+
+**This is for evaluating and for contributors.** It is not how a team runs one — the brain is a
+shared service whose connectors poll on a schedule, so it belongs on a server. For that, start at
+§2. Already installed and something's off? **`npm run doctor`** checks your environment and
+database and names what's wrong.
+
+---
+
 ## Is this for you? The short version
 
 Full docs live at **[aiosbrain.dev/guides/team-brain](https://aiosbrain.dev/guides/team-brain)** —
@@ -375,6 +408,11 @@ and run `aios push`. **Entirely optional** — the connectors above feed the bra
 
 ### 2.7 — Running it locally (contributors only)
 
+For a disposable instance with nothing to configure, use the Docker stack from
+[Try it in two minutes](#try-it-in-two-minutes) — it brings up Postgres, loads the schema, seeds
+the demo, and prints a login. Use the native setup below when you're editing code and want hot
+reload, the debugger, and the dev-login route.
+
 If you're changing the brain itself:
 
 ```bash
@@ -666,6 +704,13 @@ summaries, meeting extraction) is metered but **not capped**.
 ---
 
 ## 5. Troubleshooting
+
+**Start with `npm run doctor`.** It checks the environment and the database and names the problem
+— including the traps below that otherwise stay silent until they surface somewhere unrelated: a
+`SECRETS_KEY` that isn't exactly 32 bytes, a missing `APP_URL`, a remote database without TLS, no
+mail transport in production, and an embeddings width that doesn't match the `vector(1536)` column.
+Warnings still exit `0`; only real failures exit `1`, so an agent or CI can gate on it. Add
+`--no-db` to skip the connectivity probe.
 
 ### `DATABASE_URL is required` from `pg:schema` / `admin`, but it's in `.env.local`
 
