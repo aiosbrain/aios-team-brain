@@ -77,9 +77,20 @@ LLM key if you run the context engine. Self-host the model and all of it is zero
   the connectors feed the brain on their own. See
   [the quickstart](https://aiosbrain.dev/guides/quickstart).
 
-**Roughly:** deploy the app → set the env vars → load the schema → load the vector schema → create
-the first admin → connect one source. Add Neo4j + Graphiti later, or never. Everything below is that,
-in dependency order, with the failure modes called out.
+**The order, and roughly what each costs you** (~15 minutes to a first answer, excluding the
+optional context engine):
+
+| | | |
+|---|---|---|
+| 1 | Deploy the app | ~5 min |
+| 2 | Set the environment variables | ~3 min |
+| 3 | Load the schema (`npm run pg:schema`) | ~1 min |
+| 4 | Load the vector schema (`npm run pg:schema:vector`) | ~1 min |
+| 5 | Create the first admin | ~1 min |
+| 6 | Connect one source | ~4 min |
+| + | Add Neo4j + Graphiti | later, or never |
+
+Everything below is that, in dependency order, with the failure modes called out.
 
 > **Joining a team that already runs one?** You don't need any of this — you need an invite. See
 > [Onboarding a contributor](https://aiosbrain.dev/guides/quickstart#part-2--connect-to-a-team-brain).
