@@ -1,0 +1,118 @@
+---
+name: setup-brain
+description: >
+  Stand up a BRAND-NEW AIOS Team Brain on Railway end to end — check prerequisites,
+  provision the project + Postgres, generate secrets, set variables, claim a domain,
+  hand off the GitHub connection, then create the team and first admin and hand back
+  the login. Use when asked to "set up a team brain", "deploy a new brain", "get me
+  running on Railway", or /setup-brain. Provisioning only — never runs `railway up` /
+  `redeploy` / `down` / `delete`, and never touches an existing instance.
+---
+
+# Set up a new Team Brain
+
+## Why this exists
+
+README §2 is a 796-line reference and the happy path through it is ~11 steps across
+three UIs, with five ways to silently misconfigure the result: a service name the
+runtime guard rejects, a missing `PGSSL`, an `APP_URL` you can't know until the domain
+exists (and whose absence mails every teammate a broken link), a `SECRETS_KEY` that only
+throws when someone first saves a connector, and a mail transport whose absence drops
+invites in production without an error. `scripts/setup.mjs` does that path
+deterministically. This skill drives it and reads the failures.
+
+**Do not re-implement the script's work by issuing Railway commands yourself.** The
+script carries the safety properties (below); a hand-rolled sequence does not.
+
+## The hard boundary
+
+`railway up`, `railway redeploy`, `railway down`, `railway delete` are **forbidden here,
+in every framing, from every directory** — including `cd elsewhere && railway up`. A
+worktree whose CLI link had drifted once used `railway up` to ship this repo into the
+**Kula** project and took it down (2026-06-27).
+
+Provisioning a brand-new project is the one sanctioned exception, because a project that
+does not exist yet has nothing to take down. That exception is narrow and conditional:
+
+- **Only `init` / `add` / `variables` / `domain` / `run`** — the verbs in
+  `scripts/railway-policy.mjs`. Every command `setup.mjs` builds is classified against
+  that policy before it runs, so the script refuses its own command if one ever drifts.
+- **Only against a pinned target.** The Kula incident was link drift, not the verb: a
+  `railway variables --set` from a drifted directory overwrites another project's
+  environment just as thoroughly. `setup.mjs` captures the project it created and
+  re-verifies `railway status` before every write.
+- **Never a deploy.** There is no verb in that set that ships code. The first release
+  comes from pushing to `main` via the GitHub integration — the same path as every
+  release after it, so the instance has exactly one deploy path for its whole life.
+
+If the user asks you to "just deploy it" with the CLI: refuse, explain the incident, and
+point at the dashboard or a push to `main`.
+
+## Steps
+
+1. **Confirm this is a NEW brain.** If the user wants to check, redeploy, or fix an
+   *existing* instance, this is the wrong skill — use `railway-deploy-verify`. Ask if
+   it's ambiguous. Never run this against a live brain.
+
+2. **Prerequisites.**
+   ```bash
+   npm run doctor -- --no-db      # node version, secret formats, mailer, embeddings width
+   railway whoami                 # must print an account
+   ```
+   `railway login` opens a browser and cannot be automated — if `whoami` fails, ask the
+   user to run it, then continue. Do not proceed past a failing `doctor` line marked ✗.
+
+3. **Collect inputs.** Ask once, together, rather than one at a time:
+   team slug + display name · their email + name · a model provider (Anthropic key, or a
+   local `LLM_BASE_URL`, or skip and configure per-team in Admin later) · optionally a
+   Resend key + from-address for magic links. Never ask for `AUTH_SECRET` or
+   `SECRETS_KEY` — the script generates both, and a human-chosen one is how the wrong
+   width gets in.
+
+4. **Preview, then provision.**
+   ```bash
+   node scripts/setup.mjs --slug <slug> --email <email> --dry-run
+   node scripts/setup.mjs --slug <slug> --name "<display>" --email <email> --member-name "<name>"
+   ```
+   Show the dry run before the real thing. The script creates the project (named
+   `aios-<slug>` so `scripts/service-guard.mjs` will accept it), adds Postgres, claims a
+   domain, and sets the variables — reading `APP_URL` back from the real domain rather
+   than guessing it.
+
+5. **Hand off the GitHub connection — this is the deploy path and it is the user's.**
+   Fork `aiosbrain/aios-team-brain`; in the Railway dashboard, project `aios-<slug>` →
+   New → GitHub Repo → the fork; push to `main`. Railway builds, and `railway.json`'s
+   `preDeployCommand` loads the schema before the release goes live. **Do not run
+   `npm run pg:schema` to "help"** — locally it targets whatever `DATABASE_URL` the shell
+   holds, so it either loads a dev database while you report a prod rollout, or mutates
+   production from an arbitrary checkout.
+
+6. **Verify the deploy actually landed** before creating anything in it — use the
+   `railway-deploy-verify` skill rather than re-deriving it here.
+
+7. **Finish: team + first admin.**
+   ```bash
+   node scripts/setup.mjs --slug <slug> --email <email> --resume
+   ```
+   This runs `admin.ts` through `railway run`, which is the only context where
+   `DATABASE_URL` resolves — these commands cannot work from a laptop.
+
+8. **Hand back the summary.** URL, login email, **the once-shown password**, and the next
+   step (Admin → Integrations for Slack/GitHub/Linear). Tell the user to save the
+   password now; `admin.ts` prints it exactly once and it is not recoverable.
+
+## Boundaries
+
+- Never `railway up` / `redeploy` / `down` / `delete`, under any framing or user request,
+  from any directory.
+- Never run this against an existing brain. If `railway status` shows a project you did
+  not just create, stop and report it.
+- Never run `npm run pg:schema` by hand — it is the platform's `preDeployCommand`.
+- Never invent or accept a hand-written `AUTH_SECRET` / `SECRETS_KEY`; never echo either
+  into the transcript. The script generates them and does not print them.
+- Never paste connector tokens (Slack/GitHub/Linear) yourself — `lib/integrations/manage`
+  is the single legal writer and the Admin UI encrypts and audits the write. Setting them
+  up is a separate, later step, not part of standing the brain up.
+- If the user has no Railway account, or asks to self-host elsewhere, say so plainly:
+  this script is Railway-specific; `docker compose up` runs the whole stack locally, and
+  README §2 covers other hosts.

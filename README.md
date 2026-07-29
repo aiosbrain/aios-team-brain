@@ -258,6 +258,26 @@ Kubernetes all work. Only §2.1 is Railway-specific.
 Each step explains *why*, so you can tell when something has gone wrong rather than pattern-matching
 on green output.
 
+> **Shortcut — `npm run setup` does §2.1–§2.4 for you.** On Railway, the steps below are automated
+> by `scripts/setup.mjs`: it creates the project (named `aios-<slug>`, which is what
+> `scripts/service-guard.mjs` requires), adds Postgres, **generates** `AUTH_SECRET` and
+> `SECRETS_KEY` at the right widths, claims a domain and reads `APP_URL` back from it, sets the
+> variables, and — after you connect the repo — creates your team and first admin.
+> ```bash
+> railway login                                        # browser OAuth; can't be automated
+> npm run setup -- --slug acme --name "Acme Robotics" --email you@acme.com --dry-run
+> npm run setup -- --slug acme --name "Acme Robotics" --email you@acme.com
+> ```
+> It **never deploys.** `railway up`/`redeploy`/`down`/`delete` are refused by
+> `scripts/railway-policy.mjs`, which every command it builds is checked against; the first
+> release comes from pushing to `main` through the GitHub integration, the same as every release
+> after it. Its provisioning verbs do write, so each is gated on proof that the CLI is still
+> pointed at the project this run created — a drifted `variables --set` would overwrite another
+> project's environment the way a drifted `up` once overwrote Kula's code. Read the steps below
+> anyway: the script automates them, it doesn't replace understanding what they do.
+>
+> Agents: the `setup-brain` skill drives this and reads the failures.
+
 ### 2.1 — Create the services
 
 Fork or clone [`aiosbrain/aios-team-brain`](https://github.com/aiosbrain/aios-team-brain) to your own
