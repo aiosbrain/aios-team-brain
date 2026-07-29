@@ -72,3 +72,28 @@ export function headlineTask(person: PersonDay): TaskGroup | null {
   if (!tasks.length) return null;
   return tasks.reduce((best, t) => (rankOf(t.status) < rankOf(best.status) ? t : best));
 }
+
+/** One source and how much of a person's day came through it. */
+export interface SourceCount {
+  source: string;
+  count: number;
+}
+
+/**
+ * Where a person's work actually happened — evidence counts rolled up per source across BOTH the
+ * task-linked lane and the unlinked `other` lane, busiest first (ties alphabetical, so the order is
+ * stable between renders).
+ *
+ * Both lanes are counted because on real data almost everything is in `other`: task linking currently
+ * resolves a small fraction of items, so a rollup that only read `tasks` would report nothing for most
+ * people. This is the cheap "what kind of work was it" signal that survives when `headlineTask` is null.
+ */
+export function sourceCounts(person: PersonDay): SourceCount[] {
+  const totals = new Map<string, number>();
+  const add = (source: string, count: number) => totals.set(source, (totals.get(source) ?? 0) + count);
+  for (const t of person.tasks ?? []) for (const g of t.sources ?? []) add(g.source, g.count);
+  for (const g of person.other ?? []) add(g.source, g.count);
+  return [...totals.entries()]
+    .map(([source, count]) => ({ source, count }))
+    .sort((a, b) => b.count - a.count || (a.source < b.source ? -1 : 1));
+}

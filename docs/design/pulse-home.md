@@ -44,8 +44,8 @@ The rule is therefore *every above-the-fold band shows "N with a link", never "a
 - **`ArcsPanel variant="digest"`** renders clamped headlines and expands to the full editable list
   *in place* — one panel, not a digest plus a duplicate list, so there is no second fetch and no way for
   the two to disagree. Editing stays a full-view affordance (a two-line clamp is not an editing surface).
-- **`PersonWorkCard variant="row"`** is the same `PersonDay` at a second density (~56px vs ~300px); the
-  evidence tree stays in the full card, so the #358 "identical by construction" invariant still holds.
+- **`PersonWorkCard variant="row"`** is the same `PersonDay` at a second density; the evidence tree stays
+  in the full card, so the #358 "identical by construction" invariant still holds.
 - **Two columns** (story beside people) — the single column left ~half the width empty while pushing
   "who's on what" a full screen down. Container widened `max-w-5xl` → `max-w-6xl`.
 - **Metrics is collapsed for everyone.** The headline numbers were promoted to the ribbon (with the
@@ -62,6 +62,32 @@ is mounted in exactly one place, so gating it on `hidden > 0` made editing, reco
 the un-clamped prose unreachable product-wide whenever synthesis returned ≤ 3 arcs. For the same reason
 the unsaved-corrections banner renders in **both** densities — the digest shows edited text, so hiding the
 only save control behind the expanded view left an in-memory edit looking applied.
+
+### The roster correction — synopsis first, not task first
+
+The first roster shipped **task-centric**: headline task + status pill, with the person's synopsis as a
+one-line `truncate` fallback. That was wrong about the data. On prod, **every person had `tasks: 0`** —
+task linking resolves only a small fraction of items, so the task line never rendered and the row always
+fell through to the fallback, clipping a 190-character synopsis to about 45 characters. It did that
+inside a column with ~250px of *unused vertical space*: compressing vertically where there was room to
+spare, while destroying the one informative field.
+
+So the row is now:
+
+- **synopsis primary**, `line-clamp-4` (not `truncate`). Four lines is measured, not guessed — at this
+  column's width prod's longest summary (190 chars) needs four and still lost its last clause at three.
+  The synopsis is 1–3 sentences by construction, so the clamp is a backstop for an outlier, not the
+  normal case.
+- **`sourceCounts(person)`** chips (`github 10`) — evidence rolled up per source across **both** the
+  task lane and the unlinked `other` lane, busiest first. Counting `other` is the whole point: with
+  linking as sparse as it is, a rollup reading only `tasks` reports nothing for the actual data.
+- **task line + status pill** kept, but as the optional extra shown when linking *does* resolve one.
+- grid is **60/40** (`lg:grid-cols-5`, 3+2) with `items-start`, so the roster sizes to its content
+  instead of stretching into a void beside a taller arcs column.
+
+Verified visually by server-rendering the real component against the real prod payload
+(`.context/render-roster.tsx`, gitignored) — including the task/`+N`-chip branches that current prod
+data never reaches.
 
 **"Working on" is labelled `· most recent activity`.** The band only ever covers each person's most
 recent day, so on prod it showed 2 of 9 members — which, unlabelled, reads as "the team is idle" rather

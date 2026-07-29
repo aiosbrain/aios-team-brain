@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { digest, headlineTask, DIGEST_ARC_LIMIT, DIGEST_PEOPLE_LIMIT } from "@/lib/dashboard/pulse-digest";
-import type { PersonDay, TaskGroup } from "@/lib/dashboard/timeline-group";
+import { digest, headlineTask, sourceCounts, DIGEST_ARC_LIMIT, DIGEST_PEOPLE_LIMIT } from "@/lib/dashboard/pulse-digest";
+import type { PersonDay, SourceGroup, TaskGroup } from "@/lib/dashboard/timeline-group";
 
 /**
  * Spec: the Pulse snapshot header is BOUNDED — its height must not track data volume. These assertions
@@ -13,8 +13,12 @@ function task(taskId: string, status: string): TaskGroup {
   return { taskId, title: `task ${taskId}`, status, source: "linear", sources: [], evidenceCount: 0 };
 }
 
-function person(tasks: TaskGroup[]): PersonDay {
-  return { memberId: "m1", name: "Ada", handle: "ada", total: 0, tasks, other: [], unlinked: 0, signals: [] };
+function person(tasks: TaskGroup[], other: SourceGroup[] = []): PersonDay {
+  return { memberId: "m1", name: "Ada", handle: "ada", total: 0, tasks, other, unlinked: 0, signals: [] };
+}
+
+function group(source: string, count: number): SourceGroup {
+  return { source, count, items: [] };
 }
 
 describe("digest — bounded snapshot bands", () => {
@@ -94,5 +98,47 @@ describe("headlineTask — the one task a compact row shows", () => {
   it("prefers a recognised active task over an unmapped one regardless of order", () => {
     const p = person([task("odd-1", "sideways"), task("wip-1", "in_progress")]);
     expect(headlineTask(p)?.taskId).toBe("wip-1");
+  });
+});
+
+describe("sourceCounts — where the work happened", () => {
+  it("counts the UNLINKED lane, which is where nearly all real work sits", () => {
+    // The case that motivated this: prod's most recent day had tasks:0 for every person and all 10/1
+    // items in `other`. A rollup that only read `tasks` reports nothing for exactly the real data.
+    const p = person([], [group("github", 10)]);
+    expect(sourceCounts(p)).toEqual([{ source: "github", count: 10 }]);
+  });
+
+  it("merges the same source across the task and unlinked lanes", () => {
+    const t: TaskGroup = { ...task("t1", "in_progress"), sources: [group("github", 3)] };
+    expect(sourceCounts(person([t], [group("github", 4)]))).toEqual([{ source: "github", count: 7 }]);
+  });
+
+  it("orders busiest first so the chips lead with the dominant source", () => {
+    const p = person([], [group("slack", 2), group("github", 9)]);
+    expect(sourceCounts(p).map((s) => s.source)).toEqual(["github", "slack"]);
+  });
+
+  it("breaks count ties alphabetically so the order is stable between renders", () => {
+    const p = person([], [group("notion", 5), group("github", 5)]);
+    expect(sourceCounts(p).map((s) => s.source)).toEqual(["github", "notion"]);
+  });
+
+  it("returns nothing for a person with no evidence at all", () => {
+    expect(sourceCounts(person([]))).toEqual([]);
+  });
+
+  it("sums to the person's work total — the chips can never out-count the header", () => {
+    // groupTimeline puts each evidence item in EXACTLY ONE of `tasks` / `other` and sets `total` to the
+    // work it showed, so Σ chips must equal `total`. Pins the cross-layer agreement: a chip row that
+    // adds up to more than the "N items" line is how a summary stops being trusted. `signals` are
+    // present and must NOT be counted — decisions are context, never work.
+    const t: TaskGroup = { ...task("t1", "in_progress"), sources: [group("github", 6)], evidenceCount: 6 };
+    const p: PersonDay = {
+      ...person([t], [group("notion", 5), group("slack", 3)]),
+      total: 14,
+      signals: [{ kind: "decision", count: 2, items: [] }],
+    };
+    expect(sourceCounts(p).reduce((n, s) => n + s.count, 0)).toBe(p.total);
   });
 });

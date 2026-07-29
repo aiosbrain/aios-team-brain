@@ -48,7 +48,7 @@ export function WorkingOn({
   const view = isRoster ? digest(people ?? [], DIGEST_PEOPLE_LIMIT) : null;
 
   return (
-    <section className="prism-card flex h-full flex-col px-5 py-4">
+    <section className="prism-card flex flex-col px-5 py-4">
       <h2 className="mb-3 flex flex-wrap items-center gap-x-2 text-sm font-semibold uppercase tracking-wider text-ink-tertiary">
         <span className="flex items-center gap-2">
           <Users className="size-3.5 text-violet" /> Working on
