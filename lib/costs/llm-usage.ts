@@ -26,7 +26,9 @@ export type LlmUsageSource =
   | "meeting-merge" // duplicate-meeting merge reconciliation
   | "timeline-summary" // work-timeline day/person summaries
   | "social" // social-content generation
-  | "attribution"; // attribution-correction reasoning
+  | "attribution" // attribution-correction reasoning
+  | "graph" // Graphiti entity/fact extraction (via the graph LLM proxy) — the highest-volume consumer
+  | "embeddings"; // vector embeddings — item indexing + query/graph embedding (a distinct model class)
 
 /**
  * The DB context a caller threads down to a wrapper (callMeetingsLLM, mergeTranscriptsLLM, …) so the

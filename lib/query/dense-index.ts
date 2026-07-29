@@ -75,7 +75,7 @@ export async function indexItem(item: IndexItemInput, backend: EmbeddingBackend)
     return { itemId: item.id, chunks: 0, skipped: false };
   }
 
-  const vectors = await embed(chunks, backend);
+  const vectors = await embed(chunks, backend, { teamId: item.teamId });
   if (!vectors.length) return { itemId: item.id, chunks: 0, skipped: true };
 
   // Replace: clear old chunks, insert the fresh set (each embedding cast text → vector).

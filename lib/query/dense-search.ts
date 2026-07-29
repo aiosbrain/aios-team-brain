@@ -48,7 +48,7 @@ export async function denseSearch(
     // embedding uses the SAME backend that indexed the chunks, so the vector spaces match.
     const b = backend ?? (await resolveEmbeddingBackend(teamId));
     if (!b) return [];
-    const vecs = await embed([question], b);
+    const vecs = await embed([question], b, { teamId });
     if (!vecs[0]) return [];
     const qv = toVectorLiteral(vecs[0]);
 

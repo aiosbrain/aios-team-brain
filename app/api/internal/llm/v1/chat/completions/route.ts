@@ -56,11 +56,15 @@ export async function POST(req: NextRequest) {
   const target = await resolveGraphChatTarget(db, team.teamId);
   if (isRefusal(target)) return refusalResponse(target);
 
-  const forwarded = forwardBody(body, target.model);
+  const forwarded = forwardBody(body, target.model, target.provider);
   if (isRefusal(forwarded)) return refusalResponse(forwarded);
 
   try {
-    return await forwardUpstream(target, forwarded);
+    // Meter this extraction call into `llm_usage` (source `graph`) — the biggest LLM consumer, and
+    // until now entirely unmetered. Best-effort inside `forwardUpstream`; never affects the response.
+    return await forwardUpstream(target, forwarded, {
+      meter: { db, teamId: team.teamId, source: "graph", kind: "chat" },
+    });
   } catch (err) {
     const message = err instanceof Error ? err.message : "upstream request failed";
     return Response.json({ error: { message, type: "api_error" } }, { status: 502 });

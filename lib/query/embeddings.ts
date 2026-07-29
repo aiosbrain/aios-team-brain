@@ -1,5 +1,31 @@
 import "server-only";
 import type { EmbeddingBackend } from "./embeddings-backend";
+import { adminClient } from "@/lib/db/admin";
+import { recordLlmUsage } from "@/lib/costs/llm-usage";
+import { resolveOpenAiCost, type OpenAiUsage } from "@/lib/llm/cost";
+
+/** Meter one embeddings call into `llm_usage` (source `embeddings`). System-initiated (member null).
+ *  BEST-EFFORT: embeddings feed indexing + retrieval, so a metering failure must never break them —
+ *  every error is swallowed. Tokens are recorded even at $0 so embedding VOLUME is visible even when
+ *  the provider reports no `usage.cost`. */
+async function meterEmbedding(teamId: string, backend: EmbeddingBackend, usage: OpenAiUsage | undefined): Promise<void> {
+  try {
+    const c = resolveOpenAiCost(usage, backend.provider, backend.model, "embedding");
+    await recordLlmUsage(adminClient(), {
+      teamId,
+      memberId: null,
+      source: "embeddings",
+      provider: backend.provider,
+      model: backend.model,
+      inputTokens: c.inputTokens,
+      outputTokens: c.outputTokens,
+      costUsd: c.costUsd,
+      estimated: c.estimated,
+    });
+  } catch {
+    // Metering never breaks embedding.
+  }
+}
 
 /**
  * Embeddings client for optional dense retrieval — OpenAI-compatible `/embeddings` (any provider that
@@ -18,7 +44,11 @@ const EMBEDDINGS_TIMEOUT_MS = Number(process.env.EMBEDDINGS_TIMEOUT_MS ?? 20_000
  * column is fixed at that width, so a mis-dimensioned model would otherwise fail deep in the `::vector`
  * insert with an opaque error) — callers log + degrade ("skip dense this time").
  */
-export async function embed(texts: string[], backend: EmbeddingBackend): Promise<number[][]> {
+export async function embed(
+  texts: string[],
+  backend: EmbeddingBackend,
+  meter?: { teamId: string }
+): Promise<number[][]> {
   if (!texts.length) return [];
 
   const ctrl = new AbortController();
@@ -30,7 +60,13 @@ export async function embed(texts: string[], backend: EmbeddingBackend): Promise
         "Content-Type": "application/json",
         Authorization: `Bearer ${backend.apiKey}`,
       },
-      body: JSON.stringify({ model: backend.model, input: texts }),
+      // `usage:{include:true}` asks OpenRouter to report the real `usage.cost` so the embeddings meter
+      // records dollars, not just tokens (mirrors the graph proxy + completeText). Harmless elsewhere.
+      body: JSON.stringify({
+        model: backend.model,
+        input: texts,
+        ...(backend.provider === "openrouter" ? { usage: { include: true } } : {}),
+      }),
       signal: ctrl.signal,
     });
     if (!res.ok) {
@@ -38,7 +74,10 @@ export async function embed(texts: string[], backend: EmbeddingBackend): Promise
         `embeddings ${backend.model} @ ${backend.baseUrl}: ${res.status} ${await res.text().catch(() => "")}`
       );
     }
-    const data = (await res.json()) as { data?: { embedding: number[] }[] };
+    const data = (await res.json()) as { data?: { embedding: number[] }[]; usage?: OpenAiUsage };
+    // Meter BEFORE the vector-shape validation below: the tokens were spent the moment the call
+    // succeeded, whether or not the vectors pass the dimension check. Only when a caller opts in.
+    if (meter) await meterEmbedding(meter.teamId, backend, data.usage);
     const vectors = (data.data ?? []).map((d) => d.embedding);
     if (vectors.length !== texts.length) {
       throw new Error(`embeddings returned ${vectors.length} vectors for ${texts.length} inputs`);
