@@ -319,6 +319,8 @@ export function IntegrationsManager({
   const router = useRouter();
   const [pending, startTransition] = useTransition();
   const [error, setError] = useState<string | null>(null);
+  /** A save that SUCCEEDED but has a consequence worth naming — rendered amber, never emerald. */
+  const [warning, setWarning] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
   const SYNCABLE: Partial<Record<IntegrationType, (slug: string) => Promise<{ ok: boolean; error?: string; message?: string }>>> = {
@@ -339,6 +341,7 @@ export function IntegrationsManager({
     if (!fn) return;
     setError(null);
     setNotice(null);
+    setWarning(null);
     startTransition(async () => {
       const res = await fn(teamSlug);
       if (!res.ok) setError(res.error ?? "sync failed");
@@ -365,6 +368,7 @@ export function IntegrationsManager({
   function projectToGraph() {
     setError(null);
     setNotice(null);
+    setWarning(null);
     startTransition(async () => {
       const res = await projectToGraphNow(teamSlug);
       if (!res.ok) setError(res.error ?? "projection failed");
@@ -375,12 +379,22 @@ export function IntegrationsManager({
     });
   }
 
-  function run(fn: () => Promise<{ ok: boolean; error?: string }>) {
+  function run(fn: () => Promise<{ ok: boolean; error?: string; warning?: string }>) {
     setError(null);
+    setNotice(null);
+    setWarning(null);
     startTransition(async () => {
       const res = await fn();
       if (!res.ok) setError(res.error ?? "something went wrong");
-      else router.refresh();
+      else {
+        // A SUCCESSFUL save can still carry a warning — currently "this model can't do structured
+        // outputs, so graph extraction will stop producing facts". Shown here, at the moment of the
+        // choice: the alternative is discovering it as blank narrative arcs hours later. Kept OUT of
+        // `notice`, which renders emerald — a caution styled as success reads as "all good" and would
+        // defeat the point of surfacing it at all.
+        setWarning(res.warning ?? null);
+        router.refresh();
+      }
     });
   }
 
@@ -763,6 +777,12 @@ export function IntegrationsManager({
       {notice ? (
         <p className="rounded-lg border border-emerald/30 bg-emerald/5 px-3 py-2 text-sm text-emerald-700">
           {notice}
+        </p>
+      ) : null}
+
+      {warning ? (
+        <p className="rounded-lg border border-amber-400/30 bg-amber-400/10 px-3 py-2 text-sm text-amber-700 dark:text-amber-300">
+          {warning}
         </p>
       ) : null}
 

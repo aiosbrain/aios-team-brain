@@ -26,6 +26,10 @@ import { checkSlackChannels, privateChannelRejection } from "@/lib/integrations/
 import { RepoFormatError } from "@/lib/integrations/github-repos";
 import { validateOpenrouterKey, saveOpenrouterSettings } from "@/lib/integrations/openrouter";
 import { MEETING_TASK_STATUSES, type MeetingTaskStatus } from "@/lib/meetings/target-status";
+import {
+  checkStructuredOutputSupport,
+  structuredOutputWarning,
+} from "@/lib/llm/structured-output-support";
 import { setMeetingTaskStatus as setMeetingTaskStatusDb } from "@/lib/meetings/target-status-db";
 import {
   IntegrationConfigError,
@@ -466,7 +470,7 @@ export async function setAnsweringModel(
   teamSlug: string,
   provider: AnsweringProvider,
   model: string
-): Promise<{ ok: boolean; error?: string }> {
+): Promise<{ ok: boolean; error?: string; warning?: string }> {
   const ctx = await requireAdmin(teamSlug);
   if (!ctx) return { ok: false, error: "admins only" };
   const allowed: AnsweringProvider[] = ["anthropic", "openai", "openrouter", "local"];
@@ -493,7 +497,19 @@ export async function setAnsweringModel(
     return { ok: false, error: e instanceof Error ? e.message : "could not save answering model" };
   }
   revalidatePath(`/t/${teamSlug}/admin/integrations`);
-  return { ok: true };
+  // The save SUCCEEDED — this is advisory. Since the graph proxy made this picker also drive
+  // Graphiti's extraction, a model without structured-output support silently empties the graph:
+  // Graphiti keeps returning 202, arcs go blank, and the next signal is the stall detector six hours
+  // later. Surfacing it here turns that into a sentence at the moment of the choice. Best-effort —
+  // an unreachable catalogue or an unlisted model yields no warning rather than a false accusation.
+  let warning: string | undefined;
+  try {
+    warning =
+      structuredOutputWarning(await checkStructuredOutputSupport(provider, model.trim())) ?? undefined;
+  } catch {
+    warning = undefined;
+  }
+  return warning ? { ok: true, warning } : { ok: true };
 }
 
 /**
