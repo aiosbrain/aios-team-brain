@@ -48,7 +48,7 @@ import {
  * DATABASE_URL uses Railway's reference syntax so the value tracks the Postgres service rather
  * than being copied (a copied URL goes stale the moment credentials rotate).
  */
-export function buildVariables({ appUrl, authSecret, secretsKey, anthropicKey, resendKey, resendFrom }) {
+export function buildVariables({ appUrl, authSecret, secretsKey, anthropicKey, openaiKey, openrouterKey, llmBaseUrl, resendKey, resendFrom }) {
   const vars = {
     DATABASE_URL: "${{Postgres.DATABASE_URL}}",
     // Managed Postgres rejects plaintext; omitting this is the top first-deploy failure.
@@ -60,6 +60,12 @@ export function buildVariables({ appUrl, authSecret, secretsKey, anthropicKey, r
     APP_URL: appUrl,
   };
   if (anthropicKey) vars.ANTHROPIC_API_KEY = anthropicKey;
+  // The wizard lets the user pick any provider. Carrying only Anthropic here meant a pasted
+  // OpenAI/OpenRouter key was validated and then silently dropped, producing an instance with no
+  // answering model that still reported success.
+  if (openaiKey) vars.OPENAI_API_KEY = openaiKey;
+  if (openrouterKey) vars.OPENROUTER_API_KEY = openrouterKey;
+  if (llmBaseUrl) vars.LLM_BASE_URL = llmBaseUrl;
   if (resendKey) vars.RESEND_API_KEY = resendKey;
   if (resendFrom) vars.RESEND_FROM = resendFrom;
   return vars;
@@ -136,10 +142,23 @@ export function isEnvironmentMap(parsed) {
  * `railway variables --set …`. Echoing a real AUTH_SECRET/SECRETS_KEY there hands someone a
  * copyable command that performs exactly the rotation this script now prevents.
  */
+export const PLAN_REDACTED_KEYS = Object.freeze([
+  "AUTH_SECRET",
+  "SECRETS_KEY",
+  // Provider keys belong here for the same reason, and are the ones a widening is likely to miss:
+  // they arrived later than the two above, and a redactor that only knows the original pair leaks
+  // every key added after it.
+  "ANTHROPIC_API_KEY",
+  "OPENAI_API_KEY",
+  "OPENROUTER_API_KEY",
+  "RESEND_API_KEY",
+]);
+
 export function redactSecretsForPlan(rendered) {
+  const keys = PLAN_REDACTED_KEYS.join("|");
   return String(rendered).replace(
-    /(--set (?:AUTH_SECRET|SECRETS_KEY)=)\S+/g,
-    (_m, prefix) => `${prefix}<generated-or-preserved>`
+    new RegExp(`(--set (?:${keys})=)\\S+`, "g"),
+    (_m, prefix) => `${prefix}<redacted>`
   );
 }
 
@@ -203,7 +222,7 @@ function parseJson(text) {
 
 export async function runSetup(opts, io = { exec: defaultExec, log: console.log }) {
   // displayName / memberName belong to finishSetup — the team and member are created there.
-  const { slug, email, anthropicKey, resendKey, resendFrom, dryRun } = opts;
+  const { slug, email, anthropicKey, openaiKey, openrouterKey, llmBaseUrl, resendKey, resendFrom, dryRun } = opts;
 
   const project = toProjectName(slug);
   if (!project || !isSanctionedProjectName(project)) {
@@ -295,7 +314,11 @@ export async function runSetup(opts, io = { exec: defaultExec, log: console.log 
   if (reused.length) io.log(`  ↺ preserving existing ${reused.join(" + ")} (rotating them is destructive)`);
   const complaint = secretsKeyComplaint(existingVars.SECRETS_KEY);
   if (complaint) io.log(`  ⚠ ${complaint}`);
-  const vars = buildVariables({ appUrl, authSecret, secretsKey, anthropicKey, resendKey, resendFrom });
+  const vars = buildVariables({
+    appUrl, authSecret, secretsKey,
+    anthropicKey, openaiKey, openrouterKey, llmBaseUrl,
+    resendKey, resendFrom,
+  });
   const setv = railway(["variables", ...toVariableArgs(vars)], { write: true, pin: project, status: pinned });
   if (setv.status !== 0) throw new Error(`setting variables failed: ${setv.stderr.trim()}`);
   io.log(`✓ ${Object.keys(vars).length} variables set (secrets generated, not printed)`);
@@ -370,6 +393,9 @@ async function main() {
       email: { type: "string" },
       "member-name": { type: "string" },
       "anthropic-key": { type: "string" },
+      "openai-key": { type: "string" },
+      "openrouter-key": { type: "string" },
+      "llm-base-url": { type: "string" },
       "resend-key": { type: "string" },
       "resend-from": { type: "string" },
       resume: { type: "boolean", default: false },
@@ -387,6 +413,7 @@ async function main() {
         "  --name <display>       team display name",
         "  --member-name <name>   your display name",
         "  --anthropic-key <k>    answering model (or configure per-team in Admin later)",
+        "  --openai-key <k> | --openrouter-key <k> | --llm-base-url <url>   other providers",
         "  --resend-key <k> --resend-from <addr>   magic-link email",
         "  --resume               continue after connecting the GitHub repo",
         "  --dry-run              print the plan and write nothing. Reads DO run (so the plan can",
@@ -403,6 +430,9 @@ async function main() {
     email: values.email,
     memberName: values["member-name"],
     anthropicKey: values["anthropic-key"],
+    openaiKey: values["openai-key"],
+    openrouterKey: values["openrouter-key"],
+    llmBaseUrl: values["llm-base-url"],
     resendKey: values["resend-key"],
     resendFrom: values["resend-from"],
     dryRun: values["dry-run"],

@@ -18,6 +18,7 @@ import path from "node:path";
 import { randomBytes } from "node:crypto";
 import pg from "pg";
 import { shouldUseSsl } from "../scripts/pg-load-schema.mjs";
+import { credentialPlan } from "../scripts/setup/credential-plan.mjs";
 
 const DATABASE_URL = process.env.DATABASE_URL;
 if (!DATABASE_URL) {
@@ -122,6 +123,97 @@ function parseShellEnv(text) {
   return out;
 }
 
+/** Does this email already have a usable login? Drives whether we set a password at all. */
+async function hasCredential(email) {
+  const client = new pg.Client({ connectionString: DATABASE_URL, ssl });
+  await client.connect();
+  try {
+    const { rows } = await client.query(
+      "select 1 from auth_users where lower(email) = lower($1) and password_hash is not null limit 1",
+      [email]
+    );
+    return rows.length > 0;
+  } catch {
+    // A missing table means the schema load didn't take; treat as "no credential" and let the
+    // admin.ts call surface the real error rather than masking it here.
+    return false;
+  } finally {
+    await client.end();
+  }
+}
+
+/** Run a command, capturing output instead of inheriting it. */
+function runQuiet(cmd, args) {
+  const r = spawnSync(cmd, args, { encoding: "utf8", cwd: "/app" });
+  if (r.status !== 0) {
+    console.error(r.stdout ?? "");
+    console.error(r.stderr ?? "");
+    console.error(`bootstrap: \`${cmd} ${args.join(" ")}\` exited ${r.status}`);
+    process.exit(r.status ?? 1);
+  }
+  return r.stdout ?? "";
+}
+
+/**
+ * Create the operator's own team + admin, idempotently.
+ *
+ * PASSWORD STABILITY IS THE WHOLE DIFFICULTY, and the obvious fix is wrong.
+ *
+ * This runs on EVERY container start, so re-provisioning the credential each time would reset the
+ * login on every `docker compose up` — including over a password the user later changed in Admin.
+ * That is the same rotate-on-rerun failure the Railway provisioner was just fixed for, and worse
+ * here because a restart is routine rather than deliberate.
+ *
+ * The trap: omitting `--password` does NOT skip setting one. `scripts/admin.ts` does
+ * `flags.password || randomPassword()`, so `create-member` ALWAYS writes a credential — dropping
+ * the flag just installs a random password nobody ever sees, locking the user out completely.
+ * (Measured: the stored hash changed across a restart while this function reported "unchanged".)
+ *
+ * So the credential decision has to be made BEFORE deciding whether to run `create-member` at all —
+ * see `credentialPlan`. Once an account has a password, we touch nothing.
+ */
+async function provisionRealTeam() {
+  const slug = process.env.TEAM_SLUG;
+  const name = process.env.TEAM_NAME || slug;
+  const email = process.env.ADMIN_EMAIL;
+  if (!email) {
+    console.error("bootstrap: TEAM_SLUG was set without ADMIN_EMAIL — there would be no way to log in");
+    process.exit(1);
+  }
+  const adminName = process.env.ADMIN_NAME || email.split("@")[0];
+
+  console.log(`▶ ensuring team ${slug} and admin ${email}…`);
+  // Idempotent by construction: `createTeam` returns the existing row for a known slug.
+  runQuiet("npx", ["tsx", "--conditions", "react-server", "scripts/admin.ts", "create-team", slug, "--name", name]);
+
+  const plan = credentialPlan({
+    hasCredential: await hasCredential(email),
+    adminPassword: process.env.ADMIN_PASSWORD,
+  });
+
+  if (plan.action === "create") {
+    runQuiet("npx", [
+      "tsx", "--conditions", "react-server", "scripts/admin.ts",
+      "create-member", email,
+      "--name", adminName,
+      "--handle", adminName.toLowerCase().replace(/\W+/g, ""),
+      "--role", "admin", "--team", slug,
+      "--password", plan.password,
+      "--upsert",
+    ]);
+  }
+
+  const url = process.env.APP_URL || "http://localhost:3000";
+  console.log(
+    ["", "─".repeat(58), `  ${name} is ready`, "", `  URL       ${url}/t/${slug}`, `  Login     ${email}`,
+     plan.password
+       ? `  Password  ${plan.password}   ← copy it now, this is the only time it is shown`
+       : "  Password  unchanged — your existing login still works",
+     "", "  Next: Admin → Integrations to connect Slack / GitHub / Linear.",
+     "─".repeat(58), ""].join("\n")
+  );
+}
+
 async function main() {
   ensureDevSecrets();
 
@@ -131,8 +223,17 @@ async function main() {
   console.log("▶ loading schema (idempotent; also applies migrations)…");
   run("node", ["scripts/pg-load-schema.mjs"]);
 
+  // A REAL install: the operator's own team, not the Northwind demo. Without this, the only local
+  // path that produced something you could log into was the demo — `SEED_DEMO=false` returned here
+  // with a running app, an empty database, no team, no member and no printed credentials, which is
+  // a stack you cannot get into. `npm run setup`'s local target sets these.
+  if (process.env.TEAM_SLUG) {
+    await provisionRealTeam();
+    return;
+  }
+
   if (process.env.SEED_DEMO === "false") {
-    console.log("▶ SEED_DEMO=false — skipping demo data");
+    console.log("▶ SEED_DEMO=false — skipping demo data (no team and no login are created)");
     return;
   }
 
@@ -153,6 +254,8 @@ async function main() {
     ]);
   }
 
+  // Only reached when the demo actually owns this database. Printing demo credentials after a real
+  // install advertised a login (admin@demo.local) that was never created.
   const url = process.env.APP_URL || "http://localhost:3000";
   console.log(
     ["", "─".repeat(58), "  AIOS Team Brain is starting", "", `  URL       ${url}`,

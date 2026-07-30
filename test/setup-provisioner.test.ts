@@ -276,7 +276,29 @@ describe("the dry-run plan neither leaks nor misrepresents", () => {
     expect(plan).not.toContain("deadbeefcafe");
     expect(plan).not.toContain("aGVsbG8=");
     expect(plan).toContain("PGSSL=require"); // non-secrets stay legible
-    expect(plan).toContain("AUTH_SECRET=<generated-or-preserved>");
+    expect(plan).toContain("AUTH_SECRET=<redacted>");
+  });
+
+  it("redacts EVERY secret-valued variable, not just the original two", () => {
+    // The redactor was written when only AUTH_SECRET/SECRETS_KEY existed. Adding provider keys to
+    // `buildVariables` without widening it would print a live API key into the plan — so the two
+    // sets are pinned against each other here.
+    const secretish = Object.keys(
+      buildVariables({
+        appUrl: "https://x",
+        authSecret: "a",
+        secretsKey: "b",
+        anthropicKey: "sk-ant-live",
+        openaiKey: "sk-openai-live",
+        openrouterKey: "sk-or-live",
+        resendKey: "re_live",
+        resendFrom: "a@b.co",
+      })
+    ).filter((k) => /SECRET|KEY|TOKEN/.test(k));
+    const plan = redactSecretsForPlan(
+      `railway variables ${secretish.map((k) => `--set ${k}=LIVE-${k}`).join(" ")}`
+    );
+    for (const k of secretish) expect(plan).not.toContain(`LIVE-${k}`);
   });
 
   it("predicts preservation truthfully, because the reads are real", async () => {

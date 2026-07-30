@@ -55,8 +55,19 @@ services:
       # Optional: answer queries. Everything else works without them.
       # Exported on the host → picked up here; unset → left empty.
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      # The other providers the setup wizard can configure. Absent from this list, a key the user
+      # pasted would be validated and then silently dropped on the floor.
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       LLM_BASE_URL: ${LLM_BASE_URL:-}
       LLM_MODEL: ${LLM_MODEL:-}
+      # A REAL local install: bootstrap provisions this team + admin instead of the demo. These must
+      # be forwarded explicitly — compose does not inherit the parent process's environment, so
+      # without these four lines `npm run setup`'s local target boots a brain with no way to log in.
+      TEAM_SLUG: ${TEAM_SLUG:-}
+      TEAM_NAME: ${TEAM_NAME:-}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-}
+      ADMIN_NAME: ${ADMIN_NAME:-}
       # SEED_DEMO=false for an empty brain.
       SEED_DEMO: ${SEED_DEMO:-true}
       DEMO_EMAIL: ${DEMO_EMAIL:-admin@demo.local}
