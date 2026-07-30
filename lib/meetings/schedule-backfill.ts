@@ -1,5 +1,11 @@
 import "server-only";
 import { isMeetingTranscript } from "./from-items";
+// Type-only — erased at build, so the API route still pays nothing for these server-only modules, but
+// the dependency seam below is checked at compile time instead of behind `never` casts.
+import type { BackfillSummary } from "./from-items";
+import type { ProviderKeys } from "./llm-extract";
+import type { DbClient } from "@/lib/db/types";
+import type { IngestRunInput } from "@/lib/ingest/runs";
 
 /**
  * Run the meeting-notes backfill right after a meeting is pushed, instead of leaving it to the 30-minute
@@ -108,12 +114,77 @@ export function createMeetingBackfillScheduler(run: BackfillRunner): MeetingBack
   };
 }
 
+export interface TracedBackfillDeps {
+  backfill: () => Promise<{ created?: number; scanned?: number; merged?: number }>;
+  record: (row: {
+    ok: boolean;
+    created?: number;
+    errors?: string[];
+    meta?: Record<string, unknown>;
+  }) => Promise<void>;
+}
+
+/**
+ * Run the backfill and leave a durable `ingest_runs` trace either way.
+ *
+ * The scheduler leg records one because it was "the one scheduler loop with no durable trace — a broken
+ * model silently made no notes". Moving the work onto the push path without this would quietly undo that:
+ * the tick would log `created: 0` forever while the push path did everything, so the ledger would show a
+ * pipeline doing nothing precisely when it's working. Rethrows after recording — the scheduler wrapper is
+ * what swallows, so a failure is both traced and non-fatal.
+ */
+export async function runTracedMeetingBackfill(deps: TracedBackfillDeps): Promise<void> {
+  try {
+    const s = await deps.backfill();
+    await deps.record({
+      ok: true,
+      created: s.created ?? 0,
+      meta: { scanned: s.scanned ?? 0, merged: s.merged ?? 0 },
+    });
+  } catch (err) {
+    await deps.record({ ok: false, errors: [err instanceof Error ? err.message : String(err)] });
+    throw err;
+  }
+}
+
+/**
+ * The ledger identity of a push-triggered run, owned here rather than inlined in the singleton so it is
+ * pinned by a test. `source` must match the scheduler leg's so both land on the same pipeline-health
+ * row; `trigger: "api"` is what distinguishes an on-demand run from a poller tick — and the health
+ * card's staleness clock reads `scheduler` rows only, so getting this wrong would silently mask a dead
+ * scheduler (see `lib/ingest/pipeline-health`).
+ */
+export const PUSH_BACKFILL_RUN = { source: "meeting_notes", trigger: "api" } as const;
+
+/** Wire the traced backfill to its real dependencies. Exported so the wiring — not just the helper —
+ *  is covered; the singleton below only resolves the server-only imports. */
+export interface PushBackfillDeps {
+  db: DbClient;
+  resolveKeys: (db: DbClient, teamId: string) => Promise<ProviderKeys>;
+  backfill: (db: DbClient, teamId: string, opts: { keys: ProviderKeys }) => Promise<BackfillSummary>;
+  record: (db: DbClient, row: IngestRunInput) => Promise<unknown>;
+}
+
+export function buildPushBackfillRunner(deps: PushBackfillDeps): BackfillRunner {
+  return async (teamId: string) => {
+    const startedAt = Date.now();
+    await runTracedMeetingBackfill({
+      backfill: async () => deps.backfill(deps.db, teamId, { keys: await deps.resolveKeys(deps.db, teamId) }),
+      record: async (row) => void (await deps.record(deps.db, { teamId, ...PUSH_BACKFILL_RUN, startedAt, ...row })),
+    });
+  };
+}
+
 /** The shared instance the push route uses. Imports are lazy so the API route stays light. */
 export const meetingBackfillScheduler = createMeetingBackfillScheduler(async (teamId) => {
   const { adminClient } = await import("@/lib/db/admin");
   const { resolveAnsweringKeys } = await import("@/lib/query/answering");
   const { backfillMeetingNotesFromItems } = await import("./from-items");
-  const db = adminClient();
-  const keys = await resolveAnsweringKeys(db, teamId);
-  await backfillMeetingNotesFromItems(db, teamId, { keys });
+  const { recordIngestRun } = await import("@/lib/ingest/runs");
+  return buildPushBackfillRunner({
+    db: adminClient(),
+    resolveKeys: (db, id) => resolveAnsweringKeys(db, id),
+    backfill: (db, id, opts) => backfillMeetingNotesFromItems(db, id, opts),
+    record: (db, row) => recordIngestRun(db, row as never),
+  })(teamId);
 });

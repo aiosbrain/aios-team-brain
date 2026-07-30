@@ -41,8 +41,11 @@ const STALE_MS_BY_SOURCE: Record<string, number | null> = {
   // an accepted tradeoff since it's per-team opt-in and any throw records `ok=false`.
   // (Contrast slack/plane/linear/github AND meeting_notes, which record EVERY tick — the first four via
   // scheduler.runImport "still record configured sources (proves the poller ran)", meeting_notes
-  // unconditionally per team (scheduler.ts:222) — so last-row age == last-poll age and the 3h default
-  // is meaningful there; nulling meeting_notes would have removed a real dead-scheduler heartbeat.)
+  // unconditionally per team (scheduler.ts:222) — so last-SCHEDULER-row age == last-poll age and the 3h
+  // default is meaningful there; nulling meeting_notes would have removed a real dead-scheduler
+  // heartbeat. Note "scheduler row", not "last row": meeting_notes ALSO runs on demand from `aios push`
+  // (trigger `api`), so the staleness clock below reads scheduler-triggered rows only — an on-demand run
+  // must never be mistaken for proof that the poller is alive.)
   dense: null,
   linear_inbound: null,
   graph_project: null,
@@ -131,7 +134,7 @@ export async function getPipelineHealth(teamId: string): Promise<PipelineHealth>
     // The graph-extraction probe hits Neo4j, so run it concurrently with the ledger read. Also read
     // the team's currently-enabled integration types, so a connector leg whose integration was
     // deleted/disabled (its last run frozen as a failure) is suppressed instead of crying wolf.
-    const [res, extraction, enabled] = await Promise.all([
+    const [res, beats, extraction, enabled] = await Promise.all([
       runSql<Row>(
         `select distinct on (source) source, ok, errors, finished_at
            from ingest_runs
@@ -139,6 +142,19 @@ export async function getPipelineHealth(teamId: string): Promise<PipelineHealth>
           order by source, finished_at desc`,
         [teamId]
       ),
+      // The POLLER heartbeat, deliberately separate from the newest-row-of-any-trigger above.
+      // Staleness answers "is the scheduler still ticking", and only a `scheduler` row is evidence of
+      // that. A leg that is ALSO runnable on demand — `meeting_notes` now runs on every `aios push`
+      // (trigger `api`) — would otherwise keep refreshing its own newest-row age while the poller was
+      // wedged, masking a dead scheduler for exactly the teams that push most. `ok`/`error` still come
+      // from the newest row of ANY trigger, so a real failure stays loud whoever caused it.
+      runSql<{ source: string; finished_at: string | Date }>(
+        `select distinct on (source) source, finished_at
+           from ingest_runs
+          where (team_id = $1 or team_id is null) and trigger = 'scheduler'
+          order by source, finished_at desc`,
+        [teamId]
+      ).catch(() => null),
       getGraphExtractionHealth(teamId).catch(() => null),
       runSql<{ type: string }>(
         `select distinct type from integrations where team_id = $1 and status = 'enabled'`,
@@ -147,11 +163,21 @@ export async function getPipelineHealth(teamId: string): Promise<PipelineHealth>
     ]);
     // null = the enabled-integrations read failed → unknown config → fail OPEN (suppress nothing).
     const enabledTypes: ReadonlySet<string> | null = enabled ? new Set(enabled.rows.map((r) => r.type)) : null;
+    const iso = (v: string | Date) => (v instanceof Date ? v.toISOString() : String(v));
+    // source → newest SCHEDULER-triggered finish. Null when that read failed (fail open: fall back to
+    // the newest row of any trigger rather than inventing staleness from missing data).
+    const beatAt: Map<string, string> | null = beats
+      ? new Map(beats.rows.map((r) => [r.source, iso(r.finished_at)]))
+      : null;
     const legs: PipelineLeg[] = res.rows.map((r) => {
-      const at = r.finished_at instanceof Date ? r.finished_at.toISOString() : String(r.finished_at);
+      const at = iso(r.finished_at);
       // Stale only past THIS source's own cadence — a 24h job isn't stale at 3h (would cry wolf).
       const threshold = staleThresholdMs(r.source);
-      const stale = threshold !== null && now - Date.parse(at) > threshold;
+      // Age the POLLER, not the leg. A source with rows but no scheduler row yet (a brand-new team
+      // whose first tick hasn't landed, or an on-demand-only leg) has no heartbeat to judge, so it is
+      // not aged at all — consistent with this file's standing "never cry wolf" bias.
+      const clock = beatAt === null ? at : beatAt.get(r.source);
+      const stale = threshold !== null && clock !== undefined && now - Date.parse(clock) > threshold;
       return { source: r.source, ok: r.ok, error: r.ok ? null : firstError(r.errors), at, stale };
     });
 

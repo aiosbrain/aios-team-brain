@@ -1,6 +1,8 @@
 import { describe, it, expect } from "vitest";
 import {
+  buildPushBackfillRunner,
   createMeetingBackfillScheduler,
+  runTracedMeetingBackfill,
   shouldScheduleMeetingBackfill,
 } from "@/lib/meetings/schedule-backfill";
 
@@ -160,5 +162,91 @@ describe("createMeetingBackfillScheduler — coalescing", () => {
     s.schedule("team-1");
     await s.idle("team-1");
     expect(calls).toBe(2);
+  });
+});
+
+describe("runTracedMeetingBackfill — the push path leaves a durable trace", () => {
+  it("records a successful run with what it created", async () => {
+    const rows: unknown[] = [];
+    await runTracedMeetingBackfill({
+      backfill: async () => ({ created: 3, scanned: 5, merged: 1 }),
+      record: async (r) => void rows.push(r),
+    });
+    expect(rows).toEqual([{ ok: true, created: 3, meta: { scanned: 5, merged: 1 } }]);
+  });
+
+  it("records a FAILED run and rethrows, so a broken model is visible and still non-fatal", async () => {
+    // Without this the tick would log `created: 0` forever while the push path silently did (or failed
+    // to do) all the work — a ledger showing an idle pipeline exactly when it is the busy one.
+    const rows: { ok: boolean; errors?: string[] }[] = [];
+    await expect(
+      runTracedMeetingBackfill({
+        backfill: async () => {
+          throw new Error("model down");
+        },
+        record: async (r) => void rows.push(r),
+      })
+    ).rejects.toThrow("model down");
+    expect(rows).toEqual([{ ok: false, errors: ["model down"] }]);
+  });
+
+  it("still traces a run that created nothing", async () => {
+    const rows: { created?: number }[] = [];
+    await runTracedMeetingBackfill({ backfill: async () => ({}), record: async (r) => void rows.push(r) });
+    expect(rows[0]).toMatchObject({ ok: true, created: 0, meta: { scanned: 0, merged: 0 } });
+  });
+});
+
+describe("buildPushBackfillRunner — the ledger identity is wired, not just declared", () => {
+  it("records the run as source=meeting_notes trigger=api, with the team and counts", async () => {
+    // Pins the LITERALS at the call site. Reverting the singleton to an untraced backfill, or writing
+    // trigger='scheduler' here, would mask a dead poller on the pipeline-health card — and every test
+    // over runTracedMeetingBackfill alone would still pass.
+    const rows: Record<string, unknown>[] = [];
+    const runner = buildPushBackfillRunner({
+      db: { tag: "db" },
+      resolveKeys: async () => ({ anthropic: "k" }),
+      backfill: async () => ({ created: 2, scanned: 4, merged: 0 }),
+      record: async (_db, row) => void rows.push(row),
+    });
+    await runner("team-9");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      teamId: "team-9",
+      source: "meeting_notes",
+      trigger: "api",
+      ok: true,
+      created: 2,
+    });
+    expect(typeof rows[0].startedAt).toBe("number");
+  });
+
+  it("passes the resolved keys into the backfill", async () => {
+    let seen: unknown;
+    const runner = buildPushBackfillRunner({
+      db: {},
+      resolveKeys: async () => ({ anthropic: "resolved" }),
+      backfill: async (_db, _id, opts) => {
+        seen = opts.keys;
+        return {};
+      },
+      record: async () => undefined,
+    });
+    await runner("team-9");
+    expect(seen).toEqual({ anthropic: "resolved" });
+  });
+
+  it("records ok=false and rethrows when the backfill throws", async () => {
+    const rows: Record<string, unknown>[] = [];
+    const runner = buildPushBackfillRunner({
+      db: {},
+      resolveKeys: async () => ({}),
+      backfill: async () => {
+        throw new Error("boom");
+      },
+      record: async (_db, row) => void rows.push(row),
+    });
+    await expect(runner("team-9")).rejects.toThrow("boom");
+    expect(rows[0]).toMatchObject({ source: "meeting_notes", trigger: "api", ok: false });
   });
 });
