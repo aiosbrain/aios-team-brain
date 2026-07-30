@@ -13,6 +13,10 @@ import {
 import { ingestItem } from "@/lib/ingest";
 import { attributeIncomingItem } from "@/lib/attribution/resolve-authors";
 import { projectChangedTasksAfterWrite } from "@/lib/pm-sync";
+import {
+  meetingBackfillScheduler,
+  shouldScheduleMeetingBackfill,
+} from "@/lib/meetings/schedule-backfill";
 
 export const runtime = "nodejs";
 
@@ -90,6 +94,24 @@ export async function POST(req: NextRequest) {
       after(async () => {
         await projectChangedTasksAfterWrite(adminClient(), teamId, projectId, rowKeys);
       });
+    }
+
+    // A pushed MEETING becomes visible on the Meetings page within seconds instead of waiting for the
+    // 30-minute scheduler tick. The Meetings page reads `meeting_notes`, which only the backfill writes,
+    // so until now `aios push` returned success while the UI showed nothing. Same shape as the task
+    // projection above: after the response, coalesced per team, errors swallowed — the scheduler tick
+    // stays the backstop, so a failure here only costs latency, never the note.
+    if (
+      shouldScheduleMeetingBackfill({
+        kind: parsed.data.kind,
+        source: parsed.data.frontmatter?.source,
+        status: result.status,
+      })
+    ) {
+      const teamId = auth.teamId;
+      // Awaited so the platform keeps the process alive for this post-response work — self-host targets
+      // that freeze after the response would otherwise kill a detached run mid-extraction.
+      after(() => meetingBackfillScheduler.schedule(teamId));
     }
 
     // Strip the internal scheduling hints — the HTTP wire format stays { status, id }.
