@@ -5,7 +5,8 @@ import { serverClient } from "@/lib/db/server";
 import { resolveTeamContext } from "@/lib/auth/team-context";
 import { isRestrictedTier } from "@/lib/auth/visibility";
 import { parseRange } from "@/lib/metrics/range";
-import { getLlmCostBreakdown } from "@/lib/metrics/llm-costs";
+import { getLlmCostBreakdown, getLedgerLifetimeUsd } from "@/lib/metrics/llm-costs";
+import { getProviderReportedUsage, reconcileLedger } from "@/lib/costs/provider-usage";
 import { RangeSelector } from "@/components/dashboard/range-selector";
 import { CostBreakdownChart } from "@/components/charts/cost-breakdown";
 import { HelpHint } from "@/components/help-hint";
@@ -55,6 +56,19 @@ export default async function CostsPage({
   const db = await serverClient();
   const breakdown = await getLlmCostBreakdown(db, team.id, range, { isAdmin, memberId: me.id });
   const scopeWord = isAdmin ? "Team" : "Your";
+
+  // RECONCILIATION. The ledger is a floor, not a total: a call that times out or fails after the
+  // provider already generated is billed upstream and returns no `usage` for us to read, so no amount
+  // of fixing the meter closes the gap. Measured 2026-07-30 the ledger said $51.46 while OpenRouter's
+  // own `/credits` said $96.67 on the same key — and the page presented the floor as the answer.
+  // Admins only: it is a whole-key number, so it means nothing beside one member's scoped spend.
+  const providerUsage = isAdmin ? await getProviderReportedUsage(db, team.id) : null;
+  const ledgerLifetimeUsd =
+    isAdmin && providerUsage ? await getLedgerLifetimeUsd(db, team.id, providerUsage.provider) : null;
+  const reconciliation =
+    providerUsage && ledgerLifetimeUsd !== null
+      ? reconcileLedger(providerUsage.totalUsageUsd, ledgerLifetimeUsd)
+      : null;
 
   // Show the "tracking since" caption only when metering began INSIDE the selected window — i.e. the
   // window is wider than the data, so "last 30d" overstates coverage (decided server-side to avoid a
@@ -111,6 +125,48 @@ export default async function CostsPage({
         </div>
         <RangeSelector value={range} />
       </div>
+
+      {/* Shown whenever we can ask the provider — not only when it looks bad. A reconciliation that
+          appears only on failure teaches nobody what the number means, and its absence would be
+          indistinguishable from "we didn't check". Amber only when the gap is material. */}
+      {reconciliation ? (
+        <div
+          className={`rounded-lg border px-3 py-2 text-xs ${
+            reconciliation.status === "unattributed"
+              ? "border-amber-400/30 bg-amber-400/10 text-amber-700 dark:text-amber-300"
+              : "border-border-subtle/60 text-ink-tertiary"
+          }`}
+        >
+          {reconciliation.status === "unattributed" ? (
+            <>
+              <strong>
+                OpenRouter has billed {usd(reconciliation.providerUsd)} on this key; this ledger accounts
+                for {usd(reconciliation.ledgerUsd)}.
+              </strong>{" "}
+              {usd(reconciliation.unattributedUsd)} (
+              {Math.round(reconciliation.unattributedFraction * 100)}%) can&apos;t be attributed to a
+              feature, so the breakdown below is a <strong>floor</strong>, not the total. Usually that is
+              a call that timed out or failed after the model had already generated — billed by the
+              provider, but returning no usage for the brain to record. It also covers any spend on this
+              key from outside this instance. Both figures are lifetime for the key, not the selected
+              window.
+            </>
+          ) : reconciliation.status === "ledger-exceeds" ? (
+            <>
+              This ledger records {usd(reconciliation.ledgerUsd)} of OpenRouter spend, more than the{" "}
+              {usd(reconciliation.providerUsd)} the provider reports for the current key — usually because
+              the key was rotated, so older spend has no counterpart on the new one. Nothing is missing
+              from the breakdown below.
+            </>
+          ) : (
+            <>
+              Reconciled against the provider: OpenRouter reports {usd(reconciliation.providerUsd)} spent
+              on this key, and this ledger accounts for {usd(reconciliation.ledgerUsd)} of it (lifetime,
+              not the selected window).
+            </>
+          )}
+        </div>
+      ) : null}
 
       <CostBreakdownChart
         title="By feature"

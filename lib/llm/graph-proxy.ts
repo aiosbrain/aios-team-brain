@@ -302,7 +302,12 @@ export interface GraphMeterCtx {
  */
 async function meterGraphCall(text: string, status: number, target: ProxyTarget, meter: GraphMeterCtx): Promise<void> {
   try {
-    if (status < 200 || status >= 300) return; // only a successful call spent tokens
+    // NOT gated on a 2xx. "Only a successful call spent tokens" is what this used to assume, and it is
+    // false: a provider can return `usage` alongside a non-2xx (a post-generation moderation refusal,
+    // a partial), and that generation IS billed. Measured on 2026-07-30 the ledger held $51.46 while
+    // OpenRouter's own `/credits` reported $96.67 spent on the same key — 47% invisible. Metering
+    // whatever `usage` arrives, whatever the status, is strictly closer to the truth; a body with no
+    // `usage` still returns null below and records nothing.
     const c = meterFromOpenAiResponse(text, target.provider, target.model, meter.kind);
     if (!c) return;
     await recordLlmUsage(meter.db, {
