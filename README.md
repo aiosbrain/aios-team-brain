@@ -290,7 +290,8 @@ Postgres.
 > ⚠️ **Name the web service `aios` or `aios-<something>`.** A guard in `scripts/service-guard.mjs`
 > aborts the schema load if `RAILWAY_SERVICE_NAME` doesn't match that pattern — it exists because
 > this repo once loaded its schema into a different project's database and took it down. On a
-> non-Railway host the guard is inert.
+> non-Railway host the guard is inert. (`npm run setup` names the project for you, so this can only
+> bite a hand-created service.)
 
 Add the graph services (§2.8) later, only if you want narrative arcs.
 
@@ -311,8 +312,11 @@ RESEND_FROM="AIOS <noreply@yourdomain.com>"
 
 `APP_URL` matters more than it looks: invite and magic links are built in server actions where there
 is no request origin to fall back on, so without it every login link your team receives is broken.
+It also can't be known until the domain exists — which is why `npm run setup` claims the domain
+first and reads the value back, rather than asking you to guess it.
 
-Full reference in §3, including everything optional.
+Full reference in §3, including everything optional. `npm run doctor` checks the ones above that
+fail silently rather than at boot.
 
 ### 2.3 — Deploy, and let the schema load itself
 
@@ -361,7 +365,8 @@ railway run -s Postgres bash -lc 'DATABASE_URL=$DATABASE_PUBLIC_URL \
   --name "Your Name" --handle you --role admin --team acme'
 ```
 
-Anywhere else, export `DATABASE_URL` and run `npm run admin -- <command>`.
+Anywhere else, export `DATABASE_URL` and run `npm run admin -- <command>`. `npm run setup -- --resume`
+runs both of these for you after the first deploy and surfaces the password.
 
 > **`create-member` prints a generated password once and never again.** Copy it — that is how you log
 > in. Pass `--password` to choose your own.
@@ -416,6 +421,27 @@ This is the part that makes it a team brain rather than an empty database. Go to
 | **Plane** | an API token + workspace/project |
 
 They start pulling on the next scheduler tick (≤ 30 min) and every 30 min after.
+
+**Don't wait 30 minutes to find out whether the token worked.** A wrong Slack scope fails inside
+that tick, where nothing surfaces it, and "it isn't working" looks identical to "there was nothing
+new to ingest". Force the sync and read the result:
+
+```bash
+npm run connectors -- verify   # runs the sync now, then reports what actually landed
+npm run connectors -- status   # same report without forcing a sync
+```
+
+```
+✓ slack    14 created, 2 updated · just now
+✓ github   ran 4m ago — nothing new (not a failure)
+✗ linear   invalid api key: 401
+· plane    not configured — add it in Admin → Integrations
+```
+
+A successful run that found nothing is a **success**, not a breakage. Failures print the recorded
+error verbatim (`missing_scope: channels:read` means the Slack app needs that scope **and** a
+reinstall — scopes are fixed at install time). Exit code is non-zero only on a real failure, so this
+is safe to put in a setup script. Agents: the `connect` skill drives this whole loop.
 
 For **Notion, Google Drive, Confluence, RSS, web pages and local files**, run the Python sidecar in
 `ingestion/` — it pulls on your infrastructure and pushes over the same API, so those credentials
@@ -565,6 +591,22 @@ posting and throws rather than sending a bad id.
 > the colon form is precisely the one Graphiti rejects.
 
 ### 2.9 — Verify it worked
+
+**If you just deployed**, these two answer "is this install healthy" in a few seconds, and are the
+ones to reach for first:
+
+```bash
+npm run doctor                 # env + database: the settings that fail silently later
+npm run connectors -- status   # per-connector: configured, last run, what landed, any error
+```
+
+`doctor` exists because the misconfigurations here don't announce themselves at boot: a
+`SECRETS_KEY` of the wrong byte width only throws on the *first connector save*, an unset `APP_URL`
+mails every teammate a broken login link, a missing mail transport drops invites silently in
+production, and an embeddings model of the wrong width degrades to zero dense hits without an
+error. Each is a ✗ or ⚠ line here instead of a mystery later. It exits non-zero only on a failure.
+
+**If you're changing the brain itself**, the full loop is the e2e suite:
 
 ```bash
 bash scripts/e2e.sh
@@ -743,6 +785,9 @@ auto-loads `.env.local`. Run `set -a; . ./.env.local; set +a` first.
 looks complete while the value is blank. Generate one with
 `node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"`.
 
+`npm run doctor` catches this before you go make a token — including the common near-miss of pasting
+64 hex characters, which decodes to 48 bytes rather than 32.
+
 ### Graph accepts everything but no facts appear — arcs blank
 
 **The signature failure of this stack, and it is silent.** Graphiti returns `202` on every episode,
@@ -800,7 +845,8 @@ in the dashboard rather than iterating on a live service.
 - No embeddings backend resolved → set `EMBEDDINGS_URL` or pick a provider in Admin.
 - **Dimension mismatch.** The column is `vector(1536)`. A model of another width throws at index time
   (counted and surfaced) but degrades **silently to zero hits** at query time. `EMBEDDINGS_DIM` is
-  *not* validated against the actual column width.
+  *not* validated against the actual column width — but `npm run doctor` warns when it isn't 1536,
+  which is the case the silent degradation comes from.
 - Provider quota exhausted → the retrieval-health card says so explicitly.
 
 ### Slack connects but ingests nothing
@@ -810,12 +856,18 @@ bot has `channels:read` (a total scope failure is diagnosed by name in the run e
 channel is public in the workspace. Only a *confirmed*-private channel triggers a purge of already-
 ingested content; an unverifiable one is skipped without deleting anything.
 
+Start with `npm run connectors -- verify`: it forces the sync and prints the recorded error verbatim,
+which distinguishes a scope failure from the far more common "ran fine, nothing new to ingest".
+
 ### Login link never arrives
 
 No email transport configured. In development the link is printed to the server console. In
 production, set `RESEND_API_KEY` + `RESEND_FROM` (a verified domain — Resend's `onboarding@resend.dev`
 only delivers to the account owner) or `SMTP_URL` + `SMTP_FROM`. Also confirm `APP_URL` is set, or
 links are built against nothing.
+
+`npm run doctor` flags both — a missing transport (as a failure in production, where the mail is
+dropped rather than logged) and an unset `APP_URL`.
 
 ### My local model is ignored
 
