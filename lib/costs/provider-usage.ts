@@ -53,7 +53,11 @@ export function resetProviderUsageCache(): void {
  */
 export function parseCreditsBody(body: unknown): ProviderUsage | null {
   const d = (body as { data?: { total_usage?: unknown; total_credits?: unknown } } | null)?.data;
-  if (!d || typeof d.total_usage !== "number" || !Number.isFinite(d.total_usage)) return null;
+  // `>= 0` as well as finite: a negative total would render "$-5.00 spent", which is not a number any
+  // reader can act on. Unparseable and absurd both mean "we don't know".
+  if (!d || typeof d.total_usage !== "number" || !Number.isFinite(d.total_usage) || d.total_usage < 0) {
+    return null;
+  }
   const credits = typeof d.total_credits === "number" && Number.isFinite(d.total_credits) ? d.total_credits : null;
   return { provider: "openrouter", totalUsageUsd: d.total_usage, totalCreditsUsd: credits };
 }
@@ -103,6 +107,14 @@ export interface LedgerReconciliation {
   unattributedFraction: number;
   /** Worth telling the operator about, rather than a rounding difference. */
   material: boolean;
+  /**
+   * `ledger-exceeds` is its OWN state, not a clamped zero. With the ledger filtered to this provider,
+   * recording more than the provider billed is no longer legitimate — it means the key was rotated
+   * (old spend in the ledger, fresh key at the provider) or something double-metered. Rendering the
+   * clamped "accounts for $X of it" there produces a literally false sentence, so the UI says what
+   * actually happened instead.
+   */
+  status: "reconciled" | "unattributed" | "ledger-exceeds";
 }
 
 /** Below this the difference is timing and rounding, not a missing-spend story. */
@@ -120,11 +132,17 @@ const MATERIAL_ABSOLUTE_USD = 1;
 export function reconcileLedger(providerUsd: number, ledgerUsd: number): LedgerReconciliation {
   const unattributed = Math.max(0, providerUsd - ledgerUsd);
   const fraction = providerUsd > 0 ? unattributed / providerUsd : 0;
+  // BOTH legs. A percentage alone flags a $0.30-vs-$0.05 new install (83%, meaningless); an absolute
+  // alone flags a $10 drift on $1,000/mo (1%, noise). Only a gap that is both large enough to notice
+  // and large enough to matter is worth an operator's attention.
+  const material = unattributed >= MATERIAL_ABSOLUTE_USD && fraction >= MATERIAL_FRACTION;
+  const exceeds = ledgerUsd - providerUsd >= MATERIAL_ABSOLUTE_USD;
   return {
     providerUsd,
     ledgerUsd,
     unattributedUsd: unattributed,
     unattributedFraction: fraction,
-    material: unattributed >= MATERIAL_ABSOLUTE_USD && fraction >= MATERIAL_FRACTION,
+    material,
+    status: exceeds ? "ledger-exceeds" : material ? "unattributed" : "reconciled",
   };
 }

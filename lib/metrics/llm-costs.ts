@@ -150,10 +150,30 @@ export async function getLlmCostBreakdown(
  * only meaningful comparison is the whole team's ledger. The caller gates this on `isAdmin` for the
  * same reason — a member's scoped subtotal beside a whole-key total would read as a huge fake gap.
  */
-export async function getLedgerLifetimeUsd(db: DbClient, teamId: string): Promise<number | null> {
+export const LEDGER_LIFETIME_ROW_CAP = 500_000;
+
+export async function getLedgerLifetimeUsd(
+  db: DbClient,
+  teamId: string,
+  provider: string
+): Promise<number | null> {
   try {
-    const res = await db.from("llm_usage").select("cost_usd").eq("team_id", teamId).limit(500_000);
+    const res = await db
+      .from("llm_usage")
+      .select("cost_usd")
+      // FILTERED BY PROVIDER, and this is the whole correctness of the comparison. The figure this is
+      // measured against comes from ONE provider's billing API. Summing every provider against it
+      // dilutes the gap toward zero — an Anthropic list-price estimate is real ledger spend that
+      // OpenRouter never charged, so counting it here would "account for" money that key never saw and
+      // quietly erase the very shortfall this exists to expose.
+      .eq("provider", provider)
+      .eq("team_id", teamId)
+      .limit(LEDGER_LIFETIME_ROW_CAP);
     const rows = (res.data ?? []) as { cost_usd: number | string }[];
+    // At the cap Postgres returns an ARBITRARY subset (no ORDER BY), so the sum would be short — and a
+    // short ledger INFLATES the unattributed figure. Refusing to answer is the only honest option;
+    // the caller then shows no reconciliation rather than a confident overstatement.
+    if (rows.length >= LEDGER_LIFETIME_ROW_CAP) return null;
     return rows.reduce((sum, r) => sum + (Number(r.cost_usd) || 0), 0);
   } catch {
     return null; // can't reconcile → the caller shows nothing rather than a wrong comparison

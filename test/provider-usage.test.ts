@@ -22,6 +22,10 @@ describe("parseCreditsBody — 'unknown' must never read as 'zero'", () => {
     expect(parseCreditsBody({ data: { total_usage: 12.5 } })?.totalUsageUsd).toBe(12.5);
   });
 
+  it("refuses a NEGATIVE total rather than rendering '$-5.00 spent'", () => {
+    expect(parseCreditsBody({ data: { total_usage: -5 } })).toBeNull();
+  });
+
   it("returns NULL — not 0 — for a shape it doesn't recognise", () => {
     // A missing number must read as "we don't know what the provider charged". Zero would be the
     // same false reassurance this module exists to end.
@@ -37,6 +41,7 @@ describe("reconcileLedger — how much spend the ledger could not attribute", ()
     expect(r.unattributedUsd).toBeCloseTo(45.21, 2);
     expect(r.unattributedFraction).toBeCloseTo(0.4677, 3);
     expect(r.material).toBe(true);
+    expect(r.status).toBe("unattributed");
   });
 
   it("stays quiet for a rounding-sized difference", () => {
@@ -46,18 +51,28 @@ describe("reconcileLedger — how much spend the ledger could not attribute", ()
     expect(r.material).toBe(false);
   });
 
+  it("stays quiet when the gap is a large AMOUNT but a trivial fraction", () => {
+    // $10 adrift on $1,000 of spend is accounting noise, not a missing-spend story. I claimed this leg
+    // was mutation-covered when it was not: dropping `fraction >= MATERIAL_FRACTION` passed every test,
+    // because every other case that clears $1 also clears 5%. This is the case that pins it.
+    expect(reconcileLedger(1000, 990).material).toBe(false);
+    expect(reconcileLedger(1000, 990).status).toBe("reconciled");
+  });
+
   it("stays quiet when the gap is a large FRACTION but a trivial amount", () => {
     // A brand-new instance: $0.30 provider, $0.05 ledger. 83% unattributed and completely uninteresting.
     expect(reconcileLedger(0.3, 0.05).material).toBe(false);
   });
 
-  it("CLAMPS at zero — a ledger above the provider total is not negative spend", () => {
-    // Anthropic calls are list-price ESTIMATES counted in the ledger that contribute nothing to
-    // OpenRouter's number, so ledger > provider is legitimate and means "nothing unattributed here".
+  it("CLAMPS at zero and says WHY — a ledger above the provider total is not negative spend", () => {
+    // Now that the ledger sum is filtered to this provider, ledger > provider is no longer routine —
+    // it means the key was rotated (old spend, fresh key) or something double-metered. Rendering the
+    // clamped "accounts for $X of it" there is a literally false sentence, so it gets its own state.
     const r = reconcileLedger(10, 25);
     expect(r.unattributedUsd).toBe(0);
     expect(r.unattributedFraction).toBe(0);
     expect(r.material).toBe(false);
+    expect(r.status).toBe("ledger-exceeds");
   });
 
   it("does not divide by zero on a provider that has charged nothing", () => {

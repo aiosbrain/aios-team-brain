@@ -63,7 +63,8 @@ export default async function CostsPage({
   // own `/credits` said $96.67 on the same key — and the page presented the floor as the answer.
   // Admins only: it is a whole-key number, so it means nothing beside one member's scoped spend.
   const providerUsage = isAdmin ? await getProviderReportedUsage(db, team.id) : null;
-  const ledgerLifetimeUsd = isAdmin && providerUsage ? await getLedgerLifetimeUsd(db, team.id) : null;
+  const ledgerLifetimeUsd =
+    isAdmin && providerUsage ? await getLedgerLifetimeUsd(db, team.id, providerUsage.provider) : null;
   const reconciliation =
     providerUsage && ledgerLifetimeUsd !== null
       ? reconcileLedger(providerUsage.totalUsageUsd, ledgerLifetimeUsd)
@@ -131,12 +132,12 @@ export default async function CostsPage({
       {reconciliation ? (
         <div
           className={`rounded-lg border px-3 py-2 text-xs ${
-            reconciliation.material
+            reconciliation.status === "unattributed"
               ? "border-amber-400/30 bg-amber-400/10 text-amber-700 dark:text-amber-300"
               : "border-border-subtle/60 text-ink-tertiary"
           }`}
         >
-          {reconciliation.material ? (
+          {reconciliation.status === "unattributed" ? (
             <>
               <strong>
                 OpenRouter has billed {usd(reconciliation.providerUsd)} on this key; this ledger accounts
@@ -144,10 +145,18 @@ export default async function CostsPage({
               </strong>{" "}
               {usd(reconciliation.unattributedUsd)} (
               {Math.round(reconciliation.unattributedFraction * 100)}%) can&apos;t be attributed to a
-              feature. A call that times out, or fails after the model already generated, is billed by
-              the provider but returns no usage for the brain to record — so the breakdown below is a{" "}
-              <strong>floor</strong>, not the total. Both figures are lifetime for this key, not the
-              selected window.
+              feature, so the breakdown below is a <strong>floor</strong>, not the total. Usually that is
+              a call that timed out or failed after the model had already generated — billed by the
+              provider, but returning no usage for the brain to record. It also covers any spend on this
+              key from outside this instance. Both figures are lifetime for the key, not the selected
+              window.
+            </>
+          ) : reconciliation.status === "ledger-exceeds" ? (
+            <>
+              This ledger records {usd(reconciliation.ledgerUsd)} of OpenRouter spend, more than the{" "}
+              {usd(reconciliation.providerUsd)} the provider reports for the current key — usually because
+              the key was rotated, so older spend has no counterpart on the new one. Nothing is missing
+              from the breakdown below.
             </>
           ) : (
             <>
