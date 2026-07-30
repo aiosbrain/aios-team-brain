@@ -51,6 +51,40 @@ export const codebaseRecordSchema = z.object({
   is_archived: z.boolean().optional().default(false),
 });
 
+// `metrics.codebase_health` (brain-api document revision 1.15) — a scalar-only,
+// provenance-only workspace-governance health snapshot, scored scanner-side against the
+// workspace rubric. Faithful zod mirror of the pinned machine-readable contract
+// (test/fixtures/contract/codebase-payload-1.15.schema.json; canonical home:
+// aios-workspace/docs/contract). The object is CLOSED (strict, all fields required when
+// present) so no file paths, findings text, or contributor identity can be smuggled
+// through it; the surrounding metrics shape stays open per the contract. Guarded by
+// test/guards/codebase-payload-contract.test.ts against the vendored fixtures.
+export const codebaseHealthSchema = z.strictObject({
+  schema_version: z.string().min(1).max(20),
+  rubric_version: z.string().min(1).max(40),
+  head_sha: z.string().regex(/^[0-9a-f]{7,40}$/),
+  score_pct: z.number().min(0).max(100),
+  status: z.enum(["pass", "warn", "fail"]),
+  dimensions: z
+    .record(
+      z.string().regex(/^[a-z0-9][a-z0-9_-]{0,63}$/),
+      z.strictObject({
+        passed: z.number().int().nonnegative(),
+        total: z.number().int().nonnegative(),
+      }),
+    )
+    .refine((d) => Object.keys(d).length >= 1, {
+      message: "dimensions must have at least one entry",
+    }),
+  failed_invariant_ids: z
+    .array(z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/))
+    .max(200),
+  measured_at: z
+    .string()
+    .regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/),
+});
+export type CodebaseHealth = z.infer<typeof codebaseHealthSchema>;
+
 export const codeMetricsSchema = z.object({
   head_sha: z.string().min(1).max(64),
   window_days: z.number().int().positive().max(3650).optional().default(90),
@@ -132,6 +166,11 @@ export const codeMetricsSchema = z.object({
     .nullable()
     .optional()
     .default(null),
+  // Workspace-governance health snapshot (brain-api document revision 1.15) — scored
+  // scanner-side, persisted VERBATIM, never recomputed here (same posture as readiness_*).
+  // Optional and additive: a pre-1.15 payload without it stays valid unchanged. No
+  // `.default()`/no null: omitted must stay distinguishable from a scored object.
+  codebase_health: codebaseHealthSchema.optional(),
 });
 
 export const codeContributionSchema = z.object({

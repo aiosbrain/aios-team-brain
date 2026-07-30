@@ -1,4 +1,5 @@
 import "server-only";
+import type { CodebaseHealth } from "@/lib/api/schemas";
 import type { DbClient } from "@/lib/db/types";
 import type { Kpi } from "./pulse";
 import { rangeDays, type Range } from "./range";
@@ -303,6 +304,9 @@ export interface AgenticBreakdown {
   readiness_level: string | null;
   readiness_pct: number | null;
   readiness_pillars: Record<string, { passed: number; total: number }>;
+  // Workspace-governance health (brain-api 1.15) — the LAST scan's snapshot, verbatim as
+  // pushed (incl. measured_at); null = that scan carried no health object. Provenance-only.
+  codebase_health: CodebaseHealth | null;
 }
 
 export interface TrendPoint {
@@ -392,7 +396,7 @@ export async function getCodebaseDetail(
     "scaffolding_score, skill_breadth_score, cadence_score, issue_health, has_claude_md, " +
     "has_agents_md, agents_md_count, skills_count, commands_count, test_coverage_pct, " +
     "test_coverage_functions_pct, test_coverage_branches_pct, recent_commits, " +
-    "readiness_level, readiness_pct, readiness_pillars";
+    "readiness_level, readiness_pct, readiness_pillars, codebase_health";
 
   const [metricsRes, contribRes, issuesRes, membersRes, profilesRes] = await Promise.all([
     // NOT windowed: the breakdown/headline reflect the LAST scan even if it predates the range
@@ -469,6 +473,7 @@ export async function getCodebaseDetail(
         readiness_pct: latest.readiness_pct == null ? null : num(latest.readiness_pct as number),
         readiness_pillars:
           (latest.readiness_pillars as Record<string, { passed: number; total: number }>) ?? {},
+        codebase_health: (latest.codebase_health as CodebaseHealth | null) ?? null,
       }
     : null;
 

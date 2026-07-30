@@ -100,6 +100,12 @@ export async function ingestCodebaseScan(
         readiness_pct: m.readiness_pct,
         readiness_pillars: m.readiness_pillars,
         readiness_rubric_version: m.readiness_rubric_version,
+        // Workspace-governance health (brain-api 1.15) — provenance-only, persisted
+        // VERBATIM, never recomputed here. Because this upsert REPLACES the row on
+        // (codebase_id, head_sha), an omitted object writes null — which is also why the
+        // schema rejects sparse (health-only) pushes at the boundary. Nested arrays ride
+        // inside a plain object, which the pg adapter auto-casts to ::jsonb as a whole.
+        codebase_health: m.codebase_health ?? null,
         ...scores,
       },
       { onConflict: "codebase_id,head_sha" }

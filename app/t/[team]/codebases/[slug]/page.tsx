@@ -83,6 +83,24 @@ export default async function CodebaseDetailPage({
                 <CircleDot className="size-3" /> {cb.open_issues} open
               </span>
               <span>scanned {timeAgo(cb.last_scan_at)}</span>
+              {/* Workspace-governance health (brain-api 1.15) — the last scan's snapshot,
+                  verbatim from the scanner (provenance-only, never recomputed here). */}
+              {cb.breakdown?.codebase_health ? (
+                <span
+                  className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 ${
+                    cb.breakdown.codebase_health.status === "fail"
+                      ? "border-red-400/40 text-red-600 dark:text-red-300"
+                      : cb.breakdown.codebase_health.status === "warn"
+                        ? "border-amber-400/40 text-amber-600 dark:text-amber-300"
+                        : "border-border-subtle"
+                  }`}
+                  title={`workspace-health rubric ${cb.breakdown.codebase_health.rubric_version}`}
+                >
+                  workspace health {Math.round(cb.breakdown.codebase_health.score_pct)}% ·{" "}
+                  {cb.breakdown.codebase_health.status} · measured{" "}
+                  {timeAgo(cb.breakdown.codebase_health.measured_at)}
+                </span>
+              ) : null}
             </div>
           </div>
           <RangeSelector value={range} />
