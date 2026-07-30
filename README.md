@@ -32,14 +32,33 @@ leaves your instance unless you push it, and it runs fully on-machine at $0 if y
 
 ## Try it in two minutes
 
-To *see* it — with the demo team loaded — you need Docker and nothing else. No accounts, no
-API keys, no Postgres, no Node on your machine:
+**One command, guided:**
+
+```bash
+curl -fsSL https://aiosbrain.dev/install.sh | sh
+```
+
+It checks your prerequisites, fetches the repo, and hands you to an interview: run it **on this
+machine** (your own team, real install), **on Railway** (the shared server a team actually uses), or
+**just the demo**. It asks only what your choice needs, **validates each credential as you paste
+it** — a wrong model key is caught there, not three steps later at an empty query box — then shows
+the plan before touching anything. Already cloned? `npm run setup` is the same wizard.
+
+It never uses `sudo`, never overwrites an existing install, and never deploys.
+[`install.sh`](install.sh) is short and commented — read it before you pipe it, as you should with
+any installer.
+
+<details>
+<summary>Or do it by hand — Docker and nothing else</summary>
+
+To *see* it with the demo team loaded, you need no accounts, no API keys, no Postgres and no Node:
 
 ```bash
 git clone https://github.com/aiosbrain/aios-team-brain.git
 cd aios-team-brain
 docker compose up
 ```
+
 
 That loads the schema, seeds the Northwind Robotics demo, and prints a login for
 **http://localhost:3000**. Answering questions needs a model — `export ANTHROPIC_API_KEY=…`
@@ -49,17 +68,23 @@ before `up` (or `LLM_BASE_URL` for a local endpoint); everything else works with
 docker compose down                 # stop  (data persists in the pgdata volume)
 npm run up:reset                    # wipe and start over
 APP_PORT=3100 docker compose up     # if something already owns port 3000
-SEED_DEMO=false docker compose up   # empty brain instead of the demo
+SEED_DEMO=false docker compose up   # schema only — NO team and NO login are created
 ```
 
 Re-running `up` is safe: the schema load is idempotent and seeding is skipped once a team
 exists. Postgres is published on **5435** so it can't collide with a local Postgres or the
 test tier in `compose.test.yml`.
 
-**This is for evaluating and for contributors.** It is not how a team runs one — the brain is a
-shared service whose connectors poll on a schedule, so it belongs on a server. For that, start at
-§2. Already installed and something's off? **`npm run doctor`** checks your environment and
-database and names what's wrong.
+> `SEED_DEMO=false` gives you a running app with an empty database and **no way to log in** — no
+> team, no member, no credentials. For a real local install with *your* team, use `npm run setup`
+> (or set `TEAM_SLUG` + `ADMIN_EMAIL`, which is what the wizard does).
+
+</details>
+
+**The demo is for evaluating, and for contributors.** It is not how a team runs one — the brain is a
+shared service whose connectors poll on a schedule, so it belongs on a server. The wizard's Railway
+path does that; §2 is the same thing by hand. Already installed and something's off?
+**`npm run doctor`** checks your environment and database and names what's wrong.
 
 ---
 
