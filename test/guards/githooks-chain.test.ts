@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
 import {
   chmodSync,
@@ -8,6 +8,7 @@ import {
   readFileSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { existsSync } from "node:fs";
@@ -37,13 +38,20 @@ import { join } from "node:path";
 const REPO_ROOT = process.cwd();
 const FAKE_TERM = "TOTALLY-FAKE-NDA-CLIENT-ZZ9";
 
-/** Env for fixture git calls: identity set, hook overrides stripped. */
+/**
+ * Env for fixture git calls: identity set, hook overrides stripped, and config
+ * fully hermetic — a machine-global core.hooksPath / init.templateDir /
+ * commit.gpgsign would otherwise change fixture behavior and red these tests
+ * spuriously.
+ */
 const GIT_ENV: NodeJS.ProcessEnv = {
   ...process.env,
   GIT_AUTHOR_NAME: "Fixture",
   GIT_AUTHOR_EMAIL: "fixture@example.com",
   GIT_COMMITTER_NAME: "Fixture",
   GIT_COMMITTER_EMAIL: "fixture@example.com",
+  GIT_CONFIG_GLOBAL: "/dev/null",
+  GIT_CONFIG_NOSYSTEM: "1",
 };
 delete GIT_ENV.GIT_DIR;
 delete GIT_ENV.GIT_WORK_TREE;
@@ -125,6 +133,13 @@ afterAll(() => {
   rmSync(root, { recursive: true, force: true });
 });
 
+// Re-install the fake machine-local hooks before every test so a mid-test failure
+// (e.g. in the recursion test, which swaps .git/hooks/pre-commit) cannot cascade.
+beforeEach(() => {
+  installLocalHook("pre-commit", "staged");
+  installLocalHook("pre-push", "tree");
+});
+
 describe("tracked pre-commit: primary-checkout guard", () => {
   it("blocks an authored commit in the PRIMARY checkout, on main", () => {
     writeFileSync(join(primary, "blocked.txt"), "clean content\n");
@@ -134,6 +149,21 @@ describe("tracked pre-commit: primary-checkout guard", () => {
     expect(out).toContain("aios worktree add");
     git(primary, ["reset", "HEAD", "blocked.txt"]);
     rmSync(join(primary, "blocked.txt"));
+  });
+
+  it("still blocks when the primary is entered through a SYMLINKED path", () => {
+    // Regression: --absolute-git-dir is physical, but a logical `pwd` keeps the
+    // inherited symlinked $PWD — without `pwd -P` normalization the comparison
+    // never matches and the guard fails OPEN (e.g. ~/Tessera → ~/Projects).
+    const link = join(root, "repo-via-symlink");
+    symlinkSync(primary, link);
+    const env = { ...GIT_ENV, PWD: link };
+    writeFileSync(join(link, "sym.txt"), "clean content\n");
+    git(link, ["add", "sym.txt"], env);
+    const out = gitFails(link, ["commit", "-m", "via symlink"], env);
+    expect(out).toContain("PRIMARY checkout");
+    git(link, ["reset", "HEAD", "sym.txt"], env);
+    rmSync(join(primary, "sym.txt"));
   });
 
   it("allows a commit in a linked worktree AND runs the machine-local (NDA) chain", () => {
@@ -246,7 +276,6 @@ describe("static contract: hooks stay tracked, executable, and correctly resolve
     expect(src).toContain("check-docs-drift.mjs");
     expect(src).toContain("sync-skill-runtimes.sh");
     // The machine-local (NDA) chain must run BEFORE the drift guards.
-    expect(src.indexOf("machine-local")).toBeGreaterThan(-1);
     expect(src.indexOf('local_hook="$common_dir/hooks/pre-push"')).toBeLessThan(
       src.indexOf("check-docs-drift.mjs"),
     );

@@ -19,10 +19,10 @@ repo_root="$(git rev-parse --show-toplevel)"
 # would resolve back into .githooks/); skip anything carrying our own marker.
 common_dir="$(git rev-parse --git-common-dir)"
 if [ "${common_dir#/}" = "$common_dir" ]; then
-  common_dir="$(cd "$common_dir" && pwd)"
+  common_dir="$(cd "$common_dir" && pwd -P)"
 fi
 local_hook="$common_dir/hooks/pre-push"
-if [ -x "$local_hook" ] && ! grep -q "aios-tracked-hook" "$local_hook" 2>/dev/null; then
+if [ -x "$local_hook" ] && ! grep -q "^# aios-tracked-hook" "$local_hook" 2>/dev/null; then
   echo "pre-push: running machine-local hook…"
   if ! "$local_hook" "$@"; then
     echo "" >&2
