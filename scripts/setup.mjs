@@ -22,6 +22,11 @@
  * Resumable and idempotent. Connecting the GitHub repo is a dashboard OAuth step no CLI can do,
  * so the run stops there, tells you exactly what to click, and picks up where it left off.
  *
+ * Idempotent INCLUDES the secrets: a re-run reads the project's environment and preserves an
+ * existing AUTH_SECRET / SECRETS_KEY rather than generating fresh ones (see `resolveSecrets`).
+ * Rotating them would log the whole team out and make every encrypted connector token
+ * undecryptable, so if the environment can't be read, the run aborts instead of guessing.
+ *
  *   node scripts/setup.mjs --slug acme --name "Acme Robotics" --email you@acme.com
  *   node scripts/setup.mjs --dry-run     # print the plan, touch nothing
  */
@@ -29,6 +34,7 @@ import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { parseArgs } from "node:util";
 import {
+  READONLY_VERBS,
   assertPinnedTarget,
   classifyRailwayCommand,
   isSanctionedProjectName,
@@ -72,6 +78,71 @@ export function generateSecrets() {
   };
 }
 
+/**
+ * Keep the secrets an instance already has; generate only what is missing.
+ *
+ * Regenerating these is destructive, not merely wasteful: AUTH_SECRET invalidates every
+ * session, and SECRETS_KEY is the AES-256-GCM key connector tokens are encrypted at rest
+ * with — rotate it and every stored Slack/GitHub/Linear token becomes undecryptable. This
+ * script advertises itself as resumable and the skill tells you to re-run after fixing a
+ * failure, so a second run reaches this code on a live instance by design. `compose.yml`
+ * already persists both generated secrets for exactly this reason.
+ *
+ * A malformed existing value is preserved, not repaired: replacing a wrong-width SECRETS_KEY
+ * would "fix" the width by destroying the data it protects. The caller warns instead.
+ */
+export function resolveSecrets(existing, generated) {
+  const kept = (v) => (typeof v === "string" && v.trim().length > 0 ? v : null);
+  const authSecret = kept(existing?.AUTH_SECRET);
+  const secretsKey = kept(existing?.SECRETS_KEY);
+  return {
+    authSecret: authSecret ?? generated.authSecret,
+    secretsKey: secretsKey ?? generated.secretsKey,
+    reused: [authSecret && "AUTH_SECRET", secretsKey && "SECRETS_KEY"].filter(Boolean),
+  };
+}
+
+/** null when fine, else the reason — a base64 SECRETS_KEY that isn't exactly 32 bytes. */
+export function secretsKeyComplaint(value) {
+  if (typeof value !== "string" || !value.trim()) return null;
+  // No try/catch: `Buffer.from(junk, "base64")` never throws, it yields a short buffer — so
+  // garbage reports "decodes to 0 bytes", which is the actionable message anyway.
+  const width = Buffer.from(value, "base64").length;
+  if (width === 32) return null;
+  return `SECRETS_KEY decodes to ${width} bytes, not 32 — connector saves will fail (\`npm run doctor\` explains the fix)`;
+}
+
+/**
+ * Does this invocation only read? `variables` is a provisioning (write) verb in the policy, but
+ * `variables --json` with no `--set` is a read — the one verb whose direction depends on flags.
+ */
+export function isReadOnly(args) {
+  const verb = args[0];
+  if (verb === "variables") return !args.includes("--set") && !args.includes("--set-from-stdin");
+  return READONLY_VERBS.includes(verb);
+}
+
+/** The environment read must be a JSON OBJECT. `[]` and `"ok"` are truthy and parse fine, and
+ * treating either as "no secrets present" would fall through to generating fresh ones — the
+ * precise failure the abort exists to prevent. */
+export function isEnvironmentMap(parsed) {
+  return !!parsed && typeof parsed === "object" && !Array.isArray(parsed);
+}
+
+/**
+ * Render a command for the dry-run plan with secret VALUES masked.
+ *
+ * The plan is printed to a terminal and read by agents, and each line is a paste-ready
+ * `railway variables --set …`. Echoing a real AUTH_SECRET/SECRETS_KEY there hands someone a
+ * copyable command that performs exactly the rotation this script now prevents.
+ */
+export function redactSecretsForPlan(rendered) {
+  return String(rendered).replace(
+    /(--set (?:AUTH_SECRET|SECRETS_KEY)=)\S+/g,
+    (_m, prefix) => `${prefix}<generated-or-preserved>`
+  );
+}
+
 /** Where a run should resume from, given what already exists. */
 export function nextPhase(state) {
   if (!state.projectExists) return "create";
@@ -95,18 +166,25 @@ function defaultExec(cmd, args, opts = {}) {
  * run, not to what a comment claims we run. A forbidden verb throws before reaching the CLI.
  */
 export function makeRailway(io, { dryRun = false } = {}) {
-  return function railway(args, { write = false, pin = null, status = null } = {}) {
+  // `verify` pin-checks a READ. Reading the environment back is not a mutation, but its result
+  // is written straight back out — so a read from a drifted link would copy another project's
+  // secrets into this one. Same proof, same reason.
+  return function railway(args, { write = false, verify = false, pin = null, status = null } = {}) {
     const rendered = `railway ${args.join(" ")}`;
     const verdict = classifyRailwayCommand(rendered);
     if (verdict.decision === "block") {
       throw new Error(`setup.mjs refused its own command: ${verdict.reason}`);
     }
-    if (write) {
-      if (!pin) throw new Error(`internal: write \`${rendered}\` attempted with no pinned target`);
+    if (write || verify) {
+      if (!pin) throw new Error(`internal: \`${rendered}\` attempted with no pinned target`);
       assertPinnedTarget(status, pin); // throws on drift
     }
-    if (dryRun) {
-      io.log(`  [dry-run] ${rendered}`);
+    // `--dry-run` suppresses WRITES, not reads. Faking the reads too made the plan blind: it
+    // could not see whether the project already existed (so it showed a secret rotation a real
+    // run would not perform), and it could not detect the link drift that a real run aborts on.
+    // A read mutates nothing, so running it for real is what makes the plan predictive.
+    if (dryRun && !isReadOnly(args)) {
+      io.log(`  [dry-run] ${redactSecretsForPlan(rendered)}`);
       return { status: 0, stdout: "", stderr: "" };
     }
     return io.exec("railway", args);
@@ -189,8 +267,34 @@ export async function runSetup(opts, io = { exec: defaultExec, log: console.log 
   io.log(`✓ domain ${appUrl}`);
 
   // 7. Variables — secrets generated here, never prompted for and never echoed.
+  //
+  // On a project that already existed, read the environment FIRST. A re-run must not rotate
+  // AUTH_SECRET (logs the team out) or SECRETS_KEY (orphans every encrypted connector token).
+  // No read for a project this run just created: there is nothing to preserve.
+  // Runs in dry-run too — it is a read, and it is what lets the plan say truthfully whether a
+  // real run would preserve or generate.
+  let existingVars = {};
+  if (existingName) {
+    // Deliberately the same service targeting as the write below — an asymmetric read could
+    // preserve one service's secrets while overwriting another's. Nothing between this read
+    // and the write below can relink the CLI, so the two cannot resolve differently.
+    const read = railway(["variables", "--json"], { verify: true, pin: project, status: pinned });
+    const parsed = read.status === 0 ? parseJson(read.stdout) : null;
+    if (!isEnvironmentMap(parsed)) {
+      throw new Error(
+        `could not read the existing environment of "${project}" — refusing to continue, because ` +
+          `overwriting AUTH_SECRET/SECRETS_KEY unseen would log the team out and make every stored ` +
+          `connector token undecryptable. Fix the read (\`railway variables\`) and re-run.`
+      );
+    }
+    existingVars = parsed;
+  }
+
   io.log("▶ setting environment variables…");
-  const { authSecret, secretsKey } = generateSecrets();
+  const { authSecret, secretsKey, reused } = resolveSecrets(existingVars, generateSecrets());
+  if (reused.length) io.log(`  ↺ preserving existing ${reused.join(" + ")} (rotating them is destructive)`);
+  const complaint = secretsKeyComplaint(existingVars.SECRETS_KEY);
+  if (complaint) io.log(`  ⚠ ${complaint}`);
   const vars = buildVariables({ appUrl, authSecret, secretsKey, anthropicKey, resendKey, resendFrom });
   const setv = railway(["variables", ...toVariableArgs(vars)], { write: true, pin: project, status: pinned });
   if (setv.status !== 0) throw new Error(`setting variables failed: ${setv.stderr.trim()}`);
@@ -285,7 +389,9 @@ async function main() {
         "  --anthropic-key <k>    answering model (or configure per-team in Admin later)",
         "  --resend-key <k> --resend-from <addr>   magic-link email",
         "  --resume               continue after connecting the GitHub repo",
-        "  --dry-run              print the plan, touch nothing",
+        "  --dry-run              print the plan and write nothing. Reads DO run (so the plan can",
+        "                         tell you whether secrets would be preserved, and can catch link",
+        "                         drift) — so it needs an authenticated `railway login`.",
       ].join("\n")
     );
     process.exit(values.help ? 0 : 1);

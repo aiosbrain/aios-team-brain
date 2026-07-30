@@ -109,7 +109,12 @@ point at the dashboard or a push to `main`.
   not just create, stop and report it.
 - Never run `npm run pg:schema` by hand — it is the platform's `preDeployCommand`.
 - Never invent or accept a hand-written `AUTH_SECRET` / `SECRETS_KEY`; never echo either
-  into the transcript. The script generates them and does not print them.
+  into the transcript. The script generates them, preserves them, and prints neither.
+  **Re-running is safe:** on a project that already exists the script reads the environment
+  and keeps both secrets, generating only what is missing — rotating `AUTH_SECRET` logs the
+  team out and rotating `SECRETS_KEY` makes every stored connector token undecryptable. If it
+  reports that it could not read the environment, that abort is deliberate; diagnose the read
+  rather than working around it, and never re-set those two by hand to "unblock" a run.
 - Never paste connector tokens (Slack/GitHub/Linear) yourself — `lib/integrations/manage`
   is the single legal writer and the Admin UI encrypts and audits the write. Setting them
   up is a separate, later step, not part of standing the brain up.
