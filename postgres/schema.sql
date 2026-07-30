@@ -129,6 +129,15 @@ create table if not exists teams (
   -- Optional distinct PROVIDER for the reasoning model. Null = reuse the answering provider; set =
   -- reasoning runs on its own backend (answer on one provider, reason on another).
   reasoning_provider text check (reasoning_provider in ('anthropic', 'openai', 'openrouter', 'local')),
+  -- Optional distinct model for high-volume MACHINE extraction — today the knowledge-graph leg via the
+  -- LLM proxy, which is 99% of the LLM bill. Null = reuse the answering model (the pre-role behaviour);
+  -- the MODEL is the activation switch. See lib/query/llm-backend (role="extraction").
+  extraction_model text,
+  -- Optional distinct PROVIDER for the extraction model. Null = the answering backend, different model.
+  -- `anthropic` is deliberately excluded: Graphiti extracts via OpenAI structured outputs, which
+  -- graphChatTarget refuses for Anthropic, so allowing it would 501 every extraction call while Graphiti
+  -- kept returning 202 — a silently empty graph.
+  extraction_provider text check (extraction_provider in ('openai', 'openrouter', 'local')),
   -- Explicit embeddings-backend override for the semantic index. Null = auto (env EMBEDDINGS_URL for
   -- self-host, else dense off). Constrained to the providers that serve a 1536-dim OpenAI-compatible
   -- /embeddings model matching the item_chunks vector(1536) column — openai/openrouter only (Anthropic
@@ -147,6 +156,8 @@ alter table teams add column if not exists primary_pm_provider text;
 alter table teams add column if not exists answering_provider text;
 alter table teams add column if not exists reasoning_model text;
 alter table teams add column if not exists reasoning_provider text;
+alter table teams add column if not exists extraction_model text;
+alter table teams add column if not exists extraction_provider text;
 alter table teams add column if not exists embedding_provider text;
 alter table teams add column if not exists embedding_model text;
 do $$ begin
@@ -158,6 +169,9 @@ do $$ begin
   end if;
   if not exists (select 1 from pg_constraint where conname = 'teams_reasoning_provider_check') then
     alter table teams add constraint teams_reasoning_provider_check check (reasoning_provider in ('anthropic', 'openai', 'openrouter', 'local'));
+  end if;
+  if not exists (select 1 from pg_constraint where conname = 'teams_extraction_provider_check') then
+    alter table teams add constraint teams_extraction_provider_check check (extraction_provider in ('openai', 'openrouter', 'local'));
   end if;
   if not exists (select 1 from pg_constraint where conname = 'teams_embedding_provider_check') then
     alter table teams add constraint teams_embedding_provider_check check (embedding_provider in ('openai', 'openrouter'));

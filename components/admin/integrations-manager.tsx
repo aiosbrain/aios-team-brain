@@ -18,11 +18,12 @@ import {
   setAnsweringProvider,
   setAnsweringModel,
   setReasoningModel,
+  setExtractionModel,
   setEmbeddingModel,
   setMeetingTaskStatus,
   type PrimaryPmProvider,
 } from "@/app/t/[team]/admin/integrations/actions";
-import type { AnsweringProvider } from "@/lib/query/llm-backend";
+import type { AnsweringProvider, ExtractionProvider } from "@/lib/query/llm-backend";
 import { EMBEDDING_MODELS, EMBEDDING_PROVIDER_TYPES, type EmbeddingProvider } from "@/lib/api/schemas";
 import {
   MEETING_TASK_STATUSES,
@@ -54,6 +55,20 @@ export interface AnsweringState {
     /** The backend reasoning resolves to, or null when no distinct reasoning model is set. */
     effective: { provider: AnsweringProvider; model: string } | null;
     /** True when the requested reasoning provider wasn't configured and it fell back. */
+    usedFallback: boolean;
+  };
+  /**
+   * The distinct EXTRACTION role (teams.extraction_provider + extraction_model) — the model that does
+   * the high-volume machine work (today the knowledge graph), where nearly all the LLM spend is.
+   */
+  extraction: {
+    /** Chosen extraction provider, or null = "same as answering". Never `anthropic` (see ExtractionProvider). */
+    provider: ExtractionProvider | null;
+    /** Chosen extraction model (teams.extraction_model), or null = reuse the answering model. */
+    model: string | null;
+    /** The backend extraction resolves to, or null when no distinct extraction model is set. */
+    effective: { provider: AnsweringProvider; model: string } | null;
+    /** True when the requested extraction provider wasn't configured and it fell back WHOLE to answering. */
     usedFallback: boolean;
   };
 }
@@ -157,6 +172,8 @@ function EmbeddingPicker(props: {
 }
 
 const ROLE_PROVIDERS: AnsweringProvider[] = ["anthropic", "openai", "openrouter", "local"];
+/** Extraction's narrower list — Anthropic can't serve the OpenAI structured-output call extraction is. */
+const EXTRACTION_PROVIDERS: AnsweringProvider[] = ["openai", "openrouter", "local"];
 
 /** One role's control: a provider dropdown + model input + Save, with the effective backend shown.
  *  Used for both the Answering and Reasoning roles so they read identically. `local`'s model is
@@ -174,8 +191,14 @@ function RolePicker(props: {
   pending: boolean;
   effective: string;
   fallback: boolean;
+  /** Selectable providers. Defaults to all four; the extraction role narrows it (Anthropic can't serve
+   *  OpenAI structured outputs, so offering it would only produce a refusal on every call). */
+  providers?: AnsweringProvider[];
+  /** Amber note under the picker — used to explain a narrowed option list. */
+  note?: string;
 }) {
   const modelEditable = props.provider !== null && props.provider !== "local";
+  const providers = props.providers ?? ROLE_PROVIDERS;
   return (
     <div className="flex flex-col gap-1.5 border-t border-border-subtle pt-3 first:border-t-0 first:pt-0">
       <p className="text-xs font-medium text-ink">{props.title}</p>
@@ -188,7 +211,7 @@ function RolePicker(props: {
           className="rounded-md border border-ink/15 bg-transparent px-2.5 py-1.5 text-sm text-ink outline-none focus:border-ink/30 disabled:opacity-50"
         >
           <option value="">{props.autoLabel}</option>
-          {ROLE_PROVIDERS.map((p) => (
+          {providers.map((p) => (
             <option key={p} value={p}>
               {PROVIDER_LABEL[p]}
               {props.configured[p] ? "" : " · not set"}
@@ -223,6 +246,7 @@ function RolePicker(props: {
           <span className="ml-1 text-amber-700">· requested backend not configured, fell back</span>
         ) : null}
       </p>
+      {props.note ? <p className="text-xs text-amber-700">{props.note}</p> : null}
     </div>
   );
 }
@@ -447,6 +471,15 @@ export function IntegrationsManager({
     run(() => setReasoningModel(teamSlug, resProvider, resModel.trim()));
   }
 
+  // Extraction role (own provider + model). Same shape as reasoning: provider null = "same as
+  // answering", blank model clears both. Anthropic is absent from this picker's options — Graphiti
+  // extracts with OpenAI structured outputs, so an Anthropic extraction backend would refuse every call.
+  const [extProvider, setExtProvider] = useState<ExtractionProvider | null>(answering.extraction.provider);
+  const [extModel, setExtModel] = useState(answering.extraction.model ?? "");
+  function saveExtraction() {
+    run(() => setExtractionModel(teamSlug, extProvider, extModel.trim()));
+  }
+
   // Embeddings role (provider + curated 1536-dim model). "Auto" (null) clears both → env/off. Switching
   // provider seeds the model to that provider's single curated model. Blank provider sends "" model.
   const embConfigured: Record<EmbeddingProvider, boolean> = {
@@ -482,14 +515,15 @@ export function IntegrationsManager({
     <div className="flex flex-col gap-6">
       <div className="prism-card flex flex-col gap-4 p-4">
         <p className="flex items-center gap-2 text-sm font-medium text-ink">
-          <Sparkles className="size-4 text-violet" /> Answering &amp; reasoning models
+          <Sparkles className="size-4 text-violet" /> Answering, reasoning &amp; extraction models
         </p>
         <p className="text-xs text-ink-secondary">
           Pick the <strong>provider and model</strong> for each role. The <strong>answering</strong> model
-          runs the Query box + all extraction (summaries, action items, drafts) with reasoning off. The
-          optional <strong>reasoning</strong> model runs reasoning-heavy work (narrative arc synthesis) —
-          it can use a different provider entirely. If a chosen backend isn&apos;t configured, it falls
-          back (shown below the picker).
+          runs the Query box + in-app extraction (summaries, action items, drafts) with reasoning off. The
+          optional <strong>reasoning</strong> model runs reasoning-heavy work (narrative arc synthesis).
+          The optional <strong>extraction</strong> model runs the knowledge graph — high volume, and
+          nearly all of the bill. Each can use a different provider. If a chosen backend isn&apos;t
+          configured, the role falls back to answering (shown below the picker).
         </p>
 
         <RolePicker
@@ -524,6 +558,27 @@ export function IntegrationsManager({
               : "reuses the answering model"
           }
           fallback={answering.reasoning.usedFallback}
+        />
+
+        <RolePicker
+          title="Extraction model (optional) — where the spend is"
+          help="The model that does the high-volume machine work: building the knowledge graph from every ingested document. This is ~99% of the LLM bill, and it is mechanical — a cheap model that supports structured outputs is the right pick here, while answering keeps a strong one. Leave the model blank to reuse the answering model. “Same as answering” keeps the answering provider."
+          autoLabel="Same as answering"
+          provider={extProvider}
+          model={extModel}
+          configured={providerConfigured}
+          providers={EXTRACTION_PROVIDERS}
+          note="Anthropic isn’t offered: graph extraction is an OpenAI structured-output call, which Anthropic’s API doesn’t speak."
+          onProvider={(p) => setExtProvider(p as ExtractionProvider | null)}
+          onModel={setExtModel}
+          onSave={saveExtraction}
+          pending={pending}
+          effective={
+            answering.extraction.effective
+              ? `${PROVIDER_LABEL[answering.extraction.effective.provider]} · ${answering.extraction.effective.model}`
+              : "reuses the answering model"
+          }
+          fallback={answering.extraction.usedFallback}
         />
       </div>
 

@@ -14,8 +14,8 @@ import { getRetrievalHealth } from "@/lib/query/retrieval-health";
 import { RetrievalHealthCard } from "@/components/admin/retrieval-health-card";
 import { getPipelineHealth } from "@/lib/ingest/pipeline-health";
 import { PipelineHealthBanner } from "@/components/admin/pipeline-health-banner";
-import { describeAnswering, describeReasoning } from "@/lib/query/llm-backend";
-import { normalizeAnsweringProvider } from "@/lib/query/answering";
+import { describeAnswering, describeExtraction, describeReasoning } from "@/lib/query/llm-backend";
+import { normalizeAnsweringProvider, normalizeExtractionProvider } from "@/lib/query/answering";
 import { describeEmbedding, normalizeEmbeddingProvider } from "@/lib/query/embeddings-backend";
 import { normalizeMeetingTaskStatus } from "@/lib/meetings/target-status";
 
@@ -38,7 +38,7 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ t
   const { data: team } = await sessionDb
     .from("teams")
     .select(
-      "id, primary_pm_provider, answering_provider, reasoning_model, reasoning_provider, embedding_provider, embedding_model, meeting_task_status"
+      "id, primary_pm_provider, answering_provider, reasoning_model, reasoning_provider, extraction_model, extraction_provider, embedding_provider, embedding_model, meeting_task_status"
     )
     .eq("slug", teamSlug)
     .maybeSingle();
@@ -81,6 +81,8 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ t
   const answeringProvider = normalizeAnsweringProvider(team.answering_provider);
   const reasoningProvider = normalizeAnsweringProvider(team.reasoning_provider);
   const reasoningModel = (team.reasoning_model as string | null) ?? null;
+  const extractionProvider = normalizeExtractionProvider(team.extraction_provider);
+  const extractionModel = (team.extraction_model as string | null) ?? null;
   const localBaseUrl = process.env.LLM_BASE_URL ?? undefined;
   // One key set drives both the answering + reasoning indicators (no key is decrypted — a non-empty
   // sentinel stands in for "key is set" since the resolver only checks presence).
@@ -94,10 +96,13 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ t
     activeProvider: answeringProvider,
     reasoningModel,
     reasoningProvider,
+    extractionModel,
+    extractionProvider,
   };
   const llmEnv = { LLM_BASE_URL: localBaseUrl, LLM_MODEL: process.env.LLM_MODEL };
   const answering = describeAnswering(llmEnv, answeringKeys);
   const reasoning = describeReasoning(llmEnv, answeringKeys);
+  const extraction = describeExtraction(llmEnv, answeringKeys);
   const answeringModels: Record<"anthropic" | "openai" | "openrouter", string | null> = {
     anthropic: modelOf("anthropic"),
     openai: modelOf("openai"),
@@ -177,6 +182,12 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ t
             model: reasoningModel,
             effective: reasoning.enabled ? { provider: reasoning.provider, model: reasoning.model } : null,
             usedFallback: reasoning.usedFallback,
+          },
+          extraction: {
+            provider: extractionProvider,
+            model: extractionModel,
+            effective: extraction.enabled ? { provider: extraction.provider, model: extraction.model } : null,
+            usedFallback: extraction.usedFallback,
           },
         }}
         embedding={{
