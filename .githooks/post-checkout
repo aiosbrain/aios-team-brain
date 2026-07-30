@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# aios-tracked-hook: post-checkout — machine-local chain only.
+#
+# core.hooksPath=.githooks makes git ignore `.git/hooks/`, which is exactly
+# where `aios worktree install-hook` puts the worktree auto-hydration
+# post-checkout hook. Chain it so a raw `git worktree add` (without the `aios
+# worktree add` wrapper) still auto-hydrates config. Never blocks a checkout.
+# See .githooks/README.md for the chain convention.
+set -uo pipefail
+
+common_dir="$(git rev-parse --git-common-dir 2>/dev/null || true)"
+if [[ -n "$common_dir" && "$common_dir" != /* ]]; then
+  common_dir="$(cd "$common_dir" 2>/dev/null && pwd -P || echo "$common_dir")"
+fi
+
+local_hook="$common_dir/hooks/post-checkout"
+if [[ -n "$common_dir" && -x "$local_hook" ]] && ! grep -q "^# aios-tracked-hook" "$local_hook" 2>/dev/null; then
+  "$local_hook" "$@" || true
+fi
+
+exit 0
