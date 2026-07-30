@@ -1,7 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { db, seedTeam } from "./helpers";
 import { resolveAnsweringKeys } from "@/lib/query/answering";
 import { selectLlmBackend } from "@/lib/query/llm-backend";
+import { isRefusal, resolveGraphChatTarget } from "@/lib/llm/graph-proxy";
 
 /**
  * Spec (real Postgres): the extraction role persists, and the DB itself refuses the one provider that
@@ -56,6 +57,45 @@ describe("extraction model config (data-mechanics)", () => {
     const keys = await resolveAnsweringKeys(db(), seed.teamId);
     expect(keys.extractionModel).toBeNull();
     expect(keys.extractionProvider).toBeNull();
+  });
+
+  /**
+   * THE WIRING PIN. Everything above proves the columns persist and that `selectLlmBackend` honours
+   * them — and every one of those tests stays green if `resolveGraphChatTarget` stops asking for the
+   * extraction role, because they call the selector directly. That one argument IS the feature: without
+   * it the admin's cheap-model pick applies to nothing, the graph silently goes back to billing the
+   * answering model, and the only symptom is next month's invoice. "A cost setting that reverts unseen
+   * is a surprise bill" is this change's own argument, so it needs a test that fails when it reverts.
+   *
+   * Driven through the `local` backend so no provider key has to be decrypted — the assertion is about
+   * WHICH MODEL the graph leg resolves, which is backend-independent.
+   */
+  describe("the graph leg actually asks for the extraction role", () => {
+    const prevBase = process.env.LLM_BASE_URL;
+    const prevModel = process.env.LLM_MODEL;
+    afterEach(() => {
+      process.env.LLM_BASE_URL = prevBase;
+      process.env.LLM_MODEL = prevModel;
+    });
+
+    async function graphModelFor(teamId: string): Promise<string> {
+      process.env.LLM_BASE_URL = "http://local.test/v1";
+      process.env.LLM_MODEL = "answering-model";
+      const target = await resolveGraphChatTarget(db(), teamId);
+      if (isRefusal(target)) throw new Error(`refused: ${target.code}`);
+      return target.model;
+    }
+
+    it("sends the EXTRACTION model to Graphiti when one is set", async () => {
+      const seed = await seedTeam();
+      await db().from("teams").update({ answering_provider: "local" }).eq("id", seed.teamId);
+      // Columns null: the graph runs the answering model — every install's behaviour today.
+      expect(await graphModelFor(seed.teamId)).toBe("answering-model");
+
+      await db().from("teams").update({ extraction_model: "cheap-extraction-model" }).eq("id", seed.teamId);
+      // …and the moment an admin picks one, that is what the graph bills.
+      expect(await graphModelFor(seed.teamId)).toBe("cheap-extraction-model");
+    });
   });
 
   it("accepts every provider the graph CAN speak", async () => {

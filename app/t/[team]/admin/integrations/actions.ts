@@ -11,7 +11,7 @@ import {
   getEnabledIntegrationsWithSecrets,
   saveProviderModel as saveProviderModel_,
 } from "@/lib/integrations/manage";
-import { describeExtraction, type AnsweringProvider } from "@/lib/query/llm-backend";
+import { selectLlmBackend, type AnsweringProvider } from "@/lib/query/llm-backend";
 import { resolveAnsweringKeys } from "@/lib/query/answering";
 import { runSlackIngestion, runPlaneIngestion, runLinearIngestion, runGithubIngestion } from "@/lib/ingest/run";
 import { runGraphProjection } from "@/lib/graph/run";
@@ -509,16 +509,15 @@ export async function setAnsweringModel(
   // that is no longer true. Warning anyway would accuse a model that never touches the graph, which is
   // the false-accusation failure mode this check was explicitly built to avoid. The extraction save
   // carries the warning instead (see `setExtractionModel`).
-  let warning: string | undefined;
+  // Suppressed when the extraction role governs the graph: this save then changes nothing Graphiti uses,
+  // so warning about it would accuse a model that never touches the graph. When extraction is unset the
+  // answering model IS the graph's model, and `graphModelWarning` resolves exactly that.
   try {
-    if (!(await extractionRoleActive(db, ctx.teamId))) {
-      warning =
-        structuredOutputWarning(await checkStructuredOutputSupport(provider, model.trim())) ?? undefined;
-    }
+    if (await extractionRoleActive(db, ctx.teamId)) return { ok: true };
   } catch {
-    warning = undefined;
+    // Fall through and warn: a failed read must not silence a real problem.
   }
-  return warning ? { ok: true, warning } : { ok: true };
+  return { ok: true, ...(await graphModelWarning(db, ctx.teamId)) };
 }
 
 /**
@@ -588,28 +587,55 @@ export async function setExtractionModel(
     meta: { provider: extractionProvider, model: extractionModel },
   });
   revalidatePath(`/t/${teamSlug}/admin/integrations`);
-  // Same advisory check as the answering save, and now this is the picker that owns it — this model is
-  // the one Graphiti will actually use. A model that can't adhere to a JSON schema empties the graph.
-  //
-  // Checked against the RESOLVED provider, not the one submitted: with the provider left as "same as
-  // answering" the model still runs on whatever answers, and `checkStructuredOutputSupport` can only
-  // answer for OpenRouter — so asking about the submitted `null` would return "can't tell" on exactly
-  // the configuration most people will use.
-  let warning: string | undefined;
+  return { ok: true, ...(await graphModelWarning(db, ctx.teamId)) };
+}
+
+/**
+ * The advisory sentence about whatever now governs the graph leg. Both model pickers end here.
+ *
+ * Asked of the RESOLVED backend, never of the submitted values, and this is the whole point:
+ *
+ *  • "Same as answering" (provider null) still runs the model on whatever answers, so asking about the
+ *    submitted `null` would return "can't tell" on the configuration most people will use.
+ *  • CLEARING the extraction model hands the graph back to the answering model — which may be one that
+ *    was never warned about, because this very function suppressed the warning on the answering save
+ *    while extraction governed. Set flash as the answer model (silently, correctly), then clear
+ *    extraction, and without resolving after the write the graph would run a schema-incapable model with
+ *    nobody ever having said so. Resolving means the question is always "what will Graphiti use now",
+ *    which has no ordering hole.
+ *
+ * Advisory only, never blocking, and silent on "can't tell" — an unreachable catalogue or an unlisted
+ * model must not become an accusation (the work-key lesson).
+ */
+async function graphModelWarning(
+  db: ReturnType<typeof adminClient>,
+  teamId: string
+): Promise<{ warning?: string }> {
   try {
-    if (extractionModel) {
-      const effective = describeExtraction(
-        { LLM_BASE_URL: process.env.LLM_BASE_URL, LLM_MODEL: process.env.LLM_MODEL },
-        await resolveAnsweringKeys(db, ctx.teamId)
-      );
-      warning =
-        structuredOutputWarning(await checkStructuredOutputSupport(effective.provider, effective.model)) ??
-        undefined;
+    const keys = await resolveAnsweringKeys(db, teamId);
+    const backend = selectLlmBackend(
+      { LLM_BASE_URL: process.env.LLM_BASE_URL, LLM_MODEL: process.env.LLM_MODEL },
+      keys,
+      { role: "extraction" }
+    );
+    // Anthropic can't serve extraction at all, and this is reachable WITHOUT choosing it for the role:
+    // answering on Anthropic + "same as answering" resolves here. `setExtractionModel` refuses an
+    // explicit Anthropic pick with a sentence, so the equivalent config must not save wordlessly.
+    if (backend.provider === "anthropic") {
+      return {
+        warning:
+          "Graph extraction will run on Anthropic (your answering provider), which can't serve it — " +
+          "Graphiti extracts with OpenAI structured outputs. Pick OpenRouter, OpenAI, or a local " +
+          "endpoint as the extraction provider, or the graph will stay empty.",
+      };
     }
+    const warning = structuredOutputWarning(
+      await checkStructuredOutputSupport(backend.provider, backend.model)
+    );
+    return warning ? { warning } : {};
   } catch {
-    warning = undefined;
+    return {};
   }
-  return warning ? { ok: true, warning } : { ok: true };
 }
 
 /**

@@ -172,8 +172,14 @@ function EmbeddingPicker(props: {
 }
 
 const ROLE_PROVIDERS: AnsweringProvider[] = ["anthropic", "openai", "openrouter", "local"];
-/** Extraction's narrower list — Anthropic can't serve the OpenAI structured-output call extraction is. */
-const EXTRACTION_PROVIDERS: AnsweringProvider[] = ["openai", "openrouter", "local"];
+/** Extraction's narrower list — Anthropic can't serve the OpenAI structured-output call extraction is.
+ *  Typed as the narrow role type so the picker's callback needs no cast to stay honest. */
+const EXTRACTION_PROVIDERS: ExtractionProvider[] = ["openai", "openrouter", "local"];
+/** Narrow a picker choice to the extraction set. A real check rather than a cast: the select only
+ *  offers these three, so anything else (a stale render, a later edit to the option list) becomes
+ *  "same as answering" instead of a value the role's type says is impossible. */
+const asExtractionProvider = (p: AnsweringProvider | null): ExtractionProvider | null =>
+  p !== null && (EXTRACTION_PROVIDERS as AnsweringProvider[]).includes(p) ? (p as ExtractionProvider) : null;
 
 /** One role's control: a provider dropdown + model input + Save, with the effective backend shown.
  *  Used for both the Answering and Reasoning roles so they read identically. `local`'s model is
@@ -562,14 +568,14 @@ export function IntegrationsManager({
 
         <RolePicker
           title="Extraction model (optional) — where the spend is"
-          help="The model that does the high-volume machine work: building the knowledge graph from every ingested document. This is ~99% of the LLM bill, and it is mechanical — a cheap model that supports structured outputs is the right pick here, while answering keeps a strong one. Leave the model blank to reuse the answering model. “Same as answering” keeps the answering provider."
+          help="The model that does the high-volume machine work: building the knowledge graph from every ingested document. This is ~99% of the LLM bill, and it is mechanical — a cheap model that supports structured outputs is the right pick here, while answering keeps a strong one. Prefer OpenRouter: it reports the real per-call cost, so the saving shows up on the Costs page (an OpenAI-cloud or local pick is recorded as $0-estimated and the change becomes unmeasurable). Leave the model blank to reuse the answering model. “Same as answering” keeps the answering provider."
           autoLabel="Same as answering"
           provider={extProvider}
           model={extModel}
           configured={providerConfigured}
           providers={EXTRACTION_PROVIDERS}
           note="Anthropic isn’t offered: graph extraction is an OpenAI structured-output call, which Anthropic’s API doesn’t speak."
-          onProvider={(p) => setExtProvider(p as ExtractionProvider | null)}
+          onProvider={(p) => setExtProvider(asExtractionProvider(p))}
           onModel={setExtModel}
           onSave={saveExtraction}
           pending={pending}

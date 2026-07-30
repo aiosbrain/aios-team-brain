@@ -194,16 +194,20 @@ export function forwardBody(
     forwarded.usage = { include: true };
     // REASONING OFF. Entity/edge extraction is a schema-constrained transformation — the model emits a
     // JSON object against a supplied schema — so chain-of-thought buys nothing and is charged at the
-    // OUTPUT rate, the expensive one. `lib/llm/complete.ts` has disabled it for extraction-type calls
-    // for exactly this reason; this transport mirrored that function's `usage` line and missed the one
-    // beside it, which left the graph leg — 99% of the brain's LLM spend — as the only OpenRouter path
-    // still paying to think out loud. Measured on the live proxy: 473 of 529 completion tokens on a
-    // trivial extraction prompt were reasoning tokens (89%).
+    // OUTPUT rate, the expensive one. `lib/llm/complete.ts:133-137` has disabled it for query/extraction
+    // calls for exactly this reason; this transport mirrored that function's `usage` line and missed the
+    // one beside it.
+    //
+    // Precisely: `complete.ts` is the ONLY other transport that sends this flag at all — the streaming
+    // answer path (`lib/query/claude.ts`) deliberately does not, because a person reading an answer can
+    // benefit from the model thinking first, and it buys headroom instead (`LLM_REASONING_HEADROOM_TOKENS`).
+    // So this is not "the last path to be brought in line"; it is the second path where thinking is
+    // provably worthless, and it happens to be 99% of the bill.
     //
     // Unconditional here, unlike `complete.ts`, which keeps reasoning for a genuinely distinct
     // reasoning-role model: there is no extraction task that wants it. Ignored by non-reasoning models.
-    // `LLM_DISABLE_REASONING=0` overrides — the same escape hatch `complete.ts` honours (the only other
-    // transport that sends this flag at all), so the override is one global switch rather than two.
+    // `LLM_DISABLE_REASONING=0` overrides — the same env `complete.ts` honours, so the override stays one
+    // global switch rather than two.
     //
     // Measured through the deployed proxy on Graphiti's real schemas, n=3 per arm: extract-nodes
     // 2398-2881 completion tokens (~87% reasoning) -> 409-522, ~4.2x cheaper per call; dedupe 582-728

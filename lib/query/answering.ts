@@ -26,7 +26,12 @@ const VALID_EXTRACTION_PROVIDERS: readonly ExtractionProvider[] = ["openai", "op
 /**
  * Normalize a stored `teams.extraction_provider`. Anything outside the extraction set — including
  * `anthropic`, which the CHECK constraint already forbids — becomes null, i.e. "the answering backend".
- * A hand-edited row can therefore never point the graph leg at a backend that cannot serve it.
+ *
+ * That stops a hand-edited row from *selecting* a backend the graph can't serve; it does NOT guarantee
+ * the graph resolves a usable one, because null means "whatever answers" and the answering provider can
+ * itself be Anthropic. That case is pre-existing (answering on Anthropic has always left the graph dead),
+ * is refused by `graphChatTarget` with an actionable 501, and is warned about at save time by
+ * `graphModelWarning`. Not silent, but not prevented here either.
  */
 export function normalizeExtractionProvider(raw: unknown): ExtractionProvider | null {
   return typeof raw === "string" && (VALID_EXTRACTION_PROVIDERS as readonly string[]).includes(raw)
