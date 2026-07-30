@@ -32,6 +32,21 @@ export const DEFAULT_OPENAI_MODEL = "gpt-4o";
 /** The answering backends an admin can force via `teams.answering_provider`. */
 export type AnsweringProvider = "anthropic" | "openai" | "openrouter" | "local";
 
+/**
+ * The backends the EXTRACTION role may use — Anthropic excluded, and this is load-bearing.
+ *
+ * The only consumer of this role today is the graph LLM proxy, and Graphiti extracts via
+ * `beta.chat.completions.parse`: an OpenAI-shaped structured-output call. `graphChatTarget` therefore
+ * refuses Anthropic outright, so allowing it here would let one dropdown make EVERY extraction call
+ * 501 while Graphiti keeps answering `202` — a silently empty graph whose first signal is the stall
+ * detector six hours later. Kept unrepresentable at all three layers instead (the
+ * `teams_extraction_provider_check` CHECK, `setExtractionModel`, and the picker's option list).
+ *
+ * Widening this (if in-app `complete.ts` callers ever adopt the role, where Anthropic works fine) is a
+ * trivial additive migration; narrowing it later is the release-breaking direction.
+ */
+export type ExtractionProvider = "openai" | "openrouter" | "local";
+
 export interface LlmBackendEnv {
   LLM_BASE_URL?: string;
   LLM_MODEL?: string;
@@ -59,10 +74,28 @@ export interface LlmBackendKeys {
    * OpenRouter). Null/undefined → reasoning reuses the ANSWERING backend, just swapping the model.
    */
   reasoningProvider?: AnsweringProvider | null;
+  /**
+   * Optional distinct model for high-volume MACHINE extraction (`teams.extraction_model`) — today the
+   * knowledge-graph leg via the proxy. When set, a `role: "extraction"` selection uses it instead of the
+   * query model. Null/undefined → extraction reuses the answering model (the pre-role behaviour).
+   *
+   * The model is the activation switch: a provider without a model leaves the role off.
+   */
+  extractionModel?: string | null;
+  /**
+   * Optional distinct PROVIDER for the extraction model (`teams.extraction_provider`). Null/undefined
+   * with a model set = "the answering backend, different model" — the cheapest useful case, and
+   * deliberate. Set = extraction runs on that provider's own backend + key.
+   */
+  extractionProvider?: ExtractionProvider | null;
 }
 
-/** Which model to select: the default interactive/extraction model, or the reasoning model. */
-export type LlmRole = "query" | "reasoning";
+/**
+ * Which model to select: the default interactive model, the reasoning model, or the high-volume
+ * machine-extraction model. `query` and `extraction` differ only in WHICH model they resolve —
+ * neither ever turns chain-of-thought on (see `reasoningActive`).
+ */
+export type LlmRole = "query" | "reasoning" | "extraction";
 
 /**
  * Whether chain-of-thought reasoning should be left ON for this call. TRUE only when a reasoning-role
@@ -76,6 +109,15 @@ export type LlmRole = "query" | "reasoning";
  */
 export function reasoningActive(role: LlmRole | undefined, keys: LlmBackendKeys): boolean {
   return role === "reasoning" && nonEmpty(keys.reasoningModel);
+}
+
+/**
+ * Whether a DISTINCT extraction model applies to this call. True only for `role: "extraction"` with
+ * `teams.extraction_model` set — the model is the activation switch, so a provider chosen without a
+ * model leaves the role off and extraction keeps using the answering model.
+ */
+export function extractionActive(role: LlmRole | undefined, keys: LlmBackendKeys): boolean {
+  return role === "extraction" && nonEmpty(keys.extractionModel);
 }
 
 export type LlmBackend =
@@ -164,6 +206,29 @@ export function selectLlmBackend(
     const reasoningBackend = (keys.reasoningProvider ? candidate(keys.reasoningProvider, env, keys) : null) ?? backend;
     return { ...reasoningBackend, model: keys.reasoningModel!.trim() };
   }
+
+  // For an extraction-role task, use the team's cheap high-volume model. Same shape as reasoning above
+  // with ONE deliberate difference: the fallback is WHOLE.
+  //
+  // A requested-but-unconfigurable extraction provider returns the answering backend AND the answering
+  // MODEL — never the extraction model pointed at a backend that may not serve it. That half-swap (what
+  // the reasoning branch above does) is a guaranteed 404 per call; for reasoning it costs one failed arc
+  // synthesis, but for extraction EVERY call fails while Graphiti keeps answering `202` to the projector,
+  // so the graph silently stops growing and the first signal is the stall detector six hours later. That
+  // is the precise failure this whole stack spent a week chasing, so it must not be reachable by a
+  // dropdown. `describeExtraction` surfaces the fallback on the admin card — silence would be a
+  // cost setting that reverts unnoticed, i.e. a surprise bill.
+  //
+  // (Why the reasoning branch isn't converged onto this: `reasoningActive` is the single switch that
+  // turns chain-of-thought ON and keys on `reasoningModel` being set, so falling reasoning back to the
+  // answering MODEL would leave reasoning enabled over a model that may itself be a reasoning model —
+  // the token starvation that blanked the Learning arcs. Fixing that means changing the reasoning
+  // contract, which is its own change. See docs/design/graph-extraction-model.md.)
+  if (extractionActive(opts?.role, keys)) {
+    const own = keys.extractionProvider ? candidate(keys.extractionProvider, env, keys) : backend;
+    if (!own) return backend;
+    return { ...own, model: keys.extractionModel!.trim() };
+  }
   return backend;
 }
 
@@ -179,6 +244,33 @@ export function describeAnswering(
   const backend = selectLlmBackend(env, keys);
   const requested = keys.activeProvider ?? null;
   return {
+    requested,
+    provider: backend.provider,
+    model: backend.model,
+    usedFallback: requested !== null && backend.provider !== requested,
+  };
+}
+
+/**
+ * Describe the effective EXTRACTION backend for the admin indicator. `enabled` is false when no
+ * distinct extraction model is set (extraction reuses the answering model — nothing to show).
+ *
+ * `usedFallback` is not cosmetic here: extraction is where nearly all the spend is, so a requested
+ * cheap model that silently reverted to the expensive answering model is a surprise bill. This is the
+ * one surface that says so.
+ */
+export function describeExtraction(
+  env: LlmBackendEnv,
+  keys: LlmBackendKeys
+): { enabled: boolean; requested: ExtractionProvider | null; provider: AnsweringProvider; model: string; usedFallback: boolean } {
+  const answering = selectLlmBackend(env, keys).provider;
+  if (!extractionActive("extraction", keys)) {
+    return { enabled: false, requested: null, provider: answering, model: "", usedFallback: false };
+  }
+  const backend = selectLlmBackend(env, keys, { role: "extraction" });
+  const requested = keys.extractionProvider ?? null;
+  return {
+    enabled: true,
     requested,
     provider: backend.provider,
     model: backend.model,

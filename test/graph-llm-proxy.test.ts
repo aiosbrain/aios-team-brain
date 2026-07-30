@@ -293,3 +293,33 @@ describe("the proxy's upstream timeout", () => {
     expect(PROXY_TIMEOUT_MS_FOR_TEST).toBeLessThan(600_000);
   });
 });
+
+/**
+ * Reasoning off — the saving that needed no new setting.
+ *
+ * Extraction is a schema-constrained transformation; chain-of-thought buys nothing and is billed at
+ * the OUTPUT rate. `lib/llm/complete.ts` has disabled reasoning on OpenRouter for extraction-type
+ * calls all along. This transport copied that function's `usage: {include:true}` line and missed the
+ * one next to it, leaving the graph leg — 99% of the brain's LLM spend — as the only OpenRouter path
+ * still paying for hidden thinking. Measured live: 473 of 529 completion tokens (89%) were reasoning.
+ */
+describe("forwardBody — extraction never pays for chain-of-thought", () => {
+  it("disables reasoning on OpenRouter", () => {
+    const out = forwardBody({ messages: [] }, "qwen/qwen3.7-max", "openrouter");
+    if (isRefusal(out)) throw new Error("expected a body");
+    expect(out.reasoning).toEqual({ enabled: false });
+  });
+
+  it("leaves non-OpenRouter providers untouched — the flag is OpenRouter's", () => {
+    const out = forwardBody({ messages: [] }, "gpt-4o", "openai");
+    if (isRefusal(out)) throw new Error("expected a body");
+    expect(out.reasoning).toBeUndefined();
+    expect(out.usage).toBeUndefined();
+  });
+
+  it("still asks for the real cost alongside it", () => {
+    const out = forwardBody({ messages: [] }, "m", "openrouter");
+    if (isRefusal(out)) throw new Error("expected a body");
+    expect(out.usage).toEqual({ include: true });
+  });
+});

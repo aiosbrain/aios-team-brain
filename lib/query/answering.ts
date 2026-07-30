@@ -1,7 +1,7 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { getProviderSettings } from "@/lib/integrations/manage";
-import type { AnsweringProvider, LlmBackendKeys } from "@/lib/query/llm-backend";
+import type { AnsweringProvider, ExtractionProvider, LlmBackendKeys } from "@/lib/query/llm-backend";
 
 /**
  * The single place the answer path assembles a team's LLM backend keys: every provider's decrypted
@@ -20,17 +20,44 @@ export function normalizeAnsweringProvider(raw: unknown): AnsweringProvider | nu
     : null;
 }
 
+/** The providers the EXTRACTION role may use — Anthropic is excluded on purpose (ExtractionProvider). */
+const VALID_EXTRACTION_PROVIDERS: readonly ExtractionProvider[] = ["openai", "openrouter", "local"];
+
+/**
+ * Normalize a stored `teams.extraction_provider`. Anything outside the extraction set — including
+ * `anthropic`, which the CHECK constraint already forbids — becomes null, i.e. "the answering backend".
+ *
+ * That stops a hand-edited row from *selecting* a backend the graph can't serve; it does NOT guarantee
+ * the graph resolves a usable one, because null means "whatever answers" and the answering provider can
+ * itself be Anthropic. That case is pre-existing (answering on Anthropic has always left the graph dead),
+ * is refused by `graphChatTarget` with an actionable 501, and is warned about at save time by
+ * `graphModelWarning`. Not silent, but not prevented here either.
+ */
+export function normalizeExtractionProvider(raw: unknown): ExtractionProvider | null {
+  return typeof raw === "string" && (VALID_EXTRACTION_PROVIDERS as readonly string[]).includes(raw)
+    ? (raw as ExtractionProvider)
+    : null;
+}
+
 export async function resolveAnsweringKeys(db: DbClient, teamId: string): Promise<LlmBackendKeys> {
   const [anthropic, openai, openrouter, teamRes] = await Promise.all([
     getProviderSettings(db, teamId, "anthropic"),
     getProviderSettings(db, teamId, "openai"),
     getProviderSettings(db, teamId, "openrouter"),
-    db.from("teams").select("answering_provider, reasoning_model, reasoning_provider").eq("id", teamId).maybeSingle(),
+    db
+      .from("teams")
+      .select(
+        "answering_provider, reasoning_model, reasoning_provider, extraction_model, extraction_provider"
+      )
+      .eq("id", teamId)
+      .maybeSingle(),
   ]);
   const teamRow = teamRes.data as {
     answering_provider: string | null;
     reasoning_model: string | null;
     reasoning_provider: string | null;
+    extraction_model: string | null;
+    extraction_provider: string | null;
   } | null;
   return {
     anthropicKey: anthropic.key,
@@ -42,5 +69,7 @@ export async function resolveAnsweringKeys(db: DbClient, teamId: string): Promis
     activeProvider: normalizeAnsweringProvider(teamRow?.answering_provider),
     reasoningModel: teamRow?.reasoning_model ?? null,
     reasoningProvider: normalizeAnsweringProvider(teamRow?.reasoning_provider),
+    extractionModel: teamRow?.extraction_model ?? null,
+    extractionProvider: normalizeExtractionProvider(teamRow?.extraction_provider),
   };
 }
