@@ -40,9 +40,9 @@ curl -fsSL https://aiosbrain.dev/install.sh | sh
 
 It checks your prerequisites, fetches the repo, and hands you to an interview: run it **on this
 machine** (your own team, real install), **on Railway** (the shared server a team actually uses), or
-**just the demo**. It asks only what your choice needs, **validates each credential as you paste
-it** — a wrong model key is caught there, not three steps later at an empty query box — then shows
-the plan before touching anything. Already cloned? `npm run setup` is the same wizard.
+**just the demo**. It asks only what your choice needs, **proves your model key works
+before going further** — a wrong paste is caught there, not three steps later at an empty query box —
+then shows the plan before touching anything. Already cloned? `npm run setup` is the same wizard.
 
 It never uses `sudo`, never overwrites an existing install, and never deploys.
 [`install.sh`](install.sh) is short and commented — read it before you pipe it, as you should with
@@ -135,20 +135,26 @@ LLM key if you run the context engine. Self-host the model and all of it is zero
   the connectors feed the brain on their own. See
   [the quickstart](https://aiosbrain.dev/guides/quickstart).
 
-**The order, and roughly what each costs you** (~15 minutes to a first answer, excluding the
-optional context engine):
+**The order, and who does each part.** `npm run setup` (or the installer above) performs steps 1–3
+and 5; they're listed because you should know what it did to your machine, not because you have to
+type them. §2 is the same sequence by hand, for a host the wizard doesn't cover or when you'd rather
+drive it yourself.
 
-| | | |
-|---|---|---|
-| 1 | Deploy the app | ~5 min |
-| 2 | Set the environment variables | ~3 min |
-| 3 | Load the schema (`npm run pg:schema`) | ~1 min |
-| 4 | Load the vector schema (`npm run pg:schema:vector`) | ~1 min |
-| 5 | Create the first admin | ~1 min |
-| 6 | Connect one source | ~4 min |
-| + | Add Neo4j + Graphiti | later, or never |
+| | | | |
+|---|---|---|---|
+| 1 | Deploy the app | ~5 min | wizard |
+| 2 | Set the environment variables | ~3 min | wizard |
+| 3 | Load the schema (`npm run pg:schema`) | ~1 min | wizard |
+| 4 | Load the vector schema (`npm run pg:schema:vector`) | ~1 min | **yours** — needs an embeddings model chosen first |
+| 5 | Create the first team + admin | ~1 min | wizard (on Railway, the `--resume` run after you connect the repo) |
+| 6 | Connect one source | ~4 min | **yours** — the Admin UI is the only legal writer for tokens |
+| + | Add Neo4j + Graphiti | later, or never | **yours**, §2.8 |
 
-Everything below is that, in dependency order, with the failure modes called out.
+On the Railway path there's one more step no CLI can take for you: connecting your GitHub
+repository, which is also the deploy path. The wizard stops there and tells you exactly what to
+click.
+
+Everything below is that sequence in dependency order, with the failure modes called out.
 
 > **Joining a team that already runs one?** You don't need any of this — you need an invite. See
 > [Onboarding a contributor](https://aiosbrain.dev/guides/quickstart#part-2--connect-to-a-team-brain).
@@ -283,11 +289,17 @@ Kubernetes all work. Only §2.1 is Railway-specific.
 Each step explains *why*, so you can tell when something has gone wrong rather than pattern-matching
 on green output.
 
-> **Shortcut — `npm run setup` does §2.1–§2.4 for you.** On Railway, the steps below are automated
-> by `scripts/setup.mjs`: it creates the project (named `aios-<slug>`, which is what
-> `scripts/service-guard.mjs` requires), adds Postgres, **generates** `AUTH_SECRET` and
-> `SECRETS_KEY` at the right widths, claims a domain and reads `APP_URL` back from it, sets the
-> variables, and — after you connect the repo — creates your team and first admin.
+> **You probably don't need to read this section. `npm run setup` does §2.1–§2.4 for you** — it's an
+> interview, not a flag soup: it asks where to run (this machine / Railway / demo), collects only the
+> credentials that choice needs, **proves the model key works with a free metadata request** (a wrong
+> paste surfaces there, not later as an empty answer box), and shows you the plan before touching
+> anything. On Railway it creates the project (named `aios-<slug>`, which is what
+> `scripts/service-guard.mjs` requires), adds Postgres, **generates** `AUTH_SECRET` and `SECRETS_KEY`
+> at the right widths, claims a domain and reads `APP_URL` back from it, sets the variables, and —
+> after you connect the repo — creates your team and first admin.
+>
+> Read on when you're deploying somewhere the wizard doesn't cover, debugging a run that went wrong,
+> or you'd simply rather do it yourself and know why each step exists.
 > ```bash
 > railway login                                        # browser OAuth; can't be automated
 > npm run setup -- --slug acme --name "Acme Robotics" --email you@acme.com --dry-run

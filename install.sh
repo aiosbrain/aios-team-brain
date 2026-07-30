@@ -23,6 +23,9 @@ REF="${AIOS_REF:-main}"
 DIR="${AIOS_DIR:-aios-team-brain}"
 
 say() { printf '  %s\n' "$*"; }
+# Render the target for humans. `./$DIR` is right for a relative default but produces "./tmp/x" for
+# an absolute AIOS_DIR — a path that doesn't exist and sends people looking in the wrong place.
+show_dir() { case "$1" in /*) printf '%s' "$1" ;; *) printf './%s' "$1" ;; esac; }
 die() { printf '\n  ✗ %s\n\n' "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
@@ -46,13 +49,13 @@ if [ -e "$DIR" ]; then
   # arbitrary lifecycle scripts. Require the git remote to be the repo we intended to install.
   ORIGIN="$(git -C "$DIR" remote get-url origin 2>/dev/null || echo '')"
   if [ -d "$DIR/.git" ] && [ -f "$DIR/scripts/setup-wizard.mjs" ] && [ "$ORIGIN" = "$REPO" ]; then
-    say "found an existing Team Brain checkout in ./$DIR — re-running setup there."
+    say "found an existing Team Brain checkout in $(show_dir "$DIR") — re-running setup there."
     say "(nothing fetched; your .env.local and secrets are left alone)"
   else
-    die "./$DIR already exists and is not a checkout of $REPO. Move it, or set AIOS_DIR=<other>."
+    die "$(show_dir "$DIR") already exists and is not a checkout of $REPO. Move it, or set AIOS_DIR=<other>."
   fi
 else
-  say "cloning $REF into ./$DIR"
+  say "cloning $REPO @ $REF into $(show_dir "$DIR")"
   # --depth 1: this is an install, not a contribution. Contributors clone normally.
   git clone --quiet --depth 1 --branch "$REF" "$REPO" "$DIR" ||
     die "clone failed. Check your network, or that '$REF' is a valid ref."
@@ -79,6 +82,6 @@ if [ -c /dev/tty ]; then
   exec node scripts/setup-wizard.mjs < /dev/tty
 else
   say "no terminal detected — run this from an interactive shell:"
-  say "  cd $DIR && npm run setup"
+  say "  cd $(show_dir "$DIR") && npm run setup"
   exit 1
 fi
