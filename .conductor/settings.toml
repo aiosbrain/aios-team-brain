@@ -1,0 +1,53 @@
+# Conductor workspace settings — shared, for anyone who develops this repo in Conductor
+# (https://conductor.build). Each Conductor workspace is a git worktree on its own branch, which
+# is the layout CONTRIBUTING.md already requires. Inert if you don't use Conductor.
+#
+# Conductor only picks up changes to THIS file once they are merged to the default branch on the
+# remote — editing it on a feature branch does nothing for that workspace.
+"$schema" = "https://conductor.build/schemas/settings.repo.schema.json"
+
+[scripts]
+# Share the primary checkout's node_modules instead of installing per workspace. This is
+# CONTRIBUTING.md's documented convention, and next.config.ts contains a Turbopack workaround
+# written specifically for it (a node_modules symlink pointing outside the project root makes
+# Turbopack panic, so the root is widened to the common ancestor). It also matters at this scale:
+# node_modules is ~826 MB, so installing per workspace would cost tens of GB across the ~20
+# workspaces this repo typically has open.
+#
+# Falls back to `npm ci` when there's no root install to borrow (a fresh clone, or a cloud
+# workspace). If a branch changes package.json, run `npm install` in the workspace to break off
+# its own copy — shared deps are stale by definition then.
+setup = 'if [ -d "$CONDUCTOR_ROOT_PATH/node_modules" ]; then ln -sfn "$CONDUCTOR_ROOT_PATH/node_modules" node_modules && echo "linked shared node_modules"; else npm ci; fi'
+
+# Safe to run several workspaces at once: every run script below is parameterised on
+# CONDUCTOR_PORT, and the compose stack additionally gets a per-workspace project name so its
+# containers, volumes and generated secrets never collide with another workspace's.
+run_mode = "concurrent"
+
+# The default, because it is the only one that works in a fresh workspace with no configuration:
+# the stack brings its own Postgres, loads the schema, seeds the demo team and prints a login.
+# `.env.local` is gitignored and absent from the repo, so `next dev` alone has no database.
+#
+# COMPOSE_PROJECT_NAME isolates containers/volumes per workspace; APP_PORT and PG_PORT keep the
+# published ports inside this workspace's allocated range (CONDUCTOR_PORT … +9).
+#
+# The workspace name is lowercased and stripped: Compose rejects a project name containing
+# uppercase or anything outside [a-z0-9_-], and workspace names are free-form (a capital or a
+# space in one would otherwise fail the run with "invalid project name").
+[scripts.run.up]
+command = 'COMPOSE_PROJECT_NAME="aios-$(printf %s "$CONDUCTOR_WORKSPACE_NAME" | tr "[:upper:]" "[:lower:]" | tr -cs "a-z0-9_-" "-")" APP_PORT="$CONDUCTOR_PORT" PG_PORT="$((CONDUCTOR_PORT + 1))" docker compose up'
+default = true
+icon = "database"
+
+# For iterating on the app itself against a database you already have configured
+# (DATABASE_URL exported, or a .env.local you copied in).
+[scripts.run.dev]
+command = 'npm run dev -- --port "$CONDUCTOR_PORT"'
+icon = "play"
+
+# Unit tier in watch mode. The data-mechanics tier is deliberately not a run script: it binds
+# compose.test.yml's fixed port 5434, so it cannot run concurrently — use `npm run db:test:up`
+# and `npm run test:datamechanics:local` by hand.
+[scripts.run.test]
+command = "npx vitest"
+icon = "test-tube"

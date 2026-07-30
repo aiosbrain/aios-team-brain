@@ -22,7 +22,11 @@ services:
       POSTGRES_DB: app
     # 5435, not 5432/5433/5434: leaves a host Postgres, another project's dev DB, and the
     # data-mechanics tier in compose.test.yml all free to run at the same time.
-    ports: ["5435:5432"]
+    # Override to run several workspaces at once — the app reaches Postgres over the compose
+    # network at postgres:5432 regardless, so this port is only for reaching it from the host
+    # (`psql`). Pair it with COMPOSE_PROJECT_NAME so each stack gets its own containers/volumes:
+    #   COMPOSE_PROJECT_NAME=aios-mine APP_PORT=3100 PG_PORT=5436 docker compose up
+    ports: ["${PG_PORT:-5435}:5432"]
     volumes: ["pgdata:/var/lib/postgresql/data"]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U app -d app"]
