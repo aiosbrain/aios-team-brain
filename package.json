@@ -9,6 +9,7 @@
     "start": "next start",
     "doctor": "node scripts/doctor.mjs",
     "setup": "node scripts/setup.mjs",
+    "connectors": "npx tsx --conditions react-server scripts/connectors.ts",
     "up": "docker compose up",
     "down": "docker compose down",
     "up:reset": "docker compose down -v && docker compose up --build",
