@@ -317,6 +317,13 @@ describe("the curl installer's safety properties", () => {
     expect(code).toMatch(/\[ "\$ORIGIN" = "\$REPO" \]/);
   });
 
+  it("renders an absolute target directory without a bogus ./ prefix", () => {
+    // `./$DIR` with AIOS_DIR=/tmp/x printed "./tmp/x" — a path that does not exist, sending the
+    // reader to look in the wrong place.
+    expect(code).toMatch(/show_dir\(\)/);
+    expect(code).not.toMatch(/"\.\/\$DIR"/);
+  });
+
   it("fails loudly on a failed clone instead of continuing into a half-install", () => {
     expect(sh).toMatch(/clone failed/);
     expect(sh).toMatch(/^set -eu$/m);

@@ -42,9 +42,36 @@ function walk(dir: string, out: string[] = []): string[] {
   for (const name of entries) {
     const p = join(dir, name);
     if (statSync(p).isDirectory()) walk(p, out);
-    else if (p.endsWith(".ts") || p.endsWith(".tsx")) out.push(p);
+    // `.mjs` too: `scripts/` is now mostly .mjs (setup-wizard, setup/*, doctor, bootstrap), so a
+    // TS-only walk left a growing blind spot where a raw `/chat/completions` POST would pass the
+    // build. Traces to a real class of file, not ceremony.
+    else if (/\.(ts|tsx|mjs)$/.test(p)) out.push(p);
   }
   return out;
+}
+
+/**
+ * Remove `//` line comments and block comments before matching.
+ *
+ * Not a parser, and the imprecision is bounded on purpose: it can blank a comment marker that lives
+ * inside a STRING, which loses coverage (a miss) but never invents an accusation. A miss is the safe
+ * direction for this guard — the cost is one uncaught call, not a red build someone "fixes" by
+ * deleting a comment.
+ *
+ * The block opener requires a boundary before `/*` precisely to keep that bounded: without it, a
+ * glob or cron string (`"app/*.ts"`, `"*\/5 * * * *"`) opens a phantom comment that swallows
+ * everything up to the next `*\/` anywhere in the file — including real transport code. Those
+ * strings occur by accident, not just adversarially.
+ *
+ * Still-known gaps, unchanged by this helper and pre-existing: a URL assembled from parts
+ * (`base + "/chat/" + "completions"`) never matched the raw regex either, and a protocol-relative
+ * `fetch("//host/v1/chat/completions")` has its `//` treated as a comment. Both are misses, both
+ * were misses before comment-stripping existed.
+ */
+function stripComments(src: string): string {
+  return src
+    .replace(/(^|[\s(,;=:[{])\/\*[\s\S]*?\*\//g, "$1 ")
+    .replace(/(^|[^:])\/\/[^\n]*/g, "$1");
 }
 
 function offenders(): string[] {
@@ -54,7 +81,11 @@ function offenders(): string[] {
       const rel = file.slice(ROOT.length + 1);
       if (ALLOWLIST.has(rel)) continue;
       if (rel.endsWith(".test.ts") || rel.endsWith(".test.tsx")) continue;
-      const src = readFileSync(file, "utf8");
+      // Strip comments before matching. Prose is not an invocation — the same distinction
+      // `railway-policy.mjs` draws for its forbidden verbs. Without this, a file that DOCUMENTS
+      // that it never posts to /chat/completions gets flagged for saying so, which teaches people
+      // to delete the explanation rather than keep the guard honest.
+      const src = stripComments(readFileSync(file, "utf8"));
       for (const re of RAW_TRANSPORT) {
         if (re.test(src)) hits.push(`${rel}: matches ${re}`);
       }
