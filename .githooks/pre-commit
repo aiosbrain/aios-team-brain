@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+#
+# aios-tracked-hook: pre-commit — primary-checkout commit guard + machine-local chain.
+#
+# This file is TRACKED and version-controlled. This repo activates it via
+# `core.hooksPath=.githooks` (set by the package.json "prepare" script on npm
+# install), so it runs in the primary checkout AND in every linked worktree —
+# each worktree executes its own checked-out copy of .githooks/.
+#
+# Because core.hooksPath makes git IGNORE `.git/hooks/` entirely, any hook
+# installed there (the machine-local NDA leak-gate shim, the worktree
+# auto-hydration hook) only runs if a tracked hook here chains it explicitly.
+# See .githooks/README.md for the chain convention.
+#
+# Two jobs, in order:
+#
+#   1. PRIMARY-COMMIT GUARD — block every authored commit made in the PRIMARY
+#      checkout, on EVERY branch including `main`. AIOS requires all work to
+#      happen in a dedicated linked worktree (`aios worktree add <branch>`);
+#      the primary should only advance via `git merge --ff-only` from origin,
+#      which moves the ref without creating a commit and so never triggers this
+#      hook. A non-ff merge in the primary IS the anti-pattern and is blocked
+#      too. NO-OP inside linked worktrees.
+#      Override for a genuinely intentional primary commit (rare hotfix or a
+#      deliberate non-ff merge on main):
+#        AIOS_ALLOW_PRIMARY_COMMIT=1 git commit ...
+#
+#   2. MACHINE-LOCAL CHAIN — after the guard passes (linked worktree, or the
+#      primary under the override), exec the machine-local hook at
+#      "$(git rev-parse --git-common-dir)/hooks/pre-commit" when present and
+#      executable. On NDA-configured machines that shim runs
+#      ~/.config/aios-nda/nda-leak-gate.sh staged — the NDA confidentiality
+#      gate. The common dir is shared by all worktrees, so one machine-local
+#      install covers every worktree. The chain runs under the override too:
+#      overriding the worktree guard NEVER skips the NDA gate.
+#      Missing/non-executable machine-local hook = skipped (contributors
+#      without the private NDA term list); the gate itself fails closed once
+#      installed.
+#
+# IMPORTANT implementation note: never resolve the chain target with
+# `git rev-parse --git-path hooks/...` — that helper honors core.hooksPath and
+# resolves straight back into .githooks/ (self-recursion / a dead target).
+# Resolve via --git-common-dir instead. As a second belt, any chain target
+# containing the "aios-tracked-hook" marker is skipped.
+
+set -euo pipefail
+
+DEFAULT_BRANCH="main"
+
+# ── Detect PRIMARY vs linked WORKTREE ──────────────────────────────────────
+# In the primary checkout, the git dir IS the common git dir.
+# In a linked worktree, the git dir is `<common>/worktrees/<name>` — different.
+git_dir="$(git rev-parse --absolute-git-dir 2>/dev/null || true)"
+common_dir="$(git rev-parse --git-common-dir 2>/dev/null || true)"
+
+# Normalize the common dir to an absolute path (it can be reported relative,
+# e.g. ".git", when invoked from the primary working tree root).
+if [[ -n "$common_dir" && "$common_dir" != /* ]]; then
+  common_dir="$(cd "$common_dir" 2>/dev/null && pwd || echo "$common_dir")"
+fi
+
+is_primary=0
+if [[ -n "$git_dir" && "$git_dir" == "$common_dir" ]]; then
+  is_primary=1
+fi
+
+if [[ "$is_primary" == "1" ]]; then
+  branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
+  if [[ "${AIOS_ALLOW_PRIMARY_COMMIT:-}" == "1" ]]; then
+    echo "[aios] AIOS_ALLOW_PRIMARY_COMMIT=1 set — allowing commit on '$branch' in the primary checkout." >&2
+  else
+    suggest_branch="$branch"
+    if [[ "$suggest_branch" == "$DEFAULT_BRANCH" || "$suggest_branch" == "HEAD" ]]; then
+      suggest_branch="feat/<short-task-name>"
+    fi
+    cat >&2 <<EOF
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  AIOS worktree guard: commit BLOCKED in the PRIMARY checkout                 │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+You are committing to branch '$branch' inside the PRIMARY checkout:
+  $(git rev-parse --show-toplevel 2>/dev/null)
+
+AIOS requires ALL work to live in a dedicated git worktree — the primary
+checkout must never carry an authored commit on ANY branch, including '$DEFAULT_BRANCH'.
+It should only ever advance via 'git merge --ff-only' from origin (which moves
+the ref without a commit and never triggers this hook). Do this instead:
+
+  aios worktree add $suggest_branch
+  cd ../$(basename "$(git rev-parse --show-toplevel 2>/dev/null)")-worktrees/${suggest_branch//\//-}
+  # then commit there
+
+If this really is an intentional primary-checkout commit (a rare hotfix, or a
+deliberate non-ff merge on '$DEFAULT_BRANCH'), re-run:
+
+  AIOS_ALLOW_PRIMARY_COMMIT=1 git commit ...
+
+EOF
+    exit 1
+  fi
+fi
+
+# ── Chain the machine-local hook (NDA leak gate) from the git common dir ────
+# Runs in linked worktrees AND in the primary under the override — the NDA
+# gate is never skippable via AIOS_ALLOW_PRIMARY_COMMIT.
+local_hook="$common_dir/hooks/pre-commit"
+if [[ -x "$local_hook" ]] && ! grep -q "aios-tracked-hook" "$local_hook" 2>/dev/null; then
+  exec "$local_hook" "$@"
+fi
+
+exit 0

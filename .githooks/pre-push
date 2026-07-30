@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# pre-push: block pushes that would drift the docs from the code.
+# aios-tracked-hook: pre-push — machine-local chain + docs-drift + skill-sync guards.
 #
 # Enabled via core.hooksPath=.githooks, set automatically by `npm install` (the
 # package.json "prepare" script). The brain repo is private on a free org plan, so
@@ -8,6 +8,28 @@
 set -euo pipefail
 
 repo_root="$(git rev-parse --show-toplevel)"
+
+# ── Machine-local chain (see .githooks/README.md) ──────────────────────────
+# core.hooksPath points git at this tracked dir, so `.git/hooks/` is IGNORED —
+# the machine-local pre-push installed there (on NDA-configured machines: the
+# NDA leak-gate `tree` scan) only runs because we chain it here. It runs FIRST
+# so the confidentiality gate can never be masked by a drift failure. Missing/
+# non-executable = skipped (contributors without the private NDA term list).
+# Resolve via --git-common-dir, NOT --git-path (which honors core.hooksPath and
+# would resolve back into .githooks/); skip anything carrying our own marker.
+common_dir="$(git rev-parse --git-common-dir)"
+if [ "${common_dir#/}" = "$common_dir" ]; then
+  common_dir="$(cd "$common_dir" && pwd)"
+fi
+local_hook="$common_dir/hooks/pre-push"
+if [ -x "$local_hook" ] && ! grep -q "aios-tracked-hook" "$local_hook" 2>/dev/null; then
+  echo "pre-push: running machine-local hook…"
+  if ! "$local_hook" "$@"; then
+    echo "" >&2
+    echo "pre-push: BLOCKED by the machine-local hook: $local_hook" >&2
+    exit 1
+  fi
+fi
 guard="$repo_root/scripts/check-docs-drift.mjs"
 
 if [ -f "$guard" ]; then
