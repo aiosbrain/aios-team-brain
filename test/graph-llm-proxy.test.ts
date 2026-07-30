@@ -84,12 +84,28 @@ describe("forwardUpstream — meters graph spend into llm_usage", () => {
     });
   });
 
-  it("does NOT meter a failed upstream call — no tokens were spent to record", async () => {
+  it("does not meter a failed call that carries NO usage — there is nothing to record", async () => {
     mockFetch(429, { error: { message: "insufficient_quota" } });
     const { db, rows } = captureDb();
     const res = await forwardUpstream(target, { messages: [] }, { meter: { db, teamId: "team-1", source: "graph", kind: "chat" } });
     expect(res.status).toBe(429); // the provider error still passes through untouched
     expect(rows).toHaveLength(0);
+  });
+
+  it("DOES meter a non-2xx that still carries `usage` — the provider billed it", async () => {
+    // This used to be gated on a 2xx, on the assumption that "only a successful call spent tokens".
+    // False: a provider can return usage alongside an error (a post-generation refusal, a partial),
+    // and that generation is billed. Measured on prod 2026-07-30 the ledger held $51.46 while
+    // OpenRouter's `/credits` reported $96.67 on the same key — spend the meter simply threw away.
+    mockFetch(400, {
+      error: { message: "content policy" },
+      usage: { prompt_tokens: 1200, completion_tokens: 300, cost: 0.0091 },
+    });
+    const { db, rows } = captureDb();
+    const res = await forwardUpstream(target, { messages: [] }, { meter: { db, teamId: "team-1", source: "graph", kind: "chat" } });
+    expect(res.status).toBe(400); // the provider error still passes through untouched
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ cost_usd: 0.0091, input_tokens: 1200, output_tokens: 300 });
   });
 
   it("never lets a metering failure break the proxy response", async () => {
