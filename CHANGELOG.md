@@ -4,9 +4,18 @@ All notable changes to AIOS Team Brain are documented here. Dates are ISO-8601.
 
 The Brain API sync contract (`docs/brain-api.md` in aios-workspace) is versioned
 separately. The current member-facing major remains **v1**, at additive document
-revision **v1.14**.
+revision **v1.15**.
 
 ## [Unreleased]
+
+### Added
+
+- **Workspace-governance health ingest (brain-api 1.15, AIO-609)** —
+  `POST /api/v1/codebases` accepts an optional, provenance-only
+  `metrics.codebase_health` object (scored scanner-side, persisted verbatim on
+  `code_metrics.codebase_health`, never recomputed; sparse or malformed pushes
+  are rejected 422). The codebase detail view surfaces the latest snapshot
+  (score, status, measured_at).
 
 ## [0.8.0] — 2026-07-28
 

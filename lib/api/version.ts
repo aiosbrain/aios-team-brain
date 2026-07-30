@@ -16,8 +16,10 @@
  * forgot. Changing the wire is the trigger to bump; the guard only stops the two drifting apart.
  *
  * 1.14 — `GET /api/v1/tasks?mode=table&keys=A,B`: the by-key lookup + `unknown_keys`.
+ * 1.15 — POST /api/v1/codebases accepts the optional, provenance-only
+ *        `metrics.codebase_health` object (AIO-609; persisted verbatim, never recomputed).
  */
-export const BRAIN_API_VERSION = "1.14";
+export const BRAIN_API_VERSION = "1.15";
 
 /** Server-only Executor gateway negotiation; independent of the member API surface. */
 export const GATEWAY_CONTRACT_VERSION = "1.10";

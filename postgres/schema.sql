@@ -1462,6 +1462,9 @@ create table if not exists code_metrics (
   readiness_pct numeric(5,2),                      -- % of all rubric checks passed
   readiness_pillars jsonb not null default '{}',   -- { pillarKey: {passed,total} }
   readiness_rubric_version text,                   -- which rubric version produced the score
+  -- Workspace-governance health snapshot (brain-api 1.15; AIO-609) — scored scanner-side,
+  -- persisted verbatim (closed scalar object incl. measured_at); null = not scored
+  codebase_health jsonb,
   created_at timestamptz not null default now(),
   unique (codebase_id, head_sha)
 );
@@ -1478,6 +1481,11 @@ alter table code_metrics add column if not exists readiness_rubric_version text;
 -- gains them on `pg:schema` (the create-table above is a no-op once the table exists).
 alter table code_metrics add column if not exists test_coverage_functions_pct numeric(5,2);
 alter table code_metrics add column if not exists test_coverage_branches_pct numeric(5,2);
+
+-- Workspace-governance health (brain-api 1.15; AIO-609) — added via alter so an
+-- already-deployed code_metrics gains it on `pg:schema` (mirror of
+-- postgres/migrations/20260730130000_code_metrics_codebase_health.sql).
+alter table code_metrics add column if not exists codebase_health jsonb;
 
 -- Keep `npm run pg:schema` safe for existing deployments that created
 -- code_metrics before AEM readiness fields were added. The table declaration
