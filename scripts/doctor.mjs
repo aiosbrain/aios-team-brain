@@ -101,9 +101,13 @@ export function checkAuthSecret(value) {
 }
 
 /**
- * SECRETS_KEY must decode to EXACTLY 32 bytes (AES-256-GCM). The classic mistake is
- * generating hex instead of base64: 64 hex chars decode as base64 to 48 bytes, which is
- * accepted by `Buffer.from` and then throws at the first connector save.
+ * SECRETS_KEY must decode to EXACTLY 32 bytes (AES-256-GCM), or the first connector save 500s.
+ *
+ * The decoding rule MUST match `decodeKey` in `lib/secrets/crypto.ts`, which accepts **either** 64
+ * hex characters **or** base64 — `test/secrets-key-rule.test.ts` asserts the two agree. An earlier
+ * version of this check assumed base64 only, so it decoded a perfectly valid 64-hex key as base64
+ * (48 bytes) and told the user to "convert" a key that already worked. Reporting a good config as
+ * broken is worse than not checking it at all.
  */
 export function checkSecretsKey(value) {
   if (!value) {
@@ -113,15 +117,15 @@ export function checkSecretsKey(value) {
       fix: `node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"`,
     };
   }
-  const bytes = Buffer.from(value, "base64").length;
+  const trimmed = String(value).trim();
+  const bytes = /^[0-9a-fA-F]{64}$/.test(trimmed)
+    ? Buffer.from(trimmed, "hex").length
+    : Buffer.from(trimmed, "base64").length;
   if (bytes !== 32) {
-    const hexish = /^[0-9a-f]+$/i.test(value);
     return {
       status: FAIL,
       detail: `SECRETS_KEY decodes to ${bytes} bytes, not 32`,
-      fix: hexish
-        ? "this looks like hex — it must be base64: node -e \"console.log(require('crypto').randomBytes(32).toString('base64'))\""
-        : `node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"`,
+      fix: `node -e "console.log(require('crypto').randomBytes(32).toString('base64'))" — 64 hex chars also works`,
     };
   }
   return { status: OK, detail: "32 bytes" };

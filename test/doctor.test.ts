@@ -43,13 +43,12 @@ describe("SECRETS_KEY — must decode to exactly 32 bytes", () => {
     expect(checkSecretsKey(randomBytes(32).toString("base64")).status).toBe(OK);
   });
 
-  it("FAILS the hex-instead-of-base64 mistake, and says so", () => {
-    // 64 hex chars is what the AUTH_SECRET one-liner produces; pasted here it decodes
-    // to 48 bytes and would throw only at the first connector save.
-    const hex = randomBytes(32).toString("hex");
-    const r = checkSecretsKey(hex);
-    expect(r.status).toBe(FAIL);
-    expect(r.fix).toMatch(/base64/i);
+  // This assertion used to be the opposite, and it was wrong: it claimed 64 hex chars were a
+  // "hex-instead-of-base64 mistake". lib/secrets/crypto.ts's decodeKey accepts hex OR base64, so
+  // doctor was failing a key the server uses happily. See test/secrets-key-rule.test.ts, which
+  // pins doctor's verdict to the server's for every shape.
+  it("accepts a 64-hex key, because the server does", () => {
+    expect(checkSecretsKey(randomBytes(32).toString("hex")).status).toBe(OK);
   });
 
   it("FAILS a wrong-width key rather than deferring the error to a 500", () => {

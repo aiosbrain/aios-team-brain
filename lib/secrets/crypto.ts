@@ -12,19 +12,44 @@ const IV_LEN = 12; // GCM standard nonce
 const TAG_LEN = 16;
 const KEY_LEN = 32; // AES-256
 
-/** Resolve the 32-byte key from `SECRETS_KEY` (base64 or hex). Throws if unusable. */
-export function secretsKey(): Buffer {
-  const raw = process.env.SECRETS_KEY;
+/**
+ * Is `SECRETS_KEY` usable? The same rule as `secretsKey()`, but it returns instead of throwing so
+ * boot can check it — where the answer is advisory (an install with no connectors never needs the
+ * key) and an exception would take the whole server down over an optional feature.
+ *
+ * This key's failure mode is uniquely late: nothing reads it until the FIRST connector save, so a
+ * missing or wrong-width value surfaces as a 500 in the Admin panel long after deploy, to someone
+ * who has just finished minting a token.
+ */
+export type SecretsKeyStatus =
+  | { ok: true }
+  | { ok: false; reason: "missing" | "wrong-length"; message: string };
+
+export function secretsKeyStatus(raw: string | undefined = process.env.SECRETS_KEY): SecretsKeyStatus {
   if (!raw) {
-    throw new Error("SECRETS_KEY is required to store/read connector secrets (32 bytes, base64 or hex).");
+    return {
+      ok: false,
+      reason: "missing",
+      message: "SECRETS_KEY is required to store/read connector secrets (32 bytes, base64 or hex).",
+    };
   }
   const key = decodeKey(raw);
-  if (key.length !== KEY_LEN) {
-    const length = key.length;
-    key.fill(0);
-    throw new Error(`SECRETS_KEY must decode to ${KEY_LEN} bytes (got ${length}).`);
-  }
-  return key;
+  const length = key.length;
+  key.fill(0); // don't leave key material in a buffer we're discarding
+  return length === KEY_LEN
+    ? { ok: true }
+    : {
+        ok: false,
+        reason: "wrong-length",
+        message: `SECRETS_KEY must decode to ${KEY_LEN} bytes (got ${length}).`,
+      };
+}
+
+/** Resolve the 32-byte key from `SECRETS_KEY` (base64 or hex). Throws if unusable. */
+export function secretsKey(): Buffer {
+  const status = secretsKeyStatus();
+  if (!status.ok) throw new Error(status.message);
+  return decodeKey((process.env.SECRETS_KEY as string).trim());
 }
 
 function decodeKey(raw: string): Buffer {
