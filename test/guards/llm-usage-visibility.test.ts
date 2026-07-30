@@ -3,7 +3,7 @@ import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 
 /**
- * llm_usage row-scoping guard (CLAUDE.md §5). In postgres mode there is no RLS, so any read of
+ * llm_usage + llm_failures row-scoping guard (CLAUDE.md §5). In postgres mode there is no RLS, so any read of
  * `llm_usage` that renders to a viewer MUST scope rows in app code via `scopeLlmUsage` — a non-admin
  * sees only spend THEY initiated, an admin sees the team (incl. null-member background). Same bug
  * class as the earlier `query_log` leak; this fails the build if a dashboard page or metrics module
@@ -15,7 +15,9 @@ import { join } from "node:path";
 const ROOT = join(import.meta.dirname, "..", "..");
 const SCAN_DIRS = [join(ROOT, "app", "t"), join(ROOT, "lib", "metrics")];
 const SCOPE = /scopeLlmUsage\s*\(/;
-const READS_LLM_USAGE = /from\(\s*["']llm_usage["']\s*\)/;
+// Covers the spend ledger AND its failure sidecar: a surface reading `llm_failures` unscoped
+// would leak which background/other-member work failed, the same class of leak this guards.
+const READS_LLM_USAGE = /from\(\s*["'](llm_usage|llm_failures)["']\s*\)/;
 const OPT_OUT = /llm-usage-scope-ok:/;
 
 function walk(dir: string, out: string[] = []): string[] {

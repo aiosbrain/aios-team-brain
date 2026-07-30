@@ -53,10 +53,22 @@ describe("authorizeGraphProxy — fails closed", () => {
  */
 describe("forwardUpstream — meters graph spend into llm_usage", () => {
   const target = { url: "https://prov/api/v1/chat/completions", headers: {}, model: "qwen/x", provider: "openrouter" };
+  // Table-AWARE on purpose. The original fake pushed every insert into one array, so a row written to
+  // the failure sidecar was indistinguishable from a spend row — a test asserting "nothing was metered"
+  // would have passed while money was recorded, or failed while only a failure was. The two tables mean
+  // different things; the double has to know which one it is holding.
   const captureDb = () => {
-    const rows: Record<string, unknown>[] = [];
-    const db = { from: () => ({ insert: async (r: Record<string, unknown>) => { rows.push(r); return { error: null }; } }) } as never;
-    return { db, rows };
+    const rows: Record<string, unknown>[] = []; // llm_usage — money
+    const failures: Record<string, unknown>[] = []; // llm_failures — billed attempts we can't price
+    const db = {
+      from: (table: string) => ({
+        insert: async (r: Record<string, unknown>) => {
+          (table === "llm_failures" ? failures : rows).push(r);
+          return { error: null };
+        },
+      }),
+    } as never;
+    return { db, rows, failures };
   };
   const mockFetch = (status: number, bodyObj: unknown) =>
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
@@ -67,10 +79,13 @@ describe("forwardUpstream — meters graph spend into llm_usage", () => {
 
   it("records a `graph` row with the provider-reported cost on a successful extraction", async () => {
     mockFetch(200, { choices: [{ message: { content: "{}" } }], usage: { prompt_tokens: 900, completion_tokens: 40, cost: 0.0042 } });
-    const { db, rows } = captureDb();
+    const { db, rows, failures } = captureDb();
     const res = await forwardUpstream(target, { messages: [] }, { meter: { db, teamId: "team-1", source: "graph", kind: "chat" } });
     expect(res.status).toBe(200);
     expect(rows).toHaveLength(1);
+    // The split pinned from the other side: a priced call must NOT also be filed as an unpriceable
+    // attempt, or the page double-counts it as both a call and a failure.
+    expect(failures).toHaveLength(0);
     expect(rows[0]).toMatchObject({
       team_id: "team-1",
       source: "graph",
@@ -84,12 +99,30 @@ describe("forwardUpstream — meters graph spend into llm_usage", () => {
     });
   });
 
-  it("does not meter a failed call that carries NO usage — there is nothing to record", async () => {
+  it("does not meter a failed call that carries NO usage — but no longer loses it in silence", async () => {
     mockFetch(429, { error: { message: "insufficient_quota" } });
-    const { db, rows } = captureDb();
+    const { db, rows, failures } = captureDb();
     const res = await forwardUpstream(target, { messages: [] }, { meter: { db, teamId: "team-1", source: "graph", kind: "chat" } });
     expect(res.status).toBe(429); // the provider error still passes through untouched
+    expect(rows).toHaveLength(0); // nothing priceable arrived, so no dollars are invented
+    // …and the attempt is filed instead of vanishing. Silence here is how the Costs page ended up
+    // reporting 45% of spend as an anonymous remainder.
+    expect(failures).toHaveLength(1);
+    expect(failures[0]).toMatchObject({ team_id: "team-1", source: "graph", failure_reason: "http_429" });
+  });
+
+  it("files an ABORTED call as `timeout` — our deadline, not the provider's fault", async () => {
+    // The 2026-07-29 shape: the model generated, our own ceiling fired, the provider billed, and the
+    // ledger recorded nothing. `timeout` vs `network` is the distinction that assigns the blame.
+    const abort = Object.assign(new Error("aborted"), { name: "AbortError" });
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(abort);
+    const { db, rows, failures } = captureDb();
+    await expect(
+      forwardUpstream(target, { messages: [] }, { meter: { db, teamId: "team-1", source: "graph", kind: "chat" } })
+    ).rejects.toThrow();
     expect(rows).toHaveLength(0);
+    expect(failures).toHaveLength(1);
+    expect(failures[0]).toMatchObject({ source: "graph", failure_reason: "timeout", provider: "openrouter" });
   });
 
   it("DOES meter a non-2xx that still carries `usage` — the provider billed it", async () => {

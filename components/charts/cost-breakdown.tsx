@@ -53,7 +53,16 @@ export function CostBreakdownChart({
               const p = entry?.payload as CostSlice | undefined;
               const calls = p ? ` · ${p.calls} call${p.calls === 1 ? "" : "s"}` : "";
               const est = p?.estimated ? " · estimated" : "";
-              return [`${usd(Number(value))}${calls}${est}`, "cost"];
+              // Billed attempts that returned nothing to price. Shown HERE, next to the feature that
+              // made them, because "which feature lost the money" is the entire point of recording
+              // them — a total with no attribution is the anonymous remainder this replaced. A
+              // failure-only feature renders as a $0 bar, which without this reads as an unexplained
+              // empty row.
+              const failed =
+                p && p.failed_attempts > 0
+                  ? ` · ${p.failed_attempts} failed attempt${p.failed_attempts === 1 ? "" : "s"}`
+                  : "";
+              return [`${usd(Number(value))}${calls}${est}${failed}`, "cost"];
             }}
           />
           <Bar dataKey="cost_usd" radius={[0, 4, 4, 0]} maxBarSize={26}>
