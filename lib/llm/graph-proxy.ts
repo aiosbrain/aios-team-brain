@@ -190,7 +190,26 @@ export function forwardBody(
   // sanctioned transport (`lib/llm/complete`, `lib/chat/title`, `lib/query/claude`): today's model
   // returns cost regardless, but a different OpenRouter model can omit it unless asked, so we don't
   // leave graph metering — the largest consumer — depending on that quirk. Harmless elsewhere.
-  if (provider === "openrouter") forwarded.usage = { include: true };
+  if (provider === "openrouter") {
+    forwarded.usage = { include: true };
+    // REASONING OFF. Entity/edge extraction is a schema-constrained transformation — the model emits a
+    // JSON object against a supplied schema — so chain-of-thought buys nothing and is charged at the
+    // OUTPUT rate, the expensive one. `lib/llm/complete.ts` has disabled it for extraction-type calls
+    // for exactly this reason; this transport mirrored that function's `usage` line and missed the one
+    // beside it, which left the graph leg — 99% of the brain's LLM spend — as the only OpenRouter path
+    // still paying to think out loud. Measured on the live proxy: 473 of 529 completion tokens on a
+    // trivial extraction prompt were reasoning tokens (89%).
+    //
+    // Unconditional here, unlike `complete.ts`, which keeps reasoning for a genuinely distinct
+    // reasoning-role model: there is no extraction task that wants it. Ignored by non-reasoning models.
+    // `LLM_DISABLE_REASONING=0` overrides — the same escape hatch `complete.ts` honours (the only other
+    // transport that sends this flag at all), so the override is one global switch rather than two.
+    //
+    // Measured through the deployed proxy on Graphiti's real schemas, n=3 per arm: extract-nodes
+    // 2398-2881 completion tokens (~87% reasoning) -> 409-522, ~4.2x cheaper per call; dedupe 582-728
+    // -> 94-109, ~3.5x cheaper with IDENTICAL resolutions 3/3.
+    if (process.env.LLM_DISABLE_REASONING !== "0") forwarded.reasoning = { enabled: false };
+  }
   return forwarded;
 }
 
@@ -229,11 +248,23 @@ export async function graphProxyWithinRateLimit(db: DbClient): Promise<boolean> 
   return rateLimit(db, "graph-llm-proxy", PROXY_CALLS_PER_MINUTE);
 }
 
-/** Resolve the chat target from the team's console settings. */
+/**
+ * Resolve the chat target from the team's console settings.
+ *
+ * Uses the **extraction** role, so Admin → "Extraction model" governs the graph leg when it's set and
+ * the answering model governs it when it isn't (every install's behaviour before that setting existed).
+ * This is where 99% of the brain's LLM spend is decided: extraction is mechanical and schema-constrained,
+ * so a cheap structured-output model belongs here while the Query box keeps a strong one — before the
+ * role existed, one dropdown had to serve both and the graph inherited a reasoning model at $4.425/M out.
+ */
 export async function resolveGraphChatTarget(db: DbClient, teamId: string): Promise<ProxyTarget | ProxyRefusal> {
   const keys = await resolveAnsweringKeys(db, teamId);
   return graphChatTarget(
-    selectLlmBackend({ LLM_BASE_URL: process.env.LLM_BASE_URL, LLM_MODEL: process.env.LLM_MODEL }, keys)
+    selectLlmBackend(
+      { LLM_BASE_URL: process.env.LLM_BASE_URL, LLM_MODEL: process.env.LLM_MODEL },
+      keys,
+      { role: "extraction" }
+    )
   );
 }
 
