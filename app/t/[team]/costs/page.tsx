@@ -155,11 +155,34 @@ export default async function CostsPage({
               </strong>{" "}
               {usd(reconciliation.unattributedUsd)} (
               {Math.round(reconciliation.unattributedFraction * 100)}%) can&apos;t be attributed to a
-              feature, so the breakdown below is a <strong>floor</strong>, not the total. Usually that is
-              a call that timed out or failed after the model had already generated — billed by the
-              provider, but returning no usage for the brain to record. It also covers any spend on this
-              key from outside this instance. Both figures are lifetime for the key, not the selected
-              window.
+              feature, so the breakdown below is a <strong>floor</strong>, not the total. Three things
+              land here:
+              <ul className="mt-1.5 list-disc space-y-1 pl-5">
+                <li>
+                  <strong>Spend from before metering existed.</strong> Anything the provider billed before
+                  this ledger&apos;s first metered call
+                  {/* The ledger's earliest row across ALL providers, while the comparison above is scoped
+                      to this one — so on a team whose first metered calls were another provider's, this
+                      date is earlier than OpenRouter coverage actually began. Phrased as "the ledger's
+                      first call" rather than "coverage of this key started here", which stays true either
+                      way; tightening it would cost a provider-scoped query for a one-word gain. */}
+                  {breakdown.trackingSince ? ` (${fmtDay(breakdown.trackingSince)})` : ""} is in its
+                  lifetime total and can never enter ours.
+                </li>
+                <li>
+                  <strong>Calls billed after the model generated but returning no usage</strong> — a
+                  timeout, a dropped connection. Nothing to price, so nothing to record. Where we
+                  instrument them, these are <em>counted per feature</em> as failed attempts below.
+                </li>
+                <li>
+                  <strong>Any spend on this key from outside this instance.</strong>
+                </li>
+              </ul>
+              Because the first can never be recovered, <strong>the dollar gap here has a floor</strong>:
+              new spend dilutes the percentage, but nothing ever clears the amount. So the percentage is
+              not the signal — a high one is not itself a problem, and a falling one is just arithmetic.
+              What matters is whether the <strong>dollars grow</strong>, which means spend is escaping the
+              meter now. Both figures are lifetime for the key, not the selected window.
             </>
           ) : reconciliation.status === "ledger-exceeds" ? (
             <>
