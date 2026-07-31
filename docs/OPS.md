@@ -98,7 +98,8 @@ must stay `true`). Result: CodeRabbit auto-reviews only PRs carrying the label.
    ```
 
 2. Apply it when no local reviewer (Local Bugbot / Fable) was available for the PR, or whenever an
-   extra automated pass is wanted. It never blocks — only the required CI checks gate a merge.
+   extra automated pass is wanted. This label is also the sanctioned way to satisfy the required
+   review gate (`pr-review-gate.yml`) when no local reviewer could run — see CLAUDE.md §"Review gate".
 3. After any later push, comment `@coderabbitai review`; the label does not trigger incremental
    reviews while `auto_incremental_review: false`.
 4. Prefer substantive comments/reviews created at or after the latest PR commit as evidence. A

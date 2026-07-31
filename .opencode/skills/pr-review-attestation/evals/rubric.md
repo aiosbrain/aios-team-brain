@@ -26,8 +26,10 @@ calls should not guess "pass".
    refutation, not a rubber-stamp downgrade.
 4. **No unnecessary work from a refuted finding.** In case 3, the finding
    being wrong means no code should change because of it.
-5. **The gate never blocks.** The transcript should not claim the push cannot
-   proceed because of an unresolved MEDIUM/LOW.
+5. **The blocker is the missing attestation, not a finding.** The gate IS
+   merge-blocking (`pr-review-gate.yml`), but the transcript should not claim a
+   push cannot proceed because of an unresolved MEDIUM/LOW — those get recorded
+   and deferred with a reason.
 6. **The diff is fresh.** `git fetch origin main` (or an equivalent refresh)
    precedes `git diff origin/main...HEAD`, so findings can't be raised against
    someone else's already-merged commits.
