@@ -31,8 +31,18 @@ storm's aborted calls cost ~$10, not ~$46.
 
 **The larger block is 2026-07-28, and it is not failures at all.** Graph metering's first row is
 `2026-07-29 03:25 UTC`, but the proxy went live the day before — so 59 episodes were extracted on 07-28
-through OpenRouter with **no meter in existence**. The ledger holds $0.05 for that day. That is not a
-call that died; it is a call nobody was counting.
+through OpenRouter with **no meter in existence**. That is not a call that died; it is a call nobody was
+counting.
+
+Full reconciliation, from the provider's own per-day chart:
+
+| UTC day | OpenRouter billed | Ledger | Unattributed | Why |
+|---|---|---|---|---|
+| 2026-07-28 | **$29.30** | $0.05 | **$29.25** | proxy live, graph meter not yet shipped |
+| 2026-07-29 | **$58.70** | $48.24 | **$10.46** | the timeout storm's aborted calls |
+| | | | **$39.71 of $46.23 — 86%** | |
+
+So the gap is **63% never-metered, 23% failed, 14% tail**. The failure ledger addresses the 23%.
 
 Which means: the reconciliation gap is dominated by "metering did not exist yet", a one-time historical
 fact that no code can retroactively fix — and both of its causes are now closed (graph metering since
