@@ -24,6 +24,8 @@ AIOS-Work: <!-- e.g. AIO-72 -->
 
 ## Review summary
 
-<!-- One line: Reviewed by <Local Bugbot|Fable|CodeRabbit> — verdict …
+<!-- REQUIRED (pr-review-gate.yml). Replace this comment with one line, e.g.
+       Reviewed by Fable — verdict no blockers, 1 LOW deferred
+     Keep the `Reviewed by … — verdict …` shape; fill in BOTH sides.
      No local reviewer available? Apply the `ready-for-review` label (triggers CodeRabbit).
      After a fix push, refresh CodeRabbit with `@coderabbitai review` (incremental review is off). -->

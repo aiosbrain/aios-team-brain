@@ -66,6 +66,16 @@ flowchart TD
 
 The four required jobs (`docs-drift`, `brain-tests`, `datamechanics-tests`, `ingestion-tests`) must pass for a PR to merge (enforced via branch protection). `http-tests` runs `continue-on-error` (advisory) until it proves stable — see Branch Protection below.
 
+### `pr-review-gate.yml` — the review gate (REQUIRED)
+
+Fails a non-draft PR whose body records no `Reviewed by … — verdict …` line and which carries no
+`ready-for-review` label. Drafts are skipped and it re-runs on `ready_for_review`, so a draft can be
+pushed freely. The matcher is `scripts/pr-review-gate.mjs` (unit-tested in `test/pr-review-gate.test.ts`)
+— deliberately permissive about FORM (heading level, emphasis, bare line, any dash, NBSP, CRLF) and
+strict only about SUBSTANCE, because a gate that rejects honest attestations gets switched off. Text
+inside fenced blocks and HTML comments is ignored, so quoting the template neither satisfies nor poisons
+the check. Reads only the event payload — no secrets, no network. See CLAUDE.md §"Review gate".
+
 ### `aios-work-sync.yml` — fires on merge to `main`
 
 Extracts work keys from the PR **title, body and branch ref** and POSTs a merge event to `/api/v1/work-events`. This closes the matching issue in the team's primary PM tool automatically — currently **Linear** (the brain projects the merge event to whichever provider `teams.primary_pm_provider` names; the sync path itself is provider-neutral).
@@ -91,8 +101,9 @@ The team is small and members use different local reviewers — **John runs Loca
 **Chetan runs Fable** (`Agent(subagent_type: "code-reviewer", model: "fable")` from the
 `aios-workspace` ship tooling). Whichever ran is the local evidence, recorded as one line in the
 PR body. Local review evidence is scoped to the branch head it reviewed — treat it as stale after
-a fix commit or base movement. **None of this blocks a push or merge; only the required CI checks
-do.**
+a fix commit or base movement. **Recording it is required**: `pr-review-gate.yml` fails a non-draft
+PR that carries neither an attestation line nor the `ready-for-review` label. Which reviewer ran is
+flexible; recording one is not.
 
 CodeRabbit runs outside GitHub Actions and posts to the PR conversation. `.coderabbit.yaml` keeps
 `auto_review.enabled: true` but restricts it with `labels: [ready-for-review]` — auto-review fires
@@ -142,6 +153,9 @@ If you add an API route, table, or ingest source, update the corresponding `<!--
 Repo: `aiosbrain/aios-team-brain` → Settings → Branches → `main`
 
 - [x] Require status checks: `docs-drift`, `brain-tests`, `datamechanics-tests`, `ingestion-tests`
+- [ ] `PR records a diff review` (`pr-review-gate.yml`) — **add this to required status checks.** Until
+      it is, the job goes red on an unattested PR but the PR stays mergeable, and the gate is a
+      convention again. This box is the whole enforcement.
 - [ ] `http-tests` — currently advisory (`continue-on-error`). Graduate to required after 5 consecutive green runs on `main`: drop `continue-on-error` in `ci.yml` and add it to this list.
 - [x] Require branches to be up to date before merging
 - [x] Dismiss stale reviews on new pushes

@@ -1,0 +1,76 @@
+name: PR review gate
+
+# Enforces CLAUDE.md §"Review gate": every PR must record WHAT reviewed its diff, as a
+#   ## Review — Reviewed by <tool> — verdict <one-line summary>
+# line in the body — or hand the review to CodeRabbit with the `ready-for-review` label.
+#
+# Why a check and not a convention: the convention existed and was honoured only when someone
+# remembered. CLAUDE.md §2 — "a single writer + a build-failing guard > discipline you have to
+# remember." Drafts are skipped (you push a draft before reviewing it) and the job re-runs on
+# `ready_for_review`, so nothing merges unattested.
+#
+# The matcher lives in `scripts/pr-review-gate.mjs` and is unit-tested. Inline heredoc logic is how
+# `pr-task-link.yml` shipped a parser that read a response shape the API never returns — a gate that is
+# itself unverified either blocks honest PRs or waves everything through, and nobody finds out which.
+#
+# ⛔ STAYS ON `pull_request`. NEVER `pull_request_target`.
+# Be accurate about what this executes: on `pull_request`, `actions/checkout` gives us the PR's MERGE
+# commit, so the `scripts/pr-review-gate.mjs` that runs IS the PR's copy. A PR can therefore edit the
+# matcher (or this workflow) to pass itself — inherent to every `pull_request`-triggered check, the same
+# way a PR can edit its own tests. It is acceptable here because the job takes NO secrets, has only a
+# `contents: read` token, and makes no network calls, so there is nothing to steal; the change is
+# visible in the diff and CODEOWNERS review is the backstop. Do NOT "fix" this by reaching for
+# `pull_request_target` — that hands a fork's script the base repo's token and secrets, the textbook
+# pwn-request spelled out in pr-task-link.yml.
+on:
+  pull_request:
+    types:
+      - opened
+      - edited
+      - reopened
+      - synchronize
+      - labeled
+      - unlabeled
+      - ready_for_review
+      - converted_to_draft
+
+permissions:
+  contents: read
+
+jobs:
+  review-attested:
+    name: PR records a diff review
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check for a review attestation
+        run: |
+          node <<'NODE'
+          (async () => {
+            const fs = require("node:fs");
+            const { evaluatePr, FAIL_MESSAGE } = await import("./scripts/pr-review-gate.mjs");
+            const ev = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, "utf8"));
+            const verdict = evaluatePr(ev.pull_request || {});
+
+            if (verdict.status === "skip") {
+              console.log("Draft PR — review gate deferred until it is marked ready for review.");
+              return;
+            }
+            if (verdict.status === "pass") {
+              if (verdict.reason === "coderabbit-label") {
+                console.log("No local review recorded, but `ready-for-review` is set — CodeRabbit reviews this PR.");
+              } else {
+                console.log(`Diff reviewed by: ${verdict.tool}\nVerdict: ${verdict.verdict}`);
+              }
+              return;
+            }
+            // Fail LOUD and actionable. A gate whose message doesn't say how to satisfy it just gets
+            // bypassed by relabelling.
+            console.log(`::error title=No diff review recorded::${FAIL_MESSAGE[verdict.reason]}`);
+            process.exitCode = 1;
+          })().catch((err) => {
+            // An error in the GATE must not silently pass the PR it was meant to check.
+            console.log(`::error title=Review gate errored::${err && err.message}`);
+            process.exitCode = 1;
+          });
+          NODE

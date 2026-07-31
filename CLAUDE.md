@@ -26,23 +26,32 @@ who reads it**. The map only pays off if it's trustworthy, so:
 
 ---
 
-## Review gate — local review before pushing a PR (flexible, non-blocking)
+## Review gate — a local review of the diff is REQUIRED before you push ⚠️
 
 Many sessions/worktrees ship into this repo in parallel and merge fast — a pre-push review of the
-branch diff catches tier leaks, sync-contract drift, and correctness bugs before they land. We are
-a small team on different local tools, so the gate is **tool-flexible and never blocks a push**:
+branch diff catches tier leaks, sync-contract drift, and correctness bugs before they land. It keeps
+catching the class of defect the author structurally cannot see: the **second-order bug introduced by
+their own fix**, and the **call site that nothing pins** (a helper with a dozen green tests whose
+wiring could be deleted with every one of them still passing). So this is not advisory:
 
-- **Before you `git push` a PR branch:** review `git diff origin/main...HEAD` with whichever local
-  reviewer you have — **Local Bugbot** (John, via Cursor) or a **Fable `code-reviewer` run**
-  (Chetan — `Agent(subagent_type: "code-reviewer", model: "fable")`). Any equivalent local diff
-  review counts; use what's available.
+- **Before you `git push` a PR branch:** review `git diff origin/main...HEAD` with a local reviewer —
+  **Fable `code-reviewer`** (Chetan — `Agent(subagent_type: "code-reviewer", model: "fable")`) or
+  **Local Bugbot** (John, via Cursor). The gate is **tool-flexible but not optional**: any equivalent
+  local diff review counts, skipping it does not.
 - **Address blocker/HIGH findings before pushing**; fix or consciously defer MEDIUM/LOW with a
-  one-line reason.
-- **Record what reviewed the diff in the PR body** — one `## Review — Reviewed by <tool> — verdict …`
-  line so it's auditable. If no local reviewer was available, say so and apply the
-  `ready-for-review` label so CodeRabbit reviews the PR instead.
-- The local review examines the **diff you're about to ship**, not the bots' comments. It
-  complements CI and label-gated CodeRabbit; only the required CI checks block a merge.
+  one-line reason in the PR body.
+- **Record what reviewed the diff in the PR body** — exactly one line:
+  `## Review — Reviewed by <tool> — verdict <one-line summary>`. **Never write that line for a review
+  that didn't run** — a fabricated attestation is worse than an absent one, because it launders the
+  gap. The `pr-review-attestation` skill walks the whole flow.
+- **If no local reviewer is available:** say so, and apply the **`ready-for-review`** label so
+  CodeRabbit reviews the PR instead. That is the sanctioned alternative — silence is not.
+- **Enforced in CI.** `.github/workflows/pr-review-gate.yml` fails a non-draft PR that records neither
+  an attestation nor the `ready-for-review` label (matcher: `scripts/pr-review-gate.mjs`, unit-tested;
+  an unedited `<tool>` placeholder is rejected, because shape alone is not a check). Drafts are
+  skipped — push a draft freely; the gate re-runs when you mark it ready.
+- The local review examines the **diff you're about to ship**, not the bots' comments; it complements
+  CI and label-gated CodeRabbit rather than replacing either.
 
 ---
 

@@ -23,9 +23,13 @@ single reviewer pass to raise a false-positive HIGH finding that triggers
 unnecessary rework. This skill packages the gate exactly as documented and adds
 a second, independent check before treating any HIGH finding as real.
 
-This gate is **flexible and never blocks a push** — it complements CI and
-label-gated CodeRabbit; only required CI checks actually block a merge. Never
-refuse to push because of an unresolved MEDIUM/LOW finding.
+This gate is **tool-flexible but REQUIRED** — any equivalent local diff review
+counts, skipping it does not. `.github/workflows/pr-review-gate.yml` fails a
+non-draft PR carrying neither an attestation line nor the `ready-for-review`
+label, so the attestation is now a merge-blocking check rather than a habit.
+It complements CI and label-gated CodeRabbit rather than replacing either.
+Still never refuse to push over an unresolved MEDIUM/LOW finding — record it
+and move on; only blocker/HIGH findings hold a push.
 
 ## When this runs
 
@@ -125,9 +129,12 @@ genuinely done.
 
 ## Boundaries
 
-- Never treat this as a merge blocker — CLAUDE.md is explicit that the gate
-  never blocks a push. Report unresolved MEDIUM/LOW findings; don't refuse to
-  proceed over them.
+- The gate IS merge-blocking (`pr-review-gate.yml`), but the blocker is the
+  missing *attestation*, not an unresolved MEDIUM/LOW finding. Report those and
+  proceed; don't refuse to push over them.
+- Satisfy it honestly or take the labelled path. Adding `ready-for-review`
+  because no reviewer was available is sanctioned; adding it to silence a red
+  check after skipping a review you could have run is not.
 - Never write the `## Review — Reviewed by …` line without a review subagent
   actually having run against the current diff in this session.
 - Adversarial verification is per-finding — never batch-refute a whole review
