@@ -822,8 +822,11 @@ auto-loads `.env.local`. Run `set -a; . ./.env.local; set +a` first.
 looks complete while the value is blank. Generate one with
 `node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"`.
 
-`npm run doctor` catches this before you go make a token — including the common near-miss of pasting
-64 hex characters, which decodes to 48 bytes rather than 32.
+Either encoding works — **64 hex characters or base64**, as long as it decodes to 32 bytes.
+
+You no longer have to reach a 500 to find out. `npm run doctor` checks it before you go make a
+token, and the server now logs a `[boot]` warning naming the problem when it starts, so a bad key
+shows up in the deploy logs rather than in the Admin panel an hour later.
 
 ### Graph accepts everything but no facts appear — arcs blank
 

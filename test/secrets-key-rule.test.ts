@@ -1,0 +1,81 @@
+// Spec: `npm run doctor` must agree with the server about whether SECRETS_KEY is usable.
+//
+// This test exists because they DIDN'T. doctor decoded the value as base64 only, while the app's
+// `decodeKey` accepts 64 hex characters too — so a valid hex key was reported as "48 bytes, not 32"
+// with advice to convert a key that already worked. A checker that fails a good config is worse
+// than no checker: it sends people to change the one thing that wasn't broken.
+//
+// The assertions below compare doctor's verdict against the REAL implementation for the same
+// inputs, so the two cannot drift apart again.
+import { randomBytes } from "node:crypto";
+import { describe, expect, it } from "vitest";
+import { checkSecretsKey } from "../scripts/doctor.mjs";
+import { secretsKeyStatus } from "../lib/secrets/crypto";
+
+/** Every shape a real deployment might hold, valid or not. */
+const CASES: { name: string; value: string; usable: boolean }[] = [
+  { name: "base64 of 32 bytes (what the docs tell you to generate)", value: randomBytes(32).toString("base64"), usable: true },
+  { name: "64 hex chars (the AUTH_SECRET one-liner's output — also valid here)", value: randomBytes(32).toString("hex"), usable: true },
+  { name: "base64 with surrounding whitespace (copy-paste artefact)", value: `  ${randomBytes(32).toString("base64")}\n`, usable: true },
+  { name: "base64 of 16 bytes (too short)", value: randomBytes(16).toString("base64"), usable: false },
+  { name: "base64 of 64 bytes (too long)", value: randomBytes(64).toString("base64"), usable: false },
+  { name: "32 hex chars (16 bytes — right alphabet, wrong length)", value: randomBytes(16).toString("hex"), usable: false },
+  { name: "obviously not a key", value: "changeme", usable: false },
+];
+
+describe("doctor's SECRETS_KEY rule matches the server's", () => {
+  it.each(CASES)("$name", ({ value, usable }) => {
+    const appAccepts = secretsKeyStatus(value).ok;
+    const doctorAccepts = checkSecretsKey(value).status === "ok";
+
+    expect(appAccepts).toBe(usable); // the app behaves as specified
+    expect(doctorAccepts).toBe(appAccepts); // and doctor agrees with the app
+  });
+
+  it("regression: a 64-hex key is accepted by BOTH — it used to fail doctor only", () => {
+    const hex = randomBytes(32).toString("hex");
+    expect(secretsKeyStatus(hex).ok).toBe(true);
+    expect(checkSecretsKey(hex).status).toBe("ok");
+  });
+
+  it("never advises converting a key the server already accepts", () => {
+    const hex = randomBytes(32).toString("hex");
+    expect(checkSecretsKey(hex).fix).toBeUndefined();
+  });
+});
+
+describe("secretsKeyStatus — the boot check", () => {
+  it("reports missing separately from wrong-length, so boot can say which", () => {
+    expect(secretsKeyStatus(undefined)).toMatchObject({ ok: false, reason: "missing" });
+    expect(secretsKeyStatus("")).toMatchObject({ ok: false, reason: "missing" });
+    expect(secretsKeyStatus(randomBytes(16).toString("base64"))).toMatchObject({
+      ok: false,
+      reason: "wrong-length",
+    });
+  });
+
+  it("names the actual byte count, so the message is diagnostic rather than generic", () => {
+    const status = secretsKeyStatus(randomBytes(16).toString("base64"));
+    expect(status.ok).toBe(false);
+    if (!status.ok) expect(status.message).toMatch(/got 16/);
+  });
+
+  it("does not throw on any input — boot must never die on an optional feature's config", () => {
+    for (const v of [undefined, "", "!!!", "x".repeat(1000), "\0"]) {
+      expect(() => secretsKeyStatus(v)).not.toThrow();
+    }
+  });
+
+  it("defaults to reading process.env.SECRETS_KEY", () => {
+    const prev = process.env.SECRETS_KEY;
+    try {
+      process.env.SECRETS_KEY = randomBytes(32).toString("base64");
+      expect(secretsKeyStatus().ok).toBe(true);
+      process.env.SECRETS_KEY = "too-short";
+      expect(secretsKeyStatus().ok).toBe(false);
+    } finally {
+      if (prev === undefined) delete process.env.SECRETS_KEY;
+      else process.env.SECRETS_KEY = prev;
+    }
+  });
+});

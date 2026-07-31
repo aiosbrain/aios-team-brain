@@ -18,6 +18,25 @@ export async function register() {
 
   // Background pollers only run in the Node.js server runtime (not edge, not build).
   if (process.env.NEXT_RUNTIME !== "nodejs") return;
+
+  // Say something at boot about SECRETS_KEY, which is otherwise read for the first time when a
+  // connector secret is SAVED — so a missing or wrong-width value has always surfaced as a 500 in
+  // Admin → Integrations, hours after deploy, to whoever had just finished minting a token.
+  //
+  // A warning, deliberately, not a throw: the key is only needed for connectors and plenty of
+  // installs never add one, so failing boot would turn an optional feature's misconfiguration into
+  // a total outage. Loud enough to find in deploy logs, ignorable if you don't use connectors.
+  const { secretsKeyStatus } = await import("@/lib/secrets/crypto");
+  const keyStatus = secretsKeyStatus();
+  if (!keyStatus.ok) {
+    console.warn(
+      `[boot] ${keyStatus.message} Connector secrets cannot be saved or read until this is fixed ` +
+        `(Admin → Integrations will 500). Generate one with: ` +
+        `node -e "console.log(require('crypto').randomBytes(32).toString('base64'))" — ` +
+        `everything else works without it.`
+    );
+  }
+
   if (process.env.INGEST_POLL_ENABLED !== "false") {
     const { startIngestScheduler } = await import("@/lib/ingest/scheduler");
     startIngestScheduler();
