@@ -152,14 +152,34 @@ If you add an API route, table, or ingest source, update the corresponding `<!--
 
 Repo: `aiosbrain/aios-team-brain` → Settings → Branches → `main`
 
-- [x] Require status checks: `docs-drift`, `brain-tests`, `datamechanics-tests`, `ingestion-tests`
-- [ ] `PR records a diff review` (`pr-review-gate.yml`) — **add this to required status checks.** Until
-      it is, the job goes red on an unattested PR but the PR stays mergeable, and the gate is a
-      convention again. This box is the whole enforcement.
-- [ ] `http-tests` — currently advisory (`continue-on-error`). Graduate to required after 5 consecutive green runs on `main`: drop `continue-on-error` in `ci.yml` and add it to this list.
-- [x] Require branches to be up to date before merging
-- [x] Dismiss stale reviews on new pushes
-- [x] Require review from code owners (CODEOWNERS)
+> **Every box below was verified against the live protection API on 2026-07-31** (`gh api
+> repos/aiosbrain/aios-team-brain/branches/main/protection`). Four of them claimed settings that were
+> not on. A checklist that asserts protection the repo does not have is worse than no checklist — it
+> is read as assurance. Re-verify against the API, not against this file, before trusting it.
+
+- [x] Require status checks — the eight REQUIRED contexts are the job `name:`s, not the job ids:
+      `Docs drift guard`, `Static checks (lint + typecheck)`, `Secret scan (gitleaks)`,
+      `Brain unit tests (vitest)`, `Data-mechanics tests (real Postgres)`,
+      `Integration tests (HTTP)`, `Ingestion tests (pytest)`, `PR records a diff review`.
+- [x] `PR records a diff review` (`pr-review-gate.yml`) — enabled 2026-07-31. This box is the whole
+      enforcement: without it the job goes red on an unattested PR but the PR stays mergeable.
+      **Ordering, if it is ever re-added:** the workflow must be on `main` FIRST. A required context
+      that no PR reports leaves every open PR stuck on "Expected — waiting for status", which is what
+      happened to the seven PRs open when it was switched on — each needed one triggering event
+      (a push, a body edit, or a label) before the check reported and they could merge.
+- [x] `Integration tests (HTTP)` — **already graduated.** `ci.yml` dropped `continue-on-error` ("Now a
+      blocking gate") and the context is required. This line used to prescribe a promotion that had
+      already happened.
+- [ ] Require branches to be up to date before merging — **documented as on, actually off**
+      (`required_status_checks.strict = false`, verified 2026-07-31 via the protection API). Left as-is
+      rather than silently flipped: turning it on forces a rebase-and-re-run on every PR whenever `main`
+      moves, which on this repo's merge rate is a real cost the team should choose deliberately.
+- [ ] Dismiss stale reviews on new pushes — **documented as on, actually off**
+      (`dismiss_stale_reviews: false`).
+- [ ] Require review from code owners (CODEOWNERS) — **documented as on, actually off**
+      (`require_code_owner_reviews: false`, `required_approving_review_count: 0`). Worth knowing when
+      reasoning about the review gate: CODEOWNERS is NOT a backstop today, so the CI checks and the
+      attestation are the only things standing between a diff and `main`.
 
 ---
 
