@@ -155,11 +155,27 @@ export default async function CostsPage({
               </strong>{" "}
               {usd(reconciliation.unattributedUsd)} (
               {Math.round(reconciliation.unattributedFraction * 100)}%) can&apos;t be attributed to a
-              feature, so the breakdown below is a <strong>floor</strong>, not the total. Usually that is
-              a call that timed out or failed after the model had already generated — billed by the
-              provider, but returning no usage for the brain to record. It also covers any spend on this
-              key from outside this instance. Both figures are lifetime for the key, not the selected
-              window.
+              feature, so the breakdown below is a <strong>floor</strong>, not the total. Three things
+              land here:
+              <ul className="mt-1.5 list-disc space-y-1 pl-5">
+                <li>
+                  <strong>Spend from before metering existed.</strong>
+                  {breakdown.trackingSince ? ` This ledger starts ${fmtDay(breakdown.trackingSince)}; ` : " "}
+                  anything the provider billed earlier is in its lifetime total and can never enter ours.
+                </li>
+                <li>
+                  <strong>Calls billed after the model generated but returning no usage</strong> — a
+                  timeout, a dropped connection. Nothing to price, so nothing to record; these are counted
+                  per feature as <em>failed attempts</em> below.
+                </li>
+                <li>
+                  <strong>Any spend on this key from outside this instance.</strong>
+                </li>
+              </ul>
+              Because the first can never be recovered, <strong>this percentage will not fall as things
+              improve</strong> — a high number is not itself a problem. What matters is whether it{" "}
+              <strong>grows</strong>: that means spend is escaping the meter now. Both figures are lifetime
+              for the key, not the selected window.
             </>
           ) : reconciliation.status === "ledger-exceeds" ? (
             <>
