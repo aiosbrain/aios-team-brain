@@ -26,12 +26,23 @@ describe("guard: the reconciliation banner explains the permanent floor", () => 
     expect(page).toContain("breakdown.trackingSince");
   });
 
-  it("says the number will not fall, and to watch whether it grows", () => {
-    expect(page).toMatch(/will not fall/i);
-    expect(page).toMatch(/grows/i);
+  it("binds the never-clears claim to the DOLLARS, not the percentage", () => {
+    // The fraction is (provider - ledger) / provider, and both legs are lifetime — so as new fully
+    // metered spend accrues, the fixed pre-metering block is diluted and the PERCENTAGE falls on its
+    // own. Only the dollar amount has a floor. The first version of this banner promised the
+    // percentage could not fall, which would have read as the banner lying about arithmetic within a
+    // few months — the credibility failure this whole change exists to avoid.
+    expect(page).toMatch(/dollar gap here has a floor/i);
+    expect(page).toMatch(/dollars grow/i);
+    expect(page, "must not resurrect the false claim about the percentage").not.toMatch(
+      /percentage will not fall/i
+    );
   });
 
   it("still points at the failed-attempt breakdown for the part that IS actionable", () => {
-    expect(page).toMatch(/failed attempts/i);
+    // Anchored on wording unique to the BANNER. "failed attempts" alone also appears in the By-feature
+    // help text, so this assertion passed even with the banner's bullet deleted — vacuous against the
+    // one thing it was written to protect.
+    expect(page).toMatch(/counted per feature<\/em> as failed attempts below/i);
   });
 });

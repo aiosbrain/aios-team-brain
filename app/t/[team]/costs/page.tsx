@@ -159,23 +159,30 @@ export default async function CostsPage({
               land here:
               <ul className="mt-1.5 list-disc space-y-1 pl-5">
                 <li>
-                  <strong>Spend from before metering existed.</strong>
-                  {breakdown.trackingSince ? ` This ledger starts ${fmtDay(breakdown.trackingSince)}; ` : " "}
-                  anything the provider billed earlier is in its lifetime total and can never enter ours.
+                  <strong>Spend from before metering existed.</strong> Anything the provider billed before
+                  this ledger&apos;s first metered call
+                  {/* The ledger's earliest row across ALL providers, while the comparison above is scoped
+                      to this one — so on a team whose first metered calls were another provider's, this
+                      date is earlier than OpenRouter coverage actually began. Phrased as "the ledger's
+                      first call" rather than "coverage of this key started here", which stays true either
+                      way; tightening it would cost a provider-scoped query for a one-word gain. */}
+                  {breakdown.trackingSince ? ` (${fmtDay(breakdown.trackingSince)})` : ""} is in its
+                  lifetime total and can never enter ours.
                 </li>
                 <li>
                   <strong>Calls billed after the model generated but returning no usage</strong> — a
-                  timeout, a dropped connection. Nothing to price, so nothing to record; these are counted
-                  per feature as <em>failed attempts</em> below.
+                  timeout, a dropped connection. Nothing to price, so nothing to record. Where we
+                  instrument them, these are <em>counted per feature</em> as failed attempts below.
                 </li>
                 <li>
                   <strong>Any spend on this key from outside this instance.</strong>
                 </li>
               </ul>
-              Because the first can never be recovered, <strong>this percentage will not fall as things
-              improve</strong> — a high number is not itself a problem. What matters is whether it{" "}
-              <strong>grows</strong>: that means spend is escaping the meter now. Both figures are lifetime
-              for the key, not the selected window.
+              Because the first can never be recovered, <strong>the dollar gap here has a floor</strong>:
+              new spend dilutes the percentage, but nothing ever clears the amount. So the percentage is
+              not the signal — a high one is not itself a problem, and a falling one is just arithmetic.
+              What matters is whether the <strong>dollars grow</strong>, which means spend is escaping the
+              meter now. Both figures are lifetime for the key, not the selected window.
             </>
           ) : reconciliation.status === "ledger-exceeds" ? (
             <>
