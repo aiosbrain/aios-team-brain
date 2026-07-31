@@ -12,7 +12,7 @@ import { join } from "node:path";
 const ROOT = join(import.meta.dirname, "..", "..");
 const SCAN_DIRS = ["app", "lib", "scripts"];
 const OWNERS = [join("lib", "costs", "llm-usage.ts")];
-const WRITE_RE = /from\(\s*["']llm_usage["']\s*\)\s*\.\s*(insert|update|upsert|delete)\b/g;
+const WRITE_RE = /from\(\s*["'](llm_usage|llm_failures)["']\s*\)\s*\.\s*(insert|update|upsert|delete)\b/g;
 
 function walk(dir: string, out: string[] = []): string[] {
   let entries: string[];
@@ -37,14 +37,14 @@ function offenders(): string[] {
       if (OWNERS.some((o) => rel === o)) continue;
       if (rel.endsWith(".test.ts") || rel.includes("fake-supabase")) continue;
       const src = readFileSync(file, "utf8");
-      for (const m of src.matchAll(WRITE_RE)) hits.push(`${rel}: .from("llm_usage").${m[1]}(`);
+      for (const m of src.matchAll(WRITE_RE)) hits.push(`${rel}: .from("${m[1]}").${m[2]}(`);
     }
   }
   return hits.sort();
 }
 
-describe("single-writer: llm_usage table", () => {
-  it("only lib/costs/llm-usage.ts writes the llm_usage table", () => {
+describe("single-writer: llm_usage + llm_failures tables", () => {
+  it("only lib/costs/llm-usage.ts writes the spend ledger and its failure sidecar", () => {
     const violations = offenders();
     expect(violations, `llm_usage written outside lib/costs/llm-usage.ts:\n${violations.join("\n")}`).toEqual([]);
   });
@@ -52,7 +52,11 @@ describe("single-writer: llm_usage table", () => {
   it("the matcher discriminates (non-vacuity)", () => {
     expect(WRITE_RE.test('db.from("llm_usage").insert(')).toBe(true);
     WRITE_RE.lastIndex = 0;
+    expect(WRITE_RE.test('db.from("llm_failures").insert(')).toBe(true);
+    WRITE_RE.lastIndex = 0;
     expect(WRITE_RE.test('db.from("llm_usage").select(')).toBe(false);
+    WRITE_RE.lastIndex = 0;
+    expect(WRITE_RE.test('db.from("llm_failures").select(')).toBe(false);
     WRITE_RE.lastIndex = 0;
   });
 });

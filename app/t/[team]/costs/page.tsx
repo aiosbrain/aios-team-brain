@@ -114,6 +114,16 @@ export default async function CostsPage({
             <span className="text-sm text-ink-tertiary">
               {scopeWord} spend · last {breakdown.days}d · {breakdown.calls.toLocaleString("en-US")} call
               {breakdown.calls === 1 ? "" : "s"}
+              {breakdown.failed_attempts > 0 ? (
+                /* Amber, never merged into the call count: these attempts were billed but carry no
+                   usage to price, so they belong to the unattributed remainder above — not to the
+                   figures beside them. */
+                <span className="ml-1 text-amber-700">
+                  · {breakdown.failed_truncated ? "≥" : ""}
+                  {breakdown.failed_attempts.toLocaleString("en-US")} failed attempt
+                  {breakdown.failed_attempts === 1 ? "" : "s"}
+                </span>
+              ) : null}
             </span>
           </div>
           {trackingCaption ? (
@@ -178,6 +188,15 @@ export default async function CostsPage({
             Which part of the brain spent the money — the <code>source</code> tag on each metered call.
             Q&amp;A is the interactive Query box; the rest are background/automatic (arcs, meetings,
             timeline, social, chat titles).
+            <br />
+            <br />
+            <strong>Failed attempts</strong> are calls the provider billed but that returned nothing to
+            price — our own timeout fired mid-generation, the connection dropped, or the response carried
+            no <code>usage</code>. Their dollars are inside the unattributed remainder above, never in
+            these bars, because an aborted call reports no cost. Counted per <em>attempt</em>: the SDKs
+            above us retry, and each retry is billed on its own. Instrumented on the graph proxy and the
+            shared completion primitive — <strong>not</strong> on streaming Q&amp;A, chat titles, or
+            app-side embeddings, so a zero here is not proof of no failures on those three.
           </>
         }
       />

@@ -1642,6 +1642,46 @@ create table if not exists llm_usage (
 create index if not exists llm_usage_team_time_idx on llm_usage (team_id, created_at desc);
 create index if not exists llm_usage_member_time_idx on llm_usage (member_id, created_at desc);
 
+-- Billed-but-unmeterable LLM ATTEMPTS — the calls the spend ledger structurally cannot see.
+--
+-- WHY. A provider bills for tokens it generated even when the call then dies: our own timeout fires,
+-- the connection drops, or a non-2xx comes back with no `usage` block to read. There is nothing to
+-- meter, so `llm_usage` records nothing — and the Costs page could only report the shortfall as an
+-- anonymous lump ("$46.23, 45%, can't be attributed to a feature"). On 2026-07-29 a 120s proxy ceiling
+-- aborted graph extraction after the model had already generated and the OpenAI SDK retried each job
+-- three times; roughly as much spend went unrecorded that day as was recorded.
+--
+-- This table keeps the FACT of the attempt — which feature, which model, why it died — so the gap has
+-- a name even though the dollars are unknowable per call.
+--
+-- A SIBLING TABLE, NOT A COLUMN ON `llm_usage`, and that is the load-bearing decision: every money read
+-- caps its fetch (`llm-costs` 100k unordered, `pulse` newest-50k, the lifetime reconciler 500k). Failures
+-- arrive in retry-amplified STORMS — thousands of rows in a day — so sharing the table would let $0
+-- attempt rows evict real spend rows inside those caps and make the Spend KPI FALL during a paid-failure
+-- storm. An observability feature that understates the spend it exists to explain is worse than the gap.
+-- Separate tables make the money reads safe by construction rather than by remembering a filter forever.
+--
+-- Deliberately no cost column: an aborted connection returns no usage, and a chars/4 guess would become
+-- a total. Counts and reasons here; the provider-reconciliation banner owns the dollars.
+create table if not exists llm_failures (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  -- Human initiator, or null for a system/background call (all graph + cron work).
+  member_id uuid references members(id) on delete set null,
+  -- Same vocabulary as llm_usage.source, so a failure slices beside the spend it failed to become.
+  source text not null,
+  provider text not null,
+  model text not null default '',
+  -- timeout | network | no_usage | http_<status> | empty_content. `timeout` is OURS (the caller's
+  -- deadline was too short); the rest are the provider's. That distinction is the point of the column.
+  failure_reason text not null,
+  -- How long we waited before giving up — the number that turned the 2026-07-29 outage from a mystery
+  -- into a one-line diagnosis.
+  duration_ms integer not null default 0,
+  created_at timestamptz not null default now()
+);
+create index if not exists llm_failures_team_time_idx on llm_failures (team_id, created_at desc);
+
 -- Flat AI-tool subscriptions (Claude Max/Pro, Cursor, …). One current plan per
 -- member+provider — the real recurring spend, distinct from per-token usage_costs.
 -- Written only by lib/subscriptions/ingest via POST /api/v1/subscriptions (v1.8).

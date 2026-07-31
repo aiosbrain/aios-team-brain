@@ -7,7 +7,7 @@ import { resolveAnsweringKeys } from "@/lib/query/answering";
 import { selectLlmBackend, type LlmBackend } from "@/lib/query/llm-backend";
 import { resolveEmbeddingBackend } from "@/lib/query/embedding-key";
 import { EMBEDDING_DIM } from "@/lib/api/schemas";
-import { recordLlmUsage, type LlmUsageSource } from "@/lib/costs/llm-usage";
+import { recordLlmUsage, recordLlmFailure, classifyLlmFailure, type LlmUsageSource } from "@/lib/costs/llm-usage";
 import { meterFromOpenAiResponse } from "@/lib/llm/cost";
 
 /**
@@ -309,7 +309,20 @@ async function meterGraphCall(text: string, status: number, target: ProxyTarget,
     // whatever `usage` arrives, whatever the status, is strictly closer to the truth; a body with no
     // `usage` still returns null below and records nothing.
     const c = meterFromOpenAiResponse(text, target.provider, target.model, meter.kind);
-    if (!c) return;
+    if (!c) {
+      // Nothing meterable came back — yet the provider may well have generated and billed. Until now
+      // this returned in silence, which is precisely how spend became an anonymous 45% on the Costs
+      // page. File the attempt so the gap carries a feature and a reason.
+      await recordLlmFailure(meter.db, {
+        teamId: meter.teamId,
+        memberId: null,
+        source: meter.source,
+        provider: target.provider,
+        model: target.model,
+        reason: status >= 200 && status < 300 ? "no_usage" : (`http_${status}` as `http_${number}`),
+      });
+      return;
+    }
     await recordLlmUsage(meter.db, {
       teamId: meter.teamId,
       memberId: null,
@@ -373,6 +386,20 @@ export async function forwardUpstream(
     console.warn(
       `[graph-proxy] ${target.url} -> ${aborted ? `ABORTED by our own ${timeoutMs}ms timeout` : "failed"} after ${ms}ms`
     );
+    // The 2026-07-29 shape exactly: the model generated, our deadline fired, the provider billed, and
+    // nothing was recorded. One row per ATTEMPT — the Graphiti SDK retries, and each retry is billed
+    // separately, so attempts (not logical extractions) is the honest unit for a spend gap.
+    if (meter) {
+      await recordLlmFailure(meter.db, {
+        teamId: meter.teamId,
+        memberId: null,
+        source: meter.source,
+        provider: target.provider,
+        model: target.model,
+        reason: classifyLlmFailure(err),
+        durationMs: ms,
+      });
+    }
     throw err;
   } finally {
     clearTimeout(timer);

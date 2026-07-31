@@ -3,7 +3,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { selectLlmBackend, reasoningActive, type LlmBackendKeys, type LlmRole } from "@/lib/query/llm-backend";
 import { looksLikeTokenLimit } from "@/lib/query/claude";
 import { recordIngestRun } from "@/lib/ingest/runs";
-import { recordLlmUsage, type LlmUsageSource } from "@/lib/costs/llm-usage";
+import { recordLlmUsage, recordLlmFailure, classifyLlmFailure, type LlmUsageSource } from "@/lib/costs/llm-usage";
 import { estimateAnthropicCostUsd } from "@/lib/llm/cost";
 import type { DbClient } from "@/lib/db/types";
 
@@ -88,6 +88,26 @@ async function recordLlmOutcome(
 }
 
 /** Run one completion; returns the model's text. Throws on transport/model error or empty output. */
+/**
+ * A provider non-2xx, carrying the status so the failure ledger can file it as `http_<status>` rather
+ * than the catch-all `network`. Without this the status only survives inside the message string, and a
+ * 402 insufficient-credits reads as an infrastructure fault — sending an operator to chase the network
+ * when the answer is "top up the account". Misattributing the reason is the thing that column exists
+ * to prevent.
+ */
+class LlmHttpError extends Error {
+  constructor(readonly status: number, message: string) {
+    super(message);
+    this.name = "LlmHttpError";
+  }
+}
+/** Config faults that throw before a request is on the wire (missing key, bad client options). */
+const isConfigError = (err: unknown): boolean =>
+  err instanceof Error && /api[_ ]?key|apiKey|could not resolve|missing credentials/i.test(err.message);
+
+const httpError = (backend: { model: string; baseUrl?: string }, status: number, body: string): LlmHttpError =>
+  new LlmHttpError(status, `LLM ${backend.model} @ ${backend.baseUrl ?? "?"}: ${status} ${body}`);
+
 export async function completeText(args: CompleteArgs, opts: CompleteOptions = {}): Promise<string> {
   const keys = opts.keys ?? {};
   const maxTokens = opts.maxTokens ?? 1024;
@@ -100,6 +120,8 @@ export async function completeText(args: CompleteArgs, opts: CompleteOptions = {
   const prompt = opts.jsonObject ? `${args.prompt}\n\nReturn ONLY the JSON object.` : args.prompt;
 
   // Token/cost capture for the llm_usage meter (opts.meter). Populated per-branch below.
+  // Set once the empty-content path has already metered + filed, so the catch doesn't double-file.
+  let metered = false;
   let inTok = 0;
   let outTok = 0;
   let costUsd = 0;
@@ -154,10 +176,10 @@ export async function completeText(args: CompleteArgs, opts: CompleteOptions = {
         if (looksLikeTokenLimit(res.status, firstErrBody)) {
           res = await doPost(maxTokens);
           if (!res.ok) {
-            throw new Error(`LLM ${backend.model} @ ${backend.baseUrl}: ${res.status} ${await res.text().catch(() => "")}`);
+            throw httpError(backend, res.status, await res.text().catch(() => ""));
           }
         } else {
-          throw new Error(`LLM ${backend.model} @ ${backend.baseUrl}: ${res.status} ${firstErrBody}`);
+          throw httpError(backend, res.status, firstErrBody);
         }
       }
       const j = (await res.json()) as {
@@ -180,6 +202,29 @@ export async function completeText(args: CompleteArgs, opts: CompleteOptions = {
       const choice = j.choices?.[0];
       text = (choice?.message?.content ?? "").trim();
       if (!text) {
+        // METER BEFORE THROWING. The provider generated (and billed for) those tokens — `usage.cost`
+        // above is the real charge, already in scope. Throwing first discarded dollars we had literally
+        // just read, which is spend the ledger could always have captured and instead handed to the
+        // Costs page's "can't be attributed" remainder. The generation failing does not un-bill it.
+        if (opts.meter) {
+          await recordLlmUsage(opts.meter.db, {
+            teamId: opts.meter.teamId,
+            memberId: opts.meter.memberId ?? null,
+            source: opts.meter.source,
+            provider: backend.provider,
+            model: backend.model,
+            inputTokens: inTok,
+            outputTokens: outTok,
+            costUsd,
+            estimated,
+          });
+          // NOT also filed to `llm_failures`. That table means "billed, but nothing to price" — this
+          // call IS priced, on the line above. Filing both would double-count the same attempt against
+          // `calls` and `failed_attempts`, and make the Costs page's "their dollars are never in these
+          // bars" read false. Why it produced nothing is already durable in `ingest_runs` via
+          // `recordLlmOutcome`. `metered` stops the catch below filing it as a transport failure.
+          metered = true;
+        }
         // Name WHY it's empty — `finish_reason:"length"` on empty content is the reasoning-model
         // starvation signature (all of max_tokens went to hidden reasoning). Loud so a blank panel is
         // never a silent, undiagnosable one.
@@ -199,12 +244,30 @@ export async function completeText(args: CompleteArgs, opts: CompleteOptions = {
         { timeout: timeoutMs, maxRetries: 1 }
       );
       text = msg.content.map((b) => (b.type === "text" ? b.text : "")).join("").trim();
-      if (!text) throw new Error("LLM returned empty content");
       // Anthropic doesn't hand back a dollar charge — estimate from list prices (estimated=true).
+      // Computed BEFORE the empty check, mirroring the OpenAI branch: an empty completion is still
+      // billed, and throwing first discarded the tokens we already had. Same leak, other branch.
       inTok = msg.usage?.input_tokens ?? 0;
       outTok = msg.usage?.output_tokens ?? 0;
       costUsd = estimateAnthropicCostUsd(inTok, outTok);
       estimated = true;
+      if (!text) {
+        if (opts.meter) {
+          await recordLlmUsage(opts.meter.db, {
+            teamId: opts.meter.teamId,
+            memberId: opts.meter.memberId ?? null,
+            source: opts.meter.source,
+            provider: backend.provider,
+            model: backend.model,
+            inputTokens: inTok,
+            outputTokens: outTok,
+            costUsd,
+            estimated,
+          });
+          metered = true;
+        }
+        throw new Error("LLM returned empty content");
+      }
     }
     await recordLlmOutcome(opts.record, { ok: true, model: backend.model, startedAt });
     if (opts.meter) {
@@ -228,6 +291,26 @@ export async function completeText(args: CompleteArgs, opts: CompleteOptions = {
       error: err instanceof Error ? err.message : String(err),
       startedAt,
     });
+    // File the billed-but-unmeterable attempt so the Costs page can name which feature lost the money.
+    // ONE row per logical call here, unlike the graph proxy where each SDK retry is its own request —
+    // this function's only retry is the token-limit re-ask, so a two-attempt call under-counts by one.
+    // Stated rather than fixed: over-counting a spend gap is worse than under-counting it.
+    // A failure that never reached a provider spent nothing, so it must not enter a ledger whose only
+    // job is explaining money — the Anthropic SDK throws at CONSTRUCTION when no key resolves, and a
+    // malformed base URL throws a TypeError before any request. Both are configuration faults, already
+    // surfaced by `recordLlmOutcome` above; filing them here would inflate the spend gap with $0 rows.
+    const reachedProvider = !(err instanceof TypeError) && !isConfigError(err);
+    if (opts.meter && !metered && reachedProvider) {
+      await recordLlmFailure(opts.meter.db, {
+        teamId: opts.meter.teamId,
+        memberId: opts.meter.memberId ?? null,
+        source: opts.meter.source,
+        provider: backend.provider,
+        model: backend.model,
+        reason: err instanceof LlmHttpError ? (`http_${err.status}` as `http_${number}`) : classifyLlmFailure(err),
+        durationMs: Date.now() - startedAt,
+      });
+    }
     throw err;
   }
 }

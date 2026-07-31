@@ -8,8 +8,9 @@ import type { DbClient } from "@/lib/db/types";
  * Spend and the costs breakdown page both read it. Distinct from `usage_costs` (external dev-tool
  * spend pushed from workstations).
  *
- * SINGLE WRITER: this file is the only legal writer of `llm_usage` — guarded by
- * `test/guards/single-writer-llm-usage.test.ts`. Everything that spends brain inference records here.
+ * SINGLE WRITER: this file is the only legal writer of `llm_usage` AND its sibling `llm_failures` —
+ * guarded by `test/guards/single-writer-llm-usage.test.ts`. Everything that spends brain inference
+ * records here.
  */
 
 /** Coerce a possibly-NaN/Infinity number to a finite, non-negative value (never lose a row to bad math). */
@@ -79,4 +80,71 @@ export async function recordLlmUsage(db: DbClient, rec: LlmUsageRecord): Promise
   } catch (err) {
     console.error("[llm_usage] insert threw:", err instanceof Error ? err.message : err);
   }
+}
+
+/**
+ * Why a billed attempt produced nothing to meter.
+ *
+ * `timeout` is OURS — our own deadline fired while the model was still generating, and the provider
+ * billed for what it had produced. That is what happened on 2026-07-29 (a 120s proxy ceiling, three SDK
+ * retries per job), and keeping it distinguishable from a provider fault is the whole reason this is a
+ * column rather than a counter.
+ */
+export type LlmFailureReason =
+  | "timeout" // our AbortController/AbortSignal fired — the caller's deadline was too short
+  | "network" // the connection failed before any response
+  | "no_usage" // a response arrived carrying no `usage` block, so there was nothing to meter
+  | "empty_content" // 2xx with usage but no text (the reasoning-model starvation signature)
+  | `http_${number}`; // provider answered non-2xx with nothing meterable
+
+export interface LlmFailureRecord {
+  teamId: string;
+  memberId?: string | null;
+  source: LlmUsageSource;
+  provider: string;
+  model: string;
+  reason: LlmFailureReason;
+  durationMs?: number;
+}
+
+/**
+ * Record one BILLED-BUT-UNMETERABLE attempt into `llm_failures`.
+ *
+ * The unit is one ATTEMPT, not one logical call: a provider bills each attempt independently, and the
+ * SDKs above us retry, so a single extraction that dies three times is three rows. That is the honest
+ * unit for a spend-gap ledger — but it means the count is of attempts, and every surface must say so.
+ *
+ * NEVER call this for a refusal we raised BEFORE reaching a provider (rate limit, an Anthropic-backend
+ * refusal, a bad dimension, a stream request). Those spend nothing, so counting them here would inflate
+ * a ledger whose only job is to explain money — the same false-accusation failure the work-key check
+ * taught us. This belongs at the transport, after the request is on the wire.
+ *
+ * BEST-EFFORT, like `recordLlmUsage`: observability must never break the call it is observing.
+ */
+export async function recordLlmFailure(db: DbClient, rec: LlmFailureRecord): Promise<void> {
+  try {
+    const { error } = await db.from("llm_failures").insert({
+      team_id: rec.teamId,
+      member_id: rec.memberId ?? null,
+      source: rec.source,
+      provider: rec.provider,
+      model: rec.model,
+      failure_reason: rec.reason,
+      duration_ms: Math.round(safeNum(rec.durationMs ?? 0)),
+    });
+    if (error) console.error("[llm_failures] insert failed:", error.message);
+  } catch (err) {
+    console.error("[llm_failures] insert threw:", err instanceof Error ? err.message : err);
+  }
+}
+
+/**
+ * Classify a thrown transport error. The two abort flavours are NOT the same object: a manual
+ * `AbortController.abort()` throws `AbortError`, while `AbortSignal.timeout()` throws `TimeoutError`.
+ * Treating only the first as a timeout would file our own deadline bug — the expensive one — under
+ * "network", which is exactly the misattribution this table exists to prevent.
+ */
+export function classifyLlmFailure(err: unknown): LlmFailureReason {
+  const name = err instanceof Error ? err.name : "";
+  return name === "AbortError" || name === "TimeoutError" ? "timeout" : "network";
 }
