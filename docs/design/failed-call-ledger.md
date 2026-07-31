@@ -17,10 +17,27 @@ The gap is structural, not a bug in the meter. Three cases:
 | **no readable body at all** — timeout, abort, connection drop | ❌ **impossible** — the provider billed for tokens it generated and there is nothing to read |
 | **any body with no `usage` field** | ❌ silently dropped by `meterFromOpenAiResponse` returning null |
 
-The third case is what produced most of the $46: on 2026-07-29 a 120s proxy ceiling aborted extraction
-calls after the model had already generated, and the OpenAI SDK retried each three times. Measured:
-the ledger holds $48.24 for that day; the provider's lifetime figure implies roughly as much again
-unrecorded.
+The third case is real but is NOT most of the $46 — **corrected 2026-07-31 by reading OpenRouter's own
+per-day chart**, which is what the deferred `provider-daily-truth.md` was going to be built to do:
+
+| 2026-07-29 | |
+|---|---|
+| OpenRouter billed | **$58.70** (`qwen3.7-max` $58.60) |
+| Ledger recorded | **$48.24** |
+| Unrecorded | **$10.46 — 18%** |
+
+I had inferred "roughly as much again unrecorded ≈ a 50% abort rate". Wrong by a factor of four. The
+storm's aborted calls cost ~$10, not ~$46.
+
+**The larger block is 2026-07-28, and it is not failures at all.** Graph metering's first row is
+`2026-07-29 03:25 UTC`, but the proxy went live the day before — so 59 episodes were extracted on 07-28
+through OpenRouter with **no meter in existence**. The ledger holds $0.05 for that day. That is not a
+call that died; it is a call nobody was counting.
+
+Which means: the reconciliation gap is dominated by "metering did not exist yet", a one-time historical
+fact that no code can retroactively fix — and both of its causes are now closed (graph metering since
+07-29, the timeout since #438). The gap should stop growing. This ledger addresses the genuine but
+smaller slice.
 
 **No meter fix closes it** — you cannot read a `usage` block off a connection that died. What we CAN
 do is stop losing the *fact* of the call.
