@@ -21,8 +21,10 @@ const fixture = JSON.parse(bytes.toString("utf8"));
 
 describe("gateway approval v1.10 vendored contract", () => {
   it("is the reviewed Workspace fixture and pins the AIO-401 base", () => {
+    // Amended fixture (AIO-407, 2026-07-19): the pinned SHA-256 published in
+    // Workspace docs/brain-api.md for the in-place fingerprint amendment.
     expect(createHash("sha256").update(bytes).digest("hex")).toBe(
-      "b1bed83fbdd4e6cfff2200a4cefa828a2d770c66f898e9e7d704511935cc5e62",
+      "49156f5f1025c7408350d6bc97bd8769bf0fc54b90ffc6c78639597c4f12d02d",
     );
     expect(fixture.baseContract.sha256).toBe(
       "4ddd6495fa505b76118080865d60255bfba94a9ccda249defe428babb3d0c205",
@@ -87,6 +89,13 @@ describe("gateway approval v1.10 vendored contract", () => {
 
   it("matches the resume fingerprint vector", () => {
     const vector = fixture.vectors.resumeFingerprint;
+    // AIO-407 amendment: the fingerprint must never bind the authenticating
+    // credential, or a supported credential-rotation overlap permanently
+    // 409s an identical resume retry.
+    expect(vector.excludedFields).toEqual(["credentialId", "credentialVersion"]);
+    expect(vector.fields).not.toContain("credentialId");
+    expect(vector.fields).not.toContain("credentialVersion");
+    expect(Object.keys(vector.value).sort()).toEqual(vector.fields);
     expect(canonicalize(vector.value)).toBe(vector.jcs);
     expect(createHash("sha256").update(vector.jcs).digest("hex")).toBe(
       vector.sha256,
