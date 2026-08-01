@@ -47,7 +47,7 @@ describe("subjectMatchesMember", () => {
  *
  * The timeline used to drop any `decided_by` that wasn't exactly one name. On prod that was 27 of 56
  * decisions — 48% — and the shape it hid was the worst possible one: the calls two people made together
- * ("John Ellison & Chetan") vanished, while solo ones stayed. Fixtures below mirror the shapes of the real prod strings (all names synthetic).
+ * ("John Ellison & Chetan") vanished, while solo ones stayed. Fixtures below mirror the shapes of the real prod strings (third-party names synthetic).
  */
 describe("decisionActors", () => {
   const roster: RosterPerson[] = [
