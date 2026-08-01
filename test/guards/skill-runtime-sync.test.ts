@@ -14,8 +14,8 @@ import { join } from "node:path";
  * stale playbook — e.g. an old Railway boundary after the rules tightened. This guard fails the
  * build on that drift, so re-syncing is enforced rather than remembered.
  *
- * Publication is opt-in: a skill with no generated copies is intentionally Claude-only and is
- * not flagged. Once *any* copy exists, all three must exist and match.
+ * Publication is opt-in through `.skill-runtimes.json`. This is deliberately independent of the
+ * generated copies, so deleting every output cannot silently unpublish a skill.
  *
  * The drift/orphan cases run against a throwaway copy of the tree in $TMPDIR — a guard that
  * mutates the real working tree to prove itself can leave the repo dirty (or get those mutations
@@ -39,6 +39,7 @@ function sandbox(): string {
   const dir = mkdtempSync(join(tmpdir(), "skill-sync-"));
   mkdirSync(join(dir, "scripts"), { recursive: true });
   cpSync(join(ROOT, "scripts", "sync-skill-runtimes.sh"), join(dir, "scripts", "sync-skill-runtimes.sh"));
+  cpSync(join(ROOT, ".skill-runtimes.json"), join(dir, ".skill-runtimes.json"));
   for (const d of RUNTIME_DIRS) {
     const src = join(ROOT, d);
     if (existsSync(src)) cpSync(src, join(dir, d), { recursive: true });
@@ -148,6 +149,26 @@ describe("skill runtime sync guard", () => {
       const { status, out } = check(dir);
       expect(status, "a skill published to some runtimes but not others must fail").toBe(1);
       expect(out).toContain("PARTIAL");
+    });
+  });
+
+  it("fails when every generated copy of a manifest-listed skill is deleted", () => {
+    withSandbox((dir) => {
+      rmSync(join(dir, ".agents", "skills", "pr-review-attestation"), { recursive: true, force: true });
+      rmSync(join(dir, ".opencode", "skills", "pr-review-attestation"), { recursive: true, force: true });
+      rmSync(join(dir, ".cursor", "rules", "pr-review-attestation.mdc"), { force: true });
+      const { status, out } = check(dir);
+      expect(status).toBe(1);
+      expect(out.match(/PARTIAL/g)?.length).toBe(3);
+    });
+  });
+
+  it("rejects an invalid manifest before claiming conformance", () => {
+    withSandbox((dir) => {
+      writeFileSync(join(dir, ".skill-runtimes.json"), JSON.stringify({ version: 1, published: ["Bad Name"] }));
+      const { status, out } = check(dir);
+      expect(status).toBe(2);
+      expect(out).toContain("invalid or duplicate");
     });
   });
 });

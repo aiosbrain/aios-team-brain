@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "canonical": ".claude/skills",
+  "published": [
+    "connect",
+    "pr-review-attestation",
+    "railway-deploy-verify",
+    "setup-brain"
+  ],
+  "targets": {
+    "codex": { "path": ".agents/skills", "format": "directory" },
+    "opencode": { "path": ".opencode/skills", "format": "directory" },
+    "cursor": { "path": ".cursor/rules", "format": "cursor-rule" }
+  }
+}
