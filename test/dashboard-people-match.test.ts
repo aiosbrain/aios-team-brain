@@ -47,18 +47,18 @@ describe("subjectMatchesMember", () => {
  *
  * The timeline used to drop any `decided_by` that wasn't exactly one name. On prod that was 27 of 56
  * decisions — 48% — and the shape it hid was the worst possible one: the calls two people made together
- * ("John Ellison & Chetan") vanished, while solo ones stayed. Fixtures below are the real prod strings.
+ * ("John Ellison & Chetan") vanished, while solo ones stayed. Fixtures below mirror the shapes of the real prod strings (all names synthetic).
  */
 describe("decisionActors", () => {
   const roster: RosterPerson[] = [
     { memberId: "m-john", displayName: "John Ellison", handle: "john-ellison" },
     { memberId: "m-chetan", displayName: "Chetan", handle: "chetan" },
-    { memberId: "m-abe", displayName: "Abe Isleem", handle: "abe" },
+    { memberId: "m-ada", displayName: "Ada Sample", handle: "ada" },
   ];
 
   it("credits BOTH people in a joint decision", () => {
     expect(decisionActors("John Ellison & Chetan", roster)).toEqual(["m-john", "m-chetan"]);
-    expect(decisionActors("John Ellison & Abe Isleem", roster)).toEqual(["m-john", "m-abe"]);
+    expect(decisionActors("John Ellison & Ada Sample", roster)).toEqual(["m-john", "m-ada"]);
   });
 
   it("credits the decider AND the agreer in a qualified attribution", () => {
