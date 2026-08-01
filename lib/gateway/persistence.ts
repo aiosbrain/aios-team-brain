@@ -533,6 +533,8 @@ export async function resumeClaimGatewayExecution<T>(input: {
       state: string;
       resume_fingerprint: string | null;
       claim_idempotency_key: string | null;
+      claimed_credential_public_id: string | null;
+      claimed_credential_version: number | null;
       approval_id: string;
       approval_status: string;
       approval_expires_at: string;
@@ -560,6 +562,8 @@ export async function resumeClaimGatewayExecution<T>(input: {
               e.connection_id,e.toolkit,e.tool,e.request_hash,e.encrypted_request_envelope,
               e.request_envelope_hash,e.actor_snapshot,e.role_snapshot,e.tier_snapshot,
               e.policy_resource,e.state,e.resume_fingerprint,e.claim_idempotency_key,
+              cc.credential_id claimed_credential_public_id,
+              cc.version claimed_credential_version,
               a.id approval_id,a.status approval_status,a.expires_at approval_expires_at,
               (a.expires_at<=now()) approval_expired,
               b.executor_tenant_id,b.executor_subject_id,b.revoked_at binding_revoked_at,
@@ -583,6 +587,8 @@ export async function resumeClaimGatewayExecution<T>(input: {
          join gateway_service_identities s on s.id=e.service_identity_id and s.team_id=e.team_id
          join gateway_service_credentials gc
            on gc.id=$5 and gc.service_identity_id=e.service_identity_id and gc.team_id=e.team_id
+         left join gateway_service_credentials cc
+           on cc.id=e.claimed_credential_id and cc.team_id=e.team_id
         where e.id=$1 and e.service_identity_id=$2
           and b.executor_tenant_id=$3 and b.executor_subject_id=$4
         for update of e,a,gc`,
@@ -600,10 +606,15 @@ export async function resumeClaimGatewayExecution<T>(input: {
       inTransaction = false;
       throw new GatewayPersistenceError("gateway_not_found");
     }
+    // Internal gateway 1.10 fingerprint amendment (AIO-407, 2026-07-19): the
+    // idempotency fingerprint deliberately EXCLUDES the authenticating
+    // credential's credentialId/credentialVersion, so an identical retry
+    // authenticated by an active sibling credential of the same service
+    // identity (credential-rotation overlap) resolves to already_claimed
+    // instead of being permanently 409'd. Credential identity is still
+    // revalidated at claim time and recorded on the audit row.
     const fingerprint = sha256(
       canonicalize({
-        credentialId: input.service.credentialId,
-        credentialVersion: input.service.credentialVersion,
         executionId: input.executionId,
         executorSubjectId: input.executorSubjectId,
         executorTenantId: input.executorTenantId,
@@ -616,8 +627,36 @@ export async function resumeClaimGatewayExecution<T>(input: {
       }),
     );
     if (["claimed", "succeeded", "failed"].includes(row.state)) {
+      // Back-compat for rows claimed before the amendment: their stored
+      // fingerprint included the CLAIMING credential's credentialId/version.
+      // Recompute that legacy form from the recorded claiming credential
+      // (never the authenticating one). A legacy match proves every amended
+      // fingerprint field is byte-identical, so this acceptance is strictly
+      // narrower than the amended fingerprint — it can never widen it.
+      const legacyFingerprint =
+        row.resume_fingerprint === fingerprint ||
+        row.claimed_credential_public_id === null ||
+        row.claimed_credential_version === null
+          ? null
+          : sha256(
+              canonicalize({
+                credentialId: row.claimed_credential_public_id,
+                credentialVersion: row.claimed_credential_version,
+                executionId: input.executionId,
+                executorSubjectId: input.executorSubjectId,
+                executorTenantId: input.executorTenantId,
+                memberId: row.member_id,
+                requestHash: input.requestHash,
+                serviceIdentityId: input.service.id,
+                teamId: row.team_id,
+                tool: input.tool,
+                toolkit: input.toolkit,
+              }),
+            );
       if (
-        row.resume_fingerprint !== fingerprint ||
+        (row.resume_fingerprint !== fingerprint &&
+          (legacyFingerprint === null ||
+            row.resume_fingerprint !== legacyFingerprint)) ||
         row.claim_idempotency_key !== input.idempotencyKey
       ) {
         await client.query("ROLLBACK");

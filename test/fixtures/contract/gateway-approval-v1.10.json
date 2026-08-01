@@ -524,8 +524,6 @@
   "vectors": {
     "resumeFingerprint": {
       "fields": [
-        "credentialId",
-        "credentialVersion",
         "executionId",
         "executorSubjectId",
         "executorTenantId",
@@ -536,9 +534,9 @@
         "tool",
         "toolkit"
       ],
+      "excludedFields": ["credentialId", "credentialVersion"],
+      "excludedFieldsRationale": "credential-rotation-overlap-must-not-invalidate-resume-idempotency; credential identity is revalidated (authenticating-credential-active, stable-service-identity) and recorded on the audit row, never fingerprinted",
       "value": {
-        "credentialId": "ICEiIyQlJicoKSorLC0uLw",
-        "credentialVersion": 2,
         "executionId": "22222222-2222-4222-8222-222222222222",
         "executorSubjectId": "executor-user-42",
         "executorTenantId": "executor-tenant-7",
@@ -549,8 +547,8 @@
         "tool": "github.repository.get",
         "toolkit": "aios-github-readonly"
       },
-      "jcs": "{\"credentialId\":\"ICEiIyQlJicoKSorLC0uLw\",\"credentialVersion\":2,\"executionId\":\"22222222-2222-4222-8222-222222222222\",\"executorSubjectId\":\"executor-user-42\",\"executorTenantId\":\"executor-tenant-7\",\"memberId\":\"44444444-4444-4444-8444-444444444444\",\"requestHash\":\"4b18a1b9c0f093f7e46b4410e245fd88f011e6d820b34ef9446296ff9386f310\",\"serviceIdentityId\":\"11111111-1111-4111-8111-111111111111\",\"teamId\":\"33333333-3333-4333-8333-333333333333\",\"tool\":\"github.repository.get\",\"toolkit\":\"aios-github-readonly\"}",
-      "sha256": "0f0369a66660d1030e4104cfd394e001a16d90e0df6511698c6642ea92f7ee45"
+      "jcs": "{\"executionId\":\"22222222-2222-4222-8222-222222222222\",\"executorSubjectId\":\"executor-user-42\",\"executorTenantId\":\"executor-tenant-7\",\"memberId\":\"44444444-4444-4444-8444-444444444444\",\"requestHash\":\"4b18a1b9c0f093f7e46b4410e245fd88f011e6d820b34ef9446296ff9386f310\",\"serviceIdentityId\":\"11111111-1111-4111-8111-111111111111\",\"teamId\":\"33333333-3333-4333-8333-333333333333\",\"tool\":\"github.repository.get\",\"toolkit\":\"aios-github-readonly\"}",
+      "sha256": "93bd21487ca4f8bbbd0aa38d32735753141bec16abf9814d0e0fd3c043510472"
     },
     "requestEnvelope": {
       "algorithm": "AES-256-GCM",
