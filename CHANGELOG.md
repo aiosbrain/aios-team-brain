@@ -8,14 +8,63 @@ revision **v1.15**.
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-08-01
+
+The Brain API contract is unchanged at **v1.15** — no member-facing route, shape,
+or semantics changed after the 1.15 revision landed (#456).
+
 ### Added
 
-- **Workspace-governance health ingest (brain-api 1.15, AIO-609)** —
+- **Workspace-governance health ingest (brain-api 1.15, AIO-609, #456)** —
   `POST /api/v1/codebases` accepts an optional, provenance-only
   `metrics.codebase_health` object (scored scanner-side, persisted verbatim on
   `code_metrics.codebase_health`, never recomputed; sparse or malformed pushes
   are rejected 422). The codebase detail view surfaces the latest snapshot
-  (score, status, measured_at).
+  (score, status, measured_at). Deployed to production and live-verified; this
+  is the same scanner-ingest endpoint that serves the workspace repo's
+  scan-on-merge CI push (an anonymous-checkout, team-tier-key consumer).
+- **Setup front door** — `npm run setup` is a real interview (#453), backed by a
+  one-command local stack + `npm run doctor` preflight (#444) and agent-driven,
+  provisioning-scoped Railway setup (#445). Connectors gained terminal status,
+  forced verify, and a `/connect` skill (#447).
+- **Cost visibility** — graph extraction + embeddings are metered (#437), the
+  spend the ledger can't see is named instead of reported as an anonymous
+  percentage (#450, #458, #463), and the cost window no longer fakes 30 days.
+- **Meetings on push** — the meeting note is created when a transcript is
+  pushed, not up to 30 minutes later on the next tick (#454), with
+  push-triggered backfills traced to `ingest_runs` (#457).
+- **Model administration** — a separate, save-time-validated model for graph
+  extraction so the graph stops billing the answer model (#442, #452); the
+  graph's LLM key lives only in the admin console (#425).
+- **Plain-English timeline** — headline-first day summaries with no machine
+  tokens (#435), and a one-screen Pulse snapshot (#440, #441).
+
+### Changed
+
+- **Review gate enforced** — the pre-push diff review attestation
+  (`Reviewed by … — verdict …`) is now a required CI check
+  (`pr-review-gate.yml`), not a remembered convention (#460, #462).
+- Phantom connectors retired (sidecar GitHub, Drive watch, `wise`, Granola);
+  README rewritten from the code — hosted-first setup order, per-step timings,
+  and the Team Brain schematic (#421, #424, #431, #436, #448).
+
+### Fixed
+
+- **NDA hook chain (#459)** — the pre-commit guard is tracked in `.githooks/`
+  and the NDA leak gate chains through `core.hooksPath`, so the policy hooks
+  can no longer be silently clobbered or skipped.
+- Re-running the provisioner rotated both secrets, logging the team out and
+  orphaning every token (#451); `SECRETS_KEY` is warned about at boot and
+  `doctor` accepts valid hex keys (#449).
+- Graph extraction: the 120s proxy timeout killed long extractions (#438), and
+  monitoring now detects extraction that *stopped*, not just extraction that
+  never started (#423).
+- Cache-backed routes report the row's real age, and degraded state has its own
+  column instead of overloading `computed_at` (#426, #432).
+- The LLM single-caller guard covers `.mjs` and stops flagging prose (#455);
+  Notion/Drive/Confluence `fetch()` is proven without an account, fixing the
+  TypeError it found (#439); personal Slack OAuth scopes aligned (#443); the
+  ingest-health banner no longer cries wolf on a healthy 12h job (#434).
 
 ## [0.8.0] — 2026-07-28
 
