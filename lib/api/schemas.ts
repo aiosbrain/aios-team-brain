@@ -249,6 +249,23 @@ export const maturitySnapshotPayloadSchema = z.object({
   // Shadow Cognitive-Ergonomics band (v1.3). No `.default()`: omitted (older client) must
   // stay distinguishable from an explicit null. Provenance-only — never recomputed here.
   ce_band: z.number().int().min(0).max(4).nullable().optional(),
+  // Context Engineering Health scan summary (brain-api 1.11). Scalars only — never file
+  // paths, filenames, or the checks' free-text detail strings. Same posture as `ce_band`:
+  // no `.default()`, so an omitted field (older client, or the check simply didn't run)
+  // stays distinguishable and can never clear a previously stored summary. It is an
+  // object-or-absent field — the wire contract has no explicit-null form for it.
+  // Provenance-only — never recomputed here, never feeds placement().
+  context_health: z
+    .object({
+      score: z.number().int().min(0).max(4),
+      mode: z.enum(["workspace", "repo"]),
+      drift_count: z.number().int().nonnegative(),
+      versions_behind: z.number().int().nonnegative().nullable().optional(),
+      coverage_pct: z.number().min(0).max(100).nullable().optional(),
+      broken_link_count: z.number().int().nonnegative(),
+      checked_at: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+    })
+    .optional(),
 });
 export type MaturitySnapshotPayload = z.infer<
   typeof maturitySnapshotPayloadSchema
