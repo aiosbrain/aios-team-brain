@@ -90,4 +90,137 @@ describe("POST /api/v1/metrics (HTTP)", () => {
     });
     expect(res.status).toBe(201);
   });
+
+  // brain-api 1.11 (AIO-672). This body is exactly what the shipped workspace producer
+  // emits (`contextHealthPushFields`, aios-workspace scripts/analyze/report.mjs) — it must
+  // round-trip over the real wire, not just through the schema.
+  it("201s with a context_health summary and the DB row shows both columns", async () => {
+    const seed = await seedTeam();
+    const { key } = await issueKeyFor(seed, "team");
+
+    const res = await fetch(METRICS, {
+      method: "POST",
+      headers: keyHeaders(key, seed.teamSlug),
+      body: JSON.stringify(
+        payload({
+          context_health: {
+            score: 3,
+            mode: "workspace",
+            drift_count: 2,
+            versions_behind: 1,
+            coverage_pct: 80,
+            broken_link_count: 0,
+            checked_at: "2026-07-04",
+          },
+        })
+      ),
+    });
+    expect(res.status).toBe(201);
+    expect((await res.json()).status).toBe("ok");
+
+    const { data } = await db()
+      .from("agentic_maturity_snapshots")
+      .select("context_health_score, context_health")
+      .eq("team_id", seed.teamId)
+      .eq("member_id", seed.memberId)
+      .eq("snapshot_date", "2026-07-04")
+      .single();
+    const row = data as { context_health_score: number; context_health: Record<string, unknown> };
+    expect(row.context_health_score).toBe(3);
+    expect(row.context_health).toEqual({
+      score: 3,
+      mode: "workspace",
+      drift_count: 2,
+      versions_behind: 1,
+      coverage_pct: 80,
+      broken_link_count: 0,
+      checked_at: "2026-07-04",
+    });
+  });
+
+  it("201s in repo mode with null versions_behind / coverage_pct", async () => {
+    const seed = await seedTeam();
+    const { key } = await issueKeyFor(seed, "team");
+
+    const res = await fetch(METRICS, {
+      method: "POST",
+      headers: keyHeaders(key, seed.teamSlug),
+      body: JSON.stringify(
+        payload({
+          context_health: {
+            score: 4,
+            mode: "repo",
+            drift_count: 0,
+            versions_behind: null,
+            coverage_pct: null,
+            broken_link_count: 0,
+            checked_at: "2026-07-04",
+          },
+        })
+      ),
+    });
+    expect(res.status).toBe(201);
+  });
+
+  it("422s on an out-of-range context_health score", async () => {
+    const seed = await seedTeam();
+    const { key } = await issueKeyFor(seed, "team");
+
+    const res = await fetch(METRICS, {
+      method: "POST",
+      headers: keyHeaders(key, seed.teamSlug),
+      body: JSON.stringify(
+        payload({
+          context_health: {
+            score: 9,
+            mode: "workspace",
+            drift_count: 0,
+            versions_behind: null,
+            coverage_pct: null,
+            broken_link_count: 0,
+            checked_at: "2026-07-04",
+          },
+        })
+      ),
+    });
+    expect(res.status).toBe(422);
+    expect((await res.json()).error.code).toBe("invalid_payload");
+  });
+
+  it("422s on an invalid context_health mode", async () => {
+    const seed = await seedTeam();
+    const { key } = await issueKeyFor(seed, "team");
+
+    const res = await fetch(METRICS, {
+      method: "POST",
+      headers: keyHeaders(key, seed.teamSlug),
+      body: JSON.stringify(
+        payload({
+          context_health: {
+            score: 2,
+            mode: "bogus",
+            drift_count: 0,
+            versions_behind: null,
+            coverage_pct: null,
+            broken_link_count: 0,
+            checked_at: "2026-07-04",
+          },
+        })
+      ),
+    });
+    expect(res.status).toBe(422);
+    expect((await res.json()).error.code).toBe("invalid_payload");
+  });
+
+  it("201s when context_health is omitted (older client / no scan)", async () => {
+    const seed = await seedTeam();
+    const { key } = await issueKeyFor(seed, "team");
+
+    const res = await fetch(METRICS, {
+      method: "POST",
+      headers: keyHeaders(key, seed.teamSlug),
+      body: JSON.stringify(payload()),
+    });
+    expect(res.status).toBe(201);
+  });
 });

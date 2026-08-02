@@ -134,6 +134,7 @@ type SnapshotRow = {
   canonical_learning: number;
   canonical_cost_governance: number;
   ce_band: number | null;
+  context_health_score: number | null;
   tasks: number;
   sessions: number;
   total_cost_usd: number;
@@ -161,6 +162,7 @@ export type MemberMaturityCard = {
   spine: string;
   overall: number;
   ce_band: number | null;
+  context_health_score: number | null;
   axes: AemAxes;
   tasks: number;
   sessions: number;
@@ -174,7 +176,20 @@ export type TeamMaturity = {
   members: MemberMaturityCard[];
   teamAxes: AemAxes;
   spineDistribution: Record<string, number>;
+  /** Mean context-health score across the members who have actually scanned. */
+  averageContextHealth: number | null;
 };
+
+/**
+ * Mean of the latest-per-member non-null context-health scores; null when nobody has
+ * scanned yet. Members without a scan are SKIPPED, never counted as 0 — "no scan" is
+ * not "unhealthy".
+ */
+function averageContextHealth(scores: (number | null)[]): number | null {
+  const present = scores.filter((s): s is number => s != null);
+  if (!present.length) return null;
+  return Math.round((present.reduce((a, b) => a + b, 0) / present.length) * 100) / 100;
+}
 
 function weakestOf(axes: AemAxes): keyof AemAxes {
   return (Object.entries(axes) as [keyof AemAxes, number][]).sort((a, b) => a[1] - b[1])[0][0];
@@ -197,12 +212,16 @@ export async function getTeamMaturity(
   teamId: string,
   tier: ViewerTier
 ): Promise<TeamMaturity> {
-  if (!canSeeMaturity(tier)) return { asOf: null, members: [], teamAxes: averageAxes([]), spineDistribution: {} };
+  if (!canSeeMaturity(tier))
+    return {
+      asOf: null, members: [], teamAxes: averageAxes([]), spineDistribution: {},
+      averageContextHealth: null,
+    };
 
   const { data: snaps } = await db
     .from("agentic_maturity_snapshots")
     .select(
-      `member_id, snapshot_date, canonical_spine, canonical_overall, ce_band, tasks, sessions,
+      `member_id, snapshot_date, canonical_spine, canonical_overall, ce_band, context_health_score, tasks, sessions,
        total_cost_usd, input_tokens, output_tokens, cache_read_tokens, ${AXIS_COLS.join(", ")}`
     )
     .eq("team_id", teamId)
@@ -238,6 +257,8 @@ export async function getTeamMaturity(
       spine: r.canonical_spine,
       overall: Number(r.canonical_overall),
       ce_band: r.ce_band == null ? null : Number(r.ce_band),
+      context_health_score:
+        r.context_health_score == null ? null : Number(r.context_health_score),
       axes,
       tasks: Number(r.tasks),
       sessions: Number(r.sessions),
@@ -255,6 +276,7 @@ export async function getTeamMaturity(
     members: cards,
     teamAxes: averageAxes(cards.map((c) => c.axes)),
     spineDistribution,
+    averageContextHealth: averageContextHealth(cards.map((c) => c.context_health_score)),
   };
 }
 
@@ -296,7 +318,7 @@ export async function getMemberMaturity(
   const { data: snaps } = await db
     .from("agentic_maturity_snapshots")
     .select(
-      `member_id, snapshot_date, canonical_spine, canonical_overall, ce_band, tasks, sessions,
+      `member_id, snapshot_date, canonical_spine, canonical_overall, ce_band, context_health_score, tasks, sessions,
        total_cost_usd, input_tokens, output_tokens, cache_read_tokens, ${AXIS_COLS.join(", ")}`
     )
     .eq("team_id", teamId)
@@ -320,6 +342,8 @@ export async function getMemberMaturity(
     member_id: m.id, handle: m.actor_handle, name: m.display_name, avatar_url: m.avatar_url,
     date: dayStr(last.snapshot_date), spine: last.canonical_spine, overall: Number(last.canonical_overall),
     ce_band: last.ce_band == null ? null : Number(last.ce_band),
+    context_health_score:
+      last.context_health_score == null ? null : Number(last.context_health_score),
     axes, tasks: Number(last.tasks), sessions: Number(last.sessions),
     total_cost_usd: Number(last.total_cost_usd ?? 0),
     total_tokens: Number(last.input_tokens ?? 0) + Number(last.output_tokens ?? 0) + Number(last.cache_read_tokens ?? 0),

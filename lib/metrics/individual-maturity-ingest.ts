@@ -66,6 +66,16 @@ export async function ingestMaturitySnapshot(
         // Omitted (older client) → key absent, column untouched on conflict (preserves a
         // previously stored band). Explicit null → column set to NULL, clearing it.
         ...(payload.ce_band !== undefined ? { ce_band: payload.ce_band } : {}),
+        // Omitted (older client, or the context-health check didn't run) → keys absent,
+        // columns untouched on conflict, preserving a previously stored summary. The wire
+        // contract has no explicit-null form for context_health (object-or-absent), so a
+        // presence check is the whole rule. Persisted VERBATIM — never recomputed here.
+        ...(payload.context_health !== undefined
+          ? {
+              context_health_score: payload.context_health.score,
+              context_health: JSON.stringify(payload.context_health), // jsonb (postgres-only cast)
+            }
+          : {}),
       },
       { onConflict: "team_id,member_id,snapshot_date,metric" }
     )
@@ -89,6 +99,11 @@ export async function ingestMaturitySnapshot(
       // Preserve the omitted-vs-explicit-null distinction in the audit trail too — collapsing
       // them (e.g. via `?? null`) would hide whether a re-push actually cleared a stored band.
       ce_band: payload.ce_band === undefined ? "unchanged" : payload.ce_band,
+      // Same distinction for context_health: "unchanged" when the key is absent from the
+      // push (the stored summary survives), else the pushed score. Only the scalar score
+      // is logged — the audit trail is not a second copy of the summary.
+      context_health:
+        payload.context_health === undefined ? "unchanged" : payload.context_health.score,
     },
   });
 
