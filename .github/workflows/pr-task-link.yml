@@ -36,7 +36,7 @@ jobs:
       AIOS_API_KEY: ${{ secrets.AIOS_API_KEY }}
       AIOS_TEAM: ${{ secrets.AIOS_TEAM }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Check for an AIOS work-key
         run: |
           node <<'NODE'
