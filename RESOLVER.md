@@ -25,7 +25,7 @@ gates (AIOS hub, Tessera root) apply in addition.
 | Adding a column to an existing table | `postgres/migrations/` (alter) AND mirror into `postgres/schema.sql` (from-zero) — editing create-table alone is a prod no-op |
 | Editing any `.claude/skills/<name>/SKILL.md` | If the skill is published to other runtimes, re-run `npm run check:skills:fix` in the same change — `.agents/`, `.opencode/`, `.cursor/rules/` are generated copies (guard: `test/guards/skill-runtime-sync.test.ts` + pre-push) |
 | Writing any test | Spec-first, never characterization-first; pick the tier by failure mode (unit / data-mechanics / integration / eval — CLAUDE.md §4) |
-| Any PM/board work | `aios-linear` (global skill) — Linear only; **Plane is retired**: never register or use the `lib/pm-sync` Plane adapter (still present for historical rows; removal is a scoped migration, tracked in the resolver audit) |
+| AIOS-internal PM/board work | `aios-linear` (global skill) — Linear is the canonical board used to build AIOS; do not dual-write AIO issues to Plane. The `lib/pm-sync` Plane adapter remains a supported product integration for customer teams and must not be removed or disabled under this board-policy rule. |
 
 ## Functional Areas
 
