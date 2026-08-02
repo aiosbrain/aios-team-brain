@@ -152,6 +152,29 @@ describe("agentic-maturity dashboard reads (real Postgres)", () => {
     expect(after.averageContextHealth).toBe(3);
   });
 
+  // Regression: context health is carried only on the day the scan ran — it is NOT a
+  // per-day fact, and the producer degrades to "no scan" without failing the push. So the
+  // newest snapshot ROW is routinely the successor of the newest SCAN. Reading the newest
+  // row's column would flip a member's card to "—" the day after a perfectly good scan.
+  it("carries the most recent scan forward past later snapshots that carried none", async () => {
+    const seed = await seedTeam();
+    const alex = await createMember(db(), seed.teamId, { email: "a@x.test", displayName: "Alex", actorHandle: "alex", role: "member" });
+
+    await ingest(seed.teamId, alex.id, snap("alex", "2026-06-16", { context_health: contextHealth(2) }));
+    await ingest(seed.teamId, alex.id, snap("alex", "2026-06-17", { context_health: contextHealth(4) }));
+    await ingest(seed.teamId, alex.id, snap("alex", "2026-06-18")); // pushed, but no scan ran
+
+    const team = await getTeamMaturity(db(), seed.teamId, "team");
+    const card = team.members.find((mm) => mm.handle === "alex")!;
+    expect(card.date).toBe("2026-06-18"); // the card is still the latest snapshot
+    expect(card.context_health_score).toBe(4); // ...but shows the latest SCAN, not null
+    expect(team.averageContextHealth).toBe(4);
+
+    const m = await getMemberMaturity(db(), seed.teamId, "alex", "team");
+    expect(m!.latest.date).toBe("2026-06-18");
+    expect(m!.latest.context_health_score).toBe(4);
+  });
+
   it("GATE: an external-tier viewer gets no context-health rollup either", async () => {
     const seed = await seedTeam();
     const alex = await createMember(db(), seed.teamId, { email: "a@x.test", displayName: "Alex", actorHandle: "alex", role: "member" });

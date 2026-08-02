@@ -231,7 +231,18 @@ export async function getTeamMaturity(
   const rows = (snaps ?? []) as unknown as SnapshotRow[];
   // latest snapshot per member (rows already date-desc)
   const latest = new Map<string, SnapshotRow>();
-  for (const r of rows) if (!latest.has(r.member_id)) latest.set(r.member_id, r);
+  // Context health is a repo/workspace-hygiene fact carried only on the day the scan ran —
+  // NOT a per-day fact of the snapshot. The producer degrades to "no scan" without failing
+  // the push, so the newest ROW is routinely the newest SCAN's successor. Carry the most
+  // recent non-null score forward instead, or a member's card would flip to "—" the day
+  // after a good scan. Rows are date-desc, so the first hit is the most recent scan.
+  const latestScan = new Map<string, number>();
+  for (const r of rows) {
+    if (!latest.has(r.member_id)) latest.set(r.member_id, r);
+    if (!latestScan.has(r.member_id) && r.context_health_score != null) {
+      latestScan.set(r.member_id, Number(r.context_health_score));
+    }
+  }
 
   const memberIds = [...latest.keys()];
   const nameById = new Map<string, { handle: string; name: string; avatar: string | null }>();
@@ -257,8 +268,7 @@ export async function getTeamMaturity(
       spine: r.canonical_spine,
       overall: Number(r.canonical_overall),
       ce_band: r.ce_band == null ? null : Number(r.ce_band),
-      context_health_score:
-        r.context_health_score == null ? null : Number(r.context_health_score),
+      context_health_score: latestScan.get(r.member_id) ?? null,
       axes,
       tasks: Number(r.tasks),
       sessions: Number(r.sessions),
@@ -335,6 +345,15 @@ export async function getMemberMaturity(
     ce_band: r.ce_band == null ? null : Number(r.ce_band),
     ...rowAxes(r),
   }));
+  // Most recent non-null scan, not the newest row's value — see getTeamMaturity.
+  // Rows are date-ASC here, so scan backwards.
+  let latestScan: number | null = null;
+  for (let i = rows.length - 1; i >= 0; i--) {
+    if (rows[i].context_health_score != null) {
+      latestScan = Number(rows[i].context_health_score);
+      break;
+    }
+  }
   const last = rows[rows.length - 1];
   const axes = rowAxes(last);
   const weakest = weakestOf(axes);
@@ -342,8 +361,7 @@ export async function getMemberMaturity(
     member_id: m.id, handle: m.actor_handle, name: m.display_name, avatar_url: m.avatar_url,
     date: dayStr(last.snapshot_date), spine: last.canonical_spine, overall: Number(last.canonical_overall),
     ce_band: last.ce_band == null ? null : Number(last.ce_band),
-    context_health_score:
-      last.context_health_score == null ? null : Number(last.context_health_score),
+    context_health_score: latestScan,
     axes, tasks: Number(last.tasks), sessions: Number(last.sessions),
     total_cost_usd: Number(last.total_cost_usd ?? 0),
     total_tokens: Number(last.input_tokens ?? 0) + Number(last.output_tokens ?? 0) + Number(last.cache_read_tokens ?? 0),
