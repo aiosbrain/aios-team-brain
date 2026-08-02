@@ -13,3 +13,15 @@ export const round = (n: number, dp = 2): number => {
  * strings) to a number; null/undefined/NaN → 0. */
 export const num = (v: number | string | null | undefined): number =>
   v == null ? 0 : Number(v) || 0;
+
+/**
+ * Like `num`, but PRESERVES null instead of collapsing it to 0. Use this for any metric where
+ * "not measured" is a real, distinct state — `num()` silently turns an unknown into a zero,
+ * which for a score is a claim you did not measure (a repo that never filed a coverage report
+ * reading as a repo measured at 0%). NaN still degrades to null rather than leaking through.
+ */
+export const numOrNull = (v: number | string | null | undefined): number | null => {
+  if (v == null) return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+};
