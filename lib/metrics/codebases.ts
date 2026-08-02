@@ -4,7 +4,7 @@ import type { DbClient } from "@/lib/db/types";
 import type { Kpi } from "./pulse";
 import { rangeDays, type Range } from "./range";
 import { canSeeCodebases, type ViewerTier } from "@/lib/codebases/visibility";
-import { num, round } from "@/lib/num";
+import { num, numOrNull, round } from "@/lib/num";
 
 /**
  * The ONLY read path for codebase analytics tables — pages must go through here,
@@ -288,7 +288,8 @@ export interface AgenticBreakdown {
   agentic_score: number;
   health_score: number;
   ai_commit_ratio: number;
-  test_coverage_score: number;
+  /** null = no coverage report; NOT a measured 0%. */
+  test_coverage_score: number | null;
   scaffolding_score: number;
   skill_breadth_score: number;
   cadence_score: number;
@@ -453,7 +454,7 @@ export async function getCodebaseDetail(
         agentic_score: num(latest.agentic_score as number),
         health_score: num(latest.health_score as number),
         ai_commit_ratio: num(latest.ai_commit_ratio as number),
-        test_coverage_score: num(latest.test_coverage_score as number),
+        test_coverage_score: numOrNull(latest.test_coverage_score as number | null),
         scaffolding_score: num(latest.scaffolding_score as number),
         skill_breadth_score: num(latest.skill_breadth_score as number),
         cadence_score: num(latest.cadence_score as number),

@@ -53,17 +53,27 @@ export function AgenticScoreCard({ b }: { b: Breakdown }) {
 
       <div className="flex flex-col gap-3">
         {BARS.map((row) => {
-          const value = b[row.score] as number;
+          const value = b[row.score] as number | null;
           const weight = AGENTIC_WEIGHTS[row.key];
+          // A null sub-score means "not measured" and is excluded from the composite, so it
+          // must not render as an empty bar sitting at 0 — that reads as a measured failure.
+          const reported = value != null;
           return (
             <div key={row.key} className="flex flex-col gap-1">
               <div className="flex items-baseline justify-between text-xs">
                 <span className="text-ink-secondary">{row.label}</span>
                 <span className="text-ink-tertiary">
-                  {value} <span className="opacity-60">· {Math.round(weight * 100)}%</span>
+                  {reported ? value : <span className="italic">no report</span>}{" "}
+                  <span className="opacity-60">
+                    · {reported ? `${Math.round(weight * 100)}%` : "excluded"}
+                  </span>
                 </span>
               </div>
-              <Bar value={value} />
+              {reported ? (
+                <Bar value={value} />
+              ) : (
+                <div className="h-2 w-full rounded-full border border-dashed border-border-subtle" />
+              )}
             </div>
           );
         })}

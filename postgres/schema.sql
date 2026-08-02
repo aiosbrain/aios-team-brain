@@ -1451,7 +1451,7 @@ create table if not exists code_metrics (
   agentic_score numeric(5,2) not null default 0,
   health_score numeric(5,2) not null default 0,
   ai_commit_ratio numeric(5,2) not null default 0,
-  test_coverage_score numeric(5,2) not null default 0,
+  test_coverage_score numeric(5,2),               -- null = no coverage report (NOT a measured 0%)
   scaffolding_score numeric(5,2) not null default 0,
   skill_breadth_score numeric(5,2) not null default 0,
   cadence_score numeric(5,2) not null default 0,

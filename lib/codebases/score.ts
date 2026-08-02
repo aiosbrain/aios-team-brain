@@ -54,7 +54,8 @@ export interface ComputedScores {
   agentic_score: number;
   health_score: number;
   ai_commit_ratio: number;
-  test_coverage_score: number;
+  /** null = the repo filed no coverage report; NOT the same as a measured 0%. */
+  test_coverage_score: number | null;
   scaffolding_score: number;
   skill_breadth_score: number;
   cadence_score: number;
@@ -66,10 +67,40 @@ export function aiCommitRatio(i: ScanInputs): number {
   return clamp((100 * i.ai_commits_window) / Math.max(i.commits_window, 1));
 }
 
-/** Coverage normalized so 80% → 100 (null report → 0, surfaced as "no report" in UI). */
-export function coverageScore(i: ScanInputs): number {
-  if (i.test_coverage_pct == null) return 0;
+/**
+ * Coverage normalized so 80% → 100. Returns **null** when the repo filed no coverage report.
+ *
+ * It previously returned 0 for null, with a comment promising it was "surfaced as 'no report'
+ * in UI". That held for the aggregate tile, but not for the composites: a repo that has never
+ * reported coverage scored identically to a repo measured at 0%, and since coverage carries
+ * 40% of health_score and 25% of agentic_score, "we don't know" cost up to 40 points of health.
+ *
+ * That is not a hypothetical. A scaffolded workspace is a content repo with no test suite, and
+ * `coverage/` is gitignored so no clone can ever supply one — so EVERY workspace sat at a
+ * permanent 40-point health penalty for a test suite it was never supposed to have.
+ *
+ * Null now propagates, and `computeScores` renormalizes over the components that actually
+ * reported. Absence of evidence is not evidence of zero.
+ */
+export function coverageScore(i: ScanInputs): number | null {
+  if (i.test_coverage_pct == null) return null;
   return clamp((i.test_coverage_pct / 80) * 100);
+}
+
+/**
+ * Weighted mean over the components that reported, renormalized by their weights. A null
+ * component is EXCLUDED, not counted as zero — so dropping an unmeasurable signal leaves the
+ * remaining ones at full relative strength rather than silently capping the total.
+ */
+export function weightedScore(parts: Array<{ weight: number; value: number | null }>): number {
+  let weighted = 0;
+  let totalWeight = 0;
+  for (const { weight, value } of parts) {
+    if (value == null) continue;
+    weighted += weight * value;
+    totalWeight += weight;
+  }
+  return totalWeight === 0 ? 0 : weighted / totalWeight;
 }
 
 /** Presence of agent-native scaffolding (CLAUDE.md / AGENTS.md). */
@@ -107,23 +138,28 @@ export function computeScores(i: ScanInputs): ComputedScores {
   const cadence_score = cadenceScore(i);
   const issue_health = issueHealth(i);
 
-  const agentic_score =
-    AGENTIC_WEIGHTS.ai_commit_ratio * ai_commit_ratio +
-    AGENTIC_WEIGHTS.test_coverage_score * test_coverage_score +
-    AGENTIC_WEIGHTS.scaffolding_score * scaffolding_score +
-    AGENTIC_WEIGHTS.skill_breadth_score * skill_breadth_score +
-    AGENTIC_WEIGHTS.cadence_score * cadence_score;
+  // Renormalized over reported components — an unmeasured signal is dropped from the mean,
+  // never folded in as a zero. With coverage present both formulas are arithmetically
+  // identical to the previous straight weighted sum (the weights each total 1.0).
+  const agentic_score = weightedScore([
+    { weight: AGENTIC_WEIGHTS.ai_commit_ratio, value: ai_commit_ratio },
+    { weight: AGENTIC_WEIGHTS.test_coverage_score, value: test_coverage_score },
+    { weight: AGENTIC_WEIGHTS.scaffolding_score, value: scaffolding_score },
+    { weight: AGENTIC_WEIGHTS.skill_breadth_score, value: skill_breadth_score },
+    { weight: AGENTIC_WEIGHTS.cadence_score, value: cadence_score },
+  ]);
 
-  const health_score =
-    HEALTH_WEIGHTS.test_coverage_score * test_coverage_score +
-    HEALTH_WEIGHTS.cadence_score * cadence_score +
-    HEALTH_WEIGHTS.issue_health * issue_health;
+  const health_score = weightedScore([
+    { weight: HEALTH_WEIGHTS.test_coverage_score, value: test_coverage_score },
+    { weight: HEALTH_WEIGHTS.cadence_score, value: cadence_score },
+    { weight: HEALTH_WEIGHTS.issue_health, value: issue_health },
+  ]);
 
   return {
     agentic_score: round(agentic_score),
     health_score: round(health_score),
     ai_commit_ratio: round(ai_commit_ratio),
-    test_coverage_score: round(test_coverage_score),
+    test_coverage_score: test_coverage_score == null ? null : round(test_coverage_score),
     scaffolding_score: round(scaffolding_score),
     skill_breadth_score: round(skill_breadth_score),
     cadence_score: round(cadence_score),

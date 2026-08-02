@@ -30,8 +30,10 @@ const FULLY_AGENTIC: ScanInputs = {
 };
 
 describe("sub-scores", () => {
-  it("coverage: null report → 0; 80% → 100; 40% → 50", () => {
-    expect(coverageScore({ ...FULLY_AGENTIC, test_coverage_pct: null })).toBe(0);
+  it("coverage: no report → null; 0% → 0; 80% → 100; 40% → 50", () => {
+    // null and 0 are different facts: "never measured" vs "measured, covers nothing".
+    expect(coverageScore({ ...FULLY_AGENTIC, test_coverage_pct: null })).toBeNull();
+    expect(coverageScore({ ...FULLY_AGENTIC, test_coverage_pct: 0 })).toBe(0);
     expect(coverageScore({ ...FULLY_AGENTIC, test_coverage_pct: 80 })).toBe(100);
     expect(coverageScore({ ...FULLY_AGENTIC, test_coverage_pct: 40 })).toBe(50);
   });
@@ -76,13 +78,41 @@ describe("composite scores (weights locked)", () => {
     expect(s.health_score).toBe(100);
   });
 
-  it("dropping the coverage report lowers both scores (coverage carries weight)", () => {
+  it("a MEASURED 0% coverage lowers both scores (coverage carries weight)", () => {
     const withCov = computeScores(FULLY_AGENTIC);
-    const noCov = computeScores({ ...FULLY_AGENTIC, test_coverage_pct: null });
+    const zeroCov = computeScores({ ...FULLY_AGENTIC, test_coverage_pct: 0 });
     // agentic loses 0.25*100 = 25; health loses 0.4*100 = 40
-    expect(noCov.agentic_score).toBe(withCov.agentic_score - 25);
-    expect(noCov.health_score).toBe(withCov.health_score - 40);
-    expect(noCov.test_coverage_score).toBe(0);
+    expect(zeroCov.agentic_score).toBe(withCov.agentic_score - 25);
+    expect(zeroCov.health_score).toBe(withCov.health_score - 40);
+    expect(zeroCov.test_coverage_score).toBe(0);
+  });
+
+  it("NO coverage report is excluded from the composites, not scored as zero", () => {
+    // The regression that lets this recur: a repo that never filed a report used to score
+    // identically to a repo measured at 0%. Coverage is 40% of health, so every scaffolded
+    // workspace — a content repo with no suite, and `coverage/` gitignored so no clone can
+    // ever supply one — sat at a permanent 40-point penalty and showed as a false 0%.
+    const noCov = computeScores({ ...FULLY_AGENTIC, test_coverage_pct: null });
+    const zeroCov = computeScores({ ...FULLY_AGENTIC, test_coverage_pct: 0 });
+
+    expect(noCov.test_coverage_score).toBeNull();
+    expect(noCov.agentic_score).not.toBe(zeroCov.agentic_score);
+    expect(noCov.health_score).not.toBe(zeroCov.health_score);
+
+    // Renormalized over the components that DID report: the other four agentic weights total
+    // 0.75, and this fixture scores 100 on all of them except ai_commit_ratio (90).
+    // (0.15*90 + 0.25*100 + 0.20*100 + 0.15*100) / 0.75 = 98
+    expect(noCov.agentic_score).toBe(98);
+    // health: cadence + issue_health both 100, renormalized over 0.6 → 100
+    expect(noCov.health_score).toBe(100);
+  });
+
+  it("an unmeasured signal never drags a composite below its measured peers", () => {
+    // The invariant behind the fix, stated independently of the fixture's numbers.
+    const noCov = computeScores({ ...FULLY_AGENTIC, test_coverage_pct: null });
+    const zeroCov = computeScores({ ...FULLY_AGENTIC, test_coverage_pct: 0 });
+    expect(noCov.health_score).toBeGreaterThan(zeroCov.health_score);
+    expect(noCov.agentic_score).toBeGreaterThan(zeroCov.agentic_score);
   });
 
   it("the AI-commit trailer is a low-weight signal, not the backbone", () => {
