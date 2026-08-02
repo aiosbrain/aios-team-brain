@@ -12,6 +12,16 @@ portable: plain SQL migrations, Postgres-backed rate limiting, no Vercel-only de
 > **Last verified against code: 2026-07-29.** If a flow here disagrees with the code, the
 > code wins — fix the doc (same PR).
 
+## Agent skill publication
+
+Repository-local agent skills are authored once under `.claude/skills/`. The explicit
+publication manifest `.skill-runtimes.json` selects which canonical skills are projected
+to `.agents/skills/`, `.opencode/skills/`, and `.cursor/rules/`; merely finding a generated
+copy never publishes a skill. `scripts/sync-skill-runtimes.sh` performs deterministic
+generation and rejects unlisted or stale projections. CI runs `npm run check:skills` so a
+missing runtime, an orphaned generated copy, or an invalid manifest fails closed. These
+files are contributor tooling only and are not loaded by the Team Brain application.
+
 ## Sources of truth
 
 Where each piece of state lives, who may write it, who reads it, and how access is enforced.

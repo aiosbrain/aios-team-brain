@@ -18,7 +18,7 @@ jobs:
       AIOS_TEAM: ${{ secrets.AIOS_TEAM }}
       AIOS_PROJECT: aios-team-brain
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Post merged work event
         run: |
           node <<'NODE'

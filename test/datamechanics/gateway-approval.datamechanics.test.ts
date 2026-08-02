@@ -1,6 +1,7 @@
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { getPool } from "@/lib/db/pg/pool";
+import { canonicalize } from "@/lib/gateway/canonical";
 import {
   authorizeGatewayAdmin,
   createGatewayAdminPolicy,
@@ -398,6 +399,142 @@ describe("gateway durable approval and resume", () => {
     oldAuth.secretBytes.fill(0);
     newAuth.secretBytes.fill(0);
     stillActive.secretBytes.fill(0);
+    service.secretBytes.fill(0);
+  });
+
+  it("resolves an identical retry after credential rotation instead of 409ing (AIO-407 amendment)", async () => {
+    const { seed, ctx, service, executionId } = await approvedExecution();
+    const idempotencyKey = randomUUID();
+    let payloads = 0;
+    const winner = await resumeClaimGatewayExecution(
+      claimInput(seed, executionId, service, idempotencyKey, () => payloads++),
+    );
+    expect(winner.status).toBe("claimed");
+    expect(payloads).toBe(1);
+    const credentialId = randomBytes(16).toString("base64url");
+    const secret = randomBytes(32).toString("base64url");
+    await rotateGatewayCredential(ctx, seed.serviceIdentityId, {
+      credentialId,
+      secret,
+      replacesCredentialId: seed.credentialId,
+      correlationId: randomUUID(),
+    });
+    const rotatedAuth = await authenticateGatewayServiceCredential(
+      `Bearer aios_gw_${credentialId}_${secret}`,
+    );
+    expect(rotatedAuth.id).toBe(service.id);
+    expect(rotatedAuth.credentialRowId).not.toBe(service.credentialRowId);
+    // The defect: with credentialId/credentialVersion in the fingerprint this
+    // identical retry was permanently 409'd after rotation.
+    const retry = await resumeClaimGatewayExecution(
+      claimInput(seed, executionId, rotatedAuth, idempotencyKey, () => payloads++),
+    );
+    expect(retry).toEqual({
+      status: "already_claimed",
+      executionId,
+      state: "claimed",
+    });
+    expect(payloads).toBe(1);
+    // A change in any OTHER fingerprint field must still conflict.
+    await expect(
+      resumeClaimGatewayExecution({
+        ...claimInput(seed, executionId, rotatedAuth, idempotencyKey, () => payloads++),
+        requestHash: "a".repeat(64),
+      }),
+    ).rejects.toMatchObject({ code: "gateway_idempotency_conflict" });
+    expect(payloads).toBe(1);
+    rotatedAuth.secretBytes.fill(0);
+    service.secretBytes.fill(0);
+  });
+
+  it("resolves legacy pre-amendment stored fingerprints without widening acceptance", async () => {
+    const { seed, ctx, service, executionId } = await approvedExecution();
+    const idempotencyKey = randomUUID();
+    let payloads = 0;
+    await resumeClaimGatewayExecution(
+      claimInput(seed, executionId, service, idempotencyKey, () => payloads++),
+    );
+    // Rewrite the stored fingerprint to the pre-amendment (legacy) form that
+    // included the claiming credential's credentialId/credentialVersion —
+    // exactly what a row claimed before this fix carries in production.
+    const claimedRow = await getPool().query(
+      `select e.member_id, cc.credential_id, cc.version
+         from gateway_executions e
+         join gateway_service_credentials cc on cc.id=e.claimed_credential_id
+        where e.id=$1`,
+      [executionId],
+    );
+    const legacyFingerprint = createHash("sha256")
+      .update(
+        canonicalize({
+          credentialId: claimedRow.rows[0].credential_id,
+          credentialVersion: claimedRow.rows[0].version,
+          executionId,
+          executorSubjectId: seed.executorSubjectId,
+          executorTenantId: seed.executorTenantId,
+          memberId: claimedRow.rows[0].member_id,
+          requestHash: REQUEST_HASH,
+          serviceIdentityId: seed.serviceIdentityId,
+          teamId: seed.teamId,
+          tool: "github.repository.get",
+          toolkit: "aios-github-readonly",
+        }),
+        "utf8",
+      )
+      .digest("hex");
+    // resume_fingerprint is write-once (gateway_executions_protect), so plant
+    // the legacy value the way pre-fix code wrote it: toggle the trigger
+    // inside one transaction (ALTER TABLE is transactional, so the guard is
+    // never observably disabled outside it). Values are inlined because a
+    // multi-statement simple query cannot take bind parameters.
+    await getPool().query(`
+      begin;
+      alter table gateway_executions disable trigger gateway_executions_protect;
+      update gateway_executions set resume_fingerprint='${legacyFingerprint}'
+        where id='${executionId}';
+      alter table gateway_executions enable trigger gateway_executions_protect;
+      commit;
+    `);
+    // Identical retry with the same credential resolves via the legacy match.
+    const sameCredential = await resumeClaimGatewayExecution(
+      claimInput(seed, executionId, service, idempotencyKey, () => payloads++),
+    );
+    expect(sameCredential).toEqual({
+      status: "already_claimed",
+      executionId,
+      state: "claimed",
+    });
+    // Identical retry with a rotated sibling credential resolves too: the
+    // legacy fallback recomputes from the RECORDED claiming credential, not
+    // the authenticating one — legacy rows get the amended semantics.
+    const credentialId = randomBytes(16).toString("base64url");
+    const secret = randomBytes(32).toString("base64url");
+    await rotateGatewayCredential(ctx, seed.serviceIdentityId, {
+      credentialId,
+      secret,
+      replacesCredentialId: seed.credentialId,
+      correlationId: randomUUID(),
+    });
+    const rotatedAuth = await authenticateGatewayServiceCredential(
+      `Bearer aios_gw_${credentialId}_${secret}`,
+    );
+    const rotated = await resumeClaimGatewayExecution(
+      claimInput(seed, executionId, rotatedAuth, idempotencyKey, () => payloads++),
+    );
+    expect(rotated).toEqual({
+      status: "already_claimed",
+      executionId,
+      state: "claimed",
+    });
+    // A different fingerprint field never matches the legacy form either.
+    await expect(
+      resumeClaimGatewayExecution({
+        ...claimInput(seed, executionId, rotatedAuth, idempotencyKey, () => payloads++),
+        requestHash: "a".repeat(64),
+      }),
+    ).rejects.toMatchObject({ code: "gateway_idempotency_conflict" });
+    expect(payloads).toBe(1);
+    rotatedAuth.secretBytes.fill(0);
     service.secretBytes.fill(0);
   });
 
