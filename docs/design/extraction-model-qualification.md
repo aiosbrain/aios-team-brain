@@ -180,9 +180,49 @@ checked-in fixture must reproduce the discrimination the real episodes produced 
 
 If it cannot separate those eight, it is not a qualification probe and this does not ship on it.
 
-Episodes in the fixture are **synthetic but structurally matched** to the four real ones (the repo is
-public). The Linear-spec shape is mandatory: it is the only episode type on which several models
-collapse.
+### The acceptance run FAILED. Twice. This design is blocked on it.
+
+Episodes and dedupe candidates had to be **synthetic** (the repo is public). They were built
+structurally matched to the real ones — Linear-spec shape, full-name → bare-first-name merge,
+descriptive-label → named-entity merge, a false-merge trap.
+
+**Attempt 1** (one dedupe scenario, the direct synthetic analogue of the real one):
+`qwen3.6-35b-a3b` — the negative control, the model that actually polluted the graph — scored
+**3/3 correct**. The fixture cannot see the failure it exists to catch.
+
+**Attempt 2** (three harder scenarios, all must be correct):
+
+```
+qwen/qwen3.7-max        PASS   (correct on all three)
+qwen/qwen3.6-35b-a3b    PASS   ← the negative control passes. Still blind.
+qwen/qwen3.7-plus       FAIL   ← a model that is 3/3 on real content. FALSE NEGATIVE.
+openai/gpt-4o-mini      FAIL
+z-ai/glm-4.7-flash      FAIL
+```
+
+So the synthetic fixture is wrong in **both** directions: it passes the model we know damages the
+graph and rejects one we measured as good. Tuning it further would be fitting the fixture until it
+agrees with the conclusion — the precise failure this whole feature exists to prevent, and the one
+that produced the retraction above. **Stopping here is the criterion working, not the criterion
+failing.**
+
+The discrimination lived in the real corpus's entity names, not in the structure I could copy.
+
+### The design this points at instead: a DIFFERENTIAL probe, no fixture at all
+
+Do not ship an answer key. At save time, run the candidate model and the **incumbent** model over the
+same payload built from **this install's own recent `items`**, and flag when they disagree on identity
+resolution. That removes every problem above at once:
+
+- no synthetic fixture, so nothing to fit and nothing to drift;
+- no answer key, so no labelling of a corpus we cannot label;
+- self-calibrating per install, which is the same conclusion AIO-693's plan review reached about
+  thresholds (relative to this graph's own baseline, never an absolute);
+- it asks the question that actually matters — *is this worse than what we have* — rather than
+  *is this good in the abstract*.
+
+Cost roughly doubles (both models run) and it needs a definition of "disagree" that tolerates
+harmless variation. That is the next spec, and it should be written before any code.
 
 ## Schema drift — guarded, not hoped
 
