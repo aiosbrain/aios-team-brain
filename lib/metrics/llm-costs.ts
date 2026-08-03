@@ -2,6 +2,13 @@ import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { scopeLlmUsage, type QueryLogViewer } from "@/lib/auth/visibility";
 import { rangeDays, type Range } from "./range";
+import {
+  getLedgerLifetimeUsdExact,
+  getSpendCallCount,
+  getSpendSlices,
+  getSpendTotalUsd,
+  type SpendSlice,
+} from "./llm-spend";
 
 /**
  * The brain's own inference-spend breakdown, read from the `llm_usage` ledger (every generation the
@@ -78,36 +85,29 @@ export interface LlmCostBreakdown {
   by_provider: CostSlice[];
 }
 
-interface UsageRow {
-  source: string;
-  provider: string;
-  model: string;
-  cost_usd: number | string;
-  input_tokens: number;
-  output_tokens: number;
-  estimated: boolean;
-}
 
 /** Group rows by a key, summing cost/tokens/calls; returns slices sorted by cost desc. */
 function slicesBy(
-  rows: UsageRow[],
-  keyOf: (r: UsageRow) => string,
+  slices: SpendSlice[],
   labelOf: (k: string) => string,
   /** Failure attempts per key, folded in AFTER the spend pass — so a key that only ever failed still
    *  gets a row (it spent money we can't see), and `estimated` is decided purely by priced rows. */
   failuresByKey?: Map<string, number>
 ): CostSlice[] {
   const map = new Map<string, CostSlice>();
-  for (const r of rows) {
-    const key = keyOf(r) || "unknown";
+  for (const r of slices) {
+    const key = r.key || "unknown";
+    // MERGE, never replace. The SQL already folds ''/NULL into one 'unknown' group, so a collision
+    // should be impossible — but `map.set` would silently DROP a slice's dollars if one ever arrived,
+    // and a breakdown that quietly loses money is the bug this whole change exists to remove.
     const cur =
       map.get(key) ??
       { key, label: labelOf(key), cost_usd: 0, input_tokens: 0, output_tokens: 0, calls: 0, failed_attempts: 0, estimated: true };
-    cur.cost_usd += Number(r.cost_usd) || 0;
-    cur.input_tokens += Number(r.input_tokens) || 0;
-    cur.output_tokens += Number(r.output_tokens) || 0;
-    cur.calls += 1;
-    // A slice is "estimated" only if EVERY row in it is — one metered row makes it real.
+    cur.cost_usd += r.cost_usd;
+    cur.input_tokens += r.input_tokens;
+    cur.output_tokens += r.output_tokens;
+    cur.calls += r.calls;
+    // "estimated" is all-rows, so merging two groups keeps it only if BOTH are estimated.
     cur.estimated = cur.estimated && r.estimated;
     map.set(key, cur);
   }
@@ -132,16 +132,17 @@ export async function getLlmCostBreakdown(
   const days = rangeDays(range);
   const windowStart = new Date(Date.now() - days * 86_400_000);
 
-  const res = await scopeLlmUsage(
-    db
-      .from("llm_usage")
-      .select("source, provider, model, cost_usd, input_tokens, output_tokens, estimated")
-      .eq("team_id", teamId)
-      .gte("created_at", windowStart.toISOString())
-      .limit(100_000),
-    viewer
-  );
-  const rows = (res.data ?? []) as UsageRow[];
+  // EXACT, aggregated in Postgres. This used to fetch up to 100,000 rows and sum them here, which
+  // silently under-reported once the window held more rows than the cap — production hit that at
+  // 128,998 rows, reporting $88.33 against a true $98.84 while Pulse's lower 50k cap said $18.62.
+  // A larger cap would only move the cliff; `SUM`/`GROUP BY` has no cliff to move.
+  const [total_usd, calls, sourceSlices, modelSlices, providerSlices] = await Promise.all([
+    getSpendTotalUsd(db, teamId, days, viewer),
+    getSpendCallCount(db, teamId, days, viewer),
+    getSpendSlices(db, teamId, days, "source", viewer),
+    getSpendSlices(db, teamId, days, "model", viewer),
+    getSpendSlices(db, teamId, days, "provider", viewer),
+  ]);
 
   // Failures live in their OWN table, fetched separately — never merged into the row set above. Sharing
   // `llm_usage` would let a storm of $0 attempt rows evict real spend rows inside this query's 100k cap
@@ -165,9 +166,12 @@ export async function getLlmCostBreakdown(
   for (const f of counted) failuresBySource.set(f.source || "unknown", (failuresBySource.get(f.source || "unknown") ?? 0) + 1);
   const failed_attempts = counted.length;
 
-  const total_usd = rows.reduce((s, r) => s + (Number(r.cost_usd) || 0), 0);
-  const calls = rows.length;
-  const hasEstimates = rows.some((r) => r.estimated);
+  // "any estimated row exists" — a slice is `estimated` only when ALL its rows are, so a slice being
+  // estimated is sufficient evidence, and a mixed slice is covered by its own rows being counted
+  // elsewhere. Cheap and exact: derived from the grouped result, not a second scan.
+  // ANY estimate in the window. `slice.estimated` is bool_and (all-rows), so it alone would miss a
+  // MIXED slice — `any_estimated` is the bool_or companion computed in the same GROUP BY.
+  const hasEstimates = sourceSlices.some((s2) => s2.any_estimated);
 
   // Earliest metered call = when this team's ledger began (i.e. when metering shipped). Team-scoped,
   // NOT role-scoped: "metering began on X" is an instance-level fact, not per-member spend, and a
@@ -192,9 +196,9 @@ export async function getLlmCostBreakdown(
     hasEstimates,
     trackingSince,
     partialWindow,
-    by_source: slicesBy(rows, (r) => r.source, (k) => SOURCE_LABEL[k] ?? k, failuresBySource),
-    by_model: slicesBy(rows, (r) => r.model, (k) => k),
-    by_provider: slicesBy(rows, (r) => r.provider, (k) => k),
+    by_source: slicesBy(sourceSlices, (k) => SOURCE_LABEL[k] ?? k, failuresBySource),
+    by_model: slicesBy(modelSlices, (k) => k),
+    by_provider: slicesBy(providerSlices, (k) => k),
   };
 }
 
@@ -210,6 +214,12 @@ export async function getLlmCostBreakdown(
  * only meaningful comparison is the whole team's ledger. The caller gates this on `isAdmin` for the
  * same reason — a member's scoped subtotal beside a whole-key total would read as a huge fake gap.
  */
+/**
+ * Retained as the historical cap this function used to fetch under. Nothing reads it any more — the
+ * sum is exact — but the constant is exported, so it is kept and marked rather than silently dropped.
+ *
+ * @deprecated The lifetime total is now an exact SQL `SUM`; there is no cap to hit.
+ */
 export const LEDGER_LIFETIME_ROW_CAP = 500_000;
 
 export async function getLedgerLifetimeUsd(
@@ -217,25 +227,9 @@ export async function getLedgerLifetimeUsd(
   teamId: string,
   provider: string
 ): Promise<number | null> {
-  try {
-    const res = await db
-      .from("llm_usage")
-      .select("cost_usd")
-      // FILTERED BY PROVIDER, and this is the whole correctness of the comparison. The figure this is
-      // measured against comes from ONE provider's billing API. Summing every provider against it
-      // dilutes the gap toward zero — an Anthropic list-price estimate is real ledger spend that
-      // OpenRouter never charged, so counting it here would "account for" money that key never saw and
-      // quietly erase the very shortfall this exists to expose.
-      .eq("provider", provider)
-      .eq("team_id", teamId)
-      .limit(LEDGER_LIFETIME_ROW_CAP);
-    const rows = (res.data ?? []) as { cost_usd: number | string }[];
-    // At the cap Postgres returns an ARBITRARY subset (no ORDER BY), so the sum would be short — and a
-    // short ledger INFLATES the unattributed figure. Refusing to answer is the only honest option;
-    // the caller then shows no reconciliation rather than a confident overstatement.
-    if (rows.length >= LEDGER_LIFETIME_ROW_CAP) return null;
-    return rows.reduce((sum, r) => sum + (Number(r.cost_usd) || 0), 0);
-  } catch {
-    return null; // can't reconcile → the caller shows nothing rather than a wrong comparison
-  }
+  // Delegates to the exact aggregate. The old implementation fetched up to 500,000 rows and returned
+  // `null` when it hit the cap rather than under-report — the right instinct, and the reason the
+  // /costs reconciliation banner stayed correct while the headline beside it drifted. With an exact
+  // `SUM` there is nothing left to refuse, so the null case now means only "the query failed".
+  return getLedgerLifetimeUsdExact(db, teamId, provider);
 }
