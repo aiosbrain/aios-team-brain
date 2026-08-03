@@ -208,7 +208,7 @@ export default async function CostsPage({
         </div>
       ) : null}
 
-      {graphEfficiency.callsPerEpisode !== null && !graphEfficiency.truncated ? (
+      {graphEfficiency.callsPerEpisode !== null ? (
         <div
           className={`rounded-lg border px-3 py-2 text-xs ${
             graphEfficiency.degrading

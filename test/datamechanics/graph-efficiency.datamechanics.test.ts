@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { db, seedTeam } from "./helpers";
 import { recordLlmUsage } from "@/lib/costs/llm-usage";
+import { runSql } from "@/lib/db/pg/pool";
 import { getGraphEfficiency } from "@/lib/metrics/graph-efficiency";
 
 const ADMIN = { isAdmin: true, memberId: "00000000-0000-0000-0000-000000000000" };
@@ -42,6 +43,25 @@ describe("graph efficiency (data-mechanics)", () => {
     expect(eff.costPerEpisode).toBeCloseTo(0.006, 6);
     expect(eff.degrading).toBe(false);
   });
+
+  it("counts every graph call after the old 200,000-row cap", async () => {
+    // Regression for AIO-688/#471: cap+1 detected truncation but then hid the metric. That still
+    // discarded the exact signal in the high-volume regime the metric exists to diagnose. A literal
+    // row count keeps this decisive if somebody later reintroduces a differently named cap.
+    const seed = await seedTeam();
+    await pushRun(seed.teamId, 1);
+    await runSql(
+      `insert into llm_usage
+         (id, team_id, member_id, source, provider, model, cost_usd, input_tokens, output_tokens, estimated, created_at)
+       select gen_random_uuid(), $1, null, 'graph', 'openrouter', 'm', 0.001, 1, 1, false, now()
+         from generate_series(1, 200001)`,
+      [seed.teamId]
+    );
+
+    const eff = await getGraphEfficiency(db(), seed.teamId, "30d", ADMIN);
+    expect(eff.callsPerEpisode).toBe(200_001);
+    expect(eff.costPerEpisode).toBeCloseTo(200.001, 6);
+  }, 15_000);
 
   it("counts only the GRAPH source and this team's rows", async () => {
     const seed = await seedTeam();

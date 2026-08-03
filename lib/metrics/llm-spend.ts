@@ -125,6 +125,48 @@ export async function getSpendDailyUsd(
   return out;
 }
 
+/** Exact graph-extraction usage for one UTC day. */
+export interface GraphUsageDay {
+  day: string;
+  calls: number;
+  costUsd: number;
+}
+
+/**
+ * Exact daily numerator for graph efficiency.
+ *
+ * This must stay an aggregate: fetching raw `llm_usage` rows under a cap makes calls-per-episode and
+ * cost-per-episode look artificially LOW once extraction crosses that cap — precisely when the
+ * metric is meant to warn. The viewer predicate is retained even though the current caller is
+ * admin-only, so this ledger read cannot become a team-spend leak if it is reused later.
+ */
+export async function getGraphUsageDaily(
+  _db: unknown,
+  teamId: string,
+  startIso: string,
+  viewer: QueryLogViewer
+): Promise<GraphUsageDay[]> {
+  const scope = viewerPredicate(viewer, 4);
+  const { rows } = await runSql<{
+    day: string | Date;
+    calls: string | number;
+    cost_usd: string | number;
+  }>(
+    `select to_char(date_trunc('day', created_at at time zone 'UTC'), 'YYYY-MM-DD') as day,
+            count(*) as calls,
+            coalesce(sum(cost_usd), 0) as cost_usd
+       from llm_usage
+      where team_id = $1 and created_at >= $2 and source = $3${scope.sql}
+      group by 1`,
+    [teamId, startIso, "graph", ...scope.params]
+  );
+  return rows.map((r) => ({
+    day: String(r.day),
+    calls: Number(r.calls) || 0,
+    costUsd: Number(r.cost_usd) || 0,
+  }));
+}
+
 /** One grouped slice, pre-aggregated by Postgres. */
 export interface SpendSlice {
   key: string;

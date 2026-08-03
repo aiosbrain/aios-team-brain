@@ -1,6 +1,7 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import type { QueryLogViewer } from "@/lib/auth/visibility";
+import { getGraphUsageDaily, type GraphUsageDay } from "./llm-spend";
 import { rangeDays, type Range } from "./range";
 
 /**
@@ -77,13 +78,6 @@ export interface GraphEfficiency {
    * a stable model, the exact nagging the "requires rising" rule was supposed to prevent.
    */
   degrading: boolean;
-  /**
-   * True when the call fetch hit its cap, so the numerator is incomplete and every ratio here is an
-   * UNDERSTATEMENT. Set deliberately rather than silently truncating: the cap binds first in exactly
-   * the regime this metric exists to catch (a degraded model makes more calls), so a quiet truncation
-   * would report "healthy" precisely while money burns. The UI shows nothing when this is true.
-   */
-  truncated: boolean;
 }
 
 interface DayBucket {
@@ -98,14 +92,14 @@ const utcDay = (v: string | Date): string =>
 const ratio = (n: number, d: number): number | null => (d > 0 ? n / d : null);
 
 /**
- * Fold raw rows into per-day buckets. Pure, so the arithmetic — especially the divide-by-zero and the
- * "rising" comparison — is testable without a database.
+ * Fold exact daily usage aggregates and raw projector runs into per-day buckets. Pure, so the
+ * arithmetic — especially the divide-by-zero and the "rising" comparison — is testable without a
+ * database.
  */
 export function foldGraphEfficiency(
-  callRows: { created_at: string | Date; cost_usd: number | string }[],
+  usageDays: GraphUsageDay[],
   /** `meta.episodes` is the denominator; a run without it predates the counter and is SKIPPED. */
-  runRows: { started_at: string | Date; meta: unknown }[],
-  truncated = false
+  runRows: { started_at: string | Date; meta: unknown }[]
 ): GraphEfficiency {
   const buckets = new Map<string, DayBucket>();
   const at = (day: string): DayBucket => {
@@ -113,10 +107,10 @@ export function foldGraphEfficiency(
     buckets.set(day, cur);
     return cur;
   };
-  for (const r of callRows) {
-    const b = at(utcDay(r.created_at));
-    b.calls += 1;
-    b.costUsd += Number(r.cost_usd) || 0;
+  for (const r of usageDays) {
+    const b = at(r.day);
+    b.calls += r.calls;
+    b.costUsd += r.costUsd;
   }
   for (const r of runRows) {
     const n = (r.meta as { episodes?: unknown } | null)?.episodes;
@@ -161,8 +155,7 @@ export function foldGraphEfficiency(
     days,
     callsPerEpisode: overall,
     costPerEpisode: ratio(totalCost, totalEpisodes),
-    degrading: !truncated && overall !== null && overall > HEALTHY_CALLS_PER_EPISODE && rising,
-    truncated,
+    degrading: overall !== null && overall > HEALTHY_CALLS_PER_EPISODE && rising,
   };
 }
 
@@ -172,17 +165,7 @@ const EMPTY: GraphEfficiency = {
   callsPerEpisode: null,
   costPerEpisode: null,
   degrading: false,
-  truncated: false,
 };
-
-/**
- * Cap on the call fetch, +1 so truncation is DETECTABLE rather than silent. `getLedgerLifetimeUsd`
- * refuses to answer at its cap for the same reason: past it, an unordered fetch returns an arbitrary
- * subset, and an arbitrary subset of the numerator is a ratio that is wrong in the safe-looking
- * direction. At the degraded rate this branch is reachable inside the default window, which is exactly
- * why it must not be a silent slice.
- */
-const CALL_ROW_CAP = 200_000;
 
 /**
  * Graph extraction's work-per-episode over the window. ADMIN ONLY, enforced here.
@@ -202,14 +185,8 @@ export async function getGraphEfficiency(
 ): Promise<GraphEfficiency> {
   if (!viewer.isAdmin) return EMPTY;
   const windowStart = new Date(Date.now() - rangeDays(range) * 86_400_000).toISOString();
-  const [callsRes, runsRes] = await Promise.all([
-    db
-      .from("llm_usage")
-      .select("created_at, cost_usd")
-      .eq("team_id", teamId)
-      .eq("source", "graph")
-      .gte("created_at", windowStart)
-      .limit(CALL_ROW_CAP + 1),
+  const [usageDays, runsRes] = await Promise.all([
+    getGraphUsageDaily(db, teamId, windowStart, viewer),
     db
       .from("ingest_runs")
       .select("started_at, meta")
@@ -218,11 +195,8 @@ export async function getGraphEfficiency(
       .gte("started_at", windowStart)
       .limit(20_000),
   ]);
-  const callRows = (callsRes.data ?? []) as { created_at: string | Date; cost_usd: number | string }[];
-  const truncated = callRows.length > CALL_ROW_CAP;
   return foldGraphEfficiency(
-    truncated ? callRows.slice(0, CALL_ROW_CAP) : callRows,
-    (runsRes.data ?? []) as { started_at: string | Date; meta: unknown }[],
-    truncated
+    usageDays,
+    (runsRes.data ?? []) as { started_at: string | Date; meta: unknown }[]
   );
 }
