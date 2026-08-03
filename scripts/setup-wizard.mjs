@@ -17,9 +17,8 @@
  *
  * 1. Invent answers. With no terminal (CI, a pipeline) it stops and prints the flag-driven form,
  *    rather than defaulting its way to a misconfigured instance and reporting success.
- * 2. Deploy. The Railway path delegates to `setup.mjs`, which classifies every command against
- *    `railway-policy.mjs` — `up`/`redeploy`/`down`/`delete` are refused there, so this file cannot
- *    reach them either.
+ * 2. Deploy without a human gate. The Railway path prints the official template URL and asks the
+ *    operating system to open it; Railway owns the reviewed resource summary and final approval.
  */
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
@@ -38,7 +37,8 @@ import {
   validateSlug,
   validateTeamName,
 } from "./setup/interview.mjs";
-import { PROBE_BAD_CREDENTIAL, PROBE_OK, dockerVerdict, probeCredential } from "./setup/probe.mjs";
+import { PROBE_OK, dockerVerdict, probeCredential } from "./setup/probe.mjs";
+import { RAILWAY_PLANS_URL, RAILWAY_TEMPLATE_URL } from "./setup/railway-template.mjs";
 
 const ENV_FILE = ".env.local";
 
@@ -60,7 +60,7 @@ async function interview(p, out) {
   out.write("\n  Where should this brain run?\n\n");
   const target = await p.choose("", TARGETS, { def: 0 });
   const answers = { target };
-  if (target === "demo") return answers;
+  if (target === "demo" || target === "railway") return answers;
 
   const needs = new Set(questionsFor(target));
   out.write("\n  A few details, then I'll show you the plan before touching anything.\n\n");
@@ -110,16 +110,6 @@ async function preflight(answers, out) {
     // exists either way.
     const r = sh("docker", ["info"]);
     checks.push(["docker", dockerVerdict({ status: r.status ?? 1, stderr: r.stderr || r.stdout })]);
-  }
-
-  if (answers.target === "railway") {
-    const r = sh("railway", ["whoami"]);
-    checks.push([
-      "railway",
-      r.status === 0
-        ? { verdict: PROBE_OK, detail: (r.stdout || "").trim() || "authenticated" }
-        : { verdict: PROBE_BAD_CREDENTIAL, detail: "not logged in — run `railway login` (opens a browser), then re-run" },
-    ]);
   }
 
   if (answers.llmKey || answers.baseUrl) {
@@ -215,28 +205,20 @@ async function runDemo(out) {
   return streamed("docker", ["compose", "up"]);
 }
 
-async function runRailway(answers, out) {
-  out.write("\n  Provisioning on Railway. This never deploys — the GitHub connection does that.\n\n");
-  const args = [
-    "scripts/setup.mjs",
-    "--slug", answers.slug,
-    "--name", answers.teamName,
-    "--email", answers.email,
-    "--member-name", answers.memberName,
-  ];
-  // Carry whichever provider the user actually chose. Forwarding only Anthropic meant an
-  // OpenAI/OpenRouter key was validated live and then dropped, leaving an instance that could not
-  // answer anything while the wizard reported success.
-  const providerFlag = { anthropic: "--anthropic-key", openai: "--openai-key", openrouter: "--openrouter-key" }[
-    answers.provider
-  ];
-  if (providerFlag && answers.llmKey) args.push(providerFlag, answers.llmKey);
-  if (answers.baseUrl) args.push("--llm-base-url", answers.baseUrl);
-  if (answers.resendKey) args.push("--resend-key", answers.resendKey, "--resend-from", answers.resendFrom ?? "");
-  out.write("  (dry run first — nothing is written yet)\n\n");
-  const dry = await streamed("node", [...args, "--dry-run"]);
-  if (dry !== 0) return dry;
-  return streamed("node", args);
+export async function runRailway(_answers, out, { open = sh, platform = process.platform } = {}) {
+  out.write("\n  Prerequisite: the Railway workspace you select must have an active plan.\n");
+  out.write(`  Plans: ${RAILWAY_PLANS_URL}\n`);
+  out.write("\n  Railway will ask for your team and first-admin details, then deploy the app + Postgres.\n");
+  out.write("  No GitHub fork or local Railway CLI is required for the first deployment.\n\n");
+  out.write(`  ${RAILWAY_TEMPLATE_URL}\n\n`);
+
+  const command = platform === "darwin" ? ["open", [RAILWAY_TEMPLATE_URL]]
+    : platform === "win32" ? ["cmd", ["/c", "start", "", RAILWAY_TEMPLATE_URL]]
+      : ["xdg-open", [RAILWAY_TEMPLATE_URL]];
+  const opened = open(command[0], command[1]);
+  if ((opened.status ?? 1) === 0) out.write("  ✓ opened the deploy page in your browser\n\n");
+  else out.write("  Could not open a browser automatically — copy the URL above.\n\n");
+  return 0;
 }
 
 // ── main ────────────────────────────────────────────────────────────────────

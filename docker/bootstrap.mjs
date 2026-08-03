@@ -18,7 +18,7 @@ import path from "node:path";
 import { randomBytes } from "node:crypto";
 import pg from "pg";
 import { shouldUseSsl } from "../scripts/pg-load-schema.mjs";
-import { credentialPlan } from "../scripts/setup/credential-plan.mjs";
+import { credentialPlan, credentialSummary } from "../scripts/setup/credential-plan.mjs";
 
 const DATABASE_URL = process.env.DATABASE_URL;
 if (!DATABASE_URL) {
@@ -206,9 +206,7 @@ async function provisionRealTeam() {
   const url = process.env.APP_URL || "http://localhost:3000";
   console.log(
     ["", "─".repeat(58), `  ${name} is ready`, "", `  URL       ${url}/t/${slug}`, `  Login     ${email}`,
-     plan.password
-       ? `  Password  ${plan.password}   ← copy it now, this is the only time it is shown`
-       : "  Password  unchanged — your existing login still works",
+     credentialSummary({ password: plan.password, supplied: Boolean(process.env.ADMIN_PASSWORD) }),
      "", "  Next: Admin → Integrations to connect Slack / GitHub / Linear.",
      "─".repeat(58), ""].join("\n")
   );
