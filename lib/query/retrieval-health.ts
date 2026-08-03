@@ -192,9 +192,18 @@ export async function getRetrievalHealth(teamId: string): Promise<RetrievalHealt
   // Reachable + writing, but projected episodes aren't becoming facts (Graphiti's extractor is failing
   // on every job). Only meaningful when reachable — an unreachable service reports facts=null.
   // The lag compares against `graphNewestEpisodeAt`, NOT `lastProjectedAtMs`. They differ by exactly
-  // the thing that matters: `lastProjectedAtMs` counts every ledger touch (correct for `isGraphStale`
-  // — "is the projector alive"), while the lag needs the newest episode actually PUSHED, since a
+  // the thing that matters: `lastProjectedAtMs` is the newest `projected_at` on ANY ledger row
+  // regardless of the sentinel, while the lag needs the newest episode actually PUSHED, since a
   // redaction wave bumps the ledger without producing anything for Graphiti to extract.
+  //
+  // Since GRAPHCOST-1, `projected_at` advances only on a pass that actually POSTed episodes: a
+  // re-projection whose chunks were all unchanged (an edit past the extraction cap) writes the ledger
+  // and deliberately leaves the timestamp alone, because bumping it would make `newestEpisodeAtMs`
+  // above report a push that never happened and cry wolf on the extraction-lag probe. The tradeoff is
+  // here: `isGraphStale` reads "the projector is alive" from pushes, so a ≥6h window whose ONLY
+  // projection activity was such passes reads as quiet. That is a widening of a false-positive the
+  // unchanged-content skip already had (it never bumped either), and it errs toward the alarm that is
+  // actionable — "nothing has been pushed in 6h" is true in that window.
   const graphExtractionStalled =
     graphReachable &&
     deriveGraphExtractionStalled({
