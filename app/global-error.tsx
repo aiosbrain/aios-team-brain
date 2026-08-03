@@ -40,7 +40,7 @@ export default function GlobalError({
           }}
         >
           <h2 style={{ fontSize: "1.25rem", fontWeight: 600 }}>Something went wrong</h2>
-          <p style={{ color: "#666", maxWidth: "32rem" }}>
+          <p style={{ color: "GrayText", maxWidth: "32rem" }}>
             An unexpected error occurred and has been reported. You can try again.
           </p>
           <button
@@ -49,7 +49,7 @@ export default function GlobalError({
             style={{
               padding: "0.5rem 1rem",
               borderRadius: "0.5rem",
-              border: "1px solid #ccc",
+              border: "1px solid ButtonBorder",
               cursor: "pointer",
             }}
           >

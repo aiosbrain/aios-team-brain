@@ -104,10 +104,8 @@ h3 {
 
 .prism-card-hover:hover {
   background: var(--color-surface-card-hover);
-  border-color: rgba(139, 92, 246, 0.3);
-  box-shadow:
-    0 4px 24px rgba(124, 58, 237, 0.1),
-    0 1px 8px rgba(45, 212, 191, 0.07);
+  border-color: color-mix(in srgb, var(--aios-violet) 30%, transparent);
+  box-shadow: var(--aios-shadow-glow-featured-hover);
   transform: translateY(-1px);
 }
 
@@ -156,7 +154,7 @@ h3 {
 }
 
 .btn-ghost:hover {
-  border-color: rgba(139, 92, 246, 0.35);
+  border-color: color-mix(in srgb, var(--aios-violet) 35%, transparent);
   color: var(--color-ink);
 }
 
@@ -173,8 +171,8 @@ h3 {
 
 .prism-input:focus {
   outline: none;
-  border-color: rgba(139, 92, 246, 0.5);
-  box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.12);
+  border-color: color-mix(in srgb, var(--aios-violet) 50%, transparent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--aios-violet) 12%, transparent);
 }
 
 /* ── Markdown body (no typography plugin — hand-rolled prose) ──────────── */
@@ -260,7 +258,7 @@ h3 {
 }
 
 .prose-prism blockquote {
-  border-left: 3px solid rgba(139, 92, 246, 0.4);
+  border-left: 3px solid color-mix(in srgb, var(--aios-violet) 40%, transparent);
   padding-left: 1em;
   margin-bottom: 1em;
   color: var(--color-ink-tertiary);

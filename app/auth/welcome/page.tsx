@@ -46,7 +46,7 @@ export default async function WelcomePage({
         className="pointer-events-none absolute inset-0"
         style={{
           background:
-            "radial-gradient(60% 50% at 50% 0%, rgba(124,58,237,0.07), transparent 70%), radial-gradient(40% 40% at 80% 100%, rgba(45,212,191,0.06), transparent 70%)",
+            "radial-gradient(60% 50% at 50% 0%, color-mix(in srgb, var(--aios-violet) 7%, transparent), transparent 70%), radial-gradient(40% 40% at 80% 100%, color-mix(in srgb, var(--aios-cyan) 6%, transparent), transparent 70%)",
         }}
       />
       <div className="relative w-full max-w-sm">

@@ -15,7 +15,7 @@ import { ChartCard } from "./chart-card";
 
 const SERIES: { key: keyof KnowledgePoint; color: string }[] = [
   { key: "deliverable", color: PRISM.violet },
-  { key: "transcript", color: PRISM.blue },
+  { key: "transcript", color: PRISM.accent },
   { key: "decision", color: PRISM.amber },
   { key: "task", color: PRISM.emerald },
   { key: "skill", color: PRISM.fuchsia },
@@ -24,7 +24,7 @@ const SERIES: { key: keyof KnowledgePoint; color: string }[] = [
 
 export function KnowledgeGrowth({ data }: { data: KnowledgePoint[] }) {
   const empty = data.every((d) =>
-    SERIES.every((s) => (d[s.key] as number) === 0)
+    SERIES.every((s) => (d[s.key] as number) === 0),
   );
 
   return (
@@ -36,21 +36,25 @@ export function KnowledgeGrowth({ data }: { data: KnowledgePoint[] }) {
         <>
           <span className="font-medium text-ink">What this is</span>
           <br />
-          New items the brain learned each day, stacked by kind (deliverable, transcript, decision,
-          task, skill, artifact).
+          New items the brain learned each day, stacked by kind (deliverable,
+          transcript, decision, task, skill, artifact).
           <br />
           <br />
           Each item is counted on the day it was{" "}
-          <span className="font-medium text-ink">first seen</span> (its <code>created_at</code>, set
-          once on insert) — not when it was last re-synced. That&apos;s the difference between real
-          growth and churn: the sync scheduler touches most items every 30 minutes, so bucketing on
-          sync time would make almost everything look brand-new every day.
+          <span className="font-medium text-ink">first seen</span> (its{" "}
+          <code>created_at</code>, set once on insert) — not when it was last
+          re-synced. That&apos;s the difference between real growth and churn:
+          the sync scheduler touches most items every 30 minutes, so bucketing
+          on sync time would make almost everything look brand-new every day.
         </>
       }
       empty={empty}
     >
       <ResponsiveContainer width="100%" height={140}>
-        <AreaChart data={data} margin={{ top: 4, right: 4, left: -20, bottom: 0 }}>
+        <AreaChart
+          data={data}
+          margin={{ top: 4, right: 4, left: -20, bottom: 0 }}
+        >
           <CartesianGrid vertical={false} stroke={GRID_STROKE} />
           <XAxis
             dataKey="date"
@@ -59,7 +63,13 @@ export function KnowledgeGrowth({ data }: { data: KnowledgePoint[] }) {
             axisLine={false}
             minTickGap={28}
           />
-          <YAxis tick={AXIS_TICK} tickLine={false} axisLine={false} width={32} allowDecimals={false} />
+          <YAxis
+            tick={AXIS_TICK}
+            tickLine={false}
+            axisLine={false}
+            width={32}
+            allowDecimals={false}
+          />
           <Tooltip contentStyle={TOOLTIP_STYLE} />
           {SERIES.map((s) => (
             <Area

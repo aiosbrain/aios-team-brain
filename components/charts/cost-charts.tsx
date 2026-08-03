@@ -22,9 +22,11 @@ import { AXIS_TICK, GRID_STROKE, PRISM, TOOLTIP_STYLE } from "./palette";
 import { ChartCard } from "./chart-card";
 
 /** Stable provider → color. Falls back to a cycle for unknown providers. */
+// Governed provider-identity exception: Cursor's brand blue is not a published AIOS token.
+export const CURSOR_PROVIDER_BLUE = "#3b82f6";
 const PROVIDER_COLOR: Record<string, string> = {
   claude: PRISM.violet,
-  cursor: PRISM.blue,
+  cursor: CURSOR_PROVIDER_BLUE,
   codex: PRISM.emerald,
   opencode: PRISM.amber,
   anthropic: PRISM.fuchsia,
@@ -33,11 +35,11 @@ const PROVIDER_COLOR: Record<string, string> = {
 };
 const CYCLE = [
   PRISM.violet,
-  PRISM.blue,
+  PRISM.fuchsia,
   PRISM.emerald,
   PRISM.amber,
   PRISM.cyan,
-  PRISM.fuchsia,
+  PRISM.accent,
   PRISM.red,
 ];
 /**
@@ -125,7 +127,7 @@ export function SpendByProviderChart({
 }
 
 const TOKEN_COLORS = {
-  input: PRISM.blue,
+  input: PRISM.accent,
   output: PRISM.violet,
   cache_read: PRISM.cyan,
 };

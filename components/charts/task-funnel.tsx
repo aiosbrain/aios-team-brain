@@ -6,7 +6,7 @@ import { AXIS_TICK, PRISM, TOOLTIP_STYLE } from "./palette";
 import { ChartCard } from "./chart-card";
 
 const STATUS_COLOR: Record<string, string> = {
-  backlog: "rgba(15,15,17,0.30)",
+  backlog: "color-mix(in srgb, var(--aios-fg) 30%, transparent)",
   ready: PRISM.cyan,
   in_progress: PRISM.violet,
   blocked: PRISM.red,
@@ -52,7 +52,7 @@ export function TaskFunnel({ data }: { data: FunnelPoint[] }) {
             axisLine={false}
             width={84}
           />
-          <Tooltip contentStyle={TOOLTIP_STYLE} cursor={{ fill: "rgba(124,58,237,0.06)" }} />
+          <Tooltip contentStyle={TOOLTIP_STYLE} cursor={{ fill: "color-mix(in srgb, var(--aios-violet) 6%, transparent)" }} />
           <Bar dataKey="count" radius={[0, 4, 4, 0]} maxBarSize={22}>
             {data.map((d) => (
               <Cell key={d.status} fill={STATUS_COLOR[d.status] ?? PRISM.violet} />
