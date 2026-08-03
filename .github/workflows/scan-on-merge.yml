@@ -22,6 +22,8 @@ on:
 
 permissions:
   contents: read
+  issues: read
+  pull-requests: read
 
 # One scan at a time; newer pushes supersede in-flight ones.
 concurrency:
