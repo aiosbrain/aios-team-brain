@@ -105,9 +105,10 @@ export function validateBaseUrl(value) {
  */
 export function questionsFor(target) {
   if (target === "demo") return ["confirm-demo"];
+  if (target === "railway") return ["railway-template"];
   const shared = ["team-slug", "team-name", "admin-email", "admin-name", "llm-provider"];
   if (target === "local") return shared;
-  return [...shared, "mail-transport"]; // Railway invites go out by email; local logs in directly
+  return shared;
 }
 
 /**
@@ -131,10 +132,10 @@ export function planFor(answers) {
     ];
   }
   return [
-    { id: "railway-project", label: `Create the Railway project aios-${answers.slug} + Postgres` },
-    { id: "railway-domain", label: "Claim a public domain and set the environment" },
-    { id: "github", label: "Hand off the GitHub connection (the deploy path — yours to click)" },
-    { id: "team", label: `Create team "${answers.slug}" and your admin login` },
+    { id: "railway-template", label: "Open the official AIOS Team Brain Railway template" },
+    { id: "railway-config", label: "Enter your team and first-admin details in Railway" },
+    { id: "railway-deploy", label: "Deploy Team Brain + Postgres and wait for the healthy public URL" },
+    { id: "railway-connect", label: "Sign in and create an API key for your individual workspace" },
   ];
 }
 

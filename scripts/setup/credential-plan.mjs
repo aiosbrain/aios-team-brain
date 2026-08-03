@@ -30,3 +30,13 @@ export function credentialPlan({ hasCredential, adminPassword, generate = defaul
   if (hasCredential) return { action: "skip", password: null };
   return { action: "create", password: adminPassword || generate() };
 }
+
+/**
+ * A generated local password must be shown once. A supplied deployment password must never be
+ * copied into container logs: the operator already chose it and Railway retains it as a variable.
+ */
+export function credentialSummary({ password, supplied }) {
+  if (!password) return "  Password  unchanged — your existing login still works";
+  if (supplied) return "  Password  set from ADMIN_PASSWORD — value not printed";
+  return `  Password  ${password}   ← copy it now, this is the only time it is shown`;
+}

@@ -16,8 +16,13 @@ import {
   probeRequestFor,
   verdictForStatus,
 } from "../scripts/setup/probe.mjs";
-import { composeEnvFor } from "../scripts/setup-wizard.mjs";
-import { credentialPlan } from "../scripts/setup/credential-plan.mjs";
+import { composeEnvFor, runRailway } from "../scripts/setup-wizard.mjs";
+import { credentialPlan, credentialSummary } from "../scripts/setup/credential-plan.mjs";
+import {
+  RAILWAY_PLANS_URL,
+  RAILWAY_TEMPLATE_URL,
+  RAILWAY_TEMPLATE_INPUTS,
+} from "../scripts/setup/railway-template.mjs";
 import {
   LLM_PROVIDERS,
   TARGETS,
@@ -126,7 +131,7 @@ describe("the interview asks the routing question first", () => {
     // Asking for a Railway login before knowing the user wants Docker wastes their time.
     expect(questionsFor("demo")).toEqual(["confirm-demo"]);
     expect(questionsFor("local")).not.toContain("mail-transport"); // local logs in directly
-    expect(questionsFor("railway")).toContain("mail-transport"); // invites go out by email
+    expect(questionsFor("railway")).toEqual(["railway-template"]); // Railway owns its form
   });
 
   it("never asks for a secret it can generate", () => {
@@ -144,10 +149,41 @@ describe("the interview asks the routing question first", () => {
     expect(ids.indexOf("compose")).toBeLessThan(ids.indexOf("team")); // DB must exist first
   });
 
-  it("plans a Railway install that hands the deploy to GitHub rather than deploying", () => {
+  it("plans a Railway template deploy with no GitHub-fork pause", () => {
     const ids = planFor({ target: "railway", slug: "acme" }).map((s) => s.id);
-    expect(ids).toContain("github");
-    expect(ids.join(" ")).not.toMatch(/\bup\b|redeploy/); // the four forbidden verbs, never
+    expect(ids).toEqual(["railway-template", "railway-config", "railway-deploy", "railway-connect"]);
+    expect(ids).not.toContain("github");
+  });
+
+  it("opens the stable deploy front door and always prints a copyable fallback", async () => {
+    const output: string[] = [];
+    const open = vi.fn(() => ({ status: 0, stdout: "", stderr: "" }));
+    await runRailway({}, { write: (s: string) => output.push(s) }, { open, platform: "darwin" });
+    expect(open).toHaveBeenCalledWith("open", [RAILWAY_TEMPLATE_URL]);
+    expect(output.join("")).toContain(RAILWAY_TEMPLATE_URL);
+    expect(output.join("")).toContain("active plan");
+    expect(output.join("")).toContain(RAILWAY_PLANS_URL);
+    expect(output.join("")).not.toMatch(/Fork aiosbrain|run `railway login`/i);
+  });
+
+  it("keeps template-owned identity inputs explicit", () => {
+    expect(RAILWAY_TEMPLATE_INPUTS).toEqual([
+      "TEAM_NAME", "TEAM_SLUG", "ADMIN_NAME", "ADMIN_EMAIL", "ADMIN_PASSWORD",
+    ]);
+  });
+
+  it("preserves Docker bootstrap behavior under Railway's start-command override", () => {
+    const config = JSON.parse(
+      readFileSync(join(import.meta.dirname, "..", "railway.json"), "utf8"),
+    );
+    const start = readFileSync(
+      join(import.meta.dirname, "..", "scripts", "railway-start.sh"),
+      "utf8",
+    );
+    expect(config.deploy.startCommand).toBe("sh scripts/railway-start.sh");
+    expect(start).not.toContain('AIOS_TEMPLATE_BOOTSTRAP:-false');
+    expect(start).toContain("node docker/bootstrap.mjs");
+    expect(start).toContain("exec npm start");
   });
 });
 
@@ -396,6 +432,12 @@ describe("the local install keeps its login across a restart", () => {
 
   it("honours an operator-supplied password over a generated one", () => {
     expect(credentialPlan({ hasCredential: false, adminPassword: "mine" }).password).toBe("mine");
+  });
+
+  it("does not render an operator-supplied password into deployment logs", () => {
+    expect(credentialSummary({ password: "mine", supplied: true })).not.toContain("mine");
+    expect(credentialSummary({ password: "mine", supplied: true })).toMatch(/not printed/i);
+    expect(credentialSummary({ password: "generated", supplied: false })).toContain("generated");
   });
 
   it("pins WHY skipping means not running the command — admin.ts always sets a password", () => {

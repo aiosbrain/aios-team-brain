@@ -39,12 +39,15 @@ curl -fsSL https://aiosbrain.dev/install.sh | sh
 ```
 
 It checks your prerequisites, fetches the repo, and hands you to an interview: run it **on this
-machine** (your own team, real install), **on Railway** (the shared server a team actually uses), or
+machine** (your own team, real install), **on Railway** (opens the official one-click template), or
 **just the demo**. It asks only what your choice needs, **proves your model key works
 before going further** — a wrong paste is caught there, not three steps later at an empty query box —
 then shows the plan before touching anything. Already cloned? `npm run setup` is the same wizard.
 
-It never uses `sudo`, never overwrites an existing install, and never deploys.
+It never uses `sudo` or overwrites an existing install. The Railway choice opens the official
+template; the selected Railway workspace must have an **active plan** first. Activate one at
+**https://railway.com/workspace/plans**. Railway then shows the complete app + Postgres plan and asks
+for confirmation before deploying.
 [`install.sh`](install.sh) is short and commented — read it before you pipe it, as you should with
 any installer.
 
@@ -146,13 +149,13 @@ drive it yourself.
 | 2 | Set the environment variables | ~3 min | wizard |
 | 3 | Load the schema (`npm run pg:schema`) | ~1 min | wizard |
 | 4 | Load the vector schema (`npm run pg:schema:vector`) | ~1 min | **yours** — needs an embeddings model chosen first |
-| 5 | Create the first team + admin | ~1 min | wizard (on Railway, the `--resume` run after you connect the repo) |
+| 5 | Create the first team + admin | ~1 min | bootstrap during first start |
 | 6 | Connect one source | ~4 min | **yours** — the Admin UI is the only legal writer for tokens |
 | + | Add Neo4j + Graphiti | later, or never | **yours**, §2.8 |
 
-On the Railway path there's one more step no CLI can take for you: connecting your GitHub
-repository, which is also the deploy path. The wizard stops there and tells you exactly what to
-click.
+On the Railway path, the wizard opens **https://aiosbrain.dev/deploy/team-brain/**. The template
+deploys directly from the official repository, so a GitHub fork and `--resume` run are not required.
+An **active Railway plan** in the selected workspace is a prerequisite.
 
 Everything below is that sequence in dependency order, with the failure modes called out.
 
@@ -289,59 +292,36 @@ Kubernetes all work. Only §2.1 is Railway-specific.
 Each step explains *why*, so you can tell when something has gone wrong rather than pattern-matching
 on green output.
 
-> **You probably don't need to read this section. `npm run setup` does §2.1–§2.4 for you** — it's an
-> interview, not a flag soup: it asks where to run (this machine / Railway / demo), collects only the
-> credentials that choice needs, **proves the model key works with a free metadata request** (a wrong
-> paste surfaces there, not later as an empty answer box), and shows you the plan before touching
-> anything. On Railway it creates the project (named `aios-<slug>`, which is what
-> `scripts/service-guard.mjs` requires), adds Postgres, **generates** `AUTH_SECRET` and `SECRETS_KEY`
-> at the right widths, claims a domain and reads `APP_URL` back from it, sets the variables, and —
-> after you connect the repo — creates your team and first admin.
+> **Railway users don't need to read §2.1–§2.4.** Start at the
+> [official one-click template](https://aiosbrain.dev/deploy/team-brain/). An active Railway plan is
+> required. The template creates the app and Postgres, generates the application secrets, asks for
+> only the team and first-admin details, applies the schema, and bootstraps the login.
 >
-> Read on when you're deploying somewhere the wizard doesn't cover, debugging a run that went wrong,
-> or you'd simply rather do it yourself and know why each step exists.
-> ```bash
-> railway login                                        # browser OAuth; can't be automated
-> npm run setup -- --slug acme --name "Acme Robotics" --email you@acme.com --dry-run
-> npm run setup -- --slug acme --name "Acme Robotics" --email you@acme.com
-> ```
-> It **never deploys.** `railway up`/`redeploy`/`down`/`delete` are refused by
-> `scripts/railway-policy.mjs`, which every command it builds is checked against; the first
-> release comes from pushing to `main` through the GitHub integration, the same as every release
-> after it. Its provisioning verbs do write, so each is gated on proof that the CLI is still
-> pointed at the project this run created — a drifted `variables --set` would overwrite another
-> project's environment the way a drifted `up` once overwrote Kula's code. Read the steps below
-> anyway: the script automates them, it doesn't replace understanding what they do.
->
-> Agents: the `setup-brain` skill drives this and reads the failures.
+> Read on only for a non-Railway host, local development, or debugging a failed deployment.
 
 ### 2.1 — Create the services
 
-Fork or clone [`aiosbrain/aios-team-brain`](https://github.com/aiosbrain/aios-team-brain) to your own
-GitHub account first — deploys happen by pushing to your `main`.
+On Railway, use the [official template](https://aiosbrain.dev/deploy/team-brain/); it deploys from
+the official repository and adds Postgres without a fork, local CLI, or `--resume` step.
 
-On Railway: **New Project → Deploy from GitHub repo**, pick your fork, then **New → Database →
-Postgres** in the same project. That's the whole topology for a base install: one web service, one
-Postgres.
-
-> ⚠️ **Name the web service `aios` or `aios-<something>`.** A guard in `scripts/service-guard.mjs`
-> aborts the schema load if `RAILWAY_SERVICE_NAME` doesn't match that pattern — it exists because
-> this repo once loaded its schema into a different project's database and took it down. On a
-> non-Railway host the guard is inert. (`npm run setup` names the project for you, so this can only
-> bite a hand-created service.)
+On another host, deploy this repository as one web service and attach one Postgres 16 database.
 
 Add the graph services (§2.8) later, only if you want narrative arcs.
 
 ### 2.2 — Set the environment variables
 
-In your host's variables UI (Railway: service → **Variables**), set at minimum:
+The Railway template owns the database reference, generated secrets, and public-domain reference.
+You enter `TEAM_NAME`, `TEAM_SLUG`, `ADMIN_NAME`, `ADMIN_EMAIL`, and `ADMIN_PASSWORD` in Railway's
+reviewed form.
+
+For a manual non-template deployment, set at minimum:
 
 ```bash
-DATABASE_URL=${{Postgres.DATABASE_URL}}   # Railway: reference the Postgres service
+DATABASE_URL=postgres://user:password@host:5432/database
 PGSSL=require                             # managed Postgres almost always needs this
 AUTH_SECRET=<64 hex chars>                # node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
 SECRETS_KEY=<32 bytes base64>             # node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
-APP_URL=https://your-brain.up.railway.app # your real public URL
+APP_URL=https://your-brain.example.com    # your real public URL
 ANTHROPIC_API_KEY=sk-ant-...              # or configure a provider per-team in Admin later
 RESEND_API_KEY=re_...                     # magic links; without a transport, production sends nothing
 RESEND_FROM="AIOS <noreply@yourdomain.com>"
@@ -349,8 +329,8 @@ RESEND_FROM="AIOS <noreply@yourdomain.com>"
 
 `APP_URL` matters more than it looks: invite and magic links are built in server actions where there
 is no request origin to fall back on, so without it every login link your team receives is broken.
-It also can't be known until the domain exists — which is why `npm run setup` claims the domain
-first and reads the value back, rather than asking you to guess it.
+For the official Railway template this is wired to the generated public domain automatically; on a
+manual host, set it after the domain exists rather than guessing it in advance.
 
 Full reference in §3, including everything optional. `npm run doctor` checks the ones above that
 fail silently rather than at boot.
@@ -363,13 +343,15 @@ Push to `main`. Your host builds and starts the app. On Railway, the whole of `r
 {
   "$schema": "https://railway.com/railway.schema.json",
   "deploy": {
-    "preDeployCommand": "npm run pg:schema"
+    "preDeployCommand": "npm run pg:schema",
+    "startCommand": "sh scripts/railway-start.sh"
   }
 }
 ```
 
-So **every deploy applies the schema before the new version goes live**, and a schema failure aborts
-the release rather than shipping app code ahead of its database. On another host, run
+The repository also routes Railway startup through the same idempotent bootstrap used by the Docker
+entrypoint. So **every deploy applies the schema before the new version goes live**, and a schema
+failure aborts the release rather than shipping app code ahead of its database. On another host, run
 `npm run pg:schema` as a release/pre-deploy command with `DATABASE_URL` in the environment.
 
 **What `pg:schema` actually does** — and it is not what the name suggests. It runs
@@ -391,19 +373,18 @@ fast instead of queueing every query in the database behind it.
 
 ### 2.4 — Create your team and your first admin
 
-These run against the production database, so run them through your host's shell. On Railway:
+The official Railway template performs this step idempotently from the form values on first boot.
+The password is never printed to deployment logs, and restarts preserve an existing credential.
+
+For a manual non-template deployment, run these against the production database:
 
 ```bash
-railway run -s Postgres bash -lc 'DATABASE_URL=$DATABASE_PUBLIC_URL \
-  npx tsx --conditions react-server scripts/admin.ts create-team acme --name "Acme Robotics"'
-
-railway run -s Postgres bash -lc 'DATABASE_URL=$DATABASE_PUBLIC_URL \
-  npx tsx --conditions react-server scripts/admin.ts create-member you@acme.com \
-  --name "Your Name" --handle you --role admin --team acme'
+npm run admin -- create-team acme --name "Acme Robotics"
+npm run admin -- create-member you@acme.com \
+  --name "Your Name" --handle you --role admin --team acme
 ```
 
-Anywhere else, export `DATABASE_URL` and run `npm run admin -- <command>`. `npm run setup -- --resume`
-runs both of these for you after the first deploy and surfaces the password.
+Export `DATABASE_URL` before running them.
 
 > **`create-member` prints a generated password once and never again.** Copy it — that is how you log
 > in. Pass `--password` to choose your own.

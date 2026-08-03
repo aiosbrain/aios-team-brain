@@ -13,7 +13,7 @@
 #   - Never clobbers an existing install. If the directory is already a Team Brain checkout it
 #     re-runs setup there; if it exists and is something else, it stops. An installer that
 #     re-initialises a working instance destroys its secrets — see the rotation bug this repo fixed.
-#   - Never deploys anything. The wizard's Railway path provisions only; deploys go through GitHub.
+#   - Never deploys without confirmation. The Railway choice opens the official template page.
 #
 # Overridable: AIOS_DIR (where to install), AIOS_REF (git ref to check out), AIOS_REPO.
 set -eu

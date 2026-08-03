@@ -8,6 +8,21 @@ revision **v1.15**.
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-08-03
+
+### Added
+
+- **One-click Team Brain onboarding (AIO-445)** — the official Railway template provisions the
+  app and Postgres together, collects team and first-admin details in Railway, generates the app
+  secrets, and bootstraps a usable admin login on first start. `npm run setup` opens the stable
+  `aiosbrain.dev` deploy front door without requiring a GitHub fork or local Railway CLI.
+
+### Changed
+
+- The shared onboarding contract is v3: Create now stops for deployment approval, opens the
+  Railway template, and then resumes the same canonical-origin and `GET /api/v1/me` validation
+  used by Join. Operator-supplied admin passwords are no longer printed in deployment logs.
+
 ## [0.9.0] — 2026-08-01
 
 The Brain API contract is unchanged at **v1.15** — no member-facing route, shape,
