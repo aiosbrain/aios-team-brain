@@ -49,6 +49,13 @@ const STALE_MS_BY_SOURCE: Record<string, number | null> = {
   dense: null,
   linear_inbound: null,
   graph_project: null,
+  // `arcs` records the narrative-arc CONTINUITY of a synthesis, and only when the model actually ran —
+  // a hash-skip (unchanged facts) and a served-from-cache view both write nothing. So its newest row's
+  // age is "last time arcs were re-synthesized", not "last time the poller ran", and any age threshold
+  // would flag a team whose work simply hasn't changed. A failed synthesis records `ok=false` (tracking
+  // `untrustworthy`, NOT `payloadDegraded` — the bytes served on that branch are the good prior that was
+  // correctly kept, so payload health would have reported the failure as success).
+  arcs: null,
   // The record-only-when-active rule in its strongest form. `doc_task_infer` IS polled reliably — the
   // scheduler calls it every tick for every team (`lib/ingest/scheduler.ts`), alongside the timeline's
   // background rebuild — so this is NOT a case of "maybe nothing triggered it". It is that FIVE of its

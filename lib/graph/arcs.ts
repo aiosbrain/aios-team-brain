@@ -19,6 +19,8 @@ import {
 import { freshness, computedNow, type Freshness } from "@/lib/freshness";
 import { listArcCorrections, recordArcCorrections } from "./arc-corrections";
 import { arcIneligibleItemIds } from "./arc-eligibility";
+import { recordIngestRun } from "@/lib/ingest/runs";
+import { reconcileArcIdentity, stableArcTarget, type ArcContinuity } from "./arc-continuity";
 
 /**
  * Layer 3 — narrative arcs. Gathers the recent graph substrate (facts, tier-scoped, and NOT
@@ -42,6 +44,11 @@ export interface ArcEvidence {
 
 export interface NarrativeArc {
   id: string;
+  /** Prior arcs this one ABSORBED — they are gone from the set (`lib/graph/arc-continuity`). */
+  supersedes?: string[];
+  /** The prior this arc SPLIT OUT OF, when that prior is still alive under a different arc. Distinct
+   *  from `supersedes` on purpose: nothing was superseded, so saying so would be false. */
+  splitFrom?: string;
   title: string;
   confidence: "high" | "medium" | "low";
   summary: string;
@@ -108,14 +115,30 @@ const EMPTY_CLOBBER_MAX_AGE_MS = (() => {
 /** Requested arc count for one synthesis: scale with the number of distinct contributors in the
  *  balanced facts (≈2 arcs each) so a varied, multi-person team isn't pinned to a flat number —
  *  floored at 6, capped at MAX_ARCS. Pure + unit-tested. */
+/** The floor `arcsRequested` never goes below. Exported to `stableArcTarget` as its band floor, so the
+ *  hysteresis anchor can never drag the request beneath a value the request itself could produce. */
+export const MIN_ARCS_REQUESTED = 6;
+
 export function arcsRequested(contributorCount: number): number {
-  return Math.min(MAX_ARCS, Math.max(6, 2 * contributorCount));
+  return Math.min(MAX_ARCS, Math.max(MIN_ARCS_REQUESTED, 2 * contributorCount));
 }
 
 /** The synthesis system prompt, parameterized by how many arcs to request. Explicitly instructs the
  *  model to split ONE contributor's distinct workstreams into separate arcs (the fix for a person's
  *  varied work collapsing into a single arc) rather than merging them. */
-function buildSystemPrompt(requested: number): string {
+function buildSystemPrompt(requested: number, priorTitles: string[] = []): string {
+  // CONTINUITY. Every recompute used to be de novo — the model never saw its own previous answer, so it
+  // re-invented both the partition and the wording daily. Showing it the standing arcs costs a few
+  // tokens and removes most gratuitous rewording, which is churn the reconciler would otherwise have to
+  // repair after the fact. It is a nudge, not the mechanism: identity is settled deterministically by
+  // `reconcileArcIdentity`, precisely because prompt compliance is not something to depend on.
+  const continuity = priorTitles.length
+    ? " CONTINUITY — these arcs were active in the previous synthesis: " +
+      priorTitles.map((t) => `"${t}"`).join(", ") +
+      ". Keep an arc's title UNCHANGED if its work is still ongoing. Split one only if it has genuinely " +
+      "diverged into separate workstreams; merge two only if they have converged; drop one only if its " +
+      "work has stopped. Do not rename an arc merely to phrase it differently."
+    : "";
   return (
     `You are analyzing a team knowledge graph. Identify up to ${requested} active narrative arcs — ongoing ` +
     "storylines about what this team is working through. Favor RECENT activity and give every active " +
@@ -129,7 +152,8 @@ function buildSystemPrompt(requested: number): string {
     "names not present in the facts or their attributions. Return ONLY a JSON object of the form " +
     '{"arcs":[{"title":"short","confidence":"high|medium|low","summary":"2-3 sentences, present tense, ' +
     'specific","participants":["names"],"supporting_facts":[1,2,3]}]}. Use only fact numbers that appear ' +
-    "below. No prose, no markdown code fences — the raw JSON object only."
+    "below. No prose, no markdown code fences — the raw JSON object only." +
+    continuity
   );
 }
 
@@ -599,6 +623,10 @@ export interface SynthesisResult {
   /** Non-null when the window HAD facts. `null` = genuinely nothing to synthesize from — which is why
    *  `arcs: []` with a non-null hash is a model failure rather than the truth (see `commitArcs`). */
   factsHash: string | null;
+  /** How much of the PREVIOUS arc set survived this synthesis (`lib/graph/arc-continuity`). Reported so
+   *  the caller can record it — "arcs feel unstable" was unmeasurable before, and a stability fix you
+   *  cannot measure is a stability fix you cannot confirm. Null when the model wasn't run. */
+  continuity?: ArcContinuity | null;
   /** A dependency this synthesis needed failed (episode→item resolution, credit, the eligibility gate),
    *  so the arcs are plausible but wrong — typically unattributed, or unfiltered backlog noise. Reported
    *  as DATA so `commitArcs` can refuse to overwrite good arcs and refuse to stamp this fresh (H11). */
@@ -798,11 +826,29 @@ async function synthesizeArcs(
   // Request arcs proportional to how many distinct contributors actually made the balanced cut, so a
   // varied team gets more than a flat ceiling and each person's distinct threads have room to surface.
   const contributorCount = new Set(facts.map(humanOfFact).filter(Boolean)).size;
-  const systemPrompt = buildSystemPrompt(arcsRequested(contributorCount));
+  // Hold the requested count steady across recomputes. Deriving it purely from today's contributor
+  // count meant one person going quiet moved the target and forced the model to re-partition work that
+  // had not changed — churn manufactured by the request, not by the team.
+  const requested = stableArcTarget(
+    arcsRequested(contributorCount),
+    prior?.arcs.length ?? 0,
+    MIN_ARCS_REQUESTED,
+    MAX_ARCS
+  );
+  // TWO prompts on purpose. The model gets the CONTINUITY block (the standing arc titles); the stability
+  // hash is computed over the version WITHOUT it.
+  //
+  // The hash answers exactly one question — "did the input WORK change?" — and prior titles are not work.
+  // Folding them in makes the hash change whenever the model reworded anything last run, so an unchanged
+  // fact set re-synthesizes anyway and the reuse guard quietly stops working: the continuity nudge would
+  // have disabled the very stability mechanism it was added to reinforce.
+  const systemPrompt = buildSystemPrompt(requested, (prior?.arcs ?? []).map((a) => a.title));
+  const systemPromptForHash = buildSystemPrompt(requested);
   const userPrompt = buildPrompt(attributedFactTexts(facts, epToItem, primaryByItem), allCorrections);
 
   // The stability key must cover EVERYTHING that determines the arcs' displayed content:
-  //  • systemPrompt — so a deploy that edits the prompt / arc count re-synthesizes (not just fact churn);
+  //  • systemPromptForHash — the prompt MINUS the continuity block, so a deploy that edits the prompt or
+  //    changes the requested arc count re-synthesizes, while a mere rewording of last run's titles does not;
   //  • userPrompt   — the attributed fact texts (a re-attribution rewrites the "(Name)" prefixes → new hash);
   //  • contribDigest — the per-item CONTRIBUTOR SET (arc `participants` come from this, NOT the prompt), so a
   //    contributor-set-only correction (e.g. locking to the SAME primary to drop a spurious credit) still
@@ -811,7 +857,7 @@ async function synthesizeArcs(
   const balancedItems = [...new Set(facts.map(itemOfFact).filter(Boolean))].sort();
   const contribDigest = balancedItems.map((id) => `${id}:${(contributorsByItem.get(id) ?? []).join(",")}`).join("\n");
   const factsHash = createHash("sha256")
-    .update(systemPrompt)
+    .update(systemPromptForHash)
     .update("\n--facts--\n")
     .update(userPrompt)
     .update("\n--contributors--\n")
@@ -846,7 +892,13 @@ async function synthesizeArcs(
     : parsed;
   // Rank by recency → relevance so recent contributors' arcs lead, then attribute AI-agent names to
   // the humans behind each arc's own evidence.
-  return { arcs: rankArcs(attributeArcs(coherent, contributorsByItem)), factsHash, degraded };
+  // IDENTITY RECONCILIATION — the last step, after ranking/attribution have settled the final set.
+  // Matches each arc to the previous set on the source items its evidence cites and inherits that id,
+  // so a reworded arc over the same work is a CONTINUATION rather than a new arc. Without this, `id` is
+  // sha(title) and every rephrasing was a different arc (M7).
+  const ranked = rankArcs(attributeArcs(coherent, contributorsByItem));
+  const { arcs: reconciled, continuity } = reconcileArcIdentity(prior?.arcs ?? [], ranked);
+  return { arcs: reconciled, factsHash, degraded, continuity };
 }
 
 // In-memory cache (per process). Keyed by the tier-visible group set. Fronts the Postgres `arc_cache`
@@ -1024,12 +1076,50 @@ function refreshArcsInBackground(
   refreshing.add(key);
   void (async () => {
     const bg = adminClient();
+    const startedAt = Date.now();
     try {
       // Not route-bound → give the reasoning model the full window (BG_ARC_TIMEOUT_MS). `prior` lets the
       // fact-set-hash guard skip the LLM when nothing changed. Run the extra evidence-COHERENCE pass HERE
       // (background only — the route-bound cold-miss/correction paths can't afford the second LLM call).
-      const { arcs, factsHash, degraded } = await synthesizeArcs(bg, teamId, groups, [], keys, BG_ARC_TIMEOUT_MS, prior, true);
-      await commitArcs(bg, teamId, key, arcs, factsHash, { degraded }); // fire-and-forget: nobody awaits its freshness
+      const { arcs, factsHash, degraded, continuity } = await synthesizeArcs(bg, teamId, groups, [], keys, BG_ARC_TIMEOUT_MS, prior, true);
+      const committed = await commitArcs(bg, teamId, key, arcs, factsHash, { degraded }); // fire-and-forget: nobody awaits its freshness
+      // Record how much of the previous set survived. "Arcs feel unstable" was unmeasurable — `arc_cache`
+      // keeps only the CURRENT set, so there was no way to say whether carry-over was 30% or 90%, and
+      // therefore no way to confirm a stability fix actually worked (CLAUDE.md §3). Only the background
+      // path records: it is the one that runs on a schedule, so the series is comparable over time.
+      // Best-effort, and only when the model actually ran (`continuity` is null on a hash-skip/reuse).
+      if (continuity) {
+        // A synthesis that produced NOTHING while facts existed is a model failure, not a stability
+        // observation. It reconciles to ratio 0 and `commitArcs` correctly keeps the healthy prior, so
+        // recording it would log a transient outage as 100% churn and poison the very series this
+        // change exists to create — while `payloadDegraded` stays false (the bytes served ARE the good
+        // prior), which is why `ok` has to follow `untrustworthy` instead.
+        const modelFailed = continuity.nextCount === 0 && factsHash !== null;
+        await recordIngestRun(bg, {
+          teamId,
+          source: "arcs",
+          // View-triggered (SWR), not the poller. `scheduler` rows are read as poller-heartbeat evidence
+          // in pipeline-health; this one is not that.
+          trigger: "api",
+          ok: !committed.untrustworthy,
+          created: continuity.nextCount,
+          meta: {
+            // `group_key` is the tier scope: a team with external viewers records a row per group set,
+            // and the external one is smaller. Without this the two are indistinguishable and the
+            // eyeballed trend silently mixes them.
+            group_key: key,
+            ...(modelFailed
+              ? { synthesis_failed: true }
+              : {
+                  carried_over: continuity.carriedOver,
+                  prior_count: continuity.priorCount,
+                  // Rounded: the point is a trend you can eyeball, not float noise.
+                  continuity_pct: Math.round(continuity.ratio * 100),
+                }),
+          },
+          startedAt,
+        }).catch(() => {});
+      }
     } catch (err) {
       console.error("[arcs] background refresh failed:", err instanceof Error ? err.message : err);
     } finally {
