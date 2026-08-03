@@ -71,7 +71,37 @@ is_published() {
   return 1
 }
 
+# Memoized. This is called far more than it looks: three times directly (the startup guard, `check_all`,
+# the summary line) PLUS once per generated artifact, because `is_manifest_published` re-reads the whole
+# list to answer one membership question and the orphan loops ask it for every runtime dir and .mdc rule.
+# On this repo that was ~15 full node startups per `--check`, for a file that cannot change mid-run —
+# measured at 16.4s for the check→prune→check trio one test performs, against vitest's 5s budget. It only
+# ever passed on a warm filesystem cache. Memoized: 1.6s.
+#
+# LOAD-BEARING: every other call site runs `list_published` inside a subshell (`< <(...)`, `$(...)`),
+# whose cache write is discarded. The win exists only because the startup guard below
+# (`list_published >/dev/null || exit 2`) populates the cache in the MAIN shell first, so the subshells
+# inherit it. Move or drop that guard and this silently degrades to no caching at all.
+#
+# The "set" flag is separate from the value on purpose: keying on a non-empty string would make an empty
+# published list uncacheable AND emit a stray blank line, which `wc -l` counts — reporting "1 published
+# skills" for a manifest with none, and quietly defeating the non-vacuity test that asserts published > 0.
+_PUBLISHED_CACHE=""
+_PUBLISHED_CACHE_SET=0
 list_published() {
+  if [[ "$_PUBLISHED_CACHE_SET" != 1 ]]; then
+    local out
+    out="$(_list_published_uncached)" || return $?
+    _PUBLISHED_CACHE="$out"
+    _PUBLISHED_CACHE_SET=1
+  fi
+  # Emit nothing for an empty list, exactly as the uncached node path does. Guarded rather than
+  # unconditional so `set -e` can't see a failing `[[ ]]` as the function's exit status.
+  if [[ -n "$_PUBLISHED_CACHE" ]]; then printf '%s\n' "$_PUBLISHED_CACHE"; fi
+  return 0
+}
+
+_list_published_uncached() {
   node -e '
     const fs = require("node:fs");
     const p = process.argv[1];

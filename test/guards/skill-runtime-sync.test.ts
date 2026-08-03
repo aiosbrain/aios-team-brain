@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { spawnSync } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -21,6 +21,24 @@ import { join } from "node:path";
  * mutates the real working tree to prove itself can leave the repo dirty (or get those mutations
  * committed) if it dies mid-test.
  */
+
+/**
+ * Every test here SPAWNS `scripts/sync-skill-runtimes.sh` — the orphan test three times (check → prune →
+ * check) — against a throwaway copy of the runtime dirs in $TMPDIR.
+ *
+ * That test used to fail roughly one run in six on unchanged code. A guard that fails at random is worse
+ * than no guard: it teaches everyone to re-run instead of investigate, which is exactly how a REAL drift
+ * failure gets waved through.
+ *
+ * The cause was not flakiness in any meaningful sense — it was measured. Its three invocations took
+ * **16.4s** against vitest's 5s default, because the script re-ran its manifest parse (a full node
+ * startup) ~15 times per `--check`: three directly, plus once per generated artifact, since
+ * `is_manifest_published` re-reads the whole list to answer one membership question. It passed at all
+ * only when the filesystem cache happened to be warm. Memoizing that parse took the trio to 1.6s (10x),
+ * which is the actual fix; this explicit budget is headroom for slower CI runners, not the remedy. See
+ * `scripts/sync-skill-runtimes.sh`.
+ */
+vi.setConfig({ testTimeout: 30_000 });
 
 const ROOT = join(import.meta.dirname, "..", "..");
 const RUNTIME_DIRS = [".claude", ".agents", ".opencode", ".cursor"];
@@ -72,6 +90,22 @@ describe("skill runtime sync guard", () => {
     const { out } = check();
     const published = Number(/(\d+) published skills/.exec(out)?.[1] ?? 0);
     expect(published, `--check inspected no skills, so it cannot be catching drift:\n${out}`).toBeGreaterThan(0);
+  });
+
+  it("an EMPTY manifest reports 0 published skills, so the non-vacuity check above can fire", () => {
+    // The tripwire above only works if the count is honest. A memoization keyed on "cache is non-empty"
+    // made the empty list uncacheable AND emitted a stray blank line, which `wc -l` counts — so a
+    // manifest publishing nothing reported "1 published skills" and the guard-inspects-nothing test
+    // stayed green. The bug specifically laundered the one condition that test exists to catch.
+    withSandbox((dir) => {
+      writeFileSync(join(dir, ".skill-runtimes.json"), JSON.stringify({ version: 1, published: [] }));
+      for (const d of [join(dir, ".agents", "skills"), join(dir, ".opencode", "skills")]) {
+        rmSync(d, { recursive: true, force: true });
+      }
+      rmSync(join(dir, ".cursor", "rules"), { recursive: true, force: true });
+      const { out } = check(dir);
+      expect(/(\d+) published skills/.exec(out)?.[1], out).toBe("0");
+    });
   });
 
   it("fails when a canonical SKILL.md drifts from its copies", () => {
