@@ -26,6 +26,31 @@ who reads it**. The map only pays off if it's trustworthy, so:
 
 ---
 
+## Task gate — a Linear task + a written spec BEFORE you build a feature ⚠️
+
+Every feature starts as a **real Linear task**, created through the **AIOS CLI**, with a **spec** —
+not as a branch that acquires a justification afterwards.
+
+- **Create the task first:** add a row to `3-log/tasks-team.md` in the AIOS workspace and
+  `aios push 3-log/tasks-team.md`. The brain's `tasks` table is canonical and projects one-way into
+  Linear (`lib/pm-sync/`), so this is the only path that yields a key both the brain and Linear agree
+  on. Read the projected key back (`task_pm_links.provider_url`) and cite THAT in the branch, the PR,
+  and the `AIOS-Work:` trailer.
+- **Never invent or borrow a key.** A fabricated `AIO-xxx` links work to nothing; a real key grabbed
+  because it exists links a week of work to someone else's ticket — both have happened here, and the
+  second was worse, because an invented key resolves to nothing while a real-but-wrong one silently
+  files your work under a stranger's name.
+- **Write the spec before the code**, not after. For anything touching schema, money, or more than one
+  surface, that means a short doc in `docs/design/` that states the problem, the decision, and what
+  would falsify it — then a Fable plan review on that doc. Design review has caught a wrong data model
+  (a column that should have been a table), a wrong migration shape, and a metric measured in the
+  wrong unit — each of them cheaper to fix in prose than in a merged PR.
+- **Why the order matters:** a task written afterwards is a description of what you did, which is
+  never the same artefact as a decision about what to do. The spec is where the alternative you
+  didn't take gets recorded, and that is the part future-you actually needs.
+
+---
+
 ## Review gate — a local review of the diff is REQUIRED before you push ⚠️
 
 Many sessions/worktrees ship into this repo in parallel and merge fast — a pre-push review of the
