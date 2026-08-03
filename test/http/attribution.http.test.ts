@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { BASE_URL, issueAdminKey, issueKeyFor, keyHeaders, seedTeam } from "./http-helpers";
 import { ingest } from "../datamechanics/helpers";
 
-// HTTP edge of GET /api/v1/attribution (attribution health context layer, brain-api v1.13): auth, the
+// HTTP edge of GET /api/v1/attribution (attribution health context layer, documented in brain-api v1.16): auth, the
 // team-ADMIN gate (all-tier read, no RLS backstop — an external or non-admin principal must never reach
 // it), the summary wire shape, and the per-member drill-down. Seeding uses the shared test DB.
 
