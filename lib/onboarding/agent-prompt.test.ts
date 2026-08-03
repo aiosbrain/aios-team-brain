@@ -74,12 +74,24 @@ describe("buildAgentOnboardingPrompt", () => {
       teamName: "Acme",
       brainUrl: "https://brain.example.com/t/acme",
     });
-    expect(contract.version).toBe(2);
+    expect(contract.version).toBe(3);
     for (const marker of contract.requiredMarkers)
       expect(prompt).toContain(marker);
     for (const marker of contract.forbiddenMarkers)
       expect(prompt).not.toContain(marker);
     expect(prompt).toMatch(/team_id.*optional/i);
     expect(prompt).not.toMatch(/--team-id\s+acme/);
+  });
+
+  it("describes the approved Railway deploy and validated Join handoff", () => {
+    const prompt = buildAgentOnboardingPrompt({
+      teamSlug: "acme",
+      teamName: "Acme",
+      brainUrl: "https://brain.example.com",
+    });
+    expect(prompt).toMatch(/official Railway template/);
+    expect(prompt).toMatch(/stop for approval before opening the browser/);
+    expect(prompt).toMatch(/resume the Join path/);
+    expect(prompt).toMatch(/GET \/api\/v1\/me/);
   });
 });

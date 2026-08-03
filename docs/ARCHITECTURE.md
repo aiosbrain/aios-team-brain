@@ -9,8 +9,26 @@ portable: plain SQL migrations, Postgres-backed rate limiting, no Vercel-only de
 > ingestion sources) are guarded against drift by `scripts/check-docs-drift.mjs` — see
 > [Docs drift guard](#docs-drift-guard).
 >
-> **Last verified against code: 2026-07-29.** If a flow here disagrees with the code, the
+> **Last verified against code: 2026-08-03.** If a flow here disagrees with the code, the
 > code wins — fix the doc (same PR).
+
+## First-install deployment flow
+
+The canonical hosted-install entry point is `https://aiosbrain.dev/deploy/team-brain/`. It resolves
+to the official Railway template described in [`RAILWAY-TEMPLATE.md`](RAILWAY-TEMPLATE.md): one app
+service from this public repository plus one Postgres service. Railway reference variables wire the
+database and public domain; template secret functions generate `AUTH_SECRET` and `SECRETS_KEY`; the
+operator supplies team and first-admin identity in Railway's form.
+
+On first start, `railway.json` runs the idempotent schema loader before release. The opt-in Railway
+startup wrapper then runs the shared bootstrap to ensure the real team and first admin from
+`TEAM_*` / `ADMIN_*`. Bootstrap runs on
+every restart but checks for an existing credential before calling the admin writer, so later
+password changes are preserved. A user-supplied `ADMIN_PASSWORD` is never rendered into logs.
+
+The local curl installer remains the Docker/self-host path. Selecting Railway in that wizard opens
+the canonical deploy page; it does not provision through an ambient Railway CLI link and does not
+pause for a GitHub fork or a post-deploy `--resume` command.
 
 ## Agent skill publication
 

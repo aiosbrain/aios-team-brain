@@ -39,12 +39,13 @@ curl -fsSL https://aiosbrain.dev/install.sh | sh
 ```
 
 It checks your prerequisites, fetches the repo, and hands you to an interview: run it **on this
-machine** (your own team, real install), **on Railway** (the shared server a team actually uses), or
+machine** (your own team, real install), **on Railway** (opens the official one-click template), or
 **just the demo**. It asks only what your choice needs, **proves your model key works
 before going further** — a wrong paste is caught there, not three steps later at an empty query box —
 then shows the plan before touching anything. Already cloned? `npm run setup` is the same wizard.
 
-It never uses `sudo`, never overwrites an existing install, and never deploys.
+It never uses `sudo` or overwrites an existing install. The Railway choice opens the official
+template; Railway shows the complete app + Postgres plan and asks for confirmation before deploying.
 [`install.sh`](install.sh) is short and commented — read it before you pipe it, as you should with
 any installer.
 
@@ -146,13 +147,12 @@ drive it yourself.
 | 2 | Set the environment variables | ~3 min | wizard |
 | 3 | Load the schema (`npm run pg:schema`) | ~1 min | wizard |
 | 4 | Load the vector schema (`npm run pg:schema:vector`) | ~1 min | **yours** — needs an embeddings model chosen first |
-| 5 | Create the first team + admin | ~1 min | wizard (on Railway, the `--resume` run after you connect the repo) |
+| 5 | Create the first team + admin | ~1 min | bootstrap during first start |
 | 6 | Connect one source | ~4 min | **yours** — the Admin UI is the only legal writer for tokens |
 | + | Add Neo4j + Graphiti | later, or never | **yours**, §2.8 |
 
-On the Railway path there's one more step no CLI can take for you: connecting your GitHub
-repository, which is also the deploy path. The wizard stops there and tells you exactly what to
-click.
+On the Railway path, the wizard opens **https://aiosbrain.dev/deploy/team-brain/**. The template
+deploys directly from the official repository, so a GitHub fork and `--resume` run are not required.
 
 Everything below is that sequence in dependency order, with the failure modes called out.
 

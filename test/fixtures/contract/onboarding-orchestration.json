@@ -1,5 +1,5 @@
 {
-  "version": 2,
+  "version": 3,
   "inspection": {
     "command": "aios onboard --inspect --json",
     "dependencyFree": true,
@@ -23,8 +23,17 @@
     "validationRequest": "GET /api/v1/me"
   },
   "create": {
-    "mode": "guide-only",
-    "guide": "https://aiosbrain.dev/guides/team-brain/"
+    "mode": "railway-template",
+    "provider": "railway",
+    "deployUrl": "https://aiosbrain.dev/deploy/team-brain/",
+    "guide": "https://aiosbrain.dev/guides/team-brain/",
+    "resume": {
+      "required": [
+        "brainUrl",
+        "apiKey"
+      ],
+      "validationRequest": "GET /api/v1/me"
+    }
   },
   "sharing": {
     "pushDuringOnboarding": false
@@ -40,7 +49,7 @@
     "API key is authoritative for team identity",
     "`team_id` is optional",
     "GET /api/v1/me",
-    "Create is guide-only",
+    "Create deploys through the official Railway template",
     "Never run `aios push`",
     "What AIOS now understands.",
     "What stays private.",
