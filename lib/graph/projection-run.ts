@@ -25,6 +25,10 @@ export function projectionRunInput(
     unchanged: summary.skipped,
     errors: summary.errors,
     meta: {
+      // EPISODES pushed, the denominator for calls-per-episode on the Costs page. `created` above is
+      // ITEMS, which is a different unit: chunking splits one item into up to 16 episodes, so a ratio
+      // over items moves with the corpus's chunk mix and can read a content shift as a model change.
+      episodes: summary.episodes,
       scanned: summary.scanned,
       teams: summary.teams,
       reconciled: summary.reconciled,

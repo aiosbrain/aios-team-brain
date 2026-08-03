@@ -144,7 +144,15 @@ const KIND_LABEL: Record<string, string> = {
 
 export interface ProjectSummary {
   scanned: number;
+  /** ITEMS projected. One item becomes 1..MAX_EPISODE_CHUNKS episodes — see `episodes`. */
   projected: number;
+  /**
+   * EPISODES pushed to Graphiti, which is what extraction actually costs per unit. Distinct from
+   * `projected` because `chunkContent` splits a large item into up to `MAX_EPISODE_CHUNKS` (16), so
+   * the two differ by the corpus's chunk mix. The cost metric divides LLM calls by THIS — dividing by
+   * items instead lets a shift toward chunkier documents look like a model regression.
+   */
+  episodes: number;
   skipped: number;
   /** Items whose episodes were removed from the EXTERNAL group this batch — a NARROWING reaching the
    * graph. The caller uses it to invalidate the external-tier caches: arcs are synthesized FROM that
@@ -351,6 +359,7 @@ export async function projectItemsToGraph(
   const rows = (data ?? []) as ItemRow[];
 
   let projected = 0;
+  let episodesPushed = 0;
   let skipped = 0;
   let externalGroupVacated = 0;
   for (const item of rows) {
@@ -525,13 +534,14 @@ export async function projectItemsToGraph(
       { onConflict: "team_id,source_table,source_id" }
     );
     projected++;
+    episodesPushed += episodes.length;
   }
 
   // Cursor for the runner: rows are ordered by synced_at ascending, so the last row is the high-water
   // mark to page past next batch (audit H2). Without this the runner only ever re-scanned the oldest
   // `limit` rows and never reached items beyond that window.
   const lastSyncedAt = rows.length ? rows[rows.length - 1].synced_at : undefined;
-  return { scanned: rows.length, projected, skipped, externalGroupVacated, lastSyncedAt };
+  return { scanned: rows.length, projected, episodes: episodesPushed, skipped, externalGroupVacated, lastSyncedAt };
 }
 
 /** Back-compat: project only Slack transcripts. Prefer `projectItemsToGraph` (all ingestions). */

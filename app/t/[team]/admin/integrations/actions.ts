@@ -15,6 +15,8 @@ import { selectLlmBackend, type AnsweringProvider } from "@/lib/query/llm-backen
 import { resolveAnsweringKeys } from "@/lib/query/answering";
 import { runSlackIngestion, runPlaneIngestion, runLinearIngestion, runGithubIngestion } from "@/lib/ingest/run";
 import { runGraphProjection } from "@/lib/graph/run";
+import { projectionRunInput } from "@/lib/graph/projection-run";
+import { recordIngestRun } from "@/lib/ingest/runs";
 import {
   linkGithubRepo,
   unlinkGithubRepo,
@@ -362,8 +364,17 @@ export async function projectToGraphNow(
 ): Promise<{ ok: boolean; error?: string; message?: string }> {
   const ctx = await requireAdmin(teamSlug);
   if (!ctx) return { ok: false, error: "admins only" };
+  const startedAt = Date.now();
   try {
     const s = await runGraphProjection({ teamId: ctx.teamId });
+    // Record the run, exactly as the scheduler does. This button pushes episodes that BURN metered
+    // extraction calls, so a run that leaves no `ingest_runs` row gives the Costs page's
+    // calls-per-episode ratio a numerator with no denominator — and the admin most likely to click it
+    // is the one diagnosing extraction, who would then read a spuriously high ratio caused by their
+    // own clicking. Best-effort: a ledger write must never fail the projection.
+    if (s.projected || s.errors.length) {
+      await recordIngestRun(adminClient(), projectionRunInput(s, "manual", startedAt, Date.now()));
+    }
     if (!s.configured) {
       return { ok: false, error: "Graph memory is not configured (set GRAPHITI_URL on the brain)." };
     }
@@ -371,7 +382,7 @@ export async function projectToGraphNow(
     revalidatePath(`/t/${teamSlug}/admin/integrations`);
     return {
       ok: true,
-      message: `Projected ${s.projected} item(s) to the graph (=${s.skipped} unchanged, ${s.scanned} scanned).`,
+      message: `Projected ${s.projected} item(s) / ${s.episodes} episode(s) to the graph (=${s.skipped} unchanged, ${s.scanned} scanned).`,
     };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "projection failed" };
