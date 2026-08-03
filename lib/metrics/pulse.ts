@@ -2,9 +2,9 @@ import "server-only";
 import { isOpenStatus } from "@/lib/tasks/activity-policy";
 import type { DbClient } from "@/lib/db/types";
 import { rangeDays, type Range } from "./range";
+import { getSpendDailyUsd, getSpendTotalUsdBetween } from "./llm-spend";
 import {
   scopeQueryLog,
-  scopeLlmUsage,
   visibleItems,
   visibleTasks,
   type ViewerTier,
@@ -165,7 +165,7 @@ export async function getPulseMetrics(
 
   // Fetch each source once over the combined [prior, now] window where a delta
   // is needed, then split current vs. prior in JS.
-  const [itemsRes, queryRes, tasksRes, spendRes] = await Promise.all([
+  const [itemsRes, queryRes, tasksRes] = await Promise.all([
     // Knowledge growth reads `created_at` (first-seen), NOT `synced_at`: the scheduler bumps synced_at
     // on every 30-min tick, so windowing on it plots re-sync churn (≈all items look "new") rather than
     // real growth. created_at is set once on insert and never bumped. See postgres migration items_created_at.
@@ -198,26 +198,26 @@ export async function getPulseMetrics(
         .limit(5_000),
       tier
     ),
-    // Brain SPEND is ALL inference (Q&A + arcs + meetings + timeline + social + titles + cron), read
-    // from the `llm_usage` ledger — NOT `query_log`, which only meters the interactive Query box. The
-    // Queries KPI above still counts query_log (adoption); spend is the total cost of running the brain.
-    scopeLlmUsage(
-      db
-        .from("llm_usage")
-        .select("cost_usd, created_at")
-        .eq("team_id", teamId)
-        .gte("created_at", priorStart.toISOString())
-        .order("created_at", { ascending: false })
-        .limit(50_000),
-      viewer
-    ),
+  ]);
+
+  // Brain SPEND is ALL inference (Q&A + arcs + meetings + timeline + social + titles + cron), read
+  // from the `llm_usage` ledger — NOT `query_log`, which only meters the interactive Query box. The
+  // Queries KPI above still counts query_log (adoption); spend is the total cost of running the brain.
+  //
+  // Aggregated in Postgres via `lib/metrics/llm-spend`. This previously fetched up to 50,000 rows and
+  // summed them here, which silently under-reported once the window held more: production showed
+  // $18.62 against a true $98.84, while the /costs page's larger 100k cap showed $88.33 for the SAME
+  // window. One shared aggregate is what keeps the two surfaces from disagreeing again.
+  const [spendCurrent, spendPrior, spendByDay] = await Promise.all([
+    getSpendTotalUsdBetween(db, teamId, windowStart.toISOString(), null, viewer),
+    getSpendTotalUsdBetween(db, teamId, priorStart.toISOString(), windowStart.toISOString(), viewer),
+    getSpendDailyUsd(db, teamId, windowStart.toISOString(), viewer),
   ]);
 
   // NB: the pg adapter returns timestamptz as Date (legacy Supabase-js returned string). Normalize via toIso below.
   const itemRows = (itemsRes.data ?? []) as { kind: string; created_at: string | Date }[];
   const queryRows = (queryRes.data ?? []) as { cost_usd: number | string; created_at: string | Date }[];
   const taskRows = (tasksRes.data ?? []) as { status: string; updated_at: string | Date }[];
-  const spendRows = (spendRes.data ?? []) as { cost_usd: number | string; created_at: string | Date }[];
 
   const winStartIso = windowStart.toISOString();
   const inWindow = (iso: string) => iso >= winStartIso;
@@ -265,23 +265,13 @@ export async function getPulseMetrics(
 
   // ── brain SPEND: total inference cost per day from llm_usage (all sources, not just Q&A) ──
   const spendSpark = new Array(order.length).fill(0);
-  let spendCurrent = 0;
-  let spendPrior = 0;
-  for (const row of spendRows) {
-    const cost = Number(row.cost_usd) || 0;
-    const createdIso = toIso(row.created_at);
-    if (inWindow(createdIso)) {
-      spendCurrent += cost;
-      const i = index.get(createdIso.slice(0, 10));
-      if (i !== undefined) {
-        // Daily $ spend for the sparkline (the Sparkline normalizes, so raw dollars are fine — it
-        // shows the shape of spend under the Spend KPI).
-        spendSpark[i] += cost;
-        usage[i].cost += cost;
-      }
-    } else {
-      spendPrior += cost;
-    }
+  for (const [day, cost] of spendByDay) {
+    const i = index.get(day);
+    if (i === undefined) continue; // a day outside the rendered buckets still counts in the total
+    // Daily $ spend for the sparkline (the Sparkline normalizes, so raw dollars are fine — it
+    // shows the shape of spend under the Spend KPI).
+    spendSpark[i] += cost;
+    usage[i].cost += cost;
   }
 
   // ── tasks: funnel + in-flight KPI + activity spark ──
