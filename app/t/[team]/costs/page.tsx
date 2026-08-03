@@ -6,6 +6,7 @@ import { resolveTeamContext } from "@/lib/auth/team-context";
 import { isRestrictedTier } from "@/lib/auth/visibility";
 import { parseRange } from "@/lib/metrics/range";
 import { getLlmCostBreakdown, getLedgerLifetimeUsd } from "@/lib/metrics/llm-costs";
+import { getGraphEfficiency, HEALTHY_CALLS_PER_EPISODE } from "@/lib/metrics/graph-efficiency";
 import { getProviderReportedUsage, reconcileLedger } from "@/lib/costs/provider-usage";
 import { RangeSelector } from "@/components/dashboard/range-selector";
 import { CostBreakdownChart } from "@/components/charts/cost-breakdown";
@@ -62,6 +63,12 @@ export default async function CostsPage({
   // of fixing the meter closes the gap. Measured 2026-07-30 the ledger said $51.46 while OpenRouter's
   // own `/credits` said $96.67 on the same key — and the page presented the floor as the answer.
   // Admins only: it is a whole-key number, so it means nothing beside one member's scoped spend.
+  // WORK PER EPISODE. Graph extraction is ~99% of the bill, and its cost per CALL is the number that
+  // hides a bad model: on 2026-07-30 a swap to a model 10x cheaper per call sent calls/episode from
+  // ~19 to ~49 over three days while total spend FELL, because episode volume dropped faster than the
+  // ratio climbed. Every headline number moved the right way while the economics moved the wrong way.
+  // System-initiated work, so admin-only like the reconciliation below.
+  const graphEfficiency = await getGraphEfficiency(db, team.id, range, { isAdmin, memberId: me.id });
   const providerUsage = isAdmin ? await getProviderReportedUsage(db, team.id) : null;
   const ledgerLifetimeUsd =
     isAdmin && providerUsage ? await getLedgerLifetimeUsd(db, team.id, providerUsage.provider) : null;
@@ -198,6 +205,32 @@ export default async function CostsPage({
               not the selected window).
             </>
           )}
+        </div>
+      ) : null}
+
+      {graphEfficiency.callsPerEpisode !== null && !graphEfficiency.truncated ? (
+        <div
+          className={`rounded-lg border px-3 py-2 text-xs ${
+            graphEfficiency.degrading
+              ? "border-amber-400/30 bg-amber-400/10 text-amber-700 dark:text-amber-300"
+              : "border-border-subtle/60 text-ink-tertiary"
+          }`}
+        >
+          <strong>Graph extraction: {graphEfficiency.callsPerEpisode.toFixed(1)} LLM calls per episode</strong>
+          {graphEfficiency.costPerEpisode !== null ? ` · ${usd(graphEfficiency.costPerEpisode)} per episode` : ""}
+          {graphEfficiency.degrading ? (
+            <>
+              {" "}
+              — and <strong>rising</strong>. Work per episode that grows with the graph usually means the
+              extraction model is failing to deduplicate: each new episode is resolved against a larger
+              node set, so the cost compounds. Check the <strong>Extraction model</strong> in Admin →
+              Integrations.
+            </>
+          ) : (
+            <> — healthy is under {HEALTHY_CALLS_PER_EPISODE} (extract + dedupe over nodes and edges).</>
+          )}{" "}
+          This is the ratio to watch, not cost per call: a model can be cheaper per call and dearer per
+          episode, and total spend hides it whenever episode volume moves at the same time.
         </div>
       ) : null}
 

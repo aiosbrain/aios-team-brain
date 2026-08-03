@@ -22,6 +22,8 @@ export interface GraphProjectionSummary {
   teams: number;
   scanned: number;
   projected: number;
+  /** EPISODES pushed (an item chunks into 1..16) — the unit extraction actually costs per. */
+  episodes: number;
   skipped: number;
   /** Episodes confirmed to have actually landed in Graphiti this run (audit H3 reconcile pass). */
   reconciled: number;
@@ -98,6 +100,7 @@ async function runGraphProjectionInner(opts?: {
     teams: 0,
     scanned: 0,
     projected: 0,
+    episodes: 0,
     skipped: 0,
     reconciled: 0,
     requeued: 0,
@@ -131,6 +134,7 @@ async function runGraphProjectionInner(opts?: {
         });
         summary.scanned += s.scanned;
         summary.projected += s.projected;
+        summary.episodes += s.episodes;
         summary.skipped += s.skipped;
         externalVacated += s.externalGroupVacated;
         if (s.scanned < limit || !s.lastSyncedAt || s.lastSyncedAt === since) break;
