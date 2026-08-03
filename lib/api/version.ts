@@ -18,8 +18,10 @@
  * 1.14 — `GET /api/v1/tasks?mode=table&keys=A,B`: the by-key lookup + `unknown_keys`.
  * 1.15 — POST /api/v1/codebases accepts the optional, provenance-only
  *        `metrics.codebase_health` object (AIO-609; persisted verbatim, never recomputed).
+ * 1.16 — documents the already-shipped GET /api/v1/attribution and GET /api/v1/timeline
+ *        reads; contract alignment only, with no runtime or wire-shape change (AIO-718).
  */
-export const BRAIN_API_VERSION = "1.15";
+export const BRAIN_API_VERSION = "1.16";
 
 /** Server-only Executor gateway negotiation; independent of the member API surface. */
 export const GATEWAY_CONTRACT_VERSION = "1.10";

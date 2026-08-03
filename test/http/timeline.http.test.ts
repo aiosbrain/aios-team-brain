@@ -3,7 +3,7 @@ import { BASE_URL, issueKeyFor, keyHeaders, seedTeam } from "./http-helpers";
 import { db, ingest } from "../datamechanics/helpers";
 import { randomUUID } from "node:crypto";
 
-// HTTP edge of GET /api/v1/timeline (the work-timeline context layer, v1.12): auth, the JSON wire
+// HTTP edge of GET /api/v1/timeline (the work-timeline context layer, documented in v1.16): auth, the JSON wire
 // shape ({ window_days, days }), and tier isolation over a real socket — an external-tier key must
 // never receive team-tier work. Seeding uses the shared test DB the server reads.
 

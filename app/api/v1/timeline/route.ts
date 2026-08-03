@@ -8,7 +8,7 @@ import { getCachedWorkTimeline } from "@/lib/dashboard/timeline-cache";
 export const runtime = "nodejs";
 
 /**
- * The work-timeline context layer over HTTP (brain-api v1.12): the last 7 days of team work as a
+ * The work-timeline context layer over HTTP (documented in brain-api v1.16): the last 7 days of team work as a
  * day → person → work ledger (GitHub commits, Linear/Plane tasks, dated docs), the SAME assembled
  * payload the dashboard panel reads — so the CLI (`aios timeline`) and other machines get it without
  * recomputing. Serve-stale-while-revalidate cache (`work_timeline_cache`).
@@ -28,7 +28,7 @@ export async function GET(req: NextRequest) {
 
   try {
     // Payload ONLY. `getCachedWorkTimeline` returns `{ days, freshness }`, and the freshness envelope is
-    // deliberately NOT on the v1 wire yet — putting it here is a brain-api change (it needs the 1.15 bump
+    // deliberately NOT on the v1 wire — putting it here would require a later brain-api bump
     // plus the canonical doc in aios-workspace). Destructured rather than passed through: `Response.json`
     // takes `any`, so serializing the whole object type-checks and silently nests `days` one level deeper,
     // breaking every v1.12 consumer (`aios timeline`, MCP). Caught by review, not by tsc.

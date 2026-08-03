@@ -8,7 +8,7 @@ import { getAttributionHealth, getMemberItems } from "@/lib/attribution/health";
 export const runtime = "nodejs";
 
 /**
- * Attribution health over HTTP (brain-api v1.13) — "is each data stream landing on the right person?",
+ * Attribution health over HTTP (documented in brain-api v1.16) — "is each data stream landing on the right person?",
  * the SAME derived read the Admin → Attribution page renders (`lib/attribution/health`), so the CLI and
  * other machines get it without a web view. Two levels, mirroring the page:
  *   • no `member` param → the summary: `{ bySource, byMember, lowAttributionSources }`.
