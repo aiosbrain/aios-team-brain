@@ -20,6 +20,9 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: read
+
 # One scan at a time; newer pushes supersede in-flight ones.
 concurrency:
   group: scan-on-merge
@@ -31,21 +34,22 @@ jobs:
     runs-on: ubuntu-latest
     if: github.repository == 'aiosbrain/aios-team-brain'
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0 # full history — the scanner reads the commit window
+          persist-credentials: false
 
       # Produce coverage/coverage-summary.json (lib/** lines pct) for the scanner to read.
       # `|| true`: this is a metrics source, not a gate — never block the scan on coverage.
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "20"
           cache: "npm"
-      - run: npm ci
+      - run: npm ci --ignore-scripts
       - name: Generate coverage report (metrics source for the scanner)
         run: npm run coverage || true
 
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
 
