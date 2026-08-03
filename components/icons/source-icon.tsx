@@ -49,6 +49,7 @@ const PlaneMark = brandMark(
 type IconCmp = ComponentType<MarkProps>;
 
 const MAP: Record<string, { Icon: IconCmp; color: string; label: string }> = {
+  // Governed provider-identity exceptions: these official brand colors are not AIOS semantics.
   github: { Icon: GithubMark, color: "text-ink", label: "GitHub" },
   linear: { Icon: LinearMark, color: "text-[#5E6AD2]", label: "Linear" },
   plane: { Icon: PlaneMark, color: "text-[#3f76ff]", label: "Plane" },

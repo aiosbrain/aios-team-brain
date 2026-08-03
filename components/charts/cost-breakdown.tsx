@@ -1,12 +1,28 @@
 "use client";
 
-import { Bar, BarChart, Cell, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
+import {
+  Bar,
+  BarChart,
+  Cell,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
 import type { CostSlice } from "@/lib/metrics/llm-costs";
 import { AXIS_TICK, PRISM, TOOLTIP_STYLE } from "./palette";
 import { ChartCard } from "./chart-card";
 
 // Deterministic color per bar (stable by index — the slices arrive sorted by cost desc).
-const CYCLE = [PRISM.violet, PRISM.blue, PRISM.cyan, PRISM.emerald, PRISM.amber, PRISM.fuchsia, PRISM.red];
+const CYCLE = [
+  PRISM.violet,
+  PRISM.accent,
+  PRISM.cyan,
+  PRISM.emerald,
+  PRISM.amber,
+  PRISM.fuchsia,
+  PRISM.red,
+];
 
 function usd(n: number): string {
   // Sub-cent totals still deserve a real number, not $0.00 — show more precision when tiny.
@@ -35,9 +51,20 @@ export function CostBreakdownChart({
   const height = Math.max(140, data.length * 34 + 16);
 
   return (
-    <ChartCard title={title} hint={hint} help={help} empty={empty} emptyLabel="No spend in this window.">
+    <ChartCard
+      title={title}
+      hint={hint}
+      help={help}
+      empty={empty}
+      emptyLabel="No spend in this window."
+    >
       <ResponsiveContainer width="100%" height={height}>
-        <BarChart data={data} layout="vertical" margin={{ top: 4, right: 16, left: 8, bottom: 0 }} barCategoryGap={8}>
+        <BarChart
+          data={data}
+          layout="vertical"
+          margin={{ top: 4, right: 16, left: 8, bottom: 0 }}
+          barCategoryGap={8}
+        >
           <XAxis
             type="number"
             tick={AXIS_TICK}
@@ -45,13 +72,24 @@ export function CostBreakdownChart({
             axisLine={false}
             tickFormatter={(v) => usd(Number(v))}
           />
-          <YAxis type="category" dataKey="label" tick={AXIS_TICK} tickLine={false} axisLine={false} width={132} />
+          <YAxis
+            type="category"
+            dataKey="label"
+            tick={AXIS_TICK}
+            tickLine={false}
+            axisLine={false}
+            width={132}
+          />
           <Tooltip
             contentStyle={TOOLTIP_STYLE}
-            cursor={{ fill: "rgba(124,58,237,0.06)" }}
+            cursor={{
+              fill: "color-mix(in srgb, var(--aios-violet) 6%, transparent)",
+            }}
             formatter={(value, _name, entry) => {
               const p = entry?.payload as CostSlice | undefined;
-              const calls = p ? ` · ${p.calls} call${p.calls === 1 ? "" : "s"}` : "";
+              const calls = p
+                ? ` · ${p.calls} call${p.calls === 1 ? "" : "s"}`
+                : "";
               const est = p?.estimated ? " · estimated" : "";
               // Billed attempts that returned nothing to price. Shown HERE, next to the feature that
               // made them, because "which feature lost the money" is the entire point of recording

@@ -66,7 +66,7 @@ export function NewDecisionButton({
           onClick={() => setOpen(false)}
         >
           <div
-            className="w-full max-w-lg rounded-2xl border border-border-subtle bg-surface-inset p-6 shadow-[0_12px_48px_rgba(124,58,237,0.16)]"
+            className="w-full max-w-lg rounded-2xl border border-border-subtle bg-surface-inset p-6 shadow-[var(--aios-shadow-glow-featured)]"
             onClick={(e) => e.stopPropagation()}
           >
             <div className="mb-4 flex items-center justify-between">

@@ -16,17 +16,32 @@ import { ChartCard } from "./chart-card";
 const SERIES: { key: keyof TrendPoint; name: string; color: string }[] = [
   { key: "agentic", name: "Agentic", color: PRISM.violet },
   { key: "coverage", name: "Coverage", color: PRISM.cyan },
-  { key: "ai", name: "AI commits", color: PRISM.blue },
+  { key: "ai", name: "AI commits", color: PRISM.accent },
 ];
 
 export function AgenticTrend({ data }: { data: TrendPoint[] }) {
   return (
     <ChartCard title="Trend" hint="scores over time" empty={data.length < 2}>
       <ResponsiveContainer width="100%" height={220}>
-        <LineChart data={data} margin={{ top: 4, right: 8, left: -20, bottom: 0 }}>
+        <LineChart
+          data={data}
+          margin={{ top: 4, right: 8, left: -20, bottom: 0 }}
+        >
           <CartesianGrid vertical={false} stroke={GRID_STROKE} />
-          <XAxis dataKey="date" tick={AXIS_TICK} tickLine={false} axisLine={false} minTickGap={28} />
-          <YAxis tick={AXIS_TICK} tickLine={false} axisLine={false} width={32} domain={[0, 100]} />
+          <XAxis
+            dataKey="date"
+            tick={AXIS_TICK}
+            tickLine={false}
+            axisLine={false}
+            minTickGap={28}
+          />
+          <YAxis
+            tick={AXIS_TICK}
+            tickLine={false}
+            axisLine={false}
+            width={32}
+            domain={[0, 100]}
+          />
           <Tooltip contentStyle={TOOLTIP_STYLE} />
           {SERIES.map((s) => (
             <Line

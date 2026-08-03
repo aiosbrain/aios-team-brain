@@ -20,8 +20,8 @@ function htmlPage(status: number, heading: string, detail: string): Response {
   const body = `<!doctype html><html lang="en"><head><meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>${heading}</title>
-<style>body{font:16px/1.5 system-ui,sans-serif;max-width:32rem;margin:4rem auto;padding:0 1.5rem;color:#1a1a1a}
-h1{font-size:1.25rem}p{color:#555}</style></head>
+<style>body{font:16px/1.5 system-ui,sans-serif;max-width:32rem;margin:4rem auto;padding:0 1.5rem}
+h1{font-size:1.25rem}</style></head>
 <body><h1>${heading}</h1><p>${detail}</p></body></html>`;
   return new Response(body, {
     status,

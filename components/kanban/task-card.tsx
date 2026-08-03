@@ -18,7 +18,7 @@ export function TaskCard({ task, overlay = false }: { task: Task; overlay?: bool
       {...attributes}
       className={`prism-card prism-card-hover cursor-grab bg-surface-inset px-3.5 py-3 active:cursor-grabbing ${
         isDragging && !overlay ? "opacity-40" : ""
-      } ${overlay ? "rotate-2 shadow-[0_8px_30px_rgba(124,58,237,0.18)]" : ""}`}
+      } ${overlay ? "rotate-2 shadow-[var(--aios-shadow-glow-featured)]" : ""}`}
     >
       <p className="text-sm font-medium leading-snug text-ink">{task.title}</p>
       <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-ink-tertiary">

@@ -13,12 +13,19 @@ export function ScoreRing({
   const r = (size - stroke) / 2;
   const circ = 2 * Math.PI * r;
   const dash = (v / 100) * circ;
-  const color = v >= 75 ? "#4ade80" : v >= 50 ? "#7c3aed" : v >= 25 ? "#f59e0b" : "#ef4444";
+  const color =
+    v >= 75
+      ? "var(--aios-emerald)"
+      : v >= 50
+        ? "var(--aios-violet)"
+        : v >= 25
+          ? "var(--aios-amber)"
+          : "var(--aios-destructive)";
 
   return (
     <div className="flex flex-col items-center gap-1">
       <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} aria-hidden>
-        <circle cx={size / 2} cy={size / 2} r={r} fill="none" stroke="rgba(0,0,0,0.07)" strokeWidth={stroke} />
+        <circle cx={size / 2} cy={size / 2} r={r} fill="none" stroke="var(--aios-border)" strokeWidth={stroke} />
         <circle
           cx={size / 2}
           cy={size / 2}
