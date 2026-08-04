@@ -1,6 +1,6 @@
 import "server-only";
 import { runSql } from "@/lib/db/pg/pool";
-import { getGraphExtractionHealth } from "@/lib/graph/extraction-health";
+import { getGraphExtractionHealth, GRAPH_HEALTH_SOURCE } from "@/lib/graph/extraction-health";
 
 /**
  * Aggregate ingestion-pipeline health for a LOUD admin surface. Every pipeline leg (slack/plane/
@@ -176,7 +176,13 @@ export async function getPipelineHealth(teamId: string): Promise<PipelineHealth>
     const beatAt: Map<string, string> | null = beats
       ? new Map(beats.rows.map((r) => [r.source, iso(r.finished_at)]))
       : null;
-    const legs: PipelineLeg[] = res.rows.map((r) => {
+    // The dedupe-pollution alarm's transition LEDGER (lib/graph/extraction-alert) is not a leg: it
+    // writes a row only when the alarm flips (weeks apart), so any age-based read of it is
+    // meaningless — an ok=true recovery row would go "stale" 3h later and redden the banner on a
+    // healthy graph forever (review finding). Its live state already surfaces through the synthetic
+    // `graph_extract` leg below, fed by the same detector; the ledger rows remain visible in the
+    // Recent-runs panel as the alarm's audit trail.
+    const legs: PipelineLeg[] = res.rows.filter((r) => r.source !== GRAPH_HEALTH_SOURCE).map((r) => {
       const at = iso(r.finished_at);
       // Stale only past THIS source's own cadence — a 24h job isn't stale at 3h (would cry wolf).
       const threshold = staleThresholdMs(r.source);
@@ -192,7 +198,10 @@ export async function getPipelineHealth(teamId: string): Promise<PipelineHealth>
     // graph_project=OK on a 202, but Graphiti then fails entity extraction asynchronously, so
     // episodes are accepted while zero facts are created. Append it as a failing leg so the loud
     // banner names it just like a real broken poller.
-    if (extraction?.stalled) {
+    // Either extraction failure earns the leg: a stall (no facts) or dedupe pollution (bad facts).
+    // Keyed on both so a model that extracts confidently-wrong knowledge is as loud as one that
+    // extracts nothing — the 2026-07-30 incident was the second kind and nothing announced it.
+    if (extraction?.stalled || extraction?.dedupePolluted) {
       legs.push({
         source: "graph_extract",
         ok: false,

@@ -60,7 +60,12 @@ export interface GraphExtractionHealth {
   episodes: number | null; // projected episodes for this team (Postgres ledger)
   facts: number | null; // extracted RELATES_TO facts in Neo4j (null = Neo4j unreadable)
   stalled: boolean; // episodes are landing but not becoming facts → extractor failing
-  reason: string | null; // human-facing cause when stalled
+  /** The extractor is producing duplicate entities well above this graph's own baseline — a DIFFERENT
+   *  failure from `stalled`: extraction is working, and producing bad knowledge. Kept as its own flag
+   *  rather than folded into `stalled` because the two send an operator to different places (service
+   *  logs vs the Extraction model picker). */
+  dedupePolluted: boolean;
+  reason: string | null; // human-facing cause when stalled OR polluted
 }
 
 export interface ExtractionSignals {
@@ -184,14 +189,22 @@ async function countProjectedEpisodes(teamId: string): Promise<number | null> {
 }
 
 export async function getGraphExtractionHealth(teamId: string): Promise<GraphExtractionHealth> {
-  const empty: GraphExtractionHealth = { episodes: null, facts: null, stalled: false, reason: null };
+  const empty: GraphExtractionHealth = {
+    episodes: null,
+    facts: null,
+    stalled: false,
+    dedupePolluted: false,
+    reason: null,
+  };
   if (!neo4jConfigured()) return empty;
-  const [episodes, facts, newestEpisode, newestFact] = await Promise.all([
+  const [episodes, facts, newestEpisode, newestFact, dedupe] = await Promise.all([
     countProjectedEpisodes(teamId),
     countGraphFacts(),
     newestEpisodeAtMs(teamId),
     newestFactAtMs(),
+    dedupeSignals(),
   ]);
+  const pollution = deriveDedupePollution(dedupe);
   const signals: ExtractionSignals = {
     episodes,
     facts,
@@ -208,13 +221,177 @@ export async function getGraphExtractionHealth(teamId: string): Promise<GraphExt
     episodes,
     facts,
     stalled,
+    dedupePolluted: pollution.polluted,
     // Two distinct causes deserve two distinct sentences — "it never worked" and "it stopped" send an
     // operator to different places. Both name the graphiti service logs, which is where the actual
     // error string lives (a token cap, a 429 `insufficient_quota`, an invalid group_id).
+    // A STALL outranks pollution: no facts at all is worse news than bad facts, and stacking two
+    // paragraphs into one banner buries both.
     reason: !stalled
-      ? null
+      ? pollution.reason
       : neverExtracted
         ? `${episodes} episodes were projected but the graph has 0 extracted facts — Graphiti is accepting episodes (202) yet its entity-extraction worker is failing on every job (commonly the LLM output-token cap, e.g. "Output length exceeded max tokens"). New activity isn't becoming graph facts, so narrative arcs can't update. Check the graphiti service logs.`
         : `Graph extraction has STOPPED: episodes are still being projected, but no new fact has been extracted for about ${lagHours}h (the graph holds ${facts} facts from before). Graphiti keeps returning 202 while its extraction worker fails every job — most often the extraction LLM key is out of quota (a 429 \`insufficient_quota\`), or its output-token cap is being exceeded. Narrative arcs and the Learning panel are running on stale facts. Check the graphiti service logs.`,
   };
+}
+
+/* ────────────────────────────────────────────────────────────────────────────────────────────────
+ * DEDUPE POLLUTION — the extractor confusing entity identity, which no static check can predict.
+ *
+ * On 2026-07-30 a cheaper extraction model was selected. It passed the save-time structured-output
+ * check (#442) because it genuinely supports structured outputs; it just resolves identity badly. For
+ * four days it filled the graph with duplicate entities, and every headline number moved the RIGHT
+ * way — total spend fell, because episode volume dropped faster than work per episode rose. It was
+ * found by hand.
+ *
+ * WHY THE THRESHOLD IS RELATIVE, NOT ABSOLUTE. Graphiti records entity dedup as a `RELATES_TO` edge
+ * named `IS_DUPLICATE_OF` — normal bookkeeping, emitted by every model. `lib/graph/learning.ts`
+ * measured ~26% of this graph as those edges on 2026-07-20, ten days BEFORE the bad model, and filters
+ * them out of every read. So "any duplicate edges" is the healthy steady state: an absolute threshold
+ * would be permanently on, which is the cry-wolf failure this repo has already paid for twice.
+ *
+ * Only a RATE CHANGE against the graph's own trailing baseline is signal. That also makes it
+ * self-calibrating: a corpus that naturally produces more dedupe edges is never accused of a
+ * regression it doesn't have.
+ * ──────────────────────────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * The `ingest_runs.source` under which the alarm's delivery half (`lib/graph/extraction-alert`)
+ * records its transitions. Defined HERE, not there, so `lib/ingest/pipeline-health` can exclude the
+ * ledger from its legs without importing the mailer into every dashboard render.
+ */
+export const GRAPH_HEALTH_SOURCE = "graph_health";
+
+/** Recent window whose dedupe share is judged. */
+export const DEDUPE_RECENT_MS = 24 * 3_600_000;
+/** Trailing window it is judged AGAINST — long enough that one bad day can't move the baseline it is
+ *  compared to, which is what stops the alarm normalising a regression as it happens. */
+export const DEDUPE_BASELINE_MS = 14 * 86_400_000;
+/** Below this many recent edges the share is noise — 1 of 3 is 33% and means nothing. Mirrors
+ *  MIN_EPISODES_FOR_EXTRACTION_SIGNAL's role: refuse to judge a sample too small to carry a verdict. */
+export const MIN_EDGES_FOR_DEDUPE_SIGNAL = 200;
+/**
+ * How far above its own baseline the recent share must sit. MEASURED, not chosen: healthy observations
+ * are ~26% (learning.ts, 2026-07-20) and ~35% (sampled 2026-08-03 over pre-07-30 edges); the bad model
+ * ran ~70%. 1.4x over a ~30% baseline fires at ~42% — above every healthy reading, well below the
+ * degraded one.
+ */
+export const DEDUPE_MARGIN = 1.4;
+/**
+ * …AND an absolute floor, because a relative margin alone fires on noise when the baseline is tiny
+ * (2% → 3% is +50%). 45% sits above every healthy observation on record and below the degraded one.
+ */
+export const DEDUPE_ABSOLUTE_FLOOR = 0.45;
+
+export interface DedupeSignals {
+  /** Edges extracted in the recent window; null = Neo4j unreadable. */
+  recentTotal: number | null;
+  recentDupe: number | null;
+  /** Edges extracted in the trailing baseline window, EXCLUDING the recent one. */
+  baselineTotal: number | null;
+  baselineDupe: number | null;
+}
+
+export interface DedupePollution {
+  polluted: boolean;
+  /**
+   * Could the detector actually JUDGE this tick, or did it refuse (Neo4j unreadable, either window
+   * under the minimum sample, or a predicate-suspect zero-dupe baseline)? Consumers that act on
+   * transitions — the alarm's edge state machine — MUST key on this and not on `polluted`, because a
+   * refusal also reads `polluted: false`: during a sustained incident, one quiet Saturday whose
+   * recent window is 80 edges would otherwise look like a judged recovery and send a "recovered"
+   * mail while the graph is still at 70% duplicates.
+   */
+  judgeable: boolean;
+  recentShare: number | null;
+  baselineShare: number | null;
+  reason: string | null;
+}
+
+const share = (dupe: number | null, total: number | null): number | null =>
+  typeof dupe === "number" && typeof total === "number" && total > 0 ? dupe / total : null;
+
+/**
+ * Is the extractor producing duplicate entities at a rate its own history doesn't justify?
+ *
+ * Pure so every refusal-to-judge is testable without Neo4j. Every uncertain case returns
+ * `polluted: false` — unknown must never read as degraded, or an outage teaches people to ignore the
+ * banner (the same contract `deriveGraphExtractionStalled` keeps).
+ */
+export function deriveDedupePollution(s: DedupeSignals): DedupePollution {
+  const recentShare = share(s.recentDupe, s.recentTotal);
+  const baselineShare = share(s.baselineDupe, s.baselineTotal);
+  const out = (polluted: boolean, judgeable: boolean, reason: string | null = null): DedupePollution => ({
+    polluted,
+    judgeable,
+    recentShare,
+    baselineShare,
+    reason,
+  });
+  // Unreadable graph, too small a sample, or no baseline to compare against: all "can't tell".
+  if (recentShare === null || baselineShare === null) return out(false, false);
+  if ((s.recentTotal ?? 0) < MIN_EDGES_FOR_DEDUPE_SIGNAL) return out(false, false);
+  if ((s.baselineTotal ?? 0) < MIN_EDGES_FOR_DEDUPE_SIGNAL) return out(false, false);
+  // Predicate self-check: a healthy share on this graph is ~26–35% dupe edges — a LITERAL ZERO over
+  // ≥200 edges (~0.7^200 naturally) means the relation this probe greps for no longer exists as
+  // written (a Graphiti upgrade renaming `IS_DUPLICATE_OF` / moving it off `RELATES_TO`), not that
+  // extraction got perfect. Both windows are checked: a zero BASELINE would let a rename silently
+  // disarm the alarm, and a zero RECENT window during an active incident would mail "recovered"
+  // mid-incident while the baseline still carried pre-rename dupes (review finding). Unjudgeable.
+  if (s.baselineDupe === 0 || s.recentDupe === 0) return out(false, false);
+  if (recentShare < DEDUPE_ABSOLUTE_FLOOR) return out(false, true);
+  if (recentShare < baselineShare * DEDUPE_MARGIN) return out(false, true);
+  const pct = (n: number) => `${Math.round(n * 100)}%`;
+  return out(
+    true,
+    true,
+    `Extraction is producing duplicate entities: ${pct(recentShare)} of the last 24h of graph edges ` +
+      `are duplicate-of records, against ${pct(baselineShare)} for this graph's own baseline. That is ` +
+      `the signature of an extraction model resolving entity identity badly — check the Extraction ` +
+      `model in Admin → Integrations.`
+  );
+}
+
+/**
+ * Read both windows in ONE aggregate. Same query class as `countGraphFacts` — an aggregate returns one
+ * row, so this scans `RELATES_TO` once and costs what the probe's existing full-edge scans cost
+ * (tens of ms at ~31k edges). A `LIMIT` would do nothing here: it applies after aggregation.
+ *
+ * `r.created_at` is EXTRACTION time, deliberately not `valid_at`, which Graphiti backdates to the
+ * episode's work time — ranking a health probe by that reports on a backfill's content age instead of
+ * on what the extractor just did.
+ */
+export async function dedupeSignals(nowMs = Date.now()): Promise<DedupeSignals> {
+  const unknown: DedupeSignals = { recentTotal: null, recentDupe: null, baselineTotal: null, baselineDupe: null };
+  if (!neo4jConfigured()) return unknown;
+  try {
+    const recentSince = new Date(nowMs - DEDUPE_RECENT_MS).toISOString();
+    const baselineSince = new Date(nowMs - DEDUPE_BASELINE_MS).toISOString();
+    const rows = await runRead<{
+      recentTotal: number;
+      recentDupe: number;
+      baselineTotal: number;
+      baselineDupe: number;
+    }>(
+      `MATCH ()-[r:RELATES_TO]->()
+       WHERE r.created_at >= datetime($baselineSince)
+       RETURN
+         count(CASE WHEN r.created_at >= datetime($recentSince) THEN 1 END) AS recentTotal,
+         count(CASE WHEN r.created_at >= datetime($recentSince) AND r.name = 'IS_DUPLICATE_OF' THEN 1 END) AS recentDupe,
+         count(CASE WHEN r.created_at < datetime($recentSince) THEN 1 END) AS baselineTotal,
+         count(CASE WHEN r.created_at < datetime($recentSince) AND r.name = 'IS_DUPLICATE_OF' THEN 1 END) AS baselineDupe`,
+      { recentSince, baselineSince }
+    );
+    const r = rows[0];
+    return r
+      ? {
+          recentTotal: Number(r.recentTotal) || 0,
+          recentDupe: Number(r.recentDupe) || 0,
+          baselineTotal: Number(r.baselineTotal) || 0,
+          baselineDupe: Number(r.baselineDupe) || 0,
+        }
+      : unknown;
+  } catch {
+    return unknown; // unreadable → unknown, never degraded
+  }
 }

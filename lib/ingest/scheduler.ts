@@ -87,6 +87,16 @@ export function startIngestScheduler(): void {
         await alertDenseDegraded(db, priorFailed, { failed: 0, scanned: 0, errorSample: msg });
       }
     }
+
+    // Graph dedupe-pollution alarm (AIO-693): the scheduled caller extraction health never had. The
+    // 2026-07-30 bad-model incident was visible on every page that anyone didn't open for four days;
+    // this pushes the transition to admins instead. One cheap Neo4j aggregate per tick; best-effort,
+    // edge-debounced, and an unreadable graph changes nothing (see lib/graph/extraction-alert).
+    {
+      const { runDedupePollutionCheck } = await import("@/lib/graph/extraction-alert");
+      const action = await runDedupePollutionCheck(db);
+      if (action !== "none") console.warn(`[ingest] graph_health: dedupe pollution ${action}`);
+    }
   };
 
   // Inbound PM-sync step (brain-api v1.4): apply Linear board edits to brain tasks + adopt

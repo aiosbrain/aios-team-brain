@@ -6,6 +6,8 @@ import { getLlmHealth, type LlmHealth } from "@/lib/query/llm-health";
 import { resolveGraphChatTarget, resolveGraphEmbeddingTarget, isRefusal } from "@/lib/llm/graph-proxy";
 import {
   countGraphFacts,
+  dedupeSignals,
+  deriveDedupePollution,
   deriveGraphExtractionStalled,
   newestEpisodeAtMs,
   newestFactAtMs,
@@ -50,6 +52,7 @@ export interface RetrievalHealth {
   graphLastProjectedAt: string | null; // most recent successful projection (null = never)
   graphStalled: boolean; // degraded specifically because the projector stopped writing (vs unreachable)
   graphExtractionStalled: boolean; // episodes are reaching Graphiti (202) but its extractor makes no facts
+  graphDedupePolluted: boolean; // extraction runs, but duplicate-entity rate is over the graph's own baseline (AIO-693)
   /** A CONFIG refusal from the graph LLM proxy — Anthropic selected, embeddings unset or the wrong
    *  width, ambiguous team. Resolved from settings only (no upstream call, no spend), so it is free
    *  to check on every render and lands here INSTANTLY. Without it a misconfiguration is
@@ -105,7 +108,8 @@ export function isGraphStale(lastProjectedAtMs: number | null, nowMs: number): b
  *   • not configured (no/malformed GRAPHITI_URL)             → "off"
  *   • configured BUT /healthcheck failed (down/unreachable)   → "degraded"
  *   • reachable BUT projector hasn't written in > GRAPH_STALE_MS (writes failing) → "degraded"
- *   • reachable + writing BUT the extractor makes no facts from projected episodes → "degraded"
+ *   • reachable + writing BUT extraction is failing — no facts from projected episodes, or facts
+ *     polluted by abnormal duplicate-entity rates (both arrive via `extractionStalled`) → "degraded"
  *   • reachable AND recently projected (or nothing to project yet) → "on"
  */
 export function deriveGraphState(input: {
@@ -163,6 +167,7 @@ export async function getRetrievalHealth(teamId: string): Promise<RetrievalHealt
     graphFacts,
     graphNewestFactAt,
     graphNewestEpisodeAt,
+    graphDedupe,
     graphProxyRefusal,
     llm,
   ] =
@@ -173,6 +178,9 @@ export async function getRetrievalHealth(teamId: string): Promise<RetrievalHealt
     graphConfiguredNow ? countGraphFacts() : Promise.resolve(null),
     graphConfiguredNow ? newestFactAtMs() : Promise.resolve(null),
     graphConfiguredNow ? newestEpisodeAtMs(teamId) : Promise.resolve(null),
+    graphConfiguredNow
+      ? dedupeSignals()
+      : Promise.resolve({ recentTotal: null, recentDupe: null, baselineTotal: null, baselineDupe: null }),
     // Config-only resolution: no upstream call, nothing spent. Best-effort — a broken probe must
     // never fail the admin page.
     graphConfiguredNow
@@ -212,11 +220,17 @@ export async function getRetrievalHealth(teamId: string): Promise<RetrievalHealt
       newestEpisodeAtMs: graphNewestEpisodeAt,
       newestFactAtMs: graphNewestFactAt,
     });
+  // The OTHER extraction failure: episodes become facts, but the facts are confidently wrong —
+  // duplicate entities from a model resolving identity badly (AIO-693, the 2026-07-30 incident).
+  // Same detector as the pipeline banner + the admin email alarm, so all three surfaces flip on the
+  // same evidence and can't drift apart.
+  const graphDedupePolluted = graphReachable && deriveDedupePollution(graphDedupe).polluted;
   const graph = deriveGraphState({
     configured: graphConfiguredNow,
     reachable: graphReachable,
     lastProjectedAtMs,
-    extractionStalled: graphExtractionStalled,
+    // Either extraction failure degrades the leg — no facts, or wrong facts.
+    extractionStalled: graphExtractionStalled || graphDedupePolluted,
     nowMs,
   });
   // Degraded specifically because the projector went quiet (reachable, but a stale write path) — the
@@ -230,6 +244,7 @@ export async function getRetrievalHealth(teamId: string): Promise<RetrievalHealt
     graphLastProjectedAt: graphFresh.lastProjectedAt,
     graphStalled,
     graphExtractionStalled,
+    graphDedupePolluted,
     graphProxyRefusal,
     graphFacts,
     rerank,
