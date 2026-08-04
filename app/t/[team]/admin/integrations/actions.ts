@@ -22,6 +22,7 @@ import {
   unlinkGithubRepo,
   ensureGithubIntegration,
   githubReposAndToken,
+  countPreviouslyImportedTasks,
 } from "@/lib/integrations/github-link";
 import { saveProvisioningSettings as saveProvisioningSettings_ } from "@/lib/provisioning/settings";
 import { validateGithubToken, checkRepoAccess, type RepoAccess } from "@/lib/integrations/github-validate";
@@ -29,7 +30,6 @@ import { checkSlackChannels, privateChannelRejection } from "@/lib/integrations/
 import { RepoFormatError, normalizeRepo } from "@/lib/integrations/github-repos";
 import { estimateGithubImport, type GithubImportEstimate } from "@/lib/integrations/github-estimate";
 import { getGraphEfficiency } from "@/lib/metrics/graph-efficiency";
-import { runSql } from "@/lib/db/pg/pool";
 import { validateOpenrouterKey, saveOpenrouterSettings } from "@/lib/integrations/openrouter";
 import { MEETING_TASK_STATUSES, type MeetingTaskStatus } from "@/lib/meetings/target-status";
 import {
@@ -386,18 +386,13 @@ export async function estimateGithubImportAction(
         ? result.episodes * efficiency.costPerEpisode
         : null;
     // Re-link warning: tasks already materialized from this repo's issues project.
-    const projectSlug = `github-${owner.toLowerCase()}-${repo.toLowerCase()}`;
-    const prior = await runSql<{ n: number }>(
-      `select count(*)::int as n from tasks t join projects p on p.id = t.project_id
-        where t.team_id = $1 and p.slug = $2`,
-      [ctx.teamId, projectSlug]
-    ).catch(() => null);
+    const prior = await countPreviouslyImportedTasks(ctx.teamId, owner, repo);
     const { ok: _resultOk, ...estimate } = result;
     return {
       ok: true,
       estimate,
       priceUsd,
-      previouslyImportedTasks: prior?.rows[0]?.n ?? 0,
+      previouslyImportedTasks: prior,
     };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "estimate failed" };

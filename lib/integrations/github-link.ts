@@ -1,4 +1,5 @@
 import type { DbClient } from "@/lib/db/types";
+import { runSql } from "@/lib/db/pg/pool";
 import { upsertIntegration, type IntegrationAuth } from "./manage";
 import { decryptSecret } from "@/lib/secrets/crypto";
 import { addRepo, removeRepo } from "./github-repos";
@@ -185,4 +186,26 @@ export async function unlinkGithubRepo(
   const history = currentRepoHistory(row).filter((e) => linked.has(e.repo.toLowerCase()));
   await writeRepos(db, auth, row, repos, history);
   return repos;
+}
+
+/**
+ * Tasks already materialized from a repo's issues project (`github-<owner>-<repo>`) — the re-link
+ * warning's number (AIO-798): unlink never purges items/tasks, so re-linking with a NARROWER window
+ * diff-deletes every previously imported task outside it on the first sync. Best-effort: 0 on error.
+ */
+export async function countPreviouslyImportedTasks(
+  teamId: string,
+  owner: string,
+  repo: string
+): Promise<number> {
+  try {
+    const res = await runSql<{ n: number }>(
+      `select count(*)::int as n from tasks t join projects p on p.id = t.project_id
+        where t.team_id = $1 and p.slug = $2`,
+      [teamId, `github-${owner.toLowerCase()}-${repo.toLowerCase()}`]
+    );
+    return res.rows[0]?.n ?? 0;
+  } catch {
+    return 0;
+  }
 }
