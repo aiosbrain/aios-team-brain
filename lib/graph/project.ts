@@ -57,6 +57,14 @@ export function chunk<T>(items: readonly T[], size: number): T[][] {
  */
 export const CHUNK_CHARS = resolvePositiveInt(process.env.GRAPH_CHUNK_CHARS, 2500);
 export const MAX_EPISODE_CHUNKS = resolvePositiveInt(process.env.GRAPH_MAX_EPISODE_CHUNKS, 16);
+/**
+ * The chunk sizing the per-chunk ledger's hashes were produced under, recorded alongside them
+ * (`graph_episodes.chunk_config`). `content_sha256` hashes the WHOLE body and is invariant to
+ * chunking, so it cannot detect a config change: raising `MAX_EPISODE_CHUNKS` leaves every early
+ * chunk hashing identically while the newly-admitted tail chunks have never been pushed, and a
+ * ledger without this would report them as already extracted. A mismatch forces a full push.
+ */
+export const CHUNK_CONFIG = `${CHUNK_CHARS}x${MAX_EPISODE_CHUNKS}`;
 
 /**
  * How many episodes to scan when resolving an item's chunk names → uuids for a delete (tier-cleanup)
@@ -373,7 +381,7 @@ export async function projectItemsToGraph(
     // episodes we put in the graph, and they have to come back out (see the branch below).
     const { data: existing } = await db
       .from("graph_episodes")
-      .select("content_sha256, group_id, pending_delete_group_id")
+      .select("content_sha256, group_id, pending_delete_group_id, chunk_shas, chunk_config")
       .eq("team_id", args.teamId)
       .eq("source_table", SOURCE_TABLE)
       .eq("source_id", item.id)
@@ -382,7 +390,12 @@ export async function projectItemsToGraph(
       content_sha256: string;
       group_id: string;
       pending_delete_group_id: string | null;
+      chunk_shas: string[] | null;
+      chunk_config: string | null;
     } | null;
+    // Per-chunk ledger for THIS pass: the hashes of exactly the episodes we would send. Derived from
+    // `episodes` rather than re-chunking, so the ledger can never describe something else.
+    const chunkShas = episodes.map((e) => sha(e.content));
 
     if (episodes.length === 0) {
       // Nothing to extract NOW — but if we projected this item before, its old episodes are still in
@@ -425,6 +438,32 @@ export async function projectItemsToGraph(
     // this push is authoritative and the flag clears below.
     const purgeBeforeRepush = existingRow?.pending_delete_group_id === groupId;
     if (existingRow && existingRow.content_sha256 === contentSha && !tierChanged && !purgeBeforeRepush) {
+      // BACKFILL (GRAPHCOST-1): a row written before the per-chunk ledger existed knows the body is
+      // unchanged but not which chunks that body is made of. Record them here — from the same
+      // `toEpisodes` output the last push used, for a body proven identical by `content_sha256` — so
+      // the corpus converges as the projector walks it instead of re-extracting itself on deploy.
+      // No episodes are sent, so `projected_at` is deliberately NOT bumped (see the push path).
+      //
+      // The premise — "an identical body means these are the chunks we pushed" — holds only while the
+      // chunk config is the one that produced them, which an empty ledger cannot attest. So a rollout
+      // that changes CHUNK_CHARS/MAX_EPISODE_CHUNKS must invalidate by clearing `content_sha256` to
+      // `''`, NOT by clearing `chunk_shas`: the sentinel misses the unchanged-skip above and fails the
+      // delta predicate, forcing a real re-push. Emptying `chunk_shas` alone would route the row
+      // straight through here and bless the new config's hashes for chunks never pushed under it.
+      if (chunkShas.length > 0 && (existingRow.chunk_shas?.length ?? 0) === 0) {
+        await db.from("graph_episodes").upsert(
+          {
+            team_id: args.teamId,
+            source_table: SOURCE_TABLE,
+            source_id: item.id,
+            group_id: existingRow.group_id,
+            content_sha256: existingRow.content_sha256,
+            chunk_shas: chunkShas,
+            chunk_config: CHUNK_CONFIG,
+          },
+          { onConflict: "team_id,source_table,source_id" }
+        );
+      }
       skipped++;
       continue; // unchanged content, same tier → no-op (idempotent)
     }
@@ -495,10 +534,55 @@ export async function projectItemsToGraph(
     // exactly what reconcile's saturated-group guard refuses to feed. Skipping the push leaves the
     // existing episodes and the outstanding flag, so the retry converges instead of compounding.
     const contentUnchanged = existingRow?.content_sha256 === contentSha;
-    if (!(purgeFailed && contentUnchanged)) {
-      await client.addEpisodes(groupId, episodes);
+
+    // DELTA (GRAPHCOST-1): push only the chunks whose content actually changed. Every term below is
+    // load-bearing — each one is a state in which the ledger's per-chunk knowledge does not describe
+    // what is in the group we are about to push to, and trusting it would silently withhold content
+    // from the graph. Anything failing this predicate takes the pre-existing full-push path verbatim,
+    // which is what keeps this change out of the cleanup/retraction branches that own the leak fixes.
+    //
+    //  1. RETAINING SOURCE ONLY. A retractable source (Slack) deletes the item's episodes before every
+    //     re-push, so "already pushed" is not a property its group has. It is also the surface carrying
+    //     the retraction guarantee, and the measured churn is entirely in retaining sources — the risk
+    //     would buy nothing. (`retractFailed` needs no term of its own: that branch only runs when
+    //     retention is false, so it can never co-occur with this one.)
+    //  2. SAME GROUP. A tier change means the target group has none of this item's episodes.
+    //  3. NO CLEANUP OUTSTANDING ON ANY GROUP — `IS NULL`, not merely "not the push target". A pending
+    //     cleanup on another group is still a cleanup, and reconcile may be about to force a re-push.
+    //  4. LIVE PROJECTION, NOT A SENTINEL. `reconcile` re-queues a row that never landed by setting
+    //     `content_sha256 = ''` and NOTHING else (lib/graph/reconcile.ts) — chunk_shas, group_id and the
+    //     pending flag all survive. Without this term the other four hold, the delta finds every hash
+    //     already recorded, pushes nothing, and reconcile re-queues it again next pass: a closed loop in
+    //     which the item's content never reaches the graph while `projected_at` refreshes hourly and the
+    //     ledger reads healthy. (Found in spec review — the failure mode of the whole change.)
+    //  5. SAME CHUNK CONFIG. `content_sha256` hashes the whole body and is invariant to chunking, so a
+    //     raised cap leaves the early chunks hashing identically while the new tail chunks were never
+    //     pushed. The config is what completes the ledger's identity.
+    const deltaEligible =
+      existingRow !== null &&
+      sourceRules((item.frontmatter ?? {}).source).retainSupersededBodies &&
+      !tierChanged &&
+      existingRow.pending_delete_group_id === null &&
+      existingRow.content_sha256 !== "" &&
+      existingRow.chunk_config === CHUNK_CONFIG;
+    // NB: no `chunk_shas.length > 0` term. It would be unfalsifiable — an empty ledger yields an empty
+    // `alreadyPushed`, so the diff below already degrades to a full push on its own. A predicate term
+    // no test can redden is one the guard below would be asserting on trust.
+    const alreadyPushed = new Set(deltaEligible ? (existingRow?.chunk_shas ?? []) : []);
+    const toPush = deltaEligible ? episodes.filter((_, i) => !alreadyPushed.has(chunkShas[i])) : episodes;
+
+    if (!(purgeFailed && contentUnchanged) && toPush.length > 0) {
+      await client.addEpisodes(groupId, toPush);
     }
 
+    // A pass that POSTed nothing must not claim it pushed: `extraction-health.newestEpisodeAtMs` reads
+    // `max(projected_at) where content_sha256 <> ''` as "when did we last actually send an episode",
+    // discriminating the existing bump-without-POST paths only by their `''` sentinel. A delta pass
+    // writes a REAL digest, so bumping the timestamp here would be a third such path that the sentinel
+    // cannot tell apart — and with a hot document edited past the extraction cap hourly, the lag probe
+    // would report a false extraction stall on a perfectly healthy extractor. `reconcile`'s
+    // "too recent to judge" grace reads the same column and would defer judging a push never re-attempted.
+    const pushedSomething = toPush.length > 0 && !(purgeFailed && contentUnchanged);
     const projectedAt = new Date().toISOString();
     // Pending-delete bookkeeping for THIS push. Written only when it changes; an ordinary content
     // re-push omits both columns, so the pg upsert (which only SETs keys present in the object) leaves
@@ -528,13 +612,24 @@ export async function projectItemsToGraph(
         source_id: item.id,
         group_id: groupId,
         content_sha256: contentSha,
-        projected_at: projectedAt,
+        chunk_shas: chunkShas,
+        chunk_config: CHUNK_CONFIG,
+        // The whole current chunk list is recorded, not just what this pass sent: the next diff must
+        // be against the item's full chunking, and this is last-state, never a union. A chunk that
+        // disappears and later returns is therefore re-pushed — a cost, not a hole.
+        ...(pushedSomething ? { projected_at: projectedAt } : {}),
         ...pending,
       },
       { onConflict: "team_id,source_table,source_id" }
     );
-    projected++;
-    episodesPushed += episodes.length;
+    if (pushedSomething) projected++;
+    else skipped++; // ledger refreshed, nothing extracted — not work the health probes should see
+    // What was ACTUALLY sent, not what the item chunks into. `episodes` is the denominator of the
+    // per-episode extraction cost metric, so counting the item's full chunk list on a delta pass that
+    // sent one chunk (or none) would divide real LLM calls by phantom episodes and make extraction
+    // look cheaper per episode than it is. This also stops counting the `purgeFailed && contentUnchanged`
+    // refusal, which pushes nothing and was previously counted.
+    episodesPushed += pushedSomething ? toPush.length : 0;
   }
 
   // Cursor for the runner: rows are ordered by synced_at ascending, so the last row is the high-water

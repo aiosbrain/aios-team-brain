@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { GraphitiClient, GraphEpisode, GraphEpisodeRef } from "@/lib/graph/graphiti-client";
+import type { GraphEpisode } from "@/lib/graph/graphiti-client";
 import { projectSlackToGraph, projectItemsToGraph, deleteItemEpisodes, CHUNK_CHARS, MAX_EPISODE_CHUNKS, GROUP_SCAN_DEPTH } from "@/lib/graph/project";
 import { runGraphProjection } from "@/lib/graph/run";
 import {
@@ -11,56 +11,11 @@ import {
 } from "@/lib/graph/reconcile";
 import { purgeItemsByPathPrefix } from "@/lib/ingest/purge";
 import { db, ingest, seedTeam } from "./helpers";
+import { FakeGraphiti, client } from "./fake-graphiti";
 
 // Spec: the projector reads Slack transcripts from the brain and pushes them to Graphiti as
 // episodes, idempotently, with tier-scoped group_ids. Verified on real Postgres with a MOCKED
 // Graphiti client (no live graph service needed) — we assert the pushes + the graph_episodes state.
-
-let fakeUuidCounter = 0;
-
-/** In-memory Graphiti double: tracks episodes per group with server-assigned uuids, so
- * listEpisodes/deleteEpisode (M6, H3 reconcile) behave like the real REST surface. */
-class FakeGraphiti {
-  pushes: { groupId: string; episodes: GraphEpisode[] }[] = [];
-  // groupId -> uuid -> episode (mirrors Graphiti's own per-group episode store)
-  store = new Map<string, Map<string, GraphEpisodeRef>>();
-  // Names that should be treated as "never landed" (simulates a worker crash before extraction).
-  neverLands = new Set<string>();
-  // When true, deleteEpisode throws — simulates a Graphiti blip so cleanup fails (B2).
-  failDeletes = false;
-  // Records the `lastN` each listEpisodes call requested, so a test can assert the deep scan (B2).
-  listCalls: { groupId: string; lastN?: number }[] = [];
-  readonly configured = true;
-
-  async addEpisodes(groupId: string, episodes: GraphEpisode[]): Promise<void> {
-    this.pushes.push({ groupId, episodes });
-    const group = this.store.get(groupId) ?? new Map<string, GraphEpisodeRef>();
-    for (const e of episodes) {
-      if (e.name && this.neverLands.has(e.name)) continue; // simulated crash: never materializes
-      const uuid = `fake-uuid-${++fakeUuidCounter}`;
-      group.set(uuid, { uuid, name: e.name ?? "" });
-    }
-    this.store.set(groupId, group);
-  }
-
-  /** Honors `lastN` the way Graphiti's `GET /episodes/{group}` does — the MOST RECENT n only. Without
-   *  this the double silently makes every scan unbounded, and the depth/saturation behavior the tier
-   *  cleanup depends on (a shallow window hides an item; a full window is inconclusive) is untestable. */
-  async listEpisodes(groupId: string, lastN?: number): Promise<GraphEpisodeRef[]> {
-    this.listCalls.push({ groupId, lastN });
-    const all = [...(this.store.get(groupId)?.values() ?? [])]; // insertion order = oldest → newest
-    return typeof lastN === "number" && lastN >= 0 ? all.slice(Math.max(0, all.length - lastN)) : all;
-  }
-
-  async deleteEpisode(uuid: string): Promise<void> {
-    if (this.failDeletes) throw new Error("simulated Graphiti delete failure");
-    for (const group of this.store.values()) group.delete(uuid);
-  }
-}
-
-function client(fake: FakeGraphiti): GraphitiClient {
-  return fake as unknown as GraphitiClient;
-}
 
 /** A minimal episode with a stable name — the only field the cleanup paths key on. */
 function ep(name: string): GraphEpisode {

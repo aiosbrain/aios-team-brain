@@ -1749,6 +1749,14 @@ create table if not exists graph_episodes (
   episode_uuid text,                           -- Graphiti's episode id, if returned
   pending_delete_group_id text,                -- an OLD group still needing cleanup after a tier change (reconcile retries until empty; see lib/graph/reconcile)
   pending_delete_at timestamptz,               -- when that cleanup was recorded — anchors reconcile's straggler grace (projected_at is bumped by every content re-push)
+  -- Per-chunk ledger (GRAPHCOST-1). A large item is projected as several chunk episodes; these are the
+  -- hashes of the content last pushed TO `group_id`, so a re-projection pushes only the chunks that
+  -- actually changed instead of all of them. `chunk_config` is the chunk sizing those hashes were made
+  -- under ('<chars>x<maxChunks>') — `content_sha256` hashes the whole body and is invariant to
+  -- chunking, so it cannot detect a config change that leaves early chunks identical while new tail
+  -- chunks were never pushed. Empty = no per-chunk knowledge → full push. Sole writer: lib/graph/project.
+  chunk_shas text[] not null default '{}',
+  chunk_config text not null default '',
   projected_at timestamptz not null default now(),
   unique (team_id, source_table, source_id)
 );
