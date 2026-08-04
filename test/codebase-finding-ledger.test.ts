@@ -51,6 +51,27 @@ describe("codebase finding lifecycle", () => {
     ).toEqual({ status: "risk_accepted", event: "observed", mutatesCurrent: true });
   });
 
+  it("resolves a decided finding when complete evidence proves it absent", () => {
+    expect(
+      decideFindingTransition({
+        currentStatus: "risk_accepted",
+        present: false,
+        evidenceStatus: "complete",
+      })
+    ).toEqual({ status: "resolved", event: "resolved", mutatesCurrent: true });
+  });
+
+  it("does not let evidence older than the operator decision resolve it", () => {
+    expect(
+      decideFindingTransition({
+        currentStatus: "risk_accepted",
+        present: false,
+        evidenceStatus: "complete",
+        decisionNewerThanEvidence: true,
+      })
+    ).toBeNull();
+  });
+
   it("records older analysis without mutating current state", () => {
     expect(
       decideFindingTransition({

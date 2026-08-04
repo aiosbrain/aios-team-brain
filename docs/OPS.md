@@ -256,6 +256,23 @@ history and is therefore a human-approved rollback, never an automatic migration
 `npm run pg:schema` recreates the empty tables and function; the current migration does not
 backfill old snapshots or guess historical transitions.
 
+### Explainable-debt decision rollback
+
+Migration `20260804160000_explainable_debt_decisions.sql` is additive. The preferred application
+rollback is to deploy code that does not call `decide_codebase_finding` and retain the decision
+columns/events: old application builds ignore them, and operator history remains recoverable.
+Do not set `codebase_finding_events.metrics_id` back to `NOT NULL` while operator events exist;
+decision events intentionally use a null metrics id so repeated human decisions cannot collide
+with scan-replay idempotency.
+
+A physical rollback is destructive to audit history and requires a verified backup plus human
+approval. In order: disable the decision action, drop `decide_codebase_finding`, export the
+operator events (`event_type in ('accepted','risk_accepted','false_positive')`), delete those null-
+metrics events only after the export is verified, restore the metrics-id constraint, then drop the
+decision-expiry index, decision metadata constraint, and five decision columns. The scanner
+snapshot and original finding ledger remain authoritative throughout; never drop either ledger
+table for a Phase 1 UI rollback.
+
 ---
 
 ## 6. API-key rotation — `scripts/admin.ts`
