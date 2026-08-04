@@ -5,11 +5,11 @@ import {
   forwardBody,
   forwardUpstream,
   isRefusal,
-  resolveGraphChatTarget,
+  resolveGraphChatTargets,
   resolveGraphProxyTeamId,
   graphProxyWithinRateLimit,
 } from "@/lib/llm/graph-proxy";
-import { classifyGraphCall } from "@/lib/llm/graph-call-kind";
+import { classifyGraphCall, wantsSmallModel } from "@/lib/llm/graph-call-kind";
 
 export const runtime = "nodejs";
 /** Graphiti's extraction calls are slow (structured output over a long episode, plus resolution
@@ -55,8 +55,21 @@ export async function POST(req: NextRequest) {
   const team = await resolveGraphProxyTeamId(db);
   if (isRefusal(team)) return refusalResponse(team);
 
-  const target = await resolveGraphChatTarget(db, team.teamId);
-  if (isRefusal(target)) return refusalResponse(target);
+  // BOTH targets from one key snapshot — see `resolveGraphChatTargets`. Resolving the small one
+  // separately would double the provider-key work on the majority of calls, even when unconfigured.
+  const { strong, small: smallTarget } = await resolveGraphChatTargets(db, team.teamId);
+  if (isRefusal(strong)) return refusalResponse(strong);
+
+  // GRAPHCOST-7: Graphiti asks for a cheaper model on the two prompts that only refine work a strong
+  // model already did. Honour that, but only when our own reading of the request agrees it is one of
+  // those two (`wantsSmallModel`) — the marker alone is forgeable by one env var on the graph service
+  // and would route entity extraction to the weak model. A configured-but-off small model resolves to
+  // null, so every degraded state lands back on `strong`: today's behaviour, today's bill.
+  //
+  // The SMALL PATH IS ITS OWN TARGET, not a model string swapped into `strong`, because the meter
+  // tags the ledger row from `target.model` — a swap would file every cheap call under the expensive
+  // model and make the verification read lie in both directions.
+  const target = wantsSmallModel(body) && smallTarget ? smallTarget : strong;
 
   const forwarded = forwardBody(body, target.model, target.provider);
   if (isRefusal(forwarded)) return refusalResponse(forwarded);

@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { recordLlmUsage } from "@/lib/costs/llm-usage";
-import { getGraphSpendByCallKind, getSpendSlices, getSpendTotalUsd } from "@/lib/metrics/llm-spend";
+import {
+  getGraphSpendByCallKind,
+  getGraphSpendByCallKindAndModel,
+  getSpendSlices,
+  getSpendTotalUsd,
+} from "@/lib/metrics/llm-spend";
 import { db, seedTeam } from "./helpers";
 
 /**
@@ -14,12 +19,18 @@ import { db, seedTeam } from "./helpers";
 
 const ADMIN = { isAdmin: true as const, memberId: null };
 
-async function usage(teamId: string, callKind: string | undefined, costUsd: number, source = "graph") {
+async function usage(
+  teamId: string,
+  callKind: string | undefined,
+  costUsd: number,
+  source = "graph",
+  model = "qwen/qwen3.7-plus"
+) {
   await recordLlmUsage(db(), {
     teamId,
     source: source as "graph",
     provider: "openrouter",
-    model: "qwen/qwen3.7-plus",
+    model,
     inputTokens: 1000,
     outputTokens: 100,
     costUsd,
@@ -97,5 +108,38 @@ describe("graph spend by call kind (real Postgres)", () => {
 
     const slices = await getGraphSpendByCallKind(db(), a.teamId, 30, ADMIN);
     expect(slices.map((s) => s.callKind)).toEqual(["extract_nodes"]);
+  });
+});
+
+/**
+ * GRAPHCOST-7 — the read that VERIFIES small-model routing. Without it, "did the cheap model
+ * actually serve those calls?" is unanswerable, and a routing change nobody can verify is a routing
+ * change nobody should make.
+ */
+describe("graph spend by call kind AND model (real Postgres)", () => {
+  it("separates the same prompt served by two different models — worked vs did nothing", async () => {
+    const seed = await seedTeam();
+    // The shape after routing is enabled: the fan-out on the cheap model, extraction on the strong one.
+    await usage(seed.teamId, "node_attributes", 0.2, "graph", "cheap/small");
+    await usage(seed.teamId, "node_attributes", 0.1, "graph", "cheap/small");
+    await usage(seed.teamId, "extract_nodes", 1.0, "graph", "big/extract");
+
+    const rows = await getGraphSpendByCallKindAndModel(db(), seed.teamId, 30, ADMIN);
+    const key = (k: string, m: string) => rows.find((r) => r.callKind === k && r.model === m);
+    expect(key("node_attributes", "cheap/small")?.calls).toBe(2);
+    expect(key("node_attributes", "cheap/small")?.costUsd).toBeCloseTo(0.3, 5);
+    expect(key("extract_nodes", "big/extract")?.costUsd).toBeCloseTo(1.0, 5);
+    // The failure this read has to catch: routing believed-on but the strong model still serving.
+    expect(key("node_attributes", "big/extract")).toBeUndefined();
+  });
+
+  it("keeps '' distinct from 'unknown' here too", async () => {
+    const seed = await seedTeam();
+    await usage(seed.teamId, undefined, 1, "graph", "m");
+    await usage(seed.teamId, "unknown", 2, "graph", "m");
+    const kinds = (await getGraphSpendByCallKindAndModel(db(), seed.teamId, 30, ADMIN))
+      .map((r) => r.callKind)
+      .sort();
+    expect(kinds).toEqual(["", "unknown"]);
   });
 });

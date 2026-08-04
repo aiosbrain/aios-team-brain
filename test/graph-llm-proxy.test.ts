@@ -460,3 +460,75 @@ describe("graph call-kind reaches the ledger (the route's composition, end to en
     expect(rows[0].call_kind).toBe("unknown"); // the drift alarm, distinct from '' history
   });
 });
+
+/**
+ * GRAPHCOST-7 — the SMALL PATH's wiring, not its decision function.
+ *
+ * `wantsSmallModel` has its own specs; they prove nothing about whether a small-routed call is
+ * actually served — and ledgered — by the small model. The meter tags the row from `target.model`,
+ * so a implementation that swapped the model string into the strong target would send the right
+ * request and file the wrong row, and the by-(kind, model) read that verifies this routing would
+ * report the opposite of the truth in both directions.
+ */
+describe("small-model routing reaches the wire AND the ledger (AC4)", () => {
+  const strong = { url: "https://prov/api/v1/chat/completions", headers: {}, model: "big/extract", provider: "openrouter" };
+  const small = { url: "https://prov/api/v1/chat/completions", headers: {}, model: "small/cheap", provider: "openrouter" };
+  // node_operations.py:406 — extract_nodes.extract_attributes, carrying Graphiti's small marker.
+  const SMALL_BODY = {
+    model: "gpt-4.1-nano",
+    messages: [{ role: "system", content: "You are a helpful assistant that extracts entity properties from the provided text." }],
+  };
+
+  const captureDb = () => {
+    const rows: Record<string, unknown>[] = [];
+    const db = { from: () => ({ insert: async (r: Record<string, unknown>) => { rows.push(r); return { error: null }; } }) } as never;
+    return { db, rows };
+  };
+  const ok = () =>
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ usage: { prompt_tokens: 5000, completion_tokens: 200, cost: 0.0002 } }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      })
+    );
+
+  afterEach(() => vi.restoreAllMocks());
+
+  it("serves the small model AND ledgers it under the small model", async () => {
+    const fetchSpy = ok();
+    const { db, rows } = captureDb();
+    const forwarded = forwardBody(SMALL_BODY, small.model, small.provider);
+    if (isRefusal(forwarded)) throw new Error("expected a body");
+    await forwardUpstream(small, forwarded, {
+      meter: { db, teamId: "t", source: "graph", kind: "chat", callKind: classifyGraphCall(SMALL_BODY) },
+    });
+
+    // On the wire…
+    const sent = JSON.parse(String((fetchSpy.mock.calls[0]?.[1] as RequestInit).body));
+    expect(sent.model).toBe("small/cheap");
+    // …and in the ledger, tagged with the model that actually served it and the prompt that made it.
+    expect(rows[0]).toMatchObject({ model: "small/cheap", call_kind: "node_attributes", source: "graph" });
+  });
+
+  it("the strong path is untouched — same body, strong target, strong model everywhere", async () => {
+    const fetchSpy = ok();
+    const { db, rows } = captureDb();
+    const forwarded = forwardBody(SMALL_BODY, strong.model, strong.provider);
+    if (isRefusal(forwarded)) throw new Error("expected a body");
+    await forwardUpstream(strong, forwarded, {
+      meter: { db, teamId: "t", source: "graph", kind: "chat", callKind: classifyGraphCall(SMALL_BODY) },
+    });
+    const sent = JSON.parse(String((fetchSpy.mock.calls[0]?.[1] as RequestInit).body));
+    expect(sent.model).toBe("big/extract");
+    expect(rows[0]).toMatchObject({ model: "big/extract" });
+  });
+
+  it("the small path keeps every proxy behaviour — refusals, reasoning-off, usage (AC6)", () => {
+    // Streaming must still be refused when the small model is the target.
+    expect(isRefusal(forwardBody({ ...SMALL_BODY, stream: true }, small.model, small.provider))).toBe(true);
+    const forwarded = forwardBody(SMALL_BODY, small.model, small.provider);
+    if (isRefusal(forwarded)) throw new Error("expected a body");
+    expect(forwarded.reasoning).toEqual({ enabled: false });
+    expect(forwarded.usage).toEqual({ include: true });
+  });
+});

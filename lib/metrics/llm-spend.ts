@@ -323,6 +323,59 @@ export async function getGraphSpendByCallKind(
   }));
 }
 
+/** Graph spend for one (prompt, model) pair — how small-model routing is verified. */
+export interface GraphKindModelSlice {
+  callKind: string;
+  model: string;
+  costUsd: number;
+  calls: number;
+}
+
+/**
+ * Graph spend by (call kind × model served) — the read that proves small-model routing worked.
+ *
+ * Routing `node_attributes` to a cheap model is only trustworthy if it can be checked afterwards,
+ * and this is the check: after the change, `node_attributes` rows should carry the small model while
+ * `extract_nodes` rows still carry the strong one. Two rows with the same kind and different models
+ * is a routing change in flight; one row is either "not enabled" or "not working", and the model
+ * name says which.
+ *
+ * `model` is written from the `ProxyTarget` the call was actually served with, so this cannot be
+ * satisfied by a swapped string that never changed the transport.
+ *
+ * Like `getGraphSpendByCallKind`, `''` is kept distinct from `'unknown'` — pre-instrumentation
+ * history and a drift alarm are not the same fact.
+ */
+export async function getGraphSpendByCallKindAndModel(
+  _db: unknown,
+  teamId: string,
+  days: number,
+  viewer: QueryLogViewer
+): Promise<GraphKindModelSlice[]> {
+  const scope = viewerPredicate(viewer, 3);
+  const { rows } = await runSql<{
+    call_kind: string;
+    model: string;
+    cost_usd: string | number;
+    calls: string | number;
+  }>(
+    `select call_kind, model,
+            coalesce(sum(cost_usd), 0) as cost_usd,
+            count(*)                   as calls
+       from llm_usage
+      where team_id = $1 and created_at >= $2 and source = 'graph'${scope.sql}
+      group by call_kind, model
+      order by 3 desc`,
+    [teamId, windowStartIso(days), ...scope.params]
+  );
+  return rows.map((r) => ({
+    callKind: r.call_kind,
+    model: r.model,
+    costUsd: Number(r.cost_usd) || 0,
+    calls: Number(r.calls) || 0,
+  }));
+}
+
 /**
  * Lifetime ledger total for ONE provider — the reconciliation figure.
  *

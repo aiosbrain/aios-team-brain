@@ -4,7 +4,7 @@ import type { DbClient } from "@/lib/db/types";
 import { rateLimit } from "@/lib/api/rate-limit";
 import { resolvePositiveInt } from "@/lib/util/env";
 import { resolveAnsweringKeys } from "@/lib/query/answering";
-import { selectLlmBackend, type LlmBackend } from "@/lib/query/llm-backend";
+import { selectLlmBackend, selectSmallExtractionBackend, type LlmBackend } from "@/lib/query/llm-backend";
 import { resolveEmbeddingBackend } from "@/lib/query/embedding-key";
 import { EMBEDDING_DIM } from "@/lib/api/schemas";
 import { recordLlmUsage, recordLlmFailure, classifyLlmFailure, type LlmUsageSource } from "@/lib/costs/llm-usage";
@@ -32,10 +32,18 @@ import { meterFromOpenAiResponse } from "@/lib/llm/cost";
  * constant-time compare, a length floor, and a rate limit on the authorized path so a leaked secret
  * is bounded rather than unlimited. Brute force is not the threat at 32+ random chars; leakage is.
  *
- * `MODEL_NAME` ON THE GRAPHITI SERVICE IS DELIBERATELY IGNORED. Whatever the client asks for is
- * discarded and replaced with the model the console resolves. Honouring it would recreate the exact
- * problem this is here to remove — a second place that decides. If you are wondering why changing
- * `MODEL_NAME` on that service does nothing, this comment is the answer.
+ * `MODEL_NAME` ON THE GRAPHITI SERVICE STILL DOES NOT CHOOSE THE MODEL. Whatever the client asks for
+ * is discarded and replaced with the model the console resolves. Honouring it would recreate the
+ * exact problem this is here to remove — a second place that decides.
+ *
+ * ⚠️ ONE BIT of the client's request is now read (GRAPHCOST-7): whether Graphiti asked for
+ * `ModelSize.small`, which it signals by sending `gpt-4.1-nano`. That bit selects between two
+ * CONSOLE-configured models — it can never name a model itself — and it is only honoured when
+ * `wantsSmallModel` also recognises the request's own prompt as one of the two safe-to-downgrade
+ * kinds. That AND matters: `_get_model_for_size` returns `self.model or DEFAULT_MODEL`, so setting
+ * `MODEL_NAME=gpt-4.1-nano` here makes EVERY call wear the small marker, and honouring the marker
+ * alone would route entity extraction to the weak model. So: setting `MODEL_NAME` to a nano-ish
+ * name no longer "does nothing" — it is refused by the guard rather than obeyed. Don't set it.
  *
  * This module is the ONLY sanctioned raw transport for the graph leg (allowlisted in
  * `test/guards/llm-single-caller.test.ts`) — it holds `chat/completions` here so the route handlers
@@ -262,14 +270,31 @@ export async function graphProxyWithinRateLimit(db: DbClient): Promise<boolean> 
  * role existed, one dropdown had to serve both and the graph inherited a reasoning model at $4.425/M out.
  */
 export async function resolveGraphChatTarget(db: DbClient, teamId: string): Promise<ProxyTarget | ProxyRefusal> {
+  return (await resolveGraphChatTargets(db, teamId)).strong;
+}
+
+/**
+ * BOTH chat targets from ONE key snapshot: the extraction target every call uses, and the cheap
+ * target for the calls Graphiti marks `ModelSize.small` (null when small routing is off).
+ *
+ * One snapshot, deliberately. Resolving them separately would re-run `resolveAnsweringKeys` — four
+ * queries plus three key decryptions — on the majority of ~17k calls a day, and would pay it even on
+ * an install that never configures a small model. It would also open a window where an admin save
+ * between the two reads yields a strong and a small target from different provider snapshots, which
+ * is the one way they could diverge (the small backend is otherwise the extraction backend by
+ * construction, so `forwardBody`'s openrouter-only injections apply identically to both).
+ */
+export async function resolveGraphChatTargets(
+  db: DbClient,
+  teamId: string
+): Promise<{ strong: ProxyTarget | ProxyRefusal; small: ProxyTarget | null }> {
+  const env = { LLM_BASE_URL: process.env.LLM_BASE_URL, LLM_MODEL: process.env.LLM_MODEL };
   const keys = await resolveAnsweringKeys(db, teamId);
-  return graphChatTarget(
-    selectLlmBackend(
-      { LLM_BASE_URL: process.env.LLM_BASE_URL, LLM_MODEL: process.env.LLM_MODEL },
-      keys,
-      { role: "extraction" }
-    )
-  );
+  const strong = graphChatTarget(selectLlmBackend(env, keys, { role: "extraction" }));
+  const smallBackend = selectSmallExtractionBackend(env, keys);
+  if (!smallBackend) return { strong, small: null };
+  const small = graphChatTarget(smallBackend);
+  return { strong, small: isRefusal(small) ? null : small };
 }
 
 /** Resolve the embeddings target from the team's console settings. */

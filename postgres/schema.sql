@@ -133,6 +133,11 @@ create table if not exists teams (
   -- LLM proxy, which is 99% of the LLM bill. Null = reuse the answering model (the pre-role behaviour);
   -- the MODEL is the activation switch. See lib/query/llm-backend (role="extraction").
   extraction_model text,
+  -- Cheaper model for the extraction calls Graphiti itself marks ModelSize.small (GRAPHCOST-7).
+  -- Empty/null = off, which is today's behaviour exactly. Rides the extraction backend's provider
+  -- and key — no small-provider sibling, deliberately: a second provider would reintroduce the
+  -- half-swap the extraction branch's WHOLE fallback exists to prevent.
+  extraction_small_model text,
   -- Optional distinct PROVIDER for the extraction model. Null = the answering backend, different model.
   -- `anthropic` is deliberately excluded: Graphiti extracts via OpenAI structured outputs, which
   -- graphChatTarget refuses for Anthropic, so allowing it would 501 every extraction call while Graphiti
@@ -158,6 +163,7 @@ alter table teams add column if not exists reasoning_model text;
 alter table teams add column if not exists reasoning_provider text;
 alter table teams add column if not exists extraction_model text;
 alter table teams add column if not exists extraction_provider text;
+alter table teams add column if not exists extraction_small_model text;
 alter table teams add column if not exists embedding_provider text;
 alter table teams add column if not exists embedding_model text;
 do $$ begin
