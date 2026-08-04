@@ -16,7 +16,8 @@ import { join } from "node:path";
 const ROOT = join(import.meta.dirname, "..", "..");
 const PAGES_DIR = join(ROOT, "app", "t");
 const HELPER = join(ROOT, "lib", "metrics", "codebases.ts");
-const TABLES = /from\(\s*["'](codebases|code_metrics|code_contributions|github_issues)["']\s*\)/;
+const TABLES =
+  /from\(\s*["'](codebases|code_metrics|codebase_findings|codebase_finding_events|code_contributions|github_issues)["']\s*\)/;
 
 function walk(dir: string, out: string[] = []): string[] {
   let entries: string[];

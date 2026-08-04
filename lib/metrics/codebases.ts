@@ -5,6 +5,7 @@ import type { Kpi } from "./pulse";
 import { rangeDays, type Range } from "./range";
 import { canSeeCodebases, type ViewerTier } from "@/lib/codebases/visibility";
 import { num, numOrNull, round } from "@/lib/num";
+import type { FindingStatus } from "@/lib/codebases/finding-ledger";
 
 /**
  * The ONLY read path for codebase analytics tables — pages must go through here,
@@ -348,6 +349,35 @@ export interface CommitVolumePoint {
   human: number;
 }
 
+export interface CodebaseFindingEvent {
+  id: string;
+  event_type: string;
+  from_status: FindingStatus | null;
+  to_status: FindingStatus;
+  head_sha: string;
+  observed_at: string;
+  details: Record<string, unknown>;
+}
+
+export interface CodebaseFinding {
+  id: string;
+  fingerprint: string;
+  status: FindingStatus;
+  check_id: string;
+  axis: string;
+  kind: "quality_issue" | "evidence_gap";
+  severity: "low" | "medium" | "high" | "critical";
+  evidence_status: "complete" | "partial" | "missing" | "stale" | "error";
+  remediation_tier: number;
+  first_seen_sha: string;
+  last_seen_sha: string;
+  first_seen_at: string;
+  last_seen_at: string;
+  resolved_at: string | null;
+  occurrence_count: number;
+  events: CodebaseFindingEvent[];
+}
+
 export interface CodebaseDetail {
   id: string;
   slug: string;
@@ -368,6 +398,7 @@ export interface CodebaseDetail {
   commitVolume: CommitVolumePoint[];
   contributors: ContributorRow[];
   issues: IssueRow[];
+  findings: CodebaseFinding[];
 }
 
 export async function getCodebaseDetail(
@@ -399,7 +430,15 @@ export async function getCodebaseDetail(
     "test_coverage_functions_pct, test_coverage_branches_pct, recent_commits, " +
     "readiness_level, readiness_pct, readiness_pillars, codebase_health";
 
-  const [metricsRes, contribRes, issuesRes, membersRes, profilesRes] = await Promise.all([
+  const [
+    metricsRes,
+    contribRes,
+    issuesRes,
+    membersRes,
+    profilesRes,
+    findingsRes,
+    findingEventsRes,
+  ] = await Promise.all([
     // NOT windowed: the breakdown/headline reflect the LAST scan even if it predates the range
     // (a stale detail page keeps its last-known values). The trend windows this series in JS below.
     db
@@ -424,6 +463,24 @@ export async function getCodebaseDetail(
     db.from("members").select("id, display_name, github_login, avatar_url").eq("team_id", teamId),
     // Uploaded avatars live on member_profiles (1:1, separate table) — sibling query, merged in JS.
     db.from("member_profiles").select("member_id, avatar_data_url").eq("team_id", teamId),
+    db
+      .from("codebase_findings")
+      .select(
+        "id, fingerprint, status, check_id, axis, kind, severity, evidence_status, remediation_tier, occurrence_count, first_seen_sha, last_seen_sha, first_seen_at, last_seen_at, resolved_at"
+      )
+      .eq("team_id", teamId)
+      .eq("codebase_id", codebaseId)
+      .order("last_seen_at", { ascending: false })
+      .limit(500),
+    db
+      .from("codebase_finding_events")
+      .select(
+        "id, finding_id, event_type, from_status, to_status, head_sha, observed_at, details"
+      )
+      .eq("team_id", teamId)
+      .eq("codebase_id", codebaseId)
+      .order("observed_at", { ascending: false })
+      .limit(5_000),
   ]);
 
   type MemberMeta = { display_name: string | null; github_login: string | null; avatar_url: string | null };
@@ -555,6 +612,43 @@ export async function getCodebaseDetail(
     labels: Array.isArray(i.labels) ? i.labels : [],
   }));
 
+  type FindingEventRow = Omit<CodebaseFindingEvent, "observed_at"> & {
+    finding_id: string;
+    observed_at: string | Date;
+  };
+  const findingEventsById = new Map<string, CodebaseFindingEvent[]>();
+  for (const row of (findingEventsRes.data ?? []) as FindingEventRow[]) {
+    const events = findingEventsById.get(row.finding_id) ?? [];
+    events.push({
+      id: row.id,
+      event_type: row.event_type,
+      from_status: row.from_status,
+      to_status: row.to_status,
+      head_sha: row.head_sha,
+      observed_at: new Date(row.observed_at).toISOString(),
+      details: row.details ?? {},
+    });
+    findingEventsById.set(row.finding_id, events);
+  }
+
+  type FindingRow = Omit<CodebaseFinding, "first_seen_at" | "last_seen_at" | "resolved_at" | "events"> & {
+    first_seen_at: string | Date;
+    last_seen_at: string | Date;
+    resolved_at: string | Date | null;
+  };
+  const findings: CodebaseFinding[] = ((findingsRes.data ?? []) as FindingRow[]).map((row) => {
+    const events = findingEventsById.get(row.id) ?? [];
+    return {
+      ...row,
+      remediation_tier: num(row.remediation_tier),
+      occurrence_count: num(row.occurrence_count),
+      first_seen_at: new Date(row.first_seen_at).toISOString(),
+      last_seen_at: new Date(row.last_seen_at).toISOString(),
+      resolved_at: row.resolved_at == null ? null : new Date(row.resolved_at).toISOString(),
+      events,
+    };
+  });
+
   const c = cb as Record<string, unknown>;
   return {
     id: codebaseId,
@@ -578,6 +672,7 @@ export async function getCodebaseDetail(
     commitVolume,
     contributors,
     issues,
+    findings,
   };
 }
 

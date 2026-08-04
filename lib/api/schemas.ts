@@ -273,16 +273,27 @@ export const githubIssueSchema = z.object({
   closed_at: z.string().nullable().optional(),
 });
 
-export const codebaseScanPayloadSchema = z.object({
-  codebase: codebaseRecordSchema,
-  metrics: codeMetricsSchema,
-  contributions: z
-    .array(codeContributionSchema)
-    .max(5000)
-    .optional()
-    .default([]),
-  issues: z.array(githubIssueSchema).max(5000).optional().default([]),
-});
+export const codebaseScanPayloadSchema = z
+  .object({
+    codebase: codebaseRecordSchema,
+    metrics: codeMetricsSchema,
+    contributions: z
+      .array(codeContributionSchema)
+      .max(5000)
+      .optional()
+      .default([]),
+    issues: z.array(githubIssueSchema).max(5000).optional().default([]),
+  })
+  .superRefine((payload, context) => {
+    const health = payload.metrics.codebase_health;
+    if (health?.schema_version === "2" && health.head_sha !== payload.metrics.head_sha) {
+      context.addIssue({
+        code: "custom",
+        path: ["metrics", "codebase_health", "head_sha"],
+        message: "codebase health head_sha must match metrics head_sha",
+      });
+    }
+  });
 export type CodebaseScanPayload = z.infer<typeof codebaseScanPayloadSchema>;
 
 // AEM individual-scope maturity signals (ratios + counts; the entire privacy

@@ -1,0 +1,103 @@
+import type { CodebaseHealth } from "@/lib/api/schemas";
+import type { DbClient } from "@/lib/db/types";
+
+export type FindingStatus =
+  | "open"
+  | "accepted"
+  | "resolved"
+  | "reopened"
+  | "false_positive"
+  | "risk_accepted"
+  | "superseded"
+  | "stale_analysis";
+
+export type FindingEventType =
+  | "detected"
+  | "observed"
+  | "resolved"
+  | "reopened"
+  | "stale_analysis";
+
+export type FindingTransition = {
+  status: FindingStatus;
+  event: FindingEventType;
+  mutatesCurrent: boolean;
+};
+
+type EvidenceStatus = "complete" | "partial" | "missing" | "stale" | "error";
+
+/**
+ * Pure mirror of the database lifecycle rules. The SQL function is the atomic writer;
+ * this helper keeps the fail-closed transition contract executable in fast unit tests.
+ */
+export function decideFindingTransition(input: {
+  currentStatus: FindingStatus | null;
+  present: boolean;
+  evidenceStatus: EvidenceStatus;
+  olderThanCurrent?: boolean;
+}): FindingTransition | null {
+  const { currentStatus, present, evidenceStatus, olderThanCurrent = false } = input;
+
+  if (olderThanCurrent) {
+    if (currentStatus) {
+      return { status: currentStatus, event: "stale_analysis", mutatesCurrent: false };
+    }
+    return present
+      ? { status: "stale_analysis", event: "stale_analysis", mutatesCurrent: false }
+      : null;
+  }
+
+  if (present) {
+    if (!currentStatus) return { status: "open", event: "detected", mutatesCurrent: true };
+    if (currentStatus === "resolved" || currentStatus === "stale_analysis") {
+      return { status: "reopened", event: "reopened", mutatesCurrent: true };
+    }
+    return { status: currentStatus, event: "observed", mutatesCurrent: true };
+  }
+
+  if (
+    evidenceStatus === "complete" &&
+    (currentStatus === "open" || currentStatus === "reopened")
+  ) {
+    return { status: "resolved", event: "resolved", mutatesCurrent: true };
+  }
+  return null;
+}
+
+export interface FindingReconcileResult {
+  detected: number;
+  observed: number;
+  resolved: number;
+  reopened: number;
+  stale: number;
+}
+
+const EMPTY_RESULT: FindingReconcileResult = {
+  detected: 0,
+  observed: 0,
+  resolved: 0,
+  reopened: 0,
+  stale: 0,
+};
+
+/** Atomically project one validated v2 snapshot into current state + append-only history. */
+export async function reconcileCodebaseFindings(
+  db: DbClient,
+  input: {
+    teamId: string;
+    codebaseId: string;
+    metricsId: string;
+    health: CodebaseHealth | undefined;
+  }
+): Promise<FindingReconcileResult> {
+  if (!input.health || input.health.schema_version !== "2") return EMPTY_RESULT;
+
+  const { data, error } = await db.rpc("reconcile_codebase_findings", {
+    p_team_id: input.teamId,
+    p_codebase_id: input.codebaseId,
+    p_metrics_id: input.metricsId,
+    p_health: input.health,
+  });
+  if (error) throw new Error(`finding reconciliation failed: ${error.message}`);
+  return { ...EMPTY_RESULT, ...(data as Partial<FindingReconcileResult>) };
+}

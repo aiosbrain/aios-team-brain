@@ -215,6 +215,16 @@ evidence completeness, fail-closed quality/automation admission, per-dimension e
 and redacted stable findings in the existing provenance-only `code_metrics.codebase_health`
 JSONB column. It does not grant Team Brain repository-write or remediation authority.
 
+AIO-785 materializes those redacted v2 findings into `codebase_findings` (one current row per
+team/codebase/fingerprint) and append-only `codebase_finding_events`. The only writer remains
+`lib/codebases/ingest`, which calls the atomic `reconcile_codebase_findings` Postgres function
+after the metrics point is persisted. Replaying one metrics point is idempotent; reconciliation
+is serialized per codebase; an older analysis cannot replace active state (a previously unseen
+historical fingerprint is retained as `stale_analysis`); and only a complete, current v2 snapshot
+may resolve an absent open finding.
+`lib/metrics/codebases.getCodebaseDetail` is the sole team-tier read and returns current state
+plus lifecycle history. The ledger stores no path, symbol, source text, or diagnostic prose.
+
 Two principals, one tier model:
 
 - **Humans** — invite-only, two sign-in mechanisms:
@@ -839,7 +849,7 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 `gateway_executions` · `gateway_approvals` · `gateway_audit_log` · `gateway_rate_limits` · `rate_limits` ·
 `projects` · `items` · `item_versions` · `tasks` · `decisions` · `extracted_facts` · `stakeholder_mentions` · `graph_entities` ·
 `graph_relationships` · `query_log` · `policies` · `approval_requests` · `actions` ·
-`codebases` · `code_metrics` · `code_contributions` · `github_issues` · `member_emails` ·
+`codebases` · `code_metrics` · `codebase_findings` · `codebase_finding_events` · `code_contributions` · `github_issues` · `member_emails` ·
 `member_identities` · `member_secrets` · `member_profiles` · `member_time_off` · `member_goals` · `member_provisioning` · `integrations` ·
 `agentic_maturity_snapshots` · `task_pm_links` · `task_evidence` · `work_events` · `usage_costs` · `llm_usage` · `llm_failures` · `subscriptions` · `graph_episodes` · `arc_cache` · `arc_corrections` · `work_timeline_cache` · `doc_task_inference` ·
 `conversations` · `chat_messages` · `ingest_runs` · `social_jobs` · `brand_profiles` · `brand_assets` · `social_opportunities` · `content_plans` · `content_variants` · `media_assets` · `social_image_usage` · `social_settings` · `content_approvals` · `social_publications` · `publication_analytics` ·

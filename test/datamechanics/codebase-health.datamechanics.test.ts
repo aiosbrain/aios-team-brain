@@ -32,6 +32,66 @@ function fixture(bucket: "valid" | "invalid", prefix: string): Fixture["payload"
   return structuredClone(f.payload);
 }
 
+type V2Finding = {
+  fingerprint: string;
+  check_id: string;
+  axis: string;
+  kind: "quality_issue" | "evidence_gap";
+  severity: "low" | "medium" | "high" | "critical";
+  evidence_status: "complete" | "partial" | "missing" | "stale" | "error";
+  remediation_tier: number;
+};
+
+function v2Payload(input: {
+  slug: string;
+  head: string;
+  measuredAt: string;
+  findings?: V2Finding[];
+  evidenceStatus?: "complete" | "partial" | "missing" | "stale" | "error";
+}) {
+  const body = fixture("valid", "valid-without-health");
+  const findings = input.findings ?? [];
+  const evidenceStatus = input.evidenceStatus ?? "complete";
+  const complete = evidenceStatus === "complete";
+  body.codebase.slug = input.slug;
+  body.metrics.head_sha = input.head;
+  body.metrics.scanned_at = input.measuredAt;
+  body.metrics.codebase_health = {
+    schema_version: "2",
+    rubric_version: "1.1.0",
+    profile_id: "aios.team-brain",
+    profile_version: "1.0.0",
+    head_sha: input.head,
+    score_pct: complete && findings.length === 0 ? 100 : 70,
+    status: complete ? (findings.length === 0 ? "pass" : "fail") : "warn",
+    evidence_status: evidenceStatus,
+    quality_gate: complete ? (findings.length === 0 ? "pass" : "fail") : "unknown",
+    automation_eligible: complete && findings.length === 0,
+    dimensions: {
+      test_rigor: {
+        passed: complete && findings.length === 0 ? 1 : 0,
+        total: complete ? 1 : 0,
+        band: complete ? (findings.length === 0 ? 4 : 0) : null,
+        evidence_status: evidenceStatus,
+      },
+    },
+    failed_invariant_ids: findings.map((finding) => finding.check_id),
+    measured_at: input.measuredAt,
+    findings,
+  };
+  return body;
+}
+
+const FINDING_A: V2Finding = {
+  fingerprint: "a".repeat(64),
+  check_id: "coverage_lines_pct",
+  axis: "test_rigor",
+  kind: "quality_issue",
+  severity: "high",
+  evidence_status: "complete",
+  remediation_tier: 0,
+};
+
 /** Issue a key for the seeded team member (tier=team) or a fresh external member. */
 async function issueKeyFor(seed: Seed, tier: "team" | "external") {
   let memberId = seed.memberId;
@@ -100,6 +160,179 @@ describe("codebase_health ingest (real route handler, real Postgres)", () => {
     const detail = await getCodebaseDetail(db(), seed.teamId, slug, "90d", "team");
     expect(detail?.breakdown).not.toBeNull();
     expect(detail?.breakdown?.codebase_health).toBeNull();
+    expect(detail?.findings).toEqual([]);
+  });
+
+  it("v2 round-trips and materializes deduplicated resolve/reopen history fail closed", async () => {
+    const seed = await seedTeam();
+    const { key } = await issueKeyFor(seed, "team");
+    const slug = `ledger-${randomUUID().slice(0, 6)}`;
+    const first = v2Payload({
+      slug,
+      head: "1".repeat(40),
+      measuredAt: "2026-08-04T01:00:00Z",
+      findings: [FINDING_A],
+    });
+
+    expect((await post(key, seed.teamSlug, first)).status).toBe(201);
+    let detail = await getCodebaseDetail(db(), seed.teamId, slug, "90d", "team");
+    expect(detail?.breakdown?.codebase_health).toEqual(first.metrics.codebase_health);
+    expect(detail?.findings).toHaveLength(1);
+    expect(detail?.findings[0]).toMatchObject({
+      fingerprint: FINDING_A.fingerprint,
+      status: "open",
+      occurrence_count: 1,
+    });
+    expect(detail?.findings[0].events.map((event) => event.event_type)).toEqual(["detected"]);
+
+    // Same exact metrics point is idempotent: no duplicate row and no duplicate event.
+    expect((await post(key, seed.teamSlug, structuredClone(first))).status).toBe(201);
+    detail = await getCodebaseDetail(db(), seed.teamId, slug, "90d", "team");
+    expect(detail?.findings[0].events).toHaveLength(1);
+
+    // Unknown/partial absence cannot resolve the finding.
+    const partial = v2Payload({
+      slug,
+      head: "2".repeat(40),
+      measuredAt: "2026-08-04T02:00:00Z",
+      evidenceStatus: "partial",
+    });
+    expect((await post(key, seed.teamSlug, partial)).status).toBe(201);
+    detail = await getCodebaseDetail(db(), seed.teamId, slug, "90d", "team");
+    expect(detail?.findings[0].status).toBe("open");
+
+    // Complete absence resolves; a later recurrence reopens with history intact.
+    const resolved = v2Payload({
+      slug,
+      head: "3".repeat(40),
+      measuredAt: "2026-08-04T03:00:00Z",
+    });
+    expect((await post(key, seed.teamSlug, resolved)).status).toBe(201);
+
+    // An observation older than the resolving snapshot is history-only. Comparing only
+    // last_seen_at would incorrectly reopen this because resolution does not mean "seen".
+    const staleBeforeReopen = v2Payload({
+      slug,
+      head: "5".repeat(40),
+      measuredAt: "2026-08-04T02:30:00Z",
+      findings: [FINDING_A],
+    });
+    expect((await post(key, seed.teamSlug, staleBeforeReopen)).status).toBe(201);
+    detail = await getCodebaseDetail(db(), seed.teamId, slug, "90d", "team");
+    expect(detail?.findings[0]).toMatchObject({ status: "resolved", occurrence_count: 1 });
+
+    const reopened = v2Payload({
+      slug,
+      head: "4".repeat(40),
+      measuredAt: "2026-08-04T04:00:00Z",
+      findings: [FINDING_A],
+    });
+    expect((await post(key, seed.teamSlug, reopened)).status).toBe(201);
+
+    detail = await getCodebaseDetail(db(), seed.teamId, slug, "90d", "team");
+    expect(detail?.findings[0]).toMatchObject({ status: "reopened", occurrence_count: 2 });
+    expect(detail?.findings[0].events.map((event) => event.event_type).sort()).toEqual([
+      "detected",
+      "reopened",
+      "resolved",
+      "stale_analysis",
+    ]);
+
+    // An older analysis is history only; it cannot overwrite the reopened current state.
+    const stale = v2Payload({
+      slug,
+      head: "6".repeat(40),
+      measuredAt: "2026-08-04T03:30:00Z",
+      findings: [FINDING_A],
+    });
+    expect((await post(key, seed.teamSlug, stale)).status).toBe(201);
+    detail = await getCodebaseDetail(db(), seed.teamId, slug, "90d", "team");
+    expect(detail?.findings[0]).toMatchObject({
+      status: "reopened",
+      last_seen_sha: "4".repeat(40),
+      occurrence_count: 2,
+    });
+    expect(detail?.findings[0].events.some((event) => event.event_type === "stale_analysis")).toBe(
+      true
+    );
+  });
+
+  it("v2 ledger rows remain isolated between teams for the same repository slug", async () => {
+    const one = await seedTeam();
+    const two = await seedTeam();
+    const oneKey = await issueKeyFor(one, "team");
+    const twoKey = await issueKeyFor(two, "team");
+    const slug = `shared-${randomUUID().slice(0, 6)}`;
+    const findingB = { ...FINDING_A, fingerprint: "b".repeat(64), check_id: "eslint_warning_count" };
+
+    expect(
+      (
+        await post(
+          oneKey.key,
+          one.teamSlug,
+          v2Payload({
+            slug,
+            head: "6".repeat(40),
+            measuredAt: "2026-08-04T05:00:00Z",
+            findings: [FINDING_A],
+          })
+        )
+      ).status
+    ).toBe(201);
+    expect(
+      (
+        await post(
+          twoKey.key,
+          two.teamSlug,
+          v2Payload({
+            slug,
+            head: "7".repeat(40),
+            measuredAt: "2026-08-04T05:00:00Z",
+            findings: [findingB],
+          })
+        )
+      ).status
+    ).toBe(201);
+
+    const oneDetail = await getCodebaseDetail(db(), one.teamId, slug, "90d", "team");
+    const twoDetail = await getCodebaseDetail(db(), two.teamId, slug, "90d", "team");
+    expect(oneDetail?.findings.map((finding) => finding.fingerprint)).toEqual([
+      FINDING_A.fingerprint,
+    ]);
+    expect(twoDetail?.findings.map((finding) => finding.fingerprint)).toEqual([
+      findingB.fingerprint,
+    ]);
+  });
+
+  it("retains a previously unseen older fingerprint as history, never as active debt", async () => {
+    const seed = await seedTeam();
+    const { key } = await issueKeyFor(seed, "team");
+    const slug = `stale-new-${randomUUID().slice(0, 6)}`;
+    const latestClean = v2Payload({
+      slug,
+      head: "a".repeat(40),
+      measuredAt: "2026-08-04T08:00:00Z",
+    });
+    expect((await post(key, seed.teamSlug, latestClean)).status).toBe(201);
+
+    const olderDirty = v2Payload({
+      slug,
+      head: "b".repeat(40),
+      measuredAt: "2026-08-04T07:00:00Z",
+      findings: [FINDING_A],
+    });
+    expect((await post(key, seed.teamSlug, olderDirty)).status).toBe(201);
+
+    const detail = await getCodebaseDetail(db(), seed.teamId, slug, "90d", "team");
+    expect(detail?.findings).toHaveLength(1);
+    expect(detail?.findings[0]).toMatchObject({
+      fingerprint: FINDING_A.fingerprint,
+      status: "stale_analysis",
+      occurrence_count: 1,
+    });
+    expect(detail?.findings[0].events.map((event) => event.event_type)).toEqual([
+      "stale_analysis",
+    ]);
   });
 
   it("422 sparse: health without the full raw-metrics block is rejected, nothing persisted", async () => {
@@ -126,6 +359,24 @@ describe("codebase_health ingest (real route handler, real Postgres)", () => {
     const res = await post(key, seed.teamSlug, body);
     expect(res.status).toBe(422);
     expect((await res.json()).error.code).toBe("invalid_payload");
+  });
+
+  it("422 mismatched v2 head: lifecycle evidence cannot target a different metrics head", async () => {
+    const seed = await seedTeam();
+    const { key } = await issueKeyFor(seed, "team");
+    const slug = `head-mismatch-${randomUUID().slice(0, 6)}`;
+    const body = v2Payload({
+      slug,
+      head: "8".repeat(40),
+      measuredAt: "2026-08-04T06:00:00Z",
+      findings: [FINDING_A],
+    });
+    (body.metrics.codebase_health as { head_sha: string }).head_sha = "9".repeat(40);
+
+    const res = await post(key, seed.teamSlug, body);
+    expect(res.status).toBe(422);
+    expect((await res.json()).error.code).toBe("invalid_payload");
+    expect(await getCodebaseDetail(db(), seed.teamId, slug, "90d", "team")).toBeNull();
   });
 
   it("422 smuggled key: a health object carrying a file path is rejected, not stripped", async () => {

@@ -4,7 +4,8 @@ import { join } from "node:path";
 
 /**
  * Single-writer guard for codebase analytics (CLAUDE.md §2). `codebases`,
- * `code_metrics`, `code_contributions`, and `github_issues` are written ONLY by the
+ * `code_metrics`, `codebase_findings`, `codebase_finding_events`,
+ * `code_contributions`, and `github_issues` are written ONLY by the
  * sanctioned, audited paths: `lib/codebases/*` (ingest, behind POST /api/v1/codebases)
  * and `lib/admin/aliases.ts` (the audited alias remap, which sets
  * `code_contributions.member_id` and is itself guarded by the data-mechanics
@@ -16,7 +17,8 @@ const ROOT = join(import.meta.dirname, "..", "..");
 const SCAN_DIRS = ["app", "lib", "scripts"];
 // Sanctioned writers (audited): the ingest path + the alias remap.
 const OWNERS = [join("lib", "codebases"), join("lib", "admin", "aliases.ts")];
-const TABLES = "codebases|code_metrics|code_contributions|github_issues";
+const TABLES =
+  "codebases|code_metrics|codebase_findings|codebase_finding_events|code_contributions|github_issues";
 const WRITE_RE = new RegExp(
   `from\\(\\s*["'](${TABLES})["']\\s*\\)\\s*\\.\\s*(insert|update|upsert|delete)\\b`,
   "g"
@@ -66,6 +68,8 @@ describe("single-writer: codebase analytics tables", () => {
     expect(WRITE_RE.test('db.from("code_metrics").upsert(')).toBe(true);
     WRITE_RE.lastIndex = 0;
     expect(WRITE_RE.test('db.from("code_metrics").select(')).toBe(false);
+    WRITE_RE.lastIndex = 0;
+    expect(WRITE_RE.test('db.from("codebase_findings").update(')).toBe(true);
     WRITE_RE.lastIndex = 0;
   });
 });

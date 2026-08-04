@@ -245,6 +245,17 @@ railway run -s Postgres bash -lc \
   are idempotent by design (`create table if not exists`, `alter table … add column if not
 exists` — see `postgres/migrations/README.md`), so re-running it after a restore is always safe.
 
+### Codebase finding-ledger rollback
+
+Migration `20260804120000_codebase_finding_ledger.sql` adds only derived, redacted lifecycle
+state. The authoritative scan snapshots remain in `code_metrics.codebase_health`. If the ledger
+must be removed before a dependent Phase 1 release, first take and verify a backup, stop scan
+ingest, deploy code that no longer calls `reconcile_codebase_findings`, drop that function, then
+drop `codebase_finding_events` before `codebase_findings`. Dropping either table destroys lifecycle
+history and is therefore a human-approved rollback, never an automatic migration step. Re-running
+`npm run pg:schema` recreates the empty tables and function; the current migration does not
+backfill old snapshots or guess historical transitions.
+
 ---
 
 ## 6. API-key rotation — `scripts/admin.ts`
