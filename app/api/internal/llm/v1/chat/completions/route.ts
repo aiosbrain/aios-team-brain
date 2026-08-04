@@ -9,6 +9,7 @@ import {
   resolveGraphProxyTeamId,
   graphProxyWithinRateLimit,
 } from "@/lib/llm/graph-proxy";
+import { classifyGraphCall } from "@/lib/llm/graph-call-kind";
 
 export const runtime = "nodejs";
 /** Graphiti's extraction calls are slow (structured output over a long episode, plus resolution
@@ -64,7 +65,10 @@ export async function POST(req: NextRequest) {
     // Meter this extraction call into `llm_usage` (source `graph`) — the biggest LLM consumer, and
     // until now entirely unmetered. Best-effort inside `forwardUpstream`; never affects the response.
     return await forwardUpstream(target, forwarded, {
-      meter: { db, teamId: team.teamId, source: "graph", kind: "chat" },
+      // Classified HERE because this is the last place the REQUEST body is in scope — the meter
+      // downstream only ever sees the response. Total by construction: `classifyGraphCall` cannot
+      // throw and degrades to `unknown`, so labelling can never fail an extraction call.
+      meter: { db, teamId: team.teamId, source: "graph", kind: "chat", callKind: classifyGraphCall(body) },
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : "upstream request failed";

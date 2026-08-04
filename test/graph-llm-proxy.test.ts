@@ -9,6 +9,7 @@ import {
   isRefusal,
 } from "@/lib/llm/graph-proxy";
 import { EMBEDDING_DIM } from "@/lib/api/schemas";
+import { classifyGraphCall } from "@/lib/llm/graph-call-kind";
 
 /**
  * The graph LLM proxy exists because a SECOND provider key, on a second service, was invisible to
@@ -80,7 +81,7 @@ describe("forwardUpstream — meters graph spend into llm_usage", () => {
   it("records a `graph` row with the provider-reported cost on a successful extraction", async () => {
     mockFetch(200, { choices: [{ message: { content: "{}" } }], usage: { prompt_tokens: 900, completion_tokens: 40, cost: 0.0042 } });
     const { db, rows, failures } = captureDb();
-    const res = await forwardUpstream(target, { messages: [] }, { meter: { db, teamId: "team-1", source: "graph", kind: "chat" } });
+    const res = await forwardUpstream(target, { messages: [] }, { meter: { db, teamId: "team-1", source: "graph", kind: "chat", callKind: "extract_nodes" } });
     expect(res.status).toBe(200);
     expect(rows).toHaveLength(1);
     // The split pinned from the other side: a priced call must NOT also be filed as an unpriceable
@@ -102,7 +103,7 @@ describe("forwardUpstream — meters graph spend into llm_usage", () => {
   it("does not meter a failed call that carries NO usage — but no longer loses it in silence", async () => {
     mockFetch(429, { error: { message: "insufficient_quota" } });
     const { db, rows, failures } = captureDb();
-    const res = await forwardUpstream(target, { messages: [] }, { meter: { db, teamId: "team-1", source: "graph", kind: "chat" } });
+    const res = await forwardUpstream(target, { messages: [] }, { meter: { db, teamId: "team-1", source: "graph", kind: "chat", callKind: "extract_nodes" } });
     expect(res.status).toBe(429); // the provider error still passes through untouched
     expect(rows).toHaveLength(0); // nothing priceable arrived, so no dollars are invented
     // …and the attempt is filed instead of vanishing. Silence here is how the Costs page ended up
@@ -118,7 +119,7 @@ describe("forwardUpstream — meters graph spend into llm_usage", () => {
     vi.spyOn(globalThis, "fetch").mockRejectedValue(abort);
     const { db, rows, failures } = captureDb();
     await expect(
-      forwardUpstream(target, { messages: [] }, { meter: { db, teamId: "team-1", source: "graph", kind: "chat" } })
+      forwardUpstream(target, { messages: [] }, { meter: { db, teamId: "team-1", source: "graph", kind: "chat", callKind: "extract_nodes" } })
     ).rejects.toThrow();
     expect(rows).toHaveLength(0);
     expect(failures).toHaveLength(1);
@@ -135,7 +136,7 @@ describe("forwardUpstream — meters graph spend into llm_usage", () => {
       usage: { prompt_tokens: 1200, completion_tokens: 300, cost: 0.0091 },
     });
     const { db, rows } = captureDb();
-    const res = await forwardUpstream(target, { messages: [] }, { meter: { db, teamId: "team-1", source: "graph", kind: "chat" } });
+    const res = await forwardUpstream(target, { messages: [] }, { meter: { db, teamId: "team-1", source: "graph", kind: "chat", callKind: "extract_nodes" } });
     expect(res.status).toBe(400); // the provider error still passes through untouched
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({ cost_usd: 0.0091, input_tokens: 1200, output_tokens: 300 });
@@ -144,7 +145,7 @@ describe("forwardUpstream — meters graph spend into llm_usage", () => {
   it("never lets a metering failure break the proxy response", async () => {
     mockFetch(200, { usage: { prompt_tokens: 10, completion_tokens: 1, cost: 0.001 } });
     const throwingDb = { from: () => ({ insert: async () => { throw new Error("ledger down"); } }) } as never;
-    const res = await forwardUpstream(target, { messages: [] }, { meter: { db: throwingDb, teamId: "t", source: "graph", kind: "chat" } });
+    const res = await forwardUpstream(target, { messages: [] }, { meter: { db: throwingDb, teamId: "t", source: "graph", kind: "chat", callKind: "extract_nodes" } });
     expect(res.status).toBe(200); // the proxy is the thing this module keeps alive — metering is subordinate
   });
 
@@ -370,5 +371,92 @@ describe("forwardBody — extraction never pays for chain-of-thought", () => {
     const out = forwardBody({ messages: [] }, "m", "openrouter");
     if (isRefusal(out)) throw new Error("expected a body");
     expect(out.usage).toEqual({ include: true });
+  });
+});
+
+/**
+ * GRAPHCOST-5 — the WIRING, not the classifier.
+ *
+ * `lib/llm/graph-call-kind` has its own 28 specs, and they proved nothing about whether a real graph
+ * call ever reaches the ledger labelled. Verified by mutation: replacing the route's
+ * `classifyGraphCall(body)` with the constant `"unknown"`, and deleting `callKind` from
+ * `meterGraphCall`'s insert, each left 249 tests green. These are the assertions that redden.
+ *
+ * The composition below is exactly the route's (`app/api/internal/llm/v1/chat/completions/route.ts`):
+ * classify the REQUEST body, forward the body `forwardBody` produced, meter the response.
+ */
+describe("graph call-kind reaches the ledger (the route's composition, end to end)", () => {
+  const target = { url: "https://prov/api/v1/chat/completions", headers: {}, model: "qwen/x", provider: "openrouter" };
+  // node_operations.py:115 — extract_nodes.extract_message, verbatim from the deployed image.
+  const REAL_BODY = {
+    model: "ignored-by-the-proxy",
+    messages: [
+      {
+        role: "system",
+        content:
+          "You are an AI assistant that extracts entity nodes from conversational messages. \n    Your primary task is to extract and classify the speaker and other significant entities mentioned in the conversation.",
+      },
+      { role: "user", content: "<PREVIOUS MESSAGES>…" },
+    ],
+  };
+
+  const captureDb = () => {
+    const rows: Record<string, unknown>[] = [];
+    const db = {
+      from: () => ({
+        insert: async (r: Record<string, unknown>) => {
+          rows.push(r);
+          return { error: null };
+        },
+      }),
+    } as never;
+    return { db, rows };
+  };
+
+  afterEach(() => vi.restoreAllMocks());
+
+  it("labels a real extract_nodes call all the way into the llm_usage row", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ usage: { prompt_tokens: 4000, completion_tokens: 300, cost: 0.01 } }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      })
+    );
+    const { db, rows } = captureDb();
+    const forwarded = forwardBody(REAL_BODY, "qwen/x", "openrouter");
+    if (isRefusal(forwarded)) throw new Error("expected a body");
+
+    await forwardUpstream(target, forwarded, {
+      meter: { db, teamId: "team-1", source: "graph", kind: "chat", callKind: classifyGraphCall(REAL_BODY) },
+    });
+
+    expect(rows).toHaveLength(1);
+    // The whole point: not `''` (which would read as pre-instrumentation history) and not `unknown`.
+    expect(rows[0].call_kind).toBe("extract_nodes");
+    expect(rows[0].source).toBe("graph"); // AC4: the existing dimension is untouched
+  });
+
+  it("classifies the body the PROVIDER receives, not a different one", async () => {
+    // `forwardBody` rewrites `model` and adds `usage`/`reasoning`. If it ever touched `messages`, the
+    // label would describe a request that was never sent.
+    const forwarded = forwardBody(REAL_BODY, "qwen/x", "openrouter");
+    if (isRefusal(forwarded)) throw new Error("expected a body");
+    expect(classifyGraphCall(forwarded)).toBe(classifyGraphCall(REAL_BODY));
+    expect(forwarded.messages).toEqual(REAL_BODY.messages);
+  });
+
+  it("an unrecognised prompt reaches the ledger as `unknown`, never as ''", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ usage: { prompt_tokens: 10, completion_tokens: 1, cost: 0.001 } }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      })
+    );
+    const { db, rows } = captureDb();
+    const body = { messages: [{ role: "system", content: "You are a brand new prompt from a graph upgrade." }] };
+    await forwardUpstream(target, body, {
+      meter: { db, teamId: "team-1", source: "graph", kind: "chat", callKind: classifyGraphCall(body) },
+    });
+    expect(rows[0].call_kind).toBe("unknown"); // the drift alarm, distinct from '' history
   });
 });

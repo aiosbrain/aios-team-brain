@@ -286,12 +286,28 @@ export async function resolveGraphEmbeddingTarget(
  * slice — `graph` for extraction, `embeddings` for the graph's embedding half. All graph spend is
  * system-initiated, so `member_id` is always null.
  */
-export interface GraphMeterCtx {
+export type GraphMeterCtx = {
   db: DbClient;
   teamId: string;
-  source: Extract<LlmUsageSource, "graph" | "embeddings">;
-  kind: "chat" | "embedding";
-}
+} & (
+  | {
+      source: Extract<LlmUsageSource, "graph">;
+      kind: "chat";
+      /**
+       * Which Graphiti prompt made this call (`lib/llm/graph-call-kind.classifyGraphCall`).
+       *
+       * REQUIRED, not optional-with-a-default, and a discriminated union rather than a `?:` so the
+       * compiler enforces it. `''` in the ledger means "recorded before this shipped" — history —
+       * so a graph call site that forgot this field would silently file live spend as history and
+       * the `unknown` drift alarm would never fire. The type is the only thing that can prevent
+       * that, since the omission is invisible at runtime.
+       *
+       * Classified in the ROUTE, not here: `meterGraphCall` only ever sees the response body.
+       */
+      callKind: string;
+    }
+  | { source: Extract<LlmUsageSource, "embeddings">; kind: "embedding"; callKind?: undefined }
+);
 
 /**
  * Meter one already-received upstream body. BEST-EFFORT and total: the graph leg is the thing this
@@ -333,6 +349,7 @@ async function meterGraphCall(text: string, status: number, target: ProxyTarget,
       outputTokens: c.outputTokens,
       costUsd: c.costUsd,
       estimated: c.estimated,
+      callKind: meter.callKind,
     });
   } catch {
     // Never let metering touch the proxy path.

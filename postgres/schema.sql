@@ -1645,6 +1645,13 @@ create table if not exists llm_usage (
   output_tokens integer not null default 0,
   cost_usd numeric(12, 5) not null default 0,
   estimated boolean not null default false,
+  -- Which Graphiti prompt made this call (GRAPHCOST-5). Graph extraction is ~99% of the bill and all of
+  -- it lands under one `source`, so without this no cost lever can be sized. Three-valued and the
+  -- distinction matters: '' = recorded before this shipped (history, never written after deploy),
+  -- 'unknown' = classified but matched nothing (a RISING SHARE IS A DRIFT ALARM — the deployed graph
+  -- service's prompts have moved away from lib/llm/graph-call-kind), else one of the five prompts on
+  -- the add_episode path. No read may coalesce '' into 'unknown'. Sole writer of a non-empty value: the graph LLM proxy.
+  call_kind text not null default '',
   created_at timestamptz not null default now()
 );
 create index if not exists llm_usage_team_time_idx on llm_usage (team_id, created_at desc);
