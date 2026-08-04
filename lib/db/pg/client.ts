@@ -25,6 +25,18 @@ export class PgClient {
         );
         return { data: rows[0]?.result ?? 0, error: null };
       }
+      if (fn === "reconcile_codebase_findings") {
+        const { rows } = await runSql<{ result: Record<string, number> }>(
+          `SELECT reconcile_codebase_findings($1, $2, $3, $4::jsonb) AS result`,
+          [
+            args.p_team_id,
+            args.p_codebase_id,
+            args.p_metrics_id,
+            JSON.stringify(args.p_health),
+          ]
+        );
+        return { data: rows[0]?.result ?? {}, error: null };
+      }
       throw new Error(`pg-adapter: unsupported rpc "${fn}"`);
     } catch (err) {
       const message = err instanceof Error ? err.message : "rpc failed";

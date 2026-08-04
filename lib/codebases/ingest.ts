@@ -5,6 +5,7 @@ import { computeScores } from "@/lib/codebases/score";
 import { buildIdentityMap, resolveMember } from "@/lib/identity/resolve";
 import { projectCommitsToItems, type ScanCommit } from "@/lib/codebases/commits-to-items";
 import { audit } from "@/lib/api/audit";
+import { reconcileCodebaseFindings } from "@/lib/codebases/finding-ledger";
 
 /**
  * The ONLY write path for codebase analytics tables (single-writer guarded). Runs
@@ -12,6 +13,7 @@ import { audit } from "@/lib/api/audit";
  * there is one scoring implementation. Idempotency:
  *   • codebases       — upsert (team_id, slug)
  *   • code_metrics    — upsert (codebase_id, head_sha): same commit = no new point
+ *   • finding ledger  — atomic reconcile by stable fingerprint + metrics point
  *   • contributions   — recompute + upsert (codebase_id, author_key, day)
  *   • github_issues   — upsert (codebase_id, number)
  */
@@ -114,7 +116,17 @@ export async function ingestCodebaseScan(
     .single();
   if (mErr || !metrics) throw new Error(`code_metrics upsert failed: ${mErr?.message}`);
 
-  // 4. contributions + commits — map author → member, then write aggregates and searchable items.
+  // 4. project validated v2 findings into durable current state + append-only history.
+  // Historical v1/v1.0 snapshots remain metrics-only. The DB function is atomic and
+  // idempotent for the same metrics point; incomplete evidence can never resolve absence.
+  const findingLedger = await reconcileCodebaseFindings(db, {
+    teamId: auth.teamId,
+    codebaseId: codebase.id,
+    metricsId: metrics.id,
+    health: m.codebase_health,
+  });
+
+  // 5. contributions + commits — map author → member, then write aggregates and searchable items.
   const recentCommits = (m.recent_commits ?? []) as ScanCommit[];
   let contribCount = 0;
   let commitItemCount = 0;
@@ -151,7 +163,7 @@ export async function ingestCodebaseScan(
     commitItemCount = await projectCommitsToItems(db, auth, c.slug, recentCommits, identityMap);
   }
 
-  // 5. issues — upsert by number
+  // 6. issues — upsert by number
   let issueCount = 0;
   for (const iss of payload.issues) {
     const { error } = await db.from("github_issues").upsert(
@@ -194,6 +206,7 @@ export async function ingestCodebaseScan(
       contributions: contribCount,
       commit_items: commitItemCount,
       issues: issueCount,
+      finding_ledger: findingLedger,
     },
   });
 
