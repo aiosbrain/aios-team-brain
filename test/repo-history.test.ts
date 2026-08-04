@@ -1,5 +1,6 @@
-import { describe, expect, it } from "vitest";
-import { resolveRepoHistory } from "@/lib/integrations/github-link";
+import { describe, expect, it, vi } from "vitest";
+import { linkGithubRepo, resolveRepoHistory, type RepoHistoryEntry } from "@/lib/integrations/github-link";
+import { fetchGithubRepoIssues } from "@/lib/ingest/sources/github";
 import { validateIntegrationConfig } from "@/lib/api/schemas";
 
 /**
@@ -74,5 +75,77 @@ describe("github config schema — repoHistory (AIO-798)", () => {
         repoHistory: [{ repo: "a/b", days: 14, sinceIso: "2026-08-04T00:00:00.000Z", extra: 1 }],
       })
     ).toThrow();
+  });
+});
+
+describe("linkGithubRepo — history-entry attribution (the re-add blocker)", () => {
+  /** Minimal DbClient double: one existing github row; captures what upsertIntegration would write.
+   *  Mirrors only the two call shapes github-link makes — enough to observe the config payload. */
+  function dbWith(config: Record<string, unknown>, captured: { config?: Record<string, unknown> }) {
+    const row = { name: "github", status: "enabled", config };
+    return {
+      from: (table: string) => ({
+        select: () => ({
+          eq: () => ({
+            eq: () => ({
+              order: () => ({
+                limit: () => ({ maybeSingle: async () => ({ data: table === "integrations" ? row : null }) }),
+              }),
+            }),
+          }),
+        }),
+        upsert: (payload: { config: Record<string, unknown> }) => {
+          captured.config = payload.config;
+          return { select: () => ({ single: async () => ({ data: { id: "x", status: "enabled" }, error: null }) }) };
+        },
+        insert: async () => ({ error: null }),
+      }),
+    };
+  }
+
+  it("re-adding an ALREADY-LINKED repo re-anchors THAT repo — never the last repo in the list", async () => {
+    // The blocker this pins: addRepo de-dups, so on a re-add `repos` returns unchanged and its last
+    // element is some OTHER repo. Positional attribution re-anchored + narrowed the innocent repo's
+    // window — whose next sync would diff-delete its imported issues.
+    const innocent: RepoHistoryEntry = { repo: "acme/web", days: 90, sinceIso: "2026-01-01T00:00:00.000Z" };
+    const captured: { config?: Record<string, unknown> } = {};
+    const db = dbWith({ repos: ["acme/api", "acme/web"], repoHistory: [innocent] }, captured);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await linkGithubRepo(db as any, { teamId: "t", memberId: "m" }, "acme/api", 14);
+    const history = captured.config?.repoHistory as RepoHistoryEntry[];
+    const web = history.find((e) => e.repo === "acme/web");
+    const api = history.find((e) => e.repo === "acme/api");
+    expect(web, "the untouched repo keeps its entry").toEqual(innocent);
+    expect(api?.days).toBe(14);
+  });
+});
+
+describe("fetchGithubRepoIssues — the anchor reaches the wire", () => {
+  it("sends since= ALONGSIDE state=all, verbatim", async () => {
+    // Closing an issue bumps updated_at, so closed-in-window issues import only because BOTH params
+    // are on the URL; and the anchor must be the stored value, not a recomputed one.
+    const seen: string[] = [];
+    const fetchImpl = vi.fn(async (url: string | URL | Request) => {
+      seen.push(String(url));
+      return new Response(JSON.stringify([]), { status: 200 });
+    });
+    await fetchGithubRepoIssues({
+      owner: "acme",
+      repo: "api",
+      sinceIso: "2026-07-21T00:00:00.000Z",
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    expect(seen[0]).toContain("state=all");
+    expect(seen[0]).toContain(`since=${encodeURIComponent("2026-07-21T00:00:00.000Z")}`);
+  });
+
+  it("no anchor → no since param (the pre-window fetch, byte-identical)", async () => {
+    const seen: string[] = [];
+    const fetchImpl = vi.fn(async (url: string | URL | Request) => {
+      seen.push(String(url));
+      return new Response(JSON.stringify([]), { status: 200 });
+    });
+    await fetchGithubRepoIssues({ owner: "acme", repo: "api", fetchImpl: fetchImpl as unknown as typeof fetch });
+    expect(seen[0]).not.toContain("since=");
   });
 });

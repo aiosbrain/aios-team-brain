@@ -113,7 +113,7 @@ from the Costs page.
 github integration row, written through the existing single-writer (`github-link.writeRepos`
 pattern → `upsertIntegration`), **with the github config allowlist extended** to accept it
 (`lib/api/schemas.ts` — `.strict()` rejects unknown keys; this is a required schema edit, not an
-incidental one). `sinceIso` is resolved once at link (`now − days`, date precision) and never
+incidental one). `sinceIso` is resolved once at link (`now − days`, stored as a full ISO instant) and never
 recomputed. `config.repos` stays `string[]` — every existing reader keeps working.
 
 - **No entry = today's behaviour** (issues: all, commits: 90d), and the schema keeps `repoHistory`
@@ -129,7 +129,7 @@ recomputed. `config.repos` stays `string[]` — every existing reader keeps work
   warns with the count ("a 2-week window will remove N previously imported tasks") when the target
   project already holds tasks.
 - Entries are pruned when a repo is unlinked, and capped (one entry per linked repo, repos already
-  cap at 200). Date-precision `sinceIso` keeps the worst-case config comfortably under the 8KB
+  cap at 200). Compact entries keep the worst-case config comfortably under the 8KB
   config byte cap (`schemas.ts:657`); the cap failure, if ever hit, is `upsertIntegration`'s
   existing clear error.
 

@@ -2,7 +2,8 @@ import type { DbClient } from "@/lib/db/types";
 import { runSql } from "@/lib/db/pg/pool";
 import { upsertIntegration, type IntegrationAuth } from "./manage";
 import { decryptSecret } from "@/lib/secrets/crypto";
-import { addRepo, removeRepo } from "./github-repos";
+import { addRepo, removeRepo, normalizeRepo } from "./github-repos";
+import { githubProjectSlug } from "@/lib/ingest/sources/github-normalize";
 
 /**
  * Persistence for the Admin → Integrations "GitHub repositories" panel. A team's linked repos live
@@ -120,8 +121,11 @@ export async function linkGithubRepo(
   const repos = addRepo(currentRepos(row), repoInput); // validates + case-insensitive de-dup
   let history: RepoHistoryEntry[] | undefined;
   if (historyDays !== undefined) {
-    // The linked name as normalized by addRepo (last entry is the newly added repo).
-    const full = repos[repos.length - 1];
+    // The entry is attributed from the INPUT, never positionally: addRepo de-dups, so on a re-add
+    // of an already-linked repo `repos` comes back unchanged and its last element is some OTHER
+    // repo — attributing the entry to it would re-anchor + narrow an innocent repo's window, whose
+    // next sync would diff-delete its imported issues (review blocker on this feature's first cut).
+    const full = normalizeRepo(repoInput);
     const kept = currentRepoHistory(row).filter((e) => e.repo.toLowerCase() !== full.toLowerCase());
     // The anchor: resolved exactly once, here. The importer only ever READS it back.
     history = [...kept, { repo: full, days: historyDays, sinceIso: new Date(Date.now() - historyDays * 86_400_000).toISOString() }];
@@ -157,7 +161,7 @@ export async function ensureGithubIntegration(
 export async function githubReposAndToken(
   db: DbClient,
   teamId: string
-): Promise<{ repos: string[]; token: string | null }> {
+): Promise<{ repos: string[]; token: string | null; fileGlobs?: string[] }> {
   const { data } = await db
     .from("integrations")
     .select("config, secret_ciphertext")
@@ -169,7 +173,8 @@ export async function githubReposAndToken(
   const config = ((data?.config as Record<string, unknown>) ?? {}) as Record<string, unknown>;
   const repos = Array.isArray(config.repos) ? (config.repos as string[]) : [];
   const cipher = data?.secret_ciphertext as string | null | undefined;
-  return { repos, token: cipher ? decryptSecret(cipher) : null };
+  const fileGlobs = Array.isArray(config.fileGlobs) ? (config.fileGlobs as string[]) : undefined;
+  return { repos, token: cipher ? decryptSecret(cipher) : null, fileGlobs };
 }
 
 /** Unlink a repo (case-insensitive). No-op if no github row / repo absent. Returns the repos list. */
@@ -202,7 +207,10 @@ export async function countPreviouslyImportedTasks(
     const res = await runSql<{ n: number }>(
       `select count(*)::int as n from tasks t join projects p on p.id = t.project_id
         where t.team_id = $1 and p.slug = $2`,
-      [teamId, `github-${owner.toLowerCase()}-${repo.toLowerCase()}`]
+      // The importer's own slug builder — a hand-built `github-owner-repo` diverges on any repo
+      // with a dot (vercel/next.js → github-vercel-next-js), silently hiding the re-link warning
+      // for exactly the repos where it matters (review finding).
+      [teamId, githubProjectSlug(owner, repo)]
     );
     return res.rows[0]?.n ?? 0;
   } catch {

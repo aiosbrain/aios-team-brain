@@ -155,12 +155,14 @@ export function GithubReposPanel({ teamSlug, integration, scannedRepos }: Github
     });
   }
 
-  /** Step 2: the admin saw the number and chose the window — link, anchored. */
-  function confirmLink() {
+  /** Step 2: the admin saw the number and chose the window — link, anchored. The unreachable path
+   *  links WITHOUT a window (pre-window behaviour): no chips were shown there, so an invisible
+   *  window from leftover state would be a choice the admin never made (review finding). */
+  function confirmLink(withWindow = true) {
     if (!est) return;
     const repo = est.repo;
     setEst(null);
-    act(() => addGithubRepo(teamSlug, repo, windowDays), true);
+    act(() => (withWindow ? addGithubRepo(teamSlug, repo, windowDays) : addGithubRepo(teamSlug, repo)), true);
   }
 
   return (
@@ -386,7 +388,12 @@ export function GithubReposPanel({ teamSlug, integration, scannedRepos }: Github
                 works. You can still link it — it will import once a token with access is connected.
               </p>
               <div className="flex gap-2">
-                <button type="button" disabled={pending} onClick={confirmLink} className="btn-prism justify-center">
+                <button
+                  type="button"
+                  disabled={pending}
+                  onClick={() => confirmLink(false)}
+                  className="btn-prism justify-center"
+                >
                   Link anyway
                 </button>
                 <button
@@ -474,7 +481,7 @@ export function GithubReposPanel({ teamSlug, integration, scannedRepos }: Github
                 </p>
               ) : null}
               <div className="flex gap-2">
-                <button type="button" disabled={pending} onClick={confirmLink} className="btn-prism justify-center">
+                <button type="button" disabled={pending} onClick={() => confirmLink()} className="btn-prism justify-center">
                   <Plus className="size-4" /> Link with{" "}
                   {WINDOW_CHOICES.find((c) => c.days === windowDays)?.label.toLowerCase() ?? "window"}
                 </button>

@@ -368,9 +368,11 @@ export async function estimateGithubImportAction(
   }
   const db = adminClient();
   try {
-    const { token } = await githubReposAndToken(db, ctx.teamId);
+    // fileGlobs too: an estimate against the default globs while the importer honours custom ones
+    // would size the wrong file set (review finding — the call site nothing pins, again).
+    const { token, fileGlobs } = await githubReposAndToken(db, ctx.teamId);
     const [owner, repo] = full.split("/", 2);
-    const result = await estimateGithubImport({ owner, repo, token, historyDays });
+    const result = await estimateGithubImport({ owner, repo, token, historyDays, fileGlobs });
     if (!result.ok) {
       return result.reason === "unreachable"
         ? { ok: true, unreachable: true }
