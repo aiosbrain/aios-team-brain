@@ -1531,6 +1531,18 @@ create table if not exists codebase_findings (
 );
 alter table codebase_findings
   add column if not exists occurrence_count integer not null default 1;
+-- AIO-786 decision columns, mirrored from 20260804160000_explainable_debt_decisions.sql. REQUIRED
+-- here, not just in the migration: schema.sql loads BEFORE migrations, and the standalone
+-- decision-expiry index below references decision_expires_at — on a live DB whose table predates the
+-- migration, the guarded create-table above is a no-op, so without these alters the index statement
+-- aborts the whole load and the migration that would have added the column never runs (every deploy
+-- fails; broke prod 2026-08-04, the #251 replay class).
+alter table codebase_findings
+  add column if not exists decision_reason text,
+  add column if not exists decision_owner_member_id uuid references members(id) on delete set null,
+  add column if not exists decision_by_member_id uuid references members(id) on delete set null,
+  add column if not exists decision_at timestamptz,
+  add column if not exists decision_expires_at timestamptz;
 create index if not exists codebase_findings_active_idx
   on codebase_findings (team_id, codebase_id, status, last_seen_at desc);
 create index if not exists codebase_findings_decision_expiry_idx
