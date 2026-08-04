@@ -1,0 +1,14 @@
+{
+  "id": "aios.team-brain",
+  "version": "1.0.0",
+  "description": "Evidence requirements for admitting aios-team-brain findings to automated maintenance. The profile intentionally follows the repository's current CI capabilities instead of pretending Workspace-only rails exist here.",
+  "required_checks": [
+    "coverage_lines_pct",
+    "lint_gate",
+    "ts_build_gate",
+    "docs_drift_gate"
+  ],
+  "stale_after_days": {
+    "coverage_lines_pct": 7
+  }
+}

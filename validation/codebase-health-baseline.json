@@ -1,0 +1,206 @@
+{
+  "_comment": "Committed codebase-health baseline (AIO-605). Regenerate deliberately with `node scripts/check-codebase-health.mjs --write-baseline` after a structural change lands — never by hand. Compared ADVISORY-only by the CI step (always exit 0 in v0.9.0).",
+  "generated_at": "2026-08-04",
+  "schema_version": 2,
+  "rubric_version": "1.0.0",
+  "profile_id": "aios.team-brain",
+  "profile_version": "1.0.0",
+  "score_pct": 88,
+  "status": "healthy",
+  "evidence_status": "partial",
+  "quality_gate": "unknown",
+  "automation_eligible": false,
+  "axes": {
+    "modularity": {
+      "band": null,
+      "passed": 0,
+      "total": 0,
+      "evidence_status": "missing"
+    },
+    "boundaries": {
+      "band": null,
+      "passed": 0,
+      "total": 0,
+      "evidence_status": "missing"
+    },
+    "test_rigor": {
+      "band": null,
+      "passed": 0,
+      "total": 0,
+      "evidence_status": "missing"
+    },
+    "lint_type": {
+      "band": 3,
+      "passed": 2,
+      "total": 3,
+      "evidence_status": "complete"
+    },
+    "docs_parity": {
+      "band": 4,
+      "passed": 1,
+      "total": 1,
+      "evidence_status": "complete"
+    },
+    "invariants": {
+      "band": 4,
+      "passed": 1,
+      "total": 1,
+      "evidence_status": "partial"
+    },
+    "contributor_friction": {
+      "band": 3,
+      "passed": 1,
+      "total": 1,
+      "evidence_status": "partial"
+    }
+  },
+  "failed_invariant_ids": [],
+  "checks": [
+    {
+      "id": "file_size_gate",
+      "ok": true,
+      "value": null,
+      "required": false,
+      "evidence_status": "missing"
+    },
+    {
+      "id": "size_grandfather_count",
+      "ok": true,
+      "value": null,
+      "required": false,
+      "evidence_status": "missing"
+    },
+    {
+      "id": "size_grandfather_max",
+      "ok": true,
+      "value": null,
+      "required": false,
+      "evidence_status": "missing"
+    },
+    {
+      "id": "modularity_breaches",
+      "ok": true,
+      "value": null,
+      "required": false,
+      "evidence_status": "missing"
+    },
+    {
+      "id": "boundary_gate",
+      "ok": true,
+      "value": null,
+      "required": false,
+      "evidence_status": "missing"
+    },
+    {
+      "id": "boundary_grandfather_count",
+      "ok": true,
+      "value": null,
+      "required": false,
+      "evidence_status": "missing"
+    },
+    {
+      "id": "domain_isolation_gate",
+      "ok": true,
+      "value": null,
+      "required": false,
+      "evidence_status": "missing"
+    },
+    {
+      "id": "coverage_lines_pct",
+      "ok": true,
+      "value": null,
+      "required": true,
+      "evidence_status": "missing"
+    },
+    {
+      "id": "coverage_floor_headroom",
+      "ok": true,
+      "value": null,
+      "required": false,
+      "evidence_status": "missing"
+    },
+    {
+      "id": "mutation_score_pct",
+      "ok": true,
+      "value": null,
+      "required": false,
+      "evidence_status": "missing"
+    },
+    {
+      "id": "lint_gate",
+      "ok": true,
+      "value": true,
+      "required": true,
+      "evidence_status": "complete"
+    },
+    {
+      "id": "eslint_warning_count",
+      "ok": false,
+      "value": 2,
+      "required": false,
+      "evidence_status": "complete"
+    },
+    {
+      "id": "ts_build_gate",
+      "ok": true,
+      "value": true,
+      "required": true,
+      "evidence_status": "complete"
+    },
+    {
+      "id": "docs_drift_gate",
+      "ok": true,
+      "value": true,
+      "required": true,
+      "evidence_status": "complete"
+    },
+    {
+      "id": "invariant_registry_missing_enforcers",
+      "ok": true,
+      "value": null,
+      "required": false,
+      "evidence_status": "missing"
+    },
+    {
+      "id": "ci_wall_clock_minutes",
+      "ok": true,
+      "value": 6.4,
+      "required": false,
+      "evidence_status": "complete"
+    },
+    {
+      "id": "ratchet_debt_total",
+      "ok": true,
+      "value": null,
+      "required": false,
+      "evidence_status": "missing"
+    },
+    {
+      "id": "invariant_gate_failures",
+      "ok": true,
+      "value": 0,
+      "required": false,
+      "evidence_status": "complete"
+    }
+  ],
+  "findings": [
+    {
+      "fingerprint": "7ebd2d18f4f21c2cc7f32fdc06b3b08db7438956aacb8d708c8bc1caac93ec7a",
+      "check_id": "coverage_lines_pct",
+      "axis": "test_rigor",
+      "kind": "evidence_gap",
+      "severity": "high",
+      "evidence_status": "missing",
+      "remediation_tier": 0
+    },
+    {
+      "fingerprint": "58c38e992f27eccac1732459fe8975dc7c4254698a0f2f4e9e7c76410a4e3ff8",
+      "check_id": "eslint_warning_count",
+      "axis": "lint_type",
+      "kind": "quality_issue",
+      "severity": "medium",
+      "evidence_status": "complete",
+      "remediation_tier": 0
+    }
+  ]
+}

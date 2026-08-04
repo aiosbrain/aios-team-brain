@@ -51,16 +51,14 @@ export const codebaseRecordSchema = z.object({
   is_archived: z.boolean().optional().default(false),
 });
 
-// `metrics.codebase_health` (brain-api document revision 1.15) — a scalar-only,
-// provenance-only workspace-governance health snapshot, scored scanner-side against the
-// workspace rubric. Faithful zod mirror of the pinned machine-readable contract
-// (test/fixtures/contract/codebase-payload-1.15.schema.json; canonical home:
-// aios-workspace/docs/contract). The object is CLOSED (strict, all fields required when
-// present) so no file paths, findings text, or contributor identity can be smuggled
-// through it; the surrounding metrics shape stays open per the contract. Guarded by
-// test/guards/codebase-payload-contract.test.ts against the vendored fixtures.
-export const codebaseHealthSchema = z.strictObject({
-  schema_version: z.string().min(1).max(20),
+// `metrics.codebase_health` — a provenance-only snapshot scored scanner-side. V1 is the
+// original brain-api 1.15 scalar contract. Brain-api 1.17 adds the closed v2 metadata
+// contract (test/fixtures/contract/codebase-health-v2.schema.json): evidence completeness,
+// repository capability profile, fail-closed automation admission, and redacted findings.
+// Both reject paths, source text, finding detail, and contributor identity. Guarded by
+// test/guards/codebase-payload-contract.test.ts against the vendored canonical artifacts.
+const codebaseHealthV1Schema = z.strictObject({
+  schema_version: z.string().min(1).max(20).refine((value) => value !== "2"),
   rubric_version: z.string().min(1).max(40),
   head_sha: z.string().regex(/^[0-9a-f]{7,40}$/),
   score_pct: z.number().min(0).max(100),
@@ -83,6 +81,83 @@ export const codebaseHealthSchema = z.strictObject({
     .string()
     .regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/),
 });
+
+const evidenceStatusSchema = z.enum(["complete", "partial", "missing", "stale", "error"]);
+const codebaseHealthV2Schema = z.strictObject({
+  schema_version: z.literal("2"),
+  rubric_version: z.string().min(1).max(40),
+  profile_id: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/),
+  profile_version: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/),
+  head_sha: z.string().regex(/^[0-9a-f]{7,40}$/),
+  score_pct: z.number().min(0).max(100),
+  status: z.enum(["pass", "warn", "fail"]),
+  evidence_status: evidenceStatusSchema,
+  quality_gate: z.enum(["pass", "fail", "unknown"]),
+  automation_eligible: z.boolean(),
+  dimensions: z
+    .record(
+      z.string().regex(/^[a-z0-9][a-z0-9_-]{0,63}$/),
+      z.strictObject({
+        passed: z.number().int().nonnegative(),
+        total: z.number().int().nonnegative(),
+        band: z.number().int().min(0).max(4).nullable(),
+        evidence_status: evidenceStatusSchema,
+      }),
+    )
+    .refine((dimensions) => Object.keys(dimensions).length >= 1, {
+      message: "dimensions must have at least one entry",
+    }),
+  failed_invariant_ids: z
+    .array(z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/))
+    .max(200),
+  measured_at: z
+    .string()
+    .regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/),
+  findings: z
+    .array(
+      z.strictObject({
+        fingerprint: z.string().regex(/^[0-9a-f]{64}$/),
+        check_id: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/),
+        axis: z.string().regex(/^[a-z0-9][a-z0-9_-]{0,63}$/),
+        kind: z.enum(["quality_issue", "evidence_gap"]),
+        severity: z.enum(["low", "medium", "high", "critical"]),
+        evidence_status: evidenceStatusSchema,
+        remediation_tier: z.number().int().min(0).max(3),
+      }),
+    )
+    .max(500),
+}).superRefine((health, context) => {
+  if (health.quality_gate === "pass" && health.evidence_status !== "complete") {
+    context.addIssue({
+      code: "custom",
+      path: ["quality_gate"],
+      message: "a passing quality gate requires complete evidence",
+    });
+  }
+  if (health.quality_gate === "unknown" && health.evidence_status === "complete") {
+    context.addIssue({
+      code: "custom",
+      path: ["quality_gate"],
+      message: "an unknown quality gate cannot claim complete evidence",
+    });
+  }
+  if (
+    health.automation_eligible &&
+    (health.quality_gate !== "pass" ||
+      health.evidence_status !== "complete" ||
+      health.status === "fail")
+  ) {
+    context.addIssue({
+      code: "custom",
+      path: ["automation_eligible"],
+      message: "automation requires complete evidence, a passing gate, and non-failing health",
+    });
+  }
+});
+
+// V1 remains accepted byte-for-byte. V2 adds the evidence needed to decide whether a
+// background remediation worker may act, without accepting raw source or finding text.
+export const codebaseHealthSchema = z.union([codebaseHealthV2Schema, codebaseHealthV1Schema]);
 export type CodebaseHealth = z.infer<typeof codebaseHealthSchema>;
 
 export const codeMetricsSchema = z.object({

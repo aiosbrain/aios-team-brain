@@ -323,8 +323,8 @@ that an older brain doesn't yet serve.
 
 | File                                                       | Role                                                                                                                                                                  |
 | ---------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `aios-workspace/docs/brain-api.md`                         | Source of truth for the wire contract; states the version in its first line (`**Version: 1.16**`) and carries a dated _Revisions_ changelog for every additive change. |
-| `docs/ARCHITECTURE.md` (this repo, §"Auth & access tiers") | Carries the canonical implemented-version claim in prose: `"This server implements brain-api v1.16"`.                                                                  |
+| `aios-workspace/docs/brain-api.md`                         | Source of truth for the wire contract; states the version in its first line (`**Version: 1.17**`) and carries a dated _Revisions_ changelog for every additive change. |
+| `docs/ARCHITECTURE.md` (this repo, §"Auth & access tiers") | Carries the canonical implemented-version claim in prose: `"This server implements brain-api v1.17"`.                                                                  |
 | `lib/api/version.ts`                                       | `export const BRAIN_API_VERSION = "1.16"` — the single server-side declaration of which contract version this codebase targets.                                        |
 | `test/guards/contract-version.test.ts`                     | Fails the build if `BRAIN_API_VERSION` and the `ARCHITECTURE.md` prose claim drift apart — forces both to move together.                                              |
 | `aios-workspace/docs/contract/brain-contract.json`         | Canonical conformance fixture (`version`, `tierAliases`, `sse.frames`, `provisioningTools`, `contentHash`).                                                           |
