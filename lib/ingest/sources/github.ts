@@ -36,6 +36,14 @@ export async function fetchGithubRepoIssues(opts: {
   token?: string | null;
   fetchImpl?: typeof fetch;
   maxPages?: number;
+  /**
+   * ANCHORED history window (AIO-798): issues updated at/after this instant. Must be the stored
+   * per-repo anchor, never `now − days` recomputed per tick — a sliding window diff-DELETES issues
+   * as they age out of the fetch (the issues item is one diff-synced payload per repo). `state=all`
+   * stays alongside it: closing an issue bumps `updated_at`, so closed-in-window issues import
+   * only because both params are sent. Absent = the pre-window unbounded fetch.
+   */
+  sinceIso?: string;
 }): Promise<FetchedGithubRepo> {
   const fetchImpl = opts.fetchImpl ?? timeoutFetch;
   const headers = githubHeaders(opts.token);
@@ -43,7 +51,8 @@ export async function fetchGithubRepoIssues(opts: {
   const issues: GithubIssueRaw[] = [];
   const maxPages = opts.maxPages ?? 50;
   for (let page = 1; page <= maxPages; page++) {
-    const url = `${API}/repos/${opts.owner}/${opts.repo}/issues?state=all&per_page=100&page=${page}`;
+    const since = opts.sinceIso ? `&since=${encodeURIComponent(opts.sinceIso)}` : "";
+    const url = `${API}/repos/${opts.owner}/${opts.repo}/issues?state=all&per_page=100&page=${page}${since}`;
     const res = await fetchImpl(url, { headers });
     if (!res.ok) {
       const text = await res.text().catch(() => "");

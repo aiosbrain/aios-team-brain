@@ -49,6 +49,12 @@ function sha256(s: string): string {
   return createHash("sha256").update(s).digest("hex");
 }
 
+/** The canonical project slug for a repo's imported issues — exported so the re-link warning
+ *  (github-link.countPreviouslyImportedTasks) counts in the SAME project the importer writes. */
+export function githubProjectSlug(owner: string, repo: string): string {
+  return `github-${safeSegment(owner) || "owner"}-${safeSegment(repo) || "repo"}`;
+}
+
 function safeSegment(s: string): string {
   return s.toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
 }
@@ -72,7 +78,7 @@ function githubStatus(state: string | undefined, labels: string[]): string {
 export function normalizeGithubRepo(input: NormalizeGithubInput): ItemPayload {
   const ownerSeg = safeSegment(input.owner) || "owner";
   const repoSeg = safeSegment(input.repo) || "repo";
-  const project = `github-${ownerSeg}-${repoSeg}`;
+  const project = githubProjectSlug(input.owner, input.repo);
 
   // Exclude PRs; stable sort so a re-import is byte-identical → a true no-op at the sha256 writer.
   const included = input.issues

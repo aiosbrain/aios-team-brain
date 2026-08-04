@@ -51,6 +51,8 @@ export const HEALTHY_CALLS_PER_EPISODE = 8;
 
 /** A rise smaller than this is noise, not a trend. */
 const RISING_MARGIN = 1.25;
+/** Row cap on the `ingest_runs` denominator fetch; exceeded → `truncated`, price consumers withhold. */
+const RUN_FETCH_CAP = 20_000;
 /** Below this many measured days, "first half vs second half" is one day against one day. */
 const MIN_DAYS_FOR_TREND = 3;
 
@@ -78,6 +80,14 @@ export interface GraphEfficiency {
    * a stable model, the exact nagging the "requires rising" rule was supposed to prevent.
    */
   degrading: boolean;
+  /**
+   * True when the `ingest_runs` fetch hit its row cap, so the EPISODE DENOMINATOR is incomplete and
+   * `costPerEpisode` is an OVERSTATEMENT — while `callsPerEpisode` per missing-run day reads low.
+   * Set deliberately rather than silently truncating (the cap binds first in exactly the degraded
+   * regime): consumers that gate money on this number (the repo-import estimator, AIO-798) withhold
+   * the price instead of showing a wrong one.
+   */
+  truncated: boolean;
 }
 
 interface DayBucket {
@@ -99,7 +109,8 @@ const ratio = (n: number, d: number): number | null => (d > 0 ? n / d : null);
 export function foldGraphEfficiency(
   usageDays: GraphUsageDay[],
   /** `meta.episodes` is the denominator; a run without it predates the counter and is SKIPPED. */
-  runRows: { started_at: string | Date; meta: unknown }[]
+  runRows: { started_at: string | Date; meta: unknown }[],
+  truncated = false
 ): GraphEfficiency {
   const buckets = new Map<string, DayBucket>();
   const at = (day: string): DayBucket => {
@@ -156,6 +167,7 @@ export function foldGraphEfficiency(
     callsPerEpisode: overall,
     costPerEpisode: ratio(totalCost, totalEpisodes),
     degrading: overall !== null && overall > HEALTHY_CALLS_PER_EPISODE && rising,
+    truncated,
   };
 }
 
@@ -165,6 +177,7 @@ const EMPTY: GraphEfficiency = {
   callsPerEpisode: null,
   costPerEpisode: null,
   degrading: false,
+  truncated: false,
 };
 
 /**
@@ -193,10 +206,9 @@ export async function getGraphEfficiency(
       .eq("team_id", teamId)
       .eq("source", "graph_project")
       .gte("started_at", windowStart)
-      .limit(20_000),
+      // One past the cap, so hitting it is DETECTED rather than silently clipping the denominator.
+      .limit(RUN_FETCH_CAP + 1),
   ]);
-  return foldGraphEfficiency(
-    usageDays,
-    (runsRes.data ?? []) as { started_at: string | Date; meta: unknown }[]
-  );
+  const runRows = (runsRes.data ?? []) as { started_at: string | Date; meta: unknown }[];
+  return foldGraphEfficiency(usageDays, runRows.slice(0, RUN_FETCH_CAP), runRows.length > RUN_FETCH_CAP);
 }

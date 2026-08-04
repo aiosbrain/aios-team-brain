@@ -14,7 +14,10 @@ import type { GithubFileRaw } from "./github-files-normalize";
 export const DEFAULT_FILE_GLOBS = ["*.md", "*.mdx"];
 
 // Max decoded file size to import (skip large/generated files; the item body column caps at 1MB).
-const MAX_FILE_BYTES = 800_000;
+// Exported for the estimator: a file the importer will skip must not be priced.
+export const MAX_FILE_BYTES = 800_000;
+/** Importer's file cap per repo (see fetchGithubRepoFiles) — the estimator mirrors it. */
+export const MAX_FILES_PER_REPO = 1000;
 
 export interface FetchedGithubFiles {
   owner: string;
@@ -23,13 +26,15 @@ export interface FetchedGithubFiles {
   files: GithubFileRaw[];
 }
 
-/** fnmatch-style glob → RegExp. `*` spans path separators (matches the Python `fnmatch` semantics). */
-function globToRegExp(glob: string): RegExp {
+/** fnmatch-style glob → RegExp. `*` spans path separators (matches the Python `fnmatch` semantics).
+ *  Exported for the import-cost estimator (AIO-798), which must match EXACTLY what this importer
+ *  will fetch — a second matcher would drift. */
+export function globToRegExp(glob: string): RegExp {
   const escaped = glob.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".");
   return new RegExp(`^${escaped}$`, "i");
 }
 
-function matchesAny(path: string, globs: RegExp[]): boolean {
+export function matchesAny(path: string, globs: RegExp[]): boolean {
   return globs.some((re) => re.test(path));
 }
 
@@ -83,7 +88,7 @@ export async function fetchGithubRepoFiles(opts: {
   const fetchImpl = opts.fetchImpl ?? timeoutFetch;
   const headers = githubHeaders(opts.token);
   const globs = (opts.globs && opts.globs.length ? opts.globs : DEFAULT_FILE_GLOBS).map(globToRegExp);
-  const maxFiles = opts.maxFiles ?? 1000;
+  const maxFiles = opts.maxFiles ?? MAX_FILES_PER_REPO;
   const base = `${GITHUB_API}/repos/${opts.owner}/${opts.repo}`;
 
   // Resolve the ref (default branch) unless one was configured.

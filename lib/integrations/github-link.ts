@@ -1,7 +1,9 @@
 import type { DbClient } from "@/lib/db/types";
+import { runSql } from "@/lib/db/pg/pool";
 import { upsertIntegration, type IntegrationAuth } from "./manage";
 import { decryptSecret } from "@/lib/secrets/crypto";
-import { addRepo, removeRepo } from "./github-repos";
+import { addRepo, removeRepo, normalizeRepo } from "./github-repos";
+import { githubProjectSlug } from "@/lib/ingest/sources/github-normalize";
 
 /**
  * Persistence for the Admin → Integrations "GitHub repositories" panel. A team's linked repos live
@@ -39,17 +41,67 @@ function currentRepos(row: GithubRow | null): string[] {
   return Array.isArray(row?.config.repos) ? (row!.config.repos as string[]) : [];
 }
 
-/** Upsert the canonical github row with a new repos list, preserving other config + status. */
+/**
+ * Per-repo import-history window (AIO-798): `days` is what the admin chose; `sinceIso` is the
+ * absolute anchor resolved ONCE at link time. The anchor is the load-bearing half — recomputing
+ * `now − days` on each tick is a SLIDING window, and because issues are one diff-synced item per
+ * repo, issues aging out of a sliding fetch would be diff-DELETED from the brain tick after tick
+ * (plan-review blocker on this design). An array, not a Record keyed by repo name: the config
+ * secret-key scan walks nested object keys, and a repo literally named `acme/token-service` in key
+ * position would make the whole config unsavable.
+ */
+export interface RepoHistoryEntry {
+  repo: string;
+  days: number;
+  sinceIso: string;
+}
+
+function currentRepoHistory(row: GithubRow | null): RepoHistoryEntry[] {
+  const raw = row?.config.repoHistory;
+  if (!Array.isArray(raw)) return [];
+  return raw.filter(
+    (e): e is RepoHistoryEntry =>
+      !!e &&
+      typeof e === "object" &&
+      typeof (e as RepoHistoryEntry).repo === "string" &&
+      typeof (e as RepoHistoryEntry).days === "number" &&
+      typeof (e as RepoHistoryEntry).sinceIso === "string"
+  );
+}
+
+/**
+ * The stored history entry for a repo, or null = linked before windows existed (or outside the
+ * panel) = the pre-window behaviour: unbounded issues, default commit window. Pure and exported —
+ * the importer keys every windowed fetch on this one resolver.
+ */
+export function resolveRepoHistory(
+  config: Record<string, unknown>,
+  fullName: string
+): RepoHistoryEntry | null {
+  const raw = Array.isArray(config.repoHistory) ? (config.repoHistory as RepoHistoryEntry[]) : [];
+  const hit = raw.find((e) => e && typeof e.repo === "string" && e.repo.toLowerCase() === fullName.toLowerCase());
+  return hit && typeof hit.days === "number" && typeof hit.sinceIso === "string" ? hit : null;
+}
+
+/** Upsert the canonical github row with a new repos list (and optionally the history entries),
+ *  preserving other config + status. `repoHistory` stays ABSENT until the first entry exists —
+ *  legacy rows must remain byte-identical (`.optional()`, never defaulted). */
 async function writeRepos(
   db: DbClient,
   auth: IntegrationAuth,
   row: GithubRow | null,
-  repos: string[]
+  repos: string[],
+  repoHistory?: RepoHistoryEntry[]
 ): Promise<void> {
+  const config: Record<string, unknown> = { ...(row?.config ?? {}), repos };
+  if (repoHistory !== undefined) {
+    if (repoHistory.length > 0) config.repoHistory = repoHistory;
+    else delete config.repoHistory;
+  }
   await upsertIntegration(db, auth, {
     type: "github",
     name: row?.name ?? "github", // conflict key is (team,type,name) — a stable name = one row
-    config: { ...(row?.config ?? {}), repos },
+    config,
     status: row?.status ?? "enabled", // new row → enabled; existing → keep its status
   });
 }
@@ -61,11 +113,24 @@ async function writeRepos(
 export async function linkGithubRepo(
   db: DbClient,
   auth: IntegrationAuth,
-  repoInput: string
+  repoInput: string,
+  /** History window chosen at link time (AIO-798). Omitted = pre-window behaviour (no entry). */
+  historyDays?: number
 ): Promise<string[]> {
   const row = await firstGithubRow(db, auth.teamId);
   const repos = addRepo(currentRepos(row), repoInput); // validates + case-insensitive de-dup
-  await writeRepos(db, auth, row, repos);
+  let history: RepoHistoryEntry[] | undefined;
+  if (historyDays !== undefined) {
+    // The entry is attributed from the INPUT, never positionally: addRepo de-dups, so on a re-add
+    // of an already-linked repo `repos` comes back unchanged and its last element is some OTHER
+    // repo — attributing the entry to it would re-anchor + narrow an innocent repo's window, whose
+    // next sync would diff-delete its imported issues (review blocker on this feature's first cut).
+    const full = normalizeRepo(repoInput);
+    const kept = currentRepoHistory(row).filter((e) => e.repo.toLowerCase() !== full.toLowerCase());
+    // The anchor: resolved exactly once, here. The importer only ever READS it back.
+    history = [...kept, { repo: full, days: historyDays, sinceIso: new Date(Date.now() - historyDays * 86_400_000).toISOString() }];
+  }
+  await writeRepos(db, auth, row, repos, history);
   return repos;
 }
 
@@ -96,7 +161,7 @@ export async function ensureGithubIntegration(
 export async function githubReposAndToken(
   db: DbClient,
   teamId: string
-): Promise<{ repos: string[]; token: string | null }> {
+): Promise<{ repos: string[]; token: string | null; fileGlobs?: string[] }> {
   const { data } = await db
     .from("integrations")
     .select("config, secret_ciphertext")
@@ -108,7 +173,8 @@ export async function githubReposAndToken(
   const config = ((data?.config as Record<string, unknown>) ?? {}) as Record<string, unknown>;
   const repos = Array.isArray(config.repos) ? (config.repos as string[]) : [];
   const cipher = data?.secret_ciphertext as string | null | undefined;
-  return { repos, token: cipher ? decryptSecret(cipher) : null };
+  const fileGlobs = Array.isArray(config.fileGlobs) ? (config.fileGlobs as string[]) : undefined;
+  return { repos, token: cipher ? decryptSecret(cipher) : null, fileGlobs };
 }
 
 /** Unlink a repo (case-insensitive). No-op if no github row / repo absent. Returns the repos list. */
@@ -120,6 +186,34 @@ export async function unlinkGithubRepo(
   const row = await firstGithubRow(db, auth.teamId);
   if (!row) return [];
   const repos = removeRepo(currentRepos(row), repoInput);
-  await writeRepos(db, auth, row, repos);
+  const linked = new Set(repos.map((r) => r.toLowerCase()));
+  // Prune history entries for repos no longer linked, so the array can't outgrow the config cap.
+  const history = currentRepoHistory(row).filter((e) => linked.has(e.repo.toLowerCase()));
+  await writeRepos(db, auth, row, repos, history);
   return repos;
+}
+
+/**
+ * Tasks already materialized from a repo's issues project (`github-<owner>-<repo>`) — the re-link
+ * warning's number (AIO-798): unlink never purges items/tasks, so re-linking with a NARROWER window
+ * diff-deletes every previously imported task outside it on the first sync. Best-effort: 0 on error.
+ */
+export async function countPreviouslyImportedTasks(
+  teamId: string,
+  owner: string,
+  repo: string
+): Promise<number> {
+  try {
+    const res = await runSql<{ n: number }>(
+      `select count(*)::int as n from tasks t join projects p on p.id = t.project_id
+        where t.team_id = $1 and p.slug = $2`,
+      // The importer's own slug builder — a hand-built `github-owner-repo` diverges on any repo
+      // with a dot (vercel/next.js → github-vercel-next-js), silently hiding the re-link warning
+      // for exactly the repos where it matters (review finding).
+      [teamId, githubProjectSlug(owner, repo)]
+    );
+    return res.rows[0]?.n ?? 0;
+  } catch {
+    return 0;
+  }
 }
