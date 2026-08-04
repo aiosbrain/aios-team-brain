@@ -1,0 +1,14 @@
+-- GRAPHCOST-7 (AIO-753) — the cheaper model for the extraction calls Graphiti itself marks simple.
+--
+-- `graphiti_core` asks for `ModelSize.small` on two of the five prompts that run on the add_episode
+-- path (`node_attributes`, `dedupe_edges`), signalling it on the wire as `gpt-4.1-nano`. The proxy
+-- discarded that and served every call with the extraction model. Measured after AIO-739 shipped the
+-- `call_kind` dimension, those two kinds are a majority of graph spend, and neither can reduce what
+-- the graph knows about: both only refine work a strong model already did.
+--
+-- OPT-IN and SAFE BY DEFAULT: empty = today's behaviour exactly. There is deliberately no
+-- `extraction_small_provider` sibling — the small model rides the extraction backend's provider and
+-- key, because a second provider would reintroduce the half-swap that the extraction branch's WHOLE
+-- fallback exists to prevent (the extraction model on a backend that may not serve it is a
+-- guaranteed 404 per call, with Graphiti still answering 202 while the graph stops growing).
+alter table teams add column if not exists extraction_small_model text;

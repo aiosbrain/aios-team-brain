@@ -88,6 +88,15 @@ export interface LlmBackendKeys {
    * deliberate. Set = extraction runs on that provider's own backend + key.
    */
   extractionProvider?: ExtractionProvider | null;
+  /**
+   * Optional CHEAPER model for the extraction calls the upstream itself marks as simple
+   * (`teams.extraction_small_model`) — see `selectSmallExtractionBackend`.
+   *
+   * Deliberately has no `extractionSmallProvider` sibling: it rides the extraction backend's provider
+   * and key. A second provider here would reintroduce the half-swap the extraction branch's WHOLE
+   * fallback exists to prevent.
+   */
+  extractionSmallModel?: string | null;
 }
 
 /**
@@ -276,6 +285,55 @@ export function describeExtraction(
     model: backend.model,
     usedFallback: requested !== null && backend.provider !== requested,
   };
+}
+
+/**
+ * The backend for extraction calls Graphiti itself marks as simple, or NULL when small routing is
+ * off. Null is the safe answer everywhere — the caller then uses the ordinary extraction target, so
+ * every unconfigured or degraded state costs today's money rather than degrading the graph.
+ *
+ * Three ways it is off, and each is deliberate:
+ *
+ *  1. **No small model set.** The feature is opt-in; an operator who sets nothing gets byte-identical
+ *     behaviour.
+ *  2. **The extraction role itself is off** (`extractionModel` unset, so extraction reuses the
+ *     ANSWERING model). Layering a cheap model beneath a role the operator never enabled would
+ *     downgrade calls they never chose to treat as extraction.
+ *  3. **The extraction target FELL BACK** — a requested extraction provider that isn't configured.
+ *     The extraction branch falls back WHOLE precisely because the extraction model on a backend
+ *     that may not serve it is a guaranteed 404 per call, and Graphiti keeps answering 202 while the
+ *     graph silently stops growing. The small model inherits that trap exactly, so it switches off
+ *     rather than riding a fallback.
+ *
+ * It rides the extraction backend's provider and key by construction (spread, model replaced), so it
+ * cannot be pointed at a backend nobody configured.
+ */
+export function selectSmallExtractionBackend(env: LlmBackendEnv, keys: LlmBackendKeys): LlmBackend | null {
+  if (!nonEmpty(keys.extractionSmallModel)) return null; // (1)
+  if (!extractionActive("extraction", keys)) return null; // (2)
+  const extraction = selectLlmBackend(env, keys, { role: "extraction" });
+  const requested = keys.extractionProvider ?? null;
+  if (requested !== null && extraction.provider !== requested) return null; // (3)
+  return { ...extraction, model: keys.extractionSmallModel.trim() };
+}
+
+/**
+ * Describe the effective SMALL extraction backend for the admin indicator.
+ *
+ * `inert` is the point of this function, not `enabled`. A small model that is set but not in effect
+ * is a cost setting that reverted unnoticed — the exact surprise-bill shape `describeExtraction`'s
+ * `usedFallback` was written to make visible. Shipping the setter without this indicator would
+ * recreate that gap on a new setting.
+ */
+export function describeSmallExtraction(
+  env: LlmBackendEnv,
+  keys: LlmBackendKeys
+): { enabled: boolean; inert: boolean; model: string; provider: AnsweringProvider | null } {
+  const requestedModel = nonEmpty(keys.extractionSmallModel) ? keys.extractionSmallModel.trim() : "";
+  const backend = selectSmallExtractionBackend(env, keys);
+  if (backend) return { enabled: true, inert: false, model: backend.model, provider: backend.provider };
+  // Configured but not in effect → inert. Nothing configured → nothing to warn about.
+  return { enabled: false, inert: requestedModel !== "", model: requestedModel, provider: null };
 }
 
 /**

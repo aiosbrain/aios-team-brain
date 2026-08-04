@@ -102,3 +102,52 @@ export function classifyGraphCall(body: unknown): string {
     return UNKNOWN_GRAPH_CALL;
   }
 }
+
+/**
+ * The model name Graphiti sends when it wants a CHEAPER model for a simpler prompt.
+ *
+ * A WIRE SENTINEL, not a model we serve: it names no backend, is never forwarded to a provider, and
+ * must not migrate into `selectLlmBackend`/the settings path. `graphiti_core` 0.13.2's
+ * `_get_model_for_size` (`llm_client/openai_base_client.py:103`) returns
+ * `self.small_model or DEFAULT_SMALL_MODEL` for `ModelSize.small` and `self.model or DEFAULT_MODEL`
+ * otherwise; the deployed service configures neither, so `gpt-4.1-nano` vs `gpt-4.1-mini` is how the
+ * request tells us which it is. Verified against
+ * zepai/graphiti@sha256:76d14f30afc65d2f914637d67d0c0631a7e779e2740be1ae99b9dc0c5876d2da.
+ */
+export const GRAPHITI_SMALL_MODEL_MARKER = "gpt-4.1-nano";
+
+/**
+ * The only call kinds we will ever downgrade — the two Graphiti itself marks `ModelSize.small`.
+ *
+ * Both operate on work a STRONG model already did: `node_attributes` fills in attributes for
+ * entities `extract_nodes` has already found, and `dedupe_edges.resolve_edge` chooses among edges
+ * `extract_edges` already produced. Neither can reduce what the graph knows about, which is what
+ * makes downgrading them a different risk class from swapping the extraction model itself.
+ */
+export const SMALL_ELIGIBLE_KINDS: ReadonlySet<string> = new Set(["node_attributes", "dedupe_edges"]);
+
+/**
+ * Should this call be served by the team's cheap model? TWO INDEPENDENT SIGNALS MUST AGREE.
+ *
+ * The marker alone is NOT safe, and this is the single most important line in the change. Normal
+ * calls resolve to `self.model or DEFAULT_MODEL`, so an operator who sets `MODEL_NAME=gpt-4.1-nano`
+ * on the Graphiti service — which the proxy's own header comment invites them to try — makes EVERY
+ * call arrive wearing the marker, including `extract_nodes`. Routing on the marker alone would then
+ * put entity extraction on the weak model: the zero-entities failure a qualification probe caught on
+ * a real payload on 2026-08-04, where a candidate returned valid JSON containing nothing.
+ *
+ * So the upstream's intent must be corroborated by our own reading of the request's content. Any
+ * disagreement — marker without an eligible kind, eligible kind without the marker, a reworded
+ * prompt that classifies `unknown` — routes to the STRONG model, i.e. today's behaviour. Every
+ * drift state costs money rather than silently degrading the graph.
+ */
+export function wantsSmallModel(body: unknown): boolean {
+  try {
+    if (typeof body !== "object" || body === null) return false;
+    const model = (body as { model?: unknown }).model;
+    if (model !== GRAPHITI_SMALL_MODEL_MARKER) return false;
+    return SMALL_ELIGIBLE_KINDS.has(classifyGraphCall(body));
+  } catch {
+    return false;
+  }
+}

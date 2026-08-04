@@ -19,6 +19,7 @@ import {
   setAnsweringModel,
   setReasoningModel,
   setExtractionModel,
+  setExtractionSmallModel,
   setEmbeddingModel,
   setMeetingTaskStatus,
   type PrimaryPmProvider,
@@ -70,6 +71,12 @@ export interface AnsweringState {
     effective: { provider: AnsweringProvider; model: string } | null;
     /** True when the requested extraction provider wasn't configured and it fell back WHOLE to answering. */
     usedFallback: boolean;
+    /** Cheaper model for the calls Graphiti marks `ModelSize.small` (teams.extraction_small_model). */
+    smallModel: string | null;
+    /** Is that cheap model actually serving those calls right now? */
+    smallEnabled: boolean;
+    /** Set, but NOT in effect — the extraction role is off or it fell back. A reverted cost control. */
+    smallInert: boolean;
   };
 }
 
@@ -486,6 +493,14 @@ export function IntegrationsManager({
     run(() => setExtractionModel(teamSlug, extProvider, extModel.trim()));
   }
 
+  // The cheap model for the two calls Graphiti itself marks simple. No provider pair — it rides the
+  // extraction backend's provider and key, because a second provider would reintroduce the half-swap
+  // the extraction role's WHOLE fallback exists to prevent.
+  const [extSmallModel, setExtSmallModel] = useState(answering.extraction.smallModel ?? "");
+  function saveExtractionSmall() {
+    run(() => setExtractionSmallModel(teamSlug, extSmallModel.trim()));
+  }
+
   // Embeddings role (provider + curated 1536-dim model). "Auto" (null) clears both → env/off. Switching
   // provider seeds the model to that provider's single curated model. Blank provider sends "" model.
   const embConfigured: Record<EmbeddingProvider, boolean> = {
@@ -586,6 +601,53 @@ export function IntegrationsManager({
           }
           fallback={answering.extraction.usedFallback}
         />
+
+        {/* The cheap model for the two calls Graphiti itself marks simple. Deliberately a bare input
+            rather than a RolePicker: there is no provider to choose — it rides the extraction
+            backend's provider and key. */}
+        <div className="rounded-lg border border-line/60 p-3">
+          <div className="text-sm font-medium">Cheap model for simple graph calls (optional)</div>
+          <p className="mt-1 text-xs text-muted">
+            Graphiti asks for a cheaper model on two of its five calls — filling in entity attributes, and
+            picking between duplicate facts. Both only refine work the extraction model already did, so a
+            weak model here can’t reduce what the graph knows about. Measured on the Costs page, those two
+            calls are most of the graph bill. Runs on the extraction model’s provider and key; blank = use
+            the extraction model for everything, exactly as before. Requires an extraction model to be set.
+          </p>
+          <div className="mt-2 flex gap-2">
+            <input
+              className="min-w-0 flex-1 rounded-md border border-line bg-surface px-2 py-1 text-sm"
+              placeholder="e.g. mistralai/mistral-small-3.2-24b-instruct"
+              value={extSmallModel}
+              onChange={(e) => setExtSmallModel(e.target.value)}
+            />
+            <button
+              type="button"
+              className="rounded-md border border-line px-3 py-1 text-sm disabled:opacity-50"
+              onClick={saveExtractionSmall}
+              disabled={pending}
+            >
+              Save
+            </button>
+          </div>
+          <p className="mt-1 text-xs">
+            {answering.extraction.smallEnabled ? (
+              <span className="text-muted">
+                In effect — serving the simple graph calls.
+              </span>
+            ) : answering.extraction.smallInert ? (
+              /* The whole reason this indicator exists: a cost setting that reverted unnoticed is a
+                 surprise bill. Same class as the extraction picker's fallback warning. */
+              <span className="text-amber">
+                Saved but NOT in effect — every call is still served by the extraction model. Set an
+                extraction model above, and make sure its provider is configured (a fallback switches
+                this off deliberately).
+              </span>
+            ) : (
+              <span className="text-muted">Not set — the extraction model serves every graph call.</span>
+            )}
+          </p>
+        </div>
       </div>
 
       <EmbeddingPicker

@@ -602,6 +602,75 @@ export async function setExtractionModel(
 }
 
 /**
+ * Set the CHEAP model for the extraction calls Graphiti itself marks simple (admins only; audited).
+ *
+ * WHY A SECOND MODEL FIELD. `graphiti_core` asks for `ModelSize.small` on two of the five prompts on
+ * the add_episode path, and the proxy used to discard that and serve everything with the extraction
+ * model. Those two — filling attributes onto entities `extract_nodes` already found, and choosing
+ * among edges `extract_edges` already produced — were a majority of graph spend once `call_kind`
+ * made it measurable, and neither can reduce what the graph knows about. This is the control that
+ * lets them run cheap while entity and edge extraction keep the strong model.
+ *
+ * NO PROVIDER PAIR, deliberately: it rides the extraction backend's provider and key. A second
+ * provider would reintroduce the half-swap the extraction branch's WHOLE fallback exists to prevent.
+ *
+ * Empty clears it → every call is served by the extraction model, exactly as before. The setting is
+ * also INERT (and reported so on the card) whenever the extraction role itself is off or fell back —
+ * see `selectSmallExtractionBackend`; a cost setting that reverts unnoticed is a surprise bill.
+ */
+export async function setExtractionSmallModel(
+  teamSlug: string,
+  model: string
+): Promise<{ ok: boolean; error?: string; warning?: string }> {
+  const ctx = await requireAdmin(teamSlug);
+  if (!ctx) return { ok: false, error: "admins only" };
+  const trimmed = model.trim().slice(0, 200);
+  const db = adminClient();
+  const { error } = await db
+    .from("teams")
+    .update({ extraction_small_model: trimmed || null })
+    .eq("id", ctx.teamId);
+  if (error) return { ok: false, error: error.message };
+  await audit(db, {
+    team_id: ctx.teamId,
+    actor_kind: "member",
+    member_id: ctx.memberId,
+    action: "team.extraction_small_model_set",
+    target_type: "team",
+    target_id: ctx.teamId,
+    meta: { model: trimmed || null },
+  });
+  revalidatePath(`/t/${teamSlug}/admin/integrations`);
+  // Same advisory the extraction picker carries, asked of the SMALL model on the extraction backend.
+  // A model without structured-output support fails every call it is routed — and because these two
+  // calls only refine existing entities, the damage is quieter than an empty graph: attributes and
+  // edge resolution silently stop while extraction keeps working. Best-effort; an unreachable
+  // catalogue yields no warning rather than a false accusation.
+  return { ok: true, ...(await smallModelWarning(db, ctx.teamId, trimmed)) };
+}
+
+/** Structured-output advisory for the SMALL extraction model, on the extraction backend's provider. */
+async function smallModelWarning(
+  db: ReturnType<typeof adminClient>,
+  teamId: string,
+  model: string
+): Promise<{ warning?: string }> {
+  if (!model) return {};
+  try {
+    const keys = await resolveAnsweringKeys(db, teamId);
+    const backend = selectLlmBackend(
+      { LLM_BASE_URL: process.env.LLM_BASE_URL, LLM_MODEL: process.env.LLM_MODEL },
+      keys,
+      { role: "extraction" }
+    );
+    const warning = structuredOutputWarning(await checkStructuredOutputSupport(backend.provider, model));
+    return warning ? { warning } : {};
+  } catch {
+    return {};
+  }
+}
+
+/**
  * The advisory sentence about whatever now governs the graph leg. Both model pickers end here.
  *
  * Asked of the RESOLVED backend, never of the submitted values, and this is the whole point:

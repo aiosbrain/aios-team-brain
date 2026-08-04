@@ -47,7 +47,7 @@ export async function resolveAnsweringKeys(db: DbClient, teamId: string): Promis
     db
       .from("teams")
       .select(
-        "answering_provider, reasoning_model, reasoning_provider, extraction_model, extraction_provider"
+        "answering_provider, reasoning_model, reasoning_provider, extraction_model, extraction_provider, extraction_small_model"
       )
       .eq("id", teamId)
       .maybeSingle(),
@@ -57,6 +57,7 @@ export async function resolveAnsweringKeys(db: DbClient, teamId: string): Promis
     reasoning_model: string | null;
     reasoning_provider: string | null;
     extraction_model: string | null;
+    extraction_small_model: string | null;
     extraction_provider: string | null;
   } | null;
   return {
@@ -70,6 +71,7 @@ export async function resolveAnsweringKeys(db: DbClient, teamId: string): Promis
     reasoningModel: teamRow?.reasoning_model ?? null,
     reasoningProvider: normalizeAnsweringProvider(teamRow?.reasoning_provider),
     extractionModel: teamRow?.extraction_model ?? null,
+    extractionSmallModel: teamRow?.extraction_small_model ?? null,
     extractionProvider: normalizeExtractionProvider(teamRow?.extraction_provider),
   };
 }
