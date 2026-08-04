@@ -26,7 +26,10 @@ import {
 import { saveProvisioningSettings as saveProvisioningSettings_ } from "@/lib/provisioning/settings";
 import { validateGithubToken, checkRepoAccess, type RepoAccess } from "@/lib/integrations/github-validate";
 import { checkSlackChannels, privateChannelRejection } from "@/lib/integrations/slack-validate";
-import { RepoFormatError } from "@/lib/integrations/github-repos";
+import { RepoFormatError, normalizeRepo } from "@/lib/integrations/github-repos";
+import { estimateGithubImport, type GithubImportEstimate } from "@/lib/integrations/github-estimate";
+import { getGraphEfficiency } from "@/lib/metrics/graph-efficiency";
+import { runSql } from "@/lib/db/pg/pool";
 import { validateOpenrouterKey, saveOpenrouterSettings } from "@/lib/integrations/openrouter";
 import { MEETING_TASK_STATUSES, type MeetingTaskStatus } from "@/lib/meetings/target-status";
 import {
@@ -249,12 +252,17 @@ export async function syncGithubNow(
  */
 export async function addGithubRepo(
   teamSlug: string,
-  repo: string
+  repo: string,
+  /** History window chosen in the estimate step (AIO-798). Omitted = pre-window behaviour. */
+  historyDays?: number
 ): Promise<{ ok: boolean; error?: string }> {
   const ctx = await requireAdmin(teamSlug);
   if (!ctx) return { ok: false, error: "admins only" };
+  if (historyDays !== undefined && (!Number.isInteger(historyDays) || historyDays < 0 || historyDays > 3650)) {
+    return { ok: false, error: "invalid history window" };
+  }
   try {
-    await linkGithubRepo(adminClient(), { teamId: ctx.teamId, memberId: ctx.memberId }, repo);
+    await linkGithubRepo(adminClient(), { teamId: ctx.teamId, memberId: ctx.memberId }, repo, historyDays);
   } catch (e) {
     if (e instanceof RepoFormatError || e instanceof IntegrationConfigError) {
       return { ok: false, error: e.message };
@@ -322,6 +330,77 @@ export async function checkGithubAccess(
     return { ok: true, access };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "access check failed" };
+  }
+}
+
+/**
+ * Pre-link import estimate for a GitHub repo (AIO-798, admins only — it reads the stored PAT).
+ * Runs BEFORE anything is fetched into the brain: ~3 GitHub metadata calls sized against the
+ * projector's own chunk math, priced by the Costs page's own reader (`getGraphEfficiency`), so the
+ * estimate and the dashboard cannot disagree. Re-links are warned: unlink never purges items, so a
+ * narrower window's first fetch would diff-delete previously imported tasks.
+ */
+export async function estimateGithubImportAction(
+  teamSlug: string,
+  repoInput: string,
+  historyDays: number
+): Promise<{
+  ok: boolean;
+  error?: string;
+  estimate?: GithubImportEstimate;
+  /** episodes x this install's measured cost/episode; null = no local price history OR the metric
+   *  fetch was truncated — episodes shown, dollars withheld, never fabricated. */
+  priceUsd?: number | null;
+  unreachable?: boolean;
+  /** Tasks already imported for this repo (a re-link) — a narrower window diff-deletes them. */
+  previouslyImportedTasks?: number;
+}> {
+  const ctx = await requireAdmin(teamSlug);
+  if (!ctx) return { ok: false, error: "admins only" };
+  if (!Number.isInteger(historyDays) || historyDays < 0 || historyDays > 3650) {
+    return { ok: false, error: "invalid history window" };
+  }
+  let full: string;
+  try {
+    full = normalizeRepo(repoInput);
+  } catch (e) {
+    return { ok: false, error: e instanceof RepoFormatError ? e.message : "malformed repo" };
+  }
+  const db = adminClient();
+  try {
+    const { token } = await githubReposAndToken(db, ctx.teamId);
+    const [owner, repo] = full.split("/", 2);
+    const result = await estimateGithubImport({ owner, repo, token, historyDays });
+    if (!result.ok) {
+      return result.reason === "unreachable"
+        ? { ok: true, unreachable: true }
+        : { ok: false, error: result.detail };
+    }
+    // Price from the cost dashboard's own reader; null or truncated -> withhold, never fabricate.
+    const efficiency = await getGraphEfficiency(db, ctx.teamId, "30d", {
+      isAdmin: true,
+      memberId: ctx.memberId,
+    });
+    const priceUsd =
+      efficiency.costPerEpisode !== null && !efficiency.truncated
+        ? result.episodes * efficiency.costPerEpisode
+        : null;
+    // Re-link warning: tasks already materialized from this repo's issues project.
+    const projectSlug = `github-${owner.toLowerCase()}-${repo.toLowerCase()}`;
+    const prior = await runSql<{ n: number }>(
+      `select count(*)::int as n from tasks t join projects p on p.id = t.project_id
+        where t.team_id = $1 and p.slug = $2`,
+      [ctx.teamId, projectSlug]
+    ).catch(() => null);
+    const { ok: _resultOk, ...estimate } = result;
+    return {
+      ok: true,
+      estimate,
+      priceUsd,
+      previouslyImportedTasks: prior?.rows[0]?.n ?? 0,
+    };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "estimate failed" };
   }
 }
 

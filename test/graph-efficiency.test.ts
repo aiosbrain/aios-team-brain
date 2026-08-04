@@ -126,3 +126,14 @@ describe("foldGraphEfficiency", () => {
     expect(out.costPerEpisode).toBeCloseTo(0.004, 6);
   });
 });
+
+describe("truncated denominator (AIO-798)", () => {
+  it("a capped ingest_runs fetch surfaces as truncated — price consumers withhold, never fabricate", () => {
+    const out = foldGraphEfficiency([], [], true);
+    expect(out.truncated).toBe(true);
+  });
+
+  it("defaults to not truncated", () => {
+    expect(foldGraphEfficiency([], []).truncated).toBe(false);
+  });
+});

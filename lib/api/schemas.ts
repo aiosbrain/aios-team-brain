@@ -600,6 +600,25 @@ const integrationConfigSchemas: Record<IntegrationType, z.ZodType> = {
       // Member-onboarding provisioning: the GitHub org new members are invited into
       // (POST /orgs/{org}/invitations). NON-secret; the token stays encrypted in secret_ciphertext.
       org: z.string().max(100).optional(),
+      // Per-repo import-history windows (AIO-798). An ARRAY of objects, not a Record keyed by
+      // full_name: the secret-key scan walks nested object KEYS, so a repo literally named
+      // `acme/token-service` in key position would make the whole config unsavable. `sinceIso` is
+      // the anchor resolved ONCE at link — a recomputed (sliding) window would diff-delete issues
+      // as they age out of the fetch. `.optional()`, never defaulted: an absent key stays absent,
+      // so legacy rows are byte-identical and "no entry = pre-window behaviour" holds at the
+      // storage layer. See docs/design/repo-import-history-estimate.md.
+      repoHistory: z
+        .array(
+          z
+            .object({
+              repo: z.string().min(1).max(200),
+              days: z.number().int().min(0).max(3650),
+              sinceIso: z.string().datetime({ offset: true }).max(40),
+            })
+            .strict()
+        )
+        .max(200)
+        .optional(),
     })
     .strict(),
   slack: z

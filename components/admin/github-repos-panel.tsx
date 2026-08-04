@@ -10,6 +10,7 @@ import {
   syncGithubNow,
   connectGithubToken,
   checkGithubAccess,
+  estimateGithubImportAction,
 } from "@/app/t/[team]/admin/integrations/actions";
 import type { RepoAccess, RepoAccessState } from "@/lib/integrations/github-validate";
 import type { IntegrationRow } from "@/components/admin/integrations-manager";
@@ -24,6 +25,37 @@ interface GithubReposPanelProps {
 
 const reposOf = (i: IntegrationRow | null): string[] =>
   Array.isArray(i?.config.repos) ? (i!.config.repos as string[]) : [];
+
+/** repo (lowercase) → chosen history days, from config.repoHistory (AIO-798). */
+const historyOf = (i: IntegrationRow | null): Map<string, number> => {
+  const raw = i?.config.repoHistory;
+  const out = new Map<string, number>();
+  if (Array.isArray(raw)) {
+    for (const e of raw as { repo?: string; days?: number }[]) {
+      if (e && typeof e.repo === "string" && typeof e.days === "number") out.set(e.repo.toLowerCase(), e.days);
+    }
+  }
+  return out;
+};
+
+/** The history-window choices offered at link time. 14 first — the default the feature was asked for. */
+const WINDOW_CHOICES = [
+  { days: 14, label: "2 weeks" },
+  { days: 30, label: "30 days" },
+  { days: 90, label: "90 days" },
+  { days: 0, label: "No history" },
+] as const;
+
+type EstimateState =
+  | { repo: string; busy: true }
+  | {
+      repo: string;
+      busy: false;
+      unreachable?: boolean;
+      estimate?: Awaited<ReturnType<typeof estimateGithubImportAction>>["estimate"];
+      priceUsd?: number | null;
+      previouslyImportedTasks?: number;
+    };
 
 const ACCESS_BADGE: Record<RepoAccessState, { label: string; cls: string }> = {
   public: { label: "Public", cls: "bg-surface-overlay text-ink-tertiary" },
@@ -48,8 +80,12 @@ export function GithubReposPanel({ teamSlug, integration, scannedRepos }: Github
   const [token, setToken] = useState("");
   const [connectMsg, setConnectMsg] = useState<string | null>(null);
   const [access, setAccess] = useState<RepoAccess[] | null>(null);
+  // Two-step link flow (AIO-798): pick repo → see the priced estimate → choose a window → confirm.
+  const [est, setEst] = useState<EstimateState | null>(null);
+  const [windowDays, setWindowDays] = useState<number>(14);
 
   const linked = reposOf(integration);
+  const historyByRepo = useMemo(() => historyOf(integration), [integration]);
   const linkedLower = useMemo(() => new Set(linked.map((r) => r.toLowerCase())), [linked]);
   const suggestions = scannedRepos.filter((r) => !linkedLower.has(r.toLowerCase()));
   const enabled = integration?.status === "enabled";
@@ -95,6 +131,36 @@ export function GithubReposPanel({ teamSlug, integration, scannedRepos }: Github
       if (!res.ok) setError(res.error ?? "access check failed");
       else setAccess(res.access ?? []);
     });
+  }
+
+  /** Step 1 of linking: nothing is imported — ~3 GitHub metadata calls produce the priced estimate. */
+  function beginEstimate(repo: string, days = windowDays) {
+    setError(null);
+    setEst({ repo, busy: true });
+    startTransition(async () => {
+      const res = await estimateGithubImportAction(teamSlug, repo, days);
+      if (!res.ok) {
+        setEst(null);
+        setError(res.error ?? "estimate failed");
+        return;
+      }
+      setEst({
+        repo,
+        busy: false,
+        unreachable: res.unreachable,
+        estimate: res.estimate,
+        priceUsd: res.priceUsd,
+        previouslyImportedTasks: res.previouslyImportedTasks,
+      });
+    });
+  }
+
+  /** Step 2: the admin saw the number and chose the window — link, anchored. */
+  function confirmLink() {
+    if (!est) return;
+    const repo = est.repo;
+    setEst(null);
+    act(() => addGithubRepo(teamSlug, repo, windowDays), true);
   }
 
   return (
@@ -235,6 +301,14 @@ export function GithubReposPanel({ teamSlug, integration, scannedRepos }: Github
             {linked.map((repo) => {
               const a = accessByRepo.get(repo.toLowerCase());
               const badge = a ? ACCESS_BADGE[a.state] : null;
+              const days = historyByRepo.get(repo.toLowerCase());
+              // The most expensive default (full history) must not be the invisible one.
+              const windowLabel =
+                days === undefined
+                  ? "full history (linked before windows)"
+                  : days === 0
+                    ? "no history"
+                    : `${days}d history`;
               return (
                 <li
                   key={repo}
@@ -254,6 +328,9 @@ export function GithubReposPanel({ teamSlug, integration, scannedRepos }: Github
                       {badge.label}
                     </span>
                   ) : null}
+                  <span className="rounded-full bg-surface-overlay px-2 py-0.5 text-xs text-ink-tertiary">
+                    {windowLabel}
+                  </span>
                   <button
                     type="button"
                     disabled={pending}
@@ -275,7 +352,7 @@ export function GithubReposPanel({ teamSlug, integration, scannedRepos }: Github
         onSubmit={(e) => {
           e.preventDefault();
           const repo = input.trim();
-          if (repo) act(() => addGithubRepo(teamSlug, repo), true);
+          if (repo) beginEstimate(repo);
         }}
         className="flex flex-col gap-2 sm:flex-row"
       >
@@ -287,9 +364,132 @@ export function GithubReposPanel({ teamSlug, integration, scannedRepos }: Github
           aria-label="Repository to link"
         />
         <button type="submit" disabled={pending || !input.trim()} className="btn-prism justify-center">
-          <Plus className="size-4" /> Link repo
+          <Plus className="size-4" /> Estimate &amp; link
         </button>
       </form>
+
+      {/* Step 1 result: the priced estimate + window choice. Nothing has been imported yet. */}
+      {est ? (
+        <div className="flex flex-col gap-2 rounded-lg border border-violet/30 bg-violet/5 px-3 py-3">
+          <p className="text-xs font-medium text-ink">
+            <span className="font-mono">{est.repo}</span> — import estimate
+          </p>
+          {est.busy ? (
+            <p className="text-sm text-ink-secondary">Sizing the repo (metadata only — nothing is imported yet)…</p>
+          ) : est.unreachable ? (
+            <>
+              <p className="text-sm text-ink-secondary">
+                <span className={`mr-2 rounded-full px-2 py-0.5 text-xs font-medium ${ACCESS_BADGE.no_access.cls}`}>
+                  No access
+                </span>
+                This repo can&apos;t be read with the current token, so the cost is unknown until access
+                works. You can still link it — it will import once a token with access is connected.
+              </p>
+              <div className="flex gap-2">
+                <button type="button" disabled={pending} onClick={confirmLink} className="btn-prism justify-center">
+                  Link anyway
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setEst(null)}
+                  className="rounded-lg border border-border-default px-3 py-1 text-xs text-ink-secondary"
+                >
+                  Cancel
+                </button>
+              </div>
+            </>
+          ) : est.estimate ? (
+            <>
+              <div className="flex flex-wrap items-center gap-2 text-xs text-ink-secondary">
+                <span className="mr-1 font-medium text-ink">History window:</span>
+                {WINDOW_CHOICES.map((c) => (
+                  <button
+                    key={c.days}
+                    type="button"
+                    disabled={pending}
+                    onClick={() => {
+                      setWindowDays(c.days);
+                      beginEstimate(est.repo, c.days);
+                    }}
+                    className={`rounded-full border px-2.5 py-0.5 ${
+                      windowDays === c.days
+                        ? "border-violet/50 bg-violet/10 text-violet"
+                        : "border-border-default hover:text-ink"
+                    }`}
+                  >
+                    {c.label}
+                  </button>
+                ))}
+              </div>
+              <ul className="text-sm text-ink-secondary">
+                <li>
+                  <span className="text-ink">{est.estimate.files}</span> markdown docs →{" "}
+                  <span className="text-ink">
+                    {est.estimate.atLeast ? "at least " : ""}
+                    {est.estimate.fileEpisodes}
+                  </span>{" "}
+                  graph episodes (imported as they are now — the window applies to issues &amp; commits)
+                </li>
+                <li>
+                  {est.estimate.issueCount === null ? (
+                    <>issues in window: unknown</>
+                  ) : (
+                    <>
+                      <span className="text-ink">{est.estimate.issueCount}</span> issues in window → ~
+                      <span className="text-ink">{est.estimate.issueEpisodes}</span> episodes
+                    </>
+                  )}
+                </li>
+                <li>
+                  {est.estimate.commitCount === null ? (
+                    <>commits in window: unknown</>
+                  ) : (
+                    <>
+                      <span className="text-ink">{est.estimate.commitCount}</span> commits → contributor
+                      graphs · no extraction cost
+                    </>
+                  )}
+                </li>
+              </ul>
+              <p className="text-sm font-medium text-ink">
+                {est.priceUsd !== null && est.priceUsd !== undefined ? (
+                  <>
+                    Initial import ≈ {est.estimate.atLeast ? "at least " : ""}
+                    {est.estimate.episodes} episodes ≈ ${est.priceUsd.toFixed(2)} at your current
+                    extraction model
+                  </>
+                ) : (
+                  <>
+                    Initial import ≈ {est.estimate.atLeast ? "at least " : ""}
+                    {est.estimate.episodes} episodes — no local price history yet; the Costs page will
+                    show the real spend as it lands
+                  </>
+                )}
+              </p>
+              {est.previouslyImportedTasks ? (
+                <p className="rounded-lg border border-amber-400/30 bg-amber-400/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
+                  This repo was imported before ({est.previouslyImportedTasks} tasks exist). Linking with
+                  a narrower window will <strong>remove previously imported tasks</strong> outside it on
+                  the first sync.
+                </p>
+              ) : null}
+              <div className="flex gap-2">
+                <button type="button" disabled={pending} onClick={confirmLink} className="btn-prism justify-center">
+                  <Plus className="size-4" /> Link with{" "}
+                  {WINDOW_CHOICES.find((c) => c.days === windowDays)?.label.toLowerCase() ?? "window"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setEst(null)}
+                  className="rounded-lg border border-border-default px-3 py-1 text-xs text-ink-secondary"
+                >
+                  Cancel
+                </button>
+              </div>
+            </>
+          ) : null}
+        </div>
+      ) : null}
 
       {/* Scanned-but-unlinked suggestions */}
       {suggestions.length > 0 ? (
@@ -303,7 +503,7 @@ export function GithubReposPanel({ teamSlug, integration, scannedRepos }: Github
                 key={repo}
                 type="button"
                 disabled={pending}
-                onClick={() => act(() => addGithubRepo(teamSlug, repo))}
+                onClick={() => beginEstimate(repo)}
                 className="flex items-center gap-1.5 rounded-full border border-border-default px-3 py-1 text-xs text-ink-secondary hover:border-violet/40 hover:text-violet disabled:opacity-50"
               >
                 <Plus className="size-3" /> <span className="font-mono">{repo}</span>

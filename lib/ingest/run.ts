@@ -22,6 +22,7 @@ import { normalizeGithubRepo } from "./sources/github-normalize";
 import { fetchGithubRepoFiles } from "./sources/github-files";
 import { normalizeGithubFiles } from "./sources/github-files-normalize";
 import { ingestGithubApiScan } from "@/lib/codebases/github-api-scan";
+import { resolveRepoHistory } from "@/lib/integrations/github-link";
 
 /**
  * In-app ingestion runner — the TypeScript replacement for the Python sidecar's
@@ -580,6 +581,11 @@ export async function runGithubIngestion(opts: { teamId?: string } = {}): Promis
         const repos = (integ.config.repos as string[] | undefined) ?? [];
         const fileGlobs = integ.config.fileGlobs as string[] | undefined;
         for (const full of repos) {
+          // Per-repo history window chosen at link time (AIO-798). null = linked before windows
+          // existed (or outside the panel) = the pre-window behaviour. The stored sinceIso anchor is
+          // read back VERBATIM — recomputing it here would be the sliding window that diff-deletes
+          // imported issues as they age out (plan-review blocker; pinned by a guard).
+          const history = resolveRepoHistory(integ.config, full);
           const [owner, repo] = full.split("/", 2);
           if (!owner || !repo) {
             summary.errors.push(`integration "${integ.name}": repo "${full}" must be "owner/name"`);
@@ -588,7 +594,7 @@ export async function runGithubIngestion(opts: { teamId?: string } = {}): Promis
           summary.projects++;
           // Issues → tasks (one kind=task item, diff-synced).
           try {
-            const fetched = await fetchGithubRepoIssues({ owner, repo, token });
+            const fetched = await fetchGithubRepoIssues({ owner, repo, token, sinceIso: history?.sinceIso });
             const payload = normalizeGithubRepo(fetched);
             summary.items += payload.rows?.length ?? 0;
             const res = await ingestItem(db, auth, payload, "team");
@@ -625,7 +631,10 @@ export async function runGithubIngestion(opts: { teamId?: string } = {}): Promis
           // (no checkout). Auto-populates the per-person + commit-volume graphs on link. No-op for
           // a repo a real `aios-ingest scan` already owns (the scanner's rows are richer).
           try {
-            await ingestGithubApiScan(db, auth, { owner, repo, slug: repo, token: token ?? "" });
+            // windowDays: an explicit 0 empties the backfill while STILL upserting the codebase
+            // identity row (the destructuring default applies only to undefined) — "no history"
+            // must never mean "no contributor graphs ever". Absent entry → undefined → default 90d.
+            await ingestGithubApiScan(db, auth, { owner, repo, slug: repo, token: token ?? "", windowDays: history?.days });
           } catch (err) {
             summary.errors.push(`${full} contributions: ${err instanceof Error ? err.message : "sync failed"}`);
           }
