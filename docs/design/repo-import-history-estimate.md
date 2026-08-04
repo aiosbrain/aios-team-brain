@@ -81,7 +81,8 @@ file contents.
   header's `rel="last"` page number is the count (no `rel="last"` → the count is the returned page's
   length, not zero). Shown as "N commits → contributor graphs · no extraction cost".
 - **Unreachable repo (no PAT + private, or a fine-grained PAT not scoped to it):** the estimate
-  step surfaces the existing `RepoAccessState` vocabulary (`github-validate.checkGithubAccess`) —
+  step surfaces the existing `RepoAccessState` vocabulary (`github-validate.checkRepoAccess`, the
+  single-repo primitive — `checkGithubAccess` is the linked-repos server action) —
   a `no_access` badge, estimate marked unavailable, and the admin may still link (today's
   behaviour) with the copy "cost unknown until access works". Estimating token-free burns the
   shared-IP 60/hr unauthenticated limit, so the action prefers the stored PAT and says when it had
@@ -89,7 +90,7 @@ file contents.
 
 ### The price — reusing the cost dashboard's own reader
 
-`episodes × costPerEpisode`, from **`getGraphEfficiency(db, viewer, "30d")`**
+`episodes × costPerEpisode`, from **`getGraphEfficiency(db, teamId, "30d", viewer)`**
 (`lib/metrics/graph-efficiency.ts` — the calls-per-episode panel's module): its whole-window
 `costPerEpisode` is "what this install actually pays per episode", on its actual model, measured
 from `llm_usage` + `ingest_runs.meta.episodes`. `"30d"` because that is a real `Range`
@@ -115,8 +116,18 @@ pattern → `upsertIntegration`), **with the github config allowlist extended** 
 incidental one). `sinceIso` is resolved once at link (`now − days`, date precision) and never
 recomputed. `config.repos` stays `string[]` — every existing reader keeps working.
 
-- **No entry = today's behaviour** (issues: all, commits: 90d). This feature adds a choice at link
-  time; it must not silently contract what existing installs already import.
+- **No entry = today's behaviour** (issues: all, commits: 90d), and the schema keeps `repoHistory`
+  **`.optional()`, never defaulted** — an absent key stays absent, so legacy rows are byte-identical
+  and the existing `validateIntegrationConfig("github", {})` pin stays green. Post-ship the default
+  applies to exactly two populations: repos linked before the feature, and repos added by any path
+  that edits `config.repos` outside the panel. The linked-repos list shows each repo's window, with
+  legacy repos labelled "full history (linked before windows)" — the most expensive default in the
+  system must not be the one invisible in the UI.
+- **Re-linking a previously imported repo with a narrower window is destructive**, and the flow says
+  so: unlink never purged items/tasks (`github-link` edits config only), so a re-link's first
+  windowed fetch diff-deletes every previously imported task outside the window. The estimate step
+  warns with the count ("a 2-week window will remove N previously imported tasks") when the target
+  project already holds tasks.
 - Entries are pruned when a repo is unlinked, and capped (one entry per linked repo, repos already
   cap at 200). Date-precision `sinceIso` keeps the worst-case config comfortably under the 8KB
   config byte cap (`schemas.ts:657`); the cap failure, if ever hit, is `upsertIntegration`'s
@@ -126,9 +137,12 @@ recomputed. `config.repos` stays `string[]` — every existing reader keeps work
 
 In `lib/ingest/run.ts`'s github leg, per repo with an entry:
 
-- `fetchGithubRepoIssues({ …, sinceIso })` — new optional param → the API's `since=` (filters by
-  `updated_at`). Absent entry → today's unbounded fetch. Anchored, so the fetched set only grows —
-  no diff-delete, no churn re-projection.
+- `fetchGithubRepoIssues({ …, sinceIso })` — new optional param → the API's `since=` **alongside
+  the existing `state=all`** (closing an issue bumps `updated_at`, so closed-in-window issues import
+  only because both params are kept). Absent entry → today's unbounded fetch. Anchored, so the
+  fetched set only grows — no diff-delete, no churn re-projection. (An issue deleted/transferred on
+  GitHub's side still diff-deletes — that is the documented source-mirroring intent in
+  `github-normalize.ts:11-12`, identical to today's behaviour, and deliberately not floored.)
 - `ingestGithubApiScan({ …, windowDays: days })` — the param exists (`github-api-scan.ts:205`);
   today no caller passes it. **The scan call is never skipped** (plan-review position, adopted):
   it costs no LLM money and it upserts the repo's `codebases` identity row, which "contributor
