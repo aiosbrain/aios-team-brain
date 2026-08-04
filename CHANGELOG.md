@@ -4,9 +4,16 @@ All notable changes to AIOS Team Brain are documented here. Dates are ISO-8601.
 
 The Brain API sync contract (`docs/brain-api.md` in aios-workspace) is versioned
 separately. The current member-facing major remains **v1**, at additive document
-revision **v1.15**.
+revision **v1.17**.
 
 ## [Unreleased]
+
+### Added
+
+- **Code Maintenance Loop Phase 0 (AIO-610)** — Brain API 1.17 accepts the backward-compatible
+  codebase-health v2 snapshot with repository profile identity, explicit evidence completeness,
+  fail-closed automation admission, and a redacted normalized finding ledger. V1 snapshots remain
+  valid and Team Brain gains no repository-write authority.
 
 ## [0.10.0] — 2026-08-03
 

@@ -20,8 +20,10 @@
  *        `metrics.codebase_health` object (AIO-609; persisted verbatim, never recomputed).
  * 1.16 — documents the already-shipped GET /api/v1/attribution and GET /api/v1/timeline
  *        reads; contract alignment only, with no runtime or wire-shape change (AIO-718).
+ * 1.17 — accepts codebase_health v2 with epistemic state, repository capability profile,
+ *        fail-closed maintenance admission, and a redacted normalized finding ledger (AIO-610).
  */
-export const BRAIN_API_VERSION = "1.16";
+export const BRAIN_API_VERSION = "1.17";
 
 /** Server-only Executor gateway negotiation; independent of the member API surface. */
 export const GATEWAY_CONTRACT_VERSION = "1.10";

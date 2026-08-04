@@ -32,6 +32,8 @@ const PINNED = {
     "239905d2245db871181759ef70c2de4e72ac51fec9f3cbdd4bb92476ae30e168",
   "codebase-payload-1.15-fixtures.json":
     "ea328673822f30439b94448f5a5aeb02746f6bbc682fefbc32bc5b0bc22ca4b8",
+  "codebase-health-v2.schema.json":
+    "38de45de129c9ff3a346fb96346f905d79532b053e824a4ac85bb26a88b4371d",
 } as const;
 
 const fixtures = JSON.parse(
@@ -86,5 +88,50 @@ describe("brain-api 1.15 codebase-payload conformance", () => {
     expect(withoutHealth).toBeDefined();
     const parsed = codebaseScanPayloadSchema.parse(withoutHealth!.payload);
     expect(parsed.metrics.codebase_health).toBeUndefined();
+  });
+
+  it("accepts v2 epistemic state and rejects contradictory or incomplete claims", () => {
+    const withoutHealth = fixtures.valid.find((f) => f.name.startsWith("valid-without-health"));
+    expect(withoutHealth).toBeDefined();
+    const payload = structuredClone(withoutHealth!.payload) as {
+      metrics: { codebase_health?: Record<string, unknown> };
+    };
+    payload.metrics.codebase_health = {
+      schema_version: "2",
+      rubric_version: "1.1.0",
+      profile_id: "aios.team-brain",
+      profile_version: "1.0.0",
+      head_sha: "abc123def456abc123def456abc123def456abc1",
+      score_pct: 80,
+      status: "pass",
+      evidence_status: "partial",
+      quality_gate: "unknown",
+      automation_eligible: false,
+      dimensions: {
+        test_rigor: { passed: 0, total: 0, band: null, evidence_status: "missing" },
+      },
+      failed_invariant_ids: [],
+      measured_at: "2026-08-04T00:00:00Z",
+      findings: [
+        {
+          fingerprint: "a".repeat(64),
+          check_id: "coverage_lines_pct",
+          axis: "test_rigor",
+          kind: "evidence_gap",
+          severity: "high",
+          evidence_status: "missing",
+          remediation_tier: 0,
+        },
+      ],
+    };
+    expect(codebaseScanPayloadSchema.safeParse(payload).success).toBe(true);
+
+    const contradictory = structuredClone(payload);
+    contradictory.metrics.codebase_health!.automation_eligible = true;
+    expect(codebaseScanPayloadSchema.safeParse(contradictory).success).toBe(false);
+
+    const malformed = structuredClone(payload);
+    delete (malformed.metrics.codebase_health!.findings as Record<string, unknown>[])[0].fingerprint;
+    expect(codebaseScanPayloadSchema.safeParse(malformed).success).toBe(false);
   });
 });

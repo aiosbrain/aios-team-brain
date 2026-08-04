@@ -198,7 +198,7 @@ unversioned `/api/brain/*` + `/api/dashboard/*` surfaces; `GET /api/v1/timeline`
 and `GET /api/v1/tasks` still discards its computed `truncated` (both need a brain-api bump, so they are
 deliberately not in this change).
 
-This server **implements brain-api v1.16** (the shipped member-facing wire contract; source of truth:
+This server **implements brain-api v1.17** (the shipped member-facing wire contract; source of truth:
 `aios-workspace/docs/brain-api.md`; see the v1.14 by-key lookup on
 `GET /api/v1/tasks` below; v1.8 added the subscriptions endpoint,
 `POST /api/v1/subscriptions`; the optional `context_health` object on `POST /api/v1/metrics`,
@@ -208,6 +208,12 @@ field stayed producer-only, so catching up needed no version bump). That version
 `test/guards/contract-version.test.ts`, and mirrored by the vendored
 `test/fixtures/contract/brain-contract.json` (regenerated in lockstep with the canonical
 copy in `aios-workspace/docs/contract/`) — bump all of them together on a contract change.
+
+Brain API 1.17 keeps the original closed `codebase_health` v1 object valid and additionally
+accepts v2 maintenance snapshots. V2 persists repository capability-profile identity, explicit
+evidence completeness, fail-closed quality/automation admission, per-dimension evidence state,
+and redacted stable findings in the existing provenance-only `code_metrics.codebase_health`
+JSONB column. It does not grant Team Brain repository-write or remediation authority.
 
 Two principals, one tier model:
 
