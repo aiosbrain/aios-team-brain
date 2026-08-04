@@ -45,4 +45,18 @@ describe("dedupe predicate pinning", () => {
     expect(out.judgeable).toBe(false);
     expect(out.polluted).toBe(false);
   });
+
+  it("a zero-dupe RECENT window is equally predicate-suspect — a rename mid-incident is not a recovery", () => {
+    // A Graphiti bump that renames the relation zeroes the recent window IMMEDIATELY while the
+    // baseline still carries pre-rename dupes for up to 14 days. Judging that as healthy would mail
+    // "recovered" during an active incident, then go permanently silent once the baseline drains.
+    const out = deriveDedupePollution({
+      recentTotal: MIN_EDGES_FOR_DEDUPE_SIGNAL * 4,
+      recentDupe: 0,
+      baselineTotal: MIN_EDGES_FOR_DEDUPE_SIGNAL * 4,
+      baselineDupe: MIN_EDGES_FOR_DEDUPE_SIGNAL, // 25% — a normal healthy baseline
+    });
+    expect(out.judgeable).toBe(false);
+    expect(out.polluted).toBe(false);
+  });
 });

@@ -108,7 +108,8 @@ export function isGraphStale(lastProjectedAtMs: number | null, nowMs: number): b
  *   • not configured (no/malformed GRAPHITI_URL)             → "off"
  *   • configured BUT /healthcheck failed (down/unreachable)   → "degraded"
  *   • reachable BUT projector hasn't written in > GRAPH_STALE_MS (writes failing) → "degraded"
- *   • reachable + writing BUT the extractor makes no facts from projected episodes → "degraded"
+ *   • reachable + writing BUT extraction is failing — no facts from projected episodes, or facts
+ *     polluted by abnormal duplicate-entity rates (both arrive via `extractionStalled`) → "degraded"
  *   • reachable AND recently projected (or nothing to project yet) → "on"
  */
 export function deriveGraphState(input: {

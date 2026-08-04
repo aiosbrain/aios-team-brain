@@ -332,12 +332,13 @@ export function deriveDedupePollution(s: DedupeSignals): DedupePollution {
   if (recentShare === null || baselineShare === null) return out(false, false);
   if ((s.recentTotal ?? 0) < MIN_EDGES_FOR_DEDUPE_SIGNAL) return out(false, false);
   if ((s.baselineTotal ?? 0) < MIN_EDGES_FOR_DEDUPE_SIGNAL) return out(false, false);
-  // Predicate self-check: a healthy baseline on this graph is ~26–35% dupe edges — a LITERAL ZERO
-  // over ≥200 edges means the relation this probe greps for no longer exists as written (a Graphiti
-  // upgrade renaming `IS_DUPLICATE_OF` / moving it off `RELATES_TO`), not that extraction got
-  // perfect. Judging on it would let a rename silently disarm the alarm — or worse, mail "recovered"
-  // during an active incident. Unjudgeable, in both directions.
-  if (s.baselineDupe === 0) return out(false, false);
+  // Predicate self-check: a healthy share on this graph is ~26–35% dupe edges — a LITERAL ZERO over
+  // ≥200 edges (~0.7^200 naturally) means the relation this probe greps for no longer exists as
+  // written (a Graphiti upgrade renaming `IS_DUPLICATE_OF` / moving it off `RELATES_TO`), not that
+  // extraction got perfect. Both windows are checked: a zero BASELINE would let a rename silently
+  // disarm the alarm, and a zero RECENT window during an active incident would mail "recovered"
+  // mid-incident while the baseline still carried pre-rename dupes (review finding). Unjudgeable.
+  if (s.baselineDupe === 0 || s.recentDupe === 0) return out(false, false);
   if (recentShare < DEDUPE_ABSOLUTE_FLOOR) return out(false, true);
   if (recentShare < baselineShare * DEDUPE_MARGIN) return out(false, true);
   const pct = (n: number) => `${Math.round(n * 100)}%`;
