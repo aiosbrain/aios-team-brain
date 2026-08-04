@@ -604,7 +604,7 @@ export async function setExtractionModel(
 /**
  * Set the CHEAP model for the extraction calls Graphiti itself marks simple (admins only; audited).
  *
- * WHY A SECOND MODEL FIELD. `graphiti_core` asks for `ModelSize.small` on two of the five prompts on
+ * WHY A SECOND MODEL FIELD. `graphiti_core` asks for `ModelSize.small` on several of the prompts on
  * the add_episode path, and the proxy used to discard that and serve everything with the extraction
  * model. Those two — filling attributes onto entities `extract_nodes` already found, and choosing
  * among edges `extract_edges` already produced — were a majority of graph spend once `call_kind`
