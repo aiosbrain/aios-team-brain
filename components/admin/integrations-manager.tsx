@@ -602,51 +602,55 @@ export function IntegrationsManager({
           fallback={answering.extraction.usedFallback}
         />
 
-        {/* The cheap model for the two calls Graphiti itself marks simple. Deliberately a bare input
-            rather than a RolePicker: there is no provider to choose — it rides the extraction
-            backend's provider and key. */}
-        <div className="rounded-lg border border-line/60 p-3">
-          <div className="text-sm font-medium">Cheap model for simple graph calls (optional)</div>
-          <p className="mt-1 text-xs text-muted">
-            Graphiti asks for a cheaper model on two of its five calls — filling in entity attributes, and
-            picking between duplicate facts. Both only refine work the extraction model already did, so a
-            weak model here can’t reduce what the graph knows about. Measured on the Costs page, those two
-            calls are most of the graph bill. Runs on the extraction model’s provider and key; blank = use
-            the extraction model for everything, exactly as before. Requires an extraction model to be set.
+        {/* The cheap model for the calls Graphiti itself marks simple. Deliberately not a RolePicker:
+            there is no provider to choose — it rides the extraction backend's provider and key.
+            Markup mirrors RolePicker's tokens EXACTLY. The first version invented `text-muted`,
+            `bg-surface` and `border-line`, none of which is a token in `app/globals.css` (which
+            defines `--color-ink-secondary`, `--color-border-subtle`, …). Tailwind emits no rule for
+            an undefined token, so the help paragraph, both status lines and the card border rendered
+            INVISIBLE — title, blank gap, input, as a screenshot of the live page showed.
+            (The inert-state warning used `text-amber`, which IS a real token, so that one line would
+            have rendered. An earlier version of this comment claimed otherwise.) */}
+        <div className="flex flex-col gap-1.5 border-t border-border-subtle pt-3">
+          <p className="text-xs font-medium text-ink">Cheap model for simple graph calls (optional)</p>
+          <p className="text-xs text-ink-secondary">
+            Graphiti asks for a cheaper model on some of its calls — filling in entity attributes or
+            summaries, picking between duplicate facts, and dating them. Each only refines work the
+            extraction model already did, so a weak model here can’t reduce what the graph knows about.
+            Runs on the extraction model’s provider and key; blank = the extraction model serves every
+            call. Requires an extraction model above.
           </p>
-          <div className="mt-2 flex gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <input
-              className="min-w-0 flex-1 rounded-md border border-line bg-surface px-2 py-1 text-sm"
-              placeholder="e.g. mistralai/mistral-small-3.2-24b-instruct"
               value={extSmallModel}
               onChange={(e) => setExtSmallModel(e.target.value)}
+              placeholder="model id, e.g. mistralai/mistral-small-3.2-24b-instruct"
+              disabled={pending}
+              className="min-w-0 flex-1 rounded-md border border-ink/15 bg-transparent px-2.5 py-1.5 font-mono text-xs text-ink outline-none focus:border-ink/30 disabled:opacity-50"
             />
             <button
               type="button"
-              className="rounded-md border border-line px-3 py-1 text-sm disabled:opacity-50"
               onClick={saveExtractionSmall}
               disabled={pending}
+              className="btn-prism shrink-0 text-xs disabled:opacity-50"
             >
               Save
             </button>
           </div>
-          <p className="mt-1 text-xs">
-            {answering.extraction.smallEnabled ? (
-              <span className="text-muted">
-                In effect — serving the simple graph calls.
-              </span>
-            ) : answering.extraction.smallInert ? (
-              /* The whole reason this indicator exists: a cost setting that reverted unnoticed is a
-                 surprise bill. Same class as the extraction picker's fallback warning. */
-              <span className="text-amber">
-                Saved but NOT in effect — every call is still served by the extraction model. Set an
-                extraction model above, and make sure its provider is configured (a fallback switches
-                this off deliberately).
-              </span>
-            ) : (
-              <span className="text-muted">Not set — the extraction model serves every graph call.</span>
-            )}
-          </p>
+          {answering.extraction.smallEnabled ? (
+            <p className="text-xs text-ink-secondary">
+              Effective: <span className="font-medium text-violet">{answering.extraction.smallModel}</span>
+              <span className="ml-1">· serving the simple graph calls</span>
+            </p>
+          ) : answering.extraction.smallInert ? (
+            <p className="text-xs text-amber-700">
+              Saved but NOT in effect — every call is still served by the extraction model. Set an
+              extraction model above, and make sure its provider is configured (a fallback switches this
+              off deliberately).
+            </p>
+          ) : (
+            <p className="text-xs text-ink-secondary">Not set — the extraction model serves every graph call.</p>
+          )}
         </div>
       </div>
 
