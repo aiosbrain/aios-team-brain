@@ -33,8 +33,22 @@ describe("wantsSmallModel — two signals must agree (AC2)", () => {
     expect(wantsSmallModel(smallBody(RESOLVE_EDGE))).toBe(true);
   });
 
-  it("the two eligible kinds are exactly the two Graphiti marks ModelSize.small", () => {
-    expect([...SMALL_ELIGIBLE_KINDS].sort()).toEqual(["dedupe_edges", "node_attributes"]);
+  it("the eligible kinds are exactly the ones Graphiti marks ModelSize.small, across BOTH versions", () => {
+    // 0.13.2: node_attributes + dedupe_edges. 0.29.3 additionally marks the batched summary and the
+    // per-edge timestamp call. All four only refine work a strong model already did.
+    expect([...SMALL_ELIGIBLE_KINDS].sort()).toEqual([
+      "dedupe_edges",
+      "edge_timestamps",
+      "node_attributes",
+      "node_summaries_batch",
+    ]);
+  });
+
+  it("routes 0.29.3's batched summary and edge-timestamp calls small too", () => {
+    const batched = "You are a helpful assistant that generates concise entity summaries from provided context.";
+    const stamps = "You extract temporal bounds from facts. NEVER hallucinate dates.";
+    expect(wantsSmallModel(smallBody(batched))).toBe(true);
+    expect(wantsSmallModel(smallBody(stamps))).toBe(true);
   });
 
   it("REFUSES to route entity extraction small even when it carries the marker", () => {

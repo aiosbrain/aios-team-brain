@@ -36,6 +36,60 @@ const RUNTIME = {
 } as const;
 
 /**
+ * The same five calls in graphiti_core 0.29.3 (GRAPHCOST-8), plus the two it adds. The table spans
+ * both versions on purpose: the image upgrade is a separate deploy from this merge, so a
+ * version-specific table would misclassify 100% of calls in whichever order they happen.
+ * Verified against the 0.29.3 wheel, again from call sites.
+ */
+const RUNTIME_0293 = {
+  // node_operations.py:262 — reworded in 0.29.3
+  extract_nodes: "You are an entity extraction specialist for conversational messages. NEVER extract abstract concepts…",
+  // node_operations.py:553 — reworded
+  dedupe_nodes: "You are an entity deduplication assistant.",
+  // edge_operations.py:727 — reworded
+  dedupe_edges: "You are a fact deduplication assistant.",
+  // edge_operations.py:203 — byte-identical to 0.13.2, so it is covered by the shared row
+  extract_edges:
+    "You are an expert fact extractor that extracts fact triples from text. 1. Extracted fact triples should also be extracted with relevant date information.",
+} as const;
+
+/** NEW call kinds that exist only in 0.29.3. */
+const NEW_IN_0293 = {
+  // node_operations.py:970/973 — the BATCHED replacement for the per-entity fan-out (the fix itself)
+  node_summaries_batch: "You are a helpful assistant that generates concise entity summaries from provided context.",
+  // the episode-based variant of the same batched call
+  node_summaries_batch_episodes: "You maintain detailed, information-dense entity memories from episode text. Use ONLY facts…",
+  // edge_operations.py:680/813 — fires per NEW edge, only when the extractor left dates unset
+  edge_timestamps: "You extract temporal bounds from facts. NEVER hallucinate dates.",
+} as const;
+
+describe("classifyGraphCall — graphiti_core 0.29.3's prompts (GRAPHCOST-8)", () => {
+  for (const [label, system] of Object.entries(RUNTIME_0293)) {
+    it(`labels ${label} on 0.29.3's wording`, () => {
+      expect(classifyGraphCall(body(system))).toBe(label);
+    });
+  }
+
+  it("labels the batched summary call — the fix — DISTINCTLY from the fan-out it replaces", () => {
+    // Same label would hide whether the upgrade worked: the whole point is that node_attributes
+    // goes to ~0 while this appears. Conflating them would make the before/after read flat.
+    expect(classifyGraphCall(body(NEW_IN_0293.node_summaries_batch))).toBe("node_summaries_batch");
+    expect(classifyGraphCall(body(NEW_IN_0293.node_summaries_batch_episodes))).toBe("node_summaries_batch");
+    expect(classifyGraphCall(body(NEW_IN_0293.node_summaries_batch))).not.toBe("node_attributes");
+  });
+
+  it("labels the new per-edge timestamp call, whose share is model-dependent", () => {
+    expect(classifyGraphCall(body(NEW_IN_0293.edge_timestamps))).toBe("edge_timestamps");
+  });
+
+  it("both versions' prompts classify — the table is a UNION, so deploy order cannot break it", () => {
+    for (const sys of [...Object.values(RUNTIME), ...Object.values(RUNTIME_0293)]) {
+      expect(classifyGraphCall(body(sys))).not.toBe("unknown");
+    }
+  });
+});
+
+/**
  * Variants that exist in the same prompt FILES but are never called on this deployment's path.
  * Four of these were in the spec's first draft. They must classify `unknown` — this is the
  * assertion that reddens if someone adds a file-derived line back to the table.
@@ -68,9 +122,12 @@ describe("classifyGraphCall — the five prompts the deployed image actually cal
     });
   }
 
-  it("labels every runtime call, and every label is one the read knows about", () => {
-    const produced = Object.keys(RUNTIME);
-    expect(produced.sort()).toEqual([...GRAPH_CALL_KINDS].sort());
+  it("every 0.13.2 runtime label is one the read knows about", () => {
+    for (const label of Object.keys(RUNTIME)) expect(GRAPH_CALL_KINDS).toContain(label);
+  });
+
+  it("GRAPH_CALL_KINDS is deduped — several labels are carried by two versions' prefixes", () => {
+    expect(GRAPH_CALL_KINDS.length).toBe(new Set(GRAPH_CALL_KINDS).size);
   });
 
   it("survives the suffixes Graphiti appends to the system message", () => {

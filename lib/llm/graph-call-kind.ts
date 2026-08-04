@@ -49,10 +49,35 @@ const PROMPT_PREFIXES: readonly (readonly [kind: string, prefix: string])[] = [
   // this path runs today (the other is community operations), but the prefix cannot tell them apart,
   // and a label must not claim precision the evidence doesn't have.
   ["node_attributes", "You are a helpful assistant that extracts entity properties from the provided text."],
+
+  // ── graphiti_core 0.29.3 (GRAPHCOST-8) ─────────────────────────────────────────────────────────
+  //
+  // A UNION with the 0.13.2 rows above, deliberately. The upgrade is a separate deploy from this
+  // merge, and the table must be right in BOTH orders: ship these late and every post-upgrade call
+  // reads `unknown`; ship them without the old rows and every pre-upgrade call does. The prefixes
+  // are mutually exclusive, so carrying both costs nothing and removes the sequencing hazard.
+  // Drop the 0.13.2 rows only once no ledger row of interest predates the upgrade.
+  //
+  // Labels are kept STABLE across versions where the semantics match, so a before/after comparison
+  // of `getGraphSpendByCallKind` is a like-for-like read rather than a rename.
+  ["extract_nodes", "You are an entity extraction specialist for conversational messages."],
+  ["dedupe_nodes", "You are an entity deduplication assistant."],
+  ["dedupe_edges", "You are a fact deduplication assistant."],
+  // `extract_edges.edge` is byte-identical in 0.29.3 — already covered by the row above.
+
+  // NEW in 0.29.3: the batched replacement for the per-entity fan-out. Same label as the call it
+  // replaces would be WRONG — this one is the fix, and conflating them would hide whether it worked.
+  ["node_summaries_batch", "You are a helpful assistant that generates concise entity summaries from provided context."],
+  ["node_summaries_batch", "You maintain detailed, information-dense entity memories from episode text."],
+
+  // NEW in 0.29.3: fires once per genuinely NEW edge, and only when the extractor left the dates
+  // unset — so its share is model-dependent and worth watching rather than assuming.
+  ["edge_timestamps", "You extract temporal bounds from facts. NEVER hallucinate dates."],
 ] as const;
 
-/** Every label this classifier can emit, excluding `unknown`. The by-kind read renders these. */
-export const GRAPH_CALL_KINDS: readonly string[] = PROMPT_PREFIXES.map(([kind]) => kind);
+/** Every label this classifier can emit, excluding `unknown`. Deduped: several labels are carried by
+ *  more than one prefix, because the table spans two graphiti versions (see above). */
+export const GRAPH_CALL_KINDS: readonly string[] = [...new Set(PROMPT_PREFIXES.map(([kind]) => kind))];
 
 /**
  * `unknown` — classified, no match. Distinct from `''`, which means "recorded before this shipped".
@@ -117,14 +142,23 @@ export function classifyGraphCall(body: unknown): string {
 export const GRAPHITI_SMALL_MODEL_MARKER = "gpt-4.1-nano";
 
 /**
- * The only call kinds we will ever downgrade — the two Graphiti itself marks `ModelSize.small`.
+ * The only call kinds we will ever downgrade — the ones Graphiti itself marks `ModelSize.small`.
+ * Two on graphiti_core 0.13.2, four on 0.29.3 (the table above spans both).
  *
- * Both operate on work a STRONG model already did: `node_attributes` fills in attributes for
+ * Every one operates on work a STRONG model already did: `node_attributes` fills in attributes for
  * entities `extract_nodes` has already found, and `dedupe_edges.resolve_edge` chooses among edges
  * `extract_edges` already produced. Neither can reduce what the graph knows about, which is what
  * makes downgrading them a different risk class from swapping the extraction model itself.
  */
-export const SMALL_ELIGIBLE_KINDS: ReadonlySet<string> = new Set(["node_attributes", "dedupe_edges"]);
+export const SMALL_ELIGIBLE_KINDS: ReadonlySet<string> = new Set([
+  "node_attributes", // 0.13.2's per-entity fan-out
+  "dedupe_edges",
+  // 0.29.3 marks these `ModelSize.small` too. Both, like the two above, only refine work a strong
+  // model already did — batched summaries rewrite summaries of entities `extract_nodes` found, and
+  // timestamp extraction dates a fact `extract_edges` already produced.
+  "node_summaries_batch",
+  "edge_timestamps",
+]);
 
 /**
  * Should this call be served by the team's cheap model? TWO INDEPENDENT SIGNALS MUST AGREE.
