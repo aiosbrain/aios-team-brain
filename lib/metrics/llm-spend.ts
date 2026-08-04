@@ -262,6 +262,67 @@ export async function getSpendCallCount(
   return Number(rows[0]?.n ?? 0) || 0;
 }
 
+/** One Graphiti prompt's share of graph spend. `callKind` is `''` for pre-instrumentation rows. */
+export interface GraphCallKindSlice {
+  callKind: string;
+  costUsd: number;
+  inputTokens: number;
+  outputTokens: number;
+  calls: number;
+}
+
+/**
+ * Graph spend grouped by WHICH GRAPHITI PROMPT made the call (GRAPHCOST-5).
+ *
+ * The question this exists to answer: extraction is ~99% of the bill, and until now all of it was
+ * one number, so no lever could be sized. With this, "is the money in entity extraction, in the
+ * per-entity attribute fan-out, or in dedupe?" is one query — which is what decides whether a graph
+ * service upgrade or a model swap is the bigger win.
+ *
+ * NOT `getSpendSlices` with a fourth dimension, deliberately. That function folds
+ * `coalesce(nullif(col, ''), 'unknown')`, which is right for `model`/`provider` and destructive
+ * here: it would merge `''` (recorded before instrumentation shipped — history) into `'unknown'`
+ * (classified but unmatched — a DRIFT ALARM saying the deployed prompts have moved). Those two mean
+ * opposite things; one is inert, the other is the signal that this whole breakdown has gone stale.
+ * So the raw column is grouped as-is and callers render `''` as "pre-instrumentation".
+ *
+ * Scoped to `source = 'graph'`: no other source writes the column, and including them would put a
+ * large `''` bucket next to the real ones for no reason.
+ */
+export async function getGraphSpendByCallKind(
+  _db: unknown,
+  teamId: string,
+  days: number,
+  viewer: QueryLogViewer
+): Promise<GraphCallKindSlice[]> {
+  const scope = viewerPredicate(viewer, 3);
+  const { rows } = await runSql<{
+    call_kind: string;
+    cost_usd: string | number;
+    input_tokens: string | number;
+    output_tokens: string | number;
+    calls: string | number;
+  }>(
+    `select call_kind,
+            coalesce(sum(cost_usd), 0)      as cost_usd,
+            coalesce(sum(input_tokens), 0)  as input_tokens,
+            coalesce(sum(output_tokens), 0) as output_tokens,
+            count(*)                        as calls
+       from llm_usage
+      where team_id = $1 and created_at >= $2 and source = 'graph'${scope.sql}
+      group by call_kind
+      order by 2 desc`,
+    [teamId, windowStartIso(days), ...scope.params]
+  );
+  return rows.map((r) => ({
+    callKind: r.call_kind,
+    costUsd: Number(r.cost_usd) || 0,
+    inputTokens: Number(r.input_tokens) || 0,
+    outputTokens: Number(r.output_tokens) || 0,
+    calls: Number(r.calls) || 0,
+  }));
+}
+
 /**
  * Lifetime ledger total for ONE provider — the reconciliation figure.
  *
