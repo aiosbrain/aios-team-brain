@@ -1,0 +1,26 @@
+-- GRAPHCOST-5 (AIO-739) — which Graphiti prompt made this call.
+--
+-- Graph extraction is ~99% of the LLM bill and every call lands under one `source='graph'`, so the
+-- bill is a single undifferentiated number and no cost lever can be sized before pulling it. The
+-- request body already says which prompt it is; `lib/llm/graph-call-kind` classifies it and the
+-- proxy records it here.
+--
+-- Deliberately a NEW COLUMN rather than an encoding in `source` (e.g. 'graph:extract_nodes'): every
+-- aggregate keyed on `source = 'graph'` — the costs page, the arcs spend read, lib/metrics/llm-spend
+-- and its exact-aggregate guard — would break silently under that.
+--
+-- THREE-VALUED, and the distinction is load-bearing:
+--   ''         → recorded before this shipped (history). Never written after deploy.
+--   'unknown'  → classified, matched nothing. A RISING SHARE IS A DRIFT ALARM: it means the deployed
+--                Graphiti's prompts no longer match the table in lib/llm/graph-call-kind, which is
+--                exactly what a graph-service upgrade does.
+--   <label>    → one of the five prompts on the deployed image's add_episode path.
+-- Nothing in the read path may coalesce '' into 'unknown' (getSpendSlices does exactly that for
+-- other dimensions, correctly for those, fatally here).
+alter table llm_usage add column if not exists call_kind text not null default '';
+
+-- NO INDEX, deliberately. The by-kind read groups on this column but never FILTERS on it — `''`
+-- (pre-instrumentation history) is a required output group, so a partial `where call_kind <> ''`
+-- index can never be used by it, and Postgres only uses a partial index when the query predicate
+-- implies the index predicate. `llm_usage_team_time_idx (team_id, created_at desc)` already serves
+-- the window scan. An unused index here would be pure maintenance cost on ~17k inserts a day.

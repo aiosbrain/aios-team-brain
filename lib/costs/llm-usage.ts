@@ -55,6 +55,15 @@ export interface LlmUsageRecord {
   costUsd: number;
   /** true = price-table estimate (Anthropic); false = provider-metered (OpenRouter `usage.cost`). */
   estimated: boolean;
+  /**
+   * Which Graphiti prompt made this call (`source='graph'` only) — see `lib/llm/graph-call-kind`.
+   * Omitted everywhere else, which stores `''`.
+   *
+   * `''` means "not instrumented" and is indistinguishable from pre-deploy history, so the graph
+   * proxy passes this REQUIRED rather than optional: a graph call site that forgets it would
+   * silently file live spend as history, and the drift alarm (`unknown`) would never fire.
+   */
+  callKind?: string;
 }
 
 /**
@@ -75,6 +84,7 @@ export async function recordLlmUsage(db: DbClient, rec: LlmUsageRecord): Promise
       // Match the numeric(12,5) column scale; never persist a negative or NaN.
       cost_usd: Math.round(safeNum(rec.costUsd) * 100000) / 100000,
       estimated: rec.estimated,
+      call_kind: rec.callKind ?? "",
     });
     if (error) console.error("[llm_usage] insert failed:", error.message);
   } catch (err) {
