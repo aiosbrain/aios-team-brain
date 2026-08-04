@@ -54,16 +54,22 @@ export function RetrievalHealthCard({ health }: { health: RetrievalHealth }) {
     health.graphEpisodes != null
       ? `${health.graphEpisodes} episodes${health.graphLastProjectedAt ? ` · last projected ${timeAgo(health.graphLastProjectedAt)}` : " · none projected yet"}`
       : undefined;
+  // Extraction failing the OTHER way (AIO-693): episodes become facts, but the duplicate-entity rate
+  // is over this graph's own baseline — the extractor is resolving identity badly. A stall outranks
+  // it in the copy below, same priority as the server's reason string: no facts is worse than bad facts.
+  const graphDedupePolluted = health.graphDedupePolluted;
   const graphDetail =
     health.graph === "off"
       ? "not configured"
       : graphExtractionStalled
         ? `accepting episodes but extracting 0 facts — ${graphFreshness}`
-        : graphStalled
-          ? `projector stalled — ${graphFreshness}`
-          : health.graph === "degraded"
-            ? "configured but unreachable"
-            : graphFreshness;
+        : graphDedupePolluted
+          ? `extracting duplicate entities at an abnormal rate — ${graphFreshness}`
+          : graphStalled
+            ? `projector stalled — ${graphFreshness}`
+            : health.graph === "degraded"
+              ? "configured but unreachable"
+              : graphFreshness;
   // A configured-but-unreachable OR stalled-projector graph is a real failure — flag it loudly (red),
   // like a degraded semantic leg.
   const graphDegraded = health.graph === "degraded";
@@ -129,6 +135,15 @@ export function RetrievalHealthCard({ health }: { health: RetrievalHealth }) {
               output-token cap (<code>Output length exceeded max tokens</code>). New activity isn&apos;t
               becoming graph facts, so narrative arcs can&apos;t update. Check the Graphiti service logs.
               Keyword and semantic search are unaffected.
+            </>
+          ) : graphDedupePolluted ? (
+            <>
+              The graph&apos;s extraction model is <strong>producing duplicate entities at an abnormal
+              rate</strong> — it resolves entity identity badly, so the same person or thing accumulates
+              as separate nodes with split facts, and retrieval quietly degrades. This is the failure no
+              save-time model check can see. Check the <strong>Extraction model</strong> in
+              Admin&nbsp;→&nbsp;Integrations and consider reverting a recent change; admins were emailed
+              when this tripped.
             </>
           ) : graphStalled ? (
             <>

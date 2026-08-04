@@ -1,7 +1,12 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { sendOpsAlert, mailerConfigured } from "@/lib/auth/mailer";
-import { dedupeSignals, deriveDedupePollution, type DedupePollution } from "@/lib/graph/extraction-health";
+import {
+  dedupeSignals,
+  deriveDedupePollution,
+  GRAPH_HEALTH_SOURCE,
+  type DedupePollution,
+} from "@/lib/graph/extraction-health";
 import { recordIngestRun } from "@/lib/ingest/runs";
 
 /**
@@ -26,22 +31,22 @@ import { recordIngestRun } from "@/lib/ingest/runs";
  * recovery mail too.
  */
 
-/** The run-ledger source this alarm records its transitions under. */
-export const GRAPH_HEALTH_SOURCE = "graph_health";
+export { GRAPH_HEALTH_SOURCE };
 
 export type DedupeAlertAction = "alert" | "recover" | "none";
 
 /**
  * The edge detector, pure: prior state (was the last recorded transition a failure?) + this tick's
- * verdict → what to do. `judgeable` is false when the pollution verdict came from an unreadable or
- * too-small sample — those ticks are a no-op in BOTH directions.
+ * verdict → what to do. Keyed on the detector's OWN `judgeable` verdict, never re-derived from the
+ * shares: a below-minimum sample carries non-null shares but no verdict, and treating it as judged
+ * would turn one quiet Saturday during a sustained incident into a false "recovered" mail (review
+ * finding on the first cut of this file). Unjudgeable ticks are a no-op in BOTH directions.
  */
 export function decideDedupeAlert(
   priorPolluted: boolean,
-  pollution: Pick<DedupePollution, "polluted" | "recentShare" | "baselineShare">
+  pollution: Pick<DedupePollution, "polluted" | "judgeable">
 ): DedupeAlertAction {
-  const judgeable = pollution.recentShare !== null && pollution.baselineShare !== null;
-  if (!judgeable) return "none";
+  if (!pollution.judgeable) return "none";
   if (pollution.polluted && !priorPolluted) return "alert";
   if (!pollution.polluted && priorPolluted) return "recover";
   return "none";

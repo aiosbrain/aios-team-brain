@@ -11,10 +11,11 @@ import { decideDedupeAlert } from "@/lib/graph/extraction-alert";
  * space, so flipping any comparison in `decideDedupeAlert` reddens at least one.
  */
 
-const judged = (polluted: boolean) => ({ polluted, recentShare: 0.5, baselineShare: 0.3 });
-// The detector can only emit `polluted: false` for an unjudgeable sample (its own contract), so the
-// unjudgeable rows below never pair `polluted: true` with null shares.
-const unjudgeable = { polluted: false, recentShare: null, baselineShare: null };
+const judged = (polluted: boolean) => ({ polluted, judgeable: true });
+// A refusal always reads `polluted: false, judgeable: false` — the detector's contract. Note a
+// refused tick can still CARRY shares (a below-minimum sample computes them); `judgeable` is the
+// only field that says whether they mean anything, which is why the machine keys on it alone.
+const unjudgeable = { polluted: false, judgeable: false };
 
 describe("decideDedupeAlert", () => {
   it("fires exactly on the ok→polluted edge", () => {
@@ -41,7 +42,9 @@ describe("decideDedupeAlert", () => {
     expect(decideDedupeAlert(true, unjudgeable)).toBe("none");
   });
 
-  it("a partially readable sample (one window null) is unjudgeable, not half-judged", () => {
-    expect(decideDedupeAlert(true, { polluted: false, recentShare: 0.2, baselineShare: null })).toBe("none");
+  it("a below-minimum sample during an active alarm is not a recovery — quiet Saturday, still polluted", () => {
+    // The first cut re-derived judgeability from shares-non-null; a small sample carries shares, so
+    // one quiet day inside a sustained incident sent a false "recovered" mail (review finding).
+    expect(decideDedupeAlert(true, { polluted: false, judgeable: false })).toBe("none");
   });
 });

@@ -50,17 +50,21 @@ describe("deriveDedupePollution — the real incident", () => {
 });
 
 describe("deriveDedupePollution — refuses to judge what it cannot", () => {
-  it("unknown (Neo4j unreadable) is NOT degraded", () => {
-    expect(
-      deriveDedupePollution({ recentDupe: null, recentTotal: null, baselineDupe: null, baselineTotal: null })
-        .polluted
-    ).toBe(false);
+  it("unknown (Neo4j unreadable) is NOT degraded — and says so via `judgeable`", () => {
+    const out = deriveDedupePollution({ recentDupe: null, recentTotal: null, baselineDupe: null, baselineTotal: null });
+    expect(out.polluted).toBe(false);
+    expect(out.judgeable, "a refusal must be distinguishable from a judged 'healthy'").toBe(false);
   });
 
   it("a sample below the floor cannot carry a verdict", () => {
     // 100% recent duplicates — but over 3 edges. A fresh install, not a regression.
     const tiny = deriveDedupePollution(sig(3, 3, 100, 1000));
     expect(tiny.polluted).toBe(false);
+    // The refusal is explicit: shares are computed (they exist for display) but carry no verdict.
+    // The alarm's edge machine keys on THIS — a quiet day during a sustained incident must not
+    // read as a judged recovery (review finding on the delivery half).
+    expect(tiny.judgeable).toBe(false);
+    expect(tiny.recentShare).not.toBeNull();
     // …and the same ratio over a real sample DOES flag, so the floor is what's doing the work.
     expect(deriveDedupePollution(sig(MIN_EDGES_FOR_DEDUPE_SIGNAL, MIN_EDGES_FOR_DEDUPE_SIGNAL, 100, 1000)).polluted).toBe(true);
   });
@@ -83,10 +87,12 @@ describe("deriveDedupePollution — both conditions are load-bearing", () => {
     expect(out.polluted, "a relative margin alone fires on noise").toBe(false);
   });
 
-  it("a high share that is NOT a rise does not fire", () => {
+  it("a high share that is NOT a rise does not fire — but IS a judged verdict", () => {
     const out = deriveDedupePollution(sig(500, 1000, 480, 1000));
     expect(out.recentShare!).toBeGreaterThan(DEDUPE_ABSOLUTE_FLOOR);
     expect(out.polluted, "high-but-flat is the model's nature, not a regression").toBe(false);
+    // Judged-healthy, not refused: this CAN clear an active alarm, where a refusal cannot.
+    expect(out.judgeable).toBe(true);
   });
 
   it("needs BOTH: above the floor AND above the baseline by the margin", () => {

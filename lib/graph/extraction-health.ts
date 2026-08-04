@@ -255,6 +255,13 @@ export async function getGraphExtractionHealth(teamId: string): Promise<GraphExt
  * regression it doesn't have.
  * ──────────────────────────────────────────────────────────────────────────────────────────────── */
 
+/**
+ * The `ingest_runs.source` under which the alarm's delivery half (`lib/graph/extraction-alert`)
+ * records its transitions. Defined HERE, not there, so `lib/ingest/pipeline-health` can exclude the
+ * ledger from its legs without importing the mailer into every dashboard render.
+ */
+export const GRAPH_HEALTH_SOURCE = "graph_health";
+
 /** Recent window whose dedupe share is judged. */
 export const DEDUPE_RECENT_MS = 24 * 3_600_000;
 /** Trailing window it is judged AGAINST — long enough that one bad day can't move the baseline it is
@@ -287,6 +294,15 @@ export interface DedupeSignals {
 
 export interface DedupePollution {
   polluted: boolean;
+  /**
+   * Could the detector actually JUDGE this tick, or did it refuse (Neo4j unreadable, either window
+   * under the minimum sample, or a predicate-suspect zero-dupe baseline)? Consumers that act on
+   * transitions — the alarm's edge state machine — MUST key on this and not on `polluted`, because a
+   * refusal also reads `polluted: false`: during a sustained incident, one quiet Saturday whose
+   * recent window is 80 edges would otherwise look like a judged recovery and send a "recovered"
+   * mail while the graph is still at 70% duplicates.
+   */
+  judgeable: boolean;
   recentShare: number | null;
   baselineShare: number | null;
   reason: string | null;
@@ -305,20 +321,28 @@ const share = (dupe: number | null, total: number | null): number | null =>
 export function deriveDedupePollution(s: DedupeSignals): DedupePollution {
   const recentShare = share(s.recentDupe, s.recentTotal);
   const baselineShare = share(s.baselineDupe, s.baselineTotal);
-  const out = (polluted: boolean, reason: string | null = null): DedupePollution => ({
+  const out = (polluted: boolean, judgeable: boolean, reason: string | null = null): DedupePollution => ({
     polluted,
+    judgeable,
     recentShare,
     baselineShare,
     reason,
   });
   // Unreadable graph, too small a sample, or no baseline to compare against: all "can't tell".
-  if (recentShare === null || baselineShare === null) return out(false);
-  if ((s.recentTotal ?? 0) < MIN_EDGES_FOR_DEDUPE_SIGNAL) return out(false);
-  if ((s.baselineTotal ?? 0) < MIN_EDGES_FOR_DEDUPE_SIGNAL) return out(false);
-  if (recentShare < DEDUPE_ABSOLUTE_FLOOR) return out(false);
-  if (recentShare < baselineShare * DEDUPE_MARGIN) return out(false);
+  if (recentShare === null || baselineShare === null) return out(false, false);
+  if ((s.recentTotal ?? 0) < MIN_EDGES_FOR_DEDUPE_SIGNAL) return out(false, false);
+  if ((s.baselineTotal ?? 0) < MIN_EDGES_FOR_DEDUPE_SIGNAL) return out(false, false);
+  // Predicate self-check: a healthy baseline on this graph is ~26–35% dupe edges — a LITERAL ZERO
+  // over ≥200 edges means the relation this probe greps for no longer exists as written (a Graphiti
+  // upgrade renaming `IS_DUPLICATE_OF` / moving it off `RELATES_TO`), not that extraction got
+  // perfect. Judging on it would let a rename silently disarm the alarm — or worse, mail "recovered"
+  // during an active incident. Unjudgeable, in both directions.
+  if (s.baselineDupe === 0) return out(false, false);
+  if (recentShare < DEDUPE_ABSOLUTE_FLOOR) return out(false, true);
+  if (recentShare < baselineShare * DEDUPE_MARGIN) return out(false, true);
   const pct = (n: number) => `${Math.round(n * 100)}%`;
   return out(
+    true,
     true,
     `Extraction is producing duplicate entities: ${pct(recentShare)} of the last 24h of graph edges ` +
       `are duplicate-of records, against ${pct(baselineShare)} for this graph's own baseline. That is ` +
