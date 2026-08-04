@@ -13,6 +13,7 @@ import { ContributorTable } from "@/components/codebases/contributor-table";
 import { IssuesList } from "@/components/codebases/issues-list";
 import { AgenticTrend } from "@/components/charts/agentic-trend";
 import { ContributionsTrend } from "@/components/charts/contributions-trend";
+import { DebtPatrol } from "@/components/codebases/debt-patrol";
 
 export const metadata: Metadata = { title: "Codebase" };
 
@@ -128,6 +129,16 @@ export default async function CodebaseDetailPage({
           <AgenticScoreCard b={cb.breakdown} />
         )
       ) : null}
+
+      <DebtPatrol
+        patrol={cb.debtPatrol}
+        findings={cb.findings}
+        decisionOwners={cb.decisionOwners}
+        teamSlug={teamSlug}
+        codebaseSlug={cb.slug}
+        currentMemberId={me.id}
+        canDecide={me.tier === "team" && (me.role === "admin" || me.role === "lead")}
+      />
 
       <ContributionsTrend data={cb.commitVolume} />
 

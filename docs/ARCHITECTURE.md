@@ -626,7 +626,34 @@ erDiagram
   actions ||--o| approval_requests : may_link
   teams ||--o{ audit_log : records
   teams ||--o{ query_log : meters
+  teams ||--o{ codebases : scans
+  codebases ||--o{ codebase_findings : projects_current_state
+  codebase_findings ||--o{ codebase_finding_events : retains_history
 ```
+
+### Durable-debt patrol
+
+`code_metrics.codebase_health` remains the authoritative, versioned scanner snapshot.
+`reconcile_codebase_findings` projects admitted v2 findings into team/codebase/fingerprint-scoped
+current state plus append-only `codebase_finding_events`; it does not persist source paths,
+symbols, diagnostic prose, or source text. `lib/metrics/codebases.getCodebaseDetail` is the only
+read path and builds the report-only patrol with `lib/codebases/debt-ranking`.
+
+Ranking method v1 is deterministic. Principal (severity plus explicitly unknown reachability) is
+reported separately from interest (recurrence, age, repository change pressure, and explicitly
+unknown agent friction). Evidence confidence and remediation affordability are disclosed as
+separate factors. The score normalizes over known factor weight and always publishes admission
+coverage; unknown reachability, friction, or review cost is never converted to a measured zero.
+North Star rollups are labelled `proxy` or `unknown`. The independently verified efficacy/cost
+report stays in the engineering harness and is not redefined by this dashboard.
+
+Active team leads/admins may call `decide_codebase_finding` through the codebase server action.
+The database re-checks actor role, tenant/codebase/finding identity, active same-team ownership,
+reason length, and a bounded future expiry before atomically updating current status and appending
+an operator event. `accepted`, `risk_accepted`, and `false_positive` decisions require reason,
+owner, actor, and expiry. An expired decision re-enters the report through an effective
+`open`/`reopened` status while the stored decision and history remain intact. The action also emits
+a best-effort `audit_log` entry; the finding event is the atomic audit record.
 
 ## Module map
 

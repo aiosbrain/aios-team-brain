@@ -1501,15 +1501,41 @@ create table if not exists codebase_findings (
   first_seen_at timestamptz not null,
   last_seen_at timestamptz not null,
   resolved_at timestamptz,
+  decision_reason text,
+  decision_owner_member_id uuid references members(id) on delete set null,
+  decision_by_member_id uuid references members(id) on delete set null,
+  decision_at timestamptz,
+  decision_expires_at timestamptz,
   latest_metrics_id uuid references code_metrics(id) on delete set null,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
+  constraint codebase_findings_decision_metadata check (
+    (
+      status = any (array['accepted', 'risk_accepted', 'false_positive']::text[])
+      and decision_reason is not null
+      and char_length(decision_reason) between 10 and 500
+      and decision_at is not null
+      and decision_expires_at > decision_at
+    )
+    or
+    (
+      status <> all (array['accepted', 'risk_accepted', 'false_positive']::text[])
+      and decision_reason is null
+      and decision_owner_member_id is null
+      and decision_by_member_id is null
+      and decision_at is null
+      and decision_expires_at is null
+    )
+  ),
   unique (team_id, codebase_id, fingerprint)
 );
 alter table codebase_findings
   add column if not exists occurrence_count integer not null default 1;
 create index if not exists codebase_findings_active_idx
   on codebase_findings (team_id, codebase_id, status, last_seen_at desc);
+create index if not exists codebase_findings_decision_expiry_idx
+  on codebase_findings (team_id, codebase_id, decision_expires_at)
+  where status in ('accepted', 'risk_accepted', 'false_positive');
 
 -- Append-only lifecycle/observation history. Replaying one metrics point is idempotent.
 create table if not exists codebase_finding_events (
@@ -1517,7 +1543,9 @@ create table if not exists codebase_finding_events (
   team_id uuid not null references teams(id) on delete cascade,
   codebase_id uuid not null references codebases(id) on delete cascade,
   finding_id uuid not null references codebase_findings(id) on delete cascade,
-  metrics_id uuid not null references code_metrics(id) on delete cascade,
+  -- Scan lifecycle events carry metrics_id. Operator decisions are durable audit
+  -- events with metrics_id null so repeated decisions never collide with ingest idempotency.
+  metrics_id uuid references code_metrics(id) on delete cascade,
   event_type text not null check (event_type in (
     'detected', 'observed', 'resolved', 'reopened', 'stale_analysis',
     'accepted', 'risk_accepted', 'false_positive', 'expired', 'superseded'
@@ -1745,7 +1773,13 @@ begin
       from codebase_findings f
       where f.team_id = p_team_id
         and f.codebase_id = p_codebase_id
-        and f.status in ('open', 'reopened')
+        and (
+          f.status in ('open', 'reopened')
+          or (
+            f.status in ('accepted', 'risk_accepted', 'false_positive')
+            and f.decision_at <= v_observed_at
+          )
+        )
         and f.last_seen_at <= v_observed_at
         and not exists (
           select 1
@@ -1757,6 +1791,11 @@ begin
       update codebase_findings
       set status = 'resolved',
           resolved_at = v_observed_at,
+          decision_reason = null,
+          decision_owner_member_id = null,
+          decision_by_member_id = null,
+          decision_at = null,
+          decision_expires_at = null,
           latest_metrics_id = p_metrics_id,
           updated_at = now()
       where id = v_row.id and team_id = p_team_id;
@@ -1786,6 +1825,97 @@ begin
     'reopened', v_reopened,
     'stale', v_stale
   );
+end;
+$$;
+
+create or replace function decide_codebase_finding(
+  p_team_id uuid,
+  p_codebase_id uuid,
+  p_finding_id uuid,
+  p_actor_member_id uuid,
+  p_owner_member_id uuid,
+  p_decision_status text,
+  p_reason text,
+  p_expires_at timestamptz
+) returns jsonb
+language plpgsql
+as $$
+declare
+  v_now timestamptz := now();
+  v_reason text := btrim(coalesce(p_reason, ''));
+  v_finding codebase_findings%rowtype;
+begin
+  if p_decision_status not in ('accepted', 'risk_accepted', 'false_positive') then
+    raise exception 'invalid finding decision status';
+  end if;
+  if char_length(v_reason) not between 10 and 500 then
+    raise exception 'finding decision reason must be between 10 and 500 characters';
+  end if;
+  if p_expires_at <= v_now or p_expires_at > v_now + interval '366 days' then
+    raise exception 'finding decision expiry must be in the next 366 days';
+  end if;
+  if not exists (
+    select 1 from members
+    where id = p_actor_member_id
+      and team_id = p_team_id
+      and status = 'active'
+      and tier = 'team'
+      and role in ('admin', 'lead')
+  ) then
+    raise exception 'finding decisions require an active team lead or admin';
+  end if;
+  if not exists (
+    select 1 from members
+    where id = p_owner_member_id
+      and team_id = p_team_id
+      and status = 'active'
+      and tier = 'team'
+  ) then
+    raise exception 'finding decision owner must be an active team member';
+  end if;
+
+  select * into v_finding
+  from codebase_findings
+  where id = p_finding_id
+    and team_id = p_team_id
+    and codebase_id = p_codebase_id
+  for update;
+  if not found then
+    raise exception 'finding not found';
+  end if;
+  if v_finding.status not in (
+    'open', 'reopened', 'accepted', 'risk_accepted', 'false_positive'
+  ) then
+    raise exception 'finding status cannot receive an operator decision';
+  end if;
+
+  update codebase_findings
+  set status = p_decision_status,
+      decision_reason = v_reason,
+      decision_owner_member_id = p_owner_member_id,
+      decision_by_member_id = p_actor_member_id,
+      decision_at = v_now,
+      decision_expires_at = p_expires_at,
+      updated_at = v_now
+  where id = p_finding_id
+    and team_id = p_team_id
+    and codebase_id = p_codebase_id;
+
+  insert into codebase_finding_events (
+    team_id, codebase_id, finding_id, metrics_id, event_type,
+    from_status, to_status, head_sha, observed_at, details
+  ) values (
+    p_team_id, p_codebase_id, p_finding_id, null, p_decision_status,
+    v_finding.status, p_decision_status, v_finding.last_seen_sha, v_now,
+    jsonb_build_object(
+      'reason', v_reason,
+      'owner_member_id', p_owner_member_id,
+      'actor_member_id', p_actor_member_id,
+      'expires_at', p_expires_at
+    )
+  );
+
+  return jsonb_build_object('finding_id', p_finding_id, 'status', p_decision_status);
 end;
 $$;
 create index if not exists code_metrics_codebase_time_idx on code_metrics (codebase_id, scanned_at desc);

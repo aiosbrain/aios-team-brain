@@ -6,6 +6,7 @@ import { rangeDays, type Range } from "./range";
 import { canSeeCodebases, type ViewerTier } from "@/lib/codebases/visibility";
 import { num, numOrNull, round } from "@/lib/num";
 import type { FindingStatus } from "@/lib/codebases/finding-ledger";
+import { buildDebtPatrol, type DebtPatrol } from "@/lib/codebases/debt-ranking";
 
 /**
  * The ONLY read path for codebase analytics tables — pages must go through here,
@@ -375,7 +376,19 @@ export interface CodebaseFinding {
   last_seen_at: string;
   resolved_at: string | null;
   occurrence_count: number;
+  decision_reason: string | null;
+  decision_owner_member_id: string | null;
+  decision_owner_name: string | null;
+  decision_by_member_id: string | null;
+  decision_by_member_name: string | null;
+  decision_at: string | null;
+  decision_expires_at: string | null;
   events: CodebaseFindingEvent[];
+}
+
+export interface FindingDecisionOwner {
+  id: string;
+  display_name: string;
 }
 
 export interface CodebaseDetail {
@@ -399,6 +412,24 @@ export interface CodebaseDetail {
   contributors: ContributorRow[];
   issues: IssueRow[];
   findings: CodebaseFinding[];
+  decisionOwners: FindingDecisionOwner[];
+  debtPatrol: DebtPatrol;
+}
+
+export async function getCodebaseIdentity(
+  db: DbClient,
+  teamId: string,
+  slug: string,
+  tier: ViewerTier
+): Promise<{ id: string } | null> {
+  if (!canSeeCodebases(tier)) return null;
+  const { data } = await db
+    .from("codebases")
+    .select("id")
+    .eq("team_id", teamId)
+    .eq("slug", slug)
+    .maybeSingle();
+  return data ? { id: (data as { id: string }).id } : null;
 }
 
 export async function getCodebaseDetail(
@@ -424,7 +455,7 @@ export async function getCodebaseDetail(
   const windowStart = new Date(Date.now() - rangeDays(range) * 86_400_000).toISOString();
 
   const METRIC_COLS =
-    "scanned_at, agentic_score, health_score, ai_commit_ratio, test_coverage_score, " +
+    "scanned_at, window_days, commits_window, agentic_score, health_score, ai_commit_ratio, test_coverage_score, " +
     "scaffolding_score, skill_breadth_score, cadence_score, issue_health, has_claude_md, " +
     "has_agents_md, agents_md_count, skills_count, commands_count, test_coverage_pct, " +
     "test_coverage_functions_pct, test_coverage_branches_pct, recent_commits, " +
@@ -460,13 +491,16 @@ export async function getCodebaseDetail(
       .eq("codebase_id", codebaseId)
       .order("updated_at", { ascending: false })
       .limit(200),
-    db.from("members").select("id, display_name, github_login, avatar_url").eq("team_id", teamId),
+    db
+      .from("members")
+      .select("id, display_name, github_login, avatar_url, tier, status")
+      .eq("team_id", teamId),
     // Uploaded avatars live on member_profiles (1:1, separate table) — sibling query, merged in JS.
     db.from("member_profiles").select("member_id, avatar_data_url").eq("team_id", teamId),
     db
       .from("codebase_findings")
       .select(
-        "id, fingerprint, status, check_id, axis, kind, severity, evidence_status, remediation_tier, occurrence_count, first_seen_sha, last_seen_sha, first_seen_at, last_seen_at, resolved_at"
+        "id, fingerprint, status, check_id, axis, kind, severity, evidence_status, remediation_tier, occurrence_count, first_seen_sha, last_seen_sha, first_seen_at, last_seen_at, resolved_at, decision_reason, decision_owner_member_id, decision_by_member_id, decision_at, decision_expires_at"
       )
       .eq("team_id", teamId)
       .eq("codebase_id", codebaseId)
@@ -494,6 +528,15 @@ export async function getCodebaseDetail(
   for (const m of (membersRes.data ?? []) as ({ id: string } & MemberMeta)[]) {
     members.set(m.id, { display_name: m.display_name, github_login: m.github_login, avatar_url: m.avatar_url });
   }
+  const decisionOwners = ((membersRes.data ?? []) as Array<
+    { id: string; tier: string; status: string } & MemberMeta
+  >)
+    .filter((member) => member.tier === "team" && member.status === "active")
+    .map((member) => ({
+      id: member.id,
+      display_name: member.display_name ?? member.github_login ?? "Unnamed member",
+    }))
+    .sort((a, b) => a.display_name.localeCompare(b.display_name));
 
   // newest-first from the query. `latest` is the true last scan (unwindowed) so the breakdown
   // never blanks; the trend is windowed with a fallback to the most recent points.
@@ -631,10 +674,22 @@ export async function getCodebaseDetail(
     findingEventsById.set(row.finding_id, events);
   }
 
-  type FindingRow = Omit<CodebaseFinding, "first_seen_at" | "last_seen_at" | "resolved_at" | "events"> & {
+  type FindingRow = Omit<
+    CodebaseFinding,
+    | "first_seen_at"
+    | "last_seen_at"
+    | "resolved_at"
+    | "decision_at"
+    | "decision_expires_at"
+    | "decision_owner_name"
+    | "decision_by_member_name"
+    | "events"
+  > & {
     first_seen_at: string | Date;
     last_seen_at: string | Date;
     resolved_at: string | Date | null;
+    decision_at: string | Date | null;
+    decision_expires_at: string | Date | null;
   };
   const findings: CodebaseFinding[] = ((findingsRes.data ?? []) as FindingRow[]).map((row) => {
     const events = findingEventsById.get(row.id) ?? [];
@@ -645,8 +700,26 @@ export async function getCodebaseDetail(
       first_seen_at: new Date(row.first_seen_at).toISOString(),
       last_seen_at: new Date(row.last_seen_at).toISOString(),
       resolved_at: row.resolved_at == null ? null : new Date(row.resolved_at).toISOString(),
+      decision_owner_name:
+        row.decision_owner_member_id == null
+          ? null
+          : (members.get(row.decision_owner_member_id)?.display_name ?? "Former member"),
+      decision_by_member_name:
+        row.decision_by_member_id == null
+          ? null
+          : (members.get(row.decision_by_member_id)?.display_name ?? "Former member"),
+      decision_at: row.decision_at == null ? null : new Date(row.decision_at).toISOString(),
+      decision_expires_at:
+        row.decision_expires_at == null ? null : new Date(row.decision_expires_at).toISOString(),
       events,
     };
+  });
+
+  const patrolGeneratedAt = new Date().toISOString();
+  const debtPatrol = buildDebtPatrol(findings, {
+    commitsWindow: latest?.commits_window == null ? null : num(latest.commits_window as number),
+    windowDays: latest?.window_days == null ? null : num(latest.window_days as number),
+    now: patrolGeneratedAt,
   });
 
   const c = cb as Record<string, unknown>;
@@ -673,6 +746,8 @@ export async function getCodebaseDetail(
     contributors,
     issues,
     findings,
+    decisionOwners,
+    debtPatrol,
   };
 }
 

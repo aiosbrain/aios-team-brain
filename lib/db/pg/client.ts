@@ -37,6 +37,22 @@ export class PgClient {
         );
         return { data: rows[0]?.result ?? {}, error: null };
       }
+      if (fn === "decide_codebase_finding") {
+        const { rows } = await runSql<{ result: { finding_id: string; status: string } }>(
+          `SELECT decide_codebase_finding($1, $2, $3, $4, $5, $6, $7, $8) AS result`,
+          [
+            args.p_team_id,
+            args.p_codebase_id,
+            args.p_finding_id,
+            args.p_actor_member_id,
+            args.p_owner_member_id,
+            args.p_decision_status,
+            args.p_reason,
+            args.p_expires_at,
+          ]
+        );
+        return { data: rows[0]?.result ?? {}, error: null };
+      }
       throw new Error(`pg-adapter: unsupported rpc "${fn}"`);
     } catch (err) {
       const message = err instanceof Error ? err.message : "rpc failed";

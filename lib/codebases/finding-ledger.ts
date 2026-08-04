@@ -1,3 +1,4 @@
+import { z } from "zod";
 import type { CodebaseHealth } from "@/lib/api/schemas";
 import type { DbClient } from "@/lib/db/types";
 
@@ -16,7 +17,22 @@ export type FindingEventType =
   | "observed"
   | "resolved"
   | "reopened"
-  | "stale_analysis";
+  | "stale_analysis"
+  | "accepted"
+  | "risk_accepted"
+  | "false_positive"
+  | "expired"
+  | "superseded";
+
+export const findingDecisionSchema = z.object({
+  findingId: z.string().uuid(),
+  ownerMemberId: z.string().uuid(),
+  status: z.enum(["accepted", "risk_accepted", "false_positive"]),
+  reason: z.string().trim().min(10).max(500),
+  expiresAt: z.string().datetime({ offset: true }),
+});
+
+export type FindingDecision = z.infer<typeof findingDecisionSchema>;
 
 export type FindingTransition = {
   status: FindingStatus;
@@ -25,6 +41,19 @@ export type FindingTransition = {
 };
 
 type EvidenceStatus = "complete" | "partial" | "missing" | "stale" | "error";
+
+const RESOLVABLE_STATUSES = new Set<FindingStatus>([
+  "open",
+  "reopened",
+  "accepted",
+  "risk_accepted",
+  "false_positive",
+]);
+const DECISION_STATUSES = new Set<FindingStatus>([
+  "accepted",
+  "risk_accepted",
+  "false_positive",
+]);
 
 /**
  * Pure mirror of the database lifecycle rules. The SQL function is the atomic writer;
@@ -35,8 +64,15 @@ export function decideFindingTransition(input: {
   present: boolean;
   evidenceStatus: EvidenceStatus;
   olderThanCurrent?: boolean;
+  decisionNewerThanEvidence?: boolean;
 }): FindingTransition | null {
-  const { currentStatus, present, evidenceStatus, olderThanCurrent = false } = input;
+  const {
+    currentStatus,
+    present,
+    evidenceStatus,
+    olderThanCurrent = false,
+    decisionNewerThanEvidence = false,
+  } = input;
 
   if (olderThanCurrent) {
     if (currentStatus) {
@@ -57,7 +93,9 @@ export function decideFindingTransition(input: {
 
   if (
     evidenceStatus === "complete" &&
-    (currentStatus === "open" || currentStatus === "reopened")
+    currentStatus != null &&
+    RESOLVABLE_STATUSES.has(currentStatus) &&
+    !(DECISION_STATUSES.has(currentStatus) && decisionNewerThanEvidence)
   ) {
     return { status: "resolved", event: "resolved", mutatesCurrent: true };
   }
@@ -100,4 +138,31 @@ export async function reconcileCodebaseFindings(
   });
   if (error) throw new Error(`finding reconciliation failed: ${error.message}`);
   return { ...EMPTY_RESULT, ...(data as Partial<FindingReconcileResult>) };
+}
+
+/** Record an operator decision atomically with its append-only finding event. */
+export async function decideCodebaseFinding(
+  db: DbClient,
+  input: FindingDecision & {
+    teamId: string;
+    codebaseId: string;
+    actorMemberId: string;
+  }
+): Promise<{ findingId: string; status: FindingDecision["status"] }> {
+  const decision = findingDecisionSchema.parse(input);
+  const { data, error } = await db.rpc("decide_codebase_finding", {
+    p_team_id: input.teamId,
+    p_codebase_id: input.codebaseId,
+    p_finding_id: decision.findingId,
+    p_actor_member_id: input.actorMemberId,
+    p_owner_member_id: decision.ownerMemberId,
+    p_decision_status: decision.status,
+    p_reason: decision.reason,
+    p_expires_at: decision.expiresAt,
+  });
+  if (error) throw new Error(`finding decision failed: ${error.message}`);
+  return {
+    findingId: (data as { finding_id: string }).finding_id,
+    status: (data as { status: FindingDecision["status"] }).status,
+  };
 }
