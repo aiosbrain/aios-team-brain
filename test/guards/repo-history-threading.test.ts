@@ -31,7 +31,14 @@ describe("repo-history threading (AIO-798)", () => {
     expect(run).not.toMatch(/sinceIso:\s*new Date\(/);
   });
 
-  it("the commit scan gets the chosen window, explicit even at 0", () => {
-    expect(run).toMatch(/ingestGithubApiScan\(db, auth, \{[^}]*windowDays: history\?\.days/);
+  it("the commit scan gets the RESOLVED anchor, not a window recomputed from days (AIO-807)", () => {
+    expect(run).toMatch(/ingestGithubApiScan\(db, auth, \{[^}]*sinceIso: commitSinceIso\(history,/);
+  });
+
+  it("no leg derives a commit cutoff from `days` — that IS the bug (AIO-807)", () => {
+    // `days: 0` re-resolved to `now − 0` every tick is `since = now` every tick: a commit pushed
+    // between two scheduler runs is in neither window, forever. The importer must never compute a
+    // commit cutoff itself; `commitSinceIso` owns it, floor and clamps included.
+    expect(run).not.toMatch(/windowDays/);
   });
 });

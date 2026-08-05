@@ -22,7 +22,7 @@ import { normalizeGithubRepo } from "./sources/github-normalize";
 import { fetchGithubRepoFiles } from "./sources/github-files";
 import { normalizeGithubFiles } from "./sources/github-files-normalize";
 import { ingestGithubApiScan } from "@/lib/codebases/github-api-scan";
-import { resolveRepoHistory } from "@/lib/integrations/github-link";
+import { commitSinceIso, resolveRepoHistory } from "@/lib/integrations/github-link";
 
 /**
  * In-app ingestion runner — the TypeScript replacement for the Python sidecar's
@@ -631,10 +631,11 @@ export async function runGithubIngestion(opts: { teamId?: string } = {}): Promis
           // (no checkout). Auto-populates the per-person + commit-volume graphs on link. No-op for
           // a repo a real `aios-ingest scan` already owns (the scanner's rows are richer).
           try {
-            // windowDays: an explicit 0 empties the backfill while STILL upserting the codebase
-            // identity row (the destructuring default applies only to undefined) — "no history"
-            // must never mean "no contributor graphs ever". Absent entry → undefined → default 90d.
-            await ingestGithubApiScan(db, auth, { owner, repo, slug: repo, token: token ?? "", windowDays: history?.days });
+            // The cutoff is RESOLVED here, once, from the stored anchor (AIO-807) — never re-derived
+            // downstream from `days`. `days: 0` ("No history") means no BACKFILL, not "no contributor
+            // graphs ever": a window recomputed as `now − 0` each tick left every commit pushed
+            // between two ticks outside both windows, forever. Absent entry → null → 90d, as before.
+            await ingestGithubApiScan(db, auth, { owner, repo, slug: repo, token: token ?? "", sinceIso: commitSinceIso(history, Date.now()) });
           } catch (err) {
             summary.errors.push(`${full} contributions: ${err instanceof Error ? err.message : "sync failed"}`);
           }

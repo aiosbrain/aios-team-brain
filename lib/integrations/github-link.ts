@@ -4,6 +4,7 @@ import { upsertIntegration, type IntegrationAuth } from "./manage";
 import { decryptSecret } from "@/lib/secrets/crypto";
 import { addRepo, removeRepo, normalizeRepo } from "./github-repos";
 import { githubProjectSlug } from "@/lib/ingest/sources/github-normalize";
+import { DEFAULT_COMMIT_WINDOW_DAYS } from "@/lib/codebases/github-api-scan";
 
 /**
  * Persistence for the Admin → Integrations "GitHub repositories" panel. A team's linked repos live
@@ -81,6 +82,38 @@ export function resolveRepoHistory(
   const raw = Array.isArray(config.repoHistory) ? (config.repoHistory as RepoHistoryEntry[]) : [];
   const hit = raw.find((e) => e && typeof e.repo === "string" && e.repo.toLowerCase() === fullName.toLowerCase());
   return hit && typeof hit.days === "number" && typeof hit.sinceIso === "string" ? hit : null;
+}
+
+/**
+ * The COMMIT leg's cutoff, resolved from the stored anchor (AIO-807). Pure, exported, and the ONLY
+ * place a commit-scan `since` is derived.
+ *
+ * AIO-798 threaded the window into both windowed fetches by two different routes: issues got the
+ * stored anchor verbatim, commits got `days` re-resolved to `now − days` on every tick. At the
+ * panel's "No history" (`days: 0`) that is `since = now` every hour — a commit pushed BETWEEN two
+ * scheduler runs is newer than one run's cutoff and older than the next's, so it reaches the
+ * contributor graphs never, while `ingestGithubApiScan` keeps upserting the identity row and nothing
+ * errors. The window was always a BACKFILL control ("history is about the past, not ongoing sync" —
+ * `docs/design/repo-import-history-estimate.md`); this makes the commit leg mean that too.
+ *
+ * Three terms, each load-bearing:
+ *  1. FLOOR AT THE REPO'S OWN WIDTH, `max(days, 90)`. A flat 90 would silently truncate a wider link
+ *     on its FIRST sync — the panel offers ≤90 but the action and config schema accept up to 3650,
+ *     and the estimator quotes the admin a commit count over the full window.
+ *  2. LATER-OF anchor and floor. `now − W` rises monotonically, so a years-old link degrades to a
+ *     bounded sliding window instead of an unbounded page walk, and can never widen past the anchor.
+ *  3. A FUTURE OR UNPARSEABLE ANCHOR FALLS BACK TO THE FLOOR, never to `now` — `since` in the future
+ *     returns [] forever, and clamping it to `now` would rebuild the very bug this fixes.
+ */
+export function commitSinceIso(history: RepoHistoryEntry | null, nowMs: number): string {
+  const windowDays = Math.max(history?.days ?? DEFAULT_COMMIT_WINDOW_DAYS, DEFAULT_COMMIT_WINDOW_DAYS);
+  const floorMs = nowMs - windowDays * 86_400_000;
+  const anchorMs = history ? Date.parse(history.sinceIso) : Number.NaN;
+  // NB: no `Number.isFinite(anchorMs)` term — it would be unfalsifiable. `Date.parse` returns NaN on
+  // a malformed anchor and `NaN <= nowMs` is already false, so the comparison alone routes both
+  // unusable cases to the floor. (Verified by mutation: deleting an isFinite term reddened nothing.)
+  const usable = anchorMs <= nowMs;
+  return new Date(usable ? Math.max(anchorMs, floorMs) : floorMs).toISOString();
 }
 
 /** Upsert the canonical github row with a new repos list (and optionally the history entries),
