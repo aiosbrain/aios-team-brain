@@ -99,6 +99,37 @@ describe("GitHub-API contribution sync (data-mechanics)", () => {
     expect((data as { last_scan_at: string | null }).last_scan_at).toBeNull();
   });
 
+  // AIO-807: the CALLER owns the commit cutoff (`run.ts` → `commitSinceIso`). These two pin the hop
+  // between the guarded call site and `fetchCommitsSince`'s verbatim forwarding — the term that
+  // nothing else reddens. Deleting `params.sinceIso ??` in the scan leaves the threading guard, the
+  // resolver's nine unit rows and the wire test ALL green while the anchor is silently dead: a
+  // "No history" repo would retro-import 90 days the admin declined, and a 365-day link would
+  // truncate to 90 on its first sync.
+  it("puts the caller's resolved cutoff on the /commits request, not a window of its own", async () => {
+    const seed = await seedTeam();
+    const fetchMock = stubGithub();
+
+    await ingestGithubApiScan(
+      db(),
+      { teamId: seed.teamId, memberId: seed.memberId },
+      { owner: "acme", repo: "app", slug: "app", token: "t", sinceIso: "2026-01-02T03:04:05.000Z" }
+    );
+
+    const commitsUrl = fetchMock.mock.calls.map((c) => String(c[0])).find((u) => u.includes("/commits"));
+    expect(commitsUrl).toContain(`since=${encodeURIComponent("2026-01-02T03:04:05.000Z")}`);
+  });
+
+  it("omitting the cutoff falls back to the 90-day window (the pre-window default, unchanged)", async () => {
+    const seed = await seedTeam();
+    const fetchMock = stubGithub();
+
+    await ingestGithubApiScan(db(), { teamId: seed.teamId, memberId: seed.memberId }, { owner: "acme", repo: "app", slug: "app", token: "t" });
+
+    const commitsUrl = fetchMock.mock.calls.map((c) => String(c[0])).find((u) => u.includes("/commits")) ?? "";
+    const since = Date.parse(decodeURIComponent(new URL(commitsUrl).searchParams.get("since") ?? ""));
+    expect(Math.abs(since - (Date.now() - 90 * 86_400_000))).toBeLessThan(10_000);
+  });
+
   it("leaves a repo the CLI scanner already owns untouched (no clobber)", async () => {
     const seed = await seedTeam();
     await aliasMember(seed.teamId, seed.memberId, "chetan@acme.com");

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { linkGithubRepo, resolveRepoHistory, type RepoHistoryEntry } from "@/lib/integrations/github-link";
+import { commitSinceIso, linkGithubRepo, resolveRepoHistory, type RepoHistoryEntry } from "@/lib/integrations/github-link";
 import { fetchGithubRepoIssues } from "@/lib/ingest/sources/github";
 import { validateIntegrationConfig } from "@/lib/api/schemas";
 
@@ -37,6 +37,71 @@ describe("resolveRepoHistory", () => {
   it("malformed entries are ignored, not thrown on — config is external data", () => {
     expect(resolveRepoHistory({ repoHistory: [{ repo: "a/b" }] }, "a/b")).toBeNull();
     expect(resolveRepoHistory({ repoHistory: "nonsense" }, "a/b")).toBeNull();
+  });
+});
+
+/**
+ * The COMMIT leg's cutoff (AIO-807). AIO-798 threaded the window into both windowed fetches, but by
+ * two different routes: issues got the stored anchor, commits got `days` re-resolved to `now − days`
+ * on every tick. At `days: 0` that is `since = now` every hour, so a commit pushed BETWEEN two
+ * scheduler runs is newer than run N's cutoff and older than run N+1's — never fetched by either, and
+ * the repo's contributor graphs stay permanently empty while nothing reports an error.
+ *
+ * `commitSinceIso` resolves it from the anchor instead, floored at the repo's own window so the walk
+ * stays bounded on a link that is years old.
+ */
+describe("commitSinceIso (AIO-807)", () => {
+  const T0 = Date.parse("2026-08-01T00:00:00.000Z");
+  const DAY = 86_400_000;
+  const at = (ms: number) => new Date(ms).toISOString();
+  const entry = (days: number, anchorMs: number): RepoHistoryEntry => ({
+    repo: "acme/widgets",
+    days,
+    sinceIso: at(anchorMs),
+  });
+
+  it("THE BUG: at days=0 a commit pushed between two ticks is inside the next tick's window", () => {
+    // Linked at T0 with "No history"; the importer ticks two hours later. A commit authored at
+    // T0 + 1h must be fetched. The shipped expression yields `now` (T0 + 2h) and misses it forever.
+    const since = commitSinceIso(entry(0, T0), T0 + 2 * 3_600_000);
+    expect(Date.parse(since)).toBeLessThanOrEqual(T0 + 3_600_000);
+  });
+
+  it("days=0 asks for NO backfill — the cutoff is the link instant, not earlier", () => {
+    expect(commitSinceIso(entry(0, T0), T0 + 2 * 3_600_000)).toBe(at(T0));
+  });
+
+  it("no entry → the 90-day sliding window, byte-identical to the pre-window behaviour", () => {
+    expect(commitSinceIso(null, T0)).toBe(at(T0 - 90 * DAY));
+  });
+
+  it("an anchor older than the floor is bounded by it — a 200-day-old link walks 90 days, not 200", () => {
+    expect(commitSinceIso(entry(0, T0 - 200 * DAY), T0)).toBe(at(T0 - 90 * DAY));
+  });
+
+  it("a recent anchor is honoured exactly — days=14 linked 5 days ago fetches from link − 14d", () => {
+    const linkedAt = T0 - 5 * DAY;
+    expect(commitSinceIso(entry(14, linkedAt - 14 * DAY), T0)).toBe(at(linkedAt - 14 * DAY));
+  });
+
+  it("the floor NEVER widens a narrow choice: days=14 linked 200 days ago floors at 90, not at link − 14d", () => {
+    expect(commitSinceIso(entry(14, T0 - 214 * DAY), T0)).toBe(at(T0 - 90 * DAY));
+  });
+
+  it("a window WIDER than 90 days floors at its own width — the estimate quoted 365 days of commits", () => {
+    // `days` is capped at 3650 by the action + schema, not at the panel's 90 (actions.ts, schemas.ts).
+    // A flat 90-day floor would silently truncate this repo's backfill on its very first sync.
+    expect(commitSinceIso(entry(365, T0 - 365 * DAY), T0)).toBe(at(T0 - 365 * DAY));
+  });
+
+  it("an anchor in the FUTURE falls back to the floor — never to `now`, which would rebuild the bug", () => {
+    // Clock skew at link time, or any non-panel config write. `since` in the future returns [] forever.
+    expect(commitSinceIso(entry(0, T0 + 30 * DAY), T0)).toBe(at(T0 - 90 * DAY));
+  });
+
+  it("an unparseable anchor degrades to the floor rather than propagating NaN", () => {
+    const broken = { repo: "acme/widgets", days: 0, sinceIso: "not-a-date" } as RepoHistoryEntry;
+    expect(commitSinceIso(broken, T0)).toBe(at(T0 - 90 * DAY));
   });
 });
 

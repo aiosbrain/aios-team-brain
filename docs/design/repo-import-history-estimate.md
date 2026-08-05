@@ -143,7 +143,11 @@ In `lib/ingest/run.ts`'s github leg, per repo with an entry:
   fetched set only grows — no diff-delete, no churn re-projection. (An issue deleted/transferred on
   GitHub's side still diff-deletes — that is the documented source-mirroring intent in
   `github-normalize.ts:11-12`, identical to today's behaviour, and deliberately not floored.)
-- `ingestGithubApiScan({ …, windowDays: days })` — the param exists (`github-api-scan.ts:205`);
+- `ingestGithubApiScan({ …, windowDays: days })` — **⚠️ superseded by `repo-history-commit-anchor.md`
+  (AIO-807): this is the paragraph that shipped the bug.** `since = now` on every tick, not once, so
+  "empty backfill, row still upserted" was really "empty backfill AND every future commit missed" —
+  the leg now takes a resolved `sinceIso`. Left in place as the point-in-time record. The param exists
+  (`github-api-scan.ts:205`);
   today no caller passes it. **The scan call is never skipped** (plan-review position, adopted):
   it costs no LLM money and it upserts the repo's `codebases` identity row, which "contributor
   graphs fill from future syncs" depends on. `days = 0` passes `windowDays: 0` explicitly — the

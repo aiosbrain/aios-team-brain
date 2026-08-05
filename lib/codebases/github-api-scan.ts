@@ -20,6 +20,14 @@ import { buildIdentityMap, resolveMember } from "@/lib/identity/resolve";
 
 const GH = "https://api.github.com";
 
+/**
+ * The contribution window a repo gets when nothing narrower is known: a repo linked before per-repo
+ * windows existed (AIO-798), or any caller that passes no instant. Also the FLOOR every resolved
+ * window is bounded by (`commitSinceIso`, AIO-807) — an anchor older than this walks 90 days rather
+ * than the whole link history, which keeps the page walk bounded on a years-old link.
+ */
+export const DEFAULT_COMMIT_WINDOW_DAYS = 90;
+
 function ghHeaders(token: string): HeadersInit {
   const h: Record<string, string> = {
     Accept: "application/vnd.github+json",
@@ -202,9 +210,14 @@ export interface GithubApiScanResult {
 export async function ingestGithubApiScan(
   db: DbClient,
   auth: { teamId: string; memberId: string },
-  params: { owner: string; repo: string; slug: string; token: string; windowDays?: number }
+  params: { owner: string; repo: string; slug: string; token: string; sinceIso?: string }
 ): Promise<GithubApiScanResult> {
-  const { owner, repo, slug, token, windowDays = 90 } = params;
+  // `sinceIso` is the RESOLVED instant, owned by the caller (`commitSinceIso` — AIO-807). This used
+  // to be `windowDays`, re-derived here as `now − days`: at the panel's "No history" (`days: 0`) that
+  // is `since = now` on every tick, so a commit pushed between two scheduler runs was newer than one
+  // run's cutoff and older than the next's, and reached the contributor graphs never. Omitted (the
+  // pre-window default) still means the 90-day sliding window.
+  const { owner, repo, slug, token } = params;
 
   // If a real scan exists, leave everything to the scanner (its rows are richer and it owns
   // last_scan_at + additions/deletions). The API path is only a fallback for unscanned repos.
@@ -226,7 +239,8 @@ export async function ingestGithubApiScan(
   }
 
   const meta = await fetchRepoMeta(owner, repo, token);
-  const sinceIso = new Date(Date.now() - windowDays * 86_400_000).toISOString();
+  const sinceIso =
+    params.sinceIso ?? new Date(Date.now() - DEFAULT_COMMIT_WINDOW_DAYS * 86_400_000).toISOString();
   const commits = await fetchCommitsSince(owner, repo, token, sinceIso);
   const contributions = aggregateContributions(commits).slice(0, 5000);
 
