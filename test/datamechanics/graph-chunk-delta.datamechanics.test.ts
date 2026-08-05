@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { createHash } from "node:crypto";
-import { projectItemsToGraph, CHUNK_CHARS, MAX_EPISODE_CHUNKS, chunkContent } from "@/lib/graph/project";
+import { projectItemsToGraph, CHUNK_CHARS, MAX_EPISODE_CHUNKS, CHUNK_CONFIG, chunkContent } from "@/lib/graph/project";
 import { db, ingest, seedTeam } from "./helpers";
 import { FakeGraphiti, client } from "./fake-graphiti";
 
@@ -136,7 +136,7 @@ describe("per-chunk projection ledger (real Postgres, mocked Graphiti)", () => {
     await expectLedgerContained(seed.teamId, bothPasses);
   });
 
-  it("AC4 — a pre-feature ledger row is backfilled by one pass that pushes nothing", async () => {
+  it("AC4 — a pre-feature ledger row converges by ONE FULL RE-PUSH (AIO-808 inverted the contract)", async () => {
     const seed = await seedTeam();
     const slug = await teamSlugFor(seed.teamId);
     const text = body(CHUNK_CHARS * 2);
@@ -158,11 +158,23 @@ describe("per-chunk projection ledger (real Postgres, mocked Graphiti)", () => {
     const second = new FakeGraphiti();
     await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(second) });
 
-    expect(second.pushedEpisodes).toHaveLength(0); // no re-extraction event on deploy
+    // INVERTED BY AIO-808. This used to assert a free backfill: record the current config's hashes
+    // without pushing. That branch is deleted, because its premise — "an identical body means these
+    // are the chunks we pushed" — was only ever valid inside one config era (its own comment said so),
+    // and raising MAX_EPISODE_CHUNKS ended that era. Worse, for a pre-ledger row OVER the old cap it
+    // would have blessed tail hashes for chunks present in the graph in no form at all — silent,
+    // permanent loss that reconcile cannot see.
+    //
+    // The contract now: an unattestable config converges via ONE full re-push. That is the
+    // self-hosted upgrade path from pre-GRAPHCOST-1, and this test is what stops someone
+    // "restoring" the backfill later without confronting the hazard above.
+    const expected = chunkContent(text).length;
+    expect(expected, "fixture must actually have chunks to push").toBeGreaterThan(0);
+    expect(second.pushedEpisodes, "an unattestable config re-pushes, it does not bless").toHaveLength(expected);
     const after = await ledgerRow(seed.teamId);
     expect(after?.chunk_shas).toEqual(chunkContent(text).map(sha));
-    expect(after?.projected_at).toBe(before?.projected_at); // AC9 again: nothing was pushed
-    await expectLedgerContained(seed.teamId, first); // the hashes it recorded were pushed by pass 1
+    expect(after?.chunk_config).toBe(CHUNK_CONFIG); // and converges to the current era
+    expect(after?.projected_at, "a real push bumps the stamp").not.toBe(before?.projected_at);
   });
 
   it("AC5 — a tier change pushes every chunk into the new group, ledger notwithstanding", async () => {
@@ -292,5 +304,125 @@ describe("per-chunk projection ledger (real Postgres, mocked Graphiti)", () => {
     await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(fake) });
 
     expect(fake.pushedEpisodes).toHaveLength(3);
+  });
+});
+
+/**
+ * AIO-808 — raising MAX_EPISODE_CHUNKS must deliver the newly-admitted TAIL to items whose bodies have
+ * not changed, and must NOT re-push anything else.
+ *
+ * The whole feature turns on a distinction the first two spec drafts got wrong: the unchanged-content
+ * skip and the delta predicate ask different questions. These two tests are what separate a correct
+ * build from a plausible one. The tail test fails a compatibility-only skip (all over-cap items keep
+ * skipping, no tail lands). The count-only mutant needs its OWN case — AC11 does not catch it, though
+ * this comment used to claim so: AC11 edits the body, so the sha term fails before either new term is
+ * consulted. Hence the third test below. Do not "simplify" any of them.
+ */
+describe("chunk-cap raise (AIO-808)", () => {
+  it("an over-cap item whose body never changed receives ONLY its tail", async () => {
+    const seed = await seedTeam();
+    const slug = await teamSlugFor(seed.teamId);
+    const path = "github/repo/docs/huge.md";
+    const fm = { source: "github" };
+    // 20 chunks' worth of body against a ledger that was written under a 16-chunk cap.
+    const big = body(CHUNK_CHARS * 20, "h");
+
+    await ingest(seed, { kind: "deliverable", path, body: big, access: "team", frontmatter: fm });
+    const first = new FakeGraphiti();
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(first) });
+
+    // Rewrite the ledger to the pre-raise state: the first 16 chunks, recorded under "2500x16".
+    const row = await ledgerRow(seed.teamId);
+    const under16 = chunkContent(big, CHUNK_CHARS, 16);
+    await db()
+      .from("graph_episodes")
+      .update({ chunk_shas: under16.map(sha), chunk_config: `${CHUNK_CHARS}x16` })
+      .eq("team_id", seed.teamId)
+      .eq("source_id", row!.source_id);
+
+    // Same body, byte for byte — only the cap has moved.
+    const fake = new FakeGraphiti();
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(fake) });
+
+    const pushed = fake.pushes.flatMap((p) => p.episodes);
+    const expectedTail = chunkContent(big, CHUNK_CHARS, MAX_EPISODE_CHUNKS).length - 16;
+    expect(expectedTail, "fixture must actually straddle the old cap").toBeGreaterThan(0);
+    expect(pushed.length, "exactly the tail, nothing re-pushed").toBe(expectedTail);
+    // Identity, not just arity: a build that pushed chunks 0..3 instead of 16..19 would satisfy a
+    // count-only assertion while putting the wrong content in the graph.
+    expect(pushed.map((e) => e.content)).toEqual(chunkContent(big).slice(16));
+    // And the ledger converges to the current config with the full set recorded.
+    const after = await ledgerRow(seed.teamId);
+    expect(after?.chunk_config).toBe(`${CHUNK_CHARS}x${MAX_EPISODE_CHUNKS}`);
+    expect(after?.chunk_shas?.length).toBe(16 + expectedTail);
+  });
+
+  it("a stale config with MATCHING counts still re-pushes — the count-only mutant's killer", async () => {
+    // Kills a skip that drops the compatibility term and keeps only `owesChunks`. The fixture makes
+    // the counts EQUAL by construction (the real pushed shas are left in place) while the stored
+    // config claims different CHUNK_CHARS — so boundaries moved, every stored hash is stale, and the
+    // only correct answer is a full re-push. A count-only skip sees "owes nothing" and skips,
+    // stranding the item on boundaries that no longer exist.
+    const seed = await seedTeam();
+    const slug = await teamSlugFor(seed.teamId);
+    const path = "github/repo/docs/count-match.md";
+    const fm = { source: "github" };
+    const text = body(CHUNK_CHARS * 3, "m");
+
+    await ingest(seed, { kind: "deliverable", path, body: text, access: "team", frontmatter: fm });
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(new FakeGraphiti()) });
+
+    const row = await ledgerRow(seed.teamId);
+    await db()
+      .from("graph_episodes")
+      .update({ chunk_config: `${CHUNK_CHARS * 2}x${MAX_EPISODE_CHUNKS}` }) // different CHARS, same cap
+      .eq("team_id", seed.teamId)
+      .eq("source_id", row!.source_id);
+
+    // Assert the state the CODE WILL READ, re-fetched after the mutation — not a capture taken before
+    // it. A stale capture would still read "counts match" if someone later added `chunk_shas` to that
+    // update, silently converting this into an owes-driven test that no longer catches its own mutant
+    // while every assertion stayed green.
+    const staged = await ledgerRow(seed.teamId);
+    expect(staged?.chunk_shas?.length, "counts must MATCH, or this tests the count term instead").toBe(
+      chunkContent(text).length
+    );
+    expect(staged?.content_sha256, "body must be untouched, or the sha term short-circuits like AC11").toBe(
+      sha(text)
+    );
+
+    const fake = new FakeGraphiti();
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(fake) });
+
+    const pushed = fake.pushes.flatMap((p) => p.episodes);
+    expect(pushed.length, "untrustworthy boundaries ⇒ full re-push, not a skip").toBe(chunkContent(text).length);
+  });
+
+  it("ANTI-FLOOD — a COMPLETE item with a stale config is neither deleted nor re-pushed", async () => {
+    // The degenerate build this kills: a skip written as bare `stored !== CHUNK_CONFIG` sends the whole
+    // corpus through the push path. For a RETRACTABLE source the retract-delete branch fires before the
+    // delta predicate, so every Slack item would get deleteItemEpisodes + a full re-push — unbudgeted,
+    // and invisible to every other assertion in this file.
+    const seed = await seedTeam();
+    const slug = await teamSlugFor(seed.teamId);
+    const path = "slack/c123/1782124487.144019.md";
+    const fm = { source: "slack" }; // retainSupersededBodies: false — the flood-sensitive path
+    const small = body(CHUNK_CHARS * 2, "s"); // 2 chunks: complete under both 16 and 40
+
+    await ingest(seed, { kind: "transcript", path, body: small, access: "team", frontmatter: fm });
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(new FakeGraphiti()) });
+
+    const row = await ledgerRow(seed.teamId);
+    await db()
+      .from("graph_episodes")
+      .update({ chunk_config: `${CHUNK_CHARS}x16` }) // stale cap, but the item owes nothing
+      .eq("team_id", seed.teamId)
+      .eq("source_id", row!.source_id);
+
+    const fake = new FakeGraphiti();
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(fake) });
+
+    expect(fake.pushes.flatMap((p) => p.episodes), "a complete item owes nothing").toEqual([]);
+    expect(fake.listCalls, "and must not be dragged through the retract-delete path").toEqual([]);
   });
 });

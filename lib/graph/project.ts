@@ -55,8 +55,35 @@ export function chunk<T>(items: readonly T[], size: number): T[][] {
  * 0/NaN chunk CAP makes it emit none — either way the projector "succeeds" feeding the graph nothing
  * (or garbage). `Math.floor` also closes the fractional hole (0.5 → 0). Pure + exported, unit-tested.
  */
+/**
+ * ⚠️ CHANGING THIS RE-EXTRACTS THE ENTIRE CORPUS on the next projector tick, and it is billed
+ * (~$47 at the 2026-08 corpus). Every chunk boundary is `slice(i, i + CHUNK_CHARS)`, so a different
+ * value moves all of them: every stored hash goes stale, no item can take the delta path, and each
+ * one full-re-pushes — including dragging retractable sources through their delete-then-repush shape.
+ * Raising MAX_EPISODE_CHUNKS below does NOT do this; the two knobs look alike and cost ~27x
+ * differently. See docs/design/graph-extraction-cap.md before touching either.
+ */
 export const CHUNK_CHARS = resolvePositiveInt(process.env.GRAPH_CHUNK_CHARS, 2500);
-export const MAX_EPISODE_CHUNKS = resolvePositiveInt(process.env.GRAPH_MAX_EPISODE_CHUNKS, 16);
+/**
+ * How many chunks of `CHUNK_CHARS` an item may become — i.e. `CHUNK_CHARS * MAX_EPISODE_CHUNKS` is the
+ * hard ceiling on how much of ANY item ever reaches the graph. Everything past it is dropped by
+ * `chunkContent`, silently, forever.
+ *
+ * Raised 16 -> 40 (40,000 -> 100,000 chars) on 2026-08-05 (AIO-808). At 16 this had stopped being the
+ * "runaway-size backstop" its comment claimed: 21 items were over it and **689,235 characters — 8.6%
+ * of the corpus — had never entered the graph**, concentrated in the densest documents we own
+ * (`ARCHITECTURE.md` 11.8% present, a Chetan/John meeting transcript 54.5%). Sized from the measured
+ * corpus: 40 completes 18 of the 21; three files (ARCHITECTURE.md at 136 chunks, model-migration at
+ * 48, brain-api at 46) stay capped and are STILL dropped silently — surfacing the refused character
+ * count is specced (docs/design/graph-extraction-cap.md §3) and deliberately NOT built here.
+ *
+ * ⚠️ CHANGING `CHUNK_CHARS` RE-EXTRACTS THE WHOLE CORPUS on the next tick, and it is billed. Every
+ * chunk boundary moves, so every stored hash is stale and no item can take the delta path — ~$47 at
+ * the 2026-08 corpus. Raising THIS constant does not: boundaries are unchanged, so only the newly
+ * admitted tail chunks are pushed (179 episodes / ~$1.77 for the 16->40 move). The two knobs look
+ * alike and cost 27x differently; see docs/design/graph-extraction-cap.md.
+ */
+export const MAX_EPISODE_CHUNKS = resolvePositiveInt(process.env.GRAPH_MAX_EPISODE_CHUNKS, 40);
 /**
  * The chunk sizing the per-chunk ledger's hashes were produced under, recorded alongside them
  * (`graph_episodes.chunk_config`). `content_sha256` hashes the WHOLE body and is invariant to
@@ -65,6 +92,43 @@ export const MAX_EPISODE_CHUNKS = resolvePositiveInt(process.env.GRAPH_MAX_EPISO
  * ledger without this would report them as already extracted. A mismatch forces a full push.
  */
 export const CHUNK_CONFIG = `${CHUNK_CHARS}x${MAX_EPISODE_CHUNKS}`;
+
+/**
+ * Can the chunk hashes stored under `stored` still be TRUSTED to identify chunks of the same body
+ * under `current`? (AIO-808)
+ *
+ * Compatible iff `CHUNK_CHARS` is identical. Chunking is `body.slice(i, i + chars)` stepping by
+ * `chars`, so the cap only truncates the sequence: raising it leaves every earlier chunk
+ * byte-identical and merely appends. Changing `chars` moves every boundary and invalidates every
+ * stored hash.
+ *
+ *   same config            -> true    (today's normal path)
+ *   chars same, cap GREW   -> true    the point of this helper: stored hashes still match, so the
+ *                                     delta pushes exactly the newly-admitted tail
+ *   chars same, cap SHRANK -> false   chunks past the new cap become orphans in Graphiti that the
+ *                                     ledger would stop tracking; a full re-push is the honest answer
+ *   chars DIFFER           -> false   every boundary moved
+ *   malformed / "" / null  -> false   `""` is a real stored value; an unparseable config must never
+ *                                     read as "compatible"
+ *
+ * ⚠️ THIS ANSWERS ONLY "can I trust the stored hashes". It does NOT answer "does this item still owe
+ * chunks" — under a raised cap a body-identical item is compatible AND owes its tail, so the
+ * unchanged-content skip must AND this with a count comparison. Using this alone at the skip is the
+ * bug this feature shipped twice in review: the items it targets would all keep skipping.
+ */
+export function chunkConfigDeltaCompatible(stored: string | null | undefined, current: string): boolean {
+  const parse = (v: string | null | undefined): { chars: number; cap: number } | null => {
+    const m = /^(\d+)x(\d+)$/.exec((v ?? "").trim());
+    if (!m) return null;
+    const chars = Number(m[1]);
+    const cap = Number(m[2]);
+    return chars > 0 && cap > 0 ? { chars, cap } : null;
+  };
+  const a = parse(stored);
+  const b = parse(current);
+  if (!a || !b) return false;
+  return a.chars === b.chars && b.cap >= a.cap;
+}
 
 /**
  * How many episodes to scan when resolving an item's chunk names → uuids for a delete (tier-cleanup)
@@ -437,33 +501,42 @@ export async function projectItemsToGraph(
     // we're about to push and silently drop the item from the graph. Purge the stale ones first, then
     // this push is authoritative and the flag clears below.
     const purgeBeforeRepush = existingRow?.pending_delete_group_id === groupId;
-    if (existingRow && existingRow.content_sha256 === contentSha && !tierChanged && !purgeBeforeRepush) {
-      // BACKFILL (GRAPHCOST-1): a row written before the per-chunk ledger existed knows the body is
-      // unchanged but not which chunks that body is made of. Record them here — from the same
-      // `toEpisodes` output the last push used, for a body proven identical by `content_sha256` — so
-      // the corpus converges as the projector walks it instead of re-extracting itself on deploy.
-      // No episodes are sent, so `projected_at` is deliberately NOT bumped (see the push path).
+    // CONFIG-AWARE SKIP (AIO-808). `content_sha256` hashes the whole body and is invariant to the
+    // chunk config, so on its own this skip strands every unchanged item on the config it was last
+    // pushed under — permanently, until its body happens to change. That is how 689,235 characters
+    // sat outside the graph while the ledger read healthy.
+    //
+    // TWO TERMS, because this site asks a DIFFERENT question from the delta predicate below. That one
+    // asks "can I trust the stored hashes" (a raised cap: yes). This one asks "could this item still
+    // OWE chunks" — and under a raised cap a body-identical item is compatible AND owes its tail. Using
+    // compatibility alone here keeps exactly the items this feature targets skipping, which is the bug
+    // review caught twice. `episodes.length` is used rather than a re-derived ceil(len/chars): a second
+    // derivation can drift from `chunkContent` (they disagree on a whitespace-only body) and the ledger
+    // must never describe something else. Both values are already in scope — no added work.
+    const owesChunks = episodes.length > (existingRow?.chunk_shas?.length ?? 0);
+    const chunkingUnchanged = chunkConfigDeltaCompatible(existingRow?.chunk_config, CHUNK_CONFIG);
+    if (
+      existingRow &&
+      existingRow.content_sha256 === contentSha &&
+      !tierChanged &&
+      !purgeBeforeRepush &&
+      chunkingUnchanged &&
+      !owesChunks
+    ) {
+      // NO BACKFILL HERE ANY MORE (AIO-808). GRAPHCOST-1 had a branch that, for a row with an empty
+      // chunk ledger and a matching body sha, recorded the CURRENT config's hashes without pushing —
+      // converging pre-ledger installs for free. Its own comment admitted the premise "an identical
+      // body means these are the chunks we pushed" holds "only while the chunk config is the one that
+      // produced them, which an empty ledger cannot attest", and prescribed invalidation on any config
+      // change. Raising MAX_EPISODE_CHUNKS IS that change, so the branch's era ended with it.
       //
-      // The premise — "an identical body means these are the chunks we pushed" — holds only while the
-      // chunk config is the one that produced them, which an empty ledger cannot attest. So a rollout
-      // that changes CHUNK_CHARS/MAX_EPISODE_CHUNKS must invalidate by clearing `content_sha256` to
-      // `''`, NOT by clearing `chunk_shas`: the sentinel misses the unchanged-skip above and fails the
-      // delta predicate, forcing a real re-push. Emptying `chunk_shas` alone would route the row
-      // straight through here and bless the new config's hashes for chunks never pushed under it.
-      if (chunkShas.length > 0 && (existingRow.chunk_shas?.length ?? 0) === 0) {
-        await db.from("graph_episodes").upsert(
-          {
-            team_id: args.teamId,
-            source_table: SOURCE_TABLE,
-            source_id: item.id,
-            group_id: existingRow.group_id,
-            content_sha256: existingRow.content_sha256,
-            chunk_shas: chunkShas,
-            chunk_config: CHUNK_CONFIG,
-          },
-          { onConflict: "team_id,source_table,source_id" }
-        );
-      }
+      // It is deleted rather than left unreachable because for the one population it still served it
+      // produced this feature's own bug: a pre-ledger row OVER the old cap would have been blessed
+      // with 40 current-config hashes including tails that exist in the graph in no form at all —
+      // permanent silent loss, invisible to reconcile (whose landed-check is satisfied by chunk #0).
+      // Such a row now falls through to a full push, which is both correct and the first time its
+      // tails are extracted. Convergence for pre-ledger rows is therefore the full-push path, once.
+      // Pinned by the inverted AC4 in test/datamechanics/graph-chunk-delta.datamechanics.test.ts.
       skipped++;
       continue; // unchanged content, same tier → no-op (idempotent)
     }
@@ -564,7 +637,7 @@ export async function projectItemsToGraph(
       !tierChanged &&
       existingRow.pending_delete_group_id === null &&
       existingRow.content_sha256 !== "" &&
-      existingRow.chunk_config === CHUNK_CONFIG;
+      chunkConfigDeltaCompatible(existingRow.chunk_config, CHUNK_CONFIG);
     // NB: no `chunk_shas.length > 0` term. It would be unfalsifiable — an empty ledger yields an empty
     // `alreadyPushed`, so the diff below already degrades to a full push on its own. A predicate term
     // no test can redden is one the guard below would be asserting on trust.
