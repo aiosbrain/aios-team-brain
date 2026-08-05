@@ -542,37 +542,52 @@ NEO4J_PASSWORD=<choose one>
 
 **2.8b. Use the patched image — never the upstream one.**
 
-`graphiti/Dockerfile` builds from a **digest-pinned** `zepai/graphiti` and patches one constant:
+`graphiti/Dockerfile` builds from a **digest-pinned** `zepai/graphiti`, installs
+**`graphiti-core==0.29.3`** into the image's venv (transitively pinned by `constraints.txt`), patches
+the server to construct the `/chat/completions` client at `temperature=0` with small-model routing,
+and starts uvicorn **from the venv directly**. Read that file before changing anything here — every
+step carries the failure it exists to prevent.
+
+> ⚠️ **The graphiti service's Custom Start Command must be EMPTY.** This is the one deploy setting
+> that can silently undo the whole thing. A start command **overrides the image's `CMD`**, and the
+> base image's own command is `uv run uvicorn …` — and **`uv run` re-syncs the venv against
+> `/app/uv.lock` at boot**, which pins `graphiti-core` **0.13.2**. So the image builds green, every
+> gate in the Dockerfile passes, and the server then imports 0.13.2 anyway: the per-entity summary
+> fan-out comes back — 27.2 LLM calls per episode, of which `node_attributes` alone was 65.6% of
+> graph spend (both measured from `llm_usage`; the upgraded image runs in single digits) — and
+> nothing in the image can detect it. Observed directly — `Uninstalled 2 packages / Installed 2
+> packages` in the boot log.
+>
+> Earlier revisions of this file said the opposite ("if you have a Custom Start Command set, leave it
+> alone"), because the command that used to be prescribed here wrapped the ingest worker so it
+> survived a failed extraction. That advice predates the 0.29.3 image and is now **wrong** — the
+> command must go. To check whether yours has one, see §5. Also confirm the service still targets
+> **port 8000** (the image's `CMD` binds it, as the base image did).
+>
+> The trap the old start command also fixed — the image declares a non-root `USER app` but the base
+> `CMD` launches `uv` from `/root/.local/bin/uv`, which `app` cannot execute — is fixed by the image
+> itself now: the `CMD` invokes `/app/.venv/bin/uvicorn`, no `uv` involved.
+
+**Why the extraction-output ceiling still matters.** Graphiti extracts entities and edges with its
+own LLM, and that call's *output* is capped at `DEFAULT_MAX_TOKENS`. A dense episode whose extraction
+overflows raises inside the worker — and getzep's worker loop catches only `CancelledError`, so **any
+other exception kills the worker for the whole process.** The HTTP API keeps returning `202`.
+Episodes are accepted, nothing is extracted, and narrative arcs quietly go blank. That failure hit
+production three times.
+
+**0.29.3 ships the raised ceiling (16384) natively, so the old `sed` that patched
+`DEFAULT_MAX_TOKENS = 8192 → 16384` is gone.** In its place the Dockerfile *asserts* the value:
 
 ```dockerfile
-RUN CONFIG=/app/.venv/.../graphiti_core/llm_client/config.py \
- && grep -q 'DEFAULT_MAX_TOKENS = 8192' "$CONFIG" \
- && sed -i 's/DEFAULT_MAX_TOKENS = 8192/DEFAULT_MAX_TOKENS = 16384/' "$CONFIG"
+RUN grep -q 'DEFAULT_MAX_TOKENS = 16384' /app/.venv/.../graphiti_core/llm_client/config.py
 ```
 
-**Why this matters.** Graphiti extracts entities and edges with its own LLM, and that call's *output*
-is hard-capped at `DEFAULT_MAX_TOKENS`, which is 8192 in every published image. A dense episode whose
-extraction overflows raises inside the worker — and getzep's worker loop catches only
-`CancelledError`, so **any other exception kills the worker for the whole process.** The HTTP API
-keeps returning `202`. Episodes are accepted, nothing is extracted, and narrative arcs quietly go
-blank. That failure hit production three times. There is no env var to raise the cap; 16384 exists
-only on unreleased upstream `main`.
+Same discipline, one layer up: a future base image that regresses the ceiling **fails the build**
+rather than silently shipping an unpatched one. (If you are reading an older note that prescribes the
+`sed`, it will now fail its own `grep -q` gate — that gate working as designed.)
 
-The `grep -q` before the `sed` is a build gate: if a future base image renames the constant the build
-**fails loudly** rather than silently shipping an unpatched image.
-
-The digest pin is also deliberate — it guarantees the Neo4j schema our Cypher depends on and the REST
-API our projector uses are byte-identical to what's been running; only the token ceiling moves.
-
-> ⚠️ **If your graphiti service has a Custom Start Command set, leave it alone.** Older docs in this
-> repo prescribe one that wraps the ingest worker so it survives a failed extraction instead of dying
-> silently. It is complementary to the Dockerfile patch, not a replacement — the `sed` above modifies
-> a file *inside the image*, so it applies no matter how the process is launched. To check whether
-> yours has one, see §5.
->
-> A start command is also the documented fix for a separate trap: the image declares a non-root
-> `USER app` but its default CMD launches via `uv` at `/root/.local/bin/uv`, which `app` cannot
-> execute once the platform runs the container as the declared user. That broke a production restart.
+The digest pin is deliberate — it guarantees the Neo4j schema our Cypher depends on and the REST API
+our projector uses are byte-identical to what's been running.
 
 **2.8c. Point the app at it.** These go in the *brain's* environment, not the graphiti service's:
 
@@ -594,7 +609,7 @@ NEO4J_PASSWORD=<same as above>
 
 So 40,000 characters per item maximum; beyond that content is dropped as a runaway backstop (the full
 text still lives in `items`, FTS, and pgvector — only the graph projection is bounded). Chunking keeps
-each extraction well under the patched 16384-token ceiling.
+each extraction well under the 16384-token ceiling.
 
 > If you have seen `MAX_EPISODE_CHARS` (4000, or 6000, or 2000) referenced anywhere — in older notes
 > or docs — **it no longer exists.** It was deleted and replaced by chunking. Don't set it.
@@ -825,8 +840,14 @@ Causes, in the order they actually occur:
 1. **The extraction LLM key is out of quota.** Look for `insufficient_quota` / `RateLimitError:
    Error code: 429`. Graphiti's `OPENAI_API_KEY` is **separate from the app's** and is easy to forget
    when you top one up. Every episode fails extraction while the HTTP API keeps returning `202`.
-2. **Unpatched image.** If `DEFAULT_MAX_TOKENS` is still 8192, look for `Output length exceeded max
-   tokens`. Rebuild from `graphiti/Dockerfile`; don't deploy `zepai/graphiti` directly.
+2. **Unpatched image, or a Custom Start Command that reverted it.** If `DEFAULT_MAX_TOKENS` is still
+   8192, look for `Output length exceeded max tokens`. Rebuild from `graphiti/Dockerfile`; don't
+   deploy `zepai/graphiti` directly. **Check the service has no Custom Start Command** — one that
+   runs `uv run …` re-syncs the venv to `graphiti-core` 0.13.2 at boot and undoes the image (§2.8b).
+   Confirm what's actually running: `railway logs -s graphiti | grep -i "installed .* packages"`
+   should print **nothing** — any `Uninstalled N packages / Installed N packages` at boot means the
+   venv is being re-resolved out from under the image. (Nothing prints the library version at boot;
+   the definitive check is the service settings screen.)
 3. **`OPENAI_BASE_URL=""`.** An empty string reads as *set* and breaks every LLM call, hanging the
    queue with no error at all. Comment it out instead of blanking it.
 4. **Invalid `group_id`.** Anything outside `[A-Za-z0-9_-]` raises inside the worker.
@@ -842,23 +863,32 @@ railway logs -s graphiti | grep -c "Got a job"    # jobs picked up
 railway logs -s graphiti | grep -c "Traceback"    # jobs that failed
 ```
 
-Upstream's worker catches only `CancelledError`, so an **unpatched** worker dies on the first
-non-cancelled exception — you'd see one traceback and then silence. If `Got a job` keeps appearing
-*after* tracebacks and the queue drains to 0, a Custom Start Command wrapping the worker loop is in
-effect and doing its job. That is also how to answer "is a Custom Start Command set on this service?"
-without a settings screen — though the definitive check is your host's service settings (Railway:
-service → **Settings → Deploy → Custom Start Command**).
+Upstream's worker catches only `CancelledError`, so it dies on the first non-cancelled exception —
+you'd see one traceback and then silence. **The image no longer ships a wrapper around that loop**
+(§2.8b: the Custom Start Command that used to provide one must now be empty, or it reverts the whole
+image), so treat one traceback followed by silence as "the worker is dead". Restart it **from the
+Railway dashboard**, and if it doesn't come back healthy roll back to the last-good deployment rather
+than iterating on a live service (see below) — never `railway up`/`redeploy`. Keep the episodes/facts
+probe on Admin → Integrations as the detector, since the HTTP API will
+keep answering `202` either way.
+
+To answer "is a Custom Start Command set on this service?": the definitive check is your host's
+service settings (Railway: service → **Settings → Deploy → Custom Start Command**). From the logs,
+`Uninstalled N packages / Installed N packages` at boot is the giveaway that one is running `uv run`
+and re-resolving the venv.
 
 **Recovery:** the graph is fully regenerable from Postgres — clear `graph_episodes` and let the
 projector re-run.
 
 ### Graphiti won't come up after a restart or redeploy
 
-Two known traps. The image declares a non-root `USER app` but its default CMD launches via `uv` at
-`/root/.local/bin/uv`, which `app` can't execute once the platform runs the container as the declared
-user — this broke a production restart. And a redeploy that rebuilds from the wrong source
-reintroduces the unpatched 8192 cap. If it doesn't come healthy, roll back to the last-good deployment
-in the dashboard rather than iterating on a live service.
+Two known traps. The **base** image declares a non-root `USER app` while its default CMD launches
+`uv` from `/root/.local/bin/uv`, which `app` can't execute once the platform runs the container as
+the declared user — this broke a production restart, and is why `graphiti/Dockerfile` now starts
+`/app/.venv/bin/uvicorn` directly. A **`uv`-based** Custom Start Command reintroduces it. And a redeploy that
+rebuilds from the wrong source drops back to upstream `graphiti-core` (0.13.2, 8192-token ceiling and
+the per-entity summary fan-out). If it doesn't come healthy, roll back to the last-good deployment in
+the dashboard rather than iterating on a live service.
 
 ### Semantic search returns nothing / "degraded"
 

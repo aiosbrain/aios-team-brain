@@ -760,19 +760,24 @@ guard enforces it, it's named.
   projected + zero extracted ⇒ **degraded**, surfaced on the Admin retrieval-health card (Graph memory
   leg) **and** the loud pipeline-health banner (synthetic `graph_extract` leg) on Home + Integrations.
   **Root fix — raise the cap (not shrink episodes).** The extractor's output cap is graphiti_core's
-  `DEFAULT_MAX_TOKENS`, which is **8192 in every published `zepai/graphiti` image** (verified 2026-07-17
-  through v0.22.0) and is **not** settable by env (getzep's `graph_service/config.py` exposes only
-  api_key/base_url/model_name/embedding; the 16384 default lives only on unreleased `main`). So we run a
-  **patched image** — `graphiti/Dockerfile` builds FROM the exact prod-pinned digest and bumps only that
-  constant to 16384 (gpt-4o's max output). No version jump ⇒ the Neo4j schema our `lib/graph/learning`
-  Cypher reads and the REST API the projector uses stay byte-identical; only the token ceiling moves.
-  Large items are **chunked** (`GRAPH_CHUNK_CHARS` default 2500 × `GRAPH_MAX_EPISODE_CHUNKS` default 16)
-  into one episode per chunk, so each chunk's extraction output stays under the 16384 ceiling without
-  truncating/losing content (chunking replaced the old single-episode `MAX_EPISODE_CHARS` cap; a
-  malformed size/cap env falls back to the default rather than emitting empty/garbage episodes).
-  Deploying the patched image is a `graphiti`-service rebuild (roll back to deployment `6208aed5`
-  if unhealthy). _Guards:_ `test/graph-extraction-health.test.ts` + the `deriveGraphState` extraction-stall
-  case in `test/retrieval-health.test.ts`.
+  `DEFAULT_MAX_TOKENS`, **8192 in every published `zepai/graphiti` image** (verified 2026-07-17 through
+  v0.22.0) and **not** settable by env (getzep's `graph_service/config.py` exposes only
+  api_key/base_url/model_name/embedding). It was raised by a `sed` in `graphiti/Dockerfile` until
+  **#490 (AIO-755)** replaced that with a version jump: the image now installs **`graphiti-core==0.29.3`**
+  into the venv (transitively pinned by `constraints.txt`), which ships **16384 natively** — so the sed is
+  gone and the build **asserts** the constant instead. The same jump is what removed the per-entity
+  summary fan-out (`extract_attributes_from_node`, one LLM call per resolved entity, 65.6% of graph
+  spend). Rollback is a **dashboard rollback to the last-good deployment**, recorded before the
+  deploy — never `railway up`/`redeploy`; it is data-safe (same labels/relationships/embedder) but
+  Graphiti's queue is in-memory, so 202-accepted-but-unprocessed episodes are lost and must come back
+  via reconcile. ⚠️ **The service's Custom Start Command must be EMPTY** — it overrides the image `CMD`,
+  and any `uv run` variant re-syncs the venv back to 0.13.2 at boot, silently restoring both the 8192
+  ceiling and the fan-out (README §2.8b). Large items are **chunked** (`GRAPH_CHUNK_CHARS` default 2500 ×
+  `GRAPH_MAX_EPISODE_CHUNKS` default 16) into one episode per chunk, so each chunk's extraction output
+  stays under the 16384 ceiling without truncating/losing content (chunking replaced the old
+  single-episode `MAX_EPISODE_CHARS` cap; a malformed size/cap env falls back to the default rather than
+  emitting empty/garbage episodes). _Guards:_ `test/graph-extraction-health.test.ts` + the
+  `deriveGraphState` extraction-stall case in `test/retrieval-health.test.ts`.
 
 ## Changing X? read this
 
