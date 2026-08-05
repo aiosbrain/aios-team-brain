@@ -257,8 +257,22 @@ on that), so the fire-and-forget promise is not at risk of serverless request-te
   (superseded the old single-episode truncation cap in #305 — chunking preserves all content instead of
   losing it), so each chunk's extraction output stays under the limit; full item text still lives in
   `items`/pgvector/FTS. Median item ~240 chars = a single chunk. If the worker
-  ever wedges anyway, restart graphiti (it's an image-based service; the Custom Start Command below persists).
-- **Graphiti start command (Railway)** — the `zepai/graphiti:latest` image declares a non-root `USER app`
+  ever wedges anyway, restart graphiti **from the Railway dashboard** and roll back to the last-good
+  deployment if it doesn't come up healthy (see the superseded start-command note below — the
+  boot-time worker patch it describes is no longer in effect).
+- **Graphiti start command (Railway)** — ⚠️ **SUPERSEDED (AIO-806, 2026-08-05). This is the "older
+  doc" the README warns about: the Custom Start Command must now be EMPTY.** A start command overrides
+  the image's `CMD`, and any variant built on `uv run` re-syncs the venv back to `graphiti-core`
+  0.13.2 at boot — silently undoing the 0.29.3 image (AIO-755) and restoring the per-entity LLM
+  fan-out. Of the two problems this bullet solved, only one moves into the image: the non-root
+  `USER app` / `uv` exec trap is fixed by `graphiti/Dockerfile`'s `CMD ["/app/.venv/bin/uvicorn", …]`.
+  The **worker-resilience wrapper is deliberately NOT carried over** — it cannot coexist with an empty
+  start command. What replaces it is narrower and honest: the overflow that triggered the wedge is
+  mitigated (16384 native + chunking) and a dead worker is *detected* by
+  `lib/graph/extraction-health.ts` (episodes vs facts), not survived. See README §5.
+  Left below as the point-in-time record.
+
+  — the `zepai/graphiti:latest` image declares a non-root `USER app`
   but its default CMD launches via `uv` at `/root/.local/bin/uv`, which `app` can't exec once Railway
   runs the container as the declared user (it broke on a 2026-07-03 restart). Fix = a **Custom Start
   Command** on the graphiti service that (a) base64-injects an `except Exception: continue` into the

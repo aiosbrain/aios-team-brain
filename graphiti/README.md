@@ -36,7 +36,8 @@ unless `GRAPHITI_URL` is set. Tune with `GRAPH_PROJECT_MINUTES` (default 60), `G
 (default 500 items/run), `GRAPH_PROJECT_ENABLED=false` to disable, and the episode-sizing knobs
 `GRAPH_CHUNK_CHARS` (default 2500) / `GRAPH_MAX_EPISODE_CHUNKS` (default 16). A large item is split into
 ≤16 chunks of ≤2500 chars, each projected as its own episode (`items:<id>#k`), so every chunk's
-extraction output stays under Graphiti's ceiling (16384 on the patched image — see `Dockerfile` + the
+extraction output stays under Graphiti's ceiling (16384, native in graphiti-core 0.29.3 and asserted
+by the build — see `Dockerfile`, whose ⚠️ start-command note is a deploy precondition, + the
 "202 ≠ extracted" gotcha in `docs/ARCHITECTURE.md`). Chunking replaced the old single-episode char cap:
 truncating to fit LOSES content, whereas chunking preserves all of it. A malformed value
 (empty/non-numeric/≤0/fractional) falls back to the default rather than emitting empty/garbage episodes.

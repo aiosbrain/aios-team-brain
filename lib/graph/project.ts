@@ -38,8 +38,8 @@ export function chunk<T>(items: readonly T[], size: number): T[][] {
 
 /**
  * Graphiti extracts entities/edges from each episode with its OWN LLM, and that call's OUTPUT is
- * hard-capped (graphiti_core `DEFAULT_MAX_TOKENS`; 16384 on the patched image — gpt-4o's ceiling, can't
- * go higher). A dense episode whose extraction output overflows that cap raises `Output length exceeded
+ * hard-capped (graphiti_core `DEFAULT_MAX_TOKENS`; 16384 — native in the 0.29.3 image and asserted by
+ * the build, no longer a patched constant). A dense episode whose extraction output overflows that cap raises `Output length exceeded
  * max tokens` in `resolve_extracted_nodes`, so it's accepted (202) but never becomes facts — the item's
  * work then never appears in the graph or narrative arcs (prod 2026-06/07). Truncating to fit LOSES
  * content, so instead we CHUNK: a large item is projected as several small episodes (`items:<id>#0`,

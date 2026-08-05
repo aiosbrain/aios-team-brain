@@ -10,12 +10,16 @@ name: aios-graphiti
 # depends on structured-output support — start with a strong cloud model, swap later via env.
 services:
   graph:
-    # Built from ./Dockerfile = the digest verified running in prod on 2026-07-06 (audit M5 — an
-    # unpinned `latest` tag is a reproducibility/supply-chain risk) + ONE surgical patch: raise the
-    # LLM extraction output cap 8192 → 16384 (graphiti_core `DEFAULT_MAX_TOKENS`), because every
-    # published image caps at 8192 and the server exposes no env for it. The base digest stays pinned
-    # inside the Dockerfile, so reproducibility holds; only the token ceiling changes. Bump the base
-    # digest deliberately and re-check against prod before/after. See ./Dockerfile for the full why.
+    # Built from ./Dockerfile = a pinned base digest (audit M5 — an unpinned `latest` tag is a
+    # reproducibility/supply-chain risk) with graphiti-core pinned to 0.29.3 on top, because EVERY
+    # published zepai/graphiti image — including the one tagged 0.22.0 — serves 0.13.2 from
+    # /app/.venv, and 0.13.2 makes one LLM call PER RESOLVED ENTITY per episode (AIO-755: ~65% of the
+    # graph bill). The image also patches the server onto the /chat/completions client at
+    # temperature=0 with small-model routing, and starts uvicorn from the venv directly — never
+    # `uv run`, which would re-sync the venv back to 0.13.2 at boot. The 8192 → 16384 output-cap sed
+    # is GONE: 0.29.3 ships 16384 and the build now asserts it. Bump the base digest deliberately and
+    # re-check against prod before/after. See ./Dockerfile for the full why, incl. the ⚠️ deploy
+    # precondition that the platform's custom start command must be EMPTY.
     build:
       context: .
       dockerfile: Dockerfile
