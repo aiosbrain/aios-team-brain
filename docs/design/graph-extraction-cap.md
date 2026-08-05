@@ -139,9 +139,16 @@ what makes it delta-eligible). All 21 items would still have skipped.
 So the skip's condition is composite:
 
 ```
-skip  iff  chunkConfigDeltaCompatible(stored, current)
-      AND  currentChunkCount <= (existingRow.chunk_shas?.length ?? 0)      // nothing owed
+skip  iff  <the existing sha / tier / purge terms>                         // unchanged
+      AND  chunkConfigDeltaCompatible(stored, current)
+      AND  episodes.length <= (existingRow.chunk_shas?.length ?? 0)        // nothing owed
 ```
+
+Both new terms are AND-ed **into** the existing condition, not a replacement for it. And
+`currentChunkCount` is `episodes.length` — never a re-derived `ceil(len/chars)`, which is a second
+derivation that can drift from `chunkContent` (they already disagree on a whitespace-only body) and
+would violate the module's own rule at `:396` that the ledger is derived from `episodes` so it "can
+never describe something else".
 
 That routes exactly the 21 owing items to the delta path (where `toPush` is their tail), keeps all
 2,190 complete items skipped, and is what makes the cost table's 179 episodes exact rather than
@@ -200,6 +207,12 @@ meta. Two summaries for one fact is the H6 drift shape; one writer, both readers
   pin the helper call as the predicate's term — its current slice-anchor on the literal
   `existingRow.chunk_config === CHUNK_CONFIG` breaks loudly (the length assertion reddens), which is
   the guard behaving correctly, not collateral.
+- **Both degenerate implementations die to a NAMED test, which is the point of listing them.** A
+  *count-only* skip (dropping the compatibility term) is killed by the existing AC11 dm fixture — it
+  rewrites `chunk_config` to `"1000x64"` while keeping the real pushed shas, so the counts match and
+  a count-only skip would skip, reddening AC11's "pushes everything". A *compatibility-only* skip
+  (dropping the count term) is killed by the new tail test: cap-grew is compatible, so all 21 items
+  skip and no tail lands. Nobody may "simplify" the AC11 fixture without re-reading this.
 - **ANTI-FLOOD — the case that separates a correct build from a plausible one.** A body-unchanged,
   config-stale, **complete** item from a RETRACTABLE source (Slack) must be neither deleted nor
   re-pushed: the fake-graphiti spy log must be empty for it. A builder who implements the skip as
