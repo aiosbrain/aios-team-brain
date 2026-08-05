@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { chunkConfigDeltaCompatible } from "@/lib/graph/project";
+import { chunkConfigDeltaCompatible, chunkContent } from "@/lib/graph/project";
 
 /**
  * GRAPHCOST-1 — the delta path's entry predicate is conjunctive, and every term is load-bearing.
@@ -80,6 +80,20 @@ describe("chunkConfigDeltaCompatible — can the stored hashes still be trusted?
     expect(chunkConfigDeltaCompatible("2500x40", "1000x64")).toBe(false);
     // Same cap, different chars: the cap comparison alone would wrongly pass this.
     expect(chunkConfigDeltaCompatible("1000x40", "2500x40")).toBe(false);
+  });
+
+  it("the ASSUMPTION the helper rests on: a raised cap APPENDS, it never rewrites", () => {
+    // If this were ever false, `cap grew ⇒ trustworthy` would be silent graph corruption rather than a
+    // saving — the stored hashes would identify chunks whose content had moved. Asserted directly
+    // rather than trusted, because the whole feature is downstream of it.
+    const text = Array.from({ length: 2500 * 20 }, (_, i) => String.fromCharCode(97 + (i % 26))).join("");
+    const small = chunkContent(text, 2500, 16);
+    const large = chunkContent(text, 2500, 40);
+    expect(small).toHaveLength(16);
+    expect(large.length).toBeGreaterThan(16);
+    expect(large.slice(0, 16), "the first 16 chunks must be byte-identical").toEqual(small);
+    // …and a CHARS change does move them, which is why that case is incompatible.
+    expect(chunkContent(text, 1250, 16)[0]).not.toEqual(small[0]);
   });
 
   it("malformed, empty or absent — NEVER 'compatible'", () => {

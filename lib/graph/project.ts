@@ -73,8 +73,9 @@ export const CHUNK_CHARS = resolvePositiveInt(process.env.GRAPH_CHUNK_CHARS, 250
  * "runaway-size backstop" its comment claimed: 21 items were over it and **689,235 characters — 8.6%
  * of the corpus — had never entered the graph**, concentrated in the densest documents we own
  * (`ARCHITECTURE.md` 11.8% present, a Chetan/John meeting transcript 54.5%). Sized from the measured
- * corpus: 40 completes 18 of the 21; three files stay capped and the projector now REPORTS that
- * rather than hiding it (`chunk_overflow_chars`).
+ * corpus: 40 completes 18 of the 21; three files (ARCHITECTURE.md at 136 chunks, model-migration at
+ * 48, brain-api at 46) stay capped and are STILL dropped silently — surfacing the refused character
+ * count is specced (docs/design/graph-extraction-cap.md §3) and deliberately NOT built here.
  *
  * ⚠️ CHANGING `CHUNK_CHARS` RE-EXTRACTS THE WHOLE CORPUS on the next tick, and it is billed. Every
  * chunk boundary moves, so every stored hash is stale and no item can take the delta path — ~$47 at

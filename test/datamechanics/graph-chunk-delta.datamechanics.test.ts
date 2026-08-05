@@ -313,9 +313,10 @@ describe("per-chunk projection ledger (real Postgres, mocked Graphiti)", () => {
  *
  * The whole feature turns on a distinction the first two spec drafts got wrong: the unchanged-content
  * skip and the delta predicate ask different questions. These two tests are what separate a correct
- * build from a plausible one — the first fails a compatibility-only skip (all over-cap items keep
- * skipping, no tail lands), and AC11 above fails a count-only skip (its fixture keeps real hashes while
- * rewriting the config, so counts match and a count-only skip would skip). Do not "simplify" either.
+ * build from a plausible one. The tail test fails a compatibility-only skip (all over-cap items keep
+ * skipping, no tail lands). The count-only mutant needs its OWN case — AC11 does not catch it, though
+ * this comment used to claim so: AC11 edits the body, so the sha term fails before either new term is
+ * consulted. Hence the third test below. Do not "simplify" any of them.
  */
 describe("chunk-cap raise (AIO-808)", () => {
   it("an over-cap item whose body never changed receives ONLY its tail", async () => {
@@ -347,10 +348,47 @@ describe("chunk-cap raise (AIO-808)", () => {
     const expectedTail = chunkContent(big, CHUNK_CHARS, MAX_EPISODE_CHUNKS).length - 16;
     expect(expectedTail, "fixture must actually straddle the old cap").toBeGreaterThan(0);
     expect(pushed.length, "exactly the tail, nothing re-pushed").toBe(expectedTail);
+    // Identity, not just arity: a build that pushed chunks 0..3 instead of 16..19 would satisfy a
+    // count-only assertion while putting the wrong content in the graph.
+    expect(pushed.map((e) => e.content)).toEqual(chunkContent(big).slice(16));
     // And the ledger converges to the current config with the full set recorded.
     const after = await ledgerRow(seed.teamId);
     expect(after?.chunk_config).toBe(`${CHUNK_CHARS}x${MAX_EPISODE_CHUNKS}`);
     expect(after?.chunk_shas?.length).toBe(16 + expectedTail);
+  });
+
+  it("a stale config with MATCHING counts still re-pushes — the count-only mutant's killer", async () => {
+    // Kills a skip that drops the compatibility term and keeps only `owesChunks`. The fixture makes
+    // the counts EQUAL by construction (the real pushed shas are left in place) while the stored
+    // config claims different CHUNK_CHARS — so boundaries moved, every stored hash is stale, and the
+    // only correct answer is a full re-push. A count-only skip sees "owes nothing" and skips,
+    // stranding the item on boundaries that no longer exist.
+    const seed = await seedTeam();
+    const slug = await teamSlugFor(seed.teamId);
+    const path = "github/repo/docs/count-match.md";
+    const fm = { source: "github" };
+    const text = body(CHUNK_CHARS * 3, "m");
+
+    await ingest(seed, { kind: "deliverable", path, body: text, access: "team", frontmatter: fm });
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(new FakeGraphiti()) });
+
+    const row = await ledgerRow(seed.teamId);
+    const storedShas = row!.chunk_shas!;
+    await db()
+      .from("graph_episodes")
+      .update({ chunk_config: `${CHUNK_CHARS * 2}x${MAX_EPISODE_CHUNKS}` }) // different CHARS, same cap
+      .eq("team_id", seed.teamId)
+      .eq("source_id", row!.source_id);
+
+    // Body untouched: the sha term still holds, so this reaches the two new terms — unlike AC11.
+    const fake = new FakeGraphiti();
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(fake) });
+
+    const pushed = fake.pushes.flatMap((p) => p.episodes);
+    expect(storedShas.length, "counts must MATCH, or this tests the count term instead").toBe(
+      chunkContent(text).length
+    );
+    expect(pushed.length, "untrustworthy boundaries ⇒ full re-push, not a skip").toBe(chunkContent(text).length);
   });
 
   it("ANTI-FLOOD — a COMPLETE item with a stale config is neither deleted nor re-pushed", async () => {

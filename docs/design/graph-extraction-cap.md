@@ -64,8 +64,12 @@ gone red against the build the spec described, which is the one honest thing abo
 
 The second change site has to be named: **the unchanged-content skip must become chunk-config-aware**,
 so a body-identical item whose stored config differs routes to the delta path instead of being
-skipped. There `toPush` is exactly the tail (or empty, for an item already complete under the new
-config, whose ledger row is then refreshed to the current config and nothing is sent).
+skipped. There `toPush` is exactly the tail.
+
+(An item already **complete** under the new cap does not route there at all — the composite skip's
+second term keeps it skipped, so its `chunk_config` stays on the old string indefinitely. Harmless
+and verified monotonic: compatibility compares the *stored* value, so a later raise still parses
+compatible from `"2500x16"`. The ANTI-FLOOD guard enforces that no write happens for these.)
 
 ### 2. The backfill branch would bless chunks it never pushed (HIGH)
 
@@ -213,7 +217,14 @@ per-episode — the 2026-06/07 blank-arcs incidents were oversized *episodes* ov
 output ceiling (fixed by the image's 16,384 patch and by `CHUNK_CHARS` itself). Nothing in this change
 makes any episode larger. That is the load-bearing distinction and the reason this is a safe knob.
 
-### 3. Make the drop visible instead of silent
+### 3. Make the drop visible instead of silent — SPECCED, DEFERRED (not in the first PR)
+
+**Status: not built.** The tails-land half is self-contained and verified; this observability half
+changes `chunkContent`'s signature and threads a count through two summary types, and it was cleaner
+to ship the correctness fix on its own than to bundle a second surface into it. Deferred deliberately
+and tracked, not forgotten — and no comment or test in the shipped code may claim it exists (one did,
+which the code review caught).
+
 
 `chunkContent` currently discards the tail with no signal. It should report how many characters it
 refused, and the projector should record the total on the run (`ingest_runs.meta.chunk_overflow_chars`)
@@ -235,11 +246,12 @@ meta. Two summaries for one fact is the H6 drift shape; one writer, both readers
   `existingRow.chunk_config === CHUNK_CONFIG` breaks loudly (the length assertion reddens), which is
   the guard behaving correctly, not collateral.
 - **Both degenerate implementations die to a NAMED test, which is the point of listing them.** A
-  *count-only* skip (dropping the compatibility term) is killed by the existing AC11 dm fixture — it
-  rewrites `chunk_config` to `"1000x64"` while keeping the real pushed shas, so the counts match and
-  a count-only skip would skip, reddening AC11's "pushes everything". A *compatibility-only* skip
-  (dropping the count term) is killed by the new tail test: cap-grew is compatible, so all 21 items
-  skip and no tail lands. Nobody may "simplify" the AC11 fixture without re-reading this.
+  *compatibility-only* skip (dropping the count term) is killed by the tail test: cap-grew is
+  compatible, so all 21 items skip and no tail lands. A *count-only* skip (dropping the compatibility
+  term) needed its own fixture — **AC11 does NOT kill it**, which I claimed and the code review
+  disproved: AC11 edits the body, so the sha term fails first and neither new term is ever consulted.
+  The killer is a dedicated case: unchanged body, real pushed shas kept (so counts match by
+  construction), `chunk_config` rewritten to a **different-chars** value ⇒ must full re-push.
 - **ANTI-FLOOD — the case that separates a correct build from a plausible one.** A body-unchanged,
   config-stale, **complete** item from a RETRACTABLE source (Slack) must be neither deleted nor
   re-pushed: the fake-graphiti spy log must be empty for it. A builder who implements the skip as
