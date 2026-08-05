@@ -63,6 +63,11 @@ describe("getLedgerMonthUsdExact — the month boundary", () => {
       // +14 and -12: the extremes that move a month boundary the furthest in each direction.
       await runSql(`set time zone '${tz}'`);
       try {
+        // Prove the session actually took it on the SAME pooled connection the query will use. If the
+        // pool ever hands back a different (unshifted) client, this test would otherwise pass
+        // vacuously against the naive SQL — asserting nothing while looking like TZ coverage.
+        const { rows } = await runSql<{ tz: string }>("select current_setting('TimeZone') as tz");
+        expect(rows[0]?.tz, "session TZ did not take — the shifted assertion would be vacuous").toBe(tz);
         const shifted = await getLedgerMonthUsdExact(db, seed.teamId, "openrouter");
         expect(shifted, `month total must not move under session TZ ${tz}`).toBeCloseTo(utcAnswer ?? -1, 5);
       } finally {

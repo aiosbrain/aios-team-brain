@@ -1,5 +1,4 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { PROXY_CALLS_PER_MINUTE_FOR_TEST } from "@/lib/llm/graph-proxy";
 
 /**
  * GUARD: the graph proxy's per-minute ceiling keeps its measured default AND stays env-tunable.
@@ -30,11 +29,10 @@ describe("graph proxy call ceiling", () => {
     // Explicitly UNSET the override rather than trusting the ambient env: this is now a variable we
     // tell operators to export, so a default assertion that reads the process env would go red on
     // the very machine that took the advice.
-    vi.stubEnv("GRAPH_PROXY_CALLS_PER_MINUTE", undefined as unknown as string);
+    vi.stubEnv("GRAPH_PROXY_CALLS_PER_MINUTE", undefined);
     vi.resetModules();
     const fresh = await import("@/lib/llm/graph-proxy");
     expect(fresh.PROXY_CALLS_PER_MINUTE_FOR_TEST).toBe(120);
-    expect(PROXY_CALLS_PER_MINUTE_FOR_TEST).toBe(120);
   });
 
   it("is env-tunable, so a deliberate backlog admission needs no deploy", async () => {

@@ -56,6 +56,14 @@ describe("guard: the reconciliation banner explains the permanent floor", () => 
     const monthBlock = page.indexOf("{monthReconciliation ? (");
     expect(lifetimeBranch, "lifetime branch not found — guard is looking at the wrong shape").toBeGreaterThan(-1);
     expect(monthBlock, "month block not found").toBeGreaterThan(-1);
+    // Without this, a refactor that removes the ternary close (a lint autofix to `&&`-style
+    // conditionals does exactly that) makes indexOf return -1, and the sibling assertion below
+    // degenerates to `monthBlock > -1` — always true. The guard would disarm SILENTLY, which is
+    // worse than breaking: re-anchor it deliberately rather than let it pass on nothing.
+    expect(
+      lifetimeBlockEnd,
+      "close anchor not found — re-anchor this guard rather than letting it pass vacuously"
+    ).toBeGreaterThan(-1);
     expect(monthBlock, "the month block must be a SIBLING of the lifetime banner, not nested in it").toBeGreaterThan(
       lifetimeBlockEnd
     );
