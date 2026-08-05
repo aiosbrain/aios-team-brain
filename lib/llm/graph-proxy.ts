@@ -229,15 +229,32 @@ export const isRefusal = (v: unknown): v is ProxyRefusal =>
   typeof v === "object" && v !== null && (v as { __refusal?: unknown }).__refusal === true;
 
 /**
- * Ceiling on authorized proxy calls per minute.
+ * Ceiling on authorized proxy calls per minute — a LEAK-DAMAGE BOUND, nothing else. Without it, one
+ * leaked shared secret turns into unmetered spend on the team's provider account.
  *
- * Not for Graphiti's benefit — its extraction is serial at ~10-20s per episode, so it will never come
- * close. This bounds the damage if the shared secret ever leaks: without it, one credential turns into
- * unmetered spend on the team's provider account. Sized well above any legitimate burst (a queue
- * drain plus the embedding calls that accompany it) so it can never be the thing that wedges the
- * graph — the failure this whole module exists to stop.
+ * The rationale here used to say extraction "is serial at ~10-20s per episode, so it will never come
+ * close" and that this "can never be the thing that wedges the graph". Both were false, and stayed in
+ * the file while the opposite happened. Extraction is NOT serial (Graphiti fans out with
+ * `semaphore_gather`), and the bucket is SHARED with the embeddings half ("one credential, one
+ * budget", below), which runs 9k-19k calls/day. Measured on the prod ledger 2026-08-05: during the
+ * graphiti-0.13.2 era, demand peaked at **426 attempts/min** and this ceiling refused our own
+ * extraction **4,248 times across 46 windows**.
+ *
+ * The cause was 0.13.2's per-entity summary fan-out, which #490 (graphiti 0.29.3) removed. Since that
+ * deploy, peak demand is 76/min and overflow windows are zero — so 120 is not binding today, and the
+ * number is left alone deliberately rather than raised on stale evidence. It is env-tunable so a
+ * DELIBERATE backlog admission (a large repo import, AIO-798) needs a variable and not a deploy.
+ *
+ * Diagnosing a recurrence needs two DIFFERENT queries, because there are two different throttles:
+ *   • ours     — `rate_limits` where `bucket='graph-llm-proxy'` and `count > <this limit>`;
+ *   • upstream — `llm_failures` where `failure_reason='http_429'` (calls we DID forward; the
+ *                proxy's own refusal is returned before any failure is recorded, by contract).
+ * Conflating them sends you to the wrong fix: the 1,904 upstream 429s of 2026-08-04 were OpenRouter
+ * throttling ONE cheap model (the small/summary route), not this ceiling.
  */
-const PROXY_CALLS_PER_MINUTE = 120;
+const PROXY_CALLS_PER_MINUTE = resolvePositiveInt(process.env.GRAPH_PROXY_CALLS_PER_MINUTE, 120);
+/** Exported for the guard test only — the default and its tunability are both load-bearing. */
+export const PROXY_CALLS_PER_MINUTE_FOR_TEST = PROXY_CALLS_PER_MINUTE;
 
 /**
  * How long we wait on the provider before giving up.
@@ -346,7 +363,7 @@ async function meterGraphCall(text: string, status: number, target: ProxyTarget,
     // NOT gated on a 2xx. "Only a successful call spent tokens" is what this used to assume, and it is
     // false: a provider can return `usage` alongside a non-2xx (a post-generation moderation refusal,
     // a partial), and that generation IS billed. Measured on 2026-07-30 the ledger held $51.46 while
-    // OpenRouter's own `/credits` reported $96.67 spent on the same key — 47% invisible. Metering
+    // OpenRouter reported $96.67 spent against a $51.46 ledger — 47% invisible. Metering
     // whatever `usage` arrives, whatever the status, is strictly closer to the truth; a body with no
     // `usage` still returns null below and records nothing.
     const c = meterFromOpenAiResponse(text, target.provider, target.model, meter.kind);

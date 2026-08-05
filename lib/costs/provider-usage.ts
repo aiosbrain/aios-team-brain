@@ -1,6 +1,7 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { getProviderKey } from "@/lib/integrations/manage";
+import { OPENROUTER_BASE_URL } from "@/lib/query/llm-backend";
 
 /**
  * PROVIDER-REPORTED spend — the reconciliation the `llm_usage` ledger cannot do for itself.
@@ -16,25 +17,44 @@ import { getProviderKey } from "@/lib/integrations/manage";
  * three times: ~4,000 generations that the provider billed and we recorded as nothing, because we only
  * metered 2xx responses.
  *
- * So we ask the provider what it actually charged. `GET /api/v1/credits` needs only the inference key
- * the team already configured (unlike `/activity`, which requires a management key — verified 403).
+ * So we ask the provider what it actually charged. `GET /api/v1/key` needs only the inference key the
+ * team already configured (unlike `/activity`, which requires a management key — verified 403).
  *
- * LIFETIME, NOT WINDOWED. `total_usage` is cumulative for the key, so it cannot be sliced to "last
- * 30 days". That is a real limitation and the UI must not pretend otherwise: it is shown as a
- * lifetime reconciliation beside the windowed ledger, never substituted for it.
+ * WHY `/key` AND NOT `/credits`. This module used to read `/credits` and called its `total_usage`
+ * key-scoped in three separate comments. It is ACCOUNT-scoped. Measured 2026-08-05: `/credits`
+ * reported $202.69 while this key had spent $194.36 — so $8.33 of an unrelated key's spend was being
+ * attributed to our own blind spot, in a figure whose entire job is to say how much spend we failed
+ * to explain. No amount of correct metering could ever have closed it. `/key` reports `data.usage`
+ * for the PRESENTED key, which is the only number the comparison was ever supposed to make.
+ *
+ * PERIOD SLICES ARE AVAILABLE, and they matter more than the lifetime figure. `/key` also returns
+ * `usage_daily` / `usage_monthly`. Measured the same morning: today's ledger $0.0491 vs the
+ * provider's $0.049143 — agreement to four decimal places, i.e. the meter is currently capturing
+ * essentially everything. The lifetime gap ($42.91, 22%) is almost entirely frozen July history
+ * (pre-metering + the timeout storm) that no future work can recover, which is why the MONTHLY
+ * figure is the one an operator can act on and the lifetime one is context.
+ *
+ * `usage_monthly` is a CALENDAR month, not a rolling 30 days: August-to-date was $70.29 against a
+ * $69.63 ledger, while a rolling window would have swept in the late-July storm (~$82 on our side
+ * alone). UTC-vs-account-local is not separable from that observation — the UI says "the provider's
+ * month" rather than implying our own boundary.
  */
 
-const CREDITS_URL = "https://openrouter.ai/api/v1/credits";
+const KEY_URL = `${OPENROUTER_BASE_URL}/key`;
 const FETCH_TIMEOUT_MS = 4_000;
 /** Spend moves slowly relative to a page view, and this sits on a render path. */
 const CACHE_TTL_MS = 10 * 60_000;
 
 export interface ProviderUsage {
   provider: "openrouter";
-  /** Cumulative USD the provider says this key has spent. */
+  /** Cumulative USD the provider says THIS KEY has spent (`/key` → `data.usage`). */
   totalUsageUsd: number;
-  /** Credits purchased, when the provider reports it — lets the UI show headroom. */
-  totalCreditsUsd: number | null;
+  /**
+   * This key's spend in the provider's current calendar month, when reported. The actionable figure:
+   * the lifetime total is dominated by a frozen pre-metering block, so only the current period can
+   * tell an operator whether spend is escaping the meter NOW.
+   */
+  monthUsageUsd: number | null;
 }
 
 let cache: { at: number; teamId: string; value: ProviderUsage | null } | null = null;
@@ -45,21 +65,27 @@ export function resetProviderUsageCache(): void {
 }
 
 /**
- * Parse OpenRouter's `/credits` body. Pure, so the shape is pinned without a network call.
+ * Parse OpenRouter's `/key` body. Pure, so the shape is pinned without a network call.
  *
  * Returns null rather than zero for anything unrecognised: a missing number must read as "we don't
  * know what the provider charged", never as "the provider charged nothing" — the second is exactly
  * the false reassurance this module exists to end.
  */
-export function parseCreditsBody(body: unknown): ProviderUsage | null {
-  const d = (body as { data?: { total_usage?: unknown; total_credits?: unknown } } | null)?.data;
+export function parseKeyUsageBody(body: unknown): ProviderUsage | null {
+  const d = (body as { data?: { usage?: unknown; usage_monthly?: unknown } } | null)?.data;
   // `>= 0` as well as finite: a negative total would render "$-5.00 spent", which is not a number any
   // reader can act on. Unparseable and absurd both mean "we don't know".
-  if (!d || typeof d.total_usage !== "number" || !Number.isFinite(d.total_usage) || d.total_usage < 0) {
-    return null;
-  }
-  const credits = typeof d.total_credits === "number" && Number.isFinite(d.total_credits) ? d.total_credits : null;
-  return { provider: "openrouter", totalUsageUsd: d.total_usage, totalCreditsUsd: credits };
+  //
+  // Keyed on `usage` SPECIFICALLY, never falling back to `total_usage`: a `/credits`-shaped body must
+  // parse to null, so a silent revert to the account-wide endpoint reads as "we don't know" instead
+  // of as a plausible wrong figure. That substitution is the exact defect this function was rewritten
+  // to end, and a tolerant parser would let it back in unnoticed.
+  if (!d || typeof d.usage !== "number" || !Number.isFinite(d.usage) || d.usage < 0) return null;
+  const month =
+    typeof d.usage_monthly === "number" && Number.isFinite(d.usage_monthly) && d.usage_monthly >= 0
+      ? d.usage_monthly
+      : null;
+  return { provider: "openrouter", totalUsageUsd: d.usage, monthUsageUsd: month };
 }
 
 /**
@@ -82,11 +108,11 @@ export async function getProviderReportedUsage(
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
       try {
-        const res = await fetch(CREDITS_URL, {
+        const res = await fetch(KEY_URL, {
           headers: { Authorization: `Bearer ${key}` },
           signal: ctrl.signal,
         });
-        if (res.ok) value = parseCreditsBody(await res.json());
+        if (res.ok) value = parseKeyUsageBody(await res.json());
       } finally {
         clearTimeout(timer);
       }
@@ -120,6 +146,13 @@ export interface LedgerReconciliation {
 /** Below this the difference is timing and rounding, not a missing-spend story. */
 const MATERIAL_FRACTION = 0.05;
 const MATERIAL_ABSOLUTE_USD = 1;
+/**
+ * The same floor for the CURRENT-MONTH comparison, where the denominator resets monthly. $5 is the
+ * smallest gap that cannot be explained by the provider-leg cache plus normal in-flight skew at this
+ * install's scale (a full day of healthy graph spend is ~$5-9), so anything clearing it in-month is a
+ * real story rather than an artifact of when the page was rendered.
+ */
+export const MATERIAL_ABSOLUTE_MONTH_USD = 5;
 
 /**
  * Compare what the provider charged against what the ledger attributed.
@@ -129,14 +162,26 @@ const MATERIAL_ABSOLUTE_USD = 1;
  * while contributing nothing to OpenRouter's number. A negative "unattributed" would be nonsense; the
  * honest reading of ledger ≥ provider is simply "nothing unattributed on this provider".
  */
-export function reconcileLedger(providerUsd: number, ledgerUsd: number): LedgerReconciliation {
+export function reconcileLedger(
+  providerUsd: number,
+  ledgerUsd: number,
+  /**
+   * Absolute floor below which a difference is timing, not a story. Defaults to the lifetime figure;
+   * the CURRENT-MONTH comparison passes `MATERIAL_ABSOLUTE_MONTH_USD` because its denominator starts
+   * near zero every month — on day one, $1 of ordinary skew (the provider leg is cached up to 10
+   * minutes while the ledger leg is live) clears both legs on a few-dollar month and renders "spend is
+   * escaping the meter today" about nothing. A false amber in the first month this ships is the #463
+   * credibility failure repeating.
+   */
+  materialAbsoluteUsd: number = MATERIAL_ABSOLUTE_USD
+): LedgerReconciliation {
   const unattributed = Math.max(0, providerUsd - ledgerUsd);
   const fraction = providerUsd > 0 ? unattributed / providerUsd : 0;
   // BOTH legs. A percentage alone flags a $0.30-vs-$0.05 new install (83%, meaningless); an absolute
   // alone flags a $10 drift on $1,000/mo (1%, noise). Only a gap that is both large enough to notice
   // and large enough to matter is worth an operator's attention.
-  const material = unattributed >= MATERIAL_ABSOLUTE_USD && fraction >= MATERIAL_FRACTION;
-  const exceeds = ledgerUsd - providerUsd >= MATERIAL_ABSOLUTE_USD;
+  const material = unattributed >= materialAbsoluteUsd && fraction >= MATERIAL_FRACTION;
+  const exceeds = ledgerUsd - providerUsd >= materialAbsoluteUsd;
   return {
     providerUsd,
     ledgerUsd,
