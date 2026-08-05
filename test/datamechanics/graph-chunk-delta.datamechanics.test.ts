@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { createHash } from "node:crypto";
-import { projectItemsToGraph, CHUNK_CHARS, MAX_EPISODE_CHUNKS, chunkContent } from "@/lib/graph/project";
+import { projectItemsToGraph, CHUNK_CHARS, MAX_EPISODE_CHUNKS, CHUNK_CONFIG, chunkContent } from "@/lib/graph/project";
 import { db, ingest, seedTeam } from "./helpers";
 import { FakeGraphiti, client } from "./fake-graphiti";
 
@@ -136,7 +136,7 @@ describe("per-chunk projection ledger (real Postgres, mocked Graphiti)", () => {
     await expectLedgerContained(seed.teamId, bothPasses);
   });
 
-  it("AC4 — a pre-feature ledger row is backfilled by one pass that pushes nothing", async () => {
+  it("AC4 — a pre-feature ledger row converges by ONE FULL RE-PUSH (AIO-808 inverted the contract)", async () => {
     const seed = await seedTeam();
     const slug = await teamSlugFor(seed.teamId);
     const text = body(CHUNK_CHARS * 2);
@@ -158,11 +158,23 @@ describe("per-chunk projection ledger (real Postgres, mocked Graphiti)", () => {
     const second = new FakeGraphiti();
     await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(second) });
 
-    expect(second.pushedEpisodes).toHaveLength(0); // no re-extraction event on deploy
+    // INVERTED BY AIO-808. This used to assert a free backfill: record the current config's hashes
+    // without pushing. That branch is deleted, because its premise — "an identical body means these
+    // are the chunks we pushed" — was only ever valid inside one config era (its own comment said so),
+    // and raising MAX_EPISODE_CHUNKS ended that era. Worse, for a pre-ledger row OVER the old cap it
+    // would have blessed tail hashes for chunks present in the graph in no form at all — silent,
+    // permanent loss that reconcile cannot see.
+    //
+    // The contract now: an unattestable config converges via ONE full re-push. That is the
+    // self-hosted upgrade path from pre-GRAPHCOST-1, and this test is what stops someone
+    // "restoring" the backfill later without confronting the hazard above.
+    const expected = chunkContent(text).length;
+    expect(expected, "fixture must actually have chunks to push").toBeGreaterThan(0);
+    expect(second.pushedEpisodes, "an unattestable config re-pushes, it does not bless").toHaveLength(expected);
     const after = await ledgerRow(seed.teamId);
     expect(after?.chunk_shas).toEqual(chunkContent(text).map(sha));
-    expect(after?.projected_at).toBe(before?.projected_at); // AC9 again: nothing was pushed
-    await expectLedgerContained(seed.teamId, first); // the hashes it recorded were pushed by pass 1
+    expect(after?.chunk_config).toBe(CHUNK_CONFIG); // and converges to the current era
+    expect(after?.projected_at, "a real push bumps the stamp").not.toBe(before?.projected_at);
   });
 
   it("AC5 — a tier change pushes every chunk into the new group, ledger notwithstanding", async () => {

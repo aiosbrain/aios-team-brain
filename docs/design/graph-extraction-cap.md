@@ -163,11 +163,38 @@ corpus), so changing `CHUNK_CHARS` becomes a decision with a price tag attached 
 constant edit whose effect arrives item-by-item over months. Worth stating loudly next to the
 constant.
 
-**The backfill at `:453` is gated on STRICT equality** (`stored === CHUNK_CONFIG`), not helper
+**The backfill at `:453` was gated on STRICT equality** (`stored === CHUNK_CONFIG`), not helper
 compatibility — under compatibility, an empty-ledger over-cap row would stamp current-config hashes
 for tails never pushed, i.e. the hazard surviving its own fix. (Under the composite skip such a row
 always "owes chunks" and falls through to a sound full push anyway; the gate is strict regardless,
 because a second line of defence that shares the first one's blind spot is not one.)
+
+### Found at build: the backfill branch is DELETED, not gated
+
+Building this made the branch unreachable — a pre-ledger row carries `chunk_config = ""`, which the
+composite skip correctly rejects, so the backfill inside the skip can never run and its acceptance
+criterion (AC4) went red. Reviewed rather than patched, and the branch is **removed**:
+
+- **Its own comment set the expiry.** The premise "an identical body means these are the chunks we
+  pushed" holds "only while the chunk config is the one that produced them, which an empty ledger
+  cannot attest", and it prescribed invalidation on any config change. This change *is* that change.
+- **For the population it still served, it produced this feature's own bug.** A pre-ledger row over
+  the old cap would have been blessed with 40 current-config hashes including tails present in the
+  graph in no form — permanent silent loss, invisible to reconcile. A full push is both correct and
+  the first time those tails are extracted.
+- **The "bless shas but not the config" variant is self-defeating.** The saving lives entirely in the
+  *subsequent* skip, that skip requires a trusted config, and a pre-ledger row's producing config is
+  unattestable by construction. It would re-push next pass anyway, from a ledger claiming hashes it
+  never used.
+
+**AC4 is inverted, not deleted:** a pre-feature row (empty ledger, `""` config, unchanged body) now
+converges via one full re-push and lands on the current config. That is the self-hosted upgrade path,
+and the guard that stops someone restoring the backfill without confronting the hazard above.
+
+**Upgrade-path note for the release, not a mechanism:** an install upgrading from pre-GRAPHCOST-1 with
+Graphiti enabled re-extracts its pre-ledger rows once, on the first tick (~$0.01/episode). Prod holds
+**0** such rows so the cost table below is unchanged; building a migration for that population would
+be a guard with no failure mode behind it.
 
 ### 2. Raise the cap to 40 (100,000 chars/item)
 

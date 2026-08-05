@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { GraphEpisode } from "@/lib/graph/graphiti-client";
-import { projectSlackToGraph, projectItemsToGraph, deleteItemEpisodes, CHUNK_CHARS, MAX_EPISODE_CHUNKS, GROUP_SCAN_DEPTH } from "@/lib/graph/project";
+import { projectSlackToGraph, projectItemsToGraph, deleteItemEpisodes, CHUNK_CHARS, MAX_EPISODE_CHUNKS, GROUP_SCAN_DEPTH, chunkContent } from "@/lib/graph/project";
 import { runGraphProjection } from "@/lib/graph/run";
 import {
   reconcileProjectedEpisodes,
@@ -112,7 +112,11 @@ describe("projectItemsToGraph — all ingestions (real Postgres, mocked Graphiti
   it("chunks an oversized item into ≤ MAX_EPISODE_CHUNKS small episodes so extraction can't overflow", async () => {
     const seed = await seedTeam();
     const slug = await teamSlugFor(seed.teamId);
-    const huge = "x ".repeat(40_000); // ~80k chars, far beyond one chunk
+    // DERIVED from the cap, not a literal (AIO-808 raised MAX_EPISODE_CHUNKS 16 -> 40 and this test's
+    // 80k literal stopped straddling it — 32 chunks, uncapped, so the assertion below silently changed
+    // meaning from "the cap binds" to "the body happened to be this long"). The fixture must exceed
+    // the cap for the claim to be about capping at all.
+    const huge = "x ".repeat(Math.ceil((CHUNK_CHARS * (MAX_EPISODE_CHUNKS + 4)) / 2));
     await ingest(seed, { kind: "deliverable", path: "notion/huge.md", body: huge, access: "team" });
 
     const fake = new FakeGraphiti();
@@ -120,6 +124,9 @@ describe("projectItemsToGraph — all ingestions (real Postgres, mocked Graphiti
 
     expect(fake.pushes).toHaveLength(1); // one addEpisodes call for the item…
     const eps = fake.pushes[0].episodes;
+    // The body is long enough to want MORE chunks than the cap allows, so this asserts the CAP, not
+    // the body length — which is the whole point of the test.
+    expect(chunkContent(huge, CHUNK_CHARS, Number.MAX_SAFE_INTEGER).length).toBeGreaterThan(MAX_EPISODE_CHUNKS);
     expect(eps.length).toBe(MAX_EPISODE_CHUNKS); // …carrying several chunk episodes, capped
     for (const e of eps) expect(e.content.length).toBeLessThanOrEqual(CHUNK_CHARS); // each fits the extractor
     // Multi-chunk items get the `#k` suffix; each chunk still resolves back to the one item.

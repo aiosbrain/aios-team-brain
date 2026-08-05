@@ -55,6 +55,14 @@ export function chunk<T>(items: readonly T[], size: number): T[][] {
  * 0/NaN chunk CAP makes it emit none — either way the projector "succeeds" feeding the graph nothing
  * (or garbage). `Math.floor` also closes the fractional hole (0.5 → 0). Pure + exported, unit-tested.
  */
+/**
+ * ⚠️ CHANGING THIS RE-EXTRACTS THE ENTIRE CORPUS on the next projector tick, and it is billed
+ * (~$47 at the 2026-08 corpus). Every chunk boundary is `slice(i, i + CHUNK_CHARS)`, so a different
+ * value moves all of them: every stored hash goes stale, no item can take the delta path, and each
+ * one full-re-pushes — including dragging retractable sources through their delete-then-repush shape.
+ * Raising MAX_EPISODE_CHUNKS below does NOT do this; the two knobs look alike and cost ~27x
+ * differently. See docs/design/graph-extraction-cap.md before touching either.
+ */
 export const CHUNK_CHARS = resolvePositiveInt(process.env.GRAPH_CHUNK_CHARS, 2500);
 /**
  * How many chunks of `CHUNK_CHARS` an item may become — i.e. `CHUNK_CHARS * MAX_EPISODE_CHUNKS` is the
@@ -514,42 +522,20 @@ export async function projectItemsToGraph(
       chunkingUnchanged &&
       !owesChunks
     ) {
-      // BACKFILL (GRAPHCOST-1): a row written before the per-chunk ledger existed knows the body is
-      // unchanged but not which chunks that body is made of. Record them here — from the same
-      // `toEpisodes` output the last push used, for a body proven identical by `content_sha256` — so
-      // the corpus converges as the projector walks it instead of re-extracting itself on deploy.
-      // No episodes are sent, so `projected_at` is deliberately NOT bumped (see the push path).
+      // NO BACKFILL HERE ANY MORE (AIO-808). GRAPHCOST-1 had a branch that, for a row with an empty
+      // chunk ledger and a matching body sha, recorded the CURRENT config's hashes without pushing —
+      // converging pre-ledger installs for free. Its own comment admitted the premise "an identical
+      // body means these are the chunks we pushed" holds "only while the chunk config is the one that
+      // produced them, which an empty ledger cannot attest", and prescribed invalidation on any config
+      // change. Raising MAX_EPISODE_CHUNKS IS that change, so the branch's era ended with it.
       //
-      // The premise — "an identical body means these are the chunks we pushed" — holds only while the
-      // chunk config is the one that produced them, which an empty ledger cannot attest. So a rollout
-      // that changes CHUNK_CHARS/MAX_EPISODE_CHUNKS must invalidate by clearing `content_sha256` to
-      // `''`, NOT by clearing `chunk_shas`: the sentinel misses the unchanged-skip above and fails the
-      // delta predicate, forcing a real re-push. Emptying `chunk_shas` alone would route the row
-      // straight through here and bless the new config's hashes for chunks never pushed under it.
-      // STRICT equality, deliberately NOT `chunkConfigDeltaCompatible` (AIO-808): under compatibility a
-      // raised cap would let this bless current-config hashes for tail chunks never pushed — the exact
-      // hazard the comment above describes, surviving its own gate. A second line of defence that
-      // shares the first one's blind spot is not one. (The composite skip means such a row falls
-      // through to a sound full push anyway; measured 0 empty-ledger rows in prod on 2026-08-05, which
-      // is an observation about that instant, not an invariant.)
-      if (
-        chunkShas.length > 0 &&
-        (existingRow.chunk_shas?.length ?? 0) === 0 &&
-        existingRow.chunk_config === CHUNK_CONFIG
-      ) {
-        await db.from("graph_episodes").upsert(
-          {
-            team_id: args.teamId,
-            source_table: SOURCE_TABLE,
-            source_id: item.id,
-            group_id: existingRow.group_id,
-            content_sha256: existingRow.content_sha256,
-            chunk_shas: chunkShas,
-            chunk_config: CHUNK_CONFIG,
-          },
-          { onConflict: "team_id,source_table,source_id" }
-        );
-      }
+      // It is deleted rather than left unreachable because for the one population it still served it
+      // produced this feature's own bug: a pre-ledger row OVER the old cap would have been blessed
+      // with 40 current-config hashes including tails that exist in the graph in no form at all —
+      // permanent silent loss, invisible to reconcile (whose landed-check is satisfied by chunk #0).
+      // Such a row now falls through to a full push, which is both correct and the first time its
+      // tails are extracted. Convergence for pre-ledger rows is therefore the full-push path, once.
+      // Pinned by the inverted AC4 in test/datamechanics/graph-chunk-delta.datamechanics.test.ts.
       skipped++;
       continue; // unchanged content, same tier → no-op (idempotent)
     }
