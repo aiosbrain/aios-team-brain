@@ -1,36 +1,58 @@
 import { describe, expect, it } from "vitest";
-import { parseCreditsBody, reconcileLedger } from "@/lib/costs/provider-usage";
+import { parseKeyUsageBody, reconcileLedger } from "@/lib/costs/provider-usage";
 
 /**
  * Spec: the costs surface must not present the ledger's FLOOR as the total.
  *
- * Measured on prod 2026-07-30 — the ledger said $51.46, OpenRouter's own `/credits` said $96.67 on
- * the same key. 47% of real spend was invisible, and the dashboard reported the floor with no hint
- * that anything was missing. The cause is structural: a call that times out or fails after the
- * provider generated is billed upstream and returns no `usage` for us to read, so no amount of
- * fixing the meter can make the ledger complete on its own. Only the provider knows the total.
+ * Measured on prod 2026-07-30 — the ledger said $51.46, OpenRouter said $96.67. 47% of real spend was
+ * invisible, and the dashboard reported the floor with no hint that anything was missing. The cause is
+ * structural: a call that times out or fails after the provider generated is billed upstream and
+ * returns no `usage` for us to read, so no amount of fixing the meter can make the ledger complete on
+ * its own. Only the provider knows the total.
+ *
+ * The SOURCE of the provider figure is itself load-bearing (2026-08-05): this read `/credits`, whose
+ * `total_usage` is ACCOUNT-wide, while three comments called it key-scoped. Account $202.69 vs this
+ * key $194.36 — $8.33 of an unrelated key's spend inflating the very number that reports how much we
+ * failed to explain, uncloseable by any metering fix. `/key` → `data.usage` is the per-key figure.
  */
 
-describe("parseCreditsBody — 'unknown' must never read as 'zero'", () => {
-  it("reads the provider's cumulative spend", () => {
-    const got = parseCreditsBody({ data: { total_credits: 110, total_usage: 96.670187517 } });
-    expect(got).toEqual({ provider: "openrouter", totalUsageUsd: 96.670187517, totalCreditsUsd: 110 });
+describe("parseKeyUsageBody — 'unknown' must never read as 'zero'", () => {
+  it("reads this key's spend and its calendar-month slice from a real /key body", () => {
+    // Recorded verbatim from prod 2026-08-05, not hand-written: the fields this parser depends on
+    // exist in the shape the provider actually returns.
+    const got = parseKeyUsageBody({
+      data: {
+        label: "sk-or-v1-959...5ef",
+        limit: null,
+        usage: 194.39890159,
+        usage_daily: 0.049143255,
+        usage_weekly: 53.519963315,
+        usage_monthly: 70.29084969,
+        is_free_tier: false,
+      },
+    });
+    expect(got).toEqual({ provider: "openrouter", totalUsageUsd: 194.39890159, monthUsageUsd: 70.29084969 });
   });
 
-  it("keeps usage when credits are absent — they answer different questions", () => {
-    expect(parseCreditsBody({ data: { total_usage: 12.5 } })?.totalCreditsUsd).toBeNull();
-    expect(parseCreditsBody({ data: { total_usage: 12.5 } })?.totalUsageUsd).toBe(12.5);
+  it("keeps the lifetime figure when the month slice is absent — they answer different questions", () => {
+    expect(parseKeyUsageBody({ data: { usage: 12.5 } })?.monthUsageUsd).toBeNull();
+    expect(parseKeyUsageBody({ data: { usage: 12.5 } })?.totalUsageUsd).toBe(12.5);
   });
 
   it("refuses a NEGATIVE total rather than rendering '$-5.00 spent'", () => {
-    expect(parseCreditsBody({ data: { total_usage: -5 } })).toBeNull();
+    expect(parseKeyUsageBody({ data: { usage: -5 } })).toBeNull();
+  });
+
+  it("a /credits-shaped body parses to NULL — a silent revert must not read as a plausible figure", () => {
+    // THE guard with real history. `/credits.total_usage` is ACCOUNT-wide; reading it as this key's
+    // spend inflated the unattributed gap by every other key's lifetime spend. If someone points this
+    // back at /credits, the shape must be unrecognised ("we don't know"), never quietly parsed.
+    expect(parseKeyUsageBody({ data: { total_usage: 202.69, total_credits: 110 } })).toBeNull();
   });
 
   it("returns NULL — not 0 — for a shape it doesn't recognise", () => {
-    // A missing number must read as "we don't know what the provider charged". Zero would be the
-    // same false reassurance this module exists to end.
-    for (const junk of [null, undefined, {}, { data: {} }, { data: { total_usage: "96.67" } }, { data: { total_usage: NaN } }]) {
-      expect(parseCreditsBody(junk)).toBeNull();
+    for (const junk of [null, undefined, {}, { data: {} }, { data: { usage: "96.67" } }, { data: { usage: NaN } }]) {
+      expect(parseKeyUsageBody(junk)).toBeNull();
     }
   });
 });

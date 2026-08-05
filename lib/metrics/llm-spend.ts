@@ -383,6 +383,39 @@ export async function getGraphSpendByCallKindAndModel(
  * refusal was the right instinct and is why the /costs banner stayed correct while the headline
  * beside it drifted; an exact `SUM` means there is now nothing to refuse.
  */
+/**
+ * The ledger's total for ONE provider in the CURRENT CALENDAR MONTH, UTC — the counterpart to
+ * `/key`'s `usage_monthly` (AIO-805).
+ *
+ * UTC truncation is not incidental: the provider's month boundary is what this is compared against,
+ * so truncating in the server's local zone would manufacture a gap out of a timezone, in a figure
+ * whose only job is to expose real missing spend. `date_trunc('month', now() at time zone 'utc')`
+ * keeps both legs on the same boundary.
+ *
+ * Why a monthly figure exists at all: the LIFETIME comparison is dominated by a frozen pre-metering
+ * block (measured 2026-08-05: $42.91 of a $42.91 lifetime gap is July history), so it can never
+ * improve and cannot tell an operator whether spend is escaping the meter NOW. The month can — it
+ * read 0.9% the morning it shipped, against 22% lifetime.
+ */
+export async function getLedgerMonthUsdExact(
+  _db: unknown,
+  teamId: string,
+  provider: string
+): Promise<number | null> {
+  try {
+    const { rows } = await runSql<{ total: string | number }>(
+      `select coalesce(sum(cost_usd), 0) as total
+         from llm_usage
+        where team_id = $1 and provider = $2
+          and created_at >= date_trunc('month', (now() at time zone 'utc'))`,
+      [teamId, provider]
+    );
+    return Number(rows[0]?.total ?? 0) || 0;
+  } catch {
+    return null; // can't reconcile → the caller shows nothing rather than a wrong comparison
+  }
+}
+
 export async function getLedgerLifetimeUsdExact(
   _db: unknown,
   teamId: string,

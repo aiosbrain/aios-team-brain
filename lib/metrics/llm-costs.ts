@@ -4,6 +4,7 @@ import { scopeLlmUsage, type QueryLogViewer } from "@/lib/auth/visibility";
 import { rangeDays, type Range } from "./range";
 import {
   getLedgerLifetimeUsdExact,
+  getLedgerMonthUsdExact,
   getSpendCallCount,
   getSpendSlices,
   getSpendTotalUsd,
@@ -205,10 +206,11 @@ export async function getLlmCostBreakdown(
 /**
  * The ledger's LIFETIME total for a team, for reconciliation against the provider's own figure.
  *
- * Lifetime, not windowed, because the thing it is compared against is: OpenRouter's `/credits`
- * reports cumulative usage for a key and cannot be sliced by date. Comparing a 30-day ledger slice
- * to a lifetime provider total would manufacture a gap that isn't there — the opposite failure to
- * the one this exists to expose.
+ * Lifetime, not windowed, because the thing it is compared against is: OpenRouter's `/key` reports
+ * `usage` cumulatively for the key. Comparing a 30-day ledger slice to a lifetime provider total
+ * would manufacture a gap that isn't there — the opposite failure to the one this exists to expose.
+ * For the CURRENT-PERIOD comparison (the actionable one) see `getLedgerMonthUsd`, matched against
+ * `/key`'s `usage_monthly` on the same UTC boundary.
  *
  * Team-wide by construction (no viewer scoping): the provider figure is for the whole key, so the
  * only meaningful comparison is the whole team's ledger. The caller gates this on `isAdmin` for the
@@ -232,4 +234,17 @@ export async function getLedgerLifetimeUsd(
   // /costs reconciliation banner stayed correct while the headline beside it drifted. With an exact
   // `SUM` there is nothing left to refuse, so the null case now means only "the query failed".
   return getLedgerLifetimeUsdExact(db, teamId, provider);
+}
+
+/**
+ * The ledger's CURRENT-MONTH total for a provider (UTC), the counterpart to `/key`'s `usage_monthly`.
+ * Thin passthrough for the same reason `getLedgerLifetimeUsd` is one: the app layer must not reach
+ * into `lib/costs` directly, and the reconciliation's two legs should be fetched the same way.
+ */
+export async function getLedgerMonthUsd(
+  db: DbClient,
+  teamId: string,
+  provider: string
+): Promise<number | null> {
+  return getLedgerMonthUsdExact(db, teamId, provider);
 }

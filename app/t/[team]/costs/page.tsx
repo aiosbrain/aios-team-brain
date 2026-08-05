@@ -5,7 +5,7 @@ import { serverClient } from "@/lib/db/server";
 import { resolveTeamContext } from "@/lib/auth/team-context";
 import { isRestrictedTier } from "@/lib/auth/visibility";
 import { parseRange } from "@/lib/metrics/range";
-import { getLlmCostBreakdown, getLedgerLifetimeUsd } from "@/lib/metrics/llm-costs";
+import { getLlmCostBreakdown, getLedgerLifetimeUsd, getLedgerMonthUsd } from "@/lib/metrics/llm-costs";
 import { getGraphEfficiency, HEALTHY_CALLS_PER_EPISODE } from "@/lib/metrics/graph-efficiency";
 import { getProviderReportedUsage, reconcileLedger } from "@/lib/costs/provider-usage";
 import { RangeSelector } from "@/components/dashboard/range-selector";
@@ -60,9 +60,14 @@ export default async function CostsPage({
 
   // RECONCILIATION. The ledger is a floor, not a total: a call that times out or fails after the
   // provider already generated is billed upstream and returns no `usage` for us to read, so no amount
-  // of fixing the meter closes the gap. Measured 2026-07-30 the ledger said $51.46 while OpenRouter's
-  // own `/credits` said $96.67 on the same key — and the page presented the floor as the answer.
+  // of fixing the meter closes the gap. Measured 2026-07-30 the ledger said $51.46 while OpenRouter
+  // said $96.67 — and the page presented the floor as the answer.
   // Admins only: it is a whole-key number, so it means nothing beside one member's scoped spend.
+  //
+  // TWO PERIODS, and the MONTH is the headline (AIO-805). The lifetime gap is dominated by a frozen
+  // pre-metering block that no future work can recover, so it can never improve and cannot answer
+  // "is spend escaping the meter now" — the only question worth an operator's attention. The month
+  // can: it read 0.9% the morning it shipped, against 22% lifetime, on the same key.
   // WORK PER EPISODE. Graph extraction is ~99% of the bill, and its cost per CALL is the number that
   // hides a bad model: on 2026-07-30 a swap to a model 10x cheaper per call sent calls/episode from
   // ~19 to ~49 over three days while total spend FELL, because episode volume dropped faster than the
@@ -75,6 +80,15 @@ export default async function CostsPage({
   const reconciliation =
     providerUsage && ledgerLifetimeUsd !== null
       ? reconcileLedger(providerUsage.totalUsageUsd, ledgerLifetimeUsd)
+      : null;
+  // The month legs, both UTC-truncated so the boundary is the provider's, not the server's.
+  const ledgerMonthUsd =
+    isAdmin && providerUsage?.monthUsageUsd !== null && providerUsage
+      ? await getLedgerMonthUsd(db, team.id, providerUsage.provider)
+      : null;
+  const monthReconciliation =
+    providerUsage?.monthUsageUsd != null && ledgerMonthUsd !== null
+      ? reconcileLedger(providerUsage.monthUsageUsd, ledgerMonthUsd)
       : null;
 
   // Show the "tracking since" caption only when metering began INSIDE the selected window — i.e. the
@@ -182,14 +196,35 @@ export default async function CostsPage({
                   instrument them, these are <em>counted per feature</em> as failed attempts below.
                 </li>
                 <li>
-                  <strong>Any spend on this key from outside this instance.</strong>
+                  <strong>Any spend on this key from outside this instance.</strong> (Spend on your
+                  account&apos;s <em>other</em> keys is no longer counted here — the provider figure is
+                  scoped to the key this brain uses.)
                 </li>
               </ul>
-              Because the first can never be recovered, <strong>the dollar gap here has a floor</strong>:
-              new spend dilutes the percentage, but nothing ever clears the amount. So the percentage is
-              not the signal — a high one is not itself a problem, and a falling one is just arithmetic.
-              What matters is whether the <strong>dollars grow</strong>, which means spend is escaping the
-              meter now. Both figures are lifetime for the key, not the selected window.
+              Because the first can never be recovered, <strong>the lifetime gap has a floor</strong> —
+              nothing ever clears the amount, so it cannot tell you whether spend is escaping the meter
+              now.{" "}
+              {monthReconciliation ? (
+                <>
+                  <strong>
+                    That is what the month is for: this provider month it has billed{" "}
+                    {usd(monthReconciliation.providerUsd)} and this ledger accounts for{" "}
+                    {usd(monthReconciliation.ledgerUsd)}
+                    {monthReconciliation.status === "unattributed"
+                      ? ` — ${usd(monthReconciliation.unattributedUsd)} unexplained.`
+                      : "."}
+                  </strong>{" "}
+                  {monthReconciliation.status === "unattributed"
+                    ? "A month gap that grows is the real signal — that is spend escaping the meter today."
+                    : "A near-zero month gap means the meter is capturing current spend; the lifetime figure above is history."}{" "}
+                  The month is the provider&apos;s calendar month, not the selected window.
+                </>
+              ) : (
+                <>
+                  What matters is whether the <strong>dollars grow</strong>. Both figures are lifetime for
+                  this key, not the selected window.
+                </>
+              )}
             </>
           ) : reconciliation.status === "ledger-exceeds" ? (
             <>
