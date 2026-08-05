@@ -145,7 +145,16 @@ skip  iff  chunkConfigDeltaCompatible(stored, current)
 
 That routes exactly the 21 owing items to the delta path (where `toPush` is their tail), keeps all
 2,190 complete items skipped, and is what makes the cost table's 179 episodes exact rather than
-aspirational.
+aspirational. Both terms are free: `episodes` and `chunkShas` are already computed at `:374`/`:398`,
+above the skip — no reordering, no added work on the hot path for the 2,190.
+
+**A `CHUNK_CHARS` change still floods, and that is correct.** Compatibility fails, so every item —
+complete or not — falls through to a full re-push, because every boundary genuinely moved. Today that
+flood requires a manual `content_sha256` clear and otherwise never happens at all; after this change
+it happens automatically on deploy. That is the right behaviour and a real cost (~$47 at today's
+corpus), so changing `CHUNK_CHARS` becomes a decision with a price tag attached rather than a
+constant edit whose effect arrives item-by-item over months. Worth stating loudly next to the
+constant.
 
 **The backfill at `:453` is gated on STRICT equality** (`stored === CHUNK_CONFIG`), not helper
 compatibility — under compatibility, an empty-ledger over-cap row would stamp current-config hashes
