@@ -107,9 +107,10 @@ have different consequences:
 - **`CHUNK_CHARS` differs** → every boundary moved → not delta-eligible (today's behaviour, kept).
 - **`CHUNK_CHARS` same, `MAX_EPISODE_CHUNKS` GREW** → boundaries identical, tail appended →
   **delta-eligible**; the existing sha diff then pushes exactly the new chunks and nothing else.
-- **`CHUNK_CHARS` same, cap SHRANK** → not delta-eligible. Chunks beyond the new cap are now orphans
-  in Graphiti that our ledger would stop tracking; a full re-push (which `purgeBeforeRepush` precedes)
-  is the honest answer. This case earns no optimisation — it is rare and the cheap path is wrong.
+- **`CHUNK_CHARS` same, cap SHRANK** → not delta-eligible. Chunks beyond the new cap become orphans
+  in Graphiti that our ledger stops tracking (a shrink sets no pending-delete flag, so nothing purges
+  them); a full re-push is the honest answer. This case earns no optimisation — it is rare and the
+  cheap path is wrong.
 
 The stored `chunk_config` string is already `"<chars>x<cap>"`, so this is a parse, not a migration —
 and **a malformed, empty or NULL config parses to "incompatible"**, i.e. not delta-eligible. `""` is a
@@ -121,14 +122,36 @@ Because `test/guards/graph-delta-predicate.test.ts` asserts the predicate is a p
 where the four cases are unit-tested, and it keeps the guard's no-`||` assertion intact rather than
 weakening it to accommodate this change.
 
-### 1b. …and make the unchanged-content skip reach it
+### 1b. …and make the unchanged-content skip reach it — asking a DIFFERENT question
 
-The change above is inert without this one (the blocker). At `project.ts:440`, an item whose body is
-unchanged but whose stored config is **incompatible with the current one** must fall through to the
-delta path rather than `continue`. Same helper, same three cases, so the two sites cannot disagree.
+The change above is inert without this one (the blocker). But the second draft got the condition
+backwards, which would have re-shipped the same bug in new words: I wrote "fall through when the
+stored config is **incompatible**" — and `2500x16` → `2500x40` *is* compatible (that is precisely
+what makes it delta-eligible). All 21 items would still have skipped.
 
-The backfill at `:453` is additionally gated on a present-and-compatible stored config, so it can
-never bless current-config hashes for chunks pushed under a different one.
+**The two sites ask different questions, and one boolean cannot answer both:**
+
+| site | question | cap-grew answer |
+|---|---|---|
+| delta predicate (`:567`) | can I trust the stored shas? | **yes** — boundaries unchanged |
+| unchanged-content skip (`:440`) | could this item still OWE chunks? | **depends on the body's length** |
+
+So the skip's condition is composite:
+
+```
+skip  iff  chunkConfigDeltaCompatible(stored, current)
+      AND  currentChunkCount <= (existingRow.chunk_shas?.length ?? 0)      // nothing owed
+```
+
+That routes exactly the 21 owing items to the delta path (where `toPush` is their tail), keeps all
+2,190 complete items skipped, and is what makes the cost table's 179 episodes exact rather than
+aspirational.
+
+**The backfill at `:453` is gated on STRICT equality** (`stored === CHUNK_CONFIG`), not helper
+compatibility — under compatibility, an empty-ledger over-cap row would stamp current-config hashes
+for tails never pushed, i.e. the hazard surviving its own fix. (Under the composite skip such a row
+always "owes chunks" and falls through to a sound full push anyway; the gate is strict regardless,
+because a second line of defence that shares the first one's blind spot is not one.)
 
 ### 2. Raise the cap to 40 (100,000 chars/item)
 
@@ -162,10 +185,19 @@ meta. Two summaries for one fact is the H6 drift shape; one writer, both readers
 
 ## Guards (CLAUDE.md §7)
 
-- **The delta predicate's three cases, unit-tested and each mutation-proven**: same-config →
-  eligible; chars-changed → ineligible; cap-grown → **eligible** (the new case, and the one worth
-  $44); cap-shrunk → ineligible. The existing `test/guards/graph-delta-predicate.test.ts` is where
-  this belongs — it already exists precisely because this predicate is load-bearing.
+- **The helper's four cases, unit-tested and each mutation-proven**: same-config → eligible;
+  chars-changed → ineligible; cap-grown → **eligible** (the new case); cap-shrunk → ineligible; plus
+  malformed/`""`/NULL → ineligible. `test/guards/graph-delta-predicate.test.ts` is **rewritten** to
+  pin the helper call as the predicate's term — its current slice-anchor on the literal
+  `existingRow.chunk_config === CHUNK_CONFIG` breaks loudly (the length assertion reddens), which is
+  the guard behaving correctly, not collateral.
+- **ANTI-FLOOD — the case that separates a correct build from a plausible one.** A body-unchanged,
+  config-stale, **complete** item from a RETRACTABLE source (Slack) must be neither deleted nor
+  re-pushed: the fake-graphiti spy log must be empty for it. A builder who implements the skip as
+  bare `stored !== CHUNK_CONFIG` passes every other guard here while sending the whole corpus through
+  the push path — and for retractable sources the retract-delete branch (`:494-517`) fires *before*
+  the predicate, so each Slack item gets a `deleteItemEpisodes` + full re-push, unbudgeted. This
+  guard is the difference.
 - **The append-only claim is asserted, not assumed**: a test that chunking a fixed body at cap 16 and
   at cap 40 yields byte-identical first-16 chunks. If that is ever false, the delta optimisation is
   unsound and this test is what says so.
@@ -200,3 +232,10 @@ The verification is **extraction-side, once, after the rollout**: count episodes
 each `items:<id>` name-prefix and compare against that row's `chunk_shas` length, for the 21 items.
 Equal ⇒ the tails actually landed. Alongside it: transition spend inside ~$2, and the overflow counter
 reporting the three-file residue rather than 0 or 689,235.
+
+**And the remediation, named rather than left to improvisation:** a mismatch means Graphiti accepted
+(202) and its worker then died, so the ledger blessed chunks that were never extracted — invisible to
+reconcile forever, because its landed-check is satisfied by chunk `#0`. The heal is to clear
+`content_sha256` to `''` on the mismatched rows: the sentinel misses the skip *and* fails delta term
+4, forcing a real full re-push. (A wholly dead worker is separately caught by the extraction-health
+fact-count probe; it is the per-item ledger blessing that has no automatic retry.)
