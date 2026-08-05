@@ -124,7 +124,7 @@ const SALVAGE_MAX_AGE_MS = 48 * 3_600_000;
  * every bump is the regression the salvage was built for (reported twice as "we've lost the summaries").
  * Raise it ONLY for a bump that changes what the prose can claim, not for a shape change.
  */
-const MIN_SALVAGEABLE_VERSION = 11;
+export const MIN_SALVAGEABLE_VERSION = 11;
 
 /** `${date}|${memberId}` → that person-day's synopsis. */
 export type SalvagedSummaries = Map<string, string>;
