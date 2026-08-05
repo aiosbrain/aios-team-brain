@@ -85,12 +85,14 @@ describe("salvageSummaries — a sentence about a day outlives the shape that he
   });
 
   it("survives junk instead of throwing — a lost synopsis must never fail the panel", () => {
-    for (const junk of [null, undefined, {}, { days: "nope" }, { days: [{ people: 3 }] }, { days: [{ date: 1 }] }]) {
+    for (const junk of [null, undefined, {}, { days: "nope" }, { days: [{ people: 3 }] }, { days: [{ date: 1 }] }, { v: NaN, days: [{ date: "2026-07-27", people: [{ memberId: "m1", summary: "x" }] }] }]) {
       expect(salvageSummaries(junk, NOW - 1000, NOW).size).toBe(0);
     }
-    // A person-day with no summary contributes nothing rather than an empty string.
-    expect(salvageSummaries(payload(9, [{ memberId: "m1" }]), NOW - 1000, NOW).size).toBe(0);
-    expect(salvageSummaries(payload(9, [{ memberId: "m1", summary: "" }]), NOW - 1000, NOW).size).toBe(0);
+    // A person-day with no summary contributes nothing rather than an empty string. Version 12 is
+    // ABOVE the content floor on purpose: at a pre-floor version the gate rejects the payload first and
+    // these two go green without ever reaching the empty-summary check they exist to cover.
+    expect(salvageSummaries(payload(12, [{ memberId: "m1" }]), NOW - 1000, NOW).size).toBe(0);
+    expect(salvageSummaries(payload(12, [{ memberId: "m1", summary: "" }]), NOW - 1000, NOW).size).toBe(0);
   });
 });
 

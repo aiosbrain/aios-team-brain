@@ -150,8 +150,11 @@ export function salvageSummaries(payload: unknown, computedAtMs: number, nowMs: 
   if (!Number.isFinite(computedAtMs) || nowMs - computedAtMs > SALVAGE_MAX_AGE_MS) return out;
   // A payload with no readable `v` predates versioning (or is corrupt) — treat it as too old to trust,
   // the same direction as every other unprovable case in this change.
+  // `Number.isFinite`, not `typeof === "number"`: `NaN < 11` is false, so a NaN version would sail
+  // through the comparison. Unreachable from a persisted row (jsonb turns NaN into null), but this is an
+  // exported pure function and a gate that only holds for the callers you thought of is not a gate.
   const version = (payload as { v?: unknown } | null)?.v;
-  if (typeof version !== "number" || version < MIN_SALVAGEABLE_VERSION) return out;
+  if (!Number.isFinite(version as number) || (version as number) < MIN_SALVAGEABLE_VERSION) return out;
   const days = (payload as { days?: unknown } | null)?.days;
   if (!Array.isArray(days)) return out;
   for (const d of days as { date?: unknown; people?: unknown }[]) {
