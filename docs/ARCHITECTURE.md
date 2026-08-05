@@ -15,10 +15,12 @@ portable: plain SQL migrations, Postgres-backed rate limiting, no Vercel-only de
 ## First-install deployment flow
 
 The canonical hosted-install entry point is `https://aiosbrain.dev/deploy/team-brain/`. It resolves
-to the official Railway template described in [`RAILWAY-TEMPLATE.md`](RAILWAY-TEMPLATE.md): one app
-service from this public repository plus one Postgres service. Railway reference variables wire the
-database and public domain; template secret functions generate `AUTH_SECRET` and `SECRETS_KEY`; the
-operator supplies team and first-admin identity in Railway's form.
+to the official Railway template described in [`RAILWAY-TEMPLATE.md`](RAILWAY-TEMPLATE.md): Team
+Brain, Postgres, Graphiti, and Neo4j. Railway reference variables keep Graphiti and Neo4j on the
+private network, wire the graph LLM proxy, and share the generated Neo4j credentials; template
+secret functions generate `AUTH_SECRET`, `SECRETS_KEY`, and `GRAPH_LLM_PROXY_SECRET`. The operator
+supplies team and first-admin identity in Railway's form, including an `ADMIN_PASSWORD` of at least
+10 characters.
 
 On first start, `railway.json` runs the idempotent schema loader before release. The opt-in Railway
 startup wrapper then runs the shared bootstrap to ensure the real team and first admin from
