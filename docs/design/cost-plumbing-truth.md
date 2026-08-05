@@ -12,7 +12,7 @@ first, because the corrections are the load-bearing part.
 
 ## What plan review corrected
 
-### 1. My throttling evidence was backwards (BLOCKER)
+### 1. My throttling evidence was backwards — and the problem is already fixed (BLOCKER)
 
 I attributed 1,904 `http_429` rows in `llm_failures` to our own proxy ceiling. **They cannot be
 ours.** The proxy returns 429 and exits before recording anything
@@ -21,29 +21,35 @@ ours.** The proxy returns 429 and exits before recording anything
 reaching a provider (rate limit, …)"*. Every `http_429` row is **OpenRouter refusing a call our
 limiter already allowed**.
 
-Re-derived from `rate_limits` (the table the reviewer pointed at, which is never pruned), both
-throttles are real and independent:
+Re-derived, both throttles were real and independent — and the reviewer's discriminator queries
+settled the cause outright:
 
 ```
-bucket 'graph-llm-proxy'   46 overflow windows · peak 426 attempts/min · 4,248 self-rejections
-llm_failures http_429      1,904 provider refusals of calls we DID forward
+1,902 of 1,904 provider 429s are on  mistralai/mistral-small-3.2-24b-instruct   (07:08-11:50 Aug 4)
+        2                       on  qwen/qwen3.7-plus
+our own bucket: 46 overflow windows, peak 426 attempts/min, 4,248 self-rejections
 ```
 
-And the overlap is the decisive part:
+`mistral-small` is the cheap SUMMARY model that #488 routes `ModelSize.small` requests to. So the
+provider throttling was never about the extraction model or our ceiling: **graphiti 0.13.2's
+per-entity summary fan-out generated hundreds of small calls a minute, and OpenRouter rate-limited
+that one cheap model at ~100/min.** Our own bucket overflowed for the same reason — the fan-out, not
+the corpus.
+
+**#490 (graphiti 0.29.3) removed the fan-out, and that closed both throttles.** Since it deployed
+(2026-08-04 12:31 UTC):
 
 ```
-window                we attempted   we forwarded   provider 429s
-2026-08-01 11:57            417          120              0      ← model: qwen3.6-35b-a3b
-2026-08-01 12:31            405          120              0
-2026-08-04 10:47            426          120             97      ← model: qwen3.7-plus
-2026-08-04 11:42            290          120            106
+provider 429s          0
+failures of any kind   0
+our overflow windows   0
+peak attempts/min     76   (was 426; ceiling is 120)
 ```
 
-On Aug 1 the provider absorbed a sustained 120/min without a single refusal. On Aug 4, at the *same*
-forwarded rate, it refused ~100/min. The variable is the model, not our ceiling.
-
-**So raising the ceiling to 600 — my draft's central proposal — would have made this worse**, pushing
-5× the load at an upstream already refusing at 120. The reviewer flagged exactly this and was right.
+So the problem I opened this task for **no longer exists**, fixed by work that shipped yesterday.
+This is why the fix below is now three lines instead of a subsystem: building the observability I
+first proposed would be a guard for a failure mode that has been structurally removed — ceremony by
+CLAUDE.md §7's own test.
 
 ### 2. `/key` gives time-sliced per-key truth, which I claimed it didn't
 
@@ -57,51 +63,48 @@ Measured this morning against the ledger:
 | August so far | $69.63 | $70.29 | $0.66 (0.9%) |
 | Lifetime | $151.49 | $194.40 | $42.91 (22%) |
 
-Today's figures agree **to four decimal places**. That is the first direct proof the meter is
-capturing essentially all current spend — and it relocates the entire 22% lifetime gap to frozen
-July history (pre-metering + the timeout storm), which can never clear no matter what we build.
+Today's figures agree **to four decimal places** — the first direct proof the meter captures
+essentially all current spend, relocating the whole 22% lifetime gap to frozen July history.
 
-This also **closes the question `provider-daily-truth.md` deferred** on 2026-08-03. That doc deferred
-per-day reconciliation because it believed a management key was required. It isn't.
+`usage_monthly` = $70.29 ≈ August-only $69.63 also **rules out a rolling 30-day window**: a rolling
+window would include the late-July storm (pre-August ledger alone is ~$82). That is a discriminating
+observation, not a suggestive one. UTC-vs-account-local calendar is not separable from this data;
+the PR records a before/after-midnight `usage_daily` sample as the falsifiable check.
 
----
+This **narrows** — does not close — what `provider-daily-truth.md` deferred: it falsifies that doc's
+premise that a management key is needed for per-period truth, but gives no per-day *history* and no
+per-model attribution, which is what `/activity` is for. That doc's reopening bar is restated
+against the monthly gap in the same PR.
 
-## A. The graph proxy's rate ceiling — correct the story, not the number
+## A. The graph proxy's rate ceiling — correct the record, keep the number
 
 `lib/llm/graph-proxy.ts:232-240` documents the ceiling's rationale:
 
 > Not for Graphiti's benefit — **its extraction is serial at ~10-20s per episode, so it will never
 > come close.** … **so it can never be the thing that wedges the graph.**
 
-Both clauses are now false: Graphiti fans out with `semaphore_gather` since #490, the bucket is
-shared with embeddings ("one credential, one budget"), and demand peaks at **426/min** against a
-120 ceiling — 46 windows where we refused our own extraction.
+Both clauses were false for the whole fan-out era: demand hit **426/min** against a 120 ceiling and
+we refused our own extraction 4,248 times across 46 windows. They are *incidentally* true again
+today (peak 76/min) — but for a reason the comment doesn't state, which is exactly how a stale
+rationale hides a live problem for a week.
 
-### Fix (deliberately minimal)
+### Fix (three lines, no behaviour change)
 
-- **Do NOT change the default.** The evidence says upstream is the binding constraint on the current
-  model; 120/min is a smoothing rate the provider demonstrably absorbs. Raising it without evidence
-  that upstream can take more just converts our free refusals into billed retries.
-- **Make it env-tunable** (`GRAPH_PROXY_CALLS_PER_MINUTE` via the existing `resolvePositiveInt`,
-  mirroring `GRAPH_PROXY_TIMEOUT_MS`), so a future backlog import (AIO-798) can be admitted
-  deliberately without a code deploy, and export `PROXY_CALLS_PER_MINUTE_FOR_TEST` like the timeout
-  does.
-- **Rewrite the comment** to state what is true: a leak-damage bound; Graphiti is parallel; the
-  bucket is shared with embeddings; measured demand peaks at 426/min so the ceiling *does* bind and
-  that is currently acceptable because upstream binds first. The stale rationale is why this went a
-  week unnoticed.
-- **Two distinct signals, honestly labelled.** Self-throttling is `rate_limits.count > limit` for the
-  bucket; provider throttling is `llm_failures.failure_reason='http_429'`. They are different
-  problems with different fixes, and my draft would have shipped a probe that called the second one
-  the first — the cried-wolf failure. v1 adds a read for each to the extraction-health reason string;
-  neither may be reported as the other.
+- **Default unchanged at 120.** Post-#490 demand peaks at 76/min; there is no evidence to raise it,
+  and the historical overflow had a cause that has been removed.
+- **Env-tunable** (`GRAPH_PROXY_CALLS_PER_MINUTE` via the existing `resolvePositiveInt`, mirroring
+  `GRAPH_PROXY_TIMEOUT_MS`), with `PROXY_CALLS_PER_MINUTE_FOR_TEST` exported like the timeout — so a
+  deliberate backlog admission (AIO-798's repo import) needs a variable, not a deploy.
+- **Rewrite the comment** to the true history: a leak-damage bound; extraction is *not* serial;
+  the bucket is shared with embeddings; it demonstrably bound at 426/min during the 0.13.2 fan-out
+  and does not today at 76/min; the diagnosis path is `rate_limits` (ours) vs
+  `llm_failures.http_429` (the provider's), which are different problems.
 
-### Not in scope
+### Explicitly NOT built
 
-Making the bucket cost-aware (an embedding and a `dedupe_nodes` call cost 2,000× different amounts
-and consume the same token). Real, but a redesign of a security control, separately.
-
----
+The extraction-health signal I first proposed. Both throttles are at zero and the fan-out that
+caused them is gone; a probe now would be a guard with no live failure mode. The two queries that
+diagnosed this in three minutes are written into the comment instead, which is the cheaper artifact.
 
 ## B. Reconcile against this key, per period — not the account, per lifetime
 
@@ -122,6 +125,14 @@ our blind spot, uncloseable by any amount of correct metering.
   reads it. `data.limit` is a per-key spend cap, not credits-purchased, so it is not a substitute —
   and plumbing a new field into a display that doesn't exist is how dead code is born.
 - Use `OPENROUTER_BASE_URL` (`lib/query/llm-backend.ts:21`) rather than a second hardcoded URL.
+- **The monthly headline needs its OWN copy states.** The existing `reconcileLedger` states were
+  written for lifetime magnitudes and reusing them mis-speaks on a monthly window: a
+  provider-resets-first boundary skew lands in `ledger-exceeds`, whose copy blames key rotation
+  (`page.tsx:196-199`) — false for a month boundary. And the ledger's monthly sum must truncate in
+  **UTC** to match the provider's, or the skew is self-inflicted.
+- **Raise the materiality floor for the monthly view.** The $1 / 5% thresholds were tuned against
+  lifetime totals; in the first days of a month the denominator is small enough that ordinary timing
+  skew clears both legs and would render an alarm about nothing.
 - **Comment sites to correct** (the reviewer found three my draft missed):
   `provider-usage.ts:13-24`, `lib/metrics/llm-costs.ts:62-64`, `graph-proxy.ts:349-350`,
   `app/t/[team]/costs/page.tsx:64`, and `test/provider-usage.test.ts:7-8`. The page copy at
