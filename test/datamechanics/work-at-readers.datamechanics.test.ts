@@ -134,6 +134,10 @@ describe("the timeline windows on work_at, not sync time (real Postgres)", () =>
       frontmatter: {
         source: "slack",
         channel: "eng",
+        // Sole participant, present since the root (`first_ts === rootTs`) ⇒ they OPENED it, so
+        // `author_id` records that and the title renders unprefixed. This test is about the WINDOW
+        // (work_at vs sync time), not authorship; without the field the row would read "Replied in …".
+        author_id: "U_REPLIER",
         title: "#eng: long-running incident thread (LNK-1)",
         source_ts: rootTs,
         participants: [

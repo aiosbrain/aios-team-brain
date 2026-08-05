@@ -37,6 +37,17 @@ const SHAPE_BY_VERSION: Record<number, Record<string, string[]>> = {
     signalGroup: ["kind", "count", "items"],
     signalItem: ["id", "kind", "title", "at", "url", "stillValid"],
   },
+  // v11 is a MEANING-only bump (a Slack replier's evidence title no longer carries the thread root's
+  // words) — the tree is byte-identical to v10, so the pin is copied deliberately, not forgotten.
+  11: {
+    personDay: ["memberId", "name", "handle", "avatarUrl", "summary", "total", "tasks", "other", "unlinked", "signals"],
+    taskGroup: ["taskId", "title", "status", "source", "sources", "evidenceCount", "assignee"],
+    assignee: ["name", "avatarUrl"],
+    sourceGroup: ["source", "count", "items"],
+    evidenceItem: ["id", "title", "url", "source", "kind", "at", "linkedTask", "linkVia"],
+    signalGroup: ["kind", "count", "items"],
+    signalItem: ["id", "kind", "title", "at", "url", "stillValid"],
+  },
 };
 
 /**
@@ -46,6 +57,16 @@ const SHAPE_BY_VERSION: Record<number, Record<string, string[]>> = {
  */
 const REQUIRED_BY_VERSION: Record<number, Record<string, string[]>> = {
   10: {
+    personDay: ["memberId", "name", "handle", "total", "tasks", "other", "unlinked", "signals"],
+    taskGroup: ["taskId", "title", "status", "source", "sources", "evidenceCount", "assignee"],
+    assignee: ["name", "avatarUrl"],
+    sourceGroup: ["source", "count", "items"],
+    evidenceItem: ["id", "title", "url", "source", "kind", "at", "linkVia"],
+    signalGroup: ["kind", "count", "items"],
+    signalItem: ["id", "kind", "title", "at", "url", "stillValid"],
+  },
+  // Copied from v10 — see the note on SHAPE_BY_VERSION[11].
+  11: {
     personDay: ["memberId", "name", "handle", "total", "tasks", "other", "unlinked", "signals"],
     taskGroup: ["taskId", "title", "status", "source", "sources", "evidenceCount", "assignee"],
     assignee: ["name", "avatarUrl"],

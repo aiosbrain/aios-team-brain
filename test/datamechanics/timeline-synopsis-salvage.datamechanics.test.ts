@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { db, ingest, seedTeam, type Seed } from "./helpers";
-import { getCachedWorkTimeline, PAYLOAD_VERSION } from "@/lib/dashboard/timeline-cache";
+import { getCachedWorkTimeline, PAYLOAD_VERSION, MIN_SALVAGEABLE_VERSION } from "@/lib/dashboard/timeline-cache";
 
 /**
  * Spec: a PAYLOAD_VERSION bump must not blank the daily synopsis.
@@ -66,7 +66,14 @@ async function seedPriorRow(args: {
   tier?: "team" | "external";
 }) {
   const payload = {
-    v: args.version ?? PAYLOAD_VERSION - 1,
+    // A FOREIGN version that is still SALVAGEABLE. It used to be `PAYLOAD_VERSION - 1`, which broke the
+    // moment `MIN_SALVAGEABLE_VERSION` was introduced at the current version: v10 prose is refused on
+    // CONTENT grounds (it was written from mislabelled Slack titles), so every fixture here would be
+    // rejected by the version gate before reaching the behaviour under test — failing the one carry test
+    // and, far worse, silently DISARMING the three that assert an ABSENCE (own-person-day, age, tier),
+    // which would have gone green for the wrong reason. `+1` models the real remaining case: a row
+    // written by a NEWER build and read after a rollback.
+    v: args.version ?? PAYLOAD_VERSION + 1,
     days: [
       {
         date: args.date,
@@ -125,7 +132,7 @@ function summaryOfRenderedDay(days: Days, memberId: string): string | undefined 
 }
 
 describe("the daily synopsis survives a PAYLOAD_VERSION bump (real Postgres)", () => {
-  it("carries the previous version's summary into the first post-bump view", async () => {
+  it("carries a foreign version's summary into the first post-bump view", async () => {
     const seed = await seedLinkedTeam();
     await seedCommit(seed, "carried", WHEN);
     await seedPriorRow({
@@ -138,6 +145,25 @@ describe("the daily synopsis survives a PAYLOAD_VERSION bump (real Postgres)", (
     // Cold miss by version mismatch — exactly what every deploy that bumps the version produces.
     const { days } = await getCachedWorkTimeline(db(), seed.teamId, "team");
     expect(summaryOfRenderedDay(days, seed.memberId)).toBe("Shipped the carried work.");
+  });
+
+  it("REFUSES prose written before the content floor, even though it would bridge a bump", async () => {
+    // The other half of the same contract, and the reason the default fixture version had to move. A
+    // pre-`MIN_SALVAGEABLE_VERSION` payload is not merely a different shape: its sentences were written
+    // from prompts in which a Slack replier carried the thread ROOT author's words, so carrying one
+    // forward would re-persist that misattribution as prose in the new row. Blank beats wrong.
+    const seed = await seedLinkedTeam();
+    await seedCommit(seed, "carried", WHEN);
+    await seedPriorRow({
+      teamId: seed.teamId,
+      memberId: seed.memberId,
+      date: dayOfWhen,
+      summary: "Shared two sizzle reels.", // the shape of the misattributed claim
+      version: MIN_SALVAGEABLE_VERSION - 1,
+    });
+
+    const { days } = await getCachedWorkTimeline(db(), seed.teamId, "team");
+    expect(summaryOfRenderedDay(days, seed.memberId)).toBeUndefined();
   });
 
   it("matches a summary to ITS OWN person-day, never another's", async () => {

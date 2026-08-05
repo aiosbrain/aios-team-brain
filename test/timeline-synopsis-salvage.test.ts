@@ -39,14 +39,15 @@ const day = (people: { memberId: string; summary?: string }[]): TimelineDay =>
 describe("salvageSummaries — a sentence about a day outlives the shape that held it", () => {
   it("reads summaries out of a FOREIGN payload version", () => {
     // The whole point: every other reader rejects a version mismatch, and that rejection is what
-    // was deleting the synopsis on each deploy.
-    const got = salvageSummaries(payload(3, [{ memberId: "m1", summary: "Shipped X." }]), NOW - 1000, NOW);
+    // was deleting the synopsis on each deploy. `12` is foreign AND at-or-above the content floor
+    // (a row written by a newer build, then rolled back onto this one).
+    const got = salvageSummaries(payload(12, [{ memberId: "m1", summary: "Shipped X." }]), NOW - 1000, NOW);
     expect(got.get("2026-07-27|m1")).toBe("Shipped X.");
   });
 
   it("keys on person AND day together", () => {
     const got = salvageSummaries(
-      payload(9, [
+      payload(12, [
         { memberId: "m1", summary: "Alice's day." },
         { memberId: "m2", summary: "Bob's day." },
       ]),
@@ -59,17 +60,39 @@ describe("salvageSummaries — a sentence about a day outlives the shape that he
   });
 
   it("refuses an ancient row — a salvaged sentence is a bridge, not an archive", () => {
-    const old = salvageSummaries(payload(9, [{ memberId: "m1", summary: "Last week." }]), NOW - 8 * 24 * 3600_000, NOW);
+    // Version 12 is deliberately ABOVE the content floor so AGE is the only thing under test. With a
+    // pre-floor version here this would go green for the wrong reason and stop testing age at all.
+    const old = salvageSummaries(payload(12, [{ memberId: "m1", summary: "Last week." }]), NOW - 8 * 24 * 3600_000, NOW);
     expect(old.size).toBe(0);
   });
 
+  it("refuses PRE-v11 prose even when fresh — those sentences can carry the Slack misattribution", () => {
+    // The second-order half of the v11 authorship fix. A v10 summary was written from a prompt in which
+    // a Slack replier's evidence carried the thread ROOT author's words, so it can assert in prose the
+    // exact thing v11 removed from the titles. A cold miss IS the version bump, and that path
+    // re-persists whatever it salvages — so carrying v10 prose would launder the old claim into the new
+    // row, bounded only by the next COMPLETED background LLM pass (unbounded if the provider is down).
+    const stale = salvageSummaries(payload(10, [{ memberId: "m1", summary: "Shared two sizzle reels." }]), NOW - 1000, NOW);
+    expect(stale.size).toBe(0);
+    // …and the floor is a floor, not an equality check: the CURRENT version still salvages.
+    const current = salvageSummaries(payload(11, [{ memberId: "m1", summary: "Reviewed the rollout." }]), NOW - 1000, NOW);
+    expect(current.get("2026-07-27|m1")).toBe("Reviewed the rollout.");
+  });
+
+  it("refuses a payload with no readable version — unprovable prose is not carried", () => {
+    const noVersion = salvageSummaries({ days: [{ date: "2026-07-27", people: [{ memberId: "m1", summary: "?" }] }] }, NOW - 1000, NOW);
+    expect(noVersion.size).toBe(0);
+  });
+
   it("survives junk instead of throwing — a lost synopsis must never fail the panel", () => {
-    for (const junk of [null, undefined, {}, { days: "nope" }, { days: [{ people: 3 }] }, { days: [{ date: 1 }] }]) {
+    for (const junk of [null, undefined, {}, { days: "nope" }, { days: [{ people: 3 }] }, { days: [{ date: 1 }] }, { v: NaN, days: [{ date: "2026-07-27", people: [{ memberId: "m1", summary: "x" }] }] }]) {
       expect(salvageSummaries(junk, NOW - 1000, NOW).size).toBe(0);
     }
-    // A person-day with no summary contributes nothing rather than an empty string.
-    expect(salvageSummaries(payload(9, [{ memberId: "m1" }]), NOW - 1000, NOW).size).toBe(0);
-    expect(salvageSummaries(payload(9, [{ memberId: "m1", summary: "" }]), NOW - 1000, NOW).size).toBe(0);
+    // A person-day with no summary contributes nothing rather than an empty string. Version 12 is
+    // ABOVE the content floor on purpose: at a pre-floor version the gate rejects the payload first and
+    // these two go green without ever reaching the empty-summary check they exist to cover.
+    expect(salvageSummaries(payload(12, [{ memberId: "m1" }]), NOW - 1000, NOW).size).toBe(0);
+    expect(salvageSummaries(payload(12, [{ memberId: "m1", summary: "" }]), NOW - 1000, NOW).size).toBe(0);
   });
 });
 

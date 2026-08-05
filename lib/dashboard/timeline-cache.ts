@@ -62,7 +62,12 @@ export const TIMELINE_TTL_MS = TTL_MS;
 // v10 also found the hole in the guard built for that miss: it pinned only `PersonDay`'s own keys, so a
 // change one level down (`TaskGroup`) passed it untouched. `test/guards/timeline-payload-shape.test.ts`
 // now pins EVERY node in the tree — a nested field can strand a stale row just as badly as a top-level one.
-export const PAYLOAD_VERSION = 10;
+//
+// v11: a Slack REPLIER's evidence title is now prefixed "Replied in …" instead of carrying the thread
+// root's snippet verbatim (see the authorship note in `lib/dashboard/work-timeline`). SHAPE unchanged,
+// MEANING changed — a v10 row keeps rendering a teammate's sentence under the replier's own name, which
+// is the misattribution the fix exists to remove. Same meaning-change rule as v5/v6/v7.
+export const PAYLOAD_VERSION = 11;
 
 /** The timeline WITH the per-person-day synopsis attached. Runs the (up to 7d × roster) best-effort LLM
  *  calls — so it's used ONLY on the BACKGROUND refresh path, never inline on a request (a cold miss
@@ -103,23 +108,53 @@ async function buildTimeline(db: DbClient, teamId: string, tier: ViewerTier): Pr
  */
 const SALVAGE_MAX_AGE_MS = 48 * 3_600_000;
 
+/**
+ * The OLDEST payload version whose prose may still be carried forward.
+ *
+ * Age is not the only way a salvaged sentence can be wrong — CONTENT can be, too. Every summary written
+ * before v11 was distilled from a prompt in which a Slack replier's evidence carried the thread ROOT
+ * author's words (see the authorship note in `lib/dashboard/work-timeline`), so a v10 sentence can state
+ * in prose exactly the misattribution v11 exists to remove: "<person> shared two sizzle reels…" about a
+ * message someone else wrote. A cold miss is USUALLY a version bump, and that path re-persists whatever
+ * it salvages — so without this gate the fix would launder the old claim into the new row and the bound
+ * would be "until the next COMPLETED background LLM pass", i.e. unbounded whenever the provider is down
+ * or no answering model is configured.
+ *
+ * This is deliberately a floor, not a blanket "never salvage across a bump": dropping every synopsis on
+ * every bump is the regression the salvage was built for (reported twice as "we've lost the summaries").
+ * Raise it ONLY for a bump that changes what the prose can claim, not for a shape change.
+ */
+export const MIN_SALVAGEABLE_VERSION = 11;
+
 /** `${date}|${memberId}` → that person-day's synopsis. */
 export type SalvagedSummaries = Map<string, string>;
 
 const salvageKey = (date: string, memberId: string): string => `${date}|${memberId}`;
 
 /**
- * Pull the per-person-day summaries out of a cache payload of ANY version.
+ * Pull the per-person-day summaries out of a cache payload of any version AT OR ABOVE
+ * `MIN_SALVAGEABLE_VERSION`.
  *
- * Why this ignores `PAYLOAD_VERSION` when everything else treats a mismatch as a miss: the version
- * guards the SHAPE the panel renders, and rendering a stale shape is what strands a wrong card. A
- * `summary` is not shape — it is a sentence about what a person did on a day, and a field moving
+ * Why this mostly ignores `PAYLOAD_VERSION` when everything else treats a mismatch as a miss: the
+ * version guards the SHAPE the panel renders, and rendering a stale shape is what strands a wrong card.
+ * A `summary` is not shape — it is a sentence about what a person did on a day, and a field moving
  * elsewhere in the tree doesn't make that sentence untrue. Dropping it is what makes the synopsis
  * vanish for everyone on every bump.
+ *
+ * The ONE exception is a bump that changes what the prose is allowed to CLAIM — see
+ * `MIN_SALVAGEABLE_VERSION`. A sentence written about mislabelled inputs is not merely stale, it is
+ * wrong, and carrying it forward would re-persist the very claim the bump removed.
  */
 export function salvageSummaries(payload: unknown, computedAtMs: number, nowMs: number): SalvagedSummaries {
   const out: SalvagedSummaries = new Map();
   if (!Number.isFinite(computedAtMs) || nowMs - computedAtMs > SALVAGE_MAX_AGE_MS) return out;
+  // A payload with no readable `v` predates versioning (or is corrupt) — treat it as too old to trust,
+  // the same direction as every other unprovable case in this change.
+  // `Number.isFinite`, not `typeof === "number"`: `NaN < 11` is false, so a NaN version would sail
+  // through the comparison. Unreachable from a persisted row (jsonb turns NaN into null), but this is an
+  // exported pure function and a gate that only holds for the callers you thought of is not a gate.
+  const version = (payload as { v?: unknown } | null)?.v;
+  if (!Number.isFinite(version as number) || (version as number) < MIN_SALVAGEABLE_VERSION) return out;
   const days = (payload as { days?: unknown } | null)?.days;
   if (!Array.isArray(days)) return out;
   for (const d of days as { date?: unknown; people?: unknown }[]) {
