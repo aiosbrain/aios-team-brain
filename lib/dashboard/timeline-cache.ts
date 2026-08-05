@@ -62,7 +62,12 @@ export const TIMELINE_TTL_MS = TTL_MS;
 // v10 also found the hole in the guard built for that miss: it pinned only `PersonDay`'s own keys, so a
 // change one level down (`TaskGroup`) passed it untouched. `test/guards/timeline-payload-shape.test.ts`
 // now pins EVERY node in the tree — a nested field can strand a stale row just as badly as a top-level one.
-export const PAYLOAD_VERSION = 10;
+//
+// v11: a Slack REPLIER's evidence title is now prefixed "Replied in …" instead of carrying the thread
+// root's snippet verbatim (see the authorship note in `lib/dashboard/work-timeline`). SHAPE unchanged,
+// MEANING changed — a v10 row keeps rendering a teammate's sentence under the replier's own name, which
+// is the misattribution the fix exists to remove. Same meaning-change rule as v5/v6/v7.
+export const PAYLOAD_VERSION = 11;
 
 /** The timeline WITH the per-person-day synopsis attached. Runs the (up to 7d × roster) best-effort LLM
  *  calls — so it's used ONLY on the BACKGROUND refresh path, never inline on a request (a cold miss

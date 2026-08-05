@@ -6,6 +6,7 @@ import {
   settleTimelineRefreshes,
   readTimelineCache,
   bustTeamTimeline,
+  PAYLOAD_VERSION,
 } from "@/lib/dashboard/timeline-cache";
 
 // Spec (PR-B — the persisted work-timeline LAYER): getCachedWorkTimeline builds from items+tasks on a
@@ -71,7 +72,10 @@ describe("work-timeline cache layer (real Postgres)", () => {
     // A LITERAL, deliberately: it forces a conscious edit every time the version moves, which is the
     // moment to ask "did the payload shape or meaning change?". v10 adds `TaskGroup.assignee`, so a
     // v9 row would render a teammate's ticket as if it were the viewer's own.
-    expect((row?.payload as { v: number; days: unknown[] }).v).toBe(10);
+    // Against the CONSTANT, not a literal: what matters is that the writer stamps the version the reader
+    // checks. A hard-coded number only proves the writer agrees with whatever it was on the day this was
+    // written, and it broke on the v11 bump while the behaviour under test was perfectly fine.
+    expect((row?.payload as { v: number; days: unknown[] }).v).toBe(PAYLOAD_VERSION);
     expect((row?.payload as { days: unknown[] }).days.length).toBe(days.length);
 
     // readTimelineCache round-trips it.

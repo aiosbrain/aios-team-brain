@@ -120,12 +120,59 @@ describe("work timeline (real Postgres)", () => {
     });
 
     const days = await getWorkTimeline(db(), seed.teamId, "team");
-    // The mapped replier gets the thread in THEIR day, exactly ONCE (dedup).
-    expect(evidenceTitles(days).filter((t) => t === "#eng: dual-backend rollout plan (AIO-1)")).toHaveLength(1);
+    // The mapped replier gets the thread in THEIR day, exactly ONCE (dedup). Labelled as a REPLY: this
+    // fixture records no `author_id`, and an unprovable root must not be rendered as this person's words.
+    expect(evidenceTitles(days).filter((t) => t === "Replied in #eng: dual-backend rollout plan (AIO-1)")).toHaveLength(1);
     // Only the mapped member appears — the unmapped root ("Outsider") is dropped, never guessed.
     const names = days.flatMap((d) => d.people.map((p) => p.name));
     expect(names).toContain("Tester");
     expect(names).not.toContain("Outsider");
+  });
+
+  it("Slack: a REPLIER never has the ROOT AUTHOR's words rendered as their own", async () => {
+    // The prod report (2026-08-05): John opened a thread with "Hey Chetan! Two sizzle reels…" and Chetan
+    // replied twice. The thread's `title` IS the root message snippet, and every participant inherited it
+    // verbatim — so Chetan's card showed JOHN's sentence as if Chetan had written it. Participation was
+    // correct; the LABEL claimed authorship he did not have.
+    //
+    // TWO threads, ONE mapped member, so the fixture proves BOTH directions and cannot pass vacuously:
+    // when they wrote the root they keep authorship; when someone else did, the row says they replied.
+    const seed = await seedTeam(); // seed.memberId = "Tester" ↔ slack id U_ME
+    await db()
+      .from("member_identities")
+      .insert({ team_id: seed.teamId, member_id: seed.memberId, provider: "slack", external_id: "U_ME" });
+    const anchor = await commit(seed, "seed");
+    await insertTask(seed, anchor.projectId!, { row_key: "AIO-9", title: "Sizzle", status: "in_progress" });
+
+    const me = { author_id: "U_ME", display_name: "Tester", message_count: 2, first_ts: recentIso, last_ts: recentIso };
+    const other = { author_id: "U_JOHN", display_name: "John", message_count: 1, first_ts: recentIso, last_ts: recentIso };
+
+    // (a) SOMEONE ELSE started it — the exact reported shape.
+    await ingest(seed, {
+      kind: "transcript", path: `slack/eng/${randomUUID()}.md`, access: "team", body: "b",
+      frontmatter: {
+        source: "slack", channel: "eng", author_id: "U_JOHN",
+        title: "#eng: Hey Tester! two sizzle reels for AIO-9",
+        participants: [other, me],
+      },
+    });
+    // (b) THIS member started it — authorship must survive the fix.
+    await ingest(seed, {
+      kind: "transcript", path: `slack/eng/${randomUUID()}.md`, access: "team", body: "b",
+      frontmatter: {
+        source: "slack", channel: "eng", author_id: "U_ME",
+        title: "#eng: I am shipping AIO-9 today",
+        participants: [me, other],
+      },
+    });
+
+    const titles = evidenceTitles(await getWorkTimeline(db(), seed.teamId, "team"));
+    // (a) John's opening line is NEVER presented as this member's own words.
+    expect(titles).not.toContain("#eng: Hey Tester! two sizzle reels for AIO-9");
+    expect(titles).toContain("Replied in #eng: Hey Tester! two sizzle reels for AIO-9");
+    // (b) …while their OWN thread is still theirs, unprefixed — the fix must not blanket-demote everyone.
+    expect(titles).toContain("#eng: I am shipping AIO-9 today");
+    expect(titles).not.toContain("Replied in #eng: I am shipping AIO-9 today");
   });
 
   it("Slack: a thread whose title cites an active issue key nests under that task", async () => {
@@ -138,7 +185,10 @@ describe("work timeline (real Postgres)", () => {
     await ingest(seed, {
       kind: "transcript", path: `slack/eng/${randomUUID()}.md`, access: "team", body: "b",
       frontmatter: {
-        source: "slack", channel: "eng", title: "#eng: shipping AIO-42 today",
+        // Sole participant ⇒ they ARE the root author, so `author_id` says so: the title is their own
+        // sentence and renders unprefixed. (Without it the row would read "Replied in …" — correct for an
+        // unprovable root, but wrong for this fixture, whose subject is NESTING, not authorship.)
+        source: "slack", channel: "eng", author_id: "U_REPLIER", title: "#eng: shipping AIO-42 today",
         participants: [{ author_id: "U_REPLIER", display_name: "Tester", message_count: 1, first_ts: recentIso, last_ts: recentIso }],
       },
     });

@@ -380,19 +380,32 @@ export async function getWorkTimeline(
   for (const r of (slackRes.data ?? []) as ItemRow[]) {
     const fm = r.frontmatter ?? {};
     const title = str(fm.title) || `#${str(fm.channel) ?? "slack"} thread`;
-    // Parsed by the SHARED ledger reader (`lib/ingest/slack-participants`) — the same one the credit
-    // oracle uses, so the two surfaces can't drift on dedup or id case again. It already returns one
-    // entry per distinct author (their latest contribution time), which also keeps the synthetic row
-    // id unique per (thread, participant).
+    // AUTHORSHIP. The thread `title` is a snippet of its ROOT message (`slack-normalize.threadTitle`),
+    // so it is the ROOT AUTHOR'S WORDS. Every participant used to get a row carrying it verbatim, which
+    // rendered a teammate's message under the replier's own name — reported on prod as John's
+    // "Hey Chetan! Two sizzle reels…" appearing on CHETAN's card as if he wrote it. Participation itself
+    // was right (he replied twice); the LABEL claimed authorship he didn't have.
+    // So only the ROOT AUTHOR's row presents the snippet as their own; a replier's row is labelled as a
+    // reply TO that thread. The distinction is drawn from `frontmatter.author_id` (the root's user id),
+    // case-folded through the same `foldProviderId` the id map uses so a case variant can't silently
+    // demote a genuine author.
+    const rootAuthorId = foldProviderId(str(fm.author_id) ?? "");
     for (const p of slackParticipations(fm)) {
       const authorId = p.authorId;
-      const memberId = slackIdToMember.get(foldProviderId(authorId));
+      const folded = foldProviderId(authorId);
+      const memberId = slackIdToMember.get(folded);
       if (!memberId || !members.has(memberId)) continue;
       const at = p.lastTs;
       if (!at || !inWindow(at)) continue;
-      // One row per (thread, participant); text = title (no body fetch — a thread citing an issue key in
-      // its first line still links to a task, else it lands in "Other").
-      evItems.push({ id: `${r.id}:${authorId}`, memberId, source: "slack", kind: "slack", title, at, text: title });
+      // UNKNOWN root (a pre-`author_id` row) is labelled as a reply too: over-claiming authorship is the
+      // harmful direction — "replied in" understates a genuine author, but presenting someone else's
+      // words as yours is the bug this exists to stop.
+      const wroteRoot = rootAuthorId !== "" && folded === rootAuthorId;
+      const rowTitle = wroteRoot ? title : `Replied in ${title}`;
+      // One row per (thread, participant). `text` stays the FULL thread title for issue-key linking: a
+      // thread ABOUT a ticket is work on that ticket for everyone in it, which is a topical association,
+      // not a claim about who wrote the words. Only the rendered label distinguishes authorship.
+      evItems.push({ id: `${r.id}:${authorId}`, memberId, source: "slack", kind: "slack", title: rowTitle, at, text: title });
     }
   }
 
