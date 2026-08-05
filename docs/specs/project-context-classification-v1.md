@@ -176,8 +176,12 @@ Canonical assignable grains. Sole writer: proposed `lib/projects/context/units.t
 Required columns:
 
 - `id`, `team_id`, timestamps;
-- nullable `source_item_id`, `source_task_id`, and `source_decision_id`, with a kind-aware check
-  that exactly one canonical source is selected;
+- nullable `source_item_id`, `source_task_id`, `source_decision_id`, and `source_meeting_note_id`,
+  with a kind-aware check that exactly one canonical source is selected. `meeting_segment` units anchor
+  to the **meeting note**, not the transcript item: `meeting_notes.id` is the stable meeting identity,
+  while the duplicate-meeting merge re-points `meeting_notes.source_item_id` to a new merge-owned item
+  (see "Duplicate-meeting merge" below), so an item-anchored segment would lose its meeting on every
+  auto-merge;
 - `unit_key`: stable within the canonical source (`item`, a task/decision row key, or a meeting
   segment lineage key);
 - `unit_kind`: `item`, `task`, `decision`, or `meeting_segment`;
@@ -187,8 +191,9 @@ Required columns:
 - `content_sha256` and `source_content_sha256`;
 - `locator jsonb`: strict kind-specific locator (`start_char`, `end_char`, optional source timestamps);
 - `occurred_at`: uses the persisted source work time or meeting occurrence time;
-- `audience`: inherited from the canonical source (`items.access`, `tasks.audience`, or
-  `decisions.audience`), never accepted from a classifier;
+- `audience`: inherited from the canonical source (`items.access`, `tasks.audience`,
+  `decisions.audience`; for meeting-note-anchored units, the note's CURRENT transcript item's live
+  `access` — `meeting_notes` itself has no audience column), never accepted from a classifier;
 - `state`: `active` or `retracted`;
 - `segmentation_version` and optional `predecessor_unit_id` for lineage diagnostics.
 
@@ -196,7 +201,8 @@ Constraints and indexes:
 
 - partial unique indexes for each source kind and `unit_key`;
 - source-entity, active-work-time, kind, and audience indexes;
-- source item/task/decision foreign keys cascade when their canonical source is deleted;
+- source item/task/decision/meeting-note foreign keys cascade when their canonical source is deleted
+  (`meeting_notes` itself cascades from its transcript item, so the chain stays closed);
 - every writer verifies that the unit, canonical source, membership, and initiative share one
   `team_id`; migrations should add composite `(team_id, id)` references where PostgreSQL can enforce
   this without replacing existing primary keys, with the domain writer remaining the required guard;
@@ -206,7 +212,9 @@ Constraints and indexes:
 Ordinary projectable items get one `unit_kind='item'` unit. Materialized task and decision rows get
 their own units so a multi-row task/decision item can be classified at the actual row grain and so
 dashboard-created rows with `source_item_id is null` remain representable. The unit writer does not
-also expose the containing task/decision item when materialized rows exist. A meeting that has settled
+also expose the containing task/decision item when materialized rows exist. Whole-item and
+structured-row units ship together in Phase 1, so no interim state ever exposes the containing item
+first and re-grains it later — there is no membership migration between grains to specify. A meeting that has settled
 topic segments uses the segment units for classification and does not also expose its whole-item unit;
 the whole unit remains as a fallback while materialization or segmentation is pending or failed.
 
@@ -351,6 +359,29 @@ does not blindly include every segment. A force-included whole meeting is presen
 choice: apply to all current segments, select segments, or return them to automatic. The retired whole
 unit and its decision remain in history but are not served beside the segments.
 
+### Duplicate-meeting merge and transcript re-pointing
+
+`lib/meetings/merge.ts` runs automatically on every ingest tick. On a duplicate meeting it writes the
+merged transcript to a NEW merge-owned item (`meetings/<noteId>.md`), re-points the surviving note's
+`source_item_id` at it, and retires the replaced item behind a `merged_into` tombstone note — the
+replaced item row itself is NOT deleted (it may be connector-owned). Context must survive this from
+Phase 1 onward; without a contract, every auto-merged duplicate leaves an active whole-item unit
+serving stale context beside the merged meeting.
+
+1. Because segment units anchor to `meeting_notes.id`, a re-point is exactly the already-specified
+   changed-transcript event: lineage rules above run against the note's new transcript (fingerprint
+   first, then bounded overlap), manual memberships transfer on an unambiguous match, and ambiguity
+   goes to review. Segment offsets always index into the note's CURRENT transcript item, and segment
+   visibility derives from that item's live `access`.
+2. When merge folds note B into survivor note A, B's active units are retracted and their memberships
+   become lineage candidates for A's reconciliation under the same unambiguous/review split. The
+   segment producer and the unit reconciler skip notes with `merged_into is not null`.
+3. Whole-item units: an item replaced by a merge (its note re-pointed away, or backing a tombstoned
+   note) has its unit retracted in the same reconciliation pass, and its memberships transfer to the
+   unit of the note's current item. The merged transcript textually contains the retired one, so the
+   transfer is treated as unambiguous lineage; if the fingerprint/overlap check disagrees, the pair
+   goes to review — a force decision is never dropped silently.
+
 `lib/meetings/llm-extract.ts` remains the summary/attendee path. Its shared `callMeetingsLLM`, provider
 resolution, timeout, JSON recovery, and usage metering patterns should be reused, but segmentation gets
 its own prompt/parser and `llm_usage` source so its cost is visible separately.
@@ -413,11 +444,26 @@ Cost controls are mandatory:
 
 Initial thresholds are configuration, not magic constants hidden in UI code:
 
-- high confidence: may settle automatically unless a rule/override conflicts;
+- high confidence: classifier methods may settle automatically ONLY in `classification_mode='auto'`
+  (see the gating contract below), and never past a rule/override conflict;
 - medium confidence: review queue;
 - low confidence: no suggestion;
 - exclude rules and negative semantic examples can force review but semantic/LLM output alone cannot
   create a durable force exclusion.
+
+`classification_mode` gates CLASSIFIER-originated settlement only, and the distinction is what makes
+the phase plan coherent:
+
+- `off`: no automatic evaluation of any kind for the initiative — no suggestions, no settlement.
+- `suggest`: every stage runs, but only the deterministic stages backed by explicit human
+  configuration — method `ingestion_project` (a Settings source association, stored as a
+  system-authored rule) and enabled rules — settle effective memberships. Embedding and LLM results
+  are suggestions only, regardless of confidence.
+- `auto`: additionally, high-confidence embedding/LLM results may settle automatically.
+
+Configuration-backed stages settle in both `suggest` and `auto` because a human explicitly authored
+the association or enabled the rule; that authority is the same kind as a manual decision, only
+forward-looking. Conflicts and medium-confidence results go to review in every mode.
 
 Threshold calibration requires a held-out set from human feedback. Confidence displayed to users is
 method-specific and must not imply that a rule match and an LLM score are statistically equivalent.
@@ -588,7 +634,7 @@ separate Brain API versioned specification rather than expanding this dashboard 
 |---|---|---|---|
 | GitHub PR/commit/repo doc | Whole item | repo, path, issue/task refs, labels, URLs | Fingerprint re-evaluation; source purge closes memberships |
 | Slack | Whole thread | channel id/name, participants, explicit refs, rule terms | Current re-render replaces classification inputs; deletion clears/retire context through existing retractable-source policy |
-| Meeting | Topic segment | segment text, title, attendees, explicit refs | Re-segment with lineage; ambiguous transfer requires review |
+| Meeting | Topic segment | segment text, title, attendees, explicit refs | Re-segment with lineage; ambiguous transfer requires review; merge re-point follows the merge contract |
 | Task/decision | Materialized task/decision row | existing ingestion project, row key, task evidence, labels | Preserve source diff-sync; source-row deletion cascades its unit |
 | Extracted fact/stakeholder evidence | Whole containing item in V1 | source project/path/quote metadata | Row-grained evidence units are a later additive kind if product use proves it necessary |
 | Notion/Drive/local docs | Whole item | path, title, aliases, explicit refs, semantic profile | Reclassify only when content/profile/rules fingerprint changes |
@@ -603,8 +649,21 @@ classification preserves the existing `retainSupersededBodies: false` behavior i
 There is no RLS backstop, so all new raw-SQL and query-builder reads must be visibly tier-scoped.
 
 - `project_context_units.audience` inherits `items.access` and is not user/model writable.
-- `lib/ingest/reclassify.ts` must cascade audience narrowing to context units before committing the
-  item access change, following the current fail-closed ordering for tasks/facts/stakeholder mentions.
+- `lib/ingest/reclassify.ts` must cascade audience narrowing to ITEM-anchored context units before
+  committing the item access change, following the current fail-closed ordering for
+  tasks/facts/stakeholder mentions. That path cannot heal row-anchored units: `decisions` is
+  deliberately absent from its `INHERITING_TABLES` because a decision row's audience is a per-row
+  wire field, not item-inherited.
+- Row-anchored (task/decision) units inherit the ROW's audience, and every writer of that row
+  audience is a heal point. There are two today: the ingest materializers that write
+  `tasks.audience` / `decisions.audience` on push, and `cascadeInheritedAudience` in
+  `lib/ingest/reclassify.ts`, which also updates `tasks.audience` directly when an item's access
+  changes. Both must update the affected units' stored audience in the same fail-closed pass, before
+  the row's audience change is observable.
+- Stored unit `audience` is an index/filter hint, never the authority: every read derives visibility
+  from the live canonical source (`items.access`, `tasks.audience`, `decisions.audience`), exactly as
+  invariant 2 requires — so a missed heal can cost filter freshness, never a leak. A guard test pins
+  that no project-context read trusts stored unit audience without the live-source join.
 - Effective membership is metadata, not a visibility grant. Reads join the live item and apply
   `visibleItems`/`isRestrictedTier` semantics.
 - `lib/ingest/purge.ts` must include context units, suggestions, memberships, and embeddings in its
@@ -659,10 +718,13 @@ correction rate and bounded cost.
 - initiative/source/system filters in the existing project list;
 - architecture documentation and schema replay tests.
 
-### Phase 1 - whole-item units and manual curation
+### Phase 1 - whole-item and structured-row units, manual curation
 
 - context units, memberships, events, feedback, and single writers;
-- asynchronous whole-item reconciler;
+- asynchronous reconciler for whole items AND materialized task/decision rows — both grains from day
+  one, so the item-suppression rule for materialized sources never has an interim state to migrate;
+- the duplicate-meeting merge contract for whole-item units (retract the replaced item's unit,
+  transfer memberships to the note's current item);
 - project Context tab, item membership editor, bulk actions, history, and audit;
 - source deletion and access-reclassification integration;
 - no automatic LLM classification yet.
@@ -674,16 +736,22 @@ from them.
 
 - rule AST, versions, pure evaluator, visual builder, preview, and future-only application;
 - explicit source/reference matching;
+- `project_context_suggestions` persistence (rule conflicts and deterministic outcomes need a landing
+  zone before the Phase 3 review UI exists: a Phase 2 conflict is stored `pending`, surfaced as a
+  count on the Overview tab, and held unresolved — never silently defaulted);
 - project-first timeline and overview metrics;
 - targeted cache invalidation if measurement shows it is needed.
 
 ### Phase 3 - semantic and LLM suggestions
 
 - profile embeddings and segment-ready optional vector schema;
-- fingerprinted classifier queue, batched ambiguity-only model pass, suggestions/review UI;
+- fingerprinted classifier queue, batched ambiguity-only model pass, and the review UI over the
+  Phase 2 suggestions table;
 - confidence calibration, usage metering, run health, and held-out evaluation;
-- high-confidence auto-settlement behind the initiative's `classification_mode='auto'` after review
-  precision qualifies; every initiative starts in `suggest` mode.
+- high-confidence CLASSIFIER auto-settlement behind the initiative's `classification_mode='auto'`
+  after review precision qualifies; every initiative starts in `suggest` mode
+  (configuration-backed deterministic/rule settlement is mode-independent — see the
+  `classification_mode` contract in the classification pipeline section).
 
 ### Phase 4 - meeting topic segments
 
@@ -719,6 +787,10 @@ from them.
 - automatic writes cannot overwrite force rows;
 - access narrowing is fail-closed and source purge leaves no served unit/membership/embedding;
 - whole item to segmented meeting transition does not duplicate effective context;
+- a duplicate-meeting merge retracts the replaced item's units, transfers unambiguous manual
+  memberships across the re-point (queueing ambiguous ones), and leaves no served context anchored to
+  the retired item;
+- narrowing a task/decision ROW's audience heals its unit before the row change is observable;
 - ambiguous re-segmentation preserves prior human state for review;
 - rule update targets only the affected initiative version;
 - team isolation on every table and index-backed pagination queries;
@@ -756,7 +828,7 @@ from them.
 
 - A user can create or promote an initiative without changing existing connector project ownership.
 - A whole item can be included in multiple initiatives, moved, excluded, and returned to automatic;
-  every state is audited and survives source re-sync.
+  every state is audited and survives source re-sync AND the duplicate-meeting merge re-point.
 - Automatic runs never overwrite a manual force decision.
 - Enabled rules classify future matching units, expose exact provenance, and can be previewed before a
   bounded historical backfill.
@@ -794,6 +866,7 @@ from them.
 | `lib/query/dense-index.ts`, `embedding-key.ts`, `embeddings.ts` | Existing embedding backend and idempotency patterns |
 | `lib/query/retrieve.ts`, `dense-search.ts`, `fts-search.ts`, `provider.ts` | Explicit context scope, segment candidates, RRF/budget/citations |
 | `lib/meetings/notes.ts`, `llm-extract.ts` | Meeting provenance, provider/metering patterns; add separate segment writer |
+| `lib/meetings/merge.ts` | Auto-merge re-points `meeting_notes.source_item_id` on every tick; the unit reconciler must apply the merge contract (retire replaced units, lineage-transfer memberships) |
 | `app/t/[team]/projects/*` | Initiative list and workspace replacement |
 | `app/t/[team]/library/[itemId]/page.tsx` | Shared membership editor |
 | `components/meetings/meeting-detail-tabs.tsx` | Segment-level Projects tab |
