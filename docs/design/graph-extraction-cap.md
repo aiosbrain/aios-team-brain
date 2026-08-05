@@ -111,10 +111,12 @@ have different consequences:
 - **`CHUNK_CHARS` differs** → every boundary moved → not delta-eligible (today's behaviour, kept).
 - **`CHUNK_CHARS` same, `MAX_EPISODE_CHUNKS` GREW** → boundaries identical, tail appended →
   **delta-eligible**; the existing sha diff then pushes exactly the new chunks and nothing else.
-- **`CHUNK_CHARS` same, cap SHRANK** → not delta-eligible. Chunks beyond the new cap become orphans
-  in Graphiti that our ledger stops tracking (a shrink sets no pending-delete flag, so nothing purges
-  them); a full re-push is the honest answer. This case earns no optimisation — it is rare and the
-  cheap path is wrong.
+- **`CHUNK_CHARS` same, cap SHRANK** → not delta-eligible. Chunks beyond the new cap become
+  orphans in Graphiti that the ledger stops tracking (a shrink sets no pending-delete flag, so
+  nothing purges them); a full re-push is the honest answer. It is not a clean one: for a
+  RETAINING source nothing deletes first and `addEpisodes` does not overwrite by name, so chunks
+  `0..N` land a second time alongside the originals. Rare, deliberate, and cheaper to state than
+  to engineer around.
 
 The stored `chunk_config` string is already `"<chars>x<cap>"`, so this is a parse, not a migration —
 and **a malformed, empty or NULL config parses to "incompatible"**, i.e. not delta-eligible. `""` is a
@@ -222,7 +224,7 @@ makes any episode larger. That is the load-bearing distinction and the reason th
 **Status: not built.** The tails-land half is self-contained and verified; this observability half
 changes `chunkContent`'s signature and threads a count through two summary types, and it was cleaner
 to ship the correctness fix on its own than to bundle a second surface into it. Deferred deliberately
-and tracked, not forgotten — and no comment or test in the shipped code may claim it exists (one did,
+and tracked as **CHUNKCAP-2 → [AIO-811](https://linear.app/je4light/issue/AIO-811)**, not forgotten — and no comment or test in the shipped code may claim it exists (one did,
 which the code review caught).
 
 
@@ -291,8 +293,9 @@ alone. Every one of those signals is green if the worker dies mid-burst.
 
 The verification is **extraction-side, once, after the rollout**: count episodes in Graphiti under
 each `items:<id>` name-prefix and compare against that row's `chunk_shas` length, for the 21 items.
-Equal ⇒ the tails actually landed. Alongside it: transition spend inside ~$2, and the overflow counter
-reporting the three-file residue rather than 0 or 689,235.
+Equal ⇒ the tails actually landed. Alongside it: transition spend inside ~$2. (The
+overflow counter is NOT a criterion for this change — it belongs to AIO-811, whose acceptance signal
+it is. A criterion this PR cannot satisfy would contradict §3's own DEFERRED status.)
 
 **And the remediation, named rather than left to improvisation:** a mismatch means Graphiti accepted
 (202) and its worker then died, so the ledger blessed chunks that were never extracted — invisible to

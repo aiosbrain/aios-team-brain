@@ -373,21 +373,28 @@ describe("chunk-cap raise (AIO-808)", () => {
     await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(new FakeGraphiti()) });
 
     const row = await ledgerRow(seed.teamId);
-    const storedShas = row!.chunk_shas!;
     await db()
       .from("graph_episodes")
       .update({ chunk_config: `${CHUNK_CHARS * 2}x${MAX_EPISODE_CHUNKS}` }) // different CHARS, same cap
       .eq("team_id", seed.teamId)
       .eq("source_id", row!.source_id);
 
-    // Body untouched: the sha term still holds, so this reaches the two new terms — unlike AC11.
+    // Assert the state the CODE WILL READ, re-fetched after the mutation — not a capture taken before
+    // it. A stale capture would still read "counts match" if someone later added `chunk_shas` to that
+    // update, silently converting this into an owes-driven test that no longer catches its own mutant
+    // while every assertion stayed green.
+    const staged = await ledgerRow(seed.teamId);
+    expect(staged?.chunk_shas?.length, "counts must MATCH, or this tests the count term instead").toBe(
+      chunkContent(text).length
+    );
+    expect(staged?.content_sha256, "body must be untouched, or the sha term short-circuits like AC11").toBe(
+      sha(text)
+    );
+
     const fake = new FakeGraphiti();
     await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(fake) });
 
     const pushed = fake.pushes.flatMap((p) => p.episodes);
-    expect(storedShas.length, "counts must MATCH, or this tests the count term instead").toBe(
-      chunkContent(text).length
-    );
     expect(pushed.length, "untrustworthy boundaries ⇒ full re-push, not a skip").toBe(chunkContent(text).length);
   });
 
