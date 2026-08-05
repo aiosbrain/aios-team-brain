@@ -294,3 +294,78 @@ describe("per-chunk projection ledger (real Postgres, mocked Graphiti)", () => {
     expect(fake.pushedEpisodes).toHaveLength(3);
   });
 });
+
+/**
+ * AIO-808 — raising MAX_EPISODE_CHUNKS must deliver the newly-admitted TAIL to items whose bodies have
+ * not changed, and must NOT re-push anything else.
+ *
+ * The whole feature turns on a distinction the first two spec drafts got wrong: the unchanged-content
+ * skip and the delta predicate ask different questions. These two tests are what separate a correct
+ * build from a plausible one — the first fails a compatibility-only skip (all over-cap items keep
+ * skipping, no tail lands), and AC11 above fails a count-only skip (its fixture keeps real hashes while
+ * rewriting the config, so counts match and a count-only skip would skip). Do not "simplify" either.
+ */
+describe("chunk-cap raise (AIO-808)", () => {
+  it("an over-cap item whose body never changed receives ONLY its tail", async () => {
+    const seed = await seedTeam();
+    const slug = await teamSlugFor(seed.teamId);
+    const path = "github/repo/docs/huge.md";
+    const fm = { source: "github" };
+    // 20 chunks' worth of body against a ledger that was written under a 16-chunk cap.
+    const big = body(CHUNK_CHARS * 20, "h");
+
+    await ingest(seed, { kind: "deliverable", path, body: big, access: "team", frontmatter: fm });
+    const first = new FakeGraphiti();
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(first) });
+
+    // Rewrite the ledger to the pre-raise state: the first 16 chunks, recorded under "2500x16".
+    const row = await ledgerRow(seed.teamId);
+    const under16 = chunkContent(big, CHUNK_CHARS, 16);
+    await db()
+      .from("graph_episodes")
+      .update({ chunk_shas: under16.map(sha), chunk_config: `${CHUNK_CHARS}x16` })
+      .eq("team_id", seed.teamId)
+      .eq("source_id", row!.source_id);
+
+    // Same body, byte for byte — only the cap has moved.
+    const fake = new FakeGraphiti();
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(fake) });
+
+    const pushed = fake.pushes.flatMap((p) => p.episodes);
+    const expectedTail = chunkContent(big, CHUNK_CHARS, MAX_EPISODE_CHUNKS).length - 16;
+    expect(expectedTail, "fixture must actually straddle the old cap").toBeGreaterThan(0);
+    expect(pushed.length, "exactly the tail, nothing re-pushed").toBe(expectedTail);
+    // And the ledger converges to the current config with the full set recorded.
+    const after = await ledgerRow(seed.teamId);
+    expect(after?.chunk_config).toBe(`${CHUNK_CHARS}x${MAX_EPISODE_CHUNKS}`);
+    expect(after?.chunk_shas?.length).toBe(16 + expectedTail);
+  });
+
+  it("ANTI-FLOOD — a COMPLETE item with a stale config is neither deleted nor re-pushed", async () => {
+    // The degenerate build this kills: a skip written as bare `stored !== CHUNK_CONFIG` sends the whole
+    // corpus through the push path. For a RETRACTABLE source the retract-delete branch fires before the
+    // delta predicate, so every Slack item would get deleteItemEpisodes + a full re-push — unbudgeted,
+    // and invisible to every other assertion in this file.
+    const seed = await seedTeam();
+    const slug = await teamSlugFor(seed.teamId);
+    const path = "slack/c123/1782124487.144019.md";
+    const fm = { source: "slack" }; // retainSupersededBodies: false — the flood-sensitive path
+    const small = body(CHUNK_CHARS * 2, "s"); // 2 chunks: complete under both 16 and 40
+
+    await ingest(seed, { kind: "transcript", path, body: small, access: "team", frontmatter: fm });
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(new FakeGraphiti()) });
+
+    const row = await ledgerRow(seed.teamId);
+    await db()
+      .from("graph_episodes")
+      .update({ chunk_config: `${CHUNK_CHARS}x16` }) // stale cap, but the item owes nothing
+      .eq("team_id", seed.teamId)
+      .eq("source_id", row!.source_id);
+
+    const fake = new FakeGraphiti();
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(fake) });
+
+    expect(fake.pushes.flatMap((p) => p.episodes), "a complete item owes nothing").toEqual([]);
+    expect(fake.listCalls, "and must not be dragged through the retract-delete path").toEqual([]);
+  });
+});
