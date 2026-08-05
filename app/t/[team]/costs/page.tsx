@@ -7,7 +7,11 @@ import { isRestrictedTier } from "@/lib/auth/visibility";
 import { parseRange } from "@/lib/metrics/range";
 import { getLlmCostBreakdown, getLedgerLifetimeUsd, getLedgerMonthUsd } from "@/lib/metrics/llm-costs";
 import { getGraphEfficiency, HEALTHY_CALLS_PER_EPISODE } from "@/lib/metrics/graph-efficiency";
-import { getProviderReportedUsage, reconcileLedger } from "@/lib/costs/provider-usage";
+import {
+  getProviderReportedUsage,
+  reconcileLedger,
+  MATERIAL_ABSOLUTE_MONTH_USD,
+} from "@/lib/costs/provider-usage";
 import { RangeSelector } from "@/components/dashboard/range-selector";
 import { CostBreakdownChart } from "@/components/charts/cost-breakdown";
 import { HelpHint } from "@/components/help-hint";
@@ -81,14 +85,18 @@ export default async function CostsPage({
     providerUsage && ledgerLifetimeUsd !== null
       ? reconcileLedger(providerUsage.totalUsageUsd, ledgerLifetimeUsd)
       : null;
-  // The month legs, both UTC-truncated so the boundary is the provider's, not the server's.
+  // Both month legs truncate in UTC. That the provider's month is UTC-calendar is INFERRED (its
+  // usage_monthly matched an August-only ledger sum where a rolling 30 days would not) — hence the
+  // copy says "the provider's calendar month" rather than claiming their boundary is ours.
   const ledgerMonthUsd =
-    isAdmin && providerUsage?.monthUsageUsd !== null && providerUsage
+    isAdmin && providerUsage?.monthUsageUsd != null
       ? await getLedgerMonthUsd(db, team.id, providerUsage.provider)
       : null;
+  // A RAISED absolute floor for the month: its denominator resets monthly, so the lifetime-tuned $1
+  // would flag ordinary skew as "spend escaping the meter today" on day one of every month.
   const monthReconciliation =
     providerUsage?.monthUsageUsd != null && ledgerMonthUsd !== null
-      ? reconcileLedger(providerUsage.monthUsageUsd, ledgerMonthUsd)
+      ? reconcileLedger(providerUsage.monthUsageUsd, ledgerMonthUsd, MATERIAL_ABSOLUTE_MONTH_USD)
       : null;
 
   // Show the "tracking since" caption only when metering began INSIDE the selected window — i.e. the
@@ -204,27 +212,8 @@ export default async function CostsPage({
               Because the first can never be recovered, <strong>the lifetime gap has a floor</strong> —
               nothing ever clears the amount, so it cannot tell you whether spend is escaping the meter
               now.{" "}
-              {monthReconciliation ? (
-                <>
-                  <strong>
-                    That is what the month is for: this provider month it has billed{" "}
-                    {usd(monthReconciliation.providerUsd)} and this ledger accounts for{" "}
-                    {usd(monthReconciliation.ledgerUsd)}
-                    {monthReconciliation.status === "unattributed"
-                      ? ` — ${usd(monthReconciliation.unattributedUsd)} unexplained.`
-                      : "."}
-                  </strong>{" "}
-                  {monthReconciliation.status === "unattributed"
-                    ? "A month gap that grows is the real signal — that is spend escaping the meter today."
-                    : "A near-zero month gap means the meter is capturing current spend; the lifetime figure above is history."}{" "}
-                  The month is the provider&apos;s calendar month, not the selected window.
-                </>
-              ) : (
-                <>
-                  What matters is whether the <strong>dollars grow</strong>. Both figures are lifetime for
-                  this key, not the selected window.
-                </>
-              )}
+              What matters is whether the <strong>dollars grow</strong>. Both figures are lifetime for
+              this key, not the selected window.
             </>
           ) : reconciliation.status === "ledger-exceeds" ? (
             <>
@@ -238,6 +227,53 @@ export default async function CostsPage({
               Reconciled against the provider: OpenRouter reports {usd(reconciliation.providerUsd)} spent
               on this key, and this ledger accounts for {usd(reconciliation.ledgerUsd)} of it (lifetime,
               not the selected window).
+            </>
+          )}
+        </div>
+      ) : null}
+
+      {/* THE MONTH — rendered independently of the lifetime state above, deliberately. It was first
+          nested inside the lifetime `unattributed` branch, which hid it whenever lifetime read
+          `reconciled` (dilution) or `ledger-exceeds` (a rotated key) — i.e. it disappeared in exactly
+          the situations an operator would be watching for live leakage. A headline that only renders
+          as a footnote of another alarm is not a headline. */}
+      {monthReconciliation ? (
+        <div
+          className={`rounded-lg border px-3 py-2 text-xs ${
+            monthReconciliation.status === "unattributed"
+              ? "border-amber-400/30 bg-amber-400/10 text-amber-700 dark:text-amber-300"
+              : "border-border-subtle/60 text-ink-tertiary"
+          }`}
+        >
+          {monthReconciliation.status === "unattributed" ? (
+            <>
+              <strong>
+                This provider month, OpenRouter has billed {usd(monthReconciliation.providerUsd)} on this
+                key and this ledger accounts for {usd(monthReconciliation.ledgerUsd)} —{" "}
+                {usd(monthReconciliation.unattributedUsd)} unexplained.
+              </strong>{" "}
+              Unlike the lifetime figure, this one has no permanent floor, so{" "}
+              <strong>a month gap that grows is the real signal</strong> — that is spend escaping the
+              meter now, not history. The month is the provider&apos;s calendar month, not the selected
+              window.
+            </>
+          ) : monthReconciliation.status === "ledger-exceeds" ? (
+            <>
+              This ledger records {usd(monthReconciliation.ledgerUsd)} this month against the{" "}
+              {usd(monthReconciliation.providerUsd)} the provider reports — most likely a month-boundary
+              skew, since the provider&apos;s calendar month and this ledger&apos;s UTC month can roll at
+              different instants. It settles once both sides are inside the same month; nothing is
+              missing from the breakdown below.
+            </>
+          ) : (
+            <>
+              <strong>
+                This provider month: {usd(monthReconciliation.providerUsd)} billed on this key,{" "}
+                {usd(monthReconciliation.ledgerUsd)} accounted for.
+              </strong>{" "}
+              A near-zero gap on the current month means the meter is capturing spend as it happens — the
+              lifetime figure above is history that no metering fix can recover. The month is the
+              provider&apos;s calendar month, not the selected window.
             </>
           )}
         </div>

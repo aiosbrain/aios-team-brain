@@ -45,6 +45,32 @@ describe("guard: the reconciliation banner explains the permanent floor", () => 
     );
   });
 
+  it("renders the month INDEPENDENTLY of the lifetime state — not nested inside its amber branch", () => {
+    // The defect this pins: the month block first shipped inside `reconciliation.status ===
+    // "unattributed"`, so it vanished whenever lifetime read `reconciled` (dilution) or
+    // `ledger-exceeds` (a rotated key) — i.e. precisely when someone would be watching for live
+    // leakage. Pinning the copy could not see it: every string was present in the source while the
+    // branch was unreachable ("never attest a surface that does not render").
+    const lifetimeBranch = page.indexOf('reconciliation.status === "unattributed" ?');
+    const lifetimeBlockEnd = page.indexOf("      ) : null}", lifetimeBranch);
+    const monthBlock = page.indexOf("{monthReconciliation ? (");
+    expect(lifetimeBranch, "lifetime branch not found — guard is looking at the wrong shape").toBeGreaterThan(-1);
+    expect(monthBlock, "month block not found").toBeGreaterThan(-1);
+    expect(monthBlock, "the month block must be a SIBLING of the lifetime banner, not nested in it").toBeGreaterThan(
+      lifetimeBlockEnd
+    );
+  });
+
+  it("gives the month its own copy states rather than reusing the lifetime explanations", () => {
+    // A month in `ledger-exceeds` is a boundary skew, NOT the key rotation the lifetime copy blames —
+    // and folding it into the reassuring branch renders "a near-zero gap" beside numbers that
+    // contradict it.
+    expect(page).toMatch(/month-boundary\s*\n?\s*skew|month-boundary skew/i);
+    expect(page, "must not blame key rotation for a month skew").not.toMatch(
+      /month[\s\S]{0,200}key was rotated/i
+    );
+  });
+
   it("makes the CURRENT-PERIOD gap the actionable signal, since only it can move", () => {
     // The point of the amendment: a figure with a permanent floor cannot be an alarm. The month can,
     // and the copy must say which one to watch — otherwise the operator is back to reading a number

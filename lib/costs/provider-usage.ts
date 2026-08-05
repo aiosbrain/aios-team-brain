@@ -65,7 +65,7 @@ export function resetProviderUsageCache(): void {
 }
 
 /**
- * Parse OpenRouter's `/credits` body. Pure, so the shape is pinned without a network call.
+ * Parse OpenRouter's `/key` body. Pure, so the shape is pinned without a network call.
  *
  * Returns null rather than zero for anything unrecognised: a missing number must read as "we don't
  * know what the provider charged", never as "the provider charged nothing" — the second is exactly
@@ -146,6 +146,13 @@ export interface LedgerReconciliation {
 /** Below this the difference is timing and rounding, not a missing-spend story. */
 const MATERIAL_FRACTION = 0.05;
 const MATERIAL_ABSOLUTE_USD = 1;
+/**
+ * The same floor for the CURRENT-MONTH comparison, where the denominator resets monthly. $5 is the
+ * smallest gap that cannot be explained by the provider-leg cache plus normal in-flight skew at this
+ * install's scale (a full day of healthy graph spend is ~$5-9), so anything clearing it in-month is a
+ * real story rather than an artifact of when the page was rendered.
+ */
+export const MATERIAL_ABSOLUTE_MONTH_USD = 5;
 
 /**
  * Compare what the provider charged against what the ledger attributed.
@@ -155,14 +162,26 @@ const MATERIAL_ABSOLUTE_USD = 1;
  * while contributing nothing to OpenRouter's number. A negative "unattributed" would be nonsense; the
  * honest reading of ledger ≥ provider is simply "nothing unattributed on this provider".
  */
-export function reconcileLedger(providerUsd: number, ledgerUsd: number): LedgerReconciliation {
+export function reconcileLedger(
+  providerUsd: number,
+  ledgerUsd: number,
+  /**
+   * Absolute floor below which a difference is timing, not a story. Defaults to the lifetime figure;
+   * the CURRENT-MONTH comparison passes `MATERIAL_ABSOLUTE_MONTH_USD` because its denominator starts
+   * near zero every month — on day one, $1 of ordinary skew (the provider leg is cached up to 10
+   * minutes while the ledger leg is live) clears both legs on a few-dollar month and renders "spend is
+   * escaping the meter today" about nothing. A false amber in the first month this ships is the #463
+   * credibility failure repeating.
+   */
+  materialAbsoluteUsd: number = MATERIAL_ABSOLUTE_USD
+): LedgerReconciliation {
   const unattributed = Math.max(0, providerUsd - ledgerUsd);
   const fraction = providerUsd > 0 ? unattributed / providerUsd : 0;
   // BOTH legs. A percentage alone flags a $0.30-vs-$0.05 new install (83%, meaningless); an absolute
   // alone flags a $10 drift on $1,000/mo (1%, noise). Only a gap that is both large enough to notice
   // and large enough to matter is worth an operator's attention.
-  const material = unattributed >= MATERIAL_ABSOLUTE_USD && fraction >= MATERIAL_FRACTION;
-  const exceeds = ledgerUsd - providerUsd >= MATERIAL_ABSOLUTE_USD;
+  const material = unattributed >= materialAbsoluteUsd && fraction >= MATERIAL_FRACTION;
+  const exceeds = ledgerUsd - providerUsd >= materialAbsoluteUsd;
   return {
     providerUsd,
     ledgerUsd,

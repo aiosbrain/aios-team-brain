@@ -26,7 +26,14 @@ describe("graph proxy call ceiling", () => {
     vi.resetModules();
   });
 
-  it("defaults to the measured 120/min", () => {
+  it("defaults to the measured 120/min", async () => {
+    // Explicitly UNSET the override rather than trusting the ambient env: this is now a variable we
+    // tell operators to export, so a default assertion that reads the process env would go red on
+    // the very machine that took the advice.
+    vi.stubEnv("GRAPH_PROXY_CALLS_PER_MINUTE", undefined as unknown as string);
+    vi.resetModules();
+    const fresh = await import("@/lib/llm/graph-proxy");
+    expect(fresh.PROXY_CALLS_PER_MINUTE_FOR_TEST).toBe(120);
     expect(PROXY_CALLS_PER_MINUTE_FOR_TEST).toBe(120);
   });
 

@@ -377,20 +377,18 @@ export async function getGraphSpendByCallKindAndModel(
 }
 
 /**
- * Lifetime ledger total for ONE provider — the reconciliation figure.
- *
- * Replaces a 500,000-row fetch that returned `null` at the cap rather than under-report. That
- * refusal was the right instinct and is why the /costs banner stayed correct while the headline
- * beside it drifted; an exact `SUM` means there is now nothing to refuse.
- */
-/**
  * The ledger's total for ONE provider in the CURRENT CALENDAR MONTH, UTC — the counterpart to
  * `/key`'s `usage_monthly` (AIO-805).
  *
  * UTC truncation is not incidental: the provider's month boundary is what this is compared against,
  * so truncating in the server's local zone would manufacture a gap out of a timezone, in a figure
- * whose only job is to expose real missing spend. `date_trunc('month', now() at time zone 'utc')`
- * keeps both legs on the same boundary.
+ * whose only job is to expose real missing spend. The double `AT TIME ZONE` below makes the boundary
+ * session-independent rather than correct-by-server-config.
+ *
+ * That the provider's own month is UTC-calendar is INFERRED, not documented: `usage_monthly` matched
+ * an August-only ledger sum ($70.29 vs $69.63) where a rolling 30 days would have swept in the
+ * late-July storm. That rules out rolling; it does not rule out an account-local calendar. The UI
+ * therefore says "the provider's calendar month" rather than claiming our boundary is theirs.
  *
  * Why a monthly figure exists at all: the LIFETIME comparison is dominated by a frozen pre-metering
  * block (measured 2026-08-05: $42.91 of a $42.91 lifetime gap is July history), so it can never
@@ -407,7 +405,11 @@ export async function getLedgerMonthUsdExact(
       `select coalesce(sum(cost_usd), 0) as total
          from llm_usage
         where team_id = $1 and provider = $2
-          and created_at >= date_trunc('month', (now() at time zone 'utc'))`,
+          -- The second AT TIME ZONE converts the truncated wall-clock back to a timestamptz AS UTC.
+          -- Without it the comparison re-coerces via the SESSION TimeZone (nothing pins it in
+          -- lib/db/pg/pool), so the boundary would be correct only by coincidence of server config —
+          -- up to +/-14h of month-boundary spend landing on the wrong side.
+          and created_at >= (date_trunc('month', (now() at time zone 'utc')) at time zone 'utc')`,
       [teamId, provider]
     );
     return Number(rows[0]?.total ?? 0) || 0;
@@ -416,6 +418,13 @@ export async function getLedgerMonthUsdExact(
   }
 }
 
+/**
+ * Lifetime ledger total for ONE provider — the reconciliation figure.
+ *
+ * Replaces a 500,000-row fetch that returned `null` at the cap rather than under-report. That
+ * refusal was the right instinct and is why the /costs banner stayed correct while the headline
+ * beside it drifted; an exact `SUM` means there is now nothing to refuse.
+ */
 export async function getLedgerLifetimeUsdExact(
   _db: unknown,
   teamId: string,

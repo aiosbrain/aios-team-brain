@@ -210,7 +210,8 @@ export async function getLlmCostBreakdown(
  * `usage` cumulatively for the key. Comparing a 30-day ledger slice to a lifetime provider total
  * would manufacture a gap that isn't there — the opposite failure to the one this exists to expose.
  * For the CURRENT-PERIOD comparison (the actionable one) see `getLedgerMonthUsd`, matched against
- * `/key`'s `usage_monthly` on the same UTC boundary.
+ * `/key`'s `usage_monthly`; ours truncates in UTC, and the provider's being UTC-calendar is
+ * inferred rather than documented (see `getLedgerMonthUsdExact`).
  *
  * Team-wide by construction (no viewer scoping): the provider figure is for the whole key, so the
  * only meaningful comparison is the whole team's ledger. The caller gates this on `isAdmin` for the

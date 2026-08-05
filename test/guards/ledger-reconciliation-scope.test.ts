@@ -36,16 +36,37 @@ const SPEND = stripComments(readFileSync(join(ROOT, "lib", "metrics", "llm-spend
  * The lifetime-sum implementation ONLY — bounded to the function, not sliced to end-of-file. An
  * open-ended slice would silently start asserting against whatever function is appended below it.
  */
-const implStart = SPEND.indexOf("export async function getLedgerLifetimeUsdExact");
-const implRest = SPEND.slice(implStart + 1);
-const nextExport = implRest.indexOf("\nexport ");
-const impl = nextExport === -1 ? SPEND.slice(implStart) : SPEND.slice(implStart, implStart + 1 + nextExport);
+function sliceFn(name: string): string {
+  const start = SPEND.indexOf(`export async function ${name}`);
+  if (start === -1) throw new Error(`${name} not found — the guard is looking at the wrong shape`);
+  const rest = SPEND.slice(start + 1);
+  const next = rest.indexOf("\nexport ");
+  return next === -1 ? SPEND.slice(start) : SPEND.slice(start, start + 1 + next);
+}
+
+const impl = sliceFn("getLedgerLifetimeUsdExact");
+/**
+ * The MONTH sum has the identical hazard this guard exists for — an unscoped provider sum shipped in
+ * review once, and no behavioural test can catch it while every row in the table is openrouter. Added
+ * with the month reconciliation (AIO-805) so dropping `provider = $2` from EITHER query reddens.
+ */
+const monthImpl = sliceFn("getLedgerMonthUsdExact");
 
 describe("guard: the lifetime ledger sum is provider-scoped and never short", () => {
   it("filters llm_usage by provider", () => {
     // The one filter that makes the comparison meaningful at all.
     expect(impl).toMatch(/provider = \$\d/);
     expect(impl).toMatch(/team_id = \$\d/); // and never crosses teams
+  });
+
+  it("the MONTH sum carries the same scoping, and a session-independent boundary", () => {
+    expect(monthImpl).toMatch(/provider = \$\d/);
+    expect(monthImpl).toMatch(/team_id = \$\d/);
+    expect(monthImpl).toMatch(/sum\(cost_usd\)/);
+    // The double AT TIME ZONE is what makes the boundary independent of the session TimeZone (nothing
+    // pins it in lib/db/pg/pool). Truncating without converting back is correct only by coincidence
+    // of server config, and moves up to +/-14h of spend across the boundary when that changes.
+    expect(monthImpl).toMatch(/at time zone 'utc'\)\)? at time zone 'utc'/);
   });
 
   it("computes an exact SUM rather than fetching rows", () => {
