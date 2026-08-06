@@ -1,4 +1,9 @@
-import type { RetrievalHealth, DenseState, LegState } from "@/lib/query/retrieval-health";
+import type {
+  RetrievalHealth,
+  DenseState,
+  LegState,
+  GroupCensusSummary,
+} from "@/lib/query/retrieval-health";
 import { timeAgo } from "@/components/format";
 
 /**
@@ -22,6 +27,39 @@ const LABEL: Record<DenseState | LegState, string> = {
   degraded: "degraded",
   off: "off",
 };
+
+/** Human copy for a census refusal — why a group carries numbers but no verdict. */
+const CENSUS_REFUSAL_COPY: Record<NonNullable<GroupCensusSummary["refusal"]>, string> = {
+  "graph-unreadable": "graph unreadable — can't judge",
+  "graph-unconfigured": "graph not configured",
+  "small-sample": "too few recently-active names to judge",
+  "no-baseline": "no baseline yet (young install)",
+  "predicate-suspect": "episodes are flowing but the census reads zero names — rename or stalled extractor",
+};
+
+const sharePct = (n: number | null) => (n === null ? "?" : `${Math.round(n * 1000) / 10}%`);
+
+/**
+ * One group's entity-name census (ALARMFIX-1): how many normalised names gained a node in the recent
+ * window, how many of those are split across >1 node, and the share vs the group's own baseline —
+ * or the refusal cause when it can't be judged. These are the numbers the alarm's margin/floor
+ * constants get measured from before it is armed (rollout step 2).
+ */
+function CensusRow({ c }: { c: GroupCensusSummary }) {
+  const verdict = c.refusal
+    ? CENSUS_REFUSAL_COPY[c.refusal]
+    : `${c.recentNames ?? "?"} recent names · ${c.recentSplit ?? "?"} split · ${sharePct(c.recentShare)} (baseline ${sharePct(c.baselineShare)})`;
+  return (
+    <div className="flex items-baseline gap-2 py-0.5 text-xs">
+      <span className={`shrink-0 font-medium ${c.polluted ? "text-red-600" : "text-ink-secondary"}`}>
+        {c.group}
+      </span>
+      <span className={c.refusal === "predicate-suspect" ? "text-amber-600" : "text-ink-tertiary"}>
+        {verdict}
+      </span>
+    </div>
+  );
+}
 
 function Leg({ name, state, detail }: { name: string; state: DenseState | LegState; detail?: string }) {
   return (
@@ -54,17 +92,18 @@ export function RetrievalHealthCard({ health }: { health: RetrievalHealth }) {
     health.graphEpisodes != null
       ? `${health.graphEpisodes} episodes${health.graphLastProjectedAt ? ` · last projected ${timeAgo(health.graphLastProjectedAt)}` : " · none projected yet"}`
       : undefined;
-  // Extraction failing the OTHER way (AIO-693): episodes become facts, but the duplicate-entity rate
-  // is over this graph's own baseline — the extractor is resolving identity badly. A stall outranks
-  // it in the copy below, same priority as the server's reason string: no facts is worse than bad facts.
-  const graphDedupePolluted = health.graphDedupePolluted;
+  // Extraction failing the OTHER way (AIO-693, census signal since ALARMFIX-1): episodes become
+  // facts, but a group is accumulating same-name entity splits over its own baseline — identity is
+  // being resolved badly. A stall outranks it in the copy below, same priority as the server's
+  // reason string: no facts is worse than bad facts.
+  const graphCensusPolluted = health.graphCensusPolluted;
   const graphDetail =
     health.graph === "off"
       ? "not configured"
       : graphExtractionStalled
         ? `accepting episodes but extracting 0 facts — ${graphFreshness}`
-        : graphDedupePolluted
-          ? `extracting duplicate entities at an abnormal rate — ${graphFreshness}`
+        : graphCensusPolluted
+          ? `same-name entity splits above this graph's own baseline — ${graphFreshness}`
           : graphStalled
             ? `projector stalled — ${graphFreshness}`
             : health.graph === "degraded"
@@ -103,6 +142,16 @@ export function RetrievalHealthCard({ health }: { health: RetrievalHealth }) {
       <Leg name="Keyword" state="on" detail="always on (local Postgres FTS)" />
       <Leg name="Semantic" state={d.state} detail={denseDetail} />
       <Leg name="Graph memory" state={health.graph} detail={graphDetail} />
+      {health.graphCensus.length > 0 ? (
+        <div className="ml-[18px] border-l border-border-subtle pl-3">
+          <p className="pt-0.5 text-[11px] uppercase tracking-wide text-ink-tertiary">
+            Entity name census (same-name splits)
+          </p>
+          {health.graphCensus.map((c) => (
+            <CensusRow key={c.group} c={c} />
+          ))}
+        </div>
+      ) : null}
       <Leg name="Reranker" state={health.rerank} detail={health.rerank === "off" ? "not configured" : undefined} />
       <Leg
         name="Augment"
@@ -136,14 +185,14 @@ export function RetrievalHealthCard({ health }: { health: RetrievalHealth }) {
               becoming graph facts, so narrative arcs can&apos;t update. Check the Graphiti service logs.
               Keyword and semantic search are unaffected.
             </>
-          ) : graphDedupePolluted ? (
+          ) : graphCensusPolluted ? (
             <>
-              The graph&apos;s extraction model is <strong>producing duplicate entities at an abnormal
-              rate</strong> — it resolves entity identity badly, so the same person or thing accumulates
-              as separate nodes with split facts, and retrieval quietly degrades. This is the failure no
-              save-time model check can see. Check the <strong>Extraction model</strong> in
-              Admin&nbsp;→&nbsp;Integrations and consider reverting a recent change; admins were emailed
-              when this tripped.
+              The graph is <strong>accumulating same-name duplicate entities</strong> — the entity-name
+              census shows names split across more than one node well over this graph&apos;s own
+              baseline, so the same person or thing accumulates as separate nodes with split facts, and
+              retrieval quietly degrades. This is the failure no save-time model check can see. Check
+              the <strong>Extraction model</strong> in Admin&nbsp;→&nbsp;Integrations and consider
+              reverting a recent change; admins were emailed when this tripped.
             </>
           ) : graphStalled ? (
             <>

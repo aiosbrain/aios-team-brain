@@ -198,10 +198,11 @@ export async function getPipelineHealth(teamId: string): Promise<PipelineHealth>
     // graph_project=OK on a 202, but Graphiti then fails entity extraction asynchronously, so
     // episodes are accepted while zero facts are created. Append it as a failing leg so the loud
     // banner names it just like a real broken poller.
-    // Either extraction failure earns the leg: a stall (no facts) or dedupe pollution (bad facts).
-    // Keyed on both so a model that extracts confidently-wrong knowledge is as loud as one that
-    // extracts nothing — the 2026-07-30 incident was the second kind and nothing announced it.
-    if (extraction?.stalled || extraction?.dedupePolluted) {
+    // Either extraction failure earns the leg: a stall (no facts) or census pollution (bad facts —
+    // same-name entity splits over the group's own baseline, ALARMFIX-1). Keyed on both so a model
+    // that extracts confidently-wrong knowledge is as loud as one that extracts nothing — the
+    // 2026-07-30 incident was the second kind and nothing announced it.
+    if (extraction?.stalled || extraction?.censusPolluted) {
       legs.push({
         source: "graph_extract",
         ok: false,

@@ -778,6 +778,41 @@ guard enforces it, it's named.
   single-episode `MAX_EPISODE_CHARS` cap; a malformed size/cap env falls back to the default rather than
   emitting empty/garbage episodes). _Guards:_ `test/graph-extraction-health.test.ts` + the
   `deriveGraphState` extraction-stall case in `test/retrieval-health.test.ts`.
+- **The graph pollution alarm judges the NAME-COLLISION CENSUS, not `IS_DUPLICATE_OF` edges**
+  (AIO-693, re-armed by ALARMFIX-1). graphiti_core **0.29.3** (deployed by #490) never writes
+  `IS_DUPLICATE_OF` on the server path, so the original edge-share predicate read a literal zero
+  forever and the alarm sat silently unjudgeable — the exact silent-death shape it was built
+  against. The replacement signal (`lib/graph/extraction-health.nameCollisionSignals` +
+  `deriveNameCollisionPollution`) is the **per-group same-name split share**: of normalised `Entity`
+  names (lowercase/trim/collapse-whitespace, mirroring the wheel's `_normalize_string_exact`;
+  normalised TS-side because two raw names that collapse to one cannot be re-merged after a
+  Cypher-side aggregation) whose newest node landed in the recent window (`CENSUS_RECENT_MS`, 7d;
+  baseline scales ~1:14 via `CENSUS_BASELINE_MS`), the fraction carried by >1 node. **Zero splits is
+  a healthy, judged reading** on 0.29.3 (exact-name dedup is deterministic); a **zero-NAME** census
+  is cross-checked against the `graph_episodes` ledger — episodes flowing but no names ⇒
+  `predicate-suspect` (a graphiti rename OR a stalled extractor; the alert mail names both), no
+  episodes ⇒ ledger-confirmed young/quiet. The alarm ships **UNARMED** (`CENSUS_ALARM_ARMED=false`;
+  margin/floor are placeholders) until the admin card's per-group census has been measured on prod —
+  flipping it is the rollout's step-3 commit. Delivery (`lib/graph/extraction-alert`, driven from the
+  ingest scheduler tick) runs **two machines over the `graph_health` `ingest_runs` ledger**,
+  discriminated by `meta.alarm: "pollution" | "blindness"` (kindless legacy rows read as pollution):
+  the **pollution** machine's combined verdict is judgeable-if-any-group-judged /
+  polluted-if-any-judged-group-polluted, its alert row records the polluted group ids, and recovery
+  requires each of them judged-and-healthy **or ledger-quiet across the full recent+baseline span**
+  (the release valve; evaluated at read time) — otherwise the combined verdict stays UNJUDGEABLE.
+  The **blindness meta-alarm** pages when the pollution alarm has been UNABLE to judge: a persisted
+  `anchor` row (ok:true — a running clock is not a failure) starts a wall-clock on the first
+  clock-running refusal; ≥24h (`UNJUDGEABLE_ALERT_HOURS`) with no `fired`/`cleared` since ⇒ one
+  admin mail (`fired`), recovery mail on the first judged tick after a fire (`cleared`, edge-only).
+  Clock taxonomy: `predicate-suspect` runs; `no-baseline` runs only when the ledger shows
+  baseline-window episode flow (young installs park); `small-sample`/`graph-unconfigured` park;
+  `graph-unreadable` parks a 6h grace (`UNREADABLE_GRACE_MS`, in-memory — ledger hygiene, not mail
+  latency) then runs with unreadable-specific copy, so worst-case time-to-page for a rotted
+  credential is ≈30h. Surfaces: the Admin retrieval-health card shows the per-group census (names /
+  split / share / refusal cause); the pipeline banner + graph leg degrade on a polluted verdict.
+  _Guards:_ `test/guards/dedupe-predicate-pinned.test.ts` (census Cypher + TS normalisation + the
+  ledger tripwire), `test/guards/extraction-alert-wired.test.ts` (scheduler wiring); machines
+  mutation-tested in `test/extraction-alert.test.ts` + `test/name-collision-pollution.test.ts`.
 
 ## Changing X? read this
 

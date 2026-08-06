@@ -88,14 +88,17 @@ export function startIngestScheduler(): void {
       }
     }
 
-    // Graph dedupe-pollution alarm (AIO-693): the scheduled caller extraction health never had. The
-    // 2026-07-30 bad-model incident was visible on every page that anyone didn't open for four days;
-    // this pushes the transition to admins instead. One cheap Neo4j aggregate per tick; best-effort,
-    // edge-debounced, and an unreadable graph changes nothing (see lib/graph/extraction-alert).
+    // Graph pollution alarm (AIO-693, re-armed by ALARMFIX-1): the scheduled caller extraction
+    // health never had. The 2026-07-30 bad-model incident was visible on every page that anyone
+    // didn't open for four days; this pushes the transition to admins instead. Runs BOTH machines —
+    // the name-collision census (pollution) and the blindness meta-alarm (an alarm that can't judge
+    // and doesn't say so is the failure shape #490 left behind). Cheap per-group Neo4j aggregates
+    // per tick; best-effort, edge-debounced (see lib/graph/extraction-alert).
     {
-      const { runDedupePollutionCheck } = await import("@/lib/graph/extraction-alert");
-      const action = await runDedupePollutionCheck(db);
-      if (action !== "none") console.warn(`[ingest] graph_health: dedupe pollution ${action}`);
+      const { runGraphHealthCheck } = await import("@/lib/graph/extraction-alert");
+      const r = await runGraphHealthCheck(db);
+      if (r.pollution !== "none" || r.blindness !== "none")
+        console.warn(`[ingest] graph_health: pollution=${r.pollution} blindness=${r.blindness}`);
     }
   };
 
