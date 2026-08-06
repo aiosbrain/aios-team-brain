@@ -1,0 +1,342 @@
+# Lever 2 — stop paying for predecessor episodes that carry nothing
+
+**Status:** spec, revised after plan review — 2 blockers + 1 HIGH that inverted a finding of mine
+· **Date:** 2026-08-06 · **Owner:** Chetan
+· **Task:** `PIPEFF-2` → [AIO-821](https://linear.app/je4light/issue/AIO-821)
+· **Parent:** `PIPEFF-1` / [AIO-820](https://linear.app/je4light/issue/AIO-820) —
+  [`graph-ingestion-efficiency.md`](./graph-ingestion-efficiency.md)
+· **Depends on:** the measurement harness (`scripts/graph-ingest-cost.mjs`, merged as `efdda1b`)
+
+## The problem, in one number
+
+Every `add_episode` retrieves **ten previous episodes** and carries their full content into **four
+metered LLM calls**. At ~625 tokens each that is **~6,250 tokens of predecessor context per call** —
+the single largest term in the ~40,070 input tokens per episode the harness measured.
+
+## What the window actually is — re-derived, and it is not what the parent spec assumed
+
+Read from `graphiti_core==0.29.3` (the exact pin in `graphiti/Dockerfile`) and from
+`/app/graph_service` inside the built image `aios-graphiti:0293-pinned`.
+
+### 1. One call site, one occurrence
+
+```python
+# graphiti_core/graphiti.py:1087-1093   (`name` is in scope — add_episode's first parameter)
+previous_episodes = (
+    await self.retrieve_episodes(
+        reference_time,
+        last_n=RELEVANT_SCHEMA_LIMIT,      # ← 10
+        group_ids=[group_id],
+        source=source,
+    )
+    if previous_episode_uuids is None
+    else await EpisodicNode.get_by_uuids(self.driver, previous_episode_uuids)
+)
+```
+
+`grep -rn 'last_n=RELEVANT_SCHEMA_LIMIT' graphiti_core/` returns **exactly one line**. The constant
+itself is defined in `search/search_utils.py` and appears there **15 times** (1 definition + 14 uses)
+as the dedupe-candidate limit and the query-time retrieval limit — so patching the *constant* would
+silently narrow search quality, a different feature. **Patch the call site.** (Both this spec's
+earlier draft and the parent spec said "~20 sites"; the number is 15, and the parent spec is
+corrected in the same PR.)
+
+### 2. The server can never take the other branch
+
+`graph_service/routers/ingest.py:57` calls `add_episode(uuid, group_id, name, episode_body,
+reference_time, source, source_description)` — **no `previous_episode_uuids`**. The REST surface the
+brain uses always takes the `retrieve_episodes` branch.
+
+### 3. The window is same-**group**, not same-**document**
+
+```cypher
+MATCH (e:Episodic) WHERE e.valid_at <= $reference_time
+AND e.group_id IN $group_ids AND e.source = $source
+ORDER BY e.valid_at DESC LIMIT $num_episodes
+```
+
+Predecessors are the ten episodes in the same group (`<teamSlug>_team` / `_external`) with the
+nearest earlier `valid_at`, regardless of which item they came from.
+
+### 4. …but for a multi-chunk item, its own prior chunks are *guaranteed* to be selected
+
+**This corrects the previous draft of this spec, which claimed the opposite and built its prediction
+on it.** The derivation the reviewer supplied, which I re-checked:
+
+- The graph service runs a **single sequential FIFO worker** (`routers/ingest.py`), so chunks
+  `0..k-1` are persisted before chunk `k` is processed.
+- `lib/graph/project.ts:toEpisodes` stamps every chunk with one `pickEpisodeTimestamp(item)`, so all
+  of an item's chunks share `valid_at` — and that value **equals** `reference_time`, which is the
+  *maximum* value the `valid_at <= reference_time` filter admits.
+- `ORDER BY valid_at DESC` therefore ranks every equal-max row **above** every strictly-earlier row.
+
+So chunk `k` receives all of its own prior chunks (up to 10). What is genuinely unpinned is only
+(a) their **order** within the prompt and (b) which rows survive `LIMIT 10` if the tie pool exceeds
+ten — either because the item has more than 11 chunks, or because another item carries a
+byte-identical `valid_at` (possible where `pickEpisodeTimestamp` resolves to a date-granular
+`worked_at`; **Phase A measures how often that happens**).
+
+**The consequence, and it reshapes the lever:**
+
+| item shape | what the 10 predecessors carry | verdict |
+|---|---|---|
+| **single-chunk** (40% of items are under 600 chars) | ten **unrelated** items | pure cost, nothing to resolve |
+| **multi-chunk** | its own prior chunks first, unrelated items only as filler | the coreference mechanism, working |
+
+The waste and the value are cleanly separable by item. So the right lever is **not** a smaller
+number — it is *"carry the document's own predecessors and nothing else."*
+
+## The lever: a same-item filter, with `last_n=1` as the blunt fallback
+
+Episode names are `items:<id>` (single chunk) or `items:<id>#k` (`lib/graph/episode-name.ts`), and
+`name` is in scope at the call site. So the filter is a post-retrieval predicate on the name's
+pre-`#` prefix — the Cypher query is unchanged (retrieval is not an LLM call and costs nothing worth
+optimising); only what reaches the four prompts changes.
+
+- **single-chunk item** → **zero** predecessors (better than `last_n=1`, and provably lossless: no
+  predecessor could have been the same document)
+- **multi-chunk item** → all of its own prior chunks, up to 10 (the mechanism preserved intact)
+
+`last_n=1` — the parent spec's proposal — remains in the battery as the **blunt floor**: it is a
+smaller patch, and if the same-item filter fails to cut enough tokens (a corpus dominated by long
+documents), `last_n=1` is the fallback whose quality cost we will then have measured rather than
+guessed.
+
+## Phase A — measure what the ten predecessors actually contain, before any A/B
+
+One local run at the **current** window (10) with request bodies captured. **Capture mechanism,
+decided here rather than at build time:** a thin local forwarder sits between graphiti and the local
+brain, appends each request body to a JSONL, and forwards unchanged — so metering still traverses the
+production path (`graph-proxy` → `classifyGraphCall` → `recordLlmUsage`) and nothing about the cost
+shape is simulated. Nothing in the proxy or `llm_usage` stores prompts, and this spec is not going to
+add prompt storage to a production path to run an experiment.
+
+Measured **across all four metered carriers** — `extract_nodes`, `extract_edges`, `dedupe_nodes` and
+`node_summaries_batch`:
+
+| measured | why it decides the design |
+|---|---|
+| predecessor tokens per call, **per call kind** | sizes the prize; the parent's ~6,250 is derived, not observed, and measuring only `extract_nodes` would understate it |
+| **same-item share**, split single-chunk vs multi-chunk | the prediction from §4 is ~0% and ~100% respectively; a blended number would hide both |
+| **tie-pool contamination** — how often a *different* item shares an episode's exact `valid_at` | the one way §4's guarantee can break; if it is common, the same-item filter is worth more, not less |
+
+> `node_attributes` is **not** a fourth carrier on this install: with no custom entity types,
+> `_extract_entity_attributes` returns `{}` with no LLM call (`node_operations.py:783-791`). The
+> fourth metered carrier is `node_summaries_batch`, which embeds full predecessor content
+> (`node_operations.py:948-963`). The parent spec names the wrong one.
+
+Phase A's numbers are written into this doc **before** Phase B runs, so the prediction is on the
+record before the result exists.
+
+## Phase B — the battery
+
+Three arms, each replaying the **same corpus in the same order into a fresh, empty Neo4j**, at the
+same model and temperature as prod:
+
+| arm | patch |
+|---|---|
+| **W10** | incumbent — unpatched |
+| **SAME** | same-item filter (the designed fix) |
+| **W1** | `last_n=1` (blunt floor) |
+
+`last_n` is not env-configurable, so each arm is a **locally built image variant** off
+`graphiti/Dockerfile`. Local topology per arm: neo4j + that graphiti variant + the capture tap +
+`next start` (the brain) + the `db:test:up` Postgres — **on its own container/ports**, because a
+shared test Postgres has previously made concurrent runs look like product bugs.
+
+### The corpus is this install's own content, pulled at run time
+
+Never a checked-in fixture. `EXMODEL-1` failed exactly there: the repo is public, so the fixture had
+to be synthetic, and two synthetic attempts scored the *negative control* — the model that actually
+polluted the graph — as a pass and the good model as a fail. A fixture iterated until it agrees with
+the conclusion is the failure this workstream exists to prevent.
+
+The battery copies the selected `items` rows, the `members` rows (Q2 needs them) and the `teams` row
+from prod (read-only) into the local Postgres. Content stays local; nothing is committed.
+
+**Selection rule, fixed in advance, buckets disjoint by construction, `access = 'team'` only:**
+
+| bucket | rule | ≈episodes |
+|---|---|---|
+| A | the **5** most recent items of **≥ 8 chunks** | ~50 |
+| B | the **20** most recent items of **exactly 1 chunk and < 600 chars** | 20 |
+| C | the **8** most recent items of **2–7 chunks** | ~30 |
+
+≈100 episodes per rep. The `access='team'` restriction is what makes this land in **one group** — by
+selection, not by bypassing the projector (see below). The selected item ids are **pinned in the
+report** so a later run is comparable rather than merely similar.
+
+**Q2 power extension, deterministic:** if the corpus yields fewer than **15** literal member-name
+occurrences, extend bucket C by the next most-recent qualifying items, up to **+10**, until it does.
+If it still does not, Q2 is **UNDERPOWERED**, which counts as a FAIL (see the decision function —
+the conservative default is the point).
+
+### The push is the real projector run path
+
+**The battery drives `runGraphProjection`** against the local Postgres with `GRAPHITI_URL` pointed at
+the arm's graphiti. Not a bespoke loop over `chunkContent` + REST. This is a blocker-level
+correction, and the reason is specific:
+
+`scripts/graph-ingest-cost.mjs` cross-checks `extract_nodes` calls against `ingest_runs.meta.
+episodes`, which **only the projector run path writes** (`lib/graph/projection-run.ts:21-31`). With a
+bespoke pusher there is no such row, `episodesPushed` is `null`, and the harness prints
+"cross-check unavailable" **and reports the ratios anyway** (`graph-ingest-cost.mjs:137, 253` — a
+null is not a refusal). Q5 would then be silently unmeasurable, and C1 would lose its guard: the
+denominator counts **attempts**, so a patch-induced rise in validation retries inflates it and
+manufactures a token-per-episode "saving" — C1 stays green through the exact failure Q5 exists to
+catch.
+
+**So: cross-check unavailable ⇒ the run is INVALID, not "report with suspicion."** Same for any
+harness refusal (drain, zero episodes).
+
+### Metrics and pass bands — pre-registered
+
+Every band is relative to the **W10 arm measured in the same session**. No stored answer key, no
+absolute target except where noted: the question is *"is this worse than what we have"*, asked
+against this install's own content.
+
+| # | metric | derived from | band |
+|---|---|---|---|
+| Q1 | **entity yield** | `Entity` nodes per episode | ≥ **90%** of W10 |
+| Q2 | **people recall** | member names appearing literally in a chunk's text, found as an `Entity` in that group | ≥ **95%** of W10 **and** at most **1** person lost outright |
+| Q3 | **duplicate pollution** | `IS_DUPLICATE_OF` share of edges, via **`lib/graph/extraction-health.ts`'s own Cypher predicate** (pinned by `test/guards/dedupe-predicate-pinned.test.ts`) | ≤ W10 **+ 5 pp** |
+| Q4 | **cross-chunk entity continuity** | bucket A + C items only: share of an item's entities appearing in ≥ 2 of its chunks | ≥ **85%** of W10 |
+| Q5 | **signed retry gap** | `(extract_nodes − episodesPushed) / episodesPushed`, in pp — the harness's `signed`, normalised | must not rise by more than **2 pp** vs W10 |
+| C1 | **input tokens per episode** | the harness | must fall by ≥ **25%** vs W10 |
+
+**Q4 is the metric that tests the actual mechanism** — Q1–Q3 would all stay green while cross-chunk
+references silently stopped resolving. Q2's two clauses are both floors and the stricter binds; at
+realistic n the 95% clause is usually the operative one, and the "1 person" clause only bites on a
+small denominator.
+
+### The decision function — total, and fixed before any number exists
+
+The previous draft pre-registered bands *and* a noise rule, and never said what happens when a metric
+lands below its band but within noise. That gap is a joint that gets chosen after the numbers exist —
+EXMODEL-1's failure re-entering through analysis flexibility instead of through the fixture. So:
+
+**Aggregation.** Each arm runs **2 reps** on the same corpus into a fresh database. An arm's value
+for a metric is the **mean of its two reps**. Ratios use the mean of W10's two reps as denominator.
+W10's own **spread** — `|rep1 − rep2|`, expressed in the same units as the band — is the noise
+estimate.
+
+**Per metric, exactly one of:**
+
+- **PASS** — the arm's mean meets the band.
+- **FAIL** — the arm's mean misses the band by **more than** W10's spread.
+- **INCONCLUSIVE** — the arm's mean misses the band by **no more than** W10's spread.
+
+**INCONCLUSIVE counts as FAIL for shipping.** The burden of proof is on the change: a metric we
+cannot distinguish from a regression is not evidence that there is none. Deciding this now is what
+stops it from being decided later, in the direction I want.
+
+**Arm order and outcome:**
+
+1. Evaluate **SAME**. All of Q1–Q5 and C1 PASS → **SAME ships**.
+2. Else evaluate **W1** on the identical rule → **W1 ships**.
+3. Else **the lever does not ship**, and the negative result is committed to this doc. Cutting the
+   context is then off the table until the `previous_episode_uuids` alternative is spec'd (below).
+
+C1's ≥25% applies identically to every candidate arm: a quality-clean arm that barely moves tokens
+does not justify a deploy of this service (see *Rollout*).
+
+**Rerun policy.** "Most recent" re-draws the corpus each session, so nothing structurally binds me to
+the first result. Therefore: **every started session's outcome is appended to this doc**, pass or
+fail, with its pinned item ids. A session may be marked *invalidated* only for a pre-defined infra
+reason — a harness refusal, an unavailable cross-check, or an arm that failed to complete every
+episode — never for its numbers.
+
+**Estimated spend: ≈$5–8** on the OpenRouter key (3 arms × 2 reps × ~100 episodes, cheaper per
+episode as the window shrinks). Direct-to-provider from a local brain: the `llm_usage` **rows** land
+in the local test database (which is what the harness reads), while the **dollars** land on the
+provider bill and never in our ledger or the Costs page.
+
+### Prod parity
+
+The local team row mirrors the prod team's `extraction_provider`/`extraction_model` **and its
+small-extraction backend** — `resolveGraphChatTargets`/`selectSmallExtractionBackend` returns
+`small: null` when unconfigured, and every small-marked call then silently lands on the strong model,
+so an unmirrored small setting measures a cost shape prod does not have. **Both resolved targets are
+printed in the battery's report.**
+
+## Phase C — the patch, only if Phase B clears
+
+A `sed` in `graphiti/Dockerfile` in that file's established style: a `grep` asserting the pre-state
+(and its uniqueness), a `grep` + `ast.parse` asserting the post-state, so a base-image change that
+moves the line **fails the build** rather than silently no-op'ing. That silent no-op is the class the
+Dockerfile's own comments exist to prevent, and is exactly what the parent spec's original
+`EPISODE_WINDOW_LEN = 3` proposal would have been.
+
+**Placement is load-bearing:** the RUN must come **after** the `pip install` RUN, or pip overwrites
+the edit and every gate still passes against the pre-install file — the precedent is patch 2's own
+comment at `graphiti/Dockerfile:102`. A final assertion RUN after **all** installs re-greps the
+post-state, so ordering cannot silently regress.
+
+```
+F=/app/.venv/lib/python3.12/site-packages/graphiti_core/graphiti.py
+test "$(grep -c 'last_n=RELEVANT_SCHEMA_LIMIT,' "$F")" = "1"          # pre-state + uniqueness
+sed -i '<the arm that won>' "$F"
+grep -q '<post-state marker, incl. a PIPEFF-2 comment>' "$F"
+python -c "import ast; ast.parse(open('$F').read())"
+# the constant's own uses are untouched — hardcoded, not "unchanged":
+test "$(grep -c RELEVANT_SCHEMA_LIMIT .../search/search_utils.py)" = "15"
+```
+
+### Rollout and rollback
+
+Deploying the `graphiti` service is not routine: **restarting or var-touching it has previously
+rebuilt a broken image**, and recovery is a **dashboard rollback to a recorded deployment ID** —
+never `railway up` / `redeploy` (denied by `.claude/settings.json` and a PreToolUse hook).
+
+1. Record the current deployment ID **before** the change.
+2. Confirm the service still has **no custom start command** — a start command re-syncs the venv at
+   boot and silently reverts every patch in the image (the ⚠️ precondition in the Dockerfile).
+3. Merge → Railway builds from `graphiti/`. **`docs/ARCHITECTURE.md` is updated in the same PR**
+   (CLAUDE.md §1).
+4. **Verify in the ledger, not the logs:** input tokens/episode on the same harness, over a
+   drain-clean prod window after the deploy, against the pre-deploy baseline — and read the signed
+   cross-check, not only the ratio.
+5. Watch Q3 in prod via the **dedupe-pollution alarm (AIO-693)**, live, which emails admins on the
+   ok→polluted edge. That alarm is the backstop for a quality regression the battery missed.
+
+Rollback is data-safe in the same sense the 0.29.3 upgrade was — same labels, same embedder, same
+indices — but Graphiti's worker queue is **in-memory**, so episodes accepted (202) and unprocessed at
+rollback are lost; confirm the brain's reconcile re-pushed them.
+
+## Alternatives considered
+
+- **Patch the constant `RELEVANT_SCHEMA_LIMIT`.** Rejected: 14 further uses in `search_utils.py` make
+  it a silent search-quality change.
+- **Pass `previous_episode_uuids` from the brain.** The most explicit version of the same idea, and
+  it lives in *our* code rather than a sed into a vendored library, so it survives image bumps. It
+  needs a patch to `graph_service/routers/ingest.py` **and** a new field on the brain's `/messages`
+  payload — two surfaces, and the brain would have to track chunk uuids it does not track today.
+  **Recorded as the follow-up if Phase B kills both arms**; it gets its own task key when triggered.
+- **`use_combined_extraction`** (merge node+edge extraction into one call). Unreachable from the
+  public API; noted in the parent spec, out of scope here.
+
+## How we will know it worked
+
+Input tokens per episode falls from **~40,070** by ≥25% on the harness, over a drain-clean prod
+window after the deploy, with Q1–Q5 unmoved on the battery — and the AIO-693 alarm quiet for a week.
+
+## Risks
+
+- **The battery passes and prod still degrades**, because ~100 episodes of this install's content is
+  not every shape of content. Mitigated by the AIO-693 alarm as the live backstop and by the recorded
+  rollback path — not by claiming the battery is exhaustive.
+- **Two reps is a thin noise estimate.** It bounds noise crudely; it cannot prove a small regression
+  absent. The INCONCLUSIVE-counts-as-FAIL rule is what makes a thin estimate safe rather than
+  convenient: thin noise makes shipping *harder*, not easier.
+- **The same-item filter changes behaviour for non-`items:` episodes** (e.g. `correction:<arc_id>`
+  writeback episodes), which would get zero predecessors. That is the intended semantics — a
+  correction episode has no document to be a chunk of — but it must be stated, and the Phase C PR
+  needs a test that pins it rather than discovering it.
+
+## Session log
+
+_(every started session appended here, pass or fail — see Rerun policy)_
+
+| session | corpus item ids | Phase A result | arm outcomes | verdict |
+|---|---|---|---|---|
+| — | — | not yet run | — | — |
