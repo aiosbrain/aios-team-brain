@@ -248,12 +248,12 @@ against this install's own content.
 
 | # | metric | derived from | band |
 |---|---|---|---|
-| Q1 | **entity yield** | `Entity` nodes per episode | ≥ **90%** of W10 |
+| Q1 | **entity yield, TWO-SIDED** | `Entity` nodes per episode | within **± 10%** of W10 — an *increase* is as disqualifying as a fall |
 | Q2 | **people recall** | member names appearing literally in a chunk's text, found as an `Entity` in that group | ≥ **95%** of W10 **and** at most **1** person lost outright |
 | Q3 | **duplicate pollution, TWO-SIDED** | `IS_DUPLICATE_OF` share of edges, via **`lib/graph/extraction-health.ts`'s own Cypher predicate** (pinned by `test/guards/dedupe-predicate-pinned.test.ts`) | within **± 5 pp** of W10 — a *fall* is as disqualifying as a rise |
 | Q4 | **cross-chunk entity continuity** | buckets A + C only: share of an item's entities appearing in ≥ 2 of its chunks | ≥ **85%** of W10 |
-| Q5 | **signed retry gap** | `(extract_nodes − episodesPushed) / episodesPushed`, in pp — the harness's `signed`, normalised | must not rise by more than **2 pp** vs W10 |
-| Q6 | **cross-item entity convergence** | over member names appearing literally in chunks of **≥ 2 distinct items**: distinct `Entity` nodes carrying that name ÷ distinct names matched | ≤ **105%** of W10 |
+| Q5 | **signed retry gap** | `(extract_nodes − episodesPushed) / episodesPushed`, in pp — the harness's `signed`, normalised | must not rise by more than **3 pp** vs W10 |
+| Q6 | **cross-item entity convergence** | over member names appearing literally in chunks of **≥ 2 distinct items**: distinct `Entity` nodes carrying that name ÷ distinct names matched, **case-normalised on both sides** | ≤ **105%** of W10 |
 | C1 | **input tokens per episode** | the harness | must fall by ≥ **25%** vs W10 |
 
 **Q4 and Q6 are the two metrics that test mechanisms rather than symptoms.** Q4 catches the loss of
@@ -262,9 +262,16 @@ resolving. Q6 catches the loss of *cross-item* dedupe judgment described above, 
 gate whose direction is right for fragmentation; it deliberately reuses Q2's member-name machinery
 rather than inventing a second identity notion.
 
-**Q3's lower bound is not symmetry for its own sake.** `extraction-health.ts` already treats an
-anomalously *low* duplicate share as suspect, and failure-to-merge is exactly how the share falls
-while the graph gets worse.
+**Q1's and Q3's upper/lower bounds are not symmetry for its own sake.** `extraction-health.ts` already
+treats an anomalously *low* duplicate share as suspect, and failure-to-merge is exactly how the share
+falls while the graph gets worse. Q1's new **upper** bound is the catch-all for the fragmentation
+Q6 cannot see: the canonicalization failure above yields a node named `"John"`, which carries no
+member name at all and so never enters Q6's denominator — but it does inflate node count. A one-sided
+Q1 would have waved it through.
+
+**Q6 reports a per-name breakdown, not only the ratio.** The aggregate can stay flat while the arm
+fragments name A and W10 happens to fragment name B. That case is rare and not disqualifying on its
+own, but it must be *auditable* rather than invisible, so the per-name counts go in the report.
 
 Q2's two clauses are both floors and the stricter binds; at realistic n the 95% clause is usually the
 operative one, and the "1 person" clause only bites on a small denominator.
@@ -304,8 +311,43 @@ completes every episode and so trips none of the invalidation conditions. W10 me
 SAME's 8.5 **passes**. More noise, easier shipping — the exact opposite of what the Risks section
 claims. Under the symmetric rule the band is 7.29 + 4.2 = 11.5 and SAME correctly fails.
 
-**Belt and braces:** if W10's spread on any metric exceeds **25% of its own mean**, the session is
-**INVALID** — that is not a result, it is a broken instrument.
+**The validity ceiling is expressed in BAND units, not as a fraction of the mean.** An earlier draft
+said "spread > 25% of W10's mean ⇒ INVALID", which is degenerate in both directions:
+
+- **Too tight where the healthy mean is ~0.** Q5's healthy W10 value is ≈ 0 (the prod baseline
+  cross-checked *exact*), so 25%-of-mean ≈ 0 and **a single validation retry in one W10 rep**
+  invalidates the session. The battery could plausibly never complete a valid session.
+- **Too loose where the band is tight.** At a healthy W10 dupe share of 30%, the ceiling permits a
+  spread of 7.5 pp — but Q3's band is ± 5 pp, and PASS requires sitting more than `spread` inside
+  *both* edges, so the PASS window is **empty**. A session would be valid with a metric no arm could
+  ever pass.
+
+A decision procedure that can deadlock mid-experiment is the failure this spec exists to prevent,
+because a deadlock is what gets rewritten under pressure. So, per metric:
+
+> **W10's spread must be ≤ half that metric's band margin**, with an absolute floor where the healthy
+> mean sits near zero. Otherwise the session is **INVALID** — not a result, a broken instrument.
+
+| metric | band margin | max W10 spread |
+|---|---|---|
+| Q1 | ± 10% of W10 | 5% of W10's mean |
+| Q2 | 5% | 2.5% |
+| Q3 | ± 5 pp | 2.5 pp |
+| Q4 | 15% | 7.5% |
+| Q5 | 3 pp | **1.5 pp** (floor: at ~100 episodes one retry ≈ 1 pp, so one retry of rep-to-rep difference is tolerated and two is not — which is why Q5's band is 3 pp rather than 2) |
+| Q6 | 5% | 2.5% |
+| C1 | 25% | 12.5% |
+
+**This construction also guarantees every PASS window is non-empty in a valid session**: PASS needs
+the arm to beat the band by more than `spread`, and `spread ≤ ½ margin` always leaves room. That is
+the property the old ceiling lacked, and it is why the ceiling is derived from the band rather than
+chosen.
+
+**One further sanity gate, borrowed from the module that already owns the question:** if W10's own
+duplicate share falls outside **15–45%**, the session is INVALID. `extraction-health.ts` measures a
+healthy share on this graph at **~26–35%** and treats a literal zero as evidence the *predicate* is
+broken rather than the graph clean; ~70% was the degraded model. A W10 arm outside that range is not
+a baseline worth comparing against.
 
 **Arm order and outcome:**
 
@@ -327,8 +369,20 @@ shipping on the passer would still be legal under a log-everything rule. So:
 - shipping requires the latest valid session to pass **and** no prior valid session to have failed the
   same arm without that amendment on the record;
 - a session is *invalidated* only for a **pre-defined** reason — a harness refusal, an unavailable
-  cross-check, an arm that failed to complete every episode, an UNDERPOWERED Q2/Q6, or a W10 spread
-  above 25% of its mean — **never for its numbers**.
+  cross-check, an arm that failed to complete every episode, an UNDERPOWERED Q2/Q6, a W10 spread over
+  its per-metric ceiling, or a W10 duplicate share outside 15–45% — **never for its numbers**.
+
+**Invalidation is a free retry, so it is capped.** The amendment gate binds only *valid* sessions, and
+it has to — an infra failure must not deadlock the battery. But one trigger is operator-inducible:
+killing a container mid-arm invalidates a session that was trending badly, and next week's redraw then
+needs no amendment. So the redraw joint is closed on the invalid side too:
+
+- an invalidated session still has its **partial metrics computed and appended** to the session log,
+  with the invalidation cause attached — so a run that was going badly leaves the same trace as one
+  that was going well;
+- **more than two consecutive invalidations** without an intervening committed amendment **block
+  further sessions**. If the battery cannot complete twice running, the instrument is what needs
+  fixing, and that fix belongs in this doc before more money is spent.
 
 **Estimated spend: ≈$5–8** on the OpenRouter key (3 arms × 2 reps × ~100 episodes, cheaper per
 episode as the window shrinks). Direct-to-provider from a local brain: the `llm_usage` **rows** land
@@ -407,7 +461,7 @@ rollback are lost; confirm the brain's reconcile re-pushed them.
 ## How we will know it worked
 
 Input tokens per episode falls from **~40,070** by ≥25% on the harness, over a drain-clean prod
-window after the deploy, with Q1–Q5 unmoved on the battery — and the AIO-693 alarm quiet for a week.
+window after the deploy, with Q1–Q6 unmoved on the battery — and the AIO-693 alarm quiet for a week.
 
 ## Risks
 
