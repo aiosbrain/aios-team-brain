@@ -30,7 +30,7 @@
  */
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { assessSession, decide, MIN_UNIVERSE } from "./decision.mjs";
+import { assessSession, decide } from "./decision.mjs";
 import { buildUniverse, nameConvergence } from "./q7.mjs";
 
 const num = (s) => Number(String(s).replace(/,/g, ""));
