@@ -860,7 +860,19 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 - `POST /api/internal/llm/v1/embeddings` — the other half of that base URL (Graphiti embeds as well as extracts, so proxying only chat would leave the second key in place). **Pinned to `EMBEDDING_DIM` (1536)**: Graphiti built its Neo4j vector index at one width and has no migration path, so a different-dimension model is refused rather than silently making every stored vector incomparable. Also **meters** into `llm_usage` (`source=embeddings`), same best-effort path
 - `GET /api/brain/facts` — Brain-Learning panel Layer 1: recent Graphiti facts (last 24h) read directly from Neo4j; session-authed; tier-scoped via `visibleGroupIds` (sole enforcement, no RLS backstop)
 - `GET /api/brain/events` — Brain-Learning Layer 2: recent events (source episodes) with participants + extracted facts; session-authed; tier-scoped via `visibleGroupIds`. A recognized AI-agent/tool name in `participants` is tagged with the human behind that event's item (`resolveHumanActorsByItem` in `lib/graph/human-actors.ts` + `attributeEventParticipants` in `lib/graph/arc-attribution.ts`), same as narrative-arc participants
-- **Timeline** — a human-readable **day → person → task → evidence** ledger of the last 7 days. **Meetings
+- **Timeline** — a human-readable **day → person → task → evidence** ledger of the last 7 days. **Calendar events count too.** A person's workspace pushes the events they CHOOSE to
+share (selection happens at the source — personal events never leave the machine), and an item whose
+`frontmatter.source` is a calendar source (`calendar`/`gcal`/`google_calendar`) becomes a meeting note
+like a transcript does. Two differences, both because a calendar event is structurally better data:
+attendance is resolved **EXACTLY by email** against `members` (`buildIdentityMap().byEmail`) with no LLM
+and no name-matching — versus the transcript path's ~1.4 attendees/meeting — and it needs **no body**,
+since an invite has no transcript. Recognised by SOURCE, not `kind`: a producer may reasonably send
+`artifact` or `transcript` for an event, and keying on kind would drop it over a vocabulary choice. The
+accepted attendee shapes are deliberately liberal (`["a@x.com"]`, `[{email,display}]`,
+`[{id,display,role}]` — the workspace gog puller's own shape — and a comma-separated string); an entry
+with no parseable email is DROPPED rather than guessed at, and a non-member guest (a client) is not
+credited but never sinks the event for the members who were there. See `lib/meetings/from-calendar.ts`.
+**Meetings
 count as WORK, per ATTENDEE**: one evidence row per `(meeting, attendee)` from `meeting_note_attendees`
 (`source:"meetings"`), so a meeting lands on the card of everyone who was in it — not only whoever ran
 `aios push`. It reverses the older "meetings are team signal" exclusion, whose blocker was attribution

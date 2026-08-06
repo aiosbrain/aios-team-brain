@@ -5,6 +5,8 @@ import { extractAndStoreActionItems } from "./action-items";
 import type { ExtractedTodo } from "./extract-todos";
 import { createMeetingNoteFromItem } from "./notes";
 import { backfillMergeDuplicateMeetings } from "./merge";
+import { buildIdentityMap } from "@/lib/identity/resolve";
+import { CALENDAR_SOURCES, calendarAttendees, calendarTitle, isCalendarEvent } from "./from-calendar";
 
 /**
  * Bridge: turn transcript `items` that arrived through the CLI/ingest path (`aios push`) into
@@ -55,6 +57,20 @@ export function deriveMeetingTitle(body: string, path: string): string {
  *  null (the note defaults to its created_at). Pure. */
 export function deriveOccurredAt(frontmatter: Record<string, unknown> | null | undefined, path: string): string | null {
   const fm = frontmatter ?? {};
+  // A CALENDAR EVENT is dated by when it HAPPENS, and that is not `created`. Workspace frontmatter
+  // routinely carries `created` (the file's creation / push day), so with the generic order below an
+  // event pushed Tuesday for Thursday's meeting would log as Tuesday's work — and a batch of shared
+  // events would all pile onto the sync day. Google's own start-time fields are checked first, and
+  // only for calendar items so the transcript path's tuned order is untouched.
+  if (isCalendarEvent(typeof fm.source === "string" ? fm.source : null)) {
+    for (const key of ["start", "start_time", "startTime", "occurred_at", "source_ts", "date"]) {
+      const v = fm[key];
+      if (typeof v === "string") {
+        const m = v.match(/^\d{4}-\d{2}-\d{2}/);
+        if (m) return m[0];
+      }
+    }
+  }
   for (const key of ["created", "source_ts", "date", "occurred_at"]) {
     const v = fm[key];
     if (typeof v === "string") {
@@ -68,6 +84,9 @@ export function deriveOccurredAt(frontmatter: Record<string, unknown> | null | u
 
 interface CandidateMeta {
   id: string;
+  /** Selected now that the query is no longer filtered on it — a transcript takes the LLM path, a
+   *  calendar event (recognised by SOURCE) takes the structured-attendee path. */
+  kind: string | null;
   path: string;
   access: "team" | "external";
   member_id: string | null;
@@ -111,16 +130,43 @@ export async function backfillMeetingNotesFromItems(
   const hasNote = new Set(((noted ?? []) as { source_item_id: string }[]).map((r) => r.source_item_id));
 
   // Candidate metadata only (no bodies — transcripts can be large). Filter to meeting sources here.
-  const { data: rows } = await admin
-    .from("items")
-    .select("id, path, access, member_id, frontmatter")
-    .eq("team_id", teamId)
-    .eq("kind", "transcript")
-    .order("synced_at", { ascending: false })
-    .limit(500);
-  const candidates = ((rows ?? []) as CandidateMeta[]).filter(
-    (r) => isMeetingTranscript("transcript", (r.frontmatter?.source as string) ?? null) && !hasNote.has(r.id)
-  );
+  //
+  // TWO shapes of meeting arrive here, and they need different treatment, so the query is deliberately
+  // NOT filtered on `kind` any more:
+  //   • a TRANSCRIPT (granola/zoom/…) — has a body, attendees are inferred from it by an LLM;
+  //   • a CALENDAR EVENT — has structured attendee EMAILS and typically no body at all.
+  // Keying calendar events on `kind` would drop them over a vocabulary choice the producer is free to
+  // make (`artifact` and `transcript` are both defensible for an event), so they are keyed on SOURCE.
+  // TWO windows, unioned — NOT one widened window. Dropping the `kind='transcript'` filter to let
+  // calendar events through would have made this "the 500 newest rows of ANY kind", so a bulk sync
+  // (a github backfill, a new connector) could push a real meeting transcript below the cap and it
+  // would NEVER be noted — silently, permanently, since the window only moves forward. Each shape
+  // gets its own bounded window instead, so neither can starve the other.
+  const [transcriptRes, calendarRes] = await Promise.all([
+    admin
+      .from("items")
+      .select("id, kind, path, access, member_id, frontmatter")
+      .eq("team_id", teamId)
+      .eq("kind", "transcript")
+      .order("synced_at", { ascending: false })
+      .limit(500),
+    admin
+      .from("items")
+      .select("id, kind, path, access, member_id, frontmatter")
+      .eq("team_id", teamId)
+      .in("frontmatter->>source", [...CALENDAR_SOURCES])
+      .order("synced_at", { ascending: false })
+      .limit(500),
+  ]);
+  const byId = new Map<string, CandidateMeta>();
+  for (const r of [...((transcriptRes.data ?? []) as CandidateMeta[]), ...((calendarRes.data ?? []) as CandidateMeta[])]) {
+    byId.set(r.id, r); // an item matching both windows is one candidate
+  }
+  const candidates = [...byId.values()].filter((r) => {
+    if (hasNote.has(r.id)) return false;
+    const source = (r.frontmatter?.source as string) ?? null;
+    return isMeetingTranscript(r.kind ?? "", source) || isCalendarEvent(source);
+  });
 
   // NOTE: no early-return on an empty candidate set — the create loop below no-ops, and the
   // auto-merge at the end still runs so pre-existing duplicates get cleaned up each tick.
@@ -139,19 +185,44 @@ export async function backfillMeetingNotesFromItems(
     ((rawText: string, r: RosterPerson[]) =>
       extractFromTranscript(rawText, r, opts.keys ?? {}, undefined, { db: admin, teamId }));
 
+  // Email -> member, built ONCE for the batch. Calendar attendance is resolved EXACTLY by address —
+  // no model, no name-matching — which is the whole reason a shared calendar event attributes better
+  // than a transcript does. Built lazily: a batch with no calendar events pays nothing.
+  let byEmail: Map<string, string> | null = null;
+  const resolveEmails = async (emails: string[]): Promise<string[]> => {
+    if (!byEmail) byEmail = (await buildIdentityMap(admin, teamId)).byEmail;
+    const seen = new Set<string>();
+    const ids: string[] = [];
+    for (const e of emails) {
+      const id = byEmail.get(e);
+      // An attendee who is not a member of THIS team (an external guest, a client) is not credited —
+      // there is no person here to attribute the work to. Their presence is not lost: the event, its
+      // title and its own attendee list remain on the item.
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      ids.push(id);
+    }
+    return ids;
+  };
+
   for (const c of candidates.slice(0, limit)) {
     summary.scanned++;
     try {
+      const calendar = isCalendarEvent((c.frontmatter?.source as string) ?? null);
       const { data: item } = await admin.from("items").select("body").eq("id", c.id).maybeSingle();
       const body = (item as { body: string } | null)?.body ?? "";
-      if (!body.trim()) {
+      // A transcript with no body has nothing to extract from. A CALENDAR EVENT legitimately has no
+      // body — its content is the invite — so requiring one here is what would silently drop it.
+      if (!calendar && !body.trim()) {
         summary.skipped++;
         continue;
       }
-      const ex = await extract(body, roster).catch(() => ({ summary: "", attendeeMemberIds: [] }));
+      const ex = calendar
+        ? { summary: "", attendeeMemberIds: await resolveEmails(calendarAttendees(c.frontmatter).map((a) => a.email)) }
+        : await extract(body, roster).catch(() => ({ summary: "", attendeeMemberIds: [] }));
       const res = await createMeetingNoteFromItem(admin, teamId, {
         sourceItemId: c.id,
-        title: deriveMeetingTitle(body, c.path),
+        title: calendar ? calendarTitle(c.frontmatter, c.path) : deriveMeetingTitle(body, c.path),
         occurredAt: deriveOccurredAt(c.frontmatter, c.path),
         summary: ex.summary,
         submittedByMemberId: c.member_id,
@@ -161,7 +232,12 @@ export async function backfillMeetingNotesFromItems(
         summary.created++;
         // Pre-compute action items so a pushed meeting opens with its todos already filled in
         // (not empty until someone clicks "extract"). Best-effort — never fail the note over it.
-        try {
+        //
+        // SKIPPED for a body-less calendar event. `extractActionItems` has no empty-input guard, so it
+        // would POST "Transcript:\n\n" plus a roster hint to the model for every event: real spend for
+        // certain, and a hallucinated todo would materialize as a REAL task in "Extracted from
+        // Meetings" — pushable to Linear. An invite has no commitments in it to extract.
+        if (body.trim()) try {
           await extractAndStoreActionItems(
             admin,
             teamId,

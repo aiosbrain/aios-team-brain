@@ -23,6 +23,7 @@ import { MIN_CONFIDENCE } from "./doc-task-infer";
 import { resolveItemCreditIds } from "@/lib/attribution/contributor-credit";
 import { slackParticipations, foldProviderId } from "@/lib/ingest/slack-participants";
 import { canSeeMeetingNotes } from "@/lib/meetings/notes";
+import { isCalendarEvent } from "@/lib/meetings/from-calendar";
 
 // Only ACTIVE tasks are considered work "in progress" — Linear In Progress/In Review both normalize to
 // `in_progress`; `blocked` is active-but-stuck. Backlog/ready/done are context, excluded from the timeline.
@@ -91,6 +92,9 @@ const WORK_EVENT_LIMIT = 5000;
  *  `frontmatter.sha`, so both sides normalize to this prefix. 40 bits — collision risk ~1e-7 at our scale. */
 const SHA_JOIN_LEN = 10;
 /** Inferred (LLM) task↔item edges pulled per build. Bounded like every other leg. */
+/** Meeting notes scanned per build. Meetings are human-paced (tens per team per month), so this is a
+ *  runaway backstop rather than a working limit — unlike the item caps it sits beside. */
+const MEETING_NOTE_LIMIT = resolvePositiveInt(process.env.TIMELINE_MEETING_LIMIT, 2000);
 const TASK_EVIDENCE_LIMIT = 5000;
 
 /** The pg adapter hands timestamptz back as a string or a Date depending on the driver path; both
@@ -369,7 +373,15 @@ export async function getWorkTimeline(
     const fm = r.frontmatter ?? {};
     if (str(fm.source) === "git") continue; // handled by gitRes — no double-count
     const source = normalizeSource(str(fm.source));
-    if (source === "slack" || source === "granola" || r.kind === "transcript") continue; // slack: own query; meetings: excluded
+    // Each of these has its OWN leg, so admitting the raw item here would count the same work twice.
+    // CALENDAR is the newest and was the easy one to miss: unlike a granola transcript it arrives as a
+    // plain `artifact` with `occurred_at` frontmatter, so it passes `work_at_from_source` and lands in
+    // this lane credited to the PUSHER — while the meetings leg credits every attendee. Measured: the
+    // pusher's `total` was 2 for a single event. "What else reads the set I just widened."
+    // NB `source` here is NORMALIZED, and `normalizeSource` collapses anything not in SOURCE_RULES to
+    // "other" — so the calendar check must read the RAW frontmatter value. Checking the normalized one
+    // silently never matched, and the pusher kept getting the event twice.
+    if (source === "slack" || source === "granola" || isCalendarEvent(str(fm.source)) || r.kind === "transcript") continue;
     // A PM issue's own description doc is the TICKET, not work done on it — and its path/title carry
     // the issue's own key, so admitting it as evidence would let every assigned ticket self-satisfy
     // the evidence gate and turn the timeline back into a backlog dump (the property "never the whole
@@ -618,7 +630,19 @@ export async function getWorkTimeline(
       .select("id, title, occurred_at, created_at, submitted_by, merged_into")
       .eq("team_id", teamId)
       .is("merged_into", null) // a tombstone's attendees live on its merge target — counting both double-credits
-      .gte("created_at", sinceIso);
+      // NO date bound in SQL — ordered newest-by-meeting-date and capped instead, with `inWindow(at)`
+      // below doing the windowing on the RESOLVED date.
+      //
+      // It used to bound on `created_at`, which was safe only while every meeting arrived as a
+      // recording of something already past, so the note always post-dated the meeting. A shared
+      // CALENDAR event inverts that: choose to share next month's meetings today and the note's
+      // `created_at` is today, so by the time `occurred_at` enters the 7-day window `created_at` has
+      // long left it and the meeting silently never reaches anyone's card. Bounding on `occurred_at`
+      // instead would need an OR for null-dated notes, which this query builder has no `.or()` for —
+      // and meetings are a low-volume table (tens of rows per team), so a capped ordered scan is both
+      // simpler and exactly correct.
+      .order("occurred_at", { ascending: false })
+      .limit(MEETING_NOTE_LIMIT);
     if (meetRes.error) {
       // Best-effort, like Slack/decisions: a meetings outage must not fail the whole ledger.
       console.warn("[timeline] meetings leg skipped:", meetRes.error.message);
