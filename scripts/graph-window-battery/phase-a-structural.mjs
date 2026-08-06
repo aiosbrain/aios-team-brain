@@ -20,13 +20,17 @@
  *   DATABASE_URL=<prod public URL> node scripts/graph-window-battery/phase-a-structural.mjs
  */
 import { Client } from "pg";
-import { selectCorpus, CANDIDATE_SQL, CHUNK_CHARS, MAX_EPISODE_CHUNKS } from "./corpus.mjs";
+import { selectCorpus, CANDIDATE_SQL, CHUNK_CHARS, MAX_EPISODE_CHUNKS, blankBodySql, PROJECTABLE_KINDS } from "./corpus.mjs";
 
-const KINDS = ["transcript", "deliverable", "decision", "task", "artifact"];
-const c = new Client({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+const KINDS = PROJECTABLE_KINDS;
+// Gate SSL the way the sibling scripts do, so this also runs against a plain local Postgres.
+const url = process.env.DATABASE_URL ?? "";
+const needsSsl = /\bsslmode=require\b/.test(url) || /\.rlwy\.net|proxy\.rlwy\.net|railway/.test(url);
+const c = new Client({ connectionString: url, ...(needsSsl ? { ssl: { rejectUnauthorized: false } } : {}) });
 await c.connect();
 
-const t = await c.query("select id, slug from teams limit 1");
+// Deterministic: `limit 1` with no ORDER BY picks an arbitrary row on a multi-team install.
+const t = await c.query("select id, slug from teams order by created_at, id limit 1");
 const teamId = t.rows[0].id;
 const { rows } = await c.query(CANDIDATE_SQL, [teamId, KINDS]);
 const got = selectCorpus(rows.map((r) => ({ ...r, chars: Number(r.chars) })));
@@ -60,7 +64,7 @@ const rival = await c.query(
      from items i
      left join items o
        on o.team_id = i.team_id and o.access = i.access and o.work_at = i.work_at
-      and o.id <> i.id and o.kind = any($3) and btrim(o.body) <> ''
+      and o.id <> i.id and o.kind = any($3) and not (${blankBodySql('o.body')})
     where i.id = any($1) and i.team_id = $2
     group by i.id, i.path
     order by rival_eps desc`,

@@ -1,7 +1,19 @@
 import { describe, expect, it } from "vitest";
 // @ts-expect-error — plain .mjs script, no types; imported for its pure selection rule.
-import { bucketOf, chunkCount, selectCorpus, BUCKET_TARGETS, SMALL_ITEM_CHARS, MAX_EPISODE_CHUNKS, EPISODE_BUDGET } from "../scripts/graph-window-battery/corpus.mjs";
-import { chunkContent } from "../lib/graph/project";
+import {
+  bucketOf,
+  chunkCount,
+  selectCorpus,
+  verifyCorpus,
+  resolvePositiveInt,
+  BUCKET_TARGETS,
+  SMALL_ITEM_CHARS,
+  MAX_EPISODE_CHUNKS,
+  EPISODE_BUDGET,
+  PROJECTABLE_KINDS,
+} from "../scripts/graph-window-battery/corpus.mjs";
+import { chunkContent, PROJECTABLE_KINDS as REAL_PROJECTABLE_KINDS } from "../lib/graph/project";
+import { resolvePositiveInt as realResolvePositiveInt } from "../lib/util/env";
 
 /**
  * The battery's corpus selection for PIPEFF-2 (AIO-821).
@@ -160,5 +172,69 @@ describe("the episode budget guards Q5's band, whose number means nothing withou
     const got = selectCorpus(rows, { A: 0, B1: 100, B2: 0, C: 0 });
     expect(got.episodes).toBe(100);
     expect(got.episodeBudgetBreach).toBeNull();
+  });
+});
+
+describe("verifyCorpus — the number that matters is computed by the real function, not estimated", () => {
+  /**
+   * `chunkCount` estimates from Postgres `length(body)`, which counts CHARACTERS, while
+   * `chunkContent` slices by JS string index — UTF-16 units. `length('👍👍')` is 2 in Postgres and 4
+   * in JS (both verified). The estimate is fine for SELECTION over ~2,000 rows, but the selected ~31
+   * items feed `EPISODE_BUDGET`, which is the check keeping Q5's band meaningful — so that number is
+   * recomputed with the projector's own function rather than trusted.
+   */
+  const bodies = (m: Record<string, string>) => new Map(Object.entries(m));
+
+  it("replaces the estimate with the real chunk count and reports the divergence", () => {
+    // 1,251 astral chars = 2,502 UTF-16 units → 2 real chunks, but Postgres counts 1,251 → 1 chunk.
+    const astral = "👍".repeat(1251);
+    const selection = selectCorpus([{ id: "e", chars: astral.length / 2 }], { A: 0, B1: 0, B2: 1, C: 0 });
+    expect(selection.items[0].chunks).toBe(1); // the estimate
+    const verified = verifyCorpus(selection, bodies({ e: astral }), chunkContent);
+    expect(verified.items[0].chunks).toBe(2); // the truth
+    expect(verified.items[0].estimatedChunks).toBe(1);
+    expect(verified.divergent).toEqual([{ id: "e", estimated: 1, actual: 2 }]);
+    expect(verified.episodes).toBe(2);
+  });
+
+  it("reports NO divergence for ASCII, so the field means something when it is non-empty", () => {
+    const selection = selectCorpus([{ id: "a", chars: 6000 }], { A: 0, B1: 0, B2: 0, C: 1 });
+    const verified = verifyCorpus(selection, bodies({ a: "x".repeat(6000) }), chunkContent);
+    expect(verified.divergent).toEqual([]);
+    expect(verified.episodes).toBe(selection.episodes);
+  });
+
+  it("re-runs the episode budget on the TRUE count, not the estimate", () => {
+    const rows = Array.from({ length: 89 }, (_, i) => ({ id: `s${i}`, chars: 100 }));
+    const selection = selectCorpus(rows, { A: 0, B1: 89, B2: 0, C: 0 });
+    expect(selection.episodeBudgetBreach).toMatch(/outside/); // 89 estimated, under the floor
+    const map = new Map(rows.map((r) => [r.id, "x".repeat(100)]));
+    expect(verifyCorpus(selection, map, chunkContent).episodeBudgetBreach).toMatch(/outside/);
+  });
+
+  it("refuses when a body was not supplied rather than silently skipping the item", () => {
+    const selection = selectCorpus([{ id: "a", chars: 6000 }], { A: 0, B1: 0, B2: 0, C: 1 });
+    expect(() => verifyCorpus(selection, bodies({}), chunkContent)).toThrow(/no body supplied/);
+  });
+});
+
+describe("the env parse mirrors the projector's, including where a loose parse diverges", () => {
+  /**
+   * A .mjs script cannot import the TypeScript, so `resolvePositiveInt` is duplicated. The version
+   * this replaced (`Number(x) > 0 ? Number(x) : d`) disagreed on fractional and infinite values:
+   * `GRAPH_CHUNK_CHARS=0.5` would have had the battery chunk at 0.5 chars while the projector chunked
+   * at 2,500 — a silent, total mis-count. Pinned against the real function, not described.
+   */
+  it.each([["0.5"], ["Infinity"], ["-Infinity"], [""], ["abc"], ["-5"], ["0"], ["2500"], ["7.9"], [undefined], [null]])(
+    "agrees with lib/util/env for %s",
+    (raw) => {
+      expect(resolvePositiveInt(raw as string, 2500)).toBe(realResolvePositiveInt(raw as string, 2500));
+    }
+  );
+});
+
+describe("the projectable kinds mirror lib/graph/project.ts", () => {
+  it("matches PROJECTABLE_KINDS exactly — a drift here silently changes which items the battery can see", () => {
+    expect([...PROJECTABLE_KINDS]).toEqual([...REAL_PROJECTABLE_KINDS]);
   });
 });

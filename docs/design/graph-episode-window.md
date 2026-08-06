@@ -178,6 +178,12 @@ The heavy displacement (2.3 of 10 slots kept) is confined to small Linear items 
 with a 40-episode batch, which had little own-context to lose. So §4's guarantee is sound in
 practice for the case it matters for.
 
+**Which graph state this applies to.** These are **prod steady-state** numbers: they assume every
+episode finds a full ten-slot window. A Phase A/B run starts from an **empty Neo4j**, so the first
+~10 episodes have fewer predecessors available and carry less filler than the model says. That is
+~55 of 1,080 slots — it moves no verdict, but the comparison must be made against the same state, so
+the runner reports the warm-up episodes separately rather than blending them in.
+
 **The prediction this puts on the record, before Phase B runs:** the `SAME` filter removes **57.1% of
 all predecessor slots** as carrying nothing, and makes the remaining 43% *deterministic* rather than
 95% deterministic. Since the predecessor block is the largest term in the ~40,070 input tokens, C1's
@@ -291,7 +297,7 @@ against this install's own content.
 | # | metric | derived from | band |
 |---|---|---|---|
 | Q1 | **entity yield, TWO-SIDED** | `Entity` nodes per episode | within **± 10%** of W10 — an *increase* is as disqualifying as a fall |
-| Q2 | **people recall** | member names appearing literally in a chunk's text, found as an `Entity` in that group | ≥ **95%** of W10 **and** at most **1** person lost outright |
+| Q2 | **people recall** | member names appearing literally in a chunk's text, found as an `Entity` in that group | ≥ **95%** of W10 **and** at most **1** person lost outright — the count clause is **noise-free** (see below) |
 | Q3 | **duplicate pollution, TWO-SIDED** | `IS_DUPLICATE_OF` share of edges, via **`lib/graph/extraction-health.ts`'s own Cypher predicate** (pinned by `test/guards/dedupe-predicate-pinned.test.ts`) | within **± 5 pp** of W10 — a *fall* is as disqualifying as a rise |
 | Q4 | **cross-chunk entity continuity** | buckets A + C only: share of an item's entities appearing in ≥ 2 of its chunks | ≥ **85%** of W10 |
 | Q5 | **signed retry gap** | `(extract_nodes − episodesPushed) / episodesPushed`, in pp — the harness's `signed`, normalised | must not rise by more than **3 pp** vs W10 |
@@ -317,6 +323,13 @@ own, but it must be *auditable* rather than invisible, so the per-name counts go
 
 Q2's two clauses are both floors and the stricter binds; at realistic n the 95% clause is usually the
 operative one, and the "1 person" clause only bites on a small denominator.
+
+**The count clause takes no tolerance and yields no INCONCLUSIVE**, unlike every other gate. Applying
+a spread to an integer count of people would swallow the clause whole — any spread ≥ 1 makes "lost 2"
+and "lost 0" indistinguishable — which deletes the floor it exists to be. Losing two known people
+outright is not a statistical question. Both clauses are executable in
+`scripts/graph-window-battery/decision.mjs`, and it **refuses to judge Q2 at all** if the count was
+never measured, so the clause cannot be satisfied by omitting its input.
 
 **Q4's per-chunk attribution is real, not assumed:** 0.29.3 persists `(:Episodic)-[:MENTIONS]->(:Entity)`
 per episode (`models/edges/edge_db_queries.py:22`), built in `_process_episode_data` over the

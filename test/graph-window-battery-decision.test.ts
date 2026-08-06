@@ -41,13 +41,13 @@ const cleanArm = {
   C1: [24000, 24000], // a 40% fall, comfortably past the 25% C1 demands
 };
 
-const session = { incumbent, dupeShare: 0.305, dupeEdges: 900 };
+const session = { incumbent, dupeShare: 0.305, dupeEdges: 900, armsCompleted: true, harnessRefused: false, crossCheckAvailable: true };
 
 const run = (over: Record<string, unknown> = {}, armOver: Record<string, number[]> = {}) =>
   decide({
     session: assessSession({ ...session, ...over }),
     incumbent,
-    arms: [{ name: "SAME", metrics: { ...cleanArm, ...armOver } }],
+    arms: [{ name: "SAME", metrics: { ...cleanArm, ...armOver }, extras: { personsLost: 0 } }],
   });
 
 describe("the baseline is non-vacuous", () => {
@@ -127,7 +127,7 @@ describe("noise is strictly ANTI-ship — the review's worked counterexample", (
   it("and if the ceiling were removed, the symmetric band still refuses to call it a PASS", () => {
     // Judged directly, bypassing session validity: 8.5 against a lowered 7.29 bar, with a spread of
     // 4.2 (52% of the mean) as the tolerance. The asymmetric rule shipped this.
-    const q1 = judgeMetric("Q1", [8.5, 8.5], degraded.Q1);
+    const q1 = judgeMetric("Q1", [8.5, 8.5], degraded.Q1, {});
     expect(q1.verdict).not.toBe(VERDICT.PASS);
   });
 });
@@ -210,16 +210,41 @@ describe("the spread ceiling is per-metric and in BAND units, not a fraction of 
     expect(s.valid).toBe(false);
   });
 
-  it("GUARANTEES a non-empty PASS window at the ceiling — for every gated metric", () => {
-    // The structural property the old ceiling lacked. At exactly half the band margin there must
-    // still exist an arm value that PASSes, or the procedure can deadlock mid-experiment.
+  it("GUARANTEES a non-empty PASS window AT the ceiling — for every gated metric", () => {
+    // The structural property the old ceiling lacked, tested where it actually binds. An earlier
+    // version of this test used the shared fixture, whose spreads sit ~1/50th of the ceiling — so it
+    // would have stayed green if a future edit raised a maxSpread constant above margin/2 and
+    // re-opened the deadlock. Here each incumbent is built so its spread EQUALS the ceiling.
     for (const key of Object.keys(METRICS)) {
-      const m = METRICS[key as keyof typeof METRICS] as { kind: string; margin: number };
-      const base = incumbent[key as keyof typeof incumbent] as number[];
-      const baseMean = (base[0] + base[1]) / 2;
-      // Sit the arm exactly on the incumbent's own value: the most favourable value there is.
-      const armAt = m.kind === "ratio-fall" ? [baseMean * (1 - m.margin) * 0.5, baseMean * (1 - m.margin) * 0.5] : [baseMean, baseMean];
-      expect(judgeMetric(key, armAt, base).verdict, `${key} has no passable value at its ceiling`).toBe(VERDICT.PASS);
+      const m = METRICS[key as keyof typeof METRICS] as {
+        kind: string;
+        margin: number;
+        maxSpreadRatio?: number;
+        maxSpreadPp?: number;
+        absolute?: { input: string };
+      };
+      const mean = m.kind.startsWith("pp") ? 0.3 : 10;
+      const ceiling = m.maxSpreadRatio !== undefined ? m.maxSpreadRatio * mean : (m.maxSpreadPp as number);
+      const base = [mean - ceiling / 2, mean + ceiling / 2];
+      // The most favourable arm there is: the incumbent's own value, except for C1, where the band
+      // demands a fall rather than tolerating drift.
+      const best = m.kind === "ratio-fall" ? mean * (1 - m.margin) * 0.5 : mean;
+      const extras = m.absolute ? { [m.absolute.input]: 0 } : {};
+
+      // Precondition: this incumbent is exactly at — not over — the validity ceiling.
+      const sess = assessSession({
+        incumbent: { [key]: base },
+        dupeShare: 0.305,
+        dupeEdges: 900,
+        armsCompleted: true,
+        harnessRefused: false,
+        crossCheckAvailable: true,
+      });
+      expect(sess.problems.join(" "), `${key} fixture should sit at the ceiling, not over it`).not.toMatch(key);
+
+      expect(judgeMetric(key, [best, best], base, extras).verdict, `${key} has no passable value at its ceiling`).toBe(
+        VERDICT.PASS
+      );
     }
   });
 });
@@ -230,8 +255,8 @@ describe("arm order — SAME is evaluated before the blunt W1 fallback", () => {
       session: assessSession(session),
       incumbent,
       arms: [
-        { name: "SAME", metrics: { ...cleanArm, Q4: [0.5, 0.5] } },
-        { name: "W1", metrics: cleanArm },
+        { name: "SAME", metrics: { ...cleanArm, Q4: [0.5, 0.5] }, extras: { personsLost: 0 } },
+        { name: "W1", metrics: cleanArm, extras: { personsLost: 0 } },
       ],
     });
     expect(d.outcome).toBe("SHIP");
@@ -243,8 +268,8 @@ describe("arm order — SAME is evaluated before the blunt W1 fallback", () => {
       session: assessSession(session),
       incumbent,
       arms: [
-        { name: "SAME", metrics: cleanArm },
-        { name: "W1", metrics: { ...cleanArm, C1: [10000, 10000] } }, // a far bigger token cut
+        { name: "SAME", metrics: cleanArm, extras: { personsLost: 0 } },
+        { name: "W1", metrics: { ...cleanArm, C1: [10000, 10000] }, extras: { personsLost: 0 } }, // a far bigger token cut
       ],
     });
     expect(d.winner).toBe("SAME");
@@ -255,8 +280,8 @@ describe("arm order — SAME is evaluated before the blunt W1 fallback", () => {
       session: assessSession(session),
       incumbent,
       arms: [
-        { name: "SAME", metrics: { ...cleanArm, Q4: [0.5, 0.5] } },
-        { name: "W1", metrics: { ...cleanArm, Q2: [0.5, 0.5] } },
+        { name: "SAME", metrics: { ...cleanArm, Q4: [0.5, 0.5] }, extras: { personsLost: 0 } },
+        { name: "W1", metrics: { ...cleanArm, Q2: [0.5, 0.5] }, extras: { personsLost: 0 } },
       ],
     });
     expect(d.outcome).toBe("NO_SHIP");
@@ -273,4 +298,61 @@ describe("the two-rep requirement is structural, not stylistic", () => {
   it("refuses a single-rep incumbent for the same reason", () => {
     expect(() => judgeMetric("Q1", [10.0, 10.0], [10.0])).toThrow(/2 reps/);
   });
+});
+
+describe("Q2's second clause — the one that bites where the ratio is weakest", () => {
+  /**
+   * The spec gates Q2 on TWO floors: "≥ 95% of W10 AND at most 1 person lost outright". The first
+   * version of this file implemented only the ratio, so at small n — where "95%" of 12 names rounds
+   * to "lose none" — an arm losing two known people outright would have shipped. A gate clause left
+   * outside the executable procedure is the interpretive joint this file exists to close.
+   */
+  it("FAILS an arm that loses 2 people outright even when the recall RATIO passes", () => {
+    const d = decide({
+      session: assessSession(session),
+      incumbent,
+      arms: [{ name: "SAME", metrics: cleanArm, extras: { personsLost: 2 } }],
+    });
+    const q2 = d.arms[0].results.find((r: { key: string }) => r.key === "Q2");
+    expect(q2.verdict).toBe(VERDICT.FAIL);
+    expect(q2.absoluteBreach).toMatch(/2 people lost outright/);
+    expect(d.outcome).toBe("NO_SHIP");
+  });
+
+  it("allows exactly 1 — the clause is 'at most 1', not 'none'", () => {
+    const d = decide({
+      session: assessSession(session),
+      incumbent,
+      arms: [{ name: "SAME", metrics: cleanArm, extras: { personsLost: 1 } }],
+    });
+    expect(d.outcome).toBe("SHIP");
+  });
+
+  it("REFUSES to judge when the count was never measured — omission must not read as satisfied", () => {
+    expect(() => judgeMetric("Q2", cleanArm.Q2, incumbent.Q2, {})).toThrow(/personsLost/);
+  });
+
+  it("is noise-free: a huge incumbent spread cannot rescue a 2-person loss", () => {
+    // Deliberate: any tolerance on an integer count would make "lost 2" and "lost 0" indistinguishable
+    // and delete the floor. Losing two known people is not a statistical question.
+    const q2 = judgeMetric("Q2", cleanArm.Q2, [0.9, 0.2], { personsLost: 2 });
+    expect(q2.verdict).toBe(VERDICT.FAIL);
+  });
+});
+
+describe("assessSession refuses to run on missing safety inputs", () => {
+  /**
+   * These used to default permissive (`armsCompleted = true`, `crossCheckAvailable = true`), so a
+   * runner that forgot to pass one silently disarmed that validity trigger. Same class as the
+   * absolute-clause omission above, in the file whose whole job is that the readout cannot be
+   * quietly softened.
+   */
+  it.each(["dupeShare", "dupeEdges", "armsCompleted", "harnessRefused", "crossCheckAvailable"])(
+    "throws when %s is omitted rather than treating it as fine",
+    (field) => {
+      const full = { incumbent, dupeShare: 0.305, dupeEdges: 900, armsCompleted: true, harnessRefused: false, crossCheckAvailable: true };
+      const { [field as keyof typeof full]: _omitted, ...rest } = full;
+      expect(() => assessSession(rest)).toThrow(new RegExp(field));
+    }
+  );
 });

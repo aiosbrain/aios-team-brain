@@ -62,7 +62,21 @@ export const METRICS = Object.freeze({
   // the catch-all for the variant-form inflation Q6 cannot see — a node named "John" carries no
   // member name, so it never enters Q6's denominator, but it does inflate this.
   Q1: { label: "entity yield / episode", kind: "ratio-both", margin: 0.1, maxSpreadRatio: 0.05 },
-  Q2: { label: "people recall", kind: "ratio-lower", margin: 0.05, maxSpreadRatio: 0.025 },
+  // TWO clauses, both floors, and the stricter binds. The ratio is the noisy one; `absolute` is the
+  // one that bites at small n, which is exactly where the ratio is weakest — at 12 names, "95%"
+  // rounds to "lose none", so without this clause a 2-person loss on a thin corpus would ship.
+  //
+  // The count clause is deliberately NOISE-FREE: no tolerance, no INCONCLUSIVE. A spread on an
+  // integer count of people would swallow the clause whole (any spread ≥ 1 makes "lost 2" and "lost
+  // 0" indistinguishable), which would delete the floor it exists to be. Losing two known people
+  // outright is not a statistical question.
+  Q2: {
+    label: "people recall",
+    kind: "ratio-lower",
+    margin: 0.05,
+    maxSpreadRatio: 0.025,
+    absolute: { input: "personsLost", max: 1, describe: (v) => `${v} people lost outright (max 1)` },
+  },
   // Two-sided in PERCENTAGE POINTS: a failure-to-merge emits no IS_DUPLICATE_OF edge at all, so
   // fragmentation makes this share FALL. extraction-health.ts already treats an anomalously low
   // share as evidence the predicate is broken rather than the graph clean.
@@ -85,6 +99,17 @@ const mean = (a, b) => (a + b) / 2;
 const spread = (a, b) => Math.abs(a - b);
 
 /**
+ * "Strictly over the ceiling", tolerant of float representation.
+ *
+ * The spec says the incumbent's spread must be **at most** half the band margin, so a spread sitting
+ * exactly on the ceiling is VALID. Written as a bare `>` that fails: `0.3125 - 0.2875` evaluates to
+ * 0.025000000000000022, which is "over" a 0.025 ceiling by 2e-17 and invalidates a session on
+ * nothing. The relative epsilon is ~1e-9 — twelve orders of magnitude below any measurement this
+ * battery takes, so it can only ever absorb representation error, never a real breach.
+ */
+const over = (value, ceiling) => value > ceiling * (1 + 1e-9) + Number.EPSILON;
+
+/**
  * Judge ONE metric for ONE arm against the incumbent.
  *
  * `arm` and `incumbent` are each `[rep1, rep2]` in the metric's natural unit — a rate for the ratio
@@ -93,11 +118,17 @@ const spread = (a, b) => Math.abs(a - b);
  * Returns the verdict plus the numbers behind it, because a verdict without its inputs is exactly
  * the kind of claim this file exists to stop.
  */
-export function judgeMetric(key, arm, incumbent) {
+export function judgeMetric(key, arm, incumbent, extras = {}) {
   const m = METRICS[key];
   if (!m) throw new Error(`unknown metric ${key}`);
   if (!Array.isArray(arm) || arm.length !== 2 || !Array.isArray(incumbent) || incumbent.length !== 2) {
     throw new Error(`${key}: both arms need exactly 2 reps — the spread IS the second rep`);
+  }
+  // An absolute clause whose input was simply not supplied must NOT read as satisfied. Omission
+  // defaulting to "fine" is the class of fake this repo has already been burned by, and it would be
+  // worst here — a gate that disappears when the runner forgets to measure it.
+  if (m.absolute && extras[m.absolute.input] === undefined) {
+    throw new Error(`${key}: needs \`${m.absolute.input}\` — the clause cannot be satisfied by omitting its input`);
   }
   const armMean = mean(arm[0], arm[1]);
   const baseMean = mean(incumbent[0], incumbent[1]);
@@ -151,9 +182,17 @@ export function judgeMetric(key, arm, incumbent) {
   // is missed by more than it; anything else is within the noise of an edge.
   const clears = edges.every((e) => (e.good === "above" ? value > e.at + tol : value < e.at - tol));
   const misses = edges.some((e) => (e.good === "above" ? value < e.at - tol : value > e.at + tol));
-  const verdict = clears ? VERDICT.PASS : misses ? VERDICT.FAIL : VERDICT.INCONCLUSIVE;
+  let verdict = clears ? VERDICT.PASS : misses ? VERDICT.FAIL : VERDICT.INCONCLUSIVE;
 
-  return { key, label: m.label, verdict, value, armMean, baseMean, baseSpread, tolerance: tol, edges };
+  // The absolute clause is a hard floor and overrides a passing band — never the other way round.
+  // Both clauses are floors and the stricter binds, which is what the spec says of Q2.
+  let absoluteBreach = null;
+  if (m.absolute && extras[m.absolute.input] > m.absolute.max) {
+    absoluteBreach = m.absolute.describe(extras[m.absolute.input]);
+    verdict = VERDICT.FAIL;
+  }
+
+  return { key, label: m.label, verdict, value, armMean, baseMean, baseSpread, tolerance: tol, edges, absoluteBreach };
 }
 
 /**
@@ -163,7 +202,14 @@ export function judgeMetric(key, arm, incumbent) {
  * Every trigger here is pre-defined and none of them is "the numbers came out wrong" — that
  * distinction is the difference between a rule and an excuse.
  */
-export function assessSession({ incumbent, dupeShare, dupeEdges, underpowered = [], armsCompleted = true, harnessRefused = false, crossCheckAvailable = true }) {
+export function assessSession({ incumbent, dupeShare, dupeEdges, underpowered = [], armsCompleted, harnessRefused, crossCheckAvailable }) {
+  // REQUIRED, not defaulted-permissive. A default of `armsCompleted = true` means a runner that
+  // forgets to pass it silently disarms that validity trigger — the same "omission canonicalized as
+  // fine" class as the absolute clause above, in the one file whose job is that the readout cannot
+  // be quietly softened. Throw instead: a missing safety input is a bug, not a pass.
+  for (const [k, v] of Object.entries({ dupeShare, dupeEdges, armsCompleted, harnessRefused, crossCheckAvailable })) {
+    if (v === undefined || v === null) throw new Error(`assessSession: \`${k}\` is required — omitting it must not read as valid`);
+  }
   const problems = [];
 
   if (harnessRefused) problems.push("the cost harness refused the window — drain or cross-check");
@@ -184,20 +230,20 @@ export function assessSession({ incumbent, dupeShare, dupeEdges, underpowered = 
       // A near-zero incumbent mean is itself a broken instrument, and the ceiling collapsing with it
       // is the correct behaviour rather than a degeneracy.
       const ceiling = m.maxSpreadRatio * baseMean;
-      if (s > ceiling) problems.push(`${key} incumbent spread ${s.toFixed(4)} exceeds ${ceiling.toFixed(4)} (${m.maxSpreadRatio * 100}% of its mean)`);
+      if (over(s, ceiling)) problems.push(`${key} incumbent spread ${s.toFixed(4)} exceeds ${ceiling.toFixed(4)} (${m.maxSpreadRatio * 100}% of its mean)`);
     } else if (m.maxSpreadPp !== undefined) {
-      if (s > m.maxSpreadPp) problems.push(`${key} incumbent spread ${(s * 100).toFixed(2)}pp exceeds ${(m.maxSpreadPp * 100).toFixed(2)}pp`);
+      if (over(s, m.maxSpreadPp)) problems.push(`${key} incumbent spread ${(s * 100).toFixed(2)}pp exceeds ${(m.maxSpreadPp * 100).toFixed(2)}pp`);
     }
   }
 
   // The incumbent has to be a graph worth comparing against. 0.45 is extraction-health.ts's own
   // DEDUPE_ABSOLUTE_FLOOR; the 0.15 floor is below prod's healthy ~26-35% on purpose, because the
   // battery runs into an EMPTY Neo4j where early episodes have nothing to duplicate against.
-  if (dupeShare !== undefined && dupeShare !== null && (dupeShare < DUPE_SANE_MIN || dupeShare > DUPE_SANE_MAX)) {
+  if (dupeShare < DUPE_SANE_MIN || dupeShare > DUPE_SANE_MAX) {
     problems.push(`incumbent duplicate share ${(dupeShare * 100).toFixed(1)}% outside the sane ${DUPE_SANE_MIN * 100}-${DUPE_SANE_MAX * 100}% range`);
   }
   // extraction-health.ts refuses to judge the share below this many edges; so does this.
-  if (dupeEdges !== undefined && dupeEdges !== null && dupeEdges < MIN_EDGES_FOR_SHARE) {
+  if (dupeEdges < MIN_EDGES_FOR_SHARE) {
     problems.push(`only ${dupeEdges} edges — below the ${MIN_EDGES_FOR_SHARE}-edge minimum for a share signal`);
   }
 
@@ -221,8 +267,8 @@ export function decide({ session, incumbent, arms }) {
   if (!session.valid) {
     return { outcome: "INVALID", reasons: session.problems, arms: [] };
   }
-  const judged = arms.map(({ name, metrics }) => {
-    const results = Object.keys(METRICS).map((key) => judgeMetric(key, metrics[key], incumbent[key]));
+  const judged = arms.map(({ name, metrics, extras = {} }) => {
+    const results = Object.keys(METRICS).map((key) => judgeMetric(key, metrics[key], incumbent[key], extras));
     const blocking = results.filter((r) => r.verdict !== VERDICT.PASS);
     return { name, results, ships: blocking.length === 0, blocking };
   });

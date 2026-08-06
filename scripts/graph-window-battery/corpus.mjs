@@ -26,10 +26,28 @@
  * Hence `bucketOf` is total over every chunk count ≥ 1, and a unit test asserts that directly.
  */
 
+/**
+ * A byte-for-byte replica of `resolvePositiveInt` from `lib/util/env`, which the projector uses for
+ * these same two knobs. A .mjs script cannot import the TypeScript, so the logic is duplicated — and
+ * a unit test pins the two against each other across the cases where a loose parse diverges
+ * (`"0.5"`, `"Infinity"`, `""`, `"abc"`, `"-5"`).
+ *
+ * The loose version this replaced (`Number(x) > 0 ? Number(x) : d`) disagreed on exactly those:
+ * `GRAPH_CHUNK_CHARS=0.5` would have had the battery chunk at 0.5 chars while the projector chunked
+ * at 2,500 — a silent, total mis-count of the corpus.
+ */
+function resolvePositiveInt(raw, fallback) {
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return fallback;
+  const floored = Math.floor(n);
+  return floored > 0 ? floored : fallback;
+}
+
 /** Mirrors lib/graph/project.ts. A divergence here silently mis-buckets the whole corpus, so the
- *  battery prints both values in its report rather than trusting them. */
-export const CHUNK_CHARS = Number(process.env.GRAPH_CHUNK_CHARS) > 0 ? Number(process.env.GRAPH_CHUNK_CHARS) : 2500;
-export const MAX_EPISODE_CHUNKS = Number(process.env.GRAPH_MAX_EPISODE_CHUNKS) > 0 ? Number(process.env.GRAPH_MAX_EPISODE_CHUNKS) : 40;
+ *  runner must print both values in its report rather than leaving them implicit. */
+export const CHUNK_CHARS = resolvePositiveInt(process.env.GRAPH_CHUNK_CHARS, 2500);
+export const MAX_EPISODE_CHUNKS = resolvePositiveInt(process.env.GRAPH_MAX_EPISODE_CHUNKS, 40);
+export { resolvePositiveInt };
 
 /** The small-item threshold. 898 of 2,267 items (40%) sit under this and each occupies a whole
  *  episode at full fixed-overhead price — the population B1 exists to represent. */
@@ -133,10 +151,20 @@ export function selectCorpus(rows, targets = BUCKET_TARGETS) {
  * The SQL the battery runs against a read-only prod connection. Kept here beside the rule so the two
  * cannot drift; `length(body)` rather than `body` so selection never pulls content it does not need.
  */
+/**
+ * "This body yields no episodes", in SQL, matching `chunkContent`'s `!text.trim()`.
+ *
+ * NOT `btrim(body) = ''`: Postgres `btrim/1` strips **spaces only**, so `btrim(E'  \n\t  ')` is
+ * `E'\n\t'`, not `''` — verified on the test database. A newline/tab-only body would have been
+ * counted as a 1-episode item the projector then emits ZERO episodes for, diverging the counted and
+ * pushed totals, wasting a B1 slot, and skewing the single-chunk share.
+ */
+export const blankBodySql = (alias = "body") => `${alias} ~ '^\\s*$'`;
+
 export const CANDIDATE_SQL = `
   select id, path, kind, work_at,
          length(body) as chars,
-         (btrim(body) = '') as blank
+         (${blankBodySql()}) as blank
     from items
    where team_id = $1
      and access = 'team'
@@ -144,3 +172,46 @@ export const CANDIDATE_SQL = `
    order by work_at desc, id
    limit 2000
 `;
+
+/** The projectable kinds, mirrored from lib/graph/project.ts PROJECTABLE_KINDS (pinned by test). */
+export const PROJECTABLE_KINDS = ["transcript", "deliverable", "decision", "task", "artifact"];
+
+/**
+ * Recompute the SELECTED corpus's episode counts with the projector's REAL `chunkContent`.
+ *
+ * `chunkCount` estimates from Postgres `length(body)`, which counts CHARACTERS while `chunkContent`
+ * slices by JS string index, i.e. UTF-16 units — `length('👍👍')` is 2 in Postgres and 4 in JS. A body
+ * with astral characters near a chunk boundary therefore estimates low, which would mis-bucket at
+ * the A/C and B2/C edges and, worse, run the `EPISODE_BUDGET` check (the thing keeping Q5's band
+ * meaningful) on an undercount.
+ *
+ * The estimate is still right for SELECTION — it runs over ~2,000 rows and a boundary item landing
+ * in the neighbouring bucket is a minor sampling effect. But the ~31 selected items are few enough
+ * to chunk for real, so the number that actually matters is exact rather than derived.
+ *
+ * `chunkFn` is injected so the caller passes the projector's own `chunkContent` rather than this
+ * module re-deriving it a second time.
+ */
+export function verifyCorpus(selection, bodyById, chunkFn) {
+  const items = selection.items.map((it) => {
+    const body = bodyById.get(it.id);
+    if (body === undefined) throw new Error(`verifyCorpus: no body supplied for ${it.id}`);
+    return { ...it, estimatedChunks: it.chunks, chunks: chunkFn(body).length };
+  });
+  const episodes = items.reduce((s, i) => s + i.chunks, 0);
+  const single = items.filter((i) => i.chunks === 1).length;
+  const divergent = items.filter((i) => i.chunks !== i.estimatedChunks);
+  return {
+    ...selection,
+    items,
+    episodes,
+    singleChunkEpisodeShare: episodes > 0 ? single / episodes : 0,
+    // Surfaced, never swallowed: a divergence means the SQL estimate and the projector disagree, and
+    // the runner should say so rather than quietly using whichever number it holds.
+    divergent: divergent.map((i) => ({ id: i.id, estimated: i.estimatedChunks, actual: i.chunks })),
+    episodeBudgetBreach:
+      episodes < EPISODE_BUDGET.min || episodes > EPISODE_BUDGET.max
+        ? `${episodes} episodes is outside the ${EPISODE_BUDGET.min}-${EPISODE_BUDGET.max} range Q5's band was derived at — re-derive it in a committed amendment first`
+        : null,
+  };
+}
