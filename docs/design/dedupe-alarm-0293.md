@@ -54,6 +54,15 @@ and the ALARM's verdict for a tick is: judgeable if **any** group judged, pollut
 group is polluted — **with group memory on the recovery edge**. The alert transition row records the
 polluted group id(s) in `meta`, and "recovered" requires **those groups** to be judged-and-healthy;
 while any previously-polluted group is unjudged, the combined verdict is UNJUDGEABLE, not healthy.
+**One release valve, ledger-defined like everything else here:** a previously-polluted group is
+released from the recovery requirement once the `graph_episodes` ledger shows it had **no episode
+flow across the full recent + baseline span** — nothing is being extracted into it (a decommissioned
+external group, an ended client project), so there is no ongoing pollution to recover *from*, and
+holding the whole machine UNJUDGEABLE for it would leave the card red until heat death — the
+slow-motion cry-wolf that trains admins to ignore the surface. Evaluated at read time from the
+ledger; no new row type. Recovery therefore requires every previously-polluted group to be either
+judged-and-healthy or ledger-quiet for the full span; the recovery mail's existing residue-cleanup
+copy covers what such a group leaves behind.
 Without this, a small group that alerted and then dipped under its name minimum while the team group
 judged healthy would trigger a "recovered" mail for a group that was never re-judged — the
 one-quiet-Saturday false recovery `extraction-alert.ts` documents as a prior review finding,
@@ -176,6 +185,13 @@ symmetrically with the tripwire. `small-sample` (ledger-confirmed young/quiet gr
 repo mails on Neo4j being down**, so a permanent park would reproduce the silent-death shape behind
 a pager that does not exist. Transient restarts stay quiet inside the grace; a rotted credential
 eventually pages, with copy that says what it actually knows.
+
+**Composition note:** the grace and the 24h clock are serial, so worst-case time-to-page for a
+rotted credential is grace + `UNJUDGEABLE_ALERT_HOURS` ≈ **30h**. The grace's job is **ledger
+hygiene** (no anchor/cleared row pairs from routine restarts), not mail latency — argue it to
+neither 0 (row flood, no benefit) nor 24h "for safety" (doubles time-to-page, no benefit); 6h
+exceeds every observed healthy graphiti unavailability and matches `EXTRACTION_LAG_BUDGET_MS`'s
+precedent for exactly this budget shape.
 
 This is the fix for layer 2 and it is **signal-agnostic**: any future evidence removal parks the
 alarm in a state that pages instead of a state that hides.
