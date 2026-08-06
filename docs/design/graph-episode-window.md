@@ -443,7 +443,7 @@ not worth comparing against.
 
 **Arm order and outcome:**
 
-1. Evaluate **SAME**. All of Q1–Q6 and C1 PASS → **SAME ships**.
+1. Evaluate **SAME**. All of Q1, Q2 (count clause), Q4, Q5, Q7 and C1 PASS → **SAME ships**.
 2. Else evaluate **W1** on the identical rule → **W1 ships**.
 3. Else **the lever does not ship**, and the negative result is committed to this doc. Cutting the
    context is then off the table until the `previous_episode_uuids` alternative is spec'd (below).
@@ -572,7 +572,7 @@ rollback are lost; confirm the brain's reconcile re-pushed them.
 ## How we will know it worked
 
 Input tokens per episode falls from **~40,070** by ≥25% on the harness, over a drain-clean prod
-window after the deploy, with Q1–Q6 unmoved on the battery — and the AIO-693 alarm quiet for a week.
+window after the deploy, with the v2 gates unmoved on the battery — and ALARMFIX-1's replacement signal (the AIO-693 alarm cannot exist on 0.29.3 — Amendment 3) quiet for a week.
 
 ## Risks
 
@@ -585,12 +585,49 @@ window after the deploy, with Q1–Q6 unmoved on the battery — and the AIO-693
   (The asymmetric version in the first draft made this sentence false — bands are multiplicative in
   W10's mean, so a degraded W10 rep *lowered* the bar. That is why the rule is symmetric.)
 - **A metric can still be blind to a failure nobody enumerated.** Q6 exists because the first draft's
-  five gates all pointed the wrong way for entity fragmentation. There is no argument that Q1–Q6 are
+  five gates all pointed the wrong way for entity fragmentation. There is no argument that the v2 gates are
   exhaustive — only that each named failure mode now has a gate whose direction is right for it.
 - **The same-item filter changes behaviour for non-`items:` episodes** (e.g. `correction:<arc_id>`
   writeback episodes), which would get zero predecessors. That is the intended semantics — a
   correction episode has no document to be a chunk of — but it must be stated, and the Phase C PR
   needs a test that pins it rather than discovering it.
+
+### Amendment 3 — 2026-08-06, review-required conditions, committed before any Q7 readout
+
+The Amendment 2 review returned **CLEAR, reuse permitted** — session 2 = session 1's untouched runs
+as rep 1 plus a fresh rep 2 — with conditions, all taken:
+
+- **The on-record prediction: Q7 will read ≈ 1.0 for every arm, and a Q7 pass is NOT fragmentation
+  evidence.** The reviewer verified in the wheel what invalidates Q7 as a treatment probe: 0.29.3's
+  `_resolve_with_similarity` (`dedup_helpers.py:220`) runs **deterministic exact normalized-name
+  matching first, always** — a same-name duplicate can only arise when embedding candidate retrieval
+  misses, a path the predecessor window does not touch. The window's failure mode produces
+  **variant-named** nodes, which Q7 counts as different names by construction (measured: W10 rep 1
+  has 684 names over ~684 nodes — Q7 exactly 1.0). **Q1's upper bound is the operative fragmentation
+  gate.** Q7's honest jobs are the |U| ≥ 15 validity floor and the per-name audit trail. If Q7 moves
+  off 1.0 for any arm, that is *surprising* and gets investigated, not celebrated.
+- **Universe hygiene:** a name must contain ≥ 1 letter (kills `=======` extracted as an entity) and
+  must not contain `/` (kills file paths). **Disclosure: chosen after W10 rep 1's universe
+  composition was seen** (684 names / 185 recurring); the filter is structural, not count-tuned, and
+  identical for every arm. Measured after filtering: **|U| ≥ 156** from W10 rep 1 alone — the floor
+  clears 10×, so session 2 cannot be invalidated on power.
+- **Q2's vacuity hole closed:** the judge now derives `underpowered` from the incumbent's qualifying
+  count instead of hardcoding it empty — zero qualifying names flags Q2 UNDERPOWERED → INVALID
+  rather than letting a clause that can never fire read as a pass. End-to-end tests run a real loss
+  through the whole chain (a loss in either rep → Q2 FAIL, max-of-reps) and pin the empty-roster
+  case.
+- **The dead backstop is re-derived, not re-worded.** The Rollout section named the AIO-693 alarm as
+  the live prod backstop for a quality regression the battery missed. Session 1 proved that alarm
+  has been `judgeable: false` since #490 and **cannot be re-armed on 0.29.3** (its evidence is never
+  written). Phase C therefore gains a precondition: **the lever does not merge until ALARMFIX-1's
+  replacement pollution signal is live in prod.** Post-deploy ledger verification stays as the cost
+  check; ALARMFIX-1 is the quality check.
+
+The v2 metrics table (superseding the v1 table and its ceilings above): Q1 ± 10% (ceiling 5%) ·
+Q2 count-only, zero qualifying losses, no band · Q4 ≥ 85% (7.5%) · Q5 ≤ +3 pp (1.5 pp) ·
+Q7 ≤ 105% (2.5%) · C1 ≥ 25% fall (12.5%). Session validity: |U| ≥ 15 · Q2 has ≥ 1 qualifying name ·
+completion measured from landed `(:Episodic)` counts · harness refusal/cross-check rules unchanged.
+Stale v1 references to Q3/Q6 elsewhere in this document are superseded by this table.
 
 ## Session log
 
@@ -664,6 +701,43 @@ Committed while session 1's graphs are intact and before any new metric is compu
   interim partials above cannot move it. A fresh rep 2 per arm completes the session. *(Posed to the
   plan reviewer as an explicit question, not assumed — if the reviewer finds a tuning joint in
   reuse, session 2 runs all six reps fresh; the budget covers it.)*
+
+### Amendment 3 — 2026-08-06, review-required conditions, committed before any Q7 readout
+
+The Amendment 2 review returned **CLEAR, reuse permitted** — session 2 = session 1's untouched runs
+as rep 1 plus a fresh rep 2 — with conditions, all taken:
+
+- **The on-record prediction: Q7 will read ≈ 1.0 for every arm, and a Q7 pass is NOT fragmentation
+  evidence.** The reviewer verified in the wheel what invalidates Q7 as a treatment probe: 0.29.3's
+  `_resolve_with_similarity` (`dedup_helpers.py:220`) runs **deterministic exact normalized-name
+  matching first, always** — a same-name duplicate can only arise when embedding candidate retrieval
+  misses, a path the predecessor window does not touch. The window's failure mode produces
+  **variant-named** nodes, which Q7 counts as different names by construction (measured: W10 rep 1
+  has 684 names over ~684 nodes — Q7 exactly 1.0). **Q1's upper bound is the operative fragmentation
+  gate.** Q7's honest jobs are the |U| ≥ 15 validity floor and the per-name audit trail. If Q7 moves
+  off 1.0 for any arm, that is *surprising* and gets investigated, not celebrated.
+- **Universe hygiene:** a name must contain ≥ 1 letter (kills `=======` extracted as an entity) and
+  must not contain `/` (kills file paths). **Disclosure: chosen after W10 rep 1's universe
+  composition was seen** (684 names / 185 recurring); the filter is structural, not count-tuned, and
+  identical for every arm. Measured after filtering: **|U| ≥ 156** from W10 rep 1 alone — the floor
+  clears 10×, so session 2 cannot be invalidated on power.
+- **Q2's vacuity hole closed:** the judge now derives `underpowered` from the incumbent's qualifying
+  count instead of hardcoding it empty — zero qualifying names flags Q2 UNDERPOWERED → INVALID
+  rather than letting a clause that can never fire read as a pass. End-to-end tests run a real loss
+  through the whole chain (a loss in either rep → Q2 FAIL, max-of-reps) and pin the empty-roster
+  case.
+- **The dead backstop is re-derived, not re-worded.** The Rollout section named the AIO-693 alarm as
+  the live prod backstop for a quality regression the battery missed. Session 1 proved that alarm
+  has been `judgeable: false` since #490 and **cannot be re-armed on 0.29.3** (its evidence is never
+  written). Phase C therefore gains a precondition: **the lever does not merge until ALARMFIX-1's
+  replacement pollution signal is live in prod.** Post-deploy ledger verification stays as the cost
+  check; ALARMFIX-1 is the quality check.
+
+The v2 metrics table (superseding the v1 table and its ceilings above): Q1 ± 10% (ceiling 5%) ·
+Q2 count-only, zero qualifying losses, no band · Q4 ≥ 85% (7.5%) · Q5 ≤ +3 pp (1.5 pp) ·
+Q7 ≤ 105% (2.5%) · C1 ≥ 25% fall (12.5%). Session validity: |U| ≥ 15 · Q2 has ≥ 1 qualifying name ·
+completion measured from landed `(:Episodic)` counts · harness refusal/cross-check rules unchanged.
+Stale v1 references to Q3/Q6 elsewhere in this document are superseded by this table.
 
 ## Session log
 

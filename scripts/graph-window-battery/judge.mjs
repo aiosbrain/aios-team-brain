@@ -109,10 +109,17 @@ export function assemble(dir, items, arms = ["w10", "same", "w1"]) {
   const incumbent = metricReps("w10");
   const allReps = arms.flatMap((a) => reps[a]);
 
+  // Q2's count clause is vacuous if NO member name qualifies (present in >=2 items) — an empty
+  // members seed or a nameless draw would make qualifyingLost ≡ 0 forever, a gate that passes by
+  // never being able to fire. The incumbent's harvest reports how many names qualify; zero means the
+  // clause is unpowered, which is a session-validity fact, not a pass.
+  const qualifyingNames = Math.min(...reps.w10.map((r) => r.q.convergenceNames));
+  const underpowered = qualifyingNames < 1 ? ["Q2"] : [];
+
   const session = assessSession({
     incumbent,
     universeSize: universe.length,
-    underpowered: [],
+    underpowered,
     armsCompleted: allReps.every((r) => !r.refused && r.q.episodicNodesLanded === r.q.episodes),
     harnessRefused: allReps.some((r) => r.refused),
     crossCheckAvailable: allReps.every((r) => r.c.crossCheckAvailable),

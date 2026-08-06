@@ -21,6 +21,12 @@ export function buildUniverse(w10NameCountReps, items) {
   const universe = [];
   for (const name of candidates) {
     if (name.length < 3 || /^\d+$/.test(name)) continue;
+    // Hygiene (Amendment 3, review-required): the name must contain at least one letter — W10's
+    // rep-1 universe contained merge-conflict markers ("=======") extracted as entities — and must
+    // not be a filesystem path ("/" excluded), which dominated the raw universe. DISCLOSURE: this
+    // filter was chosen AFTER W10 rep 1's universe composition was seen (684 names, 185 recurring);
+    // it is structural, not count-tuned, and it applies identically to every arm.
+    if (!/[a-z]/.test(name) || name.includes("/")) continue;
     let count = 0;
     for (const b of bodies) if (b.includes(name)) count++;
     if (count >= 2) universe.push(name);
