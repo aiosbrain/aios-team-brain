@@ -17,9 +17,26 @@
  * `chunk_shas` is LAST-STATE (a delta pass sends a subset the ledger never records), and
  * `projected_at` is overwritten by later pushes, so re-querying a historical window loses rows.
  *
- * So the denominator is `call_kind = 'extract_nodes'`, which Graphiti fires exactly once per episode.
- * Numerator and denominator then come from the same table, the same rows, the same window — the ratio
- * cannot straddle a boundary even if the window does.
+ * So the denominator is `call_kind = 'extract_nodes'`. Numerator and denominator then come from the
+ * same table, the same rows, the same window — the ratio cannot straddle a boundary even if the
+ * window does.
+ *
+ * WHAT THE DENOMINATOR ACTUALLY COUNTS — attempts, not episodes. graphiti_core 0.29.3 fires
+ * `extract_nodes` once per extraction ATTEMPT. There is no reflexion loop (0.13.2 had one) and no
+ * per-episode fan-out, and it fires unconditionally even for content-free episodes — so the happy
+ * path is one call per episode. But two retry layers can add attempts for the SAME episode:
+ *   · `openai_base_client.py` — MAX_RETRIES=2 on pydantic validation failure. The invalid response
+ *     arrived WITH a usage block, so the proxy metered it and the retry is a second row (with a
+ *     longer prompt, since the error context is appended).
+ *   · `client.py` — tenacity on RateLimitError / EmptyResponse / JSONDecodeError. Rate-limited
+ *     attempts carry no usage and are never metered, so those don't distort; the other two do.
+ * Retries push `extract_nodes` ABOVE episodes pushed, so the cross-check's SIGNED gap is the
+ * retry-rate instrument: positive = retries, negative = the window caught a push it didn't bill.
+ * A lever that changes prompt shape can change the validation-retry rate, so a before/after must
+ * compare the signed gap as well as the ratio — otherwise a "token cut" may be a retry-rate shift.
+ *
+ * AND `llm_usage` IS LOSSY. `recordLlmUsage` is best-effort by contract, so a dropped row deflates
+ * whichever side it belonged to. Negligible against a healthy database; not zero.
  *
  * TWO REFUSALS, so the instrument cannot lie quietly. A measurement tool that reports a plausible
  * wrong number is worse than one that reports nothing, because the wrong number is what gets quoted:
@@ -40,8 +57,12 @@ import { Client } from "pg";
 /** Minutes of quiet required at each edge before a window is trustworthy. Graphiti's queue drains at
  *  LLM speed (~1-30s per call), so a gap this size means the burst genuinely ended. */
 const DEFAULT_DRAIN_MINUTES = 10;
-/** Episode payload ceiling, from lib/graph/project.ts CHUNK_CHARS. Content tokens ≈ chars / 4. */
-const CHUNK_CHARS = 2500;
+/** Episode payload ceiling, mirroring lib/graph/project.ts CHUNK_CHARS. Content tokens ≈ chars / 4.
+ *  NOTE: the projector reads `GRAPH_CHUNK_CHARS` from env, so a deployment that overrides it makes
+ *  MULTIPLE wrong here — hence the assumed size is printed in the output rather than left implicit.
+ *  Lazy CDC (`cdc1-2500`) will also mix configs across the corpus; at that point this becomes a
+ *  weighted average and the footer stops being a sufficient caveat. */
+const CHUNK_CHARS = Number(process.env.GRAPH_CHUNK_CHARS) > 0 ? Number(process.env.GRAPH_CHUNK_CHARS) : 2500;
 const CHARS_PER_TOKEN = 4;
 /** Above this relative gap the two episode counts describe different populations. */
 const CROSS_CHECK_TOLERANCE = 0.15;
@@ -49,10 +70,14 @@ const CROSS_CHECK_TOLERANCE = 0.15;
 function parseArgs(argv) {
   const args = argv.slice(2);
   const flag = (name) => args.find((a) => a.startsWith(`--${name}=`))?.split("=")[1];
-  const drainMinutes = Number(flag("drain") ?? DEFAULT_DRAIN_MINUTES);
+  const drainRaw = flag("drain");
+  const drainMinutes = drainRaw === undefined ? DEFAULT_DRAIN_MINUTES : Number(drainRaw);
   const last = flag("last");
   const positional = args.filter((a) => !a.startsWith("--"));
-  return { since: positional[0], until: positional[1], last, drainMinutes };
+  // A NaN here would reach Postgres as the literal interval 'NaN minutes' and throw a syntax error
+  // from deep inside a query, which reads as a tool bug rather than a bad flag.
+  const drainValid = Number.isFinite(drainMinutes) && drainMinutes > 0;
+  return { since: positional[0], until: positional[1], last, drainMinutes, drainValid };
 }
 
 /** `--last=24h|90m|7d` → an ISO window ending now. Convenience only; explicit bounds are preferred
@@ -73,7 +98,7 @@ export function resolveLastWindow(last, nowMs) {
  * `trailingCalls` — graph calls in the drain window immediately before `until`. Non-zero means our
  * own burst had not finished when the window closed, so episodes we counted are still being billed.
  */
-export function assessWindow({ leadingCalls, trailingCalls, extractNodes, episodesPushed }) {
+export function assessWindow({ leadingCalls, trailingCalls, forwardCalls, forwardUnknown, extractNodes, episodesPushed }) {
   const problems = [];
   if (leadingCalls > 0) {
     problems.push(
@@ -87,6 +112,22 @@ export function assessWindow({ leadingCalls, trailingCalls, extractNodes, episod
         `this burst had not drained, so some episodes counted here are still being billed`
     );
   }
+  // FORWARD drain. Both edge checks above look BACKWARD, which misses the case this deployment has
+  // actually had: a graphiti worker stalls mid-queue, goes quiet for longer than the drain, then
+  // resumes after `until`. Its episodes are counted here; its tokens are not. Silent, and it makes
+  // the pipeline look cheaper than it is — the flattering direction, which is the dangerous one.
+  if (forwardCalls > 0) {
+    problems.push(
+      `traffic AFTER the window (${forwardCalls} calls in the drain window following \`until\`) — ` +
+        `extraction spilled past the close, so episodes counted here are billed outside it`
+    );
+  }
+  if (forwardUnknown) {
+    problems.push(
+      "`until` is inside the drain window of now — the forward check cannot run yet, so a spill " +
+        "past the close would be invisible. Re-run once the window has aged past the drain."
+    );
+  }
   if (extractNodes === 0) {
     problems.push("no `extract_nodes` calls in the window — nothing was extracted, so there is no ratio");
   }
@@ -95,7 +136,9 @@ export function assessWindow({ leadingCalls, trailingCalls, extractNodes, episod
   let crossCheck = null;
   if (extractNodes > 0 && episodesPushed !== null) {
     const gap = Math.abs(extractNodes - episodesPushed) / Math.max(extractNodes, episodesPushed);
-    crossCheck = { extractNodes, episodesPushed, gap };
+    // SIGNED: positive means more extraction attempts than episodes pushed (retries); negative means
+    // the window saw a push whose extraction it did not bill. Different diagnoses, so keep the sign.
+    crossCheck = { extractNodes, episodesPushed, gap, signed: extractNodes - episodesPushed };
     if (gap > CROSS_CHECK_TOLERANCE) {
       problems.push(
         `episode counts disagree: ${extractNodes} extract_nodes calls vs ${episodesPushed} episodes ` +
@@ -135,7 +178,11 @@ export function summarise({ rows, extractNodes }) {
 const fmt = (n, d = 0) => (n === null || n === undefined ? "—" : Number(n).toLocaleString("en-US", { maximumFractionDigits: d, minimumFractionDigits: d }));
 
 async function main() {
-  const { since, until, last, drainMinutes } = parseArgs(process.argv);
+  const { since, until, last, drainMinutes, drainValid } = parseArgs(process.argv);
+  if (!drainValid) {
+    console.error("--drain must be a positive number of minutes");
+    process.exit(2);
+  }
   const window = last ? resolveLastWindow(last, Date.now()) : { since, until };
   if (!window?.since || !window?.until) {
     console.error("usage: graph-ingest-cost.mjs <sinceISO> <untilISO> [--drain=10]   |   --last=24h");
@@ -170,9 +217,13 @@ async function main() {
            (select count(*) from llm_usage
              where source='graph' and created_at >= $1::timestamptz - $3::interval and created_at < $1)::int as leading_calls,
            (select count(*) from llm_usage
-             where source='graph' and created_at >= $2::timestamptz - $3::interval and created_at < $2)::int as trailing_calls`,
+             where source='graph' and created_at >= $2::timestamptz - $3::interval and created_at < $2)::int as trailing_calls,
+           (select count(*) from llm_usage
+             where source='graph' and created_at >= $2::timestamptz and created_at < $2::timestamptz + $3::interval)::int as forward_calls,
+           (now() < $2::timestamptz + $3::interval) as forward_unknown`,
         [window.since, window.until, drain]
     );
+    let runsError = null;
     const runs = await client
         .query(
           // ANCHORED ON `finished_at`, not `started_at` — found by running this against prod. A
@@ -187,7 +238,13 @@ async function main() {
             where source = 'graph_project' and finished_at >= $1 and finished_at < $2`,
           [window.since, window.until]
         )
-        .catch(() => null);
+        // A real SQL error here (renamed table/column) would otherwise masquerade as "no runs to
+        // compare against" and silently disarm one of the two refusals — permanently, and quietly,
+        // which is the one thing this tool exists not to do. Capture it and SAY so.
+        .catch((err) => {
+          runsError = err instanceof Error ? err.message : String(err);
+          return null;
+        });
 
     const rows = byKind.rows;
     const extractNodes = Number(rows.find((r) => r.call_kind === "extract_nodes")?.calls ?? 0);
@@ -198,6 +255,8 @@ async function main() {
     const verdict = assessWindow({
       leadingCalls: Number(edges.rows[0].leading_calls),
       trailingCalls: Number(edges.rows[0].trailing_calls),
+      forwardCalls: Number(edges.rows[0].forward_calls),
+      forwardUnknown: edges.rows[0].forward_unknown === true,
       extractNodes,
       episodesPushed,
     });
@@ -206,7 +265,13 @@ async function main() {
     console.log(`\nwindow      ${window.since} → ${window.until}   (drain ${drainMinutes}m)`);
     console.log(`episodes    ${fmt(s.episodes)}   (extract_nodes calls — one per episode)`);
     if (verdict.crossCheck) {
-      console.log(`cross-check ${fmt(verdict.crossCheck.episodesPushed)} pushed per ingest_runs · ${(verdict.crossCheck.gap * 100).toFixed(0)}% apart`);
+      const sign = verdict.crossCheck.signed > 0 ? `+${verdict.crossCheck.signed} attempts over pushes (retries)` : verdict.crossCheck.signed < 0 ? `${verdict.crossCheck.signed} — pushes this window did not bill` : "exact";
+      console.log(`cross-check ${fmt(verdict.crossCheck.episodesPushed)} pushed per ingest_runs · ${(verdict.crossCheck.gap * 100).toFixed(0)}% apart · ${sign}`);
+    } else if (runsError) {
+      console.log(`cross-check UNAVAILABLE — the ingest_runs query FAILED: ${runsError}`);
+      console.log("            (one of the two refusals is disarmed; treat any ratio below with suspicion)");
+    } else {
+      console.log("cross-check unavailable — no projector runs finished inside this window");
     }
 
     if (!verdict.trustworthy) {
@@ -231,7 +296,7 @@ async function main() {
         `  ${r.call_kind.padEnd(22)} ${String(calls).padStart(6)} calls  ` +
           `${String(Math.round(Number(r.input_tokens) / calls)).padStart(7)} avg in  ` +
           `$${Number(r.cost_usd).toFixed(3).padStart(7)}  ` +
-          `${((Number(r.cost_usd) / s.costUsd) * 100).toFixed(0).padStart(3)}%`
+          `${(s.costUsd > 0 ? ((Number(r.cost_usd) / s.costUsd) * 100).toFixed(0) : "—").padStart(3)}%`
       );
     }
     console.log("");

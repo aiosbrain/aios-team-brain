@@ -16,7 +16,14 @@ import { assessWindow, summarise, resolveLastWindow } from "../scripts/graph-ing
  * produce a ratio.
  */
 
-const clean = { leadingCalls: 0, trailingCalls: 0, extractNodes: 100, episodesPushed: 100 };
+const clean = {
+  leadingCalls: 0,
+  trailingCalls: 0,
+  forwardCalls: 0,
+  forwardUnknown: false,
+  extractNodes: 100,
+  episodesPushed: 100,
+};
 
 describe("assessWindow — refuses more than it reports", () => {
   it("trusts a window that opens and closes in quiet with agreeing counts", () => {
@@ -37,6 +44,32 @@ describe("assessWindow — refuses more than it reports", () => {
     const v = assessWindow({ ...clean, trailingCalls: 3 });
     expect(v.trustworthy).toBe(false);
     expect(v.problems.join(" ")).toMatch(/TRAILING/);
+  });
+
+  it("refuses when extraction spilled PAST the window — the flattering direction", () => {
+    // Both other edge checks look backward. A graphiti worker that stalls mid-queue, goes quiet past
+    // the drain, then resumes after `until` leaves its episodes counted here and its tokens outside —
+    // making the pipeline look cheaper than it is. Silent worker death is a recorded failure of this
+    // deployment, so this is a real window shape, not a hypothetical one.
+    const v = assessWindow({ ...clean, forwardCalls: 40 });
+    expect(v.trustworthy).toBe(false);
+    expect(v.problems.join(" ")).toMatch(/AFTER the window/);
+  });
+
+  it("refuses when the window is too recent for the forward check to have run", () => {
+    // `--last=1h` can never be forward-checked: the drain window after `until` is still in the future.
+    // Unknown must not read as clean.
+    const v = assessWindow({ ...clean, forwardUnknown: true });
+    expect(v.trustworthy).toBe(false);
+    expect(v.problems.join(" ")).toMatch(/cannot run yet/);
+  });
+
+  it("keeps the cross-check gap SIGNED, because the two directions are different diagnoses", () => {
+    // Positive = more extraction attempts than pushes (retries, which 0.29.3 meters). Negative = the
+    // window saw a push it did not bill. A lever that changes prompt shape can move the retry rate,
+    // so a before/after must read the sign, not just the magnitude.
+    expect(assessWindow({ ...clean, extractNodes: 118, episodesPushed: 100 }).crossCheck?.signed).toBe(18);
+    expect(assessWindow({ ...clean, extractNodes: 100, episodesPushed: 118 }).crossCheck?.signed).toBe(-18);
   });
 
   it("refuses a window with no extraction at all rather than dividing by zero", () => {

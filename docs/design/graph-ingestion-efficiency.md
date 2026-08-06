@@ -219,8 +219,18 @@ Before any lever, a repeatable way to price a change against a **real payload**,
 workstream is exactly where stacked estimates go wrong:
 
 `scripts/graph-ingest-cost.mjs <since> <until>` reports **input tokens per episode**, calls per
-episode, and $/episode — derived from `llm_usage` **alone**, with `extract_nodes` (one per episode) as
-the denominator. No `graph_episodes ⋈ items` join, because that join is what made my first baseline
+episode, and $/episode — derived from `llm_usage` **alone**, with `extract_nodes` as the denominator.
+
+**What that denominator counts is attempts, not episodes**, and the distinction matters for lever 2.
+graphiti_core 0.29.3 has no reflexion loop and fires `extract_nodes` once per extraction attempt —
+but two retry layers (a MAX_RETRIES=2 pydantic-validation loop, and tenacity on
+EmptyResponse/JSONDecode) add *metered* attempts for the same episode. Rate-limited attempts carry no
+usage and never distort. So **the cross-check's SIGNED gap is the retry-rate instrument**: positive
+means retries, negative means a push the window did not bill.
+
+**Lever 2's before/after must compare the signed gap as well as the ratio.** Cutting the context
+changes prompt shape, which can change the validation-retry rate — so a token "saving" could partly
+be a retry-rate shift in either direction. Reading only the ratio would credit the lever for it. No `graph_episodes ⋈ items` join, because that join is what made my first baseline
 wrong: extraction is async, so a billing window and a projection window cover different episodes, and
 the ledger's `chunk_shas` is last-state while `projected_at` is overwritten by later pushes.
 
