@@ -348,6 +348,16 @@ for a metric is the **mean of its two reps**. Ratios use the mean of W10's two r
 W10's own **spread** — `|rep1 − rep2|`, expressed in the same units as the band — is the noise
 estimate.
 
+> **Amendment, 2026-08-06, during session 1's extraction and before any readout existed:** the rule
+> above pins aggregation for **band** metrics only; the non-band inputs needed their own, and the
+> judge (`scripts/graph-window-battery/judge.mjs`) pre-registers them: **`personsLost` takes the MAX
+> of the two reps** (the clause is a noise-free floor — averaging would let one clean rep launder the
+> other), **`dupeEdges` takes the MIN** (both reps must clear the 200-edge minimum),
+> **`dupeShare` takes the MEAN** (matching the band aggregation for the same quantity), and
+> **`armsCompleted` requires every rep of every arm to have landed exactly its expected episode
+> count** — measured from `(:Episodic)` nodes in the graph, not inferred from the push, because 202
+> ≠ extracted and the worker dies silently.
+
 **Per metric, exactly one of — and the rule is SYMMETRIC about the band:**
 
 - **PASS** — the arm's mean beats the band by **more than** W10's spread.

@@ -46,6 +46,17 @@ export async function entityYield(groupId: string, episodes: number): Promise<nu
 }
 
 /**
+ * How many Episodic nodes actually LANDED in the graph. `armsCompleted` must be measured, not
+ * asserted: Graphiti 202-accepts episodes into an in-memory queue and its worker dies silently on a
+ * non-Cancelled exception (a recorded incident class), so "we pushed 108" says nothing about how
+ * many were processed. The judge compares this against the corpus's expected count per rep.
+ */
+export async function episodicCount(groupId: string): Promise<number> {
+  const rows = await runRead<{ n: number }>("MATCH (e:Episodic {group_id: $g}) RETURN count(e) AS n", { g: groupId });
+  return Number(rows[0]?.n ?? 0);
+}
+
+/**
  * Q3 — the IS_DUPLICATE_OF share of RELATES_TO edges.
  *
  * The predicate is deliberately identical to `lib/graph/extraction-health.ts`'s, which is pinned by
