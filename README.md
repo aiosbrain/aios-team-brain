@@ -294,25 +294,26 @@ on green output.
 
 > **Railway users don't need to read §2.1–§2.4.** Start at the
 > [official one-click template](https://aiosbrain.dev/deploy/team-brain/). An active Railway plan is
-> required. The template creates the app and Postgres, generates the application secrets, asks for
-> only the team and first-admin details, applies the schema, and bootstraps the login.
+> required. The template creates Team Brain, Postgres, Graphiti, and Neo4j, generates the
+> application and graph secrets, asks only for the team and first-admin details, applies the schema,
+> and bootstraps the login.
 >
 > Read on only for a non-Railway host, local development, or debugging a failed deployment.
 
 ### 2.1 — Create the services
 
-On Railway, use the [official template](https://aiosbrain.dev/deploy/team-brain/); it deploys from
-the official repository and adds Postgres without a fork, local CLI, or `--resume` step.
+On Railway, use the [official template](https://aiosbrain.dev/deploy/team-brain/); it deploys the
+four-service stack from the official repository without a fork, local CLI, or `--resume` step.
 
 On another host, deploy this repository as one web service and attach one Postgres 16 database.
 
-Add the graph services (§2.8) later, only if you want narrative arcs.
+For another host, add the graph services (§2.8) when you want narrative arcs.
 
 ### 2.2 — Set the environment variables
 
 The Railway template owns the database reference, generated secrets, and public-domain reference.
-You enter `TEAM_NAME`, `TEAM_SLUG`, `ADMIN_NAME`, `ADMIN_EMAIL`, and `ADMIN_PASSWORD` in Railway's
-reviewed form.
+You enter `TEAM_NAME`, `TEAM_SLUG`, `ADMIN_NAME`, `ADMIN_EMAIL`, and an `ADMIN_PASSWORD` of at
+least 10 characters in Railway's reviewed form.
 
 For a manual non-template deployment, set at minimum:
 
