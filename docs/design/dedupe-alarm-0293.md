@@ -51,9 +51,15 @@ differ by a whitespace run, and the re-pinned guard's job is to match what 0.29.
 **Group scoping, decided:** the census runs per group (an improvement over the old global signal —
 the file's own header laments the masking a global read causes), the card shows per-group numbers,
 and the ALARM's verdict for a tick is: judgeable if **any** group judged, polluted if **any** judged
-group is polluted. Transition state stays one machine (the existing single-row read), keyed on that
-combined verdict — per-group state machines are explicitly out of scope here and belong to a future
-card iteration if per-group history earns its keep.
+group is polluted — **with group memory on the recovery edge**. The alert transition row records the
+polluted group id(s) in `meta`, and "recovered" requires **those groups** to be judged-and-healthy;
+while any previously-polluted group is unjudged, the combined verdict is UNJUDGEABLE, not healthy.
+Without this, a small group that alerted and then dipped under its name minimum while the team group
+judged healthy would trigger a "recovered" mail for a group that was never re-judged — the
+one-quiet-Saturday false recovery `extraction-alert.ts` documents as a prior review finding,
+reintroduced one layer up. Transition state stays one machine (the existing single-row read), keyed
+on that combined verdict — per-group state machines are explicitly out of scope here and belong to a
+future card iteration if per-group history earns its keep.
 
 Variant-name fragmentation is explicitly **out of scope for the alarm**: detecting it needs
 identity judgment (which strings co-refer), which is a model call — an alarm that spends LLM money
@@ -92,17 +98,25 @@ because a faithful port would brick the alarm the other way**:
 - **The "is the query even matching anything" tripwire is REPLACED, not dropped** — a zero-name
   census is indistinguishable from a young group on its own, which would recreate the silent death.
   The new tripwire cross-checks the census against the **Postgres `graph_episodes` ledger**: episodes
-  projected for the group inside the window **but zero census names** ⇒ `predicate-suspect`
-  (a graphiti bump renamed `Entity`/`created_at` — the clock RUNS); no episodes either ⇒ a genuinely
-  young or quiet group (`small-sample` — the clock PARKS). "Young group" is thereby defined by the
-  ledger, the one source that knows whether anything was pushed.
+  projected for the group inside the window **but zero census names** ⇒ `predicate-suspect` (the
+  clock RUNS); no episodes either ⇒ a genuinely young or quiet group (`small-sample` — the clock
+  PARKS). "Young group" is thereby defined by the ledger, the one source that knows whether anything
+  was pushed. **The `predicate-suspect` signature has two causes and the mail says so:** a graphiti
+  bump renaming `Entity`/`created_at` produces it, and so does a **stalled extractor** (episodes
+  202-accepted, worker dying on every job, zero new nodes — both 2026-07 prod incidents). The mail
+  copy names both candidates and points at the extraction banner and service logs rather than
+  diagnosing a rename it cannot distinguish; since the stalled leg is banner-only today, this mail
+  may in fact be the only push notification a stall gets, which is a feature so long as the copy is
+  honest about what it knows.
 
 Constants: minimum-sample refusal, relative margin, absolute floor — with the census's recent
 window a **new constant (`CENSUS_RECENT_MS`), not a reuse of `DEDUPE_RECENT_MS`**: the denominator
 counts only names that gained a node in the window, and names arrive far slower than edges, so a
 24h window on a mature mostly-merging graph could sit permanently under any minimum. Pre-committed
 response if prod measurement shows that: widen `CENSUS_RECENT_MS` until the denominator clears the
-minimum, rather than lowering the minimum. Initial values derived from prod measurement **as the
+minimum, rather than lowering the minimum — **and the trailing baseline window scales with it**
+(recent:baseline stays ~1:14), else a widened recent window quietly eats the baseline sample it is
+judged against. Initial values derived from prod measurement **as the
 first implementation step** (the card ships the numbers before the alarm judges them; see rollout).
 
 ### 2. `deriveDedupePollution` v2 — additive contract, new evidence
@@ -138,15 +152,31 @@ cannot reset or satisfy the clock.
   prior-state read (`lastGraphHealthFailed`) becomes **per alarm kind** — without the discriminator,
   a blindness row written `ok: false` would make the next healthy pollution tick mail
   "graph extraction recovered" for an alert that never fired.
-- **The 24h clock's anchor is persisted, not in-memory**: the first clock-running refusal after a
-  judged (or unknown) state writes a `blindness`-kind transition row, and the clock measures from
-  that row. An in-memory clock resets on every deploy — frequent here — and could keep the
-  meta-alarm perpetually below threshold.
+- **The 24h clock's anchor is persisted, not in-memory**, and blindness rows carry **three
+  distinguishable meanings** in `meta.phase`: `anchor` (clock start, written on the first
+  clock-running refusal after a judged/unknown state — no mail), `fired` (the mail was sent), and
+  `cleared` (first judged tick after an anchor or fired — edge-only, no mail). The mail condition is
+  exactly: *an `anchor` ≥ 24h old with no `fired` or `cleared` since it*. One meaning is not enough
+  in either direction: without `fired`, every tick past hour 24 re-mails forever; without `cleared`,
+  a judged tick that voids the clock leaves a stale anchor behind, and a clock-running refusal weeks
+  later fires instantly off it. An in-memory clock resets on every deploy — frequent here — and
+  could keep the meta-alarm perpetually below threshold.
+- **Legacy rows** (no `meta.alarm`) read as `"pollution"` kind in the per-kind read — prod's ledger
+  is empty today, but fixtures and older installs are not guaranteed to be. Anchor rows are written
+  `ok: true` (a running clock is not a pipeline failure) so the admin run list does not render red
+  for a non-failure; the kind discriminator, not `ok`, is what the reads key on.
 
-**Refusal taxonomy vs the clock:** `predicate-suspect` and `no-baseline` RUN the clock;
-`small-sample` (ledger-confirmed young/quiet group), `graph-unconfigured` (no Neo4j — there is no
-alarm to protect and nothing to page about) and `graph-unreadable` (Neo4j down — the reachability
-leg's page, not this one; double-paging is the cry-wolf failure) PARK it.
+**Refusal taxonomy vs the clock:** `predicate-suspect` RUNS the clock. `no-baseline` runs it
+**only when the ledger shows the baseline window had episode flow** — a fresh install whose recent
+window clears the name minimum before its 14-day baseline fills would otherwise get a "your alarm is
+blind" mail at ~week 2 while perfectly healthy; the ledger-defined-young test applies per *window*,
+symmetrically with the tripwire. `small-sample` (ledger-confirmed young/quiet group) and
+`graph-unconfigured` (no Neo4j — nothing to protect) PARK it. `graph-unreadable` **parks for a
+6-hour grace, then RUNS the clock with unreadable-specific mail copy** — the review verified that
+"defer to the reachability leg" defers to a pull surface (the admin card render); **no path in this
+repo mails on Neo4j being down**, so a permanent park would reproduce the silent-death shape behind
+a pager that does not exist. Transient restarts stay quiet inside the grace; a rotted credential
+eventually pages, with copy that says what it actually knows.
 
 This is the fix for layer 2 and it is **signal-agnostic**: any future evidence removal parks the
 alarm in a state that pages instead of a state that hides.
