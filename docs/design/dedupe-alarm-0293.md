@@ -73,13 +73,12 @@ the Costs page (calls/episode panel) remains the coarse backstop for the rest.
 
 ```cypher
 MATCH (n:Entity {group_id: $g})
-// normalisation mirrors the wheel's _normalize_string_exact: lowercase, trim, AND collapse
-// internal whitespace runs — apoc-free: reduce over split, or normalise in the TS layer
-WITH toLower(trim(n.name)) AS rawName, count(n) AS nodes, max(n.created_at) AS newest
-WITH rawName AS name, nodes, newest   // (implementation collapses internal whitespace before grouping)
-WHERE newest >= datetime($recentSince)          -- names ACTIVE in the recent window
-RETURN count(*) AS names,
-       count(CASE WHEN nodes > 1 THEN 1 END) AS split
+// Return PER-NAME rows; the TS layer normalises (mirroring the wheel's _normalize_string_exact:
+// lowercase, trim, COLLAPSE INTERNAL WHITESPACE) and re-groups before computing the share.
+// Normalising after a Cypher-side aggregation is impossible — two raw names that collapse to one
+// arrive as pre-aggregated totals that cannot be re-merged — so the aggregation lives on the TS
+// side of the normalisation, and the recency filter is applied there too.
+RETURN n.name AS name, count(n) AS nodes, max(n.created_at) AS newest
 ```
 
 Baseline window computed identically over the trailing period (excluding recent), keeping the
