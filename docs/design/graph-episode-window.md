@@ -158,6 +158,36 @@ Measured **across all four metered carriers** — `extract_nodes`, `extract_edge
 Phase A's numbers are written into this doc **before** Phase B runs, so the prediction is on the
 record before the result exists.
 
+### Phase A, part 1 — the structural half, measured 2026-08-06 at **zero LLM cost**
+
+Two of Phase A's three questions turned out not to need a run at all. Given the tie-rank guarantee
+(§4), the same-item share is **derivable** from the corpus shape, and tie-pool contamination is a
+**SQL query against prod**. Both were computed over the pinned 108-episode corpus:
+
+| | result |
+|---|---|
+| predecessor slots that are **unrelated items** | **617 of 1,080 — 57.1%**, pure billed waste |
+| same-item share, **single-chunk** items | **0%** (200 slots, all filler — nothing to be a chunk of) |
+| same-item share, **multi-chunk** items | **52.6%** (the rest is filler because chunk *k* has only *k* predecessors of its own to offer, and *k* < 10 for most chunks) |
+| tie-pool contamination | **every** corpus item has a rival sharing its exact `work_at`; worst is 40 rival episodes |
+| own-chunk slots the guarantee actually delivers | **95.1%** (440 of 463) |
+
+**The contamination is real but lands where it costs least.** The multi-chunk *documents* — the
+population Q4 measures — carry **1 rival episode each** and keep 95–100% of their own-chunk slots.
+The heavy displacement (2.3 of 10 slots kept) is confined to small Linear items sharing a `work_at`
+with a 40-episode batch, which had little own-context to lose. So §4's guarantee is sound in
+practice for the case it matters for.
+
+**The prediction this puts on the record, before Phase B runs:** the `SAME` filter removes **57.1% of
+all predecessor slots** as carrying nothing, and makes the remaining 43% *deterministic* rather than
+95% deterministic. Since the predecessor block is the largest term in the ~40,070 input tokens, C1's
+25% band should be cleared comfortably — and if it is not, the token accounting is wrong somewhere
+and that is itself the finding.
+
+**What still needs the stack:** the *size* of the predecessor block per call kind — the parent spec's
+~6,250 tokens is derived, not observed — across all four metered carriers. That is the only part of
+Phase A that spends money.
+
 ## Phase B — the battery
 
 Three arms, each replaying the **same corpus in the same order into a fresh, empty Neo4j**, at the

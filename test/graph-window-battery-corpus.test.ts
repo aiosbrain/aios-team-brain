@@ -140,16 +140,19 @@ describe("the episode budget guards Q5's band, whose number means nothing withou
    * that visible instead of quiet.
    */
   const big = Array.from({ length: 60 }, (_, i) => ({ id: `a${i}`, chars: 100_000 })); // 40 chunks each
+  // Read the budget rather than restate it: a test that hardcodes the constant it checks goes red
+  // for a deliberate retarget and green for a typo, which is backwards.
+  const rangeRe = new RegExp(`outside the ${EPISODE_BUDGET.min}-${EPISODE_BUDGET.max} range`);
 
   it("breaches when the corpus is far larger than the band was derived at", () => {
     const got = selectCorpus(big, { A: 5, B1: 0, B2: 0, C: 0 });
     expect(got.episodes).toBe(200);
-    expect(got.episodeBudgetBreach).toMatch(/outside the 90-120 range/);
+    expect(got.episodeBudgetBreach).toMatch(rangeRe);
   });
 
   it("breaches when it is far smaller, too — a thin corpus makes one retry huge", () => {
     const got = selectCorpus([{ id: "s", chars: 100 }], { A: 0, B1: 1, B2: 0, C: 0 });
-    expect(got.episodeBudgetBreach).toMatch(/outside the 90-120 range/);
+    expect(got.episodeBudgetBreach).toMatch(rangeRe);
   });
 
   it("passes inside the range", () => {
