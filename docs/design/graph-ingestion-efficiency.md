@@ -26,9 +26,10 @@ Two consequences beyond the patch target:
 - **The real window is 10 previous episodes, not 3.** That is why an `extract_nodes` call averages
   8,360 input tokens for a 625-token episode: ~6,250 of it is the ten predecessors.
 - **The patch target is the call site** (`graphiti.py:1090`, `last_n=RELEVANT_SCHEMA_LIMIT` →
-  `last_n=1`), not the constant. `RELEVANT_SCHEMA_LIMIT` is *also* the dedupe-candidate limit and the
-  query-time retrieval limit across ~20 call sites in `search_utils.py`; patching it at its
-  definition would silently narrow retrieval quality too.
+  `last_n=1`), not the constant. `RELEVANT_SCHEMA_LIMIT` is *also* the
+  query-time retrieval limit across **15 lines** in `search_utils.py` (1 definition + 14 uses);
+  patching it at its definition would silently narrow retrieval quality too. (Corrected from "~20
+  call sites" — counted, not estimated, in PIPEFF-2.)
 
 ### 2. My baseline was measured over mismatched sets
 
@@ -68,9 +69,11 @@ Where it goes, per call kind (2026-08-05 06:50 batch):
 | `node_summaries_batch` | 56 | 6,998 | |
 | `edge_timestamps` | 72 | 552 | |
 
-The previous-episode window is carried by **four** call kinds (extract_nodes, extract_edges,
-dedupe_nodes, and attribute extraction) — not the two I first claimed. The same text is billed many
-times over.
+The previous-episode window is carried by **four** call kinds — not the two I first claimed. The same
+text is billed many times over. (Which four was also wrong: `node_attributes` does **not** fire on
+this install — with no custom entity types `_extract_entity_attributes` returns `{}` with no LLM call
+— so the fourth carrier is `node_summaries_batch`, which embeds full predecessor content. Corrected
+in PIPEFF-2.)
 
 Cost is also ~90% fixed overhead rather than content. Measured across yesterday's projections:
 
@@ -158,18 +161,28 @@ orphan tails a shrink creates are not fixed by re-pushing the head either (nothi
 paying to re-extract buys nothing. The `chunkConfigDeltaCompatible` comment must be updated to say
 so rather than left contradicting this.
 
-### 2. Cut the repeated context — the previous-episode window, 10 → 1
+### 2. Cut the repeated context — the previous-episode window
+
+> **Superseded in detail by [`graph-episode-window.md`](./graph-episode-window.md) (PIPEFF-2 /
+> AIO-821).** Re-deriving the window against the deployed image showed the waste and the value are
+> separable *by item shape*: a single-chunk item's ten predecessors are all unrelated items (pure
+> cost), while a multi-chunk item's own prior chunks are **guaranteed** to be selected (they share
+> `valid_at` with the episode, which is the maximum value the filter admits, so they rank above every
+> strictly-earlier row). So the lever became **"carry the document's own predecessors and nothing
+> else"**, with `last_n=1` demoted to the blunt fallback arm. The paragraphs below are kept as the
+> original framing.
 
 **Patch the CALL SITE, not the constant:** `graphiti.py:1090`, `last_n=RELEVANT_SCHEMA_LIMIT` →
 `last_n=1`, as a `sed` in `graphiti/Dockerfile` (precedent: the same file constructs
 `OpenAIGenericClient` by sed; note the `DEFAULT_MAX_TOKENS` sed it once had is now an assert-only
 grep, so that half of the precedent no longer stands). `RELEVANT_SCHEMA_LIMIT` is *also* the
-dedupe-candidate limit and the query-time retrieval limit across ~20 sites in `search_utils.py` —
-patching its definition would silently narrow retrieval quality, which is a different feature.
+query-time retrieval limit across **15 lines** in `search_utils.py` — patching its definition would
+silently narrow retrieval quality, which is a different feature. (It is NOT the dedupe-candidate
+limit; that is `NODE_DEDUP_CANDIDATE_LIMIT = 15`. Corrected in PIPEFF-2.)
 
-The window is carried by **four** call kinds (`extract_nodes`, `extract_edges`, `dedupe_nodes`,
-attribute extraction), so at ~6,250 tokens of predecessors per call this is the single largest term
-in the ~38,000.
+The window is carried by **four** call kinds (`extract_nodes`, `extract_edges`, `dedupe_nodes` and
+`node_summaries_batch` — **not** attribute extraction, see the correction above), so at ~6,250 tokens
+of predecessors per call this is the single largest term in the ~38,000.
 
 **This one has a real quality trade and must not ship on an estimate — and the trade is bigger than
 I first scoped.** Cutting 10→1 removes nine predecessors, not two. Previous episodes are how the
