@@ -48,6 +48,18 @@ const SHAPE_BY_VERSION: Record<number, Record<string, string[]>> = {
     signalGroup: ["kind", "count", "items"],
     signalItem: ["id", "kind", "title", "at", "url", "stillValid"],
   },
+  // v12 adds `via` to evidenceItem — set only on a meeting credited to its SUBMITTER because no
+  // attendee resolved. It is copied explicitly by the grouper, so it is exactly the kind of key that
+  // gets silently dropped; the REQUIRED half below forces the fixture to actually produce one.
+  12: {
+    personDay: ["memberId", "name", "handle", "avatarUrl", "summary", "total", "tasks", "other", "unlinked", "signals"],
+    taskGroup: ["taskId", "title", "status", "source", "sources", "evidenceCount", "assignee"],
+    assignee: ["name", "avatarUrl"],
+    sourceGroup: ["source", "count", "items"],
+    evidenceItem: ["id", "title", "url", "source", "kind", "at", "linkedTask", "linkVia", "via"],
+    signalGroup: ["kind", "count", "items"],
+    signalItem: ["id", "kind", "title", "at", "url", "stillValid"],
+  },
 };
 
 /**
@@ -75,6 +87,17 @@ const REQUIRED_BY_VERSION: Record<number, Record<string, string[]>> = {
     signalGroup: ["kind", "count", "items"],
     signalItem: ["id", "kind", "title", "at", "url", "stillValid"],
   },
+  12: {
+    personDay: ["memberId", "name", "handle", "total", "tasks", "other", "unlinked", "signals"],
+    taskGroup: ["taskId", "title", "status", "source", "sources", "evidenceCount", "assignee"],
+    assignee: ["name", "avatarUrl"],
+    sourceGroup: ["source", "count", "items"],
+    // `via` is REQUIRED of the fixture: "no unexpected key" alone would pass just as happily if the
+    // grouper silently stopped copying it, which is the failure this version exists to pin.
+    evidenceItem: ["id", "title", "url", "source", "kind", "at", "linkVia", "via"],
+    signalGroup: ["kind", "count", "items"],
+    signalItem: ["id", "kind", "title", "at", "url", "stillValid"],
+  },
 };
 
 /** A day rich enough to instantiate every node type, including the OPTIONAL ones. */
@@ -85,6 +108,9 @@ function buildPayloadDays() {
       // m1 does the work; t1 belongs to m2 — that is what produces `TaskGroup.assignee`.
       { id: "e1", memberId: "m1", title: "commit one", url: "https://x/1", source: "github", kind: "commit", at, taskId: "t1", linkVia: "commit-text" },
       { id: "e2", memberId: "m1", title: "doc one", url: "https://x/2", source: "notion", kind: "doc", at, taskId: "t1", linkVia: "inferred" },
+      // A MEETING credited to its submitter — the only producer of `via`, and the node the v12 bump
+      // is about. Also the one evidence row that carries a bare date rather than a timestamp.
+      { id: "n1:m1", memberId: "m1", title: "1-1 with Bob", url: "/t/acme/meetings/n1", source: "meetings", kind: "meeting", at: "2026-07-22", via: "submitter" as const },
       // …and one piece of work linked to nothing, so `other`/`unlinked` are populated too.
       { id: "e3", memberId: "m1", title: "stray file", url: "https://x/3", source: "github", kind: "file", at, linkVia: "pr" },
     ],

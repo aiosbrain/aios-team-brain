@@ -58,6 +58,10 @@ const MAP: Record<string, { Icon: IconCmp; color: string; label: string }> = {
   notion: { Icon: NotionMark, color: "text-ink", label: "Notion" },
   confluence: { Icon: ConfluenceMark, color: "text-[#1868db]", label: "Confluence" },
   granola: { Icon: Mic, color: "text-emerald-600", label: "Meetings" },
+  // The timeline's meeting evidence carries `source: "meetings"` (the payload slug, not an ingest
+  // source — a meeting reaches the card from the `meeting_notes` ledger). Same icon and label as
+  // `granola`: to a reader they are the same thing.
+  meetings: { Icon: Mic, color: "text-emerald-600", label: "Meetings" },
   gdrive: { Icon: DriveMark, color: "text-[#1a73e8]", label: "Drive" },
   other: { Icon: FileText, color: "text-ink-tertiary", label: "Files" },
 };

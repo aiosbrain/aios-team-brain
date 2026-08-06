@@ -107,8 +107,15 @@ does not paper over the gap by guessing. See Out of scope.
 Priority, first non-null wins:
 
 1. `meeting_notes.occurred_at` — the meeting's own date.
-2. the transcript item's `work_at`, when the note has no `occurred_at`.
-3. `meeting_notes.created_at` as the last resort.
+2. `meeting_notes.created_at` as the fallback.
+
+**Two rungs, not three.** An earlier draft put the transcript item's `work_at` between them. Dropped
+deliberately: it would require joining `items` purely to date a row, and it buys almost nothing —
+`deriveOccurredAt` reads essentially the same frontmatter keys as `WORK_TIME_KEYS`, so a note with no
+`occurred_at` is one whose item has no source work-time either, and its `work_at` is ingest time, which
+is what `created_at` already gives. If that assumption ever breaks, the fix is to make
+`deriveOccurredAt` smarter — the meeting's own date is the right field to improve, not a second
+opinion about it here.
 
 **`at` is ALWAYS a bare `YYYY-MM-DD`, never a timestamp** — including when it came from source 2 or 3,
 which are timestamps and must be sliced. `occurred_at` is a `date` column (`schema.sql:1273`) with no
