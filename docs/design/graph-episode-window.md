@@ -196,20 +196,32 @@ one produces a stack that boots and then does nothing:
 
 **Selection rule, fixed in advance, buckets disjoint by construction, `access = 'team'` only:**
 
-| bucket | rule | ≈episodes |
+| bucket | rule | episodes (measured) |
 |---|---|---|
-| A | the **5** most recent items of **≥ 8 chunks** | ~50 |
+| A | the **3** most recent items of **≥ 8 chunks** | 57 |
 | B1 | the **15** most recent items of **exactly 1 chunk, < 600 chars** | 15 |
 | B2 | the **5** most recent items of **exactly 1 chunk, ≥ 600 chars** | 5 |
-| C | the **8** most recent items of **2–7 chunks** | ~30 |
+| C | the **8** most recent items of **2–7 chunks** | 31 |
+
+> **Amendment, 2026-08-06, before any session ran — bucket A: 5 → 3.** Run against this install, `A: 5`
+> selected 9, 8, 40, 23 and 22-chunk items: **102 episodes in bucket A alone, 153 in total**, against
+> the ~100 this spec assumed. That is not just a cost overrun — **Q5's band is derived from the corpus
+> size.** At ~100 episodes one validation retry moves the signed gap by ~1 pp, which is the entire
+> reason the band is 3 pp and its ceiling 1.5 pp. At 153 episodes one retry is 0.65 pp, so the same
+> pre-registered ceiling would silently tolerate **2.3 retries instead of one** — the number unchanged,
+> its meaning changed. Fixing the corpus size preserves the coupling; re-deriving the band after
+> seeing a corpus would not. `A: 3` measures **108 episodes**, one retry ≈ 0.93 pp, and the
+> single-chunk episode share moves from 13.1% to **18.5%** — *closer* to prod's ~17%, which matters
+> because C1 is corpus-mix-sensitive. `selectCorpus` now refuses outside **90–120 episodes**
+> (`EPISODE_BUDGET`), so a future draw cannot break the coupling quietly.
 
 The four buckets **partition** the corpus by chunk count — an earlier draft's "1 chunk *and* <600
 chars" against "2–7 chunks" left a 1-chunk-but-large item in no bucket at all, the same class of hole
 as the 4–7-chunk gap before it.
 
-≈100 episodes per rep, of which ~20% are single-chunk-item episodes — against **~17% in prod**
-(898 of 5,166). That match is what makes the blended C1 transferable, and C1 is corpus-mix-sensitive,
-so it is stated rather than left implicit.
+**108 episodes per rep, of which 18.5% are single-chunk-item episodes** — against **~17% in prod**
+(898 of 5,166). Both numbers are measured, not estimated. That match is what makes the blended C1
+transferable, and C1 is corpus-mix-sensitive, so it is stated rather than left implicit.
 
 The `access='team'` restriction is what makes this land in **one group** — by selection, not by
 bypassing the projector (see below). The selected item ids are **pinned in the report** so a later
@@ -419,8 +431,9 @@ needs no amendment. So the redraw joint is closed on the invalid side too:
 > future edit ever softens "the first valid session binds", *consecutive* silently becomes a real
 > hole and must become a total count in the same change.
 
-**Estimated spend: ≈$5–8** on the OpenRouter key (3 arms × 2 reps × ~100 episodes, cheaper per
-episode as the window shrinks). Direct-to-provider from a local brain: the `llm_usage` **rows** land
+**Estimated spend: ≤ $9.53** on the OpenRouter key — 3 arms × 2 reps × 108 episodes at the incumbent's
+measured $0.0147/episode, and that is an upper bound because the two candidate arms carry less context
+and so cost less per episode. Direct-to-provider from a local brain: the `llm_usage` **rows** land
 in the local test database (which is what the harness reads), while the **dollars** land on the
 provider bill and never in our ledger or the Costs page.
 

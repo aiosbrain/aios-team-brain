@@ -1,0 +1,146 @@
+/**
+ * The battery's corpus selection (PIPEFF-2 / AIO-821).
+ *
+ * WHY THE RULE IS FIXED IN ADVANCE AND THE CONTENT IS NOT CHECKED IN.
+ *
+ * EXMODEL-1 failed exactly here. This repo is public, so a checked-in fixture had to be synthetic —
+ * and two synthetic attempts scored the NEGATIVE CONTROL (the model that actually polluted the
+ * graph) as a pass, and the good model as a fail. Wrong in both directions. A third iteration would
+ * have been tuning the fixture until it agreed with the conclusion.
+ *
+ * So there is no fixture. The battery reads this install's own `items` at run time and chunks them
+ * with the projector's own algorithm. What IS fixed in advance — here, in code, before any run — is
+ * the SELECTION RULE, so the corpus cannot be hand-picked toward a result. The chosen item ids are
+ * pinned in the report so a later session is comparable rather than merely similar.
+ *
+ * ── THE BUCKETS PARTITION BY CHUNK COUNT ─────────────────────────────────────────────────────────
+ *
+ * Not a taste decision: the lever's whole thesis is that the ten predecessors behave differently by
+ * item shape (a single-chunk item's are all unrelated; a multi-chunk item's are its own document),
+ * so the corpus has to represent both, in a mix close to prod's.
+ *
+ * Two drafts of the spec left a HOLE here, and each hole was found by review rather than by running:
+ *   · draft 1: buckets "≥8 chunks" / "<600 chars" / "1-3 chunks" — 4-7-chunk items fell in none;
+ *   · draft 2: "≥8" / "1 chunk AND <600 chars" / "2-7" — a 1-chunk item of 600-2,500 chars fell in
+ *     none.
+ * Hence `bucketOf` is total over every chunk count ≥ 1, and a unit test asserts that directly.
+ */
+
+/** Mirrors lib/graph/project.ts. A divergence here silently mis-buckets the whole corpus, so the
+ *  battery prints both values in its report rather than trusting them. */
+export const CHUNK_CHARS = Number(process.env.GRAPH_CHUNK_CHARS) > 0 ? Number(process.env.GRAPH_CHUNK_CHARS) : 2500;
+export const MAX_EPISODE_CHUNKS = Number(process.env.GRAPH_MAX_EPISODE_CHUNKS) > 0 ? Number(process.env.GRAPH_MAX_EPISODE_CHUNKS) : 40;
+
+/** The small-item threshold. 898 of 2,267 items (40%) sit under this and each occupies a whole
+ *  episode at full fixed-overhead price — the population B1 exists to represent. */
+export const SMALL_ITEM_CHARS = 600;
+
+/**
+ * How many episodes an item becomes, by the projector's own rule: whitespace-only → none, otherwise
+ * ceil(chars / CHUNK_CHARS) capped at MAX_EPISODE_CHUNKS.
+ *
+ * Derived from `chunkContent`'s algorithm rather than by calling it, because the battery selects
+ * from a SQL projection of `length(body)` over thousands of rows and never needs the bodies to
+ * count. The equivalence is unit-tested against `chunkContent` itself.
+ */
+export function chunkCount(chars, blank = false) {
+  if (blank || chars <= 0) return 0;
+  return Math.min(Math.ceil(chars / CHUNK_CHARS), MAX_EPISODE_CHUNKS);
+}
+
+/**
+ * Which bucket an item belongs to. TOTAL over every chunk count ≥ 1 — see the header.
+ * A zero-chunk (whitespace-only) item is `null`: the projector skips it upstream, so it is not a
+ * hole in the partition, it is not an item the graph ever sees.
+ */
+export function bucketOf(chunks, chars) {
+  if (chunks <= 0) return null;
+  if (chunks >= 8) return "A"; // multi-chunk: the coreference case the lever must not break
+  if (chunks === 1) return chars < SMALL_ITEM_CHARS ? "B1" : "B2"; // the 40% tail, and the rest of the single-chunk population
+  return "C"; // 2-7 chunks
+}
+
+/**
+ * How many items of each bucket the corpus takes, most recent first.
+ *
+ * ── WHY `A` IS 3 AND NOT 5 — a pre-registration amendment, recorded before any session ran ───────
+ *
+ * The spec sized the corpus at ~100 episodes and DERIVED Q5's band from that: at ~100 episodes one
+ * validation retry moves the signed gap by ~1pp, so a 1.5pp validity ceiling tolerates exactly one
+ * retry of rep-to-rep difference and not two. That derivation is the only reason Q5's band is 3pp.
+ *
+ * Run against this install, `A: 5` selected 9, 8, 40, 23 and 22-chunk items — 102 episodes in bucket
+ * A alone, 153 in total. At 153 episodes one retry is 0.65pp, so the SAME pre-registered 1.5pp
+ * ceiling would silently tolerate 2.3 retries. The number would not have changed; what it MEANT
+ * would have. That is the quiet kind of drift this whole workstream is about.
+ *
+ * So the corpus size is fixed to keep the coupling, rather than the band re-derived after seeing a
+ * corpus: `A: 3` yields 57 + 15 + 5 + 31 = 108 episodes, where one retry is 0.93pp. It also moves the
+ * single-chunk episode share from 13.1% to ~18.5%, CLOSER to prod's ~17% — which matters because C1
+ * is corpus-mix-sensitive.
+ *
+ * If a future draw lands materially outside ~100-120 episodes, Q5's band must be re-derived in a
+ * committed amendment BEFORE that session runs. `selectCorpus` reports `episodes` so this is
+ * checkable rather than assumed.
+ */
+export const BUCKET_TARGETS = Object.freeze({ A: 3, B1: 15, B2: 5, C: 8 });
+
+/** The episode range Q5's pre-registered band was derived at. Outside it, the band is not valid. */
+export const EPISODE_BUDGET = Object.freeze({ min: 90, max: 120 });
+
+/**
+ * Pick the corpus from candidate rows, newest first within each bucket.
+ *
+ * `rows` must already be ordered newest-first and restricted to `access='team'` and the projectable
+ * kinds — the tier restriction is what makes the whole corpus land in ONE Graphiti group by
+ * SELECTION rather than by bypassing the projector, which is how the spec avoids a bespoke pusher.
+ *
+ * Pure and deterministic given `rows`: same input, same corpus. That is what makes "pinned item ids"
+ * a meaningful claim rather than a hopeful one.
+ */
+export function selectCorpus(rows, targets = BUCKET_TARGETS) {
+  const picked = { A: [], B1: [], B2: [], C: [] };
+  for (const r of rows) {
+    const n = chunkCount(r.chars, r.blank);
+    const b = bucketOf(n, r.chars);
+    if (!b) continue;
+    if (picked[b].length >= targets[b]) continue;
+    picked[b].push({ ...r, chunks: n, bucket: b });
+  }
+  const items = [...picked.A, ...picked.B1, ...picked.B2, ...picked.C];
+  const episodes = items.reduce((s, i) => s + i.chunks, 0);
+  const singleChunkEpisodes = items.filter((i) => i.chunks === 1).length;
+  return {
+    items,
+    byBucket: picked,
+    episodes,
+    // Reported because C1 is corpus-mix-sensitive: prod's single-chunk share is ~17% (898 of 5,166
+    // episodes), and a blended tokens-per-episode figure only transfers if the mix is close.
+    singleChunkEpisodeShare: episodes > 0 ? singleChunkEpisodes / episodes : 0,
+    shortfall: Object.entries(targets)
+      .filter(([b, want]) => picked[b].length < want)
+      .map(([b, want]) => `${b}: wanted ${want}, found ${picked[b].length}`),
+    // Q5's band was derived at ~100 episodes (one retry ≈ 1pp). Outside this range the band's
+    // MEANING changes without its number changing, so the runner must refuse rather than proceed.
+    episodeBudgetBreach:
+      episodes < EPISODE_BUDGET.min || episodes > EPISODE_BUDGET.max
+        ? `${episodes} episodes is outside the ${EPISODE_BUDGET.min}-${EPISODE_BUDGET.max} range Q5's band was derived at — re-derive it in a committed amendment first`
+        : null,
+  };
+}
+
+/**
+ * The SQL the battery runs against a read-only prod connection. Kept here beside the rule so the two
+ * cannot drift; `length(body)` rather than `body` so selection never pulls content it does not need.
+ */
+export const CANDIDATE_SQL = `
+  select id, path, kind, work_at,
+         length(body) as chars,
+         (btrim(body) = '') as blank
+    from items
+   where team_id = $1
+     and access = 'team'
+     and kind = any($2)
+   order by work_at desc, id
+   limit 2000
+`;
