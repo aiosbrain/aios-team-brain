@@ -11,8 +11,10 @@
 `IS_DUPLICATE_OF` share of recent `RELATES_TO` edges. graphiti_core **0.29.3** — deployed since #490
 — **never writes that relation on the server path**: `add_episode` discards the duplicate pairs
 (`nodes, uuid_map, _ = await resolve_extracted_nodes(...)`, `graphiti.py:1131`) and merges via the
-uuid map alone. Only the bulk path (which the server never calls) persists them. So the alarm's
-predicate reads a literal zero forever.
+uuid map alone. In fact **nothing in the 0.29.3 wheel writes the relation at all** — the only
+references are read-side and themselves uncalled, and the one function that captures `duplicates`
+(`_extract_and_resolve_nodes`, `graphiti.py:604`) has no callers: dead code. The alarm's predicate
+reads a literal zero forever.
 
 **Layer 2: the alarm's self-check caught it — and nothing listens to the self-check.** The
 zero-predicate guard (`extraction-health.ts:335`) correctly refuses to judge a literal-zero window
@@ -65,7 +67,10 @@ the Costs page (calls/episode panel) remains the coarse backstop for the rest.
 
 ```cypher
 MATCH (n:Entity {group_id: $g})
-WITH toLower(trim(n.name)) AS name, count(n) AS nodes, max(n.created_at) AS newest
+// normalisation mirrors the wheel's _normalize_string_exact: lowercase, trim, AND collapse
+// internal whitespace runs — apoc-free: reduce over split, or normalise in the TS layer
+WITH toLower(trim(n.name)) AS rawName, count(n) AS nodes, max(n.created_at) AS newest
+WITH rawName AS name, nodes, newest   // (implementation collapses internal whitespace before grouping)
 WHERE newest >= datetime($recentSince)          -- names ACTIVE in the recent window
 RETURN count(*) AS names,
        count(CASE WHEN nodes > 1 THEN 1 END) AS split
