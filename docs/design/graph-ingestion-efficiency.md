@@ -1,4 +1,4 @@
-# Graph ingestion bills ~60× the source text
+# Graph ingestion bills ~64× the source text
 
 **Status:** revised after plan review — 1 blocker (my patch target was a no-op) + a corrected baseline
 · **Date:** 2026-08-06 · **Owner:** Chetan
@@ -54,8 +54,8 @@ Stable within 3% across three days and 522 episodes — that stability is what m
 An episode carries at most `CHUNK_CHARS` = 2,500 characters ≈ **625 tokens of content**. We bill
 **~38,000 input tokens** to ingest it.
 
-**That is ~61× the content, not the 40× I first reported** — and ~10 LLM calls per episode, not the
-5.4 I derived from the mismatched window. Cost is **~$0.014/episode**, not $0.0099.
+**That is ~64× the content, not the 40× I first reported** — and ~10 LLM calls per episode, not the
+5.4 I derived from the mismatched window. Cost is **$0.0147/episode**, not $0.0099.
 
 Where it goes, per call kind (2026-08-05 06:50 batch):
 
@@ -230,8 +230,18 @@ Two refusals, so the instrument cannot lie quietly:
 - **Cross-check** — compare the `extract_nodes` count against episodes pushed in the same window from
   `ingest_runs.meta.episodes`; on material divergence, report the divergence instead of a ratio.
 
-Baseline every lever is measured against: **~38,000 input tokens/episode, ~10 calls/episode,
-~$0.014/episode**, stable within 3% over 522 episodes across three days.
+**Baseline, measured by the harness on a quiet-bounded window** (2026-08-05 06:45→09:52 UTC — John's
+30-item workspace push; drain-clean at both edges, cross-check 0% apart):
+
+```
+episodes    169            calls/episode  10.3
+input tok   6,771,879      per episode    40,070
+cost        $2.48          per episode    $0.0147
+MULTIPLE    64.1x the content a full episode carries
+```
+
+Every lever is measured against this window. It also corrects the batch's cost: **$2.48, not the
+$1.40 I first reported** — that figure came from a 2-hour window that clipped the burst's tail.
 
 A lever that cannot show movement on tokens-per-episode does not ship.
 
