@@ -1,7 +1,7 @@
 # Lever 2 — stop paying for predecessor episodes that carry nothing
 
-**Status:** spec, revised after plan review — 2 blockers + 1 HIGH that inverted a finding of mine
-· **Date:** 2026-08-06 · **Owner:** Chetan
+**Status:** **CLEAR** after four plan-review rounds — 3 blockers + 2 HIGHs, one of which inverted a
+finding of mine and reshaped the lever · **Date:** 2026-08-06 · **Owner:** Chetan
 · **Task:** `PIPEFF-2` → [AIO-821](https://linear.app/je4light/issue/AIO-821)
 · **Parent:** `PIPEFF-1` / [AIO-820](https://linear.app/je4light/issue/AIO-820) —
   [`graph-ingestion-efficiency.md`](./graph-ingestion-efficiency.md)
@@ -335,19 +335,46 @@ because a deadlock is what gets rewritten under pressure. So, per metric:
 | Q3 | ± 5 pp | 2.5 pp |
 | Q4 | 15% | 7.5% |
 | Q5 | 3 pp | **1.5 pp** (floor: at ~100 episodes one retry ≈ 1 pp, so one retry of rep-to-rep difference is tolerated and two is not — which is why Q5's band is 3 pp rather than 2) |
+
 | Q6 | 5% | 2.5% |
 | C1 | 25% | 12.5% |
 
-**This construction also guarantees every PASS window is non-empty in a valid session**: PASS needs
-the arm to beat the band by more than `spread`, and `spread ≤ ½ margin` always leaves room. That is
-the property the old ceiling lacked, and it is why the ceiling is derived from the band rather than
-chosen.
+**This construction also guarantees every PASS window is non-empty in a valid session.** For the
+two-sided bands that is the whole point: Q3's window is `(W10−5+s, W10+5−s)`, non-empty iff
+`s < 5 pp`, and the ceiling is 2.5. Q1's band is two-sided *and multiplicative* — edges `0.9M` and
+`1.1M`, window non-empty iff `s < 0.1M` — and its ceiling is `0.05M`, which scales with the **same
+`M`** as the edges, so the inequality holds identically for every `M > 0`. That is structurally
+unlike the old rule, which used the mean as a *universal* scale including for Q5, whose mean is
+legitimately ≈0 and has nothing to do with its band width; here the scale is the band, and the two
+metrics with dangerous means (Q3, Q5) carry absolute-pp ceilings. (For the one-sided bands the PASS
+region is a half-line and is non-empty for any spread — there the ceiling is doing a different job,
+namely stopping the same two reps from setting both the bar and the noise gate too coarsely.)
+
+**Why Q5's band is 3 pp and why widening it did not cost the guard its teeth.** A validation retry
+adds one attempt to C1's denominator and one metered `extract_nodes` call — ~8,400 input tokens,
+well under the ~40,000/attempt baseline — to its numerator, so retries drag tokens-per-episode
+*down*. At 100 episodes with the full 3-retry allowance:
+`(100 × 40,070 + 3 × 8,400) / 103 ≈ 39,148` — a **−2.3% artifact against a band that demands −25%**,
+about a tenth of the required movement, and the symmetric rule already requires beating 25% by more
+than W10's C1 spread on top of that. The bound is conservative in the right direction, too: retry
+prompts are *longer* than the originals (the error context is appended), which raises the added
+numerator and shrinks the artifact further.
 
 **One further sanity gate, borrowed from the module that already owns the question:** if W10's own
-duplicate share falls outside **15–45%**, the session is INVALID. `extraction-health.ts` measures a
-healthy share on this graph at **~26–35%** and treats a literal zero as evidence the *predicate* is
-broken rather than the graph clean; ~70% was the degraded model. A W10 arm outside that range is not
-a baseline worth comparing against.
+duplicate share falls outside **15–45%**, the session is INVALID — a baseline outside that range is
+not worth comparing against.
+
+- The **45%** is not padding: it is `DEDUPE_ABSOLUTE_FLOOR = 0.45` (`extraction-health.ts:284`), the
+  module's own constant, sitting above every healthy reading on record (~26–35%) and below the
+  degraded model's ~70%.
+- The **15%** has no module counterpart, and the reason it is below prod's healthy range is
+  structural rather than arbitrary: **the battery runs into a fresh, empty Neo4j**, so early episodes
+  have no existing candidates to duplicate against and the blended share over ~100 episodes sits
+  below prod's steady state by construction. If a first valid W10 arm still lands under 15%, that is
+  an **amendment case** — the number gets re-derived on the record, not silently re-padded.
+- The module also refuses to judge the share below `MIN_EDGES_FOR_DEDUPE_SIGNAL = 200` edges
+  (`:272`). **The battery adopts the same minimum-sample refusal for Q3 and Q6**; ~100 episodes
+  should clear it comfortably at prod's edge rates, so it is a cheap tripwire rather than a burden.
 
 **Arm order and outcome:**
 
@@ -383,6 +410,14 @@ needs no amendment. So the redraw joint is closed on the invalid side too:
 - **more than two consecutive invalidations** without an intervening committed amendment **block
   further sessions**. If the battery cannot complete twice running, the instrument is what needs
   fixing, and that fix belongs in this doc before more money is spent.
+
+> **These two rules are load-bearing on each other and must not be edited independently.**
+> *Consecutive* is a safe counter **only because a valid session binds**: resetting the counter
+> requires completing a valid session, and a valid session is never neutral — a valid FAIL binds
+> against the arm, a valid PASS ends the experiment. So interleaving a "sacrificial" valid run to
+> reset the count is self-defeating, and before the first valid session *consecutive* ≡ *total*. If a
+> future edit ever softens "the first valid session binds", *consecutive* silently becomes a real
+> hole and must become a total count in the same change.
 
 **Estimated spend: ≈$5–8** on the OpenRouter key (3 arms × 2 reps × ~100 episodes, cheaper per
 episode as the window shrinks). Direct-to-provider from a local brain: the `llm_usage` **rows** land
