@@ -36,10 +36,11 @@ previous_episodes = (
 
 `grep -rn 'last_n=RELEVANT_SCHEMA_LIMIT' graphiti_core/` returns **exactly one line**. The constant
 itself is defined in `search/search_utils.py` and appears there **15 times** (1 definition + 14 uses)
-as the dedupe-candidate limit and the query-time retrieval limit — so patching the *constant* would
-silently narrow search quality, a different feature. **Patch the call site.** (Both this spec's
-earlier draft and the parent spec said "~20 sites"; the number is 15, and the parent spec is
-corrected in the same PR.)
+as the **query-time retrieval limit** — so patching the *constant* would silently narrow search
+quality, a different feature. **Patch the call site.** (Both this spec's earlier draft and the parent
+spec said "~20 sites"; the number is 15. Both also called it the dedupe-candidate limit — it isn't:
+that cap is `NODE_DEDUP_CANDIDATE_LIMIT = 15` at `node_operations.py:64`. Immaterial to the
+don't-patch-the-constant decision, but the parent spec is corrected in the same PR.)
 
 ### 2. The server can never take the other branch
 
@@ -93,9 +94,38 @@ Episode names are `items:<id>` (single chunk) or `items:<id>#k` (`lib/graph/epis
 pre-`#` prefix — the Cypher query is unchanged (retrieval is not an LLM call and costs nothing worth
 optimising); only what reaches the four prompts changes.
 
-- **single-chunk item** → **zero** predecessors (better than `last_n=1`, and provably lossless: no
-  predecessor could have been the same document)
+- **single-chunk item** → **zero** predecessors (better than `last_n=1`, and **provably loses no
+  same-document context**: no predecessor could have been the same document)
 - **multi-chunk item** → all of its own prior chunks, up to 10 (the mechanism preserved intact)
+
+### What the filter *can* still cost — and why the first draft's gates were blind to it
+
+An earlier draft called the single-chunk case "provably lossless". That overclaims, and the failure
+it hides is this repo's own documented incident class. Unrelated predecessors do two real jobs:
+
+1. **Name canonicalization at extraction** — a chunk saying "John" extracts the canonical "John Smith"
+   when a predecessor named him in full; without one it extracts "John".
+2. **Dedupe judgment context** — `_resolve_with_llm` embeds full predecessor content into the
+   `dedupe_nodes` prompt (`node_operations.py:539-548`) precisely so the model can decide whether
+   extracted-"John" *is* candidate-"John Smith". With no context, the safe answer is **don't merge**.
+
+(Candidate *retrieval* is unaffected — candidates come from embedding similarity capped at
+`NODE_DEDUP_CANDIDATE_LIMIT`, `node_operations.py:418-452`. It is the *judgment* that loses context.)
+
+The resulting failure is **cross-item entity fragmentation**: one person or project as several
+parallel nodes. Check that against the direction of each band in the first draft and every one of
+them passes:
+
+| gate | what fragmentation does to it |
+|---|---|
+| entity yield ≥ 90% | fragmentation **raises** node count → PASS |
+| people recall | conditioned on the full name appearing literally, so the partial-name case is excluded from the denominator by construction → blind |
+| dupe share ≤ W10 + 5pp | a failure-to-merge emits **no** `IS_DUPLICATE_OF` edge, so the share **falls** → PASS |
+| cross-chunk continuity | within-item only; SAME preserves own-chunk context → PASS |
+
+So the first draft's battery would have cleared an arm that fragmented the graph's identity layer —
+the AIO-693 class. It applies to the `W1` arm too (1 unrelated predecessor instead of 10), so it is a
+battery gap, not a SAME-specific one. **Q3 becomes two-sided and Q6 is added below.**
 
 `last_n=1` — the parent spec's proposal — remains in the battery as the **blunt floor**: it is a
 smaller patch, and if the same-item filter fails to cut enough tokens (a corpus dominated by long
@@ -151,25 +181,46 @@ to be synthetic, and two synthetic attempts scored the *negative control* — th
 polluted the graph — as a pass and the good model as a fail. A fixture iterated until it agrees with
 the conclusion is the failure this workstream exists to prevent.
 
-The battery copies the selected `items` rows, the `members` rows (Q2 needs them) and the `teams` row
+The battery copies the selected `items` rows, the `members` rows (Q2/Q6 need them) and the `teams` row
 from prod (read-only) into the local Postgres. Content stays local; nothing is committed.
+
+**Three things beyond rows are required before a single call can flow**, named here because omitting
+one produces a stack that boots and then does nothing:
+
+1. the team's **`integrations` row copied verbatim, still encrypted**, plus `SECRETS_KEY` read from
+   Railway — so the provider key is never materialised into a file at any point;
+2. **`GRAPH_LLM_PROXY_SECRET`** set identically on the brain, the capture tap and graphiti
+   (`authorizeGraphProxy` fails **closed** when it is unset — by design);
+3. **`GRAPH_LLM_TEAM`** = the seeded team's slug, or `resolveGraphProxyTeamId` refuses rather than
+   guessing.
 
 **Selection rule, fixed in advance, buckets disjoint by construction, `access = 'team'` only:**
 
 | bucket | rule | ≈episodes |
 |---|---|---|
 | A | the **5** most recent items of **≥ 8 chunks** | ~50 |
-| B | the **20** most recent items of **exactly 1 chunk and < 600 chars** | 20 |
+| B1 | the **15** most recent items of **exactly 1 chunk, < 600 chars** | 15 |
+| B2 | the **5** most recent items of **exactly 1 chunk, ≥ 600 chars** | 5 |
 | C | the **8** most recent items of **2–7 chunks** | ~30 |
 
-≈100 episodes per rep. The `access='team'` restriction is what makes this land in **one group** — by
-selection, not by bypassing the projector (see below). The selected item ids are **pinned in the
-report** so a later run is comparable rather than merely similar.
+The four buckets **partition** the corpus by chunk count — an earlier draft's "1 chunk *and* <600
+chars" against "2–7 chunks" left a 1-chunk-but-large item in no bucket at all, the same class of hole
+as the 4–7-chunk gap before it.
 
-**Q2 power extension, deterministic:** if the corpus yields fewer than **15** literal member-name
-occurrences, extend bucket C by the next most-recent qualifying items, up to **+10**, until it does.
-If it still does not, Q2 is **UNDERPOWERED**, which counts as a FAIL (see the decision function —
-the conservative default is the point).
+≈100 episodes per rep, of which ~20% are single-chunk-item episodes — against **~17% in prod**
+(898 of 5,166). That match is what makes the blended C1 transferable, and C1 is corpus-mix-sensitive,
+so it is stated rather than left implicit.
+
+The `access='team'` restriction is what makes this land in **one group** — by selection, not by
+bypassing the projector (see below). The selected item ids are **pinned in the report** so a later
+run is comparable rather than merely similar.
+
+**Q2/Q6 power extension, deterministic:** if the corpus yields fewer than **15** literal member-name
+occurrences (Q2), or fewer than **5** member names present in ≥2 distinct items (Q6), extend bucket C
+by the next most-recent qualifying items, up to **+10**, until it does. If it still does not, that
+metric is **UNDERPOWERED**, which **invalidates the session** — it does not count as a FAIL. A corpus
+that cannot produce enough names is a power failure, not evidence of a regression, and the spec
+already draws that distinction for harness refusals.
 
 ### The push is the real projector run path
 
@@ -199,15 +250,30 @@ against this install's own content.
 |---|---|---|---|
 | Q1 | **entity yield** | `Entity` nodes per episode | ≥ **90%** of W10 |
 | Q2 | **people recall** | member names appearing literally in a chunk's text, found as an `Entity` in that group | ≥ **95%** of W10 **and** at most **1** person lost outright |
-| Q3 | **duplicate pollution** | `IS_DUPLICATE_OF` share of edges, via **`lib/graph/extraction-health.ts`'s own Cypher predicate** (pinned by `test/guards/dedupe-predicate-pinned.test.ts`) | ≤ W10 **+ 5 pp** |
-| Q4 | **cross-chunk entity continuity** | bucket A + C items only: share of an item's entities appearing in ≥ 2 of its chunks | ≥ **85%** of W10 |
+| Q3 | **duplicate pollution, TWO-SIDED** | `IS_DUPLICATE_OF` share of edges, via **`lib/graph/extraction-health.ts`'s own Cypher predicate** (pinned by `test/guards/dedupe-predicate-pinned.test.ts`) | within **± 5 pp** of W10 — a *fall* is as disqualifying as a rise |
+| Q4 | **cross-chunk entity continuity** | buckets A + C only: share of an item's entities appearing in ≥ 2 of its chunks | ≥ **85%** of W10 |
 | Q5 | **signed retry gap** | `(extract_nodes − episodesPushed) / episodesPushed`, in pp — the harness's `signed`, normalised | must not rise by more than **2 pp** vs W10 |
+| Q6 | **cross-item entity convergence** | over member names appearing literally in chunks of **≥ 2 distinct items**: distinct `Entity` nodes carrying that name ÷ distinct names matched | ≤ **105%** of W10 |
 | C1 | **input tokens per episode** | the harness | must fall by ≥ **25%** vs W10 |
 
-**Q4 is the metric that tests the actual mechanism** — Q1–Q3 would all stay green while cross-chunk
-references silently stopped resolving. Q2's two clauses are both floors and the stricter binds; at
-realistic n the 95% clause is usually the operative one, and the "1 person" clause only bites on a
-small denominator.
+**Q4 and Q6 are the two metrics that test mechanisms rather than symptoms.** Q4 catches the loss of
+*within-document* context — Q1–Q3 would all stay green while cross-chunk references stopped
+resolving. Q6 catches the loss of *cross-item* dedupe judgment described above, which is the only
+gate whose direction is right for fragmentation; it deliberately reuses Q2's member-name machinery
+rather than inventing a second identity notion.
+
+**Q3's lower bound is not symmetry for its own sake.** `extraction-health.ts` already treats an
+anomalously *low* duplicate share as suspect, and failure-to-merge is exactly how the share falls
+while the graph gets worse.
+
+Q2's two clauses are both floors and the stricter binds; at realistic n the 95% clause is usually the
+operative one, and the "1 person" clause only bites on a small denominator.
+
+**Q4's per-chunk attribution is real, not assumed:** 0.29.3 persists `(:Episodic)-[:MENTIONS]->(:Entity)`
+per episode (`models/edges/edge_db_queries.py:22`), built in `_process_episode_data` over the
+**resolved** (post-dedupe, canonical) nodes — so Q4 measures whether resolution converged across
+chunks, which is what it is for. The item id must be parsed with `itemIdFromEpisodeName`'s exact
+logic, **never** `STARTS WITH 'items:<id>'`, which would swallow `items:123` into `items:12`.
 
 ### The decision function — total, and fixed before any number exists
 
@@ -220,19 +286,30 @@ for a metric is the **mean of its two reps**. Ratios use the mean of W10's two r
 W10's own **spread** — `|rep1 − rep2|`, expressed in the same units as the band — is the noise
 estimate.
 
-**Per metric, exactly one of:**
+**Per metric, exactly one of — and the rule is SYMMETRIC about the band:**
 
-- **PASS** — the arm's mean meets the band.
+- **PASS** — the arm's mean beats the band by **more than** W10's spread.
 - **FAIL** — the arm's mean misses the band by **more than** W10's spread.
-- **INCONCLUSIVE** — the arm's mean misses the band by **no more than** W10's spread.
+- **INCONCLUSIVE** — the arm's mean lands **within ± spread** of the band.
 
 **INCONCLUSIVE counts as FAIL for shipping.** The burden of proof is on the change: a metric we
-cannot distinguish from a regression is not evidence that there is none. Deciding this now is what
-stops it from being decided later, in the direction I want.
+cannot distinguish from a regression is not evidence that there is none.
+
+**Why the PASS side has to carry the spread too.** An earlier draft required only "the mean meets the
+band", which made the noise estimate irrelevant to every above-band outcome — and since the bands are
+*multiplicative in W10's mean*, that let noise work in the shipping direction. Worked example: true
+W10 entity yield 10.0/episode, SAME's true value 8.5 (a real 15% regression that should fail the 90%
+band). W10's reps come in at 10.2 and 6.0 — one rep quietly degraded by a provider brownout that
+completes every episode and so trips none of the invalidation conditions. W10 mean 8.1 → band 7.29 →
+SAME's 8.5 **passes**. More noise, easier shipping — the exact opposite of what the Risks section
+claims. Under the symmetric rule the band is 7.29 + 4.2 = 11.5 and SAME correctly fails.
+
+**Belt and braces:** if W10's spread on any metric exceeds **25% of its own mean**, the session is
+**INVALID** — that is not a result, it is a broken instrument.
 
 **Arm order and outcome:**
 
-1. Evaluate **SAME**. All of Q1–Q5 and C1 PASS → **SAME ships**.
+1. Evaluate **SAME**. All of Q1–Q6 and C1 PASS → **SAME ships**.
 2. Else evaluate **W1** on the identical rule → **W1 ships**.
 3. Else **the lever does not ship**, and the negative result is committed to this doc. Cutting the
    context is then off the table until the `previous_episode_uuids` alternative is spec'd (below).
@@ -240,11 +317,18 @@ stops it from being decided later, in the direction I want.
 C1's ≥25% applies identically to every candidate arm: a quality-clean arm that barely moves tokens
 does not justify a deploy of this service (see *Rollout*).
 
-**Rerun policy.** "Most recent" re-draws the corpus each session, so nothing structurally binds me to
-the first result. Therefore: **every started session's outcome is appended to this doc**, pass or
-fail, with its pinned item ids. A session may be marked *invalidated* only for a pre-defined infra
-reason — a harness refusal, an unavailable cross-check, or an arm that failed to complete every
-episode — never for its numbers.
+**Rerun policy — and which session BINDS.** "Most recent" re-draws the corpus each session, so
+logging reruns makes multiplicity *visible* without closing it: running sessions until one passes and
+shipping on the passer would still be legal under a log-everything rule. So:
+
+- **every started session's outcome is appended to this doc**, pass or fail, with its pinned item ids;
+- **the first valid session's verdict binds.** A further session may only follow a **committed
+  amendment to this spec** stating what is being changed and why;
+- shipping requires the latest valid session to pass **and** no prior valid session to have failed the
+  same arm without that amendment on the record;
+- a session is *invalidated* only for a **pre-defined** reason — a harness refusal, an unavailable
+  cross-check, an arm that failed to complete every episode, an UNDERPOWERED Q2/Q6, or a W10 spread
+  above 25% of its mean — **never for its numbers**.
 
 **Estimated spend: ≈$5–8** on the OpenRouter key (3 arms × 2 reps × ~100 episodes, cheaper per
 episode as the window shrinks). Direct-to-provider from a local brain: the `llm_usage` **rows** land
@@ -272,10 +356,15 @@ the edit and every gate still passes against the pre-install file — the preced
 comment at `graphiti/Dockerfile:102`. A final assertion RUN after **all** installs re-greps the
 post-state, so ordering cannot silently regress.
 
+**The sed that ships is the sed that was measured, byte for byte** — lifted from the arm's image and
+recorded in the session log, not re-derived at ship time. This matters more for `SAME` than for `W1`:
+`W1` is a one-argument swap, while `SAME` is a multi-line Python insertion, and a "cleaned up"
+re-derivation is precisely how a measured result gets attached to an unmeasured patch.
+
 ```
 F=/app/.venv/lib/python3.12/site-packages/graphiti_core/graphiti.py
 test "$(grep -c 'last_n=RELEVANT_SCHEMA_LIMIT,' "$F")" = "1"          # pre-state + uniqueness
-sed -i '<the arm that won>' "$F"
+sed -i '<the winning arm's sed, VERBATIM from the image the battery ran>' "$F"
 grep -q '<post-state marker, incl. a PIPEFF-2 comment>' "$F"
 python -c "import ast; ast.parse(open('$F').read())"
 # the constant's own uses are untouched — hardcoded, not "unchanged":
@@ -326,8 +415,13 @@ window after the deploy, with Q1–Q5 unmoved on the battery — and the AIO-693
   not every shape of content. Mitigated by the AIO-693 alarm as the live backstop and by the recorded
   rollback path — not by claiming the battery is exhaustive.
 - **Two reps is a thin noise estimate.** It bounds noise crudely; it cannot prove a small regression
-  absent. The INCONCLUSIVE-counts-as-FAIL rule is what makes a thin estimate safe rather than
-  convenient: thin noise makes shipping *harder*, not easier.
+  absent. The **symmetric** PASS/FAIL/INCONCLUSIVE rule is what makes a thin estimate safe rather than
+  convenient: because the spread widens the band on *both* sides, more noise is strictly anti-ship.
+  (The asymmetric version in the first draft made this sentence false — bands are multiplicative in
+  W10's mean, so a degraded W10 rep *lowered* the bar. That is why the rule is symmetric.)
+- **A metric can still be blind to a failure nobody enumerated.** Q6 exists because the first draft's
+  five gates all pointed the wrong way for entity fragmentation. There is no argument that Q1–Q6 are
+  exhaustive — only that each named failure mode now has a gate whose direction is right for it.
 - **The same-item filter changes behaviour for non-`items:` episodes** (e.g. `correction:<arc_id>`
   writeback episodes), which would get zero predecessors. That is the intended semantics — a
   correction episode has no document to be a chunk of — but it must be stated, and the Phase C PR

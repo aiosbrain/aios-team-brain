@@ -26,7 +26,7 @@ Two consequences beyond the patch target:
 - **The real window is 10 previous episodes, not 3.** That is why an `extract_nodes` call averages
   8,360 input tokens for a 625-token episode: ~6,250 of it is the ten predecessors.
 - **The patch target is the call site** (`graphiti.py:1090`, `last_n=RELEVANT_SCHEMA_LIMIT` →
-  `last_n=1`), not the constant. `RELEVANT_SCHEMA_LIMIT` is *also* the dedupe-candidate limit and the
+  `last_n=1`), not the constant. `RELEVANT_SCHEMA_LIMIT` is *also* the
   query-time retrieval limit across **15 lines** in `search_utils.py` (1 definition + 14 uses);
   patching it at its definition would silently narrow retrieval quality too. (Corrected from "~20
   call sites" — counted, not estimated, in PIPEFF-2.)
@@ -176,8 +176,9 @@ so rather than left contradicting this.
 `last_n=1`, as a `sed` in `graphiti/Dockerfile` (precedent: the same file constructs
 `OpenAIGenericClient` by sed; note the `DEFAULT_MAX_TOKENS` sed it once had is now an assert-only
 grep, so that half of the precedent no longer stands). `RELEVANT_SCHEMA_LIMIT` is *also* the
-dedupe-candidate limit and the query-time retrieval limit across **15 lines** in `search_utils.py` —
-patching its definition would silently narrow retrieval quality, which is a different feature.
+query-time retrieval limit across **15 lines** in `search_utils.py` — patching its definition would
+silently narrow retrieval quality, which is a different feature. (It is NOT the dedupe-candidate
+limit; that is `NODE_DEDUP_CANDIDATE_LIMIT = 15`. Corrected in PIPEFF-2.)
 
 The window is carried by **four** call kinds (`extract_nodes`, `extract_edges`, `dedupe_nodes` and
 `node_summaries_batch` — **not** attribute extraction, see the correction above), so at ~6,250 tokens
