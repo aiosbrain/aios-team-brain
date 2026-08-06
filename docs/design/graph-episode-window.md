@@ -596,6 +596,79 @@ window after the deploy, with Q1–Q6 unmoved on the battery — and the AIO-693
 
 _(every started session appended here, pass or fail — see Rerun policy)_
 
+### Session 1 — 2026-08-06, **INVALID (pre-defined causes), and it caught two instrument failures**
+
+Three isolated stacks (own Postgres/Neo4j/graphiti/tap/brain per arm), identical 108-episode corpus
+(hash-verified), pushed through the real projector path (`ingest_runs.meta.episodes = 108` per arm,
+cross-check **exact** on every completed rep). Rep 1 completed on all three arms; **rep 2 was
+deliberately not run** once the session's fate was determined — the invalidity causes are properties
+of the corpus and the library, identical for every future rep, and spending the remainder on a
+known-INVALID session serves nothing.
+
+**Partial metrics, appended per the rerun policy** (rep 1 of each arm; W1 numbers added on drain):
+
+| arm | landed | Q1 (entities/ep) | Q4 (continuity) | Q3 (dupe share) | extract attempts | cost |
+|---|---|---|---|---|---|---|
+| W10 | 108/108 | 6.33 | 0.125 | **0** / 635 edges | 108 (cross-check exact) | $1.12 |
+| SAME | 108/108 | 6.25 | 0.122 | **0** / 615 edges | 108 (cross-check exact) | $0.90 |
+| W1 | — completed after disposition; recorded in session 2 | | | | | ~$0.85 |
+
+**Invalidity cause 1 — Q2/Q6 UNDERPOWERED, and no redraw can fix it.** The corpus yields **3**
+member names (floor: 15) and **1** name in ≥2 items (floor: 5). The roster explains why: this team
+has exactly **one** multi-word human name that appears in content at all ("John Ellison", 8 items) —
+the rest are connector service accounts ("GitHub Sync", "Slack Connector"), single-word names, or
+people absent from the content. The power failure is the *evidence definition meeting this install's
+roster*, not the draw — the spec's own corpus-extension rule could never reach the floors.
+
+**Invalidity cause 2 — Q3 is structurally zero on graphiti 0.29.3, discovered live.** Both arms read
+0 duplicate edges over 600+ `RELATES_TO` edges. Not fragmentation, and not the fresh-graph effect the
+15% floor allowed for: **0.29.3's `add_episode` discards the duplicate pairs** —
+`nodes, uuid_map, _ = await resolve_extracted_nodes(...)` at `graphiti.py:1131` — merging via the
+uuid map and never writing `IS_DUPLICATE_OF` on the server path. Q3 ≡ 0 on every 0.29.3 graph, and
+the 15–45% session gate can never pass. **Prod impact, filed as `ALARMFIX-1`:** the AIO-693
+dedupe-pollution alarm has been sitting in `judgeable: false` since the #490 upgrade — its own
+zero-predicate self-check caught the removal, so it is not lying, but it is silently disabled and
+nothing pages on unjudgeable-persisting.
+
+What the partials *suggest* but do not decide (single reps, INVALID session): SAME's within-document
+continuity ratio vs W10 is ~0.97 — consistent with the tie-rank guarantee that SAME preserves own
+chunks — and its rep cost ran ~19% under W10's. The amendment below is what makes such numbers
+judgeable.
+
+### Amendment 2 — 2026-08-06, before any session-2 readout: the v2 gates
+
+Committed while session 1's graphs are intact and before any new metric is computed on them.
+
+- **Q3 dropped.** Its evidence (`IS_DUPLICATE_OF`) does not exist on 0.29.3. Its fragmentation duty
+  transfers to Q7 (below) and to Q1's upper bound (unchanged).
+- **Q6 (member-name convergence) replaced by Q7 — recurring-name convergence, incumbent-referenced.**
+  Universe **U** = case-normalised names of `Entity` nodes in the **union of W10's reps** whose name
+  appears literally (case-insensitive) in **≥ 2 distinct corpus items' bodies**, length ≥ 3,
+  non-numeric. Q7 per rep = (Σ over U of distinct nodes carrying that name) ÷ |U|. Band ≤ **105% of
+  W10**, spread rule unchanged, ceiling 2.5%. Self-calibrating: presence is checked against source
+  text (no answer key), and the universe is fixed by the incumbent — the differential question "is
+  this worse than what we have", asked over the names the incumbent itself found recurring. The
+  member-name restriction is gone because this install's roster cannot power it; recurring projects,
+  tools and people carry the same fragmentation signal. **Power floor: |U| ≥ 15**, else UNDERPOWERED
+  → INVALID (replaces the dead 15–45% dupe-share gate).
+- **Q2's ratio clause dropped; its count clause survives with full force.** With one qualifying name
+  a recall ratio is meaningless, but the noise-free floor still binds: any qualifying member name
+  present in ≥ 2 items (today: John Ellison) that is absent from a shipping arm's graph in **either
+  rep** → FAIL. Unchanged implementation (`personsLost`, max of reps).
+- **Q1, Q4, Q5, C1 unchanged.** Q1's upper bound remains the catch-all for variant-form inflation
+  ("John" beside "John Smith"), which Q7 structurally cannot see — same blindness Q6 had, same
+  cover.
+- **Session 2 reuses session 1's physical runs as its rep 1.** The amendment changes *readout code
+  only*: pushes, extractions, graphs, `llm_usage` and captures are untouched artifacts, every band
+  constant has been frozen since before the first run, and the readout is a total function — the
+  interim partials above cannot move it. A fresh rep 2 per arm completes the session. *(Posed to the
+  plan reviewer as an explicit question, not assumed — if the reviewer finds a tuning joint in
+  reuse, session 2 runs all six reps fresh; the budget covers it.)*
+
+## Session log
+
+_(every started session appended here, pass or fail — see Rerun policy)_
+
 | session | corpus item ids | Phase A result | arm outcomes | verdict |
 |---|---|---|---|---|
-| — | — | not yet run | — | — |
+| 1 | pinned in `/tmp/gwb` seed output & session-2 record | structural half in spec; paid half harvested via captures | rep 1 ×3 completed; rep 2 cancelled | **INVALID** — Q2/Q6 underpowered (roster), Q3 evidence absent on 0.29.3 |
