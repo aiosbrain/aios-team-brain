@@ -23,7 +23,7 @@ import { blankBodySql } from "../../scripts/graph-window-battery/corpus.mjs";
 describe("blankBodySql agrees with chunkContent about which bodies yield no episodes", () => {
   // Each case is one whitespace shape. Plain spaces are the case both predicates get right; the
   // others are the ones only the regex gets right.
-  const blankCases = ["", " ", "   ", "\n", "\t", "  \n\t  ", "\r\n", ""];
+  const blankCases = ["", " ", "   ", "\n", "\t", "  \n\t  ", "\r\n", "\v\f"];
   const nonBlankCases = ["a", " a ", "\n#\n", "0"];
 
   it("marks every whitespace-only body blank, matching chunkContent's empty output", async () => {
@@ -42,14 +42,19 @@ describe("blankBodySql agrees with chunkContent about which bodies yield no epis
     }
   });
 
-  it("proves the predicate this replaced was WRONG — btrim strips spaces only", async () => {
-    // Non-vacuity: if this ever starts agreeing, the case above stopped discriminating and the two
-    // tests together no longer prove the fix.
-    const { rows } = await runSql<{ old_says_blank: boolean; js_says_blank: boolean }>(
-      `select (btrim($1::text) = '') as old_says_blank, true as js_says_blank`,
-      ["  \n\t  "]
-    );
-    expect(rows[0].old_says_blank).toBe(false);
-    expect(chunkContent("  \n\t  ")).toEqual([]);
+  it("keeps at least one SHARED case that separates the new predicate from the old one", async () => {
+    // Non-vacuity, bound to the fixture above rather than to its own literal. An earlier version
+    // hardcoded "  \n\t  " here, so pruning every discriminating shape out of `blankCases` would
+    // have left this green while the suite stopped proving anything — which is exactly what it
+    // claims to prevent.
+    const discriminating: string[] = [];
+    for (const body of blankCases) {
+      const { rows } = await runSql<{ old_blank: boolean }>(`select (btrim($1::text) = '') as old_blank`, [body]);
+      if (!rows[0].old_blank) discriminating.push(body);
+    }
+    expect(discriminating.length, "no shared case separates btrim from the regex any more").toBeGreaterThan(0);
+    // …and every one of them is genuinely blank to the projector, so the disagreement is the old
+    // predicate's fault rather than the fixture's.
+    for (const body of discriminating) expect(chunkContent(body)).toEqual([]);
   });
 });

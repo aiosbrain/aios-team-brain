@@ -124,11 +124,18 @@ export function judgeMetric(key, arm, incumbent, extras = {}) {
   if (!Array.isArray(arm) || arm.length !== 2 || !Array.isArray(incumbent) || incumbent.length !== 2) {
     throw new Error(`${key}: both arms need exactly 2 reps — the spread IS the second rep`);
   }
-  // An absolute clause whose input was simply not supplied must NOT read as satisfied. Omission
-  // defaulting to "fine" is the class of fake this repo has already been burned by, and it would be
-  // worst here — a gate that disappears when the runner forgets to measure it.
-  if (m.absolute && extras[m.absolute.input] === undefined) {
-    throw new Error(`${key}: needs \`${m.absolute.input}\` — the clause cannot be satisfied by omitting its input`);
+  // An absolute clause's input must be a real measurement. Checking only `=== undefined` was not
+  // enough: `null > 1` and `NaN > 1` are both FALSE, so a failed query coercing to null — the exact
+  // omission-shaped value the guard exists to refuse — sailed through as a pass. The clause must be
+  // impossible to satisfy by not measuring it, in every shape "not measured" can take.
+  if (m.absolute) {
+    const v = extras[m.absolute.input];
+    if (!Number.isInteger(v) || v < 0) {
+      throw new Error(
+        `${key}: \`${m.absolute.input}\` must be a non-negative integer, got ${JSON.stringify(v)} — ` +
+          `the clause cannot be satisfied by failing to measure it`
+      );
+    }
   }
   const armMean = mean(arm[0], arm[1]);
   const baseMean = mean(incumbent[0], incumbent[1]);
@@ -202,14 +209,21 @@ export function judgeMetric(key, arm, incumbent, extras = {}) {
  * Every trigger here is pre-defined and none of them is "the numbers came out wrong" — that
  * distinction is the difference between a rule and an excuse.
  */
-export function assessSession({ incumbent, dupeShare, dupeEdges, underpowered = [], armsCompleted, harnessRefused, crossCheckAvailable }) {
+export function assessSession({ incumbent, dupeShare, dupeEdges, underpowered, armsCompleted, harnessRefused, crossCheckAvailable }) {
   // REQUIRED, not defaulted-permissive. A default of `armsCompleted = true` means a runner that
   // forgets to pass it silently disarms that validity trigger — the same "omission canonicalized as
   // fine" class as the absolute clause above, in the one file whose job is that the readout cannot
   // be quietly softened. Throw instead: a missing safety input is a bug, not a pass.
-  for (const [k, v] of Object.entries({ dupeShare, dupeEdges, armsCompleted, harnessRefused, crossCheckAvailable })) {
+  for (const [k, v] of Object.entries({ dupeShare, dupeEdges, underpowered, armsCompleted, harnessRefused, crossCheckAvailable })) {
     if (v === undefined || v === null) throw new Error(`assessSession: \`${k}\` is required — omitting it must not read as valid`);
   }
+  // NaN is the other shape of "not measured", and it slipped BOTH dupe gates: `NaN < 0.15` and
+  // `NaN > 0.45` are each false, so a broken query produced a clean bill of health. Same reason the
+  // absolute clause above rejects it.
+  for (const [k, v] of Object.entries({ dupeShare, dupeEdges })) {
+    if (!Number.isFinite(v)) throw new Error(`assessSession: \`${k}\` must be a finite number, got ${JSON.stringify(v)}`);
+  }
+  if (!Array.isArray(underpowered)) throw new Error("assessSession: `underpowered` must be an array — defaulting it to [] reads as \"every metric is powered\"");
   const problems = [];
 
   if (harnessRefused) problems.push("the cost harness refused the window — drain or cross-check");

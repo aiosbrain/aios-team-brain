@@ -27,7 +27,8 @@
  */
 
 /**
- * A byte-for-byte replica of `resolvePositiveInt` from `lib/util/env`, which the projector uses for
+ * An extensionally-equivalent replica of `resolvePositiveInt` from `lib/util/env` — pinned by test,
+ * not by assertion, which the projector uses for
  * these same two knobs. A .mjs script cannot import the TypeScript, so the logic is duplicated — and
  * a unit test pins the two against each other across the cases where a loose parse diverges
  * (`"0.5"`, `"Infinity"`, `""`, `"abc"`, `"-5"`).
@@ -196,14 +197,26 @@ export function verifyCorpus(selection, bodyById, chunkFn) {
   const items = selection.items.map((it) => {
     const body = bodyById.get(it.id);
     if (body === undefined) throw new Error(`verifyCorpus: no body supplied for ${it.id}`);
-    return { ...it, estimatedChunks: it.chunks, chunks: chunkFn(body).length };
+    const chunks = chunkFn(body).length;
+    // Re-bucket on the TRUE count too. Returning verified `items` beside an estimated `byBucket`
+    // would hand a reader stale numbers while looking verified — and Q4's population is spec'd as
+    // "buckets A + C", so a truly-2-chunk item estimated at 1 would sit in B2 and be silently
+    // excluded from the very metric that measures cross-chunk continuity.
+    return { ...it, estimatedChunks: it.chunks, chunks, bucket: bucketOf(chunks, it.chars) ?? it.bucket };
   });
   const episodes = items.reduce((s, i) => s + i.chunks, 0);
   const single = items.filter((i) => i.chunks === 1).length;
   const divergent = items.filter((i) => i.chunks !== i.estimatedChunks);
+  const byBucket = { A: [], B1: [], B2: [], C: [] };
+  for (const it of items) if (byBucket[it.bucket]) byBucket[it.bucket].push(it);
+
   return {
     ...selection,
     items,
+    byBucket,
+    shortfall: Object.entries(BUCKET_TARGETS)
+      .filter(([b, want]) => byBucket[b].length < want)
+      .map(([b, want]) => `${b}: wanted ${want}, found ${byBucket[b].length}`),
     episodes,
     singleChunkEpisodeShare: episodes > 0 ? single / episodes : 0,
     // Surfaced, never swallowed: a divergence means the SQL estimate and the projector disagree, and

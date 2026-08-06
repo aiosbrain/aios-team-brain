@@ -41,7 +41,7 @@ const cleanArm = {
   C1: [24000, 24000], // a 40% fall, comfortably past the 25% C1 demands
 };
 
-const session = { incumbent, dupeShare: 0.305, dupeEdges: 900, armsCompleted: true, harnessRefused: false, crossCheckAvailable: true };
+const session = { incumbent, dupeShare: 0.305, dupeEdges: 900, underpowered: [], armsCompleted: true, harnessRefused: false, crossCheckAvailable: true };
 
 const run = (over: Record<string, unknown> = {}, armOver: Record<string, number[]> = {}) =>
   decide({
@@ -236,6 +236,7 @@ describe("the spread ceiling is per-metric and in BAND units, not a fraction of 
         incumbent: { [key]: base },
         dupeShare: 0.305,
         dupeEdges: 900,
+        underpowered: [],
         armsCompleted: true,
         harnessRefused: false,
         crossCheckAvailable: true,
@@ -347,12 +348,34 @@ describe("assessSession refuses to run on missing safety inputs", () => {
    * absolute-clause omission above, in the file whose whole job is that the readout cannot be
    * quietly softened.
    */
-  it.each(["dupeShare", "dupeEdges", "armsCompleted", "harnessRefused", "crossCheckAvailable"])(
+  it.each(["dupeShare", "dupeEdges", "underpowered", "armsCompleted", "harnessRefused", "crossCheckAvailable"])(
     "throws when %s is omitted rather than treating it as fine",
     (field) => {
-      const full = { incumbent, dupeShare: 0.305, dupeEdges: 900, armsCompleted: true, harnessRefused: false, crossCheckAvailable: true };
+      const full = { incumbent, dupeShare: 0.305, dupeEdges: 900, underpowered: [], armsCompleted: true, harnessRefused: false, crossCheckAvailable: true };
       const { [field as keyof typeof full]: _omitted, ...rest } = full;
       expect(() => assessSession(rest)).toThrow(new RegExp(field));
     }
   );
+});
+
+
+describe("\"not measured\" has more shapes than undefined, and none of them may pass", () => {
+  /**
+   * The first version of these guards checked only `=== undefined`. But `null > 1` and `NaN > 1` are
+   * both FALSE, so a failed query coercing to null — the exact omission-shaped value the guard exists
+   * to refuse — sailed through as a clean pass. Probed and confirmed before this fix.
+   */
+  it.each([[null], [NaN], [1.5], [-1], ["2"], [undefined]])("refuses personsLost=%s", (bad) => {
+    expect(() => judgeMetric("Q2", cleanArm.Q2, incumbent.Q2, { personsLost: bad })).toThrow(/personsLost/);
+  });
+
+  it.each([["dupeShare"], ["dupeEdges"]])("refuses a NaN %s, which slipped BOTH sanity gates", (field) => {
+    const full = { incumbent, dupeShare: 0.305, dupeEdges: 900, underpowered: [], armsCompleted: true, harnessRefused: false, crossCheckAvailable: true };
+    expect(() => assessSession({ ...full, [field]: NaN })).toThrow(/finite/);
+  });
+
+  it("refuses a non-array underpowered — defaulting it to [] read as 'every metric is powered'", () => {
+    const full = { incumbent, dupeShare: 0.305, dupeEdges: 900, underpowered: [], armsCompleted: true, harnessRefused: false, crossCheckAvailable: true };
+    expect(() => assessSession({ ...full, underpowered: "Q6" })).toThrow(/underpowered/);
+  });
 });
