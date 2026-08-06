@@ -250,13 +250,16 @@ export function assessSession({ incumbent, dupeShare, dupeEdges, underpowered, a
     }
   }
 
-  // The incumbent has to be a graph worth comparing against. 0.45 is extraction-health.ts's own
-  // DEDUPE_ABSOLUTE_FLOOR; the 0.15 floor is below prod's healthy ~26-35% on purpose, because the
-  // battery runs into an EMPTY Neo4j where early episodes have nothing to duplicate against.
+  // The incumbent has to be a graph worth comparing against. 0.45 was extraction-health.ts's
+  // DEDUPE_ABSOLUTE_FLOOR when this battery ran (ALARMFIX-1 later retired the edge-share predicate
+  // for the 0.29.3 name census; the value stays FROZEN here as this instrument's own constant —
+  // the battery measures the 0.13.2-era IS_DUPLICATE_OF share, which is what its corpus emits).
+  // The 0.15 floor is below prod's healthy ~26-35% on purpose, because the battery runs into an
+  // EMPTY Neo4j where early episodes have nothing to duplicate against.
   if (dupeShare < DUPE_SANE_MIN || dupeShare > DUPE_SANE_MAX) {
     problems.push(`incumbent duplicate share ${(dupeShare * 100).toFixed(1)}% outside the sane ${DUPE_SANE_MIN * 100}-${DUPE_SANE_MAX * 100}% range`);
   }
-  // extraction-health.ts refuses to judge the share below this many edges; so does this.
+  // extraction-health.ts refused to judge the old share below this many edges; so does this.
   if (dupeEdges < MIN_EDGES_FOR_SHARE) {
     problems.push(`only ${dupeEdges} edges — below the ${MIN_EDGES_FOR_SHARE}-edge minimum for a share signal`);
   }
@@ -264,11 +267,11 @@ export function assessSession({ incumbent, dupeShare, dupeEdges, underpowered, a
   return { valid: problems.length === 0, problems };
 }
 
-/** Mirrors extraction-health.ts's DEDUPE_ABSOLUTE_FLOOR; see assessSession. */
+/** Froze extraction-health.ts's retired DEDUPE_ABSOLUTE_FLOOR (ALARMFIX-1); see assessSession. */
 export const DUPE_SANE_MAX = 0.45;
 /** Below prod's healthy ~26-35% on purpose — the battery's Neo4j starts empty. */
 export const DUPE_SANE_MIN = 0.15;
-/** Mirrors extraction-health.ts's MIN_EDGES_FOR_DEDUPE_SIGNAL. */
+/** Froze extraction-health.ts's retired MIN_EDGES_FOR_DEDUPE_SIGNAL (ALARMFIX-1). */
 export const MIN_EDGES_FOR_SHARE = 200;
 
 /**
