@@ -72,6 +72,14 @@ export function chunkCount(chars, blank = false) {
  * A zero-chunk (whitespace-only) item is `null`: the projector skips it upstream, so it is not a
  * hole in the partition, it is not an item the graph ever sees.
  */
+/**
+ * Episode count for a body already in memory, using the JS string length — which is what
+ * `chunkContent` slices by, and is exactly the number Postgres `length()` cannot give (it counts
+ * characters, not UTF-16 units). For plain-node callers that cannot import the TypeScript.
+ * Equivalent to `chunkContent(body).length`, pinned by unit test.
+ */
+export const countFromBody = (body) => chunkCount((body ?? "").length, !(body ?? "").trim());
+
 export function bucketOf(chunks, chars) {
   if (chunks <= 0) return null;
   if (chunks >= 8) return "A"; // multi-chunk: the coreference case the lever must not break
@@ -190,14 +198,15 @@ export const PROJECTABLE_KINDS = ["transcript", "deliverable", "decision", "task
  * in the neighbouring bucket is a minor sampling effect. But the ~31 selected items are few enough
  * to chunk for real, so the number that actually matters is exact rather than derived.
  *
- * `chunkFn` is injected so the caller passes the projector's own `chunkContent` rather than this
- * module re-deriving it a second time.
+ * `countFn` is injected rather than hardcoded. Callers that can load the TypeScript (the tests) pass
+ * the projector's own `chunkContent` directly; a plain-node caller passes `countFromBody` below,
+ * which is the same algorithm over the same input and is pinned against `chunkContent` by unit test.
  */
-export function verifyCorpus(selection, bodyById, chunkFn) {
+export function verifyCorpus(selection, bodyById, countFn) {
   const items = selection.items.map((it) => {
     const body = bodyById.get(it.id);
     if (body === undefined) throw new Error(`verifyCorpus: no body supplied for ${it.id}`);
-    const chunks = chunkFn(body).length;
+    const chunks = countFn(body);
     // Re-bucket on the TRUE count too. Returning verified `items` beside an estimated `byBucket`
     // would hand a reader stale numbers while looking verified — and Q4's population is spec'd as
     // "buckets A + C", so a truly-2-chunk item estimated at 1 would sit in B2 and be silently

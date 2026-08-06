@@ -11,6 +11,7 @@ import {
   MAX_EPISODE_CHUNKS,
   EPISODE_BUDGET,
   PROJECTABLE_KINDS,
+  countFromBody,
 } from "../scripts/graph-window-battery/corpus.mjs";
 import { chunkContent, PROJECTABLE_KINDS as REAL_PROJECTABLE_KINDS } from "../lib/graph/project";
 import { resolvePositiveInt as realResolvePositiveInt } from "../lib/util/env";
@@ -184,13 +185,15 @@ describe("verifyCorpus — the number that matters is computed by the real funct
    * recomputed with the projector's own function rather than trusted.
    */
   const bodies = (m: Record<string, string>) => new Map(Object.entries(m));
+  // The REAL projector function, so verifyCorpus is exercised against the thing it claims to use.
+  const realCount = (b: string) => chunkContent(b).length;
 
   it("replaces the estimate with the real chunk count and reports the divergence", () => {
     // 1,251 astral chars = 2,502 UTF-16 units → 2 real chunks, but Postgres counts 1,251 → 1 chunk.
     const astral = "👍".repeat(1251);
     const selection = selectCorpus([{ id: "e", chars: astral.length / 2 }], { A: 0, B1: 0, B2: 1, C: 0 });
     expect(selection.items[0].chunks).toBe(1); // the estimate
-    const verified = verifyCorpus(selection, bodies({ e: astral }), chunkContent);
+    const verified = verifyCorpus(selection, bodies({ e: astral }), realCount);
     expect(verified.items[0].chunks).toBe(2); // the truth
     expect(verified.items[0].estimatedChunks).toBe(1);
     expect(verified.divergent).toEqual([{ id: "e", estimated: 1, actual: 2 }]);
@@ -199,7 +202,7 @@ describe("verifyCorpus — the number that matters is computed by the real funct
 
   it("reports NO divergence for ASCII, so the field means something when it is non-empty", () => {
     const selection = selectCorpus([{ id: "a", chars: 6000 }], { A: 0, B1: 0, B2: 0, C: 1 });
-    const verified = verifyCorpus(selection, bodies({ a: "x".repeat(6000) }), chunkContent);
+    const verified = verifyCorpus(selection, bodies({ a: "x".repeat(6000) }), realCount);
     expect(verified.divergent).toEqual([]);
     expect(verified.episodes).toBe(selection.episodes);
   });
@@ -209,12 +212,12 @@ describe("verifyCorpus — the number that matters is computed by the real funct
     const selection = selectCorpus(rows, { A: 0, B1: 89, B2: 0, C: 0 });
     expect(selection.episodeBudgetBreach).toMatch(/outside/); // 89 estimated, under the floor
     const map = new Map(rows.map((r) => [r.id, "x".repeat(100)]));
-    expect(verifyCorpus(selection, map, chunkContent).episodeBudgetBreach).toMatch(/outside/);
+    expect(verifyCorpus(selection, map, realCount).episodeBudgetBreach).toMatch(/outside/);
   });
 
   it("refuses when a body was not supplied rather than silently skipping the item", () => {
     const selection = selectCorpus([{ id: "a", chars: 6000 }], { A: 0, B1: 0, B2: 0, C: 1 });
-    expect(() => verifyCorpus(selection, bodies({}), chunkContent)).toThrow(/no body supplied/);
+    expect(() => verifyCorpus(selection, bodies({}), realCount)).toThrow(/no body supplied/);
   });
 });
 
@@ -236,5 +239,26 @@ describe("the env parse mirrors the projector's, including where a loose parse d
 describe("the projectable kinds mirror lib/graph/project.ts", () => {
   it("matches PROJECTABLE_KINDS exactly — a drift here silently changes which items the battery can see", () => {
     expect([...PROJECTABLE_KINDS]).toEqual([...REAL_PROJECTABLE_KINDS]);
+  });
+});
+
+
+describe("countFromBody is chunkContent's count, for callers that cannot load the TypeScript", () => {
+  /**
+   * `seed-local.mjs` runs under plain node and cannot import `lib/graph/project.ts`. Rather than
+   * duplicate `chunkContent` there — the parallel-implementation drift this suite already guards
+   * against once — it passes `countFromBody`, pinned here against the real function including the
+   * astral case that motivated the whole verification step.
+   */
+  it.each([
+    ["ascii", "x".repeat(6000)],
+    ["astral", "\u{1F44D}".repeat(1251)],
+    ["mixed", "a\u{1F44D}".repeat(900)],
+    ["whitespace only", "  \n\t "],
+    ["empty", ""],
+    ["single char", "x"],
+    ["past the cap", "x".repeat(2500 * (MAX_EPISODE_CHUNKS + 5))],
+  ])("agrees with chunkContent for %s", (_label, body) => {
+    expect(countFromBody(body)).toBe(chunkContent(body).length);
   });
 });
