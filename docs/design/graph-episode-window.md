@@ -746,3 +746,51 @@ _(every started session appended here, pass or fail — see Rerun policy)_
 | session | corpus item ids | Phase A result | arm outcomes | verdict |
 |---|---|---|---|---|
 | 1 | pinned in `/tmp/gwb` seed output & session-2 record | structural half in spec; paid half harvested via captures | rep 1 ×3 completed; rep 2 cancelled | **INVALID** — Q2/Q6 underpowered (roster), Q3 evidence absent on 0.29.3 |
+| 2 | same 108-episode corpus (hash-identical across arms) | predecessor share OBSERVED: W10 43.4% / SAME 33.6% / W1 10.0% of all input tokens | W10 ×2 + SAME ×2 clean; W1 rep 2 lost to infra | **INVALID** — the incumbent's own rep-to-rep spread exceeds the Q1 (7.2% vs 5%) and Q7 (7.4% vs 2.5%) validity ceilings |
+
+### Session 2 — full record (2026-08-06/07)
+
+Reused session 1's runs as rep 1 per Amendment 3; fresh rep 2 per arm. Every completed rep: 108/108
+episodes landed, zero duplicate names, cross-check **exact** (not one validation retry all session).
+
+**The judge returned INVALID, and the reason is a real property of the system, not a mishap:** at
+temperature 0 on byte-identical input, the INCUMBENT's two runs differ by **7.2% on entity yield**
+(6.333 vs 6.806/episode) and 7.4% on Q7. The validity ceilings (half the band margin) assumed
+temp-0 near-determinism; the provider's run-to-run nondeterminism is larger than that. **Two reps
+cannot distinguish an arm's quality effect from the LLM's own noise at these ceilings.** The
+procedure refused to judge quality — which is exactly what it was built to do, and materially better
+than the counterfactual: an asymmetric rule would have SHIPPED on this data.
+
+**What IS measured solidly (cost is not noisy — 2.0% incumbent spread on C1):**
+
+| | tokens/episode (rep1/rep2) | vs W10 mean | predecessor share |
+|---|---|---|---|
+| W10 | 28,000 / 28,574 | — | 43.4% |
+| SAME | 20,792 / 21,378 | **−25.5%** (band edge; INCONCLUSIVE under the spread rule) | 33.6% |
+| W1 | 18,170 / (rep 2 lost) | −35.8% (single rep) | 10.0% |
+
+Phase A part 2, finally observed: the ten-predecessor block is **4,675 tokens per extract call**
+(the parent spec derived ~6,250) — 43.4% of every input token the incumbent bills. The fresh-graph
+W10 baseline (28k) sits below prod's steady-state 40k because dedupe candidate lists are thinner on
+a young graph, as the fresh-graph note anticipated.
+
+Q7 read 0.87/0.93 — not the predicted ≈1.0: the union universe includes names only one rep
+extracted, which score 0 in the other rep. Directionally the prediction held (no same-name duplicate
+inflation anywhere: 12 of 180 names had more SAME nodes than W10 nodes, and the aggregate moved the
+OTHER way); the union-vs-intersection choice is what added the variance that tripped Q7's ceiling.
+
+**Operational incidents, all recorded:** Docker Desktop's daemon died three times (host RAM was
+fine; the Postgres evidence moved to named volumes after the first death and survived the other
+two). The graphiti worker died three times — the third gave the root cause: **`429 rate limited`
+from our own proxy's default 120/min ceiling under embedding fan-out**, an exception class the
+worker does not survive. One contaminated W10 rep 2 (my raw ledger delete bypassed the
+purge-before-repush sentinel — operator error, $1.40 wasted, rep discarded and re-run clean;
+`content_sha256 = ''` is the sanctioned requeue). W1's rep 2 graph was lost to the third daemon
+death before harvest. Total battery spend: **~$8.0** of the $9.53 envelope.
+
+**Two consecutive INVALID sessions.** Per the rerun policy, a third session requires a committed
+amendment first — which any redesign would carry anyway. The measured noise now exists to derive it
+from: resolving a 5% band against ~7% single-rep noise needs ~4 reps per arm (spread of mean scales
+~1/√n), or bands re-derived against measured noise — either is Amendment 4 material, under the
+highest-scrutiny review since every number is now known.
+

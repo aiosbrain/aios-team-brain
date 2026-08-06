@@ -63,7 +63,12 @@ export function parseCostText(text, label) {
     throw new Error(`${label}: no cross-check line at all — harness format drifted?`);
   }
 
-  const perEp = text.match(/input tok\s+[\d,]+\s+per episode\s+([\d,]+)/);
+  // The REAL line: `input tok    3,024,031   28,000 per episode` — total first, per-episode second,
+  // label LAST. The first version of this regex matched a paraphrase from the PR body instead of the
+  // harness's actual print statement, and the refusal fired on the first real file it met — which is
+  // the failure mode working exactly as designed, and the reason the fixture is now the verbatim
+  // output of a real run rather than my memory of one.
+  const perEp = text.match(/input tok\s+[\d,]+\s+([\d,]+) per episode/);
   if (!perEp) throw new Error(`${label}: no input-tokens-per-episode line — harness format drifted?`);
 
   return {
@@ -125,10 +130,14 @@ export function assemble(dir, items, arms = ["w10", "same", "w1"]) {
     crossCheckAvailable: allReps.every((r) => r.c.crossCheckAvailable),
   });
 
+  // Candidate arms = whatever was run, in the PRE-REGISTERED order (SAME before W1). A session may
+  // legitimately hold fewer arms than planned — the arm order means W1 is only ever consulted if
+  // SAME fails, so a SAME-passing session never needed W1 at all.
+  const candidates = arms.filter((a) => a !== "w10");
   const verdict = decide({
     session,
     incumbent,
-    arms: ["same", "w1"].map((arm) => ({
+    arms: candidates.map((arm) => ({
       name: arm.toUpperCase(),
       metrics: metricReps(arm),
       // Q2 v2's count clause over QUALIFYING names (present in ≥2 items), max of reps: the
@@ -141,7 +150,9 @@ export function assemble(dir, items, arms = ["w10", "same", "w1"]) {
   // one name and the incumbent fragments another — auditable, not invisible.
   const perName = universe.map((name) => {
     const count = (arm, i) => reps[arm][i].q.nameCounts.find((r) => r.name === name)?.nodes ?? 0;
-    return { name, w10: [count("w10", 0), count("w10", 1)], same: [count("same", 0), count("same", 1)], w1: [count("w1", 0), count("w1", 1)] };
+    const row = { name };
+    for (const arm of arms) row[arm] = [count(arm, 0), count(arm, 1)];
+    return row;
   });
 
   return { session, verdict, incumbent, universe, perName, reps };

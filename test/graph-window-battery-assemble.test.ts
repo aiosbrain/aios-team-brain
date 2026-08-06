@@ -15,15 +15,18 @@ import { assemble } from "../scripts/graph-window-battery/judge.mjs";
  * vacuity guard that replaced the hardcoded `underpowered: []`.
  */
 
+// Verbatim shape of a real harness run — total first, per-episode second, label last.
 const COST = (tok: number) => `
 window      2026-08-06T00:00:00Z → 2026-08-06T01:00:00Z   (drain 10m)
 episodes    108   (extract_nodes calls — one per episode)
 cross-check 108 pushed per ingest_runs · 0% apart · exact
 
 calls        1,000        9.3 per episode
-input tok   4,000,000      per episode    ${tok.toLocaleString("en-US")}
-cost        $1.00          per episode    $0.0100
-MULTIPLE    60.0x the content a full episode carries
+input tok    4,000,000   ${tok.toLocaleString("en-US")} per episode
+output tok   150,000
+cost         $1.00       $0.0100 per episode
+
+MULTIPLE     60.0x the content a full episode carries
 `;
 
 const NAMES = Array.from({ length: 20 }, (_, i) => ({ name: `project alpha ${i}`, nodes: 1 }));

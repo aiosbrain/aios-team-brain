@@ -14,15 +14,21 @@ import { parseCostText } from "../scripts/graph-window-battery/judge.mjs";
  * The fixtures replicate the harness's print statements verbatim (thousands separators included).
  */
 
+// VERBATIM from a real run (w10 rep1, 2026-08-06) with only the numbers adjusted — not a paraphrase.
+// The first fixture here was reconstructed from a PR-body sample, and the parser built against it
+// refused the first real file it met. Fixtures mimic the real shape or they pin nothing.
 const clean = `
-window      2026-08-06T07:44:05Z → 2026-08-06T09:40:00Z   (drain 10m)
+window      2026-08-06T07:44:03Z → 2026-08-06T09:18:30Z   (drain 10m)
 episodes    112   (extract_nodes calls — one per episode)
 cross-check 108 pushed per ingest_runs · 4% apart · +4 attempts over pushes (retries)
 
-calls        1,104        9.9 per episode
-input tok   4,327,881      per episode    38,642
-cost        $1.62          per episode    $0.0145
-MULTIPLE    61.8x the content a full episode carries
+calls        1,137        10.5 per episode
+input tok    4,327,881   38,642 per episode
+output tok   157,855
+cost         $1.62       $0.0145 per episode
+
+MULTIPLE     61.8x the content a full episode carries
+             (2500 chars ≈ 625 tokens vs 38,642 billed)
 `;
 
 describe("parseCostText — extraction from the harness's own output", () => {
