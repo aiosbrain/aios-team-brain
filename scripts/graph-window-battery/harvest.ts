@@ -10,7 +10,7 @@
  * Usage: npx tsx --conditions react-server scripts/graph-window-battery/harvest.ts
  */
 import { Client } from "pg";
-import { entityYield, dupeShare, crossChunkContinuity, peopleMetrics, memberPresence, episodicCount } from "./measure";
+import { entityYield, dupeShare, crossChunkContinuity, peopleMetrics, memberPresence, episodicCount, entityNameCounts } from "./measure";
 
 import { countFromBody } from "./corpus.mjs";
 
@@ -32,12 +32,13 @@ async function main(): Promise<void> {
   const multiChunkItemIds = new Set(items.filter((r) => countFromBody(r.body) > 1).map((r) => r.id));
   const presence = memberPresence(members, items);
 
-  const [q1, q3, q4, people, landed] = await Promise.all([
+  const [q1, q3, q4, people, landed, nameCounts] = await Promise.all([
     entityYield(GROUP_ID, episodes),
     dupeShare(GROUP_ID),
     crossChunkContinuity(GROUP_ID, multiChunkItemIds),
     peopleMetrics(GROUP_ID, presence),
     episodicCount(GROUP_ID),
+    entityNameCounts(GROUP_ID),
   ]);
 
   // One JSON object on stdout — the runner parses this, so nothing else may print to stdout.
@@ -53,10 +54,12 @@ async function main(): Promise<void> {
         Q4: q4,
         Q6: people.convergence,
         personsLost: people.personsLost,
+        qualifyingLost: people.qualifyingLost,
         dupeEdges: q3.total,
         namesPresent: presence.size,
         convergenceNames: people.convergenceNames,
         multiChunkItems: multiChunkItemIds.size,
+        nameCounts,
       },
       null,
       2

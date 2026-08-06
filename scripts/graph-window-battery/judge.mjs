@@ -30,7 +30,8 @@
  */
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { assessSession, decide } from "./decision.mjs";
+import { assessSession, decide, MIN_UNIVERSE } from "./decision.mjs";
+import { buildUniverse, nameConvergence } from "./q7.mjs";
 
 const num = (s) => Number(String(s).replace(/,/g, ""));
 
@@ -84,32 +85,34 @@ function loadRep(dir, arm, rep) {
   return { q, c, refused: false, q5 };
 }
 
-export function assemble(dir, arms = ["w10", "same", "w1"]) {
+/**
+ * `items` = the corpus rows ({id, body}) from ANY arm's seeded Postgres — corpora are hash-identical
+ * across arms, and Q7's universe needs the bodies to check literal recurrence.
+ */
+export function assemble(dir, items, arms = ["w10", "same", "w1"]) {
   const reps = {};
   for (const arm of arms) reps[arm] = [loadRep(dir, arm, 1), loadRep(dir, arm, 2)];
+
+  // Q7 (Amendment 2): the universe comes from the UNION of the incumbent's reps, then every rep of
+  // every arm is scored against that one fixed universe.
+  const universe = buildUniverse([reps.w10[0].q.nameCounts, reps.w10[1].q.nameCounts], items);
 
   const metricReps = (arm) => ({
     Q1: reps[arm].map((r) => r.q.Q1),
     Q2: reps[arm].map((r) => r.q.Q2),
-    Q3: reps[arm].map((r) => r.q.Q3),
     Q4: reps[arm].map((r) => r.q.Q4),
     Q5: reps[arm].map((r) => r.q5),
-    Q6: reps[arm].map((r) => r.q.Q6),
+    Q7: reps[arm].map((r) => nameConvergence(r.q.nameCounts, universe)),
     C1: reps[arm].map((r) => r.c.inputTokensPerEpisode),
   });
 
   const incumbent = metricReps("w10");
   const allReps = arms.flatMap((a) => reps[a]);
 
-  const underpowered = [];
-  if (allReps.some((r) => r.q.namesPresent < 15)) underpowered.push("Q2");
-  if (allReps.some((r) => r.q.convergenceNames < 5)) underpowered.push("Q6");
-
   const session = assessSession({
     incumbent,
-    dupeShare: (reps.w10[0].q.Q3 + reps.w10[1].q.Q3) / 2,
-    dupeEdges: Math.min(reps.w10[0].q.dupeEdges, reps.w10[1].q.dupeEdges),
-    underpowered,
+    universeSize: universe.length,
+    underpowered: [],
     armsCompleted: allReps.every((r) => !r.refused && r.q.episodicNodesLanded === r.q.episodes),
     harnessRefused: allReps.some((r) => r.refused),
     crossCheckAvailable: allReps.every((r) => r.c.crossCheckAvailable),
@@ -121,22 +124,36 @@ export function assemble(dir, arms = ["w10", "same", "w1"]) {
     arms: ["same", "w1"].map((arm) => ({
       name: arm.toUpperCase(),
       metrics: metricReps(arm),
-      // MAX of the reps: the noise-free floor takes the worse rep — see the header.
-      extras: { personsLost: Math.max(reps[arm][0].q.personsLost, reps[arm][1].q.personsLost) },
+      // Q2 v2's count clause over QUALIFYING names (present in ≥2 items), max of reps: the
+      // noise-free floor takes the worse rep — see the header.
+      extras: { personsLost: Math.max(reps[arm][0].q.qualifyingLost, reps[arm][1].q.qualifyingLost) },
     })),
   });
 
-  return { session, verdict, incumbent, reps };
+  // The per-name breakdown the spec requires: the aggregate can stay flat while the arm fragments
+  // one name and the incumbent fragments another — auditable, not invisible.
+  const perName = universe.map((name) => {
+    const count = (arm, i) => reps[arm][i].q.nameCounts.find((r) => r.name === name)?.nodes ?? 0;
+    return { name, w10: [count("w10", 0), count("w10", 1)], same: [count("same", 0), count("same", 1)], w1: [count("w1", 0), count("w1", 1)] };
+  });
+
+  return { session, verdict, incumbent, universe, perName, reps };
 }
 
 // CLI half, guarded so the parsers above are unit-testable without a results directory.
 if (process.argv[1]?.includes("judge.mjs")) {
   const dir = process.argv[2];
-  if (!dir) {
-    console.error("usage: judge.mjs <resultsDir>");
+  if (!dir || !process.env.DATABASE_URL) {
+    console.error("usage: DATABASE_URL=<any arm's battery PG> node judge.mjs <resultsDir>");
     process.exit(1);
   }
-  const { session, verdict, incumbent } = assemble(dir);
-  console.log(JSON.stringify({ session, verdict, incumbent }, null, 2));
+  const { Client } = await import("pg");
+  const pg = new Client({ connectionString: process.env.DATABASE_URL });
+  await pg.connect();
+  const { rows: items } = await pg.query("select id, body from items where access = 'team'");
+  await pg.end();
+
+  const { session, verdict, incumbent, universe, perName } = assemble(dir, items);
+  console.log(JSON.stringify({ session, verdict, incumbent, universeSize: universe.length, perName }, null, 2));
   process.exitCode = verdict.outcome === "INVALID" ? 2 : 0;
 }
