@@ -533,6 +533,16 @@ rollback are lost; confirm the brain's reconcile re-pushed them.
   needs a patch to `graph_service/routers/ingest.py` **and** a new field on the brain's `/messages`
   payload — two surfaces, and the brain would have to track chunk uuids it does not track today.
   **Recorded as the follow-up if Phase B kills both arms**; it gets its own task key when triggered.
+- **A hybrid: same-item, falling back to *N* unrelated predecessors when the item has none of its
+  own.** Phase A's structural result makes this the *specific* successor if `SAME` fails, so it is
+  named now rather than improvised at readout time. The reasoning: the two risks are not evenly
+  spread. Multi-chunk items keep their own chunks under `SAME` and lose nothing — they actually gain
+  determinism, since rival displacement disappears. **All** the fragmentation risk sits on the
+  single-chunk population, whose predecessor slots are 100% unrelated today and 0% under `SAME`. A
+  hybrid would keep a small dedupe-judgment context exactly there while still killing the 47% filler
+  that multi-chunk items carry. **Trigger: `SAME` fails on Q1-high or Q6 (the fragmentation
+  direction) but passes Q4 and C1.** It gets its own task key and its own battery session under an
+  amendment — it does not get bolted onto a running experiment.
 - **`use_combined_extraction`** (merge node+edge extraction into one call). Unreachable from the
   public API; noted in the parent spec, out of scope here.
 
