@@ -5,7 +5,7 @@
 import { GitBranch, Gavel } from "lucide-react";
 import { MemberAvatar } from "@/components/people/member-avatar";
 import { SourceIcon, sourceLabel } from "@/components/icons/source-icon";
-import type { PersonDay, SignalGroup, SourceGroup, TaskGroup } from "@/lib/dashboard/timeline-group";
+import { isBareDate, type PersonDay, type SignalGroup, type SourceGroup, type TaskGroup } from "@/lib/dashboard/timeline-group";
 import { headlineTask, sourceCounts } from "@/lib/dashboard/pulse-digest";
 
 /**
@@ -17,6 +17,11 @@ import { headlineTask, sourceCounts } from "@/lib/dashboard/pulse-digest";
  */
 
 function timeOf(at: string): string {
+  // A BARE DATE has no time to show. `meeting_notes.occurred_at` is a `date` column, so a meeting
+  // genuinely has no clock time; `Date.parse("2026-07-22")` reads it as UTC midnight and would render
+  // a confident, wrong "12:00 AM" (or the local-timezone shift of it). Signals already render
+  // bare-date rows with no timestamp for the same reason — this makes the rule general.
+  if (isBareDate(at)) return "";
   const t = Date.parse(at);
   return Number.isNaN(t) ? "" : new Date(t).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
 }

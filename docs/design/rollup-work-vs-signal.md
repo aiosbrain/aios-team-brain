@@ -19,6 +19,13 @@ appears only in the clearly-labelled Context lane.
 
 ## Scope (this PR)
 
+> **SUPERSEDED for meetings (2026-08-06).** Meetings are now per-person **WORK**, not signal — one
+> evidence row per ATTENDEE, from `meeting_note_attendees`. The blocker this section names (*"a granola
+> item's `member_id` is the recorder, not the participants"*) was an ATTRIBUTION problem, and that table
+> resolves attendance to real member FKs, so it no longer holds. The product call that meetings COUNT as
+> work (rather than sitting in the Context lane) is deliberate. See
+> `docs/specs/meeting-participation-as-work-v1.md`. Everything below about DECISIONS still stands.
+
 **In:** decisions — the clearest per-person, CLI-pushed signal. **Out (follow-ups):** meetings-as-signal (a
 granola item's `member_id` is the recorder, not the participants — team-level, not per-person), and any
 `decided_by` we can't confidently pin to ONE roster member (empty / "the team" / "Chetan + John" / an

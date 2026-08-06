@@ -67,7 +67,11 @@ export const TIMELINE_TTL_MS = TTL_MS;
 // root's snippet verbatim (see the authorship note in `lib/dashboard/work-timeline`). SHAPE unchanged,
 // MEANING changed — a v10 row keeps rendering a teammate's sentence under the replier's own name, which
 // is the misattribution the fix exists to remove. Same meaning-change rule as v5/v6/v7.
-export const PAYLOAD_VERSION = 11;
+// v12: MEETINGS are work. A person now gets an evidence row for every meeting they ATTENDED (from
+// `meeting_note_attendees`), not just the one person who pushed the transcript — plus the new optional
+// `via` key marking a submitter fallback. Both a shape change (a new key) and a meaning change (a v11
+// row keeps serving meeting-less person-days for a full TTL after deploy), so it bumps under either rule.
+export const PAYLOAD_VERSION = 12;
 
 /** The timeline WITH the per-person-day synopsis attached. Runs the (up to 7d × roster) best-effort LLM
  *  calls — so it's used ONLY on the BACKGROUND refresh path, never inline on a request (a cold miss
