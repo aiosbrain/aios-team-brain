@@ -90,7 +90,7 @@ export async function latestGraphHealthOfKind(
 
 /* ── the POLLUTION machine ────────────────────────────────────────────────────────────────────── */
 
-export type PollutionAction = "alert" | "recover" | "none";
+export type PollutionAction = "alert" | "recover" | "refresh" | "none";
 
 export interface PollutionGroupTick {
   group: string;
@@ -114,6 +114,13 @@ export interface PollutionGroupTick {
  * previously-polluted group is neither, the combined verdict is UNJUDGEABLE (action "none"), not
  * healthy.
  *
+ * MEMORY MUST NOT FORGET A GROUP THAT POLLUTES MID-INCIDENT (review HIGH on the first cut): the
+ * MAIL is edge-debounced, but the STATE is not — a group judging polluted while the alarm is
+ * already active joins the memory via a `"refresh"` action (one `ok:false` ledger row carrying the
+ * UNION of prior and new groups, NO mail). Without it, B polluting during A's incident and then
+ * dipping unjudged would let A's recovery mail fire while B is still splintering — the same false
+ * recovery HIGH-A closes, through a side door.
+ *
  * THE RELEASE VALVE, ledger-defined like everything else here: a previously-polluted group whose
  * `graph_episodes` flow is ZERO across the full recent+baseline span (a decommissioned external
  * group, an ended client project) has no ongoing pollution to recover FROM — holding the machine
@@ -131,7 +138,16 @@ export function decidePollutionAction(input: {
   const pollutedGroups = judged.filter((g) => g.polluted).map((g) => g.group);
   if (judged.length === 0) return { action: "none", pollutedGroups };
   if (pollutedGroups.length > 0) {
-    return { action: input.priorPolluted ? "none" : "alert", pollutedGroups };
+    if (!input.priorPolluted) return { action: "alert", pollutedGroups };
+    // Already alerting: no mail — but a group judging polluted that memory does not yet hold must
+    // JOIN it (a "refresh" row with the union), or its later unjudged dip is invisible to recovery.
+    const joined = pollutedGroups.filter((g) => !input.priorPollutedGroups.includes(g));
+    return joined.length > 0
+      ? {
+          action: "refresh",
+          pollutedGroups: [...new Set([...input.priorPollutedGroups, ...pollutedGroups])],
+        }
+      : { action: "none", pollutedGroups };
   }
   if (!input.priorPolluted) return { action: "none", pollutedGroups };
   const byGroup = new Map(input.groups.map((g) => [g.group, g]));
@@ -159,7 +175,8 @@ const UNJUDGEABLE_ALERT_MS = UNJUDGEABLE_ALERT_HOURS * 3_600_000;
  * (no anchor/cleared row pairs from routine graphiti restarts), not mail latency — 6h exceeds every
  * observed healthy graphiti unavailability and matches `EXTRACTION_LAG_BUDGET_MS`'s precedent for
  * exactly this budget shape. Serial with the 24h clock, so worst-case time-to-page for a rotted
- * credential is grace + 24h ≈ 30h.
+ * credential is grace + 24h ≈ 30h — ONCE a process has lived through the grace unreadable; the
+ * in-memory marker's deploy-reset corner (see `unreadableSinceMs`) is unbounded, not late.
  */
 export const UNREADABLE_GRACE_MS = 6 * 3_600_000;
 
@@ -253,10 +270,16 @@ export function blindnessClearMails(latestPhase: BlindnessPhase): boolean {
 
 /**
  * When Neo4j FIRST became unreadable, in-memory. Only the 6h grace reads this — the 24h clock
- * itself is ledger-persisted. Tradeoff, stated: a brain deploy mid-grace resets it and re-starts
- * the 6h wait, so a rotted credential pages later than 30h if deploys land more often than every
- * 6h; a persisted grace marker would instead write the routine-restart ledger churn the grace
- * exists to avoid. The grace resets, the clock does not.
+ * itself is ledger-persisted.
+ *
+ * Tradeoff, stated honestly: a brain deploy resets this marker, so the grace only ever elapses
+ * inside a single process lifetime. Under deploys landing more often than every 6h INDEFINITELY,
+ * the unreadable leg NEVER runs the clock and never pages — the "worst-case ≈ 30h" on
+ * `UNREADABLE_GRACE_MS` holds only once some process lives ≥6h while Neo4j is unreadable; the
+ * degenerate corner is UNBOUNDED, not merely late. Accepted because (a) a sustained sub-6h deploy
+ * cadence does not survive a weekend or any quiet period, which bounds the gap in practice, and
+ * (b) persisting the grace start would write the routine-restart anchor/cleared ledger churn the
+ * grace exists to avoid. The grace resets; the clock does not.
  */
 let unreadableSinceMs: number | null = null;
 
@@ -351,10 +374,19 @@ async function runPollutionMachine(
     source: GRAPH_HEALTH_SOURCE,
     trigger: "scheduler",
     ok: action === "recover",
-    errors: action === "alert" ? reasons : [],
+    errors:
+      action === "alert"
+        ? reasons
+        : action === "refresh"
+          ? [
+              `pollution memory refresh: recovery now requires each of ${pollutedGroups.join(", ")} ` +
+                `judged-and-healthy or ledger-quiet (a group joined the active incident)`,
+            ]
+          : [],
     meta: {
       alarm: "pollution",
       groups: pollutedGroups,
+      ...(action === "refresh" ? { refresh: true } : {}),
       census: censuses.map((c) => ({
         group: c.group,
         recentShare: c.pollution.recentShare,
@@ -365,6 +397,10 @@ async function runPollutionMachine(
     startedAt,
     finishedAt: nowMs,
   });
+
+  // A refresh is STATE ONLY: the alert mail already went out for this incident, and mailing again
+  // per joining group would undo the edge debounce. The row alone widens the recovery requirement.
+  if (action === "refresh") return "refresh";
 
   if (action === "alert") {
     const perGroup = pollutedCensuses

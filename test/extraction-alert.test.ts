@@ -156,6 +156,45 @@ describe("decidePollutionAction — group memory on the recovery edge", () => {
     });
     expect(d.action).toBe("recover");
   });
+
+  it("THE SIDE DOOR (review HIGH): a group polluting MID-incident joins memory via a refresh, so its later unjudged dip blocks recovery", () => {
+    // Edge-debouncing the MAIL does not require edge-debouncing the STATE. The exact sequence:
+    // Tick 1 — A alerts; the alert row records [A].
+    const t1 = decidePollutionAction({
+      groups: [judged("A", true), judged("B", false)],
+      priorPolluted: false,
+      priorPollutedGroups: [],
+    });
+    expect(t1.action).toBe("alert");
+    expect(t1.pollutedGroups).toEqual(["A"]);
+    // Tick 2 — B judges polluted while the alarm is already active: NO mail, but a memory-refresh
+    // row carrying the UNION. Without it B never enters memory and tick 3 becomes a false recovery.
+    const t2 = decidePollutionAction({
+      groups: [judged("A", true), judged("B", true)],
+      priorPolluted: true,
+      priorPollutedGroups: t1.pollutedGroups,
+    });
+    expect(t2.action).toBe("refresh");
+    expect([...t2.pollutedGroups].sort()).toEqual(["A", "B"]);
+    // Tick 3 — B dips to small-sample WITH live episode flow; A judges healthy. Recovery must NOT
+    // fire: B is in memory, unjudged, and not released by the valve.
+    const t3 = decidePollutionAction({
+      groups: [judged("A", false), refused("B", 40)],
+      priorPolluted: true,
+      priorPollutedGroups: t2.pollutedGroups,
+    });
+    expect(t3.action).toBe("none");
+  });
+
+  it("a refresh fires once per JOINING group — a persisting union is 'none', not a row per tick", () => {
+    expect(
+      decidePollutionAction({
+        groups: [judged("A", true), judged("B", true)],
+        priorPolluted: true,
+        priorPollutedGroups: ["A", "B"],
+      }).action
+    ).toBe("none");
+  });
 });
 
 describe("refusalRunsClock — the taxonomy", () => {
