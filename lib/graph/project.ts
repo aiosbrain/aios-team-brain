@@ -5,6 +5,7 @@ import { GraphitiClient, type GraphEpisode } from "./graphiti-client";
 import { episodeGroupId, isExternalGroupId, type AccessTier } from "./group";
 import { episodeName, itemIdFromEpisodeName } from "./episode-name";
 import { resolvePositiveInt } from "@/lib/util/env";
+import { chunkCdc, type CdcParams } from "./cdc";
 import { sourceRules } from "@/lib/ingest/source-rules";
 // Re-exported so the graph module's existing importers (and their specs) keep one import path.
 export { resolvePositiveInt };
@@ -56,60 +57,144 @@ export function chunk<T>(items: readonly T[], size: number): T[][] {
  * (or garbage). `Math.floor` also closes the fractional hole (0.5 → 0). Pure + exported, unit-tested.
  */
 /**
- * ⚠️ CHANGING THIS RE-EXTRACTS THE ENTIRE CORPUS on the next projector tick, and it is billed
- * (~$47 at the 2026-08 corpus). Every chunk boundary is `slice(i, i + CHUNK_CHARS)`, so a different
- * value moves all of them: every stored hash goes stale, no item can take the delta path, and each
- * one full-re-pushes — including dragging retractable sources through their delete-then-repush shape.
- * Raising MAX_EPISODE_CHUNKS below does NOT do this; the two knobs look alike and cost ~27x
- * differently. See docs/design/graph-extraction-cap.md before touching either.
+ * The TARGET AVERAGE chunk size under `cdc1` (PIPEFF-3), and the fixed chunk size under the legacy
+ * byte-offset algorithm that a mixed corpus still stores rows for.
+ *
+ * ⚠️ CHANGING THIS MOVES EVERY BOUNDARY — but it no longer re-extracts the corpus in one billed burst.
+ * Since CDC (PIPEFF-3) rolls out LAZILY, a config change is recorded per row: an item whose body has
+ * not changed and whose stored chunking is provably COMPLETE (see `storedChunkingComplete`) keeps its
+ * existing chunking indefinitely and is never re-pushed. What a change to this knob does cost is
+ * (a) the items whose bodies change afterwards, which re-chunk under the new value — normal traffic —
+ * and (b) items that fail completeness under their stored config (clipped at their old cap), which
+ * full-re-push once. The old "~$47, the whole corpus, immediately" warning was true of the eager
+ * invalidation this constant used to trigger and is no longer what happens.
+ * See docs/design/content-defined-chunking.md and docs/design/graph-extraction-cap.md.
  */
 export const CHUNK_CHARS = resolvePositiveInt(process.env.GRAPH_CHUNK_CHARS, 2500);
 /**
- * How many chunks of `CHUNK_CHARS` an item may become — i.e. `CHUNK_CHARS * MAX_EPISODE_CHUNKS` is the
- * hard ceiling on how much of ANY item ever reaches the graph. Everything past it is dropped by
- * `chunkContent`, silently, forever.
+ * The `cdc1` MINIMUM chunk size — **a content-safety bound, not a tuning knob.**
  *
- * Raised 16 -> 40 (40,000 -> 100,000 chars) on 2026-08-05 (AIO-808). At 16 this had stopped being the
- * "runaway-size backstop" its comment claimed: 21 items were over it and **689,235 characters — 8.6%
- * of the corpus — had never entered the graph**, concentrated in the densest documents we own
- * (`ARCHITECTURE.md` 11.8% present, a Chetan/John meeting transcript 54.5%). Sized from the measured
- * corpus: 40 completes 18 of the 21; three files (ARCHITECTURE.md at 136 chunks, model-migration at
- * 48, brain-api at 46) stay capped and are STILL dropped silently — surfacing the refused character
- * count is specced (docs/design/graph-extraction-cap.md §3) and deliberately NOT built here.
- *
- * ⚠️ CHANGING `CHUNK_CHARS` RE-EXTRACTS THE WHOLE CORPUS on the next tick, and it is billed. Every
- * chunk boundary moves, so every stored hash is stale and no item can take the delta path — ~$47 at
- * the 2026-08 corpus. Raising THIS constant does not: boundaries are unchanged, so only the newly
- * admitted tail chunks are pushed (179 episodes / ~$1.77 for the 16->40 move). The two knobs look
- * alike and cost 27x differently; see docs/design/graph-extraction-cap.md.
+ * `MAX_EPISODE_CHUNKS` caps an item at N *chunks* and drops everything past it (the CHUNKCAP-1 class
+ * this repo has already paid for once). Under byte-offset chunking N chunks always meant
+ * `N × CHUNK_CHARS` characters. Under CDC it means "however much text N content-defined windows happen
+ * to cover" — so without a floor, a pathological body producing many small chunks would hit the cap far
+ * sooner and drop text that is currently ingested. `CHUNK_MIN_CHARS × MAX_EPISODE_CHUNKS` is therefore
+ * the real guarantee, and the pair must be kept at or above the 100,000 characters the byte-offset era
+ * guaranteed (1,250 × 80). Lowering this without raising the cap silently reduces how much of a large
+ * document reaches the graph.
  */
-export const MAX_EPISODE_CHUNKS = resolvePositiveInt(process.env.GRAPH_MAX_EPISODE_CHUNKS, 40);
+export const CHUNK_MIN_CHARS = resolvePositiveInt(process.env.GRAPH_CHUNK_MIN_CHARS, 1250);
 /**
- * The chunk sizing the per-chunk ledger's hashes were produced under, recorded alongside them
+ * The `cdc1` MAXIMUM chunk size — where a chunk is cut when no content-defined boundary is found.
+ *
+ * Sized from prod `llm_usage` rather than the textbook 2x ratio: over 30 days of `extract_edges` calls
+ * (the widest-output kind at 2,500-char chunks) p99 output was 3,948 tokens — 24% of graphiti's 16,384
+ * output ceiling — but **one call of 898 had already saturated that ceiling exactly**, silently
+ * truncating its edges. 4,000 (rather than 5,000) puts p99 at ~38% of the ceiling. The pre-existing
+ * saturation is filed as `EXTRUNC-1` (AIO-827), not absorbed here — silent truncation happens under any
+ * chunking and the fix is detection-and-retry in extraction. But allowing 4,000-char chunks does raise
+ * tail exposure by up to 1.6x on the largest chunks: watch `llm_usage` rows with `output_tokens = 16384`.
+ */
+export const CHUNK_MAX_CHARS = resolvePositiveInt(process.env.GRAPH_CHUNK_MAX_CHARS, 4000);
+/** The `cdc1` size envelope, in UTF-16 code units. Derived from the effective env values. */
+export const CDC_PARAMS: CdcParams = { target: CHUNK_CHARS, min: CHUNK_MIN_CHARS, max: CHUNK_MAX_CHARS };
+/**
+ * How many chunks an item may become — i.e. `CHUNK_MIN_CHARS * MAX_EPISODE_CHUNKS` is the hard *floor*
+ * on how much of ANY item reaches the graph. Everything past the cap is dropped by `chunkContent`,
+ * silently, forever.
+ *
+ * Raised 16 -> 40 on 2026-08-05 (AIO-808), then **40 -> 80 by PIPEFF-3**, and the second raise is a
+ * REQUIREMENT of content-defined chunking rather than a tuning choice: CDC's floor is 1,250 rather than
+ * a guaranteed 2,500 per chunk, so 40 chunks would guarantee only 50,000 characters against the
+ * byte-offset era's 100,000. 1,250 x 80 = 100,000 restores exactly today's guarantee. Shipping CDC
+ * without this raise would quietly reduce how much of a large document reaches the graph.
+ *
+ * History worth keeping: at 16 this had stopped being the "runaway-size backstop" its comment claimed —
+ * 21 items were over it and **689,235 characters (8.6% of the corpus) had never entered the graph**,
+ * concentrated in the densest documents we own (`ARCHITECTURE.md` 11.8% present, a Chetan/John meeting
+ * transcript 54.5%). Surfacing the refused character count is specced
+ * (docs/design/graph-extraction-cap.md §3) and still deliberately NOT built.
+ *
+ * ⚠️ Raising this is cheap in BOTH the old and the new world. Under `cdc1` the cap is not an input to
+ * boundary computation at all — it only truncates the sequence — so `chunkConfigDeltaCompatible` treats
+ * a CDC cap-grow as trustworthy and the delta pushes exactly the newly-admitted tail (179 episodes /
+ * ~$1.77 for the 16->40 move). Note the 40->80 raise itself rides INSIDE the CDC config string, so this
+ * cap-grow path is not the mechanism that runs during the CDC rollout — that is the lazy completeness
+ * path. See docs/design/content-defined-chunking.md.
+ */
+export const MAX_EPISODE_CHUNKS = resolvePositiveInt(process.env.GRAPH_MAX_EPISODE_CHUNKS, 80);
+/**
+ * The chunking the per-chunk ledger's hashes were produced under, recorded alongside them
  * (`graph_episodes.chunk_config`). `content_sha256` hashes the WHOLE body and is invariant to
  * chunking, so it cannot detect a config change: raising `MAX_EPISODE_CHUNKS` leaves every early
  * chunk hashing identically while the newly-admitted tail chunks have never been pushed, and a
- * ledger without this would report them as already extracted. A mismatch forces a full push.
+ * ledger without this would report them as already extracted.
+ *
+ * **Derived from the effective values by construction, never a literal** — so flipping a `GRAPH_CHUNK_*`
+ * env is just a config change with the lazy semantics above, rather than a silent boundary change under
+ * a stale label. Two forms exist and both are load-bearing:
+ *
+ *   - `"<chars>x<cap>"`  — legacy byte-offset chunking. No longer produced, but a mixed corpus stores it
+ *                          on rows that have not changed since CDC shipped, indefinitely.
+ *   - `"cdc1-<target>-<min>-<max>-<cap>"` — content-defined. `cdc1` pins the gear tables, the window,
+ *                          the mask derivation and the UTF-16 unit; changing ANY of those is `cdc2`
+ *                          (see lib/graph/cdc.ts).
  */
-export const CHUNK_CONFIG = `${CHUNK_CHARS}x${MAX_EPISODE_CHUNKS}`;
+export const CHUNK_CONFIG = `cdc1-${CHUNK_CHARS}-${CHUNK_MIN_CHARS}-${CHUNK_MAX_CHARS}-${MAX_EPISODE_CHUNKS}`;
+
+/** A parsed `chunk_config`. The two variants are different ALGORITHMS, never interchangeable. */
+export type ParsedChunkConfig =
+  | { kind: "legacy"; chars: number; cap: number }
+  | { kind: "cdc1"; target: number; min: number; max: number; cap: number };
+
+/**
+ * Parse a stored `chunk_config` string. `null` for anything unparseable — including `""`, which is the
+ * column default and a real stored value. An unparseable config must never read as something we can
+ * reproduce; every consumer below treats `null` as "I cannot vouch for these hashes".
+ */
+export function parseChunkConfig(value: string | null | undefined): ParsedChunkConfig | null {
+  const raw = (value ?? "").trim();
+  const legacy = /^(\d+)x(\d+)$/.exec(raw);
+  if (legacy) {
+    const chars = Number(legacy[1]);
+    const cap = Number(legacy[2]);
+    return chars > 0 && cap > 0 ? { kind: "legacy", chars, cap } : null;
+  }
+  const cdc = /^cdc1-(\d+)-(\d+)-(\d+)-(\d+)$/.exec(raw);
+  if (cdc) {
+    const [target, min, max, cap] = cdc.slice(1, 5).map(Number);
+    return target > 0 && min > 0 && max > 0 && cap > 0 ? { kind: "cdc1", target, min, max, cap } : null;
+  }
+  return null;
+}
 
 /**
  * Can the chunk hashes stored under `stored` still be TRUSTED to identify chunks of the same body
- * under `current`? (AIO-808)
+ * under `current`? (AIO-808, extended for `cdc1` by PIPEFF-3)
  *
- * Compatible iff `CHUNK_CHARS` is identical. Chunking is `body.slice(i, i + chars)` stepping by
- * `chars`, so the cap only truncates the sequence: raising it leaves every earlier chunk
- * byte-identical and merely appends. Changing `chars` moves every boundary and invalidates every
- * stored hash.
+ * ONE asymmetry, in both algorithms: **the cap is not an input to boundary computation, it only
+ * truncates the emitted sequence.** Under legacy that is obvious (`slice(i, i + chars)` stepping by
+ * `chars`). Under `cdc1` it is a requirement the chunker upholds deliberately — for a fixed body under
+ * fixed parameters the whole boundary sequence is a deterministic function of the body alone, and
+ * nothing special-cases the final permitted chunk (pinned by test, because absorbing the remainder
+ * there would break prefix stability at exactly chunk `cap−1`). So in both worlds, raising the cap
+ * leaves every earlier chunk byte-identical and merely appends; changing any SIZE parameter moves
+ * every boundary.
  *
- *   same config            -> true    (today's normal path)
- *   chars same, cap GREW   -> true    the point of this helper: stored hashes still match, so the
- *                                     delta pushes exactly the newly-admitted tail
- *   chars same, cap SHRANK -> false   chunks past the new cap become orphans in Graphiti that the
- *                                     ledger would stop tracking; a full re-push is the honest answer
- *   chars DIFFER           -> false   every boundary moved
- *   malformed / "" / null  -> false   `""` is a real stored value; an unparseable config must never
- *                                     read as "compatible"
+ *   same config                  -> true    (the normal path)
+ *   sizes same, cap GREW         -> true    stored hashes still match, so the delta pushes exactly the
+ *                                           newly-admitted tail
+ *   sizes same, cap SHRANK       -> false   the stored hashes past the new cap identify chunks the
+ *                                           ledger would stop tracking. NOTE this is only "I cannot
+ *                                           vouch for the ledger"; it is NOT a decision to re-push. A
+ *                                           body-unchanged item that verifies COMPLETE under its stored
+ *                                           config is LEFT ALONE by the skip below (PIPEFF-3) — the
+ *                                           orphan tails a shrink creates are not fixed by re-extracting
+ *                                           the head either (nothing purges them), so paying for it
+ *                                           buys nothing.
+ *   sizes DIFFER                 -> false   every boundary moved
+ *   DIFFERENT ALGORITHMS         -> false   legacy vs cdc1 share no boundary in general
+ *   malformed / "" / null        -> false   `""` is a real stored value
  *
  * ⚠️ THIS ANSWERS ONLY "can I trust the stored hashes". It does NOT answer "does this item still owe
  * chunks" — under a raised cap a body-identical item is compatible AND owes its tail, so the
@@ -117,17 +202,14 @@ export const CHUNK_CONFIG = `${CHUNK_CHARS}x${MAX_EPISODE_CHUNKS}`;
  * bug this feature shipped twice in review: the items it targets would all keep skipping.
  */
 export function chunkConfigDeltaCompatible(stored: string | null | undefined, current: string): boolean {
-  const parse = (v: string | null | undefined): { chars: number; cap: number } | null => {
-    const m = /^(\d+)x(\d+)$/.exec((v ?? "").trim());
-    if (!m) return null;
-    const chars = Number(m[1]);
-    const cap = Number(m[2]);
-    return chars > 0 && cap > 0 ? { chars, cap } : null;
-  };
-  const a = parse(stored);
-  const b = parse(current);
-  if (!a || !b) return false;
-  return a.chars === b.chars && b.cap >= a.cap;
+  const a = parseChunkConfig(stored);
+  const b = parseChunkConfig(current);
+  if (!a || !b || a.kind !== b.kind) return false;
+  if (a.kind === "legacy" && b.kind === "legacy") return a.chars === b.chars && b.cap >= a.cap;
+  if (a.kind === "cdc1" && b.kind === "cdc1") {
+    return a.target === b.target && a.min === b.min && a.max === b.max && b.cap >= a.cap;
+  }
+  return false;
 }
 
 /**
@@ -180,12 +262,23 @@ export function pickEpisodeTimestamp(item: { work_at?: string | Date | null; syn
 }
 
 /**
- * Split an item's body into ≤ `maxChunks` chunks of ≤ `chunkChars` each, preserving every character
- * (content beyond `chunkChars * maxChunks` is dropped — a runaway-size backstop, not the common path).
- * Whitespace-only bodies yield `[]` (nothing to extract). Pure + unit-tested; the chunk boundaries are
- * deterministic so the content hash (taken over the full body) stays stable across runs.
+ * LEGACY byte-offset chunking: ≤ `maxChunks` chunks of ≤ `chunkChars` each, stepping by `chunkChars`.
+ *
+ * ⚠️ **THIS MUST REMAIN BYTE-EXACT FOREVER.** It is no longer how new content is chunked, but the CDC
+ * rollout is deliberately LAZY: an item whose body has not changed keeps the chunking it was pushed
+ * under, so `"<chars>x<cap>"` rows stay in `graph_episodes` indefinitely. Re-chunking one of those under
+ * the stored config — which is how `storedChunkingComplete` decides to leave it alone — reproduces its
+ * stored hashes only if this function is bit-for-bit what produced them. "Close enough" here means the
+ * whole legacy corpus fails completeness and full-re-pushes, which is the ~$76 event the lazy rollout
+ * exists to avoid.
+ *
+ * Whitespace-only bodies yield `[]` (nothing to extract), matching `chunkCdc`.
  */
-export function chunkContent(body: string, chunkChars = CHUNK_CHARS, maxChunks = MAX_EPISODE_CHUNKS): string[] {
+export function chunkContentLegacy(
+  body: string,
+  chunkChars = CHUNK_CHARS,
+  maxChunks = MAX_EPISODE_CHUNKS
+): string[] {
   const text = body ?? "";
   if (!text.trim()) return [];
   // Clamp the params too (not just the env at module load) so a direct caller passing 0/NaN can't
@@ -197,6 +290,81 @@ export function chunkContent(body: string, chunkChars = CHUNK_CHARS, maxChunks =
     chunks.push(text.slice(i, i + size));
   }
   return chunks;
+}
+
+/**
+ * Chunk a body under a SPECIFIC stored config string — the dispatch that makes "re-chunk under the
+ * config these hashes were produced with" expressible.
+ *
+ * Returns `null` for an unparseable config (including `""`, the column default). A caller that cannot
+ * reproduce a row's chunking must treat it as unattestable rather than guessing with the current one:
+ * guessing is precisely how a ledger comes to describe chunks that were never pushed.
+ */
+export function chunkContentUnderConfig(body: string, config: string | null | undefined): string[] | null {
+  const parsed = parseChunkConfig(config);
+  if (!parsed) return null;
+  return parsed.kind === "legacy"
+    ? chunkContentLegacy(body, parsed.chars, parsed.cap)
+    : chunkCdc(body, { target: parsed.target, min: parsed.min, max: parsed.max }, parsed.cap);
+}
+
+/**
+ * Split an item's body into episode-sized chunks under the CURRENT chunk config — the projector's own
+ * chunking, and what `toEpisodes` uses.
+ *
+ * Content-defined since PIPEFF-3: boundaries are a function of the characters around them rather than
+ * the distance from the start of the body, so an insertion perturbs the chunk it lands in and usually
+ * nothing else (measured: a 33-char insertion near the top of a 50,000-char document re-extracted 21 of
+ * 20 chunks under byte offsets and 1 under `cdc1`). Content past `MAX_EPISODE_CHUNKS` chunks is dropped
+ * — a runaway-size backstop, bounded from below by `CHUNK_MIN_CHARS × MAX_EPISODE_CHUNKS`.
+ * Whitespace-only bodies yield `[]` (nothing to extract). Pure + unit-tested; deterministic, so the
+ * content hash (taken over the full body) stays stable across runs.
+ */
+export function chunkContent(body: string): string[] {
+  return chunkCdc(body ?? "", CDC_PARAMS, MAX_EPISODE_CHUNKS);
+}
+
+/**
+ * PIPEFF-3, the third case: are the stored hashes' chunks **provably the whole body**, even though the
+ * chunking they were produced under is no longer the current one?
+ *
+ * This is what makes the CDC rollout lazy instead of a ~$76 re-extraction of text we already have. An
+ * item whose body has not changed and whose stored chunking covers all of it is left alone forever; only
+ * items that actually change get re-chunked under the new algorithm.
+ *
+ * **"Complete" must be defined precisely, because the loose definition is the hole.** It must NOT mean
+ * `content_sha256` matches — that is the exact bug this codebase has shipped twice in review, since the
+ * body sha is invariant to chunking. All four conditions:
+ *
+ *   1. re-chunk the body under the **stored** config (not the current one);
+ *   2. **element-wise** hash equality with the stored `chunk_shas` — not count equality, which a
+ *      coincidence of arity satisfies;
+ *   3. the re-chunk **consumed the whole body**: fewer chunks than the stored cap, or chunk lengths
+ *      summing to `body.length`. This is the free exact answer (term 1 already did the chunking) and is
+ *      strictly better than the arithmetic proxy `storedMin × storedCap ≥ body.length`, which would
+ *      condemn a 150K body fully covered in 60 of 80 chunks to a pointless re-extraction at every future
+ *      config change. An item CLIPPED at its old cap is "complete under the stored config" in the loose
+ *      sense while still owing content, and must NOT be left alone — or CDC would permanently re-strand
+ *      exactly the population CHUNKCAP-1 existed to un-strand;
+ *   4. an empty or unparseable `chunk_config` is **never** complete.
+ */
+export function storedChunkingComplete(args: {
+  body: string;
+  storedConfig: string | null | undefined;
+  storedShas: readonly string[] | null | undefined;
+  hash: (content: string) => string;
+}): boolean {
+  const parsed = parseChunkConfig(args.storedConfig); // (4)
+  if (!parsed) return false;
+  const stored = args.storedShas ?? [];
+  if (stored.length === 0) return false; // an empty ledger attests nothing
+  const rechunked = chunkContentUnderConfig(args.body, args.storedConfig); // (1)
+  if (!rechunked || rechunked.length !== stored.length) return false;
+  for (let i = 0; i < rechunked.length; i++) {
+    if (args.hash(rechunked[i]) !== stored[i]) return false; // (2) element-wise, in order
+  }
+  const consumed = rechunked.reduce((n, c) => n + c.length, 0);
+  return rechunked.length < parsed.cap || consumed === args.body.length; // (3)
 }
 
 /** Item kinds worth projecting as graph episodes — content-bearing knowledge, not raw config.
@@ -220,9 +388,11 @@ export interface ProjectSummary {
   projected: number;
   /**
    * EPISODES pushed to Graphiti, which is what extraction actually costs per unit. Distinct from
-   * `projected` because `chunkContent` splits a large item into up to `MAX_EPISODE_CHUNKS` (16), so
+   * `projected` because `chunkContent` splits a large item into up to `MAX_EPISODE_CHUNKS` chunks, so
    * the two differ by the corpus's chunk mix. The cost metric divides LLM calls by THIS — dividing by
    * items instead lets a shift toward chunkier documents look like a model regression.
+   * (The parenthetical here used to name a literal "16"; it went stale the moment the cap moved to 40,
+   * and again at 80. The constant is the only honest source.)
    */
   episodes: number;
   skipped: number;
@@ -515,13 +685,40 @@ export async function projectItemsToGraph(
     // must never describe something else. Both values are already in scope — no added work.
     const owesChunks = episodes.length > (existingRow?.chunk_shas?.length ?? 0);
     const chunkingUnchanged = chunkConfigDeltaCompatible(existingRow?.chunk_config, CHUNK_CONFIG);
+    // CASE 1 — the boundaries are TRUSTWORTHY: same (or cap-grown) config, and nothing left to owe.
+    const boundariesTrustworthy = chunkingUnchanged && !owesChunks;
+    // CASE 3 (PIPEFF-3) — the boundaries are STALE, but the item is PROVABLY COMPLETE under the config
+    // that produced its hashes, so re-chunking it would re-extract text we already have under different
+    // boundaries and learn nothing. It is what makes the CDC rollout lazy rather than a ~$76 burst:
+    // legacy-chunked rows whose bodies have not changed keep their chunking indefinitely. It also
+    // settles cap-SHRINK explicitly — a shrunk-cap item that verifies complete under its stored, larger
+    // cap is left alone, because the orphan tails a shrink creates are not fixed by re-extracting the
+    // head either.
+    //
+    // ⚠️ IT IS A WIDENING OF THIS COMPOSITE SKIP, NOT A NEW SITE, and it is written INSIDE the existing
+    // conjunction rather than beside it precisely so there is exactly ONE copy of each inherited term.
+    // A first draft repeated `!tierChanged` / `!purgeBeforeRepush` / the sha comparison inside a
+    // separate `provablyComplete` const; mutation testing showed those copies could all be deleted with
+    // every test still green — unfalsifiable terms asserting on trust, which is the shape this repo has
+    // a standing rule against. The `||` is therefore the only new thing here, and everything guarding
+    // it is shared with case 1: a re-queued (`''` sentinel) or redacted row cannot sha-match, a
+    // reclassified row fails `!tierChanged`, and a row owing a purge on this group fails
+    // `!purgeBeforeRepush` — in all three the completeness question is never even asked.
+    //
+    // Short-circuiting is load-bearing, not incidental: `storedChunkingComplete` RE-CHUNKS the body, so
+    // it must sit last, after the four cheap terms and behind `boundariesTrustworthy ||`.
     if (
       existingRow &&
       existingRow.content_sha256 === contentSha &&
       !tierChanged &&
       !purgeBeforeRepush &&
-      chunkingUnchanged &&
-      !owesChunks
+      (boundariesTrustworthy ||
+        storedChunkingComplete({
+          body: item.body ?? "",
+          storedConfig: existingRow.chunk_config,
+          storedShas: existingRow.chunk_shas,
+          hash: sha,
+        }))
     ) {
       // NO BACKFILL HERE ANY MORE (AIO-808). GRAPHCOST-1 had a branch that, for a row with an empty
       // chunk ledger and a matching body sha, recorded the CURRENT config's hashes without pushing —
