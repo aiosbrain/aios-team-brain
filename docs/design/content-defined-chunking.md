@@ -38,9 +38,20 @@ needed a $8 battery across six LLM runs because its effect was on model behaviou
 So this spec's central claim is testable in a unit test against this install's own documents, and the
 "cannot show movement ⇒ does not ship" rule is satisfiable without spending anything.
 
-**And it is coverage-neutral by construction.** The same characters end up in the graph either way;
-only the split points move. There is no admission control, no dropped content, and — unlike lever 2 —
-no mechanism by which the extractor sees *less* context about anything.
+**It is coverage-neutral by construction — but "coverage-neutral" is not "quality-neutral", and the
+distinction is exactly the one the lever-2 spec got wrong.** That spec called a case "provably
+lossless" and had to retract it under review. So, precisely:
+
+- **Coverage-neutral, and this part *is* by construction:** the same characters are ingested. No
+  admission control, no dropped content, no population excluded — provided the min-chunk/cap
+  arithmetic below holds, which is why that arithmetic is a requirement rather than a tuning knob.
+- **NOT quality-neutral, and the arithmetic gate cannot speak to it.** Different split points mean
+  different groupings, so an entity split across a boundary today may be whole tomorrow — or the
+  reverse. There is no *systematic* loss mechanism (nothing is removed from any prompt; unlike lever
+  2, no context is withheld), and content-defined boundaries plausibly land on more natural seams
+  than arbitrary byte offsets. But "plausibly better" is not "proven neutral", and this spec does not
+  claim it. The free arithmetic gate proves the *churn* reduction; it does not prove extraction
+  quality is unchanged, and nothing here pretends otherwise.
 
 ## The fix
 
@@ -57,7 +68,25 @@ neighbour. Expected: the 21-of-20 case becomes 1–2 of 20.
 |---|---|---|
 | target average | 2,500 chars | matches today's `CHUNK_CHARS`, so episode economics and the extraction ceiling are unchanged |
 | **minimum** chunk | **1,250 chars** | **load-bearing — see below** |
-| maximum chunk | 5,000 chars | a hard cut when no boundary is found; keeps every episode under the extraction ceiling |
+| maximum chunk | **4,000 chars** | a hard cut when no boundary is found — sized from the measurement below, not from the textbook 2× ratio |
+
+**The maximum is measured, not assumed — and the measurement found something.** The review demanded
+a number rather than the assertion that 5,000 "keeps every episode under the extraction ceiling",
+because an episode whose *output* overflows graphiti's 16,384-token cap is 202-accepted and **never
+becomes facts** (the 2026-06/07 blank-arcs class). Prod `llm_usage`, 30 days, `extract_edges` (the
+widest-output call kind at today's 2,500-char chunks):
+
+| p50 | p95 | p99 | max | ≥ half the ceiling |
+|---|---|---|---|---|
+| 486 | 2,421 | 3,948 | **16,384** | 1 of 898 calls (0.11%) |
+
+p99 sits at 24% of the ceiling, so doubling chunk size would put p99 near 48% — headroom, but **the
+max column is the finding: one call has already saturated the ceiling exactly**, at today's chunk
+size. That is one episode whose edges were silently truncated. It is rare (1 in ~900 over 30 days,
+on 2026-08-05) and pre-existing, but it proves the tail is not theoretical, so the max chunk is set
+to **4,000** rather than 5,000 — p99 → ~6,300, ~38% of ceiling — and **the existing saturation is
+filed separately rather than absorbed here** (it is not CDC's bug, and CDC must not be the reason it
+goes unlooked-at).
 
 **The minimum is not a tuning knob, it is what stops CDC from silently dropping content.**
 `MAX_EPISODE_CHUNKS` caps an item at 40 *chunks*, and content past the cap is discarded (the
@@ -68,10 +97,26 @@ sooner and **drop text that is currently ingested**. The minimum chunk size boun
 1,250-char floor, 40 chunks covers at least 50,000 characters.
 
 **That is still a regression against today's guaranteed 100,000, so the cap must be raised in the
-same change** to `MAX_EPISODE_CHUNKS` such that `min_chunk × cap ≥ 100,000` — i.e. **80**. This is
+same change** to `MAX_EPISODE_CHUNKS` such that `min_chunk × cap ≥ 100,000` — i.e. **80**
+(1,250 × 80 = 100,000, exactly today's floor). This is
 the cheap direction of the two knobs (raising the cap does not re-extract the corpus; changing
 `CHUNK_CHARS` does — see the ⚠️ comment on those constants), and it is a *requirement*, not an
 option: shipping CDC without it would quietly reduce how much of a large document reaches the graph.
+
+### The chunking unit, and what `cdc1` actually pins
+
+**The rolling hash slides over UTF-16 code units** (`charCodeAt`), and boundary indices are code-unit
+indices — the same space `slice` already uses, so legacy and CDC boundaries live in one coordinate
+system. This is stated because the alternative is the exact class this repo has already been bitten
+by (Postgres `length()` counting characters while JS `.length` counts UTF-16 units): a hash rolling
+over bytes while min/max live in code units would put boundary indices in two different spaces.
+A boundary inside a surrogate pair shifts deterministically by one.
+
+**`cdc1` is the reproducibility contract, not the numbers beside it.** "Re-chunk under the stored
+config" needs every detail: the gear table, the window length, the mask derivation, the unit above.
+Those are *not* in the config string and must not be — so: **`cdc1` pins all of them; changing any
+one is `cdc2`**, and the checked-in boundary fixture is what makes a silent drift a build failure.
+The fixture is not a nicety, it is the definition of `cdc1`.
 
 ### Determinism is a correctness requirement, not a nicety
 
@@ -82,17 +127,27 @@ handling). **Pinned by a test that chunks a fixture twice and asserts identical 
 that chunks the same fixture under a checked-in expected boundary list, so an accidental algorithm
 change is a build failure rather than a silent full-corpus re-push.
 
-## The rollout is the hard part, and it is worth $51 to get right
+## The rollout is the hard part, and it is worth ~$76 to get right
 
 Changing boundaries makes every stored `chunk_shas` entry meaningless. `chunkConfigDeltaCompatible`
 returns false for a config change, so **all 2,267 items fall through the composite skip to a full
-re-push: ~5,166 episodes ≈ $51, for zero new information** — the same text, re-extracted under
+re-push: ~5,166 episodes ≈ $76 at the corrected $0.0147/episode, for zero new information** — the same text, re-extracted under
 different boundaries.
 
 **So CDC rolls out LAZILY.** An item whose body has not changed keeps its existing chunking
 indefinitely; only items that actually change get re-chunked under the new algorithm. `chunk_config`
 already records the algorithm per row (`"2500x40"` → `"cdc1-2500-1250-5000-80"`), so a mixed corpus is
 representable and honest.
+
+**The day-one burst, priced.** "Only items that actually change get re-chunked" is false for exactly
+one population, deliberately: the 3 items still over the old cap (ARCHITECTURE.md ~338K, and two
+~115–120K docs) are body-unchanged but **fail completeness**, so they full-re-push on the first tick
+— roughly **170 episodes ≈ $2.50**, part of it re-extracting heads already in the graph. That is the
+CHUNKCAP-1 un-stranding arriving as a side effect, which is correct, but it is a cost and it is named
+here rather than discovered. Note also that the cap raise rides *inside* the CDC config string, so
+the legacy helper's cap-grow path (`b.cap >= a.cap`) is **never exercised by this rollout** — the
+"raising the cap is free" claim is true of the knob in general but is not the mechanism that runs
+here.
 
 This needs a **third case** the current two-case helper cannot express
 (`lib/graph/project.ts:119`, consumed by the composite skip at `:517`):
@@ -111,17 +166,48 @@ in review, since the body sha is invariant to chunking. It means all four of:
 1. parse the **stored** `chunk_config` and re-chunk the body under **that** algorithm and parameters
    (which requires `chunkContent` to become dispatchable on a config string — see *Build shape*);
 2. require **element-wise hash equality** with the stored `chunk_shas` — not count equality;
-3. require the stored config to have **covered the whole body**
-   (`storedMinChunk × storedCap ≥ body.length` for CDC, `storedChars × storedCap ≥ body.length` for
-   the legacy fixed algorithm) — otherwise an item clipped at its old cap is "complete under the
-   stored config" while still owing content, and CDC would permanently re-strand exactly the
-   population CHUNKCAP-1 existed to un-strand;
+3. require the re-chunk to have **consumed the whole body** — chunk count < the stored cap, or the
+   chunk lengths summing to `body.length`. Term 1 already re-chunks under the stored config, so this
+   exact answer is **free**, and it is strictly better than the arithmetic proxy
+   (`storedMinChunk × storedCap ≥ body.length`) an earlier draft used: that proxy is
+   sufficient-but-not-necessary, and would condemn a 150K body fully covered in 60 of 80 chunks to a
+   pointless full re-extraction at every future config change. Either way the point stands — an item
+   clipped at its old cap is "complete under the stored config" while still owing content, and must
+   NOT be left alone, or CDC would permanently re-strand exactly the population CHUNKCAP-1 existed to
+   un-strand;
 4. an empty or unparseable `chunk_config` (`''` is the column default) is **never** complete.
 
 The other skip terms stay ANDed: this is a **widening of the composite skip, not a new site**, so
 `!tierChanged`, `!purgeBeforeRepush` and the `''` reconcile sentinel are inherited — a re-queued or
 redacted row can never sha-match and so still pushes. **One mutation test per ANDed term**, per the
 one-condition-per-fixture rule.
+
+### The steady state — and the omission that would have shipped this lever as a no-op
+
+The transition above (legacy → CDC) is only half the problem. **What happens when a CDC-stored item's
+body changes?** The spec's first draft never said, and the shipped code answers badly:
+`chunkConfigDeltaCompatible`'s parser is `/^(\d+)x(\d+)$/` (`project.ts:121`), which returns **false
+for any CDC string — including `stored === current`**. So an insertion edit to a CDC item would fail
+delta eligibility, `alreadyPushed` would be empty, and **every chunk would full-re-push. The
+insertion cascade survives, now wearing content-defined boundaries.**
+
+Worse, the gate this spec declared — "the unit test is the gate" — is a pure-function test counting
+hash changes between two chunkings. **It stays green while the projector re-pushes everything**,
+because it never touches the push layer. That is the "pin the call site, not just the function"
+failure this repo has already paid for, and the same shape as the parent spec's own recorded blocker
+(a patch target that would have built green and changed nothing).
+
+So, required:
+
+- **`chunkConfigDeltaCompatible` (or its successor) must return true for identical CDC configs**, and
+  CDC↔CDC **cap-grow** is explicitly allowed on the same reasoning the legacy path uses: a CDC
+  boundary depends only on the content preceding it within the chunk, so the chunk *sequence* is a
+  prefix-stable append — a larger cap only extends it. Pinned by the same byte-identical-prefix test
+  the legacy path already has, not asserted.
+- **A projector-level acceptance test in the data-mechanics tier** (unit tier cannot see this): an
+  item stored under the CDC config, body edited by a 33-char insertion near the top, and the
+  fake-graphiti spy must receive **≤ 3 episodes**. Without it, "cannot show movement ⇒ does not ship"
+  is satisfied by a weaker gate wearing the same words.
 
 ### Cap-shrink is decided explicitly, not inherited
 
@@ -138,6 +224,11 @@ the head either (nothing purges them), so paying to re-extract buys nothing. The
   stored config" is expressible. The legacy `"<chars>x<cap>"` form keeps its exact current behaviour —
   a mixed corpus means the old algorithm must remain byte-exact forever, not "close enough".
 - The rolling hash and the boundary rule live in one pure module with no I/O, unit-tested.
+- **The CDC parameters keep env knobs** (as `CHUNK_CHARS`/`MAX_EPISODE_CHUNKS` have today), and
+  `CHUNK_CONFIG` is **derived from the effective values by construction** — so an env flip is just a
+  config change with the lazy semantics, rather than a silent boundary change under a stale label.
+- `ProjectSummary.episodes`' docstring still says "(16)" — stale since the cap became 40; fix while
+  touching.
 - `CHUNK_CONFIG` becomes the CDC string; the ⚠️ "$47 re-extracts the corpus" warnings on
   `CHUNK_CHARS`/`MAX_EPISODE_CHUNKS` become misleading once lazy CDC lands and **must be updated in
   this PR** (flagged in the parent spec's Risks and easy to forget).
