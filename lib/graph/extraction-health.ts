@@ -385,6 +385,26 @@ export function censusRecentSince(nowMs: number): string {
   return new Date(nowMs - CENSUS_RECENT_MS).toISOString();
 }
 
+/**
+ * The sentinel upper bound for a LIVE read — "no right edge". A far-future instant rather than a
+ * conditionally-omitted clause, so there is exactly ONE query text: a Cypher `n.created_at <
+ * datetime($until)` with a null `$until` evaluates to null and silently filters every row out, and
+ * two query strings (bounded / unbounded) is how the bounded form ends up untested.
+ */
+export const CENSUS_UNBOUNDED_UNTIL = "9999-12-31T23:59:59.999Z";
+
+/**
+ * The recent window's UPPER bound. `null` ⇒ live (unbounded); a number ⇒ a retroactive span.
+ *
+ * The upper bound is not decoration. The retroactive pre-deploy baseline the verification table
+ * depends on is a **span**, and a lower-bound-only query would sweep post-deploy nodes into the
+ * "before" side — reading the patched extractor's behaviour as the baseline it is being compared
+ * against. Shared by BOTH legs of `entitiesPerEpisode` for the same reason `censusRecentSince` is.
+ */
+export function censusRecentUntil(untilMs: number | null): string {
+  return untilMs === null ? CENSUS_UNBOUNDED_UNTIL : new Date(untilMs).toISOString();
+}
+
 /** One per-raw-name row from the census Cypher (Cypher aggregates by the RAW name). */
 export interface CensusNameRow {
   name: string | null;
@@ -514,17 +534,23 @@ export async function nameCollisionSignals(
  */
 export async function recentEntityCount(
   groupId: string,
-  nowMs = Date.now()
+  nowMs = Date.now(),
+  untilMs: number | null = null
 ): Promise<number | null> {
   if (!neo4jConfigured()) return null;
   try {
     const rows = await runRead<{ entities: number }>(
       `MATCH (n:Entity {group_id: $g})
-       WHERE n.created_at >= datetime($since)
+       WHERE n.created_at >= datetime($since) AND n.created_at < datetime($until)
        RETURN count(n) AS entities`,
-      { g: groupId, since: censusRecentSince(nowMs) }
+      { g: groupId, since: censusRecentSince(nowMs), until: censusRecentUntil(untilMs) }
     );
-    const n = Number(rows[0]?.entities ?? 0);
+    // NOT `?? 0`. A `count(*)` always returns a row, so a missing one means the query did not run the
+    // way this code thinks it did — and this file's own rule is that a zero which looks like a
+    // measurement is worse than an admitted unknown.
+    const raw = rows[0]?.entities;
+    if (raw === undefined || raw === null) return null;
+    const n = Number(raw);
     return Number.isFinite(n) ? n : null;
   } catch {
     return null; // unreadable → unknown, never a zero that looks like a measurement
@@ -652,22 +678,29 @@ interface GroupEpisodeFlow {
 
 async function groupEpisodeFlows(
   teamId: string | null,
-  nowMs: number
+  nowMs: number,
+  untilMs: number | null = null
 ): Promise<Map<string, GroupEpisodeFlow> | null> {
   try {
-    // The SAME span helper the entity-count leg uses — `entitiesPerEpisode` divides one by the
-    // other, so this must never become a second, independently-computed window.
+    // The SAME span helpers the entity-count leg uses — `entitiesPerEpisode` divides one by the
+    // other, so neither edge may become a second, independently-computed window.
+    //
+    // Only the RECENT leg takes the upper bound. `baseline` and `span` are live-alarm concepts (the
+    // trailing comparison window and the release valve); bounding them would change what the
+    // pollution alarm judges, which this sensor is explicitly not allowed to do. For every live
+    // caller `untilMs` is null ⇒ the sentinel ⇒ byte-identical behaviour to an unbounded filter.
     const recentSince = censusRecentSince(nowMs);
+    const recentUntil = censusRecentUntil(untilMs);
     const baselineSince = new Date(nowMs - CENSUS_BASELINE_MS).toISOString();
-    const params: unknown[] = [recentSince, baselineSince];
+    const params: unknown[] = [recentSince, baselineSince, recentUntil];
     let where = "";
     if (teamId !== null) {
       params.push(teamId);
-      where = "where team_id = $3";
+      where = "where team_id = $4";
     }
     const res = await runSql<{ group_id: string; recent: number; baseline: number; span: number }>(
       `select group_id,
-              count(*) filter (where projected_at >= $1 and content_sha256 <> '')::int as recent,
+              count(*) filter (where projected_at >= $1 and projected_at < $3 and content_sha256 <> '')::int as recent,
               count(*) filter (where projected_at >= $2 and projected_at < $1 and content_sha256 <> '')::int as baseline,
               count(*) filter (where projected_at >= $2 and content_sha256 <> '')::int as span
          from graph_episodes ${where}
@@ -710,12 +743,18 @@ export interface GroupCensus {
  * purpose — the ledger is the one source that knows what was pushed, so a group that exists only in
  * Neo4j (never projected by this install) is not this alarm's to judge. Best-effort: an unreadable
  * ledger returns [] and every caller degrades quietly.
+ *
+ * `untilMs` (PIPEFF-2, default null = live) puts a right edge on the `entitiesPerEpisode` legs —
+ * BOTH of them, which is the whole point: it is what makes the retroactive pre-deploy baseline
+ * readable from THIS surface instead of a hand-written Cypher whose window is derived independently
+ * of `censusRecentSince`. It does not move the census/alarm legs (see `groupEpisodeFlows`).
  */
 export async function groupCensuses(
   teamId: string | null,
-  nowMs = Date.now()
+  nowMs = Date.now(),
+  untilMs: number | null = null
 ): Promise<GroupCensus[]> {
-  const flows = await groupEpisodeFlows(teamId, nowMs);
+  const flows = await groupEpisodeFlows(teamId, nowMs, untilMs);
   if (flows === null) return [];
   const configured = neo4jConfigured();
   const unknown: NameCollisionSignals = {
@@ -727,7 +766,10 @@ export async function groupCensuses(
   return Promise.all(
     [...flows.entries()].map(async ([group, flow]) => {
       const [signals, recentEntities] = configured
-        ? await Promise.all([nameCollisionSignals(group, nowMs), recentEntityCount(group, nowMs)])
+        ? await Promise.all([
+            nameCollisionSignals(group, nowMs),
+            recentEntityCount(group, nowMs, untilMs),
+          ])
         : ([unknown, null] as const);
       return {
         group,

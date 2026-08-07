@@ -39,10 +39,21 @@ const CENSUS_REFUSAL_COPY: Record<NonNullable<GroupCensusSummary["refusal"]>, st
 
 const sharePct = (n: number | null) => (n === null ? "?" : `${Math.round(n * 1000) / 10}%`);
 
-/** Entity yield, 2dp — or an explicit "no episodes in window", NEVER a 0/∞/NaN that reads as a
- *  measurement. The null case is a real state (nothing was projected), not a missing number. */
-const yieldLabel = (n: number | null) =>
-  n === null ? "no episodes in window" : `${(Math.round(n * 100) / 100).toFixed(2)} entities/episode`;
+/**
+ * Entity yield, 2dp — never a 0/∞/NaN that reads as a measurement.
+ *
+ * A null ratio has TWO distinct causes and they must not share one sentence. "no episodes in window"
+ * is a real, correct statement about a quiet group; saying it when the entity Cypher actually FAILED
+ * is a false statement about the ledger, and in the census-judged / entity-leg-failed state there is
+ * no refusal copy on the line above to disambiguate it. So the numerator's own null is what
+ * separates them: unreadable graph vs genuinely nothing projected.
+ */
+const yieldLabel = (c: GroupCensusSummary) =>
+  c.entitiesPerEpisode !== null
+    ? `${(Math.round(c.entitiesPerEpisode * 100) / 100).toFixed(2)} entities/episode`
+    : c.recentEntities === null
+      ? "graph unreadable"
+      : "no episodes in window";
 
 /**
  * One group's entity-name census (ALARMFIX-1): how many normalised names gained a node in the recent
@@ -73,7 +84,7 @@ function CensusRow({ c }: { c: GroupCensusSummary }) {
         </span>
       </div>
       <div className="text-ink-tertiary">
-        yield: {yieldLabel(c.entitiesPerEpisode)}
+        yield: {yieldLabel(c)}
         {c.recentEntities !== null ? ` (${c.recentEntities} new entities)` : ""} · observational
       </div>
     </div>

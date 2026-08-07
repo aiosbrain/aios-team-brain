@@ -63,6 +63,14 @@ jobs:
         with:
           node-version: "20"
           cache: "npm"
+      # python3 is a HARD dependency of the unit tier, not an incidental one:
+      # test/guards/graphiti-patch-same-item.test.ts runs the committed patch script and EXECUTES the
+      # Python it inserts, rather than paraphrasing it in TS. That guard fails loudly without python3
+      # (a self-skipping guard disarms silently), so declare the interpreter here instead of
+      # inheriting whatever the runner image happens to ship.
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
       - run: npm ci
       - run: npm run test:gateway-approval-contracts
       - run: npm test

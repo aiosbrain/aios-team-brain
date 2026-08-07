@@ -3,7 +3,9 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   CENSUS_RECENT_MS,
+  CENSUS_UNBOUNDED_UNTIL,
   censusRecentSince,
+  censusRecentUntil,
   deriveEntitiesPerEpisode,
 } from "@/lib/graph/extraction-health";
 
@@ -36,8 +38,32 @@ const health = readFileSync(HEALTH, "utf8");
 describe("the windowed entity count is the query the spec specifies", () => {
   it("counts Entity nodes CREATED in the window, per group", () => {
     expect(health).toContain("MATCH (n:Entity {group_id: $g})");
-    expect(health).toContain("WHERE n.created_at >= datetime($since)");
     expect(health).toContain("RETURN count(n) AS entities");
+  });
+
+  it("the window is a SPAN — both edges, in one query text", () => {
+    // The upper bound is not decoration (spec §"the backstop question"). The retroactive pre-deploy
+    // baseline is a span, and a lower-bound-only query sweeps POST-deploy nodes into the "before"
+    // side — i.e. it reads the patched extractor's own behaviour as the baseline it is being
+    // compared against, and reads as a perfectly plausible number while doing it.
+    expect(health).toContain(
+      "WHERE n.created_at >= datetime($since) AND n.created_at < datetime($until)"
+    );
+    // Asserted as a whole clause, not two substrings: `>= $since` alone is exactly the deviating
+    // form this test exists to reject, and it would pass a pair of independent `toContain`s.
+    expect(health).toContain("{ g: groupId, since: censusRecentSince(nowMs), until: censusRecentUntil(untilMs) }");
+    // ONE query text. A second, unbounded variant is how the bounded form ends up never executed.
+    expect(health.match(/RETURN count\(n\) AS entities/g)?.length).toBe(1);
+  });
+
+  it("the live read is unbounded via a sentinel, not via a dropped clause", () => {
+    // A Cypher `n.created_at < datetime(null)` evaluates to null and silently filters EVERY row out,
+    // so "no upper bound" cannot be expressed by passing null through. The sentinel keeps one query
+    // text; this pins that it is genuinely far-future rather than an arbitrary date that will one day
+    // start truncating the live window.
+    expect(censusRecentUntil(null)).toBe(CENSUS_UNBOUNDED_UNTIL);
+    expect(Date.parse(CENSUS_UNBOUNDED_UNTIL)).toBeGreaterThan(Date.UTC(9000, 0, 1));
+    expect(censusRecentUntil(Date.UTC(2026, 7, 1))).toBe(new Date(Date.UTC(2026, 7, 1)).toISOString());
   });
 
   it("windows on `created_at` (extraction time), never `valid_at` (content time)", () => {
@@ -50,20 +76,46 @@ describe("the windowed entity count is the query the spec specifies", () => {
     // There is no RLS backstop (CLAUDE.md §5). The group list comes from the team-scoped ledger and
     // the Cypher is parameterised by ONE group, so a team's card can never count another tier's
     // entities. A query without the `{group_id: $g}` match would silently aggregate the instance.
-    expect(health).toContain("recentEntityCount(group, nowMs)");
-    expect(health).toContain("{ g: groupId, since: censusRecentSince(nowMs) }");
+    expect(health).toContain("recentEntityCount(group, nowMs, untilMs)");
+    expect(health).toContain("MATCH (n:Entity {group_id: $g})");
   });
 });
 
 describe("both legs of the ratio are windowed on ONE span", () => {
-  it("the ledger leg and the entity leg call the same helper", () => {
+  it("the ledger leg and the entity leg call the same helper — for BOTH edges", () => {
     // Structural, not incidental: a second `new Date(nowMs - CENSUS_RECENT_MS)` in the ledger query
     // is exactly how the two spans would drift apart later without either test noticing.
     expect(health).toContain("const recentSince = censusRecentSince(nowMs);");
     expect(health).toContain("since: censusRecentSince(nowMs)");
-    // Exactly one place computes the recent boundary from the constant.
-    const derivations = health.match(/new Date\(nowMs - CENSUS_RECENT_MS\)/g) ?? [];
-    expect(derivations.length).toBe(1);
+    // The upper edge too. Bounding only the numerator would build the mismatched-span bug this whole
+    // describe exists to prevent — a bounded entity count over an unbounded episode count.
+    expect(health).toContain("const recentUntil = censusRecentUntil(untilMs);");
+    expect(health).toContain("until: censusRecentUntil(untilMs)");
+    // Exactly one place computes each recent boundary from its source.
+    expect((health.match(/new Date\(nowMs - CENSUS_RECENT_MS\)/g) ?? []).length).toBe(1);
+    expect((health.match(/new Date\(untilMs\)/g) ?? []).length).toBe(1);
+  });
+
+  it("the ledger's RECENT leg carries the same right edge the entity leg does", () => {
+    // The retroactive read is `groupCensuses(team, now, preDeployMs)`; if the SQL recent filter had
+    // no `< $3`, that call would return (bounded entities) / (unbounded episodes) — a ratio that is
+    // wrong by exactly the post-deploy episodes it was supposed to exclude, and looks fine.
+    expect(health).toContain(
+      "count(*) filter (where projected_at >= $1 and projected_at < $3 and content_sha256 <> '')::int as recent"
+    );
+    expect(health).toContain("groupEpisodeFlows(teamId, nowMs, untilMs)");
+  });
+
+  it("the baseline and span legs are NOT bounded — they are live-alarm concepts", () => {
+    // Deliberate asymmetry, pinned so it reads as a decision rather than an oversight: bounding the
+    // trailing baseline or the release valve would change what the pollution alarm judges, and this
+    // sensor is explicitly not allowed to do that.
+    expect(health).toContain(
+      "count(*) filter (where projected_at >= $2 and projected_at < $1 and content_sha256 <> '')::int as baseline"
+    );
+    expect(health).toContain(
+      "count(*) filter (where projected_at >= $2 and content_sha256 <> '')::int as span"
+    );
   });
 
   it("the helper is CENSUS_RECENT_MS before now, as an ISO instant", () => {
@@ -139,7 +191,30 @@ describe("OBSERVATIONAL: the sensor must not be able to move any verdict", () =>
     expect(card).toContain("c.entitiesPerEpisode");
     expect(card).toContain("entities/episode");
     expect(card).toContain("observational");
-    // The null case renders as words, not as a number.
-    expect(card).toContain('n === null ? "no episodes in window"');
+  });
+
+  it("the two causes of a null ratio render as DIFFERENT sentences", () => {
+    // "no episodes in window" is a claim about the LEDGER. Printing it when the entity Cypher failed
+    // is simply false — and in the census-judged / entity-leg-failed state there is no refusal copy
+    // on the line above to disambiguate, so the card would state a wrong fact with nothing beside it
+    // to contradict. The numerator's own null is what separates them.
+    // Pinned as ONE contiguous expression rather than three `toContain`s plus an index comparison:
+    // the doc comment above this function names both strings, so an index-ordering assertion is
+    // satisfied by prose and proves nothing about the branch that actually runs.
+    const card = readFileSync(CARD, "utf8");
+    expect(card).toContain(
+      `    : c.recentEntities === null\n      ? "graph unreadable"\n      : "no episodes in window";`
+    );
+  });
+});
+
+describe("a missing row is unknown, not a measured zero", () => {
+  it("the Neo4j read does not default a missing count to 0", () => {
+    // Contained today (a `count(*)` always returns a row), pinned anyway because this file's own rule
+    // is that a zero which looks like a measurement is worse than an admitted unknown — and a future
+    // query shape change is exactly when a `?? 0` would start lying.
+    expect(health).toContain("const raw = rows[0]?.entities;");
+    expect(health).toContain("if (raw === undefined || raw === null) return null;");
+    expect(health.includes("rows[0]?.entities ?? 0")).toBe(false);
   });
 });
