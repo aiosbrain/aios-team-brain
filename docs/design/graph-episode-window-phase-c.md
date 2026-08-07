@@ -200,6 +200,45 @@ that can be *proved* rather than argued, so it is a merge precondition rather th
 > sha and therefore the sha of the file it produces — dissolving the claim above. The `why` lives in
 > `graphiti/Dockerfile`'s PATCH 3 block and in this spec.
 
+## Verification result — measured 2026-08-07, and it beat the corrected prediction
+
+Deploy: graphiti + brain on `1693d9e`, 07:08:24Z. First drain-clean post-deploy window,
+07:19:49 → 08:00:27 (opened after a 10.8-minute quiet gap, closed with the trailing drain clear):
+
+```
+episodes    29    cross-check 29 pushed per ingest_runs · 0% apart · EXACT
+input tok   865,835    29,856 per episode
+cost        $0.32      $0.0110 per episode
+MULTIPLE    47.8x the content a full episode carries   (was 64.1x)
+```
+
+| | tokens/episode |
+|---|---|
+| baseline (2026-08-05, 169 episodes, drain-clean) | 40,070 |
+| **measured post-deploy** | **29,856** |
+| **fall** | **−25.5%** |
+
+**The instrument's own validity gate passed** — cross-check *exact*, zero retry gap — and it refused
+three earlier window attempts before this one, including the first post-deploy window (the deploy had
+landed mid-burst, so pre-deploy tokens sat in it without their episodes). The number reported is the
+one it was willing to stand behind.
+
+### My ~18% correction was wrong, in the conservative direction
+
+The correction assumed the predecessor block is **fixed in absolute size**, so the battery's ~7,200
+token cut would be ~18% against prod's larger baseline. The measured absolute cut is **10,214** —
+larger than the battery's. The likely reason, stated as a hypothesis rather than a measurement: the
+battery's corpus was **18.5% single-chunk small items** (some ~200 chars), so the ten predecessors it
+carried were on average much smaller than prod's, where predecessors are mostly full 2,500-char
+chunks. A bigger block removed is a bigger saving.
+
+**Caveats that keep this honest:** 29 episodes against the baseline's 169, on a different day with a
+different content mix, and no same-day pre-deploy window was obtainable — all three candidates were
+*refused* by the harness. So the **direction and rough magnitude are solid; the exact percentage
+carries content-mix uncertainty.** The band this spec pre-registered was ~15–25%; the result sits at
+the top of it, which is a pass either way, and the "no fall at all ⇒ the patch did not take effect"
+falsifier is decisively not triggered.
+
 ## Rollout and rollback
 
 1. **Rollback anchor recorded: graphiti deployment `fde9d3b4-9e7`** (SUCCESS, 2026-08-07T00:57:11).
