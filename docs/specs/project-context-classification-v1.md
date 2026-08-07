@@ -38,7 +38,7 @@ which parts." Verified against `origin/main` (commit `1693d9e`):
 
 | Briefing claim | Verdict | Evidence |
 |---|---|---|
-| ~75 tables, 56 migrations, ~600 commits, two contributors | ✅ almost exact | 76 `create table` in `postgres/schema.sql` (75 `if not exists` + 1 plain); **55** migrations; 610 commits; 2 human contributors + dependabot |
+| ~75 tables, 56 migrations, ~600 commits, two contributors | ✅ almost exact | 75 `create table if not exists` in `postgres/schema.sql` (a naive `create table` grep counts 76 — the extra hit is the comment at `schema.sql:13`); **55** migrations; 610 commits; 2 human contributors + dependabot |
 | ~27 `/api/v1/*` routes, brain-api v1.17 | ✅ | **26** route files under `app/api/v1/`; v1.17 in `lib/api/schemas.ts:55` |
 | API keys `aios_<key_id>_<secret>`, Bearer + `X-AIOS-Team` | ✅ | `lib/api/auth.ts:40,76` |
 | Only access model is two-tier `team`/`external`, `admin` → 422, app-code only, no RLS | ✅ | `lib/graph/group.ts:8`, `app/api/v1/items/route.ts:54-60`, CLAUDE.md §5 |
@@ -321,7 +321,9 @@ correction to the brief's framing: two of the three modalities never fan out at 
 that breaks latency AND answer focus. Ruling: an **expansion budget** — the graph stage covers the
 top-K visible partitions (K = 8 default, configuration not constant), selected by a cheap router:
 initiative-profile-embedding similarity to the query (the Part II profile embeddings, reused) plus a
-recency prior, with General always included. FTS/dense remain complete over the full visible set, so
+recency prior, with General always included. Phase dependency stated: profile embeddings are a
+Phase D artifact while fan-out ships in Phase C — the router runs recency-only until profiles
+exist, which is safe precisely because correctness never depends on the router (below). FTS/dense remain complete over the full visible set, so
 **correctness never depends on the router** — beyond-cap partitions lose only graph-flavored recall,
 and the answer footer discloses scope ("graph expansion covered 8 of your 37 projects") — a
 deliberate exception to §5.7's non-disclosure because it describes the principal's OWN scope, not
@@ -390,9 +392,16 @@ Everyone may see**, not "everything":
    extracted once, in its restricted partition only, and can never sit in an Everyone-visible graph.
    The seed dataset's `supplier-negotiation` content is NOT in General — that is the leak-by-
    construction this rule exists to prevent.
-3. **Deliberate wide+specific tagging** (content in General AND project P) is allowed, costs 2×
-   extraction for that item, and is counted honestly in P̄ — it is the only source of multiplication,
-   and the no-widening invariant keeps automation from creating it.
+3. **Wide+specific tagging** (content in General AND project P) costs 2× extraction for that item
+   and is counted honestly in P̄. Be precise about who creates it: auto-tagging Everyone-visible
+   content into a NARROWER initiative is non-widening, therefore permitted — it is the tagging
+   engine's core use case — so automation legitimately produces General+P dual membership. The
+   no-widening invariant prevents the opposite direction only (restricted → wider). **Expected
+   steady state, stated rather than implied:** P̄ ≈ 1 + (share of content classified into an
+   initiative) — approaching ~2 (≈ $760/month at the measured rate) if the whole corpus classifies.
+   The levers that hold real spend below that ceiling: `exclusive` container rules (restricted
+   content is extracted once, not twice), cold-project laziness (§6 mitigation 2 — an initiative
+   nobody reads never extracts), and the small-model routing already in force.
 4. **Migration:** General's graph is today's team graph (nothing re-extracted); the eval baseline
    survives migration byte-for-byte. It then *drifts by design* as teams restrict content out of
    General — which is exactly what §12's restricted-principal eval axis exists to keep honest.
@@ -477,7 +486,11 @@ Design (defence-in-depth under the oracle, not a replacement):
   key's member (`lib/api/auth.ts` already resolves it); INSERT/UPDATE policies on content tables
   require `team_id = current_setting('aios.team_id')::uuid` and a non-null principal, so a forged or
   cross-team write dies in the database even if a route bug lets it past the app layer. Single-writer
-  modules are unaffected — they run as the same app role with principal context set.
+  modules are unaffected — they run as the same app role with principal context set. Scheduler and
+  background runs have no member: they set a per-team SYSTEM principal
+  (`set_config('aios.member_id', 'system', …)` with `aios.team_id` real), which write policies accept
+  and read policies treat as full-team — the non-null-principal rule therefore never blocks a tick,
+  and a background job that forgets to set context still fails closed.
 
 Perf note (honest): membership-join policies on every row-read add a join per table; the phase gate
 includes a before/after latency measurement on the three hottest reads (timeline, retrieve, items
