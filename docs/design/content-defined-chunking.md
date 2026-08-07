@@ -88,7 +88,7 @@ max column is the finding: one call has already saturated the ceiling exactly**,
 size. That is one episode whose edges were silently truncated. It is rare (1 in ~900 over 30 days,
 on 2026-08-05) and pre-existing, but it proves the tail is not theoretical, so the max chunk is set
 to **4,000** rather than 5,000 — p99 → ~6,300, ~38% of ceiling — and **the existing saturation is
-filed as `EXTRUNC-1`** (Linear key on the next projection), not absorbed here: silent output
+filed as `EXTRUNC-1`** → [AIO-827](https://linear.app/je4light/issue/AIO-827), not absorbed here: silent output
 truncation happens under *any* chunking, and the fix is detection-and-retry in the extraction
 pipeline (`finish_reason`, or `output == cap`) rather than a chunk-size change. The 16,384 output
 tokens came from ~625 tokens of content — ~26× the input, which points at degenerate generation, not
