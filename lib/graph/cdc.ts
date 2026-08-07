@@ -20,9 +20,16 @@
  *      space `String.prototype.slice` uses (see §"the chunking unit" below);
  *   2. the two gear tables and the splitmix32 stream that generates them;
  *   3. the rolling-hash update `h = ((h << 1) + gear(c)) >>> 0`, restarted at each chunk start;
- *   4. the mask derivation (`normBits` from `target - min`, ±2 for the normalized regions) and the
+ *   4. the mask derivation — `bits = round(log2(target))`, the normalized pair at **±1** (level 1;
+ *      level 2 was measured and REJECTED, see `masksFor`), the **backup mask at `bits - 6`**, and the
  *      "top-N-bits are zero" cut test;
- *   5. the surrogate-pair shift rule.
+ *   5. the surrogate-pair shift rule (+1, so `min` can never be violated).
+ *
+ * (Item 4 previously described a `normBits`-from-`target - min` derivation at ±2 and omitted the
+ * backup mask entirely — neither of which this module ships. The fixture protected the *behaviour*,
+ * but a maintainer reconstructing `cdc1` from this list would have rebuilt the wrong algorithm. Kept
+ * as a note because the list is the human-readable half of the contract and its accuracy is the
+ * whole point.)
  *
  * `test/graph-cdc.test.ts` checks in an expected boundary list for a fixture. That fixture is not a
  * nicety — it IS the definition of `cdc1`, and it turns a silent algorithm drift into a build failure
@@ -159,8 +166,11 @@ function normalizeParams(p: CdcParams): { min: number; target: number; max: numb
  *
  * `bits - 6` is the backup mask. Sized so that a hash-quiet run long enough to defeat the loose mask
  * over 1,500 positions still almost always yields a backup: at 5 bits, hard cuts over this repo's own
- * markdown corpus fall from ~14% to ~0.3%. Making it easier (bits-4) starts to make the backup itself
- * near-positional; harder (bits-3) leaves ~3% hard cuts and a worse delete tail.
+ * markdown corpus fall from ~14% to ~0.3%. Easier masks (bits-7, bits-8 — fewer required zero bits)
+ * start to make the backup itself near-positional; harder ones (bits-4, bits-3 — MORE required zero
+ * bits) leave ~3% hard cuts and a worse delete tail. (An earlier version of this comment had the two
+ * directions inverted: `bits-4` requires 7 zero bits against the shipped 5, which is harder, not
+ * easier.)
  */
 function masksFor(target: number): CdcMasks {
   const bits = Math.max(1, Math.round(Math.log2(Math.max(2, target))));
