@@ -748,6 +748,49 @@ _(every started session appended here, pass or fail — see Rerun policy)_
 | 1 | pinned in `/tmp/gwb` seed output & session-2 record | structural half in spec; paid half harvested via captures | rep 1 ×3 completed; rep 2 cancelled | **INVALID** — Q2/Q6 underpowered (roster), Q3 evidence absent on 0.29.3 |
 | 2 | same 108-episode corpus (hash-identical across arms) | predecessor share OBSERVED: W10 43.4% / SAME 33.6% / W1 10.0% of all input tokens | W10 ×2 + SAME ×2 clean; W1 rep 2 lost to infra | **INVALID** — the incumbent's own rep-to-rep spread exceeds the Q1 (7.2% vs 5%) and Q7 (7.4% vs 2.5%) validity ceilings |
 
+### Amendment 4 — 2026-08-07, session 3's design, derived from session 2's measured noise
+
+Committed before any session-3 run, under the standing constraint that **every number from sessions
+1–2 is known to the author** — so nothing below is a free parameter chosen after a favourable
+glance; each is either forced by a measurement or carried unchanged.
+
+- **Arms: W10 and SAME only. W1 is retired, and its retirement is a decision, not a deferral.** W1
+  existed as the blunt fallback if SAME failed. Spending 4 reps on the fallback arm doubles the cost
+  of every session for an arm we would only consult after a SAME failure — and if SAME fails at n=4,
+  the honest reading is that the lever's quality case is weak, not that a *blunter* version of the
+  same cut deserves a retry. If SAME fails session 3, **the lever is closed** and the
+  `previous_episode_uuids` alternative (Alternatives, above) becomes the only path, as its own task.
+- **n = 4 reps per arm.** Session 2 measured single-rep noise at ~7% on Q1/Q7 against 5%-scale
+  bands; the mean of 4 halves the noise on the mean (~1/√n). Aggregation: an arm's value is the
+  **mean of its 4 reps**; the noise unit is the **sample standard deviation `s` of W10's 4 reps**,
+  per metric.
+- **Decision rule, symmetric as before, in the new unit:** PASS = mean beats the band by more than
+  `s`; FAIL = misses by more than `s`; else INCONCLUSIVE (= FAIL for shipping). Since the mean's own
+  noise is ~`s/2`, a tolerance of `s` is a conservative ~2-sigma margin.
+- **Validity ceiling, re-derived in the same construction:** `s ≤ the band margin` per metric (the
+  mean's noise `s/2 ≤ margin/2` preserves the non-empty-PASS-window property the Amendment-2 round
+  established). Q5 keeps its absolute floor (one retry ≈ 1 pp at the 108-episode corpus; ceiling
+  `max(s-form, 1 pp)`); the corpus and episode budget are unchanged, so Q5's band derivation stands.
+- **Q7's universe, tightened against the union artifact session 2 exposed:** names present in **≥ 2
+  of W10's 4 reps** (and literally recurring in ≥ 2 corpus items, hygiene filter unchanged). Session
+  2's union-of-2 admitted one-rep flakes that scored zero in the other rep and produced Q7 ≈ 0.9
+  with 7% spread; a ≥2-of-4 universe removes the single-flake term while keeping the incumbent as
+  the reference. The Q7 ≈ 1.0 prediction (Amendment 3) stands and is now testable with the cleaner
+  universe.
+- **Reuse question, posed again explicitly:** session 2's completed W10 and SAME reps (2 each,
+  clean, 108/108 landed, cross-check exact) are physical artifacts whose graphs are gone but whose
+  harvests are complete. **Proposed: they count as reps 1–2 of each arm; session 3 runs 2 fresh reps
+  per arm** (~$4.4) rather than 4 (~$8.8). The readout is a total function over frozen bands; the
+  known rep values cannot move it. If the reviewer finds a joint in partial reuse under the NEW
+  noise unit (s computed over a mixed 2+2 sample — the one genuinely new interaction), session 3
+  runs all 8 fresh.
+- **Infrastructure preconditions, from session 2's incident log:** every brain runs with
+  `GRAPH_PROXY_CALLS_PER_MINUTE=600` from the start (the 429→worker-death chain), single-Neo4j
+  sequential topology from the start, Postgres on named volumes, and a Docker Desktop restart before
+  the first run (three daemon deaths in one day).
+
+## Session log — session 3 entry pending its runs
+
 ### Session 2 — full record (2026-08-06/07)
 
 Reused session 1's runs as rep 1 per Amendment 3; fresh rep 2 per arm. Every completed rep: 108/108
