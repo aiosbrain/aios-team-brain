@@ -20,7 +20,7 @@ import { freshness, computedNow, type Freshness } from "@/lib/freshness";
 import { listArcCorrections, recordArcCorrections } from "./arc-corrections";
 import { arcIneligibleItemIds } from "./arc-eligibility";
 import { recordIngestRun } from "@/lib/ingest/runs";
-import { reconcileArcIdentity, stableArcTarget, type ArcContinuity } from "./arc-continuity";
+import { reconcileArcIdentity, stableArcTarget, mergeArcPair, type ArcContinuity } from "./arc-continuity";
 
 /**
  * Layer 3 — narrative arcs. Gathers the recent graph substrate (facts, tier-scoped, and NOT
@@ -145,7 +145,9 @@ function buildSystemPrompt(requested: number, priorTitles: string[] = []): strin
     "contributor visible representation — don't let one person's arcs crowd out others who've been " +
     "working. If ONE contributor's facts span multiple DISTINCT workstreams (e.g. social vs security vs " +
     "meetings vs graph vs performance), produce a SEPARATE arc per workstream — never merge one person's " +
-    "unrelated efforts into a single arc. Each fact below is numbered [F1], [F2], … — for every arc, cite " +
+    "unrelated efforts into a single arc. Every arc's `title` must be DISTINCT and specific enough to "
+    + "tell it apart from the others — if two arcs would share a name, either they are one arc (emit one) "
+    + "or the name is too vague (name each for what makes it different). Each fact below is numbered [F1], [F2], … — for every arc, cite " +
     "the 2-5 fact numbers that support it in `supporting_facts`. A parenthesized name at the START of a " +
     'fact — e.g. "(Chetan) …" — is the human RESPONSIBLE for that work (it may not appear in the fact ' +
     "text itself): include those humans in `participants` for every arc citing their facts. Never invent " +
@@ -157,8 +159,38 @@ function buildSystemPrompt(requested: number, priorTitles: string[] = []): strin
   );
 }
 
+/**
+ * The arc's id, hashed from the title.
+ *
+ * MUST be fed the NORMALIZED (task-key-stripped) title — the same string the card renders. It used to
+ * be handed the RAW model title while `title` was stored stripped, so two arcs whose raw titles differed
+ * only by something `stripTaskKeys` removes ("… Gate Enforcement (AIO-123)" vs "… Gate Enforcement")
+ * minted DIFFERENT ids and rendered an IDENTICAL title. Identity now means what the reader sees, which
+ * is also what makes `mergeDuplicateTitles` below able to key on it.
+ */
 function stableId(title: string): string {
   return "arc-" + createHash("sha256").update(title.trim().toLowerCase()).digest("hex").slice(0, 10);
+}
+
+/**
+ * Collapse arcs that render the SAME title into one — the parse-time half of the duplicate-arc fix.
+ *
+ * Keyed on the arc id, which (since `stableId` is fed the normalized title) IS the rendered title. This
+ * catches duplicates the model emits in one response. It is NOT sufficient on its own: `reconcileArcIdentity`
+ * writes titles after this runs and can re-mint a duplicate under two DIFFERENT ids, which an id-keyed
+ * pass cannot see — that case is enforced title-keyed at the end of `reconcileArcIdentity`.
+ *
+ * MERGES rather than drops (see `mergeArcPair`): the two cards are usually distinct readings of one named
+ * storyline, so discarding either would silently lose its evidence. Order-preserving on first appearance.
+ * Pure + exported so it's unit-tested.
+ */
+export function mergeDuplicateTitles(arcs: NarrativeArc[]): NarrativeArc[] {
+  const byId = new Map<string, NarrativeArc>();
+  for (const arc of arcs) {
+    const seen = byId.get(arc.id);
+    byId.set(arc.id, seen ? mergeArcPair(seen, arc) : arc);
+  }
+  return [...byId.values()];
 }
 
 /**
@@ -375,14 +407,17 @@ export function parseArcsJson(raw: string | null, opts: ParseArcsOptions = {}): 
       arcs?: (Partial<NarrativeArc> & { supporting_facts?: unknown })[];
     };
     if (!Array.isArray(obj.arcs)) return [];
-    return obj.arcs.slice(0, MAX_ARCS).map((a) => {
+    const parsed = obj.arcs.slice(0, MAX_ARCS).map((a) => {
       const supporting_sources = Array.isArray(a.supporting_sources) ? a.supporting_sources.map(String) : [];
       const cited = buildEvidence(a.supporting_facts, facts, epToItem);
       // Fall back to free-text sources (unlinked) if the model didn't cite fact numbers.
       const evidence = cited.length ? cited : supporting_sources.map((s) => ({ fact: s }));
+      // Normalize FIRST, then hash: the id must be derived from the string the card renders, or two
+      // raw variants of one title mint two ids and render as one arc twice. See `stableId`.
+      const title = stripTaskKeys((a.title ?? "Untitled").toString()) || "Untitled";
       return {
-        id: stableId(a.title ?? ""),
-        title: stripTaskKeys((a.title ?? "Untitled").toString()) || "Untitled",
+        id: stableId(title),
+        title,
         confidence: (["high", "medium", "low"] as const).includes(a.confidence as "high")
           ? (a.confidence as NarrativeArc["confidence"])
           : "low",
@@ -393,6 +428,9 @@ export function parseArcsJson(raw: string | null, opts: ParseArcsOptions = {}): 
         derived_at: now,
       };
     });
+    // Collapses duplicates the model emitted in THIS response. The end-to-end invariant (no two
+    // arcs on screen share a title) is completed by the title-keyed pass in `reconcileArcIdentity`.
+    return mergeDuplicateTitles(parsed);
   } catch (err) {
     // The prompt asks for "ONLY JSON", but Claude/GPT often ignore that and wrap the object in a
     // markdown fence or a leading sentence anyway — extractJsonObject handles the common cases, so
