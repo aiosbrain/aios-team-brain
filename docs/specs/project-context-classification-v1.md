@@ -595,6 +595,12 @@ empty-page shapes, citation numbering gaps) — the places post-filtering leaks.
 Eight screens; each states the invariant it makes visible. All reuse the admin surface conventions
 under `app/t/[team]/admin/*` and the guard that pages read through the oracle.
 
+> **Stated gap for round 2:** the brief demands "information architecture, states, empty and error
+> states" per screen. This round delivers the screen list, each screen's invariant, and the seed
+> dataset; the full IA/state specification is a dedicated round-2 pass over all eight screens at
+> once (they share state machinery — loading/empty/error/permission-denied — that should be specified
+> once, not eight times). Flagged rather than silently thinned.
+
 1. **People, groups & projects admin** — CRUD + membership matrices. *Invariant visible:* the whole
    access model on one screen; if a human can't read it, it isn't trustworthy.
 2. **Identity manager** — bindings with confidence, evidence, audit trail, confirm/unbind. Designed
