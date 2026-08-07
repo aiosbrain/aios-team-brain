@@ -39,24 +39,43 @@ const CENSUS_REFUSAL_COPY: Record<NonNullable<GroupCensusSummary["refusal"]>, st
 
 const sharePct = (n: number | null) => (n === null ? "?" : `${Math.round(n * 1000) / 10}%`);
 
+/** Entity yield, 2dp — or an explicit "no episodes in window", NEVER a 0/∞/NaN that reads as a
+ *  measurement. The null case is a real state (nothing was projected), not a missing number. */
+const yieldLabel = (n: number | null) =>
+  n === null ? "no episodes in window" : `${(Math.round(n * 100) / 100).toFixed(2)} entities/episode`;
+
 /**
  * One group's entity-name census (ALARMFIX-1): how many normalised names gained a node in the recent
  * window, how many of those are split across >1 node, and the share vs the group's own baseline —
  * or the refusal cause when it can't be judged. These are the numbers the alarm's margin/floor
  * constants get measured from before it is armed (rollout step 2).
+ *
+ * Plus, on its own line, the **entity yield** for the same window (PIPEFF-2). Marked "observational"
+ * in the copy on purpose: it gates nothing and no band has been derived for it yet, so an admin who
+ * sees it move should look, not roll back. It exists because the split-share census above is blind
+ * by construction to variant-name fragmentation ("John" beside "John Smith"), which is the one
+ * failure mode the same-item predecessor filter could plausibly cause.
  */
 function CensusRow({ c }: { c: GroupCensusSummary }) {
   const verdict = c.refusal
     ? CENSUS_REFUSAL_COPY[c.refusal]
     : `${c.recentNames ?? "?"} recent names · ${c.recentSplit ?? "?"} split · ${sharePct(c.recentShare)} (baseline ${sharePct(c.baselineShare)})`;
   return (
-    <div className="flex items-baseline gap-2 py-0.5 text-xs">
-      <span className={`shrink-0 font-medium ${c.polluted ? "text-red-600" : "text-ink-secondary"}`}>
-        {c.group}
-      </span>
-      <span className={c.refusal === "predicate-suspect" ? "text-amber-600" : "text-ink-tertiary"}>
-        {verdict}
-      </span>
+    <div className="py-0.5 text-xs">
+      <div className="flex items-baseline gap-2">
+        <span
+          className={`shrink-0 font-medium ${c.polluted ? "text-red-600" : "text-ink-secondary"}`}
+        >
+          {c.group}
+        </span>
+        <span className={c.refusal === "predicate-suspect" ? "text-amber-600" : "text-ink-tertiary"}>
+          {verdict}
+        </span>
+      </div>
+      <div className="text-ink-tertiary">
+        yield: {yieldLabel(c.entitiesPerEpisode)}
+        {c.recentEntities !== null ? ` (${c.recentEntities} new entities)` : ""} · observational
+      </div>
     </div>
   );
 }
