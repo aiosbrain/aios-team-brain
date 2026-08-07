@@ -789,7 +789,37 @@ glance; each is either forced by a measurement or carried unchanged.
   sequential topology from the start, Postgres on named volumes, and a Docker Desktop restart before
   the first run (three daemon deaths in one day).
 
-## Session log — session 3 entry pending its runs
+## Battery closed — 2026-08-07, by owner decision, without session 3
+
+**Session 3 was never run.** The battery ends here, and this section is its terminal entry so that
+nothing above reads as a standing instruction.
+
+What happened: Amendment 4's review (BLOCKED) established that on session-2 numbers SAME's cost
+result sits *on* the −25% bar, so the pre-registered rule would most likely have returned
+INCONCLUSIVE → FAIL again at n=4 — an ~$8.8 session to confirm a reading already in hand. Rather than
+spend it, the outcome was put to the product owner with the evidence stated both ways (no quality
+loss detected on any measure; detection limit ~7%; mechanism structurally low-risk).
+
+**Chetan's decision, 2026-08-07: ship SAME anyway, as an explicit threshold judgement.** The shipping
+plan is [`graph-episode-window-phase-c.md`](./graph-episode-window-phase-c.md), which states the
+override in its first paragraph and does not present it as a battery pass.
+
+Three things this closure fixes so the record cannot be misread:
+
+- **The decision function above is spent, not pending.** "Else the lever does not ship" was the
+  battery's verdict and it stands as the battery's verdict; it was overridden by a named person on
+  stated grounds, not amended into a pass.
+- **W1 is declined as a product call**, not as an experimental outcome — recorded here as well as in
+  Phase C, because Amendment 4's review specifically required the preference be stated openly rather
+  than encoded in arm design.
+- **A correction that outlived the battery:** the −25.5% is a *fresh-graph* figure. Prod's baseline
+  is 40,070 tokens/episode against the battery's 28,287, and the predecessor block this lever removes
+  is roughly fixed in absolute size — so the expected **prod** saving is **~18%**, not 25.5%. Phase C
+  carries the arithmetic and sets its verification bands from the prod-derived number.
+
+**What remains live from this document:** the `previous_episode_uuids` alternative (Alternatives) —
+the version that would live in our own code rather than a vendored patch — recorded, unscheduled, and
+now the natural successor if the vendored patch ever becomes a maintenance burden.
 
 ### Session 2 — full record (2026-08-06/07)
 

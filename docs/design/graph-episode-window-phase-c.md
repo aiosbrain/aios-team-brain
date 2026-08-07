@@ -58,7 +58,7 @@ Placement: a new **PATCH 3** in `graphiti/Dockerfile`, **after the `pip install`
 2** — pip would overwrite an earlier edit, which is precisely what PATCH 2's own comment warns about.
 Gates, in the file's established style:
 
-- pre-state: `grep -c` the anchor line == 1 (uniqueness, and it fails loud if a base-image bump moves it)
+- pre-state: `grep -cF` the anchor line == 1 (fixed-string: the anchor contains `(` and `.`; uniqueness, and it fails loud if a base-image bump moves it)
 - the patch script's own asserts (anchor count, the line that must follow it)
 - post-state: `grep -q` the `PIPEFF-2` marker **and** `ast.parse` (already inside the script)
 - **untouched-elsewhere**: `grep -c RELEVANT_SCHEMA_LIMIT search_utils.py` == **15**, so the patch can
@@ -82,38 +82,89 @@ So the census is a backstop for a failure this lever is unlikely to cause, and b
 might. Two consequences:
 
 **1. The metric that IS sensitive is entity yield per episode** — variant-name fragmentation *raises*
-node count, which is exactly why Q1 became two-sided. And it is **already computable from data
-`groupCensuses` fetches today**: the census query returns per-name node counts (their sum is the
-group's entity count) and the ledger leg already returns episode flow for the window. Phase C
-therefore adds **`entitiesPerEpisode` to the census output and the admin card** — a derived field, no
-new query, no new cost — and that number is the quality leg of the post-deploy verification below.
+node count, which is exactly why Q1 became two-sided.
 
-**2. The merge condition is amended, in the open:** the lever merges when **`entitiesPerEpisode` is
-visible on the card** (so a regression is observable), **not** when the pollution alarm is armed. The
-arming of the pollution alarm remains ALARMFIX-1's own rollout step and is not this lever's gate,
-because it does not protect against this lever. Arming also cannot be scheduled from here: the census
-constants must be set from a prod reading, prod Neo4j has no public endpoint, and the card is the
-only surface that shows it — a human read, not an automatable step.
+**It needs a new query, and the first draft of this spec was wrong to say otherwise.** The census
+returns per-name **all-time** node counts plus each name's `max(created_at)`; you cannot recover
+"entities created in the window" from that (a name with 5 nodes and a recent newest says nothing
+about how many of the 5 are new). The only ratios constructible from today's data are all-time
+entities ÷ windowed episodes — dimensionally incoherent, drifting upward forever on a growing graph,
+and **numerically dead as a sensor**: a week of +30% fragmentation on ~300 new episodes moves a
+~5,400-episode cumulative total by under 2%, invisible inside any sane band.
+
+So Phase C adds **one small windowed count** —
+
+```cypher
+MATCH (n:Entity {group_id: $g})
+WHERE n.created_at >= datetime($since)
+RETURN count(n) AS entities
+```
+
+— and defines **`entitiesPerEpisode` = entities created in the window ÷ episodes projected in the
+same window** (the ledger leg already supplies the denominator, windowed by `projected_at`). Both
+legs windowed, same span, dimensionally coherent.
+
+**Windowing by `created_at` also dissolves the baseline problem the first draft created:** the card,
+the patch and the graphiti rebuild all ship in the same merge, so a "pre-deploy reading from the
+card" was uncapturable by construction. A `created_at`-windowed count is **computable retroactively**
+— after deploy, the same query over a pre-deploy span reads the historical baseline out of graph
+history. The before/after comparison is therefore taken entirely after the merge, from one surface.
+
+**2. The merge condition is amended, in the open:** the pollution alarm's arming is **not** this
+lever's gate, because it does not protect against this lever — and arming cannot be scheduled from
+here regardless (the census constants must be set from a prod reading, prod Neo4j has no public
+endpoint, and the card is the only surface that shows it: a human read, not an automatable step).
+What replaces it is **a build-content requirement, not an external gate** — and it is named as such
+rather than dressed up as one: this PR must *contain* the windowed `entitiesPerEpisode` on the card,
+so that the post-deploy check below has a sensor to read. The honest gate on the *outcome* is the
+verification table itself, which runs after the merge.
 
 ## Verification — in the ledger, not the logs
 
-**Before deploy**, record from the harness over a drain-clean prod window (the current steady state,
-~40,070 input tokens/episode per the parent spec's baseline) and note `entitiesPerEpisode` from the
-card.
+### The prod saving is ~18%, not the battery's 25.5% — corrected before shipping, not after
 
-**After deploy**, over a drain-clean window of comparable episode volume:
+The battery ran on a **fresh** graph whose baseline was 28,287 tokens/episode; prod's steady state is
+**40,070**, the difference being mostly longer dedupe-candidate lists on a mature graph. The
+predecessor block this lever removes is roughly **fixed in absolute size** (ten episodes' content,
+independent of graph maturity), so the same cut lands differently:
 
-| check | expectation | falsifier → roll back |
+| | baseline | absolute cut | percentage |
+|---|---|---|---|
+| battery (fresh graph) | 28,287 | −7,202 | **−25.5%** ✅ measured |
+| **prod (mature graph)** | 40,070 | ~−7,200 | **~−18%** ← the number to expect |
+
+**This corrects the figure the ship decision was taken on.** It does not change the mechanism, the
+quality evidence, or the build — but the expected recurring saving is ~18%, and any verification band
+written around 25% would have flagged a fully-working patch as broken.
+
+**After deploy**, over a drain-clean window of comparable episode volume (all readings retroactive
+per the windowing above — no pre-deploy capture is required):
+
+| check | expectation | falsifier |
 |---|---|---|
-| input tokens/episode (harness) | falls ~20–30% | **no fall** ⇒ the patch did not take effect in the running image — the silent-no-op class this Dockerfile exists to prevent |
+| input tokens/episode (harness) | falls **~15–25%** (prod-derived, see table above) | **no fall at all** ⇒ the patch did not take effect in the running image — the silent-no-op class this Dockerfile exists to prevent ⇒ investigate before rollback (a no-op is not a regression) |
 | signed cross-check gap (harness) | unchanged (~0) | a rise ⇒ the prompt change moved the validation-retry rate; part of the "saving" is a retry artefact |
-| `entitiesPerEpisode` (card) | within ~±10% of the pre-deploy reading | a **rise beyond that** ⇒ variant-name fragmentation, the lever's named risk ⇒ roll back |
+| `entitiesPerEpisode` (windowed) | **observational for the first two weeks** — record it, do not gate on it | once two weeks of prod week-over-week variation exist, set the band from that measured variation; **until then a movement is a prompt to look, not a rollback trigger** |
 | same-name split share (card) | unchanged (~0) | a rise ⇒ candidate-retrieval damage (unexpected; the census's own job) |
 
-**Byte-identity check, before merge:** build the image from the branch and diff the resulting
-`graphiti_core/graphiti.py` against the file the measured arm ran (`/tmp/gwb/graphiti.same.py`). Equal
-⇒ the shipped patch is the measured patch. This is the one claim in this spec that can be *proved*
-rather than argued, so it is a merge precondition rather than a hope.
+The `entitiesPerEpisode` band is deliberately left underived rather than guessed: the battery's ~7%
+was single-rep noise on a 108-episode corpus, while prod's week-over-week **content mix** (a
+GitHub-heavy week vs a Slack-heavy one) can move entity yield legitimately by more than that. A band
+invented now would both false-fire and swallow real fragmentation — the measured-not-chosen rule this
+workstream applies to every other constant.
+
+**Byte-identity check, before merge — anchored on checksums, not on `/tmp`:** the committed script
+applied to the pinned wheel deterministically reproduces the measured file, so the check survives a
+reboot or a different machine:
+
+| artifact | sha256 |
+|---|---|
+| `patch-same-item.py` (as committed) | `94ba6b1918b8df3f34fd44737e79a5c42f9e26a00d0fe498975e255dcdfcf2d6` |
+| patched `graphiti_core/graphiti.py` (the measured arm ran this exact file) | `49ee534a1043760f9e3b58617f7853edd65e7e643a75f34f75267528cb0ec72d` |
+
+Build the image from the branch, extract `graphiti_core/graphiti.py`, and check its sha256 equals the
+second value. Equal ⇒ the shipped patch is the measured patch. This is the one claim in this spec
+that can be *proved* rather than argued, so it is a merge precondition rather than a hope.
 
 ## Rollout and rollback
 
@@ -140,6 +191,12 @@ rather than argued, so it is a merge precondition rather than a hope.
 - **Prod's graph is mature; the battery's was fresh.** Dedupe candidate lists are longer on a mature
   graph, so both the saving and the risk may differ in magnitude from the measured numbers. The
   post-deploy token check is what confirms the saving actually transferred.
+- **Non-`items:` episodes now get zero predecessors** — `correction:<arc_id>` arc-writeback episodes
+  have no `items:` prefix, so the same-item filter matches nothing for them. That is the intended
+  semantics (a correction episode is not a chunk of a document), but the parent spec required it be
+  *stated and pinned* rather than discovered: **this PR carries a test that pins the behaviour for a
+  non-`items:` episode name**, carried here from the parent's Risks section so it does not fall
+  between the two documents.
 - **The patch is a vendored-library edit.** It must be re-verified on every base-image or
   `graphiti-core` bump; the pre-state grep gate makes a moved anchor a build failure rather than a
   silent no-op, which is the durable protection. The `previous_episode_uuids` alternative in the
