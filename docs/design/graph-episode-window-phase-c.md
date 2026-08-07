@@ -29,6 +29,17 @@ noise*; at −25.5% the lever lands on the bar, which the procedure reads as INC
 
 Two things follow, and both are stated rather than buried:
 
+> ⛔ **MERGE BLOCKED pending re-confirmation.** The figures above are the battery's, measured on a
+> **fresh** graph. The expected **prod** saving is **~18%**, not 25.5% (see *Verification* for the
+> arithmetic) — and the ship decision was taken on the 25% number. The delta review ruled that a
+> decision document whose own text disavows the basis of the decision it records cannot merge without
+> recording a re-decision, and that the correction moves the trade in one direction only: the saving
+> shrank ~30% relative while the risk side (the ~7% detection limit, the vendored-patch maintenance
+> burden) is unchanged. **Whether ~18% still clears the owner's threshold is not inferable from the
+> earlier yes.** This line is replaced by `re-confirmed by Chetan on the ~18% expectation, <date>`
+> — or by a decision not to ship — before merge. Building, reviewing and pushing proceed; merging
+> does not.
+
 1. **This ship overrides the battery's procedural outcome.** It is a threshold judgement — "nothing
    detected, detection limit ~7%, mechanism structurally low-risk, saving worth it" — made by the
    product owner, not a measurement result. The battery's verdict stands unchanged in its own doc.
@@ -96,13 +107,27 @@ So Phase C adds **one small windowed count** —
 
 ```cypher
 MATCH (n:Entity {group_id: $g})
-WHERE n.created_at >= datetime($since)
+WHERE n.created_at >= datetime($since) AND n.created_at < datetime($until)
 RETURN count(n) AS entities
 ```
+
+The **upper** bound is not decoration: the retroactive baseline is a *span*, and a lower-bound-only
+query would sweep post-deploy nodes into the "before" side.
 
 — and defines **`entitiesPerEpisode` = entities created in the window ÷ episodes projected in the
 same window** (the ledger leg already supplies the denominator, windowed by `projected_at`). Both
 legs windowed, same span, dimensionally coherent.
+
+**Two precision rules the windowing forces, both from the delta review:**
+
+- **The numerator's clock is extraction time; the denominator's is push time.** With a queue backlog
+  at deploy, episodes *pushed* before the deploy get *extracted* after it — by the patched code. So
+  the pre-deploy window's right edge must be a **drain-clean point before the deploy**, not the
+  deploy timestamp itself, or the "before" reading is contaminated with "after" behaviour.
+- **Sanity-read the count once when it is first computed** — windowed count against the unfiltered
+  count for the same group. A node with a missing or unparseable `created_at` vanishes silently from
+  a windowed count, which is the "parser that matches nothing reports zero" class this repo has
+  already been bitten by. One read, free, and it either confirms the filter or exposes it.
 
 **Windowing by `created_at` also dissolves the baseline problem the first draft created:** the card,
 the patch and the graphiti rebuild all ship in the same merge, so a "pre-deploy reading from the
@@ -144,7 +169,7 @@ per the windowing above — no pre-deploy capture is required):
 |---|---|---|
 | input tokens/episode (harness) | falls **~15–25%** (prod-derived, see table above) | **no fall at all** ⇒ the patch did not take effect in the running image — the silent-no-op class this Dockerfile exists to prevent ⇒ investigate before rollback (a no-op is not a regression) |
 | signed cross-check gap (harness) | unchanged (~0) | a rise ⇒ the prompt change moved the validation-retry rate; part of the "saving" is a retry artefact |
-| `entitiesPerEpisode` (windowed) | **observational for the first two weeks** — record it, do not gate on it | once two weeks of prod week-over-week variation exist, set the band from that measured variation; **until then a movement is a prompt to look, not a rollback trigger** |
+| `entitiesPerEpisode` (windowed) | **observational for the first two weeks** — read at **day 3, day 7 and day 14**, each reading recorded in the PR thread or this doc | a **week-over-week move > 25%** ⇒ investigate now (not roll back). 25% judges nothing — it sits clearly above the battery's ~7% noise and above plausible content-mix swing (~10–20%), so it summons a human rather than deciding anything. After two weeks, set the real band from the measured variation |
 | same-name split share (card) | unchanged (~0) | a rise ⇒ candidate-retrieval damage (unexpected; the census's own job) |
 
 The `entitiesPerEpisode` band is deliberately left underived rather than guessed: the battery's ~7%
