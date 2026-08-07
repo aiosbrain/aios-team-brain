@@ -20,8 +20,12 @@ dependency. Content ingested under a model that cannot express access must be re
 hand — permission models are load-bearing from the first row, which is why this document front-loads
 the schema and enforcement decisions and defers everything decorative.
 
-Process: the vision brief mandates phased delivery with stop-and-check-in gates. This document is the
-Phase 0 audit plus the full target design; the build phases at the end each end at a checkpoint.
+Process honesty: the brief mandates producing the specification itself in phases with
+stop-and-check-in gates ("do not produce the entire specification in one pass"). This round
+deliberately collapses spec-production into one artifact because the review loop (fresh cold review
+per round, findings applied, human reads each round) supplies the adversarial checkpoints the
+phasing was for — but that is a substitution, not compliance, and it is flagged rather than
+laundered. The BUILD phases (§17) retain hard stop-and-review gates.
 
 ---
 
@@ -34,7 +38,7 @@ which parts." Verified against `origin/main` (commit `1693d9e`):
 
 | Briefing claim | Verdict | Evidence |
 |---|---|---|
-| ~75 tables, 56 migrations, ~600 commits, two contributors | ✅ almost exact | 75 `create table` in `postgres/schema.sql`; **55** migrations; 610 commits; 2 human contributors + dependabot |
+| ~75 tables, 56 migrations, ~600 commits, two contributors | ✅ almost exact | 76 `create table` in `postgres/schema.sql` (75 `if not exists` + 1 plain); **55** migrations; 610 commits; 2 human contributors + dependabot |
 | ~27 `/api/v1/*` routes, brain-api v1.17 | ✅ | **26** route files under `app/api/v1/`; v1.17 in `lib/api/schemas.ts:55` |
 | API keys `aios_<key_id>_<secret>`, Bearer + `X-AIOS-Team` | ✅ | `lib/api/auth.ts:40,76` |
 | Only access model is two-tier `team`/`external`, `admin` → 422, app-code only, no RLS | ✅ | `lib/graph/group.ts:8`, `app/api/v1/items/route.ts:54-60`, CLAUDE.md §5 |
@@ -51,10 +55,13 @@ which parts." Verified against `origin/main` (commit `1693d9e`):
 
 **Corrections that change the design:**
 
-1. **`graph_episodes` already is the extraction cache the brief asks for.** It maps
-   `(team, group_id, item, content)` → episode UUID with dedupe (the dedupe-pollution alarm of
-   AIO-693 guards it). Per-project extraction reuses this table with a widened key rather than
-   inventing a cache.
+1. **`graph_episodes` already is the extraction cache the brief asks for — modulo a real rework.**
+   It maps an item to its episode UUID with content-SHA dedupe (the AIO-693 pollution alarm guards
+   it), but its unique key is `(team_id, source_table, source_id)` with a SINGLE `group_id` column,
+   and the reconcile/tier-cleanup and chunk-ledger state hanging off it (`pending_delete_group_id`,
+   `chunk_shas`) are single-group by construction. Per-project extraction is a widening of this
+   table to one row per `(item, group_id)` — a redesign of that machinery, scoped in Phase C, not a
+   key tweak.
 2. **Identity infrastructure exists and is deterministic** — `member_emails` (`schema.sql:218`),
    `member_identities` (`schema.sql:234`, provider user-ids for slack/linear/plane), and
    `members.github_login`, consumed by `lib/attribution/resolve-authors.ts` and
@@ -85,7 +92,7 @@ flip, stated once so no one discovers them mid-build:
 | Non-goal: "Making project context available to external-tier viewers… project taxonomy is team-tier metadata" | Projects/groups ARE the access model for every principal, external included. The `external` tier becomes a built-in group with visibility into designated projects | One access model, not two |
 | `projects.audience access_tier` column (V1 §model changes) | **Dropped.** Project visibility is the `project_groups` join, not a scalar | A scalar can't express 1+ groups |
 | Graphiti "optional derived consumer, never the owner" | Graph **required**; still never the owner of assignments/rules — but per-project graphs are the enforcement mechanism for derived knowledge | An optional graph means two permission implementations, and the second is the one nobody tests |
-| Tier safety via `visibleItems`/tier checks per surface | One visibility oracle (§5.4) + Postgres RLS as backstop (§9) | Agents are now in the loop; app-layer-only was the accepted risk being retired |
+| Tier safety via `visibleItems`/tier checks per surface | One visibility oracle (§5.1) + Postgres RLS as backstop (§9) | Agents are now in the loop; app-layer-only was the accepted risk being retired |
 | Auto-classification gated by `classification_mode` for *quality* | Additionally gated by the **no-widening invariant** (§5.6): an automatic tag may never increase the set of principals who can see content | An LLM mis-tag was noise in V1; in V2 it is a leak |
 
 **What survives from V1 intact** (Part II): context units and their merge contract, meeting topic
@@ -181,12 +188,16 @@ access-bearing. `context_unit_id` remains the grain (whole item, task/decision r
 segment), which is what lets a Slack channel be visible to Everyone while one thread in it is
 force-excluded into a restricted project only.
 
+Built-in maintenance: `lib/access/groups.ts` (the groups single writer) keeps Everyone's membership
+equal to active members — hooked on member activation/deactivation, never edited by hand; built-in
+rows are undeletable and their group membership is the only editable thing about them.
+
 Identity hardening (§8) adds columns to `member_identities` / `member_emails` rather than new
 tables: `verified_by uuid`, `verified_at`, `confidence text check (confidence in
 ('deterministic','confirmed','suggested'))`, `evidence jsonb`. Delegation adds `agent_tokens` (§10).
 Signal seams add `intent_records` (§13, design-only).
 
-**Effective visibility is a pure function**, computed in one place (§5.4):
+**Effective visibility is a pure function**, computed in one place (§5.1):
 
 ```
 visibleProjects(principal) =
@@ -223,8 +234,13 @@ recall badly when the filter is selective — and one project inside a company c
 selective filter. Options, priced:
 
 1. **Iterative index scans** (`hnsw.iterative_scan = relaxed_order`, pgvector ≥ 0.8.0): the index
-   keeps scanning until enough rows pass the WHERE clause. Preferred mechanism. **Unverified
-   assumption to close before build:** the deployed pgvector version on Railway and in
+   keeps scanning until enough rows pass the WHERE clause. Preferred mechanism. Cost profile:
+   recall is preserved (the scan continues rather than truncating); latency grows roughly with
+   1/selectivity and is bounded by `hnsw.max_scan_tuples` (default 20k) — worst case is a ~20k-tuple
+   walk, tens of ms on this corpus, hit only when a very selective project filter meets a large
+   index. `strict_order` trades a stricter ordering for more work; `relaxed_order` + RRF downstream
+   is the right pairing since RRF re-ranks anyway. Measured at the Phase B gate on the seed corpus.
+   **Unverified assumption to close before build:** the deployed pgvector version on Railway and in
    `pgvector/pgvector:pg16` (tag floats). Gate: `pg:schema:vector` fails loudly below 0.8.0.
 2. **Over-fetch + filter fallback** (works on any version): fetch `k × max(4, 40/selectivity%)`
    candidates, filter by membership, degrade to FTS-only for that partition if starved — never an
@@ -239,7 +255,7 @@ memberships instead — same join point, different edge.
 ### 5.4–5.5 Graph: structural isolation + the bolt exception list
 
 Per-project graphs (§6) make traversal isolation structural — a query fanning out inside
-`group_id = team_<teamId>_p_<projectId>` cannot reach another project's subgraph, which is the
+`group_id = g_<teamId>_p_<projectId>` cannot reach another project's subgraph, which is the
 answer to "filtering a path is not filtering a result set." **The residual risk is the app's direct
 bolt reads** (`lib/graph/neo4j.ts` consumers: arcs fact reads in `lib/graph/arcs.ts`/`learning.ts`,
 reconcile, health probes). Ruling: every bolt query must take `group_ids` from the oracle as a
@@ -255,8 +271,9 @@ membership only when doing so does not increase the set of principals who can se
 Formally: auto-tag of unit u into project p is allowed iff `audience(p) ⊆ audience_now(u)` where
 `audience(p)` = union of members of p's groups. Any widening tag — including container-default
 inheritance into a broader project — enters the review queue and requires a human with curation
-rights over the destination project. This subsumes V1's quality gating (`classification_mode`,
-Part II) and is enforced in the membership single writer, not in each classifier.
+rights over the destination project. This COMPOSES with V1's quality gating (`classification_mode`, Part II §20.2) — the mode gate
+remains fully normative for classifier-originated settlement — and is enforced in the membership
+single writer, not in each classifier.
 
 ### 5.7 Citations, abstention, counts
 
@@ -280,6 +297,41 @@ combinations, not by principal count — 2 people with identical groups share a 
 inspector (§15.6) is the runtime check that a cached surface never leaked: it recomputes the access
 path live.
 
+### 5.9 Query fan-out for multi-project principals (hard problem 4)
+
+Partitions are the storage and security unit; **fan-out is the query unit** — validated, with one
+correction to the brief's framing: two of the three modalities never fan out at all.
+
+- **FTS and dense are single queries, O(1) in project count.** Both are one SQL statement whose
+  membership join takes the oracle's whole visible set as an array parameter (§5.2–5.3) — a
+  40-project principal costs the same query shape as a 2-project one; only row selectivity changes.
+  No fan-out, no fusion, no cap needed. This is worth stating because it confines the hard problem
+  to the graph modality alone.
+- **Graph search fans out inside one call.** `POST /search` already accepts a `group_ids` array
+  (`lib/graph/graphiti-client.ts:174` — `search(query, groupIds, maxFacts)`), so N partitions are
+  one HTTP round-trip; Graphiti's hybrid search cost scales with candidate facts across the named
+  groups, not with N itself. The expansion stage (graph terms driving a second FTS pass) then feeds
+  the existing RRF fusion in `lib/query/retrieve.ts` unchanged — partition provenance rides the fact,
+  and fused ranking is exactly what RRF is for.
+- **Arcs/Pulse fuse at read time:** per-partition arc sets (each bounded by `MAX_ARCS`) merge by
+  rank with a per-partition cap of 3 on the Pulse surface; the project workspace shows its own
+  partition uncapped.
+
+**The cap, and the 40-project principal.** Unbounded graph expansion over 40 partitions is the case
+that breaks latency AND answer focus. Ruling: an **expansion budget** — the graph stage covers the
+top-K visible partitions (K = 8 default, configuration not constant), selected by a cheap router:
+initiative-profile-embedding similarity to the query (the Part II profile embeddings, reused) plus a
+recency prior, with General always included. FTS/dense remain complete over the full visible set, so
+**correctness never depends on the router** — beyond-cap partitions lose only graph-flavored recall,
+and the answer footer discloses scope ("graph expansion covered 8 of your 37 projects") — a
+deliberate exception to §5.7's non-disclosure because it describes the principal's OWN scope, not
+others' content.
+
+**Latency model:** `T ≈ T_fts + T_dense + T_graph(K) + T_rerank`, with `T_graph(K)` the only term
+that grows — sublinearly, since one call spans K groups and fact candidates are budget-capped
+(`maxFacts`). Ceiling: p95 end-to-end ≤ 2× today's single-scope query, measured on the seed dataset
+at K ∈ {1, 8, 16} as a Phase C gate; the K default moves only on that evidence.
+
 ## 6. Per-project graphs and the extraction cost model
 
 ### group_id scheme
@@ -300,8 +352,18 @@ Re-tagging into a project that already saw this content SHA is a cache hit: zero
 
 Post-0.29.3 measured baseline (ARCHITECTURE:768+, `llm_usage source=graph`): extraction is batched,
 node-attribute amplification is gone, small-call routing sends `node_attributes`/`dedupe_edges` to
-`teams.extraction_small_model`. Let E = episodes/day (~50–150 on the live team), P̄ = mean projects
-per item. Naive cost multiplier = P̄. Mitigations, in force order:
+`teams.extraction_small_model`. **Measured on prod, trailing 7 days (2026-08-07):** 59,087 graph LLM
+calls over 583 newly projected episodes — **$87.97/week, $0.151 and ~101 calls per episode** at
+~448k input tokens/episode. Caveat stated rather than smoothed: this window includes the AIO-798
+priced repo-import backfill and the denominator is `projected_at`-based, so the steady-state
+per-episode constant is likely lower; the Phase C gate re-reads it from `llm_usage` over a quiet
+window before any multiplier decision. Worked example at the measured rate: E ≈ 83/day →
+**≈ $380/month at P̄ = 1**; every +1.0 of P̄ adds the same again. That is what makes rules 1–3 of the
+General ruling above worth real money: restriction-moves-not-copies and no-widening are the
+mechanisms that hold P̄ near 1.
+
+Let E = episodes/day, P̄ = mean partitions per item (General counts). Naive cost multiplier = P̄.
+Mitigations, in force order:
 
 1. **Content-hash cache** (above): re-tags and re-syncs of unchanged content are free.
 2. **Laziness for cold projects:** extraction into a project graph is deferred until the project has
@@ -316,12 +378,27 @@ per item. Naive cost multiplier = P̄. Mitigations, in force order:
    — the dashboard's graph row gains a per-project breakdown. Budget ceiling: the existing graph
    proxy ceiling applies per team; a per-project soft cap is configuration.
 
-**General-project ruling:** the General partition (everything, Everyone-visible) is the one graph
-that would double all extraction if naively separate. Ruling: General IS the migration target graph
-(the current single team graph, renamed), and content tagged into a specific project is extracted
-*additionally* into that project's graph. Cross-project synthesis is never computed (the
-permission-laundering answer); General-partition synthesis is computed over General-visible content
-only — which is exactly today's behavior, so the eval baseline survives.
+**General-project ruling — what General is, and when content leaves it.** General is **the content
+Everyone may see**, not "everything":
+
+1. **New content defaults** to General plus whatever container rules assign — the default-mode rule
+   that preserves today's promise. A container rule may be marked **`exclusive`**, which suppresses
+   the General default: that is the restricted-Slack-channel flow, and it is how restricted content
+   is restricted *from ingest onward*, never retroactively.
+2. **Restricting existing content MOVES it out of General** (close the General membership, open the
+   restricted one — the V1 move semantics). Restriction never copies, so restricted content is
+   extracted once, in its restricted partition only, and can never sit in an Everyone-visible graph.
+   The seed dataset's `supplier-negotiation` content is NOT in General — that is the leak-by-
+   construction this rule exists to prevent.
+3. **Deliberate wide+specific tagging** (content in General AND project P) is allowed, costs 2×
+   extraction for that item, and is counted honestly in P̄ — it is the only source of multiplication,
+   and the no-widening invariant keeps automation from creating it.
+4. **Migration:** General's graph is today's team graph (nothing re-extracted); the eval baseline
+   survives migration byte-for-byte. It then *drifts by design* as teams restrict content out of
+   General — which is exactly what §12's restricted-principal eval axis exists to keep honest.
+
+Cross-project synthesis is never computed (the permission-laundering answer); each partition's
+synthesis reads only its own content.
 
 ## 7. FalkorDB vs Neo4j — recommendation
 
@@ -363,7 +440,11 @@ Required changes:
    display at most, never access.
 3. **Identity is never inferred from content.** A name in a message body is not an identity claim —
    invariant + guard test asserting no access-path code imports content-derived attribution.
-4. **Unbinding cascades** are read-time: access is recomputed per request from live bindings via the
+4. **Scope honesty:** today NO access path consumes identity bindings — principals authenticate as
+   members via keys/tokens, and bindings feed attribution only. The fail-closed rule above pre-arms
+   the first surface that will consume them (a Slack-initiated agent claiming "asking as @chetan"):
+   that claim resolves through `deterministic`/`confirmed` bindings or not at all.
+5. **Unbinding cascades** are read-time: access is recomputed per request from live bindings via the
    oracle, so revoking a binding takes effect on the next request with no cache to chase (caches key
    on group-set, which changes when membership does — §5.8).
 
@@ -391,6 +472,13 @@ Design (defence-in-depth under the oracle, not a replacement):
   *wrongly* (no principal context / forged member id) and asserts the database returns zero rows —
   i.e. RLS catches an application bug by construction (§14).
 
+- **Writes are covered, not just reads** — the brief's original accepted risk was specifically that
+  *machine sync writes* had no DB backstop. An API-key write runs with the principal context of the
+  key's member (`lib/api/auth.ts` already resolves it); INSERT/UPDATE policies on content tables
+  require `team_id = current_setting('aios.team_id')::uuid` and a non-null principal, so a forged or
+  cross-team write dies in the database even if a route bug lets it past the app layer. Single-writer
+  modules are unaffected — they run as the same app role with principal context set.
+
 Perf note (honest): membership-join policies on every row-read add a join per table; the phase gate
 includes a before/after latency measurement on the three hottest reads (timeline, retrieve, items
 list) with a stated budget (+15% p95 ceiling) before RLS graduates from staging to default.
@@ -398,6 +486,10 @@ list) with a stated budget (+15% p95 ceiling) before RLS graduates from staging 
 ## 10. Principals, delegation, and the QM slice
 
 - **Principal model:** `member` (today's API key → member binding, unchanged) or `agent_token`.
+  Wire format: `aiosd_<token_id>_<secret>` — a distinct prefix so no parser can confuse a delegated
+  token with a member key (`aios_…`, `lib/api/auth.ts:40`); same hashed-secret storage discipline as
+  `api_keys`. An old server rejects the unknown prefix with today's 401 — additive compatibility
+  needs no version negotiation.
   New table `agent_tokens`: `id, team_id, member_id (the launching principal), on_behalf_of
   (member_id, nullable = self), project_scope uuid[] (attenuation set), expires_at, revoked_at,
   created_by, last_used_at`, hashed secret, audited on mint/use/revoke.
@@ -440,9 +532,12 @@ Ruling and its direction, argued:
    un-sharing what teams already shared. A team that wants restriction-by-default flips a team
    setting: new content with no container rule then lands in a `triage` project visible to admins
    only.
-4. **Graph:** the existing `<teamSlug>_team` graph is renamed/aliased as General's graph (no
-   re-extraction); `_external` becomes external-shared's. New per-project graphs build lazily (§6).
-   Nothing is re-extracted during migration — cost ≈ 0.
+4. **Graph:** Graphiti has no rename operation, so nothing is renamed: `projects` gains a
+   `graph_group_id` column, and General records the legacy `<teamSlug>_team` id while
+   external-shared records `<teamSlug>_external` — the existing graphs become those projects'
+   partitions by pointer, not by rewrite. New projects mint `g_<teamId>_p_<projectId>` ids; the
+   scheme therefore has exactly two grandfathered exceptions per team, stored not inferred. Nothing
+   is re-extracted during migration — cost ≈ 0.
 5. **Ordering:** three additive migrations (groups/edges, identity columns, agent_tokens) appended
    after the current 55, plus the backfill job; replay-tested from zero AND from a populated
    pre-V2 database per the schema-phase gates (the #251/#495 replay lessons are the reason this is
@@ -488,7 +583,7 @@ through the *outcome*, not the code path:
 | Arcs / timeline / caches | datamechanics | B-only evidence never appears in A's arc evidence or timeline payloads; cache keyed per §5.8 |
 | Re-tag cascade | datamechanics | untag from B → B's graph facts revised (§Part II cascade), B-principal loses retrieval of the derived fact |
 | Delegation | http | token with `project_scope=[B]` for an A-only principal reads nothing (intersection), and cannot mint wider |
-| Unresolved identity | datamechanics | `suggested` binding grants no project; oracle returns builtin-Everyone only if the member row itself is confirmed |
+| Unresolved identity | datamechanics | a `suggested` binding contributes nothing to principal resolution — a connector-actor claim backed only by suggested evidence resolves to NO principal (fail closed), never to the suggested member |
 | RLS backstop | datamechanics | deliberate data-layer misuse (no principal context) returns zero rows — the app-bypass test |
 | MCP / agent context | http | tool responses for an attenuated token contain no out-of-scope item ids |
 
@@ -545,15 +640,20 @@ Each phase ends at a **stop-and-review checkpoint** (spec round, then build). Sh
 precisely so the access chain exists before anything depends on it:
 
 - **A — Principals & access skeleton** *(unblocks QM)*: groups/edges DDL + built-ins, oracle,
-  `agent_tokens` + attenuation in auth, migration §11 (backfill + built-ins), identity columns +
-  fail-closed rule. Alpha restriction: delegated tokens read-only, single team. Eval: unchanged
-  baseline must pass post-backfill.
+  `agent_tokens` + attenuation in auth, identity columns + fail-closed rule — **plus the minimal
+  context substrate the migration requires**: the `project_context_units` and
+  `project_context_memberships` tables (Part II contracts) with an item-grain-only reconciler and
+  the membership single writer. No classifier, no segments, no curation UI — just enough for §11's
+  backfill to have something to write and the oracle's `canSee` to have something to read. Stated
+  here because a Phase A that pretends it doesn't need this discovers it in week one. Then the §11
+  migration (backfill + built-ins). Alpha restriction: delegated tokens read-only, single team.
+  Eval: unchanged baseline must pass post-backfill.
 - **B — Enforced reads**: FTS/dense/timeline/arcs through the oracle; citation/abstention rules;
   RLS on content tables + the backstop test; permission inspector + admin screens 1–2; leak suite
   paths 1–2, 4–6, 9–10.
 - **C — Per-project graphs**: group_id scheme, projector fan-out + cache, per-project arcs, bolt
   guard, cost surfacing; FalkorDB spike = exit gate; leak suite graph paths; eval principal axis.
-- **D — Tagging at scale** (Part II engine under V2 invariants): container defaults, review queue,
+- **D — Tagging at scale** (Part II engine on the Phase A substrate): container defaults, review queue,
   rules UI, cascade + provenance ledger + cascade preview; view-as; seed dataset; remaining screens.
 - **E — Signal layer** (deferred; seams already in place).
 
@@ -620,9 +720,30 @@ create index if not exists graph_provenance_item_idx on graph_provenance (team_i
   where removed_at is null;
 ```
 
-Sole writer: the graph projector (`lib/graph/project.ts` extended), which learns each fact's source
-episodes from the extraction round-trip it already performs. Arcs need no new rows — their evidence
-IS the ledger.
+Sole writer: the graph projector (`lib/graph/project.ts` extended). **How rows are produced — the
+mechanism, not a hand-wave:** `POST /messages` is async fire-and-forget (202, returns neither uuid
+nor name — `lib/graph/graphiti-client.ts:7-11`), so there is NO extraction round-trip to read facts
+from. The ledger is populated by a **post-extraction harvest** in the projector's reconcile leg:
+
+1. Resolve our stable episode names (`items:<id>`) to Graphiti uuids via `GET /episodes/{group}` —
+   the client already does exactly this for the same fire-and-forget reason (client doc, same file).
+2. Per group, a bolt query walks edges/facts referencing episodes newer than a per-group harvest
+   cursor (`MATCH (f)-[:MENTIONS|…]->(e:Episodic) WHERE …`) and upserts `graph_provenance` rows.
+3. The cursor advances only on a complete sweep, so the ledger is **eventually complete with lag ≤
+   one projector cadence (60 min)** — a stated property, not an accident.
+
+**Cascade under lag:** an untag does episode-level removal immediately (`DELETE /episode/{uuid}` —
+the client's existing tier-cleanup endpoint), which stops the removed source being served regardless
+of ledger state; fact-level revision (steps 2–3 below) runs on harvested provenance and is completed
+by the next sweep. So the security property (removed content stops serving) never waits on the
+ledger; only the fidelity property (recompute-from-remainder) does.
+
+**Option B, considered and deferred:** we control the graph-service image (`graphiti/Dockerfile`),
+so `/messages` could be extended to return extraction results synchronously. Rejected for now — it
+forks the upstream API surface and couples ingest latency to extraction latency; the harvest gets
+the same data with one moving part we already run. Revisit only if harvest lag proves harmful.
+
+Arcs need no new rows — their evidence IS the ledger.
 
 ### Revision semantics
 
@@ -779,8 +900,9 @@ An active initiative has a continuously maintained context space containing:
 5. Learn from corrections by proposing editable rules, never by silently turning one correction into
    an active rule.
 6. Use deterministic metadata and existing embeddings before paying for an LLM.
-7. Keep Postgres canonical. Graphiti is an optional derived consumer, never the owner of assignments,
-   rules, segments, or corrections.
+7. *(Amended in V2 — Part I §2 flip 4)* Keep Postgres canonical. Graphiti is a REQUIRED derived
+   consumer — still never the owner of assignments, rules, segments, or corrections — and its
+   per-project partitions are the enforcement mechanism for derived knowledge.
 8. *(Superseded in V2 — Part I §5/§9)* Enforcement is the oracle + RLS backstop; source deletion
    guarantees stand unchanged.
 
@@ -849,7 +971,7 @@ flowchart LR
   Q --> R
   L --> T["Project timeline and context UI"]
   L --> C["Project-scoped retrieval"]
-  L -. "optional derived facts" .-> G["Graphiti"]
+  L -- "derived facts (required, per-project partitions)" --> G["Graphiti"]
 ```
 
 The write path is asynchronous. `lib/ingest/index.ts` remains responsible only for canonical item
@@ -1278,8 +1400,9 @@ The module reuses:
 - `lib/attribution/contributor-credit.ts` as the single attribution oracle for whole items;
 - `task_evidence` for task grouping/link explanation;
 - existing source URLs and item detail routes;
-- `lib/auth/visibility.ts` tier rules even though V1 project context is team-only, so the read remains
-  fail-closed if audience support expands later.
+- *(Amended in V2)* the access oracle (Part I §5.1) — the timeline read joins the principal's
+  visible-project set; `lib/auth/visibility.ts` tier rules remain only as the legacy-tier index-hint
+  layer beneath it.
 
 Meeting segments are context signals, not duplicated work credit for every attendee. They appear once
 at meeting time with attendees and submitters as metadata. Whole items retain the existing work/signal
@@ -1390,13 +1513,16 @@ query-builder reads must be visibly oracle-scoped.
   from the live canonical source (`items.access`, `tasks.audience`, `decisions.audience`), exactly as
   invariant 2 requires — so a missed heal can cost filter freshness, never a leak. A guard test pins
   that no project-context read trusts stored unit audience without the live-source join.
-- Effective membership is metadata, not a visibility grant. Reads join the live item and apply
-  `visibleItems`/`isRestrictedTier` semantics.
+- *(Inverted in V2 — Part I §2 flip 1)* Effective membership IS the visibility path, computed only
+  by the oracle (Part I §5.1); reads join the oracle's project set. The live item's legacy `access`
+  tier remains a migration input and index hint, never the authority.
 - `lib/ingest/purge.ts` must include context units, suggestions, memberships, and embeddings in its
   source-removal contract. Foreign-key cascades should perform deletion; the purge tests prove no
   served context remains.
 - Retracted segment content is cleared before any background classifier can read it again.
-- Project descriptions, aliases, rules, feedback, and review queues are team-tier only in V1.
+- *(Amended in V2)* Project descriptions, aliases, rules, feedback, and review queues are visible
+  exactly to principals with visibility on the project (`project_groups`) — and a principal never
+  sees the existence or name of a project no group of theirs can see.
 - Add guard tests ensuring every project-context dashboard read uses the visibility/domain read
   module and every table has one sanctioned writer.
 
