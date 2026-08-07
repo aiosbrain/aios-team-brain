@@ -29,16 +29,13 @@ noise*; at −25.5% the lever lands on the bar, which the procedure reads as INC
 
 Two things follow, and both are stated rather than buried:
 
-> ⛔ **MERGE BLOCKED pending re-confirmation.** The figures above are the battery's, measured on a
-> **fresh** graph. The expected **prod** saving is **~18%**, not 25.5% (see *Verification* for the
-> arithmetic) — and the ship decision was taken on the 25% number. The delta review ruled that a
-> decision document whose own text disavows the basis of the decision it records cannot merge without
-> recording a re-decision, and that the correction moves the trade in one direction only: the saving
-> shrank ~30% relative while the risk side (the ~7% detection limit, the vendored-patch maintenance
-> burden) is unchanged. **Whether ~18% still clears the owner's threshold is not inferable from the
-> earlier yes.** This line is replaced by `re-confirmed by Chetan on the ~18% expectation, <date>`
-> — or by a decision not to ship — before merge. Building, reviewing and pushing proceed; merging
-> does not.
+> ✅ **Re-confirmed by Chetan on the ~18% expectation, 2026-08-07.** The figures in the table above
+> are the battery's, measured on a **fresh** graph. The expected **prod** saving is **~18%**, not
+> 25.5% (see *Verification* for the arithmetic) — the original ship decision was taken on the 25%
+> number, and the delta review ruled that the earlier yes could not carry, since the correction moves
+> the trade one way only: the saving shrank ~30% relative while the risk side (the ~7% detection
+> limit, the vendored-patch maintenance burden) is unchanged. It was put back to the owner on the
+> corrected figure and re-confirmed. **The decision on record is a decision taken on ~18%.**
 
 1. **This ship overrides the battery's procedural outcome.** It is a threshold judgement — "nothing
    detected, detection limit ~7%, mechanism structurally low-risk, saving worth it" — made by the
