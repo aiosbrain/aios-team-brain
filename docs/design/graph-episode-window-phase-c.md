@@ -191,6 +191,17 @@ Build the image from the branch, extract `graphiti_core/graphiti.py`, and check 
 second value. Equal ⇒ the shipped patch is the measured patch. This is the one claim in this spec
 that can be *proved* rather than argued, so it is a merge precondition rather than a hope.
 
+> **✅ RUN, 2026-08-07** (`docker build` from `graphiti/` on branch `feat/graph-window-run`, at
+> `graphiti/patch-same-item.py` sha256 `94ba6b19…`): the built image's
+> `/app/.venv/lib/python3.12/site-packages/graphiti_core/graphiti.py` is
+> **`49ee534a1043760f9e3b58617f7853edd65e7e643a75f34f75267528cb0ec72d`** — equal. Every PATCH 3 gate
+> passed on the way (pre-state anchor count 1, the script's `patched + parses`, the post-state marker,
+> and `RELEVANT_SCHEMA_LIMIT` still 15 in `search_utils.py`). The merge precondition is met.
+>
+> Note that the script ships **without a repo header comment**, because adding one would change its
+> sha and therefore the sha of the file it produces — dissolving the claim above. The `why` lives in
+> `graphiti/Dockerfile`'s PATCH 3 block and in this spec.
+
 ## Rollout and rollback
 
 1. **Rollback anchor recorded: graphiti deployment `fde9d3b4-9e7`** (SUCCESS, 2026-08-07T00:57:11).
