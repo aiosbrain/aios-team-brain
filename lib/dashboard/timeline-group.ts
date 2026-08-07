@@ -26,6 +26,25 @@ export interface EvidenceTaskRef {
   status: string;
 }
 
+/**
+ * The payload `source` slug for a meeting. Deliberately NOT an ingest source (it is absent from
+ * `lib/ingest/source-rules`, which is keyed on what the ingest path actually sees) — a meeting reaches
+ * the timeline from the `meeting_notes` ledger, not from a connector.
+ */
+export const MEETING_SOURCE = "meetings";
+
+/**
+ * Is this `EvidenceItem.at` a bare date (`YYYY-MM-DD`) rather than a full timestamp?
+ *
+ * Some evidence genuinely has no clock time — a meeting is dated from `meeting_notes.occurred_at`, a
+ * `date` column. Rendering it as a time anyway produces a confident, wrong "12:00 AM" (or whatever the
+ * viewer's timezone makes of UTC midnight), which is worse than showing nothing. Pure, so the rule is
+ * testable without rendering; used by the person card.
+ */
+export function isBareDate(at: string): boolean {
+  return /^\d{4}-\d{2}-\d{2}$/.test(at.trim());
+}
+
 export interface EvidenceItem {
   id: string;
   title: string;
@@ -43,6 +62,15 @@ export interface EvidenceItem {
    *  `method='llm'`). Carried in the payload so a lower-precision link is diagnosable — and correctable —
    *  from every surface that reads the ledger, not just inside the builder. */
   linkVia?: "commit-text" | "pr" | "inferred";
+  /**
+   * How this person came to be credited, when it was NOT the ordinary path. Set to `"submitter"` on a
+   * meeting with no resolved attendees, where the credit falls back to whoever submitted the note —
+   * the one person we know was involved. Absent means the ordinary path (real attendance, authorship).
+   *
+   * It exists so a fallback is never silently indistinguishable from the real thing: meeting attendee
+   * extraction drops any name it can't resolve, so "no attendees" means "we don't know", not "nobody".
+   */
+  via?: "submitter";
 }
 
 export interface EvidenceWithMember extends EvidenceItem {
@@ -293,7 +321,9 @@ export function groupTimeline(
   for (const ev of evidence) {
     if (!members.has(ev.memberId)) continue; // unknown member → drop, don't guess
     const b = bucket(dayOf(ev.at), ev.memberId);
-    const item: EvidenceItem = { id: ev.id, title: ev.title, url: ev.url, source: ev.source, kind: ev.kind, at: ev.at, linkedTask: ev.linkedTask, linkVia: ev.linkVia };
+    // EXPLICIT copy — a new EvidenceItem field must be added here too, or it is silently dropped
+    // between the builder and the payload (the field exists on the type, so nothing type-errors).
+    const item: EvidenceItem = { id: ev.id, title: ev.title, url: ev.url, source: ev.source, kind: ev.kind, at: ev.at, linkedTask: ev.linkedTask, linkVia: ev.linkVia, via: ev.via };
     if (ev.taskId && taskInfo.has(ev.taskId)) {
       const arr = b.tasks.get(ev.taskId) ?? [];
       arr.push(item);
@@ -338,7 +368,12 @@ export function groupTimeline(
       // deploy too early: with linking at 9/220 items it hid ~96% of the team's week. `unlinked` stays
       // as the coverage metric that says when omission becomes safe.
       const other = toSourceGroups(b.other, perSourceCap);
-      const unlinked = b.other.length;
+      // `unlinked` is the doc->task COVERAGE metric (see the field's doc) — the number that decides
+      // when omitting `other[]` becomes safe. Meetings are work, but they are not linkable documents:
+      // nothing tries to attach them to a task, so counting them would inflate the metric permanently
+      // and destroy its meaning (one person's 16 meetings a fortnight alone would swamp it). They are
+      // still in `other`, still rendered, still counted in `total` — just not in this metric.
+      const unlinked = b.other.filter((e) => e.source !== MEETING_SOURCE).length;
       // `total` = all WORK the card shows, so the header count and the body agree. Signals are grouped by
       // kind, newest-first, capped — never counted.
       const total = tasks.reduce((n, t) => n + t.evidenceCount, 0) + other.reduce((n, g) => n + g.count, 0);
