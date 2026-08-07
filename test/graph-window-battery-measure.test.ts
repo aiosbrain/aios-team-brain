@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { continuityFrom, peopleFrom, memberPresence } from "../scripts/graph-window-battery/measure";
+// @ts-expect-error — plain .mjs, no types; ONE implementation shared by harvest and judge.
+import { buildUniverse, nameConvergence } from "../scripts/graph-window-battery/q7.mjs";
 
 /**
  * The battery's quality measurements for PIPEFF-2 (AIO-821).
@@ -156,5 +158,68 @@ describe("Q3's predicate stays tied to the one the health module pins", () => {
     expect(matches.length).toBeGreaterThanOrEqual(4);
     // …and no MATCH on a labelled node without it.
     expect(src).not.toMatch(/MATCH \(n:Entity\)(?!.*group_id)/);
+  });
+});
+
+describe("Q7 (Amendment 2) — recurring-name convergence, incumbent-referenced", () => {
+  /**
+   * Q3 died with graphiti 0.29.3 (add_episode discards duplicate_pairs — session 1, verified at
+   * graphiti.py:1131), and Q6's member-name universe was structurally underpowered on a roster with
+   * one qualifying human name. Q7 asks the same differential question over the names the INCUMBENT
+   * itself found recurring in the source text — evidence-rich regardless of roster, no answer key.
+   */
+  const items = [
+    { id: "i1", body: "Graphiti and Railway ship together. Graphiti again." },
+    { id: "i2", body: "Railway deploys the graphiti service." },
+    { id: "i3", body: "Something unrelated entirely." },
+  ];
+
+  it("builds the universe from the union of the incumbent's reps, requiring recurrence in ≥2 items", () => {
+    const u = buildUniverse(
+      [
+        [{ name: "Graphiti", nodes: 1 }, { name: "OnlyOnce", nodes: 1 }],
+        [{ name: "Railway", nodes: 1 }],
+      ],
+      items
+    );
+    // "graphiti" is in i1+i2, "railway" in i1+i2; "OnlyOnce" is in none.
+    expect(u).toEqual(["graphiti", "railway"]);
+  });
+
+  it("excludes names the incumbent found that do NOT recur in the source — no self-fulfilling universe", () => {
+    const u = buildUniverse([[{ name: "Something", nodes: 3 }]], items);
+    expect(u).toEqual([]); // "something" appears in one item only
+  });
+
+  it("filters short and numeric names, which would match prose rather than entities", () => {
+    const u = buildUniverse([[{ name: "he", nodes: 1 }, { name: "42", nodes: 1 }]], [
+      { id: "a", body: "he said 42" },
+      { id: "b", body: "he heard 42" },
+    ]);
+    expect(u).toEqual([]);
+  });
+
+  it("Q7 RISES under fragmentation — one recurring name as several parallel nodes", () => {
+    const u = ["graphiti", "railway"];
+    const clean = nameConvergence([{ name: "Graphiti", nodes: 1 }, { name: "Railway", nodes: 1 }], u);
+    const fragmented = nameConvergence([{ name: "Graphiti", nodes: 3 }, { name: "Railway", nodes: 2 }], u);
+    expect(clean).toBe(1);
+    expect(fragmented).toBe(2.5);
+    expect(fragmented).toBeGreaterThan(clean);
+  });
+
+  it("scores against the FIXED universe — an arm's own extra names cannot dilute it", () => {
+    // An arm that invents nodes for non-universe names must not move Q7 either way.
+    const u = ["graphiti"];
+    expect(nameConvergence([{ name: "Graphiti", nodes: 1 }, { name: "Invented", nodes: 9 }], u)).toBe(1);
+  });
+
+  it("counts a universe name the arm LOST as zero nodes — absence is visible, not skipped", () => {
+    const u = ["graphiti", "railway"];
+    expect(nameConvergence([{ name: "Graphiti", nodes: 1 }], u)).toBe(0.5);
+  });
+
+  it("returns 0 on an empty universe rather than NaN", () => {
+    expect(nameConvergence([{ name: "x", nodes: 1 }], [])).toBe(0);
   });
 });

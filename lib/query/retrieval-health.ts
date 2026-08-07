@@ -83,6 +83,14 @@ export interface GroupCensusSummary {
   refusal: CensusRefusal | null; // null = judged
   judgeable: boolean;
   polluted: boolean;
+  /** Entity nodes created in the same recent window (PIPEFF-2). Null = graph unreadable. */
+  recentEntities: number | null;
+  /** Entities created ÷ episodes projected, both over the recent window. **OBSERVATIONAL** — it
+   *  gates nothing (no leg state, no banner, no mail); it is displayed so the same-item predecessor
+   *  filter's one plausible failure mode (variant-name fragmentation, which the split-share census
+   *  is blind to by construction) has a sensor at all. Null when the window projected nothing —
+   *  never Infinity, never a zero that reads as a measurement. */
+  entitiesPerEpisode: number | null;
 }
 
 const COVERAGE_FLOOR = 0.9; // ≥90% embedded = healthy
@@ -251,7 +259,12 @@ export async function getRetrievalHealth(teamId: string): Promise<RetrievalHealt
     refusal: c.pollution.refusal,
     judgeable: c.pollution.judgeable,
     polluted: c.pollution.polluted,
+    recentEntities: c.recentEntities,
+    entitiesPerEpisode: c.entitiesPerEpisode,
   }));
+  // NOTE (PIPEFF-2): `entitiesPerEpisode` is carried to the card and STOPS THERE. It is not read by
+  // `graphCensusPolluted` below, by `deriveGraphState`, or by `lib/graph/extraction-alert`. Wiring it
+  // into any of those would arm an alarm on a band nobody has measured yet.
   const graphCensusPolluted = graphReachable && graphCensus.some((c) => c.judgeable && c.polluted);
   const graph = deriveGraphState({
     configured: graphConfiguredNow,

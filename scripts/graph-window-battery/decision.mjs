@@ -70,24 +70,29 @@ export const METRICS = Object.freeze({
   // integer count of people would swallow the clause whole (any spread ≥ 1 makes "lost 2" and "lost
   // 0" indistinguishable), which would delete the floor it exists to be. Losing two known people
   // outright is not a statistical question.
+  // v2 (Amendment 2): the RATIO clause is dropped — this install has one qualifying member name, so
+  // a recall percentage over n=1 is theatre. The noise-free count clause keeps full force: a
+  // qualifying person absent from a shipping arm's graph in either rep is a FAIL, no tolerance.
   Q2: {
-    label: "people recall",
-    kind: "ratio-lower",
-    margin: 0.05,
-    maxSpreadRatio: 0.025,
-    absolute: { input: "personsLost", max: 1, describe: (v) => `${v} people lost outright (max 1)` },
+    label: "people recall (count clause only)",
+    kind: "absolute-only",
+    absolute: { input: "personsLost", max: 0, describe: (v) => `${v} qualifying people lost outright (max 0)` },
   },
-  // Two-sided in PERCENTAGE POINTS: a failure-to-merge emits no IS_DUPLICATE_OF edge at all, so
-  // fragmentation makes this share FALL. extraction-health.ts already treats an anomalously low
-  // share as evidence the predicate is broken rather than the graph clean.
-  Q3: { label: "IS_DUPLICATE_OF share", kind: "pp-both", margin: 0.05, maxSpreadPp: 0.025 },
+  // Q3 (IS_DUPLICATE_OF share) was REMOVED by Amendment 2: graphiti 0.29.3's add_episode discards
+  // duplicate_pairs (graphiti.py:1131) and never writes the relation, so the metric read a
+  // structural zero on every arm — discovered live in session 1, verified in the wheel. Its
+  // fragmentation duty lives in Q7 below and in Q1's upper bound.
   Q4: { label: "cross-chunk continuity", kind: "ratio-lower", margin: 0.15, maxSpreadRatio: 0.075 },
   // 3pp, not 2: at ~100 episodes one retry ≈ 1pp, so a 1.5pp ceiling tolerates exactly one retry of
   // rep-to-rep difference and not two. The widening does not cost the guard its teeth — a retry adds
   // ~8,400 input tokens against a ~40,000/attempt baseline, so the full 3-retry allowance is a -2.3%
   // artifact on C1, against a band demanding -25%.
   Q5: { label: "signed retry gap", kind: "pp-upper", margin: 0.03, maxSpreadPp: 0.015 },
-  Q6: { label: "cross-item entity convergence", kind: "ratio-upper", margin: 0.05, maxSpreadRatio: 0.025 },
+  // v2 (Amendment 2): Q6's member-name universe was structurally underpowered on this install (one
+  // qualifying name in the roster). Q7 asks the same differential question over the names the
+  // INCUMBENT itself found recurring — Entity names from the union of W10's reps that literally
+  // appear in >=2 distinct corpus items. Fragmentation makes nodes-per-recurring-name RISE.
+  Q7: { label: "recurring-name convergence", kind: "ratio-upper", margin: 0.05, maxSpreadRatio: 0.025 },
   // The lever must EARN its deploy: this service's redeploy history is not free (see the spec's
   // Rollout). A quality-clean arm that barely moves tokens does not ship.
   C1: { label: "input tokens / episode", kind: "ratio-fall", margin: 0.25, maxSpreadRatio: 0.125 },
@@ -144,6 +149,26 @@ export function judgeMetric(key, arm, incumbent, extras = {}) {
   // Reduce every kind to: a `value`, one or two `edges`, and which side of each edge is "good".
   // Working in the metric's own units keeps the ceiling and the band commensurable — the bug in the
   // rule this replaced was exactly a units mismatch.
+  // absolute-only: no band exists — the metric is judged solely by its absolute clause, which the
+  // guard above has already required an input for. The band verdict is PASS by construction, so the
+  // absolute breach below is the only thing that can redden it.
+  if (m.kind === "absolute-only") {
+    const v = extras[m.absolute.input];
+    const breach = v > m.absolute.max ? m.absolute.describe(v) : null;
+    return {
+      key,
+      label: m.label,
+      verdict: breach ? VERDICT.FAIL : VERDICT.PASS,
+      value: null,
+      armMean: null,
+      baseMean: null,
+      baseSpread: null,
+      tolerance: null,
+      edges: [],
+      absoluteBreach: breach,
+    };
+  }
+
   let value, edges;
   switch (m.kind) {
     case "ratio-lower":
@@ -209,20 +234,17 @@ export function judgeMetric(key, arm, incumbent, extras = {}) {
  * Every trigger here is pre-defined and none of them is "the numbers came out wrong" — that
  * distinction is the difference between a rule and an excuse.
  */
-export function assessSession({ incumbent, dupeShare, dupeEdges, underpowered, armsCompleted, harnessRefused, crossCheckAvailable }) {
+export function assessSession({ incumbent, universeSize, underpowered, armsCompleted, harnessRefused, crossCheckAvailable }) {
   // REQUIRED, not defaulted-permissive. A default of `armsCompleted = true` means a runner that
   // forgets to pass it silently disarms that validity trigger — the same "omission canonicalized as
   // fine" class as the absolute clause above, in the one file whose job is that the readout cannot
   // be quietly softened. Throw instead: a missing safety input is a bug, not a pass.
-  for (const [k, v] of Object.entries({ dupeShare, dupeEdges, underpowered, armsCompleted, harnessRefused, crossCheckAvailable })) {
+  for (const [k, v] of Object.entries({ universeSize, underpowered, armsCompleted, harnessRefused, crossCheckAvailable })) {
     if (v === undefined || v === null) throw new Error(`assessSession: \`${k}\` is required — omitting it must not read as valid`);
   }
-  // NaN is the other shape of "not measured", and it slipped BOTH dupe gates: `NaN < 0.15` and
-  // `NaN > 0.45` are each false, so a broken query produced a clean bill of health. Same reason the
-  // absolute clause above rejects it.
-  for (const [k, v] of Object.entries({ dupeShare, dupeEdges })) {
-    if (!Number.isFinite(v)) throw new Error(`assessSession: \`${k}\` must be a finite number, got ${JSON.stringify(v)}`);
-  }
+  // NaN is the other shape of "not measured" — it slips every comparison gate silently, so it is
+  // refused up front rather than allowed to read as a clean bill of health.
+  if (!Number.isFinite(universeSize)) throw new Error(`assessSession: \`universeSize\` must be a finite number, got ${JSON.stringify(universeSize)}`);
   if (!Array.isArray(underpowered)) throw new Error("assessSession: `underpowered` must be an array — defaulting it to [] reads as \"every metric is powered\"");
   const problems = [];
 
@@ -250,29 +272,19 @@ export function assessSession({ incumbent, dupeShare, dupeEdges, underpowered, a
     }
   }
 
-  // The incumbent has to be a graph worth comparing against. 0.45 was extraction-health.ts's
-  // DEDUPE_ABSOLUTE_FLOOR when this battery ran (ALARMFIX-1 later retired the edge-share predicate
-  // for the 0.29.3 name census; the value stays FROZEN here as this instrument's own constant —
-  // the battery measures the 0.13.2-era IS_DUPLICATE_OF share, which is what its corpus emits).
-  // The 0.15 floor is below prod's healthy ~26-35% on purpose, because the battery runs into an
-  // EMPTY Neo4j where early episodes have nothing to duplicate against.
-  if (dupeShare < DUPE_SANE_MIN || dupeShare > DUPE_SANE_MAX) {
-    problems.push(`incumbent duplicate share ${(dupeShare * 100).toFixed(1)}% outside the sane ${DUPE_SANE_MIN * 100}-${DUPE_SANE_MAX * 100}% range`);
-  }
-  // extraction-health.ts refused to judge the old share below this many edges; so does this.
-  if (dupeEdges < MIN_EDGES_FOR_SHARE) {
-    problems.push(`only ${dupeEdges} edges — below the ${MIN_EDGES_FOR_SHARE}-edge minimum for a share signal`);
+  // v2 (Amendment 2): the 15-45% dupe-share sanity gate died with Q3 — its evidence does not exist
+  // on graphiti 0.29.3. Its replacement asks the same "is the incumbent worth comparing against"
+  // question of Q7's universe: fewer than MIN_UNIVERSE recurring names means the differential
+  // question has too little evidence to mean anything, and the session is a power failure.
+  if (universeSize < MIN_UNIVERSE) {
+    problems.push(`Q7 universe has ${universeSize} recurring names — below the ${MIN_UNIVERSE}-name minimum`);
   }
 
   return { valid: problems.length === 0, problems };
 }
 
-/** Froze extraction-health.ts's retired DEDUPE_ABSOLUTE_FLOOR (ALARMFIX-1); see assessSession. */
-export const DUPE_SANE_MAX = 0.45;
-/** Below prod's healthy ~26-35% on purpose — the battery's Neo4j starts empty. */
-export const DUPE_SANE_MIN = 0.15;
-/** Froze extraction-health.ts's retired MIN_EDGES_FOR_DEDUPE_SIGNAL (ALARMFIX-1). */
-export const MIN_EDGES_FOR_SHARE = 200;
+/** Q7's power floor: the incumbent-referenced universe must hold at least this many recurring names. */
+export const MIN_UNIVERSE = 15;
 
 /**
  * The whole readout: which arm ships, if any.

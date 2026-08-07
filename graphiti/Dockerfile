@@ -111,6 +111,55 @@ RUN F=/app/.venv/lib/python3.12/site-packages/graphiti_core/llm_client/openai_ge
 # Asserted rather than assumed, so a future base image that regresses the ceiling is caught here.
 RUN grep -q 'DEFAULT_MAX_TOKENS = 16384' /app/.venv/lib/python3.12/site-packages/graphiti_core/llm_client/config.py
 
+# ── PATCH 3: carry only the SAME ITEM's prior chunks into extraction (PIPEFF-2 / AIO-821) ──────────
+#
+# THE PROBLEM. `add_episode` fetches the group's last `RELEVANT_SCHEMA_LIMIT` (10) episodes as
+# `previous_episodes` and attaches them to EVERY extraction/dedupe/edge prompt. On our projector,
+# consecutive episodes in a group are usually chunks of ten DIFFERENT documents, so each call was
+# billed for ten unrelated documents' text. Measured on the Phase-B battery: input tokens per episode
+# **−25.5%** with this filter (20,792/21,378 vs 28,000/28,574), entity yield −3%, cross-chunk
+# continuity +4%, zero people lost, zero same-name splits, zero retries — every observed difference
+# smaller than the incumbent's own ~7% run-to-run noise. On prod's MATURE graph the same absolute cut
+# (~7,200 tokens, fixed-size: it is ten episodes' content, independent of graph maturity) lands on a
+# 40,070-token baseline, so the number to EXPECT here is **~−18%, not −25.5%**. A verification band
+# written around 25% would have called a fully-working patch broken. See
+# docs/design/graph-episode-window-phase-c.md.
+#
+# THE MECHANISM, and why the risk is bounded. It does not reduce what is READ. Episode names are
+# `items:<id>` / `items:<id>#k`, so the pre-`#` prefix identifies the document: a multi-chunk item
+# keeps ALL of its own prior chunks, and only unrelated documents drop out. The one loss channel is
+# cross-ITEM dedupe judgement (the context that helps the extractor decide "John" here is "John Smith"
+# there). A non-`items:` episode — `correction:<arc_id>` arc writeback — matches nothing and gets ZERO
+# predecessors. That is intended (a correction is not a chunk of a document) and is pinned by
+# `test/guards/graphiti-patch-same-item.test.ts`, which runs THIS script and executes the code it
+# inserts, rather than describing it.
+#
+# WHY A SCRIPT AND NOT A `sed`. The insert is 17 lines; a sed of that would be unreadable and
+# unverifiable. `patch-same-item.py` is committed **byte-for-byte as the measured arm ran it**
+# (sha256 94ba6b1918b8df3f34fd44737e79a5c42f9e26a00d0fe498975e255dcdfcf2d6) — deliberately WITHOUT a
+# repo header comment, because a header would change that sha and break the one claim in this change
+# that can be PROVED rather than argued: this script applied to the pinned wheel reproduces
+# `graphiti_core/graphiti.py` at sha256
+# 49ee534a1043760f9e3b58617f7853edd65e7e643a75f34f75267528cb0ec72d, the exact file the battery ran.
+# The script is documented here instead; the guard test pins the sha so a "tidy-up" reddens the build.
+#
+# THE GATES, and what each one catches — a vendored-library edit's real hazard is the SILENT NO-OP:
+#   * pre-state `grep -cF … == 1` — the anchor exists exactly once. Fixed-string (`-F`) because the
+#     anchor contains `(` and `.`. A base-image or graphiti-core bump that moves this line fails the
+#     BUILD instead of shipping an unpatched image that looks patched.
+#   * the script's own asserts — anchor count AND the line that must follow it — plus its `ast.parse`.
+#   * post-state `grep -q` on the inserted marker — the edit actually landed in the file we serve.
+#   * untouched-elsewhere: `RELEVANT_SCHEMA_LIMIT` still appears 15x in `search/search_utils.py`. That
+#     constant is the retrieval-quality knob the parent spec REJECTED changing; pinning its count is
+#     how this patch is prevented from ever widening into that change.
+# Runs AFTER the pip install (like PATCH 2), or pip would overwrite the edit.
+COPY patch-same-item.py /tmp/patch-same-item.py
+RUN F=/app/.venv/lib/python3.12/site-packages/graphiti_core/graphiti.py \
+ && test "$(grep -cF '                    else await EpisodicNode.get_by_uuids(self.driver, previous_episode_uuids)' "$F")" = "1" \
+ && /app/.venv/bin/python /tmp/patch-same-item.py "$F" \
+ && grep -q 'PIPEFF-2: carry only the SAME ITEM' "$F" \
+ && test "$(grep -c RELEVANT_SCHEMA_LIMIT /app/.venv/lib/python3.12/site-packages/graphiti_core/search/search_utils.py)" = "15"
+
 # ── THE RUNTIME REVERT — the trap that explains Trap 1 ─────────────────────────────────────────────
 #
 # The base image's CMD is `uv run uvicorn …`, and **`uv run` SYNCS the venv against /app/uv.lock

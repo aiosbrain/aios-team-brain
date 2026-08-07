@@ -24,24 +24,22 @@ import { judgeMetric, assessSession, decide, VERDICT, METRICS } from "../scripts
 const incumbent = {
   Q1: [10.0, 10.1], // entity yield / episode
   Q2: [0.9, 0.91], // people recall
-  Q3: [0.3, 0.31], // IS_DUPLICATE_OF share (a fraction, not pp)
   Q4: [0.8, 0.81], // cross-chunk continuity
   Q5: [0.0, 0.01], // signed retry gap
-  Q6: [1.0, 1.02], // entity nodes per member name
+  Q7: [1.0, 1.02], // nodes per recurring name (Amendment 2)
   C1: [40000, 40100], // input tokens / episode
 };
 
 const cleanArm = {
   Q1: [10.0, 10.0],
   Q2: [0.9, 0.9],
-  Q3: [0.3, 0.3],
   Q4: [0.8, 0.8],
   Q5: [0.0, 0.0],
-  Q6: [1.0, 1.0],
+  Q7: [1.0, 1.0],
   C1: [24000, 24000], // a 40% fall, comfortably past the 25% C1 demands
 };
 
-const session = { incumbent, dupeShare: 0.305, dupeEdges: 900, underpowered: [], armsCompleted: true, harnessRefused: false, crossCheckAvailable: true };
+const session = { incumbent, universeSize: 40, underpowered: [], armsCompleted: true, harnessRefused: false, crossCheckAvailable: true };
 
 const run = (over: Record<string, unknown> = {}, armOver: Record<string, number[]> = {}) =>
   decide({
@@ -58,8 +56,8 @@ describe("the baseline is non-vacuous", () => {
   });
 
   it("gates on every metric the spec names — a metric silently dropped from METRICS is a gate that stops existing", () => {
-    expect(Object.keys(METRICS).sort()).toEqual(["C1", "Q1", "Q2", "Q3", "Q4", "Q5", "Q6"]);
-    expect(run().arms[0].results).toHaveLength(7);
+    expect(Object.keys(METRICS).sort()).toEqual(["C1", "Q1", "Q2", "Q4", "Q5", "Q7"]);
+    expect(run().arms[0].results).toHaveLength(6);
   });
 });
 
@@ -77,15 +75,12 @@ describe("the fragmentation direction — the hole that made Q1 and Q3 two-sided
     expect(d.arms[0].results.find((r: { key: string }) => r.key === "Q1").verdict).toBe(VERDICT.FAIL);
   });
 
-  it("FAILS an arm whose duplicate share FALLS — a failure-to-merge emits no IS_DUPLICATE_OF edge at all", () => {
-    const d = run({}, { Q3: [0.23, 0.23] }); // -7.5pp against a ±5pp band
-    expect(d.arms[0].results.find((r: { key: string }) => r.key === "Q3").verdict).toBe(VERDICT.FAIL);
+  // Q3's version of this test is gone with Q3 itself: graphiti 0.29.3 never writes IS_DUPLICATE_OF
+  // (session 1, verified at graphiti.py:1131), so the share was a structural zero, not a metric.
+  it("FAILS an arm that fragments a recurring name across more nodes (Q7)", () => {
+    const d = run({}, { Q7: [1.2, 1.2] }); // +18% against a ≤105% band
+    expect(d.arms[0].results.find((r: { key: string }) => r.key === "Q7").verdict).toBe(VERDICT.FAIL);
     expect(d.outcome).toBe("NO_SHIP");
-  });
-
-  it("FAILS an arm that fragments a member name across more nodes (Q6)", () => {
-    const d = run({}, { Q6: [1.2, 1.2] }); // +18% against a ≤105% band
-    expect(d.arms[0].results.find((r: { key: string }) => r.key === "Q6").verdict).toBe(VERDICT.FAIL);
   });
 });
 
@@ -166,20 +161,10 @@ describe("session validity — every trigger is pre-defined, and none of them is
     expect(run({ harnessRefused: true }).outcome).toBe("INVALID");
   });
 
-  it("INVALID when the incumbent's duplicate share is above the frozen DEDUPE_ABSOLUTE_FLOOR (0.45, retired from extraction-health by ALARMFIX-1)", () => {
-    const d = run({ dupeShare: 0.7 }); // the degraded model's reading
+  it("INVALID when Q7's universe is thinner than its floor — a power failure, not a verdict", () => {
+    const d = run({ universeSize: 8 });
     expect(d.outcome).toBe("INVALID");
-    expect(d.reasons.join(" ")).toMatch(/duplicate share/);
-  });
-
-  it("INVALID when the incumbent's duplicate share is near zero — that means the PREDICATE is broken, not the graph clean", () => {
-    expect(run({ dupeShare: 0.01 }).outcome).toBe("INVALID");
-  });
-
-  it("INVALID below the 200-edge minimum the health module also refuses to judge under", () => {
-    const d = run({ dupeEdges: 150 });
-    expect(d.outcome).toBe("INVALID");
-    expect(d.reasons.join(" ")).toMatch(/200-edge/);
+    expect(d.reasons.join(" ")).toMatch(/8 recurring names/);
   });
 
   it("an INVALID session yields no arm verdicts at all — a broken instrument reports no result", () => {
@@ -204,12 +189,6 @@ describe("the spread ceiling is per-metric and in BAND units, not a fraction of 
     expect(s.problems.join(" ")).toMatch(/Q5 incumbent spread/);
   });
 
-  it("refuses a Q3 spread that would leave its two-sided PASS window EMPTY", () => {
-    // The old ceiling allowed 7.5pp against a ±5pp band: valid by the rules, unpassable by any arm.
-    const s = assessSession({ ...session, incumbent: { ...incumbent, Q3: [0.27, 0.345] } }); // 7.5pp
-    expect(s.valid).toBe(false);
-  });
-
   it("GUARANTEES a non-empty PASS window AT the ceiling — for every gated metric", () => {
     // The structural property the old ceiling lacked, tested where it actually binds. An earlier
     // version of this test used the shared fixture, whose spreads sit ~1/50th of the ceiling — so it
@@ -223,6 +202,7 @@ describe("the spread ceiling is per-metric and in BAND units, not a fraction of 
         maxSpreadPp?: number;
         absolute?: { input: string };
       };
+      if (m.kind === "absolute-only") continue; // no band → no window to be empty
       const mean = m.kind.startsWith("pp") ? 0.3 : 10;
       const ceiling = m.maxSpreadRatio !== undefined ? m.maxSpreadRatio * mean : (m.maxSpreadPp as number);
       const base = [mean - ceiling / 2, mean + ceiling / 2];
@@ -234,8 +214,7 @@ describe("the spread ceiling is per-metric and in BAND units, not a fraction of 
       // Precondition: this incumbent is exactly at — not over — the validity ceiling.
       const sess = assessSession({
         incumbent: { [key]: base },
-        dupeShare: 0.305,
-        dupeEdges: 900,
+        universeSize: 40,
         underpowered: [],
         armsCompleted: true,
         harnessRefused: false,
@@ -282,7 +261,7 @@ describe("arm order — SAME is evaluated before the blunt W1 fallback", () => {
       incumbent,
       arms: [
         { name: "SAME", metrics: { ...cleanArm, Q4: [0.5, 0.5] }, extras: { personsLost: 0 } },
-        { name: "W1", metrics: { ...cleanArm, Q2: [0.5, 0.5] }, extras: { personsLost: 0 } },
+        { name: "W1", metrics: { ...cleanArm, Q4: [0.4, 0.4] }, extras: { personsLost: 0 } },
       ],
     });
     expect(d.outcome).toBe("NO_SHIP");
@@ -308,23 +287,26 @@ describe("Q2's second clause — the one that bites where the ratio is weakest",
    * to "lose none" — an arm losing two known people outright would have shipped. A gate clause left
    * outside the executable procedure is the interpretive joint this file exists to close.
    */
-  it("FAILS an arm that loses 2 people outright even when the recall RATIO passes", () => {
-    const d = decide({
-      session: assessSession(session),
-      incumbent,
-      arms: [{ name: "SAME", metrics: cleanArm, extras: { personsLost: 2 } }],
-    });
-    const q2 = d.arms[0].results.find((r: { key: string }) => r.key === "Q2");
-    expect(q2.verdict).toBe(VERDICT.FAIL);
-    expect(q2.absoluteBreach).toMatch(/2 people lost outright/);
-    expect(d.outcome).toBe("NO_SHIP");
-  });
-
-  it("allows exactly 1 — the clause is 'at most 1', not 'none'", () => {
+  it("FAILS an arm that loses even ONE qualifying person — v2 tightened the floor to zero", () => {
+    // v1 allowed "at most 1 lost" of ~15 expected names. Amendment 2 restricts the clause to
+    // QUALIFYING names (present in ≥2 items), of which this install has one — losing them is not a
+    // rounding case at any n this roster can produce.
     const d = decide({
       session: assessSession(session),
       incumbent,
       arms: [{ name: "SAME", metrics: cleanArm, extras: { personsLost: 1 } }],
+    });
+    const q2 = d.arms[0].results.find((r: { key: string }) => r.key === "Q2");
+    expect(q2.verdict).toBe(VERDICT.FAIL);
+    expect(q2.absoluteBreach).toMatch(/1 qualifying people lost/);
+    expect(d.outcome).toBe("NO_SHIP");
+  });
+
+  it("allows zero lost", () => {
+    const d = decide({
+      session: assessSession(session),
+      incumbent,
+      arms: [{ name: "SAME", metrics: cleanArm, extras: { personsLost: 0 } }],
     });
     expect(d.outcome).toBe("SHIP");
   });
@@ -348,10 +330,10 @@ describe("assessSession refuses to run on missing safety inputs", () => {
    * absolute-clause omission above, in the file whose whole job is that the readout cannot be
    * quietly softened.
    */
-  it.each(["dupeShare", "dupeEdges", "underpowered", "armsCompleted", "harnessRefused", "crossCheckAvailable"])(
+  it.each(["universeSize", "underpowered", "armsCompleted", "harnessRefused", "crossCheckAvailable"])(
     "throws when %s is omitted rather than treating it as fine",
     (field) => {
-      const full = { incumbent, dupeShare: 0.305, dupeEdges: 900, underpowered: [], armsCompleted: true, harnessRefused: false, crossCheckAvailable: true };
+      const full = { incumbent, universeSize: 40, underpowered: [], armsCompleted: true, harnessRefused: false, crossCheckAvailable: true };
       const { [field as keyof typeof full]: _omitted, ...rest } = full;
       expect(() => assessSession(rest)).toThrow(new RegExp(field));
     }
@@ -369,13 +351,11 @@ describe("\"not measured\" has more shapes than undefined, and none of them may 
     expect(() => judgeMetric("Q2", cleanArm.Q2, incumbent.Q2, { personsLost: bad })).toThrow(/personsLost/);
   });
 
-  it.each([["dupeShare"], ["dupeEdges"]])("refuses a NaN %s, which slipped BOTH sanity gates", (field) => {
-    const full = { incumbent, dupeShare: 0.305, dupeEdges: 900, underpowered: [], armsCompleted: true, harnessRefused: false, crossCheckAvailable: true };
-    expect(() => assessSession({ ...full, [field]: NaN })).toThrow(/finite/);
+  it("refuses a NaN universeSize, which slips every comparison gate silently", () => {
+    expect(() => assessSession({ ...session, universeSize: NaN })).toThrow(/finite/);
   });
 
   it("refuses a non-array underpowered — defaulting it to [] read as 'every metric is powered'", () => {
-    const full = { incumbent, dupeShare: 0.305, dupeEdges: 900, underpowered: [], armsCompleted: true, harnessRefused: false, crossCheckAvailable: true };
-    expect(() => assessSession({ ...full, underpowered: "Q6" })).toThrow(/underpowered/);
+    expect(() => assessSession({ ...session, underpowered: "Q7" })).toThrow(/underpowered/);
   });
 });

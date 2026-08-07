@@ -815,6 +815,43 @@ guard enforces it, it's named.
   _Guards:_ `test/guards/dedupe-predicate-pinned.test.ts` (census Cypher + TS normalisation + the
   ledger tripwire), `test/guards/extraction-alert-wired.test.ts` (scheduler wiring); machines
   mutation-tested in `test/extraction-alert.test.ts` + `test/name-collision-pollution.test.ts`.
+- **The deployed graphiti image carries a SAME-ITEM predecessor filter, so what reaches the
+  extractor is this document's own chunks and nothing else** (PIPEFF-2 / AIO-821, `graphiti/Dockerfile`
+  PATCH 3 + `graphiti/patch-same-item.py`). Stock `add_episode` fetches the group's last
+  `RELEVANT_SCHEMA_LIMIT` (10) episodes as `previous_episodes` and attaches them to **every**
+  extraction/dedupe/edge prompt. Because the projector interleaves chunks of many items into one
+  group, those ten were usually ten **unrelated documents** — pure billed context. The patched image
+  filters `previous_episodes` to episodes sharing the pre-`#` prefix of the current episode's name
+  (`items:<id>` / `items:<id>#k`), so: a multi-chunk item keeps **all** of its own prior chunks; a
+  single-chunk item and a **non-`items:` episode (`correction:<arc_id>` arc writeback) get ZERO
+  predecessors** — intended (a correction is not a chunk of a document) and pinned, not discovered.
+  Nothing about what is READ or STORED changes; the one loss channel is cross-**item** dedupe
+  judgement (the context that would help the extractor decide "John" here is "John Smith" there).
+  Measured on the Phase-B battery: input tokens/episode −25.5%, entity yield −3%, continuity +4%, zero
+  people lost, zero same-name splits — every difference inside the incumbent's own ~7% noise, so this
+  shipped as a **stated product call on a threshold judgement**, not as a battery pass
+  (docs/design/graph-episode-window-phase-c.md). On prod's **mature** graph the cut is the same
+  ~7,200 absolute tokens against a 40,070 baseline ⇒ **expect ~−18%, not −25.5%**. The script is
+  committed **byte-for-byte as the measured arm ran it** (no header comment — it would change the sha)
+  and the merge precondition is a **checksum**: the script applied to the pinned wheel reproduces
+  `graphiti_core/graphiti.py` at sha256 `49ee534a…`. Build gates are all fail-loud (pre-state anchor
+  count, the script's own asserts + `ast.parse`, post-state marker, and an untouched-elsewhere pin on
+  `RELEVANT_SCHEMA_LIMIT`'s 15 occurrences in `search_utils.py` so the patch can never widen into the
+  retrieval-quality change the parent spec rejected) — a vendored-library edit's real hazard is the
+  silent no-op. The sensor for its one plausible failure mode is **`entitiesPerEpisode`**
+  (`lib/graph/extraction-health.recentEntityCount` + `deriveEntitiesPerEpisode`): entity nodes
+  **created** in the recent window ÷ episodes **projected** in the **same** window (one span helper,
+  `censusRecentSince`, feeds both legs), per group, shown on the Admin retrieval-health card. It
+  exists because the split-share census above counts SAME-name splits and is blind by construction to
+  **variant-name** fragmentation ("John" beside "John Smith"), which is what this lever could cause —
+  and variant fragmentation raises node count. It is **observational and wired to no alert path**
+  (not `deriveNameCollisionPollution`, not `extraction-alert`, not the graph leg's state): its band is
+  deliberately underived until two weeks of prod week-over-week variation exist, because prod's
+  content mix moves yield legitimately by more than the battery's noise. Zero episodes in the window
+  ⇒ `null`, never `Infinity`/`NaN`/`0`. _Guards:_
+  `test/guards/graphiti-patch-same-item.test.ts` (script sha + Dockerfile gates + the inserted Python
+  **executed**, incl. the `correction:` zero-predecessor pin),
+  `test/guards/entities-per-episode.test.ts` (shared span, null-on-zero, not-in-the-alarm-path).
 
 ## Changing X? read this
 

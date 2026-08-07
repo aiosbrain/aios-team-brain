@@ -371,6 +371,40 @@ export function normalizeEntityName(raw: string): string {
   return raw.toLowerCase().replace(/\s+/g, " ").trim();
 }
 
+/**
+ * The recent window's lower bound, as an ISO instant. ONE derivation, shared by the census's ledger
+ * leg (`groupEpisodeFlows`, windowed on `projected_at`) and the entity-count leg
+ * (`recentEntityCount`, windowed on Neo4j `n.created_at`).
+ *
+ * Single-sourced because `entitiesPerEpisode` divides one by the other: two independently-computed
+ * spans would produce a ratio that is dimensionally wrong and looks perfectly reasonable — a number
+ * on a card with no way to tell it apart from a measurement. Guarded in
+ * `test/guards/entities-per-episode.test.ts`.
+ */
+export function censusRecentSince(nowMs: number): string {
+  return new Date(nowMs - CENSUS_RECENT_MS).toISOString();
+}
+
+/**
+ * The sentinel upper bound for a LIVE read — "no right edge". A far-future instant rather than a
+ * conditionally-omitted clause, so there is exactly ONE query text: a Cypher `n.created_at <
+ * datetime($until)` with a null `$until` evaluates to null and silently filters every row out, and
+ * two query strings (bounded / unbounded) is how the bounded form ends up untested.
+ */
+export const CENSUS_UNBOUNDED_UNTIL = "9999-12-31T23:59:59.999Z";
+
+/**
+ * The recent window's UPPER bound. `null` ⇒ live (unbounded); a number ⇒ a retroactive span.
+ *
+ * The upper bound is not decoration. The retroactive pre-deploy baseline the verification table
+ * depends on is a **span**, and a lower-bound-only query would sweep post-deploy nodes into the
+ * "before" side — reading the patched extractor's behaviour as the baseline it is being compared
+ * against. Shared by BOTH legs of `entitiesPerEpisode` for the same reason `censusRecentSince` is.
+ */
+export function censusRecentUntil(untilMs: number | null): string {
+  return untilMs === null ? CENSUS_UNBOUNDED_UNTIL : new Date(untilMs).toISOString();
+}
+
 /** One per-raw-name row from the census Cypher (Cypher aggregates by the RAW name). */
 export interface CensusNameRow {
   name: string | null;
@@ -455,6 +489,91 @@ export async function nameCollisionSignals(
   } catch {
     return unknown; // unreadable → unknown, never degraded
   }
+}
+
+/* ────────────────────────────────────────────────────────────────────────────────────────────────
+ * ENTITY YIELD PER EPISODE — the sensor for the failure the census is blind to (PIPEFF-2 / AIO-821).
+ *
+ * The same-item predecessor filter shipped in `graphiti/Dockerfile` PATCH 3 stops attaching ten
+ * unrelated documents' chunks to every extraction call. Its plausible failure mode is NOT the
+ * same-name split the census counts — it is **variant-name fragmentation** ("John" beside "John
+ * Smith"), which the census sees as two different names and cannot detect by construction. What
+ * variant fragmentation DOES move is the number of entity nodes a given volume of episodes produces,
+ * so entity yield per episode is the metric that is actually sensitive to it.
+ *
+ * WHY IT NEEDED A NEW QUERY. The census returns per-name ALL-TIME node counts plus each name's
+ * newest `created_at`; "entities created in the window" is NOT recoverable from that (a name with 5
+ * nodes and a recent newest says nothing about how many of the 5 are new). All-time entities ÷
+ * windowed episodes is dimensionally incoherent, drifts upward forever on a growing graph, and is
+ * numerically dead: a week of +30% fragmentation on ~300 new episodes moves a ~5,400-episode
+ * cumulative total by under 2%.
+ *
+ * ⚠️ OBSERVATIONAL ONLY, DELIBERATELY. This value feeds NO alert path — not
+ * `deriveNameCollisionPollution`, not `lib/graph/extraction-alert`, not the graph leg's state. It is
+ * rendered on the admin card and nothing else, because its band is UNDERIVED: the battery's ~7% was
+ * single-rep noise on a 108-episode corpus, while prod's week-over-week content mix (a GitHub-heavy
+ * week vs a Slack-heavy one) can legitimately move entity yield by more. A band invented now would
+ * both false-fire and swallow real fragmentation. The band gets set from two weeks of measured prod
+ * variation, in a later commit — the measured-not-chosen rule this workstream applies to every other
+ * constant. Until then a movement is a prompt to LOOK, never a rollback trigger.
+ *
+ * Windowing by `created_at` is also what makes the before/after comparison possible at all: the
+ * patch, the card and the graphiti rebuild ship in one merge, so a "pre-deploy reading from the card"
+ * was uncapturable by construction. A `created_at`-windowed count reads the historical baseline out
+ * of graph history AFTER the deploy.
+ * ──────────────────────────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * Entity nodes CREATED in the recent window for one group. Per group — and therefore tier-scoped,
+ * since `group_id` is `<slug>_<tier>` and the group list comes from the team-scoped ledger (there is
+ * no RLS backstop; see CLAUDE.md §5).
+ *
+ * `n.created_at` is EXTRACTION time, not `valid_at` — the same choice, for the same reason, as the
+ * census and the stall probe: a backfill must be judged by what the extractor just did, not by how
+ * old its content is.
+ */
+export async function recentEntityCount(
+  groupId: string,
+  nowMs = Date.now(),
+  untilMs: number | null = null
+): Promise<number | null> {
+  if (!neo4jConfigured()) return null;
+  try {
+    const rows = await runRead<{ entities: number }>(
+      `MATCH (n:Entity {group_id: $g})
+       WHERE n.created_at >= datetime($since) AND n.created_at < datetime($until)
+       RETURN count(n) AS entities`,
+      { g: groupId, since: censusRecentSince(nowMs), until: censusRecentUntil(untilMs) }
+    );
+    // NOT `?? 0`. A `count(*)` always returns a row, so a missing one means the query did not run the
+    // way this code thinks it did — and this file's own rule is that a zero which looks like a
+    // measurement is worse than an admitted unknown.
+    const raw = rows[0]?.entities;
+    if (raw === undefined || raw === null) return null;
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : null;
+  } catch {
+    return null; // unreadable → unknown, never a zero that looks like a measurement
+  }
+}
+
+/**
+ * Entities created in the window ÷ episodes projected in the SAME window.
+ *
+ * `null` — never `Infinity`, never `NaN`, never `0` — whenever the ratio is not computable: an
+ * unreadable leg, or a window in which nothing was projected. A divide-by-zero that renders as a
+ * number is indistinguishable from a real reading on the card, which is the exact class of failure
+ * this repo has been bitten by (a parser matching nothing "measured" zero). Pure, so every one of
+ * those cases is testable without Neo4j.
+ */
+export function deriveEntitiesPerEpisode(
+  entities: number | null,
+  episodes: number | null
+): number | null {
+  if (entities === null || episodes === null) return null;
+  if (!Number.isFinite(entities) || !Number.isFinite(episodes)) return null;
+  if (episodes <= 0) return null; // no denominator ⇒ no measurement, not zero and not Infinity
+  return entities / episodes;
 }
 
 export interface NameCollisionInput {
@@ -559,20 +678,29 @@ interface GroupEpisodeFlow {
 
 async function groupEpisodeFlows(
   teamId: string | null,
-  nowMs: number
+  nowMs: number,
+  untilMs: number | null = null
 ): Promise<Map<string, GroupEpisodeFlow> | null> {
   try {
-    const recentSince = new Date(nowMs - CENSUS_RECENT_MS).toISOString();
+    // The SAME span helpers the entity-count leg uses — `entitiesPerEpisode` divides one by the
+    // other, so neither edge may become a second, independently-computed window.
+    //
+    // Only the RECENT leg takes the upper bound. `baseline` and `span` are live-alarm concepts (the
+    // trailing comparison window and the release valve); bounding them would change what the
+    // pollution alarm judges, which this sensor is explicitly not allowed to do. For every live
+    // caller `untilMs` is null ⇒ the sentinel ⇒ byte-identical behaviour to an unbounded filter.
+    const recentSince = censusRecentSince(nowMs);
+    const recentUntil = censusRecentUntil(untilMs);
     const baselineSince = new Date(nowMs - CENSUS_BASELINE_MS).toISOString();
-    const params: unknown[] = [recentSince, baselineSince];
+    const params: unknown[] = [recentSince, baselineSince, recentUntil];
     let where = "";
     if (teamId !== null) {
       params.push(teamId);
-      where = "where team_id = $3";
+      where = "where team_id = $4";
     }
     const res = await runSql<{ group_id: string; recent: number; baseline: number; span: number }>(
       `select group_id,
-              count(*) filter (where projected_at >= $1 and content_sha256 <> '')::int as recent,
+              count(*) filter (where projected_at >= $1 and projected_at < $3 and content_sha256 <> '')::int as recent,
               count(*) filter (where projected_at >= $2 and projected_at < $1 and content_sha256 <> '')::int as baseline,
               count(*) filter (where projected_at >= $2 and content_sha256 <> '')::int as span
          from graph_episodes ${where}
@@ -602,6 +730,11 @@ export interface GroupCensus {
   baselineEpisodes: number | null;
   spanEpisodes: number | null;
   pollution: NameCollisionPollution;
+  /** Entity nodes CREATED in the recent window (PIPEFF-2). Null = graph unreadable/unconfigured. */
+  recentEntities: number | null;
+  /** `recentEntities / recentEpisodes`, both over the recent window — observational, see the
+   *  section header above. Null when either leg is unknown or the window projected nothing. */
+  entitiesPerEpisode: number | null;
 }
 
 /**
@@ -610,12 +743,18 @@ export interface GroupCensus {
  * purpose — the ledger is the one source that knows what was pushed, so a group that exists only in
  * Neo4j (never projected by this install) is not this alarm's to judge. Best-effort: an unreadable
  * ledger returns [] and every caller degrades quietly.
+ *
+ * `untilMs` (PIPEFF-2, default null = live) puts a right edge on the `entitiesPerEpisode` legs —
+ * BOTH of them, which is the whole point: it is what makes the retroactive pre-deploy baseline
+ * readable from THIS surface instead of a hand-written Cypher whose window is derived independently
+ * of `censusRecentSince`. It does not move the census/alarm legs (see `groupEpisodeFlows`).
  */
 export async function groupCensuses(
   teamId: string | null,
-  nowMs = Date.now()
+  nowMs = Date.now(),
+  untilMs: number | null = null
 ): Promise<GroupCensus[]> {
-  const flows = await groupEpisodeFlows(teamId, nowMs);
+  const flows = await groupEpisodeFlows(teamId, nowMs, untilMs);
   if (flows === null) return [];
   const configured = neo4jConfigured();
   const unknown: NameCollisionSignals = {
@@ -626,18 +765,28 @@ export async function groupCensuses(
   };
   return Promise.all(
     [...flows.entries()].map(async ([group, flow]) => {
-      const signals = configured ? await nameCollisionSignals(group, nowMs) : unknown;
+      const [signals, recentEntities] = configured
+        ? await Promise.all([
+            nameCollisionSignals(group, nowMs),
+            recentEntityCount(group, nowMs, untilMs),
+          ])
+        : ([unknown, null] as const);
       return {
         group,
         signals,
         recentEpisodes: flow.recentEpisodes,
         baselineEpisodes: flow.baselineEpisodes,
         spanEpisodes: flow.spanEpisodes,
+        // `recentEntities`/`entitiesPerEpisode` are deliberately NOT passed to
+        // `deriveNameCollisionPollution` — the yield sensor is observational and must not be able to
+        // move an alarm verdict (PIPEFF-2; its band is underived until prod measurement exists).
         pollution: deriveNameCollisionPollution({
           configured,
           signals,
           recentEpisodes: flow.recentEpisodes,
         }),
+        recentEntities,
+        entitiesPerEpisode: deriveEntitiesPerEpisode(recentEntities, flow.recentEpisodes),
       };
     })
   );

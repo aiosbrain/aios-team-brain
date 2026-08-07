@@ -23,6 +23,8 @@
  * enforcement, so a query that spanned groups would silently mix tiers.
  */
 import { runRead } from "@/lib/graph/neo4j";
+// Shared with judge.mjs so the universe rule has ONE implementation.
+export { buildUniverse, nameConvergence } from "./q7.mjs";
 import { itemIdFromEpisodeName } from "@/lib/graph/episode-name";
 
 export type Metrics = {
@@ -43,6 +45,17 @@ const norm = (s: string) => s.trim().toLowerCase();
 export async function entityYield(groupId: string, episodes: number): Promise<number> {
   const rows = await runRead<{ n: number }>("MATCH (n:Entity {group_id: $g}) RETURN count(n) AS n", { g: groupId });
   return episodes > 0 ? Number(rows[0]?.n ?? 0) / episodes : 0;
+}
+
+/**
+ * How many Episodic nodes actually LANDED in the graph. `armsCompleted` must be measured, not
+ * asserted: Graphiti 202-accepts episodes into an in-memory queue and its worker dies silently on a
+ * non-Cancelled exception (a recorded incident class), so "we pushed 108" says nothing about how
+ * many were processed. The judge compares this against the corpus's expected count per rep.
+ */
+export async function episodicCount(groupId: string): Promise<number> {
+  const rows = await runRead<{ n: number }>("MATCH (e:Episodic {group_id: $g}) RETURN count(e) AS n", { g: groupId });
+  return Number(rows[0]?.n ?? 0);
 }
 
 /**
@@ -126,7 +139,7 @@ export function continuityFrom(rows: { episode: string; entity: string }[], mult
 export async function peopleMetrics(
   groupId: string,
   presence: Map<string, Set<string>>
-): Promise<{ recall: number; convergence: number; personsLost: number; convergenceNames: number }> {
+): Promise<{ recall: number; convergence: number; personsLost: number; qualifyingLost: number; convergenceNames: number }> {
   const rows = await runRead<{ name: string }>("MATCH (n:Entity {group_id: $g}) RETURN n.name AS name", { g: groupId });
   return peopleFrom(rows.map((r) => r.name), presence);
 }
@@ -135,7 +148,7 @@ export async function peopleMetrics(
 export function peopleFrom(
   entityNames: string[],
   presence: Map<string, Set<string>>
-): { recall: number; convergence: number; personsLost: number; convergenceNames: number } {
+): { recall: number; convergence: number; personsLost: number; qualifyingLost: number; convergenceNames: number } {
   const rows = entityNames.map((name) => ({ name }));
   const nodesByName = new Map<string, number>();
   for (const r of rows) {
@@ -152,7 +165,30 @@ export function peopleFrom(
   const nodesForMultiItem = multiItem.reduce((s, n) => s + (nodesByName.get(n) ?? 0), 0);
   const convergence = multiItem.length > 0 ? nodesForMultiItem / multiItem.length : 0;
 
-  return { recall, convergence, personsLost: present.length - found.length, convergenceNames: multiItem.length };
+  // Q2 v2's count clause: a QUALIFYING name (present in >=2 distinct items) absent from the graph.
+  const qualifyingLost = multiItem.filter((n) => (nodesByName.get(n) ?? 0) === 0).length;
+  return { recall, convergence, personsLost: present.length - found.length, qualifyingLost, convergenceNames: multiItem.length };
+}
+
+/**
+ * The raw entity-name census of a rep's graph — every case-normalised Entity name with its distinct
+ * node count. Q7 is computed FROM these (plus the corpus bodies) at judge time, because its universe
+ * is the union of the INCUMBENT's two reps and rep 2 does not exist while rep 1 is harvested.
+ */
+export async function entityNameCounts(groupId: string): Promise<{ name: string; nodes: number }[]> {
+  const rows = await runRead<{ name: string; nodes: number }>(
+    "MATCH (n:Entity {group_id: $g}) RETURN n.name AS name, count(n) AS nodes",
+    { g: groupId }
+  );
+  const merged = new Map<string, number>();
+  for (const r of rows) {
+    const n = norm(r.name ?? "");
+    if (!n) continue;
+    // Case-variants of one name are ONE name with their node counts summed — "graphiti" and
+    // "Graphiti" as separate nodes is exactly the fragmentation Q7 exists to count.
+    merged.set(n, (merged.get(n) ?? 0) + Number(r.nodes));
+  }
+  return [...merged.entries()].map(([name, nodes]) => ({ name, nodes }));
 }
 
 /**

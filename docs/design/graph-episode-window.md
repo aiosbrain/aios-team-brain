@@ -348,6 +348,16 @@ for a metric is the **mean of its two reps**. Ratios use the mean of W10's two r
 W10's own **spread** — `|rep1 − rep2|`, expressed in the same units as the band — is the noise
 estimate.
 
+> **Amendment, 2026-08-06, during session 1's extraction and before any readout existed:** the rule
+> above pins aggregation for **band** metrics only; the non-band inputs needed their own, and the
+> judge (`scripts/graph-window-battery/judge.mjs`) pre-registers them: **`personsLost` takes the MAX
+> of the two reps** (the clause is a noise-free floor — averaging would let one clean rep launder the
+> other), **`dupeEdges` takes the MIN** (both reps must clear the 200-edge minimum),
+> **`dupeShare` takes the MEAN** (matching the band aggregation for the same quantity), and
+> **`armsCompleted` requires every rep of every arm to have landed exactly its expected episode
+> count** — measured from `(:Episodic)` nodes in the graph, not inferred from the push, because 202
+> ≠ extracted and the worker dies silently.
+
 **Per metric, exactly one of — and the rule is SYMMETRIC about the band:**
 
 - **PASS** — the arm's mean beats the band by **more than** W10's spread.
@@ -433,7 +443,7 @@ not worth comparing against.
 
 **Arm order and outcome:**
 
-1. Evaluate **SAME**. All of Q1–Q6 and C1 PASS → **SAME ships**.
+1. Evaluate **SAME**. All of Q1, Q2 (count clause), Q4, Q5, Q7 and C1 PASS → **SAME ships**.
 2. Else evaluate **W1** on the identical rule → **W1 ships**.
 3. Else **the lever does not ship**, and the negative result is committed to this doc. Cutting the
    context is then off the table until the `previous_episode_uuids` alternative is spec'd (below).
@@ -562,7 +572,7 @@ rollback are lost; confirm the brain's reconcile re-pushed them.
 ## How we will know it worked
 
 Input tokens per episode falls from **~40,070** by ≥25% on the harness, over a drain-clean prod
-window after the deploy, with Q1–Q6 unmoved on the battery — and the AIO-693 alarm quiet for a week.
+window after the deploy, with the v2 gates unmoved on the battery — and ALARMFIX-1's replacement signal (the AIO-693 alarm cannot exist on 0.29.3 — Amendment 3) quiet for a week.
 
 ## Risks
 
@@ -575,12 +585,159 @@ window after the deploy, with Q1–Q6 unmoved on the battery — and the AIO-693
   (The asymmetric version in the first draft made this sentence false — bands are multiplicative in
   W10's mean, so a degraded W10 rep *lowered* the bar. That is why the rule is symmetric.)
 - **A metric can still be blind to a failure nobody enumerated.** Q6 exists because the first draft's
-  five gates all pointed the wrong way for entity fragmentation. There is no argument that Q1–Q6 are
+  five gates all pointed the wrong way for entity fragmentation. There is no argument that the v2 gates are
   exhaustive — only that each named failure mode now has a gate whose direction is right for it.
 - **The same-item filter changes behaviour for non-`items:` episodes** (e.g. `correction:<arc_id>`
   writeback episodes), which would get zero predecessors. That is the intended semantics — a
   correction episode has no document to be a chunk of — but it must be stated, and the Phase C PR
   needs a test that pins it rather than discovering it.
+
+### Amendment 3 — 2026-08-06, review-required conditions, committed before any Q7 readout
+
+The Amendment 2 review returned **CLEAR, reuse permitted** — session 2 = session 1's untouched runs
+as rep 1 plus a fresh rep 2 — with conditions, all taken:
+
+- **The on-record prediction: Q7 will read ≈ 1.0 for every arm, and a Q7 pass is NOT fragmentation
+  evidence.** The reviewer verified in the wheel what invalidates Q7 as a treatment probe: 0.29.3's
+  `_resolve_with_similarity` (`dedup_helpers.py:220`) runs **deterministic exact normalized-name
+  matching first, always** — a same-name duplicate can only arise when embedding candidate retrieval
+  misses, a path the predecessor window does not touch. The window's failure mode produces
+  **variant-named** nodes, which Q7 counts as different names by construction (measured: W10 rep 1
+  has 684 names over ~684 nodes — Q7 exactly 1.0). **Q1's upper bound is the operative fragmentation
+  gate.** Q7's honest jobs are the |U| ≥ 15 validity floor and the per-name audit trail. If Q7 moves
+  off 1.0 for any arm, that is *surprising* and gets investigated, not celebrated.
+- **Universe hygiene:** a name must contain ≥ 1 letter (kills `=======` extracted as an entity) and
+  must not contain `/` (kills file paths). **Disclosure: chosen after W10 rep 1's universe
+  composition was seen** (684 names / 185 recurring); the filter is structural, not count-tuned, and
+  identical for every arm. Measured after filtering: **|U| ≥ 156** from W10 rep 1 alone — the floor
+  clears 10×, so session 2 cannot be invalidated on power.
+- **Q2's vacuity hole closed:** the judge now derives `underpowered` from the incumbent's qualifying
+  count instead of hardcoding it empty — zero qualifying names flags Q2 UNDERPOWERED → INVALID
+  rather than letting a clause that can never fire read as a pass. End-to-end tests run a real loss
+  through the whole chain (a loss in either rep → Q2 FAIL, max-of-reps) and pin the empty-roster
+  case.
+- **The dead backstop is re-derived, not re-worded.** The Rollout section named the AIO-693 alarm as
+  the live prod backstop for a quality regression the battery missed. Session 1 proved that alarm
+  has been `judgeable: false` since #490 and **cannot be re-armed on 0.29.3** (its evidence is never
+  written). Phase C therefore gains a precondition: **the lever does not merge until ALARMFIX-1's
+  replacement pollution signal is live in prod.** Post-deploy ledger verification stays as the cost
+  check; ALARMFIX-1 is the quality check.
+
+The v2 metrics table (superseding the v1 table and its ceilings above): Q1 ± 10% (ceiling 5%) ·
+Q2 count-only, zero qualifying losses, no band · Q4 ≥ 85% (7.5%) · Q5 ≤ +3 pp (1.5 pp) ·
+Q7 ≤ 105% (2.5%) · C1 ≥ 25% fall (12.5%). Session validity: |U| ≥ 15 · Q2 has ≥ 1 qualifying name ·
+completion measured from landed `(:Episodic)` counts · harness refusal/cross-check rules unchanged.
+Stale v1 references to Q3/Q6 elsewhere in this document are superseded by this table.
+
+## Session log
+
+_(every started session appended here, pass or fail — see Rerun policy)_
+
+### Session 1 — 2026-08-06, **INVALID (pre-defined causes), and it caught two instrument failures**
+
+Three isolated stacks (own Postgres/Neo4j/graphiti/tap/brain per arm), identical 108-episode corpus
+(hash-verified), pushed through the real projector path (`ingest_runs.meta.episodes = 108` per arm,
+cross-check **exact** on every completed rep). Rep 1 completed on all three arms; **rep 2 was
+deliberately not run** once the session's fate was determined — the invalidity causes are properties
+of the corpus and the library, identical for every future rep, and spending the remainder on a
+known-INVALID session serves nothing.
+
+**Partial metrics, appended per the rerun policy** (rep 1 of each arm; W1 numbers added on drain):
+
+| arm | landed | Q1 (entities/ep) | Q4 (continuity) | Q3 (dupe share) | extract attempts | cost |
+|---|---|---|---|---|---|---|
+| W10 | 108/108 | 6.33 | 0.125 | **0** / 635 edges | 108 (cross-check exact) | $1.12 |
+| SAME | 108/108 | 6.25 | 0.122 | **0** / 615 edges | 108 (cross-check exact) | $0.90 |
+| W1 | — completed after disposition; recorded in session 2 | | | | | ~$0.85 |
+
+**Invalidity cause 1 — Q2/Q6 UNDERPOWERED, and no redraw can fix it.** The corpus yields **3**
+member names (floor: 15) and **1** name in ≥2 items (floor: 5). The roster explains why: this team
+has exactly **one** multi-word human name that appears in content at all ("John Ellison", 8 items) —
+the rest are connector service accounts ("GitHub Sync", "Slack Connector"), single-word names, or
+people absent from the content. The power failure is the *evidence definition meeting this install's
+roster*, not the draw — the spec's own corpus-extension rule could never reach the floors.
+
+**Invalidity cause 2 — Q3 is structurally zero on graphiti 0.29.3, discovered live.** Both arms read
+0 duplicate edges over 600+ `RELATES_TO` edges. Not fragmentation, and not the fresh-graph effect the
+15% floor allowed for: **0.29.3's `add_episode` discards the duplicate pairs** —
+`nodes, uuid_map, _ = await resolve_extracted_nodes(...)` at `graphiti.py:1131` — merging via the
+uuid map and never writing `IS_DUPLICATE_OF` on the server path. Q3 ≡ 0 on every 0.29.3 graph, and
+the 15–45% session gate can never pass. **Prod impact, filed as `ALARMFIX-1`:** the AIO-693
+dedupe-pollution alarm has been sitting in `judgeable: false` since the #490 upgrade — its own
+zero-predicate self-check caught the removal, so it is not lying, but it is silently disabled and
+nothing pages on unjudgeable-persisting.
+
+What the partials *suggest* but do not decide (single reps, INVALID session): SAME's within-document
+continuity ratio vs W10 is ~0.97 — consistent with the tie-rank guarantee that SAME preserves own
+chunks — and its rep cost ran ~19% under W10's. The amendment below is what makes such numbers
+judgeable.
+
+### Amendment 2 — 2026-08-06, before any session-2 readout: the v2 gates
+
+Committed while session 1's graphs are intact and before any new metric is computed on them.
+
+- **Q3 dropped.** Its evidence (`IS_DUPLICATE_OF`) does not exist on 0.29.3. Its fragmentation duty
+  transfers to Q7 (below) and to Q1's upper bound (unchanged).
+- **Q6 (member-name convergence) replaced by Q7 — recurring-name convergence, incumbent-referenced.**
+  Universe **U** = case-normalised names of `Entity` nodes in the **union of W10's reps** whose name
+  appears literally (case-insensitive) in **≥ 2 distinct corpus items' bodies**, length ≥ 3,
+  non-numeric. Q7 per rep = (Σ over U of distinct nodes carrying that name) ÷ |U|. Band ≤ **105% of
+  W10**, spread rule unchanged, ceiling 2.5%. Self-calibrating: presence is checked against source
+  text (no answer key), and the universe is fixed by the incumbent — the differential question "is
+  this worse than what we have", asked over the names the incumbent itself found recurring. The
+  member-name restriction is gone because this install's roster cannot power it; recurring projects,
+  tools and people carry the same fragmentation signal. **Power floor: |U| ≥ 15**, else UNDERPOWERED
+  → INVALID (replaces the dead 15–45% dupe-share gate).
+- **Q2's ratio clause dropped; its count clause survives with full force.** With one qualifying name
+  a recall ratio is meaningless, but the noise-free floor still binds: any qualifying member name
+  present in ≥ 2 items (today: John Ellison) that is absent from a shipping arm's graph in **either
+  rep** → FAIL. Unchanged implementation (`personsLost`, max of reps).
+- **Q1, Q4, Q5, C1 unchanged.** Q1's upper bound remains the catch-all for variant-form inflation
+  ("John" beside "John Smith"), which Q7 structurally cannot see — same blindness Q6 had, same
+  cover.
+- **Session 2 reuses session 1's physical runs as its rep 1.** The amendment changes *readout code
+  only*: pushes, extractions, graphs, `llm_usage` and captures are untouched artifacts, every band
+  constant has been frozen since before the first run, and the readout is a total function — the
+  interim partials above cannot move it. A fresh rep 2 per arm completes the session. *(Posed to the
+  plan reviewer as an explicit question, not assumed — if the reviewer finds a tuning joint in
+  reuse, session 2 runs all six reps fresh; the budget covers it.)*
+
+### Amendment 3 — 2026-08-06, review-required conditions, committed before any Q7 readout
+
+The Amendment 2 review returned **CLEAR, reuse permitted** — session 2 = session 1's untouched runs
+as rep 1 plus a fresh rep 2 — with conditions, all taken:
+
+- **The on-record prediction: Q7 will read ≈ 1.0 for every arm, and a Q7 pass is NOT fragmentation
+  evidence.** The reviewer verified in the wheel what invalidates Q7 as a treatment probe: 0.29.3's
+  `_resolve_with_similarity` (`dedup_helpers.py:220`) runs **deterministic exact normalized-name
+  matching first, always** — a same-name duplicate can only arise when embedding candidate retrieval
+  misses, a path the predecessor window does not touch. The window's failure mode produces
+  **variant-named** nodes, which Q7 counts as different names by construction (measured: W10 rep 1
+  has 684 names over ~684 nodes — Q7 exactly 1.0). **Q1's upper bound is the operative fragmentation
+  gate.** Q7's honest jobs are the |U| ≥ 15 validity floor and the per-name audit trail. If Q7 moves
+  off 1.0 for any arm, that is *surprising* and gets investigated, not celebrated.
+- **Universe hygiene:** a name must contain ≥ 1 letter (kills `=======` extracted as an entity) and
+  must not contain `/` (kills file paths). **Disclosure: chosen after W10 rep 1's universe
+  composition was seen** (684 names / 185 recurring); the filter is structural, not count-tuned, and
+  identical for every arm. Measured after filtering: **|U| ≥ 156** from W10 rep 1 alone — the floor
+  clears 10×, so session 2 cannot be invalidated on power.
+- **Q2's vacuity hole closed:** the judge now derives `underpowered` from the incumbent's qualifying
+  count instead of hardcoding it empty — zero qualifying names flags Q2 UNDERPOWERED → INVALID
+  rather than letting a clause that can never fire read as a pass. End-to-end tests run a real loss
+  through the whole chain (a loss in either rep → Q2 FAIL, max-of-reps) and pin the empty-roster
+  case.
+- **The dead backstop is re-derived, not re-worded.** The Rollout section named the AIO-693 alarm as
+  the live prod backstop for a quality regression the battery missed. Session 1 proved that alarm
+  has been `judgeable: false` since #490 and **cannot be re-armed on 0.29.3** (its evidence is never
+  written). Phase C therefore gains a precondition: **the lever does not merge until ALARMFIX-1's
+  replacement pollution signal is live in prod.** Post-deploy ledger verification stays as the cost
+  check; ALARMFIX-1 is the quality check.
+
+The v2 metrics table (superseding the v1 table and its ceilings above): Q1 ± 10% (ceiling 5%) ·
+Q2 count-only, zero qualifying losses, no band · Q4 ≥ 85% (7.5%) · Q5 ≤ +3 pp (1.5 pp) ·
+Q7 ≤ 105% (2.5%) · C1 ≥ 25% fall (12.5%). Session validity: |U| ≥ 15 · Q2 has ≥ 1 qualifying name ·
+completion measured from landed `(:Episodic)` counts · harness refusal/cross-check rules unchanged.
+Stale v1 references to Q3/Q6 elsewhere in this document are superseded by this table.
 
 ## Session log
 
@@ -588,4 +745,125 @@ _(every started session appended here, pass or fail — see Rerun policy)_
 
 | session | corpus item ids | Phase A result | arm outcomes | verdict |
 |---|---|---|---|---|
-| — | — | not yet run | — | — |
+| 1 | pinned in `/tmp/gwb` seed output & session-2 record | structural half in spec; paid half harvested via captures | rep 1 ×3 completed; rep 2 cancelled | **INVALID** — Q2/Q6 underpowered (roster), Q3 evidence absent on 0.29.3 |
+| 2 | same 108-episode corpus (hash-identical across arms) | predecessor share OBSERVED: W10 43.4% / SAME 33.6% / W1 10.0% of all input tokens | W10 ×2 + SAME ×2 clean; W1 rep 2 lost to infra | **INVALID** — the incumbent's own rep-to-rep spread exceeds the Q1 (7.2% vs 5%) and Q7 (7.4% vs 2.5%) validity ceilings |
+
+### Amendment 4 — 2026-08-07, session 3's design, derived from session 2's measured noise
+
+Committed before any session-3 run, under the standing constraint that **every number from sessions
+1–2 is known to the author** — so nothing below is a free parameter chosen after a favourable
+glance; each is either forced by a measurement or carried unchanged.
+
+- **Arms: W10 and SAME only. W1 is retired, and its retirement is a decision, not a deferral.** W1
+  existed as the blunt fallback if SAME failed. Spending 4 reps on the fallback arm doubles the cost
+  of every session for an arm we would only consult after a SAME failure — and if SAME fails at n=4,
+  the honest reading is that the lever's quality case is weak, not that a *blunter* version of the
+  same cut deserves a retry. If SAME fails session 3, **the lever is closed** and the
+  `previous_episode_uuids` alternative (Alternatives, above) becomes the only path, as its own task.
+- **n = 4 reps per arm.** Session 2 measured single-rep noise at ~7% on Q1/Q7 against 5%-scale
+  bands; the mean of 4 halves the noise on the mean (~1/√n). Aggregation: an arm's value is the
+  **mean of its 4 reps**; the noise unit is the **sample standard deviation `s` of W10's 4 reps**,
+  per metric.
+- **Decision rule, symmetric as before, in the new unit:** PASS = mean beats the band by more than
+  `s`; FAIL = misses by more than `s`; else INCONCLUSIVE (= FAIL for shipping). Since the mean's own
+  noise is ~`s/2`, a tolerance of `s` is a conservative ~2-sigma margin.
+- **Validity ceiling, re-derived in the same construction:** `s ≤ the band margin` per metric (the
+  mean's noise `s/2 ≤ margin/2` preserves the non-empty-PASS-window property the Amendment-2 round
+  established). Q5 keeps its absolute floor (one retry ≈ 1 pp at the 108-episode corpus; ceiling
+  `max(s-form, 1 pp)`); the corpus and episode budget are unchanged, so Q5's band derivation stands.
+- **Q7's universe, tightened against the union artifact session 2 exposed:** names present in **≥ 2
+  of W10's 4 reps** (and literally recurring in ≥ 2 corpus items, hygiene filter unchanged). Session
+  2's union-of-2 admitted one-rep flakes that scored zero in the other rep and produced Q7 ≈ 0.9
+  with 7% spread; a ≥2-of-4 universe removes the single-flake term while keeping the incumbent as
+  the reference. The Q7 ≈ 1.0 prediction (Amendment 3) stands and is now testable with the cleaner
+  universe.
+- **Reuse question, posed again explicitly:** session 2's completed W10 and SAME reps (2 each,
+  clean, 108/108 landed, cross-check exact) are physical artifacts whose graphs are gone but whose
+  harvests are complete. **Proposed: they count as reps 1–2 of each arm; session 3 runs 2 fresh reps
+  per arm** (~$4.4) rather than 4 (~$8.8). The readout is a total function over frozen bands; the
+  known rep values cannot move it. If the reviewer finds a joint in partial reuse under the NEW
+  noise unit (s computed over a mixed 2+2 sample — the one genuinely new interaction), session 3
+  runs all 8 fresh.
+- **Infrastructure preconditions, from session 2's incident log:** every brain runs with
+  `GRAPH_PROXY_CALLS_PER_MINUTE=600` from the start (the 429→worker-death chain), single-Neo4j
+  sequential topology from the start, Postgres on named volumes, and a Docker Desktop restart before
+  the first run (three daemon deaths in one day).
+
+## Battery closed — 2026-08-07, by owner decision, without session 3
+
+**Session 3 was never run.** The battery ends here, and this section is its terminal entry so that
+nothing above reads as a standing instruction.
+
+What happened: Amendment 4's review (BLOCKED) established that on session-2 numbers SAME's cost
+result sits *on* the −25% bar, so the pre-registered rule would most likely have returned
+INCONCLUSIVE → FAIL again at n=4 — an ~$8.8 session to confirm a reading already in hand. Rather than
+spend it, the outcome was put to the product owner with the evidence stated both ways (no quality
+loss detected on any measure; detection limit ~7%; mechanism structurally low-risk).
+
+**Chetan's decision, 2026-08-07: ship SAME anyway, as an explicit threshold judgement.** The shipping
+plan is [`graph-episode-window-phase-c.md`](./graph-episode-window-phase-c.md), which states the
+override in its first paragraph and does not present it as a battery pass.
+
+Three things this closure fixes so the record cannot be misread:
+
+- **The decision function above is spent, not pending.** "Else the lever does not ship" was the
+  battery's verdict and it stands as the battery's verdict; it was overridden by a named person on
+  stated grounds, not amended into a pass.
+- **W1 is declined as a product call**, not as an experimental outcome — recorded here as well as in
+  Phase C, because Amendment 4's review specifically required the preference be stated openly rather
+  than encoded in arm design.
+- **A correction that outlived the battery:** the −25.5% is a *fresh-graph* figure. Prod's baseline
+  is 40,070 tokens/episode against the battery's 28,287, and the predecessor block this lever removes
+  is roughly fixed in absolute size — so the expected **prod** saving is **~18%**, not 25.5%. Phase C
+  carries the arithmetic and sets its verification bands from the prod-derived number.
+
+**What remains live from this document:** the `previous_episode_uuids` alternative (Alternatives) —
+the version that would live in our own code rather than a vendored patch — recorded, unscheduled, and
+now the natural successor if the vendored patch ever becomes a maintenance burden.
+
+### Session 2 — full record (2026-08-06/07)
+
+Reused session 1's runs as rep 1 per Amendment 3; fresh rep 2 per arm. Every completed rep: 108/108
+episodes landed, zero duplicate names, cross-check **exact** (not one validation retry all session).
+
+**The judge returned INVALID, and the reason is a real property of the system, not a mishap:** at
+temperature 0 on byte-identical input, the INCUMBENT's two runs differ by **7.2% on entity yield**
+(6.333 vs 6.806/episode) and 7.4% on Q7. The validity ceilings (half the band margin) assumed
+temp-0 near-determinism; the provider's run-to-run nondeterminism is larger than that. **Two reps
+cannot distinguish an arm's quality effect from the LLM's own noise at these ceilings.** The
+procedure refused to judge quality — which is exactly what it was built to do, and materially better
+than the counterfactual: an asymmetric rule would have SHIPPED on this data.
+
+**What IS measured solidly (cost is not noisy — 2.0% incumbent spread on C1):**
+
+| | tokens/episode (rep1/rep2) | vs W10 mean | predecessor share |
+|---|---|---|---|
+| W10 | 28,000 / 28,574 | — | 43.4% |
+| SAME | 20,792 / 21,378 | **−25.5%** (band edge; INCONCLUSIVE under the spread rule) | 33.6% |
+| W1 | 18,170 / (rep 2 lost) | −35.8% (single rep) | 10.0% |
+
+Phase A part 2, finally observed: the ten-predecessor block is **4,675 tokens per extract call**
+(the parent spec derived ~6,250) — 43.4% of every input token the incumbent bills. The fresh-graph
+W10 baseline (28k) sits below prod's steady-state 40k because dedupe candidate lists are thinner on
+a young graph, as the fresh-graph note anticipated.
+
+Q7 read 0.87/0.93 — not the predicted ≈1.0: the union universe includes names only one rep
+extracted, which score 0 in the other rep. Directionally the prediction held (no same-name duplicate
+inflation anywhere: 12 of 180 names had more SAME nodes than W10 nodes, and the aggregate moved the
+OTHER way); the union-vs-intersection choice is what added the variance that tripped Q7's ceiling.
+
+**Operational incidents, all recorded:** Docker Desktop's daemon died three times (host RAM was
+fine; the Postgres evidence moved to named volumes after the first death and survived the other
+two). The graphiti worker died three times — the third gave the root cause: **`429 rate limited`
+from our own proxy's default 120/min ceiling under embedding fan-out**, an exception class the
+worker does not survive. One contaminated W10 rep 2 (my raw ledger delete bypassed the
+purge-before-repush sentinel — operator error, $1.40 wasted, rep discarded and re-run clean;
+`content_sha256 = ''` is the sanctioned requeue). W1's rep 2 graph was lost to the third daemon
+death before harvest. Total battery spend: **~$8.0** of the $9.53 envelope.
+
+**Two consecutive INVALID sessions.** Per the rerun policy, a third session requires a committed
+amendment first — which any redesign would carry anyway. The measured noise now exists to derive it
+from: resolving a 5% band against ~7% single-rep noise needs ~4 reps per arm (spread of mean scales
+~1/√n), or bands re-derived against measured noise — either is Amendment 4 material, under the
+highest-scrutiny review since every number is now known.
+

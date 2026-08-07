@@ -40,23 +40,53 @@ const CENSUS_REFUSAL_COPY: Record<NonNullable<GroupCensusSummary["refusal"]>, st
 const sharePct = (n: number | null) => (n === null ? "?" : `${Math.round(n * 1000) / 10}%`);
 
 /**
+ * Entity yield, 2dp — never a 0/∞/NaN that reads as a measurement.
+ *
+ * A null ratio has TWO distinct causes and they must not share one sentence. "no episodes in window"
+ * is a real, correct statement about a quiet group; saying it when the entity Cypher actually FAILED
+ * is a false statement about the ledger, and in the census-judged / entity-leg-failed state there is
+ * no refusal copy on the line above to disambiguate it. So the numerator's own null is what
+ * separates them: unreadable graph vs genuinely nothing projected.
+ */
+const yieldLabel = (c: GroupCensusSummary) =>
+  c.entitiesPerEpisode !== null
+    ? `${(Math.round(c.entitiesPerEpisode * 100) / 100).toFixed(2)} entities/episode`
+    : c.recentEntities === null
+      ? "graph unreadable"
+      : "no episodes in window";
+
+/**
  * One group's entity-name census (ALARMFIX-1): how many normalised names gained a node in the recent
  * window, how many of those are split across >1 node, and the share vs the group's own baseline —
  * or the refusal cause when it can't be judged. These are the numbers the alarm's margin/floor
  * constants get measured from before it is armed (rollout step 2).
+ *
+ * Plus, on its own line, the **entity yield** for the same window (PIPEFF-2). Marked "observational"
+ * in the copy on purpose: it gates nothing and no band has been derived for it yet, so an admin who
+ * sees it move should look, not roll back. It exists because the split-share census above is blind
+ * by construction to variant-name fragmentation ("John" beside "John Smith"), which is the one
+ * failure mode the same-item predecessor filter could plausibly cause.
  */
 function CensusRow({ c }: { c: GroupCensusSummary }) {
   const verdict = c.refusal
     ? CENSUS_REFUSAL_COPY[c.refusal]
     : `${c.recentNames ?? "?"} recent names · ${c.recentSplit ?? "?"} split · ${sharePct(c.recentShare)} (baseline ${sharePct(c.baselineShare)})`;
   return (
-    <div className="flex items-baseline gap-2 py-0.5 text-xs">
-      <span className={`shrink-0 font-medium ${c.polluted ? "text-red-600" : "text-ink-secondary"}`}>
-        {c.group}
-      </span>
-      <span className={c.refusal === "predicate-suspect" ? "text-amber-600" : "text-ink-tertiary"}>
-        {verdict}
-      </span>
+    <div className="py-0.5 text-xs">
+      <div className="flex items-baseline gap-2">
+        <span
+          className={`shrink-0 font-medium ${c.polluted ? "text-red-600" : "text-ink-secondary"}`}
+        >
+          {c.group}
+        </span>
+        <span className={c.refusal === "predicate-suspect" ? "text-amber-600" : "text-ink-tertiary"}>
+          {verdict}
+        </span>
+      </div>
+      <div className="text-ink-tertiary">
+        yield: {yieldLabel(c)}
+        {c.recentEntities !== null ? ` (${c.recentEntities} new entities)` : ""} · observational
+      </div>
     </div>
   );
 }
