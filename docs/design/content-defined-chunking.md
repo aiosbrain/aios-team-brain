@@ -1,7 +1,7 @@
 # Kill the insertion cascade — content-defined chunking
 
 **Status:** spec, pre-plan-review · **Date:** 2026-08-07 · **Owner:** Chetan
-· **Task:** `PIPEFF-3` (Linear key to be cited once the projection lands)
+· **Task:** `PIPEFF-3` → [AIO-826](https://linear.app/je4light/issue/AIO-826)
 · **Parent:** `PIPEFF-1` / [AIO-820](https://linear.app/je4light/issue/AIO-820) —
   [`graph-ingestion-efficiency.md`](./graph-ingestion-efficiency.md), lever 1
 
@@ -59,8 +59,11 @@ Replace byte-offset boundaries with a **content-defined** boundary: slide a roll
 body and cut where the hash matches a mask (the rsync/restic/borg approach, and a
 [FastCDC](https://www.usenix.org/conference/atc16/technical-sessions/presentation/xia)-shaped
 variant of it). Because the boundary is a function of the *bytes around it* rather than the distance
-from the start, an insertion perturbs only the chunk it lands in and, at worst, its immediate
-neighbour. Expected: the 21-of-20 case becomes 1–2 of 20.
+from the start, an insertion perturbs the chunk it lands in and — usually — little else. **"At worst
+its immediate neighbour" would overclaim:** because each boundary is anchored at the previous one,
+realignment after an insertion is empirical rather than guaranteed, and pathological low-entropy
+content can propagate a shift across several chunks. The acceptance table below (**≤ 3 of 20**) is
+the arbiter, not this paragraph.
 
 ### Parameters, and the one that is a content-safety issue rather than a tuning knob
 
@@ -85,8 +88,26 @@ max column is the finding: one call has already saturated the ceiling exactly**,
 size. That is one episode whose edges were silently truncated. It is rare (1 in ~900 over 30 days,
 on 2026-08-05) and pre-existing, but it proves the tail is not theoretical, so the max chunk is set
 to **4,000** rather than 5,000 — p99 → ~6,300, ~38% of ceiling — and **the existing saturation is
-filed separately rather than absorbed here** (it is not CDC's bug, and CDC must not be the reason it
-goes unlooked-at).
+filed as `EXTRUNC-1`** (Linear key on the next projection), not absorbed here: silent output
+truncation happens under *any* chunking, and the fix is detection-and-retry in the extraction
+pipeline (`finish_reason`, or `output == cap`) rather than a chunk-size change. The 16,384 output
+tokens came from ~625 tokens of content — ~26× the input, which points at degenerate generation, not
+honest density.
+
+**But "not CDC's bug" is not "unchanged by CDC", and the difference is worth saying:** allowing
+4,000-char chunks raises the tail exposure by up to 1.6× content on the largest chunks. Modestly, and
+unquantifiably from a single observation — but the honest statement is *increased*, not *unchanged*.
+The watch costs nothing because the detector is the measurement itself: **count `llm_usage` rows
+where `output_tokens = 16384`**, added to the post-ship observations below.
+
+**What choosing 4,000 costs, stated rather than left implicit:** with the mask targeting a 2,500
+average over a (1,250, 4,000] window, a plain gear-hash hard-cuts whenever no boundary appears in
+2,750 chars — roughly **11% of chunks, against ~5% at max-5,000**. A hard cut is a *position*-defined
+boundary, locally byte-offset-like, so runs of hash-quiet content (code blocks, tables) erode exactly
+the insertion-locality this lever buys; the realized average also drops to ~2,360, i.e. ~6% more
+episodes per document. **Mitigation, already implied by "FastCDC-shaped": use FastCDC normalized
+chunking**, which varies the mask to make max-cuts rare — and the real-fixture ≤3 gate is what
+catches any content where this still bites.
 
 **The minimum is not a tuning knob, it is what stops CDC from silently dropping content.**
 `MAX_EPISODE_CHUNKS` caps an item at 40 *chunks*, and content past the cap is discarded (the
@@ -136,7 +157,7 @@ different boundaries.
 
 **So CDC rolls out LAZILY.** An item whose body has not changed keeps its existing chunking
 indefinitely; only items that actually change get re-chunked under the new algorithm. `chunk_config`
-already records the algorithm per row (`"2500x40"` → `"cdc1-2500-1250-5000-80"`), so a mixed corpus is
+already records the algorithm per row (`"2500x40"` → `"cdc1-2500-1250-4000-80"`), so a mixed corpus is
 representable and honest.
 
 **The day-one burst, priced.** "Only items that actually change get re-chunked" is false for exactly
@@ -200,10 +221,25 @@ failure this repo has already paid for, and the same shape as the parent spec's 
 So, required:
 
 - **`chunkConfigDeltaCompatible` (or its successor) must return true for identical CDC configs**, and
-  CDC↔CDC **cap-grow** is explicitly allowed on the same reasoning the legacy path uses: a CDC
-  boundary depends only on the content preceding it within the chunk, so the chunk *sequence* is a
-  prefix-stable append — a larger cap only extends it. Pinned by the same byte-identical-prefix test
-  the legacy path already has, not asserted.
+  CDC↔CDC **cap-grow** is explicitly allowed — but **not for the reason an earlier draft gave.** That
+  draft said a CDC boundary "depends only on the content preceding it within the chunk", which is
+  **false**: the min-size skip and the hash restart are anchored at the chunk's *start*, i.e. where
+  the previous chunk ended, so every boundary depends on the whole chain before it. The conclusion
+  survives on a different and simpler basis: **for a fixed body under fixed `cdc1` parameters the
+  entire boundary sequence is a deterministic function of the body alone, and the cap is not an input
+  to boundary computation — it only truncates the emitted sequence.** Chunks 0..79 are therefore
+  identical under cap 80 and cap 120.
+
+  Two things that argument *requires*, so they are requirements rather than assumptions:
+
+  - **Cap semantics must be truncation-only.** A tempting implementation special-cases the final
+    permitted chunk (absorbing the remainder, or cutting it differently because it knows it is last);
+    any such case breaks prefix stability at exactly chunk `cap−1`. Consequence if violated is bounded
+    — on a future cap raise the boundary chunk's stored hash mismatches and re-pushes, costing money
+    and leaving a same-name orphan, not losing content — but it must be pinned.
+  - **The byte-identical-prefix fixture must actually reach the cap.** A fixture shorter than
+    `min × cap` never exercises the boundary chunk and proves nothing. (And it is a *new* CDC fixture,
+    not a reuse of the legacy one, which chunks with the legacy algorithm.)
 - **A projector-level acceptance test in the data-mechanics tier** (unit tier cannot see this): an
   item stored under the CDC config, body edited by a 33-char insertion near the top, and the
   fake-graphiti spy must receive **≤ 3 episodes**. Without it, "cannot show movement ⇒ does not ship"
@@ -253,7 +289,7 @@ number of chunks actually touched. That is observational — the unit test is th
 ## Risks
 
 - **The corpus stays permanently mixed.** Accepted and made explicit in `chunk_config`; the
-  alternative is $51 to re-extract text we already have.
+  alternative is ~$76 to re-extract text we already have.
 - **A CDC boundary can split mid-sentence** — so can a byte offset, and the extractor already receives
   a document's own prior chunks as context (lever 2 preserved exactly that). No worse than today, and
   the parent spec's tie-rank derivation is unaffected.
