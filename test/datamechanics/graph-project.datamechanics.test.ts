@@ -1,6 +1,16 @@
 import { describe, expect, it } from "vitest";
 import type { GraphEpisode } from "@/lib/graph/graphiti-client";
-import { projectSlackToGraph, projectItemsToGraph, deleteItemEpisodes, CHUNK_CHARS, MAX_EPISODE_CHUNKS, GROUP_SCAN_DEPTH, chunkContent } from "@/lib/graph/project";
+import {
+  projectSlackToGraph,
+  projectItemsToGraph,
+  deleteItemEpisodes,
+  CDC_PARAMS,
+  CHUNK_MIN_CHARS,
+  CHUNK_MAX_CHARS,
+  MAX_EPISODE_CHUNKS,
+  GROUP_SCAN_DEPTH,
+} from "@/lib/graph/project";
+import { cdcBoundaries } from "@/lib/graph/cdc";
 import { runGraphProjection } from "@/lib/graph/run";
 import {
   reconcileProjectedEpisodes,
@@ -116,7 +126,17 @@ describe("projectItemsToGraph — all ingestions (real Postgres, mocked Graphiti
     // 80k literal stopped straddling it — 32 chunks, uncapped, so the assertion below silently changed
     // meaning from "the cap binds" to "the body happened to be this long"). The fixture must exceed
     // the cap for the claim to be about capping at all.
-    const huge = "x ".repeat(Math.ceil((CHUNK_CHARS * (MAX_EPISODE_CHUNKS + 4)) / 2));
+    //
+    // PIPEFF-3: derived from CHUNK_MAX_CHARS rather than CHUNK_CHARS, because under `cdc1` chunk sizes
+    // vary — `CHUNK_MAX_CHARS * MAX_EPISODE_CHUNKS` is the only body length GUARANTEED to be clipped
+    // whatever the boundaries fall out as. And the body is prose-shaped rather than `"x "` repeated:
+    // content-defined boundaries are a function of content, and a period-2 pattern is a pathological
+    // shape to build the cap fixture on.
+    const words = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta"];
+    let huge = "";
+    for (let i = 0; huge.length < CHUNK_MAX_CHARS * (MAX_EPISODE_CHUNKS + 4); i++) {
+      huge += `[block-${i}] ${words[i % words.length]} ${words[(i * 3) % words.length]} ${words[(i * 7) % words.length]}. `;
+    }
     await ingest(seed, { kind: "deliverable", path: "notion/huge.md", body: huge, access: "team" });
 
     const fake = new FakeGraphiti();
@@ -126,9 +146,13 @@ describe("projectItemsToGraph — all ingestions (real Postgres, mocked Graphiti
     const eps = fake.pushes[0].episodes;
     // The body is long enough to want MORE chunks than the cap allows, so this asserts the CAP, not
     // the body length — which is the whole point of the test.
-    expect(chunkContent(huge, CHUNK_CHARS, Number.MAX_SAFE_INTEGER).length).toBeGreaterThan(MAX_EPISODE_CHUNKS);
+    expect(cdcBoundaries(huge, CDC_PARAMS).length).toBeGreaterThan(MAX_EPISODE_CHUNKS);
     expect(eps.length).toBe(MAX_EPISODE_CHUNKS); // …carrying several chunk episodes, capped
-    for (const e of eps) expect(e.content.length).toBeLessThanOrEqual(CHUNK_CHARS); // each fits the extractor
+    // Each fits the extractor. `+1` is the surrogate-pair shift's headroom (lib/graph/cdc.ts).
+    for (const e of eps) expect(e.content.length).toBeLessThanOrEqual(CHUNK_MAX_CHARS + 1);
+    // …and the content-safety floor holds: every chunk but a final short one is at least CHUNK_MIN_CHARS,
+    // which is what makes `min x cap >= 100,000` a real guarantee rather than an arithmetic hope.
+    for (const e of eps) expect(e.content.length).toBeGreaterThanOrEqual(CHUNK_MIN_CHARS);
     // Multi-chunk items get the `#k` suffix; each chunk still resolves back to the one item.
     expect(eps[0].name).toMatch(/^items:.+#0$/);
     expect(eps[1].name).toMatch(/^items:.+#1$/);
