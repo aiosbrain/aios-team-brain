@@ -6,11 +6,12 @@ import { getLlmHealth, type LlmHealth } from "@/lib/query/llm-health";
 import { resolveGraphChatTarget, resolveGraphEmbeddingTarget, isRefusal } from "@/lib/llm/graph-proxy";
 import {
   countGraphFacts,
-  dedupeSignals,
-  deriveDedupePollution,
   deriveGraphExtractionStalled,
+  groupCensuses,
   newestEpisodeAtMs,
   newestFactAtMs,
+  type CensusRefusal,
+  type GroupCensus,
 } from "@/lib/graph/extraction-health";
 import { resolveEmbeddingBackend } from "@/lib/query/embedding-key";
 
@@ -52,7 +53,13 @@ export interface RetrievalHealth {
   graphLastProjectedAt: string | null; // most recent successful projection (null = never)
   graphStalled: boolean; // degraded specifically because the projector stopped writing (vs unreachable)
   graphExtractionStalled: boolean; // episodes are reaching Graphiti (202) but its extractor makes no facts
-  graphDedupePolluted: boolean; // extraction runs, but duplicate-entity rate is over the graph's own baseline (AIO-693)
+  /** Extraction runs, but a group's same-name entity-split rate is over its own baseline — the
+   *  name-collision census (AIO-693 re-armed by ALARMFIX-1). Never true while the alarm is unarmed
+   *  (`CENSUS_ALARM_ARMED`), but the per-group numbers below show either way. */
+  graphCensusPolluted: boolean;
+  /** The per-group census the admin card renders: names active in the recent window, how many are
+   *  split across >1 node, the share vs baseline, and the refusal cause when unjudgeable. */
+  graphCensus: GroupCensusSummary[];
   /** A CONFIG refusal from the graph LLM proxy — Anthropic selected, embeddings unset or the wrong
    *  width, ambiguous team. Resolved from settings only (no upstream call, no spend), so it is free
    *  to check on every render and lands here INSTANTLY. Without it a misconfiguration is
@@ -64,6 +71,18 @@ export interface RetrievalHealth {
   augment: LegState; // optional external retrieval-augment service (RETRIEVAL_AUGMENT_URL)
   llm: LlmHealth; // answering-model health — did the configured model recently produce output?
   emailDeliverable: boolean; // a provider is configured (RESEND_API_KEY/SMTP_URL) so alerts/invites can actually send
+}
+
+/** One group's census, shaped for the card (derived from `lib/graph/extraction-health.GroupCensus`). */
+export interface GroupCensusSummary {
+  group: string;
+  recentNames: number | null;
+  recentSplit: number | null;
+  recentShare: number | null; // 0..1, null when not computable
+  baselineShare: number | null;
+  refusal: CensusRefusal | null; // null = judged
+  judgeable: boolean;
+  polluted: boolean;
 }
 
 const COVERAGE_FLOOR = 0.9; // ≥90% embedded = healthy
@@ -167,7 +186,7 @@ export async function getRetrievalHealth(teamId: string): Promise<RetrievalHealt
     graphFacts,
     graphNewestFactAt,
     graphNewestEpisodeAt,
-    graphDedupe,
+    graphGroupCensuses,
     graphProxyRefusal,
     llm,
   ] =
@@ -178,9 +197,7 @@ export async function getRetrievalHealth(teamId: string): Promise<RetrievalHealt
     graphConfiguredNow ? countGraphFacts() : Promise.resolve(null),
     graphConfiguredNow ? newestFactAtMs() : Promise.resolve(null),
     graphConfiguredNow ? newestEpisodeAtMs(teamId) : Promise.resolve(null),
-    graphConfiguredNow
-      ? dedupeSignals()
-      : Promise.resolve({ recentTotal: null, recentDupe: null, baselineTotal: null, baselineDupe: null }),
+    graphConfiguredNow ? groupCensuses(teamId) : Promise.resolve([] as GroupCensus[]),
     // Config-only resolution: no upstream call, nothing spent. Best-effort — a broken probe must
     // never fail the admin page.
     graphConfiguredNow
@@ -221,16 +238,27 @@ export async function getRetrievalHealth(teamId: string): Promise<RetrievalHealt
       newestFactAtMs: graphNewestFactAt,
     });
   // The OTHER extraction failure: episodes become facts, but the facts are confidently wrong —
-  // duplicate entities from a model resolving identity badly (AIO-693, the 2026-07-30 incident).
-  // Same detector as the pipeline banner + the admin email alarm, so all three surfaces flip on the
-  // same evidence and can't drift apart.
-  const graphDedupePolluted = graphReachable && deriveDedupePollution(graphDedupe).polluted;
+  // same-name entity splits accumulating from a model/embedding stack resolving identity badly
+  // (AIO-693, the 2026-07-30 incident; census signal since ALARMFIX-1). Same detector as the
+  // pipeline banner + the admin email alarm, so all three surfaces flip on the same evidence and
+  // can't drift apart.
+  const graphCensus: GroupCensusSummary[] = graphGroupCensuses.map((c) => ({
+    group: c.group,
+    recentNames: c.signals.recentNames,
+    recentSplit: c.signals.recentSplit,
+    recentShare: c.pollution.recentShare,
+    baselineShare: c.pollution.baselineShare,
+    refusal: c.pollution.refusal,
+    judgeable: c.pollution.judgeable,
+    polluted: c.pollution.polluted,
+  }));
+  const graphCensusPolluted = graphReachable && graphCensus.some((c) => c.judgeable && c.polluted);
   const graph = deriveGraphState({
     configured: graphConfiguredNow,
     reachable: graphReachable,
     lastProjectedAtMs,
     // Either extraction failure degrades the leg — no facts, or wrong facts.
-    extractionStalled: graphExtractionStalled || graphDedupePolluted,
+    extractionStalled: graphExtractionStalled || graphCensusPolluted,
     nowMs,
   });
   // Degraded specifically because the projector went quiet (reachable, but a stale write path) — the
@@ -244,7 +272,8 @@ export async function getRetrievalHealth(teamId: string): Promise<RetrievalHealt
     graphLastProjectedAt: graphFresh.lastProjectedAt,
     graphStalled,
     graphExtractionStalled,
-    graphDedupePolluted,
+    graphCensusPolluted,
+    graphCensus,
     graphProxyRefusal,
     graphFacts,
     rerank,

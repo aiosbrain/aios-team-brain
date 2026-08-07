@@ -166,7 +166,7 @@ describe("session validity — every trigger is pre-defined, and none of them is
     expect(run({ harnessRefused: true }).outcome).toBe("INVALID");
   });
 
-  it("INVALID when the incumbent's duplicate share is above extraction-health's own DEDUPE_ABSOLUTE_FLOOR", () => {
+  it("INVALID when the incumbent's duplicate share is above the frozen DEDUPE_ABSOLUTE_FLOOR (0.45, retired from extraction-health by ALARMFIX-1)", () => {
     const d = run({ dupeShare: 0.7 }); // the degraded model's reading
     expect(d.outcome).toBe("INVALID");
     expect(d.reasons.join(" ")).toMatch(/duplicate share/);
