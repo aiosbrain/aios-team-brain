@@ -8,12 +8,32 @@ import {
   resolvePositiveInt,
   BUCKET_TARGETS,
   SMALL_ITEM_CHARS,
+  CHUNK_CHARS,
   MAX_EPISODE_CHUNKS,
   EPISODE_BUDGET,
   PROJECTABLE_KINDS,
   countFromBody,
 } from "../scripts/graph-window-battery/corpus.mjs";
-import { chunkContent, PROJECTABLE_KINDS as REAL_PROJECTABLE_KINDS } from "../lib/graph/project";
+import {
+  chunkContent,
+  chunkContentLegacy,
+  PROJECTABLE_KINDS as REAL_PROJECTABLE_KINDS,
+} from "../lib/graph/project";
+
+/**
+ * ⚠️ THE BATTERY MIRRORS THE **LEGACY** CHUNKER, DELIBERATELY (PIPEFF-3).
+ *
+ * `chunkCount` is a closed-form re-derivation of byte-offset chunking, and PIPEFF-2's already-run
+ * sessions were pre-registered against exactly that (bucket targets, `EPISODE_BUDGET`, Q5's band). The
+ * projector has since moved to `cdc1`, whose chunk count is not a function of `length(body)` at all —
+ * so the equivalence below is pinned against `chunkContentLegacy`, which is byte-exact forever, rather
+ * than re-pointed at `chunkContent` and quietly broken. What that costs, stated rather than hidden: a
+ * FUTURE battery run would size its corpus with the legacy estimate while the projector chunks with
+ * CDC (measured realized average ~2,630 vs a flat 2,500, so roughly 5% fewer episodes than estimated).
+ * A run that needs episode-exact selection must call `verifyCorpus` with the real `chunkContent`,
+ * which is the escape hatch that already exists for the UTF-16 divergence and is exercised below.
+ */
+const legacyCount = (body: string) => chunkContentLegacy(body, CHUNK_CHARS, MAX_EPISODE_CHUNKS).length;
 import { resolvePositiveInt as realResolvePositiveInt } from "../lib/util/env";
 
 /**
@@ -69,20 +89,23 @@ describe("the buckets partition every item the graph can see", () => {
   });
 });
 
-describe("chunkCount is the projector's algorithm, not a paraphrase of it", () => {
+describe("chunkCount is the legacy chunker's algorithm, not a paraphrase of it", () => {
   const cases = [1, 100, 2499, 2500, 2501, 5000, 7501, 99_000, 250_000];
 
-  it.each(cases)("agrees with chunkContent for a %i-char body", (chars) => {
-    expect(chunkCount(chars)).toBe(chunkContent("x".repeat(chars)).length);
+  it.each(cases)("agrees with chunkContentLegacy for a %i-char body", (chars) => {
+    expect(chunkCount(chars)).toBe(legacyCount("x".repeat(chars)));
   });
 
   it("agrees on the cap — a body past CHUNK_CHARS * MAX_EPISODE_CHUNKS is clipped, not extrapolated", () => {
-    const huge = 2500 * (MAX_EPISODE_CHUNKS + 12);
+    const huge = CHUNK_CHARS * (MAX_EPISODE_CHUNKS + 12);
     expect(chunkCount(huge)).toBe(MAX_EPISODE_CHUNKS);
-    expect(chunkContent("x".repeat(huge))).toHaveLength(MAX_EPISODE_CHUNKS);
+    expect(legacyCount("x".repeat(huge))).toBe(MAX_EPISODE_CHUNKS);
   });
 
-  it("agrees that a whitespace-only body yields no episodes at all", () => {
+  it("agrees with the CURRENT chunker on the one thing that must never diverge: the blank body", () => {
+    // The battery's `blankBodySql` is checked against `chunkContent` in the data-mechanics tier, and
+    // that agreement is about which rows the projector SEES at all — it survives the algorithm change
+    // and would be a real bug if it did not.
     expect(chunkContent("   \n\t ")).toEqual([]);
     expect(chunkCount(6, true)).toBe(0);
   });
@@ -186,7 +209,7 @@ describe("verifyCorpus — the number that matters is computed by the real funct
    */
   const bodies = (m: Record<string, string>) => new Map(Object.entries(m));
   // The REAL projector function, so verifyCorpus is exercised against the thing it claims to use.
-  const realCount = (b: string) => chunkContent(b).length;
+  const realCount = (b: string) => legacyCount(b);
 
   it("replaces the estimate with the real chunk count and reports the divergence", () => {
     // 1,251 astral chars = 2,502 UTF-16 units → 2 real chunks, but Postgres counts 1,251 → 1 chunk.
@@ -243,12 +266,12 @@ describe("the projectable kinds mirror lib/graph/project.ts", () => {
 });
 
 
-describe("countFromBody is chunkContent's count, for callers that cannot load the TypeScript", () => {
+describe("countFromBody is the legacy chunker's count, for callers that cannot load the TypeScript", () => {
   /**
    * `seed-local.mjs` runs under plain node and cannot import `lib/graph/project.ts`. Rather than
-   * duplicate `chunkContent` there — the parallel-implementation drift this suite already guards
-   * against once — it passes `countFromBody`, pinned here against the real function including the
-   * astral case that motivated the whole verification step.
+   * duplicate the chunker there — the parallel-implementation drift this suite already guards against
+   * once — it passes `countFromBody`, pinned here against the real function including the astral case
+   * that motivated the whole verification step. Legacy, for the reason at the top of this file.
    */
   it.each([
     ["ascii", "x".repeat(6000)],
@@ -257,8 +280,8 @@ describe("countFromBody is chunkContent's count, for callers that cannot load th
     ["whitespace only", "  \n\t "],
     ["empty", ""],
     ["single char", "x"],
-    ["past the cap", "x".repeat(2500 * (MAX_EPISODE_CHUNKS + 5))],
-  ])("agrees with chunkContent for %s", (_label, body) => {
-    expect(countFromBody(body)).toBe(chunkContent(body).length);
+    ["past the cap", "x".repeat(CHUNK_CHARS * (MAX_EPISODE_CHUNKS + 5))],
+  ])("agrees with chunkContentLegacy for %s", (_label, body) => {
+    expect(countFromBody(body)).toBe(legacyCount(body));
   });
 });

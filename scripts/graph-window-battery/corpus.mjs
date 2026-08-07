@@ -44,8 +44,17 @@ function resolvePositiveInt(raw, fallback) {
   return floored > 0 ? floored : fallback;
 }
 
-/** Mirrors lib/graph/project.ts. A divergence here silently mis-buckets the whole corpus, so the
- *  runner must print both values in its report rather than leaving them implicit. */
+/** Mirrors the LEGACY byte-offset chunker in lib/graph/project.ts, at the cap PIPEFF-2's sessions were
+ *  pre-registered against (40). A divergence here silently mis-buckets the whole corpus, so the
+ *  runner must print both values in its report rather than leaving them implicit.
+ *
+ *  ⚠️ PIPEFF-3 moved the projector to content-defined chunking (`cdc1`), whose chunk count is NOT a
+ *  function of `length(body)` and so cannot be re-derived in SQL at all — which is what this file
+ *  exists to do. The estimate is therefore deliberately still the legacy one (pinned against
+ *  `chunkContentLegacy` by test/graph-window-battery-corpus.test.ts), and it now UNDER-counts by ~5%
+ *  because CDC realizes a ~2,630 average rather than a flat 2,500. A future battery run that needs
+ *  episode-exact selection must go through `verifyCorpus` with the projector's real `chunkContent`
+ *  — the escape hatch that already exists for the UTF-16 divergence. */
 export const CHUNK_CHARS = resolvePositiveInt(process.env.GRAPH_CHUNK_CHARS, 2500);
 export const MAX_EPISODE_CHUNKS = resolvePositiveInt(process.env.GRAPH_MAX_EPISODE_CHUNKS, 40);
 export { resolvePositiveInt };
@@ -55,12 +64,13 @@ export { resolvePositiveInt };
 export const SMALL_ITEM_CHARS = 600;
 
 /**
- * How many episodes an item becomes, by the projector's own rule: whitespace-only → none, otherwise
+ * How many episodes an item becomes, by the LEGACY chunker's rule: whitespace-only → none, otherwise
  * ceil(chars / CHUNK_CHARS) capped at MAX_EPISODE_CHUNKS.
  *
- * Derived from `chunkContent`'s algorithm rather than by calling it, because the battery selects
+ * Derived from `chunkContentLegacy`'s algorithm rather than by calling it, because the battery selects
  * from a SQL projection of `length(body)` over thousands of rows and never needs the bodies to
- * count. The equivalence is unit-tested against `chunkContent` itself.
+ * count. The equivalence is unit-tested against `chunkContentLegacy` itself. See the ⚠️ on
+ * `CHUNK_CHARS` above for why this is the legacy algorithm and what that now costs.
  */
 export function chunkCount(chars, blank = false) {
   if (blank || chars <= 0) return 0;
@@ -73,10 +83,10 @@ export function chunkCount(chars, blank = false) {
  * hole in the partition, it is not an item the graph ever sees.
  */
 /**
- * Episode count for a body already in memory, using the JS string length — which is what
- * `chunkContent` slices by, and is exactly the number Postgres `length()` cannot give (it counts
- * characters, not UTF-16 units). For plain-node callers that cannot import the TypeScript.
- * Equivalent to `chunkContent(body).length`, pinned by unit test.
+ * Episode count for a body already in memory, using the JS string length — which is what the chunker
+ * slices by, and is exactly the number Postgres `length()` cannot give (it counts characters, not
+ * UTF-16 units). For plain-node callers that cannot import the TypeScript.
+ * Equivalent to `chunkContentLegacy(body).length`, pinned by unit test.
  */
 export const countFromBody = (body) => chunkCount((body ?? "").length, !(body ?? "").trim());
 
@@ -188,7 +198,7 @@ export const PROJECTABLE_KINDS = ["transcript", "deliverable", "decision", "task
 /**
  * Recompute the SELECTED corpus's episode counts with the projector's REAL `chunkContent`.
  *
- * `chunkCount` estimates from Postgres `length(body)`, which counts CHARACTERS while `chunkContent`
+ * `chunkCount` estimates from Postgres `length(body)`, which counts CHARACTERS while the chunker
  * slices by JS string index, i.e. UTF-16 units — `length('👍👍')` is 2 in Postgres and 4 in JS. A body
  * with astral characters near a chunk boundary therefore estimates low, which would mis-bucket at
  * the A/C and B2/C edges and, worse, run the `EPISODE_BUDGET` check (the thing keeping Q5's band
@@ -200,7 +210,8 @@ export const PROJECTABLE_KINDS = ["transcript", "deliverable", "decision", "task
  *
  * `countFn` is injected rather than hardcoded. Callers that can load the TypeScript (the tests) pass
  * the projector's own `chunkContent` directly; a plain-node caller passes `countFromBody` below,
- * which is the same algorithm over the same input and is pinned against `chunkContent` by unit test.
+ * which is the legacy algorithm over the same input and is pinned against `chunkContentLegacy` by
+ * unit test.
  */
 export function verifyCorpus(selection, bodyById, countFn) {
   const items = selection.items.map((it) => {

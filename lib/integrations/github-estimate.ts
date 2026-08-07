@@ -52,8 +52,11 @@ export type GithubEstimateResult =
   | ({ ok: true } & GithubImportEstimate)
   | { ok: false; reason: "unreachable" | "error"; detail: string };
 
-/** min(ceil(bytes/CHUNK_CHARS), MAX_EPISODE_CHUNKS) — the projector's own chunking, over tree
- *  metadata (bytes ≈ chars for markdown; stated as an estimate in the UI). */
+/** min(ceil(bytes/CHUNK_CHARS), MAX_EPISODE_CHUNKS) — over tree metadata (bytes ≈ chars for markdown;
+ *  stated as an estimate in the UI). `CHUNK_CHARS` is the projector's TARGET AVERAGE chunk size under
+ *  `cdc1`, not a fixed step, so this is an estimate of the chunk count rather than a derivation of it —
+ *  which is what it always was here anyway, since it prices bytes it has not read. Both knobs are still
+ *  imported from the projector so a re-tune moves the price (pinned by test/github-estimate.test.ts). */
 export function episodesForBytes(bytes: number): number {
   if (bytes <= 0) return 0;
   return Math.min(Math.ceil(bytes / CHUNK_CHARS), MAX_EPISODE_CHUNKS);
