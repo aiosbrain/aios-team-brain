@@ -10,6 +10,7 @@ import {
   arcsRequested,
   parseOffTopicIds,
   pruneEvidenceByIds,
+  mergeDuplicateTitles,
   type NarrativeArc,
 } from "@/lib/graph/arcs";
 import type { AtomicFact } from "@/lib/graph/learning";
@@ -391,5 +392,61 @@ describe("pruneEvidenceByIds — drop a cross-topic outlier before participant a
   it("is a no-op when nothing is flagged", () => {
     const arc = makeArc({ evidence: [ev("f1"), ev("f2")] });
     expect(pruneEvidenceByIds([arc], new Set(), credit)).toEqual([arc]);
+  });
+});
+
+/**
+ * Duplicate arc TITLES (ARCDUP-1). Reported on prod: two cards both titled "PR Review Attestation Gate
+ * Enforcement", one high one medium, ids arc-8144f88eb1 / arc-90a537271b. Two paths reach that state and
+ * the fix has to cover both — (1) two raw titles differing only by a stripped task key used to mint two
+ * ids for one rendered title, and (2) two identical titles minted one id, which continuity then
+ * de-collided with `distinctId`, fixing the React key but leaving the duplicate title on screen.
+ */
+describe("duplicate arc titles never reach the card", () => {
+  const NOW2 = "2026-08-07T00:00:00.000Z";
+  const two = (a: object, b: object) => JSON.stringify({ arcs: [a, b] });
+
+  it("a task key in the RAW title no longer mints a second id for the same rendered title", () => {
+    // Path (1). Before the fix the id was hashed from the raw title, so these two produced different
+    // ids and identical display text — the exact pair seen in prod.
+    const raw = two(
+      { title: "PR Review Attestation Gate Enforcement", confidence: "high", summary: "A." },
+      { title: "PR Review Attestation Gate Enforcement (AIO-123)", confidence: "medium", summary: "B." }
+    );
+    const arcs = parseArcsJson(raw, { now: NOW2 });
+    expect(arcs).toHaveLength(1);
+    expect(arcs[0].title).toBe("PR Review Attestation Gate Enforcement");
+  });
+
+  it("two identical titles collapse to ONE arc, keeping the strongest confidence and ALL evidence", () => {
+    // Path (2), and the merge contract: nothing is silently dropped.
+    const raw = two(
+      { title: "Costs", confidence: "medium", summary: "Cheaper extraction.", participants: ["Chetan"], supporting_sources: ["s1"] },
+      { title: "Costs", confidence: "high", summary: "Metering the graph.", participants: ["John"], supporting_sources: ["s2"] }
+    );
+    const [arc, ...rest] = parseArcsJson(raw, { now: NOW2 });
+    expect(rest).toHaveLength(0);
+    expect(arc.confidence).toBe("high"); // strongest wins, not first-seen
+    expect(arc.summary).toBe("Cheaper extraction. Metering the graph."); // both claims survive
+    expect(arc.participants).toEqual(["Chetan", "John"]);
+    expect(arc.evidence.map((e) => e.fact)).toEqual(["s1", "s2"]);
+  });
+
+  it("DISTINCT titles are untouched — the fix must not collapse real arcs", () => {
+    // The control. Without it a merge-everything bug would pass every assertion above.
+    const arcs = parseArcsJson(two(
+      { title: "Costs", confidence: "high", summary: "A." },
+      { title: "Timeline", confidence: "low", summary: "B." }
+    ), { now: NOW2 });
+    expect(arcs.map((a) => a.title)).toEqual(["Costs", "Timeline"]);
+    expect(new Set(arcs.map((a) => a.id)).size).toBe(2);
+  });
+
+  it("mergeDuplicateTitles: identical restatements collapse instead of doubling the sentence", () => {
+    const mk = (summary: string): NarrativeArc => ({
+      id: "arc-x", title: "T", confidence: "low", summary, participants: [], supporting_sources: [],
+      evidence: [], derived_at: NOW2,
+    });
+    expect(mergeDuplicateTitles([mk("Same claim."), mk("Same claim.")])[0].summary).toBe("Same claim.");
   });
 });

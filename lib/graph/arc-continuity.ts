@@ -69,6 +69,58 @@ function distinctId(arc: NarrativeArc, items: Set<string>): string {
   return "arc-" + createHash("sha256").update(seed).digest("hex").slice(0, 10);
 }
 
+/** Strongest-wins ordering when two arcs collapse into one. */
+const CONFIDENCE_RANK: Record<NarrativeArc["confidence"], number> = { high: 3, medium: 2, low: 1 };
+
+/**
+ * Fold `absorbed` into `survivor`, losing nothing. Lives HERE (not in `arcs`) because both callers need
+ * it and `arcs` already imports this module — the reverse would be a cycle.
+ *
+ * `survivor` keeps its id and title; everything additive is unioned.
+ *
+ * Evidence dedups on the fact TEXT and PREFERS THE LINKED ENTRY, not merely the first one. `itemId` is
+ * the continuity anchor the next reconcile matches on, so losing it costs the arc its lineage — and
+ * first-wins alone doesn't prevent that: when the bare `{fact}` from the free-text `supporting_sources`
+ * fallback happens to come first, it shadows the linked copy of the same text.
+ *
+ * The absorbed arc's IDENTITY is not silently dropped. If it carried an id of its own (it inherited a
+ * prior, or was re-keyed) that id — and anything it had already superseded — is recorded in the
+ * survivor's `supersedes`, so "where did arc-90a537271b go" stays answerable and a stored correction
+ * bound to it is traceable rather than orphaned.
+ */
+export function mergeArcPair(survivor: NarrativeArc, absorbed: NarrativeArc): NarrativeArc {
+  const evidence = new Map<string, NarrativeArc["evidence"][number]>();
+  for (const e of [...survivor.evidence, ...absorbed.evidence]) {
+    const held = evidence.get(e.fact);
+    if (!held || (!held.itemId && e.itemId)) evidence.set(e.fact, e);
+  }
+  const supersedes = [
+    ...new Set([
+      ...(survivor.supersedes ?? []),
+      ...(absorbed.supersedes ?? []),
+      ...(absorbed.id && absorbed.id !== survivor.id ? [absorbed.id] : []),
+    ]),
+  ];
+  // Fold summaries one at a time so a 3-way merge can't re-append a sentence already carried in the
+  // joined text (comparing the pair only catches the 2-way case).
+  const summary = [survivor.summary, absorbed.summary]
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .reduce((acc, s) => (acc === "" || acc.includes(s) ? acc || s : `${acc} ${s}`), "");
+  return {
+    ...survivor,
+    confidence:
+      CONFIDENCE_RANK[absorbed.confidence] > CONFIDENCE_RANK[survivor.confidence]
+        ? absorbed.confidence
+        : survivor.confidence,
+    summary,
+    participants: [...new Set([...survivor.participants, ...absorbed.participants])],
+    supporting_sources: [...new Set([...survivor.supporting_sources, ...absorbed.supporting_sources])],
+    evidence: [...evidence.values()],
+    ...(supersedes.length ? { supersedes } : {}),
+  };
+}
+
 export interface ArcContinuity {
   /** How many arcs the previous set had. */
   priorCount: number;
@@ -181,9 +233,45 @@ export function reconcileArcIdentity(prior: NarrativeArc[], next: NarrativeArc[]
     return { ...arc, id: priorArc.id, title, ...lineageFields };
   });
 
+  // TITLE UNIQUENESS — enforced HERE because this function is the last thing that writes a title, and
+  // the line above is itself a source of duplicates: an arc that inherits a prior's name can collide
+  // with a sibling the model legitimately named differently. Parse-time merging (`mergeDuplicateTitles`)
+  // cannot cover it — by this point the duplicates carry DIFFERENT ids, so an id-keyed pass sees nothing.
+  //
+  // Two live paths, both reproduced as tests: (a) prior "Costs" over {a,b}; the model emits a NEW "Costs"
+  // over {c,d} plus a renamed continuation over {a,b} which inherits "Costs" — two cards, one name; and
+  // (b) the reported prod pair regenerating itself, because both duplicates sit in `prior`, so even a
+  // model that COMPLIES with the new distinct-titles instruction gets both arcs renamed back.
+  //
+  // The survivor is the arc that INHERITED a prior id — `arc_corrections` (team_id+arc_id) and the
+  // lineage fields are bound to it, so keeping the newcomer would strand a human's edit.
+  const byTitle = new Map<string, number>(); // normalized title → index of the survivor in `deduped`
+  const deduped: NarrativeArc[] = [];
+  // Inheritance is tracked ALONGSIDE the survivor, never re-derived from the array: once an entry has
+  // been merged it is a new object, so `arcs.indexOf(...)` would return -1 and silently report every
+  // incumbent as non-inheriting — handing the survivor role to the wrong arc on a three-way collision.
+  const survivorInherited: boolean[] = [];
+  arcs.forEach((arc, n) => {
+    const key = arc.title.trim().toLowerCase();
+    const inherited = inheritedBy.has(n);
+    const at = byTitle.get(key);
+    if (at === undefined) {
+      byTitle.set(key, deduped.length);
+      deduped.push(arc);
+      survivorInherited.push(inherited);
+      return;
+    }
+    if (inherited && !survivorInherited[at]) {
+      deduped[at] = mergeArcPair(arc, deduped[at]); // the newcomer carries the lineage — it survives
+      survivorInherited[at] = true;
+      return;
+    }
+    deduped[at] = mergeArcPair(deduped[at], arc);
+  });
+
   const carriedOver = inheritedBy.size;
   return {
-    arcs,
+    arcs: deduped,
     continuity: {
       priorCount: priorArcs.length,
       nextCount: nextArcs.length,

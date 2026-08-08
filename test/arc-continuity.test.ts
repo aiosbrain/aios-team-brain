@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { createHash } from "node:crypto";
 import {
+  mergeArcPair,
   reconcileArcIdentity,
   stableArcTarget,
   arcItemIds,
@@ -129,29 +130,70 @@ describe("reconcileArcIdentity — ids emitted are unique", () => {
   const stableId = (t: string) => "arc-" + createHash("sha256").update(t.trim().toLowerCase()).digest("hex").slice(0, 10);
   const real = (title: string, ids: string[]) => ({ ...arc(stableId(title), title, ids) });
 
-  it("a split whose children BOTH keep the parent's title does not emit the id twice", () => {
-    // The continuity prompt explicitly says "keep an arc's title UNCHANGED", so both children parse as
-    // sha("Costs") — the very id the winning child inherits. Two cards with one React key, one edit
-    // targeting both, and a single arc_corrections row (unique on team_id+arc_id) bound to two arcs.
+  // CONTRACT CHANGE (ARCDUP-1). These used to assert that a split whose children BOTH keep the parent's
+  // title emits TWO arcs with distinct ids. That fixed the React key and the arc_corrections binding but
+  // left two identically-named cards on screen — the reported prod bug. Same title now means ONE arc.
+  it("a split whose children BOTH keep the parent's title collapses to ONE arc, keeping the prior id", () => {
     const prior = [real("Costs", ["i1", "i2", "i3", "i4"])];
     const next = [real("Costs", ["i1", "i2", "i3"]), real("Costs", ["i4", "i9"])];
-    const ids = reconcileArcIdentity(prior, next).arcs.map((a) => a.id);
-    expect(new Set(ids).size).toBe(2);
-    expect(ids[0]).toBe(prior[0].id); // the winner keeps the identity
+    const arcs = reconcileArcIdentity(prior, next).arcs;
+    expect(arcs).toHaveLength(1);
+    expect(arcs[0].id).toBe(prior[0].id); // the winner keeps the identity corrections are bound to
+    // Nothing is dropped: the absorbed sibling's evidence comes along.
+    expect(arcs[0].evidence.map((e) => e.itemId).sort()).toEqual(["i1", "i2", "i3", "i4", "i9"]);
   });
 
-  it("re-keys deterministically — the same split yields the same ids every run", () => {
-    const prior = [real("Costs", ["i1", "i2", "i3", "i4"])];
-    const next = [real("Costs", ["i1", "i2", "i3"]), real("Costs", ["i4", "i9"])];
-    const a = reconcileArcIdentity(prior, next).arcs.map((x) => x.id);
-    const b = reconcileArcIdentity(prior, next).arcs.map((x) => x.id);
-    expect(a).toEqual(b);
+  it("two same-titled NEW arcs collapse to one", () => {
+    const arcs = reconcileArcIdentity([], [real("Costs", ["i1"]), real("Costs", ["i2"])]).arcs;
+    expect(arcs).toHaveLength(1);
+    expect(arcs[0].evidence.map((e) => e.itemId).sort()).toEqual(["i1", "i2"]);
   });
 
-  it("two same-titled NEW arcs get distinct ids", () => {
-    const next = [real("Costs", ["i1"]), real("Costs", ["i2"])];
-    const ids = reconcileArcIdentity([], next).arcs.map((x) => x.id);
-    expect(new Set(ids).size).toBe(2);
+  // The `distinctId` re-key is still LIVE and must stay pinned — it just can't be reached with two
+  // same-titled arcs any more. It fires when a NON-inheriting arc's own `sha(title)` equals an id an
+  // inheriting arc already took. Reaching it needs `isSameArc` to hold while `retained` stays under
+  // KEEP_TITLE_MIN_PRIOR_RETAINED, so the continuation inherits the ID but keeps its OWN name:
+  // prior of 5 items, continuation citing 2 → shared 2 (sameArc), retained 0.4 (< 0.5).
+  //
+  // An earlier version of this test used a 4-item prior and a 1-item continuation. That never inherited
+  // at all (shared 1 < MIN_SHARED_ITEMS, and containment needs priorSize <= 2), so `used` stayed empty
+  // and `distinctId` was never called — the test passed with the function neutered to `return arc.id`.
+  // The fixture below is mutation-verified to go RED under exactly that mutation.
+  it("re-keys a genuine id collision between DIFFERENTLY-titled arcs, deterministically", () => {
+    const prior = [real("Costs", ["i1", "i2", "i3", "i4", "i5"])];
+    const next = [real("Cheaper extraction", ["i1", "i2"]), real("Costs", ["i7", "i8"])];
+    const run = () => reconcileArcIdentity(prior, next).arcs;
+    const arcs = run();
+    expect(arcs).toHaveLength(2); // distinct titles → both survive the title pass
+    // The continuation INHERITED the prior id while keeping its own name (retained 0.4 < 0.5) …
+    const cont = arcs.find((x) => x.title === "Cheaper extraction")!;
+    expect(cont.id).toBe(prior[0].id);
+    // … so the legitimately-named "Costs" arc, whose own sha collides with it, must be re-keyed.
+    const costs = arcs.find((x) => x.title === "Costs")!;
+    expect(costs.id).not.toBe(prior[0].id);
+    expect(new Set(arcs.map((x) => x.id)).size).toBe(2);
+    expect(run().map((x) => x.id)).toEqual(arcs.map((x) => x.id)); // deterministic across runs
+  });
+
+  it("a collapsed duplicate that carried its OWN id is recorded in `supersedes`, not silently dropped", () => {
+    // Both duplicates inherit a prior id (the reported prod shape). One must lose — but its identity
+    // has to stay answerable, because an `arc_corrections` row is bound to it.
+    const T = "PR Review Attestation Gate Enforcement";
+    const prior = [real(T, ["i1", "i2"]), { ...arc("arc-other", T, ["i3", "i4"]) }];
+    const next = [real(T, ["i1", "i2"]), { ...arc("n2", T, ["i3", "i4"]) }];
+    const arcs = reconcileArcIdentity(prior, next).arcs;
+    expect(arcs).toHaveLength(1);
+    expect(arcs[0].supersedes).toContain("arc-other"); // the absorbed identity is traceable
+  });
+
+  it("a merge keeps the LINKED evidence entry when a bare duplicate of the same fact comes first", () => {
+    // `itemId` is the anchor the NEXT reconcile matches on, so shadowing it with a bare free-text entry
+    // would quietly cost the arc its lineage. First-wins alone doesn't prevent that — prefer-linked does.
+    const bare: NarrativeArc = { ...arc("a1", "T", []), evidence: [{ fact: "shared fact" }] };
+    const linked: NarrativeArc = { ...arc("a2", "T", []), evidence: [{ fact: "shared fact", itemId: "i9" }] };
+    const merged = mergeArcPair(bare, linked);
+    expect(merged.evidence).toHaveLength(1);
+    expect(merged.evidence[0].itemId).toBe("i9");
   });
 });
 
@@ -253,5 +295,49 @@ describe("stableArcTarget — the requested count stops oscillating", () => {
     for (let i = 0; i < 10; i++) n = stableArcTarget(12, n);
     expect(Math.abs(12 - n)).toBeLessThanOrEqual(1);
     expect(stableArcTarget(12, n)).toBe(n); // fixed point — no oscillation
+  });
+});
+
+/**
+ * TITLE UNIQUENESS THROUGH RECONCILE (ARCDUP-1). Parse-time merging can't cover this: by the time
+ * `reconcileArcIdentity` has written titles, two duplicates carry DIFFERENT ids, so an id-keyed pass
+ * sees nothing. Both scenarios below were RED before the title-keyed pass was added.
+ */
+describe("no two reconciled arcs share a title", () => {
+  const a = (id: string, title: string, items: string[], confidence: "high" | "medium" | "low" = "high"): NarrativeArc => ({
+    id, title, confidence, summary: `s-${id}`, participants: [`p-${id}`], supporting_sources: [],
+    evidence: items.map((i) => ({ fact: `f-${i}`, itemId: i })), derived_at: "2026-08-07T00:00:00.000Z",
+  });
+
+  it("title MIGRATION: a renamed continuation inheriting its prior's name can't collide with a new sibling", () => {
+    // Prior "Costs" over {a,b}. The model emits a NEW "Costs" over {c,d} (no overlap → keeps its own
+    // title) plus a renamed continuation over {a,b} (retained 1.0 → inherits "Costs"). Two "Costs" cards.
+    const prior = [a("arc-costs", "Costs", ["a", "b"])];
+    const next = [a("arc-new", "Costs", ["c", "d"]), a("arc-cont", "Cheaper extraction", ["a", "b"])];
+    const out = reconcileArcIdentity(prior, next).arcs;
+    expect(new Set(out.map((x) => x.title)).size).toBe(out.length);
+    // The survivor is the one carrying the PRIOR id — corrections (team_id+arc_id) are bound to it.
+    const costs = out.find((x) => x.title === "Costs")!;
+    expect(costs.id).toBe("arc-costs");
+    // …and the newcomer's evidence is absorbed, not dropped.
+    expect(costs.evidence.map((e) => e.itemId).sort()).toEqual(["a", "b", "c", "d"]);
+  });
+
+  it("the reported prod pair cannot regenerate itself from a duplicated PRIOR set", () => {
+    // Both duplicates sit in `prior` (that is today's cache). Even a model that COMPLIES with the new
+    // distinct-titles instruction gets both arcs renamed back by title inheritance.
+    const T = "PR Review Attestation Gate Enforcement";
+    const prior = [a("arc-8144f88eb1", T, ["i1", "i2"]), a("arc-90a537271b", T, ["i3", "i4"])];
+    const next = [a("n1", "Codex review workflow", ["i1", "i2"]), a("n2", "Retiring Plane MCP", ["i3", "i4"])];
+    const out = reconcileArcIdentity(prior, next).arcs;
+    expect(new Set(out.map((x) => x.title)).size).toBe(out.length);
+  });
+
+  it("CONTROL: distinct titles are left alone — the pass must not collapse real arcs", () => {
+    const prior = [a("arc-1", "Costs", ["a"])];
+    const next = [a("n1", "Costs", ["a"]), a("n2", "Timeline", ["z"])];
+    const out = reconcileArcIdentity(prior, next).arcs;
+    expect(out).toHaveLength(2);
+    expect(out.map((x) => x.title).sort()).toEqual(["Costs", "Timeline"]);
   });
 });
