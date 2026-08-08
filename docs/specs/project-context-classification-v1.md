@@ -10,6 +10,109 @@ spec_gate: block
 > curation machinery is retained in Part II as the tagging engine; where V2 contradicts V1, V2 wins,
 > and every such flip is listed explicitly in §2.
 
+## Executive summary — the whole design in two pages
+
+### What this is, in one paragraph
+
+Today the Team Brain has one pile of knowledge per team, and everyone on the team sees all of it
+(outsiders see a second, smaller pile). This spec re-architects the brain around **projects that
+actually partition knowledge** and **permissions that decide who sees which projects**. After it
+ships, every piece of content — a Slack thread, a PR, a meeting, a document — lives in one or more
+projects, every person belongs to groups, and groups are granted visibility into projects. Two
+people on the same team open the same brain and legitimately see different things. This is the
+foundation for selling to real companies, where "everyone sees everything" is a dealbreaker.
+
+### Why now, and why it can't wait
+
+Permission models cannot be retrofitted. Every item ingested under a model that can't express access
+is an item someone later has to reclassify by hand — fine at thousands of items, impossible at
+millions with customers depending on the answers. This is the one change that gets harder every day
+we don't make it.
+
+### The one rule
+
+```
+Person → is in → Group → can see → Project → contains → Content
+```
+
+**You can see a piece of content if you're in a group that can see a project that content is in.**
+That's the entire model. No per-item exceptions, no roles on the visibility edge, no fifth hop —
+the spec explicitly rejects both candidate complications, because simple permission models are the
+only auditable ones.
+
+### The ten decisions that matter
+
+1. **Nothing changes on migration day.** Every team gets a built-in "Everyone" group (internal
+   members only) and a "General" project holding all existing team content. Day-one visibility is
+   byte-identical to today — the recall eval passing unchanged is the migration's acceptance test.
+   Restriction is something teams then opt into, project by project.
+2. **Restricting means MOVING, not copying.** Putting content in a restricted project takes it out
+   of General. Restricted content is never simultaneously in an Everyone-visible pile.
+3. **Automation can never widen who sees something.** The auto-classifier (V1's machinery, retained
+   in Part II) can tag content into projects, but only a human can take an action that lets MORE
+   people see it. An LLM mis-tag was a quality bug before; under this model it would be a leak, so
+   the invariant is structural, not a prompt instruction.
+4. **The graph becomes required, one graph per project.** Derived knowledge (facts, arcs,
+   summaries) is computed per project and NEVER across projects — so there is no "summary that
+   mixes two projects" to compute a permission for. Isolation is structural, not filtered.
+5. **Provenance is a small ledger + revision, not deletion.** Every derived fact records which
+   source items produced it. Untag a source and its facts are recomputed from what remains (or
+   retired if nothing remains) — the graph never quietly serves knowledge derived from content that
+   left.
+6. **One permission oracle in code, RLS in Postgres as the backstop.** Every read path — search,
+   semantic search, graph, timelines, arcs, citations — filters through one module. Beneath it,
+   database row-level security catches application bugs; we test it by deliberately bypassing the
+   app layer and confirming the database refuses. "No results" looks identical whether content is
+   absent or invisible.
+7. **Agents get attenuated access, structurally.** An agent token's access = its principal's access
+   ∩ the token's scope — an intersection can only shrink, so privilege expansion is impossible
+   rather than forbidden. Old API keys keep working unchanged; the QM integration gets this
+   principal model first, before any UI.
+8. **Cost is real and priced.** Graph extraction is the expensive operation: measured on prod at
+   $0.151/episode (~$380/month at current volume). Per-project graphs multiply it by the average
+   projects-per-item; the honest ceiling is ~2× (~$760/month) if the whole corpus gets classified,
+   and the spec names the levers that keep real spend below that.
+9. **Neo4j stays for the alpha; FalkorDB gets a priced spike.** Making the graph required strains
+   the single-container self-host story (Neo4j is a JVM). A time-boxed spike with three decision
+   facts settles the backend before the graph phase ships.
+10. **The GUI is a verification instrument.** Eight screens — admin, identity manager, tagging with
+    cascade preview, per-person brain, view-as, "why can I see this?", agent launcher, signal view —
+    because the only way to trust a permission model is to look at the system as two different
+    people and see different things.
+
+### What gets built, in what order (two engineers)
+
+**A** Principals, groups, oracle, migration, delegated tokens (unblocks QM) → **B** every read path
+enforced + RLS + the permission inspector → **C** per-project graphs + cost controls (FalkorDB spike
+gates the exit) → **D** the tagging engine at scale (rules, review queue, meeting segments, cascade
+preview) → **E** the cross-project signal layer (designed now, built later). Each phase ends at a
+stop-and-review gate.
+
+### What's still unknown, honestly
+
+Three things, each with a resolution path: the deployed pgvector version (1 hour to check; gates the
+semantic-search enforcement mechanism), Graphiti's exact behavior when an episode is removed (half a
+day to probe; gates cascade fidelity), and the FalkorDB-vs-Neo4j decision facts (the Phase C spike).
+None blocks Phase A.
+
+### How to read the rest of this document
+
+| You want | Read |
+|---|---|
+| The audit of what exists today (verified against code) | §1 |
+| Exactly what changed from the V1 spec | §2 + §20.1 |
+| The data model and DDL | §4 |
+| How each read path is enforced (incl. the leak paths) | §5 |
+| Graphs, cost model, provenance/cascade | §6, §19 |
+| Identity, delegation, RLS mechanics | §8–§10 |
+| Migration of live data | §11 |
+| The adversarial leak test suite | §14 |
+| Screens and the demo dataset | §15 |
+| Build phases and open questions | §17–§18 |
+| The full tagging engine (V1, amended) | Part II §20.2 |
+
+---
+
 ## Status
 
 Draft for review round 1 — spec only, no implementation. This revision reorients the V1 spec around
