@@ -89,10 +89,26 @@ multi-chunk episodes that *do* carry a predecessor block. Commit episodes sit fa
 507 eliminated commit episodes at the fleet average — which §1 of the original draft did — **credits
 this lever with a saving PIPEFF-2 already banked yesterday.**
 
-I have **not** measured the marginal cost of a commit episode. It is measurable (a drain-clean,
-commits-only window through `scripts/graph-ingest-cost.mjs`) and it has not been done. What is
-certain is the direction and that it is large: the honest ceiling is well under the $5.60/month the
-first draft claimed.
+I have **not** measured the marginal cost of a commit episode, and this section's central claim is
+therefore an **inference** — from the zero-predecessor rule plus a ~50-token body — not a
+measurement. It is labelled as one deliberately, because it is the load-bearing fact of the decline.
+
+**I tried to measure it and it is not obtainable from existing data.** Querying every projection hour
+since the PIPEFF-2 deploy (2026-08-07 07:08:24Z) for an hour whose episodes were *all* commits
+returns **nothing** — post-deploy volume is 24 episodes across 6 hours, every one of them mixed:
+
+```
+07:00 → 3 eps (1 commit)   08:00 → 7 (2)   09:00 → 7 (0)
+10:00 → 1 (0)              16:00 → 3 (1)   00:00 → 3 (1)
+```
+
+So the number needs a **deliberately constructed** commits-only drain-clean window, not a lucky one.
+That is cheap and it has not been done. Until it exists, treat every figure in this section as a
+ceiling.
+
+What is not in doubt is the *direction*: a commit episode carries zero predecessors and ~50 tokens of
+content, while the $0.0110 fleet average is dominated by multi-chunk episodes that do carry a
+predecessor block. The honest ceiling is well under the $5.60/month the first draft claimed.
 
 ### And accretion halves the episode count too
 
