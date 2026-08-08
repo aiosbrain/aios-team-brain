@@ -31,8 +31,9 @@ who reads it**. The map only pays off if it's trustworthy, so:
 Every feature starts as a **real Linear task**, created through the **AIOS CLI**, with a **spec** —
 not as a branch that acquires a justification afterwards.
 
-- **Create the task first:** add a row to `3-log/tasks-team.md` in the AIOS workspace and
-  `aios push 3-log/tasks-team.md`. The brain's `tasks` table is canonical and projects one-way into
+- **Create the task first:** add a row to `3-log/tasks.md` in the AIOS workspace and
+  `aios push 3-log/tasks.md` — the same file the Close gate below names. (This said `tasks-team.md`
+  for a while; no such file exists.) The brain's `tasks` table is canonical and projects one-way into
   Linear (`lib/pm-sync/`), so this is the only path that yields a key both the brain and Linear agree
   on. Read the projected key back (`task_pm_links.provider_url`) and cite THAT in the branch, the PR,
   and the `AIOS-Work:` trailer.
@@ -48,6 +49,47 @@ not as a branch that acquires a justification afterwards.
 - **Why the order matters:** a task written afterwards is a description of what you did, which is
   never the same artefact as a decision about what to do. The spec is where the alternative you
   didn't take gets recorded, and that is the part future-you actually needs.
+
+---
+
+## Close gate — the merge is not done until the task says done ⚠️
+
+**When you merge a PR, move its task to `done` in the SAME session.** Opening the ticket is half the
+loop; a board full of shipped work still marked `in_progress` is worse than no board, because every
+status on it stops meaning anything.
+
+- **Set `Status` to `done` in the row in `3-log/tasks.md`, then `aios push 3-log/tasks.md`** (dry-run
+  first — it is outward-facing). Then **read the status back** the way you read the key back when you
+  opened it; a push that reported `ok` is not proof the row moved.
+- **The merge automation does NOT close a workspace-pushed row today — by design.** `aios-work-sync`
+  fires on a correct `AIOS-Work:` trailer and writes a `work_events` row, but the outcome that row gets
+  decides everything (`lib/work-events/resolve-task.ts`):
+  - `applied` — matched inside the PUSHED project (`AIOS_PROJECT: aios-team-brain`): the task IS
+    completed and projected to the PM tool.
+  - `linked` — matched only by the TEAM-WIDE fallback: `task_id` is recorded and the task is
+    **deliberately left open**, with a `work_event.would_complete` audit row instead of the status
+    write (`lib/work-events/ingest.ts`). Completing on a team-wide match would create duplicate Linear
+    issues, clobber Linear-native edits, and close issues merely *mentioned* in a PR body.
+
+  A row you pushed from `3-log/tasks.md` lives in the **workspace** project, so it resolves through
+  that fallback and lands `linked` — which is why `GRAPHCOST-8` sat open on 2026-08-07 even though its
+  PR (#490) carried the right trailer. Nothing reverted it; **nothing ever closed it.** Six tasks were
+  in that state. So closing the row yourself is not belt-and-braces, it is the only thing that closes it.
+- **Separately: a push overwrites status unconditionally.** `lib/ingest/tasks` writes `status` straight
+  from the file row, so if a task ever IS auto-closed (`applied`) while your local row still says
+  `in_progress`, the next `aios push` clobbers it back open. The file is not strictly one-way — brain-api
+  1.13 has a `mode=sync-origin` RETURN LEG that merges brain/Linear status back into the markdown — but
+  the push direction wins, so pull the return leg (or just fix the row) before pushing.
+- **For a brain-native row, a trailer citing the LINEAR key resolves to nothing.** A `work_events` row
+  for `AIO-821` sits in prod as `unresolved · no matching task row`: resolution matches on `row_key` and
+  never consults `task_pm_links`, where the Linear key lives. (A Linear-*mirrored* task is the exception —
+  its `row_key` IS the `AIO-*` key, so it resolves, as `linked`.) Cite the BRAIN row key (`PIPEFF-2`).
+- **Filing late is better than not filing, and must be labelled.** Four PRs (#372/#435/#437/#501)
+  shipped with no task at all and were retro-filed as `TLUX-1`, `TLSUM-1`, `COSTMETER-1`,
+  `SLACKATTR-1`, each marked `RETRO-FILED (#nnn)` in its description so the board doesn't imply a
+  discipline that wasn't followed. Retro-filing is the repair, not the routine.
+- The CI check `PR references a brain task` is **advisory** — it warns and goes green with no key. It
+  will not catch this for you, which is exactly why it is written down here.
 
 ---
 
