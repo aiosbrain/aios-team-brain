@@ -200,7 +200,7 @@ that can be *proved* rather than argued, so it is a merge precondition rather th
 > sha and therefore the sha of the file it produces — dissolving the claim above. The `why` lives in
 > `graphiti/Dockerfile`'s PATCH 3 block and in this spec.
 
-## Verification result — measured 2026-08-07, and it beat the corrected prediction
+## Verification result — measured 2026-08-07: cost at the top of the pre-registered band
 
 Deploy: graphiti + brain on `1693d9e`, 07:08:24Z. First drain-clean post-deploy window,
 07:19:49 → 08:00:27 (opened after a 10.8-minute quiet gap, closed with the trailing drain clear):
@@ -218,26 +218,57 @@ MULTIPLE    47.8x the content a full episode carries   (was 64.1x)
 | **measured post-deploy** | **29,856** |
 | **fall** | **−25.5%** |
 
-**The instrument's own validity gate passed** — cross-check *exact*, zero retry gap — and it refused
-three earlier window attempts before this one, including the first post-deploy window (the deploy had
-landed mid-burst, so pre-deploy tokens sat in it without their episodes). The number reported is the
-one it was willing to stand behind.
+**The instrument's own validity gate passed** — cross-check *exact*, zero retry gap — and **three
+window attempts were refused before this one**, the first of them the obvious post-deploy window (the
+deploy had landed mid-burst, so pre-deploy tokens sat in it without their episodes). The number
+reported is the one the harness was willing to stand behind. No same-day pre-deploy window was
+obtainable at all; the baseline below is therefore the 2026-08-05 one, two days earlier.
 
-### My ~18% correction was wrong, in the conservative direction
+### Status against the pre-registered verification table
+
+The table above pre-registers **five** checks. This section discharges **two** of them. The rest are
+recorded as pending rather than left to look discharged by proximity — the failure mode where a
+partial record reads as a complete one:
+
+| pre-registered check | status |
+|---|---|
+| day 0 — sanity-read the windowed entity count vs the unfiltered count | **NOT RUN.** Requires the prod graph, reachable only from inside the brain. It is **due now**, and the spec's own instruction stands: *do this before recording any day-3 number* — every later reading in the table inherits a windowed count that silently matches nothing |
+| input tokens/episode falls ~15–25% | ✅ done — see below |
+| signed cross-check gap unchanged (~0) | ✅ done — **exact**, zero retry gap, so none of the fall is a retry artefact |
+| `entitiesPerEpisode` (windowed) at day 3 / 7 / 14 | pending: **2026-08-10 · 2026-08-14 · 2026-08-21** |
+| same-name split share unchanged (~0) | pending, read alongside the `entitiesPerEpisode` days |
+
+**Cost is verified; quality is not yet read.** The lever shipped as an owner override of a procedural
+FAIL, and the quality half of the post-deploy plan is what converts that override from a bet into an
+observation. It has not happened yet.
+
+### The ~18% correction looks conservative on this window — the premise is not yet falsified
 
 The correction assumed the predecessor block is **fixed in absolute size**, so the battery's ~7,200
-token cut would be ~18% against prod's larger baseline. The measured absolute cut is **10,214** —
-larger than the battery's. The likely reason, stated as a hypothesis rather than a measurement: the
-battery's corpus was **18.5% single-chunk small items** (some ~200 chars), so the ten predecessors it
-carried were on average much smaller than prod's, where predecessors are mostly full 2,500-char
-chunks. A bigger block removed is a bigger saving.
+token cut would be ~18% against prod's larger baseline. That premise predicts 40,070 − 7,200 =
+**~32,870** tokens/episode; the window measured **29,856**, a cut of **10,214**.
 
-**Caveats that keep this honest:** 29 episodes against the baseline's 169, on a different day with a
-different content mix, and no same-day pre-deploy window was obtainable — all three candidates were
-*refused* by the harness. So the **direction and rough magnitude are solid; the exact percentage
-carries content-mix uncertainty.** The band this spec pre-registered was ~15–25%; the result sits at
-the top of it, which is a pass either way, and the "no fall at all ⇒ the patch did not take effect"
-falsifier is decisively not triggered.
+**That gap is 3,014 tokens — ~7.5% of the baseline — and this spec's own text puts plausible
+content-mix swing at ~10–20%.** So the measurement is *consistent* with the fixed-size premise being
+wrong, and equally consistent with it being right on a window whose content ran heavier than the
+baseline's. **29 episodes over 41 minutes cannot separate those two**, and stating otherwise would be
+the same over-read that produced the ~18% correction in the first place.
+
+A hypothesis for why the block might genuinely be larger in prod, offered as a hypothesis and with
+the number that cuts *against* it stated rather than omitted: the battery's corpus was **18.5%**
+single-chunk small items and prod's is **~17%** (898 of 5,166) — so *share* explains nothing, the
+two are within 1.5pp, and that match is exactly what the parent spec relied on to call C1
+transferable. Any real difference has to live in predecessor **size**, not count: the battery's
+single-chunk fillers ran ~200–600 chars against prod's mostly-full 2,500-char chunks. By arithmetic
+that term accounts for only a fraction of the 3,014-token gap, so it is not a sufficient explanation
+either. **Unresolved, and marked unresolved.**
+
+**What is solid:** a large fall occurred, it sits inside the pre-registered ~15–25% band (at, and
+nominally just above, its top edge), and the **"no fall at all ⇒ the patch did not take effect"**
+falsifier is decisively not triggered. **What is not solid:** the exact percentage, which carries
+content-mix uncertainty from 29 episodes against the baseline's 169 on a different day. Quote this as
+"a fall in the 15–25% band, point estimate 25.5%", never as "25.5% saving" — the last time a point
+estimate from one corpus travelled into the next document as a fact, it took a review round to catch.
 
 ## Rollout and rollback
 
