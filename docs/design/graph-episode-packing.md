@@ -10,17 +10,33 @@ This document is the record of why, and of what would have to change for the ans
 
 ## 0. The verdict, and the two things that produced it
 
-I specified this lever in full, then Fable plan-reviewed it. The review returned **BLOCKED**, and the
-decisive findings were not defects in the design — they were **two facts about the payload that make
-the lever much smaller than the parent spec assumed, and one that makes it more dangerous.**
+I specified this lever in full, then Fable plan-reviewed it. The review returned **BLOCKED** on two
+counts: **a fact about the payload that makes the lever smaller than the parent spec assumed**, and
+**a defect in my design that makes it more dangerous** — I originally wrote that the findings "were
+not defects in the design", which is self-flattering and wrong: §3 is a defect, and it is mine.
 
-1. **The saving is a fraction of what §1 first priced**, because PIPEFF-2 — which we shipped
-   *yesterday* — already made these exact episodes the cheapest in the fleet.
+1. **The saving is smaller than §1 first priced**, because PIPEFF-2 — which we shipped *yesterday* —
+   removed the predecessor block, which is proportionally the largest cost of exactly these episodes.
+   **How much smaller is an inference, not a measurement** (§2), and it is labelled as one throughout.
 2. **The design as I wrote it specified an indefinite tier leak**, and the fix for it erodes the
    saving further.
 
-Both are below, measured. The lever is declined in favour of `use_combined_extraction`, with that
-alternative re-costed honestly rather than inherited from the parent spec's optimistic note.
+**The decline does not hinge on that inference, and this is the point to check before reading further.**
+Three findings carry it on their own, every one of them measured or quoted from code:
+
+- **accretion** halves the episode cut (§2, measured: 4.47 sync-hours/author-day against an hourly
+  projector);
+- **the §3 leak**, quoted verbatim from `project.ts:752`;
+- **the §4/§5 quality regressions**, which are volume-independent and arguably worsen as commit share
+  grows.
+
+Even if a commit episode cost the **full** fleet average, those three still decline the lever. The
+pricing inference makes it more obviously not worth building; it is not what makes it not worth
+building. I state that explicitly because I have an incentive to make the case airtight, and the
+reviewer said so.
+
+The lever is declined in favour of `use_combined_extraction`, with that alternative re-costed rather
+than inherited from the parent spec's note.
 
 ---
 
@@ -85,9 +101,10 @@ commit is single-chunk by definition (198 chars against a 1,250-char minimum). S
 already carry no predecessor block at all**, and their bodies are ~50 tokens.
 
 The fleet average of **$0.0110/episode** (PIPEFF-2's verified post-deploy figure) is dominated by
-multi-chunk episodes that *do* carry a predecessor block. Commit episodes sit far below it. Pricing
-507 eliminated commit episodes at the fleet average — which §1 of the original draft did — **credits
-this lever with a saving PIPEFF-2 already banked yesterday.**
+multi-chunk episodes that *do* carry a predecessor block. Commit episodes therefore sit **below** it —
+by how much is the open question of this section. Pricing 507 eliminated commit episodes at the fleet
+average — which §1 of the original draft did — **credits this lever with some of the saving PIPEFF-2
+banked yesterday.**
 
 I have **not** measured the marginal cost of a commit episode, and this section's central claim is
 therefore an **inference** — from the zero-predecessor rule plus a ~50-token body — not a
@@ -106,15 +123,22 @@ So the number needs a **deliberately constructed** commits-only drain-clean wind
 That is cheap and it has not been done. Until it exists, treat every figure in this section as a
 ceiling.
 
-What is not in doubt is the *direction*: a commit episode carries zero predecessors and ~50 tokens of
-content, while the $0.0110 fleet average is dominated by multi-chunk episodes that do carry a
-predecessor block. The honest ceiling is well under the $5.60/month the first draft claimed.
+What is not in doubt is the *direction*, and it can be **bounded** without guessing at magnitude: the
+marginal saving per eliminated episode sits between a floor (the fixed prompt boilerplate a commit
+episode still pays across its ~4–10 calls, plus its **output** tokens, which the predecessor cut never
+touched) and a ceiling (the $0.0110 fleet average). So the pre-accretion saving is **≤ $5.60/month by
+construction**, and accretion halves whatever it actually is.
+
+I deliberately do not say "the cut is large". A commit episode plausibly still costs one-third to
+two-thirds of fleet average — at two-thirds, PIPEFF-2 banked about a third of this lever's saving, not
+most of it. **The bound is what the decline uses; the magnitude is unmeasured and stays unmeasured in
+this document.**
 
 ### And accretion halves the episode count too
 
 A pack must be re-pushed as its day accretes. Measured: a `(member, work-day)`'s commits arrive
 across **4.47 distinct sync hours on average (median 3, max 16)**, and the projector runs hourly
-(`project.ts:233`). So under the replace semantics §4.2 shows are mandatory, each author-day pack is
+(`project.ts:233`). So under the replace semantics §3 shows are mandatory, each author-day pack is
 deleted and re-pushed **3–5 times**:
 
 - episodes pushed per author-day ≈ **3–5, not 1** → the ~9.8% episode cut becomes **~5%**
@@ -123,7 +147,8 @@ deleted and re-pushed **3–5 times**:
 - every delete+re-add **churns episode UUIDs** that cached arcs' `episodeUuids` still reference,
   blanking evidence resolution mid-day
 
-**Combined: roughly half the episode saving, on episodes that were already the cheapest.** The honest
+**Combined: roughly half the episode saving, on episodes that were already cheaper than average by
+an unmeasured margin.** The honest
 figure is low single-digit dollars per month at today's volume, and I decline to state it more
 precisely than that without the commits-only cost window.
 
@@ -246,7 +271,11 @@ In its favour: upstream's own docstring claims combined extraction *"produces be
 orphaned nodes"*, so the quality risk is at least not adverse — unlike this lever, where every risk
 pointed one way.
 
-**It is still the better next lever**: larger (~15% vs ~5%), no schema change, no new table, no
+**Its ~15% is the parent spec's estimate and is itself unmeasured** — flagged here because this
+document exists to stop unmeasured parent numbers travelling, and carrying one through unhedged while
+correcting the other would be exactly that failure.
+
+**It is still the better next lever**: larger (~15% estimated vs ~5% measured), no schema change, no new table, no
 attribution surface, and **no tier surface** — which is the one that matters, because packing is the
 only lever in this workstream with an unrecoverable failure mode.
 
@@ -256,9 +285,14 @@ only lever in this workstream with an unrecoverable failure mode.
 
 Not "more conviction" — these, specifically:
 
-1. **Volume.** At 5–10 active engineers the commit tail multiplies while the blast radius does not.
-   Revisit when commit episodes exceed ~25% of the fleet, or when the measured commits-only cost
-   window shows the marginal saving above ~$25/month.
+1. **Volume — but with no numeric trigger, and never on its own.** An earlier draft of this section
+   said "revisit when commit episodes exceed ~25% of the fleet, or the marginal saving exceeds
+   ~$25/month". **Both numbers were invented** — round figures with no derivation anywhere in this
+   document. Worse, a dollar trigger contradicts the constraint that governs this whole workstream:
+   §4's attribution paths and §5's arc-identity and representation regressions are
+   **volume-independent** — arc-identity churn arguably *worsens* as commit share grows — and cost may
+   not be bought with quality at any price. **So no saving figure alone can flip this.** Revisit on
+   volume only *in combination with* item 4 below, or with a design that actually resolves §4 and §5.
 2. **A measured marginal price for a commit episode.** Until that exists, every number here is a
    ceiling. It is a free measurement and it is the first thing to do if anyone reopens this.
 3. **A two-phase projector**, if one is built for another reason. §3's replace semantics need it, and
@@ -275,7 +309,9 @@ Two prod measurement passes and one plan review; **no code, no LLM spend, nothin
 
 What it bought beyond the decline:
 
-- **PIPEFF-2 already banked most of this lever's saving** — single-chunk items get zero predecessors,
+- **PIPEFF-2 already banked a material — but unmeasured — fraction of this lever's saving** (the
+  predecessor block, proportionally largest for exactly these episodes; *not* established as "most")
+  — single-chunk items get zero predecessors,
   so the small-item tail is no longer the expensive thing the parent spec described. **The parent
   spec's §3 is now stale and should say so.**
 - **The commits-only marginal cost is unmeasured**, and it is the number any future small-item work
@@ -285,3 +321,46 @@ What it bought beyond the decline:
 - **An acceptance-criteria hole worth remembering:** I wrote A1–A11 against the constraints I had
   listed, and still missed the criterion for "the removed member's content is gone" — the *inverse*
   of the one I did write. When a criterion asserts something survives, ask what must not.
+
+---
+
+## Appendix — what survives the decline
+
+Restored at the reviewer's insistence: the rewrite deleted both of these, and they are the most
+durable things this work produced. Anyone touching graph projection for **any** reason starts
+here rather than re-deriving it.
+
+### A.1 Terrain facts C1–C10 (verified against the working tree; true independent of packing)
+
+| # | Constraint | Where | Failure if violated |
+|---|---|---|---|
+| C1 | `group_id` is derived **per item** from `item.access` and is the only tier enforcement — no RLS | `project.ts:612`, `group.ts:20-26`, CLAUDE.md §5 | A mixed-tier pack is a **permanent, unrecoverable external leak**. Graphiti `/search` returns everything in a group; there is no post-hoc filter anywhere. |
+| C2 | The ledger is keyed `unique (team_id, source_table, source_id)` — **one row per item** | `schema.sql:2231` | A packed episode covers N items; either the ledger grows a many-to-one shape or packing hides inside a synthetic item. |
+| C3 | `itemIdFromEpisodeName` is **pure and single-valued** (`string \| undefined`) | `episode-name.ts:21-26` | Every consumer is typed on a scalar. A multi-item episode has no representation. |
+| C4 | `deleteItemEpisodes` deletes every episode whose parsed id matches — **silently** | `project.ts:527-541` | Deleting one item would delete its pack-mates' content. Purge, retraction and tier-flip all route through it. |
+| C5 | Reconcile confirms a row if **any** chunk landed | `reconcile.ts:270-278` | One landed packed episode confirms **every** member, including members whose text never arrived. |
+| C6 | `toPush` filters by **positional index** into one item's chunk array | `project.ts:842` | A pack's chunk shas span several items; positional delta is meaningless across a pack. |
+| C7 | The PIPEFF-2 graphiti patch groups predecessor context by `name.split('#')[0]` | `graphiti/patch-same-item.py:21,25` | "Same document" silently becomes "same **pack**" — a behaviour change to a shipped, sha-pinned patch. |
+| C8 | `entitiesPerEpisode` divides entities by **episodes** | `extraction-health.ts:561-571` | Packing changes the denominator's meaning; the sensor shipped yesterday would step-change for a non-quality reason. |
+| C9 | Eligibility keeps a fact if **any** of its items is eligible | `arcs.ts:849-856` | An ineligible item rides along on an eligible pack-mate. |
+| C10 | Arc identity is item-set overlap, `MIN_SHARED_ITEMS = 2` | `arc-continuity.ts:29,39` | Changing which items a fact resolves to perturbs day-to-day arc identity. |
+
+
+### A.2 Design fragments the review upheld
+
+The lever is declined; these parts of it were judged **correct** and should be reused, not rebuilt, if
+anyone reopens this or designs anything adjacent:
+
+- **`group_id` inside the pack key.** This closes C1 *by construction* rather than by check — two
+  items of different `access` cannot share a key because the key contains the group. For the one
+  invariant with no RLS backstop, "impossible by construction" beats any guard.
+- **Never pack an author-less item.** Not "pack into a `(none)` bucket" — never. Measured population:
+  17 of 570 commits (3%), immaterial to the saving and material to correctness.
+- **A join table, not an array column.** Reconcile's fixed landed-check needs the *episode-side*
+  question ("which members does `pack:<id>` claim"), which an array on member rows cannot answer
+  without a scan; and membership changing over time makes the array a mutation-in-place shape.
+- **Replace semantics as the deletion primitive** — delete the old pack episode(s) by name, *then*
+  push the remainder, in that order. This is the correct fix for §3's leak, and it is safe precisely
+  because the survivors are re-pushed. It needs a two-phase projector (§8.3).
+- **`entitiesPerEpisode` keeps packs in its denominator.** Excluding them would blind the sensor to
+  pack-extraction failures. Annotate the discontinuity instead.
