@@ -197,6 +197,16 @@ degrades and 10 is wasteful, and should be measured in the same run rather than 
 
 ### 3. Pack small items into full episodes — coverage-neutral, 40% of items
 
+> **⛔ SUPERSEDED — DECLINED on evidence, 2026-08-08. See `docs/design/graph-episode-packing.md`
+> (PIPEFF-4 / AIO-845).** The section below is preserved as written, but its premise no longer holds:
+> it prices small items at full fixed overhead, and **PIPEFF-2 has since given every single-chunk item
+> ZERO predecessors** (`graphiti/patch-same-item.py:12`). Every small item is single-chunk, so this
+> tail is now the *cheapest* part of the fleet, not the most wasteful — most of this lever's saving
+> was banked by lever 2. Measured remainder after pack-accretion re-pushes: **~5% of episodes**, on
+> the cheapest episodes, against the only unrecoverable failure mode in this workstream (a mixed-tier
+> pack cannot be cleaned up). The next lever is `use_combined_extraction` (§4), which is larger and
+> has no tier or attribution surface.
+
 898 items under 600 characters each occupy their own episode at full fixed-overhead price. Packing
 them (per source, per time bucket, preserving per-item provenance in the episode body so attribution
 survives) turns ~898 episodes into ~180.
@@ -273,7 +283,9 @@ A lever that cannot show movement on tokens-per-episode does not ship.
 1. **Harness** (this PR) — no behaviour change, establishes the baseline.
 2. **Lever 2** (`EPISODE_WINDOW_LEN`) — biggest token win per line changed, gated on the quality battery.
 3. **Lever 1** (CDC) — the durable structural fix; needs the lazy-rollout third case.
-4. **Lever 3** (packing) — deepest blast radius, last.
+4. ~~**Lever 3** (packing) — deepest blast radius, last.~~ **DECLINED 2026-08-08** — see §3's notice
+   and `docs/design/graph-episode-packing.md`. The next lever is **§4 `use_combined_extraction`**,
+   which this document recorded as "noted, not proposed" and which is now the largest remaining one.
 
 Each is its own PR with its own before/after measurement in the body.
 
