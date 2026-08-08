@@ -248,20 +248,33 @@ The correction assumed the predecessor block is **fixed in absolute size**, so t
 token cut would be ~18% against prod's larger baseline. That premise predicts 40,070 − 7,200 =
 **~32,870** tokens/episode; the window measured **29,856**, a cut of **10,214**.
 
-**That gap is 3,014 tokens — ~7.5% of the baseline — and this spec's own text puts plausible
-content-mix swing at ~10–20%.** So the measurement is *consistent* with the fixed-size premise being
-wrong, and equally consistent with it being right on a window whose content ran heavier than the
-baseline's. **29 episodes over 41 minutes cannot separate those two**, and stating otherwise would be
-the same over-read that produced the ~18% correction in the first place.
+**That gap is 3,014 tokens — ~7.5% of the baseline — and the size of the content-mix swing it would
+have to beat has never been measured on this install.** The `~10–20%` figure this spec cites is about
+**entity yield**, not cost, and borrowing it here would be exactly the kind of number-reuse this
+document exists to catch. What *is* measured is the incumbent's **same-corpus** run-to-run cost
+spread: **~2%**. That is the wrong instrument for this question — it holds the corpus fixed, and the
+whole issue here is that the corpus changed. Baseline and post-deploy windows are different days,
+different mixes, 169 episodes against 29.
+
+So the measurement is *consistent* with the fixed-size premise being wrong, and equally consistent
+with it being right on a window whose content ran heavier than the baseline's. **29 episodes over 41
+minutes cannot separate those two**, and stating otherwise would be the same over-read that produced
+the ~18% correction in the first place.
 
 A hypothesis for why the block might genuinely be larger in prod, offered as a hypothesis and with
 the number that cuts *against* it stated rather than omitted: the battery's corpus was **18.5%**
-single-chunk small items and prod's is **~17%** (898 of 5,166) — so *share* explains nothing, the
-two are within 1.5pp, and that match is exactly what the parent spec relied on to call C1
-transferable. Any real difference has to live in predecessor **size**, not count: the battery's
-single-chunk fillers ran ~200–600 chars against prod's mostly-full 2,500-char chunks. By arithmetic
-that term accounts for only a fraction of the 3,014-token gap, so it is not a sufficient explanation
-either. **Unresolved, and marked unresolved.**
+single-chunk small items and prod's is **~17%** (898 of 5,166) — so *share* explains nothing, the two
+are within 1.5pp, and that match is exactly what the parent spec relied on to call C1 transferable.
+Any real difference therefore has to live in predecessor **size**, not count: the battery's
+single-chunk fillers ran ~200–600 chars against prod's mostly-full 2,500-char chunks. Whether that
+term is big enough to cover 3,014 tokens is **not computed here and not asserted** — the predecessor
+block's size per call kind was measured in Phase A for the *battery's* corpus only, never for prod's.
+**Unresolved, and marked unresolved.**
+
+**What would resolve it, cheaply:** `scripts/graph-window-battery/phase-a-predecessors.ts` already
+reports average predecessor tokens and predecessor share per call kind from captured prompts, with no
+LLM call. Pointed at a prod capture window it would give prod's actual block size and settle this.
+Not done; noted so the next person measures it rather than re-arguing it.
 
 **What is solid:** a large fall occurred, it sits inside the pre-registered ~15–25% band (at, and
 nominally just above, its top edge), and the **"no fall at all ⇒ the patch did not take effect"**
