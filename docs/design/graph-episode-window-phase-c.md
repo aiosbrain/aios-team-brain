@@ -200,6 +200,93 @@ that can be *proved* rather than argued, so it is a merge precondition rather th
 > sha and therefore the sha of the file it produces — dissolving the claim above. The `why` lives in
 > `graphiti/Dockerfile`'s PATCH 3 block and in this spec.
 
+## Verification result — measured 2026-08-07: cost at the top of the pre-registered band
+
+Deploy: graphiti + brain on `1693d9e`, 07:08:24Z. First drain-clean post-deploy window,
+07:19:49 → 08:00:27 (opened after a 10.8-minute quiet gap, closed with the trailing drain clear):
+
+```
+episodes    29    cross-check 29 pushed per ingest_runs · 0% apart · EXACT
+input tok   865,835    29,856 per episode
+cost        $0.32      $0.0110 per episode
+MULTIPLE    47.8x the content a full episode carries   (was 64.1x)
+```
+
+| | tokens/episode |
+|---|---|
+| baseline (2026-08-05, 169 episodes, drain-clean) | 40,070 |
+| **measured post-deploy** | **29,856** |
+| **fall** | **−25.5%** |
+
+**The instrument's own validity gate passed** — cross-check *exact*, zero retry gap — and **three
+window attempts were refused before this one**, the first of them the obvious post-deploy window (the
+deploy had landed mid-burst, so pre-deploy tokens sat in it without their episodes). The number
+reported is the one the harness was willing to stand behind. No same-day pre-deploy window was
+obtainable at all; the baseline below is therefore the 2026-08-05 one, two days earlier.
+
+### Status against the pre-registered verification table
+
+The table above pre-registers **five** checks. This section discharges **two** of them. The rest are
+recorded as pending rather than left to look discharged by proximity — the failure mode where a
+partial record reads as a complete one:
+
+| pre-registered check | status |
+|---|---|
+| day 0 — sanity-read the windowed entity count vs the unfiltered count | **NOT RUN.** Requires the prod graph, reachable only from inside the brain. It is **due now**, and the spec's own instruction stands: *do this before recording any day-3 number* — skipped, every later reading in the table **would** rest on a windowed count nothing has validated, and a windowed count that matches nothing is indistinguishable from a low one |
+| input tokens/episode falls ~15–25% | ✅ done — see below |
+| signed cross-check gap unchanged (~0) | ✅ done — **exact**, zero retry gap, so none of the fall is a retry artefact |
+| `entitiesPerEpisode` (windowed) at day 3 / 7 / 14 | pending: **2026-08-10 · 2026-08-14 · 2026-08-21** |
+| same-name split share unchanged (~0) | pending, read alongside the `entitiesPerEpisode` days |
+
+**Cost is verified; quality is not yet read.** The lever shipped as an owner override of a procedural
+FAIL, and the quality half of the post-deploy plan is what converts that override from a bet into an
+observation. It has not happened yet.
+
+### The ~18% correction looks conservative on this window — the premise is not yet falsified
+
+The correction assumed the predecessor block is **fixed in absolute size**, so the battery's ~7,200
+token cut would be ~18% against prod's larger baseline. That premise predicts 40,070 − 7,200 =
+**~32,870** tokens/episode; the window measured **29,856**, a cut of **10,214**.
+
+**That gap is 3,014 tokens — ~7.5% of the baseline — and the size of the content-mix swing it would
+have to beat has never been measured on this install.** The `~10–20%` figure this spec cites is about
+**entity yield**, not cost, and borrowing it here would be exactly the kind of number-reuse this
+document exists to catch. What *is* measured is the incumbent's **same-corpus** run-to-run cost
+spread: **~2%**. That is the wrong instrument for this question — it holds the corpus fixed, and the
+whole issue here is that the corpus changed. Baseline and post-deploy windows are different days,
+different mixes, 169 episodes against 29.
+
+So the measurement is *consistent* with the fixed-size premise being wrong, and equally consistent
+with it being right on a window whose content ran heavier than the baseline's. **29 episodes over 41
+minutes cannot separate those two**, and stating otherwise would be the same over-read that produced
+the ~18% correction in the first place.
+
+A hypothesis for why the block might genuinely be larger in prod, offered as a hypothesis and with
+the number that cuts *against* it stated rather than omitted: the battery's corpus was **18.5%**
+single-chunk small items and prod's is **~17%** (898 of 5,166) — so *share* explains nothing, the two
+are within 1.5pp, and that match is exactly what the parent spec relied on to call C1 transferable.
+Any real difference therefore has to live in predecessor **size**, not count — and the corpus record
+weakens even that: of the battery's 20 single-chunk items, **15 were under 600 chars and 5 at or
+above** (buckets B1/B2), and the other 81.5% of its episodes were full chunks, same as prod's. So the
+size gap is confined to a quarter of a fifth of the corpus. Whether that term is big enough to cover
+3,014 tokens is **not computed here and not asserted** — the predecessor block's size per call kind
+was measured in Phase A for the *battery's* corpus only, never for prod's. **Unresolved, and marked
+unresolved.**
+
+**What would resolve it:** `scripts/graph-window-battery/phase-a-predecessors.ts` already reports
+average predecessor tokens and predecessor share per call kind from captured prompts, with no LLM
+call — so the *analysis* is free. The capture is not: it needs `capture-tap.mjs` in front of prod's
+graphiti, which is a deploy-side change, not a matter of pointing the script at something that
+already exists. Cheap once a prod capture exists; noted so the next person measures it rather than
+re-arguing it.
+
+**What is solid:** a large fall occurred, it sits inside the pre-registered ~15–25% band (at, and
+nominally just above, its top edge), and the **"no fall at all ⇒ the patch did not take effect"**
+falsifier is decisively not triggered. **What is not solid:** the exact percentage, which carries
+content-mix uncertainty from 29 episodes against the baseline's 169 on a different day. Quote this as
+"a fall in the 15–25% band, point estimate 25.5%", never as "25.5% saving" — the last time a point
+estimate from one corpus travelled into the next document as a fact, it took a review round to catch.
+
 ## Rollout and rollback
 
 1. **Rollback anchor recorded: graphiti deployment `fde9d3b4-9e7`** (SUCCESS, 2026-08-07T00:57:11).
