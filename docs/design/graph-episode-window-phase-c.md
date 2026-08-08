@@ -232,7 +232,7 @@ partial record reads as a complete one:
 
 | pre-registered check | status |
 |---|---|
-| day 0 — sanity-read the windowed entity count vs the unfiltered count | **NOT RUN.** Requires the prod graph, reachable only from inside the brain. It is **due now**, and the spec's own instruction stands: *do this before recording any day-3 number* — every later reading in the table inherits a windowed count that silently matches nothing |
+| day 0 — sanity-read the windowed entity count vs the unfiltered count | **NOT RUN.** Requires the prod graph, reachable only from inside the brain. It is **due now**, and the spec's own instruction stands: *do this before recording any day-3 number* — skipped, every later reading in the table **would** rest on a windowed count nothing has validated, and a windowed count that matches nothing is indistinguishable from a low one |
 | input tokens/episode falls ~15–25% | ✅ done — see below |
 | signed cross-check gap unchanged (~0) | ✅ done — **exact**, zero retry gap, so none of the fall is a retry artefact |
 | `entitiesPerEpisode` (windowed) at day 3 / 7 / 14 | pending: **2026-08-10 · 2026-08-14 · 2026-08-21** |
@@ -265,16 +265,20 @@ A hypothesis for why the block might genuinely be larger in prod, offered as a h
 the number that cuts *against* it stated rather than omitted: the battery's corpus was **18.5%**
 single-chunk small items and prod's is **~17%** (898 of 5,166) — so *share* explains nothing, the two
 are within 1.5pp, and that match is exactly what the parent spec relied on to call C1 transferable.
-Any real difference therefore has to live in predecessor **size**, not count: the battery's
-single-chunk fillers ran ~200–600 chars against prod's mostly-full 2,500-char chunks. Whether that
-term is big enough to cover 3,014 tokens is **not computed here and not asserted** — the predecessor
-block's size per call kind was measured in Phase A for the *battery's* corpus only, never for prod's.
-**Unresolved, and marked unresolved.**
+Any real difference therefore has to live in predecessor **size**, not count — and the corpus record
+weakens even that: of the battery's 20 single-chunk items, **15 were under 600 chars and 5 at or
+above** (buckets B1/B2), and the other 81.5% of its episodes were full chunks, same as prod's. So the
+size gap is confined to a quarter of a fifth of the corpus. Whether that term is big enough to cover
+3,014 tokens is **not computed here and not asserted** — the predecessor block's size per call kind
+was measured in Phase A for the *battery's* corpus only, never for prod's. **Unresolved, and marked
+unresolved.**
 
-**What would resolve it, cheaply:** `scripts/graph-window-battery/phase-a-predecessors.ts` already
-reports average predecessor tokens and predecessor share per call kind from captured prompts, with no
-LLM call. Pointed at a prod capture window it would give prod's actual block size and settle this.
-Not done; noted so the next person measures it rather than re-arguing it.
+**What would resolve it:** `scripts/graph-window-battery/phase-a-predecessors.ts` already reports
+average predecessor tokens and predecessor share per call kind from captured prompts, with no LLM
+call — so the *analysis* is free. The capture is not: it needs `capture-tap.mjs` in front of prod's
+graphiti, which is a deploy-side change, not a matter of pointing the script at something that
+already exists. Cheap once a prod capture exists; noted so the next person measures it rather than
+re-arguing it.
 
 **What is solid:** a large fall occurred, it sits inside the pre-registered ~15–25% band (at, and
 nominally just above, its top edge), and the **"no fall at all ⇒ the patch did not take effect"**
