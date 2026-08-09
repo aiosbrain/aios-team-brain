@@ -98,11 +98,13 @@ gates the exit) → **D** the tagging engine at scale (rules, review queue, meet
 preview) → **E** the cross-project signal layer (designed now, built later). Each phase ends at a
 stop-and-review gate.
 
-**Build-with tier:** Fable / high effort for Phases A–B and any diff touching the oracle, RLS, or
-migration (the failure mode there is a silent leak with no backstop — buy the strongest builder
-where a single wrong line produces the invisible defect); Opus / high is acceptable from Phase C
-onward for the more mechanical surfaces, with multi-model review (fresh Fable session + Codex) on
-every security-critical diff regardless of builder.
+**Build-with tier (advisory):** Fable / high effort for Phases A–B and any diff touching the
+oracle, RLS, or migration (the failure mode there is a silent leak with no backstop — buy the
+strongest builder where a single wrong line produces the invisible defect); Opus / high is
+acceptable from Phase C onward for the more mechanical surfaces, with multi-model review (fresh
+Fable session + Codex) on every security-critical diff regardless of builder. This is guidance for
+the humans staffing the build, not a CI-enforced gate — the repo's review gate stays tool-flexible
+per CLAUDE.md, and no machine check verifies which model built a diff.
 
 ### What's still unknown, honestly
 
@@ -279,13 +281,29 @@ create table if not exists groups (
   slug text not null,
   name text not null,
   is_builtin boolean not null default false,
-  person_member_id uuid references members(id) on delete cascade,
+  person_member_id uuid,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
-  unique (team_id, slug)
+  unique (team_id, slug),
+  -- composite FK (same-team, §"Cross-team integrity" below) — a singleton cannot point at
+  -- another team's member
+  foreign key (team_id, person_member_id) references members (team_id, id) on delete cascade,
+  -- a built-in can never be a singleton, and vice versa
+  check (person_member_id is null or not is_builtin)
 );
 create unique index if not exists groups_person_singleton_idx
   on groups (team_id, person_member_id) where person_member_id is not null;
+```
+
+Singleton integrity is writer-enforced on top of the schema (the schema alone cannot express
+"membership = exactly that member"): the groups single writer is the ONLY module that may create a
+singleton row, and it maintains the invariant `group_members(singleton) = { person_member_id }` —
+the ordinary group-membership admin actions **reject** any edit targeting a singleton (add, remove,
+rename), group pickers exclude `person_member_id is not null` rows, and a datamechanics guard walks
+every violation: a second member added, a membership row whose member ≠ `person_member_id`, an
+empty singleton, a singleton flag set on an existing multi-member group (§14 leak-suite rows).
+
+```sql
 
 create table if not exists group_members (
   team_id uuid not null references teams(id) on delete cascade,
@@ -346,15 +364,38 @@ tables: `verified_by uuid`, `verified_at`, `confidence text check (confidence in
 ('deterministic','confirmed','suggested'))`, `evidence jsonb`. Delegation adds `agent_tokens` (§10).
 Signal seams add `intent_records` (§13, design-only).
 
+**`members` gains a `kind` column** (canonical DDL + migration, in the Phase A ordering §17
+alongside groups/edges — the Codex round-3 review caught that §8.6/§10 referenced member
+categories with no DDL or migration behind them):
+
+```sql
+alter table members add column if not exists kind text not null default 'human'
+  check (kind in ('human','agent','offroster'));
+```
+
+`is_connector` stays as-is (an orthogonal flag on existing service-account rows). **Principal
+eligibility is one predicate**, defined in the oracle module and reused verbatim by the RLS
+policies (§9), the groups single writer, and credential issuance:
+`isPrincipalEligible(m) ≡ m.kind = 'human' ∧ ¬m.is_connector ∧ m.active` — with two enforcement
+points so ineligibility is structural, not advisory: the groups single writer **rejects** adding a
+non-eligible member to any group except an agent's explicit grants (`kind='agent'` may hold
+memberships; `kind='offroster'` and connectors may not — a membership row for them cannot be
+created), and the oracle applies the predicate on every read anyway, so a flag flipped after a
+membership snuck in still resolves to nothing. Login and API-key/token issuance refuse
+non-eligible members except `kind='agent'` API keys (§10).
+
 **Effective visibility is a pure function**, computed in one place (§5.1):
 
 ```
 visibleProjects(principal) =
-  { p | ∃ g : (principal.member ∈ g) ∧ ((p,g) ∈ project_groups) }
+  eligible(principal) ? { p | ∃ g : (principal.member ∈ g) ∧ ((p,g) ∈ project_groups) } : ∅
   ∩ attenuation(principal)            -- token project-scope, §10; identity fail-closed, §8
 canSee(principal, unit) =
   ∃ m current effective include membership of unit into some p ∈ visibleProjects(principal)
 ```
+
+where `eligible` = `isPrincipalEligible` extended to admit `kind='agent'` (agents are principals;
+off-roster and connector rows are never).
 
 ## 5. Enforcement — every read path, one oracle
 
@@ -468,19 +509,28 @@ migration decides mirror-vs-drop with the RLS policy in `pgvector.sql` covering 
 inspector (§15.6) is the runtime check that a cached surface never leaked: it recomputes the access
 path live.
 
-**Attribution corrections across partitioned caches — reuse what is built.** The attribution
-cascade already exists and works because attribution is **resolved live at compute time, never
-baked into cached artifacts**: arcs and the timeline read `items.member_id` fresh at synthesis, and
-an admin correction (`applyAttributionCorrection`, `lib/ingest/attribution-correction.ts`) re-points
-the items, sets `member_id_locked`, and fires `reconcileAttribution` / `bustTeamLearningCaches`
-(`lib/ingest/reconcile-attribution.ts`) to stale `arc_cache` and bust `work_timeline_cache`
-immediately. V2 must preserve both halves, not rebuild them: (a) derived artifacts keep resolving
-attribution live — per-project graphs never embed resolved attribution metadata in episodes, so a
-correction requires no re-projection; (b) when these caches gain the project/visibility axis above,
-`bustTeamLearningCaches` **fans out to every partition containing a corrected item** — a team-global
-bust that misses per-project rows would leave stale attribution serving in exactly the surfaces this
-spec multiplies. Guard: a data-mechanics test corrects an item tagged into two projects and asserts
-both projects' arc/timeline caches were staled.
+**Attribution corrections across partitioned caches — reuse what is built, described precisely.**
+The attribution cascade already exists. Its actual mechanics (verified; the round-3 Codex review
+caught an earlier looser description): attribution is resolved live **at compute time** — arc
+synthesis and the timeline resolve credit from the live `item_versions` work ledger + `items`
+(`resolveItemCredit`, `lib/attribution/contributor-credit.ts`) — and the resolved result **is then
+baked into the cached payload** (`arc_cache.arcs` is "fully-attributed" JSON;
+`work_timeline_cache.payload` is "already attributed + grouped" — `postgres/schema.sql` comments).
+Correctness therefore comes from **invalidation, not from cache-time re-resolution**: an admin
+correction (`applyAttributionCorrection`, `lib/ingest/attribution-correction.ts`) re-points the
+items and sets `member_id_locked`, and its server action fires `bustTeamLearningCaches`
+(`lib/ingest/reconcile-attribution.ts`) post-response — deliberately NOT `reconcileAttribution`,
+which would fight the lock; identity-mapping edits fire the full `reconcileAttribution`. Both
+readers serve stale-while-revalidate, so the consistency bound is "stale attributed payload until
+the background recompute lands," not "immediate." V2 must preserve this shape, not rebuild it:
+(a) per-project graphs never embed resolved attribution metadata in episodes, so a correction
+requires no re-projection; (b) when these caches gain the project/visibility axis above,
+`bustTeamLearningCaches` **fans out to every partition containing a corrected item** — a
+team-global bust that misses per-project rows would leave stale attribution serving in exactly the
+surfaces this spec multiplies; (c) SWR staleness stays acceptable for corrections (they are rare,
+admin-initiated, and self-healing on recompute) — a ruling, not an accident. Guard: a
+data-mechanics test corrects an item tagged into two projects and asserts both projects'
+arc/timeline cache rows were staled and the recomputed payloads carry the corrected member.
 
 ### 5.8b Structured context legs — every leg named, none assumed
 
@@ -667,19 +717,26 @@ Required changes:
    authored by people who are not (and should never be) principals: clients, collaborators, past
    contributors. Today they resolve to `member_id = null` and vanish from attribution surfaces —
    their items render as author-less connector aggregates in arcs and never surface in the
-   per-person timeline. V2 makes them first-class **actors** using the precedent this repo already
-   has (`members.is_connector` — a member row valid for attribution, excluded from human surfaces):
-   an off-roster human is a member row flagged `is_offroster` (no auth, no API keys), which
-   - **is excluded from Everyone's auto-membership by definition** (`lib/access/groups.ts` filters
-     it exactly as it filters connectors) — without this exclusion, adding an external author for
-     attribution correctness would silently grant them the team corpus, the exact external-tier
-     inversion round 2 caught and closed in §11;
+   per-person timeline. V2 makes them first-class **actors**: a member row with `kind='offroster'`
+   (§4 DDL; no auth, no API keys). The *structural* precedent is `members.is_connector` — a member
+   row that participates in some machinery while excluded from others — but the semantics are
+   **deliberately opposite on the attribution side**: connectors are excluded from human-attribution
+   surfaces and connector ownership is treated as never-good attribution (`lib/ingest/reattribute.ts`
+   clears it; `lib/graph/human-actors.ts` filters `is_connector`), whereas off-roster rows are
+   **included** there — `resolveHumanActorsByItem`, arc participants, timeline, and credit must all
+   admit `kind='offroster'` while continuing to exclude connectors, and each reader that filters
+   `is_connector` today must make that distinction explicitly (enumerated at build time; guard test
+   per surface). On the access side the two are identical: an off-roster row
+   - **fails `isPrincipalEligible` (§4)** — the groups single writer refuses to create a membership
+     for it (Everyone, External, ordinary, or singleton), the oracle's `visibleProjects` resolves ∅
+     regardless of any row that might sneak in, and logins/keys/tokens cannot be issued for it
+     (guard + leak-suite row, §14). Without this, adding an external author for attribution
+     correctness would silently grant them the team corpus, the exact external-tier inversion
+     round 2 caught and closed in §11;
    - resolves normally in the identity map (`lib/identity/resolve.ts` email/handle/provider-id
      lanes), so their items get correct `member_id`, timelines, and arc participation;
-   - contributes **nothing** to principal resolution: the oracle's `visibleProjects` for an
-     `is_offroster` row is the empty set, keys/tokens cannot be minted for it, and a login for it
-     cannot exist (guard + leak-suite row, §14). Promoting one to a real principal is an explicit
-     admin action (clear the flag, invite), never a side effect of attribution.
+   - is promoted to a real principal only by an explicit admin action (set `kind='human'`, invite),
+     never as a side effect of attribution.
 
 ## 9. RLS — the backstop and its pooling trap
 
@@ -739,9 +796,15 @@ list) with a stated budget (+15% p95 ceiling) before RLS graduates from staging 
   (member_id, nullable = self), project_scope uuid[] (attenuation set), expires_at, revoked_at,
   created_by, last_used_at`, hashed secret, audited on mint/use/revoke.
 - **Attenuation, never expansion, enforced at the token layer:**
-  `effective = visibleProjects(on_behalf_of ?? member) ∩ project_scope` — computed in
-  `lib/api/auth.ts` where the Bearer key already resolves (`auth.ts:40`), so every route and the
-  oracle see only the attenuated set. A token whose `project_scope` names a project its principal
+  `effective = visibleProjects(member) ∩ visibleProjects(on_behalf_of ?? member) ∩ project_scope`
+  — computed in `lib/api/auth.ts` where the Bearer key already resolves (`auth.ts:40`), so every
+  route and the oracle see only the attenuated set. The **launcher's own visibility always
+  intersects**: the Codex round-3 review caught that the earlier formula
+  (`visibleProjects(on_behalf_of ?? member)` alone) let a mixed credential — an agent
+  `member_id` carrying a human `on_behalf_of` — ignore the agent's own (smaller) visibility and
+  ride the human's; under the triple intersection a delegate can never see more than BOTH the
+  launcher and the represented principal, so the mixed case is harmless by construction rather
+  than forbidden by a writer check. A token whose `project_scope` names a project its principal
   cannot see contributes nothing (intersection, not union) — expansion is structurally impossible,
   not policy-forbidden.
 - **Agents never read out-of-scope content — no summaries, no gist:** agent context assembly draws
@@ -770,8 +833,10 @@ agents with zero additional code. Rules that make this safe rather than convenie
    audited admin add. A new agent sees nothing until someone puts it somewhere.
 2. **Agent keys resolve to the agent principal** — an autonomous agent authenticates as itself
    (`api_keys` bound to the agent member row), and any token it mints attenuates *its own*
-   visibility by the intersection rule above. Delegation (`on_behalf_of` a human) and standing
-   identity (its own groups) are the only two modes; an agent cannot hold both in one credential.
+   visibility by the triple intersection above. Delegation (`on_behalf_of` a human) and standing
+   identity (its own groups) are the two modes, and a credential mixing them is **harmless by
+   construction**: the launcher's visibility always intersects, so an agent token naming a human
+   `on_behalf_of` still can't exceed the agent's own groups.
 3. **Attribution composes:** work an agent performs is attributed to the agent member row
    (`items.member_id`), so arcs/timeline show it honestly (the §5.1 agent-name attribution
    machinery then tags the responsible human where one exists via `on_behalf_of` provenance).
@@ -783,12 +848,17 @@ agents with zero additional code. Rules that make this safe rather than convenie
 
 Ruling and its direction, argued:
 
-1. **Built-ins:** per team, migration creates group `everyone` (**active HUMAN members with
-   `tier='team'` ONLY, excluding connector, `kind='agent'` (§10), and `is_offroster` (§8.6) rows** — an
+1. **Built-ins:** per team, migration creates group `everyone` (**active members with
+   `kind='human'`, not `is_connector`, and `tier='team'` ONLY** — an
    external-tier member in Everyone would see General, i.e. the whole team corpus, inverting
    today's isolation; a caught Critical, stated as the normative membership
    rule, maintained by the groups single writer on member activation AND tier change), group
-   `external` (members with `tier='external'`), project `general` (kind `system`), project
+   `external` (**the same eligibility rule with `tier='external'`** — agents, connectors, and
+   off-roster rows are excluded from BOTH built-ins; round 3's Codex review caught that excluding
+   them from Everyone alone left External as an automatic grant path, so an external-tier agent
+   would have seen `external-shared` with no explicit placement. An agent that needs
+   external-shared access gets it by explicit audited group grant, never auto-membership), project
+   `general` (kind `system`), project
    `external-shared` (kind `system`); `project_groups`: general↔everyone, external-shared↔external
    **and** external-shared↔everyone (external content is team-visible today — verified:
    `visibleItems` lets team-tier read external rows, not vice versa).
@@ -811,7 +881,8 @@ Ruling and its direction, argued:
    partitions by pointer, not by rewrite. New projects mint `g_<teamId>_p_<projectId>` ids; the
    scheme therefore has exactly two grandfathered exceptions per team, stored not inferred. Nothing
    is re-extracted during migration — cost ≈ 0.
-5. **Ordering:** three additive migrations (groups/edges, identity columns, agent_tokens) appended
+5. **Ordering:** four additive migrations (groups/edges incl. `person_member_id`, `members.kind`
+   with its default-`'human'` backfill, identity columns, agent_tokens) appended
    after the current 55, plus the backfill job; replay-tested from zero AND from a populated
    pre-V2 database per the schema-phase gates (the #251/#495 replay lessons are the reason this is
    stated).
@@ -860,9 +931,11 @@ through the *outcome*, not the code path:
 | RLS backstop | datamechanics | deliberate data-layer misuse (no principal context) returns zero rows — the app-bypass test |
 | MCP / agent context | http | tool responses for an attenuated token contain no out-of-scope item ids |
 | Authorship ≠ access | datamechanics | an item authored by A, tagged only into a project A cannot see, is invisible to A — authoring confers nothing (§5.1) |
-| Off-roster actor | datamechanics | an `is_offroster` member row resolves to zero visible projects, appears in no Everyone membership, and cannot be a token principal — while its items carry correct attribution (§8.6) |
-| Learner boundary | unit + datamechanics | a rule proposal cannot express a membership/group edge (schema-level), and no learner code path writes `group_members`/`project_groups` (write-policy guard, §Part II learning) |
-| Agent principal | datamechanics | an agent member in group G sees exactly G's projects; a fresh agent in no groups sees nothing; no agent row ever appears in Everyone (§10) |
+| Off-roster actor | datamechanics | a `kind='offroster'` member row resolves to zero visible projects even when a membership row is planted for it (read-side eligibility), the writer refuses to create one (write-side), it appears in no built-in membership, and no key/token can be issued for it — while its items carry correct attribution (§8.6) |
+| Learner boundary | unit (write-policy guard) + datamechanics (outcome) | a rule proposal cannot express a membership/group edge (schema-level), no learner code path writes `group_members`/`project_groups`, and after a learner run the edge tables are byte-identical (§Part II learning) |
+| Agent principal | datamechanics | an agent member in group G sees exactly G's projects; a fresh agent in no groups sees nothing; no agent row ever appears in Everyone OR External (§10, §11) |
+| Mixed agent token | http | a token minted by an agent with a human `on_behalf_of` reads only the triple intersection — planted content visible to the human but not the agent never reaches it (§10) |
+| Singleton integrity | datamechanics | a singleton group cannot gain a second member, hold a membership row for a different member, be set on a built-in, or reference another team's member (each rejected at write; composite FK + checks §4); group-picker queries exclude it |
 
 Probing tests are explicitly adversarial: timing-insensitive, but shape-sensitive (result counts,
 empty-page shapes, citation numbering gaps) — the places post-filtering leaks.
@@ -1046,7 +1119,7 @@ either traced or *knowingly* untraced. The audit of what exists today (verified 
 
 | Mutation class | Trace today |
 |---|---|
-| Attribution correction / auto re-attribution | `audit_log` (`attribution.corrected` + per-item `item.reassigned` stream; auto/heal legs best-effort) |
+| Attribution correction (manual) | `audit_log` (`attribution.corrected` + per-item `item.reassigned` stream via `lib/ingest/reassignment-log.ts`) |
 | Item edits / connector re-syncs | `item_versions` — full history with author + time; `forget-bodies` keeps the ledger, drops prose |
 | Meeting duplicate merge | `meeting_notes.merged_into` tombstone; the replaced item retired, not deleted |
 | Source removal / purge (`lib/ingest/purge`) | records **what** it deleted before deleting ("deleted nothing" vs "couldn't record" are distinguishable); content itself is gone |
@@ -1068,6 +1141,17 @@ Two gaps, each with a ruling rather than a hope:
    by design (workspace-canonical); brain-side row versioning would duplicate it. Revisit only if
    tasks become brain-native-first. Context-unit *membership* changes on those rows are traced
    regardless (`project_context_events`), so access decisions never depend on the untraced part.
+
+3. **Automatic re-attribution is per-item untraced** — `reattributeItems`
+   (`lib/ingest/reattribute.ts`) re-points `items.member_id` / `item_versions.member_id` from
+   changed identity mappings with no per-item audit or reassignment-log write (verified; the
+   round-3 Codex review caught the matrix previously calling this "best-effort traced").
+   **Ruling: accepted for V2, with the cause traced instead of the effect.** The *mapping change*
+   that triggers the batch is always audited (§8.1 — every binding create/update/delete audits),
+   the batch is conservative (only re-points to a positively-resolved member, skips locked rows)
+   and idempotently re-derivable from the audited mappings, so the per-item stream would add volume
+   without adding answerable questions. If per-item history is ever needed, the hook point is one
+   function; the gap is named here so nobody mistakes it for coverage.
 
 New mutation surfaces this spec introduces (memberships, rules, segments, group/project edges) are
 all traced by construction: `project_context_events`, rule versions, segmentation generations, and
@@ -1735,8 +1819,10 @@ two different proposals, and only one may be automated:
 **Verification (tiered per CLAUDE.md §4):** unit — a fixture feedback stream yields a proposal with
 correct precision/coverage; contradicting feedback decays health past the threshold and flags
 review, and asserts the rule was NOT disabled; `frozen` produces zero new proposals while the same
-stream still records feedback rows. datamechanics — the learner-boundary write-policy guard (§14
-leak-suite row); an enabled inferred rule's decisions settle only non-widening outcomes. The decay
+stream still records feedback rows; the learner-boundary **write-policy guard** (no learner module
+imports/writes the edge tables — guards live in the unit tier). data-mechanics — the outcome half
+of the boundary (§14 leak-suite row: edge tables byte-identical across a learner run); an enabled
+inferred rule's decisions settle only non-widening outcomes. The decay
 threshold and window are named constants in one module, deliberately (the arc-continuity precedent:
 tunable without archaeology).
 
@@ -2033,18 +2119,23 @@ correction rate and bounded cost.
 
 ## Acceptance criteria
 
-Each criterion names the tier that proves it (CLAUDE.md §4 tiers: unit = `npm test`,
-datamechanics = `npm run db:test:up && npm run test:datamechanics`, http = `npm run test:http`);
-"proven by" means a red test exists before the behavior ships and the suite exits 0 after.
+Each criterion names the tier that proves it, using CLAUDE.md §4's canonical tiers: **unit** =
+`npm test` (incl. all drift/contract/write-policy guards), **data-mechanics** =
+`npm run db:test:up && npm run test:datamechanics` (real Postgres; the vector and Neo4j compose
+variants are separate opt-in commands in `package.json` and are named explicitly where a criterion
+needs them), **integration** = `npm run test:http` + `bash scripts/e2e.sh`, **eval** = model
+judgment (not built). "Proven by" means a red test exists before the behavior ships and the suite
+exits 0 after. Below, "datamechanics" = the data-mechanics tier and "http" = the integration tier's
+HTTP suite.
 
 - A user can create or promote an initiative without changing existing connector project ownership — datamechanics test: `items.project_id` byte-identical before/after promotion.
-- A whole item can be included in multiple initiatives, moved, excluded, and returned to automatic; every state is audited and survives source re-sync AND the duplicate-meeting merge re-point — datamechanics test: state-machine walk asserting `project_context_events` rows per transition, then re-sync + merge fixtures asserting memberships (and attribution, invariant 9) unchanged.
+- A whole item can be included in multiple initiatives, moved, excluded, and returned to automatic; every state is audited and survives source re-sync AND the duplicate-meeting merge re-point — datamechanics test: state-machine walk asserting `project_context_events` rows per transition, then re-sync + merge fixtures asserting memberships transfer per the merge contract and that **context reconciliation itself never mutates attribution** (invariant 9; the merge-owned item's own attribution follows the existing `lib/meetings/merge.ts` contract — primary/new submitter or fallback — and the retired item's `item_versions` ledger is preserved, asserted separately rather than pretending attribution is byte-identical across a merge).
 - Automatic runs never overwrite a manual force decision — datamechanics test: a classifier run over a forced pair is a no-op (invariant 3 guard).
-- Enabled rules classify future matching units, expose exact provenance, and can be previewed before a bounded historical backfill — unit test: evaluator provenance snapshot; http test: the preview endpoint returns counts without writes.
+- Enabled rules classify future matching units, expose exact provenance, and can be previewed before a bounded historical backfill — unit test: evaluator provenance snapshot; datamechanics test: enable a rule → ingest a future matching unit → its persisted membership carries the exact rule/version provenance; http test: the preview endpoint returns counts without writes.
 - Ambiguous automatic results enter a review queue; low-confidence results do not pollute context — datamechanics test: a below-threshold suggestion produces no effective membership.
-- A meeting is split into source-grounded topic segments that can belong to different initiatives; users can split/merge/relabel without losing unambiguous manual assignments — datamechanics test: segmentation-generation walk with offset-slice validation (never model-trusted text).
+- A meeting is split into source-grounded topic segments that can belong to different initiatives; users can split/merge/relabel without losing unambiguous manual assignments — datamechanics test: segmentation-generation walk with offset-slice validation (never model-trusted text), then a split/merge/relabel sequence asserting persisted manual memberships transfer to the unambiguous successor segments and ambiguity lands in the review queue.
 - Project timeline and project-scoped retrieval use effective memberships rather than `items.project_id` and return only selected meeting segment text — http test: retrieval fixture returns segment text only; leak-suite §14 rows cover the negative half.
-- Source access narrowing and deletion remove project context with the same fail-closed guarantees as existing item/task/graph paths — datamechanics test: purge fixture asserts units/memberships/suggestions/embeddings gone AND the removed content's absence from retrieval (the criterion's inverse, stated deliberately).
+- Source access narrowing and deletion remove project context with the same fail-closed guarantees as existing item/task/graph paths — datamechanics test: purge fixture asserts units/memberships/suggestions/embeddings gone AND the removed content's absence from retrieval (the criterion's inverse, stated deliberately); the GRAPH half needs the Neo4j compose variant: inspect that the episodes/facts are actually removed from the partition, not merely filtered out of a query.
 - Classification skips unchanged inputs, uses deterministic/rule/embedding stages before LLM, batches paid calls, meters cost, and records honest failures — unit test: fingerprint skip + stage ordering; datamechanics test: `llm_usage` rows per paid batch and `ingest_runs` recording `ok=false` on model failure.
 - Existing ingest, tasks, decisions, meetings, team timeline, ingestion-project retrieval, and Brain API contracts remain compatible throughout staged rollout — http tier + `bash scripts/e2e.sh` green at every phase gate (§17), unchanged from today's contract suite.
 
