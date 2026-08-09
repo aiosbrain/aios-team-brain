@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
-import { db, seedTeam, type Seed } from "./helpers";
+import { db, ingest, seedTeam, type Seed } from "./helpers";
 import {
   EXTERNAL_SHARED_SLUG,
   GENERAL_SLUG,
@@ -75,11 +75,25 @@ describe("ensureAccessBootstrap (§11)", () => {
     // principals must not see General.
     expect(edges.has(`${general.id}:${external.id}`)).toBe(false);
 
+    const grantAudits = async () => {
+      const { data } = await db()
+        .from("audit_log")
+        .select("id")
+        .eq("team_id", seed.teamId)
+        .eq("action", "access.project_granted");
+      return (data ?? []).length;
+    };
+    const auditsAfterFirst = await grantAudits();
+    expect(auditsAfterFirst).toBe(3);
+
     const r2 = await ensureAccessBootstrap(db(), seed.teamId);
     expect(r2.ok).toBe(true);
     const t2 = await topology(seed);
     expect(t2.projects.map((p) => p.id).sort()).toEqual(t1.projects.map((p) => p.id).sort());
     expect(t2.grants.length).toBe(3);
+    // Audit-on-creation only (Fable High): a converged re-run mints ZERO new grant audits —
+    // at tick cadence an unconditional audit was 3 rows/team/run forever, drowning the trail.
+    expect(await grantAudits(), "re-run must not mint new grant audit rows").toBe(auditsAfterFirst);
   });
 
   it("§11 day-one shape via the oracle: team human sees both; external human sees external-shared ONLY", async () => {
@@ -133,6 +147,50 @@ describe("ensureAccessBootstrap (§11)", () => {
     // teams from OTHER concurrent tests may legitimately fail (e.g. planted squatters);
     // ours must not be among the failures.
     expect(r.failed.map((f) => f.teamId)).not.toContain(seedA.teamId);
+  });
+
+  it("ingesting into 'general' AFTER bootstrap lands in the SYSTEM row — same id, kind stays system (Fable M7)", async () => {
+    const seed = await seedTeam();
+    await ensureAccessBootstrap(db(), seed.teamId);
+    const { data: before } = await db()
+      .from("projects")
+      .select("id")
+      .eq("team_id", seed.teamId)
+      .eq("slug", GENERAL_SLUG)
+      .single();
+
+    await ingest(seed, { project: GENERAL_SLUG, path: "g/pushed.md", body: "pushed into general", access: "team" });
+
+    const { data: after } = await db()
+      .from("projects")
+      .select("id, kind")
+      .eq("team_id", seed.teamId)
+      .eq("slug", GENERAL_SLUG);
+    expect((after ?? []).length, "ingest must reuse the system row, never duplicate").toBe(1);
+    expect(after![0].id).toBe(before!.id);
+    expect(after![0].kind, "an ingest sync must never demote the system project").toBe("system");
+    const { data: item } = await db()
+      .from("items")
+      .select("project_id")
+      .eq("team_id", seed.teamId)
+      .eq("path", "g/pushed.md")
+      .single();
+    expect(item!.project_id).toBe(before!.id);
+  });
+
+  it("refuses to adopt a non-source project squatting a system slug (Fable M2)", async () => {
+    const seed = await seedTeam();
+    // Plant a future-kind row directly (dashboard initiative creation arrives with Part II).
+    await db().from("projects").insert({ team_id: seed.teamId, slug: GENERAL_SLUG, name: "curated", kind: "initiative" });
+    const r = await ensureAccessBootstrap(db(), seed.teamId);
+    expect(r.ok, "adopting an initiative would be an ACL rewrite — must refuse").toBe(false);
+    const { data: row } = await db()
+      .from("projects")
+      .select("kind")
+      .eq("team_id", seed.teamId)
+      .eq("slug", GENERAL_SLUG)
+      .single();
+    expect(row!.kind).toBe("initiative");
   });
 
   it("schema: an invalid projects.kind is rejected (named CHECK exists and constrains)", async () => {

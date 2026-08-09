@@ -29,7 +29,8 @@ type ProjectRow = { id: string; kind: string };
 
 /**
  * Get-or-create a system project. An EXISTING row under the slug (an ingestion-created
- * 'general' is common — `aios push` payloads default to it) is ADOPTED: kind flips to
+ * 'general' is common in practice; the payload schema requires `project`, so any default
+ * lives in the pushing CLI, not this repo) is ADOPTED: kind flips to
  * 'system', loudly audited. This is the §11 fail-open-to-today ruling, deliberately the
  * opposite of the groups reserved-slug refusal: adopting a source project named `general`
  * changes no one's visibility (its items are team content, already team-visible, and the
@@ -50,6 +51,15 @@ async function ensureSystemProject(
   const row = existing as ProjectRow | null;
   if (row) {
     if (row.kind !== "system") {
+      // Adopt ONLY ingestion containers. A source project has no restriction semantics (its
+      // items' visibility lives on items.access, already team-visible), so adoption is
+      // visibility-neutral — that is which way §11's fail-open ruling cuts. An INITIATIVE is
+      // grant-scoped under Part II: adopting one and granting everyone-visibility would be
+      // exactly the ACL rewrite the groups reserved-slug refusal exists to prevent (slice-3
+      // Fable Medium — written now, while the ruling's author is in the file).
+      if (row.kind !== "source") {
+        return { ok: false, error: `a kind='${row.kind}' project holds reserved slug '${slug}' — refusing to adopt it` };
+      }
       const { error } = await db.from("projects").update({ kind: "system" }).eq("id", row.id).eq("team_id", teamId);
       if (error) return { ok: false, error: error.message };
       await audit(db, {
@@ -124,7 +134,10 @@ export async function ensureAccessBootstrap(db: DbClient, teamId: string): Promi
 export async function ensureAccessBootstrapAllTeams(
   db: DbClient
 ): Promise<{ teams: number; failed: { teamId: string; error: string }[] }> {
-  const { data: teams } = await db.from("teams").select("id");
+  const { data: teams, error: tErr } = await db.from("teams").select("id");
+  // A failed teams read must NOT report a green run — an instance whose read persistently
+  // fails would otherwise show a healthy access_bootstrap leg while converging nothing.
+  if (tErr) return { teams: 0, failed: [{ teamId: "*", error: `teams read failed: ${tErr.message}` }] };
   const failed: { teamId: string; error: string }[] = [];
   for (const t of (teams ?? []) as { id: string }[]) {
     try {

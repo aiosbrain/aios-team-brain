@@ -91,7 +91,8 @@ export async function createMember(
   // never eligible) → converge the built-ins now (spec §11). Best-effort; tick is backstop.
   try {
     const { syncBuiltinMembership } = await import("@/lib/access/groups");
-    await syncBuiltinMembership(admin, teamId);
+    const sync = await syncBuiltinMembership(admin, teamId);
+    if (!sync.ok) console.warn(`[access] builtin sync after member create failed: ${sync.error}`);
   } catch {
     // access maintenance must never fail member creation
   }
@@ -300,7 +301,8 @@ export async function deleteMember(
   // now, not at the next tick (spec §11). Best-effort.
   try {
     const { syncBuiltinMembership } = await import("@/lib/access/groups");
-    await syncBuiltinMembership(admin, teamId);
+    const sync = await syncBuiltinMembership(admin, teamId);
+    if (!sync.ok) console.warn(`[access] builtin sync after member removal failed: ${sync.error}`);
   } catch {
     // access maintenance must never fail member removal
   }
