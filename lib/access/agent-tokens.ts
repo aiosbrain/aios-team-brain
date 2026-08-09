@@ -111,7 +111,7 @@ export async function mintAgentToken(
     actor_kind: "member",
     member_id: actorMemberId,
     action: "access.token_minted",
-    target_type: "agent_tokens",
+    target_type: "agent_token",
     target_id: data.id,
     // Never the secret. Scope + legs are the security-relevant provenance.
     meta: {
@@ -153,13 +153,21 @@ export async function verifyAgentToken(
 
   const launcher = await getMember(db, row.team_id, row.member_id);
   if (!launcher || !isPrincipal(launcher)) return null;
-  // Phase A: no external-tier delegation (re-checked live — a downgrade kills the token).
-  if (launcher.tier === "external") return null;
+  let repTier: "team" | "external" | null = null;
   if (row.on_behalf_of) {
     const rep = await getMember(db, row.team_id, row.on_behalf_of);
     if (!rep || !isPrincipal(rep)) return null;
-    if (rep.tier === "external") return null;
+    repTier = rep.tier;
   }
+  // Strictest tier from THIS function's own leg reads — never hardcoded (slice-2 Codex High):
+  // computed BEFORE the Phase A refusal so the value stays live code, keeping the route's
+  // isRestrictedTier filter as real defense in depth and surviving Phase B relaxing the
+  // refusal without a silent hole.
+  const effectiveTier: "team" | "external" =
+    launcher.tier === "external" || repTier === "external" ? "external" : "team";
+  // Phase A alpha restriction: no external-tier delegation on either leg (re-checked live —
+  // a tier downgrade after mint kills the token on the next request).
+  if (effectiveTier === "external") return null;
 
   return {
     tokenRowId: row.id,
@@ -167,9 +175,7 @@ export async function verifyAgentToken(
     memberId: row.member_id,
     onBehalfOf: row.on_behalf_of,
     projectScope: row.project_scope,
-    // Both legs are team-tier by the Phase A refusals above; when Phase B admits external
-    // delegation this becomes strictest-of-both-legs again.
-    effectiveTier: "team",
+    effectiveTier,
   };
 }
 
@@ -185,17 +191,28 @@ export async function revokeAgentToken(
     .update({ revoked_at: new Date().toISOString() })
     .eq("team_id", teamId)
     .eq("id", tokenRowId)
+    .is("revoked_at", null)
     .select("id");
   if (error) return { ok: false, error: error.message };
-  // A zero-row update is "no such token in this team" — never audit a revocation that did
-  // not happen (review M3: the audit log must not claim phantom revocations).
-  if (!data || (data as unknown[]).length === 0) return { ok: false, error: "no such token" };
+  if (!data || (data as unknown[]).length === 0) {
+    // Zero rows: either already revoked (idempotent success — keep the ORIGINAL revoked_at
+    // and never write a second audit row) or no such token (an error, and never audited —
+    // the audit log must not claim phantom revocations).
+    const { data: existing } = await db
+      .from("agent_tokens")
+      .select("revoked_at")
+      .eq("team_id", teamId)
+      .eq("id", tokenRowId)
+      .maybeSingle();
+    if ((existing as { revoked_at: string | null } | null)?.revoked_at) return { ok: true };
+    return { ok: false, error: "no such token" };
+  }
   await audit(db, {
     team_id: teamId,
     actor_kind: "member",
     member_id: actorMemberId,
     action: "access.token_revoked",
-    target_type: "agent_tokens",
+    target_type: "agent_token",
     target_id: tokenRowId,
   });
   return { ok: true };

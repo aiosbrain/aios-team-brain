@@ -22,8 +22,14 @@
  *        reads; contract alignment only, with no runtime or wire-shape change (AIO-718).
  * 1.17 — accepts codebase_health v2 with epistemic state, repository capability profile,
  *        fail-closed maintenance admission, and a redacted normalized finding ledger (AIO-610).
+ * 1.18 — ADDITIVE: delegated agent tokens (`aiosd_<token_id>_<secret>`, spec §10 / PCCA-2).
+ *        Phase A surface: GET /api/v1/items accepts them (oracle-filtered to the token's
+ *        effective project set); POST /api/v1/query answers 403 `delegation_not_supported`;
+ *        every other route rejects the prefix (401). Existing `aios_*` member keys are
+ *        byte-for-byte unchanged — an old server rejects the unknown prefix with today's
+ *        401, so no version negotiation is required.
  */
-export const BRAIN_API_VERSION = "1.17";
+export const BRAIN_API_VERSION = "1.18";
 
 /** Server-only Executor gateway negotiation; independent of the member API surface. */
 export const GATEWAY_CONTRACT_VERSION = "1.10";

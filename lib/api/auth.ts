@@ -75,6 +75,19 @@ export async function authenticateAgentToken(req: Request): Promise<AgentApiAuth
     }
   }
   void markAgentTokenUsed(db, principal.tokenRowId);
+  // §10: tokens audit on mint/USE/revoke. Best-effort like every audit; the actor is the
+  // launching member (audit_log.api_key_id is the api_keys namespace, not agent_tokens).
+  // If polling volume ever makes this noisy, sample/coalesce here — never silently drop.
+  void audit(db, {
+    team_id: principal.teamId,
+    actor_kind: "member",
+    member_id: principal.memberId,
+    action: "access.token_used",
+    target_type: "agent_token",
+    target_id: principal.tokenRowId,
+    meta: { on_behalf_of: principal.onBehalfOf, scoped: principal.projectScope != null },
+    ip,
+  });
   return {
     kind: "agent",
     teamId: principal.teamId,
