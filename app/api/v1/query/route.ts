@@ -1,6 +1,6 @@
 import { NextRequest } from "next/server";
 import { adminClient } from "@/lib/db/admin";
-import { authenticateApiKey } from "@/lib/api/auth";
+import { authenticateApiKey, isAgentBearer } from "@/lib/api/auth";
 import { rateLimit } from "@/lib/api/rate-limit";
 import { querySchema, errorResponse } from "@/lib/api/schemas";
 import { formatSseFrame } from "@/lib/api/sse";
@@ -24,6 +24,13 @@ const DAILY_QUERIES_PER_MEMBER = 20;
 const DAILY_TEAM_BUDGET_USD = 10;
 
 export async function POST(req: NextRequest) {
+  // Phase A alpha restriction (spec §10/§17-A): `query` refuses EVERY delegated token —
+  // any `aiosd_*` credential, spawn-default self-tokens included — until Phase B lands
+  // enforced retrieval. Honoring a token this path cannot attenuate would be enforcement
+  // by decree. Explicit 403 (not 401): the credential may be valid; the operation isn't.
+  if (isAgentBearer(req)) {
+    return errorResponse("delegation_not_supported", "delegated tokens cannot query until enforced retrieval lands (Phase B)", 403);
+  }
   const auth = await authenticateApiKey(req);
   if (!auth) return errorResponse("unauthorized", "invalid API key or team", 401);
 
