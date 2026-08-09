@@ -392,7 +392,8 @@ non-eligible members except `kind='agent'` API keys (§10).
 ```
 visibleProjects(principal) =
   eligible(principal) ? { p | ∃ g : (principal.member ∈ g) ∧ ((p,g) ∈ project_groups) } : ∅
-  ∩ attenuation(principal)            -- token project-scope, §10; identity fail-closed, §8
+  ∩ (project_scope ?? U)   -- token attenuation, §10; NULL scope = universe (deliberately the
+                           -- spec's ONE fail-open NULL — everywhere else NULL fails closed)
 canSee(principal, unit) =
   ∃ m current effective include membership of unit into some p ∈ visibleProjects(principal)
 ```
@@ -503,8 +504,14 @@ single writer, not in each classifier.
 
 Every cache keyed today by team or tier gets a project/visibility axis or dies:
 `arc_cache.group_key` (already tier-scoped) becomes per-project (§6); `work_timeline_cache` gains a
-visibility variant keyed by **sorted visible-project-set hash** (bounded by distinct group
-combinations, not by principal count — 2 people with identical groups share a cache row);
+visibility variant keyed by **sorted POST-ATTENUATION effective-visibility-set hash** (the round-3
+Fable review caught the ambiguity: a group-set key would serve an attenuated token its spawner's
+full-visibility row — a leak; the effective-set key is also what makes spawn inheritance live in
+cached surfaces, since a spawner's group change changes the hash). The cardinality bound "distinct
+group combinations, not principal count — 2 people with identical groups share a cache row" holds
+for **member** reads; **token-authenticated reads do not populate these shared caches** (computed
+per request) until a measured need says otherwise, so launch-time `project_scope` variety cannot
+explode the key space;
 `item_chunks` DOES carry a mirrored `access` column today (`postgres/optional/pgvector.sql:22` —
 kept so dense hits tier-filter in the same app-code path as FTS); under V2 that mirror is a legacy
 index hint like unit `audience` (§20.1), the query-time filter is the oracle join, and the Phase B
@@ -714,8 +721,9 @@ Required changes:
    the first surface that will consume them (a Slack-initiated agent claiming "asking as @chetan"):
    that claim resolves through `deterministic`/`confirmed` bindings or not at all.
 5. **Unbinding cascades** are read-time: access is recomputed per request from live bindings via the
-   oracle, so revoking a binding takes effect on the next request with no cache to chase (caches key
-   on group-set, which changes when membership does — §5.8).
+   oracle, so revoking a binding takes effect on the next request with no cache to chase (caches
+   key on the post-attenuation effective visibility set, which changes when membership does —
+   §5.8).
 6. **Actors vs principals — off-roster humans get attribution without access.** Content is routinely
    authored by people who are not (and should never be) principals: clients, collaborators, past
    contributors. Today they resolve to `member_id = null` and vanish from attribution surfaces —
@@ -749,7 +757,14 @@ Design (defence-in-depth under the oracle, not a replacement):
   `npm run pg:schema` / migrations run as the owner role. Today the app uses a single privileged
   connection (`lib/db/pg/pool.ts`) — this split is the enabling migration.
 - **Session mechanism:** every request executes inside a transaction that first runs
-  `select set_config('aios.team_id', $1, true), set_config('aios.member_id', $2, true)` —
+  `select set_config('aios.team_id', $1, true), set_config('aios.member_id', $2, true),
+  set_config('aios.project_scope', $3, true)` — the third variable carries a token's attenuation
+  set (NULL/absent = unattenuated member or spawn-default token), and policies intersect it where
+  present, so **token attenuation gets the same DB backstop as principal identity** (the round-3
+  Fable review caught that without this, attenuation was app-layer-only for exactly the agent
+  surface §2 calls out as the retired accepted-risk). Until the Phase B policies land, that is the
+  explicit interim state: Phase A token attenuation has no DB backstop — accepted, named, and
+  guarded by the §14 http rows. Note
   `set_config(..., true)` is **transaction-local** (`SET LOCAL` semantics), which is the entire
   answer to the pooling trap: pool checkout order cannot leak one principal into another because the
   variables die at COMMIT/ROLLBACK. Session-level `SET` is forbidden by a guard grep. `runSql` and
@@ -800,8 +815,16 @@ list) with a stated budget (+15% p95 ceiling) before RLS graduates from staging 
   i.e. inherit the principal's full live visibility — the spawn default below; empty array = sees
   nothing** — the two must never be conflated), expires_at, revoked_at,
   created_by, last_used_at`, hashed secret, audited on mint/use/revoke.
+  **Terminology, fixed once:** a **delegated token** is ANY `aiosd_*` credential, regardless of
+  whether `on_behalf_of` is set — every restriction in this spec phrased over "delegated tokens"
+  (most importantly Phase A's `query` refusal, §17) applies to spawn-default self-tokens too.
+  **Acting-as** names the `on_behalf_of`-set mode specifically. (The round-3 Fable review caught
+  these being conflated: under a mode-based reading, a spawn-default token — the majority
+  credential after the spawn default below — would have slipped past the Phase A `query` refusal
+  into a path that cannot attenuate.)
 - **Attenuation, never expansion, enforced at the token layer:**
-  `effective = visibleProjects(member) ∩ visibleProjects(on_behalf_of ?? member) ∩ project_scope`
+  `effective = visibleProjects(member) ∩ visibleProjects(on_behalf_of ?? member) ∩ (project_scope ?? U)`
+  (`NULL` scope = universe = no attenuation, the spawn default; `'{}'` = ∅ = sees nothing)
   — computed in `lib/api/auth.ts` where the Bearer key already resolves (`auth.ts:40`), so every
   route and the oracle see only the attenuated set. The **launcher's own visibility always
   intersects**: the Codex round-3 review caught that the earlier formula
@@ -821,7 +844,8 @@ list) with a stated budget (+15% p95 ceiling) before RLS graduates from staging 
 - **QM unblock slice** (minimum, shippable first): principal resolution + `on_behalf_of` +
   project-scope intersection in `lib/api/auth.ts`, the `agent_tokens` table, and mint/revoke admin
   actions — **before** any UI or graph work. Alpha restriction: see Phase A (§17) — delegated
-  tokens honored on `GET /api/v1/items` with the oracle filter; `query` refuses delegation until
+  tokens (any `aiosd_*`, per the terminology above) honored on `GET /api/v1/items` with the oracle
+  filter; `query` refuses every `aiosd_*` token — spawn-default self-tokens included — until
   Phase B; single team; no external-tier delegation.
 
 **Spawn default — a person-spawned agent inherits its spawner's memberships, by delegation, not
@@ -833,7 +857,8 @@ the person attenuate DOWN at spawn (pick a narrower project set); it offers noth
 things this default deliberately is not: (a) **not a membership copy** — no `group_members` rows
 are ever written for a spawned agent, so there is no snapshot to drift when the person's groups
 change (they lose a group, every agent they spawned loses it the same request; revoking the token
-kills it entirely), and no automation writes membership edges (invariant 10 stays intact); (b)
+kills it entirely), and no automation writes membership edges (the no-widening rule — exec
+decision 3 / Part II invariant 2 — stays intact; invariant 10 separately bounds the learner); (b)
 **not the standing-agent model** — the paragraph below. The two modes are distinguished by how the
 credential was made: person-spawned = delegated token defaulting to full inheritance; standing =
 its own member row with explicit grants and no inherited anything.
@@ -853,13 +878,19 @@ agents with zero additional code. Rules that make this safe rather than convenie
    audited admin add. A new agent sees nothing until someone puts it somewhere.
 2. **Agent keys resolve to the agent principal** — an autonomous agent authenticates as itself
    (`api_keys` bound to the agent member row), and any token it mints attenuates *its own*
-   visibility by the triple intersection above. Delegation (`on_behalf_of` a human) and standing
+   visibility by the triple intersection above. Acting-as (`on_behalf_of` a human) and standing
    identity (its own groups) are the two modes, and a credential mixing them is **harmless by
    construction**: the launcher's visibility always intersects, so an agent token naming a human
    `on_behalf_of` still can't exceed the agent's own groups.
-3. **Attribution composes:** work an agent performs is attributed to the agent member row
-   (`items.member_id`), so arcs/timeline show it honestly (the §5.1 agent-name attribution
-   machinery then tags the responsible human where one exists via `on_behalf_of` provenance).
+3. **Attribution composes:** work a STANDING agent performs is attributed to the agent member row
+   (`items.member_id`), so arcs/timeline show it honestly; the existing code-level agent-name
+   attribution (`lib/graph/arc-attribution.ts` — `KNOWN_AI_AGENT_NAMES` rewriting) continues to tag
+   the responsible human when an AI tool name surfaces in fact prose. A **person-spawned** agent
+   has no member row, so its work attributes to the spawner — a deliberate ruling: it acts *as*
+   them, and that is what the timeline should say. Making spawned-agent output *distinguishable*
+   from the person's own keystrokes (e.g. stamping the minting `agent_tokens.id` into write
+   provenance) is a named deferral, not an accident — revisit when agent write volume makes the
+   distinction matter.
 4. **View-as covers agents** (§15.5): "see the brain as this agent" is the verification tool for
    agent scoping, same as for people. Leak-suite row: an agent member in group G sees exactly G's
    projects — and nothing via Everyone (§14).
@@ -955,7 +986,7 @@ through the *outcome*, not the code path:
 | Learner boundary | unit (write-policy guard) + datamechanics (outcome) | a rule proposal cannot express a membership/group edge (schema-level), no learner code path writes `group_members`/`project_groups`, and after a learner run the edge tables are byte-identical (§Part II learning) |
 | Agent principal | datamechanics | an agent member in group G sees exactly G's projects; a fresh agent in no groups sees nothing; no agent row ever appears in Everyone OR External (§10, §11) |
 | Mixed agent token | http | a token minted by an agent with a human `on_behalf_of` reads only the triple intersection — planted content visible to the human but not the agent never reaches it (§10) |
-| Spawn inheritance is live | datamechanics | a person-spawned unattenuated token sees the spawner's projects; remove the spawner from a group and the SAME token loses that project's content on the next request — no snapshot survives (§10 spawn default); `project_scope = '{}'` (empty) sees nothing, distinct from NULL |
+| Spawn inheritance is live | http | a person-spawned unattenuated token sees the spawner's projects; remove the spawner from a group and the SAME token loses that project's content on the next request — AND **add** the spawner to a new group and the same token GAINS it on the next request (the gain direction is the assertion a snapshot cannot pass: a launcher that materialized the visible set into `project_scope` passes the lose direction via the intersection but fails the gain; §10 spawn default); `project_scope = '{}'` (empty) sees nothing, distinct from NULL |
 | Singleton integrity | datamechanics | a singleton group cannot gain a second member, hold a membership row for a different member, be set on a built-in, or reference another team's member (each rejected at write; composite FK + checks §4); group-picker queries exclude it |
 
 Probing tests are explicitly adversarial: timing-insensitive, but shape-sensitive (result counts,
@@ -993,7 +1024,11 @@ under `app/t/[team]/admin/*` and the guard that pages read through the oracle.
    as the runtime cache-leak check (§5.8). Build early, not last.
 7. **Agent launcher** — scope (project set) shown explicitly pre-launch, **defaulting to the
    spawner's full visibility** (inheritance by delegation, §10 spawn default) with attenuate-down
-   controls only; launching mints the token (§10).
+   controls only; launching mints the token (§10). **An untouched default mints
+   `project_scope = NULL`, never the enumerated project list the picker displayed** — the display
+   is a preview of live inheritance, not the credential's content; minting the displayed list
+   would freeze a snapshot, exactly what the spawn default forbids (and what §14's gain-direction
+   probe exists to catch).
 8. **Signal view** — placeholder rendering `intent_records` at the viewer's disclosure level; ships
    dark until §13 is built.
 
@@ -1021,7 +1056,8 @@ Each phase ends at a **stop-and-review checkpoint** (spec round, then build). Sh
 precisely so the access chain exists before anything depends on it:
 
 - **A — Principals & access skeleton** *(unblocks QM)*: groups/edges DDL + built-ins, oracle,
-  `agent_tokens` + attenuation in auth, identity columns + fail-closed rule — **plus the minimal
+  `members.kind` + the `isPrincipalEligible` predicate (§4), `agent_tokens` + attenuation in auth,
+  identity columns + fail-closed rule — **plus the minimal
   context substrate the migration requires**: the `project_context_units` and
   `project_context_memberships` tables (Part II contracts) with an item-grain-only reconciler and
   the membership single writer. No classifier, no segments, no curation UI — just enough for §11's
@@ -1030,7 +1066,9 @@ precisely so the access chain exists before anything depends on it:
   migration (backfill + built-ins). Alpha restriction, sequenced against what is actually
   enforceable in A: only `GET /api/v1/items` honors delegated tokens — that one read gains the
   oracle's membership filter in the same change, so attenuation is real on day one for the route QM
-  needs; `query` REFUSES delegated tokens (403 `delegation_not_supported`) until Phase B lands
+  needs; `query` REFUSES delegated tokens — ANY `aiosd_*` credential, spawn-default self-tokens
+  included ("delegated token" is mode-independent, §10 terminology) — with 403
+  `delegation_not_supported` until Phase B lands
   enforced retrieval, because shipping a token the retrieval path cannot attenuate would be
   enforcement by decree. Single team, no external-tier delegation.
   Eval: unchanged baseline must pass post-backfill.
