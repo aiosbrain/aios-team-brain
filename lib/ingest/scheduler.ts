@@ -245,20 +245,51 @@ export function startIngestScheduler(): void {
       const { ensureAccessBootstrapAllTeams } = await import("@/lib/access/bootstrap");
       const { recordIngestRun } = await import("@/lib/ingest/runs");
       const r = await ensureAccessBootstrapAllTeams(db);
-      // One instance-wide run row per tick (teamId null, like auth_cleanup): the leg is
-      // diagnosable on the dashboard, and a per-team failure surfaces in meta instead of
-      // silently converging never.
+      // Failures are recorded PER TEAM with the actual refusal/error text, so one team's
+      // permanent refusal (an initiative squatting 'general') reds only THAT team's health
+      // card — a single instance-wide failed row would have turned every team's admin banner
+      // red while hiding the cause in meta (slice-3 Codex Medium). The instance-wide row
+      // stays the every-tick heartbeat for staleness.
+      for (const f of r.failed) {
+        if (f.teamId === "*") continue; // teams-read failure → instance row below carries it
+        await recordIngestRun(db, {
+          teamId: f.teamId,
+          source: "access_bootstrap",
+          trigger: "scheduler",
+          ok: false,
+          created: 0,
+          errors: [f.error],
+          startedAt,
+        });
+      }
+      const globalFailure = r.failed.find((f) => f.teamId === "*");
       await recordIngestRun(db, {
         teamId: null,
         source: "access_bootstrap",
         trigger: "scheduler",
-        ok: r.failed.length === 0,
+        ok: !globalFailure,
         created: 0,
-        errors: r.failed.length ? [`${r.failed.length}/${r.teams} teams failed bootstrap`] : undefined,
-        meta: { teams: r.teams, failed: r.failed.slice(0, 5) },
+        errors: globalFailure ? [globalFailure.error] : undefined,
+        meta: { teams: r.teams, failedTeams: r.failed.length },
         startedAt,
       });
     } catch (err) {
+      // An unexpected throw must still leave a failed trace — a silent catch left the
+      // previous green row standing until it aged stale (slice-3 Codex Low).
+      try {
+        const { recordIngestRun } = await import("@/lib/ingest/runs");
+        await recordIngestRun(db, {
+          teamId: null,
+          source: "access_bootstrap",
+          trigger: "scheduler",
+          ok: false,
+          created: 0,
+          errors: [err instanceof Error ? err.message : "bootstrap threw"],
+          startedAt,
+        });
+      } catch {
+        // recording itself failed — the console line below is the last resort
+      }
       console.error("[ingest] access bootstrap failed", err);
     }
   }

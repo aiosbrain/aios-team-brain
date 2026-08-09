@@ -32,6 +32,13 @@ describe("§11 access-bootstrap call sites", () => {
     expect(read("lib/admin/teams.ts")).toMatch(/ensureAccessBootstrap\s*\(/);
   });
 
+  it("dashboard-created projects mint kind='initiative' — what makes source-only adoption safe", () => {
+    // Spec ruling: new dashboard-created projects default to 'initiative'. If this ever
+    // reverts to the column default ('source'), a human-created "General" becomes adoptable
+    // and inherits Everyone-visibility (the slice-3 Codex High).
+    expect(read("app/actions/projects.ts")).toMatch(/kind:\s*"initiative"/);
+  });
+
   it("the scheduler tick runs the convergence leg", () => {
     const source = read("lib/ingest/scheduler.ts");
     expect(source).toMatch(/await runAccessBootstrap\(db\);/);

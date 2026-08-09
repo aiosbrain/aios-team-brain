@@ -60,8 +60,17 @@ async function ensureSystemProject(
       if (row.kind !== "source") {
         return { ok: false, error: `a kind='${row.kind}' project holds reserved slug '${slug}' — refusing to adopt it` };
       }
-      const { error } = await db.from("projects").update({ kind: "system" }).eq("id", row.id).eq("team_id", teamId);
+      // Conditioned on kind='source' so a concurrent kind change after the refusal check
+      // can't be clobbered, and only the caller that actually flipped the row audits.
+      const { data: flipped, error } = await db
+        .from("projects")
+        .update({ kind: "system" })
+        .eq("id", row.id)
+        .eq("team_id", teamId)
+        .eq("kind", "source")
+        .select("id");
       if (error) return { ok: false, error: error.message };
+      if (!flipped || (flipped as unknown[]).length === 0) return ensureSystemProject(db, teamId, slug);
       await audit(db, {
         team_id: teamId,
         actor_kind: "system",

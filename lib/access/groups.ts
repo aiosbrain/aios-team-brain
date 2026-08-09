@@ -338,6 +338,10 @@ export async function grantProjectToGroup(
   // The bootstrap re-runs this every scheduler tick; an unconditional upsert+audit minted 3
   // audit rows/team/tick forever and re-clobbered added_by — drowning the grant trail the
   // spec's accountability story depends on (slice-3 Fable High).
+  // KNOWN BOUNDED RACE (deferred with F3): two concurrent CREATES of the same edge can both
+  // miss the select and both audit (double provenance for one ms-apart creation — the trail
+  // over-reports, never under-reports). The atomic form (INSERT … ON CONFLICT DO NOTHING
+  // RETURNING) needs adapter support; take it with the transaction surface.
   const { data: existing } = await db
     .from("project_groups")
     .select("project_id")
