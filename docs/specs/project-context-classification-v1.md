@@ -376,30 +376,39 @@ alter table members add column if not exists kind text not null default 'human'
   check (kind in ('human','agent','offroster'));
 ```
 
-`is_connector` stays as-is (an orthogonal flag on existing service-account rows). **Principal
-eligibility is one predicate**, defined in the oracle module and reused verbatim by the RLS
-policies (§9), the groups single writer, and credential issuance:
-`isPrincipalEligible(m) ≡ m.kind = 'human' ∧ ¬m.is_connector ∧ m.active` — with two enforcement
-points so ineligibility is structural, not advisory: the groups single writer **rejects** adding a
-non-eligible member to any group except an agent's explicit grants (`kind='agent'` may hold
-memberships; `kind='offroster'` and connectors may not — a membership row for them cannot be
-created), and the oracle applies the predicate on every read anyway, so a flag flipped after a
-membership snuck in still resolves to nothing. Login and API-key/token issuance refuse
-non-eligible members except `kind='agent'` API keys (§10).
+`is_connector` stays as-is (an orthogonal flag on existing service-account rows). **Eligibility is
+two named predicates, not one stretched one** (the round-3 Codex review caught a "single predicate
+reused verbatim" formulation that would have denied every standing agent at the RLS layer):
+
+- `isPrincipal(m) ≡ m.active ∧ ¬m.is_connector ∧ m.kind ∈ ('human','agent')` — who may hold
+  group memberships and resolve visibility. Defined in the oracle module; reused **verbatim** by
+  the RLS policies (§9) and the groups single writer.
+- `isBuiltinEligible(m) ≡ isPrincipal(m) ∧ m.kind = 'human'` — who the built-ins auto-admit
+  (Everyone/External membership is maintained, never hand-edited; agents are principals but are
+  NEVER auto-admitted anywhere, §10).
+
+Two enforcement points make ineligibility structural, not advisory: the groups single writer
+**rejects** any membership row for a member failing `isPrincipal` (so `kind='offroster'` and
+connectors cannot acquire one), and the oracle applies `isPrincipal` on every read anyway, so a
+flag flipped after a membership snuck in still resolves to nothing. Login refuses everything but
+`kind='human'`; API-key/token issuance refuses members failing `isPrincipal` (agents get keys,
+off-roster and connectors never).
 
 **Effective visibility is a pure function**, computed in one place (§5.1):
 
 ```
 visibleProjects(principal) =
   eligible(principal) ? { p | ∃ g : (principal.member ∈ g) ∧ ((p,g) ∈ project_groups) } : ∅
-  ∩ (project_scope ?? U)   -- token attenuation, §10; NULL scope = universe (deliberately the
-                           -- spec's ONE fail-open NULL — everywhere else NULL fails closed)
+  ∩ (project_scope ?? U)   -- token attenuation, §10; NULL scope = universe — deliberately the
+                           -- only NULL that REMOVES an attenuation restriction (state-marking
+                           -- NULLs like valid_to/removed_at/on_behalf_of are sentinels, not
+                           -- access grants); every access-input NULL elsewhere fails closed
 canSee(principal, unit) =
   ∃ m current effective include membership of unit into some p ∈ visibleProjects(principal)
 ```
 
-where `eligible` = `isPrincipalEligible` extended to admit `kind='agent'` (agents are principals;
-off-roster and connector rows are never).
+where `eligible` = `isPrincipal` (§above — humans and agents are principals; off-roster and
+connector rows are never).
 
 ## 5. Enforcement — every read path, one oracle
 
@@ -553,7 +562,7 @@ there; plus actors and Graphiti facts):
 | Leg | V2 filter |
 |---|---|
 | Decisions / tasks | join their row-grain units' memberships against the oracle set (Part II units) |
-| graph_entities / graph_relationships | partition `group_id` ∈ the oracle's graph set (§6); the Postgres mirrors gain a `group_id` column in the Phase C widening |
+| graph_entities / graph_relationships | partition `group_id` ∈ the oracle's graph set (§6); the Postgres mirrors gain a `group_id` column in the Phase C widening. **Until that widening lands, these two legs are OMITTED from query context for every attenuated or partitioned principal — all `aiosd_*` tokens, and any member whose effective set is narrower than their legacy tier view** (round-3 Codex Critical: Phase B admits delegated `query` while these mirrors are still unpartitioned; serving them would hand a scoped token team-wide entities/relationships. Fail closed by omission, not filtered-by-nothing) |
 | Graphiti facts | `group_ids` parameter from the oracle (§5.9) |
 | Actors / people | derived from visible items only; no standalone leg may bypass the oracle |
 
@@ -738,7 +747,7 @@ Required changes:
    admit `kind='offroster'` while continuing to exclude connectors, and each reader that filters
    `is_connector` today must make that distinction explicitly (enumerated at build time; guard test
    per surface). On the access side the two are identical: an off-roster row
-   - **fails `isPrincipalEligible` (§4)** — the groups single writer refuses to create a membership
+   - **fails `isPrincipal` (§4)** — the groups single writer refuses to create a membership
      for it (Everyone, External, ordinary, or singleton), the oracle's `visibleProjects` resolves ∅
      regardless of any row that might sneak in, and logins/keys/tokens cannot be issued for it
      (guard + leak-suite row, §14). Without this, adding an external author for attribution
@@ -759,10 +768,18 @@ Design (defence-in-depth under the oracle, not a replacement):
 - **Session mechanism:** every request executes inside a transaction that first runs
   `select set_config('aios.team_id', $1, true), set_config('aios.member_id', $2, true),
   set_config('aios.project_scope', $3, true)` — the third variable carries a token's attenuation
-  set (NULL/absent = unattenuated member or spawn-default token), and policies intersect it where
-  present, so **token attenuation gets the same DB backstop as principal identity** (the round-3
+  set, so **token attenuation gets the same DB backstop as principal identity** (the round-3
   Fable review caught that without this, attenuation was app-layer-only for exactly the agent
-  surface §2 calls out as the retired accepted-risk). Until the Phase B policies land, that is the
+  surface §2 calls out as the retired accepted-risk). Because a GUC is a **text** setting — passing
+  NULL to `set_config` is *reset*, and `current_setting(..., true)` yields NULL-or-empty-string
+  depending on whether the setting ever existed in the session (round-3 Codex High) — the
+  serialization is an explicit contract, not NULL-punning: every request sets all three variables;
+  `aios.project_scope` is `'*'` (universe — unattenuated member or spawn-default token), `'{}'`
+  (empty — sees nothing), or a PostgreSQL `uuid[]` literal. Policies parse with
+  `NULLIF(current_setting('aios.project_scope', true), '')` and treat NULL/absent/malformed as
+  **no principal context → zero rows (fail closed)**, same as a missing `aios.member_id`; only the
+  literal `'*'` opens the universe. Tests enumerate absent, reset/empty-string, `'*'`, `'{}'`, one
+  uuid, and malformed input — each with its stated outcome. Until the Phase B policies land, the
   explicit interim state: Phase A token attenuation has no DB backstop — accepted, named, and
   guarded by the §14 http rows. Note
   `set_config(..., true)` is **transaction-local** (`SET LOCAL` semantics), which is the entire
@@ -1055,8 +1072,13 @@ comes first; measured via the existing `ingest_runs` duration metadata.
 Each phase ends at a **stop-and-review checkpoint** (spec round, then build). Ships in this order
 precisely so the access chain exists before anything depends on it:
 
-- **A — Principals & access skeleton** *(unblocks QM)*: groups/edges DDL + built-ins, oracle,
-  `members.kind` + the `isPrincipalEligible` predicate (§4), `agent_tokens` + attenuation in auth,
+- **A — Principals & access skeleton** *(unblocks the QM principal model — stated precisely: the
+  token infrastructure and the `GET /api/v1/items` feed for manifest/sync-style consumption; QM's
+  deep-retrieval leg (`/api/v1/query`, the L2 tool its brief specifies) keeps using its existing
+  `aios_*` member key exactly as today until Phase B opens `query` to `aiosd_*` tokens — the
+  round-3 Codex review caught the bare "unblocks QM" claim overpromising)*: groups/edges DDL +
+  built-ins, oracle,
+  `members.kind` + the `isPrincipal`/`isBuiltinEligible` predicates (§4), `agent_tokens` + attenuation in auth,
   identity columns + fail-closed rule — **plus the minimal
   context substrate the migration requires**: the `project_context_units` and
   `project_context_memberships` tables (Part II contracts) with an item-grain-only reconciler and
@@ -1074,7 +1096,10 @@ precisely so the access chain exists before anything depends on it:
   Eval: unchanged baseline must pass post-backfill.
 - **B — Enforced reads**: FTS/dense/timeline/arcs through the oracle; citation/abstention rules;
   RLS on content tables + the backstop test; permission inspector + admin screens 1–2; leak suite
-  paths 1–2, 4–6, 9–10.
+  paths 1–2, 4–6, 9–10. **Phase B's `query` opens to `aiosd_*` tokens with the
+  `graph_entities`/`graph_relationships` legs OMITTED for attenuated/partitioned principals**
+  (§5.8b) — those mirrors stay unpartitioned until C, and enforced retrieval means every leg it
+  serves is enforced, not most.
 - **C — Per-project graphs**: group_id scheme, projector fan-out + cache, per-project arcs, bolt
   guard, cost surfacing; FalkorDB spike = exit gate; leak suite graph paths; eval principal axis.
 - **D — Tagging at scale** (Part II engine on the Phase A substrate): container defaults, review queue,
