@@ -52,8 +52,15 @@ function writesTo(source: string, table: string): boolean {
  */
 const UNAMBIGUOUS = ["group_members", "project_groups"];
 function mentionsWithWrites(source: string, table: string): boolean {
-  return source.includes(`"${table}"`) && WRITE_VERBS.test(source);
+  const quoted = [`"${table}"`, `'${table}'`, "`" + table + "`"];
+  return quoted.some((q) => source.includes(q)) && WRITE_VERBS.test(source);
 }
+
+/** SQL DML against an edge table anywhere in postgres/ — migrations must never seed access. */
+const SQL_DML = new RegExp(
+  `(insert\\s+into|update|delete\\s+from)\\s+(public\\.)?(${EDGE_TABLES.join("|")})\\b`,
+  "i"
+);
 
 describe("access-chain single writer", () => {
   it("only lib/access/groups.ts writes groups/group_members/project_groups", () => {
@@ -74,6 +81,29 @@ describe("access-chain single writer", () => {
       }
     }
     expect(offenders, `access edges written outside the single writer:\n${offenders.join("\n")}`).toEqual([]);
+  });
+
+  it("no SQL file seeds or mutates the access edges — built-ins are app-code-created only", () => {
+    const offenders: string[] = [];
+    const sqlFiles: string[] = [];
+    (function walkSql(dir: string) {
+      let entries: string[] = [];
+      try {
+        entries = readdirSync(dir);
+      } catch {
+        return;
+      }
+      for (const name of entries) {
+        const p = join(dir, name);
+        if (statSync(p).isDirectory()) walkSql(p);
+        else if (name.endsWith(".sql")) sqlFiles.push(p);
+      }
+    })(join(ROOT, "postgres"));
+    for (const file of sqlFiles) {
+      const source = readFileSync(file, "utf8");
+      if (SQL_DML.test(source)) offenders.push(relative(ROOT, file));
+    }
+    expect(offenders, `SQL DML against access edges:\n${offenders.join("\n")}`).toEqual([]);
   });
 
   it("is non-vacuous: the single writer itself DOES write all three tables", () => {

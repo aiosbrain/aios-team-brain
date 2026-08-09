@@ -72,9 +72,12 @@ export async function visibleProjects(db: DbClient, principal: Principal): Promi
     rows
       .filter((r) => {
         const g = r.groups;
-        if (!g?.is_builtin) return true;
+        if (!g) return false; // missing embed: unresolvable group → fail closed (review M2)
+        if (!g.is_builtin) return true;
         const requiredTier = tierFor[g.slug];
-        return requiredTier === undefined || member.tier === requiredTier;
+        // An is_builtin row with a slug outside the two known built-ins cannot be created by
+        // the writer; if one exists it is a direct write — fail closed, never "unknown = allow".
+        return requiredTier !== undefined && member.tier === requiredTier;
       })
       .map((r) => r.group_id)
   );

@@ -964,9 +964,11 @@ create unique index if not exists projects_team_id_id_idx on projects (team_id, 
 
 -- Member kind: 'human' (default) | 'agent' (standing autonomous agent — a principal, never
 -- auto-admitted to built-ins) | 'offroster' (attribution-only actor — never a principal).
--- Predicates: lib/access/eligibility.ts (isPrincipal / isBuiltinEligible).
-alter table members add column if not exists kind text not null default 'human'
-  check (kind in ('human','agent','offroster'));
+-- Predicates: lib/access/eligibility.ts (isPrincipal / isBuiltinEligible). The CHECK lives in
+-- the 20260809120000 migration as a NAMED drop-and-re-add constraint (replay-repairable — the
+-- migrations README pattern); pg:schema always runs migrations after this file, on from-zero
+-- AND existing databases, so the constraint exists in every path.
+alter table members add column if not exists kind text not null default 'human';
 
 -- Groups of people. "Everyone" and "External" are built-in rows (is_builtin), created per team
 -- by lib/access/groups.ts (ensureBuiltins); built-ins cannot be deleted and their membership is

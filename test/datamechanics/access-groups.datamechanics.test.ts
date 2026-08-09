@@ -195,6 +195,40 @@ describe("singleton integrity (direct person adds)", () => {
   });
 });
 
+describe("schema guarantees (Codex round: kind check, cascade chain)", () => {
+  it("rejects an invalid members.kind (the named CHECK exists and constrains)", async () => {
+    const seed = await seedTeam();
+    const { error } = await db()
+      .from("members")
+      .insert({
+        team_id: seed.teamId,
+        email: `${randomUUID()}@test.local`,
+        display_name: "R",
+        actor_handle: `r-${randomUUID().slice(0, 8)}`,
+        status: "active",
+        kind: "robot",
+      });
+    expect(error, "members_kind_check must reject an unknown kind").not.toBeNull();
+  });
+
+  it("deleting a member cascades their singleton group, its membership, AND its project grants", async () => {
+    const seed = await seedTeam();
+    const person = await seedMember(seed);
+    const project = await seedProject(seed);
+    const s = await ensurePersonSingleton(db(), seed.teamId, person, seed.memberId);
+    await grantProjectToGroup(db(), seed.teamId, project, s.groupId!, seed.memberId);
+
+    const { error } = await db().from("members").delete().eq("id", person).eq("team_id", seed.teamId);
+    expect(error).toBeNull();
+    const { data: g } = await db().from("groups").select("id").eq("id", s.groupId!).maybeSingle();
+    expect(g, "singleton group must cascade with its person").toBeNull();
+    const { data: grants } = await db().from("project_groups").select("group_id").eq("group_id", s.groupId!);
+    expect((grants ?? []).length, "the singleton's project grants must cascade too").toBe(0);
+    const { data: memberships } = await db().from("group_members").select("member_id").eq("group_id", s.groupId!);
+    expect((memberships ?? []).length).toBe(0);
+  });
+});
+
 describe("review-fold regressions (Fable round: hijack, tier, audit)", () => {
   it("reserved slugs: createGroup refuses everyone/external/person-*, and ensureBuiltins refuses to convert a squatter", async () => {
     const seed = await seedTeam();

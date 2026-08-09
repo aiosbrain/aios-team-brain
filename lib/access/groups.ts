@@ -104,7 +104,19 @@ export async function ensureBuiltins(db: DbClient, teamId: string): Promise<Writ
       const { error } = await db
         .from("groups")
         .insert({ team_id: teamId, slug, name, is_builtin: true });
-      if (error) return { ok: false, error: `ensure ${slug}: ${error.message}` };
+      if (error) {
+        // Race loser (unique team_id,slug): converge on the winner's row — but only if the
+        // winner IS a builtin; a squatter that won the race is still a refusal.
+        const { data: winner } = await db
+          .from("groups")
+          .select("is_builtin")
+          .eq("team_id", teamId)
+          .eq("slug", slug)
+          .maybeSingle();
+        if (!(winner as { is_builtin: boolean } | null)?.is_builtin) {
+          return { ok: false, error: `ensure ${slug}: ${error.message}` };
+        }
+      }
     }
   }
   return syncBuiltinMembership(db, teamId);
