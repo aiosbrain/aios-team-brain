@@ -71,10 +71,13 @@ so the model stays one edge type).
    database row-level security catches application bugs; we test it by deliberately bypassing the
    app layer and confirming the database refuses. "No results" looks identical whether content is
    absent or invisible.
-7. **Agents get attenuated access, structurally.** An agent token's access = its principal's access
-   ∩ the token's scope — an intersection can only shrink, so privilege expansion is impossible
-   rather than forbidden. Old API keys keep working unchanged; the QM integration gets this
-   principal model first, before any UI.
+7. **Agents get attenuated access, structurally — and standing agents are group-governed.** An
+   agent acting for a person holds a token whose access = that person's access ∩ the token's scope —
+   an intersection can only shrink, so privilege expansion is impossible rather than forbidden. An
+   **autonomous** agent is instead its own principal: put in groups like a person, seeing exactly
+   what its groups see, auto-joined to nothing (a new agent sees nothing until an admin places it).
+   Old API keys keep working unchanged; the QM integration gets this principal model first, before
+   any UI.
 8. **Cost is real and priced.** Graph extraction is the expensive operation: measured on prod at
    $0.151/episode (~$380/month at current volume). Per-project graphs multiply it by the average
    projects-per-item; the honest ceiling is ~2× (~$760/month) if the whole corpus gets classified,
@@ -753,12 +756,35 @@ list) with a stated budget (+15% p95 ceiling) before RLS graduates from staging 
   tokens honored on `GET /api/v1/items` with the oracle filter; `query` refuses delegation until
   Phase B; single team; no external-tier delegation.
 
+**Autonomous agents as first-class principals — group-governed, same one rule.** Delegation above
+covers an agent acting *as someone*; a standing autonomous agent (a scheduled workflow, a team bot
+with its own duties) is instead its **own principal**: a member row of `kind='agent'` (the
+service-account pattern `members.is_connector` already establishes), **placed in groups exactly
+like a person and seeing exactly what its groups see**. No agent-specific access semantics exist —
+`visibleProjects(agent)` is the same oracle over the same `group_members`/`project_groups` edges,
+which means the admin screen, the permission inspector, view-as, and the leak suite all cover
+agents with zero additional code. Rules that make this safe rather than convenient:
+
+1. **No automatic membership.** Agent members never auto-join Everyone (same exclusion lane as
+   connectors/off-roster in `lib/access/groups.ts`); every group an agent is in was an explicit,
+   audited admin add. A new agent sees nothing until someone puts it somewhere.
+2. **Agent keys resolve to the agent principal** — an autonomous agent authenticates as itself
+   (`api_keys` bound to the agent member row), and any token it mints attenuates *its own*
+   visibility by the intersection rule above. Delegation (`on_behalf_of` a human) and standing
+   identity (its own groups) are the only two modes; an agent cannot hold both in one credential.
+3. **Attribution composes:** work an agent performs is attributed to the agent member row
+   (`items.member_id`), so arcs/timeline show it honestly (the §5.1 agent-name attribution
+   machinery then tags the responsible human where one exists via `on_behalf_of` provenance).
+4. **View-as covers agents** (§15.5): "see the brain as this agent" is the verification tool for
+   agent scoping, same as for people. Leak-suite row: an agent member in group G sees exactly G's
+   projects — and nothing via Everyone (§14).
+
 ## 11. Migration of live production data
 
 Ruling and its direction, argued:
 
-1. **Built-ins:** per team, migration creates group `everyone` (**active members with
-   `tier='team'` ONLY, excluding connector and `is_offroster` actor rows (§8.6)** — an
+1. **Built-ins:** per team, migration creates group `everyone` (**active HUMAN members with
+   `tier='team'` ONLY, excluding connector, `kind='agent'` (§10), and `is_offroster` (§8.6) rows** — an
    external-tier member in Everyone would see General, i.e. the whole team corpus, inverting
    today's isolation; a caught Critical, stated as the normative membership
    rule, maintained by the groups single writer on member activation AND tier change), group
@@ -836,6 +862,7 @@ through the *outcome*, not the code path:
 | Authorship ≠ access | datamechanics | an item authored by A, tagged only into a project A cannot see, is invisible to A — authoring confers nothing (§5.1) |
 | Off-roster actor | datamechanics | an `is_offroster` member row resolves to zero visible projects, appears in no Everyone membership, and cannot be a token principal — while its items carry correct attribution (§8.6) |
 | Learner boundary | unit + datamechanics | a rule proposal cannot express a membership/group edge (schema-level), and no learner code path writes `group_members`/`project_groups` (write-policy guard, §Part II learning) |
+| Agent principal | datamechanics | an agent member in group G sees exactly G's projects; a fresh agent in no groups sees nothing; no agent row ever appears in Everyone (§10) |
 
 Probing tests are explicitly adversarial: timing-insensitive, but shape-sensitive (result counts,
 empty-page shapes, citation numbering gaps) — the places post-filtering leaks.
