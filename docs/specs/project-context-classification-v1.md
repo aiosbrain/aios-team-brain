@@ -5,8 +5,8 @@ spec_gate: block
 
 # Project partitioning and permissioning — V2
 
-> Filename note: this file keeps its V1 path (`project-context-classification-v1.md`) so existing
-> links survive; the document it contains is the V2 parent specification. V1's classification and
+> Filename note: this file keeps its V1 path (`docs/specs/project-context-classification-v1.md`) so
+> existing links survive; the document it contains is the V2 parent specification. V1's classification and
 > curation machinery is retained in Part II as the tagging engine; where V2 contradicts V1, V2 wins,
 > and every such flip is listed explicitly in §2.
 
@@ -94,6 +94,12 @@ enforced + RLS + the permission inspector → **C** per-project graphs + cost co
 gates the exit) → **D** the tagging engine at scale (rules, review queue, meeting segments, cascade
 preview) → **E** the cross-project signal layer (designed now, built later). Each phase ends at a
 stop-and-review gate.
+
+**Build-with tier:** Fable / high effort for Phases A–B and any diff touching the oracle, RLS, or
+migration (the failure mode there is a silent leak with no backstop — buy the strongest builder
+where a single wrong line produces the invisible defect); Opus / high is acceptable from Phase C
+onward for the more mechanical surfaces, with multi-model review (fresh Fable session + Codex) on
+every security-critical diff regardless of builder.
 
 ### What's still unknown, honestly
 
@@ -1140,7 +1146,8 @@ ledger of every delta so reviewers of V1 can see exactly what moved.
     the unchanged recall eval and a before/after visibility diff on the seed team.
   - An untag cascade removes derived knowledge from the losing project's graph within one projector
     cycle, and the permission inspector shows the revised state.
-- **V1 "Existing modules" / "Proposed modules":** stand, plus: `lib/access/oracle.ts` (visibility
+- **V1 "Existing modules" / "Proposed modules":** stand, plus these proposed new modules:
+  `lib/access/oracle.ts` (visibility
   oracle, single reader), `lib/access/groups.ts` (groups/edges single writer), extensions to
   `lib/api/auth.ts` (principal + attenuation), `lib/graph/group.ts` (per-project group ids),
   `lib/graph/provenance.ts` (ledger single writer), `agent_tokens` admin actions, and the Part I
@@ -1999,23 +2006,20 @@ correction rate and bounded cost.
 
 ## Acceptance criteria
 
-- A user can create or promote an initiative without changing existing connector project ownership.
-- A whole item can be included in multiple initiatives, moved, excluded, and returned to automatic;
-  every state is audited and survives source re-sync AND the duplicate-meeting merge re-point.
-- Automatic runs never overwrite a manual force decision.
-- Enabled rules classify future matching units, expose exact provenance, and can be previewed before a
-  bounded historical backfill.
-- Ambiguous automatic results enter a review queue; low-confidence results do not pollute context.
-- A meeting is split into source-grounded topic segments that can belong to different initiatives;
-  users can split/merge/relabel without losing unambiguous manual assignments.
-- Project timeline and project-scoped retrieval use effective memberships rather than
-  `items.project_id` and return only selected meeting segment text.
-- Source access narrowing and deletion remove project context with the same fail-closed guarantees as
-  existing item/task/graph paths.
-- Classification skips unchanged inputs, uses deterministic/rule/embedding stages before LLM, batches
-  paid calls, meters cost, and records honest failures.
-- Existing ingest, tasks, decisions, meetings, team timeline, ingestion-project retrieval, and Brain
-  API contracts remain compatible throughout staged rollout.
+Each criterion names the tier that proves it (CLAUDE.md §4 tiers: unit = `npm test`,
+datamechanics = `npm run db:test:up && npm run test:datamechanics`, http = `npm run test:http`);
+"proven by" means a red test exists before the behavior ships and the suite exits 0 after.
+
+- A user can create or promote an initiative without changing existing connector project ownership — datamechanics test: `items.project_id` byte-identical before/after promotion.
+- A whole item can be included in multiple initiatives, moved, excluded, and returned to automatic; every state is audited and survives source re-sync AND the duplicate-meeting merge re-point — datamechanics test: state-machine walk asserting `project_context_events` rows per transition, then re-sync + merge fixtures asserting memberships (and attribution, invariant 9) unchanged.
+- Automatic runs never overwrite a manual force decision — datamechanics test: a classifier run over a forced pair is a no-op (invariant 3 guard).
+- Enabled rules classify future matching units, expose exact provenance, and can be previewed before a bounded historical backfill — unit test: evaluator provenance snapshot; http test: the preview endpoint returns counts without writes.
+- Ambiguous automatic results enter a review queue; low-confidence results do not pollute context — datamechanics test: a below-threshold suggestion produces no effective membership.
+- A meeting is split into source-grounded topic segments that can belong to different initiatives; users can split/merge/relabel without losing unambiguous manual assignments — datamechanics test: segmentation-generation walk with offset-slice validation (never model-trusted text).
+- Project timeline and project-scoped retrieval use effective memberships rather than `items.project_id` and return only selected meeting segment text — http test: retrieval fixture returns segment text only; leak-suite §14 rows cover the negative half.
+- Source access narrowing and deletion remove project context with the same fail-closed guarantees as existing item/task/graph paths — datamechanics test: purge fixture asserts units/memberships/suggestions/embeddings gone AND the removed content's absence from retrieval (the criterion's inverse, stated deliberately).
+- Classification skips unchanged inputs, uses deterministic/rule/embedding stages before LLM, batches paid calls, meters cost, and records honest failures — unit test: fingerprint skip + stage ordering; datamechanics test: `llm_usage` rows per paid batch and `ingest_runs` recording `ok=false` on model failure.
+- Existing ingest, tasks, decisions, meetings, team timeline, ingestion-project retrieval, and Brain API contracts remain compatible throughout staged rollout — http tier + `bash scripts/e2e.sh` green at every phase gate (§17), unchanged from today's contract suite.
 
 ## Existing modules to reuse or extend
 
@@ -2031,14 +2035,14 @@ correction rate and bounded cost.
 | `lib/auth/guard.ts` | Add shared admin-or-lead authorization; keep mutation role policy centralized |
 | `lib/auth/visibility.ts` | Fail-closed audience reads |
 | `lib/api/audit.ts` | Generic audit trail alongside domain events |
-| `lib/dashboard/issue-ref.ts` and `timeline-evidence.ts` | Deterministic task/reference signals |
+| `lib/dashboard/issue-ref.ts` and `lib/dashboard/timeline-evidence.ts` | Deterministic task/reference signals |
 | `lib/dashboard/doc-task-infer-run.ts` | Paid-pass batching, fingerprints, settled/no-match, and failure patterns |
 | `lib/dashboard/timeline-group.ts` | Date/source display helpers, not final person-first cache filtering |
 | `lib/dashboard/work-classification.ts` | Work versus context signal semantics |
 | `lib/attribution/contributor-credit.ts` | Sole whole-item attribution oracle |
-| `lib/query/dense-index.ts`, `embedding-key.ts`, `embeddings.ts` | Existing embedding backend and idempotency patterns |
-| `lib/query/retrieve.ts`, `dense-search.ts`, `fts-search.ts`, `provider.ts` | Explicit context scope, segment candidates, RRF/budget/citations |
-| `lib/meetings/notes.ts`, `llm-extract.ts` | Meeting provenance, provider/metering patterns; add separate segment writer |
+| `lib/query/dense-index.ts`, `lib/query/embedding-key.ts`, `lib/query/embeddings.ts` | Existing embedding backend and idempotency patterns |
+| `lib/query/retrieve.ts`, `lib/query/dense-search.ts`, `lib/query/fts-search.ts`, `lib/query/provider.ts` | Explicit context scope, segment candidates, RRF/budget/citations |
+| `lib/meetings/notes.ts`, `lib/meetings/llm-extract.ts` | Meeting provenance, provider/metering patterns; add separate segment writer |
 | `lib/meetings/merge.ts` | Auto-merge re-points `meeting_notes.source_item_id` on every tick; the unit reconciler must apply the merge contract (retire replaced units, lineage-transfer memberships) |
 | `app/t/[team]/projects/*` | Initiative list and workspace replacement |
 | `app/t/[team]/library/[itemId]/page.tsx` | Shared membership editor |
