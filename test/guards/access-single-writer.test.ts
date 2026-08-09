@@ -34,12 +34,25 @@ function walk(dir: string, out: string[] = []): string[] {
 
 /** Every `.from("<table>")` occurrence followed (within the same chain, ~200 chars) by a write verb. */
 function writesTo(source: string, table: string): boolean {
-  const needle = new RegExp(`\\.from\\((["'])${table}\\1\\)`, "g");
+  const needle = new RegExp(`\\.from\\((["'\`])${table}\\1\\)`, "g");
   for (let m = needle.exec(source); m; m = needle.exec(source)) {
     const window = source.slice(m.index, m.index + 200);
     if (WRITE_VERBS.test(window)) return true;
   }
   return false;
+}
+
+/**
+ * Coarser second net for the two globally-unambiguous table names: the literal appearing
+ * ANYWHERE in a file that also contains a write verb. Catches the variable-table-name idiom
+ * (`.from(table).insert(...)`) that the chain scan cannot see — that idiom is live in this
+ * repo (lib/ingest/reclassify.ts, lib/social/store.ts), so a generic helper pointed at an
+ * edge table must not stay green. "groups" is too common a word for this net; its chain scan
+ * plus these two suffice, since a membership/grant write is what confers access.
+ */
+const UNAMBIGUOUS = ["group_members", "project_groups"];
+function mentionsWithWrites(source: string, table: string): boolean {
+  return source.includes(`"${table}"`) && WRITE_VERBS.test(source);
 }
 
 describe("access-chain single writer", () => {
@@ -52,6 +65,11 @@ describe("access-chain single writer", () => {
         const source = readFileSync(file, "utf8");
         for (const table of EDGE_TABLES) {
           if (writesTo(source, table)) offenders.push(`${rel} writes ${table}`);
+        }
+        for (const table of UNAMBIGUOUS) {
+          if (!writesTo(source, table) && mentionsWithWrites(source, table)) {
+            offenders.push(`${rel} names ${table} in a file with write verbs (variable-table idiom?)`);
+          }
         }
       }
     }

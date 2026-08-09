@@ -15,11 +15,22 @@ import { isBuiltinEligible, isPrincipal } from "@/lib/access/eligibility";
  *  - a singleton group (person_member_id set — a "direct person add") always contains exactly
  *    its person; ordinary membership edits against it are refused.
  *
- * Every mutation audits through lib/api/audit (best-effort, never blocks the write result).
+ * Admin-actor mutations audit through lib/api/audit per write; machine maintenance
+ * (syncBuiltinMembership, singleton healing) audits one summary row per run that changed
+ * anything. Best-effort, never blocks the write result — which is why the data-mechanics
+ * tier asserts at least one audit row lands.
  */
 
 export const EVERYONE_SLUG = "everyone";
 export const EXTERNAL_SLUG = "external";
+
+/** Slugs an ordinary group may not take: the two built-ins and the singleton namespace.
+ *  Without this, a group created as "everyone" BEFORE ensureBuiltins first runs would be
+ *  converted into a machine-synced builtin (the upsert flips is_builtin) and its existing
+ *  project grants would become team-wide — the review-caught hijack. */
+export function isReservedSlug(slug: string): boolean {
+  return slug === EVERYONE_SLUG || slug === EXTERNAL_SLUG || slug.startsWith("person-");
+}
 
 export interface WriteResult {
   ok: boolean;
@@ -77,10 +88,24 @@ export async function ensureBuiltins(db: DbClient, teamId: string): Promise<Writ
     [EVERYONE_SLUG, "Everyone"],
     [EXTERNAL_SLUG, "External"],
   ] as const) {
-    const { error } = await db
+    // Insert-if-absent, NEVER a blind upsert: an existing row with this slug that is not a
+    // builtin is a hijack candidate, and flipping its is_builtin would convert a curated
+    // group into a machine-synced one. Fail loudly instead.
+    const { data: existing } = await db
       .from("groups")
-      .upsert({ team_id: teamId, slug, name, is_builtin: true }, { onConflict: "team_id,slug" });
-    if (error) return { ok: false, error: `ensure ${slug}: ${error.message}` };
+      .select("id, is_builtin")
+      .eq("team_id", teamId)
+      .eq("slug", slug)
+      .maybeSingle();
+    if (existing && !(existing as { is_builtin: boolean }).is_builtin) {
+      return { ok: false, error: `a non-builtin group already holds reserved slug '${slug}' — refusing to convert it` };
+    }
+    if (!existing) {
+      const { error } = await db
+        .from("groups")
+        .insert({ team_id: teamId, slug, name, is_builtin: true });
+      if (error) return { ok: false, error: `ensure ${slug}: ${error.message}` };
+    }
   }
   return syncBuiltinMembership(db, teamId);
 }
@@ -89,6 +114,11 @@ export async function ensureBuiltins(db: DbClient, teamId: string): Promise<Writ
  * Recompute built-in membership from the members table: everyone = isBuiltinEligible ∧
  * tier='team'; external = isBuiltinEligible ∧ tier='external'. Inserts missing rows, deletes
  * rows that no longer qualify. Hook this on member activation/deactivation AND tier change.
+ *
+ * DEFERRED (review F3, wiring slice): this is a read-then-write diff with no serialization —
+ * a per-team advisory lock needs a transaction surface the adapter does not expose yet.
+ * Nothing calls this concurrently today; the oracle's read-side eligibility + tier checks
+ * bound the damage of a stale re-add to availability, not access.
  */
 export async function syncBuiltinMembership(db: DbClient, teamId: string): Promise<WriteResult> {
   const { data: groups, error: gErr } = await db
@@ -138,6 +168,9 @@ export async function syncBuiltinMembership(db: DbClient, teamId: string): Promi
         .in("member_id", toDrop);
       if (error) return { ok: false, error: error.message };
     }
+    if (toAdd.length > 0 || toDrop.length > 0) {
+      await auditWrite(db, teamId, null, "access.builtin_synced", groupId, { slug, added: toAdd, removed: toDrop });
+    }
   }
   return { ok: true };
 }
@@ -150,6 +183,7 @@ export async function createGroup(
   name: string,
   actorMemberId: string
 ): Promise<GroupResult> {
+  if (isReservedSlug(slug)) return { ok: false, error: `'${slug}' is a reserved slug` };
   const { data, error } = await db
     .from("groups")
     .insert({ team_id: teamId, slug, name })
@@ -245,9 +279,22 @@ export async function ensurePersonSingleton(
       })
       .select("id")
       .single();
-    if (error || !data) return { ok: false, error: error?.message ?? "insert failed" };
-    groupId = data.id as string;
-    await auditWrite(db, teamId, actorMemberId, "access.singleton_created", groupId, { memberId });
+    if (error) {
+      // Race loser: a concurrent call inserted first (groups_person_singleton_idx or the slug
+      // unique). Converge on the winner's row instead of surfacing the duplicate-key error.
+      const { data: winner } = await db
+        .from("groups")
+        .select("id")
+        .eq("team_id", teamId)
+        .eq("person_member_id", memberId)
+        .maybeSingle();
+      if (!winner) return { ok: false, error: error.message };
+      groupId = (winner as { id: string }).id;
+    } else if (data) {
+      groupId = data.id as string;
+      await auditWrite(db, teamId, actorMemberId, "access.singleton_created", groupId, { memberId });
+    }
+    if (!groupId) return { ok: false, error: "singleton create failed" };
   }
   // Invariant: membership = exactly the person. Upsert theirs; drop anything else.
   const { error: upErr } = await db

@@ -195,6 +195,71 @@ describe("singleton integrity (direct person adds)", () => {
   });
 });
 
+describe("review-fold regressions (Fable round: hijack, tier, audit)", () => {
+  it("reserved slugs: createGroup refuses everyone/external/person-*, and ensureBuiltins refuses to convert a squatter", async () => {
+    const seed = await seedTeam();
+    for (const slug of [EVERYONE_SLUG, EXTERNAL_SLUG, "person-abc"]) {
+      expect((await createGroup(db(), seed.teamId, slug, "X", seed.memberId)).ok).toBe(false);
+    }
+    // A squatter planted directly (bypassing the writer): ensureBuiltins must fail loudly,
+    // not flip it to builtin and expose its grants team-wide (the review-caught hijack).
+    const project = await seedProject(seed);
+    const { data: squatter } = await db()
+      .from("groups")
+      .insert({ team_id: seed.teamId, slug: EVERYONE_SLUG, name: "curated" })
+      .select("id")
+      .single();
+    await db().from("project_groups").insert({ team_id: seed.teamId, project_id: project, group_id: squatter!.id });
+    const r = await ensureBuiltins(db(), seed.teamId);
+    expect(r.ok).toBe(false);
+    const { data: after } = await db().from("groups").select("is_builtin").eq("id", squatter!.id).single();
+    expect(after!.is_builtin, "squatter must not be converted").toBe(false);
+  });
+
+  it("tier consistency is read-side too: a team→external downgrade loses Everyone visibility BEFORE any sync runs", async () => {
+    const seed = await seedTeam();
+    await ensureBuiltins(db(), seed.teamId);
+    const project = await seedProject(seed);
+    const { data: everyone } = await db()
+      .from("groups")
+      .select("id")
+      .eq("team_id", seed.teamId)
+      .eq("slug", EVERYONE_SLUG)
+      .single();
+    await grantProjectToGroup(db(), seed.teamId, project, everyone!.id, seed.memberId);
+    const principal = { teamId: seed.teamId, memberId: seed.memberId };
+    expect((await visibleProjects(db(), principal)).projectIds.has(project)).toBe(true);
+
+    // Downgrade the tier WITHOUT calling syncBuiltinMembership — the stale Everyone row remains.
+    await db().from("members").update({ tier: "external" }).eq("id", seed.memberId).eq("team_id", seed.teamId);
+    expect(
+      (await visibleProjects(db(), principal)).projectIds.has(project),
+      "stale Everyone membership must not serve a downgraded member"
+    ).toBe(false);
+  });
+
+  it("audit rows land: an admin add writes access.member_added; a builtin sync that changed something writes access.builtin_synced", async () => {
+    const seed = await seedTeam();
+    const g = await createGroup(db(), seed.teamId, "audited", "A", seed.memberId);
+    const other = await seedMember(seed);
+    await addMemberToGroup(db(), seed.teamId, g.groupId!, other, seed.memberId);
+    const { data: added } = await db()
+      .from("audit_log")
+      .select("id")
+      .eq("team_id", seed.teamId)
+      .eq("action", "access.member_added");
+    expect((added ?? []).length).toBeGreaterThan(0);
+
+    await ensureBuiltins(db(), seed.teamId); // first sync adds the seed member → a change
+    const { data: synced } = await db()
+      .from("audit_log")
+      .select("id")
+      .eq("team_id", seed.teamId)
+      .eq("action", "access.builtin_synced");
+    expect((synced ?? []).length).toBeGreaterThan(0);
+  });
+});
+
 describe("the oracle (visibleProjects)", () => {
   it("resolves the chain for an agent principal; a fresh agent in no groups sees nothing", async () => {
     const seed = await seedTeam();
