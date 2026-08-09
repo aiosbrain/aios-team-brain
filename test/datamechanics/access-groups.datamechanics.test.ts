@@ -311,6 +311,27 @@ describe("the oracle (visibleProjects)", () => {
     expect(nothing.projectIds.size).toBe(0);
   });
 
+  it("a planted AGENT membership in a built-in grants nothing — builtin membership requires isBuiltinEligible, not just tier (Codex slice-2 High)", async () => {
+    const seed = await seedTeam();
+    await ensureBuiltins(db(), seed.teamId);
+    const project = await seedProject(seed);
+    const { data: everyone } = await db()
+      .from("groups")
+      .select("id")
+      .eq("team_id", seed.teamId)
+      .eq("slug", EVERYONE_SLUG)
+      .single();
+    await grantProjectToGroup(db(), seed.teamId, project, everyone!.id, seed.memberId);
+
+    const agent = await seedMember(seed, { kind: "agent" }); // team-tier — passes a tier-only check
+    const planted = await db()
+      .from("group_members")
+      .insert({ team_id: seed.teamId, group_id: everyone!.id, member_id: agent });
+    expect(planted.error).toBeNull();
+    const seen = await visibleProjects(db(), { teamId: seed.teamId, memberId: agent });
+    expect(seen.projectIds.size, "a team-tier agent planted in Everyone must still see nothing via it").toBe(0);
+  });
+
   it("read-side eligibility: a planted membership for an offroster row still resolves to nothing", async () => {
     const seed = await seedTeam();
     const offroster = await seedMember(seed, { kind: "offroster" });

@@ -1,6 +1,6 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
-import { isPrincipal } from "@/lib/access/eligibility";
+import { isBuiltinEligible, isPrincipal } from "@/lib/access/eligibility";
 import { EVERYONE_SLUG, EXTERNAL_SLUG } from "@/lib/access/groups";
 
 /**
@@ -74,6 +74,11 @@ export async function visibleProjects(db: DbClient, principal: Principal): Promi
         const g = r.groups;
         if (!g) return false; // missing embed: unresolvable group → fail closed (review M2)
         if (!g.is_builtin) return true;
+        // Built-in membership is legitimate ONLY for builtin-eligible humans of the matching
+        // tier. Tier alone is not enough: a planted team-tier AGENT in Everyone would pass a
+        // tier-only check and inherit every General project (slice-2 Codex High) — agents are
+        // principals for ordinary groups, never for built-ins.
+        if (!isBuiltinEligible(member)) return false;
         const requiredTier = tierFor[g.slug];
         // An is_builtin row with a slug outside the two known built-ins cannot be created by
         // the writer; if one exists it is a direct write — fail closed, never "unknown = allow".
