@@ -953,6 +953,70 @@ create table if not exists projects (
   unique (team_id, slug)
 );
 
+-- ── Access chain (spec: docs/specs/project-context-classification-v1.md §4) ──────────────
+-- Person → Group → Project → Content. These three tables are the ONLY access edges; the sole
+-- writer is lib/access/groups.ts (build-enforced by test/guards/access-single-writer.test.ts).
+-- Composite same-team FKs make a cross-team edge unrepresentable (the mirrored
+-- gateway_service_identities pattern), which needs (team_id, id) unique targets on the
+-- referenced tables:
+create unique index if not exists members_team_id_id_idx on members (team_id, id);
+create unique index if not exists projects_team_id_id_idx on projects (team_id, id);
+
+-- Member kind: 'human' (default) | 'agent' (standing autonomous agent — a principal, never
+-- auto-admitted to built-ins) | 'offroster' (attribution-only actor — never a principal).
+-- Predicates: lib/access/eligibility.ts (isPrincipal / isBuiltinEligible).
+alter table members add column if not exists kind text not null default 'human'
+  check (kind in ('human','agent','offroster'));
+
+-- Groups of people. "Everyone" and "External" are built-in rows (is_builtin), created per team
+-- by lib/access/groups.ts (ensureBuiltins); built-ins cannot be deleted and their membership is
+-- machine-maintained (isBuiltinEligible + tier), never hand-edited. A row with person_member_id
+-- set is a hidden per-person singleton group ("direct person add"): system-managed, absent from
+-- group pickers, membership permanently = exactly that member (writer-enforced; the schema alone
+-- cannot express it).
+create table if not exists groups (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  slug text not null,
+  name text not null,
+  is_builtin boolean not null default false,
+  person_member_id uuid,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  unique (team_id, slug),
+  unique (team_id, id),
+  foreign key (team_id, person_member_id) references members (team_id, id) on delete cascade,
+  -- a built-in can never be a singleton, and vice versa
+  check (person_member_id is null or not is_builtin)
+);
+create unique index if not exists groups_person_singleton_idx
+  on groups (team_id, person_member_id) where person_member_id is not null;
+
+create table if not exists group_members (
+  team_id uuid not null references teams(id) on delete cascade,
+  group_id uuid not null,
+  member_id uuid not null,
+  added_by uuid references members(id) on delete set null,
+  created_at timestamptz not null default now(),
+  primary key (group_id, member_id),
+  foreign key (team_id, group_id) references groups (team_id, id) on delete cascade,
+  foreign key (team_id, member_id) references members (team_id, id) on delete cascade
+);
+create index if not exists group_members_member_idx on group_members (team_id, member_id);
+
+-- Which groups can see a project. THE access edge.
+create table if not exists project_groups (
+  team_id uuid not null references teams(id) on delete cascade,
+  project_id uuid not null,
+  group_id uuid not null,
+  added_by uuid references members(id) on delete set null,
+  created_at timestamptz not null default now(),
+  primary key (project_id, group_id),
+  foreign key (team_id, project_id) references projects (team_id, id) on delete cascade,
+  foreign key (team_id, group_id) references groups (team_id, id) on delete cascade
+);
+create index if not exists project_groups_group_idx on project_groups (team_id, group_id);
+
 create table if not exists items (
   id uuid primary key default gen_random_uuid(),
   team_id uuid not null references teams(id) on delete cascade,
