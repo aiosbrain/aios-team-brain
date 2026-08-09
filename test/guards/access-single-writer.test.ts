@@ -15,6 +15,9 @@ const ROOT = join(import.meta.dirname, "..", "..");
 const SCAN_DIRS = ["app", "lib", "scripts"];
 const SINGLE_WRITER = join("lib", "access", "groups.ts");
 const EDGE_TABLES = ["groups", "group_members", "project_groups"];
+/** agent_tokens is credential material — same single-writer treatment, its own owner module. */
+const TOKEN_WRITER = join("lib", "access", "agent-tokens.ts");
+const TOKEN_TABLE = "agent_tokens";
 const WRITE_VERBS = /\.\s*(insert|upsert|update|delete)\s*\(/;
 
 function walk(dir: string, out: string[] = []): string[] {
@@ -56,9 +59,9 @@ function mentionsWithWrites(source: string, table: string): boolean {
   return quoted.some((q) => source.includes(q)) && WRITE_VERBS.test(source);
 }
 
-/** SQL DML against an edge table anywhere in postgres/ — migrations must never seed access. */
+/** SQL DML against an edge/credential table anywhere in postgres/ — migrations never seed access. */
 const SQL_DML = new RegExp(
-  `(insert\\s+into|update|delete\\s+from)\\s+(public\\.)?(${EDGE_TABLES.join("|")})\\b`,
+  `(insert\\s+into|update|delete\\s+from)\\s+(public\\.)?(${[...EDGE_TABLES, TOKEN_TABLE].join("|")})\\b`,
   "i"
 );
 
@@ -77,6 +80,9 @@ describe("access-chain single writer", () => {
           if (!writesTo(source, table) && mentionsWithWrites(source, table)) {
             offenders.push(`${rel} names ${table} in a file with write verbs (variable-table idiom?)`);
           }
+        }
+        if (rel !== TOKEN_WRITER && (writesTo(source, TOKEN_TABLE) || mentionsWithWrites(source, TOKEN_TABLE))) {
+          offenders.push(`${rel} writes/names ${TOKEN_TABLE} outside its single writer`);
         }
       }
     }
@@ -111,6 +117,18 @@ describe("access-chain single writer", () => {
     for (const table of EDGE_TABLES) {
       expect(writesTo(source, table), `expected ${SINGLE_WRITER} to write ${table}`).toBe(true);
     }
+  });
+
+  it("non-vacuous for tokens too, and the admin actions actually wire to the lib layer", () => {
+    const tokenSource = readFileSync(join(ROOT, TOKEN_WRITER), "utf8");
+    expect(writesTo(tokenSource, TOKEN_TABLE)).toBe(true);
+    // Pin the call site, not just the function: the mint/revoke actions must call the lib
+    // layer — deleting the wiring should redden this, not stay green (the repo's recurring
+    // failure mode).
+    const actions = readFileSync(join(ROOT, "app", "t", "[team]", "admin", "agents", "actions.ts"), "utf8");
+    expect(actions).toMatch(/mintAgentToken\s*\(/);
+    expect(actions).toMatch(/revokeAgentToken\s*\(/);
+    expect(actions).toMatch(/requireAdmin\s*\(/);
   });
 });
 

@@ -1019,6 +1019,32 @@ create table if not exists project_groups (
 );
 create index if not exists project_groups_group_idx on project_groups (team_id, group_id);
 
+-- Delegated agent tokens (spec §10). Wire format `aiosd_<token_id>_<secret>` — a distinct
+-- prefix so no parser can confuse a delegated token with a member key (`aios_…`); same
+-- hashed-secret discipline as api_keys. project_scope: NULL = unattenuated (inherit the
+-- principal's full LIVE visibility — the spawn default), '{}' = sees nothing; the two are
+-- never conflated. Sole writer: lib/access/agent-tokens.ts (guarded).
+-- on_behalf_of deletion CASCADES the token rather than nulling it: a null-out would silently
+-- convert an acting-as token into a self token, i.e. widen it to the launcher's own set.
+create table if not exists agent_tokens (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  member_id uuid not null,
+  on_behalf_of uuid,
+  project_scope uuid[],
+  token_id text not null unique,
+  token_hash text not null,
+  name text not null default '',
+  created_by uuid references members(id) on delete set null,
+  created_at timestamptz not null default now(),
+  expires_at timestamptz,
+  last_used_at timestamptz,
+  revoked_at timestamptz,
+  foreign key (team_id, member_id) references members (team_id, id) on delete cascade,
+  foreign key (team_id, on_behalf_of) references members (team_id, id) on delete cascade
+);
+create index if not exists agent_tokens_member_idx on agent_tokens (team_id, member_id);
+
 create table if not exists items (
   id uuid primary key default gen_random_uuid(),
   team_id uuid not null references teams(id) on delete cascade,

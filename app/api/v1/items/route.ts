@@ -1,6 +1,6 @@
 import { NextRequest, after } from "next/server";
 import { adminClient } from "@/lib/db/admin";
-import { authenticateApiKey } from "@/lib/api/auth";
+import { authenticateApiKey, authenticateAgentToken, isAgentBearer } from "@/lib/api/auth";
 import { isRestrictedTier } from "@/lib/auth/visibility";
 import { rateLimit } from "@/lib/api/rate-limit";
 import {
@@ -135,8 +135,21 @@ export async function POST(req: NextRequest) {
 }
 
 export async function GET(req: NextRequest) {
-  const auth = await authenticateApiKey(req);
-  if (!auth) return errorResponse("unauthorized", "invalid API key or team", 401);
+  // Phase A (spec §10/§17-A): this is the ONE route that honors delegated agent tokens.
+  // An agent principal gets the oracle filter below; member keys behave exactly as before.
+  let agentProjects: ReadonlySet<string> | null = null;
+  let auth: { teamId: string; memberId: string; memberTier: "team" | "external"; apiKeyId: string };
+  if (isAgentBearer(req)) {
+    const agent = await authenticateAgentToken(req);
+    if (!agent) return errorResponse("unauthorized", "invalid agent token or team", 401);
+    const { effectiveVisibleProjects } = await import("@/lib/access/oracle");
+    agentProjects = await effectiveVisibleProjects(adminClient(), agent);
+    auth = { teamId: agent.teamId, memberId: agent.memberId, memberTier: agent.memberTier, apiKeyId: `agent:${agent.agentTokenId}` };
+  } else {
+    const memberAuth = await authenticateApiKey(req);
+    if (!memberAuth) return errorResponse("unauthorized", "invalid API key or team", 401);
+    auth = memberAuth;
+  }
 
   const db = adminClient();
   if (!(await rateLimit(db, `${auth.apiKeyId}:items:get`, 60))) {
@@ -160,6 +173,14 @@ export async function GET(req: NextRequest) {
     .order("id", { ascending: true })
     .limit(PAGE_SIZE);
   if (isRestrictedTier(auth.memberTier)) q = q.eq("access", "external");
+  // Agent principals read only items whose ingestion project is in their effective set —
+  // the oracle's triple intersection, computed live this request. An empty set short-circuits
+  // to zero rows rather than an unfiltered query (the [] vs NULL distinction, spec §10).
+  // Item-grain memberships refine this once the Part II context substrate lands.
+  if (agentProjects !== null) {
+    if (agentProjects.size === 0) return Response.json({ items: [], next_cursor: null });
+    q = q.in("project_id", [...agentProjects]);
+  }
   if (kinds?.length) q = q.in("kind", kinds);
   // On-demand fetch of one skill/deliverable folder: match path by prefix.
   if (pathPrefix) q = q.like("path", `${pathPrefix.replace(/[%_\\]/g, "\\$&")}%`);

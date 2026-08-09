@@ -14,6 +14,78 @@ export type ApiAuth = {
   email: string | null;
 };
 
+/**
+ * A delegated agent token's resolved principal (spec §10). Distinct from ApiAuth on purpose:
+ * routes must OPT IN to delegated tokens — in Phase A only GET /api/v1/items does; every
+ * other route's `authenticateApiKey` rejects the `aiosd_` prefix as malformed (fail closed),
+ * and `query` returns an explicit 403 `delegation_not_supported`.
+ */
+export type AgentApiAuth = {
+  kind: "agent";
+  teamId: string;
+  /** The launching principal. */
+  memberId: string;
+  onBehalfOf: string | null;
+  projectScope: string[] | null;
+  /** Strictest tier across both legs. */
+  memberTier: "team" | "external";
+  agentTokenId: string;
+};
+
+/** True when the Authorization header carries a delegated agent token (aiosd_ prefix). */
+export function isAgentBearer(req: Request): boolean {
+  return /^Bearer\s+aiosd_/.test(req.headers.get("authorization") || "");
+}
+
+/**
+ * Bearer auth for delegated agent tokens (`aiosd_<token_id>_<secret>`). Same discipline as
+ * authenticateApiKey: null on any failure (caller responds 401), failures audited, the
+ * X-AIOS-Team header must match the token's team.
+ */
+export async function authenticateAgentToken(req: Request): Promise<AgentApiAuth | null> {
+  const { verifyAgentToken, markAgentTokenUsed } = await import("@/lib/access/agent-tokens");
+  const header = req.headers.get("authorization") || "";
+  const teamHeader = req.headers.get("x-aios-team") || "";
+  const db = adminClient();
+  const ip = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || null;
+
+  const bearer = header.replace(/^Bearer\s+/, "");
+  const principal = await verifyAgentToken(db, bearer);
+  if (!principal) {
+    await audit(db, {
+      team_id: null,
+      actor_kind: "system",
+      action: "auth.failed",
+      meta: { reason: "invalid_agent_token", team_header: teamHeader },
+      ip,
+    });
+    return null;
+  }
+  if (teamHeader && teamHeader !== principal.teamId) {
+    const { data: team } = await db.from("teams").select("slug").eq("id", principal.teamId).maybeSingle();
+    if (teamHeader !== (team as { slug: string } | null)?.slug) {
+      await audit(db, {
+        team_id: null,
+        actor_kind: "system",
+        action: "auth.failed",
+        meta: { reason: "team_mismatch", team_header: teamHeader },
+        ip,
+      });
+      return null;
+    }
+  }
+  void markAgentTokenUsed(db, principal.tokenRowId);
+  return {
+    kind: "agent",
+    teamId: principal.teamId,
+    memberId: principal.memberId,
+    onBehalfOf: principal.onBehalfOf,
+    projectScope: principal.projectScope,
+    memberTier: principal.effectiveTier,
+    agentTokenId: principal.tokenRowId,
+  };
+}
+
 export async function markApiKeyUsed(apiKeyId: string): Promise<boolean> {
   try {
     const { error } = await adminClient()

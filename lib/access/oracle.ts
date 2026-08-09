@@ -104,3 +104,28 @@ export async function canSeeProject(db: DbClient, principal: Principal, projectI
   const { projectIds } = await visibleProjects(db, principal);
   return projectIds.has(projectId);
 }
+
+/**
+ * The delegated-token formula (spec §10), verbatim:
+ *   effective = visibleProjects(member) ∩ visibleProjects(on_behalf_of ?? member) ∩ (scope ?? U)
+ * The launcher's own visibility ALWAYS intersects — a mixed credential (agent launcher +
+ * human on_behalf_of) can never exceed the agent's own groups. Computed live per request:
+ * no snapshot exists to drift when either leg's groups change.
+ */
+export async function effectiveVisibleProjects(
+  db: DbClient,
+  token: { teamId: string; memberId: string; onBehalfOf: string | null; projectScope: string[] | null }
+): Promise<ReadonlySet<string>> {
+  const launcher = await visibleProjects(db, {
+    teamId: token.teamId,
+    memberId: token.memberId,
+    projectScope: token.projectScope,
+  });
+  if (!token.onBehalfOf || token.onBehalfOf === token.memberId) return launcher.projectIds;
+  const represented = await visibleProjects(db, {
+    teamId: token.teamId,
+    memberId: token.onBehalfOf,
+    projectScope: token.projectScope,
+  });
+  return new Set([...launcher.projectIds].filter((p) => represented.projectIds.has(p)));
+}
