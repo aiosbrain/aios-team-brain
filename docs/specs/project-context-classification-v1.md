@@ -72,10 +72,13 @@ so the model stays one edge type).
    app layer and confirming the database refuses. "No results" looks identical whether content is
    absent or invisible.
 7. **Agents get attenuated access, structurally — and standing agents are group-governed.** An
-   agent acting for a person holds a token whose access = that person's access ∩ the token's scope —
-   an intersection can only shrink, so privilege expansion is impossible rather than forbidden. An
-   **autonomous** agent is instead its own principal: put in groups like a person, seeing exactly
-   what its groups see, auto-joined to nothing (a new agent sees nothing until an admin places it).
+   agent a person spawns **inherits that person's group memberships by default** — by live
+   delegation, never by copying memberships: its access = the person's *current* access ∩ the
+   token's scope, so it tracks group changes instantly and can only be narrowed at launch, never
+   widened. An intersection can only shrink, so privilege expansion is impossible rather than
+   forbidden. An **autonomous** agent is instead its own principal: put in groups like a person,
+   seeing exactly what its groups see, auto-joined to nothing (a new agent sees nothing until an
+   admin places it).
    Old API keys keep working unchanged; the QM integration gets this principal model first, before
    any UI.
 8. **Cost is real and priced.** Graph extraction is the expensive operation: measured on prod at
@@ -793,7 +796,9 @@ list) with a stated budget (+15% p95 ceiling) before RLS graduates from staging 
   `api_keys`. An old server rejects the unknown prefix with today's 401 — additive compatibility
   needs no version negotiation.
   New table `agent_tokens`: `id, team_id, member_id (the launching principal), on_behalf_of
-  (member_id, nullable = self), project_scope uuid[] (attenuation set), expires_at, revoked_at,
+  (member_id, nullable = self), project_scope uuid[] (attenuation set; **NULL = unattenuated,
+  i.e. inherit the principal's full live visibility — the spawn default below; empty array = sees
+  nothing** — the two must never be conflated), expires_at, revoked_at,
   created_by, last_used_at`, hashed secret, audited on mint/use/revoke.
 - **Attenuation, never expansion, enforced at the token layer:**
   `effective = visibleProjects(member) ∩ visibleProjects(on_behalf_of ?? member) ∩ project_scope`
@@ -819,8 +824,23 @@ list) with a stated budget (+15% p95 ceiling) before RLS graduates from staging 
   tokens honored on `GET /api/v1/items` with the oracle filter; `query` refuses delegation until
   Phase B; single team; no external-tier delegation.
 
+**Spawn default — a person-spawned agent inherits its spawner's memberships, by delegation, not
+by copy.** When a person launches an agent, the minted `agent_tokens` row defaults to
+`member_id = spawner, on_behalf_of = null (self), project_scope = NULL` (= unattenuated), so the
+agent's effective visibility is exactly the spawner's — **computed live from the person's current
+group memberships on every request**, per the triple intersection above. The launcher (§15.7) lets
+the person attenuate DOWN at spawn (pick a narrower project set); it offers nothing to widen. Two
+things this default deliberately is not: (a) **not a membership copy** — no `group_members` rows
+are ever written for a spawned agent, so there is no snapshot to drift when the person's groups
+change (they lose a group, every agent they spawned loses it the same request; revoking the token
+kills it entirely), and no automation writes membership edges (invariant 10 stays intact); (b)
+**not the standing-agent model** — the paragraph below. The two modes are distinguished by how the
+credential was made: person-spawned = delegated token defaulting to full inheritance; standing =
+its own member row with explicit grants and no inherited anything.
+
 **Autonomous agents as first-class principals — group-governed, same one rule.** Delegation above
-covers an agent acting *as someone*; a standing autonomous agent (a scheduled workflow, a team bot
+covers an agent acting *as someone* — including the spawn default just stated; a standing
+autonomous agent (a scheduled workflow, a team bot
 with its own duties) is instead its **own principal**: a member row of `kind='agent'` (the
 service-account pattern `members.is_connector` already establishes), **placed in groups exactly
 like a person and seeing exactly what its groups see**. No agent-specific access semantics exist —
@@ -935,6 +955,7 @@ through the *outcome*, not the code path:
 | Learner boundary | unit (write-policy guard) + datamechanics (outcome) | a rule proposal cannot express a membership/group edge (schema-level), no learner code path writes `group_members`/`project_groups`, and after a learner run the edge tables are byte-identical (§Part II learning) |
 | Agent principal | datamechanics | an agent member in group G sees exactly G's projects; a fresh agent in no groups sees nothing; no agent row ever appears in Everyone OR External (§10, §11) |
 | Mixed agent token | http | a token minted by an agent with a human `on_behalf_of` reads only the triple intersection — planted content visible to the human but not the agent never reaches it (§10) |
+| Spawn inheritance is live | datamechanics | a person-spawned unattenuated token sees the spawner's projects; remove the spawner from a group and the SAME token loses that project's content on the next request — no snapshot survives (§10 spawn default); `project_scope = '{}'` (empty) sees nothing, distinct from NULL |
 | Singleton integrity | datamechanics | a singleton group cannot gain a second member, hold a membership row for a different member, be set on a built-in, or reference another team's member (each rejected at write; composite FK + checks §4); group-picker queries exclude it |
 
 Probing tests are explicitly adversarial: timing-insensitive, but shape-sensitive (result counts,
@@ -970,8 +991,9 @@ under `app/t/[team]/admin/*` and the guard that pages read through the oracle.
    grant renders as "directly added by ⟨admin⟩", §4). Agreed: highest
    value per effort — it is also the support tool for every future access bug report, and it doubles
    as the runtime cache-leak check (§5.8). Build early, not last.
-7. **Agent launcher** — scope (project set) shown explicitly pre-launch; launching mints the
-   attenuated token (§10).
+7. **Agent launcher** — scope (project set) shown explicitly pre-launch, **defaulting to the
+   spawner's full visibility** (inheritance by delegation, §10 spawn default) with attenuate-down
+   controls only; launching mints the token (§10).
 8. **Signal view** — placeholder rendering `intent_records` at the viewer's disclosure level; ships
    dark until §13 is built.
 
