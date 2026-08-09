@@ -87,6 +87,14 @@ export async function createMember(
     target_id: data.id,
     meta: { email, role: input.role, upsert: Boolean(opts.upsert) },
   });
+  // Membership eligibility may have changed (an upsert can change tier; a connector row is
+  // never eligible) → converge the built-ins now (spec §11). Best-effort; tick is backstop.
+  try {
+    const { syncBuiltinMembership } = await import("@/lib/access/groups");
+    await syncBuiltinMembership(admin, teamId);
+  } catch {
+    // access maintenance must never fail member creation
+  }
   return { id: data.id, status: data.status };
 }
 
@@ -288,5 +296,13 @@ export async function deleteMember(
     target_id: member.id,
     meta: { email: e },
   });
+  // A disabled/deleted member is no longer builtin-eligible → drop them from Everyone/External
+  // now, not at the next tick (spec §11). Best-effort.
+  try {
+    const { syncBuiltinMembership } = await import("@/lib/access/groups");
+    await syncBuiltinMembership(admin, teamId);
+  } catch {
+    // access maintenance must never fail member removal
+  }
   return { deleted: true, mode: opts.hard ? "hard" : "soft", id: member.id };
 }

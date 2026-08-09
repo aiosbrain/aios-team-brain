@@ -33,6 +33,11 @@ export function startIngestScheduler(): void {
     await runInbound(db);
     await runImport(db, "github", runGithubIngestion);
     await runAuthCleanup(db);
+    // §11 access-bootstrap convergence: built-in groups/system projects/grants for every team.
+    // Idempotent and cheap when converged; this is also how PRE-EXISTING teams get bootstrapped
+    // on first deploy (SQL migrations cannot seed the edge tables — the single-writer guard
+    // forbids it by design, so app code is the only legal seeder). Best-effort, traced.
+    await runAccessBootstrap(db);
     // Turn freshly-synced meeting transcripts (source granola/zoom/… — never slack) into meeting
     // notes, so CLI-pushed meetings show up on the Meetings page automatically. Idempotent + cheap
     // when nothing new (finds 0 candidates → returns); best-effort, never fails the tick.
@@ -234,6 +239,30 @@ export function startIngestScheduler(): void {
 
   // Create meeting notes for freshly-synced meeting transcripts, per team. Best-effort; idempotent
   // (already-noted items are skipped), so this is a cheap no-op once caught up.
+  async function runAccessBootstrap(db: ReturnType<typeof adminClient>): Promise<void> {
+    const startedAt = Date.now();
+    try {
+      const { ensureAccessBootstrapAllTeams } = await import("@/lib/access/bootstrap");
+      const { recordIngestRun } = await import("@/lib/ingest/runs");
+      const r = await ensureAccessBootstrapAllTeams(db);
+      // One instance-wide run row per tick (teamId null, like auth_cleanup): the leg is
+      // diagnosable on the dashboard, and a per-team failure surfaces in meta instead of
+      // silently converging never.
+      await recordIngestRun(db, {
+        teamId: null,
+        source: "access_bootstrap",
+        trigger: "scheduler",
+        ok: r.failed.length === 0,
+        created: 0,
+        errors: r.failed.length ? [`${r.failed.length}/${r.teams} teams failed bootstrap`] : undefined,
+        meta: { teams: r.teams, failed: r.failed.slice(0, 5) },
+        startedAt,
+      });
+    } catch (err) {
+      console.error("[ingest] access bootstrap failed", err);
+    }
+  }
+
   async function runMeetingNotesBackfill(db: ReturnType<typeof adminClient>): Promise<void> {
     try {
       const { backfillMeetingNotesFromItems } = await import("@/lib/meetings/from-items");

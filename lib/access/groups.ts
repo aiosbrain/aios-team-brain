@@ -329,7 +329,7 @@ export async function grantProjectToGroup(
   teamId: string,
   projectId: string,
   groupId: string,
-  actorMemberId: string
+  actorMemberId: string | null
 ): Promise<WriteResult> {
   const { error } = await db
     .from("project_groups")
