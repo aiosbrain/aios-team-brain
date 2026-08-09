@@ -77,10 +77,14 @@ export async function mintAgentToken(
   const launcher = await getMember(db, teamId, args.memberId);
   if (!launcher) return { ok: false, error: "launching member not found" };
   if (!isPrincipal(launcher)) return { ok: false, error: "launching member is not a principal" };
+  // Phase A alpha restriction (spec §10/§17-A): "no external-tier delegation" — refused at
+  // mint AND re-checked at verify, so a tier downgrade after mint kills the token too.
+  if (launcher.tier === "external") return { ok: false, error: "external-tier delegation is not supported in Phase A" };
   if (args.onBehalfOf) {
     const rep = await getMember(db, teamId, args.onBehalfOf);
     if (!rep) return { ok: false, error: "on_behalf_of member not found" };
     if (!isPrincipal(rep)) return { ok: false, error: "on_behalf_of member is not a principal" };
+    if (rep.tier === "external") return { ok: false, error: "external-tier delegation is not supported in Phase A" };
   }
 
   const tokenId = randomBytes(6).toString("hex");
@@ -149,11 +153,12 @@ export async function verifyAgentToken(
 
   const launcher = await getMember(db, row.team_id, row.member_id);
   if (!launcher || !isPrincipal(launcher)) return null;
-  let repTier: "team" | "external" | null = null;
+  // Phase A: no external-tier delegation (re-checked live — a downgrade kills the token).
+  if (launcher.tier === "external") return null;
   if (row.on_behalf_of) {
     const rep = await getMember(db, row.team_id, row.on_behalf_of);
     if (!rep || !isPrincipal(rep)) return null;
-    repTier = rep.tier;
+    if (rep.tier === "external") return null;
   }
 
   return {
@@ -162,7 +167,9 @@ export async function verifyAgentToken(
     memberId: row.member_id,
     onBehalfOf: row.on_behalf_of,
     projectScope: row.project_scope,
-    effectiveTier: launcher.tier === "external" || repTier === "external" ? "external" : "team",
+    // Both legs are team-tier by the Phase A refusals above; when Phase B admits external
+    // delegation this becomes strictest-of-both-legs again.
+    effectiveTier: "team",
   };
 }
 
@@ -173,12 +180,16 @@ export async function revokeAgentToken(
   tokenRowId: string,
   actorMemberId: string
 ): Promise<{ ok: boolean; error?: string }> {
-  const { error } = await db
+  const { data, error } = await db
     .from("agent_tokens")
     .update({ revoked_at: new Date().toISOString() })
     .eq("team_id", teamId)
-    .eq("id", tokenRowId);
+    .eq("id", tokenRowId)
+    .select("id");
   if (error) return { ok: false, error: error.message };
+  // A zero-row update is "no such token in this team" — never audit a revocation that did
+  // not happen (review M3: the audit log must not claim phantom revocations).
+  if (!data || (data as unknown[]).length === 0) return { ok: false, error: "no such token" };
   await audit(db, {
     team_id: teamId,
     actor_kind: "member",
