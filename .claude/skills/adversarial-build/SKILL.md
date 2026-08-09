@@ -2,7 +2,9 @@
 name: adversarial-build
 description: >
   The full build loop for a feature slice in this repo: AIOS-CLI ticket
-  (create-or-update) → write code with spec-first tests → Fable adversarial
+  (create-or-update) → spec gate (author via `aios spec init` if none exists,
+  then `aios spec eval` must say SPEC_READY) → write code with spec-first
+  tests → Fable adversarial
   review → fold → Codex adversarial review → fold → push the PR → update the
   ticket. Use when asked to "build the next phase/slice", "build X with
   reviews", or /adversarial-build. Every step below traces to a defect one of
@@ -13,10 +15,11 @@ description: >
 
 # Adversarial build loop
 
-The spine, verbatim from the operator:
+The spine, from the operator (spec gate added by operator revision):
 
-> **aios ticket (create or update) → write code → Fable adversarial review → fold →
-> Codex adversarial review → fold → push the PR → aios ticket update**
+> **aios ticket (create or update) → spec gate (author if none + `aios spec eval`) →
+> write code → Fable adversarial review → fold → Codex adversarial review → fold →
+> push the PR → aios ticket update**
 
 Two different models review because they demonstrably catch different defect
 distributions: on the slices this loop was built on, Fable found the
@@ -39,6 +42,37 @@ an experiment with replication.
 - Read the projection back (`/opt/homebrew/bin/aios status` → `pm projection: ok · N synced`
   — both `push` and `status` print that line).
   Cite the BRAIN row key in branch/PR/trailer, never the Linear `AIO-*` key.
+
+## 0.5 Spec gate (AIOS CLI)
+
+- **Locate the governing spec.** A build slice must trace to a written spec
+  (CLAUDE.md task gate: anything touching schema, money, or more than one
+  surface). For this repo's access work that is
+  `docs/specs/project-context-classification-v1.md` §-references in the PR.
+- **If no spec exists**: author one before any code — scaffold with
+  `/opt/homebrew/bin/aios spec init <path>` (writes the issue-template shape)
+  or write it in `docs/design/`/`docs/specs/`, then run it through review
+  rounds (a fresh Fable cold read at minimum) before building against it.
+- **Gate the spec** with the eval tool, and mind two sharp edges learned in
+  practice:
+  - Run **from the repo root** with the workspace env loaded:
+    `set -a && . ~/Projects/chetan-workspace/.env && set +a &&
+    /opt/homebrew/bin/aios spec eval <file> --tier deterministic --no-llm`.
+    Running from the workspace directory resolves the spec's repo-relative
+    code paths against the wrong tree and emits dozens of FALSE `SR3` blockers
+    (observed; cost a full debugging detour).
+  - Required outcome: `verdict: SPEC_READY`, exit 0. Real blockers this gate
+    has caught: acceptance criteria with no observable anchor (it reads only
+    each bullet's FIRST source line — put the test-tier/backtick anchor
+    there), a missing build-with tier, module references that don't resolve.
+  - `--tier full` adds the adversarial LLM layer when its key
+    (`DEEPSEEK_API_KEY`) is configured; when absent, the loop's two model
+    reviews stand in as the adversarial layer — say so in the PR, don't
+    pretend the layer ran.
+  - `aios spec fix <file>` exists for the bounded auto-fix loop; hand-fixing
+    against the blocker list is usually faster for a spec you just wrote.
+- Re-run the eval after ANY spec amendment mid-build — SPEC_READY is a state,
+  not a milestone.
 
 ## 1. Write the code
 
