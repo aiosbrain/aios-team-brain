@@ -1035,13 +1035,16 @@ create table if not exists agent_tokens (
   token_id text not null unique,
   token_hash text not null,
   name text not null default '',
-  created_by uuid references members(id) on delete set null,
+  created_by uuid,
   created_at timestamptz not null default now(),
   expires_at timestamptz,
   last_used_at timestamptz,
   revoked_at timestamptz,
   foreign key (team_id, member_id) references members (team_id, id) on delete cascade,
-  foreign key (team_id, on_behalf_of) references members (team_id, id) on delete cascade
+  foreign key (team_id, on_behalf_of) references members (team_id, id) on delete cascade,
+  -- provenance-only, but same-team like every other member column here (review L2).
+  -- Column-list SET NULL (PG15+): nulls created_by only, never team_id.
+  foreign key (team_id, created_by) references members (team_id, id) on delete set null (created_by)
 );
 create index if not exists agent_tokens_member_idx on agent_tokens (team_id, member_id);
 

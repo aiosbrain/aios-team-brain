@@ -72,10 +72,11 @@ describe("mint + verify lifecycle", () => {
     expect(await verifyAgentToken(db(), minted.token!), "deactivated launcher must kill the token").toBeNull();
     await db().from("members").update({ status: "active" }).eq("id", agent).eq("team_id", seed.teamId);
 
-    // revoke
+    // revoke — and a no-op revoke (unknown id) must NOT report success or audit (Fable M3)
     const r = await revokeAgentToken(db(), seed.teamId, minted.tokenRowId!, seed.memberId);
     expect(r.ok).toBe(true);
     expect(await verifyAgentToken(db(), minted.token!)).toBeNull();
+    expect((await revokeAgentToken(db(), seed.teamId, randomUUID(), seed.memberId)).ok).toBe(false);
 
     // expired
     const expired = await mintAgentToken(
@@ -189,6 +190,97 @@ describe("the items route honors delegated tokens with the oracle filter (the ON
     expect(res.status).toBe(200);
     const paths = ((await res.json()).items as { path: string }[]).map((i) => i.path);
     expect(paths).toContain("m/anything.md");
+  });
+});
+
+describe("stored scope end to end (Fable H2: the []→NULL fail-open direction must have a red test)", () => {
+  it("a token minted with projectScope [] sees ZERO items through the route — distinct from NULL = all granted", async () => {
+    const seed = await seedTeam();
+    await ingest(seed, { path: "s/one.md", body: "scoped one", access: "team", project: "sproj" });
+    const { data: projects } = await db().from("projects").select("id, slug").eq("team_id", seed.teamId);
+    const proj = ((projects ?? []) as { id: string; slug: string }[]).find((p) => p.slug === "sproj")!.id;
+
+    const agent = await seedMember(seed, { kind: "agent" });
+    const g = await createGroup(db(), seed.teamId, "sg", "G", seed.memberId);
+    await addMemberToGroup(db(), seed.teamId, g.groupId!, agent, seed.memberId);
+    await grantProjectToGroup(db(), seed.teamId, proj, g.groupId!, seed.memberId);
+
+    const nullScope = await mintAgentToken(db(), seed.teamId, { memberId: agent, projectScope: null }, seed.memberId);
+    const emptyScope = await mintAgentToken(db(), seed.teamId, { memberId: agent, projectScope: [] }, seed.memberId);
+    expect(nullScope.ok && emptyScope.ok).toBe(true);
+
+    const all = await itemsGET(itemsReq(nullScope.token!));
+    expect(((await all.json()).items as { path: string }[]).map((i) => i.path)).toContain("s/one.md");
+    const none = await itemsGET(itemsReq(emptyScope.token!));
+    expect((await none.json()).items, "stored [] must survive mint→pg→verify→route as SEES NOTHING").toEqual([]);
+  });
+
+  it("a token minted with projectScope [P] where the principal sees {P,Q} serves only P through the route", async () => {
+    const seed = await seedTeam();
+    await ingest(seed, { path: "p/in.md", body: "in scope", access: "team", project: "pproj" });
+    await ingest(seed, { path: "q/out.md", body: "out of scope", access: "team", project: "qproj" });
+    const { data: projects } = await db().from("projects").select("id, slug").eq("team_id", seed.teamId);
+    const bySlug = new Map(((projects ?? []) as { id: string; slug: string }[]).map((p) => [p.slug, p.id]));
+
+    const agent = await seedMember(seed, { kind: "agent" });
+    const g = await createGroup(db(), seed.teamId, "pq", "G", seed.memberId);
+    await addMemberToGroup(db(), seed.teamId, g.groupId!, agent, seed.memberId);
+    await grantProjectToGroup(db(), seed.teamId, bySlug.get("pproj")!, g.groupId!, seed.memberId);
+    await grantProjectToGroup(db(), seed.teamId, bySlug.get("qproj")!, g.groupId!, seed.memberId);
+
+    const minted = await mintAgentToken(
+      db(),
+      seed.teamId,
+      { memberId: agent, projectScope: [bySlug.get("pproj")!] },
+      seed.memberId
+    );
+    const res = await itemsGET(itemsReq(minted.token!));
+    const paths = ((await res.json()).items as { path: string }[]).map((i) => i.path);
+    expect(paths).toContain("p/in.md");
+    expect(paths, "attenuation must survive the storage round-trip").not.toContain("q/out.md");
+  });
+
+  it("a mixed token (agent + human on_behalf_of) through the route reads only the intersection (§14 row, route tier)", async () => {
+    const seed = await seedTeam();
+    await ingest(seed, { path: "x/shared.md", body: "both", access: "team", project: "xshared" });
+    await ingest(seed, { path: "y/humanonly.md", body: "human", access: "team", project: "yhuman" });
+    const { data: projects } = await db().from("projects").select("id, slug").eq("team_id", seed.teamId);
+    const bySlug = new Map(((projects ?? []) as { id: string; slug: string }[]).map((p) => [p.slug, p.id]));
+
+    const agent = await seedMember(seed, { kind: "agent" });
+    const ag = await createGroup(db(), seed.teamId, "ag", "A", seed.memberId);
+    await addMemberToGroup(db(), seed.teamId, ag.groupId!, agent, seed.memberId);
+    await grantProjectToGroup(db(), seed.teamId, bySlug.get("xshared")!, ag.groupId!, seed.memberId);
+    const hg = await createGroup(db(), seed.teamId, "hg", "H", seed.memberId);
+    await addMemberToGroup(db(), seed.teamId, hg.groupId!, seed.memberId, seed.memberId);
+    await grantProjectToGroup(db(), seed.teamId, bySlug.get("xshared")!, hg.groupId!, seed.memberId);
+    await grantProjectToGroup(db(), seed.teamId, bySlug.get("yhuman")!, hg.groupId!, seed.memberId);
+
+    const minted = await mintAgentToken(db(), seed.teamId, { memberId: agent, onBehalfOf: seed.memberId }, seed.memberId);
+    const res = await itemsGET(itemsReq(minted.token!));
+    const paths = ((await res.json()).items as { path: string }[]).map((i) => i.path);
+    expect(paths).toContain("x/shared.md");
+    expect(paths, "content visible to the human but not the agent must never reach the token").not.toContain("y/humanonly.md");
+  });
+});
+
+describe("Phase A: no external-tier delegation (Fable H1)", () => {
+  it("mint refuses an external-tier launcher and an external-tier on_behalf_of", async () => {
+    const seed = await seedTeam();
+    const extAgent = await seedMember(seed, { kind: "agent", tier: "external" });
+    const extHuman = await seedMember(seed, { tier: "external" });
+    const agent = await seedMember(seed, { kind: "agent" });
+    expect((await mintAgentToken(db(), seed.teamId, { memberId: extAgent }, seed.memberId)).ok).toBe(false);
+    expect((await mintAgentToken(db(), seed.teamId, { memberId: agent, onBehalfOf: extHuman }, seed.memberId)).ok).toBe(false);
+  });
+
+  it("a tier downgrade AFTER mint kills the live token at verify", async () => {
+    const seed = await seedTeam();
+    const agent = await seedMember(seed, { kind: "agent" });
+    const minted = await mintAgentToken(db(), seed.teamId, { memberId: agent }, seed.memberId);
+    expect(await verifyAgentToken(db(), minted.token!)).not.toBeNull();
+    await db().from("members").update({ tier: "external" }).eq("id", agent).eq("team_id", seed.teamId);
+    expect(await verifyAgentToken(db(), minted.token!), "external downgrade must kill the token in Phase A").toBeNull();
   });
 });
 
