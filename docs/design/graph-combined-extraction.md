@@ -292,7 +292,35 @@ and the tap edit stays the only instrument change.
 quietly corrected, because "I specified a metric against an instrument I had not opened" is the
 failure, not the two fixes.
 
-**Measured before any arm runs, at zero cost:** the incumbent's orphan share. It is the size of the
+### The free check, run — the incumbent's orphan share is 7.1%
+
+Measured on prod's live graph (read-only Cypher via `railway ssh`, 2026-08-11), **before spending
+anything**:
+
+```
+aios_team:     entities 19,051   orphans 1,356   share 7.1%
+aios_external: entities     16   orphans     2   share 12.5%
+```
+
+**The lever survives this check** — 7.1% is meaningful but not disqualifying. What it fixes:
+
+- **Q8′ gets its pre-registered bound.** The candidate FAILs if its orphan-drop loss rate exceeds the
+  **battery incumbent's** share — measured on the battery graph at run time, with prod's 7.1% as the
+  prior and a sanity check. If the battery's own figure lands far from 7.1%, that discrepancy is
+  itself reportable before any candidate rep runs.
+- **It sizes the confound Q1′ exists to dodge.** Raw entities-per-episode should fall ~7% in the
+  candidate **mechanically**. Anyone reading raw entity count would have called that a 7% quality
+  regression; Q1′ (connected entities) does not move on it.
+- **It predicts Q9's exposure.** If ~7% of entities are orphans, a consensus list drawn from all
+  entities carries ~7% guaranteed-FAIL members. The `consensus ∩ incumbent-orphans` exclusion is
+  therefore **load-bearing, not hypothetical** — without it Q9 would have failed on arithmetic.
+
+**Prediction on the record before the run:** raw entity yield falls ~5–9% in the candidate,
+`connected` entity yield does not move outside the band, and Q8′ lands near the battery incumbent's
+own orphan share. If raw yield falls much *more* than the orphan share explains, that is real entity
+loss and Q9/Q1′ must catch it.
+
+**Also measured before any arm runs:** the battery incumbent's orphan share, on the battery graph. It is the size of the
 confound, the expected mechanical shift in raw entity count, and Q8′'s pre-registered bound. One
 Cypher query.
 
