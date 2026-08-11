@@ -96,16 +96,24 @@ describe("enforced retrieval (Phase B slice 2)", () => {
     expect(enforcing.structured, "a restricted item's decision must not surface to an outsider").not.toContain("DEC-9");
   });
 
-  it("enforcing: the git/people activity digests are omitted (unpartitionable, would name restricted work)", async () => {
+  it("enforcing: the people-activity digest AND the full-corpus task-count are omitted (unpartitionable legs)", async () => {
     const seed = await seedTeam();
-    await ingest(seed, { path: "act.md", body: `act ${TERM}`, access: "team", project: "src" });
+    // An item attributed to the seed member with a non-git source → qualifies for the people digest.
+    await ingest(seed, { path: "act.md", body: `act ${TERM}`, access: "team", project: "src", frontmatter: { source: "slack" } });
+    await db().from("items").update({ member_id: seed.memberId }).eq("team_id", seed.teamId).eq("path", "act.md");
     await backfillTeamContext(db(), seed.teamId);
     const member = await seedMember(seed);
-    // An activity-intent question triggers the digests under permissive; enforcing omits them.
+    const q = "who is working on what this week";
+
+    // Permissive: the people digest header appears (proves the leg is live for this question).
+    const permissive = await retrieve(db(), seed.teamId, "team", q, null, null);
+    expect(permissive.structured, "permissive emits the people-activity digest").toContain("## Activity by person");
+
+    // Enforcing: the people digest AND the full-corpus task-count aggregate are omitted.
     const enforce = { visibleItemIds: (await visibleItemIds(db(), { teamId: seed.teamId, memberId: member })).ids };
-    const enforcing = await retrieve(db(), seed.teamId, "team", "who is working on what this week", null, enforce);
-    // The full-corpus task-count aggregate is replaced with a neutral header under enforcing.
-    expect(enforcing.structured).not.toMatch(/## Task counts \(all \d+ tasks/);
+    const enforcing = await retrieve(db(), seed.teamId, "team", q, null, enforce);
+    expect(enforcing.structured, "enforcing omits the people-activity digest (would name restricted work)").not.toContain("## Activity by person");
+    expect(enforcing.structured, "enforcing omits the full-corpus task-count").not.toMatch(/## Task counts \(all \d+ tasks/);
     expect(enforcing.structured).toContain("## Tasks visible to you");
   });
 
