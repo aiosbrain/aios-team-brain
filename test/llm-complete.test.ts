@@ -1,7 +1,12 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 // Mock the backend resolver so we exercise the OpenAI-compatible/OpenRouter path deterministically.
-vi.mock("@/lib/query/llm-backend", () => ({
+// Stub ONLY the backend selection; everything else stays real. `completeText` also calls
+// `reasoningActive` to size the token budget, and a bare object mock silently dropped that export —
+// which went unnoticed only because the other call site short-circuits on `backend.kind` before
+// reaching it. Spreading the real module keeps the budget logic honest instead of mock-shaped.
+vi.mock("@/lib/query/llm-backend", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/query/llm-backend")>()),
   selectLlmBackend: () => ({
     kind: "openai-compatible" as const,
     provider: "openai" as const,

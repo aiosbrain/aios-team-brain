@@ -32,7 +32,34 @@ const LLM_MODEL = process.env.LLM_MODEL;
  * work. Override with LLM_REASONING_HEADROOM_TOKENS. (The Anthropic path uses a separate thinking
  * budget and isn't affected.)
  */
-const REASONING_HEADROOM_TOKENS = Number(process.env.LLM_REASONING_HEADROOM_TOKENS ?? 6000);
+/** A garbage env value must not become `NaN`: `maxTokens + NaN` serializes to `max_tokens: null`, which
+ *  the provider reads as "no limit" — the opposite of a budget. Fall back to the default instead. */
+const envTokens = (raw: string | undefined, fallback: number): number => {
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
+};
+
+const REASONING_HEADROOM_TOKENS = envTokens(process.env.LLM_REASONING_HEADROOM_TOKENS, 6000);
+
+/**
+ * Headroom for a call that is ACTUALLY routed to a reasoning model (`role:"reasoning"` with a distinct
+ * `teams.reasoning_model` set). The flat 6000 above is sized for "some model here might reason"; this is
+ * sized for "this model definitely will, over a large input".
+ *
+ * MEASURED, not guessed (ARCHEAD-1). Arc synthesis asks for 4096, so the old ceiling was 10,096 for
+ * reasoning + answer together. Across 19 prod runs on `qwen/qwen3.7-plus`: successful runs generated
+ * 3,892–9,870 output tokens, and ALL THREE failures sat at 10,096/10,098 — every failure is the cap, and
+ * the best success cleared it by 226 tokens. 30% of arc runs died there, each billing ~1.5¢ for a blank.
+ *
+ * Deliberately NOT a bump to the global default: that would lift `max_tokens` on every OpenRouter call,
+ * including the small-model paths whose ceiling then trips the token-limit retry below on every request.
+ * Billing is per token GENERATED, so a bigger cap adds no PER-TOKEN cost to runs that already fit — it
+ * only lets the runs that were being thrown away finish. Not literally free, though: OpenRouter filters
+ * candidate providers by whether they can serve the requested `max_tokens` and pre-authorizes against
+ * the worst case, so a larger ask can route to a different (pricier or slower) provider, or be refused
+ * outright on a low-credit account. The ladder below is what keeps that refusal from becoming a blank.
+ */
+const REASONING_ROLE_HEADROOM_TOKENS = envTokens(process.env.LLM_REASONING_ROLE_HEADROOM_TOKENS, 16000);
 
 export interface CompleteArgs {
   system: string;
@@ -170,17 +197,29 @@ export async function completeText(args: CompleteArgs, opts: CompleteOptions = {
       // starve the answer to empty). If the headroom pushes max_tokens past a SMALL model's ceiling
       // (400), retry once with just the answer budget — mirrors the streaming path (lib/query/claude);
       // without this, every non-streaming task 400s on a small local backend while Query still works.
-      let res = await doPost(maxTokens + REASONING_HEADROOM_TOKENS);
+      // A LADDER, not a cliff. On a token-limit refusal we step DOWN one rung at a time instead of
+      // dropping straight to the bare answer budget. That mattered the moment the reasoning rung got
+      // bigger: a provider whose output ceiling sits between the two rungs would refuse the top ask and
+      // land the retry on `maxTokens` alone — 4096 for arcs, combined with reasoning still ON, which is
+      // BELOW the 3,892 minimum a successful run has ever needed. The old 30%-of-runs failure would have
+      // become ~100%. Verified once against prod that `qwen/qwen3.7-plus` accepts the top rung (HTTP 200,
+      // finish=stop), so this is insurance for the next model rather than a live bug — but it is the
+      // difference between degrading and falling over.
+      const rungs = [...new Set([
+        maxTokens + (reasoningActive(opts.role, keys) ? REASONING_ROLE_HEADROOM_TOKENS : REASONING_HEADROOM_TOKENS),
+        maxTokens + REASONING_HEADROOM_TOKENS, // the budget prod ran on for months — known-accepted
+        maxTokens,
+      ])].sort((a, b) => b - a);
+      let res = await doPost(rungs[0]);
+      for (let i = 1; i < rungs.length && !res.ok; i++) {
+        const errBody = await res.text().catch(() => "");
+        // Only a TOKEN-LIMIT refusal is worth retrying smaller; anything else is a real error and must
+        // surface immediately rather than being re-sent two more times.
+        if (!looksLikeTokenLimit(res.status, errBody)) throw httpError(backend, res.status, errBody);
+        res = await doPost(rungs[i]);
+      }
       if (!res.ok) {
-        const firstErrBody = await res.text().catch(() => "");
-        if (looksLikeTokenLimit(res.status, firstErrBody)) {
-          res = await doPost(maxTokens);
-          if (!res.ok) {
-            throw httpError(backend, res.status, await res.text().catch(() => ""));
-          }
-        } else {
-          throw httpError(backend, res.status, firstErrBody);
-        }
+        throw httpError(backend, res.status, await res.text().catch(() => ""));
       }
       const j = (await res.json()) as {
         choices?: { message?: { content?: string }; finish_reason?: string }[];
@@ -293,7 +332,9 @@ export async function completeText(args: CompleteArgs, opts: CompleteOptions = {
     });
     // File the billed-but-unmeterable attempt so the Costs page can name which feature lost the money.
     // ONE row per logical call here, unlike the graph proxy where each SDK retry is its own request —
-    // this function's only retry is the token-limit re-ask, so a two-attempt call under-counts by one.
+    // this function's only retries are the token-limit LADDER's re-asks (up to two step-downs), so a
+    // laddered call under-counts by however many rungs were refused. Those refusals are pre-generation
+    // 400s that billed nothing, so the money under-count is ~zero — it is the ATTEMPT count that is low.
     // Stated rather than fixed: over-counting a spend gap is worse than under-counting it.
     // A failure that never reached a provider spent nothing, so it must not enter a ledger whose only
     // job is explaining money — the Anthropic SDK throws at CONSTRUCTION when no key resolves, and a
