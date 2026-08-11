@@ -157,7 +157,7 @@ create table if not exists teams (
   created_at timestamptz not null default now()
 );
 -- Access-enforcement rollout flag (Phase B, spec §5/§11): 'permissive' (default) = today's
--- legacy-tier-only reads, byte-identical; 'enforcing' = oracle membership filter ∧ legacy tier.
+-- legacy-tier-only reads, byte-identical; 'enforcing' = oracle membership filter ∧ legacy tier (GET /api/v1/items only this slice).
 -- CHECK lives in the 20260811160000 migration (named, replay-repairable).
 alter table teams add column if not exists access_enforcement text not null default 'permissive';
 -- Additive columns for existing deployments.

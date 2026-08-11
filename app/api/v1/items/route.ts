@@ -201,26 +201,37 @@ export async function GET(req: NextRequest) {
     .order("updated_at", { ascending: true })
     .order("id", { ascending: true })
     .limit(PAGE_SIZE);
-  if (isRestrictedTier(auth.memberTier)) q = q.eq("access", "external");
-  // Agent principals read only items whose ingestion project is in their effective set —
-  // the oracle's triple intersection, computed live this request. An empty set short-circuits
-  // to zero rows rather than an unfiltered query (the [] vs NULL distinction, spec §10).
-  // (Phase A proxy on ingestion project_id; migrating to the membership filter is a follow-up.)
-  if (agentProjects !== null) {
+  if (isRestrictedTier(auth.memberTier)) q = q.eq("access", "external"); // legacy-tier conjunct — always
+
+  // Enforced read (Phase B slice 1, spec §5/§11): visibility = oracle ∧ legacy-tier. When the team
+  // is 'enforcing', BOTH member and agent reads intersect with the membership-visible item set
+  // (an agent must never exceed its launcher — slice-B1 Fable HIGH; the agent's Phase-A project_id
+  // proxy is used ONLY under permissive). 'permissive' (default) → member reads unchanged,
+  // byte-identical to today. A flag-read error throws → 500 (fail closed, never a wrong mode).
+  let enforcing: boolean;
+  try {
+    const { teamEnforcesAccess } = await import("@/lib/access/enforce");
+    enforcing = await teamEnforcesAccess(db, auth.teamId);
+  } catch (e) {
+    return errorResponse("internal", e instanceof Error ? e.message : "enforcement check failed", 500);
+  }
+
+  if (enforcing) {
+    const { visibleItemIdsForProjects } = await import("@/lib/access/enforce");
+    let projectSet: ReadonlySet<string>;
+    if (agentProjects !== null) {
+      projectSet = agentProjects; // the agent's effective set (already oracle-attenuated)
+    } else {
+      const { visibleProjects } = await import("@/lib/access/oracle");
+      projectSet = (await visibleProjects(db, { teamId: auth.teamId, memberId: auth.memberId })).projectIds;
+    }
+    const { ids, empty } = await visibleItemIdsForProjects(db, auth.teamId, projectSet);
+    if (empty) return Response.json({ items: [], next_cursor: null });
+    q = q.in("id", [...ids]);
+  } else if (agentProjects !== null) {
+    // Permissive team + agent token: the Phase-A ingestion-project proxy (unchanged).
     if (agentProjects.size === 0) return Response.json({ items: [], next_cursor: null });
     q = q.in("project_id", [...agentProjects]);
-  }
-  // MEMBER enforced read (Phase B slice 1, spec §5/§11): when the team is 'enforcing', intersect
-  // with the oracle's membership-visible item set — visibility = oracle ∧ legacy-tier (the tier
-  // filter above stays). 'permissive' (default) skips this entirely → byte-identical to today.
-  // Agent tokens already carry their own effective filter above, so this is member-key only.
-  if (agentProjects === null) {
-    const { teamEnforcesAccess, visibleItemIds } = await import("@/lib/access/enforce");
-    if (await teamEnforcesAccess(db, auth.teamId)) {
-      const { ids, empty } = await visibleItemIds(db, { teamId: auth.teamId, memberId: auth.memberId });
-      if (empty) return Response.json({ items: [], next_cursor: null });
-      q = q.in("id", [...ids]);
-    }
   }
   if (kinds?.length) q = q.in("kind", kinds);
   // On-demand fetch of one skill/deliverable folder: match path by prefix.

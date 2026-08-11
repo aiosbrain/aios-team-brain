@@ -1,6 +1,8 @@
 -- Phase B slice 1 (spec §5/§11): the permissive→enforcing rollout flag.
 -- 'permissive' (default) = reads behave EXACTLY as today (legacy tier filter only) — byte-identical,
--- so no team is affected until an admin flips it. 'enforcing' = reads apply the oracle membership
+-- so no team is affected until an admin flips it. SCOPE: this slice enforces only GET /api/v1/items
+-- (member AND agent keys); query/FTS/timeline/arcs/dashboard are NOT yet gated by this flag (later
+-- Phase B slices). 'enforcing' = reads apply the oracle membership
 -- filter AND the legacy tier check (visibility = oracle ∧ legacy-tier, §5.6 conjunct: a bug in
 -- either fails closed). A team flips to enforcing only once its §11 backfill is confirmed complete
 -- (else an un-partitioned item would fail closed and vanish — the flag IS the fail-open-to-today
