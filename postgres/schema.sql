@@ -1102,6 +1102,54 @@ create index if not exists items_team_synced_idx on items (team_id, synced_at de
 create index if not exists items_team_created_idx on items (team_id, created_at desc);
 create index if not exists items_search_idx on items using gin (search);
 create index if not exists items_kind_idx on items (team_id, kind);
+-- composite (team_id, id) target for context-unit same-team FKs (Phase A slice 4)
+create unique index if not exists items_team_id_id_idx on items (team_id, id);
+
+-- ── Context substrate (partitioning/permissioning Phase A slice 4 — spec §context-units) ──
+-- Item-grain subset; task/decision/meeting-segment grains + events/suggestions/rules = Phase D.
+-- Sole writers: lib/projects/context/units.ts and lib/projects/context/memberships.ts (guarded).
+create table if not exists project_context_units (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  unit_kind text not null default 'item' check (unit_kind in ('item','task','decision','meeting_segment')),
+  source_item_id uuid,
+  unit_key text not null,
+  audience access_tier not null,
+  content_sha256 text not null,
+  state text not null default 'active' check (state in ('active','retracted')),
+  occurred_at timestamptz not null default now(),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  -- item grain only in this slice: every unit MUST anchor to an item. Phase D relaxes this
+  -- (named drop/re-add) as it adds the task/decision/meeting-note source columns + FKs.
+  check (unit_kind = 'item' and source_item_id is not null),
+  unique (team_id, id),
+  foreign key (team_id, source_item_id) references items (team_id, id) on delete cascade
+);
+create unique index if not exists pcu_item_key_idx
+  on project_context_units (team_id, source_item_id) where unit_kind = 'item';
+create index if not exists pcu_team_audience_idx on project_context_units (team_id, audience) where state = 'active';
+
+create table if not exists project_context_memberships (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  project_id uuid not null,
+  context_unit_id uuid not null,
+  decision text not null default 'include' check (decision in ('include','exclude')),
+  mode text not null default 'auto' check (mode in ('auto','force_include','force_exclude')),
+  method text not null default 'ingestion_project'
+    check (method in ('ingestion_project','explicit_ref','rule','embedding','llm','manual')),
+  decided_by uuid,
+  valid_from timestamptz not null default now(),
+  valid_to timestamptz,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  foreign key (team_id, project_id) references projects (team_id, id) on delete cascade,
+  foreign key (team_id, context_unit_id) references project_context_units (team_id, id) on delete cascade
+);
+create unique index if not exists pcm_current_idx
+  on project_context_memberships (team_id, project_id, context_unit_id) where valid_to is null;
+create index if not exists pcm_unit_idx on project_context_memberships (team_id, context_unit_id) where valid_to is null;
 
 create table if not exists item_versions (
   id uuid primary key default gen_random_uuid(),

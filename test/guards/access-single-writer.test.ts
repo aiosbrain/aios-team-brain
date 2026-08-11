@@ -18,6 +18,14 @@ const EDGE_TABLES = ["groups", "group_members", "project_groups"];
 /** agent_tokens is credential material — same single-writer treatment, its own owner module. */
 const TOKEN_WRITER = join("lib", "access", "agent-tokens.ts");
 const TOKEN_TABLE = "agent_tokens";
+/**
+ * Context-substrate tables (spec §4 slice 4): each has ONE owner module. The membership table
+ * IS an access edge (the oracle reads it for canSee), so it gets the same single-writer rigor.
+ */
+const SUBSTRATE: { table: string; writer: string }[] = [
+  { table: "project_context_units", writer: join("lib", "projects", "context", "units.ts") },
+  { table: "project_context_memberships", writer: join("lib", "projects", "context", "memberships.ts") },
+];
 const WRITE_VERBS = /\.\s*(insert|upsert|update|delete)\s*\(/;
 
 function walk(dir: string, out: string[] = []): string[] {
@@ -54,14 +62,27 @@ function writesTo(source: string, table: string): boolean {
  * plus these two suffice, since a membership/grant write is what confers access.
  */
 const UNAMBIGUOUS = ["group_members", "project_groups"];
-function mentionsWithWrites(source: string, table: string): boolean {
+/**
+ * Explicit READ exemptions for the coarse "names + has write verbs" net. Each entry is a
+ * cross-table READ that legitimately appears in a file that also writes its OWN table — the
+ * precise chain-scan (`writesTo`) confirms these are NOT writes. Auditable by construction:
+ * a new entry has to be justified as a read here, and the chain-scan still catches an actual
+ * write. `lib/projects/context/memberships.ts` reads `project_groups` (no-widening gate) and
+ * `project_context_units` (the unit's inherited audience) while writing only memberships.
+ */
+const READ_EXEMPT = new Set<string>([
+  `${join("lib", "projects", "context", "memberships.ts")}:project_groups`,
+  `${join("lib", "projects", "context", "memberships.ts")}:project_context_units`,
+]);
+function mentionsWithWrites(rel: string, source: string, table: string): boolean {
+  if (READ_EXEMPT.has(`${rel}:${table}`)) return false;
   const quoted = [`"${table}"`, `'${table}'`, "`" + table + "`"];
   return quoted.some((q) => source.includes(q)) && WRITE_VERBS.test(source);
 }
 
 /** SQL DML against an edge/credential table anywhere in postgres/ — migrations never seed access. */
 const SQL_DML = new RegExp(
-  `(insert\\s+into|update|delete\\s+from)\\s+(public\\.)?(${[...EDGE_TABLES, TOKEN_TABLE].join("|")})\\b`,
+  `(insert\\s+into|update|delete\\s+from)\\s+(public\\.)?(${[...EDGE_TABLES, TOKEN_TABLE, "project_context_memberships"].join("|")})\\b`,
   "i"
 );
 
@@ -77,12 +98,17 @@ describe("access-chain single writer", () => {
           if (writesTo(source, table)) offenders.push(`${rel} writes ${table}`);
         }
         for (const table of UNAMBIGUOUS) {
-          if (!writesTo(source, table) && mentionsWithWrites(source, table)) {
+          if (!writesTo(source, table) && mentionsWithWrites(rel, source, table)) {
             offenders.push(`${rel} names ${table} in a file with write verbs (variable-table idiom?)`);
           }
         }
-        if (rel !== TOKEN_WRITER && (writesTo(source, TOKEN_TABLE) || mentionsWithWrites(source, TOKEN_TABLE))) {
+        if (rel !== TOKEN_WRITER && (writesTo(source, TOKEN_TABLE) || mentionsWithWrites(rel, source, TOKEN_TABLE))) {
           offenders.push(`${rel} writes/names ${TOKEN_TABLE} outside its single writer`);
+        }
+        for (const { table, writer } of SUBSTRATE) {
+          if (rel !== writer && (writesTo(source, table) || mentionsWithWrites(rel, source, table))) {
+            offenders.push(`${rel} writes/names ${table} outside ${writer}`);
+          }
         }
       }
     }
@@ -110,6 +136,13 @@ describe("access-chain single writer", () => {
       if (SQL_DML.test(source)) offenders.push(relative(ROOT, file));
     }
     expect(offenders, `SQL DML against access edges:\n${offenders.join("\n")}`).toEqual([]);
+  });
+
+  it("non-vacuous for the substrate: each owner module DOES write its table", () => {
+    for (const { table, writer } of SUBSTRATE) {
+      const source = readFileSync(join(ROOT, writer), "utf8");
+      expect(writesTo(source, table), `expected ${writer} to write ${table}`).toBe(true);
+    }
   });
 
   it("is non-vacuous: the single writer itself DOES write all three tables", () => {

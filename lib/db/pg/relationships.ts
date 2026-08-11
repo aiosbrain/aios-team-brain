@@ -60,6 +60,11 @@ export const RELATIONSHIPS: Record<string, Record<string, Relationship>> = {
     // (lib/access/oracle.ts) without a second round-trip.
     groups: { kind: "one", table: "groups", local: "group_id", foreign: "id" },
   },
+  project_groups: {
+    // the membership no-widening gate checks whether a project is granted to the `external`
+    // built-in group (lib/projects/context/memberships.ts).
+    groups: { kind: "one", table: "groups", local: "group_id", foreign: "id" },
+  },
 };
 
 export function lookupRelationship(base: string, name: string): Relationship | undefined {
