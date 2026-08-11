@@ -72,8 +72,12 @@ describe("reconcileItemContext (the shared per-item core)", () => {
 
   it("refuses to partition into a slug-squatting INITIATIVE — resolves system by kind, not slug alone (Fable HIGH)", async () => {
     const seed = await seedTeam();
-    // A dashboard-created initiative squats 'general' BEFORE bootstrap runs (bootstrap then refuses it).
-    await db().from("projects").insert({ team_id: seed.teamId, slug: GENERAL_SLUG, name: "curated", kind: "initiative" });
+    // BOTH system slugs squatted by dashboard-created initiatives BEFORE bootstrap runs. Planting
+    // both is load-bearing: with only one squatter the resolve returns null anyway (the other slug
+    // is missing), so the test would pass even WITHOUT the kind='system' filter — the mutation that
+    // exposed this. With both present, only the kind filter keeps the resolve from finding them.
+    await db().from("projects").insert({ team_id: seed.teamId, slug: GENERAL_SLUG, name: "curated-g", kind: "initiative" });
+    await db().from("projects").insert({ team_id: seed.teamId, slug: EXTERNAL_SHARED_SLUG, name: "curated-x", kind: "initiative" });
     const item = await ingest(seed, { path: "s.md", body: "s", access: "team", project: "src" });
     const r = await reconcileItemContext(db(), seed.teamId, item.id);
     // No kind='system' project exists → resolves null → skipped, never partitions into the squatter.
