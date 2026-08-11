@@ -17,6 +17,19 @@ promoted outward…"). It has no people or projects in it, so it correctly produ
 entities. The `aios_team` group in the same read is healthy and judged: 2,439 names, 12.66
 entities/episode, 0.2% splits against a 1.6% baseline.
 
+**Confirmed, not assumed — extraction for that group works.** The review would not accept "nothing is
+stalled" on the strength of one episode's content, so I read Neo4j directly (read-only, via
+`railway ssh` to the graphiti service, the only host that can reach `neo4j.railway.internal`):
+
+```
+aios_external | entities: 16 | episodic: 6
+aios_team     | entities: 18999 | episodic: 6037
+```
+
+`aios_external` has **16 entities all-time**. There is no per-group extraction failure being explained
+away here: the zero is purely a *windowing* effect — no new entity landed in the last 7 days because
+the only episode in that window is boilerplate.
+
 The cause is one predicate. `deriveNameCollisionPollution` (`lib/graph/extraction-health.ts:643`):
 
 ```ts
@@ -44,15 +57,26 @@ wrong, and I am correcting it before it becomes the justification for the fix.**
 1. **The card states a falsehood today** — "stalled extractor" about a working one. An alarm surface
    that accuses on no evidence trains its reader to ignore it, which is how the last alarm ended up
    silently dead.
-2. **There is a real latent paging path.** `predicate-suspect` *does* run the blindness clock
-   (`extraction-alert.ts:202`). It is currently masked only because `aios_team` clears
-   `MIN_NAMES_FOR_CENSUS_SIGNAL = 50`. On a quiet week `aios_team` drops to `small-sample`, which
-   **parks** — so the only clock-running refusal left is `aios_external`'s false one, the tick
-   becomes `"running"`, and 24 hours later the meta-alarm **mails an accusation of a stalled
-   extractor during a week when the real story is "not much happened"**. That is the cry-wolf failure
-   arriving by the exact route the meta-alarm was built to prevent, inverted.
+2. **There is a real latent paging path — rarer than I first said, and I am pricing it honestly.**
+   `predicate-suspect` *does* run the blindness clock (`extraction-alert.ts:203-204`), while
+   `small-sample` parks (`:211-213`). It is masked only because `aios_team` clears
+   `MIN_NAMES_FOR_CENSUS_SIGNAL = 50`. If `aios_team` ever falls below that it parks, leaving
+   `aios_external`'s false refusal as the only clock-running one, the tick becomes `"running"`, and
+   24 hours later the meta-alarm **mails a stalled-extractor accusation**.
 
-So: not urgent, genuinely wrong, and it fires on the quiet week when a spurious page is least welcome.
+   **I first wrote "on a quiet week". That overstates it and the measured rates say so.** The path
+   needs a conjunction: `aios_team`'s recent-name arrivals collapsing from **2,439/week to under 50**
+   — a >97% drop, a full shutdown rather than a quiet week (and diff-sync means unchanged content
+   does not re-project, so it is reachable, roughly annually) — **and** a fresh zero-yield
+   `aios_external` push (~0.7/week historically) inside the same window, **and** both holding 24h.
+
+   **The stronger version of this argument is the one I had not made:** AIOS is self-hosted per
+   organisation (CLAUDE.md §5). On a small install — one team, low volume, an external group of a
+   handful of shared files — *this conjunction is the normal state*, not the annual tail. The bug is
+   mild here and routine there.
+
+So: not urgent on this install, genuinely wrong on every install, and it pages exactly when a
+spurious page is least welcome.
 
 ---
 
@@ -68,12 +92,21 @@ if (signals.recentNames === 0) {
 }
 ```
 
-**A new constant rather than reusing `MIN_EPISODES_FOR_EXTRACTION_SIGNAL`.** The two judgements read
-different populations (facts vs normalised names) and this file's existing convention is one
-documented constant per population — `MIN_NAMES_FOR_CENSUS_SIGNAL` exists separately from the episode
-minimum for exactly this reason, and says so. Coupling them would mean a future re-derivation of one
-silently moves the other. **Initial value 25**, matching the sibling, with the derivation written
-down and marked as inherited rather than measured.
+**A new constant rather than reusing `MIN_EPISODES_FOR_EXTRACTION_SIGNAL`.** My first draft justified
+this as "different populations (facts vs names)". That is the wrong reason — **both constants are
+denominated in episodes.** The real and stronger one: `MIN_EPISODES_FOR_EXTRACTION_SIGNAL` counts
+**lifetime** episodes (`countProjectedEpisodes`, `extraction-health.ts:180-190`, no window), while
+this tripwire counts **7-day-windowed** episodes, which is a *rate*. Reusing one constant would couple
+a fresh-install threshold to a rate threshold, and a future re-derivation of either would silently
+move the other.
+
+**Initial value 25 — chosen conservative against the measured yield, not merely inherited.** At
+`aios_team`'s measured 12.66 entities/episode, even 3–5 typical episodes yielding zero names would be
+anomalous, so a floor of 25 is far above what detection strictly needs. It is set there deliberately,
+against the counter-case that makes a low floor dangerous: a workspace restructure re-pushing several
+boilerplate index files in one week would legitimately yield near-zero names, and a card that
+accuses on that burst is back to crying wolf. The asymmetry is the same one the review gate uses —
+a false accusation costs the alarm's credibility, a missed low-volume detection costs a delay.
 
 `small-sample` is the correct destination: it parks the blindness clock
 (`extraction-alert.ts:211-213`), so a low-volume group produces neither an accusation nor a page —
@@ -90,6 +123,18 @@ accepts the identical tradeoff, 25 near-empty episodes in one group is not a rea
 and adding a second unmeasured threshold to fix an unmeasured one is how thresholds multiply.
 Recorded so the next person does not think it was missed.
 
+**And its dual, which my first draft omitted — the inverse of the residual above.** Below the floor,
+a *genuine* per-group extraction failure is now **permanently silent**: a client project that
+resumes and pushes 10 content-rich episodes a week to `aios_external`, with graphiti rejecting that
+group, reads `small-sample` forever — no amber card, no clock — because that group never reaches 25
+episodes in a window. Detection of the failures that matter (a graphiti rename, a global stall) rides
+entirely on the **busy** group, which does trip: after ≤7 days of stall `aios_team`'s `recentNames`
+decays to 0 with thousands of recent episodes. So A2's "the real detection is not lost" is true **for
+busy groups only**, and must not be read as "detection preserved, period". The surviving surface for a
+quiet group is the observational `entitiesPerEpisode` number on the card. Recorded because I wrote one
+half of this residual and not the other, which is the exact failure that let a leak through the
+packing spec's criteria two days ago.
+
 **The alarm stays unarmed.** `CENSUS_ALARM_ARMED` is still `false` and this change does not touch it —
 arming remains rollout step 3, after `CENSUS_MARGIN` / `CENSUS_ABSOLUTE_FLOOR` are set from measured
 prod data. This fix is about a *refusal*, which computes regardless of arming.
@@ -101,17 +146,42 @@ prod data. This fix is about a *refusal*, which computes regardless of arming.
 | # | Criterion | Tier | Falsifier |
 |---|---|---|---|
 | A1 | Zero names with **1** recent episode ⇒ `small-sample`, `judgeable: false`, **no accusation** | unit | any `predicate-suspect` below the floor |
-| A2 | Zero names with **25** recent episodes ⇒ `predicate-suspect` — the real detection is **not** lost | unit | a genuinely stalled busy group reading `small-sample` |
-| A3 | The boundary is exact at the constant: floor−1 ⇒ `small-sample`, floor ⇒ `predicate-suspect` | unit | an off-by-one at the threshold |
+| A2 | Zero names with a **literal 25** recent episodes ⇒ `predicate-suspect` — the real detection is not lost **for a busy group** | unit | a genuinely stalled busy group reading `small-sample` |
+| A3 | The boundary is exact **at the exported constant**: `FLOOR−1` ⇒ `small-sample`, `FLOOR` ⇒ `predicate-suspect` | unit | an off-by-one at the threshold |
 | A4 | `recentEpisodes: null` (unreadable ledger) still ⇒ `small-sample`, never an accusation | unit | any accusation from a null ledger |
-| A5 | **The quiet-week page cannot fire from a below-floor group alone**: with `aios_team` at `small-sample` and `aios_external` below the floor, `classifyBlindnessTick` returns `"parked"`, not `"running"` | unit | `"running"`, which is the latent bug in §0.2 surviving the fix |
-| A6 | Prod's exact current state reproduces: 1 episode, 0 names ⇒ `small-sample` | unit (fixture from the measured values) | anything else |
-| A7 | **Mutation:** restoring `> 0` reddens A1, A3, A5 and **nothing else** | mutation | a mutation that reddens no test, or reddens A2 (which would mean A2 pins the wrong thing) |
+| A5 | **The page cannot fire from a below-floor group alone**, tested through the REAL chain: `deriveNameCollisionPollution` → `refusalRunsClock(refusal, …)` → `classifyBlindnessTick`. With `aios_team` at `small-sample` and `aios_external` below the floor, the tick is `"parked"`, not `"running"` | unit | `"running"` — §0.2's latent bug surviving the fix |
+| A6 | Prod's exact measured state reproduces: 1 recent episode, 0 names ⇒ `small-sample` | unit | anything else |
+| A7 | **Mutation:** restoring `> 0` reddens **A1, A3, A5 and A6** — and not A2 | mutation | a mutation reddening no test, or reddening A2 (which would mean A2 pins the wrong thing) |
 
-A5 is the one that matters most — it is the only criterion that tests the *consequence* rather than
-the predicate, and §0.2 is the reason this fix is worth shipping at all.
+**Why A2 uses a literal 25 and A3 uses the constant.** If both read the exported constant, a mutation
+raising the floor to 10,000 — which kills detection entirely — leaves the whole suite green. A2's
+literal is what makes that mutation fail. A3 legitimately reads the constant, because its job is the
+boundary wherever the boundary is.
 
----
+**A5 must not hand-feed booleans.** `classifyBlindnessTick` takes
+`Array<{judgeable, clockRuns}>`, so a test that constructs those literals proves a trivial OR and
+nothing about this fix. It has to derive `clockRuns` from the real refusal via `refusalRunsClock` —
+the composition `test/extraction-alert.test.ts:340-346` already uses for `graph-unreadable`.
+A5 is the only criterion that tests the *consequence* rather than the predicate, and §0.2 is the
+reason this fix is worth shipping at all.
+
+### The existing test this fix flips, named rather than discovered
+
+`test/name-collision-pollution.test.ts:104-112` pins `recentEpisodes: 10` ⇒ `predicate-suspect`. It
+**must go red** under this change — that is the fix working — and its fixture moves to `≥ 25`. Named
+here so the builder does not "resolve" the red by lowering the floor to 10, and does not update it
+silently with no criterion covering the change.
+
+`test/name-collision-pollution.test.ts:143-149` (null ledger ⇒ `small-sample`) must stay green
+untouched; it is A4's existing pin.
+
+### The contract comment is part of the change
+
+`extraction-health.ts:605-611` currently states: *"episodes projected in the window but zero census
+names ⇒ `predicate-suspect`"*. After this fix that sentence is **false as written** and must be
+updated in the same commit. A stale contract comment describing behaviour the code no longer has is
+the drift class this repo has hit four times in a week — and here it sits directly above the function
+it misdescribes.
 
 ## 4. Rollout
 
