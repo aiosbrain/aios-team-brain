@@ -206,6 +206,17 @@ arms run together, so the reps are shared.
 7% as a sanity floor. The 7% was measured on the incumbent only; the candidate's noise is unknown, and
 a longer multi-task prompt may well be noisier.
 
+**That is not circular** — the band comes from *within*-arm variance, the verdict from the *between*-arm
+mean difference, and a real arm effect does not inflate within-arm spread. It needs two guards to stay
+honest:
+
+- **t-quantiles, not z.** The variance estimate at df=14 is itself noisy, and a z-band is too narrow.
+- **A candidate-noise validity ceiling.** Pooling *rewards an unstable candidate*: its own noise
+  fattens the band that judges it. **If the candidate's within-arm SD exceeds ~2× the incumbent's,
+  the session is INVALID**, not judged with a fat band. The 7% floor only guards the too-narrow
+  direction; this guards the other. The absence of exactly this kind of validity condition is what
+  produced the last INVALID verdict.
+
 ### The metrics, after the orphan finding
 
 | Q | metric | FAIL direction | why this and not the obvious one |
@@ -229,7 +240,23 @@ and nothing else; the response is forwarded (`:82-84`) and discarded. So the raw
 does not exist anywhere. **Fix, before any run:** the tap also records the response body — `buf` is
 already in hand at `:83`, so this is a few lines, and the byte-for-byte forwarding property that
 makes the tap trustworthy is untouched (it still forwards exactly what it received, it merely also
-writes down what came back). Capture stays fatal-on-write-failure, for the same reason it already is.
+writes down what came back).
+
+**The two captures get DIFFERENT failure policies, and my first draft got this wrong by saying
+"capture stays fatal, for the same reason it already is".** They do not protect the same thing:
+
+- **Request capture stays FATAL.** It fires *before* forwarding, so a failed write means unrecorded
+  traffic would reach a paid model. That guards spend integrity and must keep killing the process.
+- **Response capture is NON-FATAL.** It fires *after* the money is spent. Exiting there turns a
+  transient write error into an aborted paid run with nothing to show for it — the worst outcome
+  available.
+
+Silent loss is prevented instead by **pairing**: each request record carries an id, each response
+record carries the same id, and **the Q8′ harvest REFUSES** (the AC7 pattern already used everywhere
+in this instrument) if any `extract_nodes_and_edges` request has no paired response. An unmeasurable
+Q8′ then reads as a refusal rather than as a low loss rate — which is the difference between "we
+could not tell" and a plausible wrong number. A dead disk still halts the run, because the request
+write fails first.
 
 **Q9 depended on prior-session artifacts that no longer exist.** I wrote "the prior session's
 harvests are on disk". They are not — Docker died three times during that session and nothing
@@ -237,7 +264,29 @@ survives on this machine. **Fix:** make the gate self-contained — build the co
 **this session's own 8 incumbent reps** (entities present in *every* one), then require the candidate
 to retain them. This is strictly better than what I specified: same corpus, same session, no
 staleness, and no dependency on artifacts I cannot verify. It is not circular — the list is built
-from the arm the candidate is measured *against*, never from the candidate.
+from the arm the candidate is measured *against*, never from the candidate. The raw material exists:
+`harvest.ts:41,62` already stores `entityNameCounts` per rep, so this is a decision-side computation
+and the tap edit stays the only instrument change.
+
+**Three things Q9 must pre-register, or it becomes the theatre Q2/Q7 were dropped to avoid:**
+
+1. **The candidate-side quantifier.** "Appears in the candidate's graph" is ambiguous across 8 reps,
+   and at ~7% noise "present in every candidate rep" false-fails on flicker — an entity at 95%
+   per-rep presence survives all 8 only ~66% of the time. **Hard FAIL only when a consensus entity is
+   absent from ALL 8 candidate reps** (unambiguous loss); partial flicker is reported as a
+   diagnostic. Names matched normalised, with near-misses reported separately — the combined prompt's
+   naming rules differ enough that a systematic *rename* would otherwise read as mass entity loss.
+2. **A consensus floor.** An empty or tiny intersection makes Q9 a vacuous pass. **If |consensus| <
+   max(25, 20% of the mean per-rep entity count), Q9 reads NOT RUN — unpowerable, never PASS**, and
+   |consensus| itself appears in the verdict table. The measured 7.2% was *yield* variance; per-entity
+   churn is unmeasured and could be far higher, so this floor is load-bearing rather than ceremony.
+3. **`consensus ∩ incumbent-orphans`, computed with the pre-run orphan census and FREE.** Any
+   consensus entity that is an orphan in the incumbent graph will be deleted by the candidate **by
+   construction** (`combined_extraction.py:295`) — a guaranteed Q9 FAIL that is knowable **before a
+   cent is spent**. If that set is non-empty, the named list goes to the owner *before* any candidate
+   rep runs: either the loss is accepted on the record (and those entities carry a status row,
+   excluded from Q9), or the lever is dead for free. **This is the single highest-value check in the
+   spec, because it can end the experiment without spending the $16.**
 
 **Both fixes are free and both are prerequisites to spending anything.** Recorded here rather than
 quietly corrected, because "I specified a metric against an instrument I had not opened" is the
@@ -260,13 +309,16 @@ including NOT RUN.
 **But dropping Q2 while adding a mechanism that deletes entities is the self-serving shape**, even
 with an honest reason, and the plan review said so. Q2 was the only recall-of-specific-content gate,
 and this candidate's known mechanical risk is entity loss. **Q9 is its powerable replacement** — a
-consensus list from the prior session's incumbent reps, which exists on disk and costs nothing to
-check. The drop is only clean *with* Q9; without it, it is the cut that blocked the last amendment.
+consensus list built from **this session's own 8 incumbent reps** (see the buildability note above;
+an earlier draft of this very paragraph said "the prior session's harvests, which exist on disk", and
+that sentence survived two paragraphs below its own retraction until the delta review caught it).
+The drop is only clean *with* Q9; without it, it is the cut that blocked the last amendment.
 
 ### Instrument, reused
 
-The corpus rule, seeder, capture tap, harvester, refusing parsers and `decision.mjs` are reused from
-PIPEFF-2 unchanged. The arms change; the instrument does not.
+The corpus rule, seeder, harvester, refusing parsers and `decision.mjs` are reused from PIPEFF-2
+**unchanged**. The capture tap is reused **except for the response capture Q8′ requires** (above) —
+stated precisely, because "the instrument does not change" was false the moment Q8′ needed it to.
 
 ## 5. Acceptance
 
@@ -276,7 +328,7 @@ PIPEFF-2 unchanged. The arms change; the instrument does not.
 | AC2 | The patch script is **idempotent and asserts its anchors**: applying twice is a no-op, and a missing anchor fails loudly rather than silently skipping | unit (runs the real Python) | a silent no-op — the failure `graphiti/Dockerfile`'s gates exist for |
 | AC3 | The patched file **parses under `ast`** and the patched call path is exercised end-to-end against a real episode | unit + e2e | any import/runtime error |
 | AC4 | **PATCH 3's predecessor filter still applies** under the combined call — a single-chunk item receives **zero** predecessors, a multi-chunk item receives only its own | unit (runs the real Python) | any predecessor from another item reaching the merged prompt |
-| AC5 | The **full per-episode call-kind profile** is pinned: exactly one `extract_nodes_and_edges`, one `edge_timestamps` **only when the extractor left dates unset**, and **zero** `extract_nodes` / `extract_edges` | unit + data-mechanics | any extra, missing or duplicated kind. "`extract_edges` not called" alone would miss a duplicated or lost timestamp call — the guard must cover the level that changed |
+| AC5 | The **full per-episode call-kind profile**: exactly one `extract_nodes_and_edges`; one **batch** `edge_timestamps` iff any edge was extracted; **0..k per-edge `edge_timestamps` fallbacks**, only for edges the batch left fully null; **zero** `extract_nodes` / `extract_edges` | unit + data-mechanics | any extra, missing or duplicated kind. "`extract_edges` not called" alone would miss a duplicated or lost timestamp call — the guard must cover the level that changed |
 | **AC8** | **`lib/llm/graph-call-kind.ts` gains an `extract_nodes_and_edges` row in THIS PR**, with a fixture built from the **real rendered prompt**, and `llm_usage` records that kind with non-zero tokens | unit + data-mechanics | the call landing in `unknown` |
 | AC6 | With `pre_extracted_edges=None` the function is **byte-identical in behaviour** to today, so the un-patched path is untouched | unit | any divergence on the fallback path |
 | AC7 | The battery's decision procedure **refuses** rather than passing when a rep is missing or a window is ambiguous | unit (existing, re-pinned) | a verdict on incomplete data |
@@ -299,8 +351,33 @@ worked.
 `extract_edges.extract_timestamps_batch` (`combined_extraction.py:246-249`) — but it gets a pinning
 fixture anyway, because "safe by inspection" is the claim this workstream keeps having to retract.
 
-**The lever does not ship if:** C1's fall is under 10%, Q8's orphan rate rises, or Q1/Q4 move outside
-the noise band. And — stated now, before the numbers exist — **a result at the boundary is a FAIL,
+**Pre-registered, so a rising call kind is not read as a bug at harvest:** `edge_timestamps` **volume
+will go UP in the candidate arm**, and that is correct behaviour. The incumbent's `extract_edges`
+prompt emits `valid_at`/`invalid_at` **inline** (`prompts/extract_edges.py:40-66`), so its per-edge
+fallback fires only for undated edges. `CombinedFact` carries **no** timestamp fields, so the
+candidate gets dates from an internal **batch** call — additive — and edges that batch leaves fully
+null still legitimately fall through to the per-edge path (`edge_operations.py:680,813`). Both share
+the same system line, so both classify as `edge_timestamps`. Expected impact ~0.5% of graph cost,
+well inside the projection's slop. **An AC that demanded "exactly one `edge_timestamps`" would have
+red-barred correct code** — which is what the first draft of AC5 did.
+
+**The lever does not ship if any of these trip** — restated verbatim against §4's table, because the
+first draft of this sentence still gated on **Q8 and Q1, which no longer exist**, and this is the
+sentence a merge decision gets read from:
+
+| gate | FAIL |
+|---|---|
+| **C1** | cost fall **< 10%** |
+| **Q1′** | connected entities/episode outside the band, either direction |
+| **Q4** | edges/episode falls outside the band |
+| **Q8′** | orphan-drop loss rate **above the incumbent's measured orphan share** |
+| **Q9** | a consensus entity absent from **all 8** candidate reps |
+| **Q5** | any rise in retry rate |
+
+If Q1′ and Q4 trip together the verdict says so as **one** finding — across-the-board
+under-extraction fails both, and reporting it as two confirmations would double-count a single cause.
+
+And — stated now, before the numbers exist — **a result at the boundary is a FAIL,
 not a judgement call.** PIPEFF-2 landed at −25.5% against a −25% bar and shipped only as an explicit
 owner override, recorded as an override. That precedent is available again, but it must be the
 owner's decision on the record, not something this spec's arithmetic quietly absorbs.
