@@ -38,6 +38,11 @@ export function startIngestScheduler(): void {
     // on first deploy (SQL migrations cannot seed the edge tables — the single-writer guard
     // forbids it by design, so app code is the only legal seeder). Best-effort, traced.
     await runAccessBootstrap(db);
+    // §11 context backfill convergence: partition every item into its unit + system-project
+    // membership. The one-time migration for pre-existing content AND the backstop for any
+    // item the on-push ingest hook missed (non-push ingest paths, a hook failure). Idempotent
+    // and cheap when converged; sequenced AFTER bootstrap so the system projects exist. Traced.
+    await runContextBackfill(db);
     // Turn freshly-synced meeting transcripts (source granola/zoom/… — never slack) into meeting
     // notes, so CLI-pushed meetings show up on the Meetings page automatically. Idempotent + cheap
     // when nothing new (finds 0 candidates → returns); best-effort, never fails the tick.
@@ -291,6 +296,57 @@ export function startIngestScheduler(): void {
         // recording itself failed — the console line below is the last resort
       }
       console.error("[ingest] access bootstrap failed", err);
+    }
+  }
+
+  async function runContextBackfill(db: ReturnType<typeof adminClient>): Promise<void> {
+    const startedAt = Date.now();
+    try {
+      const { backfillAllTeams } = await import("@/lib/projects/context/backfill");
+      const { recordIngestRun } = await import("@/lib/ingest/runs");
+      // Cutoff = tick start: bound this run to content that existed when the tick began, so a
+      // concurrent push (which the on-push hook partitions itself) isn't chased mid-sweep.
+      const cutoff = new Date(startedAt).toISOString();
+      const r = await backfillAllTeams(db, cutoff);
+      for (const f of r.failed) {
+        if (f.teamId === "*") continue;
+        await recordIngestRun(db, {
+          teamId: f.teamId,
+          source: "context_backfill",
+          trigger: "scheduler",
+          ok: false,
+          created: 0,
+          errors: [f.error],
+          startedAt,
+        });
+      }
+      const globalFailure = r.failed.find((f) => f.teamId === "*");
+      await recordIngestRun(db, {
+        teamId: null,
+        source: "context_backfill",
+        trigger: "scheduler",
+        ok: !globalFailure,
+        created: 0,
+        errors: globalFailure ? [globalFailure.error] : undefined,
+        meta: { teams: r.teams, failedTeams: r.failed.length },
+        startedAt,
+      });
+    } catch (err) {
+      try {
+        const { recordIngestRun } = await import("@/lib/ingest/runs");
+        await recordIngestRun(db, {
+          teamId: null,
+          source: "context_backfill",
+          trigger: "scheduler",
+          ok: false,
+          created: 0,
+          errors: [err instanceof Error ? err.message : "context backfill threw"],
+          startedAt,
+        });
+      } catch {
+        // last resort is the console line
+      }
+      console.error("[ingest] context backfill failed", err);
     }
   }
 

@@ -114,6 +114,25 @@ export async function POST(req: NextRequest) {
       after(() => meetingBackfillScheduler.schedule(teamId));
     }
 
+    // §11 context: partition the just-ingested item into its unit + system-project membership
+    // immediately (spec §11.2), so new content is access-partitioned on push, not only when the
+    // scheduler backfill next sweeps. After the response, best-effort — a failure only costs
+    // latency (the scheduler leg is the backstop), never the push. Skips silently if the team's
+    // system projects don't exist yet (bootstrap covers it). Inert in Phase A (no read enforces
+    // memberships yet) but keeps the substrate current from day one of Phase B.
+    if (result.status !== "unchanged") {
+      const teamId = auth.teamId;
+      const itemId = result.id;
+      after(async () => {
+        const { reconcileItemContext } = await import("@/lib/projects/context/reconcile-item");
+        const r = await reconcileItemContext(adminClient(), teamId, itemId).catch((e) => ({
+          ok: false,
+          error: e instanceof Error ? e.message : "threw",
+        }));
+        if (!r.ok) console.warn(`[access] context reconcile for item ${itemId} failed: ${(r as { error?: string }).error}`);
+      });
+    }
+
     // Strip the internal scheduling hints — the HTTP wire format stays { status, id }.
     return Response.json(
       { status: result.status, id: result.id },

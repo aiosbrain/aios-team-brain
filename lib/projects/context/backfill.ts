@@ -1,7 +1,6 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
-import { reconcileItemUnit } from "@/lib/projects/context/units";
-import { ensureIncludeMembership, closeOtherMemberships } from "@/lib/projects/context/memberships";
+import { reconcileItemContext } from "@/lib/projects/context/reconcile-item";
 import { ensureAccessBootstrap, GENERAL_SLUG, EXTERNAL_SHARED_SLUG } from "@/lib/access/bootstrap";
 
 /**
@@ -68,19 +67,12 @@ export async function backfillTeamContext(
   // it committed and are idempotent on retry).
   let lastGood: string | null = opts.afterId ?? null;
   for (const item of items) {
-    const unit = await reconcileItemUnit(db, teamId, item.id);
-    if (!unit.ok || !unit.unitId || !unit.audience) return { ok: false, error: `unit ${item.id}: ${unit.error}`, scanned, unitsCreated, membershipsCreated, cursor: lastGood };
-    if (unit.created) unitsCreated++;
-    // Route by the audience reconcile just mirrored from the item's CURRENT access — NOT the
-    // batch's stale item.access (H3). Then CLOSE any membership into the other system project,
-    // so a tier flip (external→team) stops being served through external-shared (H2 — the
-    // add-only backfill previously left the item in BOTH projects).
-    const target = unit.audience === "external" ? projectId.externalShared : projectId.general;
-    const m = await ensureIncludeMembership(db, teamId, { projectId: target, contextUnitId: unit.unitId });
-    if (!m.ok) return { ok: false, error: `membership ${item.id}: ${m.error}`, scanned, unitsCreated, membershipsCreated, cursor: lastGood };
-    if (m.created) membershipsCreated++;
-    const closed = await closeOtherMemberships(db, teamId, unit.unitId, target);
-    if (!closed.ok) return { ok: false, error: `move ${item.id}: ${closed.error}`, scanned, unitsCreated, membershipsCreated, cursor: lastGood };
+    // Per-item reconcile+route+move — the SAME core the ingest hook uses (spec §11.2), so the
+    // one-time sweep and the on-push path can never diverge in how they partition an item.
+    const r = await reconcileItemContext(db, teamId, item.id, projectId);
+    if (!r.ok) return { ok: false, error: `${item.id}: ${r.error}`, scanned, unitsCreated, membershipsCreated, cursor: lastGood };
+    if (r.unitCreated) unitsCreated++;
+    if (r.membershipCreated) membershipsCreated++;
     scanned++;
     lastGood = item.id;
   }
