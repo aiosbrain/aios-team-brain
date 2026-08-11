@@ -18,6 +18,14 @@ const EDGE_TABLES = ["groups", "group_members", "project_groups"];
 /** agent_tokens is credential material — same single-writer treatment, its own owner module. */
 const TOKEN_WRITER = join("lib", "access", "agent-tokens.ts");
 const TOKEN_TABLE = "agent_tokens";
+/**
+ * Context-substrate tables (spec §4 slice 4): each has ONE owner module. The membership table
+ * IS an access edge (the oracle reads it for canSee), so it gets the same single-writer rigor.
+ */
+const SUBSTRATE: { table: string; writer: string }[] = [
+  { table: "project_context_units", writer: join("lib", "projects", "context", "units.ts") },
+  { table: "project_context_memberships", writer: join("lib", "projects", "context", "memberships.ts") },
+];
 const WRITE_VERBS = /\.\s*(insert|upsert|update|delete)\s*\(/;
 
 function walk(dir: string, out: string[] = []): string[] {
@@ -61,7 +69,7 @@ function mentionsWithWrites(source: string, table: string): boolean {
 
 /** SQL DML against an edge/credential table anywhere in postgres/ — migrations never seed access. */
 const SQL_DML = new RegExp(
-  `(insert\\s+into|update|delete\\s+from)\\s+(public\\.)?(${[...EDGE_TABLES, TOKEN_TABLE].join("|")})\\b`,
+  `(insert\\s+into|update|delete\\s+from)\\s+(public\\.)?(${[...EDGE_TABLES, TOKEN_TABLE, "project_context_memberships"].join("|")})\\b`,
   "i"
 );
 
@@ -83,6 +91,11 @@ describe("access-chain single writer", () => {
         }
         if (rel !== TOKEN_WRITER && (writesTo(source, TOKEN_TABLE) || mentionsWithWrites(source, TOKEN_TABLE))) {
           offenders.push(`${rel} writes/names ${TOKEN_TABLE} outside its single writer`);
+        }
+        for (const { table, writer } of SUBSTRATE) {
+          if (rel !== writer && (writesTo(source, table) || mentionsWithWrites(source, table))) {
+            offenders.push(`${rel} writes/names ${table} outside ${writer}`);
+          }
         }
       }
     }
@@ -110,6 +123,13 @@ describe("access-chain single writer", () => {
       if (SQL_DML.test(source)) offenders.push(relative(ROOT, file));
     }
     expect(offenders, `SQL DML against access edges:\n${offenders.join("\n")}`).toEqual([]);
+  });
+
+  it("non-vacuous for the substrate: each owner module DOES write its table", () => {
+    for (const { table, writer } of SUBSTRATE) {
+      const source = readFileSync(join(ROOT, writer), "utf8");
+      expect(writesTo(source, table), `expected ${writer} to write ${table}`).toBe(true);
+    }
   });
 
   it("is non-vacuous: the single writer itself DOES write all three tables", () => {

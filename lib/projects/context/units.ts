@@ -1,0 +1,95 @@
+import "server-only";
+import type { DbClient } from "@/lib/db/types";
+
+/**
+ * THE single writer for `project_context_units` (spec §"project_context_units"; guarded by
+ * test/guards/access-single-writer.test.ts). This slice reconciles the ITEM grain only: one
+ * `unit_kind='item'` unit per item, `audience` inherited verbatim from `items.access` (never
+ * accepted from a classifier — the persistence contract's hard rule), `content_sha256` mirrored
+ * so a later change is detectable. Task/decision/meeting-segment grains arrive in Phase D.
+ */
+
+export interface ReconcileResult {
+  ok: boolean;
+  error?: string;
+  unitId?: string;
+  created?: boolean;
+}
+
+type ItemRow = { id: string; access: "team" | "external"; content_sha256: string; work_at: string };
+
+/**
+ * Reconcile one item into its item-grain unit. Idempotent: creates the unit if absent, and
+ * refreshes audience/content_sha256/occurred_at if the item changed (audience ALWAYS re-mirrors
+ * `items.access` so a tier reclassification propagates to the unit). The unit's audience is the
+ * source of truth the oracle-side filter will read; it is never widened by anything but a change
+ * to the item's own access.
+ */
+export async function reconcileItemUnit(
+  db: DbClient,
+  teamId: string,
+  itemId: string
+): Promise<ReconcileResult> {
+  const { data: itemData, error: iErr } = await db
+    .from("items")
+    .select("id, access, content_sha256, work_at")
+    .eq("team_id", teamId)
+    .eq("id", itemId)
+    .maybeSingle();
+  if (iErr) return { ok: false, error: iErr.message };
+  const item = itemData as ItemRow | null;
+  if (!item) return { ok: false, error: "item not found" };
+
+  const { data: existing } = await db
+    .from("project_context_units")
+    .select("id, audience, content_sha256")
+    .eq("team_id", teamId)
+    .eq("source_item_id", itemId)
+    .eq("unit_kind", "item")
+    .maybeSingle();
+
+  if (existing) {
+    const row = existing as { id: string; audience: string; content_sha256: string };
+    if (row.audience !== item.access || row.content_sha256 !== item.content_sha256) {
+      const { error } = await db
+        .from("project_context_units")
+        .update({
+          audience: item.access,
+          content_sha256: item.content_sha256,
+          occurred_at: item.work_at,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", row.id)
+        .eq("team_id", teamId);
+      if (error) return { ok: false, error: error.message };
+    }
+    return { ok: true, unitId: row.id, created: false };
+  }
+
+  const { data, error } = await db
+    .from("project_context_units")
+    .insert({
+      team_id: teamId,
+      unit_kind: "item",
+      source_item_id: itemId,
+      unit_key: "item",
+      audience: item.access,
+      content_sha256: item.content_sha256,
+      occurred_at: item.work_at,
+    })
+    .select("id")
+    .single();
+  if (error || !data) {
+    // Race loser on pcu_item_key_idx: converge on the winner.
+    const { data: winner } = await db
+      .from("project_context_units")
+      .select("id")
+      .eq("team_id", teamId)
+      .eq("source_item_id", itemId)
+      .eq("unit_kind", "item")
+      .maybeSingle();
+    if (winner) return { ok: true, unitId: (winner as { id: string }).id, created: false };
+    return { ok: false, error: error?.message ?? "insert failed" };
+  }
+  return { ok: true, unitId: data.id as string, created: true };
+}
