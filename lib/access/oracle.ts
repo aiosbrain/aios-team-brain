@@ -1,6 +1,6 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
-import { isPrincipal } from "@/lib/access/eligibility";
+import { isBuiltinEligible, isPrincipal } from "@/lib/access/eligibility";
 import { EVERYONE_SLUG, EXTERNAL_SLUG } from "@/lib/access/groups";
 
 /**
@@ -74,6 +74,11 @@ export async function visibleProjects(db: DbClient, principal: Principal): Promi
         const g = r.groups;
         if (!g) return false; // missing embed: unresolvable group → fail closed (review M2)
         if (!g.is_builtin) return true;
+        // Built-in membership is legitimate ONLY for builtin-eligible humans of the matching
+        // tier. Tier alone is not enough: a planted team-tier AGENT in Everyone would pass a
+        // tier-only check and inherit every General project (slice-2 Codex High) — agents are
+        // principals for ordinary groups, never for built-ins.
+        if (!isBuiltinEligible(member)) return false;
         const requiredTier = tierFor[g.slug];
         // An is_builtin row with a slug outside the two known built-ins cannot be created by
         // the writer; if one exists it is a direct write — fail closed, never "unknown = allow".
@@ -103,4 +108,29 @@ export async function visibleProjects(db: DbClient, principal: Principal): Promi
 export async function canSeeProject(db: DbClient, principal: Principal, projectId: string): Promise<boolean> {
   const { projectIds } = await visibleProjects(db, principal);
   return projectIds.has(projectId);
+}
+
+/**
+ * The delegated-token formula (spec §10), verbatim:
+ *   effective = visibleProjects(member) ∩ visibleProjects(on_behalf_of ?? member) ∩ (scope ?? U)
+ * The launcher's own visibility ALWAYS intersects — a mixed credential (agent launcher +
+ * human on_behalf_of) can never exceed the agent's own groups. Computed live per request:
+ * no snapshot exists to drift when either leg's groups change.
+ */
+export async function effectiveVisibleProjects(
+  db: DbClient,
+  token: { teamId: string; memberId: string; onBehalfOf: string | null; projectScope: string[] | null }
+): Promise<ReadonlySet<string>> {
+  const launcher = await visibleProjects(db, {
+    teamId: token.teamId,
+    memberId: token.memberId,
+    projectScope: token.projectScope,
+  });
+  if (!token.onBehalfOf || token.onBehalfOf === token.memberId) return launcher.projectIds;
+  const represented = await visibleProjects(db, {
+    teamId: token.teamId,
+    memberId: token.onBehalfOf,
+    projectScope: token.projectScope,
+  });
+  return new Set([...launcher.projectIds].filter((p) => represented.projectIds.has(p)));
 }
