@@ -49,6 +49,12 @@ export async function linkMemberByEmail(
        where team_id = $1 and email = $2 and status = 'invited'`,
       [teamId, email]
     );
+    // Activation changes builtin eligibility → converge Everyone/External now, not at the
+    // next scheduler tick (spec §11: membership maintained on activation AND tier change).
+    // AWAITED (failure-swallowing): fire-and-forget let the very next request observe an
+    // active member absent from Everyone (slice-3 Codex Medium). A sync failure still never
+    // fails a login; the tick is the backstop.
+    await syncBuiltinMembershipSafe(teamId);
   }
 }
 
@@ -64,6 +70,20 @@ export async function activateInvitedMembership(teamId: string, authUserId: stri
      where team_id = $1 and auth_user_id = $2 and status = 'invited'`,
     [teamId, authUserId]
   );
+  // Same eligibility hook as the email-keyed flip above.
+  await syncBuiltinMembershipSafe(teamId);
+}
+
+/** Awaited, failure-swallowing builtin re-sync — auth paths must never fail on access maintenance. */
+async function syncBuiltinMembershipSafe(teamId: string): Promise<void> {
+  try {
+    const { adminClient } = await import("@/lib/db/admin");
+    const { syncBuiltinMembership } = await import("@/lib/access/groups");
+    const r = await syncBuiltinMembership(adminClient(), teamId);
+    if (!r.ok) console.warn(`[access] builtin sync after activation failed: ${r.error}`);
+  } catch {
+    // never fail a login on access maintenance
+  }
 }
 
 export async function emailHasMember(email: string): Promise<boolean> {

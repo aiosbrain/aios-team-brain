@@ -51,6 +51,16 @@ export async function createTeam(
     target_id: team.id,
     meta: { slug, name },
   });
+  // §11 access bootstrap: built-in groups, General/external-shared system projects, and the
+  // three grants — created WITH the team so no window exists where a team has members but no
+  // access topology. Best-effort (the scheduler tick converges any failure); never blocks
+  // team creation.
+  try {
+    const { ensureAccessBootstrap } = await import("@/lib/access/bootstrap");
+    await ensureAccessBootstrap(admin, team.id);
+  } catch {
+    // converged by the next scheduler tick
+  }
   return team;
 }
 

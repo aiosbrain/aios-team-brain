@@ -27,6 +27,9 @@ export async function GET(req: NextRequest) {
     .from("projects")
     .select("slug, name, last_synced_at")
     .eq("team_id", auth.teamId)
+    // The §11 system containers (general/external-shared) are access topology, not
+    // registrable workspaces — a workspace must not mint marker files for them.
+    .neq("kind", "system")
     .order("slug");
   if (error) return errorResponse("internal", error.message, 500);
 

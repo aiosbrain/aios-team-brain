@@ -952,6 +952,11 @@ create table if not exists projects (
   created_at timestamptz not null default now(),
   unique (team_id, slug)
 );
+-- 'source' (ingestion container) | 'system' (§11 built-ins: general/external-shared) |
+-- 'initiative' (human-facing, Part II substrate). The CHECK lives in the 20260809150000
+-- migration as a named drop-and-re-add constraint (replay-repairable); pg:schema always runs
+-- migrations after this file, so it exists in every path.
+alter table projects add column if not exists kind text not null default 'source';
 
 -- ── Access chain (spec: docs/specs/project-context-classification-v1.md §4) ──────────────
 -- Person → Group → Project → Content. These three tables are the ONLY access edges; the sole

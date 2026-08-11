@@ -28,9 +28,14 @@ export async function createProjectAction(input: {
   if (!me) return { ok: false, error: "not a member of this team" };
 
   const db = await serverClient();
+  // Spec §11/Part II: dashboard-created projects are 'initiative' (ingestion containers are
+  // 'source'; the two §11 built-ins are 'system'). This is also what makes the bootstrap's
+  // source-only adoption safe: a human creating "General" here mints an initiative, which the
+  // bootstrap REFUSES to adopt instead of silently granting it Everyone-visibility
+  // (slice-3 Codex High).
   const { data, error } = await db
     .from("projects")
-    .insert({ team_id: input.teamId, slug, name })
+    .insert({ team_id: input.teamId, slug, name, kind: "initiative" })
     .select("id, slug, name")
     .single();
   if (error || !data) {

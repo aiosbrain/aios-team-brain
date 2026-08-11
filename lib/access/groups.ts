@@ -127,10 +127,13 @@ export async function ensureBuiltins(db: DbClient, teamId: string): Promise<Writ
  * tier='team'; external = isBuiltinEligible ∧ tier='external'. Inserts missing rows, deletes
  * rows that no longer qualify. Hook this on member activation/deactivation AND tier change.
  *
- * DEFERRED (review F3, wiring slice): this is a read-then-write diff with no serialization —
- * a per-team advisory lock needs a transaction surface the adapter does not expose yet.
- * Nothing calls this concurrently today; the oracle's read-side eligibility + tier checks
- * bound the damage of a stale re-add to availability, not access.
+ * DEFERRED (review F3; premise updated by slice 3): this is a read-then-write diff with no
+ * serialization — a per-team advisory lock needs a transaction surface the adapter does not
+ * expose yet. Since slice 3, concurrent callers DO exist (login-path activation hooks, admin
+ * member hooks, the scheduler tick), so interleavings can transiently re-add a just-disabled
+ * member's row or drop-then-re-add; the oracle's read-side eligibility + builtin-tier checks
+ * keep every such stale row access-inert (availability noise, never a leak), and the next
+ * sync converges. Serialize when the adapter grows transactions.
  */
 export async function syncBuiltinMembership(db: DbClient, teamId: string): Promise<WriteResult> {
   const { data: groups, error: gErr } = await db
@@ -329,8 +332,24 @@ export async function grantProjectToGroup(
   teamId: string,
   projectId: string,
   groupId: string,
-  actorMemberId: string
+  actorMemberId: string | null
 ): Promise<WriteResult> {
+  // Select-first: audit ONLY on creation (the syncBuiltinMembership audit-on-change pattern).
+  // The bootstrap re-runs this every scheduler tick; an unconditional upsert+audit minted 3
+  // audit rows/team/tick forever and re-clobbered added_by — drowning the grant trail the
+  // spec's accountability story depends on (slice-3 Fable High).
+  // KNOWN BOUNDED RACE (deferred with F3): two concurrent CREATES of the same edge can both
+  // miss the select and both audit (double provenance for one ms-apart creation — the trail
+  // over-reports, never under-reports). The atomic form (INSERT … ON CONFLICT DO NOTHING
+  // RETURNING) needs adapter support; take it with the transaction surface.
+  const { data: existing } = await db
+    .from("project_groups")
+    .select("project_id")
+    .eq("team_id", teamId)
+    .eq("project_id", projectId)
+    .eq("group_id", groupId)
+    .maybeSingle();
+  if (existing) return { ok: true };
   const { error } = await db
     .from("project_groups")
     .upsert({ team_id: teamId, project_id: projectId, group_id: groupId, added_by: actorMemberId }, { onConflict: "project_id,group_id" });
