@@ -56,19 +56,28 @@ export async function backfillTeamContext(
   const items = (data ?? []) as ItemRow[];
   let unitsCreated = 0;
   let membershipsCreated = 0;
+  let scanned = 0;
+  // On failure the cursor is the last item that FULLY succeeded (or the incoming afterId if the
+  // first item fails), so a resume RETRIES the failed item rather than skipping past it —
+  // skipping would leave a unit with no membership, i.e. content visible to no one under a
+  // Phase-B read (Fable H2). Progress within a failed batch is preserved (the successes before
+  // it committed and are idempotent on retry).
+  let lastGood: string | null = opts.afterId ?? null;
   for (const item of items) {
     const unit = await reconcileItemUnit(db, teamId, item.id);
-    if (!unit.ok || !unit.unitId) return { ok: false, error: `unit ${item.id}: ${unit.error}`, scanned: unitsCreated, unitsCreated, membershipsCreated, cursor: item.id };
+    if (!unit.ok || !unit.unitId) return { ok: false, error: `unit ${item.id}: ${unit.error}`, scanned, unitsCreated, membershipsCreated, cursor: lastGood };
     if (unit.created) unitsCreated++;
     const target = item.access === "external" ? projectId.externalShared : projectId.general;
     const m = await ensureIncludeMembership(db, teamId, { projectId: target, contextUnitId: unit.unitId });
-    if (!m.ok) return { ok: false, error: `membership ${item.id}: ${m.error}`, scanned: unitsCreated, unitsCreated, membershipsCreated, cursor: item.id };
+    if (!m.ok) return { ok: false, error: `membership ${item.id}: ${m.error}`, scanned, unitsCreated, membershipsCreated, cursor: lastGood };
     if (m.created) membershipsCreated++;
+    scanned++;
+    lastGood = item.id;
   }
 
   // Drained when the batch came back short.
   const cursor = items.length === batchSize ? items[items.length - 1].id : null;
-  return { ok: true, scanned: items.length, unitsCreated, membershipsCreated, cursor };
+  return { ok: true, scanned, unitsCreated, membershipsCreated, cursor };
 }
 
 async function resolveSystemProjectIds(
@@ -95,19 +104,27 @@ export async function backfillAllTeams(
   const { data: teams, error } = await db.from("teams").select("id");
   if (error) return { teams: 0, failed: [{ teamId: "*", error: `teams read failed: ${error.message}` }] };
   const failed: { teamId: string; error: string }[] = [];
+  const MAX_BATCHES = 10_000;
   for (const t of (teams ?? []) as { id: string }[]) {
     try {
       let cursor: string | null = null;
-      // eslint-disable-next-line no-constant-condition
-      for (let guard = 0; guard < 10_000; guard++) {
+      let drained = false;
+      for (let guard = 0; guard < MAX_BATCHES; guard++) {
         const r: BackfillResult = await backfillTeamContext(db, t.id, { afterId: cursor });
         if (!r.ok) {
           failed.push({ teamId: t.id, error: r.error ?? "unknown" });
+          drained = true; // recorded as failed; don't ALSO report guard-exhaustion below
           break;
         }
-        if (r.cursor === null) break;
+        if (r.cursor === null) {
+          drained = true;
+          break;
+        }
         cursor = r.cursor;
       }
+      // Fail LOUD on a silent partial: a corpus larger than MAX_BATCHES*batchSize left
+      // un-drained would otherwise report as covered (Fable M1).
+      if (!drained) failed.push({ teamId: t.id, error: `guard exhausted at cursor ${cursor} — corpus not fully backfilled` });
     } catch (e) {
       failed.push({ teamId: t.id, error: e instanceof Error ? e.message : "threw" });
     }

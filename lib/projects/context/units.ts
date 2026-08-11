@@ -42,15 +42,16 @@ export async function reconcileItemUnit(
 
   const { data: existing } = await db
     .from("project_context_units")
-    .select("id, audience, content_sha256")
+    .select("id, audience, content_sha256, occurred_at")
     .eq("team_id", teamId)
     .eq("source_item_id", itemId)
     .eq("unit_kind", "item")
     .maybeSingle();
 
   if (existing) {
-    const row = existing as { id: string; audience: string; content_sha256: string };
-    if (row.audience !== item.access || row.content_sha256 !== item.content_sha256) {
+    const row = existing as { id: string; audience: string; content_sha256: string; occurred_at: string };
+    const workAtDrift = new Date(row.occurred_at).getTime() !== new Date(item.work_at).getTime();
+    if (row.audience !== item.access || row.content_sha256 !== item.content_sha256 || workAtDrift) {
       const { error } = await db
         .from("project_context_units")
         .update({

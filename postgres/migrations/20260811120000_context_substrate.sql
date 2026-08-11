@@ -24,6 +24,9 @@ create table if not exists project_context_units (
   occurred_at timestamptz not null default now(),
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
+  -- exactly one canonical source per kind (item grain in this slice; extended in Phase D)
+  check (unit_kind <> 'item' or source_item_id is not null),
+  unique (team_id, id),
   foreign key (team_id, source_item_id) references items (team_id, id) on delete cascade
 );
 -- One item unit per item (the item-grain partial unique the contract names).
@@ -35,7 +38,7 @@ create table if not exists project_context_memberships (
   id uuid primary key default gen_random_uuid(),
   team_id uuid not null references teams(id) on delete cascade,
   project_id uuid not null,
-  context_unit_id uuid not null references project_context_units (id) on delete cascade,
+  context_unit_id uuid not null,
   decision text not null default 'include' check (decision in ('include','exclude')),
   mode text not null default 'auto' check (mode in ('auto','force_include','force_exclude')),
   method text not null default 'ingestion_project'
@@ -45,7 +48,8 @@ create table if not exists project_context_memberships (
   valid_to timestamptz,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
-  foreign key (team_id, project_id) references projects (team_id, id) on delete cascade
+  foreign key (team_id, project_id) references projects (team_id, id) on delete cascade,
+  foreign key (team_id, context_unit_id) references project_context_units (team_id, id) on delete cascade
 );
 -- At most one CURRENT row per (team, project, unit) — the contract's core uniqueness invariant.
 create unique index if not exists pcm_current_idx
