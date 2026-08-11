@@ -493,8 +493,15 @@ async function nativeRetrieve(
   teamId: string,
   tier: "team" | "external",
   question: string,
-  projectSlug?: string | null
+  projectSlug?: string | null,
+  enforce?: { visibleItemIds: ReadonlySet<string> } | null
 ): Promise<RetrievedContext> {
+  // Access enforcement (Phase B slice 2): `enforcing` supplies the principal's membership-visible
+  // item set. `visible(id)` gates every item-bearing leg; `omitGraph` drops the graph legs that
+  // can't be membership-filtered until Phase C. Permissive → `enforce` null → both are no-ops.
+  const visibleIds = enforce?.visibleItemIds ?? null;
+  const visible = (itemId: string | null | undefined): boolean => visibleIds === null || (itemId != null && visibleIds.has(itemId));
+  const omitGraph = enforce != null;
   // Channel scope (Gap #4): if the question names a channel ("#eng" / "in the sales channel"), scope
   // item retrieval to it and strip the phrase so the channel word isn't also a content search term.
   const { channel, cleaned } = parseChannelScope(question);
@@ -505,7 +512,7 @@ async function nativeRetrieve(
   const { source: scopedSource } = parseSourceScope(question);
 
   // Kick off the Graphiti graph-memory search concurrently with Postgres retrieval.
-  const graphFactsP = fetchGraphFacts(db, teamId, tier, q);
+  const graphFactsP = omitGraph ? Promise.resolve([] as Awaited<ReturnType<typeof fetchGraphFacts>>) : fetchGraphFacts(db, teamId, tier, q);
   // Optional dense (semantic) passage search — pgvector. Runs concurrently; resolves to [] unless
   // EMBEDDINGS_URL is set AND the pgvector schema is loaded (default installs stay pure-FTS).
   const denseP = denseSearch(teamId, tier, q, projectSlug);
@@ -570,7 +577,7 @@ async function nativeRetrieve(
   // 3. Structured-context query builders (awaited together with the above).
   let decisionsB = db
     .from("decisions")
-    .select("row_key, decided_at, title, decided_by, still_valid, projects(slug)")
+    .select("row_key, decided_at, title, decided_by, still_valid, source_item_id, projects(slug)")
     .eq("team_id", teamId)
     .order("decided_at", { ascending: false })
     .limit(50);
@@ -584,7 +591,7 @@ async function nativeRetrieve(
   const tasksB = visibleTasks(
     db
       .from("tasks")
-      .select("row_key, title, assignee, status, sprint, updated_at, projects(slug)")
+      .select("row_key, title, assignee, status, sprint, updated_at, source_item_id, projects(slug)")
       .eq("team_id", teamId)
       .order("updated_at", { ascending: false })
       .limit(80),
@@ -595,7 +602,7 @@ async function nativeRetrieve(
   // internal commitments/actors/reporting lines. `emptyRows` resolves to the same `{ data }` shape.
   const emptyRows = Promise.resolve({ data: [] as unknown[] });
   const commitmentsB =
-    isRestrictedTier(tier)
+    isRestrictedTier(tier) || omitGraph
       ? emptyRows
       : db
           .from("graph_entities")
@@ -604,7 +611,7 @@ async function nativeRetrieve(
           .eq("entity_type", "commitment")
           .limit(30);
   const relsB =
-    isRestrictedTier(tier)
+    isRestrictedTier(tier) || omitGraph
       ? emptyRows
       : db
           .from("graph_relationships")
@@ -613,7 +620,7 @@ async function nativeRetrieve(
           .in("relationship_type", ["REPORTS_TO", "OWNS", "BLOCKS"])
           .limit(80);
   const actorsB =
-    isRestrictedTier(tier)
+    isRestrictedTier(tier) || omitGraph
       ? emptyRows
       : db
           .from("graph_entities")
@@ -664,6 +671,7 @@ async function nativeRetrieve(
   for (const hit of [...rankedHits, ...sourceRecencyHits, ...recencyHits]) {
     if (seen.has(hit.id)) continue;
     seen.add(hit.id);
+    if (!visible(hit.id)) continue; // enforcement: only membership-visible items (Phase B slice 2)
     if (projectSlug && hit.slug !== projectSlug) continue;
     const text = (hit.body || "").slice(0, MAX_SOURCE_CHARS);
     if (total + text.length > MAX_TOTAL_CHARS) break;
@@ -731,6 +739,7 @@ async function nativeRetrieve(
     for (const hit of semHits) {
       if (seen.has(hit.id)) continue;
       seen.add(hit.id);
+      if (!visible(hit.id)) continue; // enforcement (semantic hits)
       if (projectSlug && hit.project !== projectSlug) continue;
       const text = (hit.body || "").slice(0, MAX_SOURCE_CHARS);
       if (total + text.length > MAX_TOTAL_CHARS) break;
@@ -753,6 +762,7 @@ async function nativeRetrieve(
     for (const h of denseHits) {
       if (seen.has(h.item_id)) continue;
       seen.add(h.item_id);
+      if (!visible(h.item_id)) continue; // enforcement (dense hits)
       if (projectSlug && h.project !== projectSlug) continue;
       const text = (h.content || "").slice(0, MAX_SOURCE_CHARS);
       if (!text) continue;
@@ -786,17 +796,25 @@ async function nativeRetrieve(
 
   // Decisions: the recency-50 window PLUS any keyword-matched decision that scrolled past it (Gap #6),
   // deduped by row_key. Recency rows first (fresh context), then the older matches under their own note.
-  type DecisionLine = { row_key: string; decided_at: string | null; title: string; decided_by: string; still_valid: boolean; slug: string };
-  const recencyDecisions: DecisionLine[] = (decisions ?? []).map((d) => ({
+  type DecisionLine = { row_key: string; decided_at: string | null; title: string; decided_by: string; still_valid: boolean; source_item_id: string | null; slug: string };
+  const recencyDecisions: DecisionLine[] = (decisions ?? [])
+    // enforcement: a decision whose SOURCE ITEM the principal can't see is dropped (its title/
+    // metadata would otherwise leak a restricted item; row-grain membership is Phase D — this
+    // source-item gate is the safe interim). Dashboard-created rows (null source) stay tier-bounded.
+    .filter((d) => visible((d.source_item_id as string | null) ?? null) || (d.source_item_id ?? null) === null)
+    .map((d) => ({
     row_key: d.row_key as string,
     decided_at: (d.decided_at as string | null) ?? null,
     title: d.title as string,
     decided_by: d.decided_by as string,
     still_valid: d.still_valid as boolean,
+    source_item_id: (d.source_item_id as string | null) ?? null,
     slug: (d.projects as unknown as { slug: string })?.slug ?? "",
   }));
   const recencyKeys = new Set(recencyDecisions.map((d) => d.row_key));
-  const olderMatches = matchedDecisions.filter((d) => !recencyKeys.has(d.row_key));
+  const olderMatches = matchedDecisions
+    .filter((d) => !recencyKeys.has(d.row_key))
+    .filter((d) => visible(d.source_item_id) || d.source_item_id === null); // enforcement: source-item gate
   const fmtDecision = (d: DecisionLine) =>
     `- #${d.row_key} (${d.decided_at ?? "?"}, ${d.slug}) ${d.title} — by ${d.decided_by}${d.still_valid ? "" : " [SUPERSEDED]"}`;
 
@@ -807,7 +825,9 @@ async function nativeRetrieve(
     ...(olderMatches.length ? ["", "## Older decisions matching this query", ...olderMatches.map(fmtDecision)] : []),
     "",
     "## Tasks (all statuses, most recently updated first)",
-    ...(tasks ?? []).map((t) => {
+    ...(tasks ?? [])
+      .filter((t) => visible((t.source_item_id as string | null) ?? null) || (t.source_item_id ?? null) === null)
+      .map((t) => {
       const u = t.updated_at;
       const day = typeof u === "string" ? u.slice(0, 10) : u ? new Date(u).toISOString().slice(0, 10) : "?";
       return `- ${t.row_key} [${t.status}] ${t.title} (${t.assignee || "unassigned"}, ${t.sprint || "no sprint"}) — updated ${day}`;
@@ -858,7 +878,7 @@ async function nativeRetrieve(
  */
 export const nativeProvider: RetrievalProvider = {
   name: "native",
-  retrieve: (r) => nativeRetrieve(r.db, r.teamId, r.tier, r.question, r.projectSlug),
+  retrieve: (r) => nativeRetrieve(r.db, r.teamId, r.tier, r.question, r.projectSlug, r.enforce ?? null),
 };
 
 /**
@@ -871,8 +891,15 @@ export async function retrieve(
   teamId: string,
   tier: "team" | "external",
   question: string,
-  projectSlug?: string | null
+  projectSlug?: string | null,
+  // Access enforcement (Phase B slice 2, spec §5.2/§5.8b). Present = the team is 'enforcing' and
+  // this principal's membership-visible item set is supplied: item legs (FTS/recency/dense) and
+  // source-linked decisions/tasks are filtered to it; the GRAPH legs (entities/relationships/
+  // Graphiti facts) are OMITTED — they carry no tier/partition and can't be membership-filtered
+  // until per-project graphs (Phase C), so under enforcing they fail closed rather than leak
+  // restricted knowledge into an answer. Absent = permissive → byte-identical to today.
+  enforce?: { visibleItemIds: ReadonlySet<string> } | null
 ): Promise<RetrievedContext> {
   const provider = selectedProviderName() === "external" ? externalProvider : nativeProvider;
-  return provider.retrieve({ db, teamId, tier, question, projectSlug: projectSlug ?? null });
+  return provider.retrieve({ db, teamId, tier, question, projectSlug: projectSlug ?? null, enforce: enforce ?? null });
 }

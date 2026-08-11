@@ -187,8 +187,21 @@ export async function POST(req: NextRequest) {
   }
   if (conversationId) await appendMessage(db, owner, conversationId, "user", question);
 
+  // Access enforcement (Phase B slice 2): same as the API query route — filter retrieval to the
+  // member's membership-visible items on an 'enforcing' team; permissive → null → byte-identical.
+  let enforce: { visibleItemIds: ReadonlySet<string> } | null = null;
+  try {
+    const { teamEnforcesAccess, visibleItemIds } = await import("@/lib/access/enforce");
+    if (await teamEnforcesAccess(db, team.id)) {
+      const { ids } = await visibleItemIds(db, { teamId: team.id, memberId: me.id });
+      enforce = { visibleItemIds: ids };
+    }
+  } catch {
+    return errorResponse("internal", "enforcement check failed", 500);
+  }
+
   const started = Date.now();
-  const ctx = await retrieve(db, team.id, memberTier, question, project);
+  const ctx = await retrieve(db, team.id, memberTier, question, project, enforce);
 
   // Per-team provider keys + models + the explicit answering-backend override (null fields → env
   // fallback in streamAnswer; `activeProvider` forces a backend, else selectLlmBackend precedence).

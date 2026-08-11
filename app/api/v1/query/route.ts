@@ -96,8 +96,22 @@ export async function POST(req: NextRequest) {
     .maybeSingle();
   const timeZone = pickTimezone([prof?.timezone, DEFAULT_TIMEZONE]);
 
+  // Access enforcement (Phase B slice 2, spec §5.2/§5.8b): on an 'enforcing' team, retrieval is
+  // filtered to the member's membership-visible items (and graph legs omitted). Permissive → the
+  // enforce arg is null → byte-identical to today. A flag-read error fails closed (500).
+  let enforce: { visibleItemIds: ReadonlySet<string> } | null = null;
+  try {
+    const { teamEnforcesAccess, visibleItemIds } = await import("@/lib/access/enforce");
+    if (await teamEnforcesAccess(db, auth.teamId)) {
+      const { ids } = await visibleItemIds(db, { teamId: auth.teamId, memberId: auth.memberId });
+      enforce = { visibleItemIds: ids };
+    }
+  } catch (e) {
+    return errorResponse("internal", "enforcement check failed", 500);
+  }
+
   const started = Date.now();
-  const ctx = await retrieve(db, auth.teamId, auth.memberTier, question, project);
+  const ctx = await retrieve(db, auth.teamId, auth.memberTier, question, project, enforce);
 
   // Per-team provider keys + models + the explicit answering-backend override (same resolver the
   // dashboard route uses, so both honor OpenRouter/OpenAI/local + `teams.answering_provider`).
