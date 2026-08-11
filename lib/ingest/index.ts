@@ -31,6 +31,13 @@ export interface IngestResult {
   id: string;
   projectId?: string;
   changedTaskRowKeys?: string[];
+  /**
+   * True when this ingest changed the item's `access` tier — including the HEAL-ACCESS path on an
+   * unchanged-body re-push (`status:"unchanged"` but `access` moved external↔team). The context
+   * hook must re-partition on THIS, not on status: a tier reclassification is exactly the move
+   * slice-4 H2 guards, and it arrives as `status:"unchanged"` (slice-5 Fable HIGH).
+   */
+  accessChanged?: boolean;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -372,6 +379,7 @@ export async function ingestItem(
       status: "unchanged",
       id: existing.id,
       projectId: project.id,
+      accessChanged,
     };
   }
 
@@ -583,5 +591,6 @@ export async function ingestItem(
     id: itemId,
     projectId: project.id,
     changedTaskRowKeys,
+    accessChanged,
   };
 }

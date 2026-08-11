@@ -104,30 +104,36 @@ export async function ensureIncludeMembership(
 }
 
 /**
- * Close every CURRENT membership of a unit into projects OTHER than `keepProjectId` (sets
- * `valid_to`). The "close old" half of a move: after a tier flip the backfill re-routes the
- * unit to the correct system project and closes the stale one, so an external→team item stops
- * being served through external-shared (slice-4 Codex H2). Returns how many rows it closed.
+ * Close the CURRENT membership of a unit into ONE specific project (`projectId`), setting
+ * `valid_to`. The "close old" half of a tier-flip MOVE: reconcile re-routes the unit to the
+ * correct system project and closes the OPPOSITE system project's membership (external→team must
+ * stop being served through external-shared — slice-4 Codex H2).
+ *
+ * Scoped to a single named project ON PURPOSE (slice-5 Codex HIGH): an earlier "close every
+ * membership except the target" would, once the Part II curation UI lets a unit belong to
+ * initiatives too, silently delete those legitimate initiative assignments on every reconcile.
+ * The move only ever swaps between the two system projects, so it closes exactly the other one.
  */
-export async function closeOtherMemberships(
+export async function closeMembershipInto(
   db: DbClient,
   teamId: string,
   contextUnitId: string,
-  keepProjectId: string
+  projectId: string
 ): Promise<{ ok: boolean; error?: string; closed: number }> {
   const { data: current } = await db
     .from("project_context_memberships")
-    .select("id, project_id")
+    .select("id")
     .eq("team_id", teamId)
     .eq("context_unit_id", contextUnitId)
+    .eq("project_id", projectId)
     .is("valid_to", null);
-  const stale = ((current ?? []) as { id: string; project_id: string }[]).filter((m) => m.project_id !== keepProjectId);
-  if (stale.length === 0) return { ok: true, closed: 0 };
+  const rows = (current ?? []) as { id: string }[];
+  if (rows.length === 0) return { ok: true, closed: 0 };
   const { error } = await db
     .from("project_context_memberships")
     .update({ valid_to: new Date().toISOString() })
     .eq("team_id", teamId)
-    .in("id", stale.map((m) => m.id));
+    .in("id", rows.map((m) => m.id));
   if (error) return { ok: false, error: error.message, closed: 0 };
-  return { ok: true, closed: stale.length };
+  return { ok: true, closed: rows.length };
 }

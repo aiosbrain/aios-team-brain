@@ -114,6 +114,35 @@ export async function POST(req: NextRequest) {
       after(() => meetingBackfillScheduler.schedule(teamId));
     }
 
+    // §11 context: partition the just-ingested item into its unit + system-project membership
+    // immediately (spec §11.2), so new content is access-partitioned on push, not only when the
+    // scheduler backfill next sweeps. After the response, best-effort — a failure only costs
+    // latency (the scheduler leg is the backstop), never the push. Skips silently if the team's
+    // system projects don't exist yet (bootstrap covers it). Inert in Phase A (no read enforces
+    // memberships yet) but keeps the substrate current from day one of Phase B.
+    // Fire on a real ingest OR a tier reclassification that arrived as `unchanged` (the
+    // heal-access path) — the latter is the security-relevant MOVE (slice-5 Fable HIGH).
+    if (result.status !== "unchanged" || result.accessChanged) {
+      const teamId = auth.teamId;
+      const itemId = result.id;
+      // Scheduling the post-response work must never fail the push — not the work (best-effort
+      // inside), and not the `after()` registration itself (it throws when called outside a
+      // request scope, e.g. the in-process handler tests). Either way the scheduler leg is the
+      // backstop, so a miss here costs latency, never the push.
+      try {
+        after(async () => {
+          const { reconcileItemContext } = await import("@/lib/projects/context/reconcile-item");
+          const r = await reconcileItemContext(adminClient(), teamId, itemId).catch((e) => ({
+            ok: false,
+            error: e instanceof Error ? e.message : "threw",
+          }));
+          if (!r.ok) console.warn(`[access] context reconcile for item ${itemId} failed: ${(r as { error?: string }).error}`);
+        });
+      } catch {
+        // no request scope (tests) or after() unavailable — the scheduler backstop covers it
+      }
+    }
+
     // Strip the internal scheduling hints — the HTTP wire format stays { status, id }.
     return Response.json(
       { status: result.status, id: result.id },

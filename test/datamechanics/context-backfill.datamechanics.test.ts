@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { db, ingest, seedTeam, type Seed } from "./helpers";
 import { backfillTeamContext } from "@/lib/projects/context/backfill";
 import { reconcileItemUnit } from "@/lib/projects/context/units";
-import { ensureIncludeMembership, closeOtherMemberships } from "@/lib/projects/context/memberships";
+import { ensureIncludeMembership } from "@/lib/projects/context/memberships";
 import { GENERAL_SLUG, EXTERNAL_SHARED_SLUG, ensureAccessBootstrap } from "@/lib/access/bootstrap";
 
 // Phase A slice 4 (spec §11.2/§context-substrate) — real-Postgres proofs. The acceptance test
