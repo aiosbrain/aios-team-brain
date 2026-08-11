@@ -212,12 +212,36 @@ a longer multi-task prompt may well be noisier.
 |---|---|---|---|
 | **C1** | cost per episode, **% of graph cost** (one unit, §1) | a fall **under 10%** | below that the lever does not pay for a vendored patch |
 | **Q1′** | **connected** entities per episode (entities with ≥1 incident edge) | outside the band, **either** direction | raw entity count is confounded: the candidate drops orphans mechanically (§3). Connected entities are well-defined in *both* arms and immune to the drop |
-| **Q8′** | **orphan-drop loss rate** in the candidate = (raw entities in the captured `CombinedExtraction` response − nodes kept) / raw | **exceeds the incumbent's measured orphan share** | the capture tap already stores the LLM response, so pre-drop counts are free. This asks the real question — *is the candidate discarding more than the incumbent was already failing to connect?* |
+| **Q8′** | **orphan-drop loss rate** in the candidate = (raw entities in the `CombinedExtraction` **response** − nodes kept) / raw | **exceeds the incumbent's measured orphan share** | asks the real question — *is the candidate discarding more than the incumbent was already failing to connect?* **Requires a tap change, see below** |
 | **Q4** | edges per episode | a fall outside the band | fewer relationships is the thing edges exist for |
-| **Q9** | **consensus-entity retention** — entities present in **every** incumbent rep of the prior session, required to appear in the candidate's graph | any qualifying entity lost | the recall gate replacing Q2 (below). Costs nothing: the prior session's harvests are on disk |
+| **Q9** | **consensus-entity retention** — entities present in **every one of this session's 8 incumbent reps**, required to appear in the candidate's graph | any qualifying entity lost | the recall gate replacing Q2 (below). Self-contained by design, see below |
 | **Q5** | retry rate (harness signed cross-check) | any rise | a longer merged prompt could push validation retries |
 | — | edge name-match skip rate, both arms | *diagnostic only* | pre-existing in both, and the candidate is more lenient (§2) — reported, not gated |
 | — | `dedupe_nodes` / `node_summaries_batch` savings | *reported separately from C1* | they shrink because entities were dropped. Folding them into the headline would let entity loss pad the cost win |
+
+### Two of these were unbuildable as first written — found by checking, before the run
+
+I specified Q8′ and Q9 against instruments I had not opened. Both were wrong, and both would have
+failed at **harvest**, after the money was spent.
+
+**Q8′ needed a capture the tap does not take.** `capture-tap.mjs:65-70` appends the **request** body
+and nothing else; the response is forwarded (`:82-84`) and discarded. So the raw pre-drop entity list
+does not exist anywhere. **Fix, before any run:** the tap also records the response body — `buf` is
+already in hand at `:83`, so this is a few lines, and the byte-for-byte forwarding property that
+makes the tap trustworthy is untouched (it still forwards exactly what it received, it merely also
+writes down what came back). Capture stays fatal-on-write-failure, for the same reason it already is.
+
+**Q9 depended on prior-session artifacts that no longer exist.** I wrote "the prior session's
+harvests are on disk". They are not — Docker died three times during that session and nothing
+survives on this machine. **Fix:** make the gate self-contained — build the consensus list from
+**this session's own 8 incumbent reps** (entities present in *every* one), then require the candidate
+to retain them. This is strictly better than what I specified: same corpus, same session, no
+staleness, and no dependency on artifacts I cannot verify. It is not circular — the list is built
+from the arm the candidate is measured *against*, never from the candidate.
+
+**Both fixes are free and both are prerequisites to spending anything.** Recorded here rather than
+quietly corrected, because "I specified a metric against an instrument I had not opened" is the
+failure, not the two fixes.
 
 **Measured before any arm runs, at zero cost:** the incumbent's orphan share. It is the size of the
 confound, the expected mechanical shift in raw entity count, and Q8′'s pre-registered bound. One
