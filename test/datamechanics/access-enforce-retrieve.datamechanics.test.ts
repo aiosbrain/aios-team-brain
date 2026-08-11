@@ -60,6 +60,22 @@ describe("enforced retrieval (Phase B slice 2)", () => {
     void openItem;
   });
 
+  it("enforcing: the Postgres graph legs (commitments/actors) are OMITTED — can't be membership-filtered until Phase C", async () => {
+    const seed = await seedTeam();
+    await ingest(seed, { path: "g.md", body: `g ${TERM}`, access: "team", project: "src" });
+    await backfillTeamContext(db(), seed.teamId);
+    // Plant a commitment graph entity (a team-tier member sees these under permissive).
+    await db().from("graph_entities").insert({ team_id: seed.teamId, entity_id: `c-${Date.now()}`, entity_type: "commitment", name: "ship the widget", attrs: { status: "open" } });
+    const member = await seedMember(seed);
+
+    const permissive = await retrieve(db(), seed.teamId, "team", `about ${TERM}`, null, null);
+    expect(permissive.structured, "permissive shows the commitment").toContain("ship the widget");
+
+    const enforce = { visibleItemIds: (await visibleItemIds(db(), { teamId: seed.teamId, memberId: member })).ids };
+    const enforcing = await retrieve(db(), seed.teamId, "team", `about ${TERM}`, null, enforce);
+    expect(enforcing.structured, "enforcing OMITS the graph leg (fail closed until Phase C)").not.toContain("ship the widget");
+  });
+
   it("enforcing: a member in NO groups retrieves nothing (fail closed)", async () => {
     const seed = await seedTeam();
     await ingest(seed, { path: "x.md", body: `x ${TERM}`, access: "team", project: "src" });
