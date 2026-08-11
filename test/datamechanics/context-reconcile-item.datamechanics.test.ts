@@ -30,6 +30,25 @@ async function membershipProjects(seed: Seed, itemId: string): Promise<string[]>
   return ((mems ?? []) as { project_id: string }[]).map((m) => m.project_id);
 }
 
+describe("accessChanged threads through the heal-access path (Fable HIGH-1 mechanism)", () => {
+  it("a same-body re-push with a different tier returns status:unchanged AND accessChanged:true", async () => {
+    const { ingestItem } = await import("@/lib/ingest");
+    const { randomUUID, createHash } = await import("node:crypto");
+    const seed = await seedTeam();
+    const body = "heal me";
+    const sha = createHash("sha256").update(body).digest("hex");
+    const auth = { teamId: seed.teamId, memberId: seed.memberId, apiKeyId: randomUUID() };
+    const payload = { project: "src", kind: "deliverable" as const, actor: "t", frontmatter: {}, path: "heal.md", body, content_sha256: sha };
+
+    const first = await ingestItem(db(), auth, payload, "team");
+    expect(first.status).toBe("created");
+    // Same body, tier flips team→external: the heal-access path patches access but returns unchanged.
+    const healed = await ingestItem(db(), auth, payload, "external");
+    expect(healed.status).toBe("unchanged");
+    expect(healed.accessChanged, "the hook keys on THIS to re-partition a tier flip that looks unchanged").toBe(true);
+  });
+});
+
 describe("reconcileItemContext (the shared per-item core)", () => {
   it("routes a fresh team item into General only; external into external-shared only", async () => {
     const seed = await seedTeam();
