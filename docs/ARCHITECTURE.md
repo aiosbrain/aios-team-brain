@@ -801,9 +801,14 @@ guard enforces it, it's named.
   Cypher-side aggregation) whose newest node landed in the recent window (`CENSUS_RECENT_MS`, 7d;
   baseline scales ~1:14 via `CENSUS_BASELINE_MS`), the fraction carried by >1 node. **Zero splits is
   a healthy, judged reading** on 0.29.3 (exact-name dedup is deterministic); a **zero-NAME** census
-  is cross-checked against the `graph_episodes` ledger — episodes flowing but no names ⇒
-  `predicate-suspect` (a graphiti rename OR a stalled extractor; the alert mail names both), no
-  episodes ⇒ ledger-confirmed young/quiet. The alarm ships **UNARMED** (`CENSUS_ALARM_ARMED=false`;
+  is cross-checked against the `graph_episodes` ledger — **at least
+  `MIN_EPISODES_FOR_CENSUS_SUSPICION` (25) windowed** episodes flowing but no names ⇒
+  `predicate-suspect` (a graphiti rename OR a stalled extractor; the alert mail names both), fewer
+  than that ⇒ ledger-confirmed young/quiet. **The floor is load-bearing** (CENSUSFLOOR-1): it
+  originally accused on ONE episode, and prod's `aios_external` — a single 196-char boilerplate index
+  stub in the window — was rendered on the card as "stalled extractor" while that group held 16
+  entities. `predicate-suspect` RUNS the blindness clock and `small-sample` PARKS it, so the floor is
+  also what stops a low-volume group paging a healthy install. The alarm ships **UNARMED** (`CENSUS_ALARM_ARMED=false`;
   margin/floor are placeholders) until the admin card's per-group census has been measured on prod —
   flipping it is the rollout's step-3 commit. Delivery (`lib/graph/extraction-alert`, driven from the
   ingest scheduler tick) runs **two machines over the `graph_health` `ingest_runs` ledger**,

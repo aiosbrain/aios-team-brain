@@ -299,6 +299,35 @@ export const CENSUS_BASELINE_MS = 14 * CENSUS_RECENT_MS;
  */
 export const MIN_NAMES_FOR_CENSUS_SIGNAL = 50;
 /**
+ * Below this many episodes projected INTO THE RECENT WINDOW, a zero-name census is not evidence of
+ * anything and must not accuse — it reads `small-sample` (which parks the blindness clock) rather
+ * than `predicate-suspect` (which runs it). CENSUSFLOOR-1 / AIO-867.
+ *
+ * The bug this closes, found live on the admin card: the floor was **one episode**, and prod's
+ * `aios_external` group held exactly one 196-char boilerplate index stub in the window — so the card
+ * read "rename or stalled extractor" about a working extractor (Neo4j: 16 entities all-time in that
+ * group). An alarm surface that accuses on no evidence trains its reader to ignore it, which is how
+ * the alarm this replaced ended up silently dead.
+ *
+ * SEPARATE from `MIN_EPISODES_FOR_EXTRACTION_SIGNAL` despite sharing its initial value, because they
+ * are different quantities: that one counts LIFETIME episodes (a fresh-install threshold), this one
+ * counts 7-day-WINDOWED episodes (a rate). One constant would couple them, and a future
+ * re-derivation of either would silently move the other.
+ *
+ * 25 is deliberately CONSERVATIVE, not inherited: at prod's measured 12.66 entities/episode even
+ * 3-5 typical episodes yielding zero names would be anomalous, so detection needs far less. It is
+ * set high against the counter-case that makes a low floor dangerous — a workspace restructure
+ * re-pushing several boilerplate index files in one week legitimately yields near-zero names, and a
+ * card that accuses on that burst is back to crying wolf.
+ *
+ * KNOWN AND ACCEPTED, both halves (see docs/design/census-sample-floor.md §2): a group pushing 25
+ * boilerplate episodes would still be accused; and a GENUINE per-group extraction failure in a group
+ * that never reaches 25 episodes per window is now permanently silent, its detection riding on the
+ * busy group (which does trip — a global stall decays the busy group's `recentNames` to 0 against
+ * thousands of recent episodes).
+ */
+export const MIN_EPISODES_FOR_CENSUS_SUSPICION = 25;
+/**
  * ⚠️ PLACEHOLDER — armed after prod measurement per the rollout (docs/design/dedupe-alarm-0293.md):
  * the card ships the per-group split-share numbers first, the margin is set from a few days of
  * measured baseline in a follow-up commit (the same measured-not-chosen path the original AIO-693
@@ -603,12 +632,18 @@ export interface NameCollisionInput {
  *  • At `baselineShare === 0` the relative margin rejects nothing, so ONLY the absolute floor
  *    judges.
  *  • A ZERO-NAME census is indistinguishable from a young group on its own, so it cross-checks the
- *    `graph_episodes` ledger: episodes projected in the window but zero census names ⇒
- *    `predicate-suspect` (a graphiti bump renaming `Entity`/`created_at` — OR a stalled extractor;
- *    the alert mail names both); no episodes either ⇒ a genuinely young/quiet group
- *    (`small-sample`). "Young" is thereby defined by the ledger, the one source that knows whether
- *    anything was pushed. An unreadable ledger (`recentEpisodes: null`) reads as `small-sample`,
- *    never as an accusation.
+ *    `graph_episodes` ledger: **at least `MIN_EPISODES_FOR_CENSUS_SUSPICION`** episodes projected in
+ *    the window but zero census names ⇒ `predicate-suspect` (a graphiti bump renaming
+ *    `Entity`/`created_at` — OR a stalled extractor; the alert mail names both); fewer than that ⇒ a
+ *    genuinely young/quiet group (`small-sample`). "Young" is thereby defined by the ledger, the one
+ *    source that knows whether anything was pushed. An unreadable ledger (`recentEpisodes: null`)
+ *    reads as `small-sample`, never as an accusation.
+ *
+ *    The floor is load-bearing, not decoration (CENSUSFLOOR-1): this cross-check originally accused
+ *    on ONE episode, and prod's `aios_external` — a single 196-char boilerplate index stub in the
+ *    window — was rendered on the admin card as "stalled extractor" while that group in fact held 16
+ *    entities. `small-sample` PARKS the blindness clock and `predicate-suspect` RUNS it, so the floor
+ *    is also what stops a low-volume group from paging an install where nothing is wrong.
  *
  * `armed` defaults to `CENSUS_ALARM_ARMED` (rollout: false until margin/floor are measured); tests
  * pass `true` to pin the armed mechanics. While unarmed the verdict is clamped `polluted: false`
@@ -639,8 +674,11 @@ export function deriveNameCollisionPollution(
     return refuse("graph-unreadable");
   }
   if (signals.recentNames === 0) {
-    // The tripwire that replaced the old zero-predicate check — see the contract above.
-    return (recentEpisodes ?? 0) > 0 ? refuse("predicate-suspect") : refuse("small-sample");
+    // The tripwire that replaced the old zero-predicate check — see the contract above. The floor is
+    // what stops it accusing on no evidence (CENSUSFLOOR-1): below it, zero names is unremarkable.
+    return (recentEpisodes ?? 0) >= MIN_EPISODES_FOR_CENSUS_SUSPICION
+      ? refuse("predicate-suspect")
+      : refuse("small-sample");
   }
   if (signals.recentNames < MIN_NAMES_FOR_CENSUS_SIGNAL) return refuse("small-sample");
   if (signals.baselineNames < MIN_NAMES_FOR_CENSUS_SIGNAL) return refuse("no-baseline");

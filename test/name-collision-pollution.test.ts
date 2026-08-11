@@ -3,6 +3,7 @@ import {
   deriveNameCollisionPollution,
   CENSUS_ABSOLUTE_FLOOR,
   MIN_NAMES_FOR_CENSUS_SIGNAL,
+  MIN_EPISODES_FOR_CENSUS_SUSPICION,
   type NameCollisionInput,
 } from "@/lib/graph/extraction-health";
 
@@ -103,10 +104,14 @@ describe("deriveNameCollisionPollution — the unarmed clamp (rollout step 1)", 
 
   it("…but judgeable and refusal still compute — the blindness meta-alarm needs them", () => {
     expect(deriveNameCollisionPollution(hot()).judgeable).toBe(true);
+    // 30, not 10: CENSUSFLOOR-1 gave the accusation an episode floor
+    // (`MIN_EPISODES_FOR_CENSUS_SUSPICION`), so 10 now reads `small-sample`. This test is about
+    // refusals still computing while unarmed, so it needs a fixture that genuinely reaches the
+    // tripwire — the floor is pinned separately by A2/A3, and must NOT be lowered to keep this green.
     const suspect = deriveNameCollisionPollution({
       configured: true,
       signals: { recentNames: 0, recentSplit: 0, baselineNames: 0, baselineSplit: 0 },
-      recentEpisodes: 10,
+      recentEpisodes: 30,
     });
     expect(suspect.refusal).toBe("predicate-suspect");
   });
@@ -158,5 +163,55 @@ describe("the configured flag is checked before the signals", () => {
       recentEpisodes: 0,
     });
     expect(out.refusal).toBe("graph-unconfigured");
+  });
+});
+
+/**
+ * CENSUSFLOOR-1 (docs/design/census-sample-floor.md): the zero-name tripwire accused on a sample of
+ * ONE episode, while its sibling judgement in the same file refuses below 25
+ * (`MIN_EPISODES_FOR_EXTRACTION_SIGNAL`) with the reason in its own docstring. Found live: prod's
+ * `aios_external` group held exactly one 196-char boilerplate index stub in the 7-day window and the
+ * admin card read "rename or stalled extractor". Neo4j confirmed 16 entities all-time in that group —
+ * extraction was fine; the zero was windowing.
+ */
+describe("deriveNameCollisionPollution — the accusation needs a sample (CENSUSFLOOR-1)", () => {
+  const zeroNames = (recentEpisodes: number | null): NameCollisionInput => ({
+    configured: true,
+    signals: { recentNames: 0, recentSplit: 0, baselineNames: 0, baselineSplit: 0 },
+    recentEpisodes,
+  });
+
+  // A1 — prod's exact shape must not accuse.
+  it("A1: zero names with ONE recent episode reads small-sample, never an accusation", () => {
+    const out = deriveNameCollisionPollution(zeroNames(1));
+    expect(out.refusal).toBe("small-sample");
+    expect(out.judgeable).toBe(false);
+    expect(out.polluted).toBe(false);
+  });
+
+  // A2 — LITERAL 25, not the constant: if every test read the constant, a mutation raising the
+  // floor to 10_000 (killing detection outright) would leave the whole suite green.
+  it("A2: zero names with a literal 25 recent episodes still trips predicate-suspect", () => {
+    expect(deriveNameCollisionPollution(zeroNames(25)).refusal).toBe("predicate-suspect");
+  });
+
+  // A3 — the boundary, wherever the constant sits.
+  it("A3: the boundary is exact at the exported constant", () => {
+    expect(deriveNameCollisionPollution(zeroNames(MIN_EPISODES_FOR_CENSUS_SUSPICION - 1)).refusal).toBe(
+      "small-sample"
+    );
+    expect(deriveNameCollisionPollution(zeroNames(MIN_EPISODES_FOR_CENSUS_SUSPICION)).refusal).toBe(
+      "predicate-suspect"
+    );
+  });
+
+  // A6 — prod's measured state, as a fixture.
+  it("A6: prod's measured aios_external state (1 episode, 0 names) reads small-sample", () => {
+    expect(deriveNameCollisionPollution(zeroNames(1)).refusal).toBe("small-sample");
+  });
+
+  // A4's null case already pinned above; re-asserted here against the new predicate's `??`.
+  it("A4: an unreadable ledger still reads small-sample under the floor comparison", () => {
+    expect(deriveNameCollisionPollution(zeroNames(null)).refusal).toBe("small-sample");
   });
 });
