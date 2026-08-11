@@ -151,7 +151,26 @@ prod data. This fix is about a *refusal*, which computes regardless of arming.
 | A4 | `recentEpisodes: null` (unreadable ledger) still ⇒ `small-sample`, never an accusation | unit | any accusation from a null ledger |
 | A5 | **The page cannot fire from a below-floor group alone**, tested through the REAL chain: `deriveNameCollisionPollution` → `refusalRunsClock(refusal, …)` → `classifyBlindnessTick`. With `aios_team` at `small-sample` and `aios_external` below the floor, the tick is `"parked"`, not `"running"` | unit | `"running"` — §0.2's latent bug surviving the fix |
 | A6 | Prod's exact measured state reproduces: 1 recent episode, 0 names ⇒ `small-sample` | unit | anything else |
-| A7 | **Mutation:** restoring `> 0` reddens **A1, A3, A5 and A6** — and not A2 | mutation | a mutation reddening no test, or reddening A2 (which would mean A2 pins the wrong thing) |
+| A7 | **Mutations, three, with the redden list recorded from the RUN and not predicted** | mutation | a mutation reddening no test, or reddening the wrong set |
+
+### A7's three mutations — measured redden lists
+
+Recorded from running them, not from predicting them. My first draft predicted mutation 2 would
+redden "A2 alone"; it reddens three tests. Same unverified-"alone" class I have hit twice already
+this week, so the lists below are transcribed output.
+
+| mutation | reddens |
+|---|---|
+| **1 — restore the `> 0` floor** (the bug itself) | A1 · A3 · A6 · A5's parked case · the guard's below-floor half |
+| **2 — floor → 10,000** (detection dead) | A2 · the unarmed-clamp refusal test · the guard's firing half |
+| **3 — the production seam:** replace `refusalRunsClock(…)` with `refusal !== null` in `runBlindnessMachine` | the roundtrip park pin, alone |
+
+**Mutation 3 is the code review's find, not mine, and it is the important one.** A5 composes the
+chain *test-side*, so it stays green if the *production* tick construction stops consulting
+`refusalRunsClock` — and that mutation ships exactly the spurious page this change exists to
+prevent, with the entire suite green. It is now pinned at the production seam
+(`test/graph-health-roundtrip.test.ts`), over the full 25h the machine needs, with a non-vacuity
+case beside it proving a clock-running refusal still anchors on the same shape.
 
 **Why A2 uses a literal 25 and A3 uses the constant.** If both read the exported constant, a mutation
 raising the floor to 10,000 — which kills detection entirely — leaves the whole suite green. A2's

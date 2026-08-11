@@ -147,3 +147,38 @@ describe("pollution rows round-trip: groups written by alert/refresh are the mem
     expect(metas[1].refresh).toBe(true);
   });
 });
+
+/**
+ * CENSUSFLOOR-1 (code review MEDIUM): the PRODUCTION tick construction was unpinned against a
+ * taxonomy bypass. `runBlindnessMachine` derives `clockRuns` per group via `refusalRunsClock`
+ * (`lib/graph/extraction-alert.ts:496-502`); replacing that with `refusal !== null` leaves the whole
+ * suite green — A5 composes the chain test-side, `refusalRunsClock`'s own tests are pure, and every
+ * all-unjudgeable sequence in this file used `predicate-suspect` (which runs the clock either way),
+ * while its one `small-sample` dip sits beside a judgeable group so the tick is `judged` regardless.
+ *
+ * That mutation ships EXACTLY the spurious page CENSUSFLOOR-1 exists to prevent: a healthy install
+ * whose only refusal is a parked `small-sample` would anchor and then mail "the pollution alarm has
+ * gone blind". Pinning the park here, at the production seam, over the full 25h the machine needs.
+ */
+describe("a parked refusal never runs the blindness clock — the production seam (CENSUSFLOOR-1)", () => {
+  const t0 = Date.UTC(2026, 7, 1);
+  const parked = { judgeable: false, polluted: false, refusal: "small-sample" as const };
+
+  it("every group small-sample for 25h+ NEVER anchors and NEVER fires", async () => {
+    const { db } = ledgerDb();
+    // Hour 0 — a parked tick must not even anchor; anchoring is what makes the 24h clock start.
+    expect((await tick(db, [census("A", parked), census("B", parked)], t0)).blindness).toBe("none");
+    // Hour 25 — past UNJUDGEABLE_ALERT_HOURS. Still nothing: parked ticks change nothing, so there
+    // is no anchor to fire off. If `clockRuns` ever stops consulting `refusalRunsClock`, this reads
+    // "anchor" here and "fire" on the next tick.
+    expect(
+      (await tick(db, [census("A", parked), census("B", parked)], t0 + 25 * HOUR)).blindness
+    ).toBe("none");
+  });
+
+  it("…while a clock-RUNNING refusal on the same shape does anchor — the pin is not vacuous", async () => {
+    const { db } = ledgerDb();
+    const suspect = { judgeable: false, polluted: false, refusal: "predicate-suspect" as const };
+    expect((await tick(db, [census("A", suspect)], t0)).blindness).toBe("anchor");
+  });
+});

@@ -125,14 +125,18 @@ describe("name-collision census pinning (graphiti_core 0.29.3)", () => {
     });
     expect(out.judgeable).toBe(false);
     expect(out.refusal).toBe("predicate-suspect");
+  });
 
-    // …and below the floor the SAME signals must not accuse — the guard covers both sides, so a
-    // regression that drops the floor cannot pass by satisfying only the firing half.
+  it("…and below the floor the SAME signals must NOT accuse — the other half of the same guard", () => {
+    // Its own `it`, not a second expect in the one above: under a floor-raising mutation the firing
+    // expect fails first and a packed assertion never executes, so it would prove nothing about the
+    // half it exists for (one-condition-per-fixture).
     const belowFloor = deriveNameCollisionPollution({
       configured: true,
       signals: { recentNames: 0, recentSplit: 0, baselineNames: 0, baselineSplit: 0 },
       recentEpisodes: 1,
     });
+    expect(belowFloor.judgeable).toBe(false);
     expect(belowFloor.refusal).toBe("small-sample");
   });
 
