@@ -76,14 +76,23 @@ describe("enforced retrieval (Phase B slice 2)", () => {
     expect(enforcing.structured, "enforcing OMITS the graph leg (fail closed until Phase C)").not.toContain("ship the widget");
   });
 
-  it("enforcing: a decision/task tied to a RESTRICTED item is dropped from the structured block (source-item gate)", async () => {
+  it("enforcing: a decision AND task tied to a RESTRICTED item are dropped from the structured block (source-item gate)", async () => {
     const seed = await seedTeam();
     const item = await ingest(seed, { path: "d.md", body: `d ${TERM}`, access: "team", project: "src" });
-    // A decision + task sourced from that item.
-    await db().from("decisions").insert({ team_id: seed.teamId, row_key: "DEC-9", title: `${TERM} decision`, decided_by: "chetan", still_valid: true, source_item_id: item.id, project_id: (await db().from("projects").select("id").eq("team_id", seed.teamId).eq("slug", "src").single()).data!.id }).then(() => {}, () => {});
+    const srcProj = (await db().from("projects").select("id").eq("team_id", seed.teamId).eq("slug", "src").single()).data!.id;
+    const decErr = (await db().from("decisions").insert({ team_id: seed.teamId, row_key: "DEC-9", title: `${TERM} decision`, decided_by: "chetan", still_valid: true, source_item_id: item.id, project_id: srcProj })).error;
+    expect(decErr, "decision fixture must insert").toBeNull();
+    const taskErr = (await db().from("tasks").insert({ team_id: seed.teamId, row_key: "TSK-9", title: `${TERM} task`, status: "in_progress", origin: "sync", source_item_id: item.id, project_id: srcProj })).error;
+    expect(taskErr, "task fixture must insert").toBeNull();
     await backfillTeamContext(db(), seed.teamId);
+
+    // Permissive PRESENCE control: both surface today.
+    const permissive = await retrieve(db(), seed.teamId, "team", `${TERM} decision`, null, null);
+    expect(permissive.structured).toContain("DEC-9");
+    expect(permissive.structured).toContain("TSK-9");
+
+    // Restrict the item away from the outsider, then enforce.
     const outsider = await seedMember(seed);
-    // Move the item to a restricted project the outsider can't see.
     const restricted = await db().from("projects").insert({ team_id: seed.teamId, slug: "dv", name: "DV", kind: "initiative" }).select("id").single();
     const g = await createGroup(db(), seed.teamId, "dvg", "DV", seed.memberId);
     await grantProjectToGroup(db(), seed.teamId, restricted.data!.id, g.groupId!, seed.memberId);
@@ -93,7 +102,8 @@ describe("enforced retrieval (Phase B slice 2)", () => {
 
     const enforce = { visibleItemIds: (await visibleItemIds(db(), { teamId: seed.teamId, memberId: outsider })).ids };
     const enforcing = await retrieve(db(), seed.teamId, "team", `${TERM} decision`, null, enforce);
-    expect(enforcing.structured, "a restricted item's decision must not surface to an outsider").not.toContain("DEC-9");
+    expect(enforcing.structured, "restricted decision must not surface").not.toContain("DEC-9");
+    expect(enforcing.structured, "restricted task must not surface").not.toContain("TSK-9");
   });
 
   it("enforcing: the people-activity digest AND the full-corpus task-count are omitted (unpartitionable legs)", async () => {

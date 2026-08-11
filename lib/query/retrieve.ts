@@ -272,13 +272,15 @@ async function resolveChannelSegment(
   db: DbClient,
   teamId: string,
   tier: "team" | "external",
-  channel: string
+  channel: string,
+  visArr?: string[] | null
 ): Promise<string> {
   // Tier-filtered like every other read (CLAUDE.md §5 — no RLS backstop). The legs this feeds are
   // themselves tier-scoped, so nothing leaks either way; re-applying it here keeps the invariant
   // "every items read carries the filter" true by inspection rather than by argument.
   let q = db.from("items").select("path").eq("team_id", teamId).eq("frontmatter->>channel", channel).limit(1);
   if (isRestrictedTier(tier)) q = q.eq("access", "external");
+  if (visArr) q = q.in("id", visArr); // enforcement: don't resolve a segment from an invisible item (Codex Medium)
   const { data } = await q;
   const path = (data as { path: string }[] | null)?.[0]?.path;
   const seg = path ? path.split("/")[1] : "";
@@ -505,6 +507,9 @@ async function nativeRetrieve(
   const visibleIds = enforce?.visibleItemIds ?? null;
   const visible = (itemId: string | null | undefined): boolean => visibleIds === null || (itemId != null && visibleIds.has(itemId));
   const omitGraph = enforce != null;
+  // In-query filter array (Codex fold): applied inside the item-leg SQL so LIMITs rank over
+  // visible rows only. null = permissive. The visible() post-filter below stays as defense-in-depth.
+  const visArr: string[] | null = visibleIds ? [...visibleIds] : null;
   // Channel scope (Gap #4): if the question names a channel ("#eng" / "in the sales channel"), scope
   // item retrieval to it and strip the phrase so the channel word isn't also a content search term.
   const { channel, cleaned } = parseChannelScope(question);
@@ -535,13 +540,13 @@ async function nativeRetrieve(
   // OR of significant terms by default; AND when the query carries an explicit `AND` operator
   // (conjunctive intent — narrows to docs about ALL topics). Same string flows to every FTS leg.
   const { query: ftsQuery, terms } = buildFtsQuery(q);
-  const ftsP = rankedFtsSearch(teamId, tier, ftsQuery, FTS_CANDIDATE_LIMIT, channel);
+  const ftsP = rankedFtsSearch(teamId, tier, ftsQuery, FTS_CANDIDATE_LIMIT, channel, visArr);
   // Grounding specificity (Gap #3) — runs concurrently; combined with hadFtsHit below.
   const specificityP = analyzeTermSpecificity(teamId, tier, terms);
   // Structured-context scaling (Gaps #5/#6): a FULL-corpus task count (aggregates survive the 80-row
   // cap) + a keyword search over ALL decisions (an old-but-relevant decision survives the 50-row
   // recency window). Both run concurrently; folded into the structured block below.
-  const taskCountsP = taskStatusCounts(teamId, tier);
+  const taskCountsP = omitGraph ? Promise.resolve({ total: 0, open: 0, byStatus: {} as Record<string, number> }) : taskStatusCounts(teamId, tier);
   const matchedDecisionsP = terms.length ? matchingDecisions(teamId, tier, ftsQuery, 10) : Promise.resolve([]);
 
   // 2. Recency: most recent items (a fallback so fresh content always has a shot). Ordered by the
@@ -556,10 +561,11 @@ async function nativeRetrieve(
     .order("id", { ascending: false })
     .limit(8);
   if (isRestrictedTier(tier)) recentB = recentB.eq("access", "external");
+  if (visArr) recentB = recentB.in("id", visArr); // enforcement: recency over visible items only
   // Channel scope (Gap #4) — keep the recency fallback inside the same channel. LIKE on the 2nd path
   // segment, resolved from the name first (Slack's segment is its channel ID — see
   // resolveChannelSegment); the FTS leg does the precise matching, this soft filter is padding.
-  const channelSeg = channel ? await resolveChannelSegment(db, teamId, tier, channel) : null;
+  const channelSeg = channel ? await resolveChannelSegment(db, teamId, tier, channel, visArr) : null;
   if (channelSeg) recentB = recentB.like("path", `%/${channelSeg}/%`);
 
   // 2a. SOURCE-scoped recency: when the question names a source, pull its most-recent items by
@@ -577,6 +583,7 @@ async function nativeRetrieve(
       .order("id", { ascending: false })
       .limit(SOURCE_RECENCY_LIMIT);
     if (isRestrictedTier(tier)) sourceRecencyB = sourceRecencyB.eq("access", "external");
+    if (visArr) sourceRecencyB = sourceRecencyB.in("id", visArr); // enforcement
     if (channelSeg) sourceRecencyB = sourceRecencyB.like("path", `%/${channelSeg}/%`);
   }
 
@@ -740,7 +747,7 @@ async function nativeRetrieve(
   const graphFacts = await graphFactsP;
   const expansion = graphExpansionQuery(graphFacts);
   if (expansion) {
-    const semHits = await rankedFtsSearch(teamId, tier, expansion, 10, channel);
+    const semHits = await rankedFtsSearch(teamId, tier, expansion, 10, channel, visArr);
     if (semHits.length > 0) grounded = true;
     for (const hit of semHits) {
       if (seen.has(hit.id)) continue;
@@ -810,7 +817,7 @@ async function nativeRetrieve(
     // enforcement: a decision whose SOURCE ITEM the principal can't see is dropped (its title/
     // metadata would otherwise leak a restricted item; row-grain membership is Phase D — this
     // source-item gate is the safe interim). Dashboard-created rows (null source) stay tier-bounded.
-    .filter((d) => visible((d.source_item_id as string | null) ?? null) || (d.source_item_id ?? null) === null)
+    .filter((d) => (d.source_item_id ?? null) === null ? visibleIds === null : visible(d.source_item_id as string))
     .map((d) => ({
     row_key: d.row_key as string,
     decided_at: (d.decided_at as string | null) ?? null,
@@ -823,7 +830,7 @@ async function nativeRetrieve(
   const recencyKeys = new Set(recencyDecisions.map((d) => d.row_key));
   const olderMatches = matchedDecisions
     .filter((d) => !recencyKeys.has(d.row_key))
-    .filter((d) => visible(d.source_item_id) || d.source_item_id === null); // enforcement: source-item gate
+    .filter((d) => (d.source_item_id ?? null) === null ? visibleIds === null : visible(d.source_item_id)); // enforcement: source-item gate; null-source dropped when enforcing
   const fmtDecision = (d: DecisionLine) =>
     `- #${d.row_key} (${d.decided_at ?? "?"}, ${d.slug}) ${d.title} — by ${d.decided_by}${d.still_valid ? "" : " [SUPERSEDED]"}`;
 
@@ -837,7 +844,7 @@ async function nativeRetrieve(
     "",
     "## Tasks (all statuses, most recently updated first)",
     ...(tasks ?? [])
-      .filter((t) => visible((t.source_item_id as string | null) ?? null) || (t.source_item_id ?? null) === null)
+      .filter((t) => (t.source_item_id ?? null) === null ? visibleIds === null : visible(t.source_item_id as string))
       .map((t) => {
       const u = t.updated_at;
       const day = typeof u === "string" ? u.slice(0, 10) : u ? new Date(u).toISOString().slice(0, 10) : "?";
