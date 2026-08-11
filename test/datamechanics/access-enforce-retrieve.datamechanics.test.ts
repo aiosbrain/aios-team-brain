@@ -76,6 +76,39 @@ describe("enforced retrieval (Phase B slice 2)", () => {
     expect(enforcing.structured, "enforcing OMITS the graph leg (fail closed until Phase C)").not.toContain("ship the widget");
   });
 
+  it("enforcing: a decision/task tied to a RESTRICTED item is dropped from the structured block (source-item gate)", async () => {
+    const seed = await seedTeam();
+    const item = await ingest(seed, { path: "d.md", body: `d ${TERM}`, access: "team", project: "src" });
+    // A decision + task sourced from that item.
+    await db().from("decisions").insert({ team_id: seed.teamId, row_key: "DEC-9", title: `${TERM} decision`, decided_by: "chetan", still_valid: true, source_item_id: item.id, project_id: (await db().from("projects").select("id").eq("team_id", seed.teamId).eq("slug", "src").single()).data!.id }).then(() => {}, () => {});
+    await backfillTeamContext(db(), seed.teamId);
+    const outsider = await seedMember(seed);
+    // Move the item to a restricted project the outsider can't see.
+    const restricted = await db().from("projects").insert({ team_id: seed.teamId, slug: "dv", name: "DV", kind: "initiative" }).select("id").single();
+    const g = await createGroup(db(), seed.teamId, "dvg", "DV", seed.memberId);
+    await grantProjectToGroup(db(), seed.teamId, restricted.data!.id, g.groupId!, seed.memberId);
+    const { data: unit } = await db().from("project_context_units").select("id").eq("source_item_id", item.id).single();
+    await db().from("project_context_memberships").update({ valid_to: new Date().toISOString() }).eq("context_unit_id", unit!.id);
+    await db().from("project_context_memberships").insert({ team_id: seed.teamId, project_id: restricted.data!.id, context_unit_id: unit!.id, method: "manual" });
+
+    const enforce = { visibleItemIds: (await visibleItemIds(db(), { teamId: seed.teamId, memberId: outsider })).ids };
+    const enforcing = await retrieve(db(), seed.teamId, "team", `${TERM} decision`, null, enforce);
+    expect(enforcing.structured, "a restricted item's decision must not surface to an outsider").not.toContain("DEC-9");
+  });
+
+  it("enforcing: the git/people activity digests are omitted (unpartitionable, would name restricted work)", async () => {
+    const seed = await seedTeam();
+    await ingest(seed, { path: "act.md", body: `act ${TERM}`, access: "team", project: "src" });
+    await backfillTeamContext(db(), seed.teamId);
+    const member = await seedMember(seed);
+    // An activity-intent question triggers the digests under permissive; enforcing omits them.
+    const enforce = { visibleItemIds: (await visibleItemIds(db(), { teamId: seed.teamId, memberId: member })).ids };
+    const enforcing = await retrieve(db(), seed.teamId, "team", "who is working on what this week", null, enforce);
+    // The full-corpus task-count aggregate is replaced with a neutral header under enforcing.
+    expect(enforcing.structured).not.toMatch(/## Task counts \(all \d+ tasks/);
+    expect(enforcing.structured).toContain("## Tasks visible to you");
+  });
+
   it("enforcing: a member in NO groups retrieves nothing (fail closed)", async () => {
     const seed = await seedTeam();
     await ingest(seed, { path: "x.md", body: `x ${TERM}`, access: "team", project: "src" });

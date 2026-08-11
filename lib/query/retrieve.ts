@@ -497,8 +497,11 @@ async function nativeRetrieve(
   enforce?: { visibleItemIds: ReadonlySet<string> } | null
 ): Promise<RetrievedContext> {
   // Access enforcement (Phase B slice 2): `enforcing` supplies the principal's membership-visible
-  // item set. `visible(id)` gates every item-bearing leg; `omitGraph` drops the graph legs that
-  // can't be membership-filtered until Phase C. Permissive → `enforce` null → both are no-ops.
+  // item set. `visible(id)` gates the item legs (FTS/recency/dense) + source-linked decisions/tasks.
+  // `omitGraph` (= enforcing) drops every leg that carries no item grain and so can't be
+  // membership-filtered: graph (entities/relationships/Graphiti facts, until Phase C), external
+  // augmentation, the git/people activity digests, and the full-corpus task-count aggregate —
+  // fail closed rather than leak restricted content/metadata. Permissive → both are no-ops.
   const visibleIds = enforce?.visibleItemIds ?? null;
   const visible = (itemId: string | null | undefined): boolean => visibleIds === null || (itemId != null && visibleIds.has(itemId));
   const omitGraph = enforce != null;
@@ -518,7 +521,10 @@ async function nativeRetrieve(
   const denseP = denseSearch(teamId, tier, q, projectSlug);
   // Git-activity + per-person activity digests (team tier only — internal) run in parallel too.
   // Context shaping: the activity digests are heavy + only relevant to "who's doing what" questions.
-  const wantsActivity = tier === "team" && wantsActivityContext(q);
+  // omitGraph (= enforcing) also gates the unpartitionable aggregate legs (git/people
+  // activity digests): item-derived, name restricted work, can't be membership-filtered → omit
+  // under enforcing, fail closed until they gain a partition (slice-B2 Fable HIGH-2/3, §5.8b).
+  const wantsActivity = tier === "team" && !omitGraph && wantsActivityContext(q);
   const gitDigestP = wantsActivity ? gitActivityDigest(db, teamId) : Promise.resolve("");
   const peopleDigestP = wantsActivity ? peopleActivityDigest(db, teamId) : Promise.resolve("");
 
@@ -648,7 +654,7 @@ async function nativeRetrieve(
     commitmentsB,
     relsB,
     actorsB,
-    fetchAugmentedSources(question, tier),
+    omitGraph ? Promise.resolve([] as Awaited<ReturnType<typeof fetchAugmentedSources>>) : fetchAugmentedSources(question, tier),
   ]);
 
   // Merge, dedupe by id, cap sizes. Ranked FTS hits (already ordered by relevance) come first, then
@@ -752,6 +758,9 @@ async function nativeRetrieve(
   // items keyword search missed, then RRF-fuses the keyword + dense rankings into the source order.
   // denseHits is [] unless dense retrieval is configured, so default installs are byte-for-byte
   // unchanged. Tier already enforced in denseSearch (live items.access).
+  // Post-filter grounding under enforcing: a match on only-invisible items must not report
+  // grounded=true (abstention side channel, §5.7 — slice-B2 Fable Medium).
+  if (omitGraph && sources.length === 0) grounded = false;
   let orderedSources = sources;
   const denseHits = await denseP;
   if (denseHits.length) {
@@ -819,7 +828,9 @@ async function nativeRetrieve(
     `- #${d.row_key} (${d.decided_at ?? "?"}, ${d.slug}) ${d.title} — by ${d.decided_by}${d.still_valid ? "" : " [SUPERSEDED]"}`;
 
   const structured = [
-    `## Task counts (all ${taskCounts.total} tasks: ${taskCounts.open} open, ${taskCounts.byStatus.done ?? 0} done)`,
+    omitGraph
+      ? `## Tasks visible to you` // enforcing: no full-corpus aggregate (§5.7 volume disclosure)
+      : `## Task counts (all ${taskCounts.total} tasks: ${taskCounts.open} open, ${taskCounts.byStatus.done ?? 0} done)`,
     "## Recent decisions (newest first)",
     ...recencyDecisions.map(fmtDecision),
     ...(olderMatches.length ? ["", "## Older decisions matching this query", ...olderMatches.map(fmtDecision)] : []),

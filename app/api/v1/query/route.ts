@@ -106,7 +106,7 @@ export async function POST(req: NextRequest) {
       const { ids } = await visibleItemIds(db, { teamId: auth.teamId, memberId: auth.memberId });
       enforce = { visibleItemIds: ids };
     }
-  } catch (e) {
+  } catch {
     return errorResponse("internal", "enforcement check failed", 500);
   }
 
