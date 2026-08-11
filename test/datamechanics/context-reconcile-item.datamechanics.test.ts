@@ -109,6 +109,54 @@ describe("reconcileItemContext (the shared per-item core)", () => {
     expect((mems ?? []).length, "must not write a membership into the squatting initiative").toBe(0);
   });
 
+  it("the move closes ONLY the opposite system project — a legitimate initiative membership survives (Codex HIGH)", async () => {
+    const seed = await seedTeam();
+    await ensureAccessBootstrap(db(), seed.teamId);
+    const item = await ingest(seed, { path: "keep.md", body: "k", access: "external", project: "src" });
+    await reconcileItemContext(db(), seed.teamId, item.id);
+    const { data: unit } = await db().from("project_context_units").select("id").eq("source_item_id", item.id).single();
+
+    // A curation-style initiative membership (Phase B shape) — the move must NOT delete it.
+    const { data: initiative } = await db()
+      .from("projects")
+      .insert({ team_id: seed.teamId, slug: "roadmap", name: "Roadmap", kind: "initiative" })
+      .select("id")
+      .single();
+    await db().from("project_context_memberships").insert({
+      team_id: seed.teamId,
+      project_id: initiative!.id,
+      context_unit_id: (unit as { id: string }).id,
+      method: "manual",
+    });
+
+    // Flip external→team: the move closes external-shared, opens General, LEAVES the initiative.
+    await db().from("items").update({ access: "team" }).eq("id", item.id).eq("team_id", seed.teamId);
+    await reconcileItemContext(db(), seed.teamId, item.id);
+    const projects = await membershipProjects(seed, item.id);
+    const s = await sys(seed);
+    expect(projects).toContain(s.general);
+    expect(projects).not.toContain(s.externalShared);
+    expect(projects, "the initiative membership must survive the tier-flip move").toContain(initiative!.id);
+  });
+
+  it("a NON-push tier change (settleReclassification) re-partitions the item (Codex HIGH — the fan-out point)", async () => {
+    const { settleReclassification } = await import("@/lib/ingest/reclassify");
+    const seed = await seedTeam();
+    await ensureAccessBootstrap(db(), seed.teamId);
+    const item = await ingest(seed, { path: "n.md", body: "n", access: "external", project: "src" });
+    await reconcileItemContext(db(), seed.teamId, item.id);
+    const s = await sys(seed);
+    expect(await membershipProjects(seed, item.id)).toEqual([s.externalShared]);
+
+    // Simulate a reclassification that did NOT go through the push route: flip access, then call
+    // the fan-out directly (as a connector re-sync would via ingestItem).
+    await db().from("items").update({ access: "team" }).eq("id", item.id).eq("team_id", seed.teamId);
+    await settleReclassification(db(), seed.teamSlug, { teamId: seed.teamId, itemId: item.id, from: "external", to: "team", source: null });
+    const after = await membershipProjects(seed, item.id);
+    expect(after).toEqual([s.general]);
+    expect(after, "the reclassification fan-out must move it off external-shared").not.toContain(s.externalShared);
+  });
+
   it("is idempotent — a second reconcile creates no new unit or membership", async () => {
     const seed = await seedTeam();
     await ensureAccessBootstrap(db(), seed.teamId);

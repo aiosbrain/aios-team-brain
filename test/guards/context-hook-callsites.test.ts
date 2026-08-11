@@ -20,6 +20,9 @@ describe("§11 context-partition call sites", () => {
     // the reconcile must be INSIDE an after() block (not merely that the file uses after()
     // somewhere — pm-sync already does): require after(async ...) with reconcileItemContext in it.
     expect(src, "must run in after(), not inline (never blocks the push)").toMatch(/after\(async[\s\S]{0,400}reconcileItemContext/);
+    // The load-bearing OR: the hook must ALSO fire when a heal-path tier flip returns
+    // status:'unchanged' (Codex Medium — this was mutation-vacuous). Deleting the OR must redden.
+    expect(src, "must fire on a heal-path tier flip (accessChanged), not only status change").toMatch(/result\.accessChanged/);
   });
 
   it("the scheduler tick runs the context-backfill convergence leg", () => {
@@ -39,6 +42,6 @@ describe("§11 context-partition call sites", () => {
     // Both must go through reconcileItemContext — if the backfill re-inlined its own routing,
     // the two paths could partition an item differently. Pin the shared dependency.
     expect(read("lib/projects/context/backfill.ts")).toMatch(/reconcileItemContext/);
-    expect(read("lib/projects/context/reconcile-item.ts")).toMatch(/closeOtherMemberships/);
+    expect(read("lib/projects/context/reconcile-item.ts")).toMatch(/closeMembershipInto/);
   });
 });

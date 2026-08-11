@@ -308,6 +308,12 @@ export function startIngestScheduler(): void {
       // concurrent push (which the on-push hook partitions itself) isn't chased mid-sweep.
       const cutoff = new Date(startedAt).toISOString();
       const r = await backfillAllTeams(db, cutoff);
+      // Record a per-team outcome EVERY tick (success AND failure), so a team that failed once
+      // and later recovers gets a newer OK row rather than staying permanently red under
+      // distinct-on (slice-5 Codex Medium).
+      for (const teamId of r.succeeded) {
+        await recordIngestRun(db, { teamId, source: "context_backfill", trigger: "scheduler", ok: true, created: 0, startedAt });
+      }
       for (const f of r.failed) {
         if (f.teamId === "*") continue;
         await recordIngestRun(db, {
@@ -339,7 +345,9 @@ export function startIngestScheduler(): void {
         const { recordIngestRun } = await import("@/lib/ingest/runs");
         await recordIngestRun(db, {
           teamId: null,
-          source: "context_backfill",
+          // instance-wide scope uses the _all source consistently (slice-5 Codex Medium) — a
+          // teamId=null 'context_backfill' row would mask per-team rows under distinct-on.
+          source: "context_backfill_all",
           trigger: "scheduler",
           ok: false,
           created: 0,

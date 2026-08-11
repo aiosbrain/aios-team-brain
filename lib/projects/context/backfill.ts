@@ -103,22 +103,25 @@ async function resolveSystemProjectIds(
 export async function backfillAllTeams(
   db: DbClient,
   cutoff: string
-): Promise<{ teams: number; failed: { teamId: string; error: string }[] }> {
+): Promise<{ teams: number; succeeded: string[]; failed: { teamId: string; error: string }[] }> {
   const { data: teams, error } = await db.from("teams").select("id");
-  if (error) return { teams: 0, failed: [{ teamId: "*", error: `teams read failed: ${error.message}` }] };
+  if (error) return { teams: 0, succeeded: [], failed: [{ teamId: "*", error: `teams read failed: ${error.message}` }] };
+  const succeeded: string[] = [];
   const failed: { teamId: string; error: string }[] = [];
   const MAX_BATCHES = 10_000;
   for (const t of (teams ?? []) as { id: string }[]) {
     try {
-      // Cheap convergence short-circuit (slice-5 Fable Medium): once every item has an item-unit,
-      // the periodic sweep has nothing to create — skip the full O(N) re-drain and cost ~2 counts.
-      // (Stale-audience from a NON-push tier change is the push hook's job via accessChanged; the
-      // reclassify-path wiring that also covers it is a Phase-B item, noted in ARCHITECTURE.)
-      const [{ count: itemCount }, { count: unitCount }] = await Promise.all([
+      // Cheap convergence short-circuit — counts CURRENT MEMBERSHIPS, not units (slice-5 Codex
+      // HIGH): a unit whose membership creation FAILED still has a unit, so a unit-count check
+      // would skip the broken item forever. A current membership means the item was fully
+      // reconciled (unit AND membership) at least once. Stale-audience from a tier change is
+      // reconverged at the reclassification fan-out (settleReclassification), not here — so a
+      // membership-count convergence is safe. ~2 counts when converged instead of an O(N) drain.
+      const [{ count: itemCount }, { count: memCount }] = await Promise.all([
         db.from("items").select("id", { count: "exact", head: true }).eq("team_id", t.id),
-        db.from("project_context_units").select("id", { count: "exact", head: true }).eq("team_id", t.id).eq("unit_kind", "item"),
+        db.from("project_context_memberships").select("id", { count: "exact", head: true }).eq("team_id", t.id).is("valid_to", null),
       ]);
-      if (typeof itemCount === "number" && typeof unitCount === "number" && unitCount >= itemCount) continue;
+      if (typeof itemCount === "number" && typeof memCount === "number" && memCount >= itemCount) { succeeded.push(t.id); continue; }
       let cursor: string | null = null;
       let drained = false;
       for (let guard = 0; guard < MAX_BATCHES; guard++) {
@@ -137,9 +140,10 @@ export async function backfillAllTeams(
       // Fail LOUD on a silent partial: a corpus larger than MAX_BATCHES*batchSize left
       // un-drained would otherwise report as covered (Fable M1).
       if (!drained) failed.push({ teamId: t.id, error: `guard exhausted at cursor ${cursor} — corpus not fully backfilled` });
+      else if (!failed.some((f) => f.teamId === t.id)) succeeded.push(t.id);
     } catch (e) {
       failed.push({ teamId: t.id, error: e instanceof Error ? e.message : "threw" });
     }
   }
-  return { teams: (teams ?? []).length, failed };
+  return { teams: (teams ?? []).length, succeeded, failed };
 }

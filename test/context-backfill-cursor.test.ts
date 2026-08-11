@@ -13,7 +13,7 @@ const bootstrap = vi.fn();
 vi.mock("@/lib/projects/context/units", () => ({ reconcileItemUnit: (...a: unknown[]) => reconcile(...a) }));
 vi.mock("@/lib/projects/context/memberships", () => ({
   ensureIncludeMembership: (...a: unknown[]) => ensureMembership(...a),
-  closeOtherMemberships: (...a: unknown[]) => closeOthers(...a),
+  closeMembershipInto: (...a: unknown[]) => closeOthers(...a),
 }));
 vi.mock("@/lib/access/bootstrap", () => ({
   ensureAccessBootstrap: (...a: unknown[]) => bootstrap(...a),
