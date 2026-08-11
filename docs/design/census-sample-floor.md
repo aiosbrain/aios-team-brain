@@ -175,6 +175,14 @@ silently with no criterion covering the change.
 `test/name-collision-pollution.test.ts:143-149` (null ledger ⇒ `small-sample`) must stay green
 untouched; it is A4's existing pin.
 
+**A third test flipped that neither this spec nor the plan review named** — found by running the full
+suite, not by reading: `test/guards/dedupe-predicate-pinned.test.ts:109-121` pins the tripwire at
+`recentEpisodes: 12`. So "named rather than discovered" was **incomplete**, and the honest record is
+that one of the three was discovered. Its fixture moves to 30, and — because it is a *guard*, whose
+job is to make a regression fail the build — it gained the **other side**: the same signals at 1
+episode must read `small-sample`. A guard that pins only the firing half can be satisfied by a
+regression that drops the floor, which is precisely the failure this whole change is about.
+
 ### The contract comment is part of the change
 
 `extraction-health.ts:605-611` currently states: *"episodes projected in the window but zero census

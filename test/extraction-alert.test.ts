@@ -12,6 +12,12 @@ import {
   type BlindnessPhase,
   type PollutionGroupTick,
 } from "@/lib/graph/extraction-alert";
+import {
+  deriveNameCollisionPollution,
+  MIN_EPISODES_FOR_CENSUS_SUSPICION,
+  MIN_NAMES_FOR_CENSUS_SIGNAL,
+  type NameCollisionInput,
+} from "@/lib/graph/extraction-health";
 import type { DbClient } from "@/lib/db/types";
 
 /**
@@ -418,5 +424,72 @@ describe("the per-kind ledger read", () => {
     ]);
     const blind = await latestGraphHealthOfKind(db, "blindness");
     expect(blind?.meta.phase).toBe("cleared");
+  });
+});
+
+/**
+ * CENSUSFLOOR-1 A5 — the CONSEQUENCE, not the predicate.
+ *
+ * §0.2 of docs/design/census-sample-floor.md: `predicate-suspect` runs the blindness clock while
+ * `small-sample` parks, so a below-floor group holding a FALSE `predicate-suspect` is the only
+ * clock-running refusal the moment the busy group drops to `small-sample` — and 24h later the
+ * meta-alarm mails a stalled-extractor accusation at an install where nothing is wrong. On a small
+ * self-hosted install that conjunction is the normal state, not the annual tail.
+ *
+ * This composes the REAL chain — deriveNameCollisionPollution → refusalRunsClock →
+ * classifyBlindnessTick — deliberately. Hand-feeding `{judgeable, clockRuns}` literals would test a
+ * trivial OR and stay green if the predicate wiring broke.
+ */
+describe("CENSUSFLOOR-1 A5 — a below-floor group cannot run the blindness clock", () => {
+  const tickFor = (groups: NameCollisionInput[]): ReturnType<typeof classifyBlindnessTick> =>
+    classifyBlindnessTick(
+      groups.map((input) => {
+        const pollution = deriveNameCollisionPollution(input);
+        return {
+          judgeable: pollution.judgeable,
+          clockRuns: pollution.refusal
+            ? refusalRunsClock(pollution.refusal, {
+                baselineEpisodes: 0,
+                unreadableSinceMs: null,
+                nowMs: Date.UTC(2026, 7, 11),
+              })
+            : false,
+        };
+      })
+    );
+
+  const zeroNames = (recentEpisodes: number | null): NameCollisionInput => ({
+    configured: true,
+    signals: { recentNames: 0, recentSplit: 0, baselineNames: 0, baselineSplit: 0 },
+    recentEpisodes,
+  });
+
+  /** A quiet busy-group week: too few names to judge, ledger present. Parks on its own. */
+  const quietBusyGroup: NameCollisionInput = {
+    configured: true,
+    signals: { recentNames: 3, recentSplit: 0, baselineNames: 3, baselineSplit: 0 },
+    recentEpisodes: 4,
+  };
+
+  it("the shutdown-week conjunction PARKS: quiet busy group + one boilerplate external episode", () => {
+    expect(tickFor([quietBusyGroup, zeroNames(1)])).toBe("parked");
+  });
+
+  it("a busy group with real content still RUNS the clock — the detection that matters survives", () => {
+    expect(tickFor([quietBusyGroup, zeroNames(MIN_EPISODES_FOR_CENSUS_SUSPICION)])).toBe("running");
+  });
+
+  it("while the busy group is judgeable the tick is judged regardless — today's masking", () => {
+    const healthyBusy: NameCollisionInput = {
+      configured: true,
+      signals: {
+        recentNames: MIN_NAMES_FOR_CENSUS_SIGNAL * 2,
+        recentSplit: 0,
+        baselineNames: MIN_NAMES_FOR_CENSUS_SIGNAL * 2,
+        baselineSplit: 0,
+      },
+      recentEpisodes: 2000,
+    };
+    expect(tickFor([healthyBusy, zeroNames(1)])).toBe("judged");
   });
 });

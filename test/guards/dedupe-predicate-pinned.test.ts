@@ -111,13 +111,29 @@ describe("name-collision census pinning (graphiti_core 0.29.3)", () => {
     // silent-death shape the old guard fell to. The `graph_episodes` ledger is the one source that
     // knows whether anything was pushed: episodes in the window + nothing in the census means the
     // query no longer matches what the image writes (a rename) OR the extractor is stalled.
+    //
+    // 30, not 12: CENSUSFLOOR-1 gave the tripwire an episode floor
+    // (`MIN_EPISODES_FOR_CENSUS_SUSPICION = 25`), because at 12 — and at prod's actual ONE — a zero
+    // census is not evidence of anything, and the card was accusing a working extractor. This guard
+    // pins that the tripwire STILL FIRES once the sample is real; the floor itself is pinned by
+    // A2/A3 in test/name-collision-pollution.test.ts. Do NOT resolve a failure here by lowering the
+    // floor — that reinstates the false accusation this guard's own subject was corrected for.
     const out = deriveNameCollisionPollution({
       configured: true,
       signals: { recentNames: 0, recentSplit: 0, baselineNames: 0, baselineSplit: 0 },
-      recentEpisodes: 12,
+      recentEpisodes: 30,
     });
     expect(out.judgeable).toBe(false);
     expect(out.refusal).toBe("predicate-suspect");
+
+    // …and below the floor the SAME signals must not accuse — the guard covers both sides, so a
+    // regression that drops the floor cannot pass by satisfying only the firing half.
+    const belowFloor = deriveNameCollisionPollution({
+      configured: true,
+      signals: { recentNames: 0, recentSplit: 0, baselineNames: 0, baselineSplit: 0 },
+      recentEpisodes: 1,
+    });
+    expect(belowFloor.refusal).toBe("small-sample");
   });
 
   it("…and NO episodes either ⇒ a ledger-confirmed young/quiet group (small-sample), never an accusation", () => {
