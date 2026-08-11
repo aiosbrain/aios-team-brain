@@ -125,14 +125,22 @@ export async function POST(req: NextRequest) {
     if (result.status !== "unchanged" || result.accessChanged) {
       const teamId = auth.teamId;
       const itemId = result.id;
-      after(async () => {
-        const { reconcileItemContext } = await import("@/lib/projects/context/reconcile-item");
-        const r = await reconcileItemContext(adminClient(), teamId, itemId).catch((e) => ({
-          ok: false,
-          error: e instanceof Error ? e.message : "threw",
-        }));
-        if (!r.ok) console.warn(`[access] context reconcile for item ${itemId} failed: ${(r as { error?: string }).error}`);
-      });
+      // Scheduling the post-response work must never fail the push — not the work (best-effort
+      // inside), and not the `after()` registration itself (it throws when called outside a
+      // request scope, e.g. the in-process handler tests). Either way the scheduler leg is the
+      // backstop, so a miss here costs latency, never the push.
+      try {
+        after(async () => {
+          const { reconcileItemContext } = await import("@/lib/projects/context/reconcile-item");
+          const r = await reconcileItemContext(adminClient(), teamId, itemId).catch((e) => ({
+            ok: false,
+            error: e instanceof Error ? e.message : "threw",
+          }));
+          if (!r.ok) console.warn(`[access] context reconcile for item ${itemId} failed: ${(r as { error?: string }).error}`);
+        });
+      } catch {
+        // no request scope (tests) or after() unavailable — the scheduler backstop covers it
+      }
     }
 
     // Strip the internal scheduling hints — the HTTP wire format stays { status, id }.
