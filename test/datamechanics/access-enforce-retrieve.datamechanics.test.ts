@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { db, ingest, seedTeam, type Seed } from "./helpers";
 import { retrieve } from "@/lib/query/retrieve";
+import { rankedFtsSearch } from "@/lib/query/fts-search";
 import { backfillTeamContext } from "@/lib/projects/context/backfill";
 import { visibleItemIds } from "@/lib/access/enforce";
 import { createGroup, grantProjectToGroup } from "@/lib/access/groups";
@@ -125,6 +126,33 @@ describe("enforced retrieval (Phase B slice 2)", () => {
     expect(enforcing.structured, "enforcing omits the people-activity digest (would name restricted work)").not.toContain("## Activity by person");
     expect(enforcing.structured, "enforcing omits the full-corpus task-count").not.toMatch(/## Task counts \(all \d+ tasks/);
     expect(enforcing.structured).toContain("## Tasks visible to you");
+  });
+
+  it("enforcing: the FTS membership filter is IN-QUERY — louder invisible rows can't crowd a visible item out of the top-N (under-return)", async () => {
+    const seed = await seedTeam();
+    // Two rows the principal can't see, ranking ABOVE the visible one (the term repeated), and a
+    // limit of 2. A post-filter would fill the top-2 with the invisible rows and return nothing.
+    const loud = `${TERM} ${TERM} ${TERM} ${TERM}`;
+    await ingest(seed, { path: "invis-1.md", body: `${loud} secret one`, access: "team", project: "src" });
+    await ingest(seed, { path: "invis-2.md", body: `${loud} secret two`, access: "team", project: "src" });
+    const vis = await ingest(seed, { path: "vis.md", body: `quiet ${TERM} note`, access: "team", project: "src" });
+    const hits = await rankedFtsSearch(seed.teamId, "team", TERM, 2, null, [vis.id]);
+    expect(hits.map((h) => h.path), "limit must rank over VISIBLE rows only").toEqual(["vis.md"]);
+  });
+
+  it("enforcing: the recency membership filter is IN-QUERY — 8 newer invisible items can't crowd out the visible one", async () => {
+    const seed = await seedTeam();
+    // The visible item is the OLDEST and matches the question only via recency (no TERM in body),
+    // so it reaches sources through the recency leg alone. 8 newer invisible items fill the leg's
+    // limit(8) page if the filter is applied after the page is cut.
+    const vis = await ingest(seed, { path: "vis-old.md", body: "quiet old note", access: "team", project: "src" });
+    for (let i = 0; i < 8; i++) {
+      await ingest(seed, { path: `fresh-${i}.md`, body: `fresh note ${i}`, access: "team", project: "src" });
+    }
+    await db().from("items").update({ work_at: "2020-01-01T00:00:00Z" }).eq("team_id", seed.teamId).eq("path", "vis-old.md");
+    await backfillTeamContext(db(), seed.teamId);
+    const ctx = await retrieve(db(), seed.teamId, "team", "what is happening lately", null, { visibleItemIds: new Set([vis.id]) });
+    expect(ctx.sources.map((s) => s.path), "the recency page must be cut over VISIBLE rows").toContain("vis-old.md");
   });
 
   it("enforcing: a member in NO groups retrieves nothing (fail closed)", async () => {
