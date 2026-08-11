@@ -52,15 +52,25 @@ projection below worth stating.
 twice; it does **not** reduce output, because the merged call still emits both the nodes and the
 edges.
 
-| assumption for the merged prompt's input | projected saving |
-|---|---|
-| input = one call's worth (optimistic) | **15.9%** of graph cost |
-| input = one call's worth **+15%** for merged instructions (conservative) | **13.4%** |
+**The merged prompt's instruction block was measured, not assumed** (rendered from the deployed
+image): `extract_nodes.extract_message` ≈ 1,782 tok, `extract_edges.edge` ≈ 1,274 tok, and the
+combined prompt ≈ **3,085 tok** — essentially both instruction blocks concatenated, plus a ~65-line
+negative-examples section. So merged input ≈ 6,635 − 1,782 + 3,085 ≈ **7,938 tok ≈ 1.20× one call**,
+*worse* than the 1.15× I first guessed.
 
-**So the parent's ~15% survives measurement** — which is worth saying plainly, because this document
-exists partly because *the last two inherited estimates did not*. The honest range is **13–16%**, and
-the residual uncertainty is the merged prompt's own length, which the battery will measure directly
-rather than assume.
+| | projected saving |
+|---|---|
+| my first estimate (input = 1.00–1.15× one call) | 13.4–15.9% |
+| **measured merged instructions (1.20×)** | **~12–14% of graph cost** |
+
+**So the parent's ~15% is close but optimistic**, and the honest figure is **~12–14%**. Worth stating
+plainly: two inherited estimates in this workstream did not survive measurement, and this one
+survives only approximately.
+
+**ONE UNIT, stated once.** Everything above is **% of graph cost**. Input is ~83% of graph cost, so a
+10% fall in *input tokens per episode* ≈ 8.3% cost, and the ~12–14% cost projection ≈ **15–17% fall in
+input tokens per episode**. §5's C1 bar is stated in **cost**, and only in cost. Mixing the two is the
+borrowed-band-from-the-wrong-metric error this workstream has already made once.
 
 ---
 
@@ -99,6 +109,34 @@ both extractors, so a merged call should inherit the filter unchanged. That is a
 `AC4` below turns it into a check — because "it's upstream so it must be fine" is precisely the
 reasoning that has been wrong twice in this workstream.
 
+### Two seam questions the plan review left open — both now read in the deployed source
+
+**No double-timestamping.** The review flagged a risk that combined's internal batch timestamps
+(`combined_extraction.py:233-278`) would be duplicated by the per-edge call downstream. They are not:
+`_extract_edge_timestamps` (`edge_operations.py:576-591`) **short-circuits** —
+
+```python
+if edge.valid_at is not None or edge.invalid_at is not None:
+    return
+```
+
+— and its own docstring names the case: *"Skips if the edge already has timestamps set (e.g., from
+the extraction prompt in the separate-extraction path)"*. Also settles where timestamps live: **not**
+inside `extract_edges` but inside `resolve_extracted_edges` (`edge_operations.py:680,813`), which
+Edit 1 does not touch. So skipping `extract_edges` neither loses nor duplicates them.
+
+**The edge name-match skip is NOT a new failure mode — and combined is the more forgiving of the
+two.** The review flagged that combined silently drops an edge whose endpoint name it cannot match
+(`combined_extraction.py:188-200`) and stated the separate path avoids this by handing the extractor
+an ID-indexed entity list. **It does not.** `extract_edges` builds `{node.name: node}` from **raw**
+names (`edge_operations.py:168`) and `continue`s on a miss (`:218-231`), whereas combined keys on
+`_normalize_string_exact` on **both** sides (`:181-189`). Same failure mode, pre-existing, and the
+candidate's matching is *strictly more lenient* than the incumbent's.
+
+The skip rate is still worth reporting — it is a real silent-loss channel in both arms — but as a
+**diagnostic**, not as a risk this lever introduces. Recorded because acting on the review's framing
+would have priced a pre-existing behaviour as a regression.
+
 ---
 
 ## 3. Why this one cannot ship on mechanism, unlike PIPEFF-2
@@ -108,61 +146,103 @@ could lean on mechanism. **This changes the question itself.** A different promp
 different set of entities and edges from identical content. There is no mechanism argument available,
 and one is not attempted here.
 
-**The quality prior is, for the first time in this workstream, positive.** Upstream's own docstring
-(`combined_extraction.py:53-55`) claims combined extraction *"produces better results than separate
-node+edge extraction because the model can see both tasks simultaneously, ensuring every entity has
-at least one connecting fact and reducing orphaned nodes."*
+### The upstream "fewer orphans" claim is post-processing, not model quality — and I nearly built the battery on it
 
-That is a **falsifiable, directional claim**, and it hands the battery a metric the previous one did
-not have: **orphan rate** — entities with no incident edge. If upstream is right it falls. If it
-rises, the merged prompt is producing entities it cannot connect, which is a quality regression this
-lever must not ship with. It is measured with one Cypher query and no LLM call.
+My first draft treated upstream's docstring (*"ensuring every entity has at least one connecting fact
+and reducing orphaned nodes"*) as a falsifiable directional claim and made **orphan rate** the
+headline quality sensor. **The plan review caught that it cannot fail, and I verified it in the
+deployed source.**
+
+`combined_extraction.py:280-295` — after edge validation, every node with no incident edge is
+**deleted**:
+
+```python
+orphan_count = sum(1 for n in extracted_nodes if n.uuid not in connected_node_uuids)
+if orphan_count:
+    logger.debug('Dropping %d orphan node(s) with no connecting edges', orphan_count)
+extracted_nodes = [n for n in extracted_nodes if n.uuid in connected_node_uuids]
+```
+
+Three consequences, and together they would have wasted the run:
+
+1. **Orphan rate is ~0 in the candidate arm by construction.** Its FAIL direction is near-impossible.
+   That is the manufactured pass this spec congratulated itself for avoiding when it dropped Q2/Q7.
+2. **Entities-per-episode is confounded.** The candidate's entity count falls by the incumbent's
+   orphan share *mechanically* — neither fragmentation nor missed content — so a two-sided band on it
+   either fails spuriously or, worse, lets the mechanical fall **mask real missed content**.
+3. **The coupling is perverse.** Dropped entities also shrink `dedupe_nodes` (24.3%) and
+   `node_summaries_batch` (9.7%) inputs. **The more entities the arm silently discards, the better its
+   cost numbers look.** C1 and Q1 would have pulled in opposite directions on the same artifact.
+
+§4 replaces both sensors accordingly. Upstream's claim is **not** carried as a prior worth anything
+on this corpus — it describes lines 280-295, not model behaviour.
 
 ---
 
-## 4. The battery — designed around why the last one came back INVALID
+## 4. The battery — redesigned after the plan review
 
 Session 2 of PIPEFF-2 returned **INVALID** because the incumbent's own two runs, at temperature 0 on
-byte-identical input, differed by **7.2%** on entity yield — larger than the 5% validity ceiling the
-bands assumed. Two reps cannot separate an arm's effect from the provider's noise. That is now a
-**measured property of this stack**, not a surprise, and this battery is built on it:
+byte-identical input, differed by **7.2%** on entity yield. That is a measured property of this stack.
 
-| | last time | this time |
+### The power arithmetic, corrected
+
+My first draft computed the standard error of **one arm's mean** (7%/√4 = 3.5%) and called a 7% effect
+separable. **The decision compares two arm means**, so the relevant quantity is the SE of the
+*difference*: √(3.5² + 3.5²) ≈ **4.95%**. A true 7% effect is z ≈ 1.4 — not separable at any
+conventional threshold. **My own sentence "an effect of ~7% is separable" was false at n=4**, and it is
+the same shape of error that produced the INVALID verdict last time, dressed in better-looking
+arithmetic.
+
+| n per arm | SE(difference) | smallest reliably detectable effect | cost |
+|---|---|---|---|
+| 4 | 4.95% | ~12% (t, df=6) | ~$6.40 |
+| **8** | **3.5%** | **~7%** | **~$12.80** |
+
+**Decision: 8 reps per arm. Envelope $16.00**, re-approved by the owner on 2026-08-11 after being
+told the figure had doubled. C1 needs no extra reps — cost metrics measured solid at n=2 — but the
+arms run together, so the reps are shared.
+
+**Bands are derived from the pooled within-arm spread observed in THIS battery**, with the historical
+7% as a sanity floor. The 7% was measured on the incumbent only; the candidate's noise is unknown, and
+a longer multi-task prompt may well be noisier.
+
+### The metrics, after the orphan finding
+
+| Q | metric | FAIL direction | why this and not the obvious one |
+|---|---|---|---|
+| **C1** | cost per episode, **% of graph cost** (one unit, §1) | a fall **under 10%** | below that the lever does not pay for a vendored patch |
+| **Q1′** | **connected** entities per episode (entities with ≥1 incident edge) | outside the band, **either** direction | raw entity count is confounded: the candidate drops orphans mechanically (§3). Connected entities are well-defined in *both* arms and immune to the drop |
+| **Q8′** | **orphan-drop loss rate** in the candidate = (raw entities in the captured `CombinedExtraction` response − nodes kept) / raw | **exceeds the incumbent's measured orphan share** | the capture tap already stores the LLM response, so pre-drop counts are free. This asks the real question — *is the candidate discarding more than the incumbent was already failing to connect?* |
+| **Q4** | edges per episode | a fall outside the band | fewer relationships is the thing edges exist for |
+| **Q9** | **consensus-entity retention** — entities present in **every** incumbent rep of the prior session, required to appear in the candidate's graph | any qualifying entity lost | the recall gate replacing Q2 (below). Costs nothing: the prior session's harvests are on disk |
+| **Q5** | retry rate (harness signed cross-check) | any rise | a longer merged prompt could push validation retries |
+| — | edge name-match skip rate, both arms | *diagnostic only* | pre-existing in both, and the candidate is more lenient (§2) — reported, not gated |
+| — | `dedupe_nodes` / `node_summaries_batch` savings | *reported separately from C1* | they shrink because entities were dropped. Folding them into the headline would let entity loss pad the cost win |
+
+**Measured before any arm runs, at zero cost:** the incumbent's orphan share. It is the size of the
+confound, the expected mechanical shift in raw entity count, and Q8′'s pre-registered bound. One
+Cypher query.
+
+### Q2 and Q7 — dropped, with status rows, and Q2 replaced
+
+| Q | status | reason |
 |---|---|---|
-| arms | 3 (W10 / SAME / W1) | **2** — incumbent vs combined |
-| reps per arm | 2 | **4** |
-| bands | assumed 5% ceiling | **derived from the measured ~7% run-to-run noise**, before any run |
-| corpus | 31 items / 108 episodes, pinned | same pinned corpus — comparability with the prior session |
+| Q2 (people recall) | **NOT RUN — unpowerable** | the roster has exactly one multi-word human name appearing in content (measured, prior session) |
+| Q7 (name convergence) | **NOT RUN — unpowerable** | 0.29.3's deterministic exact-name matching makes it read ~1.0 for every arm |
 
-**4 reps is the minimum that makes the question answerable**, not a round number: with a ~7%
-per-rep spread, the standard error of a 4-rep mean is ~3.5%, so an effect of ~7% is separable from
-noise and an effect of ~3% is honestly *not* — and the spec must say which effects it can and cannot
-detect **before** the run, not after.
+Both get a row in the verdict table rather than vanishing — every pre-registered check gets a status,
+including NOT RUN.
 
-**Reused as-is from PIPEFF-2**, because it exists and is already mutation-proven: the corpus rule
-(`scripts/graph-window-battery/corpus.mjs`), the seeder, the capture tap, the harvester, the judge's
-refusing parsers, and `decision.mjs`. The arms change; the instrument does not.
+**But dropping Q2 while adding a mechanism that deletes entities is the self-serving shape**, even
+with an honest reason, and the plan review said so. Q2 was the only recall-of-specific-content gate,
+and this candidate's known mechanical risk is entity loss. **Q9 is its powerable replacement** — a
+consensus list from the prior session's incumbent reps, which exists on disk and costs nothing to
+check. The drop is only clean *with* Q9; without it, it is the cut that blocked the last amendment.
 
-**Pre-registered, before any run:**
+### Instrument, reused
 
-| Q | metric | direction that FAILS |
-|---|---|---|
-| C1 | input tokens per episode | a fall smaller than **10%** — under the conservative projection, the lever is not paying for a vendored patch |
-| Q1 | entities per episode | a move **outside** the noise band in **either** direction — a rise is fragmentation, a fall is missed content (two-sided, per the AIO-693 lesson) |
-| **Q8** | **orphan rate** (entities with no incident edge) | a **rise** — upstream's own claim inverted, and the specific failure a merged prompt would produce |
-| Q4 | edges per episode | a fall outside the band — fewer relationships is the thing edges exist for |
-| Q5 | retry rate (harness signed cross-check) | any rise — a longer merged prompt could push validation retries |
-
-**Q2 (people recall) and Q7 (name convergence) are NOT carried forward.** The last session proved
-them unpowerable on this install: the roster has exactly one multi-word human name appearing in
-content, and 0.29.3's deterministic exact-name matching makes Q7 read ~1.0 for every arm. Running
-them again would manufacture two guaranteed passes and dress the result up as five-for-five.
-
-**Projected spend: ~$6.50.** 2 arms × 4 reps × 108 episodes, at the post-PIPEFF-2 measured rate of
-~$0.80/rep, plus headroom. **Envelope: $8.00** — I will stop and ask rather than exceed it, as last
-time. The candidate arm is cheaper than the incumbent by construction, so this is an upper bound.
-
----
+The corpus rule, seeder, capture tap, harvester, refusing parsers and `decision.mjs` are reused from
+PIPEFF-2 unchanged. The arms change; the instrument does not.
 
 ## 5. Acceptance
 
@@ -172,9 +252,28 @@ time. The candidate arm is cheaper than the incumbent by construction, so this i
 | AC2 | The patch script is **idempotent and asserts its anchors**: applying twice is a no-op, and a missing anchor fails loudly rather than silently skipping | unit (runs the real Python) | a silent no-op — the failure `graphiti/Dockerfile`'s gates exist for |
 | AC3 | The patched file **parses under `ast`** and the patched call path is exercised end-to-end against a real episode | unit + e2e | any import/runtime error |
 | AC4 | **PATCH 3's predecessor filter still applies** under the combined call — a single-chunk item receives **zero** predecessors, a multi-chunk item receives only its own | unit (runs the real Python) | any predecessor from another item reaching the merged prompt |
-| AC5 | `extract_edges` is **not called** when the combined path runs — the saving is real and not additive | unit | both call kinds present in one episode's `llm_usage` rows |
+| AC5 | The **full per-episode call-kind profile** is pinned: exactly one `extract_nodes_and_edges`, one `edge_timestamps` **only when the extractor left dates unset**, and **zero** `extract_nodes` / `extract_edges` | unit + data-mechanics | any extra, missing or duplicated kind. "`extract_edges` not called" alone would miss a duplicated or lost timestamp call — the guard must cover the level that changed |
+| **AC8** | **`lib/llm/graph-call-kind.ts` gains an `extract_nodes_and_edges` row in THIS PR**, with a fixture built from the **real rendered prompt**, and `llm_usage` records that kind with non-zero tokens | unit + data-mechanics | the call landing in `unknown` |
 | AC6 | With `pre_extracted_edges=None` the function is **byte-identical in behaviour** to today, so the un-patched path is untouched | unit | any divergence on the fallback path |
 | AC7 | The battery's decision procedure **refuses** rather than passing when a rep is missing or a window is ambiguous | unit (existing, re-pinned) | a verdict on incomplete data |
+
+### AC8 is the one that would have faked the result
+
+`lib/llm/graph-call-kind.ts` classifies spend by matching the **start of the first system message**
+against a fixed prefix table. The combined prompt's system line is:
+
+> `You are an expert knowledge graph extraction specialist for an AI agent memory system.`
+
+**It matches no row.** So without AC8: `extract_nodes` and `extract_edges` vanish from the by-kind
+report, their replacement lands in `unknown`, and a by-kind read shows a **fake ~44.5% saving** — the
+exact blind spot this repo already found and fixed once (#437), reopened by the very change whose
+verification depends on it. The new kind gets its **own label**, not a reused one: the file's own
+doctrine is that labelling a replacement with the name of what it replaced hides whether the change
+worked.
+
+`edge_timestamps` is safe and stays classified — combined reuses
+`extract_edges.extract_timestamps_batch` (`combined_extraction.py:246-249`) — but it gets a pinning
+fixture anyway, because "safe by inspection" is the claim this workstream keeps having to retract.
 
 **The lever does not ship if:** C1's fall is under 10%, Q8's orphan rate rises, or Q1/Q4 move outside
 the noise band. And — stated now, before the numbers exist — **a result at the boundary is a FAIL,
