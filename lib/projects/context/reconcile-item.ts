@@ -29,16 +29,30 @@ export interface ReconcileItemResult {
   membershipCreated?: boolean;
 }
 
-/** Resolve the two §11 system project ids for a team, or null if they don't exist yet. */
+/**
+ * Resolve the two §11 system project ids (kind='system') for a team.
+ *   { ids } — bootstrapped;  null — not bootstrapped yet (or a squatter holds the slug);
+ *   undefined — the read FAILED (distinct from null so a caller doesn't mask an outage as a skip).
+ */
 export async function systemProjectIds(
   db: DbClient,
   teamId: string
-): Promise<{ general: string; externalShared: string } | null> {
-  const { data } = await db
+): Promise<{ general: string; externalShared: string } | null | undefined> {
+  const { data, error } = await db
     .from("projects")
     .select("id, slug")
     .eq("team_id", teamId)
+    // kind='system' is load-bearing (slice-5 Fable HIGH): a dashboard-created initiative can hold
+    // the slug 'general'/'external-shared' (bootstrap REFUSES to adopt it, slice 3). Without this
+    // filter the hook would resolve the squatter's id and partition into it — the hook and the
+    // sweep diverging in exactly the refusal case the shared core exists to prevent. A squat now
+    // resolves to null → skipped, and the scheduler backstop surfaces the bootstrap refusal.
+    .eq("kind", "system")
     .in("slug", [GENERAL_SLUG, EXTERNAL_SHARED_SLUG]);
+  // A read ERROR is not "no system projects yet": returning null would mask an outage as a
+  // benign skip. Signal it so the caller can distinguish (systemProjectIds returns undefined on
+  // error; reconcileItemContext surfaces it as !ok, not skipped).
+  if (error) return undefined;
   const bySlug = new Map(((data ?? []) as { id: string; slug: string }[]).map((p) => [p.slug, p.id]));
   const general = bySlug.get(GENERAL_SLUG);
   const externalShared = bySlug.get(EXTERNAL_SHARED_SLUG);
@@ -52,8 +66,13 @@ export async function reconcileItemContext(
   itemId: string,
   sys?: { general: string; externalShared: string }
 ): Promise<ReconcileItemResult> {
-  const projects = sys ?? (await systemProjectIds(db, teamId));
-  if (!projects) return { ok: true, skipped: true };
+  let projects = sys;
+  if (!projects) {
+    const resolved = await systemProjectIds(db, teamId);
+    if (resolved === undefined) return { ok: false, error: "system project read failed" };
+    if (resolved === null) return { ok: true, skipped: true }; // team not bootstrapped yet
+    projects = resolved;
+  }
 
   const unit = await reconcileItemUnit(db, teamId, itemId);
   if (!unit.ok || !unit.unitId || !unit.audience) return { ok: false, error: `unit: ${unit.error}` };

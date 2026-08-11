@@ -110,6 +110,15 @@ export async function backfillAllTeams(
   const MAX_BATCHES = 10_000;
   for (const t of (teams ?? []) as { id: string }[]) {
     try {
+      // Cheap convergence short-circuit (slice-5 Fable Medium): once every item has an item-unit,
+      // the periodic sweep has nothing to create — skip the full O(N) re-drain and cost ~2 counts.
+      // (Stale-audience from a NON-push tier change is the push hook's job via accessChanged; the
+      // reclassify-path wiring that also covers it is a Phase-B item, noted in ARCHITECTURE.)
+      const [{ count: itemCount }, { count: unitCount }] = await Promise.all([
+        db.from("items").select("id", { count: "exact", head: true }).eq("team_id", t.id),
+        db.from("project_context_units").select("id", { count: "exact", head: true }).eq("team_id", t.id).eq("unit_kind", "item"),
+      ]);
+      if (typeof itemCount === "number" && typeof unitCount === "number" && unitCount >= itemCount) continue;
       let cursor: string | null = null;
       let drained = false;
       for (let guard = 0; guard < MAX_BATCHES; guard++) {

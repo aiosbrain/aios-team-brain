@@ -70,6 +70,22 @@ describe("reconcileItemContext (the shared per-item core)", () => {
     expect(await membershipProjects(seed, item.id)).toEqual([]);
   });
 
+  it("refuses to partition into a slug-squatting INITIATIVE — resolves system by kind, not slug alone (Fable HIGH)", async () => {
+    const seed = await seedTeam();
+    // A dashboard-created initiative squats 'general' BEFORE bootstrap runs (bootstrap then refuses it).
+    await db().from("projects").insert({ team_id: seed.teamId, slug: GENERAL_SLUG, name: "curated", kind: "initiative" });
+    const item = await ingest(seed, { path: "s.md", body: "s", access: "team", project: "src" });
+    const r = await reconcileItemContext(db(), seed.teamId, item.id);
+    // No kind='system' project exists → resolves null → skipped, never partitions into the squatter.
+    expect(r.ok).toBe(true);
+    expect(r.skipped).toBe(true);
+    const { data: mems } = await db()
+      .from("project_context_memberships")
+      .select("id")
+      .eq("team_id", seed.teamId);
+    expect((mems ?? []).length, "must not write a membership into the squatting initiative").toBe(0);
+  });
+
   it("is idempotent — a second reconcile creates no new unit or membership", async () => {
     const seed = await seedTeam();
     await ensureAccessBootstrap(db(), seed.teamId);

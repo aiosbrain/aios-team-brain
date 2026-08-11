@@ -321,9 +321,12 @@ export function startIngestScheduler(): void {
         });
       }
       const globalFailure = r.failed.find((f) => f.teamId === "*");
+      // Instance-wide heartbeat under a DISTINCT source ('context_backfill_all') so a per-team
+      // failed 'context_backfill' row isn't masked by the newer global ok row under distinct-on
+      // (slice-5 Fable Medium — the same latent shape access_bootstrap has; tracked separately).
       await recordIngestRun(db, {
         teamId: null,
-        source: "context_backfill",
+        source: "context_backfill_all",
         trigger: "scheduler",
         ok: !globalFailure,
         created: 0,

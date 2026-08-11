@@ -17,7 +17,9 @@ describe("§11 context-partition call sites", () => {
   it("the items push route reconciles context after the response", () => {
     const src = read("app/api/v1/items/route.ts");
     expect(src).toMatch(/reconcileItemContext/);
-    expect(src, "must run in after(), not inline (never blocks the push)").toMatch(/after\(async/);
+    // the reconcile must be INSIDE an after() block (not merely that the file uses after()
+    // somewhere — pm-sync already does): require after(async ...) with reconcileItemContext in it.
+    expect(src, "must run in after(), not inline (never blocks the push)").toMatch(/after\(async[\s\S]{0,400}reconcileItemContext/);
   });
 
   it("the scheduler tick runs the context-backfill convergence leg", () => {
@@ -30,6 +32,7 @@ describe("§11 context-partition call sites", () => {
     const src = read("app/t/[team]/admin/access/actions.ts");
     expect(src).toMatch(/backfillTeamContext\s*\(/);
     expect(src).toMatch(/requireAdmin\s*\(/);
+    expect(src, "must gate execution on the admin check").toMatch(/if \(!ctx\) return/);
   });
 
   it("the backfill and the ingest hook share ONE reconcile core (no divergent partitioning)", () => {

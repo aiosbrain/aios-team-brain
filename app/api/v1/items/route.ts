@@ -120,7 +120,9 @@ export async function POST(req: NextRequest) {
     // latency (the scheduler leg is the backstop), never the push. Skips silently if the team's
     // system projects don't exist yet (bootstrap covers it). Inert in Phase A (no read enforces
     // memberships yet) but keeps the substrate current from day one of Phase B.
-    if (result.status !== "unchanged") {
+    // Fire on a real ingest OR a tier reclassification that arrived as `unchanged` (the
+    // heal-access path) — the latter is the security-relevant MOVE (slice-5 Fable HIGH).
+    if (result.status !== "unchanged" || result.accessChanged) {
       const teamId = auth.teamId;
       const itemId = result.id;
       after(async () => {
