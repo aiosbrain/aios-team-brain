@@ -34,6 +34,7 @@ gates (AIOS hub, Tessera root) apply in addition.
 | Admin/ops tasks on the brain instance | `.claude/skills/admin/SKILL.md` |
 | Branches diverged / reconcile a fork | `.claude/skills/branch-reconciliation/SKILL.md` |
 | "Is this test actually wired into CI" | `.claude/skills/test-ci-wiring-audit/SKILL.md` |
+| Building a feature slice end-to-end ("build the next phase/slice", dual adversarial reviews) | `.claude/skills/adversarial-build/SKILL.md` — its steps 2–5 satisfy the Review gate; don't stack the attestation protocol on top |
 | About to push a PR branch / "did this get reviewed" / attest a PR | `.claude/skills/pr-review-attestation/SKILL.md` |
 | Just merged to main / "did the deploy go out" / check Railway | `.claude/skills/railway-deploy-verify/SKILL.md` |
 | PM projection questions (brain→Linear) | `lib/pm-sync/` — the brain's tasks table is canonical, projection is one-way; reconcile reads live status surface-only |
