@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { db, ingest, seedTeam, type Seed } from "./helpers";
 import { backfillTeamContext } from "@/lib/projects/context/backfill";
 import { reconcileItemUnit } from "@/lib/projects/context/units";
-import { ensureIncludeMembership } from "@/lib/projects/context/memberships";
+import { ensureIncludeMembership, closeOtherMemberships } from "@/lib/projects/context/memberships";
 import { GENERAL_SLUG, EXTERNAL_SHARED_SLUG, ensureAccessBootstrap } from "@/lib/access/bootstrap";
 
 // Phase A slice 4 (spec §11.2/§context-substrate) — real-Postgres proofs. The acceptance test
@@ -76,6 +76,40 @@ describe("§11 backfill — day-one visibility byte-identical to today", () => {
       cursor = r.cursor;
     }
     expect(created, "every item got a membership across the paged run").toBe(3);
+  });
+
+  it("a tier flip external→team CLOSES the stale external-shared membership on re-run — no dual-project leak (Codex H2)", async () => {
+    const seed = await seedTeam();
+    const item = await ingest(seed, { path: "flip.md", body: "flip", access: "external", project: "src" });
+    await backfillTeamContext(db(), seed.teamId);
+    const sys = await systemProjectIds(seed);
+    expect(await membershipProjects(seed, item.id)).toEqual([sys.externalShared]);
+
+    // The item is reclassified to team tier; a re-run must MOVE it (General only), not leave it
+    // in both — otherwise an external principal still sees team content.
+    await db().from("items").update({ access: "team" }).eq("id", item.id).eq("team_id", seed.teamId);
+    await backfillTeamContext(db(), seed.teamId);
+    const after = await membershipProjects(seed, item.id);
+    expect(after).toEqual([sys.general]);
+    expect(after, "the stale external-shared membership must be closed").not.toContain(sys.externalShared);
+  });
+
+  it("no-widening gate: the writer REFUSES a team-audience unit into external-shared (Codex H1)", async () => {
+    const seed = await seedTeam();
+    const item = await ingest(seed, { path: "team.md", body: "team", access: "team", project: "src" });
+    await ensureAccessBootstrap(db(), seed.teamId);
+    const sys = await systemProjectIds(seed);
+    const u = await reconcileItemUnit(db(), seed.teamId, item.id);
+    const r = await ensureIncludeMembership(db(), seed.teamId, { projectId: sys.externalShared, contextUnitId: u.unitId! });
+    expect(r.ok).toBe(false);
+    expect(r.refused, "must be a no-widening refusal, not a DB error").toBe(true);
+    // and nothing was written
+    const { data } = await db()
+      .from("project_context_memberships")
+      .select("id")
+      .eq("context_unit_id", u.unitId!)
+      .eq("project_id", sys.externalShared);
+    expect((data ?? []).length).toBe(0);
   });
 
   it("reconciler re-mirrors audience when items.access changes — a tier reclassification propagates to the unit", async () => {
@@ -177,23 +211,33 @@ describe("membership single writer", () => {
     expect(withMembership).toBe(3);
   });
 
-  it("cascades: deleting an item removes its unit + membership; deleting a project removes membership but keeps the unit (L7)", async () => {
+  it("cascade: deleting an ITEM removes its unit AND its live membership (separate fixture, item deleted first)", async () => {
     const seed = await seedTeam();
-    const item = await ingest(seed, { path: "cascade.md", body: "c", access: "team", project: "src" });
+    const item = await ingest(seed, { path: "citem.md", body: "c", access: "team", project: "src" });
+    await backfillTeamContext(db(), seed.teamId);
+    const { data: unit } = await db().from("project_context_units").select("id").eq("source_item_id", item.id).single();
+    // membership is live BEFORE the delete
+    const { data: memBefore } = await db().from("project_context_memberships").select("id").eq("context_unit_id", unit!.id).is("valid_to", null);
+    expect((memBefore ?? []).length).toBe(1);
+
+    await db().from("items").delete().eq("id", item.id).eq("team_id", seed.teamId);
+    const { data: unitAfter } = await db().from("project_context_units").select("id").eq("id", unit!.id).maybeSingle();
+    expect(unitAfter, "unit cascades with its item").toBeNull();
+    const { data: memAfter } = await db().from("project_context_memberships").select("id").eq("context_unit_id", unit!.id);
+    expect((memAfter ?? []).length, "membership cascades with the unit").toBe(0);
+  });
+
+  it("cascade: deleting a PROJECT removes its memberships but keeps the units (content-anchored)", async () => {
+    const seed = await seedTeam();
+    const item = await ingest(seed, { path: "cproj.md", body: "c", access: "team", project: "src" });
     await backfillTeamContext(db(), seed.teamId);
     const sys = await systemProjectIds(seed);
     const { data: unit } = await db().from("project_context_units").select("id").eq("source_item_id", item.id).single();
 
-    // Delete the project → membership gone, unit survives (content-anchored).
     await db().from("projects").delete().eq("id", sys.general).eq("team_id", seed.teamId);
-    const { data: memAfterProj } = await db().from("project_context_memberships").select("id").eq("context_unit_id", unit!.id);
-    expect((memAfterProj ?? []).length).toBe(0);
-    const { data: unitAfterProj } = await db().from("project_context_units").select("id").eq("id", unit!.id).maybeSingle();
-    expect(unitAfterProj, "unit survives its project's deletion").not.toBeNull();
-
-    // Delete the item → unit cascades.
-    await db().from("items").delete().eq("id", item.id).eq("team_id", seed.teamId);
-    const { data: unitAfterItem } = await db().from("project_context_units").select("id").eq("id", unit!.id).maybeSingle();
-    expect(unitAfterItem, "unit cascades with its item").toBeNull();
+    const { data: mem } = await db().from("project_context_memberships").select("id").eq("context_unit_id", unit!.id);
+    expect((mem ?? []).length, "membership cascades with its project").toBe(0);
+    const { data: unitAfter } = await db().from("project_context_units").select("id").eq("id", unit!.id).maybeSingle();
+    expect(unitAfter, "unit survives its project's deletion").not.toBeNull();
   });
 });

@@ -62,7 +62,20 @@ function writesTo(source: string, table: string): boolean {
  * plus these two suffice, since a membership/grant write is what confers access.
  */
 const UNAMBIGUOUS = ["group_members", "project_groups"];
-function mentionsWithWrites(source: string, table: string): boolean {
+/**
+ * Explicit READ exemptions for the coarse "names + has write verbs" net. Each entry is a
+ * cross-table READ that legitimately appears in a file that also writes its OWN table — the
+ * precise chain-scan (`writesTo`) confirms these are NOT writes. Auditable by construction:
+ * a new entry has to be justified as a read here, and the chain-scan still catches an actual
+ * write. `lib/projects/context/memberships.ts` reads `project_groups` (no-widening gate) and
+ * `project_context_units` (the unit's inherited audience) while writing only memberships.
+ */
+const READ_EXEMPT = new Set<string>([
+  `${join("lib", "projects", "context", "memberships.ts")}:project_groups`,
+  `${join("lib", "projects", "context", "memberships.ts")}:project_context_units`,
+]);
+function mentionsWithWrites(rel: string, source: string, table: string): boolean {
+  if (READ_EXEMPT.has(`${rel}:${table}`)) return false;
   const quoted = [`"${table}"`, `'${table}'`, "`" + table + "`"];
   return quoted.some((q) => source.includes(q)) && WRITE_VERBS.test(source);
 }
@@ -85,15 +98,15 @@ describe("access-chain single writer", () => {
           if (writesTo(source, table)) offenders.push(`${rel} writes ${table}`);
         }
         for (const table of UNAMBIGUOUS) {
-          if (!writesTo(source, table) && mentionsWithWrites(source, table)) {
+          if (!writesTo(source, table) && mentionsWithWrites(rel, source, table)) {
             offenders.push(`${rel} names ${table} in a file with write verbs (variable-table idiom?)`);
           }
         }
-        if (rel !== TOKEN_WRITER && (writesTo(source, TOKEN_TABLE) || mentionsWithWrites(source, TOKEN_TABLE))) {
+        if (rel !== TOKEN_WRITER && (writesTo(source, TOKEN_TABLE) || mentionsWithWrites(rel, source, TOKEN_TABLE))) {
           offenders.push(`${rel} writes/names ${TOKEN_TABLE} outside its single writer`);
         }
         for (const { table, writer } of SUBSTRATE) {
-          if (rel !== writer && (writesTo(source, table) || mentionsWithWrites(source, table))) {
+          if (rel !== writer && (writesTo(source, table) || mentionsWithWrites(rel, source, table))) {
             offenders.push(`${rel} writes/names ${table} outside ${writer}`);
           }
         }

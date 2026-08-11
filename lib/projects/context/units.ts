@@ -14,6 +14,10 @@ export interface ReconcileResult {
   error?: string;
   unitId?: string;
   created?: boolean;
+  /** The audience the unit now carries — mirrored from the item's CURRENT access. Callers must
+   *  route placement by THIS, never by a separately-read item.access, so a tier flip between the
+   *  two reads can't create a team unit routed to an external project (slice-4 Codex H3). */
+  audience?: "team" | "external";
 }
 
 type ItemRow = { id: string; access: "team" | "external"; content_sha256: string; work_at: string };
@@ -21,9 +25,9 @@ type ItemRow = { id: string; access: "team" | "external"; content_sha256: string
 /**
  * Reconcile one item into its item-grain unit. Idempotent: creates the unit if absent, and
  * refreshes audience/content_sha256/occurred_at if the item changed (audience ALWAYS re-mirrors
- * `items.access` so a tier reclassification propagates to the unit). The unit's audience is the
- * source of truth the oracle-side filter will read; it is never widened by anything but a change
- * to the item's own access.
+ * `items.access` so a tier reclassification propagates to the unit). The unit's audience is an
+ * inherited no-widening/index input — Phase-B visibility comes from the project memberships +
+ * oracle, NOT from this column; it is never set by anything but the item's own access.
  */
 export async function reconcileItemUnit(
   db: DbClient,
@@ -64,7 +68,7 @@ export async function reconcileItemUnit(
         .eq("team_id", teamId);
       if (error) return { ok: false, error: error.message };
     }
-    return { ok: true, unitId: row.id, created: false };
+    return { ok: true, unitId: row.id, created: false, audience: item.access };
   }
 
   const { data, error } = await db
@@ -89,8 +93,8 @@ export async function reconcileItemUnit(
       .eq("source_item_id", itemId)
       .eq("unit_kind", "item")
       .maybeSingle();
-    if (winner) return { ok: true, unitId: (winner as { id: string }).id, created: false };
+    if (winner) return { ok: true, unitId: (winner as { id: string }).id, created: false, audience: item.access };
     return { ok: false, error: error?.message ?? "insert failed" };
   }
-  return { ok: true, unitId: data.id as string, created: true };
+  return { ok: true, unitId: data.id as string, created: true, audience: item.access };
 }

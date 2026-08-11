@@ -1,7 +1,7 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { reconcileItemUnit } from "@/lib/projects/context/units";
-import { ensureIncludeMembership } from "@/lib/projects/context/memberships";
+import { ensureIncludeMembership, closeOtherMemberships } from "@/lib/projects/context/memberships";
 import { ensureAccessBootstrap, GENERAL_SLUG, EXTERNAL_SHARED_SLUG } from "@/lib/access/bootstrap";
 
 /**
@@ -32,7 +32,7 @@ type ItemRow = { id: string; access: "team" | "external" };
 export async function backfillTeamContext(
   db: DbClient,
   teamId: string,
-  opts: { batchSize?: number; afterId?: string | null } = {}
+  opts: { batchSize?: number; afterId?: string | null; createdBefore?: string } = {}
 ): Promise<BackfillResult> {
   const batchSize = Math.min(Math.max(opts.batchSize ?? 500, 1), 2000);
 
@@ -50,6 +50,10 @@ export async function backfillTeamContext(
     .order("id", { ascending: true })
     .limit(batchSize);
   if (opts.afterId) q = q.gt("id", opts.afterId);
+  // Random uuids are stable once assigned, so id-keyset covers every EXISTING row exactly once.
+  // A cutoff bounds the run to the pre-existing corpus so a concurrent insert (which the ingest
+  // hook will unit-ize itself, next slice) can't be skipped-yet-reported-drained (Codex Medium).
+  if (opts.createdBefore) q = q.lt("created_at", opts.createdBefore);
   const { data, error } = await q;
   if (error) return { ok: false, error: error.message, scanned: 0, unitsCreated: 0, membershipsCreated: 0, cursor: opts.afterId ?? null };
 
@@ -65,12 +69,18 @@ export async function backfillTeamContext(
   let lastGood: string | null = opts.afterId ?? null;
   for (const item of items) {
     const unit = await reconcileItemUnit(db, teamId, item.id);
-    if (!unit.ok || !unit.unitId) return { ok: false, error: `unit ${item.id}: ${unit.error}`, scanned, unitsCreated, membershipsCreated, cursor: lastGood };
+    if (!unit.ok || !unit.unitId || !unit.audience) return { ok: false, error: `unit ${item.id}: ${unit.error}`, scanned, unitsCreated, membershipsCreated, cursor: lastGood };
     if (unit.created) unitsCreated++;
-    const target = item.access === "external" ? projectId.externalShared : projectId.general;
+    // Route by the audience reconcile just mirrored from the item's CURRENT access — NOT the
+    // batch's stale item.access (H3). Then CLOSE any membership into the other system project,
+    // so a tier flip (external→team) stops being served through external-shared (H2 — the
+    // add-only backfill previously left the item in BOTH projects).
+    const target = unit.audience === "external" ? projectId.externalShared : projectId.general;
     const m = await ensureIncludeMembership(db, teamId, { projectId: target, contextUnitId: unit.unitId });
     if (!m.ok) return { ok: false, error: `membership ${item.id}: ${m.error}`, scanned, unitsCreated, membershipsCreated, cursor: lastGood };
     if (m.created) membershipsCreated++;
+    const closed = await closeOtherMemberships(db, teamId, unit.unitId, target);
+    if (!closed.ok) return { ok: false, error: `move ${item.id}: ${closed.error}`, scanned, unitsCreated, membershipsCreated, cursor: lastGood };
     scanned++;
     lastGood = item.id;
   }
@@ -99,7 +109,8 @@ async function resolveSystemProjectIds(
 
 /** Backfill every team to completion (drains the cursor per team). Best-effort per team. */
 export async function backfillAllTeams(
-  db: DbClient
+  db: DbClient,
+  cutoff: string
 ): Promise<{ teams: number; failed: { teamId: string; error: string }[] }> {
   const { data: teams, error } = await db.from("teams").select("id");
   if (error) return { teams: 0, failed: [{ teamId: "*", error: `teams read failed: ${error.message}` }] };
@@ -110,7 +121,7 @@ export async function backfillAllTeams(
       let cursor: string | null = null;
       let drained = false;
       for (let guard = 0; guard < MAX_BATCHES; guard++) {
-        const r: BackfillResult = await backfillTeamContext(db, t.id, { afterId: cursor });
+        const r: BackfillResult = await backfillTeamContext(db, t.id, { afterId: cursor, createdBefore: cutoff });
         if (!r.ok) {
           failed.push({ teamId: t.id, error: r.error ?? "unknown" });
           drained = true; // recorded as failed; don't ALSO report guard-exhaustion below

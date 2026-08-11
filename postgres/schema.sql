@@ -1120,8 +1120,9 @@ create table if not exists project_context_units (
   occurred_at timestamptz not null default now(),
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
-  -- exactly one canonical source per kind (item grain in this slice; extended in Phase D)
-  check (unit_kind <> 'item' or source_item_id is not null),
+  -- item grain only in this slice: every unit MUST anchor to an item. Phase D relaxes this
+  -- (named drop/re-add) as it adds the task/decision/meeting-note source columns + FKs.
+  check (unit_kind = 'item' and source_item_id is not null),
   unique (team_id, id),
   foreign key (team_id, source_item_id) references items (team_id, id) on delete cascade
 );
