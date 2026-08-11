@@ -205,10 +205,22 @@ export async function GET(req: NextRequest) {
   // Agent principals read only items whose ingestion project is in their effective set —
   // the oracle's triple intersection, computed live this request. An empty set short-circuits
   // to zero rows rather than an unfiltered query (the [] vs NULL distinction, spec §10).
-  // Item-grain memberships refine this once the Part II context substrate lands.
+  // (Phase A proxy on ingestion project_id; migrating to the membership filter is a follow-up.)
   if (agentProjects !== null) {
     if (agentProjects.size === 0) return Response.json({ items: [], next_cursor: null });
     q = q.in("project_id", [...agentProjects]);
+  }
+  // MEMBER enforced read (Phase B slice 1, spec §5/§11): when the team is 'enforcing', intersect
+  // with the oracle's membership-visible item set — visibility = oracle ∧ legacy-tier (the tier
+  // filter above stays). 'permissive' (default) skips this entirely → byte-identical to today.
+  // Agent tokens already carry their own effective filter above, so this is member-key only.
+  if (agentProjects === null) {
+    const { teamEnforcesAccess, visibleItemIds } = await import("@/lib/access/enforce");
+    if (await teamEnforcesAccess(db, auth.teamId)) {
+      const { ids, empty } = await visibleItemIds(db, { teamId: auth.teamId, memberId: auth.memberId });
+      if (empty) return Response.json({ items: [], next_cursor: null });
+      q = q.in("id", [...ids]);
+    }
   }
   if (kinds?.length) q = q.in("kind", kinds);
   // On-demand fetch of one skill/deliverable folder: match path by prefix.

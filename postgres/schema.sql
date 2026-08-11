@@ -156,6 +156,10 @@ create table if not exists teams (
   meeting_task_status text check (meeting_task_status in ('backlog', 'ready', 'in_progress', 'done')),
   created_at timestamptz not null default now()
 );
+-- Access-enforcement rollout flag (Phase B, spec §5/§11): 'permissive' (default) = today's
+-- legacy-tier-only reads, byte-identical; 'enforcing' = oracle membership filter ∧ legacy tier.
+-- CHECK lives in the 20260811160000 migration (named, replay-repairable).
+alter table teams add column if not exists access_enforcement text not null default 'permissive';
 -- Additive columns for existing deployments.
 alter table teams add column if not exists primary_pm_provider text;
 alter table teams add column if not exists answering_provider text;
