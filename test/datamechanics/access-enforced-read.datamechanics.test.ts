@@ -112,12 +112,26 @@ describe("access enforcement flag", () => {
     await backfillTeamContext(db(), seed.teamId);
     // Plant the team item into external-shared too (so the ORACLE would admit it for an external
     // member) — the TIER conjunct must still exclude it: a team-access item never reaches external.
-    const { data: unit } = await db().from("project_context_units").select("id").eq("source_item_id", (await db().from("items").select("id").eq("path","team-only.md").single()).data!.id).single();
+    const teamItemId = (await db().from("items").select("id").eq("path", "team-only.md").single()).data!.id;
+    const { data: unit } = await db().from("project_context_units").select("id").eq("source_item_id", teamItemId).single();
     const { data: extShared } = await db().from("projects").select("id").eq("team_id", seed.teamId).eq("slug", "external-shared").single();
-    await db().from("project_context_memberships").insert({ team_id: seed.teamId, project_id: extShared!.id, context_unit_id: unit!.id, method: "manual" }).then(() => {}, () => {});
-    // ensure the external member is in External so the oracle grants external-shared
+    // Move the item's membership to external-shared (close the General one first — the unit has one
+    // current row per project) so the ORACLE genuinely admits it for an external member.
+    await db().from("project_context_memberships").update({ valid_to: new Date().toISOString() }).eq("context_unit_id", unit!.id);
+    const insErr = (await db().from("project_context_memberships").insert({ team_id: seed.teamId, project_id: extShared!.id, context_unit_id: unit!.id, method: "manual" })).error;
+    expect(insErr, "the planted external-shared membership must actually persist").toBeNull();
     const { data: extGroup } = await db().from("groups").select("id").eq("team_id", seed.teamId).eq("slug", "external").single();
     await db().from("group_members").upsert({ team_id: seed.teamId, group_id: extGroup!.id, member_id: extMember }, { onConflict: "group_id,member_id" });
+
+    // POSITIVE control: the oracle WOULD admit this item for the external member (its membership is
+    // in a project they can see) — so the route excluding it proves the TIER conjunct is what cuts
+    // it, not the oracle (Codex Medium — the test was otherwise green-if-oracle-never-admits).
+    const { visibleItemIdsForProjects } = await import("@/lib/access/enforce");
+    const { visibleProjects } = await import("@/lib/access/oracle");
+    const vp = await visibleProjects(db(), { teamId: seed.teamId, memberId: extMember });
+    const admitted = await visibleItemIdsForProjects(db(), seed.teamId, vp.projectIds);
+    expect(admitted.ids.has(teamItemId), "oracle must admit the item — so the tier filter is the sole excluder").toBe(true);
+
     await setEnforcement(seed, "enforcing");
     const got = await paths(await memberKey(seed, extMember));
     expect(got, "the legacy tier conjunct must exclude a team-access item from an external principal").not.toContain("team-only.md");

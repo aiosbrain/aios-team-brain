@@ -213,7 +213,9 @@ export async function GET(req: NextRequest) {
     const { teamEnforcesAccess } = await import("@/lib/access/enforce");
     enforcing = await teamEnforcesAccess(db, auth.teamId);
   } catch (e) {
-    return errorResponse("internal", e instanceof Error ? e.message : "enforcement check failed", 500);
+    // Fail closed on a flag-read error, but don't leak the raw DB error to the client (Codex Low).
+    console.error("[access] enforcement check failed:", e instanceof Error ? e.message : e);
+    return errorResponse("internal", "enforcement check failed", 500);
   }
 
   if (enforcing) {
