@@ -71,8 +71,30 @@ describe("pipeline health — the poller heartbeat is scheduler-only (data-mecha
     await record(teamId, "api", { ok: false, errors: ["model down"], at: Date.now() - 1000 });
 
     const health = await getPipelineHealth(teamId);
+    // The property this test is FOR is unchanged: the verdict reads the newest row whatever its
+    // trigger, so a push-triggered failure is recorded and visible on the leg.
     expect(leg(health)?.ok).toBe(false);
     expect(leg(health)?.error).toBe("model down");
+    // What DID change (BANNERFLAP-1): a lone failure on top of a success is `unconfirmed`, so it no
+    // longer paints the loud banner. This assertion used to read `false`. It is flipped deliberately,
+    // not to make the suite green — the next test proves an api-triggered failure still goes loud once
+    // it repeats, which is what stops this from being a silent loss of coverage.
+    expect(leg(health)?.failureClass).toBe("unconfirmed");
+    expect(health.healthy).toBe(true);
+  });
+
+  it("a REPEATED push-triggered failure is loud — trigger-agnostic loudness survives confirmation", async () => {
+    // The control for the flipped assertion above. Without this, "one api failure is quiet" could be
+    // hiding "api failures are never loud", which would be a real regression for a team whose
+    // meeting-notes backfill only ever runs from `aios push`.
+    const { teamId } = await seedTeam();
+    await record(teamId, "scheduler", { at: Date.now() - 90 * 1000 });
+    await record(teamId, "api", { ok: false, errors: ["model down"], at: Date.now() - 60 * 1000 });
+    await record(teamId, "api", { ok: false, errors: ["model down again"], at: Date.now() - 1000 });
+
+    const health = await getPipelineHealth(teamId);
+    expect(leg(health)?.failureClass).toBe("confirmed");
+    expect(health.failing.map((l) => l.source)).toContain("meeting_notes");
     expect(health.healthy).toBe(false);
   });
 
