@@ -124,6 +124,40 @@ describe("enforced work-timeline builder (Phase B slice 4)", () => {
     expect(JSON.stringify(days), "a restricted meeting must not surface via its note").not.toContain("Confidential board prep");
   });
 
+  it("enforcing: a UI-created task (null source, VISIBLE project) still heads its group — a null-source drop would erase every dashboard task for everyone (Fable B4 Medium)", async () => {
+    const seed = await seedTeam();
+    // The citing commit is General; the task is UI-created (origin='ui', no source item) in a
+    // General-visible project. Under a naive null-source-drop the header vanishes for everyone.
+    const commitItem = await commit(seed, "feat: do the UI thing (UI-1)");
+    const generalProj = commitItem.projectId!;
+    await insertTask(seed, generalProj, { row_key: "UI-1", title: "Dashboard-made task", status: "in_progress", origin: "ui", source_item_id: null });
+    const outsider = await seedMember(seed);
+    await backfillTeamContext(db(), seed.teamId);
+    await setEnforcement(seed, "enforcing");
+
+    const enforce = await memberEnforcement(db(), { teamId: seed.teamId, memberId: outsider });
+    const days = await getWorkTimeline(db(), seed.teamId, "team", undefined, enforce);
+    expect(taskTitles(days), "a UI task in a visible project must survive enforcing").toContain("Dashboard-made task");
+    expect(evidenceTitles(days)).toContain("feat: do the UI thing (UI-1)");
+  });
+
+  it("enforcing: a SYNCED task whose restricted source was PURGED (source→null via on-delete-set-null) does NOT resurface — only origin='ui' survives a null source", async () => {
+    const seed = await seedTeam();
+    const commitItem = await commit(seed, "feat: cite the secret (SEC-1)");
+    const secretItem = await commit(seed, "internal: secret basis (SEC-1)");
+    // A SYNCED task tied to a restricted item, then the item is deleted → source_item_id goes null.
+    await insertTask(seed, commitItem.projectId!, { row_key: "SEC-1", title: "Purged-basis task", status: "in_progress", origin: "sync", source_item_id: secretItem.id });
+    const outsider = await seedMember(seed);
+    await backfillTeamContext(db(), seed.teamId);
+    await restrictItem(seed, secretItem.id);
+    await db().from("items").delete().eq("id", secretItem.id); // FK on delete set null → task.source_item_id = null
+    await setEnforcement(seed, "enforcing");
+
+    const enforce = await memberEnforcement(db(), { teamId: seed.teamId, memberId: outsider });
+    const days = await getWorkTimeline(db(), seed.teamId, "team", undefined, enforce);
+    expect(JSON.stringify(days), "a synced task with a purged restricted basis must not resurface").not.toContain("Purged-basis task");
+  });
+
   it("permissive: the enforce view is null and the ledger is byte-identical to today", async () => {
     const seed = await seedTeam();
     const item = await commit(seed, "feat: anything (AIO-40)");
@@ -215,9 +249,17 @@ describe("visibility-keyed timeline cache (§5.8)", () => {
     const member = await seedMember(seed);
     await backfillTeamContext(db(), seed.teamId);
     await setEnforcement(seed, "enforcing");
-    await getCachedWorkTimeline(db(), seed.teamId, "team", member);
-    await getCachedWorkTimeline(db(), seed.teamId, "team", null).catch(() => {});
+    await getCachedWorkTimeline(db(), seed.teamId, "team", member); // writes a vis:team:<hash> variant
     await settleTimelineRefreshes();
+    // Seed the plain tier row DIRECTLY (an enforcing read never writes it, so the "removes the tier
+    // row" half would be vacuous otherwise — Fable B4 Low): both halves must now discriminate.
+    await db().from("work_timeline_cache").upsert({
+      team_id: seed.teamId, group_key: "team",
+      payload: JSON.stringify({ v: PAYLOAD_VERSION, days: [] }), computed_at: new Date().toISOString(),
+    }, { onConflict: "team_id,group_key" });
+    const before = ((await db().from("work_timeline_cache").select("group_key").eq("team_id", seed.teamId)).data ?? []) as { group_key: string }[];
+    expect(before.some((r) => r.group_key === "team"), "tier row must exist before purge").toBe(true);
+    expect(before.some((r) => r.group_key.startsWith("vis:team:")), "a variant must exist before purge").toBe(true);
     await purgeTimelineCacheTier(db(), seed.teamId, "team");
     const { data } = await db().from("work_timeline_cache").select("group_key").eq("team_id", seed.teamId);
     const keys = ((data ?? []) as { group_key: string }[]).map((r) => r.group_key);

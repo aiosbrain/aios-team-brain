@@ -124,6 +124,7 @@ type TaskRow = {
   status: string | null;
   assignee: string | null;
   source_item_id?: string | null;
+  origin?: string | null;
 };
 
 
@@ -147,23 +148,36 @@ export async function getWorkTimeline(
   tier: ViewerTier,
   windowDays: number = WINDOW_DAYS,
   // Access enforcement (Phase B slice 4, spec §5.8/§17-B): the principal's membership-visible item
-  // set. Null/absent = permissive → byte-identical to today. Item legs carry the filter IN-QUERY
-  // (each leg's limit must rank over VISIBLE rows — a post-filter lets invisible items crowd
-  // visible ones out of the page); tasks/decisions/meetings gate on their SOURCE ITEM, because a
-  // restricted item's task/decision/meeting TITLE is itself the leak (retrieve's §5.8b ruling:
-  // a null-source row is dropped under enforcing — nothing proves it isn't restricted).
+  // set. Null/absent = permissive → byte-identical to today. Item legs carry the item filter
+  // IN-QUERY (each leg's limit must rank over VISIBLE rows — a post-filter lets invisible items
+  // crowd visible ones out of the page). Structured rows (tasks/decisions/meetings) gate on their
+  // SOURCE ITEM when they have one — a restricted item's derived TITLE is the leak.
   enforce: { visibleItemIds: ReadonlySet<string> } | null = null
 ): Promise<TimelineDay[]> {
+  const NIL_UUID = "00000000-0000-0000-0000-000000000000"; // no real item carries it (gen_random_uuid)
   const visArr: string[] | null = enforce ? [...enforce.visibleItemIds] : null;
-  const srcVisible = (id: string | null | undefined): boolean =>
-    enforce == null || (id != null && enforce.visibleItemIds.has(id));
-  // Enforcing but sees nothing → the ledger is empty by definition; return before any leg queries
-  // (mirrors the empty-set short-circuit in fts/dense — never rely on `.in("id", [])` semantics).
-  if (visArr && visArr.length === 0) return [];
-  // Conditionally AND the membership conjunct into an item-leg query (kept in ONE place so a new
-  // leg has an obvious handle to reach for).
+  // A SOURCED structured row is visible iff its source item is. Meetings + decisions gate on this
+  // alone (a null source there is the PURGE case — a restricted item removed via `on delete set
+  // null` — so fail closed and drop it; Codex B2's retrieve ruling).
+  const srcVisible = (sourceItemId: string | null | undefined): boolean =>
+    enforce == null || (sourceItemId != null && enforce.visibleItemIds.has(sourceItemId));
+  // A TASK's null source is ambiguous: a hand-typed UI task (`origin='ui'`, no restricted basis,
+  // already tier-gated by visibleTasks) OR a synced task whose restricted source was purged. The
+  // FIRST must survive — dropping all null-source tasks erased every dashboard-created task for
+  // everyone incl. admins on flip (Fable B4 Medium) — the SECOND must not (its title still names
+  // the purged restricted work). `origin` is exactly that distinction.
+  const taskVisible = (t: TaskRow): boolean => {
+    if (enforce == null) return true;
+    if (t.source_item_id != null) return enforce.visibleItemIds.has(t.source_item_id);
+    return t.origin === "ui";
+  };
+  // Conditionally AND the item-membership conjunct into an item-leg query (kept in ONE place so a
+  // new leg has an obvious handle). An EMPTY visible set uses the nil-uuid sentinel so the leg
+  // returns nothing via a well-formed query — never a bare `.in("id", [])`, whose semantics vary —
+  // while the structured legs still evaluate their project arm (a member with zero visible ITEMS
+  // can still own UI tasks in a visible project).
   const withVis = <T extends { in: (col: string, vals: string[]) => T }>(q: T): T =>
-    visArr ? q.in("id", visArr) : q;
+    visArr ? q.in("id", visArr.length ? visArr : [NIL_UUID]) : q;
   // Clamp to [1, MAX] — the window drives both the DB fetch bound (`sinceIso`) and the in-window filter,
   // so an unbounded caller value can't widen the query past the cost cap.
   const days = Math.max(1, Math.min(Math.floor(windowDays) || WINDOW_DAYS, MAX_WINDOW_DAYS));
@@ -277,7 +291,7 @@ export async function getWorkTimeline(
     visibleTasks(
       db
         .from("tasks")
-        .select("id, row_key, title, status, assignee, source_item_id")
+        .select("id, row_key, title, status, assignee, source_item_id, origin")
         .eq("team_id", teamId)
         .in("status", [...ACTIVE_STATUSES])
         .order("updated_at", { ascending: false })
@@ -337,7 +351,7 @@ export async function getWorkTimeline(
   // present even when the all-status read clips at TASK_LIMIT. Evidence-gated in the grouper.
   // Enforcing: a task is kept only when its SOURCE ITEM is visible — the header carries the task's
   // TITLE, so an invisible (or null → unprovable) source means the title itself would leak.
-  const tasks = ((taskRes.data ?? []) as TaskRow[]).filter((t) => srcVisible(t.source_item_id));
+  const tasks = ((taskRes.data ?? []) as TaskRow[]).filter(taskVisible);
 
   // Assignee → member id, via the SHARED resolver (`assigneeMember`): `tasks.assignee` is a free-text
   // string the PM tool supplied and prod carries several spellings per person, so a raw compare would
@@ -468,7 +482,7 @@ export async function getWorkTimeline(
   const allTaskRes = await visibleTasks(
     db
       .from("tasks")
-      .select("id, row_key, title, status, assignee, source_item_id")
+      .select("id, row_key, title, status, assignee, source_item_id, origin")
       .eq("team_id", teamId)
       .not("row_key", "is", null)
       .order("updated_at", { ascending: false })
@@ -479,7 +493,7 @@ export async function getWorkTimeline(
   // must not be silent (the swallowed-error trap this file warns about). WARN, like the Slack leg.
   if (allTaskRes.error) console.warn("[work-timeline] chip-task read failed:", allTaskRes.error.message);
   // Same source-item gate as the active set: a chip names the task too.
-  const allTasks = ((allTaskRes.data ?? []) as TaskRow[]).filter((t) => srcVisible(t.source_item_id));
+  const allTasks = ((allTaskRes.data ?? []) as TaskRow[]).filter(taskVisible);
   const chipInfo = new Map<string, EvidenceTaskRef>();
   for (const t of allTasks) if (t.row_key) chipInfo.set(t.id, { key: t.row_key.toUpperCase(), title: t.title || "(untitled task)", status: t.status ?? "" });
 
@@ -616,7 +630,7 @@ export async function getWorkTimeline(
     source_item_id: string | null;
     still_valid: boolean | null;
   }[]) {
-    if (!srcVisible(d.source_item_id)) continue; // enforcing: source-item gate — the title is the leak
+    if (!srcVisible(d.source_item_id)) continue; // enforcing: source-item gate (null source = purge case) — the title is the leak
     if (!d.decided_at) continue; // no day to place it on (mirrors the undated-work drop)
     const by = (d.decided_by ?? "").trim();
     if (!by) continue; // empty / group-level decided_by → dropped (a later team-signal lane's job)

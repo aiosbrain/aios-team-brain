@@ -6,7 +6,7 @@ import { getWorkTimeline } from "./work-timeline";
 import { attachPersonDaySummaries, type SummaryPassResult } from "./timeline-summary";
 import type { TimelineDay } from "./timeline-group";
 import { freshness, type Freshness } from "@/lib/freshness";
-import { memberEnforcement, teamEnforcesAccess, type MemberEnforcement } from "@/lib/access/enforce";
+import { memberVisibility, resolveTimelineEnforcement, teamEnforcesAccess, type MemberVisibility } from "@/lib/access/enforce";
 
 /**
  * The persisted, queryable work-timeline LAYER. `lib/dashboard/work-timeline.getWorkTimeline` is the
@@ -31,12 +31,19 @@ import { memberEnforcement, teamEnforcesAccess, type MemberEnforcement } from "@
  * do the row-level filtering; the key keeps each view's payload in its own row.
  */
 
-/** One cached view of the timeline: the plain tier row, or a §5.8 visibility variant. */
+/** One cached view of the timeline: the plain tier row, or a §5.8 visibility variant. Carries the
+ *  CHEAP visibility (project set + hash); the expensive item-id set is resolved only when a build
+ *  actually runs (miss/stale), never on a hit — see `buildEnforcement`. */
 interface TimelineView {
   tier: ViewerTier;
-  enforce: MemberEnforcement | null;
+  vis: MemberVisibility | null;
 }
-const viewKey = (v: TimelineView): string => (v.enforce ? `vis:${v.tier}:${v.enforce.visibilityHash}` : v.tier);
+const viewKey = (v: TimelineView): string => (v.vis ? `vis:${v.tier}:${v.vis.visibilityHash}` : v.tier);
+/** Resolve the item-id set for a build. Called ONLY on a miss/rebuild — and freshly on each
+ *  trailing-edge re-run, so a bust landing mid-rebuild rebuilds with the CURRENT membership set,
+ *  not a frozen snapshot (Fable B4 Low). */
+const buildEnforcement = (db: DbClient, teamId: string, view: TimelineView) =>
+  view.vis ? resolveTimelineEnforcement(db, teamId, view.vis) : Promise.resolve(null);
 
 const TTL_MS = 5 * 60_000; // 5-min freshness; the ledger is cheap, so refresh often.
 /** The same TTL, exported: it's the threshold that decides `freshness.stale`, so a consumer reasoning
@@ -104,7 +111,8 @@ async function buildTimeline(db: DbClient, teamId: string, view: TimelineView): 
   } catch (err) {
     console.warn("[timeline] doc-task inference skipped:", err instanceof Error ? err.message : err);
   }
-  return attachPersonDaySummaries(db, teamId, await getWorkTimeline(db, teamId, view.tier, undefined, view.enforce));
+  const enforce = await buildEnforcement(db, teamId, view);
+  return attachPersonDaySummaries(db, teamId, await getWorkTimeline(db, teamId, view.tier, undefined, enforce));
 }
 
 
@@ -269,10 +277,10 @@ export async function readTimelineCache(
   db: DbClient,
   teamId: string,
   tier: ViewerTier,
-  enforce: MemberEnforcement | null = null
+  vis: MemberVisibility | null = null
 ): Promise<CacheEntry | null> {
   try {
-    const row = await readTimelineCacheRow(db, teamId, viewKey({ tier, enforce }));
+    const row = await readTimelineCacheRow(db, teamId, viewKey({ tier, vis }));
     if (!row) return null;
     // Payload is `{ v, days }`. A missing/older version = a shape from a previous deploy → treat as a
     // MISS so the caller rebuilds (never render a stale wrong shape).
@@ -301,7 +309,7 @@ export async function writeTimelineCache(
    *  handed a partial payload as healthy. Defaults false — the callers that know pass it explicitly. */
   degraded = false,
   /** §5.8 visibility variant: present → the row is keyed vis:<tier>:<hash>, never the tier row. */
-  enforce: MemberEnforcement | null = null
+  vis: MemberVisibility | null = null
 ): Promise<void> {
   try {
     // `payload` is a top-level JSON array — serialize it ourselves (the pg adapter binds a raw JS array
@@ -309,7 +317,7 @@ export async function writeTimelineCache(
     await db.from("work_timeline_cache").upsert(
       {
         team_id: teamId,
-        group_key: viewKey({ tier, enforce }),
+        group_key: viewKey({ tier, vis }),
         payload: JSON.stringify({ v: PAYLOAD_VERSION, days }),
         computed_at: new Date().toISOString(),
         degraded,
@@ -409,7 +417,7 @@ function refreshInBackground(teamId: string, view: TimelineView): void {
         dirty.delete(key); // claim the current request; anything arriving from here re-dirties the key
         const built = await buildTimeline(bg, teamId, view);
         mem.set(key, { days: built.days, at: Date.now(), degraded: built.degraded });
-        await writeTimelineCache(bg, teamId, view.tier, built.days, built.degraded, view.enforce);
+        await writeTimelineCache(bg, teamId, view.tier, built.days, built.degraded, view.vis);
       } while (dirty.has(key));
     } catch (err) {
       console.error("[timeline] background refresh failed:", err instanceof Error ? err.message : err);
@@ -462,13 +470,13 @@ export async function getCachedWorkTimeline(
   tier: ViewerTier,
   memberId: string | null
 ): Promise<CachedTimeline> {
-  let enforce: MemberEnforcement | null = null;
+  let vis: MemberVisibility | null = null;
   if (memberId != null) {
-    enforce = await memberEnforcement(db, { teamId, memberId }); // null on a permissive team
+    vis = await memberVisibility(db, { teamId, memberId }); // CHEAP (projects only) — null on a permissive team
   } else if (await teamEnforcesAccess(db, teamId)) {
     throw new Error("timeline read without a principal on an enforcing team (fail closed)");
   }
-  const view: TimelineView = { tier, enforce };
+  const view: TimelineView = { tier, vis };
   const key = memKey(teamId, viewKey(view));
   const now = Date.now();
 
@@ -477,7 +485,7 @@ export async function getCachedWorkTimeline(
     return { days: cached.days, freshness: freshness(cached.at, TTL_MS, { now, degraded: cached.degraded }) };
   }
 
-  const persisted = await readTimelineCache(db, teamId, tier, enforce);
+  const persisted = await readTimelineCache(db, teamId, tier, vis);
   if (persisted) {
     mem.set(key, { days: persisted.days, at: persisted.at, degraded: persisted.degraded });
     // ONE envelope for both the fresh and the stale branch — `freshness()` derives `stale` from the same
@@ -494,7 +502,7 @@ export async function getCachedWorkTimeline(
   // add the per-person-day synopsis in the background. The first viewer sees the timeline immediately;
   // summaries appear on the next view once the background pass writes them (kept off the request path so
   // a big team's fan-out can't blow the page / route budget).
-  const built = await getWorkTimeline(db, teamId, tier, undefined, enforce);
+  const built = await getWorkTimeline(db, teamId, tier, undefined, await buildEnforcement(db, teamId, view));
   // …but a cold miss is USUALLY A VERSION BUMP, not a genuinely empty cache — and that path was
   // silently deleting the synopsis from every person-day until a background pass finished. Twice the
   // user's report was "we've lost the summaries at the top of each person's day", both times right
@@ -510,7 +518,7 @@ export async function getCachedWorkTimeline(
   // prose is either absent or salvaged from an older payload version — so the flag has to live on the row
   // or the very next request hands the same partial ledger over as healthy. Self-healing: the background
   // pass below rewrites the row with the real verdict once summaries land.
-  await writeTimelineCache(db, teamId, tier, days, true, enforce);
+  await writeTimelineCache(db, teamId, tier, days, true, vis);
   refreshInBackground(teamId, view);
   // DEGRADED, deliberately. A cold miss returns the pure ledger: its per-person-day synopses are either
   // absent (the background pass hasn't run) or SALVAGED from an older payload version. Both are "this is

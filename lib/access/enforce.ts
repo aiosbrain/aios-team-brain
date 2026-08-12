@@ -103,23 +103,52 @@ export async function delegatedVisibleItemIds(
 }
 
 /**
- * A member's enforcement view for CACHED/derived surfaces (Phase B slice 4, spec §5.8): the
- * visible-item set to filter with, plus the hash that KEYS the cache variant — sha256 of the
- * SORTED post-attenuation effective-project set, so two members with identical group signatures
- * share one cache row and a group change moves the member to a new key on the next read.
- * Null = the team is permissive (serve the plain tier row, byte-identical to today).
- * Throws on a flag-read error (the caller fails closed — 500/no data, never the unfiltered row).
+ * A member's VISIBILITY for CACHED/derived surfaces (Phase B slice 4, spec §5.8): the effective
+ * project set + the hash that KEYS the cache variant — sha256 of the SORTED post-attenuation
+ * effective-project set, so two members with identical group signatures share one cache row and a
+ * group change moves the member to a new key on the next read. This is the CHEAP half (projects
+ * only): a cache HIT needs the hash alone, so materializing the item-id set on every read (even a
+ * hit) would defeat what the cache is for (Fable B4 Medium). Null = permissive team (serve the
+ * plain tier row). Throws on a flag-read error (the caller fails closed — 500/no data).
  */
-export interface MemberEnforcement {
-  visibleItemIds: ReadonlySet<string>;
+export interface MemberVisibility {
+  visibleProjectIds: ReadonlySet<string>;
   /** Keys the cache variant; derived ONLY from the sorted effective project set. */
   visibilityHash: string;
 }
 
-export async function memberEnforcement(db: DbClient, principal: Principal): Promise<MemberEnforcement | null> {
+export async function memberVisibility(db: DbClient, principal: Principal): Promise<MemberVisibility | null> {
   if (!(await teamEnforcesAccess(db, principal.teamId))) return null;
   const { projectIds } = await visibleProjects(db, principal);
-  const { ids } = await visibleItemIdsForProjects(db, principal.teamId, projectIds);
   const visibilityHash = createHash("sha256").update([...projectIds].sort().join(",")).digest("hex").slice(0, 16);
-  return { visibleItemIds: ids, visibilityHash };
+  return { visibleProjectIds: projectIds, visibilityHash };
+}
+
+/**
+ * The EXPENSIVE half — the membership-visible item-id set — resolved lazily from a
+ * `MemberVisibility` only when a surface actually BUILDS (cache miss / stale rebuild), never on a
+ * hit. Structured rows gate on their source item (a null-source UI task is handled by `origin`, not
+ * a project lookup — `tasks.project_id` is the INGEST project, not an access-control project).
+ */
+export interface TimelineEnforcement {
+  visibleItemIds: ReadonlySet<string>;
+}
+
+export async function resolveTimelineEnforcement(
+  db: DbClient,
+  teamId: string,
+  vis: MemberVisibility
+): Promise<TimelineEnforcement> {
+  const { ids } = await visibleItemIdsForProjects(db, teamId, vis.visibleProjectIds);
+  return { visibleItemIds: ids };
+}
+
+/**
+ * Convenience for DIRECT build paths (no cache layer to shield — e.g. the >7d timeline expansion):
+ * resolve the full enforcement in one call. Null on a permissive team. The cache layer does NOT
+ * use this — it splits cheap-hash / lazy-items across the hit/miss boundary.
+ */
+export async function memberEnforcement(db: DbClient, principal: Principal): Promise<TimelineEnforcement | null> {
+  const vis = await memberVisibility(db, principal);
+  return vis ? resolveTimelineEnforcement(db, principal.teamId, vis) : null;
 }
