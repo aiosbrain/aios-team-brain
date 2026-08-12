@@ -123,8 +123,9 @@ that test was written to prevent. It is listed as a falsifier in §6 and pinned 
 criterion so that it stays a deliberate cost rather than becoming an accident.
 
 **The accepted cost, stated:** a `null`-threshold leg that fails once and is then never exercised
-again stays quiet in the banner indefinitely. It is not invisible — it is `unconfirmed` on the
-retrieval card and red in the runs table — but it will not shout. That is the deliberate trade: those
+again stays quiet in the banner indefinitely. It is not invisible — it is still `ok:false` on the leg
+and red in Admin → Recent ingestion runs (and, for `llm` alone, `unstable` on the retrieval card) —
+but it will not shout. That is the deliberate trade: those
 legs only run when there is work, so "no second run" carries no information about health, and the
 standing rule in this codebase is that ignorance must not accuse.
 
