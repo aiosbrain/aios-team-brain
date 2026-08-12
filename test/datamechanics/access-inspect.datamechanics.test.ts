@@ -104,13 +104,36 @@ describe("permission inspector — explainItemVisibility (Phase B slice 6)", () 
     await backfillTeamContext(db(), seed.teamId);
     // Put the external member IN the restricting ordinary group (tier-independent by design) → the
     // oracle would grant the project, but the tier conjunct must still deny a team-access item.
-    const { projectId } = await restrictInto(seed, item.id, external);
+    const { projectId, groupId } = await restrictInto(seed, item.id, external);
     await setEnforcement(seed, "enforcing");
+
+    // POSITIVE CONTROL (Codex B6 Low): prove the ORACLE actually grants the project — a TEAM-tier
+    // member added to the SAME group DOES see it. So the external denial below is provably the tier
+    // conjunct, not an oracle/setup miss making the test green for the wrong reason.
+    const teammate = await seedMember(seed);
+    await addMemberToGroup(db(), seed.teamId, groupId, teammate, seed.memberId);
+    const control = await explainItemVisibility(db(), { teamId: seed.teamId, memberId: teammate, itemId: item.id });
+    expect(control.visible, "control: a team-tier member in the same group DOES see it (oracle grants)").toBe(true);
 
     const v = await explainItemVisibility(db(), { teamId: seed.teamId, memberId: external, itemId: item.id });
     expect(v.visible, "the tier conjunct denies external→team even when the oracle grants the project").toBe(false);
     expect(v.reason).toMatch(/tier/i);
     void projectId;
+  });
+
+  it("a NON-PRINCIPAL member (disabled) is NOT visible in permissive mode — the oracle can't catch it there (Codex B6 Medium)", async () => {
+    const seed = await seedTeam();
+    const item = await ingest(seed, { path: "np.md", body: "n", access: "team", project: "src" });
+    const disabled = await seedMember(seed);
+    await db().from("members").update({ status: "disabled" }).eq("id", disabled);
+    await backfillTeamContext(db(), seed.teamId);
+    // Permissive team (default) — a naive tier-only verdict would say visible=true.
+    const v = await explainItemVisibility(db(), { teamId: seed.teamId, memberId: disabled, itemId: item.id });
+    expect(v.mode).toBe("permissive");
+    expect(v.visible, "a disabled member is not an active principal → sees nothing").toBe(false);
+    expect(v.reason).toMatch(/principal/i);
+    // …and the leak check treats every id as a leak for a non-principal.
+    expect(await auditVisibilityAgainstItemIds(db(), { teamId: seed.teamId, memberId: disabled }, [item.id])).toEqual([item.id]);
   });
 
   it("the `visible` verdict AGREES with the FULL enforced read (tier ∧ oracle) in enforcing mode", async () => {

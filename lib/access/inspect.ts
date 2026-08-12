@@ -2,8 +2,15 @@ import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { visibleProjects } from "@/lib/access/oracle";
 import { visibleItemIds, teamEnforcesAccess } from "@/lib/access/enforce";
+import { isPrincipal } from "@/lib/access/eligibility";
 import { canSeeAccess, type ViewerTier } from "@/lib/auth/visibility";
 import { EVERYONE_SLUG, EXTERNAL_SLUG } from "@/lib/access/groups";
+
+/** A substrate read errored — the caller (route) turns this into a 500. A diagnostics tool must
+ *  fail LOUD, never emit a confident wrong verdict from a swallowed error (Codex B6 Medium). */
+function throwOnReadError(error: unknown, what: string): void {
+  if (error) throw new Error(`inspect: ${what} read failed`);
+}
 
 /**
  * The permission inspector (spec §15.6, "build early, not last"). Answers "why can ⟨member⟩ see
@@ -27,6 +34,10 @@ import { EVERYONE_SLUG, EXTERNAL_SLUG } from "@/lib/access/groups";
  * This is a READ-ONLY diagnostic — it writes nothing.
  */
 
+/** How a member holds a group. `singleton` is the §4 "direct person add": the API returns
+ *  `via:"singleton"` + `grant.addedBy` (the admin who added them); the deferred inspector UI renders
+ *  that as "directly added by ⟨admin⟩, not as a group" (§15.6). The presentation is the UI's job —
+ *  this module returns the structured facts. */
 export type MembershipVia = "builtin_tier" | "singleton" | "added";
 export type GroupKind = "everyone" | "external" | "singleton" | "ordinary";
 export type EnforcementMode = "enforcing" | "permissive";
@@ -64,13 +75,23 @@ export async function explainItemVisibility(
 ): Promise<ItemVisibility> {
   const mode: EnforcementMode = (await teamEnforcesAccess(db, teamId)) ? "enforcing" : "permissive";
 
-  const [{ data: member }, { data: item }] = await Promise.all([
-    db.from("members").select("tier").eq("team_id", teamId).eq("id", memberId).maybeSingle(),
+  const [{ data: member, error: memberErr }, { data: item, error: itemErr }] = await Promise.all([
+    db.from("members").select("kind, is_connector, status, tier").eq("team_id", teamId).eq("id", memberId).maybeSingle(),
     db.from("items").select("access").eq("team_id", teamId).eq("id", itemId).maybeSingle(),
   ]);
+  throwOnReadError(memberErr, "member");
+  throwOnReadError(itemErr, "item");
   if (!member) return { itemId, memberId, mode, visible: false, chains: [], reason: "member not found in this team" };
   if (!item) return { itemId, memberId, mode, visible: false, chains: [], reason: "item not found in this team" };
-  const tier = ((member as { tier: string | null }).tier ?? "external") as ViewerTier;
+  const m = member as { kind: string; is_connector: boolean; status: string; tier: string | null };
+
+  // A NON-PRINCIPAL (disabled / connector / invited) cannot read anything — the runtime auth + the
+  // oracle both reject them. In permissive mode there is no oracle to catch it, so gate it here so
+  // the verdict matches reality in BOTH modes (Codex B6 Medium).
+  if (!isPrincipal({ kind: m.kind, is_connector: m.is_connector, status: m.status })) {
+    return { itemId, memberId, mode, visible: false, chains: [], reason: "member is not an active principal (disabled, connector, or non-active)" };
+  }
+  const tier = (m.tier ?? "external") as ViewerTier;
   const tierOk = canSeeAccess(tier, (item as { access: string | null }).access ?? "team");
 
   // THE TIER CONJUNCT — always a factor. A tier miss is a hard no in any mode.
@@ -92,11 +113,7 @@ export async function explainItemVisibility(
     .eq("team_id", teamId)
     .eq("decision", "include")
     .is("valid_to", null);
-  if (unitErr) {
-    // A swallowed read error would produce a confidently-false "not partitioned" answer from a
-    // diagnostics tool whose whole output is that sentence — fail closed with an HONEST reason.
-    return { itemId, memberId, mode, visible: false, chains: [], reason: "access substrate read error — visibility could not be determined" };
-  }
+  throwOnReadError(unitErr, "memberships"); // never a false "not partitioned" from a swallowed error
   type UnitRow = {
     project_id: string;
     method: string;
@@ -134,16 +151,16 @@ export async function explainItemVisibility(
     .eq("team_id", teamId)
     .in("project_id", grantingProjects)
     .in("group_id", [...groupIds]);
-  if (grantErr) {
-    return { itemId, memberId, mode, visible: false, chains: [], reason: "access substrate read error — visibility could not be determined" };
-  }
+  throwOnReadError(grantErr, "grants");
   const grants = (grantRows ?? []) as { project_id: string; group_id: string; added_by: string | null; created_at: string | null }[];
 
   const groupIdsInPlay = [...new Set(grants.map((g) => g.group_id))];
-  const [{ data: groupRows }, { data: gmRows }] = await Promise.all([
+  const [{ data: groupRows, error: groupErr }, { data: gmRows, error: gmErr }] = await Promise.all([
     db.from("groups").select("id, slug, name, is_builtin, person_member_id").eq("team_id", teamId).in("id", groupIdsInPlay.length ? groupIdsInPlay : ["-"]),
     db.from("group_members").select("group_id, added_by, created_at").eq("team_id", teamId).eq("member_id", memberId).in("group_id", groupIdsInPlay.length ? groupIdsInPlay : ["-"]),
   ]);
+  throwOnReadError(groupErr, "groups");
+  throwOnReadError(gmErr, "group_members"); // a chain the tool cannot build must 500, not render empty
   const groupById = new Map(((groupRows ?? []) as { id: string; slug: string; name: string; is_builtin: boolean; person_member_id: string | null }[]).map((g) => [g.id, g]));
   const gmByGroup = new Map(((gmRows ?? []) as { group_id: string; added_by: string | null; created_at: string | null }[]).map((r) => [r.group_id, r]));
 
@@ -184,11 +201,18 @@ export async function auditVisibilityAgainstItemIds(
   const ids = [...new Set(itemIds)];
   const enforcing = await teamEnforcesAccess(db, teamId);
 
-  const [{ data: member }, { data: itemRows }] = await Promise.all([
-    db.from("members").select("tier").eq("team_id", teamId).eq("id", memberId).maybeSingle(),
+  const [{ data: member, error: memberErr }, { data: itemRows, error: itemErr }] = await Promise.all([
+    db.from("members").select("kind, is_connector, status, tier").eq("team_id", teamId).eq("id", memberId).maybeSingle(),
     db.from("items").select("id, access").eq("team_id", teamId).in("id", ids),
   ]);
-  const tier = ((member as { tier: string | null } | null)?.tier ?? "external") as ViewerTier;
+  // Throw (→ route 500) on a substrate error rather than returning a wrong leak list: over-reporting
+  // false leaks OR under-reporting real ones both violate "every reported leak is real" (Codex B6 Medium).
+  throwOnReadError(memberErr, "member");
+  throwOnReadError(itemErr, "items");
+  const m = member as { kind: string; is_connector: boolean; status: string; tier: string | null } | null;
+  // A non-principal (disabled/connector/invited) may see NOTHING — every id is a leak (Codex B6 Medium).
+  if (!m || !isPrincipal({ kind: m.kind, is_connector: m.is_connector, status: m.status })) return ids;
+  const tier = (m.tier ?? "external") as ViewerTier;
   const accessById = new Map(((itemRows ?? []) as { id: string; access: string | null }[]).map((r) => [r.id, r.access ?? "team"]));
   const oracleVisible = enforcing ? (await visibleItemIds(db, { teamId, memberId })).ids : null;
 
