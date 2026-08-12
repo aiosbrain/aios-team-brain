@@ -185,3 +185,20 @@ export function wantsSmallModel(body: unknown): boolean {
     return false;
   }
 }
+
+/**
+ * Stages that only run AFTER entity resolution has completed for an episode.
+ *
+ * The graphiti pipeline is ordered `extract_nodes` → `dedupe_nodes` (`resolve_extracted_nodes`) →
+ * `extract_edges` → `dedupe_edges`. The 2026-07 outage — the one the extraction-health probe exists
+ * for — was `Output length exceeded max tokens 8192` raised INSIDE `resolve_extracted_nodes`, so a
+ * failing job emits the early stages and never reaches these two.
+ *
+ * That matters because a truncated call is still METERED: the proxy deliberately records `usage`
+ * whatever the HTTP status (`lib/llm/graph-proxy.meterGraphCall`, so billed non-2xx generations stop
+ * being invisible spend), and a `finish_reason:"length"` body is a 200 carrying usage. So "there is a
+ * recent `source='graph'` row" does NOT mean "extraction succeeded" — but "there is a recent
+ * LATE-stage row" means the job got past the stage that fails. Used by
+ * `lib/graph/extraction-health.extractorActivity` as its liveness evidence.
+ */
+export const LATE_STAGE_GRAPH_CALL_KINDS: readonly string[] = ["extract_edges", "dedupe_edges"];

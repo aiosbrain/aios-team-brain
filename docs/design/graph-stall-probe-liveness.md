@@ -68,16 +68,35 @@ Pulse — which reads as corroboration rather than as one signal counted twice.
 **Judge liveness from the extractor's own ledger, not from the graph's novelty.**
 
 `llm_usage` already records every graph LLM call with `source='graph'` and (since GRAPHCOST-5) a
-`call_kind`. A successful metered call *after* the newest projected episode is direct, positive
-evidence that the extractor ran on current work — it cannot be faked by deduplication, and it is a
-Postgres read, so it works even when Neo4j is unreadable.
+`call_kind`. A LATE-STAGE call *after* the newest projected episode is direct, positive evidence that
+the extractor ran on current work — deduplication cannot fake it, and it is a Postgres read, so it
+works even when Neo4j is unreadable.
+
+**Corrected during the Fable round — the first draft of this spec was wrong.** It claimed a bare
+`source='graph'` row proves a call succeeded, on the reasoning that failures go to `llm_failures`.
+They do not, all of them: `meterGraphCall` (`lib/llm/graph-proxy`) deliberately records whatever
+`usage` arrives **whatever the HTTP status** — that is how billed non-2xx generations stopped being
+invisible spend (47% of the bill, measured 2026-07-30) — and a truncated extraction is a **200
+carrying usage** with `finish_reason:"length"`. So the original predicate would have been blinded by
+the exact 2026-07 outage this probe exists for (`Output length exceeded max tokens 8192` raised
+inside `resolve_extracted_nodes`): every failing job would have refreshed the ledger while creating
+zero facts. A false negative on the flagship failure is worse than the false positive being fixed.
+
+The evidence is therefore narrowed to `LATE_STAGE_GRAPH_CALL_KINDS` (`extract_edges`, `dedupe_edges`).
+The pipeline runs `extract_nodes` → `dedupe_nodes` → `extract_edges` → `dedupe_edges` and the
+truncation fails at stage 2, so a stage-3/4 row proves the job cleared the stage that breaks. Healthy
+prod emits them ~1:1 with `extract_nodes`, so the narrowing costs no sensitivity. A pre-GRAPHCOST-5
+row (`call_kind = ''`) can never vouch — it cannot be shown to be a late stage, and the probe must
+not accept "maybe".
 
 Revised predicate:
 
 1. **Never extracted** (`facts === 0` over the episode floor) → still a stall. Unchanged; this is the
    original 2026-07 failure and novelty/liveness agree there.
-2. **Extractor demonstrably ran** — ≥1 successful `source='graph'` `llm_usage` row newer than the
-   newest projected episode, within the lag budget → **NOT stalled**, regardless of fact age.
+2. **Extractor demonstrably ran** — ≥1 LATE-STAGE `source='graph'` `llm_usage` row within
+   `EXTRACTION_LAG_BUDGET_MS` of the newest projected episode → **NOT stalled**, regardless of fact
+   age. Grace-bounded rather than strictly newer: extraction starts ~60s AFTER projection, so a strict
+   compare re-creates the same red banner for a window on every single run.
 3. **No recent extractor activity at all** AND facts are lagging past the budget → stall. This keeps
    the 2026-07-28 quota failure (the case the lag check was added for) loud: a dead extractor writes
    no `llm_usage` rows either.

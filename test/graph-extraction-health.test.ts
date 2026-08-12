@@ -254,3 +254,55 @@ describe("deriveGraphExtractionStalled — liveness overrides novelty", () => {
     expect(deriveGraphExtractionStalled({ ...fresh, extractor: { readable: true, newestAtMs: null } })).toBe(false);
   });
 });
+
+/**
+ * WIRING + BOUNDARY gaps found by the Fable round (STALLPROBE-1).
+ *
+ * The predicate tests above construct their own `extractor`, and the dm tests call `extractorActivity`
+ * directly — so deleting the probe from `getGraphExtractionHealth`'s `Promise.all` left every test
+ * green while silently reverting to pre-fix behaviour. That is the "pin the call site, not just the
+ * function" class, and it is exactly how a fix disappears in a later refactor.
+ */
+describe("STALLPROBE-1 wiring + boundaries", () => {
+  const N = MIN_EPISODES_FOR_EXTRACTION_SIGNAL;
+  const EPISODE_AT = Date.parse("2026-08-12T00:15:02Z");
+
+  it("getGraphExtractionHealth actually THREADS the ledger probe into the verdict", async () => {
+    // A source-level pin: the composition can't be exercised in the dm tier (getGraphExtractionHealth
+    // early-returns when neo4jConfigured() is false and that tier has no Neo4j), so assert the wire
+    // exists. Both halves are required — the call AND passing its result into the signals object.
+    const src = await import("node:fs").then((fs) =>
+      fs.readFileSync(new URL("../lib/graph/extraction-health.ts", import.meta.url), "utf8")
+    );
+    const body = src.slice(src.indexOf("export async function getGraphExtractionHealth"));
+    expect(body).toMatch(/extractorActivity\(teamId\)/);
+    expect(body).toMatch(/\n\s*extractor,\n/);
+  });
+
+  it("the liveness clear is INCLUSIVE at the grace boundary, exclusive one ms before", () => {
+    // Pins `>=` against a silent flip to `>`; ties are reachable when both stamps land the same ms.
+    const base = {
+      episodes: N * 10,
+      facts: 113_352,
+      newestEpisodeAtMs: EPISODE_AT,
+      newestFactAtMs: EPISODE_AT - (EXTRACTION_LAG_BUDGET_MS + 3_600_000),
+    };
+    const edge = EPISODE_AT - EXTRACTION_LAG_BUDGET_MS;
+    expect(deriveGraphExtractionStalled({ ...base, extractor: { readable: true, newestAtMs: edge } })).toBe(false);
+    expect(deriveGraphExtractionStalled({ ...base, extractor: { readable: true, newestAtMs: edge - 1 } })).toBe(true);
+  });
+
+  it("an unreadable ledger still does NOT suppress the zero-facts stall", () => {
+    // The spec criterion that had no test: hoisting the `readable:false` check above `facts === 0`
+    // would keep every other assertion green while letting a broken install read healthy.
+    expect(
+      deriveGraphExtractionStalled({
+        episodes: N * 10,
+        facts: 0,
+        newestEpisodeAtMs: EPISODE_AT,
+        newestFactAtMs: null,
+        extractor: { readable: false, newestAtMs: null },
+      })
+    ).toBe(true);
+  });
+});

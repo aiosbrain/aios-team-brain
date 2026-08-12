@@ -1,6 +1,7 @@
 import "server-only";
 import { runSql } from "@/lib/db/pg/pool";
 import { neo4jConfigured, runRead } from "./neo4j";
+import { LATE_STAGE_GRAPH_CALL_KINDS } from "@/lib/llm/graph-call-kind";
 
 /**
  * Graphiti EXTRACTION health — the one graph failure mode the existing signals miss.
@@ -134,7 +135,17 @@ export function deriveGraphExtractionStalled(input: ExtractionSignals): boolean 
   // Ran at or after the newest episode → it has processed current work; the frozen clock is novelty,
   // not death. `null` newestAtMs means the ledger is readable and genuinely EMPTY — no extractor
   // activity at all — which, with facts lagging, is the real outage this check exists for.
-  if (extractor !== null && extractor.newestAtMs !== null && extractor.newestAtMs >= newestEpisode) {
+  // GRACE-BOUNDED, not `>= newestEpisode`. Extraction starts ~60s AFTER projection, so a strict
+  // compare leaves a window on every single run where the newest episode has landed, its extraction
+  // has not yet been metered, and a dedup-frozen graph reads stalled — the same red banner, just
+  // briefer. Facts get a 6h budget; the ledger gets the same one. (These two stamps are also not the
+  // same clock — `projected_at` is app-side `new Date()`, `created_at` is Postgres `now()` — so a
+  // strict compare was additionally exposed to NTP skew.)
+  if (
+    extractor !== null &&
+    extractor.newestAtMs !== null &&
+    extractor.newestAtMs >= newestEpisode - EXTRACTION_LAG_BUDGET_MS
+  ) {
     return false;
   }
   return true;
@@ -219,23 +230,40 @@ export async function newestEpisodeAtMs(teamId: string): Promise<number | null> 
 }
 
 /**
- * When the extractor last SUCCEEDED, from its own spend ledger (STALLPROBE-1).
+ * When the extractor last got PAST ENTITY RESOLUTION, from its own spend ledger (STALLPROBE-1).
  *
- * `llm_usage` rows are written only AFTER a call returns (`lib/costs/llm-usage.recordLlmUsage`);
- * billed-but-failed attempts go to `llm_failures` instead. So a row here means an extraction LLM call
- * actually completed — the one liveness signal deduplication cannot suppress.
+ * ⚠️ A `source='graph'` row does NOT by itself mean a call succeeded, and an earlier draft of this
+ * probe claimed it did. `meterGraphCall` (`lib/llm/graph-proxy`) deliberately records whatever `usage`
+ * comes back **whatever the HTTP status** — that is how billed non-2xx generations stopped being
+ * invisible spend (47% of the bill, measured 2026-07-30). A truncated extraction is a **200 carrying
+ * usage** with `finish_reason:"length"`, so it writes a perfectly ordinary `llm_usage` row while
+ * creating zero facts. Vouching on "any graph row" would therefore have blinded this probe to the
+ * exact 2026-07 outage it exists for (`Output length exceeded max tokens 8192` inside
+ * `resolve_extracted_nodes`) — a false negative on the flagship failure.
  *
- * Returns `readable:false` on a read error rather than a null timestamp, because "the query failed"
- * and "the extractor has done nothing" must not collapse into one value: the first is ignorance, the
- * second is the outage. Bounded to a window so an ancient row can't vouch for a dead extractor
- * forever — the caller only compares it against the newest episode anyway.
+ * So the evidence is narrowed to LATE-STAGE kinds (`LATE_STAGE_GRAPH_CALL_KINDS`): the pipeline runs
+ * `extract_nodes` → `dedupe_nodes` → `extract_edges` → `dedupe_edges`, and the truncation fails at
+ * stage 2. A row from stage 3 or 4 proves the job cleared the stage that breaks. Healthy prod emits
+ * them ~1:1 with `extract_nodes`, so this costs no sensitivity.
+ *
+ * Rows predating GRAPHCOST-5 carry `call_kind = ''` and can never vouch — correct, not a gap: an
+ * unlabelled row cannot be shown to be a late stage, and this probe must not accept "maybe".
+ *
+ * `readable:false` on a read error, never a null timestamp: "the query failed" and "the extractor did
+ * nothing" must not collapse into one value — the first is ignorance, the second is the outage.
+ *
+ * NO wall-clock window. Bounding to `now() - 30 days` would re-import the very bug the lag budget was
+ * designed around (`EXTRACTION_LAG_BUDGET_MS`): a team quiet for two months has a legitimately old
+ * last-extraction, and filtering it away would report `null` → stall, while the reason string claimed
+ * "episodes are still being projected". The caller only ever compares this against the newest EPISODE,
+ * so an old timestamp can only vouch when the episode is equally old — which is the correct verdict.
  */
 export async function extractorActivity(teamId: string): Promise<ExtractorActivity> {
   try {
     const res = await runSql<{ at: string | null }>(
       `select max(created_at)::text as at from llm_usage
-        where team_id = $1 and source = 'graph' and created_at > now() - interval '30 days'`,
-      [teamId]
+        where team_id = $1 and source = 'graph' and call_kind = any($2::text[])`,
+      [teamId, [...LATE_STAGE_GRAPH_CALL_KINDS]]
     );
     return { readable: true, newestAtMs: parseProbeTimestamp(res.rows[0]?.at ?? null) };
   } catch {

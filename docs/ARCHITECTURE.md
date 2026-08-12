@@ -779,9 +779,14 @@ guard enforces it, it's named.
   produced "accepting episodes but extracting 0 facts" one minute after a clean pipeline run, beside the
   same card's census reporting 2,928 NEW entities, and (because the same boolean feeds the synthetic leg)
   rendered as two independent-looking failures. Lag now only accuses when the extractor's OWN spend
-  ledger agrees: `extractorActivity` reads the newest successful `source='graph'` `llm_usage` row (rows
-  are written only after a call succeeds; billed failures go to `llm_failures`), and a row at/after the
-  newest episode clears the stall. `readable:false` (query failed) is deliberately NOT the same value as
+  ledger agrees: `extractorActivity` reads the newest LATE-STAGE `source='graph'` `llm_usage` row
+  (`extract_edges`/`dedupe_edges`), and one within the lag budget of the newest episode clears the
+  stall. **Late-stage specifically, because a bare graph row proves nothing:** `meterGraphCall` records
+  whatever `usage` arrives whatever the HTTP status (so billed non-2xx generations aren't invisible
+  spend), and a truncated extraction is a 200 carrying usage — accepting any row would have blinded the
+  probe to the 2026-07 `Output length exceeded` outage it exists for. The pipeline runs `extract_nodes`
+  → `dedupe_nodes` → `extract_edges` → `dedupe_edges` and that truncation fails at stage 2, so a
+  stage-3/4 row proves the job cleared the failing stage. `readable:false` (query failed) is deliberately NOT the same value as
   an empty ledger — ignorance never accuses, proven silence does — and `facts === 0` still outranks
   liveness, so a busy-but-useless extractor stays loud. Fact-lag remains observational on the card.
   **Root fix — raise the cap (not shrink episodes).** The extractor's output cap is graphiti_core's
