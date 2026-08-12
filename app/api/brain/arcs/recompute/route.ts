@@ -7,9 +7,10 @@ import { errorResponse } from "@/lib/api/schemas";
 import { resolveAnsweringKeys } from "@/lib/query/answering";
 import { visibleGroupIds } from "@/lib/graph/group";
 import { recomputeArcs } from "@/lib/graph/arcs";
-import { freshnessWire } from "@/lib/freshness";
+import { freshnessWire, computedNow } from "@/lib/freshness";
 import { memberEnforcement } from "@/lib/access/enforce";
 import { filterArcsByVisibleItems } from "@/lib/graph/arc-visibility";
+import { readArcCache } from "@/lib/graph/arc-cache";
 
 export const runtime = "nodejs";
 export const maxDuration = 120; // arc synthesis (LLM) inline path can take up to ~110s on a cold cache
@@ -59,35 +60,49 @@ export async function POST(req: NextRequest) {
   if (tier !== "team") return errorResponse("forbidden", "corrections are team-tier only", 403);
 
   const admin = adminClient();
-  const keys = await resolveAnsweringKeys(admin, team.id);
-  const { arcs: allArcs, freshness } = await recomputeArcs(
-    admin,
-    team.id,
-    teamSlug,
-    tier,
-    visibleGroupIds(teamSlug, tier),
-    corrections,
-    keys,
-    memberId
-  );
+  const groups = visibleGroupIds(teamSlug, tier);
 
-  // Access enforcement (Phase B slice 5, spec §5.8): this route returns the recomputed TIER arc set,
-  // so — exactly like GET-style `POST /api/brain/arcs` — it must drop arcs the member can't see, or it
-  // is an unfiltered bypass of the enforced arc read (this route is team-tier-gated, NOT admin-gated;
-  // Fable B5 High). Same primitive, same fail-closed on a substrate error (→ 500). NOTE (deferred,
-  // integrity not confidentiality): an attenuated member can still WRITE a correction — in practice
-  // they only hold `arc_id`s for arcs they received (already filtered), so this is a replay-only edge;
-  // gating the correction WRITE by visibility is a separate Phase-C-adjacent question.
+  // Access enforcement (Phase B slice 5, spec §5.8). Resolve the member's visibility ONCE, fail
+  // closed on a substrate error (→ 500), and use it for BOTH gates below.
   let enforce: { visibleItemIds: ReadonlySet<string> } | null;
   try {
     enforce = await memberEnforcement(admin, { teamId: team.id, memberId });
   } catch {
     return errorResponse("internal", "enforcement check failed", 500);
   }
+
+  // WRITE gate (Codex B5 High — correction poisoning): recomputeArcs WRITES each correction to
+  // `arc_corrections` AND projects it into the shared team Graphiti group, then feeds every future
+  // team-tier synthesis. The schema accepts ANY `arc_id`, so without this an attenuated member could
+  // inject arbitrary/invisible corrections and poison the SHARED synthesis (not a replay-only edge as
+  // an earlier fold wrongly claimed). Under enforcing, a member may only correct an arc they can
+  // currently SEE: validate every target against the VISIBLE cached arc set BEFORE the write — read
+  // the cache (no synthesis; a cold cache has nothing to correct → reject). An `arc_id` that churned
+  // since their GET no longer matches → rejected, they re-fetch (fail closed beats poisonable).
+  if (enforce) {
+    const groupKey = groups.slice().sort().join(",");
+    const cached = await readArcCache(admin, team.id, groupKey);
+    const visibleIds = new Set(filterArcsByVisibleItems(cached?.arcs ?? [], enforce.visibleItemIds).map((a) => a.id));
+    if (corrections.some((c) => !visibleIds.has(c.arc_id))) {
+      return errorResponse("forbidden", "a correction targets an arc outside your visibility", 403);
+    }
+  }
+
+  const keys = await resolveAnsweringKeys(admin, team.id);
+  const { arcs: allArcs, freshness } = await recomputeArcs(admin, team.id, teamSlug, tier, groups, corrections, keys, memberId);
+
+  // READ gate: drop arcs the member can't see — this route returns the recomputed TIER set, so
+  // without the filter it is an unfiltered bypass of the enforced arc read (Fable B5 High).
   const arcs = filterArcsByVisibleItems(allArcs, enforce?.visibleItemIds ?? null);
 
   // WAS `new Date()`. A recompute can legitimately return arcs it did NOT compute: `canReuseArcs` skips
   // the model when facts are unchanged, and a degraded synthesis is refused in favour of the prior (H11).
   // Stamping "now" told the user their correction had landed in a fresh set when it may not have.
-  return Response.json({ arcs, ...freshnessWire(freshness) });
+  // §5.7: when an enforcing member's result is EMPTY, neutralize the freshness envelope — the tier
+  // cache's `as_of`/`stale`/`degraded` would otherwise leak hidden-corpus refresh/failure activity
+  // (Codex B5 Medium), letting them distinguish "team has nothing" from "everything is invisible".
+  const wire = freshnessWire(freshness);
+  const enforcingEmpty = enforce != null && arcs.length === 0;
+  // Neutral envelope via `computedNow` on enforcing-empty (§5.7) — not an inline `new Date()`.
+  return Response.json(enforcingEmpty ? { arcs, ...freshnessWire(computedNow()) } : { arcs, ...wire });
 }

@@ -12,7 +12,7 @@ import { memberEnforcement } from "@/lib/access/enforce";
 import { filterArcsByVisibleItems } from "@/lib/graph/arc-visibility";
 import { getLlmHealth } from "@/lib/query/llm-health";
 import { graphHasFacts } from "@/lib/query/retrieval-health";
-import { freshnessWire } from "@/lib/freshness";
+import { freshnessWire, computedNow } from "@/lib/freshness";
 
 export const runtime = "nodejs";
 // Arc synthesis with a reasoning model can be slow (it reasons over ~200 facts). Give the inline
@@ -74,9 +74,14 @@ export async function POST(req: NextRequest) {
   //   • no facts in the graph        → the projector hasn't populated it (graph/projector issue)
   //   • facts exist + LLM degraded   → the answering/reasoning model is failing (empty/timeout)
   //   • facts exist + LLM ok         → synthesis produced nothing this time (usually transient)
+  // §5.7 (Codex B5 High): the diagnostic below reads TEAM-WIDE graph/LLM health (`graphHasFacts`
+  // counts every episode, unscoped), so on an ENFORCING team it would tell a partitioned member
+  // "no_facts" when the team graph is truly empty but "synthesis_empty" when only INVISIBLE facts
+  // exist — disclosing that restricted content is in flight. So compute it ONLY on a permissive team
+  // (no partition to leak); an enforcing member's empty result stays a neutral empty.
   let reason: EmptyReason = null;
   let note: string | undefined;
-  if (arcs.length === 0) {
+  if (arcs.length === 0 && enforce == null) {
     const [hasFacts, llm] = await Promise.all([graphHasFacts(team.id), getLlmHealth(team.id)]);
     if (!hasFacts) {
       reason = "no_facts";
@@ -99,6 +104,16 @@ export async function POST(req: NextRequest) {
   // and shouldn't see the config), keeping only the coarse `reason` category. Team tier still gets the
   // actionable note.
   const wire = freshnessWire(freshness);
+  // §5.7 (Codex B5 Medium): when an ENFORCING member's result is empty, the tier cache's
+  // `as_of`/`stale`/`degraded` would leak hidden-corpus refresh/failure activity (they reflect the
+  // full-tier synthesis, not the member's empty slice). Return a neutral envelope so "team has
+  // nothing" and "everything is invisible" are indistinguishable. Permissive → byte-identical.
+  if (enforce != null && arcs.length === 0) {
+    // Neutral envelope via the freshness layer (`computedNow` — not an inline `new Date()`, which the
+    // fabricated-freshness guard rightly forbids): an empty result has no cached data whose staleness
+    // to report, and stamping the tier row's real time is the §5.7 leak.
+    return Response.json({ arcs, reason: null, note: undefined, ...freshnessWire(computedNow()) });
+  }
   return Response.json({
     arcs,
     // `degraded` is the ENVELOPE's now (R2/M6): "a leg this payload depended on failed". It subsumes the

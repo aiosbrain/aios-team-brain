@@ -103,6 +103,28 @@ describe("enforced arc reads (Phase B slice 5)", () => {
     expect(titles, "any restricted evidence entry drops the whole arc").not.toContain("arc mixed");
   });
 
+  it("enforcing: the correction WRITE gate — a restricted arc's id is NOT in the member's visible-arc set, so a correction targeting it is rejected (Codex B5 High poisoning gate)", async () => {
+    const { readArcCache } = await import("@/lib/graph/arc-cache");
+    const seed = await seedTeam();
+    const openItem = await ingest(seed, { path: "ok.md", body: "ok", access: "team", project: "src" });
+    const secretItem = await ingest(seed, { path: "no.md", body: "no", access: "team", project: "src" });
+    const outsider = await seedMember(seed);
+    await backfillTeamContext(db(), seed.teamId);
+    await restrictItem(seed, secretItem.id);
+    await setEnforcement(seed, "enforcing");
+    await seedArcCache(seed, [arc("visible", [openItem.id]), arc("restricted", [secretItem.id])]);
+
+    // Reproduce the recompute route's gate: read the CACHED arcs, filter to the member's visible set,
+    // collect the ids they may correct.
+    const groupKey = visibleGroupIds(seed.teamSlug, "team").slice().sort().join(",");
+    const cached = await readArcCache(db(), seed.teamId, groupKey);
+    const enforce = await memberEnforcement(db(), { teamId: seed.teamId, memberId: outsider });
+    const visibleIds = new Set(filterArcsByVisibleItems(cached?.arcs ?? [], enforce!.visibleItemIds).map((a) => a.id));
+    expect([...visibleIds], "the member may correct the arc they can see").toEqual(["visible"]);
+    expect(visibleIds.has("restricted"), "a correction targeting the restricted arc would be rejected").toBe(false);
+    expect(visibleIds.has("nonexistent-fabricated-id"), "an arbitrary fabricated id is rejected too").toBe(false);
+  });
+
   it("enforcing: an arc with no linkable evidence item fails closed (dropped) even for the admin", async () => {
     const seed = await seedTeam();
     const item = await ingest(seed, { path: "a.md", body: "a", access: "team", project: "src" });
