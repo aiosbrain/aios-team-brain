@@ -29,7 +29,7 @@ export async function GET(req: NextRequest) {
   if (!team) return errorResponse("forbidden", "not a member of this team", 403);
   const { data: me } = await rls
     .from("members")
-    .select("tier")
+    .select("id, tier")
     .eq("team_id", team.id)
     .eq("auth_user_id", user.id)
     .eq("status", "active")
@@ -37,7 +37,8 @@ export async function GET(req: NextRequest) {
   if (!me) return errorResponse("forbidden", "not a member of this team", 403);
 
   const tier = (me as { tier: "team" | "external" }).tier;
-  const { days, freshness } = await getCachedWorkTimeline(adminClient(), team.id, tier);
+  // §5.8: the session member is the principal — an enforcing team serves their visibility variant.
+  const { days, freshness } = await getCachedWorkTimeline(adminClient(), team.id, tier, (me as { id: string }).id);
   const people = mostRecentPerPerson(days);
   // WAS `new Date()` over a 5-min-TTL cache that also serves PAST the TTL while rebuilding — so this
   // reported a stale ledger as current. Now the cache row's own time (R2/M6).

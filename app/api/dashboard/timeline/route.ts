@@ -5,6 +5,7 @@ import { getSessionUser } from "@/lib/auth/session";
 import { errorResponse } from "@/lib/api/schemas";
 import { getCachedWorkTimeline } from "@/lib/dashboard/timeline-cache";
 import { getWorkTimeline, WINDOW_DAYS, MAX_WINDOW_DAYS } from "@/lib/dashboard/work-timeline";
+import { memberEnforcement } from "@/lib/access/enforce";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -36,7 +37,7 @@ export async function GET(req: NextRequest) {
   if (!team) return errorResponse("forbidden", "not a member of this team", 403);
   const { data: me } = await rls
     .from("members")
-    .select("tier")
+    .select("id, tier")
     .eq("team_id", team.id)
     .eq("auth_user_id", user.id)
     .eq("status", "active")
@@ -44,13 +45,16 @@ export async function GET(req: NextRequest) {
   if (!me) return errorResponse("forbidden", "not a member of this team", 403);
 
   const tier = (me as { tier: "team" | "external" }).tier;
+  const memberId = (me as { id: string }).id;
   // Both branches must yield a bare `TimelineDay[]`: the cached one now returns `{ days, freshness }`, and
   // the two arms only have to AGREE for `Response.json` (typed `any`) to accept a nested shape silently.
   // Note `Number(null) === 0`, so a request with no `days` param clamps to 7 and takes the cached arm —
   // i.e. the default request is the one that would have broken.
+  // §5.8: BOTH arms carry the member's enforcement — the fresh-build arm resolves it explicitly
+  // (it bypasses the cache layer, so the cache layer's resolution can't cover it).
   const timeline =
     days <= WINDOW_DAYS
-      ? (await getCachedWorkTimeline(adminClient(), team.id, tier)).days
-      : await getWorkTimeline(adminClient(), team.id, tier, days);
+      ? (await getCachedWorkTimeline(adminClient(), team.id, tier, memberId)).days
+      : await getWorkTimeline(adminClient(), team.id, tier, days, await memberEnforcement(adminClient(), { teamId: team.id, memberId }));
   return Response.json({ days: timeline, window_days: days });
 }

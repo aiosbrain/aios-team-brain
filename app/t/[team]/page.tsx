@@ -248,7 +248,7 @@ export default async function TeamHome({
             </p>
           }
         >
-          <TimelinePanel teamId={team.id} teamSlug={teamSlug} tier={tier} />
+          <TimelinePanel teamId={team.id} teamSlug={teamSlug} tier={tier} memberId={memberId} />
         </Suspense>
       </Section>
 

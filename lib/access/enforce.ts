@@ -1,4 +1,5 @@
 import "server-only";
+import { createHash } from "node:crypto";
 import type { DbClient } from "@/lib/db/types";
 import { visibleProjects, effectiveVisibleProjects, type Principal } from "@/lib/access/oracle";
 
@@ -10,11 +11,12 @@ import { visibleProjects, effectiveVisibleProjects, type Principal } from "@/lib
  *   'permissive' (default) — this module contributes NOTHING; the read is byte-identical to today.
  *   'enforcing'            — the caller intersects its item set with `visibleItemIds(...)`.
  *
- * SCOPE (through Phase B slice 3): `GET /api/v1/items` (member AND agent keys), the retrieval
- * path (`lib/query/retrieve.ts` → both query routes) for member keys under 'enforcing', and
- * delegated `aiosd_*` query (ALWAYS attenuated — see `delegatedVisibleItemIds`). Timeline, arcs,
- * and the dashboard surfaces are NOT yet enforced — an operator flipping the flag must know that;
- * those are later Phase B slices.
+ * SCOPE (through Phase B slice 4): `GET /api/v1/items` (member AND agent keys), the retrieval
+ * path (`lib/query/retrieve.ts` → both query routes) for member keys under 'enforcing', delegated
+ * `aiosd_*` query (ALWAYS attenuated — see `delegatedVisibleItemIds`), and the work-timeline read
+ * path (§5.8 visibility-variant cache — see `memberEnforcement` + `lib/dashboard/timeline-cache`).
+ * Arcs and the remaining dashboard surfaces are NOT yet enforced — an operator flipping the flag
+ * must know that; those are later Phase B slices.
  *
  * Only flip a team to 'enforcing' once its §11 backfill is complete — an un-partitioned item has no
  * membership and would fail closed (vanish). The flag is the fail-open-to-today transition control.
@@ -35,6 +37,12 @@ export async function teamEnforcesAccess(db: DbClient, teamId: string): Promise<
 export interface VisibleItemIds {
   ids: Set<string>;
   empty: boolean;
+  /** True when `empty` is the result of a READ ERROR, not a genuinely-empty membership set. A
+   *  per-request caller (the items route) treats both as "serve nothing" — self-heals next request.
+   *  A CACHING caller (the timeline, §5.8) MUST distinguish: persisting an error-derived empty as a
+   *  fresh shared variant hides every row for all members on that hash for a TTL (Codex B4 Medium).
+   *  `resolveTimelineEnforcement` throws on this so the build aborts without writing. */
+  error?: boolean;
 }
 
 /**
@@ -68,7 +76,7 @@ export async function visibleItemIdsForProjects(
     .eq("decision", "include")
     .is("valid_to", null)
     .in("project_id", [...projectIds]);
-  if (error) return { ids: new Set(), empty: true }; // fail closed on read error
+  if (error) return { ids: new Set(), empty: true, error: true }; // fail closed on read error (flagged: see `error`)
 
   const ids = new Set<string>();
   for (const row of (data ?? []) as { project_context_units: { source_item_id: string | null; state: string; unit_kind: string } | null }[]) {
@@ -98,4 +106,61 @@ export async function delegatedVisibleItemIds(
 ): Promise<VisibleItemIds> {
   const projects = await effectiveVisibleProjects(db, token);
   return visibleItemIdsForProjects(db, token.teamId, projects);
+}
+
+/**
+ * A member's VISIBILITY for CACHED/derived surfaces (Phase B slice 4, spec §5.8): the effective
+ * project set + the hash that KEYS the cache variant — sha256 of the SORTED post-attenuation
+ * effective-project set, so two members with identical group signatures share one cache row and a
+ * group change moves the member to a new key on the next read. This is the CHEAP half (projects
+ * only): a cache HIT needs the hash alone, so materializing the item-id set on every read (even a
+ * hit) would defeat what the cache is for (Fable B4 Medium). Null = permissive team (serve the
+ * plain tier row). Throws on a flag-read error (the caller fails closed — 500/no data).
+ */
+export interface MemberVisibility {
+  visibleProjectIds: ReadonlySet<string>;
+  /** Keys the cache variant; derived ONLY from the sorted effective project set. */
+  visibilityHash: string;
+}
+
+export async function memberVisibility(db: DbClient, principal: Principal): Promise<MemberVisibility | null> {
+  if (!(await teamEnforcesAccess(db, principal.teamId))) return null;
+  const { projectIds } = await visibleProjects(db, principal);
+  const visibilityHash = createHash("sha256").update([...projectIds].sort().join(",")).digest("hex").slice(0, 16);
+  return { visibleProjectIds: projectIds, visibilityHash };
+}
+
+/**
+ * The EXPENSIVE half — the membership-visible item-id set — resolved lazily from a
+ * `MemberVisibility` only when a surface actually BUILDS (cache miss / stale rebuild), never on a
+ * hit. Structured rows gate on their source item (a null-source UI task is handled by `origin`, not
+ * a project lookup — `tasks.project_id` is the INGEST project, not an access-control project).
+ */
+export interface TimelineEnforcement {
+  visibleItemIds: ReadonlySet<string>;
+}
+
+export async function resolveTimelineEnforcement(
+  db: DbClient,
+  teamId: string,
+  vis: MemberVisibility
+): Promise<TimelineEnforcement> {
+  const { ids, error } = await visibleItemIdsForProjects(db, teamId, vis.visibleProjectIds);
+  // THROW on a substrate read error rather than build from a spuriously-empty set (Codex B4
+  // Medium): the timeline CACHES its build under a shared visibility hash, so an error-derived
+  // empty would hide every item-derived row for all members on that hash until the next rebuild.
+  // The caller (cold-miss build → 500; background rebuild → caught, no write) fails closed WITHOUT
+  // caching. A genuinely-empty membership set (no error) still builds + caches a real empty ledger.
+  if (error) throw new Error("access substrate read failed while resolving timeline enforcement");
+  return { visibleItemIds: ids };
+}
+
+/**
+ * Convenience for DIRECT build paths (no cache layer to shield — e.g. the >7d timeline expansion):
+ * resolve the full enforcement in one call. Null on a permissive team. The cache layer does NOT
+ * use this — it splits cheap-hash / lazy-items across the hit/miss boundary.
+ */
+export async function memberEnforcement(db: DbClient, principal: Principal): Promise<TimelineEnforcement | null> {
+  const vis = await memberVisibility(db, principal);
+  return vis ? resolveTimelineEnforcement(db, principal.teamId, vis) : null;
 }
