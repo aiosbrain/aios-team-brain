@@ -78,7 +78,7 @@ not in the loud banner.
 | classification | when | surface |
 |---|---|---|
 | `ok` | newest run succeeded | green |
-| `unconfirmed` | newest run failed and the run before it succeeded — **including when there is no earlier run at all** (a leg's first-ever run failing) | **quiet** — the retrieval card's leg and the runs table, never the loud banner |
+| `unconfirmed` | newest run failed and the run before it succeeded — **including when there is no earlier run at all** (a leg's first-ever run failing) | **quiet** — Admin → Recent ingestion runs (and, for `llm` only, its retrieval-card leg), never the loud banner |
 | `confirmed` | the newest run failed and so did the one before it (streak ≥ 2) | **loud** — the banner, exactly as today |
 
 `stale` is untouched and remains loud on its own, independently of classification: it answers a
@@ -159,7 +159,7 @@ confirmation test, so classification and duration come from one read and cannot 
 - Team scoping is unchanged: `team_id = $1 or team_id is null` for pipeline legs, `team_id = $1` for
   `llm`. But the streak **partitions by `(source, team_id)`**, with the instance-wide `NULL` its own
   partition — a source-level streak would mix two different populations. This is not hypothetical:
-  `access_bootstrap` writes a per-team `ok=false` row AND an instance-wide row on every tick
+  `access_bootstrap` writes a per-team `ok=false` row for each team that failed, plus an unconditional instance-wide heartbeat row every tick
   (`lib/ingest/scheduler.ts:258-280`), so a team's genuine failure streak would be broken by global
   heartbeat rows that say nothing about that team. The codebase has been bitten here before —
   `context_backfill_all` exists as a separate source precisely because a global row masked per-team
@@ -260,7 +260,7 @@ call sites (`app/t/[team]/page.tsx:186`).
 - `test/pipeline-failure-confirmation.test.ts` — a leg whose newest run FAILED and whose previous run SUCCEEDED classifies `unconfirmed` and is ABSENT from `failing`, at any age — the reported false positive, and the case a time-based escalation would have re-broken.
 - `test/pipeline-failure-confirmation.test.ts` — two consecutive failed runs classify `confirmed` and appear in `failing`, however recent.
 - `test/pipeline-failure-confirmation.test.ts` — a leg whose ONLY run ever is a failure classifies `unconfirmed`, not `confirmed` — the first-run case the classification table must cover explicitly.
-- `test/pipeline-failure-confirmation.test.ts` — `failingSince` is the OLDEST run of a streak of THREE OR MORE, not the second-oldest and not the newest, and is null when the leg is not confirmed-failing. A streak of exactly two cannot distinguish those, so the fixture must be longer.
+- `test/pipeline-failure-confirmation.test.ts` — `failingSince` is the OLDEST run of a streak of THREE OR MORE, not the second-oldest and not the newest, and is null when the leg is NOT FAILING AT ALL — note it is populated for an `unconfirmed` lone failure too, which is deliberate (a stale-and-unconfirmed leg reaching the banner should still show a real instant) and is what the implementation does. A streak of exactly two cannot distinguish oldest from second-oldest, so the fixture must be longer.
 - `test/pipeline-failure-confirmation.test.ts` — a `stale` leg is loud regardless of classification, INCLUDING when its newest run succeeded — staleness is an independent signal this fix must not swallow.
 - `test/pipeline-health-graph-extract-leg.test.ts` — the synthetic `graph_extract` leg (no runs, `at: ""`) is in `failing` whenever the extraction detector says so, proving it bypasses classification rather than being silently dropped, and carries `failingSince: null` rather than a fabricated instant.
 - `test/pipeline-failure-confirmation.test.ts` — the streak partitions by `(source, team_id)`: an instance-wide `NULL`-team row interleaved between two team-scoped failures does NOT break that team's streak. Without this, `access_bootstrap`'s every-tick global row silently un-confirms a real per-team outage.
@@ -299,6 +299,13 @@ yields `degraded`; under this spec that becomes `unstable`.
   `distinct on`. Fixing that changes which legs are loud, for a reason unrelated to flapping.
 - **Alert email throttling.** `lib/ingest/pipeline-alert` composes the dismissal signature; whether a
   confirmed failure should also mail is untouched.
+- **`ingest_runs` retention / a bounded streak window.** The streak query sorts the team's whole
+  history. Measured 2026-08-12: 12,661 rows, ~299/day, nothing prunes the table, 32ms today after the
+  grouped-pass rewrite (the lateral form it replaced was 44ms and O(sources × history)). Since the
+  query lives inside `catch { return empty }`, the failure mode of letting this grow is a permanently
+  green banner — so it needs a real answer, but the answer is retention or a window with a deliberate
+  rule for legs whose newest row falls outside it, not a clamp bolted onto this slice. Review raised
+  the trajectory; the quadratic factor is fixed here and the linear one is filed.
 - **Any change to `stale` or `STALE_MS_BY_SOURCE`.** Different signal, different ticket — and §3a
   depends on that signal being left exactly as it is.
 

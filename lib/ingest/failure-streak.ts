@@ -79,8 +79,11 @@ export interface StreakRow {
  * Exported and pure because the SQL that feeds it is the part that cannot be unit-tested, and this is
  * the part that decides the verdict. Callers MUST pass rows for a single `(source, team_id)`
  * partition, newest first — see `pipeline-health` for why the partition is not just `source`:
- * `access_bootstrap` writes a per-team failure row AND an instance-wide row on every tick, so a
- * source-level streak is broken by global heartbeat rows that say nothing about that team.
+ * `access_bootstrap` writes a per-team failure row for each team that failed, plus an unconditional
+ * instance-wide heartbeat row every tick (`lib/ingest/scheduler.ts`), so a source-level streak is
+ * broken by global heartbeats that say nothing about that team. (Only the heartbeat is every-tick —
+ * an earlier draft of this comment said both were, which the repo's own grep-before-claiming rule
+ * exists to catch.)
  *
  * An empty input is `ok` with no streak: "nothing has ever run" is not a failure, and the surfaces
  * that care about never-ran already say so through other signals.

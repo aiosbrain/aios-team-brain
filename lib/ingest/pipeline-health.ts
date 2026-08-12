@@ -126,7 +126,9 @@ export interface PipelineHealth {
   legs: PipelineLeg[];
   /**
    * Legs the loud banner names: a CONFIRMED failure or a stale poller. A lone unconfirmed failure is
-   * deliberately absent — it stays visible on the retrieval card and in the runs table. `stale` is
+   * deliberately absent — it is still `ok:false` on the leg and listed in Admin → Recent
+   * ingestion runs. (NOT on the retrieval-health card: that card has no per-ingestion-source leg —
+   * only `llm` has one there. An earlier draft of this comment claimed otherwise.) `stale` is
    * independent of the classification and still loud on its own, including on a leg whose newest run
    * succeeded, because it answers a different question ("is the poller still ticking").
    */
@@ -155,12 +157,25 @@ type Row = {
  *
  * WHY THE PARTITION IS `(source, team_id)` AND NOT `source`. The outer scope is `team_id = $1 or
  * team_id is null`, and at least one source writes BOTH: `access_bootstrap` records a per-team
- * `ok=false` row and an instance-wide row on every tick (`lib/ingest/scheduler.ts`). A source-level
+ * `ok=false` row for each FAILING team, plus an unconditional instance-wide heartbeat every tick (`lib/ingest/scheduler.ts`). A source-level
  * streak is therefore broken by global heartbeat rows that say nothing about this team's health.
  * The codebase has been bitten by the same mixing before — `context_backfill_all` exists as its own
  * source precisely because a global row masked per-team rows under `distinct on`. Found in spec review.
  * The leg is then taken from the partition holding the newest row, which preserves today's "the newest
  * row is the leg's state" semantics exactly.
+ *
+ * ONE GROUPED PASS FOR THE STREAK, not a lateral subquery. The first version re-scanned the whole
+ * `scoped` CTE once per source: measured against prod (12,661 rows, ~299 new rows/day, and nothing in
+ * this repo prunes `ingest_runs`) that was 17 loops x 12,661 rows ≈ 215k row visits for a 44ms query —
+ * O(sources × history) on a table that only grows. It runs on EVERY admin Home + Integrations render
+ * and sits inside `catch { return empty }`, so the end state of that trajectory is not a slow page: it
+ * is a banner that silently reports healthy forever, which is the alarm-death this whole family of
+ * tickets exists to prevent. Review flagged the shape. The grouped form is one pass (measured 32ms on
+ * the same data), changes no behaviour, and needs no time-window clamp — a clamp would have made a leg
+ * whose newest row fell outside the window vanish from `legs` entirely, trading a performance problem
+ * for a correctness one. What remains and is NOT solved here: `scoped` still sorts the team's whole
+ * history, so retention (or a bounded window with a deliberate answer for old legs) is a real
+ * follow-up, recorded in the spec rather than left implicit.
  *
  * `ok_after` counts successes at-or-newer than each row; the current streak is the failures with none.
  * Ordering is `finished_at desc, id desc` — two runs can share a millisecond (a fast fail then a retry
@@ -183,6 +198,17 @@ const STREAK_SQL = `
       from ingest_runs
      where team_id = $1 or team_id is null
   ),
+  streaks as (
+    -- ONE grouped pass, deliberately NOT a lateral subquery. See the note above the constant for the
+    -- measurement; the short version is that the lateral form re-scanned the whole scoped CTE once
+    -- per source, which is O(sources x history) on a table that only grows.
+    -- (No backticks in here: this is inside a JS template literal, and one of them terminated the
+    -- string. tsc caught it; worth the reminder since SQL comments read like prose.)
+    select source, team_id, count(*)::int as streak_length, min(finished_at) as failing_since
+      from scoped
+     where not ok and ok_after = 0
+     group by source, team_id
+  ),
   newest as (
     select distinct on (source) source, team_id, ok, errors, finished_at
       from scoped where rn = 1
@@ -192,13 +218,9 @@ const STREAK_SQL = `
          coalesce(s.streak_length, 0) as streak_length,
          s.failing_since
     from newest n
-    left join lateral (
-      select count(*)::int as streak_length, min(finished_at) as failing_since
-        from scoped c
-       where c.source = n.source
-         and c.team_id is not distinct from n.team_id
-         and not c.ok and c.ok_after = 0
-    ) s on true`;
+    left join streaks s
+      on s.source = n.source
+     and s.team_id is not distinct from n.team_id`;
 
 function firstError(errors: unknown): string | null {
   const arr = Array.isArray(errors)
@@ -268,12 +290,16 @@ export async function getPipelineHealth(teamId: string): Promise<PipelineHealth>
       // not aged at all — consistent with this file's standing "never cry wolf" bias.
       const clock = beatAt === null ? at : beatAt.get(r.source);
       const stale = threshold !== null && clock !== undefined && now - Date.parse(clock) > threshold;
-      // BANNERFLAP-1. `streak_length` is the current unbroken failure run ending at this newest row;
-      // `Number(...) || 0` because pg returns bigint-ish counts as strings through some drivers and a
-      // NaN here would silently classify every failure as unconfirmed — i.e. silence the banner.
+      // BANNERFLAP-1. `streak_length` is the current unbroken failure run ending at this newest row.
+      // The coercion is DEFENSIVE, not a driver workaround — an earlier comment here claimed the
+      // latter and was wrong: `count(*)::int` is int4, which node-postgres already returns as a
+      // number, and `lib/db/pg/pool` overrides the date parsers so timestamps arrive as strings.
+      // What it is really for is the direction of the failure: any non-number would fall to 0 →
+      // `unconfirmed` → a silenced banner, so the fallback is written explicitly rather than left to
+      // `|| 0`, and the zero is what a missing streak legitimately means.
       const failureClass = classifyFailure({
         ok: r.ok,
-        streakLength: Number(r.streak_length) || 0,
+        streakLength: Number.isFinite(Number(r.streak_length)) ? Number(r.streak_length) : 0,
         failingSince: r.failing_since === null ? null : iso(r.failing_since),
       });
       return {
@@ -320,8 +346,9 @@ export async function getPipelineHealth(teamId: string): Promise<PipelineHealth>
     // orphaned connector (integration deleted/disabled), whose frozen last-failure isn't a live break.
     // `stale` is deliberately OR'd, not gated on the classification: it answers "is the poller still
     // ticking", so a leg whose newest run SUCCEEDED but whose scheduler went quiet must stay loud.
-    // A lone `unconfirmed` failure is absent from here by design — it is still on the retrieval card
-    // and in the runs table, just not in a banner that says the brain isn't getting fresh data.
+    // A lone `unconfirmed` failure is absent from here by design — it is still `ok:false` on the leg
+    // and listed in Admin → Recent ingestion runs, just not in a banner that says the brain isn't
+    // getting fresh data. (Only `llm` also has a retrieval-health-card leg; the others do not.)
     const failing = legs.filter(
       (l) => (l.failureClass === "confirmed" || l.stale) && !isOrphanedConnector(l.source, enabledTypes)
     );

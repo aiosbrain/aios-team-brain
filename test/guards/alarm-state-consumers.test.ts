@@ -32,9 +32,15 @@ describe("guard: the LLM leg renders `unstable` honestly", () => {
     // The mechanism, not the outcome: a Record over the union cannot be written incompletely, so
     // adding a state is a compile error rather than a silent fall-through. Pinned because a later
     // "simplification" back to a ternary would reopen the hole with every test still green.
-    expect(src, `${CARD} must map LlmHealthState through a Record so tsc enforces exhaustiveness`)
-      .toMatch(/Record<LlmHealthState,/);
-    const map = src.slice(src.indexOf("Record<LlmHealthState,"));
+    // Anchored on the DECLARATION, not the bare type name. Both reviewers caught this independently:
+    // the card's own explanatory comment contains the literal `Record<LlmHealthState, …>`, and a
+    // bare `indexOf` matched THAT — so swapping the real annotation for an untyped object literal
+    // while leaving the prose intact left this guard green with the compile-time mechanism gone.
+    // A guard satisfiable by a comment about the guard is the purest form of vacuous.
+    const DECL = "const LLM_LEG_STATE: Record<LlmHealthState,";
+    expect(src, `${CARD} must map LlmHealthState through a typed Record so tsc enforces exhaustiveness`)
+      .toContain(DECL);
+    const map = src.slice(src.indexOf(DECL));
     const body = map.slice(0, map.indexOf("}") + 1);
     for (const state of ["healthy", "unstable", "degraded", "unknown"]) {
       expect(body, `the state map is missing \`${state}\``).toContain(`${state}:`);
@@ -43,7 +49,7 @@ describe("guard: the LLM leg renders `unstable` honestly", () => {
 
   it("does not render `unstable` as the grey off-leg", () => {
     const src = read(CARD);
-    const map = src.slice(src.indexOf("Record<LlmHealthState,"));
+    const map = src.slice(src.indexOf("const LLM_LEG_STATE: Record<LlmHealthState,"));
     const body = map.slice(0, map.indexOf("}") + 1);
     // The specific regression: `unstable: "off"` would restore the grey dot the chain produced.
     expect(body).not.toMatch(/unstable:\s*"off"/);

@@ -184,7 +184,7 @@ export function RetrievalHealthCard({ health }: { health: RetrievalHealth }) {
       : llm.state === "degraded"
         ? `${llm.lastModel ?? "model"} returned no output${llm.lastFailedAt ? ` · ${timeAgo(llm.lastFailedAt)}` : ""}`
         : llm.state === "unstable"
-          ? `${llm.lastModel ?? "model"} failed once${llm.lastFailedAt ? ` ${timeAgo(llm.lastFailedAt)}` : ""} and has not failed since — not treated as an outage`
+          ? `${llm.lastModel ?? "model"} failed once${llm.lastFailedAt ? ` ${timeAgo(llm.lastFailedAt)}` : ""} and has not recurred yet — not treated as an outage`
           : "no recent activity recorded";
 
   return (
