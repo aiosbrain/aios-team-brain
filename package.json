@@ -39,6 +39,8 @@
     "db:test:down": "docker compose -f compose.test.yml down -v",
     "test:datamechanics": "vitest run --config vitest.datamechanics.config.ts",
     "test:datamechanics:local": "DATABASE_TEST_URL=postgres://app:app@localhost:5434/app_test vitest run --config vitest.datamechanics.config.ts",
+    "test:datamechanics:iso": "bash scripts/dm-isolated.sh",
+    "db:test:iso:down": "bash scripts/dm-isolated.sh --down",
     "test:http": "vitest run --config vitest.http.config.ts",
     "test:http:gateway-approval": "AIOS_GATEWAY_INTERNAL_ENABLED=true vitest run --config vitest.http.config.ts gateway-approval-enabled",
     "test:gateway-contracts": "vitest run test/gateway/gateway-contracts.test.ts",
