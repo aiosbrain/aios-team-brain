@@ -1,6 +1,7 @@
 import "server-only";
 import { runSql } from "@/lib/db/pg/pool";
 import { getGraphExtractionHealth, GRAPH_HEALTH_SOURCE } from "@/lib/graph/extraction-health";
+import { classifyFailure, type FailureClass } from "@/lib/ingest/failure-streak";
 
 /**
  * Aggregate ingestion-pipeline health for a LOUD admin surface. Every pipeline leg (slack/plane/
@@ -106,16 +107,98 @@ export interface PipelineLeg {
   error: string | null;
   at: string; // finished_at ISO
   stale: boolean; // ran before, but not recently
+  /**
+   * Is the failure standing evidence, or one sample (BANNERFLAP-1)? `ok` when the newest run
+   * succeeded; `unconfirmed` for a lone failure — real and shown, but not loud; `confirmed` once the
+   * streak reaches `FAILURES_TO_CONFIRM`. The synthetic `graph_extract` leg is `confirmed` by
+   * construction: it has no runs to streak and is already debounced by its own detector.
+   */
+  failureClass: FailureClass;
+  /**
+   * The OLDEST failure in the current unbroken streak — what "failing since" must actually render.
+   * Null when the leg is not failing, and null for `graph_extract`, which is not a point-in-time
+   * failure and must not be given a fabricated instant.
+   */
+  failingSince: string | null;
 }
 
 export interface PipelineHealth {
   legs: PipelineLeg[];
-  /** Legs that failed (latest run ok=false) or went stale — what the loud banner names. */
+  /**
+   * Legs the loud banner names: a CONFIRMED failure or a stale poller. A lone unconfirmed failure is
+   * deliberately absent — it stays visible on the retrieval card and in the runs table. `stale` is
+   * independent of the classification and still loud on its own, including on a leg whose newest run
+   * succeeded, because it answers a different question ("is the poller still ticking").
+   */
   failing: PipelineLeg[];
   healthy: boolean;
 }
 
-type Row = { source: string; ok: boolean; errors: unknown; finished_at: string | Date };
+type Row = {
+  source: string;
+  ok: boolean;
+  errors: unknown;
+  finished_at: string | Date;
+  streak_length: number | string;
+  failing_since: string | Date | null;
+};
+
+/**
+ * Newest run per source, PLUS its current failure streak — one query, so the verdict and the duration
+ * cannot disagree (BANNERFLAP-1).
+ *
+ * WHY A WINDOW FUNCTION AND NOT `distinct on`. `distinct on (source)` structurally returns one row per
+ * source, which is exactly the single-sample read this slice exists to replace. The streak needs every
+ * failure back to the last success, and it needs the OLDEST of them — a bounded two-row window cannot
+ * express that (the graph projector 422'ing for weeks is ~144 rows at a 30m cadence, and two rows
+ * would report "failing for 30 minutes" about a three-day outage).
+ *
+ * WHY THE PARTITION IS `(source, team_id)` AND NOT `source`. The outer scope is `team_id = $1 or
+ * team_id is null`, and at least one source writes BOTH: `access_bootstrap` records a per-team
+ * `ok=false` row and an instance-wide row on every tick (`lib/ingest/scheduler.ts`). A source-level
+ * streak is therefore broken by global heartbeat rows that say nothing about this team's health.
+ * The codebase has been bitten by the same mixing before — `context_backfill_all` exists as its own
+ * source precisely because a global row masked per-team rows under `distinct on`. Found in spec review.
+ * The leg is then taken from the partition holding the newest row, which preserves today's "the newest
+ * row is the leg's state" semantics exactly.
+ *
+ * `ok_after` counts successes at-or-newer than each row; the current streak is the failures with none.
+ * Ordering is `finished_at desc, id desc` — two runs can share a millisecond (a fast fail then a retry
+ * in the same tick), and `id` is the bigserial PK, so the most-recently-inserted wins deterministically.
+ * `llm-health` already documented this tie-break; the pipeline query did NOT have it, so it is new here.
+ * Runs of ANY trigger count, matching today's verdict read — only the STALENESS clock is
+ * scheduler-only, and a scheduler-only streak would return zero rows for `llm` (all `trigger: 'api'`).
+ */
+const STREAK_SQL = `
+  with scoped as (
+    select id, source, team_id, ok, errors, finished_at,
+           sum(case when ok then 1 else 0 end) over (
+             partition by source, team_id
+             order by finished_at desc, id desc
+             rows between unbounded preceding and current row
+           ) as ok_after,
+           row_number() over (
+             partition by source, team_id order by finished_at desc, id desc
+           ) as rn
+      from ingest_runs
+     where team_id = $1 or team_id is null
+  ),
+  newest as (
+    select distinct on (source) source, team_id, ok, errors, finished_at
+      from scoped where rn = 1
+     order by source, finished_at desc, id desc
+  )
+  select n.source, n.ok, n.errors, n.finished_at,
+         coalesce(s.streak_length, 0) as streak_length,
+         s.failing_since
+    from newest n
+    left join lateral (
+      select count(*)::int as streak_length, min(finished_at) as failing_since
+        from scoped c
+       where c.source = n.source
+         and c.team_id is not distinct from n.team_id
+         and not c.ok and c.ok_after = 0
+    ) s on true`;
 
 function firstError(errors: unknown): string | null {
   const arr = Array.isArray(errors)
@@ -142,13 +225,7 @@ export async function getPipelineHealth(teamId: string): Promise<PipelineHealth>
     // the team's currently-enabled integration types, so a connector leg whose integration was
     // deleted/disabled (its last run frozen as a failure) is suppressed instead of crying wolf.
     const [res, beats, extraction, enabled] = await Promise.all([
-      runSql<Row>(
-        `select distinct on (source) source, ok, errors, finished_at
-           from ingest_runs
-          where team_id = $1 or team_id is null
-          order by source, finished_at desc`,
-        [teamId]
-      ),
+      runSql<Row>(STREAK_SQL, [teamId]),
       // The POLLER heartbeat, deliberately separate from the newest-row-of-any-trigger above.
       // Staleness answers "is the scheduler still ticking", and only a `scheduler` row is evidence of
       // that. A leg that is ALSO runnable on demand — `meeting_notes` now runs on every `aios push`
@@ -191,7 +268,23 @@ export async function getPipelineHealth(teamId: string): Promise<PipelineHealth>
       // not aged at all — consistent with this file's standing "never cry wolf" bias.
       const clock = beatAt === null ? at : beatAt.get(r.source);
       const stale = threshold !== null && clock !== undefined && now - Date.parse(clock) > threshold;
-      return { source: r.source, ok: r.ok, error: r.ok ? null : firstError(r.errors), at, stale };
+      // BANNERFLAP-1. `streak_length` is the current unbroken failure run ending at this newest row;
+      // `Number(...) || 0` because pg returns bigint-ish counts as strings through some drivers and a
+      // NaN here would silently classify every failure as unconfirmed — i.e. silence the banner.
+      const failureClass = classifyFailure({
+        ok: r.ok,
+        streakLength: Number(r.streak_length) || 0,
+        failingSince: r.failing_since === null ? null : iso(r.failing_since),
+      });
+      return {
+        source: r.source,
+        ok: r.ok,
+        error: r.ok ? null : firstError(r.errors),
+        at,
+        stale,
+        failureClass,
+        failingSince: r.ok || r.failing_since === null ? null : iso(r.failing_since),
+      };
     });
 
     // Synthetic leg for the ONE failure ingest_runs structurally can't see: the projector records
@@ -209,12 +302,29 @@ export async function getPipelineHealth(teamId: string): Promise<PipelineHealth>
         error: extraction.reason,
         at: "", // not a point-in-time failure — the banner shows the cause, not a "since" time
         stale: false,
+        // EXEMPT FROM CONFIRMATION, deliberately (BANNERFLAP-1). This leg has NO `ingest_runs` rows —
+        // it is synthesised from a Neo4j/ledger probe — so it can never accumulate a streak, and
+        // `Date.parse("")` is NaN. Run through the classifier uniformly it would be `unconfirmed`
+        // FOREVER and drop out of the loud banner silently, with every other test in this slice still
+        // green. Spec review caught that. It needs no second debounce anyway: its own detector already
+        // requires a 6h lag budget / an episode floor / a census sample floor before it says anything.
+        failureClass: "confirmed",
+        // Null, not a fabricated instant. The extraction lag boundary and the newest-episode time are
+        // both to hand and both would be a made-up "since" for a condition that is explicitly not a
+        // point-in-time failure. An admitted unknown beats a number that reads as a measurement.
+        failingSince: null,
       });
     }
 
-    // A leg is "failing" if its latest run failed or it went stale — EXCEPT an orphaned connector
-    // (integration deleted/disabled), whose frozen last-failure isn't a live break to alert on.
-    const failing = legs.filter((l) => (!l.ok || l.stale) && !isOrphanedConnector(l.source, enabledTypes));
+    // A leg is loud when its failure is CONFIRMED (streak ≥ 2) or its poller went stale — EXCEPT an
+    // orphaned connector (integration deleted/disabled), whose frozen last-failure isn't a live break.
+    // `stale` is deliberately OR'd, not gated on the classification: it answers "is the poller still
+    // ticking", so a leg whose newest run SUCCEEDED but whose scheduler went quiet must stay loud.
+    // A lone `unconfirmed` failure is absent from here by design — it is still on the retrieval card
+    // and in the runs table, just not in a banner that says the brain isn't getting fresh data.
+    const failing = legs.filter(
+      (l) => (l.failureClass === "confirmed" || l.stale) && !isOrphanedConnector(l.source, enabledTypes)
+    );
     return { legs, failing, healthy: failing.length === 0 };
   } catch {
     return empty;

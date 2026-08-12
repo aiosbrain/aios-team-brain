@@ -4,6 +4,7 @@ import type {
   LegState,
   GroupCensusSummary,
 } from "@/lib/query/retrieval-health";
+import type { LlmHealthState } from "@/lib/query/llm-health";
 import { timeAgo } from "@/components/format";
 
 /**
@@ -161,15 +162,30 @@ export function RetrievalHealthCard({ health }: { health: RetrievalHealth }) {
   // Answering-model leg: map the LLM health state onto the shared leg vocabulary (unknown → the grey
   // "off" dot, since nothing's been recorded yet). This is the leg that was missing when a reasoning
   // model silently blanked Learning.
+  //
+  // A `Record` OVER THE UNION, not a ternary chain, since BANNERFLAP-1 (spec §3d). The chain this
+  // replaces read `healthy ? … : degraded ? … : "off"`, so the new `unstable` state fell through to a
+  // GREY dot captioned "no recent activity recorded" — a false statement about a leg that had just
+  // failed, and one `tsc` was perfectly happy with. A `Record<LlmHealthState, …>` cannot be written
+  // incompletely: adding a member to the union is a compile error here, which is the enforcement a
+  // text-matching guard could never give (a future `state !== "healthy"` derived boolean slips past a
+  // grep). Amber for `unstable` — visible and quiet, which is the whole point of the state.
   const llm = health.llm;
-  const llmLeg: DenseState | LegState =
-    llm.state === "healthy" ? "healthy" : llm.state === "degraded" ? "degraded" : "off";
+  const LLM_LEG_STATE: Record<LlmHealthState, DenseState | LegState> = {
+    healthy: "healthy",
+    unstable: "building", // amber: something failed once and has not recurred
+    degraded: "degraded",
+    unknown: "off",
+  };
+  const llmLeg: DenseState | LegState = LLM_LEG_STATE[llm.state];
   const llmDetail =
     llm.state === "healthy"
       ? `${llm.lastModel ?? "model"}${llm.lastOkAt ? ` · last ok ${timeAgo(llm.lastOkAt)}` : ""}`
       : llm.state === "degraded"
         ? `${llm.lastModel ?? "model"} returned no output${llm.lastFailedAt ? ` · ${timeAgo(llm.lastFailedAt)}` : ""}`
-        : "no recent activity recorded";
+        : llm.state === "unstable"
+          ? `${llm.lastModel ?? "model"} failed once${llm.lastFailedAt ? ` ${timeAgo(llm.lastFailedAt)}` : ""} and has not failed since — not treated as an outage`
+          : "no recent activity recorded";
 
   return (
     <div className="prism-card flex flex-col gap-1 p-4">
