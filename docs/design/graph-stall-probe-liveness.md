@@ -137,7 +137,7 @@ but never the accuser. "Shown" is stated as a requirement rather than an aspirat
 implementation of this section dropped fact-lag from the verdict, kept fetching it, and rendered it
 nowhere: a promise in a spec with no surface behind it.
 
-### 3d. Both halves of the lag must be scoped THE SAME WAY
+### 3d. Both halves of the lag must count THE SAME EPISODES
 
 `newestEpisodeAtMs` is team-scoped (`where team_id = $1`). The liveness read must therefore be scoped
 to that team's ledger `group_id`s, or the subtraction compares two different populations: the first
@@ -146,6 +146,21 @@ one team, ANY other team completing a job refreshed this team's clock and its de
 green forever. That is strictly worse than the fact-scope asymmetry it replaced, which needed the
 other group to produce a genuinely NOVEL fact — rare, by this document's own §1 argument. Found by
 both reviewers independently.
+
+Group is only one of the two axes, and the second was missed until a fourth review round: scoping by
+group alone still counted `correction:<arc_id>` episodes, which `lib/graph/arcs.ts` POSTs directly to
+Graphiti in the **same team group** with **no `graph_episodes` row**. The denominator counts ledger
+rows; the numerator was counting ledger rows plus arc writebacks. Concretely: item extraction is dead,
+an admin recomputes an arc that carries a human correction, the correction episode completes, and the
+clock goes fresh — the alarm stays silent for the full budget, mid-outage. So the liveness read also
+filters on `ITEM_EPISODE_PREFIX`, a **positive** match on the projector's own naming constant rather
+than a `correction:` denylist, so the next non-ledger episode kind is excluded by default instead of
+requiring someone to remember a new rule.
+
+No performance claim is made for either filter. An earlier draft of this section said the global form
+was "a label scan"; review corrected it — graphiti creates both `episode_group_id` and
+`created_at_episodic_index` on `Episodic` (`graph_queries.py:65`, `:75`), so both forms are
+index-supported. The scoping is for correctness.
 
 `countGraphFacts` stays deliberately global: "has the extractor ever produced anything at all" is an
 install-level question that no team owns, and rescoping it is a different change.
@@ -192,6 +207,7 @@ new API route, no new table, no change to `visibleItems`/`visibleTasks`/`visible
 - `test/graph-extraction-health.test.ts` — a `null` episodic timestamp never manufactures a stall, and never suppresses the `facts === 0` case.
 - `test/graph-extraction-health.test.ts` — `extractionStallCause` returns `never-extracted` only when `facts === 0`, and `stopped` otherwise, so no surface can claim "0 facts" about a liveness stall.
 - `test/graph-extraction-health.test.ts` — `extractionStallReason("stopped", …)` contains no "0 facts" claim and degrades to "for some time" on a null `lagHours` rather than printing "nullh".
+- `test/graph-extraction-health.test.ts` — the liveness query filters on `ITEM_EPISODE_PREFIX`, sharing one constant with the projector's `episodeName`, so an arc-correction writeback (`correction:<arc_id>`, no ledger row) cannot refresh the clock.
 - `test/datamechanics/graph-extraction-scope.datamechanics.test.ts` — real Postgres: `teamEpisodeGroupIds` returns only THIS team's groups and excludes groups that hold nothing but `''`-sentinel rows; `countProjectedEpisodes` excludes sentinel rows, so redaction tombstones cannot help clear `MIN_EPISODES_FOR_EXTRACTION_SIGNAL`.
 - `test/guards/extraction-stall-callsites.test.ts` — a build-failing guard: EVERY `deriveGraphExtractionStalled(` call site in every tree `tsconfig` typechecks (`lib/`, `app/`, `components/`, `scripts/`) passes `newestEpisodicAtMs`. This exists because the second call site was missed once already.
 - `docs/ARCHITECTURE.md` — the graph-extraction row states that liveness is episode-node-derived and team-scoped, that fact-lag is observational and rendered, records the accepted zero-yield blind spot, and records why the two ledger designs were rejected.

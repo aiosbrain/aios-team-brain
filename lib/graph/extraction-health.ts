@@ -1,5 +1,6 @@
 import "server-only";
 import { runSql } from "@/lib/db/pg/pool";
+import { ITEM_EPISODE_PREFIX } from "./episode-name";
 import { neo4jConfigured, runRead } from "./neo4j";
 
 /**
@@ -44,14 +45,25 @@ import { neo4jConfigured, runRead } from "./neo4j";
  *     dedup-frozen graph, which is the false positive this slice exists to remove. The trade is
  *     deliberate (a false alarm on every mature graph, every quiet night, vs. a blind spot on a
  *     failure mode never yet observed here) and it is written down rather than shipped silently.
- *   • SCOPE. Both halves of the lag are now TEAM-scoped — `newestEpisodeAtMs` by `team_id`,
- *     `newestEpisodicAtMs` by that team's ledger `group_id`s — so another team's healthy extraction
- *     can no longer mask this one's. It could before: the first draft of the liveness leg read
- *     `max(Episodic.created_at)` globally, and ANY completed job anywhere refreshed the clock, which
- *     is strictly denser masking than the fact-lag asymmetry it replaced (that one needed the other
- *     group to produce a genuinely NOVEL fact — rare, per this file's own premise). Found by review.
+ *   • SCOPE — fixed in two dimensions, both by review, both the same mistake: the two halves of the
+ *     lag must describe ONE population, because they are subtracted. `newestEpisodeAtMs` counts
+ *     `graph_episodes` rows for a team; `newestEpisodicAtMs` now matches that on BOTH axes — the
+ *     team's ledger `group_id`s (a global read let another team's healthy job mask this one's) and
+ *     ledger-backed item episodes only (a group-scoped read still counted `correction:<arc_id>`
+ *     writebacks, which `lib/graph/arcs.ts` POSTs into the same group with no ledger row, so a human
+ *     arc correction completing would have silenced this alarm mid-outage).
  *     `facts`/`countGraphFacts` REMAINS global and deliberately un-scoped: "has the extractor ever
  *     produced anything at all" is an install-level question, and scoping it is not this slice's.
+ *     WHAT THE SCOPING DOES NOT FIX, so the bullet above stops short of claiming it: a team whose
+ *     groups hold ZERO episode nodes reads `max() = null` ⇒ "can't tell" ⇒ green, and on a
+ *     MULTI-TEAM install another team's facts keep the global `facts === 0` branch quiet too. So a
+ *     brand-new team whose extraction has never once succeeded is silent on both halves — the very
+ *     "202 accepted, nothing processed" shape this probe was built for. It is NOT a regression (the
+ *     pre-scoping global read was equally green there, masked by the other team's clock), it is
+ *     backstopped on the card by the census `predicate-suspect` refusal, and on the single-team
+ *     install this product actually ships as, `facts === 0` fires normally. Closing it properly means
+ *     distinguishing "read fine, found nothing" from "could not read" — a discriminated return, not a
+ *     nullable one — and per-team fact counts; both are their own slice (STALLSCOPE-1).
  *   • A missing/unparseable timestamp disarms the recency half silently — safe, but invisible.
  *   • Detection lags by the budget (6h) by construction.
  *
@@ -285,19 +297,34 @@ export async function newestEpisodeAtMs(teamId: string): Promise<number | null> 
  * managed transaction (`utils/bulk_utils.py:136-146`, `session.execute_write`), so a failure part-way
  * through rolls the episode node back with everything else.
  *
- * SCOPED BY GROUP, unlike `countGraphFacts` and `newestFactAtMs` — and that difference is the point,
- * not an inconsistency. This value is compared against the TEAM-scoped `newestEpisodeAtMs`, so a
- * global read makes the two halves of one subtraction describe different populations: any other
- * team's healthy job refreshes the clock and this team's dead extractor reads green forever. Review
- * caught that in the first draft. The global fact reads stay global because they answer a different,
- * install-level question ("has the extractor ever produced anything at all"), which no team owns.
+ * SCOPED TO THE SAME POPULATION AS `newestEpisodeAtMs`, unlike `countGraphFacts` and
+ * `newestFactAtMs` — and that difference is the point, not an inconsistency. This value is
+ * SUBTRACTED FROM `newestEpisodeAtMs`, so anything the two halves disagree about becomes a wrong
+ * verdict. It took two review rounds to get the population right, and both misses were the same
+ * mistake in different dimensions:
+ *
+ *   • GROUP. The first draft read `MATCH (e:Episodic)` across the whole database while its
+ *     counterpart is team-scoped, so on a multi-team instance ANY other team's completed job
+ *     refreshed this team's clock and its dead extractor read green forever.
+ *   • KIND. Scoping by group alone was still wrong: `lib/graph/arcs.ts` POSTs `correction:<arc_id>`
+ *     episodes into the SAME team group with no `graph_episodes` row behind them, so a human arc
+ *     correction completing would refresh a clock whose other half counts only ledger rows. An admin
+ *     fixing an arc would have silenced this alarm for the whole budget, mid-outage. Hence the
+ *     `ITEM_EPISODE_PREFIX` filter: only ledger-backed item episodes count, which is exactly what
+ *     `newestEpisodeAtMs` measures. A positive prefix match rather than a `correction:` denylist, so
+ *     a future non-ledger episode kind is excluded by default instead of needing a new rule.
+ *
+ * The global fact reads stay global because they answer a different, install-level question ("has
+ * the extractor ever produced anything at all"), which no team owns.
  *
  * Still a pure health probe: one `max()` aggregation, returning a timestamp and never a name, a body
- * or a `group_id` — no content leaves the graph. Cheaper than the global form it replaces, too:
- * graphiti creates `CREATE INDEX episode_group_id … FOR (n:Episodic) ON (n.group_id)`
- * (`graph_queries.py:65`), so this is index-backed where `MATCH (e:Episodic)` was a label scan. That
- * ledger `group_id`s match Neo4j's is not assumed — the census next door runs
- * `MATCH (n:Entity {group_id: $g})` on those same ids and returns real prod numbers.
+ * or a `group_id` — no content leaves the graph. NO PERFORMANCE CLAIM is made for the scoping: an
+ * earlier version of this comment said the global form was "a label scan", which review corrected —
+ * graphiti creates BOTH `episode_group_id` on `(n:Episodic) ON (n.group_id)` and
+ * `created_at_episodic_index` on `(n:Episodic) ON (n.created_at)` (`graph_queries.py:65`, `:75`), so
+ * both forms are index-supported. The scoping is for correctness. That ledger `group_id`s match
+ * Neo4j's is not assumed either — the census next door runs `MATCH (n:Entity {group_id: $g})` on
+ * those same ids and returns real prod numbers.
  *
  * Null on an unreadable/unconfigured Neo4j, an unreadable ledger (`groupIds === null`), or a team
  * that has pushed nothing (`[]`) — all of which the predicate treats as "can't tell", never as
@@ -309,8 +336,8 @@ export async function newestEpisodicAtMs(groupIds: string[] | null): Promise<num
   if (groupIds === null || groupIds.length === 0) return null;
   try {
     const rows = await runRead<{ at: string | null }>(
-      "MATCH (e:Episodic) WHERE e.group_id IN $g AND e.created_at IS NOT NULL RETURN toString(max(e.created_at)) AS at",
-      { g: groupIds }
+      "MATCH (e:Episodic) WHERE e.group_id IN $g AND e.name STARTS WITH $p AND e.created_at IS NOT NULL RETURN toString(max(e.created_at)) AS at",
+      { g: groupIds, p: ITEM_EPISODE_PREFIX }
     );
     return parseProbeTimestamp(rows[0]?.at ?? null);
   } catch {
@@ -402,7 +429,16 @@ export function extractionStallReason(
     return `${args.episodes ?? 0} episodes were projected but the graph has 0 extracted facts — Graphiti is accepting episodes (202) yet its entity-extraction worker is failing on every job. Check the graphiti service logs for the actual error; the usual causes are the extraction LLM's output-token cap or an out-of-quota key. New activity isn't becoming graph facts, so narrative arcs can't update.`;
   }
   const forHow = args.lagHours === null ? "for some time" : `for about ${args.lagHours}h`;
-  return `Graph extraction has STOPPED: episodes are still being projected, but graphiti has not completed one ${forHow} — no new episode node has appeared in the graph, and an episode node is only written once a job has finished everything else. (The graph holds ${args.facts ?? 0} facts from before; fact age itself is not the signal, because on a mature graph most extracted edges deduplicate and create no new fact even when extraction is perfectly healthy.) Check the graphiti service logs for the actual error — usually an out-of-quota extraction key, the output-token cap, or a failing Neo4j write. Narrative arcs and the Learning panel are running on stale facts.`;
+  // `facts === null` is UNKNOWN (Neo4j unreadable), not zero. An earlier draft printed "holds 0 facts
+  // from before", which is this file's own banned pattern — a zero indistinguishable from a
+  // measurement — in the one sentence an operator acts on. Unreachable from either production caller
+  // today (the predicate returns false on null facts), so this is a pure-function contract rather
+  // than a live bug; it is fixed anyway because the function is exported and the next caller is free.
+  const held =
+    args.facts === null
+      ? "The graph holds facts from before (the exact count is currently unreadable);"
+      : `The graph holds ${args.facts} facts from before;`;
+  return `Graph extraction has STOPPED: episodes are still being projected, but graphiti has not completed one ${forHow} — no new episode node has appeared in the graph, and an episode node is only written once a job has finished everything else. (${held} fact age itself is not the signal, because on a mature graph most extracted edges deduplicate and create no new fact even when extraction is perfectly healthy.) Check the graphiti service logs for the actual error — usually an out-of-quota extraction key, the output-token cap, or a failing Neo4j write. Narrative arcs and the Learning panel are running on stale facts.`;
 }
 
 /** Hours between the newest pushed episode and the newest completed job; null when either is unknown. */

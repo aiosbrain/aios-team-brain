@@ -1,4 +1,8 @@
 import { describe, it, expect } from "vitest";
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { episodeName, ITEM_EPISODE_PREFIX } from "@/lib/graph/episode-name";
 import {
   deriveGraphExtractionStalled,
   extractionLagHours,
@@ -358,6 +362,16 @@ describe("extractionStallCause / extractionStallReason", () => {
     expect(reason).toContain("2347 episodes");
   });
 
+  it("degrades an UNKNOWN fact count to prose, not to a measured-looking zero", () => {
+    // `facts === null` is "Neo4j unreadable", not "zero facts". Printing "holds 0 facts from before"
+    // in the one sentence an operator acts on is this file's own banned pattern. Unreachable from
+    // production today (the predicate returns false on null facts) — pinned because the function is
+    // exported and the next caller is free to reach it.
+    const reason = extractionStallReason("stopped", { episodes: 30, facts: null, lagHours: 7 });
+    expect(reason).not.toMatch(/holds 0 facts/);
+    expect(reason).toContain("currently unreadable");
+  });
+
   it("degrades a null lag to prose instead of printing 'nullh'", () => {
     // A rendered `null` is the class of defect this file's own header calls out: a number on a card
     // with no way to tell it apart from a measurement.
@@ -380,5 +394,53 @@ describe("extractionLagHours", () => {
     // A completion NEWER than the newest episode is negative, not clamped — the predicate already
     // treats it as healthy, and clamping here would hide a clock-skew problem rather than show it.
     expect(extractionLagHours(now, now + 3_600_000)).toBe(-1);
+  });
+});
+
+/**
+ * THE LIVENESS READ'S POPULATION (STALLPROBE-1, round-4 review).
+ *
+ * `newestEpisodicAtMs` is SUBTRACTED FROM `newestEpisodeAtMs`, so the two must count the same
+ * episodes. Two review rounds found two ways they did not:
+ *   • by GROUP — a global read let another team's completed job refresh this team's clock;
+ *   • by KIND — a group-scoped read still counted `correction:<arc_id>` episodes, which
+ *     `lib/graph/arcs.ts` POSTs into the same team group with NO `graph_episodes` row. An admin
+ *     recomputing an arc mid-outage would have refreshed the clock and silenced the alarm for the
+ *     whole 6h budget while every item episode was failing.
+ *
+ * The Cypher is IO, so what is pinned here is the contract the query has to honour: the prefix
+ * constant is shared with the projector's own naming, and it is a POSITIVE match (only `items:`
+ * counts) rather than a `correction:` denylist, so the next non-ledger episode kind is excluded by
+ * default instead of needing someone to remember a new rule.
+ */
+describe("the liveness read counts ledger-backed item episodes only", () => {
+  it("shares its prefix with the projector's episode names — one constant, not two literals", () => {
+    expect(episodeName("abc", 0, 1)).toBe(`${ITEM_EPISODE_PREFIX}abc`);
+    expect(episodeName("abc", 2, 5)).toBe(`${ITEM_EPISODE_PREFIX}abc#2`);
+  });
+
+  it("excludes the arc-correction writeback, which has no ledger row behind it", () => {
+    // The exact name `lib/graph/arcs.ts` POSTs. It must NOT match the liveness prefix.
+    expect(`correction:${"arc-8144f88eb1"}`.startsWith(ITEM_EPISODE_PREFIX)).toBe(false);
+    // …and the projector's names must, or the probe would go permanently silent instead.
+    expect(episodeName("i1", 0, 1).startsWith(ITEM_EPISODE_PREFIX)).toBe(true);
+    expect(episodeName("i1", 1, 3).startsWith(ITEM_EPISODE_PREFIX)).toBe(true);
+  });
+
+  it("the query text actually applies that filter — the wiring, not just the constant", () => {
+    // A source-level pin because the filter lives in a Cypher string: the two unit assertions above
+    // stay green if someone deletes the `STARTS WITH` clause, which is exactly the bug.
+    const src = readFileSync(
+      path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "lib", "graph", "extraction-health.ts"),
+      "utf8"
+    );
+    // Anchored on the opening QUOTE of the string literal, not on the bare text: the file's own
+    // comments discuss `MATCH (e:Episodic)` at length, and a looser anchor matched the prose and
+    // passed for the wrong reason on the first run.
+    const start = src.indexOf('"MATCH (e:Episodic)');
+    expect(start, "the liveness query literal is gone or was renamed").toBeGreaterThan(-1);
+    const query = src.slice(start, src.indexOf('"', start + 1) + 1);
+    expect(query).toContain("e.group_id IN $g");
+    expect(query).toContain("e.name STARTS WITH $p");
   });
 });

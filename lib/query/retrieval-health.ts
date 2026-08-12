@@ -55,7 +55,11 @@ export interface RetrievalHealth {
   keyword: LegState; // always "on"
   dense: DenseHealth;
   graph: GraphState;
-  graphEpisodes: number | null; // projected episodes for this team (null when graph off/unreadable)
+  /** Episodes this team actually PUSHED to Graphiti (sentinel tombstones excluded), null when the
+   *  graph is off/unreadable. It is the SAME number the stall reason quotes — deliberately, after
+   *  review found the card rendering an unfiltered total ("125 episodes") beside a reason string
+   *  saying "25 episodes were projected": one number shown, a different one reasoned about. */
+  graphEpisodes: number | null;
   graphLastProjectedAt: string | null; // most recent successful projection (null = never)
   graphStalled: boolean; // degraded specifically because the projector stopped writing (vs unreachable)
   graphExtractionStalled: boolean; // episodes are reaching Graphiti (202) but no job is completing
@@ -68,6 +72,12 @@ export interface RetrievalHealth {
   /** The server-composed operator sentence for that stall — single writer, shared verbatim with the
    *  pipeline banner via `lib/graph/extraction-health.extractionStallReason`. */
   graphExtractionReason: string | null;
+  /** Hours between the newest pushed episode and the newest COMPLETED job. Passed to the card so its
+   *  short leg text can quote the MEASURED lag instead of hard-coding the budget constant, which
+   *  would drift silently if `EXTRACTION_LAG_BUDGET_MS` moved (and importing that constant into a
+   *  component would drag a `server-only` module across the boundary). Null when either end is
+   *  unknown. */
+  graphExtractionLagHours: number | null;
   /** Newest extracted RELATES_TO fact (ISO), OBSERVATIONAL ONLY since STALLPROBE-1: it no longer
    *  accuses, because on a mature graph most extracted edges deduplicate and create no new fact, so a
    *  frozen fact clock is the normal state of a healthy extractor. Shown because it is still the
@@ -223,7 +233,7 @@ export async function getRetrievalHealth(teamId: string): Promise<RetrievalHealt
     await Promise.all([
     denseHealth(teamId, configured),
     graphConfiguredNow ? new GraphitiClient().healthcheck() : Promise.resolve(false),
-    graphConfiguredNow ? graphFreshness(teamId) : Promise.resolve({ episodes: null, pushedEpisodes: null, lastProjectedAt: null }),
+    graphConfiguredNow ? graphFreshness(teamId) : Promise.resolve({ pushedEpisodes: null, lastProjectedAt: null }),
     graphConfiguredNow ? countGraphFacts() : Promise.resolve(null),
     graphConfiguredNow ? newestFactAtMs() : Promise.resolve(null),
     graphConfiguredNow ? newestEpisodeAtMs(teamId) : Promise.resolve(null),
@@ -284,13 +294,14 @@ export async function getRetrievalHealth(teamId: string): Promise<RetrievalHealt
   // WHICH stall, and the one sentence describing it — both derived server-side and shared with the
   // pipeline banner, so the card cannot drift into claiming "0 facts" about a liveness stall.
   const graphExtractionCause = extractionStallCause(graphExtractionStalled, graphFacts);
+  const graphExtractionLagHours = extractionLagHours(graphNewestEpisodeAt, graphNewestEpisodicAt);
   const graphExtractionReason =
     graphExtractionCause === null
       ? null
       : extractionStallReason(graphExtractionCause, {
           episodes: graphFresh.pushedEpisodes,
           facts: graphFacts,
-          lagHours: extractionLagHours(graphNewestEpisodeAt, graphNewestEpisodicAt),
+          lagHours: graphExtractionLagHours,
         });
   // The OTHER extraction failure: episodes become facts, but the facts are confidently wrong —
   // same-name entity splits accumulating from a model/embedding stack resolving identity badly
@@ -328,12 +339,13 @@ export async function getRetrievalHealth(teamId: string): Promise<RetrievalHealt
     keyword: "on",
     dense,
     graph,
-    graphEpisodes: graphFresh.episodes,
+    graphEpisodes: graphFresh.pushedEpisodes,
     graphLastProjectedAt: graphFresh.lastProjectedAt,
     graphStalled,
     graphExtractionStalled,
     graphExtractionCause,
     graphExtractionReason,
+    graphExtractionLagHours,
     graphNewestFactAt: graphNewestFactAt === null ? null : new Date(graphNewestFactAt).toISOString(),
     graphCensusPolluted,
     graphCensus,
@@ -362,23 +374,18 @@ export async function getRetrievalHealth(teamId: string): Promise<RetrievalHealt
  */
 async function graphFreshness(
   teamId: string
-): Promise<{ episodes: number | null; pushedEpisodes: number | null; lastProjectedAt: string | null }> {
+): Promise<{ pushedEpisodes: number | null; lastProjectedAt: string | null }> {
   try {
-    const res = await runSql<{ n: string; pushed: string; mx: string | null }>(
-      `select count(*)::int as n,
-              count(*) filter (where content_sha256 <> '')::int as pushed,
+    const res = await runSql<{ pushed: string; mx: string | null }>(
+      `select count(*) filter (where content_sha256 <> '')::int as pushed,
               max(projected_at) as mx
          from graph_episodes where team_id = $1`,
       [teamId]
     );
     const row = res.rows[0];
-    return {
-      episodes: row ? Number(row.n) : 0,
-      pushedEpisodes: row ? Number(row.pushed) : 0,
-      lastProjectedAt: row?.mx ?? null,
-    };
+    return { pushedEpisodes: row ? Number(row.pushed) : 0, lastProjectedAt: row?.mx ?? null };
   } catch {
-    return { episodes: null, pushedEpisodes: null, lastProjectedAt: null };
+    return { pushedEpisodes: null, lastProjectedAt: null };
   }
 }
 

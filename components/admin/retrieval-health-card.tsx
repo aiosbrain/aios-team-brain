@@ -131,7 +131,11 @@ export function RetrievalHealthCard({ health }: { health: RetrievalHealth }) {
   const graphStallDetail =
     health.graphExtractionCause === "never-extracted"
       ? `accepting episodes but extracting 0 facts — ${graphFreshness}`
-      : `no extraction has completed in over 6h — ${graphFreshness}`;
+      : // The MEASURED lag, not the budget constant. An earlier draft hard-coded "over 6h", which
+        // silently drifts if `EXTRACTION_LAG_BUDGET_MS` changes (review). Importing the constant here
+        // would drag a `server-only` module into a component, so the server passes the real number —
+        // which is more use to an operator than the threshold anyway.
+        `no extraction has completed in ${health.graphExtractionLagHours === null ? "longer than the alarm budget" : `~${health.graphExtractionLagHours}h`} — ${graphFreshness}`;
   // Extraction failing the OTHER way (AIO-693, census signal since ALARMFIX-1): episodes become
   // facts, but a group is accumulating same-name entity splits over its own baseline — identity is
   // being resolved badly. A stall outranks it in the copy below, same priority as the server's
