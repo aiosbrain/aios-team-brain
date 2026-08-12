@@ -96,8 +96,26 @@ export async function POST(req: NextRequest) {
     .maybeSingle();
   const timeZone = pickTimezone([prof?.timezone, DEFAULT_TIMEZONE]);
 
+  // Access enforcement (Phase B slice 2, spec §5.2/§5.8b): on an 'enforcing' team, retrieval is
+  // filtered to the member's membership-visible items (and graph legs omitted). Permissive → the
+  // enforce arg is null → byte-identical to today. A flag-read error fails closed (500).
+  let enforce: { visibleItemIds: ReadonlySet<string> } | null = null;
+  try {
+    const { teamEnforcesAccess, visibleItemIds } = await import("@/lib/access/enforce");
+    if (await teamEnforcesAccess(db, auth.teamId)) {
+      const { ids } = await visibleItemIds(db, { teamId: auth.teamId, memberId: auth.memberId });
+      enforce = { visibleItemIds: ids };
+    }
+  } catch {
+    return errorResponse("internal", "enforcement check failed", 500);
+  }
+
+  // Access enforcement (Codex HIGH): prior assistant turns can quote content whose items are no
+  // longer visible to this principal (e.g. after a group change) — omit history under enforcing
+  // until turns are visibility-revalidated. The current turn's answer is freshly retrieval-grounded.
+  const historyTurns = enforce ? [] : priorTurns;
   const started = Date.now();
-  const ctx = await retrieve(db, auth.teamId, auth.memberTier, question, project);
+  const ctx = await retrieve(db, auth.teamId, auth.memberTier, question, project, enforce);
 
   // Per-team provider keys + models + the explicit answering-backend override (same resolver the
   // dashboard route uses, so both honor OpenRouter/OpenAI/local + `teams.answering_provider`).
@@ -113,7 +131,7 @@ export async function POST(req: NextRequest) {
 
       let answer = "";
       try {
-        for await (const chunk of streamAnswer(ctx, question, keys, priorTurns, caller, timeZone)) {
+        for await (const chunk of streamAnswer(ctx, question, keys, historyTurns, caller, timeZone)) {
           if (chunk.type === "delta") {
             answer += chunk.text;
             send("delta", { text: chunk.text });

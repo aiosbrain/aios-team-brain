@@ -43,6 +43,10 @@ export interface RetrievalRequest {
   tier: "team" | "external";
   question: string;
   projectSlug?: string | null;
+  /** Access enforcement (Phase B slice 2): present = 'enforcing', supplies the principal's
+   *  membership-visible item set. Item legs filter to it; graph legs are omitted (fail closed
+   *  until Phase C). Absent/null = permissive, byte-identical to today. */
+  enforce?: { visibleItemIds: ReadonlySet<string> } | null;
 }
 
 /** A context layer. Swap the default by implementing this and selecting via CONTEXT_PROVIDER. */

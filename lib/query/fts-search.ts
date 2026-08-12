@@ -31,12 +31,22 @@ export async function rankedFtsSearch(
   tier: "team" | "external",
   orQuery: string,
   limit = 20,
-  channel?: string | null
+  channel?: string | null,
+  // Access enforcement (Phase B slice 2, Codex fold): the membership-visible item set, applied
+  // IN-QUERY so `limit` ranks over VISIBLE rows only — a post-filter would let invisible rows
+  // crowd visible ones out of the top-N (under-return) and leak an abstention side channel. Null
+  // = permissive (no filter). Empty = enforcing-but-sees-nothing → the SQL returns zero rows.
+  visibleIds?: readonly string[] | null
 ): Promise<FtsHit[]> {
   if (!orQuery.trim()) return [];
+  if (visibleIds && visibleIds.length === 0) return []; // enforcing, sees nothing
   const params: unknown[] = [orQuery, teamId];
   let where = "i.team_id = $2 and i.search @@ websearch_to_tsquery('english', $1)";
   if (isRestrictedTier(tier)) where += " and i.access = 'external'";
+  if (visibleIds) {
+    params.push(visibleIds);
+    where += ` and i.id = any($${params.length}::uuid[])`;
+  }
   if (channel) {
     // Channel scope (Gap #4). The channel NAME appears in a path's 2nd segment for sources that key
     // paths by name (`linear/aio/…`) — but NOT for Slack, whose path is keyed on the immutable
