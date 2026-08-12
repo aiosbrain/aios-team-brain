@@ -334,7 +334,9 @@ describe("delegated retrieval is ALWAYS oracle-attenuated — flag-independent (
    *  the item the way the Phase D curation surface will). */
   async function curateInto(seed: Seed, itemId: string, projectId: string): Promise<void> {
     const { data: unit } = await db().from("project_context_units").select("id").eq("source_item_id", itemId).single();
-    await db().from("project_context_memberships").update({ valid_to: new Date().toISOString() }).eq("context_unit_id", unit!.id);
+    // Expire only the CURRENT membership (Fable B3 Low: without the null filter this helper
+    // rewrites valid_to on already-expired history rows — wrong when copied to real curation).
+    await db().from("project_context_memberships").update({ valid_to: new Date().toISOString() }).eq("context_unit_id", unit!.id).is("valid_to", null);
     const { error } = await db().from("project_context_memberships").insert({ team_id: seed.teamId, project_id: projectId, context_unit_id: unit!.id, method: "manual" });
     if (error) throw new Error(`curate failed: ${error.message}`);
   }

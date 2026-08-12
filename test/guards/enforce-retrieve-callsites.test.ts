@@ -32,11 +32,14 @@ for (const route of ["app/api/v1/query/route.ts", "app/api/dashboard/query/route
 describe("delegated query wiring in app/api/v1/query/route.ts (Phase B slice 3)", () => {
   const src = read("app/api/v1/query/route.ts");
   it("delegated principals get the ALWAYS-attenuated path (flag-independent)", () => {
-    // The agent branch resolves delegatedVisibleItemIds WITH the agent principal — deleting it
-    // would let an aiosd_ token fall through to the flag-gated member path (unfiltered on a
-    // permissive team).
-    expect(src).toMatch(/if\s*\(agent\)\s*\{/);
-    expect(src).toMatch(/delegatedVisibleItemIds\s*\(\s*db\s*,\s*agent\s*\)/);
+    // Pin the FULL sequence in one regex (Fable B3 Medium): the agent branch must resolve
+    // delegatedVisibleItemIds WITH the agent principal, ASSIGN the result to `enforce`, and the
+    // flag-gated member path must be its else-branch — so the agent arm can neither lose the
+    // assignment (call kept, enforce stays null → unfiltered retrieve with graph legs live) nor
+    // be nested inside teamEnforcesAccess (flag-dependent → permissive team widens the token).
+    expect(src).toMatch(
+      /if\s*\(agent\)\s*\{\s*const\s*\{\s*ids\s*\}\s*=\s*await\s+delegatedVisibleItemIds\(\s*db\s*,\s*agent\s*\)\s*;\s*enforce\s*=\s*\{\s*visibleItemIds:\s*ids\s*\}\s*;\s*\}\s*else\s+if\s*\(await\s+teamEnforcesAccess/
+    );
   });
   it("the Phase A 403 refusal is gone — delegated tokens authenticate instead", () => {
     expect(src).not.toMatch(/delegation_not_supported/);

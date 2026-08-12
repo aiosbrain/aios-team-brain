@@ -29,7 +29,9 @@ export async function POST(req: NextRequest) {
   // is ALWAYS oracle-attenuated (independent of `teams.access_enforcement`, which is the MEMBER
   // rollout flag) and STATELESS: no conversation read/write and no history leg — the launcher's
   // prior turns may quote items outside the token's scope. Rate limits, query_log and cost
-  // metering attribute to the LAUNCHING member, so delegation never amplifies a quota.
+  // metering attribute to the LAUNCHING member row — a token never burns the REPRESENTED
+  // member's quota. (Distinct agent member rows do each get their own per-member bucket;
+  // minting is admin-gated and the team-wide daily budget still caps total spend.)
   let agent: AgentApiAuth | null = null;
   let auth: ApiAuth | null = null;
   if (isAgentBearer(req)) {
