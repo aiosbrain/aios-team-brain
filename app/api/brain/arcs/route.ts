@@ -8,6 +8,8 @@ import { errorResponse } from "@/lib/api/schemas";
 import { resolveAnsweringKeys } from "@/lib/query/answering";
 import { visibleGroupIds } from "@/lib/graph/group";
 import { getArcs } from "@/lib/graph/arcs";
+import { memberEnforcement } from "@/lib/access/enforce";
+import { filterArcsByVisibleItems } from "@/lib/graph/arc-visibility";
 import { getLlmHealth } from "@/lib/query/llm-health";
 import { graphHasFacts } from "@/lib/query/retrieval-health";
 import { freshnessWire } from "@/lib/freshness";
@@ -41,7 +43,7 @@ export async function POST(req: NextRequest) {
   if (!team) return errorResponse("forbidden", "not a member of this team", 403);
   const { data: me } = await rls
     .from("members")
-    .select("tier")
+    .select("id, tier")
     .eq("team_id", team.id)
     .eq("auth_user_id", user.id)
     .eq("status", "active")
@@ -49,9 +51,23 @@ export async function POST(req: NextRequest) {
   if (!me) return errorResponse("forbidden", "not a member of this team", 403);
 
   const tier = (me as { tier: "team" | "external" }).tier;
+  const memberId = (me as { id: string }).id;
   const admin = adminClient();
   const keys = await resolveAnsweringKeys(admin, team.id);
-  const { arcs, freshness } = await getArcs(admin, team.id, teamSlug, tier, visibleGroupIds(teamSlug, tier), keys);
+  const { arcs: allArcs, freshness } = await getArcs(admin, team.id, teamSlug, tier, visibleGroupIds(teamSlug, tier), keys);
+
+  // Access enforcement (Phase B slice 5, spec §5.8/§5.8b): on an 'enforcing' team, drop any arc that
+  // cites an item this member can't see — an arc is a synthesized narrative over its evidence, so it's
+  // all-or-nothing (`filterArcsByVisibleItems`). Permissive → null → byte-identical. A read-time filter
+  // over the tier `arc_cache` (no per-principal re-synthesis; per-project arcs are Phase C). The
+  // enforcement resolution fails CLOSED: a substrate error throws → 500, never the unfiltered set.
+  let enforce: { visibleItemIds: ReadonlySet<string> } | null;
+  try {
+    enforce = await memberEnforcement(admin, { teamId: team.id, memberId });
+  } catch {
+    return errorResponse("internal", "enforcement check failed", 500);
+  }
+  const arcs = filterArcsByVisibleItems(allArcs, enforce?.visibleItemIds ?? null);
 
   // Empty arcs are ambiguous — tell the client the ACTUAL cause so the panel stops showing a benign
   // "no arcs yet" for what is really a broken graph or a failing model:

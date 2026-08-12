@@ -41,6 +41,17 @@ describe("dense-leg enforcement wired in lib/query/retrieve.ts (Codex B3 Medium)
   });
 });
 
+describe("arc enforcement wiring in app/api/brain/arcs/route.ts (Phase B slice 5, §5.8)", () => {
+  const src = read("app/api/brain/arcs/route.ts");
+  it("resolves the member's visibility and serves the FILTERED tier arcs, not the raw getArcs output", () => {
+    expect(src).toMatch(/memberEnforcement\(\s*admin\s*,\s*\{\s*teamId:\s*team\.id\s*,\s*memberId\s*\}\s*\)/);
+    expect(src).toMatch(/const\s+arcs\s*=\s*filterArcsByVisibleItems\(\s*allArcs\s*,\s*enforce\?\.visibleItemIds\s*\?\?\s*null\s*\)/);
+  });
+  it("fails closed on an enforcement-resolution error (500, never the unfiltered set)", () => {
+    expect(src).toMatch(/catch\s*\{\s*return errorResponse\("internal", "enforcement check failed", 500\)/);
+  });
+});
+
 describe("timeline enforcement wiring (Phase B slice 4, §5.8)", () => {
   it("every timeline surface passes its PRINCIPAL to getCachedWorkTimeline (4th arg — a forgotten one would serve the tier row)", () => {
     expect(read("app/api/v1/timeline/route.ts")).toMatch(/getCachedWorkTimeline\(db,\s*auth\.teamId,\s*auth\.memberTier,\s*auth\.memberId\s*\)/);
