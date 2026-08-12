@@ -37,9 +37,19 @@ describe("projectGroupId (per-project graph partition key)", () => {
 
   it("fails LOUD on the teamSLUG footgun — a slug where an id is expected mints a wrong-but-charset-valid key otherwise (Fable High)", () => {
     // `episodeGroupId` (the tier scheme, same module) takes a slug; this takes an id. A slug passed
-    // here is charset-valid but not 32-hex → must throw, not silently produce a disjoint partition.
+    // here is not a canonical UUID → must throw, not silently produce a disjoint partition.
     expect(() => projectGroupId("acme", randomUUID())).toThrow(/UUID/i);
     expect(() => projectGroupId(randomUUID(), "supplier-negotiation")).toThrow(/UUID/i);
+  });
+
+  it("fails LOUD on a 32-HEX-shaped slug — the case a hyphen-stripped 32-hex check would WRONGLY accept (Codex High)", () => {
+    // A team slug is [a-z0-9-] and can legally be 32 chars; "a".repeat(32) is valid 32-hex ('a' is a
+    // hex digit), so a naive post-strip HEX32 check passes it. The canonical-UUID (pre-strip) check
+    // rejects it — no hyphens in the 8-4-4-4-12 positions.
+    expect(() => projectGroupId("a".repeat(32), randomUUID())).toThrow(/UUID/i);
+    expect(() => projectGroupId(randomUUID(), "0".repeat(32))).toThrow(/UUID/i);
+    // A hyphen-stripped UUID (32 hex, no hyphens) is also rejected — callers must pass CANONICAL uuids.
+    expect(() => projectGroupId(randomUUID().replace(/-/g, ""), randomUUID())).toThrow(/UUID/i);
   });
 
   it("is INJECTIVE — the `_p_` boundary can't be split ambiguously (both blocks are fixed 32-hex)", () => {

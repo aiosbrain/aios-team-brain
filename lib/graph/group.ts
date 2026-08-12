@@ -59,8 +59,11 @@ export function visibleGroupIds(teamSlug: string, viewerTier: AccessTier): strin
 // the existing graph are LATER Phase C slices (each touches schema + LLM extraction cost, so each gets
 // its own design doc). This slice just establishes the key scheme + the oracle→group-id mapping.
 
-/** A UUID with hyphens stripped — the 32-hex form each block of a project group_id must take. */
-const HEX32 = /^[0-9a-f]{32}$/i;
+/** Canonical UUID (8-4-4-4-12). Validated on INPUT, BEFORE stripping hyphens — a hyphen-stripped
+ *  32-hex check is a SUPERSET of UUIDs (a team slug is `[a-z0-9-]`, and `"a".repeat(32)` is valid
+ *  32-hex, so a 32-hex-shaped slug would slip through), which reopens the exact slug footgun. The
+ *  canonical form's hyphen POSITIONS are what a slug can't fake (Codex review). */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
  * The Graphiti group_id for one project's graph partition: `g_<teamId-hex>_p_<projectId-hex>`, both
@@ -69,22 +72,20 @@ const HEX32 = /^[0-9a-f]{32}$/i;
  * separators use `_` for the same reason `episodeGroupId` does — a `:` kills the ingest worker
  * (validate_group_id gotcha, verified 2026-06-24).
  *
- * INJECTIVITY is enforced, not assumed (Fable review): the `_p_` boundary is unambiguous ONLY because
- * both blocks are fixed-width 32-hex, so each input is asserted to be a UUID AFTER stripping. Without
+ * INJECTIVITY is enforced, not assumed: the `_p_` boundary is unambiguous ONLY because both blocks
+ * are fixed-width 32-hex, so each input is asserted to be a CANONICAL UUID (before stripping). Without
  * this, a team SLUG passed where a team ID is expected — the adjacent tier scheme `episodeGroupId`
  * takes a slug, this takes an id — would mint a charset-valid but WRONG key: the projector writes one
  * partition namespace and the read leg searches another, a silently-empty graph with no error. Fail
  * LOUD here so that mixup throws instead of producing invisible data. Pure.
  */
 export function projectGroupId(teamId: string, projectId: string): string {
-  const t = teamId.replace(/-/g, "");
-  const p = projectId.replace(/-/g, "");
-  if (!HEX32.test(t) || !HEX32.test(p)) {
-    throw new Error(`invalid per-project Graphiti group_id — teamId/projectId must be UUIDs (got team="${teamId}", project="${projectId}")`);
+  if (!UUID_RE.test(teamId) || !UUID_RE.test(projectId)) {
+    throw new Error(`invalid per-project Graphiti group_id — teamId/projectId must be canonical UUIDs (got team="${teamId}", project="${projectId}")`);
   }
-  const id = `g_${t}_p_${p}`;
-  // Belt-and-braces: a 32-hex-block id is charset-valid by construction, but keep the assertion so a
-  // future edit to the format can't silently mint an id the graph service rejects mid-ingest.
+  const id = `g_${teamId.replace(/-/g, "")}_p_${projectId.replace(/-/g, "")}`;
+  // Belt-and-braces: a hyphen-stripped-UUID id is charset-valid by construction, but keep the
+  // assertion so a future edit to the format can't silently mint an id the graph service rejects.
   if (!VALID_GROUP_ID.test(id)) {
     throw new Error(`invalid per-project Graphiti group_id "${id}"`);
   }
