@@ -44,8 +44,11 @@ That predicate answers **"when did the graph last learn something NEW?"** and is
 **"when did the extractor last RUN?"** On a mature graph those diverge:
 
 - the graph holds ~113k facts and 2,347 projected episodes;
-- `llm_usage` shows **~6.1 `dedupe_edges` calls per `extract_edges` call** — most extracted edges
-  resolve onto an edge that already exists;
+- `llm_usage` shows **6.6 `dedupe_edges` calls per `extract_edges` call** — most extracted edges
+  resolve onto an edge that already exists. Re-measured against prod 2026-08-12 rather than quoted:
+  8,919/1,340 over 30d = 6.66, 4,232/642 over 7d = 6.59, 510/68 over 2d = 7.50. (Earlier drafts of
+  this doc said "~6.1" and the ticket said "~8.5"; neither reproduced. The argument only needs the
+  ratio to be ≫1, but a cited number that does not reproduce is its own defect.);
 - a de-duplicated edge creates no new `RELATES_TO`, so `max(created_at)` does not move.
 
 So an overnight stretch in which extraction ran correctly and found nothing genuinely new freezes
@@ -97,7 +100,7 @@ against the actual wheels:
 
 | property | why it holds |
 |---|---|
-| **End-of-job** | it is persisted by `add_nodes_and_edges_bulk` (`graphiti.py:726`, reached via `:1170`), the single Neo4j write, after node resolution, edge extraction, edge resolution and attribute extraction have all returned. The node's EXISTENCE is the completion evidence |
+| **End-of-job** | it is persisted by `add_nodes_and_edges_bulk` (`graphiti.py:726`, reached via `:1170`) — the single Neo4j write **on the path we run** (`/messages` → `add_episode`, no saga, `update_communities=False`); 0.29.3 does write more after it when a saga is passed (`:736-780`) or communities are enabled (`:1184`), neither of which the REST server does. It is reached only after node resolution, edge extraction, edge resolution and attribute extraction have all returned, and the node's EXISTENCE is the completion evidence. The bulk write is ONE managed transaction (`utils/bulk_utils.py:136-146`, `session.execute_write`), so a mid-write Neo4j failure rolls the episode node back with it — "covers the write itself" holds rather than being asserted |
 | **Cannot deduplicate** | a new episode is always a new node — unlike entities and edges, which resolve onto existing ones. This is exactly the property whose absence caused the false positive. Our projector POSTs `/messages` with no uuid, so `EpisodicNode.get_by_uuid` (`:1099`) is never taken and a fresh node is constructed every time |
 | **Not backdated** | wall-clock, not the episode's `reference_time` (contrast `valid_at`, which IS backdated and is why `newestFactAtMs` deliberately reads `created_at`) |
 | **Version-independent** | no claim about stage ordering, no dependency on prompt text or `call_kind` |
@@ -115,8 +118,9 @@ Two things about that timestamp are stated rather than glossed, both verified ag
   extraction failed outright, i.e. exactly the "202 accepted" semantic being replaced. We do not use
   it (the projector is fire-and-forget `/messages` → singular `add_episode`), and nothing in this repo
   can detect a graph-service switch to it, so the limitation is recorded at the source and in
-  `docs/ARCHITECTURE.md` instead of being guarded. (`add_triplet` at `:1745` builds a throwaway
-  `EpisodicNode` but passes `[]` as the episodic nodes to the bulk write, so it never persists one.)
+  `docs/ARCHITECTURE.md` instead of being guarded. (`add_triplet` at `:1645` builds a throwaway
+  `EpisodicNode` (the literal is at `:1745`) but passes `[]` as the episodic nodes to the bulk write,
+  so it never persists one.)
 
 Revised predicate — `newestEpisodicAtMs` replaces the ledger, and fact-lag stops accusing entirely:
 
@@ -128,7 +132,23 @@ Revised predicate — `newestEpisodicAtMs` replaces the ledger, and fact-lag sto
    the Neo4j write.
 4. **Either timestamp unknown** (`null`) → not stalled. Neo4j unreadable is a different leg's business.
 
-Fact-lag becomes **observational**: still shown, never the accuser.
+Fact-lag becomes **observational**: still shown — as a quiet line on the card, never a leg state —
+but never the accuser. "Shown" is stated as a requirement rather than an aspiration because the first
+implementation of this section dropped fact-lag from the verdict, kept fetching it, and rendered it
+nowhere: a promise in a spec with no surface behind it.
+
+### 3d. Both halves of the lag must be scoped THE SAME WAY
+
+`newestEpisodeAtMs` is team-scoped (`where team_id = $1`). The liveness read must therefore be scoped
+to that team's ledger `group_id`s, or the subtraction compares two different populations: the first
+draft read `max(Episodic.created_at)` across the whole database, so on an instance hosting more than
+one team, ANY other team completing a job refreshed this team's clock and its dead extractor read
+green forever. That is strictly worse than the fact-scope asymmetry it replaced, which needed the
+other group to produce a genuinely NOVEL fact — rare, by this document's own §1 argument. Found by
+both reviewers independently.
+
+`countGraphFacts` stays deliberately global: "has the extractor ever produced anything at all" is an
+install-level question that no team owns, and rescoping it is a different change.
 
 ### 3c. The signal is REQUIRED, not optional
 
@@ -157,12 +177,12 @@ exactly the fail-open/fail-closed reasoning the higher tier is for. Two adversar
 
 ## Tier safety
 
-No tier surface changes. Both reads are numeric health probes, deliberately NOT tier-scoped — the
-existing `countGraphFacts` comment states the rule ("no content leaves the graph; 'is the extractor
-producing ANY facts?' is a global question"), and the new Neo4j read follows it exactly: a single
-`toString(max(e.created_at))` aggregation over `Episodic`, returning one timestamp and never a name,
-a body, or a `group_id`. No new API route, no new table, no change to
-`visibleItems`/`visibleTasks`/`visibleGroupIds`.
+No tier surface changes. The new Neo4j read is a single `toString(max(e.created_at))` aggregation
+over `Episodic`, returning one timestamp and never a name, a body, or a `group_id`. It is scoped by
+the team's ledger `group_id`s (§3d) — since `group_id` is `<slug>_<tier>` and the list comes from the
+team-scoped ledger, that is a NARROWING of what the first draft read, never a widening. The remaining
+global read is `countGraphFacts`, which is a pre-existing count with its own documented rationale. No
+new API route, no new table, no change to `visibleItems`/`visibleTasks`/`visibleGroupIds`.
 
 ## 4. Acceptance criteria
 
@@ -170,16 +190,25 @@ a body, or a `group_id`. No new API route, no new table, no change to
 - `test/graph-extraction-health.test.ts` — episodes projected but the newest episodic node older than the budget **IS** stalled — the real "202 accepted, nothing processed" outage, now covering the Neo4j write too.
 - `test/graph-extraction-health.test.ts` — `facts === 0` above the episode floor is stalled **even when** the episodic node is fresh (never-extracted outranks liveness).
 - `test/graph-extraction-health.test.ts` — a `null` episodic timestamp never manufactures a stall, and never suppresses the `facts === 0` case.
-- `test/guards/extraction-stall-callsites.test.ts` — a build-failing guard: EVERY `deriveGraphExtractionStalled(` call site in `lib/` passes `newestEpisodicAtMs`. This exists because the second call site was missed once already.
-- `docs/ARCHITECTURE.md` — the graph-extraction row states that liveness is episode-node-derived, that fact-lag is observational, and records why the two ledger designs were rejected.
+- `test/graph-extraction-health.test.ts` — `extractionStallCause` returns `never-extracted` only when `facts === 0`, and `stopped` otherwise, so no surface can claim "0 facts" about a liveness stall.
+- `test/graph-extraction-health.test.ts` — `extractionStallReason("stopped", …)` contains no "0 facts" claim and degrades to "for some time" on a null `lagHours` rather than printing "nullh".
+- `test/datamechanics/graph-extraction-scope.datamechanics.test.ts` — real Postgres: `teamEpisodeGroupIds` returns only THIS team's groups and excludes groups that hold nothing but `''`-sentinel rows; `countProjectedEpisodes` excludes sentinel rows, so redaction tombstones cannot help clear `MIN_EPISODES_FOR_EXTRACTION_SIGNAL`.
+- `test/guards/extraction-stall-callsites.test.ts` — a build-failing guard: EVERY `deriveGraphExtractionStalled(` call site in every tree `tsconfig` typechecks (`lib/`, `app/`, `components/`, `scripts/`) passes `newestEpisodicAtMs`. This exists because the second call site was missed once already.
+- `docs/ARCHITECTURE.md` — the graph-extraction row states that liveness is episode-node-derived and team-scoped, that fact-lag is observational and rendered, records the accepted zero-yield blind spot, and records why the two ledger designs were rejected.
 
 ## 5. Deliberately NOT in this slice
 
 - **The banner-flap threshold** (`BANNERFLAP-1` / AIO-866, two-consecutive-failures) — a different
   defect in a different file; batching them would make one PR unreviewable.
 - **The census sample floor** (`CENSUSFLOOR-1` / AIO-867) — already specced separately.
-- **The canned `Output length exceeded` example string** stays, but is reworded so it cannot read as
-  a quotation from the service. Rewriting the whole reason-string taxonomy is not in scope.
+- **The canned `Output length exceeded` example string** is removed from the admin card, which now
+  renders the server's reason verbatim instead of composing its own copy. Rewriting the whole
+  reason-string taxonomy is still not in scope.
+- **A backstop for edge-yield death** — `extract_edges` legally returning `[]` on every episode leaves
+  every surface green (see the accepted-blind-spot note in `lib/graph/extraction-health.ts`). Detecting
+  it needs an edge-yield-per-episode sensor with a measured band, which is the `PIPEFF-2`
+  `entitiesPerEpisode` pattern applied to edges — its own slice, and its band must be measured, not
+  invented.
 - **De-duplicating the two surfaces** (one probe rendering as two failures) — the fix removes the
   false positive that made the duplication visible; collapsing the surfaces is a UI change with its
   own product question.

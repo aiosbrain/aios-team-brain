@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -27,15 +27,25 @@ import { fileURLToPath } from "node:url";
  */
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
-const LIB = path.join(ROOT, "lib");
+/**
+ * Every tree `tsconfig` typechecks (`**\/*.ts` minus `test/`), not just `lib/`. Scanning only `lib/`
+ * was flagged in review: there are no call sites in `app/`/`components/`/`scripts/` today, so it was
+ * latent rather than live, but the guard's advertised property is "no call site ANYWHERE forgets" and
+ * a guard that quietly means something narrower than it claims is the failure mode this file exists
+ * to prevent. Missing directories are skipped rather than throwing, so the guard survives a reorg.
+ */
+const SCANNED = ["lib", "app", "components", "scripts"];
 const FN = "deriveGraphExtractionStalled";
 const REQUIRED_ARG = "newestEpisodicAtMs";
 
 function tsFiles(dir: string): string[] {
+  if (!existsSync(dir)) return [];
   return readdirSync(dir).flatMap((entry) => {
     const full = path.join(dir, entry);
     if (statSync(full).isDirectory()) return tsFiles(full);
-    return full.endsWith(".ts") && !full.endsWith(".d.ts") ? [full] : [];
+    // `.tsx` too — the admin card is a `.tsx`, so a component calling the predicate directly would
+    // otherwise sit outside a guard that claims to cover everything typechecked.
+    return (full.endsWith(".ts") || full.endsWith(".tsx")) && !full.endsWith(".d.ts") ? [full] : [];
   });
 }
 
@@ -52,10 +62,10 @@ function argOf(src: string, openIdx: number): string {
   return src.slice(openIdx + 1); // unbalanced — treat as the rest of the file (fails loudly below)
 }
 
-/** Every `deriveGraphExtractionStalled(` invocation in `lib/`, excluding its own declaration. */
+/** Every `deriveGraphExtractionStalled(` invocation in the scanned trees, excluding its own declaration. */
 function callSites(): { file: string; arg: string; fileSrc: string }[] {
   const out: { file: string; arg: string; fileSrc: string }[] = [];
-  for (const file of tsFiles(LIB)) {
+  for (const file of SCANNED.flatMap((d) => tsFiles(path.join(ROOT, d)))) {
     const src = readFileSync(file, "utf8");
     let from = 0;
     for (;;) {

@@ -1,6 +1,9 @@
 import { describe, it, expect } from "vitest";
 import {
   deriveGraphExtractionStalled,
+  extractionLagHours,
+  extractionStallCause,
+  extractionStallReason,
   parseProbeTimestamp,
   EXTRACTION_LAG_BUDGET_MS,
   MIN_EPISODES_FOR_EXTRACTION_SIGNAL,
@@ -220,7 +223,7 @@ describe("the lag budget boundary", () => {
  *
  * The lag half used to compare the newest episode against the newest FACT, which asks "when did the
  * graph last learn something NEW?" and was read as "when did a job last FINISH?". On a mature graph
- * those diverge — prod runs ~6.1 `dedupe_edges` per `extract_edges`, so most extracted edges resolve
+ * those diverge — prod runs 6.6 `dedupe_edges` per `extract_edges` (measured 2026-08-12), so most extracted edges resolve
  * onto an existing edge and create no `RELATES_TO` — so the clock freezes while extraction works. That
  * produced "accepting episodes but extracting 0 facts" one minute after a clean pipeline run.
  *
@@ -230,11 +233,13 @@ describe("the lag budget boundary", () => {
  * pin BOTH directions: the false positive must go, and a real outage must stay loud.
  */
 describe("deriveGraphExtractionStalled — episode-node liveness", () => {
-  const N = MIN_EPISODES_FOR_EXTRACTION_SIGNAL;
   const EPISODE_AT = Date.parse("2026-08-12T00:15:02Z");
-  /** Facts frozen far past the budget — the state that used to be sufficient to accuse. */
+  // A LITERAL, deliberately not `MIN_EPISODES_FOR_EXTRACTION_SIGNAL * 10`. Seeding a fixture from the
+  // constant under test makes it scale with a mutation of that constant, so raising the floor would
+  // leave this whole block green — the repo's own mutation-fixture-sizing rule, caught here by review.
+  // 2347 is the real prod episode count from the 2026-08-12 incident this block reproduces.
   const DEDUP_FROZEN = {
-    episodes: N * 10,
+    episodes: 2347,
     facts: 113_352,
     newestEpisodeAtMs: EPISODE_AT,
     newestFactAtMs: EPISODE_AT - (EXTRACTION_LAG_BUDGET_MS + 3_600_000),
@@ -268,7 +273,7 @@ describe("deriveGraphExtractionStalled — episode-node liveness", () => {
   it("zero facts outranks liveness — a completing extractor producing nothing is still broken", () => {
     expect(
       deriveGraphExtractionStalled({
-        episodes: N * 10,
+        episodes: 2347,
         facts: 0,
         newestEpisodeAtMs: EPISODE_AT,
         newestFactAtMs: null,
@@ -285,7 +290,7 @@ describe("deriveGraphExtractionStalled — episode-node liveness", () => {
   it("…but an unknown episodic timestamp does NOT suppress the zero-facts stall", () => {
     expect(
       deriveGraphExtractionStalled({
-        episodes: N * 10,
+        episodes: 2347,
         facts: 0,
         newestEpisodeAtMs: EPISODE_AT,
         newestFactAtMs: null,
@@ -303,5 +308,77 @@ describe("deriveGraphExtractionStalled — episode-node liveness", () => {
         newestEpisodicAtMs: EPISODE_AT,
       })
     ).toBe(false);
+  });
+});
+
+/**
+ * WHICH stall, and what its sentence may claim (STALLPROBE-1, found by review).
+ *
+ * Before this slice both causes were one hard-coded sentence — "accepting episodes but extracting 0
+ * facts" — because a stall only ever meant `facts === 0`. Liveness stalls fire with facts ≫ 0 (prod
+ * holds 113,352), so that sentence became a claim contradicted by the very card printing it, ON THE
+ * TRUE-POSITIVE PATH: the one an operator has to believe. These pin the split so no surface can
+ * regress to composing its own copy.
+ */
+describe("extractionStallCause / extractionStallReason", () => {
+  it("is null when nothing is stalled — no cause, no sentence", () => {
+    expect(extractionStallCause(false, 0)).toBeNull();
+    expect(extractionStallCause(false, 113_352)).toBeNull();
+  });
+
+  it("says never-extracted ONLY for zero facts, and stopped for every other count", () => {
+    expect(extractionStallCause(true, 0)).toBe("never-extracted");
+    expect(extractionStallCause(true, 1)).toBe("stopped");
+    expect(extractionStallCause(true, 113_352)).toBe("stopped");
+    // Unknown fact count is NOT zero facts. `facts === null` means Neo4j was unreadable, and
+    // "don't know" must never be upgraded into the stronger of the two accusations.
+    expect(extractionStallCause(true, null)).toBe("stopped");
+  });
+
+  it("the STOPPED sentence never claims zero facts, and names the real count", () => {
+    const reason = extractionStallReason("stopped", {
+      episodes: 2347,
+      facts: 113_352,
+      lagHours: 9,
+    });
+    expect(reason).toContain("113352");
+    expect(reason).toContain("about 9h");
+    // The regression this test exists for: the never-extracted copy leaking onto the liveness path.
+    expect(reason).not.toContain("0 extracted facts");
+    expect(reason).not.toMatch(/failing on every job/);
+  });
+
+  it("the NEVER-EXTRACTED sentence is the one allowed to say zero facts", () => {
+    const reason = extractionStallReason("never-extracted", {
+      episodes: 2347,
+      facts: 0,
+      lagHours: null,
+    });
+    expect(reason).toContain("0 extracted facts");
+    expect(reason).toContain("2347 episodes");
+  });
+
+  it("degrades a null lag to prose instead of printing 'nullh'", () => {
+    // A rendered `null` is the class of defect this file's own header calls out: a number on a card
+    // with no way to tell it apart from a measurement.
+    const reason = extractionStallReason("stopped", { episodes: 10, facts: 5, lagHours: null });
+    expect(reason).toContain("for some time");
+    expect(reason).not.toContain("null");
+  });
+});
+
+describe("extractionLagHours", () => {
+  it("is null when either end is unknown — never a 0 that reads as 'no lag'", () => {
+    expect(extractionLagHours(null, 1_000)).toBeNull();
+    expect(extractionLagHours(1_000, null)).toBeNull();
+    expect(extractionLagHours(null, null)).toBeNull();
+  });
+
+  it("rounds the episode-to-completion gap to hours", () => {
+    const now = Date.parse("2026-08-12T12:00:00Z");
+    expect(extractionLagHours(now, now - 9 * 3_600_000)).toBe(9);
+    // A completion NEWER than the newest episode is negative, not clamped — the predicate already
+    // treats it as healthy, and clamping here would hide a clock-skew problem rather than show it.
+    expect(extractionLagHours(now, now + 3_600_000)).toBe(-1);
   });
 });

@@ -7,11 +7,16 @@ import { resolveGraphChatTarget, resolveGraphEmbeddingTarget, isRefusal } from "
 import {
   countGraphFacts,
   deriveGraphExtractionStalled,
+  extractionLagHours,
+  extractionStallCause,
+  extractionStallReason,
   groupCensuses,
   newestEpisodeAtMs,
   newestEpisodicAtMs,
   newestFactAtMs,
+  teamEpisodeGroupIds,
   type CensusRefusal,
+  type ExtractionStallCause,
   type GroupCensus,
 } from "@/lib/graph/extraction-health";
 import { resolveEmbeddingBackend } from "@/lib/query/embedding-key";
@@ -53,7 +58,22 @@ export interface RetrievalHealth {
   graphEpisodes: number | null; // projected episodes for this team (null when graph off/unreadable)
   graphLastProjectedAt: string | null; // most recent successful projection (null = never)
   graphStalled: boolean; // degraded specifically because the projector stopped writing (vs unreachable)
-  graphExtractionStalled: boolean; // episodes are reaching Graphiti (202) but its extractor makes no facts
+  graphExtractionStalled: boolean; // episodes are reaching Graphiti (202) but no job is completing
+  /**
+   * WHICH stall — `never-extracted` (0 facts, ever) or `stopped` (jobs stopped completing). Null when
+   * not stalled. The card MUST branch on this rather than composing its own copy: before STALLPROBE-1
+   * both causes were the same sentence, and after it "extracting 0 facts" is true of only one of them.
+   */
+  graphExtractionCause: ExtractionStallCause | null;
+  /** The server-composed operator sentence for that stall — single writer, shared verbatim with the
+   *  pipeline banner via `lib/graph/extraction-health.extractionStallReason`. */
+  graphExtractionReason: string | null;
+  /** Newest extracted RELATES_TO fact (ISO), OBSERVATIONAL ONLY since STALLPROBE-1: it no longer
+   *  accuses, because on a mature graph most extracted edges deduplicate and create no new fact, so a
+   *  frozen fact clock is the normal state of a healthy extractor. Shown because it is still the
+   *  answer to "is the graph learning anything NEW?", which is a real question — just not the same
+   *  question as "is the extractor alive?". Null when the graph is off/unreadable or has no facts. */
+  graphNewestFactAt: string | null;
   /** Extraction runs, but a group's same-name entity-split rate is over its own baseline — the
    *  name-collision census (AIO-693 re-armed by ALARMFIX-1). Never true while the alarm is unarmed
    *  (`CENSUS_ALARM_ARMED`), but the per-group numbers below show either way. */
@@ -203,12 +223,16 @@ export async function getRetrievalHealth(teamId: string): Promise<RetrievalHealt
     await Promise.all([
     denseHealth(teamId, configured),
     graphConfiguredNow ? new GraphitiClient().healthcheck() : Promise.resolve(false),
-    graphConfiguredNow ? graphFreshness(teamId) : Promise.resolve({ episodes: null, lastProjectedAt: null }),
+    graphConfiguredNow ? graphFreshness(teamId) : Promise.resolve({ episodes: null, pushedEpisodes: null, lastProjectedAt: null }),
     graphConfiguredNow ? countGraphFacts() : Promise.resolve(null),
     graphConfiguredNow ? newestFactAtMs() : Promise.resolve(null),
     graphConfiguredNow ? newestEpisodeAtMs(teamId) : Promise.resolve(null),
-    // When graphiti last FINISHED a job — the liveness leg (STALLPROBE-1).
-    graphConfiguredNow ? newestEpisodicAtMs() : Promise.resolve(null),
+    // The newest graphiti job that RAN TO COMPLETION — the liveness leg (STALLPROBE-1). Scoped to
+    // THIS team's ledger groups, because it is subtracted from the team-scoped `newestEpisodeAtMs`
+    // above and a global read would let another team's healthy extraction refresh this team's clock.
+    graphConfiguredNow
+      ? teamEpisodeGroupIds(teamId).then((groups) => newestEpisodicAtMs(groups))
+      : Promise.resolve(null),
     graphConfiguredNow ? groupCensuses(teamId) : Promise.resolve([] as GroupCensus[]),
     // Config-only resolution: no upstream call, nothing spent. Best-effort — a broken probe must
     // never fail the admin page.
@@ -244,9 +268,11 @@ export async function getRetrievalHealth(teamId: string): Promise<RetrievalHealt
   const graphExtractionStalled =
     graphReachable &&
     deriveGraphExtractionStalled({
-      episodes: graphFresh.episodes,
+      episodes: graphFresh.pushedEpisodes,
       facts: graphFacts,
       newestEpisodeAtMs: graphNewestEpisodeAt,
+      // Fact age is passed but NOT read (see `ExtractionSignals.newestFactAtMs`) — it is rendered as
+      // an observational line below, never as the accuser.
       newestFactAtMs: graphNewestFactAt,
       // STALLPROBE-1. This call site was MISSED when the liveness leg was first added, because the
       // field was optional and "omitted ⇒ old behaviour" — so the pipeline banner got the fix while
@@ -255,6 +281,17 @@ export async function getRetrievalHealth(teamId: string): Promise<RetrievalHealt
       // backstop.
       newestEpisodicAtMs: graphNewestEpisodicAt,
     });
+  // WHICH stall, and the one sentence describing it — both derived server-side and shared with the
+  // pipeline banner, so the card cannot drift into claiming "0 facts" about a liveness stall.
+  const graphExtractionCause = extractionStallCause(graphExtractionStalled, graphFacts);
+  const graphExtractionReason =
+    graphExtractionCause === null
+      ? null
+      : extractionStallReason(graphExtractionCause, {
+          episodes: graphFresh.pushedEpisodes,
+          facts: graphFacts,
+          lagHours: extractionLagHours(graphNewestEpisodeAt, graphNewestEpisodicAt),
+        });
   // The OTHER extraction failure: episodes become facts, but the facts are confidently wrong —
   // same-name entity splits accumulating from a model/embedding stack resolving identity badly
   // (AIO-693, the 2026-07-30 incident; census signal since ALARMFIX-1). Same detector as the
@@ -295,6 +332,9 @@ export async function getRetrievalHealth(teamId: string): Promise<RetrievalHealt
     graphLastProjectedAt: graphFresh.lastProjectedAt,
     graphStalled,
     graphExtractionStalled,
+    graphExtractionCause,
+    graphExtractionReason,
+    graphNewestFactAt: graphNewestFactAt === null ? null : new Date(graphNewestFactAt).toISOString(),
     graphCensusPolluted,
     graphCensus,
     graphProxyRefusal,
@@ -309,16 +349,36 @@ export async function getRetrievalHealth(teamId: string): Promise<RetrievalHealt
 /** Projection freshness from the `graph_episodes` ledger (Postgres, no Graphiti round-trip): how many
  *  episodes this team has projected and when the projector last succeeded. Drives the "reachable but
  *  stalled" degraded state. Best-effort — nulls on any error so the card still renders. */
-async function graphFreshness(teamId: string): Promise<{ episodes: number | null; lastProjectedAt: string | null }> {
+/**
+ * Two numbers from one ledger pass, with DELIBERATELY different sentinel treatment — the difference is
+ * the point and it is why they stay in one query rather than being split into two that could drift.
+ *
+ * `lastProjectedAt` counts ANY row, sentinel included: it answers "is the projector alive at all",
+ * and a redaction pass is the projector doing work. `pushedEpisodes` excludes the `""` sentinel sha,
+ * because it feeds `MIN_EPISODES_FOR_EXTRACTION_SIGNAL`, whose contract is "N ACCEPTED episodes
+ * reliably yield ≥1 fact" — a tombstone was never accepted by Graphiti and must not help clear a
+ * floor that then licenses a "0 facts" accusation. Review found this counting sentinels; 20 real
+ * pushes plus 5 redactions read as 25 and cleared the fresh-install floor.
+ */
+async function graphFreshness(
+  teamId: string
+): Promise<{ episodes: number | null; pushedEpisodes: number | null; lastProjectedAt: string | null }> {
   try {
-    const res = await runSql<{ n: string; mx: string | null }>(
-      "select count(*)::int as n, max(projected_at) as mx from graph_episodes where team_id = $1",
+    const res = await runSql<{ n: string; pushed: string; mx: string | null }>(
+      `select count(*)::int as n,
+              count(*) filter (where content_sha256 <> '')::int as pushed,
+              max(projected_at) as mx
+         from graph_episodes where team_id = $1`,
       [teamId]
     );
     const row = res.rows[0];
-    return { episodes: row ? Number(row.n) : 0, lastProjectedAt: row?.mx ?? null };
+    return {
+      episodes: row ? Number(row.n) : 0,
+      pushedEpisodes: row ? Number(row.pushed) : 0,
+      lastProjectedAt: row?.mx ?? null,
+    };
   } catch {
-    return { episodes: null, lastProjectedAt: null };
+    return { episodes: null, pushedEpisodes: null, lastProjectedAt: null };
   }
 }
 

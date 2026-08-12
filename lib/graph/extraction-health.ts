@@ -28,14 +28,30 @@ import { neo4jConfigured, runRead } from "./neo4j";
  * appears? Both halves are kept — zero-facts catches a broken install, the lag catches a working
  * install that stopped.
  *
- * WHAT THIS STILL CANNOT SEE — stated because the failure being corrected was over-claiming:
- *   • PARTIAL failure. Any single success inside the lag budget reads green, so a 90%-failure rate is
- *     invisible. (On graphiti_core ≤0.13.2 the `IS_DUPLICATE_OF` bookkeeping edges — ~26% of the
- *     graph — kept a run producing no real knowledge looking alive; 0.29.3 no longer writes them,
- *     but any single real fact inside the budget still reads green.)
- *   • SCOPE ASYMMETRY. Episodes are counted per team; facts are counted globally (the fact probe is
- *     deliberately not tier-scoped). On an instance with more than one group, one group's extraction
- *     dying is masked by another group's fresh facts.
+ * WHAT THIS STILL CANNOT SEE — stated because the failure being corrected was over-claiming, and
+ * REWRITTEN for the episode-node accuser (STALLPROBE-1); the old text described the deleted
+ * fact-lag predicate and had gone quietly false in the very change that made it false:
+ *   • PARTIAL failure. Any single COMPLETED job inside the lag budget reads green, so a 90%-failure
+ *     rate is invisible.
+ *   • ZERO-YIELD COMPLETION — the detection this slice knowingly trades away. A job that runs to
+ *     completion while extracting nothing writes its episode node, so it reads green by construction.
+ *     Entity-yield death has a partial backstop (the census refuses with `predicate-suspect` when a
+ *     group projects ≥`MIN_EPISODES_FOR_CENSUS_SUSPICION` episodes and produces zero names), but
+ *     EDGE-yield death does not: `extract_edges` legally returning `[]` on every episode — a
+ *     prompt/schema regression on a graphiti upgrade is the realistic cause — leaves entities fresh,
+ *     census names fresh, `facts > 0` and the episodic clock fresh, so every surface stays green.
+ *     The retired fact-lag half DID fire on that state — but indistinguishably from a healthy
+ *     dedup-frozen graph, which is the false positive this slice exists to remove. The trade is
+ *     deliberate (a false alarm on every mature graph, every quiet night, vs. a blind spot on a
+ *     failure mode never yet observed here) and it is written down rather than shipped silently.
+ *   • SCOPE. Both halves of the lag are now TEAM-scoped — `newestEpisodeAtMs` by `team_id`,
+ *     `newestEpisodicAtMs` by that team's ledger `group_id`s — so another team's healthy extraction
+ *     can no longer mask this one's. It could before: the first draft of the liveness leg read
+ *     `max(Episodic.created_at)` globally, and ANY completed job anywhere refreshed the clock, which
+ *     is strictly denser masking than the fact-lag asymmetry it replaced (that one needed the other
+ *     group to produce a genuinely NOVEL fact — rare, per this file's own premise). Found by review.
+ *     `facts`/`countGraphFacts` REMAINS global and deliberately un-scoped: "has the extractor ever
+ *     produced anything at all" is an install-level question, and scoping it is not this slice's.
  *   • A missing/unparseable timestamp disarms the recency half silently — safe, but invisible.
  *   • Detection lags by the budget (6h) by construction.
  *
@@ -74,7 +90,16 @@ export interface ExtractionSignals {
   facts: number | null;
   /** Newest `graph_episodes.projected_at` (ms) — when WE last pushed. */
   newestEpisodeAtMs?: number | null;
-  /** Newest RELATES_TO `created_at` (ms) — see `newestFactAtMs()` for why it is not `valid_at`. */
+  /**
+   * Newest RELATES_TO `created_at` (ms) — see `newestFactAtMs()` for why it is not `valid_at`.
+   *
+   * ACCEPTED AND DELIBERATELY IGNORED since STALLPROBE-1. It is not read by the predicate at all;
+   * the field survives as NEGATIVE SPACE, so that "a 30-day-stale fact with a live extractor is not
+   * a stall" is expressible as a test. That test is the thing that reddens if a future change
+   * re-wires fact age into the verdict, which is exactly the bug this slice removed. Optional
+   * because production no longer supplies it: the pipeline banner stopped fetching it (a dead
+   * 113k-relationship Neo4j scan per render), and the admin card fetches it only to SHOW it.
+   */
   newestFactAtMs?: number | null;
   /**
    * Newest `Episodic.created_at` (ms) — the liveness signal (STALLPROBE-1). See
@@ -107,8 +132,9 @@ export function deriveGraphExtractionStalled(input: ExtractionSignals): boolean 
   // ── LIVENESS IS THE EPISODE NODE, NOT THE FACTS (STALLPROBE-1) ───────────────────────────────
   // This used to compare the newest episode against the newest FACT, which asks "when did the graph
   // last learn something NEW?" and was read as "when did a job last FINISH?". On a mature graph those
-  // diverge: prod runs ~6.1 `dedupe_edges` per `extract_edges`, so most extracted edges resolve onto
-  // an existing edge and create no `RELATES_TO` — the clock freezes while extraction works. On
+  // diverge: prod runs 6.6 `dedupe_edges` per `extract_edges` (measured 2026-08-12: 8,919/1,340 over
+  // 30d; 6.59 over 7d; 7.50 over 2d), so most extracted edges resolve onto an existing edge and
+  // create no `RELATES_TO` — the clock freezes while extraction works. On
   // 2026-08-12 that reported "accepting episodes but extracting 0 facts" one minute after a clean run,
   // beside a census counting 2,928 new entities.
   //
@@ -236,8 +262,9 @@ export async function newestEpisodeAtMs(teamId: string): Promise<number | null> 
  * "# Save all episodes"). If the graph service ever moved to that path, an episode node would exist
  * even when extraction failed outright and this signal would decay to exactly the "202 accepted"
  * semantic it replaces. Nothing in this repo can detect that switch, so it is written down here.
- * (`add_triplet` at `:1745` constructs a throwaway `EpisodicNode` but passes `[]` as the episodic
- * nodes to the bulk write, so it never persists one and cannot refresh this clock.)
+ * (`add_triplet` at `:1645` constructs a throwaway `EpisodicNode` — the literal is at `:1745` — but
+ * passes `[]` as the episodic nodes to the bulk write, so it never persists one and cannot refresh
+ * this clock.)
  *
  * Chosen over the extractor's LLM spend ledger after two review rounds killed
  * that approach: `meterGraphCall` meters whatever `usage` arrives at any HTTP status (so billed
@@ -248,20 +275,42 @@ export async function newestEpisodeAtMs(teamId: string): Promise<number | null> 
  * uncovered, and `call_kind` is prompt-prefix-matched so a graph-service upgrade would fall to
  * `unknown` and re-manufacture the alarm.
  *
- * The episode node has none of those problems: it makes no claim about stage ordering (it is behind
- * the ONLY Neo4j write, so it covers every stage including that write), it depends on no prompt text,
- * a new episode can never deduplicate onto an existing node (the property whose absence caused the
- * false positive), and it is wall-clock rather than the backdated `reference_time`.
+ * The episode node has none of those problems: it makes no claim about stage ordering, it depends on
+ * no prompt text, a new episode can never deduplicate onto an existing node (the property whose
+ * absence caused the false positive), and it is wall-clock rather than the backdated `reference_time`.
+ * It is behind the only Neo4j write ON THE PATH WE RUN — scoped deliberately, because 0.29.3 writes
+ * more after it when a saga is passed (`:736-780`) or communities are enabled (`:1184`), neither of
+ * which the REST server does; an upgrade that starts passing sagas would move that boundary. The
+ * write itself IS covered rather than merely assumed to be: `add_nodes_and_edges_bulk` runs as one
+ * managed transaction (`utils/bulk_utils.py:136-146`, `session.execute_write`), so a failure part-way
+ * through rolls the episode node back with everything else.
  *
- * Unfiltered by group, exactly like `countGraphFacts` and `newestFactAtMs` — "did ANY job finish?" is
- * a global question and no content leaves the graph. Null on an unreadable/unconfigured Neo4j, which
- * the predicate treats as "can't tell", never as "broken".
+ * SCOPED BY GROUP, unlike `countGraphFacts` and `newestFactAtMs` — and that difference is the point,
+ * not an inconsistency. This value is compared against the TEAM-scoped `newestEpisodeAtMs`, so a
+ * global read makes the two halves of one subtraction describe different populations: any other
+ * team's healthy job refreshes the clock and this team's dead extractor reads green forever. Review
+ * caught that in the first draft. The global fact reads stay global because they answer a different,
+ * install-level question ("has the extractor ever produced anything at all"), which no team owns.
+ *
+ * Still a pure health probe: one `max()` aggregation, returning a timestamp and never a name, a body
+ * or a `group_id` — no content leaves the graph. Cheaper than the global form it replaces, too:
+ * graphiti creates `CREATE INDEX episode_group_id … FOR (n:Episodic) ON (n.group_id)`
+ * (`graph_queries.py:65`), so this is index-backed where `MATCH (e:Episodic)` was a label scan. That
+ * ledger `group_id`s match Neo4j's is not assumed — the census next door runs
+ * `MATCH (n:Entity {group_id: $g})` on those same ids and returns real prod numbers.
+ *
+ * Null on an unreadable/unconfigured Neo4j, an unreadable ledger (`groupIds === null`), or a team
+ * that has pushed nothing (`[]`) — all of which the predicate treats as "can't tell", never as
+ * "broken". The empty case matters: `IN []` matches nothing, which would otherwise read as a
+ * proven-silent extractor rather than as an absence of evidence.
  */
-export async function newestEpisodicAtMs(): Promise<number | null> {
+export async function newestEpisodicAtMs(groupIds: string[] | null): Promise<number | null> {
   if (!neo4jConfigured()) return null;
+  if (groupIds === null || groupIds.length === 0) return null;
   try {
     const rows = await runRead<{ at: string | null }>(
-      "MATCH (e:Episodic) WHERE e.created_at IS NOT NULL RETURN toString(max(e.created_at)) AS at"
+      "MATCH (e:Episodic) WHERE e.group_id IN $g AND e.created_at IS NOT NULL RETURN toString(max(e.created_at)) AS at",
+      { g: groupIds }
     );
     return parseProbeTimestamp(rows[0]?.at ?? null);
   } catch {
@@ -269,17 +318,101 @@ export async function newestEpisodicAtMs(): Promise<number | null> {
   }
 }
 
-/** Projected episodes for a team from the Postgres ledger (no Graphiti round-trip). */
-async function countProjectedEpisodes(teamId: string): Promise<number | null> {
+/**
+ * Episodes this team actually PUSHED, from the Postgres ledger (no Graphiti round-trip).
+ *
+ * `content_sha256 <> ''` for the same reason `newestEpisodeAtMs` carries it, and it was missing here
+ * until review caught it: the blanking/redaction and tier-vacate paths in `lib/graph/project.ts` park
+ * a row on the `""` sentinel sha without POSTing anything to Graphiti. Counting those inflates the
+ * number that clears `MIN_EPISODES_FOR_EXTRACTION_SIGNAL`, whose whole contract is "N ACCEPTED
+ * episodes reliably yield ≥1 fact" — a tombstone was never accepted by anything. Concretely: a young
+ * team with 20 real pushes and 5 redactions read as 25, cleared the fresh-install floor, and could be
+ * accused of "0 facts" while its first extraction was still legitimately pending.
+ */
+export async function countProjectedEpisodes(teamId: string): Promise<number | null> {
   try {
     const res = await runSql<{ n: number }>(
-      "select count(*)::int as n from graph_episodes where team_id = $1",
+      "select count(*)::int as n from graph_episodes where team_id = $1 and content_sha256 <> ''",
       [teamId]
     );
     return res.rows[0]?.n ?? 0;
   } catch {
     return null;
   }
+}
+
+/**
+ * The `group_id`s this team has actually pushed episodes into — the scope for the liveness read.
+ *
+ * Exists because the liveness leg's first draft was GLOBAL (`MATCH (e:Episodic)` over the whole
+ * database) while its counterpart `newestEpisodeAtMs` is team-scoped, so on a multi-team instance any
+ * other team completing a job refreshed this team's clock and hid its dead extractor. Ledger-defined
+ * for the same reason `groupCensuses` is: the ledger is the one source that knows what THIS team
+ * pushed, and a group that exists only in Neo4j is not this team's to judge.
+ *
+ * Same `content_sha256 <> ''` sentinel as everywhere else here — a group that only ever received
+ * redaction tombstones never had anything extracted, so it must not widen the scope. `null` on an
+ * unreadable ledger, which the caller turns into "can't tell", never into an accusation.
+ */
+export async function teamEpisodeGroupIds(teamId: string): Promise<string[] | null> {
+  try {
+    const res = await runSql<{ group_id: string | null }>(
+      "select distinct group_id from graph_episodes where team_id = $1 and content_sha256 <> ''",
+      [teamId]
+    );
+    return res.rows
+      .map((r) => r.group_id)
+      .filter((g): g is string => typeof g === "string" && g.length > 0);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * WHICH stall this is — the discriminator both surfaces branch on.
+ *
+ * `never-extracted` and `stopped` send an operator to different places and, since STALLPROBE-1, make
+ * DIFFERENT factual claims: "0 facts" is true only of the first. Exported and pure because it and
+ * `extractionStallReason` are the single writer of that distinction; the admin card used to compose
+ * its own copy and hard-coded the never-extracted wording for BOTH, so a liveness stall rendered
+ * "accepting episodes but extracting 0 facts" beside the same card's own 113,352-fact count. That is
+ * the "asserts X next to its own contradicting evidence" defect this whole slice exists to remove,
+ * and shipping it on the TRUE-positive path — the one an operator must believe — would have been
+ * worse than the false positive being fixed. Found by review.
+ */
+export type ExtractionStallCause = "never-extracted" | "stopped";
+
+export function extractionStallCause(stalled: boolean, facts: number | null): ExtractionStallCause | null {
+  if (!stalled) return null;
+  return facts === 0 ? "never-extracted" : "stopped";
+}
+
+/**
+ * The operator sentence for a stall. Pure, and the ONLY place either surface's copy is written.
+ *
+ * `lagHours` is hours between the newest PUSHED episode and the newest COMPLETED job — see
+ * `getGraphExtractionHealth` for why that is start-stamped, and `newestEpisodicAtMs` for why it
+ * overstates in the accusing direction. Null renders as "for some time" rather than "for nullh".
+ */
+export function extractionStallReason(
+  cause: ExtractionStallCause,
+  args: { episodes: number | null; facts: number | null; lagHours: number | null }
+): string {
+  if (cause === "never-extracted") {
+    return `${args.episodes ?? 0} episodes were projected but the graph has 0 extracted facts — Graphiti is accepting episodes (202) yet its entity-extraction worker is failing on every job. Check the graphiti service logs for the actual error; the usual causes are the extraction LLM's output-token cap or an out-of-quota key. New activity isn't becoming graph facts, so narrative arcs can't update.`;
+  }
+  const forHow = args.lagHours === null ? "for some time" : `for about ${args.lagHours}h`;
+  return `Graph extraction has STOPPED: episodes are still being projected, but graphiti has not completed one ${forHow} — no new episode node has appeared in the graph, and an episode node is only written once a job has finished everything else. (The graph holds ${args.facts ?? 0} facts from before; fact age itself is not the signal, because on a mature graph most extracted edges deduplicate and create no new fact even when extraction is perfectly healthy.) Check the graphiti service logs for the actual error — usually an out-of-quota extraction key, the output-token cap, or a failing Neo4j write. Narrative arcs and the Learning panel are running on stale facts.`;
+}
+
+/** Hours between the newest pushed episode and the newest completed job; null when either is unknown. */
+export function extractionLagHours(
+  newestEpisodeAt: number | null,
+  newestEpisodicAt: number | null
+): number | null {
+  return newestEpisodeAt !== null && newestEpisodicAt !== null
+    ? Math.round((newestEpisodeAt - newestEpisodicAt) / 3_600_000)
+    : null;
 }
 
 export async function getGraphExtractionHealth(teamId: string): Promise<GraphExtractionHealth> {
@@ -291,48 +424,43 @@ export async function getGraphExtractionHealth(teamId: string): Promise<GraphExt
     reason: null,
   };
   if (!neo4jConfigured()) return empty;
-  const [episodes, facts, newestEpisode, newestFact, censuses, newestEpisodic] = await Promise.all([
+  const [episodes, facts, newestEpisode, censuses, newestEpisodic] = await Promise.all([
     countProjectedEpisodes(teamId),
     countGraphFacts(),
     newestEpisodeAtMs(teamId),
-    newestFactAtMs(),
     groupCensuses(teamId),
-    // Liveness: the newest graphiti job that RAN TO COMPLETION. The leg that stops dedup-frozen
-    // novelty from reading as a dead extractor (STALLPROBE-1).
-    newestEpisodicAtMs(),
+    // Liveness: the newest graphiti job that RAN TO COMPLETION, scoped to THIS team's groups so
+    // another team's healthy extraction can't refresh this team's clock (STALLPROBE-1).
+    teamEpisodeGroupIds(teamId).then((groups) => newestEpisodicAtMs(groups)),
   ]);
   const pollutedCensus = censuses.find((c) => c.pollution.judgeable && c.pollution.polluted) ?? null;
   const signals: ExtractionSignals = {
     episodes,
     facts,
     newestEpisodeAtMs: newestEpisode,
-    newestFactAtMs: newestFact,
     newestEpisodicAtMs: newestEpisodic,
   };
   const stalled = deriveGraphExtractionStalled(signals);
-  const neverExtracted = stalled && facts === 0;
+  const cause = extractionStallCause(stalled, facts);
   // Hours since the newest COMPLETED job started, not since the last new fact — the reason string
   // quotes this and it must name the thing the verdict actually rests on. (Start, not finish: see
   // `newestEpisodicAtMs`. It overstates by at most one job's duration, in the accusing direction.)
-  const lagHours =
-    newestEpisode !== null && newestEpisodic !== null
-      ? Math.round((newestEpisode - newestEpisodic) / 3_600_000)
-      : null;
+  const lagHours = extractionLagHours(newestEpisode, newestEpisodic);
   return {
     episodes,
     facts,
     stalled,
     censusPolluted: pollutedCensus !== null,
     // Two distinct causes deserve two distinct sentences — "it never worked" and "it stopped" send an
-    // operator to different places. Both name the graphiti service logs, which is where the actual
-    // error string lives (a token cap, a 429 `insufficient_quota`, an invalid group_id).
+    // operator to different places, and since STALLPROBE-1 only the first may claim "0 facts". Both
+    // name the graphiti service logs, which is where the actual error string lives (a token cap, a
+    // 429 `insufficient_quota`, an invalid group_id).
     // A STALL outranks pollution: no facts at all is worse news than bad facts, and stacking two
     // paragraphs into one banner buries both.
-    reason: !stalled
-      ? (pollutedCensus?.pollution.reason ?? null)
-      : neverExtracted
-        ? `${episodes} episodes were projected but the graph has 0 extracted facts — Graphiti is accepting episodes (202) yet its entity-extraction worker is failing on every job. Check the graphiti service logs for the actual error; the usual causes are the extraction LLM's output-token cap or an out-of-quota key. New activity isn't becoming graph facts, so narrative arcs can't update.`
-        : `Graph extraction has STOPPED: episodes are still being projected, but graphiti has not FINISHED one for about ${lagHours}h — no new episode node has appeared in the graph, which is the last thing a completed job writes. (The graph holds ${facts} facts from before; fact age itself is not the signal, because on a mature graph most extracted edges deduplicate and create no new fact even when extraction is perfectly healthy.) Check the graphiti service logs for the actual error — usually an out-of-quota extraction key, the output-token cap, or a failing Neo4j write. Narrative arcs and the Learning panel are running on stale facts.`,
+    reason:
+      cause === null
+        ? (pollutedCensus?.pollution.reason ?? null)
+        : extractionStallReason(cause, { episodes, facts, lagHours }),
   };
 }
 

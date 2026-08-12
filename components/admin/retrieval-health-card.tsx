@@ -114,14 +114,24 @@ export function RetrievalHealthCard({ health }: { health: RetrievalHealth }) {
   // (the 2026-07 failure: writes 422'd for days while the service stayed "up"). The server flags this
   // (`graphStalled`) so the banner tells the admin which failure it actually is.
   const graphStalled = health.graphStalled;
-  // Reachable + writing episodes, but the extractor turns none of them into facts (Graphiti's
-  // entity-extraction worker is failing on every job). A distinct, more specific cause than a stalled
-  // projector, so it gets its own detail + banner and takes priority.
+  // Reachable + writing episodes, but Graphiti isn't turning them into a finished job. A distinct,
+  // more specific cause than a stalled projector, so it gets its own detail + banner and takes
+  // priority. TWO causes, and they make different factual claims — `never-extracted` may say "0
+  // facts", `stopped` may NOT: after STALLPROBE-1 a liveness stall fires with facts ≫ 0 (prod holds
+  // 113,352), so the old single hard-coded sentence would have asserted "extracting 0 facts" beside
+  // this card's own fact count. The server owns both the discriminator and the sentence
+  // (`lib/graph/extraction-health.extractionStallCause`/`extractionStallReason`) so this card and the
+  // pipeline banner cannot drift apart again.
   const graphExtractionStalled = health.graphExtractionStalled;
   const graphFreshness =
     health.graphEpisodes != null
       ? `${health.graphEpisodes} episodes${health.graphLastProjectedAt ? ` · last projected ${timeAgo(health.graphLastProjectedAt)}` : " · none projected yet"}`
       : undefined;
+  // The short leg text for a stall, matched to the cause. Never "0 facts" unless facts really are 0.
+  const graphStallDetail =
+    health.graphExtractionCause === "never-extracted"
+      ? `accepting episodes but extracting 0 facts — ${graphFreshness}`
+      : `no extraction has completed in over 6h — ${graphFreshness}`;
   // Extraction failing the OTHER way (AIO-693, census signal since ALARMFIX-1): episodes become
   // facts, but a group is accumulating same-name entity splits over its own baseline — identity is
   // being resolved badly. A stall outranks it in the copy below, same priority as the server's
@@ -131,7 +141,7 @@ export function RetrievalHealthCard({ health }: { health: RetrievalHealth }) {
     health.graph === "off"
       ? "not configured"
       : graphExtractionStalled
-        ? `accepting episodes but extracting 0 facts — ${graphFreshness}`
+        ? graphStallDetail
         : graphCensusPolluted
           ? `same-name entity splits above this graph's own baseline — ${graphFreshness}`
           : graphStalled
@@ -172,6 +182,18 @@ export function RetrievalHealthCard({ health }: { health: RetrievalHealth }) {
       <Leg name="Keyword" state="on" detail="always on (local Postgres FTS)" />
       <Leg name="Semantic" state={d.state} detail={denseDetail} />
       <Leg name="Graph memory" state={health.graph} detail={graphDetail} />
+      {/* OBSERVATIONAL, never an accusation (STALLPROBE-1). Fact age used to BE the stall verdict,
+          which was the bug: on a mature graph most extracted edges deduplicate, so this clock freezes
+          while extraction is perfectly healthy. It is shown — deliberately, in the quiet tertiary
+          style, next to the census rather than in the leg state — because "is the graph learning
+          anything NEW?" is still a real question; it is just not the same question as "is the
+          extractor alive?", and the spec promised this line rather than a silently-dropped signal. */}
+      {health.graph !== "off" && health.graphNewestFactAt ? (
+        <p className="ml-[18px] text-[11px] text-ink-tertiary">
+          newest extracted fact {timeAgo(health.graphNewestFactAt)} — informational; a mature graph
+          mostly deduplicates, so this can sit still while extraction is healthy
+        </p>
+      ) : null}
       {health.graphCensus.length > 0 ? (
         <div className="ml-[18px] border-l border-border-subtle pl-3">
           <p className="pt-0.5 text-[11px] uppercase tracking-wide text-ink-tertiary">
@@ -208,11 +230,12 @@ export function RetrievalHealthCard({ health }: { health: RetrievalHealth }) {
         <p className="mt-2 rounded-lg border border-red-400/30 bg-red-400/10 px-3 py-2 text-xs text-red-600 dark:text-red-300">
           {graphExtractionStalled ? (
             <>
-              Graph memory is reachable and <strong>accepting episodes, but its extractor is producing no
-              facts</strong> ({health.graphEpisodes} projected · {health.graphFacts ?? 0} facts). Graphiti
-              returns <code>202</code> then fails entity extraction on every job — commonly the LLM
-              output-token cap (<code>Output length exceeded max tokens</code>). New activity isn&apos;t
-              becoming graph facts, so narrative arcs can&apos;t update. Check the Graphiti service logs.
+              {/* Rendered verbatim from the server, NOT re-worded here. The card used to compose its
+                  own paragraph and hard-coded the never-extracted wording ("producing no facts",
+                  "fails entity extraction on every job") for both causes — so after STALLPROBE-1 a
+                  liveness stall would have claimed 0 facts while printing the real count in the same
+                  sentence. One writer, two surfaces. */}
+              {health.graphExtractionReason}{" "}
               Keyword and semantic search are unaffected.
             </>
           ) : graphCensusPolluted ? (
