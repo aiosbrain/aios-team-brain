@@ -1,7 +1,8 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { visibleProjects } from "@/lib/access/oracle";
-import { visibleItemIds } from "@/lib/access/enforce";
+import { visibleItemIds, teamEnforcesAccess } from "@/lib/access/enforce";
+import { canSeeAccess, type ViewerTier } from "@/lib/auth/visibility";
 import { EVERYONE_SLUG, EXTERNAL_SLUG } from "@/lib/access/groups";
 
 /**
@@ -10,35 +11,44 @@ import { EVERYONE_SLUG, EXTERNAL_SLUG } from "@/lib/access/groups";
  * and doubles as the runtime cache-leak check (§5.8): given a rendered payload's item ids, which
  * ones must this principal NOT see.
  *
- * CRITICAL — the inspector must AGREE with the oracle, never re-derive the decision from a second
- * source (spec: "the oracle, RLS policies, the inspector, the leak suite all union a second source,
- * which is the divergence risk"). So the `visible` verdict here comes from the SAME
- * `visibleProjects`/`visibleItemIds` the enforcement path uses; only the CHAIN (the explanation) is
- * assembled from the edge tables. This is a READ-ONLY diagnostic — it writes nothing.
+ * CRITICAL — the inspector must AGREE with the ACTUAL enforced read, never a partial re-derivation
+ * (spec: divergence is the risk; "an inspector that disagrees with enforcement is worse than none").
+ * The enforced read is **legacy-tier ∧ (enforcing ? oracle : allow-all-in-tier)** (`lib/access/enforce`
+ * "oracle ∧ legacy-tier"; the oracle conjunct is GATED by `teams.access_enforcement`). So this module
+ * applies BOTH conjuncts, mode-aware:
+ *   - the TIER conjunct (`canSeeAccess(member.tier, item.access)`) is ALWAYS a factor — it is the
+ *     standing app-code invariant with no RLS backstop (CLAUDE.md §5), and a §5.8 leak check that
+ *     ignored it would be blind to the very leak class it exists to catch (Fable B6 High);
+ *   - the ORACLE conjunct (the project-membership chain) applies ONLY on an `enforcing` team. On a
+ *     `permissive` team the member genuinely sees everything in their tier, so an un-granted item is
+ *     NOT a leak (serving it is by-design) — reporting it as one would be a false incident (Fable B6
+ *     Medium). The returned `mode` tells the admin which semantics the verdict reflects.
+ *
+ * This is a READ-ONLY diagnostic — it writes nothing.
  */
 
-/** How a member holds a group — the three legitimate membership legs the oracle honors. */
 export type MembershipVia = "builtin_tier" | "singleton" | "added";
 export type GroupKind = "everyone" | "external" | "singleton" | "ordinary";
+export type EnforcementMode = "enforcing" | "permissive";
 
 export interface VisibilityChain {
   projectId: string;
   group: { id: string; slug: string; name: string; kind: GroupKind };
-  /** How the member is IN the group. */
   membership: { via: MembershipVia; addedBy: string | null; at: string | null };
-  /** The project_groups grant edge (who granted the project to the group). */
   grant: { addedBy: string | null; at: string | null };
-  /** The unit→project membership edge (why the item is in the project). */
   unit: { method: string; decidedBy: string | null; validFrom: string | null };
 }
 
 export interface ItemVisibility {
   itemId: string;
   memberId: string;
+  /** The team's enforcement mode — the verdict below reflects THIS mode's semantics. */
+  mode: EnforcementMode;
   visible: boolean;
-  /** One entry per distinct (project, group) grant path that makes the item visible. Empty when not. */
+  /** The project-grant paths that make the item visible under ENFORCING. Empty when not visible, or
+   *  on a permissive team (no project gate is active — visibility is by tier alone). */
   chains: VisibilityChain[];
-  /** Set only when NOT visible — the coarse reason (never leaks WHICH restricted project holds it). */
+  /** Set only when NOT visible — coarse, never names the restricted project (§5.7). */
   reason?: string;
 }
 
@@ -52,17 +62,41 @@ export async function explainItemVisibility(
   db: DbClient,
   { teamId, memberId, itemId }: { teamId: string; memberId: string; itemId: string }
 ): Promise<ItemVisibility> {
-  // 1. The AUTHORITATIVE decision inputs — the member's oracle-visible projects + post-eligibility
-  //    groups. Reusing the oracle is what keeps the inspector from disagreeing with enforcement.
+  const mode: EnforcementMode = (await teamEnforcesAccess(db, teamId)) ? "enforcing" : "permissive";
+
+  const [{ data: member }, { data: item }] = await Promise.all([
+    db.from("members").select("tier").eq("team_id", teamId).eq("id", memberId).maybeSingle(),
+    db.from("items").select("access").eq("team_id", teamId).eq("id", itemId).maybeSingle(),
+  ]);
+  if (!member) return { itemId, memberId, mode, visible: false, chains: [], reason: "member not found in this team" };
+  if (!item) return { itemId, memberId, mode, visible: false, chains: [], reason: "item not found in this team" };
+  const tier = ((member as { tier: string | null }).tier ?? "external") as ViewerTier;
+  const tierOk = canSeeAccess(tier, (item as { access: string | null }).access ?? "team");
+
+  // THE TIER CONJUNCT — always a factor. A tier miss is a hard no in any mode.
+  if (!tierOk) {
+    return { itemId, memberId, mode, visible: false, chains: [], reason: "your access tier cannot see this item's access level" };
+  }
+  // Permissive team: enforcement's oracle conjunct is inactive → visible by tier, no project chain.
+  if (mode === "permissive") {
+    return { itemId, memberId, mode, visible: true, chains: [] };
+  }
+
+  // Enforcing: the ORACLE conjunct. The member's oracle-visible projects + post-eligibility groups.
   const { projectIds: visibleProjIds, groupIds } = await visibleProjects(db, { teamId, memberId });
 
-  // 2. The item's ACTIVE include-memberships: which project(s) hold it, and the unit edge's provenance.
-  const { data: unitRows } = await db
+  // The item's ACTIVE include-memberships: which project(s) hold it + the unit edge's provenance.
+  const { data: unitRows, error: unitErr } = await db
     .from("project_context_memberships")
     .select("project_id, method, decided_by, valid_from, project_context_units(source_item_id, state, unit_kind)")
     .eq("team_id", teamId)
     .eq("decision", "include")
     .is("valid_to", null);
+  if (unitErr) {
+    // A swallowed read error would produce a confidently-false "not partitioned" answer from a
+    // diagnostics tool whose whole output is that sentence — fail closed with an HONEST reason.
+    return { itemId, memberId, mode, visible: false, chains: [], reason: "access substrate read error — visibility could not be determined" };
+  }
   type UnitRow = {
     project_id: string;
     method: string;
@@ -74,33 +108,35 @@ export async function explainItemVisibility(
   for (const r of (unitRows ?? []) as UnitRow[]) {
     const u = r.project_context_units;
     if (u && u.state === "active" && u.unit_kind === "item" && u.source_item_id === itemId) {
-      // A unit can be tagged into a project once; first active include wins for the edge display.
       if (!itemProjects.has(r.project_id)) {
         itemProjects.set(r.project_id, { method: r.method, decidedBy: r.decided_by, validFrom: r.valid_from });
       }
     }
   }
 
-  // 3. The projects that BOTH hold the item AND the member can see — the visibility intersection.
   const grantingProjects = [...itemProjects.keys()].filter((p) => visibleProjIds.has(p));
   if (grantingProjects.length === 0) {
-    // Coarse reason only — never name a restricted project the member can't see (§5.7).
     const reason = itemProjects.size === 0
       ? "the item has no active project membership (not yet partitioned, or removed)"
       : groupIds.size === 0
         ? "you are in no groups that grant access"
         : "no group you are in is granted a project that holds this item";
-    return { itemId, memberId, visible: false, chains: [], reason };
+    return { itemId, memberId, mode, visible: false, chains: [], reason };
   }
 
-  // 4. Build the chain per (project, group) grant path — ONLY through the member's post-eligibility
-  //    groups (so a stale built-in membership the oracle already filtered out never shows as a path).
-  const { data: grantRows } = await db
+  // Build the chain per (project, group) grant path — ONLY through the member's post-eligibility
+  // groups. Because `visibleProjIds` is DERIVED from those groups (oracle.ts), every granting project
+  // has ≥1 grant row through a kept group, so `chains` is empty here only on a concurrent grant
+  // delete or a swallowed read error — not the "eligibility dropped the group" case.
+  const { data: grantRows, error: grantErr } = await db
     .from("project_groups")
     .select("project_id, group_id, added_by, created_at")
     .eq("team_id", teamId)
     .in("project_id", grantingProjects)
     .in("group_id", [...groupIds]);
+  if (grantErr) {
+    return { itemId, memberId, mode, visible: false, chains: [], reason: "access substrate read error — visibility could not be determined" };
+  }
   const grants = (grantRows ?? []) as { project_id: string; group_id: string; added_by: string | null; created_at: string | null }[];
 
   const groupIdsInPlay = [...new Set(grants.map((g) => g.group_id))];
@@ -114,35 +150,30 @@ export async function explainItemVisibility(
   const chains: VisibilityChain[] = [];
   for (const grant of grants) {
     const g = groupById.get(grant.group_id);
-    if (!g) continue; // group row missing → not a renderable path (defensive)
-    const kind = groupKind(g);
+    if (!g) continue;
+    const via: MembershipVia = g.is_builtin ? "builtin_tier" : g.person_member_id === memberId ? "singleton" : "added";
     const gm = gmByGroup.get(grant.group_id);
-    // How the member holds this group: a built-in via tier (no group_members row needed), a
-    // singleton "directly added" (person_member_id === member), else an explicit `group_members` add.
-    const via: MembershipVia =
-      g.is_builtin ? "builtin_tier" : g.person_member_id === memberId ? "singleton" : "added";
     const unit = itemProjects.get(grant.project_id)!;
     chains.push({
       projectId: grant.project_id,
-      group: { id: g.id, slug: g.slug, name: g.name, kind },
+      group: { id: g.id, slug: g.slug, name: g.name, kind: groupKind(g) },
       membership: { via, addedBy: gm?.added_by ?? null, at: gm?.created_at ?? null },
       grant: { addedBy: grant.added_by, at: grant.created_at },
       unit,
     });
   }
 
-  // If the oracle says the member sees a granting project but no chain row survives (e.g. the grant
-  // is held only through a group the eligibility filter dropped), report visible with no chain
-  // rather than lie either way — but this should be empty only in a genuine race, so keep visible
-  // aligned to the oracle intersection, not to `chains.length`.
-  return { itemId, memberId, visible: true, chains };
+  // `visible` tracks the oracle∧tier verdict, not `chains.length` (a raced chain read must not flip
+  // the verdict the enforcement path would actually take).
+  return { itemId, memberId, mode, visible: true, chains };
 }
 
 /**
- * The runtime cache-leak check (spec §5.8): given a set of item ids a surface is about to render (a
- * timeline/arc/query payload), return the subset this principal must NOT see. Empty = clean. Reuses
- * the SAME `visibleItemIds` resolver the enforcement path uses, so a "leak" it reports is a real one
- * by the enforcement's own definition — a genuine backstop, not a second opinion.
+ * The runtime cache-leak check (spec §5.8): given a set of item ids a surface is about to render,
+ * return the subset this principal must NOT see under the ACTIVE enforcement — legacy-tier ∧
+ * (enforcing ? oracle : allow). Empty = clean FOR THAT MODE. Applies the SAME two conjuncts the read
+ * path does, so a reported leak is a real one; and it is NOT blind to the tier-isolation leak class
+ * (external reading team content), which the oracle set alone would miss (Fable B6 High).
  */
 export async function auditVisibilityAgainstItemIds(
   db: DbClient,
@@ -150,6 +181,22 @@ export async function auditVisibilityAgainstItemIds(
   itemIds: readonly string[]
 ): Promise<string[]> {
   if (itemIds.length === 0) return [];
-  const { ids: visible } = await visibleItemIds(db, { teamId, memberId });
-  return [...new Set(itemIds)].filter((id) => !visible.has(id));
+  const ids = [...new Set(itemIds)];
+  const enforcing = await teamEnforcesAccess(db, teamId);
+
+  const [{ data: member }, { data: itemRows }] = await Promise.all([
+    db.from("members").select("tier").eq("team_id", teamId).eq("id", memberId).maybeSingle(),
+    db.from("items").select("id, access").eq("team_id", teamId).in("id", ids),
+  ]);
+  const tier = ((member as { tier: string | null } | null)?.tier ?? "external") as ViewerTier;
+  const accessById = new Map(((itemRows ?? []) as { id: string; access: string | null }[]).map((r) => [r.id, r.access ?? "team"]));
+  const oracleVisible = enforcing ? (await visibleItemIds(db, { teamId, memberId })).ids : null;
+
+  return ids.filter((id) => {
+    const access = accessById.get(id);
+    if (access == null) return true; // unknown item (not in this team) → fail closed → a leak
+    const tierOk = canSeeAccess(tier, access);
+    const oracleOk = oracleVisible ? oracleVisible.has(id) : true; // permissive → oracle not applied
+    return !(tierOk && oracleOk);
+  });
 }

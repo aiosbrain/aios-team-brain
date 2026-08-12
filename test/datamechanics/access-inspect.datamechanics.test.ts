@@ -4,22 +4,25 @@ import { db, ingest, seedTeam, type Seed } from "./helpers";
 import { backfillTeamContext } from "@/lib/projects/context/backfill";
 import { explainItemVisibility, auditVisibilityAgainstItemIds } from "@/lib/access/inspect";
 import { visibleItemIds } from "@/lib/access/enforce";
+import { canSeeAccess } from "@/lib/auth/visibility";
 import { createGroup, grantProjectToGroup, addMemberToGroup, ensurePersonSingleton } from "@/lib/access/groups";
 
-// Phase B slice 6 (spec §15.6/§5.8) — the permission inspector. The load-bearing proofs: the WHY
-// chain names the real person→group→project→unit path with provenance; the `visible` verdict AGREES
-// with the enforcement oracle (never a second opinion); the leak-check returns exactly the ids a
-// principal must not see; and a not-visible answer never names the restricted project (§5.7).
+// Phase B slice 6 (spec §15.6/§5.8). The inspector must reflect the FULL enforced read —
+// legacy-tier ∧ (enforcing ? oracle : allow), mode-aware — not just the oracle conjunct (Fable B6
+// High). Proofs: the WHY chain + provenance; `visible` AGREES with the enforced read in BOTH modes
+// and BOTH conjuncts; the leak-check sees tier leaks too; §5.7 never names the restricted project.
 
-async function seedMember(seed: Seed): Promise<string> {
+async function seedMember(seed: Seed, tier: "team" | "external" = "team"): Promise<string> {
   const { data } = await db()
     .from("members")
-    .insert({ team_id: seed.teamId, email: `${randomUUID()}@test.local`, display_name: "M", actor_handle: `h-${randomUUID().slice(0, 10)}`, role: "member", tier: "team", status: "active" })
+    .insert({ team_id: seed.teamId, email: `${randomUUID()}@test.local`, display_name: "M", actor_handle: `h-${randomUUID().slice(0, 10)}`, role: "member", tier, status: "active" })
     .select("id")
     .single();
   return data!.id as string;
 }
-/** Move an item into a fresh restricted project granted to a fresh group; return {projectId, groupId}. */
+async function setEnforcement(seed: Seed, mode: "permissive" | "enforcing") {
+  await db().from("teams").update({ access_enforcement: mode }).eq("id", seed.teamId);
+}
 async function restrictInto(seed: Seed, itemId: string, memberInGroup?: string): Promise<{ projectId: string; groupId: string }> {
   const { data: proj } = await db().from("projects").insert({ team_id: seed.teamId, slug: `r-${randomUUID().slice(0, 8)}`, name: "Vault", kind: "initiative" }).select("id").single();
   const g = await createGroup(db(), seed.teamId, `rg-${randomUUID().slice(0, 8)}`, "Vault group", seed.memberId);
@@ -32,44 +35,46 @@ async function restrictInto(seed: Seed, itemId: string, memberInGroup?: string):
 }
 
 describe("permission inspector — explainItemVisibility (Phase B slice 6)", () => {
-  it("a General item: VISIBLE to an Everyone member, with the everyone→General→unit chain", async () => {
+  it("enforcing + General item: VISIBLE to an Everyone member via the everyone→General→unit chain", async () => {
     const seed = await seedTeam();
     const item = await ingest(seed, { path: "gen.md", body: "general work", access: "team", project: "src" });
     const member = await seedMember(seed);
     await backfillTeamContext(db(), seed.teamId);
+    await setEnforcement(seed, "enforcing");
 
     const v = await explainItemVisibility(db(), { teamId: seed.teamId, memberId: member, itemId: item.id });
+    expect(v.mode).toBe("enforcing");
     expect(v.visible).toBe(true);
-    expect(v.chains.length).toBeGreaterThanOrEqual(1);
     const everyoneChain = v.chains.find((c) => c.group.kind === "everyone");
     expect(everyoneChain, "the path runs through the Everyone built-in").toBeDefined();
-    expect(everyoneChain!.membership.via, "a built-in is held by TIER, no group_members row").toBe("builtin_tier");
-    expect(everyoneChain!.unit.method, "the unit edge carries its provenance").toBeTruthy();
+    expect(everyoneChain!.membership.via).toBe("builtin_tier");
+    expect(everyoneChain!.unit.method).toBeTruthy();
   });
 
-  it("a restricted item: VISIBLE to a member IN the restricting group — chain shows the explicit add + grant provenance", async () => {
+  it("enforcing + restricted item: VISIBLE to a member IN the group — chain shows the add + grant provenance", async () => {
     const seed = await seedTeam();
     const item = await ingest(seed, { path: "sec.md", body: "secret work", access: "team", project: "src" });
     const insider = await seedMember(seed);
     await backfillTeamContext(db(), seed.teamId);
     const { projectId, groupId } = await restrictInto(seed, item.id, insider);
+    await setEnforcement(seed, "enforcing");
 
     const v = await explainItemVisibility(db(), { teamId: seed.teamId, memberId: insider, itemId: item.id });
     expect(v.visible).toBe(true);
     const chain = v.chains.find((c) => c.projectId === projectId && c.group.id === groupId);
-    expect(chain, "the path runs through the restricting group").toBeDefined();
-    expect(chain!.membership.via, "an ordinary group add is 'added'").toBe("added");
-    expect(chain!.membership.addedBy, "who added the member is recorded").toBe(seed.memberId);
-    expect(chain!.grant.addedBy, "who granted the project to the group is recorded").toBe(seed.memberId);
+    expect(chain!.membership.via).toBe("added");
+    expect(chain!.membership.addedBy).toBe(seed.memberId);
+    expect(chain!.grant.addedBy).toBe(seed.memberId);
     expect(chain!.unit.decidedBy).toBe(seed.memberId);
   });
 
-  it("a restricted item: NOT visible to an outsider — no chain, coarse reason that never names the project (§5.7)", async () => {
+  it("enforcing + restricted item: NOT visible to an outsider — no chain, coarse reason that never names the project (§5.7)", async () => {
     const seed = await seedTeam();
     const item = await ingest(seed, { path: "sec2.md", body: "secret", access: "team", project: "src" });
     const outsider = await seedMember(seed);
     await backfillTeamContext(db(), seed.teamId);
-    const { projectId } = await restrictInto(seed, item.id); // outsider NOT added
+    const { projectId } = await restrictInto(seed, item.id);
+    await setEnforcement(seed, "enforcing");
 
     const v = await explainItemVisibility(db(), { teamId: seed.teamId, memberId: outsider, itemId: item.id });
     expect(v.visible).toBe(false);
@@ -78,27 +83,59 @@ describe("permission inspector — explainItemVisibility (Phase B slice 6)", () 
     expect(JSON.stringify(v), "the not-visible answer must NOT leak the restricted project id").not.toContain(projectId);
   });
 
-  it("the inspector's `visible` verdict AGREES with the enforcement oracle for the same principal", async () => {
+  it("PERMISSIVE team: the outsider CAN see the restricted item (enforcement off — by tier), mode=permissive, no false 'not visible'", async () => {
+    const seed = await seedTeam();
+    const item = await ingest(seed, { path: "p.md", body: "p", access: "team", project: "src" });
+    const outsider = await seedMember(seed);
+    await backfillTeamContext(db(), seed.teamId);
+    await restrictInto(seed, item.id); // outsider not in the group
+    // access_enforcement defaults to permissive — do NOT flip it.
+
+    const v = await explainItemVisibility(db(), { teamId: seed.teamId, memberId: outsider, itemId: item.id });
+    expect(v.mode).toBe("permissive");
+    expect(v.visible, "on a permissive team a team-tier member sees team content — the oracle is inactive").toBe(true);
+    expect(v.chains, "no project gate is active under permissive").toEqual([]);
+  });
+
+  it("the TIER conjunct is applied: an external-tier member in an ordinary group granted a TEAM-access item is NOT visible even under enforcing (Fable B6 High)", async () => {
+    const seed = await seedTeam();
+    const item = await ingest(seed, { path: "t.md", body: "team-only", access: "team", project: "src" });
+    const external = await seedMember(seed, "external");
+    await backfillTeamContext(db(), seed.teamId);
+    // Put the external member IN the restricting ordinary group (tier-independent by design) → the
+    // oracle would grant the project, but the tier conjunct must still deny a team-access item.
+    const { projectId } = await restrictInto(seed, item.id, external);
+    await setEnforcement(seed, "enforcing");
+
+    const v = await explainItemVisibility(db(), { teamId: seed.teamId, memberId: external, itemId: item.id });
+    expect(v.visible, "the tier conjunct denies external→team even when the oracle grants the project").toBe(false);
+    expect(v.reason).toMatch(/tier/i);
+    void projectId;
+  });
+
+  it("the `visible` verdict AGREES with the FULL enforced read (tier ∧ oracle) in enforcing mode", async () => {
     const seed = await seedTeam();
     const open = await ingest(seed, { path: "o.md", body: "o", access: "team", project: "src" });
     const secret = await ingest(seed, { path: "s.md", body: "s", access: "team", project: "src" });
     const member = await seedMember(seed);
     await backfillTeamContext(db(), seed.teamId);
-    await restrictInto(seed, secret.id); // member is an outsider to the restriction
+    await restrictInto(seed, secret.id);
+    await setEnforcement(seed, "enforcing");
 
-    const { ids: enforced } = await visibleItemIds(db(), { teamId: seed.teamId, memberId: member });
+    const { ids: oracleVisible } = await visibleItemIds(db(), { teamId: seed.teamId, memberId: member });
     for (const it of [open, secret]) {
+      const { data: row } = await db().from("items").select("access").eq("id", it.id).single();
+      const enforced = canSeeAccess("team", (row!.access as string) ?? "team") && oracleVisible.has(it.id);
       const v = await explainItemVisibility(db(), { teamId: seed.teamId, memberId: member, itemId: it.id });
-      expect(v.visible, `inspector must match the oracle for ${it.path}`).toBe(enforced.has(it.id));
+      expect(v.visible, `inspector must match the enforced read for ${it.path}`).toBe(enforced);
     }
   });
 
-  it("a singleton (direct person add) renders as a singleton membership", async () => {
+  it("enforcing + a singleton (direct person add) renders as a singleton membership", async () => {
     const seed = await seedTeam();
     const item = await ingest(seed, { path: "d.md", body: "d", access: "team", project: "src" });
     const person = await seedMember(seed);
     await backfillTeamContext(db(), seed.teamId);
-    // A restricted project granted to the person's SINGLETON group (the "direct person add", §4).
     const { data: proj } = await db().from("projects").insert({ team_id: seed.teamId, slug: `d-${randomUUID().slice(0, 8)}`, kind: "initiative" }).select("id").single();
     const singleton = await ensurePersonSingleton(db(), seed.teamId, person, seed.memberId);
     expect(singleton.ok, singleton.error).toBe(true);
@@ -106,6 +143,7 @@ describe("permission inspector — explainItemVisibility (Phase B slice 6)", () 
     const { data: unit } = await db().from("project_context_units").select("id").eq("source_item_id", item.id).single();
     await db().from("project_context_memberships").update({ valid_to: new Date().toISOString() }).eq("context_unit_id", unit!.id).is("valid_to", null);
     await db().from("project_context_memberships").insert({ team_id: seed.teamId, project_id: proj!.id as string, context_unit_id: unit!.id, method: "manual", decided_by: seed.memberId });
+    await setEnforcement(seed, "enforcing");
 
     const v = await explainItemVisibility(db(), { teamId: seed.teamId, memberId: person, itemId: item.id });
     expect(v.visible).toBe(true);
@@ -113,22 +151,47 @@ describe("permission inspector — explainItemVisibility (Phase B slice 6)", () 
     expect(chain!.group.kind).toBe("singleton");
     expect(chain!.membership.via).toBe("singleton");
   });
+
+  it("enforcing: a RETRACTED (non-active) unit membership does NOT confer visibility — pins the state='active' predicate", async () => {
+    const seed = await seedTeam();
+    const item = await ingest(seed, { path: "ret.md", body: "r", access: "team", project: "src" });
+    const insider = await seedMember(seed);
+    await backfillTeamContext(db(), seed.teamId);
+    const { projectId } = await restrictInto(seed, item.id, insider);
+    // Retract the unit: the member is in the granting group, the membership is include+valid, but the
+    // UNIT is no longer active — the enforced read (state='active') drops it, so the inspector must too.
+    await db().from("project_context_units").update({ state: "retracted" }).eq("source_item_id", item.id);
+    await setEnforcement(seed, "enforcing");
+
+    const v = await explainItemVisibility(db(), { teamId: seed.teamId, memberId: insider, itemId: item.id });
+    expect(v.visible, "a retracted unit confers no visibility").toBe(false);
+    void projectId;
+  });
 });
 
 describe("permission inspector — auditVisibilityAgainstItemIds (§5.8 runtime cache-leak check)", () => {
-  it("returns exactly the ids the principal must NOT see, [] when clean", async () => {
+  it("enforcing: returns exactly the oracle-restricted ids the principal must NOT see, [] when clean", async () => {
     const seed = await seedTeam();
     const open = await ingest(seed, { path: "a.md", body: "a", access: "team", project: "src" });
     const secret = await ingest(seed, { path: "b.md", body: "b", access: "team", project: "src" });
     const outsider = await seedMember(seed);
     await backfillTeamContext(db(), seed.teamId);
     await restrictInto(seed, secret.id);
+    await setEnforcement(seed, "enforcing");
 
-    const leaks = await auditVisibilityAgainstItemIds(db(), { teamId: seed.teamId, memberId: outsider }, [open.id, secret.id]);
-    expect(leaks, "the restricted item is a leak; the General one is not").toEqual([secret.id]);
+    expect(await auditVisibilityAgainstItemIds(db(), { teamId: seed.teamId, memberId: outsider }, [open.id, secret.id])).toEqual([secret.id]);
+    expect(await auditVisibilityAgainstItemIds(db(), { teamId: seed.teamId, memberId: outsider }, [open.id])).toEqual([]);
+    expect(await auditVisibilityAgainstItemIds(db(), { teamId: seed.teamId, memberId: outsider }, [])).toEqual([]);
+  });
 
-    const clean = await auditVisibilityAgainstItemIds(db(), { teamId: seed.teamId, memberId: outsider }, [open.id]);
-    expect(clean).toEqual([]);
-    expect(await auditVisibilityAgainstItemIds(db(), { teamId: seed.teamId, memberId: outsider }, []), "empty in → empty out").toEqual([]);
+  it("sees the TIER leak class too: an external member + a team-access item is a leak in ANY mode (the leak the oracle set alone would miss, Fable B6 High)", async () => {
+    const seed = await seedTeam();
+    const teamItem = await ingest(seed, { path: "team.md", body: "t", access: "team", project: "src" });
+    const extItem = await ingest(seed, { path: "ext.md", body: "e", access: "external", project: "src" });
+    const external = await seedMember(seed, "external");
+    await backfillTeamContext(db(), seed.teamId);
+    // PERMISSIVE team (default) — the oracle is inactive, so ONLY the tier conjunct is the enforcement.
+    const leaks = await auditVisibilityAgainstItemIds(db(), { teamId: seed.teamId, memberId: external }, [teamItem.id, extItem.id]);
+    expect(leaks, "the team-access item is a tier leak; the external-access one is not").toEqual([teamItem.id]);
   });
 });

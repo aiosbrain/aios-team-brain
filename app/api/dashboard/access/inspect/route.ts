@@ -11,8 +11,10 @@ export const runtime = "nodejs";
 
 /**
  * The permission inspector (spec §15.6) — "why can ⟨member⟩ see ⟨item⟩?" + the runtime cache-leak
- * check (§5.8). ADMIN-ONLY: it renders another principal's visibility chain (who is in which group,
- * who granted what) — internal access-topology detail no ordinary/external member may read. Gated by
+ * check (§5.8). The verdict reflects the FULL enforced read (legacy-tier ∧ (enforcing ? oracle :
+ * allow), mode-aware — see `lib/access/inspect`), so it agrees with what enforcement actually does.
+ * ADMIN-ONLY: it renders another principal's visibility chain (who is in which group, who granted
+ * what) — internal access-topology detail no ordinary/external member may read. Gated by
  * `canAccessAdmin` (admin role AND unrestricted tier, fail closed — the same gate as the /admin
  * subtree; no RLS backstop, CLAUDE.md §5).
  *
