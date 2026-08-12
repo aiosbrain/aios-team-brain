@@ -77,7 +77,9 @@ export interface ExtractionSignals {
   /** Newest RELATES_TO `created_at` (ms) — see `newestFactAtMs()` for why it is not `valid_at`. */
   newestFactAtMs?: number | null;
   /**
-   * Newest `Episodic.created_at` (ms) — when GRAPHITI last FINISHED a job (STALLPROBE-1).
+   * Newest `Episodic.created_at` (ms) — the liveness signal (STALLPROBE-1). See
+   * `newestEpisodicAtMs()` for the precise reading: the node's EXISTENCE proves a job completed;
+   * its `created_at` is the job's START instant.
    *
    * REQUIRED, deliberately. The first version of this field was optional with "omitted ⇒ old
    * behaviour", and that is exactly how the second call site (`lib/query/retrieval-health`, the
@@ -113,10 +115,12 @@ export function deriveGraphExtractionStalled(input: ExtractionSignals): boolean 
   // `Episodic` is the honest evidence: graphiti persists it in `add_nodes_and_edges_bulk` — the single
   // Neo4j write, reached only after node resolution, edge extraction/resolution and attribute
   // extraction have all returned — and a new episode is ALWAYS a new node, so unlike entities and
-  // edges it cannot deduplicate. `created_at` is `utc_now()` at construction, not the episode's
-  // backdated `reference_time`. So "episodes pushed but no episode node completing" is the literal
-  // contract of this probe ("202 accepted, nothing processed"), now covering the whole pipeline
-  // INCLUDING the Neo4j write — which the two rejected ledger designs both left uncovered.
+  // edges it cannot deduplicate. The node's EXISTENCE is what proves a job completed; its `created_at`
+  // is the job's START instant (`utc_now()` taken at the top of `add_episode`), not the episode's
+  // backdated `reference_time` and not the completion instant. So "episodes pushed but no episode node
+  // completing" is the literal contract of this probe ("202 accepted, nothing processed"), now covering
+  // the whole pipeline INCLUDING the Neo4j write — which the two rejected ledger designs both left
+  // uncovered.
   const newestEpisode = input.newestEpisodeAtMs ?? null;
   // `?? null` normalises an omitted field to the explicit unknown branch. Honest about what this is
   // worth: it changes NO current behaviour — `undefined` already falls through to `newestEpisode -
@@ -212,9 +216,30 @@ export async function newestEpisodeAtMs(teamId: string): Promise<number | null> 
 }
 
 /**
- * When graphiti last FINISHED a job — `max(Episodic.created_at)` in Neo4j.
+ * The liveness signal: `max(Episodic.created_at)` in Neo4j — the newest job that RAN TO COMPLETION.
  *
- * The liveness signal. Chosen over the extractor's LLM spend ledger after two review rounds killed
+ * Read it precisely, because the two halves come from different places. The node's **existence**
+ * is the completion evidence: it is written only by `add_nodes_and_edges_bulk` at the very end of
+ * `add_episode` (graphiti-core 0.29.3 `graphiti.py:726`, reached via `:1170`), so a job that died
+ * anywhere earlier leaves nothing behind. Its **`created_at` is the job's START instant** —
+ * `now = utc_now()` is taken at the top of `add_episode` (`:1068`) and handed to the constructor
+ * (`:1109`) — so this value is "when the newest COMPLETED job STARTED", not when it finished. The
+ * imprecision is bounded by one job's duration (seconds to a couple of minutes) against a 6h budget,
+ * and it errs toward a LARGER measured lag, i.e. toward accusing rather than toward suppressing a
+ * real outage. It is stated rather than rounded off because a future budget tightened toward job
+ * duration would make it load-bearing.
+ *
+ * KNOWN LIMITATION, verified not assumed: this holds for `add_episode` (singular), which is the path
+ * we use — the projector POSTs `/messages` fire-and-forget with no uuid (`lib/graph/graphiti-client`),
+ * so a fresh node is constructed every time and `EpisodicNode.get_by_uuid` is never taken. Graphiti
+ * also ships `add_episode_bulk` (`:1230`), which saves its episode nodes BEFORE extraction (`:1336`,
+ * "# Save all episodes"). If the graph service ever moved to that path, an episode node would exist
+ * even when extraction failed outright and this signal would decay to exactly the "202 accepted"
+ * semantic it replaces. Nothing in this repo can detect that switch, so it is written down here.
+ * (`add_triplet` at `:1745` constructs a throwaway `EpisodicNode` but passes `[]` as the episodic
+ * nodes to the bulk write, so it never persists one and cannot refresh this clock.)
+ *
+ * Chosen over the extractor's LLM spend ledger after two review rounds killed
  * that approach: `meterGraphCall` meters whatever `usage` arrives at any HTTP status (so billed
  * non-2xx generations aren't invisible spend), which means a truncated extraction — a 200 carrying
  * usage — writes an ordinary row while creating nothing. Narrowing to late-stage `call_kind`s did not
@@ -223,10 +248,10 @@ export async function newestEpisodeAtMs(teamId: string): Promise<number | null> 
  * uncovered, and `call_kind` is prompt-prefix-matched so a graph-service upgrade would fall to
  * `unknown` and re-manufacture the alarm.
  *
- * The episode node has none of those problems: it is written by `add_nodes_and_edges_bulk`, the ONLY
- * Neo4j write and the last thing a job does; a new episode can never deduplicate onto an existing
- * node (the property whose absence caused the false positive); and `created_at` is wall-clock at
- * construction, not the backdated `reference_time`.
+ * The episode node has none of those problems: it makes no claim about stage ordering (it is behind
+ * the ONLY Neo4j write, so it covers every stage including that write), it depends on no prompt text,
+ * a new episode can never deduplicate onto an existing node (the property whose absence caused the
+ * false positive), and it is wall-clock rather than the backdated `reference_time`.
  *
  * Unfiltered by group, exactly like `countGraphFacts` and `newestFactAtMs` — "did ANY job finish?" is
  * a global question and no content leaves the graph. Null on an unreadable/unconfigured Neo4j, which
@@ -272,8 +297,8 @@ export async function getGraphExtractionHealth(teamId: string): Promise<GraphExt
     newestEpisodeAtMs(teamId),
     newestFactAtMs(),
     groupCensuses(teamId),
-    // Liveness: when graphiti last FINISHED a job. The leg that stops dedup-frozen novelty from
-    // reading as a dead extractor (STALLPROBE-1).
+    // Liveness: the newest graphiti job that RAN TO COMPLETION. The leg that stops dedup-frozen
+    // novelty from reading as a dead extractor (STALLPROBE-1).
     newestEpisodicAtMs(),
   ]);
   const pollutedCensus = censuses.find((c) => c.pollution.judgeable && c.pollution.polluted) ?? null;
@@ -286,8 +311,9 @@ export async function getGraphExtractionHealth(teamId: string): Promise<GraphExt
   };
   const stalled = deriveGraphExtractionStalled(signals);
   const neverExtracted = stalled && facts === 0;
-  // Hours since a job last COMPLETED, not since the last new fact — the reason string quotes this and
-  // it must name the thing the verdict actually rests on.
+  // Hours since the newest COMPLETED job started, not since the last new fact — the reason string
+  // quotes this and it must name the thing the verdict actually rests on. (Start, not finish: see
+  // `newestEpisodicAtMs`. It overstates by at most one job's duration, in the accusing direction.)
   const lagHours =
     newestEpisode !== null && newestEpisodic !== null
       ? Math.round((newestEpisode - newestEpisodic) / 3_600_000)

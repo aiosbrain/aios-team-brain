@@ -185,4 +185,3 @@ export function wantsSmallModel(body: unknown): boolean {
     return false;
   }
 }
-

@@ -1,6 +1,7 @@
 # The graph-stall probe measures novelty, not liveness — STALLPROBE-1 / AIO-876
 
-**Status:** spec, pre-review.
+**Status:** spec — third design of this slice. Drafts 1 and 2 (both LLM-ledger based) were killed by
+review; §3a records why, so they are not re-proposed.
 **Related:** `docs/design/dedupe-alarm-0293.md` (the sibling alarm on the same card),
 `docs/design/census-sample-floor.md` (CENSUSFLOOR-1 — the same "accuses without standing evidence"
 class), `docs/design/graph-episode-window-phase-c.md` (PIPEFF-2, the lever that made dedupe dominant).
@@ -96,10 +97,26 @@ against the actual wheels:
 
 | property | why it holds |
 |---|---|
-| **End-of-job** | it is persisted by `add_nodes_and_edges_bulk` (`graphiti.py:726`), the single Neo4j write, reached only after node resolution, edge extraction, edge resolution and attribute extraction have all returned |
-| **Cannot deduplicate** | a new episode is always a new node — unlike entities and edges, which resolve onto existing ones. This is exactly the property whose absence caused the false positive |
-| **Not backdated** | `created_at: datetime = Field(default_factory=lambda: utc_now())` (`nodes.py:98`) — wall-clock at construction, not the episode's `reference_time` (contrast `valid_at`, which IS backdated and is why `newestFactAtMs` deliberately reads `created_at`) |
+| **End-of-job** | it is persisted by `add_nodes_and_edges_bulk` (`graphiti.py:726`, reached via `:1170`), the single Neo4j write, after node resolution, edge extraction, edge resolution and attribute extraction have all returned. The node's EXISTENCE is the completion evidence |
+| **Cannot deduplicate** | a new episode is always a new node — unlike entities and edges, which resolve onto existing ones. This is exactly the property whose absence caused the false positive. Our projector POSTs `/messages` with no uuid, so `EpisodicNode.get_by_uuid` (`:1099`) is never taken and a fresh node is constructed every time |
+| **Not backdated** | wall-clock, not the episode's `reference_time` (contrast `valid_at`, which IS backdated and is why `newestFactAtMs` deliberately reads `created_at`) |
 | **Version-independent** | no claim about stage ordering, no dependency on prompt text or `call_kind` |
+
+Two things about that timestamp are stated rather than glossed, both verified against the pinned
+0.29.3 wheel:
+
+- **`created_at` is the job's START, not its finish.** `now = utc_now()` is taken at the top of
+  `add_episode` (`:1068`) and handed to the constructor (`:1109`); it is never restamped. So the
+  measured lag overstates by at most one job's duration (seconds to a couple of minutes) against a
+  6h budget — in the **accusing** direction, never the suppressing one. It is written down because a
+  budget later tightened toward job duration would make it load-bearing.
+- **`add_episode_bulk` (`:1230`) would weaken this signal**, because it saves its episode nodes
+  BEFORE extraction (`:1336`, `# Save all episodes`) — an episode node would then exist even when
+  extraction failed outright, i.e. exactly the "202 accepted" semantic being replaced. We do not use
+  it (the projector is fire-and-forget `/messages` → singular `add_episode`), and nothing in this repo
+  can detect a graph-service switch to it, so the limitation is recorded at the source and in
+  `docs/ARCHITECTURE.md` instead of being guarded. (`add_triplet` at `:1745` builds a throwaway
+  `EpisodicNode` but passes `[]` as the episodic nodes to the bulk write, so it never persists one.)
 
 Revised predicate — `newestEpisodicAtMs` replaces the ledger, and fact-lag stops accusing entirely:
 
@@ -142,9 +159,10 @@ exactly the fail-open/fail-closed reasoning the higher tier is for. Two adversar
 
 No tier surface changes. Both reads are numeric health probes, deliberately NOT tier-scoped — the
 existing `countGraphFacts` comment states the rule ("no content leaves the graph; 'is the extractor
-producing ANY facts?' is a global question"), and the new ledger read follows it: it counts
-`llm_usage` rows for the team and returns a boolean/timestamp, never row content. No new API route,
-no new table, no change to `visibleItems`/`visibleTasks`/`visibleGroupIds`.
+producing ANY facts?' is a global question"), and the new Neo4j read follows it exactly: a single
+`toString(max(e.created_at))` aggregation over `Episodic`, returning one timestamp and never a name,
+a body, or a `group_id`. No new API route, no new table, no change to
+`visibleItems`/`visibleTasks`/`visibleGroupIds`.
 
 ## 4. Acceptance criteria
 
@@ -168,7 +186,15 @@ no new table, no change to `visibleItems`/`visibleTasks`/`visibleGroupIds`.
 
 ## 6. What would falsify this
 
-If, after the change, a genuinely dead extractor (provider 429, container wedged) failed to raise the
-stall within the lag budget, the ledger-liveness predicate would be too permissive — the signal it
-trusts (`llm_usage` rows) would have to be produced by something other than a real extraction. The
-data-mechanics criterion above is the guard against exactly that inversion.
+If, after the change, a genuinely dead extractor (provider 429, container wedged, Neo4j write
+failing) failed to raise the stall within the lag budget, episode-node liveness would be too
+permissive — something other than a completed `add_episode` would have to be writing `Episodic`
+nodes. Two things are the guard against that inversion: the "IS stalled when episodes are pushed and
+NO job completes" criterion above pins the direction that must not weaken, and the source audit
+above enumerates every `EpisodicNode` write in the pinned wheel (`add_episode`, `add_episode_bulk`
+which we do not call, and `add_triplet` which never persists one).
+
+The opposite falsifier — the one this slice is actually betting on — is a recurrence of the reported
+false positive: a red stall beside a census reporting new entities and a clean `llm_usage` trail. If
+that happens again after this ships, episode-node recency is not the liveness signal it is claimed to
+be, and the next place to look is whether the graph service moved to `add_episode_bulk`.
