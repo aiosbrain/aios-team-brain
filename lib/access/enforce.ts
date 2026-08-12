@@ -37,6 +37,12 @@ export async function teamEnforcesAccess(db: DbClient, teamId: string): Promise<
 export interface VisibleItemIds {
   ids: Set<string>;
   empty: boolean;
+  /** True when `empty` is the result of a READ ERROR, not a genuinely-empty membership set. A
+   *  per-request caller (the items route) treats both as "serve nothing" — self-heals next request.
+   *  A CACHING caller (the timeline, §5.8) MUST distinguish: persisting an error-derived empty as a
+   *  fresh shared variant hides every row for all members on that hash for a TTL (Codex B4 Medium).
+   *  `resolveTimelineEnforcement` throws on this so the build aborts without writing. */
+  error?: boolean;
 }
 
 /**
@@ -70,7 +76,7 @@ export async function visibleItemIdsForProjects(
     .eq("decision", "include")
     .is("valid_to", null)
     .in("project_id", [...projectIds]);
-  if (error) return { ids: new Set(), empty: true }; // fail closed on read error
+  if (error) return { ids: new Set(), empty: true, error: true }; // fail closed on read error (flagged: see `error`)
 
   const ids = new Set<string>();
   for (const row of (data ?? []) as { project_context_units: { source_item_id: string | null; state: string; unit_kind: string } | null }[]) {
@@ -139,7 +145,13 @@ export async function resolveTimelineEnforcement(
   teamId: string,
   vis: MemberVisibility
 ): Promise<TimelineEnforcement> {
-  const { ids } = await visibleItemIdsForProjects(db, teamId, vis.visibleProjectIds);
+  const { ids, error } = await visibleItemIdsForProjects(db, teamId, vis.visibleProjectIds);
+  // THROW on a substrate read error rather than build from a spuriously-empty set (Codex B4
+  // Medium): the timeline CACHES its build under a shared visibility hash, so an error-derived
+  // empty would hide every item-derived row for all members on that hash until the next rebuild.
+  // The caller (cold-miss build → 500; background rebuild → caught, no write) fails closed WITHOUT
+  // caching. A genuinely-empty membership set (no error) still builds + caches a real empty ledger.
+  if (error) throw new Error("access substrate read failed while resolving timeline enforcement");
   return { visibleItemIds: ids };
 }
 

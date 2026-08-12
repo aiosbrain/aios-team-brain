@@ -124,29 +124,30 @@ describe("enforced work-timeline builder (Phase B slice 4)", () => {
     expect(JSON.stringify(days), "a restricted meeting must not surface via its note").not.toContain("Confidential board prep");
   });
 
-  it("enforcing: a UI-created task (null source, VISIBLE project) still heads its group — a null-source drop would erase every dashboard task for everyone (Fable B4 Medium)", async () => {
+  it("enforcing: a hand-created task (created_by set, null source) still heads its group — a null-source drop would erase every dashboard task for everyone (Fable B4 Medium)", async () => {
     const seed = await seedTeam();
-    // The citing commit is General; the task is UI-created (origin='ui', no source item) in a
-    // General-visible project. Under a naive null-source-drop the header vanishes for everyone.
+    // The citing commit is General; the task is dashboard-created (created_by set, no source item)
+    // in a General-visible project. Under a naive null-source-drop the header vanishes for everyone.
     const commitItem = await commit(seed, "feat: do the UI thing (UI-1)");
     const generalProj = commitItem.projectId!;
-    await insertTask(seed, generalProj, { row_key: "UI-1", title: "Dashboard-made task", status: "in_progress", origin: "ui", source_item_id: null });
+    await insertTask(seed, generalProj, { row_key: "UI-1", title: "Dashboard-made task", status: "in_progress", origin: "ui", source_item_id: null, created_by: seed.memberId });
     const outsider = await seedMember(seed);
     await backfillTeamContext(db(), seed.teamId);
     await setEnforcement(seed, "enforcing");
 
     const enforce = await memberEnforcement(db(), { teamId: seed.teamId, memberId: outsider });
     const days = await getWorkTimeline(db(), seed.teamId, "team", undefined, enforce);
-    expect(taskTitles(days), "a UI task in a visible project must survive enforcing").toContain("Dashboard-made task");
+    expect(taskTitles(days), "a hand-created task in a visible project must survive enforcing").toContain("Dashboard-made task");
     expect(evidenceTitles(days)).toContain("feat: do the UI thing (UI-1)");
   });
 
-  it("enforcing: a SYNCED task whose restricted source was PURGED (source→null via on-delete-set-null) does NOT resurface — only origin='ui' survives a null source", async () => {
+  it("enforcing: a SYNCED task whose restricted source was PURGED (source→null) does NOT resurface — created_by null ⇒ dropped", async () => {
     const seed = await seedTeam();
     const commitItem = await commit(seed, "feat: cite the secret (SEC-1)");
     const secretItem = await commit(seed, "internal: secret basis (SEC-1)");
-    // A SYNCED task tied to a restricted item, then the item is deleted → source_item_id goes null.
-    await insertTask(seed, commitItem.projectId!, { row_key: "SEC-1", title: "Purged-basis task", status: "in_progress", origin: "sync", source_item_id: secretItem.id });
+    // A SYNCED task tied to a restricted item (created_by null, like every synced row), then the item
+    // is deleted → source_item_id goes null.
+    await insertTask(seed, commitItem.projectId!, { row_key: "SEC-1", title: "Purged-basis task", status: "in_progress", origin: "sync", source_item_id: secretItem.id, created_by: null });
     const outsider = await seedMember(seed);
     await backfillTeamContext(db(), seed.teamId);
     await restrictItem(seed, secretItem.id);
@@ -156,6 +157,24 @@ describe("enforced work-timeline builder (Phase B slice 4)", () => {
     const enforce = await memberEnforcement(db(), { teamId: seed.teamId, memberId: outsider });
     const days = await getWorkTimeline(db(), seed.teamId, "team", undefined, enforce);
     expect(JSON.stringify(days), "a synced task with a purged restricted basis must not resurface").not.toContain("Purged-basis task");
+  });
+
+  it("enforcing: an ADOPTED task (origin='ui' but created_by null) whose restricted source was purged does NOT leak — origin is durability, not access provenance (Codex B4 High)", async () => {
+    const seed = await seedTeam();
+    const commitItem = await commit(seed, "feat: cite adopted (ADO-1)");
+    const secretItem = await commit(seed, "internal: adopted secret basis (ADO-1)");
+    // lib/pm-sync/inbound.ts flips an ADOPTED synced issue to origin='ui' while it still carries an
+    // imported source and NO created_by. Gating on origin='ui' would have let this leak once purged.
+    await insertTask(seed, commitItem.projectId!, { row_key: "ADO-1", title: "Adopted restricted title", status: "in_progress", origin: "ui", source_item_id: secretItem.id, created_by: null });
+    const outsider = await seedMember(seed);
+    await backfillTeamContext(db(), seed.teamId);
+    await restrictItem(seed, secretItem.id);
+    await db().from("items").delete().eq("id", secretItem.id); // source → null; origin stays 'ui'
+    await setEnforcement(seed, "enforcing");
+
+    const enforce = await memberEnforcement(db(), { teamId: seed.teamId, memberId: outsider });
+    const days = await getWorkTimeline(db(), seed.teamId, "team", undefined, enforce);
+    expect(JSON.stringify(days), "an adopted (origin='ui', created_by null) task must not resurface via a purged source").not.toContain("Adopted restricted title");
   });
 
   it("permissive: the enforce view is null and the ledger is byte-identical to today", async () => {
@@ -264,6 +283,30 @@ describe("visibility-keyed timeline cache (§5.8)", () => {
     const { data } = await db().from("work_timeline_cache").select("group_key").eq("team_id", seed.teamId);
     const keys = ((data ?? []) as { group_key: string }[]).map((r) => r.group_key);
     expect(keys.filter((k) => k === "team" || k.startsWith("vis:team:")), `tier purge must sweep variants, got ${keys.join()}`).toEqual([]);
+  });
+
+  it("fail closed: a substrate read error while resolving enforcement THROWS and caches nothing (Codex B4 Medium — an error-empty must not become a fresh shared variant)", async () => {
+    const seed = await seedTeam();
+    await commit(seed, "feat: probe (ERR-1)");
+    const member = await seedMember(seed);
+    await backfillTeamContext(db(), seed.teamId);
+    await setEnforcement(seed, "enforcing");
+    const { resolveTimelineEnforcement, memberVisibility } = await import("@/lib/access/enforce");
+    const vis = await memberVisibility(db(), { teamId: seed.teamId, memberId: member });
+    expect(vis, "enforcing team yields a visibility").not.toBeNull();
+    // A DB whose membership read errors: resolveTimelineEnforcement must throw, not return empty.
+    const brokenDb = {
+      from() {
+        return {
+          select() { return this; }, eq() { return this; }, is() { return this; }, in() { return this; },
+          then(resolve: (v: unknown) => void) { resolve({ data: null, error: { message: "connection reset" } }); },
+        };
+      },
+    } as unknown as ReturnType<typeof db>;
+    await expect(resolveTimelineEnforcement(brokenDb, seed.teamId, vis!)).rejects.toThrow();
+    // And no timeline row was written as a side effect of the failed resolution.
+    const rows = ((await db().from("work_timeline_cache").select("group_key").eq("team_id", seed.teamId)).data ?? []) as { group_key: string }[];
+    expect(rows.some((r) => r.group_key.startsWith("vis:")), "no variant row may be persisted from a failed resolution").toBe(false);
   });
 
   it("fail closed: an enforcing team refuses a timeline read with NO principal (throw, never the tier row)", async () => {

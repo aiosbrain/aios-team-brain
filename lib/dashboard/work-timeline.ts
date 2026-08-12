@@ -124,7 +124,7 @@ type TaskRow = {
   status: string | null;
   assignee: string | null;
   source_item_id?: string | null;
-  origin?: string | null;
+  created_by?: string | null;
 };
 
 
@@ -160,15 +160,22 @@ export async function getWorkTimeline(
   // null` — so fail closed and drop it; Codex B2's retrieve ruling).
   const srcVisible = (sourceItemId: string | null | undefined): boolean =>
     enforce == null || (sourceItemId != null && enforce.visibleItemIds.has(sourceItemId));
-  // A TASK's null source is ambiguous: a hand-typed UI task (`origin='ui'`, no restricted basis,
-  // already tier-gated by visibleTasks) OR a synced task whose restricted source was purged. The
-  // FIRST must survive — dropping all null-source tasks erased every dashboard-created task for
-  // everyone incl. admins on flip (Fable B4 Medium) — the SECOND must not (its title still names
-  // the purged restricted work). `origin` is exactly that distinction.
+  // A TASK's null source is ambiguous: a hand-typed dashboard task (no restricted basis, already
+  // tier-gated by visibleTasks) OR a synced task whose restricted source was purged (its title
+  // still names the restricted work). The FIRST must survive — dropping all null-source tasks
+  // erased every dashboard-created task for everyone incl. admins on flip (Fable B4 Medium) — the
+  // SECOND must not (leak). The distinction is CREATION PROVENANCE: `created_by` is set ONLY by the
+  // dashboard create path (`app/actions/tasks.ts`, the sole writer) and never by sync/ingest — so a
+  // non-null `created_by` proves the task was hand-typed and NEVER had a source item. NOT `origin`:
+  // that is a durability/ownership state, and `lib/pm-sync/inbound.ts` flips an ADOPTED synced issue
+  // to `origin='ui'` while it still carries an imported (later-purgeable) source — using origin let a
+  // formerly-restricted adopted title leak (Codex B4 High). `created_by` nulls only on creator
+  // deletion (`on delete set null`) → the task drops (over-restriction, fail closed). Immutable
+  // otherwise: no UPDATE writes it.
   const taskVisible = (t: TaskRow): boolean => {
     if (enforce == null) return true;
     if (t.source_item_id != null) return enforce.visibleItemIds.has(t.source_item_id);
-    return t.origin === "ui";
+    return t.created_by != null;
   };
   // Conditionally AND the item-membership conjunct into an item-leg query (kept in ONE place so a
   // new leg has an obvious handle). An EMPTY visible set compiles to `WHERE false` in the pg
@@ -290,7 +297,7 @@ export async function getWorkTimeline(
     visibleTasks(
       db
         .from("tasks")
-        .select("id, row_key, title, status, assignee, source_item_id, origin")
+        .select("id, row_key, title, status, assignee, source_item_id, created_by")
         .eq("team_id", teamId)
         .in("status", [...ACTIVE_STATUSES])
         .order("updated_at", { ascending: false })
@@ -481,7 +488,7 @@ export async function getWorkTimeline(
   const allTaskRes = await visibleTasks(
     db
       .from("tasks")
-      .select("id, row_key, title, status, assignee, source_item_id, origin")
+      .select("id, row_key, title, status, assignee, source_item_id, created_by")
       .eq("team_id", teamId)
       .not("row_key", "is", null)
       .order("updated_at", { ascending: false })
