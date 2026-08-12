@@ -8,9 +8,24 @@
  * multi-chunk item gets a `#<k>` suffix: `items:<id>#0`, `items:<id>#1`, …
  */
 
+/**
+ * The prefix every LEDGER-BACKED episode name carries — i.e. every episode that has a
+ * `graph_episodes` row behind it.
+ *
+ * A constant rather than an inline literal because a second consumer now depends on it as a
+ * POPULATION filter, not just a format: `lib/graph/extraction-health.newestEpisodicAtMs` asks "when
+ * did the newest ledger-projected episode complete?" and must not count episodes nobody projected.
+ * `lib/graph/arcs.ts` writes `correction:<arc_id>` episodes straight to Graphiti in the same group
+ * with no ledger row, so without this filter a human arc correction completing would refresh the
+ * extraction-liveness clock while every item episode was failing. Found by review.
+ */
+export const ITEM_EPISODE_PREFIX = "items:";
+
 /** The episode name for chunk `index` of `total` chunks of item `itemId`. */
 export function episodeName(itemId: string, index: number, total: number): string {
-  return total <= 1 ? `items:${itemId}` : `items:${itemId}#${index}`;
+  return total <= 1
+    ? `${ITEM_EPISODE_PREFIX}${itemId}`
+    : `${ITEM_EPISODE_PREFIX}${itemId}#${index}`;
 }
 
 /**
@@ -19,8 +34,8 @@ export function episodeName(itemId: string, index: number, total: number): strin
  * can link a fact/event to the ONE item behind it regardless of how many chunks it was split into.
  */
 export function itemIdFromEpisodeName(name: string | null | undefined): string | undefined {
-  if (!name || !name.startsWith("items:")) return undefined;
-  const rest = name.slice("items:".length);
+  if (!name || !name.startsWith(ITEM_EPISODE_PREFIX)) return undefined;
+  const rest = name.slice(ITEM_EPISODE_PREFIX.length);
   const hash = rest.indexOf("#");
   return hash === -1 ? rest : rest.slice(0, hash);
 }
