@@ -154,7 +154,6 @@ export async function getWorkTimeline(
   // SOURCE ITEM when they have one — a restricted item's derived TITLE is the leak.
   enforce: { visibleItemIds: ReadonlySet<string> } | null = null
 ): Promise<TimelineDay[]> {
-  const NIL_UUID = "00000000-0000-0000-0000-000000000000"; // no real item carries it (gen_random_uuid)
   const visArr: string[] | null = enforce ? [...enforce.visibleItemIds] : null;
   // A SOURCED structured row is visible iff its source item is. Meetings + decisions gate on this
   // alone (a null source there is the PURGE case — a restricted item removed via `on delete set
@@ -172,12 +171,12 @@ export async function getWorkTimeline(
     return t.origin === "ui";
   };
   // Conditionally AND the item-membership conjunct into an item-leg query (kept in ONE place so a
-  // new leg has an obvious handle). An EMPTY visible set uses the nil-uuid sentinel so the leg
-  // returns nothing via a well-formed query — never a bare `.in("id", [])`, whose semantics vary —
-  // while the structured legs still evaluate their project arm (a member with zero visible ITEMS
-  // can still own UI tasks in a visible project).
+  // new leg has an obvious handle). An EMPTY visible set compiles to `WHERE false` in the pg
+  // adapter (`query-builder.ts` `.in([]) → "false"`, the only backend), so the item legs return
+  // nothing and fail closed — while the null-source UI tasks still surface via `taskVisible`
+  // (a member with zero visible ITEMS can still own dashboard-created tasks).
   const withVis = <T extends { in: (col: string, vals: string[]) => T }>(q: T): T =>
-    visArr ? q.in("id", visArr.length ? visArr : [NIL_UUID]) : q;
+    visArr ? q.in("id", visArr) : q;
   // Clamp to [1, MAX] — the window drives both the DB fetch bound (`sinceIso`) and the in-window filter,
   // so an unbounded caller value can't widen the query past the cost cap.
   const days = Math.max(1, Math.min(Math.floor(windowDays) || WINDOW_DAYS, MAX_WINDOW_DAYS));
