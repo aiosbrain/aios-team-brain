@@ -6,6 +6,7 @@ import { getWorkTimeline } from "./work-timeline";
 import { attachPersonDaySummaries, type SummaryPassResult } from "./timeline-summary";
 import type { TimelineDay } from "./timeline-group";
 import { freshness, type Freshness } from "@/lib/freshness";
+import { memberEnforcement, teamEnforcesAccess, type MemberEnforcement } from "@/lib/access/enforce";
 
 /**
  * The persisted, queryable work-timeline LAYER. `lib/dashboard/work-timeline.getWorkTimeline` is the
@@ -20,11 +21,22 @@ import { freshness, type Freshness } from "@/lib/freshness";
  * result is the truth of a quiet week — pinning last week's work would be misleading. A stale row is
  * still served for one cycle, but an empty rebuild is accepted.
  *
- * `group_key` = the viewer TIER ('team' | 'external'); the (team_id, group_key) PK already scopes by
- * team, so the tier alone separates a team viewer's (team+external) ledger from an external viewer's
- * (external-only). No cross-tier bleed, no RLS backstop (CLAUDE.md §5) — the builder's `visibleItems`/
- * `visibleTasks` do the row-level filtering; this key just keeps the two tiers' payloads in separate rows.
+ * `group_key` = the viewer TIER ('team' | 'external') — or, on an ENFORCING team (Phase B slice 4,
+ * spec §5.8), a VISIBILITY VARIANT `vis:<tier>:<hash>` keyed by the member's sorted effective-
+ * project-set hash: members with identical group signatures share one row (bounded cardinality =
+ * distinct group combinations, not principal count), and an enforcing read NEVER touches the plain
+ * tier row, whose payload (titles + LLM prose) may name work outside the member's visibility. The
+ * (team_id, group_key) PK accommodates both without a migration. No cross-tier bleed, no RLS
+ * backstop (CLAUDE.md §5) — the builder's `visibleItems`/`visibleTasks` (+ the §5.8 enforce filter)
+ * do the row-level filtering; the key keeps each view's payload in its own row.
  */
+
+/** One cached view of the timeline: the plain tier row, or a §5.8 visibility variant. */
+interface TimelineView {
+  tier: ViewerTier;
+  enforce: MemberEnforcement | null;
+}
+const viewKey = (v: TimelineView): string => (v.enforce ? `vis:${v.tier}:${v.enforce.visibilityHash}` : v.tier);
 
 const TTL_MS = 5 * 60_000; // 5-min freshness; the ledger is cheap, so refresh often.
 /** The same TTL, exported: it's the threshold that decides `freshness.stale`, so a consumer reasoning
@@ -76,7 +88,7 @@ export const PAYLOAD_VERSION = 12;
 /** The timeline WITH the per-person-day synopsis attached. Runs the (up to 7d × roster) best-effort LLM
  *  calls — so it's used ONLY on the BACKGROUND refresh path, never inline on a request (a cold miss
  *  returns the pure ledger fast and schedules this). Never in the raw builder the data-mechanics tier calls. */
-async function buildTimeline(db: DbClient, teamId: string, tier: ViewerTier): Promise<SummaryPassResult> {
+async function buildTimeline(db: DbClient, teamId: string, view: TimelineView): Promise<SummaryPassResult> {
   // Refresh the INFERRED doc→task links first, so anything new lands in the payload we're about to write
   // rather than one cycle later. This is the VIEW-DRIVEN trigger: a rebuild happens because somebody
   // looked, which is exactly when an inference is worth paying for — an unread team's timeline shouldn't
@@ -92,7 +104,7 @@ async function buildTimeline(db: DbClient, teamId: string, tier: ViewerTier): Pr
   } catch (err) {
     console.warn("[timeline] doc-task inference skipped:", err instanceof Error ? err.message : err);
   }
-  return attachPersonDaySummaries(db, teamId, await getWorkTimeline(db, teamId, tier));
+  return attachPersonDaySummaries(db, teamId, await getWorkTimeline(db, teamId, view.tier, undefined, view.enforce));
 }
 
 
@@ -213,20 +225,22 @@ const refreshing = new Map<string, Promise<void>>();
 // one more pass runs when it finishes (trailing edge). Without this a mid-rebuild bust is lost.
 const dirty = new Set<string>();
 
-const memKey = (teamId: string, tier: ViewerTier): string => `${teamId}:${tier}`;
+const memKey = (teamId: string, groupKey: string): string => `${teamId}:${groupKey}`;
 
 /** The raw persisted row, version and all. Two readers want it for different questions: the ledger
- *  read below (which rejects a foreign version) and the synopsis salvage (which doesn't care). */
+ *  read below (which rejects a foreign version) and the synopsis salvage (which doesn't care).
+ *  Takes the GROUP KEY, not the tier — a visibility variant must read ITS OWN row only; falling
+ *  back to the tier row would serve titles/prose from outside the member's visibility. */
 async function readTimelineCacheRow(
   db: DbClient,
   teamId: string,
-  tier: ViewerTier
+  groupKey: string
 ): Promise<{ payload: unknown; computed_at: string | Date; degraded?: boolean | null } | null> {
   const { data } = await db
     .from("work_timeline_cache")
     .select("payload, computed_at, degraded")
     .eq("team_id", teamId)
-    .eq("group_key", tier)
+    .eq("group_key", groupKey)
     .maybeSingle();
   return (data as { payload: unknown; computed_at: string | Date; degraded?: boolean | null } | null) ?? null;
 }
@@ -236,10 +250,10 @@ async function readTimelineCacheRow(
 async function readSalvageableSummaries(
   db: DbClient,
   teamId: string,
-  tier: ViewerTier
+  groupKey: string
 ): Promise<SalvagedSummaries> {
   try {
-    const row = await readTimelineCacheRow(db, teamId, tier);
+    const row = await readTimelineCacheRow(db, teamId, groupKey);
     if (!row) return new Map();
     const at =
       typeof row.computed_at === "string" ? Date.parse(row.computed_at) : new Date(row.computed_at).getTime();
@@ -254,10 +268,11 @@ async function readSalvageableSummaries(
 export async function readTimelineCache(
   db: DbClient,
   teamId: string,
-  tier: ViewerTier
+  tier: ViewerTier,
+  enforce: MemberEnforcement | null = null
 ): Promise<CacheEntry | null> {
   try {
-    const row = await readTimelineCacheRow(db, teamId, tier);
+    const row = await readTimelineCacheRow(db, teamId, viewKey({ tier, enforce }));
     if (!row) return null;
     // Payload is `{ v, days }`. A missing/older version = a shape from a previous deploy → treat as a
     // MISS so the caller rebuilds (never render a stale wrong shape).
@@ -284,7 +299,9 @@ export async function writeTimelineCache(
   /** The per-person-day synopses are missing or carried over, so the prose wasn't computed for this
    *  ledger. Persisted (R2/M6) so the NEXT reader of this row inherits the verdict instead of being
    *  handed a partial payload as healthy. Defaults false — the callers that know pass it explicitly. */
-  degraded = false
+  degraded = false,
+  /** §5.8 visibility variant: present → the row is keyed vis:<tier>:<hash>, never the tier row. */
+  enforce: MemberEnforcement | null = null
 ): Promise<void> {
   try {
     // `payload` is a top-level JSON array — serialize it ourselves (the pg adapter binds a raw JS array
@@ -292,7 +309,7 @@ export async function writeTimelineCache(
     await db.from("work_timeline_cache").upsert(
       {
         team_id: teamId,
-        group_key: tier,
+        group_key: viewKey({ tier, enforce }),
         payload: JSON.stringify({ v: PAYLOAD_VERSION, days }),
         computed_at: new Date().toISOString(),
         degraded,
@@ -312,15 +329,15 @@ export async function writeTimelineCache(
  * no empty-clobber cap). Best-effort.
  */
 export async function bustTeamTimeline(db: DbClient, teamId: string): Promise<void> {
-  for (const tier of ["team", "external"] as const) {
-    const key = memKey(teamId, tier);
-    mem.delete(key);
-    // Invalidate an ALREADY-RUNNING rebuild too. It read its inputs before this bust, so its result is
-    // wrong the moment it lands — and it lands stamped `computed_at = now`, which would make the stale
-    // payload look FRESH and suppress the next read's refresh entirely (the re-attribution would then be
-    // invisible for a full TTL). Marking dirty makes the in-flight pass run once more with the new data.
-    if (refreshing.has(key)) dirty.add(key);
-  }
+  // EVERY view of the team — the two tier rows AND all §5.8 visibility variants (their keys are not
+  // enumerable from here, so sweep by prefix). The DB update below is already team-wide.
+  const prefix = `${teamId}:`;
+  for (const key of [...mem.keys()]) if (key.startsWith(prefix)) mem.delete(key);
+  // Invalidate an ALREADY-RUNNING rebuild too. It read its inputs before this bust, so its result is
+  // wrong the moment it lands — and it lands stamped `computed_at = now`, which would make the stale
+  // payload look FRESH and suppress the next read's refresh entirely (the re-attribution would then be
+  // invisible for a full TTL). Marking dirty makes the in-flight pass run once more with the new data.
+  for (const key of refreshing.keys()) if (key.startsWith(prefix)) dirty.add(key);
   try {
     const staleAt = new Date(Date.now() - TTL_MS - 60_000).toISOString();
     await db.from("work_timeline_cache").update({ computed_at: staleAt }).eq("team_id", teamId);
@@ -348,9 +365,14 @@ export async function purgeTimelineCacheTier(
   teamId: string,
   tier: ViewerTier
 ): Promise<void> {
-  mem.delete(memKey(teamId, tier));
+  // The tier row AND its §5.8 visibility variants: a vis:<tier>:<hash> payload is built from the
+  // same tier-filtered set, so whatever made the tier row no longer servable applies to every
+  // variant of it (this is the "narrowed external→team" path — titles/prose must actually go).
+  const memPrefixes = [memKey(teamId, tier), memKey(teamId, `vis:${tier}:`)];
+  for (const key of [...mem.keys()]) if (memPrefixes.some((p) => key === p || key.startsWith(p))) mem.delete(key);
   try {
     await db.from("work_timeline_cache").delete().eq("team_id", teamId).eq("group_key", tier);
+    await db.from("work_timeline_cache").delete().eq("team_id", teamId).like("group_key", `vis:${tier}:%`);
   } catch {
     // best-effort — the caller's stale-mark backstop bounds a SERVED stale payload to one TTL (see the
     // header for why that is no longer the whole story for the summaries)
@@ -359,8 +381,12 @@ export async function purgeTimelineCacheTier(
 
 /** Fire-and-forget background rebuild for a stale key (SWR). Uses its own adminClient (not request-
  *  bound). Deduped via `refreshing`; errors logged, never thrown. */
-function refreshInBackground(teamId: string, tier: ViewerTier): void {
-  const key = memKey(teamId, tier);
+function refreshInBackground(teamId: string, view: TimelineView): void {
+  // The view is FROZEN into the rebuild: a variant row's hash is a pure function of the effective
+  // project set that produced it, so rebuilding with that same set is exactly what keeps the row
+  // correct for every member who maps to it — a member whose groups changed maps to a DIFFERENT
+  // key on their next read and never sees this row again.
+  const key = memKey(teamId, viewKey(view));
   // TRAILING EDGE, not plain dedup. A request arriving DURING a rebuild must not be dropped: the running
   // pass already read its inputs, so it cannot contain whatever just changed — yet it finishes by writing
   // `computed_at = now`, marking that stale-by-then payload FRESH for a full TTL. That silently discarded
@@ -381,9 +407,9 @@ function refreshInBackground(teamId: string, tier: ViewerTier): void {
       const bg = adminClient();
       do {
         dirty.delete(key); // claim the current request; anything arriving from here re-dirties the key
-        const built = await buildTimeline(bg, teamId, tier);
+        const built = await buildTimeline(bg, teamId, view);
         mem.set(key, { days: built.days, at: Date.now(), degraded: built.degraded });
-        await writeTimelineCache(bg, teamId, tier, built.days, built.degraded);
+        await writeTimelineCache(bg, teamId, view.tier, built.days, built.degraded, view.enforce);
       } while (dirty.has(key));
     } catch (err) {
       console.error("[timeline] background refresh failed:", err instanceof Error ? err.message : err);
@@ -423,13 +449,27 @@ export interface CachedTimeline {
  *   3. cold miss → build inline, then persist.
  * The one reader every surface calls (panel, `/api/v1/timeline`). Tier isolation is enforced inside the
  * builder's `visibleItems`/`visibleTasks`, so this is safe with `adminClient`.
+ *
+ * `memberId` is REQUIRED (Phase B slice 4, §5.8): on an ENFORCING team the read resolves the
+ * member's enforcement view and serves a `vis:<tier>:<hash>` variant — never the tier row. Pass
+ * `null` only for a read with no principal (tests, internal permissive paths); on an enforcing
+ * team that THROWS (fail closed — serving the tier row to an unidentified principal is the leak).
+ * On a permissive team the view is null and behavior is byte-identical to before.
  */
 export async function getCachedWorkTimeline(
   db: DbClient,
   teamId: string,
-  tier: ViewerTier
+  tier: ViewerTier,
+  memberId: string | null
 ): Promise<CachedTimeline> {
-  const key = memKey(teamId, tier);
+  let enforce: MemberEnforcement | null = null;
+  if (memberId != null) {
+    enforce = await memberEnforcement(db, { teamId, memberId }); // null on a permissive team
+  } else if (await teamEnforcesAccess(db, teamId)) {
+    throw new Error("timeline read without a principal on an enforcing team (fail closed)");
+  }
+  const view: TimelineView = { tier, enforce };
+  const key = memKey(teamId, viewKey(view));
   const now = Date.now();
 
   const cached = mem.get(key);
@@ -437,7 +477,7 @@ export async function getCachedWorkTimeline(
     return { days: cached.days, freshness: freshness(cached.at, TTL_MS, { now, degraded: cached.degraded }) };
   }
 
-  const persisted = await readTimelineCache(db, teamId, tier);
+  const persisted = await readTimelineCache(db, teamId, tier, enforce);
   if (persisted) {
     mem.set(key, { days: persisted.days, at: persisted.at, degraded: persisted.degraded });
     // ONE envelope for both the fresh and the stale branch — `freshness()` derives `stale` from the same
@@ -446,7 +486,7 @@ export async function getCachedWorkTimeline(
     // The PERSISTED verdict — so a reader who didn't do the work still learns the prose is missing.
     const f = freshness(persisted.at, TTL_MS, { now, degraded: persisted.degraded });
     if (!f.stale) return { days: persisted.days, freshness: f };
-    refreshInBackground(teamId, tier); // stale → serve stale, rebuild behind the request
+    refreshInBackground(teamId, view); // stale → serve stale, rebuild behind the request
     return { days: persisted.days, freshness: f };
   }
 
@@ -454,22 +494,24 @@ export async function getCachedWorkTimeline(
   // add the per-person-day synopsis in the background. The first viewer sees the timeline immediately;
   // summaries appear on the next view once the background pass writes them (kept off the request path so
   // a big team's fan-out can't blow the page / route budget).
-  const built = await getWorkTimeline(db, teamId, tier);
+  const built = await getWorkTimeline(db, teamId, tier, undefined, enforce);
   // …but a cold miss is USUALLY A VERSION BUMP, not a genuinely empty cache — and that path was
   // silently deleting the synopsis from every person-day until a background pass finished. Twice the
   // user's report was "we've lost the summaries at the top of each person's day", both times right
   // after a deploy of mine. The previous row's sentences still describe those same person-days, so
   // carry them across as a bridge; the background pass overwrites them with freshly computed ones.
   // Best-effort by construction: no salvageable row → `built`, unchanged.
-  const days = attachSalvagedSummaries(built, await readSalvageableSummaries(db, teamId, tier));
+  // SAME-KEY salvage only: prose from the tier row was written about the FULL tier-visible set and
+  // can name work outside this view's visibility — carrying it into a variant payload is a leak.
+  const days = attachSalvagedSummaries(built, await readSalvageableSummaries(db, teamId, viewKey(view)));
   const at = Date.now();
   mem.set(key, { days, at, degraded: true });
   // PERSISTED as degraded, not just reported. The row this writes is what the next reader gets, and its
   // prose is either absent or salvaged from an older payload version — so the flag has to live on the row
   // or the very next request hands the same partial ledger over as healthy. Self-healing: the background
   // pass below rewrites the row with the real verdict once summaries land.
-  await writeTimelineCache(db, teamId, tier, days, true);
-  refreshInBackground(teamId, tier);
+  await writeTimelineCache(db, teamId, tier, days, true, enforce);
+  refreshInBackground(teamId, view);
   // DEGRADED, deliberately. A cold miss returns the pure ledger: its per-person-day synopses are either
   // absent (the background pass hasn't run) or SALVAGED from an older payload version. Both are "this is
   // real work data with prose that wasn't computed for it", which is precisely the plausible-but-partial

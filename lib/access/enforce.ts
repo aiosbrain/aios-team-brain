@@ -1,4 +1,5 @@
 import "server-only";
+import { createHash } from "node:crypto";
 import type { DbClient } from "@/lib/db/types";
 import { visibleProjects, effectiveVisibleProjects, type Principal } from "@/lib/access/oracle";
 
@@ -10,11 +11,12 @@ import { visibleProjects, effectiveVisibleProjects, type Principal } from "@/lib
  *   'permissive' (default) — this module contributes NOTHING; the read is byte-identical to today.
  *   'enforcing'            — the caller intersects its item set with `visibleItemIds(...)`.
  *
- * SCOPE (through Phase B slice 3): `GET /api/v1/items` (member AND agent keys), the retrieval
- * path (`lib/query/retrieve.ts` → both query routes) for member keys under 'enforcing', and
- * delegated `aiosd_*` query (ALWAYS attenuated — see `delegatedVisibleItemIds`). Timeline, arcs,
- * and the dashboard surfaces are NOT yet enforced — an operator flipping the flag must know that;
- * those are later Phase B slices.
+ * SCOPE (through Phase B slice 4): `GET /api/v1/items` (member AND agent keys), the retrieval
+ * path (`lib/query/retrieve.ts` → both query routes) for member keys under 'enforcing', delegated
+ * `aiosd_*` query (ALWAYS attenuated — see `delegatedVisibleItemIds`), and the work-timeline read
+ * path (§5.8 visibility-variant cache — see `memberEnforcement` + `lib/dashboard/timeline-cache`).
+ * Arcs and the remaining dashboard surfaces are NOT yet enforced — an operator flipping the flag
+ * must know that; those are later Phase B slices.
  *
  * Only flip a team to 'enforcing' once its §11 backfill is complete — an un-partitioned item has no
  * membership and would fail closed (vanish). The flag is the fail-open-to-today transition control.
@@ -98,4 +100,26 @@ export async function delegatedVisibleItemIds(
 ): Promise<VisibleItemIds> {
   const projects = await effectiveVisibleProjects(db, token);
   return visibleItemIdsForProjects(db, token.teamId, projects);
+}
+
+/**
+ * A member's enforcement view for CACHED/derived surfaces (Phase B slice 4, spec §5.8): the
+ * visible-item set to filter with, plus the hash that KEYS the cache variant — sha256 of the
+ * SORTED post-attenuation effective-project set, so two members with identical group signatures
+ * share one cache row and a group change moves the member to a new key on the next read.
+ * Null = the team is permissive (serve the plain tier row, byte-identical to today).
+ * Throws on a flag-read error (the caller fails closed — 500/no data, never the unfiltered row).
+ */
+export interface MemberEnforcement {
+  visibleItemIds: ReadonlySet<string>;
+  /** Keys the cache variant; derived ONLY from the sorted effective project set. */
+  visibilityHash: string;
+}
+
+export async function memberEnforcement(db: DbClient, principal: Principal): Promise<MemberEnforcement | null> {
+  if (!(await teamEnforcesAccess(db, principal.teamId))) return null;
+  const { projectIds } = await visibleProjects(db, principal);
+  const { ids } = await visibleItemIdsForProjects(db, principal.teamId, projectIds);
+  const visibilityHash = createHash("sha256").update([...projectIds].sort().join(",")).digest("hex").slice(0, 16);
+  return { visibleItemIds: ids, visibilityHash };
 }

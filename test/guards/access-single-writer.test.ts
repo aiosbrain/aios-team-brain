@@ -73,6 +73,9 @@ const UNAMBIGUOUS = ["group_members", "project_groups"];
 const READ_EXEMPT = new Set<string>([
   `${join("lib", "projects", "context", "memberships.ts")}:project_groups`,
   `${join("lib", "projects", "context", "memberships.ts")}:project_context_units`,
+  // enforce.ts READS memberships (visibleItemIdsForProjects — the oracle conjunct); its only
+  // "write verb" is `createHash(...).update(...)` in the §5.8 visibility hash. Chain-scan clean.
+  `${join("lib", "access", "enforce.ts")}:project_context_memberships`,
 ]);
 function mentionsWithWrites(rel: string, source: string, table: string): boolean {
   if (READ_EXEMPT.has(`${rel}:${table}`)) return false;

@@ -123,6 +123,7 @@ type TaskRow = {
   title: string;
   status: string | null;
   assignee: string | null;
+  source_item_id?: string | null;
 };
 
 
@@ -144,8 +145,25 @@ export async function getWorkTimeline(
   db: DbClient,
   teamId: string,
   tier: ViewerTier,
-  windowDays: number = WINDOW_DAYS
+  windowDays: number = WINDOW_DAYS,
+  // Access enforcement (Phase B slice 4, spec §5.8/§17-B): the principal's membership-visible item
+  // set. Null/absent = permissive → byte-identical to today. Item legs carry the filter IN-QUERY
+  // (each leg's limit must rank over VISIBLE rows — a post-filter lets invisible items crowd
+  // visible ones out of the page); tasks/decisions/meetings gate on their SOURCE ITEM, because a
+  // restricted item's task/decision/meeting TITLE is itself the leak (retrieve's §5.8b ruling:
+  // a null-source row is dropped under enforcing — nothing proves it isn't restricted).
+  enforce: { visibleItemIds: ReadonlySet<string> } | null = null
 ): Promise<TimelineDay[]> {
+  const visArr: string[] | null = enforce ? [...enforce.visibleItemIds] : null;
+  const srcVisible = (id: string | null | undefined): boolean =>
+    enforce == null || (id != null && enforce.visibleItemIds.has(id));
+  // Enforcing but sees nothing → the ledger is empty by definition; return before any leg queries
+  // (mirrors the empty-set short-circuit in fts/dense — never rely on `.in("id", [])` semantics).
+  if (visArr && visArr.length === 0) return [];
+  // Conditionally AND the membership conjunct into an item-leg query (kept in ONE place so a new
+  // leg has an obvious handle to reach for).
+  const withVis = <T extends { in: (col: string, vals: string[]) => T }>(q: T): T =>
+    visArr ? q.in("id", visArr) : q;
   // Clamp to [1, MAX] — the window drives both the DB fetch bound (`sinceIso`) and the in-window filter,
   // so an unbounded caller value can't widen the query past the cost cap.
   const days = Math.max(1, Math.min(Math.floor(windowDays) || WINDOW_DAYS, MAX_WINDOW_DAYS));
@@ -217,17 +235,19 @@ export async function getWorkTimeline(
   const [gitRes, otherRes, taskRes, slackRes, decisionRes] = await Promise.all([
     // Git commits (title = commit subject → needs body; commit bodies are small).
     visibleItems(
-      db
-        .from("items")
-        .select("id, member_id, member_id_locked, frontmatter, body, work_at")
-        .eq("team_id", teamId)
-        .eq("frontmatter->>source", "git")
-        .not("member_id", "is", null)
-        .eq("work_at_from_source", true)
-        .gte("work_at", sinceIso)
-        .order("work_at", { ascending: false })
-        .order("id", { ascending: false })
-        .limit(ITEM_LIMIT),
+      withVis(
+        db
+          .from("items")
+          .select("id, member_id, member_id_locked, frontmatter, body, work_at")
+          .eq("team_id", teamId)
+          .eq("frontmatter->>source", "git")
+          .not("member_id", "is", null)
+          .eq("work_at_from_source", true)
+          .gte("work_at", sinceIso)
+          .order("work_at", { ascending: false })
+          .order("id", { ascending: false })
+          .limit(ITEM_LIMIT)
+      ),
       tier
     ),
     // Everything else (no body; title from frontmatter/path). `kind='task'` items excluded — the
@@ -236,17 +256,19 @@ export async function getWorkTimeline(
     // items with no `source` key (a hand-pushed doc with a real work time). Git commits are excluded in
     // the JS loop below instead.
     visibleItems(
-      db
-        .from("items")
-        .select("id, kind, member_id, member_id_locked, frontmatter, path, work_at")
-        .eq("team_id", teamId)
-        .neq("kind", "task")
-        .not("member_id", "is", null)
-        .eq("work_at_from_source", true)
-        .gte("work_at", sinceIso)
-        .order("work_at", { ascending: false })
-        .order("id", { ascending: false })
-        .limit(ITEM_LIMIT),
+      withVis(
+        db
+          .from("items")
+          .select("id, kind, member_id, member_id_locked, frontmatter, path, work_at")
+          .eq("team_id", teamId)
+          .neq("kind", "task")
+          .not("member_id", "is", null)
+          .eq("work_at_from_source", true)
+          .gte("work_at", sinceIso)
+          .order("work_at", { ascending: false })
+          .order("id", { ascending: false })
+          .limit(ITEM_LIMIT)
+      ),
       tier
     ),
     // ACTIVE tasks only — filtered in SQL so a backlog-heavy team can't push active tasks past
@@ -255,7 +277,7 @@ export async function getWorkTimeline(
     visibleTasks(
       db
         .from("tasks")
-        .select("id, row_key, title, status, assignee")
+        .select("id, row_key, title, status, assignee, source_item_id")
         .eq("team_id", teamId)
         .in("status", [...ACTIVE_STATUSES])
         .order("updated_at", { ascending: false })
@@ -268,7 +290,8 @@ export async function getWorkTimeline(
     // Tier-gated through the same §5 choke-point. `participants`/`title` are backfilled onto existing
     // items by the ingest frontmatter-heal, so this is empty until the first Slack sync post-deploy.
     visibleItems(
-      db
+      withVis(
+        db
         .from("items")
         .select("id, frontmatter, synced_at")
         .eq("team_id", teamId)
@@ -285,7 +308,8 @@ export async function getWorkTimeline(
         .gte("synced_at", sinceIso)
         .order("synced_at", { ascending: false })
         .order("id", { ascending: false })
-        .limit(ITEM_LIMIT),
+        .limit(ITEM_LIMIT)
+      ),
       tier
     ),
     // DECISIONS — the CONTEXT lane (signal, never counted as work). Dated by `decided_at` (a DATE).
@@ -311,7 +335,9 @@ export async function getWorkTimeline(
   // The ACTIVE set. It is no longer the whole link-target set (any referenced task can head a group —
   // see the union at `linkTargets`), but it is still fetched separately so active tasks are guaranteed
   // present even when the all-status read clips at TASK_LIMIT. Evidence-gated in the grouper.
-  const tasks = (taskRes.data ?? []) as TaskRow[];
+  // Enforcing: a task is kept only when its SOURCE ITEM is visible — the header carries the task's
+  // TITLE, so an invisible (or null → unprovable) source means the title itself would leak.
+  const tasks = ((taskRes.data ?? []) as TaskRow[]).filter((t) => srcVisible(t.source_item_id));
 
   // Assignee → member id, via the SHARED resolver (`assigneeMember`): `tasks.assignee` is a free-text
   // string the PM tool supplied and prod carries several spellings per person, so a raw compare would
@@ -442,7 +468,7 @@ export async function getWorkTimeline(
   const allTaskRes = await visibleTasks(
     db
       .from("tasks")
-      .select("id, row_key, title, status, assignee")
+      .select("id, row_key, title, status, assignee, source_item_id")
       .eq("team_id", teamId)
       .not("row_key", "is", null)
       .order("updated_at", { ascending: false })
@@ -452,7 +478,8 @@ export async function getWorkTimeline(
   // Chips are ENRICHMENT (not a core ledger leg) — a failed read must NOT blank the ledger, but it also
   // must not be silent (the swallowed-error trap this file warns about). WARN, like the Slack leg.
   if (allTaskRes.error) console.warn("[work-timeline] chip-task read failed:", allTaskRes.error.message);
-  const allTasks = (allTaskRes.data ?? []) as TaskRow[];
+  // Same source-item gate as the active set: a chip names the task too.
+  const allTasks = ((allTaskRes.data ?? []) as TaskRow[]).filter((t) => srcVisible(t.source_item_id));
   const chipInfo = new Map<string, EvidenceTaskRef>();
   for (const t of allTasks) if (t.row_key) chipInfo.set(t.id, { key: t.row_key.toUpperCase(), title: t.title || "(untitled task)", status: t.status ?? "" });
 
@@ -589,6 +616,7 @@ export async function getWorkTimeline(
     source_item_id: string | null;
     still_valid: boolean | null;
   }[]) {
+    if (!srcVisible(d.source_item_id)) continue; // enforcing: source-item gate — the title is the leak
     if (!d.decided_at) continue; // no day to place it on (mirrors the undated-work drop)
     const by = (d.decided_by ?? "").trim();
     if (!by) continue; // empty / group-level decided_by → dropped (a later team-signal lane's job)
@@ -627,7 +655,7 @@ export async function getWorkTimeline(
   if (canSeeMeetingNotes(tier)) {
     const meetRes = await db
       .from("meeting_notes")
-      .select("id, title, occurred_at, created_at, submitted_by, merged_into")
+      .select("id, title, occurred_at, created_at, submitted_by, merged_into, source_item_id")
       .eq("team_id", teamId)
       .is("merged_into", null) // a tombstone's attendees live on its merge target — counting both double-credits
       // NO date bound in SQL — ordered newest-by-meeting-date and capped instead, with `inWindow(at)`
@@ -647,7 +675,9 @@ export async function getWorkTimeline(
       // Best-effort, like Slack/decisions: a meetings outage must not fail the whole ledger.
       console.warn("[timeline] meetings leg skipped:", meetRes.error.message);
     } else {
-      const notes = (meetRes.data ?? []) as MeetingNoteRow[];
+      // Enforcing: a meeting note's restriction axis is its source TRANSCRIPT item — the note's
+      // title (and its attendee rows) surface it, so an invisible source drops the whole note.
+      const notes = ((meetRes.data ?? []) as MeetingNoteRow[]).filter((n) => srcVisible(n.source_item_id));
       const noteIds = notes.map((n) => n.id);
       const attendeesByNote = new Map<string, string[]>();
       for (const batch of chunkIds(noteIds)) {
@@ -703,6 +733,7 @@ type MeetingNoteRow = {
   created_at: string | Date | null;
   submitted_by: string | null;
   merged_into: string | null;
+  source_item_id?: string | null;
 };
 
 /** Batch ids for an `.in(...)` filter — the pg adapter binds each element and Postgres caps at 65535. */

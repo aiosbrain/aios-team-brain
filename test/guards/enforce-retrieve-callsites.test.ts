@@ -41,6 +41,22 @@ describe("dense-leg enforcement wired in lib/query/retrieve.ts (Codex B3 Medium)
   });
 });
 
+describe("timeline enforcement wiring (Phase B slice 4, §5.8)", () => {
+  it("every timeline surface passes its PRINCIPAL to getCachedWorkTimeline (4th arg — a forgotten one would serve the tier row)", () => {
+    expect(read("app/api/v1/timeline/route.ts")).toMatch(/getCachedWorkTimeline\(db,\s*auth\.teamId,\s*auth\.memberTier,\s*auth\.memberId\s*\)/);
+    expect(read("app/api/dashboard/team-work/route.ts")).toMatch(/getCachedWorkTimeline\(adminClient\(\),\s*team\.id,\s*tier,\s*\(me as \{ id: string \}\)\.id\s*\)/);
+    expect(read("components/learning/timeline-panel.tsx")).toMatch(/getCachedWorkTimeline\(adminClient\(\),\s*teamId,\s*tier,\s*memberId\s*\)/);
+  });
+  it("the windowed dashboard route enforces BOTH arms (the fresh-build arm bypasses the cache layer)", () => {
+    const src = read("app/api/dashboard/timeline/route.ts");
+    expect(src).toMatch(/getCachedWorkTimeline\(adminClient\(\),\s*team\.id,\s*tier,\s*memberId\s*\)/);
+    expect(src).toMatch(/getWorkTimeline\([^;]*days,\s*await\s+memberEnforcement\(/);
+  });
+  it("the cache layer fails closed: no principal on an enforcing team throws", () => {
+    expect(read("lib/dashboard/timeline-cache.ts")).toMatch(/timeline read without a principal on an enforcing team/);
+  });
+});
+
 describe("delegated query wiring in app/api/v1/query/route.ts (Phase B slice 3)", () => {
   const src = read("app/api/v1/query/route.ts");
   it("delegated principals get the ALWAYS-attenuated path (flag-independent)", () => {
