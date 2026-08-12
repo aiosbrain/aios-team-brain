@@ -29,6 +29,18 @@ for (const route of ["app/api/v1/query/route.ts", "app/api/dashboard/query/route
   });
 }
 
+describe("dense-leg enforcement wired in lib/query/retrieve.ts (Codex B3 Medium)", () => {
+  const src = read("lib/query/retrieve.ts");
+  it("denseSearch receives the visible-item set (in-query, not post-filter-only)", () => {
+    expect(src).toMatch(/denseSearch\(\s*teamId\s*,\s*tier\s*,\s*q\s*,\s*projectSlug\s*,\s*undefined\s*,\s*undefined\s*,\s*visArr\s*\)/);
+  });
+  it("dense grounding counts only VISIBLE hits (an invisible-only match must not suppress abstention)", () => {
+    expect(src).toMatch(/denseHits\.some\(\s*\(h\)\s*=>\s*visible\(h\.item_id\)\s*\)/);
+    // The unconditional form must be gone.
+    expect(src).not.toMatch(/if\s*\(denseHits\.length\)\s*\{\s*grounded\s*=\s*true/s);
+  });
+});
+
 describe("delegated query wiring in app/api/v1/query/route.ts (Phase B slice 3)", () => {
   const src = read("app/api/v1/query/route.ts");
   it("delegated principals get the ALWAYS-attenuated path (flag-independent)", () => {
@@ -40,6 +52,10 @@ describe("delegated query wiring in app/api/v1/query/route.ts (Phase B slice 3)"
     expect(src).toMatch(
       /if\s*\(agent\)\s*\{\s*const\s*\{\s*ids\s*\}\s*=\s*await\s+delegatedVisibleItemIds\(\s*db\s*,\s*agent\s*\)\s*;\s*enforce\s*=\s*\{\s*visibleItemIds:\s*ids\s*\}\s*;\s*\}\s*else\s+if\s*\(await\s+teamEnforcesAccess/
     );
+    // No bare `enforce = null` assignment may exist anywhere (Codex B3 Low: the sequence regex
+    // above survives a later re-null). The typed declaration (`let enforce: … | null = null`)
+    // does not match this pattern, so the legal count is zero.
+    expect(src.match(/enforce\s*=\s*null/g) ?? [], "enforce must never be re-nulled after the branch").toHaveLength(0);
   });
   it("the Phase A 403 refusal is gone — delegated tokens authenticate instead", () => {
     expect(src).not.toMatch(/delegation_not_supported/);

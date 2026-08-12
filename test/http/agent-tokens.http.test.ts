@@ -9,7 +9,8 @@ import { createHash } from "node:crypto";
 // §14's delegation rows at their NAMED tier: the wire, over a real socket — the in-process
 // handler tests (test/datamechanics/access-agent-tokens) prove the logic; this tier is what
 // catches a wire-format/serialization break the type system can't (the Response.json blind
-// spot). Phase A surface only: items GET honored + filtered, query 403, items POST rejected.
+// spot). Surface: items GET honored + filtered, items POST rejected; query ADMITS delegated
+// tokens as of Phase B slice 3 (brain-api 1.19) — invalid credential 401, stateless 422.
 
 async function seedAgentWithItem(seed: Seed): Promise<{ token: string; visiblePath: string; hiddenPath: string }> {
   const body = (t: string) => `delegated ${t} content ${randomUUID().slice(0, 6)}`;
@@ -60,15 +61,35 @@ describe("delegated tokens over the wire (Phase A surface)", () => {
     expect(paths, "out-of-set items must not cross the wire").not.toContain(hiddenPath);
   });
 
-  it("POST /api/v1/query answers 403 delegation_not_supported for any aiosd bearer", async () => {
+  it("POST /api/v1/query answers 401 for an INVALID aiosd bearer (the Phase A 403 is retired — brain-api 1.19)", async () => {
     const seed = await seedTeam();
     const res = await fetch(`${BASE_URL}/api/v1/query`, {
       method: "POST",
       headers: { ...keyHeaders("aiosd_deadbeef_bogus", seed.teamSlug), "Content-Type": "application/json" },
       body: JSON.stringify({ question: "anything" }),
     });
-    expect(res.status).toBe(403);
-    expect((await res.json()).error.code).toBe("delegation_not_supported");
+    expect(res.status).toBe(401);
+    expect((await res.json()).error.code).toBe("unauthorized");
+  });
+
+  it("POST /api/v1/query ADMITS a valid aiosd bearer (SSE stream) and 422s conversation_id (stateless)", async () => {
+    const seed = await seedTeam();
+    const { token } = await seedAgentWithItem(seed);
+    const stateless = await fetch(`${BASE_URL}/api/v1/query`, {
+      method: "POST",
+      headers: { ...keyHeaders(token, seed.teamSlug), "Content-Type": "application/json" },
+      body: JSON.stringify({ question: "anything", conversation_id: randomUUID() }),
+    });
+    expect(stateless.status, "delegated queries are stateless — conversation_id refused").toBe(422);
+
+    const res = await fetch(`${BASE_URL}/api/v1/query`, {
+      method: "POST",
+      headers: { ...keyHeaders(token, seed.teamSlug), "Content-Type": "application/json" },
+      body: JSON.stringify({ question: "what is the delegated content about" }),
+    });
+    expect(res.status, "delegated query must be admitted").toBe(200);
+    expect(res.headers.get("content-type")).toBe("text/event-stream");
+    await res.body?.cancel();
   });
 
   it("POST /api/v1/items rejects an aiosd bearer (401 — writes are not on the Phase A surface)", async () => {

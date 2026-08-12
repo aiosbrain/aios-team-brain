@@ -309,6 +309,21 @@ describe("query honors delegated tokens (Phase B slice 3, spec §10/§17-B)", ()
     expect(res.status).toBe(401);
   });
 
+  it("a query that never reaches `done` still consumes daily quota — the query_log row is written BEFORE streaming (Codex B3 High: read-deltas-and-disconnect was free and uncounted)", async () => {
+    const seed = await seedTeam();
+    const agent = await seedMember(seed, { kind: "agent" });
+    const minted = await mintAgentToken(db(), seed.teamId, { memberId: agent }, seed.memberId);
+    const res = await queryPOST(queryReq(minted.token!, { question: "count this attempt" }));
+    expect(res.status).toBe(200);
+    await res.text(); // drain: with no LLM configured this tier's stream ends in an error frame, never `done`
+    const { count } = await db()
+      .from("query_log")
+      .select("id", { count: "exact", head: true })
+      .eq("team_id", seed.teamId)
+      .eq("member_id", agent);
+    expect(count, "the attempt must be counted without a done frame").toBe(1);
+  });
+
   it("a delegated query is stateless: conversation_id is refused explicitly (422), never silently ignored", async () => {
     const seed = await seedTeam();
     const agent = await seedMember(seed, { kind: "agent" });

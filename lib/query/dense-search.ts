@@ -40,9 +40,15 @@ export async function denseSearch(
   question: string,
   projectSlug?: string | null,
   limit = 20,
-  backend?: EmbeddingBackend | null
+  backend?: EmbeddingBackend | null,
+  // Access enforcement (Phase B, Codex B3 Medium): the membership-visible item set, applied
+  // IN-QUERY like the FTS leg — so `limit` ranks over VISIBLE chunks only (a post-filter lets
+  // invisible items crowd visible ones out of the top-N) and an invisible-only match can't flip
+  // the grounding signal. Null = permissive (no filter). Empty = enforcing-but-sees-nothing.
+  visibleIds?: readonly string[] | null
 ): Promise<DenseHit[]> {
   if (!question.trim() || !(await itemChunksTablePresent())) return [];
+  if (visibleIds && visibleIds.length === 0) return []; // enforcing, sees nothing
   try {
     // Resolve the team's embeddings backend (Admin pick or env); off → no dense leg. The QUERY
     // embedding uses the SAME backend that indexed the chunks, so the vector spaces match.
@@ -58,6 +64,10 @@ export async function denseSearch(
     if (projectSlug) {
       params.push(projectSlug);
       where += ` and p.slug = $${params.length}`;
+    }
+    if (visibleIds) {
+      params.push(visibleIds);
+      where += ` and i.id = any($${params.length}::uuid[])`;
     }
     params.push(DENSE_MAX_DISTANCE);
     const distIdx = params.length;

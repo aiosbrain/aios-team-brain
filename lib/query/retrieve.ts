@@ -523,7 +523,8 @@ async function nativeRetrieve(
   const graphFactsP = omitGraph ? Promise.resolve([] as Awaited<ReturnType<typeof fetchGraphFacts>>) : fetchGraphFacts(db, teamId, tier, q);
   // Optional dense (semantic) passage search — pgvector. Runs concurrently; resolves to [] unless
   // EMBEDDINGS_URL is set AND the pgvector schema is loaded (default installs stay pure-FTS).
-  const denseP = denseSearch(teamId, tier, q, projectSlug);
+  // Enforcement is IN-QUERY (visArr), like the FTS leg — see denseSearch (Codex B3 Medium).
+  const denseP = denseSearch(teamId, tier, q, projectSlug, undefined, undefined, visArr);
   // Git-activity + per-person activity digests (team tier only — internal) run in parallel too.
   // Context shaping: the activity digests are heavy + only relevant to "who's doing what" questions.
   // omitGraph (= enforcing) also gates the unpartitionable aggregate legs (git/people
@@ -774,7 +775,10 @@ async function nativeRetrieve(
     // A dense hit here is a REAL semantic match — denseSearch applies a distance floor, so far
     // nearest-neighbors (which every query has) are already excluded. That's what makes this a valid
     // grounding signal rather than "any vector exists" (which would defeat the IDF grounding above).
-    grounded = true;
+    // Ground only on a VISIBLE hit (Codex B3 Medium): an invisible-only dense match must not
+    // suppress abstention (§5.7 side channel). The in-query filter already restricts the hits
+    // under enforcing; this visible() check is the belt-and-braces layer.
+    if (denseHits.some((h) => visible(h.item_id))) grounded = true;
     for (const h of denseHits) {
       if (seen.has(h.item_id)) continue;
       seen.add(h.item_id);

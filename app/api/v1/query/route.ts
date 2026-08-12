@@ -150,7 +150,23 @@ export async function POST(req: NextRequest) {
   // longer visible to this principal (e.g. after a group change) — omit history under enforcing
   // until turns are visibility-revalidated. The current turn's answer is freshly retrieval-grounded.
   const historyTurns = enforce ? [] : priorTurns;
+
+  // Quota integrity (Codex B3 High): write the query_log row BEFORE streaming and UPDATE it on
+  // `done` — the daily count and team budget read query_log, and a row written only in the done
+  // branch made read-the-deltas-and-disconnect free and uncounted (10/min sustained, forever).
+  // An attempt now consumes quota even when the stream errors or is canceled; token/cost fields
+  // stay 0 for incomplete streams (the usage numbers only exist at `done`).
   const started = Date.now();
+  const { data: logRow, error: logErr } = await db
+    .from("query_log")
+    .insert({ team_id: teamId, member_id: launcherId, question })
+    .select("id")
+    .single();
+  if (logErr || !logRow) {
+    // Fail closed: an uncountable query must not run (otherwise the bypass reopens on DB errors).
+    return errorResponse("internal", "query accounting failed", 500);
+  }
+  const queryLogId = (logRow as { id: string }).id;
   const ctx = await retrieve(db, teamId, memberTier, question, project, enforce);
 
   // Per-team provider keys + models + the explicit answering-backend override (same resolver the
@@ -199,10 +215,7 @@ export async function POST(req: NextRequest) {
               }
             }
 
-            await db.from("query_log").insert({
-              team_id: teamId,
-              member_id: launcherId,
-              question,
+            await db.from("query_log").update({
               answer_preview: answer.slice(0, 500),
               cited_item_ids: sources.map((s) => s.item_id).filter(Boolean),
               input_tokens: chunk.usage.input_tokens,
@@ -210,7 +223,7 @@ export async function POST(req: NextRequest) {
               cache_read_tokens: chunk.usage.cache_read_tokens,
               cost_usd: chunk.usage.cost_usd,
               latency_ms: Date.now() - started,
-            });
+            }).eq("id", queryLogId);
 
             // Meter this answer's spend into the unified brain-inference ledger (source "query"), so
             // the Pulse Spend KPI + costs breakdown see it alongside every background LLM task.
@@ -228,7 +241,11 @@ export async function POST(req: NextRequest) {
           }
         }
       } catch (e) {
-        send("error", { message: e instanceof Error ? e.message : "query failed" });
+        // Generic wire message (Codex B3 Low): raw LLM errors carry the model, internal base URL
+        // and upstream body — infrastructure detail no bearer (least of all a delegated one)
+        // should receive. Full detail goes to the server log.
+        console.error("[query] stream failed:", e instanceof Error ? e.message : e);
+        send("error", { message: "query failed" });
       } finally {
         controller.close();
       }
