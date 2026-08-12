@@ -41,6 +41,41 @@ describe("dense-leg enforcement wired in lib/query/retrieve.ts (Codex B3 Medium)
   });
 });
 
+describe("arc enforcement wiring in app/api/brain/arcs/route.ts (Phase B slice 5, §5.8)", () => {
+  const src = read("app/api/brain/arcs/route.ts");
+  it("resolves the member's visibility and serves the FILTERED tier arcs, not the raw getArcs output", () => {
+    expect(src).toMatch(/memberEnforcement\(\s*admin\s*,\s*\{\s*teamId:\s*team\.id\s*,\s*memberId\s*\}\s*\)/);
+    expect(src).toMatch(/const\s+arcs\s*=\s*filterArcsByVisibleItems\(\s*allArcs\s*,\s*enforce\?\.visibleItemIds\s*\?\?\s*null\s*\)/);
+  });
+  it("fails closed on an enforcement-resolution error (500, never the unfiltered set)", () => {
+    expect(src).toMatch(/catch\s*\{\s*return errorResponse\("internal", "enforcement check failed", 500\)/);
+  });
+  it("the RECOMPUTE route filters too — it returns the tier arc set and is team-tier-gated, not admin-gated (Fable B5 High: an unfiltered bypass otherwise)", () => {
+    const rc = read("app/api/brain/arcs/recompute/route.ts");
+    expect(rc).toMatch(/memberEnforcement\(\s*admin\s*,\s*\{\s*teamId:\s*team\.id\s*,\s*memberId\s*\}\s*\)/);
+    expect(rc).toMatch(/const\s+arcs\s*=\s*filterArcsByVisibleItems\(\s*allArcs\s*,\s*enforce\?\.visibleItemIds\s*\?\?\s*null\s*\)/);
+    expect(rc).toMatch(/catch\s*\{\s*return errorResponse\("internal", "enforcement check failed", 500\)/);
+  });
+  it("the recompute route gates the correction WRITE by visibility BEFORE recomputeArcs (Codex B5 High: arbitrary/invisible corrections poison the shared synthesis)", () => {
+    const rc = read("app/api/brain/arcs/recompute/route.ts");
+    // reads the CACHED arcs (no synthesis) + filters + rejects an out-of-visibility target …
+    expect(rc).toMatch(/readArcCache\(/);
+    expect(rc).toMatch(/corrections\.some\(\s*\(c\)\s*=>\s*!visibleIds\.has\(c\.arc_id\)\s*\)/);
+    expect(rc).toMatch(/a correction targets an arc outside your visibility/);
+    // … and that gate must sit BEFORE the recomputeArcs call (which writes + projects).
+    const gateAt = rc.indexOf("outside your visibility");
+    const recomputeAt = rc.indexOf("await recomputeArcs(");
+    expect(gateAt, "the write gate must precede recomputeArcs").toBeLessThan(recomputeAt);
+  });
+  it("both arc routes neutralize the response for an enforcing member whose result is empty (§5.7 — no absent-vs-invisible disclosure)", () => {
+    // main route: the team-wide diagnostic runs ONLY on a permissive team …
+    expect(read("app/api/brain/arcs/route.ts")).toMatch(/if\s*\(arcs\.length === 0 && enforce == null\)/);
+    // … and both routes return a neutral envelope on enforcing-empty.
+    expect(read("app/api/brain/arcs/route.ts")).toMatch(/enforce != null && arcs\.length === 0/);
+    expect(read("app/api/brain/arcs/recompute/route.ts")).toMatch(/enforcingEmpty\s*=\s*enforce != null && arcs\.length === 0/);
+  });
+});
+
 describe("timeline enforcement wiring (Phase B slice 4, §5.8)", () => {
   it("every timeline surface passes its PRINCIPAL to getCachedWorkTimeline (4th arg — a forgotten one would serve the tier row)", () => {
     expect(read("app/api/v1/timeline/route.ts")).toMatch(/getCachedWorkTimeline\(db,\s*auth\.teamId,\s*auth\.memberTier,\s*auth\.memberId\s*\)/);
