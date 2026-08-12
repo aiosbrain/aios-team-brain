@@ -9,6 +9,7 @@ import {
   deriveGraphExtractionStalled,
   groupCensuses,
   newestEpisodeAtMs,
+  newestEpisodicAtMs,
   newestFactAtMs,
   type CensusRefusal,
   type GroupCensus,
@@ -194,6 +195,7 @@ export async function getRetrievalHealth(teamId: string): Promise<RetrievalHealt
     graphFacts,
     graphNewestFactAt,
     graphNewestEpisodeAt,
+    graphNewestEpisodicAt,
     graphGroupCensuses,
     graphProxyRefusal,
     llm,
@@ -205,6 +207,8 @@ export async function getRetrievalHealth(teamId: string): Promise<RetrievalHealt
     graphConfiguredNow ? countGraphFacts() : Promise.resolve(null),
     graphConfiguredNow ? newestFactAtMs() : Promise.resolve(null),
     graphConfiguredNow ? newestEpisodeAtMs(teamId) : Promise.resolve(null),
+    // When graphiti last FINISHED a job — the liveness leg (STALLPROBE-1).
+    graphConfiguredNow ? newestEpisodicAtMs() : Promise.resolve(null),
     graphConfiguredNow ? groupCensuses(teamId) : Promise.resolve([] as GroupCensus[]),
     // Config-only resolution: no upstream call, nothing spent. Best-effort — a broken probe must
     // never fail the admin page.
@@ -244,6 +248,12 @@ export async function getRetrievalHealth(teamId: string): Promise<RetrievalHealt
       facts: graphFacts,
       newestEpisodeAtMs: graphNewestEpisodeAt,
       newestFactAtMs: graphNewestFactAt,
+      // STALLPROBE-1. This call site was MISSED when the liveness leg was first added, because the
+      // field was optional and "omitted ⇒ old behaviour" — so the pipeline banner got the fix while
+      // THIS card, the one that produced the bug report, kept the false positive and the two surfaces
+      // silently disagreed. The field is required now; `test/guards/extraction-stall-callsites` is the
+      // backstop.
+      newestEpisodicAtMs: graphNewestEpisodicAt,
     });
   // The OTHER extraction failure: episodes become facts, but the facts are confidently wrong —
   // same-name entity splits accumulating from a model/embedding stack resolving identity badly

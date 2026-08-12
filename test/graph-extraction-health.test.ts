@@ -65,27 +65,49 @@ describe("deriveGraphExtractionStalled — extraction that STOPPED, not extracti
   const now = Date.parse("2026-07-28T12:00:00Z");
   const at = (hoursAgo: number) => now - hoursAgo * HOUR;
 
-  it("STALLED: episodes still arriving, newest fact far older than the newest episode", () => {
-    // The live case. 400 historical facts is exactly what kept the old check quiet.
+  // CONTRACT CHANGE (STALLPROBE-1). This block was written when FACT age was the accuser. It no
+  // longer is: on a mature graph most extracted edges deduplicate, so the fact clock freezes while
+  // extraction runs perfectly — that is the false positive this slice removes. The liveness question
+  // is now "did a JOB FINISH" (`Episodic.created_at`), and fact age is observational. The 2026-07-28
+  // outage these tests were written for is still caught, by the episodic clock instead.
+  it("STALLED: episodes arriving, and NO JOB HAS COMPLETED since — the 2026-07-28 outage", () => {
+    // A dead extractor stops writing episode nodes too, so the outage stays loud. (It used to be the
+    // stale FACT that accused; that is now insufficient on its own — see the next test.)
     expect(
       deriveGraphExtractionStalled({
         episodes: 1243,
         facts: 400,
         newestEpisodeAtMs: at(0.2),
         newestFactAtMs: at(30),
+        newestEpisodicAtMs: at(30),
       })
     ).toBe(true);
   });
 
-  it("healthy: facts trailing episodes by less than the lag budget", () => {
-    // Extraction is serial and ~10-20s per episode, so facts ALWAYS trail. A small gap is normal
-    // and must not page anyone.
+  it("NOT stalled on stale facts alone when jobs are completing — the false positive, removed", () => {
+    // Same fixture as above except a job finished moments ago. Under the old predicate this was a
+    // stall; it is the exact prod state that produced "accepting episodes but extracting 0 facts".
+    expect(
+      deriveGraphExtractionStalled({
+        episodes: 1243,
+        facts: 400,
+        newestEpisodeAtMs: at(0.2),
+        newestFactAtMs: at(30),
+        newestEpisodicAtMs: at(0.1),
+      })
+    ).toBe(false);
+  });
+
+  it("healthy: jobs completing just behind the episodes", () => {
+    // Extraction is serial and ~10-20s per episode, so completion ALWAYS trails. A small gap is
+    // normal and must not page anyone.
     expect(
       deriveGraphExtractionStalled({
         episodes: 1243,
         facts: 400,
         newestEpisodeAtMs: at(0),
         newestFactAtMs: at(1),
+        newestEpisodicAtMs: at(1),
       })
     ).toBe(false);
   });
@@ -158,151 +180,128 @@ describe("parseProbeTimestamp — the formats the two probes actually emit", () 
 });
 
 describe("the lag budget boundary", () => {
-  const base = { episodes: 1243, facts: 400, newestEpisodeAtMs: 1_000_000_000_000 };
+  // Measured on the EPISODIC clock since STALLPROBE-1 — fact age no longer accuses.
+  const base = {
+    episodes: 1243,
+    facts: 400,
+    newestEpisodeAtMs: 1_000_000_000_000,
+    newestFactAtMs: 1_000_000_000_000 - 30 * 3_600_000, // deliberately stale: must not matter
+  };
   it("is exclusive: exactly at budget is healthy, one ms past is stalled", () => {
     expect(
-      deriveGraphExtractionStalled({ ...base, newestFactAtMs: base.newestEpisodeAtMs - EXTRACTION_LAG_BUDGET_MS })
+      deriveGraphExtractionStalled({ ...base, newestEpisodicAtMs: base.newestEpisodeAtMs - EXTRACTION_LAG_BUDGET_MS })
     ).toBe(false);
     expect(
-      deriveGraphExtractionStalled({ ...base, newestFactAtMs: base.newestEpisodeAtMs - EXTRACTION_LAG_BUDGET_MS - 1 })
+      deriveGraphExtractionStalled({
+        ...base,
+        newestEpisodicAtMs: base.newestEpisodeAtMs - EXTRACTION_LAG_BUDGET_MS - 1,
+      })
     ).toBe(true);
   });
 
-  it("a fact NEWER than the newest episode is healthy, not negative-lag nonsense", () => {
-    expect(deriveGraphExtractionStalled({ ...base, newestFactAtMs: base.newestEpisodeAtMs + 60_000 })).toBe(false);
+  it("a completion NEWER than the newest episode is healthy, not negative-lag nonsense", () => {
+    expect(deriveGraphExtractionStalled({ ...base, newestEpisodicAtMs: base.newestEpisodeAtMs + 60_000 })).toBe(false);
+  });
+
+  it("an OMITTED field (tests aren't typechecked) reads as unknown, never as healthy-by-accident", () => {
+    // Pins the desired OUTCOME for an omitted field: unknown must never accuse. Stated honestly: this
+    // does NOT pin the `?? null` itself — removing that normalisation leaves this green, because
+    // `NaN > budget` is already false. The normalisation is defensive, not behavioural (see the comment
+    // at the call site), and mutation-testing it is how that was established rather than assumed.
+    const omitted = { ...base } as Parameters<typeof deriveGraphExtractionStalled>[0];
+    expect(deriveGraphExtractionStalled(omitted)).toBe(false);
+    // …and it must not suppress the zero-facts stall either.
+    expect(deriveGraphExtractionStalled({ ...omitted, facts: 0 })).toBe(true);
   });
 });
 
 /**
- * LIVENESS vs NOVELTY (STALLPROBE-1 / AIO-876).
+ * LIVENESS IS THE EPISODE NODE (STALLPROBE-1 / AIO-876).
  *
- * The lag half of the probe answers "when did the graph last learn something NEW?" and was being read
- * as "when did the extractor last RUN?". On a mature graph those diverge — prod runs ~6.1
- * `dedupe_edges` per `extract_edges`, so most extracted edges resolve onto an existing edge and create
- * no `RELATES_TO`, freezing `max(created_at)` while extraction works perfectly. On 2026-08-12 that
- * produced "accepting episodes but extracting 0 facts" one minute after a clean pipeline run, beside
- * a census reporting 2,928 NEW entities.
+ * The lag half used to compare the newest episode against the newest FACT, which asks "when did the
+ * graph last learn something NEW?" and was read as "when did a job last FINISH?". On a mature graph
+ * those diverge — prod runs ~6.1 `dedupe_edges` per `extract_edges`, so most extracted edges resolve
+ * onto an existing edge and create no `RELATES_TO` — so the clock freezes while extraction works. That
+ * produced "accepting episodes but extracting 0 facts" one minute after a clean pipeline run.
  *
- * The fix asks the extractor's OWN ledger (`llm_usage`, source='graph') whether it ran. These pin both
- * directions: the false positive must go, and the 2026-07-28 quota outage must stay loud.
+ * `Episodic.created_at` is the honest signal: written by `add_nodes_and_edges_bulk` (the single Neo4j
+ * write, last thing a job does), it can never deduplicate, and it is wall-clock rather than backdated.
+ * Two earlier designs based on the LLM spend ledger were killed in review — see the spec — so these
+ * pin BOTH directions: the false positive must go, and a real outage must stay loud.
  */
-describe("deriveGraphExtractionStalled — liveness overrides novelty", () => {
+describe("deriveGraphExtractionStalled — episode-node liveness", () => {
   const N = MIN_EPISODES_FOR_EXTRACTION_SIGNAL;
   const EPISODE_AT = Date.parse("2026-08-12T00:15:02Z");
-  /** Facts frozen well past the budget — the condition that used to be sufficient to accuse. */
-  const LAGGING = {
+  /** Facts frozen far past the budget — the state that used to be sufficient to accuse. */
+  const DEDUP_FROZEN = {
     episodes: N * 10,
     facts: 113_352,
     newestEpisodeAtMs: EPISODE_AT,
     newestFactAtMs: EPISODE_AT - (EXTRACTION_LAG_BUDGET_MS + 3_600_000),
   };
 
-  it("is NOT stalled when the ledger shows a successful call after the newest episode", () => {
-    // The reported false positive, in the shape it actually occurred: extraction completed 60s after
-    // the episode was projected, and every new edge deduplicated.
+  it("is NOT stalled when a job FINISHED recently, however old the newest fact is", () => {
+    // The reported false positive, in the shape it occurred: extraction completed 60s after the
+    // episode was projected and every new edge deduplicated.
     expect(
-      deriveGraphExtractionStalled({
-        ...LAGGING,
-        extractor: { readable: true, newestAtMs: EPISODE_AT + 60_000 },
-      })
+      deriveGraphExtractionStalled({ ...DEDUP_FROZEN, newestEpisodicAtMs: EPISODE_AT + 60_000 })
     ).toBe(false);
   });
 
-  it("IS stalled when the ledger shows NO call since the newest episode — the 2026-07-28 outage", () => {
-    // The direction that must not be weakened: a dead extractor writes no llm_usage rows either, so
-    // lag + silence is the real signal. Without this the fix would be a blanket alarm-suppressor.
+  it("IS stalled when episodes are pushed and NO job completes — the real outage", () => {
+    // The direction that must not be weakened. This now covers the whole pipeline including the Neo4j
+    // write, which both rejected ledger designs left uncovered.
     expect(
       deriveGraphExtractionStalled({
-        ...LAGGING,
-        extractor: { readable: true, newestAtMs: EPISODE_AT - 48 * 3_600_000 },
+        ...DEDUP_FROZEN,
+        newestEpisodicAtMs: EPISODE_AT - (EXTRACTION_LAG_BUDGET_MS + 1),
       })
     ).toBe(true);
   });
 
-  it("IS stalled when the ledger is readable and EMPTY — no activity at all", () => {
-    expect(deriveGraphExtractionStalled({ ...LAGGING, extractor: { readable: true, newestAtMs: null } })).toBe(true);
+  it("is exclusive at the budget: exactly at it is healthy, one ms past is stalled", () => {
+    const at = (d: number) => deriveGraphExtractionStalled({ ...DEDUP_FROZEN, newestEpisodicAtMs: EPISODE_AT - d });
+    expect(at(EXTRACTION_LAG_BUDGET_MS)).toBe(false);
+    expect(at(EXTRACTION_LAG_BUDGET_MS + 1)).toBe(true);
   });
 
-  it("an UNREADABLE ledger never manufactures a stall — ignorance is not evidence", () => {
-    // `readable:false` is a failed query, which is not the same fact as "the extractor did nothing".
-    expect(deriveGraphExtractionStalled({ ...LAGGING, extractor: { readable: false, newestAtMs: null } })).toBe(false);
-  });
-
-  it("zero facts outranks liveness — a running extractor producing nothing is still broken", () => {
-    // The never-extracted case must not be suppressible by ledger activity, or a busy-but-useless
-    // extractor would read healthy.
+  it("zero facts outranks liveness — a completing extractor producing nothing is still broken", () => {
     expect(
       deriveGraphExtractionStalled({
         episodes: N * 10,
         facts: 0,
         newestEpisodeAtMs: EPISODE_AT,
         newestFactAtMs: null,
-        extractor: { readable: true, newestAtMs: EPISODE_AT + 60_000 },
+        newestEpisodicAtMs: EPISODE_AT + 60_000,
       })
     ).toBe(true);
   });
 
-  it("with NO ledger supplied, the verdict falls back to fact-lag alone (pre-fix behaviour)", () => {
-    // The back-compat control: existing callers/tests that pass no `extractor` must be unaffected,
-    // otherwise this change would silently disarm the lag check everywhere it isn't wired.
-    expect(deriveGraphExtractionStalled(LAGGING)).toBe(true);
+  it("an unknown episodic timestamp never manufactures a stall", () => {
+    // Neo4j unreadable/unconfigured. A different leg owns reachability; "don't know" must not accuse.
+    expect(deriveGraphExtractionStalled({ ...DEDUP_FROZEN, newestEpisodicAtMs: null })).toBe(false);
   });
 
-  it("healthy lag is still healthy regardless of the ledger", () => {
-    // The other control: liveness must not be able to CREATE a stall on a graph that is keeping up.
-    const fresh = { ...LAGGING, newestFactAtMs: EPISODE_AT - 60_000 };
-    expect(deriveGraphExtractionStalled({ ...fresh, extractor: { readable: true, newestAtMs: null } })).toBe(false);
-  });
-});
-
-/**
- * WIRING + BOUNDARY gaps found by the Fable round (STALLPROBE-1).
- *
- * The predicate tests above construct their own `extractor`, and the dm tests call `extractorActivity`
- * directly — so deleting the probe from `getGraphExtractionHealth`'s `Promise.all` left every test
- * green while silently reverting to pre-fix behaviour. That is the "pin the call site, not just the
- * function" class, and it is exactly how a fix disappears in a later refactor.
- */
-describe("STALLPROBE-1 wiring + boundaries", () => {
-  const N = MIN_EPISODES_FOR_EXTRACTION_SIGNAL;
-  const EPISODE_AT = Date.parse("2026-08-12T00:15:02Z");
-
-  it("getGraphExtractionHealth actually THREADS the ledger probe into the verdict", async () => {
-    // A source-level pin: the composition can't be exercised in the dm tier (getGraphExtractionHealth
-    // early-returns when neo4jConfigured() is false and that tier has no Neo4j), so assert the wire
-    // exists. Both halves are required — the call AND passing its result into the signals object.
-    const src = await import("node:fs").then((fs) =>
-      fs.readFileSync(new URL("../lib/graph/extraction-health.ts", import.meta.url), "utf8")
-    );
-    const body = src.slice(src.indexOf("export async function getGraphExtractionHealth"));
-    expect(body).toMatch(/extractorActivity\(teamId\)/);
-    expect(body).toMatch(/\n\s*extractor,\n/);
-  });
-
-  it("the liveness clear is INCLUSIVE at the grace boundary, exclusive one ms before", () => {
-    // Pins `>=` against a silent flip to `>`; ties are reachable when both stamps land the same ms.
-    const base = {
-      episodes: N * 10,
-      facts: 113_352,
-      newestEpisodeAtMs: EPISODE_AT,
-      newestFactAtMs: EPISODE_AT - (EXTRACTION_LAG_BUDGET_MS + 3_600_000),
-    };
-    const edge = EPISODE_AT - EXTRACTION_LAG_BUDGET_MS;
-    expect(deriveGraphExtractionStalled({ ...base, extractor: { readable: true, newestAtMs: edge } })).toBe(false);
-    expect(deriveGraphExtractionStalled({ ...base, extractor: { readable: true, newestAtMs: edge - 1 } })).toBe(true);
-  });
-
-  it("an unreadable ledger still does NOT suppress the zero-facts stall", () => {
-    // The spec criterion that had no test: hoisting the `readable:false` check above `facts === 0`
-    // would keep every other assertion green while letting a broken install read healthy.
+  it("…but an unknown episodic timestamp does NOT suppress the zero-facts stall", () => {
     expect(
       deriveGraphExtractionStalled({
         episodes: N * 10,
         facts: 0,
         newestEpisodeAtMs: EPISODE_AT,
         newestFactAtMs: null,
-        extractor: { readable: false, newestAtMs: null },
+        newestEpisodicAtMs: null,
       })
     ).toBe(true);
+  });
+
+  it("FACT AGE ALONE CAN NO LONGER ACCUSE — the whole point of the change", () => {
+    // The control that would have caught the original bug. Facts arbitrarily stale, jobs completing.
+    expect(
+      deriveGraphExtractionStalled({
+        ...DEDUP_FROZEN,
+        newestFactAtMs: EPISODE_AT - 30 * 86_400_000,
+        newestEpisodicAtMs: EPISODE_AT,
+      })
+    ).toBe(false);
   });
 });

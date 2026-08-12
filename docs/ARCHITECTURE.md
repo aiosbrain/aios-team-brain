@@ -771,22 +771,7 @@ guard enforces it, it's named.
   comparing projected episodes (Postgres ledger) vs extracted facts (Neo4j `count(RELATES_TO)`): many
   projected + zero extracted ⇒ **degraded**, surfaced on the Admin retrieval-health card (Graph memory
   leg) **and** the loud pipeline-health banner (synthetic `graph_extract` leg) on Home + Integrations.
-  **LIVENESS IS LEDGER-DERIVED, NOT NOVELTY-DERIVED (STALLPROBE-1).** The recency half used to accuse
-  purely on fact-lag (`newestEpisode − max(RELATES_TO.created_at) > 6h`), which asks "when did the graph
-  last learn something NEW?" and was read as "when did the extractor last RUN?". On a mature graph those
-  diverge: prod runs ~6.1 `dedupe_edges` per `extract_edges`, so most extracted edges resolve onto an
-  existing edge and create no `RELATES_TO` — the clock freezes while extraction works. On 2026-08-12 that
-  produced "accepting episodes but extracting 0 facts" one minute after a clean pipeline run, beside the
-  same card's census reporting 2,928 NEW entities, and (because the same boolean feeds the synthetic leg)
-  rendered as two independent-looking failures. Lag now only accuses when the extractor's OWN spend
-  ledger agrees: `extractorActivity` reads the newest LATE-STAGE `source='graph'` `llm_usage` row
-  (`extract_edges`/`dedupe_edges`), and one within the lag budget of the newest episode clears the
-  stall. **Late-stage specifically, because a bare graph row proves nothing:** `meterGraphCall` records
-  whatever `usage` arrives whatever the HTTP status (so billed non-2xx generations aren't invisible
-  spend), and a truncated extraction is a 200 carrying usage — accepting any row would have blinded the
-  probe to the 2026-07 `Output length exceeded` outage it exists for. The pipeline runs `extract_nodes`
-  → `dedupe_nodes` → `extract_edges` → `dedupe_edges` and that truncation fails at stage 2, so a
-  stage-3/4 row proves the job cleared the failing stage. `readable:false` (query failed) is deliberately NOT the same value as
+  **LIVENESS IS THE EPISODE NODE, NOT THE FACTS (STALLPROBE-1).** The recency half used to accuse on fact-lag (`newestEpisode − max(RELATES_TO.created_at) > 6h`), which asks "when did the graph last learn something NEW?" and was read as "when did a job last FINISH?". On a mature graph those diverge: prod runs ~6.1 `dedupe_edges` per `extract_edges`, so most extracted edges resolve onto an existing edge and create no `RELATES_TO` — the clock freezes while extraction works. On 2026-08-12 that produced "accepting episodes but extracting 0 facts" one minute after a clean pipeline run, beside the same card's census reporting 2,928 NEW entities, and (because the same boolean feeds the synthetic leg) rendered as two independent-looking failures. The accuser is now `newestEpisodicAtMs` = `max(Episodic.created_at)`: graphiti persists the episode node in `add_nodes_and_edges_bulk`, the SINGLE Neo4j write and the last thing a job does, so it covers the whole pipeline including the write itself; a new episode can never deduplicate onto an existing node (the property whose absence caused the false positive); and `created_at` is `utc_now()` at construction, not the backdated `reference_time`. Fact-lag is now observational. **Two LLM-ledger designs were tried and killed in review, recorded so they are not re-proposed:** (i) "any `source='graph'` `llm_usage` row" — false, because `meterGraphCall` meters whatever `usage` arrives at ANY HTTP status (so billed non-2xx generations aren't invisible spend) and a truncated extraction is a 200 carrying usage; (ii) "a late-stage `call_kind` row" — false for the outage it cited, since on graphiti-core 0.13.2 `extract_edges` ran CONCURRENTLY with the stage that failed, it left everything after that call (including the Neo4j write) uncovered, and `call_kind` is prompt-prefix-matched so a graph-service upgrade would fall to `unknown` and re-manufacture the alarm. `ExtractionSignals.newestEpisodicAtMs` is REQUIRED, not optional: the optional version left `lib/query/retrieval-health` (the card that reported the bug) unwired while every test passed, so omission is now a typecheck failure in `lib/` plus `test/guards/extraction-stall-callsites`. `readable:false` (query failed) is deliberately NOT the same value as
   an empty ledger — ignorance never accuses, proven silence does — and `facts === 0` still outranks
   liveness, so a busy-but-useless extractor stays loud. Fact-lag remains observational on the card.
   **Root fix — raise the cap (not shrink episodes).** The extractor's output cap is graphiti_core's

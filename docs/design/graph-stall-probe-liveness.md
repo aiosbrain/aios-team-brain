@@ -65,52 +65,67 @@ Pulse — which reads as corroboration rather than as one signal counted twice.
 
 ## 3. The decision
 
-**Judge liveness from the extractor's own ledger, not from the graph's novelty.**
+**Judge liveness from the EPISODE NODE graphiti writes when a job finishes.**
 
-`llm_usage` already records every graph LLM call with `source='graph'` and (since GRAPHCOST-5) a
-`call_kind`. A LATE-STAGE call *after* the newest projected episode is direct, positive evidence that
-the extractor ran on current work — deduplication cannot fake it, and it is a Postgres read, so it
-works even when Neo4j is unreadable.
+### 3a. The two designs that were tried and rejected, and why (both by review)
 
-**Corrected during the Fable round — the first draft of this spec was wrong.** It claimed a bare
-`source='graph'` row proves a call succeeded, on the reasoning that failures go to `llm_failures`.
-They do not, all of them: `meterGraphCall` (`lib/llm/graph-proxy`) deliberately records whatever
-`usage` arrives **whatever the HTTP status** — that is how billed non-2xx generations stopped being
-invisible spend (47% of the bill, measured 2026-07-30) — and a truncated extraction is a **200
-carrying usage** with `finish_reason:"length"`. So the original predicate would have been blinded by
-the exact 2026-07 outage this probe exists for (`Output length exceeded max tokens 8192` raised
-inside `resolve_extracted_nodes`): every failing job would have refreshed the ledger while creating
-zero facts. A false negative on the flagship failure is worse than the false positive being fixed.
+**Draft 1 — "any `source='graph'` `llm_usage` row".** Refuted: `meterGraphCall`
+(`lib/llm/graph-proxy.ts`) deliberately meters whatever `usage` arrives **whatever the HTTP status**,
+so billed non-2xx generations stop being invisible spend (47% of the bill, measured 2026-07-30). A
+truncated extraction is a **200 carrying usage**. Every failing job would have refreshed the ledger.
 
-The evidence is therefore narrowed to `LATE_STAGE_GRAPH_CALL_KINDS` (`extract_edges`, `dedupe_edges`).
-The pipeline runs `extract_nodes` → `dedupe_nodes` → `extract_edges` → `dedupe_edges` and the
-truncation fails at stage 2, so a stage-3/4 row proves the job cleared the stage that breaks. Healthy
-prod emits them ~1:1 with `extract_nodes`, so the narrowing costs no sensitivity. A pre-GRAPHCOST-5
-row (`call_kind = ''`) can never vouch — it cannot be shown to be a late stage, and the probe must
-not accept "maybe".
+**Draft 2 — "a LATE-STAGE (`extract_edges`/`dedupe_edges`) ledger row".** Three defects, all verified
+against the actual wheels:
+- **The justification was false for the outage it cited.** On `graphiti-core==0.13.2` — the version
+  running during the 2026-07 `Output length exceeded max tokens 8192` incident — `graphiti.py:396`
+  reads `await semaphore_gather(resolve_extracted_nodes(...), extract_edges(...))`: they are
+  **concurrent siblings**, not stages 2 and 3. The narrowing would not have caught that outage. It is
+  only sequential on `0.29.3` (`graphiti.py:1131` then `:1144`), so the property was version-contingent
+  and a rollback would silently remove it.
+- **It moved the blind spot rather than closing it.** On 0.29.3 everything below the `extract_edges`
+  call happens after the voucher fires: edge embeddings, edge resolution, attribute extraction, and —
+  critically — `add_nodes_and_edges_bulk` (`graphiti.py:726`, reached via `:1170`), *the only place
+  anything is written to Neo4j*. A Neo4j write failure would have read healthy forever.
+- **A prompt reword re-manufactures the alarm.** `call_kind` is prefix-matched off the system prompt
+  (`lib/llm/graph-call-kind.ts`), which is documented to fall to `unknown` on a graph-service upgrade.
+  All-`unknown` would read as "extractor silent" → red everywhere.
 
-Revised predicate:
+### 3b. The signal
 
-1. **Never extracted** (`facts === 0` over the episode floor) → still a stall. Unchanged; this is the
-   original 2026-07 failure and novelty/liveness agree there.
-2. **Extractor demonstrably ran** — ≥1 LATE-STAGE `source='graph'` `llm_usage` row within
-   `EXTRACTION_LAG_BUDGET_MS` of the newest projected episode → **NOT stalled**, regardless of fact
-   age. Grace-bounded rather than strictly newer: extraction starts ~60s AFTER projection, so a strict
-   compare re-creates the same red banner for a window on every single run.
-3. **No recent extractor activity at all** AND facts are lagging past the budget → stall. This keeps
-   the 2026-07-28 quota failure (the case the lag check was added for) loud: a dead extractor writes
-   no `llm_usage` rows either.
-4. **Ledger unreadable** → `null` → not stalled (fail quiet; a different leg owns reachability).
+`EpisodicNode` is the right evidence, and it is better than the ledger on every axis that matters:
 
-Fact-lag becomes an **observational** number on the card, alongside the existing yield line. It is
-still worth showing — a graph that has genuinely learned nothing in a week is interesting — but it
-must not, alone, accuse the extractor of failing.
+| property | why it holds |
+|---|---|
+| **End-of-job** | it is persisted by `add_nodes_and_edges_bulk` (`graphiti.py:726`), the single Neo4j write, reached only after node resolution, edge extraction, edge resolution and attribute extraction have all returned |
+| **Cannot deduplicate** | a new episode is always a new node — unlike entities and edges, which resolve onto existing ones. This is exactly the property whose absence caused the false positive |
+| **Not backdated** | `created_at: datetime = Field(default_factory=lambda: utc_now())` (`nodes.py:98`) — wall-clock at construction, not the episode's `reference_time` (contrast `valid_at`, which IS backdated and is why `newestFactAtMs` deliberately reads `created_at`) |
+| **Version-independent** | no claim about stage ordering, no dependency on prompt text or `call_kind` |
+
+Revised predicate — `newestEpisodicAtMs` replaces the ledger, and fact-lag stops accusing entirely:
+
+1. **Never extracted** (`facts === 0` over the episode floor) → stall. Unchanged.
+2. **Episodes are completing** — `newestEpisode − newestEpisodic <= EXTRACTION_LAG_BUDGET_MS` → **NOT
+   stalled**, whatever the fact age. Dedup-frozen novelty can no longer accuse.
+3. **Episodes pushed but not completing** — the same difference over budget → stall. This is the
+   literal contract ("202 accepted, nothing processed") and it now covers the WHOLE pipeline including
+   the Neo4j write.
+4. **Either timestamp unknown** (`null`) → not stalled. Neo4j unreadable is a different leg's business.
+
+Fact-lag becomes **observational**: still shown, never the accuser.
+
+### 3c. The signal is REQUIRED, not optional
+
+`ExtractionSignals.newestEpisodicAtMs` is a **required** field. Draft 2 made it optional with
+"omitted ⇒ pre-fix behaviour", and that is precisely how the second call site
+(`lib/query/retrieval-health.ts` — the surface that produced the bug report) stayed unwired while
+every test passed. A required field makes omission a **typecheck failure**, which is the standing
+"build-failing guard > discipline you have to remember" rule. A call-site guard backs it up.
 
 ## Dependencies
 
 **Deps: none.** This slice stands alone. It reads two sources that already exist in production —
-`llm_usage` (`source='graph'`, metered since COSTMETER-1/#437, `call_kind`-labelled since
-GRAPHCOST-5/#487) and `graph_episodes` — and changes one pure predicate plus its callers. It does
+`graph_episodes` (Postgres, when WE pushed) and `Episodic` nodes in Neo4j (when graphiti FINISHED) —
+and changes one pure predicate plus both of its callers. It does
 NOT depend on `BANNERFLAP-1` (AIO-866) or `CENSUSFLOOR-1` (AIO-867); those are siblings in the same
 "alarms must not accuse without standing evidence" family and can land in any order.
 
@@ -133,13 +148,12 @@ no new table, no change to `visibleItems`/`visibleTasks`/`visibleGroupIds`.
 
 ## 4. Acceptance criteria
 
-- `test/graph-extraction-health.test.ts` — a fixture with facts lagging **past** the budget but a successful `source='graph'` ledger row newer than the newest episode is **NOT** stalled (the reported false positive).
-- `test/graph-extraction-health.test.ts` — a fixture with facts lagging past the budget and **no** extractor activity since the newest episode **IS** stalled (the 2026-07-28 quota failure stays loud).
-- `test/graph-extraction-health.test.ts` — `facts === 0` above the episode floor is stalled **even when** the ledger shows recent activity (never-extracted outranks liveness).
-- `test/graph-extraction-health.test.ts` — an unreadable ledger (`null` activity) never manufactures a stall, and never suppresses the `facts === 0` case.
-- `test/datamechanics/graph-stall-liveness.datamechanics.test.ts` — real Postgres: `extractorActivity` reads the newest SUCCESSFUL `source='graph'` `llm_usage` row for the team, returns `readable:true`+`newestAtMs:null` on an empty ledger, and never leaks another team's rows.
-  - **Amended mid-build (2026-08-12).** The original criterion said "clears the stall end-to-end through `getGraphExtractionHealth`". That is NOT reachable in this tier: `getGraphExtractionHealth` early-returns `empty` when `neo4jConfigured()` is false (`lib/graph/extraction-health.ts`), and the data-mechanics tier has no Neo4j. Writing it anyway would have produced a test that passes on the early return without touching the predicate — green by construction. The end-to-end composition is covered by the pure unit tests above plus the real `extractorActivity` read here; the Neo4j half stays unverified by automation, stated rather than implied.
-- `docs/ARCHITECTURE.md` — the graph-extraction health row states that liveness is ledger-derived and fact-lag is observational.
+- `test/graph-extraction-health.test.ts` — facts lagging past the budget but a FRESH episodic node (within budget of the newest episode) is **NOT** stalled — the reported false positive, and the dedup-freeze case.
+- `test/graph-extraction-health.test.ts` — episodes projected but the newest episodic node older than the budget **IS** stalled — the real "202 accepted, nothing processed" outage, now covering the Neo4j write too.
+- `test/graph-extraction-health.test.ts` — `facts === 0` above the episode floor is stalled **even when** the episodic node is fresh (never-extracted outranks liveness).
+- `test/graph-extraction-health.test.ts` — a `null` episodic timestamp never manufactures a stall, and never suppresses the `facts === 0` case.
+- `test/guards/extraction-stall-callsites.test.ts` — a build-failing guard: EVERY `deriveGraphExtractionStalled(` call site in `lib/` passes `newestEpisodicAtMs`. This exists because the second call site was missed once already.
+- `docs/ARCHITECTURE.md` — the graph-extraction row states that liveness is episode-node-derived, that fact-lag is observational, and records why the two ledger designs were rejected.
 
 ## 5. Deliberately NOT in this slice
 
