@@ -59,21 +59,34 @@ export function visibleGroupIds(teamSlug: string, viewerTier: AccessTier): strin
 // the existing graph are LATER Phase C slices (each touches schema + LLM extraction cost, so each gets
 // its own design doc). This slice just establishes the key scheme + the oracle→group-id mapping.
 
+/** A UUID with hyphens stripped — the 32-hex form each block of a project group_id must take. */
+const HEX32 = /^[0-9a-f]{32}$/i;
+
 /**
- * The Graphiti group_id for one project's graph partition. Both ids are UUIDs; hyphens are STRIPPED —
- * not because a hyphen is invalid (`[A-Za-z0-9_-]` permits it) but to keep the id compact (`g_` + 32 +
- * `_p_` + 32 = 69 chars) and to sidestep Graphiti's group-id length limits the spec warns about (§6).
- * The `g_`/`_p_` separators use `_` for the same reason `episodeGroupId` does — a `:` kills the ingest
- * worker (validate_group_id gotcha, verified 2026-06-24). Fail LOUD on a malformed result (a non-UUID
- * id, or any char the strip didn't remove) rather than write an id the graph service will reject
- * mid-ingest. Pure.
+ * The Graphiti group_id for one project's graph partition: `g_<teamId-hex>_p_<projectId-hex>`, both
+ * UUIDs with hyphens stripped (kept compact at 69 chars — there is no known Graphiti group-id length
+ * limit, `validate_group_id` is charset-only, and 69 is comfortably conservative). The `g_`/`_p_`
+ * separators use `_` for the same reason `episodeGroupId` does — a `:` kills the ingest worker
+ * (validate_group_id gotcha, verified 2026-06-24).
+ *
+ * INJECTIVITY is enforced, not assumed (Fable review): the `_p_` boundary is unambiguous ONLY because
+ * both blocks are fixed-width 32-hex, so each input is asserted to be a UUID AFTER stripping. Without
+ * this, a team SLUG passed where a team ID is expected — the adjacent tier scheme `episodeGroupId`
+ * takes a slug, this takes an id — would mint a charset-valid but WRONG key: the projector writes one
+ * partition namespace and the read leg searches another, a silently-empty graph with no error. Fail
+ * LOUD here so that mixup throws instead of producing invisible data. Pure.
  */
 export function projectGroupId(teamId: string, projectId: string): string {
   const t = teamId.replace(/-/g, "");
   const p = projectId.replace(/-/g, "");
+  if (!HEX32.test(t) || !HEX32.test(p)) {
+    throw new Error(`invalid per-project Graphiti group_id — teamId/projectId must be UUIDs (got team="${teamId}", project="${projectId}")`);
+  }
   const id = `g_${t}_p_${p}`;
+  // Belt-and-braces: a 32-hex-block id is charset-valid by construction, but keep the assertion so a
+  // future edit to the format can't silently mint an id the graph service rejects mid-ingest.
   if (!VALID_GROUP_ID.test(id)) {
-    throw new Error(`invalid per-project Graphiti group_id "${id}" — teamId/projectId must be UUIDs`);
+    throw new Error(`invalid per-project Graphiti group_id "${id}"`);
   }
   return id;
 }
@@ -82,8 +95,11 @@ export function projectGroupId(teamId: string, projectId: string): string {
  * The per-project graph group_ids a principal may SEARCH: their oracle-visible project set mapped
  * through `projectGroupId`. The caller resolves the visible set from the SAME oracle the enforced
  * item reads use (`lib/access/oracle.visibleProjects`) and passes the project ids here — so the graph
- * read can never widen beyond the item read. Deduped; an EMPTY visible set → `[]` (searches nothing,
- * fail closed), never "search everything". Pure — no DB; the DB read is the caller's oracle call.
+ * read can never widen beyond the item read. Deduped; an EMPTY visible set → `[]`. That `[]` is
+ * fail-closed at the consumer: `lib/graph/graphiti-client` guards `groupIds.length === 0 → []` before
+ * the wire (an empty array Python-side would read as no-filter = search EVERYTHING), and a bolt
+ * `group_id IN []` matches nothing — so a future direct-`/search` consumer must keep that guard.
+ * Pure — no DB; the DB read is the caller's oracle call.
  */
 export function graphGroupIdsForVisibleProjects(teamId: string, projectIds: Iterable<string>): string[] {
   return [...new Set(projectIds)].map((p) => projectGroupId(teamId, p));

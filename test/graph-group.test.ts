@@ -34,6 +34,20 @@ describe("projectGroupId (per-project graph partition key)", () => {
     expect(() => projectGroupId("team:with:colons", randomUUID())).toThrow(/invalid/i);
     expect(() => projectGroupId(randomUUID(), "proj with spaces")).toThrow(/invalid/i);
   });
+
+  it("fails LOUD on the teamSLUG footgun — a slug where an id is expected mints a wrong-but-charset-valid key otherwise (Fable High)", () => {
+    // `episodeGroupId` (the tier scheme, same module) takes a slug; this takes an id. A slug passed
+    // here is charset-valid but not 32-hex → must throw, not silently produce a disjoint partition.
+    expect(() => projectGroupId("acme", randomUUID())).toThrow(/UUID/i);
+    expect(() => projectGroupId(randomUUID(), "supplier-negotiation")).toThrow(/UUID/i);
+  });
+
+  it("is INJECTIVE — the `_p_` boundary can't be split ambiguously (both blocks are fixed 32-hex)", () => {
+    // Without the 32-hex assertion, ("a_p_b","c") and ("a","b_p_c") both mint "g_a_p_b_p_c". Both
+    // must now throw (not 32-hex), so no two distinct inputs can collide onto one key.
+    expect(() => projectGroupId("a_p_b", "c")).toThrow(/UUID/i);
+    expect(() => projectGroupId("a", "b_p_c")).toThrow(/UUID/i);
+  });
 });
 
 describe("graphGroupIdsForVisibleProjects (oracle → searchable graphs)", () => {
