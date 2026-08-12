@@ -50,6 +50,12 @@ describe("arc enforcement wiring in app/api/brain/arcs/route.ts (Phase B slice 5
   it("fails closed on an enforcement-resolution error (500, never the unfiltered set)", () => {
     expect(src).toMatch(/catch\s*\{\s*return errorResponse\("internal", "enforcement check failed", 500\)/);
   });
+  it("the RECOMPUTE route filters too — it returns the tier arc set and is team-tier-gated, not admin-gated (Fable B5 High: an unfiltered bypass otherwise)", () => {
+    const rc = read("app/api/brain/arcs/recompute/route.ts");
+    expect(rc).toMatch(/memberEnforcement\(\s*admin\s*,\s*\{\s*teamId:\s*team\.id\s*,\s*memberId\s*\}\s*\)/);
+    expect(rc).toMatch(/const\s+arcs\s*=\s*filterArcsByVisibleItems\(\s*allArcs\s*,\s*enforce\?\.visibleItemIds\s*\?\?\s*null\s*\)/);
+    expect(rc).toMatch(/catch\s*\{\s*return errorResponse\("internal", "enforcement check failed", 500\)/);
+  });
 });
 
 describe("timeline enforcement wiring (Phase B slice 4, §5.8)", () => {

@@ -13,7 +13,7 @@ const arc = (id: string, itemIds: (string | undefined)[]): NarrativeArc => ({
   summary: `summary ${id}`,
   participants: [],
   supporting_sources: [],
-  evidence: itemIds.map((itemId) => ({ fact: `fact for ${id}`, itemId })),
+  evidence: itemIds.map((itemId) => ({ fact: itemId ? `fact for ${itemId}` : "UNRESOLVED restricted fact text", itemId })),
   derived_at: "2026-08-12T00:00:00Z",
 });
 
@@ -36,6 +36,13 @@ describe("filterArcsByVisibleItems", () => {
   it("enforcing: an arc with NO linkable itemId evidence fails closed (dropped) — pure-graph basis", () => {
     const got = filterArcsByVisibleItems([arc("a", [undefined, undefined])], new Set(["i1"]));
     expect(got).toEqual([]);
+  });
+
+  it("enforcing: a MIXED arc — one visible item + one UNRESOLVED entry — is dropped, not served with the unresolved fact text (Fable B5 High)", () => {
+    const mixed = arc("a", ["i1", undefined]);
+    expect(mixed.evidence[1].fact).toContain("restricted"); // the unresolved entry carries raw fact text
+    const got = filterArcsByVisibleItems([mixed], new Set(["i1"]));
+    expect(got, "an unresolved-provenance evidence entry must fail the arc closed").toEqual([]);
   });
 
   it("enforcing: mixed set — keeps only the fully-visible arcs", () => {

@@ -87,6 +87,22 @@ describe("enforced arc reads (Phase B slice 5)", () => {
     expect(titles.sort()).toEqual(["arc general", "arc restricted"]);
   });
 
+  it("enforcing: a MIXED arc — one visible item + one entry whose source is restricted — is dropped (real composition, Fable B5 High)", async () => {
+    const seed = await seedTeam();
+    const openItem = await ingest(seed, { path: "vis.md", body: "vis", access: "team", project: "src" });
+    const secretItem = await ingest(seed, { path: "sec.md", body: "sec", access: "team", project: "src" });
+    const outsider = await seedMember(seed);
+    await backfillTeamContext(db(), seed.teamId);
+    await restrictItem(seed, secretItem.id);
+    await setEnforcement(seed, "enforcing");
+    // Both entries carry a real itemId — one visible, one restricted. The restricted one must fail
+    // the whole arc closed (evidence.every, not a filter-then-every).
+    await seedArcCache(seed, [arc("mixed", [openItem.id, secretItem.id]), arc("clean", [openItem.id])]);
+    const titles = await visibleArcTitles(seed, outsider);
+    expect(titles).toContain("arc clean");
+    expect(titles, "any restricted evidence entry drops the whole arc").not.toContain("arc mixed");
+  });
+
   it("enforcing: an arc with no linkable evidence item fails closed (dropped) even for the admin", async () => {
     const seed = await seedTeam();
     const item = await ingest(seed, { path: "a.md", body: "a", access: "team", project: "src" });

@@ -8,6 +8,8 @@ import { resolveAnsweringKeys } from "@/lib/query/answering";
 import { visibleGroupIds } from "@/lib/graph/group";
 import { recomputeArcs } from "@/lib/graph/arcs";
 import { freshnessWire } from "@/lib/freshness";
+import { memberEnforcement } from "@/lib/access/enforce";
+import { filterArcsByVisibleItems } from "@/lib/graph/arc-visibility";
 
 export const runtime = "nodejs";
 export const maxDuration = 120; // arc synthesis (LLM) inline path can take up to ~110s on a cold cache
@@ -58,7 +60,7 @@ export async function POST(req: NextRequest) {
 
   const admin = adminClient();
   const keys = await resolveAnsweringKeys(admin, team.id);
-  const { arcs, freshness } = await recomputeArcs(
+  const { arcs: allArcs, freshness } = await recomputeArcs(
     admin,
     team.id,
     teamSlug,
@@ -68,6 +70,21 @@ export async function POST(req: NextRequest) {
     keys,
     memberId
   );
+
+  // Access enforcement (Phase B slice 5, spec §5.8): this route returns the recomputed TIER arc set,
+  // so — exactly like GET-style `POST /api/brain/arcs` — it must drop arcs the member can't see, or it
+  // is an unfiltered bypass of the enforced arc read (this route is team-tier-gated, NOT admin-gated;
+  // Fable B5 High). Same primitive, same fail-closed on a substrate error (→ 500). NOTE (deferred,
+  // integrity not confidentiality): an attenuated member can still WRITE a correction — in practice
+  // they only hold `arc_id`s for arcs they received (already filtered), so this is a replay-only edge;
+  // gating the correction WRITE by visibility is a separate Phase-C-adjacent question.
+  let enforce: { visibleItemIds: ReadonlySet<string> } | null;
+  try {
+    enforce = await memberEnforcement(admin, { teamId: team.id, memberId });
+  } catch {
+    return errorResponse("internal", "enforcement check failed", 500);
+  }
+  const arcs = filterArcsByVisibleItems(allArcs, enforce?.visibleItemIds ?? null);
 
   // WAS `new Date()`. A recompute can legitimately return arcs it did NOT compute: `canReuseArcs` skips
   // the model when facts are unchanged, and a degraded synthesis is refused in favour of the prior (H11).
