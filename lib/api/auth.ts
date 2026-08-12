@@ -16,9 +16,9 @@ export type ApiAuth = {
 
 /**
  * A delegated agent token's resolved principal (spec §10). Distinct from ApiAuth on purpose:
- * routes must OPT IN to delegated tokens — in Phase A only GET /api/v1/items does; every
- * other route's `authenticateApiKey` rejects the `aiosd_` prefix as malformed (fail closed),
- * and `query` returns an explicit 403 `delegation_not_supported`.
+ * routes must OPT IN to delegated tokens — GET /api/v1/items (Phase A) and POST /api/v1/query
+ * (Phase B slice 3, always oracle-attenuated) do; every other route's `authenticateApiKey`
+ * rejects the `aiosd_` prefix as malformed (fail closed).
  */
 export type AgentApiAuth = {
   kind: "agent";

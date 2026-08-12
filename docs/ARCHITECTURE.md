@@ -206,7 +206,7 @@ unversioned `/api/brain/*` + `/api/dashboard/*` surfaces; `GET /api/v1/timeline`
 and `GET /api/v1/tasks` still discards its computed `truncated` (both need a brain-api bump, so they are
 deliberately not in this change).
 
-This server **implements brain-api v1.18** (the shipped member-facing wire contract; source of truth:
+This server **implements brain-api v1.19** (the shipped member-facing wire contract; source of truth:
 `aios-workspace/docs/brain-api.md`; see the v1.14 by-key lookup on
 `GET /api/v1/tasks` below; v1.8 added the subscriptions endpoint,
 `POST /api/v1/subscriptions`; the optional `context_health` object on `POST /api/v1/metrics`,
@@ -217,10 +217,17 @@ field stayed producer-only, so catching up needed no version bump). That version
 `test/fixtures/contract/brain-contract.json` (regenerated in lockstep with the canonical
 copy in `aios-workspace/docs/contract/`) — bump all of them together on a contract change.
 
-Brain API 1.18 is ADDITIVE: delegated agent tokens (`aiosd_*`, spec §10) on the Phase A surface
-only — `GET /api/v1/items` accepts them oracle-filtered, `POST /api/v1/query` answers 403
-`delegation_not_supported`, everything else rejects the prefix; `aios_*` member keys are
-byte-for-byte unchanged, so an old server needs no negotiation (it 401s the unknown prefix).
+Brain API 1.19 opens `POST /api/v1/query` to delegated `aiosd_*` tokens (Phase B slice 3, spec
+§10/§17-B), retiring 1.18's 403 `delegation_not_supported` on that route. A delegated query is
+ALWAYS attenuated — retrieval filters to the token's live triple-intersection effective set and
+the graph legs are omitted (§5.8b) regardless of `teams.access_enforcement`, which gates only the
+MEMBER rollout — and stateless: `conversation_id` answers 422, no conversation is read or written,
+and rate limits/query_log/cost metering attribute to the launching member. Everything else still
+rejects the prefix; `aios_*` member keys are byte-for-byte unchanged.
+
+Brain API 1.18 was ADDITIVE: delegated agent tokens (`aiosd_*`, spec §10) on the Phase A surface
+only — `GET /api/v1/items` accepts them oracle-filtered, everything else rejects the prefix;
+`aios_*` member keys unchanged, so an old server needs no negotiation (it 401s the unknown prefix).
 
 Brain API 1.17 keeps the original closed `codebase_health` v1 object valid and additionally
 accepts v2 maintenance snapshots. V2 persists repository capability-profile identity, explicit

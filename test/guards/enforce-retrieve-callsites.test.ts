@@ -28,3 +28,23 @@ for (const route of ["app/api/v1/query/route.ts", "app/api/dashboard/query/route
     });
   });
 }
+
+describe("delegated query wiring in app/api/v1/query/route.ts (Phase B slice 3)", () => {
+  const src = read("app/api/v1/query/route.ts");
+  it("delegated principals get the ALWAYS-attenuated path (flag-independent)", () => {
+    // The agent branch resolves delegatedVisibleItemIds WITH the agent principal — deleting it
+    // would let an aiosd_ token fall through to the flag-gated member path (unfiltered on a
+    // permissive team).
+    expect(src).toMatch(/if\s*\(agent\)\s*\{/);
+    expect(src).toMatch(/delegatedVisibleItemIds\s*\(\s*db\s*,\s*agent\s*\)/);
+  });
+  it("the Phase A 403 refusal is gone — delegated tokens authenticate instead", () => {
+    expect(src).not.toMatch(/delegation_not_supported/);
+    expect(src).toMatch(/authenticateAgentToken\s*\(/);
+  });
+  it("delegated queries are stateless: conversation_id refused, no thread reads/writes", () => {
+    expect(src).toMatch(/agent\s*&&\s*conversation_id/);
+    // Conversation store access hangs off `owner`, which is null for agents.
+    expect(src).toMatch(/const\s+owner\s*=\s*auth\s*\?/);
+  });
+});

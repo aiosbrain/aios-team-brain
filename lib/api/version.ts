@@ -28,8 +28,15 @@
  *        every other route rejects the prefix (401). Existing `aios_*` member keys are
  *        byte-for-byte unchanged — an old server rejects the unknown prefix with today's
  *        401, so no version negotiation is required.
+ * 1.19 — POST /api/v1/query accepts delegated `aiosd_*` tokens (Phase B slice 3, spec
+ *        §10/§17-B): retrieval is ALWAYS attenuated to the token's live effective set
+ *        (graph legs omitted, §5.8b) regardless of `teams.access_enforcement`; delegated
+ *        queries are stateless — `conversation_id` answers 422, no thread is read or
+ *        written; rate limits and cost metering attribute to the launching member. The
+ *        Phase A 403 `delegation_not_supported` is retired for this route. Member `aios_*`
+ *        keys are byte-for-byte unchanged.
  */
-export const BRAIN_API_VERSION = "1.18";
+export const BRAIN_API_VERSION = "1.19";
 
 /** Server-only Executor gateway negotiation; independent of the member API surface. */
 export const GATEWAY_CONTRACT_VERSION = "1.10";
