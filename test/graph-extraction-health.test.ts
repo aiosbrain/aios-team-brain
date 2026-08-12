@@ -172,3 +172,85 @@ describe("the lag budget boundary", () => {
     expect(deriveGraphExtractionStalled({ ...base, newestFactAtMs: base.newestEpisodeAtMs + 60_000 })).toBe(false);
   });
 });
+
+/**
+ * LIVENESS vs NOVELTY (STALLPROBE-1 / AIO-876).
+ *
+ * The lag half of the probe answers "when did the graph last learn something NEW?" and was being read
+ * as "when did the extractor last RUN?". On a mature graph those diverge — prod runs ~6.1
+ * `dedupe_edges` per `extract_edges`, so most extracted edges resolve onto an existing edge and create
+ * no `RELATES_TO`, freezing `max(created_at)` while extraction works perfectly. On 2026-08-12 that
+ * produced "accepting episodes but extracting 0 facts" one minute after a clean pipeline run, beside
+ * a census reporting 2,928 NEW entities.
+ *
+ * The fix asks the extractor's OWN ledger (`llm_usage`, source='graph') whether it ran. These pin both
+ * directions: the false positive must go, and the 2026-07-28 quota outage must stay loud.
+ */
+describe("deriveGraphExtractionStalled — liveness overrides novelty", () => {
+  const N = MIN_EPISODES_FOR_EXTRACTION_SIGNAL;
+  const EPISODE_AT = Date.parse("2026-08-12T00:15:02Z");
+  /** Facts frozen well past the budget — the condition that used to be sufficient to accuse. */
+  const LAGGING = {
+    episodes: N * 10,
+    facts: 113_352,
+    newestEpisodeAtMs: EPISODE_AT,
+    newestFactAtMs: EPISODE_AT - (EXTRACTION_LAG_BUDGET_MS + 3_600_000),
+  };
+
+  it("is NOT stalled when the ledger shows a successful call after the newest episode", () => {
+    // The reported false positive, in the shape it actually occurred: extraction completed 60s after
+    // the episode was projected, and every new edge deduplicated.
+    expect(
+      deriveGraphExtractionStalled({
+        ...LAGGING,
+        extractor: { readable: true, newestAtMs: EPISODE_AT + 60_000 },
+      })
+    ).toBe(false);
+  });
+
+  it("IS stalled when the ledger shows NO call since the newest episode — the 2026-07-28 outage", () => {
+    // The direction that must not be weakened: a dead extractor writes no llm_usage rows either, so
+    // lag + silence is the real signal. Without this the fix would be a blanket alarm-suppressor.
+    expect(
+      deriveGraphExtractionStalled({
+        ...LAGGING,
+        extractor: { readable: true, newestAtMs: EPISODE_AT - 48 * 3_600_000 },
+      })
+    ).toBe(true);
+  });
+
+  it("IS stalled when the ledger is readable and EMPTY — no activity at all", () => {
+    expect(deriveGraphExtractionStalled({ ...LAGGING, extractor: { readable: true, newestAtMs: null } })).toBe(true);
+  });
+
+  it("an UNREADABLE ledger never manufactures a stall — ignorance is not evidence", () => {
+    // `readable:false` is a failed query, which is not the same fact as "the extractor did nothing".
+    expect(deriveGraphExtractionStalled({ ...LAGGING, extractor: { readable: false, newestAtMs: null } })).toBe(false);
+  });
+
+  it("zero facts outranks liveness — a running extractor producing nothing is still broken", () => {
+    // The never-extracted case must not be suppressible by ledger activity, or a busy-but-useless
+    // extractor would read healthy.
+    expect(
+      deriveGraphExtractionStalled({
+        episodes: N * 10,
+        facts: 0,
+        newestEpisodeAtMs: EPISODE_AT,
+        newestFactAtMs: null,
+        extractor: { readable: true, newestAtMs: EPISODE_AT + 60_000 },
+      })
+    ).toBe(true);
+  });
+
+  it("with NO ledger supplied, the verdict falls back to fact-lag alone (pre-fix behaviour)", () => {
+    // The back-compat control: existing callers/tests that pass no `extractor` must be unaffected,
+    // otherwise this change would silently disarm the lag check everywhere it isn't wired.
+    expect(deriveGraphExtractionStalled(LAGGING)).toBe(true);
+  });
+
+  it("healthy lag is still healthy regardless of the ledger", () => {
+    // The other control: liveness must not be able to CREATE a stall on a graph that is keeping up.
+    const fresh = { ...LAGGING, newestFactAtMs: EPISODE_AT - 60_000 };
+    expect(deriveGraphExtractionStalled({ ...fresh, extractor: { readable: true, newestAtMs: null } })).toBe(false);
+  });
+});

@@ -771,6 +771,19 @@ guard enforces it, it's named.
   comparing projected episodes (Postgres ledger) vs extracted facts (Neo4j `count(RELATES_TO)`): many
   projected + zero extracted ⇒ **degraded**, surfaced on the Admin retrieval-health card (Graph memory
   leg) **and** the loud pipeline-health banner (synthetic `graph_extract` leg) on Home + Integrations.
+  **LIVENESS IS LEDGER-DERIVED, NOT NOVELTY-DERIVED (STALLPROBE-1).** The recency half used to accuse
+  purely on fact-lag (`newestEpisode − max(RELATES_TO.created_at) > 6h`), which asks "when did the graph
+  last learn something NEW?" and was read as "when did the extractor last RUN?". On a mature graph those
+  diverge: prod runs ~6.1 `dedupe_edges` per `extract_edges`, so most extracted edges resolve onto an
+  existing edge and create no `RELATES_TO` — the clock freezes while extraction works. On 2026-08-12 that
+  produced "accepting episodes but extracting 0 facts" one minute after a clean pipeline run, beside the
+  same card's census reporting 2,928 NEW entities, and (because the same boolean feeds the synthetic leg)
+  rendered as two independent-looking failures. Lag now only accuses when the extractor's OWN spend
+  ledger agrees: `extractorActivity` reads the newest successful `source='graph'` `llm_usage` row (rows
+  are written only after a call succeeds; billed failures go to `llm_failures`), and a row at/after the
+  newest episode clears the stall. `readable:false` (query failed) is deliberately NOT the same value as
+  an empty ledger — ignorance never accuses, proven silence does — and `facts === 0` still outranks
+  liveness, so a busy-but-useless extractor stays loud. Fact-lag remains observational on the card.
   **Root fix — raise the cap (not shrink episodes).** The extractor's output cap is graphiti_core's
   `DEFAULT_MAX_TOKENS`, **8192 in every published `zepai/graphiti` image** (verified 2026-07-17 through
   v0.22.0) and **not** settable by env (getzep's `graph_service/config.py` exposes only

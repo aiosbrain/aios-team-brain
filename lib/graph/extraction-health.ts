@@ -69,6 +69,17 @@ export interface GraphExtractionHealth {
   reason: string | null; // human-facing cause when stalled OR polluted
 }
 
+/**
+ * Liveness evidence read from the EXTRACTOR'S OWN LEDGER (`llm_usage`, `source='graph'`), as opposed
+ * to the graph's novelty. `readable:false` means the Postgres read failed — which is NOT the same as
+ * "the extractor did nothing", and conflating the two is how an alarm invents an outage.
+ */
+export interface ExtractorActivity {
+  readable: boolean;
+  /** Newest SUCCESSFUL graph LLM call (ms), or null when the ledger holds none. */
+  newestAtMs: number | null;
+}
+
 export interface ExtractionSignals {
   episodes: number | null;
   facts: number | null;
@@ -76,6 +87,11 @@ export interface ExtractionSignals {
   newestEpisodeAtMs?: number | null;
   /** Newest RELATES_TO `created_at` (ms) — see `newestFactAtMs()` for why it is not `valid_at`. */
   newestFactAtMs?: number | null;
+  /**
+   * Did the extractor actually RUN recently (STALLPROBE-1)? Omitted → the caller supplied no ledger
+   * evidence and the verdict falls back to fact-lag alone, i.e. the pre-STALLPROBE-1 behaviour.
+   */
+  extractor?: ExtractorActivity | null;
 }
 
 /**
@@ -89,13 +105,39 @@ export function deriveGraphExtractionStalled(input: ExtractionSignals): boolean 
   if (episodes === null || facts === null) return false;
   // Too few episodes to judge either way — a fresh install may still be mid-first-extraction.
   if (episodes < MIN_EPISODES_FOR_EXTRACTION_SIGNAL) return false;
-  // Never extracted anything: the original 2026-07 failure.
+  // Never extracted anything: the original 2026-07 failure. Novelty and liveness agree here, so this
+  // outranks the ledger below — an extractor that runs and still produces zero facts IS broken.
   if (facts === 0) return true;
   // Extracted once, then stopped: the 2026-07-28 quota failure the count-based check could not see.
   const newestEpisode = input.newestEpisodeAtMs ?? null;
   const newestFact = input.newestFactAtMs ?? null;
   if (newestEpisode === null || newestFact === null) return false;
-  return newestEpisode - newestFact > EXTRACTION_LAG_BUDGET_MS;
+  if (newestEpisode - newestFact <= EXTRACTION_LAG_BUDGET_MS) return false;
+
+  // ── LIVENESS OVERRIDES NOVELTY (STALLPROBE-1) ────────────────────────────────────────────────
+  // Fact-lag answers "when did the graph last learn something NEW?", and it was being read as "when
+  // did the extractor last RUN?". On a mature graph those diverge: ~6.1 `dedupe_edges` calls per
+  // `extract_edges` in prod, so most extracted edges resolve onto an edge that already exists and
+  // create no `RELATES_TO` — `max(created_at)` stops moving while extraction runs perfectly. On
+  // 2026-08-12 that read as "accepting episodes but extracting 0 facts" one minute after a clean
+  // pipeline run, beside a census reporting 2,928 NEW entities. It gets MORE likely as the graph
+  // matures, and PIPEFF-2's narrower context makes novel edges rarer still.
+  //
+  // So before accusing, ask the extractor's own ledger whether it ran. A successful `source='graph'`
+  // `llm_usage` row is direct positive evidence: dedup cannot fake it, and it is a Postgres read that
+  // survives Neo4j being unreadable.
+  const extractor = input.extractor ?? null;
+  // UNREADABLE ≠ IDLE. A failed ledger read proves nothing, and this file's standing bias is never to
+  // cry wolf — so it does not manufacture a stall. In practice this is near-unreachable: `episodes`
+  // comes from the same Postgres, so a real outage there already returned false at the top.
+  if (extractor !== null && !extractor.readable) return false;
+  // Ran at or after the newest episode → it has processed current work; the frozen clock is novelty,
+  // not death. `null` newestAtMs means the ledger is readable and genuinely EMPTY — no extractor
+  // activity at all — which, with facts lagging, is the real outage this check exists for.
+  if (extractor !== null && extractor.newestAtMs !== null && extractor.newestAtMs >= newestEpisode) {
+    return false;
+  }
+  return true;
 }
 
 /** Count RELATES_TO facts in the graph. A numeric health probe (no content leaves the graph), so it's
@@ -176,6 +218,31 @@ export async function newestEpisodeAtMs(teamId: string): Promise<number | null> 
   }
 }
 
+/**
+ * When the extractor last SUCCEEDED, from its own spend ledger (STALLPROBE-1).
+ *
+ * `llm_usage` rows are written only AFTER a call returns (`lib/costs/llm-usage.recordLlmUsage`);
+ * billed-but-failed attempts go to `llm_failures` instead. So a row here means an extraction LLM call
+ * actually completed — the one liveness signal deduplication cannot suppress.
+ *
+ * Returns `readable:false` on a read error rather than a null timestamp, because "the query failed"
+ * and "the extractor has done nothing" must not collapse into one value: the first is ignorance, the
+ * second is the outage. Bounded to a window so an ancient row can't vouch for a dead extractor
+ * forever — the caller only compares it against the newest episode anyway.
+ */
+export async function extractorActivity(teamId: string): Promise<ExtractorActivity> {
+  try {
+    const res = await runSql<{ at: string | null }>(
+      `select max(created_at)::text as at from llm_usage
+        where team_id = $1 and source = 'graph' and created_at > now() - interval '30 days'`,
+      [teamId]
+    );
+    return { readable: true, newestAtMs: parseProbeTimestamp(res.rows[0]?.at ?? null) };
+  } catch {
+    return { readable: false, newestAtMs: null };
+  }
+}
+
 /** Projected episodes for a team from the Postgres ledger (no Graphiti round-trip). */
 async function countProjectedEpisodes(teamId: string): Promise<number | null> {
   try {
@@ -198,12 +265,15 @@ export async function getGraphExtractionHealth(teamId: string): Promise<GraphExt
     reason: null,
   };
   if (!neo4jConfigured()) return empty;
-  const [episodes, facts, newestEpisode, newestFact, censuses] = await Promise.all([
+  const [episodes, facts, newestEpisode, newestFact, censuses, extractor] = await Promise.all([
     countProjectedEpisodes(teamId),
     countGraphFacts(),
     newestEpisodeAtMs(teamId),
     newestFactAtMs(),
     groupCensuses(teamId),
+    // Liveness from the extractor's own ledger — the leg that stops dedup-frozen novelty from
+    // reading as a dead extractor (STALLPROBE-1).
+    extractorActivity(teamId),
   ]);
   const pollutedCensus = censuses.find((c) => c.pollution.judgeable && c.pollution.polluted) ?? null;
   const signals: ExtractionSignals = {
@@ -211,6 +281,7 @@ export async function getGraphExtractionHealth(teamId: string): Promise<GraphExt
     facts,
     newestEpisodeAtMs: newestEpisode,
     newestFactAtMs: newestFact,
+    extractor,
   };
   const stalled = deriveGraphExtractionStalled(signals);
   const neverExtracted = stalled && facts === 0;
@@ -231,8 +302,8 @@ export async function getGraphExtractionHealth(teamId: string): Promise<GraphExt
     reason: !stalled
       ? (pollutedCensus?.pollution.reason ?? null)
       : neverExtracted
-        ? `${episodes} episodes were projected but the graph has 0 extracted facts — Graphiti is accepting episodes (202) yet its entity-extraction worker is failing on every job (commonly the LLM output-token cap, e.g. "Output length exceeded max tokens"). New activity isn't becoming graph facts, so narrative arcs can't update. Check the graphiti service logs.`
-        : `Graph extraction has STOPPED: episodes are still being projected, but no new fact has been extracted for about ${lagHours}h (the graph holds ${facts} facts from before). Graphiti keeps returning 202 while its extraction worker fails every job — most often the extraction LLM key is out of quota (a 429 \`insufficient_quota\`), or its output-token cap is being exceeded. Narrative arcs and the Learning panel are running on stale facts. Check the graphiti service logs.`,
+        ? `${episodes} episodes were projected but the graph has 0 extracted facts — Graphiti is accepting episodes (202) yet its entity-extraction worker is failing on every job. Check the graphiti service logs for the actual error; the usual causes are the extraction LLM's output-token cap or an out-of-quota key. New activity isn't becoming graph facts, so narrative arcs can't update.`
+        : `Graph extraction has STOPPED: episodes are still being projected, no new fact has been extracted for about ${lagHours}h (the graph holds ${facts} facts from before), AND the extractor's own spend ledger shows no successful call since the newest episode — the three together, not the fact-lag alone. Graphiti keeps returning 202 while its extraction worker fails every job; check the graphiti service logs for the actual error, usually an out-of-quota extraction key or the output-token cap. Narrative arcs and the Learning panel are running on stale facts.`,
   };
 }
 
