@@ -1,6 +1,6 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
-import { visibleProjects, type Principal } from "@/lib/access/oracle";
+import { visibleProjects, effectiveVisibleProjects, type Principal } from "@/lib/access/oracle";
 
 /**
  * The enforced-read primitive (Phase B slice 1, spec §5/§11). Visibility = **oracle ∧ legacy-tier**:
@@ -10,9 +10,11 @@ import { visibleProjects, type Principal } from "@/lib/access/oracle";
  *   'permissive' (default) — this module contributes NOTHING; the read is byte-identical to today.
  *   'enforcing'            — the caller intersects its item set with `visibleItemIds(...)`.
  *
- * SCOPE (this slice): only `GET /api/v1/items` (member AND agent keys) is enforced. `POST
- * /api/v1/query`, FTS, timeline, arcs, and every dashboard surface are NOT yet enforced — an
- * operator flipping the flag must know that; those are later Phase B slices.
+ * SCOPE (through Phase B slice 3): `GET /api/v1/items` (member AND agent keys), the retrieval
+ * path (`lib/query/retrieve.ts` → both query routes) for member keys under 'enforcing', and
+ * delegated `aiosd_*` query (ALWAYS attenuated — see `delegatedVisibleItemIds`). Timeline, arcs,
+ * and the dashboard surfaces are NOT yet enforced — an operator flipping the flag must know that;
+ * those are later Phase B slices.
  *
  * Only flip a team to 'enforcing' once its §11 backfill is complete — an un-partitioned item has no
  * membership and would fail closed (vanish). The flag is the fail-open-to-today transition control.
@@ -80,4 +82,20 @@ export async function visibleItemIdsForProjects(
 export async function visibleItemIds(db: DbClient, principal: Principal): Promise<VisibleItemIds> {
   const { projectIds } = await visibleProjects(db, principal);
   return visibleItemIdsForProjects(db, principal.teamId, projectIds);
+}
+
+/**
+ * Delegated principals are ALWAYS attenuated (Phase B slice 3, spec §10/§5.8b): the enforce arg
+ * for an `aiosd_*` query, computed regardless of `teams.access_enforcement` — that flag is the
+ * MEMBER rollout control, and a scoped token must never ride a permissive team to full-corpus
+ * answers. Effective projects = the live triple intersection (`effectiveVisibleProjects`), then
+ * the item-grain membership set. Fail-closed end to end: an empty effective set, an un-backfilled
+ * team, or a read error all yield an empty id set → retrieval serves zero rows.
+ */
+export async function delegatedVisibleItemIds(
+  db: DbClient,
+  token: { teamId: string; memberId: string; onBehalfOf: string | null; projectScope: string[] | null }
+): Promise<VisibleItemIds> {
+  const projects = await effectiveVisibleProjects(db, token);
+  return visibleItemIdsForProjects(db, token.teamId, projects);
 }

@@ -8,9 +8,10 @@ import { mintAgentToken, revokeAgentToken, verifyAgentToken } from "@/lib/access
 import { addMemberToGroup, createGroup, grantProjectToGroup } from "@/lib/access/groups";
 import { effectiveVisibleProjects } from "@/lib/access/oracle";
 
-// Phase A slice 2 (spec §10/§17-A) — real-Postgres + real-route proofs of the delegated-token
-// contract: triple-intersection attenuation, NULL vs [] scope, live (non-snapshot) inheritance,
-// verify-time principal re-checks, the items-route oracle filter, and query's 403 refusal.
+// Phase A slice 2 (spec §10/§17-A) + Phase B slice 3 (§17-B) — real-Postgres + real-route proofs
+// of the delegated-token contract: triple-intersection attenuation, NULL vs [] scope, live
+// (non-snapshot) inheritance, verify-time principal re-checks, the items-route oracle filter, and
+// delegated `query` (admitted in B; retrieval ALWAYS attenuated, graph legs omitted, stateless).
 
 async function seedMember(seed: Seed, over: Partial<{ kind: string; tier: string; status: string }> = {}): Promise<string> {
   const { data, error } = await db()
@@ -284,16 +285,173 @@ describe("Phase A: no external-tier delegation (Fable H1)", () => {
   });
 });
 
-describe("query refuses every aiosd_* token in Phase A", () => {
-  it("returns 403 delegation_not_supported — before any credential lookup", async () => {
-    const res = await queryPOST(
-      new Request("http://test/api/v1/query", {
-        method: "POST",
-        headers: { authorization: "Bearer aiosd_deadbeef_notevenreal", "content-type": "application/json" },
-        body: JSON.stringify({ question: "anything" }),
-      }) as unknown as NextRequest
-    );
-    expect(res.status).toBe(403);
-    expect((await res.json()).error.code).toBe("delegation_not_supported");
+function queryReq(token: string, body: Record<string, unknown>): NextRequest {
+  return new Request("http://test/api/v1/query", {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify(body),
+  }) as unknown as NextRequest;
+}
+
+describe("query honors delegated tokens (Phase B slice 3, spec §10/§17-B)", () => {
+  it("a valid spawn-default token gets the SSE stream — the Phase A 403 refusal is lifted", async () => {
+    const seed = await seedTeam();
+    const agent = await seedMember(seed, { kind: "agent" });
+    const minted = await mintAgentToken(db(), seed.teamId, { memberId: agent }, seed.memberId);
+    const res = await queryPOST(queryReq(minted.token!, { question: "anything at all" }));
+    expect(res.status, "delegated query must be admitted, not refused").toBe(200);
+    expect(res.headers.get("content-type")).toBe("text/event-stream");
+    await res.body?.cancel();
+  });
+
+  it("an invalid aiosd_ credential is a 401 (credential problem), not a 403 (operation problem)", async () => {
+    const res = await queryPOST(queryReq("aiosd_deadbeef_notevenreal", { question: "anything" }));
+    expect(res.status).toBe(401);
+  });
+
+  it("a query that never reaches `done` still consumes daily quota — the query_log row is written BEFORE streaming (Codex B3 High: read-deltas-and-disconnect was free and uncounted)", async () => {
+    const seed = await seedTeam();
+    const agent = await seedMember(seed, { kind: "agent" });
+    const minted = await mintAgentToken(db(), seed.teamId, { memberId: agent }, seed.memberId);
+    const res = await queryPOST(queryReq(minted.token!, { question: "count this attempt" }));
+    expect(res.status).toBe(200);
+    await res.text(); // drain: with no LLM configured this tier's stream ends in an error frame, never `done`
+    const { count } = await db()
+      .from("query_log")
+      .select("id", { count: "exact", head: true })
+      .eq("team_id", seed.teamId)
+      .eq("member_id", agent);
+    expect(count, "the attempt must be counted without a done frame").toBe(1);
+  });
+
+  it("a delegated query is stateless: conversation_id is refused explicitly (422), never silently ignored", async () => {
+    const seed = await seedTeam();
+    const agent = await seedMember(seed, { kind: "agent" });
+    const minted = await mintAgentToken(db(), seed.teamId, { memberId: agent }, seed.memberId);
+    const res = await queryPOST(queryReq(minted.token!, { question: "q", conversation_id: randomUUID() }));
+    expect(res.status).toBe(422);
+  });
+});
+
+describe("delegated retrieval is ALWAYS oracle-attenuated — flag-independent (§5.8b: all aiosd_ tokens)", () => {
+  const TERM = "zanzibarite"; // rare term shared across fixture bodies so FTS matches them all
+
+  async function delegatedPaths(agentAuth: { teamId: string; memberId: string; onBehalfOf: string | null; projectScope: string[] | null }): Promise<string[]> {
+    const { delegatedVisibleItemIds } = await import("@/lib/access/enforce");
+    const { retrieve } = await import("@/lib/query/retrieve");
+    const { ids } = await delegatedVisibleItemIds(db(), agentAuth);
+    const ctx = await retrieve(db(), agentAuth.teamId, "team", `tell me about ${TERM}`, null, { visibleItemIds: ids });
+    return ctx.sources.map((s) => s.path);
+  }
+
+  /** Curate an item's context membership into `projectId` (the §11 backfill parks everything in
+   *  General; project scope operates over MEMBERSHIPS, so scoped-visibility fixtures must move
+   *  the item the way the Phase D curation surface will). */
+  async function curateInto(seed: Seed, itemId: string, projectId: string): Promise<void> {
+    const { data: unit } = await db().from("project_context_units").select("id").eq("source_item_id", itemId).single();
+    // Expire only the CURRENT membership (Fable B3 Low: without the null filter this helper
+    // rewrites valid_to on already-expired history rows — wrong when copied to real curation).
+    await db().from("project_context_memberships").update({ valid_to: new Date().toISOString() }).eq("context_unit_id", unit!.id).is("valid_to", null);
+    const { error } = await db().from("project_context_memberships").insert({ team_id: seed.teamId, project_id: projectId, context_unit_id: unit!.id, method: "manual" });
+    if (error) throw new Error(`curate failed: ${error.message}`);
+  }
+
+  it("on a PERMISSIVE team, a scoped token retrieves ONLY its effective set — the flag is the member rollout control, not the delegation gate", async () => {
+    const seed = await seedTeam(); // access_enforcement defaults to 'permissive'
+    const inScope = await ingest(seed, { path: "a/in-scope.md", body: `in ${TERM}`, access: "team", project: "agentproj" });
+    const outScope = await ingest(seed, { path: "b/out-of-scope.md", body: `out ${TERM}`, access: "team", project: "otherproj" });
+    await (await import("@/lib/projects/context/backfill")).backfillTeamContext(db(), seed.teamId);
+    const { data: projects } = await db().from("projects").select("id, slug").eq("team_id", seed.teamId);
+    const bySlug = new Map(((projects ?? []) as { id: string; slug: string }[]).map((p) => [p.slug, p.id]));
+    await curateInto(seed, inScope.id, bySlug.get("agentproj")!);
+    await curateInto(seed, outScope.id, bySlug.get("otherproj")!);
+
+    // The agent's LAUNCHER can see BOTH projects; the token is scoped to one. What must gate the
+    // answer is the token's scope — a launcher-only filter would pass this fixture's b/ item.
+    const agent = await seedMember(seed, { kind: "agent" });
+    const g = await createGroup(db(), seed.teamId, "dq-g", "G", seed.memberId);
+    await addMemberToGroup(db(), seed.teamId, g.groupId!, agent, seed.memberId);
+    await grantProjectToGroup(db(), seed.teamId, bySlug.get("agentproj")!, g.groupId!, seed.memberId);
+    await grantProjectToGroup(db(), seed.teamId, bySlug.get("otherproj")!, g.groupId!, seed.memberId);
+
+    const scoped = { teamId: seed.teamId, memberId: agent, onBehalfOf: null, projectScope: [bySlug.get("agentproj")!] };
+    const got = await delegatedPaths(scoped);
+    expect(got, "in-scope content must be served").toContain("a/in-scope.md");
+    expect(got, "a permissive team must NOT widen a scoped token to the full corpus").not.toContain("b/out-of-scope.md");
+  });
+
+  it("scope over an UNCURATED corpus retrieves nothing — §11 parks every item in General, so a project scope grants only what has been curated into that project (fail closed, no ingestion-project fallback)", async () => {
+    const seed = await seedTeam();
+    await ingest(seed, { path: "u/raw.md", body: `u ${TERM}`, access: "team", project: "uproj" });
+    await (await import("@/lib/projects/context/backfill")).backfillTeamContext(db(), seed.teamId);
+    const { data: projects } = await db().from("projects").select("id, slug").eq("team_id", seed.teamId);
+    const uproj = ((projects ?? []) as { id: string; slug: string }[]).find((p) => p.slug === "uproj")!.id;
+    const agent = await seedMember(seed, { kind: "agent" });
+    const g = await createGroup(db(), seed.teamId, "uq-g", "G", seed.memberId);
+    await addMemberToGroup(db(), seed.teamId, g.groupId!, agent, seed.memberId);
+    await grantProjectToGroup(db(), seed.teamId, uproj, g.groupId!, seed.memberId);
+    // The item was INGESTED under uproj, but its membership is in General until curated — the
+    // scoped token must NOT get it through the items.project_id backdoor the Phase A proxy used.
+    const got = await delegatedPaths({ teamId: seed.teamId, memberId: agent, onBehalfOf: null, projectScope: [uproj] });
+    expect(got).toEqual([]);
+  });
+
+  it("scope [] retrieves nothing (fail closed, distinct from NULL)", async () => {
+    const seed = await seedTeam();
+    await ingest(seed, { path: "n/any.md", body: `n ${TERM}`, access: "team", project: "nproj" });
+    await (await import("@/lib/projects/context/backfill")).backfillTeamContext(db(), seed.teamId);
+    const agent = await seedMember(seed, { kind: "agent" });
+    const got = await delegatedPaths({ teamId: seed.teamId, memberId: agent, onBehalfOf: null, projectScope: [] });
+    expect(got).toEqual([]);
+  });
+
+  it("graph legs are omitted for a delegated principal EVEN on a permissive team (§5.8b — the mirrors are unpartitioned until C)", async () => {
+    const seed = await seedTeam();
+    await ingest(seed, { path: "gq/x.md", body: `gq ${TERM}`, access: "team", project: "gqproj" });
+    await (await import("@/lib/projects/context/backfill")).backfillTeamContext(db(), seed.teamId);
+    await db().from("graph_entities").insert({ team_id: seed.teamId, entity_id: `c-${randomUUID().slice(0, 8)}`, entity_type: "commitment", name: "ship the delegated widget", attrs: { status: "open" } });
+    const { data: projects } = await db().from("projects").select("id, slug").eq("team_id", seed.teamId);
+    const gqproj = ((projects ?? []) as { id: string; slug: string }[]).find((p) => p.slug === "gqproj")!.id;
+    const agent = await seedMember(seed, { kind: "agent" });
+    const g = await createGroup(db(), seed.teamId, "gq-g", "G", seed.memberId);
+    await addMemberToGroup(db(), seed.teamId, g.groupId!, agent, seed.memberId);
+    await grantProjectToGroup(db(), seed.teamId, gqproj, g.groupId!, seed.memberId);
+
+    // Permissive member retrieval SEES the commitment (control: the leg is live)…
+    const { retrieve } = await import("@/lib/query/retrieve");
+    const permissive = await retrieve(db(), seed.teamId, "team", `about ${TERM}`, null, null);
+    expect(permissive.structured, "control: the graph leg serves members under permissive").toContain("ship the delegated widget");
+
+    // …but the delegated principal must never get it, permissive or not.
+    const { delegatedVisibleItemIds } = await import("@/lib/access/enforce");
+    const { ids } = await delegatedVisibleItemIds(db(), { teamId: seed.teamId, memberId: agent, onBehalfOf: null, projectScope: null });
+    const delegated = await retrieve(db(), seed.teamId, "team", `about ${TERM}`, null, { visibleItemIds: ids });
+    expect(delegated.structured, "graph legs must be OMITTED for every aiosd_ principal").not.toContain("ship the delegated widget");
+  });
+
+  it("a mixed token (agent launcher + human on_behalf_of) retrieves only the intersection", async () => {
+    const seed = await seedTeam();
+    const onlyAgent = await ingest(seed, { path: "p/only-agent.md", body: `p ${TERM}`, access: "team", project: "aproj" });
+    const shared = await ingest(seed, { path: "q/shared.md", body: `q ${TERM}`, access: "team", project: "qproj" });
+    await (await import("@/lib/projects/context/backfill")).backfillTeamContext(db(), seed.teamId);
+    const { data: projects } = await db().from("projects").select("id, slug").eq("team_id", seed.teamId);
+    const bySlug = new Map(((projects ?? []) as { id: string; slug: string }[]).map((p) => [p.slug, p.id]));
+    await curateInto(seed, onlyAgent.id, bySlug.get("aproj")!);
+    await curateInto(seed, shared.id, bySlug.get("qproj")!);
+
+    const agent = await seedMember(seed, { kind: "agent" });
+    const human = await seedMember(seed);
+    // Agent sees {aproj, qproj}; the represented human sees only {qproj}.
+    const ga = await createGroup(db(), seed.teamId, "mx-a", "A", seed.memberId);
+    await addMemberToGroup(db(), seed.teamId, ga.groupId!, agent, seed.memberId);
+    await grantProjectToGroup(db(), seed.teamId, bySlug.get("aproj")!, ga.groupId!, seed.memberId);
+    await grantProjectToGroup(db(), seed.teamId, bySlug.get("qproj")!, ga.groupId!, seed.memberId);
+    const gh = await createGroup(db(), seed.teamId, "mx-h", "H", seed.memberId);
+    await addMemberToGroup(db(), seed.teamId, gh.groupId!, human, seed.memberId);
+    await grantProjectToGroup(db(), seed.teamId, bySlug.get("qproj")!, gh.groupId!, seed.memberId);
+
+    const got = await delegatedPaths({ teamId: seed.teamId, memberId: agent, onBehalfOf: human, projectScope: null });
+    expect(got, "the shared project flows").toContain("q/shared.md");
+    expect(got, "a mixed credential must not exceed the represented human").not.toContain("p/only-agent.md");
   });
 });
