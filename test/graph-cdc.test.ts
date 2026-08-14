@@ -417,9 +417,28 @@ describe("churn: how many chunk hashes change under a real edit — CDC vs the b
       const median = cdc[Math.floor(cdc.length / 2)];
       expect(median, `${name}: median CDC churn over real docs`).toBeLessThanOrEqual(2);
       expect(Math.max(...cdc), `${name}: worst-case CDC churn over real docs`).toBeLessThanOrEqual(6);
-      expect(Math.max(...cdc), `${name}: CDC must never be worse than byte offsets`).toBeLessThanOrEqual(
-        Math.max(...leg)
-      );
+      // SCOPED, and the scoping is the point rather than a convenience.
+      //
+      // For a SAME-LENGTH IN-PLACE edit, byte-offset chunking is optimal by construction: no offset
+      // moves, so exactly the containing chunk changes and `leg` is always 1. CDC cannot beat 1 and
+      // CAN cascade, so "never worse than byte offsets" is not a property it could ever have in that
+      // scenario — and this file's own docstring quotes the spec disclaiming precisely that guarantee
+      // ("pathological low-entropy content can propagate a shift across several chunks"). The
+      // comparison is meaningful for insertions and deletions, where a byte offset churns the entire
+      // downstream tail (up to the whole capped document) and CDC's realignment is the actual claim.
+      //
+      // FOUND, not theorised: adding `docs/design/answering-model-observability.md` to the repo put a
+      // document in this live corpus whose offset-20,000 region is a long run of structurally
+      // repetitive markdown bullets — low entropy — and CDC churned 4 there against legacy's 1. The
+      // ceiling assertion above (≤6) still holds and still carries the real content of this test; it
+      // is the absolute that was over-broad. Flagged in the PR that surfaced it rather than quietly
+      // relaxed, because weakening another slice's assertion to make a build green is exactly how
+      // coverage rots.
+      if (name !== "edit in place, same length") {
+        expect(Math.max(...cdc), `${name}: CDC must never be worse than byte offsets`).toBeLessThanOrEqual(
+          Math.max(...leg)
+        );
+      }
     }
   });
 });

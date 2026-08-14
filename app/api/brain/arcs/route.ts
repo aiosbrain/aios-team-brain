@@ -87,7 +87,12 @@ export async function POST(req: NextRequest) {
       reason = "no_facts";
       note =
         "The knowledge graph has no facts yet, so there's nothing to synthesize. The graph projector may not have run or is failing — an admin can check Admin → Integrations → Retrieval health (Graph memory).";
-    } else if (llm.state === "degraded") {
+      // The ARCS TASK's state, not the leg's (LLMOBS-1). The leg now aggregates every recorded
+      // generation task, so a confirmed `meeting-summary` failure would otherwise tell a user their
+      // arcs are empty because the model is failing — while the reasoning model that actually
+      // synthesises arcs is healthy. A false diagnosis on a user-facing surface, created by widening
+      // the leg; review caught it as an unenumerated consumer.
+    } else if (llm.tasks.some((t) => t.task === "arcs" && t.state === "degraded")) {
       reason = "model_failing";
       note =
         llm.note ??
