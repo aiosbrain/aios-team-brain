@@ -693,6 +693,10 @@ export async function projectItemsToGraph(
     }
 
     const tierChanged = existingRow !== null && existingRow.group_id !== groupId;
+    // Set when the group-move UPDATE below matched zero rows (the old-key row vanished between the
+    // ledger read and the move — reconcile's re-queue DELETE can do that): the move then reserved
+    // nothing, and the reservation upsert must run instead.
+    let groupMoveMatchedNothing = false;
     // Pushing back INTO a group we still owe a purge on (a redaction that was undone before reconcile
     // finished): the pending purge deletes by item id, so leaving the flag set would delete the episodes
     // we're about to push and silently drop the item from the graph. Purge the stale ones first, then
@@ -783,7 +787,7 @@ export async function projectItemsToGraph(
       // claiming content the new group never received. Durable pending flag written here, not just
       // in the final upsert: the flag must survive a crash between this point and that write.
       const moveAt = new Date().toISOString();
-      const { error: moveErr } = await db
+      const { data: movedRows, error: moveErr } = await db
         .from("graph_episodes")
         .update({
           group_id: groupId,
@@ -794,10 +798,16 @@ export async function projectItemsToGraph(
         .eq("team_id", args.teamId)
         .eq("source_table", SOURCE_TABLE)
         .eq("source_id", item.id)
-        .eq("group_id", existingRow.group_id);
+        .eq("group_id", existingRow.group_id)
+        .select("group_id");
       if (moveErr) {
         throw new Error(`project: group-move ledger update failed for item ${item.id}: ${moveErr.message}`);
       }
+      // ROWCOUNT, not just error (Fable review Low 2): reconcile's re-queue DELETE removes exactly a
+      // no-pending-flag row whose episodes went missing, and it can land between our ledger read and
+      // this UPDATE. Zero rows moved means NOTHING is reserved — falling through to the reservation
+      // upsert below is what keeps the reserve-before-push guarantee on this path too.
+      groupMoveMatchedNothing = ((movedRows as unknown[] | null) ?? []).length === 0;
     }
     // RETRACTABLE SOURCES: replace, don't append. `addEpisodes` does not overwrite by name — Graphiti
     // keeps the old episode and the facts extracted from it — so for a source whose body is a
@@ -895,12 +905,14 @@ export async function projectItemsToGraph(
     // `addEpisodes` cannot be taken back; the old order (push, then first ledger write) meant a
     // cross-instance race — the single-flight is process-local, and a deploy overlap runs two
     // instances — could push episodes into a group and then fail its first ledger write, leaving
-    // them orphaned with no purge pointer. Reserving first inverts that: the loser fails HERE, on a
-    // plain Postgres conflict, before anything lands in a graph. The `''` sentinel means "reserved,
-    // not landed" — a crash before the final write below leaves a row reconcile re-queues.
-    // (A tier flip is already reserved by the group-move UPDATE above; an existing current-group row
-    // IS the reservation.)
-    if (existingRow === null) {
+    // them orphaned with no purge pointer. Reserving first inverts that: a CROSS-GROUP loser fails
+    // HERE, on the still-standing narrow unique, before anything lands in a graph. (Two same-group
+    // racers both pass the upsert and both push — the pre-existing duplicate-push residual, neither
+    // created nor closed by this change.) The `''` sentinel means "reserved, not landed" — a crash
+    // before the final write below leaves a row reconcile re-queues.
+    // (A tier flip is normally reserved by the group-move UPDATE above — unless it matched nothing;
+    // an existing current-group row IS the reservation.)
+    if (existingRow === null || groupMoveMatchedNothing) {
       const { error: reserveErr } = await db.from("graph_episodes").upsert(
         {
           team_id: args.teamId,

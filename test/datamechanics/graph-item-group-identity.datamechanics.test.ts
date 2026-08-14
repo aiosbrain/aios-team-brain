@@ -189,6 +189,38 @@ describe("PCCC-3 Deploy A — per-(item, group) ledger identity", () => {
     }
   });
 
+  it("a refused push (outstanding purge failed, content unchanged) contributes NOTHING to episodesByGroup", async () => {
+    const seed = await seedTeam();
+    const fake = new FakeGraphiti();
+    const r = await ingest(seed, { body: "unchanged under a failed purge", path: "refuse.md", access: "team" });
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: seed.teamSlug, client: client(fake) });
+
+    const group = episodeGroupId(seed.teamSlug, "team");
+    // Simulate a pending purge on the push target (a redaction that was undone before reconcile
+    // finished), then make the purge FAIL: the projector must refuse the re-push (pushing again
+    // would duplicate) — and the refusal must not be counted as pushed episodes, or the Phase C
+    // cost denominator inflates with pushes that never happened.
+    const { error: flagErr } = await db()
+      .from("graph_episodes")
+      .update({ pending_delete_group_id: group, pending_delete_at: new Date().toISOString() })
+      .eq("team_id", seed.teamId)
+      .eq("source_id", r.id);
+    expect(flagErr).toBeNull();
+
+    fake.failDeletes = true;
+    const before = fake.pushedEpisodes.length;
+    const summary = await projectItemsToGraph(db(), {
+      teamId: seed.teamId,
+      teamSlug: seed.teamSlug,
+      client: client(fake),
+    });
+    fake.failDeletes = false;
+
+    expect(fake.pushedEpisodes.length).toBe(before); // the refusal pushed nothing…
+    expect(summary.episodes).toBe(0); // …and neither counter claims it did
+    expect(summary.episodesByGroup[group] ?? 0).toBe(0);
+  });
+
   it("a ledger write failure on the REDACTION path is loud too (a silent one strands pre-redaction episodes with pendingCleanups reading 0)", async () => {
     const seed = await seedTeam();
     const fake = new FakeGraphiti();

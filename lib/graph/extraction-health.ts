@@ -363,7 +363,7 @@ export async function newestEpisodicAtMs(groupIds: string[] | null): Promise<num
 export async function countProjectedEpisodes(teamId: string): Promise<number | null> {
   try {
     const res = await runSql<{ n: number }>(
-      "select count(distinct source_id)::int as n from graph_episodes where team_id = $1 and content_sha256 <> ''",
+      "select count(distinct (source_table, source_id))::int as n from graph_episodes where team_id = $1 and content_sha256 <> ''",
       [teamId]
     );
     return res.rows[0]?.n ?? 0;
