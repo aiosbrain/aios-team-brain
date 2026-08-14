@@ -24,6 +24,10 @@ export interface GraphProjectionSummary {
   projected: number;
   /** EPISODES pushed (an item chunks into 1..16) — the unit extraction actually costs per. */
   episodes: number;
+  /** `episodes` split by target group (PCCC-3) — the per-partition cost substrate, recorded
+   * append-only into `ingest_runs.meta`. Row counts in `graph_episodes` cannot serve: a row is one
+   * ITEM, not one episode, and `projected_at` is mutable. */
+  episodesByGroup: Record<string, number>;
   skipped: number;
   /** Episodes confirmed to have actually landed in Graphiti this run (audit H3 reconcile pass). */
   reconciled: number;
@@ -101,6 +105,7 @@ async function runGraphProjectionInner(opts?: {
     scanned: 0,
     projected: 0,
     episodes: 0,
+    episodesByGroup: {},
     skipped: 0,
     reconciled: 0,
     requeued: 0,
@@ -135,6 +140,9 @@ async function runGraphProjectionInner(opts?: {
         summary.scanned += s.scanned;
         summary.projected += s.projected;
         summary.episodes += s.episodes;
+        for (const [g, n] of Object.entries(s.episodesByGroup)) {
+          summary.episodesByGroup[g] = (summary.episodesByGroup[g] ?? 0) + n;
+        }
         summary.skipped += s.skipped;
         externalVacated += s.externalGroupVacated;
         if (s.scanned < limit || !s.lastSyncedAt || s.lastSyncedAt === since) break;

@@ -395,6 +395,13 @@ export interface ProjectSummary {
    * and again at 80. The constant is the only honest source.)
    */
   episodes: number;
+  /**
+   * `episodes` split by the group each was pushed into (PCCC-3, design §3). The cost gate's
+   * denominator substrate: `graph_episodes` ROW counts cannot serve — a row is one ITEM, not one
+   * episode (lib/metrics/graph-efficiency documents that exact wrong answer) and its `projected_at`
+   * is mutable. This is per-pass and append-only once recorded to `ingest_runs.meta`.
+   */
+  episodesByGroup: Record<string, number>;
   skipped: number;
   /** Items whose episodes were removed from the EXTERNAL group this batch — a NARROWING reaching the
    * graph. The caller uses it to invalidate the external-tier caches: arcs are synthesized FROM that
@@ -602,6 +609,7 @@ export async function projectItemsToGraph(
 
   let projected = 0;
   let episodesPushed = 0;
+  const episodesByGroup: Record<string, number> = {};
   let skipped = 0;
   let externalGroupVacated = 0;
   for (const item of rows) {
@@ -613,20 +621,33 @@ export async function projectItemsToGraph(
 
     // Read the ledger BEFORE the "nothing to project" skip: an item that stops projecting still owns
     // episodes we put in the graph, and they have to come back out (see the branch below).
-    const { data: existing } = await db
+    //
+    // ALL of the item's rows, not `.maybeSingle()` (PCCC-3): the identity is per-(item, group) now,
+    // and this adapter's maybeSingle returns rows[0] SILENTLY on multiple rows — under fan-out that
+    // reads an arbitrary group's ledger, and a sha-match against the wrong group skips extraction
+    // into a group that never got the content (a silently-empty project graph). Deploy A still holds
+    // one row per item (the narrow unique stands), so `currentRow ?? staleRows[0]` is today's exact
+    // semantics; the shape is the set-diff foundation PCCC-5's fan-out extends.
+    const { data: existingData, error: ledgerReadErr } = await db
       .from("graph_episodes")
       .select("content_sha256, group_id, pending_delete_group_id, chunk_shas, chunk_config")
       .eq("team_id", args.teamId)
       .eq("source_table", SOURCE_TABLE)
-      .eq("source_id", item.id)
-      .maybeSingle();
-    const existingRow = existing as {
+      .eq("source_id", item.id);
+    if (ledgerReadErr) {
+      throw new Error(`project: ledger read failed for item ${item.id}: ${ledgerReadErr.message}`);
+    }
+    type LedgerRow = {
       content_sha256: string;
       group_id: string;
       pending_delete_group_id: string | null;
       chunk_shas: string[] | null;
       chunk_config: string | null;
-    } | null;
+    };
+    const rowsForItem = (existingData ?? []) as LedgerRow[];
+    const currentRow = rowsForItem.find((r) => r.group_id === groupId) ?? null;
+    const staleRows = rowsForItem.filter((r) => r.group_id !== groupId);
+    const existingRow = currentRow ?? staleRows[0] ?? null;
     // Per-chunk ledger for THIS pass: the hashes of exactly the episodes we would send. Derived from
     // `episodes` rather than re-chunking, so the ledger can never describe something else.
     const chunkShas = episodes.map((e) => sha(e.content));
@@ -647,7 +668,10 @@ export async function projectItemsToGraph(
       if (existingRow && !existingRow.pending_delete_group_id) {
         await deleteItemEpisodes(client, existingRow.group_id, item.id).catch(() => {});
         const at = new Date().toISOString();
-        await db.from("graph_episodes").upsert(
+        // Same group as the existing row, so the 4-column target matches it (no second-row insert
+        // for the narrow unique to reject). LOUD on error (PCCC-3): a silently-failed write here
+        // strands pre-redaction episodes searchable forever with pendingCleanups reading 0.
+        const { error: redactErr } = await db.from("graph_episodes").upsert(
           {
             team_id: args.teamId,
             source_table: SOURCE_TABLE,
@@ -658,8 +682,11 @@ export async function projectItemsToGraph(
             pending_delete_group_id: existingRow.group_id,
             pending_delete_at: at,
           },
-          { onConflict: "team_id,source_table,source_id" }
+          { onConflict: "team_id,source_table,source_id,group_id" }
         );
+        if (redactErr) {
+          throw new Error(`project: redaction ledger write failed for item ${item.id}: ${redactErr.message}`);
+        }
       }
       skipped++;
       continue;
@@ -748,6 +775,29 @@ export async function projectItemsToGraph(
     if (tierChanged && existingRow) {
       if (isExternalGroupId(existingRow.group_id)) externalGroupVacated++;
       await deleteItemEpisodes(client, existingRow.group_id, item.id).catch(() => {});
+      // GROUP-MOVE IS AN EXPLICIT UPDATE, NOT AN UPSERT (PCCC-3, Deploy A): under the 4-column
+      // conflict target a group change is an INSERT of a second row for the item, which the
+      // still-standing narrow unique rejects. While it stands (until Deploy B), relocate the row by
+      // its OLD key. This doubles as the RESERVATION for the new group — `''` sentinel until the
+      // push below lands, so a crash mid-move leaves a row reconcile re-queues rather than a ledger
+      // claiming content the new group never received. Durable pending flag written here, not just
+      // in the final upsert: the flag must survive a crash between this point and that write.
+      const moveAt = new Date().toISOString();
+      const { error: moveErr } = await db
+        .from("graph_episodes")
+        .update({
+          group_id: groupId,
+          content_sha256: "",
+          pending_delete_group_id: existingRow.group_id,
+          pending_delete_at: moveAt,
+        })
+        .eq("team_id", args.teamId)
+        .eq("source_table", SOURCE_TABLE)
+        .eq("source_id", item.id)
+        .eq("group_id", existingRow.group_id);
+      if (moveErr) {
+        throw new Error(`project: group-move ledger update failed for item ${item.id}: ${moveErr.message}`);
+      }
     }
     // RETRACTABLE SOURCES: replace, don't append. `addEpisodes` does not overwrite by name — Graphiti
     // keeps the old episode and the facts extracted from it — so for a source whose body is a
@@ -841,6 +891,33 @@ export async function projectItemsToGraph(
     const alreadyPushed = new Set(deltaEligible ? (existingRow?.chunk_shas ?? []) : []);
     const toPush = deltaEligible ? episodes.filter((_, i) => !alreadyPushed.has(chunkShas[i])) : episodes;
 
+    // RESERVE THE LEDGER ROW BEFORE THE IRREVERSIBLE PUSH (PCCC-3, plan-review Codex High 4).
+    // `addEpisodes` cannot be taken back; the old order (push, then first ledger write) meant a
+    // cross-instance race — the single-flight is process-local, and a deploy overlap runs two
+    // instances — could push episodes into a group and then fail its first ledger write, leaving
+    // them orphaned with no purge pointer. Reserving first inverts that: the loser fails HERE, on a
+    // plain Postgres conflict, before anything lands in a graph. The `''` sentinel means "reserved,
+    // not landed" — a crash before the final write below leaves a row reconcile re-queues.
+    // (A tier flip is already reserved by the group-move UPDATE above; an existing current-group row
+    // IS the reservation.)
+    if (existingRow === null) {
+      const { error: reserveErr } = await db.from("graph_episodes").upsert(
+        {
+          team_id: args.teamId,
+          source_table: SOURCE_TABLE,
+          source_id: item.id,
+          group_id: groupId,
+          content_sha256: "",
+          chunk_shas: [],
+          chunk_config: CHUNK_CONFIG,
+        },
+        { onConflict: "team_id,source_table,source_id,group_id" }
+      );
+      if (reserveErr) {
+        throw new Error(`project: ledger reservation failed for item ${item.id}: ${reserveErr.message}`);
+      }
+    }
+
     if (!(purgeFailed && contentUnchanged) && toPush.length > 0) {
       await client.addEpisodes(groupId, toPush);
     }
@@ -875,7 +952,7 @@ export async function projectItemsToGraph(
             ? { pending_delete_group_id: null, pending_delete_at: null } // purge confirmed + re-pushed
             : {};
 
-    await db.from("graph_episodes").upsert(
+    const { error: ledgerWriteErr } = await db.from("graph_episodes").upsert(
       {
         team_id: args.teamId,
         source_table: SOURCE_TABLE,
@@ -890,8 +967,15 @@ export async function projectItemsToGraph(
         ...(pushedSomething ? { projected_at: projectedAt } : {}),
         ...pending,
       },
-      { onConflict: "team_id,source_table,source_id" }
+      { onConflict: "team_id,source_table,source_id,group_id" }
     );
+    // LOUD (PCCC-3). This error was silently discarded, which is what made the deploy-window
+    // breakage class invisible: episodes pushed to Graphiti, ledger never written, re-pushed every
+    // pass — duplicate episodes with the ledger reading healthy. The reservation above bounds the
+    // damage of throwing here: the row exists as a `''` sentinel, so reconcile re-queues it.
+    if (ledgerWriteErr) {
+      throw new Error(`project: ledger write failed for item ${item.id}: ${ledgerWriteErr.message}`);
+    }
     if (pushedSomething) projected++;
     else skipped++; // ledger refreshed, nothing extracted — not work the health probes should see
     // What was ACTUALLY sent, not what the item chunks into. `episodes` is the denominator of the
@@ -900,13 +984,16 @@ export async function projectItemsToGraph(
     // look cheaper per episode than it is. This also stops counting the `purgeFailed && contentUnchanged`
     // refusal, which pushes nothing and was previously counted.
     episodesPushed += pushedSomething ? toPush.length : 0;
+    if (pushedSomething) {
+      episodesByGroup[groupId] = (episodesByGroup[groupId] ?? 0) + toPush.length;
+    }
   }
 
   // Cursor for the runner: rows are ordered by synced_at ascending, so the last row is the high-water
   // mark to page past next batch (audit H2). Without this the runner only ever re-scanned the oldest
   // `limit` rows and never reached items beyond that window.
   const lastSyncedAt = rows.length ? rows[rows.length - 1].synced_at : undefined;
-  return { scanned: rows.length, projected, episodes: episodesPushed, skipped, externalGroupVacated, lastSyncedAt };
+  return { scanned: rows.length, projected, episodes: episodesPushed, episodesByGroup, skipped, externalGroupVacated, lastSyncedAt };
 }
 
 /** Back-compat: project only Slack transcripts. Prefer `projectItemsToGraph` (all ingestions). */

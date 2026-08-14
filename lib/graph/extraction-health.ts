@@ -355,11 +355,15 @@ export async function newestEpisodicAtMs(groupIds: string[] | null): Promise<num
  * episodes reliably yield ≥1 fact" — a tombstone was never accepted by anything. Concretely: a young
  * team with 20 real pushes and 5 redactions read as 25, cleared the fresh-install floor, and could be
  * accused of "0 facts" while its first extraction was still legitimately pending.
+ *
+ * DISTINCT items, not rows (PCCC-3): the ledger identity is per-(item, group), so once fan-out
+ * writes an item into several project graphs, `count(*)` counts copies — and the fresh-install
+ * floor's contract is about distinct CONTENT pushed, which copies don't add to.
  */
 export async function countProjectedEpisodes(teamId: string): Promise<number | null> {
   try {
     const res = await runSql<{ n: number }>(
-      "select count(*)::int as n from graph_episodes where team_id = $1 and content_sha256 <> ''",
+      "select count(distinct source_id)::int as n from graph_episodes where team_id = $1 and content_sha256 <> ''",
       [teamId]
     );
     return res.rows[0]?.n ?? 0;
