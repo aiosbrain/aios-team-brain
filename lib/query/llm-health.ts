@@ -104,17 +104,24 @@ export interface LlmHealth {
  * (`test/guards/llm-record-coverage`) exists to make new tasks appear, so an unmapped slug is the
  * expected steady state after any new generation feature, not an error.
  */
-const TASK_COPY: Record<string, string> = {
-  arcs: "Learning arcs",
-  "arc-coherence": "Learning arc coherence",
-  "meeting-summary": "meeting summaries",
-  "meeting-actions": "meeting action items",
-  "meeting-merge": "meeting transcript merging",
-  attribution: "attribution corrections",
-};
+const TASK_COPY = new Map<string, string>([
+  ["arcs", "Learning arcs"],
+  ["arc-coherence", "Learning arc coherence"],
+  ["meeting-summary", "meeting summaries"],
+  ["meeting-actions", "meeting action items"],
+  ["meeting-merge", "meeting transcript merging"],
+  ["attribution", "attribution corrections"],
+]);
 
+/**
+ * A `Map`, not an object literal, for the same reason as the banner's copy of this: `task` comes from
+ * `meta->>'task'`, so an object lookup walks the prototype chain and `TASK_COPY["constructor"]` returns
+ * a function rather than falling through to the fallback. Static analysis flagged only the component;
+ * this side had the identical sink and is fixed with it, because fixing the flagged instance alone is
+ * how the same bug survives in the file nobody scanned.
+ */
 export function taskLabel(task: string): string {
-  return TASK_COPY[task] ?? `a background task (${task})`;
+  return TASK_COPY.get(task) ?? `a background task (${task})`;
 }
 
 function asObject(v: unknown): Record<string, unknown> {

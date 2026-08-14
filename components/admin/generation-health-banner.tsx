@@ -109,17 +109,25 @@ export function GenerationHealthBanner({ health, href }: { health: LlmHealth; hr
  * module is `server-only`, and importing it here would drag a server module into a client component.
  * `test/generation-health-banner.test.ts` pins the two in sync so the duplication cannot drift.
  */
-const LABELS: Record<string, string> = {
-  arcs: "Learning arcs",
-  "arc-coherence": "Learning arc coherence",
-  "meeting-summary": "meeting summaries",
-  "meeting-actions": "meeting action items",
-  "meeting-merge": "meeting transcript merging",
-  attribution: "attribution corrections",
-};
+const LABELS = new Map<string, string>([
+  ["arcs", "Learning arcs"],
+  ["arc-coherence", "Learning arc coherence"],
+  ["meeting-summary", "meeting summaries"],
+  ["meeting-actions", "meeting action items"],
+  ["meeting-merge", "meeting transcript merging"],
+  ["attribution", "attribution corrections"],
+]);
 
+/**
+ * A `Map`, not an object literal — static analysis flagged the object form as a generic
+ * object-injection sink and it is right: `task` reaches here from `meta->>'task'`, a database column,
+ * so an object lookup walks the prototype chain. `LABELS["constructor"]` would return a FUNCTION,
+ * which React then tries to render as a child. Not an XSS (React escapes text), but a crash or garbage
+ * on the admin's home page from a row nobody validated. A `Map` has no such chain, and the fallback
+ * below is what an unknown slug is supposed to get anyway.
+ */
 function labelOf(task: string): string {
-  return LABELS[task] ?? `a background task (${task})`;
+  return LABELS.get(task) ?? `a background task (${task})`;
 }
 
 /** Copy nicety: "meeting summaries ARE not being generated" vs "attribution IS". */

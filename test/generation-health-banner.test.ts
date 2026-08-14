@@ -68,7 +68,7 @@ describe("guard: the reason is specific — feature, model, error", () => {
     // Scoped to the LABELS object too: asserting the phrase appears ANYWHERE in the file let a
     // comment containing it mask a drifted entry.
     const labels = SRC.slice(SRC.indexOf("const LABELS"));
-    const block = labels.slice(0, labels.indexOf("};") + 2);
+    const block = labels.slice(0, labels.indexOf("]);") + 3);
     for (const slug of LLM_TASK_NAMES) {
       const server = taskLabel(slug);
       expect(block, `the banner's LABELS is missing copy for \`${slug}\``).toContain(`"${server}"`);
