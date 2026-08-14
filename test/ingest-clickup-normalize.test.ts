@@ -11,6 +11,7 @@ import {
   normalizeClickUpTasks,
   type ClickUpStatusMap,
 } from "@/lib/ingest/sources/clickup-normalize";
+import { sourceRules } from "@/lib/ingest/source-rules";
 import tasks101Page0 from "@/test/fixtures/clickup/synthetic-tasks-list-101-page-0.json";
 import tasks101Page1 from "@/test/fixtures/clickup/synthetic-tasks-list-101-page-1.json";
 import tasks202Page0 from "@/test/fixtures/clickup/synthetic-tasks-list-202-page-0.json";
@@ -163,6 +164,78 @@ describe("ClickUp task normalization", () => {
       status: "ready",
     });
   });
+
+  it("keeps its ticket documents out of the timeline's evidence lane", () => {
+    // The timeline gate is `str(fm.identifier) && sourceRules(source).emitsTicketDocuments`
+    // (lib/dashboard/work-timeline.ts). BOTH halves have to hold or a workspace of N tasks pushes N
+    // ticket documents into every assignee's day and the timeline becomes a backlog dump. Asserting
+    // the two together, because either one alone passes while the behaviour stays broken.
+    expect(sourceRules("clickup").emitsTicketDocuments).toBe(true);
+    for (const doc of normalizeClickUpTaskDocs(input)) {
+      expect(String(doc.frontmatter.identifier ?? "")).not.toBe("");
+    }
+  });
+
+  it("prefers the custom id as the ticket key and falls back to the native id", () => {
+    const docs = normalizeClickUpTaskDocs(input);
+    expect(docs.find((doc) => doc.frontmatter.native_id === "1001")!.frontmatter.identifier).toBe("PILOT-1");
+    // A Space without custom ids must still yield a non-empty key — an empty one silently fails the gate.
+    const noCustomId = normalizeClickUpTaskDocs({
+      ...input,
+      records: [{ task: { ...records[0].task, custom_id: null }, observedListIds: ["101"] }],
+    });
+    expect(noCustomId[0].frontmatter.identifier).toBe(String(records[0].task.id));
+  });
+
+  it("truncates row fields to their strict schema bounds instead of rejecting the batch", () => {
+    // One over-long ClickUp name would 422 the WHOLE workspace payload, since every task ships as one
+    // item through a strict parser. ClickUp permits a 255-char List name; `sprint` stops at 200.
+    const record: ClickUpTaskRecord = {
+      task: {
+        ...records[0].task,
+        name: "n".repeat(2500),
+        list: { id: "101", name: "L".repeat(255) },
+        assignees: [{ id: 1, username: "u".repeat(300) }],
+      },
+      observedListIds: ["101"],
+    };
+    const payload = normalizeClickUpTasks({ workspaceId: 9001, records: [record], statusMaps: { "101": list101Map } });
+    const row = (payload.rows as Array<Record<string, unknown>>)[0];
+    expect(() => taskRowSchema.parse(row)).not.toThrow();
+    expect(() => itemPayloadSchema.parse(payload)).not.toThrow();
+    expect((row.title as string).length).toBe(2000);
+    expect((row.sprint as string).length).toBe(200);
+    expect((row.assignee as string).length).toBe(200);
+  });
+
+  it("degrades an out-of-range timestamp to no work-time rather than aborting the import", () => {
+    // A third-party ClickUp integration writing a NANOSECOND epoch into `date_done` is finite but
+    // past the ±8.64e15 ms Date range, so `toISOString()` threw RangeError — taking down every task
+    // in the workspace, not the one field. (A microsecond epoch stays in range and merely dates the
+    // task to year 58566; that is a different, non-fatal problem and is not what this guards.)
+    const nanoseconds = "1786000600000000000";
+    expect(clickUpWorkedAt({ id: "overflow", date_done: nanoseconds })).toBe("");
+
+    const record: ClickUpTaskRecord = {
+      task: { ...records[0].task, date_done: nanoseconds, date_updated: nanoseconds },
+      observedListIds: ["101"],
+    };
+    const payload = normalizeClickUpTasks({ workspaceId: 9001, records: [record], statusMaps: { "101": list101Map } });
+    expect(() => itemPayloadSchema.parse(payload)).not.toThrow();
+    expect((payload.rows as Array<Record<string, unknown>>)[0].worked_at).toBe("");
+  });
+
+  it("names the status and the Lists consulted when a native status is unmapped", () => {
+    // Fail-closed is deliberate, but the blast radius is the whole workspace — so the message has to
+    // carry enough to act on, or "all ClickUp tasks stopped importing" has nothing in it to fix.
+    const record: ClickUpTaskRecord = {
+      task: { ...records[0].task, status: { status: "In Review" } },
+      observedListIds: ["101"],
+    };
+    expect(() =>
+      normalizeClickUpTasks({ workspaceId: 9001, records: [record], statusMaps: { "101": list101Map } })
+    ).toThrow(/In Review.*consulted: 101/);
+  });
 });
 
 describe("ClickUp Doc normalization", () => {
@@ -189,6 +262,31 @@ describe("ClickUp Doc normalization", () => {
     expect(payload.body.indexOf("## Agenda")).toBeLessThan(payload.body.indexOf("### Decisions"));
     expect(payload.body.indexOf("### Decisions")).toBeLessThan(payload.body.indexOf("## Action items"));
     expect(payload.body).toContain("Proceed with the read-only pilot.");
+  });
+
+  it("de-duplicates editors across ClickUp's mixed number/string user ids", () => {
+    // ClickUp returns the same user as 7 and "7" (the doc-alpha fixture mixes both). De-duplicating
+    // before coercion kept both, so a re-sync where the representation flips rewrote the frontmatter
+    // with no real edit.
+    const pages = structuredClone(docAlphaPages) as ClickUpDocPage[];
+    pages[0].edited_by = 7;
+    pages[0].pages![0].edited_by = "7";
+    pages[1].edited_by = "7";
+    const payload = normalizeClickUpDoc(9001, { doc: docAlpha as ClickUpDoc, pages });
+    expect(payload.frontmatter.editor_ids).toEqual(["7"]);
+  });
+
+  it("re-bases surviving descendants of a deleted page instead of orphaning them", () => {
+    // A deleted page emits no heading and no page_ids entry, so a live child used to render as an
+    // orphan `###` under no `##`, listed under a parent absent from the document.
+    const pages = structuredClone(docAlphaPages) as ClickUpDocPage[];
+    pages[0].deleted = true;
+    const payload = normalizeClickUpDoc(9001, { doc: docAlpha as ClickUpDoc, pages });
+
+    expect(payload.frontmatter.page_ids).toEqual(["page-decisions", "page-actions"]);
+    expect(payload.body).toContain("## Decisions");
+    expect(payload.body).not.toContain("### Decisions");
+    expect(payload.body).not.toContain("Agenda");
   });
 
   it("updates the same stable item when a page body changes", () => {

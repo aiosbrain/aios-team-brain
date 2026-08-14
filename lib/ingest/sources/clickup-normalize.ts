@@ -36,6 +36,20 @@ export class ClickUpNormalizationError extends Error {
 const BRAIN_STATUSES: ClickUpBrainStatus[] = ["backlog", "ready", "in_progress", "blocked", "done"];
 const PRIORITY_BY_ID: Record<string, string> = { "1": "urgent", "2": "high", "3": "medium", "4": "low" };
 
+/**
+ * The bounds `taskRowSchema` (lib/api/item-payload-schema.ts) enforces on the fields we fill.
+ *
+ * That parser is STRICT and the whole workspace arrives as ONE `task` item, so a single over-long
+ * ClickUp name would 422 every task in the payload rather than its own field — the failure mode the
+ * label cap already avoids. Truncating here keeps the blast radius at the field.
+ */
+const TITLE_MAX = 2000;
+const ASSIGNEE_MAX = 200;
+const SPRINT_MAX = 200;
+
+/** Beyond this the ECMAScript Date range ends and `new Date(ms).toISOString()` throws. */
+const MAX_TIMESTAMP_MS = 8.64e15;
+
 function sha256(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
@@ -57,20 +71,41 @@ export function clickUpDocIdentity(workspaceId: ClickUpId, docId: string): strin
   return `clickup:${String(workspaceId)}:doc:${docId}`;
 }
 
+/** A field the Date constructor cannot represent is no timestamp at all — see `timestampMs`. */
+function inDateRange(milliseconds: number): number | null {
+  return Math.abs(milliseconds) <= MAX_TIMESTAMP_MS ? milliseconds : null;
+}
+
+/**
+ * The ONE place a ClickUp wire value becomes milliseconds — and therefore the one place to reject a
+ * value `new Date()` cannot represent. A third-party ClickUp integration writing MICROSECONDS into
+ * `date_done` (`"1786000600000000"`) is finite, so it used to reach `toISOString()` and throw
+ * `RangeError: Invalid time value` — aborting the whole workspace import, not the one task, with an
+ * error naming no field. Rejecting at the choke point means every caller degrades to "no timestamp".
+ */
 function timestampMs(value: unknown): number | null {
   if (typeof value !== "string" && typeof value !== "number") return null;
   if (typeof value === "string" && value.trim() === "") return null;
   const numeric = Number(value);
-  if (Number.isFinite(numeric)) return numeric;
+  if (Number.isFinite(numeric)) return inDateRange(numeric);
   const parsed = Date.parse(String(value));
-  return Number.isFinite(parsed) ? parsed : null;
+  return Number.isFinite(parsed) ? inDateRange(parsed) : null;
+}
+
+/** Every `toISOString()` in this file goes through here, so none of them can throw. */
+function isoFromMilliseconds(milliseconds: number): string {
+  const date = new Date(milliseconds);
+  return Number.isFinite(date.valueOf()) ? date.toISOString() : "";
 }
 
 function isoTimestamp(value: unknown): string {
   const milliseconds = timestampMs(value);
-  if (milliseconds === null) return "";
-  const date = new Date(milliseconds);
-  return Number.isFinite(date.valueOf()) ? date.toISOString() : "";
+  return milliseconds === null ? "" : isoFromMilliseconds(milliseconds);
+}
+
+/** Row fields are bounded by a STRICT parser; truncating keeps one long field from 422-ing the batch. */
+function capped(value: string, max: number): string {
+  return value.length > max ? value.slice(0, max) : value;
 }
 
 /** A completion/closure transition is work time; a generic ClickUp updated timestamp is not. */
@@ -78,7 +113,7 @@ export function clickUpWorkedAt(task: ClickUpTask): string {
   const transitions = [task.date_done, task.date_closed]
     .map(timestampMs)
     .filter((value): value is number => value !== null);
-  return transitions.length > 0 ? new Date(Math.max(...transitions)).toISOString() : "";
+  return transitions.length > 0 ? isoFromMilliseconds(Math.max(...transitions)) : "";
 }
 
 function nativePriority(task: ClickUpTask): string {
@@ -138,11 +173,20 @@ function resolveStatus(record: ClickUpTaskRecord, statusMaps: Record<string, Cli
     if (status) resolved.add(status);
   }
 
+  // FAIL-CLOSED is deliberate: a status the brain cannot interpret must not be guessed into one.
+  // The blast radius is the whole workspace payload (this runs inside `rows.map`), so the message has
+  // to name the status and the Lists that were consulted — otherwise "one new custom status stopped
+  // every ClickUp task importing" is a bug report with nothing in it to act on.
+  const consulted = candidateListIds.length > 0 ? candidateListIds.join(", ") : "none";
   if (resolved.size === 0) {
-    throw new ClickUpNormalizationError(`ClickUp task ${taskId} status is not mapped by an observed List`);
+    throw new ClickUpNormalizationError(
+      `ClickUp task ${taskId} status "${record.task.status?.status ?? ""}" is not mapped by an observed List (consulted: ${consulted})`
+    );
   }
   if (resolved.size > 1) {
-    throw new ClickUpNormalizationError(`ClickUp task ${taskId} status maps ambiguously across observed Lists`);
+    throw new ClickUpNormalizationError(
+      `ClickUp task ${taskId} status "${record.task.status?.status ?? ""}" maps ambiguously across observed Lists (consulted: ${consulted})`
+    );
   }
   return [...resolved][0];
 }
@@ -158,10 +202,22 @@ function listIdsFor(record: ClickUpTaskRecord): string[] {
   );
 }
 
+/** ClickUp's human-facing ticket key: the custom id when the Space has them on, else the native id. */
+function taskIdentifier(task: ClickUpTask): string {
+  const custom = task.custom_id === null || task.custom_id === undefined ? "" : String(task.custom_id).trim();
+  return custom || String(task.id);
+}
+
 function taskMetadata(record: ClickUpTaskRecord, workspaceId: ClickUpId): Record<string, unknown> {
   const task = record.task;
   return {
     identity: clickUpTaskIdentity(workspaceId, task.id),
+    // The field `lib/dashboard/work-timeline.ts` gates on (with `emitsTicketDocuments`) to keep a
+    // tracker's own ticket documents out of the timeline's evidence lane. `identity` does NOT satisfy
+    // that gate — it reads `frontmatter.identifier`, the same key Linear and Plane stamp — so without
+    // this every ClickUp task document would count as evidence and turn the timeline into a backlog
+    // dump. NEVER let it be empty: the gate treats an empty identifier as "not a ticket document".
+    identifier: taskIdentifier(task),
     native_id: String(task.id),
     custom_id: task.custom_id === null || task.custom_id === undefined ? "" : String(task.custom_id),
     url: task.url ?? "",
@@ -216,12 +272,15 @@ export function normalizeClickUpTasks(input: NormalizeClickUpTasksInput): ItemPa
     const parentId = task.parent === null || task.parent === undefined ? null : String(task.parent);
     return {
       row_key: rowKey,
-      title: task.name?.trim() || "(untitled)",
+      // `title`/`assignee`/`sprint` are capped for the same reason `tagsFor` caps labels: ClickUp
+      // permits names longer than the strict row schema accepts (a List name may run to 255, `sprint`
+      // stops at 200), and one over-long field rejects the ENTIRE workspace payload at ingest.
+      title: capped(task.name?.trim() || "(untitled)", TITLE_MAX),
       status: resolveStatus(record, input.statusMaps),
       priority: nativePriority(task),
       labels: tagsFor(task),
-      assignee: assigneeName(task),
-      sprint: task.list?.name ?? "",
+      assignee: capped(assigneeName(task), ASSIGNEE_MAX),
+      sprint: capped(task.list?.name ?? "", SPRINT_MAX),
       due: isoTimestamp(task.due_date) || null,
       parent: parentId && includedIds.has(parentId) ? clickUpTaskIdentity(input.workspaceId, parentId) : null,
       worked_at: clickUpWorkedAt(task),
@@ -291,8 +350,13 @@ function orderedPages(pages: ClickUpDocPage[]): PageAtDepth[] {
   const visit = (page: ClickUpDocPage, depth: number) => {
     if (visited.has(String(page.id))) return;
     visited.add(String(page.id));
-    if (!page.deleted) ordered.push({ page, depth });
-    for (const child of page.pages ?? []) visit(child, depth + 1);
+    const kept = !page.deleted;
+    if (kept) ordered.push({ page, depth });
+    // A deleted page emits no heading and no `page_ids` entry, so its surviving descendants RE-BASE
+    // onto its depth instead of staying one level below a parent that appears nowhere in the output.
+    // Otherwise soft-deleting "Agenda" leaves its live "Decisions" child rendering as an orphan `###`
+    // under no `##`. Re-basing rather than dropping the subtree: the child's content is still real.
+    for (const child of page.pages ?? []) visit(child, kept ? depth + 1 : depth);
   };
   for (const page of pages) visit(page, 0);
   return ordered;
@@ -318,8 +382,17 @@ export function normalizeClickUpDoc(workspaceId: ClickUpId, input: ClickUpReadDo
   });
   const body = `# ${docTitle}\n\n${sections.join("\n\n")}\n`;
   const workspace = pathSegment(workspaceId);
-  const editors = [...new Set(pages.map(({ page }) => page.edited_by).filter((id): id is ClickUpId => id !== undefined))]
-    .map(String);
+  // Coerce BEFORE the Set, as `listIdsFor`/`assignee_ids` do: ClickUp returns user ids as both numbers
+  // and strings (see the doc-alpha fixture), so de-duplicating first lets `7` and `"7"` both survive —
+  // and a re-sync where ClickUp flips the representation would rewrite the frontmatter with no edit.
+  const editors = [
+    ...new Set(
+      pages
+        .map(({ page }) => page.edited_by)
+        .filter((id): id is ClickUpId => id !== undefined)
+        .map(String)
+    ),
+  ];
 
   return {
     project: projectFor(workspaceId),

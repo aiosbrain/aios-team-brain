@@ -159,6 +159,49 @@ describe("ClickUpClient retry and rate-limit handling", () => {
     expect(sleeps).toEqual([2000]);
   });
 
+  it("does not treat a MISSING remaining-quota header as an exhausted quota", async () => {
+    // `Number(null)` is 0, so a response carrying a reset epoch but no remaining count once read as
+    // "0 requests left" and parked the whole client until that epoch — a self-inflicted stall with no
+    // rate limit in force. The second request must go straight out, sleeping for nothing.
+    let now = 1_000_000;
+    const sleeps: number[] = [];
+    const client = new ClickUpClient({
+      token: "test-clickup-token",
+      // A CDN/proxy response, or an endpoint whose header set differs: reset present, remaining absent.
+      transport: async () => jsonResponse({ user: { id: 7 } }, 200, { "X-RateLimit-Reset": "1002" }),
+      now: () => now,
+      sleep: async (milliseconds) => {
+        sleeps.push(milliseconds);
+        now += milliseconds;
+      },
+    });
+
+    await client.getAuthorizedUser();
+    await client.getAuthorizedUser();
+    expect(sleeps).toEqual([]);
+  });
+
+  it("still blocks on a genuinely exhausted quota", async () => {
+    // The non-vacuous other half: remaining PRESENT and zero must park the client, or the fix above
+    // would have bought its calm by disabling the rate-limit gate entirely.
+    let now = 1_000_000;
+    const sleeps: number[] = [];
+    const client = new ClickUpClient({
+      token: "test-clickup-token",
+      transport: async () =>
+        jsonResponse({ user: { id: 7 } }, 200, { "X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1002" }),
+      now: () => now,
+      sleep: async (milliseconds) => {
+        sleeps.push(milliseconds);
+        now += milliseconds;
+      },
+    });
+
+    await client.getAuthorizedUser();
+    await client.getAuthorizedUser();
+    expect(sleeps).toEqual([2000]);
+  });
+
   it("retries transient GET failures with bounded exponential delay", async () => {
     let calls = 0;
     const sleeps: number[] = [];

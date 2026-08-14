@@ -196,9 +196,18 @@ function retryAfterMilliseconds(header: string | null, now: number): number | nu
   return Number.isFinite(date) ? Math.max(0, date - now) : null;
 }
 
+/** An ABSENT header is not a value. `Number(null)` is 0, so testing finiteness alone reads a header
+ *  the response never carried as a real zero — which is how a missing quota header became "quota
+ *  exhausted" below. Both helpers check for absence explicitly. */
+function headerNumber(header: string | null): number | null {
+  if (header === null || header.trim() === "") return null;
+  const value = Number(header);
+  return Number.isFinite(value) ? value : null;
+}
+
 function resetMilliseconds(header: string | null, now: number): number | null {
-  const seconds = Number(header);
-  if (!Number.isFinite(seconds) || seconds < 0) return null;
+  const seconds = headerNumber(header);
+  if (seconds === null || seconds < 0) return null;
   return Math.max(0, seconds * 1000 - now);
 }
 
@@ -249,7 +258,10 @@ export class ClickUpClient {
   }
 
   private observeRateLimit(response: Response): void {
-    const remaining = Number(response.headers.get("X-RateLimit-Remaining"));
+    // A response that carries `X-RateLimit-Reset` but NOT `X-RateLimit-Remaining` — a CDN error page,
+    // or an endpoint whose header set differs — used to read as remaining === 0 via `Number(null)`,
+    // parking `blockedUntilMs` and stalling every request on this client with no rate limit in force.
+    const remaining = headerNumber(response.headers.get("X-RateLimit-Remaining"));
     const resetDelay = resetMilliseconds(response.headers.get("X-RateLimit-Reset"), this.now());
     if (remaining === 0 && resetDelay !== null && resetDelay > 0) {
       this.blockedUntilMs = Math.max(this.blockedUntilMs, this.now() + resetDelay);
