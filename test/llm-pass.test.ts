@@ -129,8 +129,9 @@ describe("quiet vs failed-before-the-first-call — a distinction the first draf
 });
 
 describe("the pass always settles", () => {
-  it("writes the row when the callback THROWS, and re-throws", async () => {
-    // The happy path never exercises the `finally`. Review asked for this branch explicitly.
+  it("writes the row when the callback THROWS after a call, and re-throws", async () => {
+    // The happy path never exercises the `finally`. Review asked for this branch explicitly — and then
+    // for the NAME to be honest: a throw before the first call is a different case, below.
     const { rows, db } = captureRuns();
     await expect(
       withLlmPass({ db: db as never, teamId: "t", task: "timeline-summary" }, async (pass) => {
@@ -246,5 +247,56 @@ describe("the REAL integration — `record: pass` must reach the accumulator, no
       // No brand ⇒ per-call branch ⇒ a row now.
       expect(rows).toHaveLength(1);
     });
+  });
+});
+
+describe("a throw BEFORE the first call is evidence, not absence", () => {
+  it("records ok:false with calls:0 when the body throws having called nothing", async () => {
+    // Review found `try/finally` alone could not tell this from a QUIET pass — both hit
+    // `calls === 0 && failures === 0` and wrote nothing, leaving `llm` (no staleness clock, ages to
+    // `unknown` at 14d) silent forever. Only the one branch that marks itself explicitly was covered.
+    const { rows, db } = captureRuns();
+    await expect(
+      withLlmPass({ db: db as never, teamId: "t", task: "timeline-summary" }, async () => {
+        throw new Error("prompt construction blew up");
+      })
+    ).rejects.toThrow("prompt construction blew up");
+    expect(rows).toHaveLength(1);
+    expect(rows[0].ok).toBe(false);
+    expect((metaOf(rows[0]) as { calls: number }).calls).toBe(0);
+    expect(errorsOf(rows[0])[0]).toContain("prompt construction blew up");
+  });
+});
+
+describe("a PARTIAL failure keeps its error text", () => {
+  it("carries firstError in meta even on an ok pass", async () => {
+    // `errors` must stay empty on an ok pass or `recordIngestRun` flips it to failed — so without
+    // this, a 39-of-40 pass recorded its counts and dropped what actually went wrong, for what the
+    // timeline site itself calls "the common outcome of a flaky or rate-limited provider".
+    const { rows, db } = captureRuns();
+    await withLlmPass({ db: db as never, teamId: "t", task: "timeline-summary" }, async (pass) => {
+      call(pass, true);
+      for (let i = 0; i < 39; i++) call(pass, false, "m", "HTTP 429 rate limited");
+    });
+    expect(rows[0].ok).toBe(true);
+    expect(errorsOf(rows[0])).toEqual([]); // must stay empty, or ok flips
+    expect((metaOf(rows[0]) as { firstError: string }).firstError).toBe("HTTP 429 rate limited");
+  });
+
+  it("records a real duration rather than a fabricated zero", async () => {
+    const { rows, db } = captureRuns();
+    await withLlmPass({ db: db as never, teamId: "t", task: "timeline-summary" }, async (pass) => {
+      call(pass, true);
+      await new Promise((r) => setTimeout(r, 12));
+    });
+    expect(Number(rows[0].duration_ms)).toBeGreaterThan(0);
+  });
+
+  it("writes a null model rather than an empty string when none was seen", async () => {
+    const { rows, db } = captureRuns();
+    await withLlmPass({ db: db as never, teamId: "t", task: "timeline-summary" }, async (pass) => {
+      failLlmPassBeforeFirstCall(pass, "no keys");
+    });
+    expect((metaOf(rows[0]) as { model: string | null }).model).toBeNull();
   });
 });

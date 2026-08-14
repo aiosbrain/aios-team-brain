@@ -1,7 +1,7 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { visibleTasks, visibleItems } from "@/lib/auth/visibility";
-import { completeTextOrNull } from "@/lib/llm/complete";
+import { completeTextOrNull, withLlmPass, type LlmPass } from "@/lib/llm/complete";
 import { resolveAnsweringKeys } from "@/lib/query/answering";
 import { llmConfigured } from "./timeline-summary";
 import { resolveItemCreditIds } from "@/lib/attribution/contributor-credit";
@@ -107,6 +107,19 @@ export async function runDocTaskInference(
   /** `maxDocs` overrides the batch cap — for tests that need to prove multi-batch behaviour without
    *  seeding `MAX_DOCS` documents. */
   opts: { maxDocs?: number } = {}
+): Promise<InferRunResult> {
+  // ONE `source='llm'` row per tick, whatever the worker count (LLMOBS-2). See the note at the model
+  // call for why per-call recording was wrong here: `MAX_DOCS = 40` bounds docs, not workers.
+  return withLlmPass({ db, teamId, task: "doc-task-infer" }, (pass) =>
+    runDocTaskInferenceWithPass(db, teamId, opts, pass)
+  );
+}
+
+async function runDocTaskInferenceWithPass(
+  db: DbClient,
+  teamId: string,
+  opts: { maxDocs?: number },
+  pass: LlmPass
 ): Promise<InferRunResult> {
   const startedAt = Date.now();
   const batchCap = opts.maxDocs ?? MAX_DOCS;
@@ -287,16 +300,19 @@ export async function runDocTaskInference(
           // Reuse the timeline's ledger slice rather than widening the closed `LlmUsageSource` union —
           // same call the arcs coherence pass makes by reusing "arcs".
           meter: { db, teamId, source: "timeline-summary" },
-          // A PER-CALL record, deliberately NOT a pass (LLMOBS-2). This site was listed as a fan-out
-          // in the first draft, copied from a stale exemption reason; the code two hundred lines up
-          // says in capitals that it is ONE CALL PER WORKER — "2-3 in practice, not the doc count" —
-          // behind a 12h cooldown, so it cannot flood anything and a pass would be a row per call
-          // anyway. Review caught the stale premise; the slice shrank.
+          // A PASS, not a per-call record — and the reasoning took two review rounds to get right.
+          // The first draft called this a fan-out "one call per scored doc", copied from a stale
+          // exemption reason; that is false, and the comment above says so in capitals (ONE CALL PER
+          // WORKER, "2-3 in practice"). So the second draft made it per-call. Review then showed the
+          // CONCLUSION was still wrong for a different reason: `MAX_DOCS = 40` bounds DOCS, not
+          // workers, so 40 pending docs from 40 distinct members is 40 calls — 40 rows per run, which
+          // is precisely the flood a pass exists to prevent. "2-3 in practice" is an observation, not
+          // a bound, and a ledger cannot be protected by a typical case.
           //
           // `doc-task-infer` (hyphenated) is a `meta.task` inside `source='llm'`, and is NOT the
           // `source='doc_task_infer'` row this function already writes for its own leg. Different
           // ledgers, different questions: "did this leg run" vs "is the model producing output".
-          record: { db, teamId, task: "doc-task-infer" },
+          record: pass,
         }
       );
       if (!raw) {

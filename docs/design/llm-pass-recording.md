@@ -49,6 +49,12 @@ argument STRONGER: `completeText` meters an empty-output failure into `llm_usage
 `llm_usage` rows are ATTEMPTS, not successes, and carry no ok flag. The empty-output rate is therefore
 invisible in **both** ledgers, not merely absent from one.
 
+**One caveat on the 1,279, which review supplied:** `llm_usage`'s `source: "timeline-summary"` is
+SHARED with doc-task-infer's meter (`doc-task-infer-run.ts:287`, reusing the slice rather than widening
+a closed union), so that figure over-counts timeline proper. Nothing here is derived from it — it is
+cited only to show the ledger cannot answer the question — but a number quoted without its caveat is
+how a wrong band gets built later.
+
 What the 0 rows DO measure honestly: the transport class. Timeouts and non-2xx from this path do file
 to `llm_failures` (`complete.ts:343-353`; timeline-summary passes `meter:` at `timeline-summary.ts:111`),
 so zero in 60 days is a real near-zero transport-failure reading — and irrelevant to the mode that

@@ -101,17 +101,18 @@ export interface CompleteOptions {
  * A PASS — one `ingest_runs` row covering N calls (LLMOBS-2).
  *
  * WHY IT EXISTS. `recordLlmOutcome` writes one row per call, and `attachPersonDaySummaries` calls the
- * model once per (person, day) on every rebuild: 37.9 calls/day measured, against a whole-table rate
+ * model once per (person, day) on every rebuild: 39.5 calls/day measured over 14d (21.3/day over 60d), against a whole-table rate
  * of 333.7 rows/day and a 50-row Recent-runs panel. Wiring a per-call `record:` there would bury
  * connector evidence within a day and a half, which is why LLMOBS-1 deferred it — leaving the leg's
  * FOUNDING failure mode open for its highest-volume feature: a model failing every timeline summary
  * reads `healthy`, because `completeTextOrNull` swallows the failure and nothing records it.
  *
- * BRANDED, and the brand is load-bearing. This is handed to `completeText` in the same `record:` slot
- * as a per-call record, and a plain `{ db, teamId, task }`-shaped token would be structurally
- * assignable to that member — TypeScript would not force a discriminant, and a wrong branch below
- * would silently restore the per-call flood with the coverage guard still green (it matches
- * `record: pass` either way). The unique symbol makes the union discriminated at compile time.
+ * BRANDED — and the brand's job is narrower than an earlier version of this comment claimed. It makes
+ * the union DISCRIMINATED for narrowing, so `isPass` keys on something a caller cannot produce by
+ * accident. It does NOT prevent the flood: `LlmPass` carries `db`/`teamId`/`task`, so it remains
+ * structurally assignable to the per-call member, and deleting the `isPass` early-return below still
+ * compiles. Review corrected the overstatement. The actual pin against that mutation is the runtime
+ * integration test ("a PASS accumulates and writes nothing per call"), not the type system.
  */
 const PASS_BRAND: unique symbol = Symbol("llm-pass");
 
@@ -126,6 +127,8 @@ export interface LlmPass {
    *  that introduces an await here knows what it is breaking. */
   calls: number;
   failures: number;
+  /** The real wall-clock start, so the row's `duration_ms` reflects the pass rather than 0. */
+  readonly startedAt: number;
   /** The backend model, captured from the first call. Stable within a pass (`selectLlmBackend` is
    *  deterministic per keys/role), and REQUIRED by the health card: `deriveTaskHealth` reads
    *  `meta.model` and `degradedNote` names it. A row without it drops the model name and the
@@ -140,6 +143,10 @@ export interface LlmPass {
 export type LlmRecord = { db: DbClient; teamId: string; task: string } | LlmPass;
 
 function isPass(record: LlmRecord): record is LlmPass {
+  // `in` throws a TypeError on a truthy PRIMITIVE, and this function sits behind a "never throws"
+  // contract — a JS or `any` caller passing `record: "x"` would otherwise let observability break the
+  // generation it is observing. Review found the contract overpromised.
+  if (typeof record !== "object" || record === null) return false;
   // Narrow on the BRAND, not on duck-typed fields. Checking `calls`/`done` would send a token down
   // the per-call branch the moment either is renamed — silently restoring the flood. The symbol is a
   // real runtime value (a `declare const` would be type-only and `[PASS_BRAND]` would be `undefined`,
@@ -168,12 +175,22 @@ export async function withLlmPass<T>(
     task: init.task,
     calls: 0,
     failures: 0,
+    startedAt: Date.now(),
     model: null,
     firstError: null,
     done: false,
   } as unknown as LlmPass;
   try {
     return await body(pass);
+  } catch (err) {
+    // A throw BEFORE the first call would otherwise be indistinguishable from a quiet pass — both hit
+    // `calls === 0 && failures === 0` and write nothing, leaving `llm` (which has no staleness clock)
+    // silent forever. That is the exact class §2c calls "evidence, not absence", and the first version
+    // covered only the one branch that marks itself explicitly. Review found the rest.
+    if (pass.calls === 0) {
+      failLlmPassBeforeFirstCall(pass, err instanceof Error ? err.message : "the pass threw before its first call");
+    }
+    throw err;
   } finally {
     await finishLlmPass(pass);
   }
@@ -207,9 +224,23 @@ export async function finishLlmPass(pass: LlmPass): Promise<void> {
     source: "llm",
     trigger: "api",
     ok,
+    // `errors` must stay EMPTY on an ok pass: `recordIngestRun` forces `ok: run.ok && !errors.length`,
+    // so putting the error there would silently flip a mostly-successful pass to failed.
     errors: ok ? [] : [pass.firstError ?? "every call in the pass failed"],
-    meta: { task: pass.task, model: pass.model ?? "", calls: pass.calls, failures: pass.failures },
-    startedAt: Date.now(),
+    meta: {
+      task: pass.task,
+      // `null`, not `""` — an empty string is a value that survives `??` downstream and would hand the
+      // card `lastModel: ""` where every other path yields a name or null (review).
+      model: pass.model,
+      calls: pass.calls,
+      failures: pass.failures,
+      // UNCONDITIONALLY, including on an ok pass. Otherwise a 39-of-40-failures pass records its
+      // counts and drops the error text entirely — nowhere in `errors` (see above) and nowhere in
+      // meta — for what the timeline site itself calls "the common outcome of a flaky or rate-limited
+      // provider". The counts say how many; this says what happened.
+      firstError: pass.firstError,
+    },
+    startedAt: pass.startedAt,
   });
 }
 

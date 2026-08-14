@@ -89,7 +89,7 @@ export async function attachPersonDaySummaries(
   days: TimelineDay[]
 ): Promise<SummaryPassResult> {
   // ONE ROW PER PASS, not per call (LLMOBS-2). This fans out to a model call per (person, day) —
-  // measured 37.9/day — so a per-call `record:` would make the 50-row Recent-runs panel mostly
+  // measured 39.5/day over 14d — so a per-call `record:` would make the 50-row Recent-runs panel mostly
   // timeline summaries within a day and a half. The pass accumulates and writes once at the end.
   return withLlmPass({ db, teamId, task: "timeline-summary" }, (pass) =>
     summarizeWithPass(db, teamId, days, pass)
