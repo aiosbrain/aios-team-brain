@@ -87,6 +87,9 @@ function timestampMs(value: unknown): number | null {
   if (typeof value !== "string" && typeof value !== "number") return null;
   if (typeof value === "string" && value.trim() === "") return null;
   const numeric = Number(value);
+  // ClickUp writes 0 (and "0") for an UNSET date, not for the Unix epoch. Reading it literally dated
+  // closed tasks to 1970-01-01 — a real work-time in the timeline's eyes, and a due date in 1970.
+  if (numeric === 0) return null;
   if (Number.isFinite(numeric)) return inDateRange(numeric);
   const parsed = Date.parse(String(value));
   return Number.isFinite(parsed) ? inDateRange(parsed) : null;
@@ -103,9 +106,19 @@ function isoTimestamp(value: unknown): string {
   return milliseconds === null ? "" : isoFromMilliseconds(milliseconds);
 }
 
-/** Row fields are bounded by a STRICT parser; truncating keeps one long field from 422-ing the batch. */
+/**
+ * Row fields are bounded by a STRICT parser; truncating keeps one long field from 422-ing the batch.
+ *
+ * `slice` cuts UTF-16 CODE UNITS, so a boundary landing mid-surrogate leaves a lone half that the
+ * UTF-8 round-trip into Postgres turns into U+FFFD. An emoji in a long ClickUp task name is enough.
+ * Dropping the orphan costs one character and keeps the text valid.
+ */
 function capped(value: string, max: number): string {
-  return value.length > max ? value.slice(0, max) : value;
+  if (value.length <= max) return value;
+  const cut = value.slice(0, max);
+  const last = cut.charCodeAt(max - 1);
+  const isHighSurrogate = last >= 0xd800 && last <= 0xdbff;
+  return isHighSurrogate ? cut.slice(0, -1) : cut;
 }
 
 /** A completion/closure transition is work time; a generic ClickUp updated timestamp is not. */
@@ -366,7 +379,9 @@ function docSourceTimestamp(doc: ClickUpDoc, pages: PageAtDepth[]): string {
   const values = [doc.date_updated, ...pages.flatMap(({ page }) => [page.date_edited, page.date_updated])]
     .map(timestampMs)
     .filter((value): value is number => value !== null);
-  return values.length > 0 ? new Date(Math.max(...values)).toISOString() : "";
+  // `reduce`, not `Math.max(...values)`: a Doc's page array is unbounded and spreading it as arguments
+  // blows the stack on a large enough tree.
+  return values.length > 0 ? isoFromMilliseconds(values.reduce((a, b) => (b > a ? b : a))) : "";
 }
 
 /** One configured ClickUp Doc becomes one stable, read-only transcript item. */

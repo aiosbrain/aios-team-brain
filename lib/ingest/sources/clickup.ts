@@ -215,10 +215,14 @@ function isRetriableStatus(status: number): boolean {
   return status === 408 || status === 425 || status === 429 || [500, 502, 503, 504].includes(status);
 }
 
+/** "Latest wins" for TIML dedupe. Mirrors `timestampMs` in clickup-normalize: a value ClickUp uses
+ *  for UNSET (0) or one outside the Date range is NOT a recency signal, and the two must agree or the
+ *  client and the normalizer pick different winners for the same duplicated task. */
 function numericTimestamp(value: unknown): number {
   if (typeof value !== "string" && typeof value !== "number") return Number.NEGATIVE_INFINITY;
   const direct = Number(value);
-  if (Number.isFinite(direct)) return direct;
+  if (direct === 0) return Number.NEGATIVE_INFINITY;
+  if (Number.isFinite(direct)) return Math.abs(direct) <= 8.64e15 ? direct : Number.NEGATIVE_INFINITY;
   const parsed = Date.parse(String(value));
   return Number.isFinite(parsed) ? parsed : Number.NEGATIVE_INFINITY;
 }
@@ -425,7 +429,12 @@ export class ClickUpClient {
       );
       const pageDocs = arrayValue(payload.docs, "Docs page").map((doc) => {
         const value = objectValue(doc, "Doc") as unknown as ClickUpDoc;
-        idValue(value.id, "Doc");
+        // KEEP the coerced id. `ClickUpDoc.id` is typed `string` and `discoverDocs` sorts with
+        // `localeCompare`, but ClickUp returns ids as numbers too (the fixtures mix both) — discarding
+        // the return validated the id and then handed the raw number on, so two numeric Doc ids threw
+        // `TypeError: a.id.localeCompare is not a function` and took down the whole Docs read.
+        // Task ids are deliberately NOT coerced: `ClickUpTask.id` is `string | number` by contract.
+        value.id = idValue(value.id, "Doc");
         return value;
       });
       docs.push(...pageDocs);
@@ -449,7 +458,7 @@ export class ClickUpClient {
       await this.requestJson<unknown>(`/api/v3/workspaces/${workspace}/docs/${doc}`),
       "Doc"
     ) as unknown as ClickUpDoc;
-    idValue(value.id, "Doc");
+    value.id = idValue(value.id, "Doc");
     return value;
   }
 
@@ -462,7 +471,7 @@ export class ClickUpClient {
       "Doc pages"
     ).map((page) => {
       const value = objectValue(page, "Doc page") as unknown as ClickUpDocPage;
-      idValue(value.id, "Doc page");
+      value.id = idValue(value.id, "Doc page");
       return value;
     });
   }

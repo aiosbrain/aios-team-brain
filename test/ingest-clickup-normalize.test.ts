@@ -225,6 +225,34 @@ describe("ClickUp task normalization", () => {
     expect((payload.rows as Array<Record<string, unknown>>)[0].worked_at).toBe("");
   });
 
+  it("reads ClickUp's 0 as an unset date, not as the Unix epoch", () => {
+    // ClickUp writes 0 for "no date". Taken literally it dated closed tasks to 1970-01-01 — which the
+    // timeline reads as a real work-time — and put `due` in 1970.
+    expect(clickUpWorkedAt({ id: "unset", date_done: 0, date_closed: "0" })).toBe("");
+    const record: ClickUpTaskRecord = {
+      task: { ...records[0].task, date_done: 0, due_date: 0 },
+      observedListIds: ["101"],
+    };
+    const payload = normalizeClickUpTasks({ workspaceId: 9001, records: [record], statusMaps: { "101": list101Map } });
+    const row = (payload.rows as Array<Record<string, unknown>>)[0];
+    expect(row.worked_at).toBe("");
+    expect(row.due).toBeNull();
+  });
+
+  it("never truncates a title onto a lone surrogate half", () => {
+    // `slice` cuts UTF-16 units, so an emoji straddling the bound leaves an orphan that the UTF-8
+    // round-trip into Postgres replaces with U+FFFD.
+    const record: ClickUpTaskRecord = {
+      task: { ...records[0].task, name: `${"n".repeat(1999)}😀${"n".repeat(100)}` },
+      observedListIds: ["101"],
+    };
+    const payload = normalizeClickUpTasks({ workspaceId: 9001, records: [record], statusMaps: { "101": list101Map } });
+    const title = (payload.rows as Array<Record<string, unknown>>)[0].title as string;
+    expect(title.length).toBeLessThanOrEqual(2000);
+    expect(Buffer.from(title, "utf8").toString("utf8")).toBe(title);
+    expect(/[\ud800-\udbff]$/.test(title)).toBe(false);
+  });
+
   it("names the status and the Lists consulted when a native status is unmapped", () => {
     // Fail-closed is deliberate, but the blast radius is the whole workspace — so the message has to
     // carry enough to act on, or "all ClickUp tasks stopped importing" has nothing in it to fix.
@@ -287,6 +315,20 @@ describe("ClickUp Doc normalization", () => {
     expect(payload.body).toContain("## Decisions");
     expect(payload.body).not.toContain("### Decisions");
     expect(payload.body).not.toContain("Agenda");
+  });
+
+  it("survives an out-of-range page timestamp instead of aborting the Doc batch", () => {
+    // NOT a regression test — it passes with or without routing `docSourceTimestamp` through
+    // `isoFromMilliseconds`, because `timestampMs` already rejects out-of-range values upstream. It
+    // pins the OUTCOME so the guarantee survives a future caller that reaches the helper another way;
+    // the routing itself restores the invariant asserted on `isoFromMilliseconds`, which was false.
+    const pages = structuredClone(docAlphaPages) as ClickUpDocPage[];
+    pages[0].date_edited = "1786000600000000000";
+    pages[0].date_updated = "1786000600000000000";
+    const payload = normalizeClickUpDoc(9001, { doc: docAlpha as ClickUpDoc, pages });
+    expect(() => itemPayloadSchema.parse(payload)).not.toThrow();
+    // The surviving in-range page edits still set the timestamp.
+    expect(payload.frontmatter.source_ts).toBe(new Date(1786000300000).toISOString());
   });
 
   it("updates the same stable item when a page body changes", () => {

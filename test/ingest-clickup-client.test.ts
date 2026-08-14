@@ -94,6 +94,21 @@ describe("ClickUpClient Docs reads", () => {
     expect(calls[2].searchParams.get("content_format")).toBe("text/md");
   });
 
+  it("coerces numeric Doc ids so discovery can sort them", async () => {
+    // `idValue` coerces, but its return was discarded — so a numeric Doc id reached
+    // `a.id.localeCompare(b.id)` and threw TypeError, taking down the entire Docs read.
+    const transport: ClickUpTransport = async (input) => {
+      const url = new URL(input);
+      if (url.pathname.endsWith("/docs")) {
+        return jsonResponse({ docs: [{ id: 22, name: "Twenty-two" }, { id: 11, name: "Eleven" }] });
+      }
+      throw new Error(`unexpected request ${url.pathname}`);
+    };
+    const client = new ClickUpClient({ token: "test-clickup-token", transport });
+    const docs = await client.discoverDocs(9001, { parent: { type: "LIST", id: "101" } });
+    expect(docs.map((doc) => doc.id)).toEqual(["11", "22"]);
+  });
+
   it("fails closed on a repeated Docs cursor", async () => {
     const transport: ClickUpTransport = async () => jsonResponse({ docs: [], next_cursor: "same" });
     const client = new ClickUpClient({ token: "test-clickup-token", transport, maxPages: 5 });
