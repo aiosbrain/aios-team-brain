@@ -57,6 +57,47 @@ function callSites(): { file: string; src: string }[] {
     .filter(({ file, src }) => file !== "lib/llm/complete.ts" && /\bcompleteText(OrNull)?\s*\(/.test(src));
 }
 
+/**
+ * THE CALL SITES, pinned — added because two mutations SURVIVED the first version of this slice's
+ * tests, and they were the two that mattered most:
+ *
+ *   • giving both meetings passes ONE task string (the blocker both spec reviewers found) — every
+ *     test stayed green, because the unit tests exercise the DERIVATION with hand-built runs and the
+ *     data-mechanics test seeds `ingest_runs` directly. Neither goes through the wrapper.
+ *   • deleting `record:` from the meetings wrapper entirely — also green, for the same reason. The
+ *     spec's own criterion said to enter at a PRODUCTION path and the first draft of the dm test did
+ *     not.
+ *
+ * A derivation is perfectly correct in isolation while nothing wires it — this repo's "pin the call
+ * site, not the function" rule, learned the same way.
+ */
+describe("guard: the meetings passes record, under DISTINCT task names", () => {
+  const wrapper = readFileSync(path.join(ROOT, "lib", "meetings", "llm-extract.ts"), "utf8");
+  const actions = readFileSync(path.join(ROOT, "lib", "meetings", "action-items.ts"), "utf8");
+
+  it("the shared wrapper derives `record` from the meter it already receives", () => {
+    // `meter` bills to llm_usage; `record` files the OUTCOME the health leg reads. Only `meter` was
+    // wired for years, which is why the leg had never observed a meeting summary.
+    expect(wrapper).toMatch(/record:\s*meter && task \? \{ db: meter\.db, teamId: meter\.teamId, task \}/);
+  });
+
+  it("the summary pass and the action-items pass use DIFFERENT task strings", () => {
+    const summaryTask = /callMeetingsLLM\([\s\S]*?,\s*"([a-z-]+)"\s*\)/.exec(wrapper)?.[1];
+    const actionsTask = /callMeetingsLLM\([\s\S]*?,\s*"([a-z-]+)"\s*\)/.exec(actions)?.[1];
+    expect(summaryTask, "the summary pass passes no task string").toBeTruthy();
+    expect(actionsTask, "the action-items pass passes no task string").toBeTruthy();
+    // THE REGRESSION: they run back-to-back on every trigger with action items LAST, so one shared
+    // name makes the later success mask the earlier failure — the leg reads healthy while every
+    // meeting summary is blank.
+    expect(
+      summaryTask,
+      "both meetings passes share a task string; the action-items success will mask a summary failure"
+    ).not.toBe(actionsTask);
+    expect(summaryTask).toBe("meeting-summary");
+    expect(actionsTask).toBe("meeting-actions");
+  });
+});
+
 describe("guard: every generation call site records its outcome, or is listed", () => {
   it("finds call sites at all — a guard that matches nothing proves nothing", () => {
     const sites = callSites();
