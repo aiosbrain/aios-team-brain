@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { taskLabel } from "@/lib/query/llm-health";
+import { LLM_TASK_NAMES } from "@/lib/query/llm-task";
 
 /**
  * The Pulse generation-health banner (LLMOBS-1 §3f).
@@ -44,32 +45,46 @@ describe("guard: the reason is specific — feature, model, error", () => {
 
   it("names features through a label map, never a raw slug", () => {
     expect(SRC).toMatch(/labelOf\(t\.task\)/);
-    // A bare slug in the RENDERED markup is the defect — but `key={t.task}` is a legitimate React key
-    // and the first version of this assertion reddened correct code for it. So: every `{t.task}` must
-    // be a `key=`, which is the property actually meant.
-    for (const m of SRC.matchAll(/(.{6})\{t\.task\}/g)) {
+    // A bare slug in the RENDERED MARKUP is the defect. Scoped to the JSX region (from the component's
+    // `return (` onward) because non-render uses are legitimate and kept tripping earlier versions of
+    // this assertion: `key={t.task}` is a React key, and the dismissal signature builds `${t.task}:…`
+    // in a template literal above the return. Twice now this guard has reddened correct code by
+    // pinning a shape instead of the property, which is its own small lesson.
+    const jsx = SRC.slice(SRC.indexOf("  return ("));
+    for (const m of jsx.matchAll(/(.{6})\{t\.task\}/g)) {
       expect(m[1], `a raw task slug is rendered here: ...${m[0]}`).toContain("key=");
     }
   });
 
-  it("its label map cannot drift from the server's — same slugs, same copy", () => {
+  it("its label map cannot drift from the server's — every KNOWN task, same copy", () => {
     // The component duplicates the map deliberately (importing `llm-health` would drag a server-only
     // module into a client component). Duplication is only safe if something pins them together.
-    for (const slug of [
-      "arcs",
-      "arc-coherence",
-      "meeting-summary",
-      "meeting-actions",
-      "meeting-merge",
-      "attribution",
-    ]) {
+    //
+    // Derived from `LLM_TASK_NAMES`, NOT a hard-coded list: review found the first version enumerated
+    // its own six slugs, so a seventh task added to the union and the server map — but forgotten in
+    // the client map — stayed green and rendered a raw slug on Pulse. A guard with its own copy of the
+    // vocabulary is a second source of truth, which is the thing it was meant to prevent.
+    //
+    // Scoped to the LABELS object too: asserting the phrase appears ANYWHERE in the file let a
+    // comment containing it mask a drifted entry.
+    const labels = SRC.slice(SRC.indexOf("const LABELS"));
+    const block = labels.slice(0, labels.indexOf("};") + 2);
+    for (const slug of LLM_TASK_NAMES) {
       const server = taskLabel(slug);
-      expect(SRC, `the banner is missing copy for \`${slug}\``).toContain(`"${server}"`);
+      expect(block, `the banner's LABELS is missing copy for \`${slug}\``).toContain(`"${server}"`);
     }
   });
 
   it("reuses the failing-set dismissal contract, so a NEW failure re-shows a dismissed banner", () => {
-    expect(SRC).toMatch(/const signature = failing[\s\S]{0,120}\.join\(","\)/);
+    // The signature must carry the ERROR, not just the failing set — that is the contract
+    // `lib/ingest/pipeline-alert.alertSignature` states ("an error message changes → the alert
+    // re-appears"), and the first version keyed on task names alone while its comment claimed to
+    // mirror it. Assert the ingredients rather than the exact expression, so a reformat does not
+    // redden correct code.
+    const sig = SRC.slice(SRC.indexOf("const signature = failing"));
+    const expr = sig.slice(0, sig.indexOf(".join("));
+    expect(expr).toContain("t.task");
+    expect(expr).toContain("t.lastError");
     expect(SRC).toContain("localStorage.getItem(storageKey) === signature");
   });
 });

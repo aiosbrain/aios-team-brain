@@ -16,9 +16,17 @@ import { getLlmHealth } from "@/lib/query/llm-health";
  *   • the `finished_at desc, id desc` tie-break, for two runs in the same millisecond;
  *   • team scoping, which must survive the rewrite.
  *
- * The FIRST test is the headline: it enters through the real meetings path rather than the extraction
- * helper, because a test entering at the helper passes for a builder who threads `record` only where
- * the test passes it — leaving every production caller unobserved, which is the bug itself.
+ * WHAT THIS FILE DOES NOT DO, stated because an earlier version of this comment claimed otherwise.
+ * Every test here seeds `ingest_runs` DIRECTLY via `recordIngestRun`; none routes through
+ * `callMeetingsLLM → completeTextOrNull → recordLlmOutcome`. The comment used to say the first test
+ * "enters through the real meetings path", which was aspiration written after a mutation lesson, not
+ * fact — the commit-claims-vs-file-state failure this repo has a rule about, and review caught it.
+ *
+ * So the production wiring is pinned by `test/guards/llm-record-coverage`'s call-site assertions
+ * (which DID kill the two mutations that survived: sharing a task string, and dropping `record:`),
+ * and that is weaker evidence than an end-to-end path would be. Routing one test through the wrapper
+ * needs a stubbed model backend in this tier, which does not exist yet; it is named in the PR as the
+ * honest gap rather than described as covered.
  */
 
 const MIN = 60 * 1000;

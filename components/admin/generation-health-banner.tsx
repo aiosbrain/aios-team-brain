@@ -27,13 +27,17 @@ import type { LlmHealth } from "@/lib/query/llm-health";
  */
 export function GenerationHealthBanner({ health, href }: { health: LlmHealth; href: string }) {
   const failing = health.tasks.filter((t) => t.state === "degraded");
-  // The dismissal signature is the FAILING SET, mirroring the pipeline banner's contract: dismissing
-  // hides this exact failure, and a newly-failing task re-shows it. You cannot permanently hide a
-  // broken thing — only the thing you actually looked at.
+  // The dismissal signature mirrors `lib/ingest/pipeline-alert.alertSignature` — task, model AND
+  // error, not just the failing set. The first version keyed on task names alone while its comment
+  // claimed to mirror that contract, which was a weaker promise than it stated: dismissing an
+  // empty-output failure on `arcs` then kept the banner hidden when `arcs` later failed on a DIFFERENT
+  // model with a quota error, so the new actionable reason never re-showed. Both reviewers caught the
+  // gap between the comment and the code. You can ack the problem you have seen; you cannot blind
+  // yourself to a new one.
   const signature = failing
-    .map((t) => t.task)
+    .map((t) => `${t.task}:${t.model ?? ""}:${(t.lastError ?? "").trim()}`)
     .sort()
-    .join(",");
+    .join("|");
   const storageKey = `generation-alert-dismissed:${href.split("#")[0]}`;
   const [state, setState] = useState<{ hydrated: boolean; dismissed: boolean }>({
     hydrated: false,

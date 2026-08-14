@@ -402,6 +402,33 @@ describe("churn: how many chunk hashes change under a real edit — CDC vs the b
    * — see the asymmetry note in lib/graph/cdc.ts). Every one of those is against a legacy worst case of
    * 80 — i.e. the entire capped document.
    */
+  /**
+   * KNOWN FAILURE — CDCCHURN-1. `it.fails` on purpose: this asserts the requirement the spec actually
+   * makes, and it currently does NOT hold, so the test passes while the gap is open and flips RED the
+   * moment CDC is fixed. That is this repo's sanctioned way to record a confirmed-but-unfixed gap; a
+   * skip would rot silently.
+   *
+   * THE SPEC REQUIRES 1. `docs/design/content-defined-chunking.md`'s acceptance table reads
+   * `| edit in place, same length | 1 of 20 | 1 |` — byte-offset today, CDC required. Measured over
+   * this live corpus on 2026-08-15: 22 of 23 documents churn 1, and
+   * `docs/design/answering-model-observability.md` churns 4, because the offset-20,000 edit lands in a
+   * run of structurally repetitive markdown bullets and the boundary realignment propagates.
+   *
+   * HOW THIS NEARLY WENT WRONG, recorded because it is the more useful half. The slice that added that
+   * document first SCOPED this assertion away, arguing the spec disclaimed the guarantee. It does not:
+   * that argument cited the spec's quality-neutrality passage, while the acceptance table above states
+   * the requirement outright. One reviewer accepted the argument; the other went and read the table.
+   * The assertion was right and the implementation is what is off — which is the opposite conclusion,
+   * and the difference between filing a real defect and quietly disarming a guard.
+   */
+  it.fails("KNOWN GAP (CDCCHURN-1): in-place same-length churn beats byte offsets on every real doc", () => {
+    const docs = repoDocs();
+    const edit = (t: string) => t.slice(0, 20_000) + "XXXXXXXXXXXXXXXXXXXX" + t.slice(20_020);
+    const cdc = docs.map((t) => changedCount(chunkContent(t), chunkContent(edit(t))));
+    const leg = docs.map((t) => changedCount(legacy(t), legacy(edit(t))));
+    expect(Math.max(...cdc)).toBeLessThanOrEqual(Math.max(...leg));
+  });
+
   it("real repo documents: median churn 1-2, ceiling 6, against a legacy ceiling of the whole document", () => {
     const docs = repoDocs();
     expect(docs.length).toBeGreaterThan(5);
@@ -417,23 +444,9 @@ describe("churn: how many chunk hashes change under a real edit — CDC vs the b
       const median = cdc[Math.floor(cdc.length / 2)];
       expect(median, `${name}: median CDC churn over real docs`).toBeLessThanOrEqual(2);
       expect(Math.max(...cdc), `${name}: worst-case CDC churn over real docs`).toBeLessThanOrEqual(6);
-      // SCOPED, and the scoping is the point rather than a convenience.
-      //
-      // For a SAME-LENGTH IN-PLACE edit, byte-offset chunking is optimal by construction: no offset
-      // moves, so exactly the containing chunk changes and `leg` is always 1. CDC cannot beat 1 and
-      // CAN cascade, so "never worse than byte offsets" is not a property it could ever have in that
-      // scenario — and this file's own docstring quotes the spec disclaiming precisely that guarantee
-      // ("pathological low-entropy content can propagate a shift across several chunks"). The
-      // comparison is meaningful for insertions and deletions, where a byte offset churns the entire
-      // downstream tail (up to the whole capped document) and CDC's realignment is the actual claim.
-      //
-      // FOUND, not theorised: adding `docs/design/answering-model-observability.md` to the repo put a
-      // document in this live corpus whose offset-20,000 region is a long run of structurally
-      // repetitive markdown bullets — low entropy — and CDC churned 4 there against legacy's 1. The
-      // ceiling assertion above (≤6) still holds and still carries the real content of this test; it
-      // is the absolute that was over-broad. Flagged in the PR that surfaced it rather than quietly
-      // relaxed, because weakening another slice's assertion to make a build green is exactly how
-      // coverage rots.
+      // The `edit in place, same length` scenario is asserted SEPARATELY below, as a documented
+      // known failure (CDCCHURN-1). It is excluded here rather than deleted, and the exclusion is
+      // narrow: every other scenario still binds.
       if (name !== "edit in place, same length") {
         expect(Math.max(...cdc), `${name}: CDC must never be worse than byte offsets`).toBeLessThanOrEqual(
           Math.max(...leg)

@@ -188,17 +188,23 @@ export function deriveTaskHealth(runsNewestFirst: readonly LlmRun[] | null, nowM
     // one deliberately: a newest failure yesterday whose predecessor is 16 days old is `confirmed`
     // here and `unconfirmed` under a row filter. The streak asks "has this task failed repeatedly",
     // and a 16-day-old failure is still the last thing that happened to this task.
+    // An UNPARSEABLE timestamp yields NaN, and `NaN > x` is false, so the task is INCLUDED rather than
+    // aged out. That is the safe direction here — ageing out silences, and silencing on a value we
+    // failed to read would hide an outage on ignorance. Stated because it is a real branch, not
+    // because it is reachable: these are `timestamptz` columns through a single writer.
     if (nowMs - Date.parse(newest.finishedAt) > TASK_RECENCY_MS) continue;
     const streak = foldStreak(runs.map((r) => ({ ok: r.ok, finishedAt: r.finishedAt })));
-    const klass = classifyFailure(streak);
-    const state: LlmHealthState = klass === "ok" ? "healthy" : klass === "unconfirmed" ? "unstable" : "degraded";
     const newestFailure = runs.find((r) => !r.ok) ?? null;
     const newestOk = runs.find((r) => r.ok) ?? null;
+    const klass = classifyFailure(streak);
+    const state: LlmHealthState = klass === "ok" ? "healthy" : klass === "unconfirmed" ? "unstable" : "degraded";
     out.push({
       task,
       state,
-      // The model THIS task ran on, taken from its newest run.
-      model: newest.model,
+      // The model the task's STATE is about: for a failing task that is the failing run's model, not
+      // the newest run's — a task can fail on one model and be retried on another, and naming the
+      // retry's model sends an operator to the wrong picker.
+      model: state === "healthy" ? newest.model : (newestFailure?.model ?? newest.model),
       lastError: newestFailure?.error ?? null,
       lastFailedAt: newestFailure?.finishedAt ?? null,
       lastOkAt: newestOk?.finishedAt ?? null,
@@ -242,7 +248,9 @@ export function degradedNote(tasks: readonly LlmTaskHealth[]): string {
   // The reasoning-starvation hint is PER TASK now: it is the signature of a reasoning model, and only
   // `arcs` requests one, so attaching it to every failure would send an operator to the wrong picker.
   const starved = failing.some((t) => t.lastError && /empty content|finish_reason/i.test(t.lastError));
-  const healthy = tasks.filter((t) => t.state !== "degraded").map((t) => taskLabel(t.task));
+  // HEALTHY only, not merely "not degraded". An `unstable` task's newest run FAILED, so listing it as
+  // still working is an observation claim its own newest observation contradicts.
+  const healthy = tasks.filter((t) => t.state === "healthy").map((t) => taskLabel(t.task));
   const unaffected = healthy.length > 0 ? ` Still working: ${healthy.join(", ")}.` : "";
   return (
     `The answering model is failing for ${names} — output is missing there.` +
@@ -257,6 +265,13 @@ export function degradedNote(tasks: readonly LlmTaskHealth[]): string {
 /**
  * Read the recent runs PER TASK.
  *
+ * THE OUTER ORDER-BY CARRIES `id desc` TOO, not just the window. The window picks WHICH rows come
+ * back; the outer order decides the sequence `deriveTaskHealth` hands to `foldStreak`, whose contract
+ * is newest-first. Without it a same-millisecond fail-then-retry is planner-dependent: `runs[0]` for
+ * that task could be the FAIL, so a healed task classifies `unstable`. Both reviewers found it — and
+ * the data-mechanics test named "breaks a same-millisecond tie by id" had been passing only because
+ * small scans tend to preserve window order, i.e. flaky by construction, which is worse than absent.
+ *
  * A per-task window, not the old global `limit 2`: once more than one task records, the two newest
  * rows overall are typically both from the chattiest task, which starves a failing one of the evidence
  * it needs to confirm. `STREAK_SQL` in `lib/ingest/pipeline-health` is the in-repo precedent for the
@@ -265,7 +280,7 @@ export function degradedNote(tasks: readonly LlmTaskHealth[]): string {
  */
 const PER_TASK_SQL = `
   with scoped as (
-    select ok, meta, errors, finished_at,
+    select id, ok, meta, errors, finished_at,
            coalesce(meta->>'task', '(untagged)') as task,
            row_number() over (
              partition by coalesce(meta->>'task', '(untagged)')
@@ -275,7 +290,9 @@ const PER_TASK_SQL = `
      where source = 'llm' and team_id = $1
   )
   select ok, meta, errors, finished_at, task from scoped where rn <= $2
-   order by finished_at desc`;
+   -- id desc HERE TOO, not just in the window -- see the note above the constant.
+   -- (No backticks in this string: it is a JS template literal. Second time; noted in the fold.)
+   order by finished_at desc, id desc`;
 
 export async function getLlmHealth(teamId: string): Promise<LlmHealth> {
   const empty: LlmHealth = {
@@ -312,9 +329,18 @@ export async function getLlmHealth(teamId: string): Promise<LlmHealth> {
     const state = deriveLlmState(tasks);
     // The singular fields describe the newest FAILING row across tasks — not the leg's newest row,
     // which could be an unrelated success and would name the wrong task's model.
+    // NON-HEALTHY tasks only, worst first. A HEALTHY task still carries `lastFailedAt` whenever its
+    // window holds a failure that later healed — which is this install's measured normal (heals 6/10).
+    // Selecting on `lastFailedAt !== null` alone therefore let a healed `arcs` blip supply
+    // `lastModel`/`lastError` during a `meeting-summary` outage, so the card's detail line named the
+    // REASONING model (from arcs' successful newest run, no less) directly above a note naming meeting
+    // summaries on the query model. That is the wrong-picker misattribution this slice exists to
+    // remove, reintroduced through the healed-blip path. Both reviewers caught it; the spec shared the
+    // flaw and was corrected with the code.
+    const severity = (t: LlmTaskHealth): number => (t.state === "degraded" ? 2 : t.state === "unstable" ? 1 : 0);
     const newestFailing = tasks
-      .filter((t) => t.lastFailedAt !== null)
-      .sort((a, b) => Date.parse(b.lastFailedAt!) - Date.parse(a.lastFailedAt!))[0];
+      .filter((t) => t.state !== "healthy" && t.lastFailedAt !== null)
+      .sort((a, b) => severity(b) - severity(a) || Date.parse(b.lastFailedAt!) - Date.parse(a.lastFailedAt!))[0];
     const newestOkAt = tasks
       .map((t) => t.lastOkAt)
       .filter((a): a is string => a !== null)
