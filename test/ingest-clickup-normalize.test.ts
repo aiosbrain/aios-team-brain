@@ -86,6 +86,24 @@ describe("ClickUp task normalization", () => {
     expect(clickUpTaskIdentity(9001, "1001")).not.toContain("PILOT-1");
   });
 
+  it("deterministically caps native tags at the task schema label limit", () => {
+    const record: ClickUpTaskRecord = {
+      task: {
+        ...records[0].task,
+        tags: Array.from({ length: 60 }, (_, index) => ({ name: `tag-${String(index).padStart(2, "0")}` })),
+      },
+      observedListIds: ["101"],
+    };
+    const payload = normalizeClickUpTasks({
+      workspaceId: 9001,
+      records: [record],
+      statusMaps: { "101": list101Map },
+    });
+    const row = (payload.rows as Array<Record<string, unknown>>)[0];
+    expect(() => taskRowSchema.parse(row)).not.toThrow();
+    expect(row.labels).toEqual(Array.from({ length: 50 }, (_, index) => `tag-${String(index).padStart(2, "0")}`));
+  });
+
   it("requires a reversible mapping and refuses ambiguous TIML status resolution", () => {
     const duplicateNativeNames = { ...list101Map, done: "to do" };
     expect(() =>

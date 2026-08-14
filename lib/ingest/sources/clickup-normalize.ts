@@ -96,7 +96,7 @@ function tagsFor(task: ClickUpTask): string[] {
     .map((tag) => tag.trim())
     .filter(Boolean)
     .map((tag) => tag.slice(0, 80));
-  return [...new Set(tags)].sort((a, b) => a.localeCompare(b));
+  return [...new Set(tags)].sort((a, b) => a.localeCompare(b)).slice(0, 50);
 }
 
 function assigneeName(task: ClickUpTask): string {
