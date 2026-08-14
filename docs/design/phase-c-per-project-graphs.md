@@ -1,7 +1,9 @@
 # Phase C — per-project graph projection & migration (design)
 
-**Status:** design, pre-code, **revised after Fable plan review** (2 Blockers + 5 Highs folded). Governs the Phase C graph slices (spec `project-context-classification-v1.md` §6 / §17-C). `AIOS-Work: PCCC-2`.
+**Status:** design, pre-code, **revised after Fable plan review** (2 Blockers + 5 Highs folded). Governs the Phase C graph slices (spec `docs/specs/project-context-classification-v1.md` §6 / §17-C). `AIOS-Work: PCCC-2`.
 **Gate:** touches schema + LLM extraction cost + multiple surfaces (CLAUDE.md task gate) — reviewed as a plan before any code slice starts. This revision must clear a second plan-review pass before PCCC-3 opens.
+**Build-with:** fable / high — the code slices this doc governs change the graph's partition key, prod schema, and real LLM spend; each gets its own PR + two-model adversarial review.
+**Increment:** one PR, docs only. Every code change is deferred to the sibling slices PCCC-3..7 (§5), each its own ticket + PR + review.
 
 ## 1. Problem
 
@@ -77,7 +79,16 @@ The first draft juxtaposed two per-episode rates 10× apart (plan review High 7)
 
 `PCCC-3` coupled schema + per-group ledger + set-diff detection + consumer audit · `PCCC-4` General remap (+ feasibility spike) · **[cost re-measure gate]** · `PCCC-5` initiative fan-out (deferral-gated, push-budgeted, priced) · `PCCC-6` read cutover (team-tier, per-project-landed) · `PCCC-7` arc_cache invalidation + cleanup. Each its own PR + Fable/Codex review.
 
-## 6. Falsifiers
+## 6. Acceptance criteria (PCCC-2 — the design deliverable)
+
+- Every file:line claim in this doc resolves against the tree it reviews — re-derived by grep/read of `lib/graph/project.ts` (both `onConflict` sites + the group-less ledger read), `lib/db/pg/query-builder.ts:336` (silent multi-row `maybeSingle`), `lib/graph/run.ts` (single-flight + undefined-cursor rescan), `lib/graph/reconcile.ts` (requeue budget, orphan repair, never-landed delete), `postgres/schema.sql` (inline narrow unique; `arc_cache.group_key`), `lib/llm/graph-proxy.ts` (no per-call group context) — with any drifted citation corrected in the same commit.
+- `aios spec eval docs/design/phase-c-per-project-graphs.md --tier deterministic` returns `SPEC_READY`, exit 0, re-run after every amendment.
+- A second Fable cold-read plan review of `docs/design/phase-c-per-project-graphs.md` (this revision) completes with its verdict recorded in the PR body; any Blocker/High folded or refuted-with-evidence before push.
+- A Codex plan review of `docs/design/phase-c-per-project-graphs.md` completes with its verdict recorded in the PR body, tasked explicitly with breaking the round-1 folds.
+- The PR for this slice touches only `docs/` — no code, schema, or migration files; the code slices (PCCC-3+) each start from this doc's §5 sequencing with their own ticket + reviews.
+- Each falsifier in §7 of `docs/design/phase-c-per-project-graphs.md` names a measurable trigger AND the fallback taken when it fires (no criterion contradicts another; the untag-purge falsifier blocks the read cutover, not the schema slice).
+
+## 7. Falsifiers
 
 1. Quiet-window per-episode cost materially above §6 → P̄ multiplier unaffordable → keep the graph legs omitted for attenuated principals (accept the UX loss), General-only graph.
 2. General cannot be remapped (no in-place group-id change; §2.4 step 2 spike fails) → General also re-extracts → the backfill is the FULL corpus cost, likely unacceptable → lazy-only.
