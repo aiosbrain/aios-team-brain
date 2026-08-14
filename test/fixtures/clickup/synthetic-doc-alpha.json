@@ -1,0 +1,14 @@
+{
+  "id": "doc-alpha",
+  "date_created": 1786000000000,
+  "date_updated": 1786000200000,
+  "name": "Weekly product meeting",
+  "type": 1,
+  "parent": { "id": "101", "type": 6 },
+  "public": false,
+  "workspace_id": 9001,
+  "creator": 7,
+  "deleted": false,
+  "archived": false,
+  "url": "https://app.clickup.com/9001/docs/doc-alpha"
+}

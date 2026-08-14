@@ -1,0 +1,44 @@
+{
+  "tasks": [
+    {
+      "id": "1001",
+      "custom_id": "PILOT-1",
+      "name": "Plan the pilot",
+      "markdown_description": "Define the read-only pilot scope.",
+      "status": { "id": "st-1", "status": "to do", "type": "open" },
+      "priority": { "id": "2", "priority": "high" },
+      "assignees": [{ "id": 7, "username": "Alex", "email": "alex@example.invalid" }],
+      "tags": [{ "name": "pilot" }],
+      "parent": null,
+      "date_created": "1786000000000",
+      "date_updated": "1786000100000",
+      "date_closed": null,
+      "date_done": null,
+      "start_date": "1786000000000",
+      "due_date": "1786600000000",
+      "url": "https://app.clickup.com/t/1001",
+      "team_id": "9001",
+      "list": { "id": "101", "name": "Pilot" },
+      "locations": []
+    },
+    {
+      "id": 1002,
+      "custom_id": null,
+      "name": "Read every page",
+      "status": { "id": "st-2", "status": "in progress", "type": "custom" },
+      "priority": { "id": 3, "priority": "normal" },
+      "assignees": [],
+      "tags": [],
+      "parent": "1001",
+      "date_created": "1786000200000",
+      "date_updated": "1786000300000",
+      "date_closed": null,
+      "date_done": null,
+      "url": "https://app.clickup.com/t/1002",
+      "team_id": 9001,
+      "list": { "id": 101, "name": "Pilot" },
+      "locations": []
+    }
+  ],
+  "last_page": false
+}

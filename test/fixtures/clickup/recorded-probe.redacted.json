@@ -1,0 +1,22 @@
+{
+  "_fixture": {
+    "kind": "recorded-redacted",
+    "recorded_at": "2026-08-11",
+    "scope": "authorized Workspace and inventory metadata only",
+    "content_read": false
+  },
+  "authorized_workspaces": {
+    "teams": [
+      {
+        "id": 9000000001,
+        "name": "REDACTED WORKSPACE",
+        "members": []
+      }
+    ]
+  },
+  "inventory": {
+    "spaces": 3,
+    "lists": 35,
+    "docs": 99
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "tasks": [
+    {
+      "id": "1003",
+      "custom_id": "PILOT-3",
+      "name": "Close the loop",
+      "status": { "id": "st-5", "status": "complete", "type": "closed" },
+      "priority": { "id": "1", "priority": "urgent" },
+      "assignees": [],
+      "tags": [{ "name": "done" }],
+      "parent": null,
+      "date_updated": "1786000700000",
+      "date_closed": "1786000600000",
+      "date_done": "1786000550000",
+      "url": "https://app.clickup.com/t/1003",
+      "team_id": "9001",
+      "list": { "id": "101", "name": "Pilot" },
+      "locations": [{ "id": "202", "name": "Operations" }]
+    },
+    {
+      "id": "1004",
+      "name": "Archive the notes",
+      "status": { "id": "st-1", "status": "queued", "type": "open" },
+      "priority": null,
+      "assignees": [],
+      "tags": [],
+      "parent": null,
+      "date_updated": "1786000800000",
+      "url": "https://app.clickup.com/t/1004",
+      "team_id": "9001",
+      "list": { "id": "202", "name": "Operations" },
+      "locations": []
+    }
+  ],
+  "last_page": true
+}

@@ -1,0 +1,17 @@
+{
+  "docs": [
+    {
+      "id": "doc-beta",
+      "date_created": 1786000300000,
+      "date_updated": 1786000400000,
+      "name": "Archived notes",
+      "type": 1,
+      "parent": { "id": "101", "type": 6 },
+      "public": false,
+      "workspace_id": "9001",
+      "creator": "8",
+      "deleted": false,
+      "archived": true
+    }
+  ]
+}

@@ -1,0 +1,26 @@
+{
+  "tasks": [
+    {
+      "id": "1003",
+      "custom_id": "PILOT-3",
+      "name": "Close the loop",
+      "status": { "id": "st-5", "status": "complete", "type": "closed" },
+      "priority": { "id": "1", "priority": "urgent" },
+      "assignees": [
+        { "id": "8", "username": "Riley", "email": "riley@example.invalid" },
+        { "id": 9, "username": "Morgan", "email": "morgan@example.invalid" }
+      ],
+      "tags": [{ "name": "pilot" }, { "name": "done" }],
+      "parent": null,
+      "date_created": "1786000400000",
+      "date_updated": "1786000500000",
+      "date_closed": "1786000600000",
+      "date_done": "1786000550000",
+      "url": "https://app.clickup.com/t/1003",
+      "team_id": "9001",
+      "list": { "id": "101", "name": "Pilot" },
+      "locations": [{ "id": "202", "name": "Operations" }]
+    }
+  ],
+  "last_page": true
+}

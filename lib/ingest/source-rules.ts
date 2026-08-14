@@ -108,6 +108,9 @@ export const SOURCE_RULES: Readonly<Record<string, SourceRules>> = {
   notion: { workTimeOnUnchangedBody: "work", retainSupersededBodies: true, emitsTicketDocuments: false },
   gdrive: { workTimeOnUnchangedBody: "work", retainSupersededBodies: true, emitsTicketDocuments: false },
   confluence: { workTimeOnUnchangedBody: "work", retainSupersededBodies: true, emitsTicketDocuments: false },
+  /** Configured Docs use ClickUp's source-provided Doc/page edit timestamps. Task documents are
+   *  connector context, not authoritative ticket documents for graph eligibility. */
+  clickup: { workTimeOnUnchangedBody: "work", retainSupersededBodies: true, emitsTicketDocuments: false },
   /** Moot today — `web.py` emits no timestamp at all. Classified so the guard stays satisfied;
    *  revisit if it ever grows one, since a FETCH time would be noise-shaped, not work-shaped. */
   web: { workTimeOnUnchangedBody: "work", retainSupersededBodies: true, emitsTicketDocuments: false },
