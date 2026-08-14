@@ -263,6 +263,28 @@ export function degradedNote(tasks: readonly LlmTaskHealth[]): string {
 }
 
 /**
+ * Which task the leg's SINGULAR fields describe — extracted and exported so it is unit-testable.
+ *
+ * It was inline in `getLlmHealth` and therefore only reachable through Postgres, which is exactly how
+ * it shipped wrong and then how its FIX shipped untested: a mutation reinstating the bug survived the
+ * whole suite. A behaviour a reviewer had to find deserves a pure seam.
+ *
+ * NON-HEALTHY tasks only, worst first. A HEALTHY task still carries `lastFailedAt` whenever its window
+ * holds a failure that later healed — this install's measured normal (heals 6 times in 10). Selecting
+ * on `lastFailedAt !== null` alone therefore let a healed `arcs` blip supply `lastModel`/`lastError`
+ * during a `meeting-summary` outage, so the card's detail line named the REASONING model — taken from
+ * arcs' SUCCESSFUL newest run — directly above a note naming meeting summaries on the query model.
+ * That is the wrong-picker misattribution this slice exists to remove, arriving through the
+ * healed-blip path. Both reviewers caught it.
+ */
+export function pickReportedFailure(tasks: readonly LlmTaskHealth[]): LlmTaskHealth | undefined {
+  const severity = (t: LlmTaskHealth): number => (t.state === "degraded" ? 2 : t.state === "unstable" ? 1 : 0);
+  return tasks
+    .filter((t) => t.state !== "healthy" && t.lastFailedAt !== null)
+    .sort((a, b) => severity(b) - severity(a) || Date.parse(b.lastFailedAt!) - Date.parse(a.lastFailedAt!))[0];
+}
+
+/**
  * Read the recent runs PER TASK.
  *
  * THE OUTER ORDER-BY CARRIES `id desc` TOO, not just the window. The window picks WHICH rows come
@@ -329,18 +351,7 @@ export async function getLlmHealth(teamId: string): Promise<LlmHealth> {
     const state = deriveLlmState(tasks);
     // The singular fields describe the newest FAILING row across tasks — not the leg's newest row,
     // which could be an unrelated success and would name the wrong task's model.
-    // NON-HEALTHY tasks only, worst first. A HEALTHY task still carries `lastFailedAt` whenever its
-    // window holds a failure that later healed — which is this install's measured normal (heals 6/10).
-    // Selecting on `lastFailedAt !== null` alone therefore let a healed `arcs` blip supply
-    // `lastModel`/`lastError` during a `meeting-summary` outage, so the card's detail line named the
-    // REASONING model (from arcs' successful newest run, no less) directly above a note naming meeting
-    // summaries on the query model. That is the wrong-picker misattribution this slice exists to
-    // remove, reintroduced through the healed-blip path. Both reviewers caught it; the spec shared the
-    // flaw and was corrected with the code.
-    const severity = (t: LlmTaskHealth): number => (t.state === "degraded" ? 2 : t.state === "unstable" ? 1 : 0);
-    const newestFailing = tasks
-      .filter((t) => t.state !== "healthy" && t.lastFailedAt !== null)
-      .sort((a, b) => severity(b) - severity(a) || Date.parse(b.lastFailedAt!) - Date.parse(a.lastFailedAt!))[0];
+    const newestFailing = pickReportedFailure(tasks);
     const newestOkAt = tasks
       .map((t) => t.lastOkAt)
       .filter((a): a is string => a !== null)
