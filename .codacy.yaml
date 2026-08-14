@@ -1,0 +1,12 @@
+# Codacy configuration.
+#
+# postgres/ is excluded because Codacy's SQL analysis applies T-SQL (SQL Server) rules —
+# observed on PR #547: "Expected SET QUOTED_IDENTIFIER ON near top of file" against a
+# PostgreSQL migration, a statement Postgres itself would REJECT (unrecognized configuration
+# parameter). These files already have dialect-correct, build-failing validation that is
+# strictly stronger than a lint: `npm run pg:schema` replays schema.sql + every migration
+# from zero on each deploy, the migrations-numbering guard pins the directory's shape, and
+# the data-mechanics tier loads the full schema into a real Postgres on every CI run.
+---
+exclude_paths:
+  - "postgres/**"
