@@ -219,8 +219,15 @@ export function failLlmPassBeforeFirstCall(pass: LlmPass, error: string): void {
   pass.firstError = pass.firstError ?? error;
 }
 
-/** Best-effort durable record of one LLM outcome — never throws (observability can't break the call). */
-async function recordLlmOutcome(
+/**
+ * Best-effort durable record of one LLM outcome — never throws (observability can't break the call).
+ *
+ * EXPORTED for tests, deliberately. This is where a per-call record and a pass diverge, and a
+ * mutation that made the pass branch unreachable — restoring the per-call flood — survived a suite
+ * that drove the pass counters through a hand-written helper instead of through here. A simulation of
+ * the integration is not the integration.
+ */
+export async function recordLlmOutcome(
   record: CompleteOptions["record"],
   outcome: { ok: boolean; model: string; error?: string; startedAt: number }
 ): Promise<void> {

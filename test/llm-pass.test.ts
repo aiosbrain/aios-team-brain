@@ -1,5 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
-import { failLlmPassBeforeFirstCall, finishLlmPass, withLlmPass, type LlmPass } from "@/lib/llm/complete";
+import {
+  failLlmPassBeforeFirstCall,
+  finishLlmPass,
+  recordLlmOutcome,
+  withLlmPass,
+  type LlmPass,
+} from "@/lib/llm/complete";
 
 /**
  * ONE ROW PER PASS — LLMOBS-2.
@@ -186,5 +192,59 @@ describe("the branded token cannot be mistaken for a per-call record", () => {
         seen();
       }
     ).then(() => expect(seen).toHaveBeenCalled());
+  });
+});
+
+describe("the REAL integration — `record: pass` must reach the accumulator, not the per-call write", () => {
+  /**
+   * These exist because two mutations survived the first suite: making `isPass` duck-type on counters
+   * instead of the brand, and making `recordLlmOutcome` skip the pass branch entirely — the per-call
+   * FLOOD, restored, which is the whole defect this slice removes. Both survived because every other
+   * test in this file drives `pass.calls++` through a local helper that SIMULATES what
+   * `recordLlmOutcome` does. A simulation of the integration is not the integration, and this repo's
+   * rule is to pin the call site rather than the function.
+   */
+  it("a PASS accumulates and writes nothing per call", async () => {
+    const { rows, db } = captureRuns();
+    await withLlmPass({ db: db as never, teamId: "t", task: "timeline-summary" }, async (pass) => {
+      await recordLlmOutcome(pass, { ok: true, model: "m1", startedAt: Date.now() });
+      await recordLlmOutcome(pass, { ok: false, model: "m1", error: "boom", startedAt: Date.now() });
+      // Nothing may be written yet — the row is the pass's, at the end.
+      expect(rows).toHaveLength(0);
+      expect(pass.calls).toBe(2);
+      expect(pass.failures).toBe(1);
+      expect(pass.model).toBe("m1");
+      expect(pass.firstError).toBe("boom");
+    });
+    expect(rows).toHaveLength(1);
+  });
+
+  it("a PER-CALL record still writes immediately — the other branch is not collateral damage", async () => {
+    const { rows, db } = captureRuns();
+    await recordLlmOutcome({ db: db as never, teamId: "t", task: "arcs" }, {
+      ok: false,
+      model: "m2",
+      error: "empty content",
+      startedAt: Date.now(),
+    });
+    expect(rows).toHaveLength(1);
+    expect(rows[0].ok).toBe(false);
+    expect((metaOf(rows[0]) as { task: string }).task).toBe("arcs");
+  });
+
+  it("narrows on the BRAND, so a token with the right shape but no brand is treated per-call", () => {
+    // The mutation this kills: `isPass` duck-typing on `calls`/`done`. A caller could then hand in a
+    // look-alike and get accumulated silently — or, renaming a counter, every real pass would fall
+    // through to the per-call write.
+    const lookalike = { db: {} as never, teamId: "t", task: "timeline-summary", calls: 0, failures: 0, done: false };
+    const { rows, db } = captureRuns();
+    return recordLlmOutcome({ ...lookalike, db: db as never } as never, {
+      ok: true,
+      model: "m",
+      startedAt: Date.now(),
+    }).then(() => {
+      // No brand ⇒ per-call branch ⇒ a row now.
+      expect(rows).toHaveLength(1);
+    });
   });
 });
