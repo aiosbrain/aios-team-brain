@@ -86,7 +86,7 @@ export interface CompleteOptions {
    * transport / auth) instead of the failure being an invisible `null`. Opt-in per caller (needs a
    * db + teamId), so high-frequency incidental calls (e.g. chat titles) don't flood the ledger.
    */
-  record?: { db: DbClient; teamId: string; task: string };
+  record?: LlmRecord;
   /**
    * Meter this call's token spend into the `llm_usage` ledger (the brain-spend meter that feeds the
    * Pulse Spend KPI + the costs breakdown page). Opt-in per caller (needs a db + teamId). `source` is
@@ -97,12 +97,146 @@ export interface CompleteOptions {
   meter?: { db: DbClient; teamId: string; source: LlmUsageSource; memberId?: string | null };
 }
 
+/**
+ * A PASS — one `ingest_runs` row covering N calls (LLMOBS-2).
+ *
+ * WHY IT EXISTS. `recordLlmOutcome` writes one row per call, and `attachPersonDaySummaries` calls the
+ * model once per (person, day) on every rebuild: 37.9 calls/day measured, against a whole-table rate
+ * of 333.7 rows/day and a 50-row Recent-runs panel. Wiring a per-call `record:` there would bury
+ * connector evidence within a day and a half, which is why LLMOBS-1 deferred it — leaving the leg's
+ * FOUNDING failure mode open for its highest-volume feature: a model failing every timeline summary
+ * reads `healthy`, because `completeTextOrNull` swallows the failure and nothing records it.
+ *
+ * BRANDED, and the brand is load-bearing. This is handed to `completeText` in the same `record:` slot
+ * as a per-call record, and a plain `{ db, teamId, task }`-shaped token would be structurally
+ * assignable to that member — TypeScript would not force a discriminant, and a wrong branch below
+ * would silently restore the per-call flood with the coverage guard still green (it matches
+ * `record: pass` either way). The unique symbol makes the union discriminated at compile time.
+ */
+const PASS_BRAND: unique symbol = Symbol("llm-pass");
+
+export interface LlmPass {
+  readonly [PASS_BRAND]: true;
+  readonly db: DbClient;
+  readonly teamId: string;
+  readonly task: string;
+  /** Mutable counters. Shared across `CONCURRENCY = 6` in-flight calls at the timeline site, which is
+   *  safe ONLY because these increments are synchronous — there is no `await` between read and write.
+   *  Stated because this repo's immutability rule pushes a reader the other way, so a future refactor
+   *  that introduces an await here knows what it is breaking. */
+  calls: number;
+  failures: number;
+  /** The backend model, captured from the first call. Stable within a pass (`selectLlmBackend` is
+   *  deterministic per keys/role), and REQUIRED by the health card: `deriveTaskHealth` reads
+   *  `meta.model` and `degradedNote` names it. A row without it drops the model name and the
+   *  reasoning-starvation hint from the operator copy — the wrong-picker misattribution LLMOBS-1
+   *  existed to remove, which review caught this slice reinstating. */
+  model: string | null;
+  /** The FIRST failure's message. `meta.failures` says how many more there were. */
+  firstError: string | null;
+  done: boolean;
+}
+
+export type LlmRecord = { db: DbClient; teamId: string; task: string } | LlmPass;
+
+function isPass(record: LlmRecord): record is LlmPass {
+  // Narrow on the BRAND, not on duck-typed fields. Checking `calls`/`done` would send a token down
+  // the per-call branch the moment either is renamed — silently restoring the flood. The symbol is a
+  // real runtime value (a `declare const` would be type-only and `[PASS_BRAND]` would be `undefined`,
+  // which is how the first attempt failed) and cannot be produced accidentally by a caller.
+  return PASS_BRAND in record;
+}
+
+/**
+ * Run `body` with a pass, and write its single row when it settles — including on a throw.
+ *
+ * SCOPED rather than open/close, deliberately. The first design was `beginLlmPass()` + `finish()` in a
+ * `finally`, policed by a source-text guard. Review showed that guard cannot work: it passes
+ * `const p = begin(); if (skip) return; try {…} finally { p.finish(); }`, which leaks on the early
+ * return with the regex fully satisfied, and it fails a legitimate open-in-A/finish-in-B split. Text
+ * cannot check control flow. This shape deletes the leak class instead of policing it — the caller
+ * never holds an open pass, and the `finally` lives once, here.
+ */
+export async function withLlmPass<T>(
+  init: { db: DbClient; teamId: string; task: string },
+  body: (pass: LlmPass) => Promise<T>
+): Promise<T> {
+  const pass = {
+    [PASS_BRAND]: true,
+    db: init.db,
+    teamId: init.teamId,
+    task: init.task,
+    calls: 0,
+    failures: 0,
+    model: null,
+    firstError: null,
+    done: false,
+  } as unknown as LlmPass;
+  try {
+    return await body(pass);
+  } finally {
+    await finishLlmPass(pass);
+  }
+}
+
+/**
+ * Write the pass row. Idempotent — `done` guards it.
+ *
+ * Idempotence is NOT for "a finally after an early return", which review pointed out runs exactly
+ * once; it is for a caller who adds a defensive explicit finish alongside the one this helper already
+ * guarantees. Two rows for one pass would be two streak entries for one event.
+ *
+ * QUIET vs FAILED-BEFORE-THE-FIRST-CALL, a distinction the first draft collapsed. A pass with zero
+ * calls and nothing to do writes NO row: `ok: true` would claim a model that was never asked, and
+ * `ok: false` would accuse on no evidence. But a pass that FAILED before it could call anything —
+ * `attachPersonDaySummaries` returns `degraded: true` with zero calls when `resolveAnsweringKeys`
+ * throws, which the code itself calls "a failure, not a configuration choice" — is evidence, and it
+ * records `ok: false` with `calls: 0`. Without that it was silent FOREVER: `llm` has no staleness
+ * clock, is not a pipeline leg, and ages to `unknown` after `TASK_RECENCY_MS`.
+ */
+export async function finishLlmPass(pass: LlmPass): Promise<void> {
+  if (pass.done) return;
+  pass.done = true;
+  // Nothing attempted and nothing failed ⇒ nothing to say.
+  if (pass.calls === 0 && pass.failures === 0) return;
+  // `ok` is "not every call failed" — see docs/design/llm-pass-recording.md §2b for why this is not a
+  // threshold, and for the honest bound (one success in forty clears a pass).
+  const ok = pass.calls > pass.failures;
+  await recordIngestRun(pass.db, {
+    teamId: pass.teamId,
+    source: "llm",
+    trigger: "api",
+    ok,
+    errors: ok ? [] : [pass.firstError ?? "every call in the pass failed"],
+    meta: { task: pass.task, model: pass.model ?? "", calls: pass.calls, failures: pass.failures },
+    startedAt: Date.now(),
+  });
+}
+
+/** Mark a pass as failed before it made any call — see `finishLlmPass`. */
+export function failLlmPassBeforeFirstCall(pass: LlmPass, error: string): void {
+  pass.failures += 1;
+  pass.firstError = pass.firstError ?? error;
+}
+
 /** Best-effort durable record of one LLM outcome — never throws (observability can't break the call). */
 async function recordLlmOutcome(
   record: CompleteOptions["record"],
   outcome: { ok: boolean; model: string; error?: string; startedAt: number }
 ): Promise<void> {
   if (!record) return;
+  // NARROW ON THE BRAND FIRST. A pass accumulates into ONE row written at the end; taking the
+  // per-call branch here is exactly the flood this slice removes, and it would be invisible — the
+  // coverage guard matches `record: pass` just as happily.
+  if (isPass(record)) {
+    record.calls += 1;
+    record.model = record.model ?? outcome.model;
+    if (!outcome.ok) {
+      record.failures += 1;
+      record.firstError = record.firstError ?? outcome.error ?? "llm failed";
+    }
+    return;
+  }
   await recordIngestRun(record.db, {
     teamId: record.teamId,
     source: "llm",

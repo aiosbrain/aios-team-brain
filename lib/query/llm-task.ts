@@ -17,6 +17,12 @@ export const LLM_TASK_NAMES = [
   "meeting-actions",
   "meeting-merge",
   "attribution",
+  // LLMOBS-2. HYPHENATED, matching every other member and the keys of `TASK_COPY`. Do not confuse
+  // `doc-task-infer` (a `meta.task` inside `source='llm'`) with `doc_task_infer` (the `ingest_runs.source`
+  // of that leg's OWN pass-level row). Two spellings for one feature, two different ledgers — review
+  // flagged the collision before it was written.
+  "timeline-summary",
+  "doc-task-infer",
 ] as const;
 
 /**

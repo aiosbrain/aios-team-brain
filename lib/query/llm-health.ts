@@ -111,6 +111,8 @@ const TASK_COPY = new Map<string, string>([
   ["meeting-actions", "meeting action items"],
   ["meeting-merge", "meeting transcript merging"],
   ["attribution", "attribution corrections"],
+  ["timeline-summary", "timeline summaries"],
+  ["doc-task-infer", "task suggestions"],
 ]);
 
 /**

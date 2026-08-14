@@ -287,6 +287,16 @@ export async function runDocTaskInference(
           // Reuse the timeline's ledger slice rather than widening the closed `LlmUsageSource` union —
           // same call the arcs coherence pass makes by reusing "arcs".
           meter: { db, teamId, source: "timeline-summary" },
+          // A PER-CALL record, deliberately NOT a pass (LLMOBS-2). This site was listed as a fan-out
+          // in the first draft, copied from a stale exemption reason; the code two hundred lines up
+          // says in capitals that it is ONE CALL PER WORKER — "2-3 in practice, not the doc count" —
+          // behind a 12h cooldown, so it cannot flood anything and a pass would be a row per call
+          // anyway. Review caught the stale premise; the slice shrank.
+          //
+          // `doc-task-infer` (hyphenated) is a `meta.task` inside `source='llm'`, and is NOT the
+          // `source='doc_task_infer'` row this function already writes for its own leg. Different
+          // ledgers, different questions: "did this leg run" vs "is the model producing output".
+          record: { db, teamId, task: "doc-task-infer" },
         }
       );
       if (!raw) {

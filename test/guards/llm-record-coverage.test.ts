@@ -25,13 +25,11 @@ const LIB = path.join(ROOT, "lib");
  * point; every entry is a feature the answering-model leg is blind to.
  */
 const EXEMPT: Record<string, string> = {
-  "lib/dashboard/timeline-summary.ts":
-    "FAN-OUT: one model call per (person, day), re-run on every background rebuild. Measured 37.9 " +
-    "calls/day against 333.7 ingest_runs rows/day total and a 50-row runs panel — per-call recording " +
-    "would make the operator's panel mostly timeline summaries. Needs one row per PASS, which is a " +
-    "change to the recording primitive, not to this call site. Deferred in the spec, not forgotten.",
-  "lib/dashboard/doc-task-infer-run.ts":
-    "FAN-OUT: same shape, one call per scored doc inside a worker loop. Same fix, same slice.",
+  // BOTH FAN-OUT ENTRIES ARE GONE (LLMOBS-2). `timeline-summary` now records ONE row per pass via
+  // `withLlmPass`, and `doc-task-infer-run` takes an ordinary per-call `record:` — its exemption
+  // reason here claimed "one call per scored doc", which was FALSE: the code says ONE CALL PER WORKER,
+  // 2-3 per 12h tick. That stale reason was then copied into a spec and nearly justified an API change
+  // for a call shape that does not exist. An exemption is a claim, and claims rot.
   "lib/social/generate.ts":
     "Reaches the primitive through `lib/social/llm.ts`'s re-export, and whether social generation " +
     "belongs on the ANSWERING-MODEL leg at all is a product question, not an oversight.",
