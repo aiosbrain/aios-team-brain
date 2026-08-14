@@ -2,7 +2,7 @@ import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { adminClient } from "@/lib/db/admin";
 import { GraphitiClient } from "./graphiti-client";
-import { projectItemsToGraph } from "./project";
+import { projectItemsToGraph, ProjectionAbortError } from "./project";
 import { reconcileProjectedEpisodes } from "./reconcile";
 import { purgeExternalTierCaches } from "@/lib/cache/tier-invalidation";
 
@@ -175,6 +175,18 @@ async function runGraphProjectionInner(opts?: {
     } catch (e) {
       summary.ok = false;
       summary.errors.push(`${t.slug}: ${e instanceof Error ? e.message : "projection failed"}`);
+      // An aborted batch already pushed episodes before it threw — that extraction cost is real, and
+      // dropping it undercounts the Phase C cost gate's denominator (code-review Codex Medium 3).
+      // The abort error carries the batch's partial summary; merge the push counts.
+      if (e instanceof ProjectionAbortError) {
+        summary.scanned += e.partial.scanned;
+        summary.projected += e.partial.projected;
+        summary.episodes += e.partial.episodes;
+        for (const [g, n] of Object.entries(e.partial.episodesByGroup)) {
+          summary.episodesByGroup[g] = (summary.episodesByGroup[g] ?? 0) + n;
+        }
+        summary.skipped += e.partial.skipped;
+      }
     }
   }
   return summary;

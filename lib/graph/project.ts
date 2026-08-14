@@ -414,6 +414,21 @@ export interface ProjectSummary {
   lastSyncedAt?: string;
 }
 
+/**
+ * A pass that aborts LOUDLY mid-batch still incurred real extraction cost for everything it pushed
+ * before the abort — losing those counts undercounts the Phase C cost gate's denominator
+ * (code-review Codex Medium 3). The partial summary rides on the error so the runner records it.
+ */
+export class ProjectionAbortError extends Error {
+  constructor(
+    message: string,
+    readonly partial: ProjectSummary
+  ) {
+    super(message);
+    this.name = "ProjectionAbortError";
+  }
+}
+
 type ItemRow = {
   id: string;
   /** Persisted work-time (R1) — the episode's `valid_at`. */
@@ -612,6 +627,16 @@ export async function projectItemsToGraph(
   const episodesByGroup: Record<string, number> = {};
   let skipped = 0;
   let externalGroupVacated = 0;
+  // What this pass has ALREADY done, snapshotted at abort time — every loud throw below carries it
+  // (ProjectionAbortError) so the runner can record the real partial episode counts.
+  const partialSummary = (): ProjectSummary => ({
+    scanned: rows.length,
+    projected,
+    episodes: episodesPushed,
+    episodesByGroup: { ...episodesByGroup },
+    skipped,
+    externalGroupVacated,
+  });
   for (const item of rows) {
     const episodes = kinds.includes(item.kind) ? toEpisodes(item) : [];
     // Idempotency key = the FULL body (chunk boundaries derive deterministically from it), so an
@@ -635,7 +660,7 @@ export async function projectItemsToGraph(
       .eq("source_table", SOURCE_TABLE)
       .eq("source_id", item.id);
     if (ledgerReadErr) {
-      throw new Error(`project: ledger read failed for item ${item.id}: ${ledgerReadErr.message}`);
+      throw new ProjectionAbortError(`project: ledger read failed for item ${item.id}: ${ledgerReadErr.message}`, partialSummary());
     }
     type LedgerRow = {
       content_sha256: string;
@@ -685,7 +710,7 @@ export async function projectItemsToGraph(
           { onConflict: "team_id,source_table,source_id,group_id" }
         );
         if (redactErr) {
-          throw new Error(`project: redaction ledger write failed for item ${item.id}: ${redactErr.message}`);
+          throw new ProjectionAbortError(`project: redaction ledger write failed for item ${item.id}: ${redactErr.message}`, partialSummary());
         }
       }
       skipped++;
@@ -801,7 +826,7 @@ export async function projectItemsToGraph(
         .eq("group_id", existingRow.group_id)
         .select("group_id");
       if (moveErr) {
-        throw new Error(`project: group-move ledger update failed for item ${item.id}: ${moveErr.message}`);
+        throw new ProjectionAbortError(`project: group-move ledger update failed for item ${item.id}: ${moveErr.message}`, partialSummary());
       }
       // ROWCOUNT, not just error (Fable review Low 2): reconcile's re-queue DELETE removes exactly a
       // no-pending-flag row whose episodes went missing, and it can land between our ledger read and
@@ -906,32 +931,46 @@ export async function projectItemsToGraph(
     // cross-instance race — the single-flight is process-local, and a deploy overlap runs two
     // instances — could push episodes into a group and then fail its first ledger write, leaving
     // them orphaned with no purge pointer. Reserving first inverts that: a CROSS-GROUP loser fails
-    // HERE, on the still-standing narrow unique, before anything lands in a graph. (Two same-group
-    // racers both pass the upsert and both push — the pre-existing duplicate-push residual, neither
-    // created nor closed by this change.) The `''` sentinel means "reserved, not landed" — a crash
-    // before the final write below leaves a row reconcile re-queues.
+    // HERE, on the still-standing narrow unique, before anything lands in a graph.
+    //
+    // Plain INSERT, not upsert (code-review Codex Medium 2): an upsert's DO-UPDATE would stomp a
+    // completed racer's real sha/chunk ledger back to ''/[] — a conflict on the WIDE index is
+    // BENIGN (someone already holds the (item, group) reservation, possibly our own crashed prior
+    // pass) and is deliberately left alone. Any other reservation error throws. The `''` sentinel
+    // means "reserved, not landed" — a crash before the final write below leaves a row reconcile
+    // re-queues. On the vanished-old-row fallback the old group's purge pointer rides ON the
+    // reservation (code-review Codex High 1): the final upsert also writes it, but a crash between
+    // this push and that write must not strand a late-landing old-tier episode unpurgeable.
     // (A tier flip is normally reserved by the group-move UPDATE above — unless it matched nothing;
     // an existing current-group row IS the reservation.)
     if (existingRow === null || groupMoveMatchedNothing) {
-      const { error: reserveErr } = await db.from("graph_episodes").upsert(
-        {
-          team_id: args.teamId,
-          source_table: SOURCE_TABLE,
-          source_id: item.id,
-          group_id: groupId,
-          content_sha256: "",
-          chunk_shas: [],
-          chunk_config: CHUNK_CONFIG,
-        },
-        { onConflict: "team_id,source_table,source_id,group_id" }
-      );
-      if (reserveErr) {
-        throw new Error(`project: ledger reservation failed for item ${item.id}: ${reserveErr.message}`);
+      const { error: reserveErr } = await db.from("graph_episodes").insert({
+        team_id: args.teamId,
+        source_table: SOURCE_TABLE,
+        source_id: item.id,
+        group_id: groupId,
+        content_sha256: "",
+        chunk_shas: [],
+        chunk_config: CHUNK_CONFIG,
+        ...(tierChanged && existingRow
+          ? { pending_delete_group_id: existingRow.group_id, pending_delete_at: new Date().toISOString() }
+          : {}),
+      });
+      if (reserveErr && !reserveErr.message.includes("graph_episodes_item_group_key")) {
+        throw new ProjectionAbortError(`project: ledger reservation failed for item ${item.id}: ${reserveErr.message}`, partialSummary());
       }
     }
 
     if (!(purgeFailed && contentUnchanged) && toPush.length > 0) {
-      await client.addEpisodes(groupId, toPush);
+      try {
+        await client.addEpisodes(groupId, toPush);
+      } catch (err) {
+        // The abort still carries what earlier items pushed — that extraction was incurred.
+        throw new ProjectionAbortError(
+          `project: push failed for item ${item.id}: ${err instanceof Error ? err.message : String(err)}`,
+          partialSummary()
+        );
+      }
     }
 
     // A pass that POSTed nothing must not claim it pushed: `extraction-health.newestEpisodeAtMs` reads
@@ -986,7 +1025,7 @@ export async function projectItemsToGraph(
     // pass — duplicate episodes with the ledger reading healthy. The reservation above bounds the
     // damage of throwing here: the row exists as a `''` sentinel, so reconcile re-queues it.
     if (ledgerWriteErr) {
-      throw new Error(`project: ledger write failed for item ${item.id}: ${ledgerWriteErr.message}`);
+      throw new ProjectionAbortError(`project: ledger write failed for item ${item.id}: ${ledgerWriteErr.message}`, partialSummary());
     }
     if (pushedSomething) projected++;
     else skipped++; // ledger refreshed, nothing extracted — not work the health probes should see

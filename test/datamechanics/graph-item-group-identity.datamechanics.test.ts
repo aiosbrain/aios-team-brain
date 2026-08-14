@@ -1,5 +1,6 @@
 import { afterAll, describe, expect, it } from "vitest";
 import { projectItemsToGraph } from "@/lib/graph/project";
+import { runGraphProjection } from "@/lib/graph/run";
 import { episodeGroupId } from "@/lib/graph/group";
 import { countProjectedEpisodes } from "@/lib/graph/extraction-health";
 import { runSql } from "@/lib/db/pg/pool";
@@ -186,6 +187,118 @@ describe("PCCC-3 Deploy A — per-(item, group) ledger identity", () => {
     } finally {
       await runSql("drop trigger if exists pccc3_refuse on graph_episodes", []);
       await runSql("drop function if exists pccc3_refuse_marked()", []);
+    }
+  });
+
+  it("a FAILED reservation blocks the push — nothing may land in a graph unledgered (Codex Medium 4)", async () => {
+    const seed = await seedTeam();
+    const r = await ingest(seed, { body: "must never push unreserved", path: "guard.md", access: "team" });
+
+    // Refuse the '' reservation INSERT for this item — a stand-in for the cross-group loser's
+    // narrow-unique rejection (any non-benign reservation error must stop the push).
+    await runSql(
+      `create or replace function pccc3_refuse_reserve() returns trigger language plpgsql as $$
+         begin
+           if new.source_id = '${r.id}' and new.content_sha256 = '' then
+             raise exception 'pccc3 reservation refused';
+           end if;
+           return new;
+         end $$`,
+      []
+    );
+    await runSql(
+      "create trigger pccc3_refuse_reserve before insert on graph_episodes for each row execute function pccc3_refuse_reserve()",
+      []
+    );
+    const fake = new FakeGraphiti();
+    try {
+      await expect(
+        projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: seed.teamSlug, client: client(fake) })
+      ).rejects.toThrow(/reservation/);
+      expect(fake.pushedEpisodes).toHaveLength(0); // the guard held: no unledgered episode exists
+    } finally {
+      await runSql("drop trigger if exists pccc3_refuse_reserve on graph_episodes", []);
+      await runSql("drop function if exists pccc3_refuse_reserve()", []);
+    }
+  });
+
+  it("an aborted pass still reports the episodes it already pushed (the cost denominator survives the abort)", async () => {
+    const seed = await seedTeam();
+    const r1 = await ingest(seed, { body: "first item lands fine", path: "one.md", access: "team" });
+    const r2 = await ingest(seed, { body: "second item's write is refused", path: "two.md", access: "team" });
+    expect(r1.id).not.toBe(r2.id);
+
+    // Refuse only the SECOND item's real-sha ledger write: item 1 pushes and completes, then the
+    // pass aborts loudly — and the abort must carry item 1's pushed episodes, because Graphiti
+    // billed that extraction whether or not the pass finished (Codex review Medium 3).
+    await runSql(
+      `create or replace function pccc3_refuse_second() returns trigger language plpgsql as $$
+         begin
+           if new.source_id = '${r2.id}' and new.content_sha256 <> '' then
+             raise exception 'pccc3 second item refused';
+           end if;
+           return new;
+         end $$`,
+      []
+    );
+    await runSql(
+      "create trigger pccc3_refuse_second before insert or update on graph_episodes for each row execute function pccc3_refuse_second()",
+      []
+    );
+    const fake = new FakeGraphiti();
+    const group = episodeGroupId(seed.teamSlug, "team");
+    try {
+      const err = await projectItemsToGraph(db(), {
+        teamId: seed.teamId,
+        teamSlug: seed.teamSlug,
+        client: client(fake),
+      }).then(
+        () => null,
+        (e: unknown) => e
+      );
+      expect(err).toBeInstanceOf(Error);
+      expect((err as Error).name).toBe("ProjectionAbortError");
+      const partial = (err as { partial?: { episodes: number; episodesByGroup: Record<string, number> } }).partial;
+      expect(partial).toBeDefined();
+      expect(partial!.episodes).toBeGreaterThanOrEqual(1);
+      expect(partial!.episodesByGroup[group]).toBeGreaterThanOrEqual(1);
+    } finally {
+      await runSql("drop trigger if exists pccc3_refuse_second on graph_episodes", []);
+      await runSql("drop function if exists pccc3_refuse_second()", []);
+    }
+  });
+
+  it("runGraphProjection records an aborted batch's partial pushes in the run summary (the catch-merge call site)", async () => {
+    const seed = await seedTeam();
+    const r1 = await ingest(seed, { body: "run-level: first lands", path: "run-one.md", access: "team" });
+    const r2 = await ingest(seed, { body: "run-level: second refused", path: "run-two.md", access: "team" });
+    expect(r1.id).not.toBe(r2.id);
+
+    await runSql(
+      `create or replace function pccc3_refuse_run() returns trigger language plpgsql as $$
+         begin
+           if new.source_id = '${r2.id}' and new.content_sha256 <> '' then
+             raise exception 'pccc3 run-level refusal';
+           end if;
+           return new;
+         end $$`,
+      []
+    );
+    await runSql(
+      "create trigger pccc3_refuse_run before insert or update on graph_episodes for each row execute function pccc3_refuse_run()",
+      []
+    );
+    const fake = new FakeGraphiti();
+    const group = episodeGroupId(seed.teamSlug, "team");
+    try {
+      const summary = await runGraphProjection({ teamId: seed.teamId, db: db(), client: client(fake) });
+      expect(summary.ok).toBe(false); // the abort is still an error…
+      expect(summary.errors.join(" ")).toContain("pccc3 run-level refusal");
+      expect(summary.episodes).toBeGreaterThanOrEqual(1); // …but the paid-for pushes are recorded
+      expect(summary.episodesByGroup[group]).toBeGreaterThanOrEqual(1);
+    } finally {
+      await runSql("drop trigger if exists pccc3_refuse_run on graph_episodes", []);
+      await runSql("drop function if exists pccc3_refuse_run()", []);
     }
   });
 
