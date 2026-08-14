@@ -86,12 +86,15 @@ an experiment with replication.
   `npm run db:test:up && npm run test:datamechanics:local` · `npm run check:docs`.
   (The npm script pins the test-DB URL/port; never hand-write the incantation — it drifts.)
 - **Commit BEFORE mutation-testing, and PROVE it — `node scripts/mutation-guard.mjs`.**
-  Mutations are reverted with `git checkout <file>`, which restores the file
-  from the index/HEAD, so any uncommitted edit to a TRACKED file is destroyed
-  by the revert — silently, by the command you expect to succeed. Run the guard
-  before the first mutation; it exits non-zero and names the files at risk.
-  Untracked files do not block (a revert cannot reach them), so a new test file
-  mid-slice is fine.
+  Run the guard before the first mutation; it exits non-zero and names what is
+  at risk. Precisely (verified against real git — an earlier version of this
+  paragraph overstated it, and both reviewers caught that): `git checkout --
+  <file>` restores from the INDEX, so an UNSTAGED edit is destroyed silently by
+  the command you expect to succeed, a STAGED one survives, and untracked files
+  cannot be reached at all. The guard still blocks on any uncommitted tracked
+  change, because the loop's contract is a COMMITTED CHECKPOINT you can return
+  to — not because everything it blocks would be shredded. A new (untracked)
+  test file mid-slice does not block.
 
   This was prose in this skill for its whole life and failed anyway: the same
   operator lost work to it **three times in one session** (2026-08-14/15) —

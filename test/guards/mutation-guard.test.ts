@@ -1,6 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { trackedChanges } from "../../scripts/mutation-guard.mjs";
@@ -18,6 +19,36 @@ import { trackedChanges } from "../../scripts/mutation-guard.mjs";
  */
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+
+/**
+ * A throwaway repo, isolated from the developer's global git config.
+ *
+ * `GIT_CONFIG_GLOBAL=/dev/null` because a global `commit.gpgsign = true` (or any broken global
+ * config) would otherwise break every scratch commit here and redden the guard's own tests on a
+ * machine that has nothing wrong with it — review flagged it. Registered for cleanup so runs do not
+ * litter the temp dir, which they previously did.
+ */
+const scratch: string[] = [];
+function scratchRepo(prefix = "mutguard"): string {
+  const dir = execFileSync("mktemp", ["-d", `${tmpdir()}/${prefix}-XXXXXX`], { encoding: "utf8" }).trim();
+  scratch.push(dir);
+  execFileSync("git", ["init", "-q", dir], { env: gitEnv() });
+  return dir;
+}
+function gitEnv(): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_SYSTEM: "/dev/null",
+    GIT_AUTHOR_NAME: "t",
+    GIT_AUTHOR_EMAIL: "t@t",
+    GIT_COMMITTER_NAME: "t",
+    GIT_COMMITTER_EMAIL: "t@t",
+  };
+}
+afterAll(() => {
+  for (const dir of scratch) rmSync(dir, { recursive: true, force: true });
+});
 
 describe("trackedChanges — what a `git checkout` revert can actually destroy", () => {
   it("blocks on modified tracked files, staged or unstaged", () => {
@@ -60,40 +91,63 @@ describe("the script's exit codes — what the loop actually keys on", () => {
 
   it("exits 0 and reports clean when the tree has no tracked changes", () => {
     // Run against a throwaway clean repo so the result does not depend on this worktree's state.
-    const tmp = execFileSync("mktemp", ["-d"], { encoding: "utf8" }).trim();
-    execFileSync("git", ["init", "-q", tmp]);
-    execFileSync("git", ["-C", tmp, "commit", "-q", "--allow-empty", "-m", "init"], {
-      env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" },
-    });
-    const out = execFileSync("node", [script, "--json"], { cwd: tmp, encoding: "utf8" });
+    const tmp = scratchRepo();
+    execFileSync("git", ["-C", tmp, "commit", "-q", "--allow-empty", "-m", "init"], { env: gitEnv() });
+    const out = execFileSync("node", [script, "--json"], { cwd: tmp, encoding: "utf8", env: gitEnv() });
     expect(JSON.parse(out).clean).toBe(true);
   });
 
   it("exits NON-ZERO when a tracked file is modified — the case that ate real work", () => {
-    const tmp = execFileSync("mktemp", ["-d"], { encoding: "utf8" }).trim();
-    const env = { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" };
-    execFileSync("git", ["init", "-q", tmp]);
-    execFileSync("sh", ["-c", `echo one > ${tmp}/f.txt`]);
-    execFileSync("git", ["-C", tmp, "add", "f.txt"]);
-    execFileSync("git", ["-C", tmp, "commit", "-q", "-m", "add"], { env });
-    execFileSync("sh", ["-c", `echo two > ${tmp}/f.txt`]); // the uncommitted edit a revert would eat
+    const tmp = scratchRepo();
+    execFileSync("sh", ["-c", `echo one > "${tmp}/f.txt"`]);
+    execFileSync("git", ["-C", tmp, "add", "f.txt"], { env: gitEnv() });
+    execFileSync("git", ["-C", tmp, "commit", "-q", "-m", "add"], { env: gitEnv() });
+    execFileSync("sh", ["-c", `echo two > "${tmp}/f.txt"`]); // the UNSTAGED edit a revert would eat
 
     let code = 0;
+    let stderr = "";
     try {
-      execFileSync("node", [script], { cwd: tmp, encoding: "utf8", stdio: "pipe" });
+      execFileSync("node", [script], { cwd: tmp, encoding: "utf8", stdio: "pipe", env: gitEnv() });
     } catch (err) {
-      code = (err as { status?: number }).status ?? -1;
+      const e = err as { status?: number; stderr?: string };
+      code = e.status ?? -1;
+      stderr = e.stderr ?? "";
     }
     expect(code, "the guard must refuse to mutate a dirty tree").toBe(1);
+    // Exit 1 alone is not proof: node exits 1 on ANY uncaught crash, so a crash inside the refusal
+    // path would keep this green for the wrong reason. Review's point; pin the message.
+    expect(stderr, "exit 1 must come from the refusal, not from a crash").toContain("REFUSING");
+  });
+
+  it("refuses from a directory whose path needs URL-encoding — the silent no-op", () => {
+    // `import.meta.url` percent-encodes a space while `argv[1]` does not, so the direct-invocation
+    // check compared unequal and the script exited 0 WITH NO OUTPUT: the guard silently doing nothing,
+    // which is the failure class this whole ticket exists to kill. Reproduced by review.
+    const tmp = scratchRepo("mut guard");
+    execFileSync("sh", ["-c", `cp "${script}" "${tmp}/mg.mjs"`]);
+    execFileSync("sh", ["-c", `echo one > "${tmp}/f.txt"`]);
+    execFileSync("git", ["-C", tmp, "add", "f.txt"], { env: gitEnv() });
+    execFileSync("git", ["-C", tmp, "commit", "-q", "-m", "add"], { env: gitEnv() });
+    execFileSync("sh", ["-c", `echo two > "${tmp}/f.txt"`]);
+
+    let code = 0;
+    let stderr = "";
+    try {
+      execFileSync("node", ["./mg.mjs"], { cwd: tmp, encoding: "utf8", stdio: "pipe", env: gitEnv() });
+    } catch (err) {
+      const e = err as { status?: number; stderr?: string };
+      code = e.status ?? -1;
+      stderr = e.stderr ?? "";
+    }
+    expect(code, "a space in the path must not silently disable the guard").toBe(1);
+    expect(stderr).toContain("REFUSING");
   });
 
   it("exits 0 with only an untracked file present", () => {
-    const tmp = execFileSync("mktemp", ["-d"], { encoding: "utf8" }).trim();
-    const env = { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" };
-    execFileSync("git", ["init", "-q", tmp]);
-    execFileSync("git", ["-C", tmp, "commit", "-q", "--allow-empty", "-m", "init"], { env });
-    execFileSync("sh", ["-c", `echo new > ${tmp}/untracked.txt`]);
-    const out = execFileSync("node", [script, "--json"], { cwd: tmp, encoding: "utf8" });
+    const tmp = scratchRepo();
+    execFileSync("git", ["-C", tmp, "commit", "-q", "--allow-empty", "-m", "init"], { env: gitEnv() });
+    execFileSync("sh", ["-c", `echo new > "${tmp}/untracked.txt"`]);
+    const out = execFileSync("node", [script, "--json"], { cwd: tmp, encoding: "utf8", env: gitEnv() });
     expect(JSON.parse(out).clean).toBe(true);
   });
 });
@@ -102,6 +156,9 @@ describe("guard: the skill actually requires the check", () => {
   it("names the script in the adversarial-build loop's mutation step", () => {
     // The field can ship computed-and-unread; so can a script nothing invokes. Pin the wiring.
     const skill = readFileSync(path.join(ROOT, ".claude", "skills", "adversarial-build", "SKILL.md"), "utf8");
-    expect(skill).toContain("scripts/mutation-guard.mjs");
+    // Containment alone would pass on "never run scripts/mutation-guard.mjs" — review's point. Pin the
+    // IMPERATIVE line instead. Nothing can programmatically prove an agent runs a prose step, so this
+    // is the strongest available assertion, and it is stated as that rather than as proof.
+    expect(skill).toMatch(/PROVE it — `node scripts\/mutation-guard\.mjs`/);
   });
 });

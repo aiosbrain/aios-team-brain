@@ -3,9 +3,20 @@
  * Refuse to start mutation testing on a tree with uncommitted work (MUTGUARD-1).
  *
  * WHY THIS EXISTS, and why prose was not enough. Mutations are applied in place and reverted with
- * `git checkout <file>`, which restores that file from the index/HEAD. Any uncommitted edit to a
- * TRACKED file is therefore destroyed by the revert — silently, because the revert is the thing you
- * expect to succeed. The adversarial-build skill has said "commit BEFORE mutation-testing" since it
+ * `git checkout <file>`, and that revert silently destroys work — because the revert is the thing you
+ * expect to succeed.
+ *
+ * PRECISELY WHAT IT DESTROYS, verified against real git rather than asserted (an earlier version of
+ * this comment, the skill, and three test names all overstated it, and BOTH reviewers caught it):
+ * two-argument `git checkout -- <path>` restores the worktree from the INDEX, not from HEAD. So an
+ * UNSTAGED edit (` M`) is lost, a STAGED one (`M `) SURVIVES, and `MM` loses only the unstaged layer.
+ *
+ * The guard blocks on staged changes anyway, and the reason is the policy rather than the blast
+ * radius: the loop's contract is that a mutation run measures a COMMITTED CHECKPOINT you can return
+ * to. A staged-but-uncommitted tree is not one — and an operator who reaches for
+ * `git checkout HEAD -- <file>` or `git restore -s HEAD` does lose it. Stating that honestly matters
+ * more than the stricter-sounding claim, because a guard justified by something false is one argument
+ * away from being switched off. The adversarial-build skill has said "commit BEFORE mutation-testing" since it
  * was written, and on 2026-08-14/15 the same operator lost work to it three times in one session:
  * an extracted function and its tests were wiped mid-fold, and a commit landed whose tests called a
  * function that no longer existed. A repair script then no-opped against the reverted text and
@@ -26,6 +37,7 @@
  */
 
 import { execFileSync } from "node:child_process";
+import { pathToFileURL } from "node:url";
 
 /**
  * Tracked paths with uncommitted changes — staged or unstaged.
@@ -52,10 +64,32 @@ function main() {
   try {
     porcelain = execFileSync("git", ["status", "--porcelain"], { encoding: "utf8" });
   } catch {
-    // Not a git repo, or git is unavailable. FAIL OPEN with a warning rather than blocking the loop
-    // on an environment problem: the cost of a false block here is that mutation testing cannot run
-    // at all, and the thing being protected is a git-specific hazard that cannot occur without git.
-    process.stderr.write("mutation-guard: could not read git status — skipping the check\n");
+    // The catch used to swallow EVERY failure and exit 0. Review was right that this is the wrong
+    // default inside a real repo: a corrupt index or broken worktree metadata would let the mutation
+    // loop proceed on a tree it could not prove was recoverable — a guard failing open in exactly the
+    // situation it exists for.
+    //
+    // So the two cases are separated. NOT A REPO ⇒ fail OPEN: the hazard is git-specific and cannot
+    // occur, and blocking would stop mutation testing on an environment problem. REPO PRESENT but
+    // status unreadable ⇒ fail CLOSED: we cannot see what is at risk, and "cannot tell" must not read
+    // as "safe" — the standing rule in this codebase.
+    let insideRepo = false;
+    try {
+      insideRepo =
+        execFileSync("git", ["rev-parse", "--is-inside-work-tree"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim() ===
+        "true";
+    } catch {
+      insideRepo = false;
+    }
+    if (insideRepo) {
+      process.stderr.write(
+        "\nmutation-guard: REFUSING to mutate — inside a git worktree but `git status` failed, so the\n" +
+          "tree cannot be verified recoverable. Fix the repo state (a stale index.lock, a corrupt index)\n" +
+          "and re-run.\n\n"
+      );
+      process.exit(1);
+    }
+    process.stderr.write("mutation-guard: not a git repository — nothing a revert could destroy, skipping\n");
     process.exit(0);
   }
 
@@ -73,10 +107,11 @@ function main() {
     process.stderr.write(
       "\nmutation-guard: REFUSING to mutate — these tracked files have uncommitted changes:\n\n" +
         dirty.map((d) => `  ${d.status}  ${d.path}`).join("\n") +
-        "\n\nMutations are reverted with `git checkout <file>`, which restores from the index/HEAD, so\n" +
-        "every change listed above would be DESTROYED — silently, by the revert you expect to succeed.\n" +
-        "This has cost real work three times.\n\n" +
-        "Commit them first (that is the point: a mutation run should measure a tree you can get back).\n" +
+        "\n\nMutation testing must run against a COMMITTED CHECKPOINT you can get back. Commit these first.\n\n" +
+        "What the revert actually eats: `git checkout -- <file>` restores from the INDEX, so an\n" +
+        "UNSTAGED edit is destroyed silently by the command you expect to succeed (this has cost real\n" +
+        "work three times). A STAGED edit survives that particular command — but it is still not a\n" +
+        "checkpoint, and `git checkout HEAD -- <file>` does take it.\n\n" +
         "Untracked files are not listed and do not block — a revert cannot reach them.\n\n"
     );
   }
@@ -84,4 +119,19 @@ function main() {
 }
 
 // Only run when invoked directly, so the pure helper above can be imported by its test.
-if (import.meta.url === `file://${process.argv[1]}`) main();
+//
+// `pathToFileURL`, NOT a `file://` template. `import.meta.url` percent-encodes (a space becomes
+// `%20`) while `process.argv[1]` is raw, so from a directory whose path needs encoding the comparison
+// failed and the script exited 0 WITH NO OUTPUT — the guard the skill had just told you to trust,
+// silently doing nothing. That is the exact failure class this ticket exists to kill, and the same
+// shape as the repair script that printed success over reverted text. Found by review, reproduced
+// live from `/tmp/mut guard .../`.
+const invokedDirectly = process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (invokedDirectly) {
+  main();
+} else if (process.argv[1] !== undefined && /mutation-guard\.mjs$/.test(process.argv[1])) {
+  // Belt and braces: if this file was clearly the entry point but the URL comparison still disagreed,
+  // say so loudly rather than exiting silently. A guard that declines to run must never do it quietly.
+  process.stderr.write("mutation-guard: could not confirm direct invocation — refusing to stay silent\n");
+  main();
+}
