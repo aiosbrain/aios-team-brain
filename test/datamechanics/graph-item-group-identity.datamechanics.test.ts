@@ -156,13 +156,17 @@ describe("PCCC-3 Deploy A — per-(item, group) ledger identity", () => {
     const seed = await seedTeam();
     const r = await ingest(seed, { body: "this write will be refused", path: "loud.md", access: "team" });
 
-    // A real-Postgres fault: refuse every graph_episodes write for this item. The pg adapter
-    // returns { error } rather than throwing, so pre-PCCC-3 code sails past this and resolves —
-    // which is exactly the silence the design forbids.
+    // A real-Postgres fault: refuse the item's REAL-SHA ledger write only — the `''` reservation
+    // insert passes. Conditioned on the sha deliberately: the reservation's own throw also matches
+    // a broad refusal, which would mask a muted final-write throw (each defense layer needs its
+    // DISTINCT property pinned). The pg adapter returns { error } rather than throwing, so
+    // pre-PCCC-3 code sails past this and resolves — exactly the silence the design forbids.
     await runSql(
       `create or replace function pccc3_refuse_marked() returns trigger language plpgsql as $$
          begin
-           if new.source_id = '${r.id}' then raise exception 'pccc3 marked row refused'; end if;
+           if new.source_id = '${r.id}' and new.content_sha256 <> '' then
+             raise exception 'pccc3 marked row refused';
+           end if;
            return new;
          end $$`,
       []
