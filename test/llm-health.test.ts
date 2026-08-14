@@ -3,6 +3,7 @@ import {
   degradedNote,
   deriveLlmState,
   deriveTaskHealth,
+  pickReportedFailure,
   taskLabel,
   TASK_RECENCY_MS,
   type LlmRun,
@@ -221,5 +222,62 @@ describe("taskLabel", () => {
     // A raw `doc-task-infer` in an operator sentence is the defect; the fallback is the steady state
     // after any new generation feature, not an error path.
     expect(taskLabel("doc-task-infer")).toBe("a background task (doc-task-infer)");
+  });
+});
+
+describe("pickReportedFailure — the singular fields must not describe a HEALED task", () => {
+  const T = (task: string, state: "healthy" | "unstable" | "degraded", model: string, failedAgo: number | null) => ({
+    task,
+    state,
+    model,
+    lastError: failedAgo === null ? null : "err",
+    lastFailedAt: failedAgo === null ? null : ago(failedAgo),
+    lastOkAt: null,
+  });
+
+  it("ignores a healed blip whose failure is NEWER than the real outage", () => {
+    // The regression both reviewers found. `arcs` blipped 30 min ago and healed 10 min ago — this
+    // install's measured normal — while `meeting-summary` has been confirmed-failing for hours. The
+    // healed task's failure row is the NEWEST failure, so a naive "newest failing row" picks it and
+    // the card names the reasoning model during a query-model outage.
+    const picked = pickReportedFailure([
+      T("arcs", "healthy", "reasoning-model", 30 * 60_000),
+      T("meeting-summary", "degraded", "query-model", 3 * HOUR),
+    ]);
+    expect(picked?.task).toBe("meeting-summary");
+    expect(picked?.model).toBe("query-model");
+  });
+
+  it("prefers a DEGRADED task over an unstable one, even when the unstable failure is newer", () => {
+    const picked = pickReportedFailure([
+      T("attribution", "unstable", "query-model", 1 * HOUR),
+      T("meeting-summary", "degraded", "query-model", 5 * HOUR),
+    ]);
+    expect(picked?.task).toBe("meeting-summary");
+  });
+
+  it("is undefined when every task is healthy — a green leg reports no failure at all", () => {
+    expect(pickReportedFailure([T("arcs", "healthy", "m", 2 * HOUR)])).toBeUndefined();
+    expect(pickReportedFailure([])).toBeUndefined();
+  });
+});
+
+describe("degradedNote — 'Still working' is an observation, not a guess", () => {
+  it("does NOT list an unstable task, whose newest run just failed", () => {
+    // `state !== "degraded"` would list it; its own newest observation contradicts the claim.
+    const tasks = deriveTaskHealth(
+      [
+        run("meeting-summary", false, ago(1 * HOUR)),
+        run("meeting-summary", false, ago(2 * HOUR)),
+        run("attribution", false, ago(30 * 60_000)),
+        run("attribution", true, ago(3 * HOUR)),
+        run("arcs", true, ago(4 * HOUR)),
+      ],
+      NOW
+    );
+    expect(tasks.find((t) => t.task === "attribution")?.state).toBe("unstable");
+    const note = degradedNote(tasks);
+    expect(note).toMatch(/Still working:.*Learning arcs/);
+    expect(note).not.toMatch(/Still working:.*attribution/);
   });
 });
