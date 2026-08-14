@@ -143,6 +143,42 @@ describe("the script's exit codes — what the loop actually keys on", () => {
     expect(stderr).toContain("REFUSING");
   });
 
+  it("fails CLOSED when git status fails INSIDE a worktree — cannot tell is not safe", () => {
+    // Codex's finding: the catch swallowed every git failure and exited 0, so a corrupt index let the
+    // mutation loop proceed on a tree it could not prove recoverable — failing open in exactly the
+    // situation the guard exists for. A truncated `.git/index` reproduces it: `git status` dies with
+    // "index file smaller than expected" while `rev-parse --is-inside-work-tree` still answers `true`,
+    // which is precisely the pair the fix keys on.
+    //
+    // This mutation SURVIVED the first fold — the fix shipped untested — which is the third time in
+    // this session that a reviewer's finding was folded without pinning it.
+    const tmp = scratchRepo();
+    execFileSync("git", ["-C", tmp, "commit", "-q", "--allow-empty", "-m", "init"], { env: gitEnv() });
+    execFileSync("sh", ["-c", `echo garbage-not-an-index > "${tmp}/.git/index"`]);
+
+    let code = 0;
+    let stderr = "";
+    try {
+      execFileSync("node", [script], { cwd: tmp, encoding: "utf8", stdio: "pipe", env: gitEnv() });
+    } catch (err) {
+      const e = err as { status?: number; stderr?: string };
+      code = e.status ?? -1;
+      stderr = e.stderr ?? "";
+    }
+    expect(code, "an unreadable repo must block, not wave the loop through").toBe(1);
+    expect(stderr).toContain("REFUSING");
+  });
+
+  it("fails OPEN when there is no repo at all — the hazard cannot exist without git", () => {
+    // The other half, and the reason the two cases are separated: blocking here would stop mutation
+    // testing on an environment problem, and `git checkout` cannot destroy anything where there is no
+    // git. Over-blocking is how a guard gets bypassed.
+    const tmp = execFileSync("mktemp", ["-d", `${tmpdir()}/mutguard-norepo-XXXXXX`], { encoding: "utf8" }).trim();
+    scratch.push(tmp);
+    const out = execFileSync("node", [script, "--json"], { cwd: tmp, encoding: "utf8", env: gitEnv() });
+    expect(JSON.parse(out).clean).toBe(true);
+  });
+
   it("exits 0 with only an untracked file present", () => {
     const tmp = scratchRepo();
     execFileSync("git", ["-C", tmp, "commit", "-q", "--allow-empty", "-m", "init"], { env: gitEnv() });

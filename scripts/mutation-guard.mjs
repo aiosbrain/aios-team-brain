@@ -82,6 +82,7 @@ function main() {
       insideRepo = false;
     }
     if (insideRepo) {
+      if (json) process.stdout.write(JSON.stringify({ clean: false, unreadable: true, dirty: [] }, null, 2) + "\n");
       process.stderr.write(
         "\nmutation-guard: REFUSING to mutate — inside a git worktree but `git status` failed, so the\n" +
           "tree cannot be verified recoverable. Fix the repo state (a stale index.lock, a corrupt index)\n" +
@@ -89,6 +90,9 @@ function main() {
       );
       process.exit(1);
     }
+    // `--json` must ALWAYS emit JSON — it is the machine-readable contract, and a caller parsing it
+    // gets "Unexpected end of JSON input" otherwise. Found by the test written for the branch above.
+    if (json) process.stdout.write(JSON.stringify({ clean: true, noRepo: true, dirty: [] }, null, 2) + "\n");
     process.stderr.write("mutation-guard: not a git repository — nothing a revert could destroy, skipping\n");
     process.exit(0);
   }
