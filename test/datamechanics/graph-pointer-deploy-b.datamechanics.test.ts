@@ -274,7 +274,10 @@ describe("PCCC-4 — projects.graph_group_id: stored pointers, one writer", () =
       .select("id")
       .single();
     const id = (data as { id: string }).id;
-    await runSql("update projects set graph_group_id = $1 where id = $2", [`g_${"f".repeat(32)}_p_${"e".repeat(32)}`, id]);
+    // LEGACY-SHAPED deliberately: a value the built-in shape check would BLESS — the ordinary
+    // branch's DISTINCT property is refusing it anyway (an initiative may only hold its mint).
+    // A garbage-shaped fixture passed via the shape layer and masked a deleted ordinary branch.
+    await runSql("update projects set graph_group_id = $1 where id = $2", ["someoneelses_team", id]);
 
     const r = await ensureProjectGraphPointer(db(), { teamId: seed.teamId, projectId: id });
     expect(r.ok).toBe(false);
