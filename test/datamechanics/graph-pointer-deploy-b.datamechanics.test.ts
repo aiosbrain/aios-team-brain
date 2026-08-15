@@ -202,6 +202,85 @@ describe("PCCC-4 — projects.graph_group_id: stored pointers, one writer", () =
     expect(bySlug["extracted-from-meetings"].g).toMatch(/^g_[0-9a-f]{32}_p_[0-9a-f]{32}$/);
   });
 
+  it("a reused slug whose legacy group holds ANOTHER team's history is REFUSED, not silently inherited (Codex High 1)", async () => {
+    // Team A projected under slug 'X', renamed away BEFORE any backfill claimed X_team for it;
+    // team B then takes slug X. B's bootstrap must refuse loudly — silently pointing B's General
+    // at X_team would hand B every historical fact A pushed there.
+    const a = await seedTeam();
+    const oldSlug = a.teamSlug;
+    const { error: epErr } = await db().from("graph_episodes").insert({
+      team_id: a.teamId,
+      source_table: "items",
+      source_id: crypto.randomUUID(),
+      group_id: `${oldSlug}_team`,
+      content_sha256: sha("a's history"),
+    });
+    expect(epErr).toBeNull();
+    expect((await db().from("teams").update({ slug: `moved-${crypto.randomUUID().slice(0, 8)}` }).eq("id", a.teamId)).error).toBeNull();
+
+    const b = await seedTeam();
+    expect((await db().from("teams").update({ slug: oldSlug }).eq("id", b.teamId)).error).toBeNull();
+
+    const boot = await ensureAccessBootstrap(db(), b.teamId);
+    expect(boot.ok).toBe(false);
+    expect(boot.error ?? "").toMatch(/another team's historical episodes|slug reuse/);
+    const ptr = await runSql<{ g: string | null }>(
+      "select graph_group_id as g from projects where team_id = $1 and slug = 'general'",
+      [b.teamId]
+    );
+    // Whatever partial state bootstrap left, the pointer must NOT be the foreign group.
+    for (const row of ptr.rows) expect(row.g).not.toBe(`${oldSlug}_team`);
+  });
+
+  it("the backfill's foreign-history guard leaves a reused-slug built-in NULL instead of pointing or minting it", async () => {
+    const a = await seedTeam();
+    const oldSlug = a.teamSlug;
+    expect(
+      (
+        await db().from("graph_episodes").insert({
+          team_id: a.teamId,
+          source_table: "items",
+          source_id: crypto.randomUUID(),
+          group_id: `${oldSlug}_team`,
+          content_sha256: sha("history"),
+        })
+      ).error
+    ).toBeNull();
+    expect((await db().from("teams").update({ slug: `gone-${crypto.randomUUID().slice(0, 8)}` }).eq("id", a.teamId)).error).toBeNull();
+
+    const b = await seedTeam();
+    expect((await db().from("teams").update({ slug: oldSlug }).eq("id", b.teamId)).error).toBeNull();
+    const { data } = await db()
+      .from("projects")
+      .insert({ team_id: b.teamId, slug: "general", name: "General", kind: "system" })
+      .select("id")
+      .single();
+    const generalId = (data as { id: string }).id;
+    await runSql("update projects set graph_group_id = null where id = $1", [generalId]);
+
+    const migration = readFileSync(join(MIGRATION_DIR, "20260815140000_projects_graph_group_id.sql"), "utf8");
+    await runSql(migration, []);
+
+    const g = (await runSql<{ g: string | null }>("select graph_group_id as g from projects where id = $1", [generalId]))
+      .rows[0].g;
+    expect(g).toBeNull(); // neither the foreign legacy id NOR a minted id — left for the loud refusal
+  });
+
+  it("a corrupt pointer on an ORDINARY project is loud, never blessed (Codex Medium 2)", async () => {
+    const seed = await seedTeam();
+    const { data } = await db()
+      .from("projects")
+      .insert({ team_id: seed.teamId, slug: "ord", name: "ord", kind: "initiative" })
+      .select("id")
+      .single();
+    const id = (data as { id: string }).id;
+    await runSql("update projects set graph_group_id = $1 where id = $2", [`g_${"f".repeat(32)}_p_${"e".repeat(32)}`, id]);
+
+    const r = await ensureProjectGraphPointer(db(), { teamId: seed.teamId, projectId: id });
+    expect(r.ok).toBe(false);
+    expect(r.error ?? "").toContain("corrupt");
+  });
+
   it("two projects can never share a graph partition (partial unique on graph_group_id)", async () => {
     const seed = await seedTeam();
     const { data } = await db()

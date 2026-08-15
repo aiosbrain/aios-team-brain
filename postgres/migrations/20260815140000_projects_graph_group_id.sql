@@ -11,14 +11,23 @@
 -- `graph_group_id is null` (a replay never re-mints), and the index is IF NOT EXISTS.
 alter table projects add column if not exists graph_group_id text;
 
--- Grandfathered built-ins FIRST (the catch-all below must not mint over them).
+-- Grandfathered built-ins FIRST (the catch-all below must not mint over them). The
+-- `not exists` term is the FOREIGN-HISTORY refusal (PCCC-4 code review, Codex High 1): a team
+-- that renamed away BEFORE this backfill left its historical episodes under the old slug's
+-- group; a new team holding that slug must NOT silently inherit them — its built-in stays
+-- unpointed here, and the pointer writer's own foreign-history check then refuses LOUDLY with
+-- the named repair at the next bootstrap.
 update projects p
    set graph_group_id = t.slug || '_team'
   from teams t
  where p.team_id = t.id
    and p.kind = 'system'
    and p.slug = 'general'
-   and p.graph_group_id is null;
+   and p.graph_group_id is null
+   and not exists (
+     select 1 from graph_episodes ge
+      where ge.group_id = t.slug || '_team' and ge.team_id <> p.team_id
+   );
 
 update projects p
    set graph_group_id = t.slug || '_external'
@@ -26,13 +35,21 @@ update projects p
  where p.team_id = t.id
    and p.kind = 'system'
    and p.slug = 'external-shared'
-   and p.graph_group_id is null;
+   and p.graph_group_id is null
+   and not exists (
+     select 1 from graph_episodes ge
+      where ge.group_id = t.slug || '_external' and ge.team_id <> p.team_id
+   );
 
 -- Everything else mints the per-project scheme (hyphen-stripped UUIDs, charset-safe by
--- construction — mirrors lib/graph/group.projectGroupId exactly).
+-- construction — mirrors lib/graph/group.projectGroupId exactly). Built-ins are EXCLUDED, not
+-- just already-pointed: one skipped above by the foreign-history refusal must stay NULL so the
+-- pointer writer refuses loudly at bootstrap — minting it here would hand General an empty
+-- partition, the design's §2.0 silently-empty failure.
 update projects
    set graph_group_id = 'g_' || replace(team_id::text, '-', '') || '_p_' || replace(id::text, '-', '')
- where graph_group_id is null;
+ where graph_group_id is null
+   and not (kind = 'system' and slug in ('general', 'external-shared'));
 
 -- Two projects may never share a partition: injective by CONSTRAINT, not convention. Partial so a
 -- not-yet-pointed row (the insert-then-point window at creation) doesn't collide on null.

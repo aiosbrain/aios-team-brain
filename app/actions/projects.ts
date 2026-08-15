@@ -51,7 +51,13 @@ export async function createProjectAction(input: {
         .eq("slug", slug)
         .maybeSingle();
       if (existing) {
-        await ensureProjectGraphPointer(db, { teamId: input.teamId, projectId: (existing as ProjectRow).id });
+        const heal = await ensureProjectGraphPointer(db, { teamId: input.teamId, projectId: (existing as ProjectRow).id });
+        // A failing heal must not hide behind the duplicate-name error (Codex Medium 3): a
+        // half-created project would otherwise stay unpointed forever with every retry reading
+        // "already exists" — dark under PCCC-6's fail-closed read, invisible to the operator.
+        if (!heal.ok) {
+          return { ok: false, error: `a project "${slug}" already exists — and its graph pointer is unhealed: ${heal.error}` };
+        }
       }
       return { ok: false, error: `a project "${slug}" already exists` };
     }

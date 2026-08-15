@@ -28,11 +28,11 @@ const RAW_SQL_POINTER_WRITE = /set\s+graph_group_id/i;
  * cannot prove a creation path CALLS the writer. Deleting the dashboard action's call left every
  * test green; this list makes each wired site load-bearing.
  */
-const REQUIRED_CALL_SITES = [
-  join("lib", "access", "bootstrap.ts"),
-  join("app", "actions", "projects.ts"),
-  join("lib", "ingest", "index.ts"),
-  join("lib", "meetings", "extract-todos.ts"),
+const REQUIRED_CALL_SITES: { file: string; minCalls: number }[] = [
+  { file: join("lib", "access", "bootstrap.ts"), minCalls: 2 }, // fresh insert + adoption/convergence
+  { file: join("app", "actions", "projects.ts"), minCalls: 2 }, // success path + duplicate-branch heal (Codex M3: a substring check let either one vanish)
+  { file: join("lib", "ingest", "index.ts"), minCalls: 1 },
+  { file: join("lib", "meetings", "extract-todos.ts"), minCalls: 1 },
 ];
 
 function walk(dir: string, out: string[] = []): string[] {
@@ -70,9 +70,12 @@ describe("projects.graph_group_id single-writer", () => {
   });
 
   it("every creation path CALLS the writer — forbidding writes elsewhere cannot prove the wiring exists", () => {
-    for (const rel of REQUIRED_CALL_SITES) {
-      const src = readFileSync(join(ROOT, rel), "utf8");
-      expect(src.includes("ensureProjectGraphPointer("), `${rel} no longer calls ensureProjectGraphPointer`).toBe(true);
+    for (const { file, minCalls } of REQUIRED_CALL_SITES) {
+      const src = readFileSync(join(ROOT, file), "utf8");
+      const calls = (src.match(/ensureProjectGraphPointer\(/g) ?? []).length;
+      expect(calls, `${file}: ${calls} ensureProjectGraphPointer call(s), needs ≥ ${minCalls}`).toBeGreaterThanOrEqual(
+        minCalls
+      );
     }
   });
 });
