@@ -45,7 +45,10 @@ export async function ensureProjectGraphPointer(
     .eq("id", args.projectId)
     .eq("team_id", args.teamId)
     .maybeSingle();
-  const row = rowData as { slug: string; kind: string; graph_group_id: string | null } | null;
+  const rawRow = rowData as { slug: string; kind: string; graph_group_id?: string | null } | null;
+  // Normalize undefined → null at the boundary: Postgres returns null for an unset column, but an
+  // in-memory double returns undefined for a column its insert never carried — same meaning here.
+  const row = rawRow ? { ...rawRow, graph_group_id: rawRow.graph_group_id ?? null } : null;
   if (rowErr || !row) {
     return { ok: false, error: `graph pointer: project ${args.projectId} unreadable: ${rowErr?.message ?? "no row"}` };
   }
