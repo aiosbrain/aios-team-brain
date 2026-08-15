@@ -9,9 +9,11 @@ import {
   extractionLagHours,
   extractionObservationNote,
   extractionStallReason,
+  extractionStallShortText,
   parseProbeTimestamp,
   readExtractionSignals,
   EXTRACTION_LAG_BUDGET_MS,
+  EXTRACTION_STALL_CAUSES,
   MIN_ITEMS_FOR_EXTRACTION_SIGNAL,
   type ExtractionLiveness,
   type ExtractionSignals,
@@ -416,6 +418,24 @@ describe("extractionStallReason — what each cause is allowed to claim", () => 
       expect(extractionStallReason(cause, args({ facts: 7 })), cause).not.toMatch(groupish);
     }
     expect(extractionObservationNote(30)).not.toMatch(groupish);
+  });
+
+  it("EVERY cause has its own sentence — iterated at runtime, not enforced by an annotation", () => {
+    // MUTATION-FOUND GAP. The card's copy map is typed `Record<ExtractionStallCause, …>`, which does
+    // redden `tsc` when an entry is DELETED — but swapping the annotation for `Record<string, …>` and
+    // adding a fourth cause compiles clean, and the new cause silently renders the `stopped` wording.
+    // That is "the guard is satisfiable by editing the guard", which two reviewers found in LLMOBS-1
+    // and a mutation found here. `EXTRACTION_STALL_CAUSES` exists so this can be checked at runtime:
+    // add a cause without giving it copy and these assertions fail whatever the types say.
+    const short = EXTRACTION_STALL_CAUSES.map((c) => extractionStallShortText(c, { lagHours: 3 }));
+    const long = EXTRACTION_STALL_CAUSES.map((c) =>
+      extractionStallReason(c, { items: 30, facts: 0, lagHours: 3, liveness: WORKER_NEVER })
+    );
+    expect(new Set(short).size, "two causes share one short text").toBe(EXTRACTION_STALL_CAUSES.length);
+    expect(new Set(long).size, "two causes share one reason").toBe(EXTRACTION_STALL_CAUSES.length);
+    for (const s of [...short, ...long]) expect(s.length).toBeGreaterThan(20);
+    // …and the enumeration is the real one, not a stale copy of it.
+    expect([...EXTRACTION_STALL_CAUSES].sort()).toEqual(["never-completed", "no-facts", "stopped"]);
   });
 
   it("the observation says what it is and does not accuse", () => {

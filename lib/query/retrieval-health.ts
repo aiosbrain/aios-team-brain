@@ -5,6 +5,7 @@ import { graphitiConfigured, GraphitiClient } from "@/lib/graph/graphiti-client"
 import { getLlmHealth, type LlmHealth } from "@/lib/query/llm-health";
 import { resolveGraphChatTarget, resolveGraphEmbeddingTarget, isRefusal } from "@/lib/llm/graph-proxy";
 import {
+  extractionStallShortText,
   groupCensuses,
   readExtractionSignals,
   type CensusRefusal,
@@ -66,6 +67,10 @@ export interface RetrievalHealth {
   /** The server-composed operator sentence for that stall — single writer, shared verbatim with the
    *  pipeline banner via `lib/graph/extraction-health.extractionStallReason`. */
   graphExtractionReason: string | null;
+  /** The server-composed SHORT leg text for that stall (the card appends its own freshness suffix).
+   *  Server-side for the same reason as the reason string: the card used to compose it and hard-coded
+   *  one cause's wording for both. Null when not stalled. */
+  graphExtractionShortText: string | null;
   /**
    * A TRUE but NON-LOUD statement: this team has no completed extraction, and the graph worker is
    * provably completing other groups' work, so the likeliest cause is queue depth (STALLSCOPE-1 §2e).
@@ -280,6 +285,10 @@ export async function getRetrievalHealth(teamId: string): Promise<RetrievalHealt
   const graphExtractionCause = graphExtractionStalled ? (graphExtraction?.verdict.cause ?? null) : null;
   const graphExtractionLagHours = graphExtraction?.lagHours ?? null;
   const graphExtractionReason = graphExtractionStalled ? (graphExtraction?.reason ?? null) : null;
+  const graphExtractionShortText =
+    graphExtractionStalled && graphExtractionCause !== null
+      ? extractionStallShortText(graphExtractionCause, { lagHours: graphExtraction?.lagHours ?? null })
+      : null;
   // The suppressed-but-true state (STALLSCOPE-1 §2e): no completed extraction for this team, but the
   // worker is provably completing other groups' work, so this is queue depth rather than a failure. It
   // renders as a note on this card and reaches no banner.
@@ -326,6 +335,7 @@ export async function getRetrievalHealth(teamId: string): Promise<RetrievalHealt
     graphExtractionStalled,
     graphExtractionCause,
     graphExtractionReason,
+    graphExtractionShortText,
     graphExtractionNote,
     graphExtractionLagHours,
     graphNewestFactAt:

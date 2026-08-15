@@ -4,7 +4,6 @@ import type {
   LegState,
   GroupCensusSummary,
 } from "@/lib/query/retrieval-health";
-import type { ExtractionStallCause } from "@/lib/graph/extraction-health";
 import type { LlmHealthState } from "@/lib/query/llm-health";
 import { timeAgo } from "@/components/format";
 
@@ -118,35 +117,25 @@ export function RetrievalHealthCard({ health }: { health: RetrievalHealth }) {
   const graphStalled = health.graphStalled;
   // Reachable + writing episodes, but Graphiti isn't turning them into a finished job. A distinct,
   // more specific cause than a stalled projector, so it gets its own detail + banner and takes
-  // priority. TWO causes, and they make different factual claims — `never-extracted` may say "0
-  // facts", `stopped` may NOT: after STALLPROBE-1 a liveness stall fires with facts ≫ 0 (prod holds
-  // 113,352), so the old single hard-coded sentence would have asserted "extracting 0 facts" beside
-  // this card's own fact count. The server owns both the discriminator and the sentence
-  // (`lib/graph/extraction-health.extractionStallCause`/`extractionStallReason`) so this card and the
-  // pipeline banner cannot drift apart again.
+  // priority. THREE causes now (STALLSCOPE-1), and they make different factual claims — only
+  // `no-facts` may say "0 facts", and `never-completed` may not assert a dead worker. After
+  // STALLPROBE-1 a liveness stall fires with facts >> 0 (prod holds 113,352), so the old single
+  // hard-coded sentence asserted "extracting 0 facts" beside this card's own fact count. The server
+  // owns the discriminator AND both sentences (`extractionStallShortText`/`extractionStallReason`),
+  // so this card and the pipeline banner cannot drift apart again.
   const graphExtractionStalled = health.graphExtractionStalled;
   const graphFreshness =
     health.graphItems != null
       ? `${health.graphItems} items${health.graphLastProjectedAt ? ` · last projected ${timeAgo(health.graphLastProjectedAt)}` : " · none projected yet"}`
       : undefined;
-  // The short leg text for a stall, matched to the cause — a TOTAL map over the cause union, not an
-  // if/else with a default (STALLSCOPE-1). The default branch is what let this card assert "0 facts"
-  // about a liveness stall before STALLPROBE-1; typed as `Record<ExtractionStallCause, …>`, a fourth
-  // cause fails the build instead of silently inheriting the `stopped` wording.
-  //
-  // The MEASURED lag, not the budget constant. An earlier draft hard-coded "over 6h", which silently
-  // drifts if `EXTRACTION_LAG_BUDGET_MS` changes (review). Importing the constant here would drag a
-  // `server-only` module into a component, so the server passes the real number — which is more use to
-  // an operator than the threshold anyway.
-  const lagText =
-    health.graphExtractionLagHours === null
-      ? "longer than the alarm budget"
-      : `~${health.graphExtractionLagHours}h`;
-  const graphStallDetail: Record<ExtractionStallCause, string> = {
-    "no-facts": `0 extracted facts in this team's graph groups — ${graphFreshness}`,
-    "never-completed": `no extraction has ever completed for this team — ${graphFreshness}`,
-    stopped: `no extraction has completed in ${lagText} — ${graphFreshness}`,
-  };
+  // The short leg text for a stall comes from the SERVER, matched to the cause — this card composes
+  // no claim about extraction at all now. It used to hard-code the never-extracted wording for both
+  // causes, so a liveness stall asserted "extracting 0 facts" beside this card's own fact count. What
+  // is left here is formatting: the freshness suffix.
+  const graphStallDetail =
+    health.graphExtractionShortText === null
+      ? undefined
+      : `${health.graphExtractionShortText} — ${graphFreshness}`;
   // Extraction failing the OTHER way (AIO-693, census signal since ALARMFIX-1): episodes become
   // facts, but a group is accumulating same-name entity splits over its own baseline — identity is
   // being resolved badly. A stall outranks it in the copy below, same priority as the server's
@@ -155,8 +144,8 @@ export function RetrievalHealthCard({ health }: { health: RetrievalHealth }) {
   const graphDetail =
     health.graph === "off"
       ? "not configured"
-      : graphExtractionStalled && health.graphExtractionCause !== null
-        ? graphStallDetail[health.graphExtractionCause]
+      : graphExtractionStalled && graphStallDetail !== undefined
+        ? graphStallDetail
         : graphCensusPolluted
           ? `same-name entity splits above this graph's own baseline — ${graphFreshness}`
           : graphStalled
