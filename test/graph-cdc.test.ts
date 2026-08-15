@@ -453,8 +453,8 @@ describe("churn: how many chunk hashes change under a real edit — CDC vs the b
  *      spanning a SURVIVING boundary changes both adjacent chunks (churn 2), and an edit past the
  *      80-chunk admitted prefix changes nothing at all (churn 0).
  *
- * THE RULE, verified before it was written down — 4,962 unchanged-sequence samples swept across the
- * corpus at 97-character steps, 4,962 agreements, zero mismatches, under both this file's set-based
+ * THE RULE, verified before it was written down — 5,658 unchanged-sequence samples swept across the
+ * corpus at 97-character steps, 5,658 agreements, zero mismatches, under both this file's set-based
  * `changedCount` and a positional diff:
  *
  *   **churn = the number of ADMITTED chunk intervals the changed span intersects.**
@@ -462,9 +462,11 @@ describe("churn: how many chunk hashes change under a real edit — CDC vs the b
  * So exactly 1 needs two things together: the edit changes text, and it lies wholly inside one admitted
  * chunk. (A third condition — "no boundary strictly inside the edit span" — was specified and then
  * deleted as provably dead; see `classify`.) Anything else is reported, not gated — because when
- * the boundary sequence does change there is NO usable ceiling: the same sweep reaches **78 of 80**
- * admitted chunks for a 20-character edit (`docs/ARCHITECTURE.md` @7111) against a legacy churn of 1.
- * A ceiling asserted on a fixture would pin the fixture, not the algorithm.
+ * the boundary sequence does change there is NO usable ceiling: the same sweep reaches **8 of 80**
+ * admitted chunks for a 20-character edit (`docs/ARCHITECTURE.md` @181,517) against a legacy churn of
+ * 1 — already past the ceiling of 6 this file used to assert. An earlier measurement reached 78 before
+ * a merge changed that document, which is the live-corpus hazard in miniature: none of these numbers
+ * gates anything, and the assertions below rest on the rule and the classification instead.
  */
 describe("CDCCHURN-1: in-place same-length churn is the number of chunks the edit touches", () => {
   const EDIT_AT = 20_000;

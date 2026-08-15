@@ -291,18 +291,23 @@ create one where none was, or span a surviving one. The true rule, verified over
 with zero mismatches (`test/graph-cdc.test.ts`, CDCCHURN-1):
 
 > **churn = the number of admitted chunk intervals the changed span intersects.**
+>
+> (measured at `2b1778d` — the corpus is deliberately live, so these numbers carry a SHA)
 
-Exactly 1 requires all three: the edit changes text, it lies wholly inside one admitted chunk, and no
-boundary falls strictly inside it. Otherwise there is no useful ceiling — measured over this repo's own
-markdown, a 20-character in-place edit reaches **78 of the 80 admitted chunks**.
+Exactly 1 requires two things: the edit changes text, and it lies wholly inside one admitted chunk.
+(A third condition — "no boundary strictly inside the edit span" — is implied by the second, and was
+deleted after a mutation showed nothing could redden it.) Otherwise there is no useful ceiling —
+measured over this repo's own markdown, a 20-character in-place edit reaches **8 of the 80 admitted
+chunks**, and that number moves as the corpus does: an earlier measurement, on a longer
+`docs/ARCHITECTURE.md`, reached 78.
 
 **So the honest trade, both directions measured on the same corpus:**
 
-| edit | CDC | byte offsets |
+| edit (measured at `2b1778d`) | CDC | byte offsets |
 |---|---:|---:|
-| in-place, same length, boundary-changing (`docs/ARCHITECTURE.md` @7111) | **78** | **1** |
+| in-place, same length, boundary-changing (`docs/ARCHITECTURE.md` @181,517) | **8** | **1** |
 | in-place, same length, boundary-preserving (@20,000) | 1 | 1 |
-| insertion of 33 chars near the top | **5** | **78** |
+| insertion of 33 chars near the top | **1** | **80** |
 
 CDC is **not** "never worse than byte offsets", and this document should never have implied it. It is
 dramatically better on the insertion cascade this lever exists for, and dramatically worse on an

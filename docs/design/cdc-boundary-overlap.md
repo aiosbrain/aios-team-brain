@@ -37,12 +37,12 @@ Each wrong answer was cheap prose that would have shipped as documentation:
 
 **When the boundary sequence is unchanged, churn equals the number of ADMITTED chunk intervals that
 intersect the changed span.** Exactly 1 requires two things together: the edit changes text, and it
-lies wholly inside one admitted chunk. (Draft 3 first wrote a third condition — "no boundary strictly
+lies wholly inside one admitted chunk. (This draft first wrote a third condition — "no boundary strictly
 inside the edit span" — which a mutation then proved redundant; see §2b.)
 
 Verified by sweeping every corpus document ≥25k characters at 97-character offset steps and comparing
-the count this rule predicts against the measured churn: **4,962 unchanged-sequence samples, 4,962
-agreements, zero mismatches.** The 0-churn (past-cap) and 2-churn (spans a surviving boundary) cases
+the count this rule predicts against the measured churn: **5,658 unchanged-sequence samples, 5,658
+agreements, zero mismatches** (measured at `2b1778d`; see the staleness note below). The 0-churn (past-cap) and 2-churn (spans a surviving boundary) cases
 fall out of the same rule rather than needing exceptions.
 
 ### 0c. When the sequence DOES change, there is no usable ceiling
@@ -51,25 +51,33 @@ Draft 2 proposed asserting a re-synchronisation ceiling of 6 (the existing test'
 measured worst case of 5). Measured across the same sweep, restricted to edits inside the admitted
 prefix, the changed-sequence bucket is:
 
-| churn | 2 | 3–6 | 7–20 | 21–50 | 51–78 |
-|---|---:|---:|---:|---:|---:|
-| samples | 202 | 111 | 13 | 25 | 63 |
+| churn | 2 | 3–6 | 7–20 |
+|---|---:|---:|---:|
+| samples | 223 | 211 | 5 |
 
-**Maximum 78 of 80 admitted chunks**, from a 20-character in-place edit at `docs/ARCHITECTURE.md`
-@7111. Codex separately constructed a document reaching 8 at the test's own fixed offset. So 6 is
-fitted to one offset on today's corpus, and **no ceiling is assertable at all** — asserting one against
-a fixture would pin the fixture, not the algorithm. Draft 3 therefore asserts the changed branch's
-*classification* and *direction* (≥ 2, boundary provably destroyed), never a magnitude.
+**Maximum 8 of 80 admitted chunks**, from a 20-character in-place edit at `docs/ARCHITECTURE.md`
+@181,517 — against a legacy churn of **1** for the same edit. A reviewer independently *constructed* a
+document reaching 8 at the test's own fixed offset. So the existing ceiling of 6 is fitted to one
+offset, it is already exceeded on live content, and **no ceiling is assertable** — asserting one
+against a fixture would pin the fixture, not the algorithm. This slice therefore asserts the changed
+branch's *classification* and *direction* (≥ 2, boundary provably destroyed), never a magnitude.
+
+**STALENESS, stated because this spec's whole argument is about claims that do not reproduce.** Earlier
+drafts published a maximum of **78** from `docs/ARCHITECTURE.md` @7111. It reproduced when measured —
+and stopped reproducing when this session's own earlier merge appended a paragraph to that very file,
+which is exactly the live-corpus hazard §2c takes off the gating path. Review caught it. Every number
+here is now stamped `2b1778d`, and none of them gates a test: the shipped assertions are the rule, the
+classification and the direction, all of which survive a corpus that moves under them.
 
 ### 0d. The trade, with both directions measured
 
 This is what the acceptance table is really claiming, so it belongs in it:
 
-| edit | CDC | byte offsets |
+| edit (measured at `2b1778d`) | CDC | byte offsets |
 |---|---:|---:|
-| in-place, same length, boundary-changing (`ARCHITECTURE.md` @7111) | **78** | **1** |
+| in-place, same length, boundary-changing (`docs/ARCHITECTURE.md` @181,517) | **8** | **1** |
 | in-place, same length, boundary-preserving (@20,000) | 1 | 1 |
-| insertion of 33 chars near the top | **5** | **78** |
+| insertion of 33 chars near the top | **1** | **80** |
 
 CDC is **not** "never worse than byte offsets". It is dramatically better on insertion — the case it
 was adopted for, where byte offsets churn the entire downstream tail — and dramatically worse on an
@@ -92,8 +100,10 @@ test whose outcome depends on content nobody is thinking about.
 ## 1. The claims that cannot hold
 
 `docs/design/content-defined-chunking.md` states an unconditional `1` for `edit in place, same length`
-in **two** tables (the summary near the top and the acceptance table below), so correcting one leaves
-the claim re-derivable from the other. For byte offsets that 1 is a theorem, because offsets do not
+in its **acceptance table**. One reviewer read the summary table near the top as making the same claim
+and asked for both to be corrected; the other adjudicated and the first was wrong — that table sits
+under "Chunking is byte-offset … verified directly against the real function" and measures LEGACY
+behaviour, where 1 is a theorem. It is correct as written and is left alone. For byte offsets that 1 is a theorem, because offsets do not
 move. For CDC it cannot be: a content-defined boundary **is** content.
 
 ## 2. The decision
@@ -183,7 +193,7 @@ API route, no change to `visibleItems`/`visibleTasks`/`visibleGroupIds`.
 - `test/graph-cdc.test.ts` — the three buckets partition the corpus (`strict + changed + excluded === total`), so a classifier that moves every document into an ungated bucket reddens instead of greening.
 - `test/graph-cdc.test.ts` — a checked-in SHORT fixture makes the excluded bucket non-empty regardless of the live corpus; the live excluded count is reported, never gated.
 - `test/graph-cdc.test.ts` — the `it.fails` for CDCCHURN-1 is GONE and the `max(cdc) ≤ max(legacy)` comparison is removed for the same-length scenario, with the measured reason (78 vs 1) recorded at the site.
-- `docs/design/content-defined-chunking.md` — BOTH tables stating an unconditional 1 for `edit in place, same length` are corrected to the conditional property, and the prose carries the measured trade in both directions.
+- `docs/design/content-defined-chunking.md` — the ACCEPTANCE table's unconditional 1 for `edit in place, same length` is corrected to the conditional property and the prose carries the measured trade in both directions; the summary table above it measures byte offsets, where 1 is a theorem, and is deliberately untouched.
 - `docs/design/content-defined-chunking.md` — the `append at end` row is marked conditional and points at the follow-up ticket, rather than carrying either the old unconditional 1 or an unverified replacement.
 
 ## 4. Scope
