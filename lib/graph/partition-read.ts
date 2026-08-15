@@ -2,7 +2,7 @@ import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { armProjectsForPrincipal, readyPartitions } from "./arming";
 import { resolvePositiveInt } from "@/lib/util/env";
-import { runSql } from "@/lib/db/pg/pool";
+import { latestPushByGroup } from "./extraction-health";
 
 /**
  * The enforced team-tier graph READ set (PCCC-6, design §2.3 + spec's expansion budget): which
@@ -88,15 +88,7 @@ export async function selectEnforcedGraphPartitions(
   // written only by the INGEST upsert and is perpetually null for initiatives — ranking on it
   // made the router inert for exactly the population it exists to rank (review High 4b).
   // Deterministic tiebreak by group id.
-  const recency = new Map<string, number>();
-  if (eligible.length > 0) {
-    const rec = await runSql<{ group_id: string; mx: string | null }>(
-      `select group_id, max(projected_at) filter (where content_sha256 <> '') as mx
-         from graph_episodes where team_id = $1 and group_id = any($2) group by group_id`,
-      [args.teamId, eligible.map((p) => p.graph_group_id)]
-    );
-    for (const r of rec.rows) recency.set(r.group_id, r.mx ? new Date(r.mx).getTime() : 0);
-  }
+  const recency = await latestPushByGroup(args.teamId, eligible.map((p) => p.graph_group_id));
   const general = eligible.filter((p) => p.kind === "system" && p.slug === "general");
   const rest = eligible
     .filter((p) => !(p.kind === "system" && p.slug === "general"))
