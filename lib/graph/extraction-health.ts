@@ -414,12 +414,16 @@ export interface LedgerRead {
  * a team that looks pushed-but-unscoped, which is exactly the shape that decides whether an absence of
  * graph evidence is allowed to accuse. A named producer does not close that race; one statement does.
  *
- * `content_sha256 <> ''` is load-bearing, not tidiness, and it now excludes THREE kinds of row rather
- * than the original two: redaction/blanking tombstones and tier-vacate rows (both park on the `""`
- * sentinel while POSTing nothing), and — since PCCC-3's reserve-before-push — UNLANDED RESERVATIONS.
- * None of the three was ever accepted by graphiti, so counting them would inflate the floor and, worse,
+ * `content_sha256 <> ''` is load-bearing, not tidiness, and the set of things it excludes keeps GROWING
+ * — it is now FOUR kinds of row rather than the original two: redaction/blanking tombstones and
+ * tier-vacate rows (both park on the `""` sentinel while POSTing nothing), UNLANDED RESERVATIONS
+ * (PCCC-3's reserve-before-push), and DEFERRED fan-out rows (PCCC-5: extraction deliberately withheld
+ * for a cold initiative, `project.ts` inserting `content_sha256: ""`). None of the four was ever
+ * accepted by graphiti, so counting them would inflate the floor that licenses an accusation and, worse,
  * a redaction wave would read as "episodes just landed" and the lag check would go red on a healthy
- * extractor six hours later. Real pushes always store a 64-char digest (even `sha("")`).
+ * extractor six hours later. Real pushes always store a 64-char digest (even `sha("")`) — which is why
+ * the filter keeps working as new sentinel meanings arrive, but each new one is a reason to re-check
+ * that it does rather than assume it.
  *
  * `count(distinct (source_table, source_id))` is PCCC-3's expression, kept verbatim: the ledger's
  * identity is per-(item, group), so under fan-out one item holds several rows and `count(*)` would

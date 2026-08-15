@@ -66,11 +66,24 @@ describe("the ledger read — scope, floor and clocks from ONE statement (data-m
     expect(groups).not.toContain(`${other.teamSlug}_team`);
   });
 
-  it("counts real pushes only — tombstones and unlanded reservations cannot clear the floor", async () => {
+  it("counts real pushes only — no sentinel row of any kind can clear the floor", async () => {
     const seed = await seedTeam();
     for (let i = 0; i < 20; i++) await insertEpisode(seed.teamId, `${seed.teamSlug}_team`, REAL_SHA());
-    // Redaction/tier-vacate tombstones AND reserve-before-push reservations share the `''` sentinel.
-    for (let i = 0; i < 5; i++) await insertEpisode(seed.teamId, `${seed.teamSlug}_team`, "");
+    // FOUR kinds of row share the `''` sentinel now, and the set keeps growing: redaction/tier-vacate
+    // tombstones, PCCC-3's unlanded reservations, and PCCC-5's DEFERRED fan-out rows (extraction
+    // withheld for a cold initiative). None was accepted by graphiti, so none may clear the floor that
+    // licenses an accusation. The deferred one is asserted explicitly because it arrived AFTER this
+    // filter was written — a new sentinel meaning is a reason to re-check the filter, not to assume it.
+    for (let i = 0; i < 4; i++) await insertEpisode(seed.teamId, `${seed.teamSlug}_team`, "");
+    const { error: defErr } = await db().from("graph_episodes").insert({
+      team_id: seed.teamId,
+      source_table: "items",
+      source_id: randomUUID(),
+      group_id: `g_${seed.teamSlug}_p_cold`,
+      content_sha256: "",
+      deferred: true,
+    });
+    expect(defErr).toBeNull();
 
     const { count } = await db()
       .from("graph_episodes")
