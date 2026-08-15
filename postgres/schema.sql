@@ -2387,7 +2387,11 @@ create table if not exists graph_episodes (
   -- chunks were never pushed. Empty = no per-chunk knowledge → full push. Sole writer: lib/graph/project.
   chunk_shas text[] not null default '{}',
   chunk_config text not null default '',
-  projected_at timestamptz not null default now()
+  projected_at timestamptz not null default now(),
+  -- PCCC-5: extraction deliberately WITHHELD for a cold initiative (distinct from the '' sentinel's
+  -- three meanings). Reconcile ignores deferred rows; arming (PCCC-6) flips this false and the
+  -- projector pushes under its fan-out budget. Sole writer: lib/graph/project.
+  deferred boolean not null default false
   -- The one-row-per-item NARROW unique that used to live here was dropped by PCCC-4/Deploy B
   -- (migration 20260815150000): identity is per-(item, group) via graph_episodes_item_group_key
   -- below, and an item may hold one ledger row PER GROUP (PCCC-5 fan-out's substrate).

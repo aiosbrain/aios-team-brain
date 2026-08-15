@@ -221,7 +221,12 @@ export async function reconcileProjectedEpisodes(
     .select(
       "id, source_id, source_table, group_id, content_sha256, projected_at, episode_uuid, pending_delete_group_id, pending_delete_at"
     )
-    .eq("team_id", teamId);
+    .eq("team_id", teamId)
+    // DEFERRED rows are exempt from every judgement here (PCCC-5, design §2.5): they carry the ''
+    // sentinel because extraction is deliberately WITHHELD (a cold initiative), not because a push
+    // never landed — the never-landed delete would remove them, the projector would re-create them
+    // next pass, and the loop would churn forever while reading as healthy self-healing.
+    .eq("deferred", false);
   const rawRows = (data ?? []) as EpisodeRow[];
 
   // ── Orphan repair, BEFORE anything else judges these rows ────────────────────────────────────

@@ -2,7 +2,7 @@ import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { adminClient } from "@/lib/db/admin";
 import { GraphitiClient } from "./graphiti-client";
-import { projectItemsToGraph, ProjectionAbortError } from "./project";
+import { projectItemsToGraph, ProjectionAbortError, FANOUT_PUSH_MAX_PER_PASS } from "./project";
 import { reconcileProjectedEpisodes } from "./reconcile";
 import { purgeExternalTierCaches } from "@/lib/cache/tier-invalidation";
 
@@ -28,6 +28,8 @@ export interface GraphProjectionSummary {
    * append-only into `ingest_runs.meta`. Row counts in `graph_episodes` cannot serve: a row is one
    * ITEM, not one episode, and `projected_at` is mutable. */
   episodesByGroup: Record<string, number>;
+  /** Armed fan-out pushes withheld by the per-pass budget (PCCC-5) — the no-silent-caps signal. */
+  fanoutThrottled: number;
   skipped: number;
   /** Episodes confirmed to have actually landed in Graphiti this run (audit H3 reconcile pass). */
   reconciled: number;
@@ -81,6 +83,8 @@ export async function runGraphProjection(opts?: {
   client?: GraphitiClient;
   db?: DbClient;
   limit?: number;
+  /** Per-team fan-out budget for this RUN (default GRAPH_FANOUT_PUSH_MAX_PER_PASS); test override. */
+  fanoutPushBudget?: number;
 }): Promise<GraphProjectionSummary> {
   if (inFlight) return inFlight;
   inFlight = runGraphProjectionInner(opts);
@@ -96,6 +100,7 @@ async function runGraphProjectionInner(opts?: {
   client?: GraphitiClient;
   db?: DbClient;
   limit?: number;
+  fanoutPushBudget?: number;
 }): Promise<GraphProjectionSummary> {
   const client = opts?.client ?? new GraphitiClient();
   const summary: GraphProjectionSummary = {
@@ -106,6 +111,7 @@ async function runGraphProjectionInner(opts?: {
     projected: 0,
     episodes: 0,
     episodesByGroup: {},
+    fanoutThrottled: 0,
     skipped: 0,
     reconciled: 0,
     requeued: 0,
@@ -129,6 +135,11 @@ async function runGraphProjectionInner(opts?: {
       // MAX_BATCHES caps the loop as a runaway guard. (audit H2)
       let since: string | undefined;
       let externalVacated = 0;
+      // ONE fan-out budget per team per RUN, threaded across the batch loop (PCCC-5 review High 1):
+      // the per-call default alone resets every page — up to MAX_BATCHES× the claimed cap, executing
+      // most of a mass arming at once, which is exactly what the budget exists to smooth. Same seam
+      // GRAPH_REQUEUE_MAX_PER_PASS's comment names for reconcile.
+      let fanoutBudgetLeft = opts?.fanoutPushBudget ?? FANOUT_PUSH_MAX_PER_PASS;
       for (let batch = 0; batch < MAX_BATCHES; batch++) {
         const s = await projectItemsToGraph(db, {
           teamId: t.id,
@@ -136,7 +147,9 @@ async function runGraphProjectionInner(opts?: {
           client,
           limit,
           since,
+          fanoutPushBudget: fanoutBudgetLeft,
         });
+        fanoutBudgetLeft = Math.max(0, fanoutBudgetLeft - s.fanoutPushed);
         summary.scanned += s.scanned;
         summary.projected += s.projected;
         summary.episodes += s.episodes;
@@ -144,6 +157,7 @@ async function runGraphProjectionInner(opts?: {
           summary.episodesByGroup[g] = (summary.episodesByGroup[g] ?? 0) + n;
         }
         summary.skipped += s.skipped;
+        summary.fanoutThrottled += s.fanoutThrottled;
         externalVacated += s.externalGroupVacated;
         if (s.scanned < limit || !s.lastSyncedAt || s.lastSyncedAt === since) break;
         since = s.lastSyncedAt;
@@ -186,6 +200,7 @@ async function runGraphProjectionInner(opts?: {
           summary.episodesByGroup[g] = (summary.episodesByGroup[g] ?? 0) + n;
         }
         summary.skipped += e.partial.skipped;
+        summary.fanoutThrottled += e.partial.fanoutThrottled;
       }
     }
   }
