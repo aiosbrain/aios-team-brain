@@ -1,9 +1,11 @@
-# CDC churn 1 holds unless the edit destroys a boundary — CDCCHURN-1
+# CDC churn is the number of chunks the edit touches — CDCCHURN-1
 
-**Status:** spec, pre-review.
-**Related:** `docs/design/content-defined-chunking.md` (the requirement table this corrects). Surfaced by the
-LLMOBS-2 slice, whose spec document joined this test's live corpus and happened to straddle a chunk
-boundary — that document is on an unmerged branch, hence no path reference here.
+**Status:** spec, draft 3. Drafts 1 and 2 were each BLOCKED by two independent cold reads, and **each
+draft's central claim was falsified by measurement, not by argument**. Draft 3's rule is the first that
+was tested against the corpus BEFORE being written down (§0b).
+**Related:** `docs/design/content-defined-chunking.md` (the requirement tables this corrects).
+**Code:** `test/graph-cdc.test.ts`, three checked-in fixtures. `lib/graph/cdc.ts` is read only — no
+product change; that IS the finding, not a shortcut.
 
 ---
 
@@ -13,133 +15,198 @@ boundary — that document is on an unmerged branch, hence no path reference her
 markdown, one document churns **4** chunks for a same-length in-place edit where
 `docs/design/content-defined-chunking.md`'s acceptance table requires **1**.
 
-**The ticket blamed the wrong thing, and so did the comment in the test.** Both said the edit lands in
-"a run of structurally repetitive markdown bullets — low entropy — and the boundary realignment
-propagates". That was a guess. Measured:
+### 0a. Four characterisations, three of them wrong
 
-| edit offset | churn | distance to nearest boundary |
-|---:|---:|---:|
-| **20,000** | **4** | **1** |
-| 19,000 | 1 | 1,001 |
-| 18,000 | 1 | 841 |
-| 17,000 | 1 | 159 |
-| 21,000 | 1 | 999 |
-| 22,000 | 1 | 519 |
-| 15,000 | 1 | 491 |
+Each wrong answer was cheap prose that would have shipped as documentation:
 
-The scenario edits 20 characters at a FIXED offset of 20,000. In this one document a boundary sits at
-**20,001**, so the edit overwrites the very content that produced the cut. The chunk merges with its
-successor and the anchor chain re-syncs three chunks later. At every other offset tested — including
-ones only 159 bytes from a boundary — CDC delivers exactly the required churn of 1.
+1. *"The test over-asserts; the spec disclaims the guarantee."* — False: the table **requires** 1.
+2. *"Low-entropy repetitive bullets propagate the realignment."* — False: churn is indifferent to entropy.
+3. *(draft 1)* *"The edit OVERLAPS a boundary, destroying the cut."* — True of the failing document,
+   not the rule: a cut is decided by the ~32 code units ending at it, so an edit **near** a boundary
+   destroys one it never touches, and spliced text can **create** one. Swept across the hazard band,
+   9,480 of 15,719 non-overlapping offsets churn > 1.
+4. *(draft 2)* *"Churn is exactly 1 when the boundary SEQUENCE is unchanged."* — False in **both**
+   directions, and both reviewers constructed witnesses:
+   - **churn 2** with the sequence unchanged — `docs/ARCHITECTURE.md` @[5132,5152) spans a *surviving*
+     boundary at 5142, so both adjacent chunks change (reproduced here, exactly);
+   - **churn 0** with the sequence unchanged — an edit past the 80-chunk admitted prefix is dropped
+     entirely (`docs/ARCHITECTURE.md` admits 80 of its 145 boundaries, prefix ending at 226,302), and
+     an edit whose replacement equals the original text changes nothing at all.
 
-**So the chunker is behaving correctly and as designed.** Zero of the ten chunks in that document take
-the `max`-length fallback, which was the other plausible mechanism and is refuted. What is wrong is a
-documented claim and a test's construction.
+### 0b. The rule that is actually true, verified before being written
 
-## 1. The claim that cannot hold
+**When the boundary sequence is unchanged, churn equals the number of ADMITTED chunk intervals that
+intersect the changed span.** Exactly 1 requires three things together: the edit changes text, it lies
+wholly inside one admitted chunk, and no boundary falls strictly inside the edit span.
 
-`docs/design/content-defined-chunking.md`'s acceptance table states:
+Verified by sweeping every corpus document ≥25k characters at 97-character offset steps and comparing
+the count this rule predicts against the measured churn: **4,962 unchanged-sequence samples, 4,962
+agreements, zero mismatches.** The 0-churn (past-cap) and 2-churn (spans a surviving boundary) cases
+fall out of the same rule rather than needing exceptions.
 
-| scenario | byte-offset (today) | CDC (required) |
-|---|---|---|
-| edit in place, same length | 1 of 20 | **1** |
+### 0c. When the sequence DOES change, there is no usable ceiling
 
-For byte offsets that 1 is a theorem: offsets do not move, so exactly the containing chunk changes.
-For CDC it cannot be a theorem, because a content-defined boundary is part of the content: an edit
-that OVERLAPS a boundary destroys it, and the chunk necessarily merges with its neighbour. The spec's
-own prose already concedes the general shape — *"realignment after an insertion is empirical rather
-than guaranteed"* — but the table promises an unconditional 1 for this row, and that is what the test
-was asserting.
+Draft 2 proposed asserting a re-synchronisation ceiling of 6 (the existing test's threshold, one over a
+measured worst case of 5). Measured across the same sweep, restricted to edits inside the admitted
+prefix, the changed-sequence bucket is:
 
-The exposure is small and quantifiable: for a 20-character edit against a ~2,500-character target
-chunk, roughly **20 in 2,500 ≈ 0.8%** of offsets overlap a boundary. Across a 23-document corpus with
-one fixed offset, the chance that at least one document is hit is substantial — which is exactly what
-happened, and only when a 26k-character document was added.
+| churn | 2 | 3–6 | 7–20 | 21–50 | 51–78 |
+|---|---:|---:|---:|---:|---:|
+| samples | 202 | 111 | 13 | 25 | 63 |
+
+**Maximum 78 of 80 admitted chunks**, from a 20-character in-place edit at `docs/ARCHITECTURE.md`
+@7111. Codex separately constructed a document reaching 8 at the test's own fixed offset. So 6 is
+fitted to one offset on today's corpus, and **no ceiling is assertable at all** — asserting one against
+a fixture would pin the fixture, not the algorithm. Draft 3 therefore asserts the changed branch's
+*classification* and *direction* (≥ 2, boundary provably destroyed), never a magnitude.
+
+### 0d. The trade, with both directions measured
+
+This is what the acceptance table is really claiming, so it belongs in it:
+
+| edit | CDC | byte offsets |
+|---|---:|---:|
+| in-place, same length, boundary-changing (`ARCHITECTURE.md` @7111) | **78** | **1** |
+| in-place, same length, boundary-preserving (@20,000) | 1 | 1 |
+| insertion of 33 chars near the top | **5** | **78** |
+
+CDC is **not** "never worse than byte offsets". It is dramatically better on insertion — the case it
+was adopted for, where byte offsets churn the entire downstream tail — and dramatically worse on an
+in-place edit that disturbs a boundary. That is the trade; the tables currently state only the half
+that flatters it.
+
+### 0e. Two more things the earlier drafts got wrong
+
+- **10 of 25 corpus documents never receive the edit.** Below 20,020 characters,
+  `slice(0,20000) + "X"*20 + slice(20020)` is a 20-char **append**. The scenario has been silently
+  measuring two operations under one name.
+- **The `append at end` row is also false, and draft 2's replacement for it was false too:**
+  `ARCHITECTURE.md` churns **0** on append (the appended text lands past the cap), and the "2" ceiling
+  holds only for appends shorter than `min` — a 9,000-character append churns 5. Correcting that row
+  properly needs its own measurement pass (§4).
+
+**So the chunker is behaving correctly and as designed.** What is wrong is a documented claim, and a
+test whose outcome depends on content nobody is thinking about.
+
+## 1. The claims that cannot hold
+
+`docs/design/content-defined-chunking.md` states an unconditional `1` for `edit in place, same length`
+in **two** tables (the summary near the top and the acceptance table below), so correcting one leaves
+the claim re-derivable from the other. For byte offsets that 1 is a theorem, because offsets do not
+move. For CDC it cannot be: a content-defined boundary **is** content.
 
 ## 2. The decision
 
-**Correct the claim, and make the test measure the property that is actually true.**
+### 2a. Both tables state the property that is true, and the severity
 
-### 2a. The requirement table states the real property
+`edit in place, same length` becomes: **1 when the edit lies wholly inside one chunk and disturbs no
+boundary; otherwise the number of chunks it touches, which is unbounded in practice — measured to 78 of
+80 on this repo's own corpus.** The prose names the mechanism (a cut is decided by the ~32 code units
+ending at it) and carries §0d's trade table, so the next reader sees both directions at once.
 
-The `edit in place, same length` row becomes: **1 when the edit does not overlap a chunk boundary;
-bounded realignment when it does** (measured ceiling 6 over this corpus, the same bound the other
-scenarios already carry). The prose beside it names the mechanism — a content-defined boundary is part
-of the content, so an edit through it removes the cut — so the next reader does not have to re-derive
-what this ticket re-derived.
+`append at end` is marked **conditional and not yet fully characterised**, pointing at the follow-up
+(§4) — a true statement of ignorance rather than a fourth invented rule.
 
-### 2b. The test asserts that property, and stops depending on luck
+### 2b. The test classifies by what determines the outcome, in the right coordinates
 
-`repoDocs()` reads a LIVE corpus and the scenario edits at a fixed offset, so which documents overlap
-a boundary changes whenever anyone adds or edits a long markdown file. That is the real defect in the
-test: not that its assertion was too strict, but that whether it passes depends on content nobody is
-thinking about when they write it.
+Per document, from the same two chunkings the test already computes:
 
-The scenario therefore SPLITS by the thing that actually determines the outcome:
+1. is the document long enough to receive an in-place edit (else it is excluded — the operation is an
+   append and belongs to that scenario);
+2. is the `cdcBoundaries` sequence unchanged;
+3. does the edit span lie wholly inside one **admitted** chunk, with no boundary strictly inside it.
 
-- documents whose edit does NOT overlap a boundary must churn exactly **1** — the strict property,
-  asserted strictly, on every such document;
-- documents whose edit DOES overlap must churn within the existing ceiling (**6**), which is the
-  honest bound for realignment.
+Only documents satisfying all three are asserted `churn === 1`. Everything else is classified and
+reported, never gated. **The coordinate mismatch is named rather than left to be re-derived:**
+`cdcBoundaries` is uncapped while churn is measured on the cap-80 chunking, which is exactly why a
+past-cap edit can change the sequence and still churn 0.
 
-Boundary overlap is computable from `cdcBoundaries` directly, so the split is derived from the corpus
-rather than hard-coded, and a future document that happens to straddle a cut is classified rather than
-breaking the build.
+The partition is asserted arithmetically — `strict + changed + excluded === total` — so a classifier
+bug cannot quietly move every document into an ungated bucket.
 
-### 2c. The `it.fails` goes away
+### 2c. Both branches get a checked-in fixture, because a live corpus cannot guarantee either
 
-It exists only because the assertion was wrong. Once the assertion states a true property, a passing
-test is the honest artefact and an `it.fails` would be recording a defect that does not exist.
+Draft 2 put the changed branch on a fixture and left the strict branch live. Review showed both need
+one, for the same reason in mirror image:
+
+- **A strict fixture** — an edit verifiably far from every boundary, asserting sequence-unchanged and
+  churn 1 — because if the classifier ever marks every document "changed", the live strict assertion
+  quantifies over an empty set and greens.
+- **A changed fixture** — an edit centred on one of its own boundaries — asserting the branch is
+  *actually* exercised: the boundary exists before, is **absent** after, the sequences differ, and churn
+  ≥ 2. Centring is not a guarantee of destruction (the mask can re-fire on the new content, which is one
+  of the constructed witnesses above), so without those assertions the branch can go silently dead.
+- **A short fixture** (~16k characters) so the excluded bucket is non-empty deterministically. Draft 2
+  asserted the live excluded count is non-zero, which re-pins corpus contents:
+  `docs/design/graph-extraction-cap.md` is 56 characters from leaving that set.
+
+The live corpus keeps the strict assertion, which is where its liveness pays and where no unrelated
+document can redden it: a document that disturbs a boundary simply classifies into the reported bucket.
+
+### 2d. The `it.fails` goes, and the never-worse comparison goes with it
+
+The `it.fails` exists only because the assertion was wrong. The `max(cdc) ≤ max(legacy)` comparison is
+**removed for the same-length scenario**, with §0d's measurement recorded at the site: it asserts
+`78 ≤ 1` in the general case and `1 ≤ 1` on the strict subset, so it is either false or vacuous. It is
+also max-versus-max across *different* documents, which is named where it survives for other scenarios.
 
 ## Dependencies
 
-**Deps: none.** `test/graph-cdc.test.ts` and one table in `docs/design/content-defined-chunking.md`. No product
-code changes — which is the finding, not a shortcut.
+**Deps: none.** `test/graph-cdc.test.ts`, three small fixtures, and two tables in one design document.
+No product code changes.
 
 ## Build-with
 
-**Build-with tier: Fable / high effort.** Justification: the whole slice is a claim about an algorithm's
-guarantees, and the previous two attempts to characterise this failure were BOTH wrong (a "the spec
-disclaims it" argument that the spec contradicts, and a "low-entropy content" mechanism the measurement
-refutes). A third wrong characterisation would be worse than the original bug, because it would ship as
-documentation. Two adversarial review rounds.
+**Build-with tier: Fable / high effort.** Three of the four characterisations of this defect were wrong,
+including both previous drafts of this spec, each falsified by a reviewer's constructed or measured
+witness. A fourth wrong answer ships as documentation. Two adversarial review rounds on the spec (done —
+both BLOCKED, twice) and two on the diff.
 
 ## Tier safety
 
-No tier surface changes: a test and a design document. No product code, no schema, no API route, no
-change to `visibleItems`/`visibleTasks`/`visibleGroupIds`.
+No tier surface changes: a test, three fixtures, and a design document. No product code, no schema, no
+API route, no change to `visibleItems`/`visibleTasks`/`visibleGroupIds`.
 
 ## 3. Acceptance criteria
 
-- `test/graph-cdc.test.ts` — for every corpus document whose same-length in-place edit does NOT overlap a chunk boundary, CDC churn is exactly 1, asserted per document rather than as a corpus-wide maximum that one outlier can dominate.
-- `test/graph-cdc.test.ts` — for a document whose edit DOES overlap a boundary, churn is within the existing ceiling of 6 — and the test proves such a document is actually present in the corpus, so the branch is not vacuous.
-- `test/graph-cdc.test.ts` — the boundary-overlap classification is derived from `cdcBoundaries`, not from a hard-coded document name or offset, so a corpus change reclassifies rather than reddens.
-- `test/graph-cdc.test.ts` — the `it.fails` for CDCCHURN-1 is GONE, and no scenario is skipped: the "never worse than byte offsets" comparison is restored for every scenario, since the reason it was scoped out no longer stands.
-- `docs/design/content-defined-chunking.md` — the acceptance table's `edit in place, same length` row states the conditional property and names the mechanism, so the unconditional claim cannot be re-derived from the document.
+- `test/graph-cdc.test.ts` — a checked-in STRICT fixture (edit far from every boundary) asserts sequence-unchanged AND churn exactly 1, so the strict branch cannot go vacuous when the classifier is wrong.
+- `test/graph-cdc.test.ts` — a checked-in CHANGED fixture asserts the targeted boundary exists before the edit, is ABSENT after, the sequences differ, and churn ≥ 2 — proving the branch is exercised rather than assuming a centred edit destroys a cut.
+- `test/graph-cdc.test.ts` — no ceiling is asserted for the changed branch on any input; the measured envelope is recorded in a comment with its witness, because the live corpus already reaches 78 of 80.
+- `test/graph-cdc.test.ts` — for every LIVE document classified strict (long enough, sequence unchanged, edit inside one admitted chunk with no interior boundary), churn is exactly 1, asserted per document rather than as a corpus maximum one outlier can dominate.
+- `test/graph-cdc.test.ts` — the three buckets partition the corpus (`strict + changed + excluded === total`), so a classifier that moves every document into an ungated bucket reddens instead of greening.
+- `test/graph-cdc.test.ts` — a checked-in SHORT fixture makes the excluded bucket non-empty regardless of the live corpus; the live excluded count is reported, never gated.
+- `test/graph-cdc.test.ts` — the `it.fails` for CDCCHURN-1 is GONE and the `max(cdc) ≤ max(legacy)` comparison is removed for the same-length scenario, with the measured reason (78 vs 1) recorded at the site.
+- `docs/design/content-defined-chunking.md` — BOTH tables stating an unconditional 1 for `edit in place, same length` are corrected to the conditional property, and the prose carries the measured trade in both directions.
+- `docs/design/content-defined-chunking.md` — the `append at end` row is marked conditional and points at the follow-up ticket, rather than carrying either the old unconditional 1 or an unverified replacement.
 
 ## 4. Scope
 
-**In:** the acceptance-table row and its prose, the split scenario in `test/graph-cdc.test.ts`, removal
-of the `it.fails` and of the scoped-out comparison.
+**In:** the two `edit in place` table rows and their prose, the reclassified scenario, three fixtures,
+removal of the `it.fails` and of the same-length never-worse comparison.
 
 **Deferred, each with its reason:**
 
-- **Changing the chunker.** Nothing is wrong with it. Making a same-length edit through a boundary
-  churn only 1 would require boundaries that are not content-defined, which is the property being
-  bought.
-- **Making the corpus a fixture.** `docs/design/content-defined-chunking.md` explicitly chose a live corpus
-  ("measuring against the corpus as it is now, and a snapshot would stop being real the week after").
-  This slice removes the luck without removing the liveness; freezing it is a different trade and
-  would need its own argument.
-- **The other scenarios' offsets.** Insertion and deletion have the same fixed-offset property, but
-  their assertions are ranges rather than an exact 1, so a boundary-overlap document does not break
-  them. Worth revisiting only if it ever does.
+- **`CDCAPPEND-1` — characterising the append row properly.** Draft 2's replacement was falsified twice
+  (a past-cap document churns 0; an append longer than `min` churns 5), and inventing a third rule here
+  would repeat this ticket's entire history one row down. This slice removes the false claim and states
+  the gap; measuring the real rule is its own pass.
+- **Changing the chunker.** Draft 1 said no scheme could do better, which review correctly called too
+  strong: the cascade length is partly a consequence of restarting the search at the previous chunk's
+  start plus the 4,000-character maximum. It is rejected on a different ground — any prior-boundary-aware
+  recovery makes chunking depend on the PREVIOUS chunking, and "same body ⇒ same chunks ⇒ same hashes"
+  is the invariant the whole delta ledger rests on (`lib/graph/cdc.ts:11-13`).
+- **Re-litigating CDC vs byte offsets.** §0d shows the trade is real in both directions. Whether the
+  in-place tail justifies the insertion win is a design question with its own measurements; this slice
+  makes the trade visible instead of documenting only its good half.
+- **Making the whole corpus a fixture.** The live corpus was a deliberate choice and still pays for the
+  strict assertion; §2c removes the luck from everything that gates.
 
 ## 5. What would falsify this
 
-Wrong if a document whose edit does NOT overlap a boundary still churns more than 1 — that would mean
-overlap is not the mechanism and the low-entropy theory (or another) is back in play. The per-document
-strict assertion is what would catch it, where the old corpus-wide maximum hid it behind one outlier.
+Wrong if a document classified strict — sequence unchanged, edit inside one admitted chunk, no interior
+boundary — still churns anything but 1. That is the rule verified at 4,962/4,962, so a counterexample
+means a fifth mechanism exists and the classifier is measuring the wrong thing.
 
-Wrong in the other direction if realignment for an overlapping edit ever exceeds 6, which would mean
-the bound is not a bound. Both directions are asserted rather than assumed.
+Wrong in the other direction if the changed fixture's targeted boundary survives its own centred edit,
+which would mean the fixture is not exercising the branch it claims — the reason that assertion exists
+rather than trusting the construction.
