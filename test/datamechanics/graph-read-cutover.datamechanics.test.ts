@@ -26,6 +26,10 @@ async function bootstrapWithInitiative(seed: Seed, slug: string) {
   expect((await ensureAccessBootstrap(db(), seed.teamId)).ok).toBe(true);
   const init = await mkInitiative(seed, slug);
   const r = await ingest(seed, { body: `content ${slug}`, path: `${slug}.md`, access: "team" });
+  // General membership too — a General-less item is BORN-RESTRICTED and arm-on-restrict would arm
+  // its partition during setup, contaminating what these fixtures test (who arms, and when).
+  const { data: gp } = await db().from("projects").select("id").eq("team_id", seed.teamId).eq("slug", "general").single();
+  await tagItem(seed, r.id, (gp as { id: string }).id);
   await tagItem(seed, r.id, init.projectId);
   await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: seed.teamSlug, client: client(new FakeGraphiti()) });
   return { init, itemId: r.id };

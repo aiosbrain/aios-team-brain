@@ -438,13 +438,13 @@ describe("PCCC-5 — fan-out is DEFERRED until armed; ADD-only", () => {
     );
     // PCCC-6 semantics: this initiative-only item is RESTRICTED, so the tier flip does NOT
     // relocate its home row into `_team` — the stale external-tier row is TOMBSTONED (restricted
-    // content may sit in neither tier group) and the deferred fan-out row is untouched.
+    // content may sit in neither tier group), and the fan-out copy is ARMED by the restriction
+    // itself (review-2 Blocker 1: the move must never wait for a reader).
     expect(rows.rows).toHaveLength(2);
-    const home = rows.rows.find((x) => !x.deferred)!;
-    const fan = rows.rows.find((x) => x.deferred)!;
-    expect(home.group_id).toBe(episodeGroupId(seed.teamSlug, "external"));
+    const home = rows.rows.find((x) => x.group_id === episodeGroupId(seed.teamSlug, "external"))!;
+    const fan = rows.rows.find((x) => x.group_id === init.group)!;
     expect(home.content_sha256).toBe("");
     expect(home.pending_delete_group_id).toBe(episodeGroupId(seed.teamSlug, "external"));
-    expect(fan.group_id).toBe(init.group);
+    expect(fan.deferred).toBe(false); // armed reader-free
   });
 });

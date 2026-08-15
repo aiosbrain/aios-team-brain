@@ -574,9 +574,12 @@ async function nativeRetrieve(
       const scope = await selectEnforcedGraphPartitions(db, { teamId, visibleProjectIds: enforce.graphProjectIds });
       graphScope = { covered: scope.covered, total: scope.total };
       return fetchGraphFactsForGroups(q, scope.groups);
-    } catch {
-      // Fail CLOSED and gracefully (review Medium 6): a transient arming/latch hiccup omits the
-      // leg — the item legs still answer — instead of 500ing a query they could have served.
+    } catch (err) {
+      // Fail CLOSED and gracefully (review Medium 6) — but never SILENTLY (review-2 Medium 6): a
+      // wedged arming path must be distinguishable from the healthy omit for operators.
+      console.error(
+        `[graph] enforced partition selection failed for team ${teamId}: ${err instanceof Error ? err.message : err}`
+      );
       return [];
     }
   })();

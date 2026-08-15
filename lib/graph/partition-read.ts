@@ -71,8 +71,15 @@ export async function selectEnforcedGraphPartitions(
   });
 
   const eligible = projects.filter((p) => {
+    // Suppression applies to INITIATIVE partitions only (review-2 High 4): a self-purge in a
+    // built-in is ROUTINE — every redaction, item deletion, and restriction move-out flags a
+    // General row for >= the cleanup grace (an hour-scale floor) — so suppressing built-ins
+    // blanked the whole enforced leg's primary partition near-constantly. The narrowing that
+    // suppression exists for (untag) lives in initiative partitions; General's residual is the
+    // BOUNDED restriction-purge window (<= ~2 reconcile cycles, shortened by arm-on-restrict),
+    // named in the design as an accepted residual with restrictionMovesPending as its measure.
+    if (p.kind !== "initiative") return true; // built-ins: always eligible
     if (state.suppressed.has(p.id)) return false; // self-purge outstanding — fail closed
-    if (p.kind !== "initiative") return true; // built-ins: always ready
     return state.ready.has(p.id);
   });
 

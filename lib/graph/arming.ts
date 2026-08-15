@@ -1,6 +1,7 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { armDeferredRowsForGroups } from "./project";
+import { ensureArmingRows } from "./arming-row";
 import { chunk, IN_CLAUSE_BATCH } from "@/lib/db/batch";
 import { runSql } from "@/lib/db/pg/pool";
 
@@ -60,13 +61,7 @@ export async function armProjectsForPrincipal(
   // Row first, flip second: a crash between the two leaves an armed project whose rows flip on the
   // NEXT arm touch (readiness simply stays unlatched meanwhile) — never flipped rows with no
   // arming record, which would push without any latch ever forming.
-  for (const projectId of fresh) {
-    const { error } = await db.from("graph_project_arming").insert({ team_id: args.teamId, project_id: projectId });
-    // A racer's insert is benign — first arm wins, both flips are idempotent.
-    if (error && !error.message.includes("graph_project_arming_pkey")) {
-      throw new Error(`arming write failed for project ${projectId}: ${error.message}`);
-    }
-  }
+  await ensureArmingRows(db, args.teamId, fresh);
   if (groups.length > 0) await armDeferredRowsForGroups(db, args.teamId, groups);
 }
 

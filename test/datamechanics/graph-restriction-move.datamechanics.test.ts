@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { projectItemsToGraph } from "@/lib/graph/project";
+import { reconcileProjectedEpisodes } from "@/lib/graph/reconcile";
 import { episodeGroupId } from "@/lib/graph/group";
 import { ensureAccessBootstrap } from "@/lib/access/bootstrap";
 import { runSql } from "@/lib/db/pg/pool";
@@ -82,6 +83,12 @@ describe("PCCC-6 — the landed-gated restriction move", () => {
       init.group,
     ]);
     await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: seed.teamSlug, client: client(fake) });
+    // Reconcile-CONFIRM the copy (review-2 High 3: a 202'd-but-unconfirmed copy must not complete
+    // the move — a silently-dead worker would lose the content everywhere).
+    await runSql("update graph_episodes set episode_uuid = 'ep-c' where team_id = $1 and group_id = $2", [
+      seed.teamId,
+      init.group,
+    ]);
 
     await restrictFromGeneral(seed, r.id);
     await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: seed.teamSlug, client: client(fake) });
@@ -130,6 +137,54 @@ describe("PCCC-6 — the landed-gated restriction move", () => {
       [seed.teamId, r.id, init.group]
     );
     expect(fanRow.rows[0].deferred).toBe(true); // deferral still governs its extraction
+  });
+
+  it("restriction creates the ARMING ROW itself — a permissive team's moved content stays latchable and union-servable (review-2 Blocker 1)", async () => {
+    const seed = await seedTeam();
+    expect((await ensureAccessBootstrap(db(), seed.teamId)).ok).toBe(true);
+    const init = await mkInitiative(seed, "permissive-move");
+    const r = await ingest(seed, { body: "moved on a permissive team", path: "pm.md", access: "team" });
+    await tagIntoGeneral(seed, r.id);
+    await tagItem(seed, r.id, init.projectId);
+    const fake = new FakeGraphiti();
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: seed.teamSlug, client: client(fake) });
+
+    await restrictFromGeneral(seed, r.id);
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: seed.teamSlug, client: client(fake) });
+
+    const armRow = await runSql<{ n: number }>(
+      "select count(*)::int as n from graph_project_arming where team_id = $1 and project_id = $2",
+      [seed.teamId, init.projectId]
+    );
+    expect(armRow.rows[0].n).toBe(1); // no reader required — readyPartitions can latch this partition
+  });
+
+  it("reconcile's never-landed judge SKIPS armed-but-unpushed rows — the restriction copy survives a reader-quiet cycle (review-2 Blocker 2)", async () => {
+    const seed = await seedTeam();
+    expect((await ensureAccessBootstrap(db(), seed.teamId)).ok).toBe(true);
+    const init = await mkInitiative(seed, "quiet-team");
+    const r = await ingest(seed, { body: "restricted on a quiet team", path: "qt.md", access: "team" });
+    await tagIntoGeneral(seed, r.id);
+    await tagItem(seed, r.id, init.projectId);
+    const fake = new FakeGraphiti();
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: seed.teamSlug, client: client(fake) });
+    await restrictFromGeneral(seed, r.id);
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: seed.teamSlug, client: client(fake) });
+
+    // Armed ('' sha, empty chunk ledger), aged past every grace — the exact state reconcile's
+    // never-landed delete used to eat, re-cold-starting the arm every cycle forever.
+    await runSql(
+      "update graph_episodes set projected_at = now() - interval '2 days' where team_id = $1 and group_id = $2",
+      [seed.teamId, init.group]
+    );
+    await reconcileProjectedEpisodes(db(), client(fake), seed.teamId);
+
+    const row = await runSql<{ deferred: boolean; content_sha256: string }>(
+      "select deferred, content_sha256 from graph_episodes where team_id = $1 and source_id = $2 and group_id = $3",
+      [seed.teamId, r.id, init.group]
+    );
+    expect(row.rows).toHaveLength(1); // survived — the projector owns its convergence
+    expect(row.rows[0].deferred).toBe(false); // still armed, still queued for its budgeted push
   });
 
   it("an item with NO substrate rows keeps today's home write — only explicit membership state restricts", async () => {

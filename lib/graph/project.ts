@@ -8,6 +8,7 @@ import { resolvePositiveInt } from "@/lib/util/env";
 import { chunkCdc, type CdcParams } from "./cdc";
 import { sourceRules } from "@/lib/ingest/source-rules";
 import { resolveFanoutTargets } from "@/lib/projects/context/fanout-targets";
+import { ensureArmingRows } from "./arming-row";
 // Re-exported so the graph module's existing importers (and their specs) keep one import path.
 export { resolvePositiveInt };
 
@@ -436,7 +437,7 @@ export async function armDeferredRowsForGroups(
   for (const batch of chunk([...groupIds], IN_CLAUSE_BATCH)) {
     const { error } = await db
       .from("graph_episodes")
-      .update({ deferred: false })
+      .update({ deferred: false, projected_at: new Date().toISOString() })
       .eq("team_id", teamId)
       .eq("deferred", true)
       .in("group_id", batch);
@@ -803,7 +804,7 @@ export async function projectItemsToGraph(
     // into a group that never got the content (a silently-empty project graph).
     const { data: existingData, error: ledgerReadErr } = await db
       .from("graph_episodes")
-      .select("content_sha256, group_id, pending_delete_group_id, chunk_shas, chunk_config, deferred")
+      .select("content_sha256, group_id, pending_delete_group_id, chunk_shas, chunk_config, deferred, episode_uuid")
       .eq("team_id", args.teamId)
       .eq("source_table", SOURCE_TABLE)
       .eq("source_id", item.id);
@@ -817,6 +818,7 @@ export async function projectItemsToGraph(
       chunk_shas: string[] | null;
       chunk_config: string | null;
       deferred: boolean;
+      episode_uuid: string | null;
     };
     const rowsForItem = (existingData ?? []) as LedgerRow[];
     // PARTITION (PCCC-5): the home machinery below (tier moves, purges, delta) must see ONLY the
@@ -1016,10 +1018,48 @@ export async function projectItemsToGraph(
     // including for permissive teams whose initiatives never arm). The branch OWNS the item's whole
     // pass: the normal home flow below must not run, because purgeBeforeRepush would read the
     // tombstone as an undone redaction and RE-PUSH the restricted content into General every hour.
+    // EXTERNAL-access items are exempt (named — review-2 Low 7): their home is external-shared,
+    // and rule 2 speaks to GENERAL; the external-shared analogue is 6b/follow-up territory.
     const restrictedOutOfHome = item.access === "team" && !inGeneral.has(item.id) && episodes.length > 0;
     if (restrictedOutOfHome) {
+      // ARM the copies + the PROJECT ROW first, on EVERY restricted pass (review-2 Blocker 1 +
+      // High 3's hold-branch gap): the row is what lets readyPartitions latch the partition — on a
+      // permissive team no read ever arms, so without it the moved content would leave General and
+      // be servable from nowhere, forever. Hoisted above the sub-branches so a parked/held item
+      // still re-arms a copy that reconcile re-queued. projected_at is bumped by the flip (B2's
+      // grace reset) so the never-landed judge gives the push a full window.
+      const restrictedTargets = fanoutTargetsByItem.get(item.id) ?? new Set<string>();
+      const targetProjectIds: string[] = [];
+      for (const [projId, grp] of initiativeGroupByProject) if (restrictedTargets.has(grp)) targetProjectIds.push(projId);
+      if (targetProjectIds.length > 0) await ensureArmingRows(db, args.teamId, targetProjectIds);
+      for (const target of restrictedTargets) {
+        const targetRow = fanoutRows.find((fr) => fr.group_id === target);
+        if (targetRow?.deferred) {
+          const { error: armErr } = await db
+            .from("graph_episodes")
+            .update({ deferred: false, projected_at: new Date().toISOString() })
+            .eq("team_id", args.teamId)
+            .eq("source_table", SOURCE_TABLE)
+            .eq("source_id", item.id)
+            .eq("group_id", target)
+            .eq("deferred", true);
+          if (armErr) {
+            throw new ProjectionAbortError(
+              `project: restriction arm failed for item ${item.id} into ${target}: ${armErr.message}`,
+              partialSummary()
+            );
+          }
+        }
+      }
+      // CONFIRMED, not merely 202'd (review-2 High 3): a copy whose extraction silently died
+      // after accept would otherwise complete the move and then be re-queue-DELETED — content in
+      // no partition, with the hold branch never re-arming. episode_uuid is reconcile's confirm.
       const landedCopy = fanoutRows.some(
-        (r) => !r.deferred && r.content_sha256 === contentSha && (fanoutTargetsByItem.get(item.id) ?? new Set()).has(r.group_id)
+        (r) =>
+          !r.deferred &&
+          r.content_sha256 === contentSha &&
+          r.episode_uuid != null &&
+          (fanoutTargetsByItem.get(item.id) ?? new Set()).has(r.group_id)
       );
       if (currentRow && currentRow.content_sha256 !== "" && !currentRow.pending_delete_group_id && landedCopy) {
         // Move completes: tombstone home with a self pending flag; reconcile purges durably and
@@ -1088,25 +1128,6 @@ export async function projectItemsToGraph(
       // exactly that). The copies push under the fan-out budget on this and following passes;
       // once landed, the branch above completes the move. Counted in `restrictionMovesPending`
       // so the pending-move population is observable, never silent.
-      for (const target of fanoutTargetsByItem.get(item.id) ?? new Set<string>()) {
-        const targetRow = fanoutRows.find((fr) => fr.group_id === target);
-        if (targetRow?.deferred) {
-          const { error: armErr } = await db
-            .from("graph_episodes")
-            .update({ deferred: false })
-            .eq("team_id", args.teamId)
-            .eq("source_table", SOURCE_TABLE)
-            .eq("source_id", item.id)
-            .eq("group_id", target)
-            .eq("deferred", true);
-          if (armErr) {
-            throw new ProjectionAbortError(
-              `project: restriction arm failed for item ${item.id} into ${target}: ${armErr.message}`,
-              partialSummary()
-            );
-          }
-        }
-      }
       restrictionMovesPending++;
       // …then fall through to the NORMAL flow — the content stays Everyone-visible until the move
       // can complete without loss (copy-then-delete).
