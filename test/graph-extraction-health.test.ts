@@ -146,6 +146,23 @@ const CASES: { name: string; over: Partial<ExtractionSignals>; want: Expected }[
     over: { liveness: WORKER_NEVER, workerLiveness: WORKER_NEVER },
     want: { stalled: true, cause: "no-completion-visible", observed: null },
   },
+  {
+    // MUTATION-FOUND GAP: deleting the skew bound left every test green. A suppressor with no upper
+    // bound on clock skew can mute an alarm for as long as the stamp stays in the future — the
+    // "quietly declines to fire" failure this family exists to remove. Small skew (seconds) must still
+    // count as evidence, so the tolerance is a bound, not a ban.
+    name: "none + a worker stamp FAR in the future ⇒ accuses (a wrong clock cannot mute an alarm)",
+    over: {
+      liveness: WORKER_NEVER,
+      workerLiveness: { kind: "at", atMs: NOW + 2 * 3_600_000 },
+    },
+    want: { stalled: true, cause: "no-completion-visible", observed: null },
+  },
+  {
+    name: "none + a worker stamp seconds ahead ⇒ still suppresses (ordinary container skew)",
+    over: { liveness: WORKER_NEVER, workerLiveness: { kind: "at", atMs: NOW + 30_000 } },
+    want: { stalled: false, cause: null, observed: "queued-behind-worker" },
+  },
   // ── liveness `at`, inside the lag budget ────────────────────────────────────────────────────────
   {
     name: "at + 0 facts + idle worker ⇒ no-facts (jobs complete, nothing is extracted)",
