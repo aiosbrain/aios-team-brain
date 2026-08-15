@@ -419,12 +419,12 @@ describe("churn: how many chunk hashes change under a real edit — CDC vs the b
       }
       // `edit in place, same length` is excluded from BOTH assertions here, not just the second one
       // (CDCCHURN-1). The ceiling of 6 is fitted to this one fixed offset: swept across the same corpus,
-      // a boundary-disturbing 20-character in-place edit reaches **78 of 80 admitted chunks**
-      // (`docs/ARCHITECTURE.md` @7111), against a legacy churn of 1. And "never worse than byte offsets"
+      // a boundary-disturbing 20-character in-place edit reaches **at least 9 of 80 admitted chunks**
+      // (`docs/ARCHITECTURE.md`@178,189), against a legacy churn of 1. And "never worse than byte offsets"
       // is simply false for that scenario — byte offsets churn 1 by construction, since offsets do not
       // move. Both claims now live in the describe below, conditioned on what the edit actually touches.
       // The other scenarios still bind, and they are where CDC's win is real: the same corpus gives
-      // CDC 5 against legacy 78 for an insertion near the top.
+      // CDC 1 against legacy 80 for an insertion near the top.
       if (name === "edit in place, same length") continue;
       cdc.sort((a, b) => a - b);
       const median = cdc[Math.floor(cdc.length / 2)];
@@ -499,6 +499,22 @@ describe("CDCCHURN-1: in-place same-length churn is the number of chunks the edi
     return out;
   };
 
+  /**
+   * What the rule predicts for a STRICT document, under the metric the product actually pays.
+   *
+   * The interval count is 1 by construction (that is what `strict` means). The subtraction is the
+   * corner a third reviewer constructed and this test now pins: `lib/graph/project.ts` filters by
+   * `new Set(chunk_shas)` MEMBERSHIP, so if the edited chunk's new content already exists elsewhere in
+   * the document, nothing is re-pushed and the cost is 0. Derived from the rule — never from the churn
+   * it is checking — so it cannot pass by restating the answer.
+   */
+  const expectedStrictChurn = (t: string, at = EDIT_AT, len = EDIT_LEN): number => {
+    const holding = admittedIntervals(t).find(([s, e]) => at >= s && at + len <= e);
+    if (holding === undefined) return 0; // not strict; the caller does not reach this
+    const editedChunk = (t.slice(0, at) + "X".repeat(len) + t.slice(at + len)).slice(holding[0], holding[1]);
+    return new Set(chunkContent(t)).has(editedChunk) ? 0 : 1;
+  };
+
   type Bucket = "excluded" | "strict" | "reported";
 
   /**
@@ -556,7 +572,7 @@ describe("CDCCHURN-1: in-place same-length churn is the number of chunks the edi
     expect(after).not.toContain(target!); // …and the edit really destroyed it
     expect(JSON.stringify(after)).not.toBe(JSON.stringify(before));
     expect(classify(t, at)).toBe("reported");
-    // A DIRECTION, never a magnitude: the corpus already reaches 78 of 80, so any ceiling here would be
+    // A DIRECTION, never a magnitude: the corpus already reaches ≥9 of 80, so any ceiling here would be
     // a property of this fixture rather than of the chunker.
     expect(changedCount(chunkContent(t), chunkContent(edited))).toBeGreaterThanOrEqual(2);
   });
@@ -625,6 +641,33 @@ describe("CDCCHURN-1: in-place same-length churn is the number of chunks the edi
     expect(changedCount(chunkContent(t), chunkContent(inPlace(t)))).toBe(0);
   });
 
+  it("DUPLICATE FIXTURE: a touched chunk that coincides with an existing one costs NOTHING", () => {
+    // Constructed by the third reviewer (Codex) and reproduced here: a document built from a repeated
+    // block, with the post-edit content of the edited chunk planted in an earlier copy. The edit
+    // changes text, the boundary sequence is unchanged and the span sits inside one admitted chunk —
+    // every precondition of "strict" — yet SET churn is 0, because the edited chunk is byte-identical
+    // to one already in the ledger and `lib/graph/project.ts:1222` filters by set membership.
+    //
+    // The other two reviewers judged this unconstructible from real markdown, and they were right that
+    // it needs contrived content — but the RULE is a general claim, and a general claim with a
+    // counterexample is what this whole ticket is about.
+    const block = doc(10_000, 21);
+    const t0 = block.repeat(5);
+    const holding = admittedIntervals(t0).find(([s, e]) => EDIT_AT >= s && EDIT_AT + EDIT_LEN <= e)!;
+    const editedChunk =
+      t0.slice(holding[0], EDIT_AT) + "X".repeat(EDIT_LEN) + t0.slice(EDIT_AT + EDIT_LEN, holding[1]);
+    const twinAt = holding[0] - block.length;
+    const t = t0.slice(0, twinAt) + editedChunk + t0.slice(twinAt + (holding[1] - holding[0]));
+
+    expect(classify(t)).toBe("strict"); // every precondition of the strict bucket holds…
+    expect(changedCount(chunkContent(t), chunkContent(inPlace(t)))).toBe(0); // …and the cost is 0
+    // Positional churn is still 1 — which is exactly why the two metrics must not be conflated.
+    const before = chunkContent(t);
+    const after = chunkContent(inPlace(t));
+    expect(after.filter((c, i) => before[i] !== c).length).toBe(1);
+    expect(expectedStrictChurn(t)).toBe(0); // and the rule predicts it
+  });
+
   it("LIVE CORPUS: the in-place median stays at 1 — the assertion that would have caught this", () => {
     // Dropping the ceiling took the MEDIAN with it, and review was right that this went too far: the
     // median is metric-robust (set and positional agree in the strict bucket, which is most of the
@@ -649,7 +692,16 @@ describe("CDCCHURN-1: in-place same-length churn is the number of chunks the edi
       if (bucket !== "strict") continue;
       // Per document, not as a corpus maximum: a maximum lets one outlier dominate, which is how the
       // original defect hid — and how it was then mis-diagnosed three times.
-      expect(changedCount(chunkContent(t), chunkContent(inPlace(t))), "strict document churn").toBe(1);
+      //
+      // And the expectation is DERIVED from the rule, not the constant 1, because of the corner the
+      // third reviewer constructed: under the SET metric the ledger pays, a touched chunk whose
+      // post-edit content already exists elsewhere in the document costs NOTHING, so a strict document
+      // can legitimately churn 0. Asserting a flat 1 would redden on a true negative. This computes
+      // what the rule predicts and asserts that.
+      expect(
+        changedCount(chunkContent(t), chunkContent(inPlace(t))),
+        "strict document churn must equal what the rule predicts"
+      ).toBe(expectedStrictChurn(t));
     }
     // HONEST ABOUT WHAT THIS IS (review): the sum is a TAUTOLOGY for any total classifier — one that
     // returned "reported" for everything would satisfy it. It is kept because it pins TOTALITY (every

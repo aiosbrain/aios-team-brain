@@ -37,12 +37,16 @@ Each wrong answer was cheap prose that would have shipped as documentation:
 
 **When the boundary sequence is unchanged, churn equals the number of ADMITTED chunk intervals that
 intersect the changed span.** Exactly 1 requires two things together: the edit changes text, and it
-lies wholly inside one admitted chunk. (This draft first wrote a third condition — "no boundary strictly
+lies wholly inside one admitted chunk — **and one more under the SET metric the ledger actually pays**:
+a touched chunk whose post-edit content already exists elsewhere in the document costs NOTHING, so such
+a document legitimately churns 0. Constructed by the third reviewer and pinned as the DUPLICATE
+fixture; the other two judged it unreachable from real prose, which is true and beside the point, since
+the rule is a general claim. (This draft first wrote a third condition — "no boundary strictly
 inside the edit span" — which a mutation then proved redundant; see §2b.)
 
 Verified by sweeping every corpus document ≥25k characters at 97-character offset steps and comparing
-the count this rule predicts against the measured churn: **5,658 unchanged-sequence samples, 5,658
-agreements, zero mismatches** (measured at `2b1778d`; see the staleness note below). The 0-churn (past-cap) and 2-churn (spans a surviving boundary) cases
+the count this rule predicts against the measured churn: **5,743 unchanged-sequence samples, 5,743
+agreements, zero mismatches**. The 0-churn (past-cap) and 2-churn (spans a surviving boundary) cases
 fall out of the same rule rather than needing exceptions.
 
 ### 0c. When the sequence DOES change, there is no usable ceiling
@@ -129,8 +133,8 @@ move. For CDC it cannot be: a content-defined boundary **is** content.
 ### 2a. Both tables state the property that is true, and the severity
 
 `edit in place, same length` becomes: **1 when the edit lies wholly inside one chunk and disturbs no
-boundary; otherwise the number of chunks it touches, which is unbounded in practice — measured to 78 of
-80 on this repo's own corpus.** The prose names the mechanism (a cut is decided by the ~32 code units
+boundary; otherwise the number of chunks it touches, with no useful ceiling — observed to at least 9 of
+80 on this repo's own corpus, under the metric the ledger pays.** The prose names the mechanism (a cut is decided by the ~32 code units
 ending at it) and carries §0d's trade table, so the next reader sees both directions at once.
 
 `append at end` is marked **conditional and not yet fully characterised**, pointing at the follow-up
@@ -184,7 +188,7 @@ document can redden it: a document that disturbs a boundary simply classifies in
 
 The `it.fails` exists only because the assertion was wrong. The `max(cdc) ≤ max(legacy)` comparison is
 **removed for the same-length scenario**, with §0d's measurement recorded at the site: it asserts
-`78 ≤ 1` in the general case and `1 ≤ 1` on the strict subset, so it is either false or vacuous. It is
+`9 ≤ 1` in the general case and `1 ≤ 1` on the strict subset, so it is either false or vacuous. It is
 also max-versus-max across *different* documents, which is named where it survives for other scenarios.
 
 ## Dependencies
@@ -241,7 +245,7 @@ removal of the `it.fails` and of the same-length never-worse comparison.
 ## 5. What would falsify this
 
 Wrong if a document classified strict — sequence unchanged, edit inside one admitted chunk, no interior
-boundary — still churns anything but 1. That is the rule verified at 4,962/4,962, so a counterexample
+boundary — still churns anything but 1. That is the rule verified at 5,743/5,743, so a counterexample
 means a fifth mechanism exists and the classifier is measuring the wrong thing.
 
 Wrong in the other direction if the changed fixture's targeted boundary survives its own centred edit,

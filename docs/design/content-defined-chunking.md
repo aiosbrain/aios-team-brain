@@ -287,7 +287,7 @@ as fixtures — not content, just lengths and edit positions where content is se
 That row promised an unconditional **1** and it cannot be one. For byte offsets 1 IS a theorem: offsets
 do not move, so exactly the containing chunk changes. For CDC a boundary **is** content — a cut is
 decided by roughly the 32 code units ENDING at it — so an edit can destroy a boundary it never touches,
-create one where none was, or span a surviving one. The true rule, verified over 4,962 swept samples
+create one where none was, or span a surviving one. The true rule, verified over 5,743 swept samples
 with zero mismatches (`test/graph-cdc.test.ts`, CDCCHURN-1):
 
 > **churn = the number of admitted chunk intervals the changed span intersects.**
@@ -299,7 +299,8 @@ Exactly 1 requires two things: the edit changes text, and it lies wholly inside 
 deleted after a mutation showed nothing could redden it.) Otherwise there is no useful ceiling —
 measured over this repo's own markdown, a 20-character in-place edit reaches **8 of the 80 admitted
 chunks**, and that number moves as the corpus does: an earlier measurement, on a longer
-`docs/ARCHITECTURE.md`, reached 78.
+`docs/ARCHITECTURE.md`, reached 78 — but that was a POSITIONAL count, and positional churn is not a
+cost (see the note above the table).
 
 **So the honest trade, both directions measured on the same corpus:**
 
