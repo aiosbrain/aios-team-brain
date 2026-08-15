@@ -524,6 +524,25 @@ describe("readExtractionSignals — 'found nothing' vs 'could not read'", () => 
     expect(reading.reason).toContain("0 extracted facts");
   });
 
+  it("the fact read is SCOPED to this team's groups — the half that fixes the global count", async () => {
+    // MUTATION-FOUND GAP: dropping `WHERE r.group_id IN $g` reverts defect (b) — the count goes global,
+    // `facts === 0` becomes false forever on any install holding facts from anywhere else, and the
+    // never-extracted half is permanently disarmed for the team that is broken. Every other test in
+    // this file stayed green under that mutation, because they all mock the read. So the SCOPE is
+    // pinned at the call, not just the text: the query must carry the filter AND be handed this team's
+    // ledger groups as its parameter.
+    vi.mocked(runSql).mockResolvedValue(ledgerRow({ groups: ["acme_team", "acme_external"] }) as never);
+    vi.mocked(runRead).mockResolvedValue([{ n: 7, at: null }] as never);
+    await readExtractionSignals("t1", NOW);
+    const factCall = vi.mocked(runRead).mock.calls.find((c) => String(c[0]).includes("RELATES_TO"));
+    expect(factCall, "the fact read is gone — this test is stale, not passing").toBeDefined();
+    expect(String(factCall![0])).toContain("r.group_id IN $g");
+    expect(factCall![1]).toEqual({ g: ["acme_team", "acme_external"] });
+    // …and the liveness read is scoped to the SAME population, since one is subtracted from the other.
+    const liveCall = vi.mocked(runRead).mock.calls.find((c) => String(c[0]).includes("(e:Episodic)"));
+    expect((liveCall![1] as { g: string[] }).g).toEqual(["acme_team", "acme_external"]);
+  });
+
   it("a graph read that THROWS is `unreadable`, and it cannot", async () => {
     vi.mocked(runSql).mockResolvedValue(
       ledgerRow({ first_seen_at: new Date(NOW - LANDED_GRACE_MS - 1000).toISOString() }) as never
