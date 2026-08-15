@@ -550,6 +550,45 @@ describe("CDCCHURN-1: in-place same-length churn is the number of chunks the edi
     expect(classify(doc(EDIT_AT + EDIT_LEN, 5))).not.toBe("excluded"); // exactly eligible
   });
 
+  it("SPANNING FIXTURE: an unchanged sequence is NOT enough — the edit must sit inside one chunk", () => {
+    // MUTATION-FOUND GAP. Deleting the interior-boundary condition — i.e. restoring draft 2's false
+    // rule, "unchanged sequence ⇒ churn 1" — left every test green, because on today's corpus the
+    // sequence check catches the one document that would expose it first. Two conditions masking each
+    // other is defense-in-depth hiding a mutation, so each now has a fixture that isolates it.
+    //
+    // Here the boundary at 8,543 SURVIVES the edit (the sequence is identical) but the edit spans it,
+    // so both adjacent chunks change: churn 2, not 1.
+    const t = doc(50_000, 3);
+    const at = 8_528;
+    const boundary = 8_543;
+    const before = cdcBoundaries(t, CDC_PARAMS);
+    const edited = t.slice(0, at) + "X".repeat(EDIT_LEN) + t.slice(at + EDIT_LEN);
+    expect(before).toContain(boundary);
+    expect(cdcBoundaries(edited, CDC_PARAMS)).toEqual(before); // sequence UNCHANGED…
+    expect(at).toBeLessThan(boundary);
+    expect(at + EDIT_LEN).toBeGreaterThan(boundary); // …but the edit spans the surviving boundary
+    expect(classify(t, at)).toBe("reported");
+    expect(changedCount(chunkContent(t), chunkContent(edited))).toBe(2);
+  });
+
+  it("WINDOW FIXTURE: fitting inside one chunk is NOT enough — the sequence must also survive", () => {
+    // The mirror mutation: deleting the boundary-sequence comparison also left everything green, for the
+    // same masking reason. Here the edit sits wholly inside one original chunk and still changes the
+    // sequence, because a cut is decided by the ~32 code units ENDING at it — so an edit 25 characters
+    // short of the boundary at 4,374 destroys it without touching it. This is mechanism (3) from the
+    // header, the one that killed draft 1's overlap rule.
+    const t = doc(50_000, 1);
+    const at = 4_349;
+    const boundary = 4_374;
+    const before = cdcBoundaries(t, CDC_PARAMS);
+    const edited = t.slice(0, at) + "X".repeat(EDIT_LEN) + t.slice(at + EDIT_LEN);
+    expect(before).toContain(boundary);
+    expect(at + EDIT_LEN).toBeLessThan(boundary); // the edit does NOT overlap the boundary…
+    expect(cdcBoundaries(edited, CDC_PARAMS)).not.toEqual(before); // …and destroys it anyway
+    expect(admittedIntervals(t).some(([lo, hi]) => at >= lo && at + EDIT_LEN <= hi)).toBe(true);
+    expect(classify(t, at)).toBe("reported");
+  });
+
   it("LIVE CORPUS: every strictly-classified document churns exactly 1", () => {
     const docs = repoDocs();
     expect(docs.length).toBeGreaterThan(5);
