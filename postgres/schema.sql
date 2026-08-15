@@ -961,6 +961,15 @@ create table if not exists projects (
 -- migration as a named drop-and-re-add constraint (replay-repairable); pg:schema always runs
 -- migrations after this file, so it exists in every path.
 alter table projects add column if not exists kind text not null default 'source';
+-- The project's Graphiti partition pointer (PCCC-4; spec ~946-950 rules STORED, not inferred).
+-- §11 built-ins grandfather the legacy tier ids ('<teamSlug>_team' / '<teamSlug>_external');
+-- everything else mints lib/graph/group.projectGroupId. Sole writer:
+-- lib/graph/project-pointer.ensureProjectGraphPointer (called by every creation path) + the
+-- 20260815140000 backfill; nullable only for the insert-then-point window at creation — readers
+-- treat null as not-cutover and fail closed. Injective via the partial unique below.
+alter table projects add column if not exists graph_group_id text;
+create unique index if not exists projects_graph_group_id_key
+  on projects (graph_group_id) where graph_group_id is not null;
 
 -- ── Access chain (spec: docs/specs/project-context-classification-v1.md §4) ──────────────
 -- Person → Group → Project → Content. These three tables are the ONLY access edges; the sole
@@ -2378,11 +2387,10 @@ create table if not exists graph_episodes (
   -- chunks were never pushed. Empty = no per-chunk knowledge → full push. Sole writer: lib/graph/project.
   chunk_shas text[] not null default '{}',
   chunk_config text not null default '',
-  projected_at timestamptz not null default now(),
-  -- NARROW unique: one row per item — Deploy A of PCCC-3 keeps it (the old release's 3-column
-  -- ON CONFLICT needs it during the deploy window); Deploy B (PCCC-4) drops it, after which an
-  -- item may hold one row PER GROUP (docs/design/phase-c-per-project-graphs.md §2.1).
-  unique (team_id, source_table, source_id)
+  projected_at timestamptz not null default now()
+  -- The one-row-per-item NARROW unique that used to live here was dropped by PCCC-4/Deploy B
+  -- (migration 20260815150000): identity is per-(item, group) via graph_episodes_item_group_key
+  -- below, and an item may hold one ledger row PER GROUP (PCCC-5 fan-out's substrate).
 );
 create index if not exists graph_episodes_team_idx on graph_episodes (team_id, projected_at desc);
 -- PCCC-3: the per-(item, group) identity the projector's 4-column ON CONFLICT targets. Expressed as

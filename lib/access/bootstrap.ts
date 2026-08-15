@@ -1,6 +1,7 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { audit } from "@/lib/api/audit";
+import { ensureProjectGraphPointer } from "@/lib/graph/project-pointer";
 import {
   EVERYONE_SLUG,
   EXTERNAL_SLUG,
@@ -80,6 +81,10 @@ async function ensureSystemProject(
         meta: { slug, from_kind: row.kind },
       });
     }
+    // Pointer AFTER the kind settles (PCCC-4): for a freshly adopted source project this is the
+    // one sanctioned minted→legacy rewrite; for an already-system row it converges idempotently.
+    const adoptedPtr = await ensureProjectGraphPointer(db, { teamId, projectId: row.id });
+    if (!adoptedPtr.ok) return { ok: false, error: adoptedPtr.error };
     return { ok: true, projectId: row.id };
   }
   const { data, error } = await db
@@ -98,6 +103,8 @@ async function ensureSystemProject(
     if (winner) return ensureSystemProject(db, teamId, slug);
     return { ok: false, error: error?.message ?? "insert failed" };
   }
+  const freshPtr = await ensureProjectGraphPointer(db, { teamId, projectId: data.id as string });
+  if (!freshPtr.ok) return { ok: false, error: freshPtr.error };
   return { ok: true, projectId: data.id as string };
 }
 

@@ -78,6 +78,12 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
  * takes a slug, this takes an id — would mint a charset-valid but WRONG key: the projector writes one
  * partition namespace and the read leg searches another, a silently-empty graph with no error. Fail
  * LOUD here so that mixup throws instead of producing invisible data. Pure.
+ *
+ * AUTHORITY (amended by PCCC-4): this is the MINT default, not the read authority. Since
+ * `projects.graph_group_id` landed, the STORED pointer is what readers and the projector resolve —
+ * the §11 built-ins grandfather the legacy tier ids (`<teamSlug>_team`/`<teamSlug>_external`), so
+ * recomputing this scheme at read time would name an empty partition for exactly the two largest
+ * ones. Sole pointer writer: lib/graph/project-pointer.ensureProjectGraphPointer.
  */
 export function projectGroupId(teamId: string, projectId: string): string {
   if (!UUID_RE.test(teamId) || !UUID_RE.test(projectId)) {

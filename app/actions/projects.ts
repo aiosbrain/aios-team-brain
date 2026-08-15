@@ -2,6 +2,7 @@
 
 import { serverClient } from "@/lib/db/server";
 import { currentMember } from "@/lib/auth/guard";
+import { ensureProjectGraphPointer } from "@/lib/graph/project-pointer";
 import { slugify } from "@/lib/ids";
 
 export interface ProjectRow {
@@ -44,5 +45,8 @@ export async function createProjectAction(input: {
     }
     return { ok: false, error: error?.message ?? "could not create project" };
   }
+  // PCCC-4: every creation path records the project's graph partition pointer.
+  const ptr = await ensureProjectGraphPointer(db, { teamId: input.teamId, projectId: (data as ProjectRow).id });
+  if (!ptr.ok) return { ok: false, error: ptr.error };
   return { ok: true, project: data as ProjectRow };
 }

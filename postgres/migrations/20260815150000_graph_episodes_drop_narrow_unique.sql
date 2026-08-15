@@ -1,0 +1,13 @@
+-- PCCC-4 (Deploy B, part 2 — docs/design/phase-c-per-project-graphs.md §2.1 step 2): drop the
+-- narrow one-row-per-item unique. Deploy A (PCCC-3, migration 20260815120000) added the wide
+-- per-(item, group) arbiter and moved both projector conflict targets to it, so the old release
+-- serving during THIS deploy's preDeploy window already conflicts on the wide index — no broken
+-- window in either direction. After this, an item may legally hold one ledger row PER GROUP,
+-- which is PCCC-5 fan-out's substrate.
+--
+-- The group-move explicit UPDATE in lib/graph/project.ts deliberately SURVIVES this drop (the
+-- design's first "relax to plain upsert" ruling was amended): a plain upsert on a tier flip would
+-- leave the old-group row live, and reconcile's sentinel re-queue would re-populate the vacated
+-- tier group — a leak-by-machinery. One logical home partition = one row, moved in place, until
+-- PCCC-5's set-diff owns multi-row life cycles.
+alter table graph_episodes drop constraint if exists graph_episodes_team_id_source_table_source_id_key;
