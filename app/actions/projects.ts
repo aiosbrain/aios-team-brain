@@ -2,6 +2,7 @@
 
 import { serverClient } from "@/lib/db/server";
 import { currentMember } from "@/lib/auth/guard";
+import { ensureProjectGraphPointer } from "@/lib/graph/project-pointer";
 import { slugify } from "@/lib/ids";
 
 export interface ProjectRow {
@@ -40,9 +41,30 @@ export async function createProjectAction(input: {
     .single();
   if (error || !data) {
     if (/duplicate key|unique constraint/i.test(error?.message ?? "")) {
+      // Converge the existing row's pointer before refusing (review Medium 3b): if a prior attempt
+      // created the row and then failed its pointer write, the retry would otherwise land here
+      // forever with the project permanently unpointed — dark under PCCC-6's fail-closed read.
+      const { data: existing } = await db
+        .from("projects")
+        .select("id")
+        .eq("team_id", input.teamId)
+        .eq("slug", slug)
+        .maybeSingle();
+      if (existing) {
+        const heal = await ensureProjectGraphPointer(db, { teamId: input.teamId, projectId: (existing as ProjectRow).id });
+        // A failing heal must not hide behind the duplicate-name error (Codex Medium 3): a
+        // half-created project would otherwise stay unpointed forever with every retry reading
+        // "already exists" — dark under PCCC-6's fail-closed read, invisible to the operator.
+        if (!heal.ok) {
+          return { ok: false, error: `a project "${slug}" already exists — and its graph pointer is unhealed: ${heal.error}` };
+        }
+      }
       return { ok: false, error: `a project "${slug}" already exists` };
     }
     return { ok: false, error: error?.message ?? "could not create project" };
   }
+  // PCCC-4: every creation path records the project's graph partition pointer.
+  const ptr = await ensureProjectGraphPointer(db, { teamId: input.teamId, projectId: (data as ProjectRow).id });
+  if (!ptr.ok) return { ok: false, error: ptr.error };
   return { ok: true, project: data as ProjectRow };
 }

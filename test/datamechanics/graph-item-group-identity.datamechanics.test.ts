@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { projectItemsToGraph } from "@/lib/graph/project";
 import { runGraphProjection } from "@/lib/graph/run";
 import { episodeGroupId } from "@/lib/graph/group";
@@ -17,12 +17,12 @@ import { FakeGraphiti, client } from "./fake-graphiti";
  * ledger reservation).
  *
  * Why this tier: every claim is about what a REAL Postgres does with the widened key — arbiter
- * index matching, the narrow unique rejecting a second-group row during Deploy A, a trigger-forced
+ * index matching, a trigger-forced
  * write failure surfacing loudly. A stubbed store proves none of that.
  */
 
 const WIDE_INDEX = "graph_episodes_item_group_key";
-const NARROW_CONSTRAINT = "graph_episodes_team_id_source_table_source_id_key";
+
 
 /** A FakeGraphiti that, at the moment of each push, witnesses whether the ledger row for the
  *  pushed (team, item, group) already exists — the reservation-before-push order pin (Codex
@@ -75,26 +75,11 @@ describe("PCCC-3 Deploy A — per-(item, group) ledger identity", () => {
     expect(dup.error).not.toBeNull();
   });
 
-  it("Deploy A invariant: a second row for the same item in a DIFFERENT group is still rejected (narrow unique stands until Deploy B)", async () => {
-    const seed = await seedTeam();
-    const sourceId = crypto.randomUUID();
-    const base = {
-      team_id: seed.teamId,
-      source_table: "items",
-      source_id: sourceId,
-      content_sha256: sha("x"),
-    };
-    const first = await db()
-      .from("graph_episodes")
-      .insert({ ...base, group_id: episodeGroupId(seed.teamSlug, "team") });
-    expect(first.error).toBeNull();
-    const second = await db()
-      .from("graph_episodes")
-      .insert({ ...base, group_id: episodeGroupId(seed.teamSlug, "external") });
-    expect(second.error).not.toBeNull();
-  });
+  // The Deploy-A invariant test (second-group row rejected by the narrow unique) retired with
+  // PCCC-4/Deploy B, which drops that constraint: the INVERTED pin — a second-group row is now
+  // LEGAL — lives in graph-pointer-deploy-b.datamechanics.test.ts alongside the pointer tests.
 
-  it("a tier flip MOVES the single ledger row (explicit UPDATE while the narrow unique stands) and records the old group as pending-delete", async () => {
+  it("a tier flip MOVES the single ledger row (explicit UPDATE) and records the old group as pending-delete", async () => {
     const seed = await seedTeam();
     const fake = new FakeGraphiti();
     const r = await ingest(seed, { body: "flip me across tiers", path: "flip.md", access: "external" });
@@ -390,38 +375,14 @@ describe("PCCC-3 Deploy A — per-(item, group) ledger identity", () => {
 });
 
 describe("PCCC-3 — consumers count ITEMS, not (item, group) rows", () => {
-  const fanoutTeamIds: string[] = [];
-  afterAll(async () => {
-    // Restore the Deploy-A shape for any test file running after this one. The duplicate rows this
-    // suite created must go FIRST — re-adding the unique over them fails and would silently leave
-    // the whole container without the narrow invariant (observed: one leaked run reddened the
-    // Deploy-A tests on the next).
-    for (const teamId of fanoutTeamIds) {
-      await runSql("delete from graph_episodes where team_id = $1", [teamId]);
-    }
-    await runSql(
-      `do $$ begin
-         if not exists (select 1 from pg_constraint where conname = '${NARROW_CONSTRAINT}') then
-           alter table graph_episodes add constraint ${NARROW_CONSTRAINT} unique (team_id, source_table, source_id);
-         end if;
-       end $$`,
-      []
-    );
-    const restored = await runSql<{ n: number }>(
-      "select count(*)::int as n from pg_constraint where conname = $1",
-      [NARROW_CONSTRAINT]
-    );
-    if ((restored.rows[0]?.n ?? 0) !== 1) throw new Error("narrow unique NOT restored — container is dirty");
-  });
+  // The Deploy-A-era drop/restore scaffolding is retired (PCCC-4): the narrow unique no longer
+  // exists in the schema, so the Deploy-B state these tests once simulated is simply the real one.
 
-  it("the projector operates against the wide arbiter ALONE (Deploy B state: narrow unique dropped)", async () => {
+  it("the projector operates against the wide arbiter ALONE", async () => {
     const seed = await seedTeam();
-    fanoutTeamIds.push(seed.teamId);
-    await runSql(`alter table graph_episodes drop constraint if exists ${NARROW_CONSTRAINT}`, []);
 
     // A 3-column conflict target would error here ("no unique or exclusion constraint matching") —
-    // this is the test that keeps the 4-column target honest, because under Deploy A the narrow
-    // unique also satisfies a 3-column target and every other test stays green (the
+    // this is the test that keeps the 4-column target honest (the
     // guard-must-cover-the-level-that-changed trap).
     const fake = new FakeGraphiti();
     const r = await ingest(seed, { body: "deploy B world", path: "b.md", access: "team" });
@@ -437,11 +398,6 @@ describe("PCCC-3 — consumers count ITEMS, not (item, group) rows", () => {
 
   it("countProjectedEpisodes is invariant under fan-out (two group rows for one item = one item)", async () => {
     const seed = await seedTeam();
-    fanoutTeamIds.push(seed.teamId);
-    // Simulate the Deploy-B state this code must already tolerate: drop the narrow unique so one
-    // item can legally hold rows in two groups (exactly what PCCC-5 fan-out produces).
-    await runSql(`alter table graph_episodes drop constraint if exists ${NARROW_CONSTRAINT}`, []);
-
     const itemA = crypto.randomUUID();
     const itemB = crypto.randomUUID();
     const mk = (sourceId: string, group: string) =>

@@ -2,6 +2,7 @@ import "server-only";
 
 import { createHash } from "node:crypto";
 import { audit } from "@/lib/api/audit";
+import { ensureProjectGraphPointer } from "@/lib/graph/project-pointer";
 import { decideReattribution } from "@/lib/ingest/reattribution-decision";
 import { recordReassignment, ownerWindowStart } from "@/lib/ingest/reassignment-log";
 import type { ItemPayload } from "@/lib/api/item-payload-schema";
@@ -141,6 +142,10 @@ export async function ingestItem(
   if (projectError || !project) {
     throw new Error(`project upsert failed: ${projectError?.message}`);
   }
+  // PCCC-4: a freshly upserted source project records its graph partition pointer; the null-guarded
+  // write makes the re-sync case (project already pointed) a no-op.
+  const ptr = await ensureProjectGraphPointer(db, { teamId: auth.teamId, projectId: project.id as string });
+  if (!ptr.ok) throw new Error(ptr.error);
 
   const { data: existing } = await db
     .from("items")
