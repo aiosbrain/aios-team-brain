@@ -59,13 +59,29 @@ describe("PCCC-6 — the landed-gated restriction move", () => {
     await restrictFromGeneral(seed, r.id);
     await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: seed.teamSlug, client: client(fake) });
 
-    // The initiative copy is still DEFERRED (never armed) → the home row must be untouched.
+    // The copy was ARMED by the restriction but hasn't pushed → home untouched.
     const home = await runSql<{ content_sha256: string; pending_delete_group_id: string | null }>(
       "select content_sha256, pending_delete_group_id from graph_episodes where team_id = $1 and source_id = $2 and group_id = $3",
       [seed.teamId, r.id, episodeGroupId(seed.teamSlug, "team")]
     );
     expect(home.rows[0].content_sha256).toBe(sha("sensitive supplier terms"));
     expect(home.rows[0].pending_delete_group_id).toBeNull();
+
+    // 202'd-BUT-UNCONFIRMED discriminator (review-2 High 3): another pass pushes the copy (sha
+    // set, episode_uuid still NULL) — the move must STILL hold. A silently-dead extraction worker
+    // would otherwise complete the move and reconcile would re-queue-delete the only copy.
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: seed.teamSlug, client: client(fake) });
+    const pushedUnconfirmed = await runSql<{ content_sha256: string }>(
+      "select content_sha256 from graph_episodes where team_id = $1 and source_id = $2 and group_id = $3",
+      [seed.teamId, r.id, init.group]
+    );
+    expect(pushedUnconfirmed.rows[0].content_sha256).toBe(sha("sensitive supplier terms")); // pushed…
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: seed.teamSlug, client: client(fake) });
+    const homeStill = await runSql<{ content_sha256: string }>(
+      "select content_sha256 from graph_episodes where team_id = $1 and source_id = $2 and group_id = $3",
+      [seed.teamId, r.id, episodeGroupId(seed.teamSlug, "team")]
+    );
+    expect(homeStill.rows[0].content_sha256).toBe(sha("sensitive supplier terms")); // …but unconfirmed = no move
   });
 
   it("once the initiative copy LANDS, the move completes: home tombstoned with a self purge flag, then PARKED — never re-pushed", async () => {

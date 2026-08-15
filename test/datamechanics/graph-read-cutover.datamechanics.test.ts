@@ -130,6 +130,23 @@ describe("PCCC-6 — enforced partition selection", () => {
     expect(scope.total).toBe(ids.length);
   });
 
+  it("a self-purge in GENERAL never suppresses it — built-ins are exempt (review-2 High 4: routine hygiene must not blank the primary partition)", async () => {
+    const seed = await seedTeam();
+    expect((await ensureAccessBootstrap(db(), seed.teamId)).ok).toBe(true);
+    const r = await ingest(seed, { body: "soon redacted", path: "sg.md", access: "team" });
+    const fake = new FakeGraphiti();
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: seed.teamSlug, client: client(fake) });
+    // A routine redaction self-flags the General row (the same shape a restriction move-out writes).
+    expect((await db().from("items").update({ body: "" }).eq("id", r.id)).error).toBeNull();
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: seed.teamSlug, client: client(fake) });
+
+    const scope = await selectEnforcedGraphPartitions(db(), {
+      teamId: seed.teamId,
+      visibleProjectIds: await visibleIds(seed, []),
+    });
+    expect(scope.groups).toContain(`${seed.teamSlug}_team`); // General stays eligible through the purge window
+  });
+
   it("SOURCE projects never enter the selection — their minted partitions are empty by construction (review High 4a)", async () => {
     const seed = await seedTeam();
     expect((await ensureAccessBootstrap(db(), seed.teamId)).ok).toBe(true);
