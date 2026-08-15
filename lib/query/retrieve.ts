@@ -2,6 +2,7 @@ import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { GraphitiClient, type GraphFact } from "@/lib/graph/graphiti-client";
 import { visibleGroupIds } from "@/lib/graph/group";
+import { selectEnforcedGraphPartitions } from "@/lib/graph/partition-read";
 import { visibleTasks, isRestrictedTier } from "@/lib/auth/visibility";
 import {
   selectedProviderName,
@@ -138,16 +139,51 @@ async function fetchGraphFacts(
   tier: "team" | "external",
   question: string
 ): Promise<GraphFact[]> {
-  const client = new GraphitiClient({ timeoutMs: GRAPH_QUERY_TIMEOUT_MS });
-  if (!client.configured) return [];
   try {
     const { data: team } = await db.from("teams").select("slug").eq("id", teamId).maybeSingle();
     const slug = (team as { slug: string } | null)?.slug;
     if (!slug) return [];
-    const groupIds = visibleGroupIds(slug, tier);
-    return await client.search(question, groupIds, GRAPH_FACTS_LIMIT);
+    let groupIds = visibleGroupIds(slug, tier);
+    // PCCC-6 permissive UNION (design §2.2's sequencing consequence): once restriction-purge can
+    // move content out of `_team`, the permissive team-tier read must also cover the initiative
+    // partitions that content moved into. arm:false — a permissive read is not a reader-signal;
+    // cold initiatives must never extract for it. External permissive stays `_external` only
+    // (an external principal must never widen).
+    if (tier === "team") {
+      const { data: projRows } = await db.from("projects").select("id").eq("team_id", teamId);
+      const allIds = ((projRows ?? []) as { id: string }[]).map((p) => p.id);
+      const scope = await selectEnforcedGraphPartitions(db, { teamId, visibleProjectIds: allIds, arm: false });
+      groupIds = [...new Set([...groupIds, ...scope.groups])];
+    }
+    return await fetchGraphFactsForGroups(question, groupIds);
   } catch {
     return []; // degrade to Postgres-only retrieval
+  }
+}
+
+/**
+ * Enforcement input (PCCC-6): the item set gates the item legs; `graphProjectIds` — present ONLY
+ * for a team-tier MEMBER on an enforcing team — re-enables the graph leg over their K-capped ready
+ * partitions. Absent (external principals, delegated tokens) keeps the §5.8b omit path unchanged.
+ */
+export type RetrieveEnforce = {
+  visibleItemIds: ReadonlySet<string>;
+  graphProjectIds?: readonly string[];
+};
+
+/** The wire half of the graph leg, injectable for tests (the client was previously constructed
+ *  inline, making the partition wiring unpinnable). */
+export async function fetchGraphFactsForGroups(
+  question: string,
+  groupIds: readonly string[],
+  client?: GraphitiClient
+): Promise<GraphFact[]> {
+  const c = client ?? new GraphitiClient({ timeoutMs: GRAPH_QUERY_TIMEOUT_MS });
+  if (!c.configured || groupIds.length === 0) return [];
+  try {
+    return await c.search(question, [...groupIds], GRAPH_FACTS_LIMIT);
+  } catch {
+    return [];
   }
 }
 
@@ -496,7 +532,7 @@ async function nativeRetrieve(
   tier: "team" | "external",
   question: string,
   projectSlug?: string | null,
-  enforce?: { visibleItemIds: ReadonlySet<string> } | null
+  enforce?: RetrieveEnforce | null
 ): Promise<RetrievedContext> {
   // Access enforcement (Phase B slice 2): `enforcing` supplies the principal's membership-visible
   // item set. `visible(id)` gates the item legs (FTS/recency/dense) + source-linked decisions/tasks.
@@ -520,7 +556,18 @@ async function nativeRetrieve(
   const { source: scopedSource } = parseSourceScope(question);
 
   // Kick off the Graphiti graph-memory search concurrently with Postgres retrieval.
-  const graphFactsP = omitGraph ? Promise.resolve([] as Awaited<ReturnType<typeof fetchGraphFacts>>) : fetchGraphFacts(db, teamId, tier, q);
+  // PCCC-6 read cutover: an enforcing team-tier MEMBER gets the graph leg back, over their
+  // K-capped, read-ready, unsuppressed partitions (stored pointers). External principals and
+  // delegated tokens keep the §5.8b omit (no graphProjectIds). Permissive keeps the tier path
+  // (now union-widened inside fetchGraphFacts).
+  let graphScope: { covered: number; total: number } | undefined;
+  const graphFactsP = (async (): Promise<GraphFact[]> => {
+    if (enforce == null) return fetchGraphFacts(db, teamId, tier, q);
+    if (tier !== "team" || !enforce.graphProjectIds) return [];
+    const scope = await selectEnforcedGraphPartitions(db, { teamId, visibleProjectIds: enforce.graphProjectIds });
+    graphScope = { covered: scope.covered, total: scope.total };
+    return fetchGraphFactsForGroups(q, scope.groups);
+  })();
   // Optional dense (semantic) passage search — pgvector. Runs concurrently; resolves to [] unless
   // EMBEDDINGS_URL is set AND the pgvector schema is loaded (default installs stay pure-FTS).
   // Enforcement is IN-QUERY (visArr), like the FTS leg — see denseSearch (Codex B3 Medium).
@@ -878,7 +925,7 @@ async function nativeRetrieve(
     ? structured +
       "\n\n" +
       [
-        "## Graph memory (temporal facts — entity/relationship knowledge across all ingestions)",
+        `## Graph memory (temporal facts — entity/relationship knowledge across all ingestions)${graphScope ? ` — graph expansion covered ${graphScope.covered} of your ${graphScope.total} projects` : ""}`,
         ...graphFacts.map(
           (f) =>
             `- ${f.fact}${f.valid_at ? ` (valid ${f.valid_at.slice(0, 10)})` : ""}${f.invalid_at ? " [SUPERSEDED]" : ""}`
@@ -891,7 +938,7 @@ async function nativeRetrieve(
   // (Runs on the RRF-fused order when dense retrieval contributed, else the FTS/recency order.)
   const ranked = await rerankSources(question, orderedSources);
 
-  return { sources: ranked, structured: structuredWithGraph, grounded };
+  return { sources: ranked, structured: structuredWithGraph, grounded, ...(graphScope ? { graphScope } : {}) };
 }
 
 /**
@@ -920,7 +967,7 @@ export async function retrieve(
   // Graphiti facts) are OMITTED — they carry no tier/partition and can't be membership-filtered
   // until per-project graphs (Phase C), so under enforcing they fail closed rather than leak
   // restricted knowledge into an answer. Absent = permissive → byte-identical to today.
-  enforce?: { visibleItemIds: ReadonlySet<string> } | null
+  enforce?: RetrieveEnforce | null
 ): Promise<RetrievedContext> {
   const provider = selectedProviderName() === "external" ? externalProvider : nativeProvider;
   return provider.retrieve({ db, teamId, tier, question, projectSlug: projectSlug ?? null, enforce: enforce ?? null });

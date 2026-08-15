@@ -139,8 +139,11 @@ export async function POST(req: NextRequest) {
       const { ids } = await delegatedVisibleItemIds(db, agent);
       enforce = { visibleItemIds: ids };
     } else if (await teamEnforcesAccess(db, teamId)) {
-      const { ids } = await visibleItemIds(db, { teamId, memberId: auth!.memberId });
-      enforce = { visibleItemIds: ids };
+      const { ids, projectIds } = await visibleItemIds(db, { teamId, memberId: auth!.memberId });
+      // PCCC-6: a team-tier member gets the graph leg back over their K-capped ready partitions.
+      // External members and the delegated path above deliberately pass NO graphProjectIds — the
+      // §5.8b omit is unchanged for them.
+      enforce = { visibleItemIds: ids, ...(auth!.memberTier === "team" ? { graphProjectIds: projectIds } : {}) };
     }
   } catch {
     return errorResponse("internal", "enforcement check failed", 500);

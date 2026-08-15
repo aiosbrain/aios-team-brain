@@ -420,6 +420,28 @@ export interface ProjectSummary {
 }
 
 /**
+ * Flip a set of groups' DEFERRED rows to pushable — the arming side effect (PCCC-6). Lives here,
+ * not in lib/graph/arming, because graph_episodes has ONE writer (single-writer guarded) and the
+ * arming module owns only its own table. Idempotent; the projector's next pass pushes under its
+ * fan-out budget.
+ */
+export async function armDeferredRowsForGroups(
+  db: DbClient,
+  teamId: string,
+  groupIds: readonly string[]
+): Promise<void> {
+  for (const batch of chunk([...groupIds], IN_CLAUSE_BATCH)) {
+    const { error } = await db
+      .from("graph_episodes")
+      .update({ deferred: false })
+      .eq("team_id", teamId)
+      .eq("deferred", true)
+      .in("group_id", batch);
+    if (error) throw new Error(`arming flip failed: ${error.message}`);
+  }
+}
+
+/**
  * Restore the ledger pointer for a fan-out push whose post-push UPDATE matched zero rows (Codex
  * review High 2): reconcile's never-landed delete can eat an armed `''` row between the pass's
  * ledger read and its write — Graphiti then holds the accepted push with NO row anywhere. Write a
@@ -718,10 +740,12 @@ export async function projectItemsToGraph(
   // Batch-resolve each item's ACTIVE initiative include memberships — via the read-only substrate
   // module (the access-single-writer guard's coarse net rightly refuses those table literals in a
   // file full of write verbs).
-  const fanoutTargetsByItem = await resolveFanoutTargets(db, {
+  const generalProject = pointers.find((p) => p.kind === "system" && p.slug === "general") ?? null;
+  const { targets: fanoutTargetsByItem, inGeneral } = await resolveFanoutTargets(db, {
     teamId: args.teamId,
     itemIds: rows.map((r) => r.id),
     initiativeGroupByProject,
+    generalProjectId: generalProject?.id ?? null,
   });
 
   let projected = 0;
@@ -869,7 +893,30 @@ export async function projectItemsToGraph(
           }
           continue;
         }
-        if (r.deferred || !targets.has(r.group_id)) continue; // cold, or PCCC-6's removed-side
+        if (!r.deferred && !targets.has(r.group_id)) {
+          // PCCC-6 removed-side ACTIVATION: an untagged row that PUSHED holds restricted-away
+          // content in P's graph — tombstone ('' sha + self pending flag; reconcile purges
+          // durably, and the partition suppresses until it confirms). Never touches rows still
+          // in the target set.
+          if (r.pending_delete_group_id) continue; // already owed — converging
+          await deleteItemEpisodes(client, r.group_id, item.id).catch(() => {});
+          const at = new Date().toISOString();
+          const { error: untagErr } = await db
+            .from("graph_episodes")
+            .update({ content_sha256: "", pending_delete_group_id: r.group_id, pending_delete_at: at })
+            .eq("team_id", args.teamId)
+            .eq("source_table", SOURCE_TABLE)
+            .eq("source_id", item.id)
+            .eq("group_id", r.group_id);
+          if (untagErr) {
+            throw new ProjectionAbortError(
+              `project: untag tombstone failed for item ${item.id} in ${r.group_id}: ${untagErr.message}`,
+              partialSummary()
+            );
+          }
+          continue;
+        }
+        if (r.deferred) continue; // cold — parked until armed
         if (r.content_sha256 === contentSha || episodes.length === 0) continue; // converged / redacted
         // A row still owing a purge must NOT be pushed into: reconcile's pending-cleanup deletes
         // by item id in that group and would eat the fresh push. Let the purge finish (it clears
@@ -934,6 +981,81 @@ export async function projectItemsToGraph(
         }
       }
     };
+
+    // RESTRICTION-MOVES-NOT-COPIES, landed-gated (PCCC-6; spec rule 2, design §2.2). An item whose
+    // General membership CLOSED must leave its home partition — but only once a landed initiative
+    // copy exists (move = copy-then-delete: purging first would lose the content everywhere,
+    // including for permissive teams whose initiatives never arm). The branch OWNS the item's whole
+    // pass: the normal home flow below must not run, because purgeBeforeRepush would read the
+    // tombstone as an undone redaction and RE-PUSH the restricted content into General every hour.
+    const restrictedOutOfHome = item.access === "team" && !inGeneral.has(item.id) && episodes.length > 0;
+    if (restrictedOutOfHome) {
+      const landedCopy = fanoutRows.some(
+        (r) => !r.deferred && r.content_sha256 === contentSha && (fanoutTargetsByItem.get(item.id) ?? new Set()).has(r.group_id)
+      );
+      if (currentRow && currentRow.content_sha256 !== "" && !currentRow.pending_delete_group_id && landedCopy) {
+        // Move completes: tombstone home with a self pending flag; reconcile purges durably and
+        // General suppresses (self-purge) until it confirms — narrowing fails closed.
+        await deleteItemEpisodes(client, groupId, item.id).catch(() => {});
+        const at = new Date().toISOString();
+        const { error: moveOutErr } = await db
+          .from("graph_episodes")
+          .update({ content_sha256: "", pending_delete_group_id: groupId, pending_delete_at: at })
+          .eq("team_id", args.teamId)
+          .eq("source_table", SOURCE_TABLE)
+          .eq("source_id", item.id)
+          .eq("group_id", groupId);
+        if (moveOutErr) {
+          throw new ProjectionAbortError(
+            `project: restriction move-out failed for item ${item.id}: ${moveOutErr.message}`,
+            partialSummary()
+          );
+        }
+        await runFanout();
+        skipped++;
+        continue;
+      }
+      if (currentRow && (currentRow.pending_delete_group_id === groupId || currentRow.content_sha256 === "")) {
+        // Tombstoned or already parked at the '' sentinel (the flag clears when the purge
+        // confirms) — hold: never re-push a restricted item's home. Without the sentinel term the
+        // cleared row would fall through to the normal flow, whose '' handling force-pushes past
+        // the sha skip and re-populates General hourly — the move undone by its own machinery.
+        await runFanout();
+        skipped++;
+        continue;
+      }
+      // A restricted item's content may not sit in EITHER tier group: a stale other-tier home row
+      // (a tier flip landed while restricted) is tombstoned with a self purge flag — exposed by
+      // this slice's own tier-flip test, where the old row would otherwise stay readable at the
+      // OLD tier forever.
+      for (const stale of staleRows) {
+        if (stale.content_sha256 === "" || stale.pending_delete_group_id) continue;
+        await deleteItemEpisodes(client, stale.group_id, item.id).catch(() => {});
+        const staleAt = new Date().toISOString();
+        const { error: staleErr } = await db
+          .from("graph_episodes")
+          .update({ content_sha256: "", pending_delete_group_id: stale.group_id, pending_delete_at: staleAt })
+          .eq("team_id", args.teamId)
+          .eq("source_table", SOURCE_TABLE)
+          .eq("source_id", item.id)
+          .eq("group_id", stale.group_id);
+        if (staleErr) {
+          throw new ProjectionAbortError(
+            `project: restricted stale-home tombstone failed for item ${item.id}: ${staleErr.message}`,
+            partialSummary()
+          );
+        }
+      }
+      if (!currentRow) {
+        // Restricted from ingest onward (spec rule 1's `exclusive` flow): the home partition never
+        // receives this content at all. Fan-out (deferral, arming, pushes) proceeds normally.
+        await runFanout();
+        skipped++;
+        continue;
+      }
+      // Home row live, no landed copy yet: fall through to the NORMAL flow — the content stays
+      // Everyone-visible until the move can complete without loss.
+    }
 
     if (episodes.length === 0) {
       // Nothing to extract NOW — but if we projected this item before, its old episodes are still in

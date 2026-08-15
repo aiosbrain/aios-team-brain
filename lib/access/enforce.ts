@@ -86,10 +86,16 @@ export async function visibleItemIdsForProjects(
   return { ids, empty: ids.size === 0 };
 }
 
-/** Member convenience: resolve the principal's visible projects via the oracle, then the item ids. */
-export async function visibleItemIds(db: DbClient, principal: Principal): Promise<VisibleItemIds> {
+/** Member convenience: resolve the principal's visible projects via the oracle, then the item ids.
+ * Also RETURNS the project ids (PCCC-6): the graph legs partition by project, and recomputing the
+ * oracle a second time for them would be a disagreement surface. */
+export async function visibleItemIds(
+  db: DbClient,
+  principal: Principal
+): Promise<VisibleItemIds & { projectIds: string[] }> {
   const { projectIds } = await visibleProjects(db, principal);
-  return visibleItemIdsForProjects(db, principal.teamId, projectIds);
+  const items = await visibleItemIdsForProjects(db, principal.teamId, projectIds);
+  return { ...items, projectIds: [...projectIds] };
 }
 
 /**

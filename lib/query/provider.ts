@@ -35,6 +35,10 @@ export type RetrievedContext = {
   structured: string; // decisions/tasks/graph digest (always included by the native provider)
   /** True when query-specific search matched something; false = only recency padding. */
   grounded: boolean;
+  /** PCCC-6 (spec's expansion budget): how many of the principal's visible projects the K-capped
+   * graph stage actually covered — the deliberate own-scope disclosure exception to §5.7. Absent
+   * when the graph leg didn't run partitioned (permissive tier path, external omit, no graph). */
+  graphScope?: { covered: number; total: number };
 };
 
 export interface RetrievalRequest {
