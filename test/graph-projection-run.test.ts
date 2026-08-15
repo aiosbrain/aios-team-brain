@@ -13,6 +13,7 @@ const base: GraphProjectionSummary = {
   projected: 5,
   episodes: 9,
   episodesByGroup: { acme_team: 6, acme_external: 3 },
+  fanoutThrottled: 0,
   skipped: 7,
   reconciled: 0,
   requeued: 0,
@@ -40,6 +41,7 @@ describe("projectionRunInput", () => {
     expect(run.meta).toMatchObject({
       episodes: 9,
       episodesByGroup: { acme_team: 6, acme_external: 3 },
+      fanoutThrottled: 0,
     });
     expect(run.startedAt).toBe(1000);
     expect(run.finishedAt).toBe(2000);

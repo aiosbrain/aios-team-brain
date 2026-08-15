@@ -28,6 +28,8 @@ export interface GraphProjectionSummary {
    * append-only into `ingest_runs.meta`. Row counts in `graph_episodes` cannot serve: a row is one
    * ITEM, not one episode, and `projected_at` is mutable. */
   episodesByGroup: Record<string, number>;
+  /** Armed fan-out pushes withheld by the per-pass budget (PCCC-5) — the no-silent-caps signal. */
+  fanoutThrottled: number;
   skipped: number;
   /** Episodes confirmed to have actually landed in Graphiti this run (audit H3 reconcile pass). */
   reconciled: number;
@@ -106,6 +108,7 @@ async function runGraphProjectionInner(opts?: {
     projected: 0,
     episodes: 0,
     episodesByGroup: {},
+    fanoutThrottled: 0,
     skipped: 0,
     reconciled: 0,
     requeued: 0,
@@ -144,6 +147,7 @@ async function runGraphProjectionInner(opts?: {
           summary.episodesByGroup[g] = (summary.episodesByGroup[g] ?? 0) + n;
         }
         summary.skipped += s.skipped;
+        summary.fanoutThrottled += s.fanoutThrottled;
         externalVacated += s.externalGroupVacated;
         if (s.scanned < limit || !s.lastSyncedAt || s.lastSyncedAt === since) break;
         since = s.lastSyncedAt;
@@ -186,6 +190,7 @@ async function runGraphProjectionInner(opts?: {
           summary.episodesByGroup[g] = (summary.episodesByGroup[g] ?? 0) + n;
         }
         summary.skipped += e.partial.skipped;
+        summary.fanoutThrottled += e.partial.fanoutThrottled;
       }
     }
   }

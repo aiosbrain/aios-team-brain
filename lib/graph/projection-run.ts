@@ -34,6 +34,9 @@ export function projectionRunInput(
       // gives episodes-actually-pushed per partition — the denominator graph_episodes row counts
       // cannot provide (a row is one ITEM, and its projected_at mutates).
       episodesByGroup: summary.episodesByGroup,
+      // Fan-out pushes withheld by the per-pass budget (PCCC-5) — a cap that saturates must never
+      // be silent; persistent non-zero means arming outpaces GRAPH_FANOUT_PUSH_MAX_PER_PASS.
+      fanoutThrottled: summary.fanoutThrottled,
       scanned: summary.scanned,
       teams: summary.teams,
       reconciled: summary.reconciled,

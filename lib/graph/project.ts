@@ -7,6 +7,7 @@ import { episodeName, itemIdFromEpisodeName } from "./episode-name";
 import { resolvePositiveInt } from "@/lib/util/env";
 import { chunkCdc, type CdcParams } from "./cdc";
 import { sourceRules } from "@/lib/ingest/source-rules";
+import { resolveFanoutTargets } from "@/lib/projects/context/fanout-targets";
 // Re-exported so the graph module's existing importers (and their specs) keep one import path.
 export { resolvePositiveInt };
 
@@ -23,19 +24,10 @@ export { resolvePositiveInt };
 
 const SOURCE_TABLE = "items";
 
-/**
- * How many ids go into one `.in(...)` filter. The pg adapter binds each element separately and
- * Postgres hard-caps a statement at 65535 binds, so an unbounded list is a query that simply stops
- * working once a team's corpus grows — silently, at exactly the scale where it matters most.
- */
-export const IN_CLAUSE_BATCH = 1000;
-
-/** Split into fixed-size batches. Pure. */
-export function chunk<T>(items: readonly T[], size: number): T[][] {
-  const out: T[][] = [];
-  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
-  return out;
-}
+// Batching now lives in lib/db/batch (PCCC-5: read-only substrate modules need it without
+// importing — or cycling with — the projector); re-exported so existing importers keep one path.
+import { chunk, IN_CLAUSE_BATCH } from "@/lib/db/batch";
+export { chunk, IN_CLAUSE_BATCH };
 
 /**
  * Graphiti extracts entities/edges from each episode with its OWN LLM, and that call's OUTPUT is
@@ -222,6 +214,12 @@ export function chunkConfigDeltaCompatible(stored: string | null | undefined, cu
  */
 export const GROUP_SCAN_DEPTH = resolvePositiveInt(process.env.GRAPH_GROUP_SCAN_DEPTH, 100_000);
 
+/** Armed fan-out pushes allowed per pass per team (PCCC-5, design §2.4 step 3) — a NEW projector
+ * cap, deliberately distinct from reconcile's GRAPH_REQUEUE_MAX_PER_PASS (that one bounds
+ * re-queues of already-owed pushes; this bounds NET-NEW extraction into initiative partitions).
+ * Excess is counted in `fanoutThrottled`, never silently dropped — the next pass resumes. */
+export const FANOUT_PUSH_MAX_PER_PASS = resolvePositiveInt(process.env.GRAPH_FANOUT_PUSH_MAX_PER_PASS, 25);
+
 /**
  * The projector's cadence — how long a pushed episode has to land before the NEXT run could re-push it.
  *
@@ -402,6 +400,9 @@ export interface ProjectSummary {
    * is mutable. This is per-pass and append-only once recorded to `ingest_runs.meta`.
    */
   episodesByGroup: Record<string, number>;
+  /** Armed fan-out pushes withheld this pass by FANOUT_PUSH_MAX_PER_PASS (PCCC-5). Non-zero for
+   * several runs in a row means arming outpaces the budget — surfaced, never silent. */
+  fanoutThrottled: number;
   skipped: number;
   /** Items whose episodes were removed from the EXTERNAL group this batch — a NARROWING reaching the
    * graph. The caller uses it to invalidate the external-tier caches: arcs are synthesized FROM that
@@ -599,11 +600,15 @@ export async function projectItemsToGraph(
     kinds?: readonly string[];
     since?: string;
     limit?: number;
+    /** Armed fan-out pushes allowed THIS pass (PCCC-5, design §2.4 step 3) — a NEW cap, distinct
+     *  from reconcile's re-queue budget. Overridable for tests; env-tunable in prod. */
+    fanoutPushBudget?: number;
   }
 ): Promise<ProjectSummary> {
   const client = args.client ?? new GraphitiClient();
   const limit = args.limit ?? 50;
   const kinds: readonly string[] = args.kinds ?? PROJECTABLE_KINDS;
+  let fanoutBudget = args.fanoutPushBudget ?? FANOUT_PUSH_MAX_PER_PASS;
 
   let q = db
     .from("items")
@@ -622,11 +627,41 @@ export async function projectItemsToGraph(
   if (error) throw new Error(`project: load items failed: ${error.message}`);
   const rows = (data ?? []) as ItemRow[];
 
+  // ── PCCC-5 pass-level context ─────────────────────────────────────────────────────────────────
+  // The STORED pointers are the write authority (the rename doctrine's resolution): the home group
+  // comes from the §11 built-ins' pointers, initiative fan-out targets from initiative pointers.
+  // One read per pass; `episodeGroupId` stays as the quiet fallback for an unbootstrapped team
+  // (no built-in rows yet — the scheduler-tick bootstrap converges it within a tick).
+  const { data: pointerData, error: pointerErr } = await db
+    .from("projects")
+    .select("id, slug, kind, graph_group_id")
+    .eq("team_id", args.teamId)
+    .not("graph_group_id", "is", null);
+  if (pointerErr) throw new Error(`project: pointer read failed: ${pointerErr.message}`);
+  const pointers = (pointerData ?? []) as { id: string; slug: string; kind: string; graph_group_id: string }[];
+  const generalHome = pointers.find((p) => p.kind === "system" && p.slug === "general")?.graph_group_id ?? null;
+  const externalHome =
+    pointers.find((p) => p.kind === "system" && p.slug === "external-shared")?.graph_group_id ?? null;
+  const initiativeGroupByProject = new Map(
+    pointers.filter((p) => p.kind === "initiative").map((p) => [p.id, p.graph_group_id])
+  );
+  const initiativeGroups = new Set(initiativeGroupByProject.values());
+
+  // Batch-resolve each item's ACTIVE initiative include memberships — via the read-only substrate
+  // module (the access-single-writer guard's coarse net rightly refuses those table literals in a
+  // file full of write verbs).
+  const fanoutTargetsByItem = await resolveFanoutTargets(db, {
+    teamId: args.teamId,
+    itemIds: rows.map((r) => r.id),
+    initiativeGroupByProject,
+  });
+
   let projected = 0;
   let episodesPushed = 0;
   const episodesByGroup: Record<string, number> = {};
   let skipped = 0;
   let externalGroupVacated = 0;
+  let fanoutThrottled = 0;
   // What this pass has ALREADY done, snapshotted at abort time — every loud throw below carries it
   // (ProjectionAbortError) so the runner can record the real partial episode counts.
   const partialSummary = (): ProjectSummary => ({
@@ -636,13 +671,24 @@ export async function projectItemsToGraph(
     episodesByGroup: { ...episodesByGroup },
     skipped,
     externalGroupVacated,
+    fanoutThrottled,
   });
   for (const item of rows) {
     const episodes = kinds.includes(item.kind) ? toEpisodes(item) : [];
     // Idempotency key = the FULL body (chunk boundaries derive deterministically from it), so an
     // unchanged item is a no-op regardless of how many chunks it splits into.
     const contentSha = sha(item.body ?? "");
-    const groupId = episodeGroupId(args.teamSlug, item.access);
+    // HOME group from the STORED pointer (PCCC-5 — dissolves the rename divergence: the pointer is
+    // frozen where the graph actually lives, while a recomputed slug key would follow the rename
+    // into an empty group). Fallback to the legacy computation only when the built-in isn't
+    // pointed yet (unbootstrapped team) — byte-identical to pre-PCCC-5 behavior there.
+    const groupId =
+      (item.access === "external" ? externalHome : generalHome) ?? episodeGroupId(args.teamSlug, item.access);
+    // BOTH home candidates, for partitioning the item's ledger rows: a tier flip moves between
+    // these two; everything else in the ledger is fan-out (or an orphan PCCC-6 will own).
+    const otherHome =
+      (item.access === "external" ? generalHome : externalHome) ??
+      episodeGroupId(args.teamSlug, item.access === "external" ? "team" : "external");
 
     // Read the ledger BEFORE the "nothing to project" skip: an item that stops projecting still owns
     // episodes we put in the graph, and they have to come back out (see the branch below).
@@ -650,12 +696,10 @@ export async function projectItemsToGraph(
     // ALL of the item's rows, not `.maybeSingle()` (PCCC-3): the identity is per-(item, group) now,
     // and this adapter's maybeSingle returns rows[0] SILENTLY on multiple rows — under fan-out that
     // reads an arbitrary group's ledger, and a sha-match against the wrong group skips extraction
-    // into a group that never got the content (a silently-empty project graph). Deploy A still holds
-    // one row per item (the narrow unique stands), so `currentRow ?? staleRows[0]` is today's exact
-    // semantics; the shape is the set-diff foundation PCCC-5's fan-out extends.
+    // into a group that never got the content (a silently-empty project graph).
     const { data: existingData, error: ledgerReadErr } = await db
       .from("graph_episodes")
-      .select("content_sha256, group_id, pending_delete_group_id, chunk_shas, chunk_config")
+      .select("content_sha256, group_id, pending_delete_group_id, chunk_shas, chunk_config, deferred")
       .eq("team_id", args.teamId)
       .eq("source_table", SOURCE_TABLE)
       .eq("source_id", item.id);
@@ -668,14 +712,119 @@ export async function projectItemsToGraph(
       pending_delete_group_id: string | null;
       chunk_shas: string[] | null;
       chunk_config: string | null;
+      deferred: boolean;
     };
     const rowsForItem = (existingData ?? []) as LedgerRow[];
-    const currentRow = rowsForItem.find((r) => r.group_id === groupId) ?? null;
-    const staleRows = rowsForItem.filter((r) => r.group_id !== groupId);
+    // PARTITION (PCCC-5): the home machinery below (tier moves, purges, delta) must see ONLY the
+    // home world — the current home group and the OTHER home candidate (a tier flip moves between
+    // exactly those two). Fan-out rows (deferred, or in a known initiative group) are a separate
+    // life cycle; an unrecognized non-home row (its initiative was deleted) is deliberately left
+    // for PCCC-6's removed-side machinery rather than fed to the tier-move logic, which would
+    // relocate it and clobber a partition that was never a tier group.
+    const homeWorld = rowsForItem.filter(
+      (r) => !r.deferred && (r.group_id === groupId || r.group_id === otherHome)
+    );
+    const currentRow = homeWorld.find((r) => r.group_id === groupId) ?? null;
+    const staleRows = homeWorld.filter((r) => r.group_id !== groupId);
     const existingRow = currentRow ?? staleRows[0] ?? null;
+    const fanoutRows = rowsForItem.filter(
+      (r) => r.group_id !== groupId && r.group_id !== otherHome && (r.deferred || initiativeGroups.has(r.group_id))
+    );
     // Per-chunk ledger for THIS pass: the hashes of exactly the episodes we would send. Derived from
     // `episodes` rather than re-chunking, so the ledger can never describe something else.
     const chunkShas = episodes.map((e) => sha(e.content));
+
+    // ── PCCC-5 fan-out (ADD-only — design §2.2), as a closure because it must run on BOTH exits ──
+    // A new initiative membership DEFERS (bookkeeping row, zero LLM — cold initiatives never
+    // extract); arming (PCCC-6) flips `deferred` and the push happens here under the budget. The
+    // removed side handled in this slice is ONLY the never-pushed deferred row (deleting it touches
+    // no graph content); purging armed/pushed content on untag is PCCC-6's leak-critical machinery.
+    // A CLOSURE invoked both on the unchanged-content skip and on the normal path: the home skip
+    // fires exactly when an armed row is waiting or an untag needs cleanup (the second pass over an
+    // unchanged item), so hanging fan-out off only the changed path would freeze it forever —
+    // caught red by this slice's own arm/untag tests before shipping.
+    const runFanout = async (): Promise<void> => {
+      const targets = fanoutTargetsByItem.get(item.id) ?? new Set<string>();
+      const fanoutByGroup = new Map(fanoutRows.map((r) => [r.group_id, r]));
+      for (const target of targets) {
+        if (fanoutByGroup.has(target) || episodes.length === 0) continue;
+        const { error: deferErr } = await db.from("graph_episodes").insert({
+          team_id: args.teamId,
+          source_table: SOURCE_TABLE,
+          source_id: item.id,
+          group_id: target,
+          content_sha256: "",
+          chunk_shas: [],
+          chunk_config: CHUNK_CONFIG,
+          deferred: true,
+        });
+        // A wide-index conflict is benign (a racer/prior pass already holds the pair) — never stomp.
+        if (deferErr && !deferErr.message.includes("graph_episodes_item_group_key")) {
+          throw new ProjectionAbortError(
+            `project: deferred fan-out write failed for item ${item.id}: ${deferErr.message}`,
+            partialSummary()
+          );
+        }
+      }
+      for (const r of fanoutRows) {
+        if (r.deferred && !targets.has(r.group_id)) {
+          // Untag of a never-pushed row: pure bookkeeping. The `deferred` predicate keeps this
+          // delete from ever touching a row that HAS graph content behind it.
+          const { error: dropErr } = await db
+            .from("graph_episodes")
+            .delete()
+            .eq("team_id", args.teamId)
+            .eq("source_table", SOURCE_TABLE)
+            .eq("source_id", item.id)
+            .eq("group_id", r.group_id)
+            .eq("deferred", true);
+          if (dropErr) {
+            throw new ProjectionAbortError(
+              `project: deferred fan-out cleanup failed for item ${item.id}: ${dropErr.message}`,
+              partialSummary()
+            );
+          }
+          continue;
+        }
+        if (r.deferred || !targets.has(r.group_id)) continue; // cold, or PCCC-6's removed-side
+        if (r.content_sha256 === contentSha || episodes.length === 0) continue; // converged / redacted
+        if (fanoutBudget <= 0) {
+          fanoutThrottled++; // no silent caps: the remainder is REPORTED, not dropped (next pass resumes)
+          continue;
+        }
+        fanoutBudget--;
+        try {
+          await client.addEpisodes(r.group_id, episodes);
+        } catch (err) {
+          throw new ProjectionAbortError(
+            `project: fan-out push failed for item ${item.id} into ${r.group_id}: ${err instanceof Error ? err.message : String(err)}`,
+            partialSummary()
+          );
+        }
+        const { error: fanWriteErr } = await db
+          .from("graph_episodes")
+          .update({
+            content_sha256: contentSha,
+            chunk_shas: chunkShas,
+            chunk_config: CHUNK_CONFIG,
+            projected_at: new Date().toISOString(),
+          })
+          .eq("team_id", args.teamId)
+          .eq("source_table", SOURCE_TABLE)
+          .eq("source_id", item.id)
+          .eq("group_id", r.group_id);
+        if (fanWriteErr) {
+          // The row keeps its '' sha (armed, unlanded) — the next pass re-pushes; duplicate cost,
+          // convergent, same class as the home path's crash window.
+          throw new ProjectionAbortError(
+            `project: fan-out ledger write failed for item ${item.id}: ${fanWriteErr.message}`,
+            partialSummary()
+          );
+        }
+        episodesPushed += episodes.length;
+        episodesByGroup[r.group_id] = (episodesByGroup[r.group_id] ?? 0) + episodes.length;
+      }
+    };
 
     if (episodes.length === 0) {
       // Nothing to extract NOW — but if we projected this item before, its old episodes are still in
@@ -790,8 +939,9 @@ export async function projectItemsToGraph(
       // Such a row now falls through to a full push, which is both correct and the first time its
       // tails are extracted. Convergence for pre-ledger rows is therefore the full-push path, once.
       // Pinned by the inverted AC4 in test/datamechanics/graph-chunk-delta.datamechanics.test.ts.
+      await runFanout();
       skipped++;
-      continue; // unchanged content, same tier → no-op (idempotent)
+      continue; // unchanged content, same tier → no-op (idempotent); fan-out still ran above
     }
 
     // Audit M6 (durability hardened — Pass-1 review B2): a tier reclassification (e.g. external→team)
@@ -1038,13 +1188,15 @@ export async function projectItemsToGraph(
     if (pushedSomething) {
       episodesByGroup[groupId] = (episodesByGroup[groupId] ?? 0) + toPush.length;
     }
+
+    await runFanout();
   }
 
   // Cursor for the runner: rows are ordered by synced_at ascending, so the last row is the high-water
   // mark to page past next batch (audit H2). Without this the runner only ever re-scanned the oldest
   // `limit` rows and never reached items beyond that window.
   const lastSyncedAt = rows.length ? rows[rows.length - 1].synced_at : undefined;
-  return { scanned: rows.length, projected, episodes: episodesPushed, episodesByGroup, skipped, externalGroupVacated, lastSyncedAt };
+  return { scanned: rows.length, projected, episodes: episodesPushed, episodesByGroup, skipped, externalGroupVacated, fanoutThrottled, lastSyncedAt };
 }
 
 /** Back-compat: project only Slack transcripts. Prefer `projectItemsToGraph` (all ingestions). */
