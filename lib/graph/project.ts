@@ -400,8 +400,12 @@ export interface ProjectSummary {
    * is mutable. This is per-pass and append-only once recorded to `ingest_runs.meta`.
    */
   episodesByGroup: Record<string, number>;
-  /** Armed fan-out pushes withheld this pass by FANOUT_PUSH_MAX_PER_PASS (PCCC-5). Non-zero for
-   * several runs in a row means arming outpaces the budget — surfaced, never silent. */
+  /** Armed fan-out pushes MADE this call (items × groups) — the runner subtracts this from the
+   * shared per-team budget it threads across batches (a per-call budget alone resets every page,
+   * up to MAX_BATCHES× weaker than the claim — PCCC-5 review High 1). */
+  fanoutPushed: number;
+  /** Armed fan-out pushes withheld by the budget (PCCC-5). Non-zero for several runs in a row
+   * means arming outpaces the budget — surfaced, never silent. */
   fanoutThrottled: number;
   skipped: number;
   /** Items whose episodes were removed from the EXTERNAL group this batch — a NARROWING reaching the
@@ -478,21 +482,32 @@ export async function retireEpisodesForItems(
     source_id: string;
     group_id: string;
     pending_delete_group_id: string | null;
+    deferred: boolean;
   };
   // Chunked: the pg adapter expands `.in()` to one bind per element, and Postgres refuses a statement
   // past 65535 of them. A whole-channel purge can easily exceed a single readable batch.
-  const rows: LedgerRow[] = [];
+  const allRows: LedgerRow[] = [];
   for (const batch of chunk(itemIds, IN_CLAUSE_BATCH)) {
     const { data, error: readError } = await db
       .from("graph_episodes")
-      .select("id, source_id, group_id, pending_delete_group_id")
+      .select("id, source_id, group_id, pending_delete_group_id, deferred")
       .eq("team_id", teamId)
       .eq("source_table", SOURCE_TABLE)
       .in("source_id", batch);
     if (readError) throw new Error(`episode ledger read: ${readError.message}`);
-    rows.push(...((data ?? []) as LedgerRow[]));
+    allRows.push(...((data ?? []) as LedgerRow[]));
   }
-  if (rows.length === 0) return 0;
+  // A DEFERRED row never pushed anything — there is nothing in any graph to purge, and a tombstone
+  // would be a permanent zombie: reconcile exempts deferred rows from every judgement (incl. orphan
+  // repair), the item is gone so the projector never scans it again, and `pendingCleanups` wouldn't
+  // even count it (PCCC-5 review Medium 3). Hard-delete instead — the honest end state.
+  const deferredRows = allRows.filter((r) => r.deferred);
+  for (const r of deferredRows) {
+    const { error } = await db.from("graph_episodes").delete().eq("id", r.id).eq("deferred", true);
+    if (error) throw new Error(`deferred episode ledger delete ${r.id}: ${error.message}`);
+  }
+  const rows = allRows.filter((r) => !r.deferred);
+  if (rows.length === 0) return deferredRows.length;
 
   const client = opts.client ?? new GraphitiClient();
   // No Graphiti configured → nothing was ever pushed, so there is nothing to retry and no reconcile
@@ -506,9 +521,9 @@ export async function retireEpisodesForItems(
   if (!client.configured) {
     for (const r of rows) {
       const { error } = await db.from("graph_episodes").delete().eq("id", r.id);
-      if (error) throw new Error(`episode ledger delete ${r.id}: ${error.message}`);
+      if (error) throw new Error(`episode ledger delete : `);
     }
-    return rows.length;
+    return rows.length + deferredRows.length;
   }
 
   const at = new Date().toISOString();
@@ -536,7 +551,7 @@ export async function retireEpisodesForItems(
       .eq("id", r.id);
     if (error) throw new Error(`episode retire ${r.id}: ${error.message}`);
   }
-  return rows.length;
+  return rows.length + deferredRows.length;
 }
 
 /**
@@ -662,6 +677,7 @@ export async function projectItemsToGraph(
   let skipped = 0;
   let externalGroupVacated = 0;
   let fanoutThrottled = 0;
+  let fanoutPushed = 0;
   // What this pass has ALREADY done, snapshotted at abort time — every loud throw below carries it
   // (ProjectionAbortError) so the runner can record the real partial episode counts.
   const partialSummary = (): ProjectSummary => ({
@@ -671,6 +687,7 @@ export async function projectItemsToGraph(
     episodesByGroup: { ...episodesByGroup },
     skipped,
     externalGroupVacated,
+    fanoutPushed,
     fanoutThrottled,
   });
   for (const item of rows) {
@@ -681,7 +698,12 @@ export async function projectItemsToGraph(
     // HOME group from the STORED pointer (PCCC-5 — dissolves the rename divergence: the pointer is
     // frozen where the graph actually lives, while a recomputed slug key would follow the rename
     // into an empty group). Fallback to the legacy computation only when the built-in isn't
-    // pointed yet (unbootstrapped team) — byte-identical to pre-PCCC-5 behavior there.
+    // pointed yet — pre-PCCC-5 behavior for a NEVER-pointed, never-renamed team (the common case).
+    // Named residual (review Medium 5): a PARTIALLY bootstrapped team that also renamed can hold a
+    // home row in the old slug's group that neither home candidate nor the initiative set names —
+    // that row falls out of homeWorld and the item re-projects into the new-slug group (duplicate
+    // extraction; the old row waits for PCCC-6's ownerless-row sweep). Ruled acceptable: it needs
+    // a failed pointer write AND a rename, and the scheduler-tick bootstrap closes the window.
     const groupId =
       (item.access === "external" ? externalHome : generalHome) ?? episodeGroupId(args.teamSlug, item.access);
     // BOTH home candidates, for partitioning the item's ledger rows: a tier flip moves between
@@ -720,7 +742,11 @@ export async function projectItemsToGraph(
     // exactly those two). Fan-out rows (deferred, or in a known initiative group) are a separate
     // life cycle; an unrecognized non-home row (its initiative was deleted) is deliberately left
     // for PCCC-6's removed-side machinery rather than fed to the tier-move logic, which would
-    // relocate it and clobber a partition that was never a tier group.
+    // relocate it and clobber a partition that was never a tier group. Belt-and-braces terms, named
+    // per the unfalsifiable-terms rule (review Low 7): `!r.deferred` here and the home exclusions in
+    // fanoutRows are redundant under today's writers (deferred rows only ever target initiative
+    // groups) — they defend against a FUTURE writer bug, not a reachable state, and no test can
+    // redden them.
     const homeWorld = rowsForItem.filter(
       (r) => !r.deferred && (r.group_id === groupId || r.group_id === otherHome)
     );
@@ -792,11 +818,21 @@ export async function projectItemsToGraph(
         }
         if (r.deferred || !targets.has(r.group_id)) continue; // cold, or PCCC-6's removed-side
         if (r.content_sha256 === contentSha || episodes.length === 0) continue; // converged / redacted
+        // A row still owing a purge must NOT be pushed into: reconcile's pending-cleanup deletes
+        // by item id in that group and would eat the fresh push. Let the purge finish (it clears
+        // the flag); the next pass pushes clean — the same convergence the home path buys with
+        // purgeBeforeRepush.
+        if (r.pending_delete_group_id) continue;
         if (fanoutBudget <= 0) {
           fanoutThrottled++; // no silent caps: the remainder is REPORTED, not dropped (next pass resumes)
           continue;
         }
         fanoutBudget--;
+        // WHOLE-ITEM push, no per-chunk delta (review Medium 4, accepted deferral): the home path's
+        // GRAPHCOST-1 delta is not inherited here yet — an edited long document in k armed groups
+        // pays k × its full chunk count per edit, bounded today by the measured rate and P̄. The
+        // chunk_shas written below are recorded FOR the future delta to inherit, not read by this
+        // path — stated so the state isn't mistaken for delta support.
         try {
           await client.addEpisodes(r.group_id, episodes);
         } catch (err) {
@@ -827,6 +863,7 @@ export async function projectItemsToGraph(
         }
         episodesPushed += episodes.length;
         episodesByGroup[r.group_id] = (episodesByGroup[r.group_id] ?? 0) + episodes.length;
+        fanoutPushed++;
       }
     };
 
@@ -864,6 +901,34 @@ export async function projectItemsToGraph(
         );
         if (redactErr) {
           throw new ProjectionAbortError(`project: redaction ledger write failed for item ${item.id}: ${redactErr.message}`, partialSummary());
+        }
+      }
+      // ARMED fan-out rows hold the SAME pre-redaction content in initiative graphs (PCCC-5 review
+      // High 2 — the door B2 closes for home was open for fan-out, and PCCC-6's removed-side only
+      // covers UNTAG, not redaction-with-membership-intact). Tombstone each: '' sha + its own group
+      // as pending-delete; reconcile processes them (deferred=false) with the same durable retry.
+      // Deferred rows need nothing — they never pushed, and they park until content returns.
+      for (const r of fanoutRows) {
+        if (r.deferred || r.content_sha256 === "" || r.pending_delete_group_id) continue;
+        await deleteItemEpisodes(client, r.group_id, item.id).catch(() => {});
+        const at = new Date().toISOString();
+        const { error: fanRedactErr } = await db
+          .from("graph_episodes")
+          .update({
+            content_sha256: "",
+            projected_at: at,
+            pending_delete_group_id: r.group_id,
+            pending_delete_at: at,
+          })
+          .eq("team_id", args.teamId)
+          .eq("source_table", SOURCE_TABLE)
+          .eq("source_id", item.id)
+          .eq("group_id", r.group_id);
+        if (fanRedactErr) {
+          throw new ProjectionAbortError(
+            `project: fan-out redaction write failed for item ${item.id}: ${fanRedactErr.message}`,
+            partialSummary()
+          );
         }
       }
       skipped++;
@@ -1182,7 +1247,8 @@ export async function projectItemsToGraph(
       throw new ProjectionAbortError(`project: ledger write failed for item ${item.id}: ${ledgerWriteErr.message}`, partialSummary());
     }
     if (pushedSomething) projected++;
-    else skipped++; // ledger refreshed, nothing extracted — not work the health probes should see
+    else skipped++; // ledger refreshed, nothing extracted into HOME — an armed-only service pass still
+    // counts here (its real spend shows in episodes/episodesByGroup/fanoutPushed, not `projected`).
     // What was ACTUALLY sent, not what the item chunks into. `episodes` is the denominator of the
     // per-episode extraction cost metric, so counting the item's full chunk list on a delta pass that
     // sent one chunk (or none) would divide real LLM calls by phantom episodes and make extraction
@@ -1200,7 +1266,7 @@ export async function projectItemsToGraph(
   // mark to page past next batch (audit H2). Without this the runner only ever re-scanned the oldest
   // `limit` rows and never reached items beyond that window.
   const lastSyncedAt = rows.length ? rows[rows.length - 1].synced_at : undefined;
-  return { scanned: rows.length, projected, episodes: episodesPushed, episodesByGroup, skipped, externalGroupVacated, fanoutThrottled, lastSyncedAt };
+  return { scanned: rows.length, projected, episodes: episodesPushed, episodesByGroup, skipped, externalGroupVacated, fanoutPushed, fanoutThrottled, lastSyncedAt };
 }
 
 /** Back-compat: project only Slack transcripts. Prefer `projectItemsToGraph` (all ingestions). */

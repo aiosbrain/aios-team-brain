@@ -371,6 +371,11 @@ export async function getRetrievalHealth(teamId: string): Promise<RetrievalHealt
  * reliably yield ≥1 fact" — a tombstone was never accepted by Graphiti and must not help clear a
  * floor that then licenses a "0 facts" accusation. Review found this counting sentinels; 20 real
  * pushes plus 5 redactions read as 25 and cleared the fresh-install floor.
+ *
+ * `max(projected_at)` is deliberately UNfiltered and therefore counts PCCC-5's deferred bookkeeping
+ * inserts as projector liveness — consistent with the documented stance that a redaction pass
+ * counts as alive (this probe asks "is the projector running", not "did content ship"; the pushed
+ * count above carries the sha filter that answers the second question).
  */
 async function graphFreshness(
   teamId: string

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { projectItemsToGraph } from "@/lib/graph/project";
+import { projectItemsToGraph, retireEpisodesForItems } from "@/lib/graph/project";
+import { runGraphProjection } from "@/lib/graph/run";
 import { reconcileProjectedEpisodes } from "@/lib/graph/reconcile";
 import { episodeGroupId, projectGroupId } from "@/lib/graph/group";
 import { ensureAccessBootstrap } from "@/lib/access/bootstrap";
@@ -183,6 +184,79 @@ describe("PCCC-5 — fan-out is DEFERRED until armed; ADD-only", () => {
       fanoutPushBudget: 10,
     });
     expect(await fake.listEpisodes(init.group)).toHaveLength(3); // the rest converge
+  });
+
+  it("the budget holds at RUN level — pages cannot each claim a fresh allowance (review High 1)", async () => {
+    const seed = await seedTeam();
+    expect((await ensureAccessBootstrap(db(), seed.teamId)).ok).toBe(true);
+    const init = await mkInitiative(seed, "run-budgeted");
+    for (const n of [1, 2, 3]) {
+      const r = await ingest(seed, { body: `run-budget item ${n}`, path: `rb${n}.md`, access: "team" });
+      await tagItem(seed, r.id, init.projectId);
+    }
+    const fake = new FakeGraphiti();
+    await runGraphProjection({ teamId: seed.teamId, db: db(), client: client(fake) });
+    await runSql("update graph_episodes set deferred = false where team_id = $1 and group_id = $2", [
+      seed.teamId,
+      init.group,
+    ]);
+
+    // limit:1 forces one item per batch — the exact seam where a per-call budget silently resets.
+    const summary = await runGraphProjection({
+      teamId: seed.teamId,
+      db: db(),
+      client: client(fake),
+      limit: 1,
+      fanoutPushBudget: 2,
+    });
+    expect(await fake.listEpisodes(init.group)).toHaveLength(2); // 2, not 3 — the run-level cap held
+    expect(summary.fanoutThrottled).toBeGreaterThanOrEqual(1); // and the remainder is REPORTED
+  });
+
+  it("REDACTION of an armed-and-pushed fan-out row tombstones it with a purge pointer (review High 2 — the door B2 closes for home)", async () => {
+    const seed = await seedTeam();
+    expect((await ensureAccessBootstrap(db(), seed.teamId)).ok).toBe(true);
+    const init = await mkInitiative(seed, "redact-armed");
+    const r = await ingest(seed, { body: "sensitive, later redacted", path: "sr.md", access: "team" });
+    await tagItem(seed, r.id, init.projectId);
+    const fake = new FakeGraphiti();
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: seed.teamSlug, client: client(fake) });
+    await runSql("update graph_episodes set deferred = false where team_id = $1 and group_id = $2", [
+      seed.teamId,
+      init.group,
+    ]);
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: seed.teamSlug, client: client(fake) });
+    expect((await fake.listEpisodes(init.group)).length).toBeGreaterThan(0); // armed content is in P's graph
+
+    expect((await db().from("items").update({ body: "" }).eq("id", r.id)).error).toBeNull();
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: seed.teamSlug, client: client(fake) });
+
+    const row = await runSql<{ content_sha256: string; pending_delete_group_id: string | null }>(
+      "select content_sha256, pending_delete_group_id from graph_episodes where team_id = $1 and source_id = $2 and group_id = $3",
+      [seed.teamId, r.id, init.group]
+    );
+    expect(row.rows).toHaveLength(1);
+    expect(row.rows[0].content_sha256).toBe(""); // parked, re-pushes if content returns
+    expect(row.rows[0].pending_delete_group_id).toBe(init.group); // reconcile owns the durable purge
+    expect(await fake.listEpisodes(init.group)).toHaveLength(0); // inline best-effort already cleared it
+  });
+
+  it("purging an ITEM hard-deletes its deferred rows — no zombie invisible to every janitor (review Medium 3)", async () => {
+    const seed = await seedTeam();
+    expect((await ensureAccessBootstrap(db(), seed.teamId)).ok).toBe(true);
+    const init = await mkInitiative(seed, "purge-deferred");
+    const r = await ingest(seed, { body: "tagged then purged", path: "tp.md", access: "team" });
+    await tagItem(seed, r.id, init.projectId);
+    const fake = new FakeGraphiti();
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: seed.teamSlug, client: client(fake) });
+
+    const retired = await retireEpisodesForItems(db(), seed.teamId, [r.id], { client: client(fake) });
+    expect(retired).toBeGreaterThanOrEqual(2); // home row + deferred row both accounted
+    const left = await runSql<{ n: number }>(
+      "select count(*)::int as n from graph_episodes where team_id = $1 and source_id = $2 and deferred = true",
+      [seed.teamId, r.id]
+    );
+    expect(left.rows[0].n).toBe(0);
   });
 
   it("untagging a DEFERRED (never-pushed) row deletes it — pure bookkeeping, distinct from the PCCC-6 purge machinery", async () => {
