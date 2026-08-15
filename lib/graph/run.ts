@@ -2,7 +2,7 @@ import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { adminClient } from "@/lib/db/admin";
 import { GraphitiClient } from "./graphiti-client";
-import { projectItemsToGraph } from "./project";
+import { projectItemsToGraph, ProjectionAbortError } from "./project";
 import { reconcileProjectedEpisodes } from "./reconcile";
 import { purgeExternalTierCaches } from "@/lib/cache/tier-invalidation";
 
@@ -24,6 +24,10 @@ export interface GraphProjectionSummary {
   projected: number;
   /** EPISODES pushed (an item chunks into 1..16) — the unit extraction actually costs per. */
   episodes: number;
+  /** `episodes` split by target group (PCCC-3) — the per-partition cost substrate, recorded
+   * append-only into `ingest_runs.meta`. Row counts in `graph_episodes` cannot serve: a row is one
+   * ITEM, not one episode, and `projected_at` is mutable. */
+  episodesByGroup: Record<string, number>;
   skipped: number;
   /** Episodes confirmed to have actually landed in Graphiti this run (audit H3 reconcile pass). */
   reconciled: number;
@@ -101,6 +105,7 @@ async function runGraphProjectionInner(opts?: {
     scanned: 0,
     projected: 0,
     episodes: 0,
+    episodesByGroup: {},
     skipped: 0,
     reconciled: 0,
     requeued: 0,
@@ -135,6 +140,9 @@ async function runGraphProjectionInner(opts?: {
         summary.scanned += s.scanned;
         summary.projected += s.projected;
         summary.episodes += s.episodes;
+        for (const [g, n] of Object.entries(s.episodesByGroup)) {
+          summary.episodesByGroup[g] = (summary.episodesByGroup[g] ?? 0) + n;
+        }
         summary.skipped += s.skipped;
         externalVacated += s.externalGroupVacated;
         if (s.scanned < limit || !s.lastSyncedAt || s.lastSyncedAt === since) break;
@@ -167,6 +175,18 @@ async function runGraphProjectionInner(opts?: {
     } catch (e) {
       summary.ok = false;
       summary.errors.push(`${t.slug}: ${e instanceof Error ? e.message : "projection failed"}`);
+      // An aborted batch already pushed episodes before it threw — that extraction cost is real, and
+      // dropping it undercounts the Phase C cost gate's denominator (code-review Codex Medium 3).
+      // The abort error carries the batch's partial summary; merge the push counts.
+      if (e instanceof ProjectionAbortError) {
+        summary.scanned += e.partial.scanned;
+        summary.projected += e.partial.projected;
+        summary.episodes += e.partial.episodes;
+        for (const [g, n] of Object.entries(e.partial.episodesByGroup)) {
+          summary.episodesByGroup[g] = (summary.episodesByGroup[g] ?? 0) + n;
+        }
+        summary.skipped += e.partial.skipped;
+      }
     }
   }
   return summary;

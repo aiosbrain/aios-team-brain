@@ -2379,9 +2379,18 @@ create table if not exists graph_episodes (
   chunk_shas text[] not null default '{}',
   chunk_config text not null default '',
   projected_at timestamptz not null default now(),
+  -- NARROW unique: one row per item — Deploy A of PCCC-3 keeps it (the old release's 3-column
+  -- ON CONFLICT needs it during the deploy window); Deploy B (PCCC-4) drops it, after which an
+  -- item may hold one row PER GROUP (docs/design/phase-c-per-project-graphs.md §2.1).
   unique (team_id, source_table, source_id)
 );
 create index if not exists graph_episodes_team_idx on graph_episodes (team_id, projected_at desc);
+-- PCCC-3: the per-(item, group) identity the projector's 4-column ON CONFLICT targets. Expressed as
+-- an identically-named standalone index here AND in the migration (20260815120000) — an inline
+-- `unique (…)` inside the table declaration auto-names differently and gives a from-zero DB two
+-- identical arbiter indexes, which the replay guard cannot flag.
+create unique index if not exists graph_episodes_item_group_key
+  on graph_episodes (team_id, source_table, source_id, group_id);
 -- NB: the partial index on `pending_delete_group_id` lives ONLY in the migration
 -- (20260724180000_graph_episodes_pending_delete.sql), which runs AFTER schema.sql and adds the column
 -- first. A bare partial-index statement here would fail on an existing DB, where the table already
