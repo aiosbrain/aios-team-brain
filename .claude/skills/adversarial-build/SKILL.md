@@ -85,11 +85,24 @@ an experiment with replication.
 - Full local verification: `npx tsc --noEmit` · `npm run lint` · `npm test` ·
   `npm run db:test:up && npm run test:datamechanics:local` · `npm run check:docs`.
   (The npm script pins the test-DB URL/port; never hand-write the incantation — it drifts.)
-- **Commit BEFORE mutation-testing.** Mutations are reverted with
-  `git checkout <file>`, which restores the file from the index/HEAD — either
-  way, uncommitted edits are gone. Running it against an uncommitted tree
-  silently destroys unfolded work (this happened; the folds had to be
-  re-applied by hand).
+- **Commit BEFORE mutation-testing, and PROVE it — `node scripts/mutation-guard.mjs`.**
+  Run the guard before the first mutation; it exits non-zero and names what is
+  at risk. Precisely (verified against real git — an earlier version of this
+  paragraph overstated it, and both reviewers caught that): `git checkout --
+  <file>` restores from the INDEX, so an UNSTAGED edit is destroyed silently by
+  the command you expect to succeed, a STAGED one survives, and untracked files
+  cannot be reached at all. The guard still blocks on any uncommitted tracked
+  change, because the loop's contract is a COMMITTED CHECKPOINT you can return
+  to — not because everything it blocks would be shredded. A new (untracked)
+  test file mid-slice does not block.
+
+  This was prose in this skill for its whole life and failed anyway: the same
+  operator lost work to it **three times in one session** (2026-08-14/15) —
+  an extracted function and its tests wiped mid-fold, a commit landed whose
+  tests called a function the revert had deleted, and a "repair" script that
+  no-opped against the reverted text and printed success. A rule you have to
+  remember is the thing this repo's §2 says to replace with a check that fails.
+  MUTGUARD-1.
 - Mutation-verify every guard and security-relevant branch: break the thing,
   confirm the INTENDED test reddens (not just any test), revert, confirm the
   tree is clean (`git status --short`). A guard that survives its mutation is
