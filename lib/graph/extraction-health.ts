@@ -185,7 +185,17 @@ export interface ExtractionSignals {
  *  be CLAIMED. Renamed wholesale by STALLSCOPE-1 so every consumer breaks at compile time: the old
  *  `never-extracted` asserted a dead worker and the rejected `zero-yield` asserted a yield regression,
  *  and neither is implied by the evidence that produces them. */
-export type ExtractionStallCause = "no-facts" | "never-completed" | "stopped";
+/**
+ * An ARRAY first, with the type derived from it, because a union alone has no runtime value and
+ * therefore cannot be iterated by a test. A mutation proved that matters: the card's copy map was typed
+ * `Record<ExtractionStallCause, …>`, which correctly reddens `tsc` when an entry is DELETED — but
+ * swapping that annotation for `Record<string, …>` and adding a fourth cause compiles perfectly, and
+ * the new cause silently renders the `stopped` wording. That is the same "the guard is satisfiable by
+ * editing the guard" shape two reviewers found in LLMOBS-1. With the causes enumerable at runtime, the
+ * copy tests iterate them and a cause with no distinct sentence reddens whatever the annotations say.
+ */
+export const EXTRACTION_STALL_CAUSES = ["no-facts", "never-completed", "stopped"] as const;
+export type ExtractionStallCause = (typeof EXTRACTION_STALL_CAUSES)[number];
 
 export interface ExtractionVerdict {
   stalled: boolean;
@@ -631,6 +641,34 @@ export function extractionStallReason(
       ? "The graph holds facts from before (the exact count is currently unreadable);"
       : `The graph holds ${args.facts} facts from before in this team's groups;`;
   return `Graph extraction has STOPPED: episodes are still being projected, but graphiti has not completed one ${forHow} — no new episode node has appeared in the graph, and an episode node is only written once a job has finished everything else. (${held} fact age itself is not the signal, because on a mature graph most extracted edges deduplicate and create no new fact even when extraction is perfectly healthy.) Check the graphiti service logs for the actual error — usually an out-of-quota extraction key, the output-token cap, or a failing Neo4j write. Narrative arcs and the Learning panel are running on stale facts.`;
+}
+
+/**
+ * The SHORT leg text for a stall — the one line the admin card's Graph memory leg shows.
+ *
+ * Server-side like the long reason, and for the same reason: the card used to compose this itself and
+ * hard-coded the never-extracted wording for BOTH causes, so a liveness stall asserted "extracting 0
+ * facts" beside the card's own 113,352-fact count. The card appends its own freshness suffix (item
+ * count + "last projected"), which is formatting, not a claim.
+ *
+ * Typed `Record<ExtractionStallCause, …>` so deleting an entry fails the build, and iterated by
+ * `EXTRACTION_STALL_CAUSES` in the tests so ADDING a cause without a distinct sentence fails too —
+ * the annotation-swap a mutation walked straight through.
+ */
+export function extractionStallShortText(
+  cause: ExtractionStallCause,
+  args: { lagHours: number | null }
+): string {
+  const lag = args.lagHours === null ? "longer than the alarm budget" : `~${args.lagHours}h`;
+  const byCause: Record<ExtractionStallCause, string> = {
+    "no-facts": "0 extracted facts in this team's graph groups",
+    "never-completed": "no extraction has ever completed for this team",
+    // The MEASURED lag, not the budget constant: hard-coding "over 6h" drifts silently if
+    // `EXTRACTION_LAG_BUDGET_MS` moves, and importing that constant into a component would drag a
+    // `server-only` module across the boundary.
+    stopped: `no extraction has completed in ${lag}`,
+  };
+  return byCause[cause];
 }
 
 /**
