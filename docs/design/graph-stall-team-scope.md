@@ -1,6 +1,6 @@
 # The stall probe cannot tell "found nothing" from "could not read" — STALLSCOPE-1
 
-**Status:** spec, draft 3. Drafts 1 and 2 were each BLOCKED by two independent cold reads; every
+**Status:** spec, draft 4 (both CODE reviews BLOCKED draft 3; folded below). Drafts 1 and 2 were each BLOCKED by two independent cold reads; every
 finding is folded, and the disagreements between the reviewers are resolved explicitly below.
 **Rebased onto `origin/main` at `de16085`** — PCCC-3 (#547) and PCCC-4 (#549) merged mid-spec and
 they rewrote this slice's central files; draft 2's code model was stale and is re-derived here.
@@ -118,13 +118,19 @@ Today the episode count and the group scope are two concurrent SQL reads
 can produce `items > 0` with `groups === []`. One statement closes it:
 
 ```sql
-select count(distinct (source_table, source_id))::int as items,
-       min(first_seen_at)::text     as first_seen_at,
-       max(projected_at)::text      as newest_push_at,
-       array_agg(distinct group_id) as groups
+select count(distinct (source_table, source_id)) filter (where content_sha256 <> '')::int as items,
+       min(first_seen_at) filter (where content_sha256 <> '')::text  as first_seen_at,
+       max(projected_at) filter (where content_sha256 <> '')::text   as newest_push_at,
+       max(projected_at)::text                                       as last_projected_at,
+       array_agg(distinct group_id) filter (where content_sha256 <> '') as groups
   from graph_episodes
- where team_id = $1 and content_sha256 <> ''
+ where team_id = $1
 ```
+
+The un-filtered `last_projected_at` is deliberately a DIFFERENT population from `newest_push_at` — it
+answers "is the projector alive at all", where a redaction pass IS the projector working — and it is in
+this statement rather than in the card's own query because that separate query was the second assembler
+PCCC-3 then changed on one side only.
 
 Three outcomes, distinct: **unreadable** (threw), **empty** (no real rows), or a reading.
 `count(distinct (source_table, source_id))` is PCCC-3's expression, adopted verbatim — that repair
@@ -151,7 +157,15 @@ while pushes fail, so the value can predate the first accepted push by the lengt
 stated, and accepted, because it errs toward judging sooner and the copy never quotes it as a
 "projected at" time.
 
-**Set-once over all four write paths** — `origin/main` has four, not draft 2's two: the reservation
+**Set-once over the row's LIFECYCLE, not just the four write paths.** Both code reviewers found that
+draft 3 checked only the writes: `lib/graph/reconcile.ts` DELETED a never-landed row, and the next
+projection re-created it through the reservation INSERT with a fresh default — during exactly the
+dead-extractor outage this probe targets, where nothing lands and rows recycle every grace window.
+Detection survived only on an accident of the defaults (the re-queue cap sits below the episode floor,
+so some row always kept an old clock), and raising that cap is the DOCUMENTED response to the
+throttling a dead extractor produces. So reconcile now parks a never-landed row on the `''` sentinel
+instead of deleting it — the same thing its sibling branch already does, with the same re-queue effect
+— and a guard pins that, plus the set-once contract over all four write paths — `origin/main` has four, not draft 2's two: the reservation
 INSERT (the only row-creating path, which takes the column's default), the group-move explicit UPDATE,
 the redaction upsert, and the final upsert. None may name the column in its payload; the adapter's
 `ON CONFLICT DO UPDATE SET` lists only provided keys (`lib/db/pg/query-builder.ts:393`), so omission is
@@ -178,34 +192,50 @@ because the worker is serial and a cold team can queue behind another team's bac
 ~1 episode/minute, prod's own first ingest hour (175 rows) is ~3 hours of queue — a healthy team
 arriving behind it has no completion for hours. No fixed constant fixes that; evidence does.
 
-**So the zero-evidence branches go LOUD only when the graph shows no completion ANYWHERE inside the
-lag budget** — i.e. the worker itself is idle or dead. When it is provably completing other work, the
-same state renders as a **card observation** instead: true, visible, not a banner. This is the
-`unconfirmed`-vs-`confirmed` distinction BANNERFLAP-1 introduced, applied to a different signal.
+**So the zero-evidence branches go LOUD only when the worker is not provably serving someone else** —
+and every word of the corroborating read had to be narrowed after both code reviewers attacked draft
+3's version of it:
 
-The global read this needs is one `max(Episodic.created_at)` with no group filter — the same shape
-STALLPROBE-1 removed as the team's *clock*. It is not the clock here, and it can only ever SUPPRESS
-loudness: it never accuses, never feeds the lag branch, and never suppresses the observation. The
-masking that made it wrong as a clock is precisely the property that makes it right as a
-liveness-of-the-worker corroborator.
+```cypher
+MATCH (w:Episodic) WHERE NOT w.group_id IN $g AND w.name STARTS WITH $p
+RETURN toString(max(w.created_at)) AS at
+```
+
+- **It excludes THIS team's groups.** Draft 3 read it un-scoped, which makes it a SUPERSET of the
+  team's own liveness — so "the worker is busy" was true BY CONSTRUCTION whenever the team had a recent
+  completion, and the `at` + zero-facts state that `origin/main` deliberately keeps loud ("an extractor
+  that runs to completion and still produces zero facts IS broken") silently became a note. A
+  corroborator built from a superset of the thing it corroborates corroborates nothing.
+- **It counts only `items:` episodes.** Otherwise one `correction:<arc_id>` episode — no ledger row,
+  and exactly what the TEAM clock already had to exclude for this reason — mutes the alarm for a whole
+  budget. That is STALLPROBE-1's bug arriving one layer out.
+- **It applies ONLY where the team has no evidence of its own** (`none`/`unreadable`), never to an
+  `at`: the team's own completions disprove the queue hypothesis outright.
+- **A materially future stamp is not evidence** (`WORKER_CLOCK_SKEW_TOLERANCE_MS`, 5 min), because a
+  suppressor with no upper bound on skew can mute an alarm indefinitely.
+
+On a single-team install it therefore suppresses nothing, which is correct: with no other tenant there
+is no queue to be stuck behind. It can only ever SUPPRESS loudness — it never accuses, never feeds the
+lag branch, and never suppresses the observation, which renders as a **card observation**: true,
+visible, not a banner. That is the `unconfirmed`-vs-`confirmed` distinction BANNERFLAP-1 introduced,
+applied to a different signal.
 
 **The state table.** `gate` = the team's `first_seen_at` is older than `LANDED_GRACE_MS`; `worker idle`
-= global newest `Episodic` is absent or older than `EXTRACTION_LAG_BUDGET_MS`; every row assumes
+= no `items:` completion in ANY OTHER group inside `EXTRACTION_LAG_BUDGET_MS`; every row assumes
 `items ≥ MIN_ITEMS_FOR_EXTRACTION_SIGNAL` (below it, and for a null/empty ledger, never stalled and no
 observation). The lag axis exists only where a completion exists.
 
 | liveness | facts | gate | worker | verdict | cause / output |
 |---|---|---|---|---|---|
 | `unreadable` | 0 | passed | idle | **stalled** | `no-facts` (makes no completion claim) |
-| `unreadable` | 0 | passed | busy | not stalled | observation |
+| `unreadable` | 0 | passed | busy elsewhere | not stalled | observation |
 | `unreadable` | 0 | not passed | any | not stalled | — |
 | `unreadable` | >0 or null | any | any | not stalled | — |
 | `none` | 0 | passed | idle | **stalled** | `no-facts` (adds "and nothing has ever completed") |
 | `none` | >0 or null | passed | idle | **stalled** | `never-completed` |
-| `none` | any | passed | busy | not stalled | observation |
+| `none` | any | passed | busy elsewhere | not stalled | observation |
 | `none` | any | not passed | any | not stalled | — |
-| `at`, lag ≤ budget | 0 | passed | idle | **stalled** | `no-facts` (adds "jobs are completing") |
-| `at`, lag ≤ budget | 0 | passed | busy | not stalled | observation |
+| `at`, lag ≤ budget | 0 | passed | any | **stalled** | `no-facts` (adds "jobs are completing") — never suppressed, the team has its own evidence |
 | `at`, lag ≤ budget | 0 | not passed | any | not stalled | — |
 | `at`, lag ≤ budget | >0 or null | any | any | not stalled | — |
 | `at`, lag > budget | any | any | any | **stalled** | `stopped` (`no-facts` copy takes precedence when facts are 0 **and** its own row above fires) |
@@ -228,7 +258,7 @@ Three decisions inside that table, each a fold:
 
 ### 2f. Copy that says only what is known
 
-`ExtractionStallCause` becomes `no-facts | never-completed | stopped` — renamed so every consumer
+`ExtractionStallCause` becomes `no-facts | no-completion-visible | stopped` — renamed so every consumer
 breaks at compile time and so no name asserts a diagnosis the evidence does not carry (draft 2's
 `zero-yield` asserted a yield regression; `never-extracted` asserted a dead worker).
 

@@ -13,7 +13,7 @@
  * `graph_episodes` row behind it.
  *
  * A constant rather than an inline literal because a second consumer now depends on it as a
- * POPULATION filter, not just a format: `lib/graph/extraction-health.newestEpisodicAtMs` asks "when
+ * POPULATION filter, not just a format: `lib/graph/extraction-health`'s liveness read asks "when
  * did the newest ledger-projected episode complete?" and must not count episodes nobody projected.
  * `lib/graph/arcs.ts` writes `correction:<arc_id>` episodes straight to Graphiti in the same group
  * with no ledger row, so without this filter a human arc correction completing would refresh the

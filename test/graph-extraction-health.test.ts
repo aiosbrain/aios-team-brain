@@ -117,14 +117,14 @@ const CASES: { name: string; over: Partial<ExtractionSignals>; want: Expected }[
     want: { stalled: true, cause: "no-facts", observed: null },
   },
   {
-    name: "none + facts > 0 + idle worker ⇒ never-completed (correction episodes make facts without a ledger row)",
+    name: "none + facts > 0 + idle worker ⇒ no-completion-visible (correction episodes make facts without a ledger row)",
     over: { liveness: WORKER_NEVER },
-    want: { stalled: true, cause: "never-completed", observed: null },
+    want: { stalled: true, cause: "no-completion-visible", observed: null },
   },
   {
-    name: "none + unreadable facts + idle worker ⇒ never-completed (draft 2 left this cell with a NULL cause, which renders an empty red banner)",
+    name: "none + unreadable facts + idle worker ⇒ no-completion-visible (draft 2 left this cell with a NULL cause, which renders an empty red banner)",
     over: { liveness: WORKER_NEVER, facts: null },
-    want: { stalled: true, cause: "never-completed", observed: null },
+    want: { stalled: true, cause: "no-completion-visible", observed: null },
   },
   {
     name: "none + busy worker ⇒ observation: a serial worker on someone else's backlog is why this happens",
@@ -139,12 +139,12 @@ const CASES: { name: string; over: Partial<ExtractionSignals>; want: Expected }[
   {
     name: "none + a worker whose own clock is unreadable ⇒ accuses: suppression needs POSITIVE evidence",
     over: { liveness: WORKER_NEVER, workerLiveness: WORKER_UNREADABLE },
-    want: { stalled: true, cause: "never-completed", observed: null },
+    want: { stalled: true, cause: "no-completion-visible", observed: null },
   },
   {
     name: "none + a worker that has never completed anything anywhere ⇒ accuses",
     over: { liveness: WORKER_NEVER, workerLiveness: WORKER_NEVER },
-    want: { stalled: true, cause: "never-completed", observed: null },
+    want: { stalled: true, cause: "no-completion-visible", observed: null },
   },
   // ── liveness `at`, inside the lag budget ────────────────────────────────────────────────────────
   {
@@ -153,9 +153,15 @@ const CASES: { name: string; over: Partial<ExtractionSignals>; want: Expected }[
     want: { stalled: true, cause: "no-facts", observed: null },
   },
   {
-    name: "at + 0 facts + busy worker ⇒ observation",
+    // THE REGRESSION REVIEW CAUGHT. The first version of the corroboration applied to every
+    // zero-evidence cell, and because the worker read was an un-scoped SUPERSET of the team's own
+    // liveness, `workerBusy` was true BY CONSTRUCTION whenever this cell was reachable — so a live
+    // zero-yield extractor (jobs completing for this team, zero facts ever) silently became a note.
+    // `origin/main` kept it loud on purpose: "an extractor that runs to completion and still produces
+    // zero facts IS broken". Queue depth cannot explain a team whose own jobs are completing.
+    name: "at + 0 facts + a busy worker is STILL loud — the team's own completions disprove queue depth",
     over: { facts: 0, workerLiveness: WORKER_BUSY },
-    want: { stalled: false, cause: null, observed: "queued-behind-worker" },
+    want: { stalled: true, cause: "no-facts", observed: null },
   },
   {
     name: "at + 0 facts + gate NOT passed ⇒ silent",
@@ -365,14 +371,22 @@ describe("extractionStallReason — what each cause is allowed to claim", () => 
   it("no-facts states the zero and nothing about completions except what liveness says", () => {
     const never = extractionStallReason("no-facts", args({ liveness: { kind: "none" } }));
     expect(never).toContain("0 extracted facts");
-    expect(never).toContain("has ever completed");
+    expect(never).toContain("no completed episode");
 
     const completing = extractionStallReason(
       "no-facts",
-      args({ liveness: { kind: "at", atMs: NOW } })
+      args({ liveness: { kind: "at", atMs: NOW }, lagHours: 1 })
     );
     expect(completing).toContain("Jobs ARE completing");
-    expect(completing).not.toContain("has ever completed");
+
+    // …and the clause is RECENCY-aware. `no-facts` outranks the lag branch, so this cause is reachable
+    // with a completion OLDER than the budget — where "jobs are completing" would be false (review).
+    const staleCompletion = extractionStallReason(
+      "no-facts",
+      args({ liveness: { kind: "at", atMs: NOW }, lagHours: 30 })
+    );
+    expect(staleCompletion).not.toContain("Jobs ARE completing");
+    expect(staleCompletion).toContain("30h behind");
 
     const unknown = extractionStallReason("no-facts", args({ liveness: { kind: "unreadable" } }));
     expect(unknown).toContain("could not be read");
@@ -385,22 +399,27 @@ describe("extractionStallReason — what each cause is allowed to claim", () => 
     expect(r).not.toContain("failing on every job");
   });
 
-  it("never-completed names the graph-store restore AND that it does not self-heal", () => {
-    const r = extractionStallReason("never-completed", args({ facts: 4200 }));
+  it("no-completion-visible names the graph-store restore and the RATE it self-heals at", () => {
+    // The first version asserted the copy said a wipe is PERMANENT because "the ledger's content
+    // hashes suppress re-pushing". Both reviewers showed that is FALSE — `lib/graph/reconcile.ts`
+    // re-queues never-landed rows and the projector re-pushes them — and this assertion was
+    // build-ENFORCING the falsehood, which is worse than the sentence alone.
+    const r = extractionStallReason("no-completion-visible", args({ facts: 4200 }));
     expect(r).toContain("wipe or restore");
-    expect(r).toContain("PERMANENT");
-    expect(r).toContain("content hashes suppress re-pushing");
+    expect(r).toContain("self-heal");
+    expect(r).toContain("drip rate");
+    expect(r).not.toContain("PERMANENT");
     // It must also explain why facts can exist while nothing has completed for the items.
     expect(r).toContain("arc corrections");
     expect(r).toContain("4200 facts");
   });
 
   it("never prints a fact count it does not have — on any cause", () => {
-    for (const cause of ["no-facts", "never-completed", "stopped"] as ExtractionStallCause[]) {
+    for (const cause of ["no-facts", "no-completion-visible", "stopped"] as ExtractionStallCause[]) {
       const r = extractionStallReason(cause, args({ facts: null }));
       expect(r, cause).not.toMatch(/holds null|null facts|holds 0 facts/);
     }
-    expect(extractionStallReason("never-completed", args({ facts: null }))).toContain("unreadable");
+    expect(extractionStallReason("no-completion-visible", args({ facts: null }))).toContain("unreadable");
   });
 
   it("stopped degrades to 'for some time' rather than printing 'nullh'", () => {
@@ -414,7 +433,7 @@ describe("extractionStallReason — what each cause is allowed to claim", () => 
     // render per-group rows; this is scoped to the stall copy, which has no reason to print a partition
     // key and would be the first place one leaked into a sentence an operator screenshots.
     const groupish = /\b[a-z0-9-]+_(team|external)\b|\bg_[0-9a-f]+_p_[0-9a-f]+\b/;
-    for (const cause of ["no-facts", "never-completed", "stopped"] as ExtractionStallCause[]) {
+    for (const cause of ["no-facts", "no-completion-visible", "stopped"] as ExtractionStallCause[]) {
       expect(extractionStallReason(cause, args({ facts: 7 })), cause).not.toMatch(groupish);
     }
     expect(extractionObservationNote(30)).not.toMatch(groupish);
@@ -435,7 +454,7 @@ describe("extractionStallReason — what each cause is allowed to claim", () => 
     expect(new Set(long).size, "two causes share one reason").toBe(EXTRACTION_STALL_CAUSES.length);
     for (const s of [...short, ...long]) expect(s.length).toBeGreaterThan(20);
     // …and the enumeration is the real one, not a stale copy of it.
-    expect([...EXTRACTION_STALL_CAUSES].sort()).toEqual(["never-completed", "no-facts", "stopped"]);
+    expect([...EXTRACTION_STALL_CAUSES].sort()).toEqual(["no-completion-visible", "no-facts", "stopped"]);
   });
 
   it("the observation says what it is and does not accuse", () => {
@@ -655,10 +674,13 @@ describe("the liveness read counts ledger-backed item episodes only", () => {
     expect(query).toContain("e.name STARTS WITH $p");
   });
 
-  it("the GLOBAL worker query is a different literal — un-scoped on purpose, and unmistakably so", () => {
-    // STALLSCOPE-1 re-introduces the un-scoped read STALLPROBE-1 deleted, for a different job: it can
-    // only SUPPRESS an alarm, never make one. Pinned separately (a distinct alias) so the scoped
-    // query's own guard above cannot accidentally anchor on it and pass for the wrong reason.
+  it("the QUEUE corroborator excludes this team's groups AND non-ledger episodes", () => {
+    // The first version pinned only "un-scoped + max", which was green by construction for the two
+    // defects review then found: (1) an un-filtered global max is a SUPERSET of the team's own clock,
+    // so "the worker is busy" was true whenever the team had a recent completion — silently turning a
+    // live zero-yield extractor into a note; (2) one `correction:<arc_id>` episode, which has no ledger
+    // row and which the TEAM clock already had to exclude for exactly this reason, would suppress the
+    // alarm for the whole budget. Both are query-text properties, so they are pinned as query text.
     const src = readFileSync(
       path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "lib", "graph", "extraction-health.ts"),
       "utf8"
@@ -666,7 +688,22 @@ describe("the liveness read counts ledger-backed item episodes only", () => {
     const start = src.indexOf('"MATCH (w:Episodic)');
     expect(start, "the worker-liveness query literal is gone or was renamed").toBeGreaterThan(-1);
     const query = src.slice(start, src.indexOf('"', start + 1) + 1);
-    expect(query).not.toContain("group_id");
+    expect(query).toContain("NOT w.group_id IN $g"); // everyone ELSE
+    expect(query).toContain("w.name STARTS WITH $p"); // ledger-backed item episodes only
     expect(query).toContain("max(w.created_at)");
+  });
+
+  it("…and the corroborator is handed the team's OWN groups as the exclusion", async () => {
+    // The text above cannot prove the parameter is the right set. Deleting the argument or passing an
+    // empty array restores the superset behaviour with the query text untouched.
+    vi.mocked(runSql).mockResolvedValue(
+      { rows: [{ items: 30, first_seen_at: new Date(NOW - 86_400_000).toISOString(), newest_push_at: new Date(NOW).toISOString(), last_projected_at: new Date(NOW).toISOString(), groups: ["acme_team"] }] } as never
+    );
+    vi.mocked(runRead).mockResolvedValue([{ n: 1, at: null }] as never);
+    vi.mocked(neo4jConfigured).mockReturnValue(true);
+    await readExtractionSignals("t1", NOW);
+    const workerCall = vi.mocked(runRead).mock.calls.find((c) => String(c[0]).includes("(w:Episodic)"));
+    expect(workerCall, "the corroborator never ran").toBeDefined();
+    expect(workerCall![1]).toEqual({ g: ["acme_team"], p: ITEM_EPISODE_PREFIX });
   });
 });

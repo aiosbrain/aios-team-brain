@@ -59,27 +59,34 @@ import { LANDED_GRACE_MS } from "./reconcile";
  *     ledger-backed item episodes only (a group-scoped read still counted `correction:<arc_id>`
  *     writebacks, which `lib/graph/arcs.ts` POSTs into the same group with no ledger row, so a human
  *     arc correction completing would have silenced this alarm mid-outage).
- *     `facts`/`countGraphFacts` REMAINS global and deliberately un-scoped: "has the extractor ever
- *     produced anything at all" is an install-level question, and scoping it is not this slice's.
- *     WHAT THE SCOPING DOES NOT FIX, so the bullet above stops short of claiming it: a team whose
- *     groups hold ZERO episode nodes reads `max() = null` ⇒ "can't tell" ⇒ green, and on a
- *     MULTI-TEAM install another team's facts keep the global `facts === 0` branch quiet too. So a
- *     brand-new team whose extraction has never once succeeded is silent on both halves — the very
- *     "202 accepted, nothing processed" shape this probe was built for. It is NOT a regression (the
- *     pre-scoping global read was equally green there, masked by the other team's clock), it is
- *     backstopped on the card by the census `predicate-suspect` refusal, and on the single-team
- *     install this product actually ships as, `facts === 0` fires normally. Closing it properly means
- *     distinguishing "read fine, found nothing" from "could not read" — a discriminated return, not a
- *     nullable one — and per-team fact counts; both are their own slice (STALLSCOPE-1).
- *   • A missing/unparseable timestamp disarms the recency half silently — safe, but invisible.
- *   • Detection lags by the budget (6h) by construction.
+ *     `facts` WAS global and deliberately un-scoped here ("has the extractor ever produced anything at
+ *     all" is an install-level question). STALLSCOPE-1 scoped it — see the bullet below; this sentence
+ *     is kept in the past tense rather than deleted because the global reading is what made the
+ *     never-extracted half undetectable per team, and that is the reason the scoping exists.
+ *     WHAT THE SCOPING DID NOT FIX, and STALLSCOPE-1 now does: a team whose groups held ZERO episode
+ *     nodes read `max() = null` ⇒ "can't tell" ⇒ green, and on a MULTI-TEAM install another team's
+ *     facts kept the global `facts === 0` branch quiet too, so a team whose extraction had never once
+ *     succeeded was silent on both halves — the very "202 accepted, nothing processed" shape this
+ *     probe was built for. Both halves are closed below: liveness is a DISCRIMINATED return
+ *     (`ExtractionLiveness`) so "read fine, found nothing" is expressible, and the fact count is
+ *     scoped to the team's ledger groups.
+ *   • A missing/unparseable timestamp still reads as "could not read" — safe, and now visible as a
+ *     distinct kind rather than an indistinguishable null.
+ *   • Detection lags by the budget (6h) on the lag branch, and by the first-completion grace on the
+ *     zero-evidence branches, by construction.
+ *   • QUEUE DEPTH, not extraction failure, is the innocent reading of "nothing has completed for us"
+ *     on a multi-tenant install — so the loud path for those branches requires positive evidence that
+ *     the worker is serving OTHER groups' item episodes. On a single-team install that evidence cannot
+ *     exist, which is correct: with no other tenant there is no queue to be stuck behind.
  *
  * Best-effort: nulls/`stalled:false` on any error so it never breaks a page render.
  */
 
 /** Below this many distinct ITEMS projected we can't distinguish "extractor broken" from "fresh
  *  install still mid-first-extraction" (Graphiti processes async), so we don't flag. With a working
- *  extractor, 25 accepted episodes reliably yield ≥1 fact; 0 facts past that is unambiguous breakage.
+ *  extractor, 25 accepted ITEMS — one or more episodes each — reliably yield ≥1 fact; 0 facts past that
+ *  is unambiguous breakage. (The old wording said "25 accepted episodes" about a count of items, which
+ *  is the unit error this rename exists to stop.)
  *
  *  RENAMED from `MIN_EPISODES_FOR_EXTRACTION_SIGNAL` (STALLSCOPE-1). The quantity compared against it
  *  has counted distinct ITEMS since PCCC-3 — one item holds one ledger row per group under fan-out,
@@ -97,6 +104,15 @@ export const MIN_ITEMS_FOR_EXTRACTION_SIGNAL = 25;
  *  `now`: a team that projected nothing for a week has legitimately old facts, and comparing to the
  *  wall clock would cry stall on every quiet team. */
 export const EXTRACTION_LAG_BUDGET_MS = 6 * 3_600_000;
+
+/** How far into the FUTURE the queue corroborator's clock may sit and still count as evidence.
+ *
+ *  Graphiti stamps `created_at` from its own container clock, so a few seconds of skew against this
+ *  process is ordinary and a stamp hours ahead is not — it means a clock is wrong. The tolerance
+ *  matters because the corroborator can only SUPPRESS: without a bound, one future-dated episode node
+ *  would mute the alarm for as long as it stayed in the future, which is the "an alarm that quietly
+ *  declines to fire" failure this family exists to remove. Found by review. */
+export const WORKER_CLOCK_SKEW_TOLERANCE_MS = 5 * 60_000;
 
 export interface GraphExtractionHealth {
   items: number | null; // distinct ITEMS projected for this team (Postgres ledger; see the floor's note)
@@ -194,7 +210,7 @@ export interface ExtractionSignals {
  * editing the guard" shape two reviewers found in LLMOBS-1. With the causes enumerable at runtime, the
  * copy tests iterate them and a cause with no distinct sentence reddens whatever the annotations say.
  */
-export const EXTRACTION_STALL_CAUSES = ["no-facts", "never-completed", "stopped"] as const;
+export const EXTRACTION_STALL_CAUSES = ["no-facts", "no-completion-visible", "stopped"] as const;
 export type ExtractionStallCause = (typeof EXTRACTION_STALL_CAUSES)[number];
 
 export interface ExtractionVerdict {
@@ -267,19 +283,32 @@ export function deriveExtractionVerdict(input: ExtractionSignals): ExtractionVer
   // more specific claim. Facts include those extracted from `correction:<arc_id>` episodes (which have
   // no ledger row), so `facts > 0` does NOT imply item extraction ever ran — hence the second branch.
   const zeroEvidence: ExtractionStallCause | null =
-    facts === 0 ? "no-facts" : liveness.kind === "none" ? "never-completed" : null;
+    facts === 0 ? "no-facts" : liveness.kind === "none" ? "no-completion-visible" : null;
   if (zeroEvidence === null) return lagStalled ? stopped : quiet;
 
   // AGE GATE — a SET-ONCE clock (`first_seen_at`), never `projected_at`, which every re-push bumps.
   const gatePassed = input.firstSeenAtMs !== null && nowMs - input.firstSeenAtMs > LANDED_GRACE_MS;
   if (!gatePassed) return lagStalled ? stopped : quiet;
 
-  // CORROBORATION — is the worker completing anything at all, for anyone? Suppression requires
-  // POSITIVE evidence of a live worker: an unreadable global clock corroborates nothing and therefore
-  // suppresses nothing (it cannot manufacture an accusation either — that took a definitive
-  // `facts === 0` or a definitive `none` to reach this line).
+  // CORROBORATION — but ONLY where the team has no evidence of its own.
+  //
+  // Queue depth is the innocent explanation for "nothing has completed for US". It is NOT an
+  // explanation for "jobs complete for us and produce no facts": the team's own completions disprove
+  // the queue hypothesis outright, and `origin/main` kept that state loud on purpose ("an extractor
+  // that runs to completion and still produces zero facts IS broken"). The first version of this
+  // corroboration applied to every zero-evidence cell and silently reversed that — found by review,
+  // and the reason it slipped through is that the check was a superset of the signal it was checking.
+  const teamHasOwnEvidence = liveness.kind === "at";
+  // Suppression requires POSITIVE evidence of another tenant being served: an unreadable clock
+  // corroborates nothing and suppresses nothing. A materially FUTURE stamp is not evidence either —
+  // clock skew between the graph store and this process is seconds, so a stamp beyond that tolerance
+  // means something is wrong with a clock, and "wrong clock" must not be able to mute an alarm forever.
+  const workerAgeMs = workerLiveness.kind === "at" ? nowMs - workerLiveness.atMs : null;
   const workerBusy =
-    workerLiveness.kind === "at" && nowMs - workerLiveness.atMs <= EXTRACTION_LAG_BUDGET_MS;
+    !teamHasOwnEvidence &&
+    workerAgeMs !== null &&
+    workerAgeMs >= -WORKER_CLOCK_SKEW_TOLERANCE_MS &&
+    workerAgeMs <= EXTRACTION_LAG_BUDGET_MS;
   if (workerBusy) {
     // Still true, still worth showing — just not "the brain isn't getting fresh data".
     return lagStalled ? stopped : { stalled: false, cause: null, observed: "queued-behind-worker" };
@@ -542,25 +571,41 @@ async function readEpisodicLiveness(groupIds: string[]): Promise<ExtractionLiven
 }
 
 /**
- * The GLOBAL episodic clock — "is the graph worker completing ANYTHING, for anyone?"
+ * "Is the worker completing item extraction for SOMEONE ELSE right now?" — the queue-depth
+ * corroborator, and every word of that question is load-bearing.
  *
- * This is deliberately the un-scoped read STALLPROBE-1 deleted, and the difference is the whole
- * argument: there it was this TEAM's clock, and another team's healthy job refreshing it hid a dead
- * extractor. Here it is never subtracted from anything and can only SUPPRESS loudness — so that same
- * masking property is the correct one. A serial worker chewing through one team's backlog is precisely
- * why another team can legitimately have no completion of its own for hours (measured: ~1 episode per
- * minute, and prod's own first ingest hour queued 175 items), and no time constant distinguishes that
- * from a dead extractor. This does.
+ * WHY IT EXISTS. A cold team can have no completion of its own for hours while nothing is wrong: the
+ * graphiti worker is serial, so this team's first episode sits behind whatever is already queued
+ * (measured: ~1 episode/minute, and prod's own first ingest hour queued 175 items). No time constant
+ * distinguishes that from a dead extractor — evidence does.
+ *
+ * WHY IT EXCLUDES THIS TEAM'S GROUPS, which the first version did not. Review killed that version, and
+ * the reasoning is worth keeping: an unfiltered global max is a SUPERSET of the team-scoped max, so
+ * whenever the team's own liveness said `at`, "the worker is busy" was true BY CONSTRUCTION — and the
+ * `at` + zero-facts state, which `origin/main` deliberately kept LOUD ("an extractor that runs to
+ * completion and still produces zero facts IS broken"), silently became a non-loud note. A corroborator
+ * built from a superset of the thing it is corroborating cannot corroborate anything.
+ *
+ * WHY IT FILTERS `items:` TOO. Without it, one `correction:<arc_id>` episode — which `lib/graph/arcs.ts`
+ * POSTs with no ledger row, and which is exactly what the TEAM clock had to exclude for the same
+ * reason — would mark the worker busy and suppress the alarm for the whole budget. That is the bug
+ * STALLPROBE-1 fixed on the team clock, arriving one layer out.
+ *
+ * On a SINGLE-TEAM install this therefore reads `none` and suppresses nothing, which is correct: with
+ * no other tenant there is no queue to be stuck behind, so an absence of your own completions is about
+ * your extractor. It can only ever SUPPRESS loudness — it never accuses, never feeds the lag branch,
+ * and never suppresses the card observation.
  *
  * A different alias (`w:`) than the scoped query above, on purpose: the source-level test that pins the
  * scoped query's filters anchors on `"MATCH (e:Episodic)`, and a second literal opening with the same
  * text would let it pin the wrong query and pass for the wrong reason.
  */
-async function readWorkerLiveness(): Promise<ExtractionLiveness> {
+async function readWorkerLiveness(excludeGroupIds: string[]): Promise<ExtractionLiveness> {
   if (!neo4jConfigured()) return { kind: "unreadable" };
   try {
     const rows = await runRead<{ at: string | null }>(
-      "MATCH (w:Episodic) WHERE w.created_at IS NOT NULL RETURN toString(max(w.created_at)) AS at"
+      "MATCH (w:Episodic) WHERE NOT w.group_id IN $g AND w.name STARTS WITH $p AND w.created_at IS NOT NULL RETURN toString(max(w.created_at)) AS at",
+      { g: excludeGroupIds, p: ITEM_EPISODE_PREFIX }
     );
     return livenessFromMax(rows);
   } catch {
@@ -592,7 +637,7 @@ function livenessFromMax(rows: { at: string | null }[]): ExtractionLiveness {
  * Every sentence here is constrained by what its cell of the state table actually proves — the defect
  * class this whole family exists to remove is an alarm asserting something beside its own contradicting
  * evidence. So: `no-facts` may not claim anything about completions except what `liveness` says;
- * `never-completed` may not print a fact count it does not have and may not assert a dead worker as the
+ * `no-completion-visible` may not print a fact count it does not have and may not assert a dead worker as the
  * only cause; neither may name a `group_id` (the copy says "this team's graph groups").
  *
  * `lagHours` is hours between the newest PUSHED episode and the newest COMPLETED job — start-stamped,
@@ -612,15 +657,20 @@ export function extractionStallReason(
     // What the liveness read is allowed to add — and nothing more. The `at` clause deliberately quotes
     // no age: `lagHours` measures push-minus-completion, not the completion's age, and printing one as
     // the other is the same class of error as the fact-lag/liveness conflation STALLPROBE-1 removed.
+    // The `at` clause is RECENCY-aware: `no-facts` outranks the lag branch, so this cell is reachable
+    // with a completion OLDER than the budget, where "jobs are completing" would be false (review).
+    const stale = args.lagHours !== null && args.lagHours > EXTRACTION_LAG_BUDGET_MS / 3_600_000;
     const completions =
       args.liveness.kind === "none"
-        ? "No graph job in this projector's episode format has ever completed for those groups."
+        ? "The graph holds no completed episode in this projector's format for those groups at all."
         : args.liveness.kind === "at"
-          ? "Jobs ARE completing for those groups, so this is not simply a dead worker."
+          ? stale
+            ? `Jobs have completed for those groups before, but the newest one is about ${args.lagHours}h behind the newest push, so extraction has also stopped.`
+            : "Jobs ARE completing for those groups, so this is not simply a dead worker."
           : "Whether any job is completing could not be read from the graph just now.";
     return `${items} items have been projected for this team, but the graph holds 0 extracted facts in this team's graph groups. ${completions} Possible causes, none of them yet established: extraction completing while extracting no relations (a prompt or schema change on a graphiti upgrade), content that yields none, a change to the group-id or episode-name scheme, or a graph-store restore. Check the graphiti service logs for the actual error. Narrative arcs and the Learning panel have nothing to run on for this team.`;
   }
-  if (cause === "never-completed") {
+  if (cause === "no-completion-visible") {
     // `facts === null` is UNKNOWN (Neo4j unreadable), not zero. Printing "0 facts" there is this file's
     // own banned pattern — a zero indistinguishable from a measurement — in the one sentence an
     // operator acts on.
@@ -628,14 +678,14 @@ export function extractionStallReason(
       args.facts === null
         ? "The fact count for those groups is currently unreadable."
         : `The graph does hold ${args.facts} facts in those groups — arc corrections write facts with no ledger row behind them, so facts alone do not prove item extraction ran.`;
-    return `No graph job in this projector's episode format has ever completed for this team's graph groups, though ${items} items have been projected. ${held} Causes: the extraction worker failing every job for these groups; a graph-store wipe or restore, which is PERMANENT rather than self-healing, because the ledger's content hashes suppress re-pushing (the repair is a forced re-projection, not waiting); or a change to the group-id or episode-name scheme. Check the graphiti service logs for the actual error.`;
+    return `The graph currently holds no completed episode in this projector's format for this team's graph groups, though ${items} items have been projected. ${held} Causes: the extraction worker failing every job for these groups; a graph-store wipe or restore; or a change to the group-id or episode-name scheme. A wipe DOES self-heal — reconcile re-queues never-landed rows and the projector re-pushes them — but only at the re-queue drip rate (a bounded number of items per team per cycle), so a real corpus takes days; the fast repair is a forced re-projection. Check the graphiti service logs for the actual error.`;
   }
   const forHow = args.lagHours === null ? "for some time" : `for about ${args.lagHours}h`;
   // `facts === null` is UNKNOWN (Neo4j unreadable), not zero. An earlier draft printed "holds 0 facts
   // from before", which is this file's own banned pattern — a zero indistinguishable from a
-  // measurement — in the one sentence an operator acts on. Unreachable from either production caller
-  // today (the predicate returns false on null facts), so this is a pure-function contract rather
-  // than a live bug; it is fixed anyway because the function is exported and the next caller is free.
+  // measurement — in the one sentence an operator acts on. This IS reachable now (it was not before
+  // STALLSCOPE-1, and a comment here said so until review caught it): `at` liveness + unreadable facts
+  // + a stale completion is a pinned row of the state table and lands exactly here.
   const held =
     args.facts === null
       ? "The graph holds facts from before (the exact count is currently unreadable);"
@@ -662,7 +712,7 @@ export function extractionStallShortText(
   const lag = args.lagHours === null ? "longer than the alarm budget" : `~${args.lagHours}h`;
   const byCause: Record<ExtractionStallCause, string> = {
     "no-facts": "0 extracted facts in this team's graph groups",
-    "never-completed": "no extraction has ever completed for this team",
+    "no-completion-visible": "the graph holds no completed extraction for this team",
     // The MEASURED lag, not the budget constant: hard-coding "over 6h" drifts silently if
     // `EXTRACTION_LAG_BUDGET_MS` moves, and importing that constant into a component would drag a
     // `server-only` module across the boundary.
@@ -680,7 +730,12 @@ export function extractionStallShortText(
  * there was the same one: make the refusal itself renderable.
  */
 export function extractionObservationNote(items: number | null): string {
-  return `${items ?? 0} items have been projected for this team and no extraction has completed for its graph groups yet — but graphiti IS completing work for other groups right now, so the likeliest explanation is queue depth rather than a failure. Worth a look if it persists past the next day.`;
+  // Every clause is true BY CONSTRUCTION, which took a review round to make so: this note is reachable
+  // only when the team's own liveness is `none`/`unreadable` (no completion of its own) and the worker
+  // read — which EXCLUDES this team's groups and counts only `items:` episodes — found a recent
+  // completion. The first version could render "completing work for other groups" about the team's own
+  // group, and "no extraction has completed yet" about a team whose jobs were completing.
+  return `${items ?? 0} items have been projected for this team and the graph holds no completed extraction for its groups — but graphiti IS completing item extraction for OTHER groups right now, so the likeliest explanation is queue depth rather than a failure. Worth a look if it persists past the next day.`;
 }
 
 /** Hours between the newest pushed episode and the newest completed job; null when either is unknown. */
@@ -731,9 +786,11 @@ export async function readExtractionSignals(
   const [facts, liveness, workerLiveness] = await Promise.all([
     readTeamFacts(ledger.groups),
     readEpisodicLiveness(ledger.groups),
-    // NOT scoped, and never subtracted from anything — see `readWorkerLiveness`. Fetched even when this
-    // team has no scope, because it is the thing that decides whether an absence is worth shouting about.
-    readWorkerLiveness(),
+    // Scoped to EVERYONE ELSE (see `readWorkerLiveness`) and never subtracted from anything. Fetched
+    // even when this team has no scope, because it is what decides whether an absence is worth
+    // shouting about — and with an empty exclusion list it degrades to "is the worker doing item
+    // extraction at all", which is the right question for a team that has pushed nothing.
+    readWorkerLiveness(ledger.groups),
   ]);
   const signals: ExtractionSignals = {
     items: ledger.kind === "unreadable" ? null : ledger.items,

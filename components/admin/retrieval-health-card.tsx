@@ -118,7 +118,7 @@ export function RetrievalHealthCard({ health }: { health: RetrievalHealth }) {
   // Reachable + writing episodes, but Graphiti isn't turning them into a finished job. A distinct,
   // more specific cause than a stalled projector, so it gets its own detail + banner and takes
   // priority. THREE causes now (STALLSCOPE-1), and they make different factual claims — only
-  // `no-facts` may say "0 facts", and `never-completed` may not assert a dead worker. After
+  // `no-facts` may say "0 facts", and `no-completion-visible` may not assert a dead worker. After
   // STALLPROBE-1 a liveness stall fires with facts >> 0 (prod holds 113,352), so the old single
   // hard-coded sentence asserted "extracting 0 facts" beside this card's own fact count. The server
   // owns the discriminator AND both sentences (`extractionStallShortText`/`extractionStallReason`),

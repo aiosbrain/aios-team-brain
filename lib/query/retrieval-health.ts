@@ -271,7 +271,7 @@ export async function getRetrievalHealth(teamId: string): Promise<RetrievalHealt
   //
   // Since GRAPHCOST-1, `projected_at` advances only on a pass that actually POSTed episodes: a
   // re-projection whose chunks were all unchanged (an edit past the extraction cap) writes the ledger
-  // and deliberately leaves the timestamp alone, because bumping it would make `newestEpisodeAtMs`
+  // and deliberately leaves the timestamp alone, because bumping it would make the ledger's `newestPushAtMs`
   // above report a push that never happened and cry wolf on the extraction-lag probe. The tradeoff is
   // here: `isGraphStale` reads "the projector is alive" from pushes, so a ≥6h window whose ONLY
   // projection activity was such passes reads as quiet. That is a widening of a false-positive the

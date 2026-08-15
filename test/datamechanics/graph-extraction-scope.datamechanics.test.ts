@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
-import { db, seedTeam } from "./helpers";
+import { db, ingest, seedTeam } from "./helpers";
+import { projectItemsToGraph } from "@/lib/graph/project";
+import { FakeGraphiti, client } from "./fake-graphiti";
 import { readExtractionSignals } from "@/lib/graph/extraction-health";
 
 /**
@@ -177,6 +179,25 @@ describe("first_seen_at — the SET-ONCE clock the age gate needs (data-mechanic
 
     expect(await firstSeenAt(seed.teamId)).toBe(before);
     expect(await groupsOf(seed.teamId)).toEqual([`${seed.teamSlug}_external`]);
+  });
+
+  it("survives a REAL projector re-push — the production path, not a replayed payload shape", async () => {
+    // Review's point: the two cases above replay the projector's payload SHAPES by hand, so they stay
+    // green if `lib/graph/project.ts` ever starts naming the column. This one drives the projector
+    // itself, twice, with the body changed in between so the second pass genuinely re-pushes.
+    const seed = await seedTeam();
+    const fake = new FakeGraphiti();
+    const item = await ingest(seed, { path: "docs/clock.md", body: "first body", access: "team" });
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: seed.teamSlug, client: client(fake) });
+    const before = await firstSeenAt(seed.teamId);
+
+    await ingest(seed, { path: "docs/clock.md", body: "second body, materially different", access: "team" });
+    const second = await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: seed.teamSlug, client: client(fake) });
+    expect(second.projected).toBeGreaterThanOrEqual(1); // it really did re-push
+    expect(item.id).toBeTruthy();
+
+    expect(await firstSeenAt(seed.teamId)).toBe(before);
+    expect(Date.parse(await newestProjectedAt(seed.teamId))).toBeGreaterThanOrEqual(Date.parse(before));
   });
 
   it("is the OLDEST row's stamp, and the read exposes it as the gate clock", async () => {

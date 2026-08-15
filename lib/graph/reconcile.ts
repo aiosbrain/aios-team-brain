@@ -314,7 +314,23 @@ export async function reconcileProjectedEpisodes(
           requeueThrottled++;
           continue;
         }
-        await db.from("graph_episodes").delete().eq("id", row.id);
+        // PARK ON THE SENTINEL RATHER THAN DELETE (STALLSCOPE-1, found by both code reviewers).
+        //
+        // This used to `delete()` the row, which has the same re-queue effect — the branch above says
+        // so in its own comment ("the sentinel → the projector re-pushes it like a deleted row") — but
+        // destroys the row's identity, and with it `first_seen_at`, the SET-ONCE clock the stall
+        // probe's age gate reads. That matters in exactly the state the probe exists for: during a
+        // dead-extractor outage nothing lands, so this path recycles rows every grace window and each
+        // re-creation takes a fresh `default now()`. Detection survived only on an accident of the
+        // defaults (`REQUEUE_MAX_PER_PASS` 20 < `MIN_ITEMS_FOR_EXTRACTION_SIGNAL` 25, so some row
+        // always kept an old clock) — and raising that cap is the DOCUMENTED response to
+        // `requeueThrottled`, which a dead extractor is what produces. It would have held the gate
+        // open indefinitely.
+        //
+        // Keeping the row is also the more correct post-PCCC-3 behaviour on its own terms: the row IS
+        // the `(item, group)` reservation, and re-pushing is what a reservation is for. The delta path
+        // is skipped for a sentinel sha, so the next pass pushes the whole item exactly as before.
+        await db.from("graph_episodes").update({ content_sha256: "" }).eq("id", row.id);
         reQueued++;
       }
     }
