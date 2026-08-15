@@ -55,19 +55,37 @@ prefix, the changed-sequence bucket is:
 |---|---:|---:|---:|
 | samples | 223 | 211 | 5 |
 
-**Maximum 8 of 80 admitted chunks**, from a 20-character in-place edit at `docs/ARCHITECTURE.md`
-@181,517 — against a legacy churn of **1** for the same edit. A reviewer independently *constructed* a
-document reaching 8 at the test's own fixed offset. So the existing ceiling of 6 is fitted to one
-offset, it is already exceeded on live content, and **no ceiling is assertable** — asserting one
-against a fixture would pin the fixture, not the algorithm. This slice therefore asserts the changed
-branch's *classification* and *direction* (≥ 2, boundary provably destroyed), never a magnitude.
+**Observed maximum 9 of 80 admitted chunks** at `docs/ARCHITECTURE.md`@178,189 — against a legacy
+churn of **1** for the same edit — measured at `9c81efd`. Stated as an OBSERVED LOWER BOUND, not "the
+maximum": the sweep steps 97 characters, so it samples ~1% of offsets, and two runs differing only in
+start offset reported 8 and 9. A reviewer independently constructed a document reaching 8 at the test's
+own fixed offset. The existing ceiling of 6 is therefore fitted to one offset, is already exceeded on
+live content, and **no ceiling is assertable** — asserting one against a fixture would pin the fixture,
+not the algorithm. This slice asserts the changed branch's *classification* and *direction* (≥ 2,
+boundary provably destroyed), never a magnitude.
 
-**STALENESS, stated because this spec's whole argument is about claims that do not reproduce.** Earlier
-drafts published a maximum of **78** from `docs/ARCHITECTURE.md` @7111. It reproduced when measured —
-and stopped reproducing when this session's own earlier merge appended a paragraph to that very file,
-which is exactly the live-corpus hazard §2c takes off the gating path. Review caught it. Every number
-here is now stamped `2b1778d`, and none of them gates a test: the shipped assertions are the rule, the
-classification and the direction, all of which survive a corpus that moves under them.
+### 0f. The retracted "78" was the wrong METRIC, not stale data
+
+An earlier draft published a maximum of **78 of 80** here, and then — worse — explained the retraction
+as corpus drift ("a merge lengthened `ARCHITECTURE.md`"). Review falsified BOTH. The number reproduces
+identically on the pre-merge and post-merge file, and the pre-merge file was *shorter*, so the drift
+story had its direction backwards. That was the fifth wrong characterisation in this ticket, and the
+first one that was mine to catch.
+
+The real cause is the metric. Churn can be counted two ways:
+
+- **SET** — chunks in the edited version whose content appears nowhere in the original;
+- **POSITIONAL** — chunks that differ at the same index.
+
+**Only the set count is a cost the product pays.** `lib/graph/project.ts:1222-1223` builds
+`alreadyPushed = new Set(existingRow.chunk_shas)` and filters `episodes` by MEMBERSHIP, so a chunk
+whose content survives while its index shifts is never re-pushed and costs nothing. The 78 was a
+positional count of a state that costs **2**. `scripts/cdc-churn-sweep.mjs` now reports both, precisely
+so the two cannot be confused again: at `9c81efd` the same sweep gives set max 9 and positional max 80.
+
+The rule in §0b agrees with both metrics — but only in the unchanged-sequence bucket, where they are
+provably equal (every non-intersected chunk is byte-identical). Carrying "agrees under both" across to
+the changed bucket, where they diverge by ~40x, is what produced the 78.
 
 ### 0d. The trade, with both directions measured
 
@@ -138,8 +156,10 @@ reported, never gated. **The coordinate mismatch is named rather than left to be
 `cdcBoundaries` is uncapped while churn is measured on the cap-80 chunking, which is exactly why a
 past-cap edit can change the sequence and still churn 0.
 
-The partition is asserted arithmetically — `strict + changed + excluded === total` — so a classifier
-bug cannot quietly move every document into an ungated bucket.
+The partition sum (`strict + reported + excluded === total`) is asserted, and stated for what it is: a
+TAUTOLOGY for any total classifier, which pins totality and nothing else. What actually stops a
+reports-everything classifier is the STRICT fixture plus a `strict > 0` floor on the live census — an
+earlier draft claimed the sum caught it, which review showed it cannot.
 
 ### 2c. Both branches get a checked-in fixture, because a live corpus cannot guarantee either
 
@@ -188,11 +208,11 @@ API route, no change to `visibleItems`/`visibleTasks`/`visibleGroupIds`.
 
 - `test/graph-cdc.test.ts` — a checked-in STRICT fixture (edit far from every boundary) asserts sequence-unchanged AND churn exactly 1, so the strict branch cannot go vacuous when the classifier is wrong.
 - `test/graph-cdc.test.ts` — a checked-in CHANGED fixture asserts the targeted boundary exists before the edit, is ABSENT after, the sequences differ, and churn ≥ 2 — proving the branch is exercised rather than assuming a centred edit destroys a cut.
-- `test/graph-cdc.test.ts` — no ceiling is asserted for the changed branch on any input; the measured envelope is recorded in a comment with its witness, because the live corpus already reaches 78 of 80.
+- `test/graph-cdc.test.ts` — no ceiling is asserted for the changed branch on any input, and the median assertion is KEPT for the in-place scenario (metric-robust, and it would have caught the original defect); the observed envelope is recorded with its witness and its metric.
 - `test/graph-cdc.test.ts` — for every LIVE document classified strict (long enough, sequence unchanged, edit inside one admitted chunk), churn is exactly 1, asserted per document rather than as a corpus maximum one outlier can dominate.
-- `test/graph-cdc.test.ts` — the three buckets partition the corpus (`strict + changed + excluded === total`), so a classifier that moves every document into an ungated bucket reddens instead of greening.
+- `test/graph-cdc.test.ts` — a `strict > 0` floor on the live census, because the partition sum is a tautology for any total classifier and cannot catch a reports-everything one; the STRICT fixture is the other half of that guard.
 - `test/graph-cdc.test.ts` — a checked-in SHORT fixture makes the excluded bucket non-empty regardless of the live corpus; the live excluded count is reported, never gated.
-- `test/graph-cdc.test.ts` — the `it.fails` for CDCCHURN-1 is GONE and the `max(cdc) ≤ max(legacy)` comparison is removed for the same-length scenario, with the measured reason (78 vs 1) recorded at the site.
+- `test/graph-cdc.test.ts` — the `it.fails` for CDCCHURN-1 is GONE and the `max(cdc) ≤ max(legacy)` comparison is removed for the same-length scenario, with the measured reason recorded at the site.
 - `docs/design/content-defined-chunking.md` — the ACCEPTANCE table's unconditional 1 for `edit in place, same length` is corrected to the conditional property and the prose carries the measured trade in both directions; the summary table above it measures byte offsets, where 1 is a theorem, and is deliberately untouched.
 - `docs/design/content-defined-chunking.md` — the `append at end` row is marked conditional and points at the follow-up ticket, rather than carrying either the old unconditional 1 or an unverified replacement.
 

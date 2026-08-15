@@ -453,20 +453,29 @@ describe("churn: how many chunk hashes change under a real edit — CDC vs the b
  *      spanning a SURVIVING boundary changes both adjacent chunks (churn 2), and an edit past the
  *      80-chunk admitted prefix changes nothing at all (churn 0).
  *
- * THE RULE, verified before it was written down — 5,658 unchanged-sequence samples swept across the
- * corpus at 97-character steps, 5,658 agreements, zero mismatches, under both this file's set-based
- * `changedCount` and a positional diff:
+ * THE RULE, verified before it was written down — 5,743 unchanged-sequence samples swept across the
+ * corpus at 97-character steps, 5,743 agreements, zero mismatches, under both this file's set-based
+ * `changedCount` and a positional diff (they are provably equal in that bucket). Reproduce with
+ * `node scripts/cdc-churn-sweep.mjs`, which is committed because a prose recipe did NOT reproduce:
  *
  *   **churn = the number of ADMITTED chunk intervals the changed span intersects.**
  *
  * So exactly 1 needs two things together: the edit changes text, and it lies wholly inside one admitted
  * chunk. (A third condition — "no boundary strictly inside the edit span" — was specified and then
  * deleted as provably dead; see `classify`.) Anything else is reported, not gated — because when
- * the boundary sequence does change there is NO usable ceiling: the same sweep reaches **8 of 80**
- * admitted chunks for a 20-character edit (`docs/ARCHITECTURE.md` @181,517) against a legacy churn of
- * 1 — already past the ceiling of 6 this file used to assert. An earlier measurement reached 78 before
- * a merge changed that document, which is the live-corpus hazard in miniature: none of these numbers
- * gates anything, and the assertions below rest on the rule and the classification instead.
+ * the boundary sequence does change there is NO usable ceiling: the same sweep observes **≥ 9 of 80**
+ * admitted chunks for a 20-character edit (`docs/ARCHITECTURE.md`@178,189) against a legacy churn of 1
+ * — already past the ceiling of 6 this file used to assert. "≥" is deliberate: the sweep steps 97
+ * characters, so a maximum from it is a lower bound, and two runs differing only in start offset gave
+ * 8 and 9.
+ *
+ * AND MIND THE METRIC. An earlier draft published 78 here. That is a POSITIONAL count — chunks that
+ * differ at the same index — and it is not a cost: `lib/graph/project.ts:1222-1223` filters by
+ * `new Set(chunk_shas)` MEMBERSHIP, so a chunk that merely shifts index is never re-pushed. The same
+ * state costs 2 under `changedCount`, the metric used throughout this file. The draft then explained
+ * the retraction as corpus drift, which review also falsified — the number reproduces on both
+ * revisions of that file. Two wrong stories about one number; the sweep script now reports both
+ * metrics so they cannot be confused again.
  */
 describe("CDCCHURN-1: in-place same-length churn is the number of chunks the edit touches", () => {
   const EDIT_AT = 20_000;
@@ -599,8 +608,35 @@ describe("CDCCHURN-1: in-place same-length churn is the number of chunks the edi
     expect(before).toContain(boundary);
     expect(at + EDIT_LEN).toBeLessThan(boundary); // the edit does NOT overlap the boundary…
     expect(cdcBoundaries(edited, CDC_PARAMS)).not.toEqual(before); // …and destroys it anyway
+    expect(cdcBoundaries(edited, CDC_PARAMS)).not.toContain(boundary); // that boundary specifically
     expect(admittedIntervals(t).some(([lo, hi]) => at >= lo && at + EDIT_LEN <= hi)).toBe(true);
     expect(classify(t, at)).toBe("reported");
+  });
+
+  it("NO-OP FIXTURE: an edit that changes nothing is excluded, not counted as a churn-1 edit", () => {
+    // MUTATION-FOUND (review): the `edited === t` term had no fixture, so deleting it left every test
+    // green — the same "a predicate term no test can redden is asserted on trust" rule this file
+    // invokes twice elsewhere. Without the term this document classifies STRICT and churns 0, so the
+    // live assertion's `toBe(1)` would fail on it.
+    const base = doc(50_000, 9);
+    const t = base.slice(0, EDIT_AT) + "X".repeat(EDIT_LEN) + base.slice(EDIT_AT + EDIT_LEN);
+    expect(inPlace(t)).toBe(t); // the edit is a no-op on this document
+    expect(classify(t)).toBe("excluded");
+    expect(changedCount(chunkContent(t), chunkContent(inPlace(t)))).toBe(0);
+  });
+
+  it("LIVE CORPUS: the in-place median stays at 1 — the assertion that would have caught this", () => {
+    // Dropping the ceiling took the MEDIAN with it, and review was right that this went too far: the
+    // median is metric-robust (set and positional agree in the strict bucket, which is most of the
+    // corpus) and it is the assertion that would have caught the original defect, where one document
+    // churned 4 while every other churned 1. A ceiling is unassertable; a median is not.
+    const docs = repoDocs();
+    const churns = docs
+      .filter((t) => classify(t) !== "excluded")
+      .map((t) => changedCount(chunkContent(t), chunkContent(inPlace(t))))
+      .sort((a, b) => a - b);
+    expect(churns.length).toBeGreaterThan(5);
+    expect(churns[Math.floor(churns.length / 2)], "median in-place churn over real documents").toBe(1);
   });
 
   it("LIVE CORPUS: every strictly-classified document churns exactly 1", () => {
