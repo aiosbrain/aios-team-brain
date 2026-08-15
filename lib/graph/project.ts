@@ -768,8 +768,12 @@ export async function projectItemsToGraph(
       }
       for (const r of fanoutRows) {
         if (r.deferred && !targets.has(r.group_id)) {
-          // Untag of a never-pushed row: pure bookkeeping. The `deferred` predicate keeps this
-          // delete from ever touching a row that HAS graph content behind it.
+          // Untag of a never-pushed row: pure bookkeeping. The in-loop `r.deferred` gate is the
+          // PINNED layer (mutation-verified); the SQL `deferred = true` predicate below is
+          // belt-and-braces against the one window the gate can't see — a row ARMED between this
+          // pass's ledger read and this delete would otherwise be dropped while a push for it may
+          // already be in flight. Unpinnable without interleaving hooks; named here and in the PR
+          // rather than silently trusted.
           const { error: dropErr } = await db
             .from("graph_episodes")
             .delete()
