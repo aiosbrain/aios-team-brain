@@ -276,11 +276,44 @@ as fixtures — not content, just lengths and edit positions where content is se
 
 | scenario | byte-offset (today) | CDC (required) |
 |---|---|---|
-| edit in place, same length | 1 of 20 | 1 |
-| append at end | 1 of 20 | 1 |
+| edit in place, same length | 1 of 20 | **conditional — see below** |
+| append at end | 1 of 20 | conditional, not yet characterised (`CDCAPPEND-1`) |
 | **insert 33 chars near the top** | **21 of 20** | **≤ 3** |
 | insert a paragraph mid-document | ~half | **≤ 3** |
 | delete a paragraph near the top | ~all | **≤ 3** |
+
+### `edit in place, same length` — the row that was wrong, corrected (CDCCHURN-1)
+
+That row promised an unconditional **1** and it cannot be one. For byte offsets 1 IS a theorem: offsets
+do not move, so exactly the containing chunk changes. For CDC a boundary **is** content — a cut is
+decided by roughly the 32 code units ENDING at it — so an edit can destroy a boundary it never touches,
+create one where none was, or span a surviving one. The true rule, verified over 5,743 swept samples
+with zero mismatches (`test/graph-cdc.test.ts`, CDCCHURN-1):
+
+> **churn = the number of admitted chunk intervals the changed span intersects.**
+>
+> (measured at `2b1778d` — the corpus is deliberately live, so these numbers carry a SHA)
+
+Exactly 1 requires two things: the edit changes text, and it lies wholly inside one admitted chunk.
+(A third condition — "no boundary strictly inside the edit span" — is implied by the second, and was
+deleted after a mutation showed nothing could redden it.) Otherwise there is no useful ceiling —
+measured over this repo's own markdown, a 20-character in-place edit reaches **8 of the 80 admitted
+chunks**, and that number moves as the corpus does: an earlier measurement, on a longer
+`docs/ARCHITECTURE.md`, reached 78 — but that was a POSITIONAL count, and positional churn is not a
+cost (see the note above the table).
+
+**So the honest trade, both directions measured on the same corpus:**
+
+| edit (measured at `2b1778d`) | CDC | byte offsets |
+|---|---:|---:|
+| in-place, same length, boundary-changing (`docs/ARCHITECTURE.md` @181,517) | **8** | **1** |
+| in-place, same length, boundary-preserving (@20,000) | 1 | 1 |
+| insertion of 33 chars near the top | **1** | **80** |
+
+CDC is **not** "never worse than byte offsets", and this document should never have implied it. It is
+dramatically better on the insertion cascade this lever exists for, and dramatically worse on an
+in-place edit that disturbs a boundary. Three earlier attempts to characterise this each blamed the
+wrong mechanism — the test carries that history so the fourth reader does not re-derive it.
 
 **And in prod, after:** the projector's own `ingest_runs` records episodes per run. A week of
 editing-heavy days before and after should show the episode count per changed item fall toward the
