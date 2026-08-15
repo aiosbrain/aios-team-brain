@@ -39,11 +39,14 @@ export async function armProjectsForPrincipal(
     for (const r of (data ?? []) as { project_id: string }[]) armed.add(r.project_id);
   }
   const fresh = args.projectIds.filter((p) => !armed.has(p));
-  if (fresh.length === 0) return;
 
-  // Pointers for the fresh projects — the flip targets groups, not project ids.
+  // The FLIP runs for EVERY requested project — fresh AND already-armed. First-wins applies to the
+  // arming ROW only: a project armed last week whose items were tagged yesterday holds deferred
+  // rows that nothing else ever flips — without this, late-tagged content on an armed project
+  // would stay un-extracted forever (caught while proving the latch monotone: the late rows are
+  // exactly what the latch must survive). The latch keeps readiness monotone through the flip.
   const groups: string[] = [];
-  for (const batch of chunk(fresh, IN_CLAUSE_BATCH)) {
+  for (const batch of chunk([...args.projectIds], IN_CLAUSE_BATCH)) {
     const { data, error } = await db
       .from("projects")
       .select("id, graph_group_id")
@@ -55,8 +58,8 @@ export async function armProjectsForPrincipal(
   }
 
   // Row first, flip second: a crash between the two leaves an armed project whose rows flip on the
-  // NEXT arm-or-evaluate touch (readiness simply stays unlatched meanwhile) — never flipped rows
-  // with no arming record, which would push without any latch ever forming.
+  // NEXT arm touch (readiness simply stays unlatched meanwhile) — never flipped rows with no
+  // arming record, which would push without any latch ever forming.
   for (const projectId of fresh) {
     const { error } = await db.from("graph_project_arming").insert({ team_id: args.teamId, project_id: projectId });
     // A racer's insert is benign — first arm wins, both flips are idempotent.

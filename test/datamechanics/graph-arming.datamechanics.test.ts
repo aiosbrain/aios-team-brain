@@ -117,6 +117,19 @@ describe("PCCC-6 — arm-on-read", () => {
     await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: seed.teamSlug, client: client(new FakeGraphiti()) });
     state = await readyPartitions(db(), { teamId: seed.teamId, projects: [{ id: projectId, group }] });
     expect(state.ready.has(projectId)).toBe(true);
+
+    // The DISCRIMINATING monotone pin: a RE-ARM flips the late row into an unlanded obligation
+    // (late-tagged content must eventually extract — the flip re-runs on every arm touch), and
+    // readiness must STILL hold: only the persisted latch survives this; a live predicate flaps.
+    await armProjectsForPrincipal(db(), { teamId: seed.teamId, projectIds: [projectId] });
+    const late = await runSql<{ deferred: boolean; content_sha256: string }>(
+      "select deferred, content_sha256 from graph_episodes where team_id = $1 and group_id = $2 and source_id = $3",
+      [seed.teamId, group, r2.id]
+    );
+    expect(late.rows[0].deferred).toBe(false); // the late row IS flipped — it will extract
+    expect(late.rows[0].content_sha256).toBe(""); // …but hasn't landed yet: a live obligation
+    state = await readyPartitions(db(), { teamId: seed.teamId, projects: [{ id: projectId, group }] });
+    expect(state.ready.has(projectId)).toBe(true); // and the leg does not flap
   });
 
   it("a partition owing a purge is SUPPRESSED without un-latching (fail closed on narrowing)", async () => {
