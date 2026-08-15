@@ -1,159 +1,443 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, beforeEach } from "vitest";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { episodeName, ITEM_EPISODE_PREFIX } from "@/lib/graph/episode-name";
+import { LANDED_GRACE_MS } from "@/lib/graph/reconcile";
 import {
-  deriveGraphExtractionStalled,
+  deriveExtractionVerdict,
   extractionLagHours,
-  extractionStallCause,
+  extractionObservationNote,
   extractionStallReason,
   parseProbeTimestamp,
+  readExtractionSignals,
   EXTRACTION_LAG_BUDGET_MS,
-  MIN_EPISODES_FOR_EXTRACTION_SIGNAL,
+  MIN_ITEMS_FOR_EXTRACTION_SIGNAL,
+  type ExtractionLiveness,
+  type ExtractionSignals,
+  type ExtractionStallCause,
 } from "@/lib/graph/extraction-health";
 
+vi.mock("@/lib/db/pg/pool", () => ({ runSql: vi.fn() }));
+vi.mock("@/lib/graph/neo4j", () => ({ neo4jConfigured: vi.fn(() => true), runRead: vi.fn() }));
+import { runSql } from "@/lib/db/pg/pool";
+import { neo4jConfigured, runRead } from "@/lib/graph/neo4j";
+
 /**
- * The exact prod failure (2026-07): the projector POSTs episodes, Graphiti returns 202 and records
- * graph_project=OK, then its extractor fails every job ("Output length exceeded max tokens 8192") so
- * NO facts get created. `graph_project` stays green, /healthcheck stays green — the only observable
- * signal is "many episodes projected, zero facts extracted". This is that spec.
+ * THE STATE TABLE (STALLSCOPE-1 §2e).
+ *
+ * Three defects put this table here, and each cell is one of them:
+ *
+ *  1. The liveness read returned `number | null`, where `null` meant FIVE things — unconfigured, threw,
+ *     unparseable, no scope, and "the read succeeded and found nothing". The predicate treated all five
+ *     as "can't tell", so a team whose extraction has never once completed was silent.
+ *  2. The fact count was GLOBAL, so on any install holding facts from anywhere else `facts === 0` was
+ *     false forever and the never-extracted half was permanently disarmed for the broken team.
+ *  3. The 25-item floor was standing in for a question about TIME, and it does not: measured on prod,
+ *     the 25th real push landed **17 seconds** after the first, while extraction completes ~1 episode
+ *     per minute — so a healthy fresh install was accused within a minute of its first ingest.
+ *
+ * The fix for (3) is NOT just a longer timer. The worker is serial, so a cold team can queue behind
+ * another team's backlog (prod's own first ingest hour: 175 items ⇒ ~3h of queue) and no constant
+ * bounds that. Hence the corroboration: a zero-evidence state goes LOUD only when the graph shows no
+ * completion ANYWHERE inside the lag budget; while the worker is provably busy the same state is a
+ * card observation instead. These cases pin both halves — an absence must be able to accuse, and it
+ * must not accuse while the innocent explanation is still standing.
  */
-describe("deriveGraphExtractionStalled", () => {
-  const N = MIN_EPISODES_FOR_EXTRACTION_SIGNAL;
 
-  it("STALLED: a real backlog of projected episodes but zero extracted facts (the live bug)", () => {
-    expect(deriveGraphExtractionStalled({ episodes: 1243, facts: 0 })).toBe(true);
-    expect(deriveGraphExtractionStalled({ episodes: N, facts: 0 })).toBe(true);
+const N = MIN_ITEMS_FOR_EXTRACTION_SIGNAL;
+const NOW = 1_800_000_000_000;
+/** `first_seen_at` old enough that the age gate has passed. */
+const GATE_PASSED = NOW - LANDED_GRACE_MS - 1;
+/** …and young enough that it has not (the fresh-install case). */
+const GATE_OPEN = NOW - LANDED_GRACE_MS + 1;
+
+const WORKER_BUSY: ExtractionLiveness = { kind: "at", atMs: NOW - 60_000 };
+const WORKER_IDLE: ExtractionLiveness = { kind: "at", atMs: NOW - EXTRACTION_LAG_BUDGET_MS - 1 };
+const WORKER_NEVER: ExtractionLiveness = { kind: "none" };
+const WORKER_UNREADABLE: ExtractionLiveness = { kind: "unreadable" };
+
+const FRESH_COMPLETION: ExtractionLiveness = { kind: "at", atMs: NOW - 120_000 };
+const STALE_COMPLETION: ExtractionLiveness = {
+  kind: "at",
+  atMs: NOW - 60_000 - EXTRACTION_LAG_BUDGET_MS - 1,
+};
+
+/** A healthy team, from which each case moves exactly one thing. */
+const sig = (over: Partial<ExtractionSignals> = {}): ExtractionSignals => ({
+  items: N,
+  firstSeenAtMs: GATE_PASSED,
+  facts: 100,
+  newestPushAtMs: NOW - 60_000,
+  liveness: FRESH_COMPLETION,
+  workerLiveness: WORKER_IDLE,
+  nowMs: NOW,
+  ...over,
+});
+
+type Expected = {
+  stalled: boolean;
+  cause: ExtractionStallCause | null;
+  observed: "queued-behind-worker" | null;
+};
+
+const CASES: { name: string; over: Partial<ExtractionSignals>; want: Expected }[] = [
+  // ── liveness `unreadable` ───────────────────────────────────────────────────────────────────────
+  {
+    name: "unreadable liveness + 0 facts + gate passed + idle worker ⇒ no-facts (a definitive zero still accuses)",
+    over: { liveness: WORKER_UNREADABLE, facts: 0 },
+    want: { stalled: true, cause: "no-facts", observed: null },
+  },
+  {
+    name: "unreadable liveness + 0 facts + busy worker ⇒ observation, not an alarm",
+    over: { liveness: WORKER_UNREADABLE, facts: 0, workerLiveness: WORKER_BUSY },
+    want: { stalled: false, cause: null, observed: "queued-behind-worker" },
+  },
+  {
+    name: "unreadable liveness + 0 facts + gate NOT passed ⇒ silent (the fresh-install window)",
+    over: { liveness: WORKER_UNREADABLE, facts: 0, firstSeenAtMs: GATE_OPEN },
+    want: { stalled: false, cause: null, observed: null },
+  },
+  {
+    name: "unreadable liveness + facts > 0 ⇒ silent: it cannot accuse by itself",
+    over: { liveness: WORKER_UNREADABLE },
+    want: { stalled: false, cause: null, observed: null },
+  },
+  {
+    name: "unreadable liveness + unreadable facts ⇒ silent",
+    over: { liveness: WORKER_UNREADABLE, facts: null },
+    want: { stalled: false, cause: null, observed: null },
+  },
+  // ── liveness `none` — the read SUCCEEDED and found nothing ──────────────────────────────────────
+  {
+    name: "none + 0 facts + idle worker ⇒ no-facts (the stronger claim wins the cause)",
+    over: { liveness: WORKER_NEVER, facts: 0 },
+    want: { stalled: true, cause: "no-facts", observed: null },
+  },
+  {
+    name: "none + facts > 0 + idle worker ⇒ never-completed (correction episodes make facts without a ledger row)",
+    over: { liveness: WORKER_NEVER },
+    want: { stalled: true, cause: "never-completed", observed: null },
+  },
+  {
+    name: "none + unreadable facts + idle worker ⇒ never-completed (draft 2 left this cell with a NULL cause, which renders an empty red banner)",
+    over: { liveness: WORKER_NEVER, facts: null },
+    want: { stalled: true, cause: "never-completed", observed: null },
+  },
+  {
+    name: "none + busy worker ⇒ observation: a serial worker on someone else's backlog is why this happens",
+    over: { liveness: WORKER_NEVER, workerLiveness: WORKER_BUSY },
+    want: { stalled: false, cause: null, observed: "queued-behind-worker" },
+  },
+  {
+    name: "none + gate NOT passed ⇒ silent, even with an idle worker",
+    over: { liveness: WORKER_NEVER, firstSeenAtMs: GATE_OPEN },
+    want: { stalled: false, cause: null, observed: null },
+  },
+  {
+    name: "none + a worker whose own clock is unreadable ⇒ accuses: suppression needs POSITIVE evidence",
+    over: { liveness: WORKER_NEVER, workerLiveness: WORKER_UNREADABLE },
+    want: { stalled: true, cause: "never-completed", observed: null },
+  },
+  {
+    name: "none + a worker that has never completed anything anywhere ⇒ accuses",
+    over: { liveness: WORKER_NEVER, workerLiveness: WORKER_NEVER },
+    want: { stalled: true, cause: "never-completed", observed: null },
+  },
+  // ── liveness `at`, inside the lag budget ────────────────────────────────────────────────────────
+  {
+    name: "at + 0 facts + idle worker ⇒ no-facts (jobs complete, nothing is extracted)",
+    over: { facts: 0 },
+    want: { stalled: true, cause: "no-facts", observed: null },
+  },
+  {
+    name: "at + 0 facts + busy worker ⇒ observation",
+    over: { facts: 0, workerLiveness: WORKER_BUSY },
+    want: { stalled: false, cause: null, observed: "queued-behind-worker" },
+  },
+  {
+    name: "at + 0 facts + gate NOT passed ⇒ silent",
+    over: { facts: 0, firstSeenAtMs: GATE_OPEN },
+    want: { stalled: false, cause: null, observed: null },
+  },
+  {
+    name: "at + facts > 0 + fresh completion ⇒ healthy (the whole point of STALLPROBE-1)",
+    over: {},
+    want: { stalled: false, cause: null, observed: null },
+  },
+  {
+    name: "at + unreadable facts + fresh completion ⇒ healthy",
+    over: { facts: null },
+    want: { stalled: false, cause: null, observed: null },
+  },
+  // ── liveness `at`, past the lag budget ──────────────────────────────────────────────────────────
+  {
+    name: "at + facts > 0 + stale completion ⇒ stopped",
+    over: { liveness: STALE_COMPLETION },
+    want: { stalled: true, cause: "stopped", observed: null },
+  },
+  {
+    name: "at + unreadable facts + stale completion ⇒ stopped (the copy must not print a count it lacks)",
+    over: { liveness: STALE_COMPLETION, facts: null },
+    want: { stalled: true, cause: "stopped", observed: null },
+  },
+  {
+    name: "stale completion + a BUSY worker is still stopped — the lag branch is never suppressed",
+    over: { liveness: STALE_COMPLETION, workerLiveness: WORKER_BUSY },
+    want: { stalled: true, cause: "stopped", observed: null },
+  },
+  {
+    name: "stale completion + gate NOT passed is still stopped — the lag branch is never gated",
+    over: { liveness: STALE_COMPLETION, firstSeenAtMs: GATE_OPEN },
+    want: { stalled: true, cause: "stopped", observed: null },
+  },
+  {
+    name: "stale completion + 0 facts ⇒ no-facts takes precedence over stopped",
+    over: { liveness: STALE_COMPLETION, facts: 0 },
+    want: { stalled: true, cause: "no-facts", observed: null },
+  },
+];
+
+describe("deriveExtractionVerdict — every cell of the state table", () => {
+  for (const c of CASES) {
+    it(c.name, () => {
+      expect(deriveExtractionVerdict(sig(c.over))).toEqual(c.want);
+    });
+  }
+
+  it("a stalled verdict ALWAYS carries a cause, over the whole table", () => {
+    // Not per-case: a `stalled: true` with a null cause reaches `lib/query/retrieval-health` (which maps
+    // it to a null reason and renders an EMPTY red paragraph) and `lib/ingest/pipeline-health` (which
+    // pushes a `graph_extract` leg with `error: null`). Draft 2 of the spec had exactly that hole.
+    for (const c of CASES) {
+      const v = deriveExtractionVerdict(sig(c.over));
+      if (v.stalled) expect(v.cause, c.name).not.toBeNull();
+      if (!v.stalled) expect(v.cause, c.name).toBeNull();
+      // …and the two outputs are mutually exclusive: an alarm and a "nothing to worry about" note must
+      // never render together.
+      if (v.observed !== null) expect(v.stalled, c.name).toBe(false);
+    }
   });
 
-  it("healthy: episodes projected AND facts exist — the extractor is working", () => {
-    expect(deriveGraphExtractionStalled({ episodes: 1243, facts: 400 })).toBe(false);
-    expect(deriveGraphExtractionStalled({ episodes: N, facts: 1 })).toBe(false);
-  });
-
-  it("not flagged below the threshold — a fresh install may still be mid-first-extraction", () => {
-    // Too few episodes to distinguish "broken" from "Graphiti still processing the first batch".
-    expect(deriveGraphExtractionStalled({ episodes: N - 1, facts: 0 })).toBe(false);
-    expect(deriveGraphExtractionStalled({ episodes: 5, facts: 0 })).toBe(false);
-  });
-
-  it("nothing projected yet ⇒ not stalled (zero-vs-zero is a fresh graph, not a failure)", () => {
-    expect(deriveGraphExtractionStalled({ episodes: 0, facts: 0 })).toBe(false);
-  });
-
-  it("unknown facts (Neo4j unreadable) ⇒ not stalled — reachability is a different leg's concern", () => {
-    expect(deriveGraphExtractionStalled({ episodes: 1243, facts: null })).toBe(false);
-  });
-
-  it("unknown episodes (ledger unreadable) ⇒ not stalled — can't tell", () => {
-    expect(deriveGraphExtractionStalled({ episodes: null, facts: 0 })).toBe(false);
-    expect(deriveGraphExtractionStalled({ episodes: null, facts: null })).toBe(false);
+  it("every stalled cell produces a non-empty reason string", () => {
+    for (const c of CASES) {
+      const s = sig(c.over);
+      const v = deriveExtractionVerdict(s);
+      if (!v.cause) continue;
+      const reason = extractionStallReason(v.cause, {
+        items: s.items,
+        facts: s.facts,
+        lagHours: extractionLagHours(s.newestPushAtMs, s.liveness),
+        liveness: s.liveness,
+      });
+      expect(reason.length, c.name).toBeGreaterThan(80);
+    }
   });
 });
 
-/**
- * The SECOND prod failure (2026-07-28), which the spec above could not see.
- *
- * Graphiti's extraction key hit `insufficient_quota`. Every episode failed extraction — but the
- * graph already held ~weeks of facts from before the key ran dry, so `facts === 0` was false and
- * the probe stayed silent. Admin → Integrations showed the graph leg **green** while extraction had
- * been dead for hours; it was found by reading the service logs, not the dashboard.
- *
- * The bug in the detector is a category error: it asks "did extraction EVER work?" when the question
- * an operator needs answered is "is extraction working NOW?". A non-zero historical fact count
- * answers the first question forever, so the check disarms itself the moment it has ever succeeded.
- *
- * The signal that separates them is RECENCY: episodes keep landing while no new fact appears.
- */
-describe("deriveGraphExtractionStalled — extraction that STOPPED, not extraction that never started", () => {
-  const N = MIN_EPISODES_FOR_EXTRACTION_SIGNAL;
-  const HOUR = 3_600_000;
-  const now = Date.parse("2026-07-28T12:00:00Z");
-  const at = (hoursAgo: number) => now - hoursAgo * HOUR;
+describe("the floor — defect (c)'s protection, and the reason it is not enough on its own", () => {
+  it("below the floor nothing is emitted at all, not even an observation", () => {
+    for (const items of [0, 1, N - 1]) {
+      expect(
+        deriveExtractionVerdict(sig({ items, facts: 0, liveness: WORKER_NEVER })),
+        `items=${items}`
+      ).toEqual({ stalled: false, cause: null, observed: null });
+    }
+  });
 
-  // CONTRACT CHANGE (STALLPROBE-1). This block was written when FACT age was the accuser. It no
-  // longer is: on a mature graph most extracted edges deduplicate, so the fact clock freezes while
-  // extraction runs perfectly — that is the false positive this slice removes. The liveness question
-  // is now "did a JOB FINISH" (`Episodic.created_at`), and fact age is observational. The 2026-07-28
-  // outage these tests were written for is still caught, by the episodic clock instead.
-  it("STALLED: episodes arriving, and NO JOB HAS COMPLETED since — the 2026-07-28 outage", () => {
-    // A dead extractor stops writing episode nodes too, so the outage stays loud. (It used to be the
-    // stale FACT that accused; that is now insufficient on its own — see the next test.)
+  it("an unreadable ledger (items null) never accuses — it is an absence of evidence about everything", () => {
+    expect(deriveExtractionVerdict(sig({ items: null, facts: 0, liveness: WORKER_NEVER }))).toEqual({
+      stalled: false,
+      cause: null,
+      observed: null,
+    });
+  });
+
+  it("THE MEASURED FRESH-INSTALL CASE: 25 items 17 seconds in, zero facts, healthy ⇒ silent", () => {
+    // Prod's own numbers: the 25th real push landed 17s after the first, and extraction completes about
+    // one episode a minute. Before this slice that state returned `stalled: true` with the sentence
+    // "Graphiti is accepting episodes (202) yet its entity-extraction worker is failing on every job"
+    // — on a perfectly healthy install, on the loud banner, during someone's first ingest.
     expect(
-      deriveGraphExtractionStalled({
-        episodes: 1243,
-        facts: 400,
-        newestEpisodeAtMs: at(0.2),
-        newestFactAtMs: at(30),
-        newestEpisodicAtMs: at(30),
-      })
+      deriveExtractionVerdict(
+        sig({
+          items: N,
+          facts: 0,
+          firstSeenAtMs: NOW - 17_000,
+          liveness: WORKER_NEVER,
+          workerLiveness: WORKER_NEVER,
+          newestPushAtMs: NOW - 1_000,
+        })
+      )
+    ).toEqual({ stalled: false, cause: null, observed: null });
+  });
+
+  it("…and the same install once the grace has passed and nothing has completed ⇒ loud", () => {
+    expect(
+      deriveExtractionVerdict(
+        sig({
+          items: N,
+          facts: 0,
+          firstSeenAtMs: NOW - LANDED_GRACE_MS - 1,
+          liveness: WORKER_NEVER,
+          workerLiveness: WORKER_NEVER,
+        })
+      )
+    ).toEqual({ stalled: true, cause: "no-facts", observed: null });
+  });
+});
+
+describe("the age gate boundary — an imported grace, exercised at the edge", () => {
+  // A NAME-ONLY import satisfies nothing: these three cases fail if the gate uses any other constant,
+  // and the import is what keeps this file and `lib/graph/reconcile` from drifting apart.
+  const at = (firstSeenAtMs: number) =>
+    deriveExtractionVerdict(sig({ facts: 0, liveness: WORKER_NEVER, firstSeenAtMs })).stalled;
+
+  it("is exclusive: exactly at the grace is silent, one ms past accuses", () => {
+    expect(at(NOW - LANDED_GRACE_MS + 1)).toBe(false);
+    expect(at(NOW - LANDED_GRACE_MS)).toBe(false);
+    expect(at(NOW - LANDED_GRACE_MS - 1)).toBe(true);
+  });
+
+  it("a null clock never manufactures a stall (a row predating the column, or an unreadable ledger)", () => {
+    expect(at(NaN)).toBe(false);
+    expect(
+      deriveExtractionVerdict(sig({ facts: 0, liveness: WORKER_NEVER, firstSeenAtMs: null })).stalled
+    ).toBe(false);
+  });
+
+  it("…but a null clock does NOT suppress the lag branch, which measures from a real completion", () => {
+    expect(
+      deriveExtractionVerdict(sig({ firstSeenAtMs: null, liveness: STALE_COMPLETION })).cause
+    ).toBe("stopped");
+  });
+});
+
+describe("the lag budget boundary (STALLPROBE-1's contract, preserved)", () => {
+  const base = { items: 1243, facts: 400, newestPushAtMs: NOW };
+  it("is exclusive: exactly at budget is healthy, one ms past is stalled", () => {
+    expect(
+      deriveExtractionVerdict(
+        sig({ ...base, liveness: { kind: "at", atMs: NOW - EXTRACTION_LAG_BUDGET_MS } })
+      ).stalled
+    ).toBe(false);
+    expect(
+      deriveExtractionVerdict(
+        sig({ ...base, liveness: { kind: "at", atMs: NOW - EXTRACTION_LAG_BUDGET_MS - 1 } })
+      ).stalled
     ).toBe(true);
   });
 
-  it("NOT stalled on stale facts alone when jobs are completing — the false positive, removed", () => {
-    // Same fixture as above except a job finished moments ago. Under the old predicate this was a
-    // stall; it is the exact prod state that produced "accepting episodes but extracting 0 facts".
+  it("a completion NEWER than the newest push is healthy, not negative-lag nonsense", () => {
     expect(
-      deriveGraphExtractionStalled({
-        episodes: 1243,
-        facts: 400,
-        newestEpisodeAtMs: at(0.2),
-        newestFactAtMs: at(30),
-        newestEpisodicAtMs: at(0.1),
-      })
+      deriveExtractionVerdict(sig({ ...base, liveness: { kind: "at", atMs: NOW + 60_000 } })).stalled
     ).toBe(false);
   });
 
-  it("healthy: jobs completing just behind the episodes", () => {
-    // Extraction is serial and ~10-20s per episode, so completion ALWAYS trails. A small gap is
-    // normal and must not page anyone.
+  it("stale FACTS with a live completion are NOT a stall — the false positive this family removed", () => {
+    // The dedup-frozen graph: prod runs ~6.6 `dedupe_edges` per `extract_edges`, so most extracted
+    // edges create no new RELATES_TO and the fact clock freezes while extraction works perfectly.
     expect(
-      deriveGraphExtractionStalled({
-        episodes: 1243,
-        facts: 400,
-        newestEpisodeAtMs: at(0),
-        newestFactAtMs: at(1),
-        newestEpisodicAtMs: at(1),
-      })
-    ).toBe(false);
+      deriveExtractionVerdict(
+        sig({ ...base, newestFactAtMs: NOW - 30 * 86_400_000, liveness: FRESH_COMPLETION })
+      )
+    ).toEqual({ stalled: false, cause: null, observed: null });
   });
 
-  it("healthy: a QUIET period — both are old together", () => {
-    // Nothing was projected for a week, so of course no facts appeared. Measuring fact age against
-    // `now` instead of against the newest EPISODE would cry stall on every quiet team.
+  it("a null newest-push never accuses through the lag branch", () => {
     expect(
-      deriveGraphExtractionStalled({
-        episodes: 1243,
-        facts: 400,
-        newestEpisodeAtMs: at(200),
-        newestFactAtMs: at(201),
-      })
+      deriveExtractionVerdict(sig({ newestPushAtMs: null, liveness: STALE_COMPLETION })).stalled
     ).toBe(false);
   });
+});
 
-  it("still catches the ORIGINAL failure — zero facts, whatever the timestamps say", () => {
-    expect(
-      deriveGraphExtractionStalled({ episodes: 1243, facts: 0, newestEpisodeAtMs: at(0), newestFactAtMs: null })
-    ).toBe(true);
-    expect(deriveGraphExtractionStalled({ episodes: N, facts: 0 })).toBe(true);
+describe("extractionStallReason — what each cause is allowed to claim", () => {
+  const args = (over: Partial<Parameters<typeof extractionStallReason>[1]> = {}) => ({
+    items: 30,
+    facts: 0,
+    lagHours: 9,
+    liveness: WORKER_NEVER as ExtractionLiveness,
+    ...over,
   });
 
-  it("cannot tell: a missing timestamp is never evidence of a stall", () => {
-    // Neo4j unreadable, or an older Graphiti that didn't stamp created_at. "Don't know" is not "broken".
-    expect(
-      deriveGraphExtractionStalled({ episodes: 1243, facts: 400, newestEpisodeAtMs: at(0), newestFactAtMs: null })
-    ).toBe(false);
-    expect(
-      deriveGraphExtractionStalled({ episodes: 1243, facts: 400, newestEpisodeAtMs: null, newestFactAtMs: at(30) })
-    ).toBe(false);
+  it("no-facts states the zero and nothing about completions except what liveness says", () => {
+    const never = extractionStallReason("no-facts", args({ liveness: { kind: "none" } }));
+    expect(never).toContain("0 extracted facts");
+    expect(never).toContain("has ever completed");
+
+    const completing = extractionStallReason(
+      "no-facts",
+      args({ liveness: { kind: "at", atMs: NOW } })
+    );
+    expect(completing).toContain("Jobs ARE completing");
+    expect(completing).not.toContain("has ever completed");
+
+    const unknown = extractionStallReason("no-facts", args({ liveness: { kind: "unreadable" } }));
+    expect(unknown).toContain("could not be read");
   });
 
-  it("respects the episode threshold for the recency check too", () => {
-    // A handful of episodes on a fresh install can legitimately lag; don't flag what we can't judge.
-    expect(
-      deriveGraphExtractionStalled({ episodes: 3, facts: 1, newestEpisodeAtMs: at(0), newestFactAtMs: at(50) })
-    ).toBe(false);
+  it("no-facts offers causes without asserting that a regression occurred", () => {
+    const r = extractionStallReason("no-facts", args());
+    expect(r).toContain("none of them yet established");
+    // The old copy asserted one: "its entity-extraction worker is failing on every job".
+    expect(r).not.toContain("failing on every job");
+  });
+
+  it("never-completed names the graph-store restore AND that it does not self-heal", () => {
+    const r = extractionStallReason("never-completed", args({ facts: 4200 }));
+    expect(r).toContain("wipe or restore");
+    expect(r).toContain("PERMANENT");
+    expect(r).toContain("content hashes suppress re-pushing");
+    // It must also explain why facts can exist while nothing has completed for the items.
+    expect(r).toContain("arc corrections");
+    expect(r).toContain("4200 facts");
+  });
+
+  it("never prints a fact count it does not have — on any cause", () => {
+    for (const cause of ["no-facts", "never-completed", "stopped"] as ExtractionStallCause[]) {
+      const r = extractionStallReason(cause, args({ facts: null }));
+      expect(r, cause).not.toMatch(/holds null|null facts|holds 0 facts/);
+    }
+    expect(extractionStallReason("never-completed", args({ facts: null }))).toContain("unreadable");
+  });
+
+  it("stopped degrades to 'for some time' rather than printing 'nullh'", () => {
+    const r = extractionStallReason("stopped", args({ facts: 12, lagHours: null }));
+    expect(r).toContain("for some time");
+    expect(r).not.toContain("null");
+  });
+
+  it("no reason string leaks a group_id — the copy says 'this team's graph groups'", () => {
+    // Tier safety, pinned rather than trusted (§ Tier safety). The census table on the same card DOES
+    // render per-group rows; this is scoped to the stall copy, which has no reason to print a partition
+    // key and would be the first place one leaked into a sentence an operator screenshots.
+    const groupish = /\b[a-z0-9-]+_(team|external)\b|\bg_[0-9a-f]+_p_[0-9a-f]+\b/;
+    for (const cause of ["no-facts", "never-completed", "stopped"] as ExtractionStallCause[]) {
+      expect(extractionStallReason(cause, args({ facts: 7 })), cause).not.toMatch(groupish);
+    }
+    expect(extractionObservationNote(30)).not.toMatch(groupish);
+  });
+
+  it("the observation says what it is and does not accuse", () => {
+    const note = extractionObservationNote(30);
+    expect(note).toContain("30 items");
+    expect(note).toContain("queue depth");
+    expect(note).not.toMatch(/broken|failing|STOPPED/);
+  });
+});
+
+describe("extractionLagHours", () => {
+  it("is null unless BOTH ends are known", () => {
+    expect(extractionLagHours(null, { kind: "at", atMs: 1_000 })).toBeNull();
+    expect(extractionLagHours(1_000, { kind: "none" })).toBeNull();
+    expect(extractionLagHours(1_000, { kind: "unreadable" })).toBeNull();
+  });
+
+  it("rounds to whole hours and keeps the sign", () => {
+    expect(extractionLagHours(NOW, { kind: "at", atMs: NOW - 9 * 3_600_000 })).toBe(9);
+    // Clock skew reads negative rather than being clamped: a negative lag is healthy, and clamping
+    // would hide a clock problem rather than show it.
+    expect(extractionLagHours(NOW, { kind: "at", atMs: NOW + 3_600_000 })).toBe(-1);
   });
 });
 
@@ -186,232 +470,122 @@ describe("parseProbeTimestamp — the formats the two probes actually emit", () 
   });
 });
 
-describe("the lag budget boundary", () => {
-  // Measured on the EPISODIC clock since STALLPROBE-1 — fact age no longer accuses.
-  const base = {
-    episodes: 1243,
-    facts: 400,
-    newestEpisodeAtMs: 1_000_000_000_000,
-    newestFactAtMs: 1_000_000_000_000 - 30 * 3_600_000, // deliberately stale: must not matter
-  };
-  it("is exclusive: exactly at budget is healthy, one ms past is stalled", () => {
-    expect(
-      deriveGraphExtractionStalled({ ...base, newestEpisodicAtMs: base.newestEpisodeAtMs - EXTRACTION_LAG_BUDGET_MS })
-    ).toBe(false);
-    expect(
-      deriveGraphExtractionStalled({
-        ...base,
-        newestEpisodicAtMs: base.newestEpisodeAtMs - EXTRACTION_LAG_BUDGET_MS - 1,
-      })
-    ).toBe(true);
-  });
-
-  it("a completion NEWER than the newest episode is healthy, not negative-lag nonsense", () => {
-    expect(deriveGraphExtractionStalled({ ...base, newestEpisodicAtMs: base.newestEpisodeAtMs + 60_000 })).toBe(false);
-  });
-
-  it("an OMITTED field (tests aren't typechecked) reads as unknown, never as healthy-by-accident", () => {
-    // Pins the desired OUTCOME for an omitted field: unknown must never accuse. Stated honestly: this
-    // does NOT pin the `?? null` itself — removing that normalisation leaves this green, because
-    // `NaN > budget` is already false. The normalisation is defensive, not behavioural (see the comment
-    // at the call site), and mutation-testing it is how that was established rather than assumed.
-    const omitted = { ...base } as Parameters<typeof deriveGraphExtractionStalled>[0];
-    expect(deriveGraphExtractionStalled(omitted)).toBe(false);
-    // …and it must not suppress the zero-facts stall either.
-    expect(deriveGraphExtractionStalled({ ...omitted, facts: 0 })).toBe(true);
-  });
-});
-
 /**
- * LIVENESS IS THE EPISODE NODE (STALLPROBE-1 / AIO-876).
- *
- * The lag half used to compare the newest episode against the newest FACT, which asks "when did the
- * graph last learn something NEW?" and was read as "when did a job last FINISH?". On a mature graph
- * those diverge — prod runs 6.6 `dedupe_edges` per `extract_edges` (measured 2026-08-12), so most extracted edges resolve
- * onto an existing edge and create no `RELATES_TO` — so the clock freezes while extraction works. That
- * produced "accepting episodes but extracting 0 facts" one minute after a clean pipeline run.
- *
- * `Episodic.created_at` is the honest signal: written by `add_nodes_and_edges_bulk` (the single Neo4j
- * write, last thing a job does), it can never deduplicate, and it is wall-clock rather than backdated.
- * Two earlier designs based on the LLM spend ledger were killed in review — see the spec — so these
- * pin BOTH directions: the false positive must go, and a real outage must stay loud.
+ * THE READS, through the producer — because the discrimination this slice adds lives in the seam
+ * between a query answering and a query failing, and no pure test can reach it.
  */
-describe("deriveGraphExtractionStalled — episode-node liveness", () => {
-  const EPISODE_AT = Date.parse("2026-08-12T00:15:02Z");
-  // A LITERAL, deliberately not `MIN_EPISODES_FOR_EXTRACTION_SIGNAL * 10`. Seeding a fixture from the
-  // constant under test makes it scale with a mutation of that constant, so raising the floor would
-  // leave this whole block green — the repo's own mutation-fixture-sizing rule, caught here by review.
-  // 2347 is the real prod episode count from the 2026-08-12 incident this block reproduces.
-  const DEDUP_FROZEN = {
-    episodes: 2347,
-    facts: 113_352,
-    newestEpisodeAtMs: EPISODE_AT,
-    newestFactAtMs: EPISODE_AT - (EXTRACTION_LAG_BUDGET_MS + 3_600_000),
-  };
-
-  it("is NOT stalled when a job FINISHED recently, however old the newest fact is", () => {
-    // The reported false positive, in the shape it occurred: extraction completed 60s after the
-    // episode was projected and every new edge deduplicated.
-    expect(
-      deriveGraphExtractionStalled({ ...DEDUP_FROZEN, newestEpisodicAtMs: EPISODE_AT + 60_000 })
-    ).toBe(false);
+describe("readExtractionSignals — 'found nothing' vs 'could not read'", () => {
+  const ledgerRow = (over: Record<string, unknown> = {}) => ({
+    rows: [
+      {
+        items: 30,
+        first_seen_at: new Date(NOW - 86_400_000).toISOString(),
+        newest_push_at: new Date(NOW - 60_000).toISOString(),
+        groups: ["acme_team"],
+        ...over,
+      },
+    ],
   });
 
-  it("IS stalled when episodes are pushed and NO job completes — the real outage", () => {
-    // The direction that must not be weakened. This now covers the whole pipeline including the Neo4j
-    // write, which both rejected ledger designs left uncovered.
-    expect(
-      deriveGraphExtractionStalled({
-        ...DEDUP_FROZEN,
-        newestEpisodicAtMs: EPISODE_AT - (EXTRACTION_LAG_BUDGET_MS + 1),
-      })
-    ).toBe(true);
+  beforeEach(() => {
+    vi.mocked(neo4jConfigured).mockReturnValue(true);
+    vi.mocked(runSql).mockReset();
+    vi.mocked(runRead).mockReset();
   });
 
-  it("is exclusive at the budget: exactly at it is healthy, one ms past is stalled", () => {
-    const at = (d: number) => deriveGraphExtractionStalled({ ...DEDUP_FROZEN, newestEpisodicAtMs: EPISODE_AT - d });
-    expect(at(EXTRACTION_LAG_BUDGET_MS)).toBe(false);
-    expect(at(EXTRACTION_LAG_BUDGET_MS + 1)).toBe(true);
-  });
-
-  it("zero facts outranks liveness — a completing extractor producing nothing is still broken", () => {
-    expect(
-      deriveGraphExtractionStalled({
-        episodes: 2347,
-        facts: 0,
-        newestEpisodeAtMs: EPISODE_AT,
-        newestFactAtMs: null,
-        newestEpisodicAtMs: EPISODE_AT + 60_000,
-      })
-    ).toBe(true);
-  });
-
-  it("an unknown episodic timestamp never manufactures a stall", () => {
-    // Neo4j unreadable/unconfigured. A different leg owns reachability; "don't know" must not accuse.
-    expect(deriveGraphExtractionStalled({ ...DEDUP_FROZEN, newestEpisodicAtMs: null })).toBe(false);
-  });
-
-  it("…but an unknown episodic timestamp does NOT suppress the zero-facts stall", () => {
-    expect(
-      deriveGraphExtractionStalled({
-        episodes: 2347,
-        facts: 0,
-        newestEpisodeAtMs: EPISODE_AT,
-        newestFactAtMs: null,
-        newestEpisodicAtMs: null,
-      })
-    ).toBe(true);
-  });
-
-  it("FACT AGE ALONE CAN NO LONGER ACCUSE — the whole point of the change", () => {
-    // The control that would have caught the original bug. Facts arbitrarily stale, jobs completing.
-    expect(
-      deriveGraphExtractionStalled({
-        ...DEDUP_FROZEN,
-        newestFactAtMs: EPISODE_AT - 30 * 86_400_000,
-        newestEpisodicAtMs: EPISODE_AT,
-      })
-    ).toBe(false);
-  });
-});
-
-/**
- * WHICH stall, and what its sentence may claim (STALLPROBE-1, found by review).
- *
- * Before this slice both causes were one hard-coded sentence — "accepting episodes but extracting 0
- * facts" — because a stall only ever meant `facts === 0`. Liveness stalls fire with facts ≫ 0 (prod
- * holds 113,352), so that sentence became a claim contradicted by the very card printing it, ON THE
- * TRUE-POSITIVE PATH: the one an operator has to believe. These pin the split so no surface can
- * regress to composing its own copy.
- */
-describe("extractionStallCause / extractionStallReason", () => {
-  it("is null when nothing is stalled — no cause, no sentence", () => {
-    expect(extractionStallCause(false, 0)).toBeNull();
-    expect(extractionStallCause(false, 113_352)).toBeNull();
-  });
-
-  it("says never-extracted ONLY for zero facts, and stopped for every other count", () => {
-    expect(extractionStallCause(true, 0)).toBe("never-extracted");
-    expect(extractionStallCause(true, 1)).toBe("stopped");
-    expect(extractionStallCause(true, 113_352)).toBe("stopped");
-    // Unknown fact count is NOT zero facts. `facts === null` means Neo4j was unreadable, and
-    // "don't know" must never be upgraded into the stronger of the two accusations.
-    expect(extractionStallCause(true, null)).toBe("stopped");
-  });
-
-  it("the STOPPED sentence never claims zero facts, and names the real count", () => {
-    const reason = extractionStallReason("stopped", {
-      episodes: 2347,
-      facts: 113_352,
-      lagHours: 9,
+  it("reads the ledger in ONE statement — the property the dm tier cannot observe", () => {
+    // Two concurrent reads (a count and a distinct-group scan) could return `items > 0` with
+    // `groups: []`: a team that looks pushed-but-unscoped, which is exactly the shape that decides
+    // whether an absence of graph evidence may accuse. Spied here because a data-mechanics test sees
+    // only results, and four sequential queries return the same fixture as one.
+    vi.mocked(runSql).mockResolvedValue(ledgerRow() as never);
+    vi.mocked(runRead).mockResolvedValue([{ n: 5, at: null }] as never);
+    return readExtractionSignals("t1", NOW).then(() => {
+      expect(vi.mocked(runSql)).toHaveBeenCalledTimes(1);
+      const sqlText = String(vi.mocked(runSql).mock.calls[0]?.[0]);
+      expect(sqlText).toContain("count(distinct (source_table, source_id))");
+      expect(sqlText).toContain("min(first_seen_at)");
+      expect(sqlText).toContain("max(projected_at)");
+      expect(sqlText).toContain("array_agg(distinct group_id)");
+      expect(sqlText).toContain("content_sha256 <> ''");
     });
-    expect(reason).toContain("113352");
-    expect(reason).toContain("about 9h");
-    // The regression this test exists for: the never-extracted copy leaking onto the liveness path.
-    expect(reason).not.toContain("0 extracted facts");
-    expect(reason).not.toMatch(/failing on every job/);
   });
 
-  it("the NEVER-EXTRACTED sentence is the one allowed to say zero facts", () => {
-    const reason = extractionStallReason("never-extracted", {
-      episodes: 2347,
-      facts: 0,
-      lagHours: null,
-    });
-    expect(reason).toContain("0 extracted facts");
-    expect(reason).toContain("2347 episodes");
+  it("a graph read that ANSWERS with no rows is `none`, and it can accuse", async () => {
+    vi.mocked(runSql).mockResolvedValue(
+      ledgerRow({ first_seen_at: new Date(NOW - LANDED_GRACE_MS - 1000).toISOString() }) as never
+    );
+    // facts: a real 0; liveness + worker: `max()` over an empty set.
+    vi.mocked(runRead).mockResolvedValue([{ n: 0, at: null }] as never);
+    const reading = await readExtractionSignals("t1", NOW);
+    expect(reading.signals.liveness).toEqual({ kind: "none" });
+    expect(reading.signals.facts).toBe(0);
+    expect(reading.verdict).toEqual({ stalled: true, cause: "no-facts", observed: null });
+    expect(reading.reason).toContain("0 extracted facts");
   });
 
-  it("degrades an UNKNOWN fact count to prose, not to a measured-looking zero", () => {
-    // `facts === null` is "Neo4j unreadable", not "zero facts". Printing "holds 0 facts from before"
-    // in the one sentence an operator acts on is this file's own banned pattern. Unreachable from
-    // production today (the predicate returns false on null facts) — pinned because the function is
-    // exported and the next caller is free to reach it.
-    const reason = extractionStallReason("stopped", { episodes: 30, facts: null, lagHours: 7 });
-    expect(reason).not.toMatch(/holds 0 facts/);
-    expect(reason).toContain("currently unreadable");
+  it("a graph read that THROWS is `unreadable`, and it cannot", async () => {
+    vi.mocked(runSql).mockResolvedValue(
+      ledgerRow({ first_seen_at: new Date(NOW - LANDED_GRACE_MS - 1000).toISOString() }) as never
+    );
+    vi.mocked(runRead).mockRejectedValue(new Error("neo4j: connection acquisition timed out"));
+    const reading = await readExtractionSignals("t1", NOW);
+    expect(reading.signals.liveness).toEqual({ kind: "unreadable" });
+    expect(reading.signals.facts).toBeNull();
+    expect(reading.verdict.stalled).toBe(false);
+    expect(reading.reason).toBeNull();
   });
 
-  it("degrades a null lag to prose instead of printing 'nullh'", () => {
-    // A rendered `null` is the class of defect this file's own header calls out: a number on a card
-    // with no way to tell it apart from a measurement.
-    const reason = extractionStallReason("stopped", { episodes: 10, facts: 5, lagHours: null });
-    expect(reason).toContain("for some time");
-    expect(reason).not.toContain("null");
+  it("NO SCOPE ⇒ no graph query is issued at all, and nothing accuses", async () => {
+    // An `IN []` match returns a genuine `0`, which would read as a proven-empty graph. The team-scoped
+    // reads must not run; the GLOBAL worker read still may, since it has no scope to lack.
+    vi.mocked(runSql).mockResolvedValue({ rows: [{ items: 0, first_seen_at: null, newest_push_at: null, groups: null }] } as never);
+    vi.mocked(runRead).mockResolvedValue([{ at: null }] as never);
+    const reading = await readExtractionSignals("t1", NOW);
+    expect(reading.signals.items).toBe(0);
+    expect(reading.signals.facts).toBeNull();
+    expect(reading.signals.liveness).toEqual({ kind: "unreadable" });
+    // exactly one Neo4j call: the un-scoped worker clock
+    expect(vi.mocked(runRead)).toHaveBeenCalledTimes(1);
+    expect(String(vi.mocked(runRead).mock.calls[0]?.[0])).toContain("(w:Episodic)");
+    expect(reading.verdict.stalled).toBe(false);
   });
-});
 
-describe("extractionLagHours", () => {
-  it("is null when either end is unknown — never a 0 that reads as 'no lag'", () => {
-    expect(extractionLagHours(null, 1_000)).toBeNull();
-    expect(extractionLagHours(1_000, null)).toBeNull();
-    expect(extractionLagHours(null, null)).toBeNull();
+  it("an unreadable LEDGER reports items null, never 0 — a zero here would read as a measurement", async () => {
+    vi.mocked(runSql).mockRejectedValue(new Error("pg: terminating connection"));
+    vi.mocked(runRead).mockResolvedValue([{ at: null }] as never);
+    const reading = await readExtractionSignals("t1", NOW);
+    expect(reading.signals.items).toBeNull();
+    expect(reading.verdict.stalled).toBe(false);
   });
 
-  it("rounds the episode-to-completion gap to hours", () => {
-    const now = Date.parse("2026-08-12T12:00:00Z");
-    expect(extractionLagHours(now, now - 9 * 3_600_000)).toBe(9);
-    // A completion NEWER than the newest episode is negative, not clamped — the predicate already
-    // treats it as healthy, and clamping here would hide a clock-skew problem rather than show it.
-    expect(extractionLagHours(now, now + 3_600_000)).toBe(-1);
+  it("an unconfigured graph issues no Neo4j read and stays quiet", async () => {
+    vi.mocked(neo4jConfigured).mockReturnValue(false);
+    vi.mocked(runSql).mockResolvedValue(ledgerRow() as never);
+    const reading = await readExtractionSignals("t1", NOW);
+    expect(vi.mocked(runRead)).not.toHaveBeenCalled();
+    expect(reading.signals.liveness).toEqual({ kind: "unreadable" });
+    expect(reading.verdict.stalled).toBe(false);
+  });
+
+  it("an unparseable stamp is `unreadable`, not a fabricated instant", async () => {
+    vi.mocked(runSql).mockResolvedValue(ledgerRow() as never);
+    vi.mocked(runRead).mockResolvedValue([{ n: 3, at: "2026-07-28T12:34:56+01:00[Europe/London]" }] as never);
+    const reading = await readExtractionSignals("t1", NOW);
+    expect(reading.signals.liveness).toEqual({ kind: "unreadable" });
   });
 });
 
 /**
  * THE LIVENESS READ'S POPULATION (STALLPROBE-1, round-4 review).
  *
- * `newestEpisodicAtMs` is SUBTRACTED FROM `newestEpisodeAtMs`, so the two must count the same
+ * The team-scoped liveness is SUBTRACTED FROM the newest push, so the two must count the same
  * episodes. Two review rounds found two ways they did not:
  *   • by GROUP — a global read let another team's completed job refresh this team's clock;
  *   • by KIND — a group-scoped read still counted `correction:<arc_id>` episodes, which
  *     `lib/graph/arcs.ts` POSTs into the same team group with NO `graph_episodes` row. An admin
  *     recomputing an arc mid-outage would have refreshed the clock and silenced the alarm for the
  *     whole 6h budget while every item episode was failing.
- *
- * The Cypher is IO, so what is pinned here is the contract the query has to honour: the prefix
- * constant is shared with the projector's own naming, and it is a POSITIVE match (only `items:`
- * counts) rather than a `correction:` denylist, so the next non-ledger episode kind is excluded by
- * default instead of needing someone to remember a new rule.
  */
 describe("the liveness read counts ledger-backed item episodes only", () => {
   it("shares its prefix with the projector's episode names — one constant, not two literals", () => {
@@ -420,9 +594,7 @@ describe("the liveness read counts ledger-backed item episodes only", () => {
   });
 
   it("excludes the arc-correction writeback, which has no ledger row behind it", () => {
-    // The exact name `lib/graph/arcs.ts` POSTs. It must NOT match the liveness prefix.
     expect(`correction:${"arc-8144f88eb1"}`.startsWith(ITEM_EPISODE_PREFIX)).toBe(false);
-    // …and the projector's names must, or the probe would go permanently silent instead.
     expect(episodeName("i1", 0, 1).startsWith(ITEM_EPISODE_PREFIX)).toBe(true);
     expect(episodeName("i1", 1, 3).startsWith(ITEM_EPISODE_PREFIX)).toBe(true);
   });
@@ -442,5 +614,20 @@ describe("the liveness read counts ledger-backed item episodes only", () => {
     const query = src.slice(start, src.indexOf('"', start + 1) + 1);
     expect(query).toContain("e.group_id IN $g");
     expect(query).toContain("e.name STARTS WITH $p");
+  });
+
+  it("the GLOBAL worker query is a different literal — un-scoped on purpose, and unmistakably so", () => {
+    // STALLSCOPE-1 re-introduces the un-scoped read STALLPROBE-1 deleted, for a different job: it can
+    // only SUPPRESS an alarm, never make one. Pinned separately (a distinct alias) so the scoped
+    // query's own guard above cannot accidentally anchor on it and pass for the wrong reason.
+    const src = readFileSync(
+      path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "lib", "graph", "extraction-health.ts"),
+      "utf8"
+    );
+    const start = src.indexOf('"MATCH (w:Episodic)');
+    expect(start, "the worker-liveness query literal is gone or was renamed").toBeGreaterThan(-1);
+    const query = src.slice(start, src.indexOf('"', start + 1) + 1);
+    expect(query).not.toContain("group_id");
+    expect(query).toContain("max(w.created_at)");
   });
 });

@@ -4,6 +4,7 @@ import type {
   LegState,
   GroupCensusSummary,
 } from "@/lib/query/retrieval-health";
+import type { ExtractionStallCause } from "@/lib/graph/extraction-health";
 import type { LlmHealthState } from "@/lib/query/llm-health";
 import { timeAgo } from "@/components/format";
 
@@ -125,18 +126,27 @@ export function RetrievalHealthCard({ health }: { health: RetrievalHealth }) {
   // pipeline banner cannot drift apart again.
   const graphExtractionStalled = health.graphExtractionStalled;
   const graphFreshness =
-    health.graphEpisodes != null
-      ? `${health.graphEpisodes} episodes${health.graphLastProjectedAt ? ` · last projected ${timeAgo(health.graphLastProjectedAt)}` : " · none projected yet"}`
+    health.graphItems != null
+      ? `${health.graphItems} items${health.graphLastProjectedAt ? ` · last projected ${timeAgo(health.graphLastProjectedAt)}` : " · none projected yet"}`
       : undefined;
-  // The short leg text for a stall, matched to the cause. Never "0 facts" unless facts really are 0.
-  const graphStallDetail =
-    health.graphExtractionCause === "never-extracted"
-      ? `accepting episodes but extracting 0 facts — ${graphFreshness}`
-      : // The MEASURED lag, not the budget constant. An earlier draft hard-coded "over 6h", which
-        // silently drifts if `EXTRACTION_LAG_BUDGET_MS` changes (review). Importing the constant here
-        // would drag a `server-only` module into a component, so the server passes the real number —
-        // which is more use to an operator than the threshold anyway.
-        `no extraction has completed in ${health.graphExtractionLagHours === null ? "longer than the alarm budget" : `~${health.graphExtractionLagHours}h`} — ${graphFreshness}`;
+  // The short leg text for a stall, matched to the cause — a TOTAL map over the cause union, not an
+  // if/else with a default (STALLSCOPE-1). The default branch is what let this card assert "0 facts"
+  // about a liveness stall before STALLPROBE-1; typed as `Record<ExtractionStallCause, …>`, a fourth
+  // cause fails the build instead of silently inheriting the `stopped` wording.
+  //
+  // The MEASURED lag, not the budget constant. An earlier draft hard-coded "over 6h", which silently
+  // drifts if `EXTRACTION_LAG_BUDGET_MS` changes (review). Importing the constant here would drag a
+  // `server-only` module into a component, so the server passes the real number — which is more use to
+  // an operator than the threshold anyway.
+  const lagText =
+    health.graphExtractionLagHours === null
+      ? "longer than the alarm budget"
+      : `~${health.graphExtractionLagHours}h`;
+  const graphStallDetail: Record<ExtractionStallCause, string> = {
+    "no-facts": `0 extracted facts in this team's graph groups — ${graphFreshness}`,
+    "never-completed": `no extraction has ever completed for this team — ${graphFreshness}`,
+    stopped: `no extraction has completed in ${lagText} — ${graphFreshness}`,
+  };
   // Extraction failing the OTHER way (AIO-693, census signal since ALARMFIX-1): episodes become
   // facts, but a group is accumulating same-name entity splits over its own baseline — identity is
   // being resolved badly. A stall outranks it in the copy below, same priority as the server's
@@ -145,8 +155,8 @@ export function RetrievalHealthCard({ health }: { health: RetrievalHealth }) {
   const graphDetail =
     health.graph === "off"
       ? "not configured"
-      : graphExtractionStalled
-        ? graphStallDetail
+      : graphExtractionStalled && health.graphExtractionCause !== null
+        ? graphStallDetail[health.graphExtractionCause]
         : graphCensusPolluted
           ? `same-name entity splits above this graph's own baseline — ${graphFreshness}`
           : graphStalled
@@ -244,6 +254,16 @@ export function RetrievalHealthCard({ health }: { health: RetrievalHealth }) {
         <p className="mt-2 rounded-lg border border-amber-400/30 bg-amber-400/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
           <strong>Graph extraction can&apos;t use the configured model.</strong>{" "}
           {health.graphProxyRefusal}
+        </p>
+      ) : null}
+      {/* The SUPPRESSED zero-evidence state (STALLSCOPE-1 §2e): this team has no completed extraction,
+          but the graph worker is provably completing other groups' work, so the honest reading is queue
+          depth rather than failure. Neutral, not red, and it never reaches the pipeline banner — but it
+          IS rendered, because an alarm that quietly declines to fire is how the census alarm sat dead
+          for weeks (ALARMFIX-1). Composed server-side, like every other sentence on this card. */}
+      {health.graphExtractionNote ? (
+        <p className="mt-2 rounded-lg border border-neutral-400/30 bg-neutral-400/10 px-3 py-2 text-xs text-neutral-700 dark:text-neutral-300">
+          {health.graphExtractionNote}
         </p>
       ) : null}
       {graphDegraded ? (
