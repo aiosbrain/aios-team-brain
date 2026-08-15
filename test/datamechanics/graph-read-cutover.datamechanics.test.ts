@@ -111,14 +111,17 @@ describe("PCCC-6 — enforced partition selection", () => {
     for (const init of [a, b]) await landGroup(seed, init.group);
     // Recency comes from the PARTITION's latest real push (review High 4b: last_synced_at is
     // ingest-only and perpetually null for initiatives — seeding it proved the sort, not the
-    // feature). Age group A's ledger rows; keep B's fresh.
-    await runSql("update graph_episodes set projected_at = now() - interval '30 days' where team_id = $1 and group_id = $2", [seed.teamId, a.group]);
+    // feature). The FRESH partition is deliberately the lexicographically-LAST group, so the
+    // sort's deterministic tiebreak (group id) points the WRONG way — only real recency ranking
+    // can pick it (a muted-recency mutant survived a coin-flip version of this fixture).
+    const [lexFirst, lexLast] = [a, b].sort((x, y) => x.group.localeCompare(y.group));
+    await runSql("update graph_episodes set projected_at = now() - interval '30 days' where team_id = $1 and group_id = $2", [seed.teamId, lexFirst.group]);
 
     const ids = await visibleIds(seed, [a.projectId, b.projectId]);
     const scope = await selectEnforcedGraphPartitions(db(), { teamId: seed.teamId, visibleProjectIds: ids, k: 2 });
     expect(scope.groups).toContain(`${seed.teamSlug}_team`); // General survives every cap
-    expect(scope.groups).toContain(b.group); // most recent wins the remaining slot
-    expect(scope.groups).not.toContain(a.group);
+    expect(scope.groups).toContain(lexLast.group); // most recent wins — against the tiebreak's pull
+    expect(scope.groups).not.toContain(lexFirst.group);
     expect(scope.covered).toBe(2);
     expect(scope.total).toBe(ids.length);
   });
