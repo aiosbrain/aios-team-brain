@@ -117,26 +117,25 @@ export function RetrievalHealthCard({ health }: { health: RetrievalHealth }) {
   const graphStalled = health.graphStalled;
   // Reachable + writing episodes, but Graphiti isn't turning them into a finished job. A distinct,
   // more specific cause than a stalled projector, so it gets its own detail + banner and takes
-  // priority. TWO causes, and they make different factual claims — `never-extracted` may say "0
-  // facts", `stopped` may NOT: after STALLPROBE-1 a liveness stall fires with facts ≫ 0 (prod holds
-  // 113,352), so the old single hard-coded sentence would have asserted "extracting 0 facts" beside
-  // this card's own fact count. The server owns both the discriminator and the sentence
-  // (`lib/graph/extraction-health.extractionStallCause`/`extractionStallReason`) so this card and the
-  // pipeline banner cannot drift apart again.
+  // priority. THREE causes now (STALLSCOPE-1), and they make different factual claims — only
+  // `no-facts` may say "0 facts", and `no-completion-visible` may not assert a dead worker. After
+  // STALLPROBE-1 a liveness stall fires with facts >> 0 (prod holds 113,352), so the old single
+  // hard-coded sentence asserted "extracting 0 facts" beside this card's own fact count. The server
+  // owns the discriminator AND both sentences (`extractionStallShortText`/`extractionStallReason`),
+  // so this card and the pipeline banner cannot drift apart again.
   const graphExtractionStalled = health.graphExtractionStalled;
   const graphFreshness =
-    health.graphEpisodes != null
-      ? `${health.graphEpisodes} episodes${health.graphLastProjectedAt ? ` · last projected ${timeAgo(health.graphLastProjectedAt)}` : " · none projected yet"}`
+    health.graphItems != null
+      ? `${health.graphItems} items${health.graphLastProjectedAt ? ` · last projected ${timeAgo(health.graphLastProjectedAt)}` : " · none projected yet"}`
       : undefined;
-  // The short leg text for a stall, matched to the cause. Never "0 facts" unless facts really are 0.
+  // The short leg text for a stall comes from the SERVER, matched to the cause — this card composes
+  // no claim about extraction at all now. It used to hard-code the never-extracted wording for both
+  // causes, so a liveness stall asserted "extracting 0 facts" beside this card's own fact count. What
+  // is left here is formatting: the freshness suffix.
   const graphStallDetail =
-    health.graphExtractionCause === "never-extracted"
-      ? `accepting episodes but extracting 0 facts — ${graphFreshness}`
-      : // The MEASURED lag, not the budget constant. An earlier draft hard-coded "over 6h", which
-        // silently drifts if `EXTRACTION_LAG_BUDGET_MS` changes (review). Importing the constant here
-        // would drag a `server-only` module into a component, so the server passes the real number —
-        // which is more use to an operator than the threshold anyway.
-        `no extraction has completed in ${health.graphExtractionLagHours === null ? "longer than the alarm budget" : `~${health.graphExtractionLagHours}h`} — ${graphFreshness}`;
+    health.graphExtractionShortText === null
+      ? undefined
+      : `${health.graphExtractionShortText} — ${graphFreshness}`;
   // Extraction failing the OTHER way (AIO-693, census signal since ALARMFIX-1): episodes become
   // facts, but a group is accumulating same-name entity splits over its own baseline — identity is
   // being resolved badly. A stall outranks it in the copy below, same priority as the server's
@@ -145,7 +144,7 @@ export function RetrievalHealthCard({ health }: { health: RetrievalHealth }) {
   const graphDetail =
     health.graph === "off"
       ? "not configured"
-      : graphExtractionStalled
+      : graphExtractionStalled && graphStallDetail !== undefined
         ? graphStallDetail
         : graphCensusPolluted
           ? `same-name entity splits above this graph's own baseline — ${graphFreshness}`
@@ -244,6 +243,16 @@ export function RetrievalHealthCard({ health }: { health: RetrievalHealth }) {
         <p className="mt-2 rounded-lg border border-amber-400/30 bg-amber-400/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
           <strong>Graph extraction can&apos;t use the configured model.</strong>{" "}
           {health.graphProxyRefusal}
+        </p>
+      ) : null}
+      {/* The SUPPRESSED zero-evidence state (STALLSCOPE-1 §2e): this team has no completed extraction,
+          but the graph worker is provably completing other groups' work, so the honest reading is queue
+          depth rather than failure. Neutral, not red, and it never reaches the pipeline banner — but it
+          IS rendered, because an alarm that quietly declines to fire is how the census alarm sat dead
+          for weeks (ALARMFIX-1). Composed server-side, like every other sentence on this card. */}
+      {health.graphExtractionNote ? (
+        <p className="mt-2 rounded-lg border border-neutral-400/30 bg-neutral-400/10 px-3 py-2 text-xs text-neutral-700 dark:text-neutral-300">
+          {health.graphExtractionNote}
         </p>
       ) : null}
       {graphDegraded ? (

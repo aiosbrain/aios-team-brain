@@ -1,0 +1,21 @@
+-- STALLSCOPE-1 (docs/design/graph-stall-team-scope.md §2d): the stall probe's age gate needs a
+-- SET-ONCE clock, and `graph_episodes` has none.
+--
+-- `projected_at` is LAST-touched — every content re-push bumps it (lib/graph/project.ts, and the
+-- column's own comment in schema.sql says so) — so `min(projected_at)` is not "when this team started
+-- pushing". Gating the zero-evidence accusations on it breaks in both directions: a re-pushed corpus
+-- keeps the minimum inside the grace window and silences a dead-from-birth extractor indefinitely.
+--
+-- `first_seen_at` is written by the row-creating INSERT (the reserve-before-push reservation, PCCC-3)
+-- and by nothing else: no upsert, no group-move UPDATE names it, so `ON CONFLICT DO UPDATE SET` — which
+-- lists only the keys a payload provides (lib/db/pg/query-builder.ts) — cannot move it. Under
+-- reserve-before-push this is when the projector first created the row, NOT when a push was first
+-- accepted; if graphiti is down at install time the reservation stands while pushes fail, so the value
+-- can predate the first accepted push. That errs toward judging sooner, and no rendered copy quotes it
+-- as a "projected at" time.
+--
+-- Replay-safe: `add column if not exists`, and the default applies to existing rows as the MIGRATION
+-- instant (Postgres 11+ fast default — no table rewrite). Backfilled rows therefore read as "just
+-- seen" for one grace window after this deploy, which suppresses only the zero-evidence branches; the
+-- lag branch is never gated, so a real stall stays reportable through that window.
+alter table graph_episodes add column if not exists first_seen_at timestamptz not null default now();

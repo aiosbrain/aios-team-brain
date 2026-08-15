@@ -2391,7 +2391,14 @@ create table if not exists graph_episodes (
   -- PCCC-5: extraction deliberately WITHHELD for a cold initiative (distinct from the '' sentinel's
   -- three meanings). Reconcile ignores deferred rows; arming (PCCC-6) flips this false and the
   -- projector pushes under its fan-out budget. Sole writer: lib/graph/project.
-  deferred boolean not null default false
+  deferred boolean not null default false,
+  -- SET-ONCE (STALLSCOPE-1, migration 20260816090000): when the projector first CREATED this row —
+  -- the reserve-before-push reservation, not the first accepted push. `projected_at` above is
+  -- last-touched and moves on every re-push, so it cannot answer "how long has this team been
+  -- trying"; the stall probe's age gate reads this one. Written by the row-creating INSERT only: no
+  -- upsert or UPDATE payload names it, so ON CONFLICT DO UPDATE (which sets only provided keys)
+  -- leaves it alone. Guarded by test/guards/graph-episodes-first-seen-migration.test.ts.
+  first_seen_at timestamptz not null default now()
   -- The one-row-per-item NARROW unique that used to live here was dropped by PCCC-4/Deploy B
   -- (migration 20260815150000): identity is per-(item, group) via graph_episodes_item_group_key
   -- below, and an item may hold one ledger row PER GROUP (PCCC-5 fan-out's substrate).

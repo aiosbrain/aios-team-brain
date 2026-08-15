@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { projectItemsToGraph } from "@/lib/graph/project";
 import { runGraphProjection } from "@/lib/graph/run";
 import { episodeGroupId } from "@/lib/graph/group";
-import { countProjectedEpisodes } from "@/lib/graph/extraction-health";
+import { readExtractionSignals } from "@/lib/graph/extraction-health";
 import { runSql } from "@/lib/db/pg/pool";
 import { db, ingest, seedTeam, sha } from "./helpers";
 import { FakeGraphiti, client } from "./fake-graphiti";
@@ -412,6 +412,10 @@ describe("PCCC-3 — consumers count ITEMS, not (item, group) rows", () => {
     expect((await mk(itemA, `g_${"a".repeat(32)}_p_${"b".repeat(32)}`)).error).toBeNull();
     expect((await mk(itemB, episodeGroupId(seed.teamSlug, "team"))).error).toBeNull();
 
-    expect(await countProjectedEpisodes(seed.teamId)).toBe(2); // items, not the 3 rows
+    // STALLSCOPE-1 folded the ledger reads into one producer (`readExtractionSignals`), so this
+    // property now enters through the same path production uses. The claim is unchanged: consumers
+    // count ITEMS, not (item, group) rows.
+    const { signals } = await readExtractionSignals(seed.teamId);
+    expect(signals.items).toBe(2); // items, not the 3 rows
   });
 });

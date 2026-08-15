@@ -1269,7 +1269,7 @@ export async function projectItemsToGraph(
       }
     }
 
-    // A pass that POSTed nothing must not claim it pushed: `extraction-health.newestEpisodeAtMs` reads
+    // A pass that POSTed nothing must not claim it pushed: `extraction-health`'s ledger read (`newestPushAtMs`) reads
     // `max(projected_at) where content_sha256 <> ''` as "when did we last actually send an episode",
     // discriminating the existing bump-without-POST paths only by their `''` sentinel. A delta pass
     // writes a REAL digest, so bumping the timestamp here would be a third such path that the sentinel
