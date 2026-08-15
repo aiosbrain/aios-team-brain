@@ -109,8 +109,10 @@ describe("PCCC-6 — enforced partition selection", () => {
     }
     await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: seed.teamSlug, client: client(new FakeGraphiti()) });
     for (const init of [a, b]) await landGroup(seed, init.group);
-    await runSql("update projects set last_synced_at = now() where id = $1", [b.projectId]);
-    await runSql("update projects set last_synced_at = now() - interval '30 days' where id = $1", [a.projectId]);
+    // Recency comes from the PARTITION's latest real push (review High 4b: last_synced_at is
+    // ingest-only and perpetually null for initiatives — seeding it proved the sort, not the
+    // feature). Age group A's ledger rows; keep B's fresh.
+    await runSql("update graph_episodes set projected_at = now() - interval '30 days' where team_id = $1 and group_id = $2", [seed.teamId, a.group]);
 
     const ids = await visibleIds(seed, [a.projectId, b.projectId]);
     const scope = await selectEnforcedGraphPartitions(db(), { teamId: seed.teamId, visibleProjectIds: ids, k: 2 });
@@ -119,6 +121,26 @@ describe("PCCC-6 — enforced partition selection", () => {
     expect(scope.groups).not.toContain(a.group);
     expect(scope.covered).toBe(2);
     expect(scope.total).toBe(ids.length);
+  });
+
+  it("SOURCE projects never enter the selection — their minted partitions are empty by construction (review High 4a)", async () => {
+    const seed = await seedTeam();
+    expect((await ensureAccessBootstrap(db(), seed.teamId)).ok).toBe(true);
+    // A pointered, freshly-synced source project (the ingest path creates these for every push).
+    const r = await ingest(seed, { body: "source content", path: "s.md", access: "team", project: "src-proj" });
+    expect(r.id).toBeTruthy();
+    const { data: src } = await db()
+      .from("projects").select("id, graph_group_id").eq("team_id", seed.teamId).eq("slug", "src-proj").single();
+    const srcRow = src as { id: string; graph_group_id: string };
+    expect(srcRow.graph_group_id).toBeTruthy();
+
+    const scope = await selectEnforcedGraphPartitions(db(), {
+      teamId: seed.teamId,
+      visibleProjectIds: await visibleIds(seed, [srcRow.id]),
+      k: 2,
+    });
+    expect(scope.groups).not.toContain(srcRow.graph_group_id); // an empty partition can't spend a K slot
+    expect(scope.total).toBe(2); // and can't inflate the disclosure denominator (the two built-ins)
   });
 
   it("arm:false (the permissive union path) reads ready partitions without arming anything", async () => {

@@ -2,6 +2,7 @@ import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { armProjectsForPrincipal, readyPartitions } from "./arming";
 import { resolvePositiveInt } from "@/lib/util/env";
+import { runSql } from "@/lib/db/pg/pool";
 
 /**
  * The enforced team-tier graph READ set (PCCC-6, design §2.3 + spec's expansion budget): which
@@ -41,14 +42,22 @@ export async function selectEnforcedGraphPartitions(
 
   const { data, error } = await db
     .from("projects")
-    .select("id, slug, kind, graph_group_id, last_synced_at")
+    .select("id, slug, kind, graph_group_id")
     .eq("team_id", args.teamId)
     .in("id", [...args.visibleProjectIds])
-    .not("graph_group_id", "is", null);
+    .not("graph_group_id", "is", null)
+    // ONLY the two system built-ins and initiatives have graph partitions with content behind
+    // them (review High 4a): a SOURCE project's minted partition is empty BY CONSTRUCTION —
+    // fan-out targets initiatives, source items home to the tier groups — so admitting them as
+    // "always ready" would fill the K-cap with empty partitions and evict the ready initiatives
+    // holding restriction-moved content.
+    .in("kind", ["system", "initiative"]);
   if (error) throw new Error(`partition read: project load failed: ${error.message}`);
-  type Row = { id: string; slug: string; kind: string; graph_group_id: string; last_synced_at: string | Date | null };
+  type Row = { id: string; slug: string; kind: string; graph_group_id: string };
   const projects = (data ?? []) as Row[];
-  const total = args.visibleProjectIds.length;
+  // The disclosure denominator counts only COVERABLE projects — a source project can never be
+  // covered, and counting it would systematically understate coverage (review Low 12).
+  const total = projects.length;
 
   const initiatives = projects.filter((p) => p.kind === "initiative");
   // arm defaults ON (an enforcing principal read IS the arming trigger); the permissive union path
@@ -67,12 +76,28 @@ export async function selectEnforcedGraphPartitions(
     return state.ready.has(p.id);
   });
 
-  // General FIRST and always (spec), then recency prior. Deterministic tiebreak by group id.
-  const ts = (v: string | Date | null): number => (v ? new Date(v).getTime() : 0);
+  // General FIRST and always (spec), then the recency prior — from the PARTITION's own latest
+  // real push (max projected_at over sha<>'' ledger rows), because projects.last_synced_at is
+  // written only by the INGEST upsert and is perpetually null for initiatives — ranking on it
+  // made the router inert for exactly the population it exists to rank (review High 4b).
+  // Deterministic tiebreak by group id.
+  const recency = new Map<string, number>();
+  if (eligible.length > 0) {
+    const rec = await runSql<{ group_id: string; mx: string | null }>(
+      `select group_id, max(projected_at) filter (where content_sha256 <> '') as mx
+         from graph_episodes where team_id = $1 and group_id = any($2) group by group_id`,
+      [args.teamId, eligible.map((p) => p.graph_group_id)]
+    );
+    for (const r of rec.rows) recency.set(r.group_id, r.mx ? new Date(r.mx).getTime() : 0);
+  }
   const general = eligible.filter((p) => p.kind === "system" && p.slug === "general");
   const rest = eligible
     .filter((p) => !(p.kind === "system" && p.slug === "general"))
-    .sort((a, b) => ts(b.last_synced_at) - ts(a.last_synced_at) || a.graph_group_id.localeCompare(b.graph_group_id));
+    .sort(
+      (a, b) =>
+        (recency.get(b.graph_group_id) ?? 0) - (recency.get(a.graph_group_id) ?? 0) ||
+        a.graph_group_id.localeCompare(b.graph_group_id)
+    );
   const picked = [...general, ...rest].slice(0, Math.max(1, k));
 
   return { groups: picked.map((p) => p.graph_group_id), covered: picked.length, total };

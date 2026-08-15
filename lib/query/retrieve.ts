@@ -152,7 +152,10 @@ async function fetchGraphFacts(
     if (tier === "team") {
       const { data: projRows } = await db.from("projects").select("id").eq("team_id", teamId);
       const allIds = ((projRows ?? []) as { id: string }[]).map((p) => p.id);
-      const scope = await selectEnforcedGraphPartitions(db, { teamId, visibleProjectIds: allIds, arm: false });
+      // UNCAPPED (review Medium 5): §2.2's co-land justification is coverage-EQUIVALENCE — a
+      // permissive team must see the union of ALL its partitions, and the ready set is bounded by
+      // what enforcing readers ever armed. K applies to the enforced leg, not this union.
+      const scope = await selectEnforcedGraphPartitions(db, { teamId, visibleProjectIds: allIds, arm: false, k: Number.MAX_SAFE_INTEGER });
       groupIds = [...new Set([...groupIds, ...scope.groups])];
     }
     return await fetchGraphFactsForGroups(question, groupIds);
@@ -562,11 +565,20 @@ async function nativeRetrieve(
   // (now union-widened inside fetchGraphFacts).
   let graphScope: { covered: number; total: number } | undefined;
   const graphFactsP = (async (): Promise<GraphFact[]> => {
+    // Configured check FIRST (review Medium 8): a default no-Graphiti install must not pay team,
+    // project, arming, or aggregate reads — let alone latch WRITES — for a leg that cannot run.
+    if (!new GraphitiClient().configured) return [];
     if (enforce == null) return fetchGraphFacts(db, teamId, tier, q);
     if (tier !== "team" || !enforce.graphProjectIds) return [];
-    const scope = await selectEnforcedGraphPartitions(db, { teamId, visibleProjectIds: enforce.graphProjectIds });
-    graphScope = { covered: scope.covered, total: scope.total };
-    return fetchGraphFactsForGroups(q, scope.groups);
+    try {
+      const scope = await selectEnforcedGraphPartitions(db, { teamId, visibleProjectIds: enforce.graphProjectIds });
+      graphScope = { covered: scope.covered, total: scope.total };
+      return fetchGraphFactsForGroups(q, scope.groups);
+    } catch {
+      // Fail CLOSED and gracefully (review Medium 6): a transient arming/latch hiccup omits the
+      // leg — the item legs still answer — instead of 500ing a query they could have served.
+      return [];
+    }
   })();
   // Optional dense (semantic) passage search — pgvector. Runs concurrently; resolves to [] unless
   // EMBEDDINGS_URL is set AND the pgvector schema is loaded (default installs stay pure-FTS).
@@ -961,12 +973,15 @@ export async function retrieve(
   tier: "team" | "external",
   question: string,
   projectSlug?: string | null,
-  // Access enforcement (Phase B slice 2, spec §5.2/§5.8b). Present = the team is 'enforcing' and
-  // this principal's membership-visible item set is supplied: item legs (FTS/recency/dense) and
-  // source-linked decisions/tasks are filtered to it; the GRAPH legs (entities/relationships/
-  // Graphiti facts) are OMITTED — they carry no tier/partition and can't be membership-filtered
-  // until per-project graphs (Phase C), so under enforcing they fail closed rather than leak
-  // restricted knowledge into an answer. Absent = permissive → byte-identical to today.
+  // Access enforcement (Phase B slice 2 + PCCC-6, spec §5.2/§5.8b). Present = the team is
+  // 'enforcing' and this principal's membership-visible item set is supplied: item legs
+  // (FTS/recency/dense) and source-linked decisions/tasks are filtered to it. The GRAPHITI graph
+  // leg is PARTITIONED (PCCC-6) when graphProjectIds is present (team-tier members): searched over
+  // the K-capped, read-ready, unsuppressed stored-pointer partitions with covered/total disclosed;
+  // absent graphProjectIds (external principals, delegated tokens) the graph legs stay OMITTED —
+  // §5.8b fail-closed. The Postgres entities/relationships mirrors and the aggregate digests remain
+  // omitted under enforcing (PCCC-6b / follow-up territory). Absent enforce = permissive → tier path with the
+  // partition union.
   enforce?: RetrieveEnforce | null
 ): Promise<RetrievedContext> {
   const provider = selectedProviderName() === "external" ? externalProvider : nativeProvider;

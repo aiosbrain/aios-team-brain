@@ -189,12 +189,15 @@ export async function POST(req: NextRequest) {
 
   // Access enforcement (Phase B slice 2): same as the API query route — filter retrieval to the
   // member's membership-visible items on an 'enforcing' team; permissive → null → byte-identical.
-  let enforce: { visibleItemIds: ReadonlySet<string> } | null = null;
+  let enforce: import("@/lib/query/retrieve").RetrieveEnforce | null = null;
   try {
     const { teamEnforcesAccess, visibleItemIds } = await import("@/lib/access/enforce");
     if (await teamEnforcesAccess(db, team.id)) {
-      const { ids } = await visibleItemIds(db, { teamId: team.id, memberId: me.id });
-      enforce = { visibleItemIds: ids };
+      const { ids, projectIds } = await visibleItemIds(db, { teamId: team.id, memberId: me.id });
+      // PCCC-6: the dashboard chat is the members' PRIMARY conversational surface — it gets the
+      // K-capped partitioned graph leg exactly like /api/v1/query (review Medium 7: leaving it on
+      // the omit path while the API had the leg was an unrecorded split). Team-tier members only.
+      enforce = { visibleItemIds: ids, ...(me.tier === "team" ? { graphProjectIds: projectIds } : {}) };
     }
   } catch {
     return errorResponse("internal", "enforcement check failed", 500);

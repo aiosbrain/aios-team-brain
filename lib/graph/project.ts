@@ -407,6 +407,9 @@ export interface ProjectSummary {
   /** Armed fan-out pushes withheld by the budget (PCCC-5). Non-zero for several runs in a row
    * means arming outpaces the budget — surfaced, never silent. */
   fanoutThrottled: number;
+  /** Items whose restriction move is IN FLIGHT (home still Everyone-visible, copy not yet landed) —
+   * the §rule-2 exposure population, observable per pass (PCCC-6 review High 3). */
+  restrictionMovesPending: number;
   skipped: number;
   /** Items whose episodes were removed from the EXTERNAL group this batch — a NARROWING reaching the
    * graph. The caller uses it to invalidate the external-tier caches: arcs are synthesized FROM that
@@ -755,6 +758,7 @@ export async function projectItemsToGraph(
   let externalGroupVacated = 0;
   let fanoutThrottled = 0;
   let fanoutPushed = 0;
+  let restrictionMovesPending = 0;
   // What this pass has ALREADY done, snapshotted at abort time — every loud throw below carries it
   // (ProjectionAbortError) so the runner can record the real partial episode counts.
   const partialSummary = (): ProjectSummary => ({
@@ -766,6 +770,7 @@ export async function projectItemsToGraph(
     externalGroupVacated,
     fanoutPushed,
     fanoutThrottled,
+    restrictionMovesPending,
   });
   for (const item of rows) {
     const episodes = kinds.includes(item.kind) ? toEpisodes(item) : [];
@@ -899,6 +904,29 @@ export async function projectItemsToGraph(
           // durably, and the partition suppresses until it confirms). Never touches rows still
           // in the target set.
           if (r.pending_delete_group_id) continue; // already owed — converging
+          if (r.content_sha256 === "") {
+            // Purge CONFIRMED (reconcile cleared the flag but keeps rows) — finish the lifecycle by
+            // DELETING the row: membership is gone so nothing re-creates it, and leaving it parked
+            // would (a) re-tombstone every pass — one routine untag suppressing the partition
+            // forever + hourly deep Graphiti scans (review High 1) — and (b) sit as a perpetual
+            // unlanded obligation that blocks the latch from ever setting (review High 2).
+            const { error: doneErr } = await db
+              .from("graph_episodes")
+              .delete()
+              .eq("team_id", args.teamId)
+              .eq("source_table", SOURCE_TABLE)
+              .eq("source_id", item.id)
+              .eq("group_id", r.group_id)
+              .eq("content_sha256", "")
+              .is("pending_delete_group_id", null);
+            if (doneErr) {
+              throw new ProjectionAbortError(
+                `project: untag completion delete failed for item ${item.id}: ${doneErr.message}`,
+                partialSummary()
+              );
+            }
+            continue;
+          }
           await deleteItemEpisodes(client, r.group_id, item.id).catch(() => {});
           const at = new Date().toISOString();
           const { error: untagErr } = await db
@@ -1053,8 +1081,35 @@ export async function projectItemsToGraph(
         skipped++;
         continue;
       }
-      // Home row live, no landed copy yet: fall through to the NORMAL flow — the content stays
-      // Everyone-visible until the move can complete without loss.
+      // Home row live, no landed copy yet: ARM the item's deferred target copies RIGHT NOW —
+      // restriction is itself an arming trigger (review High 3: the only other trigger is a
+      // P-visible reader's query, which may never come, leaving restricted facts servable to
+      // enforced non-members through General for an unbounded window — spec rule 2 forbids
+      // exactly that). The copies push under the fan-out budget on this and following passes;
+      // once landed, the branch above completes the move. Counted in `restrictionMovesPending`
+      // so the pending-move population is observable, never silent.
+      for (const target of fanoutTargetsByItem.get(item.id) ?? new Set<string>()) {
+        const targetRow = fanoutRows.find((fr) => fr.group_id === target);
+        if (targetRow?.deferred) {
+          const { error: armErr } = await db
+            .from("graph_episodes")
+            .update({ deferred: false })
+            .eq("team_id", args.teamId)
+            .eq("source_table", SOURCE_TABLE)
+            .eq("source_id", item.id)
+            .eq("group_id", target)
+            .eq("deferred", true);
+          if (armErr) {
+            throw new ProjectionAbortError(
+              `project: restriction arm failed for item ${item.id} into ${target}: ${armErr.message}`,
+              partialSummary()
+            );
+          }
+        }
+      }
+      restrictionMovesPending++;
+      // …then fall through to the NORMAL flow — the content stays Everyone-visible until the move
+      // can complete without loss (copy-then-delete).
     }
 
     if (episodes.length === 0) {
@@ -1465,7 +1520,7 @@ export async function projectItemsToGraph(
   // mark to page past next batch (audit H2). Without this the runner only ever re-scanned the oldest
   // `limit` rows and never reached items beyond that window.
   const lastSyncedAt = rows.length ? rows[rows.length - 1].synced_at : undefined;
-  return { scanned: rows.length, projected, episodes: episodesPushed, episodesByGroup, skipped, externalGroupVacated, fanoutPushed, fanoutThrottled, lastSyncedAt };
+  return { scanned: rows.length, projected, episodes: episodesPushed, episodesByGroup, skipped, externalGroupVacated, fanoutPushed, fanoutThrottled, restrictionMovesPending, lastSyncedAt };
 }
 
 /** Back-compat: project only Slack transcripts. Prefer `projectItemsToGraph` (all ingestions). */

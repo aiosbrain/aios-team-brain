@@ -173,5 +173,56 @@ describe("PCCC-6 — the landed-gated restriction move", () => {
     expect(row.rows[0].content_sha256).toBe("");
     expect(row.rows[0].pending_delete_group_id).toBe(init.group);
     expect(await fake.listEpisodes(init.group)).toHaveLength(0); // inline best-effort cleared it
+
+    // LIFECYCLE COMPLETION (review High 1): once reconcile confirms the purge (flag cleared, row
+    // kept at ''), the next pass must DELETE the row — not re-tombstone it, which would suppress
+    // the partition forever, block the latch (High 2), and deep-scan Graphiti hourly.
+    await runSql(
+      "update graph_episodes set pending_delete_group_id = null where team_id = $1 and source_id = $2 and group_id = $3",
+      [seed.teamId, r.id, init.group]
+    );
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: seed.teamSlug, client: client(fake) });
+    const done = await runSql<{ n: number }>(
+      "select count(*)::int as n from graph_episodes where team_id = $1 and source_id = $2 and group_id = $3",
+      [seed.teamId, r.id, init.group]
+    );
+    expect(done.rows[0].n).toBe(0); // the lifecycle ends; nothing re-tombstones, nothing suppresses
+  });
+
+  it("RESTRICTION arms the deferred copy itself — the move never waits for a reader (review High 3)", async () => {
+    const seed = await seedTeam();
+    expect((await ensureAccessBootstrap(db(), seed.teamId)).ok).toBe(true);
+    const init = await mkInitiative(seed, "arm-on-restrict");
+    const r = await ingest(seed, { body: "restricted, nobody queries P", path: "nq.md", access: "team" });
+    await tagIntoGeneral(seed, r.id);
+    await tagItem(seed, r.id, init.projectId);
+    const fake = new FakeGraphiti();
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: seed.teamSlug, client: client(fake) });
+    // Copy exists but is DEFERRED (no reader ever armed it).
+    await restrictFromGeneral(seed, r.id);
+    const summary = await projectItemsToGraph(db(), {
+      teamId: seed.teamId,
+      teamSlug: seed.teamSlug,
+      client: client(fake),
+    });
+    expect(summary.restrictionMovesPending).toBeGreaterThanOrEqual(1); // the exposure is OBSERVABLE
+    const copy = await runSql<{ deferred: boolean }>(
+      "select deferred from graph_episodes where team_id = $1 and source_id = $2 and group_id = $3",
+      [seed.teamId, r.id, init.group]
+    );
+    expect(copy.rows[0].deferred).toBe(false); // restriction itself armed the copy
+
+    // The copy pushes on a later pass; once landed, the move completes without any reader.
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: seed.teamSlug, client: client(fake) });
+    await runSql("update graph_episodes set episode_uuid = 'ep-l' where team_id = $1 and group_id = $2", [
+      seed.teamId,
+      init.group,
+    ]);
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: seed.teamSlug, client: client(fake) });
+    const home = await runSql<{ content_sha256: string }>(
+      "select content_sha256 from graph_episodes where team_id = $1 and source_id = $2 and group_id = $3",
+      [seed.teamId, r.id, episodeGroupId(seed.teamSlug, "team")]
+    );
+    expect(home.rows[0].content_sha256).toBe(""); // the move completed reader-free
   });
 });

@@ -130,9 +130,10 @@ export async function POST(req: NextRequest) {
   // Access enforcement (spec §5.2/§5.8b/§10). Members: on an 'enforcing' team, retrieval filters
   // to the member's membership-visible items (permissive → null → byte-identical to today).
   // Delegated tokens: ALWAYS attenuated to the live triple intersection — flag-independent; a
-  // permissive team must never widen a scoped token to full-corpus answers. Either way the graph
-  // legs are omitted whenever the enforce arg is present. Any error fails closed (500).
-  let enforce: { visibleItemIds: ReadonlySet<string> } | null = null;
+  // permissive team must never widen a scoped token to full-corpus answers. Graph legs (PCCC-6):
+  // team-tier MEMBERS get the K-capped partitioned leg via graphProjectIds; external members and
+  // delegated tokens keep the §5.8b omit. Any error fails closed (500).
+  let enforce: import("@/lib/query/retrieve").RetrieveEnforce | null = null;
   try {
     const { teamEnforcesAccess, visibleItemIds, delegatedVisibleItemIds } = await import("@/lib/access/enforce");
     if (agent) {

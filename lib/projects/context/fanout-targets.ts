@@ -78,7 +78,11 @@ export async function resolveFanoutTargets(
   }
   // An item with NO substrate rows at all defaults to in-General: only an EXPLICIT membership
   // state may restrict (a substrate-hook race or failure must never silently drop content from the
-  // graph — spec rule 1's default-to-General, applied at the graph layer).
+  // graph — spec rule 1's default-to-General, applied at the graph layer). NOTE the unit read
+  // filters state='active': a fully-RETRACTED-units item (nothing writes that state yet — the
+  // Phase-D relaxation lib/access/enforce also defends against) reads as substrate-less and
+  // defaults in-General here; when retraction gains a writer, decide whether it must imply
+  // restriction BEFORE relying on it — this default would resurrect its content into General.
   if (!generalDisabled) {
     for (const id of args.itemIds) if (!itemsWithUnits.has(id)) inGeneral.add(id);
   }

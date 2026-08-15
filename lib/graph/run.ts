@@ -30,6 +30,8 @@ export interface GraphProjectionSummary {
   episodesByGroup: Record<string, number>;
   /** Armed fan-out pushes withheld by the per-pass budget (PCCC-5) — the no-silent-caps signal. */
   fanoutThrottled: number;
+  /** Restriction moves in flight (home Everyone-visible, copy unlanded) — rule-2 exposure, PCCC-6. */
+  restrictionMovesPending: number;
   skipped: number;
   /** Episodes confirmed to have actually landed in Graphiti this run (audit H3 reconcile pass). */
   reconciled: number;
@@ -112,6 +114,7 @@ async function runGraphProjectionInner(opts?: {
     episodes: 0,
     episodesByGroup: {},
     fanoutThrottled: 0,
+    restrictionMovesPending: 0,
     skipped: 0,
     reconciled: 0,
     requeued: 0,
@@ -158,6 +161,7 @@ async function runGraphProjectionInner(opts?: {
         }
         summary.skipped += s.skipped;
         summary.fanoutThrottled += s.fanoutThrottled;
+        summary.restrictionMovesPending += s.restrictionMovesPending;
         externalVacated += s.externalGroupVacated;
         if (s.scanned < limit || !s.lastSyncedAt || s.lastSyncedAt === since) break;
         since = s.lastSyncedAt;
@@ -201,6 +205,7 @@ async function runGraphProjectionInner(opts?: {
         }
         summary.skipped += e.partial.skipped;
         summary.fanoutThrottled += e.partial.fanoutThrottled;
+        summary.restrictionMovesPending += e.partial.restrictionMovesPending;
       }
     }
   }

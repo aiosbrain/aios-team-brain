@@ -87,7 +87,7 @@ export async function readyPartitions(
     .from("graph_project_arming")
     .select("project_id, ready_at")
     .eq("team_id", args.teamId)
-    .in("project_id", args.projects.map((p) => p.id));
+    .in("project_id", args.projects.map((p) => p.id)); // bounded by the caller's oracle-visible set (≤ team project count) — no 65k-bind risk at any real cardinality
   if (armErr) throw new Error(`arming state read failed: ${armErr.message}`);
   const armRows = (armData ?? []) as { project_id: string; ready_at: string | null }[];
   const armedIds = new Set(armRows.map((r) => r.project_id));
@@ -97,7 +97,7 @@ export async function readyPartitions(
   // outstanding purges. Deferred rows are NOT obligations (they join the snapshot at a later arm).
   const agg = await runSql<{ group_id: string; unlanded: number; purging: number }>(
     `select group_id,
-            count(*) filter (where deferred = false and (content_sha256 = '' or episode_uuid is null))::int as unlanded,
+            count(*) filter (where deferred = false and pending_delete_group_id is null and (content_sha256 = '' or episode_uuid is null))::int as unlanded,
             count(*) filter (where pending_delete_group_id = group_id)::int as purging
        from graph_episodes
       where team_id = $1 and group_id = any($2)
