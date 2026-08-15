@@ -128,6 +128,31 @@ describe("PCCC-4 — projects.graph_group_id: stored pointers, one writer", () =
     expect(g2).toBe(g1);
   });
 
+  it("a team RENAME never re-points a built-in's partition — the graph lives under the old slug's group", async () => {
+    // The null-guard's real job: a pointer, once set, must survive every later recompute-with-
+    // different-inputs. A renamed team's built-in would recompute to `<newslug>_team` — an empty
+    // graph — while every episode sits under the old slug's group. The stored pointer IS the truth.
+    const seed = await seedTeam();
+    const boot = await ensureAccessBootstrap(db(), seed.teamId);
+    expect(boot.ok).toBe(true);
+    const before = await runSql<{ id: string; g: string }>(
+      "select id, graph_group_id as g from projects where team_id = $1 and slug = 'general'",
+      [seed.teamId]
+    );
+    expect(before.rows[0].g).toBe(`${seed.teamSlug}_team`);
+
+    const renamed = `renamed-${crypto.randomUUID().slice(0, 8)}`;
+    expect((await db().from("teams").update({ slug: renamed }).eq("id", seed.teamId)).error).toBeNull();
+    const again = await ensureProjectGraphPointer(db(), { teamId: seed.teamId, projectId: before.rows[0].id });
+    expect(again.ok).toBe(true);
+
+    const after = await runSql<{ g: string }>(
+      "select graph_group_id as g from projects where id = $1",
+      [before.rows[0].id]
+    );
+    expect(after.rows[0].g).toBe(`${seed.teamSlug}_team`); // the OLD slug — where the facts actually are
+  });
+
   it("adopting a source project as a §11 built-in CORRECTS a minted pointer to the legacy tier id (the one sanctioned rewrite)", async () => {
     const seed = await seedTeam();
     // A team whose 'general' began life as an ingestion container: minted pointer, then adopted.
