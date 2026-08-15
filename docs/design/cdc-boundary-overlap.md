@@ -36,8 +36,9 @@ Each wrong answer was cheap prose that would have shipped as documentation:
 ### 0b. The rule that is actually true, verified before being written
 
 **When the boundary sequence is unchanged, churn equals the number of ADMITTED chunk intervals that
-intersect the changed span.** Exactly 1 requires three things together: the edit changes text, it lies
-wholly inside one admitted chunk, and no boundary falls strictly inside the edit span.
+intersect the changed span.** Exactly 1 requires two things together: the edit changes text, and it
+lies wholly inside one admitted chunk. (Draft 3 first wrote a third condition — "no boundary strictly
+inside the edit span" — which a mutation then proved redundant; see §2b.)
 
 Verified by sweeping every corpus document ≥25k characters at 97-character offset steps and comparing
 the count this rule predicts against the measured churn: **4,962 unchanged-sequence samples, 4,962
@@ -114,7 +115,13 @@ Per document, from the same two chunkings the test already computes:
 1. is the document long enough to receive an in-place edit (else it is excluded — the operation is an
    append and belongs to that scenario);
 2. is the `cdcBoundaries` sequence unchanged;
-3. does the edit span lie wholly inside one **admitted** chunk, with no boundary strictly inside it.
+3. does the edit span lie wholly inside one **admitted** chunk.
+
+The third condition draft 3 first specified — "and no boundary strictly inside the edit span" — turned
+out to be DEAD, and a mutation is what proved it: a boundary strictly inside the span necessarily
+splits it across two admitted intervals, so condition 3 already covers it. Deleting the redundant term
+reddened nothing, and this repo's rule is that a predicate term no test can redden is one the code
+would be asserting on trust. It is gone; the SPANNING fixture pins the property it was reaching for.
 
 Only documents satisfying all three are asserted `churn === 1`. Everything else is classified and
 reported, never gated. **The coordinate mismatch is named rather than left to be re-derived:**
@@ -172,7 +179,7 @@ API route, no change to `visibleItems`/`visibleTasks`/`visibleGroupIds`.
 - `test/graph-cdc.test.ts` — a checked-in STRICT fixture (edit far from every boundary) asserts sequence-unchanged AND churn exactly 1, so the strict branch cannot go vacuous when the classifier is wrong.
 - `test/graph-cdc.test.ts` — a checked-in CHANGED fixture asserts the targeted boundary exists before the edit, is ABSENT after, the sequences differ, and churn ≥ 2 — proving the branch is exercised rather than assuming a centred edit destroys a cut.
 - `test/graph-cdc.test.ts` — no ceiling is asserted for the changed branch on any input; the measured envelope is recorded in a comment with its witness, because the live corpus already reaches 78 of 80.
-- `test/graph-cdc.test.ts` — for every LIVE document classified strict (long enough, sequence unchanged, edit inside one admitted chunk with no interior boundary), churn is exactly 1, asserted per document rather than as a corpus maximum one outlier can dominate.
+- `test/graph-cdc.test.ts` — for every LIVE document classified strict (long enough, sequence unchanged, edit inside one admitted chunk), churn is exactly 1, asserted per document rather than as a corpus maximum one outlier can dominate.
 - `test/graph-cdc.test.ts` — the three buckets partition the corpus (`strict + changed + excluded === total`), so a classifier that moves every document into an ungated bucket reddens instead of greening.
 - `test/graph-cdc.test.ts` — a checked-in SHORT fixture makes the excluded bucket non-empty regardless of the live corpus; the live excluded count is reported, never gated.
 - `test/graph-cdc.test.ts` — the `it.fails` for CDCCHURN-1 is GONE and the `max(cdc) ≤ max(legacy)` comparison is removed for the same-length scenario, with the measured reason (78 vs 1) recorded at the site.
