@@ -459,8 +459,9 @@ describe("churn: how many chunk hashes change under a real edit — CDC vs the b
  *
  *   **churn = the number of ADMITTED chunk intervals the changed span intersects.**
  *
- * So exactly 1 needs three things together: the edit changes text, it lies wholly inside one admitted
- * chunk, and no boundary falls strictly inside it. Anything else is reported, not gated — because when
+ * So exactly 1 needs two things together: the edit changes text, and it lies wholly inside one admitted
+ * chunk. (A third condition — "no boundary strictly inside the edit span" — was specified and then
+ * deleted as provably dead; see `classify`.) Anything else is reported, not gated — because when
  * the boundary sequence does change there is NO usable ceiling: the same sweep reaches **78 of 80**
  * admitted chunks for a 20-character edit (`docs/ARCHITECTURE.md` @7111) against a legacy churn of 1.
  * A ceiling asserted on a fixture would pin the fixture, not the algorithm.
@@ -498,11 +499,22 @@ describe("CDCCHURN-1: in-place same-length churn is the number of chunks the edi
   const classify = (t: string, at = EDIT_AT, len = EDIT_LEN): Bucket => {
     if (t.length < at + len) return "excluded";
     const edited = t.slice(0, at) + "X".repeat(len) + t.slice(at + len);
+    // The rule's first precondition, which all three documents stated and the classifier omitted
+    // (review): an edit that changes nothing churns 0, not 1. Latent today — no corpus document holds
+    // a 20-character X-run at the edit site — but the classifier should match the rule it implements.
+    if (edited === t) return "excluded";
     const before = cdcBoundaries(t, CDC_PARAMS);
     if (JSON.stringify(before) !== JSON.stringify(cdcBoundaries(edited, CDC_PARAMS))) return "reported";
+    // ONE term, not two — and the second time this deletion has been attempted: the first went into a
+    // commit message while a mutation revert quietly took the edit itself (found by review; the same
+    // "commit claims vs file state" scar this repo already carries). The deleted term was
+    // `before.some((b) => b > at && b < at + len)`, and it is provably dead: admitted intervals are
+    // delimited by consecutive `before` boundaries, so a boundary strictly inside the edit span cannot
+    // sit inside one interval — `holding` is already undefined there. A predicate term no test can
+    // redden is one the code asserts on trust, and with it present, deleting the `holding` check left
+    // every test green: the two conditions masked each other.
     const holding = admittedIntervals(t).find(([s, e]) => at >= s && at + len <= e);
-    if (holding === undefined) return "reported"; // spans two chunks, or lies past the cap
-    return before.some((b) => b > at && b < at + len) ? "reported" : "strict";
+    return holding === undefined ? "reported" : "strict"; // spans two chunks, or lies past the cap
   };
 
   it("STRICT FIXTURE: an edit far from every boundary churns exactly 1", () => {
@@ -601,8 +613,14 @@ describe("CDCCHURN-1: in-place same-length churn is the number of chunks the edi
       // original defect hid — and how it was then mis-diagnosed three times.
       expect(changedCount(chunkContent(t), chunkContent(inPlace(t))), "strict document churn").toBe(1);
     }
-    // The partition is asserted, so a classifier that quietly moves every document into the ungated
-    // bucket reddens instead of greening.
+    // HONEST ABOUT WHAT THIS IS (review): the sum is a TAUTOLOGY for any total classifier — one that
+    // returned "reported" for everything would satisfy it. It is kept because it pins TOTALITY (every
+    // document lands in exactly one bucket); what it does NOT do is catch a reports-everything
+    // classifier. The STRICT fixture above catches that, and the floor below keeps the live assertion
+    // from silently measuring nothing.
     expect(counts.excluded + counts.strict + counts.reported).toBe(docs.length);
+    // A floor, not a pinned count: today 14 of 25 documents classify strict, and pinning that number
+    // would re-create the corpus dependence this ticket exists to remove.
+    expect(counts.strict, "no live document classified strict — the assertion above ran on nothing").toBeGreaterThan(0);
   });
 });
