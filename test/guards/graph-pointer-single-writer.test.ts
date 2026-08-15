@@ -19,6 +19,21 @@ const ROOT = join(import.meta.dirname, "..", "..");
 const SCAN_DIRS = ["app", "lib", "scripts"];
 const SINGLE_WRITER = join("lib", "graph", "project-pointer.ts");
 const WRITE_WITH_POINTER = /\.\s*(insert|upsert|update)\s*\(\s*\{[^)]*graph_group_id/s;
+/** Raw-SQL evasion: `runSql("update projects set graph_group_id …")` never matches the builder
+ *  pattern. (Known remaining limit: a payload assembled in a separate variable, or a value
+ *  containing `)` before the key — same class as the sibling guards.) */
+const RAW_SQL_POINTER_WRITE = /set\s+graph_group_id/i;
+/**
+ * The inverse check (review Medium 3a — the pin-the-call-site class): forbidding writes elsewhere
+ * cannot prove a creation path CALLS the writer. Deleting the dashboard action's call left every
+ * test green; this list makes each wired site load-bearing.
+ */
+const REQUIRED_CALL_SITES = [
+  join("lib", "access", "bootstrap.ts"),
+  join("app", "actions", "projects.ts"),
+  join("lib", "ingest", "index.ts"),
+  join("lib", "meetings", "extract-todos.ts"),
+];
 
 function walk(dir: string, out: string[] = []): string[] {
   let entries: string[];
@@ -43,7 +58,7 @@ describe("projects.graph_group_id single-writer", () => {
         const rel = relative(ROOT, file);
         if (rel === SINGLE_WRITER) continue;
         const src = readFileSync(file, "utf8");
-        if (WRITE_WITH_POINTER.test(src)) offenders.push(rel);
+        if (WRITE_WITH_POINTER.test(src) || RAW_SQL_POINTER_WRITE.test(src)) offenders.push(rel);
       }
     }
     expect(offenders, `graph_group_id written outside the single writer: ${offenders.join(", ")}`).toEqual([]);
@@ -52,5 +67,12 @@ describe("projects.graph_group_id single-writer", () => {
   it("the guard is non-vacuous: the single writer itself matches the pattern", () => {
     const src = readFileSync(join(ROOT, SINGLE_WRITER), "utf8");
     expect(WRITE_WITH_POINTER.test(src)).toBe(true);
+  });
+
+  it("every creation path CALLS the writer — forbidding writes elsewhere cannot prove the wiring exists", () => {
+    for (const rel of REQUIRED_CALL_SITES) {
+      const src = readFileSync(join(ROOT, rel), "utf8");
+      expect(src.includes("ensureProjectGraphPointer("), `${rel} no longer calls ensureProjectGraphPointer`).toBe(true);
+    }
   });
 });

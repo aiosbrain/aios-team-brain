@@ -54,8 +54,8 @@ describe("PCCC-4 Deploy B — the narrow unique is gone; the wide arbiter rules 
 
   it("a tier flip still MOVES the single ledger row — the design's first 'relax to plain upsert' ruling was a leak (amended §2.1)", async () => {
     // With the narrow unique gone, a plain 4-column upsert on a flip would INSERT a second row and
-    // leave the old-group row live with a real sha and no pending flag — and reconcile's sentinel
-    // re-queue would then RE-POPULATE the vacated tier group. The move-UPDATE must survive Deploy B.
+    // leave the old-group row live — a mixed multi-row state nothing owns until PCCC-5's set-diff
+    // lands, its vacated-tier content lingering searchable. The move-UPDATE must survive Deploy B.
     const seed = await seedTeam();
     const fake = new FakeGraphiti();
     const r = await ingest(seed, { body: "flip across tiers under deploy B", path: "flipb.md", access: "external" });
@@ -97,6 +97,12 @@ describe("PCCC-4 — projects.graph_group_id: stored pointers, one writer", () =
 
     const migration = readFileSync(join(MIGRATION_DIR, "20260815140000_projects_graph_group_id.sql"), "utf8");
     await runSql(migration, []);
+    // Replay with a CHANGED input (review Low 6): minted values are deterministic, so a plain
+    // re-run cannot distinguish "guarded no-op" from "re-mint of identical values". Renaming the
+    // team between runs makes the grandfather branch falsifiable — a replay without the
+    // `is null` guards would re-point the built-ins at the new slug's (empty) groups.
+    const renamedSlug = `replay-${crypto.randomUUID().slice(0, 8)}`;
+    expect((await db().from("teams").update({ slug: renamedSlug }).eq("id", seed.teamId)).error).toBeNull();
     await runSql(migration, []); // replay — must be a no-op, never a re-mint
 
     const read = async (id: string) =>
@@ -131,7 +137,10 @@ describe("PCCC-4 — projects.graph_group_id: stored pointers, one writer", () =
   it("a team RENAME never re-points a built-in's partition — the graph lives under the old slug's group", async () => {
     // The null-guard's real job: a pointer, once set, must survive every later recompute-with-
     // different-inputs. A renamed team's built-in would recompute to `<newslug>_team` — an empty
-    // graph — while every episode sits under the old slug's group. The stored pointer IS the truth.
+    // graph — while every PRE-RENAME episode sits under the old slug's group (post-rename episodes
+    // land under the new slug: the live-machinery divergence the design's rename doctrine names;
+    // PCCC-5 dissolves it by making the projector resolve the pointer). The stored pointer IS the
+    // truth this test defends.
     const seed = await seedTeam();
     const boot = await ensureAccessBootstrap(db(), seed.teamId);
     expect(boot.ok).toBe(true);

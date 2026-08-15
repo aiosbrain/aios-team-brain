@@ -89,7 +89,10 @@ export function projectGroupId(teamId: string, projectId: string): string {
   if (!UUID_RE.test(teamId) || !UUID_RE.test(projectId)) {
     throw new Error(`invalid per-project Graphiti group_id — teamId/projectId must be canonical UUIDs (got team="${teamId}", project="${projectId}")`);
   }
-  const id = `g_${teamId.replace(/-/g, "")}_p_${projectId.replace(/-/g, "")}`;
+  // Lowercased BEFORE stripping (PCCC-4 review Low 4): UUID_RE is case-insensitive while the SQL
+  // backfill mints from pg's always-lowercase uuid::text — a mixed-case caller would otherwise
+  // silently split one project into two partitions differing only by case.
+  const id = `g_${teamId.toLowerCase().replace(/-/g, "")}_p_${projectId.toLowerCase().replace(/-/g, "")}`;
   // Belt-and-braces: a hyphen-stripped-UUID id is charset-valid by construction, but keep the
   // assertion so a future edit to the format can't silently mint an id the graph service rejects.
   if (!VALID_GROUP_ID.test(id)) {

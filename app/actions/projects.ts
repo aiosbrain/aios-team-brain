@@ -41,6 +41,18 @@ export async function createProjectAction(input: {
     .single();
   if (error || !data) {
     if (/duplicate key|unique constraint/i.test(error?.message ?? "")) {
+      // Converge the existing row's pointer before refusing (review Medium 3b): if a prior attempt
+      // created the row and then failed its pointer write, the retry would otherwise land here
+      // forever with the project permanently unpointed — dark under PCCC-6's fail-closed read.
+      const { data: existing } = await db
+        .from("projects")
+        .select("id")
+        .eq("team_id", input.teamId)
+        .eq("slug", slug)
+        .maybeSingle();
+      if (existing) {
+        await ensureProjectGraphPointer(db, { teamId: input.teamId, projectId: (existing as ProjectRow).id });
+      }
       return { ok: false, error: `a project "${slug}" already exists` };
     }
     return { ok: false, error: error?.message ?? "could not create project" };

@@ -42,6 +42,11 @@ export async function ensureProjectGraphPointer(
   const minted = projectGroupId(args.teamId, args.projectId); // throws on non-UUID inputs — fail loud
   const isBuiltin = row.kind === "system" && (row.slug === GENERAL_SLUG || row.slug === EXTERNAL_SHARED_SLUG);
 
+  // Steady-state fast path (review Low 7 — this runs per ingest): a pointer that is set and is NOT
+  // this project's own minted id is final (a grandfathered legacy id, which never rewrites) — no
+  // teams read, no writes. Only null (first point) and own-minted (adoption candidate) proceed.
+  if (row.graph_group_id !== null && row.graph_group_id !== minted) return { ok: true };
+
   let value = minted;
   if (isBuiltin) {
     const { data: team, error: teamErr } = await db.from("teams").select("slug").eq("id", args.teamId).maybeSingle();
@@ -63,6 +68,20 @@ export async function ensureProjectGraphPointer(
     .eq("team_id", args.teamId)
     .is("graph_group_id", null);
   if (fillErr) {
+    // Name the one known way this uniquely fails (review Medium 1): a team renamed away from a slug
+    // whose legacy groups still hold another team's graph, then a NEW team created under that slug —
+    // its built-in computes the same legacy id and the global partial unique refuses. Loud and
+    // wedging by design (a silent skip would point two teams at one graph); the repair is manual
+    // and named here so the operator isn't reverse-engineering an index name.
+    if (fillErr.message.includes("projects_graph_group_id_key")) {
+      return {
+        ok: false,
+        error:
+          `graph pointer collision for project ${args.projectId}: the computed group id "${value}" is already ` +
+          `another project's partition (slug reuse after a team rename). Manual repair required: rename one ` +
+          `team's slug or repoint the older project before re-running bootstrap.`,
+      };
+    }
     return { ok: false, error: `graph pointer write failed for project ${args.projectId}: ${fillErr.message}` };
   }
 
