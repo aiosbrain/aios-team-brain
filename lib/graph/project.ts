@@ -420,6 +420,59 @@ export interface ProjectSummary {
 }
 
 /**
+ * Restore the ledger pointer for a fan-out push whose post-push UPDATE matched zero rows (Codex
+ * review High 2): reconcile's never-landed delete can eat an armed `''` row between the pass's
+ * ledger read and its write — Graphiti then holds the accepted push with NO row anywhere. Write a
+ * tombstone claiming the group with its own pending-delete, so reconcile durably purges whatever
+ * lands; a racer re-creating the row concurrently wins the wide index and we flag THAT row's ''
+ * state instead. Loud on every failure — a silent miss here is exactly the unledgered-content
+ * class the reservation ordering exists to prevent.
+ */
+export async function recoverUnledgeredFanoutPush(
+  db: DbClient,
+  args: { teamId: string; itemId: string; groupId: string; partial: () => ProjectSummary }
+): Promise<void> {
+  const at = new Date().toISOString();
+  const { error: insertErr } = await db.from("graph_episodes").insert({
+    team_id: args.teamId,
+    source_table: SOURCE_TABLE,
+    source_id: args.itemId,
+    group_id: args.groupId,
+    content_sha256: "",
+    chunk_shas: [],
+    chunk_config: CHUNK_CONFIG,
+    deferred: false,
+    pending_delete_group_id: args.groupId,
+    pending_delete_at: at,
+  });
+  if (insertErr && !insertErr.message.includes("graph_episodes_item_group_key")) {
+    throw new ProjectionAbortError(
+      `project: unledgered fan-out recovery failed for item ${args.itemId} in ${args.groupId}: ${insertErr.message}`,
+      args.partial()
+    );
+  }
+  if (insertErr) {
+    // A racer holds the row. Flag it only if it is an unlanded sentinel — a completed row means the
+    // racer's own final write already owns the state.
+    const { error: flagErr } = await db
+      .from("graph_episodes")
+      .update({ pending_delete_group_id: args.groupId, pending_delete_at: at })
+      .eq("team_id", args.teamId)
+      .eq("source_table", SOURCE_TABLE)
+      .eq("source_id", args.itemId)
+      .eq("group_id", args.groupId)
+      .eq("content_sha256", "")
+      .is("pending_delete_group_id", null);
+    if (flagErr) {
+      throw new ProjectionAbortError(
+        `project: unledgered fan-out flag failed for item ${args.itemId} in ${args.groupId}: ${flagErr.message}`,
+        args.partial()
+      );
+    }
+  }
+}
+
+/**
  * A pass that aborts LOUDLY mid-batch still incurred real extraction cost for everything it pushed
  * before the abort — losing those counts undercounts the Phase C cost gate's denominator
  * (code-review Codex Medium 3). The partial summary rides on the error so the runner records it.
@@ -841,7 +894,13 @@ export async function projectItemsToGraph(
             partialSummary()
           );
         }
-        const { error: fanWriteErr } = await db
+        // Counters ride the PUSH, not the ledger write (Codex review Medium 3): the extraction is
+        // incurred the moment addEpisodes accepts — an abort on the write below must still carry
+        // these in its partial summary or the append-only cost substrate under-counts real spend.
+        episodesPushed += episodes.length;
+        episodesByGroup[r.group_id] = (episodesByGroup[r.group_id] ?? 0) + episodes.length;
+        fanoutPushed++;
+        const { data: fanWritten, error: fanWriteErr } = await db
           .from("graph_episodes")
           .update({
             content_sha256: contentSha,
@@ -852,7 +911,8 @@ export async function projectItemsToGraph(
           .eq("team_id", args.teamId)
           .eq("source_table", SOURCE_TABLE)
           .eq("source_id", item.id)
-          .eq("group_id", r.group_id);
+          .eq("group_id", r.group_id)
+          .select("group_id");
         if (fanWriteErr) {
           // The row keeps its '' sha (armed, unlanded) — the next pass re-pushes; duplicate cost,
           // convergent, same class as the home path's crash window.
@@ -861,9 +921,17 @@ export async function projectItemsToGraph(
             partialSummary()
           );
         }
-        episodesPushed += episodes.length;
-        episodesByGroup[r.group_id] = (episodesByGroup[r.group_id] ?? 0) + episodes.length;
-        fanoutPushed++;
+        // ROWCOUNT, not just error (Codex review High 2): reconcile's never-landed delete can eat
+        // an armed '' row between this pass's read and this write — the update then matches ZERO
+        // rows while Graphiti holds the accepted push with no ledger anywhere. Restore the pointer.
+        if (((fanWritten as unknown[] | null) ?? []).length === 0) {
+          await recoverUnledgeredFanoutPush(db, {
+            teamId: args.teamId,
+            itemId: item.id,
+            groupId: r.group_id,
+            partial: partialSummary,
+          });
+        }
       }
     };
 
@@ -907,9 +975,13 @@ export async function projectItemsToGraph(
       // High 2 — the door B2 closes for home was open for fan-out, and PCCC-6's removed-side only
       // covers UNTAG, not redaction-with-membership-intact). Tombstone each: '' sha + its own group
       // as pending-delete; reconcile processes them (deferred=false) with the same durable retry.
-      // Deferred rows need nothing — they never pushed, and they park until content returns.
+      // DEFERRED rows need nothing — they never pushed, and they park until content returns. But an
+      // armed row's sha proves NOTHING (Codex review High 1): '' can mean armed-not-yet-pushed OR
+      // pushed-and-crashed-before-recording — indistinguishable, and the second holds real content.
+      // Tombstone every non-deferred fan-out row without an outstanding flag; for the truly-unpushed
+      // the purge verifies empty and clears, which is cheap, while skipping would strand the other.
       for (const r of fanoutRows) {
-        if (r.deferred || r.content_sha256 === "" || r.pending_delete_group_id) continue;
+        if (r.deferred || r.pending_delete_group_id) continue;
         await deleteItemEpisodes(client, r.group_id, item.id).catch(() => {});
         const at = new Date().toISOString();
         const { error: fanRedactErr } = await db
@@ -931,6 +1003,11 @@ export async function projectItemsToGraph(
           );
         }
       }
+      // Fan-out BOOKKEEPING still runs on this exit too (Codex review Low 4): a redacted item may
+      // simultaneously be untagged, and its never-pushed deferred rows would otherwise linger
+      // invisible to every janitor until content returned. runFanout's add/push sides are inert
+      // here (episodes.length === 0 guards both); only the deferred-untag delete does work.
+      await runFanout();
       skipped++;
       continue;
     }

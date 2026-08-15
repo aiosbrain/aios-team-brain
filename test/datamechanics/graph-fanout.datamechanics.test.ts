@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { projectItemsToGraph, retireEpisodesForItems } from "@/lib/graph/project";
+import { projectItemsToGraph, retireEpisodesForItems, recoverUnledgeredFanoutPush } from "@/lib/graph/project";
 import { runGraphProjection } from "@/lib/graph/run";
 import { reconcileProjectedEpisodes } from "@/lib/graph/reconcile";
 import { episodeGroupId, projectGroupId } from "@/lib/graph/group";
@@ -239,6 +239,152 @@ describe("PCCC-5 — fan-out is DEFERRED until armed; ADD-only", () => {
     expect(row.rows[0].content_sha256).toBe(""); // parked, re-pushes if content returns
     expect(row.rows[0].pending_delete_group_id).toBe(init.group); // reconcile owns the durable purge
     expect(await fake.listEpisodes(init.group)).toHaveLength(0); // inline best-effort already cleared it
+  });
+
+  it("REDACTION tombstones an armed row even with a '' sha — armed-and-crashed is indistinguishable from armed-unpushed (Codex High 1)", async () => {
+    const seed = await seedTeam();
+    expect((await ensureAccessBootstrap(db(), seed.teamId)).ok).toBe(true);
+    const init = await mkInitiative(seed, "armed-crash-window");
+    const r = await ingest(seed, { body: "armed then redacted before recording", path: "acw.md", access: "team" });
+    await tagItem(seed, r.id, init.projectId);
+    const fake = new FakeGraphiti();
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: seed.teamSlug, client: client(fake) });
+    // Arm but DON'T project — the row sits deferred=false, sha '' (exactly the crash-window state).
+    await runSql("update graph_episodes set deferred = false where team_id = $1 and group_id = $2", [
+      seed.teamId,
+      init.group,
+    ]);
+
+    expect((await db().from("items").update({ body: "" }).eq("id", r.id)).error).toBeNull();
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: seed.teamSlug, client: client(fake) });
+
+    const row = await runSql<{ pending_delete_group_id: string | null }>(
+      "select pending_delete_group_id from graph_episodes where team_id = $1 and source_id = $2 and group_id = $3",
+      [seed.teamId, r.id, init.group]
+    );
+    expect(row.rows).toHaveLength(1);
+    expect(row.rows[0].pending_delete_group_id).toBe(init.group); // reconcile purges whatever may have landed
+  });
+
+  it("an abort AFTER an accepted fan-out push still carries the spend in its partial summary (Codex Medium 3)", async () => {
+    const seed = await seedTeam();
+    expect((await ensureAccessBootstrap(db(), seed.teamId)).ok).toBe(true);
+    const init = await mkInitiative(seed, "abort-counts");
+    const r = await ingest(seed, { body: "pushed then write refused", path: "pw.md", access: "team" });
+    await tagItem(seed, r.id, init.projectId);
+    const fake = new FakeGraphiti();
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: seed.teamSlug, client: client(fake) });
+    await runSql("update graph_episodes set deferred = false where team_id = $1 and group_id = $2", [
+      seed.teamId,
+      init.group,
+    ]);
+    // Refuse the item's real-sha ledger writes: on this pass the home row sha-skips, so the only
+    // real-sha write is the armed fan-out update — the push precedes it and must still be counted.
+    await runSql(
+      `create or replace function pccc5_refuse_fanwrite() returns trigger language plpgsql as $$
+         begin
+           if new.source_id = '${r.id}' and new.content_sha256 <> '' then
+             raise exception 'pccc5 fan-out write refused';
+           end if;
+           return new;
+         end $$`,
+      []
+    );
+    await runSql(
+      "create trigger pccc5_refuse_fanwrite before insert or update on graph_episodes for each row execute function pccc5_refuse_fanwrite()",
+      []
+    );
+    try {
+      const err = await projectItemsToGraph(db(), {
+        teamId: seed.teamId,
+        teamSlug: seed.teamSlug,
+        client: client(fake),
+      }).then(
+        () => null,
+        (e: unknown) => e
+      );
+      expect(err).toBeInstanceOf(Error);
+      expect((err as Error).name).toBe("ProjectionAbortError");
+      const partial = (err as { partial?: { episodesByGroup: Record<string, number> } }).partial;
+      expect(partial!.episodesByGroup[init.group] ?? 0).toBeGreaterThan(0); // the push WAS incurred
+    } finally {
+      await runSql("drop trigger if exists pccc5_refuse_fanwrite on graph_episodes", []);
+      await runSql("drop function if exists pccc5_refuse_fanwrite()", []);
+    }
+  });
+
+  it("recoverUnledgeredFanoutPush restores a durable purge pointer when the row vanished mid-pass (Codex High 2)", async () => {
+    const seed = await seedTeam();
+    const group = `g_${"a".repeat(32)}_p_${"9".repeat(32)}`;
+    const itemId = crypto.randomUUID();
+
+    // (a) no row at all → a tombstone row with the flag appears
+    await recoverUnledgeredFanoutPush(db(), {
+      teamId: seed.teamId,
+      itemId,
+      groupId: group,
+      partial: () => ({
+        scanned: 0, projected: 0, episodes: 0, episodesByGroup: {}, fanoutPushed: 0,
+        fanoutThrottled: 0, skipped: 0, externalGroupVacated: 0,
+      }),
+    });
+    const made = await runSql<{ pending_delete_group_id: string | null; deferred: boolean }>(
+      "select pending_delete_group_id, deferred from graph_episodes where team_id = $1 and source_id = $2 and group_id = $3",
+      [seed.teamId, itemId, group]
+    );
+    expect(made.rows).toHaveLength(1);
+    expect(made.rows[0].pending_delete_group_id).toBe(group);
+    expect(made.rows[0].deferred).toBe(false);
+
+    // (b) a racer's completed row is never stomped
+    const doneItem = crypto.randomUUID();
+    await db().from("graph_episodes").insert({
+      team_id: seed.teamId, source_table: "items", source_id: doneItem, group_id: group.replace(/9/g, "8"),
+      content_sha256: sha("racer finished"), deferred: false,
+    });
+    await recoverUnledgeredFanoutPush(db(), {
+      teamId: seed.teamId,
+      itemId: doneItem,
+      groupId: group.replace(/9/g, "8"),
+      partial: () => ({
+        scanned: 0, projected: 0, episodes: 0, episodesByGroup: {}, fanoutPushed: 0,
+        fanoutThrottled: 0, skipped: 0, externalGroupVacated: 0,
+      }),
+    });
+    const kept = await runSql<{ content_sha256: string; pending_delete_group_id: string | null }>(
+      "select content_sha256, pending_delete_group_id from graph_episodes where team_id = $1 and source_id = $2",
+      [seed.teamId, doneItem]
+    );
+    expect(kept.rows[0].content_sha256).toBe(sha("racer finished"));
+    expect(kept.rows[0].pending_delete_group_id).toBeNull();
+  });
+
+  it("a redacted AND untagged item still gets its deferred bookkeeping cleaned (Codex Low 4)", async () => {
+    const seed = await seedTeam();
+    expect((await ensureAccessBootstrap(db(), seed.teamId)).ok).toBe(true);
+    const init = await mkInitiative(seed, "redact-untag");
+    const r = await ingest(seed, { body: "redacted and untagged together", path: "ru.md", access: "team" });
+    await tagItem(seed, r.id, init.projectId);
+    const fake = new FakeGraphiti();
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: seed.teamSlug, client: client(fake) });
+
+    expect((await db().from("items").update({ body: "" }).eq("id", r.id)).error).toBeNull();
+    expect(
+      (
+        await db()
+          .from("project_context_memberships")
+          .update({ valid_to: new Date().toISOString() })
+          .eq("team_id", seed.teamId)
+          .eq("project_id", init.projectId)
+      ).error
+    ).toBeNull();
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: seed.teamSlug, client: client(fake) });
+
+    const left = await runSql<{ n: number }>(
+      "select count(*)::int as n from graph_episodes where team_id = $1 and source_id = $2 and group_id = $3",
+      [seed.teamId, r.id, init.group]
+    );
+    expect(left.rows[0].n).toBe(0); // the deferred row is gone despite the redaction exit
   });
 
   it("purging an ITEM hard-deletes its deferred rows — no zombie invisible to every janitor (review Medium 3)", async () => {
