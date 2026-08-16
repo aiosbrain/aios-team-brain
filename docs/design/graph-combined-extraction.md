@@ -4,7 +4,10 @@
 **Parent:** `docs/design/graph-ingestion-efficiency.md` §4 ("noted, not proposed"), now the largest
 remaining lever after PIPEFF-4 (packing) was declined on evidence.
 **Siblings shipped:** PIPEFF-2 (predecessor filter, −25.5% verified) · PIPEFF-3 (content-defined chunking).
-**Owner approval:** the quality battery's spend was approved 2026-08-11, before this spec was written.
+**Owner approval:** the quality battery's spend was approved 2026-08-11 ($8), and **re-approved at
+$16** on the same day once the power arithmetic was corrected.
+**Build with:** opus / high — a vendored patch to a third-party extraction path, gated on a paid
+quality battery, in the subsystem where this repo has already paid for a silent quality regression.
 
 ---
 
@@ -20,7 +23,7 @@ because a spec that assumes a codebase that has moved is worse than no spec.
 |---|---|
 | Did anyone ship combined extraction? | **No** — zero `extract_nodes_and_edges` rows in `llm_usage`, and zero `unknown`, so the classifier has not drifted either |
 | Is the patch target intact? | **Yes** — `graphiti/Dockerfile` and the graphiti pin: **0 commits** |
-| Is the instrument intact? | **Yes** — `capture-tap.mjs`, `harvest.ts`, the battery scripts: **0 commits**. The response-capture edit (§4) is still the only instrument change needed |
+| Is the instrument intact? | **Yes** — `scripts/graph-window-battery/capture-tap.mjs`, `scripts/graph-window-battery/harvest.ts`, the battery scripts: **0 commits**. The response-capture edit (§4) is still the only instrument change needed |
 | Is `graph-call-kind.ts` still missing the row? | **Yes** — 0 commits, so AC8 stands exactly as written |
 | Is the saving still there? | **Larger.** Re-measured on a fresh 4-day window: `extract_edges` 25.1% + `extract_nodes` 22.5% = **47.6%** of graph cost, against **44.5%** when the spec was written |
 
@@ -271,7 +274,7 @@ honest:
 I specified Q8′ and Q9 against instruments I had not opened. Both were wrong, and both would have
 failed at **harvest**, after the money was spent.
 
-**Q8′ needed a capture the tap does not take.** `capture-tap.mjs:65-70` appends the **request** body
+**Q8′ needed a capture the tap does not take.** `scripts/graph-window-battery/capture-tap.mjs:65-70` appends the **request** body
 and nothing else; the response is forwarded (`:82-84`) and discarded. So the raw pre-drop entity list
 does not exist anywhere. **Fix, before any run:** the tap also records the response body — `buf` is
 already in hand at `:83`, so this is a few lines, and the byte-for-byte forwarding property that
@@ -301,7 +304,7 @@ survives on this machine. **Fix:** make the gate self-contained — build the co
 to retain them. This is strictly better than what I specified: same corpus, same session, no
 staleness, and no dependency on artifacts I cannot verify. It is not circular — the list is built
 from the arm the candidate is measured *against*, never from the candidate. The raw material exists:
-`harvest.ts:41,62` already stores `entityNameCounts` per rep, so this is a decision-side computation
+`scripts/graph-window-battery/harvest.ts:41,62` already stores `entityNameCounts` per rep, so this is a decision-side computation
 and the tap edit stays the only instrument change.
 
 **Three things Q9 must pre-register, or it becomes the theatre Q2/Q7 were dropped to avoid:**
@@ -380,11 +383,32 @@ The drop is only clean *with* Q9; without it, it is the cut that blocked the las
 
 ### Instrument, reused
 
-The corpus rule, seeder, harvester, refusing parsers and `decision.mjs` are reused from PIPEFF-2
+The corpus rule, seeder, harvester, refusing parsers and `scripts/graph-window-battery/decision.mjs` are reused from PIPEFF-2
 **unchanged**. The capture tap is reused **except for the response capture Q8′ requires** (above) —
 stated precisely, because "the instrument does not change" was false the moment Q8′ needed it to.
 
 ## 5. Acceptance
+
+Itemized criteria; each bullet leads with its observable anchor (test tier + the file that carries
+it), and the table beneath restates the same set with falsifiers.
+
+- **AC1 — `graphiti/Dockerfile` build gate:** the image built from this branch produces a
+  `graphiti_core/graphiti.py` whose sha256 equals the file the battery measured, bit-for-bit.
+- **AC2 — unit, `test/guards/graphiti-patch-combined.test.ts`:** the patch script is idempotent
+  (applying twice is a no-op) and fails loudly on a missing anchor rather than silently skipping.
+- **AC3 — unit, `test/guards/graphiti-patch-combined.test.ts`:** the patched file parses under
+  `ast`, and the patched call path is exercised against a real episode.
+- **AC4 — unit, `test/guards/graphiti-patch-combined.test.ts`:** PATCH 3's predecessor filter still
+  applies under the combined call — a single-chunk item receives zero predecessors.
+- **AC5 — data-mechanics, `test/datamechanics/graph-combined-extraction.datamechanics.test.ts`:** the
+  full per-episode call-kind profile holds (one `extract_nodes_and_edges`, one batch
+  `edge_timestamps` iff edges exist, 0..k per-edge fallbacks, zero `extract_nodes`/`extract_edges`).
+- **AC6 — unit, `test/guards/graphiti-patch-combined.test.ts`:** with `pre_extracted_edges=None` the
+  function's behaviour is identical to today, so the un-patched path is untouched.
+- **AC7 — unit, `test/graph-window-battery-decision.test.ts`:** the decision procedure refuses rather
+  than passing when a rep is missing or a window is ambiguous.
+- **AC8 — unit, `test/graph-call-kind.test.ts`:** `lib/llm/graph-call-kind.ts` classifies the real
+  rendered combined prompt as `extract_nodes_and_edges`, not `unknown`.
 
 | # | Criterion | Tier | Falsifier |
 |---|---|---|---|
