@@ -106,6 +106,10 @@ describe("PPARC-3 — the p:→g: corrections migration (criterion 5, moved from
     await runSql("update arc_cache set computed_at = now() - interval '1 minute' where team_id = $1 and group_key = $2", [seed.teamId, `g:${g}`]);
 
     const MIG = (await import("node:fs")).readFileSync("postgres/migrations/20260816150000_arc_corrections_partition_scope.sql", "utf8");
+    // The container's schema load already stamped the marker at setup — clear it so THIS test
+    // exercises a genuine first run (the fixture was time-fragile against the container-age
+    // marker; caught by the full-tier run).
+    await runSql("delete from migration_markers where name = 'pparc3_g_wipe'");
     await runSql(MIG); // first run stamps the marker + wipes pre-cutover rows
     await writeArcCache(db(), seed.teamId, "g:post-cutover", arcRow("y", "post-cutover") as never, "h");
     await runSql(MIG); // replay-safe: the marker never restamps
