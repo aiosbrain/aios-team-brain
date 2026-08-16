@@ -89,6 +89,17 @@ describe("PPARC-2 — the purge-generation fence (Codex High 1)", () => {
   it("an in-flight g: refresh overtaken by a purge DROPS its commit — the poisoned row is never resurrected", async () => {
     const { warmPartitionArcs, evictPartitionArcMemory } = await import("@/lib/graph/arcs");
     const group = projGroup();
+    // THIS test needs real facts — the file's beforeEach mocks an empty pool, and an empty
+    // synthesis short-circuits BEFORE the LLM (it committed an empty row before the eviction and
+    // made the first version of this pin fail for the wrong reason — found by instrumentation).
+    factsMock.recentFacts.mockResolvedValue({
+      facts: [{ id: "f1", fact: "pre-purge fact", at: "2026-07-20T00:00:00Z", subject: "alex", subjectType: "Person", object: "svc", objectType: "Service", episodeUuids: ["ep-1"] }],
+      ok: true,
+    });
+    factsMock.resolveEpisodeItems.mockResolvedValue({
+      items: new Map([["ep-1", { itemId: "11111111-1111-4111-8111-111111111111", source: "github" }]]),
+      ok: true,
+    });
     // Block the synthesis at the LLM so the purge can land mid-flight.
     let release: (() => void) | undefined;
     const blocked = new Promise<void>((r) => (release = r));

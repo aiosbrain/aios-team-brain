@@ -1234,12 +1234,17 @@ function refreshArcsInBackground(
   key: string,
   groups: string[],
   keys: ProviderKeys,
-  prior: { arcs: NarrativeArc[]; factsHash: string | null; degraded?: boolean } | null
+  prior: { arcs: NarrativeArc[]; factsHash: string | null; degraded?: boolean } | null,
+  /** PPARC-2: callers thread their pool-backed client; the adminClient() fallback covers legacy
+   *  call shapes. (Also what makes the fence TESTABLE — the unit env cannot construct adminClient,
+   *  so a refresh without this seam silently never ran there, which is how the fence pin's first
+   *  two versions were green-by-construction.) */
+  dbOverride?: DbClient
 ): void {
   if (refreshing.has(key)) return;
   refreshing.add(key);
   void (async () => {
-    const bg = adminClient();
+    const bg = dbOverride ?? adminClient();
     const startedAt = Date.now();
     try {
       // Not route-bound → give the reasoning model the full window (BG_ARC_TIMEOUT_MS). `prior` lets the
@@ -1349,7 +1354,7 @@ export async function warmPartitionArcs(
       memCacheSet(key, { arcs: persisted.arcs, at: persisted.computedAt, factsHash: persisted.factsHash, degraded: persisted.degraded });
       continue;
     }
-    refreshArcsInBackground(teamId, key, [group], keys, persisted ? { arcs: persisted.arcs, factsHash: persisted.factsHash, degraded: persisted.degraded } : null);
+    refreshArcsInBackground(teamId, key, [group], keys, persisted ? { arcs: persisted.arcs, factsHash: persisted.factsHash, degraded: persisted.degraded } : null, db);
     scheduled++;
   }
   return scheduled;
