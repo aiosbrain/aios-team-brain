@@ -1,6 +1,7 @@
 # Merge the two extraction calls into one — PIPEFF-5 / AIO-868
 
-**Status:** spec, pre-review. No code written.
+**Status: PAUSED at the owner's decision, 2026-08-16 — patch built and reviewed, battery NOT run.**
+Spend: **$1.06** of a $16 envelope. The incumbent baseline below is measured; the candidate arm is not.
 **Parent:** `docs/design/graph-ingestion-efficiency.md` §4 ("noted, not proposed"), now the largest
 remaining lever after PIPEFF-4 (packing) was declined on evidence.
 **Siblings shipped:** PIPEFF-2 (predecessor filter, −25.5% verified) · PIPEFF-3 (content-defined chunking).
@@ -44,6 +45,46 @@ Two consequences for the battery, neither fatal, both to be closed at build time
    fan-out rows, rather than relying on a corpus that happens to have no initiatives.
 
 Both are added to the run's preconditions. Neither changes the patch, the projection, or the $16.
+
+---
+
+## PAUSED — what exists, what does not, and what it would take to finish
+
+**Why it stopped.** Measured on prod's ledger the same day: graph spend is **$5.00–7.50/week**
+(~$0.011/episode, ~450–600 episodes/week) — down from a $48/day peak before this workstream. At that
+volume this lever's 12–14% is worth **$3–4/month**, against **~$15 more** to finish validating it.
+Payback ~4–5 months. The owner's call was to hold; recorded as their decision on the measured number.
+
+**Done, merged or pushed:**
+- The patch itself — `graphiti/patch-combined-extraction.py` + Dockerfile PATCH 4, validated against
+  the deployed file, two adversarial review rounds, 6 mutations. PR #557, **draft**.
+- The metering row so the merged call can never read as `unknown` (would have shown a fake ~45% saving).
+- The corpus instrument repaired — it was gating on the legacy chunker and under-counting by **40%**.
+- Q8′ built and tested, so the orphan-drop metric is buildable rather than discovered at harvest.
+- `run-rep.sh`, `build-arms.mjs` — the arms are proven to differ by exactly this patch.
+
+**Measured, and the one durable artifact of the spend — incumbent (PATCH 3) baseline, fresh graph,
+98 episodes, cross-check exact:**
+
+```
+input tok/episode  28,750        cost/episode  $0.0108        multiple  46.0x
+  dedupe_edges   24%   ·  dedupe_nodes  24%   ·  extract_edges 23%   ·  extract_nodes 20%
+```
+
+**`extract_nodes` + `extract_edges` = 43% of spend**, corroborating the 47.6% measured on prod from a
+different corpus. The lever's target is real and roughly the stated size.
+
+**To finish:** 7 more incumbent reps + 8 candidate reps, ~$15, ~6 hours. Everything else is in place.
+
+### The scaling finding that matters more than this lever
+
+Prod's **mature** graph bills **40,070** tokens/episode; this **fresh** graph bills **28,750** — a
+**+39% penalty from graph maturity alone**, at identical volume. The growth is in `dedupe_nodes`
+(24% of spend, 8,760 avg input tokens): its candidate list grows as the graph does.
+
+For a team running this for a year, **cost per episode rises over time independent of how much they
+ingest.** That is a larger and more structural risk than a one-off 12% saving, and no lever in this
+workstream addresses it. Recorded as an observation, not a proposal.
 
 ---
 
