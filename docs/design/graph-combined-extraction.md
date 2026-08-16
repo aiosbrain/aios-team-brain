@@ -76,6 +76,36 @@ different corpus. The lever's target is real and roughly the stated size.
 
 **To finish:** 7 more incumbent reps + 8 candidate reps, ~$15, ~6 hours. Everything else is in place.
 
+### The three conditions for turning it on — two of them mechanical
+
+The patch merges **behind a build flag defaulted off**, so production behaviour is unchanged and the
+17 files of instrument repair and tests stop being stranded on a branch (one of them fixes a bug live
+on main today: the corpus gate counts with the legacy chunker and under-counts by **40%**).
+
+A flag with only prose behind it becomes furniture. So two of the three conditions are enforced by
+tests, not by memory:
+
+| # | condition | enforcement |
+|---|---|---|
+| 1 | **On only after a passing battery.** Never on an unmeasured guess — this changes the extraction *prompt*, so mechanism cannot carry the quality argument | **Mechanical.** `PIPEFF5_COMBINED_EXTRACTION` defaults `0`; a guard asserts the Dockerfile's default path produces an **unpatched** file, so a merge can never quietly enable it |
+| 2 | **Run the battery only when it pays.** Graph spend sustained at **~3× today (~$15/week)**, *or* a real customer heading for that volume | Judgement, but on a checkable number: today is **$5.00–7.50/week** at ~$0.011/episode, measured. At ~$15/week the saving is ~$8/month and the ~$16 battery pays back in ~2 months |
+| 3 | **Delete by 2027-02-16 if neither happens.** Six months. Not "revisit" — *delete* | **Mechanical.** An expiry guard reddens on that date and names the decision, so the choice gets made by a person instead of decaying into permanent config |
+
+**Why condition 2 is different for a product than for us.** If this ships to other teams, the trigger
+is not *our* volume — it is that the validation should exist **before** a customer runs at that
+volume, not after. Our own bill may never grow; that does not make the lever less relevant to someone
+running 10×. The trigger is therefore "3× our spend **or** a customer heading there", whichever
+arrives first.
+
+**Why an expiry rather than a `TODO`.** A dormant vendored patch is real carrying cost: every reader
+of `graphiti/Dockerfile` has to work out whether it is live. The guard converts "we should decide
+this someday" into a dated, unavoidable decision — and if the answer is delete, that is a success of
+this design, not a failure of the lever.
+
+**What keeps the patch honest while dormant:** the existing guard runs the real patch script against
+the real anchors on every CI run. A graphiti upgrade that breaks it reddens the build whether the flag
+is on or off, so the patch cannot silently rot into something that no longer applies.
+
 ### The scaling finding that matters more than this lever
 
 Prod's **mature** graph bills **40,070** tokens/episode; this **fresh** graph bills **28,750** — a

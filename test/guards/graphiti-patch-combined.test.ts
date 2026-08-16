@@ -391,3 +391,71 @@ asyncio.run(main())
     }
   });
 });
+
+/**
+ * THE TWO CONDITIONS THAT ARE MECHANICAL (PIPEFF-5, docs/design/graph-combined-extraction.md).
+ *
+ * The patch merges DORMANT: it changes the extraction prompt, the battery that would validate that
+ * was paused after one rep, and at current volume the saving (~$3-4/month) does not pay for the ~$15
+ * of measurement. What merges is the instrument repair and tests beside it.
+ *
+ * A flag with only prose behind it becomes furniture, so:
+ *   1. the default must be OFF, and a build must not be able to quietly enable it;
+ *   3. the whole thing must be DELETED by an expiry date rather than left as permanent config.
+ *
+ * Condition 2 (run the battery at ~3x today's spend, or when a customer is heading there) is a
+ * judgement on a measured number and is deliberately NOT encoded — a threshold on a live cost feed
+ * would be a fourth unmeasured constant, which is the pattern this workstream keeps retiring.
+ */
+describe("PIPEFF-5 is merged DORMANT — the flag and the expiry, not the prose", () => {
+  const dockerfile = readFileSync(join(REPO, "graphiti/Dockerfile"), "utf8");
+
+  it("condition 1: the build arg exists and DEFAULTS OFF", () => {
+    // If this reddens because someone set it to 1, that is the ship decision — it must arrive with a
+    // passing battery attached, not as a side effect of another change.
+    expect(dockerfile).toMatch(/ARG PIPEFF5_COMBINED_EXTRACTION=0/);
+  });
+
+  it("condition 1: the default branch ASSERTS the file is unpatched, so off cannot silently be on", () => {
+    // The gate is not "we didn't run the patch" — it is "the file we ship does not contain it".
+    // A mount, a cache layer or a reordered build could otherwise leave a patched file behind an
+    // off flag, which is the silent-no-op class inverted.
+    expect(dockerfile).toMatch(/! grep -q 'PIPEFF-5: one extraction call'/);
+  });
+
+  it("condition 1: PATCH 3 is verified in BOTH branches — the incumbent behaviour never depends on this flag", () => {
+    const patch4Block = dockerfile.slice(dockerfile.indexOf("ARG PIPEFF5_COMBINED_EXTRACTION"));
+    const patch3Checks = patch4Block.match(/grep -q 'PIPEFF-2: carry only the SAME ITEM'/g) ?? [];
+    expect(patch3Checks.length).toBeGreaterThanOrEqual(1);
+    // …and it sits OUTSIDE the if/else, so it runs whichever way the flag points.
+    expect(patch4Block).toMatch(/fi \\\n \&\& grep -q 'PIPEFF-2: carry only the SAME ITEM'/);
+  });
+
+  /**
+   * Condition 3. This test is a deliberate time bomb.
+   *
+   * It reddens on 2027-02-16 and the ONLY correct responses are: delete the patch, its script, this
+   * suite and the Dockerfile block; or turn the flag on with a passing battery behind it and move the
+   * date. "Bump the date because CI is red" is the wrong answer and the message says so.
+   *
+   * Written this way because a `TODO: revisit` has no failure mode — a dormant vendored patch to a
+   * third-party library is real carrying cost (every reader of the Dockerfile has to work out whether
+   * it is live), and the thing that reliably removes it is a build that stops.
+   */
+  it("condition 3: the dormant patch expires 2027-02-16 — decide, do not let it become furniture", () => {
+    const EXPIRY = Date.UTC(2027, 1, 16);
+    const enabled = /ARG PIPEFF5_COMBINED_EXTRACTION=1/.test(dockerfile);
+    if (Date.now() < EXPIRY || enabled) return;
+    throw new Error(
+      [
+        "PIPEFF-5 has been dormant for six months. Decide, do not bump this date:",
+        "  · DELETE it — graphiti/patch-combined-extraction.py, the Dockerfile PATCH 4 block,",
+        "    this suite, and the extract_nodes_and_edges row in lib/llm/graph-call-kind.ts.",
+        "    This is the expected answer if graph spend never reached ~3x its 2026-08 level.",
+        "  · Or ENABLE it — but only with a passing 2-arm x 8-rep battery attached",
+        "    (docs/design/graph-combined-extraction.md), never on the mechanism argument.",
+        "Bumping the date to make CI green is the failure this guard exists to prevent.",
+      ].join("\n")
+    );
+  });
+});

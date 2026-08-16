@@ -208,12 +208,33 @@ RUN F=/app/.venv/lib/python3.12/site-packages/graphiti_core/graphiti.py \
 #     break `add_episode_bulk` silently. The gate greps the CALL, not the import — an earlier version
 #     of this comment claimed both, and describing a check that is not there is how a gate comes to be
 #     trusted for something it never did.
+# ⚠️ DEFAULTED OFF. This lever is NOT validated: it changes the extraction PROMPT, so quality cannot
+# be argued from mechanism, and the 2-arm x 8-rep battery that would settle it has NOT been run (it
+# was paused after one rep at the owner's call — the saving is ~$3-4/month at current volume against
+# ~$15 to finish measuring it). The patch merges so the instrument repair and tests beside it stop
+# being stranded on a branch; the SWITCH stays off.
+#
+# Turning it on is a one-line change to this default, and the three conditions are in
+# docs/design/graph-combined-extraction.md:
+#   1. on ONLY after a passing battery — never on an unmeasured guess;
+#   2. run the battery only at ~3x today's graph spend (~$15/week) or when a customer is heading
+#      there — below that the measurement costs more than the saving;
+#   3. if neither has happened by 2027-02-16, DELETE this block rather than keep it as decoration.
+# (2) is a judgement on a measured number; (1) and (3) are enforced by
+# `test/guards/graphiti-patch-combined.test.ts`, which asserts this default is off and reddens on the
+# expiry date. A flag with only prose behind it becomes furniture.
+ARG PIPEFF5_COMBINED_EXTRACTION=0
 COPY patch-combined-extraction.py /tmp/patch-combined-extraction.py
 RUN F=/app/.venv/lib/python3.12/site-packages/graphiti_core/graphiti.py \
- && /app/.venv/bin/python /tmp/patch-combined-extraction.py "$F" \
- && grep -q 'PIPEFF-5: one extraction call' "$F" \
- && grep -q 'pre_extracted_edges: list\[EntityEdge\] | None = None' "$F" \
- && test "$(grep -c 'extracted_edges = await extract_edges(' "$F")" = "1" \
+ && if [ "$PIPEFF5_COMBINED_EXTRACTION" = "1" ]; then \
+      /app/.venv/bin/python /tmp/patch-combined-extraction.py "$F" \
+   && grep -q 'PIPEFF-5: one extraction call' "$F" \
+   && grep -q 'pre_extracted_edges: list\[EntityEdge\] | None = None' "$F" \
+   && test "$(grep -c 'extracted_edges = await extract_edges(' "$F")" = "1" ; \
+    else \
+      echo "PIPEFF-5 combined extraction: OFF (default)" \
+   && ! grep -q 'PIPEFF-5: one extraction call' "$F" ; \
+    fi \
  && grep -q 'PIPEFF-2: carry only the SAME ITEM' "$F"
 
 # ── THE RUNTIME REVERT — the trap that explains Trap 1 ─────────────────────────────────────────────
