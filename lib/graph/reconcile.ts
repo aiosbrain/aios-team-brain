@@ -358,7 +358,12 @@ export async function reconcileProjectedEpisodes(
   let selfPurgePending = false;
   for (const row of rows) {
     if (!row.pending_delete_group_id) continue;
-    if (row.pending_delete_group_id === row.group_id) selfPurgePending = true;
+    // Purge only when a SELF clear is plausibly IMMINENT (past the cleanup grace) — keying on mere
+    // flag existence made every pass of a stuck cleanup delete the suppressed-scope rows readers
+    // were actively rebuilding, an inline re-synthesis per view per pass (Fable PCCC-7 Medium 2).
+    const selfFlaggedAt = new Date(row.pending_delete_at ?? row.projected_at).getTime();
+    if (row.pending_delete_group_id === row.group_id && selfFlaggedAt <= Date.now() - CLEANUP_GRACE_MS)
+      selfPurgePending = true;
     const arr = pendingByGroup.get(row.pending_delete_group_id) ?? [];
     arr.push(row);
     pendingByGroup.set(row.pending_delete_group_id, arr);

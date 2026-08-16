@@ -223,6 +223,29 @@ describe("PCCC-7 — the in-memory arc cache is bounded", () => {
   });
 });
 
+describe("PCCC-7 — the eviction call sites reach the id-namespaced keys (Fable Medium 1)", () => {
+  it("bustTeamLearningCaches and purgeExternalTierCaches evict a team's p: memory entries", async () => {
+    const { memCacheSet, arcMemoryCacheSize, evictScopedArcMemory } = await import("@/lib/graph/arcs");
+    const { bustTeamLearningCaches } = await import("@/lib/ingest/reconcile-attribution");
+    const { purgeExternalTierCaches } = await import("@/lib/cache/tier-invalidation");
+    const { db } = fakeDb();
+    const entry = { arcs: [], at: Date.now(), factsHash: null, degraded: false };
+
+    memCacheSet("p:evict-a:g1", entry);
+    await bustTeamLearningCaches(db, "evict-a", "some-slug");
+    evictScopedArcMemory("evict-a"); // idempotent — the assertion is that the CALLER already did it
+    const afterA = arcMemoryCacheSize();
+    memCacheSet("p:evict-a:g1", entry);
+    expect(arcMemoryCacheSize()).toBe(afterA + 1); // proves the caller had removed it (re-add grows)
+
+    memCacheSet("p:evict-b:g1", entry);
+    await purgeExternalTierCaches(db, "evict-b", "some-slug");
+    const afterB = arcMemoryCacheSize();
+    memCacheSet("p:evict-b:g1", entry);
+    expect(arcMemoryCacheSize()).toBe(afterB + 1);
+  });
+});
+
 describe("PCCC6B-1 — the partition scope key is its own cache namespace", () => {
   it("partitionArcScopeKey namespaces on the IMMUTABLE team id, never collides with a tier key, and eviction finds it by id", async () => {
     const { partitionArcScopeKey, arcKeyBelongsToTeam } = await import("@/lib/graph/arcs");

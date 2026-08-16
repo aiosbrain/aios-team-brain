@@ -156,9 +156,12 @@ export async function purgeScopedArcCache(db: DbClient, teamId: string): Promise
   }
 }
 
-/** How old a `p:` row must be before the orphan sweep may take it: well past the 4h TTL, so only
- *  rows no active reader's scope resolves to anymore (oracle churn strands them) are collected. */
-export const SCOPED_ARC_SWEEP_AGE_MS = 48 * 60 * 60_000;
+/** How old a `p:` row must be before the orphan sweep may take it: SEVEN DAYS, not a TTL multiple —
+ *  a 48h floor collected every enforced reader's row over an idle weekend, and the Monday cold miss
+ *  re-synthesized with `prior = null`, re-minting arc ids and resetting the continuity lineage the
+ *  ARCDUP machinery exists to preserve (Fable PCCC-7 Medium 3). A week of silence is genuine
+ *  abandonment; storage is the only cost of waiting. */
+export const SCOPED_ARC_SWEEP_AGE_MS = 7 * 24 * 60 * 60_000;
 
 /**
  * Delete `p:` rows a team's oracle churn has stranded (PCCC-7's orphan sweep — every scope-set

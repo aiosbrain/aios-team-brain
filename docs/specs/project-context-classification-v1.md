@@ -689,8 +689,8 @@ Everyone may see**, not "everything":
 Cross-project synthesis is never computed (the permission-laundering answer); each partition's
 synthesis reads only its own content. **Sanctioned exception (PCCC6B-1, ruled post-merge after the
 second-model review pressed the letter of this rule):** a PRINCIPAL-scoped synthesis over exactly
-the reader's own visible, ready partitions — cache-keyed by that exact scope so no other principal
-can be served it — is permitted: its input set is the reader's own oracle, so the laundering this
+the reader's own visible, ready partitions — cache-keyed by that exact scope so it is only ever
+served to a principal holding that same scope — is permitted: its input set is the reader's own oracle, so the laundering this
 rule exists to prevent cannot occur. True per-partition arcs (one synthesis per project, fused at
 read time) remain the deferred product form.
 

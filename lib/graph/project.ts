@@ -8,6 +8,8 @@ import { resolvePositiveInt } from "@/lib/util/env";
 import { chunkCdc, type CdcParams } from "./cdc";
 import { sourceRules } from "@/lib/ingest/source-rules";
 import { resolveFanoutTargets } from "@/lib/projects/context/fanout-targets";
+import { purgeScopedArcCache } from "./arc-cache";
+import { evictScopedArcMemory } from "./arcs";
 import { ensureArmingRows } from "./arming-row";
 // Re-exported so the graph module's existing importers (and their specs) keep one import path.
 export { resolvePositiveInt };
@@ -745,6 +747,20 @@ export async function projectItemsToGraph(
   // module (the access-single-writer guard's coarse net rightly refuses those table literals in a
   // file full of write verbs).
   const generalProject = pointers.find((p) => p.kind === "system" && p.slug === "general") ?? null;
+  // PCCC-7 (Fable High): clearing a SELF-purge flag is what un-suppresses a partition — and this
+  // projector path clears them too (`purgeBeforeRepush`), not just reconcile. The same rule applies
+  // at BOTH doors: the team's partition-scoped arc rows must be confirmed purged before any self
+  // flag may clear, else a pre-restriction/pre-redaction `p:` row (whose SUMMARY prose the evidence
+  // filter cannot see) is re-served by SWR the moment the scope key resolves again. Memoized once
+  // per pass; a failed purge holds every clear this pass — fail closed, converging next pass.
+  let scopedArcPurgeState: boolean | null = null;
+  const scopedArcPurgeGate = async (): Promise<boolean> => {
+    if (scopedArcPurgeState === null) {
+      scopedArcPurgeState = (await purgeScopedArcCache(db, args.teamId)).ok;
+      if (scopedArcPurgeState) evictScopedArcMemory(args.teamId);
+    }
+    return scopedArcPurgeState;
+  };
   const { targets: fanoutTargetsByItem, inGeneral } = await resolveFanoutTargets(db, {
     teamId: args.teamId,
     itemIds: rows.map((r) => r.id),
@@ -1493,8 +1509,8 @@ export async function projectItemsToGraph(
           // the delete and only then clears the flag — the same convergence the tier path uses.
           retractFailed
           ? { pending_delete_group_id: groupId, pending_delete_at: projectedAt }
-          : purgeBeforeRepush && !purgeFailed
-            ? { pending_delete_group_id: null, pending_delete_at: null } // purge confirmed + re-pushed
+          : purgeBeforeRepush && !purgeFailed && (await scopedArcPurgeGate())
+            ? { pending_delete_group_id: null, pending_delete_at: null } // purge confirmed + re-pushed (self clear — scoped arc rows purged first, see the gate)
             : {};
 
     const { error: ledgerWriteErr } = await db.from("graph_episodes").upsert(
