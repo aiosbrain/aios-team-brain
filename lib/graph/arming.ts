@@ -62,9 +62,11 @@ export async function armProjectsForPrincipal(
   //   LATCHED  → flip: late-tagged content extracts eventually; the latch is already set and
   //              monotone, so new obligations can never block it.
   //   ARMED-BUT-UNLATCHED → flip ONLY when the snapshot was never taken (zero non-deferred rows in
-  //              the group — the earlier arm wrote its row, then crashed before the flip; taking
-  //              the snapshot now is the liveness repair, or those rows would stay deferred and the
-  //              partition dark forever). Otherwise DO NOT flip: the first latch must evaluate
+  //              the group). Two producers of that state, one routine: arm-on-restrict's first
+  //              pass writes the arming row before the fan-out row exists to flip, and a crashed
+  //              arm dies between its row write and its flip. Taking the snapshot now is the
+  //              liveness repair — without it those rows stay deferred and the partition dark
+  //              forever. Otherwise DO NOT flip: the first latch must evaluate
   //              exactly the rows the first arm flipped. Re-arms feeding every later tag into the
   //              pending obligation set is precisely the busy-project starvation the design
   //              rejected (rows tagged after the snapshot stay deferred — invisible to the latch —
