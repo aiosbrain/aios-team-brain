@@ -1062,7 +1062,7 @@ leak. See `docs/specs/meeting-participation-as-work-v1.md`. A person's evidence 
 `graph_relationships` · `query_log` · `policies` · `approval_requests` · `actions` ·
 `codebases` · `code_metrics` · `codebase_findings` · `codebase_finding_events` · `code_contributions` · `github_issues` · `member_emails` ·
 `member_identities` · `member_secrets` · `member_profiles` · `member_time_off` · `member_goals` · `member_provisioning` · `integrations` ·
-`agentic_maturity_snapshots` · `task_pm_links` · `task_evidence` · `work_events` · `usage_costs` · `llm_usage` · `llm_failures` · `subscriptions` · `graph_episodes` · `graph_project_arming` · `arc_cache` · `arc_corrections` · `work_timeline_cache` · `doc_task_inference` ·
+`agentic_maturity_snapshots` · `migration_markers` · `task_pm_links` · `task_evidence` · `work_events` · `usage_costs` · `llm_usage` · `llm_failures` · `subscriptions` · `graph_episodes` · `graph_project_arming` · `arc_cache` · `arc_corrections` · `work_timeline_cache` · `doc_task_inference` ·
 `conversations` · `chat_messages` · `chat_turn_runs` · `ingest_runs` · `social_jobs` · `brand_profiles` · `brand_assets` · `social_opportunities` · `content_plans` · `content_variants` · `media_assets` · `social_image_usage` · `social_settings` · `content_approvals` · `social_publications` · `publication_analytics` ·
 `meeting_notes` · `meeting_note_attendees` · `meeting_note_submitters` ·
 `groups` · `group_members` · `project_groups` · `agent_tokens` ·

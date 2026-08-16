@@ -1,7 +1,7 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import type { NarrativeArc } from "./arcs";
-import { getArcs, warmPartitionArcs, MAX_ARCS, type ProviderKeys } from "./arcs";
+import { getArcs, schedulePartitionRefresh, PPARC_SYNTH_BUDGET_PER_READ, MAX_ARCS, type ProviderKeys } from "./arcs";
 import { readArcCache, arcTtlMs, type ArcCacheEntry } from "./arc-cache";
 import { freshness, computedNow, type Freshness } from "@/lib/freshness";
 import { latestPushByGroup } from "./extraction-health";
@@ -92,10 +92,11 @@ export async function getFusedArcs(
     (a, b) => (recency.get(b) ?? 0) - (recency.get(a) ?? 0) || a.localeCompare(b)
   );
 
-  const entries: Array<{ group: string; entry: ArcCacheEntry | null }> = [];
-  for (const group of rankedGroups) {
-    entries.push({ group, entry: await readArcCache(db, teamId, `g:${group}`) });
-  }
+  // PARALLEL reads (Codex PPARC-3 Medium 3: serial per-partition awaits made a wide scope pay
+  // N round-trips end-to-end where one batch suffices).
+  const entries: Array<{ group: string; entry: ArcCacheEntry | null }> = await Promise.all(
+    rankedGroups.map(async (group) => ({ group, entry: await readArcCache(db, teamId, `g:${group}`) }))
+  );
 
   // ONE inline synthesis: the highest-ranked partition with NO row at all. Stale-present rows are
   // served immediately and revalidated via the background warm below (they never synthesize
@@ -120,14 +121,22 @@ export async function getFusedArcs(
           : null);
   }
   // Background-warm EVERYTHING else — missing AND stale-present (Fable PPARC-3 High 2: warming
-  // only the missing left stale rows with no revalidation trigger at all — SWR with no R; the
-  // p:-union warm trigger is dead post-cutover). warmPartitionArcs skips fresh rows internally,
-  // so passing every non-inline group costs probes, not syntheses.
-  const nonInline = entries.filter((e) => e.group !== inlineTarget).map((e) => e.group);
-  // AWAITED scheduling (the syntheses themselves stay background): the probes are one cheap read
-  // per non-fresh group, and the returned count is the H2 pin's observable — fire-and-forget here
-  // made "stale rows revalidate" an unpinnable claim.
-  const warmScheduled = nonInline.length > 0 ? await warmPartitionArcs(db, teamId, nonInline, keys) : 0;
+  // only the missing left stale rows with no revalidation trigger at all — SWR with no R). The
+  // scheduling reuses THE ROWS ALREADY READ above (Codex Medium 3: re-probing them through
+  // warmPartitionArcs doubled the serial reads), is budgeted, and its count is the pin's
+  // observable; the syntheses themselves stay background.
+  let warmScheduled = 0;
+  const nowForWarm = Date.now();
+  for (const e of entries) {
+    if (e.group === inlineTarget) continue;
+    if (warmScheduled >= PPARC_SYNTH_BUDGET_PER_READ) break;
+    const isFresh =
+      e.entry != null &&
+      !freshness(e.entry.computedAt, arcTtlMs(e.entry.degraded), { now: nowForWarm, degraded: e.entry.degraded }).stale;
+    if (isFresh) continue;
+    const prior = e.entry ? { arcs: e.entry.arcs, factsHash: e.entry.factsHash, degraded: e.entry.degraded } : null;
+    if (schedulePartitionRefresh(db, teamId, e.group, keys, prior)) warmScheduled++;
+  }
 
   const present = entries.filter((e): e is { group: string; entry: ArcCacheEntry } => e.entry != null);
   const { arcs, asOf, anyDegraded } = fuseArcRows(present);

@@ -97,16 +97,18 @@ describe("PPARC-3 — the p:→g: corrections migration (criterion 5, moved from
         .insert({ team_id: seed.teamId, arc_id: row.arc_id, arc_title: "t", corrected_text: "take", group_key: row.group_key });
       expect(error).toBeNull();
     }
-    // A pre-cutover g: row (backdated before the wipe bound) — the wipe target (Codex H2) — and a
-    // POST-cutover row that must SURVIVE replay (Fable PPARC-3 High 3: the unbounded wipe
-    // cold-wiped the whole partition cache on every deploy).
+    // A pre-cutover g: row: anything computed before the MARKER's first-run stamp (Codex PPARC-3
+    // High 2: a source-code date was wrong for a self-host that warmed rows between taking
+    // PPARC-2 and PPARC-3 — the marker is deployment-relative by construction). Rows written
+    // AFTER the first run must survive replay (Fable High 3: the unbounded wipe cold-wiped the
+    // cache on every deploy).
     await writeArcCache(db(), seed.teamId, `g:${g}`, arcRow("x", "pre-cutover") as never, "h");
-    await runSql("update arc_cache set computed_at = timestamptz '2026-08-15 00:00:00+00' where team_id = $1 and group_key = $2", [seed.teamId, `g:${g}`]);
-    await writeArcCache(db(), seed.teamId, "g:post-cutover", arcRow("y", "post-cutover") as never, "h");
+    await runSql("update arc_cache set computed_at = now() - interval '1 minute' where team_id = $1 and group_key = $2", [seed.teamId, `g:${g}`]);
 
     const MIG = (await import("node:fs")).readFileSync("postgres/migrations/20260816150000_arc_corrections_partition_scope.sql", "utf8");
-    await runSql(MIG);
-    await runSql(MIG); // replay-safe
+    await runSql(MIG); // first run stamps the marker + wipes pre-cutover rows
+    await writeArcCache(db(), seed.teamId, "g:post-cutover", arcRow("y", "post-cutover") as never, "h");
+    await runSql(MIG); // replay-safe: the marker never restamps
 
     const rows = await runSql<{ arc_id: string; group_key: string }>(
       "select arc_id, group_key from arc_corrections where team_id = $1 order by arc_id",

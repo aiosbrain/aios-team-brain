@@ -10,16 +10,25 @@
 --   3. PRE-CUTOVER `g:` cache rows are WIPED (Codex PPARC-2 High 2): rows warmed before this
 --      migration were synthesized against g:-scoped corrections that did not exist yet — a
 --      re-keyed correction would sit unheard behind a fresh row for a TTL. The wipe is
---      DATE-BOUNDED so replay CONVERGES (Fable PPARC-3 High 3: an unbounded predicate re-wiped
---      the whole partition cache on EVERY deploy — cold panels, re-minted arc ids, reset
---      continuity lineage, per merge, forever). Rows computed after the bound are post-cutover
---      and correct by construction.
--- Idempotent: re-keyed rows stop matching; the wipe matches nothing once post-cutover rows exist.
+--      bounded by a DEPLOYMENT-RELATIVE MARKER so replay converges on EVERY instance (Fable
+--      PPARC-3 High 3: an unbounded predicate re-wiped the cache per deploy; Codex PPARC-3
+--      High 2: a source-code date is wrong for a self-host that warmed g: rows between taking
+--      PPARC-2 and PPARC-3 — their pre-cutover rows would postdate any literal). The marker is
+--      stamped at this migration's FIRST run on the instance; rows computed before it are
+--      pre-cutover BY DEFINITION, rows after it survive replay.
+-- Idempotent: re-keyed rows stop matching; the marker never restamps; the wipe converges.
 update arc_corrections
    set group_key = 'g:' || substr(group_key, length('p:' || team_id || ':') + 1)
  where group_key like 'p:' || team_id || ':%'
    and position(',' in substr(group_key, length('p:' || team_id || ':') + 1)) = 0;
-delete from arc_cache where group_key like 'g:%' and computed_at < timestamptz '2026-08-16 12:00:00+00';
+create table if not exists migration_markers (
+  name text primary key,
+  at timestamptz not null default now()
+);
+insert into migration_markers (name) values ('pparc3_g_wipe') on conflict (name) do nothing;
+delete from arc_cache
+ where group_key like 'g:%'
+   and computed_at < (select at from migration_markers where name = 'pparc3_g_wipe');
 do $$
 declare stranded int;
 begin

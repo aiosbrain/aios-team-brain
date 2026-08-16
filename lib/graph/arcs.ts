@@ -1334,6 +1334,23 @@ export const PPARC_SYNTH_BUDGET_PER_READ = resolvePositiveInt(process.env.PPARC_
  * machinery — single-flighted per key by `refreshing`, full BG timeout, per-partition corrections
  * scope — so a union read warms the partition rows the PPARC-3 cutover will serve. Fire-and-forget.
  */
+/** Schedule ONE partition's background refresh from an ALREADY-READ entry (PPARC-3, Codex
+ *  Medium 3: getFusedArcs holds every row it just read — re-probing them through
+ *  warmPartitionArcs doubled the serial reads on the panel hot path). Returns whether a refresh
+ *  was actually fired (single-flighted by `refreshing`). */
+export function schedulePartitionRefresh(
+  db: DbClient,
+  teamId: string,
+  group: string,
+  keys: ProviderKeys,
+  prior: { arcs: NarrativeArc[]; factsHash: string | null; degraded: boolean } | null
+): boolean {
+  const key = `g:${group}`;
+  if (refreshing.has(key)) return false;
+  refreshArcsInBackground(teamId, key, [group], keys, prior, db);
+  return true;
+}
+
 export async function warmPartitionArcs(
   db: DbClient,
   teamId: string,

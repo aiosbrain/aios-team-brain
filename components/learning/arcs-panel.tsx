@@ -49,7 +49,11 @@ export function ArcsPanel({ teamSlug, variant = "full" }: { teamSlug: string; va
   // Why the panel is empty (server-diagnosed): no_facts | model_failing | synthesis_empty | null.
   const [emptyReason, setEmptyReason] = useState<string | null>(null);
   const [emptyNote, setEmptyNote] = useState<string | null>(null);
-  const [edited, setEdited] = useState<Record<string, string>>({}); // arc_id → corrected text
+  // COMPOSITE identity (Codex PPARC-3 High 1): arc_id is sha(title) and legitimately collides
+  // ACROSS partitions in a fused panel — keying edit state on the id alone routed a human's prose
+  // to the wrong partition (the first matching arc won). Key = `${sourceGroup}|${arc_id}`; "|"
+  // appears in neither charset.
+  const [edited, setEdited] = useState<Record<string, string>>({}); // composite key → corrected text
   const [editing, setEditing] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
   const [recomputing, setRecomputing] = useState(false);
@@ -81,6 +85,8 @@ export function ArcsPanel({ teamSlug, variant = "full" }: { teamSlug: string; va
     };
   }, [teamSlug]);
 
+  const keyOf = (a: { id: string; sourceGroup?: string }) => `${a.sourceGroup ?? ""}|${a.id}`;
+
   function saveEdit(id: string) {
     const text = draft.trim();
     setEdited((e) => (text ? { ...e, [id]: text } : e));
@@ -88,17 +94,21 @@ export function ArcsPanel({ teamSlug, variant = "full" }: { teamSlug: string; va
   }
 
   async function recompute() {
-    const all = Object.entries(edited).map(([arc_id, corrected_text]) => ({
-      arc_id,
-      corrected_text,
-      // `arc_id` is a hash of the title and churns on every recompute, so the server stores the title
-      // beside it to keep the correction diagnosable afterwards. Sending it is what makes that work —
-      // without it every stored row has an empty title and the column is decoration.
-      arc_title: arcs.find((a) => a.id === arc_id)?.title ?? "",
-      // PPARC-3: a fused panel's arcs carry their partition; the server accepts ONE partition per
-      // POST (undefined = the permissive tier path, whose panel has no sourceGroup).
-      sourceGroup: arcs.find((a) => a.id === arc_id)?.sourceGroup,
-    }));
+    const all = Object.entries(edited).map(([key, corrected_text]) => {
+      const sep = key.indexOf("|");
+      const sourceGroup = key.slice(0, sep) || undefined;
+      const arc_id = key.slice(sep + 1);
+      return {
+        key,
+        arc_id,
+        corrected_text,
+        // `arc_id` is a hash of the title and churns on every recompute, so the server stores the title
+        // beside it to keep the correction diagnosable afterwards.
+        arc_title: arcs.find((a) => a.id === arc_id && (a.sourceGroup ?? undefined) === sourceGroup)?.title ?? "",
+        // ONE partition per POST (undefined = the permissive tier path, whose panel has no sourceGroup).
+        sourceGroup,
+      };
+    });
     if (!all.length) return;
     setRecomputing(true);
     setSaveError(null);
@@ -127,7 +137,7 @@ export function ArcsPanel({ teamSlug, variant = "full" }: { teamSlug: string; va
           // arc ids or re-pays its synthesis).
           setEdited((e) => {
             const next = { ...e };
-            for (const c of batch) delete next[c.arc_id];
+            for (const c of batch) delete next[c.key];
             return next;
           });
         } else anyFailed = true;
@@ -242,7 +252,7 @@ export function ArcsPanel({ teamSlug, variant = "full" }: { teamSlug: string; va
               </span>
             </div>
             <p className="line-clamp-2 text-[13px] leading-snug text-ink-secondary">
-              {edited[arc.id] ?? arc.summary}
+              {edited[keyOf(arc)] ?? arc.summary}
             </p>
           </div>
         ))}
@@ -266,10 +276,11 @@ export function ArcsPanel({ teamSlug, variant = "full" }: { teamSlug: string; va
   return (
     <div className="flex flex-col gap-3">
       {arcs.map((arc) => {
-        const text = edited[arc.id] ?? arc.summary;
-        const isEdited = arc.id in edited;
+        const arcK = keyOf(arc);
+        const text = edited[arcK] ?? arc.summary;
+        const isEdited = arcK in edited;
         return (
-          <div key={arc.id} className="prism-card flex flex-col gap-2 p-4">
+          <div key={arcK} className="prism-card flex flex-col gap-2 p-4">
             <div className="flex items-start justify-between gap-3">
               <h3 className="font-medium text-ink">{arc.title}</h3>
               <div className="flex shrink-0 items-center gap-2">
@@ -284,7 +295,7 @@ export function ArcsPanel({ teamSlug, variant = "full" }: { teamSlug: string; va
               </div>
             </div>
 
-            {editing === arc.id ? (
+            {editing === arcK ? (
               <textarea
                 autoFocus
                 value={draft}
@@ -292,19 +303,19 @@ export function ArcsPanel({ teamSlug, variant = "full" }: { teamSlug: string; va
                 onKeyDown={(e) => {
                   if (e.key === "Enter" && !e.shiftKey) {
                     e.preventDefault();
-                    saveEdit(arc.id);
+                    saveEdit(arcK);
                   } else if (e.key === "Escape") {
                     setEditing(null);
                   }
                 }}
-                onBlur={() => saveEdit(arc.id)}
+                onBlur={() => saveEdit(arcK)}
                 className="min-h-16 w-full resize-none rounded-md border border-border-default bg-surface-base px-2.5 py-1.5 text-sm text-ink outline-none focus:border-violet/50"
               />
             ) : (
               <p
                 onClick={() => {
                   setDraft(text);
-                  setEditing(arc.id);
+                  setEditing(arcK);
                 }}
                 className="cursor-text text-sm leading-relaxed text-ink-secondary hover:text-ink"
                 title="Click to edit"
