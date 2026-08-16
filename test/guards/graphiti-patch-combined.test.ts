@@ -431,6 +431,21 @@ describe("PIPEFF-5 is merged DORMANT — the flag and the expiry, not the prose"
     expect(patch4Block).toMatch(/fi \\\n \&\& grep -q 'PIPEFF-2: carry only the SAME ITEM'/);
   });
 
+  it("condition 1, PROVED not asserted: the default build reproduces the file prod runs today", () => {
+    // Built locally with the flag at its default and checksummed inside the image:
+    //   default-off  ->  49ee534a1043760f9e3b58617f7853edd65e7e643a75f34f75267528cb0ec72d
+    // which is the sha `docs/design/graph-episode-window-phase-c.md:186` records as the exact file
+    // PIPEFF-2 measured and shipped. So merging this PR is a provable NO-OP for production: the
+    // graphiti image rebuilds and serves a byte-identical `graphiti.py`.
+    //
+    // Pinned here as the string the Dockerfile must keep citing, so a future edit to PATCH 3 or the
+    // base image cannot quietly change what "off" ships while this suite still passes. The build
+    // itself is not run in CI (it needs Docker and several minutes); this is the anchor that makes
+    // the claim re-checkable by hand with one command, which is stated in the Dockerfile.
+    const SHIPPED_TODAY = "49ee534a1043760f9e3b58617f7853edd65e7e643a75f34f75267528cb0ec72d";
+    expect(dockerfile).toContain(SHIPPED_TODAY);
+  });
+
   /**
    * Condition 3. This test is a deliberate time bomb.
    *

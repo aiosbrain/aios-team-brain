@@ -944,9 +944,17 @@ guard enforces it, it's named.
   **PATCH 4 runs after PATCH 3 and depends on it** — the predecessor filter sits at the *retrieval*
   site, upstream of both extractors, so the combined call inherits it — enforced by the Dockerfile
   applying PATCH 3 first against the same file, and pinned compositionally across the two patch
-  guards rather than by any single test. **Projected ~12–14% of graph cost; NOT yet shipped on evidence** — unlike PATCH 3 this
+  guards rather than by any single test. **Merged DORMANT behind `ARG PIPEFF5_COMBINED_EXTRACTION=0`**: the default build provably serves
+  the file prod runs today (sha `49ee534a…`, the one PIPEFF-2 measured and ships), so the merge is a
+  **no-op for production**. Projected ~12–14% of graph cost, **NOT shipped on evidence** — unlike PATCH 3 this
   changes the *prompt*, so mechanism cannot carry the quality argument and the gate is a 2-arm ×
-  8-rep battery that has **not run**. One trap recorded because it nearly fooled the measurement:
+  8-rep battery that has **not run** — paused after one rep, because at the measured
+  **$5–7.50/week** of graph spend the saving is ~$3–4/month against ~$15 to finish measuring it.
+  Three conditions govern turning it on, two of them mechanical: **on only after a passing
+  battery** (guarded — the default must be off AND the off-branch asserts the shipped file is
+  unpatched), **run the battery only at ~3× today's spend or when a customer is heading there**,
+  and **delete by 2027-02-16 if neither** — enforced by an expiry guard that reddens on that date
+  rather than a comment nobody reads. One trap recorded because it nearly fooled the measurement:
   upstream's "reduces orphaned nodes" claim is **post-processing, not model quality** —
   `combined_extraction.py:295` deletes every node with no incident edge, so raw entity yield falls
   **~7% mechanically** (prod's orphan share: 1,356 of 19,051) and the battery counts **connected**

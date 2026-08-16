@@ -223,6 +223,11 @@ RUN F=/app/.venv/lib/python3.12/site-packages/graphiti_core/graphiti.py \
 # (2) is a judgement on a measured number; (1) and (3) are enforced by
 # `test/guards/graphiti-patch-combined.test.ts`, which asserts this default is off and reddens on the
 # expiry date. A flag with only prose behind it becomes furniture.
+# PROVED, not asserted: built locally with this default and checksummed inside the image, the served
+# `graphiti_core/graphiti.py` is sha256 49ee534a1043760f9e3b58617f7853edd65e7e643a75f34f75267528cb0ec72d
+# — the exact file PIPEFF-2 measured and ships today. Merging PATCH 4 in this state is a NO-OP for
+# production. Re-check with:
+#   docker build -t g . && docker run --rm g sha256sum /app/.venv/lib/python3.12/site-packages/graphiti_core/graphiti.py
 ARG PIPEFF5_COMBINED_EXTRACTION=0
 COPY patch-combined-extraction.py /tmp/patch-combined-extraction.py
 RUN F=/app/.venv/lib/python3.12/site-packages/graphiti_core/graphiti.py \
