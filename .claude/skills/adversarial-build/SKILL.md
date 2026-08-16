@@ -85,28 +85,39 @@ an experiment with replication.
 - Full local verification: `npx tsc --noEmit` · `npm run lint` · `npm test` ·
   `npm run db:test:up && npm run test:datamechanics:local` · `npm run check:docs`.
   (The npm script pins the test-DB URL/port; never hand-write the incantation — it drifts.)
-- **Commit BEFORE mutation-testing, and PROVE it — `node scripts/mutation-guard.mjs`.**
-  Run the guard before the first mutation; it exits non-zero and names what is
-  at risk. Precisely (verified against real git — an earlier version of this
-  paragraph overstated it, and both reviewers caught that): `git checkout --
-  <file>` restores from the INDEX, so an UNSTAGED edit is destroyed silently by
-  the command you expect to succeed, a STAGED one survives, and untracked files
-  cannot be reached at all. The guard still blocks on any uncommitted tracked
-  change, because the loop's contract is a COMMITTED CHECKPOINT you can return
-  to — not because everything it blocks would be shredded. A new (untracked)
-  test file mid-slice does not block.
+- **Mutation-test with ONE command — `node scripts/mutate.mjs`.** It does the whole sequence: refuses
+  unless the tree is a committed checkpoint (by calling `scripts/mutation-guard.mjs`, so there is one
+  owner of that question), refuses an untracked target, applies the `--edit` pairs simultaneously
+  against the original bytes, runs the tests you name, restores the file, verifies the restore, and
+  prints a verdict — `REDDENED` with the failing test names, or `SURVIVED`.
 
-  This was prose in this skill for its whole life and failed anyway: the same
-  operator lost work to it **three times in one session** (2026-08-14/15) —
-  an extracted function and its tests wiped mid-fold, a commit landed whose
-  tests called a function the revert had deleted, and a "repair" script that
-  no-opped against the reverted text and printed success. A rule you have to
-  remember is the thing this repo's §2 says to replace with a check that fails.
-  MUTGUARD-1.
-- Mutation-verify every guard and security-relevant branch: break the thing,
-  confirm the INTENDED test reddens (not just any test), revert, confirm the
-  tree is clean (`git status --short`). A guard that survives its mutation is
-  decoration.
+  ```
+  node scripts/mutate.mjs lib/foo.ts --edit /tmp/needle.txt /tmp/replacement.txt -- test/foo.test.ts
+  ```
+
+  **Paste that verdict into the PR body. Do not narrate it from memory** — that is the half of this
+  failure no start-of-run check can see, and it is how two commits in one session came to claim changes
+  their diffs did not contain.
+
+  **`--keep` when the mutation IS the change** ("prove this term is dead, then leave it deleted"): it
+  leaves the edit applied and prints a diff stat scoped to the target, removing the
+  re-apply-from-memory step that lost work three times. It expects the tests to stay GREEN and refuses
+  to keep a red edit unless you pass `--keep-even-if-red`.
+
+  **Exit codes track the expectation, not the verdict:** `0` met, `2` missed, `1` refused (always with a
+  message naming why), so the default `--expect reddened` exits 0 when the mutation is caught.
+
+  **Mutation-verify every guard and security-relevant branch**, and confirm the INTENDED test reddens —
+  not just any test. A guard that survives its mutation is decoration; a mutation that reddens something
+  else has told you nothing about the guard.
+
+  WHY A COMMAND AND NOT A RULE: this step said "commit BEFORE mutation-testing" in prose for its whole
+  life, then MUTGUARD-1 added a check you had to remember to call — and the same operator lost work
+  three times in the session after it shipped, because a mutation is a SEQUENCE and every ad-hoc
+  spelling of it skipped the check. Precisely (verified against real git, after both reviewers corrected
+  an earlier overstatement): `git checkout -- <file>` restores from the INDEX, so an UNSTAGED edit is
+  destroyed by the command you expect to succeed, a STAGED one survives, and untracked files cannot be
+  reached at all. MUTFLOW-1.
 
 ## 2. Fable adversarial review
 
@@ -205,4 +216,4 @@ end.
 | Spec ruling silently unimplemented | Fable | "no external-tier delegation" stated twice, enforced nowhere |
 | Reviewer hallucination | you | regex-matches claim refuted with a node repro |
 | Phantom test failures | process rule | concurrent data-mechanics runs on the shared container |
-| Lost work during mutation testing | process rule | `git checkout` against an uncommitted tree |
+| Lost work during mutation testing | `scripts/mutate.mjs` | `git checkout` on an uncommitted tree — three times in one session, while the rule was prose plus a skippable check |

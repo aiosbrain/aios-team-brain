@@ -189,12 +189,20 @@ describe("the script's exit codes — what the loop actually keys on", () => {
 });
 
 describe("guard: the skill actually requires the check", () => {
-  it("names the script in the adversarial-build loop's mutation step", () => {
-    // The field can ship computed-and-unread; so can a script nothing invokes. Pin the wiring.
+  it("requires the FLOW that calls this check, not this check as a step to remember", () => {
+    // MIGRATED BY MUTFLOW-1, deliberately and in the same change that broke it. This used to pin the
+    // literal line "PROVE it — `node scripts/mutation-guard.mjs`" in the skill. That line is gone,
+    // because requiring a check the operator has to remember to call is exactly what failed: the same
+    // operator lost work three times in the session after this guard shipped. The skill now names ONE
+    // command that runs the whole mutation sequence, and that command calls this script.
+    //
+    // So the wiring is pinned one level out — the skill must require `scripts/mutate.mjs`, and
+    // `scripts/mutate.mjs` must invoke this guard. `test/guards/mutation-flow.test.ts` proves the
+    // second link BEHAVIOURALLY (it runs the flow against a dirty scratch repo and asserts refusal),
+    // which is stronger than what this file could assert about a prose step.
     const skill = readFileSync(path.join(ROOT, ".claude", "skills", "adversarial-build", "SKILL.md"), "utf8");
-    // Containment alone would pass on "never run scripts/mutation-guard.mjs" — review's point. Pin the
-    // IMPERATIVE line instead. Nothing can programmatically prove an agent runs a prose step, so this
-    // is the strongest available assertion, and it is stated as that rather than as proof.
-    expect(skill).toMatch(/PROVE it — `node scripts\/mutation-guard\.mjs`/);
+    expect(skill).toMatch(/Mutation-test with ONE command — `node scripts\/mutate\.mjs`/);
+    const flow = readFileSync(path.join(ROOT, "scripts", "mutate.mjs"), "utf8");
+    expect(flow).toContain("mutation-guard.mjs");
   });
 });
