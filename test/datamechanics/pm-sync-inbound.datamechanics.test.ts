@@ -76,11 +76,11 @@ function linearMock(issues: MockIssue[]) {
       mutations.push({ name, variables });
       if (name === "CreateIssue") {
         return Response.json({
-          data: { issueCreate: { issue: { id: `li-created-${mutations.length}`, identifier: "T-NEW", url: "" } } },
+          data: { issueCreate: { success: true, issue: { id: `li-created-${mutations.length}`, identifier: "T-NEW", url: "" } } },
         });
       }
       if (name === "CreateLabel") {
-        return Response.json({ data: { issueLabelCreate: { issueLabel: { id: `lb-${mutations.length}` } } } });
+        return Response.json({ data: { issueLabelCreate: { success: true, issueLabel: { id: `lb-${mutations.length}` } } } });
       }
       return Response.json({ data: { issueUpdate: { success: true, issue: { id: "x" } } } });
     }

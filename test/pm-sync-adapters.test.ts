@@ -174,7 +174,7 @@ function linearMock(opts: { issues?: unknown[]; states?: unknown[]; labels?: unk
     if (query.includes("mutation")) mutations.push({ name, variables });
     if (query.includes("issueCreate")) return Response.json({ data: { issueCreate: { success: true, issue: { id: "new-issue", identifier: "AIO-9", url: "https://linear.app/AIO-9" } } } });
     if (query.includes("issueUpdate")) return Response.json({ data: { issueUpdate: { success: true, issue: { id: variables.id, identifier: "AIO-1", url: "https://linear.app/AIO-1" } } } });
-    if (query.includes("issueLabelCreate")) return Response.json({ data: { issueLabelCreate: { issueLabel: { id: "new-label" } } } });
+    if (query.includes("issueLabelCreate")) return Response.json({ data: { issueLabelCreate: { success: true, issueLabel: { id: "new-label" } } } });
     return Response.json({ data: {} });
   }) as unknown as typeof fetch;
   return { fetchImpl, mutations };

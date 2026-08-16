@@ -64,7 +64,7 @@ function linearMock() {
       return Response.json({ data: { issueCreate: { success: true, issue: { id, identifier: `AIO-${n}`, url: `https://linear.app/${id}` } } } });
     }
     if (query.includes("issueLabelCreate"))
-      return Response.json({ data: { issueLabelCreate: { issueLabel: { id: `label-${++n}` } } } });
+      return Response.json({ data: { issueLabelCreate: { success: true, issueLabel: { id: `label-${++n}` } } } });
     if (query.includes("issueUpdate"))
       return Response.json({ data: { issueUpdate: { success: true, issue: { id: variables.id, url: "https://linear.app/x" } } } });
     return Response.json({ data: {} });
