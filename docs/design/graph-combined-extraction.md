@@ -297,6 +297,14 @@ Q8′ then reads as a refusal rather than as a low loss rate — which is the di
 could not tell" and a plausible wrong number. A dead disk still halts the run, because the request
 write fails first.
 
+**Pre-registered, from the code review:** ids are salted with the tap process's start epoch, because
+the capture file survives a tap restart and a bare counter would restart at `0` — two incarnations
+writing the same ids into one JSONL, and a harvest pairing by id could pair incarnation 1's request
+with incarnation 2's response. Salting (rather than refusing a non-empty capture file) keeps a
+mid-run restart recoverable, which the last battery needed several times. **The harvest must also
+REFUSE on any duplicate id**, not merely on an unpaired one — that is the remaining gap salting
+does not close, and it is registered here before the run rather than discovered at harvest.
+
 **Q9 depended on prior-session artifacts that no longer exist.** I wrote "the prior session's
 harvests are on disk". They are not — Docker died three times during that session and nothing
 survives on this machine. **Fix:** make the gate self-contained — build the consensus list from
@@ -398,8 +406,12 @@ it), and the table beneath restates the same set with falsifiers.
   (applying twice is a no-op) and fails loudly on a missing anchor rather than silently skipping.
 - **AC3 — unit, `test/guards/graphiti-patch-combined.test.ts`:** the patched file parses under
   `ast`, and the patched call path is exercised against a real episode.
-- **AC4 — unit, `test/guards/graphiti-patch-combined.test.ts`:** PATCH 3's predecessor filter still
-  applies under the combined call — a single-chunk item receives zero predecessors.
+- **AC4 — unit, `test/guards/graphiti-patch-combined.test.ts`, compositional:** the patch hands
+  `previous_episodes` to the combined call unchanged. The *zero-predecessors-for-a-single-chunk-item*
+  property is pinned by `test/guards/graphiti-patch-same-item.test.ts` on PATCH 3, and the two are
+  bound together by the Dockerfile applying PATCH 3 before PATCH 4 against the same file. **No single
+  test composes all three**, and this bullet says so rather than implying one does — the review
+  caught the earlier wording claiming a structural assertion that does not exist.
 - **AC5 — unit, `test/guards/graphiti-patch-combined.test.ts`, plus a battery-harvest assertion:**
   the combined call replaces BOTH reads (its output flows downstream; neither `extract_nodes` nor
   `extract_edges` is called) is provable at unit level by executing the patched Python. The **full
@@ -423,7 +435,7 @@ it), and the table beneath restates the same set with falsifiers.
 | AC3 | The patched file **parses under `ast`** and the patched call path is exercised end-to-end against a real episode | unit + e2e | any import/runtime error |
 | AC4 | **PATCH 3's predecessor filter still applies** under the combined call — a single-chunk item receives **zero** predecessors, a multi-chunk item receives only its own | unit (runs the real Python) | any predecessor from another item reaching the merged prompt |
 | AC5 | The **full per-episode call-kind profile**: exactly one `extract_nodes_and_edges`; one **batch** `edge_timestamps` iff any edge was extracted; **0..k per-edge `edge_timestamps` fallbacks**, only for edges the batch left fully null; **zero** `extract_nodes` / `extract_edges` | unit + data-mechanics | any extra, missing or duplicated kind. "`extract_edges` not called" alone would miss a duplicated or lost timestamp call — the guard must cover the level that changed |
-| **AC8** | **`lib/llm/graph-call-kind.ts` gains an `extract_nodes_and_edges` row in THIS PR**, with a fixture built from the **real rendered prompt**, and `llm_usage` records that kind with non-zero tokens | unit + data-mechanics | the call landing in `unknown` |
+| **AC8** | **`lib/llm/graph-call-kind.ts` gains an `extract_nodes_and_edges` row in THIS PR**, with a fixture built from the **real rendered prompt** (unit, shipped). That `llm_usage` records the kind with non-zero tokens is asserted at **battery harvest**, not in data-mechanics — the data layer has no graphiti in it, so a dm test would stub the classifier's input and prove nothing | unit (shipped) + harvest | the call landing in `unknown` |
 | AC6 | With `pre_extracted_edges=None` the function is **byte-identical in behaviour** to today, so the un-patched path is untouched | unit | any divergence on the fallback path |
 | AC7 | The battery's decision procedure **refuses** rather than passing when a rep is missing or a window is ambiguous | unit (existing, re-pinned) | a verdict on incomplete data |
 

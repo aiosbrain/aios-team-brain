@@ -55,13 +55,23 @@ let failed = 0;
 // silently lost responses is visible in the tap's own summary and not only at harvest.
 let responsesCaptured = 0;
 let responsesLost = 0;
-// Monotonic, per-process. A counter rather than a random id: the capture file is read back in order
-// and a duplicate id would silently mis-pair a request with another call's response.
+// Monotonic within a process, SALTED with the process's start time across processes.
+//
+// A bare counter was wrong, and the way it was wrong is the failure this id exists to prevent: the
+// writability probe opens CAPTURE_FILE in append mode, so the file survives a tap restart, and a
+// restarted tap would begin again at `${ARM}-0`. Two incarnations would then write the same ids into
+// one JSONL, and a Q8' harvest pairing by id could pair incarnation 1's REQUEST with incarnation 2's
+// RESPONSE — yielding a plausible, wrong orphan-drop rate on a paid run rather than a refusal.
+//
+// Salting rather than refusing a non-empty file: a mid-run restart is a legitimate recovery (the last
+// battery needed several), and making recovery fatal would trade a silent-wrong-number risk for a
+// lose-the-run risk. The harvest closes the remaining gap by REFUSING on any duplicate id.
+const TAP_EPOCH = Date.now().toString(36);
 let nextCallId = 0;
 
 const server = createServer((req, res) => {
   const chunks = [];
-  const callId = `${ARM}-${nextCallId++}`;
+  const callId = `${ARM}-${TAP_EPOCH}-${nextCallId++}`;
   req.on("data", (c) => chunks.push(c));
   req.on("end", async () => {
     const raw = Buffer.concat(chunks);

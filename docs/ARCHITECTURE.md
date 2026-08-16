@@ -942,8 +942,9 @@ guard enforces it, it's named.
   byte), its `extract_edges` call moves under `else:`, and `add_episode` calls
   `extract_nodes_and_edges` and threads the edges through. Everything after extraction is untouched.
   **PATCH 4 runs after PATCH 3 and depends on it** — the predecessor filter sits at the *retrieval*
-  site, upstream of both extractors, so the combined call inherits it (pinned structurally, not
-  assumed). **Projected ~12–14% of graph cost; NOT yet shipped on evidence** — unlike PATCH 3 this
+  site, upstream of both extractors, so the combined call inherits it — enforced by the Dockerfile
+  applying PATCH 3 first against the same file, and pinned compositionally across the two patch
+  guards rather than by any single test. **Projected ~12–14% of graph cost; NOT yet shipped on evidence** — unlike PATCH 3 this
   changes the *prompt*, so mechanism cannot carry the quality argument and the gate is a 2-arm ×
   8-rep battery that has **not run**. One trap recorded because it nearly fooled the measurement:
   upstream's "reduces orphaned nodes" claim is **post-processing, not model quality** —

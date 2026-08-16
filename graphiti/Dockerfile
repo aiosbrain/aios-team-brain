@@ -203,9 +203,11 @@ RUN F=/app/.venv/lib/python3.12/site-packages/graphiti_core/graphiti.py \
 #     exits non-zero and names which anchor failed).
 #   * the script's own `ast.parse` — a syntactically broken file never reaches the image.
 #   * post-state `grep -q` on the inserted marker — the edit landed in the file we serve.
-#   * `extract_edges` must STILL be imported and referenced: the else-branch keeps the separate path
-#     alive for any caller that passes no pre-extracted edges. A patch that deleted it would break
-#     `add_episode_bulk` silently.
+#   * `extract_edges` must STILL be REFERENCED exactly once: the else-branch keeps the separate path
+#     alive for any caller that passes no pre-extracted edges, and a patch that deleted it would
+#     break `add_episode_bulk` silently. The gate greps the CALL, not the import — an earlier version
+#     of this comment claimed both, and describing a check that is not there is how a gate comes to be
+#     trusted for something it never did.
 COPY patch-combined-extraction.py /tmp/patch-combined-extraction.py
 RUN F=/app/.venv/lib/python3.12/site-packages/graphiti_core/graphiti.py \
  && /app/.venv/bin/python /tmp/patch-combined-extraction.py "$F" \

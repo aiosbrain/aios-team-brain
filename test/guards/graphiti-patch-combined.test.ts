@@ -270,8 +270,15 @@ asyncio.run(main())
     const a = applyPatch();
     try {
       const out = runPatched(a, DRIVER) as { prev_seen: string[][] };
-      // The filter runs BEFORE this point in the real file (asserted structurally below); what this
-      // pins is that the patch still PASSES the list through rather than rebuilding or dropping it.
+      // What THIS test pins is pass-through: the patch still hands `previous_episodes` to the
+      // combined call rather than rebuilding, reordering or dropping it.
+      //
+      // It does NOT pin that PATCH 3's filter runs first — nothing below in this file does, and an
+      // earlier version of this comment said "asserted structurally below", pointing at an assertion
+      // that does not exist. The ordering property holds COMPOSITIONALLY: the filter's semantics are
+      // pinned by `graphiti-patch-same-item.test.ts`, its position upstream of this call site is
+      // enforced by the Dockerfile applying PATCH 3 before PATCH 4 against the same file, and this
+      // test pins that the list survives the hand-off. No single test composes all three.
       expect(out.prev_seen).toEqual([["prev1", "prev2"]]);
     } finally {
       rmSync(a.dir, { recursive: true, force: true });
