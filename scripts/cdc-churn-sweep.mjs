@@ -56,6 +56,12 @@ const flag = (name, fallback) => {
   return i >= 0 && ARGV[i + 1] !== undefined ? ARGV[i + 1] : fallback;
 };
 const OP = flag("op", "inplace");
+/**
+ * The design documents ARE the corpus, so a document that publishes a distribution is inside it.
+ * Honoured in BOTH modes deliberately: `cdc-append-churn.md` sits ~79 characters below the in-place
+ * sweep's 25,000-character floor, so one more paragraph would silently move the in-place numbers too.
+ */
+const EXCLUDE = flag("exclude", "");
 const STEP = Number(flag("step", ARGV.find((a) => /^\d+$/.test(a)) ?? 97));
 
 const setChurn = (before, after) => {
@@ -87,6 +93,7 @@ const CORPORA = {
 };
 function corpus(which = "wide") {
   const { dirs, minLength } = CORPORA[which] ?? CORPORA.wide;
+  // `EXCLUDE` is applied HERE rather than at each call site, so neither mode can forget it.
   const out = [];
   const seen = new Set();
   for (const dir of dirs) {
@@ -102,7 +109,7 @@ function corpus(which = "wide") {
       if (seen.has(path)) continue;
       seen.add(path);
       const text = readFileSync(path, "utf8");
-      if (text.length >= minLength) out.push({ path, text });
+      if (text.length >= minLength && path !== EXCLUDE) out.push({ path, text });
     }
   }
   return out;
@@ -181,8 +188,7 @@ if (OP === "append") {
   // The design documents ARE the corpus, so the spec quoting these numbers is IN them and every edit to
   // it moves them (both reviewers caught a table that had already gone stale that way). `--exclude`
   // makes a published distribution stable against the document that publishes it.
-  const excluded = flag("exclude", "");
-  const docs = corpus(which).filter((d) => !excluded || d.path !== excluded);
+  const docs = corpus(which);
   const out = {
     op: "append",
     revision: revision(),
@@ -197,7 +203,7 @@ if (OP === "append") {
     depthHistogram: {},
     movedOutsideMaxWindow: 0,
     perLength: {},
-    excluded: excluded || null,
+    excluded: EXCLUDE || null,
     depthCeiling: { provable: DEPTH_CEILING, derivation: "1 + floor((max-1)/min)", observed: 0, violations: 0 },
     absoluteGuard: { formula: "depthCeiling + ceil(appendLength/min)", violations: [], synthetic: null },
     boundaryFormViolations: [],
@@ -387,7 +393,8 @@ if (OP === "append") {
 
   // The cross-algorithm envelope that REPLACES the deleted max-versus-max comparison: per document, how
   // much worse than byte offsets can CDC be? Reported by regime, because it is +1 for appends shorter
-  // than `min` and reaches +4 for long ones on synthetic documents.
+  // than `min` and larger for long ones on synthetic documents (measured +2 here — an earlier version of
+  // this comment said +4, a figure from a throwaway generator that this script never produced).
   {
     let shortMax = -Infinity, longMax = -Infinity, shortAt = null, longAt = null;
     for (const { path, text } of docs)
@@ -399,8 +406,8 @@ if (OP === "append") {
           else if (gap > longMax) { longMax = gap; longAt = { path, len, filler: fname, gap }; }
         }
     // …and the same question on SYNTHETIC documents, because a corpus of 28 real files is not evidence
-    // about the algorithm. The live corpus never exceeds +1; synthetic documents reach +4, which is why
-    // the envelope this spec gates on is scoped to the short-append regime rather than stated generally.
+    // about the algorithm. Both populations stay at +1 for appends shorter than `min`; the LONG regime is
+    // where they diverge, which is why the gate is scoped to the short one rather than stated generally.
     let synShort = -Infinity, synShortAt = null, synLong = -Infinity, synLongAt = null;
     for (let seed = 1; seed <= 300; seed++) {
       const doc = filler(2_000 + ((seed * 911) % 80_000), `s${seed}-`);
@@ -435,19 +442,56 @@ if (OP === "append") {
     };
   }
 
+  /**
+   * WHAT MAKES THIS EXIT NON-ZERO — and the three ways it used to fail OPEN, all found in review.
+   *
+   *  1. an EMPTY corpus exited 0 with zero evidence: `corpus()` swallows a `readdirSync` failure, so a
+   *     wrong cwd made every invariant vacuously green. There is a sample floor now.
+   *  2. the synthetic leg's DEPTH was computed and reported but never counted, so a chunker that broke
+   *     the derived ceiling on synthetic documents while the corpus stayed at 2 exited 0.
+   *  3. the probes had no expectations at all — `duplicateProbe` could report set === bound (the rule
+   *     silently becoming an equality again) and nothing noticed.
+   *
+   * Probe ROT is deliberately NOT a failure: the merge witness is live content and the spec says it is
+   * expected to rot. It is a `warning`, which is a different thing from a refuted invariant, and saying
+   * so is why the spec no longer claims this exits non-zero on "any" of them.
+   */
+  const expectations = [];
+  const expect = (name, ok, detail) => { if (!ok) expectations.push({ name, detail }); };
+  expect("corpus is non-empty", out.corpus.docs > 5, { docs: out.corpus.docs });
+  expect("samples were taken", out.samples > 0, { samples: out.samples });
+  expect("synthetic leg ran", (out.absoluteGuard.synthetic?.samples ?? 0) > 0, out.absoluteGuard.synthetic);
+  expect(
+    "synthetic divergence depth is within the derived ceiling",
+    (out.absoluteGuard.synthetic?.maxDepthObserved ?? Infinity) <= DEPTH_CEILING,
+    out.absoluteGuard.synthetic
+  );
+  // The rule is an INEQUALITY; this probe is the only thing that shows it, so it going tight is a defect.
+  expect("duplicate content costs strictly less than the bound", out.duplicateProbe.set < out.duplicateProbe.bound, out.duplicateProbe);
+  expect("a verbatim duplicate chunk saves nothing", out.verbatimChunkProbe.set === out.verbatimChunkProbe.bound, out.verbatimChunkProbe);
+  // The cap claim, checked rather than described: a shared prefix AT the cap must cost nothing.
+  for (const row of out.capProbe)
+    if (row.sharedChunks !== undefined)
+      expect("shared prefix at the cap costs nothing", row.sharedChunks >= CAP ? row.set === 0 : true, row);
+  out.expectationsFailed = expectations;
+  out.warnings = [];
+  if (out.mergeProbe?.note) out.warnings.push({ probe: "mergeProbe", note: out.mergeProbe.note });
+  if (out.capProbe.some((r) => r.note)) out.warnings.push({ probe: "capProbe", note: "a boundary count had no realising prefix" });
+
   console.log(JSON.stringify(out, null, 2));
-  // Non-zero on ANY refuted invariant, so the sweep is usable as a check and not only as a report.
   const failed =
     out.violations.length +
     out.absoluteGuard.violations.length +
     out.depthCeiling.violations +
     (out.absoluteGuard.synthetic?.violations ?? 0) +
-    (out.absoluteGuard.synthetic?.boundViolations ?? 0);
+    (out.absoluteGuard.synthetic?.boundViolations ?? 0) +
+    expectations.length;
   process.exit(failed === 0 ? 0 : 1);
 }
 
 const summary = {
   revision: revision(),
+  excluded: EXCLUDE || null,
   step: STEP,
   docs: 0,
   swept: 0,

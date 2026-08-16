@@ -1,8 +1,10 @@
 # Append churn is a bound, not a number — CDCAPPEND-1
 
-**Status:** spec, draft 2. Draft 1 was BLOCKED by two independent cold reads, and **its central claim was
-falsified twice over** — once for whitespace-only bodies, once for the cap. Draft 2 states the bound in
-the coordinates the cost is actually paid in, where it is a theorem with no preconditions.
+**Status:** spec, draft 3. Drafts 1 and 2 were each BLOCKED by two independent cold reads. Draft 1's
+central claim was falsified twice over (whitespace-only bodies; the cap), so draft 2 restated the bound in
+the coordinates the cost is paid in — and draft 2 then smuggled the ORIGINAL false constant back in as the
+replacement row's gloss (§2a), which the round-2 reads caught. Six characterisations of one table row have
+now been falsified; three of them were mine.
 **Date:** 2026-08-16 · **Owner:** Chetan · **Task:** `CDCAPPEND-1`
 **Related:** [`content-defined-chunking.md`](./content-defined-chunking.md) (the table this corrects),
 [`cdc-boundary-overlap.md`](./cdc-boundary-overlap.md) (`CDCCHURN-1`, the row above this one).
@@ -112,9 +114,16 @@ the ledger pays **2** where the bound says 25.
 
 **The structural claim.** In `cdcBoundaries` (`lib/graph/cdc.ts:222`) the boundary ending chunk `k` is
 computed from `text[startₖ … min(startₖ + max, n))`, and `n` enters only through `hardEnd` and the
-`n − start <= min` short-tail exit. So a boundary whose chunk **start** lies at least `max` (4,000) code
-units before the original end is computed from unchanged input and cannot move — `movedOutsideMaxWindow`
-is **0** across all 560 samples.
+`n − start <= min` short-tail exit. So a boundary whose chunk **start** lies **more than** `max` (4,000)
+code units before the original end is computed from unchanged input and cannot move —
+`movedOutsideMaxWindow` is **0** across all 560 samples.
+
+"More than", not "at least": review produced a witness at exactly `max`. For
+`"0".repeat(3999) + "\uD800"` the single boundary sits at 4,000, and appending a low surrogate moves it
+to 4,001 through `avoidSurrogateSplit` (`lib/graph/cdc.ts:194`). Malformed UTF-16 only, and the depth and
+absolute ceilings both survive it (starts in `[n − max, n)` spaced at least `min` still number at most
+4) — but the instrument tested `> max` while the prose said `≥ max`, so the prose was a paraphrase of
+what was actually checked, which is the failure mode this repo names "mutate with the real shape".
 
 **The provable ceiling on divergence depth is 4, and the observed maximum is not it.** Non-final chunks
 are at least `min`, so at most `1 + ⌊(max − 1)/min⌋ = 4` chunk starts can lie inside that window. The
@@ -201,29 +210,47 @@ synthetically, so the general claim is weaker than the short-append one.
 ### 2a. The table row states a bound, its mechanism, and the trade
 
 `append at end` becomes: **at most the number of admitted chunks after the last chunk the two chunkings
-share — 1 for a short append to a document below the cap, 0 once the shared prefix itself fills the cap,
-and growing with both the length and the entropy of the appended text.** The prose names the mechanism
-(only boundaries within `max` of the end can move; the backup-boundary preference can delete one) and
-carries §0f's trade.
+share — commonly 1 for a short append, but 2 on 4 of 28 corpus documents at the fixture's own
+66-character append; 0 once the shared prefix itself fills the cap; and growing with both the length and
+the entropy of the appended text.** The prose names the mechanism (only boundaries within `max` of the
+end can move; the backup-boundary preference can delete one) and carries §0f's trade.
+
+**Draft 2's version of this sentence said "1 for a short append to a document below the cap", and that is
+characterisation 1 walking back in as the row's gloss** — refuted by the run this spec commands
+(`fixtureAppend.churnDistribution` = `{0: 1, 1: 23, 2: 4}`, all four of those 2s below the cap). It would
+have been the seventh wrong characterisation, and the sixteen criteria of draft 2 would all have passed
+with it in place, because they constrained what the row must mention and never what it must not claim.
+Criterion 17 now pins the row's number against that distribution.
 
 ### 2b. The test asserts the bound per document — and an ABSOLUTE ceiling that cannot self-adjust
 
-The bound in §0b is computed from the chunker's own output, so **any prefix-stable chunker satisfies it
-by construction**: a regression that re-cuts deeply just shrinks `L` and inflates the bound to match.
-Asserting only that would be a guard that can never redden — the exact standard this repo applies to a
-predicate term, applied here to a whole assertion. So the test asserts three things:
+The bound in §0b is computed from the chunker's own output, and review sharpened just how weak that makes
+it as evidence: draft 2 said "any prefix-stable chunker satisfies it", and the truth is stronger —
+**every chunker does, and so does every pair of string arrays**, since `L` is defined as their common
+prefix and elements below it are members of the before-set by definition. So `boundHolds 560/560` is a
+theorem restated, not a measurement, and a `bound violated` counter is a structurally dead one. The
+informative measurements are set-metric TIGHTNESS (§0b) and the two assertions below. So the test asserts
+three things:
 
 1. **the bound**, per document per append content — `churn ≤ |C₁| − L`;
 2. **an absolute ceiling derived from the SIZE ENVELOPE, not from behaviour**:
    `churn ≤ (1 + ⌊(max − 1)/min⌋) + ⌈A/min⌉` for an append of length `A` — at most 4 tail boundaries can
    move (§0d) and the appended text adds at most `⌈A/min⌉` chunks. Zero violations across the 560 corpus
    samples and a further **8,400 samples over 400 synthetic documents** (`absoluteGuard.synthetic`, in
-   the committed script — 28 real files are not evidence about an algorithm). This is the assertion that
-   reddens if `cdc2` starts re-cutting the whole document;
+   the committed script — 28 real files are not evidence about an algorithm);
 3. **the divergence depth**, per document, against the derived 4 — never the observed 2.
 
 Equality with the bound is **reported, not gated** (a future document quoting another one verbatim would
 otherwise redden CI on an unrelated docs edit); the fixtures gate it where it is deterministic.
+
+**And here is what this set does NOT catch, stated rather than left to be discovered.** The absolute
+ceiling is loose: at a 60,000-character prose append the corpus churns 23–24 against a ceiling of
+`4 + ⌈60000/1250⌉ = 52`. A regression that cut the appended region at `min` instead of `target` would
+roughly **double** every long append's cost and still pass the ceiling, the self-adjusting bound, the
+depth gate and GROWTH. Both reviewers found this independently. Tight coverage exists only in the
+**short-append regime**, where the `legacyChurn + 1` envelope sits at zero headroom (4 documents are at
+exactly gap 1 today). The ceiling's real job is the gross case — a chunker that re-cuts the document —
+and §4 defers the long-regime gate rather than pretending this covers it.
 
 ### 2c. Four checked-in fixtures, because the live corpus cannot guarantee any of these branches
 
@@ -254,8 +281,21 @@ outcome flips with the appended content at a fixed length.
 `--op append` sweeps documents × lengths × append contents and reports both metrics, the divergence
 depth against the derived ceiling, the absolute guard, the falsified candidate, the falsified
 boundary-coordinate form of the bound, and probes for the merge event, the cap parity, the verbatim
-duplicate and the legacy envelope. It exits non-zero on any refuted invariant, so it is a check and not
-only a report. It also gains `--exclude` (the reflexivity above) and a corrected corpus definition — a
+duplicate and the legacy envelope.
+
+**It exits non-zero on a refuted invariant OR a vacuous run — and draft 2 claimed that before it was
+true.** Review found three ways it failed open: an empty corpus (a wrong working directory) exited 0 with
+zero evidence, the synthetic leg's divergence depth was computed and reported but never counted, and the
+probes had no expectations at all, so `duplicateProbe` could report set === bound — the rule silently
+becoming an equality again — with nothing noticing. There are explicit expectations now, including a
+corpus floor. Probe **rot** is deliberately not a failure but a `warning`: the merge witness is live
+content that this spec says is expected to rot, and conflating that with a refuted invariant would make
+the check cry wolf.
+
+It also gains `--exclude`, **honoured in both modes** — this file is around 79 characters below the
+in-place sweep's 25,000-character floor, so one more paragraph would silently move the 573/573 the
+in-place mode is required to reproduce, which is the went-stale-by-being-measured bug in the other mode.
+And a corrected corpus definition — a
 comment claimed its `> 4,000`-character set was "the same corpus `test/graph-cdc.test.ts` reads", which
 it never was — and a fix to the `prose-b` filler, which replaced text **after** slicing and so appended
 2,602 characters at a nominal 2,500, confounding the very "same length, different content" comparison it
@@ -290,11 +330,13 @@ schema, no API route, no change to `visibleItems`/`visibleTasks`/`visibleGroupId
 - `test/graph-cdc.test.ts` — the `max(cdc) <= max(legacy)` comparison for append is replaced by a PER-DOCUMENT `cdcChurn <= legacyChurn + 1` gated to appends shorter than `min`, with the longer-append gap reported and the measured reason recorded at the site; the comparison is untouched for the insertion and deletion scenarios.
 - `test/graph-cdc.test.ts` — the `append at end — CDC re-extracts <= 1 chunk(s)` assertion is GONE, with the measurement that refutes it recorded at the site.
 - `test/graph-cdc.test.ts` — the live-corpus equality census is reported rather than gated, and a `documents > 5` floor is asserted, because a bound assertion over an empty or single-document corpus is green by construction.
-- `scripts/cdc-churn-sweep.mjs` — `--op append` reports the bound, the absolute guard, the divergence depth against its derived ceiling, the falsified candidate, the falsified boundary-coordinate form, and the merge, cap-parity, verbatim-duplicate and legacy-envelope probes; it exits non-zero on any refuted invariant.
-- `scripts/cdc-churn-sweep.mjs` — `--exclude <path>` omits a document from the corpus, so a distribution published in a document that is itself in the corpus is stable against its own edits.
+- `scripts/cdc-churn-sweep.mjs` — `--op append` reports the bound, the absolute guard, the divergence depth against its derived ceiling, the falsified candidate, the falsified boundary-coordinate form, and the merge, cap-parity, verbatim-duplicate and legacy-envelope probes.
+- `scripts/cdc-churn-sweep.mjs` — the append mode exits non-zero on a refuted invariant OR a vacuous run (empty corpus, zero samples, no synthetic leg, synthetic depth past the derived ceiling, `duplicateProbe` going tight, `verbatimChunkProbe` going slack, a shared prefix at the cap costing anything); probe ROT is a reported warning and not a failure, and running it from a directory with no `docs/` must exit 1 rather than 0.
+- `scripts/cdc-churn-sweep.mjs` — `--exclude <path>` omits a document from the corpus in BOTH modes, since this spec sits under 100 characters below the in-place sweep's 25,000-character floor.
 - `scripts/cdc-churn-sweep.mjs` — the `prose-b` filler replaces before slicing, so the "same length, different content" comparison is not length-confounded; the false "the same corpus the test reads" comment is corrected; the in-place mode's existing numbers reproduce unchanged.
 - `docs/design/content-defined-chunking.md` — the acceptance table's `append at end` row states the bound, the shared-prefix cap condition, and that growth depends on the appended content as well as its length; the prose carries the measured CDC-vs-legacy envelope.
 - `docs/design/content-defined-chunking.md` — the summary table's legacy `| append at the end | 1 |` is SCOPED to the 66-character append it measures rather than left unqualified, since a 2,501-character append churns 2 under byte offsets too.
+- `docs/design/content-defined-chunking.md` — the corrected `append at end` row states NO unconditional number, and a test pins the row's own claim against `fixtureAppend.churnDistribution`, so a gloss like "1 for a short append" cannot pass the other sixteen criteria while contradicting the measurement.
 
 ## 4. Scope
 
@@ -320,11 +362,15 @@ corpus/filler corrections.
 
 ## 5. What would falsify this
 
-Wrong if any base document and any append make set churn **exceed** `|C₁| − L` over the admitted chunk
-arrays — that would mean a chunk at an index below `L` was re-pushed despite being byte-identical to one
-already in the ledger, contradicting the MEMBERSHIP filter at `lib/graph/project.ts:1222-1223` rather
-than anything about boundaries. (Draft 1's boundary-coordinate form was falsified exactly here, by the
-`chunkCdc` blank-body guard, so this clause names the right mechanism now.)
+**Clause 1 is proof-checked, not measurement-checked, and draft 2 mislabelled it.** `churn ≤ |C₁| − L`
+holds for any two string arrays whatsoever, so no run of the sweep can refute it and the counter that
+watches for a violation is structurally dead. It is listed because it is what the row asserts, not
+because the instrument could catch it failing — and the mechanism draft 2 named (a chunk below `L`
+re-pushed, contradicting `lib/graph/project.ts:1222-1223`) is an event the sweep computes `setChurn`
+itself and could not observe even if the product had that bug. What WOULD falsify the row is the
+translation: if the projector's membership filter ever stopped being a set-membership test, the bound
+would still be true about chunk arrays and false about cost. (Draft 1's boundary-coordinate form was a
+real, refutable claim, and it was refuted — by the `chunkCdc` blank-body guard.)
 
 Wrong if any document exceeds the absolute ceiling of `(1 + ⌊(max − 1)/min⌋) + ⌈A/min⌉`, which would mean
 the structural window in §0d is not what `cdcBoundaries` does.
