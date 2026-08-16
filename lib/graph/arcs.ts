@@ -1031,27 +1031,58 @@ export function evictScopedArcMemory(teamId: string): void {
   for (const key of cache.keys()) {
     if (key.startsWith(prefix)) cache.delete(key);
   }
+  // Fence in-flight refreshes of ANY of this team's p: keys (the same trailing-write race the g:
+  // namespace fences — pre-existing here, closed in the same fold). Generation entries are tiny;
+  // bump only keys we have seen (cache or refreshing), not a synthetic enumeration.
+  for (const key of refreshing) {
+    if (key.startsWith(prefix)) bumpPurgeGeneration(key);
+  }
+}
+
+/** Purge GENERATIONS (Codex PPARC-2 High 1, the timeline-cache dirty-protection precedent): an
+ *  in-flight background refresh that started BEFORE a purge must not commit AFTER it — the purge
+ *  doors delete the row, but nothing else fences the trailing write, so a warm reading
+ *  pre-redaction facts would resurrect the poisoned row as fresh. Every eviction bumps the key's
+ *  generation; `refreshArcsInBackground` snapshots it at start and DROPS its commit on mismatch.
+ *  Process-local by design (the same bound as the mem cache itself); the CROSS-process residual —
+ *  another instance's warm committing after this instance's purge — is named in the design, is the
+ *  same shape the `p:` namespace has always had, and is bounded by the purge re-running while the
+ *  self-purge flag persists. */
+const purgeGeneration = new Map<string, number>();
+function bumpPurgeGeneration(key: string): void {
+  purgeGeneration.set(key, (purgeGeneration.get(key) ?? 0) + 1);
+}
+function currentPurgeGeneration(key: string): number {
+  return purgeGeneration.get(key) ?? 0;
 }
 
 /** Evict ONE partition's `g:` in-memory entry (PPARC-2) — the mem half of the per-partition purge
  *  door; a DB purge without this serves the poisoned row from this process for its lifetime. */
 export function evictPartitionArcMemory(groupId: string): void {
   cache.delete(`g:${groupId}`);
+  bumpPurgeGeneration(`g:${groupId}`);
 }
 
 /** Evict every `g:` entry belonging to a team (PPARC-2, design Medium 9): `g:` keys carry only the
  *  group id, so team-wide eviction resolves the team's pointer list — built-ins + initiatives —
  *  and deletes each exactly. Async because the resolution reads `projects.graph_group_id`. */
 export async function evictTeamPartitionArcMemory(db: DbClient, teamId: string): Promise<void> {
+  const evictAllPartitionKeys = () => {
+    // FAIL CLOSED (Codex PPARC-2 Medium 3): a returned-error read left every g: key warm for a
+    // full TTL. We cannot know WHICH keys are this team's without the pointer list, so evict every
+    // g: entry — regenerable, bounded by the map, and one query each to re-warm.
+    for (const key of cache.keys()) if (key.startsWith("g:")) cache.delete(key);
+  };
   try {
-    const { data } = await db
+    const { data, error } = await db
       .from("projects")
       .select("graph_group_id")
       .eq("team_id", teamId)
       .not("graph_group_id", "is", null);
+    if (error) return evictAllPartitionKeys();
     for (const r of (data ?? []) as { graph_group_id: string }[]) cache.delete(`g:${r.graph_group_id}`);
   } catch {
-    // best-effort — the DB purge/stale-mark is the durable layer
+    evictAllPartitionKeys();
   }
 }
 
@@ -1209,7 +1240,15 @@ function refreshArcsInBackground(
       // Not route-bound → give the reasoning model the full window (BG_ARC_TIMEOUT_MS). `prior` lets the
       // fact-set-hash guard skip the LLM when nothing changed. Run the extra evidence-COHERENCE pass HERE
       // (background only — the route-bound cold-miss/correction paths can't afford the second LLM call).
+      const generationAtStart = currentPurgeGeneration(key);
       const { arcs, factsHash, degraded, continuity } = await synthesizeArcs(bg, teamId, groups, [], keys, BG_ARC_TIMEOUT_MS, prior, true, key);
+      if (currentPurgeGeneration(key) !== generationAtStart) {
+        // A purge landed while this refresh was in flight — its facts may predate the purge's
+        // reason (a redaction, a restriction move). Committing would resurrect the poisoned row
+        // as fresh; drop it and let the next read re-warm from the post-purge graph.
+        console.error(`[arcs] dropping in-flight refresh for ${key} — purged mid-synthesis (Codex PPARC-2 High 1)`);
+        return;
+      }
       const committed = await commitArcs(bg, teamId, key, arcs, factsHash, { degraded }); // fire-and-forget: nobody awaits its freshness
       // Record how much of the previous set survived. "Arcs feel unstable" was unmeasurable — `arc_cache`
       // keeps only the CURRENT set, so there was no way to say whether carry-over was 30% or 90%, and
