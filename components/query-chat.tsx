@@ -78,8 +78,10 @@ export async function pollRun(
       run?: { id?: string; status?: string; partial?: string; error?: string | null; final_message_id?: string | null } | null;
     };
     try {
+      // Encode the id: it is a path SEGMENT, and an unencoded value carrying `/`, `?` or `..` would
+      // silently address a different endpoint than the one this function claims to poll.
       const res = await fetch(
-        `/api/dashboard/conversations/${conversationId}/run?team=${encodeURIComponent(teamSlug)}`,
+        `/api/dashboard/conversations/${encodeURIComponent(conversationId)}/run?team=${encodeURIComponent(teamSlug)}`,
         { signal: opts.signal }
       );
       if (!res.ok) return null;

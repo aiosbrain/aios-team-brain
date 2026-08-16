@@ -19,7 +19,16 @@ import { join } from "node:path";
 const ROOT = join(import.meta.dirname, "..", "..");
 const SCAN_DIRS = ["app", "lib", "scripts"];
 const OWNER = join("lib", "query", "turn-runs.ts"); // the only legal writer
-const WRITE_RE = /from\(\s*["'](chat_turn_runs)["']\s*\)\s*\.\s*(insert|update|upsert|delete)\b/g;
+
+/**
+ * A FACTORY returning a fresh literal, not a shared `/g` regex.
+ *
+ * Two reasons, and both bite: a `/g` regex carries `lastIndex`, so reusing one instance across files
+ * (or across a scan and an assertion) silently skips matches — a guard that reports zero offenders
+ * because of parser state is worse than no guard. And building a fresh one via `new RegExp(src, "g")`
+ * trips the non-literal-RegExp rule. A literal in a factory gets both properties for free.
+ */
+const writeRe = () => /from\(\s*["'](chat_turn_runs)["']\s*\)\s*\.\s*(insert|update|upsert|delete)\b/g;
 
 function walk(dir: string, out: string[] = []): string[] {
   let entries: string[];
@@ -44,7 +53,7 @@ function offenders(): string[] {
       if (rel === OWNER) continue; // the sanctioned writer
       if (rel.endsWith(".test.ts") || rel.includes("fake-supabase")) continue;
       const src = readFileSync(file, "utf8");
-      for (const m of src.matchAll(WRITE_RE)) hits.push(`${rel}: .from("${m[1]}").${m[2]}(`);
+      for (const m of src.matchAll(writeRe())) hits.push(`${rel}: .from("${m[1]}").${m[2]}(`);
     }
   }
   return hits.sort();
@@ -60,7 +69,7 @@ describe("single-writer: chat_turn_runs", () => {
   });
 
   it("the matcher discriminates (non-vacuity)", () => {
-    const W = () => new RegExp(WRITE_RE.source, "g");
+    const W = writeRe;
     expect(W().test('await db.from("chat_turn_runs").insert(rec)')).toBe(true);
     expect(W().test('db.from("chat_turn_runs").update({ status: "done" })')).toBe(true);
     expect(W().test('db.from("chat_turn_runs").delete()')).toBe(true);
@@ -71,7 +80,7 @@ describe("single-writer: chat_turn_runs", () => {
 
   it("the owner file really does write the table (the guard is guarding something)", () => {
     const src = readFileSync(join(ROOT, OWNER), "utf8");
-    const writes = [...src.matchAll(new RegExp(WRITE_RE.source, "g"))];
+    const writes = [...src.matchAll(writeRe())];
     expect(writes.length).toBeGreaterThan(0);
   });
 });
