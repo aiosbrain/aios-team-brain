@@ -11,7 +11,7 @@ import {
   type LinearImportIssue,
 } from "@/lib/ingest/sources/linear-normalize";
 import { linearAdapter } from "@/lib/pm-sync/linear";
-import { linearGraphql, parseExt, stripFooter, withFooter } from "@/lib/pm-sync/linear-client";
+import { linearGraphql, parseExt, stripFooter, withFooter, linearMutation } from "@/lib/pm-sync/linear-client";
 import {
   PROJECTION_TASK_COLS,
   resolvePrimaryProvider,
@@ -487,13 +487,14 @@ async function adoptInbound(
     // `isBrainOwned` excludes the issue on the next ingest tick. Best-effort — the link's
     // provider_resource_id already excludes it (ownedResourceIds), so a failure self-heals.
     try {
-      await linearGraphql(
+      await linearMutation(
         fetchImpl,
         primary.integration.secret ?? "",
         `mutation AdoptFooter($id: String!, $description: String!) {
           issueUpdate(id: $id, input: { description: $description }) { success issue { id } }
         }`,
-        { id: it.id, description: withFooter(stripFooter(it.description), it.identifier, externalSource) }
+        { id: it.id, description: withFooter(stripFooter(it.description), it.identifier, externalSource) },
+        { payload: "issueUpdate", entity: "issue" }
       );
     } catch (err) {
       result.skipped.push(

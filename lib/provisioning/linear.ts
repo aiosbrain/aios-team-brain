@@ -1,7 +1,7 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { isRestrictedTier } from "@/lib/auth/visibility";
-import { linearGraphql } from "@/lib/pm-sync/linear-client";
+import { linearMutation } from "@/lib/pm-sync/linear-client";
 import { enabledIntegration } from "./integration";
 import type { ProvisioningAdapter, ProvisioningMember, ProvisioningResult } from "./types";
 
@@ -50,13 +50,21 @@ export const linearAdapter: ProvisioningAdapter = {
     if (teamIds.length) input.teamIds = teamIds; // omit the field entirely when unset/empty
 
     try {
-      const data = await linearGraphql<InviteCreateData>(fetchImpl, integ.secret, INVITE_MUTATION, {
-        input,
+      // Routed through the checker (PMSUCCESS-1): `linearGraphql` now REFUSES a mutation document, so
+      // this is not optional. `entityless` because I could not verify from this repo what entity
+      // `organizationInviteCreate` returns — there is no Linear SDK or recorded schema here — and
+      // requesting a field that does not exist would error the whole mutation and silently stop
+      // invites. `success` is still checked, which is all this call site ever used.
+      const data = await linearMutation<InviteCreateData>(fetchImpl, integ.secret, INVITE_MUTATION, { input }, {
+        payload: "organizationInviteCreate",
+        entityless: "unverified entity field on this payload; this site uses only `success`",
       });
-      if (data.organizationInviteCreate?.success) {
-        return { tool: "linear", status: "sent", detail: `Linear invite email sent to ${member.email}` };
-      }
-      return { tool: "linear", status: "failed", detail: "Linear did not create the invite (success=false)" };
+      // The `success === false` branch that used to live here is GONE rather than kept as belt-and-
+      // braces: `linearMutation` throws on it, so the branch was unreachable, and an unreachable
+      // predicate is one no test can redden. The catch below turns that throw into the same
+      // `status: "failed"` this returned, so the outcome is unchanged.
+      void data;
+      return { tool: "linear", status: "sent", detail: `Linear invite email sent to ${member.email}` };
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       // An already-member / already-invited error is not a failure — the person is reachable.

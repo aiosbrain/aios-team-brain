@@ -18,7 +18,7 @@ import {
   type UpsertWorkItemInput,
   type UpsertWorkItemResult,
 } from "@/lib/pm-sync/provider";
-import { linearGraphql, parseExt, withFooter, stripFooter } from "@/lib/pm-sync/linear-client";
+import { linearGraphql, linearMutation, parseExt, withFooter, stripFooter } from "@/lib/pm-sync/linear-client";
 
 type LinearState = { id: string; name: string; type: string };
 type LinearLabel = { id: string; name: string };
@@ -188,13 +188,16 @@ async function ensureLabelIds(ctx: LinearCtx, boot: LinearBootstrap, names: stri
     if (!name) continue;
     let id = boot.labels.get(name);
     if (!id) {
-      const data = await linearGraphql<{ issueLabelCreate: { issueLabel: { id: string } } }>(
+      // `success` was the one mutation that never even ASKED for it (PMSUCCESS-1); it does now, so no
+      // call site depends on a tolerated absence.
+      const data = await linearMutation<{ issueLabelCreate: { issueLabel: { id: string } } }>(
         ctx.fetchImpl,
         ctx.apiKey,
         `mutation CreateLabel($name: String!, $teamId: String!) {
-          issueLabelCreate(input: { name: $name, teamId: $teamId }) { issueLabel { id } }
+          issueLabelCreate(input: { name: $name, teamId: $teamId }) { success issueLabel { id } }
         }`,
-        { name, teamId: boot.teamId }
+        { name, teamId: boot.teamId },
+        { payload: "issueLabelCreate", entity: "issueLabel" }
       );
       id = data.issueLabelCreate.issueLabel.id;
       boot.labels.set(name, id);
@@ -279,13 +282,17 @@ export const linearAdapter: PmAdapter = {
       const state = resolveStateByGroup(states, desired);
       const changed = issue.state?.id !== state.id;
       if (changed) {
-        await linearGraphql(
+        // The result used to be discarded outright. That is the site whose refusal is REVERTED in the
+        // brain: it returns the DESIRED state below, `persistSuccess` records it as projected, and the
+        // next inbound pass sees Linear's real state over an "unchanged" brain row and writes it back.
+        await linearMutation(
           ctx.fetchImpl,
           ctx.apiKey,
           `mutation SetIssueState($id: String!, $stateId: String!) {
             issueUpdate(id: $id, input: { stateId: $stateId }) { success issue { id } }
           }`,
-          { id: issue.id, stateId: state.id }
+          { id: issue.id, stateId: state.id },
+          { payload: "issueUpdate", entity: "issue" }
         );
       }
       return {
@@ -317,26 +324,31 @@ export const linearAdapter: PmAdapter = {
     if (existing?.id) {
       issue = existing;
       if (!linearIssueMatches(issue, desiredFields)) {
-        const data = await linearGraphql<{ issueUpdate: { issue: LinearIssue } }>(
+        // A refusal here used to LATCH: the desired fingerprint was persisted with a real resource id,
+        // so `project.ts`'s short-circuit skipped the row on every future run and Linear stayed wrong
+        // under `0 errors`. Throwing routes to `persistError`, which leaves the fingerprint stale.
+        const data = await linearMutation<{ issueUpdate: { issue: LinearIssue } }>(
           ctx.fetchImpl,
           ctx.apiKey,
           `mutation UpdateIssue($id: String!, $input: IssueUpdateInput!) {
             issueUpdate(id: $id, input: $input) { success issue { id identifier url } }
           }`,
-          { id: issue.id, input: { title: task.title, description, stateId: state.id, priority, labelIds, parentId: parent, ...(assigneeId !== undefined ? { assigneeId } : {}) } }
+          { id: issue.id, input: { title: task.title, description, stateId: state.id, priority, labelIds, parentId: parent, ...(assigneeId !== undefined ? { assigneeId } : {}) } },
+          { payload: "issueUpdate", entity: "issue" }
         );
         issue = { ...issue, ...data.issueUpdate.issue, state: { id: state.id }, priority, labels: { nodes: labelIds.map((id) => ({ id, name: "" })) }, parent: parent ? { id: parent } : null, assignee: assigneeId !== undefined ? { id: assigneeId } : issue.assignee, title: task.title, description };
         boot.issuesById.set(issue.id, issue);
         mutated = true;
       }
     } else {
-      const data = await linearGraphql<{ issueCreate: { issue: LinearIssue } }>(
+      const data = await linearMutation<{ issueCreate: { issue: LinearIssue } }>(
         ctx.fetchImpl,
         ctx.apiKey,
         `mutation CreateIssue($input: IssueCreateInput!) {
           issueCreate(input: $input) { success issue { id identifier url } }
         }`,
-        { input: { teamId, title: task.title, description, stateId: state.id, priority, labelIds, parentId: parent, ...(assigneeId !== undefined ? { assigneeId } : {}) } }
+        { input: { teamId, title: task.title, description, stateId: state.id, priority, labelIds, parentId: parent, ...(assigneeId !== undefined ? { assigneeId } : {}) } },
+        { payload: "issueCreate", entity: "issue" }
       );
       issue = { ...data.issueCreate.issue, description, title: task.title, assignee: assigneeId !== undefined ? { id: assigneeId } : null };
       boot.issuesById.set(issue.id, issue);
@@ -367,13 +379,14 @@ export const linearAdapter: PmAdapter = {
     const state = resolveStateByGroup(states, desiredStateForStatus("done"));
     const changed = issue.state?.id !== state.id;
     if (changed) {
-      await linearGraphql(
+      await linearMutation(
         ctx.fetchImpl,
         ctx.apiKey,
         `mutation CompleteIssue($id: String!, $stateId: String!) {
           issueUpdate(id: $id, input: { stateId: $stateId }) { success issue { id identifier url state { id name type } } }
         }`,
-        { id: issue.id, stateId: state.id }
+        { id: issue.id, stateId: state.id },
+        { payload: "issueUpdate", entity: "issue" }
       );
     }
     return {

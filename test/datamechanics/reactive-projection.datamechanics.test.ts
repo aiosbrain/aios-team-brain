@@ -35,7 +35,7 @@ function linearMock(opts: { issues?: unknown[]; labels?: unknown[] } = {}) {
       return Response.json({ data: { issueUpdate: { success: true, issue: { id: variables.id, identifier: "AIO-1", url: "https://linear.app/AIO-1" } } } });
     }
     if (query.includes("issueLabelCreate")) {
-      return Response.json({ data: { issueLabelCreate: { issueLabel: { id: `label-${++n}` } } } });
+      return Response.json({ data: { issueLabelCreate: { success: true, issueLabel: { id: `label-${++n}` } } } });
     }
     return Response.json({ data: {} });
   }) as unknown as typeof fetch;
