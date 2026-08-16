@@ -139,19 +139,50 @@ const filler = (n, tag) => {
 };
 
 /**
- * THE BOUND. `L` = the length of the common prefix of the two boundary sequences — the last boundary the
- * two chunkings share. Chunks `0..L-1` are byte-identical, so at most the admitted chunks after `L` can
- * be re-pushed. An upper bound by construction; measured tight everywhere except duplicate content.
+ * THE BOUND, IN THE COORDINATES THE COST IS PAID IN. `L` = the length of the common prefix of the two
+ * ADMITTED CHUNK ARRAYS. Those chunks are byte-identical AND present in the before-set, so none of them
+ * can be re-pushed; at most the chunks after `L` can be. A theorem with no preconditions.
+ *
+ * IT WAS FIRST WRITTEN OVER THE BOUNDARY SEQUENCES, AND THAT VERSION IS FALSE. Both spec reviewers
+ * produced the same counter-example: `chunkCdc` returns `[]` for a whitespace-only body (cdc.ts:271)
+ * while `cdcBoundaries` still returns boundaries, so a whitespace base has `L > 0` over boundaries and
+ * an EMPTY before-set — 20,000 spaces plus one `x` churns 6 against a boundary-bound of 1. The
+ * boundary form also mis-stated the cap case (see `capParity` below). Both are reported here so the
+ * refutation reproduces rather than being asserted.
  */
-const appendBound = (b0, b1) => {
+const appendBound = (c0, c1) => {
+  let l = 0;
+  while (l < c0.length && l < c1.length && c0[l] === c1[l]) l++;
+  return { shared: l, bound: Math.max(0, c1.length - l) };
+};
+/** The FALSIFIED boundary-coordinate form, kept runnable so its counter-examples reproduce. */
+const boundaryFormBound = (b0, b1) => {
   let l = 0;
   while (l < b0.length && l < b1.length && b0[l] === b1[l]) l++;
   return { shared: l, bound: Math.max(0, Math.min(CAP, b1.length) - l) };
 };
 
+/**
+ * THE ABSOLUTE GUARD — the one assertion here that cannot self-adjust.
+ *
+ * The bound above is computed from the chunker's own output, so ANY prefix-stable chunker satisfies it:
+ * a regression that re-cuts deeply just shrinks `L` and inflates the bound to match (Fable's review).
+ * This ceiling is derived from the SIZE ENVELOPE instead — configuration, not behaviour:
+ *
+ *   • only boundaries whose chunk start lies within `max` of the old end can move (cdc.ts:222), and
+ *     non-final chunks are at least `min`, so at most `1 + floor((max-1)/min)` of them are in play;
+ *   • the appended text of length A adds at most `ceil(A/min)` further chunks.
+ */
+const DEPTH_CEILING = 1 + Math.floor((P.max - 1) / P.min);
+const absoluteCeiling = (appendLength) => DEPTH_CEILING + Math.ceil(appendLength / P.min);
+
 if (OP === "append") {
   const which = flag("corpus", "test");
-  const docs = corpus(which);
+  // The design documents ARE the corpus, so the spec quoting these numbers is IN them and every edit to
+  // it moves them (both reviewers caught a table that had already gone stale that way). `--exclude`
+  // makes a published distribution stable against the document that publishes it.
+  const excluded = flag("exclude", "");
+  const docs = corpus(which).filter((d) => !excluded || d.path !== excluded);
   const out = {
     op: "append",
     revision: revision(),
@@ -166,6 +197,11 @@ if (OP === "append") {
     depthHistogram: {},
     movedOutsideMaxWindow: 0,
     perLength: {},
+    excluded: excluded || null,
+    depthCeiling: { provable: DEPTH_CEILING, derivation: "1 + floor((max-1)/min)", observed: 0, violations: 0 },
+    absoluteGuard: { formula: "depthCeiling + ceil(appendLength/min)", violations: [], synthetic: null },
+    boundaryFormViolations: [],
+    capParity: [],
     candidate1: { name: "1 + new chunks, or 0 when capped", agrees: 0, samples: 0, misses: [] },
     legacy: {},
     duplicateProbe: null,
@@ -182,7 +218,8 @@ if (OP === "append") {
       const appended = text + make(len);
       const after = chunks(appended);
       const b1 = cdcBoundaries(appended, P);
-      const { shared, bound } = appendBound(b0, b1);
+      const { shared, bound } = appendBound(base, after);
+      const bf = boundaryFormBound(b0, b1);
       const s = setChurn(base, after);
       const p = positionalChurn(base, after);
       out.samples++;
@@ -191,11 +228,18 @@ if (OP === "append") {
       if (s === bound) out.boundTightSet++;
       else if (s < bound) out.slack.push({ path, len, filler: fname, bound, set: s, positional: p });
       if (p === bound) out.boundTightPositional++;
-      const depth = b0.length - shared;
+      if (s > bf.bound) out.boundaryFormViolations.push({ path, len, filler: fname, boundaryBound: bf.bound, set: s });
+      if (s > absoluteCeiling(len))
+        out.absoluteGuard.violations.push({ path, len, filler: fname, ceiling: absoluteCeiling(len), set: s });
+      // The cap case, measured rather than asserted: a document PAST the cap is not automatically 0.
+      if (b0.length >= CAP) out.capParity.push({ path, len, filler: fname, boundaries: b0.length, sharedBoundaries: bf.shared, set: s });
+      const depth = b0.length - bf.shared;
+      if (depth > out.depthCeiling.observed) out.depthCeiling.observed = depth;
+      if (depth > DEPTH_CEILING) out.depthCeiling.violations++;
       out.depthHistogram[depth] = (out.depthHistogram[depth] ?? 0) + 1;
       // Structural claim: a boundary whose chunk START sits at least `max` before the original end is
       // computed from unchanged input and cannot move.
-      const lastSharedEnd = shared > 0 ? b0[shared - 1] : 0;
+      const lastSharedEnd = bf.shared > 0 ? b0[bf.shared - 1] : 0;
       if (text.length - lastSharedEnd > P.max) out.movedOutsideMaxWindow++;
       const bucket = (out.perLength[`${len}/${fname}`] ??= {});
       bucket[s] = (bucket[s] ?? 0) + 1;
@@ -218,7 +262,9 @@ if (OP === "append") {
   // wrong-in-one-direction; it is decided by content nobody is thinking about.
   const FILLERS = {
     "prose-a": (n) => filler(n, "z"),
-    "prose-b": (n) => filler(n, "q").replace(/lorem/g, "dolorem"),
+    // Replace BEFORE slicing. Doing it after made this filler 2,602 characters at a nominal 2,500, so
+    // the "flips with content at a FIXED length" claim it was evidence for was length-confounded.
+    "prose-b": (n) => filler(n + 512, "q").replace(/lorem/g, "dolorem").slice(0, n),
     quiet: (n) => "a".repeat(n),
     sentence: () => " a new closing paragraph appended at the very end of the document.",
   };
@@ -242,6 +288,28 @@ if (OP === "append") {
     }
   }
 
+  // The absolute guard on SYNTHETIC documents too. 28 real files are not evidence about an algorithm,
+  // and this is the one assertion the test gates on that is meant to hold for any input, not for this
+  // corpus — so its sample count has to come from here rather than from a throwaway.
+  {
+    let samples = 0, violations = 0, maxDepth = 0, boundViolations = 0, worst = null;
+    for (let seed = 1; seed <= 400; seed++) {
+      const doc = filler(2_000 + ((seed * 911) % 80_000), `g${seed}-`);
+      const c0 = chunks(doc), b0 = cdcBoundaries(doc, P);
+      for (const len of [1, 66, 700, 1_249, 2_500, 9_000, 40_000])
+        for (const app of [filler(len, `h${seed}-`), "a".repeat(len), " ".repeat(len)]) {
+          const c1 = chunks(doc + app), b1 = cdcBoundaries(doc + app, P);
+          const s2 = setChurn(c0, c1);
+          samples++;
+          if (s2 > appendBound(c0, c1).bound) boundViolations++;
+          if (s2 > absoluteCeiling(app.length)) { violations++; worst = { seed, len, set: s2, ceiling: absoluteCeiling(app.length) }; }
+          const d = b0.length - boundaryFormBound(b0, b1).shared;
+          if (d > maxDepth) maxDepth = d;
+        }
+    }
+    out.absoluteGuard.synthetic = { documents: 400, samples, violations, worst, boundViolations, maxDepthObserved: maxDepth };
+  }
+
   // The exact append `test/graph-cdc.test.ts`'s `append at end` scenario applies, so the distribution
   // its `<= 1` assertion is really quantifying over is printed rather than described.
   {
@@ -254,24 +322,128 @@ if (OP === "append") {
     out.fixtureAppend = { text: app, length: app.length, churnDistribution: dist };
   }
 
+  // THE MERGE EVENT — an append that DELETES a boundary, via the backup-mask preference rule. Probed
+  // rather than described: the spec first claimed "appending one character" does this, and both
+  // reviewers showed it is character-dependent (`q` yes, `x` no) and that the sweep never observed it.
+  {
+    const target = "docs/design/work-timeline-context-layer.md";
+    const doc = docs.find((d) => d.path === target);
+    out.mergeProbe = doc
+      ? (() => {
+          const b0 = cdcBoundaries(doc.text, P);
+          const deletes = [];
+          const keeps = [];
+          for (const ch of ["q", "x", "a", "z", " ", ".", "%", "5", "\n"]) {
+            const b1 = cdcBoundaries(doc.text + ch, P);
+            (b1.length < b0.length ? deletes : keeps).push(ch);
+          }
+          const ch = deletes[0];
+          if (ch === undefined) return { path: target, boundariesBefore: b0.length, deletes, keeps, note: "no single character deletes a boundary here any more" };
+          const b1 = cdcBoundaries(doc.text + ch, P);
+          const gone = b0.filter((e) => e !== doc.text.length && !b1.includes(e));
+          return {
+            path: target, boundariesBefore: b0.length, boundariesAfter: b1.length,
+            deletes, keeps, character: ch, vanishedBoundaries: gone,
+            churn: setChurn(chunks(doc.text), chunks(doc.text + ch)),
+            bound: appendBound(chunks(doc.text), chunks(doc.text + ch)).bound,
+          };
+        })()
+      : { path: target, note: "not in this corpus any more — the witness is live content and may rot" };
+  }
+
+  // THE CAP CASE, CONSTRUCTED. The first draft said a document past the cap churns 0. False: what has to
+  // reach the cap is the SHARED CHUNK PREFIX, not the boundary count, and an append can move the last
+  // two boundaries. Built here so the refutation is reproducible rather than a claim about one file.
+  {
+    const big = filler(400_000, "c");
+    out.capProbe = [];
+    for (const want of [79, 80, 81, 82]) {
+      let lo = 1_000, hi = 400_000, found = null;
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        const n = cdcBoundaries(big.slice(0, mid), P).length;
+        if (n === want) { found = mid; break; }
+        if (n < want) lo = mid + 1; else hi = mid - 1;
+      }
+      if (found === null) { out.capProbe.push({ boundaries: want, note: "no prefix realises that count" }); continue; }
+      const doc = big.slice(0, found);
+      for (const len of [66, 2_500]) {
+        const app = filler(len, "d");
+        const c0 = chunks(doc), c1 = chunks(doc + app);
+        const { shared, bound } = appendBound(c0, c1);
+        out.capProbe.push({ boundaries: want, appendLength: len, sharedChunks: shared, bound, set: setChurn(c0, c1) });
+      }
+    }
+  }
+
+  // Does appending an existing chunk VERBATIM save anything? The spec claims not — the boundary shift
+  // means the re-cut chunks are not byte-identical to the original. Probed, not asserted.
+  {
+    const doc = filler(60_000, "v");
+    const c0 = chunks(doc);
+    const c1 = chunks(doc + c0[5]);
+    out.verbatimChunkProbe = { appended: "chunk 5, verbatim", bound: appendBound(c0, c1).bound, set: setChurn(c0, c1) };
+  }
+
+  // The cross-algorithm envelope that REPLACES the deleted max-versus-max comparison: per document, how
+  // much worse than byte offsets can CDC be? Reported by regime, because it is +1 for appends shorter
+  // than `min` and reaches +4 for long ones on synthetic documents.
+  {
+    let shortMax = -Infinity, longMax = -Infinity, shortAt = null, longAt = null;
+    for (const { path, text } of docs)
+      for (const len of APPEND_LENGTHS)
+        for (const [fname, make] of Object.entries(BOUND_FILLERS)) {
+          const app = make(len);
+          const gap = setChurn(chunks(text), chunks(text + app)) - setChurn(legacyChunks(text), legacyChunks(text + app));
+          if (len < P.min) { if (gap > shortMax) { shortMax = gap; shortAt = { path, len, filler: fname, gap }; } }
+          else if (gap > longMax) { longMax = gap; longAt = { path, len, filler: fname, gap }; }
+        }
+    // …and the same question on SYNTHETIC documents, because a corpus of 28 real files is not evidence
+    // about the algorithm. The live corpus never exceeds +1; synthetic documents reach +4, which is why
+    // the envelope this spec gates on is scoped to the short-append regime rather than stated generally.
+    let synShort = -Infinity, synShortAt = null, synLong = -Infinity, synLongAt = null;
+    for (let seed = 1; seed <= 300; seed++) {
+      const doc = filler(2_000 + ((seed * 911) % 80_000), `s${seed}-`);
+      for (const len of [1, 66, 700, 1_249, 2_500, 9_000, 40_000]) {
+        const app = filler(len, `t${seed}-`);
+        const gap = setChurn(chunks(doc), chunks(doc + app)) - setChurn(legacyChunks(doc), legacyChunks(doc + app));
+        if (len < P.min) { if (gap > synShort) { synShort = gap; synShortAt = { seed, len, gap, docLength: doc.length }; } }
+        else if (gap > synLong) { synLong = gap; synLongAt = { seed, len, gap, docLength: doc.length }; }
+      }
+    }
+    out.legacyEnvelope = {
+      corpus: { shortAppendMaxGap: shortMax, shortAt, longAppendMaxGap: longMax, longAt },
+      synthetic: { documents: 300, shortAppendMaxGap: synShort, shortAt: synShortAt, longAppendMaxGap: synLong, longAt: synLongAt },
+    };
+  }
+
   // The one place the bound is deliberately NOT tight: appending a document to itself reproduces whole
   // chunks, and an identical chunk is never re-pushed.
   {
     const doc = filler(60_000, "b");
     const b0 = cdcBoundaries(doc, P);
     const b1 = cdcBoundaries(doc + doc, P);
-    const { bound, shared } = appendBound(b0, b1);
+    const c0 = chunks(doc), c1 = chunks(doc + doc);
+    const { bound, shared } = appendBound(c0, c1);
     out.duplicateProbe = {
       case: "self-concatenation",
-      shared,
+      sharedChunks: shared,
+      boundaryCounts: [b0.length, b1.length],
       bound,
-      set: setChurn(chunks(doc), chunks(doc + doc)),
-      positional: positionalChurn(chunks(doc), chunks(doc + doc)),
+      set: setChurn(c0, c1),
+      positional: positionalChurn(c0, c1),
     };
   }
 
   console.log(JSON.stringify(out, null, 2));
-  process.exit(out.violations.length === 0 ? 0 : 1);
+  // Non-zero on ANY refuted invariant, so the sweep is usable as a check and not only as a report.
+  const failed =
+    out.violations.length +
+    out.absoluteGuard.violations.length +
+    out.depthCeiling.violations +
+    (out.absoluteGuard.synthetic?.violations ?? 0) +
+    (out.absoluteGuard.synthetic?.boundViolations ?? 0);
+  process.exit(failed === 0 ? 0 : 1);
 }
 
 const summary = {

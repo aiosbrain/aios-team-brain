@@ -1,17 +1,25 @@
 # Append churn is a bound, not a number — CDCAPPEND-1
 
-**Status:** spec, draft 1 · **Date:** 2026-08-16 · **Owner:** Chetan · **Task:** `CDCAPPEND-1`
+**Status:** spec, draft 2. Draft 1 was BLOCKED by two independent cold reads, and **its central claim was
+falsified twice over** — once for whitespace-only bodies, once for the cap. Draft 2 states the bound in
+the coordinates the cost is actually paid in, where it is a theorem with no preconditions.
+**Date:** 2026-08-16 · **Owner:** Chetan · **Task:** `CDCAPPEND-1`
 **Related:** [`content-defined-chunking.md`](./content-defined-chunking.md) (the table this corrects),
 [`cdc-boundary-overlap.md`](./cdc-boundary-overlap.md) (`CDCCHURN-1`, the row above this one).
 **Code:** `test/graph-cdc.test.ts`, `scripts/cdc-churn-sweep.mjs`, `lib/graph/cdc.ts` (read only —
 no product change; that IS the finding, exactly as it was one row up).
 
-**Every number below comes from one run of `node scripts/cdc-churn-sweep.mjs --op append`**, which
-stamps its own `revision` (SHA + whether the tree was dirty) for the reason this ticket's neighbour
-learned the hard way: a published measurement stopped reproducing, and the retraction story was wrong
-too. Figures here were taken at `46aad5c` with this spec present in the tree — **which matters, because
-the design documents ARE the corpus**: this file is ≥ 15,000 characters, so it joined the measured set
-and took it from 28 documents to 29. Re-run the sweep rather than trusting a number quoted here.
+**Every number below comes from one run of**
+
+```
+node scripts/cdc-churn-sweep.mjs --op append --exclude docs/design/cdc-append-churn.md
+```
+
+which stamps its own `revision` (SHA + whether the tree was dirty). `--exclude` is not a convenience: the
+design documents ARE the corpus, this file is over 15,000 characters, and **draft 1's §0e table had
+already gone stale by the time it was reviewed because writing the draft moved the document it was
+measuring into a different churn bucket.** Both reviewers caught it. Excluding this file makes the
+published distributions stable against the document that publishes them.
 
 ---
 
@@ -23,216 +31,244 @@ and took it from 28 documents to 29. Re-run the sweep rather than trusting a num
 |---|---|---|
 | append at end | 1 of 20 | conditional, not yet characterised (`CDCAPPEND-1`) |
 
-That cell is `CDCCHURN-1`'s deliberate statement of ignorance, left in place rather than filled with a
-fourth invented rule. This slice fills it — and, in measuring it, found that the **test** guarding the
-row asserts two things that are not properties of appends at all (§0e).
+That cell is `CDCCHURN-1`'s deliberate statement of ignorance, left rather than filled with a fourth
+invented rule. This slice fills it — and, in measuring it, found that the **test** guarding the row
+asserts two things that are not properties of appends at all (§0f).
 
-### 0a. Four characterisations of this row, all four falsified by measurement
+### 0a. Six characterisations of this row, all six falsified by measurement
 
-Three were falsified during `CDCCHURN-1`'s review. **The fourth was this draft's own, and it was wrong
-too** — which is why the rule below was measured before it was written, the order that ticket ended on.
+Three were falsified during `CDCCHURN-1`'s review. **Three more were falsified in this ticket, and all
+three were mine** — one by my own sweep, two by the reviewers of draft 1. That is the reason this row
+gets a bound with a proof instead of a fifth constant.
 
-1. *"Churn is 1."* — The original acceptance-table claim. False in both directions: `docs/ARCHITECTURE.md`
-   churns **0** (146 boundaries against an 80-chunk admitted cap, so an append lands past the admitted
-   prefix and is dropped entirely), and for the test fixture's own 66-character append **4 of 29**
-   corpus documents churn **2** (`fixtureAppend.churnDistribution`: `{0: 1, 1: 24, 2: 4}`).
-2. *"1 unless the appended text splits the final chunk, then 2."* — False in both halves. The 0 case
-   breaks the floor, and the 2s are not "the append split the final chunk": the new cut lands inside the
-   **appended** region, which moves the final boundary and therefore changes the chunk before it too.
-3. *"2 is the ceiling."* — Holds only for appends shorter than `min`. A 9,000-character prose append
-   churns 4–5 and a 60,000-character one churns 23–24 (§0d).
-4. *(this draft's first candidate)* *"churn = 1 + the number of new chunks, or 0 when capped."* —
-   **469 of 580 samples, 80.9%.** Every miss is in the same direction, and `docs/TODO.md` is the
-   clearest witness: it says 1 where the answer is 2, at four different append lengths. The mechanism is
-   §0d — a document's final chunk frequently has no cut at all, the text simply ended, so extending the
-   tail lets the chunker *find* a cut inside the appended region and move the last boundary **without
-   adding a chunk**. The candidate is kept runnable in the sweep (`candidate1`) so the refutation
-   reproduces rather than being asserted.
+1. *"Churn is 1."* — The original claim. False in both directions: `docs/ARCHITECTURE.md` churns **0**
+   (146 boundaries against an 80-chunk cap, so an append lands past the admitted prefix), and for the
+   test fixture's own 66-character append **4 of 28** corpus documents churn **2**
+   (`fixtureAppend.churnDistribution` = `{0: 1, 1: 23, 2: 4}`).
+2. *"1 unless the appended text splits the final chunk, then 2."* — False in both halves; the 2s are not
+   splits of the final chunk (§0d).
+3. *"2 is the ceiling."* — Holds only below `min`. A 9,000-character prose append churns 4–5, a
+   60,000-character one 23–24 (§0e).
+4. *(draft 1, mine)* *"churn = 1 + the number of new chunks, or 0 when capped."* — **449 of 560
+   samples, 80.2%** (`candidate1`). Every miss is in the same direction; `docs/TODO.md` is the clearest
+   witness, saying 1 where the answer is 2 at four different append lengths. Mechanism in §0d.
+5. *(draft 1, mine — found by BOTH reviewers)* *the bound stated over the **boundary** sequences.*
+   `chunkCdc` returns `[]` for a whitespace-only body (`lib/graph/cdc.ts:271`) while `cdcBoundaries`
+   still returns boundaries, so a whitespace base has a non-empty shared boundary prefix and an **empty**
+   before-set. **20,000 spaces plus one `x` churns 6 against a boundary-form bound of 1.** The proof's
+   premise — "those chunks are byte-identical so cannot be re-pushed" — fails because they were never
+   pushed. §0b restates the bound over chunks, where the premise is true by construction.
+6. *(draft 1, mine — found by Fable)* *"0 once the document fills the cap."* — False, and it was in the
+   proposed table row, which would have made it the fifth wrong characterisation shipping as
+   documentation. What must reach the cap is the **shared prefix**, not the boundary count, and an append
+   moves the last one or two boundaries. Constructed and committed as `capProbe`:
 
-### 0b. The rule, and it is a BOUND with a proof, not a fitted constant
+   | boundaries | append | shared chunks | bound | churn |
+   |---:|---:|---:|---:|---:|
+   | 79 | 66 | 78 | 1 | 1 |
+   | 79 | 2,500 | 78 | 2 | 2 |
+   | **80 (= cap)** | 66 | 79 | 1 | **1** |
+   | **80 (= cap)** | 2,500 | 79 | 1 | **1** |
+   | 81 | 2,500 | 80 | 0 | 0 |
 
-Let `B₀` and `B₁` be the (uncapped) boundary sequences of the document before and after the append, and
-let `L` be the length of their longest common prefix — the index of the last boundary the two chunkings
-**share**. Then:
+   A document sitting exactly at the cap churns **1**, not 0.
 
-> **churn ≤ max(0, min(cap, |B₁|) − L)** — the number of ADMITTED chunks lying after the last shared
-> boundary.
+### 0b. The rule, in the coordinates the cost is paid in
 
-**The bound is a theorem, not a measurement.** Chunks `0 … L−1` are byte-identical across the two
-chunkings, so under the SET metric the ledger pays (`lib/graph/project.ts:1222-1223` filters by
-`new Set(chunk_shas)` MEMBERSHIP) none of them can be re-pushed; at most the chunks after `L`, truncated
-at the cap, can be. Stating it as a bound rather than an equality is the correction: all four earlier
-attempts stated an equality, and an equality is what keeps being falsified.
+Let `C₀` and `C₁` be the **admitted chunk arrays** (`chunkCdc`, i.e. already capped) before and after the
+append, and `L` the length of their longest common prefix. Then:
 
-**And it is measured tight.** 29 documents × 10 append lengths × 2 append contents = **580 samples;
-bound holds 580/580; exactly tight 580/580 under both the set metric and a positional diff; zero
-violations, zero slack.**
+> **churn ≤ |C₁| − L** — the number of admitted chunks after the last chunk the two chunkings share.
 
-**The cap term is a CONSEQUENCE, not a term.** "0 when the document already fills the admitted cap" was
-this draft's second clause. It is redundant: an append can only move boundaries near the end (§0d), so a
-document with more than `cap` boundaries always has `L ≥ cap` and `min(cap, |B₁|) − L` is already ≤ 0.
-`CDCCHURN-1` deleted a predicate term for exactly this reason — "a term no test can redden is one the
-code would be asserting on trust" — and the same standard applies to prose. The clause is gone; a
-fixture asserts the property instead.
+**A theorem with no preconditions.** Chunks `0 … L−1` of `C₁` are byte-identical to chunks of `C₀` and
+therefore members of the before-set, so `lib/graph/project.ts:1222-1223` — which filters by
+`new Set(chunk_shas)` MEMBERSHIP — can never re-push them. The whitespace case (characterisation 5) is
+covered rather than excluded: a whitespace base gives `C₀ = []`, hence `L = 0` and a bound of `|C₁|`,
+which is trivially satisfied. The cap needs no term either: `C₁` is already truncated.
+
+**Measured tight: 28 documents × 10 append lengths × 2 append contents = 560 samples, bound holds
+560/560, exactly tight 560/560.** One honesty note the reviewers were right to force: of the three
+figures in that sentence, **only set-metric tightness is a measurement.** "Holds 560/560" is the theorem
+restated, and positional tightness is near-tautological (chunks after `L` differ at their index by
+construction, up to byte coincidence). The informative claim is that the SET metric — the one that costs
+money — sits exactly on the bound everywhere except duplicate content (§0c).
 
 ### 0c. Where the bound is NOT tight, and why that is the safe direction
 
-The set metric comes in **below** the bound when a new chunk's content already appears elsewhere in the
-document — an identical chunk is never re-pushed, so it costs nothing. Constructed (`duplicateProbe`):
-appending a 60,000-character document **to itself** re-cuts the tail into 25 positionally-changed chunks
-of which **23 are byte-identical to chunks that already exist**, so the ledger pays **2** where the bound
-says 25. (`CDCCHURN-1` found and pinned the same asymmetry for in-place edits; this is that finding one
-row down.)
+The set metric falls **below** the bound when a new chunk's content already exists in the document.
+Committed as `duplicateProbe`: appending a 60,000-character document **to itself** shares 22 chunks and
+re-cuts the tail into 25 positionally-changed chunks of which 23 are byte-identical to existing ones, so
+the ledger pays **2** where the bound says 25.
 
-Two things make this the right shape rather than a hole:
-
-- **The error direction is conservative.** The bound over-states cost, never under-states it, so a churn
-  budget derived from it is safe. `CDCCHURN-1`'s published-78 incident was the opposite direction — a
-  positional count quoted as a cost — and this row must not repeat it.
-- **Appending duplicate text does not generally save anything.** Appending one existing chunk *verbatim*
-  still churns the full predicted amount, because the boundary shift means the re-cut chunks are not
-  byte-identical to the original one. Only a realignment that reproduces **whole** chunks pays off,
-  which is why self-concatenation is the witness and a smaller duplicate is not.
+- **The error direction is conservative** — the bound over-states cost, so a churn budget derived from it
+  is safe. `CDCCHURN-1`'s published-78 incident was the opposite direction (a positional count quoted as
+  a cost), and this row must not repeat it.
+- **Appending duplicate text does not generally save anything.** Committed as `verbatimChunkProbe`:
+  appending one existing chunk *verbatim* churns the full bound of 2, because the boundary shift means
+  the re-cut chunks are not byte-identical to the original. Only a realignment reproducing **whole**
+  chunks pays, which is why self-concatenation is the witness and a smaller duplicate is not.
 
 ### 0d. The mechanism: an append disturbs only the tail — and can DELETE a boundary there
 
-**The structural claim.** In `cdcBoundaries` (`lib/graph/cdc.ts:222`), the boundary ending chunk `k` is
+**The structural claim.** In `cdcBoundaries` (`lib/graph/cdc.ts:222`) the boundary ending chunk `k` is
 computed from `text[startₖ … min(startₖ + max, n))`, and `n` enters only through `hardEnd` and the
-`n − start <= min` short-tail exit. So every boundary whose chunk **start** lies at least `max` (4,000)
-code units before the original end is computed from unchanged input and cannot move. Verified across all
-580 samples: `movedOutsideMaxWindow` is **0**. Measured divergence depth `|B₀| − L`:
+`n − start <= min` short-tail exit. So a boundary whose chunk **start** lies at least `max` (4,000) code
+units before the original end is computed from unchanged input and cannot move — `movedOutsideMaxWindow`
+is **0** across all 560 samples.
 
-| boundaries moved | 1 | 2 | ≥ 3 |
-|---|---:|---:|---:|
-| samples (580) | 462 | 118 | **0** |
+**The provable ceiling on divergence depth is 4, and the observed maximum is not it.** Non-final chunks
+are at least `min`, so at most `1 + ⌊(max − 1)/min⌋ = 4` chunk starts can lie inside that window. The
+sweep observes a maximum of **2** on the live corpus. That is a corpus observation, not a ceiling: a
+search over random-character documents reaches **3** (and Codex independently constructed one at seed
+1307). One reviewer proposed that depth ≤ 2 "looks provable" for these parameters — **that is refuted**;
+the assertions in §2 use the derived 4, never the observed 2, which is the same discipline `CDCCHURN-1`
+adopted after publishing a sparse-grid maximum as if it were a bound.
 
-That is why §0b's cap clause is redundant, and it is also the death of "the appended text splits the
-final chunk": an append routinely changes the chunk **before** the last one.
+This also kills "the appended text splits the final chunk": an append routinely changes the chunk
+**before** the last one. And `docs/TODO.md` shows the mechanism behind characterisation 4 — its final
+chunk is a 485-character short tail taken by the `n − start <= min` exit, so appending gives that region
+a real cut and moves a boundary **without adding a chunk**.
 
-**And it can remove a boundary entirely.** `docs/design/work-timeline-context-layer.md` has 12
-boundaries; appending **one character** leaves it with 11 — the cut at 28,384 disappears and two chunks
-merge. The mechanism is the backup boundary, documented in the module without this consequence ever
-being drawn (`lib/graph/cdc.ts:218-220`): no primary mask fires anywhere in that final chunk's search
-window, so the cut comes from the backup mask, whose preference order is *"the first backup hit at or
-after `target` if there is one, otherwise the first backup hit at all"*. Appending one character extends
-`hardEnd` by one; that character's position satisfies the backup mask **and** sits past `target`, so it
-outranks the earlier backup and the previous cut ceases to exist. Confirmed by re-running the module's
-own hash roll at that chunk start: primary cut `−1` in both versions, backup `28384` before and `29665`
-after. The bound holds through it (`L = 10`, `|B₁| = 11`, predicted 1, measured 1) — which is the point
-of stating the rule against the shared-boundary prefix rather than against the chunk count.
+**An append can also remove a boundary, and which characters do it is content-dependent.** Committed as
+`mergeProbe` against `docs/design/work-timeline-context-layer.md` (12 boundaries): appending `q`, `%` or
+`5` deletes the boundary at 28,384 and leaves 11; appending `x`, `a`, `z`, space, `.` or newline leaves
+all 12. Draft 1 said "appending **one character**" without naming it — false as an unqualified claim, in
+a spec whose §0e is about content-dependence, and the sweep's own length-1 samples use `z` and `a`, so
+the committed script never observed the event it described. It does now.
 
-### 0e. Churn depends on the appended CONTENT, not only its length — so the guarding test is not a property
+The mechanism is the backup boundary, documented in the module without this consequence being drawn
+(`lib/graph/cdc.ts:218-220`): no primary mask fires in that final chunk's search window, so the cut comes
+from the backup mask, whose preference is *"the first backup hit at or after `target` if there is one,
+otherwise the first backup hit at all"*. The appended character extends `hardEnd` by one; if that
+position satisfies the backup mask **and** sits past `target`, it outranks the earlier backup and the
+previous cut ceases to exist. The bound holds through it (bound 1, churn 1).
 
-The new boundaries are content-defined, so two appends of the *same length* churn differently. Measured
+**This witness is live content and is expected to rot.** It is illustrative; the durable version is the
+checked-in MERGE fixture (§2c).
+
+### 0e. Churn depends on the appended CONTENT, not only its length
+
+Two appends of the same length churn differently, because the new boundaries are content-defined
 (`perLength`, prose filler vs a hash-quiet run of one repeated character):
 
 | append length | prose filler | hash-quiet filler |
 |---|---|---|
-| 2,500 | `{0:1, 2:17, 3:11}` | `{0:1, 1:26, 2:2}` |
-| 9,000 | `{0:1, 4:9, 5:19}` | `{0:1, 3:26, 4:2}` |
-| 60,000 | `{0:1, 23:9, 24:19}` | `{0:1, 16:28}` |
+| 2,500 | `{0:1, 2:16, 3:11}` | `{0:1, 1:25, 2:2}` |
+| 9,000 | `{0:1, 4:9, 5:18}` | `{0:1, 3:25, 4:2}` |
+| 60,000 | `{0:1, 23:9, 24:18}` | `{0:1, 16:27}` |
 
 A hash-quiet run yields few cuts, so 60,000 characters of it become 16 chunks where prose becomes 24.
-Growth is therefore *roughly* one chunk per `target` characters **of ordinary prose**, and any statement
-of the form "an append of N characters churns K" is under-specified. This is the fifth thing the row
-never mentioned, and it kills a constant more thoroughly than length alone does.
+Growth is *roughly* one chunk per `target` characters **of ordinary prose**, and any claim of the form
+"an append of N characters churns K" is under-specified.
 
-It also decides the two assertions guarding the row today:
+### 0f. The two assertions guarding this row today
 
 - **`append at end — CDC re-extracts <= 1 chunk(s)`** (`test/graph-cdc.test.ts:368`) is asserted against
-  one 50,000-character fixture and one 66-character append. Over the corpus that same append churns 2 on
-  4 of 29 documents, and the same fixture with a 2,500-character prose append churns 3.
-- **`CDC must never be worse than byte offsets`** (`test/graph-cdc.test.ts:433`) is **not a property, and
-  its outcome is decided by content nobody chose deliberately.** At the fixture's own append, CDC is
-  strictly worse than byte offsets on **4 of 29** documents and the comparison passes anyway, because it
-  compares max against max **across different documents** and a fifth, unrelated document churns 2 under
-  legacy. Change the append content at one fixed length of 2,500 and the same comparison **fails**
-  outright under one prose filler (`maxCdc 3 > maxLeg 2`), **passes** under a second prose filler, and
-  passes under the hash-quiet filler with CDC strictly *better* on 26 of 29. `CDCCHURN-1` removed this
-  comparison for `edit in place` and named the max-versus-max flaw where it survived — this is that
-  flaw, firing.
+  one 50,000-character fixture and one 66-character append. Over the corpus that append churns 2 on 4 of
+  28 documents; the same fixture with a 2,500-character prose append churns 3.
+- **`CDC must never be worse than byte offsets`** (`test/graph-cdc.test.ts:433`) is **not a property of
+  appends, and its outcome is decided by content nobody chose.** At the fixture's own append CDC is
+  strictly worse on 4 of 28 documents and the comparison passes anyway, because it compares max against
+  max **across different documents** and a fifth, unrelated document churns 2 under legacy. It is the
+  max-versus-max flaw `CDCCHURN-1` named where it survived, firing.
 
-So the honest trade for this row: **CDC is mildly worse than byte offsets on append** for ordinary prose
-— it re-cuts the tail where byte offsets only extend it — and dramatically better on insertion (CDC 1
-against legacy 80). That is the same shape `CDCCHURN-1` documented for in-place edits, and the table
-should say it rather than imply parity.
+  **Deleting it outright is what draft 1 proposed, and both reviewers refused it** — that removes a
+  cross-algorithm guard and leaves nothing to catch a CDC regression that makes appends much worse.
+  §2d replaces it instead.
+
+So the honest trade: **CDC is mildly worse than byte offsets on append** — it re-cuts the tail where byte
+offsets only extend it — and dramatically better on insertion (CDC 1 against legacy 80). Measured
+(`legacyEnvelope`), the per-document loss is at most **+1 chunk for appends shorter than `min`**, on both
+the live corpus and 300 synthetic documents; for longer appends it reaches +1 on the corpus and +2
+synthetically, so the general claim is weaker than the short-append one.
 
 ## 1. The claims that cannot hold
 
 - The acceptance table's `append at end` row cannot carry a constant: churn grows with append length,
-  varies with append content at fixed length (§0e), and collapses to 0 past the cap.
+  varies with append content at fixed length (§0e), and reaches 0 only once the shared prefix fills the
+  cap (§0a.6) — not merely once the document does.
 - The summary table at the top of `content-defined-chunking.md` (`| append at the end | 1 |`) measures
   **legacy** behaviour on a 50,000-character document, where 20 full chunks plus a 66-character append
-  yields exactly one new chunk. It is correct as written for what it measures and is left alone — the
-  same adjudication `CDCCHURN-1` reached for the row above, recorded here so it is not re-opened.
+  gives exactly one new chunk. Draft 1 called it "correct as written" and left it; one reviewer agreed and
+  the other showed the adjudication was too broad — **a 2,501-character append churns 2 under legacy, and
+  9,000 churns 4**, so that row is conditional on append length in exactly the way the CDC column was.
+  It is not rewritten (it does measure what it says it measures) but it is **scoped to the append it
+  measures**, which is the minimum honesty the neighbouring correction demands.
 
 ## 2. The decision
 
 ### 2a. The table row states a bound, its mechanism, and the trade
 
-`append at end` becomes: **at most the number of admitted chunks after the last boundary the two
-chunkings share — 1 for a short append to an uncapped document, 0 once the document fills the cap, and
-growing with both the length and the entropy of the appended text.** The prose names the mechanism (only
-boundaries within `max` of the end can move; the backup-boundary preference can delete one) and carries
-§0e's trade, so the row states both directions at once.
+`append at end` becomes: **at most the number of admitted chunks after the last chunk the two chunkings
+share — 1 for a short append to a document below the cap, 0 once the shared prefix itself fills the cap,
+and growing with both the length and the entropy of the appended text.** The prose names the mechanism
+(only boundaries within `max` of the end can move; the backup-boundary preference can delete one) and
+carries §0f's trade.
 
-### 2b. The test asserts the bound per document, never a constant
+### 2b. The test asserts the bound per document — and an ABSOLUTE ceiling that cannot self-adjust
 
-For every live corpus document × append lengths spanning the regimes (below `min`, around `target`,
-multiples of it) × two append contents, from the two boundary sequences the test already computes:
+The bound in §0b is computed from the chunker's own output, so **any prefix-stable chunker satisfies it
+by construction**: a regression that re-cuts deeply just shrinks `L` and inflates the bound to match.
+Asserting only that would be a guard that can never redden — the exact standard this repo applies to a
+predicate term, applied here to a whole assertion. So the test asserts three things:
 
-1. `L` and the predicted admitted count;
-2. set churn **≤** predicted — the theorem, which holds for every input;
-3. equality on the live corpus, with the count of strict cases reported, so the duplicate-content case
-   becomes visible rather than silently absorbed into a `≤`.
+1. **the bound**, per document per append content — `churn ≤ |C₁| − L`;
+2. **an absolute ceiling derived from the SIZE ENVELOPE, not from behaviour**:
+   `churn ≤ (1 + ⌊(max − 1)/min⌋) + ⌈A/min⌉` for an append of length `A` — at most 4 tail boundaries can
+   move (§0d) and the appended text adds at most `⌈A/min⌉` chunks. Zero violations across the 560 corpus
+   samples and 19,509 samples including adversarial synthetic documents. This is the assertion that
+   reddens if `cdc2` starts re-cutting the whole document;
+3. **the divergence depth**, per document, against the derived 4 — never the observed 2.
 
-No constant ceiling is asserted for any append length, because a ceiling is what made this row wrong
-four times.
+Equality with the bound is **reported, not gated** (a future document quoting another one verbatim would
+otherwise redden CI on an unrelated docs edit); the fixtures gate it where it is deterministic.
 
 ### 2c. Four checked-in fixtures, because the live corpus cannot guarantee any of these branches
 
-`CDCCHURN-1`'s lesson exactly: a live-corpus assertion that quantifies over an empty set is green.
-
-- **CAPPED** — a document past the admitted cap, asserting churn 0 AND that it exceeds the cap, so the
-  assertion cannot pass by the document simply being short. Today only `docs/ARCHITECTURE.md` reaches
-  the cap on the live corpus; one refactor and that branch is empty.
+- **CAPPED** — asserts churn 0 AND that the **shared chunk prefix reaches the cap**, which is the real
+  condition; a fixture asserting only "the document exceeds the cap" would be red at 80 boundaries
+  (§0a.6).
 - **MERGE** — a document whose final cut comes from the backup mask, asserting the boundary count
-  **falls** on a one-character append, the specific boundary is present before and absent after, and the
-  bound still holds. Without the before/after assertions the fixture can silently stop exercising it.
+  **falls**, the specific boundary is present before and absent after, and the bound still holds.
+  Constructed and checked in rather than pinned to the live file the §0d witness names.
 - **DUPLICATE** — self-concatenation, asserting set churn is strictly **below** the bound while the
-  positional count equals it. This is the one branch that proves the rule is an inequality; nothing on
-  the live corpus reaches it.
+  positional count equals it. The one branch that proves the rule is an inequality; nothing on the live
+  corpus reaches it.
 - **GROWTH** — one document across the length sweep under two append contents, asserting churn is
   non-decreasing in length, reaches ≥ 4 by 9,000 characters of prose, and **differs between the two
-  contents at the same length** — so §0e's content-dependence is pinned by a test, not only by prose.
+  contents at the same length**, pinning §0e by test rather than by prose.
 
-### 2d. The false comparison goes, with its measurement recorded at the site
+### 2d. The false comparison is REPLACED, not deleted
 
-`max(cdc) ≤ max(legacy)` is removed for `append at end` and §0e is recorded at the removal site, naming
-both why it passes today (max-versus-max across different documents) and that its outcome flips with the
-appended content at a fixed length. The `<= 1` scenario assertion is replaced by the bound. The
-comparison is **kept** for the insertion and deletion scenarios, where it is true per-document and is
-the reason this lever exists.
+`max(cdc) ≤ max(legacy)` goes, and in its place a **per-document** comparison gated on the regime where
+the envelope is measured: for appends shorter than `min`, `cdcChurn ≤ legacyChurn + 1`. For longer
+appends the per-document gap is reported, not gated, with the measured corpus and synthetic maxima
+recorded at the site — because a synthetic maximum is a lower bound and this file does not gate on
+lower bounds. §0f's reasons are recorded at the removal site: why the old form passed, and that its
+outcome flips with the appended content at a fixed length.
 
-### 2e. The sweep script gains the append operation
+### 2e. The sweep script
 
-`scripts/cdc-churn-sweep.mjs` gains `--op append`: documents × lengths × append contents, reporting both
-metrics, the divergence depth, the falsified candidate, the legacy comparison per document, and a
-`revision` stamp. It also gains a corrected corpus definition — a comment claimed its `> 4,000`-character
-set was "the same corpus `test/graph-cdc.test.ts` reads", which it never was (the test reads three
-directories at ≥ 15,000 characters). That is a number measured over one population and asserted over
-another, which is this ticket's own failure mode.
+`--op append` sweeps documents × lengths × append contents and reports both metrics, the divergence
+depth against the derived ceiling, the absolute guard, the falsified candidate, the falsified
+boundary-coordinate form of the bound, and probes for the merge event, the cap parity, the verbatim
+duplicate and the legacy envelope. It exits non-zero on any refuted invariant, so it is a check and not
+only a report. It also gains `--exclude` (the reflexivity above) and a corrected corpus definition — a
+comment claimed its `> 4,000`-character set was "the same corpus `test/graph-cdc.test.ts` reads", which
+it never was — and a fix to the `prose-b` filler, which replaced text **after** slicing and so appended
+2,602 characters at a nominal 2,500, confounding the very "same length, different content" comparison it
+was evidence for.
 
 ## Dependencies
 
-**Deps: none.** One test file, four small fixtures, one script, and one table row in one design
-document. No product code, no schema, no API surface.
+**Deps: none.** One test file, four small fixtures, one script, and one table row in one design document.
+No product code, no schema, no API surface.
 
 ## Build-with
 
-**Build-with tier: Fable / high effort.** Four characterisations of this row have now been falsified, one
-of them this draft's own first candidate at 80.9%. A fifth wrong answer ships as documentation and as a
-test that pins it. Two adversarial spec reviews (Fable + Codex) before any code, two on the diff.
+**Build-with tier: Fable / high effort.** Six characterisations of this row have now been falsified,
+three of them in this ticket and all three mine. A seventh wrong answer ships as documentation and as a
+test that pins it. Two adversarial spec reviews per round (Fable + Codex); round 1 BLOCKED on both.
 
 ## Tier safety
 
@@ -241,22 +277,28 @@ schema, no API route, no change to `visibleItems`/`visibleTasks`/`visibleGroupId
 
 ## 3. Acceptance criteria
 
-- `test/graph-cdc.test.ts` — for every live corpus document at every swept append length and append content, set churn is asserted `<= max(0, min(cap, |B1|) - L)`, per document rather than as a corpus maximum one outlier can dominate.
-- `test/graph-cdc.test.ts` — a CAPPED fixture asserts churn 0 AND that the document exceeds the admitted cap, so the branch cannot pass by the document being short.
-- `test/graph-cdc.test.ts` — a MERGE fixture asserts the boundary count FALLS on a one-character append, the vanishing boundary is present before and absent after, and the bound still holds.
+- `test/graph-cdc.test.ts` — for every live corpus document at every swept append length and append content, set churn is asserted `<= |C1| - L` where L is the common prefix of the two ADMITTED CHUNK arrays, per document rather than as a corpus maximum one outlier can dominate.
+- `test/graph-cdc.test.ts` — an ABSOLUTE ceiling `churn <= (1 + floor((max-1)/min)) + ceil(A/min)` is asserted per document, derived from the size envelope rather than from the chunker's output, so a chunker that re-cuts deeply reddens it.
+- `test/graph-cdc.test.ts` — the divergence depth is asserted per document against the DERIVED ceiling of 4, never the observed 2, and the observed maximum is recorded as an observation.
+- `test/graph-cdc.test.ts` — a CAPPED fixture asserts churn 0 AND that the shared chunk prefix reaches the cap; a fixture asserting only "the document exceeds the cap" must fail, since a document at exactly 80 boundaries churns 1.
+- `test/graph-cdc.test.ts` — a MERGE fixture, checked in rather than read from the live corpus, asserts the boundary count FALLS on a one-character append, the vanishing boundary is present before and absent after, and the bound still holds.
 - `test/graph-cdc.test.ts` — a DUPLICATE fixture asserts set churn is strictly below the bound while the positional count equals it, pinning the rule as an inequality rather than an equality that happens to hold.
 - `test/graph-cdc.test.ts` — a GROWTH fixture asserts churn is non-decreasing in append length, reaches at least 4 by a 9,000-character prose append, and DIFFERS between two append contents of the same length; no constant ceiling is asserted for any length.
-- `test/graph-cdc.test.ts` — the `append at end — CDC re-extracts <= 1 chunk(s)` assertion and the `max(cdc) <= max(legacy)` comparison for append are GONE, with the measured reason recorded at the site (4 of 29 documents strictly worse at the fixture's own append; the comparison's outcome flips with append content at a fixed length).
-- `test/graph-cdc.test.ts` — the live-corpus equality census is reported and a `documents > 5` floor is asserted, because a bound assertion over an empty or single-document corpus is green by construction.
-- `scripts/cdc-churn-sweep.mjs` — `--op append` sweeps documents x lengths x append contents, reports SET and POSITIONAL churn, divergence depth, the falsified candidate and the per-document legacy comparison, and stamps the revision it measured.
-- `scripts/cdc-churn-sweep.mjs` — the corpus helper names its two definitions explicitly and the false "the same corpus the test reads" comment is corrected; the in-place mode's existing numbers reproduce unchanged.
-- `docs/design/content-defined-chunking.md` — the acceptance table's `append at end` row states the bound, the cap collapse, and that growth depends on the appended content as well as its length; the prose carries the measured CDC-vs-legacy trade in both directions.
-- `docs/design/content-defined-chunking.md` — the summary table's legacy `| append at the end | 1 |` is deliberately untouched, with the adjudication recorded so it is not re-opened a third time.
+- `test/graph-cdc.test.ts` — a WHITESPACE fixture asserts the bound holds for a whitespace-only base, the case that falsified the boundary-coordinate form of the rule.
+- `test/graph-cdc.test.ts` — the `max(cdc) <= max(legacy)` comparison for append is replaced by a PER-DOCUMENT `cdcChurn <= legacyChurn + 1` gated to appends shorter than `min`, with the longer-append gap reported and the measured reason recorded at the site; the comparison is untouched for the insertion and deletion scenarios.
+- `test/graph-cdc.test.ts` — the `append at end — CDC re-extracts <= 1 chunk(s)` assertion is GONE, with the measurement that refutes it recorded at the site.
+- `test/graph-cdc.test.ts` — the live-corpus equality census is reported rather than gated, and a `documents > 5` floor is asserted, because a bound assertion over an empty or single-document corpus is green by construction.
+- `scripts/cdc-churn-sweep.mjs` — `--op append` reports the bound, the absolute guard, the divergence depth against its derived ceiling, the falsified candidate, the falsified boundary-coordinate form, and the merge, cap-parity, verbatim-duplicate and legacy-envelope probes; it exits non-zero on any refuted invariant.
+- `scripts/cdc-churn-sweep.mjs` — `--exclude <path>` omits a document from the corpus, so a distribution published in a document that is itself in the corpus is stable against its own edits.
+- `scripts/cdc-churn-sweep.mjs` — the `prose-b` filler replaces before slicing, so the "same length, different content" comparison is not length-confounded; the false "the same corpus the test reads" comment is corrected; the in-place mode's existing numbers reproduce unchanged.
+- `docs/design/content-defined-chunking.md` — the acceptance table's `append at end` row states the bound, the shared-prefix cap condition, and that growth depends on the appended content as well as its length; the prose carries the measured CDC-vs-legacy envelope.
+- `docs/design/content-defined-chunking.md` — the summary table's legacy `| append at the end | 1 |` is SCOPED to the 66-character append it measures rather than left unqualified, since a 2,501-character append churns 2 under byte offsets too.
 
 ## 4. Scope
 
-**In:** the `append at end` acceptance row and its prose, the append scenario's two false assertions,
-four fixtures, the sweep script's append mode and corpus correction.
+**In:** the `append at end` acceptance row and its prose, the summary row's scoping, the append
+scenario's two false assertions, five fixtures, the sweep script's append mode, probes, `--exclude` and
+corpus/filler corrections.
 
 **Deferred, each with its reason:**
 
@@ -264,22 +306,27 @@ four fixtures, the sweep script's append mode and corpus correction.
   chunking and keep its boundaries — makes chunking depend on the PREVIOUS chunking, and
   "same body ⇒ same chunks ⇒ same hashes" is the invariant the whole delta ledger rests on
   (`lib/graph/cdc.ts:11-13`). Rejected on that ground, not on cost.
-- **The orphan-tail question the MERGE case raises.** When two chunks merge, the vanished chunk's
-  episode is still in the graph and nothing purges it. That is the same orphan-tail issue
+- **The orphan-tail question the MERGE case raises.** When two chunks merge, the vanished chunk's episode
+  is still in the graph and nothing purges it. That is the orphan-tail issue
   `content-defined-chunking.md` already records for a cap shrink, it predates this slice, and it is a
   product decision about purge rather than a churn measurement.
-- **Re-litigating CDC vs byte offsets.** §0e shows append is a mild loss and insertion a large win.
-  Whether the balance is right is a design question with its own measurements; this slice makes the loss
-  visible instead of asserting a parity that is not there.
+- **Gating the long-append legacy envelope.** The synthetic maximum (+2 here, higher under other
+  generators) is a lower bound, and this file does not gate on lower bounds — the short-append regime is
+  where the envelope is measured on both populations.
 - **A cross-operation churn budget.** Three rows of that table are now conditional. Turning them into one
   predictive cost model for the projector is separate work with a separate consumer.
 
 ## 5. What would falsify this
 
-Wrong if any document at any append length and content churns **more** than the bound — that would mean
-a chunk at an index below `L` changed, contradicting the byte-identity the proof rests on, and would mean
-the divergence-depth window in §0d is not what the code does.
+Wrong if any base document and any append make set churn **exceed** `|C₁| − L` over the admitted chunk
+arrays — that would mean a chunk at an index below `L` was re-pushed despite being byte-identical to one
+already in the ledger, contradicting the MEMBERSHIP filter at `lib/graph/project.ts:1222-1223` rather
+than anything about boundaries. (Draft 1's boundary-coordinate form was falsified exactly here, by the
+`chunkCdc` blank-body guard, so this clause names the right mechanism now.)
+
+Wrong if any document exceeds the absolute ceiling of `(1 + ⌊(max − 1)/min⌋) + ⌈A/min⌉`, which would mean
+the structural window in §0d is not what `cdcBoundaries` does.
 
 Wrong in the other direction if the DUPLICATE fixture's set churn ever **equals** the bound, which would
 mean the fixture stopped exercising the inequality and the rule is being pinned as an equality again —
-the failure this row has now had four times.
+the failure this row has now had six times.
