@@ -1,0 +1,47 @@
+[
+  {
+    "id": "page-agenda",
+    "doc_id": "doc-alpha",
+    "workspace_id": 9001,
+    "name": "Agenda",
+    "date_created": 1786000000000,
+    "date_updated": 1786000100000,
+    "date_edited": 1786000100000,
+    "content": "- Review the pilot\n- Assign follow-ups",
+    "creator_id": 7,
+    "edited_by": 7,
+    "authors": [7],
+    "pages": [
+      {
+        "id": "page-decisions",
+        "doc_id": "doc-alpha",
+        "parent_page_id": "page-agenda",
+        "workspace_id": "9001",
+        "name": "Decisions",
+        "sub_title": "Approved during the meeting",
+        "date_created": 1786000050000,
+        "date_updated": 1786000300000,
+        "date_edited": 1786000300000,
+        "content": "Proceed with the read-only pilot.",
+        "creator_id": "8",
+        "edited_by": "8",
+        "authors": [7, "8"],
+        "pages": []
+      }
+    ]
+  },
+  {
+    "id": "page-actions",
+    "doc_id": "doc-alpha",
+    "workspace_id": 9001,
+    "name": "Action items",
+    "date_created": 1786000150000,
+    "date_updated": 1786000250000,
+    "date_edited": 1786000250000,
+    "content": "Alex owns the fixture review.",
+    "creator_id": 7,
+    "edited_by": 7,
+    "authors": [7],
+    "pages": []
+  }
+]

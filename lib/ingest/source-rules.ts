@@ -108,6 +108,14 @@ export const SOURCE_RULES: Readonly<Record<string, SourceRules>> = {
   notion: { workTimeOnUnchangedBody: "work", retainSupersededBodies: true, emitsTicketDocuments: false },
   gdrive: { workTimeOnUnchangedBody: "work", retainSupersededBodies: true, emitsTicketDocuments: false },
   confluence: { workTimeOnUnchangedBody: "work", retainSupersededBodies: true, emitsTicketDocuments: false },
+  /** Configured Docs use ClickUp's source-provided Doc/page edit timestamps.
+   *
+   *  `emitsTicketDocuments: true` — same shape as Linear and Plane: `normalizeClickUpTaskDocs` emits
+   *  one `deliverable` per task at `clickup/<ws>/tasks/<native-id>.md`, carrying the ticket's own key
+   *  in its path and `frontmatter.identifier`. Those are the documents the timeline's evidence gate
+   *  exists to exclude — a workspace of 400 tasks would otherwise fill every assignee's day with
+   *  their own backlog. The tasks still appear as TASKS; `false` here was simply the flag inverted. */
+  clickup: { workTimeOnUnchangedBody: "work", retainSupersededBodies: true, emitsTicketDocuments: true },
   /** Moot today — `web.py` emits no timestamp at all. Classified so the guard stays satisfied;
    *  revisit if it ever grows one, since a FETCH time would be noise-shaped, not work-shaped. */
   web: { workTimeOnUnchangedBody: "work", retainSupersededBodies: true, emitsTicketDocuments: false },
