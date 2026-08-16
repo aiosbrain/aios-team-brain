@@ -56,6 +56,12 @@ message-versus-diff check in this loop, and it is what caught the second inciden
 
 ## 1. The decision
 
+**No test-runner override exists in the CLI**, and that is a fix rather than an omission: an earlier
+build read the test command from an environment variable so the guard test could stub it, and BOTH code
+reviewers showed that shipped a verdict-forgery channel — mutate a real file, stub the report, print a
+block byte-identical to a real run, and the skill tells you to paste it into a PR. The runner is a
+function argument now; the CLI hard-wires the real one and only the tests inject a fake.
+
 **One command, and it is the only path the skill documents.** Not "the only path" — draft 1 said that,
 and it is not true of a shell.
 
@@ -99,7 +105,11 @@ node scripts/mutate.mjs <file> --edit <needle-file> <replacement-file> [--edit �
    Other tracked changes the test run made are *reported separately* — "the test run also dirtied X" —
    rather than conflated with a failed restore, because a check that reddens on unrelated noise trains
    the operator to ignore it. On abnormal exit (SIGINT, crash, timeout) it restores or prints
-   `MUTATION STILL APPLIED` loudly.
+   `MUTATION STILL APPLIED` loudly — and that string is real: the restore runs in a `finally`, so any
+   throw after the write still restores, and a restore that does not take says so. **No TIMEOUT is
+   implemented**; a test command that never terminates leaves the mutation applied until the operator
+   interrupts, which the signal handlers then restore. Stated rather than left implied — review found
+   draft 2 claiming a timeout that does not exist.
 6. **Prints a verdict** — `REDDENED` with the failing test names, or `SURVIVED` — and exits on whether
    the run met its **stated expectation**, not on the raw verdict. `--expect reddened` is the default
    (an ordinary mutation should be caught); `--keep` defaults to `--expect survived`, because "prove
@@ -111,8 +121,9 @@ node scripts/mutate.mjs <file> --edit <needle-file> <replacement-file> [--edit �
    SURVIVED would be success-but-exit-2 (aborting a `set -e` chain on the good outcome) and REDDENED
    would be a broken kept edit at exit 0 — so `mutate … --keep && git commit` would commit a change
    whose tests fail. That is a new work-corruption channel created by the fix for the last one.
-7. **Appends one line to an ignored run log**, so the next post-mortem can tell "the flow was bypassed"
-   from "the flow failed" — the question that is unanswerable about the incidents above.
+7. **Appends one line to `.mutate-runs.log`** (git-ignored, best-effort — a log that cannot be written
+   must never fail a run), so the next post-mortem can tell "the flow was bypassed" from "the flow
+   failed" — the question that is unanswerable about the incidents above.
 
 ### 1b. `--keep`: the mode that addresses the failure that actually happened
 

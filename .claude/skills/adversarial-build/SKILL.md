@@ -105,7 +105,8 @@ an experiment with replication.
   to keep a red edit unless you pass `--keep-even-if-red`.
 
   **Exit codes track the expectation, not the verdict:** `0` met, `2` missed, `1` refused (always with a
-  message naming why), so the default `--expect reddened` exits 0 when the mutation is caught.
+  message naming why), so the default `--expect reddened` exits 0 when the mutation is caught. Note
+  `--keep` on a RED edit exits **2**, not 1 — it is an expectation missed, not a usage error.
 
   **Mutation-verify every guard and security-relevant branch**, and confirm the INTENDED test reddens —
   not just any test. A guard that survives its mutation is decoration; a mutation that reddens something

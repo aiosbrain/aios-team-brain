@@ -48,3 +48,4 @@ next-env.d.ts
 
 # Supabase CLI local stack artifacts — this repo is Postgres-only (see CLAUDE.md §6)
 supabase/
+.mutate-runs.log
