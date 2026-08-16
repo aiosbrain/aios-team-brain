@@ -6,7 +6,7 @@ import { clientErrorMessage } from "./stream-retry";
 import { appendMessage } from "@/lib/chat/store";
 import { generateAndSetTitle } from "@/lib/chat/title";
 import { recordLlmUsage } from "@/lib/costs/llm-usage";
-import { flushPartial, finishRun, failRun } from "./turn-runs";
+import { flushPartial, finishRun, failRun, touchRun } from "./turn-runs";
 
 /**
  * Run ONE answer turn to completion and persist it — independently of whether the client is still
@@ -46,12 +46,24 @@ export interface RunAnswerTurnArgs {
   startedAt: number;
   /** Best-effort delivery to the client. MUST NOT throw — a dead client cannot fail the turn. */
   send: (event: string, data: unknown) => void;
-  /** Injectable clock for tests (heartbeat throttling). */
+  /** Injectable clock for tests (partial-flush throttling). */
   now?: () => number;
+  /** Liveness heartbeat interval; tests shorten it. Defaults to HEARTBEAT_MS. */
+  heartbeatMs?: number;
 }
 
-/** Heartbeat cadence: often enough for a returning tab to see progress, rare enough to be cheap. */
+/** Partial-text flush cadence: often enough for a returning tab to see progress, rare enough to be cheap. */
 export const PARTIAL_FLUSH_MS = 1_500;
+
+/**
+ * Liveness heartbeat cadence — INDEPENDENT of the model producing tokens.
+ *
+ * Comfortably inside `RUN_STALE_AFTER_MS` (3 min) so a healthy-but-quiet turn (a model thinking for a
+ * long time before its first token) is never mistaken for a dead process. Without this, staleness was
+ * delta-driven: a slow first token declared the run stale, a reader was told "interrupted", and the run
+ * then completed anyway — the contradiction the staleness rule is supposed to prevent, not create.
+ */
+export const HEARTBEAT_MS = 20_000;
 
 export async function runAnswerTurn(args: RunAnswerTurnArgs): Promise<void> {
   const { db, owner, conversationId, runId, question, ctx, keys, historyTurns, caller, timeZone } = args;
@@ -71,6 +83,19 @@ export async function runAnswerTurn(args: RunAnswerTurnArgs): Promise<void> {
       console.warn("[query] client sink failed (continuing to persist):", e instanceof Error ? e.message : e);
     }
   };
+
+  // Liveness heartbeat, on a timer rather than on deltas — see HEARTBEAT_MS. Best-effort and always
+  // cleared in `finally`, so it can neither fail the turn nor outlive it (a leaked interval would keep
+  // a dead run looking alive forever, which is worse than no heartbeat at all).
+  const heartbeat = runId
+    ? setInterval(() => {
+        void touchRun(db, runId).catch((e) =>
+          console.warn("[query] heartbeat failed:", e instanceof Error ? e.message : e)
+        );
+      }, args.heartbeatMs ?? HEARTBEAT_MS)
+    : null;
+  // Don't hold the process open just for a heartbeat (Node-only; harmless where absent).
+  heartbeat?.unref?.();
 
   try {
     for await (const chunk of streamAnswer(ctx, question, keys, historyTurns, caller, timeZone, {
@@ -103,9 +128,11 @@ export async function runAnswerTurn(args: RunAnswerTurnArgs): Promise<void> {
       const sources = ctx.sources
         .filter((s) => cited.has(s.sid))
         .map((s) => ({ id: s.sid, item_id: s.item_id, project: s.project, path: s.path, kind: s.kind }));
-      send("sources", { sources });
-      send("done", chunk.usage);
-
+      // PERSIST BEFORE ANNOUNCING. `done` is the client's "this turn is safely finished" signal, so it
+      // must not precede the writes: when it did, a DB failure after `done` sent an `error` frame AFTER
+      // `done`, marked the run failed even though the model had succeeded (and been billed), and left
+      // the turn unlogged — resurrecting the under-bill through the DB-failure edge. Now a persistence
+      // failure takes the catch below BEFORE any `done` was claimed, so the client is told the truth.
       let finalMessageId: string | null = null;
       if (conversationId) {
         finalMessageId = await appendMessage(db, owner, conversationId, "assistant", answer, {
@@ -114,12 +141,13 @@ export async function runAnswerTurn(args: RunAnswerTurnArgs): Promise<void> {
           output_tokens: chunk.usage.output_tokens,
           cost_usd: chunk.usage.cost_usd,
         });
-        if (args.createdNew) {
-          await generateAndSetTitle(db, owner, conversationId, question, answer, keys);
-        }
       }
 
-      await db.from("query_log").insert({
+      // CHECK THE ERROR. The db adapter resolves `{ error }` instead of throwing, so an unchecked
+      // insert fails SILENTLY — leaving a persisted answer with no spend row, which is precisely the
+      // under-bill this slice exists to close. Loud (thrown → logged + the run marked failed) beats a
+      // turn that looks complete but is invisible to the ledger.
+      const { error: logError } = await db.from("query_log").insert({
         team_id: owner.teamId,
         member_id: owner.memberId,
         question,
@@ -131,6 +159,7 @@ export async function runAnswerTurn(args: RunAnswerTurnArgs): Promise<void> {
         cost_usd: chunk.usage.cost_usd,
         latency_ms: now() - args.startedAt,
       });
+      if (logError) throw new Error(`query_log insert failed: ${logError.message}`);
 
       await recordLlmUsage(db, {
         teamId: owner.teamId,
@@ -146,6 +175,21 @@ export async function runAnswerTurn(args: RunAnswerTurnArgs): Promise<void> {
 
       // Flip the run LAST, pointing at the message that now exists.
       if (runId) await finishRun(db, runId, finalMessageId);
+
+      // Everything durable is written — NOW tell the client the turn is complete.
+      send("sources", { sources });
+      send("done", chunk.usage);
+
+      // Cosmetic + best-effort, deliberately after `done`: the title generator makes its own bounded
+      // LLM call, and nothing about the answer's durability depends on it. Keeping it here means a slow
+      // (or failing) title never delays or fails a turn that is already safely persisted.
+      if (conversationId && args.createdNew) {
+        try {
+          await generateAndSetTitle(db, owner, conversationId, question, answer, keys);
+        } catch (e) {
+          console.warn("[query] title generation failed:", e instanceof Error ? e.message : e);
+        }
+      }
     }
   } catch (e) {
     // Log the REAL error (it carries the provider status / model / base URL) for diagnosis; the client
@@ -161,5 +205,9 @@ export async function runAnswerTurn(args: RunAnswerTurnArgs): Promise<void> {
         console.error("[query] failed to record run failure:", err instanceof Error ? err.message : err);
       }
     }
+  } finally {
+    // ALWAYS stop the heartbeat. A leaked interval would keep touching `updated_at` after the turn
+    // ended, so a run that died would keep reading as alive — defeating the staleness rule entirely.
+    if (heartbeat) clearInterval(heartbeat);
   }
 }

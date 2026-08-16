@@ -54,15 +54,18 @@ export async function pollRun(
   conversationId: string,
   onPartial: (text: string) => void,
   opts: { signal?: AbortSignal; intervalMs?: number; sleep?: (ms: number) => Promise<void> } = {}
-): Promise<{ status: "done" | "error"; error: string | null; everStreaming: boolean } | null> {
+): Promise<{ status: "done" | "error"; error: string | null; hasAnswer: boolean } | null> {
   const intervalMs = opts.intervalMs ?? 1200;
   const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
-  // Whether a turn was ACTUALLY in flight while we watched. Opening a settled thread must not be
-  // treated as a reattach — otherwise every thread click would trigger a pointless re-render/refetch.
-  let everStreaming = false;
+  // The run we started watching. The endpoint reports the thread's LATEST run, so if the user asks a
+  // new question mid-poll the id changes underneath us — that new turn belongs to the live SSE reader,
+  // not to this reattach, and adopting it would write one turn's text into another's bubble.
+  let watchedId: string | null = null;
   for (;;) {
     if (opts.signal?.aborted) return null;
-    let body: { run?: { status?: string; partial?: string; error?: string | null } | null };
+    let body: {
+      run?: { id?: string; status?: string; partial?: string; error?: string | null; final_message_id?: string | null } | null;
+    };
     try {
       const res = await fetch(
         `/api/dashboard/conversations/${conversationId}/run?team=${encodeURIComponent(teamSlug)}`,
@@ -75,13 +78,23 @@ export async function pollRun(
     }
     const run = body.run;
     if (!run) return null;
+    const id = run.id ?? null;
+    if (watchedId === null) watchedId = id;
+    else if (id !== watchedId) return null; // a different turn took over — leave it alone
     if (run.status === "streaming") {
-      everStreaming = true;
       if (run.partial) onPartial(run.partial);
       await sleep(intervalMs);
       continue;
     }
-    return { status: run.status === "error" ? "error" : "done", error: run.error ?? null, everStreaming };
+    // `hasAnswer` — NOT "did we ever observe streaming". A run that settled in the gap between the
+    // caller fetching the thread and this first poll was never seen streaming, yet its answer is
+    // exactly what the caller is missing; keying off "was it live while I watched" left the user
+    // staring at their question with a permanently blank answer bubble.
+    return {
+      status: run.status === "error" ? "error" : "done",
+      error: run.error ?? null,
+      hasAnswer: run.status === "done" && Boolean(run.final_message_id),
+    };
   }
 }
 
@@ -118,6 +131,9 @@ export function QueryChat({
   // brain loads this conversation's history server-side (shared across sessions and interfaces).
   const [conversationId, setConversationId] = useState<string | null>(initialConversationId);
   const restored = useRef(false);
+  // The in-flight reattach poll, so starting a new turn can cancel it (otherwise the old run's
+  // partial keeps arriving while the new turn streams, writing one turn's text under another).
+  const reattachAbort = useRef<AbortController | null>(null);
 
   // Remember-the-thread (Home embed): on mount, reload the last thread from the server so navigating
   // away and back restores the visible history. The thread is already persisted server-side; we just
@@ -159,31 +175,50 @@ export function QueryChat({
     const convo = initialConversationId;
     if (!convo) return;
     const ctl = new AbortController();
+    reattachAbort.current = ctl; // so `ask()` can stop this poll the moment a new turn starts
     (async () => {
       // The reattached turn is the trailing exchange that has NO answer yet — a rehydrated thread
       // renders it as `done` with an empty answer (there is no assistant message to pair with), which
       // is why "unanswered" and not `status === "streaming"` is the condition here.
-      const patchUnanswered = (patch: Partial<Exchange>) =>
+      //
+      // PATCH BY CAPTURED INDEX, not "the last exchange": if the user asks a NEW question while this
+      // poll is still in flight, the last exchange is that new turn, and the old run's partial (or its
+      // error) would land on the wrong bubble. `ask()` also aborts this poll, but the index makes the
+      // patch correct even in the window before that takes effect.
+      let targetIdx = -1;
+      setExchanges((xs) => {
+        targetIdx = xs.length - 1;
+        return xs;
+      });
+      const patchTarget = (patch: Partial<Exchange>) =>
         setExchanges((xs) => {
-          if (!xs.length) return xs;
-          const last = xs.length - 1;
-          if (xs[last].answer && xs[last].status !== "streaming") return xs;
-          return xs.map((x, i) => (i === last ? { ...x, ...patch } : x));
+          const i = targetIdx;
+          if (i < 0 || i >= xs.length) return xs;
+          if (xs[i].answer && xs[i].status !== "streaming") return xs;
+          return xs.map((x, n) => (n === i ? { ...x, ...patch } : x));
         });
       const result = await pollRun(
         teamSlug,
         convo,
-        (partial) => patchUnanswered({ answer: partial, status: "streaming" }),
+        (partial) => patchTarget({ answer: partial, status: "streaming" }),
         { signal: ctl.signal }
       );
       if (!result || ctl.signal.aborted) return;
-      // Nothing was in flight — this is an ordinary thread open, already seeded with its messages.
-      if (!result.everStreaming) return;
       if (result.status === "error") {
-        patchUnanswered({ status: "error", error: result.error ?? "The answer failed." });
+        patchTarget({ status: "error", error: result.error ?? "The answer failed." });
         return;
       }
-      // Finished while we were away — pull the durable answer from the thread.
+      // Ordinary thread open: the seeded messages already include the answer, so there is nothing to
+      // reattach to. Checked against the RENDERED state rather than "was it streaming while I watched",
+      // because a run that settled in the gap before the first poll is precisely the case where the
+      // caller is missing the answer and must refetch.
+      let needsAnswer = false;
+      setExchanges((xs) => {
+        needsAnswer = targetIdx >= 0 && targetIdx < xs.length && !xs[targetIdx].answer;
+        return xs;
+      });
+      if (!needsAnswer || !result.hasAnswer) return;
+      // The answer landed (possibly while we were away) — pull the durable copy from the thread.
       try {
         const res = await fetch(
           `/api/dashboard/conversations/${convo}?team=${encodeURIComponent(teamSlug)}`,
@@ -219,6 +254,9 @@ export function QueryChat({
   async function ask(q: string) {
     const text = q.trim();
     if (!text || busy) return;
+    // A new turn supersedes any reattach poll for this thread.
+    reattachAbort.current?.abort();
+    reattachAbort.current = null;
     setQuestion("");
     setBusy(true);
 

@@ -9,6 +9,7 @@ import {
   failRun,
   latestRun,
   activeRun,
+  touchRun,
   RUN_STALE_AFTER_MS,
 } from "@/lib/query/turn-runs";
 
@@ -141,6 +142,61 @@ describe("chat turn runs (data-mechanics)", () => {
     expect(turns).toHaveLength(1);
     expect(turns[0].answer).toBe("first answer");
     expect(JSON.stringify(turns)).not.toContain("half an answer");
+  });
+
+  it("REATTACH IS READ-ONLY: polling writes no query_log / llm_usage row (criterion 7)", async () => {
+    const seed = await seedTeam();
+    const owner = { teamId: seed.teamId, memberId: seed.memberId };
+    const convo = await createConversation(db(), owner, "q");
+    await createRun(db(), owner, convo!.id, "q");
+
+    const count = async (table: string) => {
+      const { count: n } = await db().from(table).select("id", { count: "exact", head: true }).eq("team_id", seed.teamId);
+      return n ?? 0;
+    };
+    const before = { log: await count("query_log"), usage: await count("llm_usage") };
+
+    // Everything a reattaching client does, several times over.
+    for (let i = 0; i < 3; i++) {
+      await latestRun(db(), owner, convo!.id);
+      await activeRun(db(), owner);
+    }
+
+    expect({ log: await count("query_log"), usage: await count("llm_usage") }).toEqual(before);
+  });
+
+  it("clears the partial once the answer is durable (no duplicate copy of every answer)", async () => {
+    const seed = await seedTeam();
+    const owner = { teamId: seed.teamId, memberId: seed.memberId };
+    const convo = await createConversation(db(), owner, "q");
+    const run = await createRun(db(), owner, convo!.id, "q");
+    await flushPartial(db(), run!.id, "a partial answer");
+    const messageId = await appendMessage(db(), owner, convo!.id, "assistant", "the full answer");
+    await finishRun(db(), run!.id, messageId);
+
+    const read = await latestRun(db(), owner, convo!.id);
+    expect(read?.partial_text).toBe("");
+    expect(read?.final_message_id).toBe(messageId);
+  });
+
+  it("touchRun heartbeats liveness WITHOUT inventing answer text", async () => {
+    const seed = await seedTeam();
+    const owner = { teamId: seed.teamId, memberId: seed.memberId };
+    const convo = await createConversation(db(), owner, "q");
+    const run = await createRun(db(), owner, convo!.id, "q");
+    // Backdate it so a successful heartbeat is observable.
+    const old = new Date(Date.now() - 2 * 60_000).toISOString();
+    await db().from("chat_turn_runs").update({ updated_at: old }).eq("id", run!.id);
+
+    await touchRun(db(), run!.id);
+    const read = await latestRun(db(), owner, convo!.id);
+    expect(new Date(read!.updated_at).getTime()).toBeGreaterThan(new Date(old).getTime());
+    expect(read?.partial_text).toBe(""); // liveness only — it must not fabricate content
+    // …and it cannot revive a settled run.
+    await finishRun(db(), run!.id, null);
+    const settledAt = (await latestRun(db(), owner, convo!.id))!.updated_at;
+    await touchRun(db(), run!.id);
+    expect((await latestRun(db(), owner, convo!.id))!.updated_at).toBe(settledAt);
   });
 
   it("cascades with its conversation (no orphan runs)", async () => {

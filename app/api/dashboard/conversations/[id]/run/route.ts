@@ -21,10 +21,15 @@ export const runtime = "nodejs";
  * A run orphaned by a deploy is reported as `error` (not `streaming`) via `effectiveRunStatus`, so the
  * client renders a failure rather than polling a spinner forever.
  */
+/** Reject a non-uuid id before it reaches Postgres: the cast error would be swallowed to `null` by the
+ *  reader (which ignores `error`) and answer 200 while logging a `[pg]` error on every poll tick. */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 export async function GET(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
   const owner = await resolveChatOwner(req.nextUrl.searchParams.get("team") ?? "");
   if (!owner) return errorResponse("forbidden", "not a member of this team", 403);
+  if (!UUID_RE.test(id)) return errorResponse("invalid_payload", "conversation id must be a uuid", 422);
 
   const run = await latestRun(adminClient(), owner, id);
   if (!run) return NextResponse.json({ run: null });

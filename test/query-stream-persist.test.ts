@@ -37,13 +37,14 @@ const USAGE = {
 };
 
 /** Records every table insert so "exactly once" is checked against real call counts. */
-function fakeDb() {
+function fakeDb(opts: { failInsertOn?: string } = {}) {
   const inserts: { table: string; row: Record<string, unknown> }[] = [];
   return {
     inserts,
     from(table: string) {
       return {
         insert: async (row: Record<string, unknown>) => {
+          if (opts.failInsertOn === table) return { error: { message: `${table} write refused` } };
           inserts.push({ table, row });
           return { error: null };
         },
@@ -168,6 +169,41 @@ describe("runAnswerTurn — the turn outlives its client", () => {
     // The turn still completed and persisted despite the failing flush.
     expect(appendMessageMock).toHaveBeenCalledTimes(1);
     expect(finishRunMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("a SILENT query_log failure fails the turn instead of under-billing it", async () => {
+    // The db adapter resolves `{ error }` rather than throwing, so an unchecked insert would leave a
+    // persisted answer with no spend row — the very under-bill this slice closes.
+    streamAnswerMock.mockReturnValue(okStream());
+    const db = fakeDb({ failInsertOn: "query_log" });
+    await runAnswerTurn(baseArgs(db, () => {}));
+    expect(failRunMock).toHaveBeenCalledTimes(1);
+    expect(finishRunMock).not.toHaveBeenCalled();
+  });
+
+  it("does NOT announce `done` when persistence fails — the client is told the truth", async () => {
+    // `done` means "this turn is safely finished". Sending it before the writes let a DB failure
+    // produce done-then-error, a run marked failed though the model succeeded, and an unlogged spend.
+    streamAnswerMock.mockReturnValue(okStream());
+    appendMessageMock.mockRejectedValue(new Error("db blip on message insert"));
+    const sent: string[] = [];
+    await runAnswerTurn(baseArgs(fakeDb(), (e) => sent.push(e)));
+    expect(sent).toContain("error");
+    expect(sent).not.toContain("done");
+    expect(finishRunMock).not.toHaveBeenCalled();
+    expect(failRunMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("a failing TITLE generator cannot fail an already-persisted turn", async () => {
+    streamAnswerMock.mockReturnValue(okStream());
+    generateAndSetTitleMock.mockRejectedValue(new Error("title model down"));
+    const db = fakeDb();
+    const sent: string[] = [];
+    await runAnswerTurn({ ...baseArgs(db, (e) => sent.push(e)), createdNew: true });
+    expect(sent).toContain("done");
+    expect(finishRunMock).toHaveBeenCalledTimes(1);
+    expect(failRunMock).not.toHaveBeenCalled();
+    expect(db.inserts.filter((i) => i.table === "query_log")).toHaveLength(1);
   });
 
   it("does not touch run bookkeeping when there is no run row", async () => {

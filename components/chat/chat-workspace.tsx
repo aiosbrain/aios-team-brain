@@ -70,6 +70,11 @@ export function ChatWorkspace({ teamSlug, initialQuestion }: { teamSlug: string;
   // streaming, so the normal new-chat-on-open behaviour is unchanged; a deploy-orphaned run is
   // filtered out server-side by the staleness rule.
   useEffect(() => {
+    // A DEEP-LINKED question (/query?q=…, e.g. from the Home launcher) is an explicit instruction to
+    // start a NEW chat, and QueryChat auto-asks it on mount. Re-opening a background thread here would
+    // remount QueryChat onto that thread, stranding the deep-linked turn in a dead closure — its answer
+    // persisting into a conversation the user is never shown. The explicit ask wins.
+    if (initialQuestion) return;
     const ctl = new AbortController();
     (async () => {
       try {
@@ -95,7 +100,7 @@ export function ChatWorkspace({ teamSlug, initialQuestion }: { teamSlug: string;
       }
     })();
     return () => ctl.abort();
-  }, [teamSlug]);
+  }, [teamSlug, initialQuestion]);
 
   // Debounced server search (title OR message content, owner-scoped FTS). Empty query → clear so the
   // full list shows. All setState happens inside the async timeout callback (never synchronously).

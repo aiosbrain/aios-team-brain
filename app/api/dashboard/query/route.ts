@@ -213,6 +213,16 @@ export async function POST(req: NextRequest) {
   // fallback in streamAnswer; `activeProvider` forces a backend, else selectLlmBackend precedence).
   const keys = await resolveAnsweringKeys(db, team.id);
 
+  // DEFERRED, deliberately (review: "no idempotency or active-run guard"). Two tabs — or a client that
+  // re-POSTs after losing the SSE — start two turns in one conversation: two answers, two spend rows,
+  // and interleaved messages that can mispair `recentTurns`. That is TRUE TODAY on `main` and is not
+  // introduced here; this slice widens it only slightly, by auto-reopening the same thread in a second
+  // tab. It is NOT fixed here because the obvious guard is worse than the bug: rejecting a POST while a
+  // `streaming` run exists blocks the user for up to the staleness window (3 min) whenever a run is
+  // orphaned but not yet aged out — turning a rare duplicate into a routine lockout. Doing it properly
+  // means a client-supplied idempotency key + a unique constraint, which is its own slice with its own
+  // wire-format change. Tracked; see docs/design/query-background-stream.md "Scope".
+  //
   // The in-flight run row: what makes this turn survive its client and be re-attachable on return
   // (QBGSTREAM-1). Best-effort — a run-table failure must not stop the user getting an answer.
   let runId: string | null = null;
@@ -242,9 +252,11 @@ export async function POST(req: NextRequest) {
         }
       };
 
-      // Tell the client which thread this turn belongs to (a new conversation returns its fresh id)
-      // and which run to re-attach to if it navigates away mid-answer.
-      if (conversationId) send("conversation", { id: conversationId, run_id: runId });
+      // Tell the client which thread this turn belongs to (a new conversation returns its fresh id).
+      // The payload stays EXACTLY `{ id }`: the foreground SSE contract is byte-identical to before
+      // this slice (spec acceptance criterion 8), and reattach keys off the conversation id anyway —
+      // a `run_id` here would have changed a shipped wire format for a field nothing reads.
+      if (conversationId) send("conversation", { id: conversationId });
 
       // Stream + persist. Everything durable happens inside, decoupled from `send`, so a client that
       // disappears mid-answer still gets its message, query_log row and cost metered (and its run row

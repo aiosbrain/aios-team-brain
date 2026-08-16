@@ -97,6 +97,24 @@ export async function createRun(
 }
 
 /**
+ * Bump ONLY the heartbeat, with no answer text.
+ *
+ * Liveness must not depend on the model producing output: a turn that spends 3 minutes thinking before
+ * its first token emits no deltas, so a delta-driven heartbeat would let `isRunStale` declare a
+ * perfectly healthy run dead — and it would then CONTRADICT itself by completing moments later, after a
+ * reader had already been told it was interrupted. This is the "is the process still alive" signal;
+ * `flushPartial` is the "here is the text so far" one.
+ */
+export async function touchRun(db: DbClient, runId: string): Promise<void> {
+  const { error } = await db
+    .from("chat_turn_runs")
+    .update({ updated_at: new Date().toISOString() })
+    .eq("id", runId)
+    .eq("status", "streaming");
+  if (error) throw new Error(`touchRun: ${error.message}`);
+}
+
+/**
  * Heartbeat the run with the answer so far. Also the liveness signal `isRunStale` reads, so this must
  * be called periodically even when the text hasn't grown much — silence is what marks a run dead.
  */
@@ -117,7 +135,15 @@ export async function flushPartial(db: DbClient, runId: string, partial: string)
 export async function finishRun(db: DbClient, runId: string, finalMessageId: string | null): Promise<void> {
   const { error } = await db
     .from("chat_turn_runs")
-    .update({ status: "done", final_message_id: finalMessageId, updated_at: new Date().toISOString() })
+    .update({
+      status: "done",
+      final_message_id: finalMessageId,
+      // Drop the partial: the durable answer is the chat_messages row this now points at, and keeping
+      // a second copy of every answer here forever is pure duplication (readers already prefer the
+      // final message). Cleared only when we actually have that message to point at.
+      ...(finalMessageId ? { partial_text: "" } : {}),
+      updated_at: new Date().toISOString(),
+    })
     .eq("id", runId);
   if (error) throw new Error(`finishRun: ${error.message}`);
 }

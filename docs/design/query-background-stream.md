@@ -130,6 +130,15 @@ id ever reached client state).
 - **Out (stated, per plan review MEDIUM-8):** `app/api/v1/query` (machine callers hold their own
   connection; delegated agent turns are stateless by design) and the `/sync` command
   (`syncResponse`) — both use the same channel but are not this feature.
+- **Out — concurrent-POST idempotency (deferred with reason).** Two tabs, or a client re-POSTing after
+  losing the SSE, start two turns in one conversation (two answers, two spend rows, interleaved
+  messages that can mispair `recentTurns`). This is true on `main` today and is not introduced by A′,
+  which widens it only slightly by auto-reopening the same thread in a second tab. The obvious guard —
+  409 while a `streaming` run exists — is worse than the bug: it locks the user out of their own thread
+  for up to the 3-minute staleness window whenever a run is orphaned but not yet aged out. The correct
+  fix is a client idempotency key + a unique constraint, i.e. its own slice with its own wire change.
+- **Out — Option B** (live token reattach via an in-memory broker + a second SSE endpoint), per the
+  increment statement at the top.
 
 ## Schema mechanics
 
@@ -169,8 +178,12 @@ these without reading the prose above.
    memory window.
 5. **unit** — the persisted run error text equals `clientErrorMessage(err)` and contains neither the
    model name nor the base URL (the QSTREAMRETRY-1 sanitization must not be undone via the replay path).
-6. **integration** — `GET /api/dashboard/conversations/:id/run` returns the active run (status, partial,
-   updated_at) for its owner and 403/404 for a non-owner, and never returns another member's run.
+6. **unit + data-mechanics** — `GET /api/dashboard/conversations/:id/run` returns the run for its owner;
+   a non-member gets 403, a malformed id gets 422, and a same-team NON-owner gets `200 {run: null}` —
+   deliberately indistinguishable from "no run". (Amended after review: the first draft said 403/404 for
+   a non-owner, but a 404-vs-200 split is an existence oracle — it tells a stranger whether a
+   conversation id is real. Returning the same shape for "not yours" and "nothing there" leaks less; the
+   owner filter itself is proven non-vacuously in the dm tier.)
 7. **data-mechanics** — a reattach read performs NO model call and writes NO second `query_log` /
    `llm_usage` row (R3: reconnect is strictly read-only).
 8. **integration** — with `chat_turn_runs` present, the existing `/api/dashboard/query` SSE contract is
