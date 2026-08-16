@@ -147,12 +147,23 @@ class Graphiti:
 
 /** The combined extractor the patch imports. Injected as a real module so the import resolves. */
 const COMBINED_MODULE = `PREV_SEEN = []
+ARGS_SEEN = []
 
 
 async def extract_nodes_and_edges(clients, episode, previous_episodes, entity_types=None, excluded_entity_types=None, edge_type_map=None, edge_types=None, custom_extraction_instructions=None):
     import graphiti
     graphiti.CALLS.append("extract_nodes_and_edges")
     PREV_SEEN.append(list(previous_episodes))
+    # Echo EVERY positional back, so a swapped pair is visible rather than silently accepted.
+    ARGS_SEEN.append({
+        "episode": episode,
+        "previous_episodes": list(previous_episodes),
+        "entity_types": entity_types,
+        "excluded_entity_types": excluded_entity_types,
+        "edge_type_map": edge_type_map,
+        "edge_types": edge_types,
+        "custom_extraction_instructions": custom_extraction_instructions,
+    })
     return (["node_from_combined"], ["edge_from_combined"], {"m": [0]})
 `;
 
@@ -261,6 +272,50 @@ asyncio.run(main())
       // and the combined call's OUTPUT is what flows downstream, not a stale separate-call value
       expect(out.nodes).toEqual(["node_from_combined"]);
       expect(out.edges).toEqual(["edge_from_combined"]);
+    } finally {
+      rmSync(a.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("AC5: every positional lands on the parameter it is meant for — a swap must not pass", () => {
+    // The gap the SECOND (cold) review found: the stub recorded only `previous_episodes`, so a
+    // revision swapping entity_types/excluded_entity_types, or passing edge_types where
+    // edge_type_map belongs, would pass all seven guard tests, `ast.parse` and every Dockerfile
+    // gate — and in prod silently mis-key entity classification and exclusion. Distinct sentinels
+    // per position are what make that visible.
+    const a = applyPatch();
+    try {
+      const driver = `import asyncio, json, sys
+sys.path.insert(0, ".")
+import graphiti as g
+
+async def main():
+    inst = g.Graphiti()
+    g.CALLS.clear()
+    await inst.add_episode(
+        "EP", ["PREV"],
+        entity_types="ENTITY_TYPES",
+        excluded_entity_types="EXCLUDED",
+        edge_type_map="EDGE_TYPE_MAP",
+        edge_types={"EDGE_TYPES": 1},
+        custom_extraction_instructions="CUSTOM",
+    )
+    from graphiti_core.utils.maintenance import combined_extraction as ce
+    print(json.dumps(ce.ARGS_SEEN))
+
+asyncio.run(main())
+`;
+      const seen = runPatched(a, driver) as unknown as Array<Record<string, unknown>>;
+      expect(seen).toHaveLength(1);
+      expect(seen[0]).toEqual({
+        episode: "EP",
+        previous_episodes: ["PREV"],
+        entity_types: "ENTITY_TYPES",
+        excluded_entity_types: "EXCLUDED",
+        edge_type_map: "EDGE_TYPE_MAP",
+        edge_types: { EDGE_TYPES: 1 },
+        custom_extraction_instructions: "CUSTOM",
+      });
     } finally {
       rmSync(a.dir, { recursive: true, force: true });
     }

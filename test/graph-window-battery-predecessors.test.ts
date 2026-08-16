@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { splitPrompt, PREV_TAGS } from "../scripts/graph-window-battery/phase-a-predecessors";
+import { splitPrompt, PREV_TAGS, pickRequests } from "../scripts/graph-window-battery/phase-a-predecessors";
 
 /**
  * The predecessor-block parser for Phase A (PIPEFF-2 / AIO-821).
@@ -85,5 +85,43 @@ describe("the split is exhaustive — episode plus predecessors accounts for the
   it("reports the whole prompt as episode when there is no predecessor block", () => {
     const got = splitPrompt("just the episode, nothing else");
     expect(got.episode).toBe(got.total);
+  });
+});
+
+/**
+ * PIPEFF-5 (found by the second, cold review — the first pass missed it): the capture tap now writes
+ * RESPONSE records alongside requests, and this reader was not updated. Every response line was
+ * being priced as a call with no `messages`, landing under `unknown` with zero tokens and roughly
+ * DOUBLING "captured calls" — which reads as classifier drift and sends the next person to fix the
+ * wrong thing, on a paid run.
+ */
+describe("pickRequests — the reader prices requests only, and refuses what it does not know", () => {
+  const req = (id: string) => ({ arm: "W10", at: "t", id, kind: "request", path: "/v1/chat/completions", body: { messages: [] } });
+  const res = (id: string) => ({ arm: "W10", at: "t", id, kind: "response", status: 200, body: { choices: [] } });
+
+  it("keeps requests and drops responses — the count is calls, not records", () => {
+    const out = pickRequests([req("a"), res("a"), req("b"), res("b")] as never);
+    expect(out.ok).toBe(true);
+    if (!out.ok) return;
+    expect(out.rows).toHaveLength(2);
+    expect(out.rows.every((r) => (r as { kind?: string }).kind === "request")).toBe(true);
+  });
+
+  it("treats a pre-PIPEFF-5 capture file (no `kind`) as all requests — old files still read", () => {
+    const legacy = [{ arm: "W10", at: "t", path: "/v1/chat/completions", body: { messages: [] } }];
+    const out = pickRequests(legacy as never);
+    expect(out.ok).toBe(true);
+    if (!out.ok) return;
+    expect(out.rows).toHaveLength(1);
+  });
+
+  it("REFUSES an unrecognised kind rather than silently filtering it out", () => {
+    // A future record type quietly dropped is how an instrument measures a subset and reports a
+    // total. The refusal must name the kind so the failure is actionable.
+    const out = pickRequests([req("a"), { arm: "W10", at: "t", id: "z", kind: "trace", body: {} }] as never);
+    expect(out.ok).toBe(false);
+    if (out.ok) return;
+    expect(out.error).toMatch(/trace/);
+    expect(out.error).toMatch(/refusing/);
   });
 });
