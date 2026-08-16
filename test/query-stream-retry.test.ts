@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import {
   StreamHttpError,
   isRetryableStreamError,
@@ -7,6 +7,9 @@ import {
   withStreamRetry,
   RETRYABLE_STATUS,
 } from "@/lib/query/stream-retry";
+import { streamAnswer, streamOpenAICompatible, type StreamAnswerEvent } from "@/lib/query/claude";
+import type { LlmBackend } from "@/lib/query/llm-backend";
+import type { RetrievedContext } from "@/lib/query/retrieve";
 
 type Ev = { type: "delta"; text: string } | { type: "done" };
 const isCommitted = (e: Ev): boolean => e.type === "delta";
@@ -37,13 +40,27 @@ describe("isRetryableStreamError", () => {
     expect(isRetryableStreamError({ status: 401 })).toBe(false);
   });
 
-  it("retries connection/overloaded-shaped errors that carry no status", () => {
+  it("retries statusless connection/timeout/overloaded errors — using the SHAPES the Anthropic SDK really throws", () => {
+    // Real SDK shapes: APIConnectionError → message "Connection error.", name "Error", status undefined;
+    // APIConnectionTimeoutError → message "Request timed out.". (Not a hand-set .name.)
+    expect(isRetryableStreamError(new Error("Connection error."))).toBe(true);
+    expect(isRetryableStreamError(new Error("Request timed out."))).toBe(true);
+    expect(isRetryableStreamError(new Error("fetch failed"))).toBe(true);
+    expect(isRetryableStreamError(new Error("read ECONNRESET"))).toBe(true);
+    // A statusless body carrying Anthropic's canonical overloaded shape.
+    expect(isRetryableStreamError(new Error('{"type":"overloaded_error"}'))).toBe(true);
+    // A hand-tagged APIConnectionError (some SDK versions) still classifies by name.
     const conn = new Error("socket hang up");
     conn.name = "APIConnectionError";
     expect(isRetryableStreamError(conn)).toBe(true);
-    expect(isRetryableStreamError(new Error("fetch failed"))).toBe(true);
-    expect(isRetryableStreamError(new Error("read ECONNRESET"))).toBe(true);
-    expect(isRetryableStreamError(new Error("the model is overloaded"))).toBe(true);
+  });
+
+  it("does NOT let a connection-shaped BODY rescue a permanent status (status-first short-circuit)", () => {
+    // StreamHttpError embeds the provider body; a permanent 403 whose body says "connection closed"
+    // must stay non-retryable — the status decides, the message is never consulted when a status exists.
+    expect(isRetryableStreamError(new StreamHttpError(403, "403 error 1020 connection closed by policy"))).toBe(false);
+    expect(isRetryableStreamError(new StreamHttpError(401, "401 request timed out per the proxy"))).toBe(false);
+    expect(isRetryableStreamError(new StreamHttpError(422, "422 network error in the payload text"))).toBe(false);
   });
 
   it("does NOT retry a plain non-transient error or a non-object", () => {
@@ -159,5 +176,85 @@ describe("withStreamRetry — retry only before the first delta", () => {
     ).rejects.toThrow(/503/);
     expect(calls()).toBe(2);
     expect(sleep).toHaveBeenCalledTimes(1); // one retry between the two attempts
+  });
+});
+
+// --- Integration over the real claude.ts stream (fetch-mocked) -----------------------------------
+
+const OPENAI_BACKEND = {
+  kind: "openai-compatible",
+  provider: "openai",
+  baseUrl: "https://api.example.com/v1",
+  model: "test-model",
+  apiKey: "test-key",
+  headers: {},
+} as unknown as Extract<LlmBackend, { kind: "openrouter" | "openai-compatible" }>;
+
+/** A mock streamed SSE Response from pre-formatted `data: …\n\n` frames. */
+function streamResponse(frames: string[]): Response {
+  const body = new ReadableStream<Uint8Array>({
+    start(c) {
+      const enc = new TextEncoder();
+      for (const f of frames) c.enqueue(enc.encode(f));
+      c.close();
+    },
+  });
+  return { ok: true, status: 200, body, text: async () => "" } as unknown as Response;
+}
+const deltaFrame = (s: string) => `data: ${JSON.stringify({ choices: [{ delta: { content: s } }] })}\n\n`;
+
+async function drainDeltas(gen: AsyncGenerator<StreamAnswerEvent>): Promise<string> {
+  let out = "";
+  for await (const ev of gen) if (ev.type === "delta") out += ev.text;
+  return out;
+}
+
+describe("streamOpenAICompatible — a 200 stream carrying only an error frame (the HIGH)", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("throws a classified error (not a silent empty answer) so the retry can fire", async () => {
+    const errFrame = `data: ${JSON.stringify({ error: { code: 429, message: "provider overloaded" } })}\n\n`;
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(streamResponse([errFrame, "data: [DONE]\n\n"])));
+    let caught: unknown;
+    try {
+      await drainDeltas(streamOpenAICompatible(OPENAI_BACKEND, "", "", "", "", "", "q", "UTC"));
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(StreamHttpError);
+    expect((caught as StreamHttpError).status).toBe(429);
+    expect(isRetryableStreamError(caught)).toBe(true); // → withStreamRetry will retry it
+  });
+
+  it("still yields a clean empty done (no throw) when the blank has NO error frame (reasoning starvation)", async () => {
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    const usageOnly = `data: ${JSON.stringify({ usage: { completion_tokens: 4096 } })}\n\n`;
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(streamResponse([usageOnly, "data: [DONE]\n\n"])));
+    const text = await drainDeltas(streamOpenAICompatible(OPENAI_BACKEND, "", "", "", "", "", "q", "UTC"));
+    expect(text).toBe(""); // an empty answer, but NOT thrown — retrying wouldn't help a starved model
+    err.mockRestore();
+  });
+});
+
+describe("streamAnswer — the retry wiring is actually connected (call-site pin)", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("retries a transient pre-delta failure end-to-end and streams the answer once", async () => {
+    const fetchMock = vi
+      .fn()
+      // First attempt: a retryable 503 (non-token-limit) → StreamHttpError → wrapper retries.
+      .mockResolvedValueOnce({ ok: false, status: 503, text: async () => "service unavailable", body: null })
+      // Retry: a clean stream.
+      .mockResolvedValueOnce(streamResponse([deltaFrame("hello"), "data: [DONE]\n\n"]));
+    vi.stubGlobal("fetch", fetchMock);
+    const sleep = vi.fn(async () => {});
+    const ctx = { sources: [], structured: "", grounded: true } as unknown as RetrievedContext;
+    const keys = { openrouterKey: "k", openrouterModel: "test-model" };
+    const out = await drainDeltas(
+      streamAnswer(ctx, "q", keys, [], undefined, "UTC", { sleep, delayMs: () => 1 })
+    );
+    expect(out).toBe("hello");
+    expect(fetchMock).toHaveBeenCalledTimes(2); // failed once, retried once
+    expect(sleep).toHaveBeenCalledTimes(1); // deleting withStreamRetry from streamAnswer reddens this
   });
 });

@@ -239,7 +239,10 @@ export async function* streamAnswer(
 ): AsyncGenerator<StreamAnswerEvent> {
   yield* withStreamRetry(
     () => streamAnswerOnce(ctx, question, keys, history, caller, timeZone),
-    (event) => event.type === "delta",
+    // ANY yielded event commits the stream: once the client has received anything — a delta OR the
+    // terminal `done` — a restart would corrupt the visible answer. Retry only when the attempt threw
+    // before yielding a single event. (Today `done` is always last, but this stays correct if it isn't.)
+    () => true,
     retryOpts
   );
 }
@@ -420,6 +423,10 @@ export async function* streamOpenAICompatible(
   let completion = 0;
   let cost = 0;
   let emittedChars = 0;
+  // OpenRouter (and OpenAI-compatible gateways) can answer an upstream failure with HTTP 200 and a
+  // `data: {"error": {...}}` SSE frame instead of a non-2xx — so the failure never reached the
+  // `!res.ok` check above. Capture it here and convert it to a classified throw after the loop.
+  let errorFrame: { code?: number | string; message?: string; type?: string } | null = null;
 
   while (true) {
     const { done, value } = await reader.read();
@@ -435,10 +442,17 @@ export async function* streamOpenAICompatible(
       let j: {
         choices?: { delta?: { content?: string } }[];
         usage?: { prompt_tokens?: number; completion_tokens?: number; cost?: number };
+        error?: { code?: number | string; message?: string; type?: string };
       };
       try {
         j = JSON.parse(data);
       } catch {
+        continue;
+      }
+      // A provider error delivered mid-stream on a 200 (no `choices`/`content`). Remember it; it
+      // becomes a classified throw after the loop when nothing was emitted (see below).
+      if (j.error) {
+        errorFrame = j.error;
         continue;
       }
       if (j.usage) {
@@ -475,9 +489,20 @@ export async function* streamOpenAICompatible(
     }
   }
 
+  // A 200 stream that carried a provider error frame and streamed NO answer is a transient failure
+  // wearing a success costume. Convert it to a classified throw so streamAnswer's retry can act on it
+  // (a bare "overloaded" frame is exactly the blip this ticket exists to absorb). Only when nothing was
+  // emitted — once deltas reached the client, a restart would corrupt the visible answer, so a
+  // mid-stream error after partial output falls through to the empty/partial handling below. A
+  // NON-retryable code (e.g. an auth error frame) is thrown with its own status so it surfaces at once.
+  if (errorFrame && emittedChars === 0) {
+    const code = typeof errorFrame.code === "number" ? errorFrame.code : 502;
+    const detail = errorFrame.message ?? errorFrame.type ?? "provider error";
+    throw new StreamHttpError(code, `LLM ${backend.model} @ ${backend.baseUrl}: stream error ${code} ${detail}`);
+  }
+
   // Zero visible answer text is a silent blank answer — make it diagnosable. Usual cause: a reasoning
-  // model spent the whole budget on hidden reasoning (raise LLM_REASONING_HEADROOM_TOKENS); a mid-stream
-  // provider error frame also lands here.
+  // model spent the whole budget on hidden reasoning (raise LLM_REASONING_HEADROOM_TOKENS).
   if (emittedChars === 0) {
     console.error(
       `[query] streamed answer was EMPTY (model=${backend.model}, completion_tokens=${completion}) — ` +

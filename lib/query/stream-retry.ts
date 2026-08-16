@@ -35,22 +35,33 @@ export class StreamHttpError extends Error {
  */
 export const RETRYABLE_STATUS: ReadonlySet<number> = new Set([408, 409, 429, 500, 502, 503, 504, 529]);
 
-/** Connection/transport failures that carry no HTTP status but are still worth one more try. */
+/**
+ * Connection/transport failures that carry no HTTP status but are still worth one more try:
+ * the Anthropic SDK's `APIConnectionError` ("Connection error.") and `APIConnectionTimeoutError`
+ * ("Request timed out.", both `status: undefined`), bare fetch/socket failures, and an
+ * `overloaded`/`overloaded_error` body on a statusless error. Reached ONLY for statusless errors
+ * (see the status-first short-circuit below), so it can't rescue a permanent 4xx whose body text
+ * happens to contain one of these words.
+ */
 const RETRYABLE_MESSAGE =
-  /APIConnection|ECONNRESET|ETIMEDOUT|EPIPE|ENOTFOUND|EAI_AGAIN|socket hang ?up|fetch failed|network error|connection (?:error|reset|closed)|\boverloaded\b/i;
+  /APIConnection|ECONNRESET|ETIMEDOUT|EPIPE|ENOTFOUND|EAI_AGAIN|socket hang ?up|fetch failed|network error|connection (?:error|reset|closed)|timed ?out|overloaded(?:_error)?/i;
 
 /**
  * True iff `err` is a transient failure worth retrying (before any delta has been emitted).
- * Status-first (StreamHttpError / SDK APIError both expose `.status`), then a narrow
- * connection/overloaded message fallback. False for anything else — a non-retryable error
- * must surface immediately, not after N wasted attempts.
+ *
+ * STATUS-FIRST: when the error carries a numeric HTTP status (StreamHttpError and the Anthropic
+ * SDK's APIError both expose `.status`), that status decides ALONE — we return whether it's in
+ * RETRYABLE_STATUS and never consult the message. This is load-bearing: StreamHttpError embeds the
+ * provider response BODY in its message, so a permanent 403/401/404 whose body says "connection
+ * closed" or "network error" must not be rescued into a retry by the message regex. Only a
+ * statusless error (a connection/timeout throw) falls through to the message classifier.
  */
 export function isRetryableStreamError(err: unknown): boolean {
   if (!err || typeof err !== "object") return false;
   const status = (err as { status?: unknown }).status;
-  if (typeof status === "number" && RETRYABLE_STATUS.has(status)) return true;
   const statusCode = (err as { statusCode?: unknown }).statusCode;
-  if (typeof statusCode === "number" && RETRYABLE_STATUS.has(statusCode)) return true;
+  const code = typeof status === "number" ? status : typeof statusCode === "number" ? statusCode : null;
+  if (code !== null) return RETRYABLE_STATUS.has(code); // a known status is decisive — do not fall through
   const name = typeof (err as { name?: unknown }).name === "string" ? (err as { name: string }).name : "";
   const message = typeof (err as { message?: unknown }).message === "string" ? (err as { message: string }).message : "";
   return RETRYABLE_MESSAGE.test(`${name} ${message}`);
