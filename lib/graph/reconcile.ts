@@ -385,8 +385,8 @@ export async function reconcileProjectedEpisodes(
     partitionPurgeState.set(groupId, ok);
     return ok;
   };
-  // PCCC-7 orphan sweep: oracle churn strands `p:` rows forever (every scope change mints a new
-  // key); collect the ones no reader can resolve to anymore. Age-gated well past the TTL (7d).
+  // Straggler sweep: nothing mints `p:` keys anymore (PPARC-4) — this collects PRE-CUTOVER residue
+  // only, age-gated well past the TTL (7d). Retire it once self-hosts are past the cutover era.
   await sweepStaleScopedArcCache(db, teamId);
   // PPARC-4 orphan sweep: a DELETED initiative's g: row is unreachable post-cutover (reads are
   // pointer-resolved) but nothing else ever removes it — bounded by partition count.

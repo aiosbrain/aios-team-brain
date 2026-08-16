@@ -146,20 +146,23 @@ describe("PCCC-7 — the slug→teamId re-key migration (Codex High 1)", () => {
 });
 
 describe("PCCC-7 — the orphaned-scope-key sweep", () => {
-  it("sweeps p: rows past the age floor; fresh p: rows, tier rows, OTHER TEAMS' rows, and CORRECTIONS are never touched", async () => {
+  it("sweeps p: rows past the age floor; fresh p: rows, tier rows, g: rows, OTHER TEAMS' rows, and CORRECTIONS are never touched", async () => {
     const seed = await seedTeam();
     const other = await seedTeam();
     await writeArcCache(db(), seed.teamId, `p:${seed.teamId}:old`, ARC as never, "h");
     await writeArcCache(db(), seed.teamId, `p:${seed.teamId}:fresh`, ARC as never, "h");
     await writeArcCache(db(), seed.teamId, "acme_team", ARC as never, "h");
+    // An equally-aged LIVE partition row (review Low 2): the sweep is p:-namespace-only by design —
+    // a future widening of its LIKE to reach g: rows by age would delete live partition rows.
+    await writeArcCache(db(), seed.teamId, "g:acme_team", ARC as never, "h");
     // Another team's equally-aged straggler — team A's sweep has no business with it. Re-homed
     // from the retired purgeScopedArcCache test (PPARC-4): the team-scoping property outlives
     // the function that first carried it; the sweep is now the only p: deleter.
     await writeArcCache(db(), other.teamId, `p:${other.teamId}:old`, ARC as never, "h");
-    // Age the old scoped rows (both teams') and the tier row past the floor.
+    // Age the old scoped rows (both teams'), the tier row, and the g: row past the floor.
     await runSql("update arc_cache set computed_at = now() - interval '8 days' where team_id = $1 and group_key = any($2)", [
       seed.teamId,
-      [`p:${seed.teamId}:old`, "acme_team"],
+      [`p:${seed.teamId}:old`, "acme_team", "g:acme_team"],
     ]);
     await runSql("update arc_cache set computed_at = now() - interval '8 days' where team_id = $1", [other.teamId]);
     // A correction is HUMAN data — the sweep must never touch the corrections store (ruled in the
@@ -174,6 +177,7 @@ describe("PCCC-7 — the orphaned-scope-key sweep", () => {
     expect(await readArcCache(db(), seed.teamId, `p:${seed.teamId}:old`)).toBeNull(); // swept
     expect(await readArcCache(db(), seed.teamId, `p:${seed.teamId}:fresh`)).not.toBeNull();
     expect(await readArcCache(db(), seed.teamId, "acme_team")).not.toBeNull(); // tier rows are not the sweep's business
+    expect(await readArcCache(db(), seed.teamId, "g:acme_team")).not.toBeNull(); // live partition rows are not either — age alone never qualifies a g: row
     expect(await readArcCache(db(), other.teamId, `p:${other.teamId}:old`)).not.toBeNull(); // another team's straggler survives
     const kept = await runSql<{ n: number }>("select count(*)::int as n from arc_corrections where team_id = $1", [seed.teamId]);
     expect(kept.rows[0].n).toBe(1);

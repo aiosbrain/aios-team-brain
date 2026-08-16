@@ -12,7 +12,10 @@ import { join } from "node:path";
  */
 const ROOT = join(import.meta.dirname, "..", "..");
 const SCAN = ["lib", "app", "components", "scripts"];
-const MINTS = ["`p:${", '"p:" +', "'p:' +"];
+// Spaced AND unspaced concat shapes (review Low 1: prettier normalizes to the spaced form, but the
+// guard must not be one formatter exception away from blind). `.concat()`/`join(":")`/variable-held
+// prefixes stay unmatched — the threat model is ACCIDENTAL reintroduction, not adversarial evasion.
+const MINTS = ["`p:${", '"p:" +', "'p:' +", '"p:"+', "'p:'+"];
 
 function files(dir: string, out: string[] = []): string[] {
   for (const name of readdirSync(dir)) {
