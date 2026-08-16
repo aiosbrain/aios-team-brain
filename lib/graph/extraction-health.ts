@@ -782,6 +782,33 @@ export interface ExtractionReading {
  * the ledger says which groups this team pushed into, and an empty/unreadable ledger must produce
  * "unreadable" graph legs rather than an `IN []` zero that reads as a proven-empty graph.
  */
+/**
+ * Per-group latest REAL push (max projected_at over sha<>'' rows) — the K-cap's recency prior
+ * (PCCC-6, lib/graph/partition-read). Lives HERE because it is a push-clock read over the ledger,
+ * and the stall guard (extraction-stall-callsites) rightly demands every signal-bearing
+ * graph_episodes aggregate keep this one home — two assemblers is how one surface keeps a bug the
+ * other fixed. Best-effort: on error the caller ranks the groups as recency-0 (unranked), which
+ * degrades ordering, never correctness (the router's correctness never matters by design).
+ */
+export async function latestPushByGroup(
+  teamId: string,
+  groupIds: readonly string[]
+): Promise<Map<string, number>> {
+  const out = new Map<string, number>();
+  if (groupIds.length === 0) return out;
+  try {
+    const res = await runSql<{ group_id: string; mx: string | null }>(
+      `select group_id, max(projected_at) filter (where content_sha256 <> '') as mx
+         from graph_episodes where team_id = $1 and group_id = any($2) group by group_id`,
+      [teamId, [...groupIds]]
+    );
+    for (const r of res.rows) out.set(r.group_id, r.mx ? new Date(r.mx).getTime() : 0);
+  } catch {
+    // fall through — unranked
+  }
+  return out;
+}
+
 export async function readExtractionSignals(
   teamId: string,
   nowMs: number = Date.now()

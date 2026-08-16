@@ -2415,6 +2415,23 @@ create unique index if not exists graph_episodes_item_group_key
 -- first. A bare partial-index statement here would fail on an existing DB, where the table already
 -- exists (so its declaration above is a no-op) and the column isn't present until the migration runs.
 
+-- Per-project graph ARMING state (PCCC-6, design §2.2/§2.3). A row exists once a team-tier
+-- enforcing principal's read has ARMED the project (its deferred fan-out rows flipped to
+-- pushable); `ready_at` is the MONOTONE read-ready latch — set once every row armed at that time
+-- has reconcile-confirmed landed, never cleared (items tagged later lag like today's tier graph;
+-- a live "all currently landed" predicate would starve busy initiatives and flap the leg — the
+-- design's round-2 High 4 / Codex Blocker 2 history). The obligation snapshot IS the set of
+-- armed (deferred=false) ledger rows at arm time — no id array to maintain. Sole writer:
+-- lib/graph/arming.
+create table if not exists graph_project_arming (
+  team_id uuid not null references teams(id) on delete cascade,
+  project_id uuid not null,
+  armed_at timestamptz not null default now(),
+  ready_at timestamptz,
+  primary key (team_id, project_id),
+  foreign key (team_id, project_id) references projects (team_id, id) on delete cascade
+);
+
 -- Narrative-arc synthesis cache (Layer 3, lib/graph/arcs). Arcs are an LLM synthesis over the last
 -- 7d of the graph — expensive to compute and identical for everyone sharing a tier-visible group set.
 -- This persists the result across restarts/deploys and shares it across instances (the in-memory

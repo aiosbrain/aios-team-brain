@@ -5,7 +5,8 @@ import { reconcileProjectedEpisodes } from "@/lib/graph/reconcile";
 import { episodeGroupId, projectGroupId } from "@/lib/graph/group";
 import { ensureAccessBootstrap } from "@/lib/access/bootstrap";
 import { runSql } from "@/lib/db/pg/pool";
-import { db, ingest, seedTeam, sha, type Seed } from "./helpers";
+import { db, ingest, seedTeam, sha } from "./helpers";
+import { mkInitiative, tagItem } from "./graph-helpers";
 import { FakeGraphiti, client } from "./fake-graphiti";
 
 /**
@@ -19,44 +20,6 @@ import { FakeGraphiti, client } from "./fake-graphiti";
  * Why this tier: deferral, arming, and the budget are ledger states in a REAL Postgres that
  * reconcile must respect; a stubbed store proves none of it.
  */
-
-async function mkInitiative(seed: Seed, slug: string): Promise<{ projectId: string; group: string }> {
-  const { data, error } = await db()
-    .from("projects")
-    .insert({ team_id: seed.teamId, slug, name: slug, kind: "initiative" })
-    .select("id")
-    .single();
-  expect(error).toBeNull();
-  const projectId = (data as { id: string }).id;
-  const group = projectGroupId(seed.teamId, projectId);
-  await runSql("update projects set graph_group_id = $1 where id = $2", [group, projectId]);
-  return { projectId, group };
-}
-
-async function tagItem(seed: Seed, itemId: string, projectId: string): Promise<void> {
-  const { data: unit, error: uErr } = await db()
-    .from("project_context_units")
-    .insert({
-      team_id: seed.teamId,
-      unit_kind: "item",
-      source_item_id: itemId,
-      unit_key: `item:${itemId}`,
-      audience: "team",
-      content_sha256: sha(itemId),
-    })
-    .select("id")
-    .single();
-  expect(uErr).toBeNull();
-  const { error: mErr } = await db().from("project_context_memberships").insert({
-    team_id: seed.teamId,
-    project_id: projectId,
-    context_unit_id: (unit as { id: string }).id,
-    decision: "include",
-    mode: "auto",
-    method: "manual",
-  });
-  expect(mErr).toBeNull();
-}
 
 describe("PCCC-5 — the projector resolves the HOME group from the stored pointer", () => {
   it("a repointed General moves where team-tier items land (the pointer is the write authority)", async () => {
@@ -392,6 +355,10 @@ describe("PCCC-5 — fan-out is DEFERRED until armed; ADD-only", () => {
     expect((await ensureAccessBootstrap(db(), seed.teamId)).ok).toBe(true);
     const init = await mkInitiative(seed, "purge-deferred");
     const r = await ingest(seed, { body: "tagged then purged", path: "tp.md", access: "team" });
+    // General membership too — mirroring the substrate hook; without it the item reads as
+    // restricted-from-birth (PCCC-6) and no home row exists to co-count in `retired`.
+    const { data: gp } = await db().from("projects").select("id").eq("team_id", seed.teamId).eq("slug", "general").single();
+    await tagItem(seed, r.id, (gp as { id: string }).id);
     await tagItem(seed, r.id, init.projectId);
     const fake = new FakeGraphiti();
     await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: seed.teamSlug, client: client(fake) });
@@ -465,15 +432,19 @@ describe("PCCC-5 — fan-out is DEFERRED until armed; ADD-only", () => {
     expect((await db().from("items").update({ access: "team" }).eq("id", r.id)).error).toBeNull();
     await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: seed.teamSlug, client: client(fake) });
 
-    const rows = await runSql<{ group_id: string; deferred: boolean; pending_delete_group_id: string | null }>(
-      "select group_id, deferred, pending_delete_group_id from graph_episodes where team_id = $1 and source_id = $2 order by deferred",
+    const rows = await runSql<{ group_id: string; deferred: boolean; pending_delete_group_id: string | null; content_sha256: string }>(
+      "select group_id, deferred, pending_delete_group_id, content_sha256 from graph_episodes where team_id = $1 and source_id = $2 order by deferred",
       [seed.teamId, r.id]
     );
-    expect(rows.rows).toHaveLength(2); // moved home row + untouched deferred fan-out row
-    const home = rows.rows.find((x) => !x.deferred)!;
-    const fan = rows.rows.find((x) => x.deferred)!;
-    expect(home.group_id).toBe(episodeGroupId(seed.teamSlug, "team"));
+    // PCCC-6 semantics: this initiative-only item is RESTRICTED, so the tier flip does NOT
+    // relocate its home row into `_team` — the stale external-tier row is TOMBSTONED (restricted
+    // content may sit in neither tier group), and the fan-out copy is ARMED by the restriction
+    // itself (review-2 Blocker 1: the move must never wait for a reader).
+    expect(rows.rows).toHaveLength(2);
+    const home = rows.rows.find((x) => x.group_id === episodeGroupId(seed.teamSlug, "external"))!;
+    const fan = rows.rows.find((x) => x.group_id === init.group)!;
+    expect(home.content_sha256).toBe("");
     expect(home.pending_delete_group_id).toBe(episodeGroupId(seed.teamSlug, "external"));
-    expect(fan.group_id).toBe(init.group);
+    expect(fan.deferred).toBe(false); // armed reader-free
   });
 });

@@ -127,6 +127,7 @@ type EpisodeRow = {
   episode_uuid: string | null;
   pending_delete_group_id: string | null;
   pending_delete_at: string | null;
+  chunk_shas: string[] | null;
 };
 
 /**
@@ -219,7 +220,7 @@ export async function reconcileProjectedEpisodes(
   const { data } = await db
     .from("graph_episodes")
     .select(
-      "id, source_id, source_table, group_id, content_sha256, projected_at, episode_uuid, pending_delete_group_id, pending_delete_at"
+      "id, source_id, source_table, group_id, content_sha256, projected_at, episode_uuid, pending_delete_group_id, pending_delete_at, chunk_shas"
     )
     .eq("team_id", teamId)
     // DEFERRED rows are exempt from every judgement here (PCCC-5, design §2.5): they carry the ''
@@ -308,6 +309,14 @@ export async function reconcileProjectedEpisodes(
           reQueued++;
         }
       } else {
+        // NEVER-PUSHED rows are the PROJECTOR's to converge, not this judge's to delete (review-2
+        // Blocker 2): an ARMED-but-unpushed row ('' sha, EMPTY chunk ledger — reservation or an
+        // arm awaiting its budgeted push) has claimed nothing in Graphiti, so "never landed" is
+        // vacuous for it — and deleting it re-cold-starts the arm every cycle: on a reader-quiet
+        // team the restriction-move copy deterministically never pushed and rule-2 exposure stayed
+        // open forever. A row that EVER pushed keeps its chunk_shas (the re-queue resets only the
+        // sha), so the empty ledger is the honest discriminator.
+        if ((row.chunk_shas ?? []).length === 0 && row.content_sha256 === "") continue;
         // Throttled (H7) — see REQUEUE_MAX_PER_PASS. Past the cap the pass stops judging and reports
         // the remainder; the rows are untouched and come round again next pass.
         if (reQueued >= maxRequeuePerPass) {

@@ -37,6 +37,9 @@ export function projectionRunInput(
       // Fan-out pushes withheld by the per-pass budget (PCCC-5) — a cap that saturates must never
       // be silent; persistent non-zero means arming outpaces GRAPH_FANOUT_PUSH_MAX_PER_PASS.
       fanoutThrottled: summary.fanoutThrottled,
+      // Rule-2 exposure population (PCCC-6): items restricted out of General whose move has not
+      // completed — non-zero for many runs means the copy leg is stuck, and the exposure is REAL.
+      restrictionMovesPending: summary.restrictionMovesPending,
       scanned: summary.scanned,
       teams: summary.teams,
       reconciled: summary.reconciled,
