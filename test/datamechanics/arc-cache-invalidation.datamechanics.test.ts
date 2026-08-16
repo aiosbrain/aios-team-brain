@@ -5,6 +5,7 @@ import { writeArcCache, readArcCache, purgeScopedArcCache, sweepStaleScopedArcCa
 import { episodeGroupId } from "@/lib/graph/group";
 import { runSql } from "@/lib/db/pg/pool";
 import { db, ingest, seedTeam } from "./helpers";
+import { ensureAccessBootstrap } from "@/lib/access/bootstrap";
 import { FakeGraphiti, client } from "./fake-graphiti";
 
 /**
@@ -18,11 +19,12 @@ import { FakeGraphiti, client } from "./fake-graphiti";
 const ARC = [{ id: "a1", title: "arc with restricted prose", confidence: "high", summary: "S said X", participants: [], supporting_sources: [], evidence: [], derived_at: new Date().toISOString() }];
 
 describe("PCCC-7 — restriction-driven purge of scoped arc rows", () => {
-  it("a reconcile pass holding a SELF-purge hard-purges the team's p: rows BEFORE the flag can clear — the tier row survives", async () => {
+  it("a reconcile pass holding a SELF-purge hard-purges the partition's g: row BEFORE the flag can clear — the tier row survives (PPARC-4: the g: door stands alone)", async () => {
     const seed = await seedTeam();
+    expect((await ensureAccessBootstrap(db(), seed.teamId)).ok).toBe(true);
     const teamGroup = episodeGroupId(seed.teamSlug, "team");
-    // A scoped row (the pre-restriction synthesis) and a tier row.
-    await writeArcCache(db(), seed.teamId, `p:${seed.teamId}:${teamGroup}`, ARC as never, "h1");
+    // The partition row (the pre-restriction synthesis) and a tier row.
+    await writeArcCache(db(), seed.teamId, `g:${teamGroup}`, ARC as never, "h1");
     await writeArcCache(db(), seed.teamId, teamGroup, ARC as never, "h2");
 
     // A ledger row owing a SELF purge (the restriction move-out / untag shape), past every grace,
@@ -35,7 +37,7 @@ describe("PCCC-7 — restriction-driven purge of scoped arc rows", () => {
     );
     await reconcileProjectedEpisodes(db(), client(new FakeGraphiti()), seed.teamId);
 
-    expect(await readArcCache(db(), seed.teamId, `p:${seed.teamId}:${teamGroup}`)).toBeNull(); // purged
+    expect(await readArcCache(db(), seed.teamId, `g:${teamGroup}`)).toBeNull(); // purged
     expect(await readArcCache(db(), seed.teamId, teamGroup)).not.toBeNull(); // tier row untouched
   });
 
@@ -54,10 +56,11 @@ describe("PCCC-7 — restriction-driven purge of scoped arc rows", () => {
 });
 
 describe("PCCC-7 — the projector's OWN self-clear door (Fable High)", () => {
-  it("a purgeBeforeRepush clear also purges the p: rows — the sibling door cannot resurrect a poisoned row", async () => {
+  it("a purgeBeforeRepush clear also purges the partition's g: row — the sibling door cannot resurrect a poisoned row", async () => {
     const seed = await seedTeam();
+    expect((await ensureAccessBootstrap(db(), seed.teamId)).ok).toBe(true);
     const teamGroup = episodeGroupId(seed.teamSlug, "team");
-    await writeArcCache(db(), seed.teamId, `p:${seed.teamId}:${teamGroup}`, ARC as never, "h1");
+    await writeArcCache(db(), seed.teamId, `g:${teamGroup}`, ARC as never, "h1");
 
     // The retract-failure/redaction shape: a live home row whose SELF flag is set (past every
     // grace), content unchanged — the projector's purgeBeforeRepush path confirms the purge
@@ -76,15 +79,16 @@ describe("PCCC-7 — the projector's OWN self-clear door (Fable High)", () => {
       [seed.teamId, r.id]
     );
     expect(flag.rows[0].pending_delete_group_id).toBeNull(); // the projector DID clear (the door is live)
-    expect(await readArcCache(db(), seed.teamId, `p:${seed.teamId}:${teamGroup}`)).toBeNull(); // …and purged first
+    expect(await readArcCache(db(), seed.teamId, `g:${teamGroup}`)).toBeNull(); // …and purged first
   });
 });
 
 describe("PCCC-7 — the purge trigger is clear-imminent, not flag-exists", () => {
   it("a FRESH self flag (inside the cleanup grace) does not purge the team's p: rows", async () => {
     const seed = await seedTeam();
+    expect((await ensureAccessBootstrap(db(), seed.teamId)).ok).toBe(true);
     const teamGroup = episodeGroupId(seed.teamSlug, "team");
-    await writeArcCache(db(), seed.teamId, `p:${seed.teamId}:${teamGroup}`, ARC as never, "h1");
+    await writeArcCache(db(), seed.teamId, `g:${teamGroup}`, ARC as never, "h1");
     const r = await ingest(seed, { body: "fresh flag", path: "ff.md", access: "team" });
     await runSql(
       `insert into graph_episodes (team_id, source_table, source_id, group_id, content_sha256, pending_delete_group_id, pending_delete_at, projected_at)
@@ -92,16 +96,17 @@ describe("PCCC-7 — the purge trigger is clear-imminent, not flag-exists", () =
       [seed.teamId, r.id, teamGroup]
     );
     await reconcileProjectedEpisodes(db(), client(new FakeGraphiti()), seed.teamId);
-    // No clear was possible this pass (grace not elapsed) — readers' scoped rows must survive.
-    expect(await readArcCache(db(), seed.teamId, `p:${seed.teamId}:${teamGroup}`)).not.toBeNull();
+    // No clear was possible this pass (grace not elapsed) — readers' partition rows must survive.
+    expect(await readArcCache(db(), seed.teamId, `g:${teamGroup}`)).not.toBeNull();
   });
 });
 
 describe("PCCC-7 — the purge waits for a VERIFIED-CLEAN clear (Codex High 2)", () => {
   it("while Graphiti still holds the item's episodes, the p: rows survive — a cold miss must not rebuild from the dirty graph", async () => {
     const seed = await seedTeam();
+    expect((await ensureAccessBootstrap(db(), seed.teamId)).ok).toBe(true);
     const teamGroup = episodeGroupId(seed.teamSlug, "team");
-    await writeArcCache(db(), seed.teamId, `p:${seed.teamId}:${teamGroup}`, ARC as never, "h1");
+    await writeArcCache(db(), seed.teamId, `g:${teamGroup}`, ARC as never, "h1");
 
     // Self flag past grace, but the graph is NOT clean: Graphiti still lists an episode for the
     // item, so this pass cannot clear the flag — and must not purge either. An eager purge here
@@ -126,7 +131,7 @@ describe("PCCC-7 — the purge waits for a VERIFIED-CLEAN clear (Codex High 2)",
       [seed.teamId, r.id]
     );
     expect(flag.rows[0].pending_delete_group_id).not.toBeNull(); // clear was impossible (dirty graph)
-    expect(await readArcCache(db(), seed.teamId, `p:${seed.teamId}:${teamGroup}`)).not.toBeNull(); // …so no purge either
+    expect(await readArcCache(db(), seed.teamId, `g:${teamGroup}`)).not.toBeNull(); // …so no purge either
   });
 });
 

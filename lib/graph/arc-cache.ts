@@ -197,6 +197,32 @@ export async function sweepStaleScopedArcCache(db: DbClient, teamId: string): Pr
   }
 }
 
+/**
+ * Delete `g:` rows whose partition NO LONGER EXISTS (PPARC-4, design-assigned): a deleted
+ * initiative's row is unreachable post-cutover — reads are pointer-resolved, so no scope ever
+ * includes its group again — but nothing else removes it. The predicate is the pointer list
+ * itself: a `g:<group>` row whose group matches no `projects.graph_group_id` for the team is an
+ * orphan by construction (built-ins' pointers ARE the tier ids, so tier-shaped groups are
+ * covered). Regenerable data; best-effort.
+ */
+export async function sweepOrphanedPartitionArcCache(db: DbClient, teamId: string): Promise<void> {
+  try {
+    const { runSql } = await import("@/lib/db/pg/pool");
+    await runSql(
+      `delete from arc_cache ac
+        where ac.team_id = $1
+          and ac.group_key like 'g:%'
+          and not exists (
+            select 1 from projects p
+             where p.team_id = ac.team_id
+               and p.graph_group_id = substr(ac.group_key, 3))`,
+      [teamId]
+    );
+  } catch {
+    // best-effort — orphans cost storage, not correctness; the next pass retries
+  }
+}
+
 /** Upsert the cached arcs for one team+group_key, stamping `computed_at` now. Best-effort — a failed
  *  cache write must never fail synthesis (the arcs are still returned to the caller). */
 export async function writeArcCache(

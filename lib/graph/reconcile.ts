@@ -10,8 +10,8 @@ import {
   resolvePositiveInt,
 } from "./project";
 import { isExternalGroupId } from "./group";
-import { purgeScopedArcCache, purgePartitionArcCache, sweepStaleScopedArcCache } from "./arc-cache";
-import { evictScopedArcMemory, evictPartitionArcMemory } from "./arcs";
+import { purgePartitionArcCache, sweepStaleScopedArcCache, sweepOrphanedPartitionArcCache } from "./arc-cache";
+import { evictPartitionArcMemory } from "./arcs";
 
 /**
  * Reconcile pass for the brain→Graphiti seam (audit H3, Option B — chosen over blocking-confirm
@@ -372,14 +372,8 @@ export async function reconcileProjectedEpisodes(
   // empty of the item, grace elapsed), memoized once per pass; a FAILED purge holds every self
   // clear this pass — fail closed, converging next tick. (This also subsumes the clear-imminent
   // narrowing: no clear, no purge, so a stuck cleanup never deletes readers' active rows.)
-  let scopedArcPurgeState: boolean | null = null;
-  const scopedArcPurgeGate = async (): Promise<boolean> => {
-    if (scopedArcPurgeState === null) {
-      scopedArcPurgeState = (await purgeScopedArcCache(db, teamId)).ok;
-      if (scopedArcPurgeState) evictScopedArcMemory(teamId);
-    }
-    return scopedArcPurgeState;
-  };
+  // PPARC-4: the team-wide p: purge gate is RETIRED (no writer mints p: rows since the PPARC-3
+  // cutover; the straggler SWEEP below still janitors pre-cutover residue).
   // PPARC-2: the PARTITION-NATIVE (`g:`) twin — per affected group, memoized, strictly narrower
   // (only the self-purging partition's row dies; a neighbor's rows survive its restriction).
   const partitionPurgeState = new Map<string, boolean>();
@@ -394,6 +388,9 @@ export async function reconcileProjectedEpisodes(
   // PCCC-7 orphan sweep: oracle churn strands `p:` rows forever (every scope change mints a new
   // key); collect the ones no reader can resolve to anymore. Age-gated well past the TTL (7d).
   await sweepStaleScopedArcCache(db, teamId);
+  // PPARC-4 orphan sweep: a DELETED initiative's g: row is unreachable post-cutover (reads are
+  // pointer-resolved) but nothing else ever removes it — bounded by partition count.
+  await sweepOrphanedPartitionArcCache(db, teamId);
   for (const [oldGroup, groupRows] of pendingByGroup) {
     // List the old group once (deep — a large group must not hide the item's episodes past the default
     // window). Graphiti unreachable → leave the flags set and retry next tick.
@@ -441,7 +438,7 @@ export async function reconcileProjectedEpisodes(
         !deleteFailed &&
         pastCleanupGrace &&
         !saturated &&
-        (oldGroup !== row.group_id || ((await scopedArcPurgeGate()) && (await partitionArcPurgeGate(oldGroup))))
+        (oldGroup !== row.group_id || (await partitionArcPurgeGate(oldGroup)))
       ) {
         if (orphans.has(row.source_id) && oldGroup === row.group_id) {
           // Orphan, cleanup verified: the item is gone and the group it lives in is empty of it, so

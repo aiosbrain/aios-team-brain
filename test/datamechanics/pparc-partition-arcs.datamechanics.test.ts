@@ -1,10 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { reconcileProjectedEpisodes } from "@/lib/graph/reconcile";
 import { writeArcCache, readArcCache, purgePartitionArcCache } from "@/lib/graph/arc-cache";
-import { warmPartitionArcs } from "@/lib/graph/arcs";
+import { getFusedArcs } from "@/lib/graph/arc-fusion";
 import { episodeGroupId } from "@/lib/graph/group";
 import { runSql } from "@/lib/db/pg/pool";
 import { db, ingest, seedTeam } from "./helpers";
+import { ensureAccessBootstrap } from "@/lib/access/bootstrap";
+import { mkInitiative } from "./graph-helpers";
 import { FakeGraphiti, client } from "./fake-graphiti";
 
 /**
@@ -18,10 +20,13 @@ const ARC = [{ id: "a1", title: "partition arc", confidence: "high", summary: "p
 const KEYS = { anthropicApiKey: null, openaiApiKey: null } as never;
 
 describe("PPARC-2 — the g: purge door is per-partition (criterion 8)", () => {
-  it("a self-purge clear kills EXACTLY the affected partition's g: row — the neighbor's survives, and the p: rows still die team-wide", async () => {
+  it("a self-purge clear kills EXACTLY the affected partition's g: row — the neighbor's survives (PPARC-4: the retired p: gate no longer purges; the straggler sweep owns residue)", async () => {
     const seed = await seedTeam();
+    // REAL pointers (the PPARC-4 orphan sweep rightly deletes rows for pointer-less groups —
+    // the first fixture here seeded exactly such orphans and the sweep ate the "neighbor").
+    expect((await ensureAccessBootstrap(db(), seed.teamId)).ok).toBe(true);
     const teamGroup = episodeGroupId(seed.teamSlug, "team");
-    const otherGroup = `g_${"c".repeat(32)}_p_${"d".repeat(32)}`;
+    const otherGroup = (await mkInitiative(seed, "neighbor-init")).group;
     await writeArcCache(db(), seed.teamId, `g:${teamGroup}`, ARC as never, "h1");
     await writeArcCache(db(), seed.teamId, `g:${otherGroup}`, ARC as never, "h2");
     await writeArcCache(db(), seed.teamId, `p:${seed.teamId}:${teamGroup}`, ARC as never, "h3");
@@ -36,7 +41,9 @@ describe("PPARC-2 — the g: purge door is per-partition (criterion 8)", () => {
 
     expect(await readArcCache(db(), seed.teamId, `g:${teamGroup}`)).toBeNull(); // the affected partition
     expect(await readArcCache(db(), seed.teamId, `g:${otherGroup}`)).not.toBeNull(); // the neighbor survives
-    expect(await readArcCache(db(), seed.teamId, `p:${seed.teamId}:${teamGroup}`)).toBeNull(); // p: stays team-wide until PPARC-4
+    // The p: row SURVIVES the door now (the team-wide gate retired) — only the 7d straggler
+    // sweep collects such residue; nothing can mint new ones (the inverse guard).
+    expect(await readArcCache(db(), seed.teamId, `p:${seed.teamId}:${teamGroup}`)).not.toBeNull();
   });
 
   it("purgePartitionArcCache deletes exactly one partition's row, one team's", async () => {
@@ -52,22 +59,33 @@ describe("PPARC-2 — the g: purge door is per-partition (criterion 8)", () => {
   });
 });
 
-describe("PPARC-2 — the warming budget (criterion 7's write half)", () => {
-  it("N=5 missing partitions against the default budget of 3 schedules exactly 3; a FRESH g: row is skipped, not re-minted", async () => {
+describe("PPARC-4 — the orphaned-g:-row sweep (design-assigned lifecycle)", () => {
+  it("a g: row whose partition no longer exists is swept by reconcile; a pointered partition's row survives", async () => {
     const seed = await seedTeam();
-    // One fresh row — the budget must not be spent re-minting shared state.
-    await writeArcCache(db(), seed.teamId, "g:fresh-group", ARC as never, "h");
-    const scheduled = await warmPartitionArcs(
-      db(),
-      seed.teamId,
-      ["fresh-group", "cold-1", "cold-2", "cold-3", "cold-4"],
-      KEYS
-    );
-    expect(scheduled).toBe(3); // budget holds; the fresh row consumed none of it
-
-    // The DISCRIMINATING half (a mutation survived the count-only version): a fresh-ONLY warm
-    // must schedule NOTHING — the count above can't see WHICH groups spent the budget.
-    const freshOnly = await warmPartitionArcs(db(), seed.teamId, ["fresh-group"], KEYS);
-    expect(freshOnly).toBe(0);
+    expect((await ensureAccessBootstrap(db(), seed.teamId)).ok).toBe(true);
+    const real = (await mkInitiative(seed, "living-init")).group;
+    await writeArcCache(db(), seed.teamId, `g:${real}`, ARC as never, "h1");
+    await writeArcCache(db(), seed.teamId, `g:g_${"e".repeat(32)}_p_${"f".repeat(32)}`, ARC as never, "h2"); // no pointer — a deleted initiative's residue
+    await reconcileProjectedEpisodes(db(), client(new FakeGraphiti()), seed.teamId);
+    expect(await readArcCache(db(), seed.teamId, `g:${real}`)).not.toBeNull();
+    expect(await readArcCache(db(), seed.teamId, `g:g_${"e".repeat(32)}_p_${"f".repeat(32)}`)).toBeNull();
   });
 });
+
+describe("the warming budget through the LIVE path (PPARC-4: warmPartitionArcs retired; getFusedArcs owns scheduling)", () => {
+  it("five missing partitions cost 1 inline + at most budget(3) scheduled; a fresh row costs nothing", async () => {
+    const seed = await seedTeam();
+    expect((await ensureAccessBootstrap(db(), seed.teamId)).ok).toBe(true);
+    const groups = ["cold-a", "cold-b", "cold-c", "cold-d", "cold-e"];
+    const panel = await getFusedArcs(db(), seed.teamId, seed.teamSlug, groups, KEYS);
+    expect(panel.warmScheduled).toBeLessThanOrEqual(3); // the budget holds
+    expect(panel.warmScheduled).toBeGreaterThanOrEqual(1); // and the R exists
+
+    const fresh = await seedTeam();
+    expect((await ensureAccessBootstrap(db(), fresh.teamId)).ok).toBe(true);
+    await writeArcCache(db(), fresh.teamId, "g:fresh-x", ARC as never, "h");
+    const p2 = await getFusedArcs(db(), fresh.teamId, fresh.teamSlug, ["fresh-x"], KEYS);
+    expect(p2.warmScheduled).toBe(0); // fresh rows are never re-minted
+  });
+});
+

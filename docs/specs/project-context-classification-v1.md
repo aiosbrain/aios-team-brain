@@ -686,13 +686,14 @@ Everyone may see**, not "everything":
    survives migration byte-for-byte. It then *drifts by design* as teams restrict content out of
    General — which is exactly what §12's restricted-principal eval axis exists to keep honest.
 
-Cross-project synthesis is never computed (the permission-laundering answer); each partition's
-synthesis reads only its own content. **Sanctioned exception (PCCC6B-1, ruled post-merge after the
-second-model review pressed the letter of this rule):** a PRINCIPAL-scoped synthesis over exactly
-the reader's own visible, ready partitions — cache-keyed by that exact scope so it is only ever
-served to a principal holding that same scope — is permitted: its input set is the reader's own oracle, so the laundering this
-rule exists to prevent cannot occur. True per-partition arcs (one synthesis per project, fused at
-read time) remain the deferred product form.
+Cross-project synthesis is never computed on the ENFORCED path (the permission-laundering
+answer); each partition's synthesis reads only its own content, and an enforced reader's panel is
+a prose-free FUSION of their visible partitions' independently-synthesized arc sets (PPARC-3).
+The scope is deliberately the enforced path (PPARC-4, retiring the earlier PCCC6B-1
+principal-scoped-union exception now that the union is gone): the retained PERMISSIVE tier row is
+itself a computed two-partition synthesis — the built-ins' partitions are the tier groups — and
+an unscoped "never computed" would contradict that shipped path. Permissive teams have no
+enforcement boundary to launder across.
 
 ## 7. FalkorDB vs Neo4j — recommendation
 
