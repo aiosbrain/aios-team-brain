@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { projectItemsToGraph } from "@/lib/graph/project";
 import { selectEnforcedGraphPartitions } from "@/lib/graph/partition-read";
-import { fetchGraphFactsForGroups } from "@/lib/query/retrieve";
+import { fetchGraphFactsForGroups, nativeProvider } from "@/lib/query/retrieve";
 import { episodeGroupId } from "@/lib/graph/group";
 import { ensureAccessBootstrap } from "@/lib/access/bootstrap";
 import { runSql } from "@/lib/db/pg/pool";
@@ -202,5 +204,45 @@ describe("PCCC-6 — enforced partition selection", () => {
     // Empty set short-circuits — an empty group list must NEVER reach the wire (no-filter = everything).
     await fetchGraphFactsForGroups("what changed", [], client(fake));
     expect(searches).toHaveLength(1);
+  });
+
+  it("an ENFORCED member's retrieve hands exactly the selected partitions to Graphiti — the production path end to end (Codex code-review Medium 3: the string guard alone is green-by-construction)", async () => {
+    const seed = await seedTeam();
+    const { init, itemId } = await bootstrapWithInitiative(seed, "wire-e2e");
+    await landGroup(seed, init.group);
+    const ids = await visibleIds(seed, [init.projectId]);
+    // Latch the initiative and learn the expected selection from the selector itself.
+    const expected = await selectEnforcedGraphPartitions(db(), { teamId: seed.teamId, visibleProjectIds: ids });
+    expect(expected.groups).toContain(init.group);
+
+    const captured: { url: string; group_ids?: string[] }[] = [];
+    const server = createServer((req, res) => {
+      let body = "";
+      req.on("data", (c: Buffer) => (body += c.toString()));
+      req.on("end", () => {
+        captured.push({ url: req.url ?? "", ...(body ? (JSON.parse(body) as { group_ids?: string[] }) : {}) });
+        res.setHeader("content-type", "application/json");
+        res.end(JSON.stringify({ facts: [] }));
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const prev = process.env.GRAPHITI_URL;
+    process.env.GRAPHITI_URL = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    try {
+      await nativeProvider.retrieve({
+        db: db(),
+        teamId: seed.teamId,
+        tier: "team",
+        question: "what changed in wire-e2e",
+        enforce: { visibleItemIds: new Set([itemId]), graphProjectIds: ids },
+      });
+    } finally {
+      if (prev === undefined) delete process.env.GRAPHITI_URL;
+      else process.env.GRAPHITI_URL = prev;
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+    const searches = captured.filter((c) => c.url.startsWith("/search"));
+    expect(searches).toHaveLength(1);
+    expect([...(searches[0].group_ids ?? [])].sort()).toEqual([...expected.groups].sort());
   });
 });

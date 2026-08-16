@@ -3,6 +3,7 @@ import type { DbClient } from "@/lib/db/types";
 import { armProjectsForPrincipal, readyPartitions } from "./arming";
 import { resolvePositiveInt } from "@/lib/util/env";
 import { latestPushByGroup } from "./extraction-health";
+import { generalHoldsRestrictedContent } from "@/lib/projects/context/fanout-targets";
 
 /**
  * The enforced team-tier graph READ set (PCCC-6, design §2.3 + spec's expansion budget): which
@@ -17,6 +18,14 @@ import { latestPushByGroup } from "./extraction-health";
  *   suppress: the lingering old-tier episodes are content a team-tier reader may see anyway
  *   (canSeeAccess spans both tiers), and suppressing General for routine tier-flip hygiene would
  *   blank the leg constantly. This discriminator is the load-bearing design decision here.
+ * - RESTRICTION DEBT on General (Codex code-review Blocker 1): the landed-gated move deliberately
+ *   holds General's content until the initiative copy confirms — so for the whole move window the
+ *   Everyone-visible partition carries facts a non-member must not receive, and Graphiti cannot
+ *   filter per fact. Enforced reads therefore fail closed on General while
+ *   `generalHoldsRestrictedContent` (live row OR unconfirmed self-purge for a substrate-restricted
+ *   item) is true. Substrate-discriminated, so the built-in exemption for ROUTINE hygiene below
+ *   stands. The permissive union is exempt: no enforcement exists there to protect, and blanking
+ *   General would go dark for the default mode.
  * - K-CAP (spec ~592-606): the graph stage covers General + the top-(K-1) other eligible
  *   partitions by recency prior (projects.last_synced_at — the router's correctness never matters:
  *   FTS/dense stay complete, beyond-cap partitions lose only graph-flavored recall). K default 8,
@@ -60,6 +69,20 @@ export async function selectEnforcedGraphPartitions(
   const total = projects.length;
 
   const initiatives = projects.filter((p) => p.kind === "initiative");
+  const generalProject = projects.find((p) => p.kind === "system" && p.slug === "general");
+  // Restriction-debt probe (header: RESTRICTION DEBT) — ENFORCED reads only, concurrent with the
+  // arm/latch chain. arm:false IS the permissive-union discriminator (the only caller passing it),
+  // and permissive readers may see the moved content anyway — suppressing would blank the default
+  // mode's primary partition for zero protection.
+  const generalDebtP: Promise<boolean> =
+    args.arm !== false && generalProject != null
+      ? generalHoldsRestrictedContent({
+          teamId: args.teamId,
+          generalProjectId: generalProject.id,
+          generalGroupId: generalProject.graph_group_id,
+        })
+      : Promise.resolve(false);
+
   // arm defaults ON (an enforcing principal read IS the arming trigger); the permissive union path
   // passes arm:false — no reader-signal there, and cold initiatives must never extract for it.
   if (args.arm !== false) {
@@ -69,16 +92,20 @@ export async function selectEnforcedGraphPartitions(
     teamId: args.teamId,
     projects: projects.map((p) => ({ id: p.id, group: p.graph_group_id })),
   });
+  const generalOwesRestriction = await generalDebtP;
 
   const eligible = projects.filter((p) => {
     // Suppression applies to INITIATIVE partitions only (review-2 High 4): a self-purge in a
     // built-in is ROUTINE — every redaction, item deletion, and restriction move-out flags a
     // General row for >= the cleanup grace (an hour-scale floor) — so suppressing built-ins
     // blanked the whole enforced leg's primary partition near-constantly. The narrowing that
-    // suppression exists for (untag) lives in initiative partitions; General's residual is the
-    // BOUNDED restriction-purge window (<= ~2 reconcile cycles, shortened by arm-on-restrict),
-    // named in the design as an accepted residual with restrictionMovesPending as its measure.
-    if (p.kind !== "initiative") return true; // built-ins: always eligible
+    // suppression exists for (untag) lives in initiative partitions. The ONE built-in exception is
+    // General's RESTRICTION debt (substrate-discriminated — routine hygiene never trips it): while
+    // a restriction move is anywhere short of purge-confirmed, General fails closed for enforced
+    // readers (Codex code-review Blocker 1; the old "accepted residual" contradicted spec rule 2).
+    if (p.kind !== "initiative") {
+      return !(generalOwesRestriction && p.id === generalProject?.id);
+    }
     if (state.suppressed.has(p.id)) return false; // self-purge outstanding — fail closed
     return state.ready.has(p.id);
   });

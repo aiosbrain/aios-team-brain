@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { projectItemsToGraph } from "@/lib/graph/project";
 import { reconcileProjectedEpisodes } from "@/lib/graph/reconcile";
+import { selectEnforcedGraphPartitions } from "@/lib/graph/partition-read";
 import { episodeGroupId } from "@/lib/graph/group";
 import { ensureAccessBootstrap } from "@/lib/access/bootstrap";
 import { runSql } from "@/lib/db/pg/pool";
@@ -258,6 +259,74 @@ describe("PCCC-6 — the landed-gated restriction move", () => {
       [seed.teamId, r.id, init.group]
     );
     expect(done.rows[0].n).toBe(0); // the lifecycle ends; nothing re-tombstones, nothing suppresses
+  });
+
+  it("the pending-move window fails CLOSED on General for ENFORCED readers — restricted facts are never servable through the Everyone partition (Codex code-review Blocker 1)", async () => {
+    const seed = await seedTeam();
+    expect((await ensureAccessBootstrap(db(), seed.teamId)).ok).toBe(true);
+    const init = await mkInitiative(seed, "window-leak");
+    const r = await ingest(seed, { body: "restricted mid-move", path: "wl.md", access: "team" });
+    await tagIntoGeneral(seed, r.id);
+    await tagItem(seed, r.id, init.projectId);
+    const fake = new FakeGraphiti();
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: seed.teamSlug, client: client(fake) });
+
+    // Before the restriction, an enforced non-member (oracle grants the built-ins only) gets General.
+    const { data: sys } = await db().from("projects").select("id").eq("team_id", seed.teamId).eq("kind", "system");
+    const systemIds = ((sys ?? []) as { id: string }[]).map((p) => p.id);
+    const before = await selectEnforcedGraphPartitions(db(), { teamId: seed.teamId, visibleProjectIds: systemIds });
+    expect(before.groups).toContain(`${seed.teamSlug}_team`);
+
+    // The window: restricted, copy armed but NOT landed — General's row still live in Graphiti.
+    await restrictFromGeneral(seed, r.id);
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: seed.teamSlug, client: client(fake) });
+    const during = await selectEnforcedGraphPartitions(db(), { teamId: seed.teamId, visibleProjectIds: systemIds });
+    expect(during.groups).not.toContain(`${seed.teamSlug}_team`); // fail closed — Graphiti has no per-fact filter
+  });
+
+  it("the restriction debt persists through the UNCONFIRMED purge and clears at the parked sentinel; the PERMISSIVE union keeps General throughout", async () => {
+    const seed = await seedTeam();
+    expect((await ensureAccessBootstrap(db(), seed.teamId)).ok).toBe(true);
+    const init = await mkInitiative(seed, "debt-lifecycle");
+    const r = await ingest(seed, { body: "debt lifecycle content", path: "dl.md", access: "team" });
+    await tagIntoGeneral(seed, r.id);
+    await tagItem(seed, r.id, init.projectId);
+    const fake = new FakeGraphiti();
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: seed.teamSlug, client: client(fake) });
+    // Land + confirm the copy, then restrict → the move completes on the next pass (home
+    // tombstoned, self purge flag — the purge is written but NOT yet reconcile-confirmed).
+    await runSql("update graph_episodes set deferred = false where team_id = $1 and group_id = $2", [seed.teamId, init.group]);
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: seed.teamSlug, client: client(fake) });
+    await runSql("update graph_episodes set episode_uuid = 'ep-d' where team_id = $1 and group_id = $2", [seed.teamId, init.group]);
+    await restrictFromGeneral(seed, r.id);
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: seed.teamSlug, client: client(fake) });
+
+    const { data: sys } = await db().from("projects").select("id").eq("team_id", seed.teamId).eq("kind", "system");
+    const systemIds = ((sys ?? []) as { id: string }[]).map((p) => p.id);
+    const homeGroup = `${seed.teamSlug}_team`;
+
+    // Purge written but unconfirmed: Graphiti may still hold the facts (the inline delete is
+    // best-effort) — the enforced read must STILL fail closed on General…
+    const unconfirmed = await selectEnforcedGraphPartitions(db(), { teamId: seed.teamId, visibleProjectIds: systemIds });
+    expect(unconfirmed.groups).not.toContain(homeGroup);
+    // …while the permissive union (no enforcement to protect) keeps General through the window.
+    const { data: all } = await db().from("projects").select("id").eq("team_id", seed.teamId);
+    const allIds = ((all ?? []) as { id: string }[]).map((p) => p.id);
+    const permissive = await selectEnforcedGraphPartitions(db(), {
+      teamId: seed.teamId,
+      visibleProjectIds: allIds,
+      arm: false,
+      k: Number.MAX_SAFE_INTEGER,
+    });
+    expect(permissive.groups).toContain(homeGroup);
+
+    // Purge confirms (flag cleared → the parked sentinel): nothing is owed — General returns.
+    await runSql(
+      "update graph_episodes set pending_delete_group_id = null where team_id = $1 and source_id = $2 and group_id = $3",
+      [seed.teamId, r.id, homeGroup]
+    );
+    const parked = await selectEnforcedGraphPartitions(db(), { teamId: seed.teamId, visibleProjectIds: systemIds });
+    expect(parked.groups).toContain(homeGroup);
   });
 
   it("RESTRICTION arms the deferred copy itself — the move never waits for a reader (review High 3)", async () => {

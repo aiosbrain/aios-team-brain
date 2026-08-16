@@ -1,6 +1,7 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { chunk, IN_CLAUSE_BATCH } from "@/lib/db/batch";
+import { runSql } from "@/lib/db/pg/pool";
 
 /**
  * READ-ONLY resolver: each item's ACTIVE initiative include memberships → the initiative's graph
@@ -87,4 +88,51 @@ export async function resolveFanoutTargets(
     for (const id of args.itemIds) if (!itemsWithUnits.has(id)) inGeneral.add(id);
   }
   return { targets, inGeneral };
+}
+
+/**
+ * READ-TIME restriction-debt probe for the GENERAL partition (Codex 6a code review, Blocker 1).
+ * True while General's graph group holds content for an item RESTRICTED out of General — a live
+ * row (the landed-gated move hasn't completed) or an unconfirmed self-purge (move-out written,
+ * Graphiti deletion not yet reconcile-confirmed). While true, the enforced read fails closed on
+ * General: Graphiti has no per-fact filter, so a non-member principal searching `<teamSlug>_team`
+ * would otherwise receive the restricted item's facts for the whole move window (spec rule 2 is
+ * absolute — this was previously an "accepted residual", which the spec never accepted).
+ *
+ * The restricted-out-of-General predicate here is `resolveFanoutTargets`' inGeneral complement in
+ * SQL, deliberately co-located with it: has ACTIVE units (substrate-less items default in-General)
+ * AND no open General include, team-access only (the external-shared analogue is 6b — the named
+ * exemption above). The parked sentinel ('' sha, purge flag cleared) does NOT match: the content
+ * is confirmed gone from Graphiti, so nothing is owed. Routine hygiene (redaction/deletion of an
+ * item still IN General) never matches — the built-in suppression exemption stays intact.
+ */
+export async function generalHoldsRestrictedContent(args: {
+  teamId: string;
+  generalProjectId: string;
+  generalGroupId: string;
+}): Promise<boolean> {
+  const res = await runSql<{ owed: boolean }>(
+    `select exists (
+       select 1
+         from graph_episodes ge
+         join items i on i.team_id = ge.team_id and i.id = ge.source_id
+        where ge.team_id = $1
+          and ge.group_id = $2
+          and ge.source_table = 'items'
+          and (ge.content_sha256 <> '' or ge.pending_delete_group_id is not null)
+          and i.access = 'team'
+          and exists (
+            select 1 from project_context_units u
+             where u.team_id = $1 and u.source_item_id = i.id and u.state = 'active')
+          and not exists (
+            select 1
+              from project_context_units u2
+              join project_context_memberships m on m.context_unit_id = u2.id
+             where u2.team_id = $1 and u2.source_item_id = i.id and u2.state = 'active'
+               and m.team_id = $1 and m.project_id = $3
+               and m.decision = 'include' and m.valid_to is null)
+     ) as owed`,
+    [args.teamId, args.generalGroupId, args.generalProjectId]
+  );
+  return res.rows[0]?.owed === true;
 }

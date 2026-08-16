@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { projectItemsToGraph } from "@/lib/graph/project";
 import { armProjectsForPrincipal, readyPartitions } from "@/lib/graph/arming";
+import { ensureArmingRows } from "@/lib/graph/arming-row";
 import { projectGroupId } from "@/lib/graph/group";
 import { ensureAccessBootstrap } from "@/lib/access/bootstrap";
 import { runSql } from "@/lib/db/pg/pool";
@@ -118,9 +119,10 @@ describe("PCCC-6 — arm-on-read", () => {
     state = await readyPartitions(db(), { teamId: seed.teamId, projects: [{ id: projectId, group }] });
     expect(state.ready.has(projectId)).toBe(true);
 
-    // The DISCRIMINATING monotone pin: a RE-ARM flips the late row into an unlanded obligation
-    // (late-tagged content must eventually extract — the flip re-runs on every arm touch), and
-    // readiness must STILL hold: only the persisted latch survives this; a live predicate flaps.
+    // The DISCRIMINATING monotone pin: a POST-LATCH re-arm flips the late row into an unlanded
+    // obligation (late-tagged content must eventually extract — a LATCHED project flips on every
+    // arm touch; an unlatched one does not, see the starvation pin below), and readiness must
+    // STILL hold: only the persisted latch survives this; a live predicate flaps.
     await armProjectsForPrincipal(db(), { teamId: seed.teamId, projectIds: [projectId] });
     const late = await runSql<{ deferred: boolean; content_sha256: string }>(
       "select deferred, content_sha256 from graph_episodes where team_id = $1 and group_id = $2 and source_id = $3",
@@ -168,5 +170,57 @@ describe("PCCC-6 — arm-on-read", () => {
     await armProjectsForPrincipal(db(), { teamId: seed.teamId, projectIds: [init.projectId] });
     const state = await readyPartitions(db(), { teamId: seed.teamId, projects: [{ id: init.projectId, group: init.group }] });
     expect(state.ready.has(init.projectId)).toBe(true);
+  });
+
+  it("a PRE-LATCH re-arm does NOT grow the obligation set — late tags can never starve the first latch (Codex code-review Blocker 2)", async () => {
+    const seed = await seedTeam();
+    const { projectId, group } = await setup(seed, "no-starve");
+    await armProjectsForPrincipal(db(), { teamId: seed.teamId, projectIds: [projectId] }); // snapshot = {A}
+    // A lands + confirms, but the latch has NOT been evaluated yet.
+    await runSql(
+      "update graph_episodes set content_sha256 = $1, episode_uuid = 'ep-a' where team_id = $2 and group_id = $3",
+      [sha("a"), seed.teamId, group]
+    );
+    // B is tagged AFTER the snapshot…
+    const r2 = await ingest(seed, { body: "tagged after the snapshot", path: "after.md", access: "team" });
+    await tagItem(seed, r2.id, projectId);
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: seed.teamSlug, client: client(new FakeGraphiti()) });
+    // …and the next enforcing read's arm touch must NOT flip it into the pending obligation set:
+    // under the rejected semantics every later tag re-enters the snapshot and a busy project
+    // delays its first latch indefinitely.
+    await armProjectsForPrincipal(db(), { teamId: seed.teamId, projectIds: [projectId] });
+    const b = await runSql<{ deferred: boolean }>(
+      "select deferred from graph_episodes where team_id = $1 and group_id = $2 and source_id = $3",
+      [seed.teamId, group, r2.id]
+    );
+    expect(b.rows[0].deferred).toBe(true); // invisible to the latch until a post-latch arm
+    const state = await readyPartitions(db(), { teamId: seed.teamId, projects: [{ id: projectId, group }] });
+    expect(state.ready.has(projectId)).toBe(true); // the arm-time snapshot landed — latch sets
+  });
+
+  it("a crash between the arming row and the flip is REPAIRED on the next arm touch — the partition can never stay dark (liveness half)", async () => {
+    const seed = await seedTeam();
+    const { projectId, group } = await setup(seed, "crashed-arm");
+    // The crash state: the arming row is durable, the flip never ran (all rows still deferred).
+    await ensureArmingRows(db(), seed.teamId, [projectId]);
+    // The next arm touch takes the missed snapshot (never-snapshotted ⇒ flip-eligible).
+    await armProjectsForPrincipal(db(), { teamId: seed.teamId, projectIds: [projectId] });
+    const flipped = await runSql<{ deferred: boolean }>(
+      "select deferred from graph_episodes where team_id = $1 and group_id = $2",
+      [seed.teamId, group]
+    );
+    expect(flipped.rows).toHaveLength(1);
+    expect(flipped.rows[0].deferred).toBe(false);
+  });
+
+  it("the crashed-arm state never latches VACUOUSLY — readiness refuses an untaken snapshot (latch half)", async () => {
+    const seed = await seedTeam();
+    const { projectId, group } = await setup(seed, "crashed-latch");
+    await ensureArmingRows(db(), seed.teamId, [projectId]);
+    // The permissive-union path reads readiness WITHOUT arming — during the crash window the group
+    // holds only deferred rows, and `unlanded = 0` would latch a snapshot that was never taken.
+    // The latch is permanent, so this lie would never heal.
+    const state = await readyPartitions(db(), { teamId: seed.teamId, projects: [{ id: projectId, group }] });
+    expect(state.ready.has(projectId)).toBe(false);
   });
 });
