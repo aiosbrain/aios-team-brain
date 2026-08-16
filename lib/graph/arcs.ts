@@ -706,7 +706,11 @@ async function synthesizeArcs(
   // Run the extra evidence-COHERENCE LLM pass? Only the non-route-bound BACKGROUND refresh sets this — the
   // route-bound cold-miss + correction paths skip it (a second LLM call would blow the 120s route budget).
   // A cold-miss arc may briefly show a spurious participant; the next SWR refresh prunes it.
-  runCoherence: boolean = false
+  runCoherence: boolean = false,
+  // PCCC6B-1: the synthesis SCOPE key (identical to the arc_cache group_key this result commits
+  // under). Corrections are loaded for EXACTLY this scope; absent = the legacy tier semantics
+  // (sorted group join), which additionally admits pre-6b unscoped rows.
+  scopeKey?: string
 ): Promise<SynthesisResult> {
   // Arcs are NOT time-boxed — synthesize from the most-recent facts regardless of age (a quiet week,
   // or a stalled projector, must not blank the panel). `null` = no window. Fetch a DEEP pool (not just
@@ -727,8 +731,17 @@ async function synthesizeArcs(
   // Derived from `groups` rather than a second tier argument on purpose: `groups` is already THE
   // tier-scoping input, and a parallel parameter is one more thing that can disagree with it.
   const teamTier = groups.some((g) => !isExternalGroupId(g));
+  // PCCC6B-1 scope rule: EXACT match on this synthesis's own scope key. Only the LEGACY tier path
+  // (un-prefixed key) also admits pre-6b '' rows — a partition scope never does, because those rows
+  // were made against the whole tier corpus and feeding them into a narrower scope's prompt is the
+  // laundering §2.4 step 4 closes. Partition scopes are team-tier by construction (external
+  // principals keep the omit path), so the tier gate below is unchanged by them.
+  const effectiveScopeKey = scopeKey ?? groups.slice().sort().join(",");
   const correctionsRead = teamTier
-    ? await listArcCorrections(db, teamId)
+    ? await listArcCorrections(db, teamId, {
+        groupKey: effectiveScopeKey,
+        includeLegacy: !effectiveScopeKey.startsWith("p:"),
+      })
     : { corrections: [], ok: true };
   const allCorrections = [
     ...new Set([...correctionTexts, ...correctionsRead.corrections.map((c) => c.corrected_text)]),
@@ -961,8 +974,23 @@ const refreshing = new Set<string>();
  *  `_` separator makes the `${slug}_` prefix test exact — team slugs are `[a-z0-9-]` (no `_`), so
  *  "acme" never matches "acme-corp_team" or "acmex_team". Pure + unit-tested. */
 export function arcKeyBelongsToTeam(key: string, teamSlug: string): boolean {
+  // PCCC6B-1 partition-scope keys carry the slug explicitly (`p:<slug>:<groups>`): project-group
+  // segments (`g_<teamhex>_p_<projhex>`) contain no slug, so the tier prefix test below can never
+  // see them — without the namespace, eviction would silently skip every partition-scope entry.
+  if (key.startsWith("p:")) return key.slice(2).startsWith(`${teamSlug}:`);
   const prefix = `${teamSlug}_`;
   return key.split(",").some((g) => g.startsWith(prefix));
+}
+
+/**
+ * The cache/scope key for an ENFORCED principal's partition-scoped arcs (PCCC6B-1). Its own
+ * namespace, deliberately: a built-ins-only oracle scope contains exactly the tier group pair, and
+ * an un-namespaced key would share the tier path's cache row — same bytes, DIFFERENT corrections
+ * rule (the tier row admits legacy '' corrections; a partition scope must not), so the shared row
+ * would poison across that boundary depending on who computed it first.
+ */
+export function partitionArcScopeKey(teamSlug: string, groups: readonly string[]): string {
+  return `p:${teamSlug}:${groups.slice().sort().join(",")}`;
 }
 
 export function evictArcMemoryCache(teamSlug: string): void {
@@ -1119,7 +1147,7 @@ function refreshArcsInBackground(
       // Not route-bound → give the reasoning model the full window (BG_ARC_TIMEOUT_MS). `prior` lets the
       // fact-set-hash guard skip the LLM when nothing changed. Run the extra evidence-COHERENCE pass HERE
       // (background only — the route-bound cold-miss/correction paths can't afford the second LLM call).
-      const { arcs, factsHash, degraded, continuity } = await synthesizeArcs(bg, teamId, groups, [], keys, BG_ARC_TIMEOUT_MS, prior, true);
+      const { arcs, factsHash, degraded, continuity } = await synthesizeArcs(bg, teamId, groups, [], keys, BG_ARC_TIMEOUT_MS, prior, true, key);
       const committed = await commitArcs(bg, teamId, key, arcs, factsHash, { degraded }); // fire-and-forget: nobody awaits its freshness
       // Record how much of the previous set survived. "Arcs feel unstable" was unmeasurable — `arc_cache`
       // keeps only the CURRENT set, so there was no way to say whether carry-over was 30% or 90%, and
@@ -1189,11 +1217,14 @@ export async function getArcs(
   teamSlug: string,
   tier: AccessTier,
   groups: string[],
-  keys: ProviderKeys
+  keys: ProviderKeys,
+  /** PCCC6B-1: an enforced principal's partition-scoped read passes its `partitionArcScopeKey` —
+   *  the cache row AND the corrections scope both key on it. Absent = the tier path, unchanged. */
+  opts?: { scopeKey?: string }
 ): Promise<CachedArcs> {
   // No visible groups is not a degraded read — it's a correct empty answer, computed now.
   if (groups.length === 0) return { arcs: [], freshness: computedNow() };
-  const key = groups.slice().sort().join(",");
+  const key = opts?.scopeKey ?? groups.slice().sort().join(",");
   const now = Date.now();
 
   // 1. In-memory (fastest, same process). `at` is the PERSISTED computed_at (set below), not the time
@@ -1235,7 +1266,7 @@ export async function getArcs(
   }
 
   // 3. Cold miss — first-ever load for this key. Compute inline so the user gets a real answer.
-  const { arcs, factsHash, degraded } = await synthesizeArcs(db, teamId, groups, [], keys);
+  const { arcs, factsHash, degraded } = await synthesizeArcs(db, teamId, groups, [], keys, INLINE_ARC_TIMEOUT_MS, null, false, key);
   const committed = await commitArcs(db, teamId, key, arcs, factsHash, { degraded });
   // `computedAt` comes from commitArcs, NOT from `Date.now()`: on a degraded synthesis it hands back the
   // healthy PRIOR (H11), which is hours old, and stamping that "now" is the M6 lie one branch deep.
@@ -1271,10 +1302,12 @@ export async function recomputeArcs(
   corrections: ArcCorrection[],
   keys: ProviderKeys,
   /** Who made the edit — stored for attribution. Null only if the caller genuinely has no member. */
-  memberId: string | null = null
+  memberId: string | null = null,
+  /** PCCC6B-1: the enforced partition scope this recompute runs in (see getArcs). */
+  opts?: { scopeKey?: string }
 ): Promise<CachedArcs> {
   if (groups.length === 0) return { arcs: [], freshness: computedNow() };
-  const key = groups.slice().sort().join(",");
+  const key = opts?.scopeKey ?? groups.slice().sort().join(",");
 
   // PERSIST FIRST, and let a failure surface. Everything else on this path degrades quietly because a
   // cache can be recomputed; a person's edit cannot. If this throws the route answers with an error and
@@ -1288,10 +1321,12 @@ export async function recomputeArcs(
       arc_id: c.arc_id,
       arc_title: c.arc_title ?? "",
       corrected_text: c.corrected_text,
-    }))
+    })),
+    // The scope the corrector was LOOKING AT — the only scope this correction may ever feed.
+    key
   );
 
-  const { arcs: synthesized, factsHash, degraded } = await synthesizeArcs(db, teamId, groups, corrections.map((c) => c.corrected_text), keys);
+  const { arcs: synthesized, factsHash, degraded } = await synthesizeArcs(db, teamId, groups, corrections.map((c) => c.corrected_text), keys, INLINE_ARC_TIMEOUT_MS, null, false, key);
   const committed = await commitArcs(db, teamId, key, synthesized, factsHash, { degraded });
   const arcs = committed.arcs;
   // Same rule as getArcs: a recompute whose synthesis was degraded is REFUSED and the prior is kept
@@ -1308,12 +1343,23 @@ export async function recomputeArcs(
   // Project the corrections into the graph so they also read as facts to future extraction. This is now
   // a DERIVED copy — Postgres above is the record — so it stays best-effort: losing it costs some graph
   // context, not the correction itself.
+  // PCCC6B-1: the write-back FOLLOWS THE SCOPE. Tier scope keeps today's `<slug>_team` target
+  // (safe — external-tier readers never search the team group). A SINGLE-group partition scope
+  // writes to that group. A MULTI-group partition scope writes NOTHING: the correction's prose
+  // derives from the whole scope union, so any single target narrower than its derivation scope
+  // re-creates the laundering §2.4 step 4 closes — the Postgres row above still feeds every
+  // same-scope synthesis via the prompt, so the correction itself is never lost.
+  const writebackTarget = key.startsWith("p:")
+    ? groups.length === 1
+      ? groups[0]
+      : null
+    : episodeGroupId(teamSlug, "team");
   const client = new GraphitiClient();
-  if (client.configured && corrections.length) {
+  if (client.configured && corrections.length && writebackTarget) {
     const now = new Date().toISOString();
     try {
       await client.addEpisodes(
-        episodeGroupId(teamSlug, "team"),
+        writebackTarget,
         corrections.map((c) => ({
           content: c.corrected_text,
           timestamp: now,

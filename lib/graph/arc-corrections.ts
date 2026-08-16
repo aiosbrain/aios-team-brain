@@ -39,7 +39,10 @@ export async function recordArcCorrections(
   db: DbClient,
   teamId: string,
   memberId: string | null,
-  corrections: readonly ArcCorrectionInput[]
+  corrections: readonly ArcCorrectionInput[],
+  /** PCCC6B-1: the SYNTHESIS SCOPE this correction was made in (the arc-cache group_key of the
+   *  arcs the corrector was looking at). A correction only ever feeds same-scope synthesis. */
+  groupKey: string
 ): Promise<void> {
   if (corrections.length === 0) return;
   // Last write wins within a batch. Postgres refuses an ON CONFLICT that would touch the same row twice
@@ -53,6 +56,7 @@ export async function recordArcCorrections(
       arc_id: c.arc_id,
       arc_title: c.arc_title,
       corrected_text: c.corrected_text,
+      group_key: groupKey,
       created_by: memberId,
       updated_at: now,
     })),
@@ -79,6 +83,11 @@ export async function recordArcCorrections(
 export async function listArcCorrections(
   db: DbClient,
   teamId: string,
+  /** PCCC6B-1 scope rule: EXACT group_key match only — a correction never feeds a different scope.
+   *  `includeLegacy` additionally admits pre-6b `''` rows; ONLY the tier path may set it (legacy
+   *  rows are tier-scope by construction — the recompute route has always refused external
+   *  principals — and a partition scope accepting them would be the laundering this closes). */
+  scope: { groupKey: string; includeLegacy: boolean },
   limit = CORRECTION_PROMPT_LIMIT
 ): Promise<{ corrections: StoredArcCorrection[]; ok: boolean }> {
   try {
@@ -86,6 +95,7 @@ export async function listArcCorrections(
       .from("arc_corrections")
       .select("arc_id, arc_title, corrected_text, created_by, updated_at")
       .eq("team_id", teamId)
+      .in("group_key", scope.includeLegacy ? [scope.groupKey, ""] : [scope.groupKey])
       .order("updated_at", { ascending: false })
       // A whole batch is written with ONE `now`, so `updated_at` alone leaves equal-timestamp rows in
       // whatever order the plan returns. That flips the prompt's order between refreshes, which flips

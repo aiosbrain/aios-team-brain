@@ -144,6 +144,9 @@ export async function memberVisibility(db: DbClient, principal: Principal): Prom
  */
 export interface TimelineEnforcement {
   visibleItemIds: ReadonlySet<string>;
+  /** The oracle's project set the item set was resolved FROM (PCCC6B-1: the arcs routes resolve
+   *  the principal's graph partition scope from this — same source of truth, one substrate read). */
+  visibleProjectIds: ReadonlySet<string>;
 }
 
 export async function resolveTimelineEnforcement(
@@ -158,7 +161,7 @@ export async function resolveTimelineEnforcement(
   // The caller (cold-miss build → 500; background rebuild → caught, no write) fails closed WITHOUT
   // caching. A genuinely-empty membership set (no error) still builds + caches a real empty ledger.
   if (error) throw new Error("access substrate read failed while resolving timeline enforcement");
-  return { visibleItemIds: ids };
+  return { visibleItemIds: ids, visibleProjectIds: vis.visibleProjectIds };
 }
 
 /**

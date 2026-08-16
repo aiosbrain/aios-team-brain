@@ -2441,7 +2441,7 @@ create table if not exists graph_project_arming (
 -- not a source of truth. Sole writer: lib/graph/arc-cache (via lib/graph/arcs).
 create table if not exists arc_cache (
   team_id uuid not null references teams(id) on delete cascade,
-  group_key text not null,                       -- sorted visible-group set, e.g. 'acme_external,acme_team'
+  group_key text not null,                       -- the SYNTHESIS SCOPE key: sorted visible-group set ('acme_external,acme_team'), or PCCC6B-1's partition namespace ('p:<slug>:<sorted groups>') for an enforced principal's scoped arcs
   arcs jsonb not null default '[]'::jsonb,        -- NarrativeArc[] (already human-attributed)
   -- Hash of the exact LLM synthesis input (the attributed fact prompt). The background refresh SKIPS the
   -- (non-deterministic) LLM re-synthesis when this is unchanged — so arcs only change when the underlying
@@ -2469,12 +2469,22 @@ create table if not exists arc_corrections (
   arc_id text not null,                        -- sha(title) today, and it CHURNS every recompute (M7)
   arc_title text not null default '',          -- …so the title is kept to stay diagnosable past that churn
   corrected_text text not null check (corrected_text <> ''),
+  -- PCCC6B-1: the SYNTHESIS SCOPE this correction was made in (sorted group-set key — the same
+  -- scheme as arc_cache.group_key). Synthesis loads corrections by EXACT scope match, so a
+  -- correction never feeds a different scope. '' = legacy pre-6b row (tier-scope by construction;
+  -- accepted only by the tier-path synthesis, never a partition scope).
+  group_key text not null default '',
   created_by uuid references members(id) on delete set null,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   unique (team_id, arc_id)                     -- latest take per arc wins
 );
 create index if not exists arc_corrections_team_idx on arc_corrections (team_id, updated_at desc);
+-- Replay order (the #495 class, guard: schema-index-column-replay): a live DB that predates the
+-- group_key migration loads THIS file first — the create-table above no-ops, so the column must be
+-- altered-in here BEFORE the index below references it.
+alter table arc_corrections add column if not exists group_key text not null default '';
+create index if not exists arc_corrections_team_scope_idx on arc_corrections (team_id, group_key, updated_at desc);
 
 -- ── work-timeline cache (the persisted, queryable work-timeline context layer) ──
 -- The day → person → work ledger (from `items` + `tasks`) assembled by lib/dashboard/work-timeline,
