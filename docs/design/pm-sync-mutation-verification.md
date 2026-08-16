@@ -1,8 +1,9 @@
 # A PM mutation is not done until the provider says it is — PMSUCCESS-1
 
-**Status:** spec, draft 2. Draft 1 was BLOCKED by two independent cold reads; **its honesty section
-was overstated in the direction that mattered** (§0c) and it missed the defect's worst consequence
-(§0d). · **Date:** 2026-08-16 · **Owner:** Chetan · **Task:** `PMSUCCESS-1`
+**Status:** spec, draft 3. Drafts 1 and 2 were each BLOCKED by two independent cold reads. Draft 1's
+honesty section was overstated in the direction that mattered (§0c) and missed the latch (§0d); **draft
+2's own fix for the latch then got the blast radius wrong — a refused STATUS write is reverted in the
+brain (§0e) — and its replacement guard did not guard what it claimed (§1b).** · **Date:** 2026-08-16 · **Owner:** Chetan · **Task:** `PMSUCCESS-1`
 **Reported as:** `AIO-895` / `GH-542` (see §0c — this slice does **not** claim to have found that
 incident's cause).
 **Code:** `lib/pm-sync/linear-client.ts`, `lib/pm-sync/linear.ts`, `lib/pm-sync/inbound.ts`,
@@ -97,10 +98,30 @@ just was not changed). On every subsequent run, `project.ts:282` then finds a tr
 matching fingerprint and returns `skipped`. **The row is never retried, and Linear stays permanently
 wrong under `0 errors`.**
 
-Sites 2 and 5 self-heal — `statusOnly` re-reads live state and does not take the short-circuit. Site 3
-does not. That asymmetry is why the fix's important property is not "it throws" but **"it does not write
-the fingerprint"**: throwing routes to `persistError`, which leaves the fingerprint stale, so the row is
-retried next push. Nothing currently pins that, so §2 pins it.
+The fix's important property is therefore not "it throws" but **"it does not write the fingerprint"**:
+throwing routes to `persistError`, which leaves the fingerprint stale, so the row is retried next push.
+Nothing currently pins that, so §2 pins it.
+
+Draft 2 said "sites 2 and 5 self-heal". **Site 2 does not** — see §0e, which is worse than this.
+
+### 0e. And a refused STATUS write is silently REVERTED in the brain
+
+Site 2 (`statusOnly`) returns a full result whether or not the mutation took (`linear.ts:291-299`),
+carrying `syncedStatus: state.name` — the **desired** state — and a real `providerResourceId`. So
+`persistSuccess` writes `last_projected_status` = the state Linear was never moved to, plus a
+`projection_fingerprint` computed with `parentResourceId = null` (`project.ts:277`). For a parentless
+task that equals the full-path fingerprint, so the outbound path latches exactly like site 3.
+
+Then inbound runs. `brainUnchanged` (`inbound.ts:198-203`) is true when
+`last_projected_brain_status === task.status` **and** `projection_fingerprint === currentFingerprint` —
+both hold after the refusal. Linear's real state still differs from what the brain recorded projecting,
+so inbound sees divergence over an "unchanged" brain row and **applies Linear's OLD state back onto the
+brain task.**
+
+**A task moved to done in the brain, whose Linear write was refused, is silently moved back.** That is
+the worst outcome in this slice: not a stale report, a reverted edit. The same fix cures it — a throw
+means neither `last_projected_status` nor `projection_fingerprint` is ever written — but only if the
+tests pin the statusOnly path too, which §2 now does.
 
 ## 1. The decision
 
@@ -110,11 +131,13 @@ retried next push. Nothing currently pins that, so §2 pins it.
 the provider says the write happened:
 
 - the named payload key is present in `data`;
-- **`payload.success === true` is REQUIRED by default.** Draft 1 said "absent is tolerated", and both
-  reviewers showed that re-opens the exact failure being fixed: site 1 does not currently request
-  `success`, so a call site that forgets to ask would be checked for nothing. Absence is now legal only
-  through an explicit `successNotReturned: true` at the call site — the forgetting has to be *written
-  down*;
+- **`payload.success === true` is REQUIRED, with no escape hatch.** Draft 1 said "absent is tolerated",
+  which re-opens the exact failure being fixed. Draft 2 added a `successNotReturned: true` opt-out;
+  review then showed it is **dead weight** — every one of the six sites requests `success` today
+  (`linear.ts:286,324,337,374`, `inbound.ts:494`, and site 1 gains it here), and `lib/provisioning`
+  already reads it. Nothing needs the hatch, and an unused escape hatch is just a hole waiting for
+  someone to reach for it to make a test green. A future success-less mutation edits this function and
+  brings its own test;
 - the named entity is non-null **and carries an `id`**. The entity key is REQUIRED, not optional: all six
   Linear mutations return one, so an `expect` naming none would be a check that checks nothing.
 
@@ -125,22 +148,38 @@ existing per-row catch at `project.ts:301`, which records it in `task_pm_links.l
 **`success: false` becomes an error, not a silent success.** The whole point is that
 `N synced · 0 errors` must mean N writes happened.
 
-### 1b. A build-failing guard, because the default must not be "forget"
+### 1b. The guard is a RUNTIME term in the transport, because both static designs were breakable
 
-Draft 1 proposed parsing `lib/pm-sync/*.ts` for mutation documents. **Both reviewers broke it with the
-same class of evasion**, and one of them exists in the repo already: a hoisted const passed as a
-variable (`lib/provisioning/linear.ts:20`), a document moved to `lib/pm-sync/graphql/create-issue.ts`
-and imported, string concatenation, or a mutation issued from outside the glob entirely.
+Draft 1 parsed `lib/pm-sync/*.ts` for mutation documents. **Both reviewers broke it** with a hoisted
+const passed as a variable — a shape `lib/provisioning/linear.ts:20` already uses — plus relocation to a
+subdirectory, string concatenation, and files outside the glob.
 
-So the guard does not parse for documents. It is an **import allowlist on `linearGraphql` itself**, the
-shape this repo already uses for the LLM single-caller rule (`test/guards/llm-single-caller.test.ts`):
-`linearGraphql` may be imported only by `linear-client.ts` internals and by named read-only callers.
-Every write path must go through `linearMutation`. That closes const-hoisting, concatenation, relocation
-and out-of-glob files in one move, because it stops asking *what the string looks like* and starts asking
-*who is allowed to call the raw transport*.
+Draft 2 replaced it with an **import allowlist** on `linearGraphql`, modelled on
+`test/guards/llm-single-caller.test.ts`. **Both reviewers broke that too, and the counter-example is
+fatal:** that guard skips allowlisted files wholesale (`if (ALLOWLIST.has(rel)) continue;`), and
+`lib/pm-sync/linear.ts` **must** be allowlisted — it holds five read-only queries — while also being the
+file that holds all five projection mutations and the natural home of a sixth. So adding
+`linearGraphql(…, "mutation Archive…")` inside it introduces **no new import**, reddens nothing, and
+passes all eleven acceptance criteria. An import allowlist pins where the transport is imported; it says
+nothing about what is sent through it.
 
-The guard pins the **call**, not the spelling: it is mutation-tested by adding a bypassing import and
-confirming the guard — not some other test — reddens.
+**So the primary term is not static at all.** `linearGraphql` refuses any document whose operation is a
+`mutation` unless it was invoked through `linearMutation`, which sets a module-private flag the transport
+reads. That check sees the **post-concatenation string actually being sent**, so const-hoisting,
+concatenation, re-export, namespace import, `await import()` and `require` all fail at once — none of
+them can change what the document says.
+
+The import allowlist is **kept as a second layer with a distinct property**: it bounds who may reach the
+raw transport at all, which the runtime term does not. Two layers, two different properties — and each is
+mutation-tested separately, because a sibling layer that catches the same outcome is how a mutation
+survives while looking caught.
+
+**The provisioning exemption, stated rather than laundered.** `lib/provisioning/linear.ts:53` issues
+`organizationInviteCreate` through the raw transport and reads `success` correctly today. Routing it
+through `linearMutation` means requesting `organizationInvite { id }` — a real behaviour change, which
+contradicts draft 2's §3 claim that it "needs no behaviour change". This slice **migrates it**, because
+an exemption in the one guard that defines "every write is checked" is the hole the guard exists to
+close; the entity request is additive and the site already checks the flag it would keep checking.
 
 ### 1c. A create that yields no resource id is an error
 
@@ -178,28 +217,40 @@ that a previously-silent provider refusal now surfaces as a per-row error.
 
 ## 2. Acceptance criteria
 
-- `test/pm-sync-mutation-verification.test.ts` — each of the four projection call sites is driven through its ADAPTER ENTRY POINT with a fake `fetch` (`upsertWorkItem` create, `upsertWorkItem` update, `upsertWorkItem({statusOnly})`, `moveToDone`), and a `{ success: false, issue: null }` payload makes each one throw `PmSyncError` rather than return a report.
-- `test/pm-sync-mutation-verification.test.ts` — `issueLabelCreate` (`linear.ts:195`) has its own refusal test driven through `upsertWorkItem` with a label-bearing task, so the site that does not currently request `success` cannot be the one nobody covers.
-- `test/pm-sync-mutation-verification.test.ts` — a refused UPDATE writes `last_error` and does NOT write `projection_fingerprint`, so the row is retried on the next run; a test that asserts only the throw would leave the permanent latch of §0d unpinned.
-- `test/pm-sync-mutation-verification.test.ts` — a `success: true` payload whose `issue` is null, and one whose `issue` lacks an `id`, BOTH throw — the entity check is not satisfied by the success flag alone.
-- `test/pm-sync-mutation-verification.test.ts` — a payload that omits `success` THROWS unless the call site passes `successNotReturned: true`, and a test pins that at least one call site does not pass it; tolerating absence silently is the draft-1 hole.
+**Unit tier** (`vitest.config.ts`) — the refusal logic and the guards, against a fake `fetch`:
+
+- `test/pm-sync-mutation-verification.test.ts` — each projection call site driven through its ADAPTER ENTRY POINT (`upsertWorkItem` create, `upsertWorkItem` update, `upsertWorkItem({statusOnly})`, `moveToDone`) throws `PmSyncError` on a `{ success: false, issue: null }` payload rather than returning a report.
+- `test/pm-sync-mutation-verification.test.ts` — `issueLabelCreate` (`linear.ts:195`) has its own refusal test driven through `upsertWorkItem` with a label-bearing task, so the one site that does not currently request `success` is not the site nobody covers.
+- `test/pm-sync-mutation-verification.test.ts` — a `success: true` payload whose entity is null, and one whose entity lacks an `id`, BOTH throw; and a payload omitting `success` throws — there is no opt-out to assert around.
 - `test/pm-sync-mutation-verification.test.ts` — the create path never returns a report with an empty `providerResourceId`, and neither `boot.issuesById`, `boot.issuesByExt` nor `opts.resolved` is written on the refusal path.
-- `test/pm-sync-mutation-verification.test.ts` — `adoptInbound`'s footer write is covered AT THE CHOKE POINT, not at the entry point: `inbound.ts:498-501` deliberately converts any throw into a `skipped` note (best-effort, self-healing), so an entry-point assertion would be false. The by-design catch is left alone and named in a comment.
-- `test/guards/pm-sync-linear-transport.test.ts` — `linearGraphql` is importable only by an ALLOWLIST; every PM write path must route through `linearMutation`. The guard is mutation-verified: adding a bypassing import reddens THIS guard and not some other test.
-- `test/guards/pm-sync-linear-transport.test.ts` — the allowlist is asserted non-empty and every entry is asserted to exist, so a rename cannot silently empty the guard's population.
-- `lib/pm-sync/linear.ts` — `issueLabelCreate` requests `success` like the other five, so no call site relies on the `successNotReturned` escape hatch.
-- `docs/design/pm-sync-mutation-verification.md` — §0c's unconfirmed attribution is repeated in the PR body, so the merge does not read as "AIO-895 fixed".
+- `test/pm-sync-mutation-verification.test.ts` — `adoptInbound`'s footer write is covered AT THE CHOKE POINT, because `inbound.ts:498-501` converts any throw into a `skipped` note by design; that catch is left alone and the reason is written at the site.
+- `test/guards/pm-sync-linear-transport.test.ts` — a `mutation` document sent through `linearGraphql` outside `linearMutation` is REFUSED AT RUNTIME; the test constructs the document by concatenation so the guard cannot be satisfied by a source-text parser.
+- `test/guards/pm-sync-linear-transport.test.ts` — the import allowlist is a SECOND layer with its own property (who may reach the raw transport); it is asserted non-empty and every allowlisted path must resolve, so a rename cannot silently empty it. The two layers are mutation-tested SEPARATELY, and each mutation must redden its own layer's test rather than being caught by the sibling.
+- `test/guards/pm-sync-linear-transport.test.ts` — the mutation-test that matters: adding a new mutation INSIDE an already-allowlisted file (`lib/pm-sync/linear.ts`) reddens the runtime guard. Draft 2's import allowlist passed this case, which is why it was replaced.
+- `lib/pm-sync/linear.ts` — `issueLabelCreate` requests `success` and its entity, so no site depends on tolerated absence.
+- `lib/provisioning/linear.ts` — `organizationInviteCreate` is migrated to `linearMutation` (requesting `organizationInvite { id }`), so the guard has no exemption to launder.
+
+**Data-mechanics tier** (`vitest.datamechanics.config.ts`, real Postgres) — the STORED-STATE outcomes, which a unit-tier payload assertion can green while the real short-circuit still skips:
+
+- `test/datamechanics/pm-sync-refusal.datamechanics.test.ts` — a refused UPDATE writes `last_error` and leaves `projection_fingerprint` UNCHANGED, and a SECOND projection run then retries the row instead of returning `skipped` — the two-run property that proves §0d's latch is broken.
+- `test/datamechanics/pm-sync-refusal.datamechanics.test.ts` — a refused `statusOnly` write leaves BOTH `projection_fingerprint` and `last_projected_status` unwritten, and a subsequent inbound apply does NOT revert the brain task's status — §0e's reversion, pinned end to end.
 
 ## 3. Scope
 
-**In:** the choke point, the six call sites, the guard, the create-without-id refusal, the success-path
-resource id record.
+**In:** the choke point, the six call sites, the runtime mutation term plus the import allowlist, the
+create-without-id refusal, and the `lib/provisioning/linear.ts` migration. (Draft 2 still listed "the
+success-path resource id record" here after §1d was cut — a deliverable that does not exist, which a
+builder would have hunted for.)
 
 **Deferred, each with its reason:**
 
 - **Closing `AIO-895` / `GH-542`.** Not proven caused by this, and §0c's prod evidence is against it.
-  Those tickets stay open with this slice's findings attached; closing them on a fix that does not
-  explain their evidence is exactly how a board stops meaning anything.
+  §0c is explicit that the incident is **unexplained in both directions** — draft 2's bullet still
+  carried the retracted "the prod evidence is against it", the stronger phrase §0c itself withdrew, in
+  the very section that decides whether AIO-895 closes. What the evidence supports is narrower: the
+  no-link-rows observation argues against THIS mechanism for THAT incident. Those tickets stay open with
+  this slice's findings attached; closing them on a fix that does not explain their evidence is exactly
+  how a board stops meaning anything.
 - **The duplicate-issue symptom in the same report** (`TT39`–`TT42` creating `AIO-878`–`AIO-881`
   instead of adopting existing issues). That is the adoption/footer-matching path, a different mechanism
   in the same file, and it deserves its own measurement rather than being folded in on a hunch.
