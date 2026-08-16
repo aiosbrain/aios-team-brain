@@ -7,7 +7,8 @@ import { isRestrictedTier } from "@/lib/auth/visibility";
 import { errorResponse } from "@/lib/api/schemas";
 import { resolveAnsweringKeys } from "@/lib/query/answering";
 import { visibleGroupIds } from "@/lib/graph/group";
-import { getArcs } from "@/lib/graph/arcs";
+import { getArcs, partitionArcScopeKey } from "@/lib/graph/arcs";
+import { selectEnforcedGraphPartitions } from "@/lib/graph/partition-read";
 import { memberEnforcement } from "@/lib/access/enforce";
 import { filterArcsByVisibleItems } from "@/lib/graph/arc-visibility";
 import { getLlmHealth } from "@/lib/query/llm-health";
@@ -54,19 +55,50 @@ export async function POST(req: NextRequest) {
   const memberId = (me as { id: string }).id;
   const admin = adminClient();
   const keys = await resolveAnsweringKeys(admin, team.id);
-  const { arcs: allArcs, freshness } = await getArcs(admin, team.id, teamSlug, tier, visibleGroupIds(teamSlug, tier), keys);
 
-  // Access enforcement (Phase B slice 5, spec §5.8/§5.8b): on an 'enforcing' team, drop any arc that
-  // cites an item this member can't see — an arc is a synthesized narrative over its evidence, so it's
-  // all-or-nothing (`filterArcsByVisibleItems`). Permissive → null → byte-identical. A read-time filter
-  // over the tier `arc_cache` (no per-principal re-synthesis; per-project arcs are Phase C). The
-  // enforcement resolution fails CLOSED: a substrate error throws → 500, never the unfiltered set.
-  let enforce: { visibleItemIds: ReadonlySet<string> } | null;
+  // Access enforcement — resolved BEFORE the read, because the read's SCOPE now depends on it
+  // (PCCC6B-1). On an enforcing team, a TEAM-TIER member's arcs no longer come from the shared tier
+  // `arc_cache` row at all: their synthesis runs over their ready-and-unsuppressed partition scope
+  // (`selectEnforcedGraphPartitions` — arm-on-read, uncapped; the fact pool bounds input), cached
+  // under `partitionArcScopeKey`. That is what actually closes the PCCB-5 synthesized-prose
+  // residual AND the corrections-laundering hole (a tier row synthesized with ALL team corrections
+  // used to serve every enforced member). External-tier members keep the tier path + omit
+  // semantics; permissive teams are byte-identical. The enforcement resolution fails CLOSED: a
+  // substrate error throws → 500, never the unfiltered set.
+  let enforce: import("@/lib/access/enforce").TimelineEnforcement | null;
+  let scopeGroups: string[] | null = null;
   try {
     enforce = await memberEnforcement(admin, { teamId: team.id, memberId });
+    if (enforce != null && tier === "team") {
+      // UNCAPPED deliberately (Fable 6b Medium 3 — the default K=8 made the design's "the fact
+      // pool bounds input" rationale false): arcs need the member's WHOLE ready scope, both for
+      // coverage (no undisclosed 8-partition truncation — arcs has no covered/total surface) and
+      // for key stability (a recency-churned pick set would mint new scope keys, cold-synthesizing
+      // and 403ing the correction gate on every churn).
+      const scope = await selectEnforcedGraphPartitions(admin, {
+        teamId: team.id,
+        visibleProjectIds: [...enforce.visibleProjectIds],
+        k: Number.MAX_SAFE_INTEGER,
+      });
+      scopeGroups = scope.groups;
+    }
   } catch {
     return errorResponse("internal", "enforcement check failed", 500);
   }
+
+  const groups = scopeGroups ?? visibleGroupIds(teamSlug, tier);
+  const { arcs: allArcs, freshness } = await getArcs(
+    admin,
+    team.id,
+    teamSlug,
+    tier,
+    groups,
+    keys,
+    scopeGroups ? { scopeKey: partitionArcScopeKey(teamSlug, scopeGroups) } : undefined
+  );
+
+  // The PCCB-5 evidence filter stays as defense-in-depth: a partition scope's facts are
+  // principal-visible by construction, but an item restricted BETWEEN synthesis and read is not.
   const arcs = filterArcsByVisibleItems(allArcs, enforce?.visibleItemIds ?? null);
 
   // Empty arcs are ambiguous — tell the client the ACTUAL cause so the panel stops showing a benign

@@ -32,14 +32,18 @@ export interface StoredArcCorrection extends ArcCorrectionInput {
 export const CORRECTION_PROMPT_LIMIT = 20;
 
 /**
- * Upsert corrections for a team. Latest take per arc wins (`unique (team_id, arc_id)`) — two corrections
- * on the same arc would otherwise argue with each other inside one prompt.
+ * Upsert corrections for a team. Latest take per arc PER SCOPE wins (`arc_corrections_scope_arc_key`) —
+ * two corrections on the same arc in one scope would otherwise argue inside one prompt, while the
+ * same arc corrected in two DIFFERENT scopes is two independent editorial acts (Fable 6b High 2).
  */
 export async function recordArcCorrections(
   db: DbClient,
   teamId: string,
   memberId: string | null,
-  corrections: readonly ArcCorrectionInput[]
+  corrections: readonly ArcCorrectionInput[],
+  /** PCCC6B-1: the SYNTHESIS SCOPE this correction was made in (the arc-cache group_key of the
+   *  arcs the corrector was looking at). A correction only ever feeds same-scope synthesis. */
+  groupKey: string
 ): Promise<void> {
   if (corrections.length === 0) return;
   // Last write wins within a batch. Postgres refuses an ON CONFLICT that would touch the same row twice
@@ -53,10 +57,15 @@ export async function recordArcCorrections(
       arc_id: c.arc_id,
       arc_title: c.arc_title,
       corrected_text: c.corrected_text,
+      group_key: groupKey,
       created_by: memberId,
       updated_at: now,
     })),
-    { onConflict: "team_id,arc_id" }
+    // Per-SCOPE identity (Fable 6b High 2): `arc_id` is sha(title) and near-identical scopes
+    // synthesize identical titles, so a team-global conflict target let member B's correction
+    // silently MOVE member A's row into B's scope — A's next exact-match read lost it and A's
+    // arcs reverted (H13, cross-member). One take per arc PER SCOPE.
+    { onConflict: "team_id,group_key,arc_id" }
   );
   if (error) throw new Error(`recordArcCorrections failed: ${error.message}`);
 }
@@ -79,6 +88,11 @@ export async function recordArcCorrections(
 export async function listArcCorrections(
   db: DbClient,
   teamId: string,
+  /** PCCC6B-1 scope rule: EXACT group_key match only — a correction never feeds a different scope.
+   *  `includeLegacy` additionally admits pre-6b `''` rows; ONLY the tier path may set it (legacy
+   *  rows are tier-scope by construction — the recompute route has always refused external
+   *  principals — and a partition scope accepting them would be the laundering this closes). */
+  scope: { groupKey: string; includeLegacy: boolean },
   limit = CORRECTION_PROMPT_LIMIT
 ): Promise<{ corrections: StoredArcCorrection[]; ok: boolean }> {
   try {
@@ -86,6 +100,7 @@ export async function listArcCorrections(
       .from("arc_corrections")
       .select("arc_id, arc_title, corrected_text, created_by, updated_at")
       .eq("team_id", teamId)
+      .in("group_key", scope.includeLegacy ? [scope.groupKey, ""] : [scope.groupKey])
       .order("updated_at", { ascending: false })
       // A whole batch is written with ONE `now`, so `updated_at` alone leaves equal-timestamp rows in
       // whatever order the plan returns. That flips the prompt's order between refreshes, which flips
@@ -94,7 +109,21 @@ export async function listArcCorrections(
       .order("arc_id", { ascending: true })
       .limit(limit);
     if (error) throw new Error(error.message);
-    const corrections = ((data ?? []) as Record<string, unknown>[]).map((r) => ({
+    // NEWEST take per arc across the ADMITTED scope set (second-pass 6b Medium): the tier read
+    // admits [tierKey, ''] — a pre-6b legacy row and its post-6b re-correction are DIFFERENT rows
+    // under the per-scope arbiter, and without this both takes argue inside one prompt forever
+    // (the exact state the unique exists to prevent, reintroduced across the migration boundary).
+    // Rows arrive updated_at DESC, so first-seen per arc_id is the newest. A superseded twin
+    // briefly costs one of the LIMIT slots — bounded, and it ages out of the window.
+    const newestPerArc: Record<string, unknown>[] = [];
+    const seenArcs = new Set<string>();
+    for (const r of (data ?? []) as Record<string, unknown>[]) {
+      const arcId = String(r.arc_id ?? "");
+      if (seenArcs.has(arcId)) continue;
+      seenArcs.add(arcId);
+      newestPerArc.push(r);
+    }
+    const corrections = newestPerArc.map((r) => ({
       arc_id: String(r.arc_id ?? ""),
       arc_title: String(r.arc_title ?? ""),
       corrected_text: String(r.corrected_text ?? ""),

@@ -34,6 +34,38 @@ const REQUIRED: { file: string; needle: string; why: string }[] = [
     needle: "graph expansion covered",
     why: "the covered/total disclosure (the spec's own-scope §5.7 exception) must reach the context",
   },
+  // PCCC6B-1 — the arcs cutover call sites. Deleting any of these leaves every module-level test
+  // green while an enforced member silently falls back to the tier cache (the laundering path).
+  {
+    file: join("app", "api", "brain", "arcs", "route.ts"),
+    needle: "selectEnforcedGraphPartitions(admin, {",
+    why: "an enforced team member's arcs must resolve their partition scope, not read the tier cache",
+  },
+  {
+    file: join("app", "api", "brain", "arcs", "route.ts"),
+    needle: "scopeKey: partitionArcScopeKey(teamSlug, scopeGroups)",
+    why: "the scoped read must CACHE under the partition namespace — an un-namespaced key collides with the tier row",
+  },
+  {
+    file: join("app", "api", "brain", "arcs", "recompute", "route.ts"),
+    needle: "selectEnforcedGraphPartitions(admin, {",
+    why: "an enforced member's recompute must run in their own scope, or the correction records against the tier row",
+  },
+  {
+    file: join("app", "api", "brain", "arcs", "recompute", "route.ts"),
+    needle: "readArcCache(admin, team.id, scopeKey)",
+    why: "the write gate must consult the member's OWN scope row — the arcs they were actually shown",
+  },
+  {
+    file: join("app", "api", "brain", "arcs", "route.ts"),
+    needle: "k: Number.MAX_SAFE_INTEGER",
+    why: "the arcs scope is UNCAPPED — a K-capped scope truncates coverage undisclosed and churns the cache key (Fable 6b Medium 3)",
+  },
+  {
+    file: join("app", "api", "brain", "arcs", "recompute", "route.ts"),
+    needle: "k: Number.MAX_SAFE_INTEGER",
+    why: "the recompute must resolve the SAME uncapped scope as the GET, or the write gate reads a row the member never saw",
+  },
 ];
 
 describe("PCCC-6 cutover call sites", () => {

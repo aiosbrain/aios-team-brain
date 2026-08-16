@@ -238,7 +238,12 @@ describe("H13: a stored correction reaches synthesis even with the graph wiped",
     const prompt = JSON.stringify(llmMock.completeTextOrNull.mock.calls[0]);
     expect(prompt).toContain("Dana led this, not Alex.");
     // …and read for THIS team. The mock answers any argument, so without this a wrong teamId would pass.
-    expect(correctionsMock.listArcCorrections).toHaveBeenCalledWith(expect.anything(), "team-1");
+    expect(correctionsMock.listArcCorrections).toHaveBeenCalledWith(
+      expect.anything(),
+      "team-1",
+      // PCCC6B-1: the ordinary tier synthesis asks for its own scope (legacy rows admitted).
+      expect.objectContaining({ includeLegacy: true })
+    );
   });
 });
 
