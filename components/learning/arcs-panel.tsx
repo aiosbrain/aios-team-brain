@@ -13,6 +13,8 @@ interface ArcEvidence {
 }
 
 interface Arc {
+  /** PPARC-3: present on a fused (enforced) panel — the partition this arc came from. */
+  sourceGroup?: string;
   id: string;
   title: string;
   confidence: "high" | "medium" | "low";
@@ -86,26 +88,45 @@ export function ArcsPanel({ teamSlug, variant = "full" }: { teamSlug: string; va
   }
 
   async function recompute() {
-    const corrections = Object.entries(edited).map(([arc_id, corrected_text]) => ({
+    const all = Object.entries(edited).map(([arc_id, corrected_text]) => ({
       arc_id,
       corrected_text,
       // `arc_id` is a hash of the title and churns on every recompute, so the server stores the title
       // beside it to keep the correction diagnosable afterwards. Sending it is what makes that work —
       // without it every stored row has an empty title and the column is decoration.
       arc_title: arcs.find((a) => a.id === arc_id)?.title ?? "",
+      // PPARC-3: a fused panel's arcs carry their partition; the server accepts ONE partition per
+      // POST (undefined = the permissive tier path, whose panel has no sourceGroup).
+      sourceGroup: arcs.find((a) => a.id === arc_id)?.sourceGroup,
     }));
-    if (!corrections.length) return;
+    if (!all.length) return;
     setRecomputing(true);
     setSaveError(null);
     try {
-      const res = await fetch("/api/brain/arcs/recompute", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ team: teamSlug, corrections }),
-      });
-      if (res.ok) {
-        const data = (await res.json()) as { arcs?: Arc[] };
-        setArcs(data.arcs ?? []);
+      // Group by partition — one POST each (the server 422s a cross-partition batch by design).
+      const byGroup = new Map<string | undefined, typeof all>();
+      for (const c of all) {
+        const arr = byGroup.get(c.sourceGroup) ?? [];
+        arr.push(c);
+        byGroup.set(c.sourceGroup, arr);
+      }
+      let lastData: { arcs?: Arc[] } | null = null;
+      let anyFailed = false;
+      for (const [group, batch] of byGroup) {
+        const res = await fetch("/api/brain/arcs/recompute", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            team: teamSlug,
+            ...(group ? { sourceGroup: group } : {}),
+            corrections: batch.map(({ arc_id, corrected_text, arc_title }) => ({ arc_id, corrected_text, arc_title })),
+          }),
+        });
+        if (res.ok) lastData = (await res.json()) as { arcs?: Arc[] };
+        else anyFailed = true;
+      }
+      if (!anyFailed && lastData) {
+        setArcs(lastData.arcs ?? []);
         setEdited({});
       } else {
         // Say so. A failed save used to stop the spinner and leave the old arcs, which reads exactly

@@ -51,6 +51,10 @@ export async function loadSchema({
     connectionString: databaseUrl,
     ssl: useSsl ? { rejectUnauthorized: false } : undefined,
   });
+  // Surface RAISE NOTICE output in the deploy log (PPARC-3): node-pg DISCARDS notices without a
+  // listener, which made a migration's "reported count" claim false on the only rollout path —
+  // the stranded-corrections report is a documented decision input, not decoration.
+  client.on?.("notice", (n) => console.log(`[pg notice] ${n.message}`));
   await client.connect();
   try {
     // Bound how long any DDL below will WAIT for a table lock (not how long it runs once acquired —
