@@ -78,8 +78,9 @@ describe("the warming budget through the LIVE path (PPARC-4: warmPartitionArcs r
     expect((await ensureAccessBootstrap(db(), seed.teamId)).ok).toBe(true);
     const groups = ["cold-a", "cold-b", "cold-c", "cold-d", "cold-e"];
     const panel = await getFusedArcs(db(), seed.teamId, seed.teamSlug, groups, KEYS);
-    expect(panel.warmScheduled).toBeLessThanOrEqual(3); // the budget holds
-    expect(panel.warmScheduled).toBeGreaterThanOrEqual(1); // and the R exists
+    // EXACT (review Low 1: a band would pass a budget shrink or partial scheduling failure):
+    // 5 missing − 1 inline target = 4 candidates, budget 3 → exactly 3 scheduled.
+    expect(panel.warmScheduled).toBe(3);
 
     const fresh = await seedTeam();
     expect((await ensureAccessBootstrap(db(), fresh.teamId)).ok).toBe(true);

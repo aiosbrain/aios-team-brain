@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { reconcileProjectedEpisodes } from "@/lib/graph/reconcile";
 import { projectItemsToGraph } from "@/lib/graph/project";
-import { writeArcCache, readArcCache, purgeScopedArcCache, sweepStaleScopedArcCache } from "@/lib/graph/arc-cache";
+import { writeArcCache, readArcCache, sweepStaleScopedArcCache } from "@/lib/graph/arc-cache";
 import { episodeGroupId } from "@/lib/graph/group";
 import { runSql } from "@/lib/db/pg/pool";
 import { db, ingest, seedTeam } from "./helpers";
@@ -40,19 +40,6 @@ describe("PCCC-7 — restriction-driven purge of scoped arc rows", () => {
     expect(await readArcCache(db(), seed.teamId, `g:${teamGroup}`)).toBeNull(); // purged
     expect(await readArcCache(db(), seed.teamId, teamGroup)).not.toBeNull(); // tier row untouched
   });
-
-  it("purgeScopedArcCache deletes ONLY the p: namespace, and only this team's", async () => {
-    const a = await seedTeam();
-    const b = await seedTeam();
-    await writeArcCache(db(), a.teamId, `p:${a.teamId}:g1`, ARC as never, "h");
-    await writeArcCache(db(), a.teamId, "acme_team", ARC as never, "h");
-    await writeArcCache(db(), b.teamId, `p:${b.teamId}:g1`, ARC as never, "h");
-
-    await purgeScopedArcCache(db(), a.teamId);
-    expect(await readArcCache(db(), a.teamId, `p:${a.teamId}:g1`)).toBeNull();
-    expect(await readArcCache(db(), a.teamId, "acme_team")).not.toBeNull();
-    expect(await readArcCache(db(), b.teamId, `p:${b.teamId}:g1`)).not.toBeNull();
-  });
 });
 
 describe("PCCC-7 — the projector's OWN self-clear door (Fable High)", () => {
@@ -84,7 +71,7 @@ describe("PCCC-7 — the projector's OWN self-clear door (Fable High)", () => {
 });
 
 describe("PCCC-7 — the purge trigger is clear-imminent, not flag-exists", () => {
-  it("a FRESH self flag (inside the cleanup grace) does not purge the team's p: rows", async () => {
+  it("a FRESH self flag (inside the cleanup grace) does not purge the partition's g: row", async () => {
     const seed = await seedTeam();
     expect((await ensureAccessBootstrap(db(), seed.teamId)).ok).toBe(true);
     const teamGroup = episodeGroupId(seed.teamSlug, "team");
@@ -102,7 +89,7 @@ describe("PCCC-7 — the purge trigger is clear-imminent, not flag-exists", () =
 });
 
 describe("PCCC-7 — the purge waits for a VERIFIED-CLEAN clear (Codex High 2)", () => {
-  it("while Graphiti still holds the item's episodes, the p: rows survive — a cold miss must not rebuild from the dirty graph", async () => {
+  it("while Graphiti still holds the item's episodes, the partition's g: row survives — a cold miss must not rebuild from the dirty graph", async () => {
     const seed = await seedTeam();
     expect((await ensureAccessBootstrap(db(), seed.teamId)).ok).toBe(true);
     const teamGroup = episodeGroupId(seed.teamSlug, "team");
@@ -159,16 +146,22 @@ describe("PCCC-7 — the slug→teamId re-key migration (Codex High 1)", () => {
 });
 
 describe("PCCC-7 — the orphaned-scope-key sweep", () => {
-  it("sweeps p: rows past the age floor; fresh p: rows, tier rows, and CORRECTIONS are never touched", async () => {
+  it("sweeps p: rows past the age floor; fresh p: rows, tier rows, OTHER TEAMS' rows, and CORRECTIONS are never touched", async () => {
     const seed = await seedTeam();
+    const other = await seedTeam();
     await writeArcCache(db(), seed.teamId, `p:${seed.teamId}:old`, ARC as never, "h");
     await writeArcCache(db(), seed.teamId, `p:${seed.teamId}:fresh`, ARC as never, "h");
     await writeArcCache(db(), seed.teamId, "acme_team", ARC as never, "h");
-    // Age the old scoped row and the tier row past the floor.
+    // Another team's equally-aged straggler — team A's sweep has no business with it. Re-homed
+    // from the retired purgeScopedArcCache test (PPARC-4): the team-scoping property outlives
+    // the function that first carried it; the sweep is now the only p: deleter.
+    await writeArcCache(db(), other.teamId, `p:${other.teamId}:old`, ARC as never, "h");
+    // Age the old scoped rows (both teams') and the tier row past the floor.
     await runSql("update arc_cache set computed_at = now() - interval '8 days' where team_id = $1 and group_key = any($2)", [
       seed.teamId,
       [`p:${seed.teamId}:old`, "acme_team"],
     ]);
+    await runSql("update arc_cache set computed_at = now() - interval '8 days' where team_id = $1", [other.teamId]);
     // A correction is HUMAN data — the sweep must never touch the corrections store (ruled in the
     // design: cache rows are regenerable, a person's edit is not).
     const { error } = await db()
@@ -181,6 +174,7 @@ describe("PCCC-7 — the orphaned-scope-key sweep", () => {
     expect(await readArcCache(db(), seed.teamId, `p:${seed.teamId}:old`)).toBeNull(); // swept
     expect(await readArcCache(db(), seed.teamId, `p:${seed.teamId}:fresh`)).not.toBeNull();
     expect(await readArcCache(db(), seed.teamId, "acme_team")).not.toBeNull(); // tier rows are not the sweep's business
+    expect(await readArcCache(db(), other.teamId, `p:${other.teamId}:old`)).not.toBeNull(); // another team's straggler survives
     const kept = await runSql<{ n: number }>("select count(*)::int as n from arc_corrections where team_id = $1", [seed.teamId]);
     expect(kept.rows[0].n).toBe(1);
   });

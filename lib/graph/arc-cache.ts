@@ -137,32 +137,11 @@ export async function purgeArcCacheKey(db: DbClient, teamId: string, groupKey: s
 }
 
 /**
- * HARD-DELETE every `p:`-namespace (partition-scoped, PCCC6B-1) row for a team. PCCC-7, closing
- * the post-merge Codex High 1: a scoped row synthesized BEFORE a restriction move keeps
- * restricted-derived SUMMARY prose (invisible to the evidence filter, `arc-visibility.ts:19-25`),
- * and once the partition's purge confirms it returns to the reader's scope key — so the stale row
- * is served again, for up to TTL, by SWR. Stale-marking is NOT enough (stale rows still serve);
- * only a miss forces re-synthesis from the post-move graph. Scoped rows are regenerable and
- * per-reader-scope, so over-purging costs one re-synthesis per active reader, never correctness.
- * Best-effort like every cache write — but the CALLER (reconcile) runs it BEFORE clearing any
- * self-purge flag, so a failed purge leaves the partition suppressed rather than leaking.
- */
-export async function purgeScopedArcCache(db: DbClient, teamId: string): Promise<{ ok: boolean }> {
-  try {
-    const { error } = await db.from("arc_cache").delete().eq("team_id", teamId).like("group_key", "p:%");
-    return { ok: !error };
-  } catch {
-    return { ok: false };
-  }
-}
-
-/**
- * HARD-DELETE one PARTITION's `g:` row (PPARC-2, design §2.1/§3 last row). The partition-native
- * twin of `purgeScopedArcCache`, deliberately NARROWER: a `g:` row's prose derives only from its
- * own partition, so a self-purge in group X kills exactly `g:X` — other partitions' rows survive a
- * neighbor's restriction (the team-wide `p:` purge stays beside this until PPARC-4 retires it).
- * Best-effort with an honest ok — the callers (both gated self-clear doors) treat ok:false as
- * clear-blocking, same as the `p:` gate.
+ * HARD-DELETE one PARTITION's `g:` row (PPARC-2, design §2.1/§3 last row). Deliberately NARROW:
+ * a `g:` row's prose derives only from its own partition, so a self-purge in group X kills exactly
+ * `g:X` — other partitions' rows survive a neighbor's restriction (PPARC-4 retired the team-wide
+ * `p:` purge; the straggler sweep owns pre-cutover residue). Best-effort with an honest ok — the
+ * callers (both gated self-clear doors) treat ok:false as clear-blocking.
  */
 export async function purgePartitionArcCache(db: DbClient, teamId: string, groupId: string): Promise<{ ok: boolean }> {
   try {
@@ -205,7 +184,13 @@ export async function sweepStaleScopedArcCache(db: DbClient, teamId: string): Pr
  * orphan by construction (built-ins' pointers ARE the tier ids, so tier-shaped groups are
  * covered). Regenerable data; best-effort.
  */
-export async function sweepOrphanedPartitionArcCache(db: DbClient, teamId: string): Promise<void> {
+// NOTE (review PPARC-4 Low): no age grace and no purge-generation bump here — an in-flight
+// refresh for a just-deleted initiative can recommit its row after this sweep, and per-process
+// memory entries live to TTL. Both are unreachable-by-readers (reads are pointer-resolved), so
+// the residual is storage-only and self-heals next pass. Accepted, named.
+export async function sweepOrphanedPartitionArcCache(teamId: string): Promise<void> {
+  // runSql, not the query builder: the correlated NOT EXISTS is not expressible there. Taking no
+  // db param is deliberate (review Medium 2) — a passed client was silently bypassed anyway.
   try {
     const { runSql } = await import("@/lib/db/pg/pool");
     await runSql(

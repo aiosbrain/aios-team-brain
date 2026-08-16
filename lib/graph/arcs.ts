@@ -1254,8 +1254,8 @@ function refreshArcsInBackground(
           ok: !committed.untrustworthy,
           created: continuity.nextCount,
           meta: {
-            // `group_key` is the SYNTHESIS SCOPE — the tier set for tier rows, a `p:` key for an
-            // enforced member's scoped refresh (each scope is its own continuity series).
+            // `group_key` is the SYNTHESIS SCOPE — the tier set for tier rows, a `g:` key for a
+            // partition refresh (each scope is its own continuity series).
             // and the external one is smaller. Without this the two are indistinguishable and the
             // eyeballed trend silently mixes them.
             group_key: key,
@@ -1318,13 +1318,6 @@ export function schedulePartitionRefresh(
   return true;
 }
 
-/**
- * Schedule background synthesis of PARTITION-NATIVE (`g:`) rows for up to `budget` of the given
- * groups whose rows are missing or stale (PPARC-2 §5 warming ruling). Rides the existing SWR
- * machinery — single-flighted per key by `refreshing`, full BG timeout, per-partition corrections
- * scope — so a union read warms the partition rows the PPARC-3 cutover will serve. Fire-and-forget.
- */
-
 export async function getArcs(
   db: DbClient,
   teamId: string,
@@ -1332,8 +1325,8 @@ export async function getArcs(
   tier: AccessTier,
   groups: string[],
   keys: ProviderKeys,
-  /** PCCC6B-1: an enforced principal's partition-scoped read passes its `partitionArcScopeKey` —
-   *  the cache row AND the corrections scope both key on it. Absent = the tier path, unchanged. */
+  /** A partition-native read passes its `g:<group>` scope key (PPARC-3 fusion's single-partition
+   *  synthesis) — the cache row AND the corrections scope both key on it. Absent = the tier path. */
   opts?: { scopeKey?: string }
 ): Promise<CachedArcs> {
   // No visible groups is not a degraded read — it's a correct empty answer, computed now.

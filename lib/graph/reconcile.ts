@@ -390,7 +390,7 @@ export async function reconcileProjectedEpisodes(
   await sweepStaleScopedArcCache(db, teamId);
   // PPARC-4 orphan sweep: a DELETED initiative's g: row is unreachable post-cutover (reads are
   // pointer-resolved) but nothing else ever removes it — bounded by partition count.
-  await sweepOrphanedPartitionArcCache(db, teamId);
+  await sweepOrphanedPartitionArcCache(teamId);
   for (const [oldGroup, groupRows] of pendingByGroup) {
     // List the old group once (deep — a large group must not hide the item's episodes past the default
     // window). Graphiti unreachable → leave the flags set and retry next tick.

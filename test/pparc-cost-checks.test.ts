@@ -6,8 +6,10 @@ import type { DbClient } from "@/lib/db/types";
  * PPARC-2 — the PRE-REGISTERED two-sided cost checks (design §2.4, folded per Fable Medium 5:
  * "the check records the measured crossover rather than pretending the model dominates
  * everywhere"). The LLM seam is mocked, so a synthesis call count is exact, not sampled. The union
- * model's counts are arithmetic (one call per distinct `p:` scope key — the 6b/7 machinery, pinned
- * elsewhere); the partition-native counts are MEASURED through the real warm path.
+ * model's counts are arithmetic (one call per distinct retired-`p:` scope key); the partition
+ * counts are measured through schedulePartitionRefresh with a TEST-LOCAL freshness shadow — the
+ * LIVE freshness-skip and budget ceiling are dm-pinned in pparc-partition-arcs (review Medium 3:
+ * this file is the arithmetic illustration; the load-bearing halves live there).
  *
  * REGISTERED EXPECTATIONS (both directions, honest):
  *  (a) MANY DISTINCT SCOPES over FEWER partitions — partition-native WINS: 4 readers with 4
