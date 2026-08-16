@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import type { DbClient } from "@/lib/db/types";
 
@@ -73,7 +74,9 @@ const KEYS = { anthropic: "test-key", openai: null, openrouter: null } as unknow
   typeof import("@/lib/graph/arcs").getArcs
 >[5];
 
-const slug = () => `acme${Math.floor(Math.random() * 1e9)}`;
+// randomUUID, not Math.random — same uniqueness job, and Codacy's weak-RNG security rule fires on
+// Math.random even in a test fixture (observed on this PR; the neighboring older file predates the rule).
+const slug = () => `acme${randomUUID().slice(0, 8)}`;
 
 const FACT = {
   id: "f1",
