@@ -39,7 +39,7 @@ Two consequences for the battery, neither fatal, both to be closed at build time
    **after** the push, not assume it from the seed.
 2. **Initiative fan-out is new and would inflate every count.** PCCC-5 added fan-out pushes with a
    per-pass budget of 25 (`FANOUT_PUSH_MAX_PER_PASS`, `project.ts:222`). A fanned-out item is pushed
-   to more than one group, which would break the pinned 108-episodes-per-rep denominator *and* inflate
+   to more than one group, which would break the pinned per-rep episode denominator *and* inflate
    cost in both arms. The battery must pin **`GRAPH_FANOUT_PUSH_MAX_PER_PASS=0`** and assert zero
    fan-out rows, rather than relying on a corpus that happens to have no initiatives.
 
@@ -240,6 +240,18 @@ arithmetic.
 **Decision: 8 reps per arm. Envelope $16.00**, re-approved by the owner on 2026-08-11 after being
 told the figure had doubled. C1 needs no extra reps — cost metrics measured solid at n=2 — but the
 arms run together, so the reps are shared.
+
+**Corpus drawn 2026-08-16: 31 items → 117 episodes** (budget 90–120: in range; single-chunk share
+17.1% against prod's ~17%). Earlier text assumed 108. **No band depends on that number** — Q5's gate
+is "any rise", not a per-episode fraction, so the PIPEFF-2 trap (a retry ceiling silently changing
+meaning when the corpus grew from ~100 to 153) does not reproduce here. Only the money moves, by
+117/108 ≈ 1.08.
+
+**Budget guard, because a projection is not a measurement.** Rep 1 of each arm runs first; its
+*measured* cost is multiplied out to all 16 reps and checked against the $16 envelope **before reps
+2–8 start**. If it projects over, the run stops and the owner decides. The commitment made when the
+envelope was approved was to stop and ask rather than quietly overrun, and a corpus 8% larger than
+assumed is exactly how "inside the envelope" becomes "over" one rep at a time.
 
 **Bands are derived from the pooled within-arm spread observed in THIS battery**, with the historical
 7% as a sanity floor. The 7% was measured on the incumbent only; the candidate's noise is unknown, and
