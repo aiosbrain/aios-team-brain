@@ -75,6 +75,12 @@ export async function ownsConversation(
   return Boolean((data as { id: string } | null)?.id);
 }
 
+/**
+ * Insert one message and RETURN ITS ID. The id is what `chat_turn_runs.final_message_id` points at
+ * (QBGSTREAM-1): the assistant message is written first, then the run flips to `done` carrying this
+ * id, so a reader always prefers the completed answer over the run's partial text. Callers that don't
+ * need the id can keep ignoring the return value.
+ */
 export async function appendMessage(
   db: DbClient,
   owner: Owner,
@@ -82,19 +88,24 @@ export async function appendMessage(
   role: "user" | "assistant",
   content: string,
   usage: MessageUsage = {}
-): Promise<void> {
-  const { error } = await db.from("chat_messages").insert({
-    conversation_id: conversationId,
-    team_id: owner.teamId,
-    member_id: owner.memberId,
-    role,
-    content,
-    cited_item_ids: usage.cited_item_ids ?? [],
-    input_tokens: usage.input_tokens ?? 0,
-    output_tokens: usage.output_tokens ?? 0,
-    cost_usd: usage.cost_usd ?? 0,
-  });
+): Promise<string | null> {
+  const { data, error } = await db
+    .from("chat_messages")
+    .insert({
+      conversation_id: conversationId,
+      team_id: owner.teamId,
+      member_id: owner.memberId,
+      role,
+      content,
+      cited_item_ids: usage.cited_item_ids ?? [],
+      input_tokens: usage.input_tokens ?? 0,
+      output_tokens: usage.output_tokens ?? 0,
+      cost_usd: usage.cost_usd ?? 0,
+    })
+    .select("id")
+    .single();
   if (error) throw new Error(`appendMessage: ${error.message}`);
+  const insertedId = (data as { id: string } | null)?.id ?? null;
   // Bump the conversation so the list sorts most-recent-first.
   await db
     .from("conversations")
@@ -102,6 +113,7 @@ export async function appendMessage(
     .eq("id", conversationId)
     .eq("team_id", owner.teamId)
     .eq("member_id", owner.memberId);
+  return insertedId;
 }
 
 /** The member's conversations, newest-active first, excluding archived. */

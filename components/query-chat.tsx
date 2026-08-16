@@ -44,6 +44,47 @@ export function messagesToExchanges(messages: { role: string; content: string }[
   return out;
 }
 
+/**
+ * Poll a thread's in-flight run until it settles, feeding the partial answer to `onPartial`.
+ * Returns the terminal state so the caller can render the finished answer or the failure.
+ * Exported for testing; `signal` lets a remount cancel an in-flight poll loop.
+ */
+export async function pollRun(
+  teamSlug: string,
+  conversationId: string,
+  onPartial: (text: string) => void,
+  opts: { signal?: AbortSignal; intervalMs?: number; sleep?: (ms: number) => Promise<void> } = {}
+): Promise<{ status: "done" | "error"; error: string | null; everStreaming: boolean } | null> {
+  const intervalMs = opts.intervalMs ?? 1200;
+  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  // Whether a turn was ACTUALLY in flight while we watched. Opening a settled thread must not be
+  // treated as a reattach — otherwise every thread click would trigger a pointless re-render/refetch.
+  let everStreaming = false;
+  for (;;) {
+    if (opts.signal?.aborted) return null;
+    let body: { run?: { status?: string; partial?: string; error?: string | null } | null };
+    try {
+      const res = await fetch(
+        `/api/dashboard/conversations/${conversationId}/run?team=${encodeURIComponent(teamSlug)}`,
+        { signal: opts.signal }
+      );
+      if (!res.ok) return null;
+      body = await res.json();
+    } catch {
+      return null; // aborted or offline — the caller keeps whatever it has
+    }
+    const run = body.run;
+    if (!run) return null;
+    if (run.status === "streaming") {
+      everStreaming = true;
+      if (run.partial) onPartial(run.partial);
+      await sleep(intervalMs);
+      continue;
+    }
+    return { status: run.status === "error" ? "error" : "done", error: run.error ?? null, everStreaming };
+  }
+}
+
 export function QueryChat({
   teamSlug,
   initialQuestion,
@@ -110,6 +151,54 @@ export function QueryChat({
       window.localStorage.setItem(persistKey, conversationId);
     }
   }, [persistKey, conversationId]);
+
+  // REATTACH (QBGSTREAM-1): if this thread has a turn still running server-side — because the user
+  // navigated away mid-answer and came back — resume showing it instead of a question with no answer.
+  // The generation itself never stopped; only this component's view of it did.
+  useEffect(() => {
+    const convo = initialConversationId;
+    if (!convo) return;
+    const ctl = new AbortController();
+    (async () => {
+      // The reattached turn is the trailing exchange that has NO answer yet — a rehydrated thread
+      // renders it as `done` with an empty answer (there is no assistant message to pair with), which
+      // is why "unanswered" and not `status === "streaming"` is the condition here.
+      const patchUnanswered = (patch: Partial<Exchange>) =>
+        setExchanges((xs) => {
+          if (!xs.length) return xs;
+          const last = xs.length - 1;
+          if (xs[last].answer && xs[last].status !== "streaming") return xs;
+          return xs.map((x, i) => (i === last ? { ...x, ...patch } : x));
+        });
+      const result = await pollRun(
+        teamSlug,
+        convo,
+        (partial) => patchUnanswered({ answer: partial, status: "streaming" }),
+        { signal: ctl.signal }
+      );
+      if (!result || ctl.signal.aborted) return;
+      // Nothing was in flight — this is an ordinary thread open, already seeded with its messages.
+      if (!result.everStreaming) return;
+      if (result.status === "error") {
+        patchUnanswered({ status: "error", error: result.error ?? "The answer failed." });
+        return;
+      }
+      // Finished while we were away — pull the durable answer from the thread.
+      try {
+        const res = await fetch(
+          `/api/dashboard/conversations/${convo}?team=${encodeURIComponent(teamSlug)}`,
+          { signal: ctl.signal }
+        );
+        if (!res.ok) return;
+        const body = (await res.json()) as { messages?: { role: string; content: string }[] };
+        const ex = messagesToExchanges(body.messages ?? []);
+        if (ex.length) setExchanges(ex);
+      } catch {
+        // offline / aborted — keep what we have
+      }
+    })();
+    return () => ctl.abort();
+  }, [initialConversationId, teamSlug]);
 
   // Esc collapses the expanded (near-fullscreen) chat.
   useEffect(() => {
