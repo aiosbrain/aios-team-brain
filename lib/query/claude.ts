@@ -2,7 +2,7 @@ import "server-only";
 import Anthropic from "@anthropic-ai/sdk";
 import type { RetrievedContext } from "./retrieve";
 import { selectLlmBackend, type LlmBackend, type LlmBackendKeys } from "./llm-backend";
-import { StreamHttpError, withStreamRetry, type StreamRetryOptions } from "./stream-retry";
+import { StreamHttpError, withStreamRetry, classifyErrorFrame, type StreamRetryOptions } from "./stream-retry";
 
 /**
  * Thin adapter around the Claude API so a future agent backend (e.g. Hermes)
@@ -496,9 +496,13 @@ export async function* streamOpenAICompatible(
   // mid-stream error after partial output falls through to the empty/partial handling below. A
   // NON-retryable code (e.g. an auth error frame) is thrown with its own status so it surfaces at once.
   if (errorFrame && emittedChars === 0) {
-    const code = typeof errorFrame.code === "number" ? errorFrame.code : 502;
-    const detail = errorFrame.message ?? errorFrame.type ?? "provider error";
-    throw new StreamHttpError(code, `LLM ${backend.model} @ ${backend.baseUrl}: stream error ${code} ${detail}`);
+    // classifyErrorFrame maps a string permanent code (invalid_api_key/insufficient_quota/…) to 401 so
+    // it surfaces instead of being retried and mislabeled "busy"; numeric/transient codes stay retryable.
+    // (Deferred: if this error frame carried a billed `usage.cost`, that spend isn't metered here — the
+    // meter lives in the route's done branch; a failed 200-error generation rarely bills. Tracked for a
+    // follow-up rather than threading db/meter into this transport layer.)
+    const { status, detail } = classifyErrorFrame(errorFrame);
+    throw new StreamHttpError(status, `LLM ${backend.model} @ ${backend.baseUrl}: stream error ${status} ${detail}`);
   }
 
   // Zero visible answer text is a silent blank answer — make it diagnosable. Usual cause: a reasoning

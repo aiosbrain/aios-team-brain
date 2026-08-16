@@ -95,6 +95,38 @@ export function clientErrorMessage(err: unknown): string {
   return "Something went wrong answering your question. Please try again.";
 }
 
+/**
+ * Classify a provider error frame delivered mid-stream on a 200 (`data:{"error":{...}}`) into an
+ * HTTP-style status the retry classifier can read, plus a detail string for the log message.
+ *
+ * WHY THIS EXISTS: OpenAI / OpenRouter deliver PERMANENT failures on this channel with STRING
+ * `code`s/`type`s (`invalid_api_key`, `insufficient_quota`, `authentication_error`) — a numeric-only
+ * read coerces every one of them to a retryable 502, so a broken key / exhausted quota gets retried
+ * and then reported as "the model was busy, try again". Rules: a numeric (or numeric-string) code is
+ * kept as its status; a known-permanent string → 401 (non-retryable, surfaces at once); anything else
+ * → 502 (retryable) preserving the transient default. Also tolerates a non-object frame (a bare
+ * string/true) without throwing.
+ */
+export function classifyErrorFrame(frame: unknown): { status: number; detail: string } {
+  const ef = (frame && typeof frame === "object" ? frame : {}) as { code?: unknown; message?: unknown; type?: unknown };
+  const type = typeof ef.type === "string" ? ef.type : "";
+  const message = typeof ef.message === "string" ? ef.message : "";
+  const codeStr = typeof ef.code === "string" ? ef.code : "";
+  const bare = typeof frame === "string" ? frame : "";
+  const detail = message || type || codeStr || bare || "provider error";
+  const numeric =
+    typeof ef.code === "number"
+      ? ef.code
+      : codeStr.trim() !== "" && Number.isFinite(Number(codeStr))
+        ? Number(codeStr)
+        : null;
+  if (numeric !== null) return { status: numeric, detail };
+  const permanent = /quota|credits|invalid_api_key|authentication|invalid_request|permission|forbidden|not_found|insufficient/i.test(
+    `${type} ${message} ${codeStr} ${bare}`
+  );
+  return { status: permanent ? 401 : 502, detail };
+}
+
 export interface StreamRetryOptions {
   /** Total attempts including the first. Default DEFAULT_STREAM_ATTEMPTS. */
   maxAttempts?: number;

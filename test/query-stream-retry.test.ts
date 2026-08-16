@@ -5,6 +5,7 @@ import {
   streamRetryDelayMs,
   clientErrorMessage,
   withStreamRetry,
+  classifyErrorFrame,
   RETRYABLE_STATUS,
 } from "@/lib/query/stream-retry";
 import { streamAnswer, streamOpenAICompatible, type StreamAnswerEvent } from "@/lib/query/claude";
@@ -68,6 +69,40 @@ describe("isRetryableStreamError", () => {
     expect(isRetryableStreamError(null)).toBe(false);
     expect(isRetryableStreamError("529")).toBe(false);
     expect(isRetryableStreamError(529)).toBe(false);
+  });
+});
+
+describe("classifyErrorFrame — string codes must not all become retryable 502", () => {
+  it("keeps a numeric or numeric-string code as its status", () => {
+    expect(classifyErrorFrame({ code: 429 }).status).toBe(429);
+    expect(classifyErrorFrame({ code: "429" }).status).toBe(429);
+    expect(classifyErrorFrame({ code: 503 }).status).toBe(503);
+  });
+
+  it("maps a known-permanent STRING code/type to 401 (non-retryable) — the OpenAI/OpenRouter shape", () => {
+    for (const frame of [
+      { code: "invalid_api_key" },
+      { code: "insufficient_quota" },
+      { type: "authentication_error" },
+      { code: "401" },
+      { message: "You have no credits remaining. Add credits to continue." },
+    ]) {
+      const { status } = classifyErrorFrame(frame);
+      expect(status).toBe(401);
+      expect(isRetryableStreamError(new StreamHttpError(status, "x"))).toBe(false);
+    }
+  });
+
+  it("defaults an unknown / transient-worded frame to retryable 502", () => {
+    expect(classifyErrorFrame({ message: "the model is momentarily overloaded" }).status).toBe(502);
+    expect(classifyErrorFrame({}).status).toBe(502);
+    expect(isRetryableStreamError(new StreamHttpError(502, "x"))).toBe(true);
+  });
+
+  it("tolerates a non-object frame (bare string / true) without throwing, keeping its text", () => {
+    expect(classifyErrorFrame("overloaded, retry")).toEqual({ status: 502, detail: "overloaded, retry" });
+    expect(classifyErrorFrame(true).status).toBe(502);
+    expect(classifyErrorFrame(null).status).toBe(502);
   });
 });
 
@@ -224,6 +259,20 @@ describe("streamOpenAICompatible — a 200 stream carrying only an error frame (
     expect(caught).toBeInstanceOf(StreamHttpError);
     expect((caught as StreamHttpError).status).toBe(429);
     expect(isRetryableStreamError(caught)).toBe(true); // → withStreamRetry will retry it
+  });
+
+  it("a permanent STRING-code error frame throws a NON-retryable error (broken key surfaces, not retried)", async () => {
+    const errFrame = `data: ${JSON.stringify({ error: { code: "invalid_api_key", message: "bad key" } })}\n\n`;
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(streamResponse([errFrame, "data: [DONE]\n\n"])));
+    let caught: unknown;
+    try {
+      await drainDeltas(streamOpenAICompatible(OPENAI_BACKEND, "", "", "", "", "", "q", "UTC"));
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(StreamHttpError);
+    expect((caught as StreamHttpError).status).toBe(401);
+    expect(isRetryableStreamError(caught)).toBe(false); // → withStreamRetry will NOT retry it
   });
 
   it("still yields a clean empty done (no throw) when the blank has NO error frame (reasoning starvation)", async () => {
