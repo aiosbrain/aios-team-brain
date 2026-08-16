@@ -221,13 +221,19 @@ RUN F=/app/.venv/lib/python3.12/site-packages/graphiti_core/graphiti.py \
 #      there — below that the measurement costs more than the saving;
 #   3. if neither has happened by 2027-02-16, DELETE this block rather than keep it as decoration.
 # (2) is a judgement on a measured number; (1) and (3) are enforced by
-# `test/guards/graphiti-patch-combined.test.ts`, which asserts this default is off and reddens on the
+# `test/guards/graphiti-patch-combined.test.ts`, which asserts this default is off — ANCHORED to an
+# effective line, because the unanchored version survived its realistic mutation — and reddens on the
 # expiry date. A flag with only prose behind it becomes furniture.
 # PROVED, not asserted: built locally with this default and checksummed inside the image, the served
 # `graphiti_core/graphiti.py` is sha256 49ee534a1043760f9e3b58617f7853edd65e7e643a75f34f75267528cb0ec72d
 # — the exact file PIPEFF-2 measured and ships today. Merging PATCH 4 in this state is a NO-OP for
 # production. Re-check with:
 #   docker build -t g . && docker run --rm g sha256sum /app/.venv/lib/python3.12/site-packages/graphiti_core/graphiti.py
+# ⚠️ THE PATH NO TEST CAN SEE: a Railway SERVICE VARIABLE named PIPEFF5_COMBINED_EXTRACTION reaches
+# this ARG at build time. Setting it to 1 in the dashboard enables the unvalidated patch on the next
+# build with no merge, no reddened guard, and nothing in the repo to notice — only a line in the build
+# log. Same class as the start-command trap documented above, which this file already exists to warn
+# about. The guards below cover the MERGE path; this one is covered by knowing about it. Don't.
 ARG PIPEFF5_COMBINED_EXTRACTION=0
 COPY patch-combined-extraction.py /tmp/patch-combined-extraction.py
 RUN F=/app/.venv/lib/python3.12/site-packages/graphiti_core/graphiti.py \

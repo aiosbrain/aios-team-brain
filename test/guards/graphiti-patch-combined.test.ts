@@ -410,10 +410,17 @@ asyncio.run(main())
 describe("PIPEFF-5 is merged DORMANT — the flag and the expiry, not the prose", () => {
   const dockerfile = readFileSync(join(REPO, "graphiti/Dockerfile"), "utf8");
 
-  it("condition 1: the build arg exists and DEFAULTS OFF", () => {
+  it("condition 1: the build arg exists and DEFAULTS OFF — anchored to an EFFECTIVE line", () => {
     // If this reddens because someone set it to 1, that is the ship decision — it must arrive with a
     // passing battery attached, not as a side effect of another change.
-    expect(dockerfile).toMatch(/ARG PIPEFF5_COMBINED_EXTRACTION=0/);
+    //
+    // ANCHORED (`^…$/m`), and asserting the ABSENCE of the enabled form, because the unanchored
+    // substring version SURVIVED its realistic mutation: flip the ARG to `=1` and leave the old value
+    // in an adjacent comment (`# was: ARG …=0`) — the most natural careless edit, someone recording
+    // what they changed — and all 13 tests passed with the patch live in every default build. The
+    // first mutation I ran only proved the clean-replacement shape. Mutate with the real shape.
+    expect(dockerfile).toMatch(/^ARG PIPEFF5_COMBINED_EXTRACTION=0$/m);
+    expect(dockerfile).not.toMatch(/^ARG PIPEFF5_COMBINED_EXTRACTION=1$/m);
   });
 
   it("condition 1: the default branch ASSERTS the file is unpatched, so off cannot silently be on", () => {
@@ -431,17 +438,22 @@ describe("PIPEFF-5 is merged DORMANT — the flag and the expiry, not the prose"
     expect(patch4Block).toMatch(/fi \\\n \&\& grep -q 'PIPEFF-2: carry only the SAME ITEM'/);
   });
 
-  it("condition 1, PROVED not asserted: the default build reproduces the file prod runs today", () => {
+  it("condition 1: the Dockerfile cites the sha of the file prod runs today (verified by one local build)", () => {
     // Built locally with the flag at its default and checksummed inside the image:
     //   default-off  ->  49ee534a1043760f9e3b58617f7853edd65e7e643a75f34f75267528cb0ec72d
     // which is the sha `docs/design/graph-episode-window-phase-c.md:186` records as the exact file
     // PIPEFF-2 measured and shipped. So merging this PR is a provable NO-OP for production: the
     // graphiti image rebuilds and serves a byte-identical `graphiti.py`.
     //
-    // Pinned here as the string the Dockerfile must keep citing, so a future edit to PATCH 3 or the
-    // base image cannot quietly change what "off" ships while this suite still passes. The build
-    // itself is not run in CI (it needs Docker and several minutes); this is the anchor that makes
-    // the claim re-checkable by hand with one command, which is stated in the Dockerfile.
+    // WHAT THIS PINS, precisely — an earlier version of this comment overclaimed and the review
+    // caught it. It pins THE STRING the Dockerfile cites, so the sha cannot be edited or dropped
+    // without reddening. It does NOT protect the claim from its inputs: nothing here pins the base
+    // image digest, so a `FROM` bump would change what "off" ships and leave this citation
+    // stale-false with the suite green. PATCH 3's contribution is covered compositionally, by the
+    // script-sha pin in `graphiti-patch-same-item.test.ts`, not by this suite.
+    //
+    // The build is not run in CI (Docker, several minutes). This is an anchor that keeps the claim
+    // re-checkable by hand with the one command the Dockerfile states — not a proof that executes.
     const SHIPPED_TODAY = "49ee534a1043760f9e3b58617f7853edd65e7e643a75f34f75267528cb0ec72d";
     expect(dockerfile).toContain(SHIPPED_TODAY);
   });
@@ -459,7 +471,11 @@ describe("PIPEFF-5 is merged DORMANT — the flag and the expiry, not the prose"
    */
   it("condition 3: the dormant patch expires 2027-02-16 — decide, do not let it become furniture", () => {
     const EXPIRY = Date.UTC(2027, 1, 16);
-    const enabled = /ARG PIPEFF5_COMBINED_EXTRACTION=1/.test(dockerfile);
+    // Anchored for the same reason as the test above, and one worse failure of its own: unanchored,
+    // a COMMENT containing the literal `ARG PIPEFF5_COMBINED_EXTRACTION=1` (a future "to enable,
+    // change to…" doc line) would disarm this bomb while the flag stayed off — undetectably, until
+    // the date passed and nothing happened.
+    const enabled = /^ARG PIPEFF5_COMBINED_EXTRACTION=1$/m.test(dockerfile);
     if (Date.now() < EXPIRY || enabled) return;
     throw new Error(
       [
