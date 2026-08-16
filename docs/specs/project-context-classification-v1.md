@@ -687,7 +687,12 @@ Everyone may see**, not "everything":
    General — which is exactly what §12's restricted-principal eval axis exists to keep honest.
 
 Cross-project synthesis is never computed (the permission-laundering answer); each partition's
-synthesis reads only its own content.
+synthesis reads only its own content. **Sanctioned exception (PCCC6B-1, ruled post-merge after the
+second-model review pressed the letter of this rule):** a PRINCIPAL-scoped synthesis over exactly
+the reader's own visible, ready partitions — cache-keyed by that exact scope so it is only ever
+served to a principal holding that same scope — is permitted: its input set is the reader's own oracle, so the laundering this
+rule exists to prevent cannot occur. True per-partition arcs (one synthesis per project, fused at
+read time) remain the deferred product form.
 
 ## 7. FalkorDB vs Neo4j — recommendation
 

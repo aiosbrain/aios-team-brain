@@ -154,7 +154,7 @@ describe("PCCC6B-1 — the enforced arcs read cutover (real Postgres)", () => {
       teamId: seed.teamId,
       visibleProjectIds: [...enforce!.visibleProjectIds],
     });
-    const scopeKey = partitionArcScopeKey(seed.teamSlug, scope.groups);
+    const scopeKey = partitionArcScopeKey(seed.teamId, scope.groups);
     // The scoped key is its OWN cache namespace — even a built-ins-only scope (this member's) whose
     // groups equal the tier pair must not share the tier row.
     expect(scopeKey).not.toBe(visibleGroupIds(seed.teamSlug, "team").slice().sort().join(","));

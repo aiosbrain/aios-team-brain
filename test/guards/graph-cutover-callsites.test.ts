@@ -43,7 +43,7 @@ const REQUIRED: { file: string; needle: string; why: string }[] = [
   },
   {
     file: join("app", "api", "brain", "arcs", "route.ts"),
-    needle: "scopeKey: partitionArcScopeKey(teamSlug, scopeGroups)",
+    needle: "scopeKey: partitionArcScopeKey(team.id, scopeGroups)",
     why: "the scoped read must CACHE under the partition namespace — an un-namespaced key collides with the tier row",
   },
   {

@@ -56,7 +56,9 @@ const FN_DECL_RE =
  * Functions whose JOB is invalidation: they mean "treat this as stale from now on", which is genuinely
  * what a timestamp controls — a different mechanism from "don't trust these bytes".
  */
-const INVALIDATION_FUNCTIONS = new Set(["staleArcCache", "bustTeamTimeline", "purgeTimelineCacheTier"]);
+// `sweepStaleScopedArcCache` (PCCC-7): clock-minus-duration as a DELETION CUTOFF (`computed_at <
+// cutoff`), never a written timestamp — the orphan sweep for partition-scoped rows.
+const INVALIDATION_FUNCTIONS = new Set(["staleArcCache", "bustTeamTimeline", "purgeTimelineCacheTier", "sweepStaleScopedArcCache"]);
 
 const SCAN = [
   join("lib", "graph", "arcs.ts"),

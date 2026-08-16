@@ -10,6 +10,8 @@ import {
   resolvePositiveInt,
 } from "./project";
 import { isExternalGroupId } from "./group";
+import { purgeScopedArcCache, sweepStaleScopedArcCache } from "./arc-cache";
+import { evictScopedArcMemory } from "./arcs";
 
 /**
  * Reconcile pass for the brain→Graphiti seam (audit H3, Option B — chosen over blocking-confirm
@@ -353,12 +355,34 @@ export async function reconcileProjectedEpisodes(
   let cleaned = 0;
   let cleanedExternal = 0;
   const pendingByGroup = new Map<string, EpisodeRow[]>();
+  const pendingByGroup2 = pendingByGroup; // (alias keeps the diff minimal below)
   for (const row of rows) {
     if (!row.pending_delete_group_id) continue;
-    const arr = pendingByGroup.get(row.pending_delete_group_id) ?? [];
+    const arr = pendingByGroup2.get(row.pending_delete_group_id) ?? [];
     arr.push(row);
-    pendingByGroup.set(row.pending_delete_group_id, arr);
+    pendingByGroup2.set(row.pending_delete_group_id, arr);
   }
+  // PCCC-7 (post-merge Codex High 1, placement per Codex PCCC-7 High 2): the team's
+  // partition-scoped arc rows are hard-purged LAZILY, at the first VERIFIED-CLEAN self clear this
+  // pass — never eagerly. Clearing a self flag is what returns a partition to readers' scope keys,
+  // and a `p:` row synthesized pre-restriction/pre-redaction carries prose the evidence filter
+  // cannot see — but purging while Graphiti is still DIRTY is its own poison: the next reader's
+  // cold miss re-synthesizes from the un-cleaned graph and persists that for a whole projection
+  // interval. So the purge waits for the same proof the clear itself waits for (group verified
+  // empty of the item, grace elapsed), memoized once per pass; a FAILED purge holds every self
+  // clear this pass — fail closed, converging next tick. (This also subsumes the clear-imminent
+  // narrowing: no clear, no purge, so a stuck cleanup never deletes readers' active rows.)
+  let scopedArcPurgeState: boolean | null = null;
+  const scopedArcPurgeGate = async (): Promise<boolean> => {
+    if (scopedArcPurgeState === null) {
+      scopedArcPurgeState = (await purgeScopedArcCache(db, teamId)).ok;
+      if (scopedArcPurgeState) evictScopedArcMemory(teamId);
+    }
+    return scopedArcPurgeState;
+  };
+  // PCCC-7 orphan sweep: oracle churn strands `p:` rows forever (every scope change mints a new
+  // key); collect the ones no reader can resolve to anymore. Age-gated well past the TTL (7d).
+  await sweepStaleScopedArcCache(db, teamId);
   for (const [oldGroup, groupRows] of pendingByGroup) {
     // List the old group once (deep — a large group must not hide the item's episodes past the default
     // window). Graphiti unreachable → leave the flags set and retry next tick.
@@ -397,7 +421,17 @@ export async function reconcileProjectedEpisodes(
       // rows written before the column existed.
       const flaggedAt = new Date(row.pending_delete_at ?? row.projected_at).getTime();
       const pastCleanupGrace = flaggedAt <= Date.now() - CLEANUP_GRACE_MS;
-      if (uuids.length === 0 && !deleteFailed && pastCleanupGrace && !saturated) {
+      // A SELF-purge clear un-suppresses its partition — only legal once the scoped arc rows are
+      // confirmed purged. The gate is the LAST conjunct deliberately: it must evaluate only after
+      // the clean checks pass (an earlier draft computed it per-row and re-created the eager purge
+      // on dirty groups). Cross-purge clears never touched suppression and stay free.
+      if (
+        uuids.length === 0 &&
+        !deleteFailed &&
+        pastCleanupGrace &&
+        !saturated &&
+        (oldGroup !== row.group_id || (await scopedArcPurgeGate()))
+      ) {
         if (orphans.has(row.source_id) && oldGroup === row.group_id) {
           // Orphan, cleanup verified: the item is gone and the group it lives in is empty of it, so
           // the ledger row has nothing left to describe. Clearing the flag instead would leave the

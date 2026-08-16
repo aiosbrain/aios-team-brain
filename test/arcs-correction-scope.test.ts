@@ -110,7 +110,7 @@ describe("PCCC6B-1 — synthesis loads corrections for EXACTLY its own scope", (
     const { db } = fakeDb();
     const t = slug();
     const groups = [`${t}_team`, `g_${"a".repeat(32)}_p_${"b".repeat(32)}`];
-    const scopeKey = partitionArcScopeKey(t, groups);
+    const scopeKey = partitionArcScopeKey("team-1", groups);
     await getArcs(db, "team-1", t, "team", groups, KEYS, { scopeKey });
 
     expect(correctionsMock.listArcCorrections).toHaveBeenCalledTimes(1);
@@ -148,7 +148,7 @@ describe("PCCC6B-1 — the graph write-back follows the scope", () => {
     const t = slug();
     const group = `g_${"a".repeat(32)}_p_${"b".repeat(32)}`;
     await recomputeArcs(db, "team-1", t, "team", [group], [CORRECTION], KEYS, null, {
-      scopeKey: partitionArcScopeKey(t, [group]),
+      scopeKey: partitionArcScopeKey("team-1", [group]),
     });
     expect(graphitiMock.addEpisodes).toHaveBeenCalledTimes(1);
     expect(graphitiMock.addEpisodes.mock.calls[0][0]).toBe(group);
@@ -160,7 +160,7 @@ describe("PCCC6B-1 — the graph write-back follows the scope", () => {
     const t = slug();
     const groups = [`${t}_team`, `g_${"a".repeat(32)}_p_${"b".repeat(32)}`];
     await recomputeArcs(db, "team-1", t, "team", groups, [CORRECTION], KEYS, null, {
-      scopeKey: partitionArcScopeKey(t, groups),
+      scopeKey: partitionArcScopeKey("team-1", groups),
     });
     expect(graphitiMock.addEpisodes).not.toHaveBeenCalled();
   });
@@ -180,7 +180,7 @@ describe("PCCC6B-1 — the graph write-back follows the scope", () => {
     const t = slug();
     const group = `${t}_external`;
     await recomputeArcs(db, "team-1", t, "team", [group], [CORRECTION], KEYS, null, {
-      scopeKey: partitionArcScopeKey(t, [group]),
+      scopeKey: partitionArcScopeKey("team-1", [group]),
     });
     expect(graphitiMock.addEpisodes).not.toHaveBeenCalled();
   });
@@ -190,7 +190,7 @@ describe("PCCC6B-1 — the graph write-back follows the scope", () => {
     const { db } = fakeDb();
     const t = slug();
     const groups = [`${t}_external`];
-    const scopeKey = partitionArcScopeKey(t, groups);
+    const scopeKey = partitionArcScopeKey("team-1", groups);
     await getArcs(db, "team-1", t, "team", groups, KEYS, { scopeKey });
     expect(correctionsMock.listArcCorrections).toHaveBeenCalledTimes(1);
     expect(correctionsMock.listArcCorrections.mock.calls[0][2]).toMatchObject({
@@ -204,27 +204,66 @@ describe("PCCC6B-1 — the graph write-back follows the scope", () => {
     const { db } = fakeDb();
     const t = slug();
     const group = `g_${"a".repeat(32)}_p_${"b".repeat(32)}`;
-    const scopeKey = partitionArcScopeKey(t, [group]);
+    const scopeKey = partitionArcScopeKey("team-1", [group]);
     await recomputeArcs(db, "team-1", t, "team", [group], [CORRECTION], KEYS, null, { scopeKey });
     expect(correctionsMock.recordArcCorrections).toHaveBeenCalledTimes(1);
     expect(correctionsMock.recordArcCorrections.mock.calls[0][4]).toBe(scopeKey);
   });
 });
 
+describe("PCCC-7 — the in-memory arc cache is bounded", () => {
+  it("insertion past the bound evicts the oldest entry; scoped eviction removes a team's p: keys", async () => {
+    const { memCacheSet, arcMemoryCacheSize, evictScopedArcMemory } = await import("@/lib/graph/arcs");
+    const entry = { arcs: [], at: Date.now(), factsHash: null, degraded: false };
+    for (let i = 0; i < 600; i++) memCacheSet(`p:bound-team:${i}`, entry);
+    expect(arcMemoryCacheSize()).toBeLessThanOrEqual(512); // the bound holds under churn
+    const before = arcMemoryCacheSize();
+    evictScopedArcMemory("bound-team");
+    expect(arcMemoryCacheSize()).toBeLessThan(before); // id-keyed eviction finds the p: entries
+  });
+});
+
+describe("PCCC-7 — the eviction call sites reach the id-namespaced keys (Fable Medium 1)", () => {
+  it("bustTeamLearningCaches and purgeExternalTierCaches evict a team's p: memory entries", async () => {
+    const { memCacheSet, arcMemoryCacheSize } = await import("@/lib/graph/arcs");
+    const { bustTeamLearningCaches } = await import("@/lib/ingest/reconcile-attribution");
+    const { purgeExternalTierCaches } = await import("@/lib/cache/tier-invalidation");
+    const { db } = fakeDb();
+    const entry = { arcs: [], at: Date.now(), factsHash: null, degraded: false };
+
+    // Observe the CALLER's effect directly — the first version of this test called
+    // evictScopedArcMemory itself "idempotently" and thereby masked its own mutation (caught when
+    // severing the caller's eviction reddened nothing).
+    memCacheSet("p:evict-a:g1", entry);
+    const beforeA = arcMemoryCacheSize();
+    await bustTeamLearningCaches(db, "evict-a", "some-slug");
+    expect(arcMemoryCacheSize()).toBe(beforeA - 1);
+
+    memCacheSet("p:evict-b:g1", entry);
+    const beforeB = arcMemoryCacheSize();
+    await purgeExternalTierCaches(db, "evict-b", "some-slug");
+    expect(arcMemoryCacheSize()).toBe(beforeB - 1);
+  });
+});
+
 describe("PCCC6B-1 — the partition scope key is its own cache namespace", () => {
-  it("partitionArcScopeKey embeds the slug and never collides with a tier key, and eviction still finds it", async () => {
+  it("partitionArcScopeKey namespaces on the IMMUTABLE team id, never collides with a tier key, and eviction finds it by id", async () => {
     const { partitionArcScopeKey, arcKeyBelongsToTeam } = await import("@/lib/graph/arcs");
     const t = slug();
     const tierPair = [`${t}_team`, `${t}_external`];
-    const key = partitionArcScopeKey(t, tierPair);
+    const key = partitionArcScopeKey("team-1", tierPair);
     // A built-ins-only oracle scope must NOT share a cache row with the tier path: same groups,
     // different corrections rule — a shared row would poison across the boundary.
     expect(key).not.toBe(tierPair.slice().sort().join(","));
-    expect(arcKeyBelongsToTeam(key, t)).toBe(true);
-    expect(arcKeyBelongsToTeam(key, `${t}x`)).toBe(false);
+    // PCCC-7: the NAMESPACE segment is the IMMUTABLE team id — group segments may carry the slug
+    // (built-in pointers are frozen under it), but a rename must not change the key's namespace.
+    expect(key.startsWith("p:team-1:")).toBe(true);
+    expect(arcKeyBelongsToTeam(key, t, "team-1")).toBe(true);
+    expect(arcKeyBelongsToTeam(key, t, "team-2")).toBe(false);
+    expect(arcKeyBelongsToTeam(key, t)).toBe(false); // no id supplied -> a p: key is never claimed
     // Project-group segments carry no slug — the p: namespace is what keeps eviction exact.
-    const projKey = partitionArcScopeKey(t, [`g_${"a".repeat(32)}_p_${"b".repeat(32)}`]);
-    expect(arcKeyBelongsToTeam(projKey, t)).toBe(true);
-    expect(arcKeyBelongsToTeam(projKey, "other")).toBe(false);
+    const projKey = partitionArcScopeKey("team-1", [`g_${"a".repeat(32)}_p_${"b".repeat(32)}`]);
+    expect(arcKeyBelongsToTeam(projKey, t, "team-1")).toBe(true);
+    expect(arcKeyBelongsToTeam(projKey, "other", "team-2")).toBe(false);
   });
 });
