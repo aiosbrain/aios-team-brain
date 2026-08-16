@@ -118,9 +118,10 @@ is **0** across all 560 samples.
 
 **The provable ceiling on divergence depth is 4, and the observed maximum is not it.** Non-final chunks
 are at least `min`, so at most `1 + ⌊(max − 1)/min⌋ = 4` chunk starts can lie inside that window. The
-sweep observes a maximum of **2** on the live corpus. That is a corpus observation, not a ceiling: a
-search over random-character documents reaches **3** (and Codex independently constructed one at seed
-1307). One reviewer proposed that depth ≤ 2 "looks provable" for these parameters — **that is refuted**;
+sweep observes a maximum of **2** on the live corpus and **3** on its 400 synthetic documents
+(`absoluteGuard.synthetic.maxDepthObserved`; Codex independently constructed one at seed 1307). So the
+corpus figure is an observation, not a ceiling. One reviewer proposed that depth ≤ 2 "looks provable" for
+these parameters — **that is refuted by the committed script's own output**;
 the assertions in §2 use the derived 4, never the observed 2, which is the same discipline `CDCCHURN-1`
 adopted after publishing a sparse-grid maximum as if it were a bound.
 
@@ -216,7 +217,8 @@ predicate term, applied here to a whole assertion. So the test asserts three thi
 2. **an absolute ceiling derived from the SIZE ENVELOPE, not from behaviour**:
    `churn ≤ (1 + ⌊(max − 1)/min⌋) + ⌈A/min⌉` for an append of length `A` — at most 4 tail boundaries can
    move (§0d) and the appended text adds at most `⌈A/min⌉` chunks. Zero violations across the 560 corpus
-   samples and 19,509 samples including adversarial synthetic documents. This is the assertion that
+   samples and a further **8,400 samples over 400 synthetic documents** (`absoluteGuard.synthetic`, in
+   the committed script — 28 real files are not evidence about an algorithm). This is the assertion that
    reddens if `cdc2` starts re-cutting the whole document;
 3. **the divergence depth**, per document, against the derived 4 — never the observed 2.
 
