@@ -98,6 +98,46 @@ export const METRICS = Object.freeze({
   C1: { label: "input tokens / episode", kind: "ratio-fall", margin: 0.25, maxSpreadRatio: 0.125 },
 });
 
+/**
+ * The SMALL-MODEL arm's registry (GRAPHSMALL-1) — a SEPARATE export, not additions to METRICS above.
+ *
+ * WHY SEPARATE, and this is the load-bearing part: **`C1` is the wrong cost gate for that lever.**
+ * C1 is `ratio-fall` on input TOKENS per episode — it requires the arm to SEND 25% fewer tokens. The
+ * window levers did exactly that. Routing calls to a cheaper model sends the SAME tokens at a lower
+ * price, so C1 cannot pass by construction, and a shared registry would have pre-registered that
+ * battery's own guaranteed STOP. `C2` (measured USD/episode) is the thing that must actually move;
+ * C1 stays available as a DIAGNOSTIC there (tokens should sit roughly flat) but gates nothing.
+ *
+ * Q1/Q2/Q4/Q5/Q7 are reused verbatim — the quality question is the same one, and a fork of the bands
+ * would let two batteries disagree about what "fragmented" means.
+ */
+export const SMALL_MODEL_METRICS = Object.freeze({
+  Q1: METRICS.Q1,
+  Q2: METRICS.Q2,
+  Q4: METRICS.Q4,
+  Q5: METRICS.Q5,
+  Q7: METRICS.Q7,
+  // Two-sided: a small model can truncate summaries AND pad them, and a floor sees only one.
+  Q10: { label: "summary health (distinctness)", kind: "ratio-lower", margin: 0.15, maxSpreadRatio: 0.075 },
+  // Ratio to the incumbent — the absolute level reflects the corpus, not the model (see
+  // `scoreTemporalCoverage`). A fall means `edge_timestamps` stopped resolving dates it used to.
+  Q11: { label: "temporal coverage", kind: "ratio-lower", margin: 0.15, maxSpreadRatio: 0.075 },
+  // THE cost gate for this arm. Threshold is set by the pre-flight (see the spec): 0.15 when the full
+  // 28.7% is addressable, 0.10 when only 18.7% is. Default is the conservative 0.15.
+  C2: { label: "USD / episode", kind: "ratio-fall", margin: 0.15, maxSpreadRatio: 0.075 },
+});
+
+/** The pre-flight-conditional cost band (spec: "the threshold is fixed BEFORE any arm runs"). */
+export function smallModelMetrics({ addressableShare } = {}) {
+  // Below the full-eligibility case the ceiling is 18.7%, where demanding 15% would require ~80%
+  // realisation and would STOP a clean run that captured most of what was reachable.
+  const margin = typeof addressableShare === "number" && addressableShare < 0.2 ? 0.1 : 0.15;
+  return Object.freeze({
+    ...SMALL_MODEL_METRICS,
+    C2: { ...SMALL_MODEL_METRICS.C2, margin, maxSpreadRatio: margin / 2 },
+  });
+}
+
 export const VERDICT = Object.freeze({ PASS: "PASS", FAIL: "FAIL", INCONCLUSIVE: "INCONCLUSIVE" });
 
 const mean = (a, b) => (a + b) / 2;
