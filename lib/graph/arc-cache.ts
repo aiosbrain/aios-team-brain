@@ -136,6 +136,47 @@ export async function purgeArcCacheKey(db: DbClient, teamId: string, groupKey: s
   }
 }
 
+/**
+ * HARD-DELETE every `p:`-namespace (partition-scoped, PCCC6B-1) row for a team. PCCC-7, closing
+ * the post-merge Codex High 1: a scoped row synthesized BEFORE a restriction move keeps
+ * restricted-derived SUMMARY prose (invisible to the evidence filter, `arc-visibility.ts:19-25`),
+ * and once the partition's purge confirms it returns to the reader's scope key — so the stale row
+ * is served again, for up to TTL, by SWR. Stale-marking is NOT enough (stale rows still serve);
+ * only a miss forces re-synthesis from the post-move graph. Scoped rows are regenerable and
+ * per-reader-scope, so over-purging costs one re-synthesis per active reader, never correctness.
+ * Best-effort like every cache write — but the CALLER (reconcile) runs it BEFORE clearing any
+ * self-purge flag, so a failed purge leaves the partition suppressed rather than leaking.
+ */
+export async function purgeScopedArcCache(db: DbClient, teamId: string): Promise<{ ok: boolean }> {
+  try {
+    const { error } = await db.from("arc_cache").delete().eq("team_id", teamId).like("group_key", "p:%");
+    return { ok: !error };
+  } catch {
+    return { ok: false };
+  }
+}
+
+/** How old a `p:` row must be before the orphan sweep may take it: well past the 4h TTL, so only
+ *  rows no active reader's scope resolves to anymore (oracle churn strands them) are collected. */
+export const SCOPED_ARC_SWEEP_AGE_MS = 48 * 60 * 60_000;
+
+/**
+ * Delete `p:` rows a team's oracle churn has stranded (PCCC-7's orphan sweep — every scope-set
+ * change mints a new key and abandons the old row forever). Age-based, `p:` namespace ONLY: tier
+ * rows have a fixed key per tier and are never orphaned, and the CORRECTIONS store is human data —
+ * ruled in the design: a cache row is regenerable, a person's edit is not, so the sweep never
+ * touches `arc_corrections` (stranded-scope corrections wait for their scope to recur or for a
+ * human decision, not a janitor). Best-effort.
+ */
+export async function sweepStaleScopedArcCache(db: DbClient, teamId: string): Promise<void> {
+  try {
+    const cutoff = new Date(Date.now() - SCOPED_ARC_SWEEP_AGE_MS).toISOString();
+    await db.from("arc_cache").delete().eq("team_id", teamId).like("group_key", "p:%").lt("computed_at", cutoff);
+  } catch {
+    // best-effort — orphans cost storage, not correctness; the next pass retries
+  }
+}
+
 /** Upsert the cached arcs for one team+group_key, stamping `computed_at` now. Best-effort — a failed
  *  cache write must never fail synthesis (the arcs are still returned to the caller). */
 export async function writeArcCache(

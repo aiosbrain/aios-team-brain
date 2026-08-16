@@ -94,7 +94,7 @@ export async function POST(req: NextRequest) {
     tier,
     groups,
     keys,
-    scopeGroups ? { scopeKey: partitionArcScopeKey(teamSlug, scopeGroups) } : undefined
+    scopeGroups ? { scopeKey: partitionArcScopeKey(team.id, scopeGroups) } : undefined
   );
 
   // The PCCB-5 evidence filter stays as defense-in-depth: a partition scope's facts are

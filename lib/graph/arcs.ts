@@ -968,6 +968,22 @@ const cache = new Map<
   string,
   { arcs: NarrativeArc[]; at: number; factsHash: string | null; degraded: boolean }
 >();
+/** PCCC-7 (post-merge Codex Medium 2): scoped keys made the map's cardinality one entry per
+ *  DISTINCT oracle state ever seen, unbounded across member/latch churn. Insertion-order eviction
+ *  at a bound comfortably above any live reader population — a bounced entry re-reads from the
+ *  Postgres row for the price of one query. */
+const MAX_ARC_MEMORY_ENTRIES = 512;
+/** Test-only introspection for the bound (a Map size is otherwise unobservable from outside). */
+export function arcMemoryCacheSize(): number {
+  return cache.size;
+}
+export function memCacheSet(key: string, entry: { arcs: NarrativeArc[]; at: number; factsHash: string | null; degraded: boolean }): void {
+  if (!cache.has(key) && cache.size >= MAX_ARC_MEMORY_ENTRIES) {
+    const oldest = cache.keys().next().value;
+    if (oldest !== undefined) cache.delete(oldest);
+  }
+  cache.set(key, entry);
+}
 // Group keys currently being recomputed in the background, so concurrent stale reads fire ONE
 // recompute (and thus one LLM call), not N.
 const refreshing = new Set<string>();
@@ -981,11 +997,13 @@ const refreshing = new Set<string>();
 /** Does an arc-cache key (a comma-joined set of `${slug}_${tier}` group ids) belong to `teamSlug`? The
  *  `_` separator makes the `${slug}_` prefix test exact — team slugs are `[a-z0-9-]` (no `_`), so
  *  "acme" never matches "acme-corp_team" or "acmex_team". Pure + unit-tested. */
-export function arcKeyBelongsToTeam(key: string, teamSlug: string): boolean {
-  // PCCC6B-1 partition-scope keys carry the slug explicitly (`p:<slug>:<groups>`): project-group
-  // segments (`g_<teamhex>_p_<projhex>`) contain no slug, so the tier prefix test below can never
-  // see them — without the namespace, eviction would silently skip every partition-scope entry.
-  if (key.startsWith("p:")) return key.slice(2).startsWith(`${teamSlug}:`);
+export function arcKeyBelongsToTeam(key: string, teamSlug: string, teamId?: string): boolean {
+  // PCCC6B-1 partition-scope keys carry the TEAM ID explicitly (`p:<teamId>:<groups>`) — the id,
+  // not the slug, since PCCC-7 (post-merge Codex High 2): a supported team RENAME changes the slug
+  // and would have stranded every slug-keyed correction and cache row silently. Project-group
+  // segments (`g_<teamhex>_p_<projhex>`) carry no slug either way, so the tier prefix test below
+  // can never see them — the namespace is what keeps eviction exact.
+  if (key.startsWith("p:")) return teamId != null && key.slice(2).startsWith(`${teamId}:`);
   const prefix = `${teamSlug}_`;
   return key.split(",").some((g) => g.startsWith(prefix));
 }
@@ -995,10 +1013,21 @@ export function arcKeyBelongsToTeam(key: string, teamSlug: string): boolean {
  * namespace, deliberately: a built-ins-only oracle scope contains exactly the tier group pair, and
  * an un-namespaced key would share the tier path's cache row — same bytes, DIFFERENT corrections
  * rule (the tier row admits legacy '' corrections; a partition scope must not), so the shared row
- * would poison across that boundary depending on who computed it first.
+ * would poison across that boundary depending on who computed it first. Keyed on the IMMUTABLE
+ * team id (PCCC-7): the slug renames; every scoped correction and cache row keyed by it would be
+ * stranded the moment `acme` became `acme-hq`.
  */
-export function partitionArcScopeKey(teamSlug: string, groups: readonly string[]): string {
-  return `p:${teamSlug}:${groups.slice().sort().join(",")}`;
+export function partitionArcScopeKey(teamId: string, groups: readonly string[]): string {
+  return `p:${teamId}:${groups.slice().sort().join(",")}`;
+}
+
+/** Evict every partition-scoped in-memory entry for a team (PCCC-7) — the id-keyed twin of
+ *  `evictArcMemoryCache`, for callers (reconcile) that hold the id, not the slug. */
+export function evictScopedArcMemory(teamId: string): void {
+  const prefix = `p:${teamId}:`;
+  for (const key of cache.keys()) {
+    if (key.startsWith(prefix)) cache.delete(key);
+  }
 }
 
 export function evictArcMemoryCache(teamSlug: string): void {
@@ -1119,7 +1148,7 @@ export async function commitArcs(
       `[arcs] ${modelFailed ? "synthesis produced no arcs from a non-empty fact set" : "degraded synthesis"} for ${key}; persisting with a ${Math.round(UNTRUSTED_RETRY_AFTER_MS / 60_000)}min life so it retries soon`
     );
   }
-  cache.set(key, { arcs: next, at, factsHash, degraded: untrustworthy });
+  memCacheSet(key, { arcs: next, at, factsHash, degraded: untrustworthy });
   await writeArcCache(db, teamId, key, next, factsHash, { degraded: untrustworthy });
   return { arcs: next, computedAt: at, untrustworthy, payloadDegraded: untrustworthy };
 }
@@ -1250,7 +1279,7 @@ export async function getArcs(
   // 2. Persistent cache (survives restart, shared across instances).
   const persisted = await readArcCache(db, teamId, key);
   if (persisted) {
-    cache.set(key, {
+    memCacheSet(key, {
       arcs: persisted.arcs,
       at: persisted.computedAt,
       factsHash: persisted.factsHash,

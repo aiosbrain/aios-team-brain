@@ -85,7 +85,7 @@ export async function POST(req: NextRequest) {
     return errorResponse("internal", "enforcement check failed", 500);
   }
   const groups = scopeGroups ?? visibleGroupIds(teamSlug, tier);
-  const scopeKey = scopeGroups ? partitionArcScopeKey(teamSlug, scopeGroups) : groups.slice().sort().join(",");
+  const scopeKey = scopeGroups ? partitionArcScopeKey(team.id, scopeGroups) : groups.slice().sort().join(",");
 
   // WRITE gate (Codex B5 High — correction poisoning): recomputeArcs WRITES each correction to
   // `arc_corrections` AND projects it into a Graphiti group, then feeds every future same-scope
