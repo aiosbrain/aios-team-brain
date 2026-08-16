@@ -17,15 +17,41 @@ export type LinearGraphqlResponse<T> = { data?: T; errors?: { message: string }[
  * explicit `mutation` operation can. The check therefore keys on the one token that decides it, after
  * comments are stripped so a `# mutation` in prose is not an accusation.
  */
-const MUTATION_DOC = /(^|\})\s*mutation\b/;
+// `[\s,]*`, not `\s*`: GraphQL treats commas as ignorable tokens, so `,mutation M { … }` is a document
+// Linear executes — and the first version of this regex did not match it. One byte defeated the guard.
+const MUTATION_DOC = /(^|\})[\s,]*mutation\b/;
 const stripGraphqlComments = (doc: string): string => doc.replace(/#[^\n]*/g, "");
 export const isMutationDocument = (doc: string): boolean => MUTATION_DOC.test(stripGraphqlComments(doc));
 
 /**
- * Module-private, and that is the whole design. `linearMutation` raises it for exactly one call; nothing
- * outside this file can set it, so there is no way to send a mutation through the raw transport.
+ * THE AUTHORIZATION IS AN IDENTITY, NOT A WINDOW.
+ *
+ * The first version raised a module-level boolean before `await`ing the network and lowered it in
+ * `finally` — so for the whole duration of one verified round-trip, ANY concurrent raw mutation was
+ * waved through. Both reviewers built the interleaving independently (a gated fetch plus a raw
+ * `mutation Evil` issued before the gate resolves), and it fails exactly under the load where
+ * projections overlap. There is no shared mutable state now: the unguarded transport is a private
+ * function, `linearGraphql` is a thin refusing wrapper over it, and `linearMutation` calls it directly.
+ * Nothing spans an await, so there is no window to race.
  */
-let insideVerifiedMutation = false;
+async function send<T>(
+  fetchImpl: typeof fetch,
+  apiKey: string,
+  query: string,
+  variables: Record<string, unknown>
+): Promise<T> {
+  const res = await fetchImpl("https://api.linear.app/graphql", {
+    method: "POST",
+    headers: { Authorization: apiKey, "Content-Type": "application/json" },
+    body: JSON.stringify({ query, variables }),
+  });
+  const json = (await res.json().catch(() => null)) as LinearGraphqlResponse<T> | null;
+  if (!res.ok || json?.errors?.length || !json?.data) {
+    const message = json?.errors?.map((e) => e.message).join("; ") || `HTTP ${res.status}`;
+    throw new PmSyncError(`Linear GraphQL failed: ${message}`);
+  }
+  return json.data;
+}
 
 /**
  * THE RAW TRANSPORT — reads only. Connection, auth, error mapping.
@@ -55,22 +81,12 @@ export async function linearGraphql<T>(
   query: string,
   variables: Record<string, unknown>
 ): Promise<T> {
-  if (!insideVerifiedMutation && isMutationDocument(query)) {
+  if (isMutationDocument(query)) {
     throw new PmSyncError(
       "Linear mutation sent through the raw transport — use linearMutation, which verifies the provider accepted the write (PMSUCCESS-1)"
     );
   }
-  const res = await fetchImpl("https://api.linear.app/graphql", {
-    method: "POST",
-    headers: { Authorization: apiKey, "Content-Type": "application/json" },
-    body: JSON.stringify({ query, variables }),
-  });
-  const json = (await res.json().catch(() => null)) as LinearGraphqlResponse<T> | null;
-  if (!res.ok || json?.errors?.length || !json?.data) {
-    const message = json?.errors?.map((e) => e.message).join("; ") || `HTTP ${res.status}`;
-    throw new PmSyncError(`Linear GraphQL failed: ${message}`);
-  }
-  return json.data;
+  return send<T>(fetchImpl, apiKey, query, variables);
 }
 
 /**
@@ -119,15 +135,7 @@ export async function linearMutation<T>(
   if (!isMutationDocument(query)) {
     throw new PmSyncError(`linearMutation called with a non-mutation document (${expect.payload})`);
   }
-  insideVerifiedMutation = true;
-  let data: Record<string, unknown>;
-  try {
-    data = await linearGraphql<Record<string, unknown>>(fetchImpl, apiKey, query, variables);
-  } finally {
-    // `finally`, not after the await: a throw from the transport must not leave the flag raised for
-    // whatever this process does next.
-    insideVerifiedMutation = false;
-  }
+  const data = await send<Record<string, unknown>>(fetchImpl, apiKey, query, variables);
 
   const payload = data?.[expect.payload] as Record<string, unknown> | null | undefined;
   if (payload === null || payload === undefined) {

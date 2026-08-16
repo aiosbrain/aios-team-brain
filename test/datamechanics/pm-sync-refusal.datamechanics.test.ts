@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { projectTaskByIdAfterWrite } from "@/lib/pm-sync";
+import { runInboundForTeam } from "@/lib/pm-sync/inbound";
 import { upsertIntegration, setIntegrationSecret } from "@/lib/integrations/manage";
 import { db, ingest, seedTeam, type Seed } from "./helpers";
 
@@ -179,5 +180,64 @@ describe("PMSUCCESS-1 — a refused mutation must not latch the row (real Postgr
     expect(link?.provider_resource_id).toBeNull();
     expect(link?.last_error, "a refused create must be an error, not a silent success").toMatch(/success=false/i);
     expect(link?.projection_fingerprint, "nothing may be latched from a refused create").toBeNull();
+  });
+
+  /**
+   * §0e — THE WORST OUTCOME, and the one a comment in the unit tier claimed was covered here when it
+   * was not. Review caught the false attestation; this is the test it was attesting to.
+   *
+   * A refused `statusOnly` write used to return a result carrying the DESIRED state, so `persistSuccess`
+   * recorded `last_projected_status` as a state Linear was never moved to, plus a matching fingerprint.
+   * Inbound then saw `brainUnchanged` true with Linear's real state differing, and wrote Linear's OLD
+   * state back onto the brain task — silently reverting a done-transition the user made.
+   */
+  it("a refused STATUS write leaves the projection baseline unwritten, and inbound does NOT revert the brain", async () => {
+    const seed = await seedTeam();
+    await seedLinearPrimary(seed);
+
+    // 1. Land a real issue for the row.
+    await pushTasks(seed, "d1", [{ row_key: "D1", title: "Ship it", status: "in_progress" }]);
+    const ok = linearMock();
+    await projectTaskByIdAfterWrite(db(), await taskIdOf(seed.teamId, "D1"), { fetchImpl: ok.fetchImpl });
+    const created = await linkOf(seed.teamId, "D1");
+    expect(created?.provider_resource_id).toBeTruthy();
+    const baselineStatus = created?.last_projected_status;
+
+    // 2. Move it to done in the brain — and have Linear REFUSE the status write.
+    await pushTasks(seed, "d2", [{ row_key: "D1", title: "Ship it", status: "done" }]);
+    const liveIssue = {
+      id: created!.provider_resource_id,
+      identifier: "AIO-1",
+      url: "https://linear.app/AIO-1",
+      title: "Ship it",
+      description: "aios-ext: D1 · source: aios-backlog",
+      priority: 0,
+      parent: null,
+      state: { id: "ls-started", name: "In Progress", type: "started" }, // Linear is still NOT done
+      labels: { nodes: [] },
+      team: { id: "team-uuid" },
+    };
+    const refused = linearMock({ refuse: true, issues: [liveIssue] });
+    await projectTaskByIdAfterWrite(db(), await taskIdOf(seed.teamId, "D1"), { fetchImpl: refused.fetchImpl });
+
+    const afterRefusal = await linkOf(seed.teamId, "D1");
+    expect(afterRefusal?.last_error, "the refusal must be recorded").toMatch(/success=false/i);
+    expect(
+      afterRefusal?.last_projected_status,
+      "recording the DESIRED state as projected is what made inbound revert the task"
+    ).toBe(baselineStatus ?? null);
+
+    // 3. The brain still says done, and an inbound pass must NOT drag it back to Linear's state.
+    const brainBefore = await db().from("tasks").select("status").eq("team_id", seed.teamId).eq("row_key", "D1").single();
+    expect((brainBefore.data as { status: string }).status).toBe("done");
+
+    const inbound = linearMock({ issues: [liveIssue] });
+    await runInboundForTeam(db(), seed.teamId, { fetchImpl: inbound.fetchImpl });
+
+    const brainAfter = await db().from("tasks").select("status").eq("team_id", seed.teamId).eq("row_key", "D1").single();
+    expect(
+      (brainAfter.data as { status: string }).status,
+      "inbound reverted the brain to Linear's stale state — the refused write was silently undone"
+    ).toBe("done");
   });
 });

@@ -70,26 +70,52 @@ describe("PMSUCCESS-1 layer 1 — the transport refuses an unverified mutation A
     const data = await linearGraphql<{ viewer: { id: string } }>(
       ok({ viewer: { id: "u3" } }),
       KEY,
-      `# this is deliberately not a mutation\nquery Viewer { viewer { id } }`,
+      // `} mutation` INSIDE the comment: the previous fixture said "not a mutation", whose `mutation`
+      // is preceded by a space, so the anchor already rejected it and the comment-stripping term was
+      // never exercised — deleting `stripGraphqlComments` left all 21 tests green (found by mutation).
+      `# see the } mutation note below\nquery Viewer { viewer { id } }`,
       {}
     );
     expect(data.viewer.id).toBe("u3");
   });
 
-  it("the flag does not survive a throw — a failed mutation cannot leave the door open", async () => {
-    const boom: typeof fetch = (async () => {
-      throw new Error("network down");
-    }) as unknown as typeof fetch;
+  it("A COMMA is not a loophole: `,mutation …` is valid GraphQL and is still refused", async () => {
+    // GraphQL treats commas as ignorable tokens, so Linear executes this document. The first version of
+    // the regex used `\s*` and did not match it — one byte defeated the guard (found by review).
     await expect(
-      linearMutation(boom, KEY, `mutation A { issueCreate(input: {}) { success issue { id } } }`, {}, {
-        payload: "issueCreate",
-        entity: "issue",
-      })
-    ).rejects.toThrow(/network down/);
-    // …and the very next raw call is still refused.
-    await expect(
-      linearGraphql(never, KEY, `mutation B { issueCreate(input: {}) { success issue { id } } }`, {})
+      linearGraphql(never, KEY, `,mutation Evil { issueDelete(id: "x") { success } }`, {})
     ).rejects.toThrow(/raw transport/i);
+    await expect(
+      linearGraphql(never, KEY, `query A { viewer { id } } , mutation B { issueDelete(id: "x") { success } }`, {})
+    ).rejects.toThrow(/raw transport/i);
+  });
+
+  it("CONCURRENCY: a raw mutation is refused WHILE a verified mutation's fetch is in flight", async () => {
+    // The original design raised a module-level boolean before awaiting the network and lowered it in
+    // `finally`, so for the whole round-trip ANY concurrent raw mutation was waved through. Both
+    // reviewers built this interleaving independently. There is no shared state now — the unguarded
+    // transport is private — so this asserts the property rather than the implementation.
+    let release: (r: Response) => void = () => {};
+    const gated: typeof fetch = (async () =>
+      new Promise<Response>((resolve) => {
+        release = resolve;
+      })) as unknown as typeof fetch;
+
+    const inFlight = linearMutation(
+      gated,
+      KEY,
+      `mutation Good { issueCreate(input: {}) { success issue { id } } }`,
+      {},
+      { payload: "issueCreate", entity: "issue" }
+    );
+
+    // …while that one is parked on the network, a raw mutation must still be refused.
+    await expect(
+      linearGraphql(never, KEY, `mutation Evil { issueDelete(id: "x") { success } }`, {})
+    ).rejects.toThrow(/raw transport/i);
+
+    release(Response.json({ data: { issueCreate: { success: true, issue: { id: "i1" } } } }));
+    await expect(inFlight).resolves.toBeDefined();
   });
 
   it("linearMutation refuses a NON-mutation document — the wrapper is not a way to smuggle reads", async () => {
