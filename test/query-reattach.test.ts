@@ -65,6 +65,9 @@ describe("pollRun — reattach to an in-flight turn", () => {
 
   it("STOPS when a different run takes over — one turn's text must never land in another's bubble", async () => {
     // The endpoint reports the thread's LATEST run, so a new question mid-poll switches the id.
+    // `maxPolls` bounds the run so that REMOVING the identity guard fails this test loudly instead of
+    // spinning: without the bound, the mutation starved the event loop and killed the test worker,
+    // which the mutation harness could not distinguish from "no test failed".
     const seen: string[] = [];
     vi.stubGlobal(
       "fetch",
@@ -73,9 +76,17 @@ describe("pollRun — reattach to an in-flight turn", () => {
         { id: "r2", status: "streaming", partial: "NEW turn text" },
       ])
     );
-    const out = await pollRun("team", "c1", (p) => seen.push(p), { sleep: noSleep });
+    const out = await pollRun("team", "c1", (p) => seen.push(p), { sleep: noSleep, maxPolls: 5 });
     expect(seen).toEqual(["old turn"]); // the new run's text was never adopted
     expect(out).toBeNull();
+  });
+
+  it("gives up after its poll budget instead of spinning forever", async () => {
+    const seen: string[] = [];
+    vi.stubGlobal("fetch", serveRuns([{ id: "r1", status: "streaming", partial: "still going" }]));
+    const out = await pollRun("team", "c1", (p) => seen.push(p), { sleep: noSleep, maxPolls: 3 });
+    expect(out).toBeNull();
+    expect(seen).toHaveLength(3); // bounded, not unbounded
   });
 
   it("stops immediately when aborted, and when the thread has no run", async () => {

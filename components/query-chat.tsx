@@ -53,15 +53,26 @@ export async function pollRun(
   teamSlug: string,
   conversationId: string,
   onPartial: (text: string) => void,
-  opts: { signal?: AbortSignal; intervalMs?: number; sleep?: (ms: number) => Promise<void> } = {}
+  opts: {
+    signal?: AbortSignal;
+    intervalMs?: number;
+    sleep?: (ms: number) => Promise<void>;
+    maxPolls?: number;
+  } = {}
 ): Promise<{ status: "done" | "error"; error: string | null; hasAnswer: boolean } | null> {
   const intervalMs = opts.intervalMs ?? 1200;
   const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  // A HARD BOUND on the loop. The server ages a silent run out after ~3 minutes, so in practice this is
+  // never reached — but "in practice" is not a termination argument: an endpoint that kept answering
+  // `streaming` would spin here forever, and with a zero-delay sleep the loop yields only microtasks,
+  // starving the event loop so completely that even a test timeout cannot fire (observed: it killed the
+  // vitest worker rather than failing). ~10 minutes of polling, then give up.
+  const maxPolls = opts.maxPolls ?? 500;
   // The run we started watching. The endpoint reports the thread's LATEST run, so if the user asks a
   // new question mid-poll the id changes underneath us — that new turn belongs to the live SSE reader,
   // not to this reattach, and adopting it would write one turn's text into another's bubble.
   let watchedId: string | null = null;
-  for (;;) {
+  for (let polls = 0; polls < maxPolls; polls++) {
     if (opts.signal?.aborted) return null;
     let body: {
       run?: { id?: string; status?: string; partial?: string; error?: string | null; final_message_id?: string | null } | null;
@@ -96,6 +107,7 @@ export async function pollRun(
       hasAnswer: run.status === "done" && Boolean(run.final_message_id),
     };
   }
+  return null; // poll budget exhausted — stop rather than spin
 }
 
 export function QueryChat({
