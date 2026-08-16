@@ -110,7 +110,6 @@ export function ArcsPanel({ teamSlug, variant = "full" }: { teamSlug: string; va
         arr.push(c);
         byGroup.set(c.sourceGroup, arr);
       }
-      let lastData: { arcs?: Arc[] } | null = null;
       let anyFailed = false;
       for (const [group, batch] of byGroup) {
         const res = await fetch("/api/brain/arcs/recompute", {
@@ -122,12 +121,30 @@ export function ArcsPanel({ teamSlug, variant = "full" }: { teamSlug: string; va
             corrections: batch.map(({ arc_id, corrected_text, arc_title }) => ({ arc_id, corrected_text, arc_title })),
           }),
         });
-        if (res.ok) lastData = (await res.json()) as { arcs?: Arc[] };
-        else anyFailed = true;
+        if (res.ok) {
+          // Drop THIS batch's edits — a partial-failure retry then resends only the failed
+          // partitions (Fable PPARC-3 Medium 1: resending a succeeded one 403-loops on churned
+          // arc ids or re-pays its synthesis).
+          setEdited((e) => {
+            const next = { ...e };
+            for (const c of batch) delete next[c.arc_id];
+            return next;
+          });
+        } else anyFailed = true;
       }
-      if (!anyFailed && lastData) {
-        setArcs(lastData.arcs ?? []);
-        setEdited({});
+      if (!anyFailed) {
+        // Re-fetch the FUSED panel rather than trusting a recompute body (Fable PPARC-3 High 4:
+        // the single-partition response collapsed the panel and carried no sourceGroup, so every
+        // SECOND correction 422'd). The GET restores full coverage + annotations.
+        const res = await fetch("/api/brain/arcs", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ team: teamSlug }),
+        });
+        if (res.ok) {
+          const data = (await res.json()) as { arcs?: Arc[] };
+          setArcs(data.arcs ?? []);
+        }
       } else {
         // Say so. A failed save used to stop the spinner and leave the old arcs, which reads exactly
         // like "nothing happened" — the same silent-revert experience H13 is about, one layer up. The

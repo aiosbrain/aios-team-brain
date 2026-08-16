@@ -7,16 +7,19 @@
 --      never deleted), unread after the cutover, and their count is REPORTED below (visible in
 --      the deploy log via the pg-load-schema notice listener that ships with this migration —
 --      node-pg discards notices unheard).
---   3. EVERY `g:` cache row is WIPED (Codex PPARC-2 High 2): rows warmed pre-cutover were
---      synthesized against g:-scoped corrections that did not exist yet — a re-keyed correction
---      would sit unheard behind a fresh row for a TTL. g: rows are regenerable; the cutover
---      re-warms them.
--- Idempotent: re-keyed rows stop matching; the wipe on replay deletes rows that regenerate.
+--   3. PRE-CUTOVER `g:` cache rows are WIPED (Codex PPARC-2 High 2): rows warmed before this
+--      migration were synthesized against g:-scoped corrections that did not exist yet — a
+--      re-keyed correction would sit unheard behind a fresh row for a TTL. The wipe is
+--      DATE-BOUNDED so replay CONVERGES (Fable PPARC-3 High 3: an unbounded predicate re-wiped
+--      the whole partition cache on EVERY deploy — cold panels, re-minted arc ids, reset
+--      continuity lineage, per merge, forever). Rows computed after the bound are post-cutover
+--      and correct by construction.
+-- Idempotent: re-keyed rows stop matching; the wipe matches nothing once post-cutover rows exist.
 update arc_corrections
    set group_key = 'g:' || substr(group_key, length('p:' || team_id || ':') + 1)
  where group_key like 'p:' || team_id || ':%'
    and position(',' in substr(group_key, length('p:' || team_id || ':') + 1)) = 0;
-delete from arc_cache where group_key like 'g:%';
+delete from arc_cache where group_key like 'g:%' and computed_at < timestamptz '2026-08-16 12:00:00+00';
 do $$
 declare stranded int;
 begin

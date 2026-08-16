@@ -77,6 +77,7 @@ const KEYS = { anthropic: "test-key", openai: null, openrouter: null } as unknow
 // randomUUID, not Math.random — same uniqueness job, and Codacy's weak-RNG security rule fires on
 // Math.random even in a test fixture (observed on this PR; the neighboring older file predates the rule).
 const slug = () => `acme${randomUUID().slice(0, 8)}`;
+const projGroup = () => `g_${randomUUID().replace(/-/g, "")}_p_${randomUUID().replace(/-/g, "")}`;
 
 const FACT = {
   id: "f1",
@@ -197,6 +198,25 @@ describe("PCCC6B-1 — the graph write-back follows the scope", () => {
     const scoped = correctionsMock.listArcCorrections.mock.calls.filter((c) => c[2]?.groupKey === scopeKey);
     expect(scoped).toHaveLength(1);
     expect(scoped[0][2]).toMatchObject({ groupKey: scopeKey, includeLegacy: false });
+  });
+
+  it("a g:-scoped SINGLE-group recompute writes back to THAT group — the namespace the enforced route actually sends (Fable PPARC-3 High 1: the p:-only predicate dropped g: into the TIER branch, landing restricted prose in the team group)", async () => {
+    const { recomputeArcs } = await import("@/lib/graph/arcs");
+    const { db } = fakeDb();
+    const t = slug();
+    const group = projGroup();
+    await recomputeArcs(db, "team-1", t, "team", [group], [CORRECTION], KEYS, null, { scopeKey: `g:${group}` });
+    expect(graphitiMock.addEpisodes).toHaveBeenCalledTimes(1);
+    expect(graphitiMock.addEpisodes.mock.calls[0][0]).toBe(group);
+  });
+
+  it("a g:-scoped EXTERNAL-shaped group still refuses the write-back", async () => {
+    const { recomputeArcs } = await import("@/lib/graph/arcs");
+    const { db } = fakeDb();
+    const t = slug();
+    const group = `${t}_external`;
+    await recomputeArcs(db, "team-1", t, "team", [group], [CORRECTION], KEYS, null, { scopeKey: `g:${group}` });
+    expect(graphitiMock.addEpisodes).not.toHaveBeenCalled();
   });
 
   it("the recorded correction carries the scope key it was made in", async () => {

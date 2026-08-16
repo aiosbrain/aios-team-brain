@@ -1,7 +1,7 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import type { NarrativeArc } from "./arcs";
-import { getArcs, warmPartitionArcs, type ProviderKeys } from "./arcs";
+import { getArcs, warmPartitionArcs, MAX_ARCS, type ProviderKeys } from "./arcs";
 import { readArcCache, arcTtlMs, type ArcCacheEntry } from "./arc-cache";
 import { freshness, computedNow, type Freshness } from "@/lib/freshness";
 import { latestPushByGroup } from "./extraction-health";
@@ -24,9 +24,9 @@ import { latestPushByGroup } from "./extraction-health";
  * panel is `computedNow()` (the §5.7 neutral-envelope rule carries over verbatim at the route).
  */
 
-/** The panel size — mirrors the synthesis-side MAX_ARCS (arcs.ts); fusion must not out-grow what
- *  one synthesis could have served. */
-export const FUSED_PANEL_MAX = 12;
+/** The panel size — the synthesis-side MAX_ARCS by IMPORT, not by literal (drift-proof); fusion
+ *  must not out-grow what one synthesis could have served. */
+export const FUSED_PANEL_MAX = MAX_ARCS;
 
 export interface FusedArc extends NarrativeArc {
   /** The partition this arc came from — the wire field the corrections write gate keys on. */
@@ -35,6 +35,8 @@ export interface FusedArc extends NarrativeArc {
 
 export interface FusedArcPanel {
   arcs: FusedArc[];
+  /** Background g: refreshes this read scheduled (missing OR stale partitions) — the SWR "R". */
+  warmScheduled: number;
   freshness: Freshness;
   /** Partitions with a cached (or just-synthesized) row vs. the reader's resolvable total. */
   covered: number;
@@ -81,7 +83,7 @@ export async function getFusedArcs(
   groups: readonly string[],
   keys: ProviderKeys
 ): Promise<FusedArcPanel> {
-  if (groups.length === 0) return { arcs: [], freshness: computedNow(), covered: 0, total: 0 };
+  if (groups.length === 0) return { arcs: [], warmScheduled: 0, freshness: computedNow(), covered: 0, total: 0 };
 
   // Rank by the partition's own latest real push — the same recency prior the K-cap uses; a
   // failed read degrades RANKING only, never coverage.
@@ -95,22 +97,37 @@ export async function getFusedArcs(
     entries.push({ group, entry: await readArcCache(db, teamId, `g:${group}`) });
   }
 
-  // ONE inline synthesis: the highest-ranked partition with no serviceable row. getArcs with the
-  // g: scope reuses the whole SWR/commit machinery (and refreshes a merely-STALE row in the
-  // background itself, so "stale" is served-not-blocked — only a MISSING row synthesizes inline).
+  // ONE inline synthesis: the highest-ranked partition with NO row at all. Stale-present rows are
+  // served immediately and revalidated via the background warm below (they never synthesize
+  // inline) — an earlier comment here claimed getArcs would SWR them, but this path reads rows
+  // directly and must own its own revalidation (Fable PPARC-3 High 2).
   const now = Date.now();
   const inlineTarget = rankedGroups.find((g) => entries.find((e) => e.group === g)?.entry == null);
   if (inlineTarget) {
-    const { arcs } = await getArcs(db, teamId, teamSlug, "team", [inlineTarget], keys, {
+    const { arcs, freshness: inlineFreshness } = await getArcs(db, teamId, teamSlug, "team", [inlineTarget], keys, {
       scopeKey: `g:${inlineTarget}`,
     });
     const refreshed = await readArcCache(db, teamId, `g:${inlineTarget}`);
     const slot = entries.find((e) => e.group === inlineTarget);
-    if (slot) slot.entry = refreshed ?? (arcs.length > 0 ? { arcs, computedAt: now, factsHash: null, degraded: false } : null);
+    // The fallback (cache write swallowed its failure) carries getArcs' OWN freshness — hardcoding
+    // {now, degraded:false} fabricated a healthy-fresh verdict for a possibly-degraded synthesis
+    // (Fable PPARC-3 Medium 2; the trust-dial class one branch deep).
+    if (slot)
+      slot.entry =
+        refreshed ??
+        (arcs.length > 0
+          ? { arcs, computedAt: inlineFreshness.computedAt, factsHash: null, degraded: inlineFreshness.degraded }
+          : null);
   }
-  // Background-warm every OTHER missing partition, budgeted; fire-and-forget.
-  const stillMissing = entries.filter((e) => e.entry == null).map((e) => e.group);
-  if (stillMissing.length > 0) void warmPartitionArcs(db, teamId, stillMissing, keys);
+  // Background-warm EVERYTHING else — missing AND stale-present (Fable PPARC-3 High 2: warming
+  // only the missing left stale rows with no revalidation trigger at all — SWR with no R; the
+  // p:-union warm trigger is dead post-cutover). warmPartitionArcs skips fresh rows internally,
+  // so passing every non-inline group costs probes, not syntheses.
+  const nonInline = entries.filter((e) => e.group !== inlineTarget).map((e) => e.group);
+  // AWAITED scheduling (the syntheses themselves stay background): the probes are one cheap read
+  // per non-fresh group, and the returned count is the H2 pin's observable — fire-and-forget here
+  // made "stale rows revalidate" an unpinnable claim.
+  const warmScheduled = nonInline.length > 0 ? await warmPartitionArcs(db, teamId, nonInline, keys) : 0;
 
   const present = entries.filter((e): e is { group: string; entry: ArcCacheEntry } => e.entry != null);
   const { arcs, asOf, anyDegraded } = fuseArcRows(present);
@@ -119,6 +136,7 @@ export async function getFusedArcs(
   );
   return {
     arcs,
+    warmScheduled,
     freshness:
       asOf == null
         ? computedNow()

@@ -75,7 +75,7 @@ const MAX_FACTS = 200;
 // HARD ceiling on arcs parsed from the model. The count actually REQUESTED is derived per-synthesis
 // from the number of distinct contributors (see `arcsRequested`), so a varied team isn't pinned to a
 // flat 8 — one person working six distinct threads can get six arcs instead of one merged blob.
-const MAX_ARCS = 12;
+export const MAX_ARCS = 12;
 // Fetch a MUCH deeper pool than we feed the model, so a lower-volume contributor's facts are reachable
 // for balancing. Measured too shallow at MAX_FACTS*6 (1200): one high-volume contributor held 84% of
 // the newest-1200 and everyone below the cut fell off the cliff BEFORE balancing could run. A deeper
@@ -1505,7 +1505,10 @@ export async function recomputeArcs(
   // derives from the whole scope union, so any single target narrower than its derivation scope
   // re-creates the laundering §2.4 step 4 closes — the Postgres row above still feeds every
   // same-scope synthesis via the prompt, so the correction itself is never lost.
-  const writebackTarget = key.startsWith("p:")
+  // BOTH partition namespaces (Fable PPARC-3 High 1: the g: key — the one the enforced recompute
+  // actually sends post-cutover — fell through to the TIER branch, landing a restricted arc's
+  // correction prose in the Everyone-searchable team group).
+  const writebackTarget = key.startsWith("p:") || key.startsWith("g:")
     ? groups.length === 1 && !isExternalGroupId(groups[0])
       ? groups[0]
       : null

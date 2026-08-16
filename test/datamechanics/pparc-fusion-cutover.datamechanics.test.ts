@@ -68,6 +68,21 @@ describe("PPARC-3 — coverage disclosure + the fused envelope (criteria 7/10)",
   });
 });
 
+describe("PPARC-3 — stale-present partitions REVALIDATE (Fable High 2: SWR needs its R)", () => {
+  it("a stale g: row schedules a background warm; a fresh one schedules nothing", async () => {
+    const seed = await seedTeam();
+    await writeArcCache(db(), seed.teamId, "g:swr-a", arcRow("a1", "A") as never, "ha");
+    await runSql("update arc_cache set computed_at = now() - interval '5 hours' where team_id = $1 and group_key = 'g:swr-a'", [seed.teamId]);
+    const stalePanel = await getFusedArcs(db(), seed.teamId, seed.teamSlug, ["swr-a"], KEYS);
+    expect(stalePanel.warmScheduled).toBeGreaterThanOrEqual(1); // the stale row IS revalidated
+
+    const fresh = await seedTeam();
+    await writeArcCache(db(), fresh.teamId, "g:swr-b", arcRow("b1", "B") as never, "hb");
+    const freshPanel = await getFusedArcs(db(), fresh.teamId, fresh.teamSlug, ["swr-b"], KEYS);
+    expect(freshPanel.warmScheduled).toBe(0); // fresh rows cost nothing
+  });
+});
+
 describe("PPARC-3 — the p:→g: corrections migration (criterion 5, moved from PPARC-2)", () => {
   it("re-keys single-group rows, keeps multi-group rows counted, WIPES all g: cache rows, replays idempotently, deletes no correction", async () => {
     const seed = await seedTeam();
@@ -82,8 +97,12 @@ describe("PPARC-3 — the p:→g: corrections migration (criterion 5, moved from
         .insert({ team_id: seed.teamId, arc_id: row.arc_id, arc_title: "t", corrected_text: "take", group_key: row.group_key });
       expect(error).toBeNull();
     }
-    // A pre-cutover g: row synthesized before its correction existed — the wipe target (Codex H2).
+    // A pre-cutover g: row (backdated before the wipe bound) — the wipe target (Codex H2) — and a
+    // POST-cutover row that must SURVIVE replay (Fable PPARC-3 High 3: the unbounded wipe
+    // cold-wiped the whole partition cache on every deploy).
     await writeArcCache(db(), seed.teamId, `g:${g}`, arcRow("x", "pre-cutover") as never, "h");
+    await runSql("update arc_cache set computed_at = timestamptz '2026-08-15 00:00:00+00' where team_id = $1 and group_key = $2", [seed.teamId, `g:${g}`]);
+    await writeArcCache(db(), seed.teamId, "g:post-cutover", arcRow("y", "post-cutover") as never, "h");
 
     const MIG = (await import("node:fs")).readFileSync("postgres/migrations/20260816150000_arc_corrections_partition_scope.sql", "utf8");
     await runSql(MIG);
@@ -98,6 +117,7 @@ describe("PPARC-3 — the p:→g: corrections migration (criterion 5, moved from
     expect(byArc["single"]).toBe(`g:${g}`);
     expect(byArc["multi"]).toContain("p:");
     expect(byArc["legacy"]).toBe("");
-    expect(await readArcCache(db(), seed.teamId, `g:${g}`)).toBeNull(); // wiped — the cutover re-warms
+    expect(await readArcCache(db(), seed.teamId, `g:${g}`)).toBeNull(); // pre-cutover: wiped — the cutover re-warms
+    expect(await readArcCache(db(), seed.teamId, "g:post-cutover")).not.toBeNull(); // post-cutover: SURVIVES replay — deploys must not cold-wipe the cache
   });
 });
