@@ -2,6 +2,7 @@ import "server-only";
 import Anthropic from "@anthropic-ai/sdk";
 import type { RetrievedContext } from "./retrieve";
 import { selectLlmBackend, type LlmBackend, type LlmBackendKeys } from "./llm-backend";
+import { StreamHttpError, withStreamRetry, type StreamRetryOptions } from "./stream-retry";
 
 /**
  * Thin adapter around the Claude API so a future agent backend (e.g. Hermes)
@@ -215,17 +216,43 @@ export type QueryUsage = {
  */
 export type ProviderKeys = LlmBackendKeys;
 
+/** One event on the answer stream: an incremental `delta`, then a terminal `done` with usage. */
+export type StreamAnswerEvent =
+  | { type: "delta"; text: string }
+  | { type: "done"; usage: QueryUsage };
+
+/**
+ * Resilient answer stream: one bounded, backed-off retry wrapper around `streamAnswerOnce`.
+ * A transient failure (429 / 529 / 5xx / connection drop) that occurs BEFORE any delta reaches
+ * the client is retried (nothing has been streamed, so a restart is invisible); a failure after
+ * the first delta, a non-retryable error, or an exhausted attempt budget surfaces as before.
+ * This is the single retry owner for both backends (the Anthropic client runs with maxRetries:0).
+ */
 export async function* streamAnswer(
   ctx: RetrievedContext,
   question: string,
   keys: ProviderKeys = {},
   history: ChatTurn[] = [],
   caller?: CallerIdentity,
+  timeZone: string = "UTC",
+  retryOpts: StreamRetryOptions = {}
+): AsyncGenerator<StreamAnswerEvent> {
+  yield* withStreamRetry(
+    () => streamAnswerOnce(ctx, question, keys, history, caller, timeZone),
+    (event) => event.type === "delta",
+    retryOpts
+  );
+}
+
+/** A SINGLE answer attempt (no retry). Wrapped by `streamAnswer`; exported for focused tests. */
+export async function* streamAnswerOnce(
+  ctx: RetrievedContext,
+  question: string,
+  keys: ProviderKeys = {},
+  history: ChatTurn[] = [],
+  caller?: CallerIdentity,
   timeZone: string = "UTC"
-): AsyncGenerator<
-  | { type: "delta"; text: string }
-  | { type: "done"; usage: QueryUsage }
-> {
+): AsyncGenerator<StreamAnswerEvent> {
   const sourcesBlock = ctx.sources
     .map(
       (s) =>
@@ -244,8 +271,13 @@ export async function* streamAnswer(
     return;
   }
 
-  // Per-team key wins; otherwise the SDK reads ANTHROPIC_API_KEY from the env.
-  const client = new Anthropic(keys.anthropicKey ? { apiKey: keys.anthropicKey } : undefined);
+  // Per-team key wins; otherwise the SDK reads ANTHROPIC_API_KEY from the env. maxRetries:0 —
+  // `streamAnswer`'s `withStreamRetry` is the single, uniform retry owner across both backends,
+  // so the SDK's own retry layer must not silently multiply attempts under it.
+  const client = new Anthropic({
+    ...(keys.anthropicKey ? { apiKey: keys.anthropicKey } : {}),
+    maxRetries: 0,
+  });
 
   const stream = client.messages.stream({
     model: backend.model,
@@ -370,14 +402,14 @@ export async function* streamOpenAICompatible(
     if (looksLikeTokenLimit(res.status, body)) {
       res = await postChat(ANSWER_BUDGET);
       if (!res.ok) {
-        throw new Error(`LLM ${backend.model} @ ${backend.baseUrl}: ${res.status} ${await res.text().catch(() => "")}`);
+        throw new StreamHttpError(res.status, `LLM ${backend.model} @ ${backend.baseUrl}: ${res.status} ${await res.text().catch(() => "")}`);
       }
     } else {
-      throw new Error(`LLM ${backend.model} @ ${backend.baseUrl}: ${res.status} ${body}`);
+      throw new StreamHttpError(res.status, `LLM ${backend.model} @ ${backend.baseUrl}: ${res.status} ${body}`);
     }
   }
   if (!res.body) {
-    throw new Error(`LLM ${backend.model} @ ${backend.baseUrl}: ${res.status} no stream body`);
+    throw new StreamHttpError(res.status, `LLM ${backend.model} @ ${backend.baseUrl}: ${res.status} no stream body`);
   }
 
   const reader = res.body.getReader();
