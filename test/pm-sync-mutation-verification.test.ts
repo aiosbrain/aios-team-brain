@@ -19,8 +19,14 @@ import type { IntegrationWithSecret } from "@/lib/integrations/manage";
  *
  * These tests drive the ADAPTER ENTRY POINTS with a fake `fetch`, not the choke point, because a
  * choke-point-only test pins the checker and not the call sites — and it was the call sites that were
- * wrong. The stored-state halves (fingerprint non-write, no inbound reversion) live in the
- * data-mechanics tier; a unit-tier payload assertion greens while the real short-circuit still skips.
+ * wrong.
+ *
+ * The stored-state halves live in `test/datamechanics/pm-sync-refusal.datamechanics.test.ts`: the
+ * fingerprint non-write plus the two-run retry, and the §0e case where inbound must NOT revert the brain
+ * task. THAT SENTENCE WAS A LIE WHEN IT WAS FIRST WRITTEN — the reversion test did not exist and review
+ * caught the false attestation. It exists now, and the mutation that removes the `success` check reddens
+ * all three of those dm tests. A unit-tier payload assertion cannot stand in for them: it greens while
+ * the real short-circuit still skips.
  */
 
 const integration = {
