@@ -6,7 +6,7 @@ import { getSessionUser } from "@/lib/auth/session";
 import { errorResponse } from "@/lib/api/schemas";
 import { resolveAnsweringKeys } from "@/lib/query/answering";
 import { visibleGroupIds } from "@/lib/graph/group";
-import { recomputeArcs, partitionArcScopeKey } from "@/lib/graph/arcs";
+import { recomputeArcs } from "@/lib/graph/arcs";
 import { selectEnforcedGraphPartitions } from "@/lib/graph/partition-read";
 import { freshnessWire, computedNow } from "@/lib/freshness";
 import { memberEnforcement } from "@/lib/access/enforce";
@@ -18,6 +18,10 @@ export const maxDuration = 120; // arc synthesis (LLM) inline path can take up t
 
 const schema = z.object({
   team: z.string().min(1).max(120),
+  // PPARC-3 (design write-gate ruling): ONE partition per POST. The fused panel annotates every
+  // arc with its sourceGroup; the client sends corrections for one partition at a time. Absent =
+  // the permissive tier path (whose panel carries no sourceGroup). Enforced requests REQUIRE it.
+  sourceGroup: z.string().min(1).max(200).optional(),
   corrections: z
     .array(
       z.object({
@@ -45,7 +49,7 @@ export async function POST(req: NextRequest) {
 
   const parsed = schema.safeParse(await req.json().catch(() => null));
   if (!parsed.success) return errorResponse("invalid_payload", "team + corrections required", 422);
-  const { team: teamSlug, corrections } = parsed.data;
+  const { team: teamSlug, corrections, sourceGroup } = parsed.data;
 
   const { data: team } = await rls.from("teams").select("id").eq("slug", teamSlug).maybeSingle();
   if (!team) return errorResponse("forbidden", "not a member of this team", 403);
@@ -84,8 +88,19 @@ export async function POST(req: NextRequest) {
   } catch {
     return errorResponse("internal", "enforcement check failed", 500);
   }
-  const groups = scopeGroups ?? visibleGroupIds(teamSlug, tier);
-  const scopeKey = scopeGroups ? partitionArcScopeKey(team.id, scopeGroups) : groups.slice().sort().join(",");
+  // PPARC-3: the enforced recompute runs in ONE partition (design Highs 2–3: sourceGroup is
+  // validated against the FRESHLY-RESOLVED scope — arc_id is sha(title), derivable unseen, and
+  // the evidence filter does not backstop partition visibility — and one partition means one
+  // inline synthesis, which fits the route budget that N could not). Permissive keeps the tier
+  // path byte-identical.
+  if (scopeGroups != null && sourceGroup == null) {
+    return errorResponse("invalid_payload", "sourceGroup is required on an enforcing team — correct one partition at a time", 422);
+  }
+  if (scopeGroups != null && !scopeGroups.includes(sourceGroup!)) {
+    return errorResponse("forbidden", "the claimed partition is outside your visible scope", 403);
+  }
+  const groups = scopeGroups != null ? [sourceGroup!] : visibleGroupIds(teamSlug, tier);
+  const scopeKey = scopeGroups != null ? `g:${sourceGroup}` : groups.slice().sort().join(",");
 
   // WRITE gate (Codex B5 High — correction poisoning): recomputeArcs WRITES each correction to
   // `arc_corrections` AND projects it into a Graphiti group, then feeds every future same-scope

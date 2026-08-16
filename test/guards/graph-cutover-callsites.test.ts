@@ -43,8 +43,8 @@ const REQUIRED: { file: string; needle: string; why: string }[] = [
   },
   {
     file: join("app", "api", "brain", "arcs", "route.ts"),
-    needle: "scopeKey: partitionArcScopeKey(team.id, scopeGroups)",
-    why: "the scoped read must CACHE under the partition namespace — an un-namespaced key collides with the tier row",
+    needle: "await getFusedArcs(admin, team.id, teamSlug, scopeGroups, keys)",
+    why: "PPARC-3: an enforced member's panel is the FUSION of their partitions' g: rows — dropping this silently falls back to the tier cache (the laundering path)",
   },
   {
     file: join("app", "api", "brain", "arcs", "recompute", "route.ts"),
@@ -55,6 +55,11 @@ const REQUIRED: { file: string; needle: string; why: string }[] = [
     file: join("app", "api", "brain", "arcs", "recompute", "route.ts"),
     needle: "readArcCache(admin, team.id, scopeKey)",
     why: "the write gate must consult the member's OWN scope row — the arcs they were actually shown",
+  },
+  {
+    file: join("app", "api", "brain", "arcs", "recompute", "route.ts"),
+    needle: "!scopeGroups.includes(sourceGroup!)",
+    why: "PPARC-3: the claimed partition must be validated against the FRESHLY-RESOLVED scope — arc_id is sha(title), derivable without ever being served the arc",
   },
   {
     file: join("app", "api", "brain", "arcs", "route.ts"),

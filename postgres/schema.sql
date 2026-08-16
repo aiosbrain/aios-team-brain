@@ -2457,6 +2457,14 @@ create table if not exists arc_cache (
 alter table arc_cache add column if not exists facts_hash text;
 alter table arc_cache add column if not exists degraded boolean not null default false;
 
+-- One-shot migration markers (PPARC-3): a data migration whose effect must run ONCE per instance
+-- (not per replay) stamps its first-run moment here and bounds itself on it — a source-code date
+-- cannot know when a given self-host took the migration. Sole writers: the migrations themselves.
+create table if not exists migration_markers (
+  name text primary key,
+  at timestamptz not null default now()
+);
+
 -- Human corrections to narrative arcs — the ONLY human-authored input in the learning layer, and the
 -- reason it needs a real home. These used to exist solely as Graphiti episodes written inside a
 -- swallowed catch: a graph rollback destroyed them permanently, and a failed write silently reverted the

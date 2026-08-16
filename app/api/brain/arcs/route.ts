@@ -7,7 +7,8 @@ import { isRestrictedTier } from "@/lib/auth/visibility";
 import { errorResponse } from "@/lib/api/schemas";
 import { resolveAnsweringKeys } from "@/lib/query/answering";
 import { visibleGroupIds } from "@/lib/graph/group";
-import { getArcs, partitionArcScopeKey } from "@/lib/graph/arcs";
+import { getArcs } from "@/lib/graph/arcs";
+import { getFusedArcs } from "@/lib/graph/arc-fusion";
 import { selectEnforcedGraphPartitions } from "@/lib/graph/partition-read";
 import { memberEnforcement } from "@/lib/access/enforce";
 import { filterArcsByVisibleItems } from "@/lib/graph/arc-visibility";
@@ -86,16 +87,13 @@ export async function POST(req: NextRequest) {
     return errorResponse("internal", "enforcement check failed", 500);
   }
 
+  // PPARC-3 READ CUTOVER: an enforced team member's panel is the FUSION of their partitions' g:
+  // rows (design §2.2) — the p: union is no longer read here (its writers retire in PPARC-4).
+  // Fusion synthesizes AT MOST ONE missing partition inline, warms the rest under budget, and
+  // discloses coverage. Permissive teams + external members keep the tier path byte-identical.
   const groups = scopeGroups ?? visibleGroupIds(teamSlug, tier);
-  const { arcs: allArcs, freshness } = await getArcs(
-    admin,
-    team.id,
-    teamSlug,
-    tier,
-    groups,
-    keys,
-    scopeGroups ? { scopeKey: partitionArcScopeKey(team.id, scopeGroups) } : undefined
-  );
+  const fused = scopeGroups ? await getFusedArcs(admin, team.id, teamSlug, scopeGroups, keys) : null;
+  const { arcs: allArcs, freshness } = fused ?? (await getArcs(admin, team.id, teamSlug, tier, groups, keys));
 
   // The PCCB-5 evidence filter stays as defense-in-depth: a partition scope's facts are
   // principal-visible by construction, but an item restricted BETWEEN synthesis and read is not.
@@ -153,6 +151,8 @@ export async function POST(req: NextRequest) {
   }
   return Response.json({
     arcs,
+    // PPARC-3 coverage disclosure (design §2.2) — fused reads only; the tier path omits them.
+    ...(fused ? { coveredPartitions: fused.covered, totalPartitions: fused.total } : {}),
     // `degraded` is the ENVELOPE's now (R2/M6): "a leg this payload depended on failed". It subsumes the
     // old back-compat flag, which was `reason === "model_failing"` — i.e. only ever true when arcs were
     // EMPTY, since `reason` is computed solely on the empty path. The envelope's is strictly wider and
