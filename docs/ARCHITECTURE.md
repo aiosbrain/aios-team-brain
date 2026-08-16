@@ -944,9 +944,9 @@ guard enforces it, it's named.
   **PATCH 4 runs after PATCH 3 and depends on it** — the predecessor filter sits at the *retrieval*
   site, upstream of both extractors, so the combined call inherits it — enforced by the Dockerfile
   applying PATCH 3 first against the same file, and pinned compositionally across the two patch
-  guards rather than by any single test. **Merged DORMANT behind `ARG PIPEFF5_COMBINED_EXTRACTION=0`**: the default build provably serves
-  the file prod runs today (sha `49ee534a…`, the one PIPEFF-2 measured and ships), so the merge is a
-  **no-op for production**. Projected ~12–14% of graph cost, **NOT shipped on evidence** — unlike PATCH 3 this
+  guards rather than by any single test. **Merged DORMANT behind `ARG PIPEFF5_COMBINED_EXTRACTION=0`**: the off branch **asserts the served file's
+  sha256 at build time** (`49ee534a…`, the file PIPEFF-2 measured and ships), so the merge is a
+  **no-op for production** as a build-time fact rather than a claim. Projected ~12–14% of graph cost, **NOT shipped on evidence** — unlike PATCH 3 this
   changes the *prompt*, so mechanism cannot carry the quality argument and the gate is a 2-arm ×
   8-rep battery that has **not run** — paused after one rep, because at the measured
   **$5–7.50/week** of graph spend the saving is ~$3–4/month against ~$15 to finish measuring it.

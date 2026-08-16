@@ -102,9 +102,18 @@ of `graphiti/Dockerfile` has to work out whether it is live. The guard converts 
 this someday" into a dated, unavoidable decision — and if the answer is delete, that is a success of
 this design, not a failure of the lever.
 
-**What keeps the patch honest while dormant:** the existing guard runs the real patch script against
-the real anchors on every CI run. A graphiti upgrade that breaks it reddens the build whether the flag
-is on or off, so the patch cannot silently rot into something that no longer applies.
+**What keeps the patch honest while dormant — stated precisely, because the first version of this
+paragraph was false.** It said the guard "runs the real patch script against the real anchors on every
+CI run". It does not: the guard runs the real script against a **synthetic host** that reproduces the
+anchors, and with the flag off the Docker build never applies the patch to the real file at all. So
+**upstream drift is NOT detected while dormant** — a graphiti bump could move the anchors and CI would
+stay green until someone tried to enable it.
+
+What IS enforced: the off-branch asserts the served file's **sha256** at build time, so a base-image
+or PATCH 3 change that moves what "off" ships fails the build. That covers the shipped artefact, not
+the dormant patch's applicability. The applicability gap is **accepted** — it is discovered at enable
+time, which is exactly when the battery would be run anyway, and closing it would mean applying an
+unvalidated patch on every build to see whether it still fits.
 
 ### The scaling finding that matters more than this lever
 

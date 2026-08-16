@@ -423,6 +423,32 @@ describe("PIPEFF-5 is merged DORMANT — the flag and the expiry, not the prose"
     expect(dockerfile).not.toMatch(/^ARG PIPEFF5_COMBINED_EXTRACTION=1$/m);
   });
 
+  it("condition 1: NOTHING ELSE may set that name — ENV overrides ARG and both regexes stay green", () => {
+    // Codex found this after Fable had passed the anchored version, which is the whole argument for
+    // two models. The RUN reads the SHELL VARIABLE, and in Docker an ENV of the same name wins over
+    // the ARG default. Verified empirically with a throwaway build:
+    //
+    //   ARG PIPEFF5_COMBINED_EXTRACTION=0
+    //   ENV PIPEFF5_COMBINED_EXTRACTION=1        -> RUN sees "1", patch applied
+    //
+    // Both anchored assertions above still pass in that state. So the flag's value is not enough to
+    // pin — the NAME must be declared exactly once, by exactly one instruction.
+    const decls = dockerfile
+      .split("\n")
+      .filter((l) => /^\s*(ARG|ENV)\s+PIPEFF5_COMBINED_EXTRACTION\b/.test(l));
+    expect(decls).toEqual(["ARG PIPEFF5_COMBINED_EXTRACTION=0"]);
+  });
+
+  it("condition 1: the off branch asserts the served file's SHA, not merely that a marker is absent", () => {
+    // Codex, correctly: `! grep -q '<marker>'` proves the marker is absent, which is weaker than the
+    // comments around it claimed ("ships an unpatched/byte-identical file"). A change that altered
+    // graphiti.py without that literal string — or that renamed the marker — would pass it.
+    //
+    // Strengthened to a checksum, so "off ships the file prod runs today" becomes a BUILD-TIME FACT
+    // rather than a citation a reader has to trust.
+    expect(dockerfile).toMatch(/sha256sum "\$F" \| grep -q/);
+  });
+
   it("condition 1: the default branch ASSERTS the file is unpatched, so off cannot silently be on", () => {
     // The gate is not "we didn't run the patch" — it is "the file we ship does not contain it".
     // A mount, a cache layer or a reordered build could otherwise leave a patched file behind an

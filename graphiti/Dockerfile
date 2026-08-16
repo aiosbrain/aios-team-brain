@@ -227,7 +227,9 @@ RUN F=/app/.venv/lib/python3.12/site-packages/graphiti_core/graphiti.py \
 # PROVED, not asserted: built locally with this default and checksummed inside the image, the served
 # `graphiti_core/graphiti.py` is sha256 49ee534a1043760f9e3b58617f7853edd65e7e643a75f34f75267528cb0ec72d
 # — the exact file PIPEFF-2 measured and ships today. Merging PATCH 4 in this state is a NO-OP for
-# production. Re-check with:
+# production, and the OFF BRANCH ASSERTS THAT SHA at build time, so it is a build-time fact rather
+# than a claim in a comment: any change to the base image, PATCH 3 or this file that moves what
+# "off" ships FAILS THE BUILD instead of shipping quietly. Re-check by hand with:
 #   docker build -t g . && docker run --rm g sha256sum /app/.venv/lib/python3.12/site-packages/graphiti_core/graphiti.py
 # ⚠️ THE PATH NO TEST CAN SEE: a Railway SERVICE VARIABLE named PIPEFF5_COMBINED_EXTRACTION reaches
 # this ARG at build time. Setting it to 1 in the dashboard enables the unvalidated patch on the next
@@ -244,7 +246,8 @@ RUN F=/app/.venv/lib/python3.12/site-packages/graphiti_core/graphiti.py \
    && test "$(grep -c 'extracted_edges = await extract_edges(' "$F")" = "1" ; \
     else \
       echo "PIPEFF-5 combined extraction: OFF (default)" \
-   && ! grep -q 'PIPEFF-5: one extraction call' "$F" ; \
+   && ! grep -q 'PIPEFF-5: one extraction call' "$F" \
+   && sha256sum "$F" | grep -q '^49ee534a1043760f9e3b58617f7853edd65e7e643a75f34f75267528cb0ec72d ' ; \
     fi \
  && grep -q 'PIPEFF-2: carry only the SAME ITEM' "$F"
 
