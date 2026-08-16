@@ -70,9 +70,15 @@ export async function POST(req: NextRequest) {
   try {
     enforce = await memberEnforcement(admin, { teamId: team.id, memberId });
     if (enforce != null && tier === "team") {
+      // UNCAPPED deliberately (Fable 6b Medium 3 — the default K=8 made the design's "the fact
+      // pool bounds input" rationale false): arcs need the member's WHOLE ready scope, both for
+      // coverage (no undisclosed 8-partition truncation — arcs has no covered/total surface) and
+      // for key stability (a recency-churned pick set would mint new scope keys, cold-synthesizing
+      // and 403ing the correction gate on every churn).
       const scope = await selectEnforcedGraphPartitions(admin, {
         teamId: team.id,
         visibleProjectIds: [...enforce.visibleProjectIds],
+        k: Number.MAX_SAFE_INTEGER,
       });
       scopeGroups = scope.groups;
     }

@@ -95,6 +95,21 @@ describe("arc corrections are durable in Postgres (real Postgres)", () => {
     expect(own.corrections.map((c) => c.corrected_text)).toEqual(["scope X prose"]);
   });
 
+  it("PCCC6B-1: the same arc corrected in TWO scopes is two independent rows — one member's edit can never MOVE another's (Fable 6b High 2)", async () => {
+    const seed = await seedTeam();
+    await recordArcCorrections(db(), seed.teamId, seed.memberId, [
+      { arc_id: "shared-title", arc_title: "t", corrected_text: "scope A take" },
+    ], "p:acme:g_a");
+    await recordArcCorrections(db(), seed.teamId, seed.memberId, [
+      { arc_id: "shared-title", arc_title: "t", corrected_text: "scope B take" },
+    ], "p:acme:g_b");
+    // Scope A's row survives B's write — under the old team-global unique, B's upsert MOVED it.
+    const a = await listArcCorrections(db(), seed.teamId, { groupKey: "p:acme:g_a", includeLegacy: false });
+    expect(a.corrections.map((c) => c.corrected_text)).toEqual(["scope A take"]);
+    const b = await listArcCorrections(db(), seed.teamId, { groupKey: "p:acme:g_b", includeLegacy: false });
+    expect(b.corrections.map((c) => c.corrected_text)).toEqual(["scope B take"]);
+  });
+
   it("PCCC6B-1: legacy '' rows feed ONLY a scope that opts in (the tier path) — a partition scope refuses them", async () => {
     const seed = await seedTeam();
     // A pre-6b row: written before group_key existed (simulated by the column default).

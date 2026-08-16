@@ -56,6 +56,16 @@ const REQUIRED: { file: string; needle: string; why: string }[] = [
     needle: "readArcCache(admin, team.id, scopeKey)",
     why: "the write gate must consult the member's OWN scope row — the arcs they were actually shown",
   },
+  {
+    file: join("app", "api", "brain", "arcs", "route.ts"),
+    needle: "k: Number.MAX_SAFE_INTEGER",
+    why: "the arcs scope is UNCAPPED — a K-capped scope truncates coverage undisclosed and churns the cache key (Fable 6b Medium 3)",
+  },
+  {
+    file: join("app", "api", "brain", "arcs", "recompute", "route.ts"),
+    needle: "k: Number.MAX_SAFE_INTEGER",
+    why: "the recompute must resolve the SAME uncapped scope as the GET, or the write gate reads a row the member never saw",
+  },
 ];
 
 describe("PCCC-6 cutover call sites", () => {

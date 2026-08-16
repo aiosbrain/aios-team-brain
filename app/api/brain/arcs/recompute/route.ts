@@ -75,6 +75,9 @@ export async function POST(req: NextRequest) {
       const scope = await selectEnforcedGraphPartitions(admin, {
         teamId: team.id,
         visibleProjectIds: [...enforce.visibleProjectIds],
+        // Same uncapped scope as the GET (Fable 6b Medium 3) — the gate below must consult the
+        // row the member was actually served, so the two resolutions must agree.
+        k: Number.MAX_SAFE_INTEGER,
       });
       scopeGroups = scope.groups;
     }
@@ -98,7 +101,14 @@ export async function POST(req: NextRequest) {
     const cached = await readArcCache(admin, team.id, scopeKey);
     const visibleIds = new Set(filterArcsByVisibleItems(cached?.arcs ?? [], enforce.visibleItemIds).map((a) => a.id));
     if (corrections.some((c) => !visibleIds.has(c.arc_id))) {
-      return errorResponse("forbidden", "a correction targets an arc outside your visibility", 403);
+      // Fable 6b Medium 5: scope-key drift (a latch flip or General's debt toggling between the
+      // member's GET and this POST) reads a different row than the arcs they saw — fail closed,
+      // but the message must not accuse them of a visibility violation for cache churn.
+      return errorResponse(
+        "forbidden",
+        "a correction targets an arc outside your visibility, or your arc view is stale — refresh the arcs and retry",
+        403
+      );
     }
   }
 

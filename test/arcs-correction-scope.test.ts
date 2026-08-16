@@ -171,6 +171,31 @@ describe("PCCC6B-1 — the graph write-back follows the scope", () => {
     expect(graphitiMock.addEpisodes.mock.calls[0][0]).toBe(`${t}_team`);
   });
 
+  it("an EXTERNAL-shaped single-group scope writes NOTHING to the graph — a restriction-debt window's scope is exactly [<slug>_external] (Fable 6b High 1)", async () => {
+    const { recomputeArcs, partitionArcScopeKey } = await import("@/lib/graph/arcs");
+    const { db } = fakeDb();
+    const t = slug();
+    const group = `${t}_external`;
+    await recomputeArcs(db, "team-1", t, "team", [group], [CORRECTION], KEYS, null, {
+      scopeKey: partitionArcScopeKey(t, [group]),
+    });
+    expect(graphitiMock.addEpisodes).not.toHaveBeenCalled();
+  });
+
+  it("…but that scope still LOADS its own corrections — refusing would silently revert an edit made during the window (Fable 6b Medium 4)", async () => {
+    const { getArcs, partitionArcScopeKey } = await import("@/lib/graph/arcs");
+    const { db } = fakeDb();
+    const t = slug();
+    const groups = [`${t}_external`];
+    const scopeKey = partitionArcScopeKey(t, groups);
+    await getArcs(db, "team-1", t, "team", groups, KEYS, { scopeKey });
+    expect(correctionsMock.listArcCorrections).toHaveBeenCalledTimes(1);
+    expect(correctionsMock.listArcCorrections.mock.calls[0][2]).toMatchObject({
+      groupKey: scopeKey,
+      includeLegacy: false,
+    });
+  });
+
   it("the recorded correction carries the scope key it was made in", async () => {
     const { recomputeArcs, partitionArcScopeKey } = await import("@/lib/graph/arcs");
     const { db } = fakeDb();

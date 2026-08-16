@@ -2476,8 +2476,7 @@ create table if not exists arc_corrections (
   group_key text not null default '',
   created_by uuid references members(id) on delete set null,
   created_at timestamptz not null default now(),
-  updated_at timestamptz not null default now(),
-  unique (team_id, arc_id)                     -- latest take per arc wins
+  updated_at timestamptz not null default now()
 );
 create index if not exists arc_corrections_team_idx on arc_corrections (team_id, updated_at desc);
 -- Replay order (the #495 class, guard: schema-index-column-replay): a live DB that predates the
@@ -2485,6 +2484,10 @@ create index if not exists arc_corrections_team_idx on arc_corrections (team_id,
 -- altered-in here BEFORE the index below references it.
 alter table arc_corrections add column if not exists group_key text not null default '';
 create index if not exists arc_corrections_team_scope_idx on arc_corrections (team_id, group_key, updated_at desc);
+-- Latest take per arc PER SCOPE (Fable 6b High 2) — the upsert's arbiter; identically named in the
+-- migration so a migrated DB and a from-zero DB hold ONE arbiter each. Live DBs drop the old
+-- team-global unique in the migration; from-zero never creates it.
+create unique index if not exists arc_corrections_scope_arc_key on arc_corrections (team_id, group_key, arc_id);
 
 -- ── work-timeline cache (the persisted, queryable work-timeline context layer) ──
 -- The day → person → work ledger (from `items` + `tasks`) assembled by lib/dashboard/work-timeline,

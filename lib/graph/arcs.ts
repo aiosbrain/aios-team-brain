@@ -737,7 +737,15 @@ async function synthesizeArcs(
   // laundering §2.4 step 4 closes. Partition scopes are team-tier by construction (external
   // principals keep the omit path), so the tier gate below is unchanged by them.
   const effectiveScopeKey = scopeKey ?? groups.slice().sort().join(",");
-  const correctionsRead = teamTier
+  // Fable 6b Medium 4: a PARTITION scope loads its corrections even when its groups are all
+  // external-shaped (an enforced member's scope during a restriction-debt window is exactly
+  // [<slug>_external]) — the scoped row is only ever served to TEAM-tier members (the GET resolves
+  // scopes for tier==='team' only; recompute 403s external first), and the read is exact-scope, so
+  // there is no external-principal path to it. Without this, a correction recorded in that window
+  // was stored but never read back — H13's silent revert through a new door. The un-namespaced
+  // EXTERNAL TIER path stays corrections-free (the standing gate below).
+  const correctionsEligible = effectiveScopeKey.startsWith("p:") || teamTier;
+  const correctionsRead = correctionsEligible
     ? await listArcCorrections(db, teamId, {
         groupKey: effectiveScopeKey,
         includeLegacy: !effectiveScopeKey.startsWith("p:"),
@@ -1345,12 +1353,15 @@ export async function recomputeArcs(
   // context, not the correction itself.
   // PCCC6B-1: the write-back FOLLOWS THE SCOPE. Tier scope keeps today's `<slug>_team` target
   // (safe — external-tier readers never search the team group). A SINGLE-group partition scope
-  // writes to that group. A MULTI-group partition scope writes NOTHING: the correction's prose
+  // writes to that group — UNLESS it is external-shaped (Fable 6b High 1: during a restriction-debt
+  // window an enforced member's whole scope is [<slug>_external]; a team correction written there
+  // becomes a durable episode searchable by external principals forever — the exact inversion of
+  // the tier branch's safety argument). A MULTI-group partition scope writes NOTHING: the correction's prose
   // derives from the whole scope union, so any single target narrower than its derivation scope
   // re-creates the laundering §2.4 step 4 closes — the Postgres row above still feeds every
   // same-scope synthesis via the prompt, so the correction itself is never lost.
   const writebackTarget = key.startsWith("p:")
-    ? groups.length === 1
+    ? groups.length === 1 && !isExternalGroupId(groups[0])
       ? groups[0]
       : null
     : episodeGroupId(teamSlug, "team");

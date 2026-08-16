@@ -32,8 +32,9 @@ export interface StoredArcCorrection extends ArcCorrectionInput {
 export const CORRECTION_PROMPT_LIMIT = 20;
 
 /**
- * Upsert corrections for a team. Latest take per arc wins (`unique (team_id, arc_id)`) — two corrections
- * on the same arc would otherwise argue with each other inside one prompt.
+ * Upsert corrections for a team. Latest take per arc PER SCOPE wins (`arc_corrections_scope_arc_key`) —
+ * two corrections on the same arc in one scope would otherwise argue inside one prompt, while the
+ * same arc corrected in two DIFFERENT scopes is two independent editorial acts (Fable 6b High 2).
  */
 export async function recordArcCorrections(
   db: DbClient,
@@ -60,7 +61,11 @@ export async function recordArcCorrections(
       created_by: memberId,
       updated_at: now,
     })),
-    { onConflict: "team_id,arc_id" }
+    // Per-SCOPE identity (Fable 6b High 2): `arc_id` is sha(title) and near-identical scopes
+    // synthesize identical titles, so a team-global conflict target let member B's correction
+    // silently MOVE member A's row into B's scope — A's next exact-match read lost it and A's
+    // arcs reverted (H13, cross-member). One take per arc PER SCOPE.
+    { onConflict: "team_id,group_key,arc_id" }
   );
   if (error) throw new Error(`recordArcCorrections failed: ${error.message}`);
 }
