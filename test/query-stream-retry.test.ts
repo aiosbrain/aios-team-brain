@@ -93,6 +93,36 @@ describe("classifyErrorFrame — string codes must not all become retryable 502"
     }
   });
 
+  it("lets a PERMANENT type/message override a retryable NUMERIC code (gateway-normalized billing failure)", () => {
+    // A gateway wraps an upstream billing failure in a 429. Reading the number first would retry a
+    // permanently broken account and then report "the model was busy".
+    expect(classifyErrorFrame({ code: 429, type: "insufficient_quota", message: "You exceeded your current quota" }).status).toBe(401);
+    expect(classifyErrorFrame({ code: 503, type: "invalid_api_key" }).status).toBe(401);
+  });
+
+  it("keeps rate_limit_exceeded RETRYABLE (it is a genuine transient, unlike a quota failure)", () => {
+    const { status } = classifyErrorFrame({ code: 429, type: "rate_limit_exceeded", message: "Rate limit reached" });
+    expect(status).toBe(429);
+    expect(isRetryableStreamError(new StreamHttpError(status, "x"))).toBe(true);
+  });
+
+  it("classifies a 200-frame token/context-ceiling error as NON-retryable 400 (retrying can't help)", () => {
+    for (const frame of [
+      { code: "context_length_exceeded", message: "maximum context length is 8192 tokens" },
+      { message: "max_tokens is greater than the maximum" },
+      { code: 502, type: "context_length_exceeded" }, // text beats the transient-looking number
+    ]) {
+      const { status } = classifyErrorFrame(frame);
+      expect(status).toBe(400);
+      expect(isRetryableStreamError(new StreamHttpError(status, "x"))).toBe(false);
+    }
+  });
+
+  it("does NOT over-match 'insufficient' on non-billing wording", () => {
+    // "insufficient context" is not a billing failure — it must stay on the transient default.
+    expect(classifyErrorFrame({ message: "insufficient context to answer" }).status).toBe(502);
+  });
+
   it("defaults an unknown / transient-worded frame to retryable 502", () => {
     expect(classifyErrorFrame({ message: "the model is momentarily overloaded" }).status).toBe(502);
     expect(classifyErrorFrame({}).status).toBe(502);
@@ -273,6 +303,44 @@ describe("streamOpenAICompatible — a 200 stream carrying only an error frame (
     expect(caught).toBeInstanceOf(StreamHttpError);
     expect((caught as StreamHttpError).status).toBe(401);
     expect(isRetryableStreamError(caught)).toBe(false); // → withStreamRetry will NOT retry it
+  });
+
+  it("THROWS on an error frame that arrives AFTER deltas — a truncated answer must not persist as success", async () => {
+    const frames = [
+      deltaFrame("partial answer"),
+      `data: ${JSON.stringify({ error: { code: 529, message: "upstream overloaded" } })}\n\n`,
+      "data: [DONE]\n\n",
+    ];
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(streamResponse(frames)));
+    const seen: StreamAnswerEvent[] = [];
+    let caught: unknown;
+    try {
+      for await (const ev of streamOpenAICompatible(OPENAI_BACKEND, "", "", "", "", "", "q", "UTC")) seen.push(ev);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(StreamHttpError);
+    expect((caught as StreamHttpError).status).toBe(529);
+    // The partial text was streamed, but NO terminal `done` — so the route can't persist/meter it as
+    // a completed answer; it takes the catch and reports the failure instead.
+    expect(seen.map((e) => e.type)).toEqual(["delta"]);
+  });
+
+  it("does NOT retry after a post-delta error frame (no duplicated answer) — end-to-end", async () => {
+    const frames = [
+      deltaFrame("partial"),
+      `data: ${JSON.stringify({ error: { code: 529, message: "overloaded" } })}\n\n`,
+      "data: [DONE]\n\n",
+    ];
+    const fetchMock = vi.fn().mockResolvedValue(streamResponse(frames));
+    vi.stubGlobal("fetch", fetchMock);
+    const sleep = vi.fn(async () => {});
+    const ctx = { sources: [], structured: "", grounded: true } as unknown as RetrievedContext;
+    await expect(
+      drainDeltas(streamAnswer(ctx, "q", { openrouterKey: "k", openrouterModel: "m" }, [], undefined, "UTC", { sleep }))
+    ).rejects.toThrow(/529/);
+    expect(fetchMock).toHaveBeenCalledTimes(1); // committed → no retry, despite a retryable status
+    expect(sleep).not.toHaveBeenCalled();
   });
 
   it("still yields a clean empty done (no throw) when the blank has NO error frame (reasoning starvation)", async () => {

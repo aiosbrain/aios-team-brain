@@ -114,17 +114,32 @@ export function classifyErrorFrame(frame: unknown): { status: number; detail: st
   const codeStr = typeof ef.code === "string" ? ef.code : "";
   const bare = typeof frame === "string" ? frame : "";
   const detail = message || type || codeStr || bare || "provider error";
+  const haystack = `${type} ${message} ${codeStr} ${bare}`;
   const numeric =
     typeof ef.code === "number"
       ? ef.code
       : codeStr.trim() !== "" && Number.isFinite(Number(codeStr))
         ? Number(codeStr)
         : null;
+
+  // TEXT BEATS THE NUMERIC CODE for these two families, deliberately. A gateway normalizes an
+  // upstream billing failure into `{code: 429, type: "insufficient_quota"}` — reading the number
+  // first retries a permanently broken account and then tells the user "the model was busy".
+  // The `type`/`message` is the discriminator, so it is checked FIRST.
+
+  // (a) Token/context ceiling → 400. Re-sending the identical request cannot succeed; the non-200
+  // form of this is already handled by the headroom ladder in claude.ts (`looksLikeTokenLimit`).
+  if (/context[_ ]?length|maximum context|max[_ ]?tokens|max_completion_tokens|too many tokens|reduce (?:the )?(?:length|tokens)/i.test(haystack)) {
+    return { status: 400, detail };
+  }
+  // (b) Auth / billing / permission → 401. NOTE `rate_limit_exceeded` deliberately does NOT match
+  // here (it is a genuine transient) — only quota/credit/key/permission wording does.
+  if (/insufficient[_ ]?(?:quota|credit)|exceeded your current quota|invalid[_ ]?api[_ ]?key|authentication|unauthorized|permission|forbidden|billing|credits? remaining|no credits|not[_ ]?found|invalid[_ ]?request/i.test(haystack)) {
+    return { status: 401, detail };
+  }
+
   if (numeric !== null) return { status: numeric, detail };
-  const permanent = /quota|credits|invalid_api_key|authentication|invalid_request|permission|forbidden|not_found|insufficient/i.test(
-    `${type} ${message} ${codeStr} ${bare}`
-  );
-  return { status: permanent ? 401 : 502, detail };
+  return { status: 502, detail }; // unknown → treat as transient (preserves the retry default)
 }
 
 export interface StreamRetryOptions {

@@ -495,12 +495,17 @@ export async function* streamOpenAICompatible(
   // emitted — once deltas reached the client, a restart would corrupt the visible answer, so a
   // mid-stream error after partial output falls through to the empty/partial handling below. A
   // NON-retryable code (e.g. an auth error frame) is thrown with its own status so it surfaces at once.
-  if (errorFrame && emittedChars === 0) {
-    // classifyErrorFrame maps a string permanent code (invalid_api_key/insufficient_quota/…) to 401 so
-    // it surfaces instead of being retried and mislabeled "busy"; numeric/transient codes stay retryable.
-    // (Deferred: if this error frame carried a billed `usage.cost`, that spend isn't metered here — the
-    // meter lives in the route's done branch; a failed 200-error generation rarely bills. Tracked for a
-    // follow-up rather than threading db/meter into this transport layer.)
+  // ALWAYS throw when the provider sent an error frame — including after deltas already streamed.
+  // Falling through to `done` in that case made the route persist a TRUNCATED answer as a complete
+  // success and meter it as one: the user keeps the partial text already streamed but is told the turn
+  // succeeded, and chat history stores the half-answer as final. Throwing surfaces the failure (the
+  // client shows the partial text plus an error) and CANNOT cause a duplicate answer, because
+  // withStreamRetry has `emitted === true` once any event was yielded and so will not retry.
+  // classifyErrorFrame maps permanent shapes (invalid_api_key / insufficient_quota / context_length,
+  // incl. ones wearing a retryable numeric code) to non-retryable statuses, so only genuine transients
+  // are retried. (Known gap: a billed `usage.cost` on the error frame isn't metered — the meter lives
+  // in the route's done branch, not this transport layer; tracked as a follow-up.)
+  if (errorFrame) {
     const { status, detail } = classifyErrorFrame(errorFrame);
     throw new StreamHttpError(status, `LLM ${backend.model} @ ${backend.baseUrl}: stream error ${status} ${detail}`);
   }
