@@ -77,7 +77,7 @@ What the evidence does and does not support, stated at the right strength:
 | observation | strength |
 |---|---|
 | **zero** footprint rows live today (query below) | current state only — the footprint self-erases |
-| incident rows `TT35`–`TT38` have **no link rows at all** | **load-bearing.** `ensureLink` (`project.ts:276`) inserts a link row *before* any provider call, and nothing in the repo deletes one (`tasks` FK is `on delete set null`), so this mechanism cannot produce zero rows |
+| incident rows `TT35`–`TT38` have **no link rows at all** | **load-bearing, at the narrower claim.** A row that reaches its own create/update mutation has already passed `ensureLink` (`project.ts:276`), and nothing in the repo deletes a link row (`tasks` FK is `on delete set null`) — so a row that got as far as a `success: false` create cannot end with zero link rows. The broader claim draft 2 made — "`ensureLink` runs before any provider call" — is **false**: `projectRows` calls `adapter.prepare` first, which reads through `linearGraphql` (`linear.ts:113`), and `projectTask` returns early for `no_row_key` and for a missing/failed parent before reaching `ensureLink` |
 
 ```sql
 -- run against the Railway public proxy, read-only, 2026-08-16
@@ -228,10 +228,14 @@ arrived as thrown errors, so this is unproven. If it is unreachable, the slice's
 sits behind AIO-895. That is still worth shipping, but the claim must be "verified fail-open **if** Linear
 returns this documented payload shape", not "verified live behaviour".
 
-Wrong, in the other direction, if a Linear mutation that legitimately returns `success: false` exists as a NORMAL outcome — then
-this converts a working path into a hard error. The mitigation is that `success` absent is tolerated and
-only an explicit `false` refuses; a counter-example would be a Linear mutation documented to return
-`success: false` for a condition the projector should treat as benign.
+Wrong, in the other direction, if a Linear mutation that legitimately returns `success: false` exists as a
+NORMAL outcome — then this converts a working path into a hard error. A counter-example would be a Linear
+mutation documented to return `success: false` for a condition the projector should treat as benign.
+
+*(Draft 2 left the DRAFT-1 mitigation standing here — "`success` absent is tolerated and only an explicit
+`false` refuses" — while §1a had already been folded to require it. Two incompatible specs in one
+document, created by my own fold and caught in review. The mitigation is now what §1a actually says: an
+absent `success` throws unless the call site writes `successNotReturned: true`.)*
 
 Wrong in the other direction if the guard can be satisfied without the check running — a call site that
 routes through `linearMutation` but passes an `expect` naming a payload key that is always present. The
