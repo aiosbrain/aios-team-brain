@@ -256,6 +256,28 @@ honest:
   direction; this guards the other. The absence of exactly this kind of validity condition is what
   produced the last INVALID verdict.
 
+### The two arms — stated, because the spec did not say and the wrong answer is catastrophic
+
+Found while preparing the run: this document said "2 arms — incumbent vs combined" and **never said
+what file each arm runs.** That is the single most consequential thing it could have left implicit.
+
+| arm | `graphiti_core/graphiti.py` is | why |
+|---|---|---|
+| **`PATCHED3`** (incumbent) | stock 0.29.3 **+ PATCH 3** | this is **what prod runs today**. It is the thing the candidate must beat |
+| **`COMBINED`** (candidate) | stock 0.29.3 **+ PATCH 3 + PATCH 4** | the incumbent plus this lever, and nothing else |
+
+**If the incumbent arm ran STOCK 0.29.3**, the measured delta would fold in PATCH 3's
+already-shipped −25.5% and report this lever at roughly triple its real size — a confidently wrong
+number, produced by a battery that ran perfectly. PIPEFF-2's own baseline drifted once already
+(fresh-graph 25.5% quoted as prod's number until a review caught it); this is the same class, one
+layer down.
+
+**Enforced, not documented:** `scripts/graph-window-battery/build-arms.mjs` generates both files from
+the same pinned wheel copy and **asserts that `diff PATCHED3 COMBINED` is exactly what
+`patch-combined-extraction.py` produces** — the arms differ in that patch and nothing else. It refuses
+to write the files otherwise, so a mis-built arm fails before the stack starts rather than after the
+money is spent.
+
 ### The metrics, after the orphan finding
 
 | Q | metric | FAIL direction | why this and not the obvious one |
