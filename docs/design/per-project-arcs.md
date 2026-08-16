@@ -1,0 +1,104 @@
+# Per-project arcs — partition-native synthesis with serve-time fusion (design)
+
+**Status:** design, pre-code. Governs the PPARC build slices (spec `docs/specs/project-context-classification-v1.md` §6 — this design implements the spec's PRIMARY synthesis rule, "each partition's synthesis reads only its own content", and retires the principal-scoped-union sanctioned exception at cutover). `AIOS-Work: PPARC-1`.
+**Gate:** touches schema, LLM cost, and multiple surfaces (CLAUDE.md task gate) — reviewed as a plan (Fable cold read + Codex full spec eval) before any code slice opens.
+**Build-with:** fable / high — each code slice gets its own ticket, PR, and two-model adversarial review.
+**Increment:** one PR, docs only. Code is deferred to the PPARC-2..4 slices (§5).
+**Deps:** Phase C complete — PCCC-1..7 all merged (the stored pointers, per-`(item,group)` ledger, fan-out, read cutover + arming latch, and the PCCC-7 purge/sweep machinery this design consumes are all on `main` as of 2026-08-16, tip `2d808be`). No other open work is a prerequisite.
+
+**Access posture (standing, explicit):** DEFAULT-DENY throughout — every enforced read fails CLOSED on error, absence, or ambiguity (an unresolvable partition set, a failed substrate read, an unconfirmed purge, an un-latched partition all yield the omitted partition / the neutral envelope, never a wider read). The external tier keeps the §5.8b omit path and the brain-api 422 rejection contract (docs/brain-api.md) unchanged.
+
+## 1. Problem
+
+PCCC-6b gave enforced team-tier readers arcs over a PRINCIPAL-scoped union: one synthesis over exactly the reader's visible, ready partitions, cache-keyed by that scope (`p:<teamId>:<sorted groups>`). It is permission-correct (the input set is the reader's own oracle — the spec's sanctioned exception) but structurally wrong as a product, and Phase C's own review history keeps paying for it:
+
+- **One row per distinct oracle state.** Every membership grant, latch flip, or restriction window mints a NEW scope key: cold inline synthesis for the reader, an orphaned row behind them (PCCC-7 added a 7-day sweep and a cardinality bound to janitor this), and zero cache sharing between principals whose scopes differ by one project.
+- **Corrections are scoped to the oracle state, not the thing corrected.** A correction made under scope {A,B} never feeds {A,B,C} (conservative by design), and scope churn strands it — a named 6b residual with no clean fix in the union model.
+- **A single narrative fuses every visible project.** The post-merge Codex round pressed the spec's letter over exactly this; the sanctioned-exception amendment records WHY it is safe, not that it is good. An arc about initiative A citing initiative B's framing is a product defect even when permission-clean.
+- **The write-back rule has a hole shaped like the union:** a multi-group scope's correction can be written back to NO graph group (any single target narrower than its derivation scope launders — 6b Fable High 1's fold), so its graph influence is permanently absent.
+
+## 2. Decision
+
+**Synthesis becomes partition-native: one arc set PER graph partition, each synthesis reading ONLY its own group. The reader's panel is a serve-time FUSION of their visible, ready, unsuppressed partitions' arc sets.** The spec's primary rule, with no exception in play.
+
+### 2.1 The partition arc row
+
+- `arc_cache.group_key = "g:" + <graph_group_id>` — one row per partition, shared by EVERY principal who may see that partition. The `g:` namespace is new and disjoint from both the tier keys (bare sorted sets) and 6b's `p:` per-oracle keys (which the cutover retires; PCCC-7's machinery (`purgeScopedArcCache`/`sweepStaleScopedArcCache` in `lib/graph/arc-cache.ts`) already purges/sweeps `p:` rows, and slice PPARC-4 removes their writers). Group ids are rename-proof by construction (built-ins' frozen pointers, `g_<teamhex>_p_<projhex>` for initiatives) — none of the slug/teamId re-keying history recurs.
+- Synthesis input: `recentFacts([group], …)` (`lib/graph/learning.ts`) — the single group, nothing else. `factsHash`, `degraded`, continuity, and the stability skip all keep their existing per-row semantics unchanged; continuity lineage becomes per-partition, which is what makes it finally correct (today a scope change resets lineage; a partition's lineage survives every oracle change).
+- **The in-memory layer (Fable Medium 9):** `g:` keys match NO existing eviction path (`arcKeyBelongsToTeam` is slug/`p:`-shaped). PPARC-2 adds `evictPartitionArcMemory(groupId)` (exact-key, used by the per-partition purge door — a DB purge without the mem eviction serves the poisoned row for a process lifetime) and extends team-wide eviction to resolve the team's group list (built-ins' pointers + initiative pointers) — the same class PCCC-7 fixed for `p:` keys, designed in rather than re-discovered.
+- The tier rows stay for the paths that read them today (permissive teams, enforced external members via the external tier row, social discovery). Retiring the permissive tier row in favor of fusion-over-all-partitions is explicitly OUT of this design (a later product decision; the tier row is one synthesis where fusion would be N).
+
+### 2.2 Serve-time fusion
+
+- The enforced GET resolves the reader's partitions exactly as today (`selectEnforcedGraphPartitions` (`lib/graph/partition-read.ts`) — ready ∧ unsuppressed, arm-on-read, General's restriction-debt gate), then reads each partition's `g:` row and fuses. **Cap ruling (Fable Medium 7): fusion resolution stays UNCAPPED (`k: Number.MAX_SAFE_INTEGER`), as the 6b arcs route already is** — a K-capped resolution would permanently exclude beyond-cap partitions (read-driven warming means they never warm) with the disclosure unable to distinguish cold from capped-out; the PANEL cap is the only cap. Fusion itself: concatenate arc sets, order by (partition recency prior — the same `latestPushByGroup` signal (`lib/graph/extraction-health.ts`) the K-cap ranks on — then arc confidence), cap the PANEL at the existing panel size with per-partition round-robin so one busy partition cannot evict every other partition's arcs (the same skew lesson as contributor round-robin in the arcs fact pool, NARRARC-era).
+- **Synthesis fan-out budget:** a cold enforced GET does NOT synthesize every missing partition inline. It synthesizes AT MOST ONE partition inline (the highest-ranked missing one — the reader gets a real answer), serves whatever cached rows exist for the rest, and schedules the remaining misses through the existing SWR background-refresh machinery (`refreshArcsInBackground` + the `refreshing` set in `lib/graph/arcs.ts`, single-flighted per `g:` key, budget `PPARC_SYNTH_BUDGET_PER_READ` default 3 per request). The panel discloses partial coverage (`covered/total` partitions with cached arcs — the same disclosure vocabulary as the retrieve K-cap). Falsifier: if p95 panel latency or per-read LLM spend exceeds the union model's (measured on the same corpus), the budget is wrong — tune it before cutover, not after.
+- **The fused freshness envelope, designed (Fable Medium 6b):** the panel's `as_of` = the OLDEST fused partition row's `computed_at` (honest floor — never a fabricated now), `stale` = true if ANY fused row is stale, `degraded` = true if ANY fused row is degraded; the enforcing-empty NEUTRAL envelope rule carries over verbatim (an empty fused panel returns `computedNow()`; §5.7). **Panel continuity (Fable Medium 8):** fusion orders by (stable arc lineage id per partition, THEN the recency prior) so a byte-stable set of partition rows produces a byte-stable panel; panel composition churn is recorded as a per-read observable in PPARC-3 (the pre-ARCDUP blind spot must not re-open one layer up).
+- Fusion computes NO new prose (concatenation + ordering + cap only). Cross-partition synthesis stays never-computed; there is nothing for the spec exception to cover, and slice PPARC-4 retires the exception text.
+
+### 2.3 Corrections re-scope to the partition
+
+- **Write-gate ruling (Fable plan review Highs 2–3):** the recompute route accepts corrections for ONE partition per POST (`sourceGroup` is a single top-level field; a batch spanning partitions is a 422 — the UI groups edits by partition, and one partition means ONE inline synthesis, which fits the 110s/120s route budget that N could not). The claimed `sourceGroup` is validated TWICE, in order: (1) it MUST be a member of the reader's freshly-resolved enforced scope — `arc_id` is sha(title), derivable without ever being served the arc, and the evidence filter does not backstop partition visibility, so an unvalidated claim reopens the correction-poisoning door; (2) the arc id must be in THAT partition's cached row's visible set (the standing gate). Batch dedupe keys on `(sourceGroup, arc_id)` — sha(title) legitimately collides ACROSS partitions in one fused panel, and an `arc_id`-only map silently drops one human's correction.
+- `arc_corrections.group_key = "g:" + <graph_group_id>` — the partition whose arc the human corrected. The UI knows which partition an arc came from (fusion carries `sourceGroup: string` — the partition's `graph_group_id` — per arc on the wire; the response shape stays `{ arcs, reason, note, degraded, as_of, stale }` plus `coveredPartitions: number` and `totalPartitions: number`, owned by `app/api/brain/arcs/route.ts`); the recompute route validates the corrected arc id against THAT partition's cached row (the same visible-cached-arc write gate as today (`app/api/brain/arcs/recompute/route.ts`), per partition).
+- The correction feeds ONLY that partition's synthesis (exact match, as today), and the graph write-back targets exactly that group — the single-group rule with no multi-group hole (every synthesis is single-group by construction). The external-shaped refusal stays (a correction on external-shared's arcs is stored + prompt-fed but never becomes a team-authored episode in the external-searchable group).
+- **Migration for existing rows:** legacy `''` rows keep feeding the tier path only (unchanged rule). 6b/7-era `p:<teamId>:` rows: a `p:` scope containing exactly ONE group re-keys to that group's `g:` key (the correction's derivation scope was that partition — lossless); a multi-group `p:` scope CANNOT be attributed to one partition — those rows stay `p:`-keyed, feed nothing after cutover (their reads retire with the union), and are reported by count in the migration output rather than silently dropped. Human data is never deleted. **Write discipline, stated:** corrections stay LATEST-TAKE upserts under the `(team_id, group_key, arc_id)` arbiter (`arc_corrections_scope_arc_key`) — not append-only, by the standing one-take-per-arc-per-scope rule — and the re-key migration runs inside the deploy's single `pg:schema` pass (Railway preDeploy, one writer, row-level locks; no application writer runs concurrently because the release serving traffic is the OLD one until the hook exits 0). Falsifier: if prod (or any self-host) shows multi-group `p:` correction rows at migration time, the count is the honest measure of what the union model stranded — expected 0 in this deployment (0 enforcing teams as of 2026-08-16).
+
+### 2.4 Cost model
+
+- Partition-native rows are SHARED: for a team with R distinct oracle scopes over P partitions, the union model synthesizes O(R) rows; this model synthesizes O(P) — and P rows serve every reader. Steady-state LLM spend is bounded by P × (refresh rate), independent of membership churn; the fact-hash skip applies per partition (a quiet initiative never re-synthesizes).
+- The cold-start worst case (first reader on a team with many ready initiatives) is bounded by the fan-out budget + SWR: at most 1 inline + `PPARC_SYNTH_BUDGET_PER_READ` background per read, with disclosure meanwhile. No backfill job — partitions warm on demand.
+- Measured baseline to carry into the build: one `answering`-class LLM call per partition per refresh; the count changes from R-driven to P-driven. **Honest accounting (Fable Medium 5):** external-shared is synthesized TWICE on an enforcing team with external members (the `g:` row + the bare external tier row — different keys by design), and social discovery still synthesizes the full tier row; both are in the P-side count. **Pre-registered checks, BOTH directions:** (a) two readers with DIFFERENT scopes → partition-native total calls LOWER than the union's; (b) two readers SHARING one scope over N=5 partitions → partition-native is EXPECTED to cost more on first warm (N calls vs 1) — the check records the measured crossover (reads-per-refresh-window at which sharing wins) rather than pretending the model dominates everywhere.
+
+## 3. What this dissolves, named
+
+| 6b/7 residual | Fate under partition-native arcs |
+|---|---|
+| Per-oracle cache cardinality + 7-day orphan sweep for `p:` rows | Dissolved at cutover: `g:` keys are per-partition (bounded by project count); PPARC-4 retires the `p:` writers, the sweep stays for stragglers |
+| Scope-key churn stranding corrections | Dissolved: corrections key on the partition; oracle churn cannot strand them |
+| Multi-group write-back refusal (correction graph influence lost) | Dissolved: every synthesis is single-group; the write-back always has exactly one legal target (external-shaped refusal stays) |
+| The spec's principal-scoped-union sanctioned exception | Retired by PPARC-4 (docs change in the cutover slice — the primary rule stands alone again) |
+| Union arcs fusing unrelated projects' framing into one narrative | Dissolved: an arc belongs to a partition; fusion never writes prose |
+| Restriction-window cache poisoning (PCCC-7's purge doors) | Machinery carries over 1:1 — the purge/sweep target set (`lib/graph/reconcile.ts` + the projector gate in `lib/graph/project.ts`) becomes `g:` rows whose group has the pending self-purge (STRICTLY NARROWER than today's whole-team `p:` purge: only the affected partition's row dies, other partitions' rows survive a neighbor's restriction) |
+
+## 4. Acceptance criteria (each observable; the anchor is the first line)
+
+**How a cold-start builder demonstrates acceptance, exit 0:** dm-tier criteria run with
+`npm run test:datamechanics:iso test/datamechanics/pparc-partition-arcs.datamechanics.test.ts` (per-worktree
+isolated Postgres; the file is created red-first by PPARC-2/3); unit criteria with
+`npm test -- test/pparc-fusion.test.ts`; guard criteria ride `npm test` (the guards tier). Budget
+variables are INSTANTIATED here, not left symbolic: `PPARC_SYNTH_BUDGET_PER_READ` defaults to **3**
+(env-tunable, resolved via `lib/util/env.resolvePositiveInt` like `GRAPH_EXPANSION_K`), and
+criterion 7's fixture uses **N = 5** missing partitions against that default.
+
+1. `test/datamechanics/` — a partition's synthesis input contains ONLY its own group's facts: a fact present in group A and absent from group B never appears in B's arc row (spec §6 primary rule, no exception).
+2. `test/datamechanics/` — two principals with DIFFERENT oracles sharing a visible partition read the SAME `g:` row (cache sharing is the point; the union model's per-oracle rows are gone from the enforced path).
+3. `test/datamechanics/` — the fused panel of a reader who loses a partition mid-session fails closed: the lost partition's arcs are absent on the next read (partition resolution is per-read; no fused artifact caches per-principal).
+4. `test/datamechanics/` — a correction on partition A's arc feeds A's next synthesis and never B's; its write-back lands in A's group only (external-shaped target still refused).
+5. `test/datamechanics/` — the `p:`→`g:` migration re-keys single-group correction rows losslessly, leaves multi-group rows `p:`-keyed with a reported count, replays idempotently, and never deletes a correction row.
+6. `test/` (unit) — fusion is prose-free: its output arcs are FIELD-IDENTICAL to their partition rows' arcs modulo the `sourceGroup` annotation (ordering/cap/annotation only — no field of any arc is rewritten).
+9. `test/guards/` — after PPARC-4, NO writer mints `p:` keys (the inverse criterion: the read cutover alone would let a missed `scopeKey` call site re-mint per-oracle rows with the sweep janitoring the evidence; the guard asserts the writers are gone, not just unread).
+10. `test/datamechanics/` — the fused envelope: `as_of` = oldest fused row's `computed_at`, `stale`/`degraded` = any-row-true, and the enforcing-empty neutral envelope (`computedNow()`) — asserted on the wire, not assumed from §2.2.
+7. `test/datamechanics/` — the cold fan-out budget holds: a first read over N>budget missing partitions synthesizes at most 1 inline + budget in background, and the wire discloses covered/total.
+8. `test/guards/` — the PCCC-7 purge doors cover `g:` rows: a self-purge clear still purges the affected partition's row first (and ONLY that partition's — the narrower target set of §3 is asserted, not assumed).
+
+## 5. Sequencing (each slice: own ticket, PR, two-model review)
+
+Slice tickets are opened in the operator workspace's `3-log/tasks.md` (the AIOS workspace file, not a path in this repo) AT BUILD TIME (the task gate: a ticket written before its
+code, not after), keyed `PPARC-2`, `PPARC-3`, `PPARC-4`, each citing this design and `PPARC-1` as the
+governing plan ticket — the same parent-slice relationship the PCCC series used.
+
+- **PPARC-2** — the `g:` partition row + partition-native synthesis + the migration, **AND the `g:` purge-door coverage in the same slice** (Fable plan review High 1: the purge doors are `p:`-only by construction — `purgeScopedArcCache` deletes `like 'p:%'` — so a restriction move during the rollout window would purge `p:` rows and leave a poisoned `g:` row for PPARC-3 to serve; coverage must exist the moment `g:` rows are written, and only the RETIREMENT of the `p:` target belongs in PPARC-4). **Warming, ruled (High 4):** union reads in this slice schedule `g:` warming for their scope's partitions through the SWR background machinery under the SAME `PPARC_SYNTH_BUDGET_PER_READ` — deliberate, bounded double-spend for one slice, counted SEPARATELY in the pre-registered cost check so the crossover measurement stays honest. Pre-registered cost checks (§2.4, both directions) run here.
+- **PPARC-3** — serve-time fusion + the enforced read cutover (union path retired for reads; corrections re-scope lands here with the recompute-route gate).
+- **PPARC-4** — cleanup: retire the `p:` writers + the spec's sanctioned-exception text; the purge/sweep target narrowing (§3 last row); remove the union-only code paths.
+
+## 6. Falsifiers (what would prove this design wrong)
+
+- Fusion p95 panel latency **>20% above** the union model's, or per-read LLM spend **>1.5×** the union model's, on the same dm corpus and read sequence (§2.2 budget check, both numbers from the PPARC-2 pre-registered run) — the fan-out budget or the panel cap is mis-set.
+- A correction that cannot be attributed to one partition at write time (the UI failing to carry `sourceGroup`) — the re-scope premise breaks; stop and re-design the wire, do not fall back to oracle scoping.
+- The migration finding multi-group `p:` correction rows in this deployment (expected 0) — the union model stranded human data; the count decides whether a manual attribution pass is owed before cutover.
+- Panel round-robin starving a genuinely dominant partition below usefulness — the skew lesson cuts both ways; the cap policy is a product dial, not a correctness rule.
+
+## 7. Rulings on the reviewers' remaining notes (recorded, not silent)
+
+- **`covered/total` under shared rows** discloses that a mutually-visible partition was recently warmed by someone — ruled ACCEPTABLE (the content itself is mutually visible; no restricted existence is revealed) and stated here per the §5.7 discipline (Fable Low 10).
+- **Rollback past the sweep window:** reverting PPARC-3 to the union read after `p:` rows have aged out (7d) cold-stampedes one inline synthesis per active reader scope — self-healing, accepted (Fable Low 11).
+- **The PPARC-4 spec edit scopes the primary rule to the ENFORCED path** — the retained permissive tier row is itself a computed two-partition synthesis (the built-ins' partitions ARE the tier groups), so an unscoped "never computed" would contradict the shipped tier path on day one (Fable Low 12).
