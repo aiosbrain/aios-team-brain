@@ -64,6 +64,11 @@ describe("PPARC-2 — the warming budget (criterion 7's write half)", () => {
       KEYS
     );
     expect(scheduled).toBe(3); // budget holds; the fresh row consumed none of it
+
+    // The DISCRIMINATING half (a mutation survived the count-only version): a fresh-ONLY warm
+    // must schedule NOTHING — the count above can't see WHICH groups spent the budget.
+    const freshOnly = await warmPartitionArcs(db(), seed.teamId, ["fresh-group"], KEYS);
+    expect(freshOnly).toBe(0);
   });
 });
 
