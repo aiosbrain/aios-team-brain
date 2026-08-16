@@ -25,13 +25,11 @@ const LIB = path.join(ROOT, "lib");
  * point; every entry is a feature the answering-model leg is blind to.
  */
 const EXEMPT: Record<string, string> = {
-  "lib/dashboard/timeline-summary.ts":
-    "FAN-OUT: one model call per (person, day), re-run on every background rebuild. Measured 37.9 " +
-    "calls/day against 333.7 ingest_runs rows/day total and a 50-row runs panel — per-call recording " +
-    "would make the operator's panel mostly timeline summaries. Needs one row per PASS, which is a " +
-    "change to the recording primitive, not to this call site. Deferred in the spec, not forgotten.",
-  "lib/dashboard/doc-task-infer-run.ts":
-    "FAN-OUT: same shape, one call per scored doc inside a worker loop. Same fix, same slice.",
+  // BOTH FAN-OUT ENTRIES ARE GONE (LLMOBS-2). `timeline-summary` now records ONE row per pass via
+  // `withLlmPass`, and `doc-task-infer-run` takes an ordinary per-call `record:` — its exemption
+  // reason here claimed "one call per scored doc", which was FALSE: the code says ONE CALL PER WORKER,
+  // 2-3 per 12h tick. That stale reason was then copied into a spec and nearly justified an API change
+  // for a call shape that does not exist. An exemption is a claim, and claims rot.
   "lib/social/generate.ts":
     "Reaches the primitive through `lib/social/llm.ts`'s re-export, and whether social generation " +
     "belongs on the ANSWERING-MODEL leg at all is a product question, not an oversight.",
@@ -49,10 +47,22 @@ function tsFiles(dir: string): string[] {
   });
 }
 
+/**
+ * Source with comments removed.
+ *
+ * The matcher below looks for `record:`, and BOTH reviewers found it matched the string inside a
+ * COMMENT — `timeline-summary.ts` explains its own recording in prose, so deleting the real
+ * `record: pass` left the guard green and restored the exact flood this slice removes. A guard
+ * satisfiable by a sentence about the guard is the same defect that shipped in the last slice.
+ */
+function stripComments(src: string): string {
+  return src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
+}
+
 /** Files under `lib/` that call the shared completion primitive. */
 function callSites(): { file: string; src: string }[] {
   return tsFiles(LIB)
-    .map((full) => ({ file: path.relative(ROOT, full), src: readFileSync(full, "utf8") }))
+    .map((full) => ({ file: path.relative(ROOT, full), src: stripComments(readFileSync(full, "utf8")) }))
     // The primitive's own module defines them; it is not a call site.
     .filter(({ file, src }) => file !== "lib/llm/complete.ts" && /\bcompleteText(OrNull)?\s*\(/.test(src));
 }
@@ -71,6 +81,40 @@ function callSites(): { file: string; src: string }[] {
  * A derivation is perfectly correct in isolation while nothing wires it — this repo's "pin the call
  * site, not the function" rule, learned the same way.
  */
+describe("guard: the fan-out sites record through a PASS, not a per-call token", () => {
+  /**
+   * THE LOAD-BEARING LINE OF THE SLICE, and it was unpinned until both reviewers said so.
+   *
+   * Swapping `record: pass` for `record: { db, teamId, task: "timeline-summary" }` restores the
+   * per-call flood — the entire defect LLMOBS-2 removes — and every test stayed green: the coverage
+   * matcher accepts either form (and matched a comment besides), `test/timeline-summary.test.ts` mocks
+   * the whole `@/lib/llm/complete` module, and `test/llm-pass.test.ts` never touches these files.
+   *
+   * Source-level because the alternative — a data-mechanics test entering at the production path —
+   * needs a stubbed model backend that tier does not have. Named as the weaker evidence it is, rather
+   * than described as coverage it is not.
+   */
+  const FAN_OUT = ["lib/dashboard/timeline-summary.ts", "lib/dashboard/doc-task-infer-run.ts"];
+
+  it("passes the branded pass token, never a per-call object literal", () => {
+    for (const file of FAN_OUT) {
+      const src = stripComments(readFileSync(path.join(ROOT, file), "utf8"));
+      expect(src, `${file} must record through the pass`).toMatch(/record:\s*pass\b/);
+      expect(
+        src,
+        `${file} builds a per-call record — that is the flood this slice removed`
+      ).not.toMatch(/record:\s*\{[^}]*task:/);
+    }
+  });
+
+  it("opens that pass through the scoped helper, so it cannot be left unfinished", () => {
+    for (const file of FAN_OUT) {
+      const src = stripComments(readFileSync(path.join(ROOT, file), "utf8"));
+      expect(src, `${file} must use withLlmPass`).toMatch(/withLlmPass\(/);
+    }
+  });
+});
+
 describe("guard: the meetings passes record, under DISTINCT task names", () => {
   const wrapper = readFileSync(path.join(ROOT, "lib", "meetings", "llm-extract.ts"), "utf8");
   const actions = readFileSync(path.join(ROOT, "lib", "meetings", "action-items.ts"), "utf8");

@@ -219,9 +219,14 @@ describe("taskLabel", () => {
   });
 
   it("falls back readably for an unmapped slug — the guard guarantees new ones appear", () => {
-    // A raw `doc-task-infer` in an operator sentence is the defect; the fallback is the steady state
-    // after any new generation feature, not an error path.
-    expect(taskLabel("doc-task-infer")).toBe("a background task (doc-task-infer)");
+    // A raw slug in an operator sentence is the defect; the fallback is the steady state after any new
+    // generation feature, not an error path.
+    //
+    // The example used to be `doc-task-infer`, which LLMOBS-2 then MAPPED — so this assertion started
+    // failing on correct code. That is the fallback test doing its job: it demonstrates the unmapped
+    // path, so its example has to be a slug that is genuinely unmapped, and any placeholder will keep
+    // becoming real as the vocabulary grows. Hence an obviously-fictional one.
+    expect(taskLabel("some-future-feature")).toBe("a background task (some-future-feature)");
   });
 });
 

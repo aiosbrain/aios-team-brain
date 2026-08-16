@@ -2,7 +2,7 @@ import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import type { LlmBackendKeys } from "@/lib/query/llm-backend";
 import { resolveAnsweringKeys } from "@/lib/query/answering";
-import { completeTextOrNull } from "@/lib/llm/complete";
+import { completeTextOrNull, failLlmPassBeforeFirstCall, withLlmPass, type LlmPass } from "@/lib/llm/complete";
 import { summaryPromptFor, type TimelineDay } from "./timeline-group";
 
 /**
@@ -88,11 +88,31 @@ export async function attachPersonDaySummaries(
   teamId: string,
   days: TimelineDay[]
 ): Promise<SummaryPassResult> {
+  // ONE ROW PER PASS, not per call (LLMOBS-2). This fans out to a model call per (person, day) —
+  // measured 39.5/day over 14d — so a per-call `record:` would make the 50-row Recent-runs panel mostly
+  // timeline summaries within a day and a half. The pass accumulates and writes once at the end.
+  return withLlmPass({ db, teamId, task: "timeline-summary" }, (pass) =>
+    summarizeWithPass(db, teamId, days, pass)
+  );
+}
+
+async function summarizeWithPass(
+  db: DbClient,
+  teamId: string,
+  days: TimelineDay[],
+  pass: LlmPass
+): Promise<SummaryPassResult> {
   let keys: LlmBackendKeys;
   try {
     keys = await resolveAnsweringKeys(db, teamId);
   } catch {
     // Couldn't even find out which model to use — a failure, not a configuration choice.
+    //
+    // RECORDED, with zero calls. Under the first design this was an "empty pass" and wrote nothing,
+    // which made it silent FOREVER: `llm` has no staleness clock, is not a pipeline leg, and ages to
+    // `unknown` after 14 days. It is evidence — a model that WAS asked for and could not be found —
+    // and the branch below is what "off by design" looks like, which correctly stays silent.
+    failLlmPassBeforeFirstCall(pass, "could not resolve the answering model's keys");
     return { days, degraded: true };
   }
   if (!llmConfigured(keys)) return { days, degraded: false }; // summaries are off by design
@@ -108,7 +128,15 @@ export async function attachPersonDaySummaries(
         pi,
         text: await completeTextOrNull(
           { system: SYSTEM, prompt },
-          { keys, maxTokens: MAX_TOKENS, timeoutMs: TIMEOUT_MS, meter: { db, teamId, source: "timeline-summary" } }
+          {
+            keys,
+            maxTokens: MAX_TOKENS,
+            timeoutMs: TIMEOUT_MS,
+            meter: { db, teamId, source: "timeline-summary" },
+            // `meter` bills; `record` is the health leg's evidence. Only `meter` was wired here, which
+            // is why a model failing every summary read healthy.
+            record: pass,
+          }
         ).catch(() => null),
       }));
     })
