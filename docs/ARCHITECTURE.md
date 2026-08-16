@@ -930,6 +930,34 @@ guard enforces it, it's named.
   **executed**, incl. the `correction:` zero-predecessor pin),
   `test/guards/entities-per-episode.test.ts` (shared span, null-on-zero, not-in-the-alarm-path).
 
+- **The same image ALSO merges the two extraction reads into one** (PIPEFF-5 / AIO-868,
+  `graphiti/Dockerfile` PATCH 4 + `graphiti/patch-combined-extraction.py`). Stock `add_episode` reads
+  every episode **twice** — `extract_nodes` for entities, then `extract_edges` for the relations —
+  each carrying the same body, the same PATCH-3-filtered predecessors and the same entity-type block.
+  Measured on prod's ledger over the four days after PATCH 3 shipped, those two kinds are **47.6% of
+  graph spend**. 0.29.3 ships `utils/maintenance/combined_extraction.py` doing both in one call, but
+  it is reachable only from the BULK path (`bulk_utils.py:271`, default `False`, and its sole caller
+  omits it), so the REST server can never take it — hence the patch. Three anchored edits:
+  `_extract_and_resolve_edges` gains `pre_extracted_edges=None` (None ⇒ today's behaviour, byte for
+  byte), its `extract_edges` call moves under `else:`, and `add_episode` calls
+  `extract_nodes_and_edges` and threads the edges through. Everything after extraction is untouched.
+  **PATCH 4 runs after PATCH 3 and depends on it** — the predecessor filter sits at the *retrieval*
+  site, upstream of both extractors, so the combined call inherits it (pinned structurally, not
+  assumed). **Projected ~12–14% of graph cost; NOT yet shipped on evidence** — unlike PATCH 3 this
+  changes the *prompt*, so mechanism cannot carry the quality argument and the gate is a 2-arm ×
+  8-rep battery that has **not run**. One trap recorded because it nearly fooled the measurement:
+  upstream's "reduces orphaned nodes" claim is **post-processing, not model quality** —
+  `combined_extraction.py:295` deletes every node with no incident edge, so raw entity yield falls
+  **~7% mechanically** (prod's orphan share: 1,356 of 19,051) and the battery counts **connected**
+  entities instead. Its spend is metered under its own call kind, `extract_nodes_and_edges`
+  (`lib/llm/graph-call-kind.ts`): reusing `extract_nodes`'s label would hide whether the lever worked,
+  and shipping no row at all would land it in `unknown` and report a ~45% saving that is pure
+  misclassification. _Guards:_ `test/guards/graphiti-patch-combined.test.ts` (the committed script
+  RUN against a synthetic host and the patched Python **executed** — idempotency, loud failure on a
+  missing anchor, `ast` parse, both `pre_extracted_edges` directions),
+  `test/graph-call-kind.test.ts` (the combined prompt as **rendered from the deployed image**, and
+  that it is neither `unknown` nor either replaced label).
+
 ## Changing X? read this
 
 - **Add/remove an API route, DB table, or ingestion source** → update the `<!-- drift:* -->`

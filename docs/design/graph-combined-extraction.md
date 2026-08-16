@@ -400,9 +400,15 @@ it), and the table beneath restates the same set with falsifiers.
   `ast`, and the patched call path is exercised against a real episode.
 - **AC4 — unit, `test/guards/graphiti-patch-combined.test.ts`:** PATCH 3's predecessor filter still
   applies under the combined call — a single-chunk item receives zero predecessors.
-- **AC5 — data-mechanics, `test/datamechanics/graph-combined-extraction.datamechanics.test.ts`:** the
-  full per-episode call-kind profile holds (one `extract_nodes_and_edges`, one batch
-  `edge_timestamps` iff edges exist, 0..k per-edge fallbacks, zero `extract_nodes`/`extract_edges`).
+- **AC5 — unit, `test/guards/graphiti-patch-combined.test.ts`, plus a battery-harvest assertion:**
+  the combined call replaces BOTH reads (its output flows downstream; neither `extract_nodes` nor
+  `extract_edges` is called) is provable at unit level by executing the patched Python. The **full
+  per-episode call-kind profile** (one batch `edge_timestamps` iff edges exist, 0..k per-edge
+  fallbacks) is **not** — it needs a real graphiti against a real model, so it is asserted at battery
+  harvest against `llm_usage`, not in a data-mechanics test. An earlier draft of this bullet claimed
+  a `test/datamechanics/graph-combined-extraction.datamechanics.test.ts` that cannot exist: the data
+  layer has no graphiti in it. Corrected rather than satisfied by writing a test that would have
+  stubbed the very thing under test.
 - **AC6 — unit, `test/guards/graphiti-patch-combined.test.ts`:** with `pre_extracted_edges=None` the
   function's behaviour is identical to today, so the un-patched path is untouched.
 - **AC7 — unit, `test/graph-window-battery-decision.test.ts`:** the decision procedure refuses rather

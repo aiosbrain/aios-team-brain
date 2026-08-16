@@ -51,9 +51,17 @@ try {
 let captured = 0;
 let forwarded = 0;
 let failed = 0;
+// PIPEFF-5: response-capture counters, reported at shutdown beside the request ones so a run that
+// silently lost responses is visible in the tap's own summary and not only at harvest.
+let responsesCaptured = 0;
+let responsesLost = 0;
+// Monotonic, per-process. A counter rather than a random id: the capture file is read back in order
+// and a duplicate id would silently mis-pair a request with another call's response.
+let nextCallId = 0;
 
 const server = createServer((req, res) => {
   const chunks = [];
+  const callId = `${ARM}-${nextCallId++}`;
   req.on("data", (c) => chunks.push(c));
   req.on("end", async () => {
     const raw = Buffer.concat(chunks);
@@ -66,7 +74,7 @@ const server = createServer((req, res) => {
     try {
       appendFileSync(
         CAPTURE_FILE,
-        JSON.stringify({ arm: ARM, at: new Date().toISOString(), path: req.url, body: JSON.parse(raw.toString("utf8") || "{}") }) + "\n"
+        JSON.stringify({ arm: ARM, at: new Date().toISOString(), id: callId, kind: "request", path: req.url, body: JSON.parse(raw.toString("utf8") || "{}") }) + "\n"
       );
       captured++;
     } catch {
@@ -84,6 +92,27 @@ const server = createServer((req, res) => {
       res.writeHead(upstream.status, { "content-type": upstream.headers.get("content-type") ?? "application/json" });
       res.end(buf);
       forwarded++;
+
+      // PIPEFF-5: the RESPONSE, paired to its request by `id`. Q8' (orphan-drop loss rate) needs the
+      // model's raw entity list BEFORE `combined_extraction.py` deletes the unconnected ones, and
+      // that list exists nowhere else — not in `llm_usage`, not in the graph.
+      //
+      // NON-FATAL, unlike the request capture above, and the asymmetry is deliberate. The request
+      // write fires BEFORE forwarding, so failing it means unrecorded traffic would reach a paid
+      // model — that guards spend integrity and must keep killing the process. This one fires AFTER
+      // the money is spent, where exiting would turn a transient write error into an aborted paid
+      // run with nothing to show for it. Silent loss is prevented instead by the `id` pairing: the
+      // Q8' harvest REFUSES on any combined-extraction request with no paired response, so an
+      // unmeasurable Q8' reads as a refusal rather than as a low loss rate.
+      try {
+        appendFileSync(
+          CAPTURE_FILE,
+          JSON.stringify({ arm: ARM, at: new Date().toISOString(), id: callId, kind: "response", status: upstream.status, body: JSON.parse(buf.toString("utf8") || "{}") }) + "\n"
+        );
+        responsesCaptured++;
+      } catch {
+        responsesLost++;
+      }
     } catch (err) {
       failed++;
       res.writeHead(502, { "content-type": "application/json" });
@@ -96,7 +125,11 @@ server.listen(PORT, () => {
   console.log(`tap [${ARM}] :${PORT} → ${BRAIN_URL}/api/internal/llm/v1  ·  capturing to ${CAPTURE_FILE}`);
 });
 
-const report = () => console.log(`\ntap [${ARM}]: ${captured} captured · ${forwarded} forwarded · ${failed} failed`);
+const report = () =>
+  console.log(
+    `\ntap [${ARM}]: ${captured} captured · ${forwarded} forwarded · ${failed} failed · ` +
+      `${responsesCaptured} responses captured · ${responsesLost} responses LOST`
+  );
 process.on("SIGINT", () => {
   report();
   process.exit(0);

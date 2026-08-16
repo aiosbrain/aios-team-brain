@@ -63,12 +63,44 @@ const NEW_IN_0293 = {
   edge_timestamps: "You extract temporal bounds from facts. NEVER hallucinate dates.",
 } as const;
 
+/**
+ * PIPEFF-5: the COMBINED extractor's system message, RENDERED FROM THE DEPLOYED IMAGE rather than
+ * transcribed from the source file — `prompt_library.extract_nodes_and_edges.extract_message({...})`
+ * inside `aios-graphiti`, 2026-08-16. A fixture copied by eye from a prompt template is a paraphrase
+ * of the thing under test; this is the string the model actually receives.
+ */
+const COMBINED_0293_RENDERED =
+  "You are an expert knowledge graph extraction specialist for an AI agent memory system. " +
+  "You extract both entity nodes and relationship facts from conversations in a single pass. " +
+  "The extracted graph wil";
+
 describe("classifyGraphCall — graphiti_core 0.29.3's prompts (GRAPHCOST-8)", () => {
   for (const [label, system] of Object.entries(RUNTIME_0293)) {
     it(`labels ${label} on 0.29.3's wording`, () => {
       expect(classifyGraphCall(body(system))).toBe(label);
     });
   }
+
+  it("PIPEFF-5: labels the COMBINED extractor, from the really-rendered prompt", () => {
+    expect(classifyGraphCall(body(COMBINED_0293_RENDERED))).toBe("extract_nodes_and_edges");
+  });
+
+  it("PIPEFF-5: the combined call must NOT fall to `unknown` — that is the fake-saving failure", () => {
+    // Without its row, `extract_nodes`/`extract_edges` vanish from a by-kind read while their
+    // replacement lands in `unknown`, and the ledger reports a ~45% "saving" that is pure
+    // misclassification. #437's blind spot, reopened by the change whose verification depends on
+    // this table. This is the assertion that fails if the row is ever removed "as unused".
+    expect(classifyGraphCall(body(COMBINED_0293_RENDERED))).not.toBe("unknown");
+  });
+
+  it("PIPEFF-5: the combined call gets its OWN label, not the ones it replaces", () => {
+    // Reusing `extract_nodes` or `extract_edges` would make the before/after read flat — the same
+    // reason `node_summaries_batch` is distinct from `node_attributes` below.
+    const kind = classifyGraphCall(body(COMBINED_0293_RENDERED));
+    expect(kind).not.toBe("extract_nodes");
+    expect(kind).not.toBe("extract_edges");
+    expect(GRAPH_CALL_KINDS).toContain("extract_nodes_and_edges");
+  });
 
   it("labels the batched summary call — the fix — DISTINCTLY from the fan-out it replaces", () => {
     // Same label would hide whether the upgrade worked: the whole point is that node_attributes

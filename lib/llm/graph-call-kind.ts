@@ -73,6 +73,21 @@ const PROMPT_PREFIXES: readonly (readonly [kind: string, prefix: string])[] = [
   // NEW in 0.29.3: fires once per genuinely NEW edge, and only when the extractor left the dates
   // unset — so its share is model-dependent and worth watching rather than assuming.
   ["edge_timestamps", "You extract temporal bounds from facts. NEVER hallucinate dates."],
+
+  // PIPEFF-5: the COMBINED extractor, reachable only via `graphiti/Dockerfile` PATCH 4. It replaces
+  // `extract_nodes` + `extract_edges` with a single call, and it gets its OWN label rather than
+  // reusing either of theirs — for the same reason `node_summaries_batch` does: labelling a
+  // replacement with the name of what it replaced hides whether the change worked, which is the one
+  // question the ledger is being read to answer.
+  //
+  // Shipping this row is NOT optional and NOT deferrable to the deploy. Without it the merged call
+  // falls to `unknown` while `extract_nodes`/`extract_edges` vanish, and a by-kind read of the
+  // ledger shows a ~45% "saving" that is pure misclassification — the #437 blind spot, reopened by
+  // the very change whose verification depends on this table.
+  [
+    "extract_nodes_and_edges",
+    "You are an expert knowledge graph extraction specialist for an AI agent memory system.",
+  ],
 ] as const;
 
 /** Every label this classifier can emit, excluding `unknown`. Deduped: several labels are carried by
