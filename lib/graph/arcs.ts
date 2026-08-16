@@ -979,6 +979,11 @@ const MAX_ARC_MEMORY_ENTRIES = 512;
 export function arcMemoryCacheSize(): number {
   return cache.size;
 }
+/** Test-only: does the in-memory cache hold this exact key? (The fence pin's observable — the
+ *  background refresh commits through adminClient, so a capturing db never sees its write.) */
+export function arcMemoryCacheHas(key: string): boolean {
+  return cache.has(key);
+}
 export function memCacheSet(key: string, entry: { arcs: NarrativeArc[]; at: number; factsHash: string | null; degraded: boolean }): void {
   if (!cache.has(key) && cache.size >= MAX_ARC_MEMORY_ENTRIES) {
     const oldest = cache.keys().next().value;

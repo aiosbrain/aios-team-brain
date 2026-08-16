@@ -114,13 +114,19 @@ describe("PPARC-2 — the purge-generation fence (Codex High 1)", () => {
       }),
     } as unknown as DbClient;
 
+    const { arcMemoryCacheHas } = await import("@/lib/graph/arcs");
     const scheduled = await warmPartitionArcs(capturingDb, "team-fence", [group], KEYS, 1);
     expect(scheduled).toBe(1);
     await new Promise((r) => setTimeout(r, 100)); // let the refresh reach the blocked LLM call
     evictPartitionArcMemory(group); // the purge door's mem half — bumps the key's generation
     release!();
     await new Promise((r) => setTimeout(r, 400)); // let the refresh settle
-    expect(upserts.filter((u) => u.group_key === `g:${group}`)).toHaveLength(0); // commit dropped
+    // The observable is the MODULE's own memory cache: the background refresh commits through
+    // adminClient (a capturing db never sees it — the first version of this pin was
+    // green-by-construction on exactly that, caught by its surviving mutation), and commitArcs
+    // memCacheSets unconditionally before the swallowed DB write. Fence held ⇒ key absent.
+    expect(arcMemoryCacheHas(`g:${group}`)).toBe(false);
+    expect(upserts.filter((u) => u.group_key === `g:${group}`)).toHaveLength(0); // and nothing through OUR db either
   });
 });
 
