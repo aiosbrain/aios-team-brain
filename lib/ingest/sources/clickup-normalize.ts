@@ -50,6 +50,9 @@ const SPRINT_MAX = 200;
 /** Beyond this the ECMAScript Date range ends and `new Date(ms).toISOString()` throws. */
 const MAX_TIMESTAMP_MS = 8.64e15;
 
+/** `commonItemFields.body` in lib/api/item-payload-schema.ts. Exceeding it 422s the whole payload. */
+const BODY_MAX = 1_000_000;
+
 function sha256(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
@@ -305,8 +308,29 @@ export function normalizeClickUpTasks(input: NormalizeClickUpTasksInput): ItemPa
   const lines = rows.map((row, index) =>
     JSON.stringify({ row, source: taskMetadata(records[index], input.workspaceId) })
   );
+
+  // The whole workspace is ONE item, and `commonItemFields` bounds `body` at 1,000,000 chars — so at
+  // roughly 700 B/task the body crossed the cap around 1,400 tasks and the strict parser then rejected
+  // the payload, importing NOTHING. Chunking into several `task` items is NOT the fix: the row sweep in
+  // `lib/ingest/tasks.ts` deletes every synced row in the PROJECT that the incoming item omits, so a
+  // second chunk would delete the first. So `rows` (unbounded in the schema) stays complete and carries
+  // the data, and only the human-readable detail in the body is bounded.
+  //
+  // The digest is what preserves the idempotency property: it covers EVERY line, including any the body
+  // drops, so a metadata-only change still advances `content_sha256` and an identical replay still
+  // doesn't. Truncation is declared in frontmatter rather than left silent.
+  const digest = sha256(lines.join("\n"));
   const workspace = pathSegment(input.workspaceId);
-  const body = `# ClickUp import — ${workspace}\n\n${lines.join("\n")}\n`;
+  const header = `# ClickUp import — ${workspace}\n\ndigest: ${digest}\ntasks: ${rows.length}\n\n`;
+  const budget = BODY_MAX - header.length - 1;
+  const included: string[] = [];
+  let used = 0;
+  for (const line of lines) {
+    if (used + line.length + 1 > budget) break;
+    included.push(line);
+    used += line.length + 1;
+  }
+  const body = `${header}${included.join("\n")}\n`;
 
   return {
     project: projectFor(input.workspaceId),
@@ -319,6 +343,10 @@ export function normalizeClickUpTasks(input: NormalizeClickUpTasksInput): ItemPa
       source: "clickup",
       workspace_id: String(input.workspaceId),
       task_count: rows.length,
+      // Every task is in `rows` regardless; these say how much of the per-task detail the body kept.
+      detail_count: included.length,
+      detail_truncated: included.length < lines.length,
+      rows_digest: digest,
     },
     body,
     rows,
@@ -384,7 +412,21 @@ function docSourceTimestamp(doc: ClickUpDoc, pages: PageAtDepth[]): string {
   return values.length > 0 ? isoFromMilliseconds(values.reduce((a, b) => (b > a ? b : a))) : "";
 }
 
-/** One configured ClickUp Doc becomes one stable, read-only transcript item. */
+/**
+ * One configured ClickUp Doc becomes one stable, read-only DELIVERABLE item.
+ *
+ * `transcript` was wrong and silently cost the Doc all of its credit: `classifyWork` maps
+ * `transcript` from a non-Slack source to `signal`, and `work-timeline.ts` drops every
+ * `kind === "transcript"` row one line BEFORE the `emitsTicketDocuments` gate — while
+ * `isMeetingTranscript` excludes clickup too, so the Doc landed in no lane at all. A team writing its
+ * specs in ClickUp Docs would have seen zero rollup or timeline credit for them.
+ *
+ * `deliverable` is what the sidecar's own rule gives a document: "Conversations/notes are
+ * transcripts; documents are deliverables" (`DEFAULT_KIND_BY_SOURCE` in
+ * `ingestion/aios_ingest/normalize.py` — gdrive, notion and confluence are all `deliverable`). A
+ * ClickUp Doc is a document, not a meeting recording. Docs carry no `identifier`, so the ticket-document
+ * gate this connector now opts into does not touch them.
+ */
 export function normalizeClickUpDoc(workspaceId: ClickUpId, input: ClickUpReadDoc): ItemPayload {
   const pages = orderedPages(input.pages);
   const docTitle = input.doc.name?.trim() || "Untitled ClickUp Doc";
@@ -395,7 +437,13 @@ export function normalizeClickUpDoc(workspaceId: ClickUpId, input: ClickUpReadDo
     const content = page.content?.trim() ? `\n\n${page.content.trim()}` : "";
     return `${heading} ${title}${subtitle}${content}`;
   });
-  const body = `# ${docTitle}\n\n${sections.join("\n\n")}\n`;
+  // Same 1 MB `body` bound as the task item. For a Doc the body IS the content, so truncating loses
+  // real text — but exceeding the bound loses the ENTIRE Doc to a 422, which is strictly worse. Cut at
+  // the bound and SAY so, in the body and in frontmatter, rather than shipping a silently short Doc.
+  const full = `# ${docTitle}\n\n${sections.join("\n\n")}\n`;
+  const notice = "\n\n_[Truncated: this ClickUp Doc exceeds the item body limit.]_\n";
+  const bodyTruncated = full.length > BODY_MAX;
+  const body = bodyTruncated ? `${capped(full, BODY_MAX - notice.length)}${notice}` : full;
   const workspace = pathSegment(workspaceId);
   // Coerce BEFORE the Set, as `listIdsFor`/`assignee_ids` do: ClickUp returns user ids as both numbers
   // and strings (see the doc-alpha fixture), so de-duplicating first lets `7` and `"7"` both survive —
@@ -412,7 +460,7 @@ export function normalizeClickUpDoc(workspaceId: ClickUpId, input: ClickUpReadDo
   return {
     project: projectFor(workspaceId),
     path: `clickup/${workspace}/docs/${pathSegment(input.doc.id)}.md`,
-    kind: "transcript",
+    kind: "deliverable",
     content_sha256: sha256(body),
     actor: "",
     access: "team",
@@ -427,6 +475,7 @@ export function normalizeClickUpDoc(workspaceId: ClickUpId, input: ClickUpReadDo
       page_ids: pages.map(({ page }) => String(page.id)),
       source_ts: docSourceTimestamp(input.doc, pages),
       content_format: "text/md",
+      body_truncated: bodyTruncated,
     },
     body,
   };

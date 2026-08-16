@@ -12,6 +12,7 @@ import {
   type ClickUpStatusMap,
 } from "@/lib/ingest/sources/clickup-normalize";
 import { sourceRules } from "@/lib/ingest/source-rules";
+import { classifyWork } from "@/lib/dashboard/work-classification";
 import tasks101Page0 from "@/test/fixtures/clickup/synthetic-tasks-list-101-page-0.json";
 import tasks101Page1 from "@/test/fixtures/clickup/synthetic-tasks-list-101-page-1.json";
 import tasks202Page0 from "@/test/fixtures/clickup/synthetic-tasks-list-202-page-0.json";
@@ -225,6 +226,48 @@ describe("ClickUp task normalization", () => {
     expect((payload.rows as Array<Record<string, unknown>>)[0].worked_at).toBe("");
   });
 
+  it("keeps a large workspace under the body bound with every row still present", () => {
+    // The workspace is ONE item and `body` is capped at 1,000,000 chars, so ~1,400 tasks used to 422
+    // the payload and import NOTHING. Chunking isn't available (lib/ingest/tasks.ts deletes every
+    // synced row in the project that the incoming item omits, so chunk 2 would delete chunk 1), so
+    // `rows` stays complete and only the body detail is bounded.
+    const many: ClickUpTaskRecord[] = Array.from({ length: 4000 }, (_, index) => ({
+      task: { ...records[0].task, id: `big-${index}`, custom_id: null, parent: null, name: `Task ${index}` },
+      observedListIds: ["101"],
+    }));
+    const payload = normalizeClickUpTasks({ workspaceId: 9001, records: many, statusMaps: { "101": list101Map } });
+
+    expect(() => itemPayloadSchema.parse(payload)).not.toThrow();
+    expect(payload.body.length).toBeLessThanOrEqual(1_000_000);
+    expect(payload.rows).toHaveLength(4000);
+    expect(payload.frontmatter.task_count).toBe(4000);
+    expect(payload.frontmatter.detail_truncated).toBe(true);
+    // Truncation must be declared, not silent.
+    expect(payload.frontmatter.detail_count).toBeLessThan(4000);
+  });
+
+  it("advances the item sha when a task the body omitted changes", () => {
+    // The digest covers EVERY line including the dropped tail, so idempotency survives truncation: a
+    // change beyond the body cut still moves content_sha256, and an identical replay still doesn't.
+    const many = (suffix: string): ClickUpTaskRecord[] =>
+      Array.from({ length: 4000 }, (_, index) => ({
+        task: {
+          ...records[0].task,
+          id: `big-${index}`,
+          custom_id: null,
+          parent: null,
+          name: index === 3999 ? `Task ${index}${suffix}` : `Task ${index}`,
+        },
+        observedListIds: ["101"],
+      }));
+    const base = normalizeClickUpTasks({ workspaceId: 9001, records: many(""), statusMaps: { "101": list101Map } });
+    const replay = normalizeClickUpTasks({ workspaceId: 9001, records: many(""), statusMaps: { "101": list101Map } });
+    const edited = normalizeClickUpTasks({ workspaceId: 9001, records: many(" edited"), statusMaps: { "101": list101Map } });
+
+    expect(replay.content_sha256).toBe(base.content_sha256);
+    expect(edited.content_sha256).not.toBe(base.content_sha256);
+  });
+
   it("reads ClickUp's 0 as an unset date, not as the Unix epoch", () => {
     // ClickUp writes 0 for "no date". Taken literally it dated closed tasks to 1970-01-01 — which the
     // timeline reads as a real work-time — and put `due` in 1970.
@@ -267,14 +310,19 @@ describe("ClickUp task normalization", () => {
 });
 
 describe("ClickUp Doc normalization", () => {
-  it("emits one transcript in API hierarchy/order with source-provided edit time", () => {
+  it("emits one deliverable in API hierarchy/order with source-provided edit time", () => {
     const payload = normalizeClickUpDoc(9001, {
       doc: docAlpha as ClickUpDoc,
       pages: docAlphaPages as ClickUpDocPage[],
     });
 
     expect(() => itemPayloadSchema.parse(payload)).not.toThrow();
-    expect(payload.kind).toBe("transcript");
+    // DELIVERABLE, not transcript: work-timeline drops every transcript before the ticket-document
+    // gate and classifyWork calls a non-Slack transcript `signal`, so a Doc shipped as a transcript
+    // earned no rollup or timeline credit at all. Documents are deliverables (see the sidecar's
+    // DEFAULT_KIND_BY_SOURCE: gdrive, notion and confluence all are).
+    expect(payload.kind).toBe("deliverable");
+    expect(classifyWork(payload.kind, "clickup")).toBe("work");
     expect(payload.project).toBe("clickup-9001");
     expect(payload.path).toBe("clickup/9001/docs/doc-alpha.md");
     expect(payload.frontmatter).toMatchObject({

@@ -109,6 +109,46 @@ describe("ClickUpClient Docs reads", () => {
     expect(docs.map((doc) => doc.id)).toEqual(["11", "22"]);
   });
 
+  it("skips a configured Doc that is gone and still reads the rest", async () => {
+    // `Promise.all` rejected the WHOLE Docs read on the first failure, so one stale entry in the
+    // selection imported nothing. Made likelier because discoverDocs deliberately retains deleted
+    // explicit Docs, whose /pages call is what 404s.
+    const skipped: Array<{ docId: string; status: number }> = [];
+    const transport: ClickUpTransport = async (input) => {
+      const url = new URL(input);
+      if (url.pathname.endsWith("/docs/gone")) return jsonResponse({ err: "not found" }, 404);
+      if (url.pathname.endsWith("/pages")) return jsonResponse([]);
+      const id = url.pathname.split("/").at(-1)!;
+      return jsonResponse({ id, name: id });
+    };
+    const client = new ClickUpClient({
+      token: "test-clickup-token",
+      transport,
+      onSkippedDoc: (info) => skipped.push(info),
+    });
+
+    const docs = await client.readDocs(9001, { docIds: ["ok-1", "gone", "ok-2"] });
+    expect(docs.map((read) => read.doc.id)).toEqual(["ok-1", "ok-2"]);
+    expect(skipped).toEqual([{ docId: "gone", status: 404 }]);
+  });
+
+  it("still fails the Docs read on a non-gone error", async () => {
+    // The other half: tolerating 404 must not become tolerating everything. A 401 that silently
+    // dropped Docs would report a shrunken workspace as if the Docs had been deleted.
+    const transport: ClickUpTransport = async (input) => {
+      const url = new URL(input);
+      if (url.pathname.endsWith("/docs/denied")) return jsonResponse({ err: "unauthorized" }, 401);
+      if (url.pathname.endsWith("/pages")) return jsonResponse([]);
+      const id = url.pathname.split("/").at(-1)!;
+      return jsonResponse({ id, name: id });
+    };
+    const client = new ClickUpClient({ token: "test-clickup-token", transport });
+    await expect(client.readDocs(9001, { docIds: ["ok-1", "denied"] })).rejects.toMatchObject({
+      code: "http",
+      status: 401,
+    });
+  });
+
   it("fails closed on a repeated Docs cursor", async () => {
     const transport: ClickUpTransport = async () => jsonResponse({ docs: [], next_cursor: "same" });
     const client = new ClickUpClient({ token: "test-clickup-token", transport, maxPages: 5 });

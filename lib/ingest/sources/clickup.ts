@@ -96,6 +96,12 @@ export interface ClickUpReadDoc {
   pages: ClickUpDocPage[];
 }
 
+/** A configured Doc that is GONE at the source, reported instead of failing the whole read. */
+export interface ClickUpSkippedDoc {
+  docId: string;
+  status: number;
+}
+
 export interface ClickUpClientOptions {
   token: string;
   transport: ClickUpTransport;
@@ -108,6 +114,15 @@ export interface ClickUpClientOptions {
   now?: () => number;
   sleep?: ClickUpSleep;
   random?: () => number;
+  /**
+   * Called for a configured Doc that is GONE at the source (404/410). Everything else still throws.
+   *
+   * The line is deliberate: a stale entry in the Doc selection is a CONFIG fact the operator can fix,
+   * and failing the whole read over it means one deleted Doc stops the other 98 importing. An auth,
+   * rate-limit, protocol or 5xx failure is NOT that — dropping Docs there would silently under-report
+   * a workspace as if it had shrunk, so those stay fatal.
+   */
+  onSkippedDoc?: (skipped: ClickUpSkippedDoc) => void;
 }
 
 type ErrorCode = "http" | "protocol" | "pagination" | "transport";
@@ -239,6 +254,7 @@ export class ClickUpClient {
   private readonly sleep: ClickUpSleep;
   private readonly random: () => number;
   private readonly gate: ConcurrencyGate;
+  private readonly onSkippedDoc?: (skipped: ClickUpSkippedDoc) => void;
   private blockedUntilMs = 0;
 
   constructor(options: ClickUpClientOptions) {
@@ -254,6 +270,7 @@ export class ClickUpClient {
     this.sleep = options.sleep ?? defaultSleep;
     this.random = options.random ?? Math.random;
     this.gate = new ConcurrencyGate(positiveInteger(options.maxConcurrency, 4, "maxConcurrency"));
+    this.onSkippedDoc = options.onSkippedDoc;
   }
 
   private async waitForRateWindow(): Promise<void> {
@@ -476,12 +493,40 @@ export class ClickUpClient {
     });
   }
 
+  /**
+   * Resolve a settled batch, tolerating ONLY a gone-at-the-source Doc.
+   *
+   * `Promise.all` rejects on the first failure, so one stale configured Doc used to reject the entire
+   * Docs read and import nothing — the batch-abort shape this connector keeps hitting, and one made
+   * likelier by `discoverDocs` deliberately RETAINING deleted/archived explicit Docs, whose `/pages`
+   * call is exactly what 404s. Any other failure is rethrown unchanged, so a token or quota problem
+   * still fails loudly instead of quietly shrinking the workspace.
+   */
+  private settleDocs<T>(results: PromiseSettledResult<T>[], docIds: string[]): T[] {
+    const kept: T[] = [];
+    for (const [index, result] of results.entries()) {
+      if (result.status === "fulfilled") {
+        kept.push(result.value);
+        continue;
+      }
+      const reason = result.reason;
+      const gone =
+        reason instanceof ClickUpClientError &&
+        reason.code === "http" &&
+        (reason.status === 404 || reason.status === 410);
+      if (!gone) throw reason;
+      this.onSkippedDoc?.({ docId: docIds[index] ?? "", status: reason.status ?? 0 });
+    }
+    return kept;
+  }
+
   async discoverDocs(workspaceId: ClickUpId, selection: ClickUpDocSelection): Promise<ClickUpDoc[]> {
     const explicitIds = [...new Set(selection.docIds ?? [])];
-    const [explicit, underParent] = await Promise.all([
-      Promise.all(explicitIds.map((docId) => this.getDoc(workspaceId, docId))),
+    const [explicitSettled, underParent] = await Promise.all([
+      Promise.allSettled(explicitIds.map((docId) => this.getDoc(workspaceId, docId))),
       selection.parent ? this.searchDocs(workspaceId, selection.parent) : Promise.resolve([]),
     ]);
+    const explicit = this.settleDocs(explicitSettled, explicitIds);
     const byId = new Map<string, ClickUpDoc>();
     // An explicitly configured Doc remains observable even when archived/deleted so the caller can
     // surface health instead of silently treating it as an unselected Doc. Parent discovery omits
@@ -501,6 +546,10 @@ export class ClickUpClient {
 
   async readDocs(workspaceId: ClickUpId, selection: ClickUpDocSelection): Promise<ClickUpReadDoc[]> {
     const docs = await this.discoverDocs(workspaceId, selection);
-    return Promise.all(docs.map((doc) => this.readDoc(workspaceId, doc)));
+    const settled = await Promise.allSettled(docs.map((doc) => this.readDoc(workspaceId, doc)));
+    return this.settleDocs(
+      settled,
+      docs.map((doc) => String(doc.id))
+    );
   }
 }
