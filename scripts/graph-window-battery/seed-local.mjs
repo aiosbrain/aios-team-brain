@@ -29,6 +29,7 @@
  *   node scripts/graph-window-battery/seed-local.mjs
  */
 import { Client } from "pg";
+import { spawnSync } from "node:child_process";
 import { selectCorpus, verifyCorpus, countFromBody, CANDIDATE_SQL, PROJECTABLE_KINDS } from "./corpus.mjs";
 
 /** SSL only where the URL says so, so this runs against a plain local Postgres too. */
@@ -62,6 +63,27 @@ async function copyRows(src, dst, table, where, params, nulled = []) {
   return rows.length;
 }
 
+/**
+ * Count episodes per item with the projector's OWN `chunkContent`, via `count-chunks.ts`.
+ * A bridge to the one implementation, never a copy of it.
+ */
+function countWithProjector(bodiesById) {
+  const r = spawnSync(
+    "npx",
+    ["tsx", "--conditions", "react-server", "scripts/graph-window-battery/count-chunks.ts"],
+    { input: JSON.stringify(bodiesById), encoding: "utf8", maxBuffer: 256 * 1024 * 1024 }
+  );
+  if (r.status !== 0) {
+    throw new Error(`count-chunks failed (${r.status}): ${r.stderr ?? ""}`);
+  }
+  const out = JSON.parse(r.stdout);
+  const missing = Object.keys(bodiesById).filter((id) => !Number.isFinite(out[id]));
+  // Refuse rather than silently falling back to the estimate for a subset — a corpus counted two
+  // different ways is exactly the divergence this replaces.
+  if (missing.length) throw new Error(`count-chunks returned no count for ${missing.length} item(s)`);
+  return out;
+}
+
 const src = await connect(process.env.SOURCE_DATABASE_URL, "SOURCE_DATABASE_URL");
 const dst = await connect(process.env.TARGET_DATABASE_URL, "TARGET_DATABASE_URL");
 
@@ -73,16 +95,36 @@ const team = (await src.query("select * from teams order by created_at, id limit
 if (!team) throw new Error("no team in the source database");
 
 const { rows: candidates } = await src.query(CANDIDATE_SQL, [team.id, PROJECTABLE_KINDS]);
-const selection = selectCorpus(candidates.map((r) => ({ ...r, chars: Number(r.chars) })));
+
+// PIPEFF-5: count the CANDIDATES with the projector's real chunker BEFORE bucketing.
+//
+// This used to bucket and gate on `ceil(chars / CHUNK_CHARS)`, which was exact under the legacy
+// byte-offset chunker and is not under `cdc1` (PIPEFF-3). Measured 2026-08-16: the estimate said
+// **117 episodes**, the projector then pushed **164** — a 40% under-count, not the ~5% the estimate's
+// own note claimed. So `EPISODE_BUDGET`'s 90–120 gate reported "within range" for a corpus 44
+// episodes outside it, and bucket A ("≥8 chunks") was decided on a guess.
+//
+// The real chunker lives in a `server-only` module, so it is reached through `count-chunks.ts` under
+// `tsx --conditions react-server` — a bridge, NOT a second implementation. Duplicating the algorithm
+// here is the drift this suite already guards against once.
+const candidateIds = candidates.map((r) => r.id);
+const { rows: candidateBodies } = await src.query("select id, body from items where id = any($1)", [candidateIds]);
+const realChunks = countWithProjector(Object.fromEntries(candidateBodies.map((r) => [r.id, r.body ?? ""])));
+
+const selection = selectCorpus(
+  candidates.map((r) => ({ ...r, chars: Number(r.chars), chunks: realChunks[r.id] }))
+);
+if (!selection.countedExactly) throw new Error("seed-local: some candidates lack a real chunk count — refusing to select on an estimate");
 if (selection.shortfall.length) console.log(`  shortfall: ${selection.shortfall.join(" · ")}`);
 
 const ids = selection.items.map((i) => i.id);
-const { rows: bodies } = await src.query("select id, body from items where id = any($1)", [ids]);
-const bodyById = new Map(bodies.map((r) => [r.id, r.body]));
+const bodyById = new Map(candidateBodies.filter((r) => ids.includes(r.id)).map((r) => [r.id, r.body]));
 
-// Chunk the selected bodies with the projector's REAL algorithm — the SQL estimate counts Postgres
-// characters, not JS UTF-16 units, and this number gates Q5's band via EPISODE_BUDGET.
-const verified = verifyCorpus(selection, bodyById, countFromBody);
+// Verified with the SAME real counts, so `verified.episodes` is what the projector will push.
+const verified = verifyCorpus(selection, bodyById, (body) => {
+  const hit = Object.entries(realChunks).find(([id]) => bodyById.get(id) === body);
+  return hit ? hit[1] : countFromBody(body);
+});
 if (verified.divergent?.length) {
   console.log(`  ⚠ ${verified.divergent.length} item(s) where the SQL estimate and the projector disagree:`);
   for (const d of verified.divergent) console.log(`      ${d.id}: estimated ${d.estimated}, actual ${d.actual}`);

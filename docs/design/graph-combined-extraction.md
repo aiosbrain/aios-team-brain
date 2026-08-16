@@ -241,7 +241,43 @@ arithmetic.
 told the figure had doubled. C1 needs no extra reps — cost metrics measured solid at n=2 — but the
 arms run together, so the reps are shared.
 
-**Corpus drawn 2026-08-16: 31 items → 117 episodes** (budget 90–120: in range; single-chunk share
+### AMENDMENT, 2026-08-16 — the corpus gate was measuring an algorithm we stopped using
+
+Caught by the pre-run preconditions, before any rep: **the seeder's episode-budget gate was
+decorative.** It reported "117 episodes · within range" and the projector then pushed **164**.
+
+`corpus.mjs`'s `countFromBody` estimates `ceil(chars / CHUNK_CHARS)` — exact under the legacy
+byte-offset chunker, and **not a function of `length(body)` at all** under `cdc1` (PIPEFF-3, shipped
+last week). The estimate's own ⚠️ note said it "UNDER-counts by ~5%". Measured: **40%**. So the note
+was wrong too, and the `EPISODE_BUDGET` 90–120 gate passed a corpus 44 episodes outside its own
+range, while bucket A ("≥8 chunks") was being decided on a guess.
+
+**This is the PIPEFF-2 finding repeating one lever later** — there, the corpus rule yielded 153
+episodes against an assumed ~100 and silently changed what a pre-registered band meant. Same class,
+caught earlier this time: before the reps rather than at harvest.
+
+**Fixed, and the fix is a bridge not a copy.** `scripts/graph-window-battery/count-chunks.ts` runs
+under `tsx --conditions react-server` and imports the projector's own `chunkContent`; the seeder
+shells out to it and now **buckets and gates on real counts**. Duplicating the CDC algorithm in
+`.mjs` was rejected — that is the parallel-implementation drift this suite already guards against
+once. Verified: the bridge reproduces the projector's 164 exactly.
+
+**Then the honest number made the old targets infeasible.** Under `cdc1` the most recent bucket-A
+candidate is **80 episodes — two thirds of the entire budget in one document**, and with it in, the
+budget and prod's ~17% single-chunk share became mutually unsatisfiable (the only feasible draw with
+all four buckets was 120 episodes at a 9.2% share, failing the mix-match that makes C1 transferable).
+So `MAX_ITEM_EPISODES = 30` excludes single outlier documents, and targets moved A:3→4, B1:15→10,
+B2:5→6, C:8 unchanged.
+
+**What that costs, stated rather than discovered:** the battery does **not** cover documents above
+the cap, and prod has them. The claim being bought is only that one document must not be two thirds
+of a measurement whose entire purpose is a blended per-episode figure — at 8 reps its variance would
+swamp every other item. A run that wants the very-large-document case needs its own draw and its own
+budget, not this one silently stretched.
+
+**Corpus as run: 28 items → 98 episodes, single-chunk share 16.3% (prod ~17%), budget within range.**
+
+**Superseded draft note — the earlier "31 items → 117 episodes"** (budget 90–120: in range; single-chunk share
 17.1% against prod's ~17%). Earlier text assumed 108. **No band depends on that number** — Q5's gate
 is "any rise", not a per-episode fraction, so the PIPEFF-2 trap (a retry ceiling silently changing
 meaning when the corpus grew from ~100 to 153) does not reproduce here. Only the money moves, by

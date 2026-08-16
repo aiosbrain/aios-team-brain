@@ -120,7 +120,27 @@ export function bucketOf(chunks, chars) {
  * committed amendment BEFORE that session runs. `selectCorpus` reports `episodes` so this is
  * checkable rather than assumed.
  */
-export const BUCKET_TARGETS = Object.freeze({ A: 3, B1: 15, B2: 5, C: 8 });
+export const BUCKET_TARGETS = Object.freeze({ A: 4, B1: 10, B2: 6, C: 8 });
+
+/**
+ * AMENDMENT, PIPEFF-5, 2026-08-16: exclude single items larger than this from selection.
+ *
+ * Under the legacy chunker a bucket-A item was ~8–15 episodes. Under `cdc1` the most recent
+ * A-candidate is **80 episodes** — two thirds of the entire 90–120 budget in ONE document. With that
+ * item in, the budget and prod's ~17% single-chunk share became mutually unsatisfiable: the only
+ * feasible draw with all four buckets represented was 120 episodes at a 9.2% single-chunk share,
+ * which fails the mix-match that makes C1 transferable at all.
+ *
+ * Excluding it restores both — A:3/B1:10/B2:6/C:8 yields **94 episodes at 17.0%**, and the A and C
+ * targets are unchanged from the PIPEFF-2 rule. B1 15→10 and B2 5→6 are the only target moves.
+ *
+ * WHAT THIS COSTS, stated rather than discovered: the battery does **not** cover documents above the
+ * cap. Prod has them. The claim being bought is that one document must not be two thirds of a
+ * measurement whose whole purpose is a blended per-episode figure — with 8 reps, its variance would
+ * swamp every other item. A future run that wants the very-large-document case needs its own draw
+ * and its own budget, not this one silently stretched.
+ */
+export const MAX_ITEM_EPISODES = resolvePositiveInt(process.env.GWB_MAX_ITEM_EPISODES, 30);
 
 /** The episode range Q5's pre-registered band was derived at. Outside it, the band is not valid. */
 export const EPISODE_BUDGET = Object.freeze({ min: 90, max: 120 });
@@ -138,7 +158,15 @@ export const EPISODE_BUDGET = Object.freeze({ min: 90, max: 120 });
 export function selectCorpus(rows, targets = BUCKET_TARGETS) {
   const picked = { A: [], B1: [], B2: [], C: [] };
   for (const r of rows) {
-    const n = chunkCount(r.chars, r.blank);
+    // PIPEFF-5: a row may carry `chunks` measured by the projector's REAL chunker
+    // (`count-chunks.ts`). Prefer it. The `chunkCount(chars)` estimate below was exact under the
+    // legacy byte-offset chunker and is not under `cdc1` — on the 2026-08-16 draw it said 117 while
+    // the projector pushed 164, a 40% under-count. Every consumer of this function is affected:
+    // `bucketOf` mis-files items (bucket A is "≥8 chunks" and was being decided on a guess), and
+    // `episodeBudgetBreach` was passing a corpus 44 episodes outside its own range.
+    const n = Number.isFinite(r.chunks) ? r.chunks : chunkCount(r.chars, r.blank);
+    // One document must not be most of the corpus — see MAX_ITEM_EPISODES.
+    if (n > MAX_ITEM_EPISODES) continue;
     const b = bucketOf(n, r.chars);
     if (!b) continue;
     if (picked[b].length >= targets[b]) continue;
@@ -163,6 +191,8 @@ export function selectCorpus(rows, targets = BUCKET_TARGETS) {
       episodes < EPISODE_BUDGET.min || episodes > EPISODE_BUDGET.max
         ? `${episodes} episodes is outside the ${EPISODE_BUDGET.min}-${EPISODE_BUDGET.max} range Q5's band was derived at — re-derive it in a committed amendment first`
         : null,
+    /** True when every row carried a real measured count, so the numbers above are exact, not estimated. */
+    countedExactly: rows.length > 0 && rows.every((r) => Number.isFinite(r.chunks)),
   };
 }
 

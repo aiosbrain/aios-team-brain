@@ -175,13 +175,17 @@ describe("the episode budget guards Q5's band, whose number means nothing withou
    * tolerates 2.3 retries — the number unchanged, its meaning changed. This is the guard that makes
    * that visible instead of quiet.
    */
-  const big = Array.from({ length: 60 }, (_, i) => ({ id: `a${i}`, chars: 100_000 })); // 40 chunks each
+  // 25 chunks each — deliberately UNDER `MAX_ITEM_EPISODES` (PIPEFF-5), so this fixture tests the
+  // BUDGET breach and not the per-item cap. Before the cap existed these were 40-chunk items; the
+  // cap then excluded every one of them and the corpus came out empty, which would have read as
+  // "the budget no longer breaches" — a guard passing for the wrong reason.
+  const big = Array.from({ length: 60 }, (_, i) => ({ id: `a${i}`, chars: 62_500 })); // 25 chunks each
   // Read the budget rather than restate it: a test that hardcodes the constant it checks goes red
   // for a deliberate retarget and green for a typo, which is backwards.
   const rangeRe = new RegExp(`outside the ${EPISODE_BUDGET.min}-${EPISODE_BUDGET.max} range`);
 
   it("breaches when the corpus is far larger than the band was derived at", () => {
-    const got = selectCorpus(big, { A: 5, B1: 0, B2: 0, C: 0 });
+    const got = selectCorpus(big, { A: 8, B1: 0, B2: 0, C: 0 });
     expect(got.episodes).toBe(200);
     expect(got.episodeBudgetBreach).toMatch(rangeRe);
   });
