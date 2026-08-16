@@ -15,7 +15,7 @@ function on a 50,000-char document:
 | edit | chunks re-extracted (of 20) |
 |---|---|
 | edit in place, same length | 1 |
-| append at the end | 1 |
+| append at the end (66 characters) | 1 |
 | **insert 33 chars near the top** | **21 — all of them, plus the new tail** |
 
 The chunk-delta ledger (#485) already skips unchanged chunks by comparing per-chunk hashes, so it
@@ -277,7 +277,7 @@ as fixtures — not content, just lengths and edit positions where content is se
 | scenario | byte-offset (today) | CDC (required) |
 |---|---|---|
 | edit in place, same length | 1 of 20 | **conditional — see below** |
-| append at end | 1 of 20 | conditional, not yet characterised (`CDCAPPEND-1`) |
+| append at end | 1 of 20 (for a SHORT append — see below) | **conditional — see below** |
 | **insert 33 chars near the top** | **21 of 20** | **≤ 3** |
 | insert a paragraph mid-document | ~half | **≤ 3** |
 | delete a paragraph near the top | ~all | **≤ 3** |
@@ -314,6 +314,41 @@ CDC is **not** "never worse than byte offsets", and this document should never h
 dramatically better on the insertion cascade this lever exists for, and dramatically worse on an
 in-place edit that disturbs a boundary. Three earlier attempts to characterise this each blamed the
 wrong mechanism — the test carries that history so the fourth reader does not re-derive it.
+
+### `append at end` — the row that was still wrong, corrected (CDCAPPEND-1)
+
+That row promised an unconditional **1** too, and `CDCCHURN-1` deferred it rather than give it a fourth
+invented rule. Six characterisations have now been falsified; three of them during this ticket. The rule,
+stated in the coordinates the ledger pays in — `C₀`/`C₁` are the ADMITTED chunk arrays and `L` is the
+length of their longest common prefix (`test/graph-cdc.test.ts`, CDCAPPEND-1):
+
+> **churn ≤ |C₁| − L** — the number of admitted chunks after the last chunk the two chunkings share.
+>
+> (reproduce with `node scripts/cdc-churn-sweep.mjs --op append --exclude docs/design/cdc-append-churn.md,docs/design/content-defined-chunking.md`
+> — the exclusions matter because the design documents ARE the corpus, including this one)
+
+**No unconditional number belongs in this row**, and here is why each candidate for one fails:
+
+- **not 1.** For the 66-character append this document's own test applies, the corpus churns
+  `{0: ×1, 1: ×23, 2: ×3}` with the two files above excluded (`{0: ×1, 1: ×23, 2: ×5}` over the
+  unexcluded corpus the test reads) — and every one of the 2s is a document *below* the cap. The count
+  moves as the corpus does, which is why the test computes the distribution instead of pinning it.
+- **not "0 once the document fills the cap".** What must reach the cap is the **shared prefix**, not the
+  boundary count: a document at exactly 80 boundaries churns **1** (committed witness), because an
+  append moves the last one or two boundaries.
+- **not a function of length alone.** 60,000 characters of prose churn 23–24; the same 60,000 characters
+  of one repeated character churn 16, because a hash-quiet run yields far fewer cuts.
+- **not "the appended text splits the final chunk".** An append routinely changes the chunk *before* the
+  last one, and can **delete** a boundary outright: extending the tail can promote a later backup
+  boundary over an earlier one, merging two chunks into one — so the chunk count can go *down*.
+
+**The trade, both directions measured.** CDC is mildly **worse** than byte offsets on append — it re-cuts
+the tail where byte offsets only extend it. Per document, for appends shorter than `min`, the loss is at
+most **one chunk** (measured on this corpus and on 300 synthetic documents); that is the price of the
+insertion win, where CDC churns 1 against legacy's 80. The summary table at the top of this document
+measures the legacy algorithm for a **66-character** append, where 20 full chunks plus a short append
+genuinely gives exactly one new chunk — it is scoped to that append rather than left unqualified, because
+a 2,501-character append churns 2 under byte offsets too.
 
 **And in prod, after:** the projector's own `ingest_runs` records episodes per run. A week of
 editing-heavy days before and after should show the episode count per changed item fall toward the

@@ -302,6 +302,13 @@ describe("the cap only TRUNCATES — the basis on which a CDC cap-grow keeps the
 
 // ── THE CHURN TABLE (the spec's acceptance arithmetic) ───────────────────────────────────────────
 
+/**
+ * The `append at end` scenario's append, module-scoped so the scenario that APPLIES it and the
+ * CDCAPPEND-1 describe that MEASURES it cannot drift apart. They were two copies of one literal; editing
+ * either would have left the other measuring a different append with everything green (review).
+ */
+const APPEND_AT_END = " a new closing paragraph appended at the very end of the document.";
+
 describe("churn: how many chunk hashes change under a real edit — CDC vs the byte-offset algorithm", () => {
   /**
    * The spec's central claim, and it is testable for free: "Take a real document, apply a real edit,
@@ -331,7 +338,8 @@ describe("churn: how many chunk hashes change under a real edit — CDC vs the b
     },
     {
       name: "append at end",
-      edit: (t) => t + " a new closing paragraph appended at the very end of the document.",
+      edit: (t) => t + APPEND_AT_END,
+      // `max` is no longer asserted for this scenario (CDCAPPEND-1) — see the `continue`s below.
       max: 1,
     },
     {
@@ -364,7 +372,13 @@ describe("churn: how many chunk hashes change under a real edit — CDC vs the b
     // `edit in place, same length` is covered by its own describe below (CDCCHURN-1): its churn is not
     // a single number but a function of what the edit touches, and asserting a constant here is what
     // made the acceptance table wrong in the first place.
-    if (name === "edit in place, same length") continue;
+    //
+    // `append at end` is the same defect one row down (CDCAPPEND-1), and its `<= 1` was asserted against
+    // ONE fixture and ONE 66-character append. Over the live corpus that append churns 2 on several
+    // documents, and the same fixture with a 2,500-character prose append churns 3 — so the constant is
+    // a property of this fixture, not of appends. The bound, the absolute ceiling and the per-document
+    // legacy envelope live in the CDCAPPEND-1 describe below.
+    if (name === "edit in place, same length" || name === "append at end") continue;
     it(`${name} — CDC re-extracts <= ${max} chunk(s)`, () => {
       const v2 = edit(DOC_50K);
       const cdcChurn = changedCount(chunkContent(DOC_50K), chunkContent(v2));
@@ -425,7 +439,17 @@ describe("churn: how many chunk hashes change under a real edit — CDC vs the b
       // move. Both claims now live in the describe below, conditioned on what the edit actually touches.
       // The other scenarios still bind, and they are where CDC's win is real: the same corpus gives
       // CDC 1 against legacy 80 for an insertion near the top.
-      if (name === "edit in place, same length") continue;
+      //
+      // `append at end` is excluded from BOTH assertions here too (CDCAPPEND-1), and the reason is the
+      // one this comment already names for the row above, firing. The never-worse comparison PASSES for
+      // append today only by coincidence ACROSS DIFFERENT DOCUMENTS: at this scenario's own 66-character
+      // append CDC is strictly worse than byte offsets on several corpus documents, and `max <= max`
+      // survives because one FURTHER, unrelated document churns 2 under legacy. Its outcome also flips
+      // with the appended CONTENT at a fixed length — at 2,500 characters it FAILS under both of the
+      // sweep's prose fillers and PASSES under a hash-quiet one, CDC strictly better. It is REPLACED,
+      // not deleted: the CDCAPPEND-1 describe asserts `cdc <= legacy + 1` PER DOCUMENT for appends
+      // shorter than `min`, which is where that envelope is measured on both real and synthetic corpora.
+      if (name === "edit in place, same length" || name === "append at end") continue;
       cdc.sort((a, b) => a - b);
       const median = cdc[Math.floor(cdc.length / 2)];
       expect(median, `${name}: median CDC churn over real docs`).toBeLessThanOrEqual(2);
@@ -712,5 +736,318 @@ describe("CDCCHURN-1: in-place same-length churn is the number of chunks the edi
     // A floor, not a pinned count: today 14 of 25 documents classify strict, and pinning that number
     // would re-create the corpus dependence this ticket exists to remove.
     expect(counts.strict, "no live document classified strict — the assertion above ran on nothing").toBeGreaterThan(0);
+  });
+});
+
+// ── CDCAPPEND-1: what an append at the end actually costs ────────────────────────────────────────
+
+/**
+ * The acceptance table promised an unconditional **1** for `append at end`. SIX characterisations of that
+ * row have now been falsified, and the last three were falsified during this ticket:
+ *
+ *   1. "churn is 1" — `docs/ARCHITECTURE.md` churns 0 (past the cap) and SEVERAL corpus documents churn
+ *      2 at this file's own 66-character append. The exact count is corpus-dependent — this branch's own
+ *      commits moved it — so "THE ROW'S OWN CLAIM" below computes the distribution instead of pinning it;
+ *   2. "1 unless the appended text splits the final chunk, then 2" — the 2s are not splits of the final
+ *      chunk; the new cut lands INSIDE the appended region and moves the chunk before it too;
+ *   3. "2 is the ceiling" — holds only below `min`; 9,000 characters churn 4–5 and 60,000 churn 23–24;
+ *   4. "1 + the number of new chunks, or 0 when capped" — 446 of 540 swept samples (82.6%). A final
+ *      chunk taken by the `n - start <= min` short-tail exit gets a real cut once the document grows, so
+ *      a boundary moves without a chunk being added;
+ *   5. the bound stated over the BOUNDARY sequences — false for a whitespace-only body, because
+ *      `chunkCdc` trims to `[]` while `cdcBoundaries` does not: 20,000 spaces plus one `x` churns 6
+ *      against a boundary-form bound of 1 (WHITESPACE fixture);
+ *   6. "0 once the document fills the cap" — false: a document at exactly 80 boundaries churns 1. What
+ *      must reach the cap is the SHARED PREFIX, not the boundary count (CAPPED fixture).
+ *
+ * THE RULE, stated in the coordinates the cost is paid in — `C0`/`C1` are the ADMITTED chunk arrays and
+ * `L` is the length of their longest common prefix:
+ *
+ *   **churn <= |C1| - L.**
+ *
+ * That is a theorem, and a weak one: it holds for ANY two string arrays, since elements below `L` are
+ * members of the before-set by definition. So it is asserted because it is what the design document
+ * claims, NOT as evidence — the live guards are the ABSOLUTE ceiling and the legacy envelope below, and
+ * the informative measurement is that the bound is TIGHT under the set metric (560/560 swept samples)
+ * everywhere except duplicate content.
+ *
+ * Reproduce every number with
+ * `node scripts/cdc-churn-sweep.mjs --op append --exclude docs/design/cdc-append-churn.md`.
+ * `--exclude` is load-bearing: the design documents are the corpus, so a document publishing a
+ * distribution is inside it — an earlier draft's table had already gone stale by the time it was read.
+ */
+describe("CDCAPPEND-1: append churn is a bound, not a number", () => {
+  const changedCount = (before: string[], after: string[]): number => {
+    const seen = new Set(before);
+    return after.filter((c) => !seen.has(c)).length;
+  };
+  const positionalCount = (before: string[], after: string[]): number =>
+    after.filter((c, i) => before[i] !== c).length;
+  const legacy = (t: string) => chunkContentLegacy(t, CHUNK_CHARS, MAX_EPISODE_CHUNKS);
+
+  /** The last chunk the two chunkings share. In CHUNK coordinates, which is where the cost is paid. */
+  const sharedPrefix = (before: string[], after: string[]): number => {
+    let l = 0;
+    while (l < before.length && l < after.length && before[l] === after[l]) l++;
+    return l;
+  };
+  const bound = (before: string[], after: string[]): number =>
+    Math.max(0, after.length - sharedPrefix(before, after));
+
+  /**
+   * THE ABSOLUTE CEILING — the one thing here a regressed chunker cannot satisfy by construction.
+   *
+   * `bound` is computed from the chunker's own output, so a chunker that re-cuts deeply just shrinks `L`
+   * and inflates the bound to match. This ceiling comes from the SIZE ENVELOPE instead: only boundaries
+   * whose chunk start lies within `max` of the old end can move (`cdcBoundaries` reads
+   * `text[start … min(start + max, n))`), non-final chunks are at least `min`, so at most
+   * `1 + floor((max-1)/min)` of them are in play — and the appended text adds at most `ceil(A/min)`.
+   *
+   * DERIVED from `CDC_PARAMS`, never hardcoded, so a parameter change moves the ceiling with it.
+   */
+  const DEPTH_CEILING = 1 + Math.floor((CDC_PARAMS.max - 1) / CDC_PARAMS.min);
+  const absoluteCeiling = (appendLength: number): number =>
+    DEPTH_CEILING + Math.ceil(appendLength / CDC_PARAMS.min);
+
+  /** Two append CONTENTS at every length: churn depends on the appended text, not only its size. */
+  const prose = (n: number) => doc(n, 77);
+  const quiet = (n: number) => "a".repeat(n);
+  const APPEND_LENGTHS = [1, 66, 700, 1_249, 2_500, 9_000];
+  const CONTENTS: [string, (n: number) => string][] = [
+    ["prose", prose],
+    ["quiet", quiet],
+  ];
+  /** THE literal the `append at end` scenario applies, not a copy of it. */
+  const SCENARIO_APPEND = APPEND_AT_END;
+
+  it("LIVE CORPUS: set churn never exceeds the bound, per document and per append content", () => {
+    const docs = repoDocs();
+    // A bound assertion over an empty or single-document corpus is green by construction.
+    expect(docs.length, "the corpus is too small for this assertion to mean anything").toBeGreaterThan(5);
+    let tight = 0;
+    let slack = 0;
+    for (const t of docs) {
+      const before = chunkContent(t);
+      for (const len of APPEND_LENGTHS)
+        for (const [name, make] of CONTENTS) {
+          const after = chunkContent(t + make(len));
+          const churn = changedCount(before, after);
+          expect(churn, `${name} append of ${len} exceeded the bound`).toBeLessThanOrEqual(
+            bound(before, after)
+          );
+          if (churn === bound(before, after)) tight++;
+          else slack++;
+        }
+    }
+    // REPORTED, not gated. Equality is what the swept corpus shows today (560/560), but a future
+    // document quoting another one verbatim would legitimately come in under the bound, and reddening
+    // CI on an unrelated docs edit is not what this rule is for. The DUPLICATE fixture gates the
+    // inequality where it is deterministic.
+    expect(tight + slack).toBeGreaterThan(0);
+  });
+
+  it("LIVE CORPUS: the ABSOLUTE ceiling holds — the guard that cannot self-adjust", () => {
+    // This is the assertion a regressed chunker fails. Deliberately NOT a fitted constant: it is derived
+    // from `CDC_PARAMS` and the append length. It is also LOOSE — see the ceiling test below, which
+    // records what it does not catch rather than leaving that to be discovered.
+    for (const t of repoDocs())
+      for (const len of APPEND_LENGTHS)
+        for (const [name, make] of CONTENTS) {
+          const churn = changedCount(chunkContent(t), chunkContent(t + make(len)));
+          expect(churn, `${name} append of ${len} passed the absolute ceiling`).toBeLessThanOrEqual(
+            absoluteCeiling(len)
+          );
+        }
+  });
+
+  it("the absolute ceiling is DERIVED from the envelope, and its looseness is stated not hidden", () => {
+    // Independently-written arithmetic, NOT the definition restated: the first version of this asserted
+    // `1 + Math.floor((max - 1) / min)`, which is `expect(x).toBe(x)` and survives a mutation that edits
+    // the formula itself. Review caught it.
+    expect(DEPTH_CEILING).toBe(4); // 1 + floor(3999 / 1250), at the shipped 1,250/4,000 envelope
+    // WHAT THIS DOES NOT CATCH, both reviewers independently: at a 60,000-character prose append the
+    // corpus churns 23–24 against a ceiling of 4 + ceil(60000/1250) = 52, so a chunker that cut the
+    // appended region at `min` instead of `target` would roughly DOUBLE every long append's cost and
+    // still pass. Tight coverage exists only in the short-append regime (the envelope test below).
+    expect(absoluteCeiling(60_000)).toBe(52);
+  });
+
+  it("LIVE CORPUS: divergence depth stays inside the DERIVED ceiling, not the observed maximum", () => {
+    // The observed maximum is 2 on this corpus and 3 on the sweep's synthetic documents, so 2 is an
+    // observation and asserting it would pin the corpus. `CDCCHURN-1` published a sparse-grid maximum as
+    // if it were a bound; this asserts the derived 4 and reports the observation.
+    let observed = 0;
+    for (const t of repoDocs())
+      for (const len of APPEND_LENGTHS)
+        for (const [, make] of CONTENTS) {
+          const b0 = cdcBoundaries(t, CDC_PARAMS);
+          const b1 = cdcBoundaries(t + make(len), CDC_PARAMS);
+          let l = 0;
+          while (l < b0.length && l < b1.length && b0[l] === b1[l]) l++;
+          const depth = b0.length - l;
+          expect(depth, "an append moved more boundaries than the size envelope permits").toBeLessThanOrEqual(
+            DEPTH_CEILING
+          );
+          observed = Math.max(observed, depth);
+        }
+    expect(observed, "no boundary moved at all — the assertion above ran on nothing").toBeGreaterThan(0);
+  });
+
+  it("CAPPED FIXTURE: the SHARED PREFIX must reach the cap — 'the document is past the cap' does not", () => {
+    // The characterisation this fixture exists to kill was in the proposed replacement row, which would
+    // have made it the fifth wrong answer shipping as documentation.
+    const past = doc(400_000, 7);
+    expect(cdcBoundaries(past, CDC_PARAMS).length).toBeGreaterThan(MAX_EPISODE_CHUNKS + 1);
+    const beforePast = chunkContent(past);
+    const afterPast = chunkContent(past + prose(2_500));
+    expect(sharedPrefix(beforePast, afterPast)).toBe(MAX_EPISODE_CHUNKS);
+    expect(changedCount(beforePast, afterPast), "a shared prefix at the cap must cost nothing").toBe(0);
+
+    // …and the counter-case, which is the whole point: EXACTLY at the cap, churn is 1, not 0.
+    const atCap = past.slice(0, 214_526);
+    expect(
+      cdcBoundaries(atCap, CDC_PARAMS).length,
+      "the fixture drifted off the exact-cap boundary count it is built on"
+    ).toBe(MAX_EPISODE_CHUNKS);
+    const beforeAt = chunkContent(atCap);
+    const afterAt = chunkContent(atCap + prose(2_500));
+    expect(sharedPrefix(beforeAt, afterAt)).toBeLessThan(MAX_EPISODE_CHUNKS);
+    expect(changedCount(beforeAt, afterAt), "a document AT the cap must not churn 0").toBeGreaterThan(0);
+  });
+
+  it("MERGE FIXTURE: a one-character append can DELETE a boundary", () => {
+    // The backup-boundary preference is "the first backup hit at or after `target`, otherwise the first
+    // backup hit at all" (lib/graph/cdc.ts). Extending the tail by one character extends the search
+    // window by one; if that position satisfies the backup mask AND sits past `target`, it OUTRANKS the
+    // earlier backup and the previous cut ceases to exist — two chunks merge into one.
+    //
+    // WHICH CHARACTER IS NOT INCIDENTAL. On the live document this was first observed against, `q`, `%`
+    // and `5` delete the boundary while `x`, `a`, `z`, space, `.` and newline do not; the sweep's own
+    // length-1 samples use `z` and `a` and so never saw the event. Checked in here rather than pinned to
+    // live content for exactly that reason.
+    const t = doc(30_000, 90);
+    const before = cdcBoundaries(t, CDC_PARAMS);
+    const after = cdcBoundaries(t + "#", CDC_PARAMS);
+    expect(after.length, "the fixture stopped exercising the merge").toBe(before.length - 1);
+    expect(before, "the vanishing boundary was not there to begin with").toContain(29_818);
+    expect(after, "the boundary survived — the merge did not happen").not.toContain(29_818);
+    // The bound holds through it, which is why the rule is stated against the shared prefix rather than
+    // against the chunk count: the count went DOWN.
+    const beforeChunks = chunkContent(t);
+    const afterChunks = chunkContent(t + "#");
+    expect(afterChunks.length).toBeLessThan(beforeChunks.length);
+    expect(changedCount(beforeChunks, afterChunks)).toBeLessThanOrEqual(bound(beforeChunks, afterChunks));
+  });
+
+  it("DUPLICATE FIXTURE: set churn is STRICTLY below the bound — the rule is an inequality", () => {
+    // The only branch that proves the rule is not an equality, and nothing on the live corpus reaches it.
+    // `lib/graph/project.ts` filters by `new Set(chunk_shas)` MEMBERSHIP, so a re-cut chunk whose content
+    // already exists anywhere in the document costs nothing.
+    const t = doc(60_000, 21);
+    const before = chunkContent(t);
+    const after = chunkContent(t + t);
+    expect(changedCount(before, after), "the fixture stopped exercising the inequality").toBeLessThan(
+      bound(before, after)
+    );
+    // …and the positional count sits ON the bound, which is what makes the gap a metric difference
+    // rather than a miscount.
+    expect(positionalCount(before, after)).toBe(bound(before, after));
+  });
+
+  it("DUPLICATE, the other direction: appending an existing chunk VERBATIM saves nothing", () => {
+    // Only a realignment that reproduces WHOLE chunks pays. Appending one existing chunk does not,
+    // because the boundary shift means the re-cut chunks are not byte-identical to the original — so the
+    // fixture above needs self-concatenation and a smaller duplicate would prove nothing.
+    const t = doc(60_000, 22);
+    const before = chunkContent(t);
+    const after = chunkContent(t + before[5]);
+    expect(changedCount(before, after)).toBe(bound(before, after));
+  });
+
+  it("WHITESPACE FIXTURE: the bound holds for a whitespace-only base — the case that killed the boundary form", () => {
+    // `chunkCdc` returns [] for a whitespace-only body while `cdcBoundaries` still returns boundaries, so
+    // stating the rule over BOUNDARY sequences gives a non-empty shared prefix over an EMPTY before-set.
+    // Both spec reviewers produced this independently. In chunk coordinates the case is covered rather
+    // than excluded: C0 = [], so L = 0 and the bound is |C1|.
+    const t = " ".repeat(20_000);
+    const before = chunkContent(t);
+    const after = chunkContent(t + "x");
+    expect(before, "the whitespace guard changed — this fixture is measuring something else now").toEqual([]);
+    const churn = changedCount(before, after);
+    expect(churn).toBe(6);
+    expect(churn).toBeLessThanOrEqual(bound(before, after));
+    // The refutation itself, pinned: the boundary-coordinate form would have said 1.
+    const b0 = cdcBoundaries(t, CDC_PARAMS);
+    const b1 = cdcBoundaries(t + "x", CDC_PARAMS);
+    let l = 0;
+    while (l < b0.length && l < b1.length && b0[l] === b1[l]) l++;
+    const boundaryFormBound = Math.max(0, Math.min(MAX_EPISODE_CHUNKS, b1.length) - l);
+    expect(churn, "the boundary-coordinate form is no longer refuted by this fixture").toBeGreaterThan(
+      boundaryFormBound
+    );
+  });
+
+  it("GROWTH FIXTURE: churn grows with append length AND differs with append content at the same length", () => {
+    const t = doc(50_000, 3);
+    const before = chunkContent(t);
+    const churnOf = (make: (n: number) => string, len: number) =>
+      changedCount(before, chunkContent(t + make(len)));
+    const proseSeries = APPEND_LENGTHS.map((len) => churnOf(prose, len));
+    for (let i = 1; i < proseSeries.length; i++)
+      expect(proseSeries[i], `churn fell from ${APPEND_LENGTHS[i - 1]} to ${APPEND_LENGTHS[i]}`).toBeGreaterThanOrEqual(
+        proseSeries[i - 1]
+      );
+    // No constant ceiling is asserted for any length — a ceiling is what made this row wrong four times.
+    // A FLOOR at 9,000 is asserted instead, because "conditional on length" needs a test, not prose.
+    expect(churnOf(prose, 9_000)).toBeGreaterThanOrEqual(4);
+    // …and the same length under different content churns differently, which is the fifth thing the row
+    // never mentioned: a hash-quiet run yields few cuts, so it becomes fewer chunks than prose does.
+    expect(churnOf(quiet, 9_000)).toBeLessThan(churnOf(prose, 9_000));
+  });
+
+  it("ENVELOPE: for a short append CDC is at most ONE chunk worse than byte offsets, PER DOCUMENT", () => {
+    // This REPLACES `max(cdc) <= max(legacy)` for this scenario rather than deleting it. That comparison
+    // is not a property of appends: at the scenario's own 66-character append CDC is strictly worse than
+    // byte offsets on several corpus documents, and it passes only because one FURTHER, unrelated document
+    // churns 2 under legacy — max against max, across different documents. Its outcome also flips with
+    // the appended content at a fixed length. Deleting it outright would leave no cross-algorithm guard
+    // at all, which is what both spec reviewers refused.
+    //
+    // Scoped to appends shorter than `min`, where the +1 envelope is measured on BOTH the live corpus and
+    // 300 synthetic documents. For longer appends the gap reaches +2 synthetically, so it is reported by
+    // the sweep and not gated here — this file does not gate on a lower bound.
+    const docs = repoDocs();
+    expect(docs.length).toBeGreaterThan(5);
+    let worse = 0;
+    for (const t of docs)
+      for (const len of APPEND_LENGTHS.filter((n) => n < CDC_PARAMS.min))
+        for (const [name, make] of CONTENTS) {
+          const app = make(len);
+          const cdc = changedCount(chunkContent(t), chunkContent(t + app));
+          const leg = changedCount(legacy(t), legacy(t + app));
+          expect(cdc, `${name} append of ${len}: CDC is more than one chunk worse than byte offsets`).toBeLessThanOrEqual(
+            leg + 1
+          );
+          if (cdc > leg) worse++;
+        }
+    // The trade is real and visible rather than asserted away: CDC IS worse than byte offsets on append.
+    expect(worse, "no document is worse under CDC — the envelope is measuring nothing").toBeGreaterThan(0);
+  });
+
+  it("THE ROW'S OWN CLAIM: the scenario append does not churn a constant", () => {
+    // Criterion 17. The design row may not carry an unconditional number, and the previous draft's
+    // replacement text ("1 for a short append to a document below the cap") was refuted by exactly this
+    // distribution — every one of those 2s is a below-cap document. Without this test that gloss passes
+    // every other criterion in the spec.
+    const distribution = new Map<number, number>();
+    for (const t of repoDocs()) {
+      const churn = changedCount(chunkContent(t), chunkContent(t + SCENARIO_APPEND));
+      distribution.set(churn, (distribution.get(churn) ?? 0) + 1);
+    }
+    expect(distribution.size, "the scenario append churns one constant — the row could state it").toBeGreaterThan(1);
+    expect(distribution.get(2) ?? 0, "no document churns 2 — 'always 1' would be defensible again").toBeGreaterThan(0);
+    // The 0 comes from a document past the cap; if the corpus loses it, the cap branch of the row is no
+    // longer exercised live and the CAPPED fixture is the only thing holding it.
+    expect((distribution.get(0) ?? 0) + (distribution.get(1) ?? 0)).toBeGreaterThan(0);
   });
 });
