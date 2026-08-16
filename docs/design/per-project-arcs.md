@@ -78,7 +78,7 @@ criterion 7's fixture uses **N = 5** missing partitions against that default.
 9. `test/guards/` — after PPARC-4, NO writer mints `p:` keys (the inverse criterion: the read cutover alone would let a missed `scopeKey` call site re-mint per-oracle rows with the sweep janitoring the evidence; the guard asserts the writers are gone, not just unread).
 10. `test/datamechanics/` — the fused envelope: `as_of` = oldest fused row's `computed_at`, `stale`/`degraded` = any-row-true, and the enforcing-empty neutral envelope (`computedNow()`) — asserted on the wire, not assumed from §2.2.
 7. `test/datamechanics/` — the cold fan-out budget holds: a first read over N>budget missing partitions synthesizes at most 1 inline + budget in background, and the wire discloses covered/total.
-8. `test/guards/` — the PCCC-7 purge doors cover `g:` rows: a self-purge clear still purges the affected partition's row first (and ONLY that partition's — the narrower target set of §3 is asserted, not assumed).
+8. `test/datamechanics/` (as built — a real-DB outcome, stronger than the guard tier first written here) — the PCCC-7 purge doors cover `g:` rows: a self-purge clear still purges the affected partition's row first (and ONLY that partition's — the narrower target set of §3 is asserted, not assumed).
 
 ## 5. Sequencing (each slice: own ticket, PR, two-model review)
 
@@ -87,8 +87,8 @@ code, not after), keyed `PPARC-2`, `PPARC-3`, `PPARC-4`, each citing this design
 governing plan ticket — the same parent-slice relationship the PCCC series used.
 
 - **PPARC-2** — the `g:` partition row + partition-native synthesis + the migration, **AND the `g:` purge-door coverage in the same slice** (Fable plan review High 1: the purge doors are `p:`-only by construction — `purgeScopedArcCache` deletes `like 'p:%'` — so a restriction move during the rollout window would purge `p:` rows and leave a poisoned `g:` row for PPARC-3 to serve; coverage must exist the moment `g:` rows are written, and only the RETIREMENT of the `p:` target belongs in PPARC-4). **Warming, ruled (High 4):** union reads in this slice schedule `g:` warming for their scope's partitions through the SWR background machinery under the SAME `PPARC_SYNTH_BUDGET_PER_READ` — deliberate, bounded double-spend for one slice, counted SEPARATELY in the pre-registered cost check so the crossover measurement stays honest. Pre-registered cost checks (§2.4, both directions) run here.
-- **PPARC-3** — serve-time fusion + the enforced read cutover (union path retired for reads; corrections re-scope lands here with the recompute-route gate).
-- **PPARC-4** — cleanup: retire the `p:` writers + the spec's sanctioned-exception text; the purge/sweep target narrowing (§3 last row); remove the union-only code paths.
+- **PPARC-3** — serve-time fusion + the enforced read cutover (union path retired for reads; corrections re-scope lands here with the recompute-route gate, **AND the p:→g: corrections migration lands HERE, not PPARC-2** — Fable PPARC-2 Medium 1: re-keying while the p: union still serves and still WRITES p: corrections reverts a self-host's corrected arcs for the whole window; the migration and the read that honors it are one deliverable. The migration's stranded-count RAISE NOTICE requires `scripts/pg-load-schema.mjs` to gain a `notice` listener in the same slice — node-pg discards notices unheard, so the report was false on the only rollout path, Fable Medium 2).
+- **PPARC-4** — cleanup: retire the `p:` writers + the spec's sanctioned-exception text; the purge/sweep target narrowing (§3 last row); remove the union-only code paths; **own the orphaned-`g:`-row lifecycle** (a deleted initiative's row is unreachable post-cutover but never swept — bounded by partition count, assigned here per Fable PPARC-2 Low).
 
 ## 6. Falsifiers (what would prove this design wrong)
 

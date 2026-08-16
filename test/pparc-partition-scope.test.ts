@@ -68,6 +68,23 @@ beforeEach(() => {
   factsMock.resolveEpisodeItems.mockResolvedValue({ items: new Map(), ok: true });
 });
 
+describe("PPARC-2 — the warming call site is PINNED (Fable High: deletable-with-green-suite otherwise)", () => {
+  it("a p:-scoped union read fires g:-scoped background warming — the rollout mechanism PPARC-3 depends on", async () => {
+    const { getArcs, partitionArcScopeKey } = await import("@/lib/graph/arcs");
+    const t = slug();
+    const groups = [projGroup(), projGroup()];
+    const scopeKey = partitionArcScopeKey("team-1", groups);
+    await getArcs(fakeDb(), "team-1", t, "team", groups, KEYS, { scopeKey });
+    // The piggyback is fire-and-forget; the observable is a g:-scoped corrections read arriving.
+    await vi.waitFor(() => {
+      const gCalls = correctionsMock.listArcCorrections.mock.calls.filter((c) =>
+        String(c[2]?.groupKey ?? "").startsWith("g:")
+      );
+      expect(gCalls.length).toBeGreaterThan(0);
+    }, { timeout: 5000 });
+  });
+});
+
 describe("PPARC-2 — a g:-scoped synthesis reads ONLY its own partition (criterion 1, input half)", () => {
   it("the fact read receives exactly [group] — never a union, never a tier pair", async () => {
     const { getArcs } = await import("@/lib/graph/arcs");

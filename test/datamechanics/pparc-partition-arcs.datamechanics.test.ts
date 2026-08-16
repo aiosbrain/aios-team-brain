@@ -9,7 +9,7 @@ import { FakeGraphiti, client } from "./fake-graphiti";
 
 /**
  * PPARC-2 — the partition-native (`g:`) arc row's write-path mechanics (design
- * docs/design/per-project-arcs.md §2.1/§2.2/§2.3/§3-last-row; acceptance criteria 5, 7, 8).
+ * docs/design/per-project-arcs.md §2.1/§2.2/§2.3/§3-last-row; acceptance criteria 7, 8; criterion 5's migration MOVES to PPARC-3 with the read cutover — Fable PPARC-2 Medium 1: re-keying while the p: union still serves (and still WRITES p: corrections) opens an H13 revert window on any enforcing self-host).
  * Criterion 1's full dm binding (fact isolation through a real read) lands with PPARC-3's read
  * path; its input-isolation half is unit-pinned in test/pparc-partition-scope.test.ts.
  */
@@ -69,36 +69,5 @@ describe("PPARC-2 — the warming budget (criterion 7's write half)", () => {
     // must schedule NOTHING — the count above can't see WHICH groups spent the budget.
     const freshOnly = await warmPartitionArcs(db(), seed.teamId, ["fresh-group"], KEYS);
     expect(freshOnly).toBe(0);
-  });
-});
-
-describe("PPARC-2 — the p:→g: corrections migration (criterion 5)", () => {
-  it("re-keys single-group rows losslessly, keeps multi-group rows p:-keyed, replays idempotently, deletes nothing", async () => {
-    const seed = await seedTeam();
-    const g = `g_${"a".repeat(32)}_p_${"b".repeat(32)}`;
-    const inserts = [
-      { arc_id: "single", group_key: `p:${seed.teamId}:${g}` },
-      { arc_id: "multi", group_key: `p:${seed.teamId}:${g},${episodeGroupId(seed.teamSlug, "team")}` },
-      { arc_id: "legacy", group_key: "" },
-    ];
-    for (const row of inserts) {
-      const { error } = await db()
-        .from("arc_corrections")
-        .insert({ team_id: seed.teamId, arc_id: row.arc_id, arc_title: "t", corrected_text: "take", group_key: row.group_key });
-      expect(error).toBeNull();
-    }
-    const MIG = (await import("node:fs")).readFileSync("postgres/migrations/20260816140000_arc_corrections_partition_scope.sql", "utf8");
-    await runSql(MIG);
-    await runSql(MIG); // replay-safe
-
-    const rows = await runSql<{ arc_id: string; group_key: string }>(
-      "select arc_id, group_key from arc_corrections where team_id = $1 order by arc_id",
-      [seed.teamId]
-    );
-    expect(rows.rows).toHaveLength(3); // nothing deleted — human data
-    const byArc = Object.fromEntries(rows.rows.map((r) => [r.arc_id, r.group_key]));
-    expect(byArc["single"]).toBe(`g:${g}`); // lossless re-key
-    expect(byArc["multi"]).toContain("p:"); // kept, counted, never guessed
-    expect(byArc["legacy"]).toBe(""); // the tier-legacy rule untouched
   });
 });
