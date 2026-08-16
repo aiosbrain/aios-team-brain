@@ -60,6 +60,12 @@ export async function pollRun(
     maxPolls?: number;
   } = {}
 ): Promise<{ status: "done" | "error"; error: string | null; hasAnswer: boolean } | null> {
+  // The id goes into a URL PATH SEGMENT, so constrain it to the only shape it can legitimately have
+  // before it is ever interpolated — mirroring the 422 the endpoint itself returns. Encoding alone
+  // makes a hostile value harmless; validating makes it unrepresentable, and turns "trust the caller"
+  // into something the code proves locally.
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(conversationId)) return null;
+  const runUrl = `/api/dashboard/conversations/${conversationId}/run?team=${encodeURIComponent(teamSlug)}`;
   const intervalMs = opts.intervalMs ?? 1200;
   const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   // A HARD BOUND on the loop. The server ages a silent run out after ~3 minutes, so in practice this is
@@ -78,12 +84,7 @@ export async function pollRun(
       run?: { id?: string; status?: string; partial?: string; error?: string | null; final_message_id?: string | null } | null;
     };
     try {
-      // Encode the id: it is a path SEGMENT, and an unencoded value carrying `/`, `?` or `..` would
-      // silently address a different endpoint than the one this function claims to poll.
-      const res = await fetch(
-        `/api/dashboard/conversations/${encodeURIComponent(conversationId)}/run?team=${encodeURIComponent(teamSlug)}`,
-        { signal: opts.signal }
-      );
+      const res = await fetch(runUrl, { signal: opts.signal });
       if (!res.ok) return null;
       body = await res.json();
     } catch {
