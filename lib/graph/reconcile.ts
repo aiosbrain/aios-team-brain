@@ -10,8 +10,8 @@ import {
   resolvePositiveInt,
 } from "./project";
 import { isExternalGroupId } from "./group";
-import { purgeScopedArcCache, sweepStaleScopedArcCache } from "./arc-cache";
-import { evictScopedArcMemory } from "./arcs";
+import { purgeScopedArcCache, purgePartitionArcCache, sweepStaleScopedArcCache } from "./arc-cache";
+import { evictScopedArcMemory, evictPartitionArcMemory } from "./arcs";
 
 /**
  * Reconcile pass for the brain→Graphiti seam (audit H3, Option B — chosen over blocking-confirm
@@ -380,6 +380,17 @@ export async function reconcileProjectedEpisodes(
     }
     return scopedArcPurgeState;
   };
+  // PPARC-2: the PARTITION-NATIVE (`g:`) twin — per affected group, memoized, strictly narrower
+  // (only the self-purging partition's row dies; a neighbor's rows survive its restriction).
+  const partitionPurgeState = new Map<string, boolean>();
+  const partitionArcPurgeGate = async (groupId: string): Promise<boolean> => {
+    const memo = partitionPurgeState.get(groupId);
+    if (memo !== undefined) return memo;
+    const ok = (await purgePartitionArcCache(db, teamId, groupId)).ok;
+    if (ok) evictPartitionArcMemory(groupId);
+    partitionPurgeState.set(groupId, ok);
+    return ok;
+  };
   // PCCC-7 orphan sweep: oracle churn strands `p:` rows forever (every scope change mints a new
   // key); collect the ones no reader can resolve to anymore. Age-gated well past the TTL (7d).
   await sweepStaleScopedArcCache(db, teamId);
@@ -430,7 +441,7 @@ export async function reconcileProjectedEpisodes(
         !deleteFailed &&
         pastCleanupGrace &&
         !saturated &&
-        (oldGroup !== row.group_id || (await scopedArcPurgeGate()))
+        (oldGroup !== row.group_id || ((await scopedArcPurgeGate()) && (await partitionArcPurgeGate(oldGroup))))
       ) {
         if (orphans.has(row.source_id) && oldGroup === row.group_id) {
           // Orphan, cleanup verified: the item is gone and the group it lives in is empty of it, so

@@ -3,7 +3,7 @@ import type { DbClient } from "@/lib/db/types";
 import { visibleGroupIds } from "@/lib/graph/group";
 import { purgeArcCacheKey, staleArcCache } from "@/lib/graph/arc-cache";
 import { bustTeamTimeline, purgeTimelineCacheTier } from "@/lib/dashboard/timeline-cache";
-import { evictArcMemoryCache, evictScopedArcMemory } from "@/lib/graph/arcs";
+import { evictArcMemoryCache, evictScopedArcMemory, evictTeamPartitionArcMemory } from "@/lib/graph/arcs";
 
 /**
  * Tier-scoped cache invalidation, in the lowest layer both writers can reach: `lib/ingest` (which owns
@@ -44,6 +44,7 @@ export async function purgeExternalTierCaches(
   // theirs until their own TTL; that per-process bound is the documented design limit.
   evictArcMemoryCache(teamSlug);
   evictScopedArcMemory(teamId); // PCCC-7: id-namespaced p: keys — invisible to the slug eviction
+  await evictTeamPartitionArcMemory(db, teamId); // PPARC-2: g: keys carry only the group id
   const externalArcKey = visibleGroupIds(teamSlug, "external").slice().sort().join(",");
   await purgeArcCacheKey(db, teamId, externalArcKey);
   await purgeTimelineCacheTier(db, teamId, "external");

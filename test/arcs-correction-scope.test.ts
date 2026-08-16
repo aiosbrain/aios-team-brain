@@ -113,9 +113,11 @@ describe("PCCC6B-1 — synthesis loads corrections for EXACTLY its own scope", (
     const scopeKey = partitionArcScopeKey("team-1", groups);
     await getArcs(db, "team-1", t, "team", groups, KEYS, { scopeKey });
 
-    expect(correctionsMock.listArcCorrections).toHaveBeenCalledTimes(1);
-    const args = correctionsMock.listArcCorrections.mock.calls[0];
-    expect(args[2]).toMatchObject({ groupKey: scopeKey, includeLegacy: false });
+    // PPARC-2's warming piggyback fires g:-scoped background reads alongside — the pin targets
+    // THE p:-scoped call specifically, not a global count.
+    const scoped = correctionsMock.listArcCorrections.mock.calls.filter((c) => c[2]?.groupKey === scopeKey);
+    expect(scoped).toHaveLength(1);
+    expect(scoped[0][2]).toMatchObject({ groupKey: scopeKey, includeLegacy: false });
   });
 
   it("the TIER path requests its own sorted-set key WITH legacy rows — pre-6b corrections were tier-scope by construction", async () => {
@@ -192,11 +194,9 @@ describe("PCCC6B-1 — the graph write-back follows the scope", () => {
     const groups = [`${t}_external`];
     const scopeKey = partitionArcScopeKey("team-1", groups);
     await getArcs(db, "team-1", t, "team", groups, KEYS, { scopeKey });
-    expect(correctionsMock.listArcCorrections).toHaveBeenCalledTimes(1);
-    expect(correctionsMock.listArcCorrections.mock.calls[0][2]).toMatchObject({
-      groupKey: scopeKey,
-      includeLegacy: false,
-    });
+    const scoped = correctionsMock.listArcCorrections.mock.calls.filter((c) => c[2]?.groupKey === scopeKey);
+    expect(scoped).toHaveLength(1);
+    expect(scoped[0][2]).toMatchObject({ groupKey: scopeKey, includeLegacy: false });
   });
 
   it("the recorded correction carries the scope key it was made in", async () => {

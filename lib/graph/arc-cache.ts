@@ -156,6 +156,23 @@ export async function purgeScopedArcCache(db: DbClient, teamId: string): Promise
   }
 }
 
+/**
+ * HARD-DELETE one PARTITION's `g:` row (PPARC-2, design §2.1/§3 last row). The partition-native
+ * twin of `purgeScopedArcCache`, deliberately NARROWER: a `g:` row's prose derives only from its
+ * own partition, so a self-purge in group X kills exactly `g:X` — other partitions' rows survive a
+ * neighbor's restriction (the team-wide `p:` purge stays beside this until PPARC-4 retires it).
+ * Best-effort with an honest ok — the callers (both gated self-clear doors) treat ok:false as
+ * clear-blocking, same as the `p:` gate.
+ */
+export async function purgePartitionArcCache(db: DbClient, teamId: string, groupId: string): Promise<{ ok: boolean }> {
+  try {
+    const { error } = await db.from("arc_cache").delete().eq("team_id", teamId).eq("group_key", `g:${groupId}`);
+    return { ok: !error };
+  } catch {
+    return { ok: false };
+  }
+}
+
 /** How old a `p:` row must be before the orphan sweep may take it: SEVEN DAYS, not a TTL multiple —
  *  a 48h floor collected every enforced reader's row over an idle weekend, and the Monday cold miss
  *  re-synthesized with `prior = null`, re-minting arc ids and resetting the continuity lineage the

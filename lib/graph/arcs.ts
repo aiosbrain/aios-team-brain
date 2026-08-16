@@ -1,4 +1,5 @@
 import "server-only";
+import { resolvePositiveInt } from "@/lib/util/env";
 import { createHash } from "node:crypto";
 import { completeTextOrNull } from "@/lib/llm/complete";
 import type { LlmBackendKeys } from "@/lib/query/llm-backend";
@@ -744,11 +745,12 @@ async function synthesizeArcs(
   // there is no external-principal path to it. Without this, a correction recorded in that window
   // was stored but never read back — H13's silent revert through a new door. The un-namespaced
   // EXTERNAL TIER path stays corrections-free (the standing gate below).
-  const correctionsEligible = effectiveScopeKey.startsWith("p:") || teamTier;
+  const correctionsEligible =
+    effectiveScopeKey.startsWith("p:") || effectiveScopeKey.startsWith("g:") || teamTier;
   const correctionsRead = correctionsEligible
     ? await listArcCorrections(db, teamId, {
         groupKey: effectiveScopeKey,
-        includeLegacy: !effectiveScopeKey.startsWith("p:"),
+        includeLegacy: !effectiveScopeKey.startsWith("p:") && !effectiveScopeKey.startsWith("g:"),
       })
     : { corrections: [], ok: true };
   const allCorrections = [
@@ -977,6 +979,11 @@ const MAX_ARC_MEMORY_ENTRIES = 512;
 export function arcMemoryCacheSize(): number {
   return cache.size;
 }
+/** Test-only: does the in-memory cache hold this exact key? (The fence pin's observable — the
+ *  background refresh commits through adminClient, so a capturing db never sees its write.) */
+export function arcMemoryCacheHas(key: string): boolean {
+  return cache.has(key);
+}
 export function memCacheSet(key: string, entry: { arcs: NarrativeArc[]; at: number; factsHash: string | null; degraded: boolean }): void {
   if (!cache.has(key) && cache.size >= MAX_ARC_MEMORY_ENTRIES) {
     const oldest = cache.keys().next().value;
@@ -1003,6 +1010,7 @@ export function arcKeyBelongsToTeam(key: string, teamSlug: string, teamId?: stri
   // and would have stranded every slug-keyed correction and cache row silently. Project-group
   // segments (`g_<teamhex>_p_<projhex>`) carry no slug either way, so the tier prefix test below
   // can never see them — the namespace is what keeps eviction exact.
+  if (key.startsWith("g:")) return false; // PPARC-2: g: keys carry no team — dedicated evictors own them
   if (key.startsWith("p:")) return teamId != null && key.slice(2).startsWith(`${teamId}:`);
   const prefix = `${teamSlug}_`;
   return key.split(",").some((g) => g.startsWith(prefix));
@@ -1027,6 +1035,59 @@ export function evictScopedArcMemory(teamId: string): void {
   const prefix = `p:${teamId}:`;
   for (const key of cache.keys()) {
     if (key.startsWith(prefix)) cache.delete(key);
+  }
+  // Fence in-flight refreshes of ANY of this team's p: keys (the same trailing-write race the g:
+  // namespace fences — pre-existing here, closed in the same fold). Generation entries are tiny;
+  // bump only keys we have seen (cache or refreshing), not a synthetic enumeration.
+  for (const key of refreshing) {
+    if (key.startsWith(prefix)) bumpPurgeGeneration(key);
+  }
+}
+
+/** Purge GENERATIONS (Codex PPARC-2 High 1, the timeline-cache dirty-protection precedent): an
+ *  in-flight background refresh that started BEFORE a purge must not commit AFTER it — the purge
+ *  doors delete the row, but nothing else fences the trailing write, so a warm reading
+ *  pre-redaction facts would resurrect the poisoned row as fresh. Every eviction bumps the key's
+ *  generation; `refreshArcsInBackground` snapshots it at start and DROPS its commit on mismatch.
+ *  Process-local by design (the same bound as the mem cache itself); the CROSS-process residual —
+ *  another instance's warm committing after this instance's purge — is named in the design, is the
+ *  same shape the `p:` namespace has always had, and is bounded by the purge re-running while the
+ *  self-purge flag persists. */
+const purgeGeneration = new Map<string, number>();
+function bumpPurgeGeneration(key: string): void {
+  purgeGeneration.set(key, (purgeGeneration.get(key) ?? 0) + 1);
+}
+function currentPurgeGeneration(key: string): number {
+  return purgeGeneration.get(key) ?? 0;
+}
+
+/** Evict ONE partition's `g:` in-memory entry (PPARC-2) — the mem half of the per-partition purge
+ *  door; a DB purge without this serves the poisoned row from this process for its lifetime. */
+export function evictPartitionArcMemory(groupId: string): void {
+  cache.delete(`g:${groupId}`);
+  bumpPurgeGeneration(`g:${groupId}`);
+}
+
+/** Evict every `g:` entry belonging to a team (PPARC-2, design Medium 9): `g:` keys carry only the
+ *  group id, so team-wide eviction resolves the team's pointer list — built-ins + initiatives —
+ *  and deletes each exactly. Async because the resolution reads `projects.graph_group_id`. */
+export async function evictTeamPartitionArcMemory(db: DbClient, teamId: string): Promise<void> {
+  const evictAllPartitionKeys = () => {
+    // FAIL CLOSED (Codex PPARC-2 Medium 3): a returned-error read left every g: key warm for a
+    // full TTL. We cannot know WHICH keys are this team's without the pointer list, so evict every
+    // g: entry — regenerable, bounded by the map, and one query each to re-warm.
+    for (const key of cache.keys()) if (key.startsWith("g:")) cache.delete(key);
+  };
+  try {
+    const { data, error } = await db
+      .from("projects")
+      .select("graph_group_id")
+      .eq("team_id", teamId)
+      .not("graph_group_id", "is", null);
+    if (error) return evictAllPartitionKeys();
+    for (const r of (data ?? []) as { graph_group_id: string }[]) cache.delete(`g:${r.graph_group_id}`);
+  } catch {
+    evictAllPartitionKeys();
   }
 }
 
@@ -1173,18 +1234,31 @@ function refreshArcsInBackground(
   key: string,
   groups: string[],
   keys: ProviderKeys,
-  prior: { arcs: NarrativeArc[]; factsHash: string | null; degraded?: boolean } | null
+  prior: { arcs: NarrativeArc[]; factsHash: string | null; degraded?: boolean } | null,
+  /** PPARC-2: callers thread their pool-backed client; the adminClient() fallback covers legacy
+   *  call shapes. (Also what makes the fence TESTABLE — the unit env cannot construct adminClient,
+   *  so a refresh without this seam silently never ran there, which is how the fence pin's first
+   *  two versions were green-by-construction.) */
+  dbOverride?: DbClient
 ): void {
   if (refreshing.has(key)) return;
   refreshing.add(key);
   void (async () => {
-    const bg = adminClient();
+    const bg = dbOverride ?? adminClient();
     const startedAt = Date.now();
     try {
       // Not route-bound → give the reasoning model the full window (BG_ARC_TIMEOUT_MS). `prior` lets the
       // fact-set-hash guard skip the LLM when nothing changed. Run the extra evidence-COHERENCE pass HERE
       // (background only — the route-bound cold-miss/correction paths can't afford the second LLM call).
+      const generationAtStart = currentPurgeGeneration(key);
       const { arcs, factsHash, degraded, continuity } = await synthesizeArcs(bg, teamId, groups, [], keys, BG_ARC_TIMEOUT_MS, prior, true, key);
+      if (currentPurgeGeneration(key) !== generationAtStart) {
+        // A purge landed while this refresh was in flight — its facts may predate the purge's
+        // reason (a redaction, a restriction move). Committing would resurrect the poisoned row
+        // as fresh; drop it and let the next read re-warm from the post-purge graph.
+        console.error(`[arcs] dropping in-flight refresh for ${key} — purged mid-synthesis (Codex PPARC-2 High 1)`);
+        return;
+      }
       const committed = await commitArcs(bg, teamId, key, arcs, factsHash, { degraded }); // fire-and-forget: nobody awaits its freshness
       // Record how much of the previous set survived. "Arcs feel unstable" was unmeasurable — `arc_cache`
       // keeps only the CURRENT set, so there was no way to say whether carry-over was 30% or 90%, and
@@ -1249,6 +1323,43 @@ export interface CachedArcs {
  * Empty when the graph/LLM is unavailable. Chose SWR over a global timer-driven refresh so LLM calls
  * only happen for teams actually being viewed (not every team on a timer). See docs/design/brain-learning-panel.md.
  */
+/** PPARC-2 warming budget: how many missing/stale `g:` partition rows one union read may schedule
+ *  for background synthesis (design §2.2/§5 — the deliberate, bounded double-spend of the rollout
+ *  slice, counted separately in the pre-registered cost check). */
+export const PPARC_SYNTH_BUDGET_PER_READ = resolvePositiveInt(process.env.PPARC_SYNTH_BUDGET_PER_READ, 3);
+
+/**
+ * Schedule background synthesis of PARTITION-NATIVE (`g:`) rows for up to `budget` of the given
+ * groups whose rows are missing or stale (PPARC-2 §5 warming ruling). Rides the existing SWR
+ * machinery — single-flighted per key by `refreshing`, full BG timeout, per-partition corrections
+ * scope — so a union read warms the partition rows the PPARC-3 cutover will serve. Fire-and-forget.
+ */
+export async function warmPartitionArcs(
+  db: DbClient,
+  teamId: string,
+  groups: readonly string[],
+  keys: ProviderKeys,
+  budget: number = PPARC_SYNTH_BUDGET_PER_READ
+): Promise<number> {
+  let scheduled = 0;
+  for (const group of groups) {
+    if (scheduled >= budget) break;
+    const key = `g:${group}`;
+    if (refreshing.has(key)) continue;
+    const mem = cache.get(key);
+    const now = Date.now();
+    if (mem && !freshness(mem.at, arcTtlMs(mem.degraded), { now, degraded: mem.degraded }).stale) continue;
+    const persisted = await readArcCache(db, teamId, key).catch(() => null);
+    if (persisted && !freshness(persisted.computedAt, arcTtlMs(persisted.degraded), { now, degraded: persisted.degraded }).stale) {
+      memCacheSet(key, { arcs: persisted.arcs, at: persisted.computedAt, factsHash: persisted.factsHash, degraded: persisted.degraded });
+      continue;
+    }
+    refreshArcsInBackground(teamId, key, [group], keys, persisted ? { arcs: persisted.arcs, factsHash: persisted.factsHash, degraded: persisted.degraded } : null, db);
+    scheduled++;
+  }
+  return scheduled;
+}
+
 export async function getArcs(
   db: DbClient,
   teamId: string,
@@ -1263,6 +1374,10 @@ export async function getArcs(
   // No visible groups is not a degraded read — it's a correct empty answer, computed now.
   if (groups.length === 0) return { arcs: [], freshness: computedNow() };
   const key = opts?.scopeKey ?? groups.slice().sort().join(",");
+  // PPARC-2 §5 warming ruling: a UNION read schedules partition-native (`g:`) warming for its
+  // scope's partitions, budgeted + background — the rows the PPARC-3 cutover will serve are warm
+  // before any read depends on them. Fire-and-forget; never touches this read's latency.
+  if (key.startsWith("p:")) void warmPartitionArcs(db, teamId, groups, keys);
   const now = Date.now();
 
   // 1. In-memory (fastest, same process). `at` is the PERSISTED computed_at (set below), not the time

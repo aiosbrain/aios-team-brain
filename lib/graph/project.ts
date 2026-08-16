@@ -8,8 +8,8 @@ import { resolvePositiveInt } from "@/lib/util/env";
 import { chunkCdc, type CdcParams } from "./cdc";
 import { sourceRules } from "@/lib/ingest/source-rules";
 import { resolveFanoutTargets } from "@/lib/projects/context/fanout-targets";
-import { purgeScopedArcCache } from "./arc-cache";
-import { evictScopedArcMemory } from "./arcs";
+import { purgeScopedArcCache, purgePartitionArcCache } from "./arc-cache";
+import { evictScopedArcMemory, evictPartitionArcMemory } from "./arcs";
 import { ensureArmingRows } from "./arming-row";
 // Re-exported so the graph module's existing importers (and their specs) keep one import path.
 export { resolvePositiveInt };
@@ -761,6 +761,16 @@ export async function projectItemsToGraph(
     }
     return scopedArcPurgeState;
   };
+  // PPARC-2: the per-partition `g:` twin (see reconcile's door for the narrowing rationale).
+  const partitionPurgeState = new Map<string, boolean>();
+  const partitionArcPurgeGate = async (groupId: string): Promise<boolean> => {
+    const memo = partitionPurgeState.get(groupId);
+    if (memo !== undefined) return memo;
+    const ok = (await purgePartitionArcCache(db, args.teamId, groupId)).ok;
+    if (ok) evictPartitionArcMemory(groupId);
+    partitionPurgeState.set(groupId, ok);
+    return ok;
+  };
   const { targets: fanoutTargetsByItem, inGeneral } = await resolveFanoutTargets(db, {
     teamId: args.teamId,
     itemIds: rows.map((r) => r.id),
@@ -1509,7 +1519,7 @@ export async function projectItemsToGraph(
           // the delete and only then clears the flag — the same convergence the tier path uses.
           retractFailed
           ? { pending_delete_group_id: groupId, pending_delete_at: projectedAt }
-          : purgeBeforeRepush && !purgeFailed && (await scopedArcPurgeGate())
+          : purgeBeforeRepush && !purgeFailed && (await scopedArcPurgeGate()) && (await partitionArcPurgeGate(groupId))
             ? { pending_delete_group_id: null, pending_delete_at: null } // purge confirmed + re-pushed (self clear — scoped arc rows purged first, see the gate)
             : {};
 
