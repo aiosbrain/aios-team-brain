@@ -324,16 +324,18 @@ length of their longest common prefix (`test/graph-cdc.test.ts`, CDCAPPEND-1):
 
 > **churn ≤ |C₁| − L** — the number of admitted chunks after the last chunk the two chunkings share.
 >
-> (reproduce with `node scripts/cdc-churn-sweep.mjs --op append --exclude docs/design/cdc-append-churn.md`;
-> `--exclude` matters because the design documents ARE the corpus)
+> (reproduce with `node scripts/cdc-churn-sweep.mjs --op append --exclude docs/design/cdc-append-churn.md,docs/design/content-defined-chunking.md`
+> — the exclusions matter because the design documents ARE the corpus, including this one)
 
 **No unconditional number belongs in this row**, and here is why each candidate for one fails:
 
 - **not 1.** For the 66-character append this document's own test applies, the corpus churns
-  `{0: ×1, 1: ×23, 2: ×4}` — and all four 2s are documents *below* the cap.
+  `{0: ×1, 1: ×23, 2: ×3}` with the two files above excluded (`{0: ×1, 1: ×23, 2: ×5}` over the
+  unexcluded corpus the test reads) — and every one of the 2s is a document *below* the cap. The count
+  moves as the corpus does, which is why the test computes the distribution instead of pinning it.
 - **not "0 once the document fills the cap".** What must reach the cap is the **shared prefix**, not the
-  boundary count: a document at exactly 80 boundaries churns 1–2, because an append moves the last one
-  or two boundaries.
+  boundary count: a document at exactly 80 boundaries churns **1** (committed witness), because an
+  append moves the last one or two boundaries.
 - **not a function of length alone.** 60,000 characters of prose churn 23–24; the same 60,000 characters
   of one repeated character churn 16, because a hash-quiet run yields far fewer cuts.
 - **not "the appended text splits the final chunk".** An append routinely changes the chunk *before* the

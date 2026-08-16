@@ -51,18 +51,41 @@ const P = { target: 2500, min: 1250, max: 4000 };
 const CAP = 80;
 const EDIT_LEN = 20;
 const ARGV = process.argv.slice(2);
+const refuse = (why) => {
+  console.error(`cdc-churn-sweep: REFUSING — ${why}`);
+  process.exit(2);
+};
+/**
+ * `flag()` used to take the NEXT token unconditionally, so `--op --exclude foo.md` set `op` to
+ * `"--exclude"`, fell through to in-place mode, and exited 0 — a quietly wrong run that looks like a
+ * measurement. Every degraded-input path in this file now refuses instead, because the one thing this
+ * script exists to be is a number you can trust.
+ */
 const flag = (name, fallback) => {
   const i = ARGV.indexOf(`--${name}`);
-  return i >= 0 && ARGV[i + 1] !== undefined ? ARGV[i + 1] : fallback;
+  if (i < 0) return fallback;
+  const value = ARGV[i + 1];
+  if (value === undefined || value.startsWith("--")) refuse(`--${name} needs a value`);
+  return value;
 };
 const OP = flag("op", "inplace");
+if (OP !== "inplace" && OP !== "append") refuse(`unknown --op ${OP} (expected inplace or append)`);
 /**
- * The design documents ARE the corpus, so a document that publishes a distribution is inside it.
- * Honoured in BOTH modes deliberately: `cdc-append-churn.md` sits ~79 characters below the in-place
- * sweep's 25,000-character floor, so one more paragraph would silently move the in-place numbers too.
+ * The design documents ARE the corpus, so a document that publishes a distribution is inside it —
+ * and so is a document that DESCRIBES the distribution. Both of this ticket's design files are in the
+ * measured set (`cdc-append-churn.md` at ~29k characters, `content-defined-chunking.md` at ~25k), which
+ * is not a hypothetical: an earlier commit on this branch quoted figures that its own next commit moved,
+ * twice, by editing the second file. Comma-separated, honoured in BOTH modes, and it REFUSES when a
+ * named path matches nothing — a typo'd exclusion silently publishing the unexcluded numbers is the
+ * same failure wearing a different hat.
  */
-const EXCLUDE = flag("exclude", "");
+const EXCLUDE = flag("exclude", "")
+  .split(",")
+  .map((p) => p.trim())
+  .filter(Boolean);
 const STEP = Number(flag("step", ARGV.find((a) => /^\d+$/.test(a)) ?? 97));
+// A non-numeric --step produced NaN and a 10-sample "sweep"; --step 0 hung the in-place loop forever.
+if (!Number.isInteger(STEP) || STEP < 1) refuse(`--step must be a positive integer, got ${flag("step", "")}`);
 
 const setChurn = (before, after) => {
   const seen = new Set(before);
@@ -94,6 +117,7 @@ const CORPORA = {
 function corpus(which = "wide") {
   const { dirs, minLength } = CORPORA[which] ?? CORPORA.wide;
   // `EXCLUDE` is applied HERE rather than at each call site, so neither mode can forget it.
+  const matched = new Set();
   const out = [];
   const seen = new Set();
   for (const dir of dirs) {
@@ -109,9 +133,16 @@ function corpus(which = "wide") {
       if (seen.has(path)) continue;
       seen.add(path);
       const text = readFileSync(path, "utf8");
-      if (text.length >= minLength && path !== EXCLUDE) out.push({ path, text });
+      if (text.length < minLength) continue;
+      if (EXCLUDE.includes(path)) {
+        matched.add(path);
+        continue;
+      }
+      out.push({ path, text });
     }
   }
+  const missed = EXCLUDE.filter((p) => !matched.has(p));
+  if (missed.length) refuse(`--exclude named ${missed.join(", ")}, which is not in this corpus`);
   return out;
 }
 
@@ -203,7 +234,7 @@ if (OP === "append") {
     depthHistogram: {},
     movedOutsideMaxWindow: 0,
     perLength: {},
-    excluded: EXCLUDE || null,
+    excluded: EXCLUDE.length ? EXCLUDE : null,
     depthCeiling: { provable: DEPTH_CEILING, derivation: "1 + floor((max-1)/min)", observed: 0, violations: 0 },
     absoluteGuard: { formula: "depthCeiling + ceil(appendLength/min)", violations: [], synthetic: null },
     boundaryFormViolations: [],
@@ -491,7 +522,7 @@ if (OP === "append") {
 
 const summary = {
   revision: revision(),
-  excluded: EXCLUDE || null,
+  excluded: EXCLUDE.length ? EXCLUDE : null,
   step: STEP,
   docs: 0,
   swept: 0,

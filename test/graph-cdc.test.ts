@@ -302,6 +302,13 @@ describe("the cap only TRUNCATES — the basis on which a CDC cap-grow keeps the
 
 // ── THE CHURN TABLE (the spec's acceptance arithmetic) ───────────────────────────────────────────
 
+/**
+ * The `append at end` scenario's append, module-scoped so the scenario that APPLIES it and the
+ * CDCAPPEND-1 describe that MEASURES it cannot drift apart. They were two copies of one literal; editing
+ * either would have left the other measuring a different append with everything green (review).
+ */
+const APPEND_AT_END = " a new closing paragraph appended at the very end of the document.";
+
 describe("churn: how many chunk hashes change under a real edit — CDC vs the byte-offset algorithm", () => {
   /**
    * The spec's central claim, and it is testable for free: "Take a real document, apply a real edit,
@@ -331,7 +338,8 @@ describe("churn: how many chunk hashes change under a real edit — CDC vs the b
     },
     {
       name: "append at end",
-      edit: (t) => t + " a new closing paragraph appended at the very end of the document.",
+      edit: (t) => t + APPEND_AT_END,
+      // `max` is no longer asserted for this scenario (CDCAPPEND-1) — see the `continue`s below.
       max: 1,
     },
     {
@@ -366,7 +374,7 @@ describe("churn: how many chunk hashes change under a real edit — CDC vs the b
     // made the acceptance table wrong in the first place.
     //
     // `append at end` is the same defect one row down (CDCAPPEND-1), and its `<= 1` was asserted against
-    // ONE fixture and ONE 66-character append. Over the live corpus that append churns 2 on 4 of 28
+    // ONE fixture and ONE 66-character append. Over the live corpus that append churns 2 on several
     // documents, and the same fixture with a 2,500-character prose append churns 3 — so the constant is
     // a property of this fixture, not of appends. The bound, the absolute ceiling and the per-document
     // legacy envelope live in the CDCAPPEND-1 describe below.
@@ -435,10 +443,10 @@ describe("churn: how many chunk hashes change under a real edit — CDC vs the b
       // `append at end` is excluded from BOTH assertions here too (CDCAPPEND-1), and the reason is the
       // one this comment already names for the row above, firing. The never-worse comparison PASSES for
       // append today only by coincidence ACROSS DIFFERENT DOCUMENTS: at this scenario's own 66-character
-      // append CDC is strictly worse than byte offsets on 4 of 28 corpus documents, and `max <= max`
-      // survives because a FIFTH, unrelated document churns 2 under legacy. Its outcome also flips with
-      // the appended CONTENT at a fixed length — at 2,500 characters it fails under one prose filler,
-      // passes under another, and passes with CDC strictly better under a hash-quiet one. It is REPLACED,
+      // append CDC is strictly worse than byte offsets on several corpus documents, and `max <= max`
+      // survives because one FURTHER, unrelated document churns 2 under legacy. Its outcome also flips
+      // with the appended CONTENT at a fixed length — at 2,500 characters it FAILS under both of the
+      // sweep's prose fillers and PASSES under a hash-quiet one, CDC strictly better. It is REPLACED,
       // not deleted: the CDCAPPEND-1 describe asserts `cdc <= legacy + 1` PER DOCUMENT for appends
       // shorter than `min`, which is where that envelope is measured on both real and synthetic corpora.
       if (name === "edit in place, same length" || name === "append at end") continue;
@@ -737,12 +745,13 @@ describe("CDCCHURN-1: in-place same-length churn is the number of chunks the edi
  * The acceptance table promised an unconditional **1** for `append at end`. SIX characterisations of that
  * row have now been falsified, and the last three were falsified during this ticket:
  *
- *   1. "churn is 1" — `docs/ARCHITECTURE.md` churns 0 (past the cap) and 4 of 28 corpus documents churn
- *      2 at this file's own 66-character append;
+ *   1. "churn is 1" — `docs/ARCHITECTURE.md` churns 0 (past the cap) and SEVERAL corpus documents churn
+ *      2 at this file's own 66-character append. The exact count is corpus-dependent — this branch's own
+ *      commits moved it — so "THE ROW'S OWN CLAIM" below computes the distribution instead of pinning it;
  *   2. "1 unless the appended text splits the final chunk, then 2" — the 2s are not splits of the final
  *      chunk; the new cut lands INSIDE the appended region and moves the chunk before it too;
  *   3. "2 is the ceiling" — holds only below `min`; 9,000 characters churn 4–5 and 60,000 churn 23–24;
- *   4. "1 + the number of new chunks, or 0 when capped" — 449 of 560 swept samples (80.2%). A final
+ *   4. "1 + the number of new chunks, or 0 when capped" — 446 of 540 swept samples (82.6%). A final
  *      chunk taken by the `n - start <= min` short-tail exit gets a real cut once the document grows, so
  *      a boundary moves without a chunk being added;
  *   5. the bound stated over the BOUNDARY sequences — false for a whitespace-only body, because
@@ -808,8 +817,8 @@ describe("CDCAPPEND-1: append churn is a bound, not a number", () => {
     ["prose", prose],
     ["quiet", quiet],
   ];
-  /** The exact append the `append at end` scenario above applies. */
-  const SCENARIO_APPEND = " a new closing paragraph appended at the very end of the document.";
+  /** THE literal the `append at end` scenario applies, not a copy of it. */
+  const SCENARIO_APPEND = APPEND_AT_END;
 
   it("LIVE CORPUS: set churn never exceeds the bound, per document and per append content", () => {
     const docs = repoDocs();
@@ -852,8 +861,10 @@ describe("CDCAPPEND-1: append churn is a bound, not a number", () => {
   });
 
   it("the absolute ceiling is DERIVED from the envelope, and its looseness is stated not hidden", () => {
-    expect(DEPTH_CEILING).toBe(1 + Math.floor((CDC_PARAMS.max - 1) / CDC_PARAMS.min));
-    expect(DEPTH_CEILING).toBe(4); // at the shipped 1,250/4,000 envelope
+    // Independently-written arithmetic, NOT the definition restated: the first version of this asserted
+    // `1 + Math.floor((max - 1) / min)`, which is `expect(x).toBe(x)` and survives a mutation that edits
+    // the formula itself. Review caught it.
+    expect(DEPTH_CEILING).toBe(4); // 1 + floor(3999 / 1250), at the shipped 1,250/4,000 envelope
     // WHAT THIS DOES NOT CATCH, both reviewers independently: at a 60,000-character prose append the
     // corpus churns 23–24 against a ceiling of 4 + ceil(60000/1250) = 52, so a chunker that cut the
     // appended region at `min` instead of `target` would roughly DOUBLE every long append's cost and
@@ -997,7 +1008,7 @@ describe("CDCAPPEND-1: append churn is a bound, not a number", () => {
   it("ENVELOPE: for a short append CDC is at most ONE chunk worse than byte offsets, PER DOCUMENT", () => {
     // This REPLACES `max(cdc) <= max(legacy)` for this scenario rather than deleting it. That comparison
     // is not a property of appends: at the scenario's own 66-character append CDC is strictly worse than
-    // byte offsets on 4 of 28 corpus documents, and it passes only because a FIFTH, unrelated document
+    // byte offsets on several corpus documents, and it passes only because one FURTHER, unrelated document
     // churns 2 under legacy — max against max, across different documents. Its outcome also flips with
     // the appended content at a fixed length. Deleting it outright would leave no cross-algorithm guard
     // at all, which is what both spec reviewers refused.
