@@ -85,6 +85,45 @@ describe("PPARC-2 — the warming call site is PINNED (Fable High: deletable-wit
   });
 });
 
+describe("PPARC-2 — the purge-generation fence (Codex High 1)", () => {
+  it("an in-flight g: refresh overtaken by a purge DROPS its commit — the poisoned row is never resurrected", async () => {
+    const { warmPartitionArcs, evictPartitionArcMemory } = await import("@/lib/graph/arcs");
+    const group = projGroup();
+    // Block the synthesis at the LLM so the purge can land mid-flight.
+    let release: (() => void) | undefined;
+    const blocked = new Promise<void>((r) => (release = r));
+    llmMock.completeTextOrNull.mockImplementation(async () => {
+      await blocked;
+      return '{"arcs":[{"id":"x","title":"t","confidence":"high","summary":"pre-purge prose","participants":[],"supporting_sources":[],"evidence":[]}]}';
+    });
+    const upserts: Array<Record<string, unknown>> = [];
+    const capturingDb = {
+      from: () => ({
+        select: () => ({
+          eq: () => ({
+            eq: () => ({ maybeSingle: async () => ({ data: null }) }),
+            maybeSingle: async () => ({ data: null }),
+            order: () => ({ limit: async () => ({ data: [] }) }),
+            limit: async () => ({ data: [] }),
+          }),
+        }),
+        upsert: async (row: Record<string, unknown>) => {
+          upserts.push(row);
+          return { error: null };
+        },
+      }),
+    } as unknown as DbClient;
+
+    const scheduled = await warmPartitionArcs(capturingDb, "team-fence", [group], KEYS, 1);
+    expect(scheduled).toBe(1);
+    await new Promise((r) => setTimeout(r, 100)); // let the refresh reach the blocked LLM call
+    evictPartitionArcMemory(group); // the purge door's mem half — bumps the key's generation
+    release!();
+    await new Promise((r) => setTimeout(r, 400)); // let the refresh settle
+    expect(upserts.filter((u) => u.group_key === `g:${group}`)).toHaveLength(0); // commit dropped
+  });
+});
+
 describe("PPARC-2 — a g:-scoped synthesis reads ONLY its own partition (criterion 1, input half)", () => {
   it("the fact read receives exactly [group] — never a union, never a tier pair", async () => {
     const { getArcs } = await import("@/lib/graph/arcs");
