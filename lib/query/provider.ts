@@ -35,6 +35,10 @@ export type RetrievedContext = {
   structured: string; // decisions/tasks/graph digest (always included by the native provider)
   /** True when query-specific search matched something; false = only recency padding. */
   grounded: boolean;
+  /** PCCC-6 (spec's expansion budget): how many of the principal's visible projects the K-capped
+   * graph stage actually covered — the deliberate own-scope disclosure exception to §5.7. Absent
+   * when the graph leg didn't run partitioned (permissive tier path, external omit, no graph). */
+  graphScope?: { covered: number; total: number };
 };
 
 export interface RetrievalRequest {
@@ -43,10 +47,12 @@ export interface RetrievalRequest {
   tier: "team" | "external";
   question: string;
   projectSlug?: string | null;
-  /** Access enforcement (Phase B slice 2): present = 'enforcing', supplies the principal's
-   *  membership-visible item set. Item legs filter to it; graph legs are omitted (fail closed
-   *  until Phase C). Absent/null = permissive, byte-identical to today. */
-  enforce?: { visibleItemIds: ReadonlySet<string> } | null;
+  /** Access enforcement (Phase B slice 2 + PCCC-6): present = 'enforcing', supplies the
+   *  principal's membership-visible item set; item legs filter to it. `graphProjectIds` — present
+   *  only for a team-tier MEMBER on an enforcing team — re-enables the graph leg over their
+   *  K-capped ready partitions (the PCCC-6 read cutover); absent keeps the §5.8b omit (external
+   *  principals, delegated tokens). Absent/null enforce = permissive. */
+  enforce?: { visibleItemIds: ReadonlySet<string>; graphProjectIds?: readonly string[] } | null;
 }
 
 /** A context layer. Swap the default by implementing this and selecting via CONTEXT_PROVIDER. */

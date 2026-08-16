@@ -3,6 +3,7 @@ import "server-only";
 import { createHash } from "node:crypto";
 
 import type { DbClient } from "@/lib/db/types";
+import { ensureProjectGraphPointer } from "@/lib/graph/project-pointer";
 
 export const MEETING_TODO_PROJECT_SLUG = "extracted-from-meetings";
 export const MEETING_TODO_PROJECT_NAME = "Extracted from Meetings";
@@ -220,6 +221,9 @@ export async function ensureMeetingTodoProject(db: DbClient, teamId: string): Pr
     .select("id")
     .single();
   if (projectErr || !project) throw new Error(`project upsert failed: ${projectErr?.message}`);
+  // PCCC-4: every creation path records the pointer (null-guarded — a no-op on reuse).
+  const ptr = await ensureProjectGraphPointer(db, { teamId, projectId: (project as { id: string }).id });
+  if (!ptr.ok) throw new Error(ptr.error);
   return (project as { id: string }).id;
 }
 

@@ -6,7 +6,9 @@ import { serverClient } from "@/lib/db/server";
 import { visibleItems, visibleDecisions } from "@/lib/auth/visibility";
 import { resolveTeamContext } from "@/lib/auth/team-context";
 import { getPipelineHealth } from "@/lib/ingest/pipeline-health";
+import { getLlmHealth } from "@/lib/query/llm-health";
 import { PipelineHealthBanner } from "@/components/admin/pipeline-health-banner";
+import { GenerationHealthBanner } from "@/components/admin/generation-health-banner";
 import { CopySnippet } from "@/components/copy-snippet";
 import { getPulseMetrics } from "@/lib/metrics/pulse";
 import { parseRange } from "@/lib/metrics/range";
@@ -175,7 +177,7 @@ export default async function TeamHome({
     );
   }
 
-  const [pulse, { data: decisions }, pipelineHealth] = await Promise.all([
+  const [pulse, { data: decisions }, pipelineHealth, llmHealth] = await Promise.all([
     getPulseMetrics(db, team.id, range, { isAdmin, memberId, tier }),
     visibleDecisions(
       db.from("decisions").select("id, title, decided_at, tier, still_valid, source_item_id").eq("team_id", team.id).order("decided_at", { ascending: false }).limit(8),
@@ -184,11 +186,17 @@ export default async function TeamHome({
     // Admins see a loud banner here (the landing page) if any ingestion leg is broken — so a wedged
     // pipeline surfaces without digging into Admin. Non-admins don't fetch it.
     isAdmin ? getPipelineHealth(team.id) : Promise.resolve(null),
+    // GENERATION health, separately (LLMOBS-1). `llm` used to be a leg on the pipeline banner above,
+    // which says "the brain isn't getting fresh data" — false for a model failure, and it
+    // double-counted every arcs failure. It now gets its own banner that can name the failing feature,
+    // its model and its error. Same admin gate, same fetch-nothing-for-non-admins rule.
+    isAdmin ? getLlmHealth(team.id) : Promise.resolve(null),
   ]);
 
   return (
     <div className="mx-auto flex max-w-6xl flex-col gap-6">
       {pipelineHealth ? <PipelineHealthBanner health={pipelineHealth} href={`/t/${teamSlug}/admin/integrations#ingestion-runs`} /> : null}
+      {llmHealth ? <GenerationHealthBanner health={llmHealth} href={`/t/${teamSlug}/admin/integrations`} /> : null}
 
       <div>
         <h1 className="text-2xl font-semibold text-ink">Pulse</h1>

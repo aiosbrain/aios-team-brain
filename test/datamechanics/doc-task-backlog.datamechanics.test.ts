@@ -17,7 +17,15 @@ import { db, ingest, seedTeam, type Seed } from "./helpers";
  */
 
 const { completeTextOrNull } = vi.hoisted(() => ({ completeTextOrNull: vi.fn() }));
-vi.mock("@/lib/llm/complete", () => ({ completeTextOrNull }));
+// `withLlmPass` is a pass-through here: this file is about the batching/linking behaviour, and the
+// pass contract has its own tests. It must still be present — the module is mocked wholesale, so a
+// missing export is a hard failure rather than a fallback to the real implementation.
+vi.mock("@/lib/llm/complete", () => ({
+  completeTextOrNull,
+  withLlmPass: (_init: unknown, body: (p: unknown) => Promise<unknown>) =>
+    body({ calls: 0, failures: 0, model: null, firstError: null, startedAt: Date.now(), done: false }),
+  failLlmPassBeforeFirstCall: () => {},
+}));
 // A configured model, so the pass reaches the batching/prune logic instead of short-circuiting.
 vi.mock("@/lib/dashboard/timeline-summary", async (orig) => ({
   ...(await orig<Record<string, unknown>>()),

@@ -757,8 +757,19 @@ describe("tier reclassification cleanup is durable across a failed inline delete
     const res = await reconcileProjectedEpisodes(db(), client(fake), seed.teamId, cap);
     expect(res.reQueued).toBe(cap);
     expect(res.requeueThrottled).toBe(overBy); // reported, not silently dropped
-    const { data } = await db().from("graph_episodes").select("id").eq("team_id", seed.teamId);
-    expect((data ?? []).length).toBe(overBy); // the un-judged rows are still there for the next pass
+    // STALLSCOPE-1: a re-queue now PARKS the row on the `''` sentinel instead of deleting it (deleting
+    // destroyed `first_seen_at`, the stall probe's set-once age clock — and this very throttle is what
+    // made that survivable-by-accident, since a cap below the episode floor left some row un-recycled).
+    // The property under test is unchanged and asserted more precisely: exactly `cap` rows judged, the
+    // rest untouched and still carrying their real sha for the next pass.
+    const { data } = await db()
+      .from("graph_episodes")
+      .select("id, content_sha256")
+      .eq("team_id", seed.teamId);
+    const rows = (data ?? []) as { content_sha256: string }[];
+    expect(rows.length).toBe(cap + overBy); // nothing is lost
+    expect(rows.filter((r) => r.content_sha256 === "").length).toBe(cap); // judged ⇒ re-push
+    expect(rows.filter((r) => r.content_sha256 !== "").length).toBe(overBy); // un-judged, next pass
 
     // …and the DEFAULT path throttles too. Without this the spec above only ever exercises a parameter
     // production never passes: a regression that unbound the default from the constant — or set it to
@@ -901,17 +912,36 @@ describe("reconcileProjectedEpisodes (audit H3, real Postgres)", () => {
       .maybeSingle();
     expect((landedRow as { episode_uuid: string | null }).episode_uuid).toBeTruthy();
 
-    // The crashed row is gone — a subsequent projector run will treat it as unprojected.
+    // The crashed row is PARKED ON THE SENTINEL, not deleted — a subsequent projector run still treats
+    // it as unprojected and re-pushes it. STRENGTHENED, not weakened, by STALLSCOPE-1: this used to
+    // assert the row was gone, and deleting it destroyed `first_seen_at`, the set-once clock the stall
+    // probe's age gate reads. During a dead-extractor outage this path recycles rows every grace
+    // window, so each re-creation re-stamped the clock and could hold the gate open indefinitely (both
+    // code reviewers). The re-queue EFFECT is what this test cares about, and it is asserted below.
     const { data: crashedRow } = await db()
       .from("graph_episodes")
-      .select("id")
+      .select("id, content_sha256, first_seen_at")
       .eq("team_id", seed.teamId)
       .eq("source_id", crashedItem.id)
       .maybeSingle();
-    expect(crashedRow).toBeNull();
+    expect(crashedRow).not.toBeNull();
+    const crashed = crashedRow as { content_sha256: string; first_seen_at: string | Date };
+    expect(crashed.content_sha256).toBe(""); // the sentinel: "reserved, not landed" ⇒ re-push
+    const clockBefore = String(crashed.first_seen_at);
 
     const reproject = await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(fake) });
     expect(reproject.projected).toBeGreaterThanOrEqual(1); // the crashed item gets re-pushed
+
+    // …and the re-push did not restart the age-gate clock.
+    const { data: afterRow } = await db()
+      .from("graph_episodes")
+      .select("first_seen_at, content_sha256")
+      .eq("team_id", seed.teamId)
+      .eq("source_id", crashedItem.id)
+      .maybeSingle();
+    const after = afterRow as { first_seen_at: string | Date; content_sha256: string };
+    expect(String(after.first_seen_at)).toBe(clockBefore);
+    expect(after.content_sha256).not.toBe(""); // landed again
   });
 
   it("does not judge a row projected within the grace window (still may be processing)", async () => {

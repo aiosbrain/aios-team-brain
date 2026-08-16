@@ -961,6 +961,15 @@ create table if not exists projects (
 -- migration as a named drop-and-re-add constraint (replay-repairable); pg:schema always runs
 -- migrations after this file, so it exists in every path.
 alter table projects add column if not exists kind text not null default 'source';
+-- The project's Graphiti partition pointer (PCCC-4; spec ~946-950 rules STORED, not inferred).
+-- §11 built-ins grandfather the legacy tier ids ('<teamSlug>_team' / '<teamSlug>_external');
+-- everything else mints lib/graph/group.projectGroupId. Sole writer:
+-- lib/graph/project-pointer.ensureProjectGraphPointer (called by every creation path) + the
+-- 20260815140000 backfill; nullable only for the insert-then-point window at creation — readers
+-- treat null as not-cutover and fail closed. Injective via the partial unique below.
+alter table projects add column if not exists graph_group_id text;
+create unique index if not exists projects_graph_group_id_key
+  on projects (graph_group_id) where graph_group_id is not null;
 
 -- ── Access chain (spec: docs/specs/project-context-classification-v1.md §4) ──────────────
 -- Person → Group → Project → Content. These three tables are the ONLY access edges; the sole
@@ -2379,13 +2388,49 @@ create table if not exists graph_episodes (
   chunk_shas text[] not null default '{}',
   chunk_config text not null default '',
   projected_at timestamptz not null default now(),
-  unique (team_id, source_table, source_id)
+  -- PCCC-5: extraction deliberately WITHHELD for a cold initiative (distinct from the '' sentinel's
+  -- three meanings). Reconcile ignores deferred rows; arming (PCCC-6) flips this false and the
+  -- projector pushes under its fan-out budget. Sole writer: lib/graph/project.
+  deferred boolean not null default false,
+  -- SET-ONCE (STALLSCOPE-1, migration 20260816090000): when the projector first CREATED this row —
+  -- the reserve-before-push reservation, not the first accepted push. `projected_at` above is
+  -- last-touched and moves on every re-push, so it cannot answer "how long has this team been
+  -- trying"; the stall probe's age gate reads this one. Written by the row-creating INSERT only: no
+  -- upsert or UPDATE payload names it, so ON CONFLICT DO UPDATE (which sets only provided keys)
+  -- leaves it alone. Guarded by test/guards/graph-episodes-first-seen-migration.test.ts.
+  first_seen_at timestamptz not null default now()
+  -- The one-row-per-item NARROW unique that used to live here was dropped by PCCC-4/Deploy B
+  -- (migration 20260815150000): identity is per-(item, group) via graph_episodes_item_group_key
+  -- below, and an item may hold one ledger row PER GROUP (PCCC-5 fan-out's substrate).
 );
 create index if not exists graph_episodes_team_idx on graph_episodes (team_id, projected_at desc);
+-- PCCC-3: the per-(item, group) identity the projector's 4-column ON CONFLICT targets. Expressed as
+-- an identically-named standalone index here AND in the migration (20260815120000) — an inline
+-- `unique (…)` inside the table declaration auto-names differently and gives a from-zero DB two
+-- identical arbiter indexes, which the replay guard cannot flag.
+create unique index if not exists graph_episodes_item_group_key
+  on graph_episodes (team_id, source_table, source_id, group_id);
 -- NB: the partial index on `pending_delete_group_id` lives ONLY in the migration
 -- (20260724180000_graph_episodes_pending_delete.sql), which runs AFTER schema.sql and adds the column
 -- first. A bare partial-index statement here would fail on an existing DB, where the table already
 -- exists (so its declaration above is a no-op) and the column isn't present until the migration runs.
+
+-- Per-project graph ARMING state (PCCC-6, design §2.2/§2.3). A row exists once a team-tier
+-- enforcing principal's read has ARMED the project (its deferred fan-out rows flipped to
+-- pushable); `ready_at` is the MONOTONE read-ready latch — set once every row armed at that time
+-- has reconcile-confirmed landed, never cleared (items tagged later lag like today's tier graph;
+-- a live "all currently landed" predicate would starve busy initiatives and flap the leg — the
+-- design's round-2 High 4 / Codex Blocker 2 history). The obligation snapshot IS the set of
+-- armed (deferred=false) ledger rows at arm time — no id array to maintain. Sole writer:
+-- lib/graph/arming.
+create table if not exists graph_project_arming (
+  team_id uuid not null references teams(id) on delete cascade,
+  project_id uuid not null,
+  armed_at timestamptz not null default now(),
+  ready_at timestamptz,
+  primary key (team_id, project_id),
+  foreign key (team_id, project_id) references projects (team_id, id) on delete cascade
+);
 
 -- Narrative-arc synthesis cache (Layer 3, lib/graph/arcs). Arcs are an LLM synthesis over the last
 -- 7d of the graph — expensive to compute and identical for everyone sharing a tier-visible group set.
@@ -2396,7 +2441,7 @@ create index if not exists graph_episodes_team_idx on graph_episodes (team_id, p
 -- not a source of truth. Sole writer: lib/graph/arc-cache (via lib/graph/arcs).
 create table if not exists arc_cache (
   team_id uuid not null references teams(id) on delete cascade,
-  group_key text not null,                       -- sorted visible-group set, e.g. 'acme_external,acme_team'
+  group_key text not null,                       -- the SYNTHESIS SCOPE key: sorted visible-group set ('acme_external,acme_team'), or PCCC6B-1's partition namespace ('p:<slug>:<sorted groups>') for an enforced principal's scoped arcs
   arcs jsonb not null default '[]'::jsonb,        -- NarrativeArc[] (already human-attributed)
   -- Hash of the exact LLM synthesis input (the attributed fact prompt). The background refresh SKIPS the
   -- (non-deterministic) LLM re-synthesis when this is unchanged — so arcs only change when the underlying
@@ -2424,12 +2469,25 @@ create table if not exists arc_corrections (
   arc_id text not null,                        -- sha(title) today, and it CHURNS every recompute (M7)
   arc_title text not null default '',          -- …so the title is kept to stay diagnosable past that churn
   corrected_text text not null check (corrected_text <> ''),
+  -- PCCC6B-1: the SYNTHESIS SCOPE this correction was made in (sorted group-set key — the same
+  -- scheme as arc_cache.group_key). Synthesis loads corrections by EXACT scope match, so a
+  -- correction never feeds a different scope. '' = legacy pre-6b row (tier-scope by construction;
+  -- accepted only by the tier-path synthesis, never a partition scope).
+  group_key text not null default '',
   created_by uuid references members(id) on delete set null,
   created_at timestamptz not null default now(),
-  updated_at timestamptz not null default now(),
-  unique (team_id, arc_id)                     -- latest take per arc wins
+  updated_at timestamptz not null default now()
 );
 create index if not exists arc_corrections_team_idx on arc_corrections (team_id, updated_at desc);
+-- Replay order (the #495 class, guard: schema-index-column-replay): a live DB that predates the
+-- group_key migration loads THIS file first — the create-table above no-ops, so the column must be
+-- altered-in here BEFORE the index below references it.
+alter table arc_corrections add column if not exists group_key text not null default '';
+create index if not exists arc_corrections_team_scope_idx on arc_corrections (team_id, group_key, updated_at desc);
+-- Latest take per arc PER SCOPE (Fable 6b High 2) — the upsert's arbiter; identically named in the
+-- migration so a migrated DB and a from-zero DB hold ONE arbiter each. Live DBs drop the old
+-- team-global unique in the migration; from-zero never creates it.
+create unique index if not exists arc_corrections_scope_arc_key on arc_corrections (team_id, group_key, arc_id);
 
 -- ── work-timeline cache (the persisted, queryable work-timeline context layer) ──
 -- The day → person → work ledger (from `items` + `tasks`) assembled by lib/dashboard/work-timeline,

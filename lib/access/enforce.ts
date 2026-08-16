@@ -86,10 +86,16 @@ export async function visibleItemIdsForProjects(
   return { ids, empty: ids.size === 0 };
 }
 
-/** Member convenience: resolve the principal's visible projects via the oracle, then the item ids. */
-export async function visibleItemIds(db: DbClient, principal: Principal): Promise<VisibleItemIds> {
+/** Member convenience: resolve the principal's visible projects via the oracle, then the item ids.
+ * Also RETURNS the project ids (PCCC-6): the graph legs partition by project, and recomputing the
+ * oracle a second time for them would be a disagreement surface. */
+export async function visibleItemIds(
+  db: DbClient,
+  principal: Principal
+): Promise<VisibleItemIds & { projectIds: string[] }> {
   const { projectIds } = await visibleProjects(db, principal);
-  return visibleItemIdsForProjects(db, principal.teamId, projectIds);
+  const items = await visibleItemIdsForProjects(db, principal.teamId, projectIds);
+  return { ...items, projectIds: [...projectIds] };
 }
 
 /**
@@ -138,6 +144,9 @@ export async function memberVisibility(db: DbClient, principal: Principal): Prom
  */
 export interface TimelineEnforcement {
   visibleItemIds: ReadonlySet<string>;
+  /** The oracle's project set the item set was resolved FROM (PCCC6B-1: the arcs routes resolve
+   *  the principal's graph partition scope from this — same source of truth, one substrate read). */
+  visibleProjectIds: ReadonlySet<string>;
 }
 
 export async function resolveTimelineEnforcement(
@@ -152,7 +161,7 @@ export async function resolveTimelineEnforcement(
   // The caller (cold-miss build → 500; background rebuild → caught, no write) fails closed WITHOUT
   // caching. A genuinely-empty membership set (no error) still builds + caches a real empty ledger.
   if (error) throw new Error("access substrate read failed while resolving timeline enforcement");
-  return { visibleItemIds: ids };
+  return { visibleItemIds: ids, visibleProjectIds: vis.visibleProjectIds };
 }
 
 /**

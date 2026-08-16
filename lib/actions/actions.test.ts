@@ -11,7 +11,7 @@ function seedPolicy(fake: FakeSupabase, over: Record<string, unknown>) {
   fake.tables.policies ??= [];
   fake.tables.policies.push({
     id: `p-${fake.tables.policies.length}`,
-    team_id: "team-1",
+    team_id: "00000000-0000-4000-8000-00000000feed",
     priority: 0,
     subject_role: null,
     subject_tier: null,
@@ -25,7 +25,7 @@ function seedPolicy(fake: FakeSupabase, over: Record<string, unknown>) {
 }
 
 const base = (_fake: FakeSupabase) => ({
-  teamId: "team-1",
+  teamId: "00000000-0000-4000-8000-00000000feed",
   principal: PRINCIPAL,
   memberId: "mem-1",
   apiKeyId: "key-1",

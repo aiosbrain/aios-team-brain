@@ -1,5 +1,6 @@
 import "server-only";
 import { completeTextOrNull } from "@/lib/llm/complete";
+import type { LlmTaskName } from "@/lib/query/llm-task";
 import { normalizeSummaryField } from "@/lib/meetings/summary-format";
 import type { LlmBackendKeys } from "@/lib/query/llm-backend";
 import type { LlmMeterCtx } from "@/lib/costs/llm-usage";
@@ -77,7 +78,15 @@ export async function callMeetingsLLM(
   userContent: string,
   keys: ProviderKeys,
   timeoutMs: number = MEETINGS_LLM_TIMEOUT_MS,
-  meter?: LlmMeterCtx
+  meter?: LlmMeterCtx,
+  // REQUIRED-in-practice, and separate per pass. `task` is what the answering-model health leg
+  // partitions its failure streak by (LLMOBS-1), and the two passes that share this wrapper — summary/
+  // attendees and action items — run back-to-back on EVERY production trigger with action items LAST.
+  // Under one shared task string a failure that hits only the summary pass produces `fail, ok` per
+  // upload, so the task's newest row is always `ok` and the leg reads healthy while every summary is
+  // blank. Both cold reads of the spec blocked on exactly that. Optional only so the signature stays
+  // back-compatible; every production caller passes it.
+  task?: LlmTaskName
 ): Promise<string | null> {
   return completeTextOrNull(
     { system, prompt: userContent },
@@ -86,7 +95,11 @@ export async function callMeetingsLLM(
       jsonObject: true,
       maxTokens: MEETINGS_LLM_MAX_TOKENS,
       timeoutMs,
+      // `meter` bills the spend (llm_usage); `record` files the OUTCOME (ingest_runs, source='llm')
+      // that the health leg reads. They are different ledgers and only `meter` was wired here — which
+      // is why the leg had never observed a meeting summary despite claiming to.
       meter: meter ? { ...meter, source: "meeting-extract" } : undefined,
+      record: meter && task ? { db: meter.db, teamId: meter.teamId, task } : undefined,
     }
   );
 }
@@ -187,7 +200,7 @@ export async function extractFromTranscript(
   const rosterHint = roster.length
     ? `\n\nKnown team members (for reference, not exhaustive): ${roster.map((p) => p.displayName).join(", ")}.`
     : "";
-  const raw = await callMeetingsLLM(SYSTEM_PROMPT, `Transcript:\n\n${truncated}${rosterHint}`, keys, timeoutMs, meter);
+  const raw = await callMeetingsLLM(SYSTEM_PROMPT, `Transcript:\n\n${truncated}${rosterHint}`, keys, timeoutMs, meter, "meeting-summary");
   if (!raw) return empty;
   return parseTranscriptExtraction(raw, roster);
 }

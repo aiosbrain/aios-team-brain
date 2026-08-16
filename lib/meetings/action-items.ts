@@ -83,7 +83,9 @@ export async function extractActionItems(
   const rosterHint = roster.length
     ? `\n\nKnown team members (resolve first-name mentions against these full names): ${roster.map((p) => p.displayName).join(", ")}.`
     : "";
-  const raw = await callMeetingsLLM(SYSTEM_PROMPT, `Transcript:\n\n${truncated}${rosterHint}`, keys, timeoutMs, meter);
+  // `meeting-actions`, NOT the summary pass's task. This pass runs LAST on every trigger, so sharing
+  // one task string would let its success mask a summary failure forever (LLMOBS-1).
+  const raw = await callMeetingsLLM(SYSTEM_PROMPT, `Transcript:\n\n${truncated}${rosterHint}`, keys, timeoutMs, meter, "meeting-actions");
   if (!raw) return fallback();
 
   let parsed: unknown;

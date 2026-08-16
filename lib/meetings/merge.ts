@@ -54,7 +54,14 @@ export async function mergeTranscriptsLLM(
   const prompt = `Transcript A:\n\n${a}\n\n=====\n\nTranscript B:\n\n${b}`;
   const raw = await completeTextOrNull(
     { system: MERGE_SYSTEM, prompt },
-    { keys, jsonObject: false, maxTokens: 8192, meter: meter ? { ...meter, source: "meeting-merge" } : undefined }
+    {
+      keys,
+      jsonObject: false,
+      maxTokens: 8192,
+      meter: meter ? { ...meter, source: "meeting-merge" } : undefined,
+      // `meter` bills, `record` is what the health leg reads (LLMOBS-1) — different ledgers.
+      record: meter ? { db: meter.db, teamId: meter.teamId, task: "meeting-merge" } : undefined,
+    }
   );
   const text = raw?.trim();
   if (!text) return null;

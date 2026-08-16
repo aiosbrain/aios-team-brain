@@ -6,7 +6,8 @@ import { getSessionUser } from "@/lib/auth/session";
 import { errorResponse } from "@/lib/api/schemas";
 import { resolveAnsweringKeys } from "@/lib/query/answering";
 import { visibleGroupIds } from "@/lib/graph/group";
-import { recomputeArcs } from "@/lib/graph/arcs";
+import { recomputeArcs, partitionArcScopeKey } from "@/lib/graph/arcs";
+import { selectEnforcedGraphPartitions } from "@/lib/graph/partition-read";
 import { freshnessWire, computedNow } from "@/lib/freshness";
 import { memberEnforcement } from "@/lib/access/enforce";
 import { filterArcsByVisibleItems } from "@/lib/graph/arc-visibility";
@@ -60,36 +61,69 @@ export async function POST(req: NextRequest) {
   if (tier !== "team") return errorResponse("forbidden", "corrections are team-tier only", 403);
 
   const admin = adminClient();
-  const groups = visibleGroupIds(teamSlug, tier);
 
   // Access enforcement (Phase B slice 5, spec §5.8). Resolve the member's visibility ONCE, fail
-  // closed on a substrate error (→ 500), and use it for BOTH gates below.
-  let enforce: { visibleItemIds: ReadonlySet<string> } | null;
+  // closed on a substrate error (→ 500), and use it for the scope + BOTH gates below.
+  // PCCC6B-1: an ENFORCED member's recompute runs in their partition scope — the same scope their
+  // GET serves — so the correction is recorded under that scope key and can never feed another
+  // scope's synthesis. Permissive keeps the tier path byte-identical.
+  let enforce: import("@/lib/access/enforce").TimelineEnforcement | null;
+  let scopeGroups: string[] | null = null;
   try {
     enforce = await memberEnforcement(admin, { teamId: team.id, memberId });
+    if (enforce != null) {
+      const scope = await selectEnforcedGraphPartitions(admin, {
+        teamId: team.id,
+        visibleProjectIds: [...enforce.visibleProjectIds],
+        // Same uncapped scope as the GET (Fable 6b Medium 3) — the gate below must consult the
+        // row the member was actually served, so the two resolutions must agree.
+        k: Number.MAX_SAFE_INTEGER,
+      });
+      scopeGroups = scope.groups;
+    }
   } catch {
     return errorResponse("internal", "enforcement check failed", 500);
   }
+  const groups = scopeGroups ?? visibleGroupIds(teamSlug, tier);
+  const scopeKey = scopeGroups ? partitionArcScopeKey(teamSlug, scopeGroups) : groups.slice().sort().join(",");
 
   // WRITE gate (Codex B5 High — correction poisoning): recomputeArcs WRITES each correction to
-  // `arc_corrections` AND projects it into the shared team Graphiti group, then feeds every future
-  // team-tier synthesis. The schema accepts ANY `arc_id`, so without this an attenuated member could
+  // `arc_corrections` AND projects it into a Graphiti group, then feeds every future same-scope
+  // synthesis. The schema accepts ANY `arc_id`, so without this an attenuated member could
   // inject arbitrary/invisible corrections and poison the SHARED synthesis (not a replay-only edge as
   // an earlier fold wrongly claimed). Under enforcing, a member may only correct an arc they can
   // currently SEE: validate every target against the VISIBLE cached arc set BEFORE the write — read
   // the cache (no synthesis; a cold cache has nothing to correct → reject). An `arc_id` that churned
   // since their GET no longer matches → rejected, they re-fetch (fail closed beats poisonable).
+  // PCCC6B-1: the cache row consulted is the member's OWN scope row — the arcs they were actually
+  // looking at — not the tier row their GET no longer reads.
   if (enforce) {
-    const groupKey = groups.slice().sort().join(",");
-    const cached = await readArcCache(admin, team.id, groupKey);
+    const cached = await readArcCache(admin, team.id, scopeKey);
     const visibleIds = new Set(filterArcsByVisibleItems(cached?.arcs ?? [], enforce.visibleItemIds).map((a) => a.id));
     if (corrections.some((c) => !visibleIds.has(c.arc_id))) {
-      return errorResponse("forbidden", "a correction targets an arc outside your visibility", 403);
+      // Fable 6b Medium 5: scope-key drift (a latch flip or General's debt toggling between the
+      // member's GET and this POST) reads a different row than the arcs they saw — fail closed,
+      // but the message must not accuse them of a visibility violation for cache churn.
+      return errorResponse(
+        "forbidden",
+        "a correction targets an arc outside your visibility, or your arc view is stale — refresh the arcs and retry",
+        403
+      );
     }
   }
 
   const keys = await resolveAnsweringKeys(admin, team.id);
-  const { arcs: allArcs, freshness } = await recomputeArcs(admin, team.id, teamSlug, tier, groups, corrections, keys, memberId);
+  const { arcs: allArcs, freshness } = await recomputeArcs(
+    admin,
+    team.id,
+    teamSlug,
+    tier,
+    groups,
+    corrections,
+    keys,
+    memberId,
+    scopeGroups ? { scopeKey } : undefined
+  );
 
   // READ gate: drop arcs the member can't see — this route returns the recomputed TIER set, so
   // without the filter it is an unfiltered bypass of the enforced arc read (Fable B5 High).

@@ -28,7 +28,7 @@ const STALE_MS = 3 * 60 * 60 * 1000; // 3h default
  * that fired this banner on a healthy job.
  */
 const STALE_MS_BY_SOURCE: Record<string, number | null> = {
-  llm: null, // event-driven (also surfaced on the retrieval-health card)
+  llm: null, // event-driven; not a banner leg at all since LLMOBS-1 — see NOT_PIPELINE_LEGS
   scan: null, // manual / CI
   pm_sync: null, // reactive — its own staleness heuristic lives in lib/pm-sync/runs
   auth_cleanup: 26 * 60 * 60 * 1000, // 24h cadence + 2h grace (genuinely-stuck still surfaces)
@@ -92,6 +92,28 @@ export function staleThresholdMs(source: string): number | null {
  */
 const CONNECTOR_SOURCES: ReadonlySet<string> = new Set(["slack", "plane", "linear", "github"]);
 
+/**
+ * Sources this banner does NOT speak for (LLMOBS-1). The banner's sentence is "N ingestion legs are
+ * broken — the brain isn't getting fresh data", and that is FALSE for a generation leg: ingestion is
+ * fine, a model failed.
+ *
+ * `llm` is here for a second, sharper reason review supplied: keeping it DOUBLE-COUNTS every arcs
+ * failure. A failed synthesis writes a `source='arcs'` ingest row AND, via `record:`, a `source='llm'`
+ * row (`lib/graph/arcs.ts:485-495`) — so one event lit two legs, which is literally the
+ * "2 ingestion legs are broken" of the 2026-08-11 incident BANNERFLAP-1 was raised for. The codebase
+ * already worked around the symptom instead of the cause: `arcs.ts:487` tunes a timeout specifically
+ * so "a slow-but-healthy reasoning model" does not "fire the loud pipeline banner".
+ *
+ * Pulse loses nothing it had — the `arcs` leg stays and already covered those failures — and the
+ * answering model now has its own truthful home-page banner fed by `getLlmHealth`
+ * (`components/admin/generation-health-banner`), which names the failing feature, its model and its
+ * error instead of implying the pipeline stopped.
+ *
+ * `graph_health` is excluded for an unrelated pre-existing reason (it is a transition ledger, not a
+ * leg); the two are kept in one place so the banner's leg set is readable as a set.
+ */
+const NOT_PIPELINE_LEGS: ReadonlySet<string> = new Set([GRAPH_HEALTH_SOURCE, "llm"]);
+
 /** A connector leg is "orphaned" when its integration type is no longer enabled (deleted/disabled).
  *  Its frozen last-failure row is a fossil the scheduler can't overwrite — not a live break.
  *  `enabledTypes === null` means the config read FAILED — we don't know what's configured, so we fail
@@ -127,8 +149,8 @@ export interface PipelineHealth {
   /**
    * Legs the loud banner names: a CONFIRMED failure or a stale poller. A lone unconfirmed failure is
    * deliberately absent — it is still `ok:false` on the leg and listed in Admin → Recent
-   * ingestion runs. (NOT on the retrieval-health card: that card has no per-ingestion-source leg —
-   * only `llm` has one there. An earlier draft of this comment claimed otherwise.) `stale` is
+   * ingestion runs. (NOT on the retrieval-health card: that card has no per-ingestion-source leg. It
+   * has an answering-model leg, but `llm` is no longer a pipeline leg at all — see NOT_PIPELINE_LEGS.) `stale` is
    * independent of the classification and still loud on its own, including on a leg whose newest run
    * succeeded, because it answers a different question ("is the poller still ticking").
    */
@@ -281,7 +303,7 @@ export async function getPipelineHealth(teamId: string): Promise<PipelineHealth>
     // healthy graph forever (review finding). Its live state already surfaces through the synthetic
     // `graph_extract` leg below, fed by the same detector; the ledger rows remain visible in the
     // Recent-runs panel as the alarm's audit trail.
-    const legs: PipelineLeg[] = res.rows.filter((r) => r.source !== GRAPH_HEALTH_SOURCE).map((r) => {
+    const legs: PipelineLeg[] = res.rows.filter((r) => !NOT_PIPELINE_LEGS.has(r.source)).map((r) => {
       const at = iso(r.finished_at);
       // Stale only past THIS source's own cadence — a 24h job isn't stale at 3h (would cry wolf).
       const threshold = staleThresholdMs(r.source);
@@ -348,7 +370,8 @@ export async function getPipelineHealth(teamId: string): Promise<PipelineHealth>
     // ticking", so a leg whose newest run SUCCEEDED but whose scheduler went quiet must stay loud.
     // A lone `unconfirmed` failure is absent from here by design — it is still `ok:false` on the leg
     // and listed in Admin → Recent ingestion runs, just not in a banner that says the brain isn't
-    // getting fresh data. (Only `llm` also has a retrieval-health-card leg; the others do not.)
+    // getting fresh data. (No source here has a retrieval-health-card leg: `llm` had one and is no
+    // longer a pipeline leg at all — LLMOBS-1.)
     const failing = legs.filter(
       (l) => (l.failureClass === "confirmed" || l.stale) && !isOrphanedConnector(l.source, enabledTypes)
     );

@@ -2,6 +2,7 @@ import "server-only";
 import Anthropic from "@anthropic-ai/sdk";
 import type { RetrievedContext } from "./retrieve";
 import { selectLlmBackend, type LlmBackend, type LlmBackendKeys } from "./llm-backend";
+import { StreamHttpError, withStreamRetry, classifyErrorFrame, type StreamRetryOptions } from "./stream-retry";
 
 /**
  * Thin adapter around the Claude API so a future agent backend (e.g. Hermes)
@@ -215,17 +216,46 @@ export type QueryUsage = {
  */
 export type ProviderKeys = LlmBackendKeys;
 
+/** One event on the answer stream: an incremental `delta`, then a terminal `done` with usage. */
+export type StreamAnswerEvent =
+  | { type: "delta"; text: string }
+  | { type: "done"; usage: QueryUsage };
+
+/**
+ * Resilient answer stream: one bounded, backed-off retry wrapper around `streamAnswerOnce`.
+ * A transient failure (429 / 529 / 5xx / connection drop) that occurs BEFORE any delta reaches
+ * the client is retried (nothing has been streamed, so a restart is invisible); a failure after
+ * the first delta, a non-retryable error, or an exhausted attempt budget surfaces as before.
+ * This is the single retry owner for both backends (the Anthropic client runs with maxRetries:0).
+ */
 export async function* streamAnswer(
   ctx: RetrievedContext,
   question: string,
   keys: ProviderKeys = {},
   history: ChatTurn[] = [],
   caller?: CallerIdentity,
+  timeZone: string = "UTC",
+  retryOpts: StreamRetryOptions = {}
+): AsyncGenerator<StreamAnswerEvent> {
+  yield* withStreamRetry(
+    () => streamAnswerOnce(ctx, question, keys, history, caller, timeZone),
+    // ANY yielded event commits the stream: once the client has received anything — a delta OR the
+    // terminal `done` — a restart would corrupt the visible answer. Retry only when the attempt threw
+    // before yielding a single event. (Today `done` is always last, but this stays correct if it isn't.)
+    () => true,
+    retryOpts
+  );
+}
+
+/** A SINGLE answer attempt (no retry). Wrapped by `streamAnswer`; exported for focused tests. */
+export async function* streamAnswerOnce(
+  ctx: RetrievedContext,
+  question: string,
+  keys: ProviderKeys = {},
+  history: ChatTurn[] = [],
+  caller?: CallerIdentity,
   timeZone: string = "UTC"
-): AsyncGenerator<
-  | { type: "delta"; text: string }
-  | { type: "done"; usage: QueryUsage }
-> {
+): AsyncGenerator<StreamAnswerEvent> {
   const sourcesBlock = ctx.sources
     .map(
       (s) =>
@@ -244,8 +274,13 @@ export async function* streamAnswer(
     return;
   }
 
-  // Per-team key wins; otherwise the SDK reads ANTHROPIC_API_KEY from the env.
-  const client = new Anthropic(keys.anthropicKey ? { apiKey: keys.anthropicKey } : undefined);
+  // Per-team key wins; otherwise the SDK reads ANTHROPIC_API_KEY from the env. maxRetries:0 —
+  // `streamAnswer`'s `withStreamRetry` is the single, uniform retry owner across both backends,
+  // so the SDK's own retry layer must not silently multiply attempts under it.
+  const client = new Anthropic({
+    ...(keys.anthropicKey ? { apiKey: keys.anthropicKey } : {}),
+    maxRetries: 0,
+  });
 
   const stream = client.messages.stream({
     model: backend.model,
@@ -370,14 +405,14 @@ export async function* streamOpenAICompatible(
     if (looksLikeTokenLimit(res.status, body)) {
       res = await postChat(ANSWER_BUDGET);
       if (!res.ok) {
-        throw new Error(`LLM ${backend.model} @ ${backend.baseUrl}: ${res.status} ${await res.text().catch(() => "")}`);
+        throw new StreamHttpError(res.status, `LLM ${backend.model} @ ${backend.baseUrl}: ${res.status} ${await res.text().catch(() => "")}`);
       }
     } else {
-      throw new Error(`LLM ${backend.model} @ ${backend.baseUrl}: ${res.status} ${body}`);
+      throw new StreamHttpError(res.status, `LLM ${backend.model} @ ${backend.baseUrl}: ${res.status} ${body}`);
     }
   }
   if (!res.body) {
-    throw new Error(`LLM ${backend.model} @ ${backend.baseUrl}: ${res.status} no stream body`);
+    throw new StreamHttpError(res.status, `LLM ${backend.model} @ ${backend.baseUrl}: ${res.status} no stream body`);
   }
 
   const reader = res.body.getReader();
@@ -388,6 +423,10 @@ export async function* streamOpenAICompatible(
   let completion = 0;
   let cost = 0;
   let emittedChars = 0;
+  // OpenRouter (and OpenAI-compatible gateways) can answer an upstream failure with HTTP 200 and a
+  // `data: {"error": {...}}` SSE frame instead of a non-2xx — so the failure never reached the
+  // `!res.ok` check above. Capture it here and convert it to a classified throw after the loop.
+  let errorFrame: { code?: number | string; message?: string; type?: string } | null = null;
 
   while (true) {
     const { done, value } = await reader.read();
@@ -403,10 +442,17 @@ export async function* streamOpenAICompatible(
       let j: {
         choices?: { delta?: { content?: string } }[];
         usage?: { prompt_tokens?: number; completion_tokens?: number; cost?: number };
+        error?: { code?: number | string; message?: string; type?: string };
       };
       try {
         j = JSON.parse(data);
       } catch {
+        continue;
+      }
+      // A provider error delivered mid-stream on a 200 (no `choices`/`content`). Remember it; it
+      // becomes a classified throw after the loop when nothing was emitted (see below).
+      if (j.error) {
+        errorFrame = j.error;
         continue;
       }
       if (j.usage) {
@@ -443,9 +489,29 @@ export async function* streamOpenAICompatible(
     }
   }
 
+  // A 200 stream that carried a provider error frame and streamed NO answer is a transient failure
+  // wearing a success costume. Convert it to a classified throw so streamAnswer's retry can act on it
+  // (a bare "overloaded" frame is exactly the blip this ticket exists to absorb). Only when nothing was
+  // emitted — once deltas reached the client, a restart would corrupt the visible answer, so a
+  // mid-stream error after partial output falls through to the empty/partial handling below. A
+  // NON-retryable code (e.g. an auth error frame) is thrown with its own status so it surfaces at once.
+  // ALWAYS throw when the provider sent an error frame — including after deltas already streamed.
+  // Falling through to `done` in that case made the route persist a TRUNCATED answer as a complete
+  // success and meter it as one: the user keeps the partial text already streamed but is told the turn
+  // succeeded, and chat history stores the half-answer as final. Throwing surfaces the failure (the
+  // client shows the partial text plus an error) and CANNOT cause a duplicate answer, because
+  // withStreamRetry has `emitted === true` once any event was yielded and so will not retry.
+  // classifyErrorFrame maps permanent shapes (invalid_api_key / insufficient_quota / context_length,
+  // incl. ones wearing a retryable numeric code) to non-retryable statuses, so only genuine transients
+  // are retried. (Known gap: a billed `usage.cost` on the error frame isn't metered — the meter lives
+  // in the route's done branch, not this transport layer; tracked as a follow-up.)
+  if (errorFrame) {
+    const { status, detail } = classifyErrorFrame(errorFrame);
+    throw new StreamHttpError(status, `LLM ${backend.model} @ ${backend.baseUrl}: stream error ${status} ${detail}`);
+  }
+
   // Zero visible answer text is a silent blank answer — make it diagnosable. Usual cause: a reasoning
-  // model spent the whole budget on hidden reasoning (raise LLM_REASONING_HEADROOM_TOKENS); a mid-stream
-  // provider error frame also lands here.
+  // model spent the whole budget on hidden reasoning (raise LLM_REASONING_HEADROOM_TOKENS).
   if (emittedChars === 0) {
     console.error(
       `[query] streamed answer was EMPTY (model=${backend.model}, completion_tokens=${completion}) — ` +

@@ -651,10 +651,14 @@ Mitigations, in force order:
 4. **The structural fact:** most content will live in exactly one project + General. The
    no-widening invariant means auto-tagging doesn't proliferate copies; P̄ stays near 1–2 unless
    humans deliberately fan content out. Model: cost ≈ baseline × (1 + share_multi × (P̄multi − 1)).
-5. **Visibility:** per-project spend surfaces in the existing cost dashboard by extending
-   `llm_usage` metering with `meta.group_id` (the proxy already tags calls; `lib/llm/graph-proxy.ts`)
-   — the dashboard's graph row gains a per-project breakdown. Budget ceiling: the existing graph
-   proxy ceiling applies per team; a per-project soft cap is configuration.
+5. **Visibility:** per-project spend surfaces in the existing cost dashboard — **AMENDED
+   (PCCC-2 plan review):** the original claim that the proxy "already tags calls" with
+   `meta.group_id` was false — Graphiti's completion calls carry no episode/group context
+   (`lib/llm/graph-proxy.ts`, the `resolveGraphProxyTeamId` doc comment), so exact per-call
+   `llm_usage` attribution needs an upstream graphiti_core change. Per-project spend is instead
+   APPROXIMATED from per-`(item, group)` episode counts in `graph_episodes`. Budget ceiling: the
+   existing graph proxy ceiling applies per team and stays the only HARD cap; a per-project soft
+   cap is contingent on the upstream change.
 
 **General-project ruling — what General is, and when content leaves it.** General is **the content
 Everyone may see**, not "everything":

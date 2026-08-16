@@ -4,7 +4,9 @@ import { db, ingest, seedTeam, type Seed } from "./helpers";
 import { backfillTeamContext } from "@/lib/projects/context/backfill";
 import { memberEnforcement } from "@/lib/access/enforce";
 import { filterArcsByVisibleItems } from "@/lib/graph/arc-visibility";
-import { getArcs, type NarrativeArc } from "@/lib/graph/arcs";
+import { getArcs, partitionArcScopeKey, type NarrativeArc } from "@/lib/graph/arcs";
+import { selectEnforcedGraphPartitions } from "@/lib/graph/partition-read";
+import { ensureAccessBootstrap } from "@/lib/access/bootstrap";
 import { visibleGroupIds } from "@/lib/graph/group";
 import { createGroup, grantProjectToGroup } from "@/lib/access/groups";
 
@@ -135,5 +137,49 @@ describe("enforced arc reads (Phase B slice 5)", () => {
     const titles = await visibleArcTitles(seed, seed.memberId);
     expect(titles).toContain("arc grounded");
     expect(titles, "a no-itemId arc has no verifiable basis → fail closed").not.toContain("arc pure-graph");
+  });
+});
+
+describe("PCCC6B-1 — the enforced arcs read cutover (real Postgres)", () => {
+  it("an ENFORCED member's scoped read can NEVER be served the tier cache row — while the tier path still is", async () => {
+    const seed = await seedTeam();
+    expect((await ensureAccessBootstrap(db(), seed.teamId)).ok).toBe(true);
+    await setEnforcement(seed, "enforcing");
+    // The laundering artifact: a tier row synthesized with every team correction folded in.
+    await seedArcCache(seed, [arc("tier-laundered", [])]);
+
+    const enforce = await memberEnforcement(db(), { teamId: seed.teamId, memberId: seed.memberId });
+    expect(enforce).not.toBeNull();
+    const scope = await selectEnforcedGraphPartitions(db(), {
+      teamId: seed.teamId,
+      visibleProjectIds: [...enforce!.visibleProjectIds],
+    });
+    const scopeKey = partitionArcScopeKey(seed.teamSlug, scope.groups);
+    // The scoped key is its OWN cache namespace — even a built-ins-only scope (this member's) whose
+    // groups equal the tier pair must not share the tier row.
+    expect(scopeKey).not.toBe(visibleGroupIds(seed.teamSlug, "team").slice().sort().join(","));
+
+    const { arcs } = await getArcs(
+      db(),
+      seed.teamId,
+      seed.teamSlug,
+      "team",
+      scope.groups,
+      { anthropicApiKey: null, openaiApiKey: null } as never,
+      { scopeKey }
+    );
+    expect(arcs.map((a) => a.title)).not.toContain("arc tier-laundered");
+
+    // Control: the tier path (permissive readers) still serves the seeded row — without this the
+    // assertion above would pass just as happily if the cache were simply broken.
+    const tier = await getArcs(
+      db(),
+      seed.teamId,
+      seed.teamSlug,
+      "team",
+      visibleGroupIds(seed.teamSlug, "team"),
+      { anthropicApiKey: null, openaiApiKey: null } as never
+    );
+    expect(tier.arcs.map((a) => a.title)).toContain("arc tier-laundered");
   });
 });

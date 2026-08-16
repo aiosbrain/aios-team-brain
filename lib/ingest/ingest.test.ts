@@ -14,7 +14,7 @@ import type { ItemPayload } from "@/lib/api/schemas";
  * parent nulling, partial-write preserve/clear semantics).
  */
 
-const AUTH = { teamId: "team-1", memberId: "mem-1", apiKeyId: "key-1" };
+const AUTH = { teamId: "00000000-0000-4000-8000-00000000feed", memberId: "mem-1", apiKeyId: "key-1" };
 
 /**
  * Every real task producer SERIALIZES the projectable row fields into the body — linear/plane/github

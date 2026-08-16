@@ -9,6 +9,7 @@ import { isRestrictedTier } from "@/lib/auth/visibility";
 import { formatSseFrame } from "@/lib/api/sse";
 import { retrieve } from "@/lib/query/retrieve";
 import { streamAnswer } from "@/lib/query/claude";
+import { clientErrorMessage } from "@/lib/query/stream-retry";
 import { pickTimezone, DEFAULT_TIMEZONE } from "@/lib/query/timezone";
 import {
   ownsConversation,
@@ -189,12 +190,15 @@ export async function POST(req: NextRequest) {
 
   // Access enforcement (Phase B slice 2): same as the API query route — filter retrieval to the
   // member's membership-visible items on an 'enforcing' team; permissive → null → byte-identical.
-  let enforce: { visibleItemIds: ReadonlySet<string> } | null = null;
+  let enforce: import("@/lib/query/retrieve").RetrieveEnforce | null = null;
   try {
     const { teamEnforcesAccess, visibleItemIds } = await import("@/lib/access/enforce");
     if (await teamEnforcesAccess(db, team.id)) {
-      const { ids } = await visibleItemIds(db, { teamId: team.id, memberId: me.id });
-      enforce = { visibleItemIds: ids };
+      const { ids, projectIds } = await visibleItemIds(db, { teamId: team.id, memberId: me.id });
+      // PCCC-6: the dashboard chat is the members' PRIMARY conversational surface — it gets the
+      // K-capped partitioned graph leg exactly like /api/v1/query (review Medium 7: leaving it on
+      // the omit path while the API had the leg was an unrecorded split). Team-tier members only.
+      enforce = { visibleItemIds: ids, ...(me.tier === "team" ? { graphProjectIds: projectIds } : {}) };
     }
   } catch {
     return errorResponse("internal", "enforcement check failed", 500);
@@ -222,7 +226,13 @@ export async function POST(req: NextRequest) {
 
       let answer = "";
       try {
-        for await (const chunk of streamAnswer(ctx, question, keys, historyTurns, caller, timeZone)) {
+        for await (const chunk of streamAnswer(ctx, question, keys, historyTurns, caller, timeZone, {
+          onRetry: ({ attempt, delayMs, error }) =>
+            console.warn(
+              `[query] transient answer-stream failure (attempt ${attempt}), retrying in ${delayMs}ms:`,
+              error instanceof Error ? error.message : error
+            ),
+        })) {
           if (chunk.type === "delta") {
             answer += chunk.text;
             send("delta", { text: chunk.text });
@@ -284,7 +294,12 @@ export async function POST(req: NextRequest) {
           }
         }
       } catch (e) {
-        send("error", { message: e instanceof Error ? e.message : "query failed" });
+        // Log the REAL error (it carries the provider status / model / base URL) for diagnosis,
+        // but send the client only a friendly, SANITIZED message — the raw text would leak the
+        // internal model + base URL. Bounded transient-error retry already happened upstream in
+        // streamAnswer; reaching here means it failed even after retries (or was non-retryable).
+        console.error("[query] answer stream failed:", e instanceof Error ? e.message : e);
+        send("error", { message: clientErrorMessage(e) });
       } finally {
         controller.close();
       }
