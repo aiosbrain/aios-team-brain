@@ -8,6 +8,42 @@ remaining lever after PIPEFF-4 (packing) was declined on evidence.
 
 ---
 
+## Relevance re-check, 2026-08-16 — main moved 29 commits, the lever did not
+
+The spec sat for four days while Phase C (per-project graph projection, PCCC-1..6), the alarm work
+and the mutation-flow loop landed. Re-checked against `origin/main` before doing anything else,
+because a spec that assumes a codebase that has moved is worse than no spec.
+
+**Still relevant, and the lever is bigger than when it was written:**
+
+| check | result |
+|---|---|
+| Did anyone ship combined extraction? | **No** — zero `extract_nodes_and_edges` rows in `llm_usage`, and zero `unknown`, so the classifier has not drifted either |
+| Is the patch target intact? | **Yes** — `graphiti/Dockerfile` and the graphiti pin: **0 commits** |
+| Is the instrument intact? | **Yes** — `capture-tap.mjs`, `harvest.ts`, the battery scripts: **0 commits**. The response-capture edit (§4) is still the only instrument change needed |
+| Is `graph-call-kind.ts` still missing the row? | **Yes** — 0 commits, so AC8 stands exactly as written |
+| Is the saving still there? | **Larger.** Re-measured on a fresh 4-day window: `extract_edges` 25.1% + `extract_nodes` 22.5% = **47.6%** of graph cost, against **44.5%** when the spec was written |
+
+**One thing DID change, and it touches the battery rather than the patch.** Phase C rewrote how the
+projector derives `group_id`: it now resolves a stored per-project *home pointer*, with
+`episodeGroupId` kept as "the quiet fallback for an unbootstrapped team" (`project.ts:727`, `:791`).
+Two consequences for the battery, neither fatal, both to be closed at build time:
+
+1. **The one-group property survives by fallback, not by design.** A freshly seeded battery DB has no
+   project pointer rows, so the fallback applies and the corpus lands in one group as the spec
+   assumes. But the same comment says a scheduler tick bootstraps those rows "within a tick" — so the
+   battery must either keep its scheduler off for projection or assert the corpus is single-group
+   **after** the push, not assume it from the seed.
+2. **Initiative fan-out is new and would inflate every count.** PCCC-5 added fan-out pushes with a
+   per-pass budget of 25 (`FANOUT_PUSH_MAX_PER_PASS`, `project.ts:222`). A fanned-out item is pushed
+   to more than one group, which would break the pinned 108-episodes-per-rep denominator *and* inflate
+   cost in both arms. The battery must pin **`GRAPH_FANOUT_PUSH_MAX_PER_PASS=0`** and assert zero
+   fan-out rows, rather than relying on a corpus that happens to have no initiatives.
+
+Both are added to the run's preconditions. Neither changes the patch, the projection, or the $16.
+
+---
+
 ## 0. What it is
 
 `add_episode` — the only path the REST server uses — reads every episode **twice**: once to extract
