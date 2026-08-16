@@ -1,4 +1,5 @@
 import "server-only";
+import { resolvePositiveInt } from "@/lib/util/env";
 import { createHash } from "node:crypto";
 import { completeTextOrNull } from "@/lib/llm/complete";
 import type { LlmBackendKeys } from "@/lib/query/llm-backend";
@@ -744,11 +745,12 @@ async function synthesizeArcs(
   // there is no external-principal path to it. Without this, a correction recorded in that window
   // was stored but never read back — H13's silent revert through a new door. The un-namespaced
   // EXTERNAL TIER path stays corrections-free (the standing gate below).
-  const correctionsEligible = effectiveScopeKey.startsWith("p:") || teamTier;
+  const correctionsEligible =
+    effectiveScopeKey.startsWith("p:") || effectiveScopeKey.startsWith("g:") || teamTier;
   const correctionsRead = correctionsEligible
     ? await listArcCorrections(db, teamId, {
         groupKey: effectiveScopeKey,
-        includeLegacy: !effectiveScopeKey.startsWith("p:"),
+        includeLegacy: !effectiveScopeKey.startsWith("p:") && !effectiveScopeKey.startsWith("g:"),
       })
     : { corrections: [], ok: true };
   const allCorrections = [
@@ -1003,6 +1005,7 @@ export function arcKeyBelongsToTeam(key: string, teamSlug: string, teamId?: stri
   // and would have stranded every slug-keyed correction and cache row silently. Project-group
   // segments (`g_<teamhex>_p_<projhex>`) carry no slug either way, so the tier prefix test below
   // can never see them — the namespace is what keeps eviction exact.
+  if (key.startsWith("g:")) return false; // PPARC-2: g: keys carry no team — dedicated evictors own them
   if (key.startsWith("p:")) return teamId != null && key.slice(2).startsWith(`${teamId}:`);
   const prefix = `${teamSlug}_`;
   return key.split(",").some((g) => g.startsWith(prefix));
@@ -1027,6 +1030,28 @@ export function evictScopedArcMemory(teamId: string): void {
   const prefix = `p:${teamId}:`;
   for (const key of cache.keys()) {
     if (key.startsWith(prefix)) cache.delete(key);
+  }
+}
+
+/** Evict ONE partition's `g:` in-memory entry (PPARC-2) — the mem half of the per-partition purge
+ *  door; a DB purge without this serves the poisoned row from this process for its lifetime. */
+export function evictPartitionArcMemory(groupId: string): void {
+  cache.delete(`g:${groupId}`);
+}
+
+/** Evict every `g:` entry belonging to a team (PPARC-2, design Medium 9): `g:` keys carry only the
+ *  group id, so team-wide eviction resolves the team's pointer list — built-ins + initiatives —
+ *  and deletes each exactly. Async because the resolution reads `projects.graph_group_id`. */
+export async function evictTeamPartitionArcMemory(db: DbClient, teamId: string): Promise<void> {
+  try {
+    const { data } = await db
+      .from("projects")
+      .select("graph_group_id")
+      .eq("team_id", teamId)
+      .not("graph_group_id", "is", null);
+    for (const r of (data ?? []) as { graph_group_id: string }[]) cache.delete(`g:${r.graph_group_id}`);
+  } catch {
+    // best-effort — the DB purge/stale-mark is the durable layer
   }
 }
 
@@ -1249,6 +1274,43 @@ export interface CachedArcs {
  * Empty when the graph/LLM is unavailable. Chose SWR over a global timer-driven refresh so LLM calls
  * only happen for teams actually being viewed (not every team on a timer). See docs/design/brain-learning-panel.md.
  */
+/** PPARC-2 warming budget: how many missing/stale `g:` partition rows one union read may schedule
+ *  for background synthesis (design §2.2/§5 — the deliberate, bounded double-spend of the rollout
+ *  slice, counted separately in the pre-registered cost check). */
+export const PPARC_SYNTH_BUDGET_PER_READ = resolvePositiveInt(process.env.PPARC_SYNTH_BUDGET_PER_READ, 3);
+
+/**
+ * Schedule background synthesis of PARTITION-NATIVE (`g:`) rows for up to `budget` of the given
+ * groups whose rows are missing or stale (PPARC-2 §5 warming ruling). Rides the existing SWR
+ * machinery — single-flighted per key by `refreshing`, full BG timeout, per-partition corrections
+ * scope — so a union read warms the partition rows the PPARC-3 cutover will serve. Fire-and-forget.
+ */
+export async function warmPartitionArcs(
+  db: DbClient,
+  teamId: string,
+  groups: readonly string[],
+  keys: ProviderKeys,
+  budget: number = PPARC_SYNTH_BUDGET_PER_READ
+): Promise<number> {
+  let scheduled = 0;
+  for (const group of groups) {
+    if (scheduled >= budget) break;
+    const key = `g:${group}`;
+    if (refreshing.has(key)) continue;
+    const mem = cache.get(key);
+    const now = Date.now();
+    if (mem && !freshness(mem.at, arcTtlMs(mem.degraded), { now, degraded: mem.degraded }).stale) continue;
+    const persisted = await readArcCache(db, teamId, key).catch(() => null);
+    if (persisted && !freshness(persisted.computedAt, arcTtlMs(persisted.degraded), { now, degraded: persisted.degraded }).stale) {
+      memCacheSet(key, { arcs: persisted.arcs, at: persisted.computedAt, factsHash: persisted.factsHash, degraded: persisted.degraded });
+      continue;
+    }
+    refreshArcsInBackground(teamId, key, [group], keys, persisted ? { arcs: persisted.arcs, factsHash: persisted.factsHash, degraded: persisted.degraded } : null);
+    scheduled++;
+  }
+  return scheduled;
+}
+
 export async function getArcs(
   db: DbClient,
   teamId: string,
@@ -1263,6 +1325,10 @@ export async function getArcs(
   // No visible groups is not a degraded read — it's a correct empty answer, computed now.
   if (groups.length === 0) return { arcs: [], freshness: computedNow() };
   const key = opts?.scopeKey ?? groups.slice().sort().join(",");
+  // PPARC-2 §5 warming ruling: a UNION read schedules partition-native (`g:`) warming for its
+  // scope's partitions, budgeted + background — the rows the PPARC-3 cutover will serve are warm
+  // before any read depends on them. Fire-and-forget; never touches this read's latency.
+  if (key.startsWith("p:")) void warmPartitionArcs(db, teamId, groups, keys);
   const now = Date.now();
 
   // 1. In-memory (fastest, same process). `at` is the PERSISTED computed_at (set below), not the time
