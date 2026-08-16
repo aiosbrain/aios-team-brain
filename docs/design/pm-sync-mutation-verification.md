@@ -174,12 +174,20 @@ raw transport at all, which the runtime term does not. Two layers, two different
 mutation-tested separately, because a sibling layer that catches the same outcome is how a mutation
 survives while looking caught.
 
-**The provisioning exemption, stated rather than laundered.** `lib/provisioning/linear.ts:53` issues
-`organizationInviteCreate` through the raw transport and reads `success` correctly today. Routing it
-through `linearMutation` means requesting `organizationInvite { id }` — a real behaviour change, which
-contradicts draft 2's §3 claim that it "needs no behaviour change". This slice **migrates it**, because
-an exemption in the one guard that defines "every write is checked" is the hole the guard exists to
-close; the entity request is additive and the site already checks the flag it would keep checking.
+**The provisioning site, and a build-time correction to this section.** `lib/provisioning/linear.ts:53`
+issues `organizationInviteCreate` through the raw transport. Draft 3 said to migrate it "requesting
+`organizationInvite { id }`". **Building it showed that was a guess I could not check**: there is no
+Linear SDK and no recorded schema in this repo, so I cannot verify that payload's entity field name, and
+requesting a field that does not exist errors the whole mutation — which would silently stop invites, on
+an outward-facing path, to satisfy a guard.
+
+So the site IS migrated to `linearMutation` (the runtime term leaves no choice), but its `expect` uses an
+`entityless` form that names, in prose, why there is no entity to check. That is **not** the
+`successNotReturned` hatch this spec removed: `success` is still required for every caller, which is the
+defect. What is relaxed is the second net, at one site, with the reason written into the type — and
+`test/guards/pm-sync-linear-transport.test.ts` asserts the form appears **nowhere in `lib/pm-sync`**, so
+it cannot spread into the projection path it was built for. Verifying the field name against live Linear
+and dropping the exemption is named as deferred work.
 
 ### 1c. A create that yields no resource id is an error
 
@@ -228,7 +236,7 @@ that a previously-silent provider refusal now surfaces as a per-row error.
 - `test/guards/pm-sync-linear-transport.test.ts` — the import allowlist is a SECOND layer with its own property (who may reach the raw transport); it is asserted non-empty and every allowlisted path must resolve, so a rename cannot silently empty it. The two layers are mutation-tested SEPARATELY, and each mutation must redden its own layer's test rather than being caught by the sibling.
 - `test/guards/pm-sync-linear-transport.test.ts` — the mutation-test that matters: adding a new mutation INSIDE an already-allowlisted file (`lib/pm-sync/linear.ts`) reddens the runtime guard. Draft 2's import allowlist passed this case, which is why it was replaced.
 - `lib/pm-sync/linear.ts` — `issueLabelCreate` requests `success` and its entity, so no site depends on tolerated absence.
-- `lib/provisioning/linear.ts` — `organizationInviteCreate` is migrated to `linearMutation` (requesting `organizationInvite { id }`), so the guard has no exemption to launder.
+- `lib/provisioning/linear.ts` — `organizationInviteCreate` is migrated to `linearMutation`; its `expect` uses the `entityless` form carrying the reason, and `test/guards/pm-sync-linear-transport.test.ts` asserts that form appears nowhere under `lib/pm-sync`.
 
 **Data-mechanics tier** (`vitest.datamechanics.config.ts`, real Postgres) — the STORED-STATE outcomes, which a unit-tier payload assertion can green while the real short-circuit still skips:
 
@@ -263,6 +271,9 @@ builder would have hunted for.)
 - **`lib/provisioning/linear.ts`.** Its `organizationInviteCreate` already reads `success` correctly, so
   it is inside the guard's allowlist reasoning but needs no behaviour change. Named because it is the
   seventh mutation and the reason the guard is an import allowlist rather than a document parser.
+- **Verifying `organizationInviteCreate`'s entity field against live Linear**, which would let the
+  provisioning site drop its `entityless` exemption. It needs a call to the real API; guessing the field
+  name from inside this repo is what the build refused to do.
 - **A retry on a refused mutation.** Turning a silent success into a loud error is the fix; deciding
   whether to retry it is a policy question with a rate-limit dimension.
 - **The ~2,000-character `tasks.md` description cap** discovered while filing this ticket, which fails
