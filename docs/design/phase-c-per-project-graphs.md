@@ -5,6 +5,8 @@
 **Build-with:** fable / high — the code slices this doc governs change the graph's partition key, prod schema, and real LLM spend; each gets its own PR + two-model adversarial review.
 **Increment:** one PR, docs only. Every code change is deferred to the sibling slices PCCC-3..7 (§5), each its own ticket + PR + review.
 
+**Access posture (standing, explicit):** DEFAULT-DENY throughout — every enforced read in this design fails CLOSED on error, absence, or ambiguity (an unresolvable scope, a failed substrate read, an unconfirmed purge, an un-latched partition all yield the OMITTED leg / the neutral envelope, never a wider read), and the external tier keeps the §5.8b omit path with the brain-api's 422 rejection contract for tier-violating requests (docs/brain-api.md) unchanged.
+
 ## 1. Problem
 
 The Graphiti graph is partitioned by **tier**: an item's episodes live in `<teamSlug>_team` or `<teamSlug>_external` (`lib/graph/project.projectItemsToGraph` → `episodeGroupId(teamSlug, item.access)`), and a reader searches `visibleGroupIds(tier)`. That write-time `item.access` split is the ONLY graph isolation (no RLS).
