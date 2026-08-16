@@ -63,6 +63,45 @@ export function ChatWorkspace({ teamSlug, initialQuestion }: { teamSlug: string;
     void loadList();
   }, [loadList]);
 
+  // REATTACH ON MOUNT (QBGSTREAM-1). This page keeps `activeId`/`seed` in client state only, so
+  // navigating away and back lands on a fresh "new chat" — even when a turn is still running
+  // server-side. Ask the server whether this member has an in-flight turn and, if so, open that thread
+  // (QueryChat then polls its run and shows the answer as it lands). Only when a run is genuinely
+  // streaming, so the normal new-chat-on-open behaviour is unchanged; a deploy-orphaned run is
+  // filtered out server-side by the staleness rule.
+  useEffect(() => {
+    // A DEEP-LINKED question (/query?q=…, e.g. from the Home launcher) is an explicit instruction to
+    // start a NEW chat, and QueryChat auto-asks it on mount. Re-opening a background thread here would
+    // remount QueryChat onto that thread, stranding the deep-linked turn in a dead closure — its answer
+    // persisting into a conversation the user is never shown. The explicit ask wins.
+    if (initialQuestion) return;
+    const ctl = new AbortController();
+    (async () => {
+      try {
+        const res = await fetch(
+          `/api/dashboard/conversations?team=${encodeURIComponent(teamSlug)}&active_run=1`,
+          { signal: ctl.signal }
+        );
+        if (!res.ok) return;
+        const body = (await res.json()) as { active_run?: { conversation_id: string } | null };
+        const convoId = body.active_run?.conversation_id;
+        if (!convoId || ctl.signal.aborted) return;
+        const detail = await fetch(
+          `/api/dashboard/conversations/${convoId}?team=${encodeURIComponent(teamSlug)}`,
+          { signal: ctl.signal }
+        );
+        if (!detail.ok || ctl.signal.aborted) return;
+        const convo = (await detail.json()) as { id: string; messages: StoredMessage[] };
+        // Don't yank the user out of a chat they've already started interacting with.
+        setSeed((cur) => (cur.key === "new-0" ? { key: convo.id, conversationId: convo.id, messages: toExchanges(convo.messages) } : cur));
+        setActiveId((cur) => cur ?? convo.id);
+      } catch {
+        // offline / aborted — plain new chat, no reattach
+      }
+    })();
+    return () => ctl.abort();
+  }, [teamSlug, initialQuestion]);
+
   // Debounced server search (title OR message content, owner-scoped FTS). Empty query → clear so the
   // full list shows. All setState happens inside the async timeout callback (never synchronously).
   useEffect(() => {

@@ -8,8 +8,6 @@ import { errorResponse } from "@/lib/api/schemas";
 import { isRestrictedTier } from "@/lib/auth/visibility";
 import { formatSseFrame } from "@/lib/api/sse";
 import { retrieve } from "@/lib/query/retrieve";
-import { streamAnswer } from "@/lib/query/claude";
-import { clientErrorMessage } from "@/lib/query/stream-retry";
 import { pickTimezone, DEFAULT_TIMEZONE } from "@/lib/query/timezone";
 import {
   ownsConversation,
@@ -17,9 +15,9 @@ import {
   createConversation,
   appendMessage,
 } from "@/lib/chat/store";
-import { generateAndSetTitle } from "@/lib/chat/title";
-import { recordLlmUsage } from "@/lib/costs/llm-usage";
 import { resolveAnsweringKeys } from "@/lib/query/answering";
+import { runAnswerTurn } from "@/lib/query/stream-persist";
+import { createRun } from "@/lib/query/turn-runs";
 import { isSyncCommand, runManualSync } from "@/lib/ingest/manual-sync";
 import { audit } from "@/lib/api/audit";
 
@@ -215,94 +213,83 @@ export async function POST(req: NextRequest) {
   // fallback in streamAnswer; `activeProvider` forces a backend, else selectLlmBackend precedence).
   const keys = await resolveAnsweringKeys(db, team.id);
 
+  // DEFERRED, deliberately (review: "no idempotency or active-run guard"). Two tabs — or a client that
+  // re-POSTs after losing the SSE — start two turns in one conversation: two answers, two spend rows,
+  // and interleaved messages that can mispair `recentTurns`. That is TRUE TODAY on `main` and is not
+  // introduced here; this slice widens it only slightly, by auto-reopening the same thread in a second
+  // tab. It is NOT fixed here because the obvious guard is worse than the bug: rejecting a POST while a
+  // `streaming` run exists blocks the user for up to the staleness window (3 min) whenever a run is
+  // orphaned but not yet aged out — turning a rare duplicate into a routine lockout. Doing it properly
+  // means a client-supplied idempotency key + a unique constraint, which is its own slice with its own
+  // wire-format change. Tracked; see docs/design/query-background-stream.md "Scope".
+  //
+  // The in-flight run row: what makes this turn survive its client and be re-attachable on return
+  // (QBGSTREAM-1). Best-effort — a run-table failure must not stop the user getting an answer.
+  let runId: string | null = null;
+  if (conversationId) {
+    try {
+      runId = (await createRun(db, owner, conversationId, question))?.id ?? null;
+    } catch (e) {
+      console.error("[query] could not create turn run:", e instanceof Error ? e.message : e);
+    }
+  }
+
   const encoder = new TextEncoder();
+  // `cancelled` flips when the browser goes away (tab close / reload / navigation / network drop).
+  // After that, `send` is a NO-OP rather than a throw: the generation + persistence below must run to
+  // completion regardless, which is exactly what a disconnected turn previously lost (no assistant
+  // message and no query_log row for an answer the provider had already billed).
+  let cancelled = false;
   const stream = new ReadableStream({
     async start(controller) {
-      const send = (event: string, data: unknown) =>
-        controller.enqueue(encoder.encode(formatSseFrame(event, data)));
+      const send = (event: string, data: unknown) => {
+        if (cancelled) return;
+        try {
+          controller.enqueue(encoder.encode(formatSseFrame(event, data)));
+        } catch {
+          // The client vanished between the check and the write — stop trying, keep working.
+          cancelled = true;
+        }
+      };
 
       // Tell the client which thread this turn belongs to (a new conversation returns its fresh id).
+      // The payload stays EXACTLY `{ id }`: the foreground SSE contract is byte-identical to before
+      // this slice (spec acceptance criterion 8), and reattach keys off the conversation id anyway —
+      // a `run_id` here would have changed a shipped wire format for a field nothing reads.
       if (conversationId) send("conversation", { id: conversationId });
 
-      let answer = "";
+      // Stream + persist. Everything durable happens inside, decoupled from `send`, so a client that
+      // disappears mid-answer still gets its message, query_log row and cost metered (and its run row
+      // finalized, so a returning tab sees the finished answer instead of a dead spinner).
+      await runAnswerTurn({
+        db,
+        owner,
+        conversationId,
+        runId,
+        question,
+        ctx,
+        keys,
+        historyTurns,
+        caller,
+        timeZone,
+        createdNew,
+        startedAt: started,
+        send,
+      });
+
       try {
-        for await (const chunk of streamAnswer(ctx, question, keys, historyTurns, caller, timeZone, {
-          onRetry: ({ attempt, delayMs, error }) =>
-            console.warn(
-              `[query] transient answer-stream failure (attempt ${attempt}), retrying in ${delayMs}ms:`,
-              error instanceof Error ? error.message : error
-            ),
-        })) {
-          if (chunk.type === "delta") {
-            answer += chunk.text;
-            send("delta", { text: chunk.text });
-          } else {
-            const cited = new Set<string>();
-            for (const m of answer.matchAll(/\[(S\d+)\]/g)) cited.add(m[1]);
-            const sources = ctx.sources
-              .filter((s) => cited.has(s.sid))
-              .map((s) => ({
-                id: s.sid,
-                item_id: s.item_id,
-                project: s.project,
-                path: s.path,
-                kind: s.kind,
-              }));
-            send("sources", { sources });
-            send("done", chunk.usage);
-
-            // Persist the assistant turn into the thread (full answer + cited sources + cost).
-            if (conversationId) {
-              await appendMessage(db, owner, conversationId, "assistant", answer, {
-                cited_item_ids: sources.map((s) => s.item_id).filter((id): id is string => Boolean(id)),
-                input_tokens: chunk.usage.input_tokens,
-                output_tokens: chunk.usage.output_tokens,
-                cost_usd: chunk.usage.cost_usd,
-              });
-              // On a new thread, replace the derived title with a short LLM-written one (bounded).
-              if (createdNew) {
-                await generateAndSetTitle(db, owner, conversationId, question, answer, keys);
-              }
-            }
-
-            await db.from("query_log").insert({
-              team_id: team.id,
-              member_id: me.id,
-              question,
-              answer_preview: answer.slice(0, 500),
-              cited_item_ids: sources.map((s) => s.item_id).filter(Boolean),
-              input_tokens: chunk.usage.input_tokens,
-              output_tokens: chunk.usage.output_tokens,
-              cache_read_tokens: chunk.usage.cache_read_tokens,
-              cost_usd: chunk.usage.cost_usd,
-              latency_ms: Date.now() - started,
-            });
-
-            // Meter this answer's spend into the unified brain-inference ledger (source "query"), so
-            // the Pulse Spend KPI + costs breakdown see it alongside every background LLM task.
-            await recordLlmUsage(db, {
-              teamId: team.id,
-              memberId: me.id,
-              source: "query",
-              provider: chunk.usage.provider,
-              model: chunk.usage.model,
-              inputTokens: chunk.usage.input_tokens,
-              outputTokens: chunk.usage.output_tokens,
-              costUsd: chunk.usage.cost_usd,
-              estimated: chunk.usage.estimated,
-            });
-          }
-        }
-      } catch (e) {
-        // Log the REAL error (it carries the provider status / model / base URL) for diagnosis,
-        // but send the client only a friendly, SANITIZED message — the raw text would leak the
-        // internal model + base URL. Bounded transient-error retry already happened upstream in
-        // streamAnswer; reaching here means it failed even after retries (or was non-retryable).
-        console.error("[query] answer stream failed:", e instanceof Error ? e.message : e);
-        send("error", { message: clientErrorMessage(e) });
-      } finally {
         controller.close();
+      } catch {
+        // Already closed by the client's cancel — nothing to do.
       }
+    },
+    cancel() {
+      // The browser went away. Mark it so `send` stops enqueuing; the `start` task keeps running to
+      // completion on this long-lived Node server (Railway), which is what makes the turn survive.
+      // NOTE for self-hosters: on a freeze-after-response serverless platform the process may be
+      // suspended here instead, and the turn would not complete — this design assumes a persistent
+      // Node server, as documented in docs/design/query-background-stream.md.
+      cancelled = true;
     },
   });
 

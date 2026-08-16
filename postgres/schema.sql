@@ -2542,6 +2542,47 @@ create table if not exists chat_messages (
   search tsvector generated always as (to_tsvector('english', coalesce(content, ''))) stored
 );
 create index if not exists chat_messages_conversation_idx on chat_messages (conversation_id, created_at);
+
+-- ── in-flight answer turns (QBGSTREAM-1) ─────────────────────────────────────
+-- One row per ANSWER ATTEMPT, so a turn survives the client that started it: the browser can close,
+-- reload or navigate away and the server still finishes, persists, and can be re-attached to on return.
+--
+-- WHY A SEPARATE TABLE and not columns on chat_messages: (1) `chat_messages.content` carries a STORED
+-- generated tsvector + a GIN index, so flushing a partial answer into it every second would churn the
+-- FTS index on every flush; (2) a partial assistant ROW in chat_messages would be read as a COMPLETED
+-- turn by `recentTurns` (feeding a half-answer into the LLM memory window) and rendered as done by the
+-- chat UI. Keeping in-flight state here leaves both correct by construction.
+--
+-- `final_message_id` is the partial→final handoff: the final assistant message is INSERTED FIRST, then
+-- the run flips to `done` pointing at it. A reader always prefers the final message over `partial_text`,
+-- so a crash between the two writes shows the good answer rather than partial-beside-final.
+--
+-- STALENESS: a process restart (every deploy) kills an in-flight run and would otherwise leave
+-- `status='streaming'` forever — an eternal spinner. `updated_at` is heartbeated on every flush and
+-- readers treat a stale streaming run as failed (lib/query/turn-runs.isRunStale).
+create table if not exists chat_turn_runs (
+  id uuid primary key default gen_random_uuid(),
+  conversation_id uuid not null references conversations(id) on delete cascade,
+  team_id uuid not null references teams(id) on delete cascade,
+  member_id uuid not null references members(id) on delete cascade,
+  question text not null,
+  status text not null default 'streaming' check (status in ('streaming', 'done', 'error')),
+  -- The answer so far. Heartbeat-flushed while streaming; not the durable copy of a finished answer
+  -- (that is the chat_messages row `final_message_id` points at).
+  partial_text text not null default '',
+  -- SANITIZED client-facing text only (lib/query/stream-retry.clientErrorMessage) — never the raw
+  -- provider error, which carries the internal model + base URL.
+  error_message text,
+  final_message_id uuid references chat_messages(id) on delete set null,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+-- The reattach read: "this member's most recent run in this conversation".
+create index if not exists chat_turn_runs_owner_idx
+  on chat_turn_runs (team_id, member_id, conversation_id, created_at desc);
+-- The "is anything still running for me?" probe that drives auto-reopen on /query.
+create index if not exists chat_turn_runs_active_idx
+  on chat_turn_runs (team_id, member_id, updated_at desc) where status = 'streaming';
 -- NOTE: the `chat_messages_search_idx` GIN index lives in migration 20260707130000, NOT here — on a
 -- DB that already has chat_messages the create-table above is a no-op (so the `search` column isn't
 -- added here), and an index on a not-yet-existing column would fail. The migration adds the column

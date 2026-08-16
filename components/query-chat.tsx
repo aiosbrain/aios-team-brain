@@ -44,6 +44,75 @@ export function messagesToExchanges(messages: { role: string; content: string }[
   return out;
 }
 
+/**
+ * Poll a thread's in-flight run until it settles, feeding the partial answer to `onPartial`.
+ * Returns the terminal state so the caller can render the finished answer or the failure.
+ * Exported for testing; `signal` lets a remount cancel an in-flight poll loop.
+ */
+export async function pollRun(
+  teamSlug: string,
+  conversationId: string,
+  onPartial: (text: string) => void,
+  opts: {
+    signal?: AbortSignal;
+    intervalMs?: number;
+    sleep?: (ms: number) => Promise<void>;
+    maxPolls?: number;
+  } = {}
+): Promise<{ status: "done" | "error"; error: string | null; hasAnswer: boolean } | null> {
+  // The id goes into a URL PATH SEGMENT, so constrain it to the only shape it can legitimately have
+  // before it is ever interpolated — mirroring the 422 the endpoint itself returns. Encoding alone
+  // makes a hostile value harmless; validating makes it unrepresentable, and turns "trust the caller"
+  // into something the code proves locally.
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(conversationId)) return null;
+  const runUrl = `/api/dashboard/conversations/${conversationId}/run?team=${encodeURIComponent(teamSlug)}`;
+  const intervalMs = opts.intervalMs ?? 1200;
+  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  // A HARD BOUND on the loop. The server ages a silent run out after ~3 minutes, so in practice this is
+  // never reached — but "in practice" is not a termination argument: an endpoint that kept answering
+  // `streaming` would spin here forever, and with a zero-delay sleep the loop yields only microtasks,
+  // starving the event loop so completely that even a test timeout cannot fire (observed: it killed the
+  // vitest worker rather than failing). ~10 minutes of polling, then give up.
+  const maxPolls = opts.maxPolls ?? 500;
+  // The run we started watching. The endpoint reports the thread's LATEST run, so if the user asks a
+  // new question mid-poll the id changes underneath us — that new turn belongs to the live SSE reader,
+  // not to this reattach, and adopting it would write one turn's text into another's bubble.
+  let watchedId: string | null = null;
+  for (let polls = 0; polls < maxPolls; polls++) {
+    if (opts.signal?.aborted) return null;
+    let body: {
+      run?: { id?: string; status?: string; partial?: string; error?: string | null; final_message_id?: string | null } | null;
+    };
+    try {
+      const res = await fetch(runUrl, { signal: opts.signal });
+      if (!res.ok) return null;
+      body = await res.json();
+    } catch {
+      return null; // aborted or offline — the caller keeps whatever it has
+    }
+    const run = body.run;
+    if (!run) return null;
+    const id = run.id ?? null;
+    if (watchedId === null) watchedId = id;
+    else if (id !== watchedId) return null; // a different turn took over — leave it alone
+    if (run.status === "streaming") {
+      if (run.partial) onPartial(run.partial);
+      await sleep(intervalMs);
+      continue;
+    }
+    // `hasAnswer` — NOT "did we ever observe streaming". A run that settled in the gap between the
+    // caller fetching the thread and this first poll was never seen streaming, yet its answer is
+    // exactly what the caller is missing; keying off "was it live while I watched" left the user
+    // staring at their question with a permanently blank answer bubble.
+    return {
+      status: run.status === "error" ? "error" : "done",
+      error: run.error ?? null,
+      hasAnswer: run.status === "done" && Boolean(run.final_message_id),
+    };
+  }
+  return null; // poll budget exhausted — stop rather than spin
+}
+
 export function QueryChat({
   teamSlug,
   initialQuestion,
@@ -77,6 +146,9 @@ export function QueryChat({
   // brain loads this conversation's history server-side (shared across sessions and interfaces).
   const [conversationId, setConversationId] = useState<string | null>(initialConversationId);
   const restored = useRef(false);
+  // The in-flight reattach poll, so starting a new turn can cancel it (otherwise the old run's
+  // partial keeps arriving while the new turn streams, writing one turn's text under another).
+  const reattachAbort = useRef<AbortController | null>(null);
 
   // Remember-the-thread (Home embed): on mount, reload the last thread from the server so navigating
   // away and back restores the visible history. The thread is already persisted server-side; we just
@@ -111,6 +183,73 @@ export function QueryChat({
     }
   }, [persistKey, conversationId]);
 
+  // REATTACH (QBGSTREAM-1): if this thread has a turn still running server-side — because the user
+  // navigated away mid-answer and came back — resume showing it instead of a question with no answer.
+  // The generation itself never stopped; only this component's view of it did.
+  useEffect(() => {
+    const convo = initialConversationId;
+    if (!convo) return;
+    const ctl = new AbortController();
+    reattachAbort.current = ctl; // so `ask()` can stop this poll the moment a new turn starts
+    (async () => {
+      // The reattached turn is the trailing exchange that has NO answer yet — a rehydrated thread
+      // renders it as `done` with an empty answer (there is no assistant message to pair with), which
+      // is why "unanswered" and not `status === "streaming"` is the condition here.
+      //
+      // PATCH BY CAPTURED INDEX, not "the last exchange": if the user asks a NEW question while this
+      // poll is still in flight, the last exchange is that new turn, and the old run's partial (or its
+      // error) would land on the wrong bubble. `ask()` also aborts this poll, but the index makes the
+      // patch correct even in the window before that takes effect.
+      let targetIdx = -1;
+      setExchanges((xs) => {
+        targetIdx = xs.length - 1;
+        return xs;
+      });
+      const patchTarget = (patch: Partial<Exchange>) =>
+        setExchanges((xs) => {
+          const i = targetIdx;
+          if (i < 0 || i >= xs.length) return xs;
+          if (xs[i].answer && xs[i].status !== "streaming") return xs;
+          return xs.map((x, n) => (n === i ? { ...x, ...patch } : x));
+        });
+      const result = await pollRun(
+        teamSlug,
+        convo,
+        (partial) => patchTarget({ answer: partial, status: "streaming" }),
+        { signal: ctl.signal }
+      );
+      if (!result || ctl.signal.aborted) return;
+      if (result.status === "error") {
+        patchTarget({ status: "error", error: result.error ?? "The answer failed." });
+        return;
+      }
+      // Ordinary thread open: the seeded messages already include the answer, so there is nothing to
+      // reattach to. Checked against the RENDERED state rather than "was it streaming while I watched",
+      // because a run that settled in the gap before the first poll is precisely the case where the
+      // caller is missing the answer and must refetch.
+      let needsAnswer = false;
+      setExchanges((xs) => {
+        needsAnswer = targetIdx >= 0 && targetIdx < xs.length && !xs[targetIdx].answer;
+        return xs;
+      });
+      if (!needsAnswer || !result.hasAnswer) return;
+      // The answer landed (possibly while we were away) — pull the durable copy from the thread.
+      try {
+        const res = await fetch(
+          `/api/dashboard/conversations/${convo}?team=${encodeURIComponent(teamSlug)}`,
+          { signal: ctl.signal }
+        );
+        if (!res.ok) return;
+        const body = (await res.json()) as { messages?: { role: string; content: string }[] };
+        const ex = messagesToExchanges(body.messages ?? []);
+        if (ex.length) setExchanges(ex);
+      } catch {
+        // offline / aborted — keep what we have
+      }
+    })();
+    return () => ctl.abort();
+  }, [initialConversationId, teamSlug]);
+
   // Esc collapses the expanded (near-fullscreen) chat.
   useEffect(() => {
     if (!expanded) return;
@@ -130,6 +269,9 @@ export function QueryChat({
   async function ask(q: string) {
     const text = q.trim();
     if (!text || busy) return;
+    // A new turn supersedes any reattach poll for this thread.
+    reattachAbort.current?.abort();
+    reattachAbort.current = null;
     setQuestion("");
     setBusy(true);
 
