@@ -78,6 +78,36 @@ export function summarise(rows: Row[]): Map<string, Agg> {
   return byKind;
 }
 
+/**
+ * PIPEFF-5: the capture file now interleaves REQUEST and RESPONSE records (`kind`), because Q8'
+ * needs the model's raw entity list before the combined path deletes the unconnected nodes.
+ *
+ * This reader prices REQUESTS only. A response row carries no `messages`, so counting one adds a
+ * zero-token call under `unknown` and roughly DOUBLES "captured calls" — which reads exactly like
+ * classifier drift, and would send the next person to fix the wrong thing.
+ *
+ * An UNRECOGNISED kind REFUSES rather than being dropped: a future record type silently filtered out
+ * is how an instrument comes to measure a subset of its input while reporting a total. `kind` absent
+ * means a pre-PIPEFF-5 capture file, where every row is a request.
+ *
+ * Exported and pure so it can be pinned — the bug this fixes was invisible because the filtering
+ * lived inside `main()`, where no test could reach it.
+ */
+export function pickRequests(
+  all: Array<Row & { kind?: string }>
+): { ok: true; rows: Row[] } | { ok: false; error: string } {
+  const unknown = [
+    ...new Set(all.map((r) => r.kind).filter((k) => k !== undefined && k !== "request" && k !== "response")),
+  ];
+  if (unknown.length > 0) {
+    return {
+      ok: false,
+      error: `holds record kinds this reader does not know: ${unknown.join(", ")} — refusing rather than reporting a subset as a total`,
+    };
+  }
+  return { ok: true, rows: all.filter((r) => r.kind === undefined || r.kind === "request") };
+}
+
 function main(): void {
   const file = process.argv[2];
   if (!file) {
@@ -85,10 +115,17 @@ function main(): void {
     process.exit(1);
   }
 
-  const rows: Row[] = readFileSync(file, "utf8")
+  const all: Array<Row & { kind?: string }> = readFileSync(file, "utf8")
     .split("\n")
     .filter(Boolean)
     .map((l) => JSON.parse(l));
+
+  const picked = pickRequests(all);
+  if (!picked.ok) {
+    console.error(`${file} ${picked.error}`);
+    process.exit(1);
+  }
+  const rows: Row[] = picked.rows;
 
   if (rows.length === 0) {
     // A silent zero here is indistinguishable from a clean measurement, so it refuses.

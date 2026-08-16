@@ -160,6 +160,97 @@ RUN F=/app/.venv/lib/python3.12/site-packages/graphiti_core/graphiti.py \
  && grep -q 'PIPEFF-2: carry only the SAME ITEM' "$F" \
  && test "$(grep -c RELEVANT_SCHEMA_LIMIT /app/.venv/lib/python3.12/site-packages/graphiti_core/search/search_utils.py)" = "15"
 
+# ── PATCH 4: ONE extraction call instead of two (PIPEFF-5 / AIO-868) ───────────────────────────────
+#
+# THE PROBLEM. `add_episode` reads every episode TWICE: `extract_nodes` for the entities, then
+# `extract_edges` for the relations between them. Both carry the same episode body, the same
+# (PATCH-3-filtered) predecessors and the same entity-type block. Measured on prod's ledger over the
+# four days after PATCH 3 shipped, those two kinds are **47.6% of graph spend** ($0.82 + $0.73 of
+# $3.26). 0.29.3 ships `utils/maintenance/combined_extraction.py` which does both in one call, with
+# its own registered prompt — but it is reachable only from the BULK path (`bulk_utils.py:271`,
+# default False, and `graphiti.py:798` omits it), so the REST server can never take it. Hence a
+# patch. Projected saving **~12–14% of graph cost**; see docs/design/graph-combined-extraction.md.
+#
+# WHY IT IS NOT A FREE WIN, unlike PATCH 3. PATCH 3 removed padding — same question, less junk — so
+# mechanism carried its quality argument. This CHANGES THE QUESTION: a different prompt can extract a
+# different set of entities and relations from identical text. No mechanism argument is available and
+# none is attempted; the gate is the battery (2 arms × 8 reps), and the merge decision is taken on it.
+#
+# THE THING THAT WOULD HAVE FOOLED THE MEASUREMENT — recorded because it nearly did. Upstream's
+# docstring claims combined extraction "reduc[es] orphaned nodes". It does, by DELETING them:
+# `combined_extraction.py:295` drops every node with no incident edge, behind a logger.debug. So
+# orphan rate cannot fail as a quality sensor, and RAW entity-per-episode falls ~7% MECHANICALLY
+# (prod's measured orphan share: 1,356 of 19,051). The battery therefore counts CONNECTED entities,
+# and prices the drop separately. Anyone reading raw entity yield after this ships would see a "7%
+# quality regression" that is nothing of the kind.
+#
+# THE THREE EDITS, all in `graphiti.py`, all by anchor-with-assert (see patch-combined-extraction.py):
+#   1. `_extract_and_resolve_edges` gains `pre_extracted_edges=None`. None keeps today's behaviour
+#      byte-for-byte, so the unpatched path is untouched and provably so (guard AC6).
+#   2. its `extract_edges` call moves under `else:` — skipped when edges arrive pre-extracted.
+#   3. `add_episode` calls `extract_nodes_and_edges` instead of `extract_nodes` and threads the edges
+#      through. The import is at the CALL SITE, not module scope: one anchor instead of two, and the
+#      import block is the part most likely to move on a library bump.
+# Everything after extraction — resolve_extracted_nodes, resolve_edge_pointers,
+# resolve_extracted_edges, attributes, episodic edges — is untouched by construction.
+#
+# ORDER MATTERS: this runs AFTER PATCH 3, and depends on it. PATCH 3 filters `previous_episodes` at
+# the RETRIEVAL site, upstream of both extractors, so the combined call inherits the filter — pinned
+# structurally by the guard rather than assumed.
+#
+# THE GATES, same discipline as PATCH 3 — the hazard of a vendored edit is the SILENT NO-OP:
+#   * pre-state: each of the three anchors exists exactly once (asserted inside the script, which
+#     exits non-zero and names which anchor failed).
+#   * the script's own `ast.parse` — a syntactically broken file never reaches the image.
+#   * post-state `grep -q` on the inserted marker — the edit landed in the file we serve.
+#   * `extract_edges` must STILL be REFERENCED exactly once: the else-branch keeps the separate path
+#     alive for any caller that passes no pre-extracted edges, and a patch that deleted it would
+#     break `add_episode_bulk` silently. The gate greps the CALL, not the import — an earlier version
+#     of this comment claimed both, and describing a check that is not there is how a gate comes to be
+#     trusted for something it never did.
+# ⚠️ DEFAULTED OFF. This lever is NOT validated: it changes the extraction PROMPT, so quality cannot
+# be argued from mechanism, and the 2-arm x 8-rep battery that would settle it has NOT been run (it
+# was paused after one rep at the owner's call — the saving is ~$3-4/month at current volume against
+# ~$15 to finish measuring it). The patch merges so the instrument repair and tests beside it stop
+# being stranded on a branch; the SWITCH stays off.
+#
+# Turning it on is a one-line change to this default, and the three conditions are in
+# docs/design/graph-combined-extraction.md:
+#   1. on ONLY after a passing battery — never on an unmeasured guess;
+#   2. run the battery only at ~3x today's graph spend (~$15/week) or when a customer is heading
+#      there — below that the measurement costs more than the saving;
+#   3. if neither has happened by 2027-02-16, DELETE this block rather than keep it as decoration.
+# (2) is a judgement on a measured number; (1) and (3) are enforced by
+# `test/guards/graphiti-patch-combined.test.ts`, which asserts this default is off — ANCHORED to an
+# effective line, because the unanchored version survived its realistic mutation — and reddens on the
+# expiry date. A flag with only prose behind it becomes furniture.
+# PROVED, not asserted: built locally with this default and checksummed inside the image, the served
+# `graphiti_core/graphiti.py` is sha256 49ee534a1043760f9e3b58617f7853edd65e7e643a75f34f75267528cb0ec72d
+# — the exact file PIPEFF-2 measured and ships today. Merging PATCH 4 in this state is a NO-OP for
+# production, and the OFF BRANCH ASSERTS THAT SHA at build time, so it is a build-time fact rather
+# than a claim in a comment: any change to the base image, PATCH 3 or this file that moves what
+# "off" ships FAILS THE BUILD instead of shipping quietly. Re-check by hand with:
+#   docker build -t g . && docker run --rm g sha256sum /app/.venv/lib/python3.12/site-packages/graphiti_core/graphiti.py
+# ⚠️ THE PATH NO TEST CAN SEE: a Railway SERVICE VARIABLE named PIPEFF5_COMBINED_EXTRACTION reaches
+# this ARG at build time. Setting it to 1 in the dashboard enables the unvalidated patch on the next
+# build with no merge, no reddened guard, and nothing in the repo to notice — only a line in the build
+# log. Same class as the start-command trap documented above, which this file already exists to warn
+# about. The guards below cover the MERGE path; this one is covered by knowing about it. Don't.
+ARG PIPEFF5_COMBINED_EXTRACTION=0
+COPY patch-combined-extraction.py /tmp/patch-combined-extraction.py
+RUN F=/app/.venv/lib/python3.12/site-packages/graphiti_core/graphiti.py \
+ && if [ "$PIPEFF5_COMBINED_EXTRACTION" = "1" ]; then \
+      /app/.venv/bin/python /tmp/patch-combined-extraction.py "$F" \
+   && grep -q 'PIPEFF-5: one extraction call' "$F" \
+   && grep -q 'pre_extracted_edges: list\[EntityEdge\] | None = None' "$F" \
+   && test "$(grep -c 'extracted_edges = await extract_edges(' "$F")" = "1" ; \
+    else \
+      echo "PIPEFF-5 combined extraction: OFF (default)" \
+   && ! grep -q 'PIPEFF-5: one extraction call' "$F" \
+   && sha256sum "$F" | grep -q '^49ee534a1043760f9e3b58617f7853edd65e7e643a75f34f75267528cb0ec72d ' ; \
+    fi \
+ && grep -q 'PIPEFF-2: carry only the SAME ITEM' "$F"
+
 # ── THE RUNTIME REVERT — the trap that explains Trap 1 ─────────────────────────────────────────────
 #
 # The base image's CMD is `uv run uvicorn …`, and **`uv run` SYNCS the venv against /app/uv.lock
