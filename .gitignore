@@ -48,3 +48,9 @@ next-env.d.ts
 
 # Supabase CLI local stack artifacts — this repo is Postgres-only (see CLAUDE.md §6)
 supabase/
+
+# Connector probe scratch. Reading a REAL workspace to build a connector leaves real customer data
+# on disk (the ClickUp probe wrote ~4.7 MB of live task/List dumps here), and none of it is a secret
+# gitleaks would catch — it is ordinary PII-shaped content that only an ignore rule keeps out of a
+# commit. Recorded fixtures belong in test/fixtures/, redacted, never here.
+tmp/
