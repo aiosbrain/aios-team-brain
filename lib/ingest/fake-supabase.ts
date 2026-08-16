@@ -7,10 +7,13 @@
 type Row = Record<string, unknown>;
 type Filter =
   | { kind: "eq"; col: string; val: unknown }
-  | { kind: "notNull"; col: string };
+  | { kind: "notNull"; col: string }
+  | { kind: "isNull"; col: string };
 
-let idSeq = 1;
-const nextId = () => `id-${idSeq++}`;
+// Real UUIDs, not `id-<n>` (PCCC-4): ingestItem now mints graph partition pointers whose scheme
+// asserts canonical-UUID inputs (a reviewed fail-loud invariant a fixture must satisfy, not weaken).
+import { randomUUID } from "node:crypto";
+const nextId = () => randomUUID();
 
 export class FakeSupabase {
   tables: Record<string, Row[]> = {
@@ -72,6 +75,12 @@ class Builder implements PromiseLike<{ data: unknown; error: null }> {
     this.filters.push({ kind: "notNull", col });
     return this;
   }
+  /** `.is(col, null)` — the pointer writer's immutability predicate (PCCC-4). A row whose column
+   *  was never set matches too: the fake's inserts omit absent columns, where Postgres stores null. */
+  is(col: string, _val: null) {
+    this.filters.push({ kind: "isNull", col });
+    return this;
+  }
   order(_col: string, _opts?: { ascending?: boolean }) {
     return this; // ordering is irrelevant to these unit tests
   }
@@ -90,9 +99,11 @@ class Builder implements PromiseLike<{ data: unknown; error: null }> {
 
   // -- execution ----------------------------------------------------------
   private match(row: Row): boolean {
-    return this.filters.every((f) =>
-      f.kind === "eq" ? row[f.col] === f.val : row[f.col] !== null && row[f.col] !== undefined
-    );
+    return this.filters.every((f) => {
+      if (f.kind === "eq") return row[f.col] === f.val;
+      if (f.kind === "isNull") return row[f.col] === null || row[f.col] === undefined;
+      return row[f.col] !== null && row[f.col] !== undefined;
+    });
   }
 
   private run(): Row[] {

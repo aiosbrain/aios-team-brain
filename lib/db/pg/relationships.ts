@@ -55,6 +55,20 @@ export const RELATIONSHIPS: Record<string, Record<string, Relationship>> = {
     members: { kind: "one", table: "members", local: "created_by", foreign: "id" },
     teams: { kind: "one", table: "teams", local: "team_id", foreign: "id" },
   },
+  group_members: {
+    // the oracle's read-side tier check needs the membership's group slug/is_builtin
+    // (lib/access/oracle.ts) without a second round-trip.
+    groups: { kind: "one", table: "groups", local: "group_id", foreign: "id" },
+  },
+  project_groups: {
+    // the membership no-widening gate checks whether a project is granted to the `external`
+    // built-in group (lib/projects/context/memberships.ts).
+    groups: { kind: "one", table: "groups", local: "group_id", foreign: "id" },
+  },
+  project_context_memberships: {
+    // the enforced read resolves a membership's unit → its source item (lib/access/enforce.ts).
+    project_context_units: { kind: "one", table: "project_context_units", local: "context_unit_id", foreign: "id" },
+  },
 };
 
 export function lookupRelationship(base: string, name: string): Relationship | undefined {

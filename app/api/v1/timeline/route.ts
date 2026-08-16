@@ -32,7 +32,10 @@ export async function GET(req: NextRequest) {
     // plus the canonical doc in aios-workspace). Destructured rather than passed through: `Response.json`
     // takes `any`, so serializing the whole object type-checks and silently nests `days` one level deeper,
     // breaking every v1.12 consumer (`aios timeline`, MCP). Caught by review, not by tsc.
-    const { days } = await getCachedWorkTimeline(db, auth.teamId, auth.memberTier);
+    // §5.8: the member key's principal — on an enforcing team this serves the member's visibility
+    // variant, never the full-tier row. (Delegated aiosd_ bearers never reach here: the aios_ regex
+    // rejects the prefix as malformed → 401, fail closed.)
+    const { days } = await getCachedWorkTimeline(db, auth.teamId, auth.memberTier, auth.memberId);
     return Response.json({ window_days: 7, days });
   } catch (err) {
     return errorResponse("internal", err instanceof Error ? err.message : "timeline read failed", 500);

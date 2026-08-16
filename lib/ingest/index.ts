@@ -2,6 +2,7 @@ import "server-only";
 
 import { createHash } from "node:crypto";
 import { audit } from "@/lib/api/audit";
+import { ensureProjectGraphPointer } from "@/lib/graph/project-pointer";
 import { decideReattribution } from "@/lib/ingest/reattribution-decision";
 import { recordReassignment, ownerWindowStart } from "@/lib/ingest/reassignment-log";
 import type { ItemPayload } from "@/lib/api/item-payload-schema";
@@ -31,6 +32,13 @@ export interface IngestResult {
   id: string;
   projectId?: string;
   changedTaskRowKeys?: string[];
+  /**
+   * True when this ingest changed the item's `access` tier — including the HEAL-ACCESS path on an
+   * unchanged-body re-push (`status:"unchanged"` but `access` moved external↔team). The context
+   * hook must re-partition on THIS, not on status: a tier reclassification is exactly the move
+   * slice-4 H2 guards, and it arrives as `status:"unchanged"` (slice-5 Fable HIGH).
+   */
+  accessChanged?: boolean;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -134,6 +142,10 @@ export async function ingestItem(
   if (projectError || !project) {
     throw new Error(`project upsert failed: ${projectError?.message}`);
   }
+  // PCCC-4: a freshly upserted source project records its graph partition pointer; the null-guarded
+  // write makes the re-sync case (project already pointed) a no-op.
+  const ptr = await ensureProjectGraphPointer(db, { teamId: auth.teamId, projectId: project.id as string });
+  if (!ptr.ok) throw new Error(ptr.error);
 
   const { data: existing } = await db
     .from("items")
@@ -372,6 +384,7 @@ export async function ingestItem(
       status: "unchanged",
       id: existing.id,
       projectId: project.id,
+      accessChanged,
     };
   }
 
@@ -583,5 +596,6 @@ export async function ingestItem(
     id: itemId,
     projectId: project.id,
     changedTaskRowKeys,
+    accessChanged,
   };
 }

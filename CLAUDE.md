@@ -224,8 +224,19 @@ npm run lint           # eslint
 npm run pg:schema      # load postgres/schema.sql (canonical) into DATABASE_URL — also the prod rollout step
 npm run db:test:up     # ephemeral test Postgres + load schema (migrate-from-zero = replay guard)
 npm run test:datamechanics  # real-Postgres tier: persistence + tier isolation
+npm run test:datamechanics:iso  # SAME tier, PER-WORKTREE isolated container (see below)
 bash scripts/e2e.sh    # system-level integration: seed → push → materialize → 422 → pull → live query
 ```
+
+- **Parallel worktrees + the dm tier — use `test:datamechanics:iso`.** `test:datamechanics:local`
+  points every worktree at the ONE shared compose container (`localhost:5434`), so when two
+  Conductor worktrees run the dm tier at once they contend on the same rows/locks and Postgres
+  aborts transactions — surfacing as `deadlock detected` + `null.id` seed failures that read like
+  product bugs but are pure collision. `npm run test:datamechanics:iso [files…]`
+  (`scripts/dm-isolated.sh`) gives THIS worktree its own throwaway Postgres — a per-worktree-named
+  container on a **docker-assigned** port (so two worktrees can't pick the same "free" port) —
+  created + schema-loaded on first use and reused after; `npm run db:test:iso:down` removes it.
+  Prefer `:iso` whenever another worktree might be running dm.
 
 - **Schema:** canonical = `postgres/schema.sql` (idempotent; `npm run pg:schema` loads it and is the
   prod rollout step against Railway). Additive deltas live in `postgres/migrations/` (the only

@@ -33,6 +33,16 @@ export function startIngestScheduler(): void {
     await runInbound(db);
     await runImport(db, "github", runGithubIngestion);
     await runAuthCleanup(db);
+    // §11 access-bootstrap convergence: built-in groups/system projects/grants for every team.
+    // Idempotent and cheap when converged; this is also how PRE-EXISTING teams get bootstrapped
+    // on first deploy (SQL migrations cannot seed the edge tables — the single-writer guard
+    // forbids it by design, so app code is the only legal seeder). Best-effort, traced.
+    await runAccessBootstrap(db);
+    // §11 context backfill convergence: partition every item into its unit + system-project
+    // membership. The one-time migration for pre-existing content AND the backstop for any
+    // item the on-push ingest hook missed (non-push ingest paths, a hook failure). Idempotent
+    // and cheap when converged; sequenced AFTER bootstrap so the system projects exist. Traced.
+    await runContextBackfill(db);
     // Turn freshly-synced meeting transcripts (source granola/zoom/… — never slack) into meeting
     // notes, so CLI-pushed meetings show up on the Meetings page automatically. Idempotent + cheap
     // when nothing new (finds 0 candidates → returns); best-effort, never fails the tick.
@@ -234,6 +244,123 @@ export function startIngestScheduler(): void {
 
   // Create meeting notes for freshly-synced meeting transcripts, per team. Best-effort; idempotent
   // (already-noted items are skipped), so this is a cheap no-op once caught up.
+  async function runAccessBootstrap(db: ReturnType<typeof adminClient>): Promise<void> {
+    const startedAt = Date.now();
+    try {
+      const { ensureAccessBootstrapAllTeams } = await import("@/lib/access/bootstrap");
+      const { recordIngestRun } = await import("@/lib/ingest/runs");
+      const r = await ensureAccessBootstrapAllTeams(db);
+      // Failures are recorded PER TEAM with the actual refusal/error text, so one team's
+      // permanent refusal (an initiative squatting 'general') reds only THAT team's health
+      // card — a single instance-wide failed row would have turned every team's admin banner
+      // red while hiding the cause in meta (slice-3 Codex Medium). The instance-wide row
+      // stays the every-tick heartbeat for staleness.
+      for (const f of r.failed) {
+        if (f.teamId === "*") continue; // teams-read failure → instance row below carries it
+        await recordIngestRun(db, {
+          teamId: f.teamId,
+          source: "access_bootstrap",
+          trigger: "scheduler",
+          ok: false,
+          created: 0,
+          errors: [f.error],
+          startedAt,
+        });
+      }
+      const globalFailure = r.failed.find((f) => f.teamId === "*");
+      await recordIngestRun(db, {
+        teamId: null,
+        source: "access_bootstrap",
+        trigger: "scheduler",
+        ok: !globalFailure,
+        created: 0,
+        errors: globalFailure ? [globalFailure.error] : undefined,
+        meta: { teams: r.teams, failedTeams: r.failed.length },
+        startedAt,
+      });
+    } catch (err) {
+      // An unexpected throw must still leave a failed trace — a silent catch left the
+      // previous green row standing until it aged stale (slice-3 Codex Low).
+      try {
+        const { recordIngestRun } = await import("@/lib/ingest/runs");
+        await recordIngestRun(db, {
+          teamId: null,
+          source: "access_bootstrap",
+          trigger: "scheduler",
+          ok: false,
+          created: 0,
+          errors: [err instanceof Error ? err.message : "bootstrap threw"],
+          startedAt,
+        });
+      } catch {
+        // recording itself failed — the console line below is the last resort
+      }
+      console.error("[ingest] access bootstrap failed", err);
+    }
+  }
+
+  async function runContextBackfill(db: ReturnType<typeof adminClient>): Promise<void> {
+    const startedAt = Date.now();
+    try {
+      const { backfillAllTeams } = await import("@/lib/projects/context/backfill");
+      const { recordIngestRun } = await import("@/lib/ingest/runs");
+      // Cutoff = tick start: bound this run to content that existed when the tick began, so a
+      // concurrent push (which the on-push hook partitions itself) isn't chased mid-sweep.
+      const cutoff = new Date(startedAt).toISOString();
+      const r = await backfillAllTeams(db, cutoff);
+      // Record a per-team outcome EVERY tick (success AND failure), so a team that failed once
+      // and later recovers gets a newer OK row rather than staying permanently red under
+      // distinct-on (slice-5 Codex Medium).
+      for (const teamId of r.succeeded) {
+        await recordIngestRun(db, { teamId, source: "context_backfill", trigger: "scheduler", ok: true, created: 0, startedAt });
+      }
+      for (const f of r.failed) {
+        if (f.teamId === "*") continue;
+        await recordIngestRun(db, {
+          teamId: f.teamId,
+          source: "context_backfill",
+          trigger: "scheduler",
+          ok: false,
+          created: 0,
+          errors: [f.error],
+          startedAt,
+        });
+      }
+      const globalFailure = r.failed.find((f) => f.teamId === "*");
+      // Instance-wide heartbeat under a DISTINCT source ('context_backfill_all') so a per-team
+      // failed 'context_backfill' row isn't masked by the newer global ok row under distinct-on
+      // (slice-5 Fable Medium — the same latent shape access_bootstrap has; tracked separately).
+      await recordIngestRun(db, {
+        teamId: null,
+        source: "context_backfill_all",
+        trigger: "scheduler",
+        ok: !globalFailure,
+        created: 0,
+        errors: globalFailure ? [globalFailure.error] : undefined,
+        meta: { teams: r.teams, failedTeams: r.failed.length },
+        startedAt,
+      });
+    } catch (err) {
+      try {
+        const { recordIngestRun } = await import("@/lib/ingest/runs");
+        await recordIngestRun(db, {
+          teamId: null,
+          // instance-wide scope uses the _all source consistently (slice-5 Codex Medium) — a
+          // teamId=null 'context_backfill' row would mask per-team rows under distinct-on.
+          source: "context_backfill_all",
+          trigger: "scheduler",
+          ok: false,
+          created: 0,
+          errors: [err instanceof Error ? err.message : "context backfill threw"],
+          startedAt,
+        });
+      } catch {
+        // last resort is the console line
+      }
+      console.error("[ingest] context backfill failed", err);
+    }
+  }
+
   async function runMeetingNotesBackfill(db: ReturnType<typeof adminClient>): Promise<void> {
     try {
       const { backfillMeetingNotesFromItems } = await import("@/lib/meetings/from-items");

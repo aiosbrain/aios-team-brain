@@ -127,6 +127,7 @@ type EpisodeRow = {
   episode_uuid: string | null;
   pending_delete_group_id: string | null;
   pending_delete_at: string | null;
+  chunk_shas: string[] | null;
 };
 
 /**
@@ -219,9 +220,14 @@ export async function reconcileProjectedEpisodes(
   const { data } = await db
     .from("graph_episodes")
     .select(
-      "id, source_id, source_table, group_id, content_sha256, projected_at, episode_uuid, pending_delete_group_id, pending_delete_at"
+      "id, source_id, source_table, group_id, content_sha256, projected_at, episode_uuid, pending_delete_group_id, pending_delete_at, chunk_shas"
     )
-    .eq("team_id", teamId);
+    .eq("team_id", teamId)
+    // DEFERRED rows are exempt from every judgement here (PCCC-5, design §2.5): they carry the ''
+    // sentinel because extraction is deliberately WITHHELD (a cold initiative), not because a push
+    // never landed — the never-landed delete would remove them, the projector would re-create them
+    // next pass, and the loop would churn forever while reading as healthy self-healing.
+    .eq("deferred", false);
   const rawRows = (data ?? []) as EpisodeRow[];
 
   // ── Orphan repair, BEFORE anything else judges these rows ────────────────────────────────────
@@ -303,13 +309,37 @@ export async function reconcileProjectedEpisodes(
           reQueued++;
         }
       } else {
+        // NEVER-PUSHED rows are the PROJECTOR's to converge, not this judge's to delete (review-2
+        // Blocker 2): an ARMED-but-unpushed row ('' sha, EMPTY chunk ledger — reservation or an
+        // arm awaiting its budgeted push) has claimed nothing in Graphiti, so "never landed" is
+        // vacuous for it — and deleting it re-cold-starts the arm every cycle: on a reader-quiet
+        // team the restriction-move copy deterministically never pushed and rule-2 exposure stayed
+        // open forever. A row that EVER pushed keeps its chunk_shas (the re-queue resets only the
+        // sha), so the empty ledger is the honest discriminator.
+        if ((row.chunk_shas ?? []).length === 0 && row.content_sha256 === "") continue;
         // Throttled (H7) — see REQUEUE_MAX_PER_PASS. Past the cap the pass stops judging and reports
         // the remainder; the rows are untouched and come round again next pass.
         if (reQueued >= maxRequeuePerPass) {
           requeueThrottled++;
           continue;
         }
-        await db.from("graph_episodes").delete().eq("id", row.id);
+        // PARK ON THE SENTINEL RATHER THAN DELETE (STALLSCOPE-1, found by both code reviewers).
+        //
+        // This used to `delete()` the row, which has the same re-queue effect — the branch above says
+        // so in its own comment ("the sentinel → the projector re-pushes it like a deleted row") — but
+        // destroys the row's identity, and with it `first_seen_at`, the SET-ONCE clock the stall
+        // probe's age gate reads. That matters in exactly the state the probe exists for: during a
+        // dead-extractor outage nothing lands, so this path recycles rows every grace window and each
+        // re-creation takes a fresh `default now()`. Detection survived only on an accident of the
+        // defaults (`REQUEUE_MAX_PER_PASS` 20 < `MIN_ITEMS_FOR_EXTRACTION_SIGNAL` 25, so some row
+        // always kept an old clock) — and raising that cap is the DOCUMENTED response to
+        // `requeueThrottled`, which a dead extractor is what produces. It would have held the gate
+        // open indefinitely.
+        //
+        // Keeping the row is also the more correct post-PCCC-3 behaviour on its own terms: the row IS
+        // the `(item, group)` reservation, and re-pushing is what a reservation is for. The delta path
+        // is skipped for a sentinel sha, so the next pass pushes the whole item exactly as before.
+        await db.from("graph_episodes").update({ content_sha256: "" }).eq("id", row.id);
         reQueued++;
       }
     }

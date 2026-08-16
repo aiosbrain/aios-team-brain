@@ -4,7 +4,16 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 const resolveAnsweringKeys = vi.fn(async () => ({ openrouterKey: "k" }) as Record<string, unknown>);
 const completeTextOrNull = vi.fn();
 vi.mock("@/lib/query/answering", () => ({ resolveAnsweringKeys: (...a: unknown[]) => resolveAnsweringKeys(...(a as [])) }));
-vi.mock("@/lib/llm/complete", () => ({ completeTextOrNull: (...a: unknown[]) => completeTextOrNull(...(a as [])) }));
+// `withLlmPass` is mocked as a pass-through with a throwaway token: these tests are about the SUMMARY
+// behaviour, not the recording, and the pass contract has its own file (`test/llm-pass.test.ts`).
+// It must be present in the mock though — the module is mocked wholesale, so a missing export is a
+// hard failure rather than a fallback to the real one.
+vi.mock("@/lib/llm/complete", () => ({
+  completeTextOrNull: (...a: unknown[]) => completeTextOrNull(...(a as [])),
+  withLlmPass: (_init: unknown, body: (p: unknown) => Promise<unknown>) =>
+    body({ calls: 0, failures: 0, model: null, firstError: null, done: false }),
+  failLlmPassBeforeFirstCall: () => {},
+}));
 
 import { summaryPromptFor, type PersonDay, type TimelineDay } from "@/lib/dashboard/timeline-group";
 import { llmConfigured, attachPersonDaySummaries } from "@/lib/dashboard/timeline-summary";

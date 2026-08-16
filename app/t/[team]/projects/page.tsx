@@ -32,6 +32,9 @@ export default async function ProjectsPage({ params }: { params: Promise<{ team:
     .from("projects")
     .select("id, slug, name, last_synced_at, items(count), tasks(count)")
     .eq("team_id", team.id)
+    // §11 system containers are access topology, not browsable ingestion projects; the
+    // Part II read model gives them their own surface.
+    .neq("kind", "system")
     .order("last_synced_at", { ascending: false, nullsFirst: false });
 
   const rows = (projects ?? []) as unknown as ProjectCard[];

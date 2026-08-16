@@ -1,6 +1,7 @@
 import "server-only";
 import { runSql } from "@/lib/db/pg/pool";
 import { getGraphExtractionHealth, GRAPH_HEALTH_SOURCE } from "@/lib/graph/extraction-health";
+import { classifyFailure, type FailureClass } from "@/lib/ingest/failure-streak";
 
 /**
  * Aggregate ingestion-pipeline health for a LOUD admin surface. Every pipeline leg (slack/plane/
@@ -27,7 +28,7 @@ const STALE_MS = 3 * 60 * 60 * 1000; // 3h default
  * that fired this banner on a healthy job.
  */
 const STALE_MS_BY_SOURCE: Record<string, number | null> = {
-  llm: null, // event-driven (also surfaced on the retrieval-health card)
+  llm: null, // event-driven; not a banner leg at all since LLMOBS-1 — see NOT_PIPELINE_LEGS
   scan: null, // manual / CI
   pm_sync: null, // reactive — its own staleness heuristic lives in lib/pm-sync/runs
   auth_cleanup: 26 * 60 * 60 * 1000, // 24h cadence + 2h grace (genuinely-stuck still surfaces)
@@ -91,6 +92,28 @@ export function staleThresholdMs(source: string): number | null {
  */
 const CONNECTOR_SOURCES: ReadonlySet<string> = new Set(["slack", "plane", "linear", "github"]);
 
+/**
+ * Sources this banner does NOT speak for (LLMOBS-1). The banner's sentence is "N ingestion legs are
+ * broken — the brain isn't getting fresh data", and that is FALSE for a generation leg: ingestion is
+ * fine, a model failed.
+ *
+ * `llm` is here for a second, sharper reason review supplied: keeping it DOUBLE-COUNTS every arcs
+ * failure. A failed synthesis writes a `source='arcs'` ingest row AND, via `record:`, a `source='llm'`
+ * row (`lib/graph/arcs.ts:485-495`) — so one event lit two legs, which is literally the
+ * "2 ingestion legs are broken" of the 2026-08-11 incident BANNERFLAP-1 was raised for. The codebase
+ * already worked around the symptom instead of the cause: `arcs.ts:487` tunes a timeout specifically
+ * so "a slow-but-healthy reasoning model" does not "fire the loud pipeline banner".
+ *
+ * Pulse loses nothing it had — the `arcs` leg stays and already covered those failures — and the
+ * answering model now has its own truthful home-page banner fed by `getLlmHealth`
+ * (`components/admin/generation-health-banner`), which names the failing feature, its model and its
+ * error instead of implying the pipeline stopped.
+ *
+ * `graph_health` is excluded for an unrelated pre-existing reason (it is a transition ledger, not a
+ * leg); the two are kept in one place so the banner's leg set is readable as a set.
+ */
+const NOT_PIPELINE_LEGS: ReadonlySet<string> = new Set([GRAPH_HEALTH_SOURCE, "llm"]);
+
 /** A connector leg is "orphaned" when its integration type is no longer enabled (deleted/disabled).
  *  Its frozen last-failure row is a fossil the scheduler can't overwrite — not a live break.
  *  `enabledTypes === null` means the config read FAILED — we don't know what's configured, so we fail
@@ -106,16 +129,120 @@ export interface PipelineLeg {
   error: string | null;
   at: string; // finished_at ISO
   stale: boolean; // ran before, but not recently
+  /**
+   * Is the failure standing evidence, or one sample (BANNERFLAP-1)? `ok` when the newest run
+   * succeeded; `unconfirmed` for a lone failure — real and shown, but not loud; `confirmed` once the
+   * streak reaches `FAILURES_TO_CONFIRM`. The synthetic `graph_extract` leg is `confirmed` by
+   * construction: it has no runs to streak and is already debounced by its own detector.
+   */
+  failureClass: FailureClass;
+  /**
+   * The OLDEST failure in the current unbroken streak — what "failing since" must actually render.
+   * Null when the leg is not failing, and null for `graph_extract`, which is not a point-in-time
+   * failure and must not be given a fabricated instant.
+   */
+  failingSince: string | null;
 }
 
 export interface PipelineHealth {
   legs: PipelineLeg[];
-  /** Legs that failed (latest run ok=false) or went stale — what the loud banner names. */
+  /**
+   * Legs the loud banner names: a CONFIRMED failure or a stale poller. A lone unconfirmed failure is
+   * deliberately absent — it is still `ok:false` on the leg and listed in Admin → Recent
+   * ingestion runs. (NOT on the retrieval-health card: that card has no per-ingestion-source leg. It
+   * has an answering-model leg, but `llm` is no longer a pipeline leg at all — see NOT_PIPELINE_LEGS.) `stale` is
+   * independent of the classification and still loud on its own, including on a leg whose newest run
+   * succeeded, because it answers a different question ("is the poller still ticking").
+   */
   failing: PipelineLeg[];
   healthy: boolean;
 }
 
-type Row = { source: string; ok: boolean; errors: unknown; finished_at: string | Date };
+type Row = {
+  source: string;
+  ok: boolean;
+  errors: unknown;
+  finished_at: string | Date;
+  streak_length: number | string;
+  failing_since: string | Date | null;
+};
+
+/**
+ * Newest run per source, PLUS its current failure streak — one query, so the verdict and the duration
+ * cannot disagree (BANNERFLAP-1).
+ *
+ * WHY A WINDOW FUNCTION AND NOT `distinct on`. `distinct on (source)` structurally returns one row per
+ * source, which is exactly the single-sample read this slice exists to replace. The streak needs every
+ * failure back to the last success, and it needs the OLDEST of them — a bounded two-row window cannot
+ * express that (the graph projector 422'ing for weeks is ~144 rows at a 30m cadence, and two rows
+ * would report "failing for 30 minutes" about a three-day outage).
+ *
+ * WHY THE PARTITION IS `(source, team_id)` AND NOT `source`. The outer scope is `team_id = $1 or
+ * team_id is null`, and at least one source writes BOTH: `access_bootstrap` records a per-team
+ * `ok=false` row for each FAILING team, plus an unconditional instance-wide heartbeat every tick (`lib/ingest/scheduler.ts`). A source-level
+ * streak is therefore broken by global heartbeat rows that say nothing about this team's health.
+ * The codebase has been bitten by the same mixing before — `context_backfill_all` exists as its own
+ * source precisely because a global row masked per-team rows under `distinct on`. Found in spec review.
+ * The leg is then taken from the partition holding the newest row, which preserves today's "the newest
+ * row is the leg's state" semantics exactly.
+ *
+ * ONE GROUPED PASS FOR THE STREAK, not a lateral subquery. The first version re-scanned the whole
+ * `scoped` CTE once per source: measured against prod (12,661 rows, ~299 new rows/day, and nothing in
+ * this repo prunes `ingest_runs`) that was 17 loops x 12,661 rows ≈ 215k row visits for a 44ms query —
+ * O(sources × history) on a table that only grows. It runs on EVERY admin Home + Integrations render
+ * and sits inside `catch { return empty }`, so the end state of that trajectory is not a slow page: it
+ * is a banner that silently reports healthy forever, which is the alarm-death this whole family of
+ * tickets exists to prevent. Review flagged the shape. The grouped form is one pass (measured 32ms on
+ * the same data), changes no behaviour, and needs no time-window clamp — a clamp would have made a leg
+ * whose newest row fell outside the window vanish from `legs` entirely, trading a performance problem
+ * for a correctness one. What remains and is NOT solved here: `scoped` still sorts the team's whole
+ * history, so retention (or a bounded window with a deliberate answer for old legs) is a real
+ * follow-up, recorded in the spec rather than left implicit.
+ *
+ * `ok_after` counts successes at-or-newer than each row; the current streak is the failures with none.
+ * Ordering is `finished_at desc, id desc` — two runs can share a millisecond (a fast fail then a retry
+ * in the same tick), and `id` is the bigserial PK, so the most-recently-inserted wins deterministically.
+ * `llm-health` already documented this tie-break; the pipeline query did NOT have it, so it is new here.
+ * Runs of ANY trigger count, matching today's verdict read — only the STALENESS clock is
+ * scheduler-only, and a scheduler-only streak would return zero rows for `llm` (all `trigger: 'api'`).
+ */
+const STREAK_SQL = `
+  with scoped as (
+    select id, source, team_id, ok, errors, finished_at,
+           sum(case when ok then 1 else 0 end) over (
+             partition by source, team_id
+             order by finished_at desc, id desc
+             rows between unbounded preceding and current row
+           ) as ok_after,
+           row_number() over (
+             partition by source, team_id order by finished_at desc, id desc
+           ) as rn
+      from ingest_runs
+     where team_id = $1 or team_id is null
+  ),
+  streaks as (
+    -- ONE grouped pass, deliberately NOT a lateral subquery. See the note above the constant for the
+    -- measurement; the short version is that the lateral form re-scanned the whole scoped CTE once
+    -- per source, which is O(sources x history) on a table that only grows.
+    -- (No backticks in here: this is inside a JS template literal, and one of them terminated the
+    -- string. tsc caught it; worth the reminder since SQL comments read like prose.)
+    select source, team_id, count(*)::int as streak_length, min(finished_at) as failing_since
+      from scoped
+     where not ok and ok_after = 0
+     group by source, team_id
+  ),
+  newest as (
+    select distinct on (source) source, team_id, ok, errors, finished_at
+      from scoped where rn = 1
+     order by source, finished_at desc, id desc
+  )
+  select n.source, n.ok, n.errors, n.finished_at,
+         coalesce(s.streak_length, 0) as streak_length,
+         s.failing_since
+    from newest n
+    left join streaks s
+      on s.source = n.source
+     and s.team_id is not distinct from n.team_id`;
 
 function firstError(errors: unknown): string | null {
   const arr = Array.isArray(errors)
@@ -142,13 +269,7 @@ export async function getPipelineHealth(teamId: string): Promise<PipelineHealth>
     // the team's currently-enabled integration types, so a connector leg whose integration was
     // deleted/disabled (its last run frozen as a failure) is suppressed instead of crying wolf.
     const [res, beats, extraction, enabled] = await Promise.all([
-      runSql<Row>(
-        `select distinct on (source) source, ok, errors, finished_at
-           from ingest_runs
-          where team_id = $1 or team_id is null
-          order by source, finished_at desc`,
-        [teamId]
-      ),
+      runSql<Row>(STREAK_SQL, [teamId]),
       // The POLLER heartbeat, deliberately separate from the newest-row-of-any-trigger above.
       // Staleness answers "is the scheduler still ticking", and only a `scheduler` row is evidence of
       // that. A leg that is ALSO runnable on demand — `meeting_notes` now runs on every `aios push`
@@ -182,7 +303,7 @@ export async function getPipelineHealth(teamId: string): Promise<PipelineHealth>
     // healthy graph forever (review finding). Its live state already surfaces through the synthetic
     // `graph_extract` leg below, fed by the same detector; the ledger rows remain visible in the
     // Recent-runs panel as the alarm's audit trail.
-    const legs: PipelineLeg[] = res.rows.filter((r) => r.source !== GRAPH_HEALTH_SOURCE).map((r) => {
+    const legs: PipelineLeg[] = res.rows.filter((r) => !NOT_PIPELINE_LEGS.has(r.source)).map((r) => {
       const at = iso(r.finished_at);
       // Stale only past THIS source's own cadence — a 24h job isn't stale at 3h (would cry wolf).
       const threshold = staleThresholdMs(r.source);
@@ -191,7 +312,27 @@ export async function getPipelineHealth(teamId: string): Promise<PipelineHealth>
       // not aged at all — consistent with this file's standing "never cry wolf" bias.
       const clock = beatAt === null ? at : beatAt.get(r.source);
       const stale = threshold !== null && clock !== undefined && now - Date.parse(clock) > threshold;
-      return { source: r.source, ok: r.ok, error: r.ok ? null : firstError(r.errors), at, stale };
+      // BANNERFLAP-1. `streak_length` is the current unbroken failure run ending at this newest row.
+      // The coercion is DEFENSIVE, not a driver workaround — an earlier comment here claimed the
+      // latter and was wrong: `count(*)::int` is int4, which node-postgres already returns as a
+      // number, and `lib/db/pg/pool` overrides the date parsers so timestamps arrive as strings.
+      // What it is really for is the direction of the failure: any non-number would fall to 0 →
+      // `unconfirmed` → a silenced banner, so the fallback is written explicitly rather than left to
+      // `|| 0`, and the zero is what a missing streak legitimately means.
+      const failureClass = classifyFailure({
+        ok: r.ok,
+        streakLength: Number.isFinite(Number(r.streak_length)) ? Number(r.streak_length) : 0,
+        failingSince: r.failing_since === null ? null : iso(r.failing_since),
+      });
+      return {
+        source: r.source,
+        ok: r.ok,
+        error: r.ok ? null : firstError(r.errors),
+        at,
+        stale,
+        failureClass,
+        failingSince: r.ok || r.failing_since === null ? null : iso(r.failing_since),
+      };
     });
 
     // Synthetic leg for the ONE failure ingest_runs structurally can't see: the projector records
@@ -209,12 +350,31 @@ export async function getPipelineHealth(teamId: string): Promise<PipelineHealth>
         error: extraction.reason,
         at: "", // not a point-in-time failure — the banner shows the cause, not a "since" time
         stale: false,
+        // EXEMPT FROM CONFIRMATION, deliberately (BANNERFLAP-1). This leg has NO `ingest_runs` rows —
+        // it is synthesised from a Neo4j/ledger probe — so it can never accumulate a streak, and
+        // `Date.parse("")` is NaN. Run through the classifier uniformly it would be `unconfirmed`
+        // FOREVER and drop out of the loud banner silently, with every other test in this slice still
+        // green. Spec review caught that. It needs no second debounce anyway: its own detector already
+        // requires a 6h lag budget / an episode floor / a census sample floor before it says anything.
+        failureClass: "confirmed",
+        // Null, not a fabricated instant. The extraction lag boundary and the newest-episode time are
+        // both to hand and both would be a made-up "since" for a condition that is explicitly not a
+        // point-in-time failure. An admitted unknown beats a number that reads as a measurement.
+        failingSince: null,
       });
     }
 
-    // A leg is "failing" if its latest run failed or it went stale — EXCEPT an orphaned connector
-    // (integration deleted/disabled), whose frozen last-failure isn't a live break to alert on.
-    const failing = legs.filter((l) => (!l.ok || l.stale) && !isOrphanedConnector(l.source, enabledTypes));
+    // A leg is loud when its failure is CONFIRMED (streak ≥ 2) or its poller went stale — EXCEPT an
+    // orphaned connector (integration deleted/disabled), whose frozen last-failure isn't a live break.
+    // `stale` is deliberately OR'd, not gated on the classification: it answers "is the poller still
+    // ticking", so a leg whose newest run SUCCEEDED but whose scheduler went quiet must stay loud.
+    // A lone `unconfirmed` failure is absent from here by design — it is still `ok:false` on the leg
+    // and listed in Admin → Recent ingestion runs, just not in a banner that says the brain isn't
+    // getting fresh data. (No source here has a retrieval-health-card leg: `llm` had one and is no
+    // longer a pipeline leg at all — LLMOBS-1.)
+    const failing = legs.filter(
+      (l) => (l.failureClass === "confirmed" || l.stale) && !isOrphanedConnector(l.source, enabledTypes)
+    );
     return { legs, failing, healthy: failing.length === 0 };
   } catch {
     return empty;

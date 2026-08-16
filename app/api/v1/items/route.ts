@@ -1,6 +1,6 @@
 import { NextRequest, after } from "next/server";
 import { adminClient } from "@/lib/db/admin";
-import { authenticateApiKey } from "@/lib/api/auth";
+import { authenticateApiKey, authenticateAgentToken, isAgentBearer } from "@/lib/api/auth";
 import { isRestrictedTier } from "@/lib/auth/visibility";
 import { rateLimit } from "@/lib/api/rate-limit";
 import {
@@ -114,6 +114,35 @@ export async function POST(req: NextRequest) {
       after(() => meetingBackfillScheduler.schedule(teamId));
     }
 
+    // §11 context: partition the just-ingested item into its unit + system-project membership
+    // immediately (spec §11.2), so new content is access-partitioned on push, not only when the
+    // scheduler backfill next sweeps. After the response, best-effort — a failure only costs
+    // latency (the scheduler leg is the backstop), never the push. Skips silently if the team's
+    // system projects don't exist yet (bootstrap covers it). Inert in Phase A (no read enforces
+    // memberships yet) but keeps the substrate current from day one of Phase B.
+    // Fire on a real ingest OR a tier reclassification that arrived as `unchanged` (the
+    // heal-access path) — the latter is the security-relevant MOVE (slice-5 Fable HIGH).
+    if (result.status !== "unchanged" || result.accessChanged) {
+      const teamId = auth.teamId;
+      const itemId = result.id;
+      // Scheduling the post-response work must never fail the push — not the work (best-effort
+      // inside), and not the `after()` registration itself (it throws when called outside a
+      // request scope, e.g. the in-process handler tests). Either way the scheduler leg is the
+      // backstop, so a miss here costs latency, never the push.
+      try {
+        after(async () => {
+          const { reconcileItemContext } = await import("@/lib/projects/context/reconcile-item");
+          const r = await reconcileItemContext(adminClient(), teamId, itemId).catch((e) => ({
+            ok: false,
+            error: e instanceof Error ? e.message : "threw",
+          }));
+          if (!r.ok) console.warn(`[access] context reconcile for item ${itemId} failed: ${(r as { error?: string }).error}`);
+        });
+      } catch {
+        // no request scope (tests) or after() unavailable — the scheduler backstop covers it
+      }
+    }
+
     // Strip the internal scheduling hints — the HTTP wire format stays { status, id }.
     return Response.json(
       { status: result.status, id: result.id },
@@ -135,8 +164,21 @@ export async function POST(req: NextRequest) {
 }
 
 export async function GET(req: NextRequest) {
-  const auth = await authenticateApiKey(req);
-  if (!auth) return errorResponse("unauthorized", "invalid API key or team", 401);
+  // Phase A (spec §10/§17-A): this is the ONE route that honors delegated agent tokens.
+  // An agent principal gets the oracle filter below; member keys behave exactly as before.
+  let agentProjects: ReadonlySet<string> | null = null;
+  let auth: { teamId: string; memberId: string; memberTier: "team" | "external"; apiKeyId: string };
+  if (isAgentBearer(req)) {
+    const agent = await authenticateAgentToken(req);
+    if (!agent) return errorResponse("unauthorized", "invalid agent token or team", 401);
+    const { effectiveVisibleProjects } = await import("@/lib/access/oracle");
+    agentProjects = await effectiveVisibleProjects(adminClient(), agent);
+    auth = { teamId: agent.teamId, memberId: agent.memberId, memberTier: agent.memberTier, apiKeyId: `agent:${agent.agentTokenId}` };
+  } else {
+    const memberAuth = await authenticateApiKey(req);
+    if (!memberAuth) return errorResponse("unauthorized", "invalid API key or team", 401);
+    auth = memberAuth;
+  }
 
   const db = adminClient();
   if (!(await rateLimit(db, `${auth.apiKeyId}:items:get`, 60))) {
@@ -159,7 +201,40 @@ export async function GET(req: NextRequest) {
     .order("updated_at", { ascending: true })
     .order("id", { ascending: true })
     .limit(PAGE_SIZE);
-  if (isRestrictedTier(auth.memberTier)) q = q.eq("access", "external");
+  if (isRestrictedTier(auth.memberTier)) q = q.eq("access", "external"); // legacy-tier conjunct — always
+
+  // Enforced read (Phase B slice 1, spec §5/§11): visibility = oracle ∧ legacy-tier. When the team
+  // is 'enforcing', BOTH member and agent reads intersect with the membership-visible item set
+  // (an agent must never exceed its launcher — slice-B1 Fable HIGH; the agent's Phase-A project_id
+  // proxy is used ONLY under permissive). 'permissive' (default) → member reads unchanged,
+  // byte-identical to today. A flag-read error throws → 500 (fail closed, never a wrong mode).
+  let enforcing: boolean;
+  try {
+    const { teamEnforcesAccess } = await import("@/lib/access/enforce");
+    enforcing = await teamEnforcesAccess(db, auth.teamId);
+  } catch (e) {
+    // Fail closed on a flag-read error, but don't leak the raw DB error to the client (Codex Low).
+    console.error("[access] enforcement check failed:", e instanceof Error ? e.message : e);
+    return errorResponse("internal", "enforcement check failed", 500);
+  }
+
+  if (enforcing) {
+    const { visibleItemIdsForProjects } = await import("@/lib/access/enforce");
+    let projectSet: ReadonlySet<string>;
+    if (agentProjects !== null) {
+      projectSet = agentProjects; // the agent's effective set (already oracle-attenuated)
+    } else {
+      const { visibleProjects } = await import("@/lib/access/oracle");
+      projectSet = (await visibleProjects(db, { teamId: auth.teamId, memberId: auth.memberId })).projectIds;
+    }
+    const { ids, empty } = await visibleItemIdsForProjects(db, auth.teamId, projectSet);
+    if (empty) return Response.json({ items: [], next_cursor: null });
+    q = q.in("id", [...ids]);
+  } else if (agentProjects !== null) {
+    // Permissive team + agent token: the Phase-A ingestion-project proxy (unchanged).
+    if (agentProjects.size === 0) return Response.json({ items: [], next_cursor: null });
+    q = q.in("project_id", [...agentProjects]);
+  }
   if (kinds?.length) q = q.in("kind", kinds);
   // On-demand fetch of one skill/deliverable folder: match path by prefix.
   if (pathPrefix) q = q.like("path", `${pathPrefix.replace(/[%_\\]/g, "\\$&")}%`);

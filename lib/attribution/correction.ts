@@ -90,7 +90,14 @@ export async function parseCorrectionPlan(
   ].join("\n");
   const raw = await completeTextOrNull(
     { system: SYSTEM, prompt: user },
-    { keys, jsonObject: true, maxTokens: 400, meter: meter ? { ...meter, source: "attribution" } : undefined }
+    {
+      keys,
+      jsonObject: true,
+      maxTokens: 400,
+      meter: meter ? { ...meter, source: "attribution" } : undefined,
+      // `meter` bills, `record` is what the health leg reads (LLMOBS-1) — different ledgers.
+      record: meter ? { db: meter.db, teamId: meter.teamId, task: "attribution" } : undefined,
+    }
   );
   if (!raw) return null;
   try {

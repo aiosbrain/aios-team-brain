@@ -106,6 +106,19 @@ export async function settleReclassification(
     await bustTeamTimeline(db, change.teamId);
   }
 
+  // §11 context: a tier change MUST re-partition the item's membership from ANY caller, not only
+  // the push route's after() hook — a connector re-sync or internal ingestItem flips access with
+  // no route, and the scheduler's converged short-circuit no longer catches it (slice-5 Codex
+  // HIGH). This is the fan-out point (the comment above claims it), so the move lives here.
+  // Best-effort: a reconcile failure must never fail the reclassification; idempotent.
+  try {
+    const { reconcileItemContext } = await import("@/lib/projects/context/reconcile-item");
+    const r = await reconcileItemContext(db, change.teamId, change.itemId);
+    if (!r.ok) console.warn(`[access] context re-partition after reclassification of ${change.itemId} failed: ${r.error}`);
+  } catch (e) {
+    console.warn(`[access] context re-partition threw for ${change.itemId}: ${e instanceof Error ? e.message : e}`);
+  }
+
   // Audit the rare reclassification so the tier change isn't silent. Rare enough not to reintroduce the
   // per-tick unbounded audit growth that removed the `item.unchanged` row (audit M4).
   await audit(db, {

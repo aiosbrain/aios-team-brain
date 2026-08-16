@@ -156,6 +156,10 @@ create table if not exists teams (
   meeting_task_status text check (meeting_task_status in ('backlog', 'ready', 'in_progress', 'done')),
   created_at timestamptz not null default now()
 );
+-- Access-enforcement rollout flag (Phase B, spec §5/§11): 'permissive' (default) = today's
+-- legacy-tier-only reads, byte-identical; 'enforcing' = oracle membership filter ∧ legacy tier (GET /api/v1/items only this slice).
+-- CHECK lives in the 20260811160000 migration (named, replay-repairable).
+alter table teams add column if not exists access_enforcement text not null default 'permissive';
 -- Additive columns for existing deployments.
 alter table teams add column if not exists primary_pm_provider text;
 alter table teams add column if not exists answering_provider text;
@@ -952,6 +956,115 @@ create table if not exists projects (
   created_at timestamptz not null default now(),
   unique (team_id, slug)
 );
+-- 'source' (ingestion container) | 'system' (§11 built-ins: general/external-shared) |
+-- 'initiative' (human-facing, Part II substrate). The CHECK lives in the 20260809150000
+-- migration as a named drop-and-re-add constraint (replay-repairable); pg:schema always runs
+-- migrations after this file, so it exists in every path.
+alter table projects add column if not exists kind text not null default 'source';
+-- The project's Graphiti partition pointer (PCCC-4; spec ~946-950 rules STORED, not inferred).
+-- §11 built-ins grandfather the legacy tier ids ('<teamSlug>_team' / '<teamSlug>_external');
+-- everything else mints lib/graph/group.projectGroupId. Sole writer:
+-- lib/graph/project-pointer.ensureProjectGraphPointer (called by every creation path) + the
+-- 20260815140000 backfill; nullable only for the insert-then-point window at creation — readers
+-- treat null as not-cutover and fail closed. Injective via the partial unique below.
+alter table projects add column if not exists graph_group_id text;
+create unique index if not exists projects_graph_group_id_key
+  on projects (graph_group_id) where graph_group_id is not null;
+
+-- ── Access chain (spec: docs/specs/project-context-classification-v1.md §4) ──────────────
+-- Person → Group → Project → Content. These three tables are the ONLY access edges; the sole
+-- writer is lib/access/groups.ts (build-enforced by test/guards/access-single-writer.test.ts).
+-- Composite same-team FKs make a cross-team edge unrepresentable (the mirrored
+-- gateway_service_identities pattern), which needs (team_id, id) unique targets on the
+-- referenced tables:
+create unique index if not exists members_team_id_id_idx on members (team_id, id);
+create unique index if not exists projects_team_id_id_idx on projects (team_id, id);
+
+-- Member kind: 'human' (default) | 'agent' (standing autonomous agent — a principal, never
+-- auto-admitted to built-ins) | 'offroster' (attribution-only actor — never a principal).
+-- Predicates: lib/access/eligibility.ts (isPrincipal / isBuiltinEligible). The CHECK lives in
+-- the 20260809120000 migration as a NAMED drop-and-re-add constraint (replay-repairable — the
+-- migrations README pattern); pg:schema always runs migrations after this file, on from-zero
+-- AND existing databases, so the constraint exists in every path.
+alter table members add column if not exists kind text not null default 'human';
+
+-- Groups of people. "Everyone" and "External" are built-in rows (is_builtin), created per team
+-- by lib/access/groups.ts (ensureBuiltins); built-ins cannot be deleted and their membership is
+-- machine-maintained (isBuiltinEligible + tier), never hand-edited. A row with person_member_id
+-- set is a hidden per-person singleton group ("direct person add"): system-managed, absent from
+-- group pickers, membership permanently = exactly that member (writer-enforced; the schema alone
+-- cannot express it).
+create table if not exists groups (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  slug text not null,
+  name text not null,
+  is_builtin boolean not null default false,
+  person_member_id uuid,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  unique (team_id, slug),
+  unique (team_id, id),
+  foreign key (team_id, person_member_id) references members (team_id, id) on delete cascade,
+  -- a built-in can never be a singleton, and vice versa
+  check (person_member_id is null or not is_builtin)
+);
+create unique index if not exists groups_person_singleton_idx
+  on groups (team_id, person_member_id) where person_member_id is not null;
+
+create table if not exists group_members (
+  team_id uuid not null references teams(id) on delete cascade,
+  group_id uuid not null,
+  member_id uuid not null,
+  added_by uuid references members(id) on delete set null,
+  created_at timestamptz not null default now(),
+  primary key (group_id, member_id),
+  foreign key (team_id, group_id) references groups (team_id, id) on delete cascade,
+  foreign key (team_id, member_id) references members (team_id, id) on delete cascade
+);
+create index if not exists group_members_member_idx on group_members (team_id, member_id);
+
+-- Which groups can see a project. THE access edge.
+create table if not exists project_groups (
+  team_id uuid not null references teams(id) on delete cascade,
+  project_id uuid not null,
+  group_id uuid not null,
+  added_by uuid references members(id) on delete set null,
+  created_at timestamptz not null default now(),
+  primary key (project_id, group_id),
+  foreign key (team_id, project_id) references projects (team_id, id) on delete cascade,
+  foreign key (team_id, group_id) references groups (team_id, id) on delete cascade
+);
+create index if not exists project_groups_group_idx on project_groups (team_id, group_id);
+
+-- Delegated agent tokens (spec §10). Wire format `aiosd_<token_id>_<secret>` — a distinct
+-- prefix so no parser can confuse a delegated token with a member key (`aios_…`); same
+-- hashed-secret discipline as api_keys. project_scope: NULL = unattenuated (inherit the
+-- principal's full LIVE visibility — the spawn default), '{}' = sees nothing; the two are
+-- never conflated. Sole writer: lib/access/agent-tokens.ts (guarded).
+-- on_behalf_of deletion CASCADES the token rather than nulling it: a null-out would silently
+-- convert an acting-as token into a self token, i.e. widen it to the launcher's own set.
+create table if not exists agent_tokens (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  member_id uuid not null,
+  on_behalf_of uuid,
+  project_scope uuid[],
+  token_id text not null unique,
+  token_hash text not null,
+  name text not null default '',
+  created_by uuid,
+  created_at timestamptz not null default now(),
+  expires_at timestamptz,
+  last_used_at timestamptz,
+  revoked_at timestamptz,
+  foreign key (team_id, member_id) references members (team_id, id) on delete cascade,
+  foreign key (team_id, on_behalf_of) references members (team_id, id) on delete cascade,
+  -- provenance-only, but same-team like every other member column here (review L2).
+  -- Column-list SET NULL (PG15+): nulls created_by only, never team_id.
+  foreign key (team_id, created_by) references members (team_id, id) on delete set null (created_by)
+);
+create index if not exists agent_tokens_member_idx on agent_tokens (team_id, member_id);
 
 create table if not exists items (
   id uuid primary key default gen_random_uuid(),
@@ -1002,6 +1115,54 @@ create index if not exists items_team_synced_idx on items (team_id, synced_at de
 create index if not exists items_team_created_idx on items (team_id, created_at desc);
 create index if not exists items_search_idx on items using gin (search);
 create index if not exists items_kind_idx on items (team_id, kind);
+-- composite (team_id, id) target for context-unit same-team FKs (Phase A slice 4)
+create unique index if not exists items_team_id_id_idx on items (team_id, id);
+
+-- ── Context substrate (partitioning/permissioning Phase A slice 4 — spec §context-units) ──
+-- Item-grain subset; task/decision/meeting-segment grains + events/suggestions/rules = Phase D.
+-- Sole writers: lib/projects/context/units.ts and lib/projects/context/memberships.ts (guarded).
+create table if not exists project_context_units (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  unit_kind text not null default 'item' check (unit_kind in ('item','task','decision','meeting_segment')),
+  source_item_id uuid,
+  unit_key text not null,
+  audience access_tier not null,
+  content_sha256 text not null,
+  state text not null default 'active' check (state in ('active','retracted')),
+  occurred_at timestamptz not null default now(),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  -- item grain only in this slice: every unit MUST anchor to an item. Phase D relaxes this
+  -- (named drop/re-add) as it adds the task/decision/meeting-note source columns + FKs.
+  check (unit_kind = 'item' and source_item_id is not null),
+  unique (team_id, id),
+  foreign key (team_id, source_item_id) references items (team_id, id) on delete cascade
+);
+create unique index if not exists pcu_item_key_idx
+  on project_context_units (team_id, source_item_id) where unit_kind = 'item';
+create index if not exists pcu_team_audience_idx on project_context_units (team_id, audience) where state = 'active';
+
+create table if not exists project_context_memberships (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  project_id uuid not null,
+  context_unit_id uuid not null,
+  decision text not null default 'include' check (decision in ('include','exclude')),
+  mode text not null default 'auto' check (mode in ('auto','force_include','force_exclude')),
+  method text not null default 'ingestion_project'
+    check (method in ('ingestion_project','explicit_ref','rule','embedding','llm','manual')),
+  decided_by uuid,
+  valid_from timestamptz not null default now(),
+  valid_to timestamptz,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  foreign key (team_id, project_id) references projects (team_id, id) on delete cascade,
+  foreign key (team_id, context_unit_id) references project_context_units (team_id, id) on delete cascade
+);
+create unique index if not exists pcm_current_idx
+  on project_context_memberships (team_id, project_id, context_unit_id) where valid_to is null;
+create index if not exists pcm_unit_idx on project_context_memberships (team_id, context_unit_id) where valid_to is null;
 
 create table if not exists item_versions (
   id uuid primary key default gen_random_uuid(),
@@ -2227,13 +2388,49 @@ create table if not exists graph_episodes (
   chunk_shas text[] not null default '{}',
   chunk_config text not null default '',
   projected_at timestamptz not null default now(),
-  unique (team_id, source_table, source_id)
+  -- PCCC-5: extraction deliberately WITHHELD for a cold initiative (distinct from the '' sentinel's
+  -- three meanings). Reconcile ignores deferred rows; arming (PCCC-6) flips this false and the
+  -- projector pushes under its fan-out budget. Sole writer: lib/graph/project.
+  deferred boolean not null default false,
+  -- SET-ONCE (STALLSCOPE-1, migration 20260816090000): when the projector first CREATED this row —
+  -- the reserve-before-push reservation, not the first accepted push. `projected_at` above is
+  -- last-touched and moves on every re-push, so it cannot answer "how long has this team been
+  -- trying"; the stall probe's age gate reads this one. Written by the row-creating INSERT only: no
+  -- upsert or UPDATE payload names it, so ON CONFLICT DO UPDATE (which sets only provided keys)
+  -- leaves it alone. Guarded by test/guards/graph-episodes-first-seen-migration.test.ts.
+  first_seen_at timestamptz not null default now()
+  -- The one-row-per-item NARROW unique that used to live here was dropped by PCCC-4/Deploy B
+  -- (migration 20260815150000): identity is per-(item, group) via graph_episodes_item_group_key
+  -- below, and an item may hold one ledger row PER GROUP (PCCC-5 fan-out's substrate).
 );
 create index if not exists graph_episodes_team_idx on graph_episodes (team_id, projected_at desc);
+-- PCCC-3: the per-(item, group) identity the projector's 4-column ON CONFLICT targets. Expressed as
+-- an identically-named standalone index here AND in the migration (20260815120000) — an inline
+-- `unique (…)` inside the table declaration auto-names differently and gives a from-zero DB two
+-- identical arbiter indexes, which the replay guard cannot flag.
+create unique index if not exists graph_episodes_item_group_key
+  on graph_episodes (team_id, source_table, source_id, group_id);
 -- NB: the partial index on `pending_delete_group_id` lives ONLY in the migration
 -- (20260724180000_graph_episodes_pending_delete.sql), which runs AFTER schema.sql and adds the column
 -- first. A bare partial-index statement here would fail on an existing DB, where the table already
 -- exists (so its declaration above is a no-op) and the column isn't present until the migration runs.
+
+-- Per-project graph ARMING state (PCCC-6, design §2.2/§2.3). A row exists once a team-tier
+-- enforcing principal's read has ARMED the project (its deferred fan-out rows flipped to
+-- pushable); `ready_at` is the MONOTONE read-ready latch — set once every row armed at that time
+-- has reconcile-confirmed landed, never cleared (items tagged later lag like today's tier graph;
+-- a live "all currently landed" predicate would starve busy initiatives and flap the leg — the
+-- design's round-2 High 4 / Codex Blocker 2 history). The obligation snapshot IS the set of
+-- armed (deferred=false) ledger rows at arm time — no id array to maintain. Sole writer:
+-- lib/graph/arming.
+create table if not exists graph_project_arming (
+  team_id uuid not null references teams(id) on delete cascade,
+  project_id uuid not null,
+  armed_at timestamptz not null default now(),
+  ready_at timestamptz,
+  primary key (team_id, project_id),
+  foreign key (team_id, project_id) references projects (team_id, id) on delete cascade
+);
 
 -- Narrative-arc synthesis cache (Layer 3, lib/graph/arcs). Arcs are an LLM synthesis over the last
 -- 7d of the graph — expensive to compute and identical for everyone sharing a tier-visible group set.

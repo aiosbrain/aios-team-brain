@@ -93,7 +93,13 @@ export function PipelineHealthBanner({ health, href }: { health: PipelineHealth;
               <span>— last successful run {timeAgo(l.at)} (may have stopped)</span>
             ) : (
               <span>
-                — failing{l.at ? ` since ${timeAgo(l.at)}` : ""}
+                {/* `failingSince` — the OLDEST failure in the current streak — NOT `l.at`, which is
+                    the NEWEST run. Under the old code a leg failing for three days was labelled
+                    "failing since 20 minutes ago" every time the poller re-failed, which is what made
+                    a stale red banner indistinguishable from a live one (BANNERFLAP-1 §3b). Null for
+                    the synthetic `graph_extract` leg, which is not a point-in-time failure and gets no
+                    fabricated instant — the copy falls back to the cause alone. */}
+                — failing{l.failingSince ? ` since ${timeAgo(l.failingSince)}` : ""}
                 {l.error ? <span className="text-red-600/80 dark:text-red-300/80">: {l.error}</span> : null}
               </span>
             )}

@@ -187,8 +187,28 @@ export async function POST(req: NextRequest) {
   }
   if (conversationId) await appendMessage(db, owner, conversationId, "user", question);
 
+  // Access enforcement (Phase B slice 2): same as the API query route — filter retrieval to the
+  // member's membership-visible items on an 'enforcing' team; permissive → null → byte-identical.
+  let enforce: import("@/lib/query/retrieve").RetrieveEnforce | null = null;
+  try {
+    const { teamEnforcesAccess, visibleItemIds } = await import("@/lib/access/enforce");
+    if (await teamEnforcesAccess(db, team.id)) {
+      const { ids, projectIds } = await visibleItemIds(db, { teamId: team.id, memberId: me.id });
+      // PCCC-6: the dashboard chat is the members' PRIMARY conversational surface — it gets the
+      // K-capped partitioned graph leg exactly like /api/v1/query (review Medium 7: leaving it on
+      // the omit path while the API had the leg was an unrecorded split). Team-tier members only.
+      enforce = { visibleItemIds: ids, ...(me.tier === "team" ? { graphProjectIds: projectIds } : {}) };
+    }
+  } catch {
+    return errorResponse("internal", "enforcement check failed", 500);
+  }
+
+  // Access enforcement (Codex HIGH): prior assistant turns can quote content whose items are no
+  // longer visible to this principal (e.g. after a group change) — omit history under enforcing
+  // until turns are visibility-revalidated. The current turn's answer is freshly retrieval-grounded.
+  const historyTurns = enforce ? [] : priorTurns;
   const started = Date.now();
-  const ctx = await retrieve(db, team.id, memberTier, question, project);
+  const ctx = await retrieve(db, team.id, memberTier, question, project, enforce);
 
   // Per-team provider keys + models + the explicit answering-backend override (null fields → env
   // fallback in streamAnswer; `activeProvider` forces a backend, else selectLlmBackend precedence).
@@ -205,7 +225,7 @@ export async function POST(req: NextRequest) {
 
       let answer = "";
       try {
-        for await (const chunk of streamAnswer(ctx, question, keys, priorTurns, caller, timeZone)) {
+        for await (const chunk of streamAnswer(ctx, question, keys, historyTurns, caller, timeZone)) {
           if (chunk.type === "delta") {
             answer += chunk.text;
             send("delta", { text: chunk.text });

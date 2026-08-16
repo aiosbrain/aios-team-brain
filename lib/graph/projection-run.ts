@@ -29,6 +29,17 @@ export function projectionRunInput(
       // ITEMS, which is a different unit: chunking splits one item into up to 16 episodes, so a ratio
       // over items moves with the corpus's chunk mix and can read a content shift as a model change.
       episodes: summary.episodes,
+      // Per-group split of `episodes` (PCCC-3, design §3): the append-only substrate the Phase C
+      // cost gate prices from. ingest_runs rows are never updated, so summing this key across runs
+      // gives episodes-actually-pushed per partition — the denominator graph_episodes row counts
+      // cannot provide (a row is one ITEM, and its projected_at mutates).
+      episodesByGroup: summary.episodesByGroup,
+      // Fan-out pushes withheld by the per-pass budget (PCCC-5) — a cap that saturates must never
+      // be silent; persistent non-zero means arming outpaces GRAPH_FANOUT_PUSH_MAX_PER_PASS.
+      fanoutThrottled: summary.fanoutThrottled,
+      // Rule-2 exposure population (PCCC-6): items restricted out of General whose move has not
+      // completed — non-zero for many runs means the copy leg is stuck, and the exposure is REAL.
+      restrictionMovesPending: summary.restrictionMovesPending,
       scanned: summary.scanned,
       teams: summary.teams,
       reconciled: summary.reconciled,

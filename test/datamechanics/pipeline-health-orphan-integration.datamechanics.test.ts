@@ -20,16 +20,28 @@ function auth(teamId: string, memberId: string) {
   return { teamId, memberId };
 }
 
+/**
+ * TWO failures, not one — deliberately, since BANNERFLAP-1.
+ *
+ * This file is about ORPHAN SUPPRESSION: a connector whose integration was deleted must drop out of
+ * the banner. Since a lone failure is now `unconfirmed` and absent from `failing` on its own, a
+ * single-failure fixture would make every "suppressed" assertion here pass whether or not suppression
+ * works at all — green for the wrong reason — while the "stays loud" assertions failed. Raising the
+ * fixture above the confirmation threshold keeps the orphan rule the ONLY variable under test.
+ */
 async function recordPlaneFailure(teamId: string): Promise<void> {
-  await recordIngestRun(db(), {
-    teamId,
-    source: "plane",
-    trigger: "scheduler",
-    ok: false,
-    errors: ['integration "aios-plane": The operation was aborted due to timeout'],
-    meta: { integrations: 1 },
-    startedAt: Date.now() - 1000,
-  });
+  for (const ago of [2000, 1000]) {
+    await recordIngestRun(db(), {
+      teamId,
+      source: "plane",
+      trigger: "scheduler",
+      ok: false,
+      errors: ['integration "aios-plane": The operation was aborted due to timeout'],
+      meta: { integrations: 1 },
+      startedAt: Date.now() - ago,
+      finishedAt: Date.now() - ago,
+    });
+  }
 }
 
 describe("pipeline health — orphaned connector integrations (data-mechanics)", () => {
@@ -96,14 +108,19 @@ describe("pipeline health — orphaned connector integrations (data-mechanics)",
 
   it("never suppresses a non-connector leg (dense) — it isn't integration-scoped", async () => {
     const { teamId } = await seedTeam();
-    await recordIngestRun(db(), {
-      teamId,
-      source: "dense",
-      trigger: "scheduler",
-      ok: false,
-      errors: ["embedding backend down"],
-      startedAt: Date.now() - 1000,
-    });
+    // Two failures for the same reason as `recordPlaneFailure`: one would be `unconfirmed` and absent
+    // from `failing`, so this test would fail for a reason that has nothing to do with suppression.
+    for (const ago of [2000, 1000]) {
+      await recordIngestRun(db(), {
+        teamId,
+        source: "dense",
+        trigger: "scheduler",
+        ok: false,
+        errors: ["embedding backend down"],
+        startedAt: Date.now() - ago,
+        finishedAt: Date.now() - ago,
+      });
+    }
 
     const health = await getPipelineHealth(teamId);
     expect(health.failing.some((l) => l.source === "dense")).toBe(true);

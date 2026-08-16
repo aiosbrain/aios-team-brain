@@ -5,12 +5,11 @@ import { graphitiConfigured, GraphitiClient } from "@/lib/graph/graphiti-client"
 import { getLlmHealth, type LlmHealth } from "@/lib/query/llm-health";
 import { resolveGraphChatTarget, resolveGraphEmbeddingTarget, isRefusal } from "@/lib/llm/graph-proxy";
 import {
-  countGraphFacts,
-  deriveGraphExtractionStalled,
+  extractionStallShortText,
   groupCensuses,
-  newestEpisodeAtMs,
-  newestFactAtMs,
+  readExtractionSignals,
   type CensusRefusal,
+  type ExtractionStallCause,
   type GroupCensus,
 } from "@/lib/graph/extraction-health";
 import { resolveEmbeddingBackend } from "@/lib/query/embedding-key";
@@ -49,10 +48,49 @@ export interface RetrievalHealth {
   keyword: LegState; // always "on"
   dense: DenseHealth;
   graph: GraphState;
-  graphEpisodes: number | null; // projected episodes for this team (null when graph off/unreadable)
+  /** Distinct ITEMS this team actually PUSHED to Graphiti (sentinel rows — tombstones, tier-vacates and
+   *  unlanded reservations — excluded), null when the graph is off/unreadable. It is the SAME number the
+   *  stall reason quotes, and it now comes from the same producer, after review found the card rendering
+   *  an unfiltered total ("125 episodes") beside a reason string saying "25 episodes were projected":
+   *  one number shown, a different one reasoned about. Renamed from `graphEpisodes` (STALLSCOPE-1): it
+   *  has counted distinct items since PCCC-3, and one item is one-or-more chunk episodes. */
+  graphItems: number | null;
   graphLastProjectedAt: string | null; // most recent successful projection (null = never)
   graphStalled: boolean; // degraded specifically because the projector stopped writing (vs unreachable)
-  graphExtractionStalled: boolean; // episodes are reaching Graphiti (202) but its extractor makes no facts
+  graphExtractionStalled: boolean; // episodes are reaching Graphiti (202) but no job is completing
+  /**
+   * WHICH stall — `never-extracted` (0 facts, ever) or `stopped` (jobs stopped completing). Null when
+   * not stalled. The card MUST branch on this rather than composing its own copy: before STALLPROBE-1
+   * both causes were the same sentence, and after it "extracting 0 facts" is true of only one of them.
+   */
+  graphExtractionCause: ExtractionStallCause | null;
+  /** The server-composed operator sentence for that stall — single writer, shared verbatim with the
+   *  pipeline banner via `lib/graph/extraction-health.extractionStallReason`. */
+  graphExtractionReason: string | null;
+  /** The server-composed SHORT leg text for that stall (the card appends its own freshness suffix).
+   *  Server-side for the same reason as the reason string: the card used to compose it and hard-coded
+   *  one cause's wording for both. Null when not stalled. */
+  graphExtractionShortText: string | null;
+  /**
+   * A TRUE but NON-LOUD statement: this team has no completed extraction, and the graph worker is
+   * provably completing other groups' work, so the likeliest cause is queue depth (STALLSCOPE-1 §2e).
+   * Rendered as a note on this card and NOWHERE else — in particular it never reaches the pipeline
+   * banner, whose sentence ("the brain isn't getting fresh data") would be false for it. Null unless
+   * that state holds; a suppression nothing renders is how the census alarm sat silently dead.
+   */
+  graphExtractionNote: string | null;
+  /** Hours between the newest pushed episode and the newest COMPLETED job. Passed to the card so its
+   *  short leg text can quote the MEASURED lag instead of hard-coding the budget constant, which
+   *  would drift silently if `EXTRACTION_LAG_BUDGET_MS` moved (and importing that constant into a
+   *  component would drag a `server-only` module across the boundary). Null when either end is
+   *  unknown. */
+  graphExtractionLagHours: number | null;
+  /** Newest extracted RELATES_TO fact (ISO), OBSERVATIONAL ONLY since STALLPROBE-1: it no longer
+   *  accuses, because on a mature graph most extracted edges deduplicate and create no new fact, so a
+   *  frozen fact clock is the normal state of a healthy extractor. Shown because it is still the
+   *  answer to "is the graph learning anything NEW?", which is a real question — just not the same
+   *  question as "is the extractor alive?". Null when the graph is off/unreadable or has no facts. */
+  graphNewestFactAt: string | null;
   /** Extraction runs, but a group's same-name entity-split rate is over its own baseline — the
    *  name-collision census (AIO-693 re-armed by ALARMFIX-1). Never true while the alarm is unarmed
    *  (`CENSUS_ALARM_ARMED`), but the per-group numbers below show either way. */
@@ -190,10 +228,11 @@ export async function getRetrievalHealth(teamId: string): Promise<RetrievalHealt
   const [
     dense,
     graphReachable,
-    graphFresh,
-    graphFacts,
-    graphNewestFactAt,
-    graphNewestEpisodeAt,
+    // ONE producer, shared with the pipeline banner (STALLSCOPE-1 §2g). This card used to assemble the
+    // same six reads itself, which is how it missed the liveness signal entirely when that shipped —
+    // and how its item count and the predicate's diverged again under PCCC-3. There is now one
+    // assembler, so the two surfaces cannot describe different populations.
+    graphExtraction,
     graphGroupCensuses,
     graphProxyRefusal,
     llm,
@@ -201,10 +240,7 @@ export async function getRetrievalHealth(teamId: string): Promise<RetrievalHealt
     await Promise.all([
     denseHealth(teamId, configured),
     graphConfiguredNow ? new GraphitiClient().healthcheck() : Promise.resolve(false),
-    graphConfiguredNow ? graphFreshness(teamId) : Promise.resolve({ episodes: null, lastProjectedAt: null }),
-    graphConfiguredNow ? countGraphFacts() : Promise.resolve(null),
-    graphConfiguredNow ? newestFactAtMs() : Promise.resolve(null),
-    graphConfiguredNow ? newestEpisodeAtMs(teamId) : Promise.resolve(null),
+    graphConfiguredNow ? readExtractionSignals(teamId) : Promise.resolve(null),
     graphConfiguredNow ? groupCensuses(teamId) : Promise.resolve([] as GroupCensus[]),
     // Config-only resolution: no upstream call, nothing spent. Best-effort — a broken probe must
     // never fail the admin page.
@@ -220,7 +256,11 @@ export async function getRetrievalHealth(teamId: string): Promise<RetrievalHealt
       : Promise.resolve(null),
     getLlmHealth(teamId),
   ]);
-  const lastProjectedAtMs = graphFresh.lastProjectedAt ? Date.parse(graphFresh.lastProjectedAt) : null;
+  // From the SAME ledger pass as the items/groups/timestamps the verdict rests on. It used to be its
+  // own `graphFreshness` query on this file's side — the second assembler PCCC-3 then changed on one
+  // side only. Different SENTINEL treatment from `newestPushAtMs`, deliberately (see `LedgerRead`).
+  const lastProjectedAt = graphExtraction?.lastProjectedAt ?? null;
+  const lastProjectedAtMs = lastProjectedAt ? Date.parse(lastProjectedAt) : null;
   const nowMs = Date.now();
   // Reachable + writing, but projected episodes aren't becoming facts (Graphiti's extractor is failing
   // on every job). Only meaningful when reachable — an unreachable service reports facts=null.
@@ -231,20 +271,28 @@ export async function getRetrievalHealth(teamId: string): Promise<RetrievalHealt
   //
   // Since GRAPHCOST-1, `projected_at` advances only on a pass that actually POSTed episodes: a
   // re-projection whose chunks were all unchanged (an edit past the extraction cap) writes the ledger
-  // and deliberately leaves the timestamp alone, because bumping it would make `newestEpisodeAtMs`
+  // and deliberately leaves the timestamp alone, because bumping it would make the ledger's `newestPushAtMs`
   // above report a push that never happened and cry wolf on the extraction-lag probe. The tradeoff is
   // here: `isGraphStale` reads "the projector is alive" from pushes, so a ≥6h window whose ONLY
   // projection activity was such passes reads as quiet. That is a widening of a false-positive the
   // unchanged-content skip already had (it never bumped either), and it errs toward the alarm that is
   // actionable — "nothing has been pushed in 6h" is true in that window.
-  const graphExtractionStalled =
-    graphReachable &&
-    deriveGraphExtractionStalled({
-      episodes: graphFresh.episodes,
-      facts: graphFacts,
-      newestEpisodeAtMs: graphNewestEpisodeAt,
-      newestFactAtMs: graphNewestFactAt,
-    });
+  //
+  // The verdict, the cause and the sentence all arrive from the ONE producer — this surface no longer
+  // composes any of them. `graphReachable` still gates it: an unreachable service is a different leg's
+  // report, and its reads answer nothing anyway.
+  const graphExtractionStalled = graphReachable && (graphExtraction?.verdict.stalled ?? false);
+  const graphExtractionCause = graphExtractionStalled ? (graphExtraction?.verdict.cause ?? null) : null;
+  const graphExtractionLagHours = graphExtraction?.lagHours ?? null;
+  const graphExtractionReason = graphExtractionStalled ? (graphExtraction?.reason ?? null) : null;
+  const graphExtractionShortText =
+    graphExtractionStalled && graphExtractionCause !== null
+      ? extractionStallShortText(graphExtractionCause, { lagHours: graphExtraction?.lagHours ?? null })
+      : null;
+  // The suppressed-but-true state (STALLSCOPE-1 §2e): no completed extraction for this team, but the
+  // worker is provably completing other groups' work, so this is queue depth rather than a failure. It
+  // renders as a note on this card and reaches no banner.
+  const graphExtractionNote = graphReachable ? (graphExtraction?.note ?? null) : null;
   // The OTHER extraction failure: episodes become facts, but the facts are confidently wrong —
   // same-name entity splits accumulating from a model/embedding stack resolving identity badly
   // (AIO-693, the 2026-07-30 incident; census signal since ALARMFIX-1). Same detector as the
@@ -281,35 +329,28 @@ export async function getRetrievalHealth(teamId: string): Promise<RetrievalHealt
     keyword: "on",
     dense,
     graph,
-    graphEpisodes: graphFresh.episodes,
-    graphLastProjectedAt: graphFresh.lastProjectedAt,
+    graphItems: graphExtraction?.signals.items ?? null,
+    graphLastProjectedAt: lastProjectedAt,
     graphStalled,
     graphExtractionStalled,
+    graphExtractionCause,
+    graphExtractionReason,
+    graphExtractionShortText,
+    graphExtractionNote,
+    graphExtractionLagHours,
+    graphNewestFactAt:
+      graphExtraction?.newestFactAtMs == null
+        ? null
+        : new Date(graphExtraction.newestFactAtMs).toISOString(),
     graphCensusPolluted,
     graphCensus,
     graphProxyRefusal,
-    graphFacts,
+    graphFacts: graphExtraction?.signals.facts ?? null,
     rerank,
     augment,
     llm,
     emailDeliverable,
   };
-}
-
-/** Projection freshness from the `graph_episodes` ledger (Postgres, no Graphiti round-trip): how many
- *  episodes this team has projected and when the projector last succeeded. Drives the "reachable but
- *  stalled" degraded state. Best-effort — nulls on any error so the card still renders. */
-async function graphFreshness(teamId: string): Promise<{ episodes: number | null; lastProjectedAt: string | null }> {
-  try {
-    const res = await runSql<{ n: string; mx: string | null }>(
-      "select count(*)::int as n, max(projected_at) as mx from graph_episodes where team_id = $1",
-      [teamId]
-    );
-    const row = res.rows[0];
-    return { episodes: row ? Number(row.n) : 0, lastProjectedAt: row?.mx ?? null };
-  } catch {
-    return { episodes: null, lastProjectedAt: null };
-  }
 }
 
 async function denseHealth(teamId: string, configured: boolean): Promise<DenseHealth> {

@@ -32,7 +32,34 @@ const LLM_MODEL = process.env.LLM_MODEL;
  * work. Override with LLM_REASONING_HEADROOM_TOKENS. (The Anthropic path uses a separate thinking
  * budget and isn't affected.)
  */
-const REASONING_HEADROOM_TOKENS = Number(process.env.LLM_REASONING_HEADROOM_TOKENS ?? 6000);
+/** A garbage env value must not become `NaN`: `maxTokens + NaN` serializes to `max_tokens: null`, which
+ *  the provider reads as "no limit" — the opposite of a budget. Fall back to the default instead. */
+const envTokens = (raw: string | undefined, fallback: number): number => {
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
+};
+
+const REASONING_HEADROOM_TOKENS = envTokens(process.env.LLM_REASONING_HEADROOM_TOKENS, 6000);
+
+/**
+ * Headroom for a call that is ACTUALLY routed to a reasoning model (`role:"reasoning"` with a distinct
+ * `teams.reasoning_model` set). The flat 6000 above is sized for "some model here might reason"; this is
+ * sized for "this model definitely will, over a large input".
+ *
+ * MEASURED, not guessed (ARCHEAD-1). Arc synthesis asks for 4096, so the old ceiling was 10,096 for
+ * reasoning + answer together. Across 19 prod runs on `qwen/qwen3.7-plus`: successful runs generated
+ * 3,892–9,870 output tokens, and ALL THREE failures sat at 10,096/10,098 — every failure is the cap, and
+ * the best success cleared it by 226 tokens. 30% of arc runs died there, each billing ~1.5¢ for a blank.
+ *
+ * Deliberately NOT a bump to the global default: that would lift `max_tokens` on every OpenRouter call,
+ * including the small-model paths whose ceiling then trips the token-limit retry below on every request.
+ * Billing is per token GENERATED, so a bigger cap adds no PER-TOKEN cost to runs that already fit — it
+ * only lets the runs that were being thrown away finish. Not literally free, though: OpenRouter filters
+ * candidate providers by whether they can serve the requested `max_tokens` and pre-authorizes against
+ * the worst case, so a larger ask can route to a different (pricier or slower) provider, or be refused
+ * outright on a low-credit account. The ladder below is what keeps that refusal from becoming a blank.
+ */
+const REASONING_ROLE_HEADROOM_TOKENS = envTokens(process.env.LLM_REASONING_ROLE_HEADROOM_TOKENS, 16000);
 
 export interface CompleteArgs {
   system: string;
@@ -59,7 +86,7 @@ export interface CompleteOptions {
    * transport / auth) instead of the failure being an invisible `null`. Opt-in per caller (needs a
    * db + teamId), so high-frequency incidental calls (e.g. chat titles) don't flood the ledger.
    */
-  record?: { db: DbClient; teamId: string; task: string };
+  record?: LlmRecord;
   /**
    * Meter this call's token spend into the `llm_usage` ledger (the brain-spend meter that feeds the
    * Pulse Spend KPI + the costs breakdown page). Opt-in per caller (needs a db + teamId). `source` is
@@ -70,12 +97,184 @@ export interface CompleteOptions {
   meter?: { db: DbClient; teamId: string; source: LlmUsageSource; memberId?: string | null };
 }
 
-/** Best-effort durable record of one LLM outcome — never throws (observability can't break the call). */
-async function recordLlmOutcome(
+/**
+ * A PASS — one `ingest_runs` row covering N calls (LLMOBS-2).
+ *
+ * WHY IT EXISTS. `recordLlmOutcome` writes one row per call, and `attachPersonDaySummaries` calls the
+ * model once per (person, day) on every rebuild: 39.5 calls/day measured over 14d (21.3/day over 60d), against a whole-table rate
+ * of 333.7 rows/day and a 50-row Recent-runs panel. Wiring a per-call `record:` there would bury
+ * connector evidence within a day and a half, which is why LLMOBS-1 deferred it — leaving the leg's
+ * FOUNDING failure mode open for its highest-volume feature: a model failing every timeline summary
+ * reads `healthy`, because `completeTextOrNull` swallows the failure and nothing records it.
+ *
+ * BRANDED — and the brand's job is narrower than an earlier version of this comment claimed. It makes
+ * the union DISCRIMINATED for narrowing, so `isPass` keys on something a caller cannot produce by
+ * accident. It does NOT prevent the flood: `LlmPass` carries `db`/`teamId`/`task`, so it remains
+ * structurally assignable to the per-call member, and deleting the `isPass` early-return below still
+ * compiles. Review corrected the overstatement. The actual pin against that mutation is the runtime
+ * integration test ("a PASS accumulates and writes nothing per call"), not the type system.
+ */
+const PASS_BRAND: unique symbol = Symbol("llm-pass");
+
+export interface LlmPass {
+  readonly [PASS_BRAND]: true;
+  readonly db: DbClient;
+  readonly teamId: string;
+  readonly task: string;
+  /** Mutable counters. Shared across `CONCURRENCY = 6` in-flight calls at the timeline site, which is
+   *  safe ONLY because these increments are synchronous — there is no `await` between read and write.
+   *  Stated because this repo's immutability rule pushes a reader the other way, so a future refactor
+   *  that introduces an await here knows what it is breaking. */
+  calls: number;
+  failures: number;
+  /** The real wall-clock start, so the row's `duration_ms` reflects the pass rather than 0. */
+  readonly startedAt: number;
+  /** The backend model, captured from the first call. Stable within a pass (`selectLlmBackend` is
+   *  deterministic per keys/role), and REQUIRED by the health card: `deriveTaskHealth` reads
+   *  `meta.model` and `degradedNote` names it. A row without it drops the model name and the
+   *  reasoning-starvation hint from the operator copy — the wrong-picker misattribution LLMOBS-1
+   *  existed to remove, which review caught this slice reinstating. */
+  model: string | null;
+  /** The FIRST failure's message. `meta.failures` says how many more there were. */
+  firstError: string | null;
+  done: boolean;
+}
+
+export type LlmRecord = { db: DbClient; teamId: string; task: string } | LlmPass;
+
+function isPass(record: LlmRecord): record is LlmPass {
+  // `in` throws a TypeError on a truthy PRIMITIVE, and this function sits behind a "never throws"
+  // contract — a JS or `any` caller passing `record: "x"` would otherwise let observability break the
+  // generation it is observing. Review found the contract overpromised.
+  if (typeof record !== "object" || record === null) return false;
+  // Narrow on the BRAND, not on duck-typed fields. Checking `calls`/`done` would send a token down
+  // the per-call branch the moment either is renamed — silently restoring the flood. The symbol is a
+  // real runtime value (a `declare const` would be type-only and `[PASS_BRAND]` would be `undefined`,
+  // which is how the first attempt failed) and cannot be produced accidentally by a caller.
+  return PASS_BRAND in record;
+}
+
+/**
+ * Run `body` with a pass, and write its single row when it settles — including on a throw.
+ *
+ * SCOPED rather than open/close, deliberately. The first design was `beginLlmPass()` + `finish()` in a
+ * `finally`, policed by a source-text guard. Review showed that guard cannot work: it passes
+ * `const p = begin(); if (skip) return; try {…} finally { p.finish(); }`, which leaks on the early
+ * return with the regex fully satisfied, and it fails a legitimate open-in-A/finish-in-B split. Text
+ * cannot check control flow. This shape deletes the leak class instead of policing it — the caller
+ * never holds an open pass, and the `finally` lives once, here.
+ */
+export async function withLlmPass<T>(
+  init: { db: DbClient; teamId: string; task: string },
+  body: (pass: LlmPass) => Promise<T>
+): Promise<T> {
+  const pass = {
+    [PASS_BRAND]: true,
+    db: init.db,
+    teamId: init.teamId,
+    task: init.task,
+    calls: 0,
+    failures: 0,
+    startedAt: Date.now(),
+    model: null,
+    firstError: null,
+    done: false,
+  } as unknown as LlmPass;
+  try {
+    return await body(pass);
+  } catch (err) {
+    // A throw BEFORE the first call would otherwise be indistinguishable from a quiet pass — both hit
+    // `calls === 0 && failures === 0` and write nothing, leaving `llm` (which has no staleness clock)
+    // silent forever. That is the exact class §2c calls "evidence, not absence", and the first version
+    // covered only the one branch that marks itself explicitly. Review found the rest.
+    if (pass.calls === 0) {
+      failLlmPassBeforeFirstCall(pass, err instanceof Error ? err.message : "the pass threw before its first call");
+    }
+    throw err;
+  } finally {
+    await finishLlmPass(pass);
+  }
+}
+
+/**
+ * Write the pass row. Idempotent — `done` guards it.
+ *
+ * Idempotence is NOT for "a finally after an early return", which review pointed out runs exactly
+ * once; it is for a caller who adds a defensive explicit finish alongside the one this helper already
+ * guarantees. Two rows for one pass would be two streak entries for one event.
+ *
+ * QUIET vs FAILED-BEFORE-THE-FIRST-CALL, a distinction the first draft collapsed. A pass with zero
+ * calls and nothing to do writes NO row: `ok: true` would claim a model that was never asked, and
+ * `ok: false` would accuse on no evidence. But a pass that FAILED before it could call anything —
+ * `attachPersonDaySummaries` returns `degraded: true` with zero calls when `resolveAnsweringKeys`
+ * throws, which the code itself calls "a failure, not a configuration choice" — is evidence, and it
+ * records `ok: false` with `calls: 0`. Without that it was silent FOREVER: `llm` has no staleness
+ * clock, is not a pipeline leg, and ages to `unknown` after `TASK_RECENCY_MS`.
+ */
+export async function finishLlmPass(pass: LlmPass): Promise<void> {
+  if (pass.done) return;
+  pass.done = true;
+  // Nothing attempted and nothing failed ⇒ nothing to say.
+  if (pass.calls === 0 && pass.failures === 0) return;
+  // `ok` is "not every call failed" — see docs/design/llm-pass-recording.md §2b for why this is not a
+  // threshold, and for the honest bound (one success in forty clears a pass).
+  const ok = pass.calls > pass.failures;
+  await recordIngestRun(pass.db, {
+    teamId: pass.teamId,
+    source: "llm",
+    trigger: "api",
+    ok,
+    // `errors` must stay EMPTY on an ok pass: `recordIngestRun` forces `ok: run.ok && !errors.length`,
+    // so putting the error there would silently flip a mostly-successful pass to failed.
+    errors: ok ? [] : [pass.firstError ?? "every call in the pass failed"],
+    meta: {
+      task: pass.task,
+      // `null`, not `""` — an empty string is a value that survives `??` downstream and would hand the
+      // card `lastModel: ""` where every other path yields a name or null (review).
+      model: pass.model,
+      calls: pass.calls,
+      failures: pass.failures,
+      // UNCONDITIONALLY, including on an ok pass. Otherwise a 39-of-40-failures pass records its
+      // counts and drops the error text entirely — nowhere in `errors` (see above) and nowhere in
+      // meta — for what the timeline site itself calls "the common outcome of a flaky or rate-limited
+      // provider". The counts say how many; this says what happened.
+      firstError: pass.firstError,
+    },
+    startedAt: pass.startedAt,
+  });
+}
+
+/** Mark a pass as failed before it made any call — see `finishLlmPass`. */
+export function failLlmPassBeforeFirstCall(pass: LlmPass, error: string): void {
+  pass.failures += 1;
+  pass.firstError = pass.firstError ?? error;
+}
+
+/**
+ * Best-effort durable record of one LLM outcome — never throws (observability can't break the call).
+ *
+ * EXPORTED for tests, deliberately. This is where a per-call record and a pass diverge, and a
+ * mutation that made the pass branch unreachable — restoring the per-call flood — survived a suite
+ * that drove the pass counters through a hand-written helper instead of through here. A simulation of
+ * the integration is not the integration.
+ */
+export async function recordLlmOutcome(
   record: CompleteOptions["record"],
   outcome: { ok: boolean; model: string; error?: string; startedAt: number }
 ): Promise<void> {
   if (!record) return;
+  // NARROW ON THE BRAND FIRST. A pass accumulates into ONE row written at the end; taking the
+  // per-call branch here is exactly the flood this slice removes, and it would be invisible — the
+  // coverage guard matches `record: pass` just as happily.
+  if (isPass(record)) {
+    record.calls += 1;
+    record.model = record.model ?? outcome.model;
+    if (!outcome.ok) {
+      record.failures += 1;
+      record.firstError = record.firstError ?? outcome.error ?? "llm failed";
+    }
+    return;
+  }
   await recordIngestRun(record.db, {
     teamId: record.teamId,
     source: "llm",
@@ -170,17 +369,29 @@ export async function completeText(args: CompleteArgs, opts: CompleteOptions = {
       // starve the answer to empty). If the headroom pushes max_tokens past a SMALL model's ceiling
       // (400), retry once with just the answer budget — mirrors the streaming path (lib/query/claude);
       // without this, every non-streaming task 400s on a small local backend while Query still works.
-      let res = await doPost(maxTokens + REASONING_HEADROOM_TOKENS);
+      // A LADDER, not a cliff. On a token-limit refusal we step DOWN one rung at a time instead of
+      // dropping straight to the bare answer budget. That mattered the moment the reasoning rung got
+      // bigger: a provider whose output ceiling sits between the two rungs would refuse the top ask and
+      // land the retry on `maxTokens` alone — 4096 for arcs, combined with reasoning still ON, which is
+      // BELOW the 3,892 minimum a successful run has ever needed. The old 30%-of-runs failure would have
+      // become ~100%. Verified once against prod that `qwen/qwen3.7-plus` accepts the top rung (HTTP 200,
+      // finish=stop), so this is insurance for the next model rather than a live bug — but it is the
+      // difference between degrading and falling over.
+      const rungs = [...new Set([
+        maxTokens + (reasoningActive(opts.role, keys) ? REASONING_ROLE_HEADROOM_TOKENS : REASONING_HEADROOM_TOKENS),
+        maxTokens + REASONING_HEADROOM_TOKENS, // the budget prod ran on for months — known-accepted
+        maxTokens,
+      ])].sort((a, b) => b - a);
+      let res = await doPost(rungs[0]);
+      for (let i = 1; i < rungs.length && !res.ok; i++) {
+        const errBody = await res.text().catch(() => "");
+        // Only a TOKEN-LIMIT refusal is worth retrying smaller; anything else is a real error and must
+        // surface immediately rather than being re-sent two more times.
+        if (!looksLikeTokenLimit(res.status, errBody)) throw httpError(backend, res.status, errBody);
+        res = await doPost(rungs[i]);
+      }
       if (!res.ok) {
-        const firstErrBody = await res.text().catch(() => "");
-        if (looksLikeTokenLimit(res.status, firstErrBody)) {
-          res = await doPost(maxTokens);
-          if (!res.ok) {
-            throw httpError(backend, res.status, await res.text().catch(() => ""));
-          }
-        } else {
-          throw httpError(backend, res.status, firstErrBody);
-        }
+        throw httpError(backend, res.status, await res.text().catch(() => ""));
       }
       const j = (await res.json()) as {
         choices?: { message?: { content?: string }; finish_reason?: string }[];
@@ -293,7 +504,9 @@ export async function completeText(args: CompleteArgs, opts: CompleteOptions = {
     });
     // File the billed-but-unmeterable attempt so the Costs page can name which feature lost the money.
     // ONE row per logical call here, unlike the graph proxy where each SDK retry is its own request —
-    // this function's only retry is the token-limit re-ask, so a two-attempt call under-counts by one.
+    // this function's only retries are the token-limit LADDER's re-asks (up to two step-downs), so a
+    // laddered call under-counts by however many rungs were refused. Those refusals are pre-generation
+    // 400s that billed nothing, so the money under-count is ~zero — it is the ATTEMPT count that is low.
     // Stated rather than fixed: over-counting a spend gap is worse than under-counting it.
     // A failure that never reached a provider spent nothing, so it must not enter a ledger whose only
     // job is explaining money — the Anthropic SDK throws at CONSTRUCTION when no key resolves, and a

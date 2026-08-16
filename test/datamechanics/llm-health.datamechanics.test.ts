@@ -27,12 +27,46 @@ describe("LLM answering-model health (data-mechanics)", () => {
       startedAt: Date.now() - 100,
     });
 
+    // A SECOND failure, because since BANNERFLAP-1 one row is not an outage — it is `unstable`, and
+    // `degraded` (with the actionable note) requires the failure to repeat. The point of THIS test is
+    // the reasoning-model hint, not the threshold, so the fixture is raised to the level that still
+    // exercises it rather than the assertion being lowered to whatever the code now returns.
+    await recordIngestRun(db(), {
+      teamId: seed.teamId,
+      source: "llm",
+      trigger: "api",
+      ok: false,
+      errors: ["LLM returned empty content (model=qwen/qwen3.7-plus, finish_reason=length)"],
+      meta: { model: "qwen/qwen3.7-plus", task: "arcs" },
+      startedAt: Date.now() - 50,
+    });
+
     const h = await getLlmHealth(seed.teamId);
     expect(h.state).toBe("degraded");
     expect(h.lastModel).toBe("qwen/qwen3.7-plus");
     expect(h.lastFailedAt).not.toBeNull();
     expect(h.note).toContain("qwen/qwen3.7-plus");
     expect(h.note).toMatch(/reasoning model/i); // the actionable "pick a non-reasoning model" hint
+  });
+
+  it("a LONE failure is unstable, not degraded, and carries no alarming note (BANNERFLAP-1)", async () => {
+    // The control for the fixture change above: it proves the second row is what promotes the state,
+    // so the test above cannot pass merely because a failure was recorded at all.
+    const seed = await seedTeam();
+    await recordIngestRun(db(), {
+      teamId: seed.teamId,
+      source: "llm",
+      trigger: "api",
+      ok: false,
+      errors: ["LLM returned empty content (model=qwen/qwen3.7-plus, finish_reason=length)"],
+      meta: { model: "qwen/qwen3.7-plus", task: "arcs" },
+      startedAt: Date.now() - 100,
+    });
+
+    const h = await getLlmHealth(seed.teamId);
+    expect(h.state).toBe("unstable");
+    expect(h.lastError).toContain("empty content"); // recorded and visible
+    expect(h.note).toBeUndefined(); // but no red paragraph for a blip
   });
 
   it("reports healthy after a later successful run (recovery flips the state)", async () => {

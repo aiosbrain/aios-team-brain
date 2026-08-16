@@ -361,6 +361,10 @@ describe("churn: how many chunk hashes change under a real edit — CDC vs the b
   });
 
   for (const { name, edit, max } of scenarios) {
+    // `edit in place, same length` is covered by its own describe below (CDCCHURN-1): its churn is not
+    // a single number but a function of what the edit touches, and asserting a constant here is what
+    // made the acceptance table wrong in the first place.
+    if (name === "edit in place, same length") continue;
     it(`${name} — CDC re-extracts <= ${max} chunk(s)`, () => {
       const v2 = edit(DOC_50K);
       const cdcChurn = changedCount(chunkContent(DOC_50K), chunkContent(v2));
@@ -413,6 +417,15 @@ describe("churn: how many chunk hashes change under a real edit — CDC vs the b
         cdc.push(changedCount(chunkContent(t), chunkContent(v2)));
         leg.push(changedCount(legacy(t), legacy(v2)));
       }
+      // `edit in place, same length` is excluded from BOTH assertions here, not just the second one
+      // (CDCCHURN-1). The ceiling of 6 is fitted to this one fixed offset: swept across the same corpus,
+      // a boundary-disturbing 20-character in-place edit reaches **at least 9 of 80 admitted chunks**
+      // (`docs/ARCHITECTURE.md`@178,189), against a legacy churn of 1. And "never worse than byte offsets"
+      // is simply false for that scenario — byte offsets churn 1 by construction, since offsets do not
+      // move. Both claims now live in the describe below, conditioned on what the edit actually touches.
+      // The other scenarios still bind, and they are where CDC's win is real: the same corpus gives
+      // CDC 1 against legacy 80 for an insertion near the top.
+      if (name === "edit in place, same length") continue;
       cdc.sort((a, b) => a - b);
       const median = cdc[Math.floor(cdc.length / 2)];
       expect(median, `${name}: median CDC churn over real docs`).toBeLessThanOrEqual(2);
@@ -421,5 +434,283 @@ describe("churn: how many chunk hashes change under a real edit — CDC vs the b
         Math.max(...leg)
       );
     }
+  });
+});
+
+// ── CDCCHURN-1: what an in-place same-length edit actually costs ─────────────────────────────────
+
+/**
+ * The acceptance table promised an unconditional **1** for `edit in place, same length`, and one real
+ * document churns 4. This is the fourth characterisation of that gap; the first three were wrong, and
+ * each was cheap prose that would have shipped as documentation:
+ *
+ *   1. "the test over-asserts, the spec disclaims it" — the table REQUIRES 1;
+ *   2. "low-entropy repeated bullets propagate the realignment" — churn is indifferent to entropy;
+ *   3. "the edit OVERLAPS a boundary" — true of that document, not the rule: a cut is decided by the
+ *      ~32 code units ENDING at it, so an edit near a boundary destroys one it never touches, and
+ *      spliced text can create one (9,480 of 15,719 non-overlapping offsets churn > 1);
+ *   4. "churn is 1 whenever the boundary SEQUENCE is unchanged" — false in both directions: an edit
+ *      spanning a SURVIVING boundary changes both adjacent chunks (churn 2), and an edit past the
+ *      80-chunk admitted prefix changes nothing at all (churn 0).
+ *
+ * THE RULE, verified before it was written down — 5,743 unchanged-sequence samples swept across the
+ * corpus at 97-character steps, 5,743 agreements, zero mismatches, under both this file's set-based
+ * `changedCount` and a positional diff (they are provably equal in that bucket). Reproduce with
+ * `node scripts/cdc-churn-sweep.mjs`, which is committed because a prose recipe did NOT reproduce:
+ *
+ *   **churn = the number of ADMITTED chunk intervals the changed span intersects.**
+ *
+ * So exactly 1 needs two things together: the edit changes text, and it lies wholly inside one admitted
+ * chunk. (A third condition — "no boundary strictly inside the edit span" — was specified and then
+ * deleted as provably dead; see `classify`.) Anything else is reported, not gated — because when
+ * the boundary sequence does change there is NO usable ceiling: the same sweep observes **≥ 9 of 80**
+ * admitted chunks for a 20-character edit (`docs/ARCHITECTURE.md`@178,189) against a legacy churn of 1
+ * — already past the ceiling of 6 this file used to assert. "≥" is deliberate: the sweep steps 97
+ * characters, so a maximum from it is a lower bound, and two runs differing only in start offset gave
+ * 8 and 9.
+ *
+ * AND MIND THE METRIC. An earlier draft published 78 here. That is a POSITIONAL count — chunks that
+ * differ at the same index — and it is not a cost: `lib/graph/project.ts:1222-1223` filters by
+ * `new Set(chunk_shas)` MEMBERSHIP, so a chunk that merely shifts index is never re-pushed. The same
+ * state costs 2 under `changedCount`, the metric used throughout this file. The draft then explained
+ * the retraction as corpus drift, which review also falsified — the number reproduces on both
+ * revisions of that file. Two wrong stories about one number; the sweep script now reports both
+ * metrics so they cannot be confused again.
+ */
+describe("CDCCHURN-1: in-place same-length churn is the number of chunks the edit touches", () => {
+  const EDIT_AT = 20_000;
+  const EDIT_LEN = 20;
+  const inPlace = (t: string) => t.slice(0, EDIT_AT) + "X".repeat(EDIT_LEN) + t.slice(EDIT_AT + EDIT_LEN);
+  const changedCount = (before: string[], after: string[]): number => {
+    const seen = new Set(before);
+    return after.filter((c) => !seen.has(c)).length;
+  };
+
+  /** Admitted chunk intervals — CAPPED, because churn is measured on the capped chunking while
+   *  `cdcBoundaries` is not. That coordinate mismatch is exactly why a past-cap edit can change the
+   *  boundary sequence and still churn 0, so it is named here rather than left to be re-derived. */
+  const admittedIntervals = (t: string): [number, number][] => {
+    const out: [number, number][] = [];
+    let start = 0;
+    for (const c of chunkContent(t)) {
+      out.push([start, start + c.length]);
+      start += c.length;
+    }
+    return out;
+  };
+
+  /**
+   * What the rule predicts for a STRICT document, under the metric the product actually pays.
+   *
+   * The interval count is 1 by construction (that is what `strict` means). The subtraction is the
+   * corner a third reviewer constructed and this test now pins: `lib/graph/project.ts` filters by
+   * `new Set(chunk_shas)` MEMBERSHIP, so if the edited chunk's new content already exists elsewhere in
+   * the document, nothing is re-pushed and the cost is 0. Derived from the rule — never from the churn
+   * it is checking — so it cannot pass by restating the answer.
+   */
+  const expectedStrictChurn = (t: string, at = EDIT_AT, len = EDIT_LEN): number => {
+    const holding = admittedIntervals(t).find(([s, e]) => at >= s && at + len <= e);
+    if (holding === undefined) return 0; // not strict; the caller does not reach this
+    const editedChunk = (t.slice(0, at) + "X".repeat(len) + t.slice(at + len)).slice(holding[0], holding[1]);
+    return new Set(chunkContent(t)).has(editedChunk) ? 0 : 1;
+  };
+
+  type Bucket = "excluded" | "strict" | "reported";
+
+  /**
+   * Three independent facts, in the order that makes each one meaningful. `strict` is the only gated
+   * bucket; `reported` covers every way the rule's preconditions fail (boundary disturbed, edit spans a
+   * surviving boundary, edit past the admitted prefix), and `excluded` is the documents for which this
+   * "in-place edit" is really an append.
+   */
+  const classify = (t: string, at = EDIT_AT, len = EDIT_LEN): Bucket => {
+    if (t.length < at + len) return "excluded";
+    const edited = t.slice(0, at) + "X".repeat(len) + t.slice(at + len);
+    // The rule's first precondition, which all three documents stated and the classifier omitted
+    // (review): an edit that changes nothing churns 0, not 1. Latent today — no corpus document holds
+    // a 20-character X-run at the edit site — but the classifier should match the rule it implements.
+    if (edited === t) return "excluded";
+    const before = cdcBoundaries(t, CDC_PARAMS);
+    if (JSON.stringify(before) !== JSON.stringify(cdcBoundaries(edited, CDC_PARAMS))) return "reported";
+    // ONE term, not two — and the second time this deletion has been attempted: the first went into a
+    // commit message while a mutation revert quietly took the edit itself (found by review; the same
+    // "commit claims vs file state" scar this repo already carries). The deleted term was
+    // `before.some((b) => b > at && b < at + len)`, and it is provably dead: admitted intervals are
+    // delimited by consecutive `before` boundaries, so a boundary strictly inside the edit span cannot
+    // sit inside one interval — `holding` is already undefined there. A predicate term no test can
+    // redden is one the code asserts on trust, and with it present, deleting the `holding` check left
+    // every test green: the two conditions masked each other.
+    const holding = admittedIntervals(t).find(([s, e]) => at >= s && at + len <= e);
+    return holding === undefined ? "reported" : "strict"; // spans two chunks, or lies past the cap
+  };
+
+  it("STRICT FIXTURE: an edit far from every boundary churns exactly 1", () => {
+    // Checked in rather than relying on the live corpus, because the live strict assertion below
+    // quantifies over a bucket a broken classifier could empty — and an assertion over an empty set is
+    // green. This fixture makes the strict branch impossible to lose.
+    const t = doc(50_000, 7);
+    const intervals = admittedIntervals(t);
+    const widest = intervals.reduce((a, b) => (b[1] - b[0] > a[1] - a[0] ? b : a));
+    const at = Math.floor((widest[0] + widest[1]) / 2) - EDIT_LEN / 2;
+    expect(classify(t, at), "the fixture must land in the strict bucket").toBe("strict");
+    const edited = t.slice(0, at) + "X".repeat(EDIT_LEN) + t.slice(at + EDIT_LEN);
+    expect(changedCount(chunkContent(t), chunkContent(edited))).toBe(1);
+  });
+
+  it("CHANGED FIXTURE: an edit centred on a boundary destroys it — asserted, not assumed", () => {
+    // Centring is NOT a guarantee of destruction: the mask can re-fire on the spliced content, and a
+    // reviewer constructed exactly that. Without these assertions the branch could go silently dead
+    // while the test stayed green, which is the failure this whole ticket is about.
+    const t = doc(50_000, 11);
+    const before = cdcBoundaries(t, CDC_PARAMS);
+    const target = before.find((b) => b > 5_000 && b < t.length - 5_000);
+    expect(target, "the fixture has no interior boundary to target").toBeDefined();
+    const at = target! - EDIT_LEN / 2;
+    const edited = t.slice(0, at) + "X".repeat(EDIT_LEN) + t.slice(at + EDIT_LEN);
+    const after = cdcBoundaries(edited, CDC_PARAMS);
+    expect(before).toContain(target!); // it was there…
+    expect(after).not.toContain(target!); // …and the edit really destroyed it
+    expect(JSON.stringify(after)).not.toBe(JSON.stringify(before));
+    expect(classify(t, at)).toBe("reported");
+    // A DIRECTION, never a magnitude: the corpus already reaches ≥9 of 80, so any ceiling here would be
+    // a property of this fixture rather than of the chunker.
+    expect(changedCount(chunkContent(t), chunkContent(edited))).toBeGreaterThanOrEqual(2);
+  });
+
+  it("SHORT FIXTURE: a document under the edit span is excluded, not silently measured as an append", () => {
+    // The scenario has been applying `slice(0,20000) + X*20 + slice(20020)` to documents shorter than
+    // 20,020 characters, where it is a 20-char APPEND — 10 of the 25 live documents today. Two
+    // operations under one name is how the ceiling absorbed a number nobody attributed. The fixture is
+    // checked in so the excluded bucket is non-empty regardless of what the corpus holds; pinning the
+    // LIVE excluded count would re-create the corpus dependence this ticket exists to remove
+    // (`docs/design/graph-extraction-cap.md` is ~56 characters from leaving that set).
+    expect(classify(doc(16_000, 5))).toBe("excluded");
+    expect(classify(doc(EDIT_AT + EDIT_LEN - 1, 5))).toBe("excluded"); // one short of eligible
+    expect(classify(doc(EDIT_AT + EDIT_LEN, 5))).not.toBe("excluded"); // exactly eligible
+  });
+
+  it("SPANNING FIXTURE: an unchanged sequence is NOT enough — the edit must sit inside one chunk", () => {
+    // MUTATION-FOUND GAP. Deleting the interior-boundary condition — i.e. restoring draft 2's false
+    // rule, "unchanged sequence ⇒ churn 1" — left every test green, because on today's corpus the
+    // sequence check catches the one document that would expose it first. Two conditions masking each
+    // other is defense-in-depth hiding a mutation, so each now has a fixture that isolates it.
+    //
+    // Here the boundary at 8,543 SURVIVES the edit (the sequence is identical) but the edit spans it,
+    // so both adjacent chunks change: churn 2, not 1.
+    const t = doc(50_000, 3);
+    const at = 8_528;
+    const boundary = 8_543;
+    const before = cdcBoundaries(t, CDC_PARAMS);
+    const edited = t.slice(0, at) + "X".repeat(EDIT_LEN) + t.slice(at + EDIT_LEN);
+    expect(before).toContain(boundary);
+    expect(cdcBoundaries(edited, CDC_PARAMS)).toEqual(before); // sequence UNCHANGED…
+    expect(at).toBeLessThan(boundary);
+    expect(at + EDIT_LEN).toBeGreaterThan(boundary); // …but the edit spans the surviving boundary
+    expect(classify(t, at)).toBe("reported");
+    expect(changedCount(chunkContent(t), chunkContent(edited))).toBe(2);
+  });
+
+  it("WINDOW FIXTURE: fitting inside one chunk is NOT enough — the sequence must also survive", () => {
+    // The mirror mutation: deleting the boundary-sequence comparison also left everything green, for the
+    // same masking reason. Here the edit sits wholly inside one original chunk and still changes the
+    // sequence, because a cut is decided by the ~32 code units ENDING at it — so an edit 25 characters
+    // short of the boundary at 4,374 destroys it without touching it. This is mechanism (3) from the
+    // header, the one that killed draft 1's overlap rule.
+    const t = doc(50_000, 1);
+    const at = 4_349;
+    const boundary = 4_374;
+    const before = cdcBoundaries(t, CDC_PARAMS);
+    const edited = t.slice(0, at) + "X".repeat(EDIT_LEN) + t.slice(at + EDIT_LEN);
+    expect(before).toContain(boundary);
+    expect(at + EDIT_LEN).toBeLessThan(boundary); // the edit does NOT overlap the boundary…
+    expect(cdcBoundaries(edited, CDC_PARAMS)).not.toEqual(before); // …and destroys it anyway
+    expect(cdcBoundaries(edited, CDC_PARAMS)).not.toContain(boundary); // that boundary specifically
+    expect(admittedIntervals(t).some(([lo, hi]) => at >= lo && at + EDIT_LEN <= hi)).toBe(true);
+    expect(classify(t, at)).toBe("reported");
+  });
+
+  it("NO-OP FIXTURE: an edit that changes nothing is excluded, not counted as a churn-1 edit", () => {
+    // MUTATION-FOUND (review): the `edited === t` term had no fixture, so deleting it left every test
+    // green — the same "a predicate term no test can redden is asserted on trust" rule this file
+    // invokes twice elsewhere. Without the term this document classifies STRICT and churns 0, so the
+    // live assertion's `toBe(1)` would fail on it.
+    const base = doc(50_000, 9);
+    const t = base.slice(0, EDIT_AT) + "X".repeat(EDIT_LEN) + base.slice(EDIT_AT + EDIT_LEN);
+    expect(inPlace(t)).toBe(t); // the edit is a no-op on this document
+    expect(classify(t)).toBe("excluded");
+    expect(changedCount(chunkContent(t), chunkContent(inPlace(t)))).toBe(0);
+  });
+
+  it("DUPLICATE FIXTURE: a touched chunk that coincides with an existing one costs NOTHING", () => {
+    // Constructed by the third reviewer (Codex) and reproduced here: a document built from a repeated
+    // block, with the post-edit content of the edited chunk planted in an earlier copy. The edit
+    // changes text, the boundary sequence is unchanged and the span sits inside one admitted chunk —
+    // every precondition of "strict" — yet SET churn is 0, because the edited chunk is byte-identical
+    // to one already in the ledger and `lib/graph/project.ts:1222` filters by set membership.
+    //
+    // The other two reviewers judged this unconstructible from real markdown, and they were right that
+    // it needs contrived content — but the RULE is a general claim, and a general claim with a
+    // counterexample is what this whole ticket is about.
+    const block = doc(10_000, 21);
+    const t0 = block.repeat(5);
+    const holding = admittedIntervals(t0).find(([s, e]) => EDIT_AT >= s && EDIT_AT + EDIT_LEN <= e)!;
+    const editedChunk =
+      t0.slice(holding[0], EDIT_AT) + "X".repeat(EDIT_LEN) + t0.slice(EDIT_AT + EDIT_LEN, holding[1]);
+    const twinAt = holding[0] - block.length;
+    const t = t0.slice(0, twinAt) + editedChunk + t0.slice(twinAt + (holding[1] - holding[0]));
+
+    expect(classify(t)).toBe("strict"); // every precondition of the strict bucket holds…
+    expect(changedCount(chunkContent(t), chunkContent(inPlace(t)))).toBe(0); // …and the cost is 0
+    // Positional churn is still 1 — which is exactly why the two metrics must not be conflated.
+    const before = chunkContent(t);
+    const after = chunkContent(inPlace(t));
+    expect(after.filter((c, i) => before[i] !== c).length).toBe(1);
+    expect(expectedStrictChurn(t)).toBe(0); // and the rule predicts it
+  });
+
+  it("LIVE CORPUS: the in-place median stays at 1 — the assertion that would have caught this", () => {
+    // Dropping the ceiling took the MEDIAN with it, and review was right that this went too far: the
+    // median is metric-robust (set and positional agree in the strict bucket, which is most of the
+    // corpus) and it is the assertion that would have caught the original defect, where one document
+    // churned 4 while every other churned 1. A ceiling is unassertable; a median is not.
+    const docs = repoDocs();
+    const churns = docs
+      .filter((t) => classify(t) !== "excluded")
+      .map((t) => changedCount(chunkContent(t), chunkContent(inPlace(t))))
+      .sort((a, b) => a - b);
+    expect(churns.length).toBeGreaterThan(5);
+    expect(churns[Math.floor(churns.length / 2)], "median in-place churn over real documents").toBe(1);
+  });
+
+  it("LIVE CORPUS: every strictly-classified document churns exactly 1", () => {
+    const docs = repoDocs();
+    expect(docs.length).toBeGreaterThan(5);
+    const counts: Record<Bucket, number> = { excluded: 0, strict: 0, reported: 0 };
+    for (const t of docs) {
+      const bucket = classify(t);
+      counts[bucket]++;
+      if (bucket !== "strict") continue;
+      // Per document, not as a corpus maximum: a maximum lets one outlier dominate, which is how the
+      // original defect hid — and how it was then mis-diagnosed three times.
+      //
+      // And the expectation is DERIVED from the rule, not the constant 1, because of the corner the
+      // third reviewer constructed: under the SET metric the ledger pays, a touched chunk whose
+      // post-edit content already exists elsewhere in the document costs NOTHING, so a strict document
+      // can legitimately churn 0. Asserting a flat 1 would redden on a true negative. This computes
+      // what the rule predicts and asserts that.
+      expect(
+        changedCount(chunkContent(t), chunkContent(inPlace(t))),
+        "strict document churn must equal what the rule predicts"
+      ).toBe(expectedStrictChurn(t));
+    }
+    // HONEST ABOUT WHAT THIS IS (review): the sum is a TAUTOLOGY for any total classifier — one that
+    // returned "reported" for everything would satisfy it. It is kept because it pins TOTALITY (every
+    // document lands in exactly one bucket); what it does NOT do is catch a reports-everything
+    // classifier. The STRICT fixture above catches that, and the floor below keeps the live assertion
+    // from silently measuring nothing.
+    expect(counts.excluded + counts.strict + counts.reported).toBe(docs.length);
+    // A floor, not a pinned count: today 14 of 25 documents classify strict, and pinning that number
+    // would re-create the corpus dependence this ticket exists to remove.
+    expect(counts.strict, "no live document classified strict — the assertion above ran on nothing").toBeGreaterThan(0);
   });
 });

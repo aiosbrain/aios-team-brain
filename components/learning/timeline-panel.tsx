@@ -20,15 +20,18 @@ export async function TimelinePanel({
   teamId,
   teamSlug,
   tier,
+  memberId,
 }: {
   teamId: string;
   teamSlug: string;
   tier: "team" | "external";
+  /** The viewing member — §5.8: an enforcing team serves their visibility variant, never the tier row. */
+  memberId: string;
 }) {
   // Payload only: this panel renders the ledger and has no freshness affordance today. Surfacing
   // `freshness.stale` here (a "last updated" line) is a UI change, deliberately not bundled with the
   // wire fix — see the PR's follow-ups.
-  const { days } = await getCachedWorkTimeline(adminClient(), teamId, tier);
+  const { days } = await getCachedWorkTimeline(adminClient(), teamId, tier, memberId);
   const shownDates = days.map((d) => d.date);
 
   return (

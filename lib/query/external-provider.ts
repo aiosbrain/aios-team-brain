@@ -27,6 +27,11 @@ export const externalProvider: RetrievalProvider = {
   name: "external",
   async retrieve(req: RetrievalRequest): Promise<RetrievedContext> {
     if (!URL) return EMPTY;
+    // Access enforcement (Phase B slice 2, Codex CRITICAL): a remote provider is a whole retrieval
+    // backend the oracle can't filter — its wire contract carries no membership scope. Under
+    // enforcing it must FAIL CLOSED (empty context) rather than return unrestricted remote sources.
+    // When the contract learns to accept oracle-scoped ids/projects, this can relax.
+    if (req.enforce != null) return EMPTY;
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
     try {
