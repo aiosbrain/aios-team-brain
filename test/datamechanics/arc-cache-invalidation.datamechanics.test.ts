@@ -97,6 +97,62 @@ describe("PCCC-7 — the purge trigger is clear-imminent, not flag-exists", () =
   });
 });
 
+describe("PCCC-7 — the purge waits for a VERIFIED-CLEAN clear (Codex High 2)", () => {
+  it("while Graphiti still holds the item's episodes, the p: rows survive — a cold miss must not rebuild from the dirty graph", async () => {
+    const seed = await seedTeam();
+    const teamGroup = episodeGroupId(seed.teamSlug, "team");
+    await writeArcCache(db(), seed.teamId, `p:${seed.teamId}:${teamGroup}`, ARC as never, "h1");
+
+    // Self flag past grace, but the graph is NOT clean: Graphiti still lists an episode for the
+    // item, so this pass cannot clear the flag — and must not purge either. An eager purge here
+    // hands the next reader a cold miss that re-synthesizes FROM THE DIRTY GRAPH and persists the
+    // poisoned row for a whole projection interval.
+    const r = await ingest(seed, { body: "dirty group content", path: "dg.md", access: "team" });
+    const fake = new FakeGraphiti();
+    await fake.addEpisodes(teamGroup, [{ content: "x", timestamp: new Date().toISOString(), sourceDescription: "t", name: `items:${r.id}` }]);
+    // Make the fake REFUSE deletion so the episode stays listed (deleteFailed → flag kept).
+    (fake as unknown as { deleteEpisode: () => Promise<never> }).deleteEpisode = async () => {
+      throw new Error("refusing");
+    };
+    await runSql(
+      `insert into graph_episodes (team_id, source_table, source_id, group_id, content_sha256, pending_delete_group_id, pending_delete_at, projected_at)
+       values ($1, 'items', $2, $3, 'aaa', $3, now() - interval '2 days', now() - interval '2 days')`,
+      [seed.teamId, r.id, teamGroup]
+    );
+    await reconcileProjectedEpisodes(db(), client(fake), seed.teamId);
+
+    const flag = await runSql<{ pending_delete_group_id: string | null }>(
+      "select pending_delete_group_id from graph_episodes where team_id = $1 and source_id = $2",
+      [seed.teamId, r.id]
+    );
+    expect(flag.rows[0].pending_delete_group_id).not.toBeNull(); // clear was impossible (dirty graph)
+    expect(await readArcCache(db(), seed.teamId, `p:${seed.teamId}:${teamGroup}`)).not.toBeNull(); // …so no purge either
+  });
+});
+
+describe("PCCC-7 — the slug→teamId re-key migration (Codex High 1)", () => {
+  it("rewrites a slug-keyed correction to the team-id namespace and drops slug-keyed cache rows — idempotently", async () => {
+    const seed = await seedTeam();
+    // A 6b-era row: scoped under the SLUG namespace.
+    const { error } = await db()
+      .from("arc_corrections")
+      .insert({ team_id: seed.teamId, arc_id: "legacy-scoped", arc_title: "t", corrected_text: "human take", group_key: `p:${seed.teamSlug}:g_x` });
+    expect(error).toBeNull();
+    await writeArcCache(db(), seed.teamId, `p:${seed.teamSlug}:g_x`, ARC as never, "h");
+
+    const MIG = (await import("node:fs")).readFileSync("postgres/migrations/20260816130000_arc_scope_keys_team_id.sql", "utf8");
+    await runSql(MIG);
+    await runSql(MIG); // replay-safe: the second run must be a no-op
+
+    const rekeyed = await runSql<{ group_key: string }>(
+      "select group_key from arc_corrections where team_id = $1 and arc_id = 'legacy-scoped'",
+      [seed.teamId]
+    );
+    expect(rekeyed.rows[0].group_key).toBe(`p:${seed.teamId}:g_x`); // the human's edit follows the namespace
+    expect(await readArcCache(db(), seed.teamId, `p:${seed.teamSlug}:g_x`)).toBeNull(); // regenerable — dropped
+  });
+});
+
 describe("PCCC-7 — the orphaned-scope-key sweep", () => {
   it("sweeps p: rows past the age floor; fresh p: rows, tier rows, and CORRECTIONS are never touched", async () => {
     const seed = await seedTeam();
