@@ -109,7 +109,21 @@ export async function listArcCorrections(
       .order("arc_id", { ascending: true })
       .limit(limit);
     if (error) throw new Error(error.message);
-    const corrections = ((data ?? []) as Record<string, unknown>[]).map((r) => ({
+    // NEWEST take per arc across the ADMITTED scope set (second-pass 6b Medium): the tier read
+    // admits [tierKey, ''] — a pre-6b legacy row and its post-6b re-correction are DIFFERENT rows
+    // under the per-scope arbiter, and without this both takes argue inside one prompt forever
+    // (the exact state the unique exists to prevent, reintroduced across the migration boundary).
+    // Rows arrive updated_at DESC, so first-seen per arc_id is the newest. A superseded twin
+    // briefly costs one of the LIMIT slots — bounded, and it ages out of the window.
+    const newestPerArc: Record<string, unknown>[] = [];
+    const seenArcs = new Set<string>();
+    for (const r of (data ?? []) as Record<string, unknown>[]) {
+      const arcId = String(r.arc_id ?? "");
+      if (seenArcs.has(arcId)) continue;
+      seenArcs.add(arcId);
+      newestPerArc.push(r);
+    }
+    const corrections = newestPerArc.map((r) => ({
       arc_id: String(r.arc_id ?? ""),
       arc_title: String(r.arc_title ?? ""),
       corrected_text: String(r.corrected_text ?? ""),

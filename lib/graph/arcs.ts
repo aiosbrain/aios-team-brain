@@ -1178,7 +1178,8 @@ function refreshArcsInBackground(
           ok: !committed.untrustworthy,
           created: continuity.nextCount,
           meta: {
-            // `group_key` is the tier scope: a team with external viewers records a row per group set,
+            // `group_key` is the SYNTHESIS SCOPE — the tier set for tier rows, a `p:` key for an
+            // enforced member's scoped refresh (each scope is its own continuity series).
             // and the external one is smaller. Without this the two are indistinguishable and the
             // eyeballed trend silently mixes them.
             group_key: key,

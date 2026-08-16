@@ -110,6 +110,25 @@ describe("arc corrections are durable in Postgres (real Postgres)", () => {
     expect(b.corrections.map((c) => c.corrected_text)).toEqual(["scope B take"]);
   });
 
+  it("PCCC6B-1: a tier-path RE-correction supersedes its pre-6b legacy row — one take per arc reaches the prompt (second-pass Medium)", async () => {
+    const seed = await seedTeam();
+    // The legacy row (pre-6b: group_key ''), then the post-6b re-correction under the tier key —
+    // two DIFFERENT rows under the per-scope arbiter, both admitted by the tier read.
+    const { error } = await db()
+      .from("arc_corrections")
+      .insert({ team_id: seed.teamId, arc_id: "arc-re", arc_title: "t", corrected_text: "the REJECTED take" });
+    expect(error).toBeNull();
+    await recordArcCorrections(db(), seed.teamId, seed.memberId, [
+      { arc_id: "arc-re", arc_title: "t", corrected_text: "the CURRENT take" },
+    ], "acme_external,acme_team");
+
+    const tier = await listArcCorrections(db(), seed.teamId, {
+      groupKey: "acme_external,acme_team",
+      includeLegacy: true,
+    });
+    expect(tier.corrections.map((c) => c.corrected_text)).toEqual(["the CURRENT take"]);
+  });
+
   it("PCCC6B-1: legacy '' rows feed ONLY a scope that opts in (the tier path) — a partition scope refuses them", async () => {
     const seed = await seedTeam();
     // A pre-6b row: written before group_key existed (simulated by the column default).
