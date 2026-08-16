@@ -225,24 +225,24 @@ describe("PCCC-7 — the in-memory arc cache is bounded", () => {
 
 describe("PCCC-7 — the eviction call sites reach the id-namespaced keys (Fable Medium 1)", () => {
   it("bustTeamLearningCaches and purgeExternalTierCaches evict a team's p: memory entries", async () => {
-    const { memCacheSet, arcMemoryCacheSize, evictScopedArcMemory } = await import("@/lib/graph/arcs");
+    const { memCacheSet, arcMemoryCacheSize } = await import("@/lib/graph/arcs");
     const { bustTeamLearningCaches } = await import("@/lib/ingest/reconcile-attribution");
     const { purgeExternalTierCaches } = await import("@/lib/cache/tier-invalidation");
     const { db } = fakeDb();
     const entry = { arcs: [], at: Date.now(), factsHash: null, degraded: false };
 
+    // Observe the CALLER's effect directly — the first version of this test called
+    // evictScopedArcMemory itself "idempotently" and thereby masked its own mutation (caught when
+    // severing the caller's eviction reddened nothing).
     memCacheSet("p:evict-a:g1", entry);
+    const beforeA = arcMemoryCacheSize();
     await bustTeamLearningCaches(db, "evict-a", "some-slug");
-    evictScopedArcMemory("evict-a"); // idempotent — the assertion is that the CALLER already did it
-    const afterA = arcMemoryCacheSize();
-    memCacheSet("p:evict-a:g1", entry);
-    expect(arcMemoryCacheSize()).toBe(afterA + 1); // proves the caller had removed it (re-add grows)
+    expect(arcMemoryCacheSize()).toBe(beforeA - 1);
 
     memCacheSet("p:evict-b:g1", entry);
+    const beforeB = arcMemoryCacheSize();
     await purgeExternalTierCaches(db, "evict-b", "some-slug");
-    const afterB = arcMemoryCacheSize();
-    memCacheSet("p:evict-b:g1", entry);
-    expect(arcMemoryCacheSize()).toBe(afterB + 1);
+    expect(arcMemoryCacheSize()).toBe(beforeB - 1);
   });
 });
 
