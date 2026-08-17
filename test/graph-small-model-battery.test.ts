@@ -383,3 +383,109 @@ describe("the judge is WIRED to the small-model registry (the critical fold)", (
     expect(broken.problems.join(" ")).toMatch(/IDENTICAL|inherited|separation/i);
   });
 });
+
+describe("informativeness guard — Q3's lesson, mechanised (GRAPHSMALL-2)", () => {
+  const load = () => import("../scripts/graph-window-battery/small-model-metrics.mjs");
+
+  it("a CEILING incumbent is INFORMATIVE for a fall — the guard was backwards", async () => {
+    // Review's scenario: STRONG dates every edge (Q11=1.0), SMALL loses 20%. Q11 SHOULD fail. The
+    // first version excluded Q11 precisely because the incumbent was perfect, shipping an arm that
+    // lost the one behaviour Q11 detects. A ceiling incumbent is the BEST baseline for a fall.
+    const { assessInformativeness } = await load();
+    const r = assessInformativeness([1.0, 1.0], { bandMargin: 0.15 });
+    expect(r.informative).toBe(true);
+    expect(r.riseUntestable).toBe(true); // only the RISE half is unarmable, and it is named
+  });
+
+  it("a FLOOR incumbent is uninformative — the literal Q3 shape (mechanism produces nothing)", async () => {
+    const { assessInformativeness } = await load();
+    const r = assessInformativeness([0, 0], { bandMargin: 0.15 });
+    expect(r.informative).toBe(false);
+    expect(r.reason).toMatch(/floor|cannot be expressed/i);
+  });
+
+  it("a mid-range incumbent is informative and its rise edge is testable", async () => {
+    const { assessInformativeness } = await load();
+    const r = assessInformativeness([0.5, 0.52], { bandMargin: 0.15 });
+    expect(r.informative).toBe(true);
+    expect(r.riseUntestable).toBe(false);
+  });
+
+  it("THROWS on a missing band rather than disarming every gate", async () => {
+    // `informative:false` means "exclude from gating", so returning it for a caller mistake (the
+    // registry field is `margin`, this parameter is `bandMargin`) would ship an arm with NO gates.
+    const { assessInformativeness } = await load();
+    await expect(async () => assessInformativeness([0.5, 0.5], {})).rejects.toThrow(/bandMargin is required/i);
+  });
+
+  it("treats a null/absent incumbent as uninformative, not as zero", async () => {
+    const { assessInformativeness } = await load();
+    expect(assessInformativeness([null, null], { bandMargin: 0.15 }).informative).toBe(false);
+    expect(assessInformativeness([], { bandMargin: 0.15 }).informative).toBe(false);
+  });
+});
+
+describe("autoUninformative — computed in decide, and it consults the ARMS", () => {
+  const base = { Q1: [10, 10], Q2: [1, 1], Q4: [0.5, 0.5], Q5: [0, 0], Q7: [1, 1],
+    Q10: [0.9, 0.9], Q10F: [0.6, 0.6], Q10L: [120, 120], Q11: [0.5, 0.5], C2: [0.01, 0.01] };
+  const reg = () => smallModelMetrics({ addressableShare: 0.287 });
+  const session = () => assessSession({
+    incumbent: base, universeSize: 20, underpowered: [], armsCompleted: true,
+    harnessRefused: false, crossCheckAvailable: true, registry: reg(),
+  });
+
+  it("EXCLUDES a floor-pinned metric only when NO arm departs the extreme", () => {
+    const inc = { ...base, Q11: [0, 0] };
+    const out = decide({
+      session: session(), incumbent: inc,
+      arms: [{ name: "SMALL", metrics: { ...inc, C2: [0.005, 0.005] }, extras: { personsLost: 0 } }],
+      registry: reg(),
+    });
+    expect(out.uninformative).toContain("Q11");
+    expect(out.arms[0].ships).toBe(true); // the other half of the contrast pair
+    expect(out.outcome).toBe("SHIP");
+  });
+
+  it("JUDGES a floor-pinned metric when an ARM moved — the regression must not be hidden", () => {
+    // Incumbent pinned at 0, but the arm produced 0.4: the metric demonstrably CAN move, so
+    // excluding it would hide real movement. This is the case where exclusion changes the outcome,
+    // and therefore the only case where getting it wrong matters.
+    const inc = { ...base, Q11: [0, 0] };
+    const out = decide({
+      session: session(), incumbent: inc,
+      arms: [{ name: "SMALL", metrics: { ...inc, Q11: [0.4, 0.4], C2: [0.005, 0.005] }, extras: { personsLost: 0 } }],
+      registry: reg(),
+    });
+    expect(out.uninformative).not.toContain("Q11");
+  });
+
+  it("REFUSES to disable a cost or core-quality gate", () => {
+    expect(() => decide({
+      session: session(), incumbent: base,
+      arms: [{ name: "SMALL", metrics: base, extras: { personsLost: 0 } }],
+      registry: reg(), uninformative: ["C2"],
+    })).toThrow(/may not be excluded/i);
+    expect(() => decide({
+      session: session(), incumbent: base,
+      arms: [{ name: "SMALL", metrics: base, extras: { personsLost: 0 } }],
+      registry: reg(), uninformative: [{ informative: false, reason: "no key attached" }],
+    })).toThrow(/malformed/i);
+  });
+});
+
+describe("AC8d — the readout shapes the pure scorers consume", () => {
+  it("summaryRows' row shape feeds scoreSummaryHealth, and temporalEdges' feeds scoreTemporalCoverage", () => {
+    // The judge reads r.q.Q10?.distinctness etc through OPTIONAL chaining, so a renamed field would
+    // harvest [undefined, undefined] SILENTLY rather than throwing. Pin the contract here.
+    const rows = [{ name: "Chetan", summary: "Chetan shipped the importer.", facts: ["Chetan shipped the importer"] }];
+    const health = scoreSummaryHealth(rows);
+    for (const k of ["total", "nonEmptyShare", "meanLength", "distinctness", "factOverlap"]) {
+      expect(health).toHaveProperty(k);
+    }
+    const cov = scoreTemporalCoverage([{ valid_at: "2026-08-01T00:00:00Z" }, { valid_at: null }]);
+    expect(cov).toHaveProperty("share");
+    expect(cov.share).toBe(0.5);
+    // An entity with NO facts is the OPTIONAL MATCH case — must score, not throw.
+    expect(() => scoreSummaryHealth([{ name: "X", summary: "a summary", facts: [] }])).not.toThrow();
+  });
+});

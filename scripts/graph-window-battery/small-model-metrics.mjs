@@ -137,3 +137,74 @@ export function scoreTemporalCoverage(edges) {
   if (dated === 0) return { total, share: null };
   return { total, share: dated / total };
 }
+
+/**
+ * Can this metric still FAIL on this corpus, or is the gate unarmable?
+ *
+ * WHY THIS EXISTS — Q3's lesson. Q3 (IS_DUPLICATE_OF share) read a structural ZERO on every arm
+ * because graphiti 0.29.3 stopped writing the relation, and it was only discovered LIVE, mid-session,
+ * after the money was spent (`decision.mjs` Amendment 2). A metric that cannot fail is not evidence
+ * of safety.
+ *
+ * DIRECTION-AWARE, and this is the correction that matters. An earlier version excluded any metric
+ * whose incumbent sat at a CEILING — reasoning that coverage ~1.0 "has no room to move". That was
+ * backwards, and review produced the scenario that proves it: STRONG dates every fact edge (Q11 =
+ * 1.0), SMALL stops resolving dates for 20% of them, Q11 correctly FAILS the lower edge — and the
+ * old guard excluded Q11 from gating precisely because the incumbent was perfect, letting the arm
+ * ship having lost the one behaviour Q11 exists to detect. A ceiling incumbent is the BEST baseline
+ * for detecting a fall, not a reason to disarm.
+ *
+ * What is genuinely uninformative is the FLOOR / no-evidence case — the literal Q3 shape, where the
+ * mechanism produces nothing on either arm so a fall cannot be expressed at all.
+ *
+ * `direction: "fall"` (default) asks "can this metric fall?"; `"rise"` asks the mirror question, for
+ * the upper edge of a two-sided band. A two-sided metric at the ceiling is reported
+ * `riseUntestable` — the fall edge stays armed, and only the untestable half is named.
+ */
+export function assessInformativeness(incumbentReps, { bandMargin, floor = 0, ceiling = 1, direction = "fall" } = {}) {
+  if (!Array.isArray(incumbentReps) || incumbentReps.length === 0) {
+    return { informative: false, reason: "no incumbent reps" };
+  }
+  const usable = incumbentReps.filter((v) => typeof v === "number" && Number.isFinite(v));
+  if (usable.length === 0) {
+    // `null` is what the scorers return for "no evidence" — an absence, not a zero.
+    return { informative: false, reason: "incumbent produced no measurable value (null/NaN)" };
+  }
+  if (typeof bandMargin !== "number" || !(bandMargin > 0)) {
+    // THROW, do not return uninformative. The caller reads `informative:false` as "exclude from
+    // gating", so a caller who passed the wrong registry field (the registry names it `margin`;
+    // this parameter is `bandMargin` — a mismatch that invites exactly this) would disarm EVERY
+    // metric and ship an arm with no gates at all. `assessSession` throws on missing safety inputs
+    // for the same reason: an omission must not read as a valid verdict.
+    throw new Error("assessInformativeness: bandMargin is required (the registry field is `margin`) — a missing band must not silently disarm a gate");
+  }
+  const mean = usable.reduce((a, b) => a + b, 0) / usable.length;
+
+  // The value the arm would have to reach to trip each edge of the band. Written as explicit edges
+  // rather than the previous `mean - (mean - mean*(1-bandMargin))`, which simplified to
+  // `mean*(1-bandMargin)` and so could never cross a floor of 0 — dead code whose comment claimed a
+  // check it did not perform (verified numerically before removal, not argued).
+  const lowerEdge = mean * (1 - bandMargin);
+  const upperEdge = mean * (1 + bandMargin);
+
+  if (direction === "fall") {
+    // A fall is expressible unless the incumbent is already at/below the floor.
+    if (mean <= floor + 1e-9) {
+      return { informative: false, reason: `incumbent mean ${mean.toFixed(4)} sits at the structural floor ${floor} — a fall cannot be expressed` };
+    }
+    return {
+      informative: true,
+      mean,
+      lowerEdge,
+      // Named, not excluded: for a two-sided band, the rise half is untestable from a ceiling.
+      riseUntestable: upperEdge > ceiling + 1e-9,
+    };
+  }
+  if (direction === "rise") {
+    if (mean >= ceiling - 1e-9) {
+      return { informative: false, reason: `incumbent mean ${mean.toFixed(4)} sits at the structural ceiling ${ceiling} — a rise cannot be expressed` };
+    }
+    return { informative: true, mean, upperEdge };
+  }
+  return { informative: false, reason: `unknown direction ${String(direction)}` };
+}

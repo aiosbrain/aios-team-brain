@@ -245,12 +245,18 @@ Do **not** pick from a price list. `EXMODEL-1` found candidates that 400 outrigh
 entities, *while advertising structured outputs*. Run its probe first; a model that fails it produces a
 broken battery, not a battery result.
 
-## NOT YET RUNNABLE TO A Q10/Q11 VERDICT
+## Q10/Q11 are now readable — and may declare themselves UNINFORMATIVE
 
-`measure.ts` does not yet read `(:Entity){name, summary}` or `RELATES_TO.valid_at` out of Neo4j, so
-`Q10`/`Q10F`/`Q10L`/`Q11` have scorers and bands but **no live readout**. Everything else — the
-registry, the C2 cost parse, arm separation, the pre-flight — is wired and tested.
+`measure.ts` reads `(:Entity){name, summary}` plus each entity's own adjacent `RELATES_TO.fact`
+(`summaryRows`) and every fact edge's `valid_at` (`temporalEdges`); `harvest.ts` scores them with the
+same pure functions the judge bands, so the readout cannot drift from the judged definition.
 
-Deferred deliberately after review (see the spec's Scope). Do not start a paid session expecting a
-summary/temporal verdict until the Cypher lands; the cost and dedupe questions (C2, Q1/Q7) are
-answerable today.
+**Read the `uninformative` list on the verdict before reading anything else.** A metric pinned at a
+structural floor or ceiling on this corpus is EXCLUDED from gating and listed there — it is *not* a
+pass. This matters most for **Q11**: graphiti backdates `valid_at` to the episode's work time
+(`lib/graph/extraction-health.ts:348`), so coverage may be ~1.0 on every arm, which is the same shape
+of trap that made Q3 a structural zero and burned a live session. Feed the incumbent's reps through
+`assessInformativeness(reps, { bandMargin })` and pass the excluded keys to `decide({ uninformative })`.
+
+If Q11 comes back uninformative, that is a real result about the corpus, not a failure — the summary
+and cost questions still answer.

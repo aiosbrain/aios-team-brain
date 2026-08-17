@@ -175,6 +175,60 @@ export function peopleFrom(
  * node count. Q7 is computed FROM these (plus the corpus bodies) at judge time, because its universe
  * is the union of the INCUMBENT's two reps and rep 2 does not exist while rep 1 is harvested.
  */
+/**
+ * Q10's input — every entity's summary plus the facts on its OWN adjacent edges (GRAPHSMALL-2).
+ *
+ * Schema (verified in `lib/graph/learning.ts`):
+ * `(:Entity)-[:RELATES_TO {fact, created_at, valid_at, group_id, episodes}]->(:Entity)`.
+ *
+ * `IS_DUPLICATE_OF` edges are excluded, matching every fact read in `lib/graph/learning.ts`. Dormant
+ * on the deployed 0.29.3 image (that relation is no longer written — it is why Q3 died), but a graph
+ * upgrade that revives it would otherwise feed dup-edge prose into Q10's fact-overlap denominator.
+ *
+ * Facts come from edges in EITHER direction: a fact about an entity is as often the object as the
+ * subject, and taking only outgoing edges would score a perfectly good summary as "detached" purely
+ * because of edge direction — an artefact, not a quality signal. Scoped to one `group_id` on both the
+ * node and the relationship, per the tier note at the top of this file.
+ */
+export async function summaryRows(
+  groupId: string
+): Promise<{ name: string; summary: string; facts: string[] }[]> {
+  const rows = await runRead<{ id: string; name: string; summary: string | null; facts: (string | null)[] }>(
+    // GROUP BY NODE IDENTITY, not by returned properties. Cypher groups on the non-aggregate
+    // expressions in RETURN, so `RETURN n.name, n.summary, collect(...)` would collapse two DISTINCT
+    // entities that share a name and a summary into ONE row with merged facts — precisely the shape
+    // this metric runs against, since fragmentation (the thing Q1/Q7 watch for) produces duplicate
+    // names, and boilerplate (the thing Q10 watches for) produces duplicate summaries. That would
+    // shrink Q10's denominator and inflate distinctness exactly when the arm is misbehaving.
+    // `WITH n, collect(...)` groups on the node itself.
+    `MATCH (n:Entity {group_id: $g})
+     OPTIONAL MATCH (n)-[r:RELATES_TO {group_id: $g}]-()
+     WHERE r IS NULL OR r.name IS NULL OR r.name <> 'IS_DUPLICATE_OF'
+     WITH n, collect(r.fact) AS facts
+     RETURN elementId(n) AS id, n.name AS name, n.summary AS summary, facts`,
+    { g: groupId }
+  );
+  return rows.map((r) => ({
+    name: r.name ?? "",
+    summary: r.summary ?? "",
+    facts: (r.facts ?? []).filter((f): f is string => typeof f === "string" && f.length > 0),
+  }));
+}
+
+/**
+ * Q11's input — the `valid_at` of every fact edge in the group (GRAPHSMALL-2).
+ *
+ * Returns the raw values rather than a count so `scoreTemporalCoverage` owns what "dated" means (it
+ * rejects blank strings), keeping one definition instead of two that can drift apart.
+ */
+export async function temporalEdges(groupId: string): Promise<{ valid_at: string | null }[]> {
+  const rows = await runRead<{ valid_at: string | null }>(
+    "MATCH ()-[r:RELATES_TO {group_id: $g}]->() RETURN r.valid_at AS valid_at",
+    { g: groupId }
+  );
+  return rows.map((r) => ({ valid_at: r.valid_at ?? null }));
+}
+
 export async function entityNameCounts(groupId: string): Promise<{ name: string; nodes: number }[]> {
   const rows = await runRead<{ name: string; nodes: number }>(
     "MATCH (n:Entity {group_id: $g}) RETURN n.name AS name, count(n) AS nodes",
