@@ -39,12 +39,12 @@ curl -fsSL https://aiosbrain.dev/install.sh | sh
 ```
 
 It checks your prerequisites, fetches the repo, and hands you to an interview: run it **on this
-machine** (your own team, real install), **on Railway** (opens the official one-click template), or
+machine** (your own team, real install), **on Railway** (opens the maintained one-click template), or
 **just the demo**. It asks only what your choice needs, **proves your model key works
 before going further** — a wrong paste is caught there, not three steps later at an empty query box —
 then shows the plan before touching anything. Already cloned? `npm run setup` is the same wizard.
 
-It never uses `sudo` or overwrites an existing install. The Railway choice opens the official
+It never uses `sudo` or overwrites an existing install. The Railway choice opens the maintained
 template; the selected Railway workspace must have an **active plan** first. Activate one at
 **https://railway.com/workspace/plans**. Railway then shows the complete app + Postgres plan and asks
 for confirmation before deploying.
@@ -109,7 +109,7 @@ concluding the product is broken:
 | | |
 |---|---|
 | **1 · A host** | anything that builds a Next.js app — **Node ≥ 20**. We recommend **Railway**: it detects the app, ships Postgres with pgvector already enabled, and adds Neo4j in one click if you later want the context engine. Nothing in the code depends on it |
-| **2 · Postgres 16** | the source of truth — every item, task, decision and attribution |
+| **2 · Postgres 16+** | the source of truth — every item, task, decision and attribution |
 | **3 · Two secrets** | `AUTH_SECRET` signs sessions, `SECRETS_KEY` encrypts connector tokens at rest. Each is one generated command |
 
 **Needed for the brain to answer anything**
@@ -180,7 +180,7 @@ Everything below is that sequence in dependency order, with the failure modes ca
 ### 1.1 Runtime and tooling
 
 **To deploy it**, your host needs to build a standard Next.js app — **Node ≥ 20** — and give it a
-**Postgres 16** database. Nothing else. Railway and Render detect this automatically.
+**Postgres 16 or newer** database. Nothing else. Railway and Render detect this automatically.
 
 **On your own machine** you only need tooling if you're going to run the admin CLI, the ingestion
 sidecar, or the app itself:
@@ -200,9 +200,9 @@ There is no `.nvmrc` or `.node-version` in the repo.
 | Service | Required? | Notes |
 |---|---|---|
 | **A host for the app** | **Required** | Railway is what we run and the best-supported path. Render, Fly, a VPS with Docker, or Kubernetes all work — it's a plain Next.js app with no platform-specific APIs. |
-| **Postgres 16** | **Required** | Managed (Railway, Neon, RDS…) or your own. Plain SQL schema, no vendor lock-in. |
+| **Postgres 16 or newer** | **Required** | Managed (Railway, Neon, RDS…) or your own. Plain SQL schema, no vendor lock-in. 16 is what CI and `compose.yml` run; the Railway template provisions Railway's own current Postgres image, which is newer. No version is enforced at runtime. |
 | **Neo4j 5.26.2** + **Graphiti** | Optional | Powers narrative arcs, the "what the brain is learning" panel, and graph-grounded answers. Everything else works without it. Self-hosted via `graphiti/docker-compose.yml`. **Neo4j Aura is untested** — no code path references `neo4j+s://`, so treat cloud Aura as unverified. |
-| **Email (Resend or SMTP)** | Recommended | Magic links and invites. Without it, in non-production the login link is printed to the server console; **in production the mail is dropped** (logged server-side as `[mailer] no provider`, and nowhere else). |
+| **Email (Resend or SMTP)** | Recommended | Magic links and invites. Without it the mail is **dropped in every environment** — logged server-side as `[mailer] no provider` (production) or `[mailer] (dev, no provider) would send …` (development), and nowhere else. The link itself is **never** printed: it carries a one-time token, so `mailer.ts` deliberately logs only the subject and recipient. To sign in locally without email, use `/auth/dev-login` (dev only) or the password from `npm run admin -- create-member`. |
 
 There is no Supabase dependency. It was removed — if you see Supabase env vars anywhere in your
 notes or in a stale `.env.local`, they are read by nothing.
@@ -293,19 +293,26 @@ Each step explains *why*, so you can tell when something has gone wrong rather t
 on green output.
 
 > **Railway users don't need to read §2.1–§2.4.** Start at the
-> [official one-click template](https://aiosbrain.dev/deploy/team-brain/). An active Railway plan is
-> required. The template creates Team Brain, Postgres, Graphiti, and Neo4j, generates the
+> [maintained one-click template](https://aiosbrain.dev/deploy/team-brain/) — reached by that direct
+> link, since it is deliberately unlisted in Railway's public template gallery. An active Railway
+> plan is required. The template creates Team Brain, Postgres, Graphiti, and Neo4j, generates the
 > application and graph secrets, asks only for the team and first-admin details, applies the schema,
 > and bootstraps the login.
+>
+> It does **not** configure email, and those keys are env-only — `RESEND_API_KEY` or `SMTP_URL` as
+> service variables plus a redeploy, not an Admin setting. Until then, magic-link sign-in is hidden
+> from the login form, and **member invites fall back to a manual password** the admin copies and
+> hands over — visibly, not silently. Sign in with the admin password you supplied.
 >
 > Read on only for a non-Railway host, local development, or debugging a failed deployment.
 
 ### 2.1 — Create the services
 
-On Railway, use the [official template](https://aiosbrain.dev/deploy/team-brain/); it deploys the
-four-service stack from the official repository without a fork, local CLI, or `--resume` step.
+On Railway, use the [maintained template](https://aiosbrain.dev/deploy/team-brain/); it deploys the
+four-service stack from the official repository without a fork, local CLI, or `--resume` step. It is
+unlisted in Railway's template gallery, so reach it by that link rather than by searching.
 
-On another host, deploy this repository as one web service and attach one Postgres 16 database.
+On another host, deploy this repository as one web service and attach one Postgres 16-or-newer database.
 
 For another host, add the graph services (§2.8) when you want narrative arcs.
 
@@ -330,7 +337,7 @@ RESEND_FROM="AIOS <noreply@yourdomain.com>"
 
 `APP_URL` matters more than it looks: invite and magic links are built in server actions where there
 is no request origin to fall back on, so without it every login link your team receives is broken.
-For the official Railway template this is wired to the generated public domain automatically; on a
+For the maintained Railway template this is wired to the generated public domain automatically; on a
 manual host, set it after the domain exists rather than guessing it in advance.
 
 Full reference in §3, including everything optional. `npm run doctor` checks the ones above that
@@ -374,7 +381,7 @@ fast instead of queueing every query in the database behind it.
 
 ### 2.4 — Create your team and your first admin
 
-The official Railway template performs this step idempotently from the form values on first boot.
+The maintained Railway template performs this step idempotently from the form values on first boot.
 The password is never printed to deployment logs, and restarts preserve an existing credential.
 
 For a manual non-template deployment, run these against the production database:
@@ -692,7 +699,7 @@ shipping app code ahead of its database.
 | `APP_URL` | Absolute base URL. No throw, but invite/magic links are built in server actions where there is no request origin — without it they come out broken. |
 | `SECRETS_KEY` | 32 bytes, base64 or hex. **Throws** the first time you save a connector secret — not at boot. |
 | One LLM path | `ANTHROPIC_API_KEY`, or `LLM_BASE_URL` (+ `LLM_MODEL`), or an OpenRouter key set per-team in Admin. |
-| One email path | `RESEND_API_KEY` + `RESEND_FROM`, or `SMTP_URL` + `SMTP_FROM`. Dev logs the link to console instead; in production the mail is **dropped**, noted only in the server log. |
+| One email path | `RESEND_API_KEY` + `RESEND_FROM`, or `SMTP_URL` + `SMTP_FROM`. Without one the mail is **dropped in every environment**, noted only in the server log — the link itself is never printed. Member invites fall back to a manual password you hand over yourself. |
 
 ### Optional subsystems
 
@@ -913,10 +920,15 @@ which distinguishes a scope failure from the far more common "ran fine, nothing 
 
 ### Login link never arrives
 
-No email transport configured. In development the link is printed to the server console. In
-production, set `RESEND_API_KEY` + `RESEND_FROM` (a verified domain — Resend's `onboarding@resend.dev`
-only delivers to the account owner) or `SMTP_URL` + `SMTP_FROM`. Also confirm `APP_URL` is set, or
-links are built against nothing.
+No email transport configured. **The link is never printed to the console** — it is a one-time
+credential, so the mailer logs only the subject and recipient (`[mailer] (dev, no provider) would
+send …`). In development, sign in via `/auth/dev-login` or with the password `npm run admin --
+create-member` prints. In production, set `RESEND_API_KEY` + `RESEND_FROM` (a verified domain —
+Resend's `onboarding@resend.dev` only delivers to the account owner) or `SMTP_URL` + `SMTP_FROM`.
+Also confirm `APP_URL` is set, or links are built against nothing. Note that
+`POST /api/auth/request-magic-link` returns `200` whether or not the mail went anywhere, so a
+successful response there proves nothing. The admin **invite** flow is more honest: it reports
+`emailDelivered`, and hands back a usable `loginUrl` or password when delivery failed.
 
 `npm run doctor` flags both — a missing transport (as a failure in production, where the mail is
 dropped rather than logged) and an unset `APP_URL`.
