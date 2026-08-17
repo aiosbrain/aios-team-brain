@@ -2441,7 +2441,7 @@ create table if not exists graph_project_arming (
 -- not a source of truth. Sole writer: lib/graph/arc-cache (via lib/graph/arcs).
 create table if not exists arc_cache (
   team_id uuid not null references teams(id) on delete cascade,
-  group_key text not null,                       -- the SYNTHESIS SCOPE key: sorted visible-group set ('acme_external,acme_team'), or PCCC6B-1's partition namespace ('p:<slug>:<sorted groups>') for an enforced principal's scoped arcs
+  group_key text not null,                       -- the SYNTHESIS SCOPE key: sorted visible-group set ('acme_external,acme_team') for tier rows, or one partition's 'g:<group>' (PPARC-2/3, fused at serve time). The retired per-oracle 'p:<teamId>:<sorted groups>' namespace (PCCC6B-1) mints nowhere (PPARC-4 inverse guard); pre-cutover residue is collected by the 7-day straggler sweep
   arcs jsonb not null default '[]'::jsonb,        -- NarrativeArc[] (already human-attributed)
   -- Hash of the exact LLM synthesis input (the attributed fact prompt). The background refresh SKIPS the
   -- (non-deterministic) LLM re-synthesis when this is unchanged — so arcs only change when the underlying

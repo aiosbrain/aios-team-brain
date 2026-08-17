@@ -50,7 +50,7 @@ vi.mock("@/lib/graph/graphiti-client", async (importOriginal) => {
   return { ...orig, GraphitiClient: MockClient };
 });
 
-function fakeDb(projectGroups: string[] = []) {
+function fakeDb(projectGroups: string[] = [], upserts?: Array<{ table: string; row: unknown }>) {
   return {
     from: (table: string) => ({
       select: () => ({
@@ -62,7 +62,12 @@ function fakeDb(projectGroups: string[] = []) {
           not: () => Promise.resolve({ data: table === "projects" ? projectGroups.map((g) => ({ graph_group_id: g })) : [] }),
         }),
       }),
-      upsert: async () => ({ error: null }),
+      upsert: async (row: unknown) => {
+        // Captured so absence tests can assert on the PERSISTENT half (review: the fence's
+        // original no-upsert assertion was dropped in PPARC-4's test surgery — Codex Low 5).
+        upserts?.push({ table, row });
+        return { error: null };
+      },
     }),
   } as unknown as DbClient;
 }
@@ -175,22 +180,94 @@ describe("the eviction callers reach g: keys (PPARC-2 rule; Fable Medium 1 linea
   });
 });
 
+describe("the fused envelope shares the warm classifier's clock (Codex PPARC-4 Medium 2)", () => {
+  it("a row crossing its TTL during the inline synthesis is BOTH scheduled for refresh AND reported stale", async () => {
+    const { getFusedArcs } = await import("@/lib/graph/arc-fusion");
+    const { ARC_CACHE_TTL_MS } = await import("@/lib/graph/arc-cache");
+    const cold = projGroup();
+    const borderline = projGroup();
+    // Fresh by ~150ms at read time; the 400ms inline synthesis below carries it past its TTL.
+    const borderlineRow = {
+      arcs: [{ id: "b1", title: "t", confidence: "high", summary: "s", participants: [], supporting_sources: [], evidence: [] }],
+      computed_at: new Date(Date.now() - ARC_CACHE_TTL_MS + 150).toISOString(),
+      facts_hash: "h",
+      degraded: false,
+    };
+    const rows: Record<string, unknown> = { [`g:${borderline}`]: borderlineRow };
+    const dbWithRows = {
+      from: (table: string) => ({
+        select: () => ({
+          eq: () => ({
+            eq: (_col: string, key: string) => ({ maybeSingle: async () => ({ data: table === "arc_cache" ? (rows[key] ?? null) : null }) }),
+            maybeSingle: async () => ({ data: null }),
+            order: () => ({ limit: async () => ({ data: [] }) }),
+            limit: async () => ({ data: [] }),
+            not: () => Promise.resolve({ data: [] }),
+          }),
+        }),
+        upsert: async () => ({ error: null }),
+      }),
+    } as unknown as DbClient;
+    llmMock.completeTextOrNull.mockImplementation(async () => {
+      await new Promise((r) => setTimeout(r, 400));
+      return '{"arcs":[{"id":"c1","title":"t","confidence":"high","summary":"cold prose","participants":[],"supporting_sources":[],"evidence":[]}]}';
+    });
+
+    const panel = await getFusedArcs(dbWithRows, "team-clock", slug(), [cold, borderline], KEYS);
+
+    expect(panel.warmScheduled).toBe(1); // the borderline row was classified stale and scheduled
+    // …so the envelope must say so: with the clock captured before the inline synthesis, this
+    // returned stale:false for the very row the same call had just scheduled a refresh for.
+    expect(panel.freshness.stale).toBe(true);
+    await new Promise((r) => setTimeout(r, 600)); // let the fired background warm settle
+  });
+});
+
 describe("the purge-generation fence (g:-era wiring)", () => {
-  it("an in-flight g: refresh overtaken by a purge DROPS its commit", async () => {
+  it("an in-flight g: refresh overtaken by a purge DROPS its commit — memory AND the persistent row", async () => {
     const { schedulePartitionRefresh, evictPartitionArcMemory, arcMemoryCacheHas } = await import("@/lib/graph/arcs");
     const group = projGroup();
+    const upserts: Array<{ table: string; row: unknown }> = [];
     let release: (() => void) | undefined;
     const blocked = new Promise<void>((r) => (release = r));
     llmMock.completeTextOrNull.mockImplementation(async () => {
       await blocked;
       return '{"arcs":[{"id":"x","title":"t","confidence":"high","summary":"pre-purge prose","participants":[],"supporting_sources":[],"evidence":[]}]}';
     });
-    const fired = schedulePartitionRefresh(fakeDb(), "team-fence", group, KEYS, null);
+    const fired = schedulePartitionRefresh(fakeDb([], upserts), "team-fence", group, KEYS, null);
     expect(fired).toBe(true);
     await new Promise((r) => setTimeout(r, 100)); // reach the blocked LLM
     evictPartitionArcMemory(group); // the purge door's mem half — bumps the generation
     release!();
     await new Promise((r) => setTimeout(r, 400));
-    expect(arcMemoryCacheHas(`g:${group}`)).toBe(false); // the commit was dropped
+    expect(arcMemoryCacheHas(`g:${group}`)).toBe(false); // the commit was dropped, memory half
+    // The PERSISTENT half (Codex Low 5, restoring origin/main's dropped assertion): a fence that
+    // withheld only the memory commit while writing Postgres would serve the poisoned row to
+    // every OTHER process for a TTL — the row must never have been upserted at all.
+    expect(upserts.filter((u) => u.table === "arc_cache")).toHaveLength(0);
+  });
+
+  it("an in-flight g: refresh overtaken by the TEAM-WIDE evictor drops its commit too (Codex PPARC-4 Medium 1)", async () => {
+    const { schedulePartitionRefresh, arcMemoryCacheHas } = await import("@/lib/graph/arcs");
+    const { bustTeamLearningCaches } = await import("@/lib/ingest/reconcile-attribution");
+    const group = projGroup();
+    const upserts: Array<{ table: string; row: unknown }> = [];
+    let release: (() => void) | undefined;
+    const blocked = new Promise<void>((r) => (release = r));
+    llmMock.completeTextOrNull.mockImplementation(async () => {
+      await blocked;
+      return '{"arcs":[{"id":"x","title":"t","confidence":"high","summary":"pre-correction attribution","participants":[],"supporting_sources":[],"evidence":[]}]}';
+    });
+    const fired = schedulePartitionRefresh(fakeDb([], upserts), "team-fence-wide", group, KEYS, null);
+    expect(fired).toBe(true);
+    await new Promise((r) => setTimeout(r, 100)); // reach the blocked LLM
+    // The attribution-correction percolation path: team-wide eviction must arm the same fence the
+    // per-partition door does — before this fix it only deleted memory, and the resumed refresh
+    // committed the pre-correction payload as fresh for a full TTL.
+    await bustTeamLearningCaches(fakeDb([group]), "team-fence-wide", "some-slug");
+    release!();
+    await new Promise((r) => setTimeout(r, 400));
+    expect(arcMemoryCacheHas(`g:${group}`)).toBe(false);
+    expect(upserts.filter((u) => u.table === "arc_cache")).toHaveLength(0);
   });
 });

@@ -518,9 +518,13 @@ Fable review caught the ambiguity: a group-set key would serve an attenuated tok
 full-visibility row — a leak; the effective-set key is also what makes spawn inheritance live in
 cached surfaces, since a spawner's group change changes the hash). The cardinality bound "distinct
 group combinations, not principal count — 2 people with identical groups share a cache row" holds
-for **member** reads; **token-authenticated reads do not populate these shared caches** (computed
-per request) until a measured need says otherwise, so launch-time `project_scope` variety cannot
-explode the key space;
+for **member** reads of the COMBINATION-KEYED caches — `work_timeline_cache`'s visibility variants
+and the permissive tier rows. For **enforced arcs** the unit is smaller still (PPARC-3/4 as-built):
+`arc_cache` stores one row PER PARTITION (`g:<group>`), fused prose-free at serve time, so readers
+sharing any partition share that row and no group-combination arc row exists to mint — the
+per-oracle combination namespace (`p:`) is retired. **Token-authenticated reads do not populate
+these shared caches** (computed per request) until a measured need says otherwise, so launch-time
+`project_scope` variety cannot explode the key space;
 `item_chunks` DOES carry a mirrored `access` column today (`postgres/optional/pgvector.sql:22` —
 kept so dense hits tier-filter in the same app-code path as FTS); under V2 that mirror is a legacy
 index hint like unit `audience` (§20.1), the query-time filter is the oracle join, and the Phase B

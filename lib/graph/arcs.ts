@@ -1045,11 +1045,21 @@ export function evictPartitionArcMemory(groupId: string): void {
  *  group id, so team-wide eviction resolves the team's pointer list — built-ins + initiatives —
  *  and deletes each exactly. Async because the resolution reads `projects.graph_group_id`. */
 export async function evictTeamPartitionArcMemory(db: DbClient, teamId: string): Promise<void> {
+  // Every eviction here ALSO bumps the key's purge generation (Codex PPARC-4 Medium 1): deleting
+  // without the bump left the fence unarmed on exactly this path — an in-flight g: refresh that
+  // read pre-correction attribution would commit AFTER bustTeamLearningCaches evicted + staled,
+  // resurrecting the old payload as fresh for a full TTL (the H13 revert shape, one caller up).
+  const evictAndFence = (key: string) => {
+    cache.delete(key);
+    bumpPurgeGeneration(key);
+  };
   const evictAllPartitionKeys = () => {
     // FAIL CLOSED (Codex PPARC-2 Medium 3): a returned-error read left every g: key warm for a
     // full TTL. We cannot know WHICH keys are this team's without the pointer list, so evict every
-    // g: entry — regenerable, bounded by the map, and one query each to re-warm.
-    for (const key of cache.keys()) if (key.startsWith("g:")) cache.delete(key);
+    // g: entry — regenerable, bounded by the map, and one query each to re-warm. An in-flight
+    // refresh's key need not be resident in `cache`, so fence the `refreshing` set too.
+    for (const key of cache.keys()) if (key.startsWith("g:")) evictAndFence(key);
+    for (const key of refreshing) if (key.startsWith("g:")) bumpPurgeGeneration(key);
   };
   try {
     const { data, error } = await db
@@ -1058,7 +1068,7 @@ export async function evictTeamPartitionArcMemory(db: DbClient, teamId: string):
       .eq("team_id", teamId)
       .not("graph_group_id", "is", null);
     if (error) return evictAllPartitionKeys();
-    for (const r of (data ?? []) as { graph_group_id: string }[]) cache.delete(`g:${r.graph_group_id}`);
+    for (const r of (data ?? []) as { graph_group_id: string }[]) evictAndFence(`g:${r.graph_group_id}`);
   } catch {
     evictAllPartitionKeys();
   }
