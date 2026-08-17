@@ -1,6 +1,6 @@
 # A row that names its issue must not get a second one — ADOPTDECL-1
 
-**Status:** spec, draft 3. Drafts 1 and 2 were each BLOCKED. Both of my attempts to infer
+**Status:** spec, draft 4. Drafts 1, 2 and 3 were each BLOCKED by cold reads. Both of my attempts to infer
 "the human declared this" from `provider_external_id` failed — in opposite directions — so draft 3 stops
 inferring and records the fact in its own column (§1a). Draft 2's §1c safeguard was worse than none: it
 would have stored a fingerprint asserting a projection that never happened. The Fable leg stalled twice
@@ -51,7 +51,8 @@ assumption; it is recorded because it is why the field looks usable to a reader.
 ### 0b. Confirmed in prod, not inferred
 
 Run `13291` (2026-08-14 04:13, team `73409b20…`, project `406a614e…`) reported
-`created: 5 · synced: 5 · ok: true` and created four issues alongside rows that already named their own:
+`created: 5 · synced: 5 · ok: true` and created four issues for rows that should have resolved to
+existing ones (see §0b for what this evidence does and does not witness):
 
 | row | issue created | synced at |
 |---|---|---|
@@ -139,30 +140,56 @@ against an identifier index built from the issues `buildBootstrap` already loads
 Because defaults never reach that column, the wrong-issue adoption draft 2 introduced is not merely
 unlikely, it is **unreachable**: a row that declared nothing has nothing to resolve.
 
-**The witness draft 2 cited for this was wrong, and it mattered.** It named the row inbound adoption
-creates (`inbound.ts:452-466`) as the shape that would duplicate — but that insert sets
-`provider_resource_id` in the same statement (`$5 = it.id`), so such a row resolves at the first rung
-and never needed this one. The genuinely vulnerable shape is a **Linear-mirrored task before the adopt
-sweep reaches it**: the task exists with no link row at all, and `projectAllTasks` filters only on
-`row_key not null` (`project.ts:387-393`), so it is swept into a duplicate.
+**This rung's witness has now been wrong three times, so it is stated carefully.** Draft 2 cited the
+row inbound adoption creates (`inbound.ts:452-466`) — but that insert sets `provider_resource_id` in the
+same statement, so it resolves at the first rung. Draft 3 then cited a **Linear-mirrored task before the
+adopt sweep** — also wrong: `lib/ingest/sources/linear-normalize.ts` emits no `pm_provider` /
+`pm_external_id`, so a mirrored task's `declared_external_id` is NULL forever and this rung can never
+fire for it.
 
-### 1c. Adoption is the handover — the brain's body is written immediately
+**The true witness is the shape this ticket was filed for:** a workspace markdown row that carries
+`pm_external_id` (the `TT39`–`TT42` shape), whose link therefore has a non-null `declared_external_id`
+and no `provider_resource_id`.
 
-Draft 2 said the adoption run preserves the human's prose and the next run overwrites it. **Both halves
-were wrong, and the second is the dangerous one.** After adoption the link has a `provider_resource_id`
-and `persistSuccess` stores a fingerprint computed from the **brain** shape, so the next run hits the
-short-circuit at `project.ts:281` and makes **zero provider calls**. The "one-run grace" is actually
-indefinite, and it ends at the first fingerprint-visible change — a status flip weeks later — replacing
-a colleague's write-up at a moment disconnected from the declaration, when nobody is looking.
+The mirrored-task duplicate is **real but out of scope** — see §3. It is a different fix (teach
+`linear-normalize` to emit the identifier so mirrors route through this column legitimately), and
+pretending this rung addresses it is how the wrong witness survived two drafts.
 
-Worse, the stored fingerprint would be a **recorded falsehood**: it asserts the brain shape was
-projected while Linear holds the human's body, and nothing heals it (inbound never reconciles bodies,
-`inbound.ts:432-434`). That is the same "report success for an outcome that did not happen" class
-`PMSUCCESS-1` closed one layer down, re-introduced by this slice's own safeguard.
+### 1c. Adoption seeds the brain from the issue when the brain has nothing to say
 
-So the adoption write is an ordinary update: **brain body plus footer, immediately.** Declaring an issue
-on a task row hands that issue's content to the brain, in one step, visibly. There is no grace, because a
-grace that cannot be honestly persisted is worse than none.
+Draft 2 said the adoption run preserves the human's prose and the next run overwrites it. Draft 3 said
+the brain's body is written immediately. **Both were wrong, and the repo already knew why.**
+
+Draft 2's version was incoherent: after adoption the link has a `provider_resource_id` and
+`persistSuccess` stores a fingerprint computed from the **brain** shape, so the next run hits the
+short-circuit at `project.ts:281` and makes **zero provider calls**. The grace was indefinite, ending at
+some unrelated status flip weeks later — and the stored fingerprint was a **recorded falsehood**,
+asserting a projection that never happened. That is the class `PMSUCCESS-1` closed one layer down.
+
+Draft 3's version was destructive, and this is the fact neither earlier draft checked: **a sync-pushed
+task has no body.** `materializeTasks` never writes `body` (`lib/ingest/tasks.ts:161-193`), and the
+schema says so outright — *"body is dashboard/DB-only — it never round-trips through the sync push"*
+(`postgres/schema.sql:1195`), default `''`. So for the canonical declaring shape — a markdown row
+carrying `pm_external_id: AIO-877` — "write the brain's body" means `withFooter("", …)`: **the human's
+entire issue description erased to a footer, every time.**
+
+The repo solves this one file over. Inbound adoption seeds an empty brain body **from the issue**
+(`inbound.ts:434`), and its comment names precisely the hazard draft 3 was about to re-introduce:
+*"without it, the first outbound projection after a brain-side edit would overwrite the Linear-native
+description with the mirror task's empty body."*
+
+So adoption follows that precedent:
+
+> **The adoption write sends `task.body` when the brain has one, and the issue's own stripped
+> description when it does not** — `body.trim() ? body : stripFooter(issue.description)`, plus the
+> footer. Immediately, in one step.
+
+That is honest on every axis at once: the write happens now (no grace that cannot be persisted), the
+fingerprint describes what was actually sent, and a human's write-up is inherited rather than destroyed.
+Declaring an issue still hands it to the brain — the brain simply starts from what was already there.
+
+**What this does NOT promise.** Once the brain has a body, the brain's body wins, exactly as for an
+issue the brain created. Preservation here is *seeding*, not permanent protection.
 
 ### 1d. Refuse to adopt an issue that already belongs to another row
 
@@ -176,19 +203,45 @@ team already carries it as `provider_resource_id`, or if its description carries
 `aios-ext:` footer. Two rows declaring the same key is one instance of that, not the rule.
 
 Ownership is read from persisted state, not from an in-run set: `projectTask` is callable standalone on
-the reactive path, so an in-run set would let two separate runs both adopt. And the winner is
-**arbitrary but sticky** — `projectAllTasks` applies no `ORDER BY` (`project.ts:387-393`), so which row
-wins first is not deterministic, but once it holds the `provider_resource_id` the loser fails
-consistently rather than flapping. Stated plainly rather than implying a deterministic "second".
+the reactive path, so an in-run set would let two separate runs both adopt. The winner is **arbitrary
+but sticky** — `projectAllTasks` applies no `ORDER BY` (`project.ts:387-393`), so which row wins first is
+not deterministic, but once it holds the `provider_resource_id` the loser fails consistently rather than
+flapping.
+
+**And a read-then-write check is not enough, which both reviewers found independently.** It is
+check-then-act: a reactive `after()` projection (`after-write.ts:45`) overlapping a manual board push can
+have both rows read "no owner", both `issueUpdate` the same issue, and both persist the same
+`provider_resource_id` — the two-writer loop, now silent, and afterwards **both** rows fail forever. The
+only unique constraint today is `(team_id, project_id, row_key, provider)` (`schema.sql:1271`), so the DB
+offers no backstop.
+
+Since this slice already carries a migration, it adds one: a **partial unique index on
+`(team_id, provider, provider_resource_id) where provider_resource_id is not null`**, so the second
+writer loses at the database rather than in a race. **With a prod pre-check first** — a constraint
+narrower than live data is this repo's own replay-incident class (#251), and duplicate resource ids may
+already exist from the very damage this slice is about. If the pre-check finds any, the index ships in a
+follow-up after they are reconciled, and the race is stated as accepted in the meantime.
 
 ### 1e. A withdrawn declaration must actually clear
 
 Today ingest writes the link row only when **both** `pm_provider` and `pm_external_id` are present
 (`lib/ingest/tasks.ts:202`). So a human who fixes a typo'd declaration by deleting the field leaves the
 old value in place forever — and under §1f that row then fails on every run with no remedy short of
-manual SQL. This slice makes a stale value load-bearing, so it must also make it clearable: ingest
-writes `declared_external_id` whenever `pm_provider` is present, setting it to NULL when
-`pm_external_id` is absent. Withdrawing the declaration returns the row to ordinary create-or-adopt.
+manual SQL. This slice makes a stale value load-bearing, so it must also make it clearable — and the obvious
+trigger is wrong twice over:
+
+- **The natural withdrawal deletes BOTH fields**, not just `pm_external_id`. A trigger conditioned on
+  `pm_provider` being present never fires for it, and the stale value would persist exactly when the
+  human thought they had removed it.
+- **Clearing must never INSERT.** `provider_external_id` is `text not null` with no default
+  (`schema.sql:1253`), so an insert leg for a row with no existing link has no legal value to supply —
+  it would either throw inside `materializeTasks` (a shape silently ignored today) or force ingest to
+  invent a default in the very column family this draft exists to de-ambiguate.
+
+So: **clearing is an UPDATE of existing links only, and it fires whenever a row's `pm_external_id` is
+absent** — including when `pm_provider` is absent too, in which case every provider's link for that
+`row_key` is cleared. A row that never had a link stays as it is. Withdrawing the declaration returns the
+row to ordinary create-or-adopt.
 
 ### 1f. A declared key that resolves to nothing is an ERROR, not a new issue
 
@@ -206,12 +259,30 @@ round-trip, and a real source rather than the prefix-guessing draft 2 implied. *
 stated:** a *same-prefix* miss (archived, deleted, past the pagination cap) is indistinguishable from a
 typo, so the message can rule a foreign team **in**, never rule the other causes **out**.
 
-### 1g. An adoption is reported as an adoption
+### 1g. An adoption is reported as an adoption — and four consumers must learn the word
 
 Adopting a pre-existing issue is not the same event as creating one, and a run that says `synced` for
-both hides the moment a human's issue changed hands. The report status for this rung is `adopted`, which
-the run summary counts separately — so a wrong adoption is visible in the same place the duplicate
-damage was invisible.
+both hides the moment a human's issue changed hands. The report status for this rung is `adopted`.
+
+**No exhaustive switch exists over `ProjectionReport.status`, so widening the union is silently green
+everywhere.** Both reviewers enumerated the consumers; all four are part of this slice, because a new
+status that nothing handles is worse than no new status:
+
+1. **The throttle** — `project.ts:368` sleeps only on `synced`. A first board push adopting N declared
+   rows would issue N back-to-back `issueUpdate`s at zero throttle. This is a live rate-limit risk, not
+   a cosmetic one.
+2. **The meetings action** — `app/t/[team]/meetings/actions.ts:418` maps anything that is not
+   `synced`/`skipped` to **`"failed"`**, so a successful adoption would surface as a failed push.
+   `PushTaskResult.status` (`:303`) needs the value too.
+3. **The run summary** — `summarizeProjectionReports` (`runs.ts:39-55`) would fold `adopted` into
+   `unchanged`. It must count adoptions in their own right; `meta: counts` already carries the raw
+   tally, but the named field is what the CLI prints.
+4. **The types** — `provider.ts:38` (`status: "synced" | "skipped"`) and `ProjectionStatus`
+   (`project.ts:41-49`).
+
+**A no-op adopt** — the issue already matches the desired fields, so `linearIssueMatches` is true and no
+mutation is sent — reports `adopted` as well, not `skipped`: the row DID change hands, and the footer
+write is what makes that durable.
 
 ## Dependencies
 
@@ -232,7 +303,8 @@ Codex) before code, two on the diff.
 
 ## Tier safety
 
-No tier surface changes: an outbound projection path. No new API route, no schema, no change to
+No tier surface changes: an outbound projection path. It DOES carry a schema change (§1a) — that line
+said "no schema" through draft 3 and was stale. No new API route, no change to
 `visibleItems`/`visibleTasks`/`visibleGroupIds`. The outward-facing behaviour changes are deliberate and
 named: a declared key now adopts instead of duplicating, and an unresolvable declared key now errors
 instead of creating.
@@ -243,20 +315,27 @@ instead of creating.
 - `test/pm-sync-declared-adoption.test.ts` — a row whose link carries a non-null `declared_external_id` matching a bootstrapped issue's `identifier` ADOPTS it: `issueUpdate` for that issue, no `issueCreate`, driven through `upsertWorkItem` against a fake `fetch`.
 - `test/pm-sync-declared-adoption.test.ts` — the adoption fixture makes the resource-id and footer rungs BOTH miss (no `provider_resource_id`, no `aios-ext:` footer on the issue), so only the new rung can produce the adopt — one condition per fixture.
 - `test/pm-sync-declared-adoption.test.ts` — a row with `declared_external_id` NULL never adopts, even when its `row_key` exactly equals a bootstrapped identifier; it creates. This is the wrong-issue adoption draft 2 would have shipped.
-- `test/pm-sync-declared-adoption.test.ts` — the adoption write sends the BRAIN's body plus the footer, not the issue's prior prose; no test asserts preservation, because §1c establishes there is none.
+- `test/pm-sync-declared-adoption.test.ts` — when the brain task's `body` is EMPTY (the canonical sync-pushed shape) the adoption write sends the ISSUE's own stripped description plus the footer, NOT an empty body; a fixture whose issue holds multi-paragraph prose must still contain that prose in the mutation variables.
+- `test/pm-sync-declared-adoption.test.ts` — when the brain task HAS a body, the adoption write sends the BRAIN's body plus the footer, so seeding is scoped to the empty case and is not permanent protection.
 - `test/pm-sync-declared-adoption.test.ts` — a declared key resolving to an issue already carried as another link's `provider_resource_id` FAILS, naming both rows; likewise when the issue's description carries a different row's `aios-ext:` footer.
 - `test/pm-sync-declared-adoption.test.ts` — a declared key matching no bootstrapped issue THROWS `PmSyncError` naming the key; when the key's prefix differs from `team.key` the message says "probably another team", and when it matches it does not.
 - `test/pm-sync-declared-adoption.test.ts` — the adopting row's report status is `adopted`, not `synced`, and the run summary counts it separately.
 - `test/pm-sync-declared-adoption.test.ts` — `buildBootstrap` adds no additional GraphQL round-trip: `team { key }` and the identifier index come from queries already issued, asserted by the fake `fetch`'s query count.
 - `test/ingest-tasks-declared-id.test.ts` — ingest writes `declared_external_id` when `pm_external_id` is present and sets it to NULL when the field is removed while `pm_provider` remains, so a withdrawn declaration is recoverable.
-- `test/guards/declared-external-id-single-writer.test.ts` — `lib/ingest/tasks.ts` is the only writer of `declared_external_id`; `ensureLink` and every `lib/pm-sync` path must not write it, and the guard is mutation-verified to redden on a bypassing write.
+- `test/guards/declared-external-id-single-writer.test.ts` — `lib/ingest/tasks.ts` is the only writer of `declared_external_id`, asserted REPO-WIDE rather than over `lib/pm-sync` alone: `scripts/brain-tasks.ts`, `lib/meetings/extract-todos.ts`, `scripts/backfill-meeting-todo-rowkeys.ts` and `test/datamechanics/setup.ts` all write `task_pm_links` and must not write this column. Mutation-verified to redden on a bypassing write.
+- `test/pm-sync-declared-adoption.test.ts` — an adopting report's status is `adopted` AND the throttle is paid for it (`project.ts:368`), so a bulk adoption does not issue back-to-back provider writes unthrottled.
+- `test/pm-sync-declared-adoption.test.ts` — `summarizeProjectionReports` counts `adopted` separately rather than folding it into `unchanged`, and `app/t/[team]/meetings/actions.ts` maps `adopted` to a SUCCESS, not to `"failed"`.
+- `test/ingest-tasks-declared-id.test.ts` — clearing updates links already present and never INSERTS one; a row with `pm_provider` and no `pm_external_id`, and a row with NEITHER field, both clear `declared_external_id` on every link for that `row_key`, while a row with no link at all is untouched.
+- `postgres/migrations/` — if the partial unique index on `(team_id, provider, provider_resource_id)` ships, a prod pre-check for existing duplicate resource ids is recorded in the PR; if duplicates exist the index is deferred and the accepted race is stated.
 - `test/datamechanics/pm-sync-declared-adoption.datamechanics.test.ts` — after adoption the link row's `provider_resource_id` is the ADOPTED issue's id with `last_error` null, and a SECOND projection run short-circuits without re-writing the issue; after an unresolvable declared key the row records `last_error` and no `provider_resource_id`.
 - `docs/design/pm-sync-declared-issue-adoption.md` — §0d's correction to `AIO-895`'s headline evidence is repeated in the PR body, so the merge does not read as a second fix for the same misread report.
 
 ## 3. Scope
 
-**In:** the identifier index, the declared-key rung, the declared-vs-default distinction, the
-description-preserving adoption write, the unresolvable-key error, and their tests.
+**In:** the `declared_external_id` column and its migration, the identifier index, the declared-key
+rung, the seed-from-issue adoption write (§1c), the ownership refusal plus its uniqueness backstop, the
+clearing path, the `adopted` status and its four consumers, the unresolvable-key error, the single-writer
+guard, and their tests.
 
 **Deferred, each with its reason:**
 
@@ -281,7 +360,14 @@ Wrong if a row declaring an existing issue still creates a second one after this
 the rung is not in the chain where §1a puts it, and the prod evidence in §0b would be describing a
 different mechanism than the one being fixed.
 
-Wrong in the more dangerous direction if adoption ever rewrites an issue's description with the brain's
-body on first contact. That is the failure this slice can cause and today's code cannot, so it is the one
-the tests must pin hardest — a criterion asserting only "it adopted" would pass while a colleague's
-write-up was being replaced.
+Wrong in the more dangerous direction if adoption ever **erases** an issue's description — which is
+exactly what "write the brain's body" means for the canonical declaring shape, because a sync-pushed task
+has no body (`lib/ingest/tasks.ts:161-193`, `schema.sql:1195`). §1c seeds from the issue instead,
+following `inbound.ts:434`. This is the failure this slice can cause and today's code cannot, so it is
+the one the tests must pin hardest: a criterion asserting only "it adopted" would pass while a
+colleague's write-up was replaced by a footer.
+
+*(Drafts 2 and 3 both had this section contradicting §1c — draft 2 by promising permanent preservation,
+draft 3 by mandating immediate overwrite while §3 still listed a "description-preserving adoption write".
+A builder reading either pair would have been ordered to test opposite behaviours. That is the SR19 class
+that blocked draft 2, and it survived one more draft by hiding in the scope list.)*
