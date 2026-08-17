@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { recordArcCorrections, listArcCorrections } from "@/lib/graph/arc-corrections";
+import { runSql } from "@/lib/db/pg/pool";
 import { db, seedTeam } from "./helpers";
 
 /**
@@ -127,6 +128,34 @@ describe("arc corrections are durable in Postgres (real Postgres)", () => {
       includeLegacy: true,
     });
     expect(tier.corrections.map((c) => c.corrected_text)).toEqual(["the CURRENT take"]);
+  });
+
+  it("the re-correction supersedes even when the legacy row's timestamp reads NEWER — the clock-inversion CI caught (deterministic)", async () => {
+    // The latent shape: recordArcCorrections stamps the APP clock at ms precision; the legacy
+    // row carries the DB clock at µs precision. Written <1ms apart (fast CI) or under app/DB
+    // clock skew, the legacy timestamp reads newer and newest-first resurrected the rejected
+    // take. Force that inversion EXPLICITLY so the test cannot depend on execution speed.
+    const seed = await seedTeam();
+    const { error } = await db()
+      .from("arc_corrections")
+      .insert({ team_id: seed.teamId, arc_id: "arc-inv", arc_title: "t", corrected_text: "the REJECTED take" });
+    expect(error).toBeNull();
+    await recordArcCorrections(db(), seed.teamId, seed.memberId, [
+      { arc_id: "arc-inv", arc_title: "t", corrected_text: "the CURRENT take" },
+    ], "acme_external,acme_team");
+    // Backdate nothing — FORWARD-date the legacy row past the scoped one by sub-millisecond.
+    await runSql(
+      `update arc_corrections set updated_at =
+         (select updated_at from arc_corrections where team_id = $1 and arc_id = 'arc-inv' and group_key <> '') + interval '0.7 milliseconds'
+       where team_id = $1 and arc_id = 'arc-inv' and group_key = ''`,
+      [seed.teamId]
+    );
+
+    const tier = await listArcCorrections(db(), seed.teamId, {
+      groupKey: "acme_external,acme_team",
+      includeLegacy: true,
+    });
+    expect(tier.corrections.map((c) => c.corrected_text), "scoped beats legacy regardless of clock").toEqual(["the CURRENT take"]);
   });
 
   it("PCCC6B-1: legacy '' rows feed ONLY a scope that opts in (the tier path) — a partition scope refuses them", async () => {
