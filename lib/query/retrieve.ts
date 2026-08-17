@@ -165,13 +165,19 @@ async function fetchGraphFacts(
 }
 
 /**
- * Enforcement input (PCCC-6): the item set gates the item legs; `graphProjectIds` — present ONLY
- * for a team-tier MEMBER on an enforcing team — re-enables the graph leg over their K-capped ready
- * partitions. Absent (external principals, delegated tokens) keeps the §5.8b omit path unchanged.
+ * Enforcement input (PCCC-6 + QMIR-1): the item set gates the item legs; `graphProjectIds` —
+ * present ONLY for a team-tier MEMBER on an enforcing team — re-enables the Graphiti leg over
+ * their K-capped ready partitions. `principal` discriminates the org-structural mirror legs
+ * (QMIR-1, docs/design/query-mirror-legs-classification.md): "member" regains actors +
+ * REPORTS_TO (tier-classed data — enforcement narrows item/graph partitions, never org
+ * visibility); anything else — "token", absent, or a foreign value — takes token semantics
+ * (default-deny; the serve test is the POSITIVE `=== "member"`, guard-pinned). Routes assign it;
+ * a caller never chooses its own arm.
  */
 export type RetrieveEnforce = {
   visibleItemIds: ReadonlySet<string>;
   graphProjectIds?: readonly string[];
+  principal: "member" | "token";
 };
 
 /** The wire half of the graph leg, injectable for tests (the client was previously constructed
@@ -539,13 +545,21 @@ async function nativeRetrieve(
 ): Promise<RetrievedContext> {
   // Access enforcement (Phase B slice 2): `enforcing` supplies the principal's membership-visible
   // item set. `visible(id)` gates the item legs (FTS/recency/dense) + source-linked decisions/tasks.
-  // `omitGraph` (= enforcing) drops every leg that carries no item grain and so can't be
-  // membership-filtered: graph (entities/relationships/Graphiti facts, until Phase C), external
-  // augmentation, the git/people activity digests, and the full-corpus task-count aggregate —
-  // fail closed rather than leak restricted content/metadata. Permissive → both are no-ops.
+  // `omitGraph` (= enforcing) drops the ITEM-GRAINED aggregate legs that can't be
+  // membership-filtered: external augmentation, the git/people activity digests, and the
+  // full-corpus task-count aggregate — fail closed rather than leak restricted content/metadata.
+  // (The Graphiti leg is partition-served via graphProjectIds since PCCC-6; the ORG-STRUCTURAL
+  // mirror legs are tier-classed and gated by `serveOrgStructural` below since QMIR-1 — this flag
+  // no longer speaks for them.) Permissive → all no-ops.
   const visibleIds = enforce?.visibleItemIds ?? null;
   const visible = (itemId: string | null | undefined): boolean => visibleIds === null || (itemId != null && visibleIds.has(itemId));
   const omitGraph = enforce != null;
+  // QMIR-1 (docs/design/query-mirror-legs-classification.md §3): the actors + REPORTS_TO legs are
+  // TEAM-STRUCTURAL — an enforcing MEMBER keeps them (they see the roster on every dashboard
+  // surface); tokens and both default-deny arms (absent/foreign principal) do not. The POSITIVE
+  // `=== "member"` test is the rule — a `!== "token"` negation would fail OPEN for a future
+  // constructor that omits the field (guard-pinned).
+  const serveOrgStructural = enforce == null || enforce.principal === "member";
   // In-query filter array (Codex fold): applied inside the item-leg SQL so LIMITs rank over
   // visible rows only. null = permissive. The visible() post-filter below stays as defense-in-depth.
   const visArr: string[] | null = visibleIds ? [...visibleIds] : null;
@@ -674,9 +688,12 @@ async function nativeRetrieve(
     tier
   );
   // graph_entities / graph_relationships carry NO tier column, so they can't be audience-filtered.
-  // For an external principal we therefore omit them entirely (audit H1) rather than risk leaking
-  // internal commitments/actors/reporting lines. `emptyRows` resolves to the same `{ data }` shape.
+  // For an external principal we omit them entirely (audit H1) rather than risk leaking internal
+  // commitments/actors/reporting lines. `emptyRows` resolves to the same `{ data }` shape.
   const emptyRows = Promise.resolve({ data: [] as unknown[] });
+  // COMMITMENTS stay omitted for every enforcing principal (QMIR-1 §3.5): the type has no
+  // production writer today, and the moment one lands its rows are ITEM-DERIVED and must be
+  // partition-classed from birth — this leg must not be the door they leak through.
   const commitmentsB =
     isRestrictedTier(tier) || omitGraph
       ? emptyRows
@@ -686,17 +703,19 @@ async function nativeRetrieve(
           .eq("team_id", teamId)
           .eq("entity_type", "commitment")
           .limit(30);
+  // The enforcing arm narrows to the ORG-STRUCTURAL allowlist (REPORTS_TO only — OWNS/BLOCKS have
+  // no production writer and would be item-derived); the permissive triple is today's behavior.
   const relsB =
-    isRestrictedTier(tier) || omitGraph
+    isRestrictedTier(tier) || !serveOrgStructural
       ? emptyRows
       : db
           .from("graph_relationships")
           .select("from_id, to_id, relationship_type")
           .eq("team_id", teamId)
-          .in("relationship_type", ["REPORTS_TO", "OWNS", "BLOCKS"])
+          .in("relationship_type", enforce == null ? ["REPORTS_TO", "OWNS", "BLOCKS"] : ["REPORTS_TO"])
           .limit(80);
   const actorsB =
-    isRestrictedTier(tier) || omitGraph
+    isRestrictedTier(tier) || !serveOrgStructural
       ? emptyRows
       : db
           .from("graph_entities")
@@ -976,15 +995,16 @@ export async function retrieve(
   tier: "team" | "external",
   question: string,
   projectSlug?: string | null,
-  // Access enforcement (Phase B slice 2 + PCCC-6, spec §5.2/§5.8b). Present = the team is
-  // 'enforcing' and this principal's membership-visible item set is supplied: item legs
+  // Access enforcement (Phase B slice 2 + PCCC-6 + QMIR-1, spec §5.2/§5.8b). Present = the team
+  // is 'enforcing' and this principal's membership-visible item set is supplied: item legs
   // (FTS/recency/dense) and source-linked decisions/tasks are filtered to it. The GRAPHITI graph
   // leg is PARTITIONED (PCCC-6) when graphProjectIds is present (team-tier members): searched over
   // the K-capped, read-ready, unsuppressed stored-pointer partitions with covered/total disclosed;
-  // absent graphProjectIds (external principals, delegated tokens) the graph legs stay OMITTED —
-  // §5.8b fail-closed. The Postgres entities/relationships mirrors and the aggregate digests remain
-  // omitted under enforcing (PCCC-6b / follow-up territory). Absent enforce = permissive → tier path with the
-  // partition union.
+  // absent graphProjectIds (external principals, delegated tokens) that leg stays OMITTED —
+  // §5.8b fail-closed. The ORG-STRUCTURAL mirror legs (actors + REPORTS_TO) are tier-classed
+  // (QMIR-1): served when `principal === "member"`, omitted for tokens and both default-deny
+  // arms; commitments stay omitted under enforcing. The aggregate digests remain omitted under
+  // enforcing. Absent enforce = permissive → tier path with the partition union.
   enforce?: RetrieveEnforce | null
 ): Promise<RetrievedContext> {
   const provider = selectedProviderName() === "external" ? externalProvider : nativeProvider;

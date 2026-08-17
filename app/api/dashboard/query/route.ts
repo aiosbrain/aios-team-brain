@@ -196,7 +196,9 @@ export async function POST(req: NextRequest) {
       // PCCC-6: the dashboard chat is the members' PRIMARY conversational surface — it gets the
       // K-capped partitioned graph leg exactly like /api/v1/query (review Medium 7: leaving it on
       // the omit path while the API had the leg was an unrecorded split). Team-tier members only.
-      enforce = { visibleItemIds: ids, ...(me.tier === "team" ? { graphProjectIds: projectIds } : {}) };
+      // QMIR-1: only members reach this route (`authenticateApiKey` fail-closes the aiosd_ prefix
+      // before it), so `principal: "member"` — the org-structural legs follow the tier.
+      enforce = { visibleItemIds: ids, principal: "member", ...(me.tier === "team" ? { graphProjectIds: projectIds } : {}) };
     }
   } catch {
     return errorResponse("internal", "enforcement check failed", 500);

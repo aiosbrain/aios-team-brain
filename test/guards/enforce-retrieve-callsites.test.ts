@@ -100,8 +100,12 @@ describe("delegated query wiring in app/api/v1/query/route.ts (Phase B slice 3)"
     // flag-gated member path must be its else-branch — so the agent arm can neither lose the
     // assignment (call kept, enforce stays null → unfiltered retrieve with graph legs live) nor
     // be nested inside teamEnforcesAccess (flag-dependent → permissive team widens the token).
+    // QMIR-1 widened the pin: the agent arm must ALSO carry `principal: "token"` — the
+    // org-structural mirror legs key on the positive member test, so losing the discriminant
+    // here silently costs nothing today but is the field a future refactor must not drop.
+    // Comment lines between the resolve and the assignment are permitted; code is not.
     expect(src).toMatch(
-      /if\s*\(agent\)\s*\{\s*const\s*\{\s*ids\s*\}\s*=\s*await\s+delegatedVisibleItemIds\(\s*db\s*,\s*agent\s*\)\s*;\s*enforce\s*=\s*\{\s*visibleItemIds:\s*ids\s*\}\s*;\s*\}\s*else\s+if\s*\(await\s+teamEnforcesAccess/
+      /if\s*\(agent\)\s*\{\s*const\s*\{\s*ids\s*\}\s*=\s*await\s+delegatedVisibleItemIds\(\s*db\s*,\s*agent\s*\)\s*;\s*(?:\/\/[^\n]*\n\s*)*enforce\s*=\s*\{\s*visibleItemIds:\s*ids\s*,\s*principal:\s*"token"\s*\}\s*;\s*\}\s*else\s+if\s*\(await\s+teamEnforcesAccess/
     );
     // No bare `enforce = null` assignment may exist anywhere (Codex B3 Low: the sequence regex
     // above survives a later re-null). The typed declaration (`let enforce: … | null = null`)

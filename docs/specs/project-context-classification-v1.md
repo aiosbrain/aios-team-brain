@@ -566,7 +566,7 @@ there; plus actors and Graphiti facts):
 | Leg | V2 filter |
 |---|---|
 | Decisions / tasks | join their row-grain units' memberships against the oracle set (Part II units) |
-| graph_entities / graph_relationships | partition `group_id` ∈ the oracle's graph set (§6); the Postgres mirrors gain a `group_id` column in the Phase C widening. **Until that widening lands, these two legs are OMITTED from query context for every attenuated or partitioned principal — all `aiosd_*` tokens, and any member whose effective set is narrower than their legacy tier view** (round-3 Codex Critical: Phase B admits delegated `query` while these mirrors are still unpartitioned; serving them would hand a scoped token team-wide entities/relationships. Fail closed by omission, not filtered-by-nothing) |
+| graph_entities / graph_relationships | **TIER-classed, not partition-classed (QMIR-1, `docs/design/query-mirror-legs-classification.md` — supersedes the group_id widening this row previously promised; measured 2026-08-16 the tables hold only org-structural rows, sole production writer `lib/graph/company-actors.ts`).** An enforcing TEAM-tier MEMBER is served the org-structural allowlist — `actor` entities and `REPORTS_TO` edges only; the serve test is the positive `principal === "member"` on the route-assigned discriminant. All `aiosd_*` tokens, absent/foreign-principal payloads, and the external tier keep the fail-closed omission of all three legs (round-3 Codex Critical posture, unchanged). **Standing obligation on every serving surface (`lib/query/retrieve.ts` AND `app/api/v1/company-graph/route.ts`, whose entity read is type-unfiltered today): a future writer of item-derived entity types (commitments, OWNS/BLOCKS, …) must partition-class its rows at write (a `group_id` or membership join), and no serving surface may serve those types to a scoped principal** |
 | Graphiti facts | `group_ids` parameter from the oracle (§5.9) |
 | Actors / people | derived from visible items only; no standalone leg may bypass the oracle |
 
@@ -1110,10 +1110,12 @@ precisely so the access chain exists before anything depends on it:
   Eval: unchanged baseline must pass post-backfill.
 - **B — Enforced reads**: FTS/dense/timeline/arcs through the oracle; citation/abstention rules;
   RLS on content tables + the backstop test; permission inspector + admin screens 1–2; leak suite
-  paths 1–2, 4–6, 9–10. **Phase B's `query` opens to `aiosd_*` tokens with the
-  `graph_entities`/`graph_relationships` legs OMITTED for attenuated/partitioned principals**
-  (§5.8b) — those mirrors stay unpartitioned until C, and enforced retrieval means every leg it
-  serves is enforced, not most.
+  paths 1–2, 4–6, 9–10. Phase B's `query` opened to `aiosd_*` tokens with the
+  `graph_entities`/`graph_relationships` legs omitted for attenuated/partitioned principals.
+  **As-built (QMIR-1, post-Phase-C): those mirrors are TIER-classed (§5.8b row above) — an
+  enforcing team-tier member is served the org-structural allowlist (actors + REPORTS_TO);
+  tokens and the external tier keep the omission absolutely.** Enforced retrieval still means
+  every leg it serves is enforced, not most.
 - **C — Per-project graphs**: group_id scheme, projector fan-out + cache, per-project arcs, bolt
   guard, cost surfacing; FalkorDB spike = exit gate; leak suite graph paths; eval principal axis.
 - **D — Tagging at scale** (Part II engine on the Phase A substrate): container defaults, review queue,

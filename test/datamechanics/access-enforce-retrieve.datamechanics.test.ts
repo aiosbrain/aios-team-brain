@@ -61,7 +61,7 @@ describe("enforced retrieval (Phase B slice 2)", () => {
     void openItem;
   });
 
-  it("enforcing: the Postgres graph legs (commitments/actors) are OMITTED — can't be membership-filtered until Phase C", async () => {
+  it("enforcing: the commitments leg stays OMITTED — even for the member arm (QMIR-1: no production writer; a future one must be partition-classed from birth)", async () => {
     const seed = await seedTeam();
     await ingest(seed, { path: "g.md", body: `g ${TERM}`, access: "team", project: "src" });
     await backfillTeamContext(db(), seed.teamId);
@@ -72,9 +72,12 @@ describe("enforced retrieval (Phase B slice 2)", () => {
     const permissive = await retrieve(db(), seed.teamId, "team", `about ${TERM}`, null, null);
     expect(permissive.structured, "permissive shows the commitment").toContain("ship the widget");
 
-    const enforce = { visibleItemIds: (await visibleItemIds(db(), { teamId: seed.teamId, memberId: member })).ids };
+    // The MEMBER arm — the strongest form: QMIR-1 reopened the org-structural legs for exactly
+    // this principal, and the commitments leg must stay closed even so. (The actors-half
+    // INVERSION is pinned in test/datamechanics/query-mirror-legs.datamechanics.test.ts.)
+    const enforce = { visibleItemIds: (await visibleItemIds(db(), { teamId: seed.teamId, memberId: member })).ids, principal: "member" as const };
     const enforcing = await retrieve(db(), seed.teamId, "team", `about ${TERM}`, null, enforce);
-    expect(enforcing.structured, "enforcing OMITS the graph leg (fail closed until Phase C)").not.toContain("ship the widget");
+    expect(enforcing.structured, "enforcing OMITS commitments (type allowlist, QMIR-1)").not.toContain("ship the widget");
   });
 
   it("enforcing: a decision AND task tied to a RESTRICTED item are dropped from the structured block (source-item gate)", async () => {
