@@ -67,6 +67,12 @@ export function detectMisfitThresholds(
   for (const [source, cadence] of Object.entries(cadenceBySource)) {
     const thresholdMs = thresholdFor(source);
     if (thresholdMs === null) continue; // never aged → nothing to mis-fit
+    // A non-finite threshold slips past BOTH the null check and the `<` comparison below, because
+    // every comparison with NaN is false — it would emit a finding whose numbers are NaN and whose
+    // sort key poisons the comparator. Unreachable through `staleThresholdMs` (literal constants
+    // only), and closed here rather than trusted, since the map is exactly the thing this module
+    // exists to be suspicious of.
+    if (!Number.isFinite(thresholdMs)) continue;
     if (!Number.isFinite(cadence.runs) || cadence.runs < 2) continue; // no gap observable from <2 runs
     if (!Number.isFinite(cadence.worstGapMs)) continue;
     // `>=`, not `>`: the banner fires at `now - clock > threshold`, and a gap that lands exactly ON
