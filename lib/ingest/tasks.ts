@@ -199,6 +199,13 @@ export async function materializeTasks(
     if (error) throw new Error(`task row ${row.row_key}: ${error.message}`);
     const task = taskIdSchema.parse(data);
 
+    /**
+     * ADOPTDECL-1 — this is the ONLY legal writer of `declared_external_id`.
+     *
+     * A human naming an issue on a task row is the one fact the projector cannot reconstruct:
+     * `provider_external_id` is defaulted to `row_key` by `ensureLink`, so a value there proves
+     * nothing. `declared_external_id` is never defaulted, so non-null means "a human named this".
+     */
     if (row.pm_provider && row.pm_external_id) {
       const { error: linkError } = await db.from("task_pm_links").upsert(
         {
@@ -208,12 +215,37 @@ export async function materializeTasks(
           row_key: row.row_key,
           provider: row.pm_provider,
           provider_external_id: row.pm_external_id,
+          declared_external_id: row.pm_external_id,
           provider_url: row.pm_url ?? "",
           updated_at: syncedAt,
         },
         { onConflict: "team_id,project_id,row_key,provider" }
       );
       if (linkError) throw new Error(`task PM link ${row.row_key}: ${linkError.message}`);
+    } else {
+      /**
+       * WITHDRAWAL. Deleting the declaration from the markdown must actually clear it, or the row
+       * fails forever under the unresolvable-key rule with no remedy short of manual SQL.
+       *
+       * Two things this deliberately is NOT (both found in review):
+       *  • not conditioned on `pm_provider` still being present — the NATURAL withdrawal deletes both
+       *    fields, and a trigger that needs the provider would never fire for it;
+       *  • never an INSERT. `provider_external_id` is `not null` with no default, so an upsert here
+       *    would have no legal value to supply for a row that has no link yet — it would either throw
+       *    inside the push or force ingest to invent the very default this column exists to escape.
+       *    An UPDATE that matches nothing is exactly the right no-op.
+       */
+      const { error: clearError } = await db
+        .from("task_pm_links")
+        .update({ declared_external_id: null, updated_at: syncedAt })
+        .eq("team_id", teamId)
+        .eq("project_id", projectId)
+        .eq("row_key", row.row_key)
+        // Only rows that actually carry a declaration. Without this the clear fires for EVERY
+        // undeclared row on EVERY push — one round-trip each, and `updated_at` stops meaning "last
+        // change" and starts meaning "last file push", which the admin panel sorts by.
+        .not("declared_external_id", "is", null);
+      if (clearError) throw new Error(`task PM link clear ${row.row_key}: ${clearError.message}`);
     }
   }
 

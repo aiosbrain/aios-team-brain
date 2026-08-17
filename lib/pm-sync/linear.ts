@@ -44,6 +44,10 @@ interface LinearBootstrap {
   members: Map<string, string>; // normalized name / displayName / email → user id
   issuesByExt: Map<string, LinearIssue>; // row_key → issue
   issuesById: Map<string, LinearIssue>;
+  /** ADOPTDECL-1 — human identifier ("AIO-877") → issue, for rows that DECLARED one. */
+  issuesByIdentifier: Map<string, LinearIssue>;
+  /** The team's issue-key prefix ("AIO"), so an unresolved key can be called foreign instead of a typo. */
+  teamKey: string | null;
 }
 
 // Build the assignee resolver index from team members. A normalized name OR displayName shared by two
@@ -112,6 +116,7 @@ function resolveStateByGroup(states: LinearState[], desired: DesiredState): Line
 async function buildBootstrap(ctx: LinearCtx, teamId: string): Promise<LinearBootstrap> {
   const data = await linearGraphql<{
     team: {
+      key?: string | null;
       states: { nodes: LinearState[] };
       labels: { nodes: LinearLabel[] };
     } | null;
@@ -120,12 +125,14 @@ async function buildBootstrap(ctx: LinearCtx, teamId: string): Promise<LinearBoo
     ctx.apiKey,
     `query ProjectionBootstrap($teamId: String!) {
       team(id: $teamId) {
+        key
         states(first: 100) { nodes { id name type } }
         labels(first: 250) { nodes { id name } }
       }
     }`,
     { teamId }
   );
+  const teamKey = data.team?.key ?? null;
   const states = data.team?.states.nodes ?? [];
   const labels = new Map<string, string>((data.team?.labels.nodes ?? []).map((l) => [l.name, l.id]));
 
@@ -153,6 +160,7 @@ async function buildBootstrap(ctx: LinearCtx, teamId: string): Promise<LinearBoo
 
   const issuesByExt = new Map<string, LinearIssue>();
   const issuesById = new Map<string, LinearIssue>();
+  const issuesByIdentifier = new Map<string, LinearIssue>();
   type IssuesPage = { team: { issues: { pageInfo: { hasNextPage: boolean; endCursor: string }; nodes: LinearIssue[] } } | null };
   let after: string | null = null;
   for (let i = 0; i < 100; i++) {
@@ -173,13 +181,15 @@ async function buildBootstrap(ctx: LinearCtx, teamId: string): Promise<LinearBoo
     if (!conn) break;
     for (const issue of conn.nodes) {
       issuesById.set(issue.id, issue);
+      // Free: `identifier` is already on every node this query returns. No extra round-trip.
+      if (issue.identifier) issuesByIdentifier.set(issue.identifier, issue);
       const ext = parseExt(issue.description);
       if (ext) issuesByExt.set(ext, issue);
     }
     if (!conn.pageInfo.hasNextPage) break;
     after = conn.pageInfo.endCursor;
   }
-  return { teamId, states, labels, members, issuesByExt, issuesById };
+  return { teamId, states, labels, members, issuesByExt, issuesById, issuesByIdentifier, teamKey };
 }
 
 async function ensureLabelIds(ctx: LinearCtx, boot: LinearBootstrap, names: string[]): Promise<string[]> {
@@ -267,7 +277,7 @@ export const linearAdapter: PmAdapter = {
     return seen;
   },
 
-  async upsertWorkItem({ task, link, integration, desiredFingerprint, statusOnly, bootstrap, fetchImpl }: UpsertWorkItemInput): Promise<UpsertWorkItemResult> {
+  async upsertWorkItem({ task, link, integration, desiredFingerprint, statusOnly, bootstrap, fetchImpl, ownedResourceIds }: UpsertWorkItemInput): Promise<UpsertWorkItemResult> {
     const ctx = linearCtx({ integration, link, fetchImpl });
     const desired = desiredStateForStatus(task.status);
 
@@ -313,11 +323,68 @@ export const linearAdapter: PmAdapter = {
     const priority = priorityToLinearInt(task.priority);
     const parent = task.parentResourceId ?? null;
     const assigneeId = resolveAssigneeId(boot.members, task.assignee);
-    const description = withFooter(task.body, task.row_key, ctx.externalSource);
     const desiredFields = { title: task.title, stateId: state.id, priority, labelIds, parent, body: task.body, assigneeId };
 
-    // Adopt-or-create: resource id wins, else the footer marker carrying the row_key.
-    const existing = (link?.provider_resource_id ? boot.issuesById.get(link.provider_resource_id) : undefined) || boot.issuesByExt.get(task.row_key);
+    /**
+     * ADOPTDECL-1 — the third rung: an issue a HUMAN named on this row.
+     *
+     * `declared_external_id` is non-null only when the task markdown carried `pm_external_id`
+     * (`lib/ingest/tasks.ts` is its single writer). `provider_external_id` cannot be used here:
+     * `ensureLink` defaults it to `row_key`, so a value there proves nothing and matching on it would
+     * adopt a stranger's issue for any row whose key happens to look like an identifier.
+     *
+     * Ordered LAST so it never overrides a link that already knows its issue, and only consulted when
+     * the first two rungs miss — which is what makes it an adoption rather than a re-resolution.
+     */
+    const declared = (link?.declared_external_id ?? "").trim();
+    const byResourceId = link?.provider_resource_id ? boot.issuesById.get(link.provider_resource_id) : undefined;
+    const byFooter = boot.issuesByExt.get(task.row_key);
+    let adopted: LinearIssue | undefined;
+    if (!byResourceId && !byFooter && declared) {
+      const candidate = boot.issuesByIdentifier.get(declared);
+      if (!candidate) {
+        // A declared key we cannot honour is an ERROR, not a licence to invent a second issue —
+        // creating one is the silent-duplicate behaviour this whole slice exists to remove.
+        const foreign = boot.teamKey && declared.split("-")[0] !== boot.teamKey;
+        throw new PmSyncError(
+          foreign
+            ? `Linear issue ${declared} declared on ${task.row_key} is not in team ${boot.teamKey} — probably another team's issue`
+            : `Linear issue ${declared} declared on ${task.row_key} was not found in this team`
+        );
+      }
+      // Refuse to take an issue that already belongs to someone — by EITHER means. A footer-only check
+      // misses the shape that actually happens in prod: three TT1 links across three projects share
+      // Linear issue AIO-444, and that issue carries NO footer. `ownedResourceIds` comes from the
+      // caller, the only layer that can see other rows' links.
+      const ownerExt = parseExt(candidate.description);
+      if (ownerExt && ownerExt !== task.row_key) {
+        throw new PmSyncError(
+          `Linear issue ${declared} declared on ${task.row_key} already belongs to ${ownerExt} — refusing to give one issue two writers`
+        );
+      }
+      if (ownedResourceIds?.has(candidate.id)) {
+        throw new PmSyncError(
+          `Linear issue ${declared} declared on ${task.row_key} is already linked to another task row — refusing to give one issue two writers`
+        );
+      }
+      adopted = candidate;
+    }
+
+    /**
+     * The adoption body SEEDS from the issue when the brain has nothing to say.
+     *
+     * A sync-pushed task has no body — `materializeTasks` never writes one and the schema says so
+     * outright ("body is dashboard/DB-only — it never round-trips through the sync push"). So sending
+     * the brain's body on adoption would erase a human's whole write-up down to a footer, every time.
+     * `lib/pm-sync/inbound.ts` already solves this the same way for its own adoption path.
+     *
+     * Seeding only — once the brain HAS a body, the brain's body wins, exactly as for an issue the
+     * brain created.
+     */
+    const adoptionBody = adopted && !(task.body ?? "").trim() ? stripFooter(adopted.description) : task.body;
+    const description = withFooter(adoptionBody, task.row_key, ctx.externalSource);
+
+    const existing = byResourceId || byFooter || adopted;
 
     let issue: LinearIssue;
     let mutated = false;
@@ -337,7 +404,13 @@ export const linearAdapter: PmAdapter = {
           { payload: "issueUpdate", entity: "issue" }
         );
         issue = { ...issue, ...data.issueUpdate.issue, state: { id: state.id }, priority, labels: { nodes: labelIds.map((id) => ({ id, name: "" })) }, parent: parent ? { id: parent } : null, assignee: assigneeId !== undefined ? { id: assigneeId } : issue.assignee, title: task.title, description };
+        // ALL THREE indexes, not just the first. Refreshing only `issuesById` left `issuesByExt` and
+        // `issuesByIdentifier` holding the PRE-update object, so a second row in the same batch
+        // declaring the same key read a description with no footer and adopted the issue too —
+        // deterministically, no race required.
         boot.issuesById.set(issue.id, issue);
+        if (issue.identifier) boot.issuesByIdentifier.set(issue.identifier, issue);
+        boot.issuesByExt.set(task.row_key, issue);
         mutated = true;
       }
     } else {
@@ -358,7 +431,12 @@ export const linearAdapter: PmAdapter = {
 
     return {
       provider: "linear",
-      status: mutated ? "synced" : "skipped",
+      // An adoption reports as an adoption even when no mutation was needed: the row DID change hands,
+      // and burying that under `synced`/`skipped` is how the duplicate damage stayed invisible.
+      status: adopted ? "adopted" : mutated ? "synced" : "skipped",
+      // The caller persists this into `tasks.body` and fingerprints over it — see
+      // `ProviderSyncResult.seededBody`. Without that the seed evaporates on the next push.
+      seededBody: adopted && adoptionBody !== task.body ? adoptionBody : null,
       providerResourceId: issue.id,
       providerUrl: issue.url || link?.provider_url || "",
       parentResourceId: parent,

@@ -1251,6 +1251,10 @@ create table if not exists task_pm_links (
   provider_resource_id text,
   provider_external_source text not null default 'aios',
   provider_external_id text not null,
+  -- ADOPTDECL-1: set ONLY when a human named the issue on the task row (`pm_external_id` in the
+  -- markdown). NULL means nobody declared anything. Distinct from `provider_external_id`, which
+  -- `ensureLink` defaults to `row_key` and therefore cannot express intent.
+  declared_external_id text,
   provider_url text not null default '',
   last_synced_status text,
   last_synced_at timestamptz,

@@ -44,7 +44,10 @@ export function summarizeProjectionReports(reports: ProjectionReport[]): Project
     if (r.error) errors.push(`${r.row_key}: ${r.error}`);
   }
   const failed = (counts.failed ?? 0) + (counts.missing_integration ?? 0) + (counts.missing_parent ?? 0) + (counts.cycle ?? 0);
-  const synced = counts.synced ?? 0;
+  // ADOPTDECL-1 — an adoption IS a provider write, so it counts as synced rather than falling into
+  // `unchanged`. `meta: counts` keeps the two distinguishable for anyone who needs the breakdown.
+  const adopted = counts.adopted ?? 0;
+  const synced = (counts.synced ?? 0) + adopted;
   return {
     ok: failed === 0,
     synced,

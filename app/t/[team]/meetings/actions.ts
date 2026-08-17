@@ -302,7 +302,7 @@ export async function regenerateMeetingSummaryAction(
 
 export interface PushTaskResult {
   taskId: string;
-  status: "synced" | "skipped" | "failed";
+  status: "synced" | "adopted" | "skipped" | "failed";
   url?: string;
   error?: string;
 }
@@ -416,7 +416,9 @@ export async function pushMeetingTasksAction(
     const report = reportByRowKey.get(t.row_key);
     const link = linkByTask.get(t.id);
     const status: PushTaskResult["status"] =
-      report?.status === "synced" || report?.status === "skipped" ? report.status : "failed";
+      report?.status === "synced" || report?.status === "adopted" || report?.status === "skipped"
+        ? report.status
+        : "failed";
     return {
       taskId: t.id,
       status,
