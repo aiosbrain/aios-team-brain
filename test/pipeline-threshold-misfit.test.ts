@@ -54,6 +54,14 @@ describe("detectMisfitThresholds — the behaviour", () => {
     expect(found[0]).toMatchObject({ thresholdMs: 3 * H, worstGapMs: 4 * H, runs: 100 });
   });
 
+  it("flags a gap that lands EXACTLY on the threshold — at-or-above, not strictly above", () => {
+    // The boundary is deliberate. A leg whose worst gap equals its bar is already spending time
+    // indistinguishable from broken (the banner fires at `now - clock > threshold`, and the next
+    // slightly-slower tick crosses it). This is a diagnostic, so the inclusive side is the safe one.
+    const found = detectMisfitThresholds({ onTheBar: { worstGapMs: 3 * H, p95GapMs: 1 * H, runs: 50 } }, () => 3 * H);
+    expect(found.map((f) => f.source)).toEqual(["onTheBar"]);
+  });
+
   it("reports NOTHING for a null-threshold leg — a leg that is never aged cannot be mis-fitted", () => {
     // The direction that matters: `dense`/`arcs`/`doc_task_infer` write a row only when there IS work,
     // so their gaps are unbounded by design. A detector that flagged them would produce permanent
