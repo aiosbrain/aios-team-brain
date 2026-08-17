@@ -257,6 +257,47 @@ function taskMetadata(record: ClickUpTaskRecord, workspaceId: ClickUpId): Record
   };
 }
 
+/**
+ * The task's assignees as the SOURCE-AGNOSTIC author refs `lib/attribution/resolve-authors` reads.
+ *
+ * `taskMetadata` already stamps `assignee_ids`/`assignee_emails`, but nothing consumes them:
+ * `parseAuthorRefs` handles the SINGULAR `assignee_id` for linear/plane only, and `lib/ingest/run.ts`
+ * reads that same singular key — so every ClickUp task document resolved to zero authors and the work
+ * landed unattributed while every test stayed green (AIO-924).
+ *
+ * The fix is branch #1 of `parseAuthorRefs` — structured `frontmatter.authors[]`, which takes
+ * precedence over every source-specific branch — rather than a fifth per-source special case. It also
+ * carries what a singular key structurally cannot: ClickUp tasks are MULTI-assignee, and it ships the
+ * provider id AND the email on each ref, so a team that has never run a ClickUp identity sync still
+ * resolves people by email (`resolveRef` tries the id, misses, then the email).
+ *
+ * `assignee_ids`/`assignee_emails` stay as provenance — this is additive.
+ *
+ * FOR WHOEVER BUILDS `runClickUpIngestion`: attribute these documents through
+ * `attributeIncomingItem` (or `resolveAuthors(map, parseAuthorRefs(fm), connectors)`), NOT by
+ * copying the `resolveByProviderId(idMap, "linear", doc.frontmatter.assignee_id)` line the Linear
+ * and Plane legs of `lib/ingest/run.ts` use. That line reads a key ClickUp does not emit, would
+ * silently resolve to null for every task, and would throw away every assignee after the first.
+ */
+function authorRefsFor(task: ClickUpTask): Array<Record<string, string>> {
+  return (task.assignees ?? [])
+    .map((assignee) => {
+      const ref: Record<string, string> = {
+        role: "assignee",
+        provider: "clickup",
+        external_id: String(assignee.id),
+      };
+      const email = assignee.email?.trim();
+      const name = assignee.username?.trim();
+      if (email) ref.email = email;
+      if (name) ref.display_name = name;
+      return ref;
+    })
+    // A blank id with no email and no name is no author at all; `parseAuthorRefs` would drop it
+    // anyway, and an entry it drops is one the "add a mapping" queue never gets to see.
+    .filter((ref) => ref.external_id.trim() !== "" || ref.email || ref.display_name);
+}
+
 function dedupeRecords(records: ClickUpTaskRecord[]): ClickUpTaskRecord[] {
   const byId = new Map<string, ClickUpTaskRecord>();
   for (const record of records) {
@@ -313,8 +354,13 @@ export function normalizeClickUpTasks(input: NormalizeClickUpTasksInput): ItemPa
   // roughly 700 B/task the body crossed the cap around 1,400 tasks and the strict parser then rejected
   // the payload, importing NOTHING. Chunking into several `task` items is NOT the fix: the row sweep in
   // `lib/ingest/tasks.ts` deletes every synced row in the PROJECT that the incoming item omits, so a
-  // second chunk would delete the first. So `rows` (unbounded in the schema) stays complete and carries
-  // the data, and only the human-readable detail in the body is bounded.
+  // second chunk would delete the first. So `rows` stays complete and carries the data, and only the
+  // human-readable detail in the body is bounded.
+  //
+  // `rows` is no longer UNBOUNDED, though: brain-api 1.20 caps it at `MAX_PAYLOAD_ROWS` (5,000) so an
+  // over-large workspace fails as a 422 naming `rows` and the limit rather than an opaque 413 (AIO-923).
+  // A workspace above that ceiling must be split by SELECTING FEWER LISTS — i.e. into separate brain
+  // projects — never into two pushes of the same project, which is the delete-the-first case above.
   //
   // The digest is what preserves the idempotency property: it covers EVERY line, including any the body
   // drops, so a metadata-only change still advances `content_sha256` and an identical replay still
@@ -372,6 +418,9 @@ export function normalizeClickUpTaskDocs(input: NormalizeClickUpTasksInput): Ite
         source: "clickup",
         workspace_id: String(input.workspaceId),
         ...taskMetadata(record, input.workspaceId),
+        // Read by `parseAuthorRefs` branch #1 — see `authorRefsFor`. Must stay AFTER the spread so a
+        // future `taskMetadata` key can never shadow the one signal attribution depends on.
+        authors: authorRefsFor(task),
         status: resolveStatus(record, input.statusMaps),
         source_ts: clickUpWorkedAt(task),
       },
@@ -472,6 +521,17 @@ export function normalizeClickUpDoc(workspaceId: ClickUpId, input: ClickUpReadDo
       url: input.doc.url ?? "",
       creator_id: input.doc.creator === undefined ? "" : String(input.doc.creator),
       editor_ids: editors,
+      // Same AIO-924 gap as the task documents: `creator_id`/`editor_ids` are provenance nothing reads.
+      // A Doc's creator outranks its editors (ROLE_RANK: creator 1, editor 2), so the primary author is
+      // the person who wrote it, and every editor still gets multi-author credit.
+      authors: [
+        ...(input.doc.creator === undefined
+          ? []
+          : [{ role: "creator", provider: "clickup", external_id: String(input.doc.creator) }]),
+        ...editors
+          .filter((id) => String(input.doc.creator ?? "") !== id)
+          .map((id) => ({ role: "editor", provider: "clickup", external_id: id })),
+      ],
       page_ids: pages.map(({ page }) => String(page.id)),
       source_ts: docSourceTimestamp(input.doc, pages),
       content_format: "text/md",

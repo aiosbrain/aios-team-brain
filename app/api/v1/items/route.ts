@@ -10,6 +10,7 @@ import {
   IngestValidationError,
   TierViolationError,
 } from "@/lib/api/schemas";
+import { MAX_PAYLOAD_ROWS } from "@/lib/api/item-payload-schema";
 import { ingestItem } from "@/lib/ingest";
 import { attributeIncomingItem } from "@/lib/attribution/resolve-authors";
 import { projectChangedTasksAfterWrite } from "@/lib/pm-sync";
@@ -20,7 +21,28 @@ import {
 
 export const runtime = "nodejs";
 
+/** The per-item `body` cap. Also enforced by `commonItemFields.body` in the payload schema. */
 const MAX_PAYLOAD = 1_000_000; // 1 MB per contract
+
+/**
+ * The whole-REQUEST transport ceiling (brain-api 1.20, AIO-923) — deliberately NOT `MAX_PAYLOAD`.
+ *
+ * A `task`/`decision` payload is `body` PLUS up to `MAX_PAYLOAD_ROWS` rows, and this gate used to be
+ * `MAX_PAYLOAD * 1.2` ≈ 1.2 MB — so it fired at roughly 1,100 rows, long before any row bound, with a
+ * bare `413 payload_too_large / "max 1 MB"` that named no field. Since chunking client-side is not
+ * available (the row sweep in `lib/ingest/tasks.ts` deletes every synced row the incoming item omits,
+ * so chunk 2 deletes chunk 1), a whole workspace has to fit in ONE request or fail with a reason.
+ * 5,000 rows × ~700 B ≈ 3.5 MB, +1 MB of body, +20% slack for JSON framing.
+ *
+ * The ceiling is now a bound on abuse, not on legitimate use: anything under it that is still too big
+ * is rejected by the SCHEMA, naming `rows` and the limit (422), which is the diagnosable failure.
+ * DoS surface: this raises the max bytes one authenticated key can push per request ~4.5×, bounded by
+ * the 120 pushes/min rate limit below (≈ 5.4 GB/min/key worst case, vs ≈ 1.2 GB/min before) — a
+ * ceiling on an ALREADY-AUTHENTICATED principal in a self-hosted, single-org deployment, where the
+ * same key can already push 120 × 1.2 MB/min. Untrusted volume is gated by authentication, not by
+ * this number.
+ */
+const MAX_REQUEST_BYTES = Math.ceil((MAX_PAYLOAD + MAX_PAYLOAD_ROWS * 700) * 1.2);
 const PAGE_SIZE = 200;
 
 export async function POST(req: NextRequest) {
@@ -33,7 +55,13 @@ export async function POST(req: NextRequest) {
   }
 
   const len = parseInt(req.headers.get("content-length") || "0", 10);
-  if (len > MAX_PAYLOAD * 1.2) return errorResponse("payload_too_large", "max 1 MB", 413);
+  if (len > MAX_REQUEST_BYTES) {
+    return errorResponse(
+      "payload_too_large",
+      `request exceeds ${MAX_REQUEST_BYTES} bytes (body max 1 MB, rows max ${MAX_PAYLOAD_ROWS})`,
+      413
+    );
+  }
 
   let json: unknown;
   try {
