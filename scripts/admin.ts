@@ -20,6 +20,17 @@ import { createTeam, renameTeam } from "@/lib/admin/teams";
 import { addAuthorAlias } from "@/lib/admin/aliases";
 import { linkGithub, listOrgMembers } from "@/lib/codebases/github";
 import { setMemberIdentity } from "@/lib/identity/member-identities";
+import {
+  ENFORCEMENT_MODES,
+  isEnforcementMode,
+  setAccessEnforcement,
+  type EnforcementReadiness,
+} from "@/lib/admin/access-enforcement";
+// EXPLICIT-ID purge only. `purgeItemsByPathPrefix` is deliberately NOT imported: it is path-scoped
+// and team-wide, and the workspace path roots (`0-context/`, `2-work/`, `3-log/`) are shared by every
+// project in a team — a prefix purge from a command line would take out unrelated real content. That
+// footgun stays behind the ingest callers that build their prefix from the same helper that wrote it.
+import { purgeItemIds } from "@/lib/ingest/purge";
 
 type Flags = Record<string, string | boolean>;
 
@@ -70,8 +81,46 @@ const USAGE = `Team Brain admin CLI — commands:
   link-identity <member-email> <provider> <external-id> [--handle <h>] [--email <e>] [--team <id|slug>] [--force]
                                          # link a provider user id (e.g. slack U…) to a member
   sync-github --org <org> [--team <id|slug>]                               # list candidates (needs GITHUB_TOKEN)
+  set-access-enforcement <team-slug> <permissive|enforcing> [--dry-run]
+                                         # arm/disarm per-project access enforcement for ONE team.
+                                         # 'enforcing' bootstraps + drains the §11 backfill first,
+                                         # then REFUSES if anyone would be locked out of their own
+                                         # content. 'permissive' is today's behaviour and the undo.
+                                         # The team is a POSITIONAL here — never the --team default.
+  purge-items --team <id|slug> --ids <uuid,uuid,…> --reason "<text>" [--confirm]
+                                         # irreversibly remove specific items + their versions/chunks/
+                                         # facts, retire their graph episodes, audit, bust derived
+                                         # caches. DRY RUN by default — --confirm actually deletes.
+                                         # Explicit ids only; there is no path-prefix form here.
   pg:schema                              # load postgres/schema.sql (idempotent)
 Defaults: --team demo (accepts a team UUID too). Requires DATABASE_URL (postgres). GitHub token via GITHUB_TOKEN env only.`;
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const PURGE_USAGE = `purge-items --team <id|slug> --ids <uuid,uuid,…> --reason "<text>" [--confirm]`;
+
+/** Print an enforcement readiness verdict. Blockers are why the flip is refused; warnings are real
+ *  behaviour changes the operator still has to know about, so they print on a PASS too. */
+function printReadiness(r: EnforcementReadiness): void {
+  console.log(
+    `readiness: ${r.itemsScanned} item(s) scanned, ${r.unpartitioned.count} unpartitioned; ` +
+      `${r.humanPrincipals} human + ${r.agentPrincipals} agent principal(s)`
+  );
+  if (r.unpartitioned.examples.length > 0) {
+    console.log(`  unpartitioned e.g.: ${r.unpartitioned.examples.join(", ")}`);
+  }
+  if (r.blindHumans.length > 0) {
+    console.log("  members who would see NOTHING under enforcing:");
+    console.table(r.blindHumans.map((m) => ({ email: m.email, tier: m.tier, member_id: m.memberId })));
+  }
+  for (const w of r.warnings) console.log(`  ⚠ ${w}`);
+  for (const [label, rows] of [
+    ["agent", r.unplacedAgents],
+    ["connector", r.activeConnectors],
+  ] as const) {
+    if (rows.length > 0) console.table(rows.map((m) => ({ [label]: m.email, member_id: m.memberId })));
+  }
+  console.log(r.ready ? "  ✓ ready to enforce" : "  ✗ NOT ready to enforce");
+}
 
 async function memberIdByEmail(admin: ReturnType<typeof adminClient>, teamId: string, email: string) {
   const { data } = await admin
@@ -273,6 +322,138 @@ async function main() {
         die(`${provider}:${externalId} is already linked to a different member${r.note ? ` (${r.note})` : ""}; pass --force to reassign`);
       }
       console.log(`✓ ${provider}:${externalId} → ${email} (${r.created ? "created" : r.updated ? "updated" : "unchanged"})`);
+      break;
+    }
+    case "set-access-enforcement": {
+      // The team is POSITIONAL, deliberately: every other command falls back to `--team demo`, and
+      // a silent default on the one flag that decides what a whole team can see is exactly the
+      // accident this command must not enable. Naming the team is the point.
+      const teamRef =
+        positionals[0] ||
+        die(`usage: set-access-enforcement <team-slug> <${ENFORCEMENT_MODES.join("|")}> [--dry-run]`);
+      const mode = positionals[1];
+      if (!mode || !isEnforcementMode(mode)) {
+        // Reject anything outside the two literals BEFORE touching the DB. `teamEnforcesAccess`
+        // treats every non-'enforcing' string as permissive, so a typo ('enforce', 'Enforcing')
+        // would write a value that reads back as OFF while looking like it worked.
+        die(
+          `invalid mode '${mode ?? ""}' — must be exactly one of: ${ENFORCEMENT_MODES.join(", ")}\n` +
+            `  usage: set-access-enforcement <team-slug> <${ENFORCEMENT_MODES.join("|")}> [--dry-run]`
+        );
+      }
+      const team = await resolveTeam(admin, teamRef);
+      const dryRun = Boolean(flags["dry-run"]);
+      if (mode === "enforcing" && !dryRun) {
+        console.log(`• preparing ${team.slug}: access bootstrap + §11 context backfill (idempotent) …`);
+      }
+      const r = await setAccessEnforcement(admin, team.id, mode, { dryRun });
+      if (r.prepared) {
+        console.log(
+          `  prepared: ${r.prepared.batches} batch(es), ${r.prepared.unitsCreated} unit(s), ${r.prepared.membershipsCreated} membership(s) created`
+        );
+      }
+      if (r.readiness) printReadiness(r.readiness);
+      if (!r.ok) die(r.error ?? "failed");
+      if (dryRun) {
+        console.log(
+          `• dry run — nothing written. ${team.slug} is '${r.previous}'; '${mode}' would ` +
+            (mode === "permissive" ? "always be safe (it is the fail-open direction)." : "be safe to apply now.")
+        );
+        break;
+      }
+      // The mode below is the value READ BACK from the row, not the one we asked for.
+      console.log(
+        r.changed
+          ? `✓ ${team.slug} access_enforcement: ${r.previous} → ${r.mode}`
+          : `• ${team.slug} access_enforcement already '${r.mode}' (no change)`
+      );
+      if (r.mode === "enforcing") {
+        console.log(
+          "  scope: enforcement covers GET /api/v1/items, retrieval + both query routes, delegated\n" +
+            "  aiosd_ tokens, the work timeline and narrative arcs. Other dashboard surfaces are NOT\n" +
+            "  yet enforced — see docs/OPS.md §9. Undo with: set-access-enforcement <team> permissive"
+        );
+      }
+      break;
+    }
+    case "purge-items": {
+      // A destructive command must not inherit the `--team demo` default: `--team` is REQUIRED here.
+      if (typeof flags.team !== "string" || !flags.team.trim()) {
+        die(`--team is required for purge-items (no default) — usage: ${PURGE_USAGE}`);
+      }
+      const idList = typeof flags.ids === "string" ? flags.ids : die(`--ids is required — usage: ${PURGE_USAGE}`);
+      const reason =
+        (typeof flags.reason === "string" && flags.reason.trim()) ||
+        die(`--reason is required (it is written into the items.purged audit row) — usage: ${PURGE_USAGE}`);
+      if (flags.confirm && flags["dry-run"]) die("pass either --confirm or --dry-run, not both");
+      const given = [...new Set(idList.split(",").map((s) => s.trim()).filter(Boolean))];
+      if (given.length === 0) die("--ids resolved to no ids");
+      // Validate BEFORE touching the DB: a malformed id is a typo, and a typo in a purge argument is
+      // the one input where "ignore what doesn't parse" is the wrong default.
+      const malformed = given.filter((id) => !UUID_RE.test(id));
+      if (malformed.length > 0) die(`not well-formed uuids: ${malformed.join(", ")}`);
+      // Canonicalize AFTER validating: Postgres renders uuids lowercase, and the found/missing
+      // reconciliation below is a string compare — an operator pasting an uppercase id from a
+      // spreadsheet would otherwise be told their own item "is not on this team".
+      const requested = [...new Set(given.map((id) => id.toLowerCase()))];
+
+      const team = await resolveTeam(admin, flags.team);
+      const { data: rows, error: readErr } = await admin
+        .from("items")
+        .select("id, path, kind, access")
+        .eq("team_id", team.id)
+        .in("id", requested);
+      if (readErr) die(`items read failed: ${readErr.message}`);
+      const found = (rows ?? []) as { id: string; path: string; kind: string; access: string }[];
+      const missing = requested.filter((id) => !found.some((r) => r.id === id));
+      if (missing.length > 0) {
+        // Refuse rather than purge the subset: `purgeItemIds` is team-scoped, so an id belonging to
+        // another team would silently no-op while still being COUNTED in the result — an operator
+        // would read "14 purged" for 13 deletions. Make the mismatch the operator's decision.
+        die(`${missing.length} id(s) are not items on team ${team.slug}: ${missing.join(", ")}`);
+      }
+
+      // Episode preview: `graph_episodes.source_id` has no FK to items, so these rows are exactly what
+      // a raw `delete from items` would orphan (and, where `episode_uuid` is set, leave live in Neo4j).
+      const { data: eps } = await admin
+        .from("graph_episodes")
+        .select("source_id, episode_uuid, deferred")
+        .eq("team_id", team.id)
+        .eq("source_table", "items")
+        .in("source_id", requested);
+      const episodeRows = (eps ?? []) as { source_id: string; episode_uuid: string | null; deferred: boolean }[];
+      const projected = episodeRows.filter((e) => e.episode_uuid).length;
+
+      console.log(`Team ${team.slug} — ${found.length} item(s) resolved for purge:`);
+      console.table(
+        found.map((r) => ({
+          id: r.id,
+          path: r.path,
+          kind: r.kind,
+          access: r.access,
+          episodes: episodeRows.filter((e) => e.source_id === r.id).length,
+        }))
+      );
+      console.log(
+        `graph episodes: ${episodeRows.length} ledger row(s), ${projected} projected into Graphiti/Neo4j (episode_uuid set)`
+      );
+      console.log(`reason: ${reason}`);
+
+      if (!flags.confirm) {
+        console.log(
+          "• DRY RUN — nothing deleted. This is irreversible; re-run the same command with --confirm to purge."
+        );
+        break;
+      }
+
+      const result = await purgeItemIds(admin, team.id, found.map((r) => r.id), reason);
+      console.log(`✓ purged ${result.items} item(s) on ${team.slug} — versions/chunks/facts cascaded`);
+      console.log(`✓ retired ${result.episodes} graph episode ledger row(s) (graph cleanup finishes via reconcile)`);
+      console.log(`✓ audit row written: action='items.purged' (reason + the paths above)`);
+      console.log(
+        "• derived caches: work_timeline_cache + arc_cache bust requested via bustTeamLearningCaches —\n" +
+          "  best-effort, so if a bust failed the error is printed above and those surfaces self-heal on TTL."
+      );
       break;
     }
     case "sync-github": {
