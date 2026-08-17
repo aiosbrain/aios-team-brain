@@ -154,9 +154,15 @@ background) on the branch diff. The prompt shape that works:
 
 ## 4. Codex adversarial review
 
-`codex exec --sandbox read-only -m gpt-5.6 "<prompt>"` in the background (model
-id current as of 2026-08; update as Codex models roll). Same prompt discipline
-as step 2, plus:
+`codex exec --sandbox read-only -m gpt-5.5 "<prompt>"` in the background. Same prompt
+discipline as step 2, plus:
+
+- **`gpt-5.5`, not `gpt-5.6`, on a ChatGPT-login account.** `-m gpt-5.6` fails the whole
+  run with `400 invalid_request_error: The 'gpt-5.6' model is not supported when using
+  Codex with a ChatGPT account` — and it fails AFTER the prompt is sent, so it burns a
+  round trip and reads like a hang if you are not watching the output. This step said
+  `gpt-5.6` and cost exactly that on GRAPHSMALL-1. Update the id when the account's
+  supported set actually changes, and verify with a one-line probe before a long review.
 
 - Tell it what Fable found and what was folded (including refuted claims), and
   explicitly task it with breaking the folds.
