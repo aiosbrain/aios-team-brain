@@ -144,8 +144,12 @@ resolution error yields the EMPTY scope, never the union.
   if its shape assertions bite. The recompute route's scope-key vocabulary narrows to `g:`
   keys; an ABSENT `sourceGroup` (the old permissive-client shape) now gets a 422 naming the
   new requirement (M5: a NEW refusal class, stated — not "unchanged"; the served panel
-  annotates every arc with `sourceGroup` post-cutover, so live UI self-heals on next load, and
-  the one panel component sending recomputes is updated in this slice).
+  annotates every arc with `sourceGroup` post-cutover, so live UI self-heals on next load;
+  verified during build: `components/learning/arcs-panel.tsx` has grouped per-partition and
+  sent `sourceGroup` whenever arcs carry it since PPARC-3 — NO component change is needed, and
+  a stale pre-deploy panel's group-less POST gets the 422 until reload. A team member editing
+  an external-shared arc now receives the H1 422 with its stated reason — accepted; hiding the
+  edit affordance for that partition is UI-phase polish).
 - **Cold-start cost:** a formerly-tier-path reader's first fused read synthesizes AT MOST ONE
   partition inline and warms the rest under `PPARC_SYNTH_BUDGET_PER_READ`
   (`lib/graph/arcs.ts`, consumed by `lib/graph/arc-fusion.ts`) — the same bill the tier row
