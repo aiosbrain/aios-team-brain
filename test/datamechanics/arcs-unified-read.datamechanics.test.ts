@@ -192,4 +192,21 @@ describe("PRET-3 H3 — the reclassification purge door covers the external PART
     expect(await readArcCache(db(), seed.teamId, `g:${extGroup}`), "hard-deleted, not stale-marked").toBeNull();
     expect(await readArcCache(db(), seed.teamId, `g:${teamGroup}`), "the team partition is not the door's business").not.toBeNull();
   });
+
+  it("…and on a RENAMED team the door follows the FROZEN pointer, not the current slug (review H4)", async () => {
+    const seed = await seedTeam();
+    expect((await ensureAccessBootstrap(db(), seed.teamId)).ok).toBe(true);
+    const frozenExt = episodeGroupId(seed.teamSlug, "external"); // the pointer minted pre-rename
+    await writeArcCache(db(), seed.teamId, `g:${frozenExt}`, ARC("pre-rename external prose") as never, "h1");
+    // The rename: the slug moves, the built-in's pointer stays frozen (the rename doctrine).
+    const newSlug = `${seed.teamSlug}x`;
+    await runSql("update teams set slug = $2 where id = $1", [seed.teamId, newSlug]);
+
+    await purgeExternalTierCaches(db(), seed.teamId, newSlug);
+
+    expect(
+      await readArcCache(db(), seed.teamId, `g:${frozenExt}`),
+      "a slug-derived key would miss the frozen pointer and leave the served row alive"
+    ).toBeNull();
+  });
 });
