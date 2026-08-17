@@ -46,8 +46,13 @@ function racingDb(reads: string[], audits: unknown[], opts: { allowWrite?: boole
           update: () => {
             if (!opts.allowWrite) throw new Error("the no-op path must never UPDATE the row");
             // The guarded update (…and access_enforcement = previous) against a raced row
-            // matches ZERO rows — the adapter reports success with nothing changed.
-            const chain = { eq: () => chain, then: (r: (v: { error: null }) => void) => r({ error: null }) };
+            // matches ZERO rows — RETURNING yields an empty set (Codex M2: the matched-row
+            // count, not a read-back, is what distinguishes "my write landed" from "someone
+            // else landed the same mode").
+            const chain = {
+              eq: () => chain,
+              select: async () => ({ data: [], error: null }),
+            };
             return chain;
           },
         };
@@ -83,17 +88,17 @@ describe("setAccessEnforcement — the no-op path reads back with the same disci
     expect(audits, "permissive→permissive is not a visibility change worth a trail entry").toEqual([]);
   });
 
-  it("the WRITE path's guarded predicate: a raced write fails its read-back cleanly, no audit row (PRET-2)", async () => {
+  it("the WRITE path's guarded predicate: a raced write matches zero rows and fails, no audit row (PRET-2)", async () => {
     const audits: unknown[] = [];
-    // Operator A downgrades to `permissive` from a row that reads `enforcing`; operator B flips
-    // it to `enforcing`... the row A's guarded update targeted no longer matches — zero rows
-    // change, and the read-back reveals the raced value instead of A's.
-    // reads: previous=enforcing (A's first read) → read-back=enforcing (B re-flipped / A's
-    // guarded update matched nothing).
-    const res = await setAccessEnforcement(racingDb(["enforcing", "enforcing"], audits, { allowWrite: true }), "t1", "permissive");
+    // Operator A downgrades to `permissive` from a row that reads `enforcing`; a concurrent
+    // flip moves the row first. A's guarded update matches ZERO rows — and the matched-count
+    // judgment catches even the SAME-TARGET race (B landed the same mode A wanted), where the
+    // old read-back would have reported A's write as `changed:true` and fired a second,
+    // mis-attributed audit row for one actual transition (Codex M2).
+    const res = await setAccessEnforcement(racingDb(["enforcing"], audits, { allowWrite: true }), "t1", "permissive");
 
     expect(res.ok, "a write that did not land is not a success").toBe(false);
-    expect(res.error).toMatch(/read-back mismatch/);
+    expect(res.error).toMatch(/matched 0 row/);
     expect(audits, "no phantom enforcement_changed row for a write that matched zero rows").toEqual([]);
   });
 });

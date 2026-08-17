@@ -160,6 +160,11 @@ create table if not exists teams (
 -- legacy-tier-only reads, byte-identical; 'enforcing' = oracle membership filter ∧ legacy tier (GET /api/v1/items only this slice).
 -- CHECK lives in the 20260811160000 migration (named, replay-repairable).
 alter table teams add column if not exists access_enforcement text not null default 'permissive';
+-- PRET-2: the auto-flip operator-undo hold — set atomically with any downgrade to permissive,
+-- cleared by any enforcing flip (sole writer lib/admin/access-enforcement). Control state, NOT
+-- audit-derived (Codex PRET-2 High 2: a best-effort audit row cannot enforce an operator
+-- safety decision). Mirrored in postgres/migrations/20260817120000_autoflip_hold.sql.
+alter table teams add column if not exists autoflip_hold boolean not null default false;
 -- Additive columns for existing deployments.
 alter table teams add column if not exists primary_pm_provider text;
 alter table teams add column if not exists answering_provider text;

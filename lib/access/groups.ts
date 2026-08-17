@@ -376,3 +376,24 @@ export async function revokeProjectFromGroup(
   await auditWrite(db, teamId, actorMemberId, "access.project_revoked", projectId, { groupId });
   return { ok: true };
 }
+
+/**
+ * READ helper for PRET-2's cheap warning scan (lib/admin/access-enforcement): which of these
+ * members hold at least one group membership. Lives HERE because the access-chain single-writer
+ * guard rightly refuses any other file that names the edge tables while containing write verbs
+ * (the variable-table idiom defense) — a read in the sanctioned file keeps the coarse net tight.
+ */
+export async function placedMemberIds(
+  db: DbClient,
+  teamId: string,
+  memberIds: readonly string[]
+): Promise<Set<string>> {
+  if (memberIds.length === 0) return new Set();
+  const { data, error } = await db
+    .from("group_members")
+    .select("member_id")
+    .eq("team_id", teamId)
+    .in("member_id", [...memberIds]);
+  if (error) throw new Error(`group_members read failed: ${error.message}`);
+  return new Set(((data ?? []) as { member_id: string }[]).map((r) => r.member_id));
+}

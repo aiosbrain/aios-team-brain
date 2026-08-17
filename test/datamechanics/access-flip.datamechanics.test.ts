@@ -10,7 +10,7 @@ import {
   readAccessEnforcement,
   setAccessEnforcement,
 } from "@/lib/admin/access-enforcement";
-import { runAutoFlipPass } from "@/lib/admin/auto-flip-pass";
+import { runAutoFlipPass, resetAutoFlipRotation } from "@/lib/admin/auto-flip-pass";
 
 /**
  * PRET-2 — the UNATTENDED flip path (spec docs/design/pret2-convergence-gated-flip.md §2;
@@ -128,6 +128,26 @@ describe("PRET-2 — warnings defer BEFORE any drain; manual flip still works (c
   });
 });
 
+describe("PRET-2 — the AUTHORITATIVE warning gate nets what the cheap scan misses (Codex M4)", () => {
+  it("a grouped-but-grantless agent passes the cheap scan yet still defers at the full assessment", async () => {
+    const { createGroup, addMemberToGroup } = await import("@/lib/access/groups");
+    const seed = await seedTeam();
+    await ingest(seed, { path: "g.md", body: `grantless ${TERM}`, access: "team", project: "src" });
+    await backfillTeamContext(db(), seed.teamId);
+    // The shape the cheap scan CANNOT see: the agent HAS a group membership (so the bulk
+    // placed-check passes) but the group grants no project — the oracle resolves zero.
+    const agent = await seedMember(seed, { kind: "agent" });
+    const g = await createGroup(db(), seed.teamId, "grantless", "Grantless", seed.memberId);
+    expect(g.ok, g.error).toBe(true);
+    expect((await addMemberToGroup(db(), seed.teamId, g.groupId!, agent, seed.memberId)).ok).toBe(true);
+
+    const r = await autoFlipIfReady(db(), seed.teamId);
+    expect(r.flipped, "refuseOnWarnings must catch the under-detected shape post-drain").toBe(false);
+    expect(r.deferred?.warnings.join(" ")).toContain("agent");
+    expect(await readAccessEnforcement(db(), seed.teamId)).toBe("permissive");
+  });
+});
+
 describe("PRET-2 — error containment, idempotency, and the operator-undo hold (criterion 4)", () => {
   it("an induced error defers (never throws), an enforcing team no-ops with no audit row", async () => {
     // A nonexistent team makes the mode read throw inside — autoFlipIfReady must contain it.
@@ -174,8 +194,61 @@ describe("PRET-2 — error containment, idempotency, and the operator-undo hold 
   });
 });
 
+describe("PRET-2 — the hold is durable control state, not an audit inference (Codex H2)", () => {
+  it("the hold ignores a MISLEADING audit trail — control state lives in the row, not the log", async () => {
+    const seed = await seedTeam();
+    await ingest(seed, { path: "d.md", body: `durable ${TERM}`, access: "team", project: "src" });
+    await backfillTeamContext(db(), seed.teamId);
+    expect((await autoFlipIfReady(db(), seed.teamId)).flipped).toBe(true);
+    expect((await setAccessEnforcement(db(), seed.teamId, "permissive")).ok).toBe(true);
+    // The audit trail is APPEND-ONLY by trigger (a wipe is impossible), so the discriminator is
+    // sharper: append a MISLEADING newest row claiming the last change was to 'enforcing' —
+    // exactly what a raced/duplicated best-effort trail can look like. The old audit-derived
+    // hold read latest.to and would flip; the atomic column must not care.
+    await runSql(
+      `insert into audit_log (team_id, actor_kind, action, target_type, target_id, meta)
+       values ($1::uuid, 'system', 'access.enforcement_changed', 'team', $1::text, '{"from":"permissive","to":"enforcing"}'::jsonb)`,
+      [seed.teamId]
+    );
+
+    const r = await autoFlipIfReady(db(), seed.teamId);
+    expect(r.flipped, "the hold is a teams column written atomically with the downgrade").toBe(false);
+    expect(await readAccessEnforcement(db(), seed.teamId)).toBe("permissive");
+    // And the manual re-flip clears it atomically too — the team is auto-eligible again after.
+    expect((await setAccessEnforcement(db(), seed.teamId, "enforcing")).ok).toBe(true);
+  });
+});
+
+describe("PRET-2 — blocked teams cannot starve ready ones (Codex H1: fair rotation)", () => {
+  it("with the budget saturated by permanent blockers, a ready team still flips by the next pass", async () => {
+    resetAutoFlipRotation();
+    const blocked: Seed[] = [];
+    for (let i = 0; i < 3; i++) {
+      const s = await seedTeam();
+      await ingest(s, { path: "b.md", body: `blocked ${TERM}`, access: "team", project: "src" });
+      await backfillTeamContext(db(), s.teamId);
+      // The unhealable reserved-slug refusal — a PERMANENT blocker consuming a drain slot.
+      await runSql("update groups set is_builtin = false where team_id = $1 and slug = 'everyone'", [s.teamId]);
+      blocked.push(s);
+    }
+    const ready = await seedTeam();
+    await ingest(ready, { path: "r.md", body: `ready ${TERM}`, access: "team", project: "src" });
+    await backfillTeamContext(db(), ready.teamId);
+
+    // Pass 1 may spend its whole budget on the blockers (worst-case enumeration order).
+    await runAutoFlipPass(db());
+    // Pass 2: rotation moved every drained-and-refused team to the back — the ready team must
+    // reach the budget now. Without rotation the same three blockers re-consume every slot
+    // forever and this team NEVER flips (the exact starvation Codex H1 constructed).
+    await runAutoFlipPass(db());
+    expect(await readAccessEnforcement(db(), ready.teamId)).toBe("enforcing");
+    for (const s of blocked) expect(await readAccessEnforcement(db(), s.teamId)).toBe("permissive");
+  });
+});
+
 describe("PRET-2 — the pass is rate-limited and per-team contained (criterion 5)", () => {
   it("five ready teams: one pass flips exactly 3, the next flips the remaining 2", async () => {
+    resetAutoFlipRotation();
     const seeds: Seed[] = [];
     for (let i = 0; i < 5; i++) {
       const s = await seedTeam();

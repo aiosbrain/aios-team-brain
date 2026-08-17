@@ -33,11 +33,14 @@ describe("guard: PRET-2 auto-flip call sites", () => {
     expect(src).toContain("autoFlipIfReady");
   });
 
-  it("the flip write carries the guarded predicate (program §4's flip-writer contract)", () => {
-    // The unit race test pins the read-back OUTCOME; this pins the PREDICATE itself — the fake
-    // in that test cannot observe .eq() chains, so removing the guard would leave it green.
+  it("the flip write carries the guarded predicate, the atomic hold, and RETURNING (program §4 + Codex H2/M2)", () => {
+    // The unit race test pins the OUTCOME; this pins the statement SHAPE itself — the fake in
+    // that test cannot observe .eq() chains, so removing the guard, the hold column, or the
+    // RETURNING select would leave it green.
     const src = read("lib/admin/access-enforcement.ts");
-    expect(src).toMatch(/update\(\{ access_enforcement: mode \}\)\s*\n?\s*\.eq\("id", teamId\)\s*\n?\s*\.eq\("access_enforcement", previous\)/);
+    expect(src).toMatch(
+      /update\(\{ access_enforcement: mode, autoflip_hold: mode === "permissive" \}\)\s*\n?\s*\.eq\("id", teamId\)\s*\n?\s*\.eq\("access_enforcement", previous\)\s*\n?\s*\.select\("access_enforcement"\)/
+    );
   });
 
   it("PRET_FLIP_MAX_PER_TICK has exactly one parse site", () => {

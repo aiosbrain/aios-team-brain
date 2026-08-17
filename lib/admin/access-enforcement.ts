@@ -224,6 +224,12 @@ export interface SetEnforcementOptions {
   dryRun?: boolean;
   /** Member id to attribute the audit row to (an operator running the CLI has none). */
   actorMemberId?: string | null;
+  /** The UNATTENDED policy (PRET-2, Codex M4's exactness fix): refuse to write when the
+   *  AUTHORITATIVE readiness assessment carries warnings — the manual path shows warnings to a
+   *  human who decides; the unattended path has no human. Living here (post-drain, pre-write)
+   *  means the cheap pre-scan in `autoFlipIfReady` is purely a cost optimization: a warning
+   *  shape it under-detects still nets at this gate, never as an unwarned flip. */
+  refuseOnWarnings?: boolean;
 }
 
 /**
@@ -260,6 +266,15 @@ export async function setAccessEnforcement(
         ...base,
         ok: false,
         error: `refusing to enforce — ${readiness.blockers.join("; ")}`,
+        prepared,
+        readiness,
+      };
+    }
+    if (opts.refuseOnWarnings && readiness.warnings.length > 0) {
+      return {
+        ...base,
+        ok: false,
+        error: `deferred on warnings (unattended policy) — ${readiness.warnings.join("; ")}`,
         prepared,
         readiness,
       };
@@ -301,21 +316,28 @@ async function writeMode(
     }
     return { ok: true, mode: readBack };
   }
-  // Guarded predicate (PRET-2, program §4's binding flip-writer contract): the write applies
-  // only if the row still holds the mode we read — a write raced by a concurrent flip matches
-  // zero rows and FAILS its read-back below, instead of clobbering and firing a mis-attributed
-  // audit row.
-  const { error } = await db
+  // Guarded predicate + RETURNING (PRET-2, program §4's flip-writer contract; Codex M2): the
+  // write applies only if the row still holds the mode we read, and success is judged by the
+  // MATCHED ROW COUNT — a plain read-back cannot distinguish "my write landed" from "a
+  // concurrent caller landed the same target mode", which reported changed:true and fired a
+  // second, mis-attributed audit row for one actual transition. The hold column travels in the
+  // SAME statement (Codex H2): any downgrade arms it, any enforcing flip clears it — atomic by
+  // construction, no separate write to fail silently.
+  const { data, error } = await db
     .from("teams")
-    .update({ access_enforcement: mode })
+    .update({ access_enforcement: mode, autoflip_hold: mode === "permissive" })
     .eq("id", teamId)
-    .eq("access_enforcement", previous);
+    .eq("access_enforcement", previous)
+    .select("access_enforcement");
   if (error) return { ok: false, error: `write failed: ${error.message}` };
-  // Read back: the CHECK constraint, a raced write, or a silently-dropped update all look like
-  // success at the call site otherwise, and this flag is the one an operator must not be wrong about.
-  const readBack = await readAccessEnforcement(db, teamId);
-  if (readBack !== mode) return { ok: false, error: `read-back mismatch: wrote '${mode}', row says '${readBack}'` };
-  return { ok: true, mode: readBack };
+  const rows = (data ?? []) as { access_enforcement: string }[];
+  if (rows.length !== 1) {
+    return { ok: false, error: `concurrent change: the guarded write matched ${rows.length} row(s) — the row moved under us` };
+  }
+  if (rows[0].access_enforcement !== mode) {
+    return { ok: false, error: `write anomaly: wrote '${mode}', RETURNING says '${rows[0].access_enforcement}'` };
+  }
+  return { ok: true, mode: rows[0].access_enforcement };
 }
 
 async function auditFlip(db: DbClient, teamId: string, from: string, to: string, memberId: string | null) {
@@ -347,10 +369,14 @@ export interface AutoFlipResult {
 }
 
 /**
- * The CHEAP warning scan (spec §1.1: computed BEFORE any drain is paid): the two unattended
- * warning classes — active connectors (members read only) and unplaced agents (oracle per AGENT
- * principal only). Mirrors `assessEnforcementReadiness`'s warning semantics without its coverage
- * scan or per-human loop; the full assessment remains the flip gate itself.
+ * The CHEAP warning scan (spec §1.1: computed BEFORE any drain is paid), a COST OPTIMIZATION
+ * only — the AUTHORITATIVE warning gate is `setAccessEnforcement`'s `refuseOnWarnings`
+ * (post-drain, pre-write), so a shape this scan under-detects nets there, never as an unwarned
+ * flip (Codex M4). Two adapter queries, NO per-agent oracle loop (the old loop was unbounded
+ * N+1 — an oracle call per agent per permissive team per tick): connectors from the members
+ * read; unplaced agents from one bulk group-membership read via the groups module's sanctioned
+ * helper (an agent in a group with zero
+ * project grants is the rare shape the authoritative gate still catches).
  */
 export async function assessUnattendedWarnings(db: DbClient, teamId: string): Promise<string[]> {
   const warnings: string[] = [];
@@ -367,35 +393,16 @@ export async function assessUnattendedWarnings(db: DbClient, teamId: string): Pr
     warnings.push(`active connector member(s) would read ZERO items under enforcing`);
   }
   const agents = all.filter((m) => isPrincipal({ ...m, tier: m.tier ?? undefined }) && m.kind !== "human");
-  for (const a of agents) {
-    const { projectIds } = await visibleProjects(db, { teamId, memberId: a.id });
-    if (projectIds.size === 0) {
+  if (agents.length > 0) {
+    // One bulk read via the groups module's sanctioned helper (the access-chain single-writer
+    // guard rightly refuses this file naming the edge tables directly — it contains write verbs).
+    const { placedMemberIds } = await import("@/lib/access/groups");
+    const placed = await placedMemberIds(db, teamId, agents.map((a) => a.id));
+    if (agents.some((a) => !placed.has(a.id))) {
       warnings.push(`agent member(s) in no granted group would read ZERO items under enforcing`);
-      break; // one warning class entry — the fingerprint keys on the CLASS, not the census
     }
   }
   return warnings;
-}
-
-/** The operator-undo HOLD (spec §1.1, corrected during build): ANY downgrade to permissive
- *  excludes the team from auto-flip; only a manual re-flip to enforcing re-arms it. The spec's
- *  original member-attributed-only rule was DEFEATED by reality: the CLI — the one real undo
- *  path — runs with no member id and audits as actor_kind 'system', so an attribution-keyed
- *  hold never engaged for exactly the undo it protects (the H3 scenario, reopened). Every
- *  downgrade writer that exists today is human-driven; a future genuinely-mechanical
- *  downgrader must opt back into auto-flip explicitly (a marker in its audit meta), not by
- *  this hold silently ignoring it. Fail direction: fewer auto-flips — safe. */
-async function operatorDowngraded(db: DbClient, teamId: string): Promise<boolean> {
-  const { data, error } = await db
-    .from("audit_log")
-    .select("actor_kind, meta")
-    .eq("team_id", teamId)
-    .eq("action", "access.enforcement_changed")
-    .order("created_at", { ascending: false })
-    .limit(1);
-  if (error) throw new Error(`audit read failed: ${error.message}`);
-  const last = ((data ?? []) as { actor_kind: string; meta: { to?: string } }[])[0];
-  return last != null && last.meta?.to === "permissive";
 }
 
 /** One deferral row per DISTINCT state (spec §1.1's fingerprint latch): an unchanged stuck state
@@ -418,6 +425,9 @@ async function deferAutoFlip(
       .eq("team_id", teamId)
       .eq("action", "access.autoflip_deferred")
       .order("created_at", { ascending: false })
+      // id DESC breaks same-timestamp ties deterministically (Codex: created_at alone is
+      // unordered under equal values — the clock-tie class this repo just fixed in arc-corrections).
+      .order("id", { ascending: false })
       .limit(1);
     const last = ((data ?? []) as { meta: { fingerprint?: string } }[])[0];
     if (last?.meta?.fingerprint !== fingerprint) {
@@ -454,6 +464,9 @@ export async function latestAutoFlipDeferral(db: DbClient, teamId: string): Prom
       .eq("team_id", teamId)
       .eq("action", "access.autoflip_deferred")
       .order("created_at", { ascending: false })
+      // id DESC breaks same-timestamp ties deterministically (Codex: created_at alone is
+      // unordered under equal values — the clock-tie class this repo just fixed in arc-corrections).
+      .order("id", { ascending: false })
       .limit(1);
     const row = ((data ?? []) as { created_at: string | Date; meta: Record<string, unknown> }[])[0];
     if (!row) return null;
@@ -486,26 +499,44 @@ export async function autoFlipIfReady(
   } = {}
 ): Promise<AutoFlipResult> {
   const drainAllowed = opts.drainAllowed !== false;
+  // Tracked OUTSIDE the try so a throw AFTER the expensive stage began still reports
+  // drained:true and consumes the pass's budget (Codex M1: a late throw defaulting to
+  // drained:false let a pass run unboundedly many full drains).
+  let drained = false;
   try {
-    const mode = await readAccessEnforcement(db, teamId);
-    if (mode !== "permissive") return { flipped: false, drained: false }; // already enforcing
-    if (await operatorDowngraded(db, teamId)) return { flipped: false, drained: false }; // held
+    // ONE read for both facts: the mode, and the HOLD — a teams column written atomically with
+    // every downgrade (Codex H2: the previous audit-derived hold rode a best-effort insert
+    // that could silently fail, re-flipping an operator's undo within a tick; and audit
+    // created_at ties are unordered). Only a manual enforcing flip clears it.
+    const { data, error } = await db
+      .from("teams")
+      .select("access_enforcement, autoflip_hold")
+      .eq("id", teamId)
+      .maybeSingle();
+    if (error) throw new Error(`team read failed: ${error.message}`);
+    if (!data) throw new Error(`team ${teamId} not found`);
+    const row = data as { access_enforcement: string; autoflip_hold?: boolean | null };
+    if (row.access_enforcement !== "permissive") return { flipped: false, drained }; // already enforcing
+    if (row.autoflip_hold === true) return { flipped: false, drained }; // held — the undo stands
     const warnings = await assessUnattendedWarnings(db, teamId);
     if (warnings.length > 0) return deferAutoFlip(db, teamId, { blockers: [], warnings });
-    if (!drainAllowed) return { flipped: false, drained: false }; // ready — queued for next pass
-    const r = await setAccessEnforcement(db, teamId, "enforcing", { actorMemberId: null });
-    if (r.ok) return { flipped: r.changed, drained: true };
+    if (!drainAllowed) return { flipped: false, drained }; // ready — queued for next pass
+    drained = true;
+    const r = await setAccessEnforcement(db, teamId, "enforcing", { actorMemberId: null, refuseOnWarnings: true });
+    if (r.ok) return { flipped: r.changed, drained };
     // A refusal AFTER readiness passed (a raced guarded write, a genuine write error) carries
     // empty blockers — `r.error` is then the only reason and must reach the audit row (review
     // M1: `?? []` never falls through on an empty-but-present array, so the deferral explained
-    // nothing).
-    const blockers = r.readiness?.blockers?.length ? r.readiness.blockers : [r.error ?? "refused"];
-    return deferAutoFlip(db, teamId, { blockers, warnings: r.readiness?.warnings ?? [] }, true);
+    // nothing). The authoritative warning refusal (refuseOnWarnings) lands here too, with the
+    // full assessment's warnings attached.
+    const blockers = r.readiness?.blockers?.length ? r.readiness.blockers : r.readiness?.warnings?.length ? [] : [r.error ?? "refused"];
+    return deferAutoFlip(db, teamId, { blockers, warnings: r.readiness?.warnings ?? [] }, drained);
   } catch (err) {
-    return deferAutoFlip(db, teamId, {
-      blockers: [],
-      warnings: [],
-      error: err instanceof Error ? err.message : String(err),
-    });
+    return deferAutoFlip(
+      db,
+      teamId,
+      { blockers: [], warnings: [], error: err instanceof Error ? err.message : String(err) },
+      drained
+    );
   }
 }

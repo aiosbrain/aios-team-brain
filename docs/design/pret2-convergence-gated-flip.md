@@ -8,7 +8,12 @@ access: team
 its contracts; deviations below are narrowings, called out inline.
 **Ticketing (SR12):** row `PRET-2` in the workspace `3-log/tasks.md` (parent row `PRET-1`),
 projected to Linear by pm-sync on `aios push`; this slice's PR carries `AIOS-Work: PRET-2`.
-**Deps:** PRET-1 merged (the program design; PR #580). No schema change, no migration.
+**Deps:** PRET-1 merged (the program design; PR #580). ONE additive schema change (amended
+from "none" by the Codex diff review, H2): `teams.autoflip_hold boolean not null default false`
+(`postgres/migrations/20260817120000_autoflip_hold.sql`, mirrored in `postgres/schema.sql`) —
+the operator-undo hold is CONTROL STATE and cannot ride a best-effort audit insert that can
+silently fail; it is written ATOMICALLY with every mode change (the same UPDATE statement:
+any downgrade arms it, any enforcing flip clears it).
 **Build with:** fable / high — this slice writes the flag that can brick a brain; every branch
 must fail toward "stays permissive, loudly".
 **Concurrency/durability (SR14):** audit rows are APPEND-ONLY inserts (`lib/api/audit.ts` —
@@ -28,28 +33,34 @@ logic):
 
 1. **`autoFlipIfReady(db, teamId)`** in `lib/admin/access-enforcement.ts`, with cost-ordered
    stages and two absolute exclusions:
-   - **The operator-undo hold (cold-read H3; rule corrected during build):** if the team's most
-     recent `access.enforcement_changed` audit row has `to: "permissive"`, the team is EXCLUDED
-     from auto-flip — an operator's one-command undo is not a 30-minute lease; only a
-     subsequent MANUAL enforcing flip re-arms the team. The hold keys on the DOWNGRADE, not its
-     attribution: the original member-attributed-only rule was defeated by reality — the CLI
-     (the one real undo path) runs member-less and audits as `actor_kind: "system"`, so an
-     attribution-keyed hold never engaged for exactly the undo it protects. Every downgrade
-     writer today is human-driven; a future genuinely-mechanical downgrader must opt back into
-     auto-flip explicitly via its audit meta, never by the hold silently ignoring it.
-   - **The cheap warning pre-check BEFORE any drain (cold-read H2):** warnings
-     (unplaced agents, active connectors) are computable from the members read + oracle alone —
-     no coverage scan, no drain. A warned team defers HERE, paying nothing.
+   - **The operator-undo hold (cold-read H3; twice corrected):** `teams.autoflip_hold` — a
+     column set atomically with ANY downgrade to permissive and cleared by any enforcing flip
+     (the sole flip writer's single UPDATE). The team is EXCLUDED from auto-flip while held;
+     only a manual re-flip re-arms it. History of the rule: originally member-attributed
+     (defeated — the CLI undo is member-less and audits as `system`), then any-downgrade but
+     AUDIT-derived (defeated — Codex H2: `audit()` is best-effort, so a downgrade whose audit
+     insert silently failed would be re-flipped within a tick, and same-timestamp audit rows
+     are unordered). Control state now lives in the row it controls.
+   - **The cheap warning pre-check BEFORE any drain (cold-read H2), as a COST OPTIMIZATION
+     only:** connectors from the members read; unplaced agents from ONE bulk `group_members`
+     read (Codex M4: the per-agent oracle loop was unbounded N+1 work). The AUTHORITATIVE
+     warning gate is `setAccessEnforcement`'s `refuseOnWarnings` option — post-drain,
+     pre-write, judging the full assessment's own warnings — so a shape the cheap scan
+     under-detects defers there, never flips unwarned.
    - Only a warning-free, un-held team proceeds to
      `setAccessEnforcement(db, teamId, "enforcing", { actorMemberId: null })` — the full
      prepare → drain → assess → refuse-or-write sequence, whose own blockers defer likewise.
    - **The deferral fingerprint latch (H2's audit-growth bound):** a deferral writes the
      `access.autoflip_deferred` audit row (meta `{ blockers, warnings, error? , fingerprint }`,
      fingerprint = sha of the sorted reason strings) ONLY when the fingerprint differs from the
-     team's most recent deferral row — an unchanged stuck state writes nothing and is skipped
-     without a drain on later ticks, so audit growth is one row per DISTINCT state, not per
-     tick. (`audit()` is best-effort and never throws — a swallowed deferral write just means
+     team's most recent deferral row — an unchanged stuck state writes nothing, so audit growth
+     is one row per DISTINCT state, not per tick (the latch is AUDIT HYGIENE only; attempt
+     scheduling belongs to the pass's rotation, §1.2). (`audit()` is best-effort and never throws — a swallowed deferral write just means
      the next tick retries the write; stated, harmless.)
+   - **Budget accounting under errors (Codex M1):** whether the expensive stage RAN is
+     tracked outside the try, so a throw AFTER the drain began still reports `drained: true`
+     and consumes the pass's budget — a late-throwing team cannot make a pass run unboundedly
+     many drains.
    - **Error containment (cold-read M2):** the whole per-team body is wrapped — any throw
      (readiness reads throw by design, `access-enforcement.ts:109,126`) becomes a deferral
      with `error` in meta, never a pass abort; `autoFlipIfReady` returns
@@ -60,12 +71,19 @@ logic):
    `lib/admin/auto-flip-pass.ts` (`runAutoFlipPass(db)`), called from `lib/ingest/scheduler.ts`'s
    tick beside `runContextBackfill` (cold-read L2: the tick is a closure with nothing to
    export today; the dm tests and the call-site guard need a module). Per pass: enumerate
-   `permissive` teams, filter out held/latched ones (audit reads on the existing
-   `(team_id, created_at desc)` index, action-filtered — fleet sizes make this trivially
-   cheap; the query is named in the module header per cold-read L3), attempt up to
-   **`PRET_FLIP_MAX_PER_TICK` (default 3, `resolvePositiveInt`)**, oldest-last-attempt first.
+   `permissive` teams (the HOLD rides the same team row and is read with the mode — no audit
+   scan on the hot path), attempt up to
+   **`PRET_FLIP_MAX_PER_TICK` (default 3, `resolvePositiveInt`)** under the rotation below.
    `AUTO_FLIP_ENABLED=false` is the operator kill switch for the whole pass (diff review: the
    rate-limit env cannot express zero; same opt-out pattern as `GRAPH_PROJECT_ENABLED`).
+   **Fair rotation (Codex H1):** the deferral latch dedups AUDIT ROWS only — it cannot order
+   the queue — so the pass keeps a per-process monotonic attempt sequence: every team whose
+   expensive stage ran rotates to the back; never-attempted teams go first. Permanent blockers
+   therefore cannot monopolize the budget (dm-pinned: 3 permanent blockers + 1 ready team,
+   budget 3 — the ready team flips by pass 2). Per-process on purpose: no schema, no clock;
+   a restart re-shuffles at most one budget's worth of attempts. A failed fleet ENUMERATION
+   returns a pass-level error the scheduler records as a FAILED `auto_flip` run (Codex M3 —
+   the mechanism must not stop silently).
    The count short-circuit is not consulted AT ALL (the latent count-skip bug,
    `backfill.ts:168`, is DEFERRED to PRET-6 with a comment at the site — it can only delay a
    scheduler backfill, never gate a flip). **Honest cost statement (H2 corrected —
@@ -94,7 +112,8 @@ logic):
    permission INSPECTOR and the CLI. `lib/access/inspect.ts` (whose result the dashboard route
    `app/api/dashboard/access/inspect/route.ts` serves, and which already reports the mode at
    `inspect.ts:76`) gains one ADDITIVE field —
-   `autoFlip: { lastAttemptAt: string; deferred: { blockers: string[]; warnings: string[] } } | null`
+   `autoFlip: { at: string; blockers: string[]; warnings: string[]; error?: string } | null`
+   (flat — as built and pinned by the route test; amended from the earlier nested draft shape)
    — populated from the most recent `access.autoflip_deferred` audit row for a still-permissive
    team; and `scripts/admin.ts`'s `access-enforcement` command prints the same. **Surfacing is
    the RAW latest deferral (reason + first-seen timestamp), amended from the earlier
@@ -168,9 +187,11 @@ The 422 wire contract and every route's refusal behavior are byte-identical thro
    already-enforcing team is a no-op with no new audit row (idempotency, the no-phantom-audit
    property the module already pins for the manual path); the RACE arm: a flip whose guarded
    write (`.eq("access_enforcement", previous)`) loses to a concurrent change fails cleanly
-   with no mis-attributed audit row; and the OPERATOR-UNDO HOLD: a team whose latest
-   enforcement change is a downgrade to permissive is never auto-flipped — regardless of
-   attribution, including the member-less CLI shape (audits as `system`).
+   with no mis-attributed audit row (the write returns its MATCHED ROWS — Codex M2: a
+   read-back cannot distinguish "my write landed" from a same-target concurrent winner);
+   and the OPERATOR-UNDO HOLD: any downgrade arms `teams.autoflip_hold` atomically and the
+   team is never auto-flipped while held — including the member-less CLI shape, and even if
+   the audit trail is wiped (dm-pinned).
 5. Same file — FIVE ready permissive teams, one scheduler pass: exactly
    `PRET_FLIP_MAX_PER_TICK` (3) flip; the remaining two flip on the next pass
    (rate limit, mutation-verified: budget 3→5 reddens the exact-count assertion).

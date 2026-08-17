@@ -313,6 +313,14 @@ export function startIngestScheduler(): void {
     try {
       const { runAutoFlipPass } = await import("@/lib/admin/auto-flip-pass");
       const r = await runAutoFlipPass(db);
+      if (r.error) {
+        // The pass itself could not run (fleet enumeration failed) — record a FAILED run so the
+        // mechanism cannot stop silently (Codex M3); the fail-closed direction (nothing flipped)
+        // is already the pass's own behavior.
+        console.error("[ingest] auto-flip pass could not enumerate teams:", r.error);
+        await recordIngestRun(db, { teamId: null, source: "auto_flip", trigger: "scheduler", ok: false, errors: [r.error], startedAt });
+        return;
+      }
       if (r.flipped.length || r.deferred.length) {
         console.info(
           `[ingest] auto-flip: flipped ${r.flipped.length}, deferred ${r.deferred.length} (drain attempts ${r.attempted.length})`
