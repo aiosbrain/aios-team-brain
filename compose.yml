@@ -68,10 +68,17 @@ services:
       TEAM_NAME: ${TEAM_NAME:-}
       ADMIN_EMAIL: ${ADMIN_EMAIL:-}
       ADMIN_NAME: ${ADMIN_NAME:-}
-      # SEED_DEMO=false for an empty brain.
-      SEED_DEMO: ${SEED_DEMO:-true}
+      # SEED_DEMO=false for an empty brain. Forwarded EMPTY rather than defaulted, and that is
+      # deliberate: bootstrap seeds the demo by default on a local URL anyway, but it also refuses
+      # to seed a production build served at a PUBLIC address unless SEED_DEMO is explicitly true
+      # (scripts/setup/deploy-policy.mjs). Baking `:-true` in here would answer that question on
+      # the operator's behalf — so running this stack behind a real domain would publish the
+      # documented demo login, which is the thing the policy exists to stop.
+      SEED_DEMO: ${SEED_DEMO:-}
       DEMO_EMAIL: ${DEMO_EMAIL:-admin@demo.local}
-      DEMO_PASSWORD: ${DEMO_PASSWORD:-aios-demo-password}
+      # Same reasoning: empty means "bootstrap decides" — the documented password locally, a
+      # generated one if the demo is ever opted into a public deploy.
+      DEMO_PASSWORD: ${DEMO_PASSWORD:-}
 
 volumes:
   pgdata:

@@ -54,6 +54,12 @@ export function isLocalAppUrl(appUrl) {
  * `SEED_DEMO=false` still wins everywhere, and now so do `0` / `no` / `off` — the previous
  * exact-string check silently seeded on any of them.
  *
+ * WHAT THIS DOES NOT CATCH, so nobody reads it as a complete answer: `NODE_ENV=production` comes
+ * from the Dockerfile, so the gate travels with the image — running bootstrap bare-metal with
+ * NODE_ENV unset still seeds. And a deployment whose APP_URL stays `localhost` because a reverse
+ * proxy fronts it is indistinguishable from a laptop from in here. Both are the same class of
+ * limit: this reads the environment the operator configured, and cannot audit the network.
+ *
  * @param {NodeJS.ProcessEnv} [env]
  * @returns {{seed: boolean, publicProduction: boolean, reason: "disabled"|"opt-in-required"|"enabled"}}
  */

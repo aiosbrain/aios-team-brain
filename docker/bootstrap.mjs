@@ -318,11 +318,18 @@ async function main() {
   // would advertise a password nobody can log in with.
   const url = process.env.APP_URL || "http://localhost:3000";
   const generated = DEMO.publicProduction && !process.env.DEMO_PASSWORD;
-  const passwordLine = !seededNow
-    ? "  Password  unchanged — the demo login from the first boot still works"
-    : generated
+  // "unchanged" is a claim about a credential that exists, so ASK. A boot that seeded the team
+  // but died before create-member leaves rows with no login; reporting that as "still works" sends
+  // the operator to a login screen that can never let them in — and a generated password from that
+  // first boot is gone (it is per-process), so silence would be the second wrong answer.
+  const passwordLine = seededNow
+    ? generated
       ? `  Password  ${DEMO_PASSWORD}   ← generated for this deploy, shown only now`
-      : `  Password  ${DEMO_PASSWORD}`;
+      : `  Password  ${DEMO_PASSWORD}`
+    : (await hasCredential(DEMO_EMAIL))
+      ? "  Password  unchanged — the demo login from the first boot still works"
+      : `  Password  NOT SET — ${DEMO_EMAIL} has no credential. Wipe the database and start again, ` +
+        `or set TEAM_SLUG + ADMIN_EMAIL to provision a real team.`;
   console.log(
     ["", "─".repeat(58), "  AIOS Team Brain is starting", "", `  URL       ${url}`,
      `  Login     ${DEMO_EMAIL}`, passwordLine, "",

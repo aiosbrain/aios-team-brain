@@ -106,6 +106,29 @@ describe("TEAM_SLUG — a typo must not become a failed deployment", () => {
   });
 });
 
+describe("compose does not answer the opt-in on the operator's behalf", () => {
+  // The policy is only real if the environment reaching bootstrap is the operator's. compose.yml
+  // used to materialise SEED_DEMO=true and DEMO_PASSWORD=aios-demo-password as explicit values —
+  // so `docker compose up` behind a real domain (APP_URL edited, as it must be for invite links)
+  // looked to bootstrap exactly like a deliberate opt-in, and seeded the documented password onto
+  // a public URL. Local behaviour is unchanged either way: an empty SEED_DEMO still seeds on a
+  // localhost APP_URL, and an empty DEMO_PASSWORD still falls back to the documented one there.
+  const compose = readFileSync(join(import.meta.dirname, "..", "compose.yml"), "utf8");
+
+  it("forwards SEED_DEMO and DEMO_PASSWORD empty rather than defaulting them", () => {
+    expect(compose).toMatch(/SEED_DEMO:\s*\$\{SEED_DEMO:-\}/);
+    expect(compose).toMatch(/DEMO_PASSWORD:\s*\$\{DEMO_PASSWORD:-\}/);
+    expect(compose).not.toContain("${SEED_DEMO:-true}");
+    expect(compose).not.toContain("aios-demo-password");
+  });
+
+  it("still seeds a laptop stack with the documented login", () => {
+    // What compose actually hands bootstrap now, with the Dockerfile's NODE_ENV.
+    const composeEnv = { NODE_ENV: "production", APP_URL: "http://localhost:3000", SEED_DEMO: "", DEMO_PASSWORD: "" };
+    expect(demoSeedDecision(composeEnv)).toMatchObject({ seed: true, publicProduction: false });
+  });
+});
+
 describe("bootstrap wires both decisions in", () => {
   // The recurring failure here is a correct helper that nothing calls. Pin the call sites.
   const src = readFileSync(join(import.meta.dirname, "..", "docker", "bootstrap.mjs"), "utf8");
@@ -114,6 +137,20 @@ describe("bootstrap wires both decisions in", () => {
     expect(src).toMatch(/import \{[^}]*demoSeedDecision[^}]*\} from "\.\.\/scripts\/setup\/deploy-policy\.mjs"/);
     expect(src).toContain("demoSeedDecision(process.env)");
     expect(src).not.toMatch(/SEED_DEMO === "false"/); // the exact-string check this replaced
+  });
+
+  it("lets the decision GATE the seed, not merely be computed", () => {
+    // Computing a decision and ignoring it is the shape this repo keeps getting bitten by: every
+    // test above would stay green if `if (!DEMO.seed) … return` were dropped from main(), and the
+    // documented credential would ship to public deploys again. main() can't be imported (module
+    // scope calls process.exit), so pin the branch structurally.
+    const gateAt = src.search(/if \(!DEMO\.seed\)/);
+    const returnAt = src.indexOf("return;", gateAt);
+    const seedAt = src.indexOf("scripts/seed-demo.ts");
+    expect(gateAt, "the !DEMO.seed early return is gone").toBeGreaterThan(-1);
+    expect(seedAt).toBeGreaterThan(-1);
+    expect(returnAt).toBeGreaterThan(gateAt);
+    expect(returnAt).toBeLessThan(seedAt); // the gate returns BEFORE anything is seeded
   });
 
   it("normalises TEAM_SLUG before create-team runs", () => {
