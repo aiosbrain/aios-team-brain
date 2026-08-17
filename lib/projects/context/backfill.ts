@@ -99,6 +99,51 @@ async function resolveSystemProjectIds(
   return { ok: true, general, externalShared };
 }
 
+const MAX_BATCHES = 10_000;
+
+export interface DrainResult {
+  ok: boolean;
+  error?: string;
+  unitsCreated: number;
+  membershipsCreated: number;
+  batches: number;
+}
+
+/**
+ * Drain ONE team's backfill cursor to completion. The single-team counterpart to
+ * `backfillAllTeams`, for callers that must know this team is fully partitioned before doing
+ * something else — today that is the enforcement flip (`lib/admin/access-enforcement.ts`), which
+ * cannot safely turn a team `enforcing` while any item still lacks a membership. Deliberately has
+ * NO convergence short-circuit: the count heuristic `backfillAllTeams` uses is a cheap tick
+ * optimization, and a caller about to change what a whole team can see needs the real drain.
+ * Guard-exhaustion is reported as a FAILURE, never a silent partial (Fable M1).
+ */
+export async function drainTeamContext(
+  db: DbClient,
+  teamId: string,
+  opts: { cutoff?: string } = {}
+): Promise<DrainResult> {
+  const cutoff = opts.cutoff ?? new Date().toISOString();
+  let cursor: string | null = null;
+  let unitsCreated = 0;
+  let membershipsCreated = 0;
+  for (let batch = 0; batch < MAX_BATCHES; batch++) {
+    const r = await backfillTeamContext(db, teamId, { afterId: cursor, createdBefore: cutoff });
+    unitsCreated += r.unitsCreated;
+    membershipsCreated += r.membershipsCreated;
+    if (!r.ok) return { ok: false, error: r.error, unitsCreated, membershipsCreated, batches: batch + 1 };
+    if (r.cursor === null) return { ok: true, unitsCreated, membershipsCreated, batches: batch + 1 };
+    cursor = r.cursor;
+  }
+  return {
+    ok: false,
+    error: `guard exhausted at cursor ${cursor} — corpus not fully backfilled`,
+    unitsCreated,
+    membershipsCreated,
+    batches: MAX_BATCHES,
+  };
+}
+
 /** Backfill every team to completion (drains the cursor per team). Best-effort per team. */
 export async function backfillAllTeams(
   db: DbClient,
@@ -108,7 +153,6 @@ export async function backfillAllTeams(
   if (error) return { teams: 0, succeeded: [], failed: [{ teamId: "*", error: `teams read failed: ${error.message}` }] };
   const succeeded: string[] = [];
   const failed: { teamId: string; error: string }[] = [];
-  const MAX_BATCHES = 10_000;
   for (const t of (teams ?? []) as { id: string }[]) {
     try {
       // Cheap convergence short-circuit — counts CURRENT MEMBERSHIPS, not units (slice-5 Codex

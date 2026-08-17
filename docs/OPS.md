@@ -434,3 +434,139 @@ invariant"):
   fail-open behavior matters. Not yet fixed as of this writing — treat the app-code enforcement
   above as the complete picture until AIO-349 lands, and do not assume RLS-equivalent protection
   exists anywhere in this schema.
+
+---
+
+## 9. Access enforcement — arming per-project visibility for a team
+
+**The one-line summary:** every team is `permissive` until someone changes it, and `permissive`
+means one flat pool — every `team`-tier member reads every other member's pushed content, and the
+whole timeline. If a customer believes their people are separated from each other, they are wrong
+until this is armed **and** their content is curated (see "What enforcing does not buy" below).
+
+### The command
+
+```
+npx tsx --conditions react-server scripts/admin.ts \
+  set-access-enforcement <team-slug> <permissive|enforcing> [--dry-run]
+```
+
+- The team is a **positional argument**, not `--team`. Every other command in this CLI defaults to
+  `--team demo`; a silent default on the flag that decides what an entire team can see is exactly
+  the accident this command must not enable, so it has to be named. A team UUID also works.
+- The mode must be **exactly** `permissive` or `enforcing`. `Enforcing`, `enforce`, `on` and
+  friends are rejected before the database is touched — `teamEnforcesAccess` reads every other
+  string as OFF, so an accepted typo would look armed and be inert.
+- `--dry-run` reports readiness and writes nothing — including no bootstrap and no backfill. It
+  answers "is this safe right now", not "could it be made safe".
+- The mode printed at the end is the value **read back off the row**, not the one you asked for.
+- Every flip writes an `audit_log` row: `action='access.enforcement_changed'`, `meta={from,to}`.
+
+### Why `enforcing` is not just an UPDATE
+
+Under enforcing a read serves only items with a current include-membership into a project the
+reader's groups are granted. A brain that has never run the §11 bootstrap and backfill has **no
+memberships at all**, so the naive flip (the raw SQL that was the only option before this command
+existed) hides 100% of the content from 100% of the people — including each person's own work.
+That is asserted, not assumed: see the `NAIVE flip … blinds everyone` case in
+`test/datamechanics/access-enforcement-flip.datamechanics.test.ts`.
+
+So `enforcing` does the preparation itself, in order:
+
+1. `ensureAccessBootstrap` — built-in groups (`everyone` / `external`), their membership synced
+   from the members table, the `general` / `external-shared` system projects, and the three grants.
+2. `drainTeamContext` — the §11 backfill, drained to completion, so every existing item has an
+   item-grain unit and an include-membership.
+3. `assessEnforcementReadiness` — then, and only then, it verifies and **refuses** on any blocker:
+   - an item with no current membership (it would become invisible to everyone), or
+   - an **active human** whose oracle-visible project set doesn't reach their tier's system
+     project (they would see nothing).
+   A refusal leaves the flag exactly as it was.
+
+Steps 1 and 2 are idempotent and are what the 30-minute scheduler tick does anyway; running them
+here just means you don't have to wait for a tick or run them by hand.
+
+**Warnings that are not blockers.** An active **agent** member in no granted group is reported but
+does not stop the flip, because agents are deliberately never auto-admitted to the built-in groups.
+The warning is literal: that agent's `GET /api/v1/items` returns zero rows under enforcing until an
+admin places it in a group that is granted something. If an integration goes quiet after a flip,
+this is the first thing to check.
+
+### Rolling back
+
+```
+… scripts/admin.ts set-access-enforcement <team-slug> permissive
+```
+
+`permissive` is never gated on readiness — it is the fail-open-to-today direction and cannot hide
+anything, so it is also the one-command undo for a team someone armed by hand in SQL.
+
+### What `enforcing` actually covers — and what it does not
+
+**Covered** (`lib/access/enforce.ts` is the primitive; scope is Phase B through slice 5):
+
+- `GET /api/v1/items`, for member keys **and** agent keys;
+- the retrieval path (`lib/query/retrieve.ts`) behind both query routes, for member keys;
+- delegated `aiosd_*` tokens — these are **always** attenuated, on a permissive team too;
+- the work timeline (`GET /api/v1/timeline`, the Pulse "Working on" card and its disclosure), via
+  a per-visibility cache variant;
+- narrative arcs (`POST /api/brain/arcs` and `…/recompute`), all-or-nothing per arc.
+
+**Not covered.** The remaining dashboard surfaces are not enforced yet — they still show
+everything the viewer's *tier* allows. Do not describe this flag to a customer as "members can now
+only see their own projects" across the product; it is true of the surfaces above and of nothing
+else. Residual, stated in `lib/access/enforce.ts` and worth repeating: an arc's synthesized prose
+is written from the full tier fact pool, so a kept arc's summary can still mention restricted work
+that isn't among its cited evidence. Per-project synthesis (Phase C) is the structural fix.
+
+**What enforcing does not buy.** On a stock team the §11 topology is `general ↔ everyone`, so an
+enforcing read is **byte-identical** to a permissive one: every team-tier member still sees every
+other member's content. Enforcement is the gate; **curation** is what closes it — an initiative
+project granted to a specific group, with the item's membership moved into that project. The flag
+only makes curation bite. (Pinned by the `enforcing ALONE does not separate teammates` case in the
+data-mechanics test above.)
+
+`admin`/`private`-tier content is orthogonal and unaffected: it is refused at the API with a `422`
+before it is ever stored, in both modes.
+
+---
+
+## 10. Removing content — `purge-items`
+
+```
+npx tsx --conditions react-server scripts/admin.ts \
+  purge-items --team <id|slug> --ids <uuid,uuid,…> --reason "<text>" [--confirm]
+```
+
+**Dry run by default.** With no `--confirm` it resolves the ids, prints each item's path, kind,
+tier and episode count, prints how many of those episodes are actually projected into
+Graphiti/Neo4j, and deletes nothing. `--confirm` is what removes content, and removal is
+irreversible.
+
+Use this instead of SQL. `delete from items` looks equivalent and is not: `graph_episodes` has **no
+foreign key** to `items`, so a raw delete orphans the ledger rows and leaves the corresponding
+nodes live in Neo4j with nothing pointing at them. The command routes through `purgeItemIds`, which
+records the paths into an `items.purged` audit row **before** deleting (afterwards nothing on the
+box can answer "what went?"), retires the graph episodes **first**, lets the FK cascade take
+`item_versions` / `item_chunks` / `extracted_facts` / `stakeholder_mentions` / `task_evidence` /
+`meeting_notes`, and busts `work_timeline_cache` + `arc_cache` so neither keeps quoting content the
+brain no longer has. `tasks.source_item_id` / `decisions.source_item_id` are set to null on
+purpose — those are independently authored records that merely cite the item.
+
+Guardrails, and why each exists:
+
+- **Explicit ids only.** The path-prefix purge (`purgeItemsByPathPrefix`) is intentionally
+  unreachable from the CLI: it is team-wide, and the workspace path roots (`0-context/`, `2-work/`,
+  `3-log/`) are shared by every project in a team, so one mistyped prefix would delete unrelated
+  real content. A guard test fails the build if it is ever imported here.
+- **`--team` is required** — no `demo` fallback on a destructive command.
+- **Every id must be a well-formed uuid**, checked before the database is touched.
+- **Every id must be an item on that team, or the command refuses.** `purgeItemIds` is
+  team-scoped, so a foreign id would silently no-op while still being counted — you would read
+  "14 purged" for 13 deletions.
+- **`--reason` is required**; it is written into the audit row.
+
+The graph cleanup finishes asynchronously: the ledger row survives as a
+`pending_delete_group_id` tombstone so `reconcileProjectedEpisodes` can retry a Graphiti blip, and
+drops only once the group is verified empty. When Graphiti isn't configured the row is dropped
+outright — nothing was ever pushed, so there is nothing to retry.
