@@ -71,6 +71,13 @@ export function parseCostText(text, label) {
   const perEp = text.match(/input tok\s+[\d,]+\s+([\d,]+) per episode/);
   if (!perEp) throw new Error(`${label}: no input-tokens-per-episode line — harness format drifted?`);
 
+  // USD/episode — C2's input, and the small-model arm's ONLY cost gate. The harness has always
+  // printed it (`graph-ingest-cost.mjs`: "cost  $X  $Y per episode"); this parser dropped it, so
+  // C2 had no reps and the registry that gates on it could never be fed. Optional, not required:
+  // the window battery does not use C2, and a missing line must not refuse an otherwise valid
+  // window session.
+  const usdPerEp = text.match(/cost\s+\$[\d.,]+\s+\$([\d.,]+) per episode/);
+
   return {
     refused: false,
     crossCheckAvailable,
@@ -78,6 +85,7 @@ export function parseCostText(text, label) {
     episodesPushed: pushed,
     signedGap: signed,
     inputTokensPerEpisode: num(perEp[1]),
+    usdPerEpisode: usdPerEp ? num(usdPerEp[1]) : null,
   };
 }
 
@@ -110,6 +118,27 @@ export function assemble(dir, items, arms = ["w10", "same", "w1"]) {
     Q7: reps[arm].map((r) => nameConvergence(r.q.nameCounts, universe)),
     C1: reps[arm].map((r) => r.c.inputTokensPerEpisode),
   });
+
+  /**
+   * The SMALL-MODEL arm's reps (GRAPHSMALL-1). A SEPARATE builder, because that arm is judged on a
+   * different registry: C2 (USD/episode) gates, C1 does not — C1 is `ratio-fall` on input TOKENS and
+   * this lever sends the SAME tokens to a cheaper model, so including it would fail the arm for a
+   * saving it cannot produce. The Q10 family and Q11 come from `measure.ts`'s summary/temporal readout.
+   */
+  const smallModelReps = (arm) => ({
+    ...metricReps(arm),
+    C1: undefined, // diagnostic only for this arm — read it, do not gate on it
+    Q10: reps[arm].map((r) => r.q.Q10?.distinctness),
+    Q10F: reps[arm].map((r) => r.q.Q10?.factOverlap),
+    Q10L: reps[arm].map((r) => r.q.Q10?.meanLength),
+    Q11: reps[arm].map((r) => r.q.Q11?.share),
+    C2: reps[arm].map((r) => r.c.usdPerEpisode),
+  });
+
+  // Exposed on the assembled result so a small-model session has a REAL path to the registry —
+  // exporting a builder nothing returns is how the first version of this slice shipped scorers the
+  // judge could not reach.
+  const smallModel = { incumbent: smallModelReps("w10"), armReps: smallModelReps };
 
   const incumbent = metricReps("w10");
   const allReps = arms.flatMap((a) => reps[a]);
@@ -155,7 +184,7 @@ export function assemble(dir, items, arms = ["w10", "same", "w1"]) {
     return row;
   });
 
-  return { session, verdict, incumbent, universe, perName, reps };
+  return { session, verdict, incumbent, universe, perName, reps, smallModel };
 }
 
 // CLI half, guarded so the parsers above are unit-testable without a results directory.

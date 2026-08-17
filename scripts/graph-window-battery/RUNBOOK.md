@@ -172,3 +172,85 @@ and the cause. The first valid session's verdict **binds**.
   and its own session under an amendment — it does not get bolted onto this one.
 - **INVALID** → fix the instrument, not the rules. More than two consecutive invalidations without a
   committed amendment blocks further sessions.
+
+---
+
+# The SMALL-MODEL arm (GRAPHSMALL-1)
+
+Spec: [`docs/design/graph-small-model-activation.md`](../../docs/design/graph-small-model-activation.md).
+Same topology, tap, corpus and reps as above. **Read the differences below — three of them are the
+kind that silently invalidate a session rather than fail it.**
+
+## What differs from the window battery
+
+| | window battery | small-model arm |
+|---|---|---|
+| arms differ by | a bind-mounted `graphiti.py` (checkable with `diff`) | a team CONFIG field, `extraction_small_model` |
+| cost gate | `C1` — input tokens/episode | **`C2` — USD/episode** |
+| extra quality metrics | — | **Q10** summary health, **Q11** temporal coverage |
+
+**`C1` is NOT the gate here, and this is the trap.** C1 is `ratio-fall` on input TOKENS: it demands
+the arm SEND 25% fewer. This lever sends the *same* tokens to a cheaper model, so C1 cannot pass by
+construction. Judging this arm on C1 pre-registers a guaranteed STOP. Use
+`smallModelMetrics({ addressableShare })` from `decision.mjs`; C1 is worth reading as a diagnostic
+(tokens should sit roughly FLAT) but gates nothing.
+
+## Step 0 — the pre-flight (FREE, and it sets the ship threshold)
+
+Do this before anything paid. It answers a question the code only *asserts*: which call kinds does the
+DEPLOYED image actually ask to downgrade?
+
+```bash
+# with the tap running (steps 1-4 above), replay a projection, then:
+node scripts/graph-window-battery/small-marker-preflight.mjs /tmp/gwb/capture-*.jsonl
+```
+
+Read `addressableShare` off the output and pass it to `smallModelMetrics({ addressableShare })`:
+
+- `node_summaries_batch` **marked** → ~28.7% addressable → C2 band **15%**.
+- `node_summaries_batch` **not marked** → ~18.7% → C2 band **10%**. A flat 15% there would need ~80%
+  realisation and would STOP a clean run that captured most of what was reachable.
+
+`missing` names a kind the code claims is eligible but which never carried the marker (shrinks the
+prize). `unexpected` names one that carried it but is not in `SMALL_ELIGIBLE_KINDS` — unclaimed
+savings, and a sign the prompt table has drifted from the image.
+
+## Step 5′ — seed each arm's config EXPLICITLY
+
+```js
+import { armConfig, effectiveSnapshot, assertArmsDiffer } from "./small-model-arms.mjs";
+armConfig("STRONG");                      // { extraction_small_model: null }  — set, never inherited
+armConfig("SMALL", "<model from EXMODEL-1's probe>");
+```
+
+**Why `STRONG` writes an explicit `null`:** `seed-local.mjs` copies the whole `teams` row and
+sequential arms SHARE the battery DB. A `STRONG` run after a `SMALL` run inherits the field, both arms
+route small, and the delta collapses — the session then reads as *"no savings, quality equal"*, which
+is indistinguishable from a real negative result. That is the worst failure this battery has.
+
+After both arms, snapshot what each **resolved** to (not what it intended) and gate on it:
+
+```js
+const v = assertArmsDiffer(effectiveSnapshot("STRONG", strongResolved), effectiveSnapshot("SMALL", smallResolved));
+if (!v.ok) throw new Error(v.reason);   // INVALID session — not a result
+```
+
+`*Resolved*` means `selectSmallExtractionBackend(...)?.model ?? null`. An arm whose model name was set
+but which still resolves to `null` (e.g. its provider is not configured) is a strong arm wearing a
+small label — only the resolved value can tell you.
+
+## Model selection
+
+Do **not** pick from a price list. `EXMODEL-1` found candidates that 400 outright, or collapse to 1–3
+entities, *while advertising structured outputs*. Run its probe first; a model that fails it produces a
+broken battery, not a battery result.
+
+## NOT YET RUNNABLE TO A Q10/Q11 VERDICT
+
+`measure.ts` does not yet read `(:Entity){name, summary}` or `RELATES_TO.valid_at` out of Neo4j, so
+`Q10`/`Q10F`/`Q10L`/`Q11` have scorers and bands but **no live readout**. Everything else — the
+registry, the C2 cost parse, arm separation, the pre-flight — is wired and tested.
+
+Deferred deliberately after review (see the spec's Scope). Do not start a paid session expecting a
+summary/temporal verdict until the Cypher lands; the cost and dedupe questions (C2, Q1/Q7) are
+answerable today.
