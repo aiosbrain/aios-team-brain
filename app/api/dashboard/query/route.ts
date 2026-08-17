@@ -196,8 +196,9 @@ export async function POST(req: NextRequest) {
       // PCCC-6: the dashboard chat is the members' PRIMARY conversational surface — it gets the
       // K-capped partitioned graph leg exactly like /api/v1/query (review Medium 7: leaving it on
       // the omit path while the API had the leg was an unrecorded split). Team-tier members only.
-      // QMIR-1: only members reach this route (`authenticateApiKey` fail-closes the aiosd_ prefix
-      // before it), so `principal: "member"` — the org-structural legs follow the tier.
+      // QMIR-1: only members reach this route — it authenticates via getSessionUser() (session
+      // cookie + members lookup); an aiosd_ bearer has no session, so no token can land here.
+      // Hence `principal: "member"` — the org-structural legs follow the tier.
       enforce = { visibleItemIds: ids, principal: "member", ...(me.tier === "team" ? { graphProjectIds: projectIds } : {}) };
     }
   } catch {

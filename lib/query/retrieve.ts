@@ -546,8 +546,9 @@ async function nativeRetrieve(
   // Access enforcement (Phase B slice 2): `enforcing` supplies the principal's membership-visible
   // item set. `visible(id)` gates the item legs (FTS/recency/dense) + source-linked decisions/tasks.
   // `omitGraph` (= enforcing) drops the ITEM-GRAINED aggregate legs that can't be
-  // membership-filtered: external augmentation, the git/people activity digests, and the
-  // full-corpus task-count aggregate — fail closed rather than leak restricted content/metadata.
+  // membership-filtered: external augmentation, the git/people activity digests, the
+  // full-corpus task-count aggregate, and the commitments mirror leg — fail closed rather than
+  // leak restricted content/metadata.
   // (The Graphiti leg is partition-served via graphProjectIds since PCCC-6; the ORG-STRUCTURAL
   // mirror legs are tier-classed and gated by `serveOrgStructural` below since QMIR-1 — this flag
   // no longer speaks for them.) Permissive → all no-ops.

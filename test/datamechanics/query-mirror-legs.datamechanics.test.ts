@@ -128,4 +128,23 @@ describe("QMIR-1 — tokens, default-deny arms, and the external tier keep the o
     expect(ctx.structured).not.toContain("REPORTS_TO");
     expect(ctx.structured).not.toContain("ship the widget");
   });
+
+  it("an ENFORCING EXTERNAL member — the combination the routes actually produce — gets none either (review Medium 2)", async () => {
+    // Both routes assign principal:"member" to external members, so serveOrgStructural is TRUE
+    // for them and ONLY the isRestrictedTier conjunct closes the legs. This arm pins that
+    // conjunct in the enforcing path — a gate rewritten to test the tier only under permissive
+    // (`(isRestrictedTier(tier) && enforce == null) || !serveOrgStructural`) leaks the org chart
+    // to enforcing external members with every other test green.
+    const seed = await seedTeam();
+    await ingest(seed, { path: "x.md", body: `x ${TERM}`, access: "external", project: "src" });
+    await backfillTeamContext(db(), seed.teamId);
+    await seedGraphRows(seed);
+    const member = await seedMember(seed);
+    const { ids } = await visibleItemIds(db(), { teamId: seed.teamId, memberId: member });
+
+    const ctx = await retrieve(db(), seed.teamId, "external", `about ${TERM}`, null, { visibleItemIds: ids, principal: "member" });
+    expect(ctx.structured, "the tier conjunct must hold on the member arm too").not.toContain("Alice Chen");
+    expect(ctx.structured).not.toContain("REPORTS_TO");
+    expect(ctx.structured).not.toContain("ship the widget");
+  });
 });
