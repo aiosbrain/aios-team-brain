@@ -265,10 +265,20 @@ there is no read path from a laptop, and provisioning one is a production change
 
 So rather than assume informativeness, the metric must **prove** it:
 
-- `assessInformativeness(incumbentReps, metric)` reads the INCUMBENT's own two reps and reports
-  `UNINFORMATIVE` when the metric sits at a structural floor/ceiling — a coverage of ~1.0 has no room
-  to fall, ~0.0 no room to drop further — with the threshold in band units, so "room to move" means
-  "room to move *by the amount the band would need to see*".
+- `assessInformativeness(reps, { bandMargin, direction })` is **direction-aware**. An earlier draft
+  excluded any metric whose incumbent sat at a CEILING, reasoning it had "no room to move". **That was
+  backwards** and both reviewers produced the same counter-scenario: STRONG dates every edge
+  (Q11 = 1.0), SMALL loses 20%, Q11 correctly FAILS — and the guard excluded it *because* the
+  incumbent was perfect, shipping the arm having lost the behaviour Q11 exists to detect. A ceiling
+  incumbent is the **best** baseline for detecting a fall; only the rise half is unarmable, and that
+  is reported (`riseUntestable`) rather than used to disarm. The genuinely uninformative case is the
+  **floor / no-evidence** one — the literal Q3 shape, where the mechanism produces nothing on either
+  arm.
+- **It is computed inside `decide`, from the registry's own margins**, and consults **every arm's**
+  reps — not just the incumbent's. If an arm departs the extreme the metric demonstrably can move, so
+  it is judged. (If both arms sit at the extreme the exclusion changes nothing, so the only case where
+  it alters a verdict is the case where excluding would be wrong.) A hand-passed `uninformative` key
+  is validated against an allowlist and throws for a cost or core-quality gate.
 - An `UNINFORMATIVE` metric **does not gate** and is reported as such. It is NOT a PASS: a metric that
   cannot fail is not evidence of safety, and silently counting it as PASS is how a battery ships an
   arm on a gate that was never armed.

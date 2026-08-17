@@ -385,60 +385,107 @@ describe("the judge is WIRED to the small-model registry (the critical fold)", (
 });
 
 describe("informativeness guard — Q3's lesson, mechanised (GRAPHSMALL-2)", () => {
-  it("calls a CEILING metric uninformative: coverage ~1.0 has no room to fall by the band", async () => {
-    // The Q11 risk: graphiti backdates valid_at to the episode's work time, so coverage may be ~1.0
-    // on every arm — a metric that cannot move, scoring a meaningless 1.0 ratio as PASS. Q3 read a
-    // structural ZERO exactly this way and was only caught live, after the money was spent.
-    const { assessInformativeness } = await import("../scripts/graph-window-battery/small-model-metrics.mjs");
+  const load = () => import("../scripts/graph-window-battery/small-model-metrics.mjs");
+
+  it("a CEILING incumbent is INFORMATIVE for a fall — the guard was backwards", async () => {
+    // Review's scenario: STRONG dates every edge (Q11=1.0), SMALL loses 20%. Q11 SHOULD fail. The
+    // first version excluded Q11 precisely because the incumbent was perfect, shipping an arm that
+    // lost the one behaviour Q11 detects. A ceiling incumbent is the BEST baseline for a fall.
+    const { assessInformativeness } = await load();
     const r = assessInformativeness([1.0, 1.0], { bandMargin: 0.15 });
+    expect(r.informative).toBe(true);
+    expect(r.riseUntestable).toBe(true); // only the RISE half is unarmable, and it is named
+  });
+
+  it("a FLOOR incumbent is uninformative — the literal Q3 shape (mechanism produces nothing)", async () => {
+    const { assessInformativeness } = await load();
+    const r = assessInformativeness([0, 0], { bandMargin: 0.15 });
     expect(r.informative).toBe(false);
-    expect(r.reason).toMatch(/ceiling|no room/i);
+    expect(r.reason).toMatch(/floor|cannot be expressed/i);
   });
 
-  it("calls a FLOOR metric uninformative (the literal Q3 shape)", async () => {
-    const { assessInformativeness } = await import("../scripts/graph-window-battery/small-model-metrics.mjs");
-    expect(assessInformativeness([0, 0], { bandMargin: 0.15 }).informative).toBe(false);
-  });
-
-  it("calls a MID-RANGE incumbent informative — the guard must not disarm a working metric", async () => {
-    const { assessInformativeness } = await import("../scripts/graph-window-battery/small-model-metrics.mjs");
+  it("a mid-range incumbent is informative and its rise edge is testable", async () => {
+    const { assessInformativeness } = await load();
     const r = assessInformativeness([0.5, 0.52], { bandMargin: 0.15 });
     expect(r.informative).toBe(true);
+    expect(r.riseUntestable).toBe(false);
+  });
+
+  it("THROWS on a missing band rather than disarming every gate", async () => {
+    // `informative:false` means "exclude from gating", so returning it for a caller mistake (the
+    // registry field is `margin`, this parameter is `bandMargin`) would ship an arm with NO gates.
+    const { assessInformativeness } = await load();
+    await expect(async () => assessInformativeness([0.5, 0.5], {})).rejects.toThrow(/bandMargin is required/i);
   });
 
   it("treats a null/absent incumbent as uninformative, not as zero", async () => {
-    const { assessInformativeness } = await import("../scripts/graph-window-battery/small-model-metrics.mjs");
-    // `null` is what the scorers return for "no evidence"; scoring it 0 would read as total collapse.
+    const { assessInformativeness } = await load();
     expect(assessInformativeness([null, null], { bandMargin: 0.15 }).informative).toBe(false);
     expect(assessInformativeness([], { bandMargin: 0.15 }).informative).toBe(false);
-    expect(assessInformativeness([0.5, 0.5], {}).informative).toBe(false); // no band → cannot judge room
+  });
+});
+
+describe("autoUninformative — computed in decide, and it consults the ARMS", () => {
+  const base = { Q1: [10, 10], Q2: [1, 1], Q4: [0.5, 0.5], Q5: [0, 0], Q7: [1, 1],
+    Q10: [0.9, 0.9], Q10F: [0.6, 0.6], Q10L: [120, 120], Q11: [0.5, 0.5], C2: [0.01, 0.01] };
+  const reg = () => smallModelMetrics({ addressableShare: 0.287 });
+  const session = () => assessSession({
+    incumbent: base, universeSize: 20, underpowered: [], armsCompleted: true,
+    harnessRefused: false, crossCheckAvailable: true, registry: reg(),
   });
 
-  it("an UNINFORMATIVE metric is EXCLUDED from gating, never counted as a pass", () => {
-    // A metric that cannot fail is not evidence of safety. Here Q11 would FAIL if judged (arm well
-    // below the incumbent), but it is excluded — and the result reports which questions went unanswered.
-    const base = { Q1: [10, 10], Q2: [1, 1], Q4: [0.5, 0.5], Q5: [0, 0], Q7: [1, 1],
-      Q10: [0.9, 0.9], Q10F: [0.6, 0.6], Q10L: [120, 120], Q11: [1.0, 1.0], C2: [0.01, 0.01] };
-    const session = assessSession({
-      incumbent: base, universeSize: 20, underpowered: [], armsCompleted: true,
-      harnessRefused: false, crossCheckAvailable: true,
-      registry: smallModelMetrics({ addressableShare: 0.287 }),
-    });
+  it("EXCLUDES a floor-pinned metric only when NO arm departs the extreme", () => {
+    const inc = { ...base, Q11: [0, 0] };
     const out = decide({
-      session,
-      incumbent: base,
-      arms: [{ name: "SMALL", metrics: { ...base, Q11: [0.2, 0.2], C2: [0.005, 0.005] }, extras: { personsLost: 0 } }],
-      registry: smallModelMetrics({ addressableShare: 0.287 }),
-      uninformative: ["Q11"],
+      session: session(), incumbent: inc,
+      arms: [{ name: "SMALL", metrics: { ...inc, C2: [0.005, 0.005] }, extras: { personsLost: 0 } }],
+      registry: reg(),
     });
     expect(out.uninformative).toContain("Q11");
-    expect(out.arms[0].results.map((r: { key: string }) => r.key)).not.toContain("Q11");
-    // …and with Q11 JUDGED instead, that same arm is blocked — proving the exclusion is doing work.
-    const judgedOut = decide({
-      session, incumbent: base,
-      arms: [{ name: "SMALL", metrics: { ...base, Q11: [0.2, 0.2], C2: [0.005, 0.005] }, extras: { personsLost: 0 } }],
-      registry: smallModelMetrics({ addressableShare: 0.287 }),
+    expect(out.arms[0].ships).toBe(true); // the other half of the contrast pair
+    expect(out.outcome).toBe("SHIP");
+  });
+
+  it("JUDGES a floor-pinned metric when an ARM moved — the regression must not be hidden", () => {
+    // Incumbent pinned at 0, but the arm produced 0.4: the metric demonstrably CAN move, so
+    // excluding it would hide real movement. This is the case where exclusion changes the outcome,
+    // and therefore the only case where getting it wrong matters.
+    const inc = { ...base, Q11: [0, 0] };
+    const out = decide({
+      session: session(), incumbent: inc,
+      arms: [{ name: "SMALL", metrics: { ...inc, Q11: [0.4, 0.4], C2: [0.005, 0.005] }, extras: { personsLost: 0 } }],
+      registry: reg(),
     });
-    expect(judgedOut.arms[0].ships).toBe(false);
+    expect(out.uninformative).not.toContain("Q11");
+  });
+
+  it("REFUSES to disable a cost or core-quality gate", () => {
+    expect(() => decide({
+      session: session(), incumbent: base,
+      arms: [{ name: "SMALL", metrics: base, extras: { personsLost: 0 } }],
+      registry: reg(), uninformative: ["C2"],
+    })).toThrow(/may not be excluded/i);
+    expect(() => decide({
+      session: session(), incumbent: base,
+      arms: [{ name: "SMALL", metrics: base, extras: { personsLost: 0 } }],
+      registry: reg(), uninformative: [{ informative: false, reason: "no key attached" }],
+    })).toThrow(/malformed/i);
+  });
+});
+
+describe("AC8d — the readout shapes the pure scorers consume", () => {
+  it("summaryRows' row shape feeds scoreSummaryHealth, and temporalEdges' feeds scoreTemporalCoverage", () => {
+    // The judge reads r.q.Q10?.distinctness etc through OPTIONAL chaining, so a renamed field would
+    // harvest [undefined, undefined] SILENTLY rather than throwing. Pin the contract here.
+    const rows = [{ name: "Chetan", summary: "Chetan shipped the importer.", facts: ["Chetan shipped the importer"] }];
+    const health = scoreSummaryHealth(rows);
+    for (const k of ["total", "nonEmptyShare", "meanLength", "distinctness", "factOverlap"]) {
+      expect(health).toHaveProperty(k);
+    }
+    const cov = scoreTemporalCoverage([{ valid_at: "2026-08-01T00:00:00Z" }, { valid_at: null }]);
+    expect(cov).toHaveProperty("share");
+    expect(cov.share).toBe(0.5);
+    // An entity with NO facts is the OPTIONAL MATCH case — must score, not throw.
+    expect(() => scoreSummaryHealth([{ name: "X", summary: "a summary", facts: [] }])).not.toThrow();
   });
 });

@@ -181,6 +181,10 @@ export function peopleFrom(
  * Schema (verified in `lib/graph/learning.ts`):
  * `(:Entity)-[:RELATES_TO {fact, created_at, valid_at, group_id, episodes}]->(:Entity)`.
  *
+ * `IS_DUPLICATE_OF` edges are excluded, matching every fact read in `lib/graph/learning.ts`. Dormant
+ * on the deployed 0.29.3 image (that relation is no longer written — it is why Q3 died), but a graph
+ * upgrade that revives it would otherwise feed dup-edge prose into Q10's fact-overlap denominator.
+ *
  * Facts come from edges in EITHER direction: a fact about an entity is as often the object as the
  * subject, and taking only outgoing edges would score a perfectly good summary as "detached" purely
  * because of edge direction — an artefact, not a quality signal. Scoped to one `group_id` on both the
@@ -189,10 +193,19 @@ export function peopleFrom(
 export async function summaryRows(
   groupId: string
 ): Promise<{ name: string; summary: string; facts: string[] }[]> {
-  const rows = await runRead<{ name: string; summary: string | null; facts: (string | null)[] }>(
+  const rows = await runRead<{ id: string; name: string; summary: string | null; facts: (string | null)[] }>(
+    // GROUP BY NODE IDENTITY, not by returned properties. Cypher groups on the non-aggregate
+    // expressions in RETURN, so `RETURN n.name, n.summary, collect(...)` would collapse two DISTINCT
+    // entities that share a name and a summary into ONE row with merged facts — precisely the shape
+    // this metric runs against, since fragmentation (the thing Q1/Q7 watch for) produces duplicate
+    // names, and boilerplate (the thing Q10 watches for) produces duplicate summaries. That would
+    // shrink Q10's denominator and inflate distinctness exactly when the arm is misbehaving.
+    // `WITH n, collect(...)` groups on the node itself.
     `MATCH (n:Entity {group_id: $g})
      OPTIONAL MATCH (n)-[r:RELATES_TO {group_id: $g}]-()
-     RETURN n.name AS name, n.summary AS summary, collect(r.fact) AS facts`,
+     WHERE r IS NULL OR r.name IS NULL OR r.name <> 'IS_DUPLICATE_OF'
+     WITH n, collect(r.fact) AS facts
+     RETURN elementId(n) AS id, n.name AS name, n.summary AS summary, facts`,
     { g: groupId }
   );
   return rows.map((r) => ({

@@ -57,6 +57,8 @@
  *   pp-upper      arm - incumbent in percentage points must stay at or below `margin`
  *   ratio-fall    the arm's value must be at most `1 - margin` of the incumbent's (a REQUIRED fall)
  */
+import { assessInformativeness } from "./small-model-metrics.mjs";
+
 export const METRICS = Object.freeze({
   // Two-sided: fragmentation RAISES node count, and a one-sided floor waved that through. It is also
   // the catch-all for the variant-form inflation Q6 cannot see — a node named "John" carries no
@@ -352,6 +354,51 @@ export const MIN_UNIVERSE = 15;
  * `arms` is ordered — SAME before W1 — and the FIRST arm to pass every gate wins. An arm ships only
  * if every metric PASSes; INCONCLUSIVE blocks exactly as FAIL does.
  */
+/**
+ * The ONLY metrics an informativeness assessment may exclude from gating. Deliberately narrow: the
+ * cost gates (C1/C2) and the shared quality floor (Q1/Q2/Q4/Q5/Q7) must never be disabled by a
+ * caller's data-dependent judgement — if one of those cannot be measured, the session is broken.
+ */
+export const EXCLUDABLE_METRICS = Object.freeze(new Set(["Q10", "Q10F", "Q10L", "Q11"]));
+
+/**
+ * Which excludable metrics cannot fail on THIS session — computed from the registry's own margins,
+ * the incumbent, and every arm's reps.
+ *
+ * A metric is only excluded when the incumbent cannot express a fall AND no arm departs that extreme.
+ * If an arm moved, the metric demonstrably CAN move, so it is judged — which is the whole correction
+ * review forced: the excluded-and-arm-moved case is precisely a regression being hidden.
+ */
+export function autoUninformative({ registry, incumbent, arms }) {
+  const out = [];
+  for (const key of Object.keys(registry)) {
+    if (!EXCLUDABLE_METRICS.has(key)) continue;
+    const margin = registry[key]?.margin;
+    if (typeof margin !== "number" || !(margin > 0)) continue;
+    const incReps = (incumbent ?? {})[key];
+    let verdict;
+    try {
+      verdict = assessInformativeness(incReps, { bandMargin: margin, direction: "fall" });
+    } catch {
+      continue; // a malformed band is a registry bug, not grounds to disarm
+    }
+    if (verdict.informative) continue;
+    const incMean = meanOf(incReps);
+    const armMoved = (arms ?? []).some(({ metrics }) => {
+      const m = meanOf((metrics ?? {})[key]);
+      return m !== null && incMean !== null && Math.abs(m - incMean) > 1e-9;
+    });
+    if (armMoved) continue; // it CAN move — judge it
+    out.push({ key, reason: verdict.reason });
+  }
+  return out;
+}
+
+const meanOf = (reps) => {
+  const usable = (Array.isArray(reps) ? reps : []).filter((v) => typeof v === "number" && Number.isFinite(v));
+  return usable.length ? usable.reduce((a, b) => a + b, 0) / usable.length : null;
+};
+
 export function decide({ session, incumbent, arms, registry = METRICS, uninformative = [] }) {
   if (!session.valid) {
     return { outcome: "INVALID", reasons: session.problems, arms: [] };
@@ -361,7 +408,44 @@ export function decide({ session, incumbent, arms, registry = METRICS, uninforma
   // Q11 carries the same risk from the ceiling. Excluding it is honest; passing it is a gate that was
   // never armed. The excluded keys are reported on the result so a readout says which questions this
   // corpus could not answer.
-  const skip = new Set(uninformative.map((u) => (typeof u === "string" ? u : u.key)));
+  // COMPUTED HERE, not trusted from a caller. Review (Fable) found the guard had NO caller at all —
+  // an exported function plus a RUNBOOK sentence, which is the identical defect #567 was dinged for
+  // one slice earlier in this very file. An operator who skipped the manual step got a verdict
+  // indistinguishable from one where informativeness had been assessed.
+  //
+  // It also consults the ARM reps, not just the incumbent. Excluding on the incumbent alone cannot
+  // tell "structurally pinned" from "legitimately perfect", and it resolves that ambiguity in the
+  // dangerous direction: if both arms sit at the extreme the exclusion changes nothing (the ratio
+  // passes trivially), so the ONLY case where it alters the outcome is the case where the arm moved
+  // — i.e. a real regression being waved through.
+  const auto = autoUninformative({ registry, incumbent, arms });
+  uninformative = [...uninformative, ...auto];
+
+  // VALIDATED, because this parameter DISABLES GATES. Review's scenario: `uninformative: ["C2"]`
+  // silently turns off the required cost gate and ships a no-savings arm; a caller mapping raw
+  // `assessInformativeness` results without attaching `key` yields `undefined`, which skips nothing
+  // while the readout claims something was excluded. Both fail loudly now.
+  //
+  // Only the metrics whose informativeness is genuinely corpus-dependent may be excluded. C1/C2 are
+  // cost gates and Q1/Q2/Q4/Q5/Q7 are the shared quality floor: if one of those cannot be measured
+  // the session is broken, not "informative-ly reduced".
+  const skip = new Set(
+    uninformative.map((u) => {
+      const key = typeof u === "string" ? u : u?.key;
+      if (typeof key !== "string" || key.length === 0) {
+        throw new Error(`decide: malformed uninformative entry ${JSON.stringify(u)} — expected a metric key string or { key }`);
+      }
+      if (!EXCLUDABLE_METRICS.has(key)) {
+        throw new Error(
+          `decide: ${key} may not be excluded as uninformative (allowed: ${[...EXCLUDABLE_METRICS].join(", ")}) — cost and core quality gates must not be silently disabled`
+        );
+      }
+      if (!(key in registry)) {
+        throw new Error(`decide: uninformative key ${key} is not in this registry — a typo would silently exclude nothing`);
+      }
+      return key;
+    })
+  );
   const judged = arms.map(({ name, metrics, extras = {} }) => {
     const results = Object.keys(registry)
       .filter((key) => !skip.has(key))
