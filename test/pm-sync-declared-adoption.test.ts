@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { linearAdapter } from "@/lib/pm-sync/linear";
 import { projectionFingerprint, type ProjectableTask, type TaskPmLink } from "@/lib/pm-sync/provider";
 import { summarizeProjectionReports } from "@/lib/pm-sync/runs";
@@ -222,6 +224,17 @@ describe("ADOPTDECL-1 — a declared issue is adopted, not duplicated", () => {
     expect(summary.synced, "an adoption wrote to the provider").toBe(1);
     expect(summary.unchanged).toBe(1);
     expect(summary.meta).toMatchObject({ adopted: 1 });
+  });
+
+  it("the THROTTLE is paid for an adoption — a bulk adopt must not hammer the API", () => {
+    // SOURCE-LEVEL PIN, and labelled as such. `projectRows` sleeps only for statuses it considers a
+    // provider write; before this slice that was `synced` alone, so N declared rows would have issued
+    // N back-to-back `issueUpdate`s at zero throttle. The behavioural version needs a db harness plus
+    // a wall-clock assertion, which is the flaky kind this repo avoids — so this pins the exact
+    // regression (dropping `adopted` from the condition) and nothing more.
+    const src = readFileSync(join(process.cwd(), "lib/pm-sync/project.ts"), "utf8");
+    const line = src.split("\n").find((l) => l.includes("await sleep(throttleMs)")) ?? "";
+    expect(line, "the throttle no longer covers adoptions").toContain('"adopted"');
   });
 
   it("adds no extra GraphQL round-trip: the identifier index and team key ride existing queries", async () => {
