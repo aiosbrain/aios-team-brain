@@ -10,6 +10,16 @@ revision **v1.17**.
 
 ### Changed
 
+- **PRET-3 — every arcs panel is now the fused per-project panel.** External members and
+  members of not-yet-flipped (permissive) teams are served the same per-partition fusion
+  enforcing teams already had; the legacy single tier-row synthesis is retired. Two visible
+  consequences: arc corrections can no longer target the external-shared partition (its
+  synthesis is corrections-free — internal editorial prose never reaches client-visible arcs;
+  the recompute endpoint returns 422 for it), and recomputes now always name a `sourceGroup`
+  (stale clients get a 422 until the panel reloads). Existing tier-scoped corrections are
+  migrated to the General partition automatically. Social discovery now mines the acting
+  admin's own arc scope rather than the whole team tier.
+
 - **PRET-2 — teams begin auto-flipping to per-project access enforcement.** A warning-free,
   converged team is now flipped to `enforcing` automatically by the scheduler (gated on the
   full readiness assessment; rate-limited; an operator's manual downgrade permanently holds a

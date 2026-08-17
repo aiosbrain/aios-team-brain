@@ -5,9 +5,9 @@ import { adminClient } from "@/lib/db/admin";
 import { getSessionUser } from "@/lib/auth/session";
 import { errorResponse } from "@/lib/api/schemas";
 import { resolveAnsweringKeys } from "@/lib/query/answering";
-import { visibleGroupIds } from "@/lib/graph/group";
+import { isExternalGroupId } from "@/lib/graph/group";
 import { recomputeArcs } from "@/lib/graph/arcs";
-import { selectEnforcedGraphPartitions } from "@/lib/graph/partition-read";
+import { resolveArcScope } from "@/lib/graph/partition-read";
 import { freshnessWire, computedNow } from "@/lib/freshness";
 import { memberEnforcement } from "@/lib/access/enforce";
 import { filterArcsByVisibleItems } from "@/lib/graph/arc-visibility";
@@ -72,35 +72,38 @@ export async function POST(req: NextRequest) {
   // GET serves — so the correction is recorded under that scope key and can never feed another
   // scope's synthesis. Permissive keeps the tier path byte-identical.
   let enforce: import("@/lib/access/enforce").TimelineEnforcement | null;
-  let scopeGroups: string[] | null = null;
+  let scope: import("@/lib/graph/partition-read").ArcScope;
   try {
     enforce = await memberEnforcement(admin, { teamId: team.id, memberId });
-    if (enforce != null) {
-      const scope = await selectEnforcedGraphPartitions(admin, {
-        teamId: team.id,
-        visibleProjectIds: [...enforce.visibleProjectIds],
-        // Same uncapped scope as the GET (Fable 6b Medium 3) — the gate below must consult the
-        // row the member was actually served, so the two resolutions must agree.
-        k: Number.MAX_SAFE_INTEGER,
-      });
-      scopeGroups = scope.groups;
-    }
+    // PRET-3: the SAME mode-keyed resolution as the GET — the gate below must consult the row
+    // the member was actually served, so the two resolutions must agree (Fable 6b Medium 3's
+    // uncapped rule lives inside resolveArcScope now).
+    scope = await resolveArcScope(admin, { teamId: team.id, teamSlug, memberId, tier, enforcement: enforce });
   } catch {
     return errorResponse("internal", "enforcement check failed", 500);
   }
-  // PPARC-3: the enforced recompute runs in ONE partition (design Highs 2–3: sourceGroup is
-  // validated against the FRESHLY-RESOLVED scope — arc_id is sha(title), derivable unseen, and
-  // the evidence filter does not backstop partition visibility — and one partition means one
-  // inline synthesis, which fits the route budget that N could not). Permissive keeps the tier
-  // path byte-identical.
-  if (scopeGroups != null && sourceGroup == null) {
-    return errorResponse("invalid_payload", "sourceGroup is required on an enforcing team — correct one partition at a time", 422);
+  // PRET-3: every recompute runs in ONE partition — the fused panel annotates each arc with its
+  // sourceGroup, so every client can name one. Absent = a stale pre-unification client (spec
+  // M5: a NEW 422 class, stated in the slice spec; the panel self-heals on next load).
+  if (sourceGroup == null) {
+    return errorResponse("invalid_payload", "sourceGroup is required — correct one partition at a time (refresh the arcs panel if yours predates the unification)", 422);
   }
-  if (scopeGroups != null && !scopeGroups.includes(sourceGroup!)) {
+  if (!scope.groups.includes(sourceGroup)) {
     return errorResponse("forbidden", "the claimed partition is outside your visible scope", 403);
   }
-  const groups = scopeGroups != null ? [sourceGroup!] : visibleGroupIds(teamSlug, tier);
-  const scopeKey = scopeGroups != null ? `g:${sourceGroup}` : groups.slice().sort().join(",");
+  // PRET-3 H1 write-side corollary: the external-shared partition's synthesis is
+  // CORRECTIONS-FREE (client-facing prose carries no internal editorial text), so accepting a
+  // correction scoped to it would store prose the read side never loads — the H13
+  // dead-correction shape. Refuse loudly instead.
+  if (isExternalGroupId(sourceGroup)) {
+    return errorResponse(
+      "invalid_payload",
+      "corrections cannot target the external-shared partition — its synthesis is corrections-free (client-facing prose carries no internal editorial text)",
+      422
+    );
+  }
+  const groups = [sourceGroup];
+  const scopeKey = `g:${sourceGroup}`;
 
   // WRITE gate (Codex B5 High — correction poisoning): recomputeArcs WRITES each correction to
   // `arc_corrections` AND projects it into a Graphiti group, then feeds every future same-scope
@@ -137,7 +140,7 @@ export async function POST(req: NextRequest) {
     corrections,
     keys,
     memberId,
-    scopeGroups ? { scopeKey } : undefined
+    { scopeKey } // PRET-3: every recompute is partition-scoped — the g: key always
   );
 
   // READ gate: drop arcs the member can't see — this route returns the recomputed TIER set, so

@@ -104,7 +104,7 @@ export async function getFusedArcs(
   // directly and must own its own revalidation (Fable PPARC-3 High 2).
   const inlineTarget = rankedGroups.find((g) => entries.find((e) => e.group === g)?.entry == null);
   if (inlineTarget) {
-    const { arcs, freshness: inlineFreshness } = await getArcs(db, teamId, teamSlug, "team", [inlineTarget], keys, {
+    const { arcs, freshness: inlineFreshness } = await getArcs(db, teamId, teamSlug, [inlineTarget], keys, {
       scopeKey: `g:${inlineTarget}`,
     });
     const refreshed = await readArcCache(db, teamId, `g:${inlineTarget}`);

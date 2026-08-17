@@ -38,17 +38,17 @@ const REQUIRED: { file: string; needle: string; why: string }[] = [
   // green while an enforced member silently falls back to the tier cache (the laundering path).
   {
     file: join("app", "api", "brain", "arcs", "route.ts"),
-    needle: "selectEnforcedGraphPartitions(admin, {",
-    why: "an enforced team member's arcs must resolve their partition scope, not read the tier cache",
+    needle: "resolveArcScope(admin, { teamId: team.id, teamSlug, memberId, tier, enforcement: enforce })",
+    why: "PRET-3: every reader's arcs scope comes from the ONE mode-keyed resolution — an ad-hoc scope here re-splits the read paths",
   },
   {
     file: join("app", "api", "brain", "arcs", "route.ts"),
-    needle: "await getFusedArcs(admin, team.id, teamSlug, scopeGroups, keys)",
-    why: "PPARC-3: an enforced member's panel is the FUSION of their partitions' g: rows — dropping this silently falls back to the tier cache (the laundering path)",
+    needle: "await getFusedArcs(admin, team.id, teamSlug, scope.groups, keys)",
+    why: "the fused panel is THE arcs read (ruling 1) — dropping this silently resurrects a tier fallback (the laundering path)",
   },
   {
     file: join("app", "api", "brain", "arcs", "recompute", "route.ts"),
-    needle: "selectEnforcedGraphPartitions(admin, {",
+    needle: "resolveArcScope(admin, { teamId: team.id, teamSlug, memberId, tier, enforcement: enforce })",
     why: "an enforced member's recompute must run in their own scope, or the correction records against the tier row",
   },
   {
@@ -58,16 +58,16 @@ const REQUIRED: { file: string; needle: string; why: string }[] = [
   },
   {
     file: join("app", "api", "brain", "arcs", "recompute", "route.ts"),
-    needle: "!scopeGroups.includes(sourceGroup!)",
+    needle: "!scope.groups.includes(sourceGroup)",
     why: "PPARC-3: the claimed partition must be validated against the FRESHLY-RESOLVED scope — arc_id is sha(title), derivable without ever being served the arc",
   },
   {
-    file: join("app", "api", "brain", "arcs", "route.ts"),
+    file: join("lib", "graph", "partition-read.ts"),
     needle: "k: Number.MAX_SAFE_INTEGER",
     why: "the arcs scope is UNCAPPED — a K-capped scope truncates coverage undisclosed and churns the cache key (Fable 6b Medium 3)",
   },
   {
-    file: join("app", "api", "brain", "arcs", "recompute", "route.ts"),
+    file: join("lib", "graph", "partition-read.ts"),
     needle: "k: Number.MAX_SAFE_INTEGER",
     why: "the recompute must resolve the SAME uncapped scope as the GET, or the write gate reads a row the member never saw",
   },

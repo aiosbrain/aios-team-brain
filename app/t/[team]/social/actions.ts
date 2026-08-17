@@ -4,7 +4,6 @@ import { revalidatePath } from "next/cache";
 import { adminClient } from "@/lib/db/admin";
 import { requireTeamAdmin as requireAdmin } from "@/lib/auth/guard";
 import { resolveAnsweringKeys } from "@/lib/query/answering";
-import { visibleGroupIds } from "@/lib/graph/group";
 import { discoverOpportunities } from "@/lib/social/discover";
 import { discoverOpportunitiesFromArcs } from "@/lib/social/discover-arcs";
 import { planOpportunity } from "@/lib/social/plan";
@@ -43,8 +42,12 @@ export async function discoverFromArcsNow(teamSlug: string): Promise<DiscoverRes
   try {
     const db = adminClient();
     const keys = await resolveAnsweringKeys(db, ctx.teamId);
-    const groups = visibleGroupIds(teamSlug, "team");
-    const s = await discoverOpportunitiesFromArcs(db, ctx.teamId, teamSlug, "team", groups, keys, {
+    // PRET-3 (spec §1, a STATED product change on enforcing teams): discovery mines the arcs
+    // the ACTING ADMIN can see — their oracle scope on an enforcing team, the built-in
+    // partitions on a permissive one — not a hardcoded tier union that ignored enforcement.
+    const { resolveArcScope } = await import("@/lib/graph/partition-read");
+    const scope = await resolveArcScope(db, { teamId: ctx.teamId, teamSlug, memberId: ctx.memberId, tier: "team" });
+    const s = await discoverOpportunitiesFromArcs(db, ctx.teamId, teamSlug, "team", scope.groups, keys, {
       actor: { memberId: ctx.memberId },
     });
     revalidatePath(`/t/${teamSlug}/social`);

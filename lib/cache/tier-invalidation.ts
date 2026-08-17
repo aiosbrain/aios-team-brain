@@ -1,7 +1,7 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
-import { visibleGroupIds } from "@/lib/graph/group";
-import { purgeArcCacheKey, staleArcCache } from "@/lib/graph/arc-cache";
+import { visibleGroupIds, episodeGroupId } from "@/lib/graph/group";
+import { purgeArcCacheKey, purgePartitionArcCache, staleArcCache } from "@/lib/graph/arc-cache";
 import { bustTeamTimeline, purgeTimelineCacheTier } from "@/lib/dashboard/timeline-cache";
 import { evictArcMemoryCache, evictTeamPartitionArcMemory } from "@/lib/graph/arcs";
 
@@ -46,6 +46,12 @@ export async function purgeExternalTierCaches(
   await evictTeamPartitionArcMemory(db, teamId); // PPARC-2: g: keys carry only the group id
   const externalArcKey = visibleGroupIds(teamSlug, "external").slice().sort().join(",");
   await purgeArcCacheKey(db, teamId, externalArcKey);
+  // PRET-3 H3: the external PARTITION row too — external members are served from `g:<ext>` after
+  // the arcs unification, and a stale-mark is not enough there (SWR hands the stale row to the
+  // next reader; `purgeArcCacheKey`'s own doc). While only team-tier members read g: rows this
+  // was harmless; the moment externals do, skipping it reopens the exact leak the hard-delete
+  // exists to close. Pointer-resolved via the tier id (the built-in grandfathers it).
+  await purgePartitionArcCache(db, teamId, episodeGroupId(teamSlug, "external"));
   await purgeTimelineCacheTier(db, teamId, "external");
   // Backstop under both purges (they swallow their own errors) and cover the team rows: a stale mark
   // bounds anything that survived to a single TTL rather than a full window of serving it.

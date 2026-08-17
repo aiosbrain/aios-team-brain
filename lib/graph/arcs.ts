@@ -722,35 +722,31 @@ async function synthesizeArcs(
   // Stored corrections inform EVERY synthesis, not only the recompute that produced one (H13). They used
   // to reach later synthesis only by having become a Graphiti fact — so a graph wipe didn't merely lose
   // the record, it lost the influence, and arcs quietly reverted to the version a human had rejected.
-  // TEAM-TIER ONLY. `groups` is this synthesis's tier scope (an external viewer gets external groups
-  // alone), and corrections are an internal editorial act the recompute route already refuses to an
-  // external principal. Feeding them into an EXTERNAL synthesis would put team-authored prose in the
-  // prompt that writes the external arc row — the model would paraphrase it into client-visible text and
-  // `commitArcs` would persist that under the external group_key. There is no RLS backstop (CLAUDE.md
-  // §5), so the tier check has to be here, at the read.
-  //
-  // Derived from `groups` rather than a second tier argument on purpose: `groups` is already THE
-  // tier-scoping input, and a parallel parameter is one more thing that can disagree with it.
-  const teamTier = groups.some((g) => !isExternalGroupId(g));
   // PCCC6B-1 scope rule: EXACT match on this synthesis's own scope key. Only the LEGACY tier path
   // (un-prefixed key) also admits pre-6b '' rows — a partition scope never does, because those rows
   // were made against the whole tier corpus and feeding them into a narrower scope's prompt is the
   // laundering §2.4 step 4 closes. Partition scopes are team-tier by construction (external
   // principals keep the omit path), so the tier gate below is unchanged by them.
   const effectiveScopeKey = scopeKey ?? groups.slice().sort().join(",");
-  // Fable 6b Medium 4: a PARTITION scope loads its corrections even when its groups are all
-  // external-shaped (an enforced member's scope during a restriction-debt window is exactly
-  // [<slug>_external]) — the scoped row is only ever served to TEAM-tier members (the GET resolves
-  // scopes for tier==='team' only; recompute 403s external first), and the read is exact-scope, so
-  // there is no external-principal path to it. Without this, a correction recorded in that window
-  // was stored but never read back — H13's silent revert through a new door. The un-namespaced
-  // EXTERNAL TIER path stays corrections-free (the standing gate below).
-  // PPARC-4: the p: (per-oracle union) namespace is RETIRED — g: is the one partition scope.
-  const correctionsEligible = effectiveScopeKey.startsWith("g:") || teamTier;
+  // PRET-3 H1 (docs/design/pret3-arcs-unification.md §1a): a synthesis whose PARTITION is
+  // external-shaped is CORRECTIONS-FREE — client-facing prose carries no internal editorial
+  // text. This REVERSES the Fable-6b-Medium-4 allowance (corrections loaded for a
+  // `g:<slug>_external` partition scope), which rested on "there is no external-principal path
+  // to the g: row" — the arcs unification routes external members onto exactly that row. The
+  // write side matches: the recompute route refuses corrections targeting the external-shared
+  // partition, so nothing is stored that this gate would silently never read (the H13
+  // dead-correction shape). Team-shaped partition scopes load their exact-scope corrections
+  // unchanged. PPARC-4: g: is the one partition namespace.
+  const scopeIsExternalPartition =
+    effectiveScopeKey.startsWith("g:") && isExternalGroupId(effectiveScopeKey.slice(2));
+  // PRET-3: every scope key is g:-prefixed (the tier entry retired with the unification), so
+  // eligibility is exactly the H1 rule; the legacy '' arm is dead (includeLegacy: false — the
+  // tier path was its only trigger; the H2 migration re-keyed tier-set rows).
+  const correctionsEligible = !scopeIsExternalPartition;
   const correctionsRead = correctionsEligible
     ? await listArcCorrections(db, teamId, {
         groupKey: effectiveScopeKey,
-        includeLegacy: !effectiveScopeKey.startsWith("g:"),
+        includeLegacy: false,
       })
     : { corrections: [], ok: true };
   const allCorrections = [
@@ -1332,16 +1328,16 @@ export async function getArcs(
   db: DbClient,
   teamId: string,
   teamSlug: string,
-  tier: AccessTier,
   groups: string[],
   keys: ProviderKeys,
-  /** A partition-native read passes its `g:<group>` scope key (PPARC-3 fusion's single-partition
-   *  synthesis) — the cache row AND the corrections scope both key on it. Absent = the tier path. */
-  opts?: { scopeKey?: string }
+  /** The `g:<group>` partition scope key — REQUIRED since PRET-3 (the arcs unification): the
+   *  tier-key fallback is retired; every synthesis is partition-native, and the cache row AND
+   *  the corrections scope both key on this. */
+  opts: { scopeKey: string }
 ): Promise<CachedArcs> {
   // No visible groups is not a degraded read — it's a correct empty answer, computed now.
   if (groups.length === 0) return { arcs: [], freshness: computedNow() };
-  const key = opts?.scopeKey ?? groups.slice().sort().join(",");
+  const key = opts.scopeKey;
 
   const now = Date.now();
 
@@ -1421,11 +1417,12 @@ export async function recomputeArcs(
   keys: ProviderKeys,
   /** Who made the edit — stored for attribution. Null only if the caller genuinely has no member. */
   memberId: string | null = null,
-  /** PCCC6B-1: the enforced partition scope this recompute runs in (see getArcs). */
-  opts?: { scopeKey?: string }
+  /** The `g:<group>` partition scope this recompute runs in — REQUIRED since PRET-3 (the arcs
+   *  unification): the tier-key fallback is retired; the route always names one partition. */
+  opts: { scopeKey: string }
 ): Promise<CachedArcs> {
   if (groups.length === 0) return { arcs: [], freshness: computedNow() };
-  const key = opts?.scopeKey ?? groups.slice().sort().join(",");
+  const key = opts.scopeKey;
 
   // PERSIST FIRST, and let a failure surface. Everything else on this path degrades quietly because a
   // cache can be recomputed; a person's edit cannot. If this throws the route answers with an error and

@@ -138,7 +138,8 @@ describe("a degraded synthesis never reaches the model", () => {
 
     const { getArcs } = await import("@/lib/graph/arcs");
     const { db } = fakeDb();
-    await getArcs(db, "team-1", "acme", "external", externalGroups(), KEYS);
+    const g = externalGroups();
+    await getArcs(db, "team-1", "acme", g, KEYS, { scopeKey: `g:${g[0]}` });
 
     expect(llmMock.completeTextOrNull).not.toHaveBeenCalled();
   });
@@ -155,7 +156,8 @@ describe("a degraded synthesis never reaches the model", () => {
 
     const { getArcs } = await import("@/lib/graph/arcs");
     const { db } = fakeDb();
-    await getArcs(db, "team-1", "acme", "external", externalGroups(), KEYS);
+    const g = externalGroups();
+    await getArcs(db, "team-1", "acme", g, KEYS, { scopeKey: `g:${g[0]}` });
 
     expect(llmMock.completeTextOrNull).not.toHaveBeenCalled();
   });
@@ -169,7 +171,8 @@ describe("a degraded synthesis never reaches the model", () => {
 
     const { getArcs } = await import("@/lib/graph/arcs");
     const { db, upserts } = fakeDb();
-    const res = await getArcs(db, "team-1", "acme", "external", externalGroups(), KEYS);
+    const g = externalGroups();
+    const res = await getArcs(db, "team-1", "acme", g, KEYS, { scopeKey: `g:${g[0]}` });
 
     expect(llmMock.completeTextOrNull).not.toHaveBeenCalled();
     expect(upserts).toHaveLength(1);
@@ -196,7 +199,8 @@ describe("a degraded synthesis never reaches the model", () => {
 
     const { getArcs } = await import("@/lib/graph/arcs");
     const { db } = fakeDb();
-    await getArcs(db, "team-1", "acme", "external", externalGroups(), KEYS);
+    const g = externalGroups();
+    await getArcs(db, "team-1", "acme", g, KEYS, { scopeKey: `g:${g[0]}` });
 
     expect(llmMock.completeTextOrNull).toHaveBeenCalled();
   });
@@ -232,7 +236,8 @@ describe("H13: a stored correction reaches synthesis even with the graph wiped",
 
     const { getArcs } = await import("@/lib/graph/arcs");
     const { db } = fakeDb();
-    await getArcs(db, "team-1", "acme", "team", teamGroups(), KEYS);
+    const tg = [teamGroups()[0]];
+    await getArcs(db, "team-1", "acme", tg, KEYS, { scopeKey: `g:${tg[0]}` });
 
     expect(llmMock.completeTextOrNull).toHaveBeenCalled();
     const prompt = JSON.stringify(llmMock.completeTextOrNull.mock.calls[0]);
@@ -241,13 +246,14 @@ describe("H13: a stored correction reaches synthesis even with the graph wiped",
     expect(correctionsMock.listArcCorrections).toHaveBeenCalledWith(
       expect.anything(),
       "team-1",
-      // PCCC6B-1: the ordinary tier synthesis asks for its own scope (legacy rows admitted).
-      expect.objectContaining({ includeLegacy: true })
+      // PRET-3: every synthesis is partition-scoped; the legacy arm is dead (the H2 migration
+      // re-keyed tier-set rows, so exact-scope is complete).
+      expect.objectContaining({ includeLegacy: false, groupKey: `g:${tg[0]}` })
     );
   });
 });
 
-describe("H13 tier: corrections are team-authored and must not reach an EXTERNAL synthesis", () => {
+describe("PRET-3 H1: corrections never reach an EXTERNAL-SHAPED partition's synthesis (the H13-tier property, g:-era)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     llmMock.completeTextOrNull.mockResolvedValue('{"arcs":[]}');
@@ -274,13 +280,13 @@ describe("H13 tier: corrections are team-authored and must not reach an EXTERNAL
   });
 
   it("keeps correction text out of an external viewer's prompt", async () => {
-    // The leak this fix could have introduced. `synthesizeArcs` serves BOTH tiers, so reading a
-    // team-wide corrections table unconditionally would put internal editorial prose into the prompt
-    // that writes the EXTERNAL arc row — the model paraphrases it into client-visible text and
-    // `commitArcs` persists it under the external group_key. No RLS backstop (CLAUDE.md §5).
+    // PRET-3 H1: the external-shared partition is served to EXTERNAL MEMBERS post-unification,
+    // so its synthesis is corrections-free — internal editorial prose must never be paraphrased
+    // into the row externals read. No RLS backstop (CLAUDE.md §5).
     const { getArcs } = await import("@/lib/graph/arcs");
     const { db } = fakeDb();
-    await getArcs(db, "team-1", "acme", "external", externalGroups(), KEYS);
+    const g = externalGroups();
+    await getArcs(db, "team-1", "acme", g, KEYS, { scopeKey: `g:${g[0]}` });
 
     expect(llmMock.completeTextOrNull).toHaveBeenCalled();
     expect(JSON.stringify(llmMock.completeTextOrNull.mock.calls[0])).not.toContain("INTERNAL:");
@@ -291,7 +297,8 @@ describe("H13 tier: corrections are team-authored and must not reach an EXTERNAL
     // reached any prompt at all.
     const { getArcs } = await import("@/lib/graph/arcs");
     const { db } = fakeDb();
-    await getArcs(db, "team-1", "acme", "team", teamGroups(), KEYS);
+    const tg = [teamGroups()[0]];
+    await getArcs(db, "team-1", "acme", tg, KEYS, { scopeKey: `g:${tg[0]}` });
 
     expect(JSON.stringify(llmMock.completeTextOrNull.mock.calls[0])).toContain("INTERNAL:");
   });
@@ -332,7 +339,7 @@ describe("a STORED correction must not disable the stability skip", () => {
 
     // Pass 1 — cold miss. Synthesizes once and tells us the hash of these exact inputs.
     const first = fakeDb();
-    await getArcs(first.db, "team-1", "acme", "team", groupsA, KEYS);
+    await getArcs(first.db, "team-1", "acme", [groupsA[0]], KEYS, { scopeKey: `g:${groupsA[0]}` });
     expect(llmMock.completeTextOrNull).toHaveBeenCalledTimes(1);
     const factsHash = first.upserts[0].facts_hash as string;
     expect(factsHash).toBeTruthy();
@@ -345,7 +352,7 @@ describe("a STORED correction must not disable the stability skip", () => {
       computed_at: stale,
       facts_hash: factsHash,
     });
-    await getArcs(second.db, "team-1", "acme", "team", groupsB, KEYS);
+    await getArcs(second.db, "team-1", "acme", [groupsB[0]], KEYS, { scopeKey: `g:${groupsB[0]}` });
     await new Promise((r) => setTimeout(r, 50)); // the refresh is fire-and-forget
 
     expect(llmMock.completeTextOrNull).toHaveBeenCalledTimes(1); // still 1 — the model was NOT re-run

@@ -1,6 +1,7 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
-import { getArcs, type NarrativeArc, type ProviderKeys } from "@/lib/graph/arcs";
+import { getFusedArcs } from "@/lib/graph/arc-fusion";
+import { type NarrativeArc, type ProviderKeys } from "@/lib/graph/arcs";
 import { createOpportunity } from "./store";
 import { evidenceCeiling } from "./tier";
 import { recencyFactor, type OpportunityScores } from "./discover-score";
@@ -9,7 +10,7 @@ import type { DiscoverSummary } from "./discover";
 
 /**
  * Content discovery FROM narrative arcs (Social Brain). Where `discover.ts` turns individual `items`
- * into opportunities, this turns the team's Layer-3 narrative arcs (`lib/graph/arcs.getArcs`) into
+ * into opportunities, this turns the acting admin's fused arc panel (`lib/graph/arc-fusion`) into
  * opportunities — the "look at the arcs and pick stories to post" on-ramp. Arcs are already
  * synthesized, evidence-backed, and human-attributed, so an arc is a natural candidate story.
  *
@@ -24,7 +25,7 @@ import type { DiscoverSummary } from "./discover";
 export interface DiscoverArcsOptions {
   now?: Date;
   actor?: SocialActor;
-  /** Inject arcs instead of fetching via `getArcs` — used by tests (getArcs needs Neo4j). */
+  /** Inject arcs instead of fetching via the fused read — used by tests (synthesis needs Neo4j). */
   arcs?: NarrativeArc[];
 }
 
@@ -89,7 +90,9 @@ export async function discoverOpportunitiesFromArcs(
   // degraded arc set produces fewer/older opportunities rather than wrong ones (each is reviewed before
   // publish). Called out rather than silently destructured so a future author sees the envelope was
   // considered and dropped on purpose, not missed.
-  const arcs = opts.arcs ?? (await getArcs(db, teamId, teamSlug, tier, groups, keys)).arcs;
+  // PRET-3: the fused read is THE arcs read — `groups` is the caller's resolved scope
+  // (the acting admin's, via resolveArcScope), never a tier union.
+  const arcs = opts.arcs ?? (await getFusedArcs(db, teamId, teamSlug, groups, keys)).arcs;
 
   // Resolve every arc's evidence-item tiers in one pass so per-arc access is a pure in-memory calc.
   const allItemIds = arcs.flatMap((a) => a.evidence.map((e) => e.itemId).filter((id): id is string => !!id));
