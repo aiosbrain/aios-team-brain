@@ -113,8 +113,11 @@ function printReadiness(r: EnforcementReadiness): void {
     console.table(r.blindHumans.map((m) => ({ email: m.email, tier: m.tier, member_id: m.memberId })));
   }
   for (const w of r.warnings) console.log(`  ⚠ ${w}`);
-  if (r.unplacedAgents.length > 0) {
-    console.table(r.unplacedAgents.map((m) => ({ agent: m.email, member_id: m.memberId })));
+  for (const [label, rows] of [
+    ["agent", r.unplacedAgents],
+    ["connector", r.activeConnectors],
+  ] as const) {
+    if (rows.length > 0) console.table(rows.map((m) => ({ [label]: m.email, member_id: m.memberId })));
   }
   console.log(r.ready ? "  ✓ ready to enforce" : "  ✗ NOT ready to enforce");
 }
@@ -383,12 +386,16 @@ async function main() {
         (typeof flags.reason === "string" && flags.reason.trim()) ||
         die(`--reason is required (it is written into the items.purged audit row) — usage: ${PURGE_USAGE}`);
       if (flags.confirm && flags["dry-run"]) die("pass either --confirm or --dry-run, not both");
-      const requested = [...new Set(idList.split(",").map((s) => s.trim()).filter(Boolean))];
-      if (requested.length === 0) die("--ids resolved to no ids");
+      const given = [...new Set(idList.split(",").map((s) => s.trim()).filter(Boolean))];
+      if (given.length === 0) die("--ids resolved to no ids");
       // Validate BEFORE touching the DB: a malformed id is a typo, and a typo in a purge argument is
       // the one input where "ignore what doesn't parse" is the wrong default.
-      const malformed = requested.filter((id) => !UUID_RE.test(id));
+      const malformed = given.filter((id) => !UUID_RE.test(id));
       if (malformed.length > 0) die(`not well-formed uuids: ${malformed.join(", ")}`);
+      // Canonicalize AFTER validating: Postgres renders uuids lowercase, and the found/missing
+      // reconciliation below is a string compare — an operator pasting an uppercase id from a
+      // spreadsheet would otherwise be told their own item "is not on this team".
+      const requested = [...new Set(given.map((id) => id.toLowerCase()))];
 
       const team = await resolveTeam(admin, flags.team);
       const { data: rows, error: readErr } = await admin

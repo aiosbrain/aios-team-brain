@@ -4,7 +4,7 @@ import type { NextRequest } from "next/server";
 import { GET as itemsGET, POST as itemsPOST } from "@/app/api/v1/items/route";
 import { db, ingest, sha, seedTeam, type Seed } from "./helpers";
 import { issueApiKey } from "@/lib/admin/keys";
-import { createGroup, grantProjectToGroup, addMemberToGroup } from "@/lib/access/groups";
+import { createGroup, grantProjectToGroup, addMemberToGroup, revokeProjectFromGroup } from "@/lib/access/groups";
 import {
   assessEnforcementReadiness,
   readAccessEnforcement,
@@ -218,6 +218,89 @@ describe("access enforcement — arming the flag on a real team", () => {
     expect(r.unpartitioned.count, "the corpus is fine — this blocker is about PEOPLE").toBe(0);
     // Not a theory: B's reads really are empty in that state.
     expect(await paths(await memberKey(seed, memberB))).toEqual([]);
+  });
+
+  it("an item parked in a project NO GROUP is granted counts as unreachable, not as covered", async () => {
+    // Fable review M1. "Has a membership" is the wrong question: the oracle derives its project
+    // set from GRANTS, so a membership into an un-granted project reaches nobody and the item is
+    // as invisible as an unpartitioned one. Today's writers can't produce this — but a brain
+    // repaired by hand in SQL can, and that brain is exactly this command's audience.
+    const { seed } = await seedTwoMemberTeam();
+    expect((await setAccessEnforcement(db(), seed.teamId, "enforcing")).ok).toBe(true);
+    const { data: orphanProject } = await db()
+      .from("projects")
+      .insert({ team_id: seed.teamId, slug: "no-grants", name: "No grants", kind: "initiative" })
+      .select("id")
+      .single();
+    const bItemId = (await db().from("items").select("id").eq("path", "b-work.md").eq("team_id", seed.teamId).single()).data!.id;
+    const { data: unit } = await db().from("project_context_units").select("id").eq("source_item_id", bItemId).single();
+    await db().from("project_context_memberships").update({ valid_to: new Date().toISOString() }).eq("context_unit_id", unit!.id);
+    await db()
+      .from("project_context_memberships")
+      .insert({ team_id: seed.teamId, project_id: orphanProject!.id, context_unit_id: unit!.id, method: "manual" });
+
+    const r = await assessEnforcementReadiness(db(), seed.teamId);
+    expect(r.unpartitioned.count, "a grant-less membership is not coverage").toBe(1);
+    expect(r.unpartitioned.examples).toEqual(["b-work.md"]);
+    expect(r.ready).toBe(false);
+    // And the verdict agrees with the enforced read, which is the whole point of the check.
+    expect(await paths(await memberKey(seed, seed.memberId))).not.toContain("b-work.md");
+  });
+
+  it("a team-tier human who can no longer reach external-shared is blind, not merely narrowed", async () => {
+    // Fable review L1. Checking General alone would pass a team member who has silently lost the
+    // whole external corpus they can read today — the exact class of regression this gate exists
+    // to catch, just in the less obvious of the two system projects.
+    const { seed } = await seedTwoMemberTeam();
+    expect((await setAccessEnforcement(db(), seed.teamId, "enforcing")).ok).toBe(true);
+    const { data: extShared } = await db()
+      .from("projects")
+      .select("id")
+      .eq("team_id", seed.teamId)
+      .eq("slug", "external-shared")
+      .single();
+    const { data: everyone } = await db()
+      .from("groups")
+      .select("id")
+      .eq("team_id", seed.teamId)
+      .eq("slug", "everyone")
+      .single();
+    expect((await revokeProjectFromGroup(db(), seed.teamId, extShared!.id, everyone!.id, seed.memberId)).ok).toBe(true);
+
+    const r = await assessEnforcementReadiness(db(), seed.teamId);
+    expect(r.ready).toBe(false);
+    expect(r.blindHumans.length, "both team-tier humans lost external-shared").toBe(2);
+    expect(r.unpartitioned.count, "the corpus itself is still fine").toBe(0);
+  });
+
+  it("an active CONNECTOR is a warning: it can read today and reads nothing under enforcing", async () => {
+    // Fable review, plus a live prod observation: 4 of that team's 9 active members are connectors.
+    // `authenticateApiKey` only rejects a non-active member, so a connector key genuinely reads
+    // the corpus today — and the oracle resolves a non-principal to nothing.
+    const { seed } = await seedTwoMemberTeam();
+    const connector = await seedMember(seed);
+    await db().from("members").update({ is_connector: true }).eq("id", connector);
+    expect(await paths(await memberKey(seed, connector)), "reads everything while permissive").toContain("a-work.md");
+
+    const res = await setAccessEnforcement(db(), seed.teamId, "enforcing");
+    expect(res.ok, "not a blocker — a connector is not a person losing their own work").toBe(true);
+    expect(res.readiness?.activeConnectors.map((m) => m.memberId)).toEqual([connector]);
+    expect(res.readiness?.warnings.join(" ")).toMatch(/connector member\(s\) can read the corpus today/);
+    expect(await paths(await memberKey(seed, connector)), "and the warning is literal").toEqual([]);
+  });
+
+  it("a no-change flip reads back but writes no audit row", async () => {
+    const { seed } = await seedTwoMemberTeam();
+    const res = await setAccessEnforcement(db(), seed.teamId, "permissive");
+    expect(res.ok).toBe(true);
+    expect(res.mode).toBe("permissive");
+    expect(res.changed).toBe(false);
+    const { data } = await db()
+      .from("audit_log")
+      .select("action")
+      .eq("team_id", seed.teamId)
+      .eq("action", "access.enforcement_changed");
+    expect(data ?? [], "permissive→permissive is not a visibility change worth a trail entry").toEqual([]);
   });
 
   it("an unplaced AGENT is a warning, not a blocker — agents are never auto-admitted", async () => {

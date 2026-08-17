@@ -73,6 +73,8 @@ export interface EnforcementReadiness {
   blindHumans: BlindPrincipal[];
   /** Active agents the oracle resolves to nothing — expected (agents are never auto-admitted). */
   unplacedAgents: BlindPrincipal[];
+  /** Active connector service accounts: they can read today and will read nothing under enforcing. */
+  activeConnectors: BlindPrincipal[];
 }
 
 type MemberRow = {
@@ -122,7 +124,8 @@ export async function assessEnforcementReadiness(db: DbClient, teamId: string): 
     .select("id, email, kind, is_connector, status, tier")
     .eq("team_id", teamId);
   if (mErr) throw new Error(`members read failed: ${mErr.message}`);
-  const principals = ((memberRows ?? []) as MemberRow[]).filter((m) => isPrincipal({ ...m, tier: m.tier ?? undefined }));
+  const all = (memberRows ?? []) as MemberRow[];
+  const principals = all.filter((m) => isPrincipal({ ...m, tier: m.tier ?? undefined }));
   const blindHumans: BlindPrincipal[] = [];
   const unplacedAgents: BlindPrincipal[] = [];
   let humanPrincipals = 0;
@@ -133,16 +136,29 @@ export async function assessEnforcementReadiness(db: DbClient, teamId: string): 
     const identity: BlindPrincipal = { memberId: m.id, email: m.email, kind: m.kind, tier: m.tier };
     if (m.kind === "human") {
       humanPrincipals++;
-      // A team-tier human must reach General (all team content, byte-identical to today); an
-      // external-tier human must reach external-shared. Any other tier value reaches NEITHER
-      // built-in group, so it is a lockout, not a curiosity — report it as one.
-      const required = m.tier === "team" ? generalId : m.tier === "external" ? externalSharedId : undefined;
-      if (!required || !projectIds.has(required)) blindHumans.push(identity);
+      // A team-tier human must reach BOTH system projects — General (all team content) and
+      // external-shared, which holds the team-visible external content they can see today. A
+      // team member who reaches General alone has silently lost the external corpus, so checking
+      // General only would pass a real regression. An external-tier human must reach
+      // external-shared. Any other tier value reaches NEITHER built-in group, which is a lockout.
+      const required =
+        m.tier === "team"
+          ? [generalId, externalSharedId]
+          : m.tier === "external"
+            ? [externalSharedId]
+            : [undefined];
+      if (required.some((p) => !p || !projectIds.has(p))) blindHumans.push(identity);
     } else {
       agentPrincipals++;
       if (projectIds.size === 0) unplacedAgents.push(identity);
     }
   }
+  // CONNECTORS are not principals by design (service accounts must never resolve visibility), but
+  // `authenticateApiKey` only rejects a non-ACTIVE member — so a connector key can read the corpus
+  // today and will read NOTHING once enforcing. Not a lockout of a person, so not a blocker; but a
+  // silent integration going empty is exactly the kind of change an operator must be told about.
+  // (Live prod check while building this: 4 of that team's 9 active members are connectors.)
+  const activeConnectors = all.filter((m) => m.is_connector && m.status === "active");
   if (blindHumans.length > 0) {
     blockers.push(
       `${blindHumans.length} active human member(s) would see NOTHING under enforcing — their groups grant no path to their tier's system project`
@@ -152,6 +168,13 @@ export async function assessEnforcementReadiness(db: DbClient, teamId: string): 
     warnings.push(
       `${unplacedAgents.length} active agent member(s) are in no granted group and will read ZERO items under enforcing ` +
         `(agents are never auto-admitted to Everyone/External by design — place them explicitly, or their pulls go empty)`
+    );
+  }
+  if (activeConnectors.length > 0) {
+    warnings.push(
+      `${activeConnectors.length} active connector member(s) can read the corpus today and will read ZERO items under ` +
+        `enforcing (a connector is not a principal, so the oracle resolves it to nothing). Connectors normally only PUSH — ` +
+        `check whether any of yours also pulls before you rely on this being harmless`
     );
   }
 
@@ -181,6 +204,7 @@ export async function assessEnforcementReadiness(db: DbClient, teamId: string): 
     agentPrincipals,
     blindHumans,
     unplacedAgents,
+    activeConnectors: activeConnectors.map((m) => ({ memberId: m.id, email: m.email, kind: m.kind, tier: m.tier })),
   };
 }
 
@@ -241,25 +265,31 @@ export async function setAccessEnforcement(
       };
     }
     if (opts.dryRun) return { ...base, ok: true, mode: previous, readiness };
-    const written = await writeMode(db, teamId, mode);
+    const written = await writeMode(db, teamId, mode, previous);
     if (!written.ok) return { ...base, ok: false, error: written.error, prepared, readiness };
-    await auditFlip(db, teamId, previous, written.mode!, opts.actorMemberId ?? null);
+    if (written.mode !== previous) await auditFlip(db, teamId, previous, written.mode!, opts.actorMemberId ?? null);
     return { ok: true, previous, mode: written.mode, changed: written.mode !== previous, prepared, readiness };
   }
 
   // permissive — the fail-open-to-today direction. Never gated: it is the undo.
   if (opts.dryRun) return { ...base, ok: true, mode: previous };
-  const written = await writeMode(db, teamId, mode);
+  const written = await writeMode(db, teamId, mode, previous);
   if (!written.ok) return { ...base, ok: false, error: written.error };
-  await auditFlip(db, teamId, previous, written.mode!, opts.actorMemberId ?? null);
+  if (written.mode !== previous) await auditFlip(db, teamId, previous, written.mode!, opts.actorMemberId ?? null);
   return { ok: true, previous, mode: written.mode, changed: written.mode !== previous };
 }
 
 async function writeMode(
   db: DbClient,
   teamId: string,
-  mode: EnforcementMode
+  mode: EnforcementMode,
+  previous: string
 ): Promise<{ ok: boolean; error?: string; mode?: string }> {
+  // A no-change flip still READS BACK (the operator asked what the mode is, and the answer has to
+  // come off the row) but does not WRITE: an `access.enforcement_changed` audit row saying
+  // permissive→permissive is noise in the one trail someone will later read to reconstruct when a
+  // team's visibility actually changed.
+  if (previous === mode) return { ok: true, mode: await readAccessEnforcement(db, teamId) };
   const { error } = await db.from("teams").update({ access_enforcement: mode }).eq("id", teamId);
   if (error) return { ok: false, error: `write failed: ${error.message}` };
   // Read back: the CHECK constraint, a raced write, or a silently-dropped update all look like

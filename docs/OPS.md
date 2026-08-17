@@ -486,11 +486,26 @@ So `enforcing` does the preparation itself, in order:
 Steps 1 and 2 are idempotent and are what the 30-minute scheduler tick does anyway; running them
 here just means you don't have to wait for a tick or run them by hand.
 
-**Warnings that are not blockers.** An active **agent** member in no granted group is reported but
-does not stop the flip, because agents are deliberately never auto-admitted to the built-in groups.
-The warning is literal: that agent's `GET /api/v1/items` returns zero rows under enforcing until an
-admin places it in a group that is granted something. If an integration goes quiet after a flip,
-this is the first thing to check.
+**Warnings that are not blockers.** Two kinds, and both are literal rather than decorative:
+
+- An active **agent** member in no granted group. Agents are deliberately never auto-admitted to
+  the built-in groups, so that agent's `GET /api/v1/items` returns zero rows under enforcing until
+  an admin places it in a group that is granted something.
+- An active **connector** (the auto-provisioned per-source ingest actor). A connector is not a
+  principal, so the oracle resolves it to nothing — but API-key auth only rejects a non-*active*
+  member, so a connector key that reads today reads nothing after the flip. Connectors normally
+  only push, which is why this is a warning and not a refusal; check whether any of yours also
+  pulls. (On the AIOS production team as of 2026-08-17, 4 of 9 active members are connectors.)
+
+If an integration goes quiet after a flip, these two are the first things to check.
+
+**One window the preflight cannot close.** The backfill drain is bounded to the corpus that
+existed when it started, and the coverage scan runs after it. An item ingested between that scan
+and the flag write — or by a non-push path whose on-ingest partition hook failed — has no
+membership yet and is invisible until the next 30-minute scheduler tick reconverges it. That
+direction is fail-CLOSED (content briefly hidden, never leaked) and self-heals, but if you are
+arming enforcement during an active sync, wait a tick and re-run `--dry-run` before you trust the
+verdict.
 
 ### Rolling back
 

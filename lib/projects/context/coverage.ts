@@ -22,7 +22,8 @@ const MAX_SCAN_BATCHES = 10_000;
 
 export interface CoverageResult {
   scanned: number;
-  /** Items with no ACTIVE item-grain unit carrying a CURRENT include-membership. */
+  /** Items no principal could reach: no ACTIVE item-grain unit carrying a CURRENT
+   *  include-membership into a project that at least one group is GRANTED. */
   count: number;
   /** Up to `EXAMPLE_LIMIT` paths, so an operator sees WHAT would vanish, not only how much. */
   examples: string[];
@@ -86,15 +87,30 @@ async function coveredItemIds(db: DbClient, teamId: string, itemIds: string[]): 
 
   const { data: memRows, error: memErr } = await db
     .from("project_context_memberships")
-    .select("context_unit_id")
+    .select("context_unit_id, project_id")
     .eq("team_id", teamId)
     .eq("decision", "include")
     .is("valid_to", null)
     .in("context_unit_id", [...itemByUnit.keys()]);
   if (memErr) throw new Error(`membership read failed: ${memErr.message}`);
-  for (const r of (memRows ?? []) as { context_unit_id: string }[]) {
+  const granted = await grantedProjectIds(db, teamId);
+  for (const r of (memRows ?? []) as { context_unit_id: string; project_id: string }[]) {
+    // A membership into a project NO GROUP is granted reaches nobody: the oracle derives its
+    // project set from grants, so such an item is as invisible under enforcing as an
+    // unpartitioned one. The sanctioned writers only ever route into the two just-granted system
+    // projects, so this cannot happen through them — but a brain repaired by hand in SQL is
+    // exactly this command's audience, and "has a membership" was the wrong question to ask it.
+    if (!granted.has(r.project_id)) continue;
     const itemId = itemByUnit.get(r.context_unit_id);
     if (itemId) covered.add(itemId);
   }
   return covered;
+}
+
+/** Projects reachable by SOME group. Read-only; the grant table is written only by
+ *  `lib/access/groups.ts` (single writer) and this module never writes anything. */
+async function grantedProjectIds(db: DbClient, teamId: string): Promise<Set<string>> {
+  const { data, error } = await db.from("project_groups").select("project_id").eq("team_id", teamId);
+  if (error) throw new Error(`grant read failed: ${error.message}`);
+  return new Set(((data ?? []) as { project_id: string }[]).map((r) => r.project_id));
 }
