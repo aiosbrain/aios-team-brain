@@ -128,7 +128,9 @@ export async function POST(req: NextRequest) {
     // Neutral envelope via the freshness layer (`computedNow` — not an inline `new Date()`, which the
     // fabricated-freshness guard rightly forbids): an empty result has no cached data whose staleness
     // to report, and stamping the tier row's real time is the §5.7 leak.
-    return Response.json({ arcs, reason: null, note: undefined, ...freshnessWire(computedNow()) });
+    // Coverage pair on EVERY branch (Codex M4: 'universal' meant universal — a branch-dependent
+    // shape is a false wire claim even when no consumer discriminates on it today).
+    return Response.json({ arcs, reason: null, note: undefined, coveredPartitions: covered, totalPartitions: total, ...freshnessWire(computedNow()) });
   }
   return Response.json({
     arcs,

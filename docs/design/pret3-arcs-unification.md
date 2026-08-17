@@ -206,7 +206,24 @@ resolution error yields the EMPTY scope, never the union.
    either preflight fails, record "spec gate: NOT RUN — CLI unavailable" in the PR body —
    never a silent skip.
 
-## 4b. Small print (from the cold read's Lows)
+## 4b. Small print (from the reviews' Lows)
+
+- Rollout races (Codex diff review H1/H2): the data migration runs at preDeploy while the OLD
+  application still serves, so the pre-H1 external-row wipe and a catch-up correction re-key
+  run in the NEW code's boot path instead (`lib/graph/pret3-boot-sweep.ts`, marker-guarded via
+  `migration_markers`, first scheduler tick post-activation — strictly after old writers are
+  gone; a failure records a loud `pret3_sweep` ingest run). The migration keeps the bulk
+  re-key (idempotent, replayed every deploy).
+- The purge door's pointer read distinguishes error from no-row (Codex H3): on a READ ERROR it
+  sweeps ALL external-shaped partition rows for the team (`purgeExternalShapedPartitionRows`) —
+  a purge door's safe direction is deleting more regenerable cache, never a targeted delete
+  that might miss the served row.
+- The coverage pair is on EVERY response branch, including the enforcing-empty neutral
+  envelope (Codex M4).
+- A failed built-in ADOPTION (kind flipped, pointer conversion failed mid-bootstrap) can leave
+  `resolveArcScope`'s permissive branch returning a minted-but-empty source partition — a
+  silently blank panel until the idempotent bootstrap heals it on the next tick (Codex L5).
+  Fails CLOSED for access; accepted and named, not coded around.
 
 - The external correction WRITE path stays closed (the recompute route 403s external members
   today and continues to — L1, stated because every external READ re-routes).

@@ -252,3 +252,20 @@ export async function writeArcCache(
     // best-effort — synthesis result is still returned even if we couldn't persist it
   }
 }
+
+/** PRET-3 (Codex H3's fail-closed arm): delete EVERY external-shaped `g:` partition row for a
+ *  team — the purge door's fallback when the stored pointer cannot be read (a targeted delete
+ *  that might miss the served row is the leak; deleting more regenerable cache never is).
+ *  Best-effort with an honest ok, same contract as its siblings. */
+export async function purgeExternalShapedPartitionRows(db: DbClient, teamId: string): Promise<{ ok: boolean }> {
+  try {
+    const { error } = await db
+      .from("arc_cache")
+      .delete()
+      .eq("team_id", teamId)
+      .like("group_key", "g:%\\_external");
+    return { ok: !error };
+  } catch {
+    return { ok: false };
+  }
+}

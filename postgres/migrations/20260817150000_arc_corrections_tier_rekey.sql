@@ -71,21 +71,13 @@ begin
     moved, kept_conflict, kept_p, skipped_no_pointer;
 end $$;
 
--- Diff-review M1: standing `g:<slug>_external` cache rows synthesized under the 6b-M4 allowance
--- may carry corrections-laundered prose, and this deploy routes EXTERNAL members onto exactly
--- those rows — a fresh or SWR-served row would hand internal editorial text to external
--- principals for up to ~one TTL. Regenerable cache: wipe external-shaped partition rows ONCE,
--- MARKER-BOUNDED (the PPARC-3 precedent — `pg:schema` replays every migration each deploy, so
--- an unbounded delete would cold-start every external panel per release, the exact
--- re-wipe-per-deploy class that migration's Fable review caught): rows computed BEFORE the
--- marker's first stamping are pre-H1 by definition; rows after it are corrections-free by
--- construction and survive replay.
-create table if not exists migration_markers (
-  name text primary key,
-  at timestamptz not null default now()
-);
-insert into migration_markers (name) values ('pret3_ext_row_wipe') on conflict (name) do nothing;
-delete from arc_cache
- where group_key like 'g:%'
-   and group_key like '%\_external' escape '\'
-   and computed_at < (select at from migration_markers where name = 'pret3_ext_row_wipe');
+-- Diff-review M1 + the Codex rollout-race finding (H1): the pre-H1 external-row wipe does NOT
+-- live here. This file runs as Railway's preDeployCommand while the OLD application is still
+-- serving — old code writes corrections-influenced external rows during the deploy window, and
+-- a migration-stamped marker would bless exactly those rows forever ("corrections-free by
+-- construction" is false until the new code is live). The wipe (and a catch-up re-key sweep
+-- for corrections written in the same window) runs in the NEW application's boot path instead
+-- (lib/graph/pret3-boot-sweep.ts — marker-guarded via migration_markers, stamped only AFTER
+-- new-code activation, idempotent, multi-replica safe). The re-key above still runs here for
+-- the bulk: it is idempotent and replayed every deploy, so pre-existing rows convert as early
+-- as possible; the boot sweep owns the deploy-window stragglers.
