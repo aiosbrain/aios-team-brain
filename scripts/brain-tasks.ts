@@ -24,13 +24,13 @@
  *   extract-meeting-todos --team <slug|id> [--source-project <slug>] [--path-prefix <p>]
  *          [--since <iso>] [--limit <n>] [--dry-run] [--project-to-linear]
  *
- * status:   backlog | ready | in_progress | blocked | done   (default backlog)
+ * status:   backlog | ready | in_progress | in_review | blocked | done   (default backlog)
  * priority: none | low | medium | high | urgent              (default none)
  */
 import { readFileSync } from "node:fs";
 import { adminClient } from "@/lib/db/admin";
 import { uiRowKey } from "@/lib/ids";
-import { normalizeTaskPriority } from "@/lib/api/schemas";
+import { TASK_STATUSES, normalizeTaskPriority } from "@/lib/api/schemas";
 import { projectAllTasks, recordProjectionRun } from "@/lib/pm-sync";
 import { getEnabledIntegrationsWithSecrets } from "@/lib/integrations/manage";
 import { linearGraphql } from "@/lib/pm-sync/linear-client";
@@ -45,7 +45,10 @@ type ResolvePage = {
   team: { issues: { pageInfo: { hasNextPage: boolean; endCursor: string }; nodes: { id: string; identifier: string; url: string }[] } } | null;
 };
 
-const STATUSES = ["backlog", "ready", "in_progress", "blocked", "done"];
+// Imported, not re-spelled: this was a hand-maintained fourth copy of the canonical set and it
+// silently went stale when `in_review` was added. `normalizeTaskPriority` was already imported from
+// the same module, so there was never a reason for the list to be local.
+const STATUSES: readonly string[] = TASK_STATUSES;
 
 function parseArgs(argv: string[]): { cmd: string; positionals: string[]; flags: Flags } {
   const [cmd = "help", ...rest] = argv;

@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { normalizeLinearTeam, normalizeLinearDocs, linearWorkedAt, type NormalizeLinearInput } from "@/lib/ingest/sources/linear-normalize";
 import { itemPayloadSchema, taskRowSchema } from "@/lib/api/schemas";
+import { desiredStateForStatus } from "@/lib/pm-sync/provider";
 import { withFooter } from "@/lib/pm-sync/linear-client";
 
 // Spec (worked_at): the task's WORK time is its last state transition — max(startedAt, completedAt,
@@ -67,6 +68,35 @@ describe("normalizeLinearTeam", () => {
     expect(row.priority).toBe("high"); // priority int 2
     expect(row.labels).toEqual(["api"]);
     expect(row.assignee).toBe("Alex");
+  });
+
+  it("keeps a Linear 'In Review' state as in_review instead of flattening it into in_progress", () => {
+    // THE regression this whole status change exists for, and it is not hypothetical or
+    // ClickUp-shaped: the AIOS team's own Linear board carries a workflow state named "In Review"
+    // of type `started`. `linearStatus` is name-first, so before `in_review` was a canonical status
+    // the name simply didn't resolve and it fell through to TYPE_TO_STATUS.started → `in_progress`.
+    // The brain was losing review-state fidelity on its own primary PM tool, silently, and every
+    // existing test stayed green because none of them fed it a state name outside the five.
+    const p = normalizeLinearTeam({
+      ...base,
+      issues: [
+        { id: "u1", identifier: "ENG-7", title: "Awaiting review", state: { name: "In Review", type: "started" } },
+        // Same TYPE, different name — proving the name is what discriminates, not the type. If this
+        // pair ever collapses to one value again, the fidelity is gone and this goes red.
+        { id: "u2", identifier: "ENG-8", title: "Being written", state: { name: "In Progress", type: "started" } },
+      ],
+    });
+    const rows = p.rows as Array<Record<string, unknown>>;
+    expect(rows.map((r) => r.status)).toEqual(["in_review", "in_progress"]);
+    // The projection leg has to have an honest answer for the round trip, or the brain would write
+    // the review task back onto whichever `started` state Linear happens to list first.
+    expect(desiredStateForStatus("in_review")).toEqual({ group: "started", preferredName: "In Review" });
+    // Native fidelity is preserved alongside the canonical value, as it is for every Linear state.
+    const docs = normalizeLinearDocs({
+      ...base,
+      issues: [{ id: "u1", identifier: "ENG-7", title: "Awaiting review", state: { name: "In Review", type: "started" } }],
+    });
+    expect(docs[0].frontmatter).toMatchObject({ state: "In Review", state_type: "started", status: "in_review" });
   });
 
   it("de-dupes brain round-trippers: issues carrying the aios-ext footer are skipped", () => {

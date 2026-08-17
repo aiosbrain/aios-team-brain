@@ -49,8 +49,21 @@
  *        server still gets the pre-1.20 413 — the failure it already handles — so no negotiation is
  *        needed. The cap is WIRE-ONLY: `ingestItem` re-parses with the uncapped storage schema, so
  *        the in-process Linear/GitHub/Plane mirrors (up to 20,000 rows) are unaffected.
+ * 1.21 — The canonical task-status set gains `in_review`, between `in_progress` and `blocked`:
+ *        `backlog|ready|in_progress|in_review|blocked|done` (postgres `task_status`, widened by
+ *        postgres/migrations/20260817120000_task_status_in_review.sql). This is a NORMALIZATION
+ *        change, not a wire-shape one — `taskRowSchema.status` is still a free `string(120)` that
+ *        the SERVER interprets, so no client has to change and none can send an illegal value.
+ *        WHAT AN OLD CLIENT SEES: a task the server now stores as `in_review` used to be stored as
+ *        `in_progress` (a Linear state literally named "In Review" is type `started`, so it fell
+ *        through to the started→in_progress rule). A pre-1.21 client reading that row back — the
+ *        `mode=sync-origin` return leg, `GET /api/v1/tasks?mode=table` — receives a status word it
+ *        has no column for. That is the only observable break, and it is why this is a minor bump
+ *        rather than silent: clients that switch on the status set must add the sixth value.
+ *        A client that PUSHES the literal string "in review"/"In Review" now lands on `in_review`
+ *        instead of `backlog`-with-`raw_status`, which is strictly better fidelity.
  */
-export const BRAIN_API_VERSION = "1.20";
+export const BRAIN_API_VERSION = "1.21";
 
 /** Server-only Executor gateway negotiation; independent of the member API surface. */
 export const GATEWAY_CONTRACT_VERSION = "1.10";

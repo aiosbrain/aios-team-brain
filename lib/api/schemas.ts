@@ -465,10 +465,22 @@ export function normalizeTier(tier: string): "team" | "external" | null {
   return null;
 }
 
+/**
+ * Canonical task status vocabulary (postgres `task_status` enum). Ordered by lifecycle —
+ * board columns, the Pulse funnel and the enum's own sort order all read off this order.
+ *
+ * `in_review` is provider-AGNOSTIC, not a ClickUp accommodation: Linear's default AIO board
+ * carries a workflow state literally named "In Review" of type `started`, which collapsed to
+ * `in_progress` before this existed — the brain was losing review-state fidelity on its own
+ * primary PM tool. Plane teams with a review state and ClickUp approval loops inherit it.
+ * `blocked` deliberately sits AFTER it: blocked is an orthogonal "stuck" flag rather than a
+ * later stage, and it was already positioned last-before-done.
+ */
 export const TASK_STATUSES = [
   "backlog",
   "ready",
   "in_progress",
+  "in_review",
   "blocked",
   "done",
 ] as const;
@@ -660,28 +672,18 @@ const integrationConfigSchemas: Record<IntegrationType, z.ZodType> = {
   // `listIds` is the task selection; `docIds`/`docParent*` select Docs. A half-configured integration
   // stays savable (same stance as notion) — the runner reports what's missing.
   //
-  // `statusMaps` is an ARRAY keyed by an INNER `listId` field, deliberately not a
-  // `Record<listId, …>`: the secret-key scan below walks nested object KEYS, so a List id in key
-  // position would be scanned as a config key — the same hazard `github.repoHistory` documents.
+  // There is deliberately NO per-List status map. Status normalization is `clickUpStatus`
+  // (lib/ingest/sources/clickup-normalize.ts) — name-first, then ClickUp's own `status.type`,
+  // fail-open — the same configuration-free shape Linear and Plane use. The removed `statusMaps`
+  // key required a bijective 5-to-5 map that no List with 3 or 9 statuses could satisfy, failed
+  // CLOSED (one unmapped status aborted the whole workspace payload), and had no writer at all:
+  // lib/integrations/build-config.ts never emitted it, so it was `{}` for every List in practice
+  // and the first task of ANY ClickUp workspace threw. `.strict()` now rejects it, which is the
+  // intended outcome — no saved config can contain it, since none could ever be authored.
   clickup: z
     .object({
       workspaceId: z.string().max(64).optional(),
       listIds: z.array(z.string().min(1).max(64)).max(200).default([]),
-      statusMaps: z
-        .array(
-          z
-            .object({
-              listId: z.string().min(1).max(64),
-              backlog: z.string().min(1).max(80),
-              ready: z.string().min(1).max(80),
-              in_progress: z.string().min(1).max(80),
-              blocked: z.string().min(1).max(80),
-              done: z.string().min(1).max(80),
-            })
-            .strict()
-        )
-        .max(200)
-        .optional(),
       docIds: z.array(z.string().min(1).max(64)).max(200).optional(),
       docParentType: z.enum(["SPACE", "FOLDER", "LIST", "EVERYTHING", "WORKSPACE"]).optional(),
       docParentId: z.string().max(64).optional(),

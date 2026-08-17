@@ -8,6 +8,7 @@ const DOT: Record<TaskStatus, string> = {
   backlog: "bg-ink-tertiary",
   ready: "bg-cyan",
   in_progress: "bg-violet",
+  in_review: "bg-amber",
   blocked: "bg-red",
   done: "bg-emerald",
 };

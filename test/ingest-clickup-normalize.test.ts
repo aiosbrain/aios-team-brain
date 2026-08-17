@@ -1,17 +1,19 @@
 import { describe, expect, it } from "vitest";
-import { itemPayloadSchema, taskRowSchema } from "@/lib/api/schemas";
+import { TASK_STATUSES, itemPayloadSchema, taskRowSchema } from "@/lib/api/schemas";
+import { OPEN_STATUSES } from "@/lib/tasks/activity-policy";
+import type { TaskStatusValue } from "@/lib/pm-sync/provider";
 import { MAX_PAYLOAD_ROWS as MAX_ROWS, wireItemPayloadSchema } from "@/lib/api/item-payload-schema";
 import { parseAuthorRefs, primaryAuthorRef } from "@/lib/attribution/resolve-authors";
 import type { ClickUpDoc, ClickUpDocPage, ClickUpTask, ClickUpTaskRecord } from "@/lib/ingest/sources/clickup";
 import {
-  ClickUpNormalizationError,
   clickUpDocIdentity,
+  clickUpStatus,
+  clickUpStatusOrNull,
   clickUpTaskIdentity,
   clickUpWorkedAt,
   normalizeClickUpDoc,
   normalizeClickUpTaskDocs,
   normalizeClickUpTasks,
-  type ClickUpStatusMap,
 } from "@/lib/ingest/sources/clickup-normalize";
 import { sourceRules } from "@/lib/ingest/source-rules";
 import { classifyWork } from "@/lib/dashboard/work-classification";
@@ -21,33 +23,13 @@ import tasks202Page0 from "@/test/fixtures/clickup/synthetic-tasks-list-202-page
 import docAlpha from "@/test/fixtures/clickup/synthetic-doc-alpha.json";
 import docAlphaPages from "@/test/fixtures/clickup/synthetic-doc-alpha-pages.json";
 
-const list101Map: ClickUpStatusMap = {
-  backlog: "backlog",
-  ready: "to do",
-  in_progress: "in progress",
-  blocked: "blocked",
-  done: "complete",
-};
-
-const list202Map: ClickUpStatusMap = {
-  backlog: "intake",
-  ready: "queued",
-  in_progress: "doing",
-  blocked: "waiting",
-  done: "complete",
-};
-
 const records: ClickUpTaskRecord[] = [
   ...(tasks101Page0.tasks as ClickUpTask[]).map((task) => ({ task, observedListIds: ["101"] })),
   ...(tasks101Page1.tasks as ClickUpTask[]).map((task) => ({ task, observedListIds: ["101"] })),
   ...(tasks202Page0.tasks as ClickUpTask[]).map((task) => ({ task, observedListIds: ["202"] })),
 ];
 
-const input = {
-  workspaceId: 9001,
-  records,
-  statusMaps: { "101": list101Map, "202": list202Map },
-};
+const input = { workspaceId: 9001, records };
 
 describe("ClickUp task normalization", () => {
   it("de-duplicates native ids and emits stable task identities, hierarchy, dates, and provenance", () => {
@@ -101,50 +83,133 @@ describe("ClickUp task normalization", () => {
     const payload = normalizeClickUpTasks({
       workspaceId: 9001,
       records: [record],
-      statusMaps: { "101": list101Map },
     });
     const row = (payload.rows as Array<Record<string, unknown>>)[0];
     expect(() => taskRowSchema.parse(row)).not.toThrow();
     expect(row.labels).toEqual(Array.from({ length: 50 }, (_, index) => `tag-${String(index).padStart(2, "0")}`));
   });
 
-  it("requires a reversible mapping and refuses ambiguous TIML status resolution", () => {
-    const duplicateNativeNames = { ...list101Map, done: "to do" };
-    expect(() =>
-      normalizeClickUpTasks({
-        workspaceId: 9001,
-        records: [records[0]],
-        statusMaps: { "101": duplicateNativeNames },
-      })
-    ).toThrow(ClickUpNormalizationError);
-
-    const ambiguous: ClickUpTaskRecord = {
-      task: { ...records[0].task, list: undefined, status: { status: "to do" } },
-      observedListIds: ["101", "202"],
-    };
-    expect(() =>
-      normalizeClickUpTasks({
-        workspaceId: 9001,
-        records: [ambiguous],
-        statusMaps: { "101": list101Map, "202": { ...list202Map, blocked: "to do", ready: "queued" } },
-      })
-    ).toThrow(/ambiguously/);
+  it("resolves a status by NAME before consulting ClickUp's type", () => {
+    // The precedence `linearStatus`/`planeStatus` already use: a List author who literally names a
+    // column "Blocked" or "Backlog" means it, even though ClickUp types both as `custom`/`open`.
+    // Asserting the CONFLICT case specifically — a name and a type that disagree — because a
+    // type-first mapper passes any test where the two happen to agree.
+    expect(clickUpStatus("Blocked", "custom")).toBe("blocked");
+    expect(clickUpStatus("Backlog", "open")).toBe("backlog"); // type alone would say `ready`
+    expect(clickUpStatus("Done", "custom")).toBe("done"); // type alone would say `in_progress`
+    // Case and separators are normalized by `normalizeTaskStatus`, so these are the same status.
+    expect(clickUpStatus("IN PROGRESS", "open")).toBe("in_progress");
+    expect(clickUpStatus("in-progress", "open")).toBe("in_progress");
   });
 
-  it("uses the selected home List mapping before additional TIML List mappings", () => {
-    const record: ClickUpTaskRecord = {
-      task: { ...records[0].task, status: { status: "to do" } },
-      observedListIds: ["101", "202"],
+  it("falls back to ClickUp's type, mapping `open` to ready rather than backlog", () => {
+    expect(clickUpStatus("to do", "open")).toBe("ready");
+    expect(clickUpStatus("doing", "custom")).toBe("in_progress");
+    expect(clickUpStatus("complete", "done")).toBe("done");
+    expect(clickUpStatus("archived", "closed")).toBe("done");
+    // `open → ready`, NOT `backlog`, is the load-bearing choice: ClickUp has ONE not-started type,
+    // so `backlog` would drop every ClickUp workspace's whole not-started column out of
+    // OPEN_STATUSES and therefore off Home, Pulse in-flight and the timeline.
+    expect(OPEN_STATUSES.has(clickUpStatus("to do", "open") as TaskStatusValue)).toBe(true);
+  });
+
+  it("never throws on an unknown status, and fails OPEN to backlog", () => {
+    // The predecessor threw from inside `rows.map`, so ONE unrecognised status aborted the entire
+    // workspace payload and every per-task document with it. A status the brain can't place is one
+    // row in intake, not an unimportable workspace.
+    expect(() => clickUpStatus("Marinating", "totally-invented-type")).not.toThrow();
+    expect(clickUpStatus("Marinating", "totally-invented-type")).toBe("backlog");
+    expect(clickUpStatus(undefined, undefined)).toBe("backlog");
+    expect(clickUpStatus("", "")).toBe("backlog");
+    // The strict variant a future inbound-apply needs says "unresolvable" instead of guessing.
+    expect(clickUpStatusOrNull("Marinating", "totally-invented-type")).toBeNull();
+    expect(clickUpStatusOrNull("to do", "open")).toBe("ready");
+
+    const unknown: ClickUpTaskRecord = {
+      task: { ...records[0].task, status: { status: "Marinating", type: "nope" } },
+      observedListIds: ["101"],
     };
-    const payload = normalizeClickUpTasks({
-      workspaceId: 9001,
-      records: [record],
-      statusMaps: {
-        "101": list101Map,
-        "202": { ...list202Map, blocked: "to do", ready: "queued" },
-      },
+    const payload = normalizeClickUpTasks({ workspaceId: 9001, records: [unknown] });
+    expect((payload.rows as Array<Record<string, unknown>>)[0].status).toBe("backlog");
+    // …and the per-task documents survive too — the old fail-closed threw from BOTH entry points.
+    expect(() => normalizeClickUpTaskDocs({ workspaceId: 9001, records: [unknown] })).not.toThrow();
+  });
+
+  it("imports a 3-status List and a 9-status List, neither of which a 5-to-5 map could describe", () => {
+    // The bijective `Record<brainStatus, string>` this replaced needed EXACTLY five distinct
+    // ClickUp status names per List. A List with three could not satisfy it and a List with nine
+    // could not either — so the failure was never "large workspace", it was every workspace whose
+    // pipeline is not exactly five columns wide.
+    const lean = [
+      { name: "To Do", type: "open", expect: "ready" },
+      { name: "Doing", type: "custom", expect: "in_progress" },
+      { name: "Done", type: "done", expect: "done" },
+    ];
+    // A nine-status delivery pipeline with a client-approval loop.
+    const wide = [
+      { name: "to do", type: "open", expect: "ready" },
+      { name: "in progress", type: "custom", expect: "in_progress" },
+      { name: "blocked", type: "custom", expect: "blocked" },
+      { name: "team approval", type: "custom", expect: "in_review" },
+      { name: "client approval", type: "custom", expect: "in_review" },
+      { name: "corrections", type: "custom", expect: "in_progress" },
+      { name: "client approved", type: "custom", expect: "in_progress" },
+      { name: "done", type: "done", expect: "done" },
+      { name: "Closed", type: "closed", expect: "done" },
+    ];
+
+    for (const list of [lean, wide]) {
+      const payload = normalizeClickUpTasks({
+        workspaceId: 9001,
+        records: list.map((s, index) => ({
+          task: { ...records[0].task, id: `s-${index}`, custom_id: null, parent: null, status: { status: s.name, type: s.type } },
+          observedListIds: ["101"],
+        })),
+      });
+      expect(() => itemPayloadSchema.parse(payload)).not.toThrow();
+      const rows = payload.rows as Array<Record<string, unknown>>;
+      expect(rows).toHaveLength(list.length);
+      expect(rows.map((row) => row.status)).toEqual(list.map((s) => s.expect));
+      // Every row is a legal `task_status` — the mapper cannot invent a value the enum rejects.
+      for (const row of rows) expect(TASK_STATUSES).toContain(row.status);
+    }
+  });
+
+  it("routes a named review/approval stage to in_review, but not its past tense", () => {
+    // ClickUp collapses everything between start and finish into the single `custom` type, so the
+    // display name is the ONLY review signal available — unlike Linear, whose "In Review" state is
+    // caught by the name rule anyway. This is why the heuristic exists and why it is ClickUp-local.
+    expect(clickUpStatus("In Review", "custom")).toBe("in_review"); // exact name, no heuristic needed
+    expect(clickUpStatus("team approval", "custom")).toBe("in_review");
+    expect(clickUpStatus("client approval", "custom")).toBe("in_review");
+    expect(clickUpStatus("Ready for review", "custom")).toBe("in_review");
+    expect(clickUpStatus("Code Review", "custom")).toBe("in_review");
+    // Past tense means the work came BACK from review and is active again — the `\b` anchors
+    // matter, and a substring match would get every one of these wrong.
+    expect(clickUpStatus("client approved", "custom")).toBe("in_progress");
+    expect(clickUpStatus("reviewed", "custom")).toBe("in_progress");
+    // A terminal type still wins over the heuristic never firing on it — `done` is not review.
+    expect(clickUpStatus("approved", "done")).toBe("done");
+  });
+
+  it("keeps the native status AND its type verbatim beside the canonical one", () => {
+    // The fidelity story: `in_review` collapses "team approval" and "client approval" together in
+    // `tasks`, so the native pair has to survive on the document or the distinction is destroyed
+    // rather than merely coarsened. `native_status_type` is stamped so a downstream consumer never
+    // has to re-derive terminality by regexing a display name.
+    const record: ClickUpTaskRecord = {
+      task: { ...records[0].task, status: { status: "Client Approval", type: "custom" } },
+      observedListIds: ["101"],
+    };
+    const [doc] = normalizeClickUpTaskDocs({ workspaceId: 9001, records: [record] });
+    expect(doc.frontmatter).toMatchObject({
+      status: "in_review",
+      native_status: "Client Approval",
+      native_status_type: "custom",
     });
-    expect((payload.rows as Array<Record<string, unknown>>)[0].status).toBe("ready");
+    expect(normalizeClickUpTasks({ workspaceId: 9001, records: [record] }).body).toContain(
+      '"native_status":"Client Approval"'
+    );
   });
 
   it("uses only completion/closure transitions as worked_at", () => {
@@ -249,7 +314,7 @@ describe("ClickUp task normalization", () => {
       },
       observedListIds: ["101"],
     };
-    const payload = normalizeClickUpTasks({ workspaceId: 9001, records: [record], statusMaps: { "101": list101Map } });
+    const payload = normalizeClickUpTasks({ workspaceId: 9001, records: [record] });
     const row = (payload.rows as Array<Record<string, unknown>>)[0];
     expect(() => taskRowSchema.parse(row)).not.toThrow();
     expect(() => itemPayloadSchema.parse(payload)).not.toThrow();
@@ -270,7 +335,7 @@ describe("ClickUp task normalization", () => {
       task: { ...records[0].task, date_done: nanoseconds, date_updated: nanoseconds },
       observedListIds: ["101"],
     };
-    const payload = normalizeClickUpTasks({ workspaceId: 9001, records: [record], statusMaps: { "101": list101Map } });
+    const payload = normalizeClickUpTasks({ workspaceId: 9001, records: [record] });
     expect(() => itemPayloadSchema.parse(payload)).not.toThrow();
     expect((payload.rows as Array<Record<string, unknown>>)[0].worked_at).toBe("");
   });
@@ -284,7 +349,7 @@ describe("ClickUp task normalization", () => {
       task: { ...records[0].task, id: `big-${index}`, custom_id: null, parent: null, name: `Task ${index}` },
       observedListIds: ["101"],
     }));
-    const payload = normalizeClickUpTasks({ workspaceId: 9001, records: many, statusMaps: { "101": list101Map } });
+    const payload = normalizeClickUpTasks({ workspaceId: 9001, records: many });
 
     expect(() => itemPayloadSchema.parse(payload)).not.toThrow();
     expect(payload.body.length).toBeLessThanOrEqual(1_000_000);
@@ -304,7 +369,6 @@ describe("ClickUp task normalization", () => {
     const workspaceOf = (count: number) =>
       normalizeClickUpTasks({
         workspaceId: 9001,
-        statusMaps: { "101": list101Map },
         records: Array.from({ length: count }, (_, index) => ({
           task: { ...records[0].task, id: `big-${index}`, custom_id: null, parent: null, name: `Task ${index}` },
           observedListIds: ["101"],
@@ -337,9 +401,9 @@ describe("ClickUp task normalization", () => {
         },
         observedListIds: ["101"],
       }));
-    const base = normalizeClickUpTasks({ workspaceId: 9001, records: many(""), statusMaps: { "101": list101Map } });
-    const replay = normalizeClickUpTasks({ workspaceId: 9001, records: many(""), statusMaps: { "101": list101Map } });
-    const edited = normalizeClickUpTasks({ workspaceId: 9001, records: many(" edited"), statusMaps: { "101": list101Map } });
+    const base = normalizeClickUpTasks({ workspaceId: 9001, records: many("") });
+    const replay = normalizeClickUpTasks({ workspaceId: 9001, records: many("") });
+    const edited = normalizeClickUpTasks({ workspaceId: 9001, records: many(" edited") });
 
     expect(replay.content_sha256).toBe(base.content_sha256);
     expect(edited.content_sha256).not.toBe(base.content_sha256);
@@ -353,7 +417,7 @@ describe("ClickUp task normalization", () => {
       task: { ...records[0].task, date_done: 0, due_date: 0 },
       observedListIds: ["101"],
     };
-    const payload = normalizeClickUpTasks({ workspaceId: 9001, records: [record], statusMaps: { "101": list101Map } });
+    const payload = normalizeClickUpTasks({ workspaceId: 9001, records: [record] });
     const row = (payload.rows as Array<Record<string, unknown>>)[0];
     expect(row.worked_at).toBe("");
     expect(row.due).toBeNull();
@@ -366,23 +430,24 @@ describe("ClickUp task normalization", () => {
       task: { ...records[0].task, name: `${"n".repeat(1999)}😀${"n".repeat(100)}` },
       observedListIds: ["101"],
     };
-    const payload = normalizeClickUpTasks({ workspaceId: 9001, records: [record], statusMaps: { "101": list101Map } });
+    const payload = normalizeClickUpTasks({ workspaceId: 9001, records: [record] });
     const title = (payload.rows as Array<Record<string, unknown>>)[0].title as string;
     expect(title.length).toBeLessThanOrEqual(2000);
     expect(Buffer.from(title, "utf8").toString("utf8")).toBe(title);
     expect(/[\ud800-\udbff]$/.test(title)).toBe(false);
   });
 
-  it("names the status and the Lists consulted when a native status is unmapped", () => {
-    // Fail-closed is deliberate, but the blast radius is the whole workspace — so the message has to
-    // carry enough to act on, or "all ClickUp tasks stopped importing" has nothing in it to fix.
+  it("resolves a typeless status by name alone instead of failing the workspace", () => {
+    // This case used to be the whole bug: a status ClickUp sent without a `type` threw
+    // `ClickUpNormalizationError` from inside `rows.map`, so ONE task took down the entire
+    // workspace payload. Now the name resolves it — and "In Review" resolves to the canonical
+    // status added for exactly this, rather than being flattened into `in_progress`.
     const record: ClickUpTaskRecord = {
       task: { ...records[0].task, status: { status: "In Review" } },
       observedListIds: ["101"],
     };
-    expect(() =>
-      normalizeClickUpTasks({ workspaceId: 9001, records: [record], statusMaps: { "101": list101Map } })
-    ).toThrow(/In Review.*consulted: 101/);
+    const payload = normalizeClickUpTasks({ workspaceId: 9001, records: [record] });
+    expect((payload.rows as Array<Record<string, unknown>>)[0].status).toBe("in_review");
   });
 });
 

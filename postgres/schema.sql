@@ -44,8 +44,11 @@ exception when duplicate_object then null; end $$;
 alter type item_kind add value if not exists 'fact';
 alter type item_kind add value if not exists 'stakeholder_mention';
 do $$ begin
-  create type task_status as enum ('backlog', 'ready', 'in_progress', 'blocked', 'done');
+  create type task_status as enum ('backlog', 'ready', 'in_progress', 'in_review', 'blocked', 'done');
 exception when duplicate_object then null; end $$;
+-- Widening for a DB that already holds `task_status`: the `create type` above is a no-op there, so
+-- the catch-up lives in postgres/migrations/20260817120000_task_status_in_review.sql. Kept OUT of
+-- this file on purpose — see that migration's header for why the position matters.
 do $$ begin
   create type task_origin as enum ('sync', 'ui');
 exception when duplicate_object then null; end $$;

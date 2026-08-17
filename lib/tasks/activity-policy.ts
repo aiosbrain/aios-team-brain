@@ -29,9 +29,19 @@ import type { TaskStatusValue } from "@/lib/pm-sync/provider";
  * is provider-agnostic by construction and a new provider inherits the rule instead of bypassing it.
  */
 
-/** Being worked right now — including `blocked` (underway and stuck), excluding `ready` (queued). */
+/**
+ * Being worked right now — including `blocked` (underway and stuck) and `in_review` (handed off for
+ * review, still in flight), excluding `ready` (queued).
+ *
+ * `in_review` is here rather than merely open because of what it USED to be: before the status
+ * existed, a Linear "In Review" state resolved to `in_progress` and therefore counted as active on
+ * Home, Pulse in-flight, the work timeline and arc eligibility. Splitting it out without adding it
+ * back would have silently emptied those surfaces of every task awaiting review — a regression
+ * disguised as a fidelity improvement.
+ */
 export const ACTIVE_STATUSES: ReadonlySet<TaskStatusValue> = new Set<TaskStatusValue>([
   "in_progress",
+  "in_review",
   "blocked",
 ]);
 

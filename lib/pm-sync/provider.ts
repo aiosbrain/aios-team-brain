@@ -8,7 +8,7 @@ export type PmProvider = "plane" | "linear";
 
 // Canonical task status values (postgres `task_status` enum). The projection engine maps these
 // onto provider workflow-state "groups" (Plane state `group` / Linear state `type`).
-export type TaskStatusValue = "backlog" | "ready" | "in_progress" | "blocked" | "done";
+export type TaskStatusValue = "backlog" | "ready" | "in_progress" | "in_review" | "blocked" | "done";
 export type StateGroup = "backlog" | "unstarted" | "started" | "completed" | "cancelled";
 
 export interface TaskPmLink {
@@ -127,6 +127,12 @@ export interface PmAdapter {
 
 // status → desired provider state. Both providers share five workflow groups; `blocked` has no
 // native group, so it maps to `started` unless a state literally named "Blocked" exists (UX caveat).
+// `in_review` is in exactly the same position: neither Linear nor Plane has a `review` state GROUP —
+// Linear's types are backlog|unstarted|started|completed|canceled — so it also projects into
+// `started` with a name hint. That is not a fudge: `resolveStateByGroup` (lib/pm-sync/linear.ts)
+// prefers a state whose NAME matches `preferredName` within the group, so a board that really has an
+// "In Review" started state gets it exactly, and a board that doesn't falls back to the first
+// started state — the same graceful degradation `blocked` has always had.
 export interface DesiredState {
   group: StateGroup;
   preferredName: string;
@@ -138,6 +144,8 @@ export function desiredStateForStatus(status: string): DesiredState {
       return { group: "unstarted", preferredName: "Todo" };
     case "in_progress":
       return { group: "started", preferredName: "In Progress" };
+    case "in_review":
+      return { group: "started", preferredName: "In Review" };
     case "blocked":
       return { group: "started", preferredName: "Blocked" };
     case "done":

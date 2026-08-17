@@ -1,4 +1,7 @@
-export const TASK_STATUSES = ["backlog", "ready", "in_progress", "blocked", "done"] as const;
+// Mirrors `TASK_STATUSES` in lib/api/schemas.ts (the postgres `task_status` enum), in the same
+// lifecycle order — this is the board's column order. Client-side copy because lib/api/schemas.ts
+// is server-only; keep the two in lockstep.
+export const TASK_STATUSES = ["backlog", "ready", "in_progress", "in_review", "blocked", "done"] as const;
 export type TaskStatus = (typeof TASK_STATUSES)[number];
 
 // Canonical priority words (postgres `task_priority`); mirrors normalizeTaskPriority's output set.
@@ -9,6 +12,7 @@ export const STATUS_LABELS: Record<TaskStatus, string> = {
   backlog: "Backlog",
   ready: "Ready",
   in_progress: "In progress",
+  in_review: "In review",
   blocked: "Blocked",
   done: "Done",
 };

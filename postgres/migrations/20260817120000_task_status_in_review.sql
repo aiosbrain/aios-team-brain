@@ -1,0 +1,23 @@
+-- Widen the `task_status` enum with `in_review`.
+--
+-- WHY A MIGRATION AND NOT JUST schema.sql: `schema.sql` creates the type inside a
+-- `do $$ … exception when duplicate_object then null $$` block, so on a DB that already has
+-- `task_status` the whole `create type` is swallowed and the new label never appears. Prod keeps
+-- the five-value shape until this file runs. (Same reason `alter table … add column if not exists`
+-- lives here rather than in the `create table` body — postgres/migrations/README.md.)
+--
+-- POSITION MATTERS: enum labels sort by their physical order, not alphabetically, so
+-- `order by status` and any `min/max(status)` read off it. `before 'blocked'` reproduces the
+-- from-zero order in `schema.sql` — without it an existing DB would sort `in_review` LAST and
+-- silently disagree with a freshly-loaded one.
+--
+-- IDEMPOTENT: `if not exists` makes this a no-op on replay, which `npm run pg:schema` does on
+-- EVERY deploy (there is no applied-migrations table). It is also a no-op from zero, because
+-- `schema.sql` already created the type with the label.
+--
+-- SINGLE STATEMENT ON PURPOSE: `alter type … add value` is only transaction-safe on PostgreSQL
+-- >= 12, and then only while the new label goes unused in the same transaction. The loader sends
+-- each migration file as ONE simple query, which Postgres wraps in an implicit transaction — so
+-- this file must not also contain a statement that *uses* 'in_review' (a backfill, a re-added
+-- CHECK). If one is ever needed, it belongs in a LATER migration file, not appended here.
+alter type task_status add value if not exists 'in_review' before 'blocked';
