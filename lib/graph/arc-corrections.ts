@@ -98,7 +98,7 @@ export async function listArcCorrections(
   try {
     const { data, error } = await db
       .from("arc_corrections")
-      .select("arc_id, arc_title, corrected_text, created_by, updated_at")
+      .select("arc_id, arc_title, corrected_text, created_by, updated_at, group_key")
       .eq("team_id", teamId)
       .in("group_key", scope.includeLegacy ? [scope.groupKey, ""] : [scope.groupKey])
       .order("updated_at", { ascending: false })
@@ -109,19 +109,30 @@ export async function listArcCorrections(
       .order("arc_id", { ascending: true })
       .limit(limit);
     if (error) throw new Error(error.message);
-    // NEWEST take per arc across the ADMITTED scope set (second-pass 6b Medium): the tier read
+    // ONE take per arc across the ADMITTED scope set (second-pass 6b Medium): the tier read
     // admits [tierKey, ''] — a pre-6b legacy row and its post-6b re-correction are DIFFERENT rows
     // under the per-scope arbiter, and without this both takes argue inside one prompt forever
     // (the exact state the unique exists to prevent, reintroduced across the migration boundary).
-    // Rows arrive updated_at DESC, so first-seen per arc_id is the newest. A superseded twin
-    // briefly costs one of the LIMIT slots — bounded, and it ages out of the window.
+    // The winner rule is SEMANTIC, not clock-based: a SCOPED row beats the legacy ('') row for
+    // its arc regardless of timestamps — recordArcCorrections stamps the APP clock at millisecond
+    // precision while raw/legacy rows carry the DB clock at microsecond precision, so a
+    // re-correction written <1ms after (or with app/DB clock skew against) the legacy row FLOORS
+    // to an earlier updated_at and "newest-first" resurrected the rejected take (caught red in
+    // CI + a loaded local run, green standalone — QMIR-1's CI, latent since 6b). Among rows of
+    // the SAME legacy-ness the per-scope unique guarantees one row per arc, so updated_at order
+    // never has to arbitrate within a class. A superseded twin briefly costs one of the LIMIT
+    // slots — bounded, and it ages out of the window.
     const newestPerArc: Record<string, unknown>[] = [];
-    const seenArcs = new Set<string>();
+    const winnerIdx = new Map<string, number>();
     for (const r of (data ?? []) as Record<string, unknown>[]) {
       const arcId = String(r.arc_id ?? "");
-      if (seenArcs.has(arcId)) continue;
-      seenArcs.add(arcId);
-      newestPerArc.push(r);
+      const held = winnerIdx.get(arcId);
+      if (held === undefined) {
+        winnerIdx.set(arcId, newestPerArc.length);
+        newestPerArc.push(r);
+      } else if (String(newestPerArc[held].group_key ?? "") === "" && String(r.group_key ?? "") !== "") {
+        newestPerArc[held] = r; // the scoped re-correction supersedes its legacy row, in place
+      }
     }
     const corrections = newestPerArc.map((r) => ({
       arc_id: String(r.arc_id ?? ""),

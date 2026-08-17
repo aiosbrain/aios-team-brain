@@ -101,7 +101,7 @@ Each deferral names its home (round-2 Low 10 — this repo's task gate is ticket
 
 - **FalkorDB** — §17-C spike resolved (stay on Neo4j/Graphiti; a server upgrade + bolt-read rewrite, saves RAM not LLM spend, SSPL). Phase C proceeds on the existing backend. Closed, no ticket.
 - **External-tier per-project graph reads** — external principals keep the omit path (§2.0). Unticketed until an external-tier principal needs graph-grounded answers (a product signal, not a Phase C dependency); ticket then opens against a per-`(project, tier)` or per-fact-filter design.
-- **The Postgres `graph_entities`/`graph_relationships` mirrors** (`/api/v1/query` structured legs) — a separate `group_id` leg. Unticketed until the PCCC-6 read cutover lands (its shape depends on the pointer scheme proving out).
+- **The Postgres `graph_entities`/`graph_relationships` mirrors** (`/api/v1/query` structured legs) — **RESOLVED by QMIR-1** (`docs/design/query-mirror-legs-classification.md`): measured, the tables hold only org-structural rows (actors + REPORTS_TO), so they are TIER-classed and the `group_id` leg this bullet anticipated is retired as a category error; the partition-classing obligation transfers to any future item-derived entity writer (spec §5.8b).
 - **Per-project arcs** (the structural fix for the PCCB-5 synthesized-prose residual) — unticketed until PCCC-6 lands; it consumes the per-project graphs this doc builds.
 
 ## 5. Sequencing

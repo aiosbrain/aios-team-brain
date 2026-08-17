@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import { readFileSync, readdirSync, statSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 /**
@@ -51,6 +52,41 @@ function offenders(): string[] {
   return hits.sort();
 }
 
+// The SQL surface (QMIR-1, Codex Medium 3): migrations ARE production writers — the actor
+// backfill proves it — and a future migration inserting ITEM-DERIVED rows would land team-wide
+// on every serving surface (retrieve's reopened legs + the type-unfiltered
+// /api/v1/company-graph) with this guard green. Scan postgres/ too; the one sanctioned
+// member-derived backfill is allowlisted.
+const SQL_WRITE_RE = /(insert\s+into|update|delete\s+from)\s+(graph_entities|graph_relationships)\b/gi;
+const SQL_OWNERS = new Set(["postgres/migrations/20260707120100_backfill_graph_actors.sql"]);
+
+function walkSql(dir: string, out: string[] = []): string[] {
+  let entries: string[];
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return out;
+  }
+  for (const name of entries) {
+    const p = join(dir, name);
+    if (statSync(p).isDirectory()) walkSql(p, out);
+    else if (p.endsWith(".sql")) out.push(p);
+  }
+  return out;
+}
+
+function sqlOffenders(root: string, owners: ReadonlySet<string> = SQL_OWNERS): string[] {
+  const hits: string[] = [];
+  for (const file of walkSql(root)) {
+    const rel = file.slice(ROOT.length + 1).split("\\").join("/");
+    if (owners.has(rel)) continue;
+    const src = readFileSync(file, "utf8");
+    // schema.sql's CREATE TABLE bodies are not writes; the regex matches DML verbs only.
+    for (const m of src.matchAll(SQL_WRITE_RE)) hits.push(`${rel}: ${m[1]} ${m[2]}`);
+  }
+  return hits.sort();
+}
+
 describe("single-writer: graph_entities / graph_relationships", () => {
   it("only lib/graph/company-actors.ts (and the demo seed) writes the company graph tables", () => {
     const violations = offenders();
@@ -67,5 +103,26 @@ describe("single-writer: graph_entities / graph_relationships", () => {
     WRITE_RE.lastIndex = 0;
     expect(WRITE_RE.test('db.from("graph_entities").select(')).toBe(false);
     WRITE_RE.lastIndex = 0;
+  });
+
+  it("no SQL file writes the company graph tables outside the sanctioned backfill (QMIR-1)", () => {
+    const violations = sqlOffenders(join(ROOT, "postgres"));
+    expect(violations, `SQL writers of the company graph tables:\n${violations.join("\n")}`).toEqual([]);
+    // Non-vacuity against the real tree: the sanctioned backfill DOES carry the write shape, so
+    // an emptied allowlist must produce hits — the scanner cannot be blind.
+    expect(sqlOffenders(join(ROOT, "postgres"), new Set()).length).toBeGreaterThan(0);
+  });
+
+  it("the SQL scanner catches a planted offender migration", () => {
+    const dir = mkdtempSync(join(tmpdir(), "company-graph-sql-guard-"));
+    try {
+      writeFileSync(join(dir, "20990101000000_bad.sql"), "insert into graph_entities (team_id, entity_id, entity_type) values ('t','e','commitment');\n");
+      writeFileSync(join(dir, "innocent.sql"), "create table if not exists graph_entities (id uuid);\nselect * from graph_entities;\n");
+      const hits = sqlOffenders(dir, new Set());
+      expect(hits).toHaveLength(1);
+      expect(hits[0]).toContain("bad");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

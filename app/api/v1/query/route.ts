@@ -138,13 +138,17 @@ export async function POST(req: NextRequest) {
     const { teamEnforcesAccess, visibleItemIds, delegatedVisibleItemIds } = await import("@/lib/access/enforce");
     if (agent) {
       const { ids } = await delegatedVisibleItemIds(db, agent);
-      enforce = { visibleItemIds: ids };
+      // QMIR-1: a delegated token is `principal: "token"` — the org-structural mirror legs stay
+      // absolutely omitted for it, tier-independent (the round-3 Codex Critical posture).
+      enforce = { visibleItemIds: ids, principal: "token" };
     } else if (await teamEnforcesAccess(db, teamId)) {
       const { ids, projectIds } = await visibleItemIds(db, { teamId, memberId: auth!.memberId });
       // PCCC-6: a team-tier member gets the graph leg back over their K-capped ready partitions.
       // External members and the delegated path above deliberately pass NO graphProjectIds — the
-      // §5.8b omit is unchanged for them.
-      enforce = { visibleItemIds: ids, ...(auth!.memberTier === "team" ? { graphProjectIds: projectIds } : {}) };
+      // §5.8b omit is unchanged for them. QMIR-1: `principal: "member"` also readmits the
+      // org-structural mirror legs (actors + REPORTS_TO) — for team tier; external members keep
+      // the tier omit inside retrieve.
+      enforce = { visibleItemIds: ids, principal: "member", ...(auth!.memberTier === "team" ? { graphProjectIds: projectIds } : {}) };
     }
   } catch {
     return errorResponse("internal", "enforcement check failed", 500);

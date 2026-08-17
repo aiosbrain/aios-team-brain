@@ -100,13 +100,24 @@ describe("delegated query wiring in app/api/v1/query/route.ts (Phase B slice 3)"
     // flag-gated member path must be its else-branch — so the agent arm can neither lose the
     // assignment (call kept, enforce stays null → unfiltered retrieve with graph legs live) nor
     // be nested inside teamEnforcesAccess (flag-dependent → permissive team widens the token).
+    // QMIR-1 widened the pin: the agent arm must ALSO carry `principal: "token"` — the
+    // org-structural mirror legs key on the positive member test, so losing the discriminant
+    // here silently costs nothing today but is the field a future refactor must not drop.
+    // Comment lines between the resolve and the assignment are permitted; code is not.
     expect(src).toMatch(
-      /if\s*\(agent\)\s*\{\s*const\s*\{\s*ids\s*\}\s*=\s*await\s+delegatedVisibleItemIds\(\s*db\s*,\s*agent\s*\)\s*;\s*enforce\s*=\s*\{\s*visibleItemIds:\s*ids\s*\}\s*;\s*\}\s*else\s+if\s*\(await\s+teamEnforcesAccess/
+      /if\s*\(agent\)\s*\{\s*const\s*\{\s*ids\s*\}\s*=\s*await\s+delegatedVisibleItemIds\(\s*db\s*,\s*agent\s*\)\s*;\s*(?:\/\/[^\n]*\n\s*)*enforce\s*=\s*\{\s*visibleItemIds:\s*ids\s*,\s*principal:\s*"token"\s*\}\s*;\s*\}\s*else\s+if\s*\(await\s+teamEnforcesAccess/
     );
     // No bare `enforce = null` assignment may exist anywhere (Codex B3 Low: the sequence regex
     // above survives a later re-null). The typed declaration (`let enforce: … | null = null`)
     // does not match this pattern, so the legal count is zero.
     expect(src.match(/enforce\s*=\s*null/g) ?? [], "enforce must never be re-nulled after the branch").toHaveLength(0);
+  });
+  it("both MEMBER arms carry principal: \"member\" (QMIR-1 review Low 1 — the call site nothing else pins)", () => {
+    // Fail direction is closed (a dropped/flipped discriminant silently costs members the org
+    // chart, not a leak) — but a call site pinned by nothing is this repo's flagship defect class.
+    expect(src).toMatch(/enforce\s*=\s*\{\s*visibleItemIds:\s*ids\s*,\s*principal:\s*"member"/);
+    const dash = read("app/api/dashboard/query/route.ts");
+    expect(dash).toMatch(/enforce\s*=\s*\{\s*visibleItemIds:\s*ids\s*,\s*principal:\s*"member"/);
   });
   it("the Phase A 403 refusal is gone — delegated tokens authenticate instead", () => {
     expect(src).not.toMatch(/delegation_not_supported/);
