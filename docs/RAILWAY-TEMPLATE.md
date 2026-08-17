@@ -41,7 +41,7 @@ that will own the deployment.
 | `GRAPH_PROJECT_ENABLED` | fixed to `true` |
 | `SECRETS_KEY` | a generated secret that must decode to **exactly 32 bytes**. The live template uses `${{ secret(64, "0123456789abcdef") }}` (64 hex chars). A 43-char base64url secret also works and was what earlier revisions of this document described. `decodeKey` (`lib/secrets/crypto.ts:55-59`) takes 64-char hex, else base64 — validation is on decoded length alone, so both forms are accepted. Anything else fails on the first connector save, not at boot. |
 | `TEAM_NAME` | required user input |
-| `TEAM_SLUG` | required user input; lowercase letters, digits, hyphens |
+| `TEAM_SLUG` | required user input; lowercase letters, digits, hyphens. Railway's form cannot validate it, so bootstrap normalises anything else (`Acme Corp` → `acme-corp`) and prints what it used — the slug is the team's permanent `/t/<slug>` address |
 | `ADMIN_NAME` | required user input |
 | `ADMIN_EMAIL` | required user input |
 | `ADMIN_PASSWORD` | required user input, minimum 10 characters; never printed by bootstrap |

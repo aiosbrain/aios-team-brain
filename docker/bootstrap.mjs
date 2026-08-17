@@ -11,6 +11,11 @@
  * credential, and this image runs NODE_ENV=production where magic-link mail is dropped
  * without a transport — so without this step the stack would come up with nothing to log in
  * with. Skip the whole demo with SEED_DEMO=false.
+ *
+ * The demo is DEFAULT-ON for a laptop and OPT-IN for anything with a public address: on a
+ * production build whose APP_URL is not localhost it seeds only for an explicit SEED_DEMO=true,
+ * because the demo login is documented in this public repo. See `scripts/setup/deploy-policy.mjs`
+ * for that decision and for TEAM_SLUG normalisation.
  */
 import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -19,6 +24,7 @@ import { randomBytes } from "node:crypto";
 import pg from "pg";
 import { shouldUseSsl } from "../scripts/pg-load-schema.mjs";
 import { credentialPlan, credentialSummary } from "../scripts/setup/credential-plan.mjs";
+import { demoSeedDecision, normalizeTeamSlug } from "../scripts/setup/deploy-policy.mjs";
 
 const DATABASE_URL = process.env.DATABASE_URL;
 if (!DATABASE_URL) {
@@ -26,8 +32,13 @@ if (!DATABASE_URL) {
   process.exit(1);
 }
 
+const DEMO = demoSeedDecision(process.env);
 const DEMO_EMAIL = process.env.DEMO_EMAIL || "admin@demo.local";
-const DEMO_PASSWORD = process.env.DEMO_PASSWORD || "aios-demo-password";
+// The documented demo password is a convenience for a laptop, and a published credential
+// anywhere else. If an operator opts the demo INTO a production deploy with a public URL, they
+// get a generated one instead — printed once, like every other first-boot secret here.
+const DEMO_PASSWORD =
+  process.env.DEMO_PASSWORD || (DEMO.publicProduction ? randomBytes(12).toString("base64url") : "aios-demo-password");
 const WAIT_TIMEOUT_MS = Number(process.env.DB_WAIT_TIMEOUT_MS || 60_000);
 
 const ssl = shouldUseSsl(DATABASE_URL) ? { rejectUnauthorized: false } : undefined;
@@ -173,13 +184,37 @@ function runQuiet(cmd, args) {
  * see `credentialPlan`. Once an account has a password, we touch nothing.
  */
 async function provisionRealTeam() {
-  const slug = process.env.TEAM_SLUG;
-  const name = process.env.TEAM_NAME || slug;
+  const url = process.env.APP_URL || "http://localhost:3000";
+  const typed = String(process.env.TEAM_SLUG ?? "").trim();
   const email = process.env.ADMIN_EMAIL;
   if (!email) {
     console.error("bootstrap: TEAM_SLUG was set without ADMIN_EMAIL — there would be no way to log in");
     process.exit(1);
   }
+
+  // TEAM_SLUG arrives from a deploy form with no validation, so "Acme Corp" is the obvious
+  // thing to type — and `createTeam` rejects it, which used to mean die() → restart loop →
+  // failed deployment over a half-provisioned database. Normalise, then SAY SO: the slug is in
+  // every URL the operator is about to bookmark.
+  const { slug, changed } = normalizeTeamSlug(typed);
+  if (!slug) {
+    console.error(
+      `bootstrap: TEAM_SLUG='${typed}' contains no letters or digits, so there is no name to give this team — ` +
+        `set TEAM_SLUG to something like 'acme-corp' and redeploy`
+    );
+    process.exit(1);
+  }
+  if (changed) {
+    console.log(
+      [
+        `⚠ TEAM_SLUG '${typed}' is not a valid slug (lowercase letters, digits and dashes only).`,
+        `  Using '${slug}' instead — this is the team's permanent address: ${url}/t/${slug}`,
+        `  Set TEAM_SLUG=${slug} in your deploy variables so it can never change under you.`,
+      ].join("\n")
+    );
+  }
+  // The display name keeps what the operator typed; only the URL had to be sanitised.
+  const name = process.env.TEAM_NAME || (changed ? typed : slug);
   const adminName = process.env.ADMIN_NAME || email.split("@")[0];
 
   console.log(`▶ ensuring team ${slug} and admin ${email}…`);
@@ -203,7 +238,6 @@ async function provisionRealTeam() {
     ]);
   }
 
-  const url = process.env.APP_URL || "http://localhost:3000";
   console.log(
     ["", "─".repeat(58), `  ${name} is ready`, "", `  URL       ${url}/t/${slug}`, `  Login     ${email}`,
      credentialSummary({ password: plan.password, supplied: Boolean(process.env.ADMIN_PASSWORD) }),
@@ -230,12 +264,36 @@ async function main() {
     return;
   }
 
-  if (process.env.SEED_DEMO === "false") {
-    console.log("▶ SEED_DEMO=false — skipping demo data (no team and no login are created)");
+  if (!DEMO.seed) {
+    if (DEMO.reason === "disabled") {
+      console.log(`▶ SEED_DEMO=${process.env.SEED_DEMO} — skipping demo data (no team and no login are created)`);
+      return;
+    }
+    // reason === "opt-in-required": a production build on a non-local URL. Seeding here would
+    // publish a team with a documented password to whoever finds the address first.
+    const url = process.env.APP_URL || "";
+    console.log(
+      [
+        "",
+        "─".repeat(58),
+        `  Skipping the demo seed — this deploy is served at ${url}`,
+        "",
+        "  The demo team ships a documented login (admin@demo.local), which must not be",
+        "  reachable from the internet. Nothing has been created, so there is no login yet.",
+        "",
+        "  To provision YOUR team and admin (recommended):",
+        "    set TEAM_SLUG, TEAM_NAME, ADMIN_EMAIL (optionally ADMIN_PASSWORD) and redeploy.",
+        "  To seed the demo here anyway:",
+        "    set SEED_DEMO=true (a demo password is then generated, not the documented one).",
+        "─".repeat(58),
+        "",
+      ].join("\n")
+    );
     return;
   }
 
-  if ((await teamCount()) > 0) {
+  const seededNow = (await teamCount()) === 0;
+  if (!seededNow) {
     console.log("▶ existing data found — skipping seed");
   } else {
     console.log("▶ seeding the Northwind demo team…");
@@ -254,10 +312,27 @@ async function main() {
 
   // Only reached when the demo actually owns this database. Printing demo credentials after a real
   // install advertised a login (admin@demo.local) that was never created.
+  //
+  // The password line has to track what this boot actually DID. DEMO_PASSWORD is generated per
+  // process on a public production deploy, so printing it on a restart that skipped seeding
+  // would advertise a password nobody can log in with.
   const url = process.env.APP_URL || "http://localhost:3000";
+  const generated = DEMO.publicProduction && !process.env.DEMO_PASSWORD;
+  // "unchanged" is a claim about a credential that exists, so ASK. A boot that seeded the team
+  // but died before create-member leaves rows with no login; reporting that as "still works" sends
+  // the operator to a login screen that can never let them in — and a generated password from that
+  // first boot is gone (it is per-process), so silence would be the second wrong answer.
+  const passwordLine = seededNow
+    ? generated
+      ? `  Password  ${DEMO_PASSWORD}   ← generated for this deploy, shown only now`
+      : `  Password  ${DEMO_PASSWORD}`
+    : (await hasCredential(DEMO_EMAIL))
+      ? "  Password  unchanged — the demo login from the first boot still works"
+      : `  Password  NOT SET — ${DEMO_EMAIL} has no credential. Wipe the database and start again, ` +
+        `or set TEAM_SLUG + ADMIN_EMAIL to provision a real team.`;
   console.log(
     ["", "─".repeat(58), "  AIOS Team Brain is starting", "", `  URL       ${url}`,
-     `  Login     ${DEMO_EMAIL}`, `  Password  ${DEMO_PASSWORD}`, "",
+     `  Login     ${DEMO_EMAIL}`, passwordLine, "",
      "  Demo data: Northwind Robotics. Set SEED_DEMO=false for an empty brain.",
      "─".repeat(58), ""].join("\n")
   );

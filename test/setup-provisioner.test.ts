@@ -95,8 +95,8 @@ describe("the provisioner never deploys", () => {
 
 describe("writes are gated on a verified pin", () => {
   it("aborts before creating anything when the directory is linked elsewhere", async () => {
-    const io = fakeRailway({ linkedTo: "kula" });
-    await expect(runSetup(OPTS, io)).rejects.toThrow(/already linked.*kula/is);
+    const io = fakeRailway({ linkedTo: "other-project" });
+    await expect(runSetup(OPTS, io)).rejects.toThrow(/already linked.*other-project/is);
     expect(io.calls.map((a) => a[0])).not.toContain("init"); // nothing was created
   });
 
@@ -104,7 +104,7 @@ describe("writes are gated on a verified pin", () => {
     const io = fakeRailway();
     const railway = makeRailway(io);
     expect(() =>
-      railway(["variables", "--set", "X=1"], { write: true, pin: "aios-acme", status: { name: "kula" } })
+      railway(["variables", "--set", "X=1"], { write: true, pin: "aios-acme", status: { name: "other-project" } })
     ).toThrow(/refusing to write/i);
   });
 
@@ -324,8 +324,8 @@ describe("the dry-run plan neither leaks nor misrepresents", () => {
 
   it("a dry run now catches the link drift a real run aborts on", async () => {
     // Previously the faked `status` read made every dry run look clean from a drifted directory.
-    const io = fakeRailway({ linkedTo: "kula" });
-    await expect(runSetup({ ...OPTS, dryRun: true }, io)).rejects.toThrow(/already linked.*kula/is);
+    const io = fakeRailway({ linkedTo: "other-project" });
+    await expect(runSetup({ ...OPTS, dryRun: true }, io)).rejects.toThrow(/already linked.*other-project/is);
   });
 
   it("does not read the environment at all for a brand-new project", async () => {

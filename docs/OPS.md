@@ -126,8 +126,8 @@ no `cursor[bot]` review activity appears.
 
 **Incident:** the Railway CLI links each directory to a project in `~/.railway/config.json`
 (keyed by absolute path). `railway up`/`redeploy` deploys the **current directory's code to that
-linked project**. A Conductor worktree for _this_ repo had drifted to the **Kula** project's link,
-so a deploy from it shipped aios-team-brain into Kula and took Kula down.
+linked project**. On 2026-06-27 a Conductor worktree for _this_ repo had drifted to an unrelated
+project's link, so a deploy from it shipped aios-team-brain into that project and took it down.
 
 ### The rule (enforced)
 
@@ -139,14 +139,23 @@ CLI is **read-only** here. The destructive verbs are **blocked** by `.claude/set
 
 ### Runtime backstop (defense in depth)
 
-The hook only fires inside the agent's shell. The **runtime** guard covers everything else (a human
-`railway up`, or any path that lands this code on a foreign service): the schema loaders
-(`pg-load-schema.mjs` = the `preDeployCommand`, `pg-load-vector.mjs`) call `assertServiceIdentity`
-(`scripts/service-guard.mjs`) **before** opening a DB connection. If `RAILWAY_SERVICE_NAME` is set and
-isn't an AIOS service (`aios` / `aios-*`; override `AIOS_RAILWAY_SERVICES`), the load aborts non-zero and
-Railway halts the release — so aios can never inject its schema into another project's DB (2026-06-27).
-This mirrors Kula's `src/lib/service-guard.ts`; both apps carrying it is what makes the protection
-symmetric. Guarded by `test/guards/service-guard.test.ts`.
+The hook only fires inside the agent's shell. The **runtime** guard covers the rest: the schema
+loaders (`pg-load-schema.mjs` = the `preDeployCommand`, `pg-load-vector.mjs`) call
+`assertServiceIdentity` (`scripts/service-guard.mjs`) **before** opening a DB connection. If the
+deploy is an AIOS one and `RAILWAY_SERVICE_NAME` isn't an AIOS service (`aios` / `aios-*`; override
+`AIOS_RAILWAY_SERVICES`), the load aborts non-zero and Railway halts the release.
+
+**"An AIOS one" is the load-bearing part, and it is deliberately narrow.** This repo is public and
+self-hosted, and `pg-load-schema.mjs` is the `preDeployCommand` — so an unconditional check turns
+"you named your Railway service after your company" into an unrecoverable failed release for a
+stranger. Enforcement therefore requires a marker: `RAILWAY_PROJECT_ID` matching AIOS's own project
+(platform-injected, so it cannot be pruned away and quietly disable production protection), or an
+explicit `AIOS_RAILWAY_SERVICES`, which any self-hoster can set to opt into the same guard for
+their own service names. Known limit, by construction: a deploy pushed into a **different** Railway
+project inherits that project's environment, so the marker is not visible there and the runtime
+guard will not fire — that case is owned by the layers above (deny-list, hook, link check, project
+token) and by the receiving app carrying this same guard for itself. Guarded by
+`test/guards/service-guard.test.ts`.
 
 ### After creating a new worktree
 
@@ -161,7 +170,8 @@ bash scripts/railway-link-check.sh   # flags any aios dir not linked to AIOS
 ### Strongest guard — a project-scoped token (recommended) — HUMAN STEP
 
 A **project token** scopes the CLI to a single project + environment, so even a stray deploy from a
-mislinked directory physically cannot reach another project (e.g. Kula).
+mislinked directory physically cannot reach another project — which is exactly the gap the runtime
+guard cannot close on its own.
 
 1. Railway dashboard → **AIOS** project → **Settings → Tokens** → create a **Project token** for
    the **production** environment (name it e.g. `aios-cli`).

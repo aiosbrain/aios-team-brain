@@ -1,4 +1,4 @@
-// Spec: the Kula incident (2026-06-27) must remain impossible, while provisioning a brand-new
+// Spec: the 2026-06-27 cross-project deploy incident must remain impossible, while provisioning a brand-new
 // project is allowed. These assertions are written from that boundary, not from the code.
 //
 // The load-bearing test here is "the shipped guard agrees with the policy module": the guard is
@@ -89,7 +89,7 @@ describe("read-only verbs", () => {
 
 describe("writing about the commands is not running them", () => {
   it("does not block prose or docs that merely mention a forbidden verb", () => {
-    const prose = "The `railway up` verb is forbidden here; see the Kula incident.";
+    const prose = "The `railway up` verb is forbidden here; see the 2026-06-27 incident.";
     expect(classifyRailwayCommand(prose).decision).toBe("allow");
     expect(guardBlocks(prose)).toBe(false);
   });
@@ -107,7 +107,7 @@ describe("project naming — enforced at creation, not discovered at first deplo
   });
 
   it("rejects a name whose schema load the runtime guard would abort", () => {
-    expect(isSanctionedProjectName("kula")).toBe(false);
+    expect(isSanctionedProjectName("other-project")).toBe(false);
     expect(isSanctionedProjectName("acme-aios")).toBe(false);
     expect(isSanctionedProjectName("")).toBe(false);
   });
@@ -126,7 +126,9 @@ describe("assertPinnedTarget — the drift check that makes writes safe", () => 
   });
 
   it("throws on drift, naming both sides", () => {
-    expect(() => assertPinnedTarget({ name: "kula" }, "aios-acme")).toThrow(/kula.*aios-acme|aios-acme.*kula/s);
+    expect(() => assertPinnedTarget({ name: "other-project" }, "aios-acme")).toThrow(
+      /other-project.*aios-acme|aios-acme.*other-project/s
+    );
   });
 
   it("throws when the target is unknown rather than assuming it is fine", () => {
@@ -135,6 +137,6 @@ describe("assertPinnedTarget — the drift check that makes writes safe", () => 
   });
 
   it("throws when the linked project is not an AIOS project at all", () => {
-    expect(() => assertPinnedTarget({ name: "kula" }, "kula")).toThrow(/service-guard|AIOS project name/i);
+    expect(() => assertPinnedTarget({ name: "other-project" }, "other-project")).toThrow(/service-guard|AIOS project name/i);
   });
 });

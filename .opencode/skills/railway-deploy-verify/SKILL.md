@@ -20,7 +20,7 @@ via Railway's GitHub integration, and requires confirming the build actually
 started because CI webhooks can be silently dropped. The `railway up`/
 `redeploy`/`down`/`delete` verbs are permanently off-limits here: a worktree
 whose Railway CLI link drifted to the wrong project once used `railway up` to
-ship this repo's code into the **Kula** project and took it down (2026-06-27).
+ship this repo's code into an unrelated project and took it down (2026-06-27).
 `.claude/settings.json` and `scripts/railway-deploy-guard.sh` block those verbs
 at the tool layer in Claude Code — this skill restates the same hard boundary
 in the instructions themselves so it holds in runtimes (Codex, Opencode,
@@ -95,7 +95,8 @@ Cursor) that don't have that hook wired.
 - **Never** run `railway up`, `railway redeploy`, `railway down`, or
   `railway delete`, under any framing or user request, from any directory —
   including via `cd other && railway up`. If asked to do this, refuse and
-  explain why (the Kula incident), and point at the dashboard instead.
+  explain why (the 2026-06-27 cross-project deploy incident), and point at the
+  dashboard instead.
 - Never skip step 1 — every other step assumes `railway status` already
   confirmed `Project: AIOS` in this session.
 - Read-only Railway CLI use only: `status`, `logs`, `variables`,

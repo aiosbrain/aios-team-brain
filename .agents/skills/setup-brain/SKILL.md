@@ -28,8 +28,8 @@ script carries the safety properties (below); a hand-rolled sequence does not.
 
 `railway up`, `railway redeploy`, `railway down`, `railway delete` are **forbidden here,
 in every framing, from every directory** — including `cd elsewhere && railway up`. A
-worktree whose CLI link had drifted once used `railway up` to ship this repo into the
-**Kula** project and took it down (2026-06-27).
+worktree whose CLI link had drifted once used `railway up` to ship this repo into an
+unrelated project and took it down (2026-06-27).
 
 Provisioning a brand-new project is the one sanctioned exception, because a project that
 does not exist yet has nothing to take down. That exception is narrow and conditional:
@@ -37,7 +37,7 @@ does not exist yet has nothing to take down. That exception is narrow and condit
 - **Only `init` / `add` / `variables` / `domain` / `run`** — the verbs in
   `scripts/railway-policy.mjs`. Every command `setup.mjs` builds is classified against
   that policy before it runs, so the script refuses its own command if one ever drifts.
-- **Only against a pinned target.** The Kula incident was link drift, not the verb: a
+- **Only against a pinned target.** That incident was link drift, not the verb: a
   `railway variables --set` from a drifted directory overwrites another project's
   environment just as thoroughly. `setup.mjs` captures the project it created and
   re-verifies `railway status` before every write.

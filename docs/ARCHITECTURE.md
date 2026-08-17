@@ -28,6 +28,25 @@ startup wrapper then runs the shared bootstrap to ensure the real team and first
 every restart but checks for an existing credential before calling the admin writer, so later
 password changes are preserved. A user-supplied `ADMIN_PASSWORD` is never rendered into logs.
 
+Two guards sit on that flow because it is driven by a form with no input validation
+(`scripts/setup/deploy-policy.mjs`, called from `docker/bootstrap.mjs`):
+
+- **`TEAM_SLUG` is normalised before `create-team`** — `Acme Corp` becomes `acme-corp`, and the
+  substitution is printed, because the slug is the team's permanent address (`/t/<slug>`). Without
+  it, `createTeam`'s slug regex rejected the value, `scripts/admin.ts` called `die()`, and Railway
+  restarted the container until the release failed over a half-provisioned database. An input with
+  no letters or digits at all still fails, loudly, rather than being guessed at.
+- **Demo seeding is opt-in on a public URL** — a deploy without `TEAM_SLUG` used to fall through to
+  the Northwind demo and its documented admin login (`admin@demo.local`, credentials printed to the
+  deploy log), which is correct on a laptop and a published account anywhere else. When
+  `NODE_ENV=production` and `APP_URL` is not a local address, the demo seeds only for an explicit
+  `SEED_DEMO=true`, and generates its password instead of using the documented one. `docker compose
+  up` (localhost `APP_URL`) is unaffected.
+
+The schema loader itself carries the service-identity guard (`scripts/service-guard.mjs`), which
+enforces only on deploys carrying an AIOS marker — see [`OPS.md` §4](OPS.md) for why a public,
+self-hosted repo cannot make that check unconditional.
+
 The local curl installer remains the Docker/self-host path. Selecting Railway in that wizard opens
 the canonical deploy page; it does not provision through an ambient Railway CLI link and does not
 pause for a GitHub fork or a post-deploy `--resume` command.
