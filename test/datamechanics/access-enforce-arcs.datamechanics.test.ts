@@ -4,18 +4,18 @@ import { db, ingest, seedTeam, type Seed } from "./helpers";
 import { backfillTeamContext } from "@/lib/projects/context/backfill";
 import { memberEnforcement } from "@/lib/access/enforce";
 import { filterArcsByVisibleItems } from "@/lib/graph/arc-visibility";
-import { getArcs, type NarrativeArc } from "@/lib/graph/arcs";
-import { selectEnforcedGraphPartitions } from "@/lib/graph/partition-read";
+import { type NarrativeArc } from "@/lib/graph/arcs";
+import { resolveArcScope } from "@/lib/graph/partition-read";
+import { getFusedArcs } from "@/lib/graph/arc-fusion";
 import { ensureAccessBootstrap } from "@/lib/access/bootstrap";
-import { visibleGroupIds } from "@/lib/graph/group";
+import { episodeGroupId } from "@/lib/graph/group";
 import { createGroup, grantProjectToGroup } from "@/lib/access/groups";
 
-// Phase B slice 5 (spec §5.8/§5.8b) — arc read enforcement composed against REAL member-visibility
-// resolution + a REAL arc_cache read. The route synthesizes arcs via an LLM (not available here), so
-// we seed arc_cache directly and prove the enforcement COMPOSITION: getArcs returns the seeded tier
-// arcs, and the filter drops any arc citing an item the outsider can't see. The pure filter's own
-// cases are in test/graph-arc-visibility.test.ts; this pins that the item ids actually line up with
-// what memberEnforcement resolves from the substrate.
+// Phase B slice 5 (spec §5.8/§5.8b), re-homed onto the PRET-3 unified read: the enforcement
+// COMPOSITION is proven over the FUSED path every reader now uses — resolveArcScope resolves the
+// member's scope, getFusedArcs serves the g: partition rows (seeded directly — the LLM is not
+// available here), and the evidence filter drops any arc citing an item the member can't see.
+// The pure filter's own cases are in test/graph-arc-visibility.test.ts.
 
 async function seedMember(seed: Seed): Promise<string> {
   const { data } = await db()
@@ -41,16 +41,20 @@ const arc = (id: string, itemIds: string[]): NarrativeArc => ({
   supporting_sources: [], evidence: itemIds.map((itemId) => ({ fact: `fact ${itemId}`, itemId })), derived_at: new Date().toISOString(),
 });
 async function seedArcCache(seed: Seed, arcs: NarrativeArc[]) {
-  const groupKey = visibleGroupIds(seed.teamSlug, "team").slice().sort().join(",");
+  // The General built-in's PARTITION row — where the fused read actually looks (PRET-3).
+  const groupKey = `g:${episodeGroupId(seed.teamSlug, "team")}`;
   const { error } = await db().from("arc_cache").upsert(
     { team_id: seed.teamId, group_key: groupKey, arcs: JSON.stringify(arcs), computed_at: new Date().toISOString() },
     { onConflict: "team_id,group_key" }
   );
   expect(error, "arc_cache seed must insert").toBeNull();
 }
+/** Mirrors the arcs route post-PRET-3: resolveArcScope → getFusedArcs → the evidence filter. */
 async function visibleArcTitles(seed: Seed, memberId: string): Promise<string[]> {
-  const { arcs } = await getArcs(db(), seed.teamId, seed.teamSlug, "team", visibleGroupIds(seed.teamSlug, "team"), { anthropicApiKey: null, openaiApiKey: null } as never);
+  expect((await ensureAccessBootstrap(db(), seed.teamId)).ok).toBe(true);
   const enforce = await memberEnforcement(db(), { teamId: seed.teamId, memberId });
+  const scope = await resolveArcScope(db(), { teamId: seed.teamId, teamSlug: seed.teamSlug, memberId, tier: "team", enforcement: enforce });
+  const { arcs } = await getFusedArcs(db(), seed.teamId, seed.teamSlug, scope.groups, { anthropicApiKey: null, openaiApiKey: null } as never);
   return filterArcsByVisibleItems(arcs, enforce?.visibleItemIds ?? null).map((a) => a.title);
 }
 
@@ -75,7 +79,7 @@ describe("enforced arc reads (Phase B slice 5)", () => {
     expect(titles, "an arc citing ANY restricted item must not (no partial redaction)").not.toContain("arc mixed");
   });
 
-  it("permissive: the same outsider sees every arc (byte-identical to today)", async () => {
+  it("permissive: the same outsider sees every arc — served through the fused built-in row (PRET-3)", async () => {
     const seed = await seedTeam();
     const openItem = await ingest(seed, { path: "o.md", body: "o", access: "team", project: "src" });
     const secretItem = await ingest(seed, { path: "s.md", body: "s", access: "team", project: "src" });
@@ -116,9 +120,9 @@ describe("enforced arc reads (Phase B slice 5)", () => {
     await setEnforcement(seed, "enforcing");
     await seedArcCache(seed, [arc("visible", [openItem.id]), arc("restricted", [secretItem.id])]);
 
-    // Reproduce the recompute route's gate: read the CACHED arcs, filter to the member's visible set,
-    // collect the ids they may correct.
-    const groupKey = visibleGroupIds(seed.teamSlug, "team").slice().sort().join(",");
+    // Reproduce the recompute route's gate post-PRET-3: the route reads the member's OWN
+    // partition-scope row (scopeKey = g:<sourceGroup>) — here the General built-in's.
+    const groupKey = `g:${episodeGroupId(seed.teamSlug, "team")}`;
     const cached = await readArcCache(db(), seed.teamId, groupKey);
     const enforce = await memberEnforcement(db(), { teamId: seed.teamId, memberId: outsider });
     const visibleIds = new Set(filterArcsByVisibleItems(cached?.arcs ?? [], enforce!.visibleItemIds).map((a) => a.id));
@@ -140,38 +144,26 @@ describe("enforced arc reads (Phase B slice 5)", () => {
   });
 });
 
-describe("the enforced arcs read serves ONLY partition rows (PCCC6B-1 property, PPARC-4 mechanism)", () => {
-  it("an ENFORCED member's fused read can NEVER be served the tier cache row — while the tier path still is", async () => {
+describe("the arcs read serves ONLY partition rows (PCCC6B-1 property; PRET-3: for everyone)", () => {
+  it("a tier-key row is structurally unreachable — present in the cache, absent from every panel", async () => {
     const seed = await seedTeam();
     expect((await ensureAccessBootstrap(db(), seed.teamId)).ok).toBe(true);
     await setEnforcement(seed, "enforcing");
     // The laundering artifact: a tier row synthesized with every team correction folded in.
-    await seedArcCache(seed, [arc("tier-laundered", [])]);
-
-    const enforce = await memberEnforcement(db(), { teamId: seed.teamId, memberId: seed.memberId });
-    expect(enforce).not.toBeNull();
-    const scope = await selectEnforcedGraphPartitions(db(), {
-      teamId: seed.teamId,
-      visibleProjectIds: [...enforce!.visibleProjectIds],
-    });
-    // The fused read consumes g: partition rows ONLY — the tier row's key is not a g: key, so it
-    // is structurally unreachable regardless of scope contents.
-    const { getFusedArcs } = await import("@/lib/graph/arc-fusion");
-    const panel = await getFusedArcs(db(), seed.teamId, seed.teamSlug, scope.groups, {
-      anthropicApiKey: null,
-      openaiApiKey: null,
-    } as never);
-    expect(panel.arcs.map((a) => a.title)).not.toContain("arc tier-laundered");
-
-    // Control: the tier path (permissive readers) still serves the seeded row.
-    const tier = await getArcs(
-      db(),
-      seed.teamId,
-      seed.teamSlug,
-      "team",
-      visibleGroupIds(seed.teamSlug, "team"),
-      { anthropicApiKey: null, openaiApiKey: null } as never
+    // PRE-PRET-3 this was the permissive/external serving row; now it is dead weight awaiting
+    // PRET-6 cleanup — no read path can reach a non-g: key (getArcs/getFusedArcs are g:-only by
+    // signature), which is the WHOLE mechanism.
+    const tierKey = [episodeGroupId(seed.teamSlug, "team"), episodeGroupId(seed.teamSlug, "external")].sort().join(",");
+    await db().from("arc_cache").upsert(
+      { team_id: seed.teamId, group_key: tierKey, arcs: JSON.stringify([arc("tier-laundered", [])]), computed_at: new Date().toISOString() },
+      { onConflict: "team_id,group_key" }
     );
-    expect(tier.arcs.map((a) => a.title)).toContain("arc tier-laundered");
+
+    const titles = await visibleArcTitles(seed, seed.memberId);
+    expect(titles, "the tier row's content reaches no panel").not.toContain("arc tier-laundered");
+    // Non-vacuity: the sentinel row genuinely exists in the cache.
+    const { readArcCache } = await import("@/lib/graph/arc-cache");
+    const raw = await readArcCache(db(), seed.teamId, tierKey);
+    expect(raw?.arcs.map((a) => a.title)).toContain("arc tier-laundered");
   });
 });

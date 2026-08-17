@@ -703,15 +703,15 @@ async function synthesizeArcs(
   llmTimeoutMs: number = INLINE_ARC_TIMEOUT_MS,
   // The prior cached arcs + their fact hash (background refresh only). When the freshly-built prompt hashes
   // identically AND there's no correction, we KEEP the prior arcs and skip the LLM (the stability guard).
-  prior?: { arcs: NarrativeArc[]; factsHash: string | null; degraded?: boolean } | null,
+  prior: { arcs: NarrativeArc[]; factsHash: string | null; degraded?: boolean } | null = null,
   // Run the extra evidence-COHERENCE LLM pass? Only the non-route-bound BACKGROUND refresh sets this — the
   // route-bound cold-miss + correction paths skip it (a second LLM call would blow the 120s route budget).
   // A cold-miss arc may briefly show a spurious participant; the next SWR refresh prunes it.
   runCoherence: boolean = false,
   // PCCC6B-1: the synthesis SCOPE key (identical to the arc_cache group_key this result commits
-  // under). Corrections are loaded for EXACTLY this scope; absent = the legacy tier semantics
-  // (sorted group join), which additionally admits pre-6b unscoped rows.
-  scopeKey?: string
+  // under). Corrections are loaded for EXACTLY this scope. REQUIRED since PRET-3 — the legacy
+  // tier fallback (sorted group join) is retired with the arcs unification.
+  scopeKey: string
 ): Promise<SynthesisResult> {
   // Arcs are NOT time-boxed — synthesize from the most-recent facts regardless of age (a quiet week,
   // or a stalled projector, must not blank the panel). `null` = no window. Fetch a DEEP pool (not just
@@ -722,12 +722,9 @@ async function synthesizeArcs(
   // Stored corrections inform EVERY synthesis, not only the recompute that produced one (H13). They used
   // to reach later synthesis only by having become a Graphiti fact — so a graph wipe didn't merely lose
   // the record, it lost the influence, and arcs quietly reverted to the version a human had rejected.
-  // PCCC6B-1 scope rule: EXACT match on this synthesis's own scope key. Only the LEGACY tier path
-  // (un-prefixed key) also admits pre-6b '' rows — a partition scope never does, because those rows
-  // were made against the whole tier corpus and feeding them into a narrower scope's prompt is the
-  // laundering §2.4 step 4 closes. Partition scopes are team-tier by construction (external
-  // principals keep the omit path), so the tier gate below is unchanged by them.
-  const effectiveScopeKey = scopeKey ?? groups.slice().sort().join(",");
+  // PCCC6B-1 scope rule: EXACT match on this synthesis's own scope key (always g:-prefixed
+  // since PRET-3 — the tier fallback is gone, so no caller can reach a legacy semantics here).
+  const effectiveScopeKey = scopeKey;
   // PRET-3 H1 (docs/design/pret3-arcs-unification.md §1a): a synthesis whose PARTITION is
   // external-shaped is CORRECTIONS-FREE — client-facing prose carries no internal editorial
   // text. This REVERSES the Fable-6b-Medium-4 allowance (corrections loaded for a

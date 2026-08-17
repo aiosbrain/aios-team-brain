@@ -51,9 +51,11 @@ function arc(id: string): NarrativeArc {
  */
 let n = 0;
 function groupsFor(): { groups: string[]; key: string } {
+  // PRET-3: every arcs read is partition-scoped — the fixture keys are g: keys now; the
+  // cache-mechanics properties under test are scope-key-agnostic.
   const slug = `degtest${++n}`;
-  const groups = [`${slug}_team`, `${slug}_external`];
-  return { groups, key: groups.slice().sort().join(",") };
+  const groups = [`${slug}_team`];
+  return { groups, key: `g:${slug}_team` };
 }
 
 describe("degraded is persisted, and computed_at stops doubling as a trust dial (R2/M6)", () => {
@@ -85,7 +87,7 @@ describe("degraded is persisted, and computed_at stops doubling as a trust dial 
     const at = new Date(Date.now() - (UNTRUSTED_RETRY_AFTER_MS + 30_000)).toISOString();
     await db().from("arc_cache").update({ computed_at: at }).eq("team_id", seed.teamId);
 
-    const res = await getArcs(db(), seed.teamId, "acme", "team", groups, {});
+    const res = await getArcs(db(), seed.teamId, "acme", groups, {}, { scopeKey: key });
     expect(res.freshness.stale).toBe(true); // retries soon, exactly as the backdating used to force
     expect(Date.now() - res.freshness.computedAt).toBeLessThan(ARC_CACHE_TTL_MS); // …while still young
   });
@@ -98,7 +100,7 @@ describe("degraded is persisted, and computed_at stops doubling as a trust dial 
     const at = new Date(Date.now() - (UNTRUSTED_RETRY_AFTER_MS + 30_000)).toISOString();
     await db().from("arc_cache").update({ computed_at: at }).eq("team_id", seed.teamId);
 
-    const res = await getArcs(db(), seed.teamId, "acme", "team", groups, {});
+    const res = await getArcs(db(), seed.teamId, "acme", groups, {}, { scopeKey: key });
     expect(res.freshness.stale).toBe(false);
     expect(res.freshness.degraded).toBe(false);
   });
@@ -110,7 +112,7 @@ describe("degraded is persisted, and computed_at stops doubling as a trust dial 
     const { groups, key } = groupsFor();
     await writeArcCache(db(), seed.teamId, key, [arc("a4")], "h4", { degraded: true });
 
-    const res = await getArcs(db(), seed.teamId, "acme", "team", groups, {});
+    const res = await getArcs(db(), seed.teamId, "acme", groups, {}, { scopeKey: key });
     expect(res.arcs.map((a) => a.id)).toEqual(["a4"]);
     expect(res.freshness.degraded).toBe(true); // read back from the row, not from this call's work
   });
