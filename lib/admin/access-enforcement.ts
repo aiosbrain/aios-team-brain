@@ -289,7 +289,18 @@ async function writeMode(
   // come off the row) but does not WRITE: an `access.enforcement_changed` audit row saying
   // permissive→permissive is noise in the one trail someone will later read to reconstruct when a
   // team's visibility actually changed.
-  if (previous === mode) return { ok: true, mode: await readAccessEnforcement(db, teamId) };
+  if (previous === mode) {
+    const readBack = await readAccessEnforcement(db, teamId);
+    // The read-back is only worth doing if it can FAIL. A no-op merely looks like one: another
+    // operator can flip the row between our `previous` read and this one, and without this check
+    // that race reports `ok` for a mode nobody asked for and fires a phantom
+    // `enforcement_changed` audit row attributed to the wrong operator (because `written.mode !==
+    // previous` becomes true). Same discipline as the write path below.
+    if (readBack !== mode) {
+      return { ok: false, error: `concurrent change: expected '${mode}', row now says '${readBack}'` };
+    }
+    return { ok: true, mode: readBack };
+  }
   const { error } = await db.from("teams").update({ access_enforcement: mode }).eq("id", teamId);
   if (error) return { ok: false, error: `write failed: ${error.message}` };
   // Read back: the CHECK constraint, a raced write, or a silently-dropped update all look like
