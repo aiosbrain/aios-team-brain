@@ -77,6 +77,32 @@ describe("QMIR-1 — an enforcing team-tier member regains the org-structural le
   });
 });
 
+describe("QMIR-1 — a departed member's edges do not render (Codex Medium 1)", () => {
+  it("a disabled actor's REPORTS_TO edge is dropped alongside the actor; the active pair's edge survives", async () => {
+    const seed = await seedTeam();
+    await ingest(seed, { path: "g.md", body: `g ${TERM}`, access: "team", project: "src" });
+    await backfillTeamContext(db(), seed.teamId);
+    await seedGraphRows(seed);
+    // The REAL writer's soft-disable shape: the actor row is kept with attrs.status = "disabled"
+    // (lib/graph/company-actors.ts) — the fixture must carry it, or this test misses the
+    // lifecycle the finding is about.
+    const { error: e1 } = await db().from("graph_entities").insert({
+      team_id: seed.teamId, entity_type: "actor", entity_id: "member:departed",
+      name: "Dana Departed", attrs: { member_role: "member", status: "disabled" },
+    });
+    expect(e1).toBeNull();
+    const { error: e2 } = await db().from("graph_relationships").insert({
+      team_id: seed.teamId, from_id: "member:departed", to_id: "member:alice", relationship_type: "REPORTS_TO",
+    });
+    expect(e2).toBeNull();
+
+    const ctx = await retrieve(db(), seed.teamId, "team", "who reports to whom?", null, await enforcingMember(seed));
+    expect(ctx.structured, "the departed person is not cited").not.toContain("Dana Departed");
+    expect(ctx.structured, "their edge is not cited either — the actor filter alone left it").not.toContain("member:departed REPORTS_TO");
+    expect(ctx.structured, "the active pair's edge survives the filter").toContain("member:bob REPORTS_TO member:alice");
+  });
+});
+
 describe("QMIR-1 — the type allowlist holds under enforcing (criterion 2)", () => {
   it("a planted commitment and a planted OWNS edge reach a PERMISSIVE member but NOT an enforcing one", async () => {
     const seed = await seedTeam();

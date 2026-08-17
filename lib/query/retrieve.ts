@@ -920,6 +920,15 @@ async function nativeRetrieve(
   const fmtDecision = (d: DecisionLine) =>
     `- #${d.row_key} (${d.decided_at ?? "?"}, ${d.slug}) ${d.title} — by ${d.decided_by}${d.still_valid ? "" : " [SUPERSEDED]"}`;
 
+  // The disabled set the relationships renderer consults (Codex QMIR-1 Medium 1) — sourced from
+  // the same actors fetch the actor filter uses, so the two filters cannot disagree about who is
+  // departed.
+  const disabledActorIds = new Set(
+    (actors ?? [])
+      .filter((a) => (a.attrs as { status?: string } | null)?.status === "disabled")
+      .map((a) => a.entity_id as string)
+  );
+
   const structured = [
     omitGraph
       ? `## Tasks visible to you` // enforcing: no full-corpus aggregate (§5.7 volume disclosure)
@@ -949,7 +958,14 @@ async function nativeRetrieve(
       .map((a) => `- ${a.entity_id}: ${a.name} (${(a.attrs as Record<string, unknown>)?.role ?? ""})`),
     "",
     "## Key relationships",
-    ...(rels ?? []).map((r) => `- ${r.from_id} ${r.relationship_type} ${r.to_id}`),
+    // A departed member's edges must not render either (Codex QMIR-1 Medium 1: the actor filter
+    // above hid the disabled PERSON while this line still cited their REPORTS_TO edge — the
+    // "never cited as current staff" claim, one leg over). Checkable endpoints only: an endpoint
+    // outside the actors fetch (its 40-row cap, or a non-actor id) has no status to consult and
+    // renders as an opaque id — that fail-open residual is named, not hidden.
+    ...(rels ?? [])
+      .filter((r) => !disabledActorIds.has(r.from_id) && !disabledActorIds.has(r.to_id))
+      .map((r) => `- ${r.from_id} ${r.relationship_type} ${r.to_id}`),
     gitDigest,
     peopleDigest,
   ].join("\n");
