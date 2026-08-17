@@ -165,6 +165,19 @@ function runQuiet(cmd, args) {
   return r.stdout ?? "";
 }
 
+/** Best-effort variant: logs a failure and CONTINUES — for steps whose failure must never kill
+ *  the boot (PRET-2 review Low 1: a die() inside the spawned command would otherwise become a
+ *  restart loop, the deploy-policy incident class; the scheduler pass is the retry). */
+function runSoft(cmd, args) {
+  const r = spawnSync(cmd, args, { encoding: "utf8", cwd: "/app" });
+  if (r.stdout) console.log(r.stdout.trimEnd());
+  if (r.status !== 0) {
+    console.error(r.stderr ?? "");
+    console.error(`bootstrap: \`${cmd} ${args.join(" ")}\` exited ${r.status} — continuing (best-effort step)`);
+  }
+  return r.stdout ?? "";
+}
+
 /**
  * Create the operator's own team + admin, idempotently.
  *
@@ -308,6 +321,13 @@ async function main() {
       "--password", DEMO_PASSWORD,
       "--upsert",
     ]);
+
+    // PRET-2: seed → drain → gated flip, one path (the seed writes via ingestItem, which
+    // bypasses the items route's reconcile hook — the flip's own drain partitions those rows).
+    // Best-effort: a refusal/deferral here is surfaced by the command and retried by the
+    // scheduler pass; the boot never fails on it.
+    console.log("▶ auto-flipping the demo team to enforcing (gated — refuses rather than bricks)…");
+    runSoft("npx", ["tsx", "--conditions", "react-server", "scripts/admin.ts", "auto-flip", "demo"]);
   }
 
   // Only reached when the demo actually owns this database. Printing demo credentials after a real

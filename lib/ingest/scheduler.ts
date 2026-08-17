@@ -43,6 +43,11 @@ export function startIngestScheduler(): void {
     // item the on-push ingest hook missed (non-push ingest paths, a hook failure). Idempotent
     // and cheap when converged; sequenced AFTER bootstrap so the system projects exist. Traced.
     await runContextBackfill(db);
+    // PRET-2 auto-flip: move warning-free, un-held, ready permissive teams to enforcing —
+    // sequenced AFTER bootstrap+backfill so a team's first eligible tick can flip it. Cheap
+    // stages run for every permissive team; at most PRET_FLIP_MAX_PER_TICK drains per pass
+    // (lib/admin/auto-flip-pass). Best-effort, traced when it did anything.
+    await runAutoFlip(db);
     // Turn freshly-synced meeting transcripts (source granola/zoom/… — never slack) into meeting
     // notes, so CLI-pushed meetings show up on the Meetings page automatically. Idempotent + cheap
     // when nothing new (finds 0 candidates → returns); best-effort, never fails the tick.
@@ -296,6 +301,44 @@ export function startIngestScheduler(): void {
         // recording itself failed — the console line below is the last resort
       }
       console.error("[ingest] access bootstrap failed", err);
+    }
+  }
+
+  // PRET-2 (docs/design/pret2-convergence-gated-flip.md §1.2): the unattended flip pass.
+  // AUTO_FLIP_ENABLED=false is the operator kill switch (the rate-limit env cannot express
+  // zero) — same opt-out pattern as GRAPH_PROJECT_ENABLED.
+  async function runAutoFlip(db: ReturnType<typeof adminClient>): Promise<void> {
+    if (process.env.AUTO_FLIP_ENABLED === "false") return;
+    const startedAt = Date.now();
+    try {
+      const { runAutoFlipPass } = await import("@/lib/admin/auto-flip-pass");
+      const r = await runAutoFlipPass(db);
+      if (r.error) {
+        // The pass itself could not run (fleet enumeration failed) — record a FAILED run so the
+        // mechanism cannot stop silently (Codex M3); the fail-closed direction (nothing flipped)
+        // is already the pass's own behavior.
+        console.error("[ingest] auto-flip pass could not enumerate teams:", r.error);
+        await recordIngestRun(db, { teamId: null, source: "auto_flip", trigger: "scheduler", ok: false, errors: [r.error], startedAt });
+        return;
+      }
+      if (r.flipped.length || r.deferred.length) {
+        console.info(
+          `[ingest] auto-flip: flipped ${r.flipped.length}, deferred ${r.deferred.length} (drain attempts ${r.attempted.length})`
+        );
+        await recordIngestRun(db, {
+          teamId: null,
+          source: "auto_flip",
+          trigger: "scheduler",
+          ok: true,
+          created: r.flipped.length,
+          meta: { flipped: r.flipped, attempted: r.attempted.length, deferred: r.deferred.length },
+          startedAt,
+        });
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error("[ingest] auto-flip pass failed:", msg);
+      await recordIngestRun(db, { teamId: null, source: "auto_flip", trigger: "scheduler", ok: false, errors: [msg], startedAt }).catch(() => {});
     }
   }
 

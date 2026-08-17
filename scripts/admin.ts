@@ -81,6 +81,8 @@ const USAGE = `Team Brain admin CLI — commands:
   link-identity <member-email> <provider> <external-id> [--handle <h>] [--email <e>] [--team <id|slug>] [--force]
                                          # link a provider user id (e.g. slack U…) to a member
   sync-github --org <org> [--team <id|slug>]                               # list candidates (needs GITHUB_TOKEN)
+  auto-flip <team-slug>                  # PRET-2: the unattended gated flip (refuses on warnings/
+                                         # blockers/operator hold; the scheduler pass retries)
   set-access-enforcement <team-slug> <permissive|enforcing> [--dry-run]
                                          # arm/disarm per-project access enforcement for ONE team.
                                          # 'enforcing' bootstraps + drains the §11 backfill first,
@@ -359,6 +361,18 @@ async function main() {
           `• dry run — nothing written. ${team.slug} is '${r.previous}'; '${mode}' would ` +
             (mode === "permissive" ? "always be safe (it is the fail-open direction)." : "be safe to apply now.")
         );
+        // PRET-2 stuck-state: show the scheduler's view of this team too (same read the
+        // permission inspector serves), so the operator sees why auto-flip is waiting.
+        const { latestAutoFlipDeferral } = await import("@/lib/admin/access-enforcement");
+        const d = await latestAutoFlipDeferral(admin, team.id);
+        if (d && r.previous === "permissive") {
+          console.log(
+            `• last auto-flip deferral (${d.at}):` +
+              (d.blockers.length ? ` blockers: ${d.blockers.join("; ")}` : "") +
+              (d.warnings.length ? ` warnings: ${d.warnings.join("; ")}` : "") +
+              (d.error ? ` error: ${d.error}` : "")
+          );
+        }
         break;
       }
       // The mode below is the value READ BACK from the row, not the one we asked for.
@@ -373,6 +387,28 @@ async function main() {
             "  aiosd_ tokens, the work timeline and narrative arcs. Other dashboard surfaces are NOT\n" +
             "  yet enforced — see docs/OPS.md §9. Undo with: set-access-enforcement <team> permissive"
         );
+      }
+      break;
+    }
+    case "auto-flip": {
+      // PRET-2 (docs/design/pret2-convergence-gated-flip.md §1.3): the UNATTENDED gated flip —
+      // seed → drain → gated flip is the new-team path, and docker/bootstrap.mjs invokes exactly
+      // this subcommand post-seed. Same positional-team discipline as set-access-enforcement.
+      const teamRef = positionals[0] || die("usage: auto-flip <team-slug>");
+      const team = await resolveTeam(admin, teamRef);
+      const { autoFlipIfReady } = await import("@/lib/admin/access-enforcement");
+      const r = await autoFlipIfReady(admin, team.id);
+      if (r.flipped) {
+        console.log(`✓ ${team.slug} auto-flipped to enforcing`);
+      } else if (r.deferred) {
+        console.log(
+          `• ${team.slug} NOT flipped — deferred:` +
+            (r.deferred.blockers.length ? `\n  blockers: ${r.deferred.blockers.join("; ")}` : "") +
+            (r.deferred.warnings.length ? `\n  warnings (manual flip decides): ${r.deferred.warnings.join("; ")}` : "") +
+            (r.deferred.error ? `\n  error: ${r.deferred.error}` : "")
+        );
+      } else {
+        console.log(`• ${team.slug} not flipped (already enforcing, or an operator hold stands)`);
       }
       break;
     }

@@ -8,6 +8,18 @@ revision **v1.17**.
 
 ## [Unreleased]
 
+### Changed
+
+- **PRET-2 — teams begin auto-flipping to per-project access enforcement.** A warning-free,
+  converged team is now flipped to `enforcing` automatically by the scheduler (gated on the
+  full readiness assessment; rate-limited; an operator's manual downgrade permanently holds a
+  team out of auto-flip). **On flip day a team's Learning panel changes**: the single
+  tier-wide narrative is replaced by the fused per-project arc panel — the accepted product
+  change of the membership-is-the-access-model program
+  (`docs/design/retire-permissive-model.md`). Teams with active connectors or unplaced agents
+  are NOT auto-flipped: their warnings surface via the permission inspector and
+  `admin.ts set-access-enforcement --dry-run`, and the flip stays a manual decision.
+
 ### Added
 
 - **Code Maintenance Loop Phase 0 (AIO-610)** — Brain API 1.17 accepts the backward-compatible
