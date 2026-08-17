@@ -30,6 +30,7 @@ flowchart TD
         B4["http-tests (advisory)\nnext build + test:http\nreal socket · route runtime"]
         B5["ingestion-tests\npytest\nPython ingest pipeline"]
         B6["aios-work-sync\nPOST /api/v1/work-events\ncloses Linear issue on merge"]
+        B7["scan-on-merge\nPOST /api/v1/codebases\ncodebase readiness → brain\n(advisory; silent skip w/o secrets)"]
     end
 
     subgraph BotReviews["Async Bot Reviews — GitHub Apps"]
@@ -48,6 +49,7 @@ flowchart TD
     GitHubActions --> D1
     BotReviews --> D2
     MERGE --> B6
+    MERGE --> B7
 ```
 
 ---
@@ -92,6 +94,26 @@ Two behaviours worth knowing:
 - **The existence check asks about the keys, not for the table.** It calls `GET /api/v1/tasks?mode=table&keys=A,B` (brain-api 1.14), which is bounded by the keys asked for, so absence is proof and the brain answers `unknown_keys` outright. That is what lets an invented key be *called* invented.
 
   The fallback matters as much: against a brain that predates 1.14 (400 on `keys`) it re-asks `?all=1`, which is capped at 500 rows ordered stalest-first. There a key found is confirmed, but a key absent from a **full** page reports `unverified`, never "invented" — the check is not allowed to accuse on data it never saw. That distinction exists because the check's first real run told us a real ticket didn't exist; on this team's data (677 tasks) `?all=1` could never have seen it.
+
+### `pr-task-link.yml` — advisory work-key check on every PR
+
+Warns (never fails) when a PR cites no brain work-key, and — when the brain secrets below are present — asks the brain whether the cited keys actually exist, using the shared matcher above. Without credentials it degrades to a FORMAT-only check and says so in the annotation. It is the open-time counterpart to `aios-work-sync.yml`'s merge-time close.
+
+**⛔ It must stay on `pull_request`, never `pull_request_target`.** The job checks out the PR (the merge ref, `actions/checkout`'s default on this event) and _executes_ `scripts/pr-work-keys.mjs` from it — fork-controlled code — with `AIOS_API_KEY` in the environment. On `pull_request`, GitHub withholds secrets from fork runs, so a fork that edits that script gets an empty key and there is nothing to steal; `pull_request_target` would run it with secrets **and** the base repo's permissions — a textbook pwn-request on a public repo. Fork PRs correctly reporting "credentials not configured" is the intended behaviour, not a bug to fix by changing the trigger.
+
+### `scan-on-merge.yml` — fires on push to `main` (advisory; nothing blocks on it)
+
+Runs the Python codebase scanner over this repo and POSTs the result to `/api/v1/codebases`, so the Codebases dashboard's agent-readiness figures for `aios-team-brain` stay fresh. It runs `npm run coverage` first purely as a **metrics source** for the scanner's `_read_coverage()` (`|| true` — the coverage _gate_ stays in `ci.yml`), then `python -m aios_ingest.cli scan`. Concurrency group `scan-on-merge` with `cancel-in-progress: true`, and the job is pinned to `if: github.repository == 'aiosbrain/aios-team-brain'` so a fork never scans into someone else's brain.
+
+**Required secrets — the SAME three as `aios-work-sync.yml`:** `AIOS_BRAIN_URL`, `AIOS_TEAM`, `AIOS_API_KEY`.
+
+Three things about them are easy to get wrong, and each fails in a way that does not look like a failure:
+
+- **`AIOS_BRAIN_URL` is handed to the scanner as `BRAIN_URL`, not under its own name.** The Python side reads `BRAIN_URL` / `AIOS_API_KEY` / `AIOS_TEAM` (`ingestion/aios_ingest/config.py`), so the step's `env:` block does the rename. Copying the `env:` from `aios-work-sync.yml` verbatim — which passes `AIOS_BRAIN_URL` straight through — leaves the scanner with no brain URL at all.
+- **The key must be TEAM tier.** `POST /api/v1/codebases` rejects anything else with `403 forbidden_tier` ("codebase metrics are team-tier only"). There is no admin key tier to reach for instead: `authenticateApiKey` only ever yields `"team" | "external"` (`lib/api/auth.ts`), so `external` is the only other thing a key can be, and it fails outright rather than degrading.
+- **A missing secret is a SILENT SKIP, not a failure.** The scan step guards on `[ -z "$AIOS_API_KEY" ] || [ -z "$BRAIN_URL" ] || [ -z "$AIOS_TEAM" ]` and then `exit 0`, so the job is **green** and the repo simply stops appearing in the brain. That fail-open is exactly how a repo goes invisible to the brain for days without anything turning red — it is what happened to the repos the multi-repo split created. **Read the step log, not the check mark:** a real scan prints `scanned <slug>: N commits (M AI-assisted), … coverage=…, readiness=…` and then spends most of its wall-clock uploading; a skip prints `scan secrets not configured (BRAIN_URL/AIOS_TEAM/AIOS_API_KEY) — skipping` and the step ends immediately.
+
+**A configured scan can still go red** — the workflow's "never red" comment covers only the missing-secret path. `/api/v1/codebases` is rate-limited at 60 POSTs per minute per key and the scanner gives up with `BrainError: 429 rate_limited: gave up after 5 retries`, which fails the job (e.g. run `31999692276`, 2026-08-17). Nothing downstream blocks on that, but the readiness figure for that head SHA never lands — so a red scan is a real gap in the dashboard, not noise to mute.
 
 ---
 
