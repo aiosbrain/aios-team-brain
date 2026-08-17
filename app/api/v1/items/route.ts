@@ -4,13 +4,12 @@ import { authenticateApiKey, authenticateAgentToken, isAgentBearer } from "@/lib
 import { isRestrictedTier } from "@/lib/auth/visibility";
 import { rateLimit } from "@/lib/api/rate-limit";
 import {
-  itemPayloadSchema,
   normalizeTier,
   errorResponse,
   IngestValidationError,
   TierViolationError,
 } from "@/lib/api/schemas";
-import { MAX_PAYLOAD_ROWS } from "@/lib/api/item-payload-schema";
+import { MAX_PAYLOAD_ROWS, wireItemPayloadSchema } from "@/lib/api/item-payload-schema";
 import { ingestItem } from "@/lib/ingest";
 import { attributeIncomingItem } from "@/lib/attribution/resolve-authors";
 import { projectChangedTasksAfterWrite } from "@/lib/pm-sync";
@@ -28,19 +27,24 @@ const MAX_PAYLOAD = 1_000_000; // 1 MB per contract
  * The whole-REQUEST transport ceiling (brain-api 1.20, AIO-923) — deliberately NOT `MAX_PAYLOAD`.
  *
  * A `task`/`decision` payload is `body` PLUS up to `MAX_PAYLOAD_ROWS` rows, and this gate used to be
- * `MAX_PAYLOAD * 1.2` ≈ 1.2 MB — so it fired at roughly 1,100 rows, long before any row bound, with a
+ * `MAX_PAYLOAD * 1.2` = 1.2 MB — so it fired at roughly 1,100 rows, long before any row bound, with a
  * bare `413 payload_too_large / "max 1 MB"` that named no field. Since chunking client-side is not
- * available (the row sweep in `lib/ingest/tasks.ts` deletes every synced row the incoming item omits,
- * so chunk 2 deletes chunk 1), a whole workspace has to fit in ONE request or fail with a reason.
- * 5,000 rows × ~700 B ≈ 3.5 MB, +1 MB of body, +20% slack for JSON framing.
+ * available for `task`/`decision` (the row sweep in `lib/ingest/tasks.ts` deletes every synced row in
+ * the project that the incoming item omits, so chunk 2 deletes chunk 1), a whole workspace has to fit
+ * in ONE request or fail with a reason. 1 MB body + 5,000 rows × ~700 B, +20% JSON framing slack =
+ * **5,400,000 B (5.4 MB)**, a 4.5× raise.
  *
- * The ceiling is now a bound on abuse, not on legitimate use: anything under it that is still too big
- * is rejected by the SCHEMA, naming `rows` and the limit (422), which is the diagnosable failure.
- * DoS surface: this raises the max bytes one authenticated key can push per request ~4.5×, bounded by
- * the 120 pushes/min rate limit below (≈ 5.4 GB/min/key worst case, vs ≈ 1.2 GB/min before) — a
- * ceiling on an ALREADY-AUTHENTICATED principal in a self-hosted, single-org deployment, where the
- * same key can already push 120 × 1.2 MB/min. Untrusted volume is gated by authentication, not by
- * this number.
+ * NOT a guarantee that 5,000 rows always fit: 700 B is the measured ClickUp average, and 5,000 rows
+ * of schema-legal maximums (2,000-char titles, 50 × 80-char labels) exceed this and still 413. That
+ * failure is now at least diagnosable — the message names both bounds — but the two limits are
+ * independent, and neither implies the other.
+ *
+ * DoS surface: worst case per key is 120 × 5.4 MB ≈ **648 MB/min**, up from 120 × 1.2 MB ≈ 144 MB/min.
+ * The mitigation is the rate limit below plus authentication: this is a ceiling on an ALREADY-
+ * AUTHENTICATED principal in a self-hosted, single-org deployment, so the population that can reach
+ * it is the team's own issued keys, and the pre-existing 144 MB/min was already well past what a
+ * malicious key needs to hurt. A 4.5× raise on an authenticated, rate-limited path is a real but
+ * small increase in blast radius, taken deliberately so that legitimate imports stop failing.
  */
 const MAX_REQUEST_BYTES = Math.ceil((MAX_PAYLOAD + MAX_PAYLOAD_ROWS * 700) * 1.2);
 const PAGE_SIZE = 200;
@@ -69,7 +73,7 @@ export async function POST(req: NextRequest) {
   } catch {
     return errorResponse("invalid_payload", "body must be JSON", 422);
   }
-  const parsed = itemPayloadSchema.safeParse(json);
+  const parsed = wireItemPayloadSchema.safeParse(json);
   if (!parsed.success) {
     return errorResponse("invalid_payload", parsed.error.issues[0]?.message ?? "invalid", 422);
   }

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { itemPayloadSchema, taskRowSchema } from "@/lib/api/schemas";
-import { MAX_PAYLOAD_ROWS as MAX_ROWS } from "@/lib/api/item-payload-schema";
+import { MAX_PAYLOAD_ROWS as MAX_ROWS, wireItemPayloadSchema } from "@/lib/api/item-payload-schema";
 import { parseAuthorRefs, primaryAuthorRef } from "@/lib/attribution/resolve-authors";
 import type { ClickUpDoc, ClickUpDocPage, ClickUpTask, ClickUpTaskRecord } from "@/lib/ingest/sources/clickup";
 import {
@@ -312,12 +312,14 @@ describe("ClickUp task normalization", () => {
       });
 
     // The documented ceiling itself still parses — the cap must not shrink the supported workspace.
-    expect(() => itemPayloadSchema.parse(workspaceOf(MAX_ROWS))).not.toThrow();
+    expect(() => wireItemPayloadSchema.parse(workspaceOf(MAX_ROWS))).not.toThrow();
 
-    const parsed = itemPayloadSchema.safeParse(workspaceOf(MAX_ROWS + 1));
+    const parsed = wireItemPayloadSchema.safeParse(workspaceOf(MAX_ROWS + 1));
     expect(parsed.success).toBe(false);
-    // route.ts surfaces `issues[0].message` verbatim as a 422 `invalid_payload`, so the limit has to be
-    // IN that message — a diagnosable ceiling, not a number the caller has to guess at.
+    // The bound is on the WIRE schema only: `itemPayloadSchema` (what `ingestItem` re-parses) stays
+    // uncapped so the in-process Linear/GitHub/Plane mirrors keep working — see
+    // test/guards/wire-vs-storage-payload-schema.test.ts. route.ts surfaces `issues[0].message`
+    // verbatim as a 422 `invalid_payload`, so the limit has to be IN that message.
     expect(parsed.error!.issues[0].message).toContain(String(MAX_ROWS));
   });
 

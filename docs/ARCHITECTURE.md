@@ -385,22 +385,38 @@ sequenceDiagram
 | Bound | Value | Where | Failure |
 |---|---|---|---|
 | `body` (one item's prose) | 1 MB | `commonItemFields.body` in `lib/api/item-payload-schema.ts`, re-checked in the route | `422 invalid_payload` (schema) |
-| `rows` (a `task`/`decision`/`fact`/`stakeholder_mention` payload's row count) | 5,000 — `MAX_PAYLOAD_ROWS` | same file, on every row-bearing kind | `422 invalid_payload`, message names `rows` and the limit |
-| whole request | `MAX_REQUEST_BYTES` ≈ 4.2 MB — `(1 MB + 5,000 × 700 B) × 1.2` | `content-length` gate in the route | `413 payload_too_large` |
+| `rows` (a `task`/`decision`/`fact`/`stakeholder_mention` payload's row count) | 5,000 — `MAX_PAYLOAD_ROWS`, **wire only** | `wireItemPayloadSchema`, parsed by the route; `itemPayloadSchema` (what `ingestItem` re-parses) is UNCAPPED | `422 invalid_payload`, message names `rows` and the limit |
+| whole request | `MAX_REQUEST_BYTES` = 5,400,000 B (5.4 MB) — `(1 MB + 5,000 × 700 B) × 1.2` | `content-length` gate in the route | `413 payload_too_large` |
 
 The transport gate was `1 MB × 1.2` and `rows` was UNBOUNDED, so the only thing that stopped a large
 workspace was the 413 — firing at roughly **1,100 rows** with a message naming no field (measured:
 1,000 rows = 1,089,970 B accepted, 3,500 = 1,918,564 B rejected). A 35-List ClickUp workspace failed
 atomically at ~32 tasks per List.
 
-**The client cannot fix this by chunking**, which is why the bound had to move server-side: the row
-sweep in `lib/ingest/tasks.ts` DELETES every synced row in the project the incoming item omits, so a
-second chunk deletes the first — splitting one project's rows across pushes silently destroys data. A
-source above 5,000 rows must be split into separate **projects** (fewer Lists per integration), never
-into two pushes of the same project. The transport gate is now sized to fit the row ceiling, so it is
-a bound on abuse rather than on legitimate use; anything under it that is still too big is rejected by
-the schema, which can say why. DoS exposure is bounded by the existing **120 pushes/min per key** rate
-limit on an already-authenticated principal.
+**The client cannot fix this by chunking**, which is why the bound had to move server-side: for
+`task`/`decision` the row sweep (`lib/ingest/tasks.ts`, `lib/ingest/decisions.ts`) DELETES every
+synced row in the PROJECT the incoming item omits, so a second chunk deletes the first — splitting one
+project's rows across pushes silently destroys data. A source above 5,000 rows must be split into
+separate **projects** (fewer Lists per integration), never into two pushes of the same project.
+(`fact`/`stakeholder_mention` sweep per-ITEM instead — `lib/ingest/evidence.ts` — so distinct paths
+would be safe there; the shared error message stays conservative rather than giving advice that is
+only sometimes true.)
+
+**The cap is WIRE-ONLY, and that distinction is load-bearing.** `ingestItem` re-parses every payload
+through `itemPayloadSchema`, including the ones the in-process mirror legs build — and those have no
+transport step and legitimately exceed 5,000 (`fetchLinearTeam` paginates 200 × 100 = up to 20,000
+issues into ONE `task` item; GitHub and Plane are shaped the same). So the route parses with
+`wireItemPayloadSchema` (capped) and `ingestItem` with `itemPayloadSchema` (uncapped); collapsing the
+two would turn a working Linear import into an `IngestValidationError` on every scheduler tick.
+Guarded by `test/guards/wire-vs-storage-payload-schema.test.ts`, which pins both the ceilings and the
+two call sites.
+
+The transport gate is sized to fit the row ceiling **for average rows** — 700 B is the measured
+ClickUp figure; 5,000 rows of schema-legal maximums still 413, so neither limit implies the other.
+DoS: worst case per key rises from ~144 MB/min to ~648 MB/min (120 × 5.4 MB), mitigated by the
+existing **120 pushes/min per key** rate limit on an already-authenticated principal in a self-hosted,
+single-org deployment — a real but small increase in blast radius, taken so legitimate imports stop
+failing.
 
 ### Grounded query — `POST /api/v1/query` (SSE)
 
