@@ -63,3 +63,42 @@ describe("notion — the token is the secret, the selection is what to pull", ()
     expect(buildConfig("notion", "")).toEqual({ pageIds: [] });
   });
 });
+
+describe("clickup — the pk_ token is the secret, the selection is workspace + Lists + Docs", () => {
+  it("parses workspace, Lists and Docs out of the one free-text field", () => {
+    // `,` is the OUTER separator (toList), so a multi-value entry needs `|`.
+    expect(buildConfig("clickup", "workspaceId=9001, listIds=101|202, docIds=doc-a|doc-b")).toEqual({
+      workspaceId: "9001",
+      listIds: ["101", "202"],
+      docIds: ["doc-a", "doc-b"],
+    });
+  });
+
+  it("an empty selection is savable — a half-configured integration must not be un-persistable", () => {
+    // Matches the notion stance: the admin saves the token first and picks Lists after. `default:`
+    // returning `{}` would ALSO have been savable, which is exactly why this needs its own case —
+    // a missing switch arm is not a compile error here, it silently stores an empty config.
+    expect(buildConfig("clickup", "")).toEqual({ listIds: [] });
+  });
+
+  it("reads a lone bare token as the workspace id rather than silently dropping it", () => {
+    // The hint says `workspaceId=…`, but an admin who types just the id would otherwise save an
+    // empty config with no complaint — the one failure here that is silent rather than a visible
+    // 400. linear/plane already fall back this way for `projectId`.
+    expect(buildConfig("clickup", "9001")).toEqual({ workspaceId: "9001", listIds: [] });
+    // An explicit key always wins over the fallback.
+    expect(buildConfig("clickup", "9001, workspaceId=7777")).toEqual({ workspaceId: "7777", listIds: [] });
+    // Ambiguous (two bare tokens) stays dropped — guessing which is the workspace would be worse.
+    expect(buildConfig("clickup", "9001, 9002")).toEqual({ listIds: [] });
+  });
+
+  it("produces config the downstream validator accepts (round-trip)", () => {
+    const cfg = buildConfig("clickup", "workspaceId=9001, listIds=101, docParentType=space, docParentId=s1");
+    expect(validateIntegrationConfig("clickup", cfg)).toEqual({
+      workspaceId: "9001",
+      listIds: ["101"],
+      docParentType: "SPACE", // upper-cased for the enum, so a lowercase entry is not a save failure
+      docParentId: "s1",
+    });
+  });
+});

@@ -13,6 +13,14 @@ export function toList(raw: string): string[] {
     .filter(Boolean);
 }
 
+/** Split ONE `key=value`'s value into multiple entries. `|` because `,` is the outer separator. */
+function subList(raw: string): string[] {
+  return raw
+    .split("|")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
 function toKeyValues(raw: string): Record<string, string> {
   const out: Record<string, string> = {};
   for (const part of toList(raw)) {
@@ -64,6 +72,24 @@ export function buildConfig(
         : list[0]
           ? { projectId: list[0] }
           : {};
+    case "clickup": {
+      // `toList` already consumed commas/newlines as the OUTER separator, so a multi-value field
+      // needs an inner one: `workspaceId=9001, listIds=101|202, docIds=doc-alpha|doc-beta`.
+      // Keys are dropped when absent rather than set to `undefined` — `config` is stored as jsonb
+      // and a re-save must not add null-ish keys the `.strict()` allowlist then has to tolerate.
+      const out: Record<string, unknown> = {};
+      // A lone bare token is the workspace id — the hint shows `workspaceId=…`, but an admin who
+      // types just `9001` would otherwise have it silently dropped and save an empty config with no
+      // complaint. linear/plane already fall back this way for `projectId`; matching that.
+      const bare = list.filter((entry) => !entry.includes("="));
+      if (kv.workspaceId) out.workspaceId = kv.workspaceId;
+      else if (bare.length === 1) out.workspaceId = bare[0];
+      out.listIds = kv.listIds ? subList(kv.listIds) : [];
+      if (kv.docIds) out.docIds = subList(kv.docIds);
+      if (kv.docParentType) out.docParentType = kv.docParentType.toUpperCase();
+      if (kv.docParentId) out.docParentId = kv.docParentId;
+      return out;
+    }
     default:
       return {};
   }

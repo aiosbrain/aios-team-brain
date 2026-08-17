@@ -2351,7 +2351,7 @@ create table if not exists integrations (
   -- from the app's zod type union, so nothing can create one. The values stay in this CHECK on
   -- PURPOSE — narrowing an enumerated CHECK is the #251 incident shape, and a self-host holding a
   -- legacy row would fail its next schema load. Dead here is harmless; a failed deploy is not.
-  type text not null check (type in ('github','granola','slack','wise','linear','plane','openai','anthropic','google','openrouter','typefully','notion')),
+  type text not null check (type in ('github','granola','slack','wise','linear','plane','openai','anthropic','google','openrouter','typefully','notion','clickup')),
   name text not null,
   config jsonb not null default '{}',
   secret_ciphertext text,                 -- AES-256-GCM blob (base64); null if no secret set
