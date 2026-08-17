@@ -1,8 +1,10 @@
 # A row that names its issue must not get a second one — ADOPTDECL-1
 
-**Status:** spec, draft 2. Draft 1 was BLOCKED by a Codex cold read (two blockers), and its §1c
-protection was falsified by me while that review ran. The Fable leg **stalled twice and did not run** —
-recorded here rather than papered over; it is re-attempted on this draft. · **Date:** 2026-08-16 · **Owner:** Chetan · **Task:** `ADOPTDECL-1`
+**Status:** spec, draft 3. Drafts 1 and 2 were each BLOCKED. Both of my attempts to infer
+"the human declared this" from `provider_external_id` failed — in opposite directions — so draft 3 stops
+inferring and records the fact in its own column (§1a). Draft 2's §1c safeguard was worse than none: it
+would have stored a fingerprint asserting a projection that never happened. The Fable leg stalled twice
+on draft 1 and did not run; it ran on draft 2 and returned BLOCKED with a Critical plus four Highs. · **Date:** 2026-08-16 · **Owner:** Chetan · **Task:** `ADOPTDECL-1`
 **Related:** `AIO-895` / `GH-542` (this is the symptom that report buried in a parenthetical — see §0d),
 [`pm-sync-mutation-verification.md`](./pm-sync-mutation-verification.md) (`PMSUCCESS-1`, which named this
 as deferred).
@@ -66,9 +68,12 @@ must have written it. There are at least three other writers — `ensureLink` (`
 `scripts/brain-tasks.ts`. (`persistSuccess` genuinely does not write it — that part held.)
 
 So the column's present value does **not** establish who wrote it. What the prod data does support is
-narrower and still sufficient: **four issues were created by that run for four rows, and those rows'
-links now point at the new issues.** The mechanism in §0 is established by reading `linear.ts:320`, not
-by this column.
+narrower: **four issues were created by that run for four rows, and those rows' links now point at the
+new issues.** It does **not** witness what those rows declared *before* the run — the pre-run values are
+gone, which is the same reason the column proves nothing about who wrote it. So the headline should be
+read as "duplicates of existing issues appeared for these rows", not as "these rows demonstrably named
+their own". The mechanism in §0 is established by reading `linear.ts:320`; prod supplies the damage, not
+the intent.
 
 ### 0c. Why the damage is worse than an extra row
 
@@ -102,101 +107,125 @@ question (§3).
 
 ## 1. The decision
 
-### 1a. The declared key joins the adopt-or-create chain, as its last rung
+**Drafts 1 and 2 both tried to infer "the human declared this" from `provider_external_id`, and both
+failed — in opposite directions.** Draft 1 fired only when the value differed from `row_key`, which
+missed real declarations. Draft 2 fired whenever the value resolved to an issue, which **adopts a
+stranger's issue** for any row whose `row_key` happens to look like a Linear identifier — and
+`ensureLink` (`project.ts:168`) writes exactly that default into exactly that column. The column cannot
+carry intent, because two writers with opposite meanings share it.
 
-`buildBootstrap` (`linear.ts:155-181`) already fetches `identifier` for every issue and indexes only by
-`id` and by footer. It gains `issuesByIdentifier`, which costs **zero additional API calls** — the data is
-already in hand.
+So draft 3 stops guessing and records the fact.
 
-The chain becomes: stored resource id → footer marker → **declared identifier** → create.
+### 1a. A column that means what it says: `declared_external_id`
 
-### 1b. The rung fires on a RESOLVING identifier, not on a guess about intent
+`task_pm_links` gains `declared_external_id text`. It is written by **one** writer — the task ingest,
+which already knows (`lib/ingest/tasks.ts:202`) that it is looking at a human-authored
+`pm_external_id` — and it is never defaulted. `ensureLink` does not touch it.
 
-Draft 1 said the rung should fire only when `provider_external_id !== row_key`, on the theory that
-`ensureLink` (`project.ts:168`) defaults the column to `row_key`, so anything different must have been
-declared by a human. **Review broke it, and the counter-example is not exotic:** a row whose `row_key`
-IS a Linear identifier — which is exactly what inbound adoption creates (`inbound.ts:452-466` writes
-`row_key = it.identifier` **and** `provider_external_id = it.identifier`) — is classified as "default"
-and still duplicates. Worse, draft 1's third acceptance criterion **pinned that outcome as correct**, so
-all nine criteria could pass with a real declared-key row still duplicating.
+Non-null therefore means *a human named this issue on this row*, which is the predicate every section
+below needs and neither earlier draft had. `provider_external_id` keeps its current meaning and its
+current readers (`linear.ts:277`, `:374`, `plane.ts:174`) untouched; this slice adds a fact rather than
+overloading one.
 
-So the rule stops inferring intent. **The rung fires when `provider_external_id` matches the
-`identifier` of an issue the bootstrap loaded** — whatever `row_key` says. A value that names a real
-issue in this team is the strongest signal available, and it is a lookup rather than a comparison
-against a convention.
+Additive migration in `postgres/migrations/` plus the mirror in `schema.sql`, per the repo's
+column-adding rule.
 
-The residual risk is a `row_key` that coincidentally equals a real identifier in the same Linear team
-while meaning something else. That is bounded and acceptable: the default only ever equals `row_key`,
-row keys in this workspace look like `TT39` / `PMSUCCESS-1`, and a row deliberately named `AIO-877` in a
-team where `AIO-877` exists almost certainly does mean it. It is named here rather than left implicit,
-and §2 pins the non-matching case so a row whose key resolves to nothing still creates as it does today.
+### 1b. The rung fires on the declared column, and only there
 
-### 1c. Adoption is a HANDOVER, and draft 1's promise about descriptions was false
+The adopt-or-create chain in `linear.ts:319-320` gains a last rung: resolve `declared_external_id`
+against an identifier index built from the issues `buildBootstrap` already loads
+(`linear.ts:166` returns `identifier` on every node — no extra round-trip).
 
-Draft 1 said adoption "takes ownership of the marker, not of the prose" — writing the footer onto the
-human's existing body instead of replacing it. **I falsified that myself while the review ran, and it
-matters because it reads as a safeguard.** `linearIssueMatches` (`linear.ts`) ends with:
+Because defaults never reach that column, the wrong-issue adoption draft 2 introduced is not merely
+unlikely, it is **unreachable**: a row that declared nothing has nothing to resolve.
 
-```ts
-if (stripFooter(issue.description) !== desired.body.trim()) return false;
-```
+**The witness draft 2 cited for this was wrong, and it mattered.** It named the row inbound adoption
+creates (`inbound.ts:452-466`) as the shape that would duplicate — but that insert sets
+`provider_resource_id` in the same statement (`$5 = it.id`), so such a row resolves at the first rung
+and never needed this one. The genuinely vulnerable shape is a **Linear-mirrored task before the adopt
+sweep reaches it**: the task exists with no link row at all, and `projectAllTasks` filters only on
+`row_key not null` (`project.ts:387-393`), so it is swept into a duplicate.
 
-After an adoption that preserved the human's body, the very next projection compares that preserved body
-against the brain task's body, finds them different, and takes the update branch — writing
-`withFooter(task.body, …)` over it. **The protection was exactly one run deep.**
+### 1c. Adoption is the handover — the brain's body is written immediately
 
-The honest design, stated rather than implied: **declaring an issue on a task row hands that issue's
-content to the brain.** From the run after adoption the brain's body is authoritative, exactly as it is
-for an issue the brain created. There is no way around that short of a per-link "descriptions are not
-ours" flag, which is a schema change and makes the projection non-uniform — deferred in §3, not smuggled
-in here.
+Draft 2 said the adoption run preserves the human's prose and the next run overwrites it. **Both halves
+were wrong, and the second is the dangerous one.** After adoption the link has a `provider_resource_id`
+and `persistSuccess` stores a fingerprint computed from the **brain** shape, so the next run hits the
+short-circuit at `project.ts:281` and makes **zero provider calls**. The "one-run grace" is actually
+indefinite, and it ends at the first fingerprint-visible change — a status flip weeks later — replacing
+a colleague's write-up at a moment disconnected from the declaration, when nobody is looking.
 
-Two things follow, and §2 pins both:
+Worse, the stored fingerprint would be a **recorded falsehood**: it asserts the brain shape was
+projected while Linear holds the human's body, and nothing heals it (inbound never reconciles bodies,
+`inbound.ts:432-434`). That is the same "report success for an outcome that did not happen" class
+`PMSUCCESS-1` closed one layer down, re-introduced by this slice's own safeguard.
 
-- **First contact still preserves.** The adoption write is the human's body plus the footer, not the
-  brain's body. A run that adopts should not be the run that overwrites; if the declaration was a
-  mistake, there is one cycle in which the prose is still there to notice.
-- **The second run is pinned as a test, not left as a surprise.** A criterion asserts that the next
-  projection writes the brain's body — so nobody reads §1c and believes the prose is protected.
+So the adoption write is an ordinary update: **brain body plus footer, immediately.** Declaring an issue
+on a task row hands that issue's content to the brain, in one step, visibly. There is no grace, because a
+grace that cannot be honestly persisted is worse than none.
 
-### 1c-bis. Two rows may not declare the same issue
+### 1d. Refuse to adopt an issue that already belongs to another row
 
-Nothing stops two `row_key`s from declaring the same identifier. With the rung in place both would adopt
-it, `persistSuccess` would attach both links to one `provider_resource_id`, and each projection would
-overwrite the other's title, body and state in a shared issue — a silent two-writer loop.
+Draft 2 guarded only against two rows declaring the *same string*. That misses the shape that actually
+produces a two-writer loop: row A created `AIO-900` through normal projection, and a human then declares
+`AIO-900` on row B. No two rows "declared" it, so draft 2's check never fires — and each run alternates
+A's and B's content into one issue.
 
-A declared identifier that is already claimed by another row's link in the same team fails the row, with
-a message naming both row keys. Refusing is right here: the projector cannot know which row is meant,
-and guessing produces exactly the flapping this slice exists to prevent.
+The check is therefore **ownership, by any means**: the resolved issue is refused if another link in the
+team already carries it as `provider_resource_id`, or if its description carries a *different* row's
+`aios-ext:` footer. Two rows declaring the same key is one instance of that, not the rule.
 
-### 1d. A declared key that resolves to nothing is an ERROR, not a new issue
+Ownership is read from persisted state, not from an in-run set: `projectTask` is callable standalone on
+the reactive path, so an in-run set would let two separate runs both adopt. And the winner is
+**arbitrary but sticky** — `projectAllTasks` applies no `ORDER BY` (`project.ts:387-393`), so which row
+wins first is not deterministic, but once it holds the `provider_resource_id` the loser fails
+consistently rather than flapping. Stated plainly rather than implying a deterministic "second".
 
-If the identifier names no issue in the configured team — a typo, or an issue in another Linear team the
-bootstrap never loaded — today's behaviour is to create a duplicate silently. That is the same fail-open
-class `PMSUCCESS-1` just closed one layer down: the run reports `synced` for an outcome nobody asked for.
+### 1e. A withdrawn declaration must actually clear
 
-The row fails with a message naming the unresolved key, which `persistError` records and the run's
-`errors[]` surfaces. Creating an issue is a reasonable thing to do when the row says nothing; it is not a
-reasonable thing to do when the row said something and we could not honour it.
+Today ingest writes the link row only when **both** `pm_provider` and `pm_external_id` are present
+(`lib/ingest/tasks.ts:202`). So a human who fixes a typo'd declaration by deleting the field leaves the
+old value in place forever — and under §1f that row then fails on every run with no remedy short of
+manual SQL. This slice makes a stale value load-bearing, so it must also make it clearable: ingest
+writes `declared_external_id` whenever `pm_provider` is present, setting it to NULL when
+`pm_external_id` is absent. Withdrawing the declaration returns the row to ordinary create-or-adopt.
 
-**The tradeoff, named rather than discovered.** "Unresolvable" here means *absent from the bootstrap*,
-and that set is larger than typos. An identifier can be perfectly valid and still miss: an issue in
-another Linear team, an archived or deleted issue, or one beyond what `team.issues` paginates
-(`linear.ts:156-181`). Those rows sync fine today — by creating a local issue — and after this slice they
-fail per-row instead. That is the intended direction (a row that names something we cannot find should
-say so, not invent a substitute), but it is a real behaviour change for rows nobody thought were broken,
-so the message has to distinguish the cases it can: an identifier that does not match this team's key
-prefix is reported as *probably another team*, not as a typo. §2 pins that wording, because "not found"
-alone sends someone hunting for a spelling mistake that isn't there.
+### 1f. A declared key that resolves to nothing is an ERROR, not a new issue
+
+If the declared identifier names no issue the bootstrap loaded, the row fails with a message naming it,
+which `persistError` records and the run's `errors[]` surfaces. Creating an issue is reasonable when the
+row said nothing; it is not reasonable when the row said something we could not honour.
+
+**The tradeoff, named rather than discovered.** "Unresolvable" means *absent from the bootstrap*, which
+is wider than typos: another Linear team, an archived or deleted issue, or one beyond what `team.issues`
+paginates (`linear.ts:156-181`). Those rows create silently today and fail per-row after this slice.
+That is the intended direction, and §1e is what keeps it recoverable.
+
+To tell a foreign key from a typo the bootstrap query fetches `team { key }` — the same query, no extra
+round-trip, and a real source rather than the prefix-guessing draft 2 implied. **Residual ambiguity,
+stated:** a *same-prefix* miss (archived, deleted, past the pagination cap) is indistinguishable from a
+typo, so the message can rule a foreign team **in**, never rule the other causes **out**.
+
+### 1g. An adoption is reported as an adoption
+
+Adopting a pre-existing issue is not the same event as creating one, and a run that says `synced` for
+both hides the moment a human's issue changed hands. The report status for this rung is `adopted`, which
+the run summary counts separately — so a wrong adoption is visible in the same place the duplicate
+damage was invisible.
 
 ## Dependencies
 
-**Deps: none.** `lib/pm-sync/linear.ts` plus tests. No schema change — `provider_external_id` exists and
-is already populated. No new API call.
+**Deps: none**, but the shape changed: this now carries a **schema change** (`declared_external_id` on
+`task_pm_links`, additive migration plus the `schema.sql` mirror), a change to `lib/ingest/tasks.ts`, and
+a single-writer guard — alongside `lib/pm-sync/linear.ts` and the tests. No new API call: `team { key }`
+and the identifier index both come from queries `buildBootstrap` already issues.
 
 ## Build-with
 
-**Build-with tier: Fable / high effort.** This changes what an outward-facing projector does with a
+**Build-with tier: Fable / high effort — and it is now SCHEMA-TOUCHING**, which raises the bar: a
+column, a migration, a `schema.sql` mirror, and a single-writer guard. Drafts 1 and 2 tried to avoid the
+column and both produced a wrong rule, so the schema change is the finding, not scope creep. This changes
+what an outward-facing projector does with a
 human's existing issue — the failure mode is overwriting someone's writing, or adopting the wrong issue,
 neither of which a test suite notices unless it is written to. Two adversarial spec reviews (Fable +
 Codex) before code, two on the diff.
@@ -210,16 +239,18 @@ instead of creating.
 
 ## 2. Acceptance criteria
 
-- `test/pm-sync-declared-adoption.test.ts` — a row whose link carries a `provider_external_id` matching a bootstrapped issue's `identifier` ADOPTS it: the run sends `issueUpdate` for that issue and NO `issueCreate`, driven through `upsertWorkItem` against a fake `fetch`.
-- `test/pm-sync-declared-adoption.test.ts` — the same input on a build without the identifier index CREATES, so the test cannot pass on a build that still duplicates; this is asserted by mutation, not by assertion alone.
-- `test/pm-sync-declared-adoption.test.ts` — a row whose `row_key` IS a Linear identifier (the shape `inbound.ts:452-466` creates, where `row_key` and `provider_external_id` are both the identifier) ADOPTS rather than creating. Draft 1's criterion pinned the opposite and would have shipped the duplicate for exactly this row.
-- `test/pm-sync-declared-adoption.test.ts` — a `provider_external_id` matching NO bootstrapped identifier creates as today, so the rung cannot fire on a row that names nothing real.
-- `test/pm-sync-declared-adoption.test.ts` — the adoption write PRESERVES the issue's prior body and adds only the footer: a fixture whose issue body is human prose must still contain that prose in the mutation variables.
-- `test/pm-sync-declared-adoption.test.ts` — the SECOND projection after adoption writes the BRAIN's body over that prose. This pins the handover §1c describes rather than the protection draft 1 promised; a test asserting preservation on run two would be asserting a falsehood.
-- `test/pm-sync-declared-adoption.test.ts` — two rows declaring the SAME identifier: the second row fails with a message naming both row keys, and does not attach a second link to that issue.
-- `test/pm-sync-declared-adoption.test.ts` — a declared key that matches no issue THROWS `PmSyncError` naming the key; when the key's prefix does not match the team's, the message says so instead of implying a typo.
-- `test/pm-sync-declared-adoption.test.ts` — `buildBootstrap` adds no additional GraphQL round-trip for the identifier index: the fake `fetch` records the same query count as before.
-- `test/datamechanics/pm-sync-declared-adoption.datamechanics.test.ts` — after adoption the link row's `provider_resource_id` is the ADOPTED issue's id with `last_error` null; after an unresolvable declared key the row records `last_error` and no `provider_resource_id`.
+- `postgres/migrations/` — an additive migration adds `task_pm_links.declared_external_id`, mirrored into `postgres/schema.sql`, so a from-zero load and a live DB agree.
+- `test/pm-sync-declared-adoption.test.ts` — a row whose link carries a non-null `declared_external_id` matching a bootstrapped issue's `identifier` ADOPTS it: `issueUpdate` for that issue, no `issueCreate`, driven through `upsertWorkItem` against a fake `fetch`.
+- `test/pm-sync-declared-adoption.test.ts` — the adoption fixture makes the resource-id and footer rungs BOTH miss (no `provider_resource_id`, no `aios-ext:` footer on the issue), so only the new rung can produce the adopt — one condition per fixture.
+- `test/pm-sync-declared-adoption.test.ts` — a row with `declared_external_id` NULL never adopts, even when its `row_key` exactly equals a bootstrapped identifier; it creates. This is the wrong-issue adoption draft 2 would have shipped.
+- `test/pm-sync-declared-adoption.test.ts` — the adoption write sends the BRAIN's body plus the footer, not the issue's prior prose; no test asserts preservation, because §1c establishes there is none.
+- `test/pm-sync-declared-adoption.test.ts` — a declared key resolving to an issue already carried as another link's `provider_resource_id` FAILS, naming both rows; likewise when the issue's description carries a different row's `aios-ext:` footer.
+- `test/pm-sync-declared-adoption.test.ts` — a declared key matching no bootstrapped issue THROWS `PmSyncError` naming the key; when the key's prefix differs from `team.key` the message says "probably another team", and when it matches it does not.
+- `test/pm-sync-declared-adoption.test.ts` — the adopting row's report status is `adopted`, not `synced`, and the run summary counts it separately.
+- `test/pm-sync-declared-adoption.test.ts` — `buildBootstrap` adds no additional GraphQL round-trip: `team { key }` and the identifier index come from queries already issued, asserted by the fake `fetch`'s query count.
+- `test/ingest-tasks-declared-id.test.ts` — ingest writes `declared_external_id` when `pm_external_id` is present and sets it to NULL when the field is removed while `pm_provider` remains, so a withdrawn declaration is recoverable.
+- `test/guards/declared-external-id-single-writer.test.ts` — `lib/ingest/tasks.ts` is the only writer of `declared_external_id`; `ensureLink` and every `lib/pm-sync` path must not write it, and the guard is mutation-verified to redden on a bypassing write.
+- `test/datamechanics/pm-sync-declared-adoption.datamechanics.test.ts` — after adoption the link row's `provider_resource_id` is the ADOPTED issue's id with `last_error` null, and a SECOND projection run short-circuits without re-writing the issue; after an unresolvable declared key the row records `last_error` and no `provider_resource_id`.
 - `docs/design/pm-sync-declared-issue-adoption.md` — §0d's correction to `AIO-895`'s headline evidence is repeated in the PR body, so the merge does not read as a second fix for the same misread report.
 
 ## 3. Scope
