@@ -64,6 +64,8 @@ logic):
    `(team_id, created_at desc)` index, action-filtered — fleet sizes make this trivially
    cheap; the query is named in the module header per cold-read L3), attempt up to
    **`PRET_FLIP_MAX_PER_TICK` (default 3, `resolvePositiveInt`)**, oldest-last-attempt first.
+   `AUTO_FLIP_ENABLED=false` is the operator kill switch for the whole pass (diff review: the
+   rate-limit env cannot express zero; same opt-out pattern as `GRAPH_PROJECT_ENABLED`).
    The count short-circuit is not consulted AT ALL (the latent count-skip bug,
    `backfill.ts:168`, is DEFERRED to PRET-6 with a comment at the site — it can only delay a
    scheduler backfill, never gate a flip). **Honest cost statement (H2 corrected —
@@ -94,11 +96,16 @@ logic):
    `inspect.ts:76`) gains one ADDITIVE field —
    `autoFlip: { lastAttemptAt: string; deferred: { blockers: string[]; warnings: string[] } } | null`
    — populated from the most recent `access.autoflip_deferred` audit row for a still-permissive
-   team; and `scripts/admin.ts`'s `access-enforcement` command prints the same. STUCK is
-   ATTEMPTS-relative, never wall-clock-relative (cold-read M4: a tick-relative rule mislabels
-   healthy queued teams in any fleet >6 permissive): a team renders STUCK when its latest
-   deferral carries BLOCKERS and has persisted across ≥2 attempts (same fingerprint twice);
-   warning-deferred teams render as AWAITING MANUAL FLIP — a decision state, not a fault. Wire contract
+   team; and `scripts/admin.ts`'s `access-enforcement` command prints the same. **Surfacing is
+   the RAW latest deferral (reason + first-seen timestamp), amended from the earlier
+   attempts-counted STUCK rule (diff-review M3):** the fingerprint latch deliberately writes
+   ONE row per distinct state and `audit_log` is append-only by trigger, so an attempt counter
+   cannot exist without either audit spam (the H2 hazard) or an audit UPDATE (forbidden).
+   Blockers-vs-warnings in the surfaced row IS the classification — blockers = stuck on a
+   fault, warnings = awaiting the operator's manual-flip decision; no wall-clock or
+   attempt-count label is applied (which also moots cold-read M4's mislabeled-queue concern —
+   nothing is labeled by time at all). A rendered STUCK badge is deferred to whichever slice
+   first builds an enforcement UI surface. Wire contract
    disposition (SR7): this slice changes NO HTTP contracts — no route added or removed, the
    existing tier-422 refusals untouched; the inspect payload change is additive-only, and any
    http-tier pin on its shape is updated in this same slice.

@@ -305,7 +305,10 @@ export function startIngestScheduler(): void {
   }
 
   // PRET-2 (docs/design/pret2-convergence-gated-flip.md §1.2): the unattended flip pass.
+  // AUTO_FLIP_ENABLED=false is the operator kill switch (the rate-limit env cannot express
+  // zero) — same opt-out pattern as GRAPH_PROJECT_ENABLED.
   async function runAutoFlip(db: ReturnType<typeof adminClient>): Promise<void> {
+    if (process.env.AUTO_FLIP_ENABLED === "false") return;
     const startedAt = Date.now();
     try {
       const { runAutoFlipPass } = await import("@/lib/admin/auto-flip-pass");

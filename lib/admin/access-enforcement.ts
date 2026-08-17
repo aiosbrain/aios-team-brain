@@ -362,7 +362,9 @@ export async function assessUnattendedWarnings(db: DbClient, teamId: string): Pr
   const all = (memberRows ?? []) as MemberRow[];
   const connectors = all.filter((m) => m.is_connector && m.status === "active");
   if (connectors.length > 0) {
-    warnings.push(`${connectors.length} active connector member(s) would read ZERO items under enforcing`);
+    // CLASS-keyed, no census (review L2): the deferral fingerprint hashes these strings, and a
+    // count that churns (a connector added) is not a distinct STUCK state worth a new audit row.
+    warnings.push(`active connector member(s) would read ZERO items under enforcing`);
   }
   const agents = all.filter((m) => isPrincipal({ ...m, tier: m.tier ?? undefined }) && m.kind !== "human");
   for (const a of agents) {
@@ -493,12 +495,12 @@ export async function autoFlipIfReady(
     if (!drainAllowed) return { flipped: false, drained: false }; // ready — queued for next pass
     const r = await setAccessEnforcement(db, teamId, "enforcing", { actorMemberId: null });
     if (r.ok) return { flipped: r.changed, drained: true };
-    return deferAutoFlip(
-      db,
-      teamId,
-      { blockers: r.readiness?.blockers ?? [r.error ?? "refused"], warnings: r.readiness?.warnings ?? [] },
-      true
-    );
+    // A refusal AFTER readiness passed (a raced guarded write, a genuine write error) carries
+    // empty blockers — `r.error` is then the only reason and must reach the audit row (review
+    // M1: `?? []` never falls through on an empty-but-present array, so the deferral explained
+    // nothing).
+    const blockers = r.readiness?.blockers?.length ? r.readiness.blockers : [r.error ?? "refused"];
+    return deferAutoFlip(db, teamId, { blockers, warnings: r.readiness?.warnings ?? [] }, true);
   } catch (err) {
     return deferAutoFlip(db, teamId, {
       blockers: [],

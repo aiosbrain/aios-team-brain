@@ -74,7 +74,9 @@ describe("PRET-2 — a ready, warning-free team auto-flips with byte-identical i
     const post = await itemLegPaths(seed, seed.memberId); // enforced read: oracle member arm
     // The §11 byte-identical promise, scoped to the legs it governs (spec §2.1): the ITEM-LEG
     // sources. The structured legs differ by design post-flip (aggregates omitted, rels
-    // narrowed, graph partition-served) and are NOT asserted equal here.
+    // narrowed, graph partition-served) and are NOT asserted equal here. Non-empty pin first
+    // (review M2): [] toEqual [] would green a retrieve regression as "byte-identical".
+    expect(pre.length, "the fixture's two items must actually ground").toBeGreaterThanOrEqual(2);
     expect(post).toEqual(pre);
   });
 });

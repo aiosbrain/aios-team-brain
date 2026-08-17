@@ -46,8 +46,8 @@ try {
       `select coalesce(sum(greatest(cardinality(ge.chunk_shas), 1)), 0)::int as n
          from graph_episodes ge
          join projects bp on bp.team_id = ge.team_id and bp.graph_group_id = ge.group_id and bp.kind = 'system'
-         join project_context_units u on u.team_id = ge.team_id and u.item_id = ge.source_id::uuid and u.state = 'active'
-         join project_context_memberships m on m.team_id = ge.team_id and m.context_unit_id = u.id and m.valid_to is null
+         join project_context_units u on u.team_id = ge.team_id and u.source_item_id = ge.source_id and u.state = 'active'
+         join project_context_memberships m on m.team_id = ge.team_id and m.context_unit_id = u.id and m.valid_to is null and m.decision = 'include'
          join projects ip on ip.id = m.project_id and ip.kind <> 'system'
         where ge.team_id = $1 and ge.source_table = 'items'`,
       [t.id]
