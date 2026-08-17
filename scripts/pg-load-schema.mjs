@@ -35,8 +35,8 @@ export async function loadSchema({
   logger = console,
 } = {}) {
   // On Railway, refuse to run if this app landed on a non-AIOS service — the
-  // 2026-06-27 vector: this preDeployCommand ran against Kula's DATABASE_URL and
-  // injected our schema into Kula's prod DB. Abort BEFORE reading DATABASE_URL or
+  // 2026-06-27 vector: this preDeployCommand ran against another project's DATABASE_URL
+  // and injected our schema into their production DB. Abort BEFORE reading DATABASE_URL or
   // opening any database connection.
   assertServiceIdentity("load the AIOS schema");
 

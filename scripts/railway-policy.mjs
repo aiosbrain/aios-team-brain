@@ -9,7 +9,7 @@
  *
  * THE DISTINCTION THAT MAKES PROVISIONING SAFE
  *
- * The 2026-06-27 Kula incident was not really about `up` — it was about the *link*. The Railway
+ * The 2026-06-27 cross-project deploy incident was not really about `up` — it was about the *link*. The Railway
  * CLI resolves the target project from `~/.railway/config.json`, keyed by absolute path, so any
  * write verb run from a drifted directory hits someone else's project. `railway variables --set`
  * against a drifted link would overwrite another project's production environment just as surely
@@ -30,7 +30,7 @@
  * for the life of the instance.
  */
 
-/** Never, under any framing. The four verbs that caused or could repeat the Kula incident. */
+/** Never, under any framing. The four verbs that caused or could repeat that incident. */
 export const FORBIDDEN_VERBS = Object.freeze(["up", "redeploy", "down", "delete"]);
 
 /** Writes. Legal only against a freshly created, pinned project — see assertPinnedTarget. */
@@ -62,7 +62,7 @@ export function classifyRailwayCommand(command) {
     return {
       decision: "block",
       verb: forbidden,
-      reason: `\`railway ${forbidden}\` is permanently forbidden — production deploys go through the GitHub integration (Kula, 2026-06-27)`,
+      reason: `\`railway ${forbidden}\` is permanently forbidden — production deploys go through the GitHub integration (2026-06-27 cross-project deploy incident)`,
     };
   }
 
@@ -112,7 +112,7 @@ export function assertPinnedTarget(status, expected) {
   if (actual !== expected) {
     throw new Error(
       `railway is linked to "${actual}" but this run provisions "${expected}" — refusing to write. ` +
-        `This is the link drift that took Kula down; re-run from a clean directory.`
+        `This is the link drift that took an unrelated project down on 2026-06-27; re-run from a clean directory.`
     );
   }
   if (!isSanctionedProjectName(actual)) {

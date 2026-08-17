@@ -16,7 +16,7 @@
  *
  * Provisioning verbs (`init`/`add`/`variables`/`domain`/`run`) DO write, so each is gated on
  * `assertPinnedTarget`: proof from `railway status --json` that the CLI is pointed at the
- * project this run created. The Kula incident was link drift, and a drifted `variables --set`
+ * project this run created. The 2026-06-27 incident was link drift, and a drifted `variables --set`
  * would clobber another project's environment just as effectively as a drifted `up`.
  *
  * Resumable and idempotent. Connecting the GitHub repo is a dashboard OAuth step no CLI can do,

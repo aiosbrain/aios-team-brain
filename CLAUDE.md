@@ -265,19 +265,30 @@ list`; CI webhooks can be silently dropped) — re-trigger via the Railway dashb
 - **⛔ NEVER run `railway up` / `railway redeploy` / `railway down` / `railway delete`.** The Railway CLI is
   **read-only** here (`status`, `logs`, `variables`, `deployment list`, `connect`). `railway up` deploys the current
   worktree's code to whatever project that directory is _linked_ to (`~/.railway/config.json`, keyed by
-  absolute path) — and a Conductor worktree that drifted to the wrong link (an aios worktree linked to the
-  **Kula** project) once shipped this repo's code into Kula and took it down. The GitHub-merge path is bound
+  absolute path) — and a Conductor worktree that drifted to the wrong link (an aios worktree linked to an
+  unrelated project) once shipped this repo's code into that project and took it down (2026-06-27, the
+  cross-project deploy incident). The GitHub-merge path is bound
   to the right project and cannot do that. This is **guarded**: `.claude/settings.json` denies those verbs +
   a PreToolUse hook (`scripts/railway-deploy-guard.sh`) blocks them (incl. `cd other && railway up`). Before
   _any_ Railway command, confirm `railway status` shows **Project: AIOS**; audit all worktrees with
   `bash scripts/railway-link-check.sh`.
 - **Runtime backstop (`scripts/service-guard.mjs`).** The hook above only fires inside the agent's shell; it
-  can't stop a human `railway up` or any other path that lands this code on a foreign service. So the schema
-  loaders (`pg-load-schema.mjs` = the `preDeployCommand`, and `pg-load-vector.mjs`) call `assertServiceIdentity`
-  **before** connecting: if `RAILWAY_SERVICE_NAME` is set and isn't an AIOS service (`aios` / `aios-*`, override
-  via `AIOS_RAILWAY_SERVICES`), the load aborts non-zero and Railway halts the release — so this repo can never
-  inject its schema into another project's DB again (the 2026-06-27 Kula incident). Mirrors Kula's
-  `src/lib/service-guard.ts`; guarded by `test/guards/service-guard.test.ts`.
+  can't stop a human `railway up` or any other path that lands this code on a service it doesn't belong on. So
+  the schema loaders (`pg-load-schema.mjs` = the `preDeployCommand`, and `pg-load-vector.mjs`) call
+  `assertServiceIdentity` **before** connecting: on an AIOS deploy whose `RAILWAY_SERVICE_NAME` isn't an AIOS
+  service (`aios` / `aios-*`, override via `AIOS_RAILWAY_SERVICES`), the load aborts non-zero and Railway halts
+  the release. **It enforces only on deploys it can identify as AIOS's** — `RAILWAY_PROJECT_ID` matching AIOS's
+  project (platform-injected, so it can't be pruned away and silently disable production protection), or an
+  explicit `AIOS_RAILWAY_SERVICES`. That scoping is not timidity: this repo is public and self-hosted, and an
+  unconditional check would turn "I named my Railway service after my company" into an unrecoverable failed
+  release from a pre-deploy hook. The cross-**project** case is out of its reach by construction (that deploy
+  inherits the other project's env) and belongs to the layers above. Read the module header before changing the
+  marker; guarded by `test/guards/service-guard.test.ts`.
+- **Demo seeding is opt-in on a public URL (`docker/bootstrap.mjs` + `scripts/setup/deploy-policy.mjs`).** The
+  demo admin is a documented credential in a public repo, so on a production build whose `APP_URL` isn't
+  localhost the demo seeds only for an explicit `SEED_DEMO=true` (and then with a generated password). Local
+  `docker compose up` is unchanged. `TEAM_SLUG` is normalised (`Acme Corp` → `acme-corp`) and the change is
+  reported, because a rejected slug used to mean die() → restart loop → failed deployment.
 
 ---
 

@@ -2,7 +2,7 @@
 #
 # Audit the Railway CLI link map (~/.railway/config.json): flag any aios-team-brain directory
 # linked to a project OTHER than "AIOS". Conductor spawns worktrees that can drift to the wrong
-# link; a mislinked aios worktree is the exact condition that let a deploy hit the Kula project.
+# link; a mislinked aios worktree is the exact condition that let a deploy hit an unrelated project.
 #
 # Read-only. Exits non-zero if any aios directory is mislinked. Run it any time, e.g. after
 # creating a new worktree:  bash scripts/railway-link-check.sh
