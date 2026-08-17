@@ -36,7 +36,7 @@ that will own the deployment.
 | `GRAPH_PROJECT_ENABLED` | fixed to `true` |
 | `SECRETS_KEY` | `${{ secret(43, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_") }}` (32 bytes when base64url-decoded) |
 | `TEAM_NAME` | required user input |
-| `TEAM_SLUG` | required user input; lowercase letters, digits, hyphens |
+| `TEAM_SLUG` | required user input; lowercase letters, digits, hyphens. Railway's form cannot validate it, so bootstrap normalises anything else (`Acme Corp` → `acme-corp`) and prints what it used — the slug is the team's permanent `/t/<slug>` address |
 | `ADMIN_NAME` | required user input |
 | `ADMIN_EMAIL` | required user input |
 | `ADMIN_PASSWORD` | required user input, minimum 10 characters; never printed by bootstrap |
