@@ -40,6 +40,8 @@ export interface ProjectionTaskRow {
 
 export type ProjectionStatus =
   | "synced"
+  /** ADOPTDECL-1 — took over a pre-existing provider issue a human named. A write happened. */
+  | "adopted"
   | "skipped"
   | "no_row_key"
   | "no_primary_provider"
@@ -135,7 +137,7 @@ export function toProjectable(row: ProjectionTaskRow, parentResourceId: string |
 // Columns of task_pm_links the projection engine reads. The pg adapter (prod) rejects a bare
 // "*" column reference, so every select / insert-returning must name columns explicitly.
 const LINK_COLS =
-  "id, team_id, project_id, task_id, row_key, provider, provider_resource_id, provider_external_source, provider_external_id, provider_url, projection_fingerprint, last_projected_status, last_projected_brain_status, provider_seen_status";
+  "id, team_id, project_id, task_id, row_key, provider, provider_resource_id, provider_external_source, provider_external_id, declared_external_id, provider_url, projection_fingerprint, last_projected_status, last_projected_brain_status, provider_seen_status";
 
 // The exact `tasks` columns that hydrate a ProjectionTaskRow. Named explicitly (the pg adapter
 // rejects "*") and shared by every loader so the projected shape can't drift between call sites.
@@ -364,8 +366,10 @@ export async function projectRows(
       fetchImpl: opts.fetchImpl,
     });
     reports.push(report);
-    // Only pay the throttle when we actually wrote to the provider.
-    if (report.status === "synced") await sleep(throttleMs);
+    // Only pay the throttle when we actually wrote to the provider — and an ADOPTION is a write.
+    // Missing it here would let a first board push adopt N declared rows with N back-to-back
+    // `issueUpdate` calls at zero throttle, which is a rate-limit risk and not a cosmetic one.
+    if (report.status === "synced" || report.status === "adopted") await sleep(throttleMs);
   }
   return reports;
 }

@@ -21,6 +21,8 @@ export interface TaskPmLink {
   provider_resource_id: string | null;
   provider_external_source: string;
   provider_external_id: string;
+  /** ADOPTDECL-1 — set ONLY when a human named the issue on the task row; NULL otherwise. */
+  declared_external_id?: string | null;
   provider_url: string;
   // Projection bookkeeping (brain-api v1.2). Present on rows loaded for projection; the legacy
   // moveToDone path may omit them.
@@ -35,7 +37,7 @@ export interface TaskPmLink {
 
 export interface ProviderSyncResult {
   provider: PmProvider;
-  status: "synced" | "skipped";
+  status: "synced" | "adopted" | "skipped";
   providerResourceId?: string | null;
   providerUrl?: string;
   syncedStatus?: string;
