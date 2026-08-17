@@ -532,6 +532,11 @@ export const INTEGRATION_TYPES = [
   "notion",
   "linear",
   "plane",
+  // ClickUp: the token is the SECRET (a `pk_…` personal API token); the non-secret selection is the
+  // workspace, which Lists to import tasks from, and which Docs to read. The read client + normalizers
+  // already exist (lib/ingest/sources/clickup.ts + clickup-normalize.ts, AIO-819) — they just had
+  // nowhere to read a token from, so ClickUp could not be connected at all.
+  "clickup",
   // LLM provider API keys. The key is stored encrypted in secret_ciphertext, same path as the
   // source connectors above. openai/anthropic/google are secret-only; openrouter also carries a
   // NON-secret `model` selection (the OpenAI-compatible gateway needs a model slug).
@@ -649,6 +654,37 @@ const integrationConfigSchemas: Record<IntegrationType, z.ZodType> = {
       // the invite role (default resolves from tier: external→guest, else user). NON-secret hints.
       inviteTeamIds: z.array(z.string().max(64)).max(20).optional(),
       inviteRole: z.enum(["user", "admin", "guest"]).optional(),
+    })
+    .strict(),
+  // ClickUp: `workspaceId` drives the brain project slug (`clickup-<ws>`) and every task/doc identity;
+  // `listIds` is the task selection; `docIds`/`docParent*` select Docs. A half-configured integration
+  // stays savable (same stance as notion) — the runner reports what's missing.
+  //
+  // `statusMaps` is an ARRAY keyed by an INNER `listId` field, deliberately not a
+  // `Record<listId, …>`: the secret-key scan below walks nested object KEYS, so a List id in key
+  // position would be scanned as a config key — the same hazard `github.repoHistory` documents.
+  clickup: z
+    .object({
+      workspaceId: z.string().max(64).optional(),
+      listIds: z.array(z.string().min(1).max(64)).max(200).default([]),
+      statusMaps: z
+        .array(
+          z
+            .object({
+              listId: z.string().min(1).max(64),
+              backlog: z.string().min(1).max(80),
+              ready: z.string().min(1).max(80),
+              in_progress: z.string().min(1).max(80),
+              blocked: z.string().min(1).max(80),
+              done: z.string().min(1).max(80),
+            })
+            .strict()
+        )
+        .max(200)
+        .optional(),
+      docIds: z.array(z.string().min(1).max(64)).max(200).optional(),
+      docParentType: z.enum(["SPACE", "FOLDER", "LIST", "EVERYTHING", "WORKSPACE"]).optional(),
+      docParentId: z.string().max(64).optional(),
     })
     .strict(),
   plane: z

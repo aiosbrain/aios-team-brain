@@ -273,7 +273,8 @@ type IntegrationType =
   | "anthropic"
   | "openrouter"
   | "google"
-  | "notion";
+  | "notion"
+  | "clickup";
 
 export interface IntegrationRow {
   id: string;
@@ -287,7 +288,7 @@ export interface IntegrationRow {
 // Data-source connectors shown in the generic "Add an integration" form. Provider keys get their
 // own panel (PROVIDER_TYPES); GitHub gets its own repo panel (GithubReposPanel) — so both are
 // excluded here to avoid two places to manage the same thing.
-const TYPES: IntegrationType[] = ["slack", "notion", "linear", "plane"];
+const TYPES: IntegrationType[] = ["slack", "notion", "linear", "plane", "clickup"];
 
 // LLM provider API keys — one set for the team, managed in the dedicated "AI provider keys" panel.
 const PROVIDER_TYPES = ["anthropic", "openai", "google"] as const;
@@ -309,6 +310,8 @@ const SELECTION_HINT: Partial<Record<IntegrationType, string>> = {
   notion: "page IDs (comma-separated), or databaseId=<id>",
   linear: "teamId=..., projectId=..., doneStateName=Done",
   plane: "workspaceSlug=..., projectId=..., doneStateName=DONE, externalSource=aios-backlog",
+  // `,` separates entries, so a multi-value entry uses `|` (see lib/integrations/build-config).
+  clickup: "workspaceId=..., listIds=101|202, docIds=doc-a|doc-b",
 };
 
 function summarizeConfig(type: IntegrationType, config: Record<string, unknown>): string {
@@ -325,6 +328,13 @@ function summarizeConfig(type: IntegrationType, config: Record<string, unknown>)
       config.projectId ? `project ${config.projectId}` : null,
       config.doneStateName ? `done ${config.doneStateName}` : null,
       config.inboundApply === true ? "inbound ✓" : null,
+    ].filter(Boolean).join(" · ") || "—";
+  }
+  if (type === "clickup") {
+    return [
+      config.workspaceId ? `workspace ${config.workspaceId}` : null,
+      `${arr("listIds").length} list(s)`,
+      arr("docIds").length ? `${arr("docIds").length} doc(s)` : null,
     ].filter(Boolean).join(" · ") || "—";
   }
   if (type === "plane") {
@@ -886,6 +896,15 @@ export function IntegrationsManager({
               flow back. Reversible; re-save with this unchecked to turn it off.
             </span>
           </label>
+        ) : null}
+        {form.type === "clickup" ? (
+          <p className="text-xs text-amber-700">
+            The token is a ClickUp personal API token (<code>pk_…</code>), from ClickUp → Settings →
+            Apps. Saving it connects the workspace and stores it encrypted — but ClickUp does{" "}
+            <strong>not import yet</strong>: the scheduled ingestion run is not built, so there is no
+            &ldquo;Sync now&rdquo; button on this row and nothing will appear in the brain until it
+            lands.
+          </p>
         ) : null}
         <input
           className="prism-input"

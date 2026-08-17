@@ -63,3 +63,31 @@ describe("notion — the token is the secret, the selection is what to pull", ()
     expect(buildConfig("notion", "")).toEqual({ pageIds: [] });
   });
 });
+
+describe("clickup — the pk_ token is the secret, the selection is workspace + Lists + Docs", () => {
+  it("parses workspace, Lists and Docs out of the one free-text field", () => {
+    // `,` is the OUTER separator (toList), so a multi-value entry needs `|`.
+    expect(buildConfig("clickup", "workspaceId=9001, listIds=101|202, docIds=doc-a|doc-b")).toEqual({
+      workspaceId: "9001",
+      listIds: ["101", "202"],
+      docIds: ["doc-a", "doc-b"],
+    });
+  });
+
+  it("an empty selection is savable — a half-configured integration must not be un-persistable", () => {
+    // Matches the notion stance: the admin saves the token first and picks Lists after. `default:`
+    // returning `{}` would ALSO have been savable, which is exactly why this needs its own case —
+    // a missing switch arm is not a compile error here, it silently stores an empty config.
+    expect(buildConfig("clickup", "")).toEqual({ listIds: [] });
+  });
+
+  it("produces config the downstream validator accepts (round-trip)", () => {
+    const cfg = buildConfig("clickup", "workspaceId=9001, listIds=101, docParentType=space, docParentId=s1");
+    expect(validateIntegrationConfig("clickup", cfg)).toEqual({
+      workspaceId: "9001",
+      listIds: ["101"],
+      docParentType: "SPACE", // upper-cased for the enum, so a lowercase entry is not a save failure
+      docParentId: "s1",
+    });
+  });
+});
