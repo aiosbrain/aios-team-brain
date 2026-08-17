@@ -125,11 +125,12 @@ synthesis has no callers.
   team's arcs panel composition changes from the single tier-row narrative to the fused
   per-project panel — ruling 1's accepted change, surfaced at the slice that causes it, not
   four slices later.
-- **Stuck-state** (PRET-2): no new table — the admin surface's existing data function
-  (`lib/admin/access-enforcement.ts`) returns the convergence result alongside the mode; a team
-  permissive with `checkedAt` older than two scheduler ticks or with `error` set renders as
-  STUCK on the admin card. Schema change: none until PRET-6 (the flag column is untouched
-  through PRET-2..5).
+- **Stuck-state** (PRET-2): no new table — surfaced through the surfaces that EXIST (the
+  permission inspector `lib/access/inspect.ts` → `app/api/dashboard/access/inspect/route.ts`,
+  and the `scripts/admin.ts` CLI; there is no admin enforcement card today — PR #578 was
+  CLI-only). STUCK is ATTEMPTS-relative: blockers persisting across ≥2 auto-flip attempts
+  (same deferral fingerprint); warning-deferred teams are AWAITING MANUAL FLIP, a decision
+  state. Schema change: none until PRET-6 (the flag column is untouched through PRET-2..5).
 - **Invite default AND the group-recompute disposition** (PRET-4; cold-read H3 — the
   mechanism the triad rides on, named): today General access is DERIVED from tier continuously
   — `lib/access/groups.ts` `syncBuiltinMembership` recomputes the `everyone`/`external` groups
@@ -153,12 +154,14 @@ slice opens its own `PRET-n` row there BEFORE its build starts (the task gate), 
 Linear by the pm-sync path (`lib/pm-sync/`) on `aios push` — the slice's PR cites its own
 row key in an `AIOS-Work:` trailer, never the Linear key.
 
-- **PRET-2 — the convergence-gated flip.** Building on `lib/admin/access-enforcement.ts`: a
-  measured convergence check (memberships counted against eligible items, the backfill's own
-  short-circuit arithmetic), auto-flip on convergence for existing teams, new teams created
-  enforcing, the stuck-state surfaced loudly. After this slice every healthy team row reads
-  `enforcing`; the flag still exists (PRET-6 removes it) so a self-host that upgrades
-  mid-program is never silently switched without the gate.
+- **PRET-2 — the convergence-gated flip.** Building on `lib/admin/access-enforcement.ts`: the
+  real readiness assessment as the sole gate (§4), auto-flip for warning-free existing teams,
+  new teams created PERMISSIVE and flipped by the same gate after their first seed+drain (one
+  path — the §4 contract; an earlier draft of this bullet said "created enforcing", corrected
+  per its own contract), the stuck-state surfaced loudly. After this slice every warning-free
+  healthy team reads `enforcing`; warned teams await a manual flip with the warnings surfaced;
+  the flag still exists (PRET-6 removes it) so a self-host that upgrades mid-program is never
+  silently switched without the gate.
 - **PRET-3 — arcs unification, for EVERY reader class** (cold-read H2: a retirement that
   fences a reader out must name their destination). The fused path becomes the ONLY arcs read:
   a team-tier member on an enforcing team fuses their oracle partitions (today's behavior); an
