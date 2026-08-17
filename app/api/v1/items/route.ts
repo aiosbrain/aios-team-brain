@@ -29,9 +29,9 @@ const MAX_PAYLOAD = 1_000_000; // 1 MB per contract
  * A `task`/`decision` payload is `body` PLUS up to `MAX_PAYLOAD_ROWS` rows, and this gate used to be
  * `MAX_PAYLOAD * 1.2` = 1.2 MB — so it fired at roughly 1,100 rows, long before any row bound, with a
  * bare `413 payload_too_large / "max 1 MB"` that named no field. Since chunking client-side is not
- * available for `task`/`decision` (the row sweep in `lib/ingest/tasks.ts` deletes every synced row in
- * the project that the incoming item omits, so chunk 2 deletes chunk 1), a whole workspace has to fit
- * in ONE request or fail with a reason. 1 MB body + 5,000 rows × ~700 B, +20% JSON framing slack =
+ * available for `task` (the sweep in `lib/ingest/tasks.ts` is PROJECT-wide, so chunk 2 deletes chunk
+ * 1 — the other row kinds sweep per-item and could be split), a whole workspace has to fit in ONE
+ * request or fail with a reason. 1 MB body + 5,000 rows × ~700 B, +20% JSON framing slack =
  * **5,400,000 B (5.4 MB)**, a 4.5× raise.
  *
  * NOT a guarantee that 5,000 rows always fit: 700 B is the measured ClickUp average, and 5,000 rows
@@ -77,6 +77,11 @@ export async function POST(req: NextRequest) {
   if (!parsed.success) {
     return errorResponse("invalid_payload", parsed.error.issues[0]?.message ?? "invalid", 422);
   }
+  // UNREACHABLE, and kept deliberately. `commonItemFields.body` is `z.string().max(1_000_000)`, so an
+  // over-cap body already 422'd at the parse above — a body overflow is `invalid_payload`, NOT this
+  // 413, which is why the brain-api 1.20 envelope says 413 means the TRANSPORT ceiling. Left as a
+  // belt-and-braces backstop in case the schema's own cap is ever relaxed or decoupled from
+  // `MAX_PAYLOAD`; if it fires, the two have drifted.
   if (parsed.data.body.length > MAX_PAYLOAD) {
     return errorResponse("payload_too_large", "body exceeds 1 MB", 413);
   }

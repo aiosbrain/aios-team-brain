@@ -393,14 +393,18 @@ workspace was the 413 — firing at roughly **1,100 rows** with a message naming
 1,000 rows = 1,089,970 B accepted, 3,500 = 1,918,564 B rejected). A 35-List ClickUp workspace failed
 atomically at ~32 tasks per List.
 
-**The client cannot fix this by chunking**, which is why the bound had to move server-side: for
-`task`/`decision` the row sweep (`lib/ingest/tasks.ts`, `lib/ingest/decisions.ts`) DELETES every
-synced row in the PROJECT the incoming item omits, so a second chunk deletes the first — splitting one
-project's rows across pushes silently destroys data. A source above 5,000 rows must be split into
-separate **projects** (fewer Lists per integration), never into two pushes of the same project.
-(`fact`/`stakeholder_mention` sweep per-ITEM instead — `lib/ingest/evidence.ts` — so distinct paths
-would be safe there; the shared error message stays conservative rather than giving advice that is
-only sometimes true.)
+**For `task`, the client cannot fix this by chunking** — which is why the bound had to move
+server-side. `lib/ingest/tasks.ts` sweeps **PROJECT-wide** (`project_id` + `origin='sync'`, no item
+filter), so a second `task` item in the same project deletes the first one's rows: splitting one
+project's tasks across pushes silently destroys data. A task source above 5,000 rows must be split
+into separate **projects** (fewer Lists per integration), never into two pushes of the same project.
+
+**`task` is the exception, not the rule.** The other three row-bearing kinds sweep **per-ITEM**:
+`lib/ingest/decisions.ts` scopes its diff-delete to `source_item_id = itemId` (so a UI-created
+decision and other items' rows are never touched), and `lib/ingest/evidence.ts` does the same for
+`fact`/`stakeholder_mention`. For those, splitting across distinct paths **is** safe. The shared
+`rows` error message stays conservative — "narrow the selection" is true for every kind, where
+"never split across pushes" would be true only for tasks.
 
 **The cap is WIRE-ONLY, and that distinction is load-bearing.** `ingestItem` re-parses every payload
 through `itemPayloadSchema`, including the ones the in-process mirror legs build — and those have no

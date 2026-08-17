@@ -10,10 +10,13 @@ import { z } from "zod";
  * 1,918,564 B rejected), so a 35-List workspace failed atomically at ~32 tasks per List with an
  * error that read like a server limit rather than a payload one.
  *
- * WHY NOT CHUNK CLIENT-SIDE: for `task` and `decision` the row sweep (`lib/ingest/tasks.ts`,
- * `lib/ingest/decisions.ts`) DELETES every synced row in the PROJECT that the incoming item omits,
- * so a second chunk deletes the first. Splitting one project's rows across pushes silently destroys
- * data; the contract has to accept the whole set or say why not.
+ * WHY NOT CHUNK CLIENT-SIDE — for `task`, which is the kind this actually bit. `lib/ingest/tasks.ts`
+ * sweeps PROJECT-wide (`project_id` + `origin='sync'`, no item filter), so a second `task` item in the
+ * same project deletes the first one's rows. Splitting one project's tasks across pushes silently
+ * destroys data; the contract has to accept the whole set or say why not.
+ * The other three row kinds sweep per-ITEM — `decisions.ts` scopes its diff-delete to
+ * `source_item_id = itemId`, and `evidence.ts` does the same for `fact`/`stakeholder_mention` — so
+ * for those, splitting across DISTINCT PATHS is in fact safe. `task` is the exception, not the rule.
  *
  * So the bound moves to where it can be DIAGNOSED: Zod rejects at a stated row count and `route.ts`
  * surfaces that message as a `422 invalid_payload` naming the limit, while the transport gate is
