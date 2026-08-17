@@ -308,6 +308,13 @@ async function main() {
       "--password", DEMO_PASSWORD,
       "--upsert",
     ]);
+
+    // PRET-2: seed → drain → gated flip, one path (the seed writes via ingestItem, which
+    // bypasses the items route's reconcile hook — the flip's own drain partitions those rows).
+    // Best-effort: a refusal/deferral here is surfaced by the command and retried by the
+    // scheduler pass; the boot never fails on it.
+    console.log("▶ auto-flipping the demo team to enforcing (gated — refuses rather than bricks)…");
+    runQuiet("npx", ["tsx", "--conditions", "react-server", "scripts/admin.ts", "auto-flip", "demo"]);
   }
 
   // Only reached when the demo actually owns this database. Printing demo credentials after a real

@@ -61,6 +61,11 @@ export interface ItemVisibility {
   chains: VisibilityChain[];
   /** Set only when NOT visible — coarse, never names the restricted project (§5.7). */
   reason?: string;
+  /** PRET-2 stuck-state surfacing (additive): on a still-PERMISSIVE team, the most recent
+   *  unattended-flip deferral — why the scheduler hasn't flipped this team (blockers persisting
+   *  = STUCK; warnings = awaiting a manual flip decision). Absent on enforcing teams and teams
+   *  never deferred. */
+  autoFlip?: { at: string; blockers: string[]; warnings: string[]; error?: string };
 }
 
 function groupKind(g: { slug: string; is_builtin: boolean; person_member_id: string | null }): GroupKind {
@@ -100,7 +105,10 @@ export async function explainItemVisibility(
   }
   // Permissive team: enforcement's oracle conjunct is inactive → visible by tier, no project chain.
   if (mode === "permissive") {
-    return { itemId, memberId, mode, visible: true, chains: [] };
+    // PRET-2: surface WHY the scheduler hasn't flipped this team (additive; best-effort).
+    const { latestAutoFlipDeferral } = await import("@/lib/admin/access-enforcement");
+    const autoFlip = await latestAutoFlipDeferral(db, teamId);
+    return { itemId, memberId, mode, visible: true, chains: [], ...(autoFlip ? { autoFlip } : {}) };
   }
 
   // Enforcing: the ORACLE conjunct. The member's oracle-visible projects + post-eligibility groups.

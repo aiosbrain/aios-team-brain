@@ -301,7 +301,15 @@ async function writeMode(
     }
     return { ok: true, mode: readBack };
   }
-  const { error } = await db.from("teams").update({ access_enforcement: mode }).eq("id", teamId);
+  // Guarded predicate (PRET-2, program §4's binding flip-writer contract): the write applies
+  // only if the row still holds the mode we read — a write raced by a concurrent flip matches
+  // zero rows and FAILS its read-back below, instead of clobbering and firing a mis-attributed
+  // audit row.
+  const { error } = await db
+    .from("teams")
+    .update({ access_enforcement: mode })
+    .eq("id", teamId)
+    .eq("access_enforcement", previous);
   if (error) return { ok: false, error: `write failed: ${error.message}` };
   // Read back: the CHECK constraint, a raced write, or a silently-dropped update all look like
   // success at the call site otherwise, and this flag is the one an operator must not be wrong about.
@@ -320,4 +328,176 @@ async function auditFlip(db: DbClient, teamId: string, from: string, to: string,
     target_id: teamId,
     meta: { from, to },
   });
+}
+
+// ---------------------------------------------------------------------------
+// PRET-2 — the UNATTENDED flip path (spec docs/design/pret2-convergence-gated-flip.md §1;
+// program docs/design/retire-permissive-model.md §4). Everything below may run with no human
+// watching, so it is stage-ordered by cost and fails toward "stays permissive, loudly".
+// ---------------------------------------------------------------------------
+
+export interface AutoFlipResult {
+  flipped: boolean;
+  /** Present when the team was considered and REFUSED (blockers/warnings/error). Absent for the
+   *  silent no-ops (already enforcing, the operator-undo hold — whose reason lives on the
+   *  enforcement_changed row itself, not in deferral spam — and the queued-past-budget case). */
+  deferred?: { blockers: string[]; warnings: string[]; error?: string };
+  /** True when the EXPENSIVE stage (prepare→drain→assess) ran — what the pass's budget counts. */
+  drained: boolean;
+}
+
+/**
+ * The CHEAP warning scan (spec §1.1: computed BEFORE any drain is paid): the two unattended
+ * warning classes — active connectors (members read only) and unplaced agents (oracle per AGENT
+ * principal only). Mirrors `assessEnforcementReadiness`'s warning semantics without its coverage
+ * scan or per-human loop; the full assessment remains the flip gate itself.
+ */
+export async function assessUnattendedWarnings(db: DbClient, teamId: string): Promise<string[]> {
+  const warnings: string[] = [];
+  const { data: memberRows, error } = await db
+    .from("members")
+    .select("id, email, kind, is_connector, status, tier")
+    .eq("team_id", teamId);
+  if (error) throw new Error(`members read failed: ${error.message}`);
+  const all = (memberRows ?? []) as MemberRow[];
+  const connectors = all.filter((m) => m.is_connector && m.status === "active");
+  if (connectors.length > 0) {
+    warnings.push(`${connectors.length} active connector member(s) would read ZERO items under enforcing`);
+  }
+  const agents = all.filter((m) => isPrincipal({ ...m, tier: m.tier ?? undefined }) && m.kind !== "human");
+  for (const a of agents) {
+    const { projectIds } = await visibleProjects(db, { teamId, memberId: a.id });
+    if (projectIds.size === 0) {
+      warnings.push(`agent member(s) in no granted group would read ZERO items under enforcing`);
+      break; // one warning class entry — the fingerprint keys on the CLASS, not the census
+    }
+  }
+  return warnings;
+}
+
+/** The operator-undo HOLD (spec §1.1): a member-attributed downgrade to permissive excludes the
+ *  team from auto-flip permanently; only a manual re-flip re-arms it. System history never holds. */
+async function operatorDowngraded(db: DbClient, teamId: string): Promise<boolean> {
+  const { data, error } = await db
+    .from("audit_log")
+    .select("actor_kind, meta")
+    .eq("team_id", teamId)
+    .eq("action", "access.enforcement_changed")
+    .order("created_at", { ascending: false })
+    .limit(1);
+  if (error) throw new Error(`audit read failed: ${error.message}`);
+  const last = ((data ?? []) as { actor_kind: string; meta: { to?: string } }[])[0];
+  return last != null && last.actor_kind === "member" && last.meta?.to === "permissive";
+}
+
+/** One deferral row per DISTINCT state (spec §1.1's fingerprint latch): an unchanged stuck state
+ *  writes nothing. `audit()` is best-effort — a swallowed write just retries next attempt. */
+async function deferAutoFlip(
+  db: DbClient,
+  teamId: string,
+  deferred: { blockers: string[]; warnings: string[]; error?: string },
+  drained = false
+): Promise<AutoFlipResult> {
+  const { createHash } = await import("node:crypto");
+  const fingerprint = createHash("sha256")
+    .update(JSON.stringify([[...deferred.blockers].sort(), [...deferred.warnings].sort(), deferred.error ?? ""]))
+    .digest("hex")
+    .slice(0, 16);
+  try {
+    const { data } = await db
+      .from("audit_log")
+      .select("meta")
+      .eq("team_id", teamId)
+      .eq("action", "access.autoflip_deferred")
+      .order("created_at", { ascending: false })
+      .limit(1);
+    const last = ((data ?? []) as { meta: { fingerprint?: string } }[])[0];
+    if (last?.meta?.fingerprint !== fingerprint) {
+      await audit(db, {
+        team_id: teamId,
+        actor_kind: "system",
+        action: "access.autoflip_deferred",
+        target_type: "team",
+        target_id: teamId,
+        meta: { ...deferred, fingerprint },
+      });
+    }
+  } catch {
+    // the latch read failing must not turn a deferral into a throw — next attempt retries
+  }
+  return { flipped: false, deferred, drained };
+}
+
+export interface AutoFlipDeferral {
+  at: string;
+  blockers: string[];
+  warnings: string[];
+  error?: string;
+}
+
+/** The most recent auto-flip deferral — the stuck-state surfacing read (spec §1.4), shared by
+ *  the permission inspector and the CLI so the two surfaces cannot disagree. Null = never
+ *  deferred (or the read failed — surfacing is best-effort, never a 500). */
+export async function latestAutoFlipDeferral(db: DbClient, teamId: string): Promise<AutoFlipDeferral | null> {
+  try {
+    const { data } = await db
+      .from("audit_log")
+      .select("created_at, meta")
+      .eq("team_id", teamId)
+      .eq("action", "access.autoflip_deferred")
+      .order("created_at", { ascending: false })
+      .limit(1);
+    const row = ((data ?? []) as { created_at: string | Date; meta: Record<string, unknown> }[])[0];
+    if (!row) return null;
+    const at = row.created_at instanceof Date ? row.created_at.toISOString() : String(row.created_at);
+    return {
+      at,
+      blockers: Array.isArray(row.meta.blockers) ? (row.meta.blockers as string[]) : [],
+      warnings: Array.isArray(row.meta.warnings) ? (row.meta.warnings as string[]) : [],
+      ...(typeof row.meta.error === "string" ? { error: row.meta.error } : {}),
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The unattended flip. NEVER throws (spec §1.1 error containment — one team's failure must not
+ * abort the fleet pass): every stage's throw becomes a deferral with `error` in meta. Stage
+ * order is cost order — mode read, hold read, cheap warning scan, and only then the full
+ * prepare→drain→assess→write sequence via `setAccessEnforcement` (reused, not reimplemented).
+ */
+export async function autoFlipIfReady(
+  db: DbClient,
+  teamId: string,
+  opts: {
+    /** The pass's drain-budget gate: false = run only the cheap stages; a ready team QUEUES
+     *  silently for the next pass instead of entering the expensive sequence (spec §1.2 — the
+     *  budget bounds drains, cheap checks run for every permissive team every pass). */
+    drainAllowed?: boolean;
+  } = {}
+): Promise<AutoFlipResult> {
+  const drainAllowed = opts.drainAllowed !== false;
+  try {
+    const mode = await readAccessEnforcement(db, teamId);
+    if (mode !== "permissive") return { flipped: false, drained: false }; // already enforcing
+    if (await operatorDowngraded(db, teamId)) return { flipped: false, drained: false }; // held
+    const warnings = await assessUnattendedWarnings(db, teamId);
+    if (warnings.length > 0) return deferAutoFlip(db, teamId, { blockers: [], warnings });
+    if (!drainAllowed) return { flipped: false, drained: false }; // ready — queued for next pass
+    const r = await setAccessEnforcement(db, teamId, "enforcing", { actorMemberId: null });
+    if (r.ok) return { flipped: r.changed, drained: true };
+    return deferAutoFlip(
+      db,
+      teamId,
+      { blockers: r.readiness?.blockers ?? [r.error ?? "refused"], warnings: r.readiness?.warnings ?? [] },
+      true
+    );
+  } catch (err) {
+    return deferAutoFlip(db, teamId, {
+      blockers: [],
+      warnings: [],
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
 }

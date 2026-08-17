@@ -18,8 +18,11 @@ import { setAccessEnforcement } from "@/lib/admin/access-enforcement";
  * The stub interleaves the two reads exactly as the race would.
  */
 
-/** A DbClient whose `teams` read returns `reads` in order — i.e. a row that changes underneath us. */
-function racingDb(reads: string[], audits: unknown[]): DbClient {
+/** A DbClient whose `teams` read returns `reads` in order — i.e. a row that changes underneath us.
+ *  `allowWrite` arms the WRITE-path variant (PRET-2's guarded predicate): the update "succeeds"
+ *  (matches zero rows — the adapter reports no error either way), and the subsequent read-back
+ *  reveals the raced row. */
+function racingDb(reads: string[], audits: unknown[], opts: { allowWrite?: boolean } = {}): DbClient {
   return {
     from(table: string) {
       if (table === "audit_log") {
@@ -41,7 +44,11 @@ function racingDb(reads: string[], audits: unknown[]): DbClient {
             }),
           }),
           update: () => {
-            throw new Error("the no-op path must never UPDATE the row");
+            if (!opts.allowWrite) throw new Error("the no-op path must never UPDATE the row");
+            // The guarded update (…and access_enforcement = previous) against a raced row
+            // matches ZERO rows — the adapter reports success with nothing changed.
+            const chain = { eq: () => chain, then: (r: (v: { error: null }) => void) => r({ error: null }) };
+            return chain;
           },
         };
       }
@@ -74,5 +81,19 @@ describe("setAccessEnforcement — the no-op path reads back with the same disci
     expect(res.mode).toBe("permissive");
     expect(res.changed).toBe(false);
     expect(audits, "permissive→permissive is not a visibility change worth a trail entry").toEqual([]);
+  });
+
+  it("the WRITE path's guarded predicate: a raced write fails its read-back cleanly, no audit row (PRET-2)", async () => {
+    const audits: unknown[] = [];
+    // Operator A downgrades to `permissive` from a row that reads `enforcing`; operator B flips
+    // it to `enforcing`... the row A's guarded update targeted no longer matches — zero rows
+    // change, and the read-back reveals the raced value instead of A's.
+    // reads: previous=enforcing (A's first read) → read-back=enforcing (B re-flipped / A's
+    // guarded update matched nothing).
+    const res = await setAccessEnforcement(racingDb(["enforcing", "enforcing"], audits, { allowWrite: true }), "t1", "permissive");
+
+    expect(res.ok, "a write that did not land is not a success").toBe(false);
+    expect(res.error).toMatch(/read-back mismatch/);
+    expect(audits, "no phantom enforcement_changed row for a write that matched zero rows").toEqual([]);
   });
 });
