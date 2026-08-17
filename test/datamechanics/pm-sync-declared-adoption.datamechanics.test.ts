@@ -156,6 +156,37 @@ describe("ADOPTDECL-1 — a declaration survives ingest and adopts (real Postgre
     expect(sent, "the write-up must survive the status push").toContain("A real write-up nobody wants deleted.");
   });
 
+  it("an undeclared row is not re-written on every push — the clear must not churn updated_at", async () => {
+    // The clear used to fire for EVERY row without a declaration, on EVERY push, rewriting null over
+    // null and bumping updated_at — one round-trip per row, and `updated_at` stops meaning "last
+    // change" and starts meaning "last file push", which the admin panel sorts by. Found in review;
+    // the mutation that removes the predicate survived until this test existed.
+    const seed = await seedTeam();
+    await seedLinearPrimary(seed);
+    await pushTasks(seed, "w1", [{ row_key: "W1", title: "No declaration", status: "in_progress" }]);
+    const mock = linearMock({ issues: [] });
+    await projectTaskByIdAfterWrite(db(), await taskIdOf(seed.teamId, "W1"), { fetchImpl: mock.fetchImpl });
+
+    const before = await db()
+      .from("task_pm_links")
+      .select("updated_at")
+      .eq("team_id", seed.teamId)
+      .eq("row_key", "W1")
+      .single();
+    const stamp = (before.data as { updated_at: string }).updated_at;
+    expect(stamp, "the link must exist for this to mean anything").toBeTruthy();
+
+    // A second push of the same undeclared row must not touch the link at all.
+    await pushTasks(seed, "w2", [{ row_key: "W1", title: "No declaration", status: "in_progress" }]);
+    const after = await db()
+      .from("task_pm_links")
+      .select("updated_at")
+      .eq("team_id", seed.teamId)
+      .eq("row_key", "W1")
+      .single();
+    expect((after.data as { updated_at: string }).updated_at, "an undeclared row was re-written").toBe(stamp);
+  });
+
   it("an unresolvable declared key records the error and claims NO resource id", async () => {
     const seed = await seedTeam();
     await seedLinearPrimary(seed);
